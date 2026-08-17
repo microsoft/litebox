@@ -505,6 +505,7 @@ mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{SessionReferences, release_pending_reference};
+    use crate::socket::SocketProvider;
     use crate::{
         BrokerCore, BrokerCoreLimits, BrokerError, CallerCredential, ObjectRights, PolicyEngine,
         SocketPolicy,
@@ -546,6 +547,10 @@ mod tests {
             socket_provider.clone(),
         )
         .unwrap();
+        assert!(Arc::ptr_eq(
+            &broker.network_config(),
+            &socket_provider.network_config()
+        ));
 
         check_event_reference_lifecycle(&broker);
         check_session_drop_releases_references(&broker);

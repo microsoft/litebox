@@ -195,7 +195,7 @@ int main(int argc, char **argv) {
     assert(connect(fd, (const struct sockaddr *)&server, sizeof(server)) == 0);
     address_length = sizeof(local);
     assert(getsockname(fd, (struct sockaddr *)&local, &address_length) == 0);
-    assert(local.sin_addr.s_addr == htonl(INADDR_LOOPBACK));
+    assert(local.sin_addr.s_addr == inet_addr("10.0.2.15"));
     assert(local.sin_port != 0);
     address_length = sizeof(peer);
     assert(getpeername(fd, (struct sockaddr *)&peer, &address_length) == 0);
@@ -345,13 +345,13 @@ int main(int argc, char **argv) {
     struct sockaddr_in bind_address = {
         .sin_family = AF_INET,
         .sin_port = 0,
-        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
     };
+    assert(inet_pton(AF_INET, "10.0.2.15", &bind_address.sin_addr) == 1);
     assert(bind(fd, (const struct sockaddr *)&bind_address,
                 sizeof(bind_address)) == 0);
     address_length = sizeof(local);
     assert(getsockname(fd, (struct sockaddr *)&local, &address_length) == 0);
-    assert(local.sin_addr.s_addr == htonl(INADDR_LOOPBACK));
+    assert(local.sin_addr.s_addr == inet_addr("10.0.2.15"));
     assert(local.sin_port != 0);
     assert(close(fd) == 0);
     return 0;

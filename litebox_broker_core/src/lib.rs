@@ -40,7 +40,7 @@ pub use policy::{
 };
 use session::ObjectReference;
 pub use session::{BrokerSession, CallerCredential, ObjectRights, SessionId};
-use socket::{BrokerSocketPorts, SocketProvider};
+use socket::{BrokerNetworkConfig, BrokerSocketPorts, SocketProvider};
 
 /// BrokerCore result type.
 pub type Result<T> = core::result::Result<T, BrokerError>;
@@ -116,6 +116,7 @@ pub struct BrokerCore {
     pub(crate) pending_references: Arc<AtomicUsize>,
     pub(crate) reserved_pipe_capacity: Arc<AtomicUsize>,
     pub(crate) reserved_sockets: Arc<AtomicUsize>,
+    pub(crate) network_config: Arc<BrokerNetworkConfig>,
     pub(crate) socket_provider: Arc<dyn SocketProvider>,
     pub(crate) socket_ports: BrokerSocketPorts,
 }
@@ -137,6 +138,7 @@ impl BrokerCore {
         BROKER_CORE_CREATED
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| BrokerError::BrokerCoreAlreadyExists)?;
+        let network_config = socket_provider.network_config();
 
         Ok(Self {
             policy: Arc::new(policy),
@@ -147,6 +149,7 @@ impl BrokerCore {
             pending_references: Arc::new(AtomicUsize::new(0)),
             reserved_pipe_capacity: Arc::new(AtomicUsize::new(0)),
             reserved_sockets: Arc::new(AtomicUsize::new(0)),
+            network_config,
             socket_provider,
             socket_ports: BrokerSocketPorts::default(),
         })
@@ -156,6 +159,12 @@ impl BrokerCore {
     #[must_use]
     pub const fn limits(&self) -> BrokerCoreLimits {
         self.limits
+    }
+
+    /// Returns the immutable broker-wide network configuration.
+    #[must_use]
+    pub fn network_config(&self) -> Arc<BrokerNetworkConfig> {
+        Arc::clone(&self.network_config)
     }
 
     pub(crate) fn allocate_reference_handle(&self) -> Result<ObjectHandle> {

@@ -93,16 +93,16 @@ int main(void) {
     assert(listener >= 0);
     struct sockaddr_in local = {
         .sin_family = AF_INET,
-        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
         .sin_port = 0,
     };
+    assert(inet_pton(AF_INET, "10.0.2.15", &local.sin_addr) == 1);
     assert(bind(listener, (const struct sockaddr *)&local, sizeof(local)) == 0);
     assert(listen(listener, 8) == 0);
     assert(shutdown(listener, SHUT_WR) == 0);
     socklen_t length = sizeof(local);
     assert(getsockname(listener, (struct sockaddr *)&local, &length) == 0);
     assert(length == sizeof(local));
-    assert(local.sin_addr.s_addr == htonl(INADDR_LOOPBACK));
+    assert(local.sin_addr.s_addr == inet_addr("10.0.2.15"));
     assert(local.sin_port != 0);
 
     assert(accept(listener, NULL, NULL) == -1);

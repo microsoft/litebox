@@ -4,6 +4,8 @@
 //! Broker authority for socket policy, guest-visible endpoints, and platform
 //! lifecycle.
 
+mod network;
+
 use alloc::{sync::Arc, vec::Vec};
 use core::net::{Ipv4Addr, SocketAddrV4};
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -23,11 +25,15 @@ use crate::readiness::{ReadinessRegistration, ReadinessSink};
 use crate::session::{ObjectEntry, ObjectRights};
 use crate::{BrokerError, BrokerSession, Result, SessionId};
 
-const DEFAULT_TCP_LISTEN_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
-const DEFAULT_TCP_LOCAL_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
-const DEFAULT_UDP_BIND_POLICY_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
-const DEFAULT_UDP_LOCAL_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
+pub use network::{BrokerNetworkConfig, GuestSocketBinding, SocketDestination};
+
+const DEFAULT_LISTEN_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
+const DEFAULT_UNCONNECTED_UDP_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
 const FIRST_EPHEMERAL_PORT: u16 = 49152;
+
+fn default_connected_address(network_config: &BrokerNetworkConfig) -> SocketAddrV4 {
+    SocketAddrV4::new(network_config.guest_ipv4_address(), 0)
+}
 
 #[derive(Default)]
 struct BrokerSocketPortState {
@@ -199,6 +205,9 @@ pub struct PlatformDatagramReceive {
 /// and accounting domains, not separate provider namespaces. Operations on an
 /// individual socket belong to [`PlatformSocket`], not this shared provider.
 pub trait SocketProvider: Send + Sync {
+    /// Returns the immutable network identity shared with broker core.
+    fn network_config(&self) -> Arc<BrokerNetworkConfig>;
+
     /// Creates one nonblocking socket resource for a broker session.
     ///
     /// Any provider-retained clones must become inert when
@@ -239,7 +248,7 @@ pub trait PlatformSocket: Send + Sync {
     /// UDP bind may be entirely logical and need not allocate a native socket.
     /// A failed outcome or broker error must leave the socket unbound and
     /// retryable.
-    fn bind(&self, address: SocketAddrV4) -> Result<SocketOutcome<SocketAddrV4>>;
+    fn bind(&self, binding: GuestSocketBinding) -> Result<SocketOutcome<SocketAddrV4>>;
 
     /// Starts a TCP listener and returns its unchanged guest-visible address.
     fn listen(&self, backlog: u32) -> Result<SocketOutcome<SocketAddrV4>>;
@@ -265,7 +274,7 @@ pub trait PlatformSocket: Send + Sync {
     /// during teardown.
     fn connect(
         &self,
-        address: SocketAddrV4,
+        destination: SocketDestination,
     ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError>;
 
     /// Sends bytes without waiting for platform readiness.
@@ -284,7 +293,7 @@ pub trait PlatformSocket: Send + Sync {
         &self,
         data: Vec<u8>,
         flags: SendFlags,
-        destination: Option<SocketAddrV4>,
+        destination: Option<SocketDestination>,
     ) -> Result<SocketOutcome<usize>>;
 
     /// Receives bytes without waiting for platform readiness.
@@ -346,9 +355,29 @@ pub trait PlatformSocket: Send + Sync {
 }
 
 /// Provider for broker configurations that deliberately disable sockets.
-pub struct UnsupportedSocketProvider;
+pub struct UnsupportedSocketProvider {
+    network_config: Arc<BrokerNetworkConfig>,
+}
+
+impl UnsupportedSocketProvider {
+    /// Creates a provider that rejects sockets while retaining shared config.
+    #[must_use]
+    pub fn new(network_config: Arc<BrokerNetworkConfig>) -> Self {
+        Self { network_config }
+    }
+}
+
+impl Default for UnsupportedSocketProvider {
+    fn default() -> Self {
+        Self::new(Arc::new(BrokerNetworkConfig::default()))
+    }
+}
 
 impl SocketProvider for UnsupportedSocketProvider {
+    fn network_config(&self) -> Arc<BrokerNetworkConfig> {
+        Arc::clone(&self.network_config)
+    }
+
     fn create(
         &self,
         _session_id: SessionId,
@@ -423,6 +452,10 @@ pub fn connect(
         };
         socket.create_request
     };
+    let destination = match session.core.network_config.classify_destination(address) {
+        Ok(destination) => destination,
+        Err(error) => return Ok(SocketOutcome::Failed(error)),
+    };
 
     // Destination denial is an operation-level socket failure. Failures while
     // evaluating policy remain broker errors.
@@ -430,6 +463,7 @@ pub fn connect(
         session.caller_credential,
         create_request,
         address,
+        &session.core.network_config,
     ) {
         Ok(()) => {}
         Err(BrokerError::PolicyDenied) => {
@@ -439,7 +473,7 @@ pub fn connect(
     }
 
     if is_udp(create_request) {
-        return connect_datagram(session, &object, create_request, address);
+        return connect_datagram(session, &object, create_request, destination);
     }
 
     let (resource, needs_bind) = {
@@ -466,7 +500,8 @@ pub fn connect(
         match session.core.policy.authorize_socket_bind(
             session.caller_credential,
             create_request,
-            DEFAULT_TCP_LOCAL_ADDRESS,
+            default_connected_address(&session.core.network_config),
+            &session.core.network_config,
         ) {
             Ok(()) => {}
             Err(BrokerError::PolicyDenied) => {
@@ -482,7 +517,7 @@ pub fn connect(
             session,
             create_request,
             &resource,
-            DEFAULT_TCP_LOCAL_ADDRESS,
+            default_connected_address(&session.core.network_config),
         ) {
             Ok(binding) => binding,
             Err(error) => {
@@ -505,7 +540,14 @@ pub fn connect(
             }
         }
     }
-    let status = match resource.connect(address) {
+    {
+        let mut object = object.write();
+        let ObjectEntry::Socket(socket) = &mut *object else {
+            return Err(BrokerError::InvalidRights);
+        };
+        socket.stream_connect_attempted = true;
+    }
+    let status = match resource.connect(destination) {
         Ok(SocketConnectionStatus::Unconnected) => {
             finish_retired_connect(&object);
             resource.retire();
@@ -526,7 +568,7 @@ pub fn connect(
     Ok(SocketOutcome::Completed(status))
 }
 
-/// Binds a socket to an authorized loopback address.
+/// Binds a socket to the guest wildcard or configured private address.
 pub fn bind(
     session: &BrokerSession,
     handle: ObjectHandle,
@@ -556,6 +598,7 @@ pub fn bind(
         session.caller_credential,
         create_request,
         address,
+        &session.core.network_config,
     ) {
         Ok(()) => {}
         Err(BrokerError::PolicyDenied) => {
@@ -567,22 +610,22 @@ pub fn bind(
             return Err(error);
         }
     }
-    let outcome = if guest_transport(create_request).is_some() {
-        match reserve_and_bind(session, create_request, &resource, address) {
-            Ok(ReserveAndBindOutcome::Completed(local_address, reservation)) => {
-                finish_configuration(&object, Some(local_address), Some(reservation), false)?;
-                return Ok(SocketOutcome::Completed(local_address));
-            }
-            Ok(ReserveAndBindOutcome::Failed(error)) => Ok(SocketOutcome::Failed(error)),
-            Ok(ReserveAndBindOutcome::Retired) => {
-                finish_retired_configuration(&object, None, None)?;
-                resource.retire();
-                return Err(BrokerError::Internal);
-            }
-            Err(error) => Err(error),
+    if guest_transport(create_request).is_none() {
+        finish_configuration(&object, None, None, false)?;
+        return Err(BrokerError::Internal);
+    }
+    let outcome = match reserve_and_bind(session, create_request, &resource, address) {
+        Ok(ReserveAndBindOutcome::Completed(local_address, reservation)) => {
+            finish_configuration(&object, Some(local_address), Some(reservation), false)?;
+            return Ok(SocketOutcome::Completed(local_address));
         }
-    } else {
-        resource.bind(address)
+        Ok(ReserveAndBindOutcome::Failed(error)) => Ok(SocketOutcome::Failed(error)),
+        Ok(ReserveAndBindOutcome::Retired) => {
+            finish_retired_configuration(&object, None, None)?;
+            resource.retire();
+            return Err(BrokerError::Internal);
+        }
+        Err(error) => Err(error),
     };
     match outcome {
         Ok(SocketOutcome::Completed(local_address)) => {
@@ -641,7 +684,8 @@ pub fn listen(
         match session.core.policy.authorize_socket_bind(
             session.caller_credential,
             create_request,
-            DEFAULT_TCP_LISTEN_ADDRESS,
+            DEFAULT_LISTEN_ADDRESS,
+            &session.core.network_config,
         ) {
             Ok(()) => {}
             Err(BrokerError::PolicyDenied) => {
@@ -653,18 +697,14 @@ pub fn listen(
                 return Err(error);
             }
         }
-        let binding = match reserve_and_bind(
-            session,
-            create_request,
-            &resource,
-            DEFAULT_TCP_LISTEN_ADDRESS,
-        ) {
-            Ok(binding) => binding,
-            Err(error) => {
-                finish_configuration(&object, None, None, false)?;
-                return Err(error);
-            }
-        };
+        let binding =
+            match reserve_and_bind(session, create_request, &resource, DEFAULT_LISTEN_ADDRESS) {
+                Ok(binding) => binding,
+                Err(error) => {
+                    finish_configuration(&object, None, None, false)?;
+                    return Err(error);
+                }
+            };
         match binding {
             ReserveAndBindOutcome::Completed(address, reservation) => {
                 local_address = Some(address);
@@ -756,6 +796,11 @@ pub fn accept(
         }
     };
     resource.platform_socket.call_once(|| accepted.socket);
+    let local_address = session
+        .core
+        .network_config
+        .canonical_guest_address(local_address)
+        .ok_or(BrokerError::Internal)?;
     let accepted_socket = SocketObject::new_connected(resource, create_request, local_address);
     let handle = reference.commit(ObjectEntry::Socket(accepted_socket))?;
     Ok(SocketOutcome::Completed(AcceptedBrokerSocket {
@@ -817,11 +862,23 @@ pub fn send_to(
         };
         socket.create_request
     };
+    let destination = match destination {
+        Some(destination) => match session
+            .core
+            .network_config
+            .classify_destination(destination)
+        {
+            Ok(destination) => Some(destination),
+            Err(error) => return Ok(SocketOutcome::Failed(error)),
+        },
+        None => None,
+    };
     if let Some(destination) = destination {
         match session.core.policy.authorize_socket_connect(
             session.caller_credential,
             create_request,
-            destination,
+            destination.requested(),
+            &session.core.network_config,
         ) {
             Ok(()) => {}
             Err(BrokerError::PolicyDenied) => {
@@ -857,7 +914,8 @@ pub fn send_to(
         match session.core.policy.authorize_socket_bind(
             session.caller_credential,
             create_request,
-            DEFAULT_UDP_BIND_POLICY_ADDRESS,
+            DEFAULT_UNCONNECTED_UDP_ADDRESS,
+            &session.core.network_config,
         ) {
             Ok(()) => {}
             Err(BrokerError::PolicyDenied) => {
@@ -873,7 +931,7 @@ pub fn send_to(
             session,
             create_request,
             &resource,
-            DEFAULT_UDP_LOCAL_ADDRESS,
+            DEFAULT_UNCONNECTED_UDP_ADDRESS,
         ) {
             Ok(ReserveAndBindOutcome::Completed(local_address, reservation)) => {
                 finish_configuration(&object, Some(local_address), Some(reservation), false)?;
@@ -1101,15 +1159,18 @@ pub fn status(session: &BrokerSession, handle: ObjectHandle) -> Result<SocketSta
     };
 
     if datagram {
-        datagram_status(&object)
+        datagram_status(&object, &session.core.network_config)
     } else {
-        stream_status(&object)
+        stream_status(&object, &session.core.network_config)
     }
 }
 
 /// Reconciles broker stream state with an asynchronous platform connection.
-fn stream_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusResponse> {
-    let (resource, status, local_address, connect_in_flight) = {
+fn stream_status(
+    object: &spin::RwLock<ObjectEntry>,
+    network_config: &BrokerNetworkConfig,
+) -> Result<SocketStatusResponse> {
+    let (resource, status, local_address, connect_in_flight, stream_connect_attempted) = {
         let object = object.read();
         let ObjectEntry::Socket(socket) = &*object else {
             return Err(BrokerError::InvalidRights);
@@ -1119,12 +1180,13 @@ fn stream_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRespo
             socket.connection_status,
             socket.local_address,
             socket.connect_in_flight,
+            socket.stream_connect_attempted,
         )
     };
     if connect_in_flight {
         return Ok(SocketStatusResponse {
             status: SocketConnectionStatus::Connecting,
-            local_address: None,
+            local_address: project_local_address(network_config, local_address, true)?,
             pending_error: None,
         });
     }
@@ -1134,7 +1196,11 @@ fn stream_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRespo
     ) {
         return Ok(SocketStatusResponse {
             status,
-            local_address,
+            local_address: project_local_address(
+                network_config,
+                local_address,
+                stream_connect_attempted,
+            )?,
             pending_error: None,
         });
     }
@@ -1149,20 +1215,37 @@ fn stream_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRespo
     {
         return Err(BrokerError::Internal);
     }
-    socket.local_address = socket.local_address.or(response.local_address);
-    response.local_address = socket.local_address;
+    if !platform_local_address_is_valid(
+        network_config,
+        socket.local_address,
+        response.local_address,
+    ) {
+        socket.connection_status = SocketConnectionStatus::Failed(SocketError::Other);
+        socket.resource_retired = true;
+        drop(object);
+        resource.retire();
+        return Err(BrokerError::Internal);
+    }
     if socket.connection_status == SocketConnectionStatus::Connecting {
         socket.connection_status = response.status;
     } else {
         // Another status call reached a terminal state while this platform query was in flight.
         response.status = socket.connection_status;
     }
+    response.local_address = project_local_address(
+        network_config,
+        socket.local_address,
+        socket.stream_connect_attempted,
+    )?;
     Ok(response)
 }
 
 /// Queries datagram errors and address refinement without surrendering the
 /// broker-owned peer state to a potentially stale platform snapshot.
-fn datagram_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusResponse> {
+fn datagram_status(
+    object: &spin::RwLock<ObjectEntry>,
+    network_config: &BrokerNetworkConfig,
+) -> Result<SocketStatusResponse> {
     let (
         resource,
         status,
@@ -1187,7 +1270,11 @@ fn datagram_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRes
     if configuration_in_flight || resource_retired {
         return Ok(SocketStatusResponse {
             status,
-            local_address,
+            local_address: project_local_address(
+                network_config,
+                local_address,
+                status == SocketConnectionStatus::Connected,
+            )?,
             pending_error: None,
         });
     }
@@ -1209,7 +1296,11 @@ fn datagram_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRes
         if resource_retired {
             return Ok(SocketStatusResponse {
                 status,
-                local_address,
+                local_address: project_local_address(
+                    network_config,
+                    local_address,
+                    status == SocketConnectionStatus::Connected,
+                )?,
                 pending_error: None,
             });
         }
@@ -1227,15 +1318,19 @@ fn datagram_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRes
         }
         if socket.configuration_in_flight {
             response.status = socket.connection_status;
-            response.local_address = socket.local_address;
+            response.local_address = project_local_address(
+                network_config,
+                socket.local_address,
+                socket.connection_status == SocketConnectionStatus::Connected,
+            )?;
             response.pending_error = pending_error;
             return Ok(response);
         }
-        let invalid_local_address = match (socket.local_address, response.local_address) {
-            (None, Some(_)) => true,
-            (Some(reserved), Some(platform)) => reserved.port() != platform.port(),
-            _ => false,
-        };
+        let invalid_local_address = !platform_local_address_is_valid(
+            network_config,
+            socket.local_address,
+            response.local_address,
+        );
         if invalid_local_address {
             socket.configuration_in_flight = false;
             socket.connection_status = SocketConnectionStatus::Failed(SocketError::Other);
@@ -1262,13 +1357,19 @@ fn datagram_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRes
             // Do not let an unordered platform snapshot overwrite newer
             // broker observations.
             response.status = socket.connection_status;
-            socket.local_address = socket.local_address.or(response.local_address);
-            response.local_address = socket.local_address;
+            response.local_address = project_local_address(
+                network_config,
+                socket.local_address,
+                socket.connection_status == SocketConnectionStatus::Connected,
+            )?;
             response.pending_error = pending_error;
             return Ok(response);
         }
-        socket.local_address = response.local_address.or(socket.local_address);
-        response.local_address = socket.local_address;
+        response.local_address = project_local_address(
+            network_config,
+            socket.local_address,
+            socket.connection_status == SocketConnectionStatus::Connected,
+        )?;
         response.pending_error = pending_error;
         response.status = socket.connection_status;
         return Ok(response);
@@ -1312,6 +1413,38 @@ fn socket_state(
     ))
 }
 
+fn platform_local_address_is_valid(
+    network_config: &BrokerNetworkConfig,
+    reserved: Option<SocketAddrV4>,
+    platform: Option<SocketAddrV4>,
+) -> bool {
+    match (reserved, platform) {
+        (None | Some(_), None) => true,
+        (None, Some(_)) => false,
+        (Some(reserved), Some(platform)) => {
+            platform == reserved
+                || network_config.canonical_guest_address(reserved) == Some(platform)
+        }
+    }
+}
+
+fn project_local_address(
+    network_config: &BrokerNetworkConfig,
+    reserved: Option<SocketAddrV4>,
+    concrete_identity: bool,
+) -> Result<Option<SocketAddrV4>> {
+    if !concrete_identity {
+        return Ok(reserved);
+    }
+    reserved
+        .map(|address| {
+            network_config
+                .canonical_guest_address(address)
+                .ok_or(BrokerError::Internal)
+        })
+        .transpose()
+}
+
 enum ReserveAndBindOutcome {
     Completed(SocketAddrV4, GuestPortReservation),
     Failed(SocketError),
@@ -1332,7 +1465,9 @@ fn reserve_and_bind(
         SocketOutcome::Completed(binding) => binding,
         SocketOutcome::Failed(error) => return Ok(ReserveAndBindOutcome::Failed(error)),
     };
-    match resource.bind(local_address)? {
+    let binding = GuestSocketBinding::new(&session.core.network_config, local_address)
+        .ok_or(BrokerError::Internal)?;
+    match resource.bind(binding)? {
         SocketOutcome::Completed(bound_address) if bound_address == local_address => {
             Ok(ReserveAndBindOutcome::Completed(local_address, reservation))
         }
@@ -1345,7 +1480,7 @@ fn connect_datagram(
     session: &BrokerSession,
     object: &spin::RwLock<ObjectEntry>,
     create_request: CreateSocketRequest,
-    address: SocketAddrV4,
+    destination: SocketDestination,
 ) -> Result<SocketOutcome<SocketConnectionStatus>> {
     let (resource, previous_status, needs_bind) = {
         let mut object = object.write();
@@ -1369,7 +1504,8 @@ fn connect_datagram(
         match session.core.policy.authorize_socket_bind(
             session.caller_credential,
             create_request,
-            DEFAULT_UDP_BIND_POLICY_ADDRESS,
+            default_connected_address(&session.core.network_config),
+            &session.core.network_config,
         ) {
             Ok(()) => {}
             Err(BrokerError::PolicyDenied) => {
@@ -1385,7 +1521,7 @@ fn connect_datagram(
             session,
             create_request,
             &resource,
-            DEFAULT_UDP_LOCAL_ADDRESS,
+            default_connected_address(&session.core.network_config),
         ) {
             Ok(binding) => binding,
             Err(error) => {
@@ -1408,7 +1544,7 @@ fn connect_datagram(
             }
         }
     }
-    match resource.connect(address) {
+    match resource.connect(destination) {
         Ok(SocketConnectionStatus::Connected) => {
             finish_datagram_connect(object, SocketConnectionStatus::Connected, true);
             Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
@@ -1628,6 +1764,7 @@ pub(crate) struct SocketObject {
     connection_status: SocketConnectionStatus,
     local_address: Option<SocketAddrV4>,
     connect_in_flight: bool,
+    stream_connect_attempted: bool,
     configuration_in_flight: bool,
     listening: bool,
     datagram_connect_generation: u64,
@@ -1642,6 +1779,7 @@ impl SocketObject {
             connection_status: SocketConnectionStatus::Unconnected,
             local_address: None,
             connect_in_flight: false,
+            stream_connect_attempted: false,
             configuration_in_flight: false,
             listening: false,
             datagram_connect_generation: 0,
@@ -1660,6 +1798,7 @@ impl SocketObject {
             connection_status: SocketConnectionStatus::Connected,
             local_address: Some(local_address),
             connect_in_flight: false,
+            stream_connect_attempted: true,
             configuration_in_flight: false,
             listening: false,
             datagram_connect_generation: 0,
@@ -1701,13 +1840,13 @@ impl SocketResource {
 
     fn connect(
         &self,
-        address: SocketAddrV4,
+        destination: SocketDestination,
     ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
-        self.platform_socket().connect(address)
+        self.platform_socket().connect(destination)
     }
 
-    fn bind(&self, address: SocketAddrV4) -> Result<SocketOutcome<SocketAddrV4>> {
-        self.platform_socket().bind(address)
+    fn bind(&self, binding: GuestSocketBinding) -> Result<SocketOutcome<SocketAddrV4>> {
+        self.platform_socket().bind(binding)
     }
 
     fn listen(&self, backlog: u32) -> Result<SocketOutcome<SocketAddrV4>> {
@@ -1733,7 +1872,7 @@ impl SocketResource {
         &self,
         data: Vec<u8>,
         flags: SendFlags,
-        destination: Option<SocketAddrV4>,
+        destination: Option<SocketDestination>,
     ) -> Result<SocketOutcome<usize>> {
         self.platform_socket().send_to(data, flags, destination)
     }
@@ -1870,46 +2009,58 @@ pub(crate) mod tests {
     #[test]
     fn guest_transport_port_namespaces_are_broker_wide_and_independent() {
         let ports = BrokerSocketPorts::default();
-        let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 80);
+        let wildcard_address = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 80);
+        let guest_address =
+            SocketAddrV4::new(BrokerNetworkConfig::default().guest_ipv4_address(), 80);
 
         let SocketOutcome::Completed((_, first_reservation)) =
-            ports.reserve(create_request(), address).unwrap()
+            ports.reserve(create_request(), wildcard_address).unwrap()
         else {
             panic!("first TCP reservation failed");
         };
         assert!(matches!(
-            ports.reserve(create_request(), address),
+            ports.reserve(create_request(), guest_address),
             Ok(SocketOutcome::Failed(SocketError::AddressInUse))
         ));
         let SocketOutcome::Completed((_, udp_reservation)) =
-            ports.reserve(create_udp_request(), address).unwrap()
+            ports.reserve(create_udp_request(), guest_address).unwrap()
         else {
             panic!("UDP reservation must be independent from TCP");
         };
         assert!(matches!(
-            ports.reserve(create_udp_request(), address),
+            ports.reserve(create_udp_request(), wildcard_address),
             Ok(SocketOutcome::Failed(SocketError::AddressInUse))
         ));
 
         drop(first_reservation);
         assert!(matches!(
-            ports.reserve(create_request(), address),
+            ports.reserve(create_request(), guest_address),
             Ok(SocketOutcome::Completed(_))
         ));
         assert!(matches!(
-            ports.reserve(create_udp_request(), address),
+            ports.reserve(create_udp_request(), wildcard_address),
             Ok(SocketOutcome::Failed(SocketError::AddressInUse))
         ));
         drop(udp_reservation);
         assert!(matches!(
-            ports.reserve(create_udp_request(), address),
+            ports.reserve(create_udp_request(), wildcard_address),
             Ok(SocketOutcome::Completed(_))
         ));
     }
 
-    #[derive(Clone, Default)]
+    #[derive(Clone)]
     pub(crate) struct TestSocketProvider {
+        network_config: Arc<BrokerNetworkConfig>,
         state: Arc<TestSocketState>,
+    }
+
+    impl Default for TestSocketProvider {
+        fn default() -> Self {
+            Self {
+                network_config: Arc::new(BrokerNetworkConfig::default()),
+                state: Arc::new(TestSocketState::default()),
+            }
+        }
     }
 
     #[derive(Default)]
@@ -1918,6 +2069,8 @@ pub(crate) mod tests {
         closed_sessions: StdMutex<std::vec::Vec<SessionId>>,
         sent: StdMutex<std::vec::Vec<u8>>,
         connect_calls: AtomicUsize,
+        connect_destinations: StdMutex<std::vec::Vec<SocketDestination>>,
+        connect_block: StdMutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
         status_calls: AtomicUsize,
         status_responses: StdMutex<std::collections::VecDeque<SocketStatusResponse>>,
         status_block: StdMutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
@@ -1977,6 +2130,10 @@ pub(crate) mod tests {
     }
 
     impl SocketProvider for TestSocketProvider {
+        fn network_config(&self) -> Arc<BrokerNetworkConfig> {
+            Arc::clone(&self.network_config)
+        }
+
         fn create(
             &self,
             session_id: SessionId,
@@ -2032,7 +2189,8 @@ pub(crate) mod tests {
     }
 
     impl PlatformSocket for TestPlatformSocket {
-        fn bind(&self, address: SocketAddrV4) -> Result<SocketOutcome<SocketAddrV4>> {
+        fn bind(&self, binding: GuestSocketBinding) -> Result<SocketOutcome<SocketAddrV4>> {
+            let address = binding.requested();
             self.state.binds.lock().unwrap().push(address);
             if is_tcp(self.create_request) {
                 let bound_address = if self
@@ -2085,9 +2243,19 @@ pub(crate) mod tests {
 
         fn connect(
             &self,
-            _address: SocketAddrV4,
+            destination: SocketDestination,
         ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
             self.state.connect_calls.fetch_add(1, Ordering::Relaxed);
+            self.state
+                .connect_destinations
+                .lock()
+                .unwrap()
+                .push(destination);
+            let connect_block = self.state.connect_block.lock().unwrap().take();
+            if let Some((started, release)) = connect_block {
+                started.send(()).unwrap();
+                release.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
             if self.state.fail_connect.swap(false, Ordering::Relaxed) {
                 return Err(PlatformConnectError::PeerUnchanged(BrokerError::Internal));
             }
@@ -2126,7 +2294,7 @@ pub(crate) mod tests {
             &self,
             data: Vec<u8>,
             _flags: SendFlags,
-            _destination: Option<SocketAddrV4>,
+            _destination: Option<SocketDestination>,
         ) -> Result<SocketOutcome<usize>> {
             self.state.sent.lock().unwrap().extend_from_slice(&data);
             Ok(SocketOutcome::Completed(data.len()))
@@ -2230,7 +2398,7 @@ pub(crate) mod tests {
         check_socket_operations_and_policy(broker, provider);
         check_tcp_option_state_is_per_socket(broker);
         check_udp_socket_operations(broker, provider);
-        check_udp_status_rejects_changed_reserved_port(broker, provider);
+        check_udp_status_rejects_invalid_local_address(broker, provider);
         check_concurrent_udp_status_does_not_regress_connection(broker, provider);
         check_server_socket_operations(broker, provider);
         check_failed_listener_shutdown_preserves_state(broker, provider);
@@ -2327,7 +2495,7 @@ pub(crate) mod tests {
             .unwrap();
         let readiness = Arc::new(TestReadinessSink::default());
         let retired_before = provider.state.retired_sockets.load(Ordering::Relaxed);
-        let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 42000);
+        let address = SocketAddrV4::new(broker.network_config.guest_ipv4_address(), 42000);
 
         let invalid = create(&first_session, create_request(), readiness.clone()).unwrap();
         provider.return_invalid_bind_address_once();
@@ -2415,14 +2583,15 @@ pub(crate) mod tests {
             Arc::new(TestReadinessSink::default()),
         )
         .unwrap();
-        let original_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 42001);
+        let original_address = SocketAddrV4::new(broker.network_config.guest_ipv4_address(), 42001);
         assert_eq!(
             bind(&session, handle, original_address),
             Ok(SocketOutcome::Completed(original_address))
         );
 
         let duplicate_ports = BrokerSocketPorts::default();
-        let duplicate_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 42002);
+        let duplicate_address =
+            SocketAddrV4::new(broker.network_config.guest_ipv4_address(), 42002);
         let SocketOutcome::Completed((duplicate_address, duplicate_reservation)) = duplicate_ports
             .reserve(create_request(), duplicate_address)
             .unwrap()
@@ -2477,6 +2646,23 @@ pub(crate) mod tests {
         assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 1);
         assert_eq!(session.reserved_sockets.load(Ordering::Relaxed), 1);
         assert_eq!(status(&other, handle), Err(BrokerError::UnknownObject));
+        let connect_calls = provider.state.connect_calls.load(Ordering::Relaxed);
+        assert_eq!(
+            connect(
+                &session,
+                handle,
+                SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 80),
+            ),
+            Ok(SocketOutcome::Failed(SocketError::InvalidArgument))
+        );
+        assert_eq!(
+            connect(&session, handle, SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),),
+            Ok(SocketOutcome::Failed(SocketError::InvalidArgument))
+        );
+        assert_eq!(
+            provider.state.connect_calls.load(Ordering::Relaxed),
+            connect_calls
+        );
         assert_eq!(
             connect(
                 &session,
@@ -2496,6 +2682,12 @@ pub(crate) mod tests {
         assert_eq!(
             connect(&session, handle, loopback_address()),
             Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting))
+        );
+        assert_eq!(
+            provider.state.connect_destinations.lock().unwrap().last(),
+            Some(&SocketDestination::External {
+                requested: loopback_address()
+            })
         );
         let local_address = *provider
             .state
@@ -2666,6 +2858,25 @@ pub(crate) mod tests {
             send_to(&session, handle, b"x".to_vec(), SendFlags::NONE, None),
             Ok(SocketOutcome::Failed(SocketError::NotConnected))
         );
+        let binds_before = provider.state.binds.lock().unwrap().len();
+        let sent_before = provider.state.sent.lock().unwrap().len();
+        for invalid in [
+            SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 53),
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+        ] {
+            assert_eq!(
+                send_to(
+                    &session,
+                    handle,
+                    b"x".to_vec(),
+                    SendFlags::NONE,
+                    Some(invalid),
+                ),
+                Ok(SocketOutcome::Failed(SocketError::InvalidArgument))
+            );
+        }
+        assert_eq!(provider.state.binds.lock().unwrap().len(), binds_before);
+        assert_eq!(provider.state.sent.lock().unwrap().len(), sent_before);
         assert_eq!(
             send_to(
                 &session,
@@ -2796,7 +3007,7 @@ pub(crate) mod tests {
         );
     }
 
-    fn check_udp_status_rejects_changed_reserved_port(
+    fn check_udp_status_rejects_invalid_local_address(
         broker: &BrokerCore,
         provider: &TestSocketProvider,
     ) {
@@ -2831,13 +3042,74 @@ pub(crate) mod tests {
         );
         session.close_object_reference(unbound).unwrap();
 
+        let wrong_address = create(
+            &session,
+            create_udp_request(),
+            Arc::new(TestReadinessSink::default()),
+        )
+        .unwrap();
+        assert_eq!(
+            send_to(
+                &session,
+                wrong_address,
+                b"x".to_vec(),
+                SendFlags::NONE,
+                Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 53)),
+            ),
+            Ok(SocketOutcome::Completed(1))
+        );
+        let reserved_address = *provider
+            .state
+            .binds
+            .lock()
+            .unwrap()
+            .last()
+            .expect("automatic UDP bind was not recorded");
+        provider
+            .state
+            .status_responses
+            .lock()
+            .unwrap()
+            .push_back(SocketStatusResponse {
+                status: SocketConnectionStatus::Unconnected,
+                local_address: Some(SocketAddrV4::new(
+                    broker.network_config.guest_ipv4_address(),
+                    reserved_address.port(),
+                )),
+                pending_error: None,
+            });
+        assert_eq!(
+            status(&session, wrong_address),
+            Ok(SocketStatusResponse {
+                status: SocketConnectionStatus::Unconnected,
+                local_address: Some(reserved_address),
+                pending_error: None,
+            })
+        );
+        provider
+            .state
+            .status_responses
+            .lock()
+            .unwrap()
+            .push_back(SocketStatusResponse {
+                status: SocketConnectionStatus::Unconnected,
+                local_address: Some(SocketAddrV4::new(
+                    Ipv4Addr::LOCALHOST,
+                    reserved_address.port(),
+                )),
+                pending_error: None,
+            });
+        let retired_before = provider.state.retired_sockets.load(Ordering::Relaxed);
+        assert_eq!(status(&session, wrong_address), Err(BrokerError::Internal));
+        assert_eq!(
+            provider.state.retired_sockets.load(Ordering::Relaxed),
+            retired_before + 1
+        );
+        session.close_object_reference(wrong_address).unwrap();
+
         let handle = create(
             &session,
-            CreateSocketRequest {
-                address_family: AddressFamily::Ipv4,
-                socket_type: SocketType::Datagram,
-                protocol: IpProtocol::Udp,
-            },
+            create_udp_request(),
             Arc::new(TestReadinessSink::default()),
         )
         .unwrap();
@@ -2851,7 +3123,13 @@ pub(crate) mod tests {
             ),
             Ok(SocketOutcome::Completed(1))
         );
-        let reserved_address = status(&session, handle).unwrap().local_address.unwrap();
+        let reserved_address = *provider
+            .state
+            .binds
+            .lock()
+            .unwrap()
+            .last()
+            .expect("automatic UDP bind was not recorded");
         let changed_port = if reserved_address.port() == u16::MAX {
             reserved_address.port() - 1
         } else {
@@ -2864,7 +3142,10 @@ pub(crate) mod tests {
             .unwrap()
             .push_back(SocketStatusResponse {
                 status: SocketConnectionStatus::Unconnected,
-                local_address: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, changed_port)),
+                local_address: Some(SocketAddrV4::new(
+                    broker.network_config.guest_ipv4_address(),
+                    changed_port,
+                )),
                 pending_error: None,
             });
         let retired_before = provider.state.retired_sockets.load(Ordering::Relaxed);
@@ -2909,18 +3190,26 @@ pub(crate) mod tests {
         let non_loopback = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 8080);
         let binds_before = provider.state.binds.lock().unwrap().len();
         assert_eq!(
+            bind(&session, listener, loopback_address()),
+            Ok(SocketOutcome::Failed(SocketError::PolicyDenied))
+        );
+        assert_eq!(provider.state.binds.lock().unwrap().len(), binds_before);
+        assert_eq!(
             bind(&session, listener, non_loopback),
             Ok(SocketOutcome::Failed(SocketError::PolicyDenied))
         );
         assert_eq!(provider.state.binds.lock().unwrap().len(), binds_before);
 
-        let requested_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
+        let requested_address = SocketAddrV4::new(broker.network_config.guest_ipv4_address(), 0);
         let SocketOutcome::Completed(local_address) =
             bind(&session, listener, requested_address).unwrap()
         else {
             panic!("guest TCP bind failed");
         };
-        assert!(local_address.ip().is_loopback());
+        assert_eq!(
+            *local_address.ip(),
+            broker.network_config.guest_ipv4_address()
+        );
         assert_ne!(local_address.port(), 0);
         assert_eq!(
             status(&session, listener),
@@ -3063,9 +3352,8 @@ pub(crate) mod tests {
         assert_eq!(stale.local_address, Some(local_address));
         assert_eq!(stale.pending_error, None);
 
-        let next_local_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, local_address.port());
-        let stale_local_address =
-            SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), local_address.port());
+        let next_local_address = local_address;
+        let stale_local_address = local_address;
         *provider.state.status_responses.lock().unwrap() = std::collections::VecDeque::from([
             SocketStatusResponse {
                 status: SocketConnectionStatus::Unconnected,
@@ -3110,6 +3398,80 @@ pub(crate) mod tests {
             status(&session, handle).unwrap().status,
             SocketConnectionStatus::Connected
         );
+        session.close_object_reference(handle).unwrap();
+
+        let wildcard_bound = create(
+            &session,
+            create_udp_request(),
+            Arc::new(TestReadinessSink::default()),
+        )
+        .unwrap();
+        let SocketOutcome::Completed(wildcard_address) = bind(
+            &session,
+            wildcard_bound,
+            SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
+        )
+        .unwrap() else {
+            panic!("wildcard UDP bind failed");
+        };
+        assert!(wildcard_address.ip().is_unspecified());
+        assert_eq!(
+            connect(&session, wildcard_bound, loopback_address()),
+            Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+        );
+        provider
+            .state
+            .status_responses
+            .lock()
+            .unwrap()
+            .push_back(SocketStatusResponse {
+                status: SocketConnectionStatus::Connected,
+                local_address: None,
+                pending_error: None,
+            });
+        let (status_started_tx, status_started_rx) = mpsc::channel();
+        let (status_release_tx, status_release_rx) = mpsc::channel();
+        *provider.state.status_block.lock().unwrap() = Some((status_started_tx, status_release_rx));
+        let (connect_started_tx, connect_started_rx) = mpsc::channel();
+        let (connect_release_tx, connect_release_rx) = mpsc::channel();
+        *provider.state.connect_block.lock().unwrap() =
+            Some((connect_started_tx, connect_release_rx));
+
+        let status_session = Arc::clone(&session);
+        let in_flight_status =
+            std::thread::spawn(move || status(&status_session, wildcard_bound).unwrap());
+        status_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let connect_session = Arc::clone(&session);
+        let in_flight_connect = std::thread::spawn(move || {
+            connect(
+                &connect_session,
+                wildcard_bound,
+                SocketAddrV4::new(Ipv4Addr::LOCALHOST, 54),
+            )
+        });
+        connect_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        status_release_tx.send(()).unwrap();
+        assert_eq!(
+            in_flight_status.join().unwrap(),
+            SocketStatusResponse {
+                status: SocketConnectionStatus::Connected,
+                local_address: Some(SocketAddrV4::new(
+                    broker.network_config.guest_ipv4_address(),
+                    wildcard_address.port(),
+                )),
+                pending_error: None,
+            }
+        );
+        connect_release_tx.send(()).unwrap();
+        assert_eq!(
+            in_flight_connect.join().unwrap(),
+            Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+        );
+        session.close_object_reference(wildcard_bound).unwrap();
     }
 
     fn check_failed_listener_shutdown_preserves_state(
@@ -3486,7 +3848,7 @@ pub(crate) mod tests {
             .unwrap()
             .last()
             .expect("automatic TCP bind was not recorded");
-        let platform_local_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152);
+        let platform_local_address = local_address;
         *provider.state.status_responses.lock().unwrap() = std::collections::VecDeque::from([
             SocketStatusResponse {
                 status: SocketConnectionStatus::Connecting,
@@ -3558,7 +3920,7 @@ pub(crate) mod tests {
             .unwrap()
             .push_back(SocketStatusResponse {
                 status: SocketConnectionStatus::Failed(SocketError::TimedOut),
-                local_address: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49153)),
+                local_address: Some(local_address),
                 pending_error: None,
             });
 

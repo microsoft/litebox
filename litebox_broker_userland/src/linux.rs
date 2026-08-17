@@ -8,6 +8,7 @@ use std::process::Child;
 use std::sync::Arc;
 use std::time::Instant;
 
+use litebox_broker_core::socket::BrokerNetworkConfig;
 use litebox_broker_core::{BrokerCore, BrokerCoreLimits, ObjectRights, PolicyEngine};
 use litebox_broker_platform_linux_userland::LinuxSocketProvider;
 use litebox_broker_protocol::message::{BrokerRequest, BrokerResponse};
@@ -50,11 +51,17 @@ pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
     let control_listener = UnixListener::bind(&control_socket_path)?;
     control_listener.set_nonblocking(true)?;
     let limits = BrokerCoreLimits::DEFAULT;
+    let network_config = Arc::new(
+        BrokerNetworkConfig::new(args.guest_ipv4_address)
+            .expect("clap validates the guest IPv4 address"),
+    );
     let broker = BrokerCore::new_with_limits(
-        PolicyEngine::with_host_guaranteed_rights(ObjectRights::all())
-            .with_socket_policy(configured_socket_policy(&args.allow_tcp_destination)?),
+        PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()).with_socket_policy(
+            configured_socket_policy(&args.allow_tcp_destination, &network_config)?,
+        ),
         limits,
-        Arc::new(LinuxSocketProvider::new(
+        Arc::new(LinuxSocketProvider::new_with_network_config(
+            Arc::clone(&network_config),
             limits.max_sockets,
             limits.max_sockets_per_session,
         )?),

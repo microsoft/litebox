@@ -5,11 +5,12 @@ use super::*;
 
 #[test]
 fn pending_guest_connections_are_keyed_by_complete_host_tuple() {
+    let guest_ip = guest_ipv4_address();
     let remote_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 40000);
     let first_listener = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
     let second_listener = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5001);
-    let first_guest = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1000);
-    let second_guest = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1001);
+    let first_guest = SocketAddrV4::new(guest_ip, 1000);
+    let second_guest = SocketAddrV4::new(guest_ip, 1001);
     let mut tcp = ReactorTcpState::default();
     for (listener, guest) in [
         (first_listener, first_guest),
@@ -34,7 +35,7 @@ fn pending_guest_connections_are_keyed_by_complete_host_tuple() {
             (remote_address, first_listener),
             PendingGuestTcpConnection {
                 session_id: SessionId(8),
-                guest_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1002),
+                guest_address: SocketAddrV4::new(guest_ip, 1002),
                 listener_id: 1,
                 discard_on_accept: false,
                 discard_until_deadline: false,
@@ -74,7 +75,8 @@ fn pending_guest_connections_are_keyed_by_complete_host_tuple() {
 
 #[test]
 fn tuple_collision_persists_its_discard_marker() {
-    let guest_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
+    let network_config = BrokerNetworkConfig::default();
+    let guest_address = SocketAddrV4::new(network_config.guest_ipv4_address(), 5000);
     let remote_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 40000);
     let host_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 41000);
     let connection = (remote_address, host_address);
@@ -82,7 +84,7 @@ fn tuple_collision_persists_its_discard_marker() {
     let mut tcp = ReactorTcpState::default();
     tcp.insert_binding(ReactorTcpBinding {
         socket_id: 1,
-        guest_address,
+        binding: GuestSocketBinding::new(&network_config, guest_address).unwrap(),
         host_address: Some(host_address),
         listening: true,
         requires_backlog_drain: false,
@@ -145,7 +147,7 @@ fn untracked_guest_connection_cleanup_is_bounded_and_drains_backlog() {
     let (published, publications) = channel();
     let (retired, retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
-    let guest_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8090);
+    let guest_address = guest_address(8090);
     let listener = create_socket(&listener_session, readiness.clone());
     assert_eq!(
         litebox_broker_core::socket::bind(&listener_session, listener, guest_address),
@@ -309,7 +311,7 @@ fn reactor_drives_a_loopback_tcp_socket() {
     let local_address = status
         .local_address
         .expect("connected socket must expose its local address");
-    assert_eq!(*local_address.ip(), Ipv4Addr::LOCALHOST);
+    assert_eq!(*local_address.ip(), guest_ipv4_address());
     assert_ne!(local_address.port(), 0);
     assert_eq!(status.pending_error, None);
     assert_eq!(
@@ -817,7 +819,7 @@ fn accepted_guest_tcp_close_with_unread_data_preserves_reset() {
     let (published, publications) = channel();
     let (retired, retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
-    let guest_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8091);
+    let guest_address = guest_address(8091);
     let listener = create_socket(&listener_session, readiness.clone());
     assert_eq!(
         litebox_broker_core::socket::bind(&listener_session, listener, guest_address),
@@ -903,8 +905,8 @@ fn guest_tcp_namespace_routes_across_sessions_and_hides_private_backend() {
     let shadowed_host_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     shadowed_host_listener.set_nonblocking(true).unwrap();
     let guest_port = shadowed_host_listener.local_addr().unwrap().port();
-    let guest_address = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), guest_port);
-    let guest_destination = SocketAddrV4::new(Ipv4Addr::LOCALHOST, guest_port);
+    let guest_address = guest_address(guest_port);
+    let guest_destination = guest_address;
     let listener = create_socket(&listener_session, readiness.clone());
     assert_eq!(
         litebox_broker_core::socket::bind(&listener_session, listener, guest_address),
@@ -1059,7 +1061,7 @@ fn connector_and_session_teardown_clean_bounded_pending_state() {
     let (published, publications) = channel();
     let (retired, retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
-    let guest_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8082);
+    let guest_address = guest_address(8082);
     let listener = create_socket(&listener_session, readiness.clone());
     assert_eq!(
         litebox_broker_core::socket::bind(&listener_session, listener, guest_address),
@@ -1177,7 +1179,7 @@ fn graceful_connector_close_preserves_late_accept_and_eof() {
     let (published, publications) = channel();
     let (retired, retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
-    let guest_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8089);
+    let guest_address = guest_address(8089);
     let listener = create_socket(&listener_session, readiness.clone());
     assert_eq!(
         litebox_broker_core::socket::bind(&listener_session, listener, guest_address),
@@ -1242,7 +1244,7 @@ fn abortive_connector_close_releases_descriptor_capacity() {
     let (published, publications) = channel();
     let (retired, retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
-    let guest_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8086);
+    let guest_address = guest_address(8086);
     let listener = create_socket(&listener_session, readiness.clone());
     assert_eq!(
         litebox_broker_core::socket::bind(&listener_session, listener, guest_address),
@@ -1325,7 +1327,7 @@ fn accept_bounds_unmatched_private_connections_per_command() {
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
-    let guest_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8087);
+    let guest_address = guest_address(8087);
     let listener = create_socket(&listener_session, readiness.clone());
     assert_eq!(
         litebox_broker_core::socket::bind(&listener_session, listener, guest_address),
@@ -1411,8 +1413,8 @@ fn accept_preserves_a_queued_connection_when_retained_capacity_is_unrelated() {
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
-    let target_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8084);
-    let other_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8085);
+    let target_address = guest_address(8084);
+    let other_address = guest_address(8085);
 
     let target_listener = create_socket(&target_listener_session, readiness.clone());
     let other_listener = create_socket(&other_listener_session, readiness.clone());
@@ -1517,7 +1519,7 @@ fn stop_listening_cleanup_survives_readiness_failure() {
         inner: TestReadinessSink { published, retired },
         fail_next_publish: Mutex::new(None),
     });
-    let guest_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8088);
+    let guest_address = guest_address(8088);
     let listener = create_socket(&listener_session, readiness.clone());
     assert_eq!(
         litebox_broker_core::socket::bind(&listener_session, listener, guest_address),
@@ -1612,8 +1614,9 @@ fn reactor_drives_a_loopback_tcp_listener() {
         SocketOutcome::Completed(address) => address,
         SocketOutcome::Failed(error) => panic!("listen failed: {error:?}"),
     };
-    assert!(local_address.ip().is_loopback());
+    assert!(local_address.ip().is_unspecified());
     assert_ne!(local_address.port(), 0);
+    let listener_guest_address = guest_address(local_address.port());
     let private_address = provider
         .reactor
         .host_address(local_address.port())
@@ -1641,7 +1644,7 @@ fn reactor_drives_a_loopback_tcp_listener() {
     let second_client = create_socket(&session, readiness.clone());
     for client in [first_client, second_client] {
         assert!(matches!(
-            litebox_broker_core::socket::connect(&session, client, local_address),
+            litebox_broker_core::socket::connect(&session, client, listener_guest_address),
             Ok(SocketOutcome::Completed(
                 SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
             ))
@@ -1667,7 +1670,7 @@ fn reactor_drives_a_loopback_tcp_listener() {
             SocketOutcome::Completed(accepted) => accepted,
             SocketOutcome::Failed(error) => panic!("first accept failed: {error:?}"),
         };
-    assert_eq!(first.local_address, local_address);
+    assert_eq!(first.local_address, listener_guest_address);
     assert_eq!(first.remote_address, first_client_address);
     assert!(
         session
@@ -1682,7 +1685,7 @@ fn reactor_drives_a_loopback_tcp_listener() {
             SocketOutcome::Completed(accepted) => accepted,
             SocketOutcome::Failed(error) => panic!("second accept failed: {error:?}"),
         };
-    assert_eq!(second.local_address, local_address);
+    assert_eq!(second.local_address, listener_guest_address);
     assert_eq!(second.remote_address, second_client_address);
     assert!(
         !session

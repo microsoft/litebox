@@ -11,7 +11,7 @@ use std::process::Child;
 use std::sync::Arc;
 use std::time::Instant;
 
-use litebox_broker_core::socket::UnsupportedSocketProvider;
+use litebox_broker_core::socket::{BrokerNetworkConfig, UnsupportedSocketProvider};
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
 use litebox_broker_protocol::message::{BrokerRequest, BrokerResponse};
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
@@ -51,10 +51,15 @@ impl HostAssociationShutdown for WindowsControlRingHostShutdown {
 pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
     let control_pipe = unique_control_pipe_name();
     let control_listener = WindowsNamedPipeListener::bind(&control_pipe)?;
+    let network_config = Arc::new(
+        BrokerNetworkConfig::new(args.guest_ipv4_address)
+            .expect("clap validates the guest IPv4 address"),
+    );
     let broker = BrokerCore::new(
-        PolicyEngine::with_host_guaranteed_rights(ObjectRights::all())
-            .with_socket_policy(configured_socket_policy(&args.allow_tcp_destination)?),
-        Arc::new(UnsupportedSocketProvider),
+        PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()).with_socket_policy(
+            configured_socket_policy(&args.allow_tcp_destination, &network_config)?,
+        ),
+        Arc::new(UnsupportedSocketProvider::new(network_config)),
     )?;
 
     crate::run_runner_process(&args, &control_pipe, |runner, runner_process_id| {

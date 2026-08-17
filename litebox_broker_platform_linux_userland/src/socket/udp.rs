@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::os::fd::OwnedFd;
 
-use litebox_broker_core::socket::PlatformConnectError;
+use litebox_broker_core::socket::{GuestSocketBinding, PlatformConnectError, SocketDestination};
 use litebox_broker_core::{BrokerError, Result as BrokerResult, SessionId};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
@@ -90,12 +90,11 @@ impl ReactorUdpState {
 #[derive(Clone, Copy)]
 pub(super) struct ReactorUdpBinding {
     pub(super) socket_id: u64,
-    pub(super) guest_address: SocketAddrV4,
+    pub(super) binding: GuestSocketBinding,
     pub(super) internal_address: SocketAddrV4,
 }
 
 pub(super) struct UdpSocketState {
-    pub(super) original_bind_was_wildcard: bool,
     pub(super) internal_address: Option<SocketAddrV4>,
     pub(super) peer: Option<ReactorUdpPeer>,
     guest_receive_queue: VecDeque<GuestDatagram>,
@@ -112,7 +111,6 @@ pub(super) struct UdpSocketState {
 impl Default for UdpSocketState {
     fn default() -> Self {
         Self {
-            original_bind_was_wildcard: false,
             internal_address: None,
             peer: None,
             guest_receive_queue: VecDeque::new(),
@@ -210,7 +208,7 @@ impl ReactorUdpState {
     }
 
     pub(super) fn insert_binding(&mut self, binding: ReactorUdpBinding) -> BrokerResult<()> {
-        let guest_port = binding.guest_address.port();
+        let guest_port = binding.binding.requested().port();
         if guest_port == 0 || self.bindings.contains_key(&guest_port) {
             return Err(BrokerError::Internal);
         }
@@ -228,12 +226,8 @@ impl ReactorUdpState {
         }
     }
 
-    fn guest_binding(&self, address: SocketAddrV4) -> Option<ReactorUdpBinding> {
-        address
-            .ip()
-            .is_loopback()
-            .then(|| self.bindings.get(&address.port()).copied())
-            .flatten()
+    fn guest_binding(&self, port: u16) -> Option<ReactorUdpBinding> {
+        self.bindings.get(&port).copied()
     }
 
     pub(super) fn binding_for_socket(&self, socket_id: u64) -> Option<ReactorUdpBinding> {
@@ -243,48 +237,34 @@ impl ReactorUdpState {
             .copied()
     }
 
-    pub(super) fn update_guest_address(
-        &mut self,
-        socket_id: u64,
-        guest_address: SocketAddrV4,
-    ) -> BrokerResult<()> {
-        let binding = self
-            .bindings
-            .values_mut()
-            .find(|binding| binding.socket_id == socket_id)
-            .ok_or(BrokerError::Internal)?;
-        if binding.guest_address.port() != guest_address.port() {
-            return Err(BrokerError::Internal);
-        }
-        binding.guest_address = guest_address;
-        Ok(())
-    }
-
     pub(super) fn is_private_host_port(&self, port: u16) -> bool {
         self.native_endpoints.contains_key(&port)
     }
 }
 
 impl Reactor {
-    /// Resolves a UDP destination with guest bindings taking precedence over
-    /// private native endpoints and external routing.
+    /// Resolves one core-classified UDP destination.
     pub(super) fn resolve_udp_destination(
         &self,
-        mut address: SocketAddrV4,
+        destination: SocketDestination,
     ) -> SocketOutcome<ReactorUdpPeer> {
-        if address.ip().is_unspecified() {
-            address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, address.port());
-        }
-        if let Some(binding) = self.udp.guest_binding(address) {
-            return SocketOutcome::Completed(ReactorUdpPeer::Guest {
-                socket_generation: binding.socket_id,
-                guest_address: binding.internal_address,
-            });
-        }
-        if self.is_private_udp_host_endpoint(address) {
-            SocketOutcome::Failed(SocketError::ConnectionRefused)
-        } else {
-            SocketOutcome::Completed(ReactorUdpPeer::External(address))
+        match destination {
+            SocketDestination::Guest { requested } => {
+                let Some(binding) = self.udp.guest_binding(requested.port()) else {
+                    return SocketOutcome::Failed(SocketError::ConnectionRefused);
+                };
+                SocketOutcome::Completed(ReactorUdpPeer::Guest {
+                    socket_generation: binding.socket_id,
+                    guest_address: binding.internal_address,
+                })
+            }
+            SocketDestination::External { requested } => {
+                if self.is_private_udp_host_endpoint(requested) {
+                    SocketOutcome::Failed(SocketError::ConnectionRefused)
+                } else {
+                    SocketOutcome::Completed(ReactorUdpPeer::External(requested))
+                }
+            }
         }
     }
 

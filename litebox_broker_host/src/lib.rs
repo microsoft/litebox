@@ -697,8 +697,9 @@ mod tests {
     use core::net::{Ipv4Addr, SocketAddrV4};
     use litebox_broker_core::readiness::ReadinessRegistration;
     use litebox_broker_core::socket::{
-        AcceptedPlatformSocket, PlatformConnectError, PlatformDatagramReceive, PlatformSocket,
-        PlatformStreamReceive, SocketProvider,
+        AcceptedPlatformSocket, BrokerNetworkConfig, GuestSocketBinding, PlatformConnectError,
+        PlatformDatagramReceive, PlatformSocket, PlatformStreamReceive, SocketDestination,
+        SocketProvider,
     };
     use litebox_broker_core::{ObjectRights, PolicyEngine, SessionId, SocketPolicy};
     use litebox_broker_protocol::event::{
@@ -754,9 +755,15 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct TestSocketProvider;
+    struct TestSocketProvider {
+        network_config: Arc<BrokerNetworkConfig>,
+    }
 
     impl SocketProvider for TestSocketProvider {
+        fn network_config(&self) -> Arc<BrokerNetworkConfig> {
+            Arc::clone(&self.network_config)
+        }
+
         fn create(
             &self,
             _session_id: SessionId,
@@ -782,8 +789,9 @@ mod tests {
     impl PlatformSocket for TestPlatformSocket {
         fn bind(
             &self,
-            address: SocketAddrV4,
+            binding: GuestSocketBinding,
         ) -> litebox_broker_core::Result<SocketOutcome<SocketAddrV4>> {
+            let address = binding.requested();
             if self.create_request.socket_type == SocketType::Stream {
                 *self.local_address.lock().unwrap() = Some(address);
                 return Ok(SocketOutcome::Completed(address));
@@ -817,7 +825,7 @@ mod tests {
 
         fn connect(
             &self,
-            _address: SocketAddrV4,
+            _destination: SocketDestination,
         ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
             self.readiness
                 .publish(litebox_broker_protocol::readiness::ReadinessFlags::WRITE)
@@ -841,7 +849,7 @@ mod tests {
             &self,
             data: Vec<u8>,
             _flags: SendFlags,
-            _destination: Option<SocketAddrV4>,
+            _destination: Option<SocketDestination>,
         ) -> litebox_broker_core::Result<SocketOutcome<usize>> {
             Ok(SocketOutcome::Completed(data.len()))
         }
@@ -912,7 +920,7 @@ mod tests {
         let broker = BrokerCore::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_socket_policy(SocketPolicy::Ipv4Loopback),
-            Arc::new(TestSocketProvider),
+            Arc::new(TestSocketProvider::default()),
         )
         .unwrap();
 
@@ -1373,7 +1381,10 @@ mod tests {
             ),
             BrokerResult::Socket(SocketResponse::Status(SocketStatusResponse {
                 status: SocketConnectionStatus::Connected,
-                local_address: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152)),
+                local_address: Some(SocketAddrV4::new(
+                    broker.network_config().guest_ipv4_address(),
+                    49152,
+                )),
                 pending_error: None,
             }))
         );

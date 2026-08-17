@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use litebox_broker_core::readiness::ReadinessRegistration;
-use litebox_broker_core::socket::PlatformConnectError;
+use litebox_broker_core::socket::{GuestSocketBinding, PlatformConnectError, SocketDestination};
 use litebox_broker_core::{BrokerError, Result as BrokerResult, SessionId};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
@@ -239,7 +239,7 @@ pub(super) enum PendingGuestConnectionMatch {
 #[derive(Clone, Copy)]
 pub(super) struct ReactorTcpBinding {
     pub(super) socket_id: u64,
-    pub(super) guest_address: SocketAddrV4,
+    pub(super) binding: GuestSocketBinding,
     pub(super) host_address: Option<SocketAddrV4>,
     pub(super) listening: bool,
     pub(super) requires_backlog_drain: bool,
@@ -255,7 +255,7 @@ impl ReactorTcpState {
     }
 
     pub(super) fn insert_binding(&mut self, binding: ReactorTcpBinding) -> BrokerResult<()> {
-        let port = binding.guest_address.port();
+        let port = binding.binding.requested().port();
         if port == 0 || self.bindings.contains_key(&port) {
             return Err(BrokerError::Internal);
         }
@@ -276,11 +276,8 @@ impl ReactorTcpState {
         }
     }
 
-    pub(super) fn guest_binding(&self, address: SocketAddrV4) -> Option<ReactorTcpBinding> {
-        if !address.ip().is_loopback() {
-            return None;
-        }
-        self.bindings.get(&address.port()).copied()
+    pub(super) fn guest_binding(&self, port: u16) -> Option<ReactorTcpBinding> {
+        self.bindings.get(&port).copied()
     }
 
     pub(super) fn set_host_address(
@@ -1208,7 +1205,7 @@ impl Reactor {
     pub(super) fn bind_tcp_socket(
         &mut self,
         id: u64,
-        guest_address: SocketAddrV4,
+        binding: GuestSocketBinding,
         already_bound: bool,
     ) -> BrokerResult<SocketOutcome<SocketAddrV4>> {
         if already_bound {
@@ -1216,12 +1213,13 @@ impl Reactor {
         }
         self.tcp.insert_binding(ReactorTcpBinding {
             socket_id: id,
-            guest_address,
+            binding,
             host_address: None,
             listening: false,
             requires_backlog_drain: false,
             untracked_connection_deadline: None,
         })?;
+        let guest_address = binding.requested();
         let socket = self.sockets.get_mut(&id).ok_or(BrokerError::Internal)?;
         socket.guest_local_address = Some(guest_address);
         socket
@@ -1232,10 +1230,10 @@ impl Reactor {
         Ok(SocketOutcome::Completed(guest_address))
     }
 
-    pub(super) fn connect_tcp_guest(
+    pub(super) fn connect_tcp_destination(
         &mut self,
         id: u64,
-        guest_address: SocketAddrV4,
+        destination: SocketDestination,
     ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
         let (session_id, local_guest_address) = self
             .sockets
@@ -1246,21 +1244,37 @@ impl Reactor {
                     .map(|address| (socket.session_id, address))
             })
             .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?;
-        let (network_address, guest_listener_id) =
-            match self.resolve_guest_destination(guest_address) {
-                SocketOutcome::Completed(destination) => destination,
-                SocketOutcome::Failed(error) => {
-                    let status = SocketConnectionStatus::Failed(error);
-                    let socket = self
-                        .sockets
-                        .get_mut(&id)
-                        .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?;
-                    socket.connection_status = status;
-                    update_snapshot(socket, Some(status), ReadinessFlags::ERROR)
-                        .map_err(PlatformConnectError::PeerIndeterminate)?;
-                    return Ok(status);
-                }
-            };
+        let local_guest_address = self
+            .network_config
+            .canonical_guest_address(local_guest_address)
+            .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?;
+        {
+            let socket = self
+                .sockets
+                .get_mut(&id)
+                .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?;
+            socket.guest_local_address = Some(local_guest_address);
+            socket
+                .snapshot
+                .lock()
+                .expect("Linux socket snapshot mutex poisoned")
+                .local_address = Some(local_guest_address);
+        }
+        let (network_address, guest_listener_id) = match self.resolve_guest_destination(destination)
+        {
+            SocketOutcome::Completed(destination) => destination,
+            SocketOutcome::Failed(error) => {
+                let status = SocketConnectionStatus::Failed(error);
+                let socket = self
+                    .sockets
+                    .get_mut(&id)
+                    .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?;
+                socket.connection_status = status;
+                update_snapshot(socket, Some(status), ReadinessFlags::ERROR)
+                    .map_err(PlatformConnectError::PeerIndeterminate)?;
+                return Ok(status);
+            }
+        };
         if guest_listener_id.is_some() {
             self.expire_deadlined_state(Instant::now());
             self.reserve_pending_guest_connection(session_id)
@@ -1806,34 +1820,35 @@ impl Reactor {
     /// native ports may numerically collide.
     pub(super) fn resolve_guest_destination(
         &self,
-        mut address: SocketAddrV4,
+        destination: SocketDestination,
     ) -> SocketOutcome<(SocketAddrV4, Option<u64>)> {
-        if address.ip().is_unspecified() {
-            address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, address.port());
-        }
-        if let Some(binding) = self.tcp.guest_binding(address) {
-            // A live guest binding owns this destination port broker-wide;
-            // only a listener with a fully classified backlog may receive
-            // new guest connections through it.
-            if !binding.listening
-                || binding.requires_backlog_drain
-                // Defence in depth for failures after connect(2) but before a
-                // complete host tuple can be recorded.
-                || binding.untracked_connection_deadline.is_some()
-            {
-                return SocketOutcome::Failed(SocketError::ConnectionRefused);
-            }
-            return match binding.host_address {
-                Some(host_address) => {
-                    SocketOutcome::Completed((host_address, Some(binding.socket_id)))
+        match destination {
+            SocketDestination::Guest { requested } => {
+                let Some(binding) = self.tcp.guest_binding(requested.port()) else {
+                    return SocketOutcome::Failed(SocketError::ConnectionRefused);
+                };
+                // Only a live listener with a fully classified backlog may
+                // receive new guest connections through its private address.
+                if !binding.listening
+                    || binding.requires_backlog_drain
+                    || binding.untracked_connection_deadline.is_some()
+                {
+                    return SocketOutcome::Failed(SocketError::ConnectionRefused);
                 }
-                None => SocketOutcome::Failed(SocketError::ConnectionRefused),
-            };
-        }
-        if self.is_private_tcp_host_endpoint(address) {
-            SocketOutcome::Failed(SocketError::ConnectionRefused)
-        } else {
-            SocketOutcome::Completed((address, None))
+                match binding.host_address {
+                    Some(host_address) => {
+                        SocketOutcome::Completed((host_address, Some(binding.socket_id)))
+                    }
+                    None => SocketOutcome::Failed(SocketError::ConnectionRefused),
+                }
+            }
+            SocketDestination::External { requested } => {
+                if self.is_private_tcp_host_endpoint(requested) {
+                    SocketOutcome::Failed(SocketError::ConnectionRefused)
+                } else {
+                    SocketOutcome::Completed((requested, None))
+                }
+            }
         }
     }
 
@@ -1974,6 +1989,10 @@ impl Reactor {
                 return Err(BrokerError::WouldBlock);
             }
         };
+        let listener_guest_address = self
+            .network_config
+            .canonical_guest_address(listener_guest_address)
+            .ok_or(BrokerError::Internal)?;
         let listener_session = self
             .sessions
             .get(&listener_session_id)

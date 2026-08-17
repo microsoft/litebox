@@ -23,13 +23,13 @@ static int run_server(void) {
     assert(fd >= 0);
     struct sockaddr_in local = {
         .sin_family = AF_INET,
-        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
         .sin_port = 0,
     };
+    assert(inet_pton(AF_INET, "10.0.2.15", &local.sin_addr) == 1);
     assert(bind(fd, (const struct sockaddr *)&local, sizeof(local)) == 0);
     socklen_t length = sizeof(local);
     assert(getsockname(fd, (struct sockaddr *)&local, &length) == 0);
-    assert(local.sin_addr.s_addr == htonl(INADDR_LOOPBACK));
+    assert(local.sin_addr.s_addr == inet_addr("10.0.2.15"));
     assert(local.sin_port != 0);
     printf("LISTEN %u\n", (unsigned int)ntohs(local.sin_port));
 
@@ -40,7 +40,7 @@ static int run_server(void) {
     assert(recvfrom(fd, request, sizeof(request), 0,
                     (struct sockaddr *)&source, &length) == sizeof(request));
     assert(memcmp(request, "request", sizeof(request)) == 0);
-    assert(source.sin_addr.s_addr == htonl(INADDR_LOOPBACK));
+    assert(source.sin_addr.s_addr == inet_addr("10.0.2.15"));
     assert(source.sin_port != 0);
     assert(close(fd) == 0);
     return 0;
@@ -51,9 +51,9 @@ static int run_client(const char *port) {
     assert(fd >= 0);
     struct sockaddr_in server = {
         .sin_family = AF_INET,
-        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
         .sin_port = htons((uint16_t)strtoul(port, NULL, 10)),
     };
+    assert(inet_pton(AF_INET, "10.0.2.15", &server.sin_addr) == 1);
     assert(sendto(fd, "request", 7, 0, (const struct sockaddr *)&server,
                   sizeof(server)) == 7);
     struct sockaddr_in local;

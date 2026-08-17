@@ -26,6 +26,14 @@ mod udp;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+fn guest_ipv4_address() -> Ipv4Addr {
+    BrokerNetworkConfig::default().guest_ipv4_address()
+}
+
+fn guest_address(port: u16) -> SocketAddrV4 {
+    SocketAddrV4::new(guest_ipv4_address(), port)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ReceivedPlatformDatagram {
     received: usize,

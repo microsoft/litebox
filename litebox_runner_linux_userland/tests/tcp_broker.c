@@ -44,7 +44,7 @@ int main(int argc, char **argv) {
         socklen_t connecting_address_length = sizeof(connecting_address);
         assert(getsockname(fd, (struct sockaddr *)&connecting_address,
                            &connecting_address_length) == 0);
-        assert(connecting_address.sin_addr.s_addr == htonl(INADDR_LOOPBACK));
+        assert(connecting_address.sin_addr.s_addr == inet_addr("10.0.2.15"));
         assert(connecting_address.sin_port != 0);
         int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
         assert(epoll_fd >= 0);
@@ -63,7 +63,7 @@ int main(int argc, char **argv) {
     socklen_t address_length = sizeof(local_address);
     assert(getsockname(fd, (struct sockaddr *)&local_address, &address_length) == 0);
     assert(local_address.sin_family == AF_INET);
-    assert(local_address.sin_addr.s_addr == htonl(INADDR_LOOPBACK));
+    assert(local_address.sin_addr.s_addr == inet_addr("10.0.2.15"));
     assert(local_address.sin_port != 0);
     assert(accept(fd, NULL, NULL) == -1);
     assert(errno == EINVAL);
