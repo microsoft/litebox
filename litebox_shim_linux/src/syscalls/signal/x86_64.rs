@@ -27,6 +27,10 @@ pub(super) fn sp(ctx: &PtRegs) -> usize {
     ctx.rsp
 }
 
+pub(super) fn pc(ctx: &PtRegs) -> usize {
+    ctx.rip
+}
+
 pub(super) fn get_signal_frame(sp: usize, _action: &SigAction) -> usize {
     let mut frame_addr = sp;
 

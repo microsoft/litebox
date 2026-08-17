@@ -319,6 +319,10 @@ pub const SI_TKILL: i32 = -6;
 pub const SI_DETHREAD: i32 = -7;
 pub const SI_ASYNCNL: i32 = -60;
 
+pub const ILL_ILLOPN: i32 = 2;
+
+pub const FPE_INTDIV: i32 = 1;
+
 #[cfg(target_arch = "x86_64")]
 #[repr(C)]
 #[derive(Clone, FromBytes, IntoBytes)]
