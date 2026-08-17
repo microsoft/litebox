@@ -29,8 +29,8 @@ use crate::session::{ObjectEntry, ObjectRights};
 use crate::{BrokerError, BrokerSession, Result, SessionId};
 
 pub use network::{
-    BrokerNetworkConfig, GuestSocketBinding, GuestSourceLease, RoutedSocketConnect,
-    SocketDestination,
+    BrokerNetworkConfig, GuestSocketBinding, GuestSourceLease, GuestTcpListenerTarget,
+    RoutedSocketConnect, SocketDestination,
 };
 
 const DEFAULT_LISTEN_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
@@ -55,6 +55,7 @@ struct GuestTransportPortState {
 struct GuestBindingEntry {
     lease: Weak<GuestBindingLeaseInner>,
     id: u64,
+    tcp_listening: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,6 +101,26 @@ impl GuestBindingLease {
             GuestBindingKey::Wildcard(port) => SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port),
             GuestBindingKey::Exact(address) => address,
         }
+    }
+
+    fn id(&self) -> u64 {
+        self.inner.id
+    }
+
+    fn transport(&self) -> GuestTransport {
+        self.inner.transport
+    }
+}
+
+struct GuestTcpListenerRegistration {
+    ports: BrokerSocketPorts,
+    key: GuestBindingKey,
+    id: u64,
+}
+
+impl GuestTcpListenerRegistration {
+    fn target(&self) -> GuestTcpListenerTarget {
+        GuestTcpListenerTarget(self.id)
     }
 }
 
@@ -163,6 +184,7 @@ impl BrokerSocketPorts {
         let entry = GuestBindingEntry {
             lease: Arc::downgrade(&lease.inner),
             id,
+            tcp_listening: false,
         };
         let replaced = match key {
             GuestBindingKey::Wildcard(port) => ports.wildcard.insert(port, entry),
@@ -202,6 +224,61 @@ impl BrokerSocketPorts {
         drop(upgraded);
         valid
     }
+
+    fn register_tcp_listener(
+        &self,
+        lease: &GuestBindingLease,
+    ) -> Result<GuestTcpListenerRegistration> {
+        if lease.inner.transport != GuestTransport::Tcp {
+            return Err(BrokerError::Internal);
+        }
+        let mut state = self.state.lock();
+        let entry = match lease.inner.key {
+            GuestBindingKey::Wildcard(port) => state.guest_tcp.wildcard.get_mut(&port),
+            GuestBindingKey::Exact(address) => state.guest_tcp.exact.get_mut(&address),
+        }
+        .ok_or(BrokerError::Internal)?;
+        let upgraded = entry.lease.upgrade().ok_or(BrokerError::Internal)?;
+        if entry.id != lease.inner.id
+            || !Arc::ptr_eq(&upgraded, &lease.inner)
+            || entry.tcp_listening
+        {
+            return Err(BrokerError::Internal);
+        }
+        entry.tcp_listening = true;
+        drop(state);
+        drop(upgraded);
+        Ok(GuestTcpListenerRegistration {
+            ports: self.clone(),
+            key: lease.inner.key,
+            id: lease.inner.id,
+        })
+    }
+
+    fn resolve_tcp_listener(&self, destination: SocketAddrV4) -> Option<GuestTcpListenerTarget> {
+        let mut state = self.state.lock();
+        if let Some(target) = resolve_tcp_listener_entry(&mut state.guest_tcp.exact, &destination) {
+            return Some(target);
+        }
+        resolve_tcp_listener_entry(&mut state.guest_tcp.wildcard, &destination.port())
+    }
+}
+
+fn resolve_tcp_listener_entry<K>(
+    entries: &mut HashMap<K, GuestBindingEntry>,
+    key: &K,
+) -> Option<GuestTcpListenerTarget>
+where
+    K: Eq + core::hash::Hash,
+{
+    let entry = entries.get(key)?;
+    if entry.lease.strong_count() == 0 {
+        entries.remove(key);
+        return None;
+    }
+    entry
+        .tcp_listening
+        .then_some(GuestTcpListenerTarget(entry.id))
 }
 
 fn allocate_ephemeral(
@@ -291,6 +368,19 @@ impl Drop for GuestBindingLeaseInner {
                     ports.exact.remove(&address);
                 }
             }
+        }
+    }
+}
+
+impl Drop for GuestTcpListenerRegistration {
+    fn drop(&mut self) {
+        let mut state = self.ports.state.lock();
+        let entry = match self.key {
+            GuestBindingKey::Wildcard(port) => state.guest_tcp.wildcard.get_mut(&port),
+            GuestBindingKey::Exact(address) => state.guest_tcp.exact.get_mut(&address),
+        };
+        if let Some(entry) = entry.filter(|entry| entry.id == self.id) {
+            entry.tcp_listening = false;
         }
     }
 }
@@ -643,6 +733,7 @@ pub fn create(
         readiness,
         _quota: quota,
         port_reservation: Mutex::new(None),
+        tcp_listener_registration: Mutex::new(None),
     });
     let platform_socket = match session.core.socket_provider.create(
         session.session_id,
@@ -810,16 +901,6 @@ pub fn connect(
             SocketError::InvalidArgument,
         )));
     };
-    let guest_source = if matches!(destination, SocketDestination::Guest { .. }) {
-        Some(GuestSourceLease::new(
-            binding.lease(),
-            concrete_local_address,
-            destination.requested(),
-            session.core.socket_ports.allocate_source_lease_id()?,
-        ))
-    } else {
-        None
-    };
     {
         let mut object = object.write();
         let ObjectEntry::Socket(socket) = &mut *object else {
@@ -828,6 +909,33 @@ pub fn connect(
         socket.stream_connect_attempted = true;
         socket.concrete_local_address = Some(concrete_local_address);
     }
+    let guest_source = if matches!(destination, SocketDestination::Guest { .. }) {
+        let Some(listener_target) = session
+            .core
+            .socket_ports
+            .resolve_tcp_listener(destination.requested())
+        else {
+            let status = SocketConnectionStatus::Failed(SocketError::ConnectionRefused);
+            finish_connect(&object, status);
+            return Ok(SocketOutcome::Completed(status));
+        };
+        let source_lease_id = match session.core.socket_ports.allocate_source_lease_id() {
+            Ok(id) => id,
+            Err(error) => {
+                finish_unchanged_connect(&object);
+                return Err(error);
+            }
+        };
+        Some(GuestSourceLease::new(
+            binding.lease(),
+            concrete_local_address,
+            destination.requested(),
+            listener_target,
+            source_lease_id,
+        ))
+    } else {
+        None
+    };
     let status = match resource.connect_routed(RoutedSocketConnect::new(destination, guest_source))
     {
         Ok(SocketConnectionStatus::Unconnected) => {
@@ -1013,6 +1121,15 @@ pub fn listen(
                 resource.retire();
                 return Err(BrokerError::Internal);
             }
+            let listener_lease = port_reservation
+                .clone()
+                .or_else(|| resource.port_reservation())
+                .ok_or(BrokerError::Internal)?;
+            if let Err(error) = resource.activate_tcp_listener(&listener_lease) {
+                finish_retired_configuration(&object, local_address, port_reservation)?;
+                resource.retire();
+                return Err(error);
+            }
             finish_configuration(&object, local_address, port_reservation, true)?;
             Ok(SocketOutcome::Completed(address))
         }
@@ -1034,7 +1151,7 @@ pub fn accept(
     readiness_sink: Arc<dyn ReadinessSink>,
 ) -> Result<SocketOutcome<AcceptedBrokerSocket>> {
     let listener = session.authorized_object(handle, ObjectRights::WAIT)?;
-    let (listener_resource, create_request, local_address) = {
+    let (listener_resource, listener_target, create_request, local_address) = {
         let listener = listener.read();
         let ObjectEntry::Socket(socket) = &*listener else {
             return Err(BrokerError::InvalidRights);
@@ -1047,6 +1164,10 @@ pub fn accept(
         }
         (
             Arc::clone(&socket.resource),
+            socket
+                .resource
+                .listener_target()
+                .ok_or(BrokerError::Internal)?,
             socket.create_request,
             socket.local_address.ok_or(BrokerError::Internal)?,
         )
@@ -1067,6 +1188,7 @@ pub fn accept(
         readiness,
         _quota: quota,
         port_reservation: Mutex::new(None),
+        tcp_listener_registration: Mutex::new(None),
     });
     let accepted = match listener_resource.accept(resource.readiness.clone()) {
         Ok(SocketOutcome::Completed(accepted)) => accepted,
@@ -1103,6 +1225,7 @@ pub fn accept(
             .core
             .socket_ports
             .validates_live_lease(&source_binding)
+        && listener_target == accepted.guest_source.listener_target()
         && accepted.guest_source.claim_accept();
     if !metadata_is_valid {
         accepted.socket.retire();
@@ -1476,6 +1599,7 @@ pub fn shutdown(
                         | SocketOutcome::Failed(SocketError::NotConnected))
                 )
             {
+                resource.clear_tcp_listener();
                 socket.listening = false;
                 socket.connection_status =
                     SocketConnectionStatus::Failed(SocketError::NotConnected);
@@ -2203,6 +2327,7 @@ pub(crate) struct SocketResource {
     readiness: ReadinessRegistration,
     _quota: Arc<SocketQuotaReservation>,
     port_reservation: Mutex<Option<GuestBindingLease>>,
+    tcp_listener_registration: Mutex<Option<GuestTcpListenerRegistration>>,
 }
 
 impl SocketResource {
@@ -2220,6 +2345,30 @@ impl SocketResource {
 
     fn port_reservation(&self) -> Option<GuestBindingLease> {
         self.port_reservation.lock().clone()
+    }
+
+    fn activate_tcp_listener(&self, lease: &GuestBindingLease) -> Result<()> {
+        let mut slot = self.tcp_listener_registration.lock();
+        if let Some(registration) = slot.as_ref() {
+            return if registration.target() == GuestTcpListenerTarget(lease.id()) {
+                Ok(())
+            } else {
+                Err(BrokerError::Internal)
+            };
+        }
+        *slot = Some(lease.inner.ports.register_tcp_listener(lease)?);
+        Ok(())
+    }
+
+    fn listener_target(&self) -> Option<GuestTcpListenerTarget> {
+        self.tcp_listener_registration
+            .lock()
+            .as_ref()
+            .map(GuestTcpListenerRegistration::target)
+    }
+
+    fn clear_tcp_listener(&self) {
+        self.tcp_listener_registration.lock().take();
     }
 
     fn platform_socket(&self) -> &dyn PlatformSocket {
@@ -2246,6 +2395,7 @@ impl SocketResource {
 
     fn retire(&self) {
         self.platform_socket().retire();
+        self.clear_tcp_listener();
     }
 
     fn accept(
@@ -2338,6 +2488,7 @@ impl Drop for SocketResource {
         if let Some(platform_socket) = self.platform_socket.get() {
             platform_socket.retire();
         }
+        self.tcp_listener_registration.lock().take();
         self.readiness.retire();
     }
 }
@@ -2438,6 +2589,42 @@ pub(crate) mod tests {
             ports.reserve(create_udp_request(), wildcard_address),
             Ok(SocketOutcome::Completed(_))
         ));
+    }
+
+    #[test]
+    fn tcp_listener_resolution_tracks_activation_and_generation() {
+        let ports = BrokerSocketPorts::default();
+        let config = BrokerNetworkConfig::default();
+        let loopback = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080);
+        let private = SocketAddrV4::new(config.guest_ipv4_address(), 8080);
+        let wildcard = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 8080);
+
+        let SocketOutcome::Completed((_, exact_lease)) =
+            ports.reserve(create_request(), loopback).unwrap()
+        else {
+            panic!("exact TCP reservation failed");
+        };
+        assert_eq!(ports.resolve_tcp_listener(loopback), None);
+        let exact_registration = ports.register_tcp_listener(&exact_lease).unwrap();
+        let exact_target = exact_registration.target();
+        assert_eq!(ports.resolve_tcp_listener(loopback), Some(exact_target));
+        assert_eq!(ports.resolve_tcp_listener(private), None);
+        drop(exact_registration);
+        assert_eq!(ports.resolve_tcp_listener(loopback), None);
+        drop(exact_lease);
+
+        let SocketOutcome::Completed((_, wildcard_lease)) =
+            ports.reserve(create_request(), wildcard).unwrap()
+        else {
+            panic!("wildcard TCP reservation failed");
+        };
+        let wildcard_registration = ports.register_tcp_listener(&wildcard_lease).unwrap();
+        let wildcard_target = wildcard_registration.target();
+        assert_ne!(wildcard_target, exact_target);
+        assert_eq!(ports.resolve_tcp_listener(loopback), Some(wildcard_target));
+        assert_eq!(ports.resolve_tcp_listener(private), Some(wildcard_target));
+        drop(wildcard_registration);
+        assert_eq!(ports.resolve_tcp_listener(loopback), None);
     }
 
     #[test]
@@ -2862,6 +3049,30 @@ pub(crate) mod tests {
         }
     }
 
+    struct TestTcpListenerRegistration {
+        _lease: GuestBindingLease,
+        _registration: GuestTcpListenerRegistration,
+    }
+
+    fn register_test_tcp_listener(
+        broker: &BrokerCore,
+        address: SocketAddrV4,
+    ) -> TestTcpListenerRegistration {
+        let SocketOutcome::Completed((reserved, lease)) = broker
+            .socket_ports
+            .reserve(create_request(), address)
+            .unwrap()
+        else {
+            panic!("test TCP listener reservation failed");
+        };
+        assert_eq!(reserved, address);
+        let registration = broker.socket_ports.register_tcp_listener(&lease).unwrap();
+        TestTcpListenerRegistration {
+            _lease: lease,
+            _registration: registration,
+        }
+    }
+
     pub(crate) fn check_socket_lifecycle(broker: &BrokerCore, provider: &TestSocketProvider) {
         check_failed_create_rolls_back(broker, provider);
         check_socket_operations_and_policy(broker, provider);
@@ -3106,6 +3317,30 @@ pub(crate) mod tests {
         let other = broker
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();
+        let missing = create(
+            &session,
+            create_request(),
+            Arc::new(TestReadinessSink::default()),
+        )
+        .unwrap();
+        let connect_calls = provider.state.connect_calls.load(Ordering::Relaxed);
+        assert_eq!(
+            connect(
+                &session,
+                missing,
+                SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8081),
+            ),
+            Ok(SocketOutcome::Completed(SocketConnectionStatus::Failed(
+                SocketError::ConnectionRefused,
+            )))
+        );
+        assert_eq!(
+            provider.state.connect_calls.load(Ordering::Relaxed),
+            connect_calls
+        );
+        session.close_object_reference(missing).unwrap();
+
+        let _listener = register_test_tcp_listener(broker, loopback_address());
         let readiness = Arc::new(TestReadinessSink::default());
         let port_zero = create(&session, create_request(), readiness.clone()).unwrap();
         let connect_calls = provider.state.connect_calls.load(Ordering::Relaxed);
@@ -3754,6 +3989,10 @@ pub(crate) mod tests {
             Ok(SocketOutcome::Completed(()))
         );
         assert_eq!(
+            broker.socket_ports.resolve_tcp_listener(local_address),
+            None
+        );
+        assert_eq!(
             status(&session, listener),
             Ok(SocketStatusResponse {
                 status: SocketConnectionStatus::Failed(SocketError::NotConnected),
@@ -4000,14 +4239,23 @@ pub(crate) mod tests {
             Arc::new(TestReadinessSink::default()),
         )
         .unwrap();
-        assert!(matches!(
-            listen(&session, handle, 8),
-            Ok(SocketOutcome::Completed(_))
-        ));
+        let SocketOutcome::Completed(listener_address) = listen(&session, handle, 8).unwrap()
+        else {
+            panic!("test TCP listen failed");
+        };
         provider.fail_next_shutdown();
         assert_eq!(
             shutdown(&session, handle, ShutdownMode::StopListening),
             Err(BrokerError::ResourceExhausted)
+        );
+        assert!(
+            broker
+                .socket_ports
+                .resolve_tcp_listener(SocketAddrV4::new(
+                    Ipv4Addr::LOCALHOST,
+                    listener_address.port(),
+                ))
+                .is_some()
         );
         assert_eq!(
             connect(&session, handle, loopback_address()),
@@ -4177,6 +4425,7 @@ pub(crate) mod tests {
         broker: &BrokerCore,
         provider: &TestSocketProvider,
     ) {
+        let _listener = register_test_tcp_listener(broker, loopback_address());
         let session = broker
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();
@@ -4341,6 +4590,7 @@ pub(crate) mod tests {
         broker: &BrokerCore,
         provider: &TestSocketProvider,
     ) {
+        let _listener = register_test_tcp_listener(broker, loopback_address());
         let session = Arc::new(
             broker
                 .create_session(CallerCredential::Unauthenticated)
@@ -4408,6 +4658,7 @@ pub(crate) mod tests {
         broker: &BrokerCore,
         provider: &TestSocketProvider,
     ) {
+        let _listener = register_test_tcp_listener(broker, loopback_address());
         let session = broker
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();

@@ -29,9 +29,8 @@ use rustix::net::{
 };
 
 use super::{
-    PRIVATE_BACKEND_ADDRESS, Reactor, ReactorReceiveFromOutcome, SocketKind, WAKE_TOKEN,
-    broker_error_from_errno, local_socket_address, socket_operation_error_from_errno,
-    update_snapshot, zeroed_vec,
+    Reactor, ReactorReceiveFromOutcome, SocketKind, WAKE_TOKEN, broker_error_from_errno,
+    local_socket_address, socket_operation_error_from_errno, update_snapshot, zeroed_vec,
 };
 
 pub(super) const MAX_REJECTED_UDP_DATAGRAMS_PER_COMMAND: usize = 64;
@@ -421,7 +420,7 @@ impl Reactor {
         endpoint.host_address.port() == address.port()
             && match endpoint.route {
                 UdpNativeRoute::External => is_local_ipv4_address(*address.ip()),
-                UdpNativeRoute::Gateway => *address.ip() == PRIVATE_BACKEND_ADDRESS,
+                UdpNativeRoute::Gateway => *address.ip() == Ipv4Addr::LOCALHOST,
             }
     }
 
@@ -1202,7 +1201,7 @@ impl Reactor {
         candidate.port() == peer.port()
             && match route {
                 UdpNativeRoute::External => is_local_ipv4_address(*peer.ip()),
-                UdpNativeRoute::Gateway => *peer.ip() == PRIVATE_BACKEND_ADDRESS,
+                UdpNativeRoute::Gateway => *peer.ip() == Ipv4Addr::LOCALHOST,
             }
     }
 
@@ -1296,7 +1295,7 @@ impl Reactor {
             let wildcard = SocketAddrV4::new(
                 match route {
                     UdpNativeRoute::External => Ipv4Addr::UNSPECIFIED,
-                    UdpNativeRoute::Gateway => PRIVATE_BACKEND_ADDRESS,
+                    UdpNativeRoute::Gateway => Ipv4Addr::LOCALHOST,
                 },
                 0,
             );
@@ -2412,13 +2411,15 @@ mod tests {
         ));
         assert!(Reactor::udp_candidate_covers_peer(
             UdpNativeRoute::Gateway,
-            SocketAddrV4::new(PRIVATE_BACKEND_ADDRESS, port),
-            SocketAddrV4::new(PRIVATE_BACKEND_ADDRESS, port),
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
         ));
+        // Only the gateway address itself is a gateway peer, so a different
+        // host loopback address stays outside the gateway route.
         assert!(!Reactor::udp_candidate_covers_peer(
             UdpNativeRoute::Gateway,
-            SocketAddrV4::new(PRIVATE_BACKEND_ADDRESS, port),
             SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
+            SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 3), port),
         ));
     }
 

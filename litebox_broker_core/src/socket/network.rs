@@ -12,6 +12,10 @@ use litebox_broker_protocol::socket::SocketError;
 
 use super::GuestBindingLease;
 
+/// Opaque core-issued identity for one guest TCP listener generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct GuestTcpListenerTarget(pub(super) u64);
+
 /// Immutable network identity shared by broker core and its socket provider.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BrokerNetworkConfig {
@@ -150,6 +154,13 @@ impl GuestSocketBinding {
         self.is_valid_for(config) && self.lease.covers(address, config)
     }
 
+    /// Returns the opaque target reserved for this TCP binding.
+    #[must_use]
+    pub fn tcp_listener_target(&self) -> Option<GuestTcpListenerTarget> {
+        (self.lease.transport() == super::GuestTransport::Tcp)
+            .then_some(GuestTcpListenerTarget(self.lease.id()))
+    }
+
     /// Selects the concrete guest source identity for one route.
     #[must_use]
     pub fn concrete_address_for(
@@ -249,6 +260,7 @@ struct GuestSourceLeaseInner {
     binding: GuestBindingLease,
     source: SocketAddrV4,
     destination: SocketAddrV4,
+    listener_target: GuestTcpListenerTarget,
     id: u64,
     transferred: AtomicBool,
 }
@@ -258,6 +270,7 @@ impl GuestSourceLease {
         binding: GuestBindingLease,
         source: SocketAddrV4,
         destination: SocketAddrV4,
+        listener_target: GuestTcpListenerTarget,
         id: u64,
     ) -> Self {
         Self {
@@ -265,6 +278,7 @@ impl GuestSourceLease {
                 binding,
                 source,
                 destination,
+                listener_target,
                 id,
                 transferred: AtomicBool::new(false),
             }),
@@ -281,6 +295,12 @@ impl GuestSourceLease {
     #[must_use]
     pub fn destination(&self) -> SocketAddrV4 {
         self.inner.destination
+    }
+
+    /// Returns the exact listener generation selected by broker core.
+    #[must_use]
+    pub fn listener_target(&self) -> GuestTcpListenerTarget {
+        self.inner.listener_target
     }
 
     pub(crate) fn binding(&self) -> GuestBindingLease {
@@ -301,6 +321,7 @@ impl fmt::Debug for GuestSourceLease {
             .debug_struct("GuestSourceLease")
             .field("source", &self.inner.source)
             .field("destination", &self.inner.destination)
+            .field("listener_target", &self.inner.listener_target)
             .field("id", &self.inner.id)
             .finish_non_exhaustive()
     }
@@ -334,6 +355,14 @@ impl RoutedSocketConnect {
     #[must_use]
     pub const fn guest_source(&self) -> Option<&GuestSourceLease> {
         self.guest_source.as_ref()
+    }
+
+    /// Returns the core-selected guest TCP listener target, when present.
+    #[must_use]
+    pub fn guest_listener_target(&self) -> Option<GuestTcpListenerTarget> {
+        self.guest_source
+            .as_ref()
+            .map(GuestSourceLease::listener_target)
     }
 
     /// Splits this request into its provider-owned values.

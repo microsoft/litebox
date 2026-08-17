@@ -702,7 +702,9 @@ mod tests {
         RoutedAcceptedPlatformSocket, RoutedPlatformDatagramReceive, RoutedSocketConnect,
         SocketDestination, SocketProvider,
     };
-    use litebox_broker_core::{ObjectRights, PolicyEngine, SessionId, SocketPolicy};
+    use litebox_broker_core::{
+        DestinationPortRange, GatewayPortRule, ObjectRights, PolicyEngine, SessionId, SocketPolicy,
+    };
     use litebox_broker_protocol::event::{
         AddEventRequest, ConsumeEventRequest, CreateEventRequest, EventConsumeMode,
     };
@@ -713,7 +715,7 @@ mod tests {
         SharedBufferDescriptor,
     };
     use litebox_broker_protocol::socket::{
-        AddressFamily, ConnectSocketRequest, CreateSocketRequest, IpProtocol, ReceiveFlags,
+        AddressFamily, ConnectSocketRequest, CreateSocketRequest, IpProtocol, Port, ReceiveFlags,
         ReceiveFromFlags, ReceiveFromSocketRequest, ReceiveFromSocketResponse,
         ReceiveSocketRequest, SendFlags, SendSocketRequest, SendToSocketRequest,
         SendToSocketResponse, ShutdownMode, ShutdownSocketRequest, SocketConnectionStatus,
@@ -965,12 +967,17 @@ mod tests {
 
     #[test]
     fn host_request_handling_uses_one_broker_core() {
-        let broker = BrokerCore::new(
-            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-                .with_socket_policy(SocketPolicy::Ipv4Loopback),
-            Arc::new(TestSocketProvider::default()),
-        )
-        .unwrap();
+        let policy = PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(SocketPolicy::Ipv4Loopback)
+            .with_gateway_rules(
+                &[GatewayPortRule::new(
+                    CallerCredential::Unauthenticated,
+                    DestinationPortRange::new(Port(8080), Port(8080)).unwrap(),
+                )],
+                &[],
+            )
+            .unwrap();
+        let broker = BrokerCore::new(policy, Arc::new(TestSocketProvider::default())).unwrap();
 
         test_channel_negotiates_routes_one_request_and_returns_peer_closed(&broker);
         test_channel_retries_after_version_mismatch(&broker);
@@ -1411,7 +1418,7 @@ mod tests {
                 &session,
                 BrokerOperation::Socket(SocketRequest::Connect(ConnectSocketRequest {
                     handle: response.handle,
-                    address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080),
+                    address: SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 1), 8080),
                 })),
                 &shared_buffers,
             ),
@@ -1429,7 +1436,10 @@ mod tests {
             ),
             BrokerResult::Socket(SocketResponse::Status(SocketStatusResponse {
                 status: SocketConnectionStatus::Connected,
-                local_address: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152)),
+                local_address: Some(SocketAddrV4::new(
+                    BrokerNetworkConfig::default().guest_ipv4_address(),
+                    49152,
+                )),
                 pending_error: None,
             }))
         );

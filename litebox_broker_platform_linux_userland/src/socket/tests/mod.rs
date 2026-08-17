@@ -3,7 +3,7 @@
 
 use std::io::{Read as _, Write as _};
 use std::net::Ipv4Addr;
-use std::net::{Shutdown, TcpListener, TcpStream, UdpSocket};
+use std::net::{Shutdown, TcpListener, UdpSocket};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 

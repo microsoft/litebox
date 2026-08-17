@@ -4,217 +4,6 @@
 use super::*;
 
 #[test]
-fn pending_guest_connections_are_keyed_by_complete_host_tuple() {
-    let guest_ip = guest_ipv4_address();
-    let remote_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 40000);
-    let first_listener = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000);
-    let second_listener = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5001);
-    let first_guest = SocketAddrV4::new(guest_ip, 1000);
-    let second_guest = SocketAddrV4::new(guest_ip, 1001);
-    let mut tcp = ReactorTcpState::default();
-    for (index, (listener, _guest)) in [
-        (first_listener, first_guest),
-        (second_listener, second_guest),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        tcp.insert_pending_guest_connection(
-            (remote_address, listener),
-            PendingGuestTcpConnection {
-                session_id: SessionId(7 + index as u64),
-                guest_source: None,
-                listener_id: 1,
-                discard_on_accept: false,
-                discard_until_deadline: false,
-                discard_deadline: None,
-                retained_connector: None,
-            },
-        )
-        .unwrap();
-    }
-    assert_eq!(
-        tcp.insert_pending_guest_connection(
-            (remote_address, first_listener),
-            PendingGuestTcpConnection {
-                session_id: SessionId(8),
-                guest_source: None,
-                listener_id: 1,
-                discard_on_accept: false,
-                discard_until_deadline: false,
-                discard_deadline: None,
-                retained_connector: None,
-            },
-        ),
-        Err(BrokerError::ResourceExhausted)
-    );
-
-    assert_eq!(
-        match tcp
-            .take_pending_guest_connection(remote_address, second_listener)
-            .unwrap()
-        {
-            PendingGuestConnectionMatch::Take(connection) => connection.session_id,
-            PendingGuestConnectionMatch::PersistentDiscard => {
-                panic!("deliverable connection became a discard marker")
-            }
-        },
-        SessionId(8)
-    );
-    assert_eq!(
-        match tcp
-            .take_pending_guest_connection(remote_address, first_listener)
-            .unwrap()
-        {
-            PendingGuestConnectionMatch::Take(connection) => connection.session_id,
-            PendingGuestConnectionMatch::PersistentDiscard => {
-                panic!("deliverable connection became a discard marker")
-            }
-        },
-        SessionId(7)
-    );
-    assert!(tcp.pending_guest_connections.is_empty());
-}
-
-#[test]
-fn tuple_collision_persists_its_discard_marker() {
-    let remote_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 40000);
-    let host_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 41000);
-    let connection = (remote_address, host_address);
-    let deadline = Instant::now() + PENDING_CONNECT_DISCARD_LIFETIME;
-    let mut tcp = ReactorTcpState::default();
-    assert!(!tcp.persist_discard_marker_for_collision(connection, 1, deadline));
-    tcp.insert_pending_guest_connection(
-        connection,
-        PendingGuestTcpConnection {
-            session_id: SessionId(7),
-            guest_source: None,
-            listener_id: 1,
-            discard_on_accept: false,
-            discard_until_deadline: false,
-            discard_deadline: Some(Instant::now()),
-            retained_connector: None,
-        },
-    )
-    .unwrap();
-    assert!(!tcp.persist_discard_marker_for_collision(connection, 1, deadline));
-    tcp.pending_guest_connections
-        .get_mut(&connection)
-        .unwrap()
-        .discard_on_accept = true;
-
-    assert!(tcp.persist_discard_marker_for_collision(connection, 1, deadline));
-    let marker = tcp.pending_guest_connections.get(&connection).unwrap();
-    assert!(marker.discard_until_deadline);
-    assert_eq!(marker.discard_deadline, Some(deadline));
-    assert!(matches!(
-        tcp.take_pending_guest_connection(remote_address, host_address),
-        Some(PendingGuestConnectionMatch::PersistentDiscard)
-    ));
-    assert!(tcp.pending_guest_connections.contains_key(&connection));
-}
-
-#[test]
-fn untracked_guest_connection_cleanup_is_bounded_and_drains_backlog() {
-    let provider = Arc::new(LinuxSocketProvider::new(6, 3).unwrap());
-    let broker = BrokerCore::new_with_limits(
-        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
-        BrokerCoreLimits::new_with_all_limits(12, 0, 6, 6),
-        provider.clone(),
-    )
-    .unwrap();
-    let listener_session = broker
-        .create_session(CallerCredential::Unauthenticated)
-        .unwrap();
-    let connector_session = broker
-        .create_session(CallerCredential::Unauthenticated)
-        .unwrap();
-    let (published, publications) = channel();
-    let (retired, retirements) = channel();
-    let readiness = Arc::new(TestReadinessSink { published, retired });
-    let guest_address = guest_address(8090);
-    let listener = create_socket(&listener_session, readiness.clone());
-    assert_eq!(
-        litebox_broker_core::socket::bind(&listener_session, listener, guest_address),
-        Ok(SocketOutcome::Completed(guest_address))
-    );
-    assert_eq!(
-        litebox_broker_core::socket::listen(&listener_session, listener, 4),
-        Ok(SocketOutcome::Completed(guest_address))
-    );
-
-    provider
-        .reactor
-        .defer_untracked_guest_connection(guest_address.port());
-    let blocked = create_socket(&connector_session, readiness.clone());
-    assert_eq!(
-        litebox_broker_core::socket::connect(&connector_session, blocked, guest_address),
-        Ok(SocketOutcome::Completed(SocketConnectionStatus::Failed(
-            SocketError::ConnectionRefused
-        )))
-    );
-    connector_session.close_object_reference(blocked).unwrap();
-    assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), blocked);
-
-    provider.reactor.expire_pending_guest_connections();
-    let connector = create_socket(&connector_session, readiness.clone());
-    assert!(matches!(
-        litebox_broker_core::socket::connect(&connector_session, connector, guest_address),
-        Ok(SocketOutcome::Completed(
-            SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
-        ))
-    ));
-    wait_until_connected(&connector_session, connector, &publications);
-    wait_until_ready(
-        &listener_session,
-        &publications,
-        listener,
-        ReadinessFlags::READ,
-    );
-    let accepted =
-        match litebox_broker_core::socket::accept(&listener_session, listener, readiness.clone())
-            .unwrap()
-        {
-            SocketOutcome::Completed(accepted) => accepted.handle,
-            SocketOutcome::Failed(error) => panic!("guest accept failed: {error:?}"),
-        };
-    listener_session.close_object_reference(accepted).unwrap();
-    assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), accepted);
-    connector_session.close_object_reference(connector).unwrap();
-    assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), connector);
-
-    let private_address = provider.reactor.host_address(guest_address.port()).unwrap();
-    let _unmatched = TcpStream::connect(private_address).unwrap();
-    provider
-        .reactor
-        .defer_untracked_guest_connection(guest_address.port());
-    provider.reactor.expire_pending_guest_connections();
-
-    let gated = create_socket(&connector_session, readiness.clone());
-    assert_eq!(
-        litebox_broker_core::socket::connect(&connector_session, gated, guest_address),
-        Ok(SocketOutcome::Completed(SocketConnectionStatus::Failed(
-            SocketError::ConnectionRefused
-        )))
-    );
-    connector_session.close_object_reference(gated).unwrap();
-    assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), gated);
-    assert!(matches!(
-        litebox_broker_core::socket::accept(&listener_session, listener, readiness.clone(),),
-        Err(BrokerError::WouldBlock)
-    ));
-
-    let final_connector = create_socket(&connector_session, readiness);
-    assert!(matches!(
-        litebox_broker_core::socket::connect(&connector_session, final_connector, guest_address,),
-        Ok(SocketOutcome::Completed(
-            SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
-        ))
-    ));
-}
-
-#[test]
 fn reactor_drives_a_loopback_tcp_socket() {
     assert_eq!(
         socket_operation_error_from_errno(Errno::NOMEM),
@@ -268,6 +57,10 @@ fn reactor_drives_a_loopback_tcp_socket() {
         assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
     });
 
+    let refused_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let refused_address = refused_listener.local_addr().unwrap();
+    drop(refused_listener);
+
     let provider = Arc::new(LinuxSocketProvider::new(8, 8).unwrap());
     let broker = BrokerCore::new_with_limits(
         policy_with_gateway(
@@ -275,6 +68,7 @@ fn reactor_drives_a_loopback_tcp_socket() {
                 address.port(),
                 read_shutdown_address.port(),
                 abort_address.port(),
+                refused_address.port(),
             ],
             &[],
         ),
@@ -518,14 +312,11 @@ fn reactor_drives_a_loopback_tcp_socket() {
             .contains(ReadinessFlags::ERROR)
     );
 
-    let refused_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let refused_address = refused_listener.local_addr().unwrap();
-    drop(refused_listener);
     let refused_handle = create_socket(&session, readiness.clone());
     let refused_connect = litebox_broker_core::socket::connect(
         &session,
         refused_handle,
-        socket_address_v4(refused_address),
+        gateway_address(refused_address.port()),
     )
     .unwrap();
     assert!(matches!(
@@ -874,7 +665,7 @@ fn accepted_guest_tcp_close_with_unread_data_preserves_reset() {
 }
 
 #[test]
-fn guest_tcp_namespace_routes_across_sessions_and_hides_private_backend() {
+fn guest_tcp_namespace_routes_across_sessions_without_host_endpoints() {
     let provider = Arc::new(LinuxSocketProvider::new(5, 3).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
@@ -892,24 +683,33 @@ fn guest_tcp_namespace_routes_across_sessions_and_hides_private_backend() {
     let (published, publications) = channel();
     let (retired, retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
+    // The host keeps its own listener on the numerically identical port to
+    // prove that the guest namespace never borrows a host endpoint.
     let shadowed_host_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     shadowed_host_listener.set_nonblocking(true).unwrap();
     let guest_port = shadowed_host_listener.local_addr().unwrap().port();
     let guest_address = guest_address(guest_port);
-    let guest_destination = guest_address;
     let listener = create_socket(&listener_session, readiness.clone());
     assert_eq!(
         litebox_broker_core::socket::bind(&listener_session, listener, guest_address),
         Ok(SocketOutcome::Completed(guest_address))
     );
-    assert_eq!(provider.reactor.host_address(guest_address.port()), None);
+    assert_eq!(
+        provider.reactor.tcp_transport_kind(guest_address),
+        Some(TcpTransportKind::NoDescriptor)
+    );
 
     let early_client = create_socket(&client_session, readiness.clone());
     assert_eq!(
-        litebox_broker_core::socket::connect(&client_session, early_client, guest_destination,),
+        litebox_broker_core::socket::connect(&client_session, early_client, guest_address),
         Ok(SocketOutcome::Completed(SocketConnectionStatus::Failed(
             SocketError::ConnectionRefused,
         )))
+    );
+    assert_eq!(
+        provider.reactor.listener_queue_state(guest_address.port()),
+        Some((0, 0)),
+        "a connect refused before listen must not queue anything"
     );
     assert_eq!(
         shadowed_host_listener.accept().unwrap_err().kind(),
@@ -925,33 +725,19 @@ fn guest_tcp_namespace_routes_across_sessions_and_hides_private_backend() {
         litebox_broker_core::socket::listen(&listener_session, listener, 3),
         Ok(SocketOutcome::Completed(guest_address))
     );
-    let private_address = provider
-        .reactor
-        .host_address(guest_address.port())
-        .expect("listener backend must be realized");
-    assert!(private_address.ip().is_loopback());
-    assert_ne!(private_address, guest_address);
-
-    let direct_client = create_socket(&client_session, readiness.clone());
     assert_eq!(
-        litebox_broker_core::socket::connect(&client_session, direct_client, private_address,),
-        Ok(SocketOutcome::Completed(SocketConnectionStatus::Failed(
-            SocketError::ConnectionRefused,
-        )))
+        provider.reactor.tcp_transport_kind(guest_address),
+        Some(TcpTransportKind::NoDescriptor),
+        "a guest listener must never own a host descriptor"
     );
-    client_session
-        .close_object_reference(direct_client)
-        .unwrap();
     assert_eq!(
-        retirements.recv_timeout(TEST_TIMEOUT).unwrap(),
-        direct_client
+        provider.reactor.listener_queue_state(guest_address.port()),
+        Some((0, 0))
     );
 
-    let native_client = TcpStream::connect(private_address).unwrap();
-    wait_for_readiness(&publications, listener, ReadinessFlags::READ);
     let client = create_socket(&client_session, readiness.clone());
     assert!(matches!(
-        litebox_broker_core::socket::connect(&client_session, client, guest_destination),
+        litebox_broker_core::socket::connect(&client_session, client, guest_address),
         Ok(SocketOutcome::Completed(
             SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
         ))
@@ -961,29 +747,13 @@ fn guest_tcp_namespace_routes_across_sessions_and_hides_private_backend() {
         .unwrap()
         .local_address
         .unwrap();
-    let connector_private_address = provider
-        .reactor
-        .host_address(client_address.port())
-        .expect("connector backend must be realized");
-    assert_ne!(connector_private_address, client_address);
-    let connector_probe = create_socket(&client_session, readiness.clone());
     assert_eq!(
-        litebox_broker_core::socket::connect(
-            &client_session,
-            connector_probe,
-            connector_private_address,
-        ),
-        Ok(SocketOutcome::Completed(SocketConnectionStatus::Failed(
-            SocketError::ConnectionRefused,
-        )))
+        provider.reactor.tcp_transport_kind(client_address),
+        Some(TcpTransportKind::Virtual),
+        "a guest connection must use only a broker-local stream"
     );
-    client_session
-        .close_object_reference(connector_probe)
-        .unwrap();
-    assert_eq!(
-        retirements.recv_timeout(TEST_TIMEOUT).unwrap(),
-        connector_probe
-    );
+    assert_eq!(*client_address.ip(), guest_ipv4_address());
+    assert_eq!(provider.reactor.queued_accept_count(), 1);
     wait_until_ready(
         &listener_session,
         &publications,
@@ -999,8 +769,11 @@ fn guest_tcp_namespace_routes_across_sessions_and_hides_private_backend() {
         };
     assert_eq!(accepted.local_address, guest_address);
     assert_eq!(accepted.remote_address, client_address);
-    assert_eq!(provider.reactor.pending_guest_connection_count(), 0);
-    assert_eq!(provider.reactor.retained_connector_count(), 0);
+    assert_eq!(provider.reactor.queued_accept_count(), 0);
+    assert_eq!(
+        provider.reactor.listener_queue_state(guest_address.port()),
+        Some((0, 0))
+    );
 
     assert_eq!(
         send_bytes(&client_session, client, b"x", SendFlags::NONE),
@@ -1025,20 +798,395 @@ fn guest_tcp_namespace_routes_across_sessions_and_hides_private_backend() {
         Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(1)))
     );
     assert_eq!(byte, *b"x");
+    // The host listener on the same port number stays untouched by every
+    // guest-namespace connection.
     assert_eq!(
         shadowed_host_listener.accept().unwrap_err().kind(),
         ErrorKind::WouldBlock
     );
-    drop(native_client);
+
+    listener_session
+        .close_object_reference(accepted.handle)
+        .unwrap();
+    assert_eq!(
+        retirements.recv_timeout(TEST_TIMEOUT).unwrap(),
+        accepted.handle
+    );
+    client_session.close_object_reference(client).unwrap();
+    assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), client);
+    listener_session.close_object_reference(listener).unwrap();
+    assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), listener);
 }
 
 #[test]
-fn connector_and_session_teardown_clean_bounded_pending_state() {
-    let provider = Arc::new(LinuxSocketProvider::new(3, 1).unwrap());
+fn guest_tcp_options_are_cached_without_a_host_socket() {
+    let provider = Arc::new(LinuxSocketProvider::new(3, 3).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::Ipv4Loopback),
         BrokerCoreLimits::new_with_all_limits(8, 0, 3, 3),
+        provider.clone(),
+    )
+    .unwrap();
+    let session = broker
+        .create_session(CallerCredential::Unauthenticated)
+        .unwrap();
+    let (published, publications) = channel();
+    let (retired, retirements) = channel();
+    let readiness = Arc::new(TestReadinessSink { published, retired });
+    let guest_address = guest_address(8094);
+    let listener = create_socket(&session, readiness.clone());
+    assert_eq!(
+        litebox_broker_core::socket::bind(&session, listener, guest_address),
+        Ok(SocketOutcome::Completed(guest_address))
+    );
+    assert_eq!(
+        litebox_broker_core::socket::listen(&session, listener, 1),
+        Ok(SocketOutcome::Completed(guest_address))
+    );
+    // A logical listener owns no descriptor, so its options are pure cache.
+    for value in [
+        TcpOptionValue::NoDelay(true),
+        TcpOptionValue::KeepAlive(true),
+    ] {
+        assert_eq!(
+            litebox_broker_core::socket::set_tcp_option(&session, listener, value),
+            Ok(())
+        );
+    }
+    assert_eq!(
+        litebox_broker_core::socket::get_tcp_option(&session, listener, TcpOptionName::NoDelay),
+        Ok(TcpOptionValue::NoDelay(true))
+    );
+    assert_eq!(
+        litebox_broker_core::socket::get_tcp_option(&session, listener, TcpOptionName::KeepAlive),
+        Ok(TcpOptionValue::KeepAlive(true))
+    );
+
+    let connector = create_socket(&session, readiness.clone());
+    assert_eq!(
+        litebox_broker_core::socket::set_tcp_option(
+            &session,
+            connector,
+            TcpOptionValue::NoDelay(true),
+        ),
+        Ok(())
+    );
+    assert!(matches!(
+        litebox_broker_core::socket::connect(&session, connector, guest_address),
+        Ok(SocketOutcome::Completed(
+            SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
+        ))
+    ));
+    wait_until_connected(&session, connector, &publications);
+    // The virtual stream rejects TCP-level options natively, so the cached
+    // value must survive the connection.
+    assert_eq!(
+        litebox_broker_core::socket::get_tcp_option(&session, connector, TcpOptionName::NoDelay),
+        Ok(TcpOptionValue::NoDelay(true))
+    );
+    assert_eq!(
+        litebox_broker_core::socket::set_tcp_option(
+            &session,
+            connector,
+            TcpOptionValue::KeepAlive(true),
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        litebox_broker_core::socket::get_tcp_option(&session, connector, TcpOptionName::KeepAlive),
+        Ok(TcpOptionValue::KeepAlive(true))
+    );
+    wait_until_ready(&session, &publications, listener, ReadinessFlags::READ);
+    let accepted =
+        match litebox_broker_core::socket::accept(&session, listener, readiness.clone()).unwrap() {
+            SocketOutcome::Completed(accepted) => accepted,
+            SocketOutcome::Failed(error) => panic!("accept failed: {error:?}"),
+        };
+    // An accepted socket inherits the listener options like a native accept.
+    assert_eq!(
+        litebox_broker_core::socket::get_tcp_option(
+            &session,
+            accepted.handle,
+            TcpOptionName::NoDelay,
+        ),
+        Ok(TcpOptionValue::NoDelay(true))
+    );
+    assert_eq!(
+        litebox_broker_core::socket::get_tcp_option(
+            &session,
+            accepted.handle,
+            TcpOptionName::KeepAlive,
+        ),
+        Ok(TcpOptionValue::KeepAlive(true))
+    );
+    drop(session);
+    let _ = retirements.recv_timeout(TEST_TIMEOUT).unwrap();
+}
+
+#[test]
+fn saturated_guest_backlog_parks_connectors_until_accept() {
+    let provider = Arc::new(LinuxSocketProvider::new(6, 6).unwrap());
+    let broker = BrokerCore::new_with_limits(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+        BrokerCoreLimits::new_with_all_limits(8, 0, 6, 6),
+        provider.clone(),
+    )
+    .unwrap();
+    let session = broker
+        .create_session(CallerCredential::Unauthenticated)
+        .unwrap();
+    let (published, publications) = channel();
+    let (retired, retirements) = channel();
+    let readiness = Arc::new(TestReadinessSink { published, retired });
+    let guest_address = guest_address(8095);
+    let listener = create_socket(&session, readiness.clone());
+    assert_eq!(
+        litebox_broker_core::socket::bind(&session, listener, guest_address),
+        Ok(SocketOutcome::Completed(guest_address))
+    );
+    assert_eq!(
+        litebox_broker_core::socket::listen(&session, listener, 1),
+        Ok(SocketOutcome::Completed(guest_address))
+    );
+
+    let first = create_socket(&session, readiness.clone());
+    assert!(matches!(
+        litebox_broker_core::socket::connect(&session, first, guest_address),
+        Ok(SocketOutcome::Completed(
+            SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
+        ))
+    ));
+    wait_until_connected(&session, first, &publications);
+    let second = create_socket(&session, readiness.clone());
+    // The backlog is full, so this connect must park instead of failing.
+    assert_eq!(
+        litebox_broker_core::socket::connect(&session, second, guest_address),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting))
+    );
+    assert_eq!(
+        provider.reactor.listener_queue_state(guest_address.port()),
+        Some((1, 1))
+    );
+    assert_eq!(provider.reactor.queued_accept_count(), 2);
+    let second_address = litebox_broker_core::socket::status(&session, second)
+        .unwrap()
+        .local_address
+        .unwrap();
+    assert!(matches!(
+        receive_into(&session, second, &mut [0_u8; 1], ReceiveFlags::NONE, 0, 0),
+        Err(BrokerError::WouldBlock)
+    ));
+
+    wait_until_ready(&session, &publications, listener, ReadinessFlags::READ);
+    let accepted =
+        match litebox_broker_core::socket::accept(&session, listener, readiness.clone()).unwrap() {
+            SocketOutcome::Completed(accepted) => accepted,
+            SocketOutcome::Failed(error) => panic!("first accept failed: {error:?}"),
+        };
+    assert_ne!(accepted.remote_address, second_address);
+    // Accepting frees one backlog slot, which promotes the parked connector.
+    wait_until_connected(&session, second, &publications);
+    assert_eq!(
+        provider.reactor.listener_queue_state(guest_address.port()),
+        Some((1, 0))
+    );
+    assert_eq!(provider.reactor.queued_accept_count(), 1);
+
+    wait_until_ready(&session, &publications, listener, ReadinessFlags::READ);
+    let promoted =
+        match litebox_broker_core::socket::accept(&session, listener, readiness.clone()).unwrap() {
+            SocketOutcome::Completed(accepted) => accepted,
+            SocketOutcome::Failed(error) => panic!("promoted accept failed: {error:?}"),
+        };
+    assert_eq!(promoted.remote_address, second_address);
+    assert_eq!(provider.reactor.queued_accept_count(), 0);
+    assert_eq!(
+        send_bytes(&session, second, b"promoted", SendFlags::NONE),
+        Ok(SocketOutcome::Completed(8))
+    );
+    let mut data = [0_u8; 8];
+    loop {
+        match receive_into(
+            &session,
+            promoted.handle,
+            &mut data,
+            ReceiveFlags::NONE,
+            0,
+            0,
+        ) {
+            Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(8))) => break,
+            Err(BrokerError::WouldBlock) => {
+                wait_until_ready(
+                    &session,
+                    &publications,
+                    promoted.handle,
+                    ReadinessFlags::READ,
+                );
+            }
+            outcome => panic!("unexpected promoted receive outcome: {outcome:?}"),
+        }
+    }
+    assert_eq!(&data, b"promoted");
+    drop(session);
+    let _ = retirements.recv_timeout(TEST_TIMEOUT).unwrap();
+}
+
+#[test]
+fn growing_guest_backlog_promotes_all_parked_connectors() {
+    let provider = Arc::new(LinuxSocketProvider::new(10, 10).unwrap());
+    let broker = BrokerCore::new_with_limits(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+        BrokerCoreLimits::new_with_all_limits(8, 0, 10, 10),
+        provider.clone(),
+    )
+    .unwrap();
+    let session = broker
+        .create_session(CallerCredential::Unauthenticated)
+        .unwrap();
+    let (published, publications) = channel();
+    let (retired, retirements) = channel();
+    let readiness = Arc::new(TestReadinessSink { published, retired });
+    let guest_address = guest_address(8097);
+    let listener = create_socket(&session, readiness.clone());
+    assert_eq!(
+        litebox_broker_core::socket::bind(&session, listener, guest_address),
+        Ok(SocketOutcome::Completed(guest_address))
+    );
+    assert_eq!(
+        litebox_broker_core::socket::listen(&session, listener, 2),
+        Ok(SocketOutcome::Completed(guest_address))
+    );
+
+    let connectors = [
+        create_socket(&session, readiness.clone()),
+        create_socket(&session, readiness.clone()),
+        create_socket(&session, readiness.clone()),
+        create_socket(&session, readiness.clone()),
+    ];
+    for connector in connectors {
+        assert!(matches!(
+            litebox_broker_core::socket::connect(&session, connector, guest_address),
+            Ok(SocketOutcome::Completed(
+                SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
+            ))
+        ));
+    }
+    wait_until_connected(&session, connectors[0], &publications);
+    wait_until_connected(&session, connectors[1], &publications);
+    assert_eq!(
+        provider.reactor.listener_queue_state(guest_address.port()),
+        Some((2, 2))
+    );
+
+    assert_eq!(
+        litebox_broker_core::socket::listen(&session, listener, 4),
+        Ok(SocketOutcome::Completed(guest_address))
+    );
+    wait_until_connected(&session, connectors[2], &publications);
+    wait_until_connected(&session, connectors[3], &publications);
+    assert_eq!(
+        provider.reactor.listener_queue_state(guest_address.port()),
+        Some((4, 0))
+    );
+    drop(session);
+    let _ = retirements.recv_timeout(TEST_TIMEOUT).unwrap();
+}
+
+#[test]
+fn listener_close_resets_queued_and_refuses_parked_connectors() {
+    let provider = Arc::new(LinuxSocketProvider::new(6, 6).unwrap());
+    let broker = BrokerCore::new_with_limits(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+        BrokerCoreLimits::new_with_all_limits(8, 0, 6, 6),
+        provider.clone(),
+    )
+    .unwrap();
+    let listener_session = broker
+        .create_session(CallerCredential::Unauthenticated)
+        .unwrap();
+    let connector_session = broker
+        .create_session(CallerCredential::Unauthenticated)
+        .unwrap();
+    let (published, publications) = channel();
+    let (retired, retirements) = channel();
+    let readiness = Arc::new(TestReadinessSink { published, retired });
+    let guest_address = guest_address(8096);
+    let listener = create_socket(&listener_session, readiness.clone());
+    assert_eq!(
+        litebox_broker_core::socket::bind(&listener_session, listener, guest_address),
+        Ok(SocketOutcome::Completed(guest_address))
+    );
+    assert_eq!(
+        litebox_broker_core::socket::listen(&listener_session, listener, 1),
+        Ok(SocketOutcome::Completed(guest_address))
+    );
+
+    let queued = create_socket(&connector_session, readiness.clone());
+    assert!(matches!(
+        litebox_broker_core::socket::connect(&connector_session, queued, guest_address),
+        Ok(SocketOutcome::Completed(
+            SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
+        ))
+    ));
+    wait_until_connected(&connector_session, queued, &publications);
+    let parked = create_socket(&connector_session, readiness.clone());
+    assert_eq!(
+        litebox_broker_core::socket::connect(&connector_session, parked, guest_address),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting))
+    );
+    assert_eq!(provider.reactor.queued_accept_count(), 2);
+
+    listener_session.close_object_reference(listener).unwrap();
+    assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), listener);
+    assert_eq!(provider.reactor.queued_accept_count(), 0);
+    assert_eq!(
+        provider.reactor.listener_queue_state(guest_address.port()),
+        None
+    );
+
+    // A connection that was never accepted is aborted, exactly as a native
+    // listener close would reset its unaccepted backlog.
+    wait_until_ready(
+        &connector_session,
+        &publications,
+        queued,
+        ReadinessFlags::ERROR,
+    );
+    assert_eq!(
+        receive_into(
+            &connector_session,
+            queued,
+            &mut [0_u8; 1],
+            ReceiveFlags::NONE,
+            0,
+            0,
+        ),
+        Ok(SocketOutcome::Failed(SocketError::ConnectionReset))
+    );
+    assert_eq!(
+        send_bytes(&connector_session, queued, b"x", SendFlags::NONE),
+        Ok(SocketOutcome::Failed(SocketError::ConnectionReset))
+    );
+    assert_eq!(
+        wait_until_failed(&connector_session, parked, &publications),
+        SocketError::ConnectionRefused
+    );
+    drop(connector_session);
+    drop(listener_session);
+    let _ = retirements.recv_timeout(TEST_TIMEOUT).unwrap();
+}
+
+#[test]
+fn connector_and_session_teardown_release_queued_accepts() {
+    let provider = Arc::new(LinuxSocketProvider::new(4, 3).unwrap());
+    let broker = BrokerCore::new_with_limits(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+        BrokerCoreLimits::new_with_all_limits(8, 0, 4, 4),
         provider.clone(),
     )
     .unwrap();
@@ -1062,18 +1210,35 @@ fn connector_and_session_teardown_clean_bounded_pending_state() {
         Ok(SocketOutcome::Completed(guest_address))
     );
 
-    let connector = create_socket(&connector_session, readiness.clone());
+    let first = create_socket(&connector_session, readiness.clone());
     assert!(matches!(
-        litebox_broker_core::socket::connect(&connector_session, connector, guest_address,),
+        litebox_broker_core::socket::connect(&connector_session, first, guest_address),
         Ok(SocketOutcome::Completed(
             SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
         ))
     ));
-    wait_until_connected(&connector_session, connector, &publications);
-    connector_session.close_object_reference(connector).unwrap();
-    assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), connector);
-    assert_eq!(provider.reactor.pending_guest_connection_count(), 1);
-    assert_eq!(provider.reactor.retained_connector_count(), 1);
+    wait_until_connected(&connector_session, first, &publications);
+    connector_session.close_object_reference(first).unwrap();
+    assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), first);
+    // A graceful close keeps the queued connection acceptable, so its slot
+    // stays charged to the connector session.
+    assert_eq!(provider.reactor.queued_accept_count(), 1);
+    assert_eq!(
+        provider.reactor.listener_queue_state(guest_address.port()),
+        Some((1, 0))
+    );
+
+    let second = create_socket(&connector_session, readiness.clone());
+    assert!(matches!(
+        litebox_broker_core::socket::connect(&connector_session, second, guest_address),
+        Ok(SocketOutcome::Completed(
+            SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
+        ))
+    ));
+    wait_until_connected(&connector_session, second, &publications);
+    assert_eq!(provider.reactor.queued_accept_count(), 2);
+    // Queued accepts are charged like live sockets, so the session budget is
+    // exhausted even though only one of its sockets is still open.
     assert_eq!(
         litebox_broker_core::socket::create(
             &connector_session,
@@ -1086,68 +1251,82 @@ fn connector_and_session_teardown_clean_bounded_pending_state() {
         ),
         Err(BrokerError::ResourceExhausted)
     );
-    assert_ne!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), listener);
+    // The rejected create still retires the handle it reserved.
+    assert_ne!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), second);
 
     drop(connector_session);
-    assert_eq!(provider.reactor.pending_guest_connection_count(), 1);
-    assert_eq!(provider.reactor.retained_connector_count(), 0);
-    provider.reactor.expire_pending_guest_connections();
-    assert_eq!(provider.reactor.pending_guest_connection_count(), 0);
-
-    let blocked_connector_session = broker
-        .create_session(CallerCredential::Unauthenticated)
-        .unwrap();
-    let blocked_connector = create_socket(&blocked_connector_session, readiness.clone());
+    assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), second);
+    assert_eq!(provider.reactor.queued_accept_count(), 0);
     assert_eq!(
-        litebox_broker_core::socket::connect(
-            &blocked_connector_session,
-            blocked_connector,
-            guest_address,
-        ),
-        Ok(SocketOutcome::Completed(SocketConnectionStatus::Failed(
-            SocketError::ConnectionRefused
-        )))
-    );
-    blocked_connector_session
-        .close_object_reference(blocked_connector)
-        .unwrap();
-    assert_eq!(
-        retirements.recv_timeout(TEST_TIMEOUT).unwrap(),
-        blocked_connector
-    );
-
-    wait_until_ready(
-        &listener_session,
-        &publications,
-        listener,
-        ReadinessFlags::READ,
+        provider.reactor.listener_queue_state(guest_address.port()),
+        Some((0, 0))
     );
     assert!(matches!(
-        litebox_broker_core::socket::accept(&listener_session, listener, readiness.clone(),),
+        litebox_broker_core::socket::accept(&listener_session, listener, readiness.clone()),
         Err(BrokerError::WouldBlock)
     ));
     assert_ne!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), listener);
 
-    let final_connector_session = broker
-        .create_session(CallerCredential::Unauthenticated)
-        .unwrap();
-    let final_connector = create_socket(&final_connector_session, readiness);
-    assert!(matches!(
-        litebox_broker_core::socket::connect(
-            &final_connector_session,
-            final_connector,
-            guest_address,
-        ),
-        Ok(SocketOutcome::Completed(
-            SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
-        ))
-    ));
-    wait_until_connected(&final_connector_session, final_connector, &publications);
-    assert_eq!(provider.reactor.pending_guest_connection_count(), 1);
     listener_session.close_object_reference(listener).unwrap();
     assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), listener);
-    assert_eq!(provider.reactor.pending_guest_connection_count(), 0);
-    assert_eq!(provider.reactor.retained_connector_count(), 0);
+    assert_eq!(provider.reactor.queued_accept_count(), 0);
+    drop(listener_session);
+}
+
+#[test]
+fn guest_connect_budget_counts_live_and_queued_resources_together() {
+    let provider = Arc::new(LinuxSocketProvider::new(5, 2).unwrap());
+    let broker = BrokerCore::new_with_limits(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+        BrokerCoreLimits::new_with_all_limits(8, 0, 5, 5),
+        provider.clone(),
+    )
+    .unwrap();
+    let listener_session = broker
+        .create_session(CallerCredential::Unauthenticated)
+        .unwrap();
+    let connector_session = broker
+        .create_session(CallerCredential::Unauthenticated)
+        .unwrap();
+    let (published, _publications) = channel();
+    let (retired, retirements) = channel();
+    let readiness = Arc::new(TestReadinessSink { published, retired });
+    let guest_address = guest_address(8098);
+    let listener = create_socket(&listener_session, readiness.clone());
+    assert_eq!(
+        litebox_broker_core::socket::bind(&listener_session, listener, guest_address),
+        Ok(SocketOutcome::Completed(guest_address))
+    );
+    assert_eq!(
+        litebox_broker_core::socket::listen(&listener_session, listener, 1),
+        Ok(SocketOutcome::Completed(guest_address))
+    );
+
+    let first = create_socket(&connector_session, readiness.clone());
+    let second = create_socket(&connector_session, readiness);
+    assert_eq!(
+        litebox_broker_core::socket::connect(&connector_session, first, guest_address),
+        Err(BrokerError::ResourceExhausted)
+    );
+    assert_eq!(provider.reactor.queued_accept_count(), 0);
+    assert_eq!(
+        provider.reactor.listener_queue_state(guest_address.port()),
+        Some((0, 0))
+    );
+    let first_address = litebox_broker_core::socket::status(&connector_session, first)
+        .unwrap()
+        .local_address
+        .unwrap();
+    assert_eq!(
+        provider.reactor.tcp_transport_kind(first_address),
+        Some(TcpTransportKind::NoDescriptor)
+    );
+
+    connector_session.close_object_reference(first).unwrap();
+    connector_session.close_object_reference(second).unwrap();
+    assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), first);
+    assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), second);
 }
 
 #[test]
@@ -1171,15 +1350,18 @@ fn guest_connect_capacity_failure_leaves_external_retry_unbound() {
             .unwrap(),
     )])
     .unwrap();
-    let provider = Arc::new(LinuxSocketProvider::new(3, 1).unwrap());
+    let provider = Arc::new(LinuxSocketProvider::new(4, 4).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(socket_policy),
-        BrokerCoreLimits::new_with_all_limits(6, 0, 3, 1),
+        BrokerCoreLimits::new_with_all_limits(8, 0, 4, 4),
         provider.clone(),
     )
     .unwrap();
     let listener_session = broker
+        .create_session(CallerCredential::Unauthenticated)
+        .unwrap();
+    let retry_session = broker
         .create_session(CallerCredential::Unauthenticated)
         .unwrap();
     let connector_session = broker
@@ -1199,56 +1381,43 @@ fn guest_connect_capacity_failure_leaves_external_retry_unbound() {
         Ok(SocketOutcome::Completed(guest_address))
     );
 
-    let first = create_socket(&connector_session, readiness.clone());
+    let retry = create_socket(&retry_session, readiness.clone());
+    // Another session consumes the last reactor slot with a queued accept
+    // before this socket connects anywhere.
+    let connector = create_socket(&connector_session, readiness.clone());
     assert!(matches!(
-        litebox_broker_core::socket::connect(&connector_session, first, guest_address),
+        litebox_broker_core::socket::connect(&connector_session, connector, guest_address),
         Ok(SocketOutcome::Completed(
             SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
         ))
     ));
-    wait_until_connected(&connector_session, first, &publications);
-    assert_eq!(
-        litebox_broker_core::socket::shutdown(&connector_session, first, ShutdownMode::Abort,),
-        Ok(SocketOutcome::Completed(()))
-    );
-    connector_session.close_object_reference(first).unwrap();
-    assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), first);
-    assert_eq!(provider.reactor.pending_guest_connection_count(), 1);
-    assert_eq!(provider.reactor.retained_connector_count(), 0);
+    wait_until_connected(&connector_session, connector, &publications);
+    assert_eq!(provider.reactor.queued_accept_count(), 1);
 
-    let retry_listener = create_socket(&connector_session, readiness.clone());
     assert_eq!(
-        litebox_broker_core::socket::connect(&connector_session, retry_listener, guest_address,),
+        litebox_broker_core::socket::connect(&retry_session, retry, guest_address),
         Err(BrokerError::ResourceExhausted)
     );
-    let SocketOutcome::Completed(retry_listener_address) =
-        litebox_broker_core::socket::listen(&connector_session, retry_listener, 1).unwrap()
-    else {
-        panic!("retryable connect failure corrupted listener identity");
-    };
-    assert!(retry_listener_address.ip().is_unspecified());
-    connector_session
-        .close_object_reference(retry_listener)
-        .unwrap();
     assert_eq!(
-        retirements.recv_timeout(TEST_TIMEOUT).unwrap(),
-        retry_listener
+        provider.reactor.listener_queue_state(guest_address.port()),
+        Some((1, 0)),
+        "a refused connect must not add itself to the listener queue"
     );
+    assert_eq!(provider.reactor.queued_accept_count(), 1);
 
-    let retry = create_socket(&connector_session, readiness);
-    assert_eq!(
-        litebox_broker_core::socket::connect(&connector_session, retry, guest_address),
-        Err(BrokerError::ResourceExhausted)
-    );
+    // The external route needs no accept slot, so the same socket stays
+    // usable after the guest route was refused.
     assert!(matches!(
-        litebox_broker_core::socket::connect(&connector_session, retry, external_address),
+        litebox_broker_core::socket::connect(&retry_session, retry, external_address),
         Ok(SocketOutcome::Completed(
             SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
         ))
     ));
-    wait_until_connected(&connector_session, retry, &publications);
+    wait_until_connected(&retry_session, retry, &publications);
     let (_, peer_address) = external_listener.accept().unwrap();
     assert_eq!(peer_address.ip(), local_ip);
+    drop(retry_session);
+    let _ = retirements.recv_timeout(TEST_TIMEOUT).unwrap();
 }
 
 #[test]
@@ -1296,7 +1465,7 @@ fn graceful_connector_close_preserves_late_accept_and_eof() {
 
     connector_session.close_object_reference(connector).unwrap();
     assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), connector);
-    assert_eq!(provider.reactor.retained_connector_count(), 1);
+    assert_eq!(provider.reactor.queued_accept_count(), 1);
     wait_until_ready(
         &listener_session,
         &publications,
@@ -1311,14 +1480,13 @@ fn graceful_connector_close_preserves_late_accept_and_eof() {
         SocketOutcome::Failed(error) => panic!("late accept failed: {error:?}"),
     };
     assert_eq!(accepted.remote_address, connector_address);
-    assert_eq!(provider.reactor.pending_guest_connection_count(), 0);
-    assert_eq!(provider.reactor.retained_connector_count(), 0);
+    assert_eq!(provider.reactor.queued_accept_count(), 0);
     wait_for_end_of_stream(&listener_session, accepted.handle, &publications);
 }
 
 #[test]
-fn abortive_connector_close_releases_descriptor_capacity() {
-    let provider = Arc::new(LinuxSocketProvider::new(3, 1).unwrap());
+fn abortive_connector_close_releases_queued_capacity() {
+    let provider = Arc::new(LinuxSocketProvider::new(3, 2).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::Ipv4Loopback),
@@ -1354,243 +1522,46 @@ fn abortive_connector_close_releases_descriptor_capacity() {
         ))
     ));
     wait_until_connected(&connector_session, connector, &publications);
+    assert_eq!(provider.reactor.queued_accept_count(), 1);
     assert_eq!(
         litebox_broker_core::socket::shutdown(&connector_session, connector, ShutdownMode::Abort,),
         Ok(SocketOutcome::Completed(()))
     );
     connector_session.close_object_reference(connector).unwrap();
     assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), connector);
-    assert_eq!(provider.reactor.pending_guest_connection_count(), 1);
-    assert_eq!(provider.reactor.retained_connector_count(), 0);
-
-    provider.reactor.expire_pending_guest_connections();
-    assert_eq!(provider.reactor.pending_guest_connection_count(), 0);
-    assert_eq!(provider.reactor.retained_connector_count(), 0);
-
-    let replacement = create_socket(&connector_session, readiness.clone());
+    // An abortive close discards the queued connection immediately, so the
+    // listener never observes it and the accept slot is released.
+    assert_eq!(provider.reactor.queued_accept_count(), 0);
     assert_eq!(
-        litebox_broker_core::socket::connect(&connector_session, replacement, guest_address,),
-        Ok(SocketOutcome::Completed(SocketConnectionStatus::Failed(
-            SocketError::ConnectionRefused
-        )))
+        provider.reactor.listener_queue_state(guest_address.port()),
+        Some((0, 0))
     );
-    connector_session
-        .close_object_reference(replacement)
-        .unwrap();
-    assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), replacement);
-
-    loop {
-        match litebox_broker_core::socket::accept(&listener_session, listener, readiness.clone()) {
-            Err(BrokerError::WouldBlock) => break,
-            Ok(SocketOutcome::Failed(
-                SocketError::ConnectionAborted | SocketError::ConnectionReset,
-            )) => {}
-            _ => panic!("unexpected stale accept outcome"),
-        }
-    }
-
-    let final_connector = create_socket(&connector_session, readiness);
-    assert!(matches!(
-        litebox_broker_core::socket::connect(&connector_session, final_connector, guest_address,),
-        Ok(SocketOutcome::Completed(
-            SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
-        ))
-    ));
-    wait_until_connected(&connector_session, final_connector, &publications);
-}
-
-#[test]
-fn accept_bounds_unmatched_private_connections_per_command() {
-    let provider = Arc::new(LinuxSocketProvider::new(3, 2).unwrap());
-    let broker = BrokerCore::new_with_limits(
-        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
-        BrokerCoreLimits::new_with_all_limits(8, 0, 3, 3),
-        provider.clone(),
-    )
-    .unwrap();
-    let listener_session = broker
-        .create_session(CallerCredential::Unauthenticated)
-        .unwrap();
-    let connector_session = broker
-        .create_session(CallerCredential::Unauthenticated)
-        .unwrap();
-    let (published, publications) = channel();
-    let (retired, _retirements) = channel();
-    let readiness = Arc::new(TestReadinessSink { published, retired });
-    let guest_address = guest_address(8087);
-    let listener = create_socket(&listener_session, readiness.clone());
-    assert_eq!(
-        litebox_broker_core::socket::bind(&listener_session, listener, guest_address),
-        Ok(SocketOutcome::Completed(guest_address))
-    );
-    let unmatched_connection_count = MAX_UNMATCHED_ACCEPTS_PER_COMMAND;
-    assert_eq!(
-        litebox_broker_core::socket::listen(
-            &listener_session,
-            listener,
-            u32::try_from(unmatched_connection_count + 2).unwrap(),
-        ),
-        Ok(SocketOutcome::Completed(guest_address))
-    );
-    let private_address = provider.reactor.host_address(guest_address.port()).unwrap();
-    let _unmatched_connections = (0..unmatched_connection_count)
-        .map(|_| TcpStream::connect(private_address).unwrap())
-        .collect::<Vec<_>>();
-
-    let connector = create_socket(&connector_session, readiness.clone());
-    assert!(matches!(
-        litebox_broker_core::socket::connect(&connector_session, connector, guest_address,),
-        Ok(SocketOutcome::Completed(
-            SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
-        ))
-    ));
-    wait_until_connected(&connector_session, connector, &publications);
-    let connector_address = litebox_broker_core::socket::status(&connector_session, connector)
-        .unwrap()
-        .local_address
-        .unwrap();
-    wait_until_ready(
-        &listener_session,
-        &publications,
-        listener,
-        ReadinessFlags::READ,
-    );
-    assert_eq!(provider.reactor.pending_guest_connection_count(), 1);
-    while publications.try_recv().is_ok() {}
-
-    assert!(matches!(
-        litebox_broker_core::socket::accept(&listener_session, listener, readiness.clone(),),
-        Err(BrokerError::WouldBlock)
-    ));
     assert!(
-        listener_session
+        !listener_session
             .check_readiness(listener)
             .unwrap()
             .contains(ReadinessFlags::READ)
     );
-    wait_for_readiness(&publications, listener, ReadinessFlags::READ);
-    let accepted = match litebox_broker_core::socket::accept(&listener_session, listener, readiness)
-        .unwrap()
-    {
-        SocketOutcome::Completed(accepted) => accepted,
-        SocketOutcome::Failed(error) => panic!("guest accept failed: {error:?}"),
-    };
-    assert_eq!(accepted.remote_address, connector_address);
-}
-
-#[test]
-fn accept_preserves_a_queued_connection_when_retained_capacity_is_unrelated() {
-    let provider = Arc::new(LinuxSocketProvider::new(4, 4).unwrap());
-    let broker = BrokerCore::new_with_limits(
-        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
-        BrokerCoreLimits::new_with_all_limits(8, 0, 5, 5),
-        provider.clone(),
-    )
-    .unwrap();
-    let target_listener_session = broker
-        .create_session(CallerCredential::Unauthenticated)
-        .unwrap();
-    let target_connector_session = broker
-        .create_session(CallerCredential::Unauthenticated)
-        .unwrap();
-    let other_listener_session = broker
-        .create_session(CallerCredential::Unauthenticated)
-        .unwrap();
-    let other_connector_session = broker
-        .create_session(CallerCredential::Unauthenticated)
-        .unwrap();
-    let (published, publications) = channel();
-    let (retired, _retirements) = channel();
-    let readiness = Arc::new(TestReadinessSink { published, retired });
-    let target_address = guest_address(8084);
-    let other_address = guest_address(8085);
-
-    let target_listener = create_socket(&target_listener_session, readiness.clone());
-    let other_listener = create_socket(&other_listener_session, readiness.clone());
-    for (session, listener, address) in [
-        (&target_listener_session, target_listener, target_address),
-        (&other_listener_session, other_listener, other_address),
-    ] {
-        assert_eq!(
-            litebox_broker_core::socket::bind(session, listener, address),
-            Ok(SocketOutcome::Completed(address))
-        );
-        assert_eq!(
-            litebox_broker_core::socket::listen(session, listener, 1),
-            Ok(SocketOutcome::Completed(address))
-        );
-    }
-
-    let target_connector = create_socket(&target_connector_session, readiness.clone());
-    let other_connector = create_socket(&other_connector_session, readiness.clone());
-    for (session, connector, address) in [
-        (&target_connector_session, target_connector, target_address),
-        (&other_connector_session, other_connector, other_address),
-    ] {
-        assert!(matches!(
-            litebox_broker_core::socket::connect(session, connector, address),
-            Ok(SocketOutcome::Completed(
-                SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
-            ))
-        ));
-        wait_until_connected(session, connector, &publications);
-    }
-    let target_connector_address =
-        litebox_broker_core::socket::status(&target_connector_session, target_connector)
-            .unwrap()
-            .local_address
-            .unwrap();
-    other_connector_session
-        .close_object_reference(other_connector)
-        .unwrap();
-    assert_eq!(provider.reactor.pending_guest_connection_count(), 2);
-    assert_eq!(provider.reactor.retained_connector_count(), 1);
-
-    let deadline = Instant::now() + TEST_TIMEOUT;
-    while !target_listener_session
-        .check_readiness(target_listener)
-        .unwrap()
-        .contains(ReadinessFlags::READ)
-    {
-        assert!(
-            Instant::now() < deadline,
-            "target listener did not become ready"
-        );
-        std::thread::yield_now();
-    }
     assert!(matches!(
-        litebox_broker_core::socket::accept(
-            &target_listener_session,
-            target_listener,
-            readiness.clone(),
-        ),
-        Err(BrokerError::ResourceExhausted)
+        litebox_broker_core::socket::accept(&listener_session, listener, readiness.clone()),
+        Err(BrokerError::WouldBlock)
     ));
-    assert_eq!(provider.reactor.pending_guest_connection_count(), 2);
+    assert_ne!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), listener);
 
-    other_listener_session
-        .close_object_reference(other_listener)
-        .unwrap();
-    assert_eq!(provider.reactor.pending_guest_connection_count(), 1);
-    assert_eq!(provider.reactor.retained_connector_count(), 0);
-    let accepted = match litebox_broker_core::socket::accept(
-        &target_listener_session,
-        target_listener,
-        readiness,
-    )
-    .unwrap()
-    {
-        SocketOutcome::Completed(accepted) => accepted,
-        SocketOutcome::Failed(error) => panic!("target accept failed: {error:?}"),
-    };
-    assert_eq!(accepted.remote_address, target_connector_address);
+    let replacement = create_socket(&connector_session, readiness);
+    assert!(matches!(
+        litebox_broker_core::socket::connect(&connector_session, replacement, guest_address,),
+        Ok(SocketOutcome::Completed(
+            SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
+        ))
+    ));
+    wait_until_connected(&connector_session, replacement, &publications);
+    assert_eq!(provider.reactor.queued_accept_count(), 1);
 }
 
 #[test]
 fn stop_listening_cleanup_survives_readiness_failure() {
-    let provider = Arc::new(LinuxSocketProvider::new(3, 1).unwrap());
+    let provider = Arc::new(LinuxSocketProvider::new(3, 2).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::Ipv4Loopback),
@@ -1620,7 +1591,6 @@ fn stop_listening_cleanup_survives_readiness_failure() {
         litebox_broker_core::socket::listen(&listener_session, listener, 1),
         Ok(SocketOutcome::Completed(guest_address))
     );
-    let private_address = provider.reactor.host_address(guest_address.port()).unwrap();
 
     let connector = create_socket(&connector_session, readiness.clone());
     assert!(matches!(
@@ -1638,8 +1608,7 @@ fn stop_listening_cleanup_survives_readiness_failure() {
     );
     connector_session.close_object_reference(connector).unwrap();
     assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), connector);
-    assert_eq!(provider.reactor.pending_guest_connection_count(), 1);
-    assert_eq!(provider.reactor.retained_connector_count(), 1);
+    assert_eq!(provider.reactor.queued_accept_count(), 1);
 
     readiness.fail_next_publish_matching(listener, ReadinessFlags::HANGUP, ReadinessFlags::READ);
     assert_eq!(
@@ -1655,11 +1624,10 @@ fn stop_listening_cleanup_survives_readiness_failure() {
     assert!(listener_readiness.contains(ReadinessFlags::WRITE));
     assert!(listener_readiness.contains(ReadinessFlags::HANGUP));
     assert!(!listener_readiness.contains(ReadinessFlags::READ));
-    assert_eq!(provider.reactor.pending_guest_connection_count(), 0);
-    assert_eq!(provider.reactor.retained_connector_count(), 0);
+    assert_eq!(provider.reactor.queued_accept_count(), 0);
     assert_eq!(
-        provider.reactor.host_address(guest_address.port()),
-        Some(private_address)
+        provider.reactor.listener_queue_state(guest_address.port()),
+        Some((0, 0))
     );
     assert_eq!(
         litebox_broker_core::socket::listen(&listener_session, listener, 1),
@@ -1677,9 +1645,11 @@ fn stop_listening_cleanup_survives_readiness_failure() {
     assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), refused);
     listener_session.close_object_reference(listener).unwrap();
     assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), listener);
-    assert_eq!(provider.reactor.pending_guest_connection_count(), 0);
-    assert_eq!(provider.reactor.retained_connector_count(), 0);
-    assert_eq!(provider.reactor.host_address(guest_address.port()), None);
+    assert_eq!(provider.reactor.queued_accept_count(), 0);
+    assert_eq!(
+        provider.reactor.listener_queue_state(guest_address.port()),
+        None
+    );
 }
 
 #[test]
@@ -1708,12 +1678,11 @@ fn reactor_drives_a_loopback_tcp_listener() {
     assert!(local_address.ip().is_unspecified());
     assert_ne!(local_address.port(), 0);
     let listener_guest_address = guest_address(local_address.port());
-    let private_address = provider
-        .reactor
-        .host_address(local_address.port())
-        .expect("listening socket must have a private host endpoint");
-    assert!(private_address.ip().is_loopback());
-    assert_ne!(private_address.port(), 0);
+    assert_eq!(
+        provider.reactor.tcp_transport_kind(local_address),
+        Some(TcpTransportKind::NoDescriptor),
+        "a guest listener must never own a host descriptor"
+    );
     assert_eq!(
         litebox_broker_core::socket::shutdown(&session, listener, ShutdownMode::Write),
         Ok(SocketOutcome::Failed(SocketError::NotConnected))
