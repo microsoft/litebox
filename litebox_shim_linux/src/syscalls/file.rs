@@ -113,11 +113,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
         typed_fd: TypedFd<Subsystem>,
     ) -> Result<usize, TypedFd<Subsystem>> {
         let fd_limit = self.fd_limit.load(Ordering::Relaxed);
-        self.insert_raw_fd_at_or_above(typed_fd, 0, fd_limit)
+        self.insert_raw_fd_at_or_above_locked(rds, typed_fd, 0, fd_limit)
     }
 
     fn insert_raw_fd_at_or_above<Subsystem: FdEnabledSubsystem>(
         &self,
+        typed_fd: TypedFd<Subsystem>,
+        min_fd: usize,
+        fd_limit: usize,
+    ) -> Result<usize, TypedFd<Subsystem>> {
+        let mut rds = self.raw_descriptor_store.write();
+        self.insert_raw_fd_at_or_above_locked(&mut rds, typed_fd, min_fd, fd_limit)
+    }
+
+    fn insert_raw_fd_at_or_above_locked<Subsystem: FdEnabledSubsystem>(
+        &self,
+        rds: &mut litebox::fd::RawDescriptorStorage,
         typed_fd: TypedFd<Subsystem>,
         min_fd: usize,
         fd_limit: usize,
