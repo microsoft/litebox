@@ -32,17 +32,92 @@ const DEFAULT_TCP_LOCAL_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCA
 const DEFAULT_UDP_LOCAL_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
 const FIRST_EPHEMERAL_PORT: u16 = 49152;
 
-#[derive(Default)]
-struct BrokerSocketPortState {
-    guest_tcp: GuestTransportPortState,
-    guest_udp: GuestTransportPortState,
+/// Platform-observed socket state returned to the broker for reconciliation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlatformSocketStatus {
+    /// Current platform connection state.
+    pub status: SocketConnectionStatus,
+    /// Local endpoint observed by the platform, if any.
+    pub local_address: Option<SocketAddrV4>,
+    /// Pending asynchronous socket error consumed by this observation.
+    pub pending_error: Option<SocketError>,
 }
 
 #[derive(Default)]
-struct GuestTransportPortState {
+struct BrokerSocketPortState {
+    guest_tcp: GuestTransportBindingState,
+    guest_udp: GuestTransportBindingState,
+}
+
+#[derive(Default)]
+struct GuestTransportBindingState {
     wildcard: HashSet<u16>,
     exact: HashSet<SocketAddrV4>,
     next_ephemeral: Option<u16>,
+}
+
+impl GuestTransportBindingState {
+    fn allocate_ephemeral(&mut self, requested_address: SocketAddrV4) -> Result<u16> {
+        let start = self.next_ephemeral.unwrap_or(FIRST_EPHEMERAL_PORT);
+        let mut port = start;
+        loop {
+            let candidate = SocketAddrV4::new(*requested_address.ip(), port);
+            if !self.conflicts(candidate) {
+                self.next_ephemeral = Some(if port == u16::MAX {
+                    FIRST_EPHEMERAL_PORT
+                } else {
+                    port + 1
+                });
+                return Ok(port);
+            }
+            port = if port == u16::MAX {
+                FIRST_EPHEMERAL_PORT
+            } else {
+                port + 1
+            };
+            if port == start {
+                return Err(BrokerError::ResourceExhausted);
+            }
+        }
+    }
+
+    fn conflicts(&self, requested_address: SocketAddrV4) -> bool {
+        if self.wildcard.contains(&requested_address.port()) {
+            return true;
+        }
+
+        if requested_address.ip().is_unspecified() {
+            self.exact
+                .iter()
+                .any(|address| address.port() == requested_address.port())
+        } else {
+            self.exact.contains(&requested_address)
+        }
+    }
+
+    fn insert(&mut self, key: GuestBindingKey) -> Result<bool> {
+        match key {
+            GuestBindingKey::Wildcard(port) => {
+                self.wildcard
+                    .try_reserve(1)
+                    .map_err(|_| BrokerError::OutOfMemory)?;
+                Ok(self.wildcard.insert(port))
+            }
+            GuestBindingKey::Exact(address) => {
+                self.exact
+                    .try_reserve(1)
+                    .map_err(|_| BrokerError::OutOfMemory)?;
+                Ok(self.exact.insert(address))
+            }
+        }
+    }
+
+    fn remove(&mut self, key: GuestBindingKey) -> bool {
+        match key {
+            GuestBindingKey::Wildcard(port) => self.wildcard.remove(&port),
+            GuestBindingKey::Exact(address) => self.exact.remove(&address),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,6 +140,7 @@ struct GuestBindingReservation {
 
 impl GuestBindingReservation {
     fn covers(&self, address: SocketAddrV4) -> bool {
+        // TODO: Allow the configured guest private address once shared guest identity is added.
         if address.port() == 0 || !address.ip().is_loopback() {
             return false;
         }
@@ -109,31 +185,19 @@ impl BrokerSocketPorts {
             GuestTransport::Udp => &mut state.guest_udp,
         };
         let port = if requested_address.port() == 0 {
-            allocate_ephemeral(ports, requested_address)?
-        } else if binding_conflicts(ports, requested_address) {
+            ports.allocate_ephemeral(requested_address)?
+        } else if ports.conflicts(requested_address) {
             return Ok(SocketOutcome::Failed(SocketError::AddressInUse));
         } else {
             requested_address.port()
         };
         let local_address = SocketAddrV4::new(*requested_address.ip(), port);
         let key = if local_address.ip().is_unspecified() {
-            ports
-                .wildcard
-                .try_reserve(1)
-                .map_err(|_| BrokerError::OutOfMemory)?;
             GuestBindingKey::Wildcard(port)
         } else {
-            ports
-                .exact
-                .try_reserve(1)
-                .map_err(|_| BrokerError::OutOfMemory)?;
             GuestBindingKey::Exact(local_address)
         };
-        let inserted = match key {
-            GuestBindingKey::Wildcard(port) => ports.wildcard.insert(port),
-            GuestBindingKey::Exact(address) => ports.exact.insert(address),
-        };
-        if !inserted {
+        if !ports.insert(key)? {
             return Err(BrokerError::Internal);
         }
         drop(state);
@@ -152,48 +216,6 @@ fn guest_binding_address_is_valid(address: SocketAddrV4) -> bool {
     address.ip().is_unspecified() || address.ip().is_loopback()
 }
 
-fn allocate_ephemeral(
-    ports: &mut GuestTransportPortState,
-    requested_address: SocketAddrV4,
-) -> Result<u16> {
-    let start = ports.next_ephemeral.unwrap_or(FIRST_EPHEMERAL_PORT);
-    let mut port = start;
-    loop {
-        let candidate = SocketAddrV4::new(*requested_address.ip(), port);
-        if !binding_conflicts(ports, candidate) {
-            ports.next_ephemeral = Some(if port == u16::MAX {
-                FIRST_EPHEMERAL_PORT
-            } else {
-                port + 1
-            });
-            return Ok(port);
-        }
-        port = if port == u16::MAX {
-            FIRST_EPHEMERAL_PORT
-        } else {
-            port + 1
-        };
-        if port == start {
-            return Err(BrokerError::ResourceExhausted);
-        }
-    }
-}
-
-fn binding_conflicts(ports: &GuestTransportPortState, requested_address: SocketAddrV4) -> bool {
-    if ports.wildcard.contains(&requested_address.port()) {
-        return true;
-    }
-
-    if requested_address.ip().is_unspecified() {
-        ports
-            .exact
-            .iter()
-            .any(|address| address.port() == requested_address.port())
-    } else {
-        ports.exact.contains(&requested_address)
-    }
-}
-
 impl Drop for GuestBindingReservation {
     fn drop(&mut self) {
         let mut state = self.ports.state.lock();
@@ -201,10 +223,7 @@ impl Drop for GuestBindingReservation {
             GuestTransport::Tcp => &mut state.guest_tcp,
             GuestTransport::Udp => &mut state.guest_udp,
         };
-        let removed = match self.key {
-            GuestBindingKey::Wildcard(port) => ports.wildcard.remove(&port),
-            GuestBindingKey::Exact(address) => ports.exact.remove(&address),
-        };
+        let removed = ports.remove(self.key);
         debug_assert!(removed, "live guest binding reservation must be registered");
     }
 }
@@ -407,7 +426,7 @@ pub trait PlatformSocket: Send + Sync {
     /// broker owns the peer state; the platform reports pending asynchronous
     /// errors and may specialize the local IP address after external routing,
     /// but it must preserve the broker-reserved local port.
-    fn status(&self) -> Result<SocketStatusResponse>;
+    fn status(&self) -> Result<PlatformSocketStatus>;
 
     /// Synchronously and idempotently ends this socket's platform authority.
     ///
@@ -1210,17 +1229,17 @@ fn stream_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRespo
         });
     }
 
-    let mut response = resource.status()?;
+    let platform_status = resource.status()?;
     let mut object = object.write();
     let ObjectEntry::Socket(socket) = &mut *object else {
         return Err(BrokerError::InvalidRights);
     };
     if socket.connection_status == SocketConnectionStatus::Connecting
-        && response.status == SocketConnectionStatus::Unconnected
+        && platform_status.status == SocketConnectionStatus::Unconnected
     {
         return Err(BrokerError::Internal);
     }
-    if let Some(observed) = response.local_address {
+    if let Some(observed) = platform_status.local_address {
         match socket.local_address {
             Some(reserved) if reserved.ip().is_unspecified() => {
                 if observed.port() != reserved.port() || !observed.ip().is_loopback() {
@@ -1232,14 +1251,15 @@ fn stream_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRespo
             Some(_) => {}
         }
     }
-    response.local_address = socket.local_address;
     if socket.connection_status == SocketConnectionStatus::Connecting {
-        socket.connection_status = response.status;
-    } else {
-        // Another status call reached a terminal state while this platform query was in flight.
-        response.status = socket.connection_status;
+        socket.connection_status = platform_status.status;
     }
-    Ok(response)
+    // Another status call may have reached a terminal state while this platform query was in flight.
+    Ok(SocketStatusResponse {
+        status: socket.connection_status,
+        local_address: socket.local_address,
+        pending_error: platform_status.pending_error,
+    })
 }
 
 /// Queries datagram errors and address refinement without surrendering the
@@ -1295,25 +1315,27 @@ fn datagram_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRes
                 pending_error: None,
             });
         }
-        let mut response = resource.status()?;
-        pending_error = pending_error.or(response.pending_error);
+        let platform_status = resource.status()?;
+        pending_error = pending_error.or(platform_status.pending_error);
         let mut object = object.write();
         let ObjectEntry::Socket(socket) = &mut *object else {
             return Err(BrokerError::InvalidRights);
         };
         if socket.resource_retired {
-            response.status = socket.connection_status;
-            response.local_address = socket.local_address;
-            response.pending_error = None;
-            return Ok(response);
+            return Ok(SocketStatusResponse {
+                status: socket.connection_status,
+                local_address: socket.local_address,
+                pending_error: None,
+            });
         }
         if socket.configuration_in_flight {
-            response.status = socket.connection_status;
-            response.local_address = socket.local_address;
-            response.pending_error = pending_error;
-            return Ok(response);
+            return Ok(SocketStatusResponse {
+                status: socket.connection_status,
+                local_address: socket.local_address,
+                pending_error,
+            });
         }
-        let invalid_local_address = match (socket.local_address, response.local_address) {
+        let invalid_local_address = match (socket.local_address, platform_status.local_address) {
             (None, Some(_)) => true,
             (Some(reserved), Some(platform)) => reserved.port() != platform.port(),
             _ => false,
@@ -1328,7 +1350,7 @@ fn datagram_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRes
             return Err(BrokerError::Internal);
         }
         if matches!(
-            response.status,
+            platform_status.status,
             SocketConnectionStatus::Connecting | SocketConnectionStatus::Failed(_)
         ) {
             return Err(BrokerError::Internal);
@@ -1343,17 +1365,19 @@ fn datagram_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRes
             // Continuous peer replacement can race both bounded queries.
             // Do not let an unordered platform snapshot overwrite newer
             // broker observations.
-            response.status = socket.connection_status;
-            socket.local_address = socket.local_address.or(response.local_address);
-            response.local_address = socket.local_address;
-            response.pending_error = pending_error;
-            return Ok(response);
+            socket.local_address = socket.local_address.or(platform_status.local_address);
+            return Ok(SocketStatusResponse {
+                status: socket.connection_status,
+                local_address: socket.local_address,
+                pending_error,
+            });
         }
-        socket.local_address = response.local_address.or(socket.local_address);
-        response.local_address = socket.local_address;
-        response.pending_error = pending_error;
-        response.status = socket.connection_status;
-        return Ok(response);
+        socket.local_address = platform_status.local_address.or(socket.local_address);
+        return Ok(SocketStatusResponse {
+            status: socket.connection_status,
+            local_address: socket.local_address,
+            pending_error,
+        });
     }
 }
 
@@ -1860,7 +1884,7 @@ impl SocketResource {
         self.platform_socket().get_tcp_option(name)
     }
 
-    fn status(&self) -> Result<SocketStatusResponse> {
+    fn status(&self) -> Result<PlatformSocketStatus> {
         self.platform_socket().status()
     }
 
@@ -2096,7 +2120,7 @@ pub(crate) mod tests {
         sent: StdMutex<std::vec::Vec<u8>>,
         connect_calls: AtomicUsize,
         status_calls: AtomicUsize,
-        status_responses: StdMutex<std::collections::VecDeque<SocketStatusResponse>>,
+        status_responses: StdMutex<std::collections::VecDeque<PlatformSocketStatus>>,
         status_block: StdMutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
         binds: StdMutex<std::vec::Vec<SocketAddrV4>>,
         listens: StdMutex<std::vec::Vec<u32>>,
@@ -2364,15 +2388,15 @@ pub(crate) mod tests {
             }
         }
 
-        fn status(&self) -> Result<SocketStatusResponse> {
+        fn status(&self) -> Result<PlatformSocketStatus> {
             self.state.status_calls.fetch_add(1, Ordering::Relaxed);
-            let response = self
+            let status = self
                 .state
                 .status_responses
                 .lock()
                 .unwrap()
                 .pop_front()
-                .unwrap_or(SocketStatusResponse {
+                .unwrap_or(PlatformSocketStatus {
                     status: SocketConnectionStatus::Connected,
                     local_address: None,
                     pending_error: None,
@@ -2382,7 +2406,7 @@ pub(crate) mod tests {
                 started.send(()).unwrap();
                 release.recv_timeout(Duration::from_secs(5)).unwrap();
             }
-            Ok(response)
+            Ok(status)
         }
 
         fn retire(&self) {
@@ -3002,7 +3026,7 @@ pub(crate) mod tests {
             .status_responses
             .lock()
             .unwrap()
-            .push_back(SocketStatusResponse {
+            .push_back(PlatformSocketStatus {
                 status: SocketConnectionStatus::Unconnected,
                 local_address: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152)),
                 pending_error: None,
@@ -3046,7 +3070,7 @@ pub(crate) mod tests {
             .status_responses
             .lock()
             .unwrap()
-            .push_back(SocketStatusResponse {
+            .push_back(PlatformSocketStatus {
                 status: SocketConnectionStatus::Unconnected,
                 local_address: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, changed_port)),
                 pending_error: None,
@@ -3212,12 +3236,12 @@ pub(crate) mod tests {
         )
         .unwrap();
         *provider.state.status_responses.lock().unwrap() = std::collections::VecDeque::from([
-            SocketStatusResponse {
+            PlatformSocketStatus {
                 status: SocketConnectionStatus::Unconnected,
                 local_address: None,
                 pending_error: None,
             },
-            SocketStatusResponse {
+            PlatformSocketStatus {
                 status: SocketConnectionStatus::Connected,
                 local_address: None,
                 pending_error: None,
@@ -3251,12 +3275,12 @@ pub(crate) mod tests {
         let stale_local_address =
             SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), local_address.port());
         *provider.state.status_responses.lock().unwrap() = std::collections::VecDeque::from([
-            SocketStatusResponse {
+            PlatformSocketStatus {
                 status: SocketConnectionStatus::Unconnected,
                 local_address: Some(stale_local_address),
                 pending_error: Some(SocketError::ConnectionRefused),
             },
-            SocketStatusResponse {
+            PlatformSocketStatus {
                 status: SocketConnectionStatus::Connected,
                 local_address: Some(next_local_address),
                 pending_error: Some(SocketError::NetworkUnreachable),
@@ -3672,12 +3696,12 @@ pub(crate) mod tests {
             .expect("automatic TCP bind was not recorded");
         let platform_local_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152);
         *provider.state.status_responses.lock().unwrap() = std::collections::VecDeque::from([
-            SocketStatusResponse {
+            PlatformSocketStatus {
                 status: SocketConnectionStatus::Connecting,
                 local_address: None,
                 pending_error: None,
             },
-            SocketStatusResponse {
+            PlatformSocketStatus {
                 status: SocketConnectionStatus::Connected,
                 local_address: Some(platform_local_address),
                 pending_error: Some(SocketError::ConnectionReset),
@@ -3740,7 +3764,7 @@ pub(crate) mod tests {
             .status_responses
             .lock()
             .unwrap()
-            .push_back(SocketStatusResponse {
+            .push_back(PlatformSocketStatus {
                 status: SocketConnectionStatus::Failed(SocketError::TimedOut),
                 local_address: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49153)),
                 pending_error: None,

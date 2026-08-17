@@ -698,7 +698,7 @@ mod tests {
     use litebox_broker_core::readiness::ReadinessRegistration;
     use litebox_broker_core::socket::{
         AcceptedPlatformSocket, PlatformConnectError, PlatformDatagramReceive, PlatformSocket,
-        PlatformStreamReceive, SocketProvider,
+        PlatformSocketStatus, PlatformStreamReceive, SocketProvider,
     };
     use litebox_broker_core::{ObjectRights, PolicyEngine, SessionId, SocketPolicy};
     use litebox_broker_protocol::event::{
@@ -892,8 +892,8 @@ mod tests {
             }
         }
 
-        fn status(&self) -> litebox_broker_core::Result<SocketStatusResponse> {
-            Ok(SocketStatusResponse {
+        fn status(&self) -> litebox_broker_core::Result<PlatformSocketStatus> {
+            Ok(PlatformSocketStatus {
                 status: SocketConnectionStatus::Connected,
                 local_address: None,
                 pending_error: None,

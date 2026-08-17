@@ -19,14 +19,14 @@ use std::time::Duration;
 
 use litebox_broker_core::socket::{
     AcceptedPlatformSocket, GuestSocketBinding, PlatformConnectError, PlatformDatagramReceive,
-    PlatformSocket, PlatformStreamReceive, SocketProvider,
+    PlatformSocket, PlatformSocketStatus, PlatformStreamReceive, SocketProvider,
 };
 use litebox_broker_core::{BrokerError, Result as BrokerResult, SessionId};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
     AddressFamily, CreateSocketRequest, IpProtocol, MAX_UDP_DATAGRAM_SIZE, ReceiveFlags,
     ReceiveFromFlags, SendFlags, ShutdownMode, SocketConnectionStatus, SocketError, SocketOutcome,
-    SocketStatusResponse, SocketType, TcpOptionName, TcpOptionValue,
+    SocketType, TcpOptionName, TcpOptionValue,
 };
 use rustix::buffer::spare_capacity;
 use rustix::event::{EventfdFlags, Timespec, epoll, eventfd};
@@ -35,7 +35,7 @@ use rustix::net::{getsockname, sockopt};
 
 use litebox_broker_core::readiness::ReadinessRegistration;
 #[cfg(test)]
-use litebox_broker_protocol::socket::MAX_SOCKET_TRANSFER_SIZE;
+use litebox_broker_protocol::socket::{MAX_SOCKET_TRANSFER_SIZE, SocketStatusResponse};
 
 mod tcp;
 mod udp;
@@ -390,7 +390,7 @@ impl PlatformSocket for LinuxSocket {
             })
     }
 
-    fn status(&self) -> BrokerResult<SocketStatusResponse> {
+    fn status(&self) -> BrokerResult<PlatformSocketStatus> {
         self.reactor.request(|response| ReactorCommand::Status {
             id: self.id,
             response,
@@ -824,7 +824,7 @@ enum ReactorCommand {
     },
     Status {
         id: u64,
-        response: SyncSender<BrokerResult<SocketStatusResponse>>,
+        response: SyncSender<BrokerResult<PlatformSocketStatus>>,
     },
     Close {
         id: u64,
@@ -1327,7 +1327,7 @@ impl Reactor {
         Ok(SocketOutcome::Completed(()))
     }
 
-    fn status_socket(&mut self, socket_id: u64) -> BrokerResult<SocketStatusResponse> {
+    fn status_socket(&mut self, socket_id: u64) -> BrokerResult<PlatformSocketStatus> {
         let kind = self
             .sockets
             .get(&socket_id)
@@ -2017,7 +2017,7 @@ fn local_socket_address(socket: &OwnedFd) -> BrokerResult<SocketAddrV4> {
     }
 }
 
-fn status_socket(socket: &mut SocketEntry) -> BrokerResult<SocketStatusResponse> {
+fn status_socket(socket: &mut SocketEntry) -> BrokerResult<PlatformSocketStatus> {
     let query_socket_error = {
         let snapshot = socket
             .snapshot
@@ -2062,7 +2062,7 @@ fn status_socket(socket: &mut SocketEntry) -> BrokerResult<SocketStatusResponse>
             snapshot.readiness = ReadinessFlags(snapshot.readiness.0 & !ReadinessFlags::ERROR.0);
         }
         (
-            SocketStatusResponse {
+            PlatformSocketStatus {
                 status: socket.connection_status,
                 local_address: snapshot.local_address,
                 pending_error,
