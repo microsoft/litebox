@@ -577,7 +577,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         thread | shared
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_arch = "x86_64"))]
     pub(crate) fn take_pending_siginfo(&self, signal: Signal) -> Siginfo {
         self.signals.pending.borrow_mut().remove(signal)
     }
@@ -775,13 +775,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     pub(crate) fn handle_exception_request(
         &self,
         info: &litebox::shim::ExceptionInfo,
-        ctx: &PtRegs,
+        _ctx: &PtRegs,
     ) {
         #[cfg(target_arch = "x86_64")]
         let (signal, fault_address) = match info.exception {
-            Exception::DIVIDE_ERROR => (Signal::SIGFPE, arch::pc(ctx)),
+            Exception::DIVIDE_ERROR => (Signal::SIGFPE, arch::pc(_ctx)),
             Exception::BREAKPOINT => (Signal::SIGTRAP, 0),
-            Exception::INVALID_OPCODE => (Signal::SIGILL, arch::pc(ctx)),
+            Exception::INVALID_OPCODE => (Signal::SIGILL, arch::pc(_ctx)),
             Exception::PAGE_FAULT => (Signal::SIGSEGV, info.cr2),
             // Page faults and unknown exceptions map to SIGSEGV. There may be
             // more appropriate signals in some other cases (e.g., SIGBUS).
