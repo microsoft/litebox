@@ -523,7 +523,7 @@ pub fn connect(
     // evaluating policy remain broker errors.
     match session.core.policy.authorize_socket_connect(
         session.caller_credential,
-        create_request,
+        create_request.protocol,
         address,
     ) {
         Ok(()) => {}
@@ -558,21 +558,6 @@ pub fn connect(
         (Arc::clone(&socket.resource), socket.local_address.is_none())
     };
     if needs_bind {
-        match session
-            .core
-            .policy
-            .authorize_socket_bind(session.caller_credential, create_request)
-        {
-            Ok(()) => {}
-            Err(BrokerError::PolicyDenied) => {
-                finish_connect(&object, SocketConnectionStatus::Unconnected);
-                return Ok(SocketOutcome::Failed(SocketError::PolicyDenied));
-            }
-            Err(error) => {
-                finish_connect(&object, SocketConnectionStatus::Unconnected);
-                return Err(error);
-            }
-        }
         let binding = match reserve_and_bind(
             session,
             create_request,
@@ -621,7 +606,7 @@ pub fn connect(
     Ok(SocketOutcome::Completed(status))
 }
 
-/// Binds a socket to an authorized loopback address.
+/// Binds a socket to a supported guest-namespace address.
 pub fn bind(
     session: &BrokerSession,
     handle: ObjectHandle,
@@ -647,21 +632,6 @@ pub fn bind(
         socket.configuration_in_flight = true;
         (Arc::clone(&socket.resource), socket.create_request)
     };
-    match session
-        .core
-        .policy
-        .authorize_socket_bind(session.caller_credential, create_request)
-    {
-        Ok(()) => {}
-        Err(BrokerError::PolicyDenied) => {
-            finish_configuration(&object, None, None, false)?;
-            return Ok(SocketOutcome::Failed(SocketError::PolicyDenied));
-        }
-        Err(error) => {
-            finish_configuration(&object, None, None, false)?;
-            return Err(error);
-        }
-    }
     if guest_transport(create_request).is_none() {
         finish_retired_configuration(&object, None, None)?;
         resource.retire();
@@ -726,21 +696,6 @@ pub fn listen(
     let mut local_address = existing_local_address;
     let mut port_reservation = None;
     if local_address.is_none() {
-        match session
-            .core
-            .policy
-            .authorize_socket_bind(session.caller_credential, create_request)
-        {
-            Ok(()) => {}
-            Err(BrokerError::PolicyDenied) => {
-                finish_configuration(&object, None, None, false)?;
-                return Ok(SocketOutcome::Failed(SocketError::PolicyDenied));
-            }
-            Err(error) => {
-                finish_configuration(&object, None, None, false)?;
-                return Err(error);
-            }
-        }
         let binding = match reserve_and_bind(
             session,
             create_request,
@@ -910,7 +865,7 @@ pub fn send_to(
     if let Some(destination) = destination {
         match session.core.policy.authorize_socket_connect(
             session.caller_credential,
-            create_request,
+            create_request.protocol,
             destination,
         ) {
             Ok(()) => {}
@@ -944,21 +899,6 @@ pub fn send_to(
         (Arc::clone(&socket.resource), needs_bind)
     };
     if needs_bind {
-        match session
-            .core
-            .policy
-            .authorize_socket_bind(session.caller_credential, create_request)
-        {
-            Ok(()) => {}
-            Err(BrokerError::PolicyDenied) => {
-                finish_configuration(&object, None, None, false)?;
-                return Ok(SocketOutcome::Failed(SocketError::PolicyDenied));
-            }
-            Err(error) => {
-                finish_configuration(&object, None, None, false)?;
-                return Err(error);
-            }
-        }
         match reserve_and_bind(
             session,
             create_request,
@@ -1234,15 +1174,15 @@ fn stream_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRespo
     let ObjectEntry::Socket(socket) = &mut *object else {
         return Err(BrokerError::InvalidRights);
     };
-    if socket.connection_status == SocketConnectionStatus::Connecting
-        && platform_status.status == SocketConnectionStatus::Unconnected
-    {
-        return Err(BrokerError::Internal);
-    }
     if let Some(observed) = platform_status.local_address {
         match socket.local_address {
-            Some(reserved) if reserved.ip().is_unspecified() => {
-                if observed.port() != reserved.port() || !observed.ip().is_loopback() {
+            Some(broker_address) if broker_address.ip().is_unspecified() => {
+                if observed.port() != broker_address.port() || !observed.ip().is_loopback() {
+                    socket.listening = false;
+                    socket.connection_status = SocketConnectionStatus::Failed(SocketError::Other);
+                    socket.resource_retired = true;
+                    drop(object);
+                    resource.retire();
                     return Err(BrokerError::Internal);
                 }
                 socket.local_address = Some(observed);
@@ -1250,6 +1190,11 @@ fn stream_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRespo
             None => socket.local_address = Some(observed),
             Some(_) => {}
         }
+    }
+    if socket.connection_status == SocketConnectionStatus::Connecting
+        && platform_status.status == SocketConnectionStatus::Unconnected
+    {
+        return Err(BrokerError::Internal);
     }
     if socket.connection_status == SocketConnectionStatus::Connecting {
         socket.connection_status = platform_status.status;
@@ -1337,7 +1282,9 @@ fn datagram_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRes
         }
         let invalid_local_address = match (socket.local_address, platform_status.local_address) {
             (None, Some(_)) => true,
-            (Some(reserved), Some(platform)) => reserved.port() != platform.port(),
+            (Some(broker_address), Some(observed)) if broker_address.port() != observed.port() => {
+                true
+            }
             _ => false,
         };
         if invalid_local_address {
@@ -1349,6 +1296,12 @@ fn datagram_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRes
             resource.retire();
             return Err(BrokerError::Internal);
         }
+        let local_address_refinement = match (socket.local_address, platform_status.local_address) {
+            (Some(broker_address), Some(observed)) if broker_address.ip().is_unspecified() => {
+                Some(observed)
+            }
+            _ => None,
+        };
         if matches!(
             platform_status.status,
             SocketConnectionStatus::Connecting | SocketConnectionStatus::Failed(_)
@@ -1365,14 +1318,14 @@ fn datagram_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRes
             // Continuous peer replacement can race both bounded queries.
             // Do not let an unordered platform snapshot overwrite newer
             // broker observations.
-            socket.local_address = socket.local_address.or(platform_status.local_address);
+            socket.local_address = socket.local_address.or(local_address_refinement);
             return Ok(SocketStatusResponse {
                 status: socket.connection_status,
                 local_address: socket.local_address,
                 pending_error,
             });
         }
-        socket.local_address = platform_status.local_address.or(socket.local_address);
+        socket.local_address = local_address_refinement.or(socket.local_address);
         return Ok(SocketStatusResponse {
             status: socket.connection_status,
             local_address: socket.local_address,
@@ -1473,21 +1426,6 @@ fn connect_datagram(
         )
     };
     if needs_bind {
-        match session
-            .core
-            .policy
-            .authorize_socket_bind(session.caller_credential, create_request)
-        {
-            Ok(()) => {}
-            Err(BrokerError::PolicyDenied) => {
-                finish_datagram_connect(object, previous_status, false);
-                return Ok(SocketOutcome::Failed(SocketError::PolicyDenied));
-            }
-            Err(error) => {
-                finish_datagram_connect(object, previous_status, false);
-                return Err(error);
-            }
-        }
         let binding = match reserve_and_bind(
             session,
             create_request,
@@ -2432,13 +2370,14 @@ pub(crate) mod tests {
         check_socket_operations_and_policy(broker, provider);
         check_tcp_option_state_is_per_socket(broker);
         check_udp_socket_operations(broker, provider);
-        check_udp_status_rejects_changed_reserved_port(broker, provider);
+        check_udp_status_validates_local_address(broker, provider);
         check_concurrent_udp_status_does_not_regress_connection(broker, provider);
         check_server_socket_operations(broker, provider);
         check_failed_listener_shutdown_preserves_state(broker, provider);
         check_listener_shutdown_does_not_race_listen(broker, provider);
         check_connect_errors_classify_peer_state(broker, provider);
         check_concurrent_status_preserves_terminal_state(broker, provider);
+        check_stream_status_validates_local_address(broker, provider);
         check_failed_status_preserves_local_address(broker, provider);
         check_quota_waits_for_deferred_retirement(broker, provider);
         check_platform_socket_retires_before_last_arc_drop(broker, provider);
@@ -3004,7 +2943,7 @@ pub(crate) mod tests {
         );
     }
 
-    fn check_udp_status_rejects_changed_reserved_port(
+    fn check_udp_status_validates_local_address(
         broker: &BrokerCore,
         provider: &TestSocketProvider,
     ) {
@@ -3106,6 +3045,88 @@ pub(crate) mod tests {
             connect_calls
         );
         session.close_object_reference(handle).unwrap();
+
+        let exact = create(
+            &session,
+            create_udp_request(),
+            Arc::new(TestReadinessSink::default()),
+        )
+        .unwrap();
+        let exact_address = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), 40000);
+        assert_eq!(
+            bind(&session, exact, exact_address),
+            Ok(SocketOutcome::Completed(exact_address))
+        );
+        provider
+            .state
+            .status_responses
+            .lock()
+            .unwrap()
+            .push_back(PlatformSocketStatus {
+                status: SocketConnectionStatus::Unconnected,
+                local_address: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, exact_address.port())),
+                pending_error: None,
+            });
+        let retired_before = provider.state.retired_sockets.load(Ordering::Relaxed);
+        assert_eq!(
+            status(&session, exact),
+            Ok(SocketStatusResponse {
+                status: SocketConnectionStatus::Unconnected,
+                local_address: Some(exact_address),
+                pending_error: None,
+            })
+        );
+        assert_eq!(
+            provider.state.retired_sockets.load(Ordering::Relaxed),
+            retired_before
+        );
+        session.close_object_reference(exact).unwrap();
+
+        for observed_ip in [
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::new(10, 0, 0, 1),
+        ] {
+            let wildcard = create(
+                &session,
+                create_udp_request(),
+                Arc::new(TestReadinessSink::default()),
+            )
+            .unwrap();
+            let SocketOutcome::Completed(wildcard_address) = bind(
+                &session,
+                wildcard,
+                SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
+            )
+            .unwrap() else {
+                panic!("guest UDP wildcard bind failed");
+            };
+            let observed_address = SocketAddrV4::new(observed_ip, wildcard_address.port());
+            provider
+                .state
+                .status_responses
+                .lock()
+                .unwrap()
+                .push_back(PlatformSocketStatus {
+                    status: SocketConnectionStatus::Unconnected,
+                    local_address: Some(observed_address),
+                    pending_error: None,
+                });
+            let retired_before = provider.state.retired_sockets.load(Ordering::Relaxed);
+            assert_eq!(
+                status(&session, wildcard),
+                Ok(SocketStatusResponse {
+                    status: SocketConnectionStatus::Unconnected,
+                    local_address: Some(observed_address),
+                    pending_error: None,
+                })
+            );
+            assert_eq!(
+                provider.state.retired_sockets.load(Ordering::Relaxed),
+                retired_before
+            );
+            session.close_object_reference(wildcard).unwrap();
+        }
     }
 
     fn check_server_socket_operations(broker: &BrokerCore, provider: &TestSocketProvider) {
@@ -3732,6 +3753,136 @@ pub(crate) mod tests {
                 pending_error: None,
             }
         );
+    }
+
+    fn check_stream_status_validates_local_address(
+        broker: &BrokerCore,
+        provider: &TestSocketProvider,
+    ) {
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let valid = create(
+            &session,
+            create_request(),
+            Arc::new(TestReadinessSink::default()),
+        )
+        .unwrap();
+        let SocketOutcome::Completed(wildcard_address) =
+            bind(&session, valid, SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).unwrap()
+        else {
+            panic!("guest TCP wildcard bind failed");
+        };
+        assert_eq!(
+            connect(&session, valid, loopback_address()),
+            Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting))
+        );
+        let observed_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, wildcard_address.port());
+        provider
+            .state
+            .status_responses
+            .lock()
+            .unwrap()
+            .push_back(PlatformSocketStatus {
+                status: SocketConnectionStatus::Connected,
+                local_address: Some(observed_address),
+                pending_error: None,
+            });
+        let retired_before = provider.state.retired_sockets.load(Ordering::Relaxed);
+        assert_eq!(
+            status(&session, valid),
+            Ok(SocketStatusResponse {
+                status: SocketConnectionStatus::Connected,
+                local_address: Some(observed_address),
+                pending_error: None,
+            })
+        );
+        assert_eq!(
+            provider.state.retired_sockets.load(Ordering::Relaxed),
+            retired_before
+        );
+        session.close_object_reference(valid).unwrap();
+
+        for (platform_connection_status, observed_ip, wrong_port) in [
+            (
+                SocketConnectionStatus::Connected,
+                Ipv4Addr::new(10, 0, 0, 1),
+                false,
+            ),
+            (
+                SocketConnectionStatus::Unconnected,
+                Ipv4Addr::new(10, 0, 0, 1),
+                false,
+            ),
+            (SocketConnectionStatus::Connected, Ipv4Addr::LOCALHOST, true),
+        ] {
+            let handle = create(
+                &session,
+                create_request(),
+                Arc::new(TestReadinessSink::default()),
+            )
+            .unwrap();
+            let SocketOutcome::Completed(wildcard_address) = bind(
+                &session,
+                handle,
+                SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
+            )
+            .unwrap() else {
+                panic!("guest TCP wildcard bind failed");
+            };
+            assert_eq!(
+                connect(&session, handle, loopback_address()),
+                Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting))
+            );
+            let observed_port = if wrong_port {
+                if wildcard_address.port() == u16::MAX {
+                    wildcard_address.port() - 1
+                } else {
+                    wildcard_address.port() + 1
+                }
+            } else {
+                wildcard_address.port()
+            };
+            provider
+                .state
+                .status_responses
+                .lock()
+                .unwrap()
+                .push_back(PlatformSocketStatus {
+                    status: platform_connection_status,
+                    local_address: Some(SocketAddrV4::new(observed_ip, observed_port)),
+                    pending_error: None,
+                });
+
+            let retired_before = provider.state.retired_sockets.load(Ordering::Relaxed);
+            assert_eq!(status(&session, handle), Err(BrokerError::Internal));
+            assert_eq!(
+                provider.state.retired_sockets.load(Ordering::Relaxed),
+                retired_before + 1
+            );
+            let status_calls = provider.state.status_calls.load(Ordering::Relaxed);
+            assert_eq!(
+                status(&session, handle),
+                Ok(SocketStatusResponse {
+                    status: SocketConnectionStatus::Failed(SocketError::Other),
+                    local_address: Some(wildcard_address),
+                    pending_error: None,
+                })
+            );
+            assert_eq!(
+                provider.state.status_calls.load(Ordering::Relaxed),
+                status_calls
+            );
+            assert_eq!(
+                send(&session, handle, vec![1], SendFlags::NONE),
+                Ok(SocketOutcome::Failed(SocketError::NotConnected))
+            );
+            session.close_object_reference(handle).unwrap();
+            assert_eq!(
+                provider.state.retired_sockets.load(Ordering::Relaxed),
+                retired_before + 1
+            );
+        }
     }
 
     fn check_failed_status_preserves_local_address(
