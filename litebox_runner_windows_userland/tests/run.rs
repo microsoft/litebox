@@ -227,6 +227,181 @@ fn build_windows_broker() -> (std::path::PathBuf, std::path::PathBuf) {
     (broker, runner)
 }
 
+/// Runs the official Windows embeddable Python distribution through the
+/// runner. `LITEBOX_PYTHON_PATH` can point at a locally provided x64
+/// `python.exe`; otherwise the test downloads and verifies a pinned official
+/// distribution.
+///
+/// Python currently reaches CSR initialization. The completion oracle remains
+/// deferred until the shim implements `BasepNlsGetUserInfo`.
+#[test]
+#[ignore = "downloads Python and asserts a stable runtime progress floor"]
+fn run_python_pe() {
+    let source = python_source();
+    let source_dir = source
+        .parent()
+        .expect("LITEBOX_PYTHON_PATH must have a parent directory");
+    let test_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("python");
+    let _ = std::fs::remove_dir_all(&test_dir);
+    std::fs::create_dir_all(&test_dir).unwrap();
+
+    let mut host_images = Vec::new();
+    for entry in std::fs::read_dir(source_dir)
+        .unwrap_or_else(|error| panic!("failed to read `{}`: {error}", source_dir.display()))
+    {
+        let entry = entry.expect("failed to read Python distribution entry");
+        let file_type = entry
+            .file_type()
+            .expect("failed to read Python distribution entry type");
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let source_path = entry.path();
+        let destination = test_dir.join(entry.file_name());
+        let bytes = std::fs::read(&source_path)
+            .unwrap_or_else(|error| panic!("failed to read `{}`: {error}", source_path.display()));
+        let file_name = entry.file_name();
+        let file_name = file_name.to_str();
+        if matches!(file_name, Some("python.exe" | "python312.dll")) {
+            let rewritten =
+                litebox_syscall_rewriter::rewrite_binary(&bytes, None).unwrap_or_else(|error| {
+                    panic!("failed to rewrite `{}`: {error}", source_path.display())
+                });
+            std::fs::write(&destination, rewritten).unwrap();
+            host_images.push(bytes);
+        } else {
+            std::fs::write(&destination, bytes).unwrap();
+        }
+    }
+
+    assert!(
+        test_dir.join("python.exe").is_file(),
+        "Python distribution did not contain python.exe"
+    );
+    for image in &host_images {
+        stage_transitive_import_closure(&test_dir, image);
+    }
+
+    let tar_path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("python.tar");
+    create_tar_with_dir(&test_dir, &tar_path);
+
+    let mut command =
+        std::process::Command::new(env!("CARGO_BIN_EXE_litebox_runner_windows_userland"));
+    command.env("LITEBOX_LOG", "debug");
+    command.args([
+        "--initial-files",
+        tar_path.to_str().unwrap(),
+        "/python.exe",
+        "-c",
+        "print('hello world')",
+    ]);
+    println!("Running `{command:?}`");
+    let output = command
+        .output()
+        .expect("failed to run litebox_runner_windows_userland");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let logs = format!("{stdout}\n{stderr}");
+    println!(
+        "Python exit: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        stdout,
+        stderr
+    );
+
+    let dll_load = logs
+        .rfind("python312.dll")
+        .expect("Python did not load python312.dll");
+    logs[dll_load..]
+        .find("NtAlpcSendWaitReceivePort")
+        .expect("Python did not reach CSR initialization");
+
+    // TODO(frontier): restore exit-zero and `hello world` assertions once BASESRV
+    // BasepNlsGetUserInfo (CSR API 0x1001e) NLS payload handling lands.
+}
+
+fn python_source() -> std::path::PathBuf {
+    const DISTRIBUTION_URL: &str =
+        "https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip";
+    const DISTRIBUTION_SHA256: &str =
+        "4acbed6dd1c744b0376e3b1cf57ce906f9dc9e95e68824584c8099a63025a3c3";
+
+    if let Some(source) = std::env::var_os("LITEBOX_PYTHON_PATH") {
+        return source.into();
+    }
+
+    let download_dir =
+        std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("python_3.12.10_embed_amd64");
+    std::fs::create_dir_all(&download_dir).expect("failed to create Python download directory");
+    let archive = download_dir.join("python-3.12.10-embed-amd64.zip");
+
+    if archive.exists() && sha256_file(&archive) != DISTRIBUTION_SHA256 {
+        println!(
+            "Removing cached Python distribution with an unexpected SHA-256: `{}`",
+            archive.display()
+        );
+        std::fs::remove_file(&archive)
+            .expect("failed to remove invalid cached Python distribution");
+    }
+
+    if !archive.exists() {
+        let temporary_archive = download_dir.join(format!(
+            "python-3.12.10-embed-amd64.zip.{}.tmp",
+            std::process::id()
+        ));
+        println!("Downloading Python from `{DISTRIBUTION_URL}`");
+        let status = std::process::Command::new("curl.exe")
+            .args([
+                "--fail",
+                "--location",
+                "--proto",
+                "=https",
+                "--tlsv1.2",
+                "--output",
+            ])
+            .arg(&temporary_archive)
+            .arg(DISTRIBUTION_URL)
+            .status()
+            .expect("failed to start curl.exe to download Python");
+        assert!(status.success(), "curl.exe failed to download Python");
+
+        let actual_sha256 = sha256_file(&temporary_archive);
+        assert_eq!(
+            actual_sha256, DISTRIBUTION_SHA256,
+            "downloaded Python distribution has an unexpected SHA-256"
+        );
+        std::fs::rename(&temporary_archive, &archive)
+            .expect("failed to cache verified Python distribution");
+    }
+
+    let distribution_dir = download_dir.join("distribution");
+    let source = distribution_dir.join("python.exe");
+    if !source.exists() {
+        std::fs::create_dir_all(&distribution_dir)
+            .expect("failed to create Python extraction directory");
+        println!("Extracting verified Python distribution");
+        let status = std::process::Command::new("tar.exe")
+            .arg("-xf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&distribution_dir)
+            .status()
+            .expect("failed to start tar.exe");
+        assert!(
+            status.success(),
+            "tar.exe failed to extract Python with status {status}"
+        );
+        assert!(
+            source.is_file(),
+            "Python archive did not extract `{}`",
+            source.display()
+        );
+    }
+
+    source
+}
+
 /// Drives the real `7za b` CPU benchmark through the runner using the
 /// transitive-import-closure staging helper. `7za` is a large third-party
 /// binary that must not be committed. `LITEBOX_7ZA_PATH` can point at a locally
