@@ -170,7 +170,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::EnterShim
                 return ContinueOperation::Terminate;
             }
         }
-        self.enter_shim(false, ctx, |task, _ctx| task.handle_exception_request(info))
+        self.enter_shim(false, ctx, |task, ctx| {
+            task.handle_exception_request(info, ctx);
+        })
     }
 
     fn interrupt(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
