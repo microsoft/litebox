@@ -18,7 +18,7 @@ use litebox::mm::linux::VmFlags;
 use litebox::platform::TimerHandle;
 use litebox::platform::{ArchSpecificRegister, RawMutex as _};
 use litebox::platform::{Instant as _, SystemTime as _, TimeProvider};
-use litebox::sync::Mutex;
+use litebox::sync::{Mutex, RwLock};
 use litebox::utils::TruncateExt as _;
 use litebox_common_linux::{
     ArchPrctlArg, CloneFlags, FutexArgs, IntervalTimer, ItimerVal, PrctlArg, TimeParam,
@@ -119,7 +119,7 @@ pub(crate) struct Process<Platform: ShimPlatform> {
     nr_threads: <Platform as litebox::platform::RawMutexProvider>::RawMutex,
     inner: Mutex<Platform, ProcessInner<Platform>>,
     /// Resource limits for this process.
-    pub(crate) limits: ResourceLimits,
+    pub(crate) limits: ResourceLimits<Platform>,
     /// Process-wide alarm timer.
     pub(crate) alarm_timer: Mutex<Platform, Alarm<Platform>>,
 }
@@ -752,68 +752,38 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 pub(crate) const RLIMIT_NOFILE_CUR: usize = 1024 * 1024;
 const RLIMIT_NOFILE_MAX: usize = 1024 * 1024;
 
-struct AtomicRlimit {
-    cur: core::sync::atomic::AtomicUsize,
-    max: core::sync::atomic::AtomicUsize,
+pub(crate) struct ResourceLimits<Platform: ShimPlatform> {
+    limits: RwLock<
+        Platform,
+        [litebox_common_linux::Rlimit; litebox_common_linux::RlimitResource::RLIM_NLIMITS],
+    >,
 }
 
-impl AtomicRlimit {
-    const fn new(cur: usize, max: usize) -> Self {
+impl<Platform: ShimPlatform> ResourceLimits<Platform> {
+    fn default() -> Self {
+        let mut limits = [const {
+            litebox_common_linux::Rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            }
+        }; litebox_common_linux::RlimitResource::RLIM_NLIMITS];
+        limits[litebox_common_linux::RlimitResource::NOFILE as usize] =
+            litebox_common_linux::Rlimit {
+                rlim_cur: RLIMIT_NOFILE_CUR,
+                rlim_max: RLIMIT_NOFILE_MAX,
+            };
+        limits[litebox_common_linux::RlimitResource::STACK as usize] =
+            litebox_common_linux::Rlimit {
+                rlim_cur: crate::loader::DEFAULT_STACK_SIZE,
+                rlim_max: litebox_common_linux::rlim_t::MAX,
+            };
         Self {
-            cur: core::sync::atomic::AtomicUsize::new(cur),
-            max: core::sync::atomic::AtomicUsize::new(max),
-        }
-    }
-}
-
-pub(crate) struct ResourceLimits {
-    limits: [AtomicRlimit; litebox_common_linux::RlimitResource::RLIM_NLIMITS],
-}
-
-impl ResourceLimits {
-    const fn default() -> Self {
-        seq_macro::seq!(N in 0..16 {
-            let mut limits = [
-                #(
-                    AtomicRlimit::new(0, 0),
-                )*
-            ];
-        });
-        limits[litebox_common_linux::RlimitResource::NOFILE as usize] = AtomicRlimit {
-            cur: core::sync::atomic::AtomicUsize::new(RLIMIT_NOFILE_CUR),
-            max: core::sync::atomic::AtomicUsize::new(RLIMIT_NOFILE_MAX),
-        };
-        limits[litebox_common_linux::RlimitResource::STACK as usize] = AtomicRlimit {
-            cur: core::sync::atomic::AtomicUsize::new(crate::loader::DEFAULT_STACK_SIZE),
-            max: core::sync::atomic::AtomicUsize::new(litebox_common_linux::rlim_t::MAX),
-        };
-        Self { limits }
-    }
-
-    pub(crate) fn get_rlimit(
-        &self,
-        resource: litebox_common_linux::RlimitResource,
-    ) -> litebox_common_linux::Rlimit {
-        let r = &self.limits[resource as usize];
-        litebox_common_linux::Rlimit {
-            rlim_cur: r.cur.load(Ordering::Relaxed),
-            rlim_max: r.max.load(Ordering::Relaxed),
+            limits: RwLock::new(limits),
         }
     }
 
     pub(crate) fn get_rlimit_cur(&self, resource: litebox_common_linux::RlimitResource) -> usize {
-        let r = &self.limits[resource as usize];
-        r.cur.load(Ordering::Relaxed)
-    }
-
-    fn set_rlimit(
-        &self,
-        resource: litebox_common_linux::RlimitResource,
-        new_limit: litebox_common_linux::Rlimit,
-    ) {
-        let r = &self.limits[resource as usize];
-        r.cur.store(new_limit.rlim_cur, Ordering::Relaxed);
-        r.max.store(new_limit.rlim_max, Ordering::Relaxed);
+        self.limits.read()[resource as usize].rlim_cur
     }
 }
 
@@ -824,17 +794,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         resource: litebox_common_linux::RlimitResource,
         new_limit: Option<litebox_common_linux::Rlimit>,
     ) -> Result<litebox_common_linux::Rlimit, Errno> {
-        let old_rlimit = match resource {
+        match resource {
             litebox_common_linux::RlimitResource::NOFILE
-            | litebox_common_linux::RlimitResource::STACK => {
-                self.thread.process.limits.get_rlimit(resource)
-            }
+            | litebox_common_linux::RlimitResource::STACK => {},
             _ => {
                 log_unsupported!("Unsupported resource for get_rlimit: {:?}", resource);
                 return Err(Errno::EINVAL);
             }
         };
         if let Some(new_limit) = new_limit {
+            let mut limits = self.thread.process.limits.limits.write();
+            let old_rlimit = limits[resource as usize];
             if new_limit.rlim_cur > new_limit.rlim_max {
                 return Err(Errno::EINVAL);
             }
@@ -851,13 +821,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             match resource {
                 litebox_common_linux::RlimitResource::NOFILE => {
                     let new_max_fd = new_limit.rlim_cur.saturating_sub(1);
-                    self.thread.process.limits.set_rlimit(resource, new_limit);
                     self.files.borrow().set_max_fd(new_max_fd);
                 }
                 _ => unimplemented!("Unsupported resource for set_rlimit: {:?}", resource),
             }
+            limits[resource as usize] = new_limit;
+            Ok(old_rlimit)
+        } else {
+            Ok(self.thread.process.limits.limits.read()[resource as usize])
         }
-        Ok(old_rlimit)
     }
 
     /// Handle syscall `prlimit64`.
@@ -1647,6 +1619,54 @@ mod tests {
     use crate::{UserPtr, UserPtrMut};
 
     extern crate std;
+
+    #[test]
+    fn resource_limit_reads_do_not_observe_interleaved_updates() {
+        use super::ResourceLimits;
+        use crate::syscalls::tests::TestPlatform;
+        use litebox_common_linux::{Rlimit, RlimitResource};
+        use std::sync::{Arc, Barrier};
+
+        const ITERATIONS: usize = 20_000;
+
+        let limits = Arc::new(ResourceLimits::<TestPlatform>::default());
+        let barrier = Arc::new(Barrier::new(3));
+        let writer = |new_limit: Rlimit| {
+            let limits = limits.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..ITERATIONS {
+                    limits.limits.write()[RlimitResource::NOFILE as usize] = new_limit;
+                }
+            })
+        };
+        let writer_a = writer(Rlimit {
+            rlim_cur: 90,
+            rlim_max: 100,
+        });
+        let writer_b = writer(Rlimit {
+            rlim_cur: 10,
+            rlim_max: 10,
+        });
+
+        barrier.wait();
+        for _ in 0..ITERATIONS * 2 {
+            let limit = limits.limits.read()[RlimitResource::NOFILE as usize];
+            assert!(
+                (limit.rlim_cur == super::RLIMIT_NOFILE_CUR
+                    && limit.rlim_max == super::RLIMIT_NOFILE_MAX)
+                    || (limit.rlim_cur == 90 && limit.rlim_max == 100)
+                    || (limit.rlim_cur == 10 && limit.rlim_max == 10),
+                "observed interleaved resource limit ({}, {})",
+                limit.rlim_cur,
+                limit.rlim_max,
+            );
+        }
+
+        writer_a.join().unwrap();
+        writer_b.join().unwrap();
+    }
 
     #[cfg(target_arch = "x86_64")]
     #[test]
