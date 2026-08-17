@@ -463,19 +463,16 @@ impl PolicyEngine {
         &self,
         caller_credential: CallerCredential,
         request: CreateSocketRequest,
-        address: SocketAddrV4,
     ) -> Result<(), BrokerError> {
         self.principal_object_rights(caller_credential)?;
-        // Egress rules do not describe local listener authority. Socket
-        // creation admission plus this fixed loopback boundary governs binds.
+        // Destination rules do not describe local binding authority. Socket
+        // creation admission governs whether the caller may claim a valid
+        // guest-namespace address; socket authority validates that address.
         let supported_socket = matches!(
             (request.socket_type, request.protocol),
             (SocketType::Stream, IpProtocol::Tcp) | (SocketType::Datagram, IpProtocol::Udp)
         );
-        if request.address_family == AddressFamily::Ipv4
-            && supported_socket
-            && address.ip().is_loopback()
-        {
+        if request.address_family == AddressFamily::Ipv4 && supported_socket {
             Ok(())
         } else {
             Err(BrokerError::PolicyDenied)
@@ -772,20 +769,12 @@ mod tests {
             Err(BrokerError::PolicyDenied)
         );
         assert_eq!(
-            policy.authorize_socket_bind(
-                CallerCredential::Unauthenticated,
-                IPV4_UDP,
-                address([127, 0, 0, 1], 0),
-            ),
+            policy.authorize_socket_bind(CallerCredential::Unauthenticated, IPV4_UDP,),
             Ok(())
         );
         assert_eq!(
-            policy.authorize_socket_bind(
-                CallerCredential::Unauthenticated,
-                IPV4_UDP,
-                address([0, 0, 0, 0], 0),
-            ),
-            Err(BrokerError::PolicyDenied)
+            policy.authorize_socket_bind(CallerCredential::Unauthenticated, IPV4_UDP,),
+            Ok(())
         );
     }
 }

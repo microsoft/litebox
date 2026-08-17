@@ -18,8 +18,8 @@ use std::time::Instant;
 use std::time::Duration;
 
 use litebox_broker_core::socket::{
-    AcceptedPlatformSocket, PlatformConnectError, PlatformDatagramReceive, PlatformSocket,
-    PlatformStreamReceive, SocketProvider,
+    AcceptedPlatformSocket, GuestSocketBinding, PlatformConnectError, PlatformDatagramReceive,
+    PlatformSocket, PlatformStreamReceive, SocketProvider,
 };
 use litebox_broker_core::{BrokerError, Result as BrokerResult, SessionId};
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -47,7 +47,7 @@ use tcp::{
 #[cfg(test)]
 use tcp::{
     MAX_UNMATCHED_ACCEPTS_PER_COMMAND, PENDING_CONNECT_DISCARD_LIFETIME,
-    PendingGuestConnectionMatch, PendingGuestTcpConnection, ReactorTcpBinding,
+    PendingGuestConnectionMatch, PendingGuestTcpConnection,
 };
 use udp::{
     ReactorUdpBinding, ReactorUdpPeer, ReactorUdpState, UDP_EVENT_TOKEN_FLAG, UdpNativeErrorState,
@@ -232,10 +232,10 @@ struct LinuxSocket {
 }
 
 impl PlatformSocket for LinuxSocket {
-    fn bind(&self, address: SocketAddrV4) -> BrokerResult<SocketOutcome<SocketAddrV4>> {
+    fn bind(&self, binding: GuestSocketBinding) -> BrokerResult<SocketOutcome<SocketAddrV4>> {
         self.reactor.request(|response| ReactorCommand::Bind {
             id: self.id,
-            address,
+            binding,
             response,
         })
     }
@@ -272,6 +272,7 @@ impl PlatformSocket for LinuxSocket {
             SocketOutcome::Completed(accepted) => {
                 Ok(SocketOutcome::Completed(AcceptedPlatformSocket {
                     socket,
+                    local_address: accepted.local_address,
                     remote_address: accepted.remote_address,
                 }))
             }
@@ -765,7 +766,7 @@ enum ReactorCommand {
     },
     Bind {
         id: u64,
-        address: SocketAddrV4,
+        binding: GuestSocketBinding,
         response: SyncSender<BrokerResult<SocketOutcome<SocketAddrV4>>>,
     },
     Listen {
@@ -1038,32 +1039,32 @@ impl Reactor {
     fn bind_socket(
         &mut self,
         id: u64,
-        requested_address: SocketAddrV4,
+        binding: GuestSocketBinding,
     ) -> BrokerResult<SocketOutcome<SocketAddrV4>> {
+        let requested_address = binding.requested();
         let (kind, already_bound) = self
             .sockets
             .get(&id)
             .map(|socket| (socket.kind(), socket.guest_local_address.is_some()))
             .ok_or(BrokerError::Internal)?;
+        if !binding.is_valid() || binding.is_tcp() != (kind == SocketKind::Tcp) {
+            return Err(BrokerError::Internal);
+        }
         if kind == SocketKind::Udp {
             if already_bound {
                 return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
             }
-            self.udp.reserve_binding(requested_address.port())?;
-            let original_bind_was_wildcard = requested_address.ip().is_unspecified();
-            let internal_address = if original_bind_was_wildcard {
+            let internal_address = if binding.is_wildcard() {
                 SocketAddrV4::new(Ipv4Addr::LOCALHOST, requested_address.port())
             } else {
                 requested_address
             };
             self.udp.insert_binding(ReactorUdpBinding {
                 socket_id: id,
-                guest_address: requested_address,
-                internal_address,
+                binding,
             })?;
             let socket = self.sockets.get_mut(&id).ok_or(BrokerError::Internal)?;
             let udp = socket.udp_state_mut()?;
-            udp.original_bind_was_wildcard = original_bind_was_wildcard;
             udp.internal_address = Some(internal_address);
             socket.guest_local_address = Some(requested_address);
             socket
@@ -1073,7 +1074,7 @@ impl Reactor {
                 .local_address = Some(requested_address);
             return Ok(SocketOutcome::Completed(requested_address));
         }
-        self.bind_tcp_socket(id, requested_address, already_bound)
+        self.bind_tcp_socket(id, binding, already_bound)
     }
 
     fn connect_socket(
@@ -1135,8 +1136,11 @@ impl Reactor {
             let guest_local_address = match (|| {
                 let socket = self.sockets.get(&id).ok_or(BrokerError::Internal)?;
                 let current = socket.guest_local_address.ok_or(BrokerError::Internal)?;
-                let udp = socket.udp_state()?;
-                if udp.original_bind_was_wildcard {
+                let binding = self
+                    .udp
+                    .binding_for_socket(id)
+                    .ok_or(BrokerError::Internal)?;
+                if binding.binding.is_wildcard() {
                     let ip = match (&peer, &staged_endpoint, reused_host_address) {
                         (ReactorUdpPeer::Guest { .. }, _, _) => Ipv4Addr::LOCALHOST,
                         (ReactorUdpPeer::External(_), Some(endpoint), _) => {
@@ -1165,9 +1169,6 @@ impl Reactor {
             }
             self.clear_udp_external_peers(id)
                 .map_err(PlatformConnectError::PeerIndeterminate)?;
-            self.udp
-                .update_guest_address(id, guest_local_address)
-                .map_err(PlatformConnectError::PeerIndeterminate)?;
             let readiness = self
                 .udp_readiness(id)
                 .map_err(PlatformConnectError::PeerIndeterminate)?;
@@ -1179,10 +1180,10 @@ impl Reactor {
                     ))?;
             socket.guest_local_address = Some(guest_local_address);
             socket.connection_status = SocketConnectionStatus::Connected;
-            socket
+            let udp = socket
                 .udp_state_mut()
-                .map_err(PlatformConnectError::PeerIndeterminate)?
-                .peer = Some(peer);
+                .map_err(PlatformConnectError::PeerIndeterminate)?;
+            udp.peer = Some(peer);
             socket
                 .snapshot
                 .lock()
@@ -1229,7 +1230,7 @@ impl Reactor {
                 if self
                     .udp
                     .binding_for_socket(socket_generation)
-                    .is_none_or(|binding| binding.internal_address != guest_address)
+                    .is_none_or(|binding| !binding.binding.covers(guest_address))
                 {
                     return Ok(SocketOutcome::Failed(SocketError::ConnectionRefused));
                 }
@@ -1459,7 +1460,8 @@ impl Reactor {
             let _ = self.clear_udp_receive_queue(id);
             self.replace_udp_endpoint(id, None);
             if let Some(binding) = self.udp.binding_for_socket(id) {
-                self.udp.remove_binding(binding.guest_address.port(), id);
+                self.udp
+                    .remove_binding(binding.binding.requested().port(), id);
             }
             let external_peer_count = self
                 .sockets
@@ -1603,10 +1605,10 @@ impl Reactor {
                 }
                 ReactorCommand::Bind {
                     id,
-                    address,
+                    binding,
                     response,
                 } => {
-                    let outcome = self.bind_socket(id, address);
+                    let outcome = self.bind_socket(id, binding);
                     if response.send(outcome).is_err() {
                         self.remove_socket(id);
                     }
@@ -1730,12 +1732,12 @@ impl Reactor {
                     let host_address = self
                         .tcp
                         .bindings
-                        .get(&guest_port)
+                        .get(guest_port)
                         .and_then(|binding| binding.host_address)
                         .or_else(|| {
                             self.udp
                                 .bindings
-                                .get(&guest_port)
+                                .get(guest_port)
                                 .and_then(|binding| self.sockets.get(&binding.socket_id))
                                 .and_then(|socket| socket.udp_state().ok())
                                 .and_then(|udp| udp.external_endpoint.as_ref())
@@ -1767,7 +1769,7 @@ impl Reactor {
                     let size = self
                         .udp
                         .bindings
-                        .get(&guest_port)
+                        .get(guest_port)
                         .and_then(|binding| self.sockets.get(&binding.socket_id))
                         .and_then(|socket| socket.udp_state().ok())
                         .and_then(|udp| udp.external_endpoint.as_ref())
@@ -1790,7 +1792,7 @@ impl Reactor {
                     let outcome = self
                         .udp
                         .bindings
-                        .get(&guest_port)
+                        .get(guest_port)
                         .ok_or(BrokerError::Internal)
                         .and_then(|binding| self.udp_native_head_datagram_bytes(binding.socket_id));
                     let _ = response.send(outcome);
@@ -1806,7 +1808,7 @@ impl Reactor {
                         let socket_id = self
                             .udp
                             .bindings
-                            .get(&guest_port)
+                            .get(guest_port)
                             .ok_or(BrokerError::Internal)?
                             .socket_id;
                         ready.send(()).map_err(|_| BrokerError::Internal)?;
@@ -1859,7 +1861,7 @@ impl Reactor {
                     let listener_id = self
                         .tcp
                         .bindings
-                        .get(&guest_port)
+                        .get(guest_port)
                         .expect("test guest listener binding missing")
                         .socket_id;
                     self.tcp.defer_untracked_connection(

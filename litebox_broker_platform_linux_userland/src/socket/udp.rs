@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::os::fd::OwnedFd;
 
-use litebox_broker_core::socket::PlatformConnectError;
+use litebox_broker_core::socket::{GuestSocketBinding, PlatformConnectError};
 use litebox_broker_core::{BrokerError, Result as BrokerResult, SessionId};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
@@ -47,7 +47,7 @@ pub(super) const UDP_EVENT_TOKEN_FLAG: u64 = 1 << 63;
 
 /// Reactor-wide UDP namespace, native endpoint, and queue-accounting state.
 pub(super) struct ReactorUdpState {
-    pub(super) bindings: HashMap<u16, ReactorUdpBinding>,
+    pub(super) bindings: ReactorUdpBindings,
     pub(super) native_endpoints: HashMap<u16, UdpNativeEndpointIdentity>,
     pub(super) external_peer_count: usize,
     pub(super) queued_datagrams: usize,
@@ -58,10 +58,36 @@ pub(super) struct ReactorUdpState {
     pub(super) next_endpoint_generation: u64,
 }
 
+#[derive(Default)]
+pub(super) struct ReactorUdpBindings {
+    wildcard: HashMap<u16, ReactorUdpBinding>,
+    exact: HashMap<SocketAddrV4, ReactorUdpBinding>,
+}
+
+impl ReactorUdpBindings {
+    fn clear(&mut self) {
+        self.wildcard.clear();
+        self.exact.clear();
+    }
+
+    fn values(&self) -> impl Iterator<Item = &ReactorUdpBinding> {
+        self.wildcard.values().chain(self.exact.values())
+    }
+
+    #[cfg(test)]
+    pub(super) fn get(&self, port: u16) -> Option<&ReactorUdpBinding> {
+        self.wildcard.get(&port).or_else(|| {
+            self.exact
+                .iter()
+                .find_map(|(address, binding)| (address.port() == port).then_some(binding))
+        })
+    }
+}
+
 impl Default for ReactorUdpState {
     fn default() -> Self {
         Self {
-            bindings: HashMap::new(),
+            bindings: ReactorUdpBindings::default(),
             native_endpoints: HashMap::new(),
             external_peer_count: 0,
             queued_datagrams: 0,
@@ -87,15 +113,13 @@ impl ReactorUdpState {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct ReactorUdpBinding {
     pub(super) socket_id: u64,
-    pub(super) guest_address: SocketAddrV4,
-    pub(super) internal_address: SocketAddrV4,
+    pub(super) binding: GuestSocketBinding,
 }
 
 pub(super) struct UdpSocketState {
-    pub(super) original_bind_was_wildcard: bool,
     pub(super) internal_address: Option<SocketAddrV4>,
     pub(super) peer: Option<ReactorUdpPeer>,
     guest_receive_queue: VecDeque<GuestDatagram>,
@@ -112,7 +136,6 @@ pub(super) struct UdpSocketState {
 impl Default for UdpSocketState {
     fn default() -> Self {
         Self {
-            original_bind_was_wildcard: false,
             internal_address: None,
             peer: None,
             guest_receive_queue: VecDeque::new(),
@@ -200,64 +223,89 @@ pub(super) enum ReactorUdpPeer {
 }
 
 impl ReactorUdpState {
-    pub(super) fn reserve_binding(&mut self, guest_port: u16) -> BrokerResult<()> {
-        if guest_port == 0 || self.bindings.contains_key(&guest_port) {
+    pub(super) fn reserve_binding(&mut self, binding: &GuestSocketBinding) -> BrokerResult<()> {
+        let requested = binding.requested();
+        if !binding.is_valid()
+            || if binding.is_wildcard() {
+                self.bindings.wildcard.contains_key(&requested.port())
+                    || self
+                        .bindings
+                        .exact
+                        .keys()
+                        .any(|address| address.port() == requested.port())
+            } else {
+                self.bindings.wildcard.contains_key(&requested.port())
+                    || self.bindings.exact.contains_key(&requested)
+            }
+        {
             return Err(BrokerError::Internal);
         }
-        self.bindings
-            .try_reserve(1)
-            .map_err(|_| BrokerError::OutOfMemory)
+        if binding.is_wildcard() {
+            self.bindings
+                .wildcard
+                .try_reserve(1)
+                .map_err(|_| BrokerError::OutOfMemory)
+        } else {
+            self.bindings
+                .exact
+                .try_reserve(1)
+                .map_err(|_| BrokerError::OutOfMemory)
+        }
     }
 
     pub(super) fn insert_binding(&mut self, binding: ReactorUdpBinding) -> BrokerResult<()> {
-        let guest_port = binding.guest_address.port();
-        if guest_port == 0 || self.bindings.contains_key(&guest_port) {
-            return Err(BrokerError::Internal);
+        let requested = binding.binding.requested();
+        self.reserve_binding(&binding.binding)?;
+        if binding.binding.is_wildcard() {
+            self.bindings.wildcard.insert(requested.port(), binding);
+        } else {
+            self.bindings.exact.insert(requested, binding);
         }
-        self.bindings.insert(guest_port, binding);
         Ok(())
     }
 
     pub(super) fn remove_binding(&mut self, guest_port: u16, socket_id: u64) {
         if self
             .bindings
+            .wildcard
             .get(&guest_port)
             .is_some_and(|binding| binding.socket_id == socket_id)
         {
-            self.bindings.remove(&guest_port);
+            self.bindings.wildcard.remove(&guest_port);
+            return;
+        }
+        if let Some(address) = self.bindings.exact.iter().find_map(|(address, binding)| {
+            (address.port() == guest_port && binding.socket_id == socket_id).then_some(*address)
+        }) {
+            self.bindings.exact.remove(&address);
         }
     }
 
     fn guest_binding(&self, address: SocketAddrV4) -> Option<ReactorUdpBinding> {
-        address
-            .ip()
-            .is_loopback()
-            .then(|| self.bindings.get(&address.port()).copied())
-            .flatten()
+        if !address.ip().is_loopback() {
+            return None;
+        }
+        self.bindings
+            .exact
+            .get(&address)
+            .or_else(|| self.bindings.wildcard.get(&address.port()))
+            .cloned()
+    }
+
+    pub(super) fn has_binding_on_port(&self, port: u16) -> bool {
+        self.bindings.wildcard.contains_key(&port)
+            || self
+                .bindings
+                .exact
+                .keys()
+                .any(|address| address.port() == port)
     }
 
     pub(super) fn binding_for_socket(&self, socket_id: u64) -> Option<ReactorUdpBinding> {
         self.bindings
             .values()
             .find(|binding| binding.socket_id == socket_id)
-            .copied()
-    }
-
-    pub(super) fn update_guest_address(
-        &mut self,
-        socket_id: u64,
-        guest_address: SocketAddrV4,
-    ) -> BrokerResult<()> {
-        let binding = self
-            .bindings
-            .values_mut()
-            .find(|binding| binding.socket_id == socket_id)
-            .ok_or(BrokerError::Internal)?;
-        if binding.guest_address.port() != guest_address.port() {
-            return Err(BrokerError::Internal);
-        }
-        binding.guest_address = guest_address;
-        Ok(())
+            .cloned()
     }
 
     pub(super) fn is_private_host_port(&self, port: u16) -> bool {
@@ -278,8 +326,11 @@ impl Reactor {
         if let Some(binding) = self.udp.guest_binding(address) {
             return SocketOutcome::Completed(ReactorUdpPeer::Guest {
                 socket_generation: binding.socket_id,
-                guest_address: binding.internal_address,
+                guest_address: address,
             });
+        }
+        if address.ip().is_loopback() && self.udp.has_binding_on_port(address.port()) {
+            return SocketOutcome::Failed(SocketError::ConnectionRefused);
         }
         if self.is_private_udp_host_endpoint(address) {
             SocketOutcome::Failed(SocketError::ConnectionRefused)
@@ -520,11 +571,8 @@ impl Reactor {
             match udp.peer {
                 None => true,
                 Some(ReactorUdpPeer::Guest {
-                    socket_generation,
-                    guest_address,
-                }) => {
-                    socket_generation == source_socket_id && guest_address == source_guest_address
-                }
+                    socket_generation, ..
+                }) => socket_generation == source_socket_id,
                 Some(ReactorUdpPeer::External(_)) => false,
             }
         };

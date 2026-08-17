@@ -782,8 +782,9 @@ mod tests {
     impl PlatformSocket for TestPlatformSocket {
         fn bind(
             &self,
-            address: SocketAddrV4,
+            binding: litebox_broker_core::socket::GuestSocketBinding,
         ) -> litebox_broker_core::Result<SocketOutcome<SocketAddrV4>> {
+            let address = binding.requested();
             if self.create_request.socket_type == SocketType::Stream {
                 *self.local_address.lock().unwrap() = Some(address);
                 return Ok(SocketOutcome::Completed(address));
