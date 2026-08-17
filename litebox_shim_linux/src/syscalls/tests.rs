@@ -140,12 +140,28 @@ fn test_fcntl() {
 }
 
 #[test]
-fn test_pipe2_with_one_fd_slot_left() {
+fn test_pipe2_race_with_concurrent_close() {
     let task = init_platform(None);
     task.files.borrow().set_max_fd(3);
 
-    assert_eq!(task.sys_pipe2(OFlags::empty()), Err(Errno::EMFILE));
-    assert_eq!(task.sys_close(3), Err(Errno::EBADF));
+    let stop = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+    let stop_closer = stop.clone();
+    let closer = task.spawn_clone_for_test(move |task| {
+        while !stop_closer.load(core::sync::atomic::Ordering::Relaxed) {
+            let _ = task.sys_close(3);
+        }
+    });
+
+    for iter in 0..50_000 {
+        assert_eq!(
+            task.sys_pipe2(OFlags::empty()),
+            Err(Errno::EMFILE),
+            "failed at iteration {iter}"
+        );
+    }
+
+    stop.store(true, core::sync::atomic::Ordering::Relaxed);
+    closer.join().unwrap();
 }
 
 #[test]
