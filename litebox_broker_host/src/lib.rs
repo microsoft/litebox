@@ -698,8 +698,9 @@ mod tests {
     use litebox_broker_core::readiness::ReadinessRegistration;
     use litebox_broker_core::socket::{
         AcceptedPlatformSocket, BrokerNetworkConfig, GuestSocketBinding, PlatformConnectError,
-        PlatformDatagramReceive, PlatformSocket, PlatformStreamReceive, SocketDestination,
-        SocketProvider,
+        PlatformDatagramReceive, PlatformSocket, PlatformStreamReceive,
+        RoutedAcceptedPlatformSocket, RoutedPlatformDatagramReceive, RoutedSocketConnect,
+        SocketDestination, SocketProvider,
     };
     use litebox_broker_core::{ObjectRights, PolicyEngine, SessionId, SocketPolicy};
     use litebox_broker_protocol::event::{
@@ -789,6 +790,13 @@ mod tests {
     impl PlatformSocket for TestPlatformSocket {
         fn bind(
             &self,
+            _address: SocketAddrV4,
+        ) -> litebox_broker_core::Result<SocketOutcome<SocketAddrV4>> {
+            Err(litebox_broker_core::BrokerError::UnsupportedOperation)
+        }
+
+        fn bind_guest(
+            &self,
             binding: GuestSocketBinding,
         ) -> litebox_broker_core::Result<SocketOutcome<SocketAddrV4>> {
             let address = binding.requested();
@@ -823,9 +831,25 @@ mod tests {
             Err(litebox_broker_core::BrokerError::WouldBlock)
         }
 
+        fn accept_routed(
+            &self,
+            _readiness: ReadinessRegistration,
+        ) -> litebox_broker_core::Result<SocketOutcome<RoutedAcceptedPlatformSocket>> {
+            Err(litebox_broker_core::BrokerError::WouldBlock)
+        }
+
         fn connect(
             &self,
-            _destination: SocketDestination,
+            _destination: SocketAddrV4,
+        ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
+            Err(PlatformConnectError::PeerUnchanged(
+                litebox_broker_core::BrokerError::UnsupportedOperation,
+            ))
+        }
+
+        fn connect_routed(
+            &self,
+            _destination: RoutedSocketConnect,
         ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
             self.readiness
                 .publish(litebox_broker_protocol::readiness::ReadinessFlags::WRITE)
@@ -846,6 +870,15 @@ mod tests {
         }
 
         fn send_to(
+            &self,
+            _data: Vec<u8>,
+            _flags: SendFlags,
+            _destination: Option<SocketAddrV4>,
+        ) -> litebox_broker_core::Result<SocketOutcome<usize>> {
+            Err(litebox_broker_core::BrokerError::UnsupportedOperation)
+        }
+
+        fn send_to_routed(
             &self,
             data: Vec<u8>,
             _flags: SendFlags,
@@ -877,6 +910,21 @@ mod tests {
                 data: [4, 5, 6][..received].to_vec(),
                 datagram_length: 4,
                 source_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49153),
+            }))
+        }
+
+        fn receive_from_routed(
+            &self,
+            length: usize,
+            _flags: ReceiveFromFlags,
+        ) -> litebox_broker_core::Result<SocketOutcome<RoutedPlatformDatagramReceive>> {
+            let received = length.min(3);
+            Ok(SocketOutcome::Completed(RoutedPlatformDatagramReceive {
+                data: [4, 5, 6][..received].to_vec(),
+                datagram_length: 4,
+                source: SocketDestination::Guest {
+                    requested: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49153),
+                },
             }))
         }
 
@@ -1381,10 +1429,7 @@ mod tests {
             ),
             BrokerResult::Socket(SocketResponse::Status(SocketStatusResponse {
                 status: SocketConnectionStatus::Connected,
-                local_address: Some(SocketAddrV4::new(
-                    broker.network_config().guest_ipv4_address(),
-                    49152,
-                )),
+                local_address: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152)),
                 pending_error: None,
             }))
         );

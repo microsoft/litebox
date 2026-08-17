@@ -35,7 +35,7 @@ int main(int argc, char **argv) {
         .sin_family = AF_INET,
         .sin_port = htons((uint16_t)strtoul(argv[1], NULL, 10)),
     };
-    assert(inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) == 1);
+    assert(inet_pton(AF_INET, "10.0.2.1", &address.sin_addr) == 1);
     int result = connect(fd, (const struct sockaddr *)&address, sizeof(address));
     assert(result == 0 || (result == -1 && errno == EINPROGRESS));
 
@@ -70,7 +70,7 @@ int main(int argc, char **argv) {
     struct sockaddr_in peer_address;
     address_length = sizeof(peer_address);
     assert(getpeername(fd, (struct sockaddr *)&peer_address, &address_length) == 0);
-    assert(peer_address.sin_addr.s_addr == htonl(INADDR_LOOPBACK));
+    assert(peer_address.sin_addr.s_addr == address.sin_addr.s_addr);
     assert(peer_address.sin_port == address.sin_port);
     int option = 1;
     assert(setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &option,
@@ -351,6 +351,16 @@ int main(int argc, char **argv) {
     } else {
         assert(errno == ECONNREFUSED);
     }
+    assert(close(fd) == 0);
+
+    fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    assert(fd >= 0);
+    address.sin_port = 0;
+    assert(connect(fd, (const struct sockaddr *)&address, sizeof(address)) == -1);
+    assert(errno == ECONNREFUSED);
+    address.sin_port = htons((uint16_t)strtoul(argv[1], NULL, 10));
+    assert(connect(fd, (const struct sockaddr *)&address, sizeof(address)) == -1);
+    assert(errno == ECONNREFUSED);
     assert(close(fd) == 0);
 
     fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);

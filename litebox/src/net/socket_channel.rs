@@ -121,11 +121,15 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
         if !flags.is_empty() {
             unimplemented!()
         }
-        if let Some(addr) = destination
-            && (addr.port() == 0 || addr.ip().is_unspecified())
-        {
+        if destination.is_some_and(|addr| addr.port() == 0) {
             return Err(ChannelWriteError::Unaddressable);
         }
+        let destination = destination.map(|addr| match addr {
+            SocketAddr::V4(addr) if addr.ip().is_unspecified() => SocketAddr::V4(
+                core::net::SocketAddrV4::new(core::net::Ipv4Addr::LOCALHOST, addr.port()),
+            ),
+            _ => addr,
+        });
         match self {
             Self::BrokerStream(socket) => socket.try_write(buf),
             Self::BrokerDatagram(socket) => socket.try_write(buf, destination),

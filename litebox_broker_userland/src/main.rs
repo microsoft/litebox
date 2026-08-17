@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use litebox_broker_core::socket::BrokerNetworkConfig;
 use litebox_broker_core::{
-    BrokerCore, CallerCredential, DestinationPortRange, DestinationRule, Ipv4Cidr,
-    MAX_DESTINATION_RULES, SocketPolicy, SocketPolicyError,
+    BrokerCore, CallerCredential, DestinationPortRange, DestinationRule, GatewayPortRule, Ipv4Cidr,
+    SocketPolicy, SocketPolicyError,
 };
 use litebox_broker_host::{BrokerHostAssociation, ConnectionTermination, setup_connection};
 use litebox_broker_protocol::message::{BrokerRequest, BrokerResponse};
@@ -84,6 +84,31 @@ impl FromStr for AllowedTcpDestination {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AllowedGatewayPort(DestinationPortRange);
+
+impl FromStr for AllowedGatewayPort {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        parse_port_range(value, "gateway").map(Self)
+    }
+}
+
+fn parse_port_range(value: &str, label: &str) -> Result<DestinationPortRange, String> {
+    let (start, end) = value
+        .split_once('-')
+        .map_or((value, value), |(start, end)| (start, end));
+    let start = start
+        .parse::<u16>()
+        .map_err(|error| format!("invalid {label} port: {error}"))?;
+    let end = end
+        .parse::<u16>()
+        .map_err(|error| format!("invalid {label} port: {error}"))?;
+    DestinationPortRange::new(Port(start), Port(end))
+        .ok_or_else(|| format!("{label} port range must be ordered and exclude port zero"))
+}
+
 #[derive(Parser, Debug)]
 struct CliArgs {
     /// Permit outbound TCP connections to a destination CIDR and port range.
@@ -92,6 +117,12 @@ struct CliArgs {
     /// `0.0.0.0/0:1-65535` permits every nonzero IPv4 TCP destination.
     #[arg(long, value_name = "CIDR:PORT[-PORT]")]
     allow_tcp_destination: Vec<AllowedTcpDestination>,
+    /// Permit TCP access through the host-loopback gateway on a port range.
+    #[arg(long, value_name = "PORT[-PORT]")]
+    allow_host_gateway_tcp_port: Vec<AllowedGatewayPort>,
+    /// Permit UDP access through the host-loopback gateway on a port range.
+    #[arg(long, value_name = "PORT[-PORT]")]
+    allow_host_gateway_udp_port: Vec<AllowedGatewayPort>,
     /// Broker-wide private IPv4 identity shared by guest processes.
     #[arg(
         long,
@@ -100,6 +131,14 @@ struct CliArgs {
         value_parser = parse_guest_ipv4_address
     )]
     guest_ipv4_address: Ipv4Addr,
+    /// Guest-visible address that translates authorized traffic to host loopback.
+    #[arg(
+        long,
+        value_name = "ADDRESS",
+        default_value = "10.0.2.1",
+        value_parser = parse_private_ipv4_address
+    )]
+    gateway_ipv4_address: Ipv4Addr,
     /// Local runner executable to launch.
     #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::ExecutablePath)]
     runner: PathBuf,
@@ -109,12 +148,23 @@ struct CliArgs {
 }
 
 fn parse_guest_ipv4_address(value: &str) -> Result<Ipv4Addr, String> {
+    parse_private_ipv4_address(value)
+}
+
+fn parse_private_ipv4_address(value: &str) -> Result<Ipv4Addr, String> {
     let address = value
         .parse::<Ipv4Addr>()
-        .map_err(|error| format!("invalid guest IPv4 address: {error}"))?;
-    BrokerNetworkConfig::new(address)
-        .map(|config| config.guest_ipv4_address())
-        .ok_or_else(|| "guest IPv4 address must be RFC1918 private unicast".to_owned())
+        .map_err(|error| format!("invalid private IPv4 address: {error}"))?;
+    if address.is_private()
+        && !address.is_unspecified()
+        && !address.is_loopback()
+        && !address.is_broadcast()
+        && !address.is_multicast()
+    {
+        Ok(address)
+    } else {
+        Err("address must be RFC1918 private unicast".to_owned())
+    }
 }
 
 fn run_runner_process(
@@ -143,33 +193,12 @@ fn run_runner_process(
 
 fn configured_socket_policy(
     allowed_destinations: &[AllowedTcpDestination],
-    network_config: &BrokerNetworkConfig,
+    _network_config: &BrokerNetworkConfig,
 ) -> Result<SocketPolicy, SocketPolicyError> {
     if allowed_destinations.is_empty() {
         return Ok(SocketPolicy::Ipv4Loopback);
     }
-    let full_port_range = DestinationPortRange::new(Port(1), Port(u16::MAX))
-        .expect("the full nonzero port range is valid");
-    let guest_address = Ipv4Address(network_config.guest_ipv4_address().octets());
-    let guest_cidr =
-        Ipv4Cidr::new(guest_address, 32).expect("a guest host address is a canonical /32");
-    let guest_rule = DestinationRule::new(
-        CallerCredential::HostGuaranteed,
-        guest_cidr,
-        full_port_range,
-    );
-    let guest_is_covered = allowed_destinations.iter().any(|allowed| {
-        allowed.destination.contains(guest_address)
-            && allowed.ports.start() == Port(1)
-            && allowed.ports.end() == Port(u16::MAX)
-    });
-    if !guest_is_covered && allowed_destinations.len() >= MAX_DESTINATION_RULES {
-        return Err(SocketPolicyError::TooManyRules {
-            maximum: MAX_DESTINATION_RULES - 1,
-            actual: allowed_destinations.len(),
-        });
-    }
-    let mut rules = allowed_destinations
+    let rules = allowed_destinations
         .iter()
         .map(|allowed| {
             DestinationRule::new(
@@ -179,15 +208,14 @@ fn configured_socket_policy(
             )
         })
         .collect::<Vec<_>>();
-    if !guest_is_covered {
-        rules.push(guest_rule);
-    }
-    let udp_loopback = DestinationRule::new(
-        CallerCredential::HostGuaranteed,
-        Ipv4Cidr::new(Ipv4Address([127, 0, 0, 0]), 8).expect("the IPv4 loopback CIDR is canonical"),
-        full_port_range,
-    );
-    SocketPolicy::from_tcp_udp_destination_rules(&rules, &[guest_rule, udp_loopback])
+    SocketPolicy::from_guest_network_destination_rules(true, &rules, true, &[])
+}
+
+fn configured_gateway_rules(allowed: &[AllowedGatewayPort]) -> Vec<GatewayPortRule> {
+    allowed
+        .iter()
+        .map(|allowed| GatewayPortRule::new(CallerCredential::HostGuaranteed, allowed.0))
+        .collect()
 }
 
 fn serve_runner<Memory, SetupChannel, RequestSource, ResponseSink, NotificationChannel, Shutdown>(
@@ -606,6 +634,7 @@ mod cli_tests {
 
         assert_eq!(args.allow_tcp_destination.len(), 1);
         assert_eq!(args.guest_ipv4_address, Ipv4Addr::new(10, 0, 2, 15));
+        assert_eq!(args.gateway_ipv4_address, Ipv4Addr::new(10, 0, 2, 1));
     }
 
     #[test]
@@ -640,7 +669,7 @@ mod cli_tests {
         let allowed = "0.0.0.0/0:80".parse::<AllowedTcpDestination>().unwrap();
         let policy = configured_socket_policy(&[allowed], &network_config).unwrap();
         let rules = policy.tcp_destination_rules().unwrap();
-        assert_eq!(rules.len(), 2);
+        assert_eq!(rules.len(), 1);
         assert_eq!(
             rules[0],
             DestinationRule::new(
@@ -649,56 +678,28 @@ mod cli_tests {
                 allowed.ports,
             )
         );
-        let guest_rule = DestinationRule::new(
-            CallerCredential::HostGuaranteed,
-            Ipv4Cidr::new(
-                Ipv4Address(network_config.guest_ipv4_address().octets()),
-                32,
-            )
-            .unwrap(),
-            DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
-        );
-        assert_eq!(rules[1], guest_rule);
-        assert_eq!(
-            policy.udp_destination_rules().unwrap(),
-            &[
-                guest_rule,
-                DestinationRule::new(
-                    CallerCredential::HostGuaranteed,
-                    Ipv4Cidr::new(Ipv4Address([127, 0, 0, 0]), 8).unwrap(),
-                    DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
-                ),
-            ]
-        );
+        assert_eq!(policy.udp_destination_rules(), Some([].as_slice()));
     }
 
     #[test]
-    fn guest_destination_rule_is_deduplicated_only_for_full_port_coverage() {
-        let network_config = BrokerNetworkConfig::default();
-        let guest = network_config.guest_ipv4_address();
-        let covered = format!("{guest}/32:1-65535")
-            .parse::<AllowedTcpDestination>()
-            .unwrap();
+    fn gateway_port_arguments_are_protocol_specific() {
+        let tcp = "443-444".parse::<AllowedGatewayPort>().unwrap();
+        let udp = "53".parse::<AllowedGatewayPort>().unwrap();
         assert_eq!(
-            configured_socket_policy(&[covered], &network_config)
-                .unwrap()
-                .tcp_destination_rules()
-                .unwrap()
-                .len(),
-            1
+            configured_gateway_rules(&[tcp]),
+            [GatewayPortRule::new(
+                CallerCredential::HostGuaranteed,
+                DestinationPortRange::new(Port(443), Port(444)).unwrap(),
+            )]
         );
-
-        let partial = format!("{guest}/32:443")
-            .parse::<AllowedTcpDestination>()
-            .unwrap();
         assert_eq!(
-            configured_socket_policy(&[partial], &network_config)
-                .unwrap()
-                .tcp_destination_rules()
-                .unwrap()
-                .len(),
-            2
+            configured_gateway_rules(&[udp]),
+            [GatewayPortRule::new(
+                CallerCredential::HostGuaranteed,
+                DestinationPortRange::new(Port(53), Port(53)).unwrap(),
+            )]
         );
+        assert!("0".parse::<AllowedGatewayPort>().is_err());
     }
 
     #[test]
@@ -848,7 +849,7 @@ mod tests {
         let host = std::thread::spawn(move || {
             let broker = BrokerCore::new(
                 PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()),
-                Arc::new(UnsupportedSocketProvider::default()),
+                Arc::new(UnsupportedSocketProvider),
             )
             .unwrap();
             let shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();

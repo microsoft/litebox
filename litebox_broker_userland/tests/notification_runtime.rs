@@ -48,7 +48,7 @@ fn spawn_host(
     std::thread::spawn(move || {
         let broker = BrokerCore::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all()),
-            Arc::new(UnsupportedSocketProvider::default()),
+            Arc::new(UnsupportedSocketProvider),
         )
         .unwrap();
         let shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();
@@ -130,7 +130,7 @@ fn readiness_of(notification: Option<BrokerNotification>) -> ReadinessNotificati
 fn host_serves_control_requests_and_notifications_over_shared_rings() {
     let broker = BrokerCore::new(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all()),
-        Arc::new(UnsupportedSocketProvider::default()),
+        Arc::new(UnsupportedSocketProvider),
     )
     .unwrap();
     let (local_control, host_control) = UnixStream::pair().unwrap();

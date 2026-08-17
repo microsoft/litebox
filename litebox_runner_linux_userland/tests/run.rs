@@ -662,12 +662,32 @@ fn test_runner_broker_tcp_client_with_rewriter() {
     let refused_port = refused_listener.local_addr().unwrap().port();
     drop(refused_listener);
     let control_socket_path = unique_test_socket_path("runner-broker-tcp-control");
+    let tcp_gateway_rules = [
+        litebox_broker_core::GatewayPortRule::new(
+            litebox_broker_core::CallerCredential::HostGuaranteed,
+            litebox_broker_core::DestinationPortRange::new(
+                litebox_broker_protocol::socket::Port(port),
+                litebox_broker_protocol::socket::Port(port),
+            )
+            .unwrap(),
+        ),
+        litebox_broker_core::GatewayPortRule::new(
+            litebox_broker_core::CallerCredential::HostGuaranteed,
+            litebox_broker_core::DestinationPortRange::new(
+                litebox_broker_protocol::socket::Port(refused_port),
+                litebox_broker_protocol::socket::Port(refused_port),
+            )
+            .unwrap(),
+        ),
+    ];
     let broker = spawn_test_broker(
         &control_socket_path,
         litebox_broker_core::PolicyEngine::with_host_guaranteed_rights(
             litebox_broker_core::ObjectRights::all(),
         )
-        .with_socket_policy(litebox_broker_core::SocketPolicy::Ipv4Loopback),
+        .with_socket_policy(litebox_broker_core::SocketPolicy::Ipv4Loopback)
+        .with_gateway_rules(&tcp_gateway_rules, &[])
+        .unwrap(),
         1,
     );
     Runner::new(&target, "broker_tcp_client_rewriter")
@@ -675,7 +695,7 @@ fn test_runner_broker_tcp_client_with_rewriter() {
         .arg(refused_port.to_string())
         .broker_socket(&control_socket_path)
         .run();
-    assert_eq!(broker.next_close_object_count(), 9);
+    assert_eq!(broker.next_close_object_count(), 10);
     broker.join();
     server.join().unwrap();
 }
@@ -751,12 +771,32 @@ fn test_runner_broker_udp_with_rewriter() {
     });
 
     let control_socket_path = unique_test_socket_path("runner-broker-udp-control");
+    let udp_gateway_rules = [
+        litebox_broker_core::GatewayPortRule::new(
+            litebox_broker_core::CallerCredential::HostGuaranteed,
+            litebox_broker_core::DestinationPortRange::new(
+                litebox_broker_protocol::socket::Port(port),
+                litebox_broker_protocol::socket::Port(port),
+            )
+            .unwrap(),
+        ),
+        litebox_broker_core::GatewayPortRule::new(
+            litebox_broker_core::CallerCredential::HostGuaranteed,
+            litebox_broker_core::DestinationPortRange::new(
+                litebox_broker_protocol::socket::Port(refused_port),
+                litebox_broker_protocol::socket::Port(refused_port),
+            )
+            .unwrap(),
+        ),
+    ];
     let broker = spawn_test_broker(
         &control_socket_path,
         litebox_broker_core::PolicyEngine::with_host_guaranteed_rights(
             litebox_broker_core::ObjectRights::all(),
         )
-        .with_socket_policy(litebox_broker_core::SocketPolicy::Ipv4Loopback),
+        .with_socket_policy(litebox_broker_core::SocketPolicy::Ipv4Loopback)
+        .with_gateway_rules(&[], &udp_gateway_rules)
+        .unwrap(),
         1,
     );
     runner
@@ -1230,15 +1270,25 @@ fn test_broker_with_curl() {
 
     let curl_path = run_which("curl");
     let control_socket_path = unique_test_socket_path("runner-broker-curl-control");
+    let tcp_gateway_rules = [litebox_broker_core::GatewayPortRule::new(
+        litebox_broker_core::CallerCredential::HostGuaranteed,
+        litebox_broker_core::DestinationPortRange::new(
+            litebox_broker_protocol::socket::Port(port),
+            litebox_broker_protocol::socket::Port(port),
+        )
+        .unwrap(),
+    )];
     let broker = spawn_test_broker(
         &control_socket_path,
         litebox_broker_core::PolicyEngine::with_host_guaranteed_rights(
             litebox_broker_core::ObjectRights::all(),
         )
-        .with_socket_policy(litebox_broker_core::SocketPolicy::Ipv4Loopback),
+        .with_socket_policy(litebox_broker_core::SocketPolicy::Ipv4Loopback)
+        .with_gateway_rules(&tcp_gateway_rules, &[])
+        .unwrap(),
         1,
     );
-    let url = format!("http://127.0.0.1:{port}/something");
+    let url = format!("http://10.0.2.1:{port}/something");
     let output = Runner::new(&curl_path, "curl_rewriter")
         .args(["-sS", &url])
         .broker_socket(&control_socket_path)
@@ -1269,14 +1319,6 @@ fn test_broker_with_iperf3() {
 
     let iperf3_path = run_which("iperf3");
     let control_socket_path = unique_test_socket_path("runner-broker-iperf3-control");
-    let broker = spawn_test_broker(
-        &control_socket_path,
-        litebox_broker_core::PolicyEngine::with_host_guaranteed_rights(
-            litebox_broker_core::ObjectRights::all(),
-        )
-        .with_socket_policy(litebox_broker_core::SocketPolicy::Ipv4Loopback),
-        1,
-    );
 
     let mut last_server_output = String::new();
     let mut started_server = None;
@@ -1333,12 +1375,30 @@ fn test_broker_with_iperf3() {
     }
     let (port, mut server, server_output) = started_server
         .unwrap_or_else(|| panic!("iperf3 server did not start; output:\n{last_server_output}"));
+    let tcp_gateway_rules = [litebox_broker_core::GatewayPortRule::new(
+        litebox_broker_core::CallerCredential::HostGuaranteed,
+        litebox_broker_core::DestinationPortRange::new(
+            litebox_broker_protocol::socket::Port(port),
+            litebox_broker_protocol::socket::Port(port),
+        )
+        .unwrap(),
+    )];
+    let broker = spawn_test_broker(
+        &control_socket_path,
+        litebox_broker_core::PolicyEngine::with_host_guaranteed_rights(
+            litebox_broker_core::ObjectRights::all(),
+        )
+        .with_socket_policy(litebox_broker_core::SocketPolicy::Ipv4Loopback)
+        .with_gateway_rules(&tcp_gateway_rules, &[])
+        .unwrap(),
+        1,
+    );
 
     let mut runner = Runner::new(&iperf3_path, "broker_iperf3_client_rewriter");
     runner
         .args([
             "-c",
-            "127.0.0.1",
+            "10.0.2.1",
             "-p",
             &port.to_string(),
             "--connect-timeout",

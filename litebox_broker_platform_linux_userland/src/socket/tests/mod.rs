@@ -11,7 +11,7 @@ use super::*;
 use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_core::{
     BrokerCore, BrokerCoreLimits, BrokerSession, CallerCredential, DestinationPortRange,
-    DestinationRule, Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy,
+    DestinationRule, GatewayPortRule, Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy,
 };
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::socket::{Ipv4Address, Port, ReceiveSocketResponse};
@@ -32,6 +32,35 @@ fn guest_ipv4_address() -> Ipv4Addr {
 
 fn guest_address(port: u16) -> SocketAddrV4 {
     SocketAddrV4::new(guest_ipv4_address(), port)
+}
+
+fn gateway_address(port: u16) -> SocketAddrV4 {
+    SocketAddrV4::new(BrokerNetworkConfig::default().gateway_ipv4_address(), port)
+}
+
+fn policy_with_gateway(tcp_ports: &[u16], udp_ports: &[u16]) -> PolicyEngine {
+    let tcp_rules = tcp_ports
+        .iter()
+        .map(|port| {
+            GatewayPortRule::new(
+                CallerCredential::Unauthenticated,
+                DestinationPortRange::new(Port(*port), Port(*port)).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let udp_rules = udp_ports
+        .iter()
+        .map(|port| {
+            GatewayPortRule::new(
+                CallerCredential::Unauthenticated,
+                DestinationPortRange::new(Port(*port), Port(*port)).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+        .with_socket_policy(SocketPolicy::Ipv4Loopback)
+        .with_gateway_rules(&tcp_rules, &udp_rules)
+        .unwrap()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -310,8 +339,7 @@ fn directional_shutdown_survives_readiness_publication_failure() {
 
     let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
     let broker = BrokerCore::new_with_limits(
-        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+        policy_with_gateway(&[address.port()], &[]),
         BrokerCoreLimits::new_with_all_limits(4, 0, 2, 2),
         provider,
     )
@@ -328,7 +356,7 @@ fn directional_shutdown_survives_readiness_publication_failure() {
 
     let tcp = create_socket(&session, readiness.clone());
     assert!(matches!(
-        litebox_broker_core::socket::connect(&session, tcp, socket_address_v4(address)),
+        litebox_broker_core::socket::connect(&session, tcp, gateway_address(address.port())),
         Ok(SocketOutcome::Completed(
             SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
         ))

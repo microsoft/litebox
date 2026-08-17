@@ -11,7 +11,7 @@ use std::process::Child;
 use std::sync::Arc;
 use std::time::Instant;
 
-use litebox_broker_core::socket::{BrokerNetworkConfig, UnsupportedSocketProvider};
+use litebox_broker_core::socket::{BrokerNetworkConfig, ConfiguredUnsupportedSocketProvider};
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
 use litebox_broker_protocol::message::{BrokerRequest, BrokerResponse};
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
@@ -27,7 +27,7 @@ use litebox_broker_transport_windows_userland::shared_memory::WindowsSharedMemor
 
 use super::{
     HostAssociationShutdown, HostRequestSource, HostResponseSink, SETUP_TIMEOUT,
-    configured_socket_policy,
+    configured_gateway_rules, configured_socket_policy,
 };
 
 impl HostRequestSource for WindowsControlRingHostRequestSource {
@@ -52,14 +52,21 @@ pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
     let control_pipe = unique_control_pipe_name();
     let control_listener = WindowsNamedPipeListener::bind(&control_pipe)?;
     let network_config = Arc::new(
-        BrokerNetworkConfig::new(args.guest_ipv4_address)
-            .expect("clap validates the guest IPv4 address"),
+        BrokerNetworkConfig::new(args.guest_ipv4_address, args.gateway_ipv4_address)
+            .ok_or("guest and gateway IPv4 addresses must be distinct private unicast addresses")?,
     );
+    let policy = PolicyEngine::with_host_guaranteed_rights(ObjectRights::all())
+        .with_socket_policy(configured_socket_policy(
+            &args.allow_tcp_destination,
+            &network_config,
+        )?)
+        .with_gateway_rules(
+            &configured_gateway_rules(&args.allow_host_gateway_tcp_port),
+            &configured_gateway_rules(&args.allow_host_gateway_udp_port),
+        )?;
     let broker = BrokerCore::new(
-        PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()).with_socket_policy(
-            configured_socket_policy(&args.allow_tcp_destination, &network_config)?,
-        ),
-        Arc::new(UnsupportedSocketProvider::new(network_config)),
+        policy,
+        Arc::new(ConfiguredUnsupportedSocketProvider::new(network_config)),
     )?;
 
     crate::run_runner_process(&args, &control_pipe, |runner, runner_process_id| {

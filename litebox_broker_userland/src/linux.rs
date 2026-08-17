@@ -22,7 +22,7 @@ use litebox_broker_transport_linux_userland::unix_socket::{
 
 use super::{
     HostAssociationShutdown, HostRequestSource, HostResponseSink, SETUP_TIMEOUT,
-    configured_socket_policy,
+    configured_gateway_rules, configured_socket_policy,
 };
 
 impl HostRequestSource for UnixControlRingHostRequestSource {
@@ -52,13 +52,20 @@ pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
     control_listener.set_nonblocking(true)?;
     let limits = BrokerCoreLimits::DEFAULT;
     let network_config = Arc::new(
-        BrokerNetworkConfig::new(args.guest_ipv4_address)
-            .expect("clap validates the guest IPv4 address"),
+        BrokerNetworkConfig::new(args.guest_ipv4_address, args.gateway_ipv4_address)
+            .ok_or("guest and gateway IPv4 addresses must be distinct private unicast addresses")?,
     );
+    let policy = PolicyEngine::with_host_guaranteed_rights(ObjectRights::all())
+        .with_socket_policy(configured_socket_policy(
+            &args.allow_tcp_destination,
+            &network_config,
+        )?)
+        .with_gateway_rules(
+            &configured_gateway_rules(&args.allow_host_gateway_tcp_port),
+            &configured_gateway_rules(&args.allow_host_gateway_udp_port),
+        )?;
     let broker = BrokerCore::new_with_limits(
-        PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()).with_socket_policy(
-            configured_socket_policy(&args.allow_tcp_destination, &network_config)?,
-        ),
+        policy,
         limits,
         Arc::new(LinuxSocketProvider::new_with_network_config(
             Arc::clone(&network_config),

@@ -33,6 +33,14 @@ use crate::{
 
 const _: () = assert!(MAX_SOCKET_PEEK_SIZE as usize == super::SOCKET_RECEIVE_OPERATION_SIZE);
 
+fn normalize_ipv4_destination(address: SocketAddrV4) -> SocketAddrV4 {
+    if address.port() != 0 && address.ip().is_unspecified() {
+        SocketAddrV4::new(core::net::Ipv4Addr::LOCALHOST, address.port())
+    } else {
+        address
+    }
+}
+
 struct BrokerTcpSocketState {
     connection: SocketConnectionStatus,
     local_address: Option<SocketAddrV4>,
@@ -184,6 +192,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
     }
 
     pub(super) fn start_connect(&self, address: SocketAddrV4) -> Result<(), ConnectError> {
+        let address = normalize_ipv4_destination(address);
         let previous = self.state.lock().connection;
         let outcome = self
             .broker
@@ -726,6 +735,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerUdpSocket<Platfor
     }
 
     pub(super) fn start_connect(&self, address: SocketAddrV4) -> Result<(), ConnectError> {
+        let address = normalize_ipv4_destination(address);
         let _configuration = self.configuration_lock.lock();
         let outcome = self
             .broker
@@ -740,6 +750,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerUdpSocket<Platfor
                 state.remote_address = Some(address);
                 Ok(())
             }
+
             SocketOutcome::Completed(_) => Err(ConnectError::OperationFailed(
                 SocketAsyncError::BackendFailure,
             )),

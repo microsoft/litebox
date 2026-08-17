@@ -3,29 +3,36 @@
 
 //! Broker-owned IPv4 identity and trusted socket routing values.
 
+use alloc::sync::Arc;
+use core::fmt;
 use core::net::{Ipv4Addr, SocketAddrV4};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use litebox_broker_protocol::socket::SocketError;
+
+use super::GuestBindingLease;
 
 /// Immutable network identity shared by broker core and its socket provider.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BrokerNetworkConfig {
     guest_ipv4_address: Ipv4Addr,
+    gateway_ipv4_address: Ipv4Addr,
 }
 
 impl BrokerNetworkConfig {
-    /// Creates a configuration for one RFC1918 guest IPv4 address.
+    /// Creates a configuration for distinct RFC1918 guest and gateway addresses.
     #[must_use]
-    pub fn new(guest_ipv4_address: Ipv4Addr) -> Option<Self> {
-        if !guest_ipv4_address.is_private()
-            || guest_ipv4_address.is_unspecified()
-            || guest_ipv4_address.is_loopback()
-            || guest_ipv4_address.is_broadcast()
-            || guest_ipv4_address.is_multicast()
+    pub fn new(guest_ipv4_address: Ipv4Addr, gateway_ipv4_address: Ipv4Addr) -> Option<Self> {
+        if !is_private_unicast(guest_ipv4_address)
+            || !is_private_unicast(gateway_ipv4_address)
+            || guest_ipv4_address == gateway_ipv4_address
         {
             return None;
         }
-        Some(Self { guest_ipv4_address })
+        Some(Self {
+            guest_ipv4_address,
+            gateway_ipv4_address,
+        })
     }
 
     /// Returns the broker-wide guest IPv4 identity.
@@ -34,100 +41,177 @@ impl BrokerNetworkConfig {
         self.guest_ipv4_address
     }
 
-    /// Returns the concrete guest identity for a wildcard or private binding.
+    /// Returns the guest-visible gateway IPv4 address.
     #[must_use]
-    pub fn canonical_guest_address(&self, address: SocketAddrV4) -> Option<SocketAddrV4> {
-        if address.port() == 0 {
-            return None;
-        }
-        if address.ip().is_unspecified() || *address.ip() == self.guest_ipv4_address {
-            Some(SocketAddrV4::new(self.guest_ipv4_address, address.port()))
-        } else {
-            None
-        }
+    pub const fn gateway_ipv4_address(&self) -> Ipv4Addr {
+        self.gateway_ipv4_address
     }
 
+    /// Normalizes and classifies one nonzero destination.
     pub(crate) fn classify_destination(
         &self,
         requested: SocketAddrV4,
     ) -> Result<SocketDestination, SocketError> {
-        if requested.ip().is_unspecified() || requested.port() == 0 {
+        if requested.port() == 0 {
             return Err(SocketError::InvalidArgument);
         }
-        if *requested.ip() == self.guest_ipv4_address {
+        let requested = if requested.ip().is_unspecified() {
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, requested.port())
+        } else {
+            requested
+        };
+        if is_invalid_destination(*requested.ip()) {
+            return Err(SocketError::InvalidArgument);
+        }
+        if requested.ip().is_loopback() || *requested.ip() == self.guest_ipv4_address {
             Ok(SocketDestination::Guest { requested })
+        } else if *requested.ip() == self.gateway_ipv4_address {
+            Ok(SocketDestination::Gateway { requested })
         } else {
             Ok(SocketDestination::External { requested })
         }
+    }
+
+    pub(crate) fn binding_is_valid(&self, requested: SocketAddrV4) -> bool {
+        requested.ip().is_unspecified()
+            || requested.ip().is_loopback()
+            || *requested.ip() == self.guest_ipv4_address
     }
 }
 
 impl Default for BrokerNetworkConfig {
     fn default() -> Self {
-        Self::new(Ipv4Addr::new(10, 0, 2, 15)).expect("the default guest IPv4 address is valid")
+        Self::new(Ipv4Addr::new(10, 0, 2, 15), Ipv4Addr::new(10, 0, 2, 1))
+            .expect("the default broker network addresses are valid")
     }
 }
 
+fn is_private_unicast(address: Ipv4Addr) -> bool {
+    address.is_private()
+        && !address.is_unspecified()
+        && !address.is_loopback()
+        && !address.is_broadcast()
+        && !address.is_multicast()
+}
+
+fn is_invalid_destination(address: Ipv4Addr) -> bool {
+    let first = address.octets()[0];
+    address.is_broadcast()
+        || address.is_multicast()
+        || first >= 240
+        || (first == 0 && !address.is_unspecified())
+}
+
 /// Broker-authorized guest binding passed to a platform provider.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct GuestSocketBinding {
     requested: SocketAddrV4,
-    wildcard: bool,
+    lease: GuestBindingLease,
 }
 
 impl GuestSocketBinding {
-    /// Creates a binding valid for one broker network configuration.
-    ///
-    /// Broker core constructs this only after policy and port authorization.
-    /// Platform providers must still call [`Self::is_valid_for`] because this
-    /// portable value is not itself an authorization boundary.
-    #[must_use]
-    pub fn new(config: &BrokerNetworkConfig, requested: SocketAddrV4) -> Option<Self> {
+    pub(crate) fn new(
+        config: &BrokerNetworkConfig,
+        requested: SocketAddrV4,
+        lease: GuestBindingLease,
+    ) -> Option<Self> {
         if requested.port() == 0
-            || (!requested.ip().is_unspecified() && *requested.ip() != config.guest_ipv4_address())
+            || !config.binding_is_valid(requested)
+            || lease.requested_address() != requested
         {
             return None;
         }
-        Some(Self {
-            requested,
-            wildcard: requested.ip().is_unspecified(),
-        })
+        Some(Self { requested, lease })
     }
 
     /// Returns the broker-reserved guest-visible binding.
     #[must_use]
-    pub const fn requested(self) -> SocketAddrV4 {
+    pub const fn requested(&self) -> SocketAddrV4 {
         self.requested
     }
 
     /// Returns whether the original binding used the wildcard address.
     #[must_use]
-    pub const fn is_wildcard(self) -> bool {
-        self.wildcard
+    pub const fn is_wildcard(&self) -> bool {
+        self.requested.ip().is_unspecified()
     }
 
     /// Checks that this value is valid for a provider's shared configuration.
     #[must_use]
-    pub fn is_valid_for(self, config: &BrokerNetworkConfig) -> bool {
-        Self::new(config, self.requested) == Some(self)
+    pub fn is_valid_for(&self, config: &BrokerNetworkConfig) -> bool {
+        self.requested.port() != 0
+            && config.binding_is_valid(self.requested)
+            && self.lease.requested_address() == self.requested
     }
 
-    /// Returns the concrete guest source identity for this binding.
+    /// Returns whether this reservation covers one concrete guest address.
     #[must_use]
-    pub fn canonical_address(self, config: &BrokerNetworkConfig) -> Option<SocketAddrV4> {
-        if !self.is_valid_for(config) {
+    pub fn covers(&self, config: &BrokerNetworkConfig, address: SocketAddrV4) -> bool {
+        self.is_valid_for(config) && self.lease.covers(address, config)
+    }
+
+    /// Selects the concrete guest source identity for one route.
+    #[must_use]
+    pub fn concrete_address_for(
+        &self,
+        config: &BrokerNetworkConfig,
+        destination: SocketDestination,
+    ) -> Option<SocketAddrV4> {
+        if !self.is_valid_for(config) || !destination.is_valid_for(config) {
             return None;
         }
-        config.canonical_guest_address(self.requested)
+        if !self.is_wildcard() {
+            if self.requested.ip().is_loopback()
+                && !matches!(destination, SocketDestination::Guest { .. })
+            {
+                return None;
+            }
+            return Some(self.requested);
+        }
+        let ip = match destination {
+            SocketDestination::Guest { requested } if requested.ip().is_loopback() => {
+                Ipv4Addr::LOCALHOST
+            }
+            SocketDestination::Guest { .. }
+            | SocketDestination::Gateway { .. }
+            | SocketDestination::External { .. } => config.guest_ipv4_address,
+        };
+        Some(SocketAddrV4::new(ip, self.requested.port()))
+    }
+
+    pub(crate) fn lease(&self) -> GuestBindingLease {
+        self.lease.clone()
     }
 }
 
+impl fmt::Debug for GuestSocketBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GuestSocketBinding")
+            .field("requested", &self.requested)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for GuestSocketBinding {
+    fn eq(&self, other: &Self) -> bool {
+        self.requested == other.requested
+    }
+}
+
+impl Eq for GuestSocketBinding {}
+
 /// Trusted classification of one validated socket destination.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum SocketDestination {
     /// Route only through the broker-wide guest namespace.
     Guest {
-        /// Original guest-requested destination.
+        /// Normalized guest-requested destination.
+        requested: SocketAddrV4,
+    },
+    /// Translate through the explicitly authorized host gateway.
+    Gateway {
+        /// Guest-visible gateway destination.
         requested: SocketAddrV4,
     },
     /// Route only through the platform's native external path.
@@ -138,11 +222,13 @@ pub enum SocketDestination {
 }
 
 impl SocketDestination {
-    /// Returns the original guest-requested destination.
+    /// Returns the normalized guest-requested destination.
     #[must_use]
     pub const fn requested(self) -> SocketAddrV4 {
         match self {
-            Self::Guest { requested } | Self::External { requested } => requested,
+            Self::Guest { requested }
+            | Self::Gateway { requested }
+            | Self::External { requested } => requested,
         }
     }
 
@@ -153,28 +239,135 @@ impl SocketDestination {
     }
 }
 
+/// Core-issued guest TCP source identity retained through routed accept.
+#[derive(Clone)]
+pub struct GuestSourceLease {
+    inner: Arc<GuestSourceLeaseInner>,
+}
+
+struct GuestSourceLeaseInner {
+    binding: GuestBindingLease,
+    source: SocketAddrV4,
+    destination: SocketAddrV4,
+    id: u64,
+    transferred: AtomicBool,
+}
+
+impl GuestSourceLease {
+    pub(crate) fn new(
+        binding: GuestBindingLease,
+        source: SocketAddrV4,
+        destination: SocketAddrV4,
+        id: u64,
+    ) -> Self {
+        Self {
+            inner: Arc::new(GuestSourceLeaseInner {
+                binding,
+                source,
+                destination,
+                id,
+                transferred: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    /// Returns the exact guest-visible connector source.
+    #[must_use]
+    pub fn source(&self) -> SocketAddrV4 {
+        self.inner.source
+    }
+
+    /// Returns the exact guest destination used by the connector.
+    #[must_use]
+    pub fn destination(&self) -> SocketAddrV4 {
+        self.inner.destination
+    }
+
+    pub(crate) fn binding(&self) -> GuestBindingLease {
+        self.inner.binding.clone()
+    }
+
+    pub(crate) fn claim_accept(&self) -> bool {
+        self.inner
+            .transferred
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+}
+
+impl fmt::Debug for GuestSourceLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GuestSourceLease")
+            .field("source", &self.inner.source)
+            .field("destination", &self.inner.destination)
+            .field("id", &self.inner.id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Trusted routed connect request passed to a platform provider.
+#[derive(Clone, Debug)]
+pub struct RoutedSocketConnect {
+    destination: SocketDestination,
+    guest_source: Option<GuestSourceLease>,
+}
+
+impl RoutedSocketConnect {
+    pub(crate) fn new(
+        destination: SocketDestination,
+        guest_source: Option<GuestSourceLease>,
+    ) -> Self {
+        Self {
+            destination,
+            guest_source,
+        }
+    }
+
+    /// Returns the classified destination.
+    #[must_use]
+    pub const fn destination(&self) -> SocketDestination {
+        self.destination
+    }
+
+    /// Returns the core-issued source token for a guest TCP connect.
+    #[must_use]
+    pub const fn guest_source(&self) -> Option<&GuestSourceLease> {
+        self.guest_source.as_ref()
+    }
+
+    /// Splits this request into its provider-owned values.
+    #[must_use]
+    pub fn into_parts(self) -> (SocketDestination, Option<GuestSourceLease>) {
+        (self.destination, self.guest_source)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::socket::BrokerSocketPorts;
+    use litebox_broker_protocol::socket::{
+        AddressFamily, CreateSocketRequest, IpProtocol, SocketOutcome, SocketType,
+    };
+
+    const fn create_request() -> CreateSocketRequest {
+        CreateSocketRequest {
+            address_family: AddressFamily::Ipv4,
+            socket_type: SocketType::Stream,
+            protocol: IpProtocol::Tcp,
+        }
+    }
 
     #[test]
-    fn network_config_validates_private_unicast_identity() {
-        assert_eq!(
-            BrokerNetworkConfig::default().guest_ipv4_address(),
-            Ipv4Addr::new(10, 0, 2, 15)
+    fn network_config_validates_distinct_private_unicast_addresses() {
+        let config = BrokerNetworkConfig::default();
+        assert_eq!(config.guest_ipv4_address(), Ipv4Addr::new(10, 0, 2, 15));
+        assert_eq!(config.gateway_ipv4_address(), Ipv4Addr::new(10, 0, 2, 1));
+        assert!(
+            BrokerNetworkConfig::new(Ipv4Addr::new(172, 16, 0, 2), Ipv4Addr::new(172, 16, 0, 1))
+                .is_some()
         );
-        for valid in [
-            Ipv4Addr::new(10, 0, 0, 1),
-            Ipv4Addr::new(172, 16, 0, 1),
-            Ipv4Addr::new(192, 168, 0, 1),
-        ] {
-            assert_eq!(
-                BrokerNetworkConfig::new(valid)
-                    .expect("private unicast address should be valid")
-                    .guest_ipv4_address(),
-                valid
-            );
-        }
         for invalid in [
             Ipv4Addr::UNSPECIFIED,
             Ipv4Addr::LOCALHOST,
@@ -182,48 +375,87 @@ mod tests {
             Ipv4Addr::new(224, 0, 0, 1),
             Ipv4Addr::new(192, 0, 2, 1),
         ] {
-            assert_eq!(BrokerNetworkConfig::new(invalid), None);
+            assert_eq!(
+                BrokerNetworkConfig::new(invalid, Ipv4Addr::new(10, 0, 2, 1)),
+                None
+            );
         }
+        assert_eq!(
+            BrokerNetworkConfig::new(Ipv4Addr::new(10, 0, 2, 15), Ipv4Addr::new(10, 0, 2, 15)),
+            None
+        );
     }
 
     #[test]
-    fn destination_classification_uses_only_the_guest_identity() {
+    fn destination_classification_normalizes_and_separates_routes() {
         let config = BrokerNetworkConfig::default();
         let guest = SocketAddrV4::new(config.guest_ipv4_address(), 80);
-        let loopback = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 80);
+        let gateway = SocketAddrV4::new(config.gateway_ipv4_address(), 80);
+        let loopback = SocketAddrV4::new(Ipv4Addr::new(127, 2, 3, 4), 80);
+        let normalized = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 80);
         assert_eq!(
             config.classify_destination(guest),
             Ok(SocketDestination::Guest { requested: guest })
         );
         assert_eq!(
             config.classify_destination(loopback),
-            Ok(SocketDestination::External {
+            Ok(SocketDestination::Guest {
                 requested: loopback
             })
         );
         assert_eq!(
-            config.classify_destination(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 80)),
-            Err(SocketError::InvalidArgument)
+            config.classify_destination(gateway),
+            Ok(SocketDestination::Gateway { requested: gateway })
         );
         assert_eq!(
-            config.classify_destination(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
-            Err(SocketError::InvalidArgument)
+            config.classify_destination(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 80)),
+            Ok(SocketDestination::Guest {
+                requested: normalized
+            })
         );
+        for invalid in [
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+            SocketAddrV4::new(Ipv4Addr::BROADCAST, 80),
+            SocketAddrV4::new(Ipv4Addr::new(224, 0, 0, 1), 80),
+            SocketAddrV4::new(Ipv4Addr::new(240, 0, 0, 1), 80),
+            SocketAddrV4::new(Ipv4Addr::new(0, 1, 2, 3), 80),
+        ] {
+            assert_eq!(
+                config.classify_destination(invalid),
+                Err(SocketError::InvalidArgument)
+            );
+        }
     }
 
     #[test]
-    fn guest_binding_preserves_wildcard_and_canonicalizes_identity() {
+    fn guest_binding_preserves_exact_and_wildcard_identity() {
         let config = BrokerNetworkConfig::default();
+        let ports = BrokerSocketPorts::default();
         let wildcard = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 49152);
-        let binding = GuestSocketBinding::new(&config, wildcard).unwrap();
+        let SocketOutcome::Completed((wildcard, lease)) =
+            ports.reserve(create_request(), wildcard).unwrap()
+        else {
+            panic!("wildcard reservation failed");
+        };
+        let binding = GuestSocketBinding::new(&config, wildcard, lease).unwrap();
         assert!(binding.is_wildcard());
         assert_eq!(
-            binding.canonical_address(&config),
-            Some(SocketAddrV4::new(config.guest_ipv4_address(), 49152))
+            binding.concrete_address_for(
+                &config,
+                SocketDestination::Guest {
+                    requested: SocketAddrV4::new(Ipv4Addr::new(127, 2, 3, 4), 80)
+                }
+            ),
+            Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152))
         );
         assert_eq!(
-            GuestSocketBinding::new(&config, SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152)),
-            None
+            binding.concrete_address_for(
+                &config,
+                SocketDestination::Gateway {
+                    requested: SocketAddrV4::new(config.gateway_ipv4_address(), 80)
+                }
+            ),
+            Some(SocketAddrV4::new(config.guest_ipv4_address(), 49152))
         );
     }
 }
