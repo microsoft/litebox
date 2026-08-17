@@ -120,7 +120,7 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
         self.insert_raw_fd_locked(&mut rds, typed_fd)
     }
 
-    fn insert_raw_fd_locked<Subsystem: FdEnabledSubsystem>(
+    pub(super) fn insert_raw_fd_locked<Subsystem: FdEnabledSubsystem>(
         &self,
         rds: &mut litebox::fd::RawDescriptorStorage,
         typed_fd: TypedFd<Subsystem>,
@@ -810,7 +810,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.do_close_and_replace::<LinuxFS<Platform>>(raw_fd, None)
     }
 
-    fn remove_and_drop_descriptor<S: FdEnabledSubsystem>(&self, fd: &TypedFd<S>) {
+    pub(super) fn remove_and_drop_descriptor<S: FdEnabledSubsystem>(&self, fd: &TypedFd<S>) {
         let entry = {
             let mut dt = self.global.litebox.descriptor_table_mut();
             dt.remove(fd)
@@ -1857,11 +1857,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         drop(dt);
         let files = self.files.borrow();
         let raw_fd = files.insert_raw_fd(typed).map_err(|typed| {
-            self.global
-                .litebox
-                .descriptor_table_mut()
-                .remove(&typed)
-                .unwrap();
+            self.remove_and_drop_descriptor(&typed);
             Errno::EMFILE
         })?;
         Ok(raw_fd.try_into().unwrap())
@@ -2099,11 +2095,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         drop(dt);
         let files = self.files.borrow();
         let raw_fd = files.insert_raw_fd(typed).map_err(|typed| {
-            self.global
-                .litebox
-                .descriptor_table_mut()
-                .remove(&typed)
-                .unwrap();
+            self.remove_and_drop_descriptor(&typed);
             Errno::EMFILE
         })?;
         Ok(raw_fd.try_into().unwrap())

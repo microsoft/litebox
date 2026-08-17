@@ -1016,7 +1016,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 }
 
                 files.insert_raw_fd(typed).map_err(|typed| {
-                    let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
+                    self.remove_and_drop_descriptor(&typed);
                     Errno::EMFILE
                 })?
             }
@@ -1047,6 +1047,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .ok_or(Errno::EFAULT)?;
         Ok(())
     }
+
     fn do_socketpair(
         &self,
         domain: AddressFamily,
@@ -1072,15 +1073,36 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     assert!(old.is_none());
                 }
                 drop(dt);
-                let raw_fd1 = files.insert_raw_fd(typed1).map_err(|typed| {
-                    let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
-                    Errno::EMFILE
-                })?;
-                let raw_fd2 = files.insert_raw_fd(typed2).map_err(|typed| {
-                    self.do_close(raw_fd1).unwrap();
-                    let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
-                    Errno::EMFILE
-                })?;
+                // Both inserts and the rollback of the first one must happen under a single
+                // acquisition of the raw descriptor store lock: otherwise a concurrent `close`
+                // could free the first socket's slot and another thread could take it over,
+                // making the rollback remove an unrelated file descriptor.
+                let mut rds = files.raw_descriptor_store.write();
+                let raw_fd1 = match files.insert_raw_fd_locked(&mut rds, typed1) {
+                    Ok(raw_fd) => raw_fd,
+                    Err(typed1) => {
+                        drop(rds);
+                        self.remove_and_drop_descriptor(&typed1);
+                        self.remove_and_drop_descriptor(&typed2);
+                        return Err(Errno::EMFILE);
+                    }
+                };
+                let raw_fd2 = match files.insert_raw_fd_locked(&mut rds, typed2) {
+                    Ok(raw_fd) => raw_fd,
+                    Err(typed2) => {
+                        let typed1 = rds
+                            .fd_consume_raw_integer::<crate::syscalls::unix::UnixSocketSubsystem<
+                                Platform,
+                                FS,
+                            >>(raw_fd1)
+                            .unwrap();
+                        drop(rds);
+                        self.remove_and_drop_descriptor(&typed1);
+                        self.remove_and_drop_descriptor(&typed2);
+                        return Err(Errno::EMFILE);
+                    }
+                };
+                drop(rds);
                 (raw_fd1, raw_fd2)
             }
             AddressFamily::INET | AddressFamily::INET6 | AddressFamily::NETLINK => {
@@ -1301,7 +1323,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 }
                 drop(dt);
                 let raw_fd = files.insert_raw_fd(typed).map_err(|typed| {
-                    let _ = self.global.litebox.descriptor_table_mut().remove(&typed);
+                    self.remove_and_drop_descriptor(&typed);
                     Errno::EMFILE
                 })?;
                 Ok((raw_fd, peer_addr))
@@ -3332,6 +3354,31 @@ mod unix_tests {
 
         unix_socketpair_bidirectional(SockType::Stream, true);
         unix_socketpair_bidirectional(SockType::Datagram, true);
+    }
+
+    #[test]
+    fn test_socketpair_race_with_concurrent_close() {
+        let task = init_platform(None);
+        task.files.borrow().set_max_fd(3);
+
+        let stop = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+        let stop_closer = stop.clone();
+        let closer = task.spawn_clone_for_test(move |task| {
+            while !stop_closer.load(core::sync::atomic::Ordering::Relaxed) {
+                let _ = task.sys_close(3);
+            }
+        });
+
+        for iter in 0..50_000 {
+            assert_eq!(
+                task.do_socketpair(AddressFamily::UNIX, SockType::Stream, SockFlags::empty(), 0),
+                Err(Errno::EMFILE),
+                "failed at iteration {iter}"
+            );
+        }
+
+        stop.store(true, core::sync::atomic::Ordering::Relaxed);
+        closer.join().unwrap();
     }
 
     fn unix_socket_recv_timeout(ty: SockType) {
