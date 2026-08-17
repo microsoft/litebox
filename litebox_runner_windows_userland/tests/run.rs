@@ -49,6 +49,55 @@ fn run_hello_world_pe() {
     );
 }
 
+/// Runs a hello-world guest PE through the Windows userland broker.
+#[test]
+fn run_hello_world_pe_with_broker() {
+    let test_dir =
+        std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kernel32_import_broker");
+    let _ = std::fs::remove_dir_all(&test_dir);
+    std::fs::create_dir_all(&test_dir).unwrap();
+    let pe_path =
+        build_kernel32_import_pe(&test_dir, "kernel32_import", KERNEL32_IMPORT_PE_SOURCE, &[]);
+    println!(
+        "Built rewritten kernel32-import PE fixture at `{}`",
+        pe_path.display()
+    );
+    stage_system_fixtures(&test_dir);
+    let tar_path =
+        std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kernel32_import_broker.tar");
+    create_tar_with_dir(&test_dir, &tar_path);
+
+    let (broker, runner) = build_windows_broker();
+    let mut command = std::process::Command::new(broker);
+    command
+        .env("LITEBOX_LOG", "debug")
+        .arg("--runner")
+        .arg(runner)
+        .args([
+            "--initial-files",
+            tar_path.to_str().unwrap(),
+            "/kernel32_import.exe",
+        ]);
+    println!("Running `{command:?}`");
+    let output = command
+        .output()
+        .expect("failed to run litebox_runner_windows_userland through the broker");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "broker failed to run kernel32-import PE; status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        stdout,
+        stderr
+    );
+    assert!(
+        stdout.contains("hello world\n"),
+        "guest output was not captured\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
 /// Runs a guest PE that creates and joins a child thread.
 #[test]
 fn run_multithreaded_pe() {
@@ -149,6 +198,33 @@ fn run_crt_locale_pe() {
         stdout.contains("crt ok\n"),
         "guest crt output was not captured\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
+}
+
+fn build_windows_broker() -> (std::path::PathBuf, std::path::PathBuf) {
+    let runner = std::env::var_os("NEXTEST_BIN_EXE_litebox_runner_windows_userland").map_or_else(
+        || std::path::PathBuf::from(env!("CARGO_BIN_EXE_litebox_runner_windows_userland")),
+        std::path::PathBuf::from,
+    );
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let status = std::process::Command::new(cargo)
+        .args([
+            "build",
+            "-p",
+            "litebox_broker_userland",
+            "--bin",
+            "litebox-broker-userland",
+        ])
+        .status()
+        .expect("failed to build litebox-broker-userland");
+    assert!(status.success(), "failed to build litebox-broker-userland");
+
+    let broker = runner.with_file_name("litebox-broker-userland.exe");
+    assert!(
+        broker.is_file(),
+        "broker executable not found at {}",
+        broker.display()
+    );
+    (broker, runner)
 }
 
 /// Stages the guest system DLLs and locale tables the PE fixture needs.

@@ -416,10 +416,13 @@ pub struct WindowsShimBuilder<Platform: ShimPlatform> {
 impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
     #[must_use]
     pub fn new(platform: &'static Platform) -> Self {
-        Self {
-            platform,
-            litebox: LiteBox::new(platform),
-        }
+        Self::new_with_litebox(platform, LiteBox::new(platform))
+    }
+
+    /// Creates a builder backed by an existing LiteBox instance.
+    #[must_use]
+    pub fn new_with_litebox(platform: &'static Platform, litebox: LiteBox<Platform>) -> Self {
+        Self { platform, litebox }
     }
 
     #[must_use]

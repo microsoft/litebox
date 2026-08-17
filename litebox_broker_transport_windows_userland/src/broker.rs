@@ -5,24 +5,24 @@ use std::ffi::OsStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::control_ring::{
+    WindowsControlRingLocalCallChannel, WindowsControlRingLocalNotificationChannel,
+};
+use crate::named_pipe::WindowsNamedPipeLocalSetupChannel;
 use anyhow::{Context as _, Result};
 use litebox_broker_local::{BrokerLocal, BrokerNotifications};
 use litebox_broker_protocol::message::BrokerNotification;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport::control_ring::ControlRing;
-use litebox_broker_transport_windows_userland::control_ring::{
-    WindowsControlRingLocalCallChannel, WindowsControlRingLocalNotificationChannel,
-};
-use litebox_broker_transport_windows_userland::named_pipe::WindowsNamedPipeLocalSetupChannel;
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub(crate) struct BrokerConnection {
-    pub(crate) local: BrokerLocal<WindowsControlRingLocalCallChannel>,
-    pub(crate) notifications: BrokerNotifications<WindowsControlRingLocalNotificationChannel>,
+pub struct BrokerConnection {
+    pub local: BrokerLocal<WindowsControlRingLocalCallChannel>,
+    pub notifications: BrokerNotifications<WindowsControlRingLocalNotificationChannel>,
 }
 
-pub(crate) fn connect(control_pipe: &OsStr) -> Result<BrokerConnection> {
+pub fn connect(control_pipe: &OsStr) -> Result<BrokerConnection> {
     let deadline = Instant::now() + SETUP_TIMEOUT;
     let setup =
         WindowsNamedPipeLocalSetupChannel::connect_with_setup_deadline(control_pipe, deadline)
@@ -51,7 +51,7 @@ pub(crate) fn connect(control_pipe: &OsStr) -> Result<BrokerConnection> {
     })
 }
 
-pub(crate) fn start_notification_receiver(
+pub fn start_notification_receiver(
     mut notifications: BrokerNotifications<WindowsControlRingLocalNotificationChannel>,
     dispatch_notification: impl Fn(BrokerNotification) + Send + 'static,
     dispatch_failure: impl Fn() + Send + 'static,
