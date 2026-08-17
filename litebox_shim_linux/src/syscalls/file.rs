@@ -79,7 +79,7 @@ pub(crate) struct FilesState<Platform: ShimPlatform, FS: ShimFS> {
     pub(crate) fs: alloc::sync::Arc<FS>,
     pub(crate) raw_descriptor_store:
         litebox::sync::RwLock<Platform, litebox::fd::RawDescriptorStorage>,
-    max_fd: AtomicUsize,
+    fd_limit: AtomicUsize,
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
@@ -89,12 +89,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
             raw_descriptor_store: litebox::sync::RwLock::new(
                 litebox::fd::RawDescriptorStorage::new(),
             ),
-            max_fd: AtomicUsize::new(usize::MAX),
+            fd_limit: AtomicUsize::new(usize::MAX),
         }
     }
 
-    pub(crate) fn set_max_fd(&self, max_fd: usize) {
-        self.max_fd.store(max_fd, Ordering::Relaxed);
+    pub(crate) fn set_fd_limit(&self, fd_limit: usize) {
+        self.fd_limit.store(fd_limit, Ordering::Relaxed);
     }
 
     // Returns Ok(raw_fd) if it fits within the max limits already set up; otherwise returns the
@@ -112,14 +112,32 @@ impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
         rds: &mut litebox::fd::RawDescriptorStorage,
         typed_fd: TypedFd<Subsystem>,
     ) -> Result<usize, TypedFd<Subsystem>> {
-        // XXX(jb): should we try to somehow enforce that it is set at the smallest
-        // available/unassigned FD number?
-        let raw_fd = rds.fd_into_raw_integer(typed_fd);
-        let max_fd = self.max_fd.load(Ordering::Relaxed);
-        if raw_fd > max_fd {
-            let orig = rds.fd_consume_raw_integer::<Subsystem>(raw_fd).unwrap();
-            return Err(alloc::sync::Arc::into_inner(orig).unwrap());
+        let fd_limit = self.fd_limit.load(Ordering::Relaxed);
+        self.insert_raw_fd_at_or_above(typed_fd, 0, fd_limit)
+    }
+
+    fn insert_raw_fd_at_or_above<Subsystem: FdEnabledSubsystem>(
+        &self,
+        typed_fd: TypedFd<Subsystem>,
+        min_fd: usize,
+        fd_limit: usize,
+    ) -> Result<usize, TypedFd<Subsystem>> {
+        if min_fd >= fd_limit {
+            return Err(typed_fd);
         }
+
+        let mut raw_fd = min_fd;
+        for occupied_raw_fd in rds.iter_alive().skip_while(|&fd| fd < min_fd) {
+            if occupied_raw_fd != raw_fd {
+                break;
+            }
+            raw_fd += 1;
+        }
+        if raw_fd >= fd_limit {
+            return Err(typed_fd);
+        }
+        let success = rds.fd_into_specific_raw_integer(typed_fd, raw_fd);
+        assert!(success);
         Ok(raw_fd)
     }
 }
@@ -749,6 +767,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.do_close_and_replace::<FS>(raw_fd, None)
     }
 
+    fn remove_and_drop_descriptor<S: FdEnabledSubsystem>(&self, fd: &TypedFd<S>) {
+        let entry = {
+            let mut dt = self.global.litebox.descriptor_table_mut();
+            dt.remove(fd)
+        };
+        // do not hold any locks while dropping the entry
+        drop(entry);
+    }
+
     /// Close the file at `raw_fd` and optionally place a new file in the same slot.
     ///
     /// This function ensure `close` and `insert` are done atomically.
@@ -826,30 +853,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             ConsumedFd::Network(fd) => self.global.close_socket(&self.wait_cx(), fd),
             ConsumedFd::Pipes(fd) => self.global.close_linux_pipe(&fd),
             ConsumedFd::Eventfd(fd) => {
-                let entry = {
-                    let mut dt = self.global.litebox.descriptor_table_mut();
-                    dt.remove(&fd)
-                };
-                // do not hold any locks while dropping the entry
-                drop(entry);
+                self.remove_and_drop_descriptor(&fd);
                 Ok(())
             }
             ConsumedFd::Epoll(fd) => {
-                let entry = {
-                    let mut dt = self.global.litebox.descriptor_table_mut();
-                    dt.remove(&fd)
-                };
-                // do not hold any locks while dropping the entry
-                drop(entry);
+                self.remove_and_drop_descriptor(&fd);
                 Ok(())
             }
             ConsumedFd::Unix(fd) => {
-                let entry = {
-                    let mut dt = self.global.litebox.descriptor_table_mut();
-                    dt.remove(&fd)
-                };
-                // do not hold any locks while dropping the entry
-                drop(entry);
+                self.remove_and_drop_descriptor(&fd);
                 Ok(())
             }
         }
@@ -2379,17 +2391,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             fd: &TypedFd<S>,
             close_on_exec: bool,
             target: DupFdRequest,
+            close_typed_fd: impl FnOnce(TypedFd<S>),
         ) -> Result<usize, DupFdError> {
-            let max_fd = task
-                .process()
-                .limits
-                .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE);
+            let fd_limit = files.fd_limit.load(Ordering::Relaxed);
             match target {
-                DupFdRequest::Exact(target) if target >= max_fd => {
+                DupFdRequest::Exact(target) | DupFdRequest::LowestAtOrAbove(target)
+                    if target >= fd_limit =>
+                {
                     return Err(DupFdError::TargetFdExceedsLimit);
                 }
-                DupFdRequest::LowestAtOrAbove(min_fd) if min_fd >= max_fd => {
-                    return Err(DupFdError::TargetFdExceedsLimit);
+                DupFdRequest::LowestAvailable if fd_limit == 0 => {
+                    return Err(DupFdError::TooManyFiles);
                 }
                 _ => {}
             }
@@ -2408,27 +2420,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     target
                 }
                 DupFdRequest::LowestAvailable => {
-                    let rds = &mut *files.raw_descriptor_store.write();
-                    rds.fd_into_raw_integer(fd)
+                    match files.insert_raw_fd_at_or_above(fd, 0, fd_limit) {
+                        Ok(fd) => fd,
+                        Err(fd) => {
+                            close_typed_fd(fd);
+                            return Err(DupFdError::TooManyFiles);
+                        }
+                    }
                 }
                 DupFdRequest::LowestAtOrAbove(min_fd) => {
-                    let rds = &mut *files.raw_descriptor_store.write();
-                    let mut raw_fd = min_fd;
-                    for occupied_raw_fd in rds.iter_alive().skip_while(|&fd| fd < min_fd) {
-                        if occupied_raw_fd != raw_fd {
-                            break;
+                    match files.insert_raw_fd_at_or_above(fd, min_fd, fd_limit) {
+                        Ok(fd) => fd,
+                        Err(fd) => {
+                            close_typed_fd(fd);
+                            return Err(DupFdError::TooManyFiles);
                         }
-                        raw_fd += 1;
                     }
-                    let success = rds.fd_into_specific_raw_integer(fd, raw_fd);
-                    assert!(success);
-                    raw_fd
                 }
             };
-            if new_fd >= max_fd {
-                let _ = task.do_close(new_fd);
-                return Err(DupFdError::TooManyFiles);
-            }
             Ok(new_fd)
         }
 
@@ -2437,12 +2446,38 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         files
             .run_on_raw_fd(
                 file,
-                |fd| dup(self, &files, fd, close_on_exec, target),
-                |fd| dup(self, &files, fd, close_on_exec, target),
-                |fd| dup(self, &files, fd, close_on_exec, target),
-                |fd| dup(self, &files, fd, close_on_exec, target),
-                |fd| dup(self, &files, fd, close_on_exec, target),
-                |fd| dup(self, &files, fd, close_on_exec, target),
+                |fd| {
+                    dup(self, &files, fd, close_on_exec, target, |fd| {
+                        let _ = files.fs.close(&fd);
+                    })
+                },
+                |fd| {
+                    dup(self, &files, fd, close_on_exec, target, |fd| {
+                        let _ = self
+                            .global
+                            .close_socket(&self.wait_cx(), alloc::sync::Arc::new(fd));
+                    })
+                },
+                |fd| {
+                    dup(self, &files, fd, close_on_exec, target, |fd| {
+                        let _ = self.global.close_linux_pipe(&fd);
+                    })
+                },
+                |fd| {
+                    dup(self, &files, fd, close_on_exec, target, |fd| {
+                        self.remove_and_drop_descriptor(&fd);
+                    })
+                },
+                |fd| {
+                    dup(self, &files, fd, close_on_exec, target, |fd| {
+                        self.remove_and_drop_descriptor(&fd);
+                    })
+                },
+                |fd| {
+                    dup(self, &files, fd, close_on_exec, target, |fd| {
+                        self.remove_and_drop_descriptor(&fd);
+                    })
+                },
             )
             .map_err(|_| DupFdError::BadFd)?
     }
