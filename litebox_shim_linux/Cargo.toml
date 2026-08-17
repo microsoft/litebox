@@ -13,7 +13,6 @@ litebox_util_log = { version = "0.1.0", path = "../litebox_util_log" }
 once_cell = { version = "1.20.2", default-features = false, features = ["alloc", "race"] }
 thiserror = { version = "2.0.6", default-features = false }
 syscalls = { version = "0.6", default-features = false }
-seq-macro = "0.3"
 ringbuf = { version = "0.4.8", default-features = false, features = ["alloc"] }
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 litebox_syscall_rewriter = { version = "0.1.0", path = "../litebox_syscall_rewriter", default-features = false }
