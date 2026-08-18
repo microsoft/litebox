@@ -1047,7 +1047,12 @@ impl Reactor {
             .get(&id)
             .map(|socket| (socket.kind(), socket.guest_local_address.is_some()))
             .ok_or(BrokerError::Internal)?;
-        if !binding.is_valid() || binding.is_tcp() != (kind == SocketKind::Tcp) {
+        let binding_kind = if binding.is_tcp() {
+            SocketKind::Tcp
+        } else {
+            SocketKind::Udp
+        };
+        if !binding.is_valid() || binding_kind != kind {
             return Err(BrokerError::Internal);
         }
         if kind == SocketKind::Udp {
@@ -1061,7 +1066,7 @@ impl Reactor {
             };
             self.udp.insert_binding(ReactorUdpBinding {
                 socket_id: id,
-                binding,
+                guest_binding: binding,
             })?;
             let socket = self.sockets.get_mut(&id).ok_or(BrokerError::Internal)?;
             let udp = socket.udp_state_mut()?;
@@ -1140,7 +1145,7 @@ impl Reactor {
                     .udp
                     .binding_for_socket(id)
                     .ok_or(BrokerError::Internal)?;
-                if binding.binding.is_wildcard() {
+                if binding.guest_binding.is_wildcard() {
                     let ip = match (&peer, &staged_endpoint, reused_host_address) {
                         (ReactorUdpPeer::Guest { .. }, _, _) => Ipv4Addr::LOCALHOST,
                         (ReactorUdpPeer::External(_), Some(endpoint), _) => {
@@ -1230,7 +1235,7 @@ impl Reactor {
                 if self
                     .udp
                     .binding_for_socket(socket_generation)
-                    .is_none_or(|binding| !binding.binding.covers(guest_address))
+                    .is_none_or(|binding| !binding.guest_binding.covers(guest_address))
                 {
                     return Ok(SocketOutcome::Failed(SocketError::ConnectionRefused));
                 }
@@ -1461,7 +1466,7 @@ impl Reactor {
             self.replace_udp_endpoint(id, None);
             if let Some(binding) = self.udp.binding_for_socket(id) {
                 self.udp
-                    .remove_binding(binding.binding.requested().port(), id);
+                    .remove_binding(binding.guest_binding.requested().port(), id);
             }
             let external_peer_count = self
                 .sockets

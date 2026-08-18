@@ -116,7 +116,7 @@ impl ReactorUdpState {
 #[derive(Clone)]
 pub(super) struct ReactorUdpBinding {
     pub(super) socket_id: u64,
-    pub(super) binding: GuestSocketBinding,
+    pub(super) guest_binding: GuestSocketBinding,
 }
 
 pub(super) struct UdpSocketState {
@@ -254,9 +254,9 @@ impl ReactorUdpState {
     }
 
     pub(super) fn insert_binding(&mut self, binding: ReactorUdpBinding) -> BrokerResult<()> {
-        let requested = binding.binding.requested();
-        self.reserve_binding(&binding.binding)?;
-        if binding.binding.is_wildcard() {
+        let requested = binding.guest_binding.requested();
+        self.reserve_binding(&binding.guest_binding)?;
+        if binding.guest_binding.is_wildcard() {
             self.bindings.wildcard.insert(requested.port(), binding);
         } else {
             self.bindings.exact.insert(requested, binding);

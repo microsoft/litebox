@@ -271,7 +271,7 @@ pub(super) enum PendingGuestConnectionMatch {
 #[derive(Clone)]
 pub(super) struct ReactorTcpBinding {
     pub(super) socket_id: u64,
-    pub(super) binding: GuestSocketBinding,
+    pub(super) guest_binding: GuestSocketBinding,
     pub(super) host_address: Option<SocketAddrV4>,
     pub(super) listening: bool,
     pub(super) requires_backlog_drain: bool,
@@ -287,9 +287,9 @@ impl ReactorTcpState {
     }
 
     pub(super) fn insert_binding(&mut self, binding: ReactorTcpBinding) -> BrokerResult<()> {
-        let requested = binding.binding.requested();
-        if !binding.binding.is_valid()
-            || if binding.binding.is_wildcard() {
+        let requested = binding.guest_binding.requested();
+        if !binding.guest_binding.is_valid()
+            || if binding.guest_binding.is_wildcard() {
                 self.bindings.wildcard.contains_key(&requested.port())
                     || self
                         .bindings
@@ -303,7 +303,7 @@ impl ReactorTcpState {
         {
             return Err(BrokerError::Internal);
         }
-        if binding.binding.is_wildcard() {
+        if binding.guest_binding.is_wildcard() {
             self.bindings
                 .wildcard
                 .try_reserve(1)
@@ -373,7 +373,7 @@ impl ReactorTcpState {
             .bindings
             .values_mut()
             .find(|binding| {
-                binding.socket_id == socket_id && binding.binding.requested().port() == port
+                binding.socket_id == socket_id && binding.guest_binding.requested().port() == port
             })
             .ok_or(BrokerError::Internal)?;
         binding.host_address = Some(host_address);
@@ -385,7 +385,7 @@ impl ReactorTcpState {
             .bindings
             .values_mut()
             .find(|binding| {
-                binding.socket_id == socket_id && binding.binding.requested().port() == port
+                binding.socket_id == socket_id && binding.guest_binding.requested().port() == port
             })
             .ok_or(BrokerError::Internal)?;
         if binding.host_address.is_none() {
@@ -400,7 +400,7 @@ impl ReactorTcpState {
             .bindings
             .values_mut()
             .find(|binding| {
-                binding.socket_id == socket_id && binding.binding.requested().port() == port
+                binding.socket_id == socket_id && binding.guest_binding.requested().port() == port
             })
             .ok_or(BrokerError::Internal)?;
         binding.listening = false;
@@ -1309,7 +1309,7 @@ impl Reactor {
         let guest_address = binding.requested();
         self.tcp.insert_binding(ReactorTcpBinding {
             socket_id: id,
-            binding,
+            guest_binding: binding,
             host_address: None,
             listening: false,
             requires_backlog_drain: false,
@@ -1343,7 +1343,7 @@ impl Reactor {
             .tcp
             .binding_for_socket(id)
             .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?
-            .binding
+            .guest_binding
             .is_wildcard()
         {
             SocketAddrV4::new(Ipv4Addr::LOCALHOST, reserved_local_address.port())
