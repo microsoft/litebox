@@ -1,9 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use alloc::string::String;
 use core::marker::PhantomData;
-use core::mem::size_of;
+use core::mem::{align_of, size_of};
 
 use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider};
@@ -13,6 +12,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use super::Handle;
 use crate::nt_types::{ProcessEnvironmentBlock, ThreadEnvironmentBlock, UnicodeString};
+use crate::syscalls::object_manager::WINDOWS_API_PORT;
 use crate::{ConstPtr, MutPtr, ShimFS, ShimPlatform, Task, probe_guest_output_preserving_value};
 
 const CSR_MAX_MESSAGE_LENGTH: u32 = 0x148;
@@ -24,9 +24,33 @@ const USER_CONNECT_VERSION: u64 = 0x0e41_05d9;
 const USER_CONNECT_TRAILING_VALUE: u64 = 0x6658;
 const USER_HANDLE_ENTRY_SIZE: u32 = 0x20;
 const USERSRV_BACKING_SIZE: usize = crate::PAGE_SIZE;
-const USERSRV_BACKING_ALIGNMENT: usize = 0x20;
+const USER_MESSAGE_BITMAP_ALIGNMENT: usize = 0x20;
+const RESERVED_MESSAGE_MAX_MESSAGES: [usize; 3] = [0x318, 0x318, 0x14];
+const FNID_MESSAGE_MAX_MESSAGES: [usize; 10] = [
+    0x318, // FNID_SCROLLBAR
+    0x318, // FNID_ICONTITLE
+    0x318, // FNID_MENU
+    0x402, // FNID_DESKTOP
+    0x318, // FNID_DEFWINDOWPROC
+    0x318, // FNID_MESSAGEWND
+    0,     // FNID_SWITCH
+    0x318, // FNID_BUTTON
+    0x288, // FNID_COMBOBOX
+    0x82,  // FNID_COMBOLBOX
+];
+const DEFAULT_WINDOW_MAX_MESSAGES: usize = 0x33f;
+const DEFAULT_WINDOW_SPECIAL_MAX_MESSAGES: usize = 0x349;
 // TODO(csr-server-dll-names): report names once the CSR connect contract models them.
 const CSR_NUMBER_OF_SERVER_DLL_NAMES: u32 = 0;
+
+const fn user_message_bitmap_storage_size(max_messages: usize) -> usize {
+    let word_bits = u32::BITS as usize;
+    let words = max_messages.div_ceil(word_bits);
+    let bytes = words * size_of::<u32>();
+    (bytes + USER_MESSAGE_BITMAP_ALIGNMENT - 1) & !(USER_MESSAGE_BITMAP_ALIGNMENT - 1)
+}
+
+const _: () = assert!(USER_MESSAGE_BITMAP_ALIGNMENT.is_power_of_two());
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,9 +91,8 @@ impl<Platform: ShimPlatform> crate::WindowsHandleSubsystem for LpcPortSubsystem<
     }
 }
 
-pub(crate) struct LpcPortHandleObject {
-    _port_name: String,
-    usersrv_backing_base: usize,
+pub(crate) enum LpcPortHandleObject {
+    CsrApi { usersrv_backing_base: usize },
 }
 
 #[repr(C)]
@@ -142,7 +165,7 @@ struct CsrClientConnect {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
-pub(crate) struct CsrApiMessage {
+struct CsrApiMessage {
     header: PortMessage,
     capture_data: usize,
     api_number: u32,
@@ -156,16 +179,16 @@ const _: () = assert!(size_of::<CsrApiMessage>() == CSR_API_MESSAGE_LENGTH as us
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
-struct UserWindowMessage {
+struct UserWindowMessageTable {
     max_messages: usize,
-    message_bits: usize,
+    message_bitmap: usize,
 }
 
-impl UserWindowMessage {
-    const fn new(max_messages: usize, message_bits: usize) -> Self {
+impl UserWindowMessageTable {
+    const fn new(max_messages: usize, message_bitmap: usize) -> Self {
         Self {
             max_messages,
-            message_bits,
+            message_bitmap,
         }
     }
 }
@@ -179,14 +202,14 @@ struct UserSharedInfo {
     padding: u32,
     display_info: usize,
     shared_data: usize,
-    reserved_message_0: UserWindowMessage,
+    reserved_message_table_0: UserWindowMessageTable,
     reserved: [u8; 0x10],
-    reserved_message_1: UserWindowMessage,
-    reserved_message_2: UserWindowMessage,
+    reserved_message_table_1: UserWindowMessageTable,
+    reserved_message_table_2: UserWindowMessageTable,
     padding_2: [u8; 0x30],
-    control_messages: [UserWindowMessage; 24],
-    default_window_messages: UserWindowMessage,
-    default_window_spec_messages: UserWindowMessage,
+    fnid_message_tables: [UserWindowMessageTable; 24],
+    default_window_message_table: UserWindowMessageTable,
+    default_window_special_message_table: UserWindowMessageTable,
 }
 
 const _: () = assert!(size_of::<UserSharedInfo>() == 0x238);
@@ -199,7 +222,39 @@ struct UserConnect {
     trailing_value: u64,
 }
 
-const _: () = assert!(size_of::<UserConnect>() == 0x248);
+#[repr(C, align(32))]
+struct UsersrvBackingLayout {
+    server_info: [u8; 0x20],
+    handle_entries: [u8; 0x20],
+    display_info: [u8; 0x20],
+    shared_data: [u8; 0x20],
+    reserved_message_bitmap_0:
+        [u8; user_message_bitmap_storage_size(RESERVED_MESSAGE_MAX_MESSAGES[0])],
+    reserved_message_bitmap_1:
+        [u8; user_message_bitmap_storage_size(RESERVED_MESSAGE_MAX_MESSAGES[1])],
+    reserved_message_bitmap_2:
+        [u8; user_message_bitmap_storage_size(RESERVED_MESSAGE_MAX_MESSAGES[2])],
+    scrollbar_message_bitmap: [u8; user_message_bitmap_storage_size(FNID_MESSAGE_MAX_MESSAGES[0])],
+    icon_title_message_bitmap: [u8; user_message_bitmap_storage_size(FNID_MESSAGE_MAX_MESSAGES[1])],
+    menu_message_bitmap: [u8; user_message_bitmap_storage_size(FNID_MESSAGE_MAX_MESSAGES[2])],
+    desktop_message_bitmap: [u8; user_message_bitmap_storage_size(FNID_MESSAGE_MAX_MESSAGES[3])],
+    default_window_proc_message_bitmap:
+        [u8; user_message_bitmap_storage_size(FNID_MESSAGE_MAX_MESSAGES[4])],
+    message_window_message_bitmap:
+        [u8; user_message_bitmap_storage_size(FNID_MESSAGE_MAX_MESSAGES[5])],
+    button_message_bitmap: [u8; user_message_bitmap_storage_size(FNID_MESSAGE_MAX_MESSAGES[7])],
+    combo_box_message_bitmap: [u8; user_message_bitmap_storage_size(FNID_MESSAGE_MAX_MESSAGES[8])],
+    combo_list_box_message_bitmap:
+        [u8; user_message_bitmap_storage_size(FNID_MESSAGE_MAX_MESSAGES[9])],
+    default_window_message_bitmap:
+        [u8; user_message_bitmap_storage_size(DEFAULT_WINDOW_MAX_MESSAGES)],
+    default_window_special_message_bitmap:
+        [u8; user_message_bitmap_storage_size(DEFAULT_WINDOW_SPECIAL_MAX_MESSAGES)],
+    reserved: [u8; 0x940],
+}
+
+const _: () = assert!(size_of::<UsersrvBackingLayout>() == USERSRV_BACKING_SIZE);
+const _: () = assert!(align_of::<UsersrvBackingLayout>() == 0x20);
 
 pub(crate) struct ConnectPortParameters<Platform: ShimPlatform> {
     pub(crate) port_handle: MutPtr<Platform, Handle>,
@@ -228,6 +283,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
         if let Err(status) = self.process.object_manager.resolve_port(&port_name) {
             return status;
+        }
+        if port_name != WINDOWS_API_PORT {
+            litebox_util_log::debug!(port_name:% = port_name; "Unsupported LPC port");
+            return NtStatus::NOT_SUPPORTED;
         }
 
         let Some(client_view) = params.client_view else {
@@ -301,11 +360,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             self.rollback_pagefile_section_view(mapped_view.base);
             return status;
         }
-        let port = LpcPortHandleObject {
-            _port_name: port_name.clone(),
+        let port = LpcPortHandleObject::CsrApi {
             usersrv_backing_base,
         };
-        let handle = match self.insert_typed_handle::<LpcPortSubsystem<Platform>>(port, 0, drop) {
+        let handle = match self.insert_typed_handle::<LpcPortSubsystem<Platform>>(
+            port,
+            0,
+            Self::close_lpc_port,
+        ) {
             Ok(handle) => handle,
             Err(status) => {
                 self.rollback_pagefile_section_view(mapped_view.base);
@@ -364,31 +426,57 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         &self,
         port_handle: Handle,
         flags: AlpcMessageFlags,
-        send_message: MutPtr<Platform, CsrApiMessage>,
+        send_message: MutPtr<Platform, u8>,
         send_message_attributes: Option<ConstPtr<Platform, u8>>,
-        receive_message: MutPtr<Platform, CsrApiMessage>,
+        receive_message: MutPtr<Platform, u8>,
         buffer_length: MutPtr<Platform, usize>,
         receive_message_attributes: Option<MutPtr<Platform, u8>>,
         timeout: Option<ConstPtr<Platform, i64>>,
     ) -> NtStatus {
-        if !flags.contains(AlpcMessageFlags::SYNC_REQUEST)
-            || flags
-                .intersects(AlpcMessageFlags::RELEASE_MESSAGE | AlpcMessageFlags::INTERNAL_REJECT)
+        // This models the synchronous, in-place CSR request observed during process startup.
+        // Expand the contract only with a trace that exercises additional ALPC wait semantics.
+        if flags != AlpcMessageFlags::SYNC_REQUEST
             || send_message_attributes.is_some()
             || receive_message_attributes.is_some()
             || timeout.is_some()
             || send_message.as_usize() != receive_message.as_usize()
         {
+            litebox_util_log::debug!(
+                flags:% = format_args!("{:#x}", flags.bits()),
+                send_attributes = send_message_attributes.is_some(),
+                receive_attributes = receive_message_attributes.is_some(),
+                timeout = timeout.is_some(),
+                distinct_message_buffers = send_message.as_usize() != receive_message.as_usize();
+                "Unsupported ALPC send/wait/receive parameters"
+            );
             // TODO(alpc-async): model independent send/receive and attribute paths.
             return NtStatus::INVALID_PARAMETER;
         }
 
-        let port = match self
-            .typed_handle_entry_with_access::<LpcPortSubsystem<Platform>>(port_handle, 0)
-        {
-            Ok(entry) => entry.with_entry(|entry| entry.usersrv_backing_base),
-            Err(status) => return status,
-        };
+        match self.typed_handle_entry_with_access::<LpcPortSubsystem<Platform>>(port_handle, 0) {
+            Ok(entry) => entry.with_entry(|entry| match entry {
+                LpcPortHandleObject::CsrApi {
+                    usersrv_backing_base,
+                } => Self::handle_csr_api_port_message(
+                    *usersrv_backing_base,
+                    send_message,
+                    receive_message,
+                    buffer_length,
+                ),
+            }),
+            Err(status) => status,
+        }
+    }
+
+    fn handle_csr_api_port_message(
+        usersrv_backing_base: usize,
+        send_message: MutPtr<Platform, u8>,
+        receive_message: MutPtr<Platform, u8>,
+        buffer_length: MutPtr<Platform, usize>,
+    ) -> NtStatus {
+        let send_message = MutPtr::<Platform, CsrApiMessage>::from_usize(send_message.as_usize());
+        let receive_message =
+            MutPtr::<Platform, CsrApiMessage>::from_usize(receive_message.as_usize());
         let Some(mut message) = send_message.read_at_offset(0) else {
             return NtStatus::ACCESS_VIOLATION;
         };
@@ -421,7 +509,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::ACCESS_VIOLATION;
         }
 
-        let Some(user_connect) = build_user_connect(port) else {
+        let Some(user_connect) = build_user_connect(usersrv_backing_base) else {
             return NtStatus::INVALID_VIEW_SIZE;
         };
         // TODO(usersrv-shared-content): populate real win32k shared data when USER APIs need it.
@@ -443,12 +531,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     pub(crate) fn close_lpc_port_handle(&self, handle: Handle) {
-        self.close_typed_handle::<LpcPortSubsystem<Platform>>(handle, drop);
+        self.close_typed_handle::<LpcPortSubsystem<Platform>>(handle, Self::close_lpc_port);
     }
 
-    pub(crate) fn close_lpc_port(port: LpcPortHandleObject) {
-        drop(port);
-    }
+    pub(crate) fn close_lpc_port(_port: LpcPortHandleObject) {}
 
     fn csr_api_connect_info(&self) -> Option<CsrApiConnectInfo> {
         let read_only_shared_memory_base = crate::read_field_at_offset::<Platform, usize>(
@@ -489,61 +575,95 @@ fn zero_guest_usersrv_backing<Platform: RawPointerProvider>(
 }
 
 fn build_user_connect(backing_base: usize) -> Option<UserConnect> {
-    let mut backing_offset = 0usize;
-    let mut allocate = |size: usize| {
-        let size = size.checked_next_multiple_of(USERSRV_BACKING_ALIGNMENT)?;
-        let next_offset = backing_offset.checked_add(size)?;
-        if next_offset > USERSRV_BACKING_SIZE {
-            return None;
-        }
-        let pointer = backing_base.checked_add(backing_offset)?;
-        backing_offset = next_offset;
-        Some(pointer)
-    };
-    let server_info = allocate(USERSRV_BACKING_ALIGNMENT)?;
-    let handle_entries = allocate(USERSRV_BACKING_ALIGNMENT)?;
-    let display_info = allocate(USERSRV_BACKING_ALIGNMENT)?;
-    let shared_data = allocate(USERSRV_BACKING_ALIGNMENT)?;
-    let mut window_message = |max_messages: usize| {
-        Some(UserWindowMessage::new(
-            max_messages,
-            if max_messages == 0 {
-                0
-            } else {
-                allocate(max_messages.div_ceil(8))?
-            },
-        ))
-    };
-    let reserved_message_0 = window_message(0x318)?;
-    let reserved_message_1 = window_message(0x318)?;
-    let reserved_message_2 = window_message(0x14)?;
-    let mut control_messages = [UserWindowMessage::new(0, 0); 24];
-    for (index, max_messages) in [
-        0x318usize, 0x318, 0x318, 0x402, 0x318, 0x318, 0, 0x318, 0x288, 0x82,
+    let pointer = |offset| backing_base.checked_add(offset);
+    let message_table =
+        |max_messages, offset| Some(UserWindowMessageTable::new(max_messages, pointer(offset)?));
+    let reserved_message_table_0 = message_table(
+        RESERVED_MESSAGE_MAX_MESSAGES[0],
+        core::mem::offset_of!(UsersrvBackingLayout, reserved_message_bitmap_0),
+    )?;
+    let reserved_message_table_1 = message_table(
+        RESERVED_MESSAGE_MAX_MESSAGES[1],
+        core::mem::offset_of!(UsersrvBackingLayout, reserved_message_bitmap_1),
+    )?;
+    let reserved_message_table_2 = message_table(
+        RESERVED_MESSAGE_MAX_MESSAGES[2],
+        core::mem::offset_of!(UsersrvBackingLayout, reserved_message_bitmap_2),
+    )?;
+    let mut fnid_message_tables = [UserWindowMessageTable::new(0, 0); 24];
+    // Indices follow the historical FNID order. Presence and message limits are captured from
+    // the target x64 Windows build; the meaning of each bitmap bit remains private.
+    for (index, bitmap_offset) in [
+        Some(core::mem::offset_of!(
+            UsersrvBackingLayout,
+            scrollbar_message_bitmap
+        )),
+        Some(core::mem::offset_of!(
+            UsersrvBackingLayout,
+            icon_title_message_bitmap
+        )),
+        Some(core::mem::offset_of!(
+            UsersrvBackingLayout,
+            menu_message_bitmap
+        )),
+        Some(core::mem::offset_of!(
+            UsersrvBackingLayout,
+            desktop_message_bitmap
+        )),
+        Some(core::mem::offset_of!(
+            UsersrvBackingLayout,
+            default_window_proc_message_bitmap
+        )),
+        Some(core::mem::offset_of!(
+            UsersrvBackingLayout,
+            message_window_message_bitmap
+        )),
+        None, // FNID_SWITCH is captured as (0, NULL), so it needs no backing bitmap.
+        Some(core::mem::offset_of!(
+            UsersrvBackingLayout,
+            button_message_bitmap
+        )),
+        Some(core::mem::offset_of!(
+            UsersrvBackingLayout,
+            combo_box_message_bitmap
+        )),
+        Some(core::mem::offset_of!(
+            UsersrvBackingLayout,
+            combo_list_box_message_bitmap
+        )),
     ]
     .into_iter()
     .enumerate()
     {
-        control_messages[index] = window_message(max_messages)?;
+        if let Some(bitmap_offset) = bitmap_offset {
+            fnid_message_tables[index] =
+                message_table(FNID_MESSAGE_MAX_MESSAGES[index], bitmap_offset)?;
+        }
     }
 
     Some(UserConnect {
         version: USER_CONNECT_VERSION,
         shared_info: UserSharedInfo {
-            server_info,
-            handle_entries,
+            server_info: pointer(core::mem::offset_of!(UsersrvBackingLayout, server_info))?,
+            handle_entries: pointer(core::mem::offset_of!(UsersrvBackingLayout, handle_entries))?,
             handle_entry_size: USER_HANDLE_ENTRY_SIZE,
             padding: 0,
-            display_info,
-            shared_data,
-            reserved_message_0,
+            display_info: pointer(core::mem::offset_of!(UsersrvBackingLayout, display_info))?,
+            shared_data: pointer(core::mem::offset_of!(UsersrvBackingLayout, shared_data))?,
+            reserved_message_table_0,
             reserved: [0; 0x10],
-            reserved_message_1,
-            reserved_message_2,
+            reserved_message_table_1,
+            reserved_message_table_2,
             padding_2: [0; 0x30],
-            control_messages,
-            default_window_messages: window_message(0x33f)?,
-            default_window_spec_messages: window_message(0x349)?,
+            fnid_message_tables,
+            default_window_message_table: message_table(
+                DEFAULT_WINDOW_MAX_MESSAGES,
+                core::mem::offset_of!(UsersrvBackingLayout, default_window_message_bitmap),
+            )?,
+            default_window_special_message_table: message_table(
+                DEFAULT_WINDOW_SPECIAL_MAX_MESSAGES,
+                core::mem::offset_of!(UsersrvBackingLayout, default_window_special_message_bitmap),
+            )?,
         },
         trailing_value: USER_CONNECT_TRAILING_VALUE,
     })
@@ -593,7 +713,6 @@ mod tests {
 
     use super::*;
     use crate::syscalls::mm::PageProtection;
-    use crate::syscalls::object_manager::WINDOWS_API_PORT;
     use crate::tests::{
         TestFS, TestPlatform, const_ptr, mut_byte_ptr, mut_ptr, test_task, unicode_string,
         utf16_units,
@@ -730,13 +849,29 @@ mod tests {
         message.client_connect.connection_info_size = size_of::<UserConnect>();
         let mut receive_capacity = 0x3b8usize;
 
+        let original_message = message;
+        assert_eq!(
+            task.sys_nt_alpc_send_wait_receive_port(
+                handle,
+                AlpcMessageFlags::SYNC_REQUEST | AlpcMessageFlags::WAIT_ALERTABLE,
+                mut_byte_ptr(&mut message),
+                None,
+                mut_byte_ptr(&mut message),
+                mut_ptr(&mut receive_capacity),
+                None,
+                None,
+            ),
+            NtStatus::INVALID_PARAMETER
+        );
+        assert_eq!(message.as_bytes(), original_message.as_bytes());
+
         assert_eq!(
             task.sys_nt_alpc_send_wait_receive_port(
                 handle,
                 AlpcMessageFlags::SYNC_REQUEST,
-                mut_ptr(&mut message),
+                mut_byte_ptr(&mut message),
                 None,
-                mut_ptr(&mut message),
+                mut_byte_ptr(&mut message),
                 mut_ptr(&mut receive_capacity),
                 None,
                 None,
@@ -752,13 +887,13 @@ mod tests {
             USER_HANDLE_ENTRY_SIZE
         );
         assert_eq!(
-            usersrv_info.shared_info.control_messages[3].max_messages,
+            usersrv_info.shared_info.fnid_message_tables[3].max_messages,
             0x402
         );
         assert_eq!(
             usersrv_info
                 .shared_info
-                .default_window_messages
+                .default_window_message_table
                 .max_messages,
             0x33f
         );

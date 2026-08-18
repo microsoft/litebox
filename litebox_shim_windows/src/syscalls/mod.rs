@@ -225,9 +225,9 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
     NtAlpcSendWaitReceivePort {
         port_handle: Handle,
         flags: lpc::AlpcMessageFlags,
-        send_message: Platform::RawMutPointer<lpc::CsrApiMessage>,
+        send_message: Platform::RawMutPointer<u8>,
         send_message_attributes: Option<Platform::RawConstPointer<u8>>,
-        receive_message: Platform::RawMutPointer<lpc::CsrApiMessage>,
+        receive_message: Platform::RawMutPointer<u8>,
         buffer_length: Platform::RawMutPointer<usize>,
         receive_message_attributes: Option<Platform::RawMutPointer<u8>>,
         timeout: Option<Platform::RawConstPointer<i64>>,
