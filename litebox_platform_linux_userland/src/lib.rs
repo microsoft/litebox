@@ -2420,7 +2420,7 @@ impl litebox::mm::linux::VmemPageFaultHandler for LinuxUserland {
 
 #[cfg(test)]
 mod tests {
-    use core::sync::atomic::AtomicU32;
+    use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::thread::sleep;
 
     use litebox::{fs::OFlags, platform::RawMutex};
@@ -2461,6 +2461,61 @@ mod tests {
             assert!(page.end > page.start);
             prev = page.end;
         }
+    }
+
+    #[test]
+    fn asynchronous_sigsegv_does_not_trigger_exception_fixup() {
+        const CHILD_ENV: &str = "LITEBOX_ASYNC_SIGSEGV_TEST_CHILD";
+
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::asynchronous_sigsegv_does_not_trigger_exception_fixup",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "subprocess failed: {status}");
+            return;
+        }
+
+        unsafe {
+            let mut action: libc::sigaction = core::mem::zeroed();
+            action.sa_sigaction = libc::SIG_IGN;
+            assert_eq!(
+                libc::sigaction(libc::SIGSEGV, &raw const action, core::ptr::null_mut(),),
+                0
+            );
+        }
+        let _platform = LinuxUserland::new(None);
+
+        let target = unsafe { libc::pthread_self() };
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let sender_stop = stop.clone();
+        let sender = std::thread::spawn(move || {
+            while !sender_stop.load(Ordering::Relaxed) {
+                assert_eq!(unsafe { libc::pthread_kill(target, libc::SIGSEGV) }, 0);
+                std::thread::yield_now();
+            }
+        });
+
+        let src = vec![0x5a; 16 * 1024 * 1024];
+        let mut dst = vec![0; src.len()];
+        for _ in 0..16 {
+            assert!(unsafe {
+                litebox::mm::exception_table::memcpy_fallible(
+                    dst.as_mut_ptr(),
+                    src.as_ptr(),
+                    src.len(),
+                )
+                .is_ok()
+            });
+        }
+        stop.store(true, Ordering::Relaxed);
+        sender.join().unwrap();
+        assert_eq!(dst, src);
     }
 
     #[test]
