@@ -17,7 +17,7 @@ use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
     ReadError, RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
 };
-use super::inode_allocator::InodeAllocator;
+use super::inode_allocator::{InodeAllocator, InodeAllocators};
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
 use crate::path::Arg;
 use thiserror::Error;
@@ -37,7 +37,7 @@ pub struct Composer {
 /// A [`Composer`] builder.
 pub struct ComposerBuilder {
     mounts: Vec<(Option<String>, Box<dyn Backend>)>,
-    next_backend_device_id: u64,
+    allocators: InodeAllocators,
 }
 
 /// A mounted backend.
@@ -70,7 +70,7 @@ impl Composer {
     pub fn builder() -> ComposerBuilder {
         ComposerBuilder {
             mounts: vec![],
-            next_backend_device_id: 1,
+            allocators: InodeAllocators::starting_at(1),
         }
     }
 }
@@ -79,16 +79,24 @@ impl ComposerBuilder {
     /// Add a backend mounted at `path`.
     #[must_use]
     pub fn mount<B: Backend>(
-        mut self,
+        self,
         path: impl Arg,
         backend: impl FnOnce(InodeAllocator) -> B,
     ) -> Self {
-        let backend_device_id = self.next_backend_device_id;
+        self.mount_nestable(path, |allocators| backend(allocators.next()))
+    }
+
+    /// Add a backend mounted at `path`, which may draw an allocator per backend it is made of.
+    #[must_use]
+    pub fn mount_nestable<B: Backend>(
+        mut self,
+        path: impl Arg,
+        backend: impl FnOnce(&InodeAllocators) -> B,
+    ) -> Self {
         // TODO(jayb): Decide whether we need a fallible version of closure-based mount.
-        let backend = backend(InodeAllocator::for_device(backend_device_id));
+        let backend = backend(&self.allocators);
         self.mounts
             .push((path.as_rust_str().map(Into::into).ok(), Box::new(backend)));
-        self.next_backend_device_id = backend_device_id + 1;
         self
     }
 
