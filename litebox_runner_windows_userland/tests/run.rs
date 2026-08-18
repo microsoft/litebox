@@ -231,11 +231,8 @@ fn build_windows_broker() -> (std::path::PathBuf, std::path::PathBuf) {
 /// runner. `LITEBOX_PYTHON_PATH` can point at a locally provided x64
 /// `python.exe`; otherwise the test downloads and verifies a pinned official
 /// distribution.
-///
-/// Python currently reaches CSR initialization. The completion oracle remains
-/// deferred until the shim implements `BasepNlsGetUserInfo`.
 #[test]
-#[ignore = "downloads Python and asserts a stable runtime progress floor"]
+#[ignore = "downloads and runs the official Python embeddable distribution"]
 fn run_python_pe() {
     let source = python_source();
     let source_dir = source
@@ -302,7 +299,6 @@ fn run_python_pe() {
         .expect("failed to run litebox_runner_windows_userland");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let logs = format!("{stdout}\n{stderr}");
     println!(
         "Python exit: {:?}\nstdout:\n{}\nstderr:\n{}",
         output.status.code(),
@@ -310,15 +306,17 @@ fn run_python_pe() {
         stderr
     );
 
-    let dll_load = logs
-        .rfind("python312.dll")
-        .expect("Python did not load python312.dll");
-    logs[dll_load..]
-        .find("NtAlpcSendWaitReceivePort")
-        .expect("Python did not reach CSR initialization");
-
-    // TODO(frontier): restore exit-zero and `hello world` assertions once BASESRV
-    // BasepNlsGetUserInfo (CSR API 0x1001e) NLS payload handling lands.
+    assert!(
+        output.status.success(),
+        "Python failed; status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        stdout,
+        stderr
+    );
+    assert!(
+        stdout.lines().any(|line| line == "hello world"),
+        "Python output was not captured\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
 }
 
 fn python_source() -> std::path::PathBuf {

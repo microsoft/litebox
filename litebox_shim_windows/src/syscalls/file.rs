@@ -10,10 +10,12 @@ use core::mem::{align_of, offset_of, size_of};
 use int_enum::IntEnum;
 use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd};
 use litebox::fs::errors::{
-    FileStatusError, MkdirError, OpenError, PathError, ReadDirError, ReadError, WriteError,
+    FileStatusError, MkdirError, OpenError, PathError, ReadDirError, ReadError, SeekError,
+    WriteError,
 };
 use litebox::fs::{FileStatus, FileType, Mode, OFlags, SeekWhence};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider};
+use litebox::utils::TruncateExt as _;
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::byteorder::native_endian::U32;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
@@ -372,6 +374,39 @@ pub(crate) struct FileBasicInformation {
     change_time: i64,
     file_attributes: u32,
     _reserved: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, Immutable, IntoBytes)]
+struct FileStatBasicInformation {
+    file_id: i64,
+    creation_time: i64,
+    last_access_time: i64,
+    last_write_time: i64,
+    change_time: i64,
+    allocation_size: i64,
+    end_of_file: i64,
+    file_attributes: u32,
+    reparse_tag: u32,
+    number_of_links: u32,
+    device_type: u32,
+    device_characteristics: u32,
+    reserved: u32,
+    volume_serial_number: i64,
+    file_id_128: [u8; 16],
+}
+
+const _: () = assert!(size_of::<FileStatBasicInformation>() == 0x68);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, Immutable, IntoBytes)]
+struct FileStandardInformation {
+    allocation_size: i64,
+    end_of_file: i64,
+    number_of_links: u32,
+    delete_pending: u8,
+    directory: u8,
+    padding: [u8; 2],
 }
 
 pub(crate) struct FileObjectSubsystem<FS>(PhantomData<fn(FS)>);
@@ -948,6 +983,279 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         NtStatus::SUCCESS
     }
 
+    pub(crate) fn sys_nt_query_information_by_name(
+        &self,
+        object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
+        io_status_block: MutPtr<Platform, IoStatusBlock>,
+        file_information: MutPtr<Platform, u8>,
+        length: u32,
+        file_information_class: u32,
+    ) -> NtStatus {
+        const FILE_STAT_BASIC_INFORMATION_CLASS: u32 = 77;
+        let Some(object_attributes) = object_attributes else {
+            return NtStatus::INVALID_PARAMETER;
+        };
+        if file_information_class != FILE_STAT_BASIC_INFORMATION_CLASS {
+            return NtStatus::INVALID_INFO_CLASS;
+        }
+        if length != size_of::<FileStatBasicInformation>().trunc() {
+            return NtStatus::INFO_LENGTH_MISMATCH;
+        }
+        if probe_guest_output_preserving_value::<Platform, IoStatusBlock>(io_status_block).is_err()
+            || probe_guest_output_buffer::<Platform>(file_information, length as usize).is_err()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        let object_attributes = match read_object_attributes::<Platform>(object_attributes) {
+            Ok(object_attributes) => object_attributes,
+            Err(status) => return status,
+        };
+        let path = match self.object_attributes_to_file_target(object_attributes) {
+            Ok(FileTarget::Filesystem(path)) => path,
+            Ok(FileTarget::Condrv(_) | FileTarget::KsecDevice) => {
+                return NtStatus::OBJECT_NAME_NOT_FOUND;
+            }
+            Err(status) => return status,
+        };
+        let status = match self.fs.file_status(&path) {
+            Ok(status) => status,
+            Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory)) => {
+                let parent = parent_directory_path(&path);
+                return if self.fs.file_status(parent).is_ok() {
+                    NtStatus::OBJECT_NAME_NOT_FOUND
+                } else {
+                    NtStatus::OBJECT_PATH_NOT_FOUND
+                };
+            }
+            Err(error) => return map_file_status_error(error),
+        };
+        let mut attributes = if status.file_type == FileType::Directory {
+            FileAttributes::DIRECTORY
+        } else {
+            FileAttributes::ARCHIVE
+        };
+        if !status.mode.intersects(Mode::WUSR | Mode::WGRP | Mode::WOTH) {
+            attributes.insert(FileAttributes::READONLY);
+        }
+        let file_id = u64::try_from(status.node_info.ino).unwrap_or_default();
+        let end_of_file = i64::try_from(status.size).unwrap_or(i64::MAX);
+        let allocation_size = status
+            .size
+            .checked_next_multiple_of(status.blksize.max(1))
+            .and_then(|size| i64::try_from(size).ok())
+            .unwrap_or(i64::MAX);
+        let mut file_id_128 = [0; 16];
+        litebox_util_log::debug!(
+            path = path.as_str(),
+            end_of_file,
+            allocation_size;
+            "Handled NtQueryInformationByName FileStatBasicInformation"
+        );
+        file_id_128[..size_of::<u64>()].copy_from_slice(&file_id.to_ne_bytes());
+        // TODO(fs-timestamps): Populate timestamps when FileStatus exposes them.
+        let information = FileStatBasicInformation {
+            file_id: i64::from_ne_bytes(file_id.to_ne_bytes()),
+            allocation_size,
+            end_of_file,
+            file_attributes: attributes.bits(),
+            number_of_links: 1,
+            device_type: FileDeviceType::Disk as u32,
+            file_id_128,
+            ..FileStatBasicInformation::default()
+        };
+        let output =
+            MutPtr::<Platform, FileStatBasicInformation>::from_usize(file_information.as_usize());
+        if output.write_at_offset(0, information).is_none()
+            || io_status_block
+                .write_at_offset(
+                    0,
+                    IoStatusBlock::new(NtStatus::SUCCESS, size_of::<FileStatBasicInformation>()),
+                )
+                .is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        NtStatus::SUCCESS
+    }
+
+    pub(crate) fn sys_nt_query_information_file(
+        &self,
+        file_handle: Handle,
+        io_status_block: MutPtr<Platform, IoStatusBlock>,
+        file_information: MutPtr<Platform, u8>,
+        length: u32,
+        file_information_class: u32,
+    ) -> NtStatus {
+        const FILE_STANDARD_INFORMATION_CLASS: u32 = 5;
+        const FILE_POSITION_INFORMATION_CLASS: u32 = 14;
+        if file_information_class == FILE_STANDARD_INFORMATION_CLASS {
+            if length != size_of::<FileStandardInformation>().trunc() {
+                return NtStatus::INFO_LENGTH_MISMATCH;
+            }
+            if probe_guest_output_preserving_value::<Platform, IoStatusBlock>(io_status_block)
+                .is_err()
+                || probe_guest_output_buffer::<Platform>(file_information, length as usize).is_err()
+            {
+                return NtStatus::ACCESS_VIOLATION;
+            }
+            let file = match self.file_entry(file_handle) {
+                Ok(file) => file,
+                Err(status) => return status,
+            };
+            let status = match file.with_entry(|file| self.fs.file_status(&file.path)) {
+                Ok(status) => status,
+                Err(error) => return map_file_status_error(error),
+            };
+            let end_of_file = i64::try_from(status.size).unwrap_or(i64::MAX);
+            let allocation_size = status
+                .size
+                .checked_next_multiple_of(status.blksize.max(1))
+                .and_then(|size| i64::try_from(size).ok())
+                .unwrap_or(i64::MAX);
+            let information = FileStandardInformation {
+                allocation_size,
+                end_of_file,
+                number_of_links: 1,
+                directory: u8::from(status.file_type == FileType::Directory),
+                ..FileStandardInformation::default()
+            };
+            let output = MutPtr::<Platform, FileStandardInformation>::from_usize(
+                file_information.as_usize(),
+            );
+            if output.write_at_offset(0, information).is_none()
+                || io_status_block
+                    .write_at_offset(
+                        0,
+                        IoStatusBlock::new(NtStatus::SUCCESS, size_of::<FileStandardInformation>()),
+                    )
+                    .is_none()
+            {
+                return NtStatus::ACCESS_VIOLATION;
+            }
+            return NtStatus::SUCCESS;
+        }
+        if file_information_class != FILE_POSITION_INFORMATION_CLASS {
+            return NtStatus::INVALID_INFO_CLASS;
+        }
+        if length != size_of::<i64>().trunc() {
+            return NtStatus::INFO_LENGTH_MISMATCH;
+        }
+        if probe_guest_output_preserving_value::<Platform, IoStatusBlock>(io_status_block).is_err()
+            || probe_guest_output_buffer::<Platform>(file_information, length as usize).is_err()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        let file = match self.file_entry(file_handle) {
+            Ok(file) => file,
+            Err(status) => return status,
+        };
+        let result = file.with_entry(|file| match &file.backing {
+            FileObjectBacking::Filesystem { fd, is_directory } => {
+                if *is_directory {
+                    return Err(SeekError::NonSeekable);
+                }
+                self.fs.seek(fd, 0, SeekWhence::RelativeToCurrentOffset)
+            }
+            FileObjectBacking::CondrvStream { fd, .. } => {
+                self.fs.seek(fd, 0, SeekWhence::RelativeToCurrentOffset)
+            }
+            FileObjectBacking::CondrvControl(_) | FileObjectBacking::KsecDevice => {
+                Err(SeekError::NonSeekable)
+            }
+        });
+        let position = match result {
+            Ok(position) => i64::try_from(position).unwrap_or(i64::MAX),
+            Err(SeekError::ClosedFd) => return NtStatus::INVALID_HANDLE,
+            Err(SeekError::NonSeekable | SeekError::InvalidOffset) => {
+                return NtStatus::INVALID_DEVICE_REQUEST;
+            }
+            Err(_) => return NtStatus::UNSUCCESSFUL,
+        };
+        litebox_util_log::debug!(
+            file_handle = file_handle.as_raw(),
+            position;
+            "Handled NtQueryInformationFile FilePositionInformation"
+        );
+        let output = MutPtr::<Platform, i64>::from_usize(file_information.as_usize());
+        if output.write_at_offset(0, position).is_none()
+            || io_status_block
+                .write_at_offset(0, IoStatusBlock::new(NtStatus::SUCCESS, size_of::<i64>()))
+                .is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        NtStatus::SUCCESS
+    }
+
+    pub(crate) fn sys_nt_set_information_file(
+        &self,
+        file_handle: Handle,
+        io_status_block: MutPtr<Platform, IoStatusBlock>,
+        file_information: ConstPtr<Platform, u8>,
+        length: u32,
+        file_information_class: u32,
+    ) -> NtStatus {
+        const FILE_POSITION_INFORMATION_CLASS: u32 = 14;
+        if file_information_class != FILE_POSITION_INFORMATION_CLASS {
+            return NtStatus::INVALID_INFO_CLASS;
+        }
+        if length != size_of::<i64>().trunc() {
+            return NtStatus::INFO_LENGTH_MISMATCH;
+        }
+        if probe_guest_output_preserving_value::<Platform, IoStatusBlock>(io_status_block).is_err()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        let position = ConstPtr::<Platform, i64>::from_usize(file_information.as_usize());
+        let Some(position) = position.read_at_offset(0) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        let Ok(position) = isize::try_from(position) else {
+            return NtStatus::INVALID_PARAMETER;
+        };
+        if position < 0 {
+            return NtStatus::INVALID_PARAMETER;
+        }
+        let file = match self.file_entry(file_handle) {
+            Ok(file) => file,
+            Err(status) => return status,
+        };
+        let result = file.with_entry(|file| match &file.backing {
+            FileObjectBacking::Filesystem { fd, is_directory } => {
+                if *is_directory {
+                    return Err(SeekError::NonSeekable);
+                }
+                self.fs.seek(fd, position, SeekWhence::RelativeToBeginning)
+            }
+            FileObjectBacking::CondrvStream { fd, .. } => {
+                self.fs.seek(fd, position, SeekWhence::RelativeToBeginning)
+            }
+            FileObjectBacking::CondrvControl(_) | FileObjectBacking::KsecDevice => {
+                Err(SeekError::NonSeekable)
+            }
+        });
+        let status = match result {
+            Ok(_) => NtStatus::SUCCESS,
+            Err(SeekError::ClosedFd) => NtStatus::INVALID_HANDLE,
+            Err(SeekError::InvalidOffset) => NtStatus::INVALID_PARAMETER,
+            Err(SeekError::NonSeekable) => NtStatus::INVALID_DEVICE_REQUEST,
+            Err(_) => NtStatus::UNSUCCESSFUL,
+        };
+        litebox_util_log::debug!(
+            file_handle = file_handle.as_raw(),
+            position,
+            status:%;
+            "Handled NtSetInformationFile FilePositionInformation"
+        );
+        if io_status_block
+            .write_at_offset(0, IoStatusBlock::new(status, 0))
+            .is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        status
+    }
+
     // TODO(query-full-attributes): Implement NtQueryFullAttributesFile when a guest needs
     // allocation size and end-of-file metadata in addition to basic attributes.
 
@@ -1293,6 +1601,117 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         status: NtStatus,
         information: usize,
     ) -> NtStatus {
+        if io_status_block
+            .write_at_offset(0, IoStatusBlock::new(status, information))
+            .is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        if !event.is_null() {
+            let event_status = self.set_event(event);
+            if event_status != NtStatus::SUCCESS {
+                return event_status;
+            }
+        }
+        status
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "NtReadFile has nine ABI parameters; keeping them explicit preserves syscall ordering"
+    )]
+    pub(crate) fn sys_nt_read_file(
+        &self,
+        file_handle: Handle,
+        event: Handle,
+        apc_routine: Option<ConstPtr<Platform, u8>>,
+        apc_context: Option<ConstPtr<Platform, u8>>,
+        io_status_block: MutPtr<Platform, IoStatusBlock>,
+        buffer: MutPtr<Platform, u8>,
+        length: u32,
+        byte_offset: Option<ConstPtr<Platform, i64>>,
+        key: Option<ConstPtr<Platform, u32>>,
+    ) -> NtStatus {
+        if probe_guest_output_preserving_value::<Platform, IoStatusBlock>(io_status_block).is_err()
+            || probe_guest_output_buffer::<Platform>(buffer, length as usize).is_err()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        if !event.is_null()
+            && let Err(status) = self.check_event_modify_access(event)
+        {
+            return status;
+        }
+        let offset = match byte_offset {
+            Some(byte_offset) => match byte_offset.read_at_offset(0) {
+                Some(FILE_USE_FILE_POINTER_POSITION) => None,
+                Some(offset) if offset >= 0 => match usize::try_from(offset) {
+                    Ok(offset) => Some(offset),
+                    Err(_) => return NtStatus::INVALID_PARAMETER,
+                },
+                Some(_) => return NtStatus::INVALID_PARAMETER,
+                None => return NtStatus::ACCESS_VIOLATION,
+            },
+            None => None,
+        };
+        if let Some(key) = key
+            && key.read_at_offset(0).is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        let file = match self.file_entry(file_handle) {
+            Ok(file) => file,
+            Err(status) => return status,
+        };
+        if !event.is_null()
+            && let Err(status) = self.clear_event(event)
+        {
+            return status;
+        }
+        if apc_routine.is_some() || apc_context.is_some() {
+            litebox_util_log::debug!(
+                file_handle = file_handle.as_raw();
+                "Ignoring NtReadFile APC completion arguments for synchronous completion"
+            );
+        }
+        let mut bytes = alloc::vec![0; length as usize];
+        let result = file.with_entry(|file| match &file.backing {
+            FileObjectBacking::Filesystem { fd, is_directory } => {
+                if *is_directory {
+                    return Err(ReadError::NotAFile);
+                }
+                let read = self.fs.read(fd, &mut bytes, offset)?;
+                if let Some(offset) = offset
+                    && file
+                        .create_options
+                        .intersects(FileCreateOptions::SYNCHRONOUS_IO)
+                {
+                    let _ = self.fs.seek(
+                        fd,
+                        (offset + read).cast_signed(),
+                        SeekWhence::RelativeToBeginning,
+                    );
+                }
+                Ok(read)
+            }
+            FileObjectBacking::CondrvStream { fd, .. } => self.fs.read(fd, &mut bytes, offset),
+            FileObjectBacking::CondrvControl(_) | FileObjectBacking::KsecDevice => {
+                Err(ReadError::NotAFile)
+            }
+        });
+        let (status, information) = match result {
+            Ok(0) => (NtStatus::END_OF_FILE, 0),
+            Ok(read) => {
+                if write_slice::<Platform, u8>(buffer.as_usize(), &bytes[..read]).is_none() {
+                    return NtStatus::ACCESS_VIOLATION;
+                }
+                (NtStatus::SUCCESS, read)
+            }
+            Err(ReadError::ClosedFd) => (NtStatus::INVALID_HANDLE, 0),
+            Err(ReadError::NotForReading) => (NtStatus::ACCESS_DENIED, 0),
+            Err(ReadError::NotAFile) => (NtStatus::INVALID_DEVICE_REQUEST, 0),
+            Err(_) => (NtStatus::UNSUCCESSFUL, 0),
+        };
         if io_status_block
             .write_at_offset(0, IoStatusBlock::new(status, information))
             .is_none()
