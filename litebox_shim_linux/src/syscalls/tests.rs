@@ -7,13 +7,10 @@ use zerocopy::FromBytes as _;
 
 use crate::UserPtrMut;
 
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use litebox::shim::{Exception, ExceptionInfo};
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use litebox_common_linux::PtRegs;
 #[cfg(target_arch = "x86_64")]
 use litebox_common_linux::signal::FPE_INTDIV;
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use litebox_common_linux::signal::{ILL_ILLOPN, SI_KERNEL, SiginfoData, Signal};
 
 extern crate std;
