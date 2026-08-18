@@ -38,6 +38,10 @@ pub(super) fn sp(ctx: &PtRegs) -> usize {
     ctx.sp
 }
 
+pub(super) fn pc(ctx: &PtRegs) -> usize {
+    ctx.pc
+}
+
 pub(super) fn get_signal_frame(sp: usize, _action: &SigAction) -> usize {
     let frame_addr = sp.wrapping_sub(core::mem::size_of::<SignalFrame>());
     // Linux AArch64 signal entry requires a 16-byte-aligned stack pointer.

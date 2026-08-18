@@ -577,7 +577,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         thread | shared
     }
 
-    #[cfg(all(test, target_arch = "x86_64"))]
+    #[cfg(test)]
     pub(crate) fn take_pending_siginfo(&self, signal: Signal) -> Siginfo {
         self.signals.pending.borrow_mut().remove(signal)
     }
@@ -794,16 +794,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // SIGBUS and SIGFPE all fold into `DATA_ABORT_LOWER_EL`, so a guest
         // SIGBUS or SIGFPE arrives here as SIGSEGV.
         //
-        // TODO: carry SIGFPE exactly, as exception class 0x2c, once
-        // `force_signal_with_info` accepts signals beyond SIGKILL and SIGSEGV.
-        // Selecting SIGFPE here would trip its assert today.
         #[cfg(target_arch = "aarch64")]
         let (signal, fault_address) = match info.exception {
             Exception::BRK64
             | Exception::BREAKPOINT_LOWER_EL
             | Exception::BREAKPOINT_CURRENT_EL => (Signal::SIGTRAP, 0),
             Exception::INSTRUCTION_ABORT_LOWER_EL | Exception::INSTRUCTION_ABORT_CURRENT_EL => {
-                (Signal::SIGILL, info.fault_address)
+                (Signal::SIGILL, arch::pc(ctx))
             }
             // Data aborts and unknown exception classes map to SIGSEGV.
             _ => (Signal::SIGSEGV, info.fault_address),
