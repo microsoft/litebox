@@ -1255,6 +1255,71 @@ fn udp_exact_bindings_coexist_and_wildcard_covers_loopback() {
 }
 
 #[test]
+fn udp_external_route_slot_reuses_and_retires_its_native_endpoint() {
+    let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
+    let broker = BrokerCore::new_with_limits(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+        BrokerCoreLimits::new_with_all_limits(4, 0, 2, 2),
+        provider.clone(),
+    )
+    .unwrap();
+    let session = broker
+        .create_session(CallerCredential::Unauthenticated)
+        .unwrap();
+    let (published, _publications) = channel();
+    let (retired, retirements) = channel();
+    let readiness = Arc::new(TestReadinessSink { published, retired });
+    let socket = create_udp_socket(&session, readiness);
+    let first = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let second = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    first.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
+    second.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
+    let first_address = socket_address_v4(first.local_addr().unwrap());
+    let second_address = socket_address_v4(second.local_addr().unwrap());
+
+    assert_eq!(provider.reactor.udp_native_endpoint_count(), 0);
+    assert_eq!(provider.reactor.udp_native_event_token_count(), 0);
+    assert_eq!(
+        send_datagram(
+            &session,
+            socket,
+            b"first",
+            SendFlags::NONE,
+            Some(first_address),
+        ),
+        Ok(SocketOutcome::Completed(5))
+    );
+    let mut first_payload = [0; 5];
+    let (_, first_source) = first.recv_from(&mut first_payload).unwrap();
+    assert_eq!(&first_payload, b"first");
+    assert_eq!(provider.reactor.udp_native_endpoint_count(), 1);
+    assert_eq!(provider.reactor.udp_native_event_token_count(), 1);
+
+    assert_eq!(
+        send_datagram(
+            &session,
+            socket,
+            b"second",
+            SendFlags::NONE,
+            Some(second_address),
+        ),
+        Ok(SocketOutcome::Completed(6))
+    );
+    let mut second_payload = [0; 6];
+    let (_, second_source) = second.recv_from(&mut second_payload).unwrap();
+    assert_eq!(&second_payload, b"second");
+    assert_eq!(second_source, first_source);
+    assert_eq!(provider.reactor.udp_native_endpoint_count(), 1);
+    assert_eq!(provider.reactor.udp_native_event_token_count(), 1);
+
+    session.close_object_reference(socket).unwrap();
+    assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), socket);
+    assert_eq!(provider.reactor.udp_native_endpoint_count(), 0);
+    assert_eq!(provider.reactor.udp_native_event_token_count(), 0);
+}
+
+#[test]
 fn udp_endpoint_staging_error_rolls_back_external_peer_reservation() {
     let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
     let broker = BrokerCore::new_with_limits(
@@ -1287,6 +1352,7 @@ fn udp_endpoint_staging_error_rolls_back_external_peer_reservation() {
     );
     assert_eq!(provider.reactor.udp_external_peer_count(), 0);
     assert_eq!(provider.reactor.udp_native_endpoint_count(), 0);
+    assert_eq!(provider.reactor.udp_native_event_token_count(), 0);
 
     session.close_object_reference(socket).unwrap();
 }
