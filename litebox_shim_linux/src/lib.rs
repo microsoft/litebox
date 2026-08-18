@@ -56,15 +56,8 @@ use crate::syscalls::file::get_file_descriptor_flags;
 
 pub type DefaultFS<Platform> = LinuxFS<Platform>;
 
-pub(crate) type LinuxFS<Platform> = litebox::fs::layered::FileSystem<
-    Platform,
-    litebox::fs::resolver::Resolver<Platform, litebox::fs::in_mem::InMem<Platform>>,
-    litebox::fs::layered::FileSystem<
-        Platform,
-        litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>,
-        litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>,
-    >,
->;
+pub(crate) type LinuxFS<Platform> =
+    litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>;
 
 pub(crate) type FileFd<FS> = litebox::fd::TypedFd<FS>;
 
@@ -219,13 +212,13 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         &self.litebox
     }
 
-    /// Create a default layered file system with the given in-memory layer and tar data.
+    /// Create the default file system with the given in-memory layer and tar data.
     pub fn default_fs(
         &self,
-        in_mem_fs: litebox::fs::resolver::Resolver<Platform, litebox::fs::in_mem::InMem<Platform>>,
+        in_mem: litebox::fs::in_mem::InMem<Platform>,
         tar_data: Cow<'static, [u8]>,
     ) -> DefaultFS<Platform> {
-        default_fs(&self.litebox, in_mem_fs, tar_data)
+        default_fs(&self.litebox, in_mem, tar_data)
     }
 
     /// Build the shim.
@@ -376,40 +369,28 @@ impl<Platform: ShimPlatform> LinuxShimProcess<Platform> {
     }
 }
 
-/// Create a default layered file system with the given in-memory layer and tar data.
+/// Create the default file system with the given in-memory layer and tar data.
 fn default_fs<Platform: ShimPlatform>(
     litebox: &LiteBox<Platform>,
-    in_mem_fs: litebox::fs::resolver::Resolver<Platform, litebox::fs::in_mem::InMem<Platform>>,
+    in_mem: litebox::fs::in_mem::InMem<Platform>,
     tar_data: Cow<'static, [u8]>,
 ) -> LinuxFS<Platform> {
-    let dev_stdio = litebox::fs::resolver::Resolver::new(
+    litebox::fs::resolver::Resolver::new(
         litebox,
         litebox::fs::composer::Composer::builder()
+            .mount_nestable("/", |allocators| {
+                litebox::fs::overlay::Overlay::new(
+                    litebox,
+                    in_mem,
+                    litebox::fs::tar_ro::TarRo::new(tar_data, allocators.next()),
+                    allocators.next(),
+                )
+            })
             .mount("/dev", |allocator| {
                 litebox::fs::devices::Devices::new(litebox, allocator)
             })
             .build()
             .unwrap(),
-    );
-    let tar_ro = litebox::fs::resolver::Resolver::new(
-        litebox,
-        litebox::fs::composer::Composer::builder()
-            .mount("/", |allocator| {
-                litebox::fs::tar_ro::TarRo::new(tar_data, allocator)
-            })
-            .build()
-            .unwrap(),
-    );
-    litebox::fs::layered::FileSystem::new(
-        litebox,
-        in_mem_fs,
-        litebox::fs::layered::FileSystem::new(
-            litebox,
-            dev_stdio,
-            tar_ro,
-            litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
-        ),
-        litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
     )
 }
 

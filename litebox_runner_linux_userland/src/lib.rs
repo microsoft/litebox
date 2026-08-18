@@ -201,7 +201,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     }
 
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new(platform);
-    let litebox = shim_builder.litebox();
     // SAFETY: `gettid` takes no pointer arguments and has no Rust-side aliasing requirements.
     let tid = unsafe { libc::syscall(libc::SYS_gettid) }
         .try_into()
@@ -289,10 +288,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             ));
         }
 
-        let in_mem = litebox::fs::resolver::Resolver::new(
-            litebox,
-            litebox::fs::in_mem::InMem::new_initialized(entries),
-        );
+        let in_mem = litebox::fs::in_mem::InMem::new_initialized(entries);
         shim_builder.default_fs(in_mem, tar_data.into())
     };
 
