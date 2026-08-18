@@ -2139,7 +2139,9 @@ unsafe fn next_signal_handler(
     info: &mut libc::siginfo_t,
     context: &mut libc::ucontext_t,
 ) {
-    if signum == libc::SIGSEGV {
+    // An asynchronous `SIGSEGV` (`info.si_code <= 0`) can interrupt a fixup range.
+    // Do not interpret it as a memory fault.
+    if signum == libc::SIGSEGV && info.si_code > 0 {
         let ip: usize = {
             #[cfg(target_arch = "x86_64")]
             {
