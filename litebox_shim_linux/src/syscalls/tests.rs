@@ -7,6 +7,13 @@ use zerocopy::FromBytes as _;
 
 use crate::UserPtrMut;
 
+#[cfg(target_arch = "x86_64")]
+use litebox::shim::{Exception, ExceptionInfo};
+#[cfg(target_arch = "x86_64")]
+use litebox_common_linux::PtRegs;
+#[cfg(target_arch = "x86_64")]
+use litebox_common_linux::signal::{FPE_INTDIV, ILL_ILLOPN, SI_KERNEL, SiginfoData, Signal};
+
 extern crate std;
 
 const TEST_TAR_FILE: &[u8] = include_bytes!("../../../litebox/src/fs/test.tar");
@@ -49,6 +56,50 @@ pub(crate) fn init_platform() -> crate::Task<TestPlatform, crate::DefaultFS<Test
     });
     let fs = alloc::sync::Arc::new(shim_builder.default_fs(in_mem_fs, TEST_TAR_FILE.into()));
     shim_builder.build().0.new_test_task(fs)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn exceptions_queue_their_corresponding_signals() {
+    const FAULT_PC: usize = 0x4444_0000;
+
+    let task = init_platform();
+    let ctx = PtRegs {
+        rip: FAULT_PC,
+        ..Default::default()
+    };
+
+    for (exception, signal, code, addr) in [
+        (
+            Exception::DIVIDE_ERROR,
+            Signal::SIGFPE,
+            FPE_INTDIV,
+            FAULT_PC,
+        ),
+        (Exception::BREAKPOINT, Signal::SIGTRAP, SI_KERNEL, 0),
+        (
+            Exception::INVALID_OPCODE,
+            Signal::SIGILL,
+            ILL_ILLOPN,
+            FAULT_PC,
+        ),
+    ] {
+        task.handle_exception_request(
+            &ExceptionInfo {
+                exception,
+                error_code: 0,
+                cr2: 0,
+                kernel_mode: false,
+            },
+            &ctx,
+        );
+
+        let siginfo = task.take_pending_siginfo(signal);
+        assert_eq!(siginfo.code, code);
+        let actual_data = siginfo.data.pad;
+        let expected_data = SiginfoData::new_addr(addr).pad;
+        assert_eq!(actual_data, expected_data);
+    }
 }
 
 #[test]
