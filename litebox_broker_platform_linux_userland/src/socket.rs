@@ -628,6 +628,26 @@ impl ReactorClient {
     }
 
     #[cfg(test)]
+    fn inject_udp_status_errors(
+        &self,
+        guest_port: u16,
+        cached_error: SocketError,
+        native_error: SocketError,
+    ) {
+        let (response, receive) = sync_channel(1);
+        self.commands
+            .send(ReactorCommand::InjectUdpStatusErrors {
+                guest_port,
+                cached_error,
+                native_error,
+                response,
+            })
+            .unwrap();
+        self.signal().unwrap();
+        receive.recv().unwrap().unwrap();
+    }
+
+    #[cfg(test)]
     fn udp_native_receive_buffer_size(&self, guest_port: u16) -> Option<usize> {
         let (response, receive) = sync_channel(1);
         self.commands
@@ -868,6 +888,13 @@ enum ReactorCommand {
     #[cfg(test)]
     UdpNativeEventTokenCount {
         response: SyncSender<usize>,
+    },
+    #[cfg(test)]
+    InjectUdpStatusErrors {
+        guest_port: u16,
+        cached_error: SocketError,
+        native_error: SocketError,
+        response: SyncSender<BrokerResult<()>>,
     },
     #[cfg(test)]
     UdpNativeReceiveBufferSize {
@@ -1729,6 +1756,17 @@ impl Reactor {
                 #[cfg(test)]
                 ReactorCommand::UdpNativeEventTokenCount { response } => {
                     let _ = response.send(self.udp.event_tokens.len());
+                }
+                #[cfg(test)]
+                ReactorCommand::InjectUdpStatusErrors {
+                    guest_port,
+                    cached_error,
+                    native_error,
+                    response,
+                } => {
+                    let outcome =
+                        self.inject_udp_status_errors(guest_port, cached_error, native_error);
+                    let _ = response.send(outcome);
                 }
                 #[cfg(test)]
                 ReactorCommand::UdpNativeReceiveBufferSize {

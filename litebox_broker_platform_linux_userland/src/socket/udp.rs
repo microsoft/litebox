@@ -566,6 +566,7 @@ impl Reactor {
             .native_endpoint
             .as_ref()
             .is_some_and(|endpoint| endpoint.error.is_pending());
+        let republish_error = cached_error.is_some() && native_error_pending;
         if pending_error.is_none() && native_error_pending {
             pending_error = self.take_udp_error(socket_id)?;
         }
@@ -575,6 +576,11 @@ impl Reactor {
             .get_mut(&socket_id)
             .ok_or(BrokerError::Internal)?;
         let _ = update_snapshot(socket, None, readiness);
+        if republish_error {
+            // Returning the cached error leaves another error pending without
+            // changing readiness, so wake a waiter for the remaining error.
+            let _ = socket.readiness.republish(readiness);
+        }
         if let Err(error) = self.rearm_udp_endpoint_if_needed(socket_id) {
             if let Some(pending_error) = pending_error {
                 let socket = self
@@ -599,6 +605,41 @@ impl Reactor {
             local_address,
             pending_error,
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn inject_udp_status_errors(
+        &mut self,
+        guest_port: u16,
+        cached_error: SocketError,
+        native_error: SocketError,
+    ) -> BrokerResult<()> {
+        let socket_id = self
+            .udp
+            .bindings
+            .get(guest_port)
+            .ok_or(BrokerError::Internal)?
+            .socket_id;
+        let socket = self
+            .sockets
+            .get_mut(&socket_id)
+            .ok_or(BrokerError::Internal)?;
+        {
+            let mut snapshot = socket
+                .snapshot
+                .lock()
+                .expect("Linux socket snapshot mutex poisoned");
+            snapshot.pending_error = Some(cached_error);
+            snapshot.readiness = snapshot.readiness | ReadinessFlags::ERROR;
+        }
+        socket
+            .udp_state_mut()?
+            .native_endpoint
+            .as_mut()
+            .ok_or(BrokerError::Internal)?
+            .error
+            .record_consumed(native_error);
+        Ok(())
     }
 
     fn udp_queue_would_drop(

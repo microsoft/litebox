@@ -286,6 +286,58 @@ fn udp_status_publication_failure_still_rearms_native_endpoint() {
 }
 
 #[test]
+fn udp_status_republishes_when_another_error_remains_pending() {
+    let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
+    let broker = BrokerCore::new_with_limits(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+        BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
+        provider.clone(),
+    )
+    .unwrap();
+    let session = broker
+        .create_session(CallerCredential::Unauthenticated)
+        .unwrap();
+    let (published, publications) = channel();
+    let (retired, _retirements) = channel();
+    let readiness = Arc::new(TestReadinessSink { published, retired });
+    let socket = create_udp_socket(&session, readiness);
+    let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let peer_address = socket_address_v4(peer.local_addr().unwrap());
+    assert_eq!(
+        litebox_broker_core::socket::connect(&session, socket, peer_address),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+    );
+    let local_address = litebox_broker_core::socket::status(&session, socket)
+        .unwrap()
+        .local_address
+        .unwrap();
+    while publications.try_recv().is_ok() {}
+
+    provider.reactor.inject_udp_status_errors(
+        local_address.port(),
+        SocketError::ConnectionRefused,
+        SocketError::Other,
+    );
+    assert_eq!(
+        litebox_broker_core::socket::status(&session, socket)
+            .unwrap()
+            .pending_error,
+        Some(SocketError::ConnectionRefused)
+    );
+    let (published_socket, published_readiness) = publications.recv_timeout(TEST_TIMEOUT).unwrap();
+    assert_eq!(published_socket, socket);
+    assert!(published_readiness.contains(ReadinessFlags::ERROR));
+
+    assert_eq!(
+        litebox_broker_core::socket::status(&session, socket)
+            .unwrap()
+            .pending_error,
+        Some(SocketError::Other)
+    );
+}
+
+#[test]
 fn guest_udp_queue_pressure_drops_new_datagrams_successfully() {
     let provider = Arc::new(LinuxSocketProvider::new(2, 1).unwrap());
     let broker = BrokerCore::new_with_limits(
