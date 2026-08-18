@@ -184,6 +184,17 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             .collect();
         let file = mmapped_file(&prog)?;
         let data = if cli_args.rewrite_syscalls {
+            #[cfg(target_arch = "aarch64")]
+            let rewritten = litebox_syscall_rewriter::hook_syscalls_in_elf_with_options(
+                file.data,
+                None,
+                litebox_syscall_rewriter::RewriteOptions::new(
+                    litebox_syscall_rewriter::TargetHost::Linux,
+                    cfg!(feature = "aarch64_virtualize_x18"),
+                ),
+            )
+            .with_context(|| format!("failed to rewrite {}", prog.display()))?;
+            #[cfg(not(target_arch = "aarch64"))]
             let rewritten = litebox_syscall_rewriter::hook_syscalls_in_elf(file.data, None)
                 .with_context(|| format!("failed to rewrite {}", prog.display()))?;
             rewritten.into()

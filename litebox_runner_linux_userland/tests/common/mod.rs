@@ -195,6 +195,8 @@ pub fn rewrite_with_cache(input_path: &Path, output_path: &Path, extra_args: &[&
     input_paths.extend(rewriter_paths);
 
     let mut args = vec!["run", "-p", "litebox_syscall_rewriter", "--"];
+    #[cfg(all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"))]
+    args.push("--virtualize-x18");
     args.extend_from_slice(extra_args);
     args.push("-o");
     args.push(output_path.to_str().unwrap());

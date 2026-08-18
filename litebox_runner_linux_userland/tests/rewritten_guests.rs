@@ -126,3 +126,27 @@ fn test_signals_while_exercising_each_aarch64_gate_kind() {
         String::from_utf8_lossy(&output.stdout),
     );
 }
+
+#[test]
+#[cfg(all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"))]
+fn test_x18_virtualization() {
+    let target = common::compile(
+        "./tests/x18_virtualization.S",
+        "x18_virtualization_nolibc",
+        true,
+        true,
+    );
+    let binary_path = std::env::var("NEXTEST_BIN_EXE_litebox_runner_linux_userland")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_litebox_runner_linux_userland").to_string());
+    let output = std::process::Command::new(binary_path)
+        .args(["--unstable", "--rewrite-syscalls"])
+        .arg(target)
+        .output()
+        .expect("Failed to run litebox_runner_linux_userland");
+    assert!(
+        output.status.success(),
+        "x18 fixture failed ({}): {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+}

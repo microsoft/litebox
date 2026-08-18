@@ -15,12 +15,10 @@
 //! This crate currently supports x86-64 ELFs for syscall hooking and x86-64 PEs for syscall
 //! hooking plus rewriting Windows TEB accesses from GS segment overrides to FS segment overrides.
 //!
-//! It also supports AArch64 ELFs. AArch64 support currently targets **Linux guests on Linux
-//! hosts** and rewrites `SVC #imm` syscalls plus both directions of guest thread-pointer access
-//! (`MSR TPIDR_EL0` writes and `MRS TPIDR_EL0` reads): the host owns the hardware `TPIDR_EL0`
-//! anchor and the guest thread pointer is fully virtualized to a host-managed memory slot. This
-//! thread-pointer virtualization is Linux-host-specific; other hosts (Linux-on-Windows,
-//! Linux-on-macOS) must anchor and virtualize TLS differently. See the `aarch64` module for details.
+//! It also supports AArch64 ELFs. Linux has complete syscall, guest
+//! thread-pointer, and optional x18 virtualization. macOS and Windows target
+//! selection currently provides x18-only host-anchor emission scaffolding;
+//! there is no in-tree loader/runtime for those artifacts.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
@@ -129,16 +127,69 @@ const BUN_FOOTER_MARKER: &[u8] = b"\n---- Bun! ----\n";
 /// This is checked by the loader to verify that the trampoline is valid.
 pub const TRAMPOLINE_MAGIC: &[u8; 8] = b"LITEBOX0";
 
+/// Host operating system for AArch64 guest rewriting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TargetHost {
+    /// Linux, using `TPIDR_EL0` as the host per-thread anchor.
+    #[default]
+    Linux,
+    /// Experimental macOS emission using `TPIDRRO_EL0` as the host anchor.
+    /// No in-tree macOS runtime consumes these artifacts.
+    MacOs,
+    /// Experimental Windows emission using physical `x18` as the host anchor.
+    /// No in-tree AArch64 Windows runtime consumes these artifacts.
+    Windows,
+}
+
+/// Options for architecture-specific rewriting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RewriteOptions {
+    target_host: TargetHost,
+    virtualize_x18: bool,
+}
+
+impl RewriteOptions {
+    /// Selects the AArch64 host and whether Linux guest `x18` accesses are
+    /// virtualized. Non-Linux targets always virtualize `x18`.
+    pub const fn new(target_host: TargetHost, virtualize_x18: bool) -> Self {
+        Self {
+            target_host,
+            virtualize_x18: virtualize_x18 || !matches!(target_host, TargetHost::Linux),
+        }
+    }
+
+    /// Returns the selected AArch64 host ABI.
+    const fn target_host(self) -> TargetHost {
+        self.target_host
+    }
+
+    /// Returns whether AArch64 guest `x18` accesses must be virtualized.
+    const fn effective_virtualize_x18(self) -> bool {
+        self.virtualize_x18
+    }
+}
+
 /// Rewrite a supported binary for LiteBox.
 ///
 /// ELF64 inputs are passed through [`hook_syscalls_in_elf`]. PE64 inputs have
 /// executable-section GS segment overrides rewritten to FS and `syscall`
 /// instructions redirected through a LiteBox trampoline footer.
 pub fn rewrite_binary(input_binary: &[u8], trampoline: Option<u64>) -> Result<Vec<u8>> {
+    rewrite_binary_with_options(input_binary, trampoline, RewriteOptions::default())
+}
+
+/// Rewrite a supported binary with explicit architecture-specific options.
+///
+/// The options affect AArch64 ELF rewriting and are ignored for PE input.
+pub fn rewrite_binary_with_options(
+    input_binary: &[u8],
+    trampoline: Option<u64>,
+    options: RewriteOptions,
+) -> Result<Vec<u8>> {
     if is_pe_binary(input_binary) {
         rewrite_pe_for_litebox(input_binary, trampoline)
     } else {
-        hook_syscalls_in_elf(input_binary, trampoline)
+        hook_syscalls_in_elf_with_options(input_binary, trampoline, options)
     }
 }
 
@@ -196,22 +247,30 @@ const NT_SYSNO_REWRITE_LOOKBACK: usize = 16;
 /// no instructions are rewritten in that case.
 ///
 /// For patch-site discovery, AArch64 also rewrites guest thread-pointer accesses
-/// (`MSR TPIDR_EL0` writes and `MRS TPIDR_EL0` reads), so a binary containing one
-/// is patched (and gets a non-empty trampoline) even when it has no syscall
-/// (`SVC`) instructions at all. (See the `aarch64` module docs.)
+/// (`MSR TPIDR_EL0` writes and `MRS TPIDR_EL0` reads) and, when requested,
+/// supported x18 accesses. Such a binary is patched even when it has no syscall
+/// (`SVC`) instructions. See the `aarch64` module docs.
 ///
 /// Returns the rewritten binary. Binaries that cannot or do not need to be
 /// patched (relocatable objects, non-ELF files, already-hooked binaries,
-/// binaries without executable sections) are returned unchanged — these are
-/// not errors. See the per-architecture behavior above.
+/// binaries without executable sections) are returned unchanged.
 ///
 /// Returns `Err` for genuinely broken inputs (corrupt ELF, unsupported
 /// executables like Bun, arithmetic overflow) and for binaries that contain
 /// patch sites that could not be redirected. An unpatchable site is replaced
 /// with a trapping instruction so it faults instead of escaping to the host
 /// kernel: `icebp; hlt` on x86-64, and `BRK` on AArch64 (where a patch site is
-/// an `SVC`, `MSR TPIDR_EL0`, or `MRS TPIDR_EL0` instruction).
+/// an `SVC`, `MSR TPIDR_EL0`, `MRS TPIDR_EL0`, or enabled x18 instruction).
 pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Result<Vec<u8>> {
+    hook_syscalls_in_elf_with_options(input_binary, trampoline, RewriteOptions::default())
+}
+
+/// Rewrite an ELF with explicit architecture-specific options.
+pub fn hook_syscalls_in_elf_with_options(
+    input_binary: &[u8],
+    trampoline: Option<u64>,
+    options: RewriteOptions,
+) -> Result<Vec<u8>> {
     if input_binary.ends_with(BUN_FOOTER_MARKER) {
         return Err(Error::UnsupportedExecutable(
             "Bun-packaged executable".into(),
@@ -302,6 +361,7 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
             &text_sections,
             placement,
             trampoline.unwrap_or(0),
+            options,
         );
     }
 
@@ -831,6 +891,7 @@ fn hook_aarch64_elf(
     text_sections: &[TextSectionInfo],
     placement: TrampolinePlacement,
     callback: u64,
+    options: RewriteOptions,
 ) -> Result<Vec<u8>> {
     if let TrampolinePlacement::InsideLoadSpan { addr, limit, .. } = placement {
         let mut attempt = buf.to_vec();
@@ -841,6 +902,7 @@ fn hook_aarch64_elf(
             addr,
             Some(limit),
             callback,
+            options,
         );
         // A gap that is too small, or too far from the text for a gate's
         // branch to reach back, is a property of this address rather than of
@@ -863,6 +925,7 @@ fn hook_aarch64_elf(
         placement.fallback_addr(),
         None,
         callback,
+        options,
     )
 }
 
@@ -887,13 +950,14 @@ fn hook_aarch64_elf_at(
     trampoline_base_addr: u64,
     trampoline_limit: Option<u64>,
     callback: u64,
+    options: RewriteOptions,
 ) -> Result<Vec<u8>> {
     let Some(outcome) = aarch64::hook_syscalls_aarch64(
         buf,
         text_sections,
         trampoline_base_addr,
         callback,
-        aarch64::Host::Linux,
+        aarch64::RewriteConfig::new(options.target_host(), options.effective_virtualize_x18()),
     )?
     else {
         // No patch sites: emit the original binary with a size-0 sentinel
@@ -922,9 +986,9 @@ fn hook_aarch64_elf_at(
     }
     if !outcome.trapped_sites.is_empty() {
         return Err(Error::UnpatchableSyscalls(format!(
-            "{} unpatchable instruction(s) (SVC / MSR / MRS TPIDR_EL0) at {trapped:?}",
+            "{} unpatchable AArch64 patch site(s) (SVC / TPIDR_EL0 / x18) at {:?}",
             outcome.trapped_sites.len(),
-            trapped = outcome.trapped_sites,
+            outcome.trapped_sites,
         )));
     }
     let mut out = buf.to_vec();
@@ -993,6 +1057,7 @@ fn is_already_hooked(input_binary: &[u8], arch: Arch) -> bool {
         // TPIDR_EL0` accesses either. It is already hooked (nothing to do).
         return true;
     }
+
     if file_offset % 0x1000 != 0 {
         return false;
     }
@@ -1508,13 +1573,37 @@ pub fn patch_code_segment(
     trampoline_write_vaddr: u64,
     syscall_entry_addr: u64,
 ) -> Result<(Vec<u8>, Vec<u64>)> {
+    patch_code_segment_with_options(
+        code,
+        code_vaddr,
+        trampoline_write_vaddr,
+        syscall_entry_addr,
+        RewriteOptions::default(),
+    )
+}
+
+/// Runtime code-segment rewriting with explicit architecture-specific options.
+pub fn patch_code_segment_with_options(
+    code: &mut [u8],
+    code_vaddr: u64,
+    trampoline_write_vaddr: u64,
+    syscall_entry_addr: u64,
+    options: RewriteOptions,
+) -> Result<(Vec<u8>, Vec<u64>)> {
     #[cfg(target_arch = "x86_64")]
     {
+        let _ = options;
         patch_x86_64_code_segment(code, code_vaddr, trampoline_write_vaddr, syscall_entry_addr)
     }
     #[cfg(target_arch = "aarch64")]
     {
-        patch_aarch64_code_segment(code, code_vaddr, trampoline_write_vaddr, syscall_entry_addr)
+        patch_aarch64_code_segment(
+            code,
+            code_vaddr,
+            trampoline_write_vaddr,
+            syscall_entry_addr,
+            options,
+        )
     }
 }
 
@@ -1568,6 +1657,7 @@ fn patch_aarch64_code_segment(
     code_vaddr: u64,
     trampoline_write_vaddr: u64,
     syscall_entry_addr: u64,
+    options: RewriteOptions,
 ) -> Result<(Vec<u8>, Vec<u64>)> {
     let section = TextSectionInfo {
         vaddr: code_vaddr,
@@ -1579,7 +1669,7 @@ fn patch_aarch64_code_segment(
         &[section],
         trampoline_write_vaddr,
         syscall_entry_addr,
-        aarch64::Host::Linux,
+        aarch64::RewriteConfig::new(options.target_host(), options.effective_virtualize_x18()),
     )?
     else {
         return Ok((Vec::new(), Vec::new()));
@@ -1600,13 +1690,23 @@ fn patch_aarch64_code_segment(
 /// On AArch64 the caller must synchronize the instruction stream over `code`
 /// before it is fetched again; see [`patch_code_segment`].
 pub fn trap_all_syscalls_in_code(code: &mut [u8], code_vaddr: u64) -> Result<usize> {
+    trap_all_syscalls_in_code_with_options(code, code_vaddr, RewriteOptions::default())
+}
+
+/// Trap every architecture-specific patch site selected by `options`.
+pub fn trap_all_syscalls_in_code_with_options(
+    code: &mut [u8],
+    code_vaddr: u64,
+    options: RewriteOptions,
+) -> Result<usize> {
     #[cfg(target_arch = "x86_64")]
     {
+        let _ = options;
         trap_all_x86_64_syscalls(code, code_vaddr)
     }
     #[cfg(target_arch = "aarch64")]
     {
-        trap_all_aarch64_patch_sites(code, code_vaddr)
+        trap_all_aarch64_patch_sites(code, code_vaddr, options)
     }
 }
 
@@ -1625,17 +1725,25 @@ fn trap_all_x86_64_syscalls(code: &mut [u8], code_vaddr: u64) -> Result<usize> {
     Ok(count)
 }
 
-/// [`trap_all_syscalls_in_code`] for an AArch64 host, where every site the
-/// scanner recognizes — `SVC` and the `MSR`/`MRS TPIDR_EL0` accesses it
-/// virtualizes — becomes `BRK`.
+/// [`trap_all_syscalls_in_code`] for AArch64, where every site selected by
+/// `options` (`SVC`, Linux TPIDR accesses, and enabled x18 accesses) becomes
+/// `BRK`.
 #[cfg(any(test, target_arch = "aarch64"))]
-fn trap_all_aarch64_patch_sites(code: &mut [u8], code_vaddr: u64) -> Result<usize> {
+fn trap_all_aarch64_patch_sites(
+    code: &mut [u8],
+    code_vaddr: u64,
+    options: RewriteOptions,
+) -> Result<usize> {
     let section = TextSectionInfo {
         vaddr: code_vaddr,
         file_offset: 0,
         size: code.len() as u64,
     };
-    aarch64::trap_all_patch_sites(code, &[section])
+    aarch64::trap_all_patch_sites(
+        code,
+        &[section],
+        aarch64::RewriteConfig::new(options.target_host(), options.effective_virtualize_x18()),
+    )
 }
 
 /// The guest page size assumed when laying out the appended trampoline.
@@ -2414,7 +2522,16 @@ mod tests {
             file_offset: code_offset as u64,
             size: (elf.len() - code_offset) as u64,
         };
-        let out = hook_aarch64_elf_at(&input, &mut elf, &[section], 0x220000, None, 0).unwrap();
+        let out = hook_aarch64_elf_at(
+            &input,
+            &mut elf,
+            &[section],
+            0x220000,
+            None,
+            0,
+            RewriteOptions::default(),
+        )
+        .unwrap();
 
         assert_eq!(
             &out[ELF_HEADER_BYTES..ELF_HEADER_BYTES + phdrs_before.len()],
@@ -2469,7 +2586,15 @@ mod tests {
         let mut direct = elf.clone();
         assert!(
             matches!(
-                hook_aarch64_elf_at(&input, &mut direct, &[section()], UNREACHABLE_GAP, None, 0),
+                hook_aarch64_elf_at(
+                    &input,
+                    &mut direct,
+                    &[section()],
+                    UNREACHABLE_GAP,
+                    None,
+                    0,
+                    RewriteOptions::default(),
+                ),
                 Err(Error::UnpatchableSyscalls(_))
             ),
             "the gap has to be genuinely unreachable for this test to mean anything"
@@ -2481,8 +2606,15 @@ mod tests {
             limit: 0x10000,
             fallback_addr: 0x20000,
         };
-        hook_aarch64_elf(&input, &mut elf, &[section()], placement, 0)
-            .expect("the reachable fallback address must be retried");
+        hook_aarch64_elf(
+            &input,
+            &mut elf,
+            &[section()],
+            placement,
+            0,
+            RewriteOptions::default(),
+        )
+        .expect("the reachable fallback address must be retried");
     }
 
     /// x86-64 placement is deliberately unchanged; see `trampoline_addr_for`.
@@ -2588,7 +2720,15 @@ mod tests {
             size: buf.len() as u64,
         }];
         let placement = TrampolinePlacement::PastLastSegment { addr: 0x1000_0000 };
-        let err = hook_aarch64_elf(&input, &mut buf, &sections, placement, 0).unwrap_err();
+        let err = hook_aarch64_elf(
+            &input,
+            &mut buf,
+            &sections,
+            placement,
+            0,
+            RewriteOptions::default(),
+        )
+        .unwrap_err();
         assert!(
             matches!(err, Error::UnpatchableSyscalls(_)),
             "expected UnpatchableSyscalls, got {err:?}"
@@ -2605,9 +2745,14 @@ mod tests {
         let trampoline_vaddr = 0x1000_1000;
         let syscall_entry_addr = 0x1000_0000_0000;
 
-        let (trampoline, trapped) =
-            patch_aarch64_code_segment(&mut code, code_vaddr, trampoline_vaddr, syscall_entry_addr)
-                .unwrap();
+        let (trampoline, trapped) = patch_aarch64_code_segment(
+            &mut code,
+            code_vaddr,
+            trampoline_vaddr,
+            syscall_entry_addr,
+            RewriteOptions::default(),
+        )
+        .unwrap();
 
         assert!(
             trapped.is_empty(),
@@ -2639,8 +2784,14 @@ mod tests {
     fn aarch64_runtime_patch_of_syscall_free_code_emits_nothing() {
         let mut code = 0xD503_201Fu32.to_le_bytes().to_vec(); // NOP
         let before = code.clone();
-        let (trampoline, trapped) =
-            patch_aarch64_code_segment(&mut code, 0x1000, 0x2000, 0x3000).unwrap();
+        let (trampoline, trapped) = patch_aarch64_code_segment(
+            &mut code,
+            0x1000,
+            0x2000,
+            0x3000,
+            RewriteOptions::default(),
+        )
+        .unwrap();
         assert!(trampoline.is_empty());
         assert!(trapped.is_empty());
         assert_eq!(code, before, "syscall-free code is left untouched");
@@ -2655,8 +2806,14 @@ mod tests {
     fn aarch64_runtime_gates_carry_the_thread_pointer_placeholder() {
         // MRS X0, TPIDR_EL0 — a thread-pointer read, which is gated.
         let mut code = 0xD53B_D040u32.to_le_bytes().to_vec();
-        let (mut trampoline, trapped) =
-            patch_aarch64_code_segment(&mut code, 0x1000, 0x2000, 0x3000).unwrap();
+        let (mut trampoline, trapped) = patch_aarch64_code_segment(
+            &mut code,
+            0x1000,
+            0x2000,
+            0x3000,
+            RewriteOptions::default(),
+        )
+        .unwrap();
         assert!(trapped.is_empty());
         assert!(
             aarch64::find_guest_tpidr_placeholder(&trampoline).is_some(),
@@ -2680,9 +2837,14 @@ mod tests {
         let code_vaddr = 0x1000;
         let trampoline_vaddr = 0x400000;
 
-        let (runtime, skipped) =
-            patch_aarch64_code_segment(&mut runtime_code, code_vaddr, trampoline_vaddr, 0x1234)
-                .unwrap();
+        let (runtime, skipped) = patch_aarch64_code_segment(
+            &mut runtime_code,
+            code_vaddr,
+            trampoline_vaddr,
+            0x1234,
+            RewriteOptions::default(),
+        )
+        .unwrap();
         assert!(skipped.is_empty());
         let section = TextSectionInfo {
             vaddr: code_vaddr,
@@ -2694,7 +2856,7 @@ mod tests {
             &[section],
             trampoline_vaddr,
             0x1234,
-            aarch64::Host::Linux,
+            aarch64::RewriteConfig::new(TargetHost::Linux, false),
         )
         .unwrap()
         .unwrap();
@@ -2737,7 +2899,8 @@ mod tests {
         code.extend_from_slice(&0xD51B_D040u32.to_le_bytes()); // MSR TPIDR_EL0, X0
         code.extend_from_slice(&0xD53B_D041u32.to_le_bytes()); // MRS X1, TPIDR_EL0
 
-        let count = trap_all_aarch64_patch_sites(&mut code, 0x1000).unwrap();
+        let count =
+            trap_all_aarch64_patch_sites(&mut code, 0x1000, RewriteOptions::default()).unwrap();
 
         assert_eq!(count, 3, "SVC and both thread-pointer accesses are sites");
         for (index, word) in code.chunks_exact(4).enumerate() {

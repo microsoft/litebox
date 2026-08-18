@@ -39,10 +39,11 @@
 //!
 //! `guest_tpidr_offset` is fixed by the host binary's link and one rewritten
 //! guest must run under any host build, so gates carry a placeholder offset.
-//! **A loader must pass staged gates through [`finalize_trampoline_gates`],
-//! which patches the offset and proves no placeholder survives, before mapping
-//! the trampoline executable** — an unpatched gate does not fault. See
-//! `GUEST_TPIDR_OFFSET_PLACEHOLDER`.
+//! **A loader must pass staged gates through [`finalize_trampoline_gates`], or
+//! [`finalize_trampoline_gates_with_x18`] when x18 virtualization is enabled,
+//! before mapping the trampoline executable.** The finalizer validates every
+//! slot and patches each metadata-designated placeholder; an unpatched gate
+//! does not fault. See `GUEST_TPIDR_OFFSET_PLACEHOLDER`.
 //!
 //! ## Gate scratch storage
 //!
@@ -53,9 +54,14 @@
 //! with `SP` unmapped faults where the native instruction would not. The MRS
 //! gate uses its destination as scratch and needs no frame.
 //!
-//! The gates' extra memory accesses clear the local exclusive monitor, so a
-//! gated instruction between `LDXR` and `STXR` would livelock. No real codegen
-//! emits that.
+//! X18 gates add memory accesses that can clear the local exclusive monitor, so
+//! the scanner rejects x18 sites lexically bracketed by an exclusive load and
+//! store. TODO: use function metadata and control flow to cover noncontiguous
+//! exclusive sequences.
+//!
+//! The x18 gates spill below the guest SP. A guest memory operand that aliases
+//! that live spill area through an arbitrary register cannot be detected
+//! statically and is outside the supported gate semantics.
 //!
 //! ## `X16` is preserved across an `SVC`
 //!
@@ -94,9 +100,21 @@
 //! `rt_sigreturn` needs no gate: the runtime installs its own trampoline
 //! address into the signal frame, and an absolute address is reachable
 //! regardless of branch range.
+//!
+//! ## Guest x18 limits
+//!
+//! X18 virtualization handles ordinary register substitutions, `CBZ`/`CBNZ`,
+//! `TBZ`/`TBNZ`, and `ADR`/`ADRP` forms required by the supported workloads.
+//! Currently unsupported decoder layouts such as `ADC`/`SBC`, other PC-relative
+//! forms, and indirect control flow through x18 reject AOT rewriting and become
+//! traps during runtime rewriting.
 
 use alloc::format;
 use alloc::vec::Vec;
+use yaxpeax_arch::{Decoder, U8Reader};
+use yaxpeax_arm::armv8::a64::{
+    InstDecoder, Instruction as DecodedInstruction, Opcode as DecodedOpcode, Operand,
+};
 
 use crate::{Error, Result, TextSectionInfo, checked_add_u64};
 
@@ -140,6 +158,23 @@ pub const MRS_SLOT_BYTES: usize = 16;
 pub const MSR_SLOT_BYTES: usize = 48;
 /// Byte size of an emitted `SVC` gate slot.
 pub const SVC_SLOT_BYTES: usize = 64;
+/// Byte size of an ordinary self-contained x18 gate slot.
+const X18_SLOT_BYTES: usize = 48;
+/// Byte size of a self-contained x18 compare/test-branch gate slot.
+const X18_COMPARE_BRANCH_SLOT_BYTES: usize = 48;
+/// Byte size of a self-contained `ADR X18` gate slot.
+const X18_ADR_SLOT_BYTES: usize = 32;
+/// Distinct compact-slot sizes probed by classifiers and finalizers. Metadata
+/// distinguishes gate kinds that share the 48-byte size.
+pub const GATE_SLOT_SIZES: [usize; 4] = [
+    MRS_SLOT_BYTES,
+    X18_ADR_SLOT_BYTES,
+    MSR_SLOT_BYTES,
+    SVC_SLOT_BYTES,
+];
+/// Candidate starts required to cover the largest executable gate body:
+/// `max(ceil(executable_end / GATE_ALIGNMENT))`, currently `ceil(48 / 16)`.
+pub const GATE_PC_CANDIDATE_COUNT: usize = 3;
 const NOP: u32 = 0xD503_201F;
 
 const GATE_METADATA_MAGIC: u32 = 0xB807;
@@ -162,6 +197,9 @@ enum GateKind {
     Svc = 0,
     MrsTpidr = 1,
     MsrTpidr = 2,
+    X18 = 3,
+    X18CompareBranch = 4,
+    X18Adr = 5,
 }
 
 impl GateKind {
@@ -170,9 +208,16 @@ impl GateKind {
     }
 
     fn from_bits(bits: u32) -> Option<Self> {
-        [Self::Svc, Self::MrsTpidr, Self::MsrTpidr]
-            .into_iter()
-            .find(|kind| kind.bits() == bits)
+        [
+            Self::Svc,
+            Self::MrsTpidr,
+            Self::MsrTpidr,
+            Self::X18,
+            Self::X18CompareBranch,
+            Self::X18Adr,
+        ]
+        .into_iter()
+        .find(|kind| kind.bits() == bits)
     }
 }
 
@@ -198,10 +243,26 @@ pub enum GateMetadata {
         /// Register holding the value to write.
         source: u8,
     },
+    /// An ordinary instruction with every integer x18 operand replaced by the
+    /// selected value scratch register.
+    X18 {
+        /// Scratch register substituted for x18.
+        scratch: u8,
+    },
+    /// A compare/test branch (`CBZ`/`CBNZ`/`TBZ`/`TBNZ`) on logical x18.
+    X18CompareBranch {
+        /// Scratch register substituted in the gate-local branch.
+        scratch: u8,
+    },
+    /// An `ADR X18` materialized through `scratch`.
+    X18Adr {
+        /// Scratch register receiving the absolute address.
+        scratch: u8,
+    },
 }
 
 #[repr(transparent)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EncodedGateMetadata(u32);
 
 impl EncodedGateMetadata {
@@ -213,6 +274,9 @@ impl EncodedGateMetadata {
             GateMetadata::Svc => (GateKind::Svc, 0),
             GateMetadata::MrsTpidr { destination } => (GateKind::MrsTpidr, destination),
             GateMetadata::MsrTpidr { source } => (GateKind::MsrTpidr, source),
+            GateMetadata::X18 { scratch } => (GateKind::X18, scratch),
+            GateMetadata::X18CompareBranch { scratch } => (GateKind::X18CompareBranch, scratch),
+            GateMetadata::X18Adr { scratch } => (GateKind::X18Adr, scratch),
         };
         if register > MAX_REGISTER {
             return None;
@@ -246,6 +310,11 @@ impl EncodedGateMetadata {
                 destination: register,
             }),
             GateKind::MsrTpidr => Some(GateMetadata::MsrTpidr { source: register }),
+            GateKind::X18 if register != XZR => Some(GateMetadata::X18 { scratch: register }),
+            GateKind::X18CompareBranch if register != XZR => {
+                Some(GateMetadata::X18CompareBranch { scratch: register })
+            }
+            GateKind::X18Adr if register != XZR => Some(GateMetadata::X18Adr { scratch: register }),
             _ => None,
         }
     }
@@ -266,6 +335,572 @@ const SP: u8 = 31;
 /// Zero register (register 31 in a transfer-register field, where it reads as
 /// zero / discards writes — distinct from `SP`'s base-register meaning).
 const XZR: u8 = 31;
+
+const X18: u16 = 18;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum X18Classification {
+    None,
+    X18(X18TransformResult),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecodedX18Classification {
+    None,
+    Ordinary,
+    Unsupported(X18Unsupported),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum X18TransformResult {
+    Supported(X18Substitution),
+    Unsupported(X18Unsupported),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct X18Substitution {
+    word: u32,
+    scratch: u8,
+    anchor_scratch: u8,
+    pc_relative: Option<X18PcRelative>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum X18PcRelative {
+    Adr(u64),
+    Adrp(u64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct X18CompareBranch {
+    target: u64,
+    scratch: u8,
+    anchor_scratch: u8,
+    kind: X18BranchKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum X18BranchKind {
+    CbzW,
+    CbzX,
+    CbnzW,
+    CbnzX,
+    Tbz(u8),
+    Tbnz(u8),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct X18Adr {
+    target: u64,
+    scratch: u8,
+    anchor_scratch: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum X18Unsupported {
+    ControlFlow,
+    PcRelative,
+    ExclusiveAtomic,
+    EncodingLayout,
+    DecodeFailure,
+}
+
+fn decode_instruction(word: u32) -> Option<DecodedInstruction> {
+    let bytes = word.to_le_bytes();
+    InstDecoder::default()
+        .decode(&mut U8Reader::new(&bytes))
+        .ok()
+}
+
+fn operand_uses_x18(operand: &Operand) -> bool {
+    match operand {
+        Operand::Register(_, register)
+        | Operand::RegisterOrSP(_, register)
+        | Operand::RegShift(_, _, _, register)
+        | Operand::RegPreIndex(register, _, _)
+        | Operand::RegPostIndex(register, _) => *register == X18,
+        Operand::RegisterPair(_, first) => *first == X18 || first.checked_add(1) == Some(X18),
+        Operand::RegRegOffset(base, index, _, _, _) | Operand::RegPostIndexReg(base, index) => {
+            *base == X18 || *index == X18
+        }
+        _ => false,
+    }
+}
+
+fn mark_operand_registers(operand: &Operand, used: &mut [bool; 32]) {
+    let mut mark = |register: u16| {
+        if let Ok(register) = u8::try_from(register)
+            && register <= MAX_REGISTER
+        {
+            used[usize::from(register)] = true;
+        }
+    };
+    match operand {
+        Operand::Register(_, register)
+        | Operand::RegisterOrSP(_, register)
+        | Operand::RegShift(_, _, _, register)
+        | Operand::RegPreIndex(register, _, _)
+        | Operand::RegPostIndex(register, _) => mark(*register),
+        Operand::RegisterPair(_, first) => {
+            mark(*first);
+            if let Some(second) = first.checked_add(1) {
+                mark(second);
+            }
+        }
+        Operand::RegRegOffset(base, index, _, _, _) | Operand::RegPostIndexReg(base, index) => {
+            mark(*base);
+            mark(*index);
+        }
+        _ => {}
+    }
+}
+
+fn select_x18_scratches(instruction: &DecodedInstruction) -> Option<(u8, u8)> {
+    let mut used = [false; 32];
+    for operand in &instruction.operands {
+        mark_operand_registers(operand, &mut used);
+    }
+    let mut available = (7u8..=17)
+        .rev()
+        .filter(|register| !used[usize::from(*register)]);
+    Some((available.next()?, available.next()?))
+}
+
+fn x18_fixed_gate_can_execute(instruction: &DecodedInstruction) -> bool {
+    // SP reads are safe because the gate restores original SP for the
+    // instruction, but an SP write would move the frame and make exact register
+    // restoration impossible.
+    let writes_sp = matches!(instruction.operands[0], Operand::RegisterOrSP(_, 31))
+        || instruction.operands.iter().any(|operand| {
+            matches!(
+                operand,
+                Operand::RegPreIndex(31, _, true)
+                    | Operand::RegPostIndex(31, _)
+                    | Operand::RegPostIndexReg(31, _)
+            )
+        });
+    let overlaps_frame = instruction
+        .operands
+        .iter()
+        .any(|operand| matches!(operand, Operand::RegPreIndex(31, offset, _) if *offset < 0));
+    !writes_sp && !overlaps_frame
+}
+
+fn has_possible_x18_field(word: u32) -> bool {
+    // SVE ADD (vectors, unpredicated) uses these fields for Z registers only.
+    if word & 0xFF20_FC00 == 0x0420_0000 {
+        return false;
+    }
+    [0, 5, 10, 16]
+        .into_iter()
+        .any(|shift| (word >> shift) & REG_MASK == u32::from(X18))
+        || [0, 16]
+            .into_iter()
+            .any(|shift| (word >> shift) & REG_MASK == u32::from(X18 - 1))
+}
+
+fn is_control_flow(opcode: DecodedOpcode) -> bool {
+    matches!(
+        opcode,
+        DecodedOpcode::TBZ
+            | DecodedOpcode::TBNZ
+            | DecodedOpcode::CBZ
+            | DecodedOpcode::CBNZ
+            | DecodedOpcode::B
+            | DecodedOpcode::BR
+            | DecodedOpcode::Bcc(_)
+            | DecodedOpcode::BCcc(_)
+            | DecodedOpcode::BL
+            | DecodedOpcode::BLR
+            | DecodedOpcode::RET
+            | DecodedOpcode::ERET
+            | DecodedOpcode::DRPS
+            | DecodedOpcode::BLRAA
+            | DecodedOpcode::BLRAAZ
+            | DecodedOpcode::BLRAB
+            | DecodedOpcode::BLRABZ
+            | DecodedOpcode::BRAA
+            | DecodedOpcode::BRAAZ
+            | DecodedOpcode::BRAB
+            | DecodedOpcode::BRABZ
+            | DecodedOpcode::RETAA
+            | DecodedOpcode::RETAB
+            | DecodedOpcode::ERETAA
+            | DecodedOpcode::ERETAB
+            | DecodedOpcode::RETAASPPC
+            | DecodedOpcode::RETABSPPC
+            | DecodedOpcode::RETAASPPCR
+            | DecodedOpcode::RETABSPPCR
+    )
+}
+
+fn is_exclusive_or_atomic(opcode: DecodedOpcode) -> bool {
+    matches!(
+        opcode,
+        DecodedOpcode::LDAXP
+            | DecodedOpcode::LDAXR
+            | DecodedOpcode::LDAXRB
+            | DecodedOpcode::LDAXRH
+            | DecodedOpcode::LDXP
+            | DecodedOpcode::LDXR
+            | DecodedOpcode::LDXRB
+            | DecodedOpcode::LDXRH
+            | DecodedOpcode::STLXP
+            | DecodedOpcode::STLXR
+            | DecodedOpcode::STLXRB
+            | DecodedOpcode::STLXRH
+            | DecodedOpcode::STXP
+            | DecodedOpcode::STXR
+            | DecodedOpcode::STXRB
+            | DecodedOpcode::STXRH
+            | DecodedOpcode::SWP(_)
+            | DecodedOpcode::SWPB(_)
+            | DecodedOpcode::SWPH(_)
+            | DecodedOpcode::LDADD(_)
+            | DecodedOpcode::LDADDB(_)
+            | DecodedOpcode::LDADDH(_)
+            | DecodedOpcode::LDCLR(_)
+            | DecodedOpcode::LDCLRB(_)
+            | DecodedOpcode::LDCLRH(_)
+            | DecodedOpcode::LDEOR(_)
+            | DecodedOpcode::LDEORB(_)
+            | DecodedOpcode::LDEORH(_)
+            | DecodedOpcode::LDSET(_)
+            | DecodedOpcode::LDSETB(_)
+            | DecodedOpcode::LDSETH(_)
+            | DecodedOpcode::LDSMAX(_)
+            | DecodedOpcode::LDSMAXB(_)
+            | DecodedOpcode::LDSMAXH(_)
+            | DecodedOpcode::LDSMIN(_)
+            | DecodedOpcode::LDSMINB(_)
+            | DecodedOpcode::LDSMINH(_)
+            | DecodedOpcode::LDUMAX(_)
+            | DecodedOpcode::LDUMAXB(_)
+            | DecodedOpcode::LDUMAXH(_)
+            | DecodedOpcode::LDUMIN(_)
+            | DecodedOpcode::LDUMINB(_)
+            | DecodedOpcode::LDUMINH(_)
+            | DecodedOpcode::CAS(_)
+            | DecodedOpcode::CASB(_)
+            | DecodedOpcode::CASH(_)
+            | DecodedOpcode::CASP(_)
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExclusiveBoundary {
+    Load,
+    Store,
+}
+
+fn exclusive_boundary(word: u32) -> Option<ExclusiveBoundary> {
+    use DecodedOpcode::{LDAXP, LDAXR, LDAXRB, LDAXRH, LDXP, LDXR, LDXRB, LDXRH};
+    use DecodedOpcode::{STLXP, STLXR, STLXRB, STLXRH, STXP, STXR, STXRB, STXRH};
+
+    let opcode = decode_instruction(word)?.opcode;
+    if matches!(
+        opcode,
+        LDAXP | LDAXR | LDAXRB | LDAXRH | LDXP | LDXR | LDXRB | LDXRH
+    ) {
+        Some(ExclusiveBoundary::Load)
+    } else if matches!(
+        opcode,
+        STLXP | STLXR | STLXRB | STLXRH | STXP | STXR | STXRB | STXRH
+    ) {
+        Some(ExclusiveBoundary::Store)
+    } else {
+        None
+    }
+}
+
+fn classify_decoded_x18(instruction: &DecodedInstruction) -> DecodedX18Classification {
+    if !instruction.operands.iter().any(operand_uses_x18) {
+        return DecodedX18Classification::None;
+    }
+    if is_control_flow(instruction.opcode) {
+        return DecodedX18Classification::Unsupported(X18Unsupported::ControlFlow);
+    }
+    if instruction
+        .operands
+        .iter()
+        .any(|operand| matches!(operand, Operand::PCOffset(_)))
+    {
+        return DecodedX18Classification::Unsupported(X18Unsupported::PcRelative);
+    }
+    if is_exclusive_or_atomic(instruction.opcode) {
+        return DecodedX18Classification::Unsupported(X18Unsupported::ExclusiveAtomic);
+    }
+    DecodedX18Classification::Ordinary
+}
+
+fn classify_x18(word: u32) -> X18Classification {
+    // yaxpeax-arm 0.4.0 truncates the five-bit Rt field of MSR (register).
+    // Check the architectural encoding so an X18 source cannot fail open.
+    if word & 0xFFF0_001F == 0xD510_0012 {
+        return X18Classification::X18(X18TransformResult::Unsupported(
+            X18Unsupported::EncodingLayout,
+        ));
+    }
+    let Some(instruction) = decode_instruction(word) else {
+        return if has_possible_x18_field(word) {
+            X18Classification::X18(X18TransformResult::Unsupported(
+                X18Unsupported::DecodeFailure,
+            ))
+        } else {
+            X18Classification::None
+        };
+    };
+    match classify_decoded_x18(&instruction) {
+        DecodedX18Classification::None => X18Classification::None,
+        DecodedX18Classification::Unsupported(reason) => {
+            X18Classification::X18(X18TransformResult::Unsupported(reason))
+        }
+        DecodedX18Classification::Ordinary if x18_fixed_gate_can_execute(&instruction) => {
+            select_x18_scratches(&instruction)
+                .and_then(|(scratch, anchor_scratch)| {
+                    substitute_x18(word, scratch).map(|word| (word, scratch, anchor_scratch))
+                })
+                .map_or(
+                    X18Classification::X18(X18TransformResult::Unsupported(
+                        X18Unsupported::EncodingLayout,
+                    )),
+                    |(word, scratch, anchor_scratch)| {
+                        X18Classification::X18(X18TransformResult::Supported(X18Substitution {
+                            word,
+                            scratch,
+                            anchor_scratch,
+                            pc_relative: None,
+                        }))
+                    },
+                )
+        }
+        DecodedX18Classification::Ordinary => X18Classification::X18(
+            X18TransformResult::Unsupported(X18Unsupported::EncodingLayout),
+        ),
+    }
+}
+
+fn classify_x18_conditional_branch(word: u32, vaddr: u64) -> Option<X18CompareBranch> {
+    let instruction = decode_instruction(word)?;
+    let (width, offset, test_bit) = match instruction.operands {
+        [
+            Operand::Register(width, X18),
+            Operand::PCOffset(offset),
+            Operand::Nothing,
+            Operand::Nothing,
+        ] if matches!(instruction.opcode, DecodedOpcode::CBZ | DecodedOpcode::CBNZ) => {
+            (width, offset, None)
+        }
+        [
+            Operand::Register(width, X18),
+            Operand::Imm16(bit),
+            Operand::PCOffset(offset),
+            Operand::Nothing,
+        ] if matches!(instruction.opcode, DecodedOpcode::TBZ | DecodedOpcode::TBNZ) => {
+            (width, offset, Some(u8::try_from(bit).ok()?))
+        }
+        _ => return None,
+    };
+    if !matches!(
+        width,
+        yaxpeax_arm::armv8::a64::SizeCode::W | yaxpeax_arm::armv8::a64::SizeCode::X
+    ) {
+        return None;
+    }
+    let kind = match (instruction.opcode, width, test_bit) {
+        (DecodedOpcode::CBZ, yaxpeax_arm::armv8::a64::SizeCode::W, None) => X18BranchKind::CbzW,
+        (DecodedOpcode::CBZ, yaxpeax_arm::armv8::a64::SizeCode::X, None) => X18BranchKind::CbzX,
+        (DecodedOpcode::CBNZ, yaxpeax_arm::armv8::a64::SizeCode::W, None) => X18BranchKind::CbnzW,
+        (DecodedOpcode::CBNZ, yaxpeax_arm::armv8::a64::SizeCode::X, None) => X18BranchKind::CbnzX,
+        (DecodedOpcode::TBZ, _, Some(bit)) => X18BranchKind::Tbz(bit),
+        (DecodedOpcode::TBNZ, _, Some(bit)) => X18BranchKind::Tbnz(bit),
+        _ => return None,
+    };
+    let (scratch, anchor_scratch) = select_x18_scratches(&instruction)?;
+    Some(X18CompareBranch {
+        target: vaddr.checked_add_signed(offset)?,
+        scratch,
+        anchor_scratch,
+        kind,
+    })
+}
+
+fn classify_pc_relative_x18(word: u32, vaddr: u64) -> Option<X18Substitution> {
+    let instruction = decode_instruction(word)?;
+    let [
+        Operand::Register(_, X18),
+        Operand::PCOffset(offset),
+        Operand::Nothing,
+        Operand::Nothing,
+    ] = instruction.operands
+    else {
+        return None;
+    };
+    if !matches!(instruction.opcode, DecodedOpcode::ADR | DecodedOpcode::ADRP) {
+        return None;
+    }
+    let (scratch, anchor_scratch) = select_x18_scratches(&instruction)?;
+    let target = if instruction.opcode == DecodedOpcode::ADR {
+        vaddr.checked_add_signed(offset)?
+    } else {
+        (vaddr & !PAGE_OFFSET_MASK).checked_add_signed(offset)?
+    };
+    Some(X18Substitution {
+        word: word & !REG_MASK | u32::from(scratch),
+        scratch,
+        anchor_scratch,
+        pc_relative: Some(if instruction.opcode == DecodedOpcode::ADR {
+            X18PcRelative::Adr(target)
+        } else {
+            X18PcRelative::Adrp(target)
+        }),
+    })
+}
+
+fn classify_adr_x18(word: u32, vaddr: u64) -> Option<X18Adr> {
+    let instruction = decode_instruction(word)?;
+    let [
+        Operand::Register(yaxpeax_arm::armv8::a64::SizeCode::X, X18),
+        Operand::PCOffset(offset),
+        Operand::Nothing,
+        Operand::Nothing,
+    ] = instruction.operands
+    else {
+        return None;
+    };
+    if instruction.opcode != DecodedOpcode::ADR {
+        return None;
+    }
+    let (scratch, anchor_scratch) = select_x18_scratches(&instruction)?;
+    Some(X18Adr {
+        target: vaddr.checked_add_signed(offset)?,
+        scratch,
+        anchor_scratch,
+    })
+}
+
+fn replace_register_field(word: &mut u32, shift: u32, replacement: u8) -> Option<()> {
+    if (*word >> shift) & REG_MASK != u32::from(X18) {
+        return None;
+    }
+    *word = (*word & !(REG_MASK << shift)) | (u32::from(replacement) << shift);
+    Some(())
+}
+
+fn expected_operand(operand: Operand, replacement: u16) -> Option<Operand> {
+    let replace = |register| {
+        if register == X18 {
+            replacement
+        } else {
+            register
+        }
+    };
+    Some(match operand {
+        Operand::Register(size, X18) => Operand::Register(size, replacement),
+        Operand::RegisterOrSP(size, X18) => Operand::RegisterOrSP(size, replacement),
+        Operand::RegShift(style, amount, size, X18) => {
+            Operand::RegShift(style, amount, size, replacement)
+        }
+        Operand::RegRegOffset(base, index, size, style, amount) => {
+            Operand::RegRegOffset(replace(base), replace(index), size, style, amount)
+        }
+        Operand::RegPreIndex(X18, offset, writeback) => {
+            Operand::RegPreIndex(replacement, offset, writeback)
+        }
+        Operand::RegPostIndex(X18, offset) => Operand::RegPostIndex(replacement, offset),
+        Operand::RegPostIndexReg(base, index) => {
+            Operand::RegPostIndexReg(replace(base), replace(index))
+        }
+        Operand::RegisterPair(_, first) if first == X18 || first.checked_add(1) == Some(X18) => {
+            return None;
+        }
+        other => other,
+    })
+}
+
+fn substitute_x18(word: u32, replacement: u8) -> Option<u32> {
+    let instruction = decode_instruction(word)?;
+    if classify_decoded_x18(&instruction) != DecodedX18Classification::Ordinary {
+        return None;
+    }
+    let mut transformed_word = word;
+    let mut expected = instruction;
+    for (index, operand) in instruction.operands.iter().enumerate() {
+        match operand {
+            Operand::Register(_, X18) | Operand::RegisterOrSP(_, X18) => {
+                let shift = match (instruction.opcode, index) {
+                    (
+                        DecodedOpcode::MADD
+                        | DecodedOpcode::MSUB
+                        | DecodedOpcode::SMADDL
+                        | DecodedOpcode::SMSUBL
+                        | DecodedOpcode::UMADDL
+                        | DecodedOpcode::UMSUBL
+                        | DecodedOpcode::LSLV
+                        | DecodedOpcode::LSRV
+                        | DecodedOpcode::ASRV
+                        | DecodedOpcode::RORV
+                        | DecodedOpcode::CSEL
+                        | DecodedOpcode::CSINC
+                        | DecodedOpcode::CSINV
+                        | DecodedOpcode::CSNEG
+                        | DecodedOpcode::EXTR
+                        | DecodedOpcode::UMULH
+                        | DecodedOpcode::SMULH,
+                        2,
+                    )
+                    | (DecodedOpcode::CCMP | DecodedOpcode::CCMN, 1) => 16,
+                    (
+                        DecodedOpcode::MADD
+                        | DecodedOpcode::MSUB
+                        | DecodedOpcode::SMADDL
+                        | DecodedOpcode::SMSUBL
+                        | DecodedOpcode::UMADDL
+                        | DecodedOpcode::UMSUBL,
+                        3,
+                    ) => RT2_SHIFT,
+                    (DecodedOpcode::CCMP | DecodedOpcode::CCMN, 0) | (DecodedOpcode::EXTR, 1) => {
+                        RN_SHIFT
+                    }
+                    (_, 0) if instruction.operands[1] != Operand::Nothing => 0,
+                    (_, 1)
+                        if matches!(
+                            instruction.opcode,
+                            DecodedOpcode::STP | DecodedOpcode::LDP
+                        ) =>
+                    {
+                        RT2_SHIFT
+                    }
+                    (_, 1) => RN_SHIFT,
+                    _ => return None,
+                };
+                replace_register_field(&mut transformed_word, shift, replacement)?;
+            }
+            Operand::RegShift(_, _, _, X18) => {
+                replace_register_field(&mut transformed_word, 16, replacement)?;
+            }
+            Operand::RegRegOffset(base, index, _, _, _) | Operand::RegPostIndexReg(base, index) => {
+                if *base == X18 {
+                    replace_register_field(&mut transformed_word, RN_SHIFT, replacement)?;
+                }
+                if *index == X18 {
+                    replace_register_field(&mut transformed_word, 16, replacement)?;
+                }
+            }
+            Operand::RegPreIndex(X18, _, _) | Operand::RegPostIndex(X18, _) => {
+                replace_register_field(&mut transformed_word, RN_SHIFT, replacement)?;
+            }
+            Operand::RegisterPair(_, first)
+                if *first == X18 || first.checked_add(1) == Some(X18) =>
+            {
+                return None;
+            }
+            _ => {}
+        }
+        expected.operands[index] = expected_operand(*operand, u16::from(replacement))?;
+    }
+    (decode_instruction(transformed_word)? == expected).then_some(transformed_word)
+}
 
 // --- Guest thread-pointer virtualization ---
 //
@@ -292,6 +927,9 @@ const LDR_UIMM12_MAX_BYTE_OFFSET: u16 = LDST_UIMM12_IMM_MAX * LDST_UIMM12_SCALE_
 /// Alignment a runtime's guest thread-pointer slot must satisfy: the scale of
 /// the 64-bit unsigned-offset `LDR`/`STR` the gates address it with.
 pub const GUEST_TPIDR_OFFSET_ALIGN: u16 = LDST_UIMM12_SCALE_64BIT;
+
+/// Guest x18 immediately follows the generic guest thread-pointer slot.
+pub const GUEST_X18_OFFSET_FROM_GUEST_TP: usize = core::mem::size_of::<usize>();
 
 /// Largest byte offset from the host anchor at which a runtime may place the
 /// guest thread-pointer slot.
@@ -322,9 +960,313 @@ pub(crate) const MIN_GUEST_TPIDR_OFFSET: u16 = 16;
 /// It buys **no** run-time safety. An unpatched gate does not fault: it reads
 /// and writes one self-consistent address 32KB past the host thread pointer,
 /// quietly corrupting eight bytes of whatever is mapped there. A loader must
-/// prove no placeholder survives — see [`find_guest_tpidr_placeholder`] —
+/// use [`finalize_trampoline_gates`] or [`finalize_trampoline_gates_with_x18`]
 /// before making a trampoline executable.
 pub(crate) const GUEST_TPIDR_OFFSET_PLACEHOLDER: u16 = MAX_GUEST_TPIDR_OFFSET;
+/// Distinct placeholder for the anchor-relative guest x18 slot.
+const GUEST_X18_OFFSET_PLACEHOLDER: u16 = MAX_GUEST_TPIDR_OFFSET - 8;
+
+/// Stack frame used by x18 gates to preserve their two scratch registers.
+pub const X18_FRAME_BYTES: u16 = 16;
+const X18_FRAME_OFF_SCRATCHES: u16 = 0;
+
+/// State of an x18 gate's scratch frame at an interrupted instruction boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum X18FrameState {
+    /// No frame exists; SP and scratch registers are already guest-visible.
+    Absent,
+    /// SP points to the frame, but the original scratch registers are still live.
+    AtSpRegistersLive,
+    /// SP points to the frame holding the original scratch registers.
+    AtSpRestoreRegisters,
+    /// SP is above the frame, which still holds the original scratch registers.
+    BelowSpRestoreRegisters,
+}
+
+/// Source of the guest-visible x18 value during recovery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum X18ValueSource {
+    /// Read x18 from its runtime-owned logical slot.
+    Slot,
+    /// Read the updated x18 value from the gate's value scratch register.
+    Scratch,
+}
+
+/// Guest PC selected after x18 gate recovery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum X18Resume {
+    /// Resume at the original guest instruction.
+    Original,
+    /// Resume at the instruction following the original guest instruction.
+    Next,
+    /// Resume at the original conditional branch target.
+    TakenTarget,
+}
+
+/// Runtime-owned x18-slot access about to execute at a gate boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum X18SlotAccess {
+    /// The boundary instruction does not access the logical x18 slot.
+    None,
+    /// The boundary instruction loads the logical x18 slot.
+    Load,
+    /// The boundary instruction stores the logical x18 slot.
+    Store,
+}
+
+/// Host-neutral recovery semantics derived from an emitted x18 gate boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct X18RecoveryPlan {
+    /// Scratch-frame state at this instruction boundary.
+    pub frame: X18FrameState,
+    /// Source of the canonical guest x18 value.
+    pub value: X18ValueSource,
+    /// Guest PC selected by recovery.
+    pub resume: X18Resume,
+    /// Runtime-owned slot access about to execute at this boundary.
+    pub slot_access: X18SlotAccess,
+}
+
+impl X18RecoveryPlan {
+    const fn new(
+        frame: X18FrameState,
+        value: X18ValueSource,
+        resume: X18Resume,
+        slot_access: X18SlotAccess,
+    ) -> Self {
+        Self {
+            frame,
+            value,
+            resume,
+            slot_access,
+        }
+    }
+}
+
+/// Instruction boundaries in the persisted ordinary-x18 gate layout.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum X18GateOffset {
+    /// Gate entry, before the scratch frame is pushed.
+    Entry = 0,
+    /// First host-anchor read.
+    FirstAnchor = 4,
+    /// Logical-x18 slot load.
+    SlotLoad = 8,
+    /// Preserve the frame address across the transformed instruction.
+    FrameAddress = 12,
+    /// First frame pop.
+    FirstPop = 16,
+    /// Transformed guest instruction.
+    Transform = 20,
+    /// Restore the frame stack pointer.
+    RestoreSp = 24,
+    /// Second host-anchor read.
+    SecondAnchor = 28,
+    /// Logical-x18 slot store.
+    SlotStore = 32,
+    /// Scratch-register restore.
+    RestoreRegisters = 36,
+    /// Branch back to guest code.
+    Return = 40,
+    /// First byte after the executable gate body.
+    ExecutableEnd = 44,
+}
+
+impl X18GateOffset {
+    /// Returns the offset for indexing a gate byte slice.
+    const fn as_usize(self) -> usize {
+        self as u8 as usize
+    }
+
+    /// Decodes an executable instruction boundary in an ordinary x18 gate.
+    pub fn from_offset(offset: usize) -> Option<Self> {
+        Some(match offset {
+            0 => Self::Entry,
+            4 => Self::FirstAnchor,
+            8 => Self::SlotLoad,
+            12 => Self::FrameAddress,
+            16 => Self::FirstPop,
+            20 => Self::Transform,
+            24 => Self::RestoreSp,
+            28 => Self::SecondAnchor,
+            32 => Self::SlotStore,
+            36 => Self::RestoreRegisters,
+            40 => Self::Return,
+            _ => return None,
+        })
+    }
+
+    /// Returns the recovery semantics for this emitted instruction boundary.
+    pub const fn recovery_plan(self) -> Option<X18RecoveryPlan> {
+        use X18FrameState::{
+            Absent, AtSpRegistersLive, AtSpRestoreRegisters, BelowSpRestoreRegisters,
+        };
+        use X18Resume::{Next, Original};
+        use X18SlotAccess::{Load, None as NoSlotAccess, Store};
+        use X18ValueSource::{Scratch, Slot};
+
+        Some(match self {
+            Self::Entry => X18RecoveryPlan::new(Absent, Slot, Original, NoSlotAccess),
+            Self::FirstAnchor => {
+                X18RecoveryPlan::new(AtSpRegistersLive, Slot, Original, NoSlotAccess)
+            }
+            Self::SlotLoad => X18RecoveryPlan::new(AtSpRestoreRegisters, Slot, Original, Load),
+            Self::FrameAddress | Self::FirstPop => {
+                X18RecoveryPlan::new(AtSpRestoreRegisters, Slot, Original, NoSlotAccess)
+            }
+            Self::Transform => {
+                X18RecoveryPlan::new(BelowSpRestoreRegisters, Slot, Original, NoSlotAccess)
+            }
+            Self::RestoreSp => {
+                X18RecoveryPlan::new(BelowSpRestoreRegisters, Scratch, Next, NoSlotAccess)
+            }
+            Self::SecondAnchor => {
+                X18RecoveryPlan::new(AtSpRestoreRegisters, Scratch, Next, NoSlotAccess)
+            }
+            Self::SlotStore => X18RecoveryPlan::new(AtSpRestoreRegisters, Scratch, Next, Store),
+            Self::RestoreRegisters => {
+                X18RecoveryPlan::new(AtSpRestoreRegisters, Slot, Next, NoSlotAccess)
+            }
+            Self::Return => X18RecoveryPlan::new(Absent, Slot, Next, NoSlotAccess),
+            Self::ExecutableEnd => return None,
+        })
+    }
+}
+
+/// Instruction boundaries in the persisted x18 compare/test-branch gate layout.
+#[derive(Clone, Copy)]
+#[repr(u8)]
+pub enum X18CompareBranchOffset {
+    /// Gate entry, before the frame is allocated.
+    Entry = 0,
+    /// Scratch-register spill.
+    Spill = 4,
+    /// Host-anchor read.
+    Anchor = 8,
+    /// Logical-x18 slot load.
+    SlotLoad = 12,
+    /// Original compare/test branch.
+    Test = 16,
+    /// Fallthrough scratch restore.
+    FallthroughRestore = 20,
+    /// Fallthrough frame pop.
+    FallthroughPop = 24,
+    /// Branch to the original fallthrough PC.
+    FallthroughBranch = 28,
+    /// Taken-path scratch restore.
+    TakenRestore = 32,
+    /// Taken-path frame pop.
+    TakenPop = 36,
+    /// Branch to the original taken target.
+    TakenBranch = 40,
+}
+
+impl X18CompareBranchOffset {
+    /// Decodes an executable instruction boundary.
+    pub fn from_offset(offset: usize) -> Option<Self> {
+        Some(match offset {
+            0 => Self::Entry,
+            4 => Self::Spill,
+            8 => Self::Anchor,
+            12 => Self::SlotLoad,
+            16 => Self::Test,
+            20 => Self::FallthroughRestore,
+            24 => Self::FallthroughPop,
+            28 => Self::FallthroughBranch,
+            32 => Self::TakenRestore,
+            36 => Self::TakenPop,
+            40 => Self::TakenBranch,
+            _ => return None,
+        })
+    }
+
+    /// Returns the recovery semantics for this emitted instruction boundary.
+    pub const fn recovery_plan(self) -> X18RecoveryPlan {
+        use X18FrameState::{Absent, AtSpRegistersLive, AtSpRestoreRegisters};
+        use X18Resume::{Next, Original, TakenTarget};
+        use X18SlotAccess::{Load, None as NoSlotAccess};
+        use X18ValueSource::Slot;
+
+        match self {
+            Self::Entry => X18RecoveryPlan::new(Absent, Slot, Original, NoSlotAccess),
+            Self::Spill => X18RecoveryPlan::new(AtSpRegistersLive, Slot, Original, NoSlotAccess),
+            Self::Anchor | Self::Test => {
+                X18RecoveryPlan::new(AtSpRestoreRegisters, Slot, Original, NoSlotAccess)
+            }
+            Self::SlotLoad => X18RecoveryPlan::new(AtSpRestoreRegisters, Slot, Original, Load),
+            Self::FallthroughRestore => {
+                X18RecoveryPlan::new(AtSpRestoreRegisters, Slot, Next, NoSlotAccess)
+            }
+            Self::FallthroughPop => {
+                X18RecoveryPlan::new(AtSpRegistersLive, Slot, Next, NoSlotAccess)
+            }
+            Self::FallthroughBranch => X18RecoveryPlan::new(Absent, Slot, Next, NoSlotAccess),
+            Self::TakenRestore => {
+                X18RecoveryPlan::new(AtSpRestoreRegisters, Slot, TakenTarget, NoSlotAccess)
+            }
+            Self::TakenPop => {
+                X18RecoveryPlan::new(AtSpRegistersLive, Slot, TakenTarget, NoSlotAccess)
+            }
+            Self::TakenBranch => X18RecoveryPlan::new(Absent, Slot, TakenTarget, NoSlotAccess),
+        }
+    }
+}
+
+/// Instruction boundaries in the persisted ADR-x18 gate layout.
+#[derive(Clone, Copy)]
+#[repr(u8)]
+pub enum X18AdrOffset {
+    /// Gate entry, before the frame is pushed.
+    Entry = 0,
+    /// Host-anchor read.
+    Anchor = 4,
+    /// Materialize the target page.
+    Adrp = 8,
+    /// Add the target's page offset.
+    Add = 12,
+    /// Commit the result to the logical-x18 slot.
+    SlotStore = 16,
+    /// Restore scratch registers and SP.
+    Restore = 20,
+    /// Branch back to guest code.
+    Return = 24,
+}
+
+impl X18AdrOffset {
+    /// Decodes an executable instruction boundary.
+    pub fn from_offset(offset: usize) -> Option<Self> {
+        Some(match offset {
+            0 => Self::Entry,
+            4 => Self::Anchor,
+            8 => Self::Adrp,
+            12 => Self::Add,
+            16 => Self::SlotStore,
+            20 => Self::Restore,
+            24 => Self::Return,
+            _ => return None,
+        })
+    }
+
+    /// Returns the recovery semantics for this emitted instruction boundary.
+    pub const fn recovery_plan(self) -> X18RecoveryPlan {
+        use X18FrameState::{Absent, AtSpRegistersLive, AtSpRestoreRegisters};
+        use X18Resume::{Next, Original};
+        use X18SlotAccess::{None as NoSlotAccess, Store};
+        use X18ValueSource::{Scratch, Slot};
+
+        match self {
+            Self::Entry => X18RecoveryPlan::new(Absent, Slot, Original, NoSlotAccess),
+            Self::Anchor => X18RecoveryPlan::new(AtSpRegistersLive, Slot, Original, NoSlotAccess),
+            Self::Adrp | Self::Add => {
+                X18RecoveryPlan::new(AtSpRestoreRegisters, Slot, Original, NoSlotAccess)
+            }
+            Self::SlotStore => X18RecoveryPlan::new(AtSpRestoreRegisters, Scratch, Next, Store),
+            Self::Restore => X18RecoveryPlan::new(AtSpRestoreRegisters, Slot, Next, NoSlotAccess),
+            Self::Return => X18RecoveryPlan::new(Absent, Slot, Next, NoSlotAccess),
+        }
+    }
+}
 
 // --- SVC gate stack frame ---
 //
@@ -442,16 +1384,12 @@ const MSR_FRAME_OFF_VALUE: u16 = 16;
 /// Callback address slot.
 const HEADER_CALLBACK_OFFSET: usize = 0;
 
-/// First byte past the 8-byte callback slot, and so the first that can be read
-/// as an instruction word. Scans start here: the slot holds an address, which
-/// could bit-for-bit resemble any instruction they look for.
+/// First byte past the 8-byte callback slot.
+#[cfg(test)]
 const FIRST_SCANNABLE_OFFSET: usize = HEADER_CALLBACK_OFFSET + 8;
 
 /// First byte of the per-site gates; the callback header is padded with NOPs to
-/// the 16-byte slot alignment. Everything from [`FIRST_SCANNABLE_OFFSET`] on is
-/// instructions this module emitted, which is what lets
-/// [`patch_guest_tpidr_offset`] scan for its patch sites instead of carrying a
-/// side table of them.
+/// the 16-byte slot alignment.
 const GATES_START_OFFSET: usize = GATE_ALIGNMENT;
 
 // ============================================================
@@ -555,7 +1493,17 @@ enum Opcode {
     LdrUimm = 0xF940_0000,
     Stp = 0xA900_0000,
     Ldp = 0xA940_0000,
+    StpPre = 0xA980_0000,
+    LdpPost = 0xA8C0_0000,
     MrsTpidrEl0 = MRS_TPIDR_EL0_BITS,
+    MrsTpidrroEl0 = 0xD53B_D060,
+    MovReg = 0xAA00_03E0,
+    CbnzW = 0x3500_0000,
+    CbzW = 0x3400_0000,
+    CbzX = 0xB400_0000,
+    CbnzX = 0xB500_0000,
+    Tbz = 0x3600_0000,
+    Tbnz = 0x3700_0000,
     Brk = 0xD420_0000,
 }
 
@@ -729,8 +1677,56 @@ enum Insn {
         rn: u8,
         imm_bytes: i16,
     },
+    /// `STP Xt, Xt2, [Xn, #imm_bytes]!`.
+    StpPre {
+        rt: u8,
+        rt2: u8,
+        rn: u8,
+        imm_bytes: i16,
+    },
+    /// `LDP Xt, Xt2, [Xn], #imm_bytes`.
+    LdpPost {
+        rt: u8,
+        rt2: u8,
+        rn: u8,
+        imm_bytes: i16,
+    },
     /// `MRS Xt, TPIDR_EL0` (read thread pointer).
     MrsTpidrEl0(u8),
+    /// `MRS Xt, TPIDRRO_EL0` (macOS read-only thread pointer).
+    MrsTpidrroEl0(u8),
+    /// `MOV Xd, Xs`, encoded as `ORR Xd, XZR, Xs`.
+    MovReg {
+        rd: u8,
+        rs: u8,
+    },
+    /// `CBNZ Wt, #offset`.
+    CbnzW {
+        rt: u8,
+        offset: i64,
+    },
+    /// `CBZ Wt, #offset`.
+    CbzW {
+        rt: u8,
+        offset: i64,
+    },
+    /// `CBZ Xt, #offset`.
+    CbzX {
+        rt: u8,
+        offset: i64,
+    },
+    /// `CBNZ Xt, #offset`.
+    CbnzX {
+        rt: u8,
+        offset: i64,
+    },
+    /// `TBZ`/`TBNZ Wt, #bit, #offset`.
+    TestBranch {
+        rt: u8,
+        bit: u8,
+        offset: i64,
+        nonzero: bool,
+    },
     /// `BRK #imm16` — software breakpoint raising a synchronous debug exception.
     Brk(u16),
 }
@@ -766,7 +1762,51 @@ impl Insn {
                 rn,
                 imm_bytes,
             } => ldst_pair(Opcode::Ldp, rt, rt2, rn, imm_bytes),
+            Insn::StpPre {
+                rt,
+                rt2,
+                rn,
+                imm_bytes,
+            } => ldst_pair(Opcode::StpPre, rt, rt2, rn, imm_bytes),
+            Insn::LdpPost {
+                rt,
+                rt2,
+                rn,
+                imm_bytes,
+            } => ldst_pair(Opcode::LdpPost, rt, rt2, rn, imm_bytes),
             Insn::MrsTpidrEl0(rt) => Some(Opcode::MrsTpidrEl0.bits() | u32::from(rt)),
+            Insn::MrsTpidrroEl0(rt) => Some(Opcode::MrsTpidrroEl0.bits() | u32::from(rt)),
+            Insn::MovReg { rd, rs } => {
+                Some(Opcode::MovReg.bits() | (u32::from(rs) << 16) | u32::from(rd))
+            }
+            Insn::CbnzW { rt, offset } => pcrel_imm19(Opcode::CbnzW, offset, u32::from(rt)),
+            Insn::CbzW { rt, offset } => pcrel_imm19(Opcode::CbzW, offset, u32::from(rt)),
+            Insn::CbzX { rt, offset } => pcrel_imm19(Opcode::CbzX, offset, u32::from(rt)),
+            Insn::CbnzX { rt, offset } => pcrel_imm19(Opcode::CbnzX, offset, u32::from(rt)),
+            Insn::TestBranch {
+                rt,
+                bit,
+                offset,
+                nonzero,
+            } => {
+                if bit >= 64 || offset % 4 != 0 {
+                    return None;
+                }
+                let imm14 = i32::try_from(offset >> 2).ok()?;
+                if !(-(1 << 13)..(1 << 13)).contains(&imm14) {
+                    return None;
+                }
+                Some(
+                    if nonzero {
+                        Opcode::Tbnz.bits()
+                    } else {
+                        Opcode::Tbz.bits()
+                    } | (u32::from(bit >> 5) << 31)
+                        | (u32::from(bit & 31) << 19)
+                        | ((imm14.cast_unsigned() & 0x3fff) << RN_SHIFT)
+                        | u32::from(rt),
+                )
+            }
             Insn::Brk(imm) => Some(Opcode::Brk.bits() | (u32::from(imm) << RN_SHIFT)),
         }
     }
@@ -780,16 +1820,35 @@ impl Insn {
 /// register* a gate reads to reach the host's per-thread block, and this names
 /// which one; gates read it through [`Host::anchor_read`], so adding a host is
 /// a new variant plus its arm there.
-///
-/// Only [`Host::Linux`] exists today. macOS would anchor on `TPIDRRO_EL0` and
-/// Windows on the `x18` TEB pointer, since neither preserves `TPIDR_EL0` across
-/// a host transition; both would also need host-specific `SVC` callback
-/// dispatch, not just a new anchor.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Host {
     /// Linux host: the kernel preserves `TPIDR_EL0` across host execution, so
     /// the anchor lives there and the anchor read is `MRS Xd, TPIDR_EL0`.
     Linux,
+    /// macOS host: `TPIDRRO_EL0` points at the host per-thread block.
+    MacOs,
+    /// Windows host: physical `x18` points at the thread environment block.
+    Windows,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RewriteConfig {
+    host: Host,
+    virtualize_x18: bool,
+}
+
+impl RewriteConfig {
+    pub(crate) const fn new(target: crate::TargetHost, virtualize_x18: bool) -> Self {
+        let host = match target {
+            crate::TargetHost::Linux => Host::Linux,
+            crate::TargetHost::MacOs => Host::MacOs,
+            crate::TargetHost::Windows => Host::Windows,
+        };
+        Self {
+            host,
+            virtualize_x18,
+        }
+    }
 }
 
 impl Host {
@@ -798,6 +1857,8 @@ impl Host {
     fn anchor_read(self, rd: u8) -> Insn {
         match self {
             Host::Linux => Insn::MrsTpidrEl0(rd),
+            Host::MacOs => Insn::MrsTpidrroEl0(rd),
+            Host::Windows => Insn::MovReg { rd, rs: 18 },
         }
     }
 }
@@ -826,16 +1887,26 @@ enum PatchKind {
     MsrTpidr(u8),
     /// `MRS Xd, TPIDR_EL0`; the `u8` is the destination register (0-30).
     MrsTpidr(u8),
+    /// An x18 use detected under explicit virtualization.
+    X18(X18TransformResult),
+    /// A compare/test branch (`CBZ`/`CBNZ`/`TBZ`/`TBNZ`) on logical x18.
+    X18CompareBranch(X18CompareBranch),
+    /// An `ADR X18` with its original absolute target.
+    X18Adr(X18Adr),
 }
 
-/// Scan all executable sections for `SVC #imm`, `MSR TPIDR_EL0` (thread-pointer
-/// writes), and `MRS TPIDR_EL0` (thread-pointer reads). AArch64 instructions are
-/// always 4-byte aligned, so we step in 4-byte units. Returns sites in ascending
-/// file order.
+/// Scans executable sections for Linux syscall/thread-pointer gates and, when
+/// configured, x18 gates. Linux-specific sites are rejected for other hosts;
+/// x18 sites inside lexical exclusive sequences are rejected. AArch64
+/// instructions are fixed-width, so sites are returned in ascending file order.
 ///
 /// `MRS XZR, TPIDR_EL0` is a discarded read (register 31 as an `LDR` base would
 /// mean `SP`), so it is left native; every other `MRS Xd, TPIDR_EL0` is gated.
-fn find_patch_sites(sections: &[TextSectionInfo], buf: &[u8]) -> Result<Vec<PatchSite>> {
+fn find_patch_sites(
+    sections: &[TextSectionInfo],
+    buf: &[u8],
+    config: RewriteConfig,
+) -> Result<Vec<PatchSite>> {
     let mut sites = Vec::new();
 
     for section in sections {
@@ -859,17 +1930,49 @@ fn find_patch_sites(sections: &[TextSectionInfo], buf: &[u8]) -> Result<Vec<Patc
             ));
         }
         let section_data = &buf[start..end];
+        let mut inside_exclusive_sequence = false;
 
         for i in (0..section_data.len()).step_by(INSN_BYTES) {
             if i + INSN_BYTES > section_data.len() {
                 break;
             }
             let insn = u32::from_le_bytes(section_data[i..i + INSN_BYTES].try_into().unwrap());
+            let exclusive_boundary = exclusive_boundary(insn);
+            if exclusive_boundary == Some(ExclusiveBoundary::Load) {
+                inside_exclusive_sequence = true;
+            } else if exclusive_boundary == Some(ExclusiveBoundary::Store) {
+                inside_exclusive_sequence = false;
+            }
             let kind = if (insn & SVC_OPCODE_MASK) == SVC_OPCODE_BITS {
+                if config.host != Host::Linux {
+                    return Err(Error::UnsupportedExecutable(format!(
+                        "AArch64 SVC site is unsupported for the selected host at {:#x}",
+                        checked_add_u64(section.vaddr, i as u64, "SVC site")?
+                    )));
+                }
                 PatchKind::Svc
             } else if (insn & MSR_TPIDR_EL0_MASK) == MSR_TPIDR_EL0_BITS {
-                PatchKind::MsrTpidr((insn & REG_MASK) as u8)
+                if config.host != Host::Linux {
+                    return Err(Error::UnsupportedExecutable(format!(
+                        "AArch64 TPIDR_EL0 write is unsupported for the selected host at {:#x}",
+                        checked_add_u64(section.vaddr, i as u64, "TPIDR site")?
+                    )));
+                }
+                let source = (insn & REG_MASK) as u8;
+                if config.virtualize_x18 && u16::from(source) == X18 {
+                    PatchKind::X18(X18TransformResult::Unsupported(
+                        X18Unsupported::EncodingLayout,
+                    ))
+                } else {
+                    PatchKind::MsrTpidr(source)
+                }
             } else if (insn & MRS_TPIDR_EL0_MASK) == MRS_TPIDR_EL0_BITS {
+                if config.host != Host::Linux {
+                    return Err(Error::UnsupportedExecutable(format!(
+                        "AArch64 TPIDR_EL0 read is unsupported for the selected host at {:#x}",
+                        checked_add_u64(section.vaddr, i as u64, "TPIDR site")?
+                    )));
+                }
                 let rd = (insn & REG_MASK) as u8;
                 // `MRS XZR, TPIDR_EL0` discards its result (a no-op read); gating
                 // it would mean using register 31 as an `LDR` base (= SP), so
@@ -877,10 +1980,41 @@ fn find_patch_sites(sections: &[TextSectionInfo], buf: &[u8]) -> Result<Vec<Patc
                 if rd == XZR {
                     continue;
                 }
-                PatchKind::MrsTpidr(rd)
+                if config.virtualize_x18 && u16::from(rd) == X18 {
+                    PatchKind::X18(X18TransformResult::Unsupported(
+                        X18Unsupported::EncodingLayout,
+                    ))
+                } else {
+                    PatchKind::MrsTpidr(rd)
+                }
+            } else if config.virtualize_x18 {
+                let vaddr = checked_add_u64(section.vaddr, i as u64, "x18 site")?;
+                if let Some(branch) = classify_x18_conditional_branch(insn, vaddr) {
+                    PatchKind::X18CompareBranch(branch)
+                } else if let Some(adr) = classify_adr_x18(insn, vaddr) {
+                    PatchKind::X18Adr(adr)
+                } else if let Some(transformation) = classify_pc_relative_x18(insn, vaddr) {
+                    PatchKind::X18(X18TransformResult::Supported(transformation))
+                } else {
+                    match classify_x18(insn) {
+                        X18Classification::None => continue,
+                        X18Classification::X18(result) => PatchKind::X18(result),
+                    }
+                }
             } else {
                 continue;
             };
+            if inside_exclusive_sequence
+                && matches!(
+                    kind,
+                    PatchKind::X18(_) | PatchKind::X18CompareBranch(_) | PatchKind::X18Adr(_)
+                )
+            {
+                return Err(Error::UnsupportedExecutable(format!(
+                    "AArch64 gate inside exclusive sequence at {:#x}",
+                    checked_add_u64(section.vaddr, i as u64, "exclusive sequence gate")?
+                )));
+            }
             sites.push(PatchSite {
                 file_offset: start + i,
                 vaddr: checked_add_u64(section.vaddr, i as u64, "patch site")?,
@@ -929,14 +2063,14 @@ pub(crate) fn hook_syscalls_aarch64(
     text_sections: &[TextSectionInfo],
     trampoline_base_addr: u64,
     callback: u64,
-    host: Host,
+    config: RewriteConfig,
 ) -> Result<Option<HookOutcome>> {
     if !trampoline_base_addr.is_multiple_of(GATE_ALIGNMENT as u64) {
         return Err(Error::AddressOverflow(format!(
             "AArch64 trampoline base {trampoline_base_addr:#x} is not {GATE_ALIGNMENT}-byte aligned"
         )));
     }
-    let sites = find_patch_sites(text_sections, buf)?;
+    let sites = find_patch_sites(text_sections, buf, config)?;
 
     if sites.is_empty() {
         // No patch sites: nothing to redirect, so no trampoline is
@@ -979,7 +2113,7 @@ pub(crate) fn hook_syscalls_aarch64(
                     trampoline_base_addr,
                     site,
                     rt,
-                    host,
+                    config.host,
                 )?,
                 PatchKind::MrsTpidr(rd) => emit_mrs_gate(
                     &mut trampoline_data,
@@ -987,7 +2121,32 @@ pub(crate) fn hook_syscalls_aarch64(
                     trampoline_base_addr,
                     site,
                     rd,
-                    host,
+                    config.host,
+                )?,
+                PatchKind::X18(X18TransformResult::Supported(transformation)) => emit_x18_gate(
+                    &mut trampoline_data,
+                    gate_offset,
+                    trampoline_base_addr,
+                    site,
+                    transformation,
+                    config.host,
+                )?,
+                PatchKind::X18(X18TransformResult::Unsupported(_)) => GateBuild::Unreachable,
+                PatchKind::X18CompareBranch(branch) => emit_x18_compare_branch_gate(
+                    &mut trampoline_data,
+                    gate_offset,
+                    trampoline_base_addr,
+                    site,
+                    branch,
+                    config.host,
+                )?,
+                PatchKind::X18Adr(adr) => emit_x18_adr_gate(
+                    &mut trampoline_data,
+                    gate_offset,
+                    trampoline_base_addr,
+                    site,
+                    adr,
+                    config.host,
                 )?,
             }
         } else {
@@ -1027,8 +2186,8 @@ fn trap_site(buf: &mut [u8], file_offset: usize) {
 /// many were trapped.
 ///
 /// The fail-safe behind [`crate::trap_all_syscalls_in_code`], for a segment
-/// that could not be patched at all. [`hook_syscalls_aarch64`] traps its own
-/// unreachable sites as it goes and does not come through here.
+/// that could not be patched at all. The main hooker traps its own unreachable
+/// sites as it goes and does not come through here.
 ///
 /// The `cfg` tracks reachability, not capability: the scan and the rewrite are
 /// host-agnostic, but nothing calls this in an x86-64 build.
@@ -1036,8 +2195,9 @@ fn trap_site(buf: &mut [u8], file_offset: usize) {
 pub(crate) fn trap_all_patch_sites(
     buf: &mut [u8],
     text_sections: &[TextSectionInfo],
+    config: RewriteConfig,
 ) -> Result<usize> {
-    let sites = find_patch_sites(text_sections, buf)?;
+    let sites = find_patch_sites(text_sections, buf, config)?;
     for site in &sites {
         trap_site(buf, site.file_offset);
     }
@@ -1314,6 +2474,238 @@ fn emit_mrs_gate(
     Ok(GateBuild::Emitted)
 }
 
+fn emit_x18_gate(
+    trampoline_data: &mut Vec<u8>,
+    gate_offset: usize,
+    trampoline_base_addr: u64,
+    site: &PatchSite,
+    transformation: X18Substitution,
+    host: Host,
+) -> Result<GateBuild> {
+    let X18Substitution {
+        mut word,
+        scratch,
+        anchor_scratch,
+        pc_relative,
+    } = transformation;
+    let gate_vaddr = checked_add_u64(trampoline_base_addr, gate_offset as u64, "x18 gate")?;
+    let mut asm = Asm::new(gate_vaddr);
+
+    asm.emit(Insn::StpPre {
+        rt: scratch,
+        rt2: anchor_scratch,
+        rn: SP,
+        imm_bytes: -(X18_FRAME_BYTES.cast_signed()),
+    });
+    asm.emit(host.anchor_read(anchor_scratch));
+    asm.emit(Insn::LdrUimm {
+        rt: scratch,
+        rn: anchor_scratch,
+        imm_bytes: GUEST_X18_OFFSET_PLACEHOLDER,
+    });
+    asm.emit(Insn::AddImm {
+        rd: anchor_scratch,
+        rn: SP,
+        imm12: 0,
+    });
+    asm.emit(Insn::AddSp(X18_FRAME_BYTES));
+    if let Some(pc_relative) = pc_relative {
+        let transformed_pc = asm.here()?;
+        let relocated = match pc_relative {
+            X18PcRelative::Adr(target) => Insn::Adr {
+                rd: scratch,
+                byte_off: target
+                    .cast_signed()
+                    .saturating_sub(transformed_pc.cast_signed()),
+            },
+            X18PcRelative::Adrp(target) => Insn::Adrp {
+                rd: scratch,
+                page_off: (target & !PAGE_OFFSET_MASK)
+                    .cast_signed()
+                    .saturating_sub((transformed_pc & !PAGE_OFFSET_MASK).cast_signed())
+                    >> 12,
+            },
+        }
+        .encode();
+        let Some(relocated) = relocated else {
+            return Ok(GateBuild::Unreachable);
+        };
+        word = relocated;
+    }
+    asm.push_word(word);
+
+    // The transformed instruction excludes both scratches. The anchor scratch
+    // can therefore carry the frame address while original SP is live.
+    asm.emit(Insn::AddImm {
+        rd: SP,
+        rn: anchor_scratch,
+        imm12: 0,
+    });
+    asm.emit(host.anchor_read(anchor_scratch));
+    asm.emit(Insn::StrUimm {
+        rt: scratch,
+        rn: anchor_scratch,
+        imm_bytes: GUEST_X18_OFFSET_PLACEHOLDER,
+    });
+    asm.emit(Insn::LdpPost {
+        rt: scratch,
+        rt2: anchor_scratch,
+        rn: SP,
+        imm_bytes: X18_FRAME_BYTES.cast_signed(),
+    });
+    let return_addr = checked_add_u64(site.vaddr, INSN_BYTES_U64, "x18 return")?;
+    if !asm.branch_to(return_addr)? {
+        return Ok(GateBuild::Unreachable);
+    }
+    append_gate_slot(
+        trampoline_data,
+        asm.finish(),
+        trampoline_base_addr,
+        gate_vaddr,
+        GateMetadata::X18 { scratch },
+        X18_SLOT_BYTES,
+    )?;
+    Ok(GateBuild::Emitted)
+}
+
+fn emit_x18_compare_branch_gate(
+    trampoline_data: &mut Vec<u8>,
+    gate_offset: usize,
+    trampoline_base_addr: u64,
+    site: &PatchSite,
+    branch: X18CompareBranch,
+    host: Host,
+) -> Result<GateBuild> {
+    let gate_vaddr = checked_add_u64(
+        trampoline_base_addr,
+        gate_offset as u64,
+        "x18 compare-branch gate",
+    )?;
+    let mut asm = Asm::new(gate_vaddr);
+    asm.emit(Insn::SubSp(X18_FRAME_BYTES));
+    asm.emit(Insn::Stp {
+        rt: branch.scratch,
+        rt2: branch.anchor_scratch,
+        rn: SP,
+        imm_bytes: X18_FRAME_OFF_SCRATCHES.cast_signed(),
+    });
+    asm.emit(host.anchor_read(branch.anchor_scratch));
+    asm.emit(Insn::LdrUimm {
+        rt: branch.scratch,
+        rn: branch.anchor_scratch,
+        imm_bytes: GUEST_X18_OFFSET_PLACEHOLDER,
+    });
+    asm.emit(match branch.kind {
+        X18BranchKind::CbzW => Insn::CbzW {
+            rt: branch.scratch,
+            offset: 16,
+        },
+        X18BranchKind::CbzX => Insn::CbzX {
+            rt: branch.scratch,
+            offset: 16,
+        },
+        X18BranchKind::CbnzW => Insn::CbnzW {
+            rt: branch.scratch,
+            offset: 16,
+        },
+        X18BranchKind::CbnzX => Insn::CbnzX {
+            rt: branch.scratch,
+            offset: 16,
+        },
+        X18BranchKind::Tbz(bit) => Insn::TestBranch {
+            rt: branch.scratch,
+            bit,
+            offset: 16,
+            nonzero: false,
+        },
+        X18BranchKind::Tbnz(bit) => Insn::TestBranch {
+            rt: branch.scratch,
+            bit,
+            offset: 16,
+            nonzero: true,
+        },
+    });
+    for target in [
+        checked_add_u64(site.vaddr, INSN_BYTES_U64, "x18 branch fallthrough")?,
+        branch.target,
+    ] {
+        asm.emit(Insn::Ldp {
+            rt: branch.scratch,
+            rt2: branch.anchor_scratch,
+            rn: SP,
+            imm_bytes: X18_FRAME_OFF_SCRATCHES.cast_signed(),
+        });
+        asm.emit(Insn::AddSp(X18_FRAME_BYTES));
+        if !asm.branch_to(target)? {
+            return Ok(GateBuild::Unreachable);
+        }
+    }
+    append_gate_slot(
+        trampoline_data,
+        asm.finish(),
+        trampoline_base_addr,
+        gate_vaddr,
+        GateMetadata::X18CompareBranch {
+            scratch: branch.scratch,
+        },
+        X18_COMPARE_BRANCH_SLOT_BYTES,
+    )?;
+    Ok(GateBuild::Emitted)
+}
+
+fn emit_x18_adr_gate(
+    trampoline_data: &mut Vec<u8>,
+    gate_offset: usize,
+    trampoline_base_addr: u64,
+    site: &PatchSite,
+    adr: X18Adr,
+    host: Host,
+) -> Result<GateBuild> {
+    let gate_vaddr = checked_add_u64(trampoline_base_addr, gate_offset as u64, "ADR X18 gate")?;
+    let mut asm = Asm::new(gate_vaddr);
+    asm.emit(Insn::StpPre {
+        rt: adr.scratch,
+        rt2: adr.anchor_scratch,
+        rn: SP,
+        imm_bytes: -(X18_FRAME_BYTES.cast_signed()),
+    });
+    asm.emit(host.anchor_read(adr.anchor_scratch));
+    if !asm.adrp(adr.scratch, adr.target)? {
+        return Ok(GateBuild::Unreachable);
+    }
+    asm.emit(Insn::AddImm {
+        rd: adr.scratch,
+        rn: adr.scratch,
+        imm12: (adr.target & PAGE_OFFSET_MASK) as u16,
+    });
+    asm.emit(Insn::StrUimm {
+        rt: adr.scratch,
+        rn: adr.anchor_scratch,
+        imm_bytes: GUEST_X18_OFFSET_PLACEHOLDER,
+    });
+    asm.emit(Insn::LdpPost {
+        rt: adr.scratch,
+        rt2: adr.anchor_scratch,
+        rn: SP,
+        imm_bytes: X18_FRAME_BYTES.cast_signed(),
+    });
+    let return_addr = checked_add_u64(site.vaddr, INSN_BYTES_U64, "ADR X18 return")?;
+    if !asm.branch_to(return_addr)? {
+        return Ok(GateBuild::Unreachable);
+    }
+    append_gate_slot(
+        trampoline_data,
+        asm.finish(),
+        trampoline_base_addr,
+        gate_vaddr,
+        GateMetadata::X18Adr {
+            scratch: adr.scratch,
+        },
+        X18_ADR_SLOT_BYTES,
+    )?;
+    Ok(GateBuild::Emitted)
+}
+
 fn append_gate_slot(
     trampoline_data: &mut Vec<u8>,
     mut code: Vec<u8>,
@@ -1398,6 +2790,15 @@ fn validate_gate_slot_inner(
     slot: &[u8],
     addressing: SlotAddressing,
     metadata: GateMetadata,
+) -> bool {
+    validate_gate_slot_inner_for_host(slot, addressing, metadata, None)
+}
+
+fn validate_gate_slot_inner_for_host(
+    slot: &[u8],
+    addressing: SlotAddressing,
+    metadata: GateMetadata,
+    host: Option<Host>,
 ) -> bool {
     let slot_size = metadata.slot_size();
     // Both variants' positions are 16-byte aligned by construction, because the
@@ -1574,6 +2975,173 @@ fn validate_gate_slot_inner(
                 }
                 && padding_is_nops(40)
         }
+        GateMetadata::X18 { scratch } => {
+            let anchor_scratch = ((word(0) >> RT2_SHIFT) & REG_MASK) as u8;
+            if !(7..=17).contains(&anchor_scratch) || anchor_scratch == scratch {
+                return false;
+            }
+            exact(
+                0,
+                Insn::StpPre {
+                    rt: scratch,
+                    rt2: anchor_scratch,
+                    rn: SP,
+                    imm_bytes: -(X18_FRAME_BYTES.cast_signed()),
+                },
+            ) && is_host_anchor_read(
+                word(X18GateOffset::FirstAnchor.as_usize()),
+                anchor_scratch,
+                host,
+            ) && is_x18_access(
+                word(X18GateOffset::SlotLoad.as_usize()),
+                Opcode::LdrUimm,
+                scratch,
+                anchor_scratch,
+            ) && exact(
+                X18GateOffset::FrameAddress.as_usize(),
+                Insn::AddImm {
+                    rd: anchor_scratch,
+                    rn: SP,
+                    imm12: 0,
+                },
+            ) && exact(
+                X18GateOffset::FirstPop.as_usize(),
+                Insn::AddSp(X18_FRAME_BYTES),
+            ) && exact(
+                X18GateOffset::RestoreSp.as_usize(),
+                Insn::AddImm {
+                    rd: SP,
+                    rn: anchor_scratch,
+                    imm12: 0,
+                },
+            ) && is_host_anchor_read(
+                word(X18GateOffset::SecondAnchor.as_usize()),
+                anchor_scratch,
+                host,
+            ) && word(X18GateOffset::FirstAnchor.as_usize())
+                == word(X18GateOffset::SecondAnchor.as_usize())
+                && is_x18_access(
+                    word(X18GateOffset::SlotStore.as_usize()),
+                    Opcode::StrUimm,
+                    scratch,
+                    anchor_scratch,
+                )
+                && exact(
+                    X18GateOffset::RestoreRegisters.as_usize(),
+                    Insn::LdpPost {
+                        rt: scratch,
+                        rt2: anchor_scratch,
+                        rn: SP,
+                        imm_bytes: X18_FRAME_BYTES.cast_signed(),
+                    },
+                )
+                && word(X18GateOffset::Return.as_usize()) & OPCODE_TOP6_MASK == Opcode::B.bits()
+                && padding_is_nops(X18GateOffset::ExecutableEnd.as_usize())
+        }
+        GateMetadata::X18CompareBranch { scratch } => {
+            let anchor_scratch = ((word(4) >> RT2_SHIFT) & REG_MASK) as u8;
+            if !(7..=17).contains(&anchor_scratch) || anchor_scratch == scratch {
+                return false;
+            }
+            exact(0, Insn::SubSp(X18_FRAME_BYTES))
+                && exact(
+                    4,
+                    Insn::Stp {
+                        rt: scratch,
+                        rt2: anchor_scratch,
+                        rn: SP,
+                        imm_bytes: 0,
+                    },
+                )
+                && is_host_anchor_read(word(8), anchor_scratch, host)
+                && is_x18_access(word(12), Opcode::LdrUimm, scratch, anchor_scratch)
+                && ([
+                    Insn::CbnzW {
+                        rt: scratch,
+                        offset: 16,
+                    },
+                    Insn::CbzW {
+                        rt: scratch,
+                        offset: 16,
+                    },
+                    Insn::CbnzX {
+                        rt: scratch,
+                        offset: 16,
+                    },
+                    Insn::CbzX {
+                        rt: scratch,
+                        offset: 16,
+                    },
+                ]
+                .into_iter()
+                .any(|instruction| exact(16, instruction))
+                    || (0..64).any(|bit| {
+                        [false, true].into_iter().any(|nonzero| {
+                            exact(
+                                16,
+                                Insn::TestBranch {
+                                    rt: scratch,
+                                    bit,
+                                    offset: 16,
+                                    nonzero,
+                                },
+                            )
+                        })
+                    }))
+                && exact(
+                    20,
+                    Insn::Ldp {
+                        rt: scratch,
+                        rt2: anchor_scratch,
+                        rn: SP,
+                        imm_bytes: 0,
+                    },
+                )
+                && exact(24, Insn::AddSp(X18_FRAME_BYTES))
+                && word(28) & OPCODE_TOP6_MASK == Opcode::B.bits()
+                && exact(
+                    32,
+                    Insn::Ldp {
+                        rt: scratch,
+                        rt2: anchor_scratch,
+                        rn: SP,
+                        imm_bytes: 0,
+                    },
+                )
+                && exact(36, Insn::AddSp(X18_FRAME_BYTES))
+                && word(40) & OPCODE_TOP6_MASK == Opcode::B.bits()
+        }
+        GateMetadata::X18Adr { scratch } => {
+            let anchor_scratch = ((word(0) >> RT2_SHIFT) & REG_MASK) as u8;
+            let adrp = word(8);
+            let add = word(12);
+            if !(7..=17).contains(&anchor_scratch) || anchor_scratch == scratch {
+                return false;
+            }
+            exact(
+                0,
+                Insn::StpPre {
+                    rt: scratch,
+                    rt2: anchor_scratch,
+                    rn: SP,
+                    imm_bytes: -(X18_FRAME_BYTES.cast_signed()),
+                },
+            ) && is_host_anchor_read(word(4), anchor_scratch, host)
+                && adrp & ADRP_SHAPE_MASK == Opcode::Adrp.bits() | u32::from(scratch)
+                && add & ADD_IMM_SHAPE_MASK
+                    == Opcode::AddImm.bits() | (u32::from(scratch) << RN_SHIFT) | u32::from(scratch)
+                && is_x18_access(word(16), Opcode::StrUimm, scratch, anchor_scratch)
+                && exact(
+                    20,
+                    Insn::LdpPost {
+                        rt: scratch,
+                        rt2: anchor_scratch,
+                        rn: SP,
+                        imm_bytes: X18_FRAME_BYTES.cast_signed(),
+                    },
+                )
+                && word(24) & OPCODE_TOP6_MASK == Opcode::B.bits()
+        }
     }
 }
 
@@ -1584,6 +3152,9 @@ impl GateMetadata {
             GateMetadata::Svc => SVC_SLOT_BYTES,
             GateMetadata::MrsTpidr { .. } => MRS_SLOT_BYTES,
             GateMetadata::MsrTpidr { .. } => MSR_SLOT_BYTES,
+            GateMetadata::X18 { .. } => X18_SLOT_BYTES,
+            GateMetadata::X18CompareBranch { .. } => X18_COMPARE_BRANCH_SLOT_BYTES,
+            GateMetadata::X18Adr { .. } => X18_ADR_SLOT_BYTES,
         }
     }
 
@@ -1601,6 +3172,9 @@ impl GateMetadata {
             // Frame teardown ends at 28, then the `B` back at 32. The second
             // `B` at 36 never executes, so a PC there is not a live gate PC.
             GateMetadata::MsrTpidr { .. } => 36,
+            GateMetadata::X18 { .. } => X18GateOffset::ExecutableEnd.as_usize(),
+            GateMetadata::X18CompareBranch { .. } => 44,
+            GateMetadata::X18Adr { .. } => 28,
         }
     }
 
@@ -1611,6 +3185,9 @@ impl GateMetadata {
             GateMetadata::Svc => 44,
             GateMetadata::MrsTpidr { .. } => 8,
             GateMetadata::MsrTpidr { .. } => 32,
+            GateMetadata::X18 { .. } => X18GateOffset::Return.as_usize(),
+            GateMetadata::X18CompareBranch { .. } => 28,
+            GateMetadata::X18Adr { .. } => 24,
         }
     }
 
@@ -1618,10 +3195,9 @@ impl GateMetadata {
     /// effect. A saved PC names the instruction about to execute, so past this
     /// offset the effect has happened.
     ///
-    /// This says when the effect lands, not that the context is rewindable
-    /// before it. Only [`GateMetadata::MsrTpidr`] is, from its spill frame.
-    /// [`GateMetadata::MrsTpidr`] destroys the register a rewind would restore,
-    /// so every PC inside it is carried forward instead.
+    /// This says when the effect lands, not whether signal canonicalization
+    /// rewinds or carries the gate forward. That decision also depends on the
+    /// gate kind and recoverable spill-frame state.
     pub const fn commit_offset(self) -> usize {
         match self {
             // The shim performs the syscall, so any PC in an `SVC` slot is
@@ -1632,6 +3208,8 @@ impl GateMetadata {
             GateMetadata::MrsTpidr { .. } => 4,
             // The guest-TLS store.
             GateMetadata::MsrTpidr { .. } => 20,
+            GateMetadata::X18 { .. } => X18GateOffset::Transform.as_usize(),
+            GateMetadata::X18CompareBranch { .. } | GateMetadata::X18Adr { .. } => 16,
         }
     }
 }
@@ -1650,7 +3228,9 @@ pub struct ClassifiedGate {
     slot_offset: usize,
     slot_size: u8,
     commit_offset: u8,
+    anchor_scratch: u8,
     original_site: u64,
+    conditional_target: u64,
     metadata: GateMetadata,
 }
 
@@ -1670,9 +3250,25 @@ impl ClassifiedGate {
         self.commit_offset
     }
 
+    pub fn anchor_scratch(self) -> Option<u8> {
+        matches!(
+            self.metadata,
+            GateMetadata::X18 { .. }
+                | GateMetadata::X18CompareBranch { .. }
+                | GateMetadata::X18Adr { .. }
+        )
+        .then_some(self.anchor_scratch)
+    }
+
     /// Original guest instruction address recovered from the return branch.
     pub fn original_site(self) -> u64 {
         self.original_site
+    }
+
+    /// Original taken target of a conditional x18 gate.
+    pub fn conditional_target(self) -> Option<u64> {
+        matches!(self.metadata, GateMetadata::X18CompareBranch { .. })
+            .then_some(self.conditional_target)
     }
 
     /// Decoded semantic gate metadata.
@@ -1681,7 +3277,7 @@ impl ClassifiedGate {
     }
 }
 
-/// Classify an AArch64 trampoline PC by testing at most four aligned candidate
+/// Classifies a Linux-host AArch64 trampoline PC by testing aligned candidate
 /// slot starts and requiring exactly one exact-template match.
 pub fn classify_gate_pc(
     trampoline: &[u8],
@@ -1693,11 +3289,12 @@ pub fn classify_gate_pc(
     }
     let relative = usize::try_from(pc.checked_sub(trampoline_base)?).ok()?;
     let aligned = relative & !(GATE_ALIGNMENT - 1);
-    let candidates = core::array::from_fn(|index| aligned.saturating_sub(index * GATE_ALIGNMENT));
+    let candidates: [usize; GATE_PC_CANDIDATE_COUNT] =
+        core::array::from_fn(|index| aligned.saturating_sub(index * GATE_ALIGNMENT));
     classify_gate_pc_with_candidates(trampoline, trampoline_base, pc, candidates)
 }
 
-/// Classifies one fault-safely copied compact slot containing `pc`.
+/// Classifies one Linux-host, fault-safely copied compact slot containing `pc`.
 ///
 /// The caller is responsible for selecting candidate slot starts and for
 /// requiring exactly one match. Keeping that policy outside this pure helper
@@ -1718,13 +3315,25 @@ pub fn classify_copied_gate_slot(slot: &[u8], slot_vaddr: u64, pc: u64) -> Optio
             u32::from_le_bytes(slot.get(28..32)?.try_into().ok()?),
             slot_vaddr + 28,
         )?,
-        GateMetadata::MrsTpidr { .. } | GateMetadata::MsrTpidr { .. } => 0,
+        GateMetadata::MrsTpidr { .. }
+        | GateMetadata::MsrTpidr { .. }
+        | GateMetadata::X18 { .. }
+        | GateMetadata::X18CompareBranch { .. }
+        | GateMetadata::X18Adr { .. } => 0,
     };
     // For `Svc` the base was just recovered from the slot's own literal load,
     // so `validate_gate_slot`'s callback check is a tautology here. The other
     // template checks still do real work; this is structural recognition, not
     // authentication.
-    if !validate_gate_slot(slot, trampoline_base, slot_vaddr, metadata) {
+    if !validate_gate_slot_inner_for_host(
+        slot,
+        SlotAddressing::Placed {
+            trampoline_base,
+            slot_vaddr,
+        },
+        metadata,
+        Some(Host::Linux),
+    ) {
         return None;
     }
     let return_offset = metadata.return_offset();
@@ -1736,20 +3345,35 @@ pub fn classify_copied_gate_slot(slot: &[u8], slot_vaddr: u64, pc: u64) -> Optio
         ),
         slot_vaddr + return_offset as u64,
     )?;
+    let conditional_target = if matches!(metadata, GateMetadata::X18CompareBranch { .. }) {
+        decode_branch_target(
+            u32::from_le_bytes(slot[40..44].try_into().ok()?),
+            slot_vaddr + 40,
+        )?
+    } else {
+        0
+    };
     Some(ClassifiedGate {
         slot_offset: 0,
         slot_size: u8::try_from(slot.len()).ok()?,
         commit_offset: u8::try_from(metadata.commit_offset()).ok()?,
+        anchor_scratch: match metadata {
+            GateMetadata::X18 { .. }
+            | GateMetadata::X18CompareBranch { .. }
+            | GateMetadata::X18Adr { .. } => x18_anchor_scratch(slot, metadata)?,
+            _ => 0,
+        },
         original_site: return_target.checked_sub(4)?,
+        conditional_target,
         metadata,
     })
 }
 
-fn classify_gate_pc_with_candidates(
+fn classify_gate_pc_with_candidates<const N: usize>(
     trampoline: &[u8],
     trampoline_base: u64,
     pc: u64,
-    candidates: [usize; 4],
+    candidates: [usize; N],
 ) -> Option<ClassifiedGate> {
     let relative = usize::try_from(pc.checked_sub(trampoline_base)?).ok()?;
     let mut match_found = None;
@@ -1757,7 +3381,7 @@ fn classify_gate_pc_with_candidates(
         if start < GATES_START_OFFSET || !start.is_multiple_of(GATE_ALIGNMENT) {
             continue;
         }
-        for slot_size in [MRS_SLOT_BYTES, MSR_SLOT_BYTES, SVC_SLOT_BYTES] {
+        for slot_size in GATE_SLOT_SIZES {
             let end = start.checked_add(slot_size)?;
             if relative < start || relative >= end || end > trampoline.len() {
                 continue;
@@ -1773,7 +3397,15 @@ fn classify_gate_pc_with_candidates(
             // decoded metadata's layout accessors apply to these bytes.
             if metadata.slot_size() != slot_size
                 || relative >= start + metadata.executable_end()
-                || !validate_gate_slot(slot, trampoline_base, slot_vaddr, metadata)
+                || !validate_gate_slot_inner_for_host(
+                    slot,
+                    SlotAddressing::Placed {
+                        trampoline_base,
+                        slot_vaddr,
+                    },
+                    metadata,
+                    Some(Host::Linux),
+                )
             {
                 continue;
             }
@@ -1789,11 +3421,26 @@ fn classify_gate_pc_with_candidates(
                 ),
                 slot_vaddr + return_offset as u64,
             )?;
+            let conditional_target = if matches!(metadata, GateMetadata::X18CompareBranch { .. }) {
+                decode_branch_target(
+                    u32::from_le_bytes(slot[40..44].try_into().ok()?),
+                    slot_vaddr + 40,
+                )?
+            } else {
+                0
+            };
             match_found = Some(ClassifiedGate {
                 slot_offset: start,
                 slot_size: u8::try_from(slot_size).ok()?,
                 commit_offset: u8::try_from(metadata.commit_offset()).ok()?,
+                anchor_scratch: match metadata {
+                    GateMetadata::X18 { .. }
+                    | GateMetadata::X18CompareBranch { .. }
+                    | GateMetadata::X18Adr { .. } => x18_anchor_scratch(slot, metadata)?,
+                    _ => 0,
+                },
                 original_site: return_target.checked_sub(4)?,
+                conditional_target,
                 metadata,
             });
         }
@@ -1809,10 +3456,48 @@ fn is_tpidr_access(word: u32, opcode: Opcode, rt: u8, rn: u8) -> bool {
     valid_emitted_tpidr_offset(encoded * u32::from(GUEST_TPIDR_OFFSET_ALIGN))
 }
 
+fn is_x18_access(word: u32, opcode: Opcode, rt: u8, rn: u8) -> bool {
+    word & !LDST_UIMM12_IMM_MASK == opcode.bits() | (u32::from(rn) << RN_SHIFT) | u32::from(rt)
+        && valid_emitted_x18_offset(
+            ((word & LDST_UIMM12_IMM_MASK) >> LDST_UIMM12_IMM_SHIFT)
+                * u32::from(GUEST_TPIDR_OFFSET_ALIGN),
+        )
+}
+
+fn is_host_anchor_read(word: u32, register: u8, host: Option<Host>) -> bool {
+    host.map_or_else(
+        || {
+            [Host::Linux, Host::MacOs, Host::Windows]
+                .into_iter()
+                .any(|host| host.anchor_read(register).encode() == Some(word))
+        },
+        |host| host.anchor_read(register).encode() == Some(word),
+    )
+}
+
+fn x18_anchor_scratch(slot: &[u8], metadata: GateMetadata) -> Option<u8> {
+    let offset = match metadata {
+        GateMetadata::X18 { .. } | GateMetadata::X18Adr { .. } => 0,
+        GateMetadata::X18CompareBranch { .. } => 4,
+        _ => return None,
+    };
+    Some(
+        ((u32::from_le_bytes(slot[offset..offset + 4].try_into().ok()?) >> RT2_SHIFT) & REG_MASK)
+            as u8,
+    )
+}
+
 fn valid_emitted_tpidr_offset(offset: u32) -> bool {
     offset == u32::from(GUEST_TPIDR_OFFSET_PLACEHOLDER)
         || (offset.is_multiple_of(u32::from(GUEST_TPIDR_OFFSET_ALIGN))
             && (u32::from(MIN_GUEST_TPIDR_OFFSET)..u32::from(GUEST_TPIDR_OFFSET_PLACEHOLDER))
+                .contains(&offset))
+}
+
+fn valid_emitted_x18_offset(offset: u32) -> bool {
+    offset == u32::from(GUEST_X18_OFFSET_PLACEHOLDER)
+        || (offset.is_multiple_of(u32::from(GUEST_TPIDR_OFFSET_ALIGN))
+            && (u32::from(MIN_GUEST_TPIDR_OFFSET)..u32::from(GUEST_X18_OFFSET_PLACEHOLDER))
                 .contains(&offset))
 }
 
@@ -1845,46 +3530,86 @@ fn decode_ldr_literal_target(word: u32, pc: u64) -> Option<u64> {
 }
 
 fn decode_adrp_add_target(adrp: u32, add: u32, pc: u64) -> Option<u64> {
-    if adrp & ADRP_SHAPE_MASK != Opcode::Adrp.bits() | u32::from(X16)
-        || add & ADD_IMM_SHAPE_MASK
-            != Opcode::AddImm.bits() | (u32::from(X16) << RN_SHIFT) | u32::from(X16)
+    decode_adrp_add_target_for(adrp, add, pc, X16)
+}
+
+fn decode_adrp_add_target_for(adrp: u32, add: u32, pc: u64, register: u8) -> Option<u64> {
+    let page = decode_adrp_target(adrp, pc, register)?;
+    if add & ADD_IMM_SHAPE_MASK
+        != Opcode::AddImm.bits() | (u32::from(register) << RN_SHIFT) | u32::from(register)
     {
+        return None;
+    }
+    page.checked_add(u64::from(add >> RT2_SHIFT) & PAGE_OFFSET_MASK)
+}
+
+fn decode_adrp_target(adrp: u32, pc: u64, rd: u8) -> Option<u64> {
+    if adrp & ADRP_SHAPE_MASK != Opcode::Adrp.bits() | u32::from(rd) {
         return None;
     }
     let immlo = i64::from((adrp >> ADR_IMMLO_SHIFT) & ADR_IMMLO_MASK);
     let immhi = i64::from((adrp >> RN_SHIFT) & IMM19_MASK);
     let imm21 = (immhi << 2) | immlo;
     let page_delta = sign_extend(imm21, IMM21_BITS) << ADRP_PAGE_SHIFT;
-    let page = (pc & !PAGE_OFFSET_MASK).checked_add_signed(page_delta)?;
-    page.checked_add(u64::from(add >> RT2_SHIFT) & PAGE_OFFSET_MASK)
+    (pc & !PAGE_OFFSET_MASK).checked_add_signed(page_delta)
 }
 
 // ============================================================
 // Load-time guest thread-pointer offset patching
 // ============================================================
 
-/// Bits \[31:10] of an unsigned-offset load/store: everything except `Rn`
-/// (\[9:5]) and `Rt` (\[4:0]), i.e. the opcode *and* the scaled `imm12`.
-const LDST_UIMM12_OPCODE_AND_IMM_MASK: u32 = 0xFFFF_FC00;
 /// The scaled 12-bit immediate field of an unsigned-offset load/store, \[21:10].
 const LDST_UIMM12_IMM_MASK: u32 = 0x003F_FC00;
 /// Bit position of that immediate field.
 const LDST_UIMM12_IMM_SHIFT: u32 = 10;
 
-/// Patches every gate and fails if any executable placeholder remains.
+/// Validates and patches every thread-pointer gate in a Linux-host trampoline.
+/// Trampolines containing x18 gates must use
+/// [`finalize_trampoline_gates_with_x18`].
 ///
 /// # Errors
 ///
-/// Propagates errors from [`patch_guest_tpidr_offset`] and fails if any
-/// placeholder survives.
+/// Rejects invalid offsets, malformed slots, unexpected field values, and x18
+/// gates before mutating the trampoline.
 pub fn finalize_trampoline_gates(trampoline: &mut [u8], offset: u16) -> Result<()> {
-    patch_guest_tpidr_offset(trampoline, offset)?;
-    if let Some(at) = find_guest_tpidr_placeholder(trampoline) {
+    if !is_patchable_guest_tpidr_offset(offset) {
         return Err(Error::TrampolinePatchFailure(format!(
-            "trampoline byte {at} still holds the guest thread-pointer placeholder after patching \
-             with offset {offset}"
+            "guest thread-pointer offset {offset} is not a legitimate gate target"
         )));
     }
+    let validation = validate_trampoline_and_collect_offsets(trampoline, offset, false)?;
+    if validation.has_x18_gate {
+        return Err(Error::TrampolinePatchFailure(
+            "AArch64 trampoline contains x18 gates or placeholders; use \
+             finalize_trampoline_gates_with_x18"
+                .into(),
+        ));
+    }
+    patch_offset_words(trampoline, &validation.patch_offsets, offset);
+    Ok(())
+}
+
+/// Finalizes both anchor-relative guest slots in a Linux-host trampoline.
+/// Validation happens against a copy so an invalid offset cannot partially
+/// patch the caller's trampoline.
+pub fn finalize_trampoline_gates_with_x18(
+    trampoline: &mut [u8],
+    guest_tpidr_offset: u16,
+    guest_x18_offset: u16,
+) -> Result<()> {
+    let expected_x18_offset = usize::from(guest_tpidr_offset)
+        .checked_add(GUEST_X18_OFFSET_FROM_GUEST_TP)
+        .and_then(|offset| u16::try_from(offset).ok());
+    if expected_x18_offset != Some(guest_x18_offset) {
+        return Err(Error::TrampolinePatchFailure(format!(
+            "guest x18 offset {guest_x18_offset} does not immediately follow guest thread-pointer \
+             offset {guest_tpidr_offset}"
+        )));
+    }
+    let mut staged = trampoline.to_vec();
+    patch_guest_tpidr_offset_inner(&mut staged, guest_tpidr_offset, true)?;
+    patch_guest_x18_offset(&mut staged, guest_x18_offset)?;
+    trampoline.copy_from_slice(&staged);
     Ok(())
 }
 
@@ -1895,6 +3620,13 @@ pub fn finalize_trampoline_gates(trampoline: &mut [u8], offset: u16) -> Result<(
 pub fn is_patchable_guest_tpidr_offset(offset: u16) -> bool {
     offset.is_multiple_of(GUEST_TPIDR_OFFSET_ALIGN)
         && (MIN_GUEST_TPIDR_OFFSET..GUEST_TPIDR_OFFSET_PLACEHOLDER).contains(&offset)
+}
+
+/// Whether an x18 gate can be patched to reach `offset` without retaining a
+/// value reserved for an unpatched placeholder.
+pub fn is_patchable_guest_x18_offset(offset: u16) -> bool {
+    offset.is_multiple_of(GUEST_TPIDR_OFFSET_ALIGN)
+        && (MIN_GUEST_TPIDR_OFFSET..GUEST_X18_OFFSET_PLACEHOLDER).contains(&offset)
 }
 
 /// Rewrites the guest thread-pointer offset in every gate of one emitted
@@ -1912,13 +3644,22 @@ pub fn is_patchable_guest_tpidr_offset(offset: u16) -> bool {
 /// [`MAX_GUEST_TPIDR_OFFSET`], which is reserved as the placeholder. Also fails
 /// if the blob is not a well-formed trampoline: too short for the shared
 /// prologue, not a whole number of instruction words, or holding a placeholder
-/// in a shape no gate emits.
+/// in a metadata-designated field with an unexpected value. Trampolines with
+/// x18 gates must instead use [`finalize_trampoline_gates_with_x18`].
 ///
 /// # Panics
 ///
 /// Panics if a validated slot is shorter than its own metadata word, which the
 /// slot templates make impossible.
 pub fn patch_guest_tpidr_offset(trampoline: &mut [u8], offset: u16) -> Result<usize> {
+    patch_guest_tpidr_offset_inner(trampoline, offset, false)
+}
+
+fn patch_guest_tpidr_offset_inner(
+    trampoline: &mut [u8],
+    offset: u16,
+    allow_x18: bool,
+) -> Result<usize> {
     if !is_patchable_guest_tpidr_offset(offset) {
         return Err(Error::TrampolinePatchFailure(format!(
             "guest thread-pointer offset {offset} is not a legitimate gate target: it must be a \
@@ -1929,7 +3670,13 @@ pub fn patch_guest_tpidr_offset(trampoline: &mut [u8], offset: u16) -> Result<us
         )));
     }
 
-    let patch_offsets = validate_trampoline_and_collect_placeholders(trampoline, offset)?;
+    let validation = validate_trampoline_and_collect_offsets(trampoline, offset, false)?;
+    if validation.has_x18_gate && !allow_x18 {
+        return Err(Error::TrampolinePatchFailure(
+            "AArch64 trampoline contains x18 gates; use finalize_trampoline_gates_with_x18".into(),
+        ));
+    }
+    let patch_offsets = validation.patch_offsets;
     let new_imm = u32::from(offset / GUEST_TPIDR_OFFSET_ALIGN) << LDST_UIMM12_IMM_SHIFT;
     for offset in &patch_offsets {
         let word = &mut trampoline[*offset..*offset + INSN_BYTES];
@@ -1940,17 +3687,43 @@ pub fn patch_guest_tpidr_offset(trampoline: &mut [u8], offset: u16) -> Result<us
     Ok(patch_offsets.len())
 }
 
-/// Validates every slot and returns the offsets of the thread-pointer
-/// instructions still holding the placeholder.
-///
-/// A trampoline arrives from the guest's own file and the slot templates accept
-/// any encodable offset, so a thread-pointer access holding neither the
-/// placeholder nor `expected_offset` is one this rewriter did not put there and
+fn patch_guest_x18_offset(trampoline: &mut [u8], offset: u16) -> Result<usize> {
+    if !is_patchable_guest_x18_offset(offset) {
+        return Err(Error::TrampolinePatchFailure(format!(
+            "guest x18 offset {offset} is not a legitimate gate target"
+        )));
+    }
+    let validation = validate_trampoline_and_collect_offsets(trampoline, offset, true)?;
+    if !validation.has_x18_gate {
+        return Ok(0);
+    }
+    patch_offset_words(trampoline, &validation.patch_offsets, offset);
+    Ok(validation.patch_offsets.len())
+}
+
+fn patch_offset_words(trampoline: &mut [u8], patch_offsets: &[usize], offset: u16) {
+    let new_imm = u32::from(offset / GUEST_TPIDR_OFFSET_ALIGN) << LDST_UIMM12_IMM_SHIFT;
+    for offset in patch_offsets {
+        let word = &mut trampoline[*offset..*offset + INSN_BYTES];
+        let insn = u32::from_le_bytes(word.try_into().expect("four-byte patch offset"));
+        word.copy_from_slice(&((insn & !LDST_UIMM12_IMM_MASK) | new_imm).to_le_bytes());
+    }
+}
+
+struct TrampolineValidation {
+    patch_offsets: Vec<usize>,
+    has_x18_gate: bool,
+}
+
+/// Validates every Linux-host slot, reports whether any x18 gate is present,
+/// and returns metadata-designated fields that still hold the selected
+/// placeholder. A field holding neither the placeholder nor `expected_offset`
 /// is rejected rather than left alone.
-fn validate_trampoline_and_collect_placeholders(
+fn validate_trampoline_and_collect_offsets(
     trampoline: &[u8],
     expected_offset: u16,
-) -> Result<Vec<usize>> {
+    x18: bool,
+) -> Result<TrampolineValidation> {
     if trampoline.len() < GATES_START_OFFSET || !trampoline.len().is_multiple_of(INSN_BYTES) {
         return Err(Error::TrampolinePatchFailure(
             "malformed AArch64 trampoline length".into(),
@@ -1967,9 +3740,10 @@ fn validate_trampoline_and_collect_placeholders(
 
     let mut cursor = GATES_START_OFFSET;
     let mut patch_offsets = Vec::new();
+    let mut has_x18_gate = false;
     while cursor < trampoline.len() {
         let mut matched = None;
-        for slot_size in [MRS_SLOT_BYTES, MSR_SLOT_BYTES, SVC_SLOT_BYTES] {
+        for slot_size in GATE_SLOT_SIZES {
             let Some(end) = cursor
                 .checked_add(slot_size)
                 .filter(|&end| end <= trampoline.len())
@@ -1985,12 +3759,13 @@ fn validate_trampoline_and_collect_placeholders(
                 continue;
             };
             if metadata.slot_size() != slot_size
-                || !validate_gate_slot_inner(
+                || !validate_gate_slot_inner_for_host(
                     &trampoline[cursor..end],
                     SlotAddressing::Unplaced {
                         slot_offset: cursor as u64,
                     },
                     metadata,
+                    Some(Host::Linux),
                 )
             {
                 continue;
@@ -2007,17 +3782,34 @@ fn validate_trampoline_and_collect_placeholders(
                 "malformed AArch64 compact slot at byte {cursor}"
             )));
         };
-        let instruction_offset = match metadata {
-            GateMetadata::MrsTpidr { .. } => Some(cursor + 4),
-            GateMetadata::MsrTpidr { .. } => Some(cursor + 20),
-            GateMetadata::Svc => None,
+        has_x18_gate |= matches!(
+            metadata,
+            GateMetadata::X18 { .. }
+                | GateMetadata::X18CompareBranch { .. }
+                | GateMetadata::X18Adr { .. }
+        );
+        let instruction_offsets: &[usize] = match (metadata, x18) {
+            (GateMetadata::MrsTpidr { .. }, false) => &[cursor + 4],
+            (GateMetadata::MsrTpidr { .. }, false) => &[cursor + 20],
+            (GateMetadata::X18 { .. }, true) => &[
+                cursor + X18GateOffset::SlotLoad.as_usize(),
+                cursor + X18GateOffset::SlotStore.as_usize(),
+            ],
+            (GateMetadata::X18CompareBranch { .. }, true) => &[cursor + 12],
+            (GateMetadata::X18Adr { .. }, true) => &[cursor + 16],
+            _ => &[],
         };
-        if let Some(offset) = instruction_offset {
+        for &offset in instruction_offsets {
             let insn =
                 u32::from_le_bytes(trampoline[offset..offset + INSN_BYTES].try_into().unwrap());
             let encoded = (insn & LDST_UIMM12_IMM_MASK) >> LDST_UIMM12_IMM_SHIFT;
             let gate_offset = encoded * u32::from(GUEST_TPIDR_OFFSET_ALIGN);
-            if gate_offset == u32::from(GUEST_TPIDR_OFFSET_PLACEHOLDER) {
+            let placeholder = if x18 {
+                GUEST_X18_OFFSET_PLACEHOLDER
+            } else {
+                GUEST_TPIDR_OFFSET_PLACEHOLDER
+            };
+            if gate_offset == u32::from(placeholder) {
                 patch_offsets.push(offset);
             } else if gate_offset != u32::from(expected_offset) {
                 return Err(Error::TrampolinePatchFailure(format!(
@@ -2029,43 +3821,43 @@ fn validate_trampoline_and_collect_placeholders(
         }
         cursor = end;
     }
-    Ok(patch_offsets)
+    Ok(TrampolineValidation {
+        patch_offsets,
+        has_x18_gate,
+    })
 }
 
-/// The `imm12` field, already shifted into place, that an unpatched gate's
-/// `LDR`/`STR` carries.
-fn placeholder_imm_field() -> u32 {
-    u32::from(GUEST_TPIDR_OFFSET_PLACEHOLDER / GUEST_TPIDR_OFFSET_ALIGN) << LDST_UIMM12_IMM_SHIFT
-}
-
-/// Byte offset of the first instruction in `trampoline` that still carries the
-/// emitted placeholder, or `None` if no gate is left unpatched. This is the
-/// loader's proof obligation: an unpatched gate does not fault, so its absence
-/// has to be checked rather than assumed.
+/// Byte offset of the first Linux-host gate instruction that still carries the
+/// emitted placeholder.
 ///
-/// Skips the header's callback slot, which is a 64-bit address and could
-/// bit-for-bit resemble a gate instruction. Matches the shape-independent
-/// opcode-and-immediate pattern, so a placeholder-bearing word in a shape no
-/// gate emits is still reported.
-///
-/// # Panics
-///
-/// Panics if a four-byte window fails to convert to an array, which the
-/// chunked iteration makes impossible.
+/// Only metadata-designated thread-pointer fields in validated gate templates
+/// are considered; copied guest instructions cannot create false positives.
+/// This inspection helper also returns `None` for malformed/non-Linux input;
+/// loaders must use the `Result`-returning finalizers for acceptance.
 pub fn find_guest_tpidr_placeholder(trampoline: &[u8]) -> Option<usize> {
-    let placeholder_imm = placeholder_imm_field();
-    let ldr_pattern = Opcode::LdrUimm.bits() | placeholder_imm;
-    let str_pattern = Opcode::StrUimm.bits() | placeholder_imm;
+    find_structured_placeholder(trampoline, false)
+}
 
-    trampoline
-        .get(FIRST_SCANNABLE_OFFSET..)?
-        .chunks_exact(4)
-        .position(|word| {
-            let insn = u32::from_le_bytes(word.try_into().expect("chunks_exact(4) yields 4 bytes"));
-            let opcode_and_imm = insn & LDST_UIMM12_OPCODE_AND_IMM_MASK;
-            opcode_and_imm == ldr_pattern || opcode_and_imm == str_pattern
-        })
-        .map(|index| FIRST_SCANNABLE_OFFSET + index * 4)
+/// Returns the first unfinalized guest-x18 access in a valid Linux-host
+/// trampoline. Returns `None` for malformed/non-Linux input as well as absence;
+/// loaders must use [`finalize_trampoline_gates_with_x18`] for acceptance.
+#[cfg(test)]
+fn find_guest_x18_placeholder(trampoline: &[u8]) -> Option<usize> {
+    find_structured_placeholder(trampoline, true)
+}
+
+fn find_structured_placeholder(trampoline: &[u8], x18: bool) -> Option<usize> {
+    let validation = validate_trampoline_and_collect_offsets(
+        trampoline,
+        if x18 {
+            GUEST_X18_OFFSET_PLACEHOLDER
+        } else {
+            GUEST_TPIDR_OFFSET_PLACEHOLDER
+        },
+        x18,
+    )
+    .ok()?;
+    validation.patch_offsets.into_iter().next()
 }
 
 // ============================================================
@@ -2190,6 +3982,222 @@ mod tests {
     use super::*;
 
     #[test]
+    fn non_linux_rejects_linux_specific_sites_but_accepts_x18_only_scan() {
+        for target in [crate::TargetHost::MacOs, crate::TargetHost::Windows] {
+            let config = RewriteConfig::new(target, true);
+            for word in [SVC_0, MSR_TPIDR_EL0_BITS, MRS_TPIDR_EL0_BITS] {
+                let bytes = word.to_le_bytes();
+                let error = find_patch_sites(
+                    &[TextSectionInfo {
+                        vaddr: 0x1000,
+                        file_offset: 0,
+                        size: 4,
+                    }],
+                    &bytes,
+                    config,
+                )
+                .err()
+                .expect("non-Linux Linux-specific site must fail");
+                assert!(
+                    matches!(error, Error::UnsupportedExecutable(reason) if reason.contains("selected host"))
+                );
+            }
+
+            let bytes = 0x0b12_0063u32.to_le_bytes();
+            let sites = find_patch_sites(
+                &[TextSectionInfo {
+                    vaddr: 0x1000,
+                    file_offset: 0,
+                    size: 4,
+                }],
+                &bytes,
+                config,
+            )
+            .unwrap();
+            assert!(matches!(sites[0].kind, PatchKind::X18(_)));
+        }
+    }
+
+    #[test]
+    fn msr_register_x18_fails_closed_despite_decoder_truncation() {
+        assert!(matches!(
+            classify_x18(0xd51b_4412), // msr fpcr, x18
+            X18Classification::X18(X18TransformResult::Unsupported(
+                X18Unsupported::EncodingLayout
+            ))
+        ));
+        assert_eq!(classify_x18(0xd51b_4402), X18Classification::None); // msr fpcr, x2
+    }
+
+    #[test]
+    fn negative_sp_relative_x18_access_is_rejected() {
+        assert!(matches!(
+            classify_x18(0xf81f_83f2), // stur x18, [sp, #-8]
+            X18Classification::X18(X18TransformResult::Unsupported(
+                X18Unsupported::EncodingLayout
+            ))
+        ));
+    }
+
+    #[test]
+    fn x18_gate_inside_exclusive_sequence_is_rejected() {
+        let scan = |words: &[u32]| {
+            let bytes = words
+                .iter()
+                .flat_map(|word| word.to_le_bytes())
+                .collect::<Vec<_>>();
+            find_patch_sites(
+                &[TextSectionInfo {
+                    vaddr: 0x1000,
+                    file_offset: 0,
+                    size: bytes.len() as u64,
+                }],
+                &bytes,
+                RewriteConfig {
+                    host: Host::Linux,
+                    virtualize_x18: true,
+                },
+            )
+        };
+
+        let error = scan(&[
+            0x885f_fc20, // ldaxr w0, [x1]
+            0x8b12_0063, // add x3, x3, x18
+            0x8804_fc25, // stlxr w4, w5, [x1]
+        ])
+        .err()
+        .expect("x18 gate inside exclusive sequence must fail");
+        assert!(
+            matches!(error, Error::UnsupportedExecutable(reason) if reason.contains("exclusive sequence"))
+        );
+
+        let sites = scan(&[
+            0x885f_fc20, // ldaxr w0, [x1]
+            0x8804_fc25, // stlxr w4, w5, [x1]
+            0x8b12_0063, // add x3, x3, x18
+        ])
+        .unwrap();
+        assert_eq!(sites[0].vaddr, 0x1008);
+    }
+
+    #[test]
+    fn x18_semantics_override_raw_vector_fields() {
+        for word in [0xaa00_03f2, 0x0b12_0063] {
+            assert!(
+                matches!(
+                    classify_x18(word),
+                    X18Classification::X18(X18TransformResult::Supported(_))
+                ),
+                "word {word:#010x}"
+            );
+        }
+        for word in [
+            0x4eb2_1e50, // mov v16.16b, v18.16b
+            0x1400_0012, // b .+72
+        ] {
+            assert_eq!(classify_x18(word), X18Classification::None);
+        }
+    }
+
+    #[test]
+    fn x18_required_register_field_table() {
+        for (word, transformed) in [
+            (0xaa00_03f2, 0xaa00_03f1), // Rd
+            (0xaa12_03e0, 0xaa11_03e0), // Rm
+            (0x0b12_0063, 0x0b11_0063), // ADD Rm
+            (0xf940_0642, 0xf940_0622), // memory base
+            (0xf832_7824, 0xf831_7824), // memory index
+            (0xa906_4bee, 0xa906_47ee), // Rt2
+            (0x9b08_486b, 0x9b08_446b), // MADD Ra
+            (0x9b12_8c41, 0x9b11_8c41), // MSUB Rm
+            (0x9b25_48a4, 0x9b25_44a4), // SMADDL Ra
+            (0x9b32_8c41, 0x9b31_8c41), // SMSUBL Rm
+            (0x9ba3_4841, 0x9ba3_4441), // UMADDL Ra
+            (0x9bb2_8c41, 0x9bb1_8c41), // UMSUBL Rm
+            (0xfa5e_1244, 0xfa5e_1224), // CCMP Rn
+            (0x7a52_1344, 0x7a51_1344), // CCMP Rm
+            (0xba52_1244, 0xba51_1224), // CCMN Rn/Rm
+            (0x9ad2_25d2, 0x9ad1_25d1), // shift Rd/Rm
+            (0x1a92_1146, 0x1a91_1146), // CSEL Rm
+            (0x93d2_4e41, 0x93d1_4e21), // EXTR Rn/Rm
+            (0x9bd2_7ce4, 0x9bd1_7ce4), // UMULH Rm
+            (0x9b52_7ce4, 0x9b51_7ce4), // SMULH Rm
+        ] {
+            assert_eq!(
+                substitute_x18(word, 17),
+                Some(transformed),
+                "word {word:#010x}"
+            );
+        }
+    }
+
+    #[test]
+    fn x18_decoder_failure_fallback_table() {
+        for (word, expected) in [
+            (
+                0xffff_fff2,
+                X18Classification::X18(X18TransformResult::Unsupported(
+                    X18Unsupported::DecodeFailure,
+                )),
+            ),
+            (0xffff_ffff, X18Classification::None),
+            (0x0420_e3e7, X18Classification::None), // SVE cntb
+            (0x2522_1ce1, X18Classification::None), // SVE whilelo
+            (0x04e1_0012, X18Classification::None), // SVE add z18.d, z0.d, z1.d
+            (0xa400_a020, X18Classification::None), // SVE ld1b
+            (0xe400_e060, X18Classification::None), // SVE st1b
+            (
+                0xa5e0_a240, // SVE ld1d { z0.d }, p0/z, [x18]
+                X18Classification::X18(X18TransformResult::Unsupported(
+                    X18Unsupported::DecodeFailure,
+                )),
+            ),
+        ] {
+            assert_eq!(classify_x18(word), expected, "word {word:#010x}");
+        }
+    }
+
+    #[test]
+    fn decoder_fallback_does_not_treat_mov_immediate_as_x18() {
+        assert_eq!(classify_x18(0x5280_0028), X18Classification::None); // mov w8, #1
+    }
+
+    #[test]
+    fn guest_x18_patchability_excludes_reserved_placeholders() {
+        assert!(is_patchable_guest_x18_offset(32744));
+        assert!(!is_patchable_guest_x18_offset(32752));
+        assert!(!is_patchable_guest_x18_offset(32760));
+    }
+
+    #[test]
+    fn x18_unsupported_class_table() {
+        for (word, expected) in [
+            (
+                0xd61f_0240,
+                X18Classification::X18(X18TransformResult::Unsupported(
+                    X18Unsupported::ControlFlow,
+                )),
+            ), // br x18
+            (
+                0xf000_0012,
+                X18Classification::X18(X18TransformResult::Unsupported(X18Unsupported::PcRelative)),
+            ), // adrp x18
+            (
+                0x5800_0012,
+                X18Classification::X18(X18TransformResult::Unsupported(X18Unsupported::PcRelative)),
+            ), // ldr x18, literal
+            (
+                0x4832_7ed4,
+                X18Classification::X18(X18TransformResult::Unsupported(
+                    X18Unsupported::ExclusiveAtomic,
+                )),
+            ), // casp
+        ] {
+            assert_eq!(classify_x18(word), expected, "word {word:#010x}");
+        }
+    }
+
+    #[test]
     fn rt_sigreturn_trampoline_uses_the_svc_gate_frame_abi() {
         let callback = 0x1122_3344_5566_7788usize;
         let code = emit_rt_sigreturn_trampoline(callback).unwrap();
@@ -2209,6 +4217,13 @@ mod tests {
     const MSR_GATE_INSNS: usize = 9;
     const MSR_GATE_SIZE: usize = MSR_SLOT_BYTES;
     const MRS_GATE_SIZE: usize = MRS_SLOT_BYTES;
+
+    fn x18_config(host: Host) -> RewriteConfig {
+        RewriteConfig {
+            host,
+            virtualize_x18: true,
+        }
+    }
 
     fn word_at(data: &[u8], byte_off: usize) -> u32 {
         u32::from_le_bytes(data[byte_off..byte_off + 4].try_into().unwrap())
@@ -2325,15 +4340,41 @@ mod tests {
             file_offset: 0,
             size: buf.len() as u64,
         }];
-        hook_syscalls_aarch64(&mut buf, &sections, tramp_base, callback, Host::Linux)
-            .unwrap()
-            .expect("expected a trampoline (input has patch sites)")
-            .trampoline
+        hook_syscalls_aarch64(
+            &mut buf,
+            &sections,
+            tramp_base,
+            callback,
+            RewriteConfig {
+                host: Host::Linux,
+                virtualize_x18: false,
+            },
+        )
+        .unwrap()
+        .expect("expected a trampoline (input has patch sites)")
+        .trampoline
     }
 
     /// Like [`hook_words`] but returns the raw `Option` outcome so callers can
     /// assert the "no patch sites" (`None`) sentinel and trapped-site cases.
     fn hook_words_opt(words: &[u32], base: u64, tramp_base: u64) -> (Vec<u8>, Option<HookOutcome>) {
+        hook_words_opt_with_config(
+            words,
+            base,
+            tramp_base,
+            RewriteConfig {
+                host: Host::Linux,
+                virtualize_x18: false,
+            },
+        )
+    }
+
+    fn hook_words_opt_with_config(
+        words: &[u32],
+        base: u64,
+        tramp_base: u64,
+        config: RewriteConfig,
+    ) -> (Vec<u8>, Option<HookOutcome>) {
         let mut buf = Vec::new();
         for w in words {
             buf.extend_from_slice(&w.to_le_bytes());
@@ -2343,9 +4384,310 @@ mod tests {
             file_offset: 0,
             size: buf.len() as u64,
         }];
-        let outcome =
-            hook_syscalls_aarch64(&mut buf, &sections, tramp_base, 0, Host::Linux).unwrap();
+        let outcome = hook_syscalls_aarch64(&mut buf, &sections, tramp_base, 0, config).unwrap();
         (buf, outcome)
+    }
+
+    #[test]
+    fn x18_gate_uses_each_hosts_exact_anchor_read() {
+        for (host, anchor_word) in [
+            (Host::Linux, 0xd53b_d050),
+            (Host::MacOs, 0xd53b_d070),
+            (Host::Windows, 0xaa12_03f0),
+        ] {
+            let (_, outcome) =
+                hook_words_opt_with_config(&[0x0b12_0063], 0x1000, 0x400000, x18_config(host));
+            let trampoline = outcome.unwrap().trampoline;
+            let gate = &trampoline[GATES_START_OFFSET..];
+            assert_eq!(gate.len(), X18_SLOT_BYTES);
+            assert_eq!(
+                word_at(gate, X18GateOffset::FirstAnchor.as_usize()),
+                anchor_word
+            );
+            assert_eq!(
+                word_at(gate, X18_SLOT_BYTES - GATE_METADATA_BYTES),
+                EncodedGateMetadata::encode(GateMetadata::X18 { scratch: X17 })
+                    .unwrap()
+                    .0
+            );
+        }
+    }
+
+    #[test]
+    fn cbnz_w18_gate_preserves_both_original_destinations() {
+        let (patched, outcome) = hook_words_opt_with_config(
+            &[0x3500_0332], // cbnz w18, 0x1064
+            0x1000,
+            0x400000,
+            x18_config(Host::Linux),
+        );
+        let outcome = outcome.unwrap();
+
+        assert!(outcome.trapped_sites.is_empty());
+        assert_eq!(word_at(&patched, 0) & OPCODE_TOP6_MASK, Opcode::B.bits());
+        let gate = &outcome.trampoline[GATES_START_OFFSET..];
+        assert_eq!(gate.len(), 48);
+        assert_eq!(
+            decode_branch_target(word_at(gate, 28), 0x400000 + GATES_START_OFFSET as u64 + 28),
+            Some(0x1004)
+        );
+        assert_eq!(
+            decode_branch_target(word_at(gate, 40), 0x400000 + GATES_START_OFFSET as u64 + 40),
+            Some(0x1064)
+        );
+    }
+
+    #[test]
+    fn compare_branch_x18_gate_finalizes_without_size_ambiguity() {
+        let (_, outcome) =
+            hook_words_opt_with_config(&[0x3500_0332], 0x1000, 0x400000, x18_config(Host::Linux));
+        let mut trampoline = outcome.unwrap().trampoline;
+
+        finalize_trampoline_gates_with_x18(&mut trampoline, 96, 104).unwrap();
+        assert_eq!(find_guest_x18_placeholder(&trampoline), None);
+    }
+
+    #[test]
+    fn tbnz_x18_bit_63_gate_encodes_without_panicking() {
+        let (patched, outcome) = hook_words_opt_with_config(
+            &[0xb7f8_00b2], // tbnz x18, #63, 0x1014
+            0x1000,
+            0x400000,
+            x18_config(Host::Linux),
+        );
+        let outcome = outcome.unwrap();
+
+        assert!(outcome.trapped_sites.is_empty());
+        assert_eq!(word_at(&patched, 0) & OPCODE_TOP6_MASK, Opcode::B.bits());
+        let gate = &outcome.trampoline[GATES_START_OFFSET..];
+        assert_eq!(word_at(gate, 16), 0xb7f8_0091); // tbnz x17, #63, +16
+    }
+
+    #[test]
+    fn ordinary_x18_gate_allows_x30_operands() {
+        let (patched, outcome) = hook_words_opt_with_config(
+            &[0x2a12_03fe], // mov w30, w18
+            0x1000,
+            0x400000,
+            x18_config(Host::Linux),
+        );
+        let outcome = outcome.unwrap();
+
+        assert!(outcome.trapped_sites.is_empty());
+        assert_eq!(word_at(&patched, 0) & OPCODE_TOP6_MASK, Opcode::B.bits());
+    }
+
+    #[test]
+    fn adrp_x18_gate_preserves_original_page_target() {
+        let (patched, outcome) = hook_words_opt_with_config(
+            &[0xf000_0012], // adrp x18, +0x3000 from page 0x1000
+            0x1000,
+            0x400000,
+            x18_config(Host::Linux),
+        );
+        let outcome = outcome.unwrap();
+
+        assert!(outcome.trapped_sites.is_empty());
+        assert_eq!(word_at(&patched, 0) & OPCODE_TOP6_MASK, Opcode::B.bits());
+        let transformed_pc =
+            0x400000 + GATES_START_OFFSET as u64 + X18GateOffset::Transform.as_usize() as u64;
+        assert_eq!(
+            decode_adrp_target(
+                word_at(
+                    &outcome.trampoline,
+                    GATES_START_OFFSET + X18GateOffset::Transform.as_usize(),
+                ),
+                transformed_pc,
+                17,
+            ),
+            Some(0x4000)
+        );
+    }
+
+    #[test]
+    fn adr_x18_gate_preserves_original_target() {
+        let (patched, outcome) = hook_words_opt_with_config(
+            &[0x1000_0072], // adr x18, 0x100c
+            0x1000,
+            0x400000,
+            x18_config(Host::Linux),
+        );
+        let outcome = outcome.unwrap();
+
+        assert!(outcome.trapped_sites.is_empty());
+        assert_eq!(word_at(&patched, 0) & OPCODE_TOP6_MASK, Opcode::B.bits());
+        assert_eq!(
+            decode_adrp_add_target_for(
+                word_at(&outcome.trampoline, GATES_START_OFFSET + 8),
+                word_at(&outcome.trampoline, GATES_START_OFFSET + 12),
+                0x400000 + GATES_START_OFFSET as u64 + 8,
+                17,
+            ),
+            Some(0x100c)
+        );
+    }
+
+    #[test]
+    fn adr_x18_gate_finalizes() {
+        let (_, outcome) =
+            hook_words_opt_with_config(&[0x1000_0072], 0x1000, 0x400000, x18_config(Host::Linux));
+        let mut trampoline = outcome.unwrap().trampoline;
+
+        finalize_trampoline_gates_with_x18(&mut trampoline, 96, 104).unwrap();
+        assert_eq!(find_guest_x18_placeholder(&trampoline), None);
+    }
+
+    #[test]
+    fn x18_offsets_finalize_transactionally() {
+        let (_, outcome) =
+            hook_words_opt_with_config(&[0x0b12_0063], 0x1000, 0x400000, x18_config(Host::Linux));
+        let mut trampoline = outcome.unwrap().trampoline;
+        let before = trampoline.clone();
+        assert!(matches!(
+            finalize_trampoline_gates_with_x18(&mut trampoline, 96, 12),
+            Err(Error::TrampolinePatchFailure(_))
+        ));
+        assert_eq!(trampoline, before);
+
+        assert!(matches!(
+            finalize_trampoline_gates_with_x18(&mut trampoline, 96, 96),
+            Err(Error::TrampolinePatchFailure(_))
+        ));
+        assert_eq!(trampoline, before);
+
+        finalize_trampoline_gates_with_x18(&mut trampoline, 96, 104).unwrap();
+        assert_eq!(find_guest_x18_placeholder(&trampoline), None);
+    }
+
+    #[test]
+    fn tpidr_only_patcher_rejects_x18_gates_transactionally() {
+        let (_, outcome) =
+            hook_words_opt_with_config(&[0xaa00_03f2], 0x1000, 0x400000, x18_config(Host::Linux));
+        let mut trampoline = outcome.unwrap().trampoline;
+        let before = trampoline.clone();
+
+        assert!(patch_guest_tpidr_offset(&mut trampoline, 96).is_err());
+        assert_eq!(trampoline, before);
+    }
+
+    #[test]
+    fn combined_finalizer_validates_x18_offset_without_x18_gates() {
+        let (_, mut trampoline) = hook_words(&[SVC_0], 0x1000, 0x400000);
+        let before = trampoline.clone();
+
+        assert!(finalize_trampoline_gates_with_x18(&mut trampoline, 96, 12).is_err());
+        assert_eq!(trampoline, before);
+    }
+
+    #[test]
+    fn combined_finalizer_requires_adjacent_guest_slots() {
+        let (_, outcome) =
+            hook_words_opt_with_config(&[0xaa00_03f2], 0x1000, 0x400000, x18_config(Host::Linux));
+        let mut trampoline = outcome.unwrap().trampoline;
+        let before = trampoline.clone();
+
+        assert!(finalize_trampoline_gates_with_x18(&mut trampoline, 96, 112).is_err());
+        assert_eq!(trampoline, before);
+    }
+
+    #[test]
+    fn transformed_instruction_may_resemble_x18_placeholder() {
+        let guest_instruction = 0xf97f_fc12; // ldr x18, [x0, #32760]
+        let (_, outcome) = hook_words_opt_with_config(
+            &[guest_instruction],
+            0x1000,
+            0x400000,
+            x18_config(Host::Linux),
+        );
+        let mut trampoline = outcome.unwrap().trampoline;
+        let transformed = GATES_START_OFFSET + X18GateOffset::Transform.as_usize();
+        let before = word_at(&trampoline, transformed);
+
+        finalize_trampoline_gates_with_x18(&mut trampoline, 96, 104).unwrap();
+
+        assert_eq!(word_at(&trampoline, transformed), before);
+        assert_eq!(find_guest_x18_placeholder(&trampoline), None);
+        assert_eq!(find_guest_tpidr_placeholder(&trampoline), None);
+    }
+
+    #[test]
+    fn legacy_finalizer_rejects_x18_trampoline_transactionally() {
+        let (_, outcome) = hook_words_opt_with_config(
+            &[Insn::MrsTpidrEl0(9).encode().unwrap(), 0x0b12_0063],
+            0x1000,
+            0x400000,
+            x18_config(Host::Linux),
+        );
+        let mut trampoline = outcome.unwrap().trampoline;
+        let before = trampoline.clone();
+
+        let error = finalize_trampoline_gates(&mut trampoline, 96).unwrap_err();
+
+        assert!(
+            matches!(error, Error::TrampolinePatchFailure(reason) if reason.contains("finalize_trampoline_gates_with_x18"))
+        );
+        assert_eq!(trampoline, before);
+    }
+
+    #[test]
+    fn x18_gate_out_of_branch_range_traps_without_emitting_a_slot() {
+        let base = 0x1004u64;
+        let max_forward = (1u64 << 27) - 4;
+        let trampoline_base = base + max_forward - GATES_START_OFFSET as u64;
+        let (patched, outcome) = hook_words_opt_with_config(
+            &[0x0b12_0063],
+            base,
+            trampoline_base,
+            x18_config(Host::Linux),
+        );
+        let outcome = outcome.unwrap();
+        assert_eq!(
+            word_at(&patched, 0),
+            Insn::Brk(TRAP_BRK_IMM).encode().unwrap()
+        );
+        assert_eq!(outcome.trapped_sites, vec![base]);
+        assert_eq!(outcome.trampoline.len(), GATES_START_OFFSET);
+    }
+
+    #[test]
+    fn tpidr_x18_overlap_is_x18_when_enabled_and_tp_gate_by_default() {
+        let words = [msr_tpidr_el0(18), Insn::MrsTpidrEl0(18).encode().unwrap()];
+        let bytes = words
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<_>>();
+        let section = TextSectionInfo {
+            vaddr: 0x1000,
+            file_offset: 0,
+            size: bytes.len() as u64,
+        };
+        let enabled = RewriteConfig {
+            host: Host::Linux,
+            virtualize_x18: true,
+        };
+        let sites = find_patch_sites(&[section], &bytes, enabled).unwrap();
+        assert!(sites.iter().all(|site| matches!(
+            site.kind,
+            PatchKind::X18(X18TransformResult::Unsupported(
+                X18Unsupported::EncodingLayout
+            ))
+        )));
+
+        let (patched, outcome) = hook_words_opt_with_config(&words, 0x1000, 0x2000, enabled);
+        let trap = Insn::Brk(TRAP_BRK_IMM).encode().unwrap();
+        assert_eq!(word_at(&patched, 0), trap);
+        assert_eq!(word_at(&patched, 4), trap);
+        assert_eq!(outcome.unwrap().trapped_sites, vec![0x1000, 0x1004]);
+
+        let (patched, outcome) = hook_words_opt(&words, 0x1000, 0x2000);
+        assert_ne!(word_at(&patched, 0), trap);
+        assert_ne!(word_at(&patched, 4), trap);
+        let outcome = outcome.unwrap();
+        assert!(outcome.trapped_sites.is_empty());
+        assert_eq!(
+            outcome.trampoline.len(),
+            GATES_START_OFFSET + MSR_GATE_SIZE + MRS_GATE_SIZE
+        );
     }
 
     #[test]
@@ -2966,7 +5308,7 @@ mod tests {
                 );
             }
         }
-        for kind in 3..16 {
+        for kind in 6..16 {
             let invalid = (valid & !GATE_METADATA_KIND_MASK) | (kind << GATE_METADATA_KIND_SHIFT);
             assert_eq!(EncodedGateMetadata(invalid).decode(), None, "kind {kind}");
         }
@@ -3015,7 +5357,16 @@ mod tests {
             size: 4,
         };
         assert!(matches!(
-            hook_syscalls_aarch64(&mut code, &[section], 0x400004, 0, Host::Linux),
+            hook_syscalls_aarch64(
+                &mut code,
+                &[section],
+                0x400004,
+                0,
+                RewriteConfig {
+                    host: Host::Linux,
+                    virtualize_x18: false,
+                },
+            ),
             Err(Error::AddressOverflow(_))
         ));
     }
@@ -3091,7 +5442,7 @@ mod tests {
                 );
             }
         }
-        for kind in 3..16 {
+        for kind in 6..16 {
             let word = (valid & !GATE_METADATA_KIND_MASK) | (kind << GATE_METADATA_KIND_SHIFT);
             assert_eq!(EncodedGateMetadata(word).decode(), None, "kind {kind}");
         }
@@ -3138,17 +5489,18 @@ mod tests {
                     Some(ClassifiedGate {
                         slot_offset: start,
                         slot_size: u8::try_from(size).unwrap(),
-                        commit_offset: match metadata {
-                            GateMetadata::Svc => 0,
-                            GateMetadata::MrsTpidr { .. } => 4,
-                            GateMetadata::MsrTpidr { .. } => 20,
-                        },
+                        commit_offset: u8::try_from(metadata.commit_offset()).unwrap(),
+                        anchor_scratch: 0,
                         original_site: 0x1000
                             + match metadata {
                                 GateMetadata::MrsTpidr { .. } => 0,
                                 GateMetadata::MsrTpidr { .. } => 4,
                                 GateMetadata::Svc => 8,
+                                GateMetadata::X18 { .. }
+                                | GateMetadata::X18CompareBranch { .. }
+                                | GateMetadata::X18Adr { .. } => unreachable!(),
                             },
+                        conditional_target: 0,
                         metadata,
                     })
                 );
@@ -3159,6 +5511,53 @@ mod tests {
         }
         assert_eq!(classify_gate_pc(&trampoline, base, base + 144), None);
         assert_eq!(classify_gate_pc(&trampoline, base, base - 4), None);
+    }
+
+    #[test]
+    fn classifier_finds_every_x18_gate_kind() {
+        let words = [
+            0xaa00_03f2, // mov x18, x0
+            0x3500_0332, // cbnz w18, +0x64
+            0x1000_0072, // adr x18, +0xc
+        ];
+        let base = 0x400000;
+        let (_patched, outcome) =
+            hook_words_opt_with_config(&words, 0x1000, base, x18_config(Host::Linux));
+        let trampoline = outcome.unwrap().trampoline;
+
+        for (index, (start, size)) in [
+            (16usize, X18_SLOT_BYTES),
+            (16 + X18_SLOT_BYTES, X18_COMPARE_BRANCH_SLOT_BYTES),
+            (
+                16 + X18_SLOT_BYTES + X18_COMPARE_BRANCH_SLOT_BYTES,
+                X18_ADR_SLOT_BYTES,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let metadata = EncodedGateMetadata(u32::from_le_bytes(
+                trampoline[start + size - 4..start + size]
+                    .try_into()
+                    .unwrap(),
+            ))
+            .decode()
+            .unwrap();
+            assert!(match index {
+                0 => matches!(metadata, GateMetadata::X18 { .. }),
+                1 => matches!(metadata, GateMetadata::X18CompareBranch { .. }),
+                2 => matches!(metadata, GateMetadata::X18Adr { .. }),
+                _ => unreachable!(),
+            });
+            for offset in (0..metadata.executable_end()).step_by(INSN_BYTES) {
+                let classified =
+                    classify_gate_pc(&trampoline, base, base + (start + offset) as u64)
+                        .expect("emitted x18 slot must classify");
+                assert_eq!(classified.slot_offset(), start);
+                assert_eq!(classified.slot_size(), u8::try_from(size).unwrap());
+                assert_eq!(classified.metadata(), metadata);
+            }
+        }
     }
 
     #[test]

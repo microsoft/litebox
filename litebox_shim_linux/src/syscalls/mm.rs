@@ -55,8 +55,21 @@ fn finalize_trampoline_gates(
     // Gates encode a scaled `u16`; the platform API remains pointer-width.
     let offset = u16::try_from(offset)
         .map_err(|_| format!("guest thread-pointer offset {offset} is too large for a gate"))?;
-    litebox_syscall_rewriter::aarch64::finalize_trampoline_gates(trampoline, offset)
-        .map_err(|e| format!("failed to patch guest thread-pointer offset {offset}: {e}"))
+    if cfg!(feature = "aarch64_virtualize_x18") {
+        let x18 = offset
+            .checked_add(
+                u16::try_from(litebox_syscall_rewriter::aarch64::GUEST_X18_OFFSET_FROM_GUEST_TP)
+                    .expect("guest x18 slot delta fits in a gate offset"),
+            )
+            .ok_or_else(|| alloc::string::String::from("guest x18 offset overflow"))?;
+        litebox_syscall_rewriter::aarch64::finalize_trampoline_gates_with_x18(
+            trampoline, offset, x18,
+        )
+        .map_err(|e| format!("failed to patch guest offsets {offset}/{x18}: {e}"))
+    } else {
+        litebox_syscall_rewriter::aarch64::finalize_trampoline_gates(trampoline, offset)
+            .map_err(|e| format!("failed to patch guest thread-pointer offset {offset}: {e}"))
+    }
 }
 
 /// Per-fd state for the shim's runtime ELF syscall rewriter.
@@ -962,6 +975,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
         let mut code_buf = code_owned.into_vec();
         let code_vaddr = mapped_addr.as_usize() as u64;
+        #[cfg(target_arch = "aarch64")]
+        let count = litebox_syscall_rewriter::trap_all_syscalls_in_code_with_options(
+            &mut code_buf,
+            code_vaddr,
+            crate::aarch64_rewrite_options(),
+        )
+        .unwrap_or_else(|e| {
+            panic!("fatal: failed to disassemble code segment for trap fallback: {e:?}");
+        });
+        #[cfg(target_arch = "x86_64")]
         let count = litebox_syscall_rewriter::trap_all_syscalls_in_code(&mut code_buf, code_vaddr)
             .unwrap_or_else(|e| {
                 panic!("fatal: failed to disassemble code segment for trap fallback: {e:?}");
@@ -1242,6 +1265,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             syscall_entry as u64
         };
 
+        #[cfg(target_arch = "aarch64")]
+        let patch_result = litebox_syscall_rewriter::patch_code_segment_with_options(
+            &mut code_buf,
+            code_vaddr,
+            trampoline_write_vaddr,
+            syscall_entry_addr,
+            crate::aarch64_rewrite_options(),
+        );
+        #[cfg(target_arch = "x86_64")]
         let patch_result = litebox_syscall_rewriter::patch_code_segment(
             &mut code_buf,
             code_vaddr,
@@ -1445,6 +1477,36 @@ mod tests {
                 litebox_syscall_rewriter::aarch64::GateMetadata::MrsTpidr { destination: 9, .. }
             ));
             tramp
+        }
+
+        #[cfg(feature = "aarch64_virtualize_x18")]
+        #[test]
+        fn x18_gate_is_finalized_with_the_platform_offset() {
+            let mut code = 0xaa00_03f2u32.to_le_bytes(); // mov x18, x0
+            let options = litebox_syscall_rewriter::RewriteOptions::new(
+                litebox_syscall_rewriter::TargetHost::Linux,
+                true,
+            );
+            let (mut trampoline, trapped) =
+                litebox_syscall_rewriter::patch_code_segment_with_options(
+                    &mut code, 0x1000, 0x400000, 0, options,
+                )
+                .unwrap();
+            assert!(trapped.is_empty());
+
+            super::super::finalize_trampoline_gates(&StubPlatform(Some(96)), &mut trampoline)
+                .unwrap();
+
+            assert!(matches!(
+                litebox_syscall_rewriter::aarch64::classify_gate_pc(
+                    &trampoline,
+                    0x400000,
+                    0x400010,
+                )
+                .unwrap()
+                .metadata(),
+                litebox_syscall_rewriter::aarch64::GateMetadata::X18 { .. }
+            ));
         }
 
         /// Runtime gates receive the callback address, not a callback-slot address.

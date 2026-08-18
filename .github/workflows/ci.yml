@@ -123,6 +123,10 @@ jobs:
           ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features $AARCH64_CRATES
       - run: ./.github/tools/github_actions_run_cargo build $AARCH64_CRATES
       - run: ./.github/tools/github_actions_run_cargo nextest $AARCH64_CRATES
+      - name: Test AArch64 x18 virtualization
+        run: |
+          ./.github/tools/github_actions_run_cargo nextest -p litebox_syscall_rewriter -p litebox_platform_linux_userland -p litebox_shim_linux --features litebox_platform_linux_userland/aarch64_virtualize_x18,litebox_shim_linux/aarch64_virtualize_x18
+          ./.github/tools/github_actions_run_cargo nextest -p litebox_runner_linux_userland --features litebox_runner_linux_userland/aarch64_virtualize_x18 -E 'binary(run) or binary(rewritten_guests)'
       # Nextest does not run doctests.
       - run: |
           ./.github/tools/github_actions_run_cargo test --doc $AARCH64_CRATES
