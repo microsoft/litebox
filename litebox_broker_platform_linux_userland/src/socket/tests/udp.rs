@@ -866,6 +866,16 @@ fn guest_udp_namespace_routes_across_sessions_and_filters_private_endpoints() {
         send_datagram(
             &sender_session,
             sender,
+            b"claimed miss",
+            SendFlags::NONE,
+            Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, guest_port)),
+        ),
+        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+    );
+    assert_eq!(
+        send_datagram(
+            &sender_session,
+            sender,
             b"request",
             SendFlags::NONE,
             Some(receiver_guest_address),
@@ -1053,6 +1063,195 @@ fn guest_udp_namespace_routes_across_sessions_and_filters_private_endpoints() {
         }))
     );
     assert_eq!(&reply, b"guest");
+}
+
+#[test]
+fn udp_exact_bindings_coexist_and_wildcard_covers_loopback() {
+    let provider = Arc::new(LinuxSocketProvider::new(8, 5).unwrap());
+    let broker = BrokerCore::new_with_limits(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+        BrokerCoreLimits::new_with_all_limits(12, 0, 8, 8),
+        provider,
+    )
+    .unwrap();
+    let receiver_session = broker
+        .create_session(CallerCredential::Unauthenticated)
+        .unwrap();
+    let sender_session = broker
+        .create_session(CallerCredential::Unauthenticated)
+        .unwrap();
+    let (published, publications) = channel();
+    let (retired, _retirements) = channel();
+    let readiness = Arc::new(TestReadinessSink { published, retired });
+
+    let first = create_udp_socket(&receiver_session, readiness.clone());
+    let SocketOutcome::Completed(first_address) = litebox_broker_core::socket::bind(
+        &receiver_session,
+        first,
+        SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), 0),
+    )
+    .unwrap() else {
+        panic!("first exact UDP bind failed");
+    };
+    let second_address = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 3), first_address.port());
+    let second = create_udp_socket(&receiver_session, readiness.clone());
+    assert_eq!(
+        litebox_broker_core::socket::bind(&receiver_session, second, second_address),
+        Ok(SocketOutcome::Completed(second_address))
+    );
+    let wildcard_competitor = create_udp_socket(&receiver_session, readiness.clone());
+    assert_eq!(
+        litebox_broker_core::socket::bind(
+            &receiver_session,
+            wildcard_competitor,
+            SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, first_address.port()),
+        ),
+        Ok(SocketOutcome::Failed(SocketError::AddressInUse))
+    );
+
+    let sender = create_udp_socket(&sender_session, readiness.clone());
+    for (receiver, destination, payload) in [
+        (first, first_address, b"first".as_slice()),
+        (second, second_address, b"second".as_slice()),
+    ] {
+        assert_eq!(
+            send_datagram(
+                &sender_session,
+                sender,
+                payload,
+                SendFlags::NONE,
+                Some(destination),
+            ),
+            Ok(SocketOutcome::Completed(payload.len()))
+        );
+        wait_until_ready(
+            &receiver_session,
+            &publications,
+            receiver,
+            ReadinessFlags::READ,
+        );
+        let mut received = [0; 6];
+        assert_eq!(
+            receive_datagram_into(
+                &receiver_session,
+                receiver,
+                &mut received,
+                ReceiveFromFlags::NONE,
+            ),
+            Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+                received: payload.len(),
+                datagram_length: payload.len(),
+                source_address: SocketAddrV4::new(
+                    Ipv4Addr::LOCALHOST,
+                    litebox_broker_core::socket::status(&sender_session, sender)
+                        .unwrap()
+                        .local_address
+                        .unwrap()
+                        .port(),
+                ),
+            }))
+        );
+        assert_eq!(&received[..payload.len()], payload);
+    }
+
+    let wildcard = create_udp_socket(&receiver_session, readiness.clone());
+    let SocketOutcome::Completed(wildcard_address) = litebox_broker_core::socket::bind(
+        &receiver_session,
+        wildcard,
+        SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
+    )
+    .unwrap() else {
+        panic!("wildcard UDP bind failed");
+    };
+    let concrete_destination =
+        SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 4), wildcard_address.port());
+    assert_eq!(
+        send_datagram(
+            &sender_session,
+            sender,
+            b"wild",
+            SendFlags::NONE,
+            Some(concrete_destination),
+        ),
+        Ok(SocketOutcome::Completed(4))
+    );
+    wait_until_ready(
+        &receiver_session,
+        &publications,
+        wildcard,
+        ReadinessFlags::READ,
+    );
+    let mut received = [0; 4];
+    assert!(matches!(
+        receive_datagram_into(
+            &receiver_session,
+            wildcard,
+            &mut received,
+            ReceiveFromFlags::NONE,
+        ),
+        Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+            received: 4,
+            datagram_length: 4,
+            ..
+        }))
+    ));
+    assert_eq!(&received, b"wild");
+
+    assert_eq!(
+        litebox_broker_core::socket::connect(&sender_session, sender, concrete_destination,),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+    );
+    assert_eq!(
+        send_datagram(&sender_session, sender, b"ping", SendFlags::NONE, None),
+        Ok(SocketOutcome::Completed(4))
+    );
+    wait_until_ready(
+        &receiver_session,
+        &publications,
+        wildcard,
+        ReadinessFlags::READ,
+    );
+    let mut request = [0; 4];
+    let source_address = match receive_datagram_into(
+        &receiver_session,
+        wildcard,
+        &mut request,
+        ReceiveFromFlags::NONE,
+    ) {
+        Ok(SocketOutcome::Completed(datagram)) => datagram.source_address,
+        result => panic!("connected wildcard receive failed: {result:?}"),
+    };
+    assert_eq!(&request, b"ping");
+    assert_eq!(
+        send_datagram(
+            &receiver_session,
+            wildcard,
+            b"pong",
+            SendFlags::NONE,
+            Some(source_address),
+        ),
+        Ok(SocketOutcome::Completed(4))
+    );
+    wait_until_ready(&sender_session, &publications, sender, ReadinessFlags::READ);
+    let mut reply = [0; 4];
+    assert!(matches!(
+        receive_datagram_into(
+            &sender_session,
+            sender,
+            &mut reply,
+            ReceiveFromFlags::NONE,
+        ),
+        Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+            received: 4,
+            datagram_length: 4,
+            source_address,
+        })) if source_address == SocketAddrV4::new(
+            Ipv4Addr::LOCALHOST,
+            wildcard_address.port(),
+        )
+    ));
+    assert_eq!(&reply, b"pong");
 }
 
 #[test]

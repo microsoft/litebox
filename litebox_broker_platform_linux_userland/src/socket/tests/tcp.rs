@@ -20,6 +20,7 @@ fn pending_guest_connections_are_keyed_by_complete_host_tuple() {
             PendingGuestTcpConnection {
                 session_id: SessionId(7),
                 guest_address: guest,
+                local_address: listener,
                 listener_id: 1,
                 discard_on_accept: false,
                 discard_until_deadline: false,
@@ -35,6 +36,7 @@ fn pending_guest_connections_are_keyed_by_complete_host_tuple() {
             PendingGuestTcpConnection {
                 session_id: SessionId(8),
                 guest_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1002),
+                local_address: first_listener,
                 listener_id: 1,
                 discard_on_accept: false,
                 discard_until_deadline: false,
@@ -80,21 +82,13 @@ fn tuple_collision_persists_its_discard_marker() {
     let connection = (remote_address, host_address);
     let deadline = Instant::now() + PENDING_CONNECT_DISCARD_LIFETIME;
     let mut tcp = ReactorTcpState::default();
-    tcp.insert_binding(ReactorTcpBinding {
-        socket_id: 1,
-        guest_address,
-        host_address: Some(host_address),
-        listening: true,
-        requires_backlog_drain: false,
-        untracked_connection_deadline: None,
-    })
-    .unwrap();
     assert!(!tcp.persist_discard_marker_for_collision(connection, 1, deadline));
     tcp.insert_pending_guest_connection(
         connection,
         PendingGuestTcpConnection {
             session_id: SessionId(7),
             guest_address,
+            local_address: guest_address,
             listener_id: 1,
             discard_on_accept: false,
             discard_until_deadline: false,
@@ -113,12 +107,6 @@ fn tuple_collision_persists_its_discard_marker() {
     let marker = tcp.pending_guest_connections.get(&connection).unwrap();
     assert!(marker.discard_until_deadline);
     assert_eq!(marker.discard_deadline, Some(deadline));
-    assert!(
-        !tcp.bindings
-            .get(&guest_address.port())
-            .unwrap()
-            .requires_backlog_drain
-    );
     assert!(matches!(
         tcp.take_pending_guest_connection(remote_address, host_address),
         Some(PendingGuestConnectionMatch::PersistentDiscard)
@@ -904,7 +892,8 @@ fn guest_tcp_namespace_routes_across_sessions_and_hides_private_backend() {
     shadowed_host_listener.set_nonblocking(true).unwrap();
     let guest_port = shadowed_host_listener.local_addr().unwrap().port();
     let guest_address = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), guest_port);
-    let guest_destination = SocketAddrV4::new(Ipv4Addr::LOCALHOST, guest_port);
+    let claimed_port_miss = SocketAddrV4::new(Ipv4Addr::LOCALHOST, guest_port);
+    let guest_destination = guest_address;
     let listener = create_socket(&listener_session, readiness.clone());
     assert_eq!(
         litebox_broker_core::socket::bind(&listener_session, listener, guest_address),
@@ -914,7 +903,7 @@ fn guest_tcp_namespace_routes_across_sessions_and_hides_private_backend() {
 
     let early_client = create_socket(&client_session, readiness.clone());
     assert_eq!(
-        litebox_broker_core::socket::connect(&client_session, early_client, guest_destination,),
+        litebox_broker_core::socket::connect(&client_session, early_client, claimed_port_miss,),
         Ok(SocketOutcome::Completed(SocketConnectionStatus::Failed(
             SocketError::ConnectionRefused,
         )))
@@ -1038,6 +1027,188 @@ fn guest_tcp_namespace_routes_across_sessions_and_hides_private_backend() {
         ErrorKind::WouldBlock
     );
     drop(native_client);
+}
+
+#[test]
+fn tcp_exact_bindings_coexist_and_wildcard_accepts_concrete_destinations() {
+    let provider = Arc::new(LinuxSocketProvider::new(12, 8).unwrap());
+    let policy = SocketPolicy::from_tcp_destination_rules(&[DestinationRule::new(
+        CallerCredential::Unauthenticated,
+        Ipv4Cidr::new(Ipv4Address([0, 0, 0, 0]), 0).unwrap(),
+        DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
+    )])
+    .unwrap();
+    let broker = BrokerCore::new_with_limits(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all()).with_socket_policy(policy),
+        BrokerCoreLimits::new_with_all_limits(20, 0, 12, 12),
+        provider,
+    )
+    .unwrap();
+    let listener_session = broker
+        .create_session(CallerCredential::Unauthenticated)
+        .unwrap();
+    let connector_session = broker
+        .create_session(CallerCredential::Unauthenticated)
+        .unwrap();
+    let (published, publications) = channel();
+    let (retired, _retirements) = channel();
+    let readiness = Arc::new(TestReadinessSink { published, retired });
+
+    let first_listener = create_socket(&listener_session, readiness.clone());
+    let SocketOutcome::Completed(first_address) = litebox_broker_core::socket::bind(
+        &listener_session,
+        first_listener,
+        SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), 0),
+    )
+    .unwrap() else {
+        panic!("first exact bind failed");
+    };
+    let second_address = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 3), first_address.port());
+    let second_listener = create_socket(&listener_session, readiness.clone());
+    assert_eq!(
+        litebox_broker_core::socket::bind(&listener_session, second_listener, second_address,),
+        Ok(SocketOutcome::Completed(second_address))
+    );
+    let wildcard_competitor = create_socket(&listener_session, readiness.clone());
+    assert_eq!(
+        litebox_broker_core::socket::bind(
+            &listener_session,
+            wildcard_competitor,
+            SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, first_address.port()),
+        ),
+        Ok(SocketOutcome::Failed(SocketError::AddressInUse))
+    );
+    assert_eq!(
+        litebox_broker_core::socket::listen(&listener_session, first_listener, 1),
+        Ok(SocketOutcome::Completed(first_address))
+    );
+    assert_eq!(
+        litebox_broker_core::socket::listen(&listener_session, second_listener, 1),
+        Ok(SocketOutcome::Completed(second_address))
+    );
+
+    for (listener, destination) in [
+        (first_listener, first_address),
+        (second_listener, second_address),
+    ] {
+        let connector = create_socket(&connector_session, readiness.clone());
+        assert!(matches!(
+            litebox_broker_core::socket::connect(&connector_session, connector, destination,),
+            Ok(SocketOutcome::Completed(
+                SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
+            ))
+        ));
+        wait_until_connected(&connector_session, connector, &publications);
+        wait_until_ready(
+            &listener_session,
+            &publications,
+            listener,
+            ReadinessFlags::READ,
+        );
+        let accepted = match litebox_broker_core::socket::accept(
+            &listener_session,
+            listener,
+            readiness.clone(),
+        )
+        .unwrap()
+        {
+            SocketOutcome::Completed(accepted) => accepted,
+            SocketOutcome::Failed(error) => panic!("exact accept failed: {error:?}"),
+        };
+        assert_eq!(accepted.local_address, destination);
+    }
+
+    let wildcard_listener = create_socket(&listener_session, readiness.clone());
+    let SocketOutcome::Completed(wildcard_address) = litebox_broker_core::socket::bind(
+        &listener_session,
+        wildcard_listener,
+        SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
+    )
+    .unwrap() else {
+        panic!("wildcard bind failed");
+    };
+    assert_eq!(
+        litebox_broker_core::socket::listen(&listener_session, wildcard_listener, 2),
+        Ok(SocketOutcome::Completed(wildcard_address))
+    );
+    let concrete_destination =
+        SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 4), wildcard_address.port());
+    let connector = create_socket(&connector_session, readiness.clone());
+    let SocketOutcome::Completed(connector_binding) = litebox_broker_core::socket::bind(
+        &connector_session,
+        connector,
+        SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
+    )
+    .unwrap() else {
+        panic!("wildcard connector bind failed");
+    };
+    assert!(matches!(
+        litebox_broker_core::socket::connect(&connector_session, connector, concrete_destination,),
+        Ok(SocketOutcome::Completed(
+            SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
+        ))
+    ));
+    wait_until_connected(&connector_session, connector, &publications);
+    assert_eq!(
+        litebox_broker_core::socket::status(&connector_session, connector)
+            .unwrap()
+            .local_address,
+        Some(SocketAddrV4::new(
+            Ipv4Addr::LOCALHOST,
+            connector_binding.port(),
+        ))
+    );
+    wait_until_ready(
+        &listener_session,
+        &publications,
+        wildcard_listener,
+        ReadinessFlags::READ,
+    );
+    let accepted = match litebox_broker_core::socket::accept(
+        &listener_session,
+        wildcard_listener,
+        readiness.clone(),
+    )
+    .unwrap()
+    {
+        SocketOutcome::Completed(accepted) => accepted,
+        SocketOutcome::Failed(error) => panic!("wildcard accept failed: {error:?}"),
+    };
+    assert_eq!(accepted.local_address, concrete_destination);
+    assert_eq!(
+        accepted.remote_address,
+        SocketAddrV4::new(Ipv4Addr::LOCALHOST, connector_binding.port())
+    );
+
+    let unspecified_connector = create_socket(&connector_session, readiness.clone());
+    assert!(matches!(
+        litebox_broker_core::socket::connect(
+            &connector_session,
+            unspecified_connector,
+            SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, wildcard_address.port()),
+        ),
+        Ok(SocketOutcome::Completed(
+            SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
+        ))
+    ));
+    wait_until_connected(&connector_session, unspecified_connector, &publications);
+    wait_until_ready(
+        &listener_session,
+        &publications,
+        wildcard_listener,
+        ReadinessFlags::READ,
+    );
+    let accepted =
+        match litebox_broker_core::socket::accept(&listener_session, wildcard_listener, readiness)
+            .unwrap()
+        {
+            SocketOutcome::Completed(accepted) => accepted,
+            SocketOutcome::Failed(error) => panic!("unspecified accept failed: {error:?}"),
+        };
+    assert_eq!(
+        accepted.local_address,
+        SocketAddrV4::new(Ipv4Addr::LOCALHOST, wildcard_address.port())
+    );
 }
 
 #[test]

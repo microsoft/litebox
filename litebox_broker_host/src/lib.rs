@@ -698,7 +698,7 @@ mod tests {
     use litebox_broker_core::readiness::ReadinessRegistration;
     use litebox_broker_core::socket::{
         AcceptedPlatformSocket, PlatformConnectError, PlatformDatagramReceive, PlatformSocket,
-        PlatformStreamReceive, SocketProvider,
+        PlatformSocketStatus, PlatformStreamReceive, SocketProvider,
     };
     use litebox_broker_core::{ObjectRights, PolicyEngine, SessionId, SocketPolicy};
     use litebox_broker_protocol::event::{
@@ -782,8 +782,9 @@ mod tests {
     impl PlatformSocket for TestPlatformSocket {
         fn bind(
             &self,
-            address: SocketAddrV4,
+            binding: litebox_broker_core::socket::GuestSocketBinding,
         ) -> litebox_broker_core::Result<SocketOutcome<SocketAddrV4>> {
+            let address = binding.requested();
             if self.create_request.socket_type == SocketType::Stream {
                 *self.local_address.lock().unwrap() = Some(address);
                 return Ok(SocketOutcome::Completed(address));
@@ -891,8 +892,8 @@ mod tests {
             }
         }
 
-        fn status(&self) -> litebox_broker_core::Result<SocketStatusResponse> {
-            Ok(SocketStatusResponse {
+        fn status(&self) -> litebox_broker_core::Result<PlatformSocketStatus> {
+            Ok(PlatformSocketStatus {
                 status: SocketConnectionStatus::Connected,
                 local_address: None,
                 pending_error: None,

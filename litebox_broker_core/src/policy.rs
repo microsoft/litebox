@@ -196,8 +196,8 @@ impl DestinationPolicy {
 
 /// Socket creation and outbound destination access available to broker-owned sockets.
 ///
-/// Local bind authority is separate from egress destination rules: an admitted
-/// IPv4 TCP or UDP socket may bind only within the IPv4 loopback network.
+/// Local bind authority is separate from egress destination rules and is
+/// enforced by the broker's guest binding namespace.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 #[expect(
@@ -208,7 +208,7 @@ pub enum SocketPolicy {
     /// Deny all socket creation and connection attempts.
     #[default]
     Deny,
-    /// Allow IPv4 TCP and UDP sockets to use only the IPv4 loopback network.
+    /// Allow IPv4 TCP and UDP sockets with destinations in the IPv4 loopback network.
     Ipv4Loopback,
     /// Apply bounded TCP destination rules.
     TcpDestinationRules(DestinationPolicy),
@@ -439,43 +439,19 @@ impl PolicyEngine {
     pub(crate) fn authorize_socket_connect(
         &self,
         caller_credential: CallerCredential,
-        request: CreateSocketRequest,
+        protocol: IpProtocol,
         address: SocketAddrV4,
     ) -> Result<(), BrokerError> {
-        self.principal_object_rights(caller_credential)?;
-        let permitted = match (request.socket_type, request.protocol) {
-            (SocketType::Stream, IpProtocol::Tcp) => self
+        let permitted = match protocol {
+            IpProtocol::Tcp => self
                 .socket_policy
                 .permits_tcp_destination(caller_credential, address),
-            (SocketType::Datagram, IpProtocol::Udp) => self
+            IpProtocol::Udp => self
                 .socket_policy
                 .permits_udp_destination(caller_credential, address),
             _ => false,
         };
-        if request.address_family == AddressFamily::Ipv4 && permitted {
-            Ok(())
-        } else {
-            Err(BrokerError::PolicyDenied)
-        }
-    }
-
-    pub(crate) fn authorize_socket_bind(
-        &self,
-        caller_credential: CallerCredential,
-        request: CreateSocketRequest,
-        address: SocketAddrV4,
-    ) -> Result<(), BrokerError> {
-        self.principal_object_rights(caller_credential)?;
-        // Egress rules do not describe local listener authority. Socket
-        // creation admission plus this fixed loopback boundary governs binds.
-        let supported_socket = matches!(
-            (request.socket_type, request.protocol),
-            (SocketType::Stream, IpProtocol::Tcp) | (SocketType::Datagram, IpProtocol::Udp)
-        );
-        if request.address_family == AddressFamily::Ipv4
-            && supported_socket
-            && address.ip().is_loopback()
-        {
+        if permitted {
             Ok(())
         } else {
             Err(BrokerError::PolicyDenied)
@@ -666,7 +642,7 @@ mod tests {
         assert_eq!(
             unauthenticated.authorize_socket_connect(
                 CallerCredential::Unauthenticated,
-                IPV4_TCP,
+                IpProtocol::Tcp,
                 address([10, 15, 0, 1], 443),
             ),
             Ok(())
@@ -680,7 +656,7 @@ mod tests {
             assert_eq!(
                 unauthenticated.authorize_socket_connect(
                     CallerCredential::Unauthenticated,
-                    IPV4_TCP,
+                    IpProtocol::Tcp,
                     denied,
                 ),
                 Err(BrokerError::PolicyDenied)
@@ -695,7 +671,7 @@ mod tests {
         assert_eq!(
             policy.authorize_socket_connect(
                 CallerCredential::Unauthenticated,
-                IPV4_TCP,
+                IpProtocol::Tcp,
                 address([127, 255, 0, 1], 80),
             ),
             Ok(())
@@ -703,7 +679,7 @@ mod tests {
         assert_eq!(
             policy.authorize_socket_connect(
                 CallerCredential::Unauthenticated,
-                IPV4_TCP,
+                IpProtocol::Tcp,
                 address([10, 0, 0, 1], 80),
             ),
             Err(BrokerError::PolicyDenied)
@@ -711,7 +687,7 @@ mod tests {
         assert_eq!(
             policy.authorize_socket_connect(
                 CallerCredential::Unauthenticated,
-                IPV4_TCP,
+                IpProtocol::Tcp,
                 address([127, 0, 0, 1], 0),
             ),
             Ok(())
@@ -719,7 +695,7 @@ mod tests {
         assert_eq!(
             policy.authorize_socket_connect(
                 CallerCredential::Unauthenticated,
-                IPV4_UDP,
+                IpProtocol::Udp,
                 address([127, 0, 0, 1], 53),
             ),
             Ok(())
@@ -727,7 +703,7 @@ mod tests {
         assert_eq!(
             policy.authorize_socket_connect(
                 CallerCredential::Unauthenticated,
-                IPV4_UDP,
+                IpProtocol::Udp,
                 address([10, 0, 0, 1], 53),
             ),
             Err(BrokerError::PolicyDenied)
@@ -758,7 +734,7 @@ mod tests {
         assert_eq!(
             policy.authorize_socket_connect(
                 CallerCredential::Unauthenticated,
-                IPV4_UDP,
+                IpProtocol::Udp,
                 address([127, 0, 0, 1], 53),
             ),
             Ok(())
@@ -766,24 +742,8 @@ mod tests {
         assert_eq!(
             policy.authorize_socket_connect(
                 CallerCredential::Unauthenticated,
-                IPV4_UDP,
+                IpProtocol::Udp,
                 address([192, 0, 2, 1], 443),
-            ),
-            Err(BrokerError::PolicyDenied)
-        );
-        assert_eq!(
-            policy.authorize_socket_bind(
-                CallerCredential::Unauthenticated,
-                IPV4_UDP,
-                address([127, 0, 0, 1], 0),
-            ),
-            Ok(())
-        );
-        assert_eq!(
-            policy.authorize_socket_bind(
-                CallerCredential::Unauthenticated,
-                IPV4_UDP,
-                address([0, 0, 0, 0], 0),
             ),
             Err(BrokerError::PolicyDenied)
         );
