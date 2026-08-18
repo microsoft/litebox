@@ -1255,7 +1255,7 @@ fn udp_exact_bindings_coexist_and_wildcard_covers_loopback() {
 }
 
 #[test]
-fn udp_external_route_slot_reuses_and_retires_its_native_endpoint() {
+fn udp_native_endpoint_is_reused_and_retired() {
     let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
@@ -1339,7 +1339,7 @@ fn udp_endpoint_staging_error_rolls_back_external_peer_reservation() {
     let external = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let external_address = socket_address_v4(external.local_addr().unwrap());
 
-    provider.reactor.exhaust_udp_endpoint_generation();
+    provider.reactor.exhaust_udp_event_tokens();
     assert_eq!(
         send_datagram(
             &session,

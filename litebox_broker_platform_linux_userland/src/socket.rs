@@ -50,8 +50,8 @@ use tcp::{
     PendingGuestConnectionMatch, PendingGuestTcpConnection,
 };
 use udp::{
-    ReactorUdpBinding, ReactorUdpPeer, ReactorUdpState, UDP_EVENT_TOKEN_FLAG, UdpEndpointSlot,
-    UdpNativeRoute, UdpReceiveOrigin, UdpSocketState, is_local_ipv4_address,
+    ReactorUdpBinding, ReactorUdpPeer, ReactorUdpState, UDP_EVENT_TOKEN_FLAG, UdpReceiveOrigin,
+    UdpSocketState, is_local_ipv4_address,
 };
 
 /// Epoll token reserved for the eventfd that wakes the reactor for commands.
@@ -664,10 +664,10 @@ impl ReactorClient {
     }
 
     #[cfg(test)]
-    fn exhaust_udp_endpoint_generation(&self) {
+    fn exhaust_udp_event_tokens(&self) {
         let (response, receive) = sync_channel(1);
         self.commands
-            .send(ReactorCommand::ExhaustUdpEndpointGeneration { response })
+            .send(ReactorCommand::ExhaustUdpEventTokens { response })
             .unwrap();
         self.signal().unwrap();
         receive.recv().unwrap();
@@ -891,7 +891,7 @@ enum ReactorCommand {
         response: SyncSender<BrokerResult<(bool, usize)>>,
     },
     #[cfg(test)]
-    ExhaustUdpEndpointGeneration {
+    ExhaustUdpEventTokens {
         response: SyncSender<()>,
     },
     #[cfg(test)]
@@ -1112,8 +1112,6 @@ impl Reactor {
                 }
             };
             let mut reused_host_address = None;
-            let native_route = UdpNativeRoute::External;
-            let endpoint_slot = UdpEndpointSlot::Active(native_route);
             let mut staged_endpoint = match peer {
                 ReactorUdpPeer::Guest { .. } => None,
                 ReactorUdpPeer::External(address) => {
@@ -1123,10 +1121,11 @@ impl Reactor {
                         .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?
                         .udp_state()
                         .map_err(PlatformConnectError::PeerUnchanged)?
-                        .native_endpoint(native_route)
+                        .native_endpoint
+                        .as_ref()
                         .is_some()
                     {
-                        match self.connect_existing_udp_endpoint(id, native_route, address)? {
+                        match self.connect_existing_udp_endpoint(id, address)? {
                             SocketOutcome::Completed(host_address) => {
                                 reused_host_address = Some(host_address);
                                 None
@@ -1137,13 +1136,7 @@ impl Reactor {
                         }
                     } else {
                         match self
-                            .stage_udp_endpoint(
-                                id,
-                                native_route,
-                                endpoint_slot,
-                                address,
-                                Some(address),
-                            )
+                            .stage_udp_endpoint(id, address, Some(address))
                             .map_err(PlatformConnectError::PeerUnchanged)?
                         {
                             SocketOutcome::Completed(endpoint) => Some(endpoint),
@@ -1192,10 +1185,7 @@ impl Reactor {
                 }
             };
             if reused_host_address.is_none() {
-                self.replace_all_udp_endpoints(id, staged_endpoint.take())
-                    .map_err(PlatformConnectError::PeerIndeterminate)?;
-            } else {
-                self.retain_udp_endpoint(id, native_route)
+                self.replace_udp_endpoint(id, staged_endpoint.take())
                     .map_err(PlatformConnectError::PeerIndeterminate)?;
             }
             self.clear_udp_external_peers(id)
@@ -1268,8 +1258,6 @@ impl Reactor {
                 self.enqueue_guest_datagram(id, socket_generation, data)
             }
             ReactorUdpPeer::External(address) => {
-                let native_route = UdpNativeRoute::External;
-                let endpoint_slot = UdpEndpointSlot::Active(native_route);
                 let external_peer_added = if authorize_external_reply {
                     self.reserve_udp_external_peer(id, address)?
                 } else {
@@ -1280,16 +1268,11 @@ impl Reactor {
                     .get(&id)
                     .ok_or(BrokerError::Internal)?
                     .udp_state()?
-                    .native_endpoint(native_route)
+                    .native_endpoint
+                    .as_ref()
                     .is_none()
                 {
-                    let endpoint = match self.stage_udp_endpoint(
-                        id,
-                        native_route,
-                        endpoint_slot,
-                        address,
-                        None,
-                    ) {
+                    let endpoint = match self.stage_udp_endpoint(id, address, None) {
                         Ok(SocketOutcome::Completed(endpoint)) => endpoint,
                         Ok(SocketOutcome::Failed(error)) => {
                             if external_peer_added {
@@ -1304,9 +1287,9 @@ impl Reactor {
                             return Err(error);
                         }
                     };
-                    self.replace_udp_endpoint(id, native_route, Some(endpoint))?;
+                    self.replace_udp_endpoint(id, Some(endpoint))?;
                 }
-                let outcome = self.send_external_udp(id, endpoint_slot, data, address);
+                let outcome = self.send_external_udp(id, data, address);
                 if !matches!(outcome, Ok(SocketOutcome::Completed(_))) && external_peer_added {
                     self.remove_udp_external_peer(id, address);
                 }
@@ -1349,10 +1332,10 @@ impl Reactor {
             socket.write_shutdown |= shut_write;
             if shut_read {
                 let udp = socket.udp_state_mut()?;
-                if udp.peeked_origin == Some(UdpReceiveOrigin::External) {
+                if udp.peeked_origin == Some(UdpReceiveOrigin::Native) {
                     udp.peeked_origin = None;
                 }
-                if let Some(endpoint) = udp.native_endpoint_mut(UdpNativeRoute::External) {
+                if let Some(endpoint) = udp.native_endpoint.as_mut() {
                     endpoint.readable = false;
                 }
             }
@@ -1411,15 +1394,13 @@ impl Reactor {
             .next_receive_origin;
         let first = pinned.unwrap_or(next);
         let second = match first {
-            UdpReceiveOrigin::Guest => UdpReceiveOrigin::External,
-            UdpReceiveOrigin::External => UdpReceiveOrigin::Guest,
+            UdpReceiveOrigin::Guest => UdpReceiveOrigin::Native,
+            UdpReceiveOrigin::Native => UdpReceiveOrigin::Guest,
         };
         for origin in [first, second] {
             let outcome = match origin {
                 UdpReceiveOrigin::Guest => self.receive_guest_udp(id, length, flags)?,
-                UdpReceiveOrigin::External => {
-                    self.receive_native_udp(id, UdpNativeRoute::External, length, flags)?
-                }
+                UdpReceiveOrigin::Native => self.receive_native_udp(id, length, flags)?,
             };
             if let Some(outcome) = outcome {
                 return Ok(outcome);
@@ -1442,7 +1423,7 @@ impl Reactor {
         };
         if kind == SocketKind::Udp {
             let _ = self.clear_udp_receive_queue(id);
-            let _ = self.replace_all_udp_endpoints(id, None);
+            let _ = self.replace_udp_endpoint(id, None);
             if let Some(binding) = self.udp.binding_for_socket(id) {
                 self.udp
                     .remove_binding(binding.guest_binding.requested().port(), id);
@@ -1724,7 +1705,7 @@ impl Reactor {
                                 .get(guest_port)
                                 .and_then(|binding| self.sockets.get(&binding.socket_id))
                                 .and_then(|socket| socket.udp_state().ok())
-                                .and_then(|udp| udp.native_endpoint(UdpNativeRoute::External))
+                                .and_then(|udp| udp.native_endpoint.as_ref())
                                 .map(|endpoint| endpoint.host_address)
                         });
                     let _ = response.send(host_address);
@@ -1760,7 +1741,7 @@ impl Reactor {
                         .get(guest_port)
                         .and_then(|binding| self.sockets.get(&binding.socket_id))
                         .and_then(|socket| socket.udp_state().ok())
-                        .and_then(|udp| udp.native_endpoint(UdpNativeRoute::External))
+                        .and_then(|udp| udp.native_endpoint.as_ref())
                         .map(|endpoint| {
                             sockopt::socket_recv_buffer_size(&endpoint.socket)
                                 .map_err(broker_error_from_errno)
@@ -1807,16 +1788,12 @@ impl Reactor {
                             .get_mut(&socket_id)
                             .ok_or(BrokerError::Internal)?
                             .udp_state_mut()?
-                            .native_endpoint_mut(UdpNativeRoute::External)
+                            .native_endpoint
+                            .as_mut()
                             .ok_or(BrokerError::Internal)?
                             .readable = true;
                         if self
-                            .receive_native_udp(
-                                socket_id,
-                                UdpNativeRoute::External,
-                                1,
-                                ReceiveFromFlags::NONE,
-                            )?
+                            .receive_native_udp(socket_id, 1, ReceiveFromFlags::NONE)?
                             .is_some()
                         {
                             return Err(BrokerError::Internal);
@@ -1826,7 +1803,8 @@ impl Reactor {
                             .get(&socket_id)
                             .ok_or(BrokerError::Internal)?
                             .udp_state()?
-                            .native_endpoint(UdpNativeRoute::External)
+                            .native_endpoint
+                            .as_ref()
                             .map(|endpoint| endpoint.readable)
                             .ok_or(BrokerError::Internal)?;
                         let head_datagram_bytes = self.udp_native_head_datagram_bytes(socket_id)?;
@@ -1835,8 +1813,8 @@ impl Reactor {
                     let _ = response.send(outcome);
                 }
                 #[cfg(test)]
-                ReactorCommand::ExhaustUdpEndpointGeneration { response } => {
-                    self.udp.next_endpoint_generation = u64::MAX;
+                ReactorCommand::ExhaustUdpEventTokens { response } => {
+                    self.udp.next_event_token = UDP_EVENT_TOKEN_FLAG - 1;
                     let _ = response.send(());
                 }
                 #[cfg(test)]
