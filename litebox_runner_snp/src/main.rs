@@ -34,15 +34,7 @@ impl log::Log for HostLogger {
 static HOST_LOGGER: HostLogger = HostLogger;
 
 type Platform = litebox_platform_linux_kernel::host::snp::snp_impl::SnpLinuxKernel;
-type DefaultFS = litebox::fs::layered::FileSystem<
-    Platform,
-    litebox::fs::resolver::Resolver<Platform, litebox::fs::in_mem::InMem<Platform>>,
-    litebox::fs::layered::FileSystem<
-        Platform,
-        litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>,
-        litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>,
-    >,
->;
+type DefaultFS = litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>;
 
 type Shim = litebox_shim_linux::LinuxShim<Platform, DefaultFS>;
 
@@ -207,16 +199,6 @@ pub extern "C" fn sandbox_process_init(
     #[allow(clippy::missing_panics_doc)]
     let shim = SHIM.get().expect("initialized");
     let litebox = shim.litebox();
-    let in_mem_fs = litebox::fs::resolver::Resolver::new(
-        litebox,
-        litebox::fs::in_mem::InMem::new_initialized([(
-            "/tmp",
-            litebox::fs::in_mem::InitialNode::Directory {
-                mode: litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
-                owner: litebox::fs::UserInfo::ROOT,
-            },
-        )]),
-    );
 
     let socket_addr = core::net::SocketAddr::V4(core::net::SocketAddrV4::new(
         core::net::Ipv4Addr::new(10, 0, 0, 1),
@@ -229,7 +211,7 @@ pub extern "C" fn sandbox_process_init(
             globals::SM_TERM_GENERAL,
         );
     };
-    let nine_p_composer = litebox::fs::composer::Composer::builder()
+    let composer = litebox::fs::composer::Composer::builder()
         .mount("/", |allocator| {
             let Ok(backend) = litebox::fs::nine_p::NineP::<Platform, _>::new(
                 transport, 65536, "root", "/tmp", allocator,
@@ -242,16 +224,19 @@ pub extern "C" fn sandbox_process_init(
             };
             backend
         })
-        .build()
-        .unwrap_or_else(
-            |(litebox::fs::composer::BuildError::NoMounts
-             | litebox::fs::composer::BuildError::InvalidMountPath
-             | litebox::fs::composer::BuildError::DuplicateMountPath)| unreachable!(),
-        );
-    let nine_p = litebox::fs::resolver::Resolver::new(litebox, nine_p_composer);
-    let dev_stdio_composer = litebox::fs::composer::Composer::builder()
         .mount("/dev", |allocator| {
             litebox::fs::devices::Devices::new(litebox, allocator)
+        })
+        .mount("/tmp", |_allocator| {
+            litebox::fs::in_mem::InMem::<Platform>::new_initialized([(
+                "/",
+                litebox::fs::in_mem::InitialNode::Directory {
+                    mode: litebox::fs::Mode::RWXU
+                        | litebox::fs::Mode::RWXG
+                        | litebox::fs::Mode::RWXO,
+                    owner: litebox::fs::UserInfo::ROOT,
+                },
+            )])
         })
         .build()
         .unwrap_or_else(
@@ -259,19 +244,7 @@ pub extern "C" fn sandbox_process_init(
              | litebox::fs::composer::BuildError::InvalidMountPath
              | litebox::fs::composer::BuildError::DuplicateMountPath)| unreachable!(),
         );
-    let dev_stdio = litebox::fs::resolver::Resolver::new(litebox, dev_stdio_composer);
-    let default_fs = litebox::fs::layered::FileSystem::new(
-        litebox,
-        in_mem_fs,
-        litebox::fs::layered::FileSystem::new(
-            litebox,
-            dev_stdio,
-            nine_p,
-            litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
-        ),
-        litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
-    );
-    let fs = alloc::sync::Arc::new(default_fs);
+    let fs = alloc::sync::Arc::new(litebox::fs::resolver::Resolver::new(litebox, composer));
 
     // Loading a program may trigger page faults, so we need to set SHIM before this.
     let program = match shim.load_program(fs, platform.init_task(boot_params), &program, argv, envp)
