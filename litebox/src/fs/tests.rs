@@ -1209,7 +1209,7 @@ mod overlay {
     /// An upper backend whose root is writable by the acting user, holding `entries`.
     ///
     /// The overlay directs every mutation to the upper backend, so its root has to allow writes for
-    /// anything to be created; the old `layered` tests chmod-ed `/` as root for the same reason.
+    /// anything to be created.
     fn upper(
         entries: impl IntoIterator<Item = (&'static str, InitialNode)>,
     ) -> InMem<MockPlatform> {
@@ -1281,11 +1281,10 @@ mod overlay {
         fs.close(&fd).expect("Failed to close dir");
     }
 
-    /// Check that for the same file, even though it started as a lower-level file, writing to it
-    /// successfully migrated it to an upper-level file, and converted the internal descriptors
-    /// over, such that the expected semantics of being able to see the updated file are held.
+    /// Check that for the same file, even though it started as a lower file, writing to it copies
+    /// it up and redirects handles already open on it, so every descriptor sees the update.
     #[test]
-    fn file_read_write_sync_up() {
+    fn file_read_write_copy_up() {
         let litebox = LiteBox::new(MockPlatform::new());
         let fs = overlay_fs(&litebox, upper([]));
         let fd1 = fs
@@ -1316,10 +1315,10 @@ mod overlay {
         fs.close(&fd2).expect("Failed to close file");
     }
 
-    /// Similar to [`file_read_write_sync_up`] but also confirm that file positions have been
+    /// Similar to [`file_read_write_copy_up`] but also confirm that file positions have been
     /// maintained.
     #[test]
-    fn file_read_write_seek_sync() {
+    fn file_read_write_copy_up_keeps_position() {
         let litebox = LiteBox::new(MockPlatform::new());
         let fs = overlay_fs(&litebox, upper([]));
         let fd1 = fs
@@ -1576,7 +1575,7 @@ mod overlay {
     }
 
     #[test]
-    fn o_excl_layered_tests() {
+    fn o_excl_tests() {
         let litebox = LiteBox::new(MockPlatform::new());
         let fs = overlay_fs(&litebox, upper([]));
 
@@ -1600,7 +1599,7 @@ mod overlay {
             )
             .expect("Failed to create new file with O_CREAT | O_EXCL");
 
-        fs.write(&fd, b"layered test", None)
+        fs.write(&fd, b"overlay test", None)
             .expect("Failed to write to new file");
         fs.close(&fd).expect("Failed to close new file");
 
@@ -1709,7 +1708,7 @@ mod overlay {
     }
 
     #[test]
-    fn file_creation_with_ancestor_dir_migration() {
+    fn file_creation_materializes_ancestor_dirs() {
         let litebox = LiteBox::new(MockPlatform::new());
         let fs = overlay_fs(&litebox, upper([]));
 
@@ -1744,12 +1743,12 @@ mod overlay {
     }
 
     #[test]
-    fn file_modification_with_ancestor_dir_migration() {
+    fn file_modification_materializes_ancestor_dirs() {
         let litebox = LiteBox::new(MockPlatform::new());
         let fs = overlay_fs(&litebox, upper([]));
 
         // Open bar/baz for writing (both bar and baz exist in lower layer)
-        // This should migrate ancestor directories and allow file modification
+        // This copies up the ancestor directories and allows the file to be modified
         let fd = fs
             .open("bar/baz", OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to open bar/baz for writing");
@@ -1784,7 +1783,7 @@ mod overlay {
         let litebox = LiteBox::new(MockPlatform::new());
         let fs = overlay_fs(&litebox, upper([]));
 
-        // Open with O_TRUNC should create a shadow file in upper layer
+        // Open with O_TRUNC should copy the file up into the upper backend, empty
         let fd = fs
             .open("foo", OFlags::RDWR | OFlags::TRUNC, Mode::empty())
             .expect("Failed to open file with O_TRUNC");
@@ -1918,7 +1917,7 @@ mod overlay {
     }
 
     #[test]
-    fn migrate_file_up_does_not_deadlock() {
+    fn copy_up_does_not_deadlock() {
         use std::sync::mpsc;
         use std::thread;
         use std::time::Duration;
@@ -1940,7 +1939,7 @@ mod overlay {
         });
 
         rx.recv_timeout(Duration::from_secs(2))
-            .expect("migrate_file_up deadlocked");
+            .expect("copy-up deadlocked");
     }
 }
 
