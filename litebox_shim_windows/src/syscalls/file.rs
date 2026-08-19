@@ -1223,30 +1223,53 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if position < 0 {
             return NtStatus::INVALID_PARAMETER;
         }
-        let file = match self.file_entry(file_handle) {
+        // Setting the current byte offset requires the handle to grant data access (either
+        // FILE_READ_DATA or FILE_WRITE_DATA) and to have been opened for synchronous I/O: the
+        // file position is a property of a synchronous file object. Resolving the handle through
+        // the access-aware lookup prevents a metadata-only duplicate from moving the file
+        // position shared with a more privileged handle, and the synchronous-mode check rejects
+        // asynchronous handles that have no meaningful current position, matching NT.
+        let file = match self.typed_handle_entry_with_access_check::<FileObjectSubsystem<FS>>(
+            file_handle,
+            |granted_access| {
+                granted_access & (FileAccess::READ_DATA | FileAccess::WRITE_DATA).bits() != 0
+            },
+        ) {
             Ok(file) => file,
             Err(status) => return status,
         };
-        let result = file.with_entry(|file| match &file.backing {
-            FileObjectBacking::Filesystem { fd, is_directory } => {
-                if *is_directory {
-                    return Err(SeekError::NonSeekable);
+        let result = file.with_entry(|file| {
+            if !file
+                .create_options
+                .intersects(FileCreateOptions::SYNCHRONOUS_IO)
+            {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            let seek = match &file.backing {
+                FileObjectBacking::Filesystem { fd, is_directory } => {
+                    if *is_directory {
+                        Err(SeekError::NonSeekable)
+                    } else {
+                        self.fs.seek(fd, position, SeekWhence::RelativeToBeginning)
+                    }
                 }
-                self.fs.seek(fd, position, SeekWhence::RelativeToBeginning)
-            }
-            FileObjectBacking::CondrvStream { fd, .. } => {
-                self.fs.seek(fd, position, SeekWhence::RelativeToBeginning)
-            }
-            FileObjectBacking::CondrvControl(_) | FileObjectBacking::KsecDevice => {
-                Err(SeekError::NonSeekable)
-            }
+                FileObjectBacking::CondrvStream { fd, .. } => {
+                    self.fs.seek(fd, position, SeekWhence::RelativeToBeginning)
+                }
+                FileObjectBacking::CondrvControl(_) | FileObjectBacking::KsecDevice => {
+                    Err(SeekError::NonSeekable)
+                }
+            };
+            seek.map_err(|err| match err {
+                SeekError::ClosedFd => NtStatus::INVALID_HANDLE,
+                SeekError::InvalidOffset => NtStatus::INVALID_PARAMETER,
+                SeekError::NonSeekable => NtStatus::INVALID_DEVICE_REQUEST,
+                _ => NtStatus::UNSUCCESSFUL,
+            })
         });
         let status = match result {
             Ok(_) => NtStatus::SUCCESS,
-            Err(SeekError::ClosedFd) => NtStatus::INVALID_HANDLE,
-            Err(SeekError::InvalidOffset) => NtStatus::INVALID_PARAMETER,
-            Err(SeekError::NonSeekable) => NtStatus::INVALID_DEVICE_REQUEST,
-            Err(_) => NtStatus::UNSUCCESSFUL,
+            Err(status) => status,
         };
         litebox_util_log::debug!(
             file_handle = file_handle.as_raw(),
@@ -3437,6 +3460,170 @@ mod tests {
                 ),
                 NtStatus::SUCCESS
             );
+            assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
+        });
+    }
+
+    const FILE_POSITION_INFORMATION_CLASS: u32 = 14;
+
+    fn const_byte_ptr<T>(value: &T) -> ConstPtr<TestPlatform, u8> {
+        ConstPtr::<TestPlatform, u8>::from_usize(core::ptr::from_ref(value).cast::<u8>() as usize)
+    }
+
+    fn create_file_with_options(
+        task: &Task<TestPlatform, TestFS>,
+        path: &str,
+        desired_access: u32,
+        create_disposition: u32,
+        create_options: u32,
+    ) -> (NtStatus, Handle, IoStatusBlock) {
+        let (_path, _name, attributes) = open_object_attributes(path);
+        let mut handle = Handle::default();
+        let mut io_status = IoStatusBlock::default();
+        let status = task.sys_nt_create_file(
+            mut_ptr(&mut handle),
+            desired_access,
+            Some(const_ptr(&attributes)),
+            mut_ptr(&mut io_status),
+            None,
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            create_disposition,
+            create_options,
+            None,
+            0,
+        );
+        (status, handle, io_status)
+    }
+
+    fn set_file_position(
+        task: &Task<TestPlatform, TestFS>,
+        handle: Handle,
+        position: i64,
+    ) -> (NtStatus, IoStatusBlock) {
+        let mut io_status = IoStatusBlock::new(NtStatus::UNSUCCESSFUL, usize::MAX);
+        let status = task.sys_nt_set_information_file(
+            handle,
+            mut_ptr(&mut io_status),
+            const_byte_ptr(&position),
+            8,
+            FILE_POSITION_INFORMATION_CLASS,
+        );
+        (status, io_status)
+    }
+
+    #[test]
+    fn nt_set_position_information_updates_synchronous_position() {
+        run_with_test_platform_pointers(|| {
+            let task = crate::tests::test_task();
+            create_existing_file(&task, "/tmp/set-pos.txt", b"0123456789");
+            let (status, handle, _) =
+                create_file(&task, "/tmp/set-pos.txt", FILE_GENERIC_READ, FILE_OPEN);
+            assert_eq!(status, NtStatus::SUCCESS);
+
+            let (status, io_status) = set_file_position(&task, handle, 4);
+            assert_eq!(status, NtStatus::SUCCESS);
+            assert_eq!(io_status.status, NtStatus::SUCCESS.as_raw());
+
+            // A subsequent read with no explicit offset starts at the new position.
+            let mut output = [0u8; 3];
+            let mut read_status = IoStatusBlock::new(NtStatus::UNSUCCESSFUL, usize::MAX);
+            assert_eq!(
+                task.sys_nt_read_file(
+                    handle,
+                    Handle::default(),
+                    None,
+                    None,
+                    mut_ptr(&mut read_status),
+                    mut_byte_ptr(&mut output),
+                    output.len().try_into().unwrap(),
+                    None,
+                    None,
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(&output, b"456");
+            assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
+        });
+    }
+
+    #[test]
+    fn nt_set_position_information_rejects_duplicate_without_data_access() {
+        run_with_test_platform_pointers(|| {
+            let task = crate::tests::test_task();
+            create_existing_file(&task, "/tmp/set-pos-access.txt", b"0123456789");
+            let (status, source, _) = create_file(
+                &task,
+                "/tmp/set-pos-access.txt",
+                FILE_GENERIC_READ,
+                FILE_OPEN,
+            );
+            assert_eq!(status, NtStatus::SUCCESS);
+
+            let mut restricted = Handle::default();
+            assert_eq!(
+                task.sys_nt_duplicate_object(
+                    crate::syscalls::ProcessHandle::CURRENT,
+                    source,
+                    crate::syscalls::ProcessHandle::CURRENT,
+                    Some(mut_ptr(&mut restricted)),
+                    FileAccess::READ_ATTRIBUTES.bits(),
+                    0,
+                    0,
+                ),
+                NtStatus::SUCCESS
+            );
+
+            let (status, io_status) = set_file_position(&task, restricted, 4);
+            assert_eq!(status, NtStatus::ACCESS_DENIED);
+            // The early access-denied return must leave the caller's IO status untouched.
+            assert_eq!(io_status.status, NtStatus::UNSUCCESSFUL.as_raw());
+            assert_eq!(io_status.information, usize::MAX);
+
+            // The privileged source handle's shared position must be unchanged: a read with no
+            // explicit offset still starts at the beginning.
+            let mut output = [0u8; 3];
+            let mut read_status = IoStatusBlock::new(NtStatus::UNSUCCESSFUL, usize::MAX);
+            assert_eq!(
+                task.sys_nt_read_file(
+                    source,
+                    Handle::default(),
+                    None,
+                    None,
+                    mut_ptr(&mut read_status),
+                    mut_byte_ptr(&mut output),
+                    output.len().try_into().unwrap(),
+                    None,
+                    None,
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(&output, b"012");
+
+            assert_eq!(task.sys_nt_close(source), NtStatus::SUCCESS);
+            assert_eq!(task.sys_nt_close(restricted), NtStatus::SUCCESS);
+        });
+    }
+
+    #[test]
+    fn nt_set_position_information_rejects_asynchronous_handle() {
+        run_with_test_platform_pointers(|| {
+            let task = crate::tests::test_task();
+            create_existing_file(&task, "/tmp/set-pos-async.txt", b"0123456789");
+            let (status, handle, _) = create_file_with_options(
+                &task,
+                "/tmp/set-pos-async.txt",
+                FILE_GENERIC_READ,
+                FILE_OPEN,
+                0,
+            );
+            assert_eq!(status, NtStatus::SUCCESS);
+
+            let (status, io_status) = set_file_position(&task, handle, 4);
+            assert_eq!(status, NtStatus::INVALID_PARAMETER);
+            assert_eq!(io_status.status, NtStatus::INVALID_PARAMETER.as_raw());
+            assert_eq!(io_status.information, 0);
+
             assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
         });
     }
