@@ -970,60 +970,44 @@ const GUEST_X18_OFFSET_PLACEHOLDER: u16 = MAX_GUEST_TPIDR_OFFSET - 8;
 pub const X18_FRAME_BYTES: u16 = 16;
 const X18_FRAME_OFF_SCRATCHES: u16 = 0;
 
-/// State of an x18 gate's scratch frame at an interrupted instruction boundary.
+/// Location of guest scratch state at an emitted x18 instruction boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum X18FrameState {
-    /// No frame exists; SP and scratch registers are already guest-visible.
     Absent,
-    /// SP points to the frame, but the original scratch registers are still live.
     AtSpRegistersLive,
-    /// SP points to the frame holding the original scratch registers.
     AtSpRestoreRegisters,
-    /// SP is above the frame, which still holds the original scratch registers.
     BelowSpRestoreRegisters,
 }
 
 /// Source of the guest-visible x18 value during recovery.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum X18ValueSource {
-    /// Read x18 from its runtime-owned logical slot.
     Slot,
-    /// Read the updated x18 value from the gate's value scratch register.
     Scratch,
 }
 
 /// Guest PC selected after x18 gate recovery.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum X18Resume {
-    /// Resume at the original guest instruction.
     Original,
-    /// Resume at the instruction following the original guest instruction.
     Next,
-    /// Resume at the original conditional branch target.
     TakenTarget,
 }
 
-/// Runtime-owned x18-slot access about to execute at a gate boundary.
+/// Runtime-owned x18-slot access at an emitted instruction boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum X18SlotAccess {
-    /// The boundary instruction does not access the logical x18 slot.
     None,
-    /// The boundary instruction loads the logical x18 slot.
     Load,
-    /// The boundary instruction stores the logical x18 slot.
     Store,
 }
 
 /// Host-neutral recovery semantics derived from an emitted x18 gate boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct X18RecoveryPlan {
-    /// Scratch-frame state at this instruction boundary.
     pub frame: X18FrameState,
-    /// Source of the canonical guest x18 value.
     pub value: X18ValueSource,
-    /// Guest PC selected by recovery.
     pub resume: X18Resume,
-    /// Runtime-owned slot access about to execute at this boundary.
     pub slot_access: X18SlotAccess,
 }
 
@@ -1160,9 +1144,15 @@ pub enum X18CompareBranchOffset {
     TakenPop = 36,
     /// Branch to the original taken target.
     TakenBranch = 40,
+    /// First byte after the executable gate body.
+    ExecutableEnd = 44,
 }
 
 impl X18CompareBranchOffset {
+    const fn as_usize(self) -> usize {
+        self as u8 as usize
+    }
+
     /// Decodes an executable instruction boundary.
     pub fn from_offset(offset: usize) -> Option<Self> {
         Some(match offset {
@@ -1182,13 +1172,13 @@ impl X18CompareBranchOffset {
     }
 
     /// Returns the recovery semantics for this emitted instruction boundary.
-    pub const fn recovery_plan(self) -> X18RecoveryPlan {
+    pub const fn recovery_plan(self) -> Option<X18RecoveryPlan> {
         use X18FrameState::{Absent, AtSpRegistersLive, AtSpRestoreRegisters};
         use X18Resume::{Next, Original, TakenTarget};
         use X18SlotAccess::{Load, None as NoSlotAccess};
         use X18ValueSource::Slot;
 
-        match self {
+        Some(match self {
             Self::Entry => X18RecoveryPlan::new(Absent, Slot, Original, NoSlotAccess),
             Self::Spill => X18RecoveryPlan::new(AtSpRegistersLive, Slot, Original, NoSlotAccess),
             Self::Anchor | Self::Test => {
@@ -1209,7 +1199,8 @@ impl X18CompareBranchOffset {
                 X18RecoveryPlan::new(AtSpRegistersLive, Slot, TakenTarget, NoSlotAccess)
             }
             Self::TakenBranch => X18RecoveryPlan::new(Absent, Slot, TakenTarget, NoSlotAccess),
-        }
+            Self::ExecutableEnd => return None,
+        })
     }
 }
 
@@ -1231,9 +1222,15 @@ pub enum X18AdrOffset {
     Restore = 20,
     /// Branch back to guest code.
     Return = 24,
+    /// First byte after the executable gate body.
+    ExecutableEnd = 28,
 }
 
 impl X18AdrOffset {
+    const fn as_usize(self) -> usize {
+        self as u8 as usize
+    }
+
     /// Decodes an executable instruction boundary.
     pub fn from_offset(offset: usize) -> Option<Self> {
         Some(match offset {
@@ -1249,13 +1246,13 @@ impl X18AdrOffset {
     }
 
     /// Returns the recovery semantics for this emitted instruction boundary.
-    pub const fn recovery_plan(self) -> X18RecoveryPlan {
+    pub const fn recovery_plan(self) -> Option<X18RecoveryPlan> {
         use X18FrameState::{Absent, AtSpRegistersLive, AtSpRestoreRegisters};
         use X18Resume::{Next, Original};
         use X18SlotAccess::{None as NoSlotAccess, Store};
         use X18ValueSource::{Scratch, Slot};
 
-        match self {
+        Some(match self {
             Self::Entry => X18RecoveryPlan::new(Absent, Slot, Original, NoSlotAccess),
             Self::Anchor => X18RecoveryPlan::new(AtSpRegistersLive, Slot, Original, NoSlotAccess),
             Self::Adrp | Self::Add => {
@@ -1264,7 +1261,8 @@ impl X18AdrOffset {
             Self::SlotStore => X18RecoveryPlan::new(AtSpRestoreRegisters, Scratch, Next, Store),
             Self::Restore => X18RecoveryPlan::new(AtSpRestoreRegisters, Slot, Next, NoSlotAccess),
             Self::Return => X18RecoveryPlan::new(Absent, Slot, Next, NoSlotAccess),
-        }
+            Self::ExecutableEnd => return None,
+        })
     }
 }
 
@@ -1287,6 +1285,162 @@ pub const SVC_FRAME_OFF_RETADDR: u16 = 8;
 /// Address of this site's outbound stub. ABI: the runtime's syscall callback
 /// branches here to resume at the original syscall site.
 pub const SVC_FRAME_OFF_STUB: u16 = 16;
+
+/// Whether a synchronous fault at a boundary is attributable to runtime state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeAccess {
+    NoAccess,
+    Memory,
+}
+
+/// Source of the guest-visible MRS destination value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MrsTpidrValueSource {
+    Register,
+    Slot,
+}
+
+/// Host-neutral recovery semantics for an interrupted MRS-TPIDR gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MrsTpidrRecoveryPlan {
+    pub value: MrsTpidrValueSource,
+    pub completed: bool,
+    pub runtime_access: RuntimeAccess,
+}
+
+/// Instruction boundaries in the emitted MRS-TPIDR gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MrsTpidrGateOffset {
+    Entry = 0,
+    SlotLoad = 4,
+    Return = 8,
+    ExecutableEnd = 12,
+}
+
+impl MrsTpidrGateOffset {
+    const fn as_usize(self) -> usize {
+        self as u8 as usize
+    }
+
+    pub fn from_offset(offset: usize) -> Option<Self> {
+        Some(match offset {
+            0 => Self::Entry,
+            4 => Self::SlotLoad,
+            8 => Self::Return,
+            _ => return None,
+        })
+    }
+
+    pub const fn recovery_plan(self) -> Option<MrsTpidrRecoveryPlan> {
+        Some(match self {
+            Self::Entry => MrsTpidrRecoveryPlan {
+                value: MrsTpidrValueSource::Register,
+                completed: false,
+                runtime_access: RuntimeAccess::NoAccess,
+            },
+            Self::SlotLoad => MrsTpidrRecoveryPlan {
+                value: MrsTpidrValueSource::Slot,
+                completed: true,
+                runtime_access: RuntimeAccess::Memory,
+            },
+            Self::Return => MrsTpidrRecoveryPlan {
+                value: MrsTpidrValueSource::Register,
+                completed: true,
+                runtime_access: RuntimeAccess::NoAccess,
+            },
+            Self::ExecutableEnd => return None,
+        })
+    }
+}
+
+/// Location of guest x16 and SP at an emitted SVC instruction boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SvcFrameState {
+    NoFrame,
+    FrameAtSpX16Live,
+    RestoreX16FromFrame,
+}
+
+/// Host-neutral recovery semantics for an interrupted SVC gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SvcRecoveryPlan {
+    pub frame: SvcFrameState,
+    pub runtime_access: RuntimeAccess,
+}
+
+/// Instruction boundaries in the emitted SVC gate and its outbound stub.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SvcGateOffset {
+    Entry = 0,
+    SpillX16 = 4,
+    MaterializeReturnPage = 8,
+    MaterializeReturnAddress = 12,
+    StoreReturnAddress = 16,
+    MaterializeOutboundStub = 20,
+    StoreOutboundStub = 24,
+    LoadCallback = 28,
+    BranchCallback = 32,
+    OutboundRestoreX16 = 36,
+    OutboundRestoreSp = 40,
+    Return = 44,
+    ExecutableEnd = 48,
+}
+
+impl SvcGateOffset {
+    const fn as_usize(self) -> usize {
+        self as u8 as usize
+    }
+
+    pub fn from_offset(offset: usize) -> Option<Self> {
+        Some(match offset {
+            0 => Self::Entry,
+            4 => Self::SpillX16,
+            8 => Self::MaterializeReturnPage,
+            12 => Self::MaterializeReturnAddress,
+            16 => Self::StoreReturnAddress,
+            20 => Self::MaterializeOutboundStub,
+            24 => Self::StoreOutboundStub,
+            28 => Self::LoadCallback,
+            32 => Self::BranchCallback,
+            36 => Self::OutboundRestoreX16,
+            40 => Self::OutboundRestoreSp,
+            44 => Self::Return,
+            _ => return None,
+        })
+    }
+
+    pub const fn recovery_plan(self) -> Option<SvcRecoveryPlan> {
+        use RuntimeAccess::{Memory, NoAccess};
+        Some(match self {
+            Self::Entry => SvcRecoveryPlan {
+                frame: SvcFrameState::NoFrame,
+                runtime_access: NoAccess,
+            },
+            Self::SpillX16 | Self::MaterializeReturnPage => SvcRecoveryPlan {
+                frame: SvcFrameState::FrameAtSpX16Live,
+                runtime_access: NoAccess,
+            },
+            Self::MaterializeReturnAddress
+            | Self::StoreReturnAddress
+            | Self::MaterializeOutboundStub
+            | Self::StoreOutboundStub
+            | Self::BranchCallback => SvcRecoveryPlan {
+                frame: SvcFrameState::RestoreX16FromFrame,
+                runtime_access: NoAccess,
+            },
+            Self::LoadCallback => SvcRecoveryPlan {
+                frame: SvcFrameState::RestoreX16FromFrame,
+                runtime_access: Memory,
+            },
+            Self::OutboundRestoreX16
+            | Self::OutboundRestoreSp
+            | Self::Return
+            | Self::ExecutableEnd => return None,
+        })
+    }
+}
 
 pub const RT_SIGRETURN_TRAMPOLINE_BYTES: usize = 48;
 
@@ -1377,7 +1531,115 @@ pub const MSR_FRAME_BYTES: u16 = 32;
 const MSR_FRAME_OFF_X16: u16 = 0;
 /// Captured guest thread-pointer value, staged while all guest registers are
 /// still pristine.
-const MSR_FRAME_OFF_VALUE: u16 = 16;
+pub const MSR_FRAME_OFF_VALUE: u16 = 16;
+
+/// Location of guest scratch state at an emitted MSR-TPIDR instruction boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MsrTpidrFrameState {
+    Absent,
+    RegistersLive,
+    RestoreRegisters,
+}
+
+/// Host-neutral recovery semantics for an interrupted MSR-TPIDR gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MsrTpidrRecoveryPlan {
+    pub frame: MsrTpidrFrameState,
+    /// Whether the staged source value must authenticate recovery.
+    pub validate_capture: bool,
+    pub completed: bool,
+    pub runtime_access: RuntimeAccess,
+}
+
+/// Instruction boundaries in the emitted MSR-TPIDR gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MsrTpidrGateOffset {
+    Entry = 0,
+    SpillRegisters = 4,
+    CaptureSource = 8,
+    ReadAnchor = 12,
+    LoadCapturedSource = 16,
+    SlotStore = 20,
+    RestoreRegisters = 24,
+    RestoreSp = 28,
+    Return = 32,
+    ExecutableEnd = 36,
+}
+
+impl MsrTpidrGateOffset {
+    const fn as_usize(self) -> usize {
+        self as u8 as usize
+    }
+
+    pub fn from_offset(offset: usize) -> Option<Self> {
+        Some(match offset {
+            0 => Self::Entry,
+            4 => Self::SpillRegisters,
+            8 => Self::CaptureSource,
+            12 => Self::ReadAnchor,
+            16 => Self::LoadCapturedSource,
+            20 => Self::SlotStore,
+            24 => Self::RestoreRegisters,
+            28 => Self::RestoreSp,
+            32 => Self::Return,
+            _ => return None,
+        })
+    }
+
+    pub const fn recovery_plan(self) -> Option<MsrTpidrRecoveryPlan> {
+        use MsrTpidrFrameState::{Absent, RegistersLive, RestoreRegisters};
+        Some(match self {
+            Self::Entry => MsrTpidrRecoveryPlan {
+                frame: Absent,
+                validate_capture: false,
+                completed: false,
+                runtime_access: RuntimeAccess::NoAccess,
+            },
+            Self::SpillRegisters | Self::CaptureSource => MsrTpidrRecoveryPlan {
+                frame: RegistersLive,
+                validate_capture: false,
+                completed: false,
+                runtime_access: RuntimeAccess::NoAccess,
+            },
+            Self::ReadAnchor => MsrTpidrRecoveryPlan {
+                frame: RegistersLive,
+                validate_capture: true,
+                completed: false,
+                runtime_access: RuntimeAccess::NoAccess,
+            },
+            Self::LoadCapturedSource | Self::SlotStore => MsrTpidrRecoveryPlan {
+                frame: RestoreRegisters,
+                validate_capture: true,
+                completed: false,
+                runtime_access: if matches!(self, Self::SlotStore) {
+                    RuntimeAccess::Memory
+                } else {
+                    RuntimeAccess::NoAccess
+                },
+            },
+            Self::RestoreRegisters => MsrTpidrRecoveryPlan {
+                frame: RestoreRegisters,
+                validate_capture: true,
+                completed: true,
+                runtime_access: RuntimeAccess::NoAccess,
+            },
+            Self::RestoreSp => MsrTpidrRecoveryPlan {
+                frame: RegistersLive,
+                validate_capture: false,
+                completed: true,
+                runtime_access: RuntimeAccess::NoAccess,
+            },
+            Self::Return => MsrTpidrRecoveryPlan {
+                frame: Absent,
+                validate_capture: false,
+                completed: true,
+                runtime_access: RuntimeAccess::NoAccess,
+            },
+            Self::ExecutableEnd => return None,
+        })
+    }
+}
 
 // --- Trampoline layout offsets (all in bytes) ---
 
@@ -3165,16 +3427,14 @@ impl GateMetadata {
     /// classified as one.
     pub(crate) const fn executable_end(self) -> usize {
         match self {
-            // The `B` back to the original site at 44 is the last instruction.
-            GateMetadata::Svc => 48,
-            // `MRS`, the guest-TLS `LDR`, then the `B` back.
-            GateMetadata::MrsTpidr { .. } => 12,
-            // Frame teardown ends at 28, then the `B` back at 32. The second
-            // `B` at 36 never executes, so a PC there is not a live gate PC.
-            GateMetadata::MsrTpidr { .. } => 36,
+            GateMetadata::Svc => SvcGateOffset::ExecutableEnd.as_usize(),
+            GateMetadata::MrsTpidr { .. } => MrsTpidrGateOffset::ExecutableEnd.as_usize(),
+            GateMetadata::MsrTpidr { .. } => MsrTpidrGateOffset::ExecutableEnd.as_usize(),
             GateMetadata::X18 { .. } => X18GateOffset::ExecutableEnd.as_usize(),
-            GateMetadata::X18CompareBranch { .. } => 44,
-            GateMetadata::X18Adr { .. } => 28,
+            GateMetadata::X18CompareBranch { .. } => {
+                X18CompareBranchOffset::ExecutableEnd.as_usize()
+            }
+            GateMetadata::X18Adr { .. } => X18AdrOffset::ExecutableEnd.as_usize(),
         }
     }
 
@@ -3182,34 +3442,14 @@ impl GateMetadata {
     /// original site.
     pub(crate) const fn return_offset(self) -> usize {
         match self {
-            GateMetadata::Svc => 44,
-            GateMetadata::MrsTpidr { .. } => 8,
-            GateMetadata::MsrTpidr { .. } => 32,
+            GateMetadata::Svc => SvcGateOffset::Return.as_usize(),
+            GateMetadata::MrsTpidr { .. } => MrsTpidrGateOffset::Return.as_usize(),
+            GateMetadata::MsrTpidr { .. } => MsrTpidrGateOffset::Return.as_usize(),
             GateMetadata::X18 { .. } => X18GateOffset::Return.as_usize(),
-            GateMetadata::X18CompareBranch { .. } => 28,
-            GateMetadata::X18Adr { .. } => 24,
-        }
-    }
-
-    /// Byte offset of the instruction that commits the gate's architectural
-    /// effect. A saved PC names the instruction about to execute, so past this
-    /// offset the effect has happened.
-    ///
-    /// This says when the effect lands, not whether signal canonicalization
-    /// rewinds or carries the gate forward. That decision also depends on the
-    /// gate kind and recoverable spill-frame state.
-    pub const fn commit_offset(self) -> usize {
-        match self {
-            // The shim performs the syscall, so any PC in an `SVC` slot is
-            // still pre-commit — though at 4 or beyond `SP` and `X16` still
-            // need undoing.
-            GateMetadata::Svc => 0,
-            // The guest-TLS load.
-            GateMetadata::MrsTpidr { .. } => 4,
-            // The guest-TLS store.
-            GateMetadata::MsrTpidr { .. } => 20,
-            GateMetadata::X18 { .. } => X18GateOffset::Transform.as_usize(),
-            GateMetadata::X18CompareBranch { .. } | GateMetadata::X18Adr { .. } => 16,
+            GateMetadata::X18CompareBranch { .. } => {
+                X18CompareBranchOffset::FallthroughBranch.as_usize()
+            }
+            GateMetadata::X18Adr { .. } => X18AdrOffset::Return.as_usize(),
         }
     }
 }
@@ -3220,14 +3460,12 @@ pub fn decode_gate_metadata_word(word: u32) -> Option<GateMetadata> {
 }
 
 /// A validated gate slot containing some PC, with what a signal handler needs
-/// to canonicalize the interrupted context: where the slot starts, how far
-/// into it the guest-visible effect commits, and which guest instruction it
-/// replaced.
+/// to canonicalize the interrupted context: where the slot starts and which
+/// guest instruction it replaced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClassifiedGate {
     slot_offset: usize,
     slot_size: u8,
-    commit_offset: u8,
     anchor_scratch: u8,
     original_site: u64,
     conditional_target: u64,
@@ -3243,11 +3481,6 @@ impl ClassifiedGate {
     /// Kind-derived byte size of the validated slot.
     pub fn slot_size(self) -> u8 {
         self.slot_size
-    }
-
-    /// Template-derived architectural commit offset.
-    pub fn commit_offset(self) -> u8 {
-        self.commit_offset
     }
 
     pub fn anchor_scratch(self) -> Option<u8> {
@@ -3312,8 +3545,15 @@ pub fn classify_copied_gate_slot(slot: &[u8], slot_vaddr: u64, pc: u64) -> Optio
     }
     let trampoline_base = match metadata {
         GateMetadata::Svc => decode_ldr_literal_target(
-            u32::from_le_bytes(slot.get(28..32)?.try_into().ok()?),
-            slot_vaddr + 28,
+            u32::from_le_bytes(
+                slot.get(
+                    SvcGateOffset::LoadCallback.as_usize()
+                        ..SvcGateOffset::LoadCallback.as_usize() + INSN_BYTES,
+                )?
+                .try_into()
+                .ok()?,
+            ),
+            slot_vaddr + SvcGateOffset::LoadCallback.as_usize() as u64,
         )?,
         GateMetadata::MrsTpidr { .. }
         | GateMetadata::MsrTpidr { .. }
@@ -3347,8 +3587,13 @@ pub fn classify_copied_gate_slot(slot: &[u8], slot_vaddr: u64, pc: u64) -> Optio
     )?;
     let conditional_target = if matches!(metadata, GateMetadata::X18CompareBranch { .. }) {
         decode_branch_target(
-            u32::from_le_bytes(slot[40..44].try_into().ok()?),
-            slot_vaddr + 40,
+            u32::from_le_bytes(
+                slot[X18CompareBranchOffset::TakenBranch.as_usize()
+                    ..X18CompareBranchOffset::TakenBranch.as_usize() + INSN_BYTES]
+                    .try_into()
+                    .ok()?,
+            ),
+            slot_vaddr + X18CompareBranchOffset::TakenBranch.as_usize() as u64,
         )?
     } else {
         0
@@ -3356,7 +3601,6 @@ pub fn classify_copied_gate_slot(slot: &[u8], slot_vaddr: u64, pc: u64) -> Optio
     Some(ClassifiedGate {
         slot_offset: 0,
         slot_size: u8::try_from(slot.len()).ok()?,
-        commit_offset: u8::try_from(metadata.commit_offset()).ok()?,
         anchor_scratch: match metadata {
             GateMetadata::X18 { .. }
             | GateMetadata::X18CompareBranch { .. }
@@ -3423,8 +3667,13 @@ fn classify_gate_pc_with_candidates<const N: usize>(
             )?;
             let conditional_target = if matches!(metadata, GateMetadata::X18CompareBranch { .. }) {
                 decode_branch_target(
-                    u32::from_le_bytes(slot[40..44].try_into().ok()?),
-                    slot_vaddr + 40,
+                    u32::from_le_bytes(
+                        slot[X18CompareBranchOffset::TakenBranch.as_usize()
+                            ..X18CompareBranchOffset::TakenBranch.as_usize() + INSN_BYTES]
+                            .try_into()
+                            .ok()?,
+                    ),
+                    slot_vaddr + X18CompareBranchOffset::TakenBranch.as_usize() as u64,
                 )?
             } else {
                 0
@@ -3432,7 +3681,6 @@ fn classify_gate_pc_with_candidates<const N: usize>(
             match_found = Some(ClassifiedGate {
                 slot_offset: start,
                 slot_size: u8::try_from(slot_size).ok()?,
-                commit_offset: u8::try_from(metadata.commit_offset()).ok()?,
                 anchor_scratch: match metadata {
                     GateMetadata::X18 { .. }
                     | GateMetadata::X18CompareBranch { .. }
@@ -5489,7 +5737,6 @@ mod tests {
                     Some(ClassifiedGate {
                         slot_offset: start,
                         slot_size: u8::try_from(size).unwrap(),
-                        commit_offset: u8::try_from(metadata.commit_offset()).unwrap(),
                         anchor_scratch: 0,
                         original_site: 0x1000
                             + match metadata {
