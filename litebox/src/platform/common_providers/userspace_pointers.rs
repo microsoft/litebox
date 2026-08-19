@@ -441,14 +441,22 @@ mod tests {
         }
     }
 
+    struct PanicOnValidation;
+
+    impl ValidateAccess for PanicOnValidation {
+        fn validate<T>(_ptr: *mut T) -> Option<*mut T> {
+            panic!("overflow must be rejected before pointer validation")
+        }
+
+        fn validate_slice<T>(_ptr: *mut [T]) -> Option<*mut T> {
+            panic!("overflow must be rejected before slice validation")
+        }
+    }
+
     #[test]
     fn copy_to_slice_rejects_offset_overflow_without_wrapping() {
-        let source = [0xa5u8; 4];
-        let ptr = UserConstPtr::<AcceptAll, u8>::from_ptr(source.as_ptr());
+        let ptr = UserConstPtr::<PanicOnValidation, u8>::from_usize(0x10001);
         let mut dst = [0u8; 4];
-        // `usize::MAX` element offset would wrap the base pointer around the address
-        // space; the checked contract must reject it as `None` rather than reading
-        // from the wrapped-back (accepted) address.
         assert_eq!(ptr.copy_to_slice(usize::MAX, &mut dst), None);
         assert_eq!(dst, [0u8; 4]);
     }
@@ -477,12 +485,9 @@ mod tests {
 
     #[test]
     fn copy_from_slice_rejects_offset_overflow_without_wrapping() {
-        let mut dest = [0u8; 4];
-        let ptr = UserMutPtr::<AcceptAll, u8>::from_ptr(dest.as_mut_ptr());
+        let ptr = UserMutPtr::<PanicOnValidation, u8>::from_usize(0x10001);
         let source = [0xa5u8; 4];
-        // A wrapping offset must be rejected before any write occurs.
         assert_eq!(ptr.copy_from_slice(usize::MAX, &source), None);
-        assert_eq!(dest, [0u8; 4]);
     }
 
     #[test]

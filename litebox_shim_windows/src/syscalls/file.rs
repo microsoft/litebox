@@ -3357,6 +3357,90 @@ mod tests {
         });
     }
 
+    #[test]
+    fn nt_read_file_partial_explicit_read_updates_synchronous_position() {
+        run_with_test_platform_pointers(|| {
+            let task = crate::tests::test_task();
+            let explicit_offset = 17usize;
+            let byte_offset = i64::try_from(explicit_offset).unwrap();
+            let length = NT_READ_FILE_CHUNK_SIZE * 2;
+            let data: std::vec::Vec<u8> = (0..length + explicit_offset + 16)
+                .map(|i| u8::try_from(i % 251).unwrap())
+                .collect();
+            create_existing_file(&task, "/tmp/read-partial-explicit.txt", &data);
+            let (status, handle, _) = create_file(
+                &task,
+                "/tmp/read-partial-explicit.txt",
+                FILE_GENERIC_READ,
+                FILE_OPEN,
+            );
+            assert_eq!(status, NtStatus::SUCCESS);
+
+            let mut allocation_base = 0;
+            let mut allocation_size = length;
+            assert_eq!(
+                task.sys_nt_allocate_virtual_memory(
+                    crate::syscalls::ProcessHandle::CURRENT,
+                    mut_ptr(&mut allocation_base),
+                    0,
+                    mut_ptr(&mut allocation_size),
+                    (AllocationType::MEM_RESERVE | AllocationType::MEM_COMMIT).bits(),
+                    PageProtection::PAGE_READWRITE.bits(),
+                ),
+                NtStatus::SUCCESS
+            );
+
+            task.fs.inject_read_error_after(1);
+            let mut io_status = IoStatusBlock::new(NtStatus::UNSUCCESSFUL, usize::MAX);
+            assert_eq!(
+                task.sys_nt_read_file(
+                    handle,
+                    Handle::default(),
+                    None,
+                    None,
+                    mut_ptr(&mut io_status),
+                    MutPtr::<TestPlatform, u8>::from_usize(allocation_base),
+                    length.try_into().unwrap(),
+                    Some(const_ptr(&byte_offset)),
+                    None,
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(io_status.information, NT_READ_FILE_CHUNK_SIZE);
+
+            let mut next = [0u8; 16];
+            assert_eq!(
+                task.sys_nt_read_file(
+                    handle,
+                    Handle::default(),
+                    None,
+                    None,
+                    mut_ptr(&mut io_status),
+                    mut_byte_ptr(&mut next),
+                    next.len().try_into().unwrap(),
+                    None,
+                    None,
+                ),
+                NtStatus::SUCCESS
+            );
+            let next_offset = explicit_offset + NT_READ_FILE_CHUNK_SIZE;
+            assert_eq!(next, data[next_offset..next_offset + next.len()]);
+
+            let mut release_base = allocation_base;
+            let mut release_size = 0;
+            assert_eq!(
+                task.sys_nt_free_virtual_memory(
+                    crate::syscalls::ProcessHandle::CURRENT,
+                    mut_ptr(&mut release_base),
+                    mut_ptr(&mut release_size),
+                    FreeType::MEM_RELEASE.bits(),
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
+        });
+    }
+
     fn open_fs_root(task: &Task<TestPlatform, TestFS>) -> Handle {
         let (_path, _name, attributes) = open_object_attributes("/");
         let mut handle = Handle::default();
