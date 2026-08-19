@@ -229,11 +229,10 @@ fn build_windows_broker() -> (std::path::PathBuf, std::path::PathBuf) {
 
 /// Drives the real `7za b` CPU benchmark through the runner using the
 /// transitive-import-closure staging helper. `7za` is a large third-party
-/// binary that must not be committed, so this test is gated behind the
-/// `LITEBOX_7ZA_PATH` environment variable pointing at a locally provided x64
-/// `7za.exe` and skips cleanly when the variable is unset — keeping the
-/// repository binary-free while remaining repeatable for anyone with the
-/// binary.
+/// binary that must not be committed. `LITEBOX_7ZA_PATH` can point at a locally
+/// provided x64 `7za.exe`; otherwise the test downloads and verifies a pinned
+/// official x64 7-Zip installer, then extracts its console executable into
+/// `CARGO_TARGET_TMPDIR`.
 ///
 /// This drives the frontier forward while asserting the deliverable: staging
 /// must reach transitive depth the old hardcoded list missed (`cryptbase.dll`),
@@ -243,16 +242,13 @@ fn build_windows_broker() -> (std::path::PathBuf, std::path::PathBuf) {
 /// exit status is reported rather than asserted.
 ///
 /// Marked `#[ignore]` so it never reports a misleading `PASS` on the default
-/// gate (it needs the external binary); run it explicitly with
-/// `--run-ignored all` and `LITEBOX_7ZA_PATH` set. The hermetic tests below
-/// exercise the helper on every default run.
+/// gate (it downloads an external binary); run it explicitly with
+/// `--run-ignored all`. The hermetic tests below exercise the helper on every
+/// default run.
 #[test]
-#[ignore = "requires LITEBOX_7ZA_PATH pointing at a local x64 7za.exe"]
+#[ignore = "downloads an official x64 7-Zip binary unless LITEBOX_7ZA_PATH is set"]
 fn run_7za_benchmark_pe() {
-    let Some(source) = std::env::var_os("LITEBOX_7ZA_PATH") else {
-        println!("skipping run_7za_benchmark_pe: LITEBOX_7ZA_PATH is not set");
-        return;
-    };
+    let source = seven_zip_source();
 
     let test_dir =
         std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("seven_zip_benchmark");
@@ -299,6 +295,91 @@ fn run_7za_benchmark_pe() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn seven_zip_source() -> std::path::PathBuf {
+    const INSTALLER_URL: &str =
+        "https://github.com/ip7z/7zip/releases/download/26.02/7z2602-x64.msi";
+    const INSTALLER_SHA256: &str =
+        "db407a4f6d4999e5c7bc00ce8a882be94717b56e7fa68140fe3f12605d91643e";
+
+    if let Some(source) = std::env::var_os("LITEBOX_7ZA_PATH") {
+        return source.into();
+    }
+
+    let download_dir =
+        std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("seven_zip_26.02_x64_msi");
+    std::fs::create_dir_all(&download_dir).expect("failed to create 7-Zip download directory");
+    let installer = download_dir.join("7z2602-x64.msi");
+
+    if installer.exists() && sha256_file(&installer) != INSTALLER_SHA256 {
+        println!(
+            "Removing cached 7-Zip installer with an unexpected SHA-256: `{}`",
+            installer.display()
+        );
+        std::fs::remove_file(&installer).expect("failed to remove invalid cached 7-Zip installer");
+    }
+
+    if !installer.exists() {
+        let temporary_installer =
+            download_dir.join(format!("7z2602-x64.msi.{}.tmp", std::process::id()));
+        println!("Downloading 7-Zip from `{INSTALLER_URL}`");
+        let status = std::process::Command::new("curl.exe")
+            .args([
+                "--fail",
+                "--location",
+                "--proto",
+                "=https",
+                "--tlsv1.2",
+                "--output",
+            ])
+            .arg(&temporary_installer)
+            .arg(INSTALLER_URL)
+            .status()
+            .expect("failed to start curl.exe to download 7-Zip");
+        assert!(status.success(), "curl.exe failed to download 7-Zip");
+
+        let actual_sha256 = sha256_file(&temporary_installer);
+        assert_eq!(
+            actual_sha256, INSTALLER_SHA256,
+            "downloaded 7-Zip installer has an unexpected SHA-256"
+        );
+        std::fs::rename(&temporary_installer, &installer)
+            .expect("failed to cache verified 7-Zip installer");
+    }
+
+    let install_dir = download_dir.join("installed");
+    let source = install_dir.join("Files").join("7-Zip").join("7z.exe");
+    if !source.exists() {
+        std::fs::create_dir_all(&install_dir).expect("failed to create 7-Zip extraction directory");
+        println!("Extracting verified 7-Zip MSI");
+        let status = std::process::Command::new("msiexec.exe")
+            .arg("/a")
+            .arg(&installer)
+            .arg("/qn")
+            .arg(format!("TARGETDIR={}", install_dir.display()))
+            .status()
+            .expect("failed to start msiexec.exe");
+        assert!(
+            status.success(),
+            "msiexec.exe failed to extract 7-Zip with status {status}"
+        );
+        assert!(
+            source.is_file(),
+            "7-Zip installer did not extract `{}`",
+            source.display()
+        );
+    }
+
+    source
+}
+
+fn sha256_file(path: &std::path::Path) -> String {
+    use sha2::Digest;
+
+    let bytes = std::fs::read(path)
+        .unwrap_or_else(|error| panic!("failed to read `{}` for SHA-256: {error}", path.display()));
+    format!("{:x}", sha2::Sha256::digest(bytes))
 }
 
 /// Stages the minimal guest system DLLs and locale tables the lightweight PE

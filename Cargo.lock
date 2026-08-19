@@ -1754,6 +1754,7 @@ dependencies = [
  "litebox_util_log",
  "memmap2",
  "object",
+ "sha2",
  "tar",
  "tracing-subscriber",
 ]

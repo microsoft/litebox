@@ -18,6 +18,7 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 [dev-dependencies]
 litebox_syscall_rewriter = { version = "0.1.0", path = "../litebox_syscall_rewriter" }
 object = { version = "0.36.7", default-features = false, features = ["read_core", "pe"] }
+sha2 = { version = "0.10", default-features = false }
 tar = "0.4"
 
 [lints]
