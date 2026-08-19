@@ -403,8 +403,9 @@ fn python_source() -> std::path::PathBuf {
 /// Drives the real `7za b` CPU benchmark through the runner using the
 /// transitive-import-closure staging helper. `7za` is a large third-party
 /// binary that must not be committed. `LITEBOX_7ZA_PATH` can point at a locally
-/// provided x64 `7za.exe`; otherwise the test downloads and verifies a pinned
-/// official x64 7-Zip installer, then extracts its console executable into
+/// provided standalone x64 `7za.exe`; other console executables must have their
+/// sibling `7z.dll`. Otherwise the test downloads and verifies a pinned official
+/// x64 7-Zip installer, then extracts its console executable into
 /// `CARGO_TARGET_TMPDIR`.
 ///
 /// This drives the frontier forward while asserting the deliverable: staging
@@ -419,7 +420,7 @@ fn python_source() -> std::path::PathBuf {
 #[ignore = "downloads an official x64 7-Zip binary unless LITEBOX_7ZA_PATH is set"]
 fn run_7za_benchmark_pe() {
     let source = seven_zip_source();
-    let codec_source = source.with_file_name("7z.dll");
+    let codec_source = seven_zip_codec_source(&source);
 
     let test_dir =
         std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("seven_zip_benchmark");
@@ -431,16 +432,21 @@ fn run_7za_benchmark_pe() {
         .expect("failed to rewrite 7za.exe");
     std::fs::write(test_dir.join("7za.exe"), &rewritten).unwrap();
 
-    let host_codec = std::fs::read(&codec_source)
-        .unwrap_or_else(|error| panic!("failed to read `{}`: {error}", codec_source.display()));
-    let rewritten_codec = litebox_syscall_rewriter::rewrite_binary(&host_codec, None)
-        .expect("failed to rewrite 7z.dll");
-    std::fs::write(test_dir.join("7z.dll"), rewritten_codec).unwrap();
+    let host_codec = codec_source.as_ref().map(|codec_source| {
+        let host_codec = std::fs::read(codec_source)
+            .unwrap_or_else(|error| panic!("failed to read `{}`: {error}", codec_source.display()));
+        let rewritten_codec = litebox_syscall_rewriter::rewrite_binary(&host_codec, None)
+            .expect("failed to rewrite 7z.dll");
+        std::fs::write(test_dir.join("7z.dll"), rewritten_codec).unwrap();
+        host_codec
+    });
 
     // Import parsing walks the original host image; rewriting does not change
     // the import tables.
     stage_transitive_import_closure(&test_dir, &host_exe);
-    stage_transitive_import_closure(&test_dir, &host_codec);
+    if let Some(host_codec) = &host_codec {
+        stage_transitive_import_closure(&test_dir, host_codec);
+    }
 
     // TODO(runtime-plugin-staging): `stage_transitive_import_closure`
     // under-approximates runtime dependencies. Keep general discovery of DLLs
@@ -483,6 +489,31 @@ fn run_7za_benchmark_pe() {
         String::from_utf8_lossy(&output.stdout).contains("Compressing"),
         "7za benchmark output was missing the result table"
     );
+}
+
+fn seven_zip_codec_source(source: &std::path::Path) -> Option<std::path::PathBuf> {
+    if source
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|name| name.eq_ignore_ascii_case("7za.exe"))
+    {
+        return None;
+    }
+
+    let codec = source.with_file_name("7z.dll");
+    assert!(
+        codec.is_file(),
+        "`{}` requires sibling codec `{}`; use standalone 7za.exe or a complete 7-Zip installation",
+        source.display(),
+        codec.display()
+    );
+    Some(codec)
+}
+
+#[test]
+fn standalone_7za_override_does_not_require_sibling_codec() {
+    let standalone = std::path::Path::new("C:\\standalone\\7za.exe");
+    assert_eq!(seven_zip_codec_source(standalone), None);
 }
 
 fn seven_zip_source() -> std::path::PathBuf {
