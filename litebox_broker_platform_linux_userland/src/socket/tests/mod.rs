@@ -11,13 +11,13 @@ use super::*;
 use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_core::{
     BrokerCore, BrokerCoreLimits, BrokerSession, CallerCredential, DestinationPortRange,
-    DestinationRule, Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy,
+    DestinationRule, GatewayPortRule, Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy,
 };
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::socket::{Ipv4Address, Port, ReceiveSocketResponse};
 
 use super::udp::{
-    MAX_REJECTED_UDP_DATAGRAMS_PER_COMMAND, MAX_UDP_EXTERNAL_PEERS_PER_SOCKET,
+    MAX_REJECTED_UDP_DATAGRAMS_PER_COMMAND, MAX_UDP_NATIVE_PEERS_PER_SOCKET,
     MAX_UDP_NATIVE_RECEIVE_BUFFER, MAX_UDP_QUEUE_DATAGRAMS_PER_SOURCE,
 };
 
@@ -25,6 +25,97 @@ mod tcp;
 mod udp;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Creates a broker core and Linux provider that share one network configuration.
+///
+/// Every test authorizes the whole host-gateway port range so gateway routing
+/// is exercised by destination classification rather than by policy shape.
+fn broker_with_sockets(
+    socket_policy: &SocketPolicy,
+    limits: BrokerCoreLimits,
+    max_sockets: usize,
+    max_sockets_per_session: usize,
+) -> (BrokerCore, Arc<LinuxSocketProvider>) {
+    // One configuration value reaches both the core and its provider.
+    let network_config = Arc::new(BrokerNetworkConfig::default());
+    broker_with_network_configs(
+        socket_policy,
+        limits,
+        max_sockets,
+        max_sockets_per_session,
+        Arc::clone(&network_config),
+        network_config,
+    )
+}
+
+/// Creates a broker core and provider from explicit network configurations.
+///
+/// Passing a provider configuration that differs from the core's exercises the
+/// provider's fail-closed validation of trusted broker metadata.
+fn broker_with_network_configs(
+    socket_policy: &SocketPolicy,
+    limits: BrokerCoreLimits,
+    max_sockets: usize,
+    max_sockets_per_session: usize,
+    core_config: Arc<BrokerNetworkConfig>,
+    provider_config: Arc<BrokerNetworkConfig>,
+) -> (BrokerCore, Arc<LinuxSocketProvider>) {
+    let provider = Arc::new(
+        LinuxSocketProvider::new(provider_config, max_sockets, max_sockets_per_session).unwrap(),
+    );
+    let gateway_rules = [GatewayPortRule::new(
+        CallerCredential::Unauthenticated,
+        DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
+    )];
+    let broker = BrokerCore::new_with_limits(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(*socket_policy)
+            .with_gateway_rules(&gateway_rules, &gateway_rules)
+            .unwrap(),
+        limits,
+        core_config,
+        Arc::clone(&provider) as Arc<dyn SocketProvider>,
+    )
+    .unwrap();
+    (broker, provider)
+}
+
+/// Admits the guest namespace for both transports without external rules.
+fn guest_network_policy() -> SocketPolicy {
+    SocketPolicy::from_guest_network_destination_rules(true, &[], true, &[]).unwrap()
+}
+
+/// Returns the shared default guest identity used by every platform test.
+fn test_network_config() -> BrokerNetworkConfig {
+    BrokerNetworkConfig::default()
+}
+
+/// Returns the configured private guest address.
+fn guest_ipv4_address() -> Ipv4Addr {
+    test_network_config().guest_ipv4_address()
+}
+
+/// Returns the guest-visible host gateway address.
+fn gateway_ipv4_address() -> Ipv4Addr {
+    test_network_config().gateway_ipv4_address()
+}
+
+/// Returns the guest-visible gateway address for one host loopback service.
+fn gateway_route(host_address: SocketAddrV4) -> SocketAddrV4 {
+    assert!(
+        host_address.ip().is_loopback(),
+        "a gateway route replaces host loopback access"
+    );
+    SocketAddrV4::new(
+        test_network_config().gateway_ipv4_address(),
+        host_address.port(),
+    )
+}
+
+/// Returns the guest-visible gateway address for one host listener address.
+fn gateway_address(host_address: std::net::SocketAddr) -> SocketAddrV4 {
+    gateway_route(socket_address_v4(host_address))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ReceivedPlatformDatagram {
@@ -184,6 +275,102 @@ fn synchronous_errors_do_not_consume_tcp_connect_status() {
     ));
 }
 
+#[test]
+fn only_translated_routes_have_a_native_host_address() {
+    let config = test_network_config();
+    let port = 8080;
+    assert_eq!(
+        native_host_address(SocketDestination::Guest {
+            requested: SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)
+        }),
+        None
+    );
+    assert_eq!(
+        native_host_address(SocketDestination::Guest {
+            requested: SocketAddrV4::new(config.guest_ipv4_address(), port)
+        }),
+        None
+    );
+    assert_eq!(
+        native_host_address(SocketDestination::Gateway {
+            requested: SocketAddrV4::new(config.gateway_ipv4_address(), port)
+        }),
+        Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
+    );
+    let external = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 9), port);
+    assert_eq!(
+        native_host_address(SocketDestination::External {
+            requested: external
+        }),
+        Some(external)
+    );
+}
+
+#[test]
+fn provider_configuration_disagreement_fails_closed() {
+    let provider_config = Arc::new(
+        BrokerNetworkConfig::new(Ipv4Addr::new(172, 16, 0, 2), Ipv4Addr::new(172, 16, 0, 1))
+            .expect("the divergent provider addresses are valid"),
+    );
+    let (broker, provider) = broker_with_network_configs(
+        &guest_network_policy(),
+        BrokerCoreLimits::new_with_all_limits(8, 0, 4, 4),
+        4,
+        4,
+        Arc::new(BrokerNetworkConfig::default()),
+        provider_config,
+    );
+    let session = broker
+        .create_session(CallerCredential::Unauthenticated)
+        .unwrap();
+    let (published, _publications) = channel();
+    let (retired, _retirements) = channel();
+    let readiness = Arc::new(TestReadinessSink { published, retired });
+
+    // A binding the provider's configuration cannot represent is rejected
+    // before any guest or native state exists for it.
+    let datagram = create_udp_socket(&session, readiness.clone());
+    assert_eq!(
+        litebox_broker_core::socket::bind(
+            &session,
+            datagram,
+            SocketAddrV4::new(guest_ipv4_address(), 0),
+        ),
+        Err(BrokerError::Internal)
+    );
+    // A route tag that disagrees with the provider's configuration cannot
+    // select a native destination.
+    assert_eq!(
+        send_datagram(
+            &session,
+            datagram,
+            b"gateway",
+            SendFlags::NONE,
+            Some(SocketAddrV4::new(gateway_ipv4_address(), 9000)),
+        ),
+        Err(BrokerError::Internal)
+    );
+    assert_eq!(provider.reactor.udp_native_endpoint_count(), 0);
+    assert_eq!(provider.reactor.udp_native_event_token_count(), 0);
+    assert_eq!(provider.reactor.udp_native_peer_count(), 0);
+
+    let stream = create_socket(&session, readiness);
+    assert_eq!(
+        litebox_broker_core::socket::connect(
+            &session,
+            stream,
+            SocketAddrV4::new(gateway_ipv4_address(), 9000),
+        ),
+        Err(BrokerError::Internal)
+    );
+    assert_eq!(
+        litebox_broker_core::socket::status(&session, stream)
+            .unwrap()
+            .status,
+        SocketConnectionStatus::Unconnected
+    );
+}
+
 struct TestReadinessSink {
     published: Sender<(ObjectHandle, ReadinessFlags)>,
     retired: Sender<ObjectHandle>,
@@ -300,14 +487,12 @@ fn directional_shutdown_survives_readiness_publication_failure() {
         wait_to_release_server.recv_timeout(TEST_TIMEOUT).unwrap();
     });
 
-    let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
-    let broker = BrokerCore::new_with_limits(
-        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+    let (broker, _provider) = broker_with_sockets(
+        &guest_network_policy(),
         BrokerCoreLimits::new_with_all_limits(4, 0, 2, 2),
-        provider,
-    )
-    .unwrap();
+        2,
+        2,
+    );
     let session = broker
         .create_session(CallerCredential::Unauthenticated)
         .unwrap();
@@ -320,7 +505,7 @@ fn directional_shutdown_survives_readiness_publication_failure() {
 
     let tcp = create_socket(&session, readiness.clone());
     assert!(matches!(
-        litebox_broker_core::socket::connect(&session, tcp, socket_address_v4(address)),
+        litebox_broker_core::socket::connect(&session, tcp, gateway_address(address)),
         Ok(SocketOutcome::Completed(
             SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
         ))

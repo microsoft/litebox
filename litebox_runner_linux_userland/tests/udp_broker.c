@@ -85,7 +85,10 @@ int main(int argc, char **argv) {
         .sin_family = AF_INET,
         .sin_port = htons((uint16_t)strtoul(argv[1], NULL, 10)),
     };
-    assert(inet_pton(AF_INET, "127.0.0.1", &server.sin_addr) == 1);
+    // Host services are reachable only through the guest-visible gateway.
+    assert(inet_pton(AF_INET, "10.0.2.1", &server.sin_addr) == 1);
+    struct in_addr guest_address;
+    assert(inet_pton(AF_INET, "10.0.2.15", &guest_address) == 1);
 
     const char unconnected[] = "unconnected";
     assert(sendto(fd, unconnected, sizeof(unconnected) - 1, 0,
@@ -117,7 +120,7 @@ int main(int argc, char **argv) {
     assert(recvmsg(fd, &message, 0) == sizeof(truncated));
     assert(memcmp(truncated, "0123", sizeof(truncated)) == 0);
     assert((message.msg_flags & MSG_TRUNC) != 0);
-    assert(source.sin_addr.s_addr == htonl(INADDR_LOOPBACK));
+    assert(source.sin_addr.s_addr == server.sin_addr.s_addr);
     assert(source.sin_port == server.sin_port);
     retract_readable(fd);
 
@@ -188,14 +191,14 @@ int main(int argc, char **argv) {
     assert(empty == 0xff);
     assert(address_length == sizeof(source));
     assert(source.sin_family == AF_INET);
-    assert(source.sin_addr.s_addr == htonl(INADDR_LOOPBACK));
+    assert(source.sin_addr.s_addr == server.sin_addr.s_addr);
     assert(source.sin_port == server.sin_port);
     retract_readable(fd);
 
     assert(connect(fd, (const struct sockaddr *)&server, sizeof(server)) == 0);
     address_length = sizeof(local);
     assert(getsockname(fd, (struct sockaddr *)&local, &address_length) == 0);
-    assert(local.sin_addr.s_addr == htonl(INADDR_LOOPBACK));
+    assert(local.sin_addr.s_addr == guest_address.s_addr);
     assert(local.sin_port != 0);
     address_length = sizeof(peer);
     assert(getpeername(fd, (struct sockaddr *)&peer, &address_length) == 0);
@@ -273,7 +276,7 @@ int main(int argc, char **argv) {
         .sin_family = AF_INET,
         .sin_port = htons((uint16_t)strtoul(argv[2], NULL, 10)),
     };
-    assert(inet_pton(AF_INET, "127.0.0.1", &refused.sin_addr) == 1);
+    assert(inet_pton(AF_INET, "10.0.2.1", &refused.sin_addr) == 1);
     assert(connect(refused_fd, (const struct sockaddr *)&refused,
                    sizeof(refused)) == 0);
 

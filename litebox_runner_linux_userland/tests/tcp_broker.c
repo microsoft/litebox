@@ -35,7 +35,10 @@ int main(int argc, char **argv) {
         .sin_family = AF_INET,
         .sin_port = htons((uint16_t)strtoul(argv[1], NULL, 10)),
     };
-    assert(inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) == 1);
+    // Host services are reachable only through the guest-visible gateway.
+    assert(inet_pton(AF_INET, "10.0.2.1", &address.sin_addr) == 1);
+    struct in_addr guest_address;
+    assert(inet_pton(AF_INET, "10.0.2.15", &guest_address) == 1);
     int result = connect(fd, (const struct sockaddr *)&address, sizeof(address));
     assert(result == 0 || (result == -1 && errno == EINPROGRESS));
 
@@ -44,7 +47,7 @@ int main(int argc, char **argv) {
         socklen_t connecting_address_length = sizeof(connecting_address);
         assert(getsockname(fd, (struct sockaddr *)&connecting_address,
                            &connecting_address_length) == 0);
-        assert(connecting_address.sin_addr.s_addr == htonl(INADDR_LOOPBACK));
+        assert(connecting_address.sin_addr.s_addr == guest_address.s_addr);
         assert(connecting_address.sin_port != 0);
         int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
         assert(epoll_fd >= 0);
@@ -63,14 +66,14 @@ int main(int argc, char **argv) {
     socklen_t address_length = sizeof(local_address);
     assert(getsockname(fd, (struct sockaddr *)&local_address, &address_length) == 0);
     assert(local_address.sin_family == AF_INET);
-    assert(local_address.sin_addr.s_addr == htonl(INADDR_LOOPBACK));
+    assert(local_address.sin_addr.s_addr == guest_address.s_addr);
     assert(local_address.sin_port != 0);
     assert(accept(fd, NULL, NULL) == -1);
     assert(errno == EINVAL);
     struct sockaddr_in peer_address;
     address_length = sizeof(peer_address);
     assert(getpeername(fd, (struct sockaddr *)&peer_address, &address_length) == 0);
-    assert(peer_address.sin_addr.s_addr == htonl(INADDR_LOOPBACK));
+    assert(peer_address.sin_addr.s_addr == address.sin_addr.s_addr);
     assert(peer_address.sin_port == address.sin_port);
     int option = 1;
     assert(setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &option,
@@ -351,6 +354,18 @@ int main(int argc, char **argv) {
     } else {
         assert(errno == ECONNREFUSED);
     }
+    assert(close(fd) == 0);
+
+    // The reserved port zero fails the socket without reaching the gateway,
+    // and the failure persists for a later authorized destination.
+    fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    assert(fd >= 0);
+    address.sin_port = 0;
+    assert(connect(fd, (const struct sockaddr *)&address, sizeof(address)) == -1);
+    assert(errno == ECONNREFUSED);
+    address.sin_port = htons((uint16_t)strtoul(argv[1], NULL, 10));
+    assert(connect(fd, (const struct sockaddr *)&address, sizeof(address)) == -1);
+    assert(errno == ECONNREFUSED);
     assert(close(fd) == 0);
 
     fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);

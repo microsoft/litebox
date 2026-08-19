@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use litebox_broker_core::{
-    BrokerCore, CallerCredential, DestinationPortRange, DestinationRule, Ipv4Cidr, SocketPolicy,
-    SocketPolicyError,
+    BrokerCore, CallerCredential, DestinationPortRange, DestinationRule, GatewayPortRule, Ipv4Cidr,
+    SocketPolicy, SocketPolicyError,
 };
 use litebox_broker_host::{BrokerHostAssociation, ConnectionTermination, setup_connection};
 use litebox_broker_protocol::message::{BrokerRequest, BrokerResponse};
@@ -67,30 +67,64 @@ impl FromStr for AllowedTcpDestination {
                 "IPv4 CIDR must have a valid prefix and canonical network address".to_owned()
             })?;
 
-        let (start, end) = ports
-            .split_once('-')
-            .map_or((ports, ports), |(start, end)| (start, end));
-        let start = start
-            .parse::<u16>()
-            .map_err(|error| format!("invalid TCP port: {error}"))?;
-        let end = end
-            .parse::<u16>()
-            .map_err(|error| format!("invalid TCP port: {error}"))?;
-        let ports = DestinationPortRange::new(Port(start), Port(end))
-            .ok_or_else(|| "TCP port range must be ordered and exclude port zero".to_owned())?;
+        let ports = parse_port_range(ports, "TCP")?;
 
         Ok(Self { destination, ports })
     }
+}
+
+/// One host-gateway destination port range authorized on the command line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AllowedGatewayPort(DestinationPortRange);
+
+impl FromStr for AllowedGatewayPort {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        parse_port_range(value, "gateway").map(Self)
+    }
+}
+
+/// Parses one `PORT` or `START-END` destination port range.
+fn parse_port_range(value: &str, label: &str) -> Result<DestinationPortRange, String> {
+    let (start, end) = value
+        .split_once('-')
+        .map_or((value, value), |(start, end)| (start, end));
+    let start = start
+        .parse::<u16>()
+        .map_err(|error| format!("invalid {label} port: {error}"))?;
+    let end = end
+        .parse::<u16>()
+        .map_err(|error| format!("invalid {label} port: {error}"))?;
+    DestinationPortRange::new(Port(start), Port(end))
+        .ok_or_else(|| format!("{label} port range must be ordered and exclude port zero"))
 }
 
 #[derive(Parser, Debug)]
 struct CliArgs {
     /// Permit outbound TCP connections to a destination CIDR and port range.
     ///
-    /// May be repeated. Supplying any rule replaces the default loopback-only policy.
+    /// May be repeated. Supplying any rule replaces the default loopback-only
+    /// policy with guest networking plus these external destinations.
     /// `0.0.0.0/0:1-65535` permits every nonzero IPv4 TCP destination.
     #[arg(long, value_name = "CIDR:PORT[-PORT]")]
     allow_tcp_destination: Vec<AllowedTcpDestination>,
+    /// Permit TCP access to a host service through the guest-visible gateway
+    /// address 10.0.2.1, which reaches host loopback on the same port.
+    ///
+    /// May be repeated. Each rule authorizes one destination port or range and
+    /// selects guest networking, because guests no longer reach host loopback
+    /// directly.
+    #[arg(long, value_name = "PORT[-PORT]")]
+    allow_host_gateway_tcp_port: Vec<AllowedGatewayPort>,
+    /// Permit UDP access to a host service through the guest-visible gateway
+    /// address 10.0.2.1, which reaches host loopback on the same port.
+    ///
+    /// May be repeated. Each rule authorizes one destination port or range and
+    /// selects guest networking, because guests no longer reach host loopback
+    /// directly.
+    #[arg(long, value_name = "PORT[-PORT]")]
+    allow_host_gateway_udp_port: Vec<AllowedGatewayPort>,
     /// Local runner executable to launch.
     #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::ExecutablePath)]
     runner: PathBuf,
@@ -125,8 +159,16 @@ fn run_runner_process(
 
 fn configured_socket_policy(
     allowed_destinations: &[AllowedTcpDestination],
+    tcp_gateway_ports: &[AllowedGatewayPort],
+    udp_gateway_ports: &[AllowedGatewayPort],
 ) -> Result<SocketPolicy, SocketPolicyError> {
-    if allowed_destinations.is_empty() {
+    // A gateway rule authorizes a route only under a guest-network policy, so
+    // the literal loopback default survives only without any external
+    // destination or gateway configuration.
+    if allowed_destinations.is_empty()
+        && tcp_gateway_ports.is_empty()
+        && udp_gateway_ports.is_empty()
+    {
         return Ok(SocketPolicy::Ipv4Loopback);
     }
     let rules = allowed_destinations
@@ -139,13 +181,15 @@ fn configured_socket_policy(
             )
         })
         .collect::<Vec<_>>();
-    let udp_loopback = DestinationRule::new(
-        CallerCredential::HostGuaranteed,
-        Ipv4Cidr::new(Ipv4Address([127, 0, 0, 0]), 8).expect("the IPv4 loopback CIDR is canonical"),
-        DestinationPortRange::new(Port(1), Port(u16::MAX))
-            .expect("the full nonzero UDP port range is valid"),
-    );
-    SocketPolicy::from_tcp_udp_destination_rules(&rules, &[udp_loopback])
+    SocketPolicy::from_guest_network_destination_rules(true, &rules, true, &[])
+}
+
+/// Builds the bounded gateway port rules for one transport protocol.
+fn configured_gateway_rules(allowed_ports: &[AllowedGatewayPort]) -> Vec<GatewayPortRule> {
+    allowed_ports
+        .iter()
+        .map(|allowed| GatewayPortRule::new(CallerCredential::HostGuaranteed, allowed.0))
+        .collect()
 }
 
 fn serve_runner<Memory, SetupChannel, RequestSource, ResponseSink, NotificationChannel, Shutdown>(
@@ -556,6 +600,10 @@ mod cli_tests {
             "litebox-broker-userland",
             "--allow-tcp-destination",
             "127.0.0.0/8:80",
+            "--allow-host-gateway-tcp-port",
+            "8080",
+            "--allow-host-gateway-udp-port",
+            "53-54",
             "--runner",
             "runner",
             "guest",
@@ -563,6 +611,18 @@ mod cli_tests {
         .unwrap();
 
         assert_eq!(args.allow_tcp_destination.len(), 1);
+        assert_eq!(
+            args.allow_host_gateway_tcp_port,
+            [AllowedGatewayPort(
+                DestinationPortRange::new(Port(8080), Port(8080)).unwrap()
+            )]
+        );
+        assert_eq!(
+            args.allow_host_gateway_udp_port,
+            [AllowedGatewayPort(
+                DestinationPortRange::new(Port(53), Port(54)).unwrap()
+            )]
+        );
     }
 
     #[test]
@@ -589,30 +649,77 @@ mod cli_tests {
     #[test]
     fn tcp_destination_arguments_replace_the_loopback_default() {
         assert_eq!(
-            configured_socket_policy(&[]).unwrap(),
+            configured_socket_policy(&[], &[], &[]).unwrap(),
             SocketPolicy::Ipv4Loopback
         );
 
         let allowed = "0.0.0.0/0:80".parse::<AllowedTcpDestination>().unwrap();
-        let policy = configured_socket_policy(&[allowed]).unwrap();
-        let rules = policy.tcp_destination_rules().unwrap();
-        assert_eq!(rules.len(), 1);
+        let policy = configured_socket_policy(&[allowed], &[], &[]).unwrap();
+        // Guest traffic is admitted for both protocols; UDP keeps no external
+        // destination rules of its own.
+        assert!(matches!(
+            policy,
+            SocketPolicy::GuestNetwork {
+                admit_tcp: true,
+                admit_udp: true,
+                ..
+            }
+        ));
         assert_eq!(
-            rules[0],
-            DestinationRule::new(
-                CallerCredential::HostGuaranteed,
-                allowed.destination,
-                allowed.ports,
+            policy.tcp_destination_rules(),
+            Some(
+                [DestinationRule::new(
+                    CallerCredential::HostGuaranteed,
+                    allowed.destination,
+                    allowed.ports,
+                )]
+                .as_slice()
             )
         );
+        assert_eq!(policy.udp_destination_rules(), Some([].as_slice()));
+    }
+
+    #[test]
+    fn gateway_port_arguments_are_protocol_specific() {
+        let tcp = "443-444".parse::<AllowedGatewayPort>().unwrap();
+        let udp = "53".parse::<AllowedGatewayPort>().unwrap();
+
         assert_eq!(
-            policy.udp_destination_rules().unwrap(),
-            &[DestinationRule::new(
+            configured_gateway_rules(&[tcp]),
+            [GatewayPortRule::new(
                 CallerCredential::HostGuaranteed,
-                Ipv4Cidr::new(Ipv4Address([127, 0, 0, 0]), 8).unwrap(),
-                DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
+                DestinationPortRange::new(Port(443), Port(444)).unwrap(),
             )]
         );
+        assert_eq!(
+            configured_gateway_rules(&[udp]),
+            [GatewayPortRule::new(
+                CallerCredential::HostGuaranteed,
+                DestinationPortRange::new(Port(53), Port(53)).unwrap(),
+            )]
+        );
+        assert_eq!(configured_gateway_rules(&[]), []);
+        for malformed in ["0", "1-0", "53-0", "", "80-", "http"] {
+            assert!(malformed.parse::<AllowedGatewayPort>().is_err());
+        }
+    }
+
+    #[test]
+    fn gateway_ports_alone_select_the_guest_network_policy() {
+        let gateway = "8080".parse::<AllowedGatewayPort>().unwrap();
+
+        for (tcp_ports, udp_ports) in [
+            ([gateway].as_slice(), [].as_slice()),
+            ([].as_slice(), [gateway].as_slice()),
+        ] {
+            let policy = configured_socket_policy(&[], tcp_ports, udp_ports).unwrap();
+            assert_eq!(
+                policy,
+                SocketPolicy::from_guest_network_destination_rules(true, &[], true, &[]).unwrap()
+            );
+            assert_eq!(policy.tcp_destination_rules(), Some([].as_slice()));
+            assert_eq!(policy.udp_destination_rules(), Some([].as_slice()));
+        }
     }
 }
 
@@ -625,7 +732,7 @@ mod tests {
     use std::sync::mpsc::{Receiver, sync_channel};
     use std::time::{Duration, Instant};
 
-    use litebox_broker_core::socket::UnsupportedSocketProvider;
+    use litebox_broker_core::socket::{BrokerNetworkConfig, UnsupportedSocketProvider};
     use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
     use litebox_broker_host::setup_connection;
     use litebox_broker_protocol::BROKER_PROTOCOL_VERSION;
@@ -747,6 +854,7 @@ mod tests {
         let host = std::thread::spawn(move || {
             let broker = BrokerCore::new(
                 PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()),
+                Arc::new(BrokerNetworkConfig::default()),
                 Arc::new(UnsupportedSocketProvider),
             )
             .unwrap();

@@ -33,6 +33,20 @@ use crate::{
 
 const _: () = assert!(MAX_SOCKET_PEEK_SIZE as usize == super::SOCKET_RECEIVE_OPERATION_SIZE);
 
+/// Normalizes the IPv4 unspecified destination to loopback.
+///
+/// A guest that names `0.0.0.0` with a nonzero port means the local host, so
+/// the broker request and the cached peer both use the loopback address it
+/// resolves to. The reserved port zero keeps its address, leaving the broker to
+/// report the ordinary port-zero failure.
+pub(super) fn normalize_ipv4_destination(address: SocketAddrV4) -> SocketAddrV4 {
+    if address.port() != 0 && address.ip().is_unspecified() {
+        SocketAddrV4::new(core::net::Ipv4Addr::LOCALHOST, address.port())
+    } else {
+        address
+    }
+}
+
 struct BrokerTcpSocketState {
     connection: SocketConnectionStatus,
     local_address: Option<SocketAddrV4>,
@@ -184,6 +198,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
     }
 
     pub(super) fn start_connect(&self, address: SocketAddrV4) -> Result<(), ConnectError> {
+        let address = normalize_ipv4_destination(address);
         let previous = self.state.lock().connection;
         let outcome = self
             .broker
@@ -726,6 +741,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerUdpSocket<Platfor
     }
 
     pub(super) fn start_connect(&self, address: SocketAddrV4) -> Result<(), ConnectError> {
+        let address = normalize_ipv4_destination(address);
         let _configuration = self.configuration_lock.lock();
         let outcome = self
             .broker
@@ -1185,6 +1201,28 @@ impl From<BrokerSocketError> for SocketAsyncError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unspecified_destinations_normalize_to_loopback_above_port_zero() {
+        use core::net::Ipv4Addr;
+
+        assert_eq!(
+            normalize_ipv4_destination(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 80)),
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 80)
+        );
+        // Port zero keeps the reserved destination the broker refuses.
+        assert_eq!(
+            normalize_ipv4_destination(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
+            SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)
+        );
+        for unchanged in [
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 80),
+            SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 1), 80),
+            SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 15), 0),
+        ] {
+            assert_eq!(normalize_ipv4_destination(unchanged), unchanged);
+        }
+    }
 
     #[test]
     fn restored_udp_error_precedes_prefetched_successor() {

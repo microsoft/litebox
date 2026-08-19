@@ -5,14 +5,12 @@ use super::*;
 
 #[test]
 fn guest_udp_readiness_failure_rolls_back_enqueue() {
-    let provider = Arc::new(LinuxSocketProvider::new(2, 1).unwrap());
-    let broker = BrokerCore::new_with_limits(
-        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+    let (broker, provider) = broker_with_sockets(
+        &guest_network_policy(),
         BrokerCoreLimits::new_with_all_limits(4, 0, 2, 1),
-        provider.clone(),
-    )
-    .unwrap();
+        2,
+        1,
+    );
     let receiver_session = broker
         .create_session(CallerCredential::Unauthenticated)
         .unwrap();
@@ -102,14 +100,12 @@ fn guest_udp_readiness_failure_rolls_back_enqueue() {
 
 #[test]
 fn native_udp_readiness_failure_does_not_fail_shared_reactor() {
-    let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
-    let broker = BrokerCore::new_with_limits(
-        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+    let (broker, _provider) = broker_with_sockets(
+        &guest_network_policy(),
         BrokerCoreLimits::new_with_all_limits(4, 0, 2, 2),
-        provider,
-    )
-    .unwrap();
+        2,
+        2,
+    );
     let session = broker
         .create_session(CallerCredential::Unauthenticated)
         .unwrap();
@@ -120,25 +116,25 @@ fn native_udp_readiness_failure_does_not_fail_shared_reactor() {
         fail_next_publish: Mutex::new(None),
     });
     let socket = create_udp_socket(&session, readiness.clone());
-    let external = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    external.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
-    let external_address = socket_address_v4(external.local_addr().unwrap());
+    let gateway_peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    gateway_peer.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
+    let gateway_peer_route = gateway_address(gateway_peer.local_addr().unwrap());
     assert_eq!(
         send_datagram(
             &session,
             socket,
             b"contact",
             SendFlags::NONE,
-            Some(external_address),
+            Some(gateway_peer_route),
         ),
         Ok(SocketOutcome::Completed(7))
     );
     let mut contact = [0; 7];
-    let (_, native_address) = external.recv_from(&mut contact).unwrap();
+    let (_, native_address) = gateway_peer.recv_from(&mut contact).unwrap();
     assert_eq!(&contact, b"contact");
 
     readiness.fail_next_publish_matching(socket, ReadinessFlags::READ, ReadinessFlags::default());
-    external.send_to(b"reply", native_address).unwrap();
+    gateway_peer.send_to(b"reply", native_address).unwrap();
     let deadline = Instant::now() + TEST_TIMEOUT;
     while !session
         .check_readiness(socket)
@@ -159,7 +155,7 @@ fn native_udp_readiness_failure_does_not_fail_shared_reactor() {
         Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
             received: 5,
             datagram_length: 5,
-            source_address: external_address,
+            source_address: gateway_peer_route,
         }))
     );
     assert_eq!(&reply, b"reply");
@@ -171,8 +167,8 @@ fn native_udp_readiness_failure_does_not_fail_shared_reactor() {
             .contains(ReadinessFlags::READ)
     );
 
-    external.send_to(b"first", native_address).unwrap();
-    external.send_to(b"second", native_address).unwrap();
+    gateway_peer.send_to(b"first", native_address).unwrap();
+    gateway_peer.send_to(b"second", native_address).unwrap();
     wait_until_ready(&session, &publications, socket, ReadinessFlags::READ);
     readiness.fail_next_publish_matching(socket, ReadinessFlags::default(), ReadinessFlags::READ);
     for (index, expected) in [b"first".as_slice(), b"second".as_slice()]
@@ -190,7 +186,7 @@ fn native_udp_readiness_failure_does_not_fail_shared_reactor() {
             Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
                 received: expected.len(),
                 datagram_length: expected.len(),
-                source_address: external_address,
+                source_address: gateway_peer_route,
             }))
         );
         assert_eq!(&data[..expected.len()], expected);
@@ -214,14 +210,12 @@ fn native_udp_readiness_failure_does_not_fail_shared_reactor() {
 
 #[test]
 fn udp_status_publication_failure_still_rearms_native_endpoint() {
-    let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
-    let broker = BrokerCore::new_with_limits(
-        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+    let (broker, _provider) = broker_with_sockets(
+        &guest_network_policy(),
         BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
-        provider,
-    )
-    .unwrap();
+        1,
+        1,
+    );
     let session = broker
         .create_session(CallerCredential::Unauthenticated)
         .unwrap();
@@ -233,7 +227,7 @@ fn udp_status_publication_failure_still_rearms_native_endpoint() {
     });
     let socket = create_udp_socket(&session, readiness.clone());
     let refused = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let refused_address = socket_address_v4(refused.local_addr().unwrap());
+    let refused_address = gateway_address(refused.local_addr().unwrap());
     drop(refused);
     assert_eq!(
         litebox_broker_core::socket::connect(&session, socket, refused_address),
@@ -287,14 +281,12 @@ fn udp_status_publication_failure_still_rearms_native_endpoint() {
 
 #[test]
 fn udp_status_republishes_when_another_error_remains_pending() {
-    let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
-    let broker = BrokerCore::new_with_limits(
-        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+    let (broker, provider) = broker_with_sockets(
+        &guest_network_policy(),
         BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
-        provider.clone(),
-    )
-    .unwrap();
+        1,
+        1,
+    );
     let session = broker
         .create_session(CallerCredential::Unauthenticated)
         .unwrap();
@@ -303,7 +295,7 @@ fn udp_status_republishes_when_another_error_remains_pending() {
     let readiness = Arc::new(TestReadinessSink { published, retired });
     let socket = create_udp_socket(&session, readiness);
     let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let peer_address = socket_address_v4(peer.local_addr().unwrap());
+    let peer_address = gateway_address(peer.local_addr().unwrap());
     assert_eq!(
         litebox_broker_core::socket::connect(&session, socket, peer_address),
         Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
@@ -339,14 +331,12 @@ fn udp_status_republishes_when_another_error_remains_pending() {
 
 #[test]
 fn guest_udp_queue_pressure_drops_new_datagrams_successfully() {
-    let provider = Arc::new(LinuxSocketProvider::new(2, 1).unwrap());
-    let broker = BrokerCore::new_with_limits(
-        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+    let (broker, provider) = broker_with_sockets(
+        &guest_network_policy(),
         BrokerCoreLimits::new_with_all_limits(4, 0, 2, 1),
-        provider.clone(),
-    )
-    .unwrap();
+        2,
+        1,
+    );
     let receiver_session = broker
         .create_session(CallerCredential::Unauthenticated)
         .unwrap();
@@ -429,15 +419,13 @@ fn guest_udp_queue_pressure_drops_new_datagrams_successfully() {
 }
 
 #[test]
-fn udp_external_peer_authorization_is_bounded_without_eviction() {
-    let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
-    let broker = BrokerCore::new_with_limits(
-        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+fn udp_native_peer_authorization_is_bounded_without_eviction() {
+    let (broker, _provider) = broker_with_sockets(
+        &guest_network_policy(),
         BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
-        provider,
-    )
-    .unwrap();
+        1,
+        1,
+    );
     let session = broker
         .create_session(CallerCredential::Unauthenticated)
         .unwrap();
@@ -448,7 +436,7 @@ fn udp_external_peer_authorization_is_bounded_without_eviction() {
 
     let first = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     first.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
-    let first_address = socket_address_v4(first.local_addr().unwrap());
+    let first_address = gateway_address(first.local_addr().unwrap());
     assert_eq!(
         send_datagram(&session, handle, b"x", SendFlags::NONE, Some(first_address),),
         Ok(SocketOutcome::Completed(1))
@@ -458,9 +446,9 @@ fn udp_external_peer_authorization_is_bounded_without_eviction() {
     let native_source = socket_address_v4(native_source);
 
     let mut peers = Vec::new();
-    while peers.len() < MAX_UDP_EXTERNAL_PEERS_PER_SOCKET - 1 {
+    while peers.len() < MAX_UDP_NATIVE_PEERS_PER_SOCKET - 1 {
         let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let address = socket_address_v4(peer.local_addr().unwrap());
+        let address = gateway_address(peer.local_addr().unwrap());
         if address.port() == native_source.port() {
             continue;
         }
@@ -482,7 +470,7 @@ fn udp_external_peer_authorization_is_bounded_without_eviction() {
             handle,
             b"overflow",
             SendFlags::NONE,
-            Some(socket_address_v4(overflow.local_addr().unwrap())),
+            Some(gateway_address(overflow.local_addr().unwrap())),
         ),
         Err(BrokerError::ResourceExhausted)
     );
@@ -505,28 +493,13 @@ fn udp_external_peer_authorization_is_bounded_without_eviction() {
 fn reactor_preserves_udp_datagram_semantics() {
     let server = UdpSocket::bind("127.0.0.1:0").unwrap();
     server.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
-    let server_address = socket_address_v4(server.local_addr().unwrap());
-    let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
-    let socket_policy = SocketPolicy::from_udp_destination_rules(&[
-        DestinationRule::new(
-            CallerCredential::Unauthenticated,
-            Ipv4Cidr::new(Ipv4Address([127, 0, 0, 0]), 8).unwrap(),
-            DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
-        ),
-        DestinationRule::new(
-            CallerCredential::Unauthenticated,
-            Ipv4Cidr::new(Ipv4Address([255, 255, 255, 255]), 32).unwrap(),
-            DestinationPortRange::new(Port(9), Port(9)).unwrap(),
-        ),
-    ])
-    .unwrap();
-    let broker = BrokerCore::new_with_limits(
-        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(socket_policy),
+    let server_route = gateway_address(server.local_addr().unwrap());
+    let (broker, provider) = broker_with_sockets(
+        &guest_network_policy(),
         BrokerCoreLimits::new_with_all_limits(4, 0, 2, 2),
-        provider.clone(),
-    )
-    .unwrap();
+        2,
+        2,
+    );
     let session = broker
         .create_session(CallerCredential::Unauthenticated)
         .unwrap();
@@ -574,7 +547,7 @@ fn reactor_preserves_udp_datagram_semantics() {
             shutdown_handle,
             b"after shutdown",
             SendFlags::NONE,
-            Some(server_address),
+            Some(server_route),
         ),
         Ok(SocketOutcome::Failed(SocketError::Other))
     );
@@ -600,7 +573,7 @@ fn reactor_preserves_udp_datagram_semantics() {
             read_shutdown_handle,
             b"before shutdown",
             SendFlags::NONE,
-            Some(server_address),
+            Some(server_route),
         ),
         Ok(SocketOutcome::Completed(15))
     );
@@ -617,7 +590,7 @@ fn reactor_preserves_udp_datagram_semantics() {
             read_shutdown_handle,
             b"write only",
             SendFlags::NONE,
-            Some(server_address),
+            Some(server_route),
         ),
         Ok(SocketOutcome::Completed(10))
     );
@@ -657,18 +630,20 @@ fn reactor_preserves_udp_datagram_semantics() {
         send_datagram(
             &session,
             handle,
-            b"implicit bind",
+            b"invalid class",
             SendFlags::NONE,
             Some(SocketAddrV4::new(Ipv4Addr::BROADCAST, 9)),
         ),
-        Ok(SocketOutcome::Failed(SocketError::Other))
+        Ok(SocketOutcome::Failed(SocketError::InvalidArgument))
     );
-    let implicitly_bound = litebox_broker_core::socket::status(&session, handle)
-        .unwrap()
-        .local_address
-        .unwrap();
-    assert!(implicitly_bound.ip().is_unspecified());
-    assert_ne!(implicitly_bound.port(), 0);
+    // A destination that no route can represent is rejected before the
+    // implicit bind reserves a guest endpoint.
+    assert_eq!(
+        litebox_broker_core::socket::status(&session, handle)
+            .unwrap()
+            .local_address,
+        None
+    );
     let mut no_data = [0; 1];
     assert_eq!(
         receive_datagram_into(&session, handle, &mut no_data, ReceiveFromFlags::NONE,),
@@ -680,7 +655,7 @@ fn reactor_preserves_udp_datagram_semantics() {
             handle,
             b"ping",
             SendFlags::NONE,
-            Some(server_address),
+            Some(server_route),
         ),
         Ok(SocketOutcome::Completed(4))
     );
@@ -692,7 +667,7 @@ fn reactor_preserves_udp_datagram_semantics() {
     assert_eq!(status.status, SocketConnectionStatus::Unconnected);
     let local_address = status.local_address.unwrap();
     assert!(local_address.ip().is_unspecified());
-    assert_eq!(local_address, implicitly_bound);
+    assert_ne!(local_address.port(), 0);
     assert!(source.ip().is_loopback());
 
     server.send_to(&[], source).unwrap();
@@ -703,7 +678,7 @@ fn reactor_preserves_udp_datagram_semantics() {
         Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
             received: 0,
             datagram_length: 0,
-            source_address: server_address,
+            source_address: server_route,
         }))
     );
     assert_eq!(
@@ -719,7 +694,7 @@ fn reactor_preserves_udp_datagram_semantics() {
         Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
             received: 3,
             datagram_length: 6,
-            source_address: server_address,
+            source_address: server_route,
         }))
     );
     assert_eq!(&peeked, b"abc");
@@ -729,7 +704,7 @@ fn reactor_preserves_udp_datagram_semantics() {
         Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
             received: 3,
             datagram_length: 6,
-            source_address: server_address,
+            source_address: server_route,
         }))
     );
     assert_eq!(&peeked, b"abc");
@@ -739,7 +714,7 @@ fn reactor_preserves_udp_datagram_semantics() {
         Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
             received: 4,
             datagram_length: 6,
-            source_address: server_address,
+            source_address: server_route,
         }))
     );
     assert_eq!(&truncated, b"abcd");
@@ -749,14 +724,17 @@ fn reactor_preserves_udp_datagram_semantics() {
     );
 
     assert_eq!(
-        litebox_broker_core::socket::connect(&session, handle, server_address),
+        litebox_broker_core::socket::connect(&session, handle, server_route),
         Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
     );
     let connected_status = litebox_broker_core::socket::status(&session, handle).unwrap();
     assert_eq!(connected_status.status, SocketConnectionStatus::Connected);
     assert_eq!(
         connected_status.local_address,
-        Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, local_address.port()))
+        Some(SocketAddrV4::new(
+            guest_ipv4_address(),
+            local_address.port()
+        ))
     );
     let maximum = vec![0x5a; MAX_UDP_DATAGRAM_SIZE as usize];
     assert_eq!(
@@ -776,7 +754,7 @@ fn reactor_preserves_udp_datagram_semantics() {
             handle,
             SocketAddrV4::new(Ipv4Addr::BROADCAST, 9),
         ),
-        Ok(SocketOutcome::Failed(SocketError::Other))
+        Ok(SocketOutcome::Failed(SocketError::InvalidArgument))
     );
     assert_eq!(
         send_datagram(&session, handle, b"old peer", SendFlags::NONE, None),
@@ -787,10 +765,10 @@ fn reactor_preserves_udp_datagram_semantics() {
     assert_eq!(socket_address_v4(preserved_source), source);
 
     let refused_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-    let refused_address = socket_address_v4(refused_socket.local_addr().unwrap());
+    let refused_route = gateway_address(refused_socket.local_addr().unwrap());
     drop(refused_socket);
     assert_eq!(
-        litebox_broker_core::socket::connect(&session, handle, refused_address),
+        litebox_broker_core::socket::connect(&session, handle, refused_route),
         Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
     );
     assert_eq!(
@@ -806,7 +784,7 @@ fn reactor_preserves_udp_datagram_semantics() {
             SendFlags::NONE,
             Some(SocketAddrV4::new(Ipv4Addr::BROADCAST, 9)),
         ),
-        Ok(SocketOutcome::Failed(SocketError::Other))
+        Ok(SocketOutcome::Failed(SocketError::InvalidArgument))
     );
     let send_error_status = litebox_broker_core::socket::status(&session, handle).unwrap();
     assert_eq!(
@@ -830,7 +808,7 @@ fn reactor_preserves_udp_datagram_semantics() {
             handle,
             SocketAddrV4::new(Ipv4Addr::BROADCAST, 9),
         ),
-        Ok(SocketOutcome::Failed(SocketError::Other))
+        Ok(SocketOutcome::Failed(SocketError::InvalidArgument))
     );
     let refused_status = litebox_broker_core::socket::status(&session, handle).unwrap();
     assert_eq!(
@@ -844,7 +822,7 @@ fn reactor_preserves_udp_datagram_semantics() {
             .contains(ReadinessFlags::ERROR)
     );
     assert_eq!(
-        litebox_broker_core::socket::connect(&session, handle, server_address),
+        litebox_broker_core::socket::connect(&session, handle, server_route),
         Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
     );
 
@@ -853,7 +831,7 @@ fn reactor_preserves_udp_datagram_semantics() {
         Ok(SocketOutcome::Completed(()))
     );
     assert_eq!(
-        litebox_broker_core::socket::connect(&session, handle, server_address),
+        litebox_broker_core::socket::connect(&session, handle, server_route),
         Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
     );
     assert!(
@@ -873,14 +851,12 @@ fn reactor_preserves_udp_datagram_semantics() {
 
 #[test]
 fn guest_udp_namespace_routes_across_sessions_and_filters_private_endpoints() {
-    let provider = Arc::new(LinuxSocketProvider::new(6, 3).unwrap());
-    let broker = BrokerCore::new_with_limits(
-        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+    let (broker, provider) = broker_with_sockets(
+        &guest_network_policy(),
         BrokerCoreLimits::new_with_all_limits(8, 0, 6, 3),
-        provider.clone(),
-    )
-    .unwrap();
+        6,
+        3,
+    );
     let receiver_session = broker
         .create_session(CallerCredential::Unauthenticated)
         .unwrap();
@@ -896,7 +872,9 @@ fn guest_udp_namespace_routes_across_sessions_and_filters_private_endpoints() {
         .set_nonblocking(true)
         .expect("failed to make shadow socket nonblocking");
     let guest_port = shadowed_host_socket.local_addr().unwrap().port();
-    let receiver_guest_address = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), guest_port);
+    // An exact private guest binding shadows the identical host loopback port
+    // and still reaches the host gateway.
+    let receiver_guest_address = SocketAddrV4::new(guest_ipv4_address(), guest_port);
     let receiver = create_udp_socket(&receiver_session, readiness.clone());
     assert_eq!(
         litebox_broker_core::socket::bind(&receiver_session, receiver, receiver_guest_address,),
@@ -938,7 +916,10 @@ fn guest_udp_namespace_routes_across_sessions_and_filters_private_endpoints() {
         .unwrap()
         .local_address
         .expect("implicit UDP bind missing");
-    let sender_source_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, sender_guest_address.port());
+    // A wildcard sender answers a private guest destination with the shared
+    // private guest identity.
+    let sender_source_address =
+        SocketAddrV4::new(guest_ipv4_address(), sender_guest_address.port());
     wait_until_ready(
         &receiver_session,
         &publications,
@@ -998,22 +979,22 @@ fn guest_udp_namespace_routes_across_sessions_and_filters_private_endpoints() {
         ErrorKind::WouldBlock
     );
 
-    let external = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    external.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
-    let external_address = socket_address_v4(external.local_addr().unwrap());
+    let host_service = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    host_service.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
+    let host_service_route = gateway_address(host_service.local_addr().unwrap());
     assert_eq!(
         send_datagram(
             &receiver_session,
             receiver,
             b"contact",
             SendFlags::NONE,
-            Some(external_address),
+            Some(host_service_route),
         ),
         Ok(SocketOutcome::Completed(7))
     );
-    let mut external_packet = [0; 7];
-    let (_, receiver_source) = external.recv_from(&mut external_packet).unwrap();
-    assert_eq!(&external_packet, b"contact");
+    let mut service_packet = [0; 7];
+    let (_, receiver_source) = host_service.recv_from(&mut service_packet).unwrap();
+    assert_eq!(&service_packet, b"contact");
     assert_eq!(provider.reactor.udp_native_endpoint_count(), 1);
     assert!(
         provider
@@ -1053,7 +1034,7 @@ fn guest_udp_namespace_routes_across_sessions_and_filters_private_endpoints() {
         ),
         Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
     );
-    external.send_to(b"reply", receiver_source).unwrap();
+    host_service.send_to(b"reply", receiver_source).unwrap();
     wait_until_ready(
         &receiver_session,
         &publications,
@@ -1081,7 +1062,7 @@ fn guest_udp_namespace_routes_across_sessions_and_filters_private_endpoints() {
         Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
             received: 5,
             datagram_length: 5,
-            source_address: external_address,
+            source_address: host_service_route,
         }))
     );
     assert_eq!(&reply, b"reply");
@@ -1096,7 +1077,7 @@ fn guest_udp_namespace_routes_across_sessions_and_filters_private_endpoints() {
         Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
             received: 5,
             datagram_length: 5,
-            source_address: external_address,
+            source_address: host_service_route,
         }))
     );
     assert_eq!(&reply, b"reply");
@@ -1119,14 +1100,12 @@ fn guest_udp_namespace_routes_across_sessions_and_filters_private_endpoints() {
 
 #[test]
 fn udp_exact_bindings_coexist_and_wildcard_covers_loopback() {
-    let provider = Arc::new(LinuxSocketProvider::new(8, 5).unwrap());
-    let broker = BrokerCore::new_with_limits(
-        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+    let (broker, _provider) = broker_with_sockets(
+        &guest_network_policy(),
         BrokerCoreLimits::new_with_all_limits(12, 0, 8, 8),
-        provider,
-    )
-    .unwrap();
+        8,
+        5,
+    );
     let receiver_session = broker
         .create_session(CallerCredential::Unauthenticated)
         .unwrap();
@@ -1195,7 +1174,7 @@ fn udp_exact_bindings_coexist_and_wildcard_covers_loopback() {
                 received: payload.len(),
                 datagram_length: payload.len(),
                 source_address: SocketAddrV4::new(
-                    Ipv4Addr::LOCALHOST,
+                    *destination.ip(),
                     litebox_broker_core::socket::status(&sender_session, sender)
                         .unwrap()
                         .local_address
@@ -1299,7 +1278,7 @@ fn udp_exact_bindings_coexist_and_wildcard_covers_loopback() {
             datagram_length: 4,
             source_address,
         })) if source_address == SocketAddrV4::new(
-            Ipv4Addr::LOCALHOST,
+            *concrete_destination.ip(),
             wildcard_address.port(),
         )
     ));
@@ -1308,14 +1287,12 @@ fn udp_exact_bindings_coexist_and_wildcard_covers_loopback() {
 
 #[test]
 fn udp_native_endpoint_is_reused_and_retired() {
-    let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
-    let broker = BrokerCore::new_with_limits(
-        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+    let (broker, provider) = broker_with_sockets(
+        &guest_network_policy(),
         BrokerCoreLimits::new_with_all_limits(4, 0, 2, 2),
-        provider.clone(),
-    )
-    .unwrap();
+        2,
+        2,
+    );
     let session = broker
         .create_session(CallerCredential::Unauthenticated)
         .unwrap();
@@ -1327,8 +1304,8 @@ fn udp_native_endpoint_is_reused_and_retired() {
     let second = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     first.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
     second.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
-    let first_address = socket_address_v4(first.local_addr().unwrap());
-    let second_address = socket_address_v4(second.local_addr().unwrap());
+    let first_address = gateway_address(first.local_addr().unwrap());
+    let second_address = gateway_address(second.local_addr().unwrap());
 
     assert_eq!(provider.reactor.udp_native_endpoint_count(), 0);
     assert_eq!(provider.reactor.udp_native_event_token_count(), 0);
@@ -1372,15 +1349,13 @@ fn udp_native_endpoint_is_reused_and_retired() {
 }
 
 #[test]
-fn udp_endpoint_staging_error_rolls_back_external_peer_reservation() {
-    let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
-    let broker = BrokerCore::new_with_limits(
-        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+fn udp_endpoint_staging_error_rolls_back_native_peer_reservation() {
+    let (broker, provider) = broker_with_sockets(
+        &guest_network_policy(),
         BrokerCoreLimits::new_with_all_limits(4, 0, 2, 2),
-        provider.clone(),
-    )
-    .unwrap();
+        2,
+        2,
+    );
     let session = broker
         .create_session(CallerCredential::Unauthenticated)
         .unwrap();
@@ -1388,8 +1363,8 @@ fn udp_endpoint_staging_error_rolls_back_external_peer_reservation() {
     let (retired, _retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
     let socket = create_udp_socket(&session, readiness);
-    let external = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let external_address = socket_address_v4(external.local_addr().unwrap());
+    let gateway_peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let gateway_peer_route = gateway_address(gateway_peer.local_addr().unwrap());
 
     provider.reactor.exhaust_udp_event_tokens();
     assert_eq!(
@@ -1398,11 +1373,11 @@ fn udp_endpoint_staging_error_rolls_back_external_peer_reservation() {
             socket,
             b"not sent",
             SendFlags::NONE,
-            Some(external_address),
+            Some(gateway_peer_route),
         ),
         Err(BrokerError::ResourceExhausted)
     );
-    assert_eq!(provider.reactor.udp_external_peer_count(), 0);
+    assert_eq!(provider.reactor.udp_native_peer_count(), 0);
     assert_eq!(provider.reactor.udp_native_endpoint_count(), 0);
     assert_eq!(provider.reactor.udp_native_event_token_count(), 0);
 
@@ -1411,14 +1386,12 @@ fn udp_endpoint_staging_error_rolls_back_external_peer_reservation() {
 
 #[test]
 fn stale_udp_datagrams_are_not_relabelled_after_guest_port_reuse() {
-    let provider = Arc::new(LinuxSocketProvider::new(5, 3).unwrap());
-    let broker = BrokerCore::new_with_limits(
-        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+    let (broker, provider) = broker_with_sockets(
+        &guest_network_policy(),
         BrokerCoreLimits::new_with_all_limits(8, 0, 5, 3),
-        provider.clone(),
-    )
-    .unwrap();
+        5,
+        3,
+    );
     let receiver_session = broker
         .create_session(CallerCredential::Unauthenticated)
         .unwrap();
@@ -1518,14 +1491,12 @@ fn stale_udp_datagrams_are_not_relabelled_after_guest_port_reuse() {
 
 #[test]
 fn udp_queued_datagrams_survive_source_session_teardown() {
-    let provider = Arc::new(LinuxSocketProvider::new(3, 1).unwrap());
-    let broker = BrokerCore::new_with_limits(
-        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+    let (broker, provider) = broker_with_sockets(
+        &guest_network_policy(),
         BrokerCoreLimits::new_with_all_limits(6, 0, 3, 1),
-        provider.clone(),
-    )
-    .unwrap();
+        3,
+        1,
+    );
     let source_session = broker
         .create_session(CallerCredential::Unauthenticated)
         .unwrap();
@@ -1651,14 +1622,12 @@ fn udp_queued_datagrams_survive_source_session_teardown() {
 
 #[test]
 fn connected_guest_udp_enforces_barriers_peek_and_peer_generations() {
-    let provider = Arc::new(LinuxSocketProvider::new(4, 2).unwrap());
-    let broker = BrokerCore::new_with_limits(
-        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+    let (broker, provider) = broker_with_sockets(
+        &guest_network_policy(),
         BrokerCoreLimits::new_with_all_limits(8, 0, 4, 2),
-        provider.clone(),
-    )
-    .unwrap();
+        4,
+        2,
+    );
     let first_session = broker
         .create_session(CallerCredential::Unauthenticated)
         .unwrap();
@@ -1796,26 +1765,23 @@ fn externally_connected_udp_preserves_guest_routing_identity() {
     let external = UdpSocket::bind((local_ip, 0)).unwrap();
     external.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
     let external_address = socket_address_v4(external.local_addr().unwrap());
-    let provider = Arc::new(LinuxSocketProvider::new(4, 2).unwrap());
-    let policy = SocketPolicy::from_udp_destination_rules(&[
-        DestinationRule::new(
-            CallerCredential::Unauthenticated,
-            Ipv4Cidr::new(Ipv4Address([127, 0, 0, 0]), 8).unwrap(),
-            DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
-        ),
-        DestinationRule::new(
+    let policy = SocketPolicy::from_guest_network_destination_rules(
+        true,
+        &[],
+        true,
+        &[DestinationRule::new(
             CallerCredential::Unauthenticated,
             Ipv4Cidr::new(Ipv4Address(local_ip.octets()), 32).unwrap(),
             DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
-        ),
-    ])
-    .unwrap();
-    let broker = BrokerCore::new_with_limits(
-        PolicyEngine::with_unauthenticated_rights(ObjectRights::all()).with_socket_policy(policy),
-        BrokerCoreLimits::new_with_all_limits(6, 0, 4, 2),
-        provider.clone(),
+        )],
     )
     .unwrap();
+    let (broker, provider) = broker_with_sockets(
+        &policy,
+        BrokerCoreLimits::new_with_all_limits(6, 0, 4, 2),
+        4,
+        2,
+    );
     let source_session = broker
         .create_session(CallerCredential::Unauthenticated)
         .unwrap();
@@ -1840,7 +1806,9 @@ fn externally_connected_udp_preserves_guest_routing_identity() {
         .unwrap()
         .local_address
         .expect("connected UDP source address missing");
-    assert_eq!(source_address.ip(), &local_ip);
+    // An external route answers with the shared private guest identity, not
+    // the host source the kernel selected.
+    assert_eq!(source_address.ip(), &guest_ipv4_address());
     let internal_source_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, source_address.port());
 
     assert_eq!(
@@ -1918,14 +1886,12 @@ fn externally_connected_udp_preserves_guest_routing_identity() {
 
 #[test]
 fn guest_connected_udp_drains_native_ingress_without_delivering_it() {
-    let provider = Arc::new(LinuxSocketProvider::new(4, 2).unwrap());
-    let broker = BrokerCore::new_with_limits(
-        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+    let (broker, provider) = broker_with_sockets(
+        &guest_network_policy(),
         BrokerCoreLimits::new_with_all_limits(8, 0, 4, 2),
-        provider.clone(),
-    )
-    .unwrap();
+        4,
+        2,
+    );
     let receiver_session = broker
         .create_session(CallerCredential::Unauthenticated)
         .unwrap();
@@ -1940,7 +1906,9 @@ fn guest_connected_udp_drains_native_ingress_without_delivering_it() {
         .local_addr()
         .unwrap()
         .port();
-    let receiver_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, guest_port);
+    // A private guest binding can still reach the host gateway, so this socket
+    // owns both a guest peer and one native endpoint.
+    let receiver_address = SocketAddrV4::new(guest_ipv4_address(), guest_port);
     let receiver = create_udp_socket(&receiver_session, readiness.clone());
     assert_eq!(
         litebox_broker_core::socket::bind(&receiver_session, receiver, receiver_address,),
@@ -1961,7 +1929,7 @@ fn guest_connected_udp_drains_native_ingress_without_delivering_it() {
     let source_address = litebox_broker_core::socket::status(&sender_session, sender)
         .unwrap()
         .local_address
-        .map(|address| SocketAddrV4::new(Ipv4Addr::LOCALHOST, address.port()))
+        .map(|address| SocketAddrV4::new(guest_ipv4_address(), address.port()))
         .unwrap();
     let mut warmup = [0; 6];
     assert_eq!(
@@ -1985,7 +1953,7 @@ fn guest_connected_udp_drains_native_ingress_without_delivering_it() {
 
     let attacker = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     attacker.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
-    let attacker_address = socket_address_v4(attacker.local_addr().unwrap());
+    let attacker_address = gateway_address(attacker.local_addr().unwrap());
     assert_eq!(
         send_datagram(
             &receiver_session,
@@ -2059,4 +2027,235 @@ fn guest_connected_udp_drains_native_ingress_without_delivering_it() {
         }))
     );
     assert_eq!(&payload, b"ok");
+}
+
+#[test]
+fn guest_udp_misses_never_create_native_state() {
+    let (broker, provider) = broker_with_sockets(
+        &guest_network_policy(),
+        BrokerCoreLimits::new_with_all_limits(4, 0, 2, 2),
+        2,
+        2,
+    );
+    let session = broker
+        .create_session(CallerCredential::Unauthenticated)
+        .unwrap();
+    let (published, _publications) = channel();
+    let (retired, _retirements) = channel();
+    let readiness = Arc::new(TestReadinessSink { published, retired });
+    let socket = create_udp_socket(&session, readiness);
+
+    let host_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    host_socket.set_nonblocking(true).unwrap();
+    let shadowed_port = host_socket.local_addr().unwrap().port();
+    for destination in [
+        SocketAddrV4::new(Ipv4Addr::LOCALHOST, shadowed_port),
+        SocketAddrV4::new(guest_ipv4_address(), shadowed_port),
+    ] {
+        assert_eq!(
+            send_datagram(
+                &session,
+                socket,
+                b"miss",
+                SendFlags::NONE,
+                Some(destination)
+            ),
+            Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+        );
+        assert_eq!(
+            litebox_broker_core::socket::connect(&session, socket, destination),
+            Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+        );
+    }
+    // A guest miss neither reaches the host nor allocates native state.
+    assert_eq!(
+        host_socket.recv_from(&mut [0; 4]).unwrap_err().kind(),
+        ErrorKind::WouldBlock
+    );
+    assert_eq!(provider.reactor.udp_native_endpoint_count(), 0);
+    assert_eq!(provider.reactor.udp_native_event_token_count(), 0);
+    assert_eq!(provider.reactor.udp_native_peer_count(), 0);
+}
+
+#[test]
+fn udp_gateway_and_external_reuse_one_native_endpoint() {
+    let local_ip = non_loopback_local_ipv4();
+    if std::env::var_os("CI").is_some() {
+        assert!(
+            local_ip.is_some(),
+            "CI runner must provide a routable non-loopback IPv4 address"
+        );
+    }
+    let Some(local_ip) = local_ip else {
+        return;
+    };
+    let gateway_peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    gateway_peer.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
+    let gateway_peer_route = gateway_address(gateway_peer.local_addr().unwrap());
+    let external_peer = UdpSocket::bind((local_ip, 0)).unwrap();
+    external_peer.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
+    let external_peer_address = socket_address_v4(external_peer.local_addr().unwrap());
+    let policy = SocketPolicy::from_guest_network_destination_rules(
+        true,
+        &[],
+        true,
+        &[DestinationRule::new(
+            CallerCredential::Unauthenticated,
+            Ipv4Cidr::new(Ipv4Address(local_ip.octets()), 32).unwrap(),
+            DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
+        )],
+    )
+    .unwrap();
+    let (broker, provider) = broker_with_sockets(
+        &policy,
+        BrokerCoreLimits::new_with_all_limits(4, 0, 2, 2),
+        2,
+        2,
+    );
+    let session = broker
+        .create_session(CallerCredential::Unauthenticated)
+        .unwrap();
+    let (published, publications) = channel();
+    let (retired, _retirements) = channel();
+    let readiness = Arc::new(TestReadinessSink { published, retired });
+    let socket = create_udp_socket(&session, readiness);
+
+    assert_eq!(
+        send_datagram(
+            &session,
+            socket,
+            b"gateway",
+            SendFlags::NONE,
+            Some(gateway_peer_route),
+        ),
+        Ok(SocketOutcome::Completed(7))
+    );
+    let mut payload = [0; 8];
+    let (_, gateway_native_source) = gateway_peer.recv_from(&mut payload).unwrap();
+    let gateway_native_source = socket_address_v4(gateway_native_source);
+    assert!(gateway_native_source.ip().is_loopback());
+    assert_eq!(provider.reactor.udp_native_endpoint_count(), 1);
+    assert_eq!(provider.reactor.udp_native_event_token_count(), 1);
+
+    assert_eq!(
+        send_datagram(
+            &session,
+            socket,
+            b"external",
+            SendFlags::NONE,
+            Some(external_peer_address),
+        ),
+        Ok(SocketOutcome::Completed(8))
+    );
+    let (_, external_native_source) = external_peer.recv_from(&mut payload).unwrap();
+    let external_native_source = socket_address_v4(external_native_source);
+    // One endpoint serves both routes, so the host-visible source port is
+    // reused instead of allocating another descriptor or epoll token.
+    assert_eq!(external_native_source.port(), gateway_native_source.port());
+    assert_eq!(provider.reactor.udp_native_endpoint_count(), 1);
+    assert_eq!(provider.reactor.udp_native_event_token_count(), 1);
+    assert_eq!(provider.reactor.udp_native_peer_count(), 2);
+
+    gateway_peer.send_to(b"gr", gateway_native_source).unwrap();
+    wait_until_ready(&session, &publications, socket, ReadinessFlags::READ);
+    let mut reply = [0; 2];
+    assert_eq!(
+        receive_datagram_into(&session, socket, &mut reply, ReceiveFromFlags::NONE),
+        Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+            received: 2,
+            datagram_length: 2,
+            source_address: gateway_peer_route,
+        }))
+    );
+    assert_eq!(&reply, b"gr");
+
+    external_peer
+        .send_to(b"er", external_native_source)
+        .unwrap();
+    wait_until_ready(&session, &publications, socket, ReadinessFlags::READ);
+    assert_eq!(
+        receive_datagram_into(&session, socket, &mut reply, ReceiveFromFlags::NONE),
+        Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+            received: 2,
+            datagram_length: 2,
+            source_address: external_peer_address,
+        }))
+    );
+    assert_eq!(&reply, b"er");
+    assert_eq!(provider.reactor.udp_native_endpoint_count(), 1);
+    assert_eq!(provider.reactor.udp_native_event_token_count(), 1);
+}
+
+#[test]
+fn gateway_udp_replies_report_the_gateway_and_reject_other_host_sources() {
+    let (broker, provider) = broker_with_sockets(
+        &guest_network_policy(),
+        BrokerCoreLimits::new_with_all_limits(4, 0, 2, 2),
+        2,
+        2,
+    );
+    let session = broker
+        .create_session(CallerCredential::Unauthenticated)
+        .unwrap();
+    let (published, publications) = channel();
+    let (retired, _retirements) = channel();
+    let readiness = Arc::new(TestReadinessSink { published, retired });
+    let socket = create_udp_socket(&session, readiness);
+
+    let service = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    service.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
+    let service_route = gateway_address(service.local_addr().unwrap());
+    assert_eq!(
+        send_datagram(
+            &session,
+            socket,
+            b"request",
+            SendFlags::NONE,
+            Some(service_route),
+        ),
+        Ok(SocketOutcome::Completed(7))
+    );
+    let mut request = [0; 7];
+    let (_, native_source) = service.recv_from(&mut request).unwrap();
+    let native_source = socket_address_v4(native_source);
+    assert_eq!(&request, b"request");
+    assert_eq!(provider.reactor.udp_native_peer_count(), 1);
+
+    // The broker's own endpoint is never a reachable gateway destination.
+    assert_eq!(
+        send_datagram(
+            &session,
+            socket,
+            b"self",
+            SendFlags::NONE,
+            Some(SocketAddrV4::new(
+                gateway_ipv4_address(),
+                native_source.port(),
+            )),
+        ),
+        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+    );
+
+    // Another host loopback source may not masquerade as the gateway.
+    let alias_impostor = UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 2), 0)).unwrap();
+    alias_impostor.send_to(b"spoofed", native_source).unwrap();
+    let port_impostor = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    port_impostor.send_to(b"spoofed", native_source).unwrap();
+    service.send_to(b"reply", native_source).unwrap();
+    wait_until_ready(&session, &publications, socket, ReadinessFlags::READ);
+    let mut reply = [0; 7];
+    assert_eq!(
+        receive_datagram_into(&session, socket, &mut reply[..5], ReceiveFromFlags::NONE),
+        Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+            received: 5,
+            datagram_length: 5,
+            source_address: service_route,
+        }))
+    );
+    assert_eq!(&reply[..5], b"reply");
+    assert_eq!(
+        receive_datagram_into(&session, socket, &mut reply, ReceiveFromFlags::NONE),
+        Err(BrokerError::WouldBlock)
+    );
+    assert_eq!(provider.reactor.udp_native_peer_count(), 1);
 }

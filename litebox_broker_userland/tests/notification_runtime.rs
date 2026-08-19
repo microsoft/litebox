@@ -7,7 +7,7 @@ use std::sync::mpsc::{Receiver, channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use litebox_broker_core::socket::UnsupportedSocketProvider;
+use litebox_broker_core::socket::{BrokerNetworkConfig, UnsupportedSocketProvider};
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
 use litebox_broker_host::{ConnectionTermination, setup_connection};
 use litebox_broker_local::{BrokerLocal, BrokerNotifications};
@@ -48,6 +48,7 @@ fn spawn_host(
     std::thread::spawn(move || {
         let broker = BrokerCore::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all()),
+            Arc::new(BrokerNetworkConfig::default()),
             Arc::new(UnsupportedSocketProvider),
         )
         .unwrap();
@@ -130,6 +131,7 @@ fn readiness_of(notification: Option<BrokerNotification>) -> ReadinessNotificati
 fn host_serves_control_requests_and_notifications_over_shared_rings() {
     let broker = BrokerCore::new(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all()),
+        Arc::new(BrokerNetworkConfig::default()),
         Arc::new(UnsupportedSocketProvider),
     )
     .unwrap();

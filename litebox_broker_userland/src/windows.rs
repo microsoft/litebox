@@ -11,7 +11,7 @@ use std::process::Child;
 use std::sync::Arc;
 use std::time::Instant;
 
-use litebox_broker_core::socket::UnsupportedSocketProvider;
+use litebox_broker_core::socket::{BrokerNetworkConfig, UnsupportedSocketProvider};
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
 use litebox_broker_protocol::message::{BrokerRequest, BrokerResponse};
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
@@ -27,7 +27,7 @@ use litebox_broker_transport_windows_userland::shared_memory::WindowsSharedMemor
 
 use super::{
     HostAssociationShutdown, HostRequestSource, HostResponseSink, SETUP_TIMEOUT,
-    configured_socket_policy,
+    configured_gateway_rules, configured_socket_policy,
 };
 
 impl HostRequestSource for WindowsControlRingHostRequestSource {
@@ -51,9 +51,19 @@ impl HostAssociationShutdown for WindowsControlRingHostShutdown {
 pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
     let control_pipe = unique_control_pipe_name();
     let control_listener = WindowsNamedPipeListener::bind(&control_pipe)?;
+    let policy = PolicyEngine::with_host_guaranteed_rights(ObjectRights::all())
+        .with_socket_policy(configured_socket_policy(
+            &args.allow_tcp_destination,
+            &args.allow_host_gateway_tcp_port,
+            &args.allow_host_gateway_udp_port,
+        )?)
+        .with_gateway_rules(
+            &configured_gateway_rules(&args.allow_host_gateway_tcp_port),
+            &configured_gateway_rules(&args.allow_host_gateway_udp_port),
+        )?;
     let broker = BrokerCore::new(
-        PolicyEngine::with_host_guaranteed_rights(ObjectRights::all())
-            .with_socket_policy(configured_socket_policy(&args.allow_tcp_destination)?),
+        policy,
+        Arc::new(BrokerNetworkConfig::default()),
         Arc::new(UnsupportedSocketProvider),
     )?;
 

@@ -8,6 +8,7 @@ use std::process::Child;
 use std::sync::Arc;
 use std::time::Instant;
 
+use litebox_broker_core::socket::BrokerNetworkConfig;
 use litebox_broker_core::{BrokerCore, BrokerCoreLimits, ObjectRights, PolicyEngine};
 use litebox_broker_platform_linux_userland::LinuxSocketProvider;
 use litebox_broker_protocol::message::{BrokerRequest, BrokerResponse};
@@ -21,7 +22,7 @@ use litebox_broker_transport_linux_userland::unix_socket::{
 
 use super::{
     HostAssociationShutdown, HostRequestSource, HostResponseSink, SETUP_TIMEOUT,
-    configured_socket_policy,
+    configured_gateway_rules, configured_socket_policy,
 };
 
 impl HostRequestSource for UnixControlRingHostRequestSource {
@@ -50,11 +51,24 @@ pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
     let control_listener = UnixListener::bind(&control_socket_path)?;
     control_listener.set_nonblocking(true)?;
     let limits = BrokerCoreLimits::DEFAULT;
+    // The broker core and its socket provider must share one network identity.
+    let network_config = Arc::new(BrokerNetworkConfig::default());
+    let policy = PolicyEngine::with_host_guaranteed_rights(ObjectRights::all())
+        .with_socket_policy(configured_socket_policy(
+            &args.allow_tcp_destination,
+            &args.allow_host_gateway_tcp_port,
+            &args.allow_host_gateway_udp_port,
+        )?)
+        .with_gateway_rules(
+            &configured_gateway_rules(&args.allow_host_gateway_tcp_port),
+            &configured_gateway_rules(&args.allow_host_gateway_udp_port),
+        )?;
     let broker = BrokerCore::new_with_limits(
-        PolicyEngine::with_host_guaranteed_rights(ObjectRights::all())
-            .with_socket_policy(configured_socket_policy(&args.allow_tcp_destination)?),
+        policy,
         limits,
+        Arc::clone(&network_config),
         Arc::new(LinuxSocketProvider::new(
+            network_config,
             limits.max_sockets,
             limits.max_sockets_per_session,
         )?),

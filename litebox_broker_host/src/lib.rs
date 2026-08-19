@@ -697,10 +697,13 @@ mod tests {
     use core::net::{Ipv4Addr, SocketAddrV4};
     use litebox_broker_core::readiness::ReadinessRegistration;
     use litebox_broker_core::socket::{
-        AcceptedPlatformSocket, PlatformConnectError, PlatformDatagramReceive, PlatformSocket,
-        PlatformSocketStatus, PlatformStreamReceive, SocketProvider,
+        AcceptedPlatformSocket, BrokerNetworkConfig, PlatformConnectError, PlatformSocket,
+        PlatformSocketStatus, PlatformStreamReceive, RoutedPlatformDatagramReceive,
+        SocketDestination, SocketProvider,
     };
-    use litebox_broker_core::{ObjectRights, PolicyEngine, SessionId, SocketPolicy};
+    use litebox_broker_core::{
+        DestinationPortRange, GatewayPortRule, ObjectRights, PolicyEngine, SessionId, SocketPolicy,
+    };
     use litebox_broker_protocol::event::{
         AddEventRequest, ConsumeEventRequest, CreateEventRequest, EventConsumeMode,
     };
@@ -711,7 +714,7 @@ mod tests {
         SharedBufferDescriptor,
     };
     use litebox_broker_protocol::socket::{
-        AddressFamily, ConnectSocketRequest, CreateSocketRequest, IpProtocol, ReceiveFlags,
+        AddressFamily, ConnectSocketRequest, CreateSocketRequest, IpProtocol, Port, ReceiveFlags,
         ReceiveFromFlags, ReceiveFromSocketRequest, ReceiveFromSocketResponse,
         ReceiveSocketRequest, SendFlags, SendSocketRequest, SendToSocketRequest,
         SendToSocketResponse, ShutdownMode, ShutdownSocketRequest, SocketConnectionStatus,
@@ -818,7 +821,7 @@ mod tests {
 
         fn connect(
             &self,
-            _address: SocketAddrV4,
+            _destination: SocketDestination,
         ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
             self.readiness
                 .publish(litebox_broker_protocol::readiness::ReadinessFlags::WRITE)
@@ -842,7 +845,7 @@ mod tests {
             &self,
             data: Vec<u8>,
             _flags: SendFlags,
-            _destination: Option<SocketAddrV4>,
+            _destination: Option<SocketDestination>,
         ) -> litebox_broker_core::Result<SocketOutcome<usize>> {
             Ok(SocketOutcome::Completed(data.len()))
         }
@@ -864,12 +867,14 @@ mod tests {
             &self,
             length: usize,
             _flags: ReceiveFromFlags,
-        ) -> litebox_broker_core::Result<SocketOutcome<PlatformDatagramReceive>> {
+        ) -> litebox_broker_core::Result<SocketOutcome<RoutedPlatformDatagramReceive>> {
             let received = length.min(3);
-            Ok(SocketOutcome::Completed(PlatformDatagramReceive {
+            Ok(SocketOutcome::Completed(RoutedPlatformDatagramReceive {
                 data: [4, 5, 6][..received].to_vec(),
                 datagram_length: 4,
-                source_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49153),
+                source: SocketDestination::Guest {
+                    requested: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49153),
+                },
             }))
         }
 
@@ -910,9 +915,23 @@ mod tests {
 
     #[test]
     fn host_request_handling_uses_one_broker_core() {
+        // Guest networking admits both protocols inside the guest namespace,
+        // and the TCP gateway rule authorizes the one host service below.
+        let policy = PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(
+                SocketPolicy::from_guest_network_destination_rules(true, &[], true, &[]).unwrap(),
+            )
+            .with_gateway_rules(
+                &[GatewayPortRule::new(
+                    CallerCredential::Unauthenticated,
+                    DestinationPortRange::new(Port(8080), Port(8080)).unwrap(),
+                )],
+                &[],
+            )
+            .unwrap();
         let broker = BrokerCore::new(
-            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-                .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            policy,
+            Arc::new(BrokerNetworkConfig::default()),
             Arc::new(TestSocketProvider),
         )
         .unwrap();
@@ -1356,7 +1375,10 @@ mod tests {
                 &session,
                 BrokerOperation::Socket(SocketRequest::Connect(ConnectSocketRequest {
                     handle: response.handle,
-                    address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080),
+                    address: SocketAddrV4::new(
+                        BrokerNetworkConfig::default().gateway_ipv4_address(),
+                        8080,
+                    ),
                 })),
                 &shared_buffers,
             ),
@@ -1374,7 +1396,12 @@ mod tests {
             ),
             BrokerResult::Socket(SocketResponse::Status(SocketStatusResponse {
                 status: SocketConnectionStatus::Connected,
-                local_address: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152)),
+                // A wildcard reservation reaches the gateway as the private
+                // guest identity.
+                local_address: Some(SocketAddrV4::new(
+                    BrokerNetworkConfig::default().guest_ipv4_address(),
+                    49152,
+                )),
                 pending_error: None,
             }))
         );

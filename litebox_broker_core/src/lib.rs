@@ -35,12 +35,13 @@ use spin::rwlock::RwLock;
 
 pub use error::BrokerError;
 pub use policy::{
-    DestinationPolicy, DestinationPortRange, DestinationRule, Ipv4Cidr, MAX_DESTINATION_RULES,
-    PolicyEngine, PolicyProfile, SocketPolicy, SocketPolicyError,
+    DestinationPolicy, DestinationPortRange, DestinationRule, GatewayPortRule, Ipv4Cidr,
+    MAX_DESTINATION_RULES, MAX_GATEWAY_RULES, PolicyEngine, PolicyProfile, SocketPolicy,
+    SocketPolicyError,
 };
 use session::ObjectReference;
 pub use session::{BrokerSession, CallerCredential, ObjectRights, SessionId};
-use socket::{BrokerSocketPorts, SocketProvider};
+use socket::{BrokerNetworkConfig, BrokerSocketPorts, SocketProvider};
 
 /// BrokerCore result type.
 pub type Result<T> = core::result::Result<T, BrokerError>;
@@ -110,6 +111,7 @@ impl Default for BrokerCoreLimits {
 pub struct BrokerCore {
     pub(crate) policy: Arc<PolicyEngine>,
     pub(crate) limits: BrokerCoreLimits,
+    pub(crate) network_config: Arc<BrokerNetworkConfig>,
     pub(crate) next_session_id: Arc<RwLock<u64>>,
     pub(crate) next_reference_handle: Arc<RwLock<u64>>,
     pub(crate) references: Arc<RwLock<HashMap<ObjectHandle, ObjectReference>>>,
@@ -124,14 +126,27 @@ static BROKER_CORE_CREATED: AtomicBool = AtomicBool::new(false);
 
 impl BrokerCore {
     /// Creates the broker core with a broker-wide platform socket provider.
-    pub fn new(policy: PolicyEngine, socket_provider: Arc<dyn SocketProvider>) -> Result<Self> {
-        Self::new_with_limits(policy, BrokerCoreLimits::DEFAULT, socket_provider)
+    ///
+    /// The network configuration is the broker-wide guest identity shared with
+    /// the socket provider; both must agree on the same value.
+    pub fn new(
+        policy: PolicyEngine,
+        network_config: Arc<BrokerNetworkConfig>,
+        socket_provider: Arc<dyn SocketProvider>,
+    ) -> Result<Self> {
+        Self::new_with_limits(
+            policy,
+            BrokerCoreLimits::DEFAULT,
+            network_config,
+            socket_provider,
+        )
     }
 
     /// Creates the broker core with explicit limits and a socket provider.
     pub fn new_with_limits(
         policy: PolicyEngine,
         limits: BrokerCoreLimits,
+        network_config: Arc<BrokerNetworkConfig>,
         socket_provider: Arc<dyn SocketProvider>,
     ) -> Result<Self> {
         BROKER_CORE_CREATED
@@ -141,6 +156,7 @@ impl BrokerCore {
         Ok(Self {
             policy: Arc::new(policy),
             limits,
+            network_config,
             next_session_id: Arc::new(RwLock::new(1)),
             next_reference_handle: Arc::new(RwLock::new(1)),
             references: Arc::new(RwLock::new(HashMap::new())),
@@ -156,6 +172,12 @@ impl BrokerCore {
     #[must_use]
     pub const fn limits(&self) -> BrokerCoreLimits {
         self.limits
+    }
+
+    /// Returns the immutable broker-wide network configuration.
+    #[must_use]
+    pub fn network_config(&self) -> Arc<BrokerNetworkConfig> {
+        Arc::clone(&self.network_config)
     }
 
     pub(crate) fn allocate_reference_handle(&self) -> Result<ObjectHandle> {

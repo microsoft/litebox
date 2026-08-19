@@ -18,8 +18,9 @@ use std::time::Instant;
 use std::time::Duration;
 
 use litebox_broker_core::socket::{
-    AcceptedPlatformSocket, GuestSocketBinding, PlatformConnectError, PlatformDatagramReceive,
-    PlatformSocket, PlatformSocketStatus, PlatformStreamReceive, SocketProvider,
+    AcceptedPlatformSocket, BrokerNetworkConfig, GuestSocketBinding, PlatformConnectError,
+    PlatformSocket, PlatformSocketStatus, PlatformStreamReceive, RoutedPlatformDatagramReceive,
+    SocketDestination, SocketProvider,
 };
 use litebox_broker_core::{BrokerError, Result as BrokerResult, SessionId};
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -173,10 +174,23 @@ pub struct LinuxSocketProvider {
 }
 
 impl LinuxSocketProvider {
-    /// Starts a provider with global and per-session socket limits.
-    pub fn new(max_sockets: usize, max_sockets_per_session: usize) -> IoResult<Self> {
+    /// Starts a provider with a shared network configuration and socket limits.
+    ///
+    /// The configuration is the broker-wide guest identity; the caller must
+    /// pass the same value it gave [`litebox_broker_core::BrokerCore`], because
+    /// this provider validates every broker-issued binding and destination
+    /// against it before touching native state.
+    pub fn new(
+        network_config: Arc<BrokerNetworkConfig>,
+        max_sockets: usize,
+        max_sockets_per_session: usize,
+    ) -> IoResult<Self> {
         Ok(Self {
-            reactor: Arc::new(ReactorClient::start(max_sockets, max_sockets_per_session)?),
+            reactor: Arc::new(ReactorClient::start(
+                network_config,
+                max_sockets,
+                max_sockets_per_session,
+            )?),
         })
     }
 }
@@ -273,7 +287,7 @@ impl PlatformSocket for LinuxSocket {
                 Ok(SocketOutcome::Completed(AcceptedPlatformSocket {
                     socket,
                     local_address: accepted.local_address,
-                    remote_address: accepted.remote_address,
+                    remote: accepted.remote,
                 }))
             }
             SocketOutcome::Failed(error) => Ok(SocketOutcome::Failed(error)),
@@ -282,9 +296,9 @@ impl PlatformSocket for LinuxSocket {
 
     fn connect(
         &self,
-        address: SocketAddrV4,
+        destination: SocketDestination,
     ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
-        self.reactor.connect(self.id, address)
+        self.reactor.connect(self.id, destination)
     }
 
     fn send(&self, data: Vec<u8>, _flags: SendFlags) -> BrokerResult<SocketOutcome<usize>> {
@@ -299,7 +313,7 @@ impl PlatformSocket for LinuxSocket {
         &self,
         data: Vec<u8>,
         _flags: SendFlags,
-        destination: Option<SocketAddrV4>,
+        destination: Option<SocketDestination>,
     ) -> BrokerResult<SocketOutcome<usize>> {
         self.reactor.request(|response| ReactorCommand::SendTo {
             id: self.id,
@@ -342,7 +356,7 @@ impl PlatformSocket for LinuxSocket {
         &self,
         length: usize,
         flags: ReceiveFromFlags,
-    ) -> BrokerResult<SocketOutcome<PlatformDatagramReceive>> {
+    ) -> BrokerResult<SocketOutcome<RoutedPlatformDatagramReceive>> {
         match self
             .reactor
             .request(|response| ReactorCommand::ReceiveFrom {
@@ -354,11 +368,11 @@ impl PlatformSocket for LinuxSocket {
             ReactorReceiveFromOutcome::Received {
                 data: received,
                 datagram_length,
-                source_address,
-            } => Ok(SocketOutcome::Completed(PlatformDatagramReceive {
+                source,
+            } => Ok(SocketOutcome::Completed(RoutedPlatformDatagramReceive {
                 data: received,
                 datagram_length,
-                source_address,
+                source,
             })),
             ReactorReceiveFromOutcome::Failed(error) => Ok(SocketOutcome::Failed(error)),
         }
@@ -424,7 +438,11 @@ struct ReactorClient {
 }
 
 impl ReactorClient {
-    fn start(max_sockets: usize, max_sockets_per_session: usize) -> IoResult<Self> {
+    fn start(
+        network_config: Arc<BrokerNetworkConfig>,
+        max_sockets: usize,
+        max_sockets_per_session: usize,
+    ) -> IoResult<Self> {
         let epoll_fd = epoll::create(epoll::CreateFlags::CLOEXEC)?;
         let wake = Arc::new(eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK)?);
         epoll::add(
@@ -454,6 +472,7 @@ impl ReactorClient {
                     wake: reactor_wake,
                     commands: receiver,
                     sockets,
+                    network_config,
                     tcp: ReactorTcpState::default(),
                     udp: ReactorUdpState::default(),
                     sessions: HashMap::new(),
@@ -524,12 +543,12 @@ impl ReactorClient {
     fn connect(
         &self,
         id: u64,
-        address: SocketAddrV4,
+        destination: SocketDestination,
     ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
         let (response, receive) = sync_channel(1);
         let command = ReactorCommand::Connect {
             id,
-            address,
+            destination,
             response,
         };
         // Block until the reactor has queue space (see `request`): a transiently
@@ -661,10 +680,10 @@ impl ReactorClient {
     }
 
     #[cfg(test)]
-    fn udp_external_peer_count(&self) -> usize {
+    fn udp_native_peer_count(&self) -> usize {
         let (response, receive) = sync_channel(1);
         self.commands
-            .send(ReactorCommand::UdpExternalPeerCount { response })
+            .send(ReactorCommand::UdpNativePeerCount { response })
             .unwrap();
         self.signal().unwrap();
         receive.recv().unwrap()
@@ -791,7 +810,7 @@ enum ReactorCommand {
     },
     Connect {
         id: u64,
-        address: SocketAddrV4,
+        destination: SocketDestination,
         response: SyncSender<core::result::Result<SocketConnectionStatus, PlatformConnectError>>,
     },
     Bind {
@@ -820,7 +839,7 @@ enum ReactorCommand {
     SendTo {
         id: u64,
         data: Vec<u8>,
-        destination: Option<SocketAddrV4>,
+        destination: Option<SocketDestination>,
         response: SyncSender<BrokerResult<SocketOutcome<usize>>>,
     },
     Receive {
@@ -902,7 +921,7 @@ enum ReactorCommand {
         response: SyncSender<BrokerResult<Option<usize>>>,
     },
     #[cfg(test)]
-    UdpExternalPeerCount {
+    UdpNativePeerCount {
         response: SyncSender<usize>,
     },
     #[cfg(test)]
@@ -940,7 +959,7 @@ enum ReactorReceiveFromOutcome {
     Received {
         data: Vec<u8>,
         datagram_length: usize,
-        source_address: SocketAddrV4,
+        source: SocketDestination,
     },
     Failed(SocketError),
 }
@@ -951,6 +970,8 @@ struct Reactor {
     wake: Arc<OwnedFd>,
     commands: Receiver<ReactorCommand>,
     sockets: HashMap<u64, SocketEntry>,
+    /// Broker-wide guest identity shared with the broker core.
+    network_config: Arc<BrokerNetworkConfig>,
     tcp: ReactorTcpState,
     udp: ReactorUdpState,
     sessions: HashMap<SessionId, ReactorSessionState>,
@@ -1008,7 +1029,7 @@ struct ReactorSessionState {
     live_socket_count: usize,
     pending_guest_connection_count: usize,
     retained_connector_count: usize,
-    udp_external_peer_count: usize,
+    udp_native_peer_count: usize,
     udp_queued_datagrams: usize,
     udp_queued_bytes: usize,
     closing: bool,
@@ -1025,7 +1046,7 @@ fn retain_session_state(state: &ReactorSessionState) -> bool {
         || state.live_socket_count != 0
         || state.pending_guest_connection_count != 0
         || state.retained_connector_count != 0
-        || state.udp_external_peer_count != 0
+        || state.udp_native_peer_count != 0
         || state.udp_queued_datagrams != 0
         || state.udp_queued_bytes != 0
 }
@@ -1093,25 +1114,21 @@ impl Reactor {
         } else {
             SocketKind::Udp
         };
-        if !binding.is_valid() || binding_kind != kind {
+        if !binding.is_valid_for(&self.network_config) || binding_kind != kind {
             return Err(BrokerError::Internal);
         }
         if kind == SocketKind::Udp {
             if already_bound {
                 return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
             }
-            let internal_address = if binding.is_wildcard() {
-                SocketAddrV4::new(Ipv4Addr::LOCALHOST, requested_address.port())
-            } else {
-                requested_address
-            };
-            self.udp.insert_binding(ReactorUdpBinding {
-                socket_id: id,
-                guest_binding: binding,
-            })?;
+            self.udp.insert_binding(
+                &self.network_config,
+                ReactorUdpBinding {
+                    socket_id: id,
+                    guest_binding: binding,
+                },
+            )?;
             let socket = self.sockets.get_mut(&id).ok_or(BrokerError::Internal)?;
-            let udp = socket.udp_state_mut()?;
-            udp.internal_address = Some(internal_address);
             socket.guest_local_address = Some(requested_address);
             socket
                 .snapshot
@@ -1126,22 +1143,37 @@ impl Reactor {
     fn connect_socket(
         &mut self,
         id: u64,
-        guest_address: SocketAddrV4,
+        destination: SocketDestination,
     ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
         let kind = self.sockets.get(&id).map(SocketEntry::kind).ok_or(
             PlatformConnectError::PeerIndeterminate(BrokerError::Internal),
         )?;
         if kind == SocketKind::Udp {
-            let peer = match self.resolve_udp_destination(guest_address) {
+            // Route classification and the guest-visible source are decided
+            // before any native state changes, so malformed trusted metadata
+            // fails closed with the peer unchanged.
+            let peer = match self
+                .resolve_udp_destination(destination)
+                .map_err(PlatformConnectError::PeerUnchanged)?
+            {
                 SocketOutcome::Completed(peer) => peer,
                 SocketOutcome::Failed(error) => {
                     return Ok(SocketConnectionStatus::Failed(error));
                 }
             };
-            let mut reused_host_address = None;
+            let guest_local_address = self
+                .udp
+                .binding_for_socket(id)
+                .and_then(|binding| {
+                    binding
+                        .guest_binding
+                        .concrete_address_for(&self.network_config, destination)
+                })
+                .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?;
+            let mut reused_endpoint = false;
             let mut staged_endpoint = match peer {
                 ReactorUdpPeer::Guest { .. } => None,
-                ReactorUdpPeer::External(address) => {
+                ReactorUdpPeer::Native { host_address, .. } => {
                     if self
                         .sockets
                         .get(&id)
@@ -1152,9 +1184,9 @@ impl Reactor {
                         .as_ref()
                         .is_some()
                     {
-                        match self.connect_existing_udp_endpoint(id, address)? {
-                            SocketOutcome::Completed(host_address) => {
-                                reused_host_address = Some(host_address);
+                        match self.connect_existing_udp_endpoint(id, host_address)? {
+                            SocketOutcome::Completed(()) => {
+                                reused_endpoint = true;
                                 None
                             }
                             SocketOutcome::Failed(error) => {
@@ -1163,7 +1195,7 @@ impl Reactor {
                         }
                     } else {
                         match self
-                            .stage_udp_endpoint(id, address, Some(address))
+                            .stage_udp_endpoint(id, host_address, Some(host_address))
                             .map_err(PlatformConnectError::PeerUnchanged)?
                         {
                             SocketOutcome::Completed(endpoint) => Some(endpoint),
@@ -1180,42 +1212,11 @@ impl Reactor {
                 }
                 return Err(PlatformConnectError::PeerIndeterminate(error));
             }
-            let guest_local_address = match (|| {
-                let socket = self.sockets.get(&id).ok_or(BrokerError::Internal)?;
-                let current = socket.guest_local_address.ok_or(BrokerError::Internal)?;
-                let binding = self
-                    .udp
-                    .binding_for_socket(id)
-                    .ok_or(BrokerError::Internal)?;
-                if binding.guest_binding.is_wildcard() {
-                    let ip = match (&peer, &staged_endpoint, reused_host_address) {
-                        (ReactorUdpPeer::Guest { .. }, _, _) => Ipv4Addr::LOCALHOST,
-                        (ReactorUdpPeer::External(_), Some(endpoint), _) => {
-                            *endpoint.host_address.ip()
-                        }
-                        (ReactorUdpPeer::External(_), None, Some(host_address)) => {
-                            *host_address.ip()
-                        }
-                        _ => return Err(BrokerError::Internal),
-                    };
-                    Ok(SocketAddrV4::new(ip, current.port()))
-                } else {
-                    Ok(current)
-                }
-            })() {
-                Ok(address) => address,
-                Err(error) => {
-                    if let Some(endpoint) = staged_endpoint.take() {
-                        self.unregister_udp_endpoint(endpoint);
-                    }
-                    return Err(PlatformConnectError::PeerIndeterminate(error));
-                }
-            };
-            if reused_host_address.is_none() {
+            if !reused_endpoint {
                 self.replace_udp_endpoint(id, staged_endpoint.take())
                     .map_err(PlatformConnectError::PeerIndeterminate)?;
             }
-            self.clear_udp_external_peers(id)
+            self.clear_udp_native_peers(id)
                 .map_err(PlatformConnectError::PeerIndeterminate)?;
             let readiness = self
                 .udp_readiness(id)
@@ -1241,16 +1242,16 @@ impl Reactor {
                 .map_err(PlatformConnectError::PeerIndeterminate)?;
             return Ok(SocketConnectionStatus::Connected);
         }
-        self.connect_tcp_guest(id, guest_address)
+        self.connect_tcp_guest(id, destination)
     }
 
     fn send_to_socket(
         &mut self,
         id: u64,
         data: &[u8],
-        destination: Option<SocketAddrV4>,
+        destination: Option<SocketDestination>,
     ) -> BrokerResult<SocketOutcome<usize>> {
-        let (peer, authorize_external_reply) = {
+        let (peer, authorize_native_reply) = {
             let socket = self.sockets.get(&id).ok_or(BrokerError::Internal)?;
             if socket.kind() != SocketKind::Udp || data.len() > MAX_UDP_DATAGRAM_SIZE as usize {
                 return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
@@ -1260,7 +1261,7 @@ impl Reactor {
             }
             let udp = socket.udp_state()?;
             match destination {
-                Some(address) => match self.resolve_udp_destination(address) {
+                Some(destination) => match self.resolve_udp_destination(destination)? {
                     SocketOutcome::Completed(peer) => (peer, udp.peer.is_none()),
                     SocketOutcome::Failed(error) => return Ok(SocketOutcome::Failed(error)),
                 },
@@ -1273,20 +1274,27 @@ impl Reactor {
         match peer {
             ReactorUdpPeer::Guest {
                 socket_generation,
-                guest_address,
+                destination,
             } => {
                 if self
                     .udp
                     .binding_for_socket(socket_generation)
-                    .is_none_or(|binding| !binding.guest_binding.covers(guest_address))
+                    .is_none_or(|binding| {
+                        !binding
+                            .guest_binding
+                            .covers(&self.network_config, destination.requested())
+                    })
                 {
                     return Ok(SocketOutcome::Failed(SocketError::ConnectionRefused));
                 }
-                self.enqueue_guest_datagram(id, socket_generation, data)
+                self.enqueue_guest_datagram(id, socket_generation, destination, data)
             }
-            ReactorUdpPeer::External(address) => {
-                let external_peer_added = if authorize_external_reply {
-                    self.reserve_udp_external_peer(id, address)?
+            ReactorUdpPeer::Native {
+                host_address,
+                destination,
+            } => {
+                let native_peer_added = if authorize_native_reply {
+                    self.reserve_udp_native_peer(id, host_address, destination)?
                 } else {
                     false
                 };
@@ -1299,26 +1307,26 @@ impl Reactor {
                     .as_ref()
                     .is_none()
                 {
-                    let endpoint = match self.stage_udp_endpoint(id, address, None) {
+                    let endpoint = match self.stage_udp_endpoint(id, host_address, None) {
                         Ok(SocketOutcome::Completed(endpoint)) => endpoint,
                         Ok(SocketOutcome::Failed(error)) => {
-                            if external_peer_added {
-                                self.remove_udp_external_peer(id, address);
+                            if native_peer_added {
+                                self.remove_udp_native_peer(id, host_address);
                             }
                             return Ok(SocketOutcome::Failed(error));
                         }
                         Err(error) => {
-                            if external_peer_added {
-                                self.remove_udp_external_peer(id, address);
+                            if native_peer_added {
+                                self.remove_udp_native_peer(id, host_address);
                             }
                             return Err(error);
                         }
                     };
                     self.replace_udp_endpoint(id, Some(endpoint))?;
                 }
-                let outcome = self.send_external_udp(id, data, address);
-                if !matches!(outcome, Ok(SocketOutcome::Completed(_))) && external_peer_added {
-                    self.remove_udp_external_peer(id, address);
+                let outcome = self.send_native_udp(id, data, host_address);
+                if !matches!(outcome, Ok(SocketOutcome::Completed(_))) && native_peer_added {
+                    self.remove_udp_native_peer(id, host_address);
                 }
                 outcome
             }
@@ -1455,24 +1463,24 @@ impl Reactor {
                 self.udp
                     .remove_binding(binding.guest_binding.requested().port(), id);
             }
-            let external_peer_count = self
+            let native_peer_count = self
                 .sockets
                 .get(&id)
                 .and_then(|socket| socket.udp_state().ok())
-                .map_or(0, |udp| udp.external_peers.len());
-            self.udp.external_peer_count = self
+                .map_or(0, |udp| udp.native_peers.len());
+            self.udp.native_peer_count = self
                 .udp
-                .external_peer_count
-                .checked_sub(external_peer_count)
-                .expect("reactor UDP external peer count underflow");
+                .native_peer_count
+                .checked_sub(native_peer_count)
+                .expect("reactor UDP native peer count underflow");
             let session = self
                 .sessions
                 .get_mut(&session_id)
                 .expect("UDP socket session state missing");
-            session.udp_external_peer_count = session
-                .udp_external_peer_count
-                .checked_sub(external_peer_count)
-                .expect("session UDP external peer count underflow");
+            session.udp_native_peer_count = session
+                .udp_native_peer_count
+                .checked_sub(native_peer_count)
+                .expect("session UDP native peer count underflow");
             self.sockets.remove(&id);
             session.live_socket_count = session
                 .live_socket_count
@@ -1589,10 +1597,10 @@ impl Reactor {
                 }
                 ReactorCommand::Connect {
                     id,
-                    address,
+                    destination,
                     response,
                 } => {
-                    let outcome = self.connect_socket(id, address);
+                    let outcome = self.connect_socket(id, destination);
                     let _ = response.send(outcome);
                 }
                 ReactorCommand::Bind {
@@ -1788,8 +1796,8 @@ impl Reactor {
                     let _ = response.send(size);
                 }
                 #[cfg(test)]
-                ReactorCommand::UdpExternalPeerCount { response } => {
-                    let _ = response.send(self.udp.external_peer_count);
+                ReactorCommand::UdpNativePeerCount { response } => {
+                    let _ = response.send(self.udp.native_peer_count);
                 }
                 #[cfg(test)]
                 ReactorCommand::UdpNativeHeadDatagramBytes {
@@ -2082,6 +2090,21 @@ const fn socket_kind(request: CreateSocketRequest) -> Option<SocketKind> {
         (AddressFamily::Ipv4, SocketType::Stream, IpProtocol::Tcp) => Some(SocketKind::Tcp),
         (AddressFamily::Ipv4, SocketType::Datagram, IpProtocol::Udp) => Some(SocketKind::Udp),
         _ => None,
+    }
+}
+
+/// Translates one non-guest route to the host address realized natively.
+///
+/// An authorized gateway route reaches the host through loopback on the same
+/// port, and an external route keeps its requested address. A guest route has
+/// no native host address because it never leaves the broker's namespace.
+const fn native_host_address(destination: SocketDestination) -> Option<SocketAddrV4> {
+    match destination {
+        SocketDestination::Guest { .. } => None,
+        SocketDestination::Gateway { requested } => {
+            Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, requested.port()))
+        }
+        SocketDestination::External { requested } => Some(requested),
     }
 }
 

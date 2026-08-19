@@ -505,6 +505,7 @@ mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{SessionReferences, release_pending_reference};
+    use crate::socket::BrokerNetworkConfig;
     use crate::{
         BrokerCore, BrokerCoreLimits, BrokerError, CallerCredential, ObjectRights, PolicyEngine,
         SocketPolicy,
@@ -543,6 +544,7 @@ mod tests {
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_socket_policy(SocketPolicy::Ipv4Loopback),
             BrokerCoreLimits::new_with_all_limits(2, 4, 2, 1),
+            Arc::new(BrokerNetworkConfig::default()),
             socket_provider.clone(),
         )
         .unwrap();
