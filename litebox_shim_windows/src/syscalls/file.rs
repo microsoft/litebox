@@ -10,7 +10,7 @@ use core::mem::{align_of, offset_of, size_of};
 use int_enum::IntEnum;
 use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd};
 use litebox::fs::errors::{
-    FileStatusError, MkdirError, OpenError, PathError, ReadDirError, WriteError,
+    FileStatusError, MkdirError, OpenError, PathError, ReadDirError, ReadError, WriteError,
 };
 use litebox::fs::{FileStatus, FileType, Mode, OFlags, SeekWhence};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider};
@@ -45,6 +45,9 @@ bitflags::bitflags! {
 const FILE_SHARE_READ: u32 = 0x0000_0001;
 const FILE_SHARE_WRITE: u32 = 0x0000_0002;
 const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+
+// Bound guest-controlled file I/O allocations while keeping backend call overhead reasonable.
+const FILE_IO_CHUNK_SIZE: usize = 0x80_000;
 
 /// Append at the current end of file
 const FILE_WRITE_TO_END_OF_FILE: i64 = -1;
@@ -440,6 +443,20 @@ enum IoctlTarget {
     Unsupported,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FileIoOperation {
+    Read,
+    Write,
+}
+
+/// Result of [`Task::prepare_file_io`]: the resolved file entry handle together
+/// with the resolved absolute byte offset (`None` when the current file-pointer
+/// position should be used).
+type PreparedFileIo<Platform, FS> = (
+    litebox::fd::EntryHandle<Platform, FileObjectSubsystem<FS>>,
+    Option<usize>,
+);
+
 #[derive(Clone, Copy)]
 enum FileSharingIdentity<'a> {
     Path(&'a str),
@@ -739,6 +756,32 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         .ok_or(NtStatus::INVALID_HANDLE)
     }
 
+    fn file_io_entry(
+        &self,
+        handle: Handle,
+        operation: FileIoOperation,
+    ) -> Result<
+        (
+            litebox::fd::EntryHandle<Platform, FileObjectSubsystem<FS>>,
+            bool,
+        ),
+        NtStatus,
+    > {
+        let mut append_only = false;
+        let file = self.typed_handle_entry_with_access_check::<FileObjectSubsystem<FS>>(
+            handle,
+            |granted_access| match operation {
+                FileIoOperation::Read => granted_access & FileAccess::READ_DATA.bits() != 0,
+                FileIoOperation::Write => {
+                    append_only = granted_access & FileAccess::WRITE_DATA.bits() == 0
+                        && granted_access & FileAccess::APPEND_DATA.bits() != 0;
+                    granted_access & (FileAccess::WRITE_DATA | FileAccess::APPEND_DATA).bits() != 0
+                }
+            },
+        )?;
+        Ok((file, append_only))
+    }
+
     pub(crate) fn image_section_file_path(&self, handle: Handle) -> Result<String, NtStatus> {
         let entry = self.typed_handle_entry_with_access::<FileObjectSubsystem<FS>>(
             handle,
@@ -975,89 +1018,79 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         {
             return NtStatus::ACCESS_VIOLATION;
         }
-        let Some(buffer) = buffer.to_owned_slice(length as usize) else {
+        let input_length = length as usize;
+        if buffer.as_usize().checked_add(input_length).is_none() {
             return NtStatus::ACCESS_VIOLATION;
-        };
-        if !event.is_null()
-            && let Err(status) = self.check_event_modify_access(event)
-        {
-            return status;
         }
-        let offset = match byte_offset {
-            Some(byte_offset) => match byte_offset.read_at_offset(0) {
-                Some(FILE_USE_FILE_POINTER_POSITION) => None,
-                Some(FILE_WRITE_TO_END_OF_FILE) => {
-                    let file = match self.file_entry(file_handle) {
-                        Ok(file) => file,
-                        Err(status) => return status,
-                    };
-                    match file.with_entry(|file| self.fs.file_status(&file.path)) {
-                        Ok(status) => Some(status.size),
-                        Err(error) => return map_file_status_error(error),
-                    }
-                }
-                Some(offset) if offset >= 0 => match usize::try_from(offset) {
-                    Ok(offset) => Some(offset),
-                    Err(_) => return NtStatus::INVALID_PARAMETER,
-                },
-                Some(_) => return NtStatus::INVALID_PARAMETER,
-                None => return NtStatus::ACCESS_VIOLATION,
-            },
-            None => None,
-        };
-        if let Some(key) = key {
-            let Some(key) = key.read_at_offset(0) else {
-                return NtStatus::ACCESS_VIOLATION;
-            };
-            litebox_util_log::debug!(
-                file_handle = file_handle.as_raw(),
-                key = key;
-                "Ignoring NtWriteFile byte-range lock key; byte-range locking is not supported yet"
-            );
-        }
-
-        let file = match self.file_entry(file_handle) {
-            Ok(file) => file,
+        let (file, offset) = match self.prepare_file_io(
+            file_handle,
+            event,
+            apc_routine,
+            apc_context,
+            byte_offset,
+            key,
+            FileIoOperation::Write,
+            input_length,
+        ) {
+            Ok(prepared) => prepared,
             Err(status) => return status,
         };
-        if !event.is_null()
-            && let Err(status) = self.clear_event(event)
-        {
-            return status;
-        }
-        if apc_routine.is_some() || apc_context.is_some() {
-            litebox_util_log::debug!(
-                file_handle = file_handle.as_raw();
-                "Ignoring NtWriteFile APC completion arguments for synchronous completion"
-            );
-        }
-        let result = file.with_entry(|file| match &file.backing {
-            FileObjectBacking::Filesystem { fd, is_directory } => {
-                if *is_directory {
-                    return Err(WriteError::NotAFile);
+        let mut total_written = 0;
+        let result = loop {
+            if total_written == input_length {
+                break Ok(total_written);
+            }
+            let chunk_length = (input_length - total_written).min(FILE_IO_CHUNK_SIZE);
+            let chunk_address = buffer.as_usize() + total_written;
+            let Some(bytes) =
+                ConstPtr::<Platform, u8>::from_usize(chunk_address).to_owned_slice(chunk_length)
+            else {
+                return NtStatus::ACCESS_VIOLATION;
+            };
+            let chunk_offset = offset.map(|offset| offset + total_written);
+            let write = file.with_entry(|file| match &file.backing {
+                FileObjectBacking::Filesystem { fd, is_directory } => {
+                    if *is_directory {
+                        return Err(WriteError::NotAFile);
+                    }
+                    self.fs.write(fd, &bytes, chunk_offset)
                 }
-                let written = self.fs.write(fd, &buffer, offset)?;
-                // A positional write leaves the backing file offset untouched, but NT advances a
-                // synchronous file object's position past the end of every write, including
-                // explicit-offset and append writes. Asynchronous handles keep their position.
-                if let Some(offset) = offset
+                FileObjectBacking::CondrvStream { fd, .. } => {
+                    self.fs.write(fd, &bytes, chunk_offset)
+                }
+                FileObjectBacking::CondrvControl(_) | FileObjectBacking::KsecDevice => {
+                    Err(WriteError::NotAFile)
+                }
+            });
+            let written = match write {
+                Ok(0) => break Ok(total_written),
+                Ok(written) => written,
+                Err(_) if total_written != 0 => break Ok(total_written),
+                Err(error) => break Err(error),
+            };
+            total_written += written;
+            if written < chunk_length {
+                break Ok(total_written);
+            }
+        };
+        if result.is_ok()
+            && let Some(offset) = offset
+        {
+            file.with_entry(|file| {
+                if let FileObjectBacking::Filesystem { fd, .. } = &file.backing
                     && file
                         .create_options
                         .intersects(FileCreateOptions::SYNCHRONOUS_IO)
+                    && input_length != 0
                 {
                     let _ = self.fs.seek(
                         fd,
-                        (offset + written).cast_signed(),
+                        (offset + total_written).cast_signed(),
                         SeekWhence::RelativeToBeginning,
                     );
                 }
-                Ok(written)
-            }
-            FileObjectBacking::CondrvStream { fd, .. } => self.fs.write(fd, &buffer, offset),
-            FileObjectBacking::CondrvControl(_) | FileObjectBacking::KsecDevice => {
-                Err(WriteError::NotAFile)
-            }
-        });
+            });
+        }
         let (status, information) = match result {
             Ok(written) => (NtStatus::SUCCESS, written),
             Err(WriteError::ClosedFd) => (NtStatus::INVALID_HANDLE, 0),
@@ -1065,6 +1098,201 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Err(WriteError::NotAFile) => (NtStatus::INVALID_DEVICE_REQUEST, 0),
             Err(_) => (NtStatus::UNSUCCESSFUL, 0),
         };
+        self.complete_file_io(event, io_status_block, status, information)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "NtReadFile has nine ABI parameters; keeping them explicit preserves syscall ordering"
+    )]
+    pub(crate) fn sys_nt_read_file(
+        &self,
+        file_handle: Handle,
+        event: Handle,
+        apc_routine: Option<ConstPtr<Platform, u8>>,
+        apc_context: Option<ConstPtr<Platform, u8>>,
+        io_status_block: MutPtr<Platform, IoStatusBlock>,
+        buffer: MutPtr<Platform, u8>,
+        length: u32,
+        byte_offset: Option<ConstPtr<Platform, i64>>,
+        key: Option<ConstPtr<Platform, u32>>,
+    ) -> NtStatus {
+        let output_length = length as usize;
+        if probe_guest_output_preserving_value::<Platform, IoStatusBlock>(io_status_block).is_err()
+            || buffer.as_usize().checked_add(output_length).is_none()
+            || probe_guest_output_buffer::<Platform>(buffer, output_length).is_err()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        let mut bytes = match file_io_buffer(output_length) {
+            Ok(bytes) => bytes,
+            Err(status) => return status,
+        };
+        let (file, offset) = match self.prepare_file_io(
+            file_handle,
+            event,
+            apc_routine,
+            apc_context,
+            byte_offset,
+            key,
+            FileIoOperation::Read,
+            output_length,
+        ) {
+            Ok(prepared) => prepared,
+            Err(status) => return status,
+        };
+        let mut total_read = 0;
+        let mut guest_write_failed = false;
+        let result = file.with_entry(|file| {
+            loop {
+                if total_read == output_length {
+                    break;
+                }
+                let chunk_length = (output_length - total_read).min(bytes.len());
+                let chunk_offset = offset.map(|offset| offset + total_read);
+                let (read, continue_after_full_chunk) = match &file.backing {
+                    FileObjectBacking::Filesystem { fd, is_directory } => {
+                        if *is_directory {
+                            return Err(ReadError::NotAFile);
+                        }
+                        (
+                            self.fs.read(fd, &mut bytes[..chunk_length], chunk_offset),
+                            true,
+                        )
+                    }
+                    // TODO(condrv-large-read): Continue with per-operation nonblocking reads
+                    // after the first chunk once FileSystem can report WouldBlock.
+                    FileObjectBacking::CondrvStream { fd, .. } => (
+                        self.fs.read(fd, &mut bytes[..chunk_length], chunk_offset),
+                        false,
+                    ),
+                    FileObjectBacking::CondrvControl(_) | FileObjectBacking::KsecDevice => {
+                        return Err(ReadError::NotAFile);
+                    }
+                };
+                let read = match read {
+                    Ok(0) => break,
+                    Ok(read) => read,
+                    Err(_) if total_read != 0 => break,
+                    Err(error) => return Err(error),
+                };
+                if buffer.copy_from_slice(total_read, &bytes[..read]).is_none() {
+                    guest_write_failed = true;
+                    return Err(ReadError::Io);
+                }
+                total_read += read;
+                if read < chunk_length || !continue_after_full_chunk {
+                    break;
+                }
+            }
+            if let Some(offset) = offset
+                && let FileObjectBacking::Filesystem { fd, .. } = &file.backing
+                && file
+                    .create_options
+                    .intersects(FileCreateOptions::SYNCHRONOUS_IO)
+                && output_length != 0
+            {
+                let _ = self.fs.seek(
+                    fd,
+                    (offset + total_read).cast_signed(),
+                    SeekWhence::RelativeToBeginning,
+                );
+            }
+            Ok(total_read)
+        });
+        if guest_write_failed {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        let (status, information) = match result {
+            Ok(0) if output_length == 0 => (NtStatus::SUCCESS, 0),
+            Ok(0) => (NtStatus::END_OF_FILE, 0),
+            Ok(read) => (NtStatus::SUCCESS, read),
+            Err(ReadError::ClosedFd) => (NtStatus::INVALID_HANDLE, 0),
+            Err(ReadError::NotForReading) => (NtStatus::ACCESS_DENIED, 0),
+            Err(ReadError::NotAFile) => (NtStatus::INVALID_DEVICE_REQUEST, 0),
+            Err(_) => (NtStatus::UNSUCCESSFUL, 0),
+        };
+        self.complete_file_io(event, io_status_block, status, information)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "shared NtReadFile/NtWriteFile ABI preparation keeps validation order consistent"
+    )]
+    fn prepare_file_io(
+        &self,
+        file_handle: Handle,
+        event: Handle,
+        apc_routine: Option<ConstPtr<Platform, u8>>,
+        apc_context: Option<ConstPtr<Platform, u8>>,
+        byte_offset: Option<ConstPtr<Platform, i64>>,
+        key: Option<ConstPtr<Platform, u32>>,
+        operation: FileIoOperation,
+        length: usize,
+    ) -> Result<PreparedFileIo<Platform, FS>, NtStatus> {
+        if !event.is_null() {
+            self.check_event_modify_access(event)?;
+        }
+        let (file, append_only) = self.file_io_entry(file_handle, operation)?;
+        let requested_offset = match byte_offset {
+            Some(byte_offset) => Some(
+                byte_offset
+                    .read_at_offset(0)
+                    .ok_or(NtStatus::ACCESS_VIOLATION)?,
+            ),
+            None => None,
+        };
+        let offset = match requested_offset {
+            requested_offset
+                if append_only
+                    || requested_offset == Some(FILE_WRITE_TO_END_OF_FILE)
+                        && operation == FileIoOperation::Write =>
+            {
+                let status = file
+                    .with_entry(|file| self.fs.file_status(&file.path))
+                    .map_err(map_file_status_error)?;
+                Some(status.size)
+            }
+            Some(FILE_USE_FILE_POINTER_POSITION) | None => None,
+            Some(offset) if offset >= 0 => {
+                Some(usize::try_from(offset).map_err(|_| NtStatus::INVALID_PARAMETER)?)
+            }
+            Some(_) => return Err(NtStatus::INVALID_PARAMETER),
+        };
+        if let Some(key) = key {
+            let Some(key) = key.read_at_offset(0) else {
+                return Err(NtStatus::ACCESS_VIOLATION);
+            };
+            litebox_util_log::debug!(
+                file_handle = file_handle.as_raw(),
+                key = key,
+                operation:? = operation;
+                "Ignoring file I/O byte-range lock key; byte-range locking is not supported yet"
+            );
+        }
+        if offset.is_some_and(|offset| offset.checked_add(length).is_none()) {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        if !event.is_null() {
+            self.clear_event(event)?;
+        }
+        if apc_routine.is_some() || apc_context.is_some() {
+            litebox_util_log::debug!(
+                file_handle = file_handle.as_raw(),
+                operation:? = operation;
+                "Ignoring file I/O APC completion arguments for synchronous completion"
+            );
+        }
+        Ok((file, offset))
+    }
+
+    fn complete_file_io(
+        &self,
+        event: Handle,
+        io_status_block: MutPtr<Platform, IoStatusBlock>,
+        status: NtStatus,
+        information: usize,
+    ) -> NtStatus {
         if io_status_block
             .write_at_offset(0, IoStatusBlock::new(status, information))
             .is_none()
@@ -1859,6 +2087,16 @@ fn probe_file_outputs<Platform: RawPointerProvider>(
     probe_guest_output_preserving_value::<Platform, IoStatusBlock>(io_status_block)
 }
 
+fn file_io_buffer(length: usize) -> Result<Vec<u8>, NtStatus> {
+    let capacity = length.min(FILE_IO_CHUNK_SIZE);
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(capacity)
+        .map_err(|_| NtStatus::NO_MEMORY)?;
+    buffer.resize(capacity, 0);
+    Ok(buffer)
+}
+
 fn write_file_result<Platform: RawPointerProvider>(
     file_handle: MutPtr<Platform, Handle>,
     io_status_block: MutPtr<Platform, IoStatusBlock>,
@@ -2618,6 +2856,105 @@ mod tests {
         );
         assert_eq!(task.sys_nt_close(source), NtStatus::SUCCESS);
         assert_eq!(task.sys_nt_close(maximum_duplicate), NtStatus::SUCCESS);
+    }
+
+    #[test]
+    fn nt_write_file_forces_append_only_handles_to_end_of_file() {
+        run_with_test_platform_pointers(|| {
+            let task = crate::tests::test_task();
+            let path = "/tmp/append-only.txt";
+            create_existing_file(&task, path, b"data");
+            let (status, handle, _) = create_file(
+                &task,
+                path,
+                (FileAccess::APPEND_DATA | FileAccess::SYNCHRONIZE).bits(),
+                FILE_OPEN,
+            );
+            assert_eq!(status, NtStatus::SUCCESS);
+
+            let input = b'!';
+            let byte_offset = 0i64;
+            let mut io_status = IoStatusBlock::default();
+            assert_eq!(
+                task.sys_nt_write_file(
+                    handle,
+                    Handle::default(),
+                    None,
+                    None,
+                    mut_ptr(&mut io_status),
+                    const_ptr(&input),
+                    1,
+                    Some(const_ptr(&byte_offset)),
+                    None,
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(io_status.information, 1);
+            assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
+
+            let fd = task.fs.open(path, OFlags::RDONLY, Mode::empty()).unwrap();
+            let mut contents = [0; 5];
+            assert_eq!(task.fs.read(&fd, &mut contents, Some(0)).unwrap(), 5);
+            assert_eq!(&contents, b"data!");
+            task.fs.close(&fd).unwrap();
+        });
+    }
+
+    #[test]
+    fn nt_file_io_transfers_across_multiple_chunks() {
+        run_with_test_platform_pointers(|| {
+            let task = crate::tests::test_task();
+            let (status, handle, _) = create_file(
+                &task,
+                "/tmp/chunked-file-io.txt",
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                FILE_CREATE,
+            );
+            assert_eq!(status, NtStatus::SUCCESS);
+
+            let length = FILE_IO_CHUNK_SIZE * 2 + 4096;
+            let input: std::vec::Vec<u8> = (0..length)
+                .map(|index| u8::try_from(index % 251).unwrap())
+                .collect();
+            let byte_offset = 0i64;
+            let mut io_status = IoStatusBlock::default();
+            assert_eq!(
+                task.sys_nt_write_file(
+                    handle,
+                    Handle::default(),
+                    None,
+                    None,
+                    mut_ptr(&mut io_status),
+                    const_ptr(&input[0]),
+                    u32::try_from(input.len()).unwrap(),
+                    Some(const_ptr(&byte_offset)),
+                    None,
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(io_status.information, input.len());
+
+            let mut output = std::vec![0xa5; length];
+            let output_buffer =
+                MutPtr::<TestPlatform, u8>::from_usize(output.as_mut_ptr() as usize);
+            assert_eq!(
+                task.sys_nt_read_file(
+                    handle,
+                    Handle::default(),
+                    None,
+                    None,
+                    mut_ptr(&mut io_status),
+                    output_buffer,
+                    u32::try_from(output.len()).unwrap(),
+                    Some(const_ptr(&byte_offset)),
+                    None,
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(io_status.information, output.len());
+            assert_eq!(output, input);
+            assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
+        });
     }
 
     #[test]
