@@ -224,6 +224,10 @@ fn copy_to_slice<V: ValidateAccess, T: FromBytes + Copy>(
     let src = ptr.wrapping_add(start_offset);
     let src =
         V::validate_slice(core::ptr::slice_from_raw_parts(src, buf.len()).cast_mut())?.cast_const();
+    // SAFETY: `buf` is a valid destination for `size_of_val(buf)` bytes, and `validate_slice`
+    // bounds the source to the corresponding userspace range. `T: FromBytes` permits every copied
+    // bit pattern, while `memcpy_fallible` reports inaccessible guest pages instead of exposing
+    // them as Rust references. The platform scopes any required userspace access around the copy.
     V::with_user_memory_access(|| unsafe {
         memcpy_fallible(buf.as_mut_ptr().cast(), src.cast(), size_of_val(buf))
     })
