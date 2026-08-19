@@ -24,8 +24,5 @@ litebox_platform_linux_userland = { path = "../litebox_platform_linux_userland/"
 [target.'cfg(target_os = "windows")'.dev-dependencies]
 litebox_platform_windows_userland = { path = "../litebox_platform_windows_userland/", version = "0.1.0" }
 
-[dev-dependencies]
-litebox = { path = "../litebox/", version = "0.1.0", features = ["test-utils"] }
-
 [lints]
 workspace = true

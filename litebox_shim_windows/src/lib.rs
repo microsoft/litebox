@@ -29,9 +29,8 @@ use litebox::platform::{
 use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
 use litebox::sync::{Mutex, RawSyncPrimitivesProvider};
 use litebox::utils::TruncateExt as _;
+use litebox_common_windows::NtSysno;
 use litebox_common_windows::loader::PAGE_SIZE;
-use litebox_common_windows::{NtSysno, Win32Sysno};
-use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::syscalls::event::{EventHandleObject, EventSubsystem};
 use crate::syscalls::file::{FileObject, FileObjectSubsystem};
@@ -128,13 +127,6 @@ bitflags::bitflags! {
 
         const _ = !0;
     }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes)]
-struct ObjectHandleFlagInformation {
-    inherit: u8,
-    protect_from_close: u8,
 }
 
 impl HandleAttributes {
@@ -419,7 +411,6 @@ where
 pub struct WindowsShimBuilder<Platform: ShimPlatform> {
     platform: &'static Platform,
     litebox: LiteBox<Platform>,
-    nt_gdi_init2: Option<fn(usize) -> usize>,
 }
 
 impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
@@ -431,20 +422,7 @@ impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
     /// Creates a builder backed by an existing LiteBox instance.
     #[must_use]
     pub fn new_with_litebox(platform: &'static Platform, litebox: LiteBox<Platform>) -> Self {
-        Self {
-            platform,
-            litebox,
-            nt_gdi_init2: None,
-        }
-    }
-
-    /// Configures the host-backed implementation used for `NtGdiInit2`.
-    ///
-    /// The callback receives the address of the guest process environment block.
-    #[must_use]
-    pub fn with_nt_gdi_init2(mut self, callback: fn(usize) -> usize) -> Self {
-        self.nt_gdi_init2 = Some(callback);
-        self
+        Self { platform, litebox }
     }
 
     #[must_use]
@@ -477,7 +455,6 @@ impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
             mui_generation: AtomicU32::new(1),
             qpc_boot_instant: TimeProvider::now(self.platform),
             litebox: self.litebox,
-            nt_gdi_init2: self.nt_gdi_init2,
             _fs: PhantomData,
         });
         WindowsShim(global)
@@ -597,7 +574,6 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     mui_generation: AtomicU32,
     qpc_boot_instant: <Platform as TimeProvider>::Instant,
     litebox: LiteBox<Platform>,
-    nt_gdi_init2: Option<fn(usize) -> usize>,
     _fs: PhantomData<FS>,
 }
 
@@ -996,34 +972,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     fn handle_syscall_request(&self, ctx: &mut litebox_common_linux::PtRegs) {
-        if let Some(syscall) = Win32Sysno::from_raw(ctx.orig_rax) {
-            ctx.rax = match syscall {
-                Win32Sysno::NtGdiInit2 => self
-                    .global
-                    .nt_gdi_init2
-                    .map_or(0, |callback| callback(self.process.peb_address)),
-            };
-            return;
-        }
-
-        if NtSysno::from_raw(ctx.orig_rax).is_none() {
-            let caller = if ctx.rsp == 0 {
-                0
-            } else {
-                ConstPtr::<Platform, usize>::from_usize(ctx.rsp)
-                    .read_at_offset(0)
-                    .unwrap_or_default()
-            };
-            litebox_util_log::error!(
-                syscall_number:% = format_args!("{:#x}", ctx.orig_rax),
-                rip:% = format_args!("{:#x}", ctx.rip),
-                caller:% = format_args!("{caller:#x}");
-                "Unsupported Windows syscall"
-            );
-            ctx.rax = NtStatus::NOT_SUPPORTED.as_raw().cast_unsigned() as usize;
-            return;
-        }
-
         let Some(req) = SyscallRequest::<Platform>::try_from_raw(ctx) else {
             let caller = ConstPtr::<Platform, usize>::from_usize(ctx.rsp)
                 .read_at_offset(0)
@@ -1426,45 +1374,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 object_attributes,
                 file_information,
             } => self.sys_nt_query_attributes_file(object_attributes, file_information),
-            SyscallRequest::NtQueryInformationByName {
-                object_attributes,
-                io_status_block,
-                file_information,
-                length,
-                file_information_class,
-            } => self.sys_nt_query_information_by_name(
-                object_attributes,
-                io_status_block,
-                file_information,
-                length,
-                file_information_class,
-            ),
-            SyscallRequest::NtQueryInformationFile {
-                file_handle,
-                io_status_block,
-                file_information,
-                length,
-                file_information_class,
-            } => self.sys_nt_query_information_file(
-                file_handle,
-                io_status_block,
-                file_information,
-                length,
-                file_information_class,
-            ),
-            SyscallRequest::NtSetInformationFile {
-                file_handle,
-                io_status_block,
-                file_information,
-                length,
-                file_information_class,
-            } => self.sys_nt_set_information_file(
-                file_handle,
-                io_status_block,
-                file_information,
-                length,
-                file_information_class,
-            ),
             SyscallRequest::NtCreateFile {
                 file_handle,
                 desired_access,
@@ -1939,30 +1848,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 section_information_length,
                 return_length,
             ),
-            SyscallRequest::NtQueryObject {
-                handle,
-                object_information_class,
-                object_information,
-                object_information_length,
-                return_length,
-            } => self.sys_nt_query_object(
-                handle,
-                object_information_class,
-                object_information,
-                object_information_length,
-                return_length,
-            ),
-            SyscallRequest::NtSetInformationObject {
-                handle,
-                object_information_class,
-                object_information,
-                object_information_length,
-            } => self.sys_nt_set_information_object(
-                handle,
-                object_information_class,
-                object_information,
-                object_information_length,
-            ),
             SyscallRequest::NtQueryInformationProcess {
                 process_handle,
                 process_information_class,
@@ -2411,86 +2296,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.close_handle(handle, CloseRawHandleVisitor { task: self })
     }
 
-    pub(crate) fn sys_nt_query_object(
-        &self,
-        handle: syscalls::Handle,
-        object_information_class: u32,
-        object_information: MutPtr<Platform, u8>,
-        object_information_length: u32,
-        return_length: Option<MutPtr<Platform, u32>>,
-    ) -> NtStatus {
-        const OBJECT_HANDLE_FLAG_INFORMATION_CLASS: u32 = 4;
-        let required_length = core::mem::size_of::<ObjectHandleFlagInformation>().trunc();
-        if object_information_class != OBJECT_HANDLE_FLAG_INFORMATION_CLASS {
-            return NtStatus::INVALID_INFO_CLASS;
-        }
-        if object_information_length < required_length {
-            return NtStatus::INFO_LENGTH_MISMATCH;
-        }
-        let metadata = match self.handle_metadata(handle) {
-            Ok(metadata) => metadata,
-            Err(status) => return status,
-        };
-        if let Some(return_length) = return_length
-            && return_length.write_at_offset(0, required_length).is_none()
-        {
-            return NtStatus::ACCESS_VIOLATION;
-        }
-        let information = MutPtr::<Platform, ObjectHandleFlagInformation>::from_usize(
-            object_information.as_usize(),
-        );
-        if information
-            .write_at_offset(
-                0,
-                ObjectHandleFlagInformation {
-                    inherit: u8::from(metadata.attributes.contains(HandleAttributes::INHERIT)),
-                    protect_from_close: u8::from(
-                        metadata
-                            .attributes
-                            .contains(HandleAttributes::PROTECT_FROM_CLOSE),
-                    ),
-                },
-            )
-            .is_none()
-        {
-            return NtStatus::ACCESS_VIOLATION;
-        }
-        NtStatus::SUCCESS
-    }
-
-    pub(crate) fn sys_nt_set_information_object(
-        &self,
-        handle: syscalls::Handle,
-        object_information_class: u32,
-        object_information: ConstPtr<Platform, u8>,
-        object_information_length: u32,
-    ) -> NtStatus {
-        const OBJECT_HANDLE_FLAG_INFORMATION_CLASS: u32 = 4;
-        if object_information_class != OBJECT_HANDLE_FLAG_INFORMATION_CLASS {
-            return NtStatus::INVALID_INFO_CLASS;
-        }
-        if object_information_length != core::mem::size_of::<ObjectHandleFlagInformation>().trunc()
-        {
-            return NtStatus::INFO_LENGTH_MISMATCH;
-        }
-        let information = ConstPtr::<Platform, ObjectHandleFlagInformation>::from_usize(
-            object_information.as_usize(),
-        );
-        let Some(information) = information.read_at_offset(0) else {
-            return NtStatus::ACCESS_VIOLATION;
-        };
-        let mut attributes = HandleAttributes::empty();
-        attributes.set(HandleAttributes::INHERIT, information.inherit != 0);
-        attributes.set(
-            HandleAttributes::PROTECT_FROM_CLOSE,
-            information.protect_from_close != 0,
-        );
-        match self.set_handle_behavior_attributes(handle, attributes) {
-            Ok(()) => NtStatus::SUCCESS,
-            Err(status) => status,
-        }
-    }
-
     #[expect(
         clippy::too_many_arguments,
         reason = "matches the native NtDuplicateObject contract"
@@ -2607,108 +2412,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         try_duplicate!(TokenSubsystem);
 
         Err(NtStatus::INVALID_HANDLE)
-    }
-
-    fn handle_metadata(&self, handle: syscalls::Handle) -> Result<WindowsHandleMetadata, NtStatus> {
-        macro_rules! try_metadata {
-            ($subsystem:ty) => {
-                if let Some(result) = self.try_handle_metadata::<$subsystem>(handle) {
-                    return result;
-                }
-            };
-        }
-
-        try_metadata!(FileObjectSubsystem<FS>);
-        try_metadata!(RegistryKeySubsystem<Platform>);
-        try_metadata!(EventSubsystem<Platform>);
-        try_metadata!(SemaphoreSubsystem<Platform>);
-        try_metadata!(DirectoryObjectSubsystem<Platform>);
-        try_metadata!(SymbolicLinkSubsystem<Platform>);
-        try_metadata!(IoCompletionSubsystem<Platform>);
-        try_metadata!(LpcPortSubsystem<Platform>);
-        try_metadata!(TimerSubsystem<Platform>);
-        try_metadata!(WaitCompletionPacketSubsystem<Platform>);
-        try_metadata!(WorkerFactorySubsystem<Platform>);
-        try_metadata!(SectionSubsystem<Platform>);
-        try_metadata!(TokenSubsystem);
-        try_metadata!(ThreadSubsystem<Platform>);
-
-        Err(NtStatus::INVALID_HANDLE)
-    }
-
-    fn set_handle_behavior_attributes(
-        &self,
-        handle: syscalls::Handle,
-        attributes: HandleAttributes,
-    ) -> Result<(), NtStatus> {
-        macro_rules! try_set_attributes {
-            ($subsystem:ty) => {
-                if let Some(result) =
-                    self.try_set_handle_behavior_attributes::<$subsystem>(handle, attributes)
-                {
-                    return result;
-                }
-            };
-        }
-
-        try_set_attributes!(FileObjectSubsystem<FS>);
-        try_set_attributes!(RegistryKeySubsystem<Platform>);
-        try_set_attributes!(EventSubsystem<Platform>);
-        try_set_attributes!(SemaphoreSubsystem<Platform>);
-        try_set_attributes!(DirectoryObjectSubsystem<Platform>);
-        try_set_attributes!(SymbolicLinkSubsystem<Platform>);
-        try_set_attributes!(IoCompletionSubsystem<Platform>);
-        try_set_attributes!(LpcPortSubsystem<Platform>);
-        try_set_attributes!(TimerSubsystem<Platform>);
-        try_set_attributes!(WaitCompletionPacketSubsystem<Platform>);
-        try_set_attributes!(WorkerFactorySubsystem<Platform>);
-        try_set_attributes!(SectionSubsystem<Platform>);
-        try_set_attributes!(TokenSubsystem);
-        try_set_attributes!(ThreadSubsystem<Platform>);
-
-        Err(NtStatus::INVALID_HANDLE)
-    }
-
-    fn try_set_handle_behavior_attributes<Subsystem>(
-        &self,
-        handle: syscalls::Handle,
-        attributes: HandleAttributes,
-    ) -> Option<Result<(), NtStatus>>
-    where
-        Subsystem: WindowsHandleSubsystem,
-    {
-        let typed = match self.typed_handle::<Subsystem>(handle) {
-            Ok(typed) => typed,
-            Err(NtStatus::OBJECT_TYPE_MISMATCH) => return None,
-            Err(status) => return Some(Err(status)),
-        };
-        Some(
-            self.global
-                .litebox
-                .descriptor_table_mut()
-                .with_metadata_mut::<Subsystem, WindowsHandleMetadata, _>(&typed, |metadata| {
-                    metadata
-                        .attributes
-                        .remove(HandleAttributes::INHERIT | HandleAttributes::PROTECT_FROM_CLOSE);
-                    metadata.attributes.insert(attributes);
-                })
-                .map_err(|_| NtStatus::INVALID_HANDLE),
-        )
-    }
-
-    fn try_handle_metadata<Subsystem>(
-        &self,
-        handle: syscalls::Handle,
-    ) -> Option<Result<WindowsHandleMetadata, NtStatus>>
-    where
-        Subsystem: WindowsHandleSubsystem,
-    {
-        let typed = match self.typed_handle::<Subsystem>(handle) {
-            Ok(typed) => typed,
-            Err(NtStatus::OBJECT_TYPE_MISMATCH) => return None,
-            Err(status) => return Some(Err(status)),
-        };
-        Some(self.typed_handle_metadata(&typed))
     }
 
     fn try_duplicate_handle<Subsystem>(

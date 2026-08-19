@@ -36,7 +36,6 @@ windows-sys = { version = "0.60.2", features = [
 lock_tracing = ["dep:arrayvec", "spin/mutex"]
 panic_on_unclosed_fd_drop = []
 enforce_singleton_litebox_instance = []
-test-utils = []
 
 [lints]
 workspace = true

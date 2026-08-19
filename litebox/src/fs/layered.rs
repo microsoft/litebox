@@ -68,8 +68,6 @@ pub struct FileSystem<
     // cwd invariant: always ends with a `/`
     current_working_dir: String,
     node_info_lookup: sync::RwLock<Platform, HashMap<NodeInfo, usize>>,
-    #[cfg(feature = "test-utils")]
-    reads_before_injected_error: AtomicUsize,
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower: super::FileSystem>
@@ -93,41 +91,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Upper: super::FileSystem, Lower:
             current_working_dir: "/".into(),
             layering_semantics,
             node_info_lookup,
-            #[cfg(feature = "test-utils")]
-            reads_before_injected_error: AtomicUsize::new(usize::MAX),
-        }
-    }
-
-    /// Injects one [`ReadError::Io`] after `successful_reads` subsequent reads.
-    ///
-    /// This is available only for tests that need to exercise callers' handling of an error after
-    /// an earlier successful transfer.
-    #[cfg(feature = "test-utils")]
-    #[doc(hidden)]
-    pub fn inject_read_error_after(&self, successful_reads: usize) {
-        self.reads_before_injected_error
-            .store(successful_reads, SeqCst);
-    }
-
-    #[cfg(feature = "test-utils")]
-    fn take_injected_read_error(&self) -> bool {
-        let mut remaining = self.reads_before_injected_error.load(SeqCst);
-        loop {
-            if remaining == usize::MAX {
-                return false;
-            }
-            let next = if remaining == 0 {
-                usize::MAX
-            } else {
-                remaining - 1
-            };
-            match self
-                .reads_before_injected_error
-                .compare_exchange(remaining, next, SeqCst, SeqCst)
-            {
-                Ok(_) => return remaining == 0,
-                Err(current) => remaining = current,
-            }
         }
     }
 
@@ -770,10 +733,6 @@ impl<
         buf: &mut [u8],
         offset: Option<usize>,
     ) -> Result<usize, ReadError> {
-        #[cfg(feature = "test-utils")]
-        if self.take_injected_read_error() {
-            return Err(ReadError::Io);
-        }
         // Since a write to a lower-level file upgrades the underlying entry out completely to an
         // upper-level file, we don't actually need to worry about a desync; a write to lower-level
         // file will successfully be seen as just being an upper level file. Thus, it is sufficient

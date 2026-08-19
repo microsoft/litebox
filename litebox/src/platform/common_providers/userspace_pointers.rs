@@ -213,39 +213,6 @@ fn to_owned_slice<V: ValidateAccess, T: FromBytes>(
     Some(unsafe { data.assume_init() })
 }
 
-fn copy_to_slice<V: ValidateAccess, T: FromBytes + Copy>(
-    ptr: *const T,
-    start_offset: usize,
-    buf: &mut [T],
-) -> Option<()> {
-    if buf.is_empty() {
-        return Some(());
-    }
-    // Match the checked-offset contract of the `RawConstPointer::copy_to_slice` trait default:
-    // it converts every element offset (`start_offset + index`) to `isize` and returns `None`
-    // when that fails, so reject a largest element offset that exceeds `isize::MAX`. Also reject a
-    // complete byte range if it would extend past the end of the address space, instead of silently
-    // wrapping into an unrelated (but possibly still-valid) userspace range. Given both checks pass,
-    // the subsequent `wrapping_add` is provenance-preserving and does not actually wrap.
-    let max_element_offset = start_offset.checked_add(buf.len() - 1)?;
-    isize::try_from(max_element_offset).ok()?;
-    let byte_offset = core::mem::size_of::<T>().checked_mul(start_offset)?;
-    (ptr as usize)
-        .checked_add(byte_offset)?
-        .checked_add(size_of_val(buf))?;
-    let src = ptr.wrapping_add(start_offset);
-    let src =
-        V::validate_slice(core::ptr::slice_from_raw_parts(src, buf.len()).cast_mut())?.cast_const();
-    // SAFETY: `buf` is a valid destination for `size_of_val(buf)` bytes, and `validate_slice`
-    // bounds the source to the corresponding userspace range. `T: FromBytes` permits every copied
-    // bit pattern, while `memcpy_fallible` reports inaccessible guest pages instead of exposing
-    // them as Rust references. The platform scopes any required userspace access around the copy.
-    V::with_user_memory_access(|| unsafe {
-        memcpy_fallible(buf.as_mut_ptr().cast(), src.cast(), size_of_val(buf))
-    })
-    .ok()
-}
-
 impl<V: ValidateAccess, T: FromBytes> RawConstPointer<T> for UserConstPtr<V, T> {
     fn read_at_offset(self, count: isize) -> Option<T> {
         read_at_offset::<V, T>(self.as_ptr(), count)
@@ -253,13 +220,6 @@ impl<V: ValidateAccess, T: FromBytes> RawConstPointer<T> for UserConstPtr<V, T> 
 
     fn to_owned_slice(self, len: usize) -> Option<alloc::boxed::Box<[T]>> {
         to_owned_slice::<V, T>(self.as_ptr(), len)
-    }
-
-    fn copy_to_slice(self, start_offset: usize, buf: &mut [T]) -> Option<()>
-    where
-        T: Copy,
-    {
-        copy_to_slice::<V, T>(self.as_ptr(), start_offset, buf)
     }
 
     fn as_usize(&self) -> usize {
@@ -327,13 +287,6 @@ impl<V: ValidateAccess, T: FromBytes> RawConstPointer<T> for UserMutPtr<V, T> {
         to_owned_slice::<V, T>(self.as_ptr().cast_const(), len)
     }
 
-    fn copy_to_slice(self, start_offset: usize, buf: &mut [T]) -> Option<()>
-    where
-        T: Copy,
-    {
-        copy_to_slice::<V, T>(self.as_ptr().cast_const(), start_offset, buf)
-    }
-
     fn as_usize(&self) -> usize {
         self.inner
     }
@@ -399,146 +352,14 @@ impl<V: ValidateAccess, T: FromBytes + IntoBytes> RawMutPointer<T> for UserMutPt
     where
         T: Copy,
     {
-        let start = isize::try_from(start_offset).ok()?;
-        start.checked_add_unsigned(buf.len())?;
         if buf.is_empty() {
             return Some(());
         }
-        // Match the checked-offset contract of the `RawMutPointer::copy_from_slice` trait default:
-        // it converts the offset to `isize` and checks the exclusive element end. Also reject a
-        // complete byte range that would extend past the end of the address space instead of
-        // silently wrapping into an unrelated (but possibly still-valid) userspace range. Given
-        // both checks pass, the subsequent `wrapping_add` is provenance-preserving and does not
-        // actually wrap.
-        let byte_offset = core::mem::size_of::<T>().checked_mul(start_offset)?;
-        (self.as_ptr() as usize)
-            .checked_add(byte_offset)?
-            .checked_add(size_of_val(buf))?;
         let dst = self.as_ptr().wrapping_add(start_offset);
         let dst = V::validate_slice(core::ptr::slice_from_raw_parts_mut(dst, buf.len()))?;
-        // SAFETY: `validate_slice` bounds the destination to the corresponding userspace range for
-        // `buf.len()` elements, and `buf` is a valid source for `size_of_val(buf)` bytes. The copied
-        // bytes originate from an initialized `&[T]`, so every written bit pattern is valid, while
-        // `memcpy_fallible` reports inaccessible guest pages instead of faulting. The platform scopes
-        // any required userspace access around the copy.
         V::with_user_memory_access(|| unsafe {
             memcpy_fallible(dst.cast(), buf.as_ptr().cast(), size_of_val(buf))
         })
         .ok()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A [`ValidateAccess`] that accepts every address, mirroring the permissive
-    /// behavior a real validator exhibits for a wrapped-around pointer that happens
-    /// to land back inside a valid userspace interval.
-    struct AcceptAll;
-
-    impl ValidateAccess for AcceptAll {
-        fn validate<T>(ptr: *mut T) -> Option<*mut T> {
-            Some(ptr)
-        }
-        fn validate_slice<T>(ptr: *mut [T]) -> Option<*mut T> {
-            Some(ptr.cast())
-        }
-    }
-
-    struct PanicOnValidation;
-
-    impl ValidateAccess for PanicOnValidation {
-        fn validate<T>(_ptr: *mut T) -> Option<*mut T> {
-            panic!("overflow must be rejected before pointer validation")
-        }
-
-        fn validate_slice<T>(_ptr: *mut [T]) -> Option<*mut T> {
-            panic!("overflow must be rejected before slice validation")
-        }
-    }
-
-    #[test]
-    fn copy_to_slice_rejects_offset_overflow_without_wrapping() {
-        let ptr = UserConstPtr::<PanicOnValidation, u8>::from_usize(0x10001);
-        let mut dst = [0u8; 4];
-        assert_eq!(ptr.copy_to_slice(usize::MAX, &mut dst), None);
-        assert_eq!(dst, [0u8; 4]);
-    }
-
-    #[test]
-    fn copy_to_slice_rejects_byte_range_end_overflow_before_validation() {
-        let ptr = UserConstPtr::<PanicOnValidation, u32>::from_usize(usize::MAX - 2);
-        let mut dst = [0u32; 1];
-        assert_eq!(ptr.copy_to_slice(0, &mut dst), None);
-    }
-
-    #[test]
-    fn copy_to_slice_accepts_zero_offset() {
-        let source = [1u8, 2, 3, 4];
-        let ptr = UserConstPtr::<AcceptAll, u8>::from_ptr(source.as_ptr());
-        let mut dst = [0u8; 4];
-        assert_eq!(ptr.copy_to_slice(0, &mut dst), Some(()));
-        assert_eq!(dst, source);
-    }
-
-    #[test]
-    fn copy_to_slice_rejects_isize_max_element_offset() {
-        let source = [0xa5u8; 4];
-        let ptr = UserConstPtr::<AcceptAll, u8>::from_ptr(source.as_ptr());
-        let mut dst = [0u8; 4];
-        // An element offset above `isize::MAX` fits `usize` byte arithmetic without wrapping the
-        // base pointer, but the trait default rejects it via its `isize` conversion. The override
-        // must reject it identically rather than proceed to validate/read.
-        let start_offset = (isize::MAX as usize) + 1;
-        assert_eq!(ptr.copy_to_slice(start_offset, &mut dst), None);
-        assert_eq!(dst, [0u8; 4]);
-    }
-
-    #[test]
-    fn copy_from_slice_rejects_offset_overflow_without_wrapping() {
-        let ptr = UserMutPtr::<PanicOnValidation, u8>::from_usize(0x10001);
-        let source = [0xa5u8; 4];
-        assert_eq!(ptr.copy_from_slice(usize::MAX, &source), None);
-    }
-
-    #[test]
-    fn copy_from_slice_rejects_byte_range_end_overflow_before_validation() {
-        let ptr = UserMutPtr::<PanicOnValidation, u32>::from_usize(usize::MAX - 2);
-        let source = [0xa5u32; 1];
-        assert_eq!(ptr.copy_from_slice(0, &source), None);
-    }
-
-    #[test]
-    fn copy_from_slice_rejects_isize_max_exclusive_end_before_validation() {
-        let ptr = UserMutPtr::<PanicOnValidation, ()>::from_usize(0x10000);
-        assert_eq!(ptr.copy_from_slice(isize::MAX as usize, &[()]), None);
-    }
-
-    #[test]
-    fn copy_from_slice_rejects_invalid_offset_for_empty_copy() {
-        let ptr = UserMutPtr::<PanicOnValidation, u8>::from_usize(0x10000);
-        assert_eq!(ptr.copy_from_slice(usize::MAX, &[]), None);
-    }
-
-    #[test]
-    fn copy_from_slice_accepts_zero_offset() {
-        let mut dest = [0u8; 4];
-        let ptr = UserMutPtr::<AcceptAll, u8>::from_ptr(dest.as_mut_ptr());
-        let source = [1u8, 2, 3, 4];
-        assert_eq!(ptr.copy_from_slice(0, &source), Some(()));
-        assert_eq!(dest, source);
-    }
-
-    #[test]
-    fn copy_from_slice_rejects_isize_max_element_offset() {
-        let mut dest = [0u8; 4];
-        let ptr = UserMutPtr::<AcceptAll, u8>::from_ptr(dest.as_mut_ptr());
-        let source = [0xa5u8; 4];
-        // An element offset above `isize::MAX` must be rejected before any write, matching the
-        // trait default's `isize` conversion contract.
-        let start_offset = (isize::MAX as usize) + 1;
-        assert_eq!(ptr.copy_from_slice(start_offset, &source), None);
-        assert_eq!(dest, [0u8; 4]);
     }
 }
