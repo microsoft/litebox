@@ -17,27 +17,20 @@ use oci_client::config::ConfigFile;
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
 
-/// Return the OCI platform matching the packager build architecture.
-fn build_platform() -> (oci_spec::image::Os, oci_spec::image::Arch) {
-    let architecture = if cfg!(target_arch = "x86_64") {
-        oci_spec::image::Arch::Amd64
-    } else if cfg!(target_arch = "aarch64") {
-        oci_spec::image::Arch::ARM64
-    } else {
-        panic!("unsupported packager architecture")
-    };
-    (oci_spec::image::Os::Linux, architecture)
-}
+use crate::CliTargetArch;
 
-fn select_build_manifest(entries: &[oci_client::manifest::ImageIndexEntry]) -> Option<String> {
-    let (os, architecture) = build_platform();
+/// Select the Linux manifest for the requested guest architecture.
+fn select_manifest(
+    entries: &[oci_client::manifest::ImageIndexEntry],
+    target_arch: CliTargetArch,
+) -> Option<String> {
+    let architecture = target_arch.oci_arch();
     entries
         .iter()
         .find(|entry| {
-            entry
-                .platform
-                .as_ref()
-                .is_some_and(|platform| platform.os == os && platform.architecture == architecture)
+            entry.platform.as_ref().is_some_and(|platform| {
+                platform.os == oci_spec::image::Os::Linux && platform.architecture == architecture
+            })
         })
         .map(|entry| entry.digest.clone())
 }
@@ -108,7 +101,11 @@ pub struct RootfsEntry {
 /// Currently only anonymous (unauthenticated) pulls are supported. Private
 /// registries or images that require credentials will fail with an
 /// authorization error from the registry.
-pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<ExtractedImage> {
+pub fn pull_and_extract(
+    image_ref: &str,
+    target_arch: CliTargetArch,
+    verbose: bool,
+) -> anyhow::Result<ExtractedImage> {
     // Parse the image reference
     let reference: Reference = image_ref
         .parse()
@@ -127,8 +124,9 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
     let image_data = rt.block_on(async {
         let config = ClientConfig {
             protocol: ClientProtocol::Https,
-            // Pull the Linux image matching the packager build architecture.
-            platform_resolver: Some(Box::new(select_build_manifest)),
+            platform_resolver: Some(Box::new(move |entries| {
+                select_manifest(entries, target_arch)
+            })),
             ..Default::default()
         };
         let client = Client::new(config);
@@ -152,7 +150,12 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
                 ],
             )
             .await
-            .with_context(|| format!("failed to pull image {reference}"))?;
+            .with_context(|| {
+                format!(
+                    "failed to pull image {reference} for linux/{}",
+                    target_arch.name()
+                )
+            })?;
 
         if verbose {
             eprintln!("  Pulled {} layer(s)", image_data.layers.len());
@@ -160,6 +163,20 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
 
         Ok::<_, anyhow::Error>(image_data)
     })?;
+
+    let config_json = image_data.config.data.to_vec();
+    let config_file = ConfigFile::try_from(image_data.config);
+    if let Ok(config_file) = &config_file
+        && (config_file.os != oci_spec::image::Os::Linux
+            || config_file.architecture != target_arch.oci_arch())
+    {
+        anyhow::bail!(
+            "pulled OCI image targets {}/{}, expected linux/{}",
+            config_file.os,
+            config_file.architecture,
+            target_arch.name(),
+        );
+    }
 
     // Create temp directory for extraction
     let tempdir = tempfile::tempdir().context("failed to create temporary directory for rootfs")?;
@@ -205,37 +222,33 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
         eprintln!("  Rootfs extracted to {}", rootfs_path.display());
     }
 
-    // Save the raw config JSON before parsing (try_from consumes it).
-    let config_json = image_data.config.data.to_vec();
-
     // Parse image config for ENTRYPOINT, CMD, ENV, WORKDIR.
-    let config = match ConfigFile::try_from(image_data.config) {
-        Ok(cf) => {
-            let exec_config = cf.config.as_ref();
-            let ic = ImageConfig {
+    let config = match config_file {
+        Ok(config_file) => {
+            let exec_config = config_file.config.as_ref();
+            ImageConfig {
                 entrypoint: exec_config.and_then(|c| c.entrypoint.clone()),
                 cmd: exec_config.and_then(|c| c.cmd.clone()),
                 env: exec_config.and_then(|c| c.env.clone()),
                 working_dir: exec_config.and_then(|c| c.working_dir.clone()),
-            };
-            if verbose {
-                eprintln!(
-                    "  Image config: ENTRYPOINT={:?} CMD={:?} WORKDIR={:?} ENV=({} vars)",
-                    ic.entrypoint,
-                    ic.cmd,
-                    ic.working_dir,
-                    ic.env.as_ref().map_or(0, Vec::len)
-                );
             }
-            ic
         }
         Err(e) => {
             eprintln!(
-                "warning: failed to parse image config: {e}; config_and_run.sh will not be generated"
+                "warning: failed to parse image config: {e}; config_and_run.sh will use defaults"
             );
             ImageConfig::default()
         }
     };
+    if verbose {
+        eprintln!(
+            "  Image config: ENTRYPOINT={:?} CMD={:?} WORKDIR={:?} ENV=({} vars)",
+            config.entrypoint,
+            config.cmd,
+            config.working_dir,
+            config.env.as_ref().map_or(0, Vec::len)
+        );
+    }
 
     Ok(ExtractedImage {
         tempdir,
