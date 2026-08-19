@@ -1753,6 +1753,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 && file
                     .create_options
                     .intersects(FileCreateOptions::SYNCHRONOUS_IO)
+                && output_length != 0
             {
                 let _ = self.fs.seek(
                     fd,
@@ -1766,6 +1767,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::ACCESS_VIOLATION;
         }
         let (status, information) = match result {
+            Ok(0) if output_length == 0 => (NtStatus::SUCCESS, 0),
             Ok(0) => (NtStatus::END_OF_FILE, 0),
             Ok(read) => (NtStatus::SUCCESS, read),
             Err(ReadError::ClosedFd) => (NtStatus::INVALID_HANDLE, 0),
@@ -3033,6 +3035,56 @@ mod tests {
                 ),
                 NtStatus::SUCCESS
             );
+            assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
+        });
+    }
+
+    #[test]
+    fn nt_read_file_zero_length_succeeds_without_advancing_file() {
+        run_with_test_platform_pointers(|| {
+            let task = crate::tests::test_task();
+            create_existing_file(&task, "/tmp/read-zero.txt", b"litebox");
+            let (status, handle, _) =
+                create_file(&task, "/tmp/read-zero.txt", FILE_GENERIC_READ, FILE_OPEN);
+            assert_eq!(status, NtStatus::SUCCESS);
+
+            let mut output = [0xa5; 7];
+            let mut io_status = IoStatusBlock::default();
+            for byte_offset in [None, Some(const_ptr(&7i64))] {
+                assert_eq!(
+                    task.sys_nt_read_file(
+                        handle,
+                        Handle::default(),
+                        None,
+                        None,
+                        mut_ptr(&mut io_status),
+                        mut_byte_ptr(&mut output),
+                        0,
+                        byte_offset,
+                        None,
+                    ),
+                    NtStatus::SUCCESS
+                );
+                assert_eq!(io_status.status, NtStatus::SUCCESS.as_raw());
+                assert_eq!(io_status.information, 0);
+                assert_eq!(output, [0xa5; 7]);
+            }
+
+            assert_eq!(
+                task.sys_nt_read_file(
+                    handle,
+                    Handle::default(),
+                    None,
+                    None,
+                    mut_ptr(&mut io_status),
+                    mut_byte_ptr(&mut output),
+                    output.len().try_into().unwrap(),
+                    None,
+                    None,
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(&output, b"litebox");
             assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
         });
     }
