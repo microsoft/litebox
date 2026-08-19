@@ -221,6 +221,14 @@ fn copy_to_slice<V: ValidateAccess, T: FromBytes + Copy>(
     if buf.is_empty() {
         return Some(());
     }
+    // Match the checked-offset contract of the `RawConstPointer::copy_to_slice` trait default:
+    // reject an offset that would move the base pointer past the end of the address space instead
+    // of silently wrapping into an unrelated (but possibly still-valid) userspace range. The
+    // subsequent `wrapping_add` is provenance-preserving and, given this check passed, does not
+    // actually wrap.
+    core::mem::size_of::<T>()
+        .checked_mul(start_offset)
+        .and_then(|byte_offset| (ptr as usize).checked_add(byte_offset))?;
     let src = ptr.wrapping_add(start_offset);
     let src =
         V::validate_slice(core::ptr::slice_from_raw_parts(src, buf.len()).cast_mut())?.cast_const();
@@ -390,11 +398,78 @@ impl<V: ValidateAccess, T: FromBytes + IntoBytes> RawMutPointer<T> for UserMutPt
         if buf.is_empty() {
             return Some(());
         }
+        // Match the checked-offset contract of the `RawMutPointer::copy_from_slice` trait default:
+        // reject an offset that would move the base pointer past the end of the address space
+        // instead of silently wrapping into an unrelated (but possibly still-valid) userspace
+        // range. The subsequent `wrapping_add` is provenance-preserving and, given this check
+        // passed, does not actually wrap.
+        core::mem::size_of::<T>()
+            .checked_mul(start_offset)
+            .and_then(|byte_offset| (self.as_ptr() as usize).checked_add(byte_offset))?;
         let dst = self.as_ptr().wrapping_add(start_offset);
         let dst = V::validate_slice(core::ptr::slice_from_raw_parts_mut(dst, buf.len()))?;
         V::with_user_memory_access(|| unsafe {
             memcpy_fallible(dst.cast(), buf.as_ptr().cast(), size_of_val(buf))
         })
         .ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A [`ValidateAccess`] that accepts every address, mirroring the permissive
+    /// behavior a real validator exhibits for a wrapped-around pointer that happens
+    /// to land back inside a valid userspace interval.
+    struct AcceptAll;
+
+    impl ValidateAccess for AcceptAll {
+        fn validate<T>(ptr: *mut T) -> Option<*mut T> {
+            Some(ptr)
+        }
+        fn validate_slice<T>(ptr: *mut [T]) -> Option<*mut T> {
+            Some(ptr.cast())
+        }
+    }
+
+    #[test]
+    fn copy_to_slice_rejects_offset_overflow_without_wrapping() {
+        let source = [0xa5u8; 4];
+        let ptr = UserConstPtr::<AcceptAll, u8>::from_ptr(source.as_ptr());
+        let mut dst = [0u8; 4];
+        // `usize::MAX` element offset would wrap the base pointer around the address
+        // space; the checked contract must reject it as `None` rather than reading
+        // from the wrapped-back (accepted) address.
+        assert_eq!(ptr.copy_to_slice(usize::MAX, &mut dst), None);
+        assert_eq!(dst, [0u8; 4]);
+    }
+
+    #[test]
+    fn copy_to_slice_accepts_zero_offset() {
+        let source = [1u8, 2, 3, 4];
+        let ptr = UserConstPtr::<AcceptAll, u8>::from_ptr(source.as_ptr());
+        let mut dst = [0u8; 4];
+        assert_eq!(ptr.copy_to_slice(0, &mut dst), Some(()));
+        assert_eq!(dst, source);
+    }
+
+    #[test]
+    fn copy_from_slice_rejects_offset_overflow_without_wrapping() {
+        let mut dest = [0u8; 4];
+        let ptr = UserMutPtr::<AcceptAll, u8>::from_ptr(dest.as_mut_ptr());
+        let source = [0xa5u8; 4];
+        // A wrapping offset must be rejected before any write occurs.
+        assert_eq!(ptr.copy_from_slice(usize::MAX, &source), None);
+        assert_eq!(dest, [0u8; 4]);
+    }
+
+    #[test]
+    fn copy_from_slice_accepts_zero_offset() {
+        let mut dest = [0u8; 4];
+        let ptr = UserMutPtr::<AcceptAll, u8>::from_ptr(dest.as_mut_ptr());
+        let source = [1u8, 2, 3, 4];
+        assert_eq!(ptr.copy_from_slice(0, &source), Some(()));
+        assert_eq!(dest, source);
     }
 }
