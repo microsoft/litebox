@@ -1659,7 +1659,10 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         {
             return NtStatus::ACCESS_VIOLATION;
         }
-        let file = match self.file_entry(file_handle) {
+        let file = match self.typed_handle_entry_with_access::<FileObjectSubsystem<FS>>(
+            file_handle,
+            FileAccess::READ_DATA.bits(),
+        ) {
             Ok(file) => file,
             Err(status) => return status,
         };
@@ -2844,6 +2847,54 @@ mod tests {
             0,
         );
         (status, handle, io_status)
+    }
+
+    #[test]
+    fn nt_read_file_rejects_duplicate_without_read_data_access() {
+        run_with_test_platform_pointers(|| {
+            let task = crate::tests::test_task();
+            create_existing_file(&task, "/tmp/read-access.txt", b"litebox");
+            let (status, source, _) =
+                create_file(&task, "/tmp/read-access.txt", FILE_GENERIC_READ, FILE_OPEN);
+            assert_eq!(status, NtStatus::SUCCESS);
+
+            let mut restricted = Handle::default();
+            assert_eq!(
+                task.sys_nt_duplicate_object(
+                    crate::syscalls::ProcessHandle::CURRENT,
+                    source,
+                    crate::syscalls::ProcessHandle::CURRENT,
+                    Some(mut_ptr(&mut restricted)),
+                    FileAccess::READ_ATTRIBUTES.bits(),
+                    0,
+                    0,
+                ),
+                NtStatus::SUCCESS
+            );
+
+            let mut output = [0xa5; 7];
+            let mut io_status = IoStatusBlock::new(NtStatus::UNSUCCESSFUL, usize::MAX);
+            assert_eq!(
+                task.sys_nt_read_file(
+                    restricted,
+                    Handle::default(),
+                    None,
+                    None,
+                    mut_ptr(&mut io_status),
+                    mut_byte_ptr(&mut output),
+                    output.len().try_into().unwrap(),
+                    None,
+                    None,
+                ),
+                NtStatus::ACCESS_DENIED
+            );
+            assert_eq!(output, [0xa5; 7]);
+            assert_eq!(io_status.status, NtStatus::UNSUCCESSFUL.as_raw());
+            assert_eq!(io_status.information, usize::MAX);
+
+            assert_eq!(task.sys_nt_close(source), NtStatus::SUCCESS);
+            assert_eq!(task.sys_nt_close(restricted), NtStatus::SUCCESS);
+        });
     }
 
     fn open_fs_root(task: &Task<TestPlatform, TestFS>) -> Handle {
