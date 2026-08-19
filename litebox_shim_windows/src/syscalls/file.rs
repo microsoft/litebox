@@ -33,6 +33,13 @@ use crate::{
     ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_buffer, probe_guest_output_preserving_value,
     raw_handle_entry, write_slice,
 };
+#[cfg(test)]
+use crate::{
+    PAGE_SIZE,
+    syscalls::mm::{AllocationType, FreeType, PageProtection},
+};
+
+const NT_READ_FILE_CHUNK_SIZE: usize = 64 * 1024;
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1632,10 +1639,37 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         byte_offset: Option<ConstPtr<Platform, i64>>,
         key: Option<ConstPtr<Platform, u32>>,
     ) -> NtStatus {
+        let output_length = length as usize;
+        let output_address = buffer.as_usize();
         if probe_guest_output_preserving_value::<Platform, IoStatusBlock>(io_status_block).is_err()
-            || probe_guest_output_buffer::<Platform>(buffer, length as usize).is_err()
+            || output_address.checked_add(output_length).is_none()
         {
             return NtStatus::ACCESS_VIOLATION;
+        }
+        let chunk_capacity = output_length.min(NT_READ_FILE_CHUNK_SIZE);
+        let mut bytes = Vec::new();
+        if bytes.try_reserve_exact(chunk_capacity).is_err() {
+            return NtStatus::NO_MEMORY;
+        }
+        bytes.resize(chunk_capacity, 0);
+
+        let mut validated = 0;
+        while validated < output_length {
+            let chunk_length = (output_length - validated).min(bytes.len());
+            let chunk = MutPtr::<Platform, u8>::from_usize(output_address + validated);
+            for (index, byte) in bytes[..chunk_length].iter_mut().enumerate() {
+                let Ok(index) = isize::try_from(index) else {
+                    return NtStatus::ACCESS_VIOLATION;
+                };
+                let Some(value) = chunk.read_at_offset(index) else {
+                    return NtStatus::ACCESS_VIOLATION;
+                };
+                *byte = value;
+            }
+            if chunk.copy_from_slice(0, &bytes[..chunk_length]).is_none() {
+                return NtStatus::ACCESS_VIOLATION;
+            }
+            validated += chunk_length;
         }
         if !event.is_null()
             && let Err(status) = self.check_event_modify_access(event)
@@ -1659,6 +1693,13 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         {
             return NtStatus::ACCESS_VIOLATION;
         }
+        if offset
+            .and_then(|offset| offset.checked_add(output_length))
+            .is_none()
+            && offset.is_some()
+        {
+            return NtStatus::INVALID_PARAMETER;
+        }
         let file = match self.typed_handle_entry_with_access::<FileObjectSubsystem<FS>>(
             file_handle,
             FileAccess::READ_DATA.bits(),
@@ -1677,39 +1718,58 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 "Ignoring NtReadFile APC completion arguments for synchronous completion"
             );
         }
-        let mut bytes = alloc::vec![0; length as usize];
-        let result = file.with_entry(|file| match &file.backing {
-            FileObjectBacking::Filesystem { fd, is_directory } => {
-                if *is_directory {
-                    return Err(ReadError::NotAFile);
+        let mut total_read = 0;
+        let mut guest_write_failed = false;
+        let result = file.with_entry(|file| {
+            while total_read < output_length {
+                let chunk_length = (output_length - total_read).min(bytes.len());
+                let chunk_offset = offset.map(|offset| offset + total_read);
+                let read = match &file.backing {
+                    FileObjectBacking::Filesystem { fd, is_directory } => {
+                        if *is_directory {
+                            return Err(ReadError::NotAFile);
+                        }
+                        self.fs.read(fd, &mut bytes[..chunk_length], chunk_offset)?
+                    }
+                    FileObjectBacking::CondrvStream { fd, .. } => {
+                        self.fs.read(fd, &mut bytes[..chunk_length], chunk_offset)?
+                    }
+                    FileObjectBacking::CondrvControl(_) | FileObjectBacking::KsecDevice => {
+                        return Err(ReadError::NotAFile);
+                    }
+                };
+                if read == 0 {
+                    break;
                 }
-                let read = self.fs.read(fd, &mut bytes, offset)?;
-                if let Some(offset) = offset
-                    && file
-                        .create_options
-                        .intersects(FileCreateOptions::SYNCHRONOUS_IO)
-                {
-                    let _ = self.fs.seek(
-                        fd,
-                        (offset + read).cast_signed(),
-                        SeekWhence::RelativeToBeginning,
-                    );
+                if buffer.copy_from_slice(total_read, &bytes[..read]).is_none() {
+                    guest_write_failed = true;
+                    return Err(ReadError::Io);
                 }
-                Ok(read)
+                total_read += read;
+                if read < chunk_length {
+                    break;
+                }
             }
-            FileObjectBacking::CondrvStream { fd, .. } => self.fs.read(fd, &mut bytes, offset),
-            FileObjectBacking::CondrvControl(_) | FileObjectBacking::KsecDevice => {
-                Err(ReadError::NotAFile)
+            if let (Some(offset), FileObjectBacking::Filesystem { fd, .. }) =
+                (offset, &file.backing)
+                && file
+                    .create_options
+                    .intersects(FileCreateOptions::SYNCHRONOUS_IO)
+            {
+                let _ = self.fs.seek(
+                    fd,
+                    (offset + total_read).cast_signed(),
+                    SeekWhence::RelativeToBeginning,
+                );
             }
+            Ok(total_read)
         });
+        if guest_write_failed {
+            return NtStatus::ACCESS_VIOLATION;
+        }
         let (status, information) = match result {
             Ok(0) => (NtStatus::END_OF_FILE, 0),
-            Ok(read) => {
-                if write_slice::<Platform, u8>(buffer.as_usize(), &bytes[..read]).is_none() {
-                    return NtStatus::ACCESS_VIOLATION;
-                }
-                (NtStatus::SUCCESS, read)
-            }
+            Ok(read) => (NtStatus::SUCCESS, read),
             Err(ReadError::ClosedFd) => (NtStatus::INVALID_HANDLE, 0),
             Err(ReadError::NotForReading) => (NtStatus::ACCESS_DENIED, 0),
             Err(ReadError::NotAFile) => (NtStatus::INVALID_DEVICE_REQUEST, 0),
@@ -2894,6 +2954,88 @@ mod tests {
 
             assert_eq!(task.sys_nt_close(source), NtStatus::SUCCESS);
             assert_eq!(task.sys_nt_close(restricted), NtStatus::SUCCESS);
+        });
+    }
+
+    #[test]
+    fn nt_read_file_rejects_middle_buffer_hole_before_advancing_file() {
+        run_with_test_platform_pointers(|| {
+            let task = crate::tests::test_task();
+            create_existing_file(&task, "/tmp/read-buffer.txt", b"litebox");
+            let (status, handle, _) =
+                create_file(&task, "/tmp/read-buffer.txt", FILE_GENERIC_READ, FILE_OPEN);
+            assert_eq!(status, NtStatus::SUCCESS);
+
+            let mut allocation_base = 0;
+            let mut allocation_size = PAGE_SIZE * 3;
+            assert_eq!(
+                task.sys_nt_allocate_virtual_memory(
+                    crate::syscalls::ProcessHandle::CURRENT,
+                    mut_ptr(&mut allocation_base),
+                    0,
+                    mut_ptr(&mut allocation_size),
+                    (AllocationType::MEM_RESERVE | AllocationType::MEM_COMMIT).bits(),
+                    PageProtection::PAGE_READWRITE.bits(),
+                ),
+                NtStatus::SUCCESS
+            );
+            let mut hole_base = allocation_base + PAGE_SIZE;
+            let mut hole_size = PAGE_SIZE;
+            assert_eq!(
+                task.sys_nt_free_virtual_memory(
+                    crate::syscalls::ProcessHandle::CURRENT,
+                    mut_ptr(&mut hole_base),
+                    mut_ptr(&mut hole_size),
+                    FreeType::MEM_DECOMMIT.bits(),
+                ),
+                NtStatus::SUCCESS
+            );
+
+            let mut io_status = IoStatusBlock::default();
+            assert_eq!(
+                task.sys_nt_read_file(
+                    handle,
+                    Handle::default(),
+                    None,
+                    None,
+                    mut_ptr(&mut io_status),
+                    MutPtr::<TestPlatform, u8>::from_usize(allocation_base),
+                    (PAGE_SIZE * 3).try_into().unwrap(),
+                    None,
+                    None,
+                ),
+                NtStatus::ACCESS_VIOLATION
+            );
+
+            let mut output = [0; 7];
+            assert_eq!(
+                task.sys_nt_read_file(
+                    handle,
+                    Handle::default(),
+                    None,
+                    None,
+                    mut_ptr(&mut io_status),
+                    mut_byte_ptr(&mut output),
+                    output.len().try_into().unwrap(),
+                    None,
+                    None,
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(&output, b"litebox");
+
+            let mut release_base = allocation_base;
+            let mut release_size = 0;
+            assert_eq!(
+                task.sys_nt_free_virtual_memory(
+                    crate::syscalls::ProcessHandle::CURRENT,
+                    mut_ptr(&mut release_base),
+                    mut_ptr(&mut release_size),
+                    FreeType::MEM_RELEASE.bits(),
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
         });
     }
 
