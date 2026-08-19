@@ -92,6 +92,7 @@ jobs:
         -p litebox
         -p litebox_common_linux
         -p litebox_syscall_rewriter
+        -p litebox_packager
         -p litebox_platform_linux_userland
         -p litebox_shim_linux
         -p litebox_runner_linux_userland

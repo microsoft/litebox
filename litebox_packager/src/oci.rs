@@ -17,6 +17,31 @@ use oci_client::config::ConfigFile;
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
 
+/// Return the OCI platform matching the packager build architecture.
+fn build_platform() -> (oci_spec::image::Os, oci_spec::image::Arch) {
+    let architecture = if cfg!(target_arch = "x86_64") {
+        oci_spec::image::Arch::Amd64
+    } else if cfg!(target_arch = "aarch64") {
+        oci_spec::image::Arch::ARM64
+    } else {
+        panic!("unsupported packager architecture")
+    };
+    (oci_spec::image::Os::Linux, architecture)
+}
+
+fn select_build_manifest(entries: &[oci_client::manifest::ImageIndexEntry]) -> Option<String> {
+    let (os, architecture) = build_platform();
+    entries
+        .iter()
+        .find(|entry| {
+            entry
+                .platform
+                .as_ref()
+                .is_some_and(|platform| platform.os == os && platform.architecture == architecture)
+        })
+        .map(|entry| entry.digest.clone())
+}
+
 /// Parsed OCI image execution configuration (ENTRYPOINT, CMD, ENV, WORKDIR).
 #[derive(Debug, Default)]
 pub struct ImageConfig {
@@ -102,18 +127,8 @@ pub fn pull_and_extract(image_ref: &str, verbose: bool) -> anyhow::Result<Extrac
     let image_data = rt.block_on(async {
         let config = ClientConfig {
             protocol: ClientProtocol::Https,
-            // Always pull linux/amd64 images regardless of host platform.
-            platform_resolver: Some(Box::new(|entries| {
-                entries
-                    .iter()
-                    .find(|entry| {
-                        entry.platform.as_ref().is_some_and(|p| {
-                            p.os == oci_spec::image::Os::Linux
-                                && p.architecture == oci_spec::image::Arch::Amd64
-                        })
-                    })
-                    .map(|e| e.digest.clone())
-            })),
+            // Pull the Linux image matching the packager build architecture.
+            platform_resolver: Some(Box::new(select_build_manifest)),
             ..Default::default()
         };
         let client = Client::new(config);
