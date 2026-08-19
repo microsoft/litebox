@@ -39,8 +39,6 @@ use crate::{
     syscalls::mm::{AllocationType, FreeType, PageProtection},
 };
 
-const NT_READ_FILE_CHUNK_SIZE: usize = 64 * 1024;
-
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct FileAttributes: u32 {
@@ -1456,8 +1454,9 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         key: Option<ConstPtr<Platform, u32>>,
     ) -> NtStatus {
         let output_length = length as usize;
+        let output_address = buffer.as_usize();
         if probe_guest_output_preserving_value::<Platform, IoStatusBlock>(io_status_block).is_err()
-            || buffer.as_usize().checked_add(output_length).is_none()
+            || output_address.checked_add(output_length).is_none()
             || probe_guest_output_buffer::<Platform>(buffer, output_length).is_err()
         {
             return NtStatus::ACCESS_VIOLATION;
@@ -1466,6 +1465,17 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Ok(bytes) => bytes,
             Err(status) => return status,
         };
+        let mut validated = 0;
+        while validated < output_length {
+            let chunk_length = (output_length - validated).min(bytes.len());
+            let chunk = MutPtr::<Platform, u8>::from_usize(output_address + validated);
+            if chunk.copy_to_slice(0, &mut bytes[..chunk_length]).is_none()
+                || chunk.copy_from_slice(0, &bytes[..chunk_length]).is_none()
+            {
+                return NtStatus::ACCESS_VIOLATION;
+            }
+            validated += chunk_length;
+        }
         let (file, offset) = match self.prepare_file_io(
             file_handle,
             event,
@@ -1631,187 +1641,6 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         status: NtStatus,
         information: usize,
     ) -> NtStatus {
-        if io_status_block
-            .write_at_offset(0, IoStatusBlock::new(status, information))
-            .is_none()
-        {
-            return NtStatus::ACCESS_VIOLATION;
-        }
-        if !event.is_null() {
-            let event_status = self.set_event(event);
-            if event_status != NtStatus::SUCCESS {
-                return event_status;
-            }
-        }
-        status
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "NtReadFile has nine ABI parameters; keeping them explicit preserves syscall ordering"
-    )]
-    pub(crate) fn sys_nt_read_file(
-        &self,
-        file_handle: Handle,
-        event: Handle,
-        apc_routine: Option<ConstPtr<Platform, u8>>,
-        apc_context: Option<ConstPtr<Platform, u8>>,
-        io_status_block: MutPtr<Platform, IoStatusBlock>,
-        buffer: MutPtr<Platform, u8>,
-        length: u32,
-        byte_offset: Option<ConstPtr<Platform, i64>>,
-        key: Option<ConstPtr<Platform, u32>>,
-    ) -> NtStatus {
-        let output_length = length as usize;
-        let output_address = buffer.as_usize();
-        if probe_guest_output_preserving_value::<Platform, IoStatusBlock>(io_status_block).is_err()
-            || output_address.checked_add(output_length).is_none()
-        {
-            return NtStatus::ACCESS_VIOLATION;
-        }
-        let chunk_capacity = output_length.min(NT_READ_FILE_CHUNK_SIZE);
-        let mut bytes = Vec::new();
-        if bytes.try_reserve_exact(chunk_capacity).is_err() {
-            return NtStatus::NO_MEMORY;
-        }
-        bytes.resize(chunk_capacity, 0);
-
-        let mut validated = 0;
-        while validated < output_length {
-            let chunk_length = (output_length - validated).min(bytes.len());
-            let chunk = MutPtr::<Platform, u8>::from_usize(output_address + validated);
-            if chunk.copy_to_slice(0, &mut bytes[..chunk_length]).is_none() {
-                return NtStatus::ACCESS_VIOLATION;
-            }
-            if chunk.copy_from_slice(0, &bytes[..chunk_length]).is_none() {
-                return NtStatus::ACCESS_VIOLATION;
-            }
-            validated += chunk_length;
-        }
-        if !event.is_null()
-            && let Err(status) = self.check_event_modify_access(event)
-        {
-            return status;
-        }
-        let offset = match byte_offset {
-            Some(byte_offset) => match byte_offset.read_at_offset(0) {
-                Some(FILE_USE_FILE_POINTER_POSITION) => None,
-                Some(offset) if offset >= 0 => match usize::try_from(offset) {
-                    Ok(offset) => Some(offset),
-                    Err(_) => return NtStatus::INVALID_PARAMETER,
-                },
-                Some(_) => return NtStatus::INVALID_PARAMETER,
-                None => return NtStatus::ACCESS_VIOLATION,
-            },
-            None => None,
-        };
-        if let Some(key) = key
-            && key.read_at_offset(0).is_none()
-        {
-            return NtStatus::ACCESS_VIOLATION;
-        }
-        if offset
-            .and_then(|offset| offset.checked_add(output_length))
-            .is_none()
-            && offset.is_some()
-        {
-            return NtStatus::INVALID_PARAMETER;
-        }
-        let file = match self.typed_handle_entry_with_access::<FileObjectSubsystem<FS>>(
-            file_handle,
-            FileAccess::READ_DATA.bits(),
-        ) {
-            Ok(file) => file,
-            Err(status) => return status,
-        };
-        if !event.is_null()
-            && let Err(status) = self.clear_event(event)
-        {
-            return status;
-        }
-        if apc_routine.is_some() || apc_context.is_some() {
-            litebox_util_log::debug!(
-                file_handle = file_handle.as_raw();
-                "Ignoring NtReadFile APC completion arguments for synchronous completion"
-            );
-        }
-        let mut total_read = 0;
-        let mut guest_write_failed = false;
-        let result = file.with_entry(|file| {
-            while total_read < output_length {
-                let chunk_length = (output_length - total_read).min(bytes.len());
-                let chunk_offset = offset.map(|offset| offset + total_read);
-                let (read, continue_after_full_chunk) = match &file.backing {
-                    FileObjectBacking::Filesystem { fd, is_directory } => {
-                        if *is_directory {
-                            return Err(ReadError::NotAFile);
-                        }
-                        (
-                            self.fs.read(fd, &mut bytes[..chunk_length], chunk_offset),
-                            true,
-                        )
-                    }
-                    FileObjectBacking::CondrvStream { fd, .. } => (
-                        self.fs.read(fd, &mut bytes[..chunk_length], chunk_offset),
-                        false,
-                    ),
-                    FileObjectBacking::CondrvControl(_) | FileObjectBacking::KsecDevice => {
-                        return Err(ReadError::NotAFile);
-                    }
-                };
-                let read = match read {
-                    Ok(read) => read,
-                    // A backend error on a later chunk must not discard bytes already copied into
-                    // the guest buffer by earlier chunks. Report the partial transfer (like
-                    // Windows returns the short count) rather than failing with `Information = 0`
-                    // and leaving the guest buffer and file position inconsistent. Only surface the
-                    // error when nothing has been transferred yet.
-                    Err(err) => {
-                        if total_read > 0 {
-                            break;
-                        }
-                        return Err(err);
-                    }
-                };
-                if read == 0 {
-                    break;
-                }
-                if buffer.copy_from_slice(total_read, &bytes[..read]).is_none() {
-                    guest_write_failed = true;
-                    return Err(ReadError::Io);
-                }
-                total_read += read;
-                if read < chunk_length || !continue_after_full_chunk {
-                    break;
-                }
-            }
-            if let (Some(offset), FileObjectBacking::Filesystem { fd, .. }) =
-                (offset, &file.backing)
-                && file
-                    .create_options
-                    .intersects(FileCreateOptions::SYNCHRONOUS_IO)
-                && output_length != 0
-            {
-                let _ = self.fs.seek(
-                    fd,
-                    (offset + total_read).cast_signed(),
-                    SeekWhence::RelativeToBeginning,
-                );
-            }
-            Ok(total_read)
-        });
-        if guest_write_failed {
-            return NtStatus::ACCESS_VIOLATION;
-        }
-        let (status, information) = match result {
-            Ok(0) if output_length == 0 => (NtStatus::SUCCESS, 0),
-            Ok(0) => (NtStatus::END_OF_FILE, 0),
-            Ok(read) => (NtStatus::SUCCESS, read),
-            Err(ReadError::ClosedFd) => (NtStatus::INVALID_HANDLE, 0),
-            Err(ReadError::NotForReading) => (NtStatus::ACCESS_DENIED, 0),
-            Err(ReadError::NotAFile) => (NtStatus::INVALID_DEVICE_REQUEST, 0),
-            Err(_) => (NtStatus::UNSUCCESSFUL, 0),
-        };
         if io_status_block
             .write_at_offset(0, IoStatusBlock::new(status, information))
             .is_none()
@@ -3104,7 +2933,7 @@ mod tests {
             );
 
             // A guest-controlled `u32::MAX` length must not trigger a multi-gigabyte allocation
-            // (the shim caps its scratch buffer at NT_READ_FILE_CHUNK_SIZE and reports NO_MEMORY on
+            // (the shim caps its scratch buffer at FILE_IO_CHUNK_SIZE and reports NO_MEMORY on
             // a failed reservation, never OOM-aborting). The full output range is pre-probed before
             // any file access, so a length extending past the small mapping faults with
             // ACCESS_VIOLATION rather than consuming file data.
@@ -3212,8 +3041,8 @@ mod tests {
     fn nt_read_file_reads_across_multiple_chunks() {
         run_with_test_platform_pointers(|| {
             let task = crate::tests::test_task();
-            // Larger than NT_READ_FILE_CHUNK_SIZE so the read loop spans several chunks.
-            let length = NT_READ_FILE_CHUNK_SIZE * 2 + 4096;
+            // Larger than FILE_IO_CHUNK_SIZE so the read loop spans several chunks.
+            let length = FILE_IO_CHUNK_SIZE * 2 + 4096;
             let data: std::vec::Vec<u8> = (0..length)
                 .map(|i| u8::try_from(i % 251).unwrap())
                 .collect();
@@ -3283,7 +3112,7 @@ mod tests {
     fn nt_read_file_reports_partial_transfer_after_later_chunk_error() {
         run_with_test_platform_pointers(|| {
             let task = crate::tests::test_task();
-            let length = NT_READ_FILE_CHUNK_SIZE * 2;
+            let length = FILE_IO_CHUNK_SIZE * 2;
             let data: std::vec::Vec<u8> = (0..length)
                 .map(|i| u8::try_from(i % 251).unwrap())
                 .collect();
@@ -3328,7 +3157,7 @@ mod tests {
                 NtStatus::SUCCESS
             );
             assert_eq!(io_status.status, NtStatus::SUCCESS.as_raw());
-            assert_eq!(io_status.information, NT_READ_FILE_CHUNK_SIZE);
+            assert_eq!(io_status.information, FILE_IO_CHUNK_SIZE);
 
             let mut readback = std::vec![0u8; length];
             assert_eq!(
@@ -3336,13 +3165,10 @@ mod tests {
                     .copy_to_slice(0, &mut readback),
                 Some(())
             );
+            assert_eq!(&readback[..FILE_IO_CHUNK_SIZE], &data[..FILE_IO_CHUNK_SIZE]);
             assert_eq!(
-                &readback[..NT_READ_FILE_CHUNK_SIZE],
-                &data[..NT_READ_FILE_CHUNK_SIZE]
-            );
-            assert_eq!(
-                &readback[NT_READ_FILE_CHUNK_SIZE..],
-                &std::vec![0xa5; NT_READ_FILE_CHUNK_SIZE]
+                &readback[FILE_IO_CHUNK_SIZE..],
+                &std::vec![0xa5; FILE_IO_CHUNK_SIZE]
             );
 
             let mut next = [0u8; 16];
@@ -3362,7 +3188,7 @@ mod tests {
             );
             assert_eq!(
                 next,
-                data[NT_READ_FILE_CHUNK_SIZE..NT_READ_FILE_CHUNK_SIZE + next.len()]
+                data[FILE_IO_CHUNK_SIZE..FILE_IO_CHUNK_SIZE + next.len()]
             );
 
             let mut release_base = allocation_base;
@@ -3386,7 +3212,7 @@ mod tests {
             let task = crate::tests::test_task();
             let explicit_offset = 17usize;
             let byte_offset = i64::try_from(explicit_offset).unwrap();
-            let length = NT_READ_FILE_CHUNK_SIZE * 2;
+            let length = FILE_IO_CHUNK_SIZE * 2;
             let data: std::vec::Vec<u8> = (0..length + explicit_offset + 16)
                 .map(|i| u8::try_from(i % 251).unwrap())
                 .collect();
@@ -3429,7 +3255,7 @@ mod tests {
                 ),
                 NtStatus::SUCCESS
             );
-            assert_eq!(io_status.information, NT_READ_FILE_CHUNK_SIZE);
+            assert_eq!(io_status.information, FILE_IO_CHUNK_SIZE);
 
             let mut next = [0u8; 16];
             assert_eq!(
@@ -3446,7 +3272,7 @@ mod tests {
                 ),
                 NtStatus::SUCCESS
             );
-            let next_offset = explicit_offset + NT_READ_FILE_CHUNK_SIZE;
+            let next_offset = explicit_offset + FILE_IO_CHUNK_SIZE;
             assert_eq!(next, data[next_offset..next_offset + next.len()]);
 
             let mut release_base = allocation_base;
