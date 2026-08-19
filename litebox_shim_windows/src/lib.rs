@@ -1420,6 +1420,27 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 byte_offset,
                 key,
             ),
+            SyscallRequest::NtReadFile {
+                file_handle,
+                event,
+                apc_routine,
+                apc_context,
+                io_status_block,
+                buffer,
+                length,
+                byte_offset,
+                key,
+            } => self.sys_nt_read_file(
+                file_handle,
+                event,
+                apc_routine,
+                apc_context,
+                io_status_block,
+                buffer,
+                length,
+                byte_offset,
+                key,
+            ),
             SyscallRequest::NtGetCurrentProcessorNumberEx { processor_number } => {
                 self.sys_nt_get_current_processor_number_ex(processor_number)
             }
