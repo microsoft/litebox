@@ -416,6 +416,11 @@ impl<V: ValidateAccess, T: FromBytes + IntoBytes> RawMutPointer<T> for UserMutPt
             .checked_add(size_of_val(buf))?;
         let dst = self.as_ptr().wrapping_add(start_offset);
         let dst = V::validate_slice(core::ptr::slice_from_raw_parts_mut(dst, buf.len()))?;
+        // SAFETY: `validate_slice` bounds the destination to the corresponding userspace range for
+        // `buf.len()` elements, and `buf` is a valid source for `size_of_val(buf)` bytes. The copied
+        // bytes originate from an initialized `&[T]`, so every written bit pattern is valid, while
+        // `memcpy_fallible` reports inaccessible guest pages instead of faulting. The platform scopes
+        // any required userspace access around the copy.
         V::with_user_memory_access(|| unsafe {
             memcpy_fallible(dst.cast(), buf.as_ptr().cast(), size_of_val(buf))
         })
