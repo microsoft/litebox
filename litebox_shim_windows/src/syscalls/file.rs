@@ -3109,7 +3109,9 @@ mod tests {
             let task = crate::tests::test_task();
             // Larger than NT_READ_FILE_CHUNK_SIZE so the read loop spans several chunks.
             let length = NT_READ_FILE_CHUNK_SIZE * 2 + 4096;
-            let data: std::vec::Vec<u8> = (0..length).map(|i| (i % 251) as u8).collect();
+            let data: std::vec::Vec<u8> = (0..length)
+                .map(|i| u8::try_from(i % 251).unwrap())
+                .collect();
             create_existing_file(&task, "/tmp/read-large.txt", &data);
             let (status, handle, _) =
                 create_file(&task, "/tmp/read-large.txt", FILE_GENERIC_READ, FILE_OPEN);
