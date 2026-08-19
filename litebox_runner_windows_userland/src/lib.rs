@@ -15,12 +15,12 @@ use memmap2::Mmap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-type HostNtGdiInit2 = unsafe extern "system" fn() -> usize;
+type HostNtGdiInit2 = unsafe extern "system" fn() -> isize;
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn LoadLibraryW(name: *const u16) -> *mut core::ffi::c_void;
-    fn GetProcAddress(module: *mut core::ffi::c_void, name: *const u8) -> *mut core::ffi::c_void;
+    fn GetProcAddress(module: *mut core::ffi::c_void, name: *const u8) -> Option<HostNtGdiInit2>;
 }
 
 fn host_nt_gdi_init2(guest_peb: usize) -> usize {
@@ -66,13 +66,7 @@ fn host_nt_gdi_init2(guest_peb: usize) -> usize {
         }
         // SAFETY: the module remains loaded for the process lifetime and the
         // export name is a static, NUL-terminated byte string.
-        let address = unsafe { GetProcAddress(module, c"NtGdiInit2".as_ptr().cast()) };
-        if address.is_null() {
-            return None;
-        }
-        // SAFETY: Win32u exports NtGdiInit2 with the no-argument system ABI and
-        // an ULONG_PTR return value on x86-64 Windows.
-        Some(unsafe { core::mem::transmute::<*mut core::ffi::c_void, HostNtGdiInit2>(address) })
+        unsafe { GetProcAddress(module, c"NtGdiInit2".as_ptr().cast()) }
     });
     let Some(callback) = callback else {
         litebox_util_log::error!("Failed to resolve host win32u!NtGdiInit2");
@@ -80,7 +74,7 @@ fn host_nt_gdi_init2(guest_peb: usize) -> usize {
     };
     // SAFETY: the cached function was resolved and typed above, and Win32u
     // remains loaded for the lifetime of the process.
-    let result = unsafe { callback() };
+    let result = unsafe { callback() }.cast_unsigned();
 
     let host_peb: usize;
     // SAFETY: on x86-64 Windows, GS points to the host TEB and TEB+0x60 is
