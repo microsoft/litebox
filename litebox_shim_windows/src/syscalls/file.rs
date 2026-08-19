@@ -1724,16 +1724,30 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                             return Err(ReadError::NotAFile);
                         }
                         (
-                            self.fs.read(fd, &mut bytes[..chunk_length], chunk_offset)?,
+                            self.fs.read(fd, &mut bytes[..chunk_length], chunk_offset),
                             true,
                         )
                     }
                     FileObjectBacking::CondrvStream { fd, .. } => (
-                        self.fs.read(fd, &mut bytes[..chunk_length], chunk_offset)?,
+                        self.fs.read(fd, &mut bytes[..chunk_length], chunk_offset),
                         false,
                     ),
                     FileObjectBacking::CondrvControl(_) | FileObjectBacking::KsecDevice => {
                         return Err(ReadError::NotAFile);
+                    }
+                };
+                let read = match read {
+                    Ok(read) => read,
+                    // A backend error on a later chunk must not discard bytes already copied into
+                    // the guest buffer by earlier chunks. Report the partial transfer (like
+                    // Windows returns the short count) rather than failing with `Information = 0`
+                    // and leaving the guest buffer and file position inconsistent. Only surface the
+                    // error when nothing has been transferred yet.
+                    Err(err) => {
+                        if total_read > 0 {
+                            break;
+                        }
+                        return Err(err);
                     }
                 };
                 if read == 0 {
@@ -3085,6 +3099,75 @@ mod tests {
                 NtStatus::SUCCESS
             );
             assert_eq!(&output, b"litebox");
+            assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
+        });
+    }
+
+    #[test]
+    fn nt_read_file_reads_across_multiple_chunks() {
+        run_with_test_platform_pointers(|| {
+            let task = crate::tests::test_task();
+            // Larger than NT_READ_FILE_CHUNK_SIZE so the read loop spans several chunks.
+            let length = NT_READ_FILE_CHUNK_SIZE * 2 + 4096;
+            let data: std::vec::Vec<u8> = (0..length).map(|i| (i % 251) as u8).collect();
+            create_existing_file(&task, "/tmp/read-large.txt", &data);
+            let (status, handle, _) =
+                create_file(&task, "/tmp/read-large.txt", FILE_GENERIC_READ, FILE_OPEN);
+            assert_eq!(status, NtStatus::SUCCESS);
+
+            // The guest output buffer must live in the guest address range, so reserve it via
+            // NtAllocateVirtualMemory rather than a host allocation.
+            let mut allocation_base = 0;
+            let mut allocation_size = length;
+            assert_eq!(
+                task.sys_nt_allocate_virtual_memory(
+                    crate::syscalls::ProcessHandle::CURRENT,
+                    mut_ptr(&mut allocation_base),
+                    0,
+                    mut_ptr(&mut allocation_size),
+                    (AllocationType::MEM_RESERVE | AllocationType::MEM_COMMIT).bits(),
+                    PageProtection::PAGE_READWRITE.bits(),
+                ),
+                NtStatus::SUCCESS
+            );
+
+            let mut io_status = IoStatusBlock::new(NtStatus::UNSUCCESSFUL, usize::MAX);
+            assert_eq!(
+                task.sys_nt_read_file(
+                    handle,
+                    Handle::default(),
+                    None,
+                    None,
+                    mut_ptr(&mut io_status),
+                    MutPtr::<TestPlatform, u8>::from_usize(allocation_base),
+                    length.try_into().unwrap(),
+                    None,
+                    None,
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(io_status.status, NtStatus::SUCCESS.as_raw());
+            assert_eq!(io_status.information, length);
+
+            let mut readback = std::vec![0u8; length];
+            assert_eq!(
+                ConstPtr::<TestPlatform, u8>::from_usize(allocation_base)
+                    .copy_to_slice(0, &mut readback),
+                Some(())
+            );
+            assert_eq!(readback, data);
+
+            let mut release_base = allocation_base;
+            let mut release_size = 0;
+            assert_eq!(
+                task.sys_nt_free_virtual_memory(
+                    crate::syscalls::ProcessHandle::CURRENT,
+                    mut_ptr(&mut release_base),
+                    mut_ptr(&mut release_size),
+                    FreeType::MEM_RELEASE.bits(),
+                ),
+                NtStatus::SUCCESS
+            );
             assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
         });
     }
