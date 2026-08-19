@@ -222,12 +222,16 @@ fn copy_to_slice<V: ValidateAccess, T: FromBytes + Copy>(
         return Some(());
     }
     // Match the checked-offset contract of the `RawConstPointer::copy_to_slice` trait default:
-    // reject an offset that would move the base pointer past the end of the address space instead
-    // of silently wrapping into an unrelated (but possibly still-valid) userspace range. The
-    // subsequent `wrapping_add` is provenance-preserving and, given this check passed, does not
-    // actually wrap.
+    // it converts every element offset (`start_offset + index`) to `isize` and returns `None`
+    // when that fails, so reject a largest element offset that exceeds `isize::MAX`. Also reject a
+    // byte offset for that same element that would move the base pointer past the end of the address
+    // space, instead of silently wrapping into an unrelated (but possibly still-valid) userspace
+    // range. Given both checks pass, the subsequent `wrapping_add` is provenance-preserving and
+    // does not actually wrap.
+    let max_element_offset = start_offset.checked_add(buf.len() - 1)?;
+    isize::try_from(max_element_offset).ok()?;
     core::mem::size_of::<T>()
-        .checked_mul(start_offset)
+        .checked_mul(max_element_offset)
         .and_then(|byte_offset| (ptr as usize).checked_add(byte_offset))?;
     let src = ptr.wrapping_add(start_offset);
     let src =
@@ -399,12 +403,16 @@ impl<V: ValidateAccess, T: FromBytes + IntoBytes> RawMutPointer<T> for UserMutPt
             return Some(());
         }
         // Match the checked-offset contract of the `RawMutPointer::copy_from_slice` trait default:
-        // reject an offset that would move the base pointer past the end of the address space
-        // instead of silently wrapping into an unrelated (but possibly still-valid) userspace
-        // range. The subsequent `wrapping_add` is provenance-preserving and, given this check
-        // passed, does not actually wrap.
+        // it converts the offset to `isize` (`start_offset.try_into()`) and returns `None` when
+        // that fails, so reject a largest element offset that exceeds `isize::MAX`. Also reject a
+        // byte offset for that same element that would move the base pointer past the end of the
+        // address space instead of silently wrapping into an unrelated (but possibly still-valid)
+        // userspace range. Given both checks pass, the subsequent `wrapping_add` is
+        // provenance-preserving and does not actually wrap.
+        let max_element_offset = start_offset.checked_add(buf.len() - 1)?;
+        isize::try_from(max_element_offset).ok()?;
         core::mem::size_of::<T>()
-            .checked_mul(start_offset)
+            .checked_mul(max_element_offset)
             .and_then(|byte_offset| (self.as_ptr() as usize).checked_add(byte_offset))?;
         let dst = self.as_ptr().wrapping_add(start_offset);
         let dst = V::validate_slice(core::ptr::slice_from_raw_parts_mut(dst, buf.len()))?;
@@ -455,6 +463,19 @@ mod tests {
     }
 
     #[test]
+    fn copy_to_slice_rejects_isize_max_element_offset() {
+        let source = [0xa5u8; 4];
+        let ptr = UserConstPtr::<AcceptAll, u8>::from_ptr(source.as_ptr());
+        let mut dst = [0u8; 4];
+        // An element offset above `isize::MAX` fits `usize` byte arithmetic without wrapping the
+        // base pointer, but the trait default rejects it via its `isize` conversion. The override
+        // must reject it identically rather than proceed to validate/read.
+        let start_offset = (isize::MAX as usize) + 1;
+        assert_eq!(ptr.copy_to_slice(start_offset, &mut dst), None);
+        assert_eq!(dst, [0u8; 4]);
+    }
+
+    #[test]
     fn copy_from_slice_rejects_offset_overflow_without_wrapping() {
         let mut dest = [0u8; 4];
         let ptr = UserMutPtr::<AcceptAll, u8>::from_ptr(dest.as_mut_ptr());
@@ -471,5 +492,17 @@ mod tests {
         let source = [1u8, 2, 3, 4];
         assert_eq!(ptr.copy_from_slice(0, &source), Some(()));
         assert_eq!(dest, source);
+    }
+
+    #[test]
+    fn copy_from_slice_rejects_isize_max_element_offset() {
+        let mut dest = [0u8; 4];
+        let ptr = UserMutPtr::<AcceptAll, u8>::from_ptr(dest.as_mut_ptr());
+        let source = [0xa5u8; 4];
+        // An element offset above `isize::MAX` must be rejected before any write, matching the
+        // trait default's `isize` conversion contract.
+        let start_offset = (isize::MAX as usize) + 1;
+        assert_eq!(ptr.copy_from_slice(start_offset, &source), None);
+        assert_eq!(dest, [0u8; 4]);
     }
 }
