@@ -224,15 +224,15 @@ fn copy_to_slice<V: ValidateAccess, T: FromBytes + Copy>(
     // Match the checked-offset contract of the `RawConstPointer::copy_to_slice` trait default:
     // it converts every element offset (`start_offset + index`) to `isize` and returns `None`
     // when that fails, so reject a largest element offset that exceeds `isize::MAX`. Also reject a
-    // byte offset for that same element that would move the base pointer past the end of the address
-    // space, instead of silently wrapping into an unrelated (but possibly still-valid) userspace
-    // range. Given both checks pass, the subsequent `wrapping_add` is provenance-preserving and
-    // does not actually wrap.
+    // complete byte range if it would extend past the end of the address space, instead of silently
+    // wrapping into an unrelated (but possibly still-valid) userspace range. Given both checks pass,
+    // the subsequent `wrapping_add` is provenance-preserving and does not actually wrap.
     let max_element_offset = start_offset.checked_add(buf.len() - 1)?;
     isize::try_from(max_element_offset).ok()?;
-    core::mem::size_of::<T>()
-        .checked_mul(max_element_offset)
-        .and_then(|byte_offset| (ptr as usize).checked_add(byte_offset))?;
+    let byte_offset = core::mem::size_of::<T>().checked_mul(start_offset)?;
+    (ptr as usize)
+        .checked_add(byte_offset)?
+        .checked_add(size_of_val(buf))?;
     let src = ptr.wrapping_add(start_offset);
     let src =
         V::validate_slice(core::ptr::slice_from_raw_parts(src, buf.len()).cast_mut())?.cast_const();
@@ -399,21 +399,21 @@ impl<V: ValidateAccess, T: FromBytes + IntoBytes> RawMutPointer<T> for UserMutPt
     where
         T: Copy,
     {
+        let start = isize::try_from(start_offset).ok()?;
+        start.checked_add_unsigned(buf.len())?;
         if buf.is_empty() {
             return Some(());
         }
         // Match the checked-offset contract of the `RawMutPointer::copy_from_slice` trait default:
-        // it converts the offset to `isize` (`start_offset.try_into()`) and returns `None` when
-        // that fails, so reject a largest element offset that exceeds `isize::MAX`. Also reject a
-        // byte offset for that same element that would move the base pointer past the end of the
-        // address space instead of silently wrapping into an unrelated (but possibly still-valid)
-        // userspace range. Given both checks pass, the subsequent `wrapping_add` is
-        // provenance-preserving and does not actually wrap.
-        let max_element_offset = start_offset.checked_add(buf.len() - 1)?;
-        isize::try_from(max_element_offset).ok()?;
-        core::mem::size_of::<T>()
-            .checked_mul(max_element_offset)
-            .and_then(|byte_offset| (self.as_ptr() as usize).checked_add(byte_offset))?;
+        // it converts the offset to `isize` and checks the exclusive element end. Also reject a
+        // complete byte range that would extend past the end of the address space instead of
+        // silently wrapping into an unrelated (but possibly still-valid) userspace range. Given
+        // both checks pass, the subsequent `wrapping_add` is provenance-preserving and does not
+        // actually wrap.
+        let byte_offset = core::mem::size_of::<T>().checked_mul(start_offset)?;
+        (self.as_ptr() as usize)
+            .checked_add(byte_offset)?
+            .checked_add(size_of_val(buf))?;
         let dst = self.as_ptr().wrapping_add(start_offset);
         let dst = V::validate_slice(core::ptr::slice_from_raw_parts_mut(dst, buf.len()))?;
         V::with_user_memory_access(|| unsafe {
@@ -462,6 +462,13 @@ mod tests {
     }
 
     #[test]
+    fn copy_to_slice_rejects_byte_range_end_overflow_before_validation() {
+        let ptr = UserConstPtr::<PanicOnValidation, u32>::from_usize(usize::MAX - 2);
+        let mut dst = [0u32; 1];
+        assert_eq!(ptr.copy_to_slice(0, &mut dst), None);
+    }
+
+    #[test]
     fn copy_to_slice_accepts_zero_offset() {
         let source = [1u8, 2, 3, 4];
         let ptr = UserConstPtr::<AcceptAll, u8>::from_ptr(source.as_ptr());
@@ -488,6 +495,25 @@ mod tests {
         let ptr = UserMutPtr::<PanicOnValidation, u8>::from_usize(0x10001);
         let source = [0xa5u8; 4];
         assert_eq!(ptr.copy_from_slice(usize::MAX, &source), None);
+    }
+
+    #[test]
+    fn copy_from_slice_rejects_byte_range_end_overflow_before_validation() {
+        let ptr = UserMutPtr::<PanicOnValidation, u32>::from_usize(usize::MAX - 2);
+        let source = [0xa5u32; 1];
+        assert_eq!(ptr.copy_from_slice(0, &source), None);
+    }
+
+    #[test]
+    fn copy_from_slice_rejects_isize_max_exclusive_end_before_validation() {
+        let ptr = UserMutPtr::<PanicOnValidation, ()>::from_usize(0x10000);
+        assert_eq!(ptr.copy_from_slice(isize::MAX as usize, &[()]), None);
+    }
+
+    #[test]
+    fn copy_from_slice_rejects_invalid_offset_for_empty_copy() {
+        let ptr = UserMutPtr::<PanicOnValidation, u8>::from_usize(0x10000);
+        assert_eq!(ptr.copy_from_slice(usize::MAX, &[]), None);
     }
 
     #[test]
