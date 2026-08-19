@@ -1,11 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-#[cfg(target_arch = "x86_64")]
 pub mod oci;
 
 use anyhow::{Context, bail};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use rayon::prelude::*;
 #[cfg(target_os = "linux")]
 use std::collections::BTreeMap;
@@ -61,9 +60,94 @@ pub struct CliArgs {
     #[arg(long = "no-rewrite", value_name = "PATH")]
     pub no_rewrite: Vec<PathBuf>,
 
+    /// Host ABI expected by packaged AArch64 binaries; ignored for x86-64 binaries.
+    #[arg(long, value_enum, default_value_t)]
+    pub target_host: CliTargetHost,
+
+    /// CPU architecture of binaries selected and rewritten for the package.
+    /// Cross-architecture packaging is supported only with `--oci-image`.
+    #[arg(long, value_enum, default_value_t)]
+    pub target_arch: CliTargetArch,
+
+    /// Virtualize x18 in packaged AArch64 binaries targeting Linux; ignored for
+    /// x86-64 binaries and always enabled for macOS and Windows host ABIs.
+    /// Requires the runner's `aarch64_virtualize_x18` feature.
+    #[arg(long = "virtualize-x18")]
+    pub virtualize_x18: bool,
+
     /// Print verbose output during packaging.
     #[arg(short = 'v', long = "verbose")]
     pub verbose: bool,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum CliTargetHost {
+    Linux,
+    Macos,
+    Windows,
+}
+
+impl Default for CliTargetHost {
+    fn default() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::Macos
+        } else if cfg!(target_os = "windows") {
+            Self::Windows
+        } else {
+            Self::Linux
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum CliTargetArch {
+    #[value(name = "x86-64")]
+    X86_64,
+    Aarch64,
+}
+
+impl CliTargetArch {
+    fn elf_machine(self) -> u16 {
+        match self {
+            Self::X86_64 => EM_X86_64,
+            Self::Aarch64 => EM_AARCH64,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::X86_64 => "x86-64",
+            Self::Aarch64 => "aarch64",
+        }
+    }
+
+    fn oci_arch(self) -> oci_spec::image::Arch {
+        match self {
+            Self::X86_64 => oci_spec::image::Arch::Amd64,
+            Self::Aarch64 => oci_spec::image::Arch::ARM64,
+        }
+    }
+}
+
+impl Default for CliTargetArch {
+    fn default() -> Self {
+        if cfg!(target_arch = "aarch64") {
+            Self::Aarch64
+        } else {
+            Self::X86_64
+        }
+    }
+}
+
+impl CliArgs {
+    fn rewrite_options(&self) -> litebox_syscall_rewriter::RewriteOptions {
+        let target_host = match self.target_host {
+            CliTargetHost::Linux => litebox_syscall_rewriter::TargetHost::Linux,
+            CliTargetHost::Macos => litebox_syscall_rewriter::TargetHost::MacOs,
+            CliTargetHost::Windows => litebox_syscall_rewriter::TargetHost::Windows,
+        };
+        litebox_syscall_rewriter::RewriteOptions::new(target_host, self.virtualize_x18)
+    }
 }
 
 /// Parsed `--include` entry.
@@ -92,22 +176,17 @@ fn parse_include(spec: &str) -> anyhow::Result<IncludeEntry> {
 
 /// Run the packaging tool.
 pub fn run(args: CliArgs) -> anyhow::Result<()> {
+    let rewrite_options = args.rewrite_options();
     if let Some(ref image_ref) = args.oci_image {
-        #[cfg(target_arch = "x86_64")]
-        {
-            return run_oci(image_ref, &args);
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            let _ = image_ref;
-            bail!("--oci-image is only supported on x86_64");
-        }
+        return run_oci(image_ref, &args, rewrite_options);
     }
+
+    validate_host_target_arch(args.target_arch)?;
 
     // Host mode (local ELF files + ldd dependency discovery) is Linux-only.
     #[cfg(target_os = "linux")]
     {
-        run_host_mode(args)
+        run_host_mode(args, rewrite_options)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -121,7 +200,10 @@ pub fn run(args: CliArgs) -> anyhow::Result<()> {
 
 /// Host mode: package local ELF files with ldd-based dependency discovery.
 #[cfg(target_os = "linux")]
-fn run_host_mode(args: CliArgs) -> anyhow::Result<()> {
+fn run_host_mode(
+    args: CliArgs,
+    rewrite_options: litebox_syscall_rewriter::RewriteOptions,
+) -> anyhow::Result<()> {
     let input_files: Vec<PathBuf> = args
         .input_files
         .iter()
@@ -189,7 +271,7 @@ fn run_host_mode(args: CliArgs) -> anyhow::Result<()> {
                 }
                 data
             } else {
-                rewrite_elf(&data, real_path, verbose)
+                rewrite_elf(&data, real_path, verbose, rewrite_options, args.target_arch)
             };
 
             let mut entries = Vec::new();
@@ -242,7 +324,13 @@ fn run_host_mode(args: CliArgs) -> anyhow::Result<()> {
             use std::os::unix::fs::MetadataExt as _;
             std::fs::metadata(&inc.host_path).map_or(0o755, |m| m.mode())
         };
-        let rewritten = rewrite_elf(&data, &inc.host_path, args.verbose);
+        let rewritten = rewrite_elf(
+            &data,
+            &inc.host_path,
+            args.verbose,
+            rewrite_options,
+            args.target_arch,
+        );
         if args.verbose {
             eprintln!(
                 "  including {} as {}",
@@ -263,11 +351,14 @@ fn run_host_mode(args: CliArgs) -> anyhow::Result<()> {
 }
 
 /// Run the packager in OCI mode: pull image, extract rootfs, rewrite ELFs, build tar.
-#[cfg(target_arch = "x86_64")]
-fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
+fn run_oci(
+    image_ref: &str,
+    args: &CliArgs,
+    rewrite_options: litebox_syscall_rewriter::RewriteOptions,
+) -> anyhow::Result<()> {
     // --- Phase 1: Pull and extract OCI image ---
     eprintln!("Pulling OCI image: {image_ref}");
-    let extracted = oci::pull_and_extract(image_ref, args.verbose)?;
+    let extracted = oci::pull_and_extract(image_ref, args.target_arch, args.verbose)?;
 
     // --- Phase 2: Scan rootfs for files ---
     eprintln!("Scanning rootfs...");
@@ -309,7 +400,13 @@ fn run_oci(image_ref: &str, args: &CliArgs) -> anyhow::Result<()> {
                 .with_context(|| format!("failed to read {}", entry.read_path.display()))?;
 
             let rewritten = if entry.is_executable && !no_rewrite.contains(&entry.read_path) {
-                rewrite_elf(&data, &entry.read_path, verbose)
+                rewrite_elf(
+                    &data,
+                    &entry.read_path,
+                    verbose,
+                    rewrite_options,
+                    args.target_arch,
+                )
             } else {
                 data
             };
@@ -581,15 +678,17 @@ fn elf_machine(data: &[u8]) -> Option<u16> {
     }
 }
 
-/// Returns the expected ELF e_machine value for the current target architecture.
-fn target_elf_machine() -> u16 {
-    if cfg!(target_arch = "x86_64") {
-        EM_X86_64
-    } else if cfg!(target_arch = "aarch64") {
-        EM_AARCH64
-    } else {
-        0 // Unknown — skip arch check
+/// Reject cross-architecture dependency discovery in host mode.
+fn validate_host_target_arch(target_arch: CliTargetArch) -> anyhow::Result<()> {
+    let build_arch = CliTargetArch::default();
+    if target_arch != build_arch {
+        bail!(
+            "host mode cannot target {} from {} build; use --oci-image for cross-architecture packaging",
+            target_arch.name(),
+            build_arch.name()
+        );
     }
+    Ok(())
 }
 
 /// Rewrite an ELF file's syscall instructions using the litebox syscall rewriter.
@@ -598,8 +697,15 @@ fn target_elf_machine() -> u16 {
 /// detected via a magic-byte check and returned unmodified without being sent
 /// through the rewriter. For actual ELF files, benign rewriter errors (already
 /// hooked, no syscalls, unsupported object, missing `.text`) are treated as
-/// warnings and the original bytes are returned.
-fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> Vec<u8> {
+/// warnings and the original bytes are returned. ELF files for other target
+/// architectures are included unchanged.
+fn rewrite_elf(
+    data: &[u8],
+    path: &Path,
+    verbose: bool,
+    options: litebox_syscall_rewriter::RewriteOptions,
+    target_arch: CliTargetArch,
+) -> Vec<u8> {
     // Fast-path: skip the rewriter entirely for non-ELF files.
     if data.len() < 4 || data[..4] != ELF_MAGIC {
         if verbose {
@@ -610,9 +716,8 @@ fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> Vec<u8> {
 
     // Skip ELF files whose architecture doesn't match the target. OCI images
     // may contain cross-architecture binaries (e.g., aarch64 in an x86_64
-    // image) which the rewriter cannot handle.
-    let target_machine = target_elf_machine();
-    if target_machine != 0 && elf_machine(data).is_some_and(|machine| machine != target_machine) {
+    // image), which are not part of the selected guest architecture.
+    if elf_machine(data).is_some_and(|machine| machine != target_arch.elf_machine()) {
         if verbose {
             eprintln!(
                 "  {} (wrong ELF architecture, skipping rewrite)",
@@ -622,7 +727,7 @@ fn rewrite_elf(data: &[u8], path: &Path, verbose: bool) -> Vec<u8> {
         return data.to_vec();
     }
 
-    match litebox_syscall_rewriter::hook_syscalls_in_elf(data, None) {
+    match litebox_syscall_rewriter::hook_syscalls_in_elf_with_options(data, None, options) {
         Ok(rewritten) => {
             if verbose {
                 eprintln!("  {} (rewritten)", path.display());
