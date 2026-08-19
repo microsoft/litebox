@@ -2484,110 +2484,82 @@ mod tests {
         #[test]
         fn reserve_alignment_outputs_match_host_ntdll() {
             run_with_test_platform_pointers(|| {
-                // The fidelity comparison reserves a fixed address on the host, frees it, and then
-                // reserves the same address through the guest. That is only meaningful when no
-                // other thread claims the range in between. Under the parallel test runner a racing
-                // reservation (from this or another `host_fidelity` module) surfaces as
-                // STATUS_CONFLICTING_ADDRESSES on one side only, which is environmental noise rather
-                // than a fidelity divergence. Retry with a fresh probe when that happens; a genuine
-                // divergence still fails fast on the equality assertions below, and a persistent
-                // conflict fails by exhausting the attempts.
-                const MAX_ATTEMPTS: usize = 32;
-                for _ in 0..MAX_ATTEMPTS {
-                    let mut probe_base = core::ptr::null_mut::<c_void>();
-                    let mut probe_region_size = ALLOCATION_GRANULARITY * 2;
-                    // SAFETY: The output pointers are valid locals and the current-process pseudo
-                    // handle targets this process. The allocation is released before reuse below.
-                    let probe_status = unsafe {
-                        host_status(NtAllocateVirtualMemory(
-                            current_process(),
-                            &raw mut probe_base,
-                            0,
-                            &raw mut probe_region_size,
-                            AllocationType::MEM_RESERVE.bits(),
-                            PageProtection::PAGE_READWRITE.bits(),
-                        ))
-                    };
-                    assert_eq!(probe_status, NtStatus::SUCCESS);
-
-                    let mut probe_release_base = probe_base;
-                    let mut probe_release_size = 0usize;
-                    // SAFETY: Releases the host allocation created above so the fixed-address probe
-                    // can reuse the same address range.
-                    let probe_free_status = unsafe {
-                        host_status(NtFreeVirtualMemory(
-                            current_process(),
-                            &raw mut probe_release_base,
-                            &raw mut probe_release_size,
-                            FreeType::MEM_RELEASE.bits(),
-                        ))
-                    };
-                    assert_eq!(probe_free_status, NtStatus::SUCCESS);
-
-                    let requested_base = probe_base.wrapping_byte_add(PAGE_SIZE + 123);
-                    let mut host_base = requested_base;
-                    let mut host_region_size = 1usize;
-                    // SAFETY: The fixed address range was just released and the output pointers are
-                    // valid locals. The allocation is released before the guest probe runs.
-                    let host_allocate_status = unsafe {
-                        host_status(NtAllocateVirtualMemory(
-                            current_process(),
-                            &raw mut host_base,
-                            0,
-                            &raw mut host_region_size,
-                            AllocationType::MEM_RESERVE.bits(),
-                            PageProtection::PAGE_READWRITE.bits(),
-                        ))
-                    };
-                    // A racing thread claimed the freed range before the host reserve; retry.
-                    if host_allocate_status == NtStatus::CONFLICTING_ADDRESSES {
-                        continue;
-                    }
-                    assert_eq!(host_allocate_status, NtStatus::SUCCESS);
-
-                    let mut host_release_base = host_base;
-                    let mut host_release_size = 0usize;
-                    // SAFETY: Releases the fixed host allocation created by this test.
-                    let host_free_status = unsafe {
-                        host_status(NtFreeVirtualMemory(
-                            current_process(),
-                            &raw mut host_release_base,
-                            &raw mut host_release_size,
-                            FreeType::MEM_RELEASE.bits(),
-                        ))
-                    };
-                    assert_eq!(host_free_status, NtStatus::SUCCESS);
-
-                    let task = crate::tests::test_task();
-                    let mut guest_base = requested_base as usize;
-                    let mut guest_region_size = 1usize;
-                    let guest_allocate_status = task.sys_nt_allocate_virtual_memory(
-                        ProcessHandle::CURRENT,
-                        mut_ptr(&mut guest_base),
+                let mut probe_base = core::ptr::null_mut::<c_void>();
+                let mut probe_region_size = ALLOCATION_GRANULARITY * 2;
+                // SAFETY: The output pointers are valid locals and the current-process pseudo
+                // handle targets this process. The allocation is released before reuse below.
+                let probe_status = unsafe {
+                    host_status(NtAllocateVirtualMemory(
+                        current_process(),
+                        &raw mut probe_base,
                         0,
-                        mut_ptr(&mut guest_region_size),
+                        &raw mut probe_region_size,
                         AllocationType::MEM_RESERVE.bits(),
                         PageProtection::PAGE_READWRITE.bits(),
-                    );
-                    // A racing thread claimed the range between the host free and the guest
-                    // reserve; the host succeeded at an address the guest can no longer obtain, so
-                    // this attempt cannot compare fidelity. Retry with a fresh probe.
-                    if guest_allocate_status == NtStatus::CONFLICTING_ADDRESSES
-                        && host_allocate_status == NtStatus::SUCCESS
-                    {
-                        continue;
-                    }
-                    assert_eq!(guest_allocate_status, host_allocate_status);
-                    assert_eq!(guest_base, host_base as usize);
-                    assert_eq!(guest_region_size, host_region_size);
+                    ))
+                };
+                assert_eq!(probe_status, NtStatus::SUCCESS);
 
-                    release_allocation(&task, guest_base);
-                    return;
-                }
-                panic!(
-                    "reserve fidelity comparison never observed an unraced attempt in \
-                     {MAX_ATTEMPTS} tries"
+                let mut probe_release_base = probe_base;
+                let mut probe_release_size = 0usize;
+                // SAFETY: Releases the host allocation created above so the fixed-address probe
+                // can reuse the same address range.
+                let probe_free_status = unsafe {
+                    host_status(NtFreeVirtualMemory(
+                        current_process(),
+                        &raw mut probe_release_base,
+                        &raw mut probe_release_size,
+                        FreeType::MEM_RELEASE.bits(),
+                    ))
+                };
+                assert_eq!(probe_free_status, NtStatus::SUCCESS);
+
+                let requested_base = probe_base.wrapping_byte_add(PAGE_SIZE + 123);
+                let mut host_base = requested_base;
+                let mut host_region_size = 1usize;
+                // SAFETY: The fixed address range was just released and the output pointers are
+                // valid locals. The allocation is released before the guest probe runs.
+                let host_allocate_status = unsafe {
+                    host_status(NtAllocateVirtualMemory(
+                        current_process(),
+                        &raw mut host_base,
+                        0,
+                        &raw mut host_region_size,
+                        AllocationType::MEM_RESERVE.bits(),
+                        PageProtection::PAGE_READWRITE.bits(),
+                    ))
+                };
+                assert_eq!(host_allocate_status, NtStatus::SUCCESS);
+
+                let mut host_release_base = host_base;
+                let mut host_release_size = 0usize;
+                // SAFETY: Releases the fixed host allocation created by this test.
+                let host_free_status = unsafe {
+                    host_status(NtFreeVirtualMemory(
+                        current_process(),
+                        &raw mut host_release_base,
+                        &raw mut host_release_size,
+                        FreeType::MEM_RELEASE.bits(),
+                    ))
+                };
+                assert_eq!(host_free_status, NtStatus::SUCCESS);
+
+                let task = crate::tests::test_task();
+                let mut guest_base = requested_base as usize;
+                let mut guest_region_size = 1usize;
+                let guest_allocate_status = task.sys_nt_allocate_virtual_memory(
+                    ProcessHandle::CURRENT,
+                    mut_ptr(&mut guest_base),
+                    0,
+                    mut_ptr(&mut guest_region_size),
+                    AllocationType::MEM_RESERVE.bits(),
+                    PageProtection::PAGE_READWRITE.bits(),
                 );
+                assert_eq!(guest_allocate_status, host_allocate_status);
+                assert_eq!(guest_base, host_base as usize);
+                assert_eq!(guest_region_size, host_region_size);
+
+                release_allocation(&task, guest_base);
             });
         }
 
