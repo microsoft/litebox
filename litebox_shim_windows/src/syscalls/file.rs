@@ -1657,14 +1657,8 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         while validated < output_length {
             let chunk_length = (output_length - validated).min(bytes.len());
             let chunk = MutPtr::<Platform, u8>::from_usize(output_address + validated);
-            for (index, byte) in bytes[..chunk_length].iter_mut().enumerate() {
-                let Ok(index) = isize::try_from(index) else {
-                    return NtStatus::ACCESS_VIOLATION;
-                };
-                let Some(value) = chunk.read_at_offset(index) else {
-                    return NtStatus::ACCESS_VIOLATION;
-                };
-                *byte = value;
+            if chunk.copy_to_slice(0, &mut bytes[..chunk_length]).is_none() {
+                return NtStatus::ACCESS_VIOLATION;
             }
             if chunk.copy_from_slice(0, &bytes[..chunk_length]).is_none() {
                 return NtStatus::ACCESS_VIOLATION;

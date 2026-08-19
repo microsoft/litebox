@@ -321,6 +321,20 @@ where
     /// be invalid.
     fn to_owned_slice(self, len: usize) -> Option<alloc::boxed::Box<[T]>>;
 
+    /// Copy values from the pointer into an existing slice.
+    ///
+    /// Returns `None` without guaranteeing the destination contents if the source range is invalid.
+    fn copy_to_slice(self, start_offset: usize, buf: &mut [T]) -> Option<()>
+    where
+        T: Copy,
+    {
+        for (index, value) in buf.iter_mut().enumerate() {
+            let offset = start_offset.checked_add(index)?.try_into().ok()?;
+            *value = self.read_at_offset(offset)?;
+        }
+        Some(())
+    }
+
     /// Read the pointer as an owned C string.
     ///
     /// Returns `None` if the provided pointer is invalid, or such a string is known (in advance) to
