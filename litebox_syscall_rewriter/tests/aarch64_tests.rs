@@ -12,7 +12,10 @@
 // Deliberate, range-checked casts on a 64-bit host throughout this test.
 #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 
-use litebox_syscall_rewriter::{Error, TRAMPOLINE_MAGIC, hook_syscalls_in_elf};
+use litebox_syscall_rewriter::{
+    Error, RewriteOptions, TRAMPOLINE_MAGIC, TargetHost, hook_syscalls_in_elf,
+    hook_syscalls_in_elf_with_options,
+};
 
 const HELLO_AARCH64: &[u8] = include_bytes!("hello-aarch64");
 
@@ -189,6 +192,41 @@ fn aarch64_hello_world_is_hooked() {
         0x1400_0000,
         "MRS TPIDR_EL0 should be rewritten to B"
     );
+}
+
+#[test]
+fn aarch64_rx_segment_padding_is_not_scanned_when_sections_exist() {
+    let mut elf = HELLO_AARCH64.to_vec();
+    let padding = 0x100;
+    assert!(
+        exec_sections(&elf)
+            .iter()
+            .all(|(offset, _, size)| !(padding >= *offset && padding < offset + size))
+    );
+    elf[padding..padding + 4].copy_from_slice(&SVC_0.to_le_bytes());
+
+    let out = hook_syscalls_in_elf(&elf, Some(0)).unwrap();
+
+    assert_eq!(read_u32(&out, padding), SVC_0);
+}
+
+#[test]
+fn aarch64_text_section_confirms_x18_code_without_symbols_or_fdes() {
+    let mut elf = HELLO_AARCH64.to_vec();
+    let sections = exec_sections(&elf);
+    assert_eq!(sections.len(), 1, "fixture should contain only .text");
+    let (text_offset, _, _) = sections[0];
+    let mov_x0_x18 = 0xAA12_03E0u32;
+    elf[text_offset..text_offset + 4].copy_from_slice(&mov_x0_x18.to_le_bytes());
+
+    let out = hook_syscalls_in_elf_with_options(
+        &elf,
+        Some(0),
+        RewriteOptions::new(TargetHost::Linux, true),
+    )
+    .unwrap();
+
+    assert_eq!(read_u32(&out, text_offset) & 0xFC00_0000, 0x1400_0000);
 }
 
 #[test]

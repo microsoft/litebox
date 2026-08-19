@@ -2150,14 +2150,24 @@ enum PatchKind {
 ///
 /// `MRS XZR, TPIDR_EL0` is a discarded read (register 31 as an `LDR` base would
 /// mean `SP`), so it is left native; every other `MRS Xd, TPIDR_EL0` is gated.
+#[cfg(any(test, target_arch = "aarch64"))]
 fn find_patch_sites(
     sections: &[TextSectionInfo],
     buf: &[u8],
     config: RewriteConfig,
 ) -> Result<Vec<PatchSite>> {
+    find_patch_sites_with_code_ranges(sections, sections, buf, config)
+}
+
+fn find_patch_sites_with_code_ranges(
+    executable_sections: &[TextSectionInfo],
+    code_sections: &[TextSectionInfo],
+    buf: &[u8],
+    config: RewriteConfig,
+) -> Result<Vec<PatchSite>> {
     let mut sites = Vec::new();
 
-    for section in sections {
+    for section in executable_sections {
         let start = usize::try_from(section.file_offset)
             .map_err(|_| Error::ParseError("section file offset too large".into()))?;
         let size = usize::try_from(section.size)
@@ -2179,18 +2189,38 @@ fn find_patch_sites(
         }
         let section_data = &buf[start..end];
         let mut inside_exclusive_sequence = false;
+        let mut was_known_code = false;
+        let mut code_index = 0;
 
         for i in (0..section_data.len()).step_by(INSN_BYTES) {
             if i + INSN_BYTES > section_data.len() {
                 break;
             }
             let insn = u32::from_le_bytes(section_data[i..i + INSN_BYTES].try_into().unwrap());
-            let exclusive_boundary = exclusive_boundary(insn);
-            if exclusive_boundary == Some(ExclusiveBoundary::Load) {
-                inside_exclusive_sequence = true;
-            } else if exclusive_boundary == Some(ExclusiveBoundary::Store) {
+            let vaddr = checked_add_u64(section.vaddr, i as u64, "patch site")?;
+            while code_index < code_sections.len()
+                && code_sections[code_index]
+                    .vaddr
+                    .saturating_add(code_sections[code_index].size)
+                    <= vaddr
+            {
+                code_index += 1;
+            }
+            let known_code = code_sections.get(code_index).is_some_and(|code| {
+                vaddr >= code.vaddr && vaddr < code.vaddr.saturating_add(code.size)
+            });
+            if !known_code || !was_known_code {
                 inside_exclusive_sequence = false;
             }
+            if known_code {
+                let exclusive_boundary = exclusive_boundary(insn);
+                if exclusive_boundary == Some(ExclusiveBoundary::Load) {
+                    inside_exclusive_sequence = true;
+                } else if exclusive_boundary == Some(ExclusiveBoundary::Store) {
+                    inside_exclusive_sequence = false;
+                }
+            }
+            was_known_code = known_code;
             let kind = if (insn & SVC_OPCODE_MASK) == SVC_OPCODE_BITS {
                 if config.host != Host::Linux {
                     return Err(Error::UnsupportedExecutable(format!(
@@ -2235,8 +2265,7 @@ fn find_patch_sites(
                 } else {
                     PatchKind::MrsTpidr(rd)
                 }
-            } else if config.virtualize_x18 {
-                let vaddr = checked_add_u64(section.vaddr, i as u64, "x18 site")?;
+            } else if config.virtualize_x18 && known_code {
                 if let Some(branch) = classify_x18_conditional_branch(insn, vaddr) {
                     PatchKind::X18CompareBranch(branch)
                 } else if let Some(adr) = classify_adr_x18(insn, vaddr) {
@@ -2265,7 +2294,7 @@ fn find_patch_sites(
             }
             sites.push(PatchSite {
                 file_offset: start + i,
-                vaddr: checked_add_u64(section.vaddr, i as u64, "patch site")?,
+                vaddr,
                 kind,
             });
         }
@@ -2306,9 +2335,28 @@ pub(crate) struct HookOutcome {
 /// whose gate cannot branch back, is replaced with a trap and listed in
 /// [`HookOutcome::trapped_sites`] so the caller can reject the incomplete
 /// rewrite, mirroring the x86-64 unpatchable-syscall path.
+#[cfg(any(test, target_arch = "aarch64"))]
 pub(crate) fn hook_syscalls_aarch64(
     buf: &mut [u8],
     text_sections: &[TextSectionInfo],
+    trampoline_base_addr: u64,
+    callback: u64,
+    config: RewriteConfig,
+) -> Result<Option<HookOutcome>> {
+    hook_syscalls_aarch64_with_code_ranges(
+        buf,
+        text_sections,
+        text_sections,
+        trampoline_base_addr,
+        callback,
+        config,
+    )
+}
+
+pub(crate) fn hook_syscalls_aarch64_with_code_ranges(
+    buf: &mut [u8],
+    executable_sections: &[TextSectionInfo],
+    code_sections: &[TextSectionInfo],
     trampoline_base_addr: u64,
     callback: u64,
     config: RewriteConfig,
@@ -2318,7 +2366,7 @@ pub(crate) fn hook_syscalls_aarch64(
             "AArch64 trampoline base {trampoline_base_addr:#x} is not {GATE_ALIGNMENT}-byte aligned"
         )));
     }
-    let sites = find_patch_sites(text_sections, buf, config)?;
+    let sites = find_patch_sites_with_code_ranges(executable_sections, code_sections, buf, config)?;
 
     if sites.is_empty() {
         // No patch sites: nothing to redirect, so no trampoline is
@@ -4924,6 +4972,28 @@ mod tests {
             outcome.trampoline.len(),
             GATES_START_OFFSET + MSR_GATE_SIZE + MRS_GATE_SIZE
         );
+    }
+
+    #[test]
+    fn unknown_executable_bytes_scan_mandatory_sites_but_not_heuristic_x18() {
+        let words: [u32; 2] = [0xd400_0001, 0x5d56_4f48];
+        let bytes = words
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<_>>();
+        let executable = [TextSectionInfo {
+            vaddr: 0x1000,
+            file_offset: 0,
+            size: bytes.len() as u64,
+        }];
+
+        let sites =
+            find_patch_sites_with_code_ranges(&executable, &[], &bytes, x18_config(Host::Linux))
+                .unwrap();
+
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].vaddr, 0x1000);
+        assert_eq!(sites[0].kind, PatchKind::Svc);
     }
 
     #[test]

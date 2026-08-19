@@ -10,6 +10,7 @@ anyhow = ["dep:anyhow"]
 clap = ["dep:clap"]
 
 [dependencies]
+gimli = { version = "0.32", default-features = false, features = ["read-core"] }
 iced-x86 = { version = "1.21", default-features = false, features = ["no_std", "decoder", "encoder", "instr_info"] }
 litebox_common_windows = { path = "../litebox_common_windows/", version = "0.1.0" }
 object = { version = "0.36.7", default-features = false, features = ["elf", "pe", "read_core"] }

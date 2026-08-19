@@ -64,7 +64,7 @@ use alloc::vec::Vec;
 use litebox_common_windows::NtSysno;
 use object::pe::{IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE};
 use object::read::pe::{ImageNtHeaders as _, ImageOptionalHeader as _, PeFile64};
-use object::read::{Object as _, ObjectSection as _, ObjectSegment as _};
+use object::read::{Object as _, ObjectSection as _, ObjectSegment as _, ObjectSymbol as _};
 use thiserror::Error;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
@@ -204,6 +204,7 @@ struct TrampolineHeader64 {
 }
 
 /// Metadata about an executable section, extracted from a read-only object parse.
+#[derive(Clone, Copy)]
 struct TextSectionInfo {
     /// Virtual address of the section
     vaddr: u64,
@@ -211,6 +212,12 @@ struct TextSectionInfo {
     file_offset: u64,
     /// Size of the section data in bytes
     size: u64,
+}
+
+#[derive(Clone, Copy)]
+struct Aarch64ScanSections<'a> {
+    executable: &'a [TextSectionInfo],
+    code: &'a [TextSectionInfo],
 }
 
 struct SyscallPatchResult {
@@ -322,7 +329,7 @@ pub fn hook_syscalls_in_elf_with_options(
     fixup_phdr_alignment(buf);
 
     // Parse the ELF and extract all metadata we need, then drop the borrow so we can mutate buf.
-    let (arch, text_sections, placement) = {
+    let (arch, text_sections, aarch64_code_sections, placement) = {
         let file = object::File::parse(&*buf).map_err(|e| Error::ParseError(e.to_string()))?;
 
         let arch = match file {
@@ -334,11 +341,24 @@ pub fn hook_syscalls_in_elf_with_options(
             _ => return Ok(input_binary.to_vec()),
         };
 
-        let text_sections = match text_sections(&file) {
+        let executable_sections = match if arch == Arch::Aarch64 {
+            text_sections(&file).or_else(|error| match error {
+                InternalError::NoTextSectionFound => aarch64_executable_segments(&file),
+                other => Err(other),
+            })
+        } else {
+            text_sections(&file)
+        } {
             Ok(sections) => sections,
             Err(InternalError::NoTextSectionFound) => return Ok(input_binary.to_vec()),
             Err(InternalError::Public(e)) => return Err(e),
             Err(e) => unreachable!("unexpected internal error: {e:?}"),
+        };
+        let (text_sections, aarch64_code_sections) = if arch == Arch::Aarch64 {
+            let code = aarch64_code_sections(&file, &executable_sections);
+            (executable_sections, code)
+        } else {
+            (executable_sections, Vec::new())
         };
 
         if is_already_hooked(&*buf, arch) {
@@ -347,7 +367,7 @@ pub fn hook_syscalls_in_elf_with_options(
 
         let placement = find_addr_for_trampoline_code(&file)?;
 
-        (arch, text_sections, placement)
+        (arch, text_sections, aarch64_code_sections, placement)
     };
 
     // AArch64 uses a fully separate rewriting strategy (single-instruction
@@ -358,7 +378,10 @@ pub fn hook_syscalls_in_elf_with_options(
         return hook_aarch64_elf(
             input_binary,
             buf,
-            &text_sections,
+            Aarch64ScanSections {
+                executable: &text_sections,
+                code: &aarch64_code_sections,
+            },
             placement,
             trampoline.unwrap_or(0),
             options,
@@ -888,7 +911,7 @@ fn append_trampoline_footer(
 fn hook_aarch64_elf(
     input_binary: &[u8],
     buf: &mut [u8],
-    text_sections: &[TextSectionInfo],
+    sections: Aarch64ScanSections<'_>,
     placement: TrampolinePlacement,
     callback: u64,
     options: RewriteOptions,
@@ -898,7 +921,7 @@ fn hook_aarch64_elf(
         let out = hook_aarch64_elf_at(
             input_binary,
             &mut attempt,
-            text_sections,
+            sections,
             addr,
             Some(limit),
             callback,
@@ -921,7 +944,7 @@ fn hook_aarch64_elf(
     hook_aarch64_elf_at(
         input_binary,
         buf,
-        text_sections,
+        sections,
         placement.fallback_addr(),
         None,
         callback,
@@ -946,15 +969,16 @@ fn hook_aarch64_elf(
 fn hook_aarch64_elf_at(
     input_binary: &[u8],
     buf: &mut [u8],
-    text_sections: &[TextSectionInfo],
+    sections: Aarch64ScanSections<'_>,
     trampoline_base_addr: u64,
     trampoline_limit: Option<u64>,
     callback: u64,
     options: RewriteOptions,
 ) -> Result<Vec<u8>> {
-    let Some(outcome) = aarch64::hook_syscalls_aarch64(
+    let Some(outcome) = aarch64::hook_syscalls_aarch64_with_code_ranges(
         buf,
-        text_sections,
+        sections.executable,
+        sections.code,
         trampoline_base_addr,
         callback,
         aarch64::RewriteConfig::new(options.target_host(), options.effective_virtualize_x18()),
@@ -1028,6 +1052,165 @@ fn text_sections(
         return Err(InternalError::NoTextSectionFound);
     }
     Ok(text_sections)
+}
+
+/// Returns executable load segments only as a fallback for AArch64 ELFs whose
+/// section table is absent. When executable sections exist, scanning them avoids
+/// treating unrelated headers, metadata, or padding in an RX segment as code.
+fn aarch64_executable_segments(
+    file: &object::File<'_>,
+) -> core::result::Result<Vec<TextSectionInfo>, InternalError> {
+    let mut segments: Vec<_> = file
+        .segments()
+        .filter_map(|segment| {
+            let object::SegmentFlags::Elf { p_flags } = segment.flags() else {
+                return None;
+            };
+            if p_flags & object::elf::PF_X == 0 {
+                return None;
+            }
+            let (file_offset, size) = segment.file_range();
+            Some(TextSectionInfo {
+                vaddr: segment.address(),
+                file_offset,
+                size,
+            })
+        })
+        .collect();
+    segments.sort_unstable_by_key(|segment| segment.vaddr);
+    if segments.is_empty() {
+        return Err(InternalError::NoTextSectionFound);
+    }
+    Ok(segments)
+}
+
+/// Builds ranges where metadata positively identifies AArch64 code. Executable
+/// bytes outside these ranges remain eligible for exact mandatory-site scans,
+/// but not heuristic x18 classification.
+fn aarch64_code_sections(
+    file: &object::File<'_>,
+    executable: &[TextSectionInfo],
+) -> Vec<TextSectionInfo> {
+    let mut ranges = Vec::new();
+    for symbol in file.symbols().chain(file.dynamic_symbols()) {
+        if symbol.kind() == object::SymbolKind::Text
+            && symbol.size() != 0
+            && let Some(end) = symbol.address().checked_add(symbol.size())
+        {
+            ranges.push((symbol.address(), end));
+        }
+    }
+
+    if let Some(section) = file.section_by_name(".eh_frame")
+        && let Ok(data) = section.uncompressed_data()
+    {
+        ranges.extend(eh_frame_ranges(
+            &data,
+            section.address(),
+            file.section_by_name(".text").map(|text| text.address()),
+            file.section_by_name(".got").map(|got| got.address()),
+        ));
+    }
+
+    let has_function_metadata = !aarch64_ranges_to_sections(ranges.clone(), executable).is_empty();
+
+    for section in file.sections() {
+        let Ok(name) = section.name() else {
+            continue;
+        };
+        if (matches!(name, ".init" | ".fini" | ".plt" | ".iplt") || name.starts_with(".plt."))
+            && let Some(end) = section.address().checked_add(section.size())
+        {
+            ranges.push((section.address(), end));
+        }
+    }
+
+    if !has_function_metadata
+        && let Some(text) = file.section_by_name(".text")
+        && let Some(end) = text.address().checked_add(text.size())
+    {
+        ranges.push((text.address(), end));
+    }
+
+    aarch64_ranges_to_sections(ranges, executable)
+}
+
+fn eh_frame_ranges(
+    data: &[u8],
+    eh_frame_address: u64,
+    text_address: Option<u64>,
+    got_address: Option<u64>,
+) -> Vec<(u64, u64)> {
+    let mut section = gimli::EhFrame::new(data, gimli::LittleEndian);
+    section.set_address_size(8);
+    let mut bases = gimli::BaseAddresses::default().set_eh_frame(eh_frame_address);
+    if let Some(text_address) = text_address {
+        bases = bases.set_text(text_address);
+    }
+    if let Some(got_address) = got_address {
+        bases = bases.set_got(got_address);
+    }
+    let mut entries = gimli::UnwindSection::entries(&section, &bases);
+    let mut ranges = Vec::new();
+    loop {
+        let Ok(Some(entry)) = entries.next() else {
+            return ranges;
+        };
+        if let gimli::CieOrFde::Fde(partial) = entry {
+            let Ok(fde) = partial.parse(gimli::UnwindSection::cie_from_offset) else {
+                return ranges;
+            };
+            if fde.len() != 0
+                && let Some(end) = fde.initial_address().checked_add(fde.len())
+            {
+                ranges.push((fde.initial_address(), end));
+            }
+        }
+    }
+}
+
+fn aarch64_ranges_to_sections(
+    ranges: Vec<(u64, u64)>,
+    executable: &[TextSectionInfo],
+) -> Vec<TextSectionInfo> {
+    let mut clipped = Vec::new();
+    for (start, end) in ranges {
+        for section in executable {
+            let section_end = section.vaddr.saturating_add(section.size);
+            let start = start
+                .max(section.vaddr)
+                .checked_add(3)
+                .map_or(u64::MAX, |start| start & !3);
+            let end = end.min(section_end) & !3;
+            if start < end {
+                clipped.push((start, end, section));
+            }
+        }
+    }
+    clipped.sort_unstable_by_key(|(start, _, _)| *start);
+
+    let mut code: Vec<TextSectionInfo> = Vec::new();
+    for (start, end, section) in clipped {
+        if let Some(previous) = code.last_mut()
+            && start >= previous.vaddr
+            && previous.vaddr.saturating_add(previous.size) >= start
+            && previous.file_offset.saturating_add(start - previous.vaddr)
+                == section.file_offset.saturating_add(start - section.vaddr)
+        {
+            previous.size = end
+                .max(previous.vaddr.saturating_add(previous.size))
+                .saturating_sub(previous.vaddr);
+            continue;
+        }
+        code.push(TextSectionInfo {
+            vaddr: start,
+            file_offset: section
+                .file_offset
+                .saturating_add(start.saturating_sub(section.vaddr)),
+            size: end - start,
+        });
+    }
+    code
 }
 
 /// Check if the binary is already hooked by looking for TRAMPOLINE_MAGIC at the end of the file.
@@ -2273,6 +2456,25 @@ fn hook_syscall_and_after(
 mod tests {
     use super::*;
 
+    #[test]
+    fn aarch64_ranges_are_clipped_aligned_and_merged() {
+        let executable = [TextSectionInfo {
+            vaddr: 0x1000,
+            file_offset: 0x200,
+            size: 0x20,
+        }];
+
+        let ranges = aarch64_ranges_to_sections(
+            vec![(0x0fff, 0x1006), (0x1004, 0x100d), (0x101e, 0x1024)],
+            &executable,
+        );
+
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].vaddr, 0x1000);
+        assert_eq!(ranges[0].file_offset, 0x200);
+        assert_eq!(ranges[0].size, 0xc);
+    }
+
     fn seg(vaddr: u64, filesz: u64, memsz: u64, align: u64) -> LoadSegment {
         LoadSegment {
             vaddr,
@@ -2525,7 +2727,10 @@ mod tests {
         let out = hook_aarch64_elf_at(
             &input,
             &mut elf,
-            &[section],
+            Aarch64ScanSections {
+                executable: &[section],
+                code: &[section],
+            },
             0x220000,
             None,
             0,
@@ -2548,8 +2753,12 @@ mod tests {
         elf[..4].copy_from_slice(b"\x7fELF");
         elf[4] = object::elf::ELFCLASS64;
         elf[5] = object::elf::ELFDATA2LSB;
+        elf[6] = object::elf::EV_CURRENT;
+        elf[16..18].copy_from_slice(&object::elf::ET_EXEC.to_le_bytes());
         elf[18..20].copy_from_slice(&object::elf::EM_AARCH64.to_le_bytes());
+        elf[20..24].copy_from_slice(&u32::from(object::elf::EV_CURRENT).to_le_bytes());
         elf[32..40].copy_from_slice(&(ELF_HEADER_BYTES as u64).to_le_bytes());
+        elf[52..54].copy_from_slice(&u16::try_from(ELF_HEADER_BYTES).unwrap().to_le_bytes());
         elf[54..56].copy_from_slice(&u16::try_from(PROGRAM_HEADER_BYTES).unwrap().to_le_bytes());
         elf[56..58].copy_from_slice(&1u16.to_le_bytes());
 
@@ -2557,6 +2766,8 @@ mod tests {
         elf[text..text + 4].copy_from_slice(&object::elf::PT_LOAD.to_le_bytes());
         elf[text + 4..text + 8]
             .copy_from_slice(&(object::elf::PF_R | object::elf::PF_X).to_le_bytes());
+        elf[text + 8..text + 16]
+            .copy_from_slice(&((ELF_HEADER_BYTES + PROGRAM_HEADER_BYTES) as u64).to_le_bytes());
         elf[text + 16..text + 24].copy_from_slice(&0x1000u64.to_le_bytes());
         elf[text + 32..text + 40].copy_from_slice(&4u64.to_le_bytes());
         elf[text + 40..text + 48].copy_from_slice(&4u64.to_le_bytes());
@@ -2564,6 +2775,15 @@ mod tests {
 
         elf.extend(0xD400_0001u32.to_le_bytes());
         elf
+    }
+
+    #[test]
+    fn aarch64_sectionless_elf_still_rewrites_svc_from_executable_segment() {
+        let input = aarch64_elf_with_one_svc();
+        let output = hook_syscalls_in_elf(&input, None).unwrap();
+
+        let patched = u32::from_le_bytes(output[input.len() - 4..input.len()].try_into().unwrap());
+        assert_eq!(patched & 0xfc00_0000, 0x1400_0000);
     }
 
     /// A gap the gates cannot branch back from is retried at the fallback
@@ -2589,7 +2809,10 @@ mod tests {
                 hook_aarch64_elf_at(
                     &input,
                     &mut direct,
-                    &[section()],
+                    Aarch64ScanSections {
+                        executable: &[section()],
+                        code: &[section()],
+                    },
                     UNREACHABLE_GAP,
                     None,
                     0,
@@ -2609,7 +2832,10 @@ mod tests {
         hook_aarch64_elf(
             &input,
             &mut elf,
-            &[section()],
+            Aarch64ScanSections {
+                executable: &[section()],
+                code: &[section()],
+            },
             placement,
             0,
             RewriteOptions::default(),
@@ -2723,7 +2949,10 @@ mod tests {
         let err = hook_aarch64_elf(
             &input,
             &mut buf,
-            &sections,
+            Aarch64ScanSections {
+                executable: &sections,
+                code: &sections,
+            },
             placement,
             0,
             RewriteOptions::default(),

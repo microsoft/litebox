@@ -892,6 +892,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "gimli"
+version = "0.32.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
+
+[[package]]
 name = "glob"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1829,6 +1835,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "gimli",
  "iced-x86",
  "insta",
  "litebox_common_windows",
