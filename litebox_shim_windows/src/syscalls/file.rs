@@ -3054,6 +3054,88 @@ mod tests {
     }
 
     #[test]
+    fn nt_read_file_rejects_oversized_length_without_oom_or_advancing_file() {
+        run_with_test_platform_pointers(|| {
+            let task = crate::tests::test_task();
+            create_existing_file(&task, "/tmp/read-oversized.txt", b"litebox");
+            let (status, handle, _) = create_file(
+                &task,
+                "/tmp/read-oversized.txt",
+                FILE_GENERIC_READ,
+                FILE_OPEN,
+            );
+            assert_eq!(status, NtStatus::SUCCESS);
+
+            let mut allocation_base = 0;
+            let mut allocation_size = PAGE_SIZE * 3;
+            assert_eq!(
+                task.sys_nt_allocate_virtual_memory(
+                    crate::syscalls::ProcessHandle::CURRENT,
+                    mut_ptr(&mut allocation_base),
+                    0,
+                    mut_ptr(&mut allocation_size),
+                    (AllocationType::MEM_RESERVE | AllocationType::MEM_COMMIT).bits(),
+                    PageProtection::PAGE_READWRITE.bits(),
+                ),
+                NtStatus::SUCCESS
+            );
+
+            // A guest-controlled `u32::MAX` length must not trigger a multi-gigabyte allocation
+            // (the shim caps its scratch buffer at NT_READ_FILE_CHUNK_SIZE and reports NO_MEMORY on
+            // a failed reservation, never OOM-aborting). The full output range is pre-probed before
+            // any file access, so a length extending past the small mapping faults with
+            // ACCESS_VIOLATION rather than consuming file data.
+            let mut io_status = IoStatusBlock::default();
+            assert_eq!(
+                task.sys_nt_read_file(
+                    handle,
+                    Handle::default(),
+                    None,
+                    None,
+                    mut_ptr(&mut io_status),
+                    MutPtr::<TestPlatform, u8>::from_usize(allocation_base),
+                    u32::MAX,
+                    None,
+                    None,
+                ),
+                NtStatus::ACCESS_VIOLATION
+            );
+
+            // The file position must not have advanced: a subsequent bounded read still returns the
+            // file contents from the beginning.
+            let mut output = [0; 7];
+            assert_eq!(
+                task.sys_nt_read_file(
+                    handle,
+                    Handle::default(),
+                    None,
+                    None,
+                    mut_ptr(&mut io_status),
+                    mut_byte_ptr(&mut output),
+                    output.len().try_into().unwrap(),
+                    None,
+                    None,
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(&output, b"litebox");
+
+            let mut release_base = allocation_base;
+            let mut release_size = 0;
+            assert_eq!(
+                task.sys_nt_free_virtual_memory(
+                    crate::syscalls::ProcessHandle::CURRENT,
+                    mut_ptr(&mut release_base),
+                    mut_ptr(&mut release_size),
+                    FreeType::MEM_RELEASE.bits(),
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
+        });
+    }
+
+    #[test]
     fn nt_read_file_zero_length_succeeds_without_advancing_file() {
         run_with_test_platform_pointers(|| {
             let task = crate::tests::test_task();
