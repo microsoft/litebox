@@ -13,6 +13,89 @@ use litebox_broker_transport_windows_userland::broker;
 use litebox_platform_windows_userland::WindowsUserland;
 use memmap2::Mmap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+type HostNtGdiInit2 = unsafe extern "system" fn() -> isize;
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn LoadLibraryW(name: *const u16) -> *mut core::ffi::c_void;
+    fn GetProcAddress(module: *mut core::ffi::c_void, name: *const u8) -> Option<HostNtGdiInit2>;
+}
+
+fn host_nt_gdi_init2(guest_peb: usize) -> usize {
+    const PEB_SHARED_DATA_OFFSET: usize = 0xf8;
+    static CALLBACK: OnceLock<Option<HostNtGdiInit2>> = OnceLock::new();
+    let callback = CALLBACK.get_or_init(|| {
+        const USER32_DLL: &[u16] = &[
+            b'u' as u16,
+            b's' as u16,
+            b'e' as u16,
+            b'r' as u16,
+            b'3' as u16,
+            b'2' as u16,
+            b'.' as u16,
+            b'd' as u16,
+            b'l' as u16,
+            b'l' as u16,
+            0,
+        ];
+        const WIN32U_DLL: &[u16] = &[
+            b'w' as u16,
+            b'i' as u16,
+            b'n' as u16,
+            b'3' as u16,
+            b'2' as u16,
+            b'u' as u16,
+            b'.' as u16,
+            b'd' as u16,
+            b'l' as u16,
+            b'l' as u16,
+            0,
+        ];
+        // SAFETY: `USER32_DLL` is a static, NUL-terminated UTF-16 string.
+        // Loading User32 initializes the process kernel callback table used by
+        // Win32u services before NtGdiInit2 can trigger a user-mode callback.
+        if unsafe { LoadLibraryW(USER32_DLL.as_ptr()) }.is_null() {
+            return None;
+        }
+        // SAFETY: `WIN32U_DLL` is a static, NUL-terminated UTF-16 string.
+        let module = unsafe { LoadLibraryW(WIN32U_DLL.as_ptr()) };
+        if module.is_null() {
+            return None;
+        }
+        // SAFETY: the module remains loaded for the process lifetime and the
+        // export name is a static, NUL-terminated byte string.
+        unsafe { GetProcAddress(module, c"NtGdiInit2".as_ptr().cast()) }
+    });
+    let Some(callback) = callback else {
+        litebox_util_log::error!("Failed to resolve host win32u!NtGdiInit2");
+        return 0;
+    };
+    // SAFETY: the cached function was resolved and typed above, and Win32u
+    // remains loaded for the lifetime of the process.
+    let result = unsafe { callback() }.cast_unsigned();
+
+    let host_peb: usize;
+    // SAFETY: on x86-64 Windows, GS points to the host TEB and TEB+0x60 is
+    // the current process's PEB pointer.
+    unsafe {
+        core::arch::asm!(
+            "mov {}, gs:[0x60]",
+            out(reg) host_peb,
+            options(nostack, preserves_flags, readonly),
+        );
+    }
+    // SAFETY: both PEB addresses are valid for the lifetime of their process.
+    // NtGdiInit2 initialized the host PEB's SharedData field, which guest
+    // GDI32Full expects the syscall to initialize in its own PEB as well.
+    unsafe {
+        let shared_data = ((host_peb + PEB_SHARED_DATA_OFFSET) as *const usize).read();
+        ((guest_peb + PEB_SHARED_DATA_OFFSET) as *mut usize).write(shared_data);
+    }
+
+    result
+}
 
 fn mmapped_file(path: impl AsRef<Path>) -> Result<&'static [u8]> {
     let path = path.as_ref();
@@ -106,8 +189,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             litebox.broker_failure_dispatcher(),
         )?;
         litebox_shim_windows::WindowsShimBuilder::new_with_litebox(platform, litebox)
+            .with_nt_gdi_init2(host_nt_gdi_init2)
     } else {
-        litebox_shim_windows::WindowsShimBuilder::new(platform)
+        litebox_shim_windows::WindowsShimBuilder::new(platform).with_nt_gdi_init2(host_nt_gdi_init2)
     };
     let litebox = shim_builder.litebox();
 

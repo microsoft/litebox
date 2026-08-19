@@ -37,6 +37,17 @@ impl crate::platform::PageManagementProvider<PAGE_SIZE> for DummyVmemBackend {
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     const TASK_ADDR_MAX: usize = 0xFFFF_FFFF_F000; // 48-bit VA space
 
+    // Fallback bounds so this dummy backend still satisfies the trait when the mm unit tests are
+    // built on a non-Linux host (e.g. a Windows developer machine). The values only need to be
+    // `PAGE_SIZE`-aligned; the backend does nothing with them.
+    #[cfg(not(target_os = "linux"))]
+    const TASK_ADDR_MIN: usize = 0x1_0000;
+    #[cfg(not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )))]
+    const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000;
+
     fn allocate_pages(
         &self,
         suggested_range: Range<usize>,

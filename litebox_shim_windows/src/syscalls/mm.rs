@@ -61,7 +61,7 @@ impl PageProtection {
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    struct AllocationType: u32 {
+    pub(crate) struct AllocationType: u32 {
         const MEM_COMMIT = 0x1000;
         const MEM_RESERVE = 0x2000;
         const MEM_RESET = 0x80000;
@@ -75,7 +75,7 @@ bitflags::bitflags! {
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    struct FreeType: u32 {
+    pub(crate) struct FreeType: u32 {
         const MEM_COALESCE_PLACEHOLDERS = 0x1;
         const MEM_PRESERVE_PLACEHOLDER = 0x2;
         const MEM_DECOMMIT = 0x4000;

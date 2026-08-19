@@ -61,7 +61,7 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
-use litebox_common_windows::NtSysno;
+use litebox_common_windows::{NtSysno, Win32Sysno};
 use object::pe::{IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE};
 use object::read::pe::{ImageNtHeaders as _, ImageOptionalHeader as _, PeFile64};
 use object::read::{Object as _, ObjectSection as _, ObjectSegment as _};
@@ -444,7 +444,8 @@ pub fn rewrite_pe_for_litebox(input_binary: &[u8], trampoline: Option<u64>) -> R
             Err(InternalError::Public(e)) => return Err(e),
             Err(e) => unreachable!("unexpected internal error: {e:?}"),
         };
-        let sysno_map = pe_ntdll_sysno_map(&file, buf, &text_sections)?;
+        let mut sysno_map = pe_ntdll_sysno_map(&file, buf, &text_sections)?;
+        sysno_map.extend(pe_win32u_sysno_map(&file, buf, &text_sections)?);
         (
             text_sections,
             sysno_map,
@@ -555,7 +556,7 @@ fn pe_ntdll_sysno_map(
     file: &object::File<'_>,
     buf: &[u8],
     text_sections: &[TextSectionInfo],
-) -> Result<BTreeMap<u32, NtSysno>> {
+) -> Result<BTreeMap<u32, u32>> {
     let mut map = BTreeMap::new();
     let mut exports_ntdll_loader_entrypoint = false;
 
@@ -585,12 +586,53 @@ fn pe_ntdll_sysno_map(
         let stub_offset = usize::try_from(addr - section.vaddr)
             .map_err(|_| Error::ParseError("export offset out of range".into()))?;
         if let Some(build_sysno) = read_nt_stub_sysno(section_data, stub_offset) {
-            map.insert(build_sysno, sysno);
+            map.insert(build_sysno, sysno.as_raw());
         }
     }
 
     if !exports_ntdll_loader_entrypoint {
         return Ok(BTreeMap::new());
+    }
+
+    Ok(map)
+}
+
+/// Maps the build-specific Win32u service numbers for the small set of
+/// Win32k syscalls that LiteBox explicitly handles into a namespace disjoint
+/// from ntdll's stable syscall numbers.
+fn pe_win32u_sysno_map(
+    file: &object::File<'_>,
+    buf: &[u8],
+    text_sections: &[TextSectionInfo],
+) -> Result<BTreeMap<u32, u32>> {
+    let mut map = BTreeMap::new();
+
+    for export in file
+        .exports()
+        .map_err(|e| Error::ParseError(e.to_string()))?
+    {
+        let Ok(name) = core::str::from_utf8(export.name()) else {
+            continue;
+        };
+        let Some(sysno) = Win32Sysno::from_export_name(name) else {
+            continue;
+        };
+
+        let addr = export.address();
+        let Some(section) = text_sections.iter().find(|section| {
+            section
+                .vaddr
+                .checked_add(section.size)
+                .is_some_and(|end| addr >= section.vaddr && addr < end)
+        }) else {
+            continue;
+        };
+        let section_data = section_slice(buf, section)?;
+        let stub_offset = usize::try_from(addr - section.vaddr)
+            .map_err(|_| Error::ParseError("export offset out of range".into()))?;
+        if let Some(build_sysno) = read_nt_stub_sysno(section_data, stub_offset) {
+            map.insert(build_sysno, sysno.as_raw());
+        }
     }
 
     Ok(map)
@@ -620,7 +662,7 @@ fn rewrite_nt_sysnos_in_sections(
     arch: Arch,
     buf: &mut [u8],
     text_sections: &[TextSectionInfo],
-    sysno_map: &BTreeMap<u32, NtSysno>,
+    sysno_map: &BTreeMap<u32, u32>,
     control_transfer_targets: &BTreeSet<u64>,
 ) -> Result<usize> {
     if sysno_map.is_empty() {
@@ -657,7 +699,7 @@ fn rewrite_nt_sysnos_in_section(
     arch: Arch,
     section_base_addr: u64,
     section_data: &mut [u8],
-    sysno_map: &BTreeMap<u32, NtSysno>,
+    sysno_map: &BTreeMap<u32, u32>,
     control_transfer_targets: &BTreeSet<u64>,
 ) -> Result<usize> {
     let instructions = decode_section_instructions(arch, section_data, section_base_addr)?;
@@ -706,7 +748,7 @@ fn rewrite_nt_sysnos_in_section(
                     let imm_start = imm_end
                         .checked_sub(4)
                         .ok_or_else(|| Error::ParseError("mov eax length < 4".into()))?;
-                    section_data[imm_start..imm_end].copy_from_slice(&sysno.as_raw().to_le_bytes());
+                    section_data[imm_start..imm_end].copy_from_slice(&sysno.to_le_bytes());
                     rewritten += 1;
                 }
                 break;
@@ -2944,7 +2986,7 @@ mod tests {
     fn rewrite_replaces_mov_eax_before_syscall() {
         let mut stub = nt_stub_bytes();
         let mut map = BTreeMap::new();
-        map.insert(NT_STUB_BUILD_SYSNO, NtSysno::NtTerminateProcess);
+        map.insert(NT_STUB_BUILD_SYSNO, NtSysno::NtTerminateProcess.as_raw());
         let targets = BTreeSet::new();
 
         let rewritten =
@@ -2957,6 +2999,20 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_replaces_win32u_service_with_disjoint_stable_sysno() {
+        let mut stub = nt_stub_bytes();
+        let mut map = BTreeMap::new();
+        map.insert(NT_STUB_BUILD_SYSNO, Win32Sysno::NtGdiInit2.as_raw());
+        let targets = BTreeSet::new();
+
+        let rewritten =
+            rewrite_nt_sysnos_in_section(Arch::X86_64, 0, &mut stub, &map, &targets).unwrap();
+        assert_eq!(rewritten, 1);
+        assert_eq!(&stub[4..8], &Win32Sysno::NtGdiInit2.as_raw().to_le_bytes(),);
+        assert!(NtSysno::from_raw(Win32Sysno::NtGdiInit2.as_raw() as usize).is_none());
+    }
+
+    #[test]
     fn rewrite_covers_zw_alias_with_same_build_sysno() {
         // Two stubs back-to-back sharing the same build-specific sysno, the way
         // ntdll's Nt* / Zw* pair often look when emitted as separate stubs.
@@ -2965,7 +3021,7 @@ mod tests {
         section.extend_from_slice(&nt_stub_bytes());
 
         let mut map = BTreeMap::new();
-        map.insert(NT_STUB_BUILD_SYSNO, NtSysno::NtTerminateProcess);
+        map.insert(NT_STUB_BUILD_SYSNO, NtSysno::NtTerminateProcess.as_raw());
         let targets = BTreeSet::new();
 
         let rewritten =
@@ -2982,7 +3038,7 @@ mod tests {
     #[test]
     fn rewrite_leaves_mov_eax_with_unknown_imm_alone() {
         let mut stub = nt_stub_bytes();
-        let map: BTreeMap<u32, NtSysno> = BTreeMap::new();
+        let map: BTreeMap<u32, u32> = BTreeMap::new();
         let targets = BTreeSet::new();
 
         let rewritten =
@@ -3003,7 +3059,7 @@ mod tests {
         ];
 
         let mut map = BTreeMap::new();
-        map.insert(NT_STUB_BUILD_SYSNO, NtSysno::NtTerminateProcess);
+        map.insert(NT_STUB_BUILD_SYSNO, NtSysno::NtTerminateProcess.as_raw());
         let targets = BTreeSet::new();
 
         let rewritten =
@@ -3024,7 +3080,7 @@ mod tests {
         ];
 
         let mut map = BTreeMap::new();
-        map.insert(NT_STUB_BUILD_SYSNO, NtSysno::NtTerminateProcess);
+        map.insert(NT_STUB_BUILD_SYSNO, NtSysno::NtTerminateProcess.as_raw());
         let targets = BTreeSet::new();
 
         let rewritten =
@@ -3045,7 +3101,7 @@ mod tests {
         ];
 
         let mut map = BTreeMap::new();
-        map.insert(NT_STUB_BUILD_SYSNO, NtSysno::NtTerminateProcess);
+        map.insert(NT_STUB_BUILD_SYSNO, NtSysno::NtTerminateProcess.as_raw());
         let mut targets = BTreeSet::new();
         targets.insert(syscall_offset);
 

@@ -30,7 +30,9 @@ mod fcall;
 
 pub mod transport;
 
-#[cfg(test)]
+// These tests drive a real `diod` 9P server (`apt install diod`) as an external process and read
+// results back through `std::os::unix`, so they only build and run on Linux hosts.
+#[cfg(all(test, target_os = "linux"))]
 mod tests;
 
 const DEVICE_ID: usize = u32::from_le_bytes(*b"NINE") as usize;
