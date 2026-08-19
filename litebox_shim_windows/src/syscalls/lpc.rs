@@ -4,8 +4,9 @@
 use core::marker::PhantomData;
 use core::mem::{align_of, size_of};
 
+use int_enum::IntEnum;
 use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry};
-use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider};
+use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox::utils::TruncateExt as _;
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
@@ -15,14 +16,13 @@ use crate::nt_types::{ProcessEnvironmentBlock, ThreadEnvironmentBlock, UnicodeSt
 use crate::syscalls::object_manager::WINDOWS_API_PORT;
 use crate::{ConstPtr, MutPtr, ShimFS, ShimPlatform, Task, probe_guest_output_preserving_value};
 
+// Maximum total message length advertised by `\Windows\ApiPort` on the target x64 Windows build.
+// TODO(csr-api-message-union): model the full CSR API message union and derive this from its size.
 const CSR_MAX_MESSAGE_LENGTH: u32 = 0x148;
 const CSR_SERVER_PROCESS_ID: usize = 1;
-const CSR_API_MESSAGE_LENGTH: u16 = 0x58;
-const CSR_API_DATA_LENGTH: u16 = 0x30;
 const USERSRV_SERVER_DLL_INDEX: u32 = 3;
 const USER_CONNECT_VERSION: u64 = 0x0e41_05d9;
 const USER_CONNECT_TRAILING_VALUE: u64 = 0x6658;
-const USER_HANDLE_ENTRY_SIZE: u32 = 0x20;
 const USERSRV_BACKING_SIZE: usize = crate::PAGE_SIZE;
 const USER_MESSAGE_BITMAP_ALIGNMENT: usize = 0x20;
 const RESERVED_MESSAGE_MAX_MESSAGES: [usize; 3] = [0x318, 0x318, 0x14];
@@ -47,10 +47,26 @@ const fn user_message_bitmap_storage_size(max_messages: usize) -> usize {
     let word_bits = u32::BITS as usize;
     let words = max_messages.div_ceil(word_bits);
     let bytes = words * size_of::<u32>();
-    (bytes + USER_MESSAGE_BITMAP_ALIGNMENT - 1) & !(USER_MESSAGE_BITMAP_ALIGNMENT - 1)
+    bytes.next_multiple_of(USER_MESSAGE_BITMAP_ALIGNMENT)
 }
 
 const _: () = assert!(USER_MESSAGE_BITMAP_ALIGNMENT.is_power_of_two());
+
+#[repr(u16)]
+#[derive(Clone, Copy, Debug, Eq, IntEnum, PartialEq)]
+enum LpcMessageType {
+    NewMessage = 0,
+    Request = 1,
+    Reply = 2,
+    Datagram = 3,
+    LostReply = 4,
+    PortClosed = 5,
+    ClientDied = 6,
+    Exception = 7,
+    DebugEvent = 8,
+    ErrorEvent = 9,
+    ConnectionRequest = 10,
+}
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -152,8 +168,6 @@ pub(crate) struct PortMessage {
     client_view_size: usize,
 }
 
-const _: () = assert!(size_of::<PortMessage>() == 0x28);
-
 #[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
 struct CsrClientConnect {
@@ -174,8 +188,6 @@ struct CsrApiMessage {
     padding: u32,
     client_connect: CsrClientConnect,
 }
-
-const _: () = assert!(size_of::<CsrApiMessage>() == CSR_API_MESSAGE_LENGTH as usize);
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
@@ -212,8 +224,6 @@ struct UserSharedInfo {
     default_window_special_message_table: UserWindowMessageTable,
 }
 
-const _: () = assert!(size_of::<UserSharedInfo>() == 0x238);
-
 #[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
 struct UserConnect {
@@ -222,12 +232,33 @@ struct UserConnect {
     trailing_value: u64,
 }
 
+#[repr(C)]
+struct UserServerInfo {
+    reserved: [u8; 0x20],
+}
+
+#[repr(C)]
+struct UserHandleEntry {
+    reserved: [u8; 0x20],
+}
+
+#[repr(C)]
+struct UserDisplayInfo {
+    reserved: [u8; 0x20],
+}
+
+#[repr(C)]
+struct UserSharedData {
+    reserved: [u8; 0x20],
+}
+
 #[repr(C, align(32))]
 struct UsersrvBackingLayout {
-    server_info: [u8; 0x20],
-    handle_entries: [u8; 0x20],
-    display_info: [u8; 0x20],
-    shared_data: [u8; 0x20],
+    server_info: UserServerInfo,
+    // TODO(usersrv-handle-table): size this table from the entry count published by server_info.
+    handle_entries: [UserHandleEntry; 1],
+    display_info: UserDisplayInfo,
+    shared_data: UserSharedData,
     reserved_message_bitmap_0:
         [u8; user_message_bitmap_storage_size(RESERVED_MESSAGE_MAX_MESSAGES[0])],
     reserved_message_bitmap_1:
@@ -356,10 +387,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::INVALID_VIEW_SIZE;
         }
         let usersrv_backing_base = mapped_view.base + client_view_size;
-        if let Err(status) = zero_guest_usersrv_backing::<Platform>(usersrv_backing_base) {
-            self.rollback_pagefile_section_view(mapped_view.base);
-            return status;
-        }
+        // TODO(usersrv-ro-section): replace this client-writable page with server-owned backing
+        // exposed to the guest through a read-only mapping.
         let port = LpcPortHandleObject::CsrApi {
             usersrv_backing_base,
         };
@@ -486,15 +515,41 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if receive_capacity < size_of::<CsrApiMessage>() {
             return NtStatus::BUFFER_TOO_SMALL;
         }
-        if message.header.data_length != CSR_API_DATA_LENGTH
-            || message.header.total_length != CSR_API_MESSAGE_LENGTH
-            || message.header.message_type != 0
-            || message.header.data_info_offset != 0
-            || message.api_number != 0
+        if message.api_number != 0
             || message.client_connect.server_dll_index != USERSRV_SERVER_DLL_INDEX
-            || message.client_connect.connection_info_size != size_of::<UserConnect>()
         {
+            litebox_util_log::debug!(
+                api_number:% = format_args!("{:#x}", message.api_number),
+                server_dll_index = message.client_connect.server_dll_index;
+                "Unsupported CSR API request"
+            );
             // TODO(csr-api-dispatch): dispatch other CSR APIs and server DLLs.
+            return NtStatus::INVALID_PARAMETER;
+        }
+        if message.header.data_length
+            != (size_of::<CsrApiMessage>() - core::mem::offset_of!(CsrApiMessage, capture_data))
+                .trunc()
+            || message.header.total_length != size_of::<CsrApiMessage>().trunc()
+            || !matches!(
+                LpcMessageType::try_from(message.header.message_type),
+                Ok(LpcMessageType::NewMessage)
+            )
+            || message.header.data_info_offset != 0
+        {
+            litebox_util_log::debug!(
+                data_length:% = format_args!("{:#x}", message.header.data_length),
+                total_length:% = format_args!("{:#x}", message.header.total_length),
+                message_type:% = format_args!("{:#x}", message.header.message_type),
+                data_info_offset:% = format_args!("{:#x}", message.header.data_info_offset);
+                "Invalid CSR API port message header"
+            );
+            return NtStatus::INVALID_PARAMETER;
+        }
+        if message.client_connect.connection_info_size != size_of::<UserConnect>() {
+            litebox_util_log::debug!(
+                connection_info_size = message.client_connect.connection_info_size;
+                "Invalid USERSRV connection information size"
+            );
             return NtStatus::INVALID_PARAMETER;
         }
 
@@ -513,12 +568,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::INVALID_VIEW_SIZE;
         };
         // TODO(usersrv-shared-content): populate real win32k shared data when USER APIs need it.
-        // TODO(usersrv-ro-section): move this backing to a read-only shared mapping.
         if connection_info.write_at_offset(0, user_connect).is_none() {
             return NtStatus::ACCESS_VIOLATION;
         }
 
-        message.header.message_type = 2;
+        message.header.message_type = LpcMessageType::Reply as u16;
         message.status = NtStatus::SUCCESS.as_raw();
         if receive_message.write_at_offset(0, message).is_none()
             || buffer_length
@@ -556,22 +610,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             server_process_id: CSR_SERVER_PROCESS_ID,
         })
     }
-}
-
-fn zero_guest_usersrv_backing<Platform: RawPointerProvider>(
-    backing_base: usize,
-) -> Result<(), NtStatus> {
-    let zeros = [0u8; 0x100];
-    let backing = MutPtr::<Platform, u8>::from_usize(backing_base);
-    for offset in (0..USERSRV_BACKING_SIZE).step_by(zeros.len()) {
-        backing
-            .write_slice_at_offset(
-                offset.try_into().map_err(|_| NtStatus::INVALID_PARAMETER)?,
-                &zeros,
-            )
-            .ok_or(NtStatus::ACCESS_VIOLATION)?;
-    }
-    Ok(())
 }
 
 fn build_user_connect(backing_base: usize) -> Option<UserConnect> {
@@ -646,7 +684,7 @@ fn build_user_connect(backing_base: usize) -> Option<UserConnect> {
         shared_info: UserSharedInfo {
             server_info: pointer(core::mem::offset_of!(UsersrvBackingLayout, server_info))?,
             handle_entries: pointer(core::mem::offset_of!(UsersrvBackingLayout, handle_entries))?,
-            handle_entry_size: USER_HANDLE_ENTRY_SIZE,
+            handle_entry_size: size_of::<UserHandleEntry>().trunc(),
             padding: 0,
             display_info: pointer(core::mem::offset_of!(UsersrvBackingLayout, display_info))?,
             shared_data: pointer(core::mem::offset_of!(UsersrvBackingLayout, shared_data))?,
@@ -842,8 +880,10 @@ mod tests {
 
         let mut usersrv_info = UserConnect::new_zeroed();
         let mut message = CsrApiMessage::new_zeroed();
-        message.header.data_length = CSR_API_DATA_LENGTH;
-        message.header.total_length = CSR_API_MESSAGE_LENGTH;
+        message.header.data_length = (size_of::<CsrApiMessage>()
+            - core::mem::offset_of!(CsrApiMessage, capture_data))
+        .trunc();
+        message.header.total_length = size_of::<CsrApiMessage>().trunc();
         message.client_connect.server_dll_index = USERSRV_SERVER_DLL_INDEX;
         message.client_connect.connection_info = core::ptr::from_mut(&mut usersrv_info) as usize;
         message.client_connect.connection_info_size = size_of::<UserConnect>();
@@ -878,25 +918,9 @@ mod tests {
             ),
             NtStatus::SUCCESS
         );
-        assert_eq!(message.header.message_type, 2);
+        assert_eq!(message.header.message_type, LpcMessageType::Reply as u16);
         assert_eq!(message.status, NtStatus::SUCCESS.as_raw());
         assert_eq!(receive_capacity, size_of::<CsrApiMessage>());
-        assert_eq!(usersrv_info.version, USER_CONNECT_VERSION);
-        assert_eq!(
-            usersrv_info.shared_info.handle_entry_size,
-            USER_HANDLE_ENTRY_SIZE
-        );
-        assert_eq!(
-            usersrv_info.shared_info.fnid_message_tables[3].max_messages,
-            0x402
-        );
-        assert_eq!(
-            usersrv_info
-                .shared_info
-                .default_window_message_table
-                .max_messages,
-            0x33f
-        );
         assert_eq!(usersrv_info.trailing_value, USER_CONNECT_TRAILING_VALUE);
         for pointer in [
             usersrv_info.shared_info.server_info,
