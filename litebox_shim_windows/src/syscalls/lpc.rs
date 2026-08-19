@@ -464,6 +464,9 @@ struct ActivationContextBlob {
 const _: () = assert!(size_of::<ActivationContextAssemblyInformation>() == 0x6c);
 const _: () = assert!(size_of::<ActivationContextAssemblySection>() == 0x300);
 const _: () = assert!(size_of::<ActivationContextBlob>() == 0x47c);
+// The blob is written into the BASESRV backing page; guarantee it fits so a future
+// blob or PAGE_SIZE change cannot silently spill into the adjacent USERSRV backing.
+const _: () = assert!(size_of::<ActivationContextBlob>() <= BASESRV_BACKING_SIZE);
 
 #[expect(
     clippy::cast_possible_truncation,
