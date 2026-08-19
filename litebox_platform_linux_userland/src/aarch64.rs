@@ -14,7 +14,7 @@ use litebox_syscall_rewriter::aarch64::{
 #[cfg(feature = "aarch64_virtualize_x18")]
 use litebox_syscall_rewriter::aarch64::{
     X18_FRAME_BYTES, X18AdrOffset, X18CompareBranchOffset, X18FrameState, X18GateOffset, X18Resume,
-    X18SlotAccess, X18ValueSource,
+    X18ValueSource,
 };
 
 /// Overwrites the destination with the TLS control-block address derived from
@@ -1520,8 +1520,8 @@ fn canonicalize_aarch64_gate_signal_context_with_kind(
             let Some(plan) = stage.recovery_plan() else {
                 return Aarch64GateSignalResult::InvalidRuntimeState;
             };
-            if interruption == GateInterruption::Synchronous
-                && plan.slot_access != X18SlotAccess::None
+            if plan.runtime_access == RuntimeAccess::Memory
+                && interruption == GateInterruption::Synchronous
             {
                 return Aarch64GateSignalResult::InvalidRuntimeState;
             }
@@ -1561,8 +1561,8 @@ fn canonicalize_aarch64_gate_signal_context_with_kind(
             let Some(plan) = stage.recovery_plan() else {
                 return Aarch64GateSignalResult::InvalidRuntimeState;
             };
-            if interruption == GateInterruption::Synchronous
-                && plan.slot_access != X18SlotAccess::None
+            if plan.runtime_access == RuntimeAccess::Memory
+                && interruption == GateInterruption::Synchronous
             {
                 return Aarch64GateSignalResult::InvalidRuntimeState;
             }
@@ -1606,8 +1606,8 @@ fn canonicalize_aarch64_gate_signal_context_with_kind(
             let Some(plan) = stage.recovery_plan() else {
                 return Aarch64GateSignalResult::InvalidRuntimeState;
             };
-            if interruption == GateInterruption::Synchronous
-                && plan.slot_access != X18SlotAccess::None
+            if plan.runtime_access == RuntimeAccess::Memory
+                && interruption == GateInterruption::Synchronous
             {
                 return Aarch64GateSignalResult::InvalidRuntimeState;
             }

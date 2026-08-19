@@ -970,6 +970,13 @@ const GUEST_X18_OFFSET_PLACEHOLDER: u16 = MAX_GUEST_TPIDR_OFFSET - 8;
 pub const X18_FRAME_BYTES: u16 = 16;
 const X18_FRAME_OFF_SCRATCHES: u16 = 0;
 
+/// Whether a synchronous fault at a boundary is attributable to runtime state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeAccess {
+    NoAccess,
+    Memory,
+}
+
 /// Location of guest scratch state at an emitted x18 instruction boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum X18FrameState {
@@ -994,21 +1001,13 @@ pub enum X18Resume {
     TakenTarget,
 }
 
-/// Runtime-owned x18-slot access at an emitted instruction boundary.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum X18SlotAccess {
-    None,
-    Load,
-    Store,
-}
-
 /// Host-neutral recovery semantics derived from an emitted x18 gate boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct X18RecoveryPlan {
     pub frame: X18FrameState,
     pub value: X18ValueSource,
     pub resume: X18Resume,
-    pub slot_access: X18SlotAccess,
+    pub runtime_access: RuntimeAccess,
 }
 
 impl X18RecoveryPlan {
@@ -1016,13 +1015,13 @@ impl X18RecoveryPlan {
         frame: X18FrameState,
         value: X18ValueSource,
         resume: X18Resume,
-        slot_access: X18SlotAccess,
+        runtime_access: RuntimeAccess,
     ) -> Self {
         Self {
             frame,
             value,
             resume,
-            slot_access,
+            runtime_access,
         }
     }
 }
@@ -1083,36 +1082,34 @@ impl X18GateOffset {
 
     /// Returns the recovery semantics for this emitted instruction boundary.
     pub const fn recovery_plan(self) -> Option<X18RecoveryPlan> {
+        use RuntimeAccess::{Memory, NoAccess};
         use X18FrameState::{
             Absent, AtSpRegistersLive, AtSpRestoreRegisters, BelowSpRestoreRegisters,
         };
         use X18Resume::{Next, Original};
-        use X18SlotAccess::{Load, None as NoSlotAccess, Store};
         use X18ValueSource::{Scratch, Slot};
 
         Some(match self {
-            Self::Entry => X18RecoveryPlan::new(Absent, Slot, Original, NoSlotAccess),
-            Self::FirstAnchor => {
-                X18RecoveryPlan::new(AtSpRegistersLive, Slot, Original, NoSlotAccess)
-            }
-            Self::SlotLoad => X18RecoveryPlan::new(AtSpRestoreRegisters, Slot, Original, Load),
+            Self::Entry => X18RecoveryPlan::new(Absent, Slot, Original, NoAccess),
+            Self::FirstAnchor => X18RecoveryPlan::new(AtSpRegistersLive, Slot, Original, NoAccess),
+            Self::SlotLoad => X18RecoveryPlan::new(AtSpRestoreRegisters, Slot, Original, Memory),
             Self::FrameAddress | Self::FirstPop => {
-                X18RecoveryPlan::new(AtSpRestoreRegisters, Slot, Original, NoSlotAccess)
+                X18RecoveryPlan::new(AtSpRestoreRegisters, Slot, Original, NoAccess)
             }
             Self::Transform => {
-                X18RecoveryPlan::new(BelowSpRestoreRegisters, Slot, Original, NoSlotAccess)
+                X18RecoveryPlan::new(BelowSpRestoreRegisters, Slot, Original, NoAccess)
             }
             Self::RestoreSp => {
-                X18RecoveryPlan::new(BelowSpRestoreRegisters, Scratch, Next, NoSlotAccess)
+                X18RecoveryPlan::new(BelowSpRestoreRegisters, Scratch, Next, NoAccess)
             }
             Self::SecondAnchor => {
-                X18RecoveryPlan::new(AtSpRestoreRegisters, Scratch, Next, NoSlotAccess)
+                X18RecoveryPlan::new(AtSpRestoreRegisters, Scratch, Next, NoAccess)
             }
-            Self::SlotStore => X18RecoveryPlan::new(AtSpRestoreRegisters, Scratch, Next, Store),
+            Self::SlotStore => X18RecoveryPlan::new(AtSpRestoreRegisters, Scratch, Next, Memory),
             Self::RestoreRegisters => {
-                X18RecoveryPlan::new(AtSpRestoreRegisters, Slot, Next, NoSlotAccess)
+                X18RecoveryPlan::new(AtSpRestoreRegisters, Slot, Next, NoAccess)
             }
-            Self::Return => X18RecoveryPlan::new(Absent, Slot, Next, NoSlotAccess),
+            Self::Return => X18RecoveryPlan::new(Absent, Slot, Next, NoAccess),
             Self::ExecutableEnd => return None,
         })
     }
@@ -1173,32 +1170,28 @@ impl X18CompareBranchOffset {
 
     /// Returns the recovery semantics for this emitted instruction boundary.
     pub const fn recovery_plan(self) -> Option<X18RecoveryPlan> {
+        use RuntimeAccess::{Memory, NoAccess};
         use X18FrameState::{Absent, AtSpRegistersLive, AtSpRestoreRegisters};
         use X18Resume::{Next, Original, TakenTarget};
-        use X18SlotAccess::{Load, None as NoSlotAccess};
         use X18ValueSource::Slot;
 
         Some(match self {
-            Self::Entry => X18RecoveryPlan::new(Absent, Slot, Original, NoSlotAccess),
-            Self::Spill => X18RecoveryPlan::new(AtSpRegistersLive, Slot, Original, NoSlotAccess),
+            Self::Entry => X18RecoveryPlan::new(Absent, Slot, Original, NoAccess),
+            Self::Spill => X18RecoveryPlan::new(AtSpRegistersLive, Slot, Original, NoAccess),
             Self::Anchor | Self::Test => {
-                X18RecoveryPlan::new(AtSpRestoreRegisters, Slot, Original, NoSlotAccess)
+                X18RecoveryPlan::new(AtSpRestoreRegisters, Slot, Original, NoAccess)
             }
-            Self::SlotLoad => X18RecoveryPlan::new(AtSpRestoreRegisters, Slot, Original, Load),
+            Self::SlotLoad => X18RecoveryPlan::new(AtSpRestoreRegisters, Slot, Original, Memory),
             Self::FallthroughRestore => {
-                X18RecoveryPlan::new(AtSpRestoreRegisters, Slot, Next, NoSlotAccess)
+                X18RecoveryPlan::new(AtSpRestoreRegisters, Slot, Next, NoAccess)
             }
-            Self::FallthroughPop => {
-                X18RecoveryPlan::new(AtSpRegistersLive, Slot, Next, NoSlotAccess)
-            }
-            Self::FallthroughBranch => X18RecoveryPlan::new(Absent, Slot, Next, NoSlotAccess),
+            Self::FallthroughPop => X18RecoveryPlan::new(AtSpRegistersLive, Slot, Next, NoAccess),
+            Self::FallthroughBranch => X18RecoveryPlan::new(Absent, Slot, Next, NoAccess),
             Self::TakenRestore => {
-                X18RecoveryPlan::new(AtSpRestoreRegisters, Slot, TakenTarget, NoSlotAccess)
+                X18RecoveryPlan::new(AtSpRestoreRegisters, Slot, TakenTarget, NoAccess)
             }
-            Self::TakenPop => {
-                X18RecoveryPlan::new(AtSpRegistersLive, Slot, TakenTarget, NoSlotAccess)
-            }
-            Self::TakenBranch => X18RecoveryPlan::new(Absent, Slot, TakenTarget, NoSlotAccess),
+            Self::TakenPop => X18RecoveryPlan::new(AtSpRegistersLive, Slot, TakenTarget, NoAccess),
+            Self::TakenBranch => X18RecoveryPlan::new(Absent, Slot, TakenTarget, NoAccess),
             Self::ExecutableEnd => return None,
         })
     }
@@ -1247,20 +1240,20 @@ impl X18AdrOffset {
 
     /// Returns the recovery semantics for this emitted instruction boundary.
     pub const fn recovery_plan(self) -> Option<X18RecoveryPlan> {
+        use RuntimeAccess::{Memory, NoAccess};
         use X18FrameState::{Absent, AtSpRegistersLive, AtSpRestoreRegisters};
         use X18Resume::{Next, Original};
-        use X18SlotAccess::{None as NoSlotAccess, Store};
         use X18ValueSource::{Scratch, Slot};
 
         Some(match self {
-            Self::Entry => X18RecoveryPlan::new(Absent, Slot, Original, NoSlotAccess),
-            Self::Anchor => X18RecoveryPlan::new(AtSpRegistersLive, Slot, Original, NoSlotAccess),
+            Self::Entry => X18RecoveryPlan::new(Absent, Slot, Original, NoAccess),
+            Self::Anchor => X18RecoveryPlan::new(AtSpRegistersLive, Slot, Original, NoAccess),
             Self::Adrp | Self::Add => {
-                X18RecoveryPlan::new(AtSpRestoreRegisters, Slot, Original, NoSlotAccess)
+                X18RecoveryPlan::new(AtSpRestoreRegisters, Slot, Original, NoAccess)
             }
-            Self::SlotStore => X18RecoveryPlan::new(AtSpRestoreRegisters, Scratch, Next, Store),
-            Self::Restore => X18RecoveryPlan::new(AtSpRestoreRegisters, Slot, Next, NoSlotAccess),
-            Self::Return => X18RecoveryPlan::new(Absent, Slot, Next, NoSlotAccess),
+            Self::SlotStore => X18RecoveryPlan::new(AtSpRestoreRegisters, Scratch, Next, Memory),
+            Self::Restore => X18RecoveryPlan::new(AtSpRestoreRegisters, Slot, Next, NoAccess),
+            Self::Return => X18RecoveryPlan::new(Absent, Slot, Next, NoAccess),
             Self::ExecutableEnd => return None,
         })
     }
@@ -1285,13 +1278,6 @@ pub const SVC_FRAME_OFF_RETADDR: u16 = 8;
 /// Address of this site's outbound stub. ABI: the runtime's syscall callback
 /// branches here to resume at the original syscall site.
 pub const SVC_FRAME_OFF_STUB: u16 = 16;
-
-/// Whether a synchronous fault at a boundary is attributable to runtime state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RuntimeAccess {
-    NoAccess,
-    Memory,
-}
 
 /// Source of the guest-visible MRS destination value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
