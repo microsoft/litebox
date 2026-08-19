@@ -3174,6 +3174,107 @@ mod tests {
         });
     }
 
+    #[test]
+    fn nt_read_file_reports_partial_transfer_after_later_chunk_error() {
+        run_with_test_platform_pointers(|| {
+            let task = crate::tests::test_task();
+            let length = NT_READ_FILE_CHUNK_SIZE * 2;
+            let data: std::vec::Vec<u8> = (0..length)
+                .map(|i| u8::try_from(i % 251).unwrap())
+                .collect();
+            create_existing_file(&task, "/tmp/read-partial.txt", &data);
+            let (status, handle, _) =
+                create_file(&task, "/tmp/read-partial.txt", FILE_GENERIC_READ, FILE_OPEN);
+            assert_eq!(status, NtStatus::SUCCESS);
+
+            let mut allocation_base = 0;
+            let mut allocation_size = length;
+            assert_eq!(
+                task.sys_nt_allocate_virtual_memory(
+                    crate::syscalls::ProcessHandle::CURRENT,
+                    mut_ptr(&mut allocation_base),
+                    0,
+                    mut_ptr(&mut allocation_size),
+                    (AllocationType::MEM_RESERVE | AllocationType::MEM_COMMIT).bits(),
+                    PageProtection::PAGE_READWRITE.bits(),
+                ),
+                NtStatus::SUCCESS
+            );
+            let output = MutPtr::<TestPlatform, u8>::from_usize(allocation_base);
+            assert_eq!(
+                output.copy_from_slice(0, &std::vec![0xa5; length]),
+                Some(())
+            );
+
+            task.fs.inject_read_error_after(1);
+            let mut io_status = IoStatusBlock::new(NtStatus::UNSUCCESSFUL, usize::MAX);
+            assert_eq!(
+                task.sys_nt_read_file(
+                    handle,
+                    Handle::default(),
+                    None,
+                    None,
+                    mut_ptr(&mut io_status),
+                    output,
+                    length.try_into().unwrap(),
+                    None,
+                    None,
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(io_status.status, NtStatus::SUCCESS.as_raw());
+            assert_eq!(io_status.information, NT_READ_FILE_CHUNK_SIZE);
+
+            let mut readback = std::vec![0u8; length];
+            assert_eq!(
+                ConstPtr::<TestPlatform, u8>::from_usize(allocation_base)
+                    .copy_to_slice(0, &mut readback),
+                Some(())
+            );
+            assert_eq!(
+                &readback[..NT_READ_FILE_CHUNK_SIZE],
+                &data[..NT_READ_FILE_CHUNK_SIZE]
+            );
+            assert_eq!(
+                &readback[NT_READ_FILE_CHUNK_SIZE..],
+                &std::vec![0xa5; NT_READ_FILE_CHUNK_SIZE]
+            );
+
+            let mut next = [0u8; 16];
+            assert_eq!(
+                task.sys_nt_read_file(
+                    handle,
+                    Handle::default(),
+                    None,
+                    None,
+                    mut_ptr(&mut io_status),
+                    mut_byte_ptr(&mut next),
+                    next.len().try_into().unwrap(),
+                    None,
+                    None,
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(
+                next,
+                data[NT_READ_FILE_CHUNK_SIZE..NT_READ_FILE_CHUNK_SIZE + next.len()]
+            );
+
+            let mut release_base = allocation_base;
+            let mut release_size = 0;
+            assert_eq!(
+                task.sys_nt_free_virtual_memory(
+                    crate::syscalls::ProcessHandle::CURRENT,
+                    mut_ptr(&mut release_base),
+                    mut_ptr(&mut release_size),
+                    FreeType::MEM_RELEASE.bits(),
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
+        });
+    }
+
     fn open_fs_root(task: &Task<TestPlatform, TestFS>) -> Handle {
         let (_path, _name, attributes) = open_object_attributes("/");
         let mut handle = Handle::default();
