@@ -1528,4 +1528,157 @@ mod tests {
         assert_eq!(message.status, NtStatus::SUCCESS.as_raw());
         assert_eq!(receive_capacity, size_of::<CsrApiMessage>());
     }
+
+    #[test]
+    fn basesrv_create_activation_context2_materializes_blob_and_replies() {
+        const BUFFER_LEN: usize = BASESRV_CREATE_ACTIVATION_CONTEXT2_MESSAGE_LENGTH as usize;
+        // Native ntdll overlays the SxS request onto the CSR message starting at this offset;
+        // `capture_data` (0x28) and `api_number` (0x30) sit below it and stay intact.
+        const REQUEST_OFFSET: usize = 0x40;
+        const AMD64_PROCESSOR_ARCHITECTURE: u16 = 9;
+        const ACTIVATION_CONTEXT_HEADER_MAGIC: u32 = 0x7874_6341;
+
+        let mut peb = ProcessEnvironmentBlock::new_zeroed();
+        peb.read_only_shared_memory_base = 0x7000_0000;
+        peb.read_only_static_server_data = 0x7000_1000;
+        peb.csr_server_read_only_shared_memory_base = 0x7100_0000;
+        let task = task_with_peb(&mut peb);
+        let (_name_units, name) = api_port_name(WINDOWS_API_PORT);
+        let qos = security_qos();
+        let section_handle = create_client_section(&task, SECTION_MAP_READ | SECTION_MAP_WRITE);
+        let mut handle = Handle::default();
+        let mut client_view = PortView {
+            length: size_of::<PortView>().trunc(),
+            padding: 0,
+            section_handle,
+            section_offset: 0,
+            view_size: crate::PAGE_SIZE * 3,
+            view_base: 0,
+            view_remote_base: 0,
+        };
+        let mut max_message_length = 0u32;
+        let mut connection_info = empty_connect_info();
+        let mut connection_info_len = size_of::<CsrApiConnectInfo>().trunc();
+        assert_eq!(
+            task.sys_nt_connect_port(ConnectPortParameters {
+                port_handle: mut_ptr(&mut handle),
+                port_name: const_ptr(&name),
+                security_qos: const_ptr(&qos),
+                client_view: Some(mut_ptr(&mut client_view)),
+                server_view: None,
+                max_message_length: Some(mut_ptr(&mut max_message_length)),
+                connection_information: Some(mut_byte_ptr(&mut connection_info)),
+                connection_information_length: Some(mut_ptr(&mut connection_info_len)),
+            }),
+            NtStatus::SUCCESS
+        );
+
+        // Guest-visible slot into which the server writes the activation-context data pointer.
+        let mut activation_context_data_out = 0usize;
+
+        let mut request = BaseSxsCreateActivationContextMessageV2::new_zeroed();
+        request.flags = BaseMsgSxsFlags::MANIFEST_PRESENT.bits();
+        request.processor_architecture = AMD64_PROCESSOR_ARCHITECTURE;
+        request.activation_context_data =
+            core::ptr::from_mut(&mut activation_context_data_out) as usize;
+        request.activation_context_data_wow64 = 0;
+        request.run_level.run_level = 3;
+        request.run_level.ui_access = 0;
+
+        // A well-formed four-pointer capture buffer; every offset stays within the message.
+        let capture = CsrCaptureBufferFourPointers {
+            length: 0x100,
+            padding_0: 0,
+            related_capture_buffer: 0,
+            count_message_pointers: 4,
+            padding_1: 0,
+            free_space: 0,
+            message_pointer_offsets: [0x40, 0x48, 0x50, 0x58],
+        };
+
+        let build_message =
+            |capture_ptr: usize, request: &BaseSxsCreateActivationContextMessageV2| {
+                let mut header = CsrApiMessage::new_zeroed();
+                header.header.data_length = BASESRV_CREATE_ACTIVATION_CONTEXT2_DATA_LENGTH;
+                header.header.total_length = BASESRV_CREATE_ACTIVATION_CONTEXT2_MESSAGE_LENGTH;
+                header.header.message_type = 0;
+                header.header.data_info_offset = 0;
+                header.api_number = BASESRV_CREATE_ACTIVATION_CONTEXT2_API;
+                header.capture_data = capture_ptr;
+                let mut buffer = [0u8; BUFFER_LEN];
+                buffer[..size_of::<CsrApiMessage>()].copy_from_slice(header.as_bytes());
+                buffer[REQUEST_OFFSET..].copy_from_slice(request.as_bytes());
+                buffer
+            };
+
+        let send = |buffer: &mut [u8; BUFFER_LEN], receive_capacity: &mut usize| {
+            task.sys_nt_alpc_send_wait_receive_port(
+                handle,
+                AlpcMessageFlags::SYNC_REQUEST,
+                mut_byte_ptr(buffer),
+                None,
+                mut_byte_ptr(buffer),
+                mut_ptr(receive_capacity),
+                None,
+                None,
+            )
+        };
+
+        let capture_ptr = core::ptr::from_ref(&capture) as usize;
+
+        // Happy path: the request is accepted, the blob is materialised, and the reply is fixed up.
+        let mut buffer = build_message(capture_ptr, &request);
+        let mut receive_capacity = BUFFER_LEN;
+        assert_eq!(send(&mut buffer, &mut receive_capacity), NtStatus::SUCCESS);
+
+        let reply = ConstPtr::<TestPlatform, CsrApiMessage>::from_usize(
+            core::ptr::from_ref(&buffer) as usize,
+        )
+        .read_at_offset(0)
+        .expect("reply message is readable");
+        assert_eq!(reply.header.message_type, 2);
+        assert_eq!(reply.status, NtStatus::SUCCESS.as_raw());
+        assert_eq!(receive_capacity, BUFFER_LEN);
+
+        // The server returns the guest address of the freshly materialised activation-context blob.
+        assert_ne!(activation_context_data_out, 0);
+        let blob = ConstPtr::<TestPlatform, ActivationContextData>::from_usize(
+            activation_context_data_out,
+        )
+        .read_at_offset(0)
+        .expect("activation-context blob header is readable");
+        assert_eq!(blob.magic, ACTIVATION_CONTEXT_HEADER_MAGIC);
+        assert_eq!(blob.header_size, size_of::<ActivationContextData>().trunc());
+        assert_eq!(blob.total_size, size_of::<ActivationContextBlob>().trunc());
+
+        // Contract negatives: each malformed field is rejected with INVALID_PARAMETER.
+        let mut wrong_arch = request;
+        wrong_arch.processor_architecture = 0;
+        let mut buffer = build_message(capture_ptr, &wrong_arch);
+        let mut receive_capacity = BUFFER_LEN;
+        assert_eq!(
+            send(&mut buffer, &mut receive_capacity),
+            NtStatus::INVALID_PARAMETER
+        );
+
+        let mut no_manifest = request;
+        no_manifest.flags = 0;
+        let mut buffer = build_message(capture_ptr, &no_manifest);
+        let mut receive_capacity = BUFFER_LEN;
+        assert_eq!(
+            send(&mut buffer, &mut receive_capacity),
+            NtStatus::INVALID_PARAMETER
+        );
+
+        let bad_capture = CsrCaptureBufferFourPointers {
+            count_message_pointers: 3,
+            ..capture
+        };
+        let mut buffer = build_message(core::ptr::from_ref(&bad_capture) as usize, &request);
+        let mut receive_capacity = BUFFER_LEN;
+        assert_eq!(
+            send(&mut buffer, &mut receive_capacity),
+            NtStatus::INVALID_PARAMETER
+        );
+    }
 }
