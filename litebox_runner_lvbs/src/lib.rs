@@ -1341,8 +1341,7 @@ fn write_rpc_args_to_normal_world(
 
 // use include_bytes! to include ldelf
 const LDELF_BINARY: &[u8] = &[0u8; 0];
-const TA_BINARY: &[u8] = &[0u8; 0];
-const TA_BINARIES: &[&[u8]] = &[TA_BINARY];
+const TA_BINARIES: &[&[u8]] = &[];
 
 /// Register a TA binary embedded in the runner image.
 fn register_embedded_ta(shim: &litebox_shim_optee::OpteeShim, ta_binary: &'static [u8]) -> bool {
