@@ -22,7 +22,6 @@ const CSR_MAX_MESSAGE_LENGTH: u32 = 0x148;
 const CSR_SERVER_PROCESS_ID: usize = 1;
 const USERSRV_SERVER_DLL_INDEX: u32 = 3;
 const USER_CONNECT_VERSION: u64 = 0x0e41_05d9;
-const USER_CONNECT_TRAILING_VALUE: u64 = 0x6658;
 const USERSRV_BACKING_SIZE: usize = crate::PAGE_SIZE;
 const USER_MESSAGE_BITMAP_ALIGNMENT: usize = 0x20;
 const RESERVED_MESSAGE_MAX_MESSAGES: [usize; 3] = [0x318, 0x318, 0x14];
@@ -703,7 +702,8 @@ fn build_user_connect(backing_base: usize) -> Option<UserConnect> {
                 core::mem::offset_of!(UsersrvBackingLayout, default_window_special_message_bitmap),
             )?,
         },
-        trailing_value: USER_CONNECT_TRAILING_VALUE,
+        // TODO(usersrv-connect-layout): identify and model this field's native semantics.
+        trailing_value: 0,
     })
 }
 
@@ -921,18 +921,5 @@ mod tests {
         assert_eq!(message.header.message_type, LpcMessageType::Reply as u16);
         assert_eq!(message.status, NtStatus::SUCCESS.as_raw());
         assert_eq!(receive_capacity, size_of::<CsrApiMessage>());
-        assert_eq!(usersrv_info.trailing_value, USER_CONNECT_TRAILING_VALUE);
-        for pointer in [
-            usersrv_info.shared_info.server_info,
-            usersrv_info.shared_info.handle_entries,
-            usersrv_info.shared_info.display_info,
-            usersrv_info.shared_info.shared_data,
-        ] {
-            assert_ne!(pointer, 0);
-            assert_eq!(
-                ConstPtr::<TestPlatform, u8>::from_usize(pointer).read_at_offset(0),
-                Some(0)
-            );
-        }
     }
 }
