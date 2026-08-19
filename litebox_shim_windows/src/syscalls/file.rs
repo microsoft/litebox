@@ -1724,16 +1724,20 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             while total_read < output_length {
                 let chunk_length = (output_length - total_read).min(bytes.len());
                 let chunk_offset = offset.map(|offset| offset + total_read);
-                let read = match &file.backing {
+                let (read, continue_after_full_chunk) = match &file.backing {
                     FileObjectBacking::Filesystem { fd, is_directory } => {
                         if *is_directory {
                             return Err(ReadError::NotAFile);
                         }
-                        self.fs.read(fd, &mut bytes[..chunk_length], chunk_offset)?
+                        (
+                            self.fs.read(fd, &mut bytes[..chunk_length], chunk_offset)?,
+                            true,
+                        )
                     }
-                    FileObjectBacking::CondrvStream { fd, .. } => {
-                        self.fs.read(fd, &mut bytes[..chunk_length], chunk_offset)?
-                    }
+                    FileObjectBacking::CondrvStream { fd, .. } => (
+                        self.fs.read(fd, &mut bytes[..chunk_length], chunk_offset)?,
+                        false,
+                    ),
                     FileObjectBacking::CondrvControl(_) | FileObjectBacking::KsecDevice => {
                         return Err(ReadError::NotAFile);
                     }
@@ -1746,7 +1750,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     return Err(ReadError::Io);
                 }
                 total_read += read;
-                if read < chunk_length {
+                if read < chunk_length || !continue_after_full_chunk {
                     break;
                 }
             }
