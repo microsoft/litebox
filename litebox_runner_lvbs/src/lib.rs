@@ -5,7 +5,6 @@
 
 extern crate alloc;
 
-use alloc::{boxed::Box, vec};
 use core::{ops::Neg, panic::PanicInfo};
 use litebox::{
     mm::linux::PAGE_SIZE,
@@ -44,6 +43,7 @@ use litebox_shim_optee::msg_handler::{
 };
 use litebox_shim_optee::session::{OpenSessionTarget, TaInstance, session_manager};
 use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr, UserConstPtr};
+use zerocopy::FromZeros as _;
 
 /// Seed the initial heap regions so the global allocator has enough memory
 /// for slab-backed allocations (the slab needs >= 2 MB backing pages).
@@ -806,13 +806,18 @@ fn open_session_new_instance(
         let _ = unsafe { delete_task_page_table(task_pt_id) };
     })?;
 
-    // Load ldelf and TA - Box immediately to keep at fixed heap address
-    let loaded_program = Box::new(shim.load_ldelf(LDELF_BINARY, ta_uuid).map_err(|_| {
+    let loaded_program = shim.load_ldelf(LDELF_BINARY, ta_uuid).map_err(|_| {
         // Safety: We are about to tear down this TA instance;
         // no references to user-space memory will be held afterwards.
         unsafe { teardown_ta_page_table(&shim, task_pt_id) };
         OpteeSmcReturnCode::ENomem
-    })?);
+    })?;
+    let loaded_program = litebox_common_lvbs::try_box(loaded_program)
+        .map_err(|_| OpteeSmcReturnCode::ENomem)
+        .inspect_err(|_| {
+            // Safety: No TA user-space references have been created yet.
+            unsafe { teardown_ta_page_table(&shim, task_pt_id) };
+        })?;
 
     let ta_flags = loaded_program.ta_flags;
 
@@ -1277,7 +1282,7 @@ fn write_msg_args_to_normal_world(
     )?;
 
     let msg_args_size = optee_msg_args_total_size(msg_args.num_params);
-    let mut blob = vec![0u8; msg_args_size];
+    let mut blob = u8::new_vec_zeroed(msg_args_size).map_err(|_| OpteeSmcReturnCode::ENomem)?;
     msg_args.serialize(&mut blob)?;
 
     let ptr = NormalWorldMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
@@ -1301,7 +1306,7 @@ fn write_non_ta_msg_args_to_normal_world(
     msg_args_phys_addr: u64,
 ) -> Result<(), OpteeSmcReturnCode> {
     let msg_args_size = optee_msg_args_total_size(msg_args.num_params);
-    let mut blob = vec![0u8; msg_args_size];
+    let mut blob = u8::new_vec_zeroed(msg_args_size).map_err(|_| OpteeSmcReturnCode::ENomem)?;
     msg_args.serialize(&mut blob)?;
 
     let ptr = NormalWorldMutPtr::<u8, PAGE_SIZE>::with_contiguous_pages(
@@ -1328,7 +1333,7 @@ fn write_rpc_args_to_normal_world(
     let msg_args_size = optee_msg_args_total_size(msg_args.num_params);
 
     let rpc_args_size = optee_msg_args_total_size(rpc_args.num_params);
-    let mut blob = vec![0u8; rpc_args_size];
+    let mut blob = u8::new_vec_zeroed(rpc_args_size).map_err(|_| OpteeSmcReturnCode::ENomem)?;
     rpc_args.serialize(&mut blob)?;
 
     let rpc_pa: usize = <u64 as litebox::utils::TruncateExt<usize>>::trunc(msg_args_phys_addr)

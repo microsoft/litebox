@@ -28,8 +28,7 @@ use litebox_common_optee::{
     TeeOrigin, TeeParamType, TeeResult, TeeUuid, UteeEntryFunc, UteeParamOwned, UteeParams,
     optee_msg_args_total_size,
 };
-use once_cell::race::OnceBox;
-use zerocopy::{FromBytes, Immutable};
+use zerocopy::{FromBytes, FromZeros as _, Immutable};
 
 // OP-TEE version and build info (2.0)
 // TODO: Consider replacing it with our own version info
@@ -65,6 +64,10 @@ const MAX_NOTIF_VALUE: usize = 0;
 /// Subject to change if the memory budget increases.
 const MAX_SHM_MEMREF_SIZE: usize = 8 * 1024 * 1024;
 const MAX_SHM_REF_MAP_ENTRIES: usize = 1024;
+
+fn allocate_zeroed_vec(len: usize) -> Result<Vec<u8>, OpteeSmcReturnCode> {
+    u8::new_vec_zeroed(len).map_err(|_| OpteeSmcReturnCode::ENomem)
+}
 
 #[inline]
 fn page_align_down(address: u64) -> u64 {
@@ -117,12 +120,16 @@ fn parse_optee_msg_args(
         }
         let rpc_params = &rpc_blob[size_of::<OpteeMsgArgsHeader>()..];
         let rpc = OpteeRpcArgs::from_header_and_raw_params(&rpc_header, rpc_params)?;
-        Some(Box::new(rpc))
+        let mut boxed = OpteeRpcArgs::new_box_zeroed().map_err(|_| OpteeSmcReturnCode::ENomem)?;
+        *boxed = rpc;
+        Some(boxed)
     } else {
         None
     };
 
-    Ok((Box::new(main_args), rpc_args))
+    let mut boxed = OpteeMsgArgs::new_box_zeroed().map_err(|_| OpteeSmcReturnCode::ENomem)?;
+    *boxed = main_args;
+    Ok((boxed, rpc_args))
 }
 
 /// Read `OpteeMsgArgs` (and optional `OpteeRpcArgs`) from a VTL0 physical address.
@@ -191,7 +198,7 @@ pub fn read_optee_msg_args_from_phys(
         main_max
     };
 
-    let mut blob = alloc::vec![0u8; copy_size];
+    let mut blob = allocate_zeroed_vec(copy_size)?;
 
     let blob_ptr =
         NormalWorldConstPtr::<u8, PAGE_SIZE>::with_contiguous_pages(phys_addr, copy_size)
@@ -241,7 +248,7 @@ pub fn handle_optee_smc_args(
             // `OpteeMsgArgs` is located at the offset specified in args[3] within the shared memory region pointed by args[1]:args[2].
             let (shm_ref, offset) = smc.optee_regd_shm_ref_and_offset()?;
             let shm_info = shm_ref_map()
-                .get(shm_ref)
+                .get(shm_ref)?
                 .ok_or(OpteeSmcReturnCode::EBadAddr)?;
 
             // Compute copy size from known-good upper bounds — no untrusted data involved.
@@ -249,7 +256,7 @@ pub fn handle_optee_smc_args(
             let copy_size =
                 main_max + optee_msg_args_total_size(OpteeRpcArgs::MAX_RPC_ARG_PARAM_COUNT.trunc());
 
-            let mut blob = alloc::vec![0u8; copy_size];
+            let mut blob = allocate_zeroed_vec(copy_size)?;
             shm_info.read_at(offset, &mut blob)?;
             let (msg_args, rpc_args) = parse_optee_msg_args(&blob, true)?;
 
@@ -540,7 +547,7 @@ pub fn decode_ta_request(
                 let buffer_size = checked_memref_size(tmem.size)?;
                 let shm_info = get_shm_info_from_optee_msg_param_tmem(tmem)?;
 
-                ta_req_info.out_shm_info[i] = Some(shm_info.clone());
+                ta_req_info.out_shm_info[i] = Some(shm_info.try_clone()?);
                 build_memref_inout(&shm_info, buffer_size)?
             }
             OpteeMsgAttrType::RmemInout => {
@@ -548,7 +555,7 @@ pub fn decode_ta_request(
                 let buffer_size = checked_memref_size(rmem.size)?;
                 let shm_info = get_shm_info_from_optee_msg_param_rmem(rmem)?;
 
-                ta_req_info.out_shm_info[i] = Some(shm_info.clone());
+                ta_req_info.out_shm_info[i] = Some(shm_info.try_clone()?);
                 build_memref_inout(&shm_info, buffer_size)?
             }
             _ => return Err(OpteeSmcReturnCode::EBadCmd),
@@ -563,7 +570,7 @@ fn build_memref_input(
     shm_info: &ShmInfo<PAGE_SIZE>,
     data_size: usize,
 ) -> Result<UteeParamOwned, OpteeSmcReturnCode> {
-    let mut data = alloc::vec![0u8; data_size];
+    let mut data = allocate_zeroed_vec(data_size)?;
     shm_info.read_at(0, &mut data)?;
     Ok(UteeParamOwned::MemrefInput { data: data.into() })
 }
@@ -573,7 +580,7 @@ fn build_memref_inout(
     shm_info: &ShmInfo<PAGE_SIZE>,
     buffer_size: usize,
 ) -> Result<UteeParamOwned, OpteeSmcReturnCode> {
-    let mut buffer = alloc::vec![0u8; buffer_size];
+    let mut buffer = allocate_zeroed_vec(buffer_size)?;
     shm_info.read_at(0, &mut buffer)?;
     Ok(UteeParamOwned::MemrefInout {
         data: buffer.into(),
@@ -686,16 +693,24 @@ impl ShmRefPagesData {
 /// `page_offset` indicates the page offset of the first page (i.e., `pages[0]`) which should be
 /// smaller than `ALIGN`.
 /// `len` is the byte length of the shared memory view starting at `page_offset`.
-#[derive(Clone)]
 pub struct ShmInfo<const ALIGN: usize> {
-    page_addrs: Box<[PhysPageAddr<ALIGN>]>,
+    page_addrs: Vec<PhysPageAddr<ALIGN>>,
     page_offset: usize,
     len: usize,
 }
 
 impl<const ALIGN: usize> ShmInfo<ALIGN> {
+    fn try_clone(&self) -> Result<Self, OpteeSmcReturnCode> {
+        let mut page_addrs = Vec::new();
+        page_addrs
+            .try_reserve_exact(self.page_addrs.len())
+            .map_err(|_| OpteeSmcReturnCode::ENomem)?;
+        page_addrs.extend_from_slice(&self.page_addrs);
+        Self::new(page_addrs, self.page_offset, self.len)
+    }
+
     pub fn new(
-        page_addrs: Box<[PhysPageAddr<ALIGN>]>,
+        page_addrs: Vec<PhysPageAddr<ALIGN>>,
         page_offset: usize,
         len: usize,
     ) -> Result<Self, OpteeSmcReturnCode> {
@@ -772,6 +787,9 @@ impl<const ALIGN: usize> ShmRefMap<ALIGN> {
         } else if guard.len() >= MAX_SHM_REF_MAP_ENTRIES {
             Err(OpteeSmcReturnCode::ENomem)
         } else {
+            guard
+                .try_reserve(1)
+                .map_err(|_| OpteeSmcReturnCode::ENomem)?;
             let _ = guard.insert(shm_ref, info);
             Ok(())
         }
@@ -782,9 +800,9 @@ impl<const ALIGN: usize> ShmRefMap<ALIGN> {
         guard.remove(&shm_ref)
     }
 
-    pub fn get(&self, shm_ref: u64) -> Option<ShmInfo<ALIGN>> {
+    pub fn get(&self, shm_ref: u64) -> Result<Option<ShmInfo<ALIGN>>, OpteeSmcReturnCode> {
         let guard = self.inner.lock();
-        guard.get(&shm_ref).cloned()
+        guard.get(&shm_ref).map(ShmInfo::try_clone).transpose()
     }
 
     /// This function registers shared memory information that the normal world (VTL0) provides.
@@ -814,8 +832,14 @@ impl<const ALIGN: usize> ShmRefMap<ALIGN> {
             return Err(OpteeSmcReturnCode::ENomem);
         }
         let num_pages = aligned_size_usize / ALIGN;
-        let mut pages = Vec::with_capacity(num_pages);
+        let mut pages = Vec::new();
+        pages
+            .try_reserve_exact(num_pages)
+            .map_err(|_| OpteeSmcReturnCode::ENomem)?;
         let mut visited_pages_data = HashSet::new();
+        visited_pages_data
+            .try_reserve(num_pages)
+            .map_err(|_| OpteeSmcReturnCode::ENomem)?;
         let mut cur_addr: usize = shm_ref_pages_data_phys_addr.trunc();
         loop {
             if visited_pages_data.contains(&cur_addr) {
@@ -850,17 +874,14 @@ impl<const ALIGN: usize> ShmRefMap<ALIGN> {
             }
         }
 
-        self.insert(
-            shm_ref,
-            ShmInfo::new(pages.into_boxed_slice(), page_offset.trunc(), size)?,
-        )?;
+        self.insert(shm_ref, ShmInfo::new(pages, page_offset.trunc(), size)?)?;
         Ok(())
     }
 }
 
 fn shm_ref_map() -> &'static ShmRefMap<PAGE_SIZE> {
-    static SHM_REF_MAP: OnceBox<ShmRefMap<PAGE_SIZE>> = OnceBox::new();
-    SHM_REF_MAP.get_or_init(|| Box::new(ShmRefMap::new()))
+    static SHM_REF_MAP: spin::Once<ShmRefMap<PAGE_SIZE>> = spin::Once::new();
+    SHM_REF_MAP.call_once(ShmRefMap::new)
 }
 
 /// Get the normal world shared memory information (physical addresses and page offset) from `OpteeMsgParamTmem`.
@@ -873,7 +894,7 @@ fn get_shm_info_from_optee_msg_param_tmem(
 ) -> Result<ShmInfo<PAGE_SIZE>, OpteeSmcReturnCode> {
     if tmem.buf_ptr == 0 {
         // NULL buffer - create empty ShmInfo
-        return ShmInfo::new(Box::new([]), 0, 0);
+        return ShmInfo::new(Vec::new(), 0, 0);
     }
 
     let phys_addr = tmem.buf_ptr;
@@ -891,7 +912,10 @@ fn get_shm_info_from_optee_msg_param_tmem(
         .div_ceil(PAGE_SIZE);
 
     // Build page address list
-    let mut page_addrs = Vec::with_capacity(num_pages);
+    let mut page_addrs = Vec::new();
+    page_addrs
+        .try_reserve_exact(num_pages)
+        .map_err(|_| OpteeSmcReturnCode::ENomem)?;
     for i in 0..num_pages {
         let page_addr = aligned_addr
             .checked_add(
@@ -902,7 +926,7 @@ fn get_shm_info_from_optee_msg_param_tmem(
         page_addrs.push(PhysPageAddr::new(page_addr.trunc()).ok_or(OpteeSmcReturnCode::EBadAddr)?);
     }
 
-    ShmInfo::new(page_addrs.into_boxed_slice(), page_offset, size)
+    ShmInfo::new(page_addrs, page_offset, size)
 }
 
 /// Get the normal world shared memory information (physical addresses and page offset) from `OpteeMsgParamRmem`.
@@ -912,7 +936,7 @@ fn get_shm_info_from_optee_msg_param_tmem(
 fn get_shm_info_from_optee_msg_param_rmem(
     rmem: OpteeMsgParamRmem,
 ) -> Result<ShmInfo<PAGE_SIZE>, OpteeSmcReturnCode> {
-    let Some(shm_info) = shm_ref_map().get(rmem.shm_ref) else {
+    let Some(shm_info) = shm_ref_map().get(rmem.shm_ref)? else {
         return Err(OpteeSmcReturnCode::ENotAvail);
     };
     let page_offset = shm_info.page_offset;
@@ -934,11 +958,10 @@ fn get_shm_info_from_optee_msg_param_rmem(
     if start_page_index >= shm_info.page_addrs.len() || end_page_index > shm_info.page_addrs.len() {
         return Err(OpteeSmcReturnCode::EBadAddr);
     }
-    let mut page_addrs = Vec::with_capacity(end_page_index - start_page_index);
+    let mut page_addrs = Vec::new();
+    page_addrs
+        .try_reserve_exact(end_page_index - start_page_index)
+        .map_err(|_| OpteeSmcReturnCode::ENomem)?;
     page_addrs.extend_from_slice(&shm_info.page_addrs[start_page_index..end_page_index]);
-    ShmInfo::new(
-        page_addrs.into_boxed_slice(),
-        start % PAGE_SIZE,
-        rmem.size.trunc(),
-    )
+    ShmInfo::new(page_addrs, start % PAGE_SIZE, rmem.size.trunc())
 }

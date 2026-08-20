@@ -16,7 +16,7 @@ use litebox::{
     utils::{ReinterpretSignedExt as _, TruncateExt as _},
 };
 use thiserror::Error;
-use zerocopy::FromBytes;
+use zerocopy::{FromBytes, FromZeros as _};
 
 use crate::errno::Errno;
 
@@ -134,6 +134,8 @@ pub enum ElfParseError<E> {
     UnsupportedType,
     #[error("Bad interpreter")]
     BadInterp,
+    #[error("failed to allocate ELF parsing buffer")]
+    AllocationFailed,
 }
 
 impl<E: Into<Errno>> From<ElfParseError<E>> for Errno {
@@ -147,6 +149,7 @@ impl<E: Into<Errno>> From<ElfParseError<E>> for Errno {
             | ElfParseError::BadInterp
             | ElfParseError::UnsupportedType => Errno::ENOEXEC,
             ElfParseError::Io(err) => err.into(),
+            ElfParseError::AllocationFailed => Errno::ENOMEM,
         }
     }
 }
@@ -210,7 +213,8 @@ impl ElfParsedFile {
             .checked_mul(header.e_phnum)
             .ok_or(ElfParseError::BadFormat)?;
 
-        let mut phdrs = alloc::vec![0u8; usize::from(phdr_size)];
+        let mut phdrs = u8::new_vec_zeroed(usize::from(phdr_size))
+            .map_err(|_| ElfParseError::AllocationFailed)?;
         file.read_at(header.e_phoff, &mut phdrs)
             .map_err(ElfParseError::Io)?;
 
@@ -379,7 +383,7 @@ impl ElfParsedFile {
         if !(2..4096).contains(&len) {
             return Err(ElfParseError::BadInterp);
         }
-        let mut buf = alloc::vec![0u8; len + 1];
+        let mut buf = u8::new_vec_zeroed(len + 1).map_err(|_| ElfParseError::AllocationFailed)?;
         file.read_at(ph.p_offset, &mut buf[..len])
             .map_err(ElfParseError::Io)?;
         buf.truncate(

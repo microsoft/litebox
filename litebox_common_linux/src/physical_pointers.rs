@@ -155,7 +155,10 @@ where
         let span = end_page
             .checked_sub(start_page)
             .ok_or(PhysPointerError::Overflow)?;
-        let mut pages = alloc::vec::Vec::with_capacity(span / ALIGN);
+        let mut pages = alloc::vec::Vec::new();
+        pages
+            .try_reserve_exact(span / ALIGN)
+            .map_err(|_| PhysPointerError::AllocError)?;
         let mut current_page = start_page;
         while current_page < end_page {
             pages.push(

@@ -6,7 +6,6 @@
 
 use crate::syscalls::Cleanup;
 use crate::{Task, UserConstPtr, UserMutPtr};
-use alloc::vec;
 use alloc::vec::Vec;
 use hmac::{Hmac, Mac};
 use litebox::mm::linux::PAGE_SIZE;
@@ -20,6 +19,7 @@ use litebox_common_optee::{
 };
 use num_enum::TryFromPrimitive;
 use sha2::Sha256;
+use zerocopy::FromZeros as _;
 use zeroize::{Zeroize, Zeroizing};
 
 struct SystemPta;
@@ -150,6 +150,7 @@ impl Task {
             return Err(TeeResult::Busy);
         }
 
+        busy.try_reserve(1).map_err(|_| TeeResult::OutOfMemory)?;
         busy.insert(pta);
         Ok(Some(PtaBusyGuard { task: self, pta }))
     }
@@ -166,15 +167,18 @@ impl Task {
         // IDs or memory. The cap is checked while holding the lock, then the lock
         // is released before `open_session` runs.
         {
-            let pta_sessions = self.pta_sessions.lock();
+            let mut pta_sessions = self.pta_sessions.lock();
             if pta_sessions.len() >= MAX_PTA_SESSIONS_PER_TASK {
                 return Err(TeeResult::Busy);
             }
+            pta_sessions
+                .try_reserve(1)
+                .map_err(|_| TeeResult::OutOfMemory)?;
         }
 
         // Run the PTA hook without holding `pta_sessions`. OP-TEE `Task` is
         // single-threaded, so nothing else mutates `pta_sessions` in the meantime.
-        // Keeping the hook outside the lock to avoid a self deadlock.
+        // Keeping the hook outside the lock avoids a self deadlock.
         let session_id = pta.open_session(params)?;
 
         let prev = self.pta_sessions.lock().insert(session_id, pta);
@@ -200,10 +204,18 @@ impl Task {
     }
 
     pub(crate) fn close_all_pta_sessions(&self) {
-        // Drain into a local buffer and release the lock before invoking
-        // `close_session` to avoid potential dead locks.
-        let sessions: Vec<(u32, PseudoTa)> = self.pta_sessions.lock().drain().collect();
-        for (session_id, pta) in sessions {
+        loop {
+            // Remove one entry at a time so the lock is not held across callbacks
+            // and cleanup does not require a temporary allocation.
+            let session = {
+                let mut sessions = self.pta_sessions.lock();
+                let Some((&session_id, &pta)) = sessions.iter().next() else {
+                    break;
+                };
+                sessions.remove(&session_id);
+                (session_id, pta)
+            };
+            let (session_id, pta) = session;
             pta.close_session(self, session_id);
             crate::SessionIdPool::recycle(session_id);
         }
@@ -307,7 +319,8 @@ impl SystemPta {
 
         // subkey = KDF(huk, usage || ta_uuid || extra_data)
         let ta_uuid_bytes = task.ta_app_id.to_le_bytes();
-        let mut subkey_buf = Zeroizing::new(vec![0u8; subkey_size]);
+        let mut subkey_buf =
+            Zeroizing::new(u8::new_vec_zeroed(subkey_size).map_err(|_| TeeResult::OutOfMemory)?);
         Self::huk_subkey_derive(
             task,
             HukSubkeyUsage::UniqueTa,
@@ -337,7 +350,11 @@ impl SystemPta {
 
         let kdf_context_len =
             core::mem::size_of::<u32>() + const_data.iter().map(|chunk| chunk.len()).sum::<usize>();
-        let mut kdf_context = Zeroizing::new(Vec::with_capacity(kdf_context_len));
+        let mut kdf_context = Vec::new();
+        kdf_context
+            .try_reserve_exact(kdf_context_len)
+            .map_err(|_| TeeResult::OutOfMemory)?;
+        let mut kdf_context = Zeroizing::new(kdf_context);
         kdf_context.extend_from_slice(&(usage as u32).to_le_bytes());
         for chunk in const_data {
             kdf_context.extend_from_slice(chunk);

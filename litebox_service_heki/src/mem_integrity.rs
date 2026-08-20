@@ -4,7 +4,7 @@
 //! Functions for checking the memory integrity of VTL0 kernel image and modules
 
 use crate::ModuleMemory;
-use alloc::{vec, vec::Vec};
+use alloc::vec::Vec;
 use authenticode::{AttributeCertificateIterator, AuthenticodeSignature, authenticode_digest};
 use cms::{content_info::ContentInfo, signed_data::SignedData};
 use const_oid::db::rfc5912::{ID_SHA_256, ID_SHA_512, RSA_ENCRYPTION};
@@ -32,6 +32,7 @@ use x509_cert::{
     der::{Decode, Encode, oid::ObjectIdentifier},
 };
 use zerocopy::FromBytes;
+use zerocopy::FromZeros as _;
 
 /// This function validates the memory content of a loaded kernel module against the original ELF file.
 /// In particular, it checks whether the non-relocatable/patchable bytes of certain sections
@@ -101,7 +102,8 @@ pub(crate) fn validate_kernel_module_against_elf(
                 usize::try_from(target_shdr.sh_size).map_err(|_| KernelElfError::ElfParseFailed)?,
             )
             .ok_or(KernelElfError::ElfParseFailed)?;
-        let mut section_from_elf = vec![0u8; end - start];
+        let mut section_from_elf =
+            u8::new_vec_zeroed(end - start).map_err(|_| KernelElfError::AllocationFailed)?;
         section_from_elf.copy_from_slice(&original_elf_data[start..end]);
 
         let mut reloc_ranges = RangeSet::<usize>::new();
@@ -138,6 +140,9 @@ pub(crate) fn validate_kernel_module_against_elf(
             for non_reloc in reloc_ranges.gaps(&(0..section_from_elf.len())) {
                 for i in non_reloc {
                     if section_from_elf[i] != section_in_memory[i] {
+                        diffs
+                            .try_reserve(1)
+                            .map_err(|_| KernelElfError::AllocationFailed)?;
                         diffs.push(i);
                     }
                 }
@@ -570,8 +575,12 @@ pub(crate) fn verify_kernel_pe_signature(
         }
     }
     // check whether the computed digest matches the one in the Authenticode signature
-    let computed_digest = compute_authenticode_digest(kernel_blob, digest_algorithm_oid)?;
-    if signature_verified && authenticode_signature.digest() == computed_digest {
+    let digest_matches = verify_authenticode_digest(
+        kernel_blob,
+        digest_algorithm_oid,
+        authenticode_signature.digest(),
+    )?;
+    if signature_verified && digest_matches {
         return Ok(());
     }
     Err(VerificationError::AuthenticationFailed)
@@ -599,21 +608,22 @@ fn extract_authenticode_signature(
     authenticode_signature.ok_or(VerificationError::InvalidSignature)
 }
 
-/// This function computes an Authenticode digest over a kernel blob PE.
-fn compute_authenticode_digest(
+/// This function verifies an Authenticode digest over a kernel blob PE.
+fn verify_authenticode_digest(
     kernel_blob: &[u8],
     digest_alg: ObjectIdentifier,
-) -> Result<Vec<u8>, VerificationError> {
+    expected_digest: &[u8],
+) -> Result<bool, VerificationError> {
     let pe = PeFile64::parse(kernel_blob).map_err(|_| VerificationError::ParseFailed)?;
 
     if digest_alg == ID_SHA_256 {
         let mut hasher = AuthenticodeHasher::<Sha256>::default();
         authenticode_digest(&pe, &mut hasher).map_err(|_| VerificationError::ParseFailed)?;
-        Ok(hasher.hasher.finalize().to_vec())
+        Ok(expected_digest == hasher.hasher.finalize().as_slice())
     } else if digest_alg == ID_SHA_512 {
         let mut hasher = AuthenticodeHasher::<Sha512>::default();
         authenticode_digest(&pe, &mut hasher).map_err(|_| VerificationError::ParseFailed)?;
-        Ok(hasher.hasher.finalize().to_vec())
+        Ok(expected_digest == hasher.hasher.finalize().as_slice())
     } else {
         Err(VerificationError::Unsupported)
     }
@@ -728,6 +738,17 @@ pub(crate) enum KernelElfError {
     #[cfg_attr(debug_assertions, allow(dead_code))]
     #[error("unsupported relocation type")]
     UnsupportedRelocation,
+    #[error("failed to allocate ELF validation buffer")]
+    AllocationFailed,
+}
+
+impl From<KernelElfError> for litebox_common_lvbs::VsmError {
+    fn from(error: KernelElfError) -> Self {
+        match error {
+            KernelElfError::AllocationFailed => Self::AllocationFailed,
+            _ => Self::Vtl0CopyFailed,
+        }
+    }
 }
 
 #[cfg(test)]

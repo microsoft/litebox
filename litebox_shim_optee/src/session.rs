@@ -483,9 +483,8 @@ pub struct SessionManager {
 
 /// Get the global session manager.
 pub fn session_manager() -> &'static SessionManager {
-    static SESSION_MANAGER: once_cell::race::OnceBox<SessionManager> =
-        once_cell::race::OnceBox::new();
-    SESSION_MANAGER.get_or_init(|| alloc::boxed::Box::new(SessionManager::new()))
+    static SESSION_MANAGER: spin::Once<SessionManager> = spin::Once::new();
+    SESSION_MANAGER.call_once(SessionManager::new)
 }
 
 impl SessionManager {

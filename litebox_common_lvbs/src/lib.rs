@@ -8,7 +8,7 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 use core::mem;
 use litebox::utils::TruncateExt;
 use litebox_common_linux::errno::Errno;
@@ -33,6 +33,22 @@ pub const MAX_CORES: usize = 128;
 
 /// VTL call parameters (`param[0]`: function ID, `param[1..4]`: parameters)
 pub const NUM_VTLCALL_PARAMS: usize = 4;
+
+/// Fallibly allocate a boxed value without first materializing it on the heap.
+pub fn try_box<T>(value: T) -> Result<Box<T>, zerocopy::AllocError> {
+    const { assert!(core::mem::size_of::<T>() != 0) };
+    let layout = core::alloc::Layout::new::<T>();
+    // SAFETY: `layout` describes exactly one non-zero-sized `T`. A successful
+    // allocation is aligned for `T`, and the value is written before constructing
+    // the owning Box.
+    unsafe {
+        let ptr = core::ptr::NonNull::new(alloc::alloc::alloc(layout))
+            .ok_or(zerocopy::AllocError)?
+            .cast::<T>();
+        ptr.write(value);
+        Ok(Box::from_raw(ptr.as_ptr()))
+    }
+}
 
 pub const VSM_VTL_CALL_FUNC_ID_ENABLE_APS_VTL: u32 = 0x1_ffe0;
 pub const VSM_VTL_CALL_FUNC_ID_BOOT_APS: u32 = 0x1_ffe1;
@@ -261,6 +277,9 @@ pub enum VsmError {
     #[error("failed to copy data from/to VTL0")]
     Vtl0CopyFailed,
 
+    #[error("failed to allocate VTL1 memory")]
+    AllocationFailed,
+
     // Hypercall Errors
     #[error("hypercall failed: {0:?}")]
     HypercallFailed(HypervCallError),
@@ -327,6 +346,8 @@ impl From<VsmError> for Errno {
 
             // Unsupported operation
             VsmError::OperationNotSupported(_) => Errno::ENOTSUP,
+
+            VsmError::AllocationFailed => Errno::ENOMEM,
 
             // Security/verification failures - access denied
             VsmError::TextPatchSuspicious
@@ -906,7 +927,10 @@ pub trait Vtl0Gate {
         let last_page = (end - 1) & !(page_size - 1);
 
         let page_count = ((last_page - start_page) / page_size + 1).trunc();
-        let mut pages = Vec::with_capacity(page_count);
+        let mut pages = Vec::new();
+        pages
+            .try_reserve_exact(page_count)
+            .map_err(|_| VsmError::AllocationFailed)?;
         let mut p = start_page;
         loop {
             pages.push(
@@ -924,7 +948,8 @@ pub trait Vtl0Gate {
     /// Read a `FromBytes` value out of a contiguous VTL0 physical span starting
     /// at `phys_addr`.
     fn read_vtl0_val<T: FromBytes>(&self, phys_addr: u64) -> Result<T, VsmError> {
-        let mut buf = alloc::vec![0u8; core::mem::size_of::<T>()];
+        let mut buf = u8::new_vec_zeroed(core::mem::size_of::<T>())
+            .map_err(|_| VsmError::AllocationFailed)?;
         self.read_vtl0_contiguous(phys_addr, &mut buf)?;
         T::read_from_bytes(&buf).map_err(|_| VsmError::Vtl0CopyFailed)
     }

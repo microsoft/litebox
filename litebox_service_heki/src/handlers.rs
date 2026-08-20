@@ -26,7 +26,7 @@ use litebox_common_lvbs::{
 };
 use x86_64::{
     PhysAddr, VirtAddr,
-    structures::paging::{PageSize, PhysFrame, Size4KiB, frame::PhysFrameRange},
+    structures::paging::{PageSize, PhysFrame, Size4KiB},
 };
 use x509_cert::{Certificate, der::Decode};
 use zerocopy::{FromBytes, FromZeros, IntoBytes};
@@ -162,18 +162,10 @@ impl<P: Vtl0Gate> Heki<P> {
             }
         }
 
-        system_certs_mem
-            .write_bytes_from_heki_range(&self.gate)
-            .map_err(|_| VsmError::Vtl0CopyFailed)?;
-        patch_info_mem
-            .write_bytes_from_heki_range(&self.gate)
-            .map_err(|_| VsmError::Vtl0CopyFailed)?;
-        kinfo_mem
-            .write_bytes_from_heki_range(&self.gate)
-            .map_err(|_| VsmError::Vtl0CopyFailed)?;
-        kdata_mem
-            .write_bytes_from_heki_range(&self.gate)
-            .map_err(|_| VsmError::Vtl0CopyFailed)?;
+        system_certs_mem.write_bytes_from_heki_range(&self.gate)?;
+        patch_info_mem.write_bytes_from_heki_range(&self.gate)?;
+        kinfo_mem.write_bytes_from_heki_range(&self.gate)?;
+        kdata_mem.write_bytes_from_heki_range(&self.gate)?;
 
         if system_certs_mem.is_empty() {
             return Err(VsmError::SystemCertificatesNotFound);
@@ -189,8 +181,9 @@ impl<P: Vtl0Gate> Heki<P> {
         // The system certificate is loaded into VTL1 and locked down before `end_of_boot` is signaled.
         // Its integrity depends on UEFI Secure Boot which ensures only trusted software is loaded during
         // the boot process.
-        self.set_system_certificates(certs.clone());
-        log::debug!("HEKI: Loaded {} system certificate(s)", certs.len());
+        let cert_count = certs.len();
+        self.set_system_certificates(certs);
+        log::debug!("HEKI: Loaded {cert_count} system certificate(s)");
 
         // ToDo: Remove kexec_trampoline_insert_failed and protect kexec_trampoline_metadata
         // once we have a better solution to handle the non-page-aligned kexec trampoline metadata.
@@ -295,7 +288,7 @@ impl<P: Vtl0Gate> Heki<P> {
                         if !heki_range.is_aligned(Size4KiB::SIZE) {
                             return Err(VsmError::AddressNotPageAligned);
                         }
-                        module_memory_metadata.insert_heki_range(heki_range);
+                        module_memory_metadata.insert_heki_range(heki_range)?;
                         module_in_memory
                             .extend_range(heki_range.mod_mem_type(), heki_range)
                             .map_err(|_| VsmError::InvalidInputAddress)?;
@@ -308,10 +301,11 @@ impl<P: Vtl0Gate> Heki<P> {
         // The reserve + freeze + validate + promote + patch-commit sequence runs transactionally: the
         // gate reserves `initial`, commits on `Ok`, and rolls back (unprotecting every newly
         // reserved range) on `Err`.
-        let initial: Vec<PhysFrameRange<Size4KiB>> = module_memory_metadata
-            .iter()
-            .map(|r| r.phys_frame_range)
-            .collect();
+        let mut initial = Vec::new();
+        initial
+            .try_reserve_exact(module_memory_metadata.iter().len())
+            .map_err(|_| VsmError::AllocationFailed)?;
+        initial.extend(module_memory_metadata.iter().map(|r| r.phys_frame_range));
         self.gate
             .protect_frames_transactionally(&initial, &mut |txn| {
                 // Freeze frames that require immutable copy/validation to avoid TOCTOU.
@@ -323,15 +317,9 @@ impl<P: Vtl0Gate> Heki<P> {
                     }
                 }
 
-                module_as_elf
-                    .write_bytes_from_heki_range(&self.gate)
-                    .map_err(|_| VsmError::Vtl0CopyFailed)?;
-                patch_info_for_module
-                    .write_bytes_from_heki_range(&self.gate)
-                    .map_err(|_| VsmError::Vtl0CopyFailed)?;
-                module_in_memory
-                    .write_bytes_from_heki_range(&self.gate)
-                    .map_err(|_| VsmError::Vtl0CopyFailed)?;
+                module_as_elf.write_bytes_from_heki_range(&self.gate)?;
+                patch_info_for_module.write_bytes_from_heki_range(&self.gate)?;
+                module_in_memory.write_bytes_from_heki_range(&self.gate)?;
 
                 let elf_size = (module_as_elf[..]).len();
                 if elf_size > MODULE_VALIDATION_MAX_SIZE {
@@ -348,9 +336,7 @@ impl<P: Vtl0Gate> Heki<P> {
 
                 verify_kernel_module_signature(original_elf_data, certs)?;
 
-                if !validate_kernel_module_against_elf(&module_in_memory, original_elf_data)
-                    .map_err(|_| VsmError::Vtl0CopyFailed)?
-                {
+                if !validate_kernel_module_against_elf(&module_in_memory, original_elf_data)? {
                     return Err(VsmError::ModuleRelocationInvalid);
                 }
 
@@ -423,7 +409,7 @@ impl<P: Vtl0Gate> Heki<P> {
 
         // Drop the init ranges from the module's metadata regardless of failures. This is intentional
         // since hypercalls shouldn't fail and avoiding double release is more important.
-        let freed_init_patch_targets = self.module_memory_metadata.remove_init_ranges(token);
+        let freed_init_patch_targets = self.module_memory_metadata.remove_init_ranges(token)?;
         // Remove the precomputed patches targeting those freed init frames so a stale init patch cannot
         // later be applied to recycled frames (no patch-after-free).
         if !freed_init_patch_targets.is_empty() {
@@ -449,7 +435,7 @@ impl<P: Vtl0Gate> Heki<P> {
             }
         }
 
-        if let Some(patch_targets) = self.module_memory_metadata.get_patch_targets(token) {
+        if let Some(patch_targets) = self.module_memory_metadata.get_patch_targets(token)? {
             self.precomputed_patches.remove_patch_data(&patch_targets);
         }
 
@@ -532,22 +518,19 @@ impl<P: Vtl0Gate> Heki<P> {
         // Reserve then freeze the protected kexec frames, rejecting overlap with VTL1 or other
         // protected frames. The reserve/protect (incl. the mid-flow segment reserve for crash kexec),
         // blob copy, and signature check run transactionally: commit on `Ok`, rollback on `Err`.
-        let initial: Vec<PhysFrameRange<Size4KiB>> = kexec_memory_metadata
-            .iter()
-            .map(|r| r.phys_frame_range)
-            .collect();
+        let mut initial = Vec::new();
+        initial
+            .try_reserve_exact(kexec_memory_metadata.iter().len())
+            .map_err(|_| VsmError::AllocationFailed)?;
+        initial.extend(kexec_memory_metadata.iter().map(|r| r.phys_frame_range));
         self.gate
             .protect_frames_transactionally(&initial, &mut |txn| {
                 for kexec_mem_range in &kexec_memory_metadata {
                     txn.protect(kexec_mem_range.phys_frame_range, MemAttr::MEM_ATTR_READ)?;
                 }
 
-                kexec_image
-                    .write_bytes_from_heki_range(&self.gate)
-                    .map_err(|_| VsmError::Vtl0CopyFailed)?;
-                kexec_kernel_blob
-                    .write_bytes_from_heki_range(&self.gate)
-                    .map_err(|_| VsmError::Vtl0CopyFailed)?;
+                kexec_image.write_bytes_from_heki_range(&self.gate)?;
+                kexec_kernel_blob.write_bytes_from_heki_range(&self.gate)?;
 
                 // If this function is called for crash kexec, we protect its kimage segments as well.
                 if is_crash {
@@ -558,6 +541,9 @@ impl<P: Vtl0Gate> Heki<P> {
                         return Err(VsmError::KexecImageSegmentsInvalid);
                     }
                     let mut segment_ranges = Vec::new();
+                    segment_ranges
+                        .try_reserve_exact(kimage.nr_segments.trunc())
+                        .map_err(|_| VsmError::AllocationFailed)?;
                     for i in 0..usize::try_from(kimage.nr_segments).unwrap_or(0) {
                         VirtAddr::try_new(kimage.segment[i].buf)
                             .map_err(|_| VsmError::InvalidVirtualAddress)?;
@@ -568,15 +554,18 @@ impl<P: Vtl0Gate> Heki<P> {
                             return Err(VsmError::KexecSegmentRangeInvalid);
                         }
                     }
-                    let segment_frame_ranges: Vec<PhysFrameRange<Size4KiB>> =
-                        segment_ranges.iter().map(|r| r.phys_frame_range).collect();
+                    let mut segment_frame_ranges = Vec::new();
+                    segment_frame_ranges
+                        .try_reserve_exact(segment_ranges.len())
+                        .map_err(|_| VsmError::AllocationFailed)?;
+                    segment_frame_ranges.extend(segment_ranges.iter().map(|r| r.phys_frame_range));
                     let reservation_statuses = txn.reserve(&segment_frame_ranges)?;
                     for (segment_range, status) in
                         segment_ranges.into_iter().zip(reservation_statuses)
                     {
                         if status == ReservationStatus::New {
                             txn.protect(segment_range.phys_frame_range, MemAttr::MEM_ATTR_READ)?;
-                            kexec_memory_metadata.insert_memory_range(segment_range);
+                            kexec_memory_metadata.insert_memory_range(segment_range)?;
                         }
                     }
                 }
@@ -749,6 +738,9 @@ fn parse_certs(mut buf: &[u8]) -> Result<Vec<Certificate>, VsmError> {
         let cert_bytes = &buf[..total_len];
         let cert =
             Certificate::from_der(cert_bytes).map_err(|_| VsmError::CertificateParseFailed)?;
+        certs
+            .try_reserve(1)
+            .map_err(|_| VsmError::AllocationFailed)?;
         certs.push(cert);
         buf = &buf[total_len..];
     }

@@ -359,6 +359,7 @@ impl PageTableManager {
         let task_pt_id: usize = pt.get_physical_frame().start_address().as_u64().trunc();
 
         let mut task_pts = self.task_page_tables.write();
+        task_pts.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
         task_pts.insert(task_pt_id, pt);
 
         Ok(task_pt_id)
@@ -1201,7 +1202,9 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
         // rejects duplicate/shared mappings, but this keeps the error local to the input array.
         // A single page can never collide with itself, so skip the set allocation.
         if pages.len() > 1 {
-            let mut seen = hashbrown::HashSet::with_capacity(pages.len());
+            let mut seen = hashbrown::HashSet::new();
+            seen.try_reserve(pages.len())
+                .map_err(|_| PhysPointerError::AllocError)?;
             for page in pages {
                 if !seen.insert(page.as_usize()) {
                     return Err(PhysPointerError::DuplicatePhysicalAddress(page.as_usize()));
@@ -1222,15 +1225,18 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
         //
         // `validate_unowned` rejects VTL1-owned PA before callers reach `vmap`, so these pages are
         // foreign and the vmap VA range never aliases VTL1-owned Rust memory.
-        let frames: alloc::vec::Vec<PhysFrame<Size4KiB>> = pages
-            .iter()
-            .map(|p| {
-                let address = p.as_usize();
+        let mut frames = alloc::vec::Vec::new();
+        frames
+            .try_reserve_exact(pages.len())
+            .map_err(|_| PhysPointerError::AllocError)?;
+        for page in pages {
+            let address = page.as_usize();
+            frames.push(
                 x86_64::PhysAddr::try_new(address as u64)
                     .map(PhysFrame::containing_address)
-                    .map_err(|_| PhysPointerError::InvalidPhysicalAddress(address))
-            })
-            .collect::<Result<_, _>>()?;
+                    .map_err(|_| PhysPointerError::InvalidPhysicalAddress(address))?,
+            );
+        }
 
         let base_va = vmap_allocator()
             .allocate_va(frames.len())
