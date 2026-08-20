@@ -131,6 +131,13 @@ enum FileHandleInformationClass {
 #[repr(u32)]
 #[allow(clippy::enum_variant_names)]
 #[derive(Clone, Copy, Debug, Eq, IntEnum, PartialEq)]
+enum FileByNameInformationClass {
+    FileStatBasicInformation = 77,
+}
+
+#[repr(u32)]
+#[allow(clippy::enum_variant_names)]
+#[derive(Clone, Copy, Debug, Eq, IntEnum, PartialEq)]
 enum FileInformationClass {
     FileDirectoryInformation = 1,
     FileFullDirectoryInformation = 2,
@@ -250,8 +257,16 @@ struct DirectoryEntry {
     file_id: i64,
 }
 
-impl DirectoryEntry {
-    fn from_status(name: String, status: &FileStatus) -> Self {
+struct FileStatusMetadata {
+    end_of_file: i64,
+    allocation_size: i64,
+    file_attributes: FileAttributes,
+    file_id: Option<u64>,
+    file_id_128: [u8; 16],
+}
+
+impl FileStatusMetadata {
+    fn from_status(status: &FileStatus) -> Self {
         let mut file_attributes = if status.file_type == FileType::Directory {
             FileAttributes::DIRECTORY
         } else {
@@ -266,14 +281,32 @@ impl DirectoryEntry {
             .checked_next_multiple_of(status.blksize.max(1))
             .and_then(|size| i64::try_from(size).ok())
             .unwrap_or(i64::MAX);
-        let file_id = u64::try_from(status.node_info.ino)
-            .map_or(-1, |id| i64::from_ne_bytes(id.to_ne_bytes()));
+        let file_id = u64::try_from(status.node_info.ino).ok();
+        let mut file_id_128 = [0; 16];
+        if let Some(file_id) = file_id {
+            file_id_128[..size_of::<u64>()].copy_from_slice(&file_id.to_ne_bytes());
+        }
         Self {
-            name,
             end_of_file,
             allocation_size,
             file_attributes,
             file_id,
+            file_id_128,
+        }
+    }
+}
+
+impl DirectoryEntry {
+    fn from_status(name: String, status: &FileStatus) -> Self {
+        let metadata = FileStatusMetadata::from_status(status);
+        Self {
+            name,
+            end_of_file: metadata.end_of_file,
+            allocation_size: metadata.allocation_size,
+            file_attributes: metadata.file_attributes,
+            file_id: metadata
+                .file_id
+                .map_or(-1, |file_id| i64::from_ne_bytes(file_id.to_ne_bytes())),
         }
     }
 }
@@ -382,6 +415,26 @@ pub(crate) struct FileBasicInformation {
     change_time: i64,
     file_attributes: u32,
     _reserved: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, Immutable, IntoBytes)]
+struct FileStatBasicInformation {
+    file_id: i64,
+    creation_time: i64,
+    last_access_time: i64,
+    last_write_time: i64,
+    change_time: i64,
+    allocation_size: i64,
+    end_of_file: i64,
+    file_attributes: u32,
+    reparse_tag: u32,
+    number_of_links: u32,
+    device_type: u32,
+    device_characteristics: u32,
+    reserved: u32,
+    volume_serial_number: i64,
+    file_id_128: [u8; 16],
 }
 
 #[repr(C)]
@@ -969,6 +1022,104 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         NtStatus::SUCCESS
     }
 
+    pub(crate) fn sys_nt_query_information_by_name(
+        &self,
+        object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
+        io_status_block: MutPtr<Platform, IoStatusBlock>,
+        file_information: MutPtr<Platform, u8>,
+        length: u32,
+        file_information_class: u32,
+    ) -> NtStatus {
+        let Some(object_attributes) = object_attributes else {
+            return NtStatus::INVALID_PARAMETER;
+        };
+        let Ok(file_information_class) =
+            FileByNameInformationClass::try_from(file_information_class)
+        else {
+            litebox_util_log::debug!(
+                file_information_class = file_information_class;
+                "Unsupported NtQueryInformationByName class"
+            );
+            return NtStatus::INVALID_INFO_CLASS;
+        };
+        match file_information_class {
+            FileByNameInformationClass::FileStatBasicInformation => self
+                .query_file_stat_basic_information(
+                    object_attributes,
+                    io_status_block,
+                    file_information,
+                    length,
+                ),
+        }
+    }
+
+    fn query_file_stat_basic_information(
+        &self,
+        object_attributes: ConstPtr<Platform, ObjectAttributes>,
+        io_status_block: MutPtr<Platform, IoStatusBlock>,
+        file_information: MutPtr<Platform, u8>,
+        length: u32,
+    ) -> NtStatus {
+        if length < size_of::<FileStatBasicInformation>().trunc() {
+            return NtStatus::INFO_LENGTH_MISMATCH;
+        }
+        if probe_guest_output_preserving_value::<Platform, IoStatusBlock>(io_status_block).is_err()
+            || probe_guest_output_buffer::<Platform>(file_information, length as usize).is_err()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        let object_attributes = match read_object_attributes::<Platform>(object_attributes) {
+            Ok(object_attributes) => object_attributes,
+            Err(status) => return status,
+        };
+        let path = match self.object_attributes_to_file_target(object_attributes) {
+            Ok(FileTarget::Filesystem(path)) => path,
+            Ok(FileTarget::Condrv(_) | FileTarget::KsecDevice) => {
+                return NtStatus::OBJECT_NAME_NOT_FOUND;
+            }
+            Err(status) => return status,
+        };
+        let status = match self.fs.file_status(&path) {
+            Ok(status) => status,
+            Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory)) => {
+                let parent = parent_directory_path(&path);
+                return if self.fs.file_status(parent).is_ok() {
+                    NtStatus::OBJECT_NAME_NOT_FOUND
+                } else {
+                    NtStatus::OBJECT_PATH_NOT_FOUND
+                };
+            }
+            Err(error) => return map_file_status_error(error),
+        };
+        let metadata = FileStatusMetadata::from_status(&status);
+        // TODO(fs-timestamps): Populate timestamps when FileStatus exposes them.
+        let information = FileStatBasicInformation {
+            file_id: metadata
+                .file_id
+                .map_or(0, |file_id| i64::from_ne_bytes(file_id.to_ne_bytes())),
+            allocation_size: metadata.allocation_size,
+            end_of_file: metadata.end_of_file,
+            file_attributes: metadata.file_attributes.bits(),
+            number_of_links: 1,
+            device_type: FileDeviceType::Disk as u32,
+            file_id_128: metadata.file_id_128,
+            ..FileStatBasicInformation::default()
+        };
+        let output =
+            MutPtr::<Platform, FileStatBasicInformation>::from_usize(file_information.as_usize());
+        if output.write_at_offset(0, information).is_none()
+            || io_status_block
+                .write_at_offset(
+                    0,
+                    IoStatusBlock::success(size_of::<FileStatBasicInformation>()),
+                )
+                .is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        NtStatus::SUCCESS
+    }
+
     pub(crate) fn sys_nt_query_information_file(
         &self,
         file_handle: Handle,
@@ -1011,7 +1162,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         file_information: MutPtr<Platform, u8>,
         length: u32,
     ) -> NtStatus {
-        if length != size_of::<FileStandardInformation>().trunc() {
+        if length < size_of::<FileStandardInformation>().trunc() {
             return NtStatus::INFO_LENGTH_MISMATCH;
         }
         if probe_guest_output_preserving_value::<Platform, IoStatusBlock>(io_status_block).is_err()
@@ -1035,15 +1186,10 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Ok(status) => status,
             Err(status) => return status,
         };
-        let end_of_file = i64::try_from(status.size).unwrap_or(i64::MAX);
-        let allocation_size = status
-            .size
-            .checked_next_multiple_of(status.blksize.max(1))
-            .and_then(|size| i64::try_from(size).ok())
-            .unwrap_or(i64::MAX);
+        let metadata = FileStatusMetadata::from_status(&status);
         let information = FileStandardInformation {
-            allocation_size,
-            end_of_file,
+            allocation_size: metadata.allocation_size,
+            end_of_file: metadata.end_of_file,
             number_of_links: 1,
             directory: u8::from(status.file_type == FileType::Directory),
             ..FileStandardInformation::default()
@@ -1070,7 +1216,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         file_information: MutPtr<Platform, u8>,
         length: u32,
     ) -> NtStatus {
-        if length != size_of::<i64>().trunc() {
+        if length < size_of::<i64>().trunc() {
             return NtStatus::INFO_LENGTH_MISMATCH;
         }
         if probe_guest_output_preserving_value::<Platform, IoStatusBlock>(io_status_block).is_err()
@@ -1149,7 +1295,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             );
             return NtStatus::INVALID_INFO_CLASS;
         }
-        if length != size_of::<i64>().trunc() {
+        if length < size_of::<i64>().trunc() {
             return NtStatus::INFO_LENGTH_MISMATCH;
         }
         if probe_guest_output_preserving_value::<Platform, IoStatusBlock>(io_status_block).is_err()

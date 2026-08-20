@@ -1374,6 +1374,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 object_attributes,
                 file_information,
             } => self.sys_nt_query_attributes_file(object_attributes, file_information),
+            SyscallRequest::NtQueryInformationByName {
+                object_attributes,
+                io_status_block,
+                file_information,
+                length,
+                file_information_class,
+            } => self.sys_nt_query_information_by_name(
+                object_attributes,
+                io_status_block,
+                file_information,
+                length,
+                file_information_class,
+            ),
             SyscallRequest::NtQueryInformationFile {
                 file_handle,
                 io_status_block,
