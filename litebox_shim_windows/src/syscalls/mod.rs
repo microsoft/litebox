@@ -656,6 +656,19 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         section_information_length: usize,
         return_length: Option<Platform::RawMutPointer<usize>>,
     },
+    NtQueryObject {
+        handle: Handle,
+        object_information_class: u32,
+        object_information: Platform::RawMutPointer<u8>,
+        object_information_length: u32,
+        return_length: Option<Platform::RawMutPointer<u32>>,
+    },
+    NtSetInformationObject {
+        handle: Handle,
+        object_information_class: u32,
+        object_information: Platform::RawConstPointer<u8>,
+        object_information_length: u32,
+    },
     NtQueryInformationProcess {
         process_handle: ProcessHandle,
         process_information_class: u32,
@@ -1412,6 +1425,19 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 section_information:*,
                 section_information_length,
                 return_length:*,
+            })),
+            NtSysno::NtQueryObject => Some(sys_req!(NtQueryObject {
+                handle: { Handle::from_raw },
+                object_information_class,
+                object_information:*,
+                object_information_length,
+                return_length:*,
+            })),
+            NtSysno::NtSetInformationObject => Some(sys_req!(NtSetInformationObject {
+                handle: { Handle::from_raw },
+                object_information_class,
+                object_information:*,
+                object_information_length,
             })),
             NtSysno::NtQueryInformationProcess => Some(sys_req!(NtQueryInformationProcess {
                 process_handle: { ProcessHandle::from_raw },
