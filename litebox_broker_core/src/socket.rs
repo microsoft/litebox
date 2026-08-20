@@ -25,7 +25,6 @@ use crate::session::{ObjectEntry, ObjectRights};
 use crate::{BrokerError, BrokerSession, Result, SessionId};
 
 const DEFAULT_TCP_LISTEN_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
-const DEFAULT_TCP_LOCAL_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
 const DEFAULT_UDP_LOCAL_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
 const FIRST_EPHEMERAL_PORT: u16 = 49152;
 
@@ -652,11 +651,12 @@ pub fn connect(
         (Arc::clone(&socket.resource), socket.local_address.is_none())
     };
     if needs_bind {
-        let default_local_address = if *address.ip() == GUEST_IPV4_ADDRESS {
-            SocketAddrV4::new(GUEST_IPV4_ADDRESS, 0)
+        let local_ip = if *address.ip() == GUEST_IPV4_ADDRESS {
+            GUEST_IPV4_ADDRESS
         } else {
-            DEFAULT_TCP_LOCAL_ADDRESS
+            Ipv4Addr::LOCALHOST
         };
+        let default_local_address = SocketAddrV4::new(local_ip, 0);
         let binding =
             match reserve_and_bind(session, create_request, &resource, default_local_address) {
                 Ok(binding) => binding,
