@@ -1374,6 +1374,32 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 object_attributes,
                 file_information,
             } => self.sys_nt_query_attributes_file(object_attributes, file_information),
+            SyscallRequest::NtQueryInformationFile {
+                file_handle,
+                io_status_block,
+                file_information,
+                length,
+                file_information_class,
+            } => self.sys_nt_query_information_file(
+                file_handle,
+                io_status_block,
+                file_information,
+                length,
+                file_information_class,
+            ),
+            SyscallRequest::NtSetInformationFile {
+                file_handle,
+                io_status_block,
+                file_information,
+                length,
+                file_information_class,
+            } => self.sys_nt_set_information_file(
+                file_handle,
+                io_status_block,
+                file_information,
+                length,
+                file_information_class,
+            ),
             SyscallRequest::NtCreateFile {
                 file_handle,
                 desired_access,

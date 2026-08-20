@@ -361,6 +361,20 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
         file_information: Platform::RawMutPointer<file::FileBasicInformation>,
     },
+    NtQueryInformationFile {
+        file_handle: Handle,
+        io_status_block: Platform::RawMutPointer<nt_types::IoStatusBlock>,
+        file_information: Platform::RawMutPointer<u8>,
+        length: u32,
+        file_information_class: u32,
+    },
+    NtSetInformationFile {
+        file_handle: Handle,
+        io_status_block: Platform::RawMutPointer<nt_types::IoStatusBlock>,
+        file_information: Platform::RawConstPointer<u8>,
+        length: u32,
+        file_information_class: u32,
+    },
     NtCreateFile {
         file_handle: Platform::RawMutPointer<Handle>,
         desired_access: u32,
@@ -1088,6 +1102,20 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
             NtSysno::NtQueryAttributesFile => Some(sys_req!(NtQueryAttributesFile {
                 object_attributes:*,
                 file_information:*,
+            })),
+            NtSysno::NtQueryInformationFile => Some(sys_req!(NtQueryInformationFile {
+                file_handle:{Handle::from_raw},
+                io_status_block:*,
+                file_information:*,
+                length,
+                file_information_class,
+            })),
+            NtSysno::NtSetInformationFile => Some(sys_req!(NtSetInformationFile {
+                file_handle:{Handle::from_raw},
+                io_status_block:*,
+                file_information:*,
+                length,
+                file_information_class,
             })),
             NtSysno::NtCreateFile => Some(sys_req!(NtCreateFile {
                 file_handle:*,

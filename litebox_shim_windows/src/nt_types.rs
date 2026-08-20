@@ -250,6 +250,14 @@ impl IoStatusBlock {
             information,
         }
     }
+
+    pub(crate) const fn success(information: usize) -> Self {
+        Self::new(NtStatus::SUCCESS, information)
+    }
+
+    pub(crate) const fn failure(status: NtStatus) -> Self {
+        Self::new(status, 0)
+    }
 }
 
 pub(crate) fn read_object_attributes<Platform: RawPointerProvider>(
