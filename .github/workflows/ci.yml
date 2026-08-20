@@ -195,6 +195,23 @@ jobs:
     env:
       RUSTFLAGS: -Dwarnings
       RUSTDOCFLAGS: -Dwarnings
+      # Crates that build and run on Windows.
+      WINDOWS_CRATES: >-
+        -p litebox_common_linux
+        -p litebox_common_windows
+        -p litebox_syscall_rewriter
+        -p litebox_packager
+        -p litebox_broker_protocol
+        -p litebox_broker_transport
+        -p litebox_broker_core
+        -p litebox_broker_local
+        -p litebox_broker_host
+        -p litebox_broker_transport_windows_userland
+        -p litebox_platform_windows_userland
+        -p litebox_shim_linux
+        -p litebox_shim_windows
+        -p litebox_runner_linux_on_windows_userland
+        -p litebox_runner_windows_userland
     steps:
       - name: Check out repo
         uses: actions/checkout@v6
@@ -206,18 +223,16 @@ jobs:
         with:
           tool: nextest@${{ env.NEXTEST_VERSION }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --locked --verbose --all-targets --all-features -p litebox_runner_linux_on_windows_userland -p litebox_runner_windows_userland -p litebox_shim_windows
-      - run: cargo build --locked --verbose -p litebox_runner_linux_on_windows_userland -p litebox_runner_windows_userland
-      - run: cargo nextest run --locked --profile ci -p litebox_runner_linux_on_windows_userland -p litebox_runner_windows_userland
-      - run: cargo nextest run --locked --profile ci -p litebox_shim_linux
-      - run: cargo nextest run --locked --profile ci -p litebox_shim_windows
+      - run: cargo clippy --locked --verbose --all-targets --all-features ($env:WINDOWS_CRATES -split ' ')
+      - run: cargo build --locked --verbose ($env:WINDOWS_CRATES -split ' ')
+      - run: cargo nextest run --locked --profile ci ($env:WINDOWS_CRATES -split ' ')
       - run: |
-          cargo test --locked --verbose --doc -p litebox_runner_linux_on_windows_userland -p litebox_runner_windows_userland
+          cargo test --locked --verbose --doc ($env:WINDOWS_CRATES -split ' ')
           # We need to run `cargo test --doc` separately because doc tests
           # aren't included in nextest at the moment. See relevant discussion at
           # https://github.com/nextest-rs/nextest/issues/16
       - name: Build documentation (fail on warnings)
-        run: cargo doc --locked --verbose --no-deps --all-features --document-private-items -p litebox_runner_linux_on_windows_userland -p litebox_runner_windows_userland
+        run: cargo doc --locked --verbose --no-deps --all-features --document-private-items ($env:WINDOWS_CRATES -split ' ')
 
   confirm_no_std:
     name: Confirm no_std
