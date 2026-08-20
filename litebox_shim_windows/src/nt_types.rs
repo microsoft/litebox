@@ -3,11 +3,11 @@
 
 use alloc::string::String;
 use core::mem::offset_of;
-use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider};
+use litebox::platform::{RawConstPointer as _, RawPointerProvider};
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use crate::{ConstPtr, MutPtr, syscalls::Handle};
+use crate::{ConstPtr, syscalls::Handle};
 
 bitflags::bitflags! {
     /// Flags carried in `CONTEXT.ContextFlags`, selecting which register groups
@@ -258,14 +258,6 @@ impl IoStatusBlock {
     pub(crate) const fn failure(status: NtStatus) -> Self {
         Self::new(status, 0)
     }
-}
-
-pub(crate) fn write_io_status_block<Platform: RawPointerProvider>(
-    io_status_block: MutPtr<Platform, IoStatusBlock>,
-    status: NtStatus,
-    information: usize,
-) -> Option<()> {
-    io_status_block.write_at_offset(0, IoStatusBlock::new(status, information))
 }
 
 pub(crate) fn read_object_attributes<Platform: RawPointerProvider>(

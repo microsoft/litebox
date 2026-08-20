@@ -22,7 +22,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use crate::nt_types::{
     AccessMask, IoStatusBlock, ObjectAttributes, UnicodeString, read_object_attributes,
-    read_unicode_string_at, write_io_status_block,
+    read_unicode_string_at,
 };
 use crate::syscalls::Handle;
 use crate::syscalls::condrv::{self, CondrvObject, CondrvStreamDirection, CondrvStreamObject};
@@ -1051,12 +1051,12 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let output =
             MutPtr::<Platform, FileStandardInformation>::from_usize(file_information.as_usize());
         if output.write_at_offset(0, information).is_none()
-            || write_io_status_block::<Platform>(
-                io_status_block,
-                NtStatus::SUCCESS,
-                size_of::<FileStandardInformation>(),
-            )
-            .is_none()
+            || io_status_block
+                .write_at_offset(
+                    0,
+                    IoStatusBlock::success(size_of::<FileStandardInformation>()),
+                )
+                .is_none()
         {
             return NtStatus::ACCESS_VIOLATION;
         }
@@ -1123,12 +1123,9 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
         let output = MutPtr::<Platform, i64>::from_usize(file_information.as_usize());
         if output.write_at_offset(0, position).is_none()
-            || write_io_status_block::<Platform>(
-                io_status_block,
-                NtStatus::SUCCESS,
-                size_of::<i64>(),
-            )
-            .is_none()
+            || io_status_block
+                .write_at_offset(0, IoStatusBlock::success(size_of::<i64>()))
+                .is_none()
         {
             return NtStatus::ACCESS_VIOLATION;
         }
@@ -1207,14 +1204,14 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Err(_) => Err(NtStatus::UNSUCCESSFUL),
             }
         });
-        let status = match result {
-            Ok(()) => NtStatus::SUCCESS,
-            Err(status) => status,
+        let completion = match result {
+            Ok(()) => IoStatusBlock::success(0),
+            Err(status) => IoStatusBlock::failure(status),
         };
-        if write_io_status_block::<Platform>(io_status_block, status, 0).is_none() {
+        if io_status_block.write_at_offset(0, completion).is_none() {
             return NtStatus::ACCESS_VIOLATION;
         }
-        status
+        NtStatus::from_raw(completion.status.cast_unsigned())
     }
 
     // TODO(query-full-attributes): Implement NtQueryFullAttributesFile when a guest needs
@@ -1360,14 +1357,14 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
             });
         }
-        let (status, information) = match result {
-            Ok(written) => (NtStatus::SUCCESS, written),
-            Err(WriteError::ClosedFd) => (NtStatus::INVALID_HANDLE, 0),
-            Err(WriteError::NotForWriting) => (NtStatus::ACCESS_DENIED, 0),
-            Err(WriteError::NotAFile) => (NtStatus::INVALID_DEVICE_REQUEST, 0),
-            Err(_) => (NtStatus::UNSUCCESSFUL, 0),
+        let completion = match result {
+            Ok(written) => IoStatusBlock::success(written),
+            Err(WriteError::ClosedFd) => IoStatusBlock::failure(NtStatus::INVALID_HANDLE),
+            Err(WriteError::NotForWriting) => IoStatusBlock::failure(NtStatus::ACCESS_DENIED),
+            Err(WriteError::NotAFile) => IoStatusBlock::failure(NtStatus::INVALID_DEVICE_REQUEST),
+            Err(_) => IoStatusBlock::failure(NtStatus::UNSUCCESSFUL),
         };
-        self.complete_file_io(event, io_status_block, status, information)
+        self.complete_file_io(event, io_status_block, completion)
     }
 
     #[expect(
@@ -1472,16 +1469,16 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if guest_write_failed {
             return NtStatus::ACCESS_VIOLATION;
         }
-        let (status, information) = match result {
-            Ok(0) if output_length == 0 => (NtStatus::SUCCESS, 0),
-            Ok(0) => (NtStatus::END_OF_FILE, 0),
-            Ok(read) => (NtStatus::SUCCESS, read),
-            Err(ReadError::ClosedFd) => (NtStatus::INVALID_HANDLE, 0),
-            Err(ReadError::NotForReading) => (NtStatus::ACCESS_DENIED, 0),
-            Err(ReadError::NotAFile) => (NtStatus::INVALID_DEVICE_REQUEST, 0),
-            Err(_) => (NtStatus::UNSUCCESSFUL, 0),
+        let completion = match result {
+            Ok(0) if output_length == 0 => IoStatusBlock::success(0),
+            Ok(0) => IoStatusBlock::failure(NtStatus::END_OF_FILE),
+            Ok(read) => IoStatusBlock::success(read),
+            Err(ReadError::ClosedFd) => IoStatusBlock::failure(NtStatus::INVALID_HANDLE),
+            Err(ReadError::NotForReading) => IoStatusBlock::failure(NtStatus::ACCESS_DENIED),
+            Err(ReadError::NotAFile) => IoStatusBlock::failure(NtStatus::INVALID_DEVICE_REQUEST),
+            Err(_) => IoStatusBlock::failure(NtStatus::UNSUCCESSFUL),
         };
-        self.complete_file_io(event, io_status_block, status, information)
+        self.complete_file_io(event, io_status_block, completion)
     }
 
     #[expect(
@@ -1559,10 +1556,9 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         &self,
         event: Handle,
         io_status_block: MutPtr<Platform, IoStatusBlock>,
-        status: NtStatus,
-        information: usize,
+        completion: IoStatusBlock,
     ) -> NtStatus {
-        if write_io_status_block::<Platform>(io_status_block, status, information).is_none() {
+        if io_status_block.write_at_offset(0, completion).is_none() {
             return NtStatus::ACCESS_VIOLATION;
         }
         if !event.is_null() {
@@ -1571,7 +1567,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 return event_status;
             }
         }
-        status
+        NtStatus::from_raw(completion.status.cast_unsigned())
     }
 
     pub(crate) fn sys_nt_query_volume_information_file(
@@ -1705,7 +1701,9 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             "Handled NtQueryDirectoryFileEx syscall"
         );
         if write_slice::<Platform, u8>(file_information.as_usize(), &output).is_none()
-            || write_io_status_block::<Platform>(io_status_block, status, output.len()).is_none()
+            || io_status_block
+                .write_at_offset(0, IoStatusBlock::new(status, output.len()))
+                .is_none()
         {
             return NtStatus::ACCESS_VIOLATION;
         }
@@ -1960,12 +1958,12 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             characteristics: FileDeviceCharacteristics::IS_MOUNTED.bits(),
         };
         if fs_information.write_at_offset(0, info).is_none()
-            || write_io_status_block::<Platform>(
-                io_status_block,
-                NtStatus::SUCCESS,
-                size_of::<FileFsDeviceInformation>(),
-            )
-            .is_none()
+            || io_status_block
+                .write_at_offset(
+                    0,
+                    IoStatusBlock::success(size_of::<FileFsDeviceInformation>()),
+                )
+                .is_none()
         {
             return NtStatus::ACCESS_VIOLATION;
         }
