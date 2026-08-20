@@ -319,6 +319,8 @@ impl Reactor {
                 guest_address: address,
             });
         }
+        // TODO: Once gateway routing replaces host-loopback fallback, fail all
+        // unmatched guest-network destinations closed.
         if *address.ip() == GUEST_IPV4_ADDRESS
             || (address.ip().is_loopback() && self.udp.has_binding_on_port(address.port()))
         {

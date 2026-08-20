@@ -1956,6 +1956,8 @@ impl Reactor {
                 None => SocketOutcome::Failed(SocketError::ConnectionRefused),
             };
         }
+        // TODO: Once gateway routing replaces host-loopback fallback, fail all
+        // unmatched guest-network destinations closed.
         if *address.ip() == GUEST_IPV4_ADDRESS
             || (address.ip().is_loopback() && self.tcp.has_binding_on_port(address.port()))
         {
