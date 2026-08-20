@@ -3,7 +3,7 @@
 
 use std::io::{Read as _, Write as _};
 use std::net::Ipv4Addr;
-use std::net::{Shutdown, TcpListener, TcpStream, UdpSocket};
+use std::net::{Shutdown, TcpListener, UdpSocket};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
@@ -211,7 +211,7 @@ impl ReadinessSink for TestReadinessSink {
 }
 
 struct PendingPublishFailure {
-    handle: ObjectHandle,
+    handle: Option<ObjectHandle>,
     required: ReadinessFlags,
     forbidden: ReadinessFlags,
 }
@@ -237,7 +237,15 @@ impl FailingReadinessSink {
         forbidden: ReadinessFlags,
     ) {
         *self.fail_next_publish.lock().unwrap() = Some(PendingPublishFailure {
-            handle,
+            handle: Some(handle),
+            required,
+            forbidden,
+        });
+    }
+
+    fn fail_next_publish_matching_any(&self, required: ReadinessFlags, forbidden: ReadinessFlags) {
+        *self.fail_next_publish.lock().unwrap() = Some(PendingPublishFailure {
+            handle: None,
             required,
             forbidden,
         });
@@ -270,7 +278,7 @@ impl ReadinessSink for FailingReadinessSink {
     fn publish(&self, handle: ObjectHandle, readiness: ReadinessFlags) -> BrokerResult<()> {
         let mut fail_next_publish = self.fail_next_publish.lock().unwrap();
         let should_fail = fail_next_publish.as_ref().is_some_and(|failure| {
-            failure.handle == handle
+            failure.handle.is_none_or(|failed| failed == handle)
                 && readiness.contains(failure.required)
                 && readiness.0 & failure.forbidden.0 == 0
         });
