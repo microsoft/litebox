@@ -653,7 +653,7 @@ pub fn connect(
     };
     if needs_bind {
         let default_local_address = if *address.ip() == GUEST_IPV4_ADDRESS {
-            SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)
+            SocketAddrV4::new(GUEST_IPV4_ADDRESS, 0)
         } else {
             DEFAULT_TCP_LOCAL_ADDRESS
         };
@@ -2484,6 +2484,7 @@ pub(crate) mod tests {
     pub(crate) fn check_socket_lifecycle(broker: &BrokerCore, provider: &TestSocketProvider) {
         check_failed_create_rolls_back(broker, provider);
         check_socket_operations_and_policy(broker, provider);
+        check_private_tcp_connect_uses_exact_implicit_binding(broker, provider);
         check_tcp_option_state_is_per_socket(broker);
         check_udp_socket_operations(broker, provider);
         check_udp_status_validates_local_address(broker, provider);
@@ -2902,6 +2903,37 @@ pub(crate) mod tests {
         );
 
         assert_eq!(session.close_object_reference(second), Ok(()));
+    }
+
+    fn check_private_tcp_connect_uses_exact_implicit_binding(
+        broker: &BrokerCore,
+        provider: &TestSocketProvider,
+    ) {
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let handle = create(
+            &session,
+            create_request(),
+            Arc::new(TestReadinessSink::default()),
+        )
+        .unwrap();
+        assert!(matches!(
+            connect(&session, handle, SocketAddrV4::new(GUEST_IPV4_ADDRESS, 80),),
+            Ok(SocketOutcome::Completed(
+                SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
+            ))
+        ));
+        let bound_address = *provider
+            .state
+            .binds
+            .lock()
+            .unwrap()
+            .last()
+            .expect("automatic private TCP bind was not recorded");
+        assert_eq!(*bound_address.ip(), GUEST_IPV4_ADDRESS);
+        assert_ne!(bound_address.port(), 0);
+        session.close_object_reference(handle).unwrap();
     }
 
     fn check_udp_socket_operations(broker: &BrokerCore, provider: &TestSocketProvider) {
