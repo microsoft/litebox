@@ -29,6 +29,13 @@ const DEFAULT_TCP_LOCAL_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCA
 const DEFAULT_UDP_LOCAL_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
 const FIRST_EPHEMERAL_PORT: u16 = 49152;
 
+/// Fixed broker-wide private IPv4 identity of the shared guest network.
+pub const GUEST_IPV4_ADDRESS: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 15);
+
+pub(crate) fn is_guest_network_address(address: Ipv4Addr) -> bool {
+    address.is_loopback() || address == GUEST_IPV4_ADDRESS
+}
+
 /// Platform-observed socket state returned to the broker for reconciliation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PlatformSocketStatus {
@@ -137,8 +144,7 @@ struct GuestBindingReservation {
 
 impl GuestBindingReservation {
     fn covers(&self, address: SocketAddrV4) -> bool {
-        // TODO: Allow the configured guest private address once shared guest identity is added.
-        if address.port() == 0 || !address.ip().is_loopback() {
+        if address.port() == 0 || !is_guest_network_address(*address.ip()) {
             return false;
         }
         match self.key {
@@ -210,7 +216,7 @@ impl BrokerSocketPorts {
 }
 
 fn guest_binding_address_is_valid(address: SocketAddrV4) -> bool {
-    address.ip().is_unspecified() || address.ip().is_loopback()
+    address.ip().is_unspecified() || is_guest_network_address(*address.ip())
 }
 
 impl Drop for GuestBindingReservation {
@@ -264,17 +270,38 @@ impl GuestSocketBinding {
         self.transport == GuestTransport::Tcp
     }
 
-    /// Returns whether this binding covers one concrete guest loopback address.
+    /// Returns whether this binding covers one concrete guest-network address.
     #[must_use]
     pub fn covers(&self, address: SocketAddrV4) -> bool {
         self.is_valid()
             && address.port() != 0
-            && address.ip().is_loopback()
+            && is_guest_network_address(*address.ip())
             && if self.is_wildcard() {
                 address.port() == self.requested.port()
             } else {
                 address == self.requested
             }
+    }
+
+    /// Selects this binding's guest-visible source for a guest destination.
+    #[must_use]
+    pub fn guest_source_address(&self, destination: SocketAddrV4) -> Option<SocketAddrV4> {
+        if !self.is_valid()
+            || destination.port() == 0
+            || !is_guest_network_address(*destination.ip())
+        {
+            return None;
+        }
+        if self.is_wildcard() {
+            let source_ip = if *destination.ip() == GUEST_IPV4_ADDRESS {
+                GUEST_IPV4_ADDRESS
+            } else {
+                Ipv4Addr::LOCALHOST
+            };
+            Some(SocketAddrV4::new(source_ip, self.requested.port()))
+        } else {
+            Some(self.requested)
+        }
     }
 }
 
@@ -625,18 +652,19 @@ pub fn connect(
         (Arc::clone(&socket.resource), socket.local_address.is_none())
     };
     if needs_bind {
-        let binding = match reserve_and_bind(
-            session,
-            create_request,
-            &resource,
-            DEFAULT_TCP_LOCAL_ADDRESS,
-        ) {
-            Ok(binding) => binding,
-            Err(error) => {
-                finish_connect(&object, SocketConnectionStatus::Unconnected);
-                return Err(error);
-            }
+        let default_local_address = if *address.ip() == GUEST_IPV4_ADDRESS {
+            SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)
+        } else {
+            DEFAULT_TCP_LOCAL_ADDRESS
         };
+        let binding =
+            match reserve_and_bind(session, create_request, &resource, default_local_address) {
+                Ok(binding) => binding,
+                Err(error) => {
+                    finish_connect(&object, SocketConnectionStatus::Unconnected);
+                    return Err(error);
+                }
+            };
         match binding {
             ReserveAndBindOutcome::Completed(local_address, reservation) => {
                 attach_binding(&object, local_address, reservation)?;
@@ -1244,7 +1272,9 @@ fn stream_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRespo
     if let Some(observed) = platform_status.local_address {
         match socket.local_address {
             Some(broker_address) if broker_address.ip().is_unspecified() => {
-                if observed.port() != broker_address.port() || !observed.ip().is_loopback() {
+                if observed.port() != broker_address.port()
+                    || !is_guest_network_address(*observed.ip())
+                {
                     socket.listening = false;
                     socket.connection_status = SocketConnectionStatus::Failed(SocketError::Other);
                     socket.resource_retired = true;
@@ -1984,6 +2014,7 @@ pub(crate) mod tests {
     use crate::readiness::tests::TestReadinessSink;
     use crate::{BrokerCore, CallerCredential};
     use litebox_broker_protocol::socket::{AddressFamily, IpProtocol, SocketType};
+    use std::net::Ipv4Addr;
     use std::sync::{Mutex as StdMutex, mpsc};
     use std::time::Duration;
     use std::vec;
@@ -2029,10 +2060,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn guest_binding_namespaces_support_exact_and_wildcard_loopback() {
+    fn guest_binding_namespaces_support_exact_and_wildcard_guest_addresses() {
         let ports = BrokerSocketPorts::default();
         let first = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080);
         let second = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), 8080);
+        let private = SocketAddrV4::new(GUEST_IPV4_ADDRESS, 8080);
         let wildcard = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 8080);
 
         let SocketOutcome::Completed((_, first_lease)) =
@@ -2045,6 +2077,11 @@ pub(crate) mod tests {
         else {
             panic!("second exact reservation failed");
         };
+        let SocketOutcome::Completed((_, private_lease)) =
+            ports.reserve(create_request(), private).unwrap()
+        else {
+            panic!("private exact reservation failed");
+        };
         assert!(matches!(
             ports.reserve(create_request(), wildcard),
             Ok(SocketOutcome::Failed(SocketError::AddressInUse))
@@ -2052,6 +2089,7 @@ pub(crate) mod tests {
 
         drop(first_lease);
         drop(second_lease);
+        drop(private_lease);
         let SocketOutcome::Completed((_, wildcard_lease)) =
             ports.reserve(create_request(), wildcard).unwrap()
         else {
@@ -2061,8 +2099,19 @@ pub(crate) mod tests {
             ports.reserve(create_request(), first),
             Ok(SocketOutcome::Failed(SocketError::AddressInUse))
         ));
+        assert!(matches!(
+            ports.reserve(create_request(), private),
+            Ok(SocketOutcome::Failed(SocketError::AddressInUse))
+        ));
         assert!(wildcard_lease.covers(first));
         assert!(wildcard_lease.covers(second));
+        assert!(wildcard_lease.covers(private));
+        let binding = GuestSocketBinding::new(&wildcard_lease);
+        assert_eq!(
+            binding.guest_source_address(first),
+            Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080))
+        );
+        assert_eq!(binding.guest_source_address(private), Some(private));
     }
 
     #[test]

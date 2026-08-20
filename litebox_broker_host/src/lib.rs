@@ -912,7 +912,7 @@ mod tests {
     fn host_request_handling_uses_one_broker_core() {
         let broker = BrokerCore::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-                .with_socket_policy(SocketPolicy::Ipv4Loopback),
+                .with_socket_policy(SocketPolicy::GuestNetwork),
             Arc::new(TestSocketProvider),
         )
         .unwrap();

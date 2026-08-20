@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use litebox_broker_core::readiness::ReadinessRegistration;
-use litebox_broker_core::socket::{GuestSocketBinding, PlatformConnectError};
+use litebox_broker_core::socket::{GUEST_IPV4_ADDRESS, GuestSocketBinding, PlatformConnectError};
 use litebox_broker_core::{BrokerError, Result as BrokerResult, SessionId};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
@@ -337,13 +337,11 @@ impl ReactorTcpState {
     }
 
     pub(super) fn guest_binding(&self, address: SocketAddrV4) -> Option<ReactorTcpBinding> {
-        if !address.ip().is_loopback() {
-            return None;
-        }
         self.bindings
             .exact
             .get(&address)
             .or_else(|| self.bindings.wildcard.get(&address.port()))
+            .filter(|binding| binding.guest_binding.covers(address))
             .cloned()
     }
 
@@ -1339,22 +1337,15 @@ impl Reactor {
                     .map(|address| (socket.session_id, address))
             })
             .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?;
-        let local_guest_address = if self
-            .tcp
-            .binding_for_socket(id)
-            .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?
-            .guest_binding
-            .is_wildcard()
-        {
-            SocketAddrV4::new(Ipv4Addr::LOCALHOST, reserved_local_address.port())
-        } else {
-            reserved_local_address
-        };
         let concrete_guest_destination = if guest_address.ip().is_unspecified() {
             SocketAddrV4::new(Ipv4Addr::LOCALHOST, guest_address.port())
         } else {
             guest_address
         };
+        let binding = self
+            .tcp
+            .binding_for_socket(id)
+            .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?;
         let (network_address, guest_listener_id) =
             match self.resolve_guest_destination(guest_address) {
                 SocketOutcome::Completed(destination) => destination,
@@ -1370,6 +1361,16 @@ impl Reactor {
                     return Ok(status);
                 }
             };
+        let local_guest_address = if guest_listener_id.is_some() {
+            binding
+                .guest_binding
+                .guest_source_address(concrete_guest_destination)
+                .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?
+        } else if binding.guest_binding.is_wildcard() {
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, reserved_local_address.port())
+        } else {
+            reserved_local_address
+        };
         if guest_listener_id.is_some() {
             self.expire_deadlined_state(Instant::now());
             self.reserve_pending_guest_connection(session_id)
@@ -1955,7 +1956,9 @@ impl Reactor {
                 None => SocketOutcome::Failed(SocketError::ConnectionRefused),
             };
         }
-        if address.ip().is_loopback() && self.tcp.has_binding_on_port(address.port()) {
+        if *address.ip() == GUEST_IPV4_ADDRESS
+            || (address.ip().is_loopback() && self.tcp.has_binding_on_port(address.port()))
+        {
             return SocketOutcome::Failed(SocketError::ConnectionRefused);
         }
         if self.is_private_tcp_host_endpoint(address) {

@@ -3,6 +3,7 @@
 
 use core::net::SocketAddrV4;
 
+use crate::socket::is_guest_network_address;
 use crate::{BrokerError, CallerCredential, ObjectRights};
 use litebox_broker_protocol::socket::{
     AddressFamily, CreateSocketRequest, IpProtocol, Ipv4Address, Port, SocketType,
@@ -208,13 +209,13 @@ pub enum SocketPolicy {
     /// Deny all socket creation and connection attempts.
     #[default]
     Deny,
-    /// Allow IPv4 TCP and UDP sockets with destinations in the IPv4 loopback network.
-    Ipv4Loopback,
-    /// Apply bounded TCP destination rules.
+    /// Allow IPv4 TCP and UDP sockets within the shared guest network.
+    GuestNetwork,
+    /// Allow guest-network TCP plus bounded native TCP destination rules.
     TcpDestinationRules(DestinationPolicy),
-    /// Apply bounded UDP destination rules.
+    /// Allow guest-network UDP plus bounded native UDP destination rules.
     UdpDestinationRules(DestinationPolicy),
-    /// Apply independent bounded TCP and UDP destination rules.
+    /// Allow guest-network TCP and UDP plus independent native destination rules.
     TcpUdpDestinationRules {
         /// TCP destination policy.
         tcp: DestinationPolicy,
@@ -255,7 +256,7 @@ impl SocketPolicy {
         match self {
             Self::TcpDestinationRules(policy)
             | Self::TcpUdpDestinationRules { tcp: policy, .. } => Some(policy.rules()),
-            Self::Deny | Self::Ipv4Loopback | Self::UdpDestinationRules(_) => None,
+            Self::Deny | Self::GuestNetwork | Self::UdpDestinationRules(_) => None,
         }
     }
 
@@ -265,32 +266,16 @@ impl SocketPolicy {
         match self {
             Self::UdpDestinationRules(policy)
             | Self::TcpUdpDestinationRules { udp: policy, .. } => Some(policy.rules()),
-            Self::Deny | Self::Ipv4Loopback | Self::TcpDestinationRules(_) => None,
+            Self::Deny | Self::GuestNetwork | Self::TcpDestinationRules(_) => None,
         }
     }
 
-    fn permits_tcp_socket(self, caller_credential: CallerCredential) -> bool {
-        match self {
-            Self::Deny | Self::UdpDestinationRules(_) => false,
-            Self::Ipv4Loopback => true,
-            Self::TcpDestinationRules(policy)
-            | Self::TcpUdpDestinationRules { tcp: policy, .. } => policy
-                .rules()
-                .iter()
-                .any(|rule| rule.caller_credential == caller_credential),
-        }
+    fn permits_tcp_socket(self) -> bool {
+        !matches!(self, Self::Deny | Self::UdpDestinationRules(_))
     }
 
-    fn permits_udp_socket(self, caller_credential: CallerCredential) -> bool {
-        match self {
-            Self::Deny | Self::TcpDestinationRules(_) => false,
-            Self::Ipv4Loopback => true,
-            Self::UdpDestinationRules(policy)
-            | Self::TcpUdpDestinationRules { udp: policy, .. } => policy
-                .rules()
-                .iter()
-                .any(|rule| rule.caller_credential == caller_credential),
-        }
+    fn permits_udp_socket(self) -> bool {
+        !matches!(self, Self::Deny | Self::TcpDestinationRules(_))
     }
 
     fn permits_tcp_destination(
@@ -300,12 +285,15 @@ impl SocketPolicy {
     ) -> bool {
         match self {
             Self::Deny | Self::UdpDestinationRules(_) => false,
-            Self::Ipv4Loopback => address.ip().is_loopback(),
+            Self::GuestNetwork => is_guest_network_address(*address.ip()),
             Self::TcpDestinationRules(policy)
-            | Self::TcpUdpDestinationRules { tcp: policy, .. } => policy
-                .rules()
-                .iter()
-                .any(|rule| rule.permits(caller_credential, address)),
+            | Self::TcpUdpDestinationRules { tcp: policy, .. } => {
+                is_guest_network_address(*address.ip())
+                    || policy
+                        .rules()
+                        .iter()
+                        .any(|rule| rule.permits(caller_credential, address))
+            }
         }
     }
 
@@ -316,12 +304,15 @@ impl SocketPolicy {
     ) -> bool {
         match self {
             Self::Deny | Self::TcpDestinationRules(_) => false,
-            Self::Ipv4Loopback => address.ip().is_loopback(),
+            Self::GuestNetwork => is_guest_network_address(*address.ip()),
             Self::UdpDestinationRules(policy)
-            | Self::TcpUdpDestinationRules { udp: policy, .. } => policy
-                .rules()
-                .iter()
-                .any(|rule| rule.permits(caller_credential, address)),
+            | Self::TcpUdpDestinationRules { udp: policy, .. } => {
+                is_guest_network_address(*address.ip())
+                    || policy
+                        .rules()
+                        .iter()
+                        .any(|rule| rule.permits(caller_credential, address))
+            }
         }
     }
 }
@@ -421,12 +412,8 @@ impl PolicyEngine {
     ) -> Result<ObjectRights, BrokerError> {
         let rights = self.principal_object_rights(caller_credential)?;
         let permitted = match (request.socket_type, request.protocol) {
-            (SocketType::Stream, IpProtocol::Tcp) => {
-                self.socket_policy.permits_tcp_socket(caller_credential)
-            }
-            (SocketType::Datagram, IpProtocol::Udp) => {
-                self.socket_policy.permits_udp_socket(caller_credential)
-            }
+            (SocketType::Stream, IpProtocol::Tcp) => self.socket_policy.permits_tcp_socket(),
+            (SocketType::Datagram, IpProtocol::Udp) => self.socket_policy.permits_udp_socket(),
             _ => false,
         };
         if request.address_family == AddressFamily::Ipv4 && permitted {
@@ -647,6 +634,14 @@ mod tests {
             ),
             Ok(())
         );
+        assert_eq!(
+            unauthenticated.authorize_socket_connect(
+                CallerCredential::Unauthenticated,
+                IpProtocol::Tcp,
+                address([10, 0, 2, 15], 1),
+            ),
+            Ok(())
+        );
         for denied in [
             address([10, 16, 0, 1], 443),
             address([10, 15, 0, 1], 445),
@@ -665,14 +660,22 @@ mod tests {
     }
 
     #[test]
-    fn loopback_policy_allows_tcp_and_udp_only_within_loopback() {
+    fn guest_network_policy_allows_tcp_and_udp_only_within_the_guest_network() {
         let policy = PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback);
+            .with_socket_policy(SocketPolicy::GuestNetwork);
         assert_eq!(
             policy.authorize_socket_connect(
                 CallerCredential::Unauthenticated,
                 IpProtocol::Tcp,
                 address([127, 255, 0, 1], 80),
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            policy.authorize_socket_connect(
+                CallerCredential::Unauthenticated,
+                IpProtocol::Tcp,
+                address([10, 0, 2, 15], 80),
             ),
             Ok(())
         );
@@ -704,6 +707,14 @@ mod tests {
             policy.authorize_socket_connect(
                 CallerCredential::Unauthenticated,
                 IpProtocol::Udp,
+                address([10, 0, 2, 15], 53),
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            policy.authorize_socket_connect(
+                CallerCredential::Unauthenticated,
+                IpProtocol::Udp,
                 address([10, 0, 0, 1], 53),
             ),
             Err(BrokerError::PolicyDenied)
@@ -717,14 +728,9 @@ mod tests {
             cidr([192, 0, 2, 0], 24),
             ports(443, 443),
         );
-        let udp_rule = DestinationRule::new(
-            CallerCredential::Unauthenticated,
-            cidr([127, 0, 0, 0], 8),
-            ports(53, 53),
-        );
         let policy = PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(
-                SocketPolicy::from_tcp_udp_destination_rules(&[tcp_rule], &[udp_rule]).unwrap(),
+                SocketPolicy::from_tcp_udp_destination_rules(&[tcp_rule], &[]).unwrap(),
             );
 
         assert_eq!(
@@ -735,7 +741,7 @@ mod tests {
             policy.authorize_socket_connect(
                 CallerCredential::Unauthenticated,
                 IpProtocol::Udp,
-                address([127, 0, 0, 1], 53),
+                address([10, 0, 2, 15], 53),
             ),
             Ok(())
         );

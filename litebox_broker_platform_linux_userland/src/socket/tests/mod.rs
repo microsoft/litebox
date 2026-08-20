@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use super::*;
 use litebox_broker_core::readiness::ReadinessSink;
+use litebox_broker_core::socket::GUEST_IPV4_ADDRESS;
 use litebox_broker_core::{
     BrokerCore, BrokerCoreLimits, BrokerSession, CallerCredential, DestinationPortRange,
     DestinationRule, Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy,
@@ -303,7 +304,7 @@ fn directional_shutdown_survives_readiness_publication_failure() {
     let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            .with_socket_policy(SocketPolicy::GuestNetwork),
         BrokerCoreLimits::new_with_all_limits(4, 0, 2, 2),
         provider,
     )
