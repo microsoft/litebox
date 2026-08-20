@@ -40,6 +40,35 @@ const FIRST_STACK_ARGUMENT_OFFSET: usize = 0x28;
 const HANDLE_SHIFT: u32 = 2;
 const HANDLE_TAG_MASK: usize = (1usize << HANDLE_SHIFT) - 1;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct IoStatus {
+    pub(crate) status: NtStatus,
+    pub(crate) information: usize,
+}
+
+impl IoStatus {
+    pub(crate) const fn success(information: usize) -> Self {
+        Self {
+            status: NtStatus::SUCCESS,
+            information,
+        }
+    }
+
+    pub(crate) const fn failure(status: NtStatus) -> Self {
+        Self {
+            status,
+            information: 0,
+        }
+    }
+
+    pub(crate) const fn with_information(status: NtStatus, information: usize) -> Self {
+        Self {
+            status,
+            information,
+        }
+    }
+}
+
 #[repr(transparent)]
 #[derive(
     Clone, Copy, Debug, Default, Eq, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout,
@@ -360,6 +389,20 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
     NtQueryAttributesFile {
         object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
         file_information: Platform::RawMutPointer<file::FileBasicInformation>,
+    },
+    NtQueryInformationFile {
+        file_handle: Handle,
+        io_status_block: Platform::RawMutPointer<nt_types::IoStatusBlock>,
+        file_information: Platform::RawMutPointer<u8>,
+        length: u32,
+        file_information_class: u32,
+    },
+    NtSetInformationFile {
+        file_handle: Handle,
+        io_status_block: Platform::RawMutPointer<nt_types::IoStatusBlock>,
+        file_information: Platform::RawConstPointer<u8>,
+        length: u32,
+        file_information_class: u32,
     },
     NtCreateFile {
         file_handle: Platform::RawMutPointer<Handle>,
@@ -1088,6 +1131,20 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
             NtSysno::NtQueryAttributesFile => Some(sys_req!(NtQueryAttributesFile {
                 object_attributes:*,
                 file_information:*,
+            })),
+            NtSysno::NtQueryInformationFile => Some(sys_req!(NtQueryInformationFile {
+                file_handle:{Handle::from_raw},
+                io_status_block:*,
+                file_information:*,
+                length,
+                file_information_class,
+            })),
+            NtSysno::NtSetInformationFile => Some(sys_req!(NtSetInformationFile {
+                file_handle:{Handle::from_raw},
+                io_status_block:*,
+                file_information:*,
+                length,
+                file_information_class,
             })),
             NtSysno::NtCreateFile => Some(sys_req!(NtCreateFile {
                 file_handle:*,

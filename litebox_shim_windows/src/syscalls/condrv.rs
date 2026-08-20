@@ -7,11 +7,11 @@ use alloc::sync::Arc;
 use core::mem::size_of;
 
 use int_enum::IntEnum;
-use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
+use litebox::platform::RawConstPointer as _;
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-use crate::nt_types::IoStatusBlock;
+use crate::syscalls::IoStatus;
 use crate::{ConstPtr, MutPtr};
 
 const FILE_DEVICE_CONSOLE: u32 = 0x50;
@@ -302,13 +302,12 @@ pub(crate) fn validate_connect_server_ea<Platform: crate::ShimPlatform>(
 
 pub(crate) fn handle_ioctl<Platform: crate::ShimPlatform>(
     condrv_object: CondrvObject,
-    io_status_block: MutPtr<Platform, IoStatusBlock>,
     io_control_code: u32,
     input_buffer: Option<ConstPtr<Platform, u8>>,
     input_buffer_length: u32,
     output_buffer: Option<MutPtr<Platform, u8>>,
     output_buffer_length: u32,
-) -> NtStatus {
+) -> IoStatus {
     let device_type = io_control_code >> 16;
     let access = IoControlAccess::from_bits_retain((io_control_code >> 14) & 0x3);
     let function = (io_control_code >> 2) & 0xfff;
@@ -320,7 +319,7 @@ pub(crate) fn handle_ioctl<Platform: crate::ShimPlatform>(
             io_control_code:% = format_args!("{io_control_code:#x}");
             "Unsupported ConDrv IOCTL shape"
         );
-        return complete_ioctl::<Platform>(io_status_block, NtStatus::NOT_SUPPORTED, 0);
+        return IoStatus::failure(NtStatus::NOT_SUPPORTED);
     }
 
     let Ok(function) = ConsoleIoControlFunction::try_from(function) else {
@@ -329,7 +328,7 @@ pub(crate) fn handle_ioctl<Platform: crate::ShimPlatform>(
             io_control_code:% = format_args!("{io_control_code:#x}");
             "Unsupported ConDrv IOCTL function"
         );
-        return complete_ioctl::<Platform>(io_status_block, NtStatus::NOT_SUPPORTED, 0);
+        return IoStatus::failure(NtStatus::NOT_SUPPORTED);
     };
 
     match (condrv_object, function) {
@@ -344,9 +343,9 @@ pub(crate) fn handle_ioctl<Platform: crate::ShimPlatform>(
                 .and_then(|input_buffer| input_buffer.read_at_offset(0))
                 .is_none()
             {
-                return complete_ioctl::<Platform>(io_status_block, NtStatus::ACCESS_VIOLATION, 0);
+                return IoStatus::failure(NtStatus::ACCESS_VIOLATION);
             }
-            complete_ioctl::<Platform>(io_status_block, NtStatus::SUCCESS, 0)
+            IoStatus::success(0)
         }
         _ => {
             litebox_util_log::debug!(
@@ -355,23 +354,9 @@ pub(crate) fn handle_ioctl<Platform: crate::ShimPlatform>(
                 io_control_code:% = format_args!("{io_control_code:#x}");
                 "Unsupported ConDrv IOCTL for object"
             );
-            complete_ioctl::<Platform>(io_status_block, NtStatus::NOT_SUPPORTED, 0)
+            IoStatus::failure(NtStatus::NOT_SUPPORTED)
         }
     }
-}
-
-pub(crate) fn complete_ioctl<Platform: crate::ShimPlatform>(
-    io_status_block: MutPtr<Platform, IoStatusBlock>,
-    status: NtStatus,
-    information: usize,
-) -> NtStatus {
-    if io_status_block
-        .write_at_offset(0, IoStatusBlock::new(status, information))
-        .is_none()
-    {
-        return NtStatus::ACCESS_VIOLATION;
-    }
-    status
 }
 
 #[cfg(test)]
