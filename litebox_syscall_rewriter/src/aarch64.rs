@@ -3964,8 +3964,10 @@ fn validate_trampoline_and_collect_offsets(
         ));
     }
     if trampoline[8..GATES_START_OFFSET]
-        .chunks_exact(4)
-        .any(|word| u32::from_le_bytes(word.try_into().unwrap()) != NOP)
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .any(|word| u32::from_le_bytes(*word) != NOP)
     {
         return Err(Error::TrampolinePatchFailure(
             "malformed AArch64 trampoline header padding".into(),

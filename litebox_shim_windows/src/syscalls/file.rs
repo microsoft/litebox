@@ -2916,8 +2916,10 @@ mod tests {
             let name_end = name_start + name_length;
             assert!(name_end <= information);
             let name: std::vec::Vec<u16> = output[name_start..name_end]
-                .chunks_exact(2)
-                .map(|bytes| u16::from_ne_bytes(bytes.try_into().unwrap()))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|bytes| u16::from_ne_bytes(*bytes))
                 .collect();
             names.push(std::string::String::from_utf16(&name).unwrap());
             let next_offset =

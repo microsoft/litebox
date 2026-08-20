@@ -1480,8 +1480,10 @@ mod tests {
             "string buffer range stays inside output buffer"
         );
         let units: alloc::vec::Vec<u16> = buffer[offset..offset + length]
-            .chunks_exact(2)
-            .map(|bytes| u16::from_le_bytes(bytes.try_into().expect("u16 bytes")))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|bytes| u16::from_le_bytes(*bytes))
             .collect();
         String::from_utf16_lossy(&units)
     }

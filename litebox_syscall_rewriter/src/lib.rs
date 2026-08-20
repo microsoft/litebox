@@ -2903,8 +2903,8 @@ mod tests {
             trap_all_aarch64_patch_sites(&mut code, 0x1000, RewriteOptions::default()).unwrap();
 
         assert_eq!(count, 3, "SVC and both thread-pointer accesses are sites");
-        for (index, word) in code.chunks_exact(4).enumerate() {
-            let insn = u32::from_le_bytes(word.try_into().unwrap());
+        for (index, word) in code.as_chunks::<4>().0.iter().enumerate() {
+            let insn = u32::from_le_bytes(*word);
             if index == 1 {
                 assert_eq!(insn, 0xD503_201F, "the NOP is not a patch site");
             } else {

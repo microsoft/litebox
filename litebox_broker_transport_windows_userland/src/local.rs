@@ -425,9 +425,11 @@ fn decode_transfer(frame: &[u8]) -> IoResult<TransferredSharedMemory> {
         return Err(invalid_data("invalid shared-memory transfer frame length"));
     }
     let handles = frame[13..]
-        .chunks_exact(8)
+        .as_chunks::<8>()
+        .0
+        .iter()
         .map(|bytes| {
-            usize::try_from(u64::from_le_bytes(bytes.try_into().unwrap()))
+            usize::try_from(u64::from_le_bytes(*bytes))
                 .map_err(|_| invalid_data("transferred handle is too large"))
         })
         .collect::<IoResult<Vec<_>>>()?;
