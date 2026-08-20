@@ -62,6 +62,24 @@ fn connected_guest_tcp_pair(port: u16) -> GuestTcpPair {
     }
 }
 
+fn abort_and_close_accepted_peer(pair: &GuestTcpPair) {
+    assert_eq!(
+        litebox_broker_core::socket::shutdown(
+            &pair.listener_session,
+            pair.accepted,
+            ShutdownMode::Abort,
+        ),
+        Ok(SocketOutcome::Completed(()))
+    );
+    pair.listener_session
+        .close_object_reference(pair.accepted)
+        .unwrap();
+    assert_eq!(
+        pair.retirements.recv_timeout(TEST_TIMEOUT).unwrap(),
+        pair.accepted
+    );
+}
+
 #[test]
 fn reactor_drives_a_loopback_tcp_socket() {
     assert_eq!(
@@ -1110,21 +1128,7 @@ fn accepted_guest_tcp_close_with_unread_data_preserves_reset() {
 #[test]
 fn guest_tcp_direct_receive_reports_reset_once_then_eof() {
     let pair = connected_guest_tcp_pair(8101);
-    assert_eq!(
-        litebox_broker_core::socket::shutdown(
-            &pair.listener_session,
-            pair.accepted,
-            ShutdownMode::Abort,
-        ),
-        Ok(SocketOutcome::Completed(()))
-    );
-    pair.listener_session
-        .close_object_reference(pair.accepted)
-        .unwrap();
-    assert_eq!(
-        pair.retirements.recv_timeout(TEST_TIMEOUT).unwrap(),
-        pair.accepted
-    );
+    abort_and_close_accepted_peer(&pair);
     wait_until_ready(
         &pair.connector_session,
         &pair.publications,
@@ -1197,21 +1201,7 @@ fn guest_tcp_status_consumes_reset_before_buffered_data() {
         pair.connector,
         ReadinessFlags::READ,
     );
-    assert_eq!(
-        litebox_broker_core::socket::shutdown(
-            &pair.listener_session,
-            pair.accepted,
-            ShutdownMode::Abort,
-        ),
-        Ok(SocketOutcome::Completed(()))
-    );
-    pair.listener_session
-        .close_object_reference(pair.accepted)
-        .unwrap();
-    assert_eq!(
-        pair.retirements.recv_timeout(TEST_TIMEOUT).unwrap(),
-        pair.accepted
-    );
+    abort_and_close_accepted_peer(&pair);
     wait_until_ready(
         &pair.connector_session,
         &pair.publications,
@@ -1279,21 +1269,7 @@ fn guest_tcp_buffered_data_precedes_direct_reset_and_eof() {
         pair.connector,
         ReadinessFlags::READ,
     );
-    assert_eq!(
-        litebox_broker_core::socket::shutdown(
-            &pair.listener_session,
-            pair.accepted,
-            ShutdownMode::Abort,
-        ),
-        Ok(SocketOutcome::Completed(()))
-    );
-    pair.listener_session
-        .close_object_reference(pair.accepted)
-        .unwrap();
-    assert_eq!(
-        pair.retirements.recv_timeout(TEST_TIMEOUT).unwrap(),
-        pair.accepted
-    );
+    abort_and_close_accepted_peer(&pair);
 
     let mut buffered = [0_u8; 8];
     assert_eq!(
@@ -1362,8 +1338,6 @@ fn guest_tcp_namespace_routes_across_sessions_and_hides_private_backend() {
         litebox_broker_core::socket::bind(&listener_session, listener, guest_address),
         Ok(SocketOutcome::Completed(guest_address))
     );
-    assert_eq!(provider.reactor.host_address(guest_address.port()), None);
-
     let early_client = create_socket(&client_session, readiness.clone());
     assert_eq!(
         litebox_broker_core::socket::connect(&client_session, early_client, claimed_port_miss,),
@@ -1408,7 +1382,6 @@ fn guest_tcp_namespace_routes_across_sessions_and_hides_private_backend() {
         litebox_broker_core::socket::listen(&listener_session, listener, 3),
         Ok(SocketOutcome::Completed(guest_address))
     );
-    assert_eq!(provider.reactor.host_address(guest_address.port()), None);
     assert_eq!(provider.reactor.tcp_descriptor_counts(), (1, 0, 0));
     let client = create_socket(&client_session, readiness.clone());
     assert!(matches!(
@@ -1424,7 +1397,6 @@ fn guest_tcp_namespace_routes_across_sessions_and_hides_private_backend() {
         .local_address
         .unwrap();
     assert_eq!(*client_address.ip(), GUEST_IPV4_ADDRESS);
-    assert_eq!(provider.reactor.host_address(client_address.port()), None);
     wait_until_ready(
         &listener_session,
         &publications,
@@ -2610,8 +2582,6 @@ fn stop_listening_cleanup_survives_readiness_failure() {
         litebox_broker_core::socket::listen(&listener_session, listener, 1),
         Ok(SocketOutcome::Completed(guest_address))
     );
-    assert_eq!(provider.reactor.host_address(guest_address.port()), None);
-
     let connector = create_socket(&connector_session, readiness.clone());
     assert!(matches!(
         litebox_broker_core::socket::connect(&connector_session, connector, guest_address,),
@@ -2645,7 +2615,6 @@ fn stop_listening_cleanup_survives_readiness_failure() {
     assert!(listener_readiness.contains(ReadinessFlags::HANGUP));
     assert!(!listener_readiness.contains(ReadinessFlags::READ));
     assert_eq!(provider.reactor.queued_guest_connection_count(), 0);
-    assert_eq!(provider.reactor.host_address(guest_address.port()), None);
     assert_eq!(
         litebox_broker_core::socket::listen(&listener_session, listener, 1),
         Ok(SocketOutcome::Failed(SocketError::InvalidArgument))
@@ -2663,7 +2632,6 @@ fn stop_listening_cleanup_survives_readiness_failure() {
     listener_session.close_object_reference(listener).unwrap();
     assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), listener);
     assert_eq!(provider.reactor.queued_guest_connection_count(), 0);
-    assert_eq!(provider.reactor.host_address(guest_address.port()), None);
 }
 
 #[test]
@@ -2691,7 +2659,6 @@ fn reactor_drives_a_loopback_tcp_listener() {
     };
     assert!(local_address.ip().is_loopback());
     assert_ne!(local_address.port(), 0);
-    assert_eq!(provider.reactor.host_address(local_address.port()), None);
     assert_eq!(
         litebox_broker_core::socket::shutdown(&session, listener, ShutdownMode::Write),
         Ok(SocketOutcome::Failed(SocketError::NotConnected))

@@ -103,15 +103,8 @@ pub(super) struct QueuedGuestTcpConnection {
     pub(super) guest_source_lease: GuestSourceLease,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum GuestTcpSide {
-    Connector,
-    Accepted,
-}
-
 pub(super) struct GuestTcpEndpoint {
     pub(super) connection_id: u64,
-    pub(super) side: GuestTcpSide,
     pub(super) queued_listener_id: Option<u64>,
     reset_state: GuestTcpResetState,
 }
@@ -184,10 +177,6 @@ impl ReactorTcpBindings {
 
     pub(super) fn values(&self) -> impl Iterator<Item = &ReactorTcpBinding> {
         self.wildcard.values().chain(self.exact.values())
-    }
-
-    fn values_mut(&mut self) -> impl Iterator<Item = &mut ReactorTcpBinding> {
-        self.wildcard.values_mut().chain(self.exact.values_mut())
     }
 }
 
@@ -286,7 +275,6 @@ fn consume_synchronous_error(socket: &SocketEntry) -> BrokerResult<()> {
 pub(super) struct ReactorTcpBinding {
     pub(super) socket_id: u64,
     pub(super) guest_binding: GuestSocketBinding,
-    pub(super) listening: bool,
 }
 
 enum ResolvedTcpDestination {
@@ -383,30 +371,6 @@ impl ReactorTcpState {
             .values()
             .find(|binding| binding.socket_id == socket_id)
             .cloned()
-    }
-
-    pub(super) fn mark_listening(&mut self, port: u16, socket_id: u64) -> BrokerResult<()> {
-        let binding = self
-            .bindings
-            .values_mut()
-            .find(|binding| {
-                binding.socket_id == socket_id && binding.guest_binding.requested().port() == port
-            })
-            .ok_or(BrokerError::Internal)?;
-        binding.listening = true;
-        Ok(())
-    }
-
-    pub(super) fn stop_listening(&mut self, port: u16, socket_id: u64) -> BrokerResult<()> {
-        let binding = self
-            .bindings
-            .values_mut()
-            .find(|binding| {
-                binding.socket_id == socket_id && binding.guest_binding.requested().port() == port
-            })
-            .ok_or(BrokerError::Internal)?;
-        binding.listening = false;
-        Ok(())
     }
 }
 
@@ -1163,7 +1127,7 @@ impl Reactor {
                     .and_then(|tcp| tcp.listener.as_ref())
                     .is_some_and(|listener| listener.listening)
             });
-        let mut outcome = shutdown_tcp_socket(
+        let outcome = shutdown_tcp_socket(
             self.sockets.get_mut(&id).ok_or(BrokerError::Internal)?,
             mode,
         );
@@ -1174,15 +1138,6 @@ impl Reactor {
         }
         if was_listening && outcome == Ok(SocketOutcome::Completed(())) {
             self.purge_listener_queue(id);
-            let update = self
-                .sockets
-                .get(&id)
-                .and_then(|socket| socket.guest_local_address)
-                .ok_or(BrokerError::Internal)
-                .and_then(|address| self.tcp.stop_listening(address.port(), id));
-            if let Err(error) = update {
-                outcome = Err(error);
-            }
         }
         outcome
     }
@@ -1200,7 +1155,6 @@ impl Reactor {
         self.tcp.insert_binding(ReactorTcpBinding {
             socket_id: id,
             guest_binding: binding,
-            listening: false,
         })?;
         let socket = self.sockets.get_mut(&id).ok_or(BrokerError::Internal)?;
         socket.guest_local_address = Some(guest_address);
@@ -1441,7 +1395,6 @@ impl Reactor {
             tcp.descriptor = TcpDescriptor::GuestUnix(connector_socket);
             tcp.guest_endpoint = Some(GuestTcpEndpoint {
                 connection_id,
-                side: GuestTcpSide::Connector,
                 queued_listener_id: Some(listener_id),
                 reset_state: GuestTcpResetState::None,
             });
@@ -1515,9 +1468,8 @@ impl Reactor {
             .and_then(|socket| socket.tcp_state().ok())
             .and_then(|tcp| {
                 tcp.guest_endpoint.as_ref().and_then(|endpoint| {
-                    (endpoint.side == GuestTcpSide::Connector)
-                        .then_some(endpoint.queued_listener_id)
-                        .flatten()
+                    endpoint
+                        .queued_listener_id
                         .map(|listener_id| (listener_id, endpoint.connection_id))
                 })
             });
@@ -1814,13 +1766,12 @@ impl Reactor {
             address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, address.port());
         }
         if let Some(binding) = self.tcp.guest_binding(address) {
-            let listener_live = binding.listening
-                && self
-                    .sockets
-                    .get(&binding.socket_id)
-                    .and_then(|listener| listener.tcp_state().ok())
-                    .and_then(|tcp| tcp.listener.as_ref())
-                    .is_some_and(|listener| listener.listening);
+            let listener_live = self
+                .sockets
+                .get(&binding.socket_id)
+                .and_then(|listener| listener.tcp_state().ok())
+                .and_then(|tcp| tcp.listener.as_ref())
+                .is_some_and(|listener| listener.listening);
             if !listener_live {
                 return SocketOutcome::Failed(SocketError::ConnectionRefused);
             }
@@ -1853,6 +1804,10 @@ impl Reactor {
             return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
         }
         let guest_address = guest_address.ok_or(BrokerError::Internal)?;
+        self.tcp
+            .binding_for_socket(id)
+            .filter(|binding| binding.guest_binding.requested() == guest_address)
+            .ok_or(BrokerError::Internal)?;
         let backlog = usize::try_from(backlog)
             .map_err(|_| BrokerError::UnsupportedOperation)?
             .max(1);
@@ -1875,7 +1830,6 @@ impl Reactor {
                 });
             }
         }
-        self.tcp.mark_listening(guest_address.port(), id)?;
         Ok(SocketOutcome::Completed(guest_address))
     }
 
@@ -2031,7 +1985,6 @@ impl Reactor {
                     listener: None,
                     guest_endpoint: Some(GuestTcpEndpoint {
                         connection_id,
-                        side: GuestTcpSide::Accepted,
                         queued_listener_id: None,
                         reset_state: GuestTcpResetState::None,
                     }),
