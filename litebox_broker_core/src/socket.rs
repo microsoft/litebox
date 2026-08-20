@@ -142,6 +142,10 @@ struct GuestBindingReservation {
 }
 
 impl GuestBindingReservation {
+    fn is_wildcard(&self) -> bool {
+        matches!(self.key, GuestBindingKey::Wildcard(_))
+    }
+
     fn covers(&self, address: SocketAddrV4) -> bool {
         if address.port() == 0 || !is_guest_network_address(*address.ip()) {
             return false;
@@ -1314,6 +1318,7 @@ fn datagram_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRes
         configuration_in_flight,
         datagram_connect_generation,
         resource_retired,
+        wildcard_binding,
     ) = {
         let object = object.read();
         let ObjectEntry::Socket(socket) = &*object else {
@@ -1326,6 +1331,7 @@ fn datagram_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRes
             socket.configuration_in_flight,
             socket.datagram_connect_generation,
             socket.resource_retired,
+            socket.resource.port_reservation_is_wildcard(),
         )
     };
     if configuration_in_flight || resource_retired {
@@ -1394,7 +1400,9 @@ fn datagram_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRes
             return Err(BrokerError::Internal);
         }
         let local_address_refinement = match (socket.local_address, platform_status.local_address) {
-            (Some(broker_address), Some(observed)) if broker_address.ip().is_unspecified() => {
+            (Some(broker_address), Some(observed))
+                if wildcard_binding || broker_address.ip().is_unspecified() =>
+            {
                 Some(observed)
             }
             _ => None,
@@ -1839,6 +1847,13 @@ impl SocketResource {
             .lock()
             .as_ref()
             .is_some_and(|reservation| reservation.covers(address))
+    }
+
+    fn port_reservation_is_wildcard(&self) -> bool {
+        self.port_reservation
+            .lock()
+            .as_ref()
+            .is_some_and(GuestBindingReservation::is_wildcard)
     }
 
     fn platform_socket(&self) -> &dyn PlatformSocket {
