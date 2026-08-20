@@ -11,7 +11,7 @@ use litebox::platform::RawConstPointer as _;
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-use crate::syscalls::IoStatus;
+use crate::nt_types::IoStatusBlock;
 use crate::{ConstPtr, MutPtr};
 
 const FILE_DEVICE_CONSOLE: u32 = 0x50;
@@ -307,7 +307,7 @@ pub(crate) fn handle_ioctl<Platform: crate::ShimPlatform>(
     input_buffer_length: u32,
     output_buffer: Option<MutPtr<Platform, u8>>,
     output_buffer_length: u32,
-) -> IoStatus {
+) -> IoStatusBlock {
     let device_type = io_control_code >> 16;
     let access = IoControlAccess::from_bits_retain((io_control_code >> 14) & 0x3);
     let function = (io_control_code >> 2) & 0xfff;
@@ -319,7 +319,7 @@ pub(crate) fn handle_ioctl<Platform: crate::ShimPlatform>(
             io_control_code:% = format_args!("{io_control_code:#x}");
             "Unsupported ConDrv IOCTL shape"
         );
-        return IoStatus::failure(NtStatus::NOT_SUPPORTED);
+        return IoStatusBlock::failure(NtStatus::NOT_SUPPORTED);
     }
 
     let Ok(function) = ConsoleIoControlFunction::try_from(function) else {
@@ -328,7 +328,7 @@ pub(crate) fn handle_ioctl<Platform: crate::ShimPlatform>(
             io_control_code:% = format_args!("{io_control_code:#x}");
             "Unsupported ConDrv IOCTL function"
         );
-        return IoStatus::failure(NtStatus::NOT_SUPPORTED);
+        return IoStatusBlock::failure(NtStatus::NOT_SUPPORTED);
     };
 
     match (condrv_object, function) {
@@ -343,9 +343,9 @@ pub(crate) fn handle_ioctl<Platform: crate::ShimPlatform>(
                 .and_then(|input_buffer| input_buffer.read_at_offset(0))
                 .is_none()
             {
-                return IoStatus::failure(NtStatus::ACCESS_VIOLATION);
+                return IoStatusBlock::failure(NtStatus::ACCESS_VIOLATION);
             }
-            IoStatus::success(0)
+            IoStatusBlock::success(0)
         }
         _ => {
             litebox_util_log::debug!(
@@ -354,7 +354,7 @@ pub(crate) fn handle_ioctl<Platform: crate::ShimPlatform>(
                 io_control_code:% = format_args!("{io_control_code:#x}");
                 "Unsupported ConDrv IOCTL for object"
             );
-            IoStatus::failure(NtStatus::NOT_SUPPORTED)
+            IoStatusBlock::failure(NtStatus::NOT_SUPPORTED)
         }
     }
 }

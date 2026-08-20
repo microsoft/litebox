@@ -40,35 +40,6 @@ const FIRST_STACK_ARGUMENT_OFFSET: usize = 0x28;
 const HANDLE_SHIFT: u32 = 2;
 const HANDLE_TAG_MASK: usize = (1usize << HANDLE_SHIFT) - 1;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct IoStatus {
-    pub(crate) status: NtStatus,
-    pub(crate) information: usize,
-}
-
-impl IoStatus {
-    pub(crate) const fn success(information: usize) -> Self {
-        Self {
-            status: NtStatus::SUCCESS,
-            information,
-        }
-    }
-
-    pub(crate) const fn failure(status: NtStatus) -> Self {
-        Self {
-            status,
-            information: 0,
-        }
-    }
-
-    pub(crate) const fn with_information(status: NtStatus, information: usize) -> Self {
-        Self {
-            status,
-            information,
-        }
-    }
-}
-
 #[repr(transparent)]
 #[derive(
     Clone, Copy, Debug, Default, Eq, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout,

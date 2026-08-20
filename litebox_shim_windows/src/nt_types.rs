@@ -250,16 +250,22 @@ impl IoStatusBlock {
             information,
         }
     }
+
+    pub(crate) const fn success(information: usize) -> Self {
+        Self::new(NtStatus::SUCCESS, information)
+    }
+
+    pub(crate) const fn failure(status: NtStatus) -> Self {
+        Self::new(status, 0)
+    }
 }
 
 pub(crate) fn write_io_status_block<Platform: RawPointerProvider>(
     io_status_block: MutPtr<Platform, IoStatusBlock>,
     status: NtStatus,
     information: usize,
-) -> Result<(), NtStatus> {
-    io_status_block
-        .write_at_offset(0, IoStatusBlock::new(status, information))
-        .ok_or(NtStatus::ACCESS_VIOLATION)
+) -> Option<()> {
+    io_status_block.write_at_offset(0, IoStatusBlock::new(status, information))
 }
 
 pub(crate) fn read_object_attributes<Platform: RawPointerProvider>(
