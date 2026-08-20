@@ -541,7 +541,7 @@ mod tests {
         let socket_provider = Arc::new(crate::socket::tests::TestSocketProvider::default());
         let broker = BrokerCore::new_with_limits(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-                .with_socket_policy(SocketPolicy::Ipv4Loopback),
+                .with_socket_policy(SocketPolicy::guest_network()),
             BrokerCoreLimits::new_with_all_limits(2, 4, 2, 1),
             socket_provider.clone(),
         )

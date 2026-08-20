@@ -119,7 +119,7 @@ fn untracked_guest_connection_cleanup_is_bounded_and_drains_backlog() {
     let provider = Arc::new(LinuxSocketProvider::new(6, 3).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(12, 0, 6, 6),
         provider.clone(),
     )
@@ -271,7 +271,7 @@ fn reactor_drives_a_loopback_tcp_socket() {
     let provider = Arc::new(LinuxSocketProvider::new(8, 8).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(16, 0, 8, 8),
         provider,
     )
@@ -604,7 +604,7 @@ fn tcp_receive_survives_readiness_publication_failure() {
     let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
         provider,
     )
@@ -662,7 +662,7 @@ fn tcp_status_publication_failure_preserves_consumed_error() {
     let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
         provider,
     )
@@ -722,7 +722,7 @@ fn exhausted_tcp_peek_cache_refreshes_before_terminal_eof() {
     let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
         provider,
     )
@@ -791,7 +791,7 @@ fn accepted_guest_tcp_close_with_unread_data_preserves_reset() {
     let provider = Arc::new(LinuxSocketProvider::new(3, 2).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(6, 0, 3, 3),
         provider,
     )
@@ -874,7 +874,7 @@ fn guest_tcp_namespace_routes_across_sessions_and_hides_private_backend() {
     let provider = Arc::new(LinuxSocketProvider::new(5, 3).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(8, 0, 5, 4),
         provider.clone(),
     )
@@ -891,7 +891,7 @@ fn guest_tcp_namespace_routes_across_sessions_and_hides_private_backend() {
     let shadowed_host_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     shadowed_host_listener.set_nonblocking(true).unwrap();
     let guest_port = shadowed_host_listener.local_addr().unwrap().port();
-    let guest_address = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), guest_port);
+    let guest_address = SocketAddrV4::new(GUEST_IPV4_ADDRESS, guest_port);
     let claimed_port_miss = SocketAddrV4::new(Ipv4Addr::LOCALHOST, guest_port);
     let guest_destination = guest_address;
     let listener = create_socket(&listener_session, readiness.clone());
@@ -916,6 +916,29 @@ fn guest_tcp_namespace_routes_across_sessions_and_hides_private_backend() {
     assert_eq!(
         retirements.recv_timeout(TEST_TIMEOUT).unwrap(),
         early_client
+    );
+    let unbound_private_port = if guest_port == u16::MAX {
+        guest_port - 1
+    } else {
+        guest_port + 1
+    };
+    let unbound_private_client = create_socket(&client_session, readiness.clone());
+    assert_eq!(
+        litebox_broker_core::socket::connect(
+            &client_session,
+            unbound_private_client,
+            SocketAddrV4::new(GUEST_IPV4_ADDRESS, unbound_private_port),
+        ),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Failed(
+            SocketError::ConnectionRefused,
+        )))
+    );
+    client_session
+        .close_object_reference(unbound_private_client)
+        .unwrap();
+    assert_eq!(
+        retirements.recv_timeout(TEST_TIMEOUT).unwrap(),
+        unbound_private_client
     );
 
     assert_eq!(
@@ -958,6 +981,7 @@ fn guest_tcp_namespace_routes_across_sessions_and_hides_private_backend() {
         .unwrap()
         .local_address
         .unwrap();
+    assert_eq!(*client_address.ip(), GUEST_IPV4_ADDRESS);
     let connector_private_address = provider
         .reactor
         .host_address(client_address.port())
@@ -1032,12 +1056,13 @@ fn guest_tcp_namespace_routes_across_sessions_and_hides_private_backend() {
 #[test]
 fn tcp_exact_bindings_coexist_and_wildcard_accepts_concrete_destinations() {
     let provider = Arc::new(LinuxSocketProvider::new(12, 8).unwrap());
-    let policy = SocketPolicy::from_tcp_destination_rules(&[DestinationRule::new(
-        CallerCredential::Unauthenticated,
-        Ipv4Cidr::new(Ipv4Address([0, 0, 0, 0]), 0).unwrap(),
-        DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
-    )])
-    .unwrap();
+    let policy = SocketPolicy::deny()
+        .with_tcp_destination_rules(&[DestinationRule::new(
+            CallerCredential::Unauthenticated,
+            Ipv4Cidr::new(Ipv4Address([0, 0, 0, 0]), 0).unwrap(),
+            DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
+        )])
+        .unwrap();
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all()).with_socket_policy(policy),
         BrokerCoreLimits::new_with_all_limits(20, 0, 12, 12),
@@ -1131,8 +1156,7 @@ fn tcp_exact_bindings_coexist_and_wildcard_accepts_concrete_destinations() {
         litebox_broker_core::socket::listen(&listener_session, wildcard_listener, 2),
         Ok(SocketOutcome::Completed(wildcard_address))
     );
-    let concrete_destination =
-        SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 4), wildcard_address.port());
+    let concrete_destination = SocketAddrV4::new(GUEST_IPV4_ADDRESS, wildcard_address.port());
     let connector = create_socket(&connector_session, readiness.clone());
     let SocketOutcome::Completed(connector_binding) = litebox_broker_core::socket::bind(
         &connector_session,
@@ -1154,7 +1178,7 @@ fn tcp_exact_bindings_coexist_and_wildcard_accepts_concrete_destinations() {
             .unwrap()
             .local_address,
         Some(SocketAddrV4::new(
-            Ipv4Addr::LOCALHOST,
+            GUEST_IPV4_ADDRESS,
             connector_binding.port(),
         ))
     );
@@ -1177,7 +1201,7 @@ fn tcp_exact_bindings_coexist_and_wildcard_accepts_concrete_destinations() {
     assert_eq!(accepted.local_address, concrete_destination);
     assert_eq!(
         accepted.remote_address,
-        SocketAddrV4::new(Ipv4Addr::LOCALHOST, connector_binding.port())
+        SocketAddrV4::new(GUEST_IPV4_ADDRESS, connector_binding.port())
     );
 
     let unspecified_connector = create_socket(&connector_session, readiness.clone());
@@ -1216,7 +1240,7 @@ fn connector_and_session_teardown_clean_bounded_pending_state() {
     let provider = Arc::new(LinuxSocketProvider::new(3, 1).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(8, 0, 3, 3),
         provider.clone(),
     )
@@ -1334,7 +1358,7 @@ fn graceful_connector_close_preserves_late_accept_and_eof() {
     let provider = Arc::new(LinuxSocketProvider::new(4, 2).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(8, 0, 4, 4),
         provider.clone(),
     )
@@ -1399,7 +1423,7 @@ fn abortive_connector_close_releases_descriptor_capacity() {
     let provider = Arc::new(LinuxSocketProvider::new(3, 1).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(8, 0, 3, 3),
         provider.clone(),
     )
@@ -1482,7 +1506,7 @@ fn accept_bounds_unmatched_private_connections_per_command() {
     let provider = Arc::new(LinuxSocketProvider::new(3, 2).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(8, 0, 3, 3),
         provider.clone(),
     )
@@ -1562,7 +1586,7 @@ fn accept_preserves_a_queued_connection_when_retained_capacity_is_unrelated() {
     let provider = Arc::new(LinuxSocketProvider::new(4, 4).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(8, 0, 5, 5),
         provider.clone(),
     )
@@ -1671,7 +1695,7 @@ fn stop_listening_cleanup_survives_readiness_failure() {
     let provider = Arc::new(LinuxSocketProvider::new(3, 1).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(8, 0, 3, 3),
         provider.clone(),
     )
@@ -1765,7 +1789,7 @@ fn reactor_drives_a_loopback_tcp_listener() {
     let provider = Arc::new(LinuxSocketProvider::new(6, 6).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(8, 0, 6, 6),
         provider.clone(),
     )

@@ -8,7 +8,7 @@ fn guest_udp_readiness_failure_rolls_back_enqueue() {
     let provider = Arc::new(LinuxSocketProvider::new(2, 1).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(4, 0, 2, 1),
         provider.clone(),
     )
@@ -105,7 +105,7 @@ fn native_udp_readiness_failure_does_not_fail_shared_reactor() {
     let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(4, 0, 2, 2),
         provider,
     )
@@ -217,7 +217,7 @@ fn udp_status_publication_failure_still_rearms_native_endpoint() {
     let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
         provider,
     )
@@ -290,7 +290,7 @@ fn udp_status_republishes_when_another_error_remains_pending() {
     let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
         provider.clone(),
     )
@@ -342,7 +342,7 @@ fn guest_udp_queue_pressure_drops_new_datagrams_successfully() {
     let provider = Arc::new(LinuxSocketProvider::new(2, 1).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(4, 0, 2, 1),
         provider.clone(),
     )
@@ -433,7 +433,7 @@ fn udp_external_peer_authorization_is_bounded_without_eviction() {
     let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
         provider,
     )
@@ -507,19 +507,20 @@ fn reactor_preserves_udp_datagram_semantics() {
     server.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
     let server_address = socket_address_v4(server.local_addr().unwrap());
     let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
-    let socket_policy = SocketPolicy::from_udp_destination_rules(&[
-        DestinationRule::new(
-            CallerCredential::Unauthenticated,
-            Ipv4Cidr::new(Ipv4Address([127, 0, 0, 0]), 8).unwrap(),
-            DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
-        ),
-        DestinationRule::new(
-            CallerCredential::Unauthenticated,
-            Ipv4Cidr::new(Ipv4Address([255, 255, 255, 255]), 32).unwrap(),
-            DestinationPortRange::new(Port(9), Port(9)).unwrap(),
-        ),
-    ])
-    .unwrap();
+    let socket_policy = SocketPolicy::deny()
+        .with_udp_destination_rules(&[
+            DestinationRule::new(
+                CallerCredential::Unauthenticated,
+                Ipv4Cidr::new(Ipv4Address([127, 0, 0, 0]), 8).unwrap(),
+                DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
+            ),
+            DestinationRule::new(
+                CallerCredential::Unauthenticated,
+                Ipv4Cidr::new(Ipv4Address([255, 255, 255, 255]), 32).unwrap(),
+                DestinationPortRange::new(Port(9), Port(9)).unwrap(),
+            ),
+        ])
+        .unwrap();
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(socket_policy),
@@ -876,7 +877,7 @@ fn guest_udp_namespace_routes_across_sessions_and_filters_private_endpoints() {
     let provider = Arc::new(LinuxSocketProvider::new(6, 3).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(8, 0, 6, 3),
         provider.clone(),
     )
@@ -896,7 +897,7 @@ fn guest_udp_namespace_routes_across_sessions_and_filters_private_endpoints() {
         .set_nonblocking(true)
         .expect("failed to make shadow socket nonblocking");
     let guest_port = shadowed_host_socket.local_addr().unwrap().port();
-    let receiver_guest_address = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), guest_port);
+    let receiver_guest_address = SocketAddrV4::new(GUEST_IPV4_ADDRESS, guest_port);
     let receiver = create_udp_socket(&receiver_session, readiness.clone());
     assert_eq!(
         litebox_broker_core::socket::bind(&receiver_session, receiver, receiver_guest_address,),
@@ -924,6 +925,22 @@ fn guest_udp_namespace_routes_across_sessions_and_filters_private_endpoints() {
         ),
         Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
     );
+    let unbound_private_port = if guest_port == u16::MAX {
+        guest_port - 1
+    } else {
+        guest_port + 1
+    };
+    assert_eq!(
+        send_datagram(
+            &sender_session,
+            sender,
+            b"private miss",
+            SendFlags::NONE,
+            Some(SocketAddrV4::new(GUEST_IPV4_ADDRESS, unbound_private_port,)),
+        ),
+        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+    );
+    assert_eq!(provider.reactor.udp_native_endpoint_count(), 0);
     assert_eq!(
         send_datagram(
             &sender_session,
@@ -938,7 +955,7 @@ fn guest_udp_namespace_routes_across_sessions_and_filters_private_endpoints() {
         .unwrap()
         .local_address
         .expect("implicit UDP bind missing");
-    let sender_source_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, sender_guest_address.port());
+    let sender_source_address = SocketAddrV4::new(GUEST_IPV4_ADDRESS, sender_guest_address.port());
     wait_until_ready(
         &receiver_session,
         &publications,
@@ -1118,11 +1135,11 @@ fn guest_udp_namespace_routes_across_sessions_and_filters_private_endpoints() {
 }
 
 #[test]
-fn udp_exact_bindings_coexist_and_wildcard_covers_loopback() {
+fn udp_exact_bindings_coexist_and_wildcard_covers_guest_addresses() {
     let provider = Arc::new(LinuxSocketProvider::new(8, 5).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(12, 0, 8, 8),
         provider,
     )
@@ -1216,8 +1233,7 @@ fn udp_exact_bindings_coexist_and_wildcard_covers_loopback() {
     .unwrap() else {
         panic!("wildcard UDP bind failed");
     };
-    let concrete_destination =
-        SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 4), wildcard_address.port());
+    let concrete_destination = SocketAddrV4::new(GUEST_IPV4_ADDRESS, wildcard_address.port());
     assert_eq!(
         send_datagram(
             &sender_session,
@@ -1299,7 +1315,7 @@ fn udp_exact_bindings_coexist_and_wildcard_covers_loopback() {
             datagram_length: 4,
             source_address,
         })) if source_address == SocketAddrV4::new(
-            Ipv4Addr::LOCALHOST,
+            GUEST_IPV4_ADDRESS,
             wildcard_address.port(),
         )
     ));
@@ -1311,7 +1327,7 @@ fn udp_native_endpoint_is_reused_and_retired() {
     let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(4, 0, 2, 2),
         provider.clone(),
     )
@@ -1376,7 +1392,7 @@ fn udp_endpoint_staging_error_rolls_back_external_peer_reservation() {
     let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(4, 0, 2, 2),
         provider.clone(),
     )
@@ -1414,7 +1430,7 @@ fn stale_udp_datagrams_are_not_relabelled_after_guest_port_reuse() {
     let provider = Arc::new(LinuxSocketProvider::new(5, 3).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(8, 0, 5, 3),
         provider.clone(),
     )
@@ -1521,7 +1537,7 @@ fn udp_queued_datagrams_survive_source_session_teardown() {
     let provider = Arc::new(LinuxSocketProvider::new(3, 1).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(6, 0, 3, 1),
         provider.clone(),
     )
@@ -1654,7 +1670,7 @@ fn connected_guest_udp_enforces_barriers_peek_and_peer_generations() {
     let provider = Arc::new(LinuxSocketProvider::new(4, 2).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(8, 0, 4, 2),
         provider.clone(),
     )
@@ -1782,6 +1798,67 @@ fn connected_guest_udp_enforces_barriers_peek_and_peer_generations() {
 }
 
 #[test]
+fn wildcard_udp_reconnect_updates_guest_source_identity() {
+    let provider = Arc::new(LinuxSocketProvider::new(3, 3).unwrap());
+    let broker = BrokerCore::new_with_limits(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(SocketPolicy::guest_network()),
+        BrokerCoreLimits::new_with_all_limits(6, 0, 3, 3),
+        provider,
+    )
+    .unwrap();
+    let session = broker
+        .create_session(CallerCredential::Unauthenticated)
+        .unwrap();
+    let (published, _publications) = channel();
+    let (retired, _retirements) = channel();
+    let readiness = Arc::new(TestReadinessSink { published, retired });
+
+    let private_receiver = create_udp_socket(&session, readiness.clone());
+    let SocketOutcome::Completed(private_address) = litebox_broker_core::socket::bind(
+        &session,
+        private_receiver,
+        SocketAddrV4::new(GUEST_IPV4_ADDRESS, 0),
+    )
+    .unwrap() else {
+        panic!("private UDP bind failed");
+    };
+    let loopback_receiver = create_udp_socket(&session, readiness.clone());
+    let SocketOutcome::Completed(loopback_address) = litebox_broker_core::socket::bind(
+        &session,
+        loopback_receiver,
+        SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+    )
+    .unwrap() else {
+        panic!("loopback UDP bind failed");
+    };
+
+    let sender = create_udp_socket(&session, readiness);
+    assert_eq!(
+        litebox_broker_core::socket::connect(&session, sender, private_address),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+    );
+    let private_source = litebox_broker_core::socket::status(&session, sender)
+        .unwrap()
+        .local_address
+        .expect("private UDP connect lost its local address");
+    assert_eq!(*private_source.ip(), GUEST_IPV4_ADDRESS);
+
+    assert_eq!(
+        litebox_broker_core::socket::connect(&session, sender, loopback_address),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+    );
+    let loopback_source = litebox_broker_core::socket::status(&session, sender)
+        .unwrap()
+        .local_address
+        .expect("loopback UDP reconnect lost its local address");
+    assert_eq!(
+        loopback_source,
+        SocketAddrV4::new(Ipv4Addr::LOCALHOST, private_source.port())
+    );
+}
+
+#[test]
 fn externally_connected_udp_preserves_guest_routing_identity() {
     let local_ip = non_loopback_local_ipv4();
     if std::env::var_os("CI").is_some() {
@@ -1797,19 +1874,20 @@ fn externally_connected_udp_preserves_guest_routing_identity() {
     external.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
     let external_address = socket_address_v4(external.local_addr().unwrap());
     let provider = Arc::new(LinuxSocketProvider::new(4, 2).unwrap());
-    let policy = SocketPolicy::from_udp_destination_rules(&[
-        DestinationRule::new(
-            CallerCredential::Unauthenticated,
-            Ipv4Cidr::new(Ipv4Address([127, 0, 0, 0]), 8).unwrap(),
-            DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
-        ),
-        DestinationRule::new(
-            CallerCredential::Unauthenticated,
-            Ipv4Cidr::new(Ipv4Address(local_ip.octets()), 32).unwrap(),
-            DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
-        ),
-    ])
-    .unwrap();
+    let policy = SocketPolicy::deny()
+        .with_udp_destination_rules(&[
+            DestinationRule::new(
+                CallerCredential::Unauthenticated,
+                Ipv4Cidr::new(Ipv4Address([127, 0, 0, 0]), 8).unwrap(),
+                DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
+            ),
+            DestinationRule::new(
+                CallerCredential::Unauthenticated,
+                Ipv4Cidr::new(Ipv4Address(local_ip.octets()), 32).unwrap(),
+                DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
+            ),
+        ])
+        .unwrap();
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all()).with_socket_policy(policy),
         BrokerCoreLimits::new_with_all_limits(6, 0, 4, 2),
@@ -1921,7 +1999,7 @@ fn guest_connected_udp_drains_native_ingress_without_delivering_it() {
     let provider = Arc::new(LinuxSocketProvider::new(4, 2).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(8, 0, 4, 2),
         provider.clone(),
     )

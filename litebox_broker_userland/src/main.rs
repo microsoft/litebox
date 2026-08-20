@@ -87,7 +87,7 @@ impl FromStr for AllowedTcpDestination {
 struct CliArgs {
     /// Permit outbound TCP connections to a destination CIDR and port range.
     ///
-    /// May be repeated. Supplying any rule replaces the default loopback-only policy.
+    /// May be repeated to extend the default guest-network policy for TCP.
     /// `0.0.0.0/0:1-65535` permits every nonzero IPv4 TCP destination.
     #[arg(long, value_name = "CIDR:PORT[-PORT]")]
     allow_tcp_destination: Vec<AllowedTcpDestination>,
@@ -127,7 +127,7 @@ fn configured_socket_policy(
     allowed_destinations: &[AllowedTcpDestination],
 ) -> Result<SocketPolicy, SocketPolicyError> {
     if allowed_destinations.is_empty() {
-        return Ok(SocketPolicy::Ipv4Loopback);
+        return Ok(SocketPolicy::guest_network());
     }
     let rules = allowed_destinations
         .iter()
@@ -139,13 +139,7 @@ fn configured_socket_policy(
             )
         })
         .collect::<Vec<_>>();
-    let udp_loopback = DestinationRule::new(
-        CallerCredential::HostGuaranteed,
-        Ipv4Cidr::new(Ipv4Address([127, 0, 0, 0]), 8).expect("the IPv4 loopback CIDR is canonical"),
-        DestinationPortRange::new(Port(1), Port(u16::MAX))
-            .expect("the full nonzero UDP port range is valid"),
-    );
-    SocketPolicy::from_tcp_udp_destination_rules(&rules, &[udp_loopback])
+    SocketPolicy::guest_network().with_tcp_destination_rules(&rules)
 }
 
 fn serve_runner<Memory, SetupChannel, RequestSource, ResponseSink, NotificationChannel, Shutdown>(
@@ -587,10 +581,10 @@ mod cli_tests {
     }
 
     #[test]
-    fn tcp_destination_arguments_replace_the_loopback_default() {
+    fn tcp_destination_arguments_extend_the_guest_network_default() {
         assert_eq!(
             configured_socket_policy(&[]).unwrap(),
-            SocketPolicy::Ipv4Loopback
+            SocketPolicy::guest_network()
         );
 
         let allowed = "0.0.0.0/0:80".parse::<AllowedTcpDestination>().unwrap();
@@ -605,14 +599,7 @@ mod cli_tests {
                 allowed.ports,
             )
         );
-        assert_eq!(
-            policy.udp_destination_rules().unwrap(),
-            &[DestinationRule::new(
-                CallerCredential::HostGuaranteed,
-                Ipv4Cidr::new(Ipv4Address([127, 0, 0, 0]), 8).unwrap(),
-                DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
-            )]
-        );
+        assert_eq!(policy.udp_destination_rules().unwrap(), &[]);
     }
 }
 

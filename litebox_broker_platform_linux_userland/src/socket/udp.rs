@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::os::fd::OwnedFd;
 
-use litebox_broker_core::socket::{GuestSocketBinding, PlatformConnectError};
+use litebox_broker_core::socket::{GUEST_IPV4_ADDRESS, GuestSocketBinding, PlatformConnectError};
 use litebox_broker_core::{BrokerError, Result as BrokerResult, SessionId};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
@@ -119,7 +119,6 @@ pub(super) struct ReactorUdpBinding {
 }
 
 pub(super) struct UdpSocketState {
-    pub(super) internal_address: Option<SocketAddrV4>,
     pub(super) peer: Option<ReactorUdpPeer>,
     guest_receive_queue: VecDeque<GuestDatagram>,
     guest_receive_bytes: usize,
@@ -133,7 +132,6 @@ pub(super) struct UdpSocketState {
 impl Default for UdpSocketState {
     fn default() -> Self {
         Self {
-            internal_address: None,
             peer: None,
             guest_receive_queue: VecDeque::new(),
             guest_receive_bytes: 0,
@@ -276,13 +274,11 @@ impl ReactorUdpState {
     }
 
     fn guest_binding(&self, address: SocketAddrV4) -> Option<ReactorUdpBinding> {
-        if !address.ip().is_loopback() {
-            return None;
-        }
         self.bindings
             .exact
             .get(&address)
             .or_else(|| self.bindings.wildcard.get(&address.port()))
+            .filter(|binding| binding.guest_binding.covers(address))
             .cloned()
     }
 
@@ -323,7 +319,11 @@ impl Reactor {
                 guest_address: address,
             });
         }
-        if address.ip().is_loopback() && self.udp.has_binding_on_port(address.port()) {
+        // TODO: Once gateway routing replaces host-loopback fallback, fail all
+        // unmatched guest-network destinations closed.
+        if *address.ip() == GUEST_IPV4_ADDRESS
+            || (address.ip().is_loopback() && self.udp.has_binding_on_port(address.port()))
+        {
             return SocketOutcome::Failed(SocketError::ConnectionRefused);
         }
         if self.is_private_udp_host_endpoint(address) {
@@ -689,20 +689,16 @@ impl Reactor {
         &mut self,
         source_socket_id: u64,
         destination_generation: u64,
+        source_guest_address: SocketAddrV4,
         payload: &[u8],
     ) -> BrokerResult<SocketOutcome<usize>> {
-        let (source_session_id, source_guest_address) = {
+        let source_session_id = {
             let source = self
                 .sockets
                 .get(&source_socket_id)
                 .ok_or(BrokerError::Internal)?;
-            (
-                source.session_id,
-                source
-                    .udp_state()?
-                    .internal_address
-                    .ok_or(BrokerError::Internal)?,
-            )
+            source.udp_state()?;
+            source.session_id
         };
         let destination_id = destination_generation;
         let accepts_source = {

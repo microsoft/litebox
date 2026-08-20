@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{Error, ErrorKind, Result as IoResult};
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::SocketAddrV4;
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
@@ -1100,18 +1100,11 @@ impl Reactor {
             if already_bound {
                 return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
             }
-            let internal_address = if binding.is_wildcard() {
-                SocketAddrV4::new(Ipv4Addr::LOCALHOST, requested_address.port())
-            } else {
-                requested_address
-            };
             self.udp.insert_binding(ReactorUdpBinding {
                 socket_id: id,
                 guest_binding: binding,
             })?;
             let socket = self.sockets.get_mut(&id).ok_or(BrokerError::Internal)?;
-            let udp = socket.udp_state_mut()?;
-            udp.internal_address = Some(internal_address);
             socket.guest_local_address = Some(requested_address);
             socket
                 .snapshot
@@ -1189,7 +1182,12 @@ impl Reactor {
                     .ok_or(BrokerError::Internal)?;
                 if binding.guest_binding.is_wildcard() {
                     let ip = match (&peer, &staged_endpoint, reused_host_address) {
-                        (ReactorUdpPeer::Guest { .. }, _, _) => Ipv4Addr::LOCALHOST,
+                        (ReactorUdpPeer::Guest { guest_address, .. }, _, _) => {
+                            return binding
+                                .guest_binding
+                                .guest_source_address(*guest_address)
+                                .ok_or(BrokerError::Internal);
+                        }
                         (ReactorUdpPeer::External(_), Some(endpoint), _) => {
                             *endpoint.host_address.ip()
                         }
@@ -1275,6 +1273,11 @@ impl Reactor {
                 socket_generation,
                 guest_address,
             } => {
+                let source_address = self
+                    .udp
+                    .binding_for_socket(id)
+                    .and_then(|binding| binding.guest_binding.guest_source_address(guest_address))
+                    .ok_or(BrokerError::Internal)?;
                 if self
                     .udp
                     .binding_for_socket(socket_generation)
@@ -1282,7 +1285,7 @@ impl Reactor {
                 {
                     return Ok(SocketOutcome::Failed(SocketError::ConnectionRefused));
                 }
-                self.enqueue_guest_datagram(id, socket_generation, data)
+                self.enqueue_guest_datagram(id, socket_generation, source_address, data)
             }
             ReactorUdpPeer::External(address) => {
                 let external_peer_added = if authorize_external_reply {
