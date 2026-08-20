@@ -1254,7 +1254,6 @@ mod tests {
 
     use core::mem::{size_of, size_of_val};
 
-    use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
     use litebox_common_windows::nt_status::NtStatus;
 
     use super::*;

@@ -1579,7 +1579,7 @@ mod tests {
     include!("api_set_mappings.rs");
 
     use alloc::{string::String, vec, vec::Vec};
-    use litebox::platform::{RawConstPointer as _, RawPointerProvider};
+    use litebox::platform::RawPointerProvider;
     use litebox_common_windows::loader::{
         ApiSetHashEntry, ApiSetNamespace, ApiSetNamespaceEntry, ApiSetValueEntry,
         MAX_API_SET_NAMESPACE_SIZE, api_set_hash_prefix,
@@ -1648,13 +1648,13 @@ mod tests {
         let len = len as usize;
         let end = offset.checked_add(len)?;
         let bytes = bytes.get(offset..end)?;
-        let mut chunks = bytes.chunks_exact(size_of::<u16>());
-        if !chunks.remainder().is_empty() {
+        let (chunks, remainder) = bytes.as_chunks::<{ size_of::<u16>() }>();
+        if !remainder.is_empty() {
             return None;
         }
         let units = chunks
-            .by_ref()
-            .map(|chunk| u16::from_le_bytes(chunk.try_into().expect("u16 byte chunk")))
+            .iter()
+            .map(|chunk| u16::from_le_bytes(*chunk))
             .collect::<Vec<_>>();
         Some(String::from_utf16_lossy(&units))
     }
