@@ -21,9 +21,9 @@ fn objdump(objdump_cmd: &str, binary: &[u8]) -> String {
         .lines()
         // Drop objdump's banner because its temporary filename varies by platform and invocation.
         .filter(|line| {
-            !line.rsplit_once(':').is_some_and(|(_, banner)| {
-                banner.trim_start().starts_with("file format ")
-            })
+            !line
+                .rsplit_once(':')
+                .is_some_and(|(_, banner)| banner.trim_start().starts_with("file format "))
         })
         .map(|line| normalize_objdump_line(line, trampoline_range.as_ref()))
         .collect::<Vec<_>>();
