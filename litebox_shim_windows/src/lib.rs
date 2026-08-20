@@ -1887,6 +1887,30 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 section_information_length,
                 return_length,
             ),
+            SyscallRequest::NtQueryObject {
+                handle,
+                object_information_class,
+                object_information,
+                object_information_length,
+                return_length,
+            } => self.sys_nt_query_object(
+                handle,
+                object_information_class,
+                object_information,
+                object_information_length,
+                return_length,
+            ),
+            SyscallRequest::NtSetInformationObject {
+                handle,
+                object_information_class,
+                object_information,
+                object_information_length,
+            } => self.sys_nt_set_information_object(
+                handle,
+                object_information_class,
+                object_information,
+                object_information_length,
+            ),
             SyscallRequest::NtQueryInformationProcess {
                 process_handle,
                 process_information_class,
@@ -2333,6 +2357,110 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     pub(crate) fn sys_nt_close(&self, handle: syscalls::Handle) -> NtStatus {
         self.close_handle(handle, CloseRawHandleVisitor { task: self })
+    }
+
+    fn handle_metadata(&self, handle: syscalls::Handle) -> Result<WindowsHandleMetadata, NtStatus> {
+        macro_rules! try_metadata {
+            ($subsystem:ty) => {
+                if let Some(result) =
+                    self.try_get_handle_metadata_for_subsystem::<$subsystem>(handle)
+                {
+                    return result;
+                }
+            };
+        }
+
+        try_metadata!(FileObjectSubsystem<FS>);
+        try_metadata!(RegistryKeySubsystem<Platform>);
+        try_metadata!(EventSubsystem<Platform>);
+        try_metadata!(SemaphoreSubsystem<Platform>);
+        try_metadata!(DirectoryObjectSubsystem<Platform>);
+        try_metadata!(SymbolicLinkSubsystem<Platform>);
+        try_metadata!(IoCompletionSubsystem<Platform>);
+        try_metadata!(LpcPortSubsystem<Platform>);
+        try_metadata!(TimerSubsystem<Platform>);
+        try_metadata!(WaitCompletionPacketSubsystem<Platform>);
+        try_metadata!(WorkerFactorySubsystem<Platform>);
+        try_metadata!(SectionSubsystem<Platform>);
+        try_metadata!(TokenSubsystem);
+        try_metadata!(ThreadSubsystem<Platform>);
+
+        Err(NtStatus::INVALID_HANDLE)
+    }
+
+    fn try_get_handle_metadata_for_subsystem<Subsystem>(
+        &self,
+        handle: syscalls::Handle,
+    ) -> Option<Result<WindowsHandleMetadata, NtStatus>>
+    where
+        Subsystem: WindowsHandleSubsystem,
+    {
+        let typed = match self.typed_handle::<Subsystem>(handle) {
+            Ok(typed) => typed,
+            Err(NtStatus::OBJECT_TYPE_MISMATCH) => return None,
+            Err(status) => return Some(Err(status)),
+        };
+        Some(self.typed_handle_metadata(&typed))
+    }
+
+    fn set_handle_attributes(
+        &self,
+        handle: syscalls::Handle,
+        mask: HandleAttributes,
+        attributes: HandleAttributes,
+    ) -> Result<(), NtStatus> {
+        macro_rules! try_set_attributes {
+            ($subsystem:ty) => {
+                if let Some(result) =
+                    self.try_set_handle_attributes::<$subsystem>(handle, mask, attributes)
+                {
+                    return result;
+                }
+            };
+        }
+
+        try_set_attributes!(FileObjectSubsystem<FS>);
+        try_set_attributes!(RegistryKeySubsystem<Platform>);
+        try_set_attributes!(EventSubsystem<Platform>);
+        try_set_attributes!(SemaphoreSubsystem<Platform>);
+        try_set_attributes!(DirectoryObjectSubsystem<Platform>);
+        try_set_attributes!(SymbolicLinkSubsystem<Platform>);
+        try_set_attributes!(IoCompletionSubsystem<Platform>);
+        try_set_attributes!(LpcPortSubsystem<Platform>);
+        try_set_attributes!(TimerSubsystem<Platform>);
+        try_set_attributes!(WaitCompletionPacketSubsystem<Platform>);
+        try_set_attributes!(WorkerFactorySubsystem<Platform>);
+        try_set_attributes!(SectionSubsystem<Platform>);
+        try_set_attributes!(TokenSubsystem);
+        try_set_attributes!(ThreadSubsystem<Platform>);
+
+        Err(NtStatus::INVALID_HANDLE)
+    }
+
+    fn try_set_handle_attributes<Subsystem>(
+        &self,
+        handle: syscalls::Handle,
+        mask: HandleAttributes,
+        attributes: HandleAttributes,
+    ) -> Option<Result<(), NtStatus>>
+    where
+        Subsystem: WindowsHandleSubsystem,
+    {
+        let typed = match self.typed_handle::<Subsystem>(handle) {
+            Ok(typed) => typed,
+            Err(NtStatus::OBJECT_TYPE_MISMATCH) => return None,
+            Err(status) => return Some(Err(status)),
+        };
+        Some(
+            self.global
+                .litebox
+                .descriptor_table_mut()
+                .with_metadata_mut::<Subsystem, WindowsHandleMetadata, _>(&typed, |metadata| {
+                    metadata.attributes.remove(mask);
+                    metadata.attributes.insert(attributes & mask);
+                })
+                .map_err(|_| NtStatus::INVALID_HANDLE),
+        )
     }
 
     #[expect(

@@ -12,8 +12,10 @@ use core::hash::{Hash, Hasher};
 use core::marker::PhantomData;
 use core::mem::size_of;
 
+use int_enum::IntEnum;
 use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider};
+use litebox::utils::TruncateExt as _;
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
@@ -36,6 +38,49 @@ const STANDARD_RIGHTS_REQUIRED: u32 = AccessMask::DELETE.bits()
     | AccessMask::READ_CONTROL.bits()
     | AccessMask::WRITE_DAC.bits()
     | AccessMask::WRITE_OWNER.bits();
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, IntEnum, PartialEq)]
+enum ObjectInformationClass {
+    Basic = 0,
+    Name = 1,
+    Type = 2,
+    Types = 3,
+    HandleFlag = 4,
+    Session = 5,
+    SessionObject = 6,
+    SetRefTrace = 7,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, FromBytes, Immutable, IntoBytes)]
+struct ObjectHandleFlagInformation {
+    inherit: u8,
+    protect_from_close: u8,
+}
+
+impl From<crate::HandleAttributes> for ObjectHandleFlagInformation {
+    fn from(attributes: crate::HandleAttributes) -> Self {
+        Self {
+            inherit: u8::from(attributes.contains(crate::HandleAttributes::INHERIT)),
+            protect_from_close: u8::from(
+                attributes.contains(crate::HandleAttributes::PROTECT_FROM_CLOSE),
+            ),
+        }
+    }
+}
+
+impl From<ObjectHandleFlagInformation> for crate::HandleAttributes {
+    fn from(information: ObjectHandleFlagInformation) -> Self {
+        let mut attributes = Self::empty();
+        attributes.set(Self::INHERIT, information.inherit != 0);
+        attributes.set(
+            Self::PROTECT_FROM_CLOSE,
+            information.protect_from_close != 0,
+        );
+        attributes
+    }
+}
 
 // Wine's server seeds these object-manager directories during init_directories/create_session;
 // ReactOS initializes the same root-style namespace through ObpRootDirectoryObject.
@@ -1043,6 +1088,85 @@ fn write_directory_records<Platform: RawPointerProvider>(
 }
 
 impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    pub(crate) fn sys_nt_query_object(
+        &self,
+        handle: Handle,
+        object_information_class: u32,
+        object_information: MutPtr<Platform, u8>,
+        object_information_length: u32,
+        return_length: Option<MutPtr<Platform, u32>>,
+    ) -> NtStatus {
+        match ObjectInformationClass::try_from(object_information_class) {
+            Ok(ObjectInformationClass::HandleFlag) => {}
+            Ok(_) => {
+                litebox_util_log::debug!(
+                    object_information_class = object_information_class;
+                    "Unsupported NtQueryObject class"
+                );
+                return NtStatus::NOT_IMPLEMENTED;
+            }
+            Err(_) => return NtStatus::INVALID_INFO_CLASS,
+        }
+        let required_length = size_of::<ObjectHandleFlagInformation>().trunc();
+        if object_information_length < required_length {
+            return NtStatus::INFO_LENGTH_MISMATCH;
+        }
+        let metadata = match self.handle_metadata(handle) {
+            Ok(metadata) => metadata,
+            Err(status) => return status,
+        };
+        if let Some(return_length) = return_length
+            && return_length.write_at_offset(0, required_length).is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        let information = MutPtr::<Platform, ObjectHandleFlagInformation>::from_usize(
+            object_information.as_usize(),
+        );
+        if information
+            .write_at_offset(0, ObjectHandleFlagInformation::from(metadata.attributes))
+            .is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        NtStatus::SUCCESS
+    }
+
+    pub(crate) fn sys_nt_set_information_object(
+        &self,
+        handle: Handle,
+        object_information_class: u32,
+        object_information: ConstPtr<Platform, u8>,
+        object_information_length: u32,
+    ) -> NtStatus {
+        match ObjectInformationClass::try_from(object_information_class) {
+            Ok(ObjectInformationClass::HandleFlag) => {}
+            Ok(_) => {
+                litebox_util_log::debug!(
+                    object_information_class = object_information_class;
+                    "Unsupported NtSetInformationObject class"
+                );
+                return NtStatus::NOT_IMPLEMENTED;
+            }
+            Err(_) => return NtStatus::INVALID_INFO_CLASS,
+        }
+        if object_information_length != size_of::<ObjectHandleFlagInformation>().trunc() {
+            return NtStatus::INFO_LENGTH_MISMATCH;
+        }
+        let information = ConstPtr::<Platform, ObjectHandleFlagInformation>::from_usize(
+            object_information.as_usize(),
+        );
+        let Some(information) = information.read_at_offset(0) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        let attributes = crate::HandleAttributes::from(information);
+        let mask = crate::HandleAttributes::INHERIT | crate::HandleAttributes::PROTECT_FROM_CLOSE;
+        match self.set_handle_attributes(handle, mask, attributes) {
+            Ok(()) => NtStatus::SUCCESS,
+            Err(status) => status,
+        }
+    }
+
     fn directory_entry(
         &self,
         handle: Handle,
@@ -1428,7 +1552,6 @@ mod tests {
     use alloc::sync::Arc;
     use core::mem::size_of;
 
-    use litebox::utils::TruncateExt as _;
     use litebox_common_windows::nt_status::NtStatus;
 
     use super::*;
@@ -1438,13 +1561,87 @@ mod tests {
         load_time_windows_shared_section,
     };
     use crate::tests::{
-        TestPlatform, const_ptr, mut_ptr, null_mut_ptr, object_attributes,
+        TestPlatform, const_ptr, mut_byte_ptr, mut_ptr, null_mut_ptr, object_attributes,
         run_with_test_platform_pointers, test_task, unicode_string, utf16_units,
     };
 
     const DIRECTORY_QUERY: u32 = 0x0000_0001;
     const DIRECTORY_TRAVERSE: u32 = 0x0000_0002;
     const DIRECTORY_ALL_ACCESS: u32 = 0x000f_000f;
+
+    #[test]
+    fn nt_object_handle_flags_round_trip() {
+        run_with_test_platform_pointers(|| {
+            let task = test_task();
+            let mut handle = Handle::default();
+            assert_eq!(
+                task.sys_nt_create_directory_object(
+                    mut_ptr(&mut handle),
+                    DIRECTORY_ALL_ACCESS,
+                    None,
+                    Handle::default(),
+                    0,
+                ),
+                NtStatus::SUCCESS
+            );
+
+            let set_information = ObjectHandleFlagInformation {
+                inherit: 1,
+                protect_from_close: 1,
+            };
+            let set_information =
+                ConstPtr::<TestPlatform, u8>::from_usize(const_ptr(&set_information).as_usize());
+            assert_eq!(
+                task.sys_nt_set_information_object(
+                    handle,
+                    ObjectInformationClass::HandleFlag as u32,
+                    set_information,
+                    size_of::<ObjectHandleFlagInformation>().trunc(),
+                ),
+                NtStatus::SUCCESS
+            );
+
+            let mut queried_information = ObjectHandleFlagInformation {
+                inherit: 0,
+                protect_from_close: 0,
+            };
+            let mut return_length = 0;
+            assert_eq!(
+                task.sys_nt_query_object(
+                    handle,
+                    ObjectInformationClass::HandleFlag as u32,
+                    mut_byte_ptr(&mut queried_information),
+                    size_of::<ObjectHandleFlagInformation>().trunc(),
+                    Some(mut_ptr(&mut return_length)),
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(queried_information.inherit, 1);
+            assert_eq!(queried_information.protect_from_close, 1);
+            assert_eq!(
+                return_length,
+                size_of::<ObjectHandleFlagInformation>().trunc()
+            );
+            assert_eq!(task.sys_nt_close(handle), NtStatus::HANDLE_NOT_CLOSABLE);
+
+            let clear_information = ObjectHandleFlagInformation {
+                inherit: 0,
+                protect_from_close: 0,
+            };
+            let clear_information =
+                ConstPtr::<TestPlatform, u8>::from_usize(const_ptr(&clear_information).as_usize());
+            assert_eq!(
+                task.sys_nt_set_information_object(
+                    handle,
+                    ObjectInformationClass::HandleFlag as u32,
+                    clear_information,
+                    size_of::<ObjectHandleFlagInformation>().trunc(),
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
+        });
+    }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     struct ParsedDirectoryInformation {
