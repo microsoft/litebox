@@ -304,7 +304,7 @@ fn directional_shutdown_survives_readiness_publication_failure() {
     let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::GuestNetwork),
+            .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(4, 0, 2, 2),
         provider,
     )

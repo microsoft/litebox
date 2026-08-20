@@ -667,7 +667,7 @@ fn test_runner_broker_tcp_client_with_rewriter() {
         litebox_broker_core::PolicyEngine::with_host_guaranteed_rights(
             litebox_broker_core::ObjectRights::all(),
         )
-        .with_socket_policy(litebox_broker_core::SocketPolicy::GuestNetwork),
+        .with_socket_policy(litebox_broker_core::SocketPolicy::guest_network()),
         1,
     );
     Runner::new(&target, "broker_tcp_client_rewriter")
@@ -756,7 +756,7 @@ fn test_runner_broker_udp_with_rewriter() {
         litebox_broker_core::PolicyEngine::with_host_guaranteed_rights(
             litebox_broker_core::ObjectRights::all(),
         )
-        .with_socket_policy(litebox_broker_core::SocketPolicy::GuestNetwork),
+        .with_socket_policy(litebox_broker_core::SocketPolicy::guest_network()),
         1,
     );
     runner
@@ -787,7 +787,7 @@ fn test_runner_broker_udp_namespace_delivers_after_sender_close() {
         litebox_broker_core::PolicyEngine::with_host_guaranteed_rights(
             litebox_broker_core::ObjectRights::all(),
         )
-        .with_socket_policy(litebox_broker_core::SocketPolicy::GuestNetwork),
+        .with_socket_policy(litebox_broker_core::SocketPolicy::guest_network()),
         2,
     );
     let mut server = Runner::new(&target, "broker_udp_namespace_server_rewriter")
@@ -856,7 +856,7 @@ fn test_runner_broker_tcp_server_with_rewriter() {
         litebox_broker_core::PolicyEngine::with_host_guaranteed_rights(
             litebox_broker_core::ObjectRights::all(),
         )
-        .with_socket_policy(litebox_broker_core::SocketPolicy::GuestNetwork),
+        .with_socket_policy(litebox_broker_core::SocketPolicy::guest_network()),
         1,
     );
     let mut child = Runner::new(&target, "broker_tcp_server_rewriter")
@@ -1279,7 +1279,7 @@ fn test_broker_with_curl() {
         litebox_broker_core::PolicyEngine::with_host_guaranteed_rights(
             litebox_broker_core::ObjectRights::all(),
         )
-        .with_socket_policy(litebox_broker_core::SocketPolicy::GuestNetwork),
+        .with_socket_policy(litebox_broker_core::SocketPolicy::guest_network()),
         1,
     );
     let url = format!("http://127.0.0.1:{port}/something");
@@ -1318,7 +1318,7 @@ fn test_broker_with_iperf3() {
         litebox_broker_core::PolicyEngine::with_host_guaranteed_rights(
             litebox_broker_core::ObjectRights::all(),
         )
-        .with_socket_policy(litebox_broker_core::SocketPolicy::GuestNetwork),
+        .with_socket_policy(litebox_broker_core::SocketPolicy::guest_network()),
         1,
     );
 

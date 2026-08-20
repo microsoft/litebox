@@ -175,7 +175,7 @@ pub enum SocketPolicyError {
 
 /// Bounded static IPv4 destination rules for one transport protocol.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DestinationPolicy {
+struct DestinationPolicy {
     destination_rules: [DestinationRule; MAX_DESTINATION_RULES],
     destination_rule_count: usize,
 }
@@ -200,44 +200,48 @@ impl DestinationPolicy {
 /// Local bind authority is separate from egress destination rules and is
 /// enforced by the broker's guest binding namespace.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[non_exhaustive]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "fixed-capacity policy storage avoids infallible allocation in no_std configuration"
-)]
-pub enum SocketPolicy {
-    /// Deny all socket creation and connection attempts.
-    #[default]
-    Deny,
-    /// Allow IPv4 TCP and UDP sockets within the shared guest network.
-    GuestNetwork,
-    /// Allow guest-network TCP plus bounded native TCP destination rules.
-    TcpDestinationRules(DestinationPolicy),
-    /// Allow guest-network UDP plus bounded native UDP destination rules.
-    UdpDestinationRules(DestinationPolicy),
-    /// Allow guest-network TCP and UDP plus independent native destination rules.
-    TcpUdpDestinationRules {
-        /// TCP destination policy.
-        tcp: DestinationPolicy,
-        /// UDP destination policy.
-        udp: DestinationPolicy,
-    },
+pub struct SocketPolicy {
+    tcp: Option<DestinationPolicy>,
+    udp: Option<DestinationPolicy>,
 }
 
 impl SocketPolicy {
+    /// Creates a policy that denies all socket creation and connection attempts.
+    #[must_use]
+    pub const fn deny() -> Self {
+        Self {
+            tcp: None,
+            udp: None,
+        }
+    }
+
+    /// Creates a policy allowing IPv4 TCP and UDP within the shared guest network.
+    #[must_use]
+    pub const fn guest_network() -> Self {
+        Self {
+            tcp: Some(DestinationPolicy::empty()),
+            udp: Some(DestinationPolicy::empty()),
+        }
+    }
+
     /// Creates a bounded policy from static IPv4 TCP destination rules.
     pub fn from_tcp_destination_rules(
         rules: &[DestinationRule],
     ) -> Result<Self, SocketPolicyError> {
-        Ok(Self::TcpDestinationRules(copy_destination_rules(rules)?))
+        Ok(Self {
+            tcp: Some(copy_destination_rules(rules)?),
+            udp: None,
+        })
     }
 
     /// Creates a bounded policy from static IPv4 UDP destination rules.
     pub fn from_udp_destination_rules(
         rules: &[DestinationRule],
     ) -> Result<Self, SocketPolicyError> {
-        let policy = copy_destination_rules(rules)?;
-        Ok(Self::UdpDestinationRules(policy))
+        Ok(Self {
+            tcp: None,
+            udp: Some(copy_destination_rules(rules)?),
+        })
     }
 
     /// Creates a policy with independent static IPv4 TCP and UDP rules.
@@ -245,37 +249,30 @@ impl SocketPolicy {
         tcp_rules: &[DestinationRule],
         udp_rules: &[DestinationRule],
     ) -> Result<Self, SocketPolicyError> {
-        let tcp = copy_destination_rules(tcp_rules)?;
-        let udp = copy_destination_rules(udp_rules)?;
-        Ok(Self::TcpUdpDestinationRules { tcp, udp })
+        Ok(Self {
+            tcp: Some(copy_destination_rules(tcp_rules)?),
+            udp: Some(copy_destination_rules(udp_rules)?),
+        })
     }
 
-    /// Returns the configured rules for a bounded destination policy.
+    /// Returns the native TCP destination rules, or `None` when TCP is denied.
     #[must_use]
     pub fn tcp_destination_rules(&self) -> Option<&[DestinationRule]> {
-        match self {
-            Self::TcpDestinationRules(policy)
-            | Self::TcpUdpDestinationRules { tcp: policy, .. } => Some(policy.rules()),
-            Self::Deny | Self::GuestNetwork | Self::UdpDestinationRules(_) => None,
-        }
+        self.tcp.as_ref().map(DestinationPolicy::rules)
     }
 
-    /// Returns the configured UDP rules for a bounded destination policy.
+    /// Returns the native UDP destination rules, or `None` when UDP is denied.
     #[must_use]
     pub fn udp_destination_rules(&self) -> Option<&[DestinationRule]> {
-        match self {
-            Self::UdpDestinationRules(policy)
-            | Self::TcpUdpDestinationRules { udp: policy, .. } => Some(policy.rules()),
-            Self::Deny | Self::GuestNetwork | Self::TcpDestinationRules(_) => None,
-        }
+        self.udp.as_ref().map(DestinationPolicy::rules)
     }
 
-    fn permits_tcp_socket(self) -> bool {
-        !matches!(self, Self::Deny | Self::UdpDestinationRules(_))
+    const fn permits_tcp_socket(self) -> bool {
+        self.tcp.is_some()
     }
 
-    fn permits_udp_socket(self) -> bool {
-        !matches!(self, Self::Deny | Self::TcpDestinationRules(_))
+    const fn permits_udp_socket(self) -> bool {
+        self.udp.is_some()
     }
 
     fn permits_tcp_destination(
@@ -283,18 +280,13 @@ impl SocketPolicy {
         caller_credential: CallerCredential,
         address: SocketAddrV4,
     ) -> bool {
-        match self {
-            Self::Deny | Self::UdpDestinationRules(_) => false,
-            Self::GuestNetwork => is_guest_network_address(*address.ip()),
-            Self::TcpDestinationRules(policy)
-            | Self::TcpUdpDestinationRules { tcp: policy, .. } => {
-                is_guest_network_address(*address.ip())
-                    || policy
-                        .rules()
-                        .iter()
-                        .any(|rule| rule.permits(caller_credential, address))
-            }
-        }
+        self.tcp.is_some_and(|policy| {
+            is_guest_network_address(*address.ip())
+                || policy
+                    .rules()
+                    .iter()
+                    .any(|rule| rule.permits(caller_credential, address))
+        })
     }
 
     fn permits_udp_destination(
@@ -302,18 +294,13 @@ impl SocketPolicy {
         caller_credential: CallerCredential,
         address: SocketAddrV4,
     ) -> bool {
-        match self {
-            Self::Deny | Self::TcpDestinationRules(_) => false,
-            Self::GuestNetwork => is_guest_network_address(*address.ip()),
-            Self::UdpDestinationRules(policy)
-            | Self::TcpUdpDestinationRules { udp: policy, .. } => {
-                is_guest_network_address(*address.ip())
-                    || policy
-                        .rules()
-                        .iter()
-                        .any(|rule| rule.permits(caller_credential, address))
-            }
-        }
+        self.udp.is_some_and(|policy| {
+            is_guest_network_address(*address.ip())
+                || policy
+                    .rules()
+                    .iter()
+                    .any(|rule| rule.permits(caller_credential, address))
+        })
     }
 }
 
@@ -362,7 +349,7 @@ impl PolicyEngine {
     pub const fn new(profile: PolicyProfile) -> Self {
         Self {
             profile,
-            socket_policy: SocketPolicy::Deny,
+            socket_policy: SocketPolicy::deny(),
         }
     }
 
@@ -516,6 +503,11 @@ mod tests {
 
     #[test]
     fn socket_policy_defaults_to_deny() {
+        let socket_policy = SocketPolicy::default();
+        assert_eq!(socket_policy, SocketPolicy::deny());
+        assert_eq!(socket_policy.tcp_destination_rules(), None);
+        assert_eq!(socket_policy.udp_destination_rules(), None);
+
         let policy = PolicyEngine::with_unauthenticated_rights(ObjectRights::all());
         assert_eq!(
             policy.authorize_socket_create(CallerCredential::Unauthenticated, IPV4_TCP),
@@ -568,6 +560,12 @@ mod tests {
                 .unwrap(),
             &maximum
         );
+        assert_eq!(
+            SocketPolicy::from_tcp_destination_rules(&maximum)
+                .unwrap()
+                .udp_destination_rules(),
+            None
+        );
 
         let excessive = [rule; MAX_DESTINATION_RULES + 1];
         assert_eq!(
@@ -593,6 +591,12 @@ mod tests {
                 .udp_destination_rules()
                 .unwrap(),
             &maximum
+        );
+        assert_eq!(
+            SocketPolicy::from_udp_destination_rules(&maximum)
+                .unwrap()
+                .tcp_destination_rules(),
+            None
         );
 
         let excessive = [rule; MAX_DESTINATION_RULES + 1];
@@ -661,8 +665,11 @@ mod tests {
 
     #[test]
     fn guest_network_policy_allows_tcp_and_udp_only_within_the_guest_network() {
+        let socket_policy = SocketPolicy::guest_network();
+        assert_eq!(socket_policy.tcp_destination_rules(), Some([].as_slice()));
+        assert_eq!(socket_policy.udp_destination_rules(), Some([].as_slice()));
         let policy = PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::GuestNetwork);
+            .with_socket_policy(socket_policy);
         assert_eq!(
             policy.authorize_socket_connect(
                 CallerCredential::Unauthenticated,

@@ -35,8 +35,8 @@ use spin::rwlock::RwLock;
 
 pub use error::BrokerError;
 pub use policy::{
-    DestinationPolicy, DestinationPortRange, DestinationRule, Ipv4Cidr, MAX_DESTINATION_RULES,
-    PolicyEngine, PolicyProfile, SocketPolicy, SocketPolicyError,
+    DestinationPortRange, DestinationRule, Ipv4Cidr, MAX_DESTINATION_RULES, PolicyEngine,
+    PolicyProfile, SocketPolicy, SocketPolicyError,
 };
 use session::ObjectReference;
 pub use session::{BrokerSession, CallerCredential, ObjectRights, SessionId};

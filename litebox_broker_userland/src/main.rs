@@ -127,7 +127,7 @@ fn configured_socket_policy(
     allowed_destinations: &[AllowedTcpDestination],
 ) -> Result<SocketPolicy, SocketPolicyError> {
     if allowed_destinations.is_empty() {
-        return Ok(SocketPolicy::GuestNetwork);
+        return Ok(SocketPolicy::guest_network());
     }
     let rules = allowed_destinations
         .iter()
@@ -584,7 +584,7 @@ mod cli_tests {
     fn tcp_destination_arguments_extend_the_guest_network_default() {
         assert_eq!(
             configured_socket_policy(&[]).unwrap(),
-            SocketPolicy::GuestNetwork
+            SocketPolicy::guest_network()
         );
 
         let allowed = "0.0.0.0/0:80".parse::<AllowedTcpDestination>().unwrap();
