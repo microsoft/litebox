@@ -206,7 +206,7 @@ jobs:
         with:
           tool: nextest@${{ env.NEXTEST_VERSION }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --locked --verbose --all-targets --all-features -p litebox_runner_linux_on_windows_userland -p litebox_runner_windows_userland
+      - run: cargo clippy --locked --verbose --all-targets --all-features -p litebox_runner_linux_on_windows_userland -p litebox_runner_windows_userland -p litebox_shim_windows
       - run: cargo build --locked --verbose -p litebox_runner_linux_on_windows_userland -p litebox_runner_windows_userland
       - run: cargo nextest run --locked --profile ci -p litebox_runner_linux_on_windows_userland -p litebox_runner_windows_userland
       - run: cargo nextest run --locked --profile ci -p litebox_shim_linux
