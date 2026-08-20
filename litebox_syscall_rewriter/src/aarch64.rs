@@ -2150,7 +2150,7 @@ enum PatchKind {
 ///
 /// `MRS XZR, TPIDR_EL0` is a discarded read (register 31 as an `LDR` base would
 /// mean `SP`), so it is left native; every other `MRS Xd, TPIDR_EL0` is gated.
-#[cfg(any(test, target_arch = "aarch64"))]
+#[cfg(test)]
 fn find_patch_sites(
     sections: &[TextSectionInfo],
     buf: &[u8],
@@ -2335,7 +2335,7 @@ pub(crate) struct HookOutcome {
 /// whose gate cannot branch back, is replaced with a trap and listed in
 /// [`HookOutcome::trapped_sites`] so the caller can reject the incomplete
 /// rewrite, mirroring the x86-64 unpatchable-syscall path.
-#[cfg(any(test, target_arch = "aarch64"))]
+#[cfg(test)]
 pub(crate) fn hook_syscalls_aarch64(
     buf: &mut [u8],
     text_sections: &[TextSectionInfo],
@@ -2487,13 +2487,13 @@ fn trap_site(buf: &mut [u8], file_offset: usize) {
 ///
 /// The `cfg` tracks reachability, not capability: the scan and the rewrite are
 /// host-agnostic, but nothing calls this in an x86-64 build.
-#[cfg(any(test, target_arch = "aarch64"))]
-pub(crate) fn trap_all_patch_sites(
+pub(crate) fn trap_all_patch_sites_with_code_ranges(
     buf: &mut [u8],
-    text_sections: &[TextSectionInfo],
+    executable_sections: &[TextSectionInfo],
+    code_sections: &[TextSectionInfo],
     config: RewriteConfig,
 ) -> Result<usize> {
-    let sites = find_patch_sites(text_sections, buf, config)?;
+    let sites = find_patch_sites_with_code_ranges(executable_sections, code_sections, buf, config)?;
     for site in &sites {
         trap_site(buf, site.file_offset);
     }

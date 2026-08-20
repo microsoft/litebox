@@ -60,6 +60,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
+use core::ops::Range;
 
 use litebox_common_windows::NtSysno;
 use object::pe::{IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE};
@@ -220,6 +221,73 @@ struct Aarch64ScanSections<'a> {
     code: &'a [TextSectionInfo],
 }
 
+/// Mapping-relative ranges used by AArch64 patch-site scanning.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Aarch64CodeScanRanges {
+    pub executable: Vec<Range<usize>>,
+    pub identified: Vec<Range<usize>>,
+}
+
+/// Owned AArch64 ELF code metadata, independent of the parsed ELF buffer.
+#[derive(Clone)]
+pub struct Aarch64ElfCodeMetadata {
+    executable: Vec<TextSectionInfo>,
+    identified: Vec<TextSectionInfo>,
+}
+
+impl Aarch64ElfCodeMetadata {
+    /// Parse executable and positively identified code ranges from an ELF64 image.
+    pub fn parse(elf: &[u8]) -> Result<Self> {
+        let word_len = elf.len().div_ceil(8);
+        let mut aligned = Vec::new();
+        aligned
+            .try_reserve_exact(word_len)
+            .map_err(|_| Error::ParseError("ELF metadata allocation failed".into()))?;
+        aligned.resize(word_len, 0u64);
+        let bytes = aligned.as_mut_bytes();
+        bytes[..elf.len()].copy_from_slice(elf);
+        Self::parse_aligned(&mut aligned, elf.len())
+    }
+
+    /// Parse an ELF image already stored in 8-byte-aligned words without copying it.
+    pub fn parse_aligned(aligned: &mut [u64], byte_len: usize) -> Result<Self> {
+        let bytes = aligned.as_mut_bytes();
+        if byte_len > bytes.len() {
+            return Err(Error::ParseError(
+                "aligned ELF byte length exceeds storage".into(),
+            ));
+        }
+        fixup_phdr_alignment(&mut bytes[..byte_len]);
+        let file = object::File::parse(&bytes[..byte_len])
+            .map_err(|error| Error::ParseError(error.to_string()))?;
+        if file.architecture() != object::Architecture::Aarch64 {
+            return Err(Error::UnsupportedExecutable(
+                "code metadata requires an AArch64 ELF".into(),
+            ));
+        }
+        match aarch64_elf_code_metadata(&file) {
+            Ok(metadata) => Ok(metadata),
+            Err(InternalError::Public(error)) => Err(error),
+            Err(InternalError::NoTextSectionFound) => Err(Error::UnsupportedExecutable(
+                "AArch64 ELF has no executable code ranges".into(),
+            )),
+            Err(error) => unreachable!("unexpected metadata error: {error:?}"),
+        }
+    }
+
+    /// Project ELF file ranges into one file-backed mapping.
+    pub fn ranges_for_mapping(
+        &self,
+        file_offset: u64,
+        mapping_len: usize,
+    ) -> Result<Aarch64CodeScanRanges> {
+        Ok(Aarch64CodeScanRanges {
+            executable: project_file_ranges(&self.executable, file_offset, mapping_len)?,
+            identified: project_file_ranges(&self.identified, file_offset, mapping_len)?,
+        })
+    }
+}
+
 struct SyscallPatchResult {
     found_syscall: bool,
     skipped_addrs: Vec<u64>,
@@ -341,24 +409,22 @@ pub fn hook_syscalls_in_elf_with_options(
             _ => return Ok(input_binary.to_vec()),
         };
 
-        let executable_sections = match if arch == Arch::Aarch64 {
-            text_sections(&file).or_else(|error| match error {
-                InternalError::NoTextSectionFound => aarch64_executable_segments(&file),
-                other => Err(other),
-            })
-        } else {
-            text_sections(&file)
-        } {
-            Ok(sections) => sections,
-            Err(InternalError::NoTextSectionFound) => return Ok(input_binary.to_vec()),
-            Err(InternalError::Public(e)) => return Err(e),
-            Err(e) => unreachable!("unexpected internal error: {e:?}"),
-        };
         let (text_sections, aarch64_code_sections) = if arch == Arch::Aarch64 {
-            let code = aarch64_code_sections(&file, &executable_sections);
-            (executable_sections, code)
+            let metadata = match aarch64_elf_code_metadata(&file) {
+                Ok(metadata) => metadata,
+                Err(InternalError::NoTextSectionFound) => return Ok(input_binary.to_vec()),
+                Err(InternalError::Public(error)) => return Err(error),
+                Err(error) => unreachable!("unexpected metadata error: {error:?}"),
+            };
+            (metadata.executable, metadata.identified)
         } else {
-            (executable_sections, Vec::new())
+            let sections = match text_sections(&file) {
+                Ok(sections) => sections,
+                Err(InternalError::NoTextSectionFound) => return Ok(input_binary.to_vec()),
+                Err(InternalError::Public(error)) => return Err(error),
+                Err(error) => unreachable!("unexpected internal error: {error:?}"),
+            };
+            (sections, Vec::new())
         };
 
         if is_already_hooked(&*buf, arch) {
@@ -1082,6 +1148,50 @@ fn aarch64_executable_segments(
         return Err(InternalError::NoTextSectionFound);
     }
     Ok(segments)
+}
+
+fn aarch64_elf_code_metadata(
+    file: &object::File<'_>,
+) -> core::result::Result<Aarch64ElfCodeMetadata, InternalError> {
+    let executable = text_sections(file).or_else(|error| match error {
+        InternalError::NoTextSectionFound => aarch64_executable_segments(file),
+        other => Err(other),
+    })?;
+    let identified = aarch64_code_sections(file, &executable);
+    Ok(Aarch64ElfCodeMetadata {
+        executable,
+        identified,
+    })
+}
+
+fn project_file_ranges(
+    ranges: &[TextSectionInfo],
+    mapping_file_offset: u64,
+    mapping_len: usize,
+) -> Result<Vec<Range<usize>>> {
+    let mapping_len =
+        u64::try_from(mapping_len).map_err(|_| Error::AddressOverflow("mapping length".into()))?;
+    let mapping_end = mapping_file_offset
+        .checked_add(mapping_len)
+        .ok_or_else(|| Error::AddressOverflow("mapping file range".into()))?;
+    let mut projected = Vec::new();
+    for range in ranges {
+        let range_end = range
+            .file_offset
+            .checked_add(range.size)
+            .ok_or_else(|| Error::AddressOverflow("ELF code file range".into()))?;
+        let start = range.file_offset.max(mapping_file_offset);
+        let end = range_end.min(mapping_end);
+        if start < end {
+            projected.push(
+                usize::try_from(start - mapping_file_offset)
+                    .map_err(|_| Error::AddressOverflow("projected range start".into()))?
+                    ..usize::try_from(end - mapping_file_offset)
+                        .map_err(|_| Error::AddressOverflow("projected range end".into()))?,
+            );
+        }
+    }
+    Ok(projected)
 }
 
 /// Builds ranges where metadata positively identifies AArch64 code. Executable
@@ -1842,14 +1952,42 @@ fn patch_aarch64_code_segment(
     syscall_entry_addr: u64,
     options: RewriteOptions,
 ) -> Result<(Vec<u8>, Vec<u64>)> {
-    let section = TextSectionInfo {
-        vaddr: code_vaddr,
-        file_offset: 0,
-        size: code.len() as u64,
-    };
-    let Some(outcome) = aarch64::hook_syscalls_aarch64(
+    let ranges = whole_code_scan_ranges(code.len());
+    patch_aarch64_code_segment_with_options_and_ranges(
         code,
-        &[section],
+        code_vaddr,
+        &ranges,
+        trampoline_write_vaddr,
+        syscall_entry_addr,
+        options,
+    )
+}
+
+#[cfg(any(test, target_arch = "aarch64"))]
+fn whole_code_scan_ranges(code_len: usize) -> Aarch64CodeScanRanges {
+    let executable: Vec<Range<usize>> = core::iter::once(0..code_len).collect();
+    let identified = executable.clone();
+    Aarch64CodeScanRanges {
+        executable,
+        identified,
+    }
+}
+
+/// Runtime AArch64 rewriting constrained by mapping-relative ELF code ranges.
+pub fn patch_aarch64_code_segment_with_options_and_ranges(
+    code: &mut [u8],
+    code_vaddr: u64,
+    ranges: &Aarch64CodeScanRanges,
+    trampoline_write_vaddr: u64,
+    syscall_entry_addr: u64,
+    options: RewriteOptions,
+) -> Result<(Vec<u8>, Vec<u64>)> {
+    let executable = scan_sections(code_vaddr, &ranges.executable, code.len())?;
+    let identified = scan_sections(code_vaddr, &ranges.identified, code.len())?;
+    let Some(outcome) = aarch64::hook_syscalls_aarch64_with_code_ranges(
+        code,
+        &executable,
+        &identified,
         trampoline_write_vaddr,
         syscall_entry_addr,
         aarch64::RewriteConfig::new(options.target_host(), options.effective_virtualize_x18()),
@@ -1859,6 +1997,30 @@ fn patch_aarch64_code_segment(
     };
 
     Ok((outcome.trampoline, outcome.trapped_sites))
+}
+
+fn scan_sections(
+    code_vaddr: u64,
+    ranges: &[Range<usize>],
+    code_len: usize,
+) -> Result<Vec<TextSectionInfo>> {
+    ranges
+        .iter()
+        .map(|range| {
+            if range.start > range.end || range.end > code_len {
+                return Err(Error::ParseError(
+                    "scan range extends beyond mapping".into(),
+                ));
+            }
+            Ok(TextSectionInfo {
+                vaddr: code_vaddr
+                    .checked_add(range.start as u64)
+                    .ok_or_else(|| Error::AddressOverflow("scan range address".into()))?,
+                file_offset: range.start as u64,
+                size: (range.end - range.start) as u64,
+            })
+        })
+        .collect()
 }
 
 /// Replace every syscall patch site in `code` with a trap instruction, so that
@@ -1917,14 +2079,23 @@ fn trap_all_aarch64_patch_sites(
     code_vaddr: u64,
     options: RewriteOptions,
 ) -> Result<usize> {
-    let section = TextSectionInfo {
-        vaddr: code_vaddr,
-        file_offset: 0,
-        size: code.len() as u64,
-    };
-    aarch64::trap_all_patch_sites(
+    let ranges = whole_code_scan_ranges(code.len());
+    trap_all_aarch64_patch_sites_with_options_and_ranges(code, code_vaddr, &ranges, options)
+}
+
+/// Trap runtime AArch64 patch sites selected by mapping-relative ELF ranges.
+pub fn trap_all_aarch64_patch_sites_with_options_and_ranges(
+    code: &mut [u8],
+    code_vaddr: u64,
+    ranges: &Aarch64CodeScanRanges,
+    options: RewriteOptions,
+) -> Result<usize> {
+    let executable = scan_sections(code_vaddr, &ranges.executable, code.len())?;
+    let identified = scan_sections(code_vaddr, &ranges.identified, code.len())?;
+    aarch64::trap_all_patch_sites_with_code_ranges(
         code,
-        &[section],
+        &executable,
+        &identified,
         aarch64::RewriteConfig::new(options.target_host(), options.effective_virtualize_x18()),
     )
 }
