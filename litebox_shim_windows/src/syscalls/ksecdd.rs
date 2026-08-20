@@ -379,8 +379,10 @@ fn read_utf16_at_offset<Platform: crate::ShimPlatform>(
     let address = buffer.as_usize().checked_add(offset)?;
     let bytes = ConstPtr::<Platform, u8>::from_usize(address).to_owned_slice(byte_length)?;
     let units = bytes
-        .chunks_exact(size_of::<u16>())
-        .map(|bytes| u16::from_le_bytes(bytes.try_into().unwrap()))
+        .as_chunks::<{ size_of::<u16>() }>()
+        .0
+        .iter()
+        .map(|bytes| u16::from_le_bytes(*bytes))
         .collect::<alloc::vec::Vec<_>>();
     let terminator = units.iter().position(|&unit| unit == 0)?;
     String::from_utf16(&units[..terminator]).ok()
