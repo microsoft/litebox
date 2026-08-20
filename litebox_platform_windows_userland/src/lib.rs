@@ -351,7 +351,7 @@ impl litebox::platform::SignalProvider for WindowsUserland {
 /// Ensures the module-wide TLS slot index ([`TLS_INDEX`]) has been allocated.
 ///
 /// This must be called before any code that reads `TLS_INDEX`. Both
-/// [`run_thread`] (guest threads) and [`run_test_thread`](WindowsUserland::run_test_thread)
+/// [`run_thread`] (guest threads) and `WindowsUserland::run_test_thread`
 /// (test threads) go through here.
 fn ensure_tls_index() {
     // Allocate a TLS slot for this module if not already done. This is used as
