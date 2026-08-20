@@ -1725,7 +1725,7 @@ const LDR_LITERAL_SHAPE_MASK: u32 = 0xFF00_001F;
 /// fields zeroed. An encoder selects a variant and ORs in its operands via
 /// [`Opcode::bits`]. (`MRS TPIDR_EL0` is encoded from [`Opcode::MrsTpidrEl0`],
 /// whose bits equal [`MRS_TPIDR_EL0_BITS`] — the scan-detection pattern in
-/// [`find_patch_sites`].)
+/// [`find_patch_sites_with_code_ranges`].)
 #[repr(u32)]
 #[derive(Clone, Copy)]
 enum Opcode {

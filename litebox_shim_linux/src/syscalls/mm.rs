@@ -1093,6 +1093,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 .is_some(),
             "fatal: failed to write trap bytes back to code segment"
         );
+
+        // Restore RX.
         self.sys_mprotect_raw(
             mapped_addr,
             len,
