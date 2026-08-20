@@ -215,42 +215,10 @@ struct TextSectionInfo {
     size: u64,
 }
 
-#[derive(Clone, Copy)]
-struct Aarch64ScanSections<'a> {
-    executable: &'a [TextSectionInfo],
-    code: &'a [TextSectionInfo],
-}
-
-/// Mapping-relative ranges used by AArch64 patch-site scanning.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Aarch64CodeScanRanges {
-    pub executable: Vec<Range<usize>>,
-    pub identified: Vec<Range<usize>>,
-}
-
-/// Owned AArch64 ELF code metadata, independent of the parsed ELF buffer.
-#[derive(Clone)]
-pub struct Aarch64ElfCodeMetadata {
-    executable: Vec<TextSectionInfo>,
-    identified: Vec<TextSectionInfo>,
-}
-
-impl Aarch64ElfCodeMetadata {
-    /// Parse executable and positively identified code ranges from an ELF64 image.
-    pub fn parse(elf: &[u8]) -> Result<Self> {
-        let word_len = elf.len().div_ceil(8);
-        let mut aligned = Vec::new();
-        aligned
-            .try_reserve_exact(word_len)
-            .map_err(|_| Error::ParseError("ELF metadata allocation failed".into()))?;
-        aligned.resize(word_len, 0u64);
-        let bytes = aligned.as_mut_bytes();
-        bytes[..elf.len()].copy_from_slice(elf);
-        Self::parse_aligned(&mut aligned, elf.len())
-    }
-
-    /// Parse an ELF image already stored in 8-byte-aligned words without copying it.
-    pub fn parse_aligned(aligned: &mut [u64], byte_len: usize) -> Result<Self> {
+impl aarch64::ElfCodeMetadata {
+    /// Parse an ELF image in aligned storage, relocating an unaligned program
+    /// header table within that storage if required by the object parser.
+    pub fn parse_aligned_in_place(aligned: &mut [u64], byte_len: usize) -> Result<Self> {
         let bytes = aligned.as_mut_bytes();
         if byte_len > bytes.len() {
             return Err(Error::ParseError(
@@ -280,8 +248,8 @@ impl Aarch64ElfCodeMetadata {
         &self,
         file_offset: u64,
         mapping_len: usize,
-    ) -> Result<Aarch64CodeScanRanges> {
-        Ok(Aarch64CodeScanRanges {
+    ) -> Result<aarch64::CodeScanRanges> {
+        Ok(aarch64::CodeScanRanges {
             executable: project_file_ranges(&self.executable, file_offset, mapping_len)?,
             identified: project_file_ranges(&self.identified, file_offset, mapping_len)?,
         })
@@ -444,7 +412,7 @@ pub fn hook_syscalls_in_elf_with_options(
         return hook_aarch64_elf(
             input_binary,
             buf,
-            Aarch64ScanSections {
+            aarch64::ScanSections {
                 executable: &text_sections,
                 code: &aarch64_code_sections,
             },
@@ -977,7 +945,7 @@ fn append_trampoline_footer(
 fn hook_aarch64_elf(
     input_binary: &[u8],
     buf: &mut [u8],
-    sections: Aarch64ScanSections<'_>,
+    sections: aarch64::ScanSections<'_>,
     placement: TrampolinePlacement,
     callback: u64,
     options: RewriteOptions,
@@ -1035,7 +1003,7 @@ fn hook_aarch64_elf(
 fn hook_aarch64_elf_at(
     input_binary: &[u8],
     buf: &mut [u8],
-    sections: Aarch64ScanSections<'_>,
+    sections: aarch64::ScanSections<'_>,
     trampoline_base_addr: u64,
     trampoline_limit: Option<u64>,
     callback: u64,
@@ -1120,45 +1088,12 @@ fn text_sections(
     Ok(text_sections)
 }
 
-/// Returns executable load segments only as a fallback for AArch64 ELFs whose
-/// section table is absent. When executable sections exist, scanning them avoids
-/// treating unrelated headers, metadata, or padding in an RX segment as code.
-fn aarch64_executable_segments(
-    file: &object::File<'_>,
-) -> core::result::Result<Vec<TextSectionInfo>, InternalError> {
-    let mut segments: Vec<_> = file
-        .segments()
-        .filter_map(|segment| {
-            let object::SegmentFlags::Elf { p_flags } = segment.flags() else {
-                return None;
-            };
-            if p_flags & object::elf::PF_X == 0 {
-                return None;
-            }
-            let (file_offset, size) = segment.file_range();
-            Some(TextSectionInfo {
-                vaddr: segment.address(),
-                file_offset,
-                size,
-            })
-        })
-        .collect();
-    segments.sort_unstable_by_key(|segment| segment.vaddr);
-    if segments.is_empty() {
-        return Err(InternalError::NoTextSectionFound);
-    }
-    Ok(segments)
-}
-
 fn aarch64_elf_code_metadata(
     file: &object::File<'_>,
-) -> core::result::Result<Aarch64ElfCodeMetadata, InternalError> {
-    let executable = text_sections(file).or_else(|error| match error {
-        InternalError::NoTextSectionFound => aarch64_executable_segments(file),
-        other => Err(other),
-    })?;
+) -> core::result::Result<aarch64::ElfCodeMetadata, InternalError> {
+    let executable = text_sections(file)?;
     let identified = aarch64_code_sections(file, &executable);
-    Ok(Aarch64ElfCodeMetadata {
+    Ok(aarch64::ElfCodeMetadata {
         executable,
         identified,
     })
@@ -1213,16 +1148,20 @@ fn aarch64_code_sections(
 
     if let Some(section) = file.section_by_name(".eh_frame")
         && let Ok(data) = section.uncompressed_data()
-    {
-        ranges.extend(eh_frame_ranges(
+        && let Some(eh_frame_ranges) = eh_frame_ranges(
             &data,
             section.address(),
             file.section_by_name(".text").map(|text| text.address()),
             file.section_by_name(".got").map(|got| got.address()),
-        ));
+        )
+    {
+        ranges.extend(eh_frame_ranges);
     }
 
     let has_function_metadata = !aarch64_ranges_to_sections(ranges.clone(), executable).is_empty();
+    if !has_function_metadata {
+        return executable.to_vec();
+    }
 
     for section in file.sections() {
         let Ok(name) = section.name() else {
@@ -1235,13 +1174,6 @@ fn aarch64_code_sections(
         }
     }
 
-    if !has_function_metadata
-        && let Some(text) = file.section_by_name(".text")
-        && let Some(end) = text.address().checked_add(text.size())
-    {
-        ranges.push((text.address(), end));
-    }
-
     aarch64_ranges_to_sections(ranges, executable)
 }
 
@@ -1250,7 +1182,7 @@ fn eh_frame_ranges(
     eh_frame_address: u64,
     text_address: Option<u64>,
     got_address: Option<u64>,
-) -> Vec<(u64, u64)> {
+) -> Option<Vec<(u64, u64)>> {
     let mut section = gimli::EhFrame::new(data, gimli::LittleEndian);
     section.set_address_size(8);
     let mut bases = gimli::BaseAddresses::default().set_eh_frame(eh_frame_address);
@@ -1263,12 +1195,14 @@ fn eh_frame_ranges(
     let mut entries = gimli::UnwindSection::entries(&section, &bases);
     let mut ranges = Vec::new();
     loop {
-        let Ok(Some(entry)) = entries.next() else {
-            return ranges;
+        let entry = match entries.next() {
+            Ok(Some(entry)) => entry,
+            Ok(None) => return Some(ranges),
+            Err(_) => return None,
         };
         if let gimli::CieOrFde::Fde(partial) = entry {
             let Ok(fde) = partial.parse(gimli::UnwindSection::cie_from_offset) else {
-                return ranges;
+                return None;
             };
             if fde.len() != 0
                 && let Some(end) = fde.initial_address().checked_add(fde.len())
@@ -1964,10 +1898,10 @@ fn patch_aarch64_code_segment(
 }
 
 #[cfg(any(test, target_arch = "aarch64"))]
-fn whole_code_scan_ranges(code_len: usize) -> Aarch64CodeScanRanges {
+fn whole_code_scan_ranges(code_len: usize) -> aarch64::CodeScanRanges {
     let executable: Vec<Range<usize>> = core::iter::once(0..code_len).collect();
     let identified = executable.clone();
-    Aarch64CodeScanRanges {
+    aarch64::CodeScanRanges {
         executable,
         identified,
     }
@@ -1977,7 +1911,7 @@ fn whole_code_scan_ranges(code_len: usize) -> Aarch64CodeScanRanges {
 pub fn patch_aarch64_code_segment_with_options_and_ranges(
     code: &mut [u8],
     code_vaddr: u64,
-    ranges: &Aarch64CodeScanRanges,
+    ranges: &aarch64::CodeScanRanges,
     trampoline_write_vaddr: u64,
     syscall_entry_addr: u64,
     options: RewriteOptions,
@@ -2087,7 +2021,7 @@ fn trap_all_aarch64_patch_sites(
 pub fn trap_all_aarch64_patch_sites_with_options_and_ranges(
     code: &mut [u8],
     code_vaddr: u64,
-    ranges: &Aarch64CodeScanRanges,
+    ranges: &aarch64::CodeScanRanges,
     options: RewriteOptions,
 ) -> Result<usize> {
     let executable = scan_sections(code_vaddr, &ranges.executable, code.len())?;
@@ -2898,7 +2832,7 @@ mod tests {
         let out = hook_aarch64_elf_at(
             &input,
             &mut elf,
-            Aarch64ScanSections {
+            aarch64::ScanSections {
                 executable: &[section],
                 code: &[section],
             },
@@ -2948,15 +2882,6 @@ mod tests {
         elf
     }
 
-    #[test]
-    fn aarch64_sectionless_elf_still_rewrites_svc_from_executable_segment() {
-        let input = aarch64_elf_with_one_svc();
-        let output = hook_syscalls_in_elf(&input, None).unwrap();
-
-        let patched = u32::from_le_bytes(output[input.len() - 4..input.len()].try_into().unwrap());
-        assert_eq!(patched & 0xfc00_0000, 0x1400_0000);
-    }
-
     /// A gap the gates cannot branch back from is retried at the fallback
     /// address rather than failing the whole binary.
     #[test]
@@ -2980,7 +2905,7 @@ mod tests {
                 hook_aarch64_elf_at(
                     &input,
                     &mut direct,
-                    Aarch64ScanSections {
+                    aarch64::ScanSections {
                         executable: &[section()],
                         code: &[section()],
                     },
@@ -3003,7 +2928,7 @@ mod tests {
         hook_aarch64_elf(
             &input,
             &mut elf,
-            Aarch64ScanSections {
+            aarch64::ScanSections {
                 executable: &[section()],
                 code: &[section()],
             },
@@ -3120,7 +3045,7 @@ mod tests {
         let err = hook_aarch64_elf(
             &input,
             &mut buf,
-            Aarch64ScanSections {
+            aarch64::ScanSections {
                 executable: &sections,
                 code: &sections,
             },

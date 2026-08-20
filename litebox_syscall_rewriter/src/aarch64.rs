@@ -111,12 +111,44 @@
 
 use alloc::format;
 use alloc::vec::Vec;
+use core::ops::Range;
 use yaxpeax_arch::{Decoder, U8Reader};
 use yaxpeax_arm::armv8::a64::{
     InstDecoder, Instruction as DecodedInstruction, Opcode as DecodedOpcode, Operand,
 };
 
 use crate::{Error, Result, TextSectionInfo, checked_add_u64};
+
+#[derive(Clone, Copy)]
+pub(crate) struct ScanSections<'a> {
+    pub(crate) executable: &'a [TextSectionInfo],
+    pub(crate) code: &'a [TextSectionInfo],
+}
+
+/// Mapping-relative ranges used by AArch64 patch-site scanning.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodeScanRanges {
+    pub(crate) executable: Vec<Range<usize>>,
+    pub(crate) identified: Vec<Range<usize>>,
+}
+
+impl CodeScanRanges {
+    /// Mapping-relative executable ranges.
+    pub fn executable(&self) -> &[Range<usize>] {
+        &self.executable
+    }
+
+    /// Mapping-relative ranges positively identified as code.
+    pub fn identified(&self) -> &[Range<usize>] {
+        &self.identified
+    }
+}
+
+/// Owned AArch64 ELF code metadata, independent of the parsed ELF buffer.
+pub struct ElfCodeMetadata {
+    pub(crate) executable: Vec<TextSectionInfo>,
+    pub(crate) identified: Vec<TextSectionInfo>,
+}
 
 // ============================================================
 // Constants

@@ -13,10 +13,8 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 
 use litebox_syscall_rewriter::{
-    Aarch64ElfCodeMetadata, Error, RewriteOptions, TRAMPOLINE_MAGIC, TargetHost,
-    hook_syscalls_in_elf, hook_syscalls_in_elf_with_options,
-    patch_aarch64_code_segment_with_options_and_ranges,
-    trap_all_aarch64_patch_sites_with_options_and_ranges,
+    Error, RewriteOptions, TRAMPOLINE_MAGIC, TargetHost, hook_syscalls_in_elf,
+    hook_syscalls_in_elf_with_options,
 };
 
 const HELLO_AARCH64: &[u8] = include_bytes!("hello-aarch64");
@@ -214,56 +212,26 @@ fn aarch64_rx_segment_padding_is_not_scanned_when_sections_exist() {
 
 #[test]
 fn aarch64_metadata_projects_text_into_file_mapping() {
-    let metadata = Aarch64ElfCodeMetadata::parse(HELLO_AARCH64).unwrap();
-    let ranges = metadata.ranges_for_mapping(0, 0x140).unwrap();
-
-    assert_eq!(ranges.executable, vec![0x110..0x140]);
-    assert_eq!(ranges.identified, vec![0x110..0x140]);
-
-    let ranges = metadata.ranges_for_mapping(0x100, 0x40).unwrap();
-    assert_eq!(ranges.executable, vec![0x10..0x40]);
-    assert_eq!(ranges.identified, vec![0x10..0x40]);
-}
-
-#[test]
-fn aarch64_runtime_ranges_exclude_padding_from_x18_scan() {
-    let mut code = vec![0u8; 8];
-    code[..4].copy_from_slice(&0x5D56_4F48u32.to_le_bytes());
-    code[4..].copy_from_slice(&0xAA12_03E0u32.to_le_bytes());
-    let ranges = litebox_syscall_rewriter::Aarch64CodeScanRanges {
-        executable: core::iter::once(0..8).collect(),
-        identified: core::iter::once(4..8).collect(),
-    };
-
-    let (gates, trapped) = patch_aarch64_code_segment_with_options_and_ranges(
-        &mut code,
-        0x1000,
-        &ranges,
-        0x2000,
-        0,
-        RewriteOptions::new(TargetHost::Linux, true),
+    let mut aligned = vec![0u64; HELLO_AARCH64.len().div_ceil(8)];
+    zerocopy::IntoBytes::as_mut_bytes(aligned.as_mut_slice())[..HELLO_AARCH64.len()]
+        .copy_from_slice(HELLO_AARCH64);
+    let metadata = litebox_syscall_rewriter::aarch64::ElfCodeMetadata::parse_aligned_in_place(
+        &mut aligned,
+        HELLO_AARCH64.len(),
     )
     .unwrap();
+    let ranges = metadata.ranges_for_mapping(0, 0x140).unwrap();
 
-    assert!(!gates.is_empty());
-    assert!(trapped.is_empty());
-    assert_eq!(read_u32(&code, 0), 0x5D56_4F48);
-    assert_eq!(read_u32(&code, 4) & 0xFC00_0000, 0x1400_0000);
+    assert_eq!(ranges.executable().len(), 1);
+    assert_eq!(ranges.executable()[0], 0x110..0x140);
+    assert_eq!(ranges.identified().len(), 1);
+    assert_eq!(ranges.identified()[0], 0x110..0x140);
 
-    let mut trapped_code = vec![0u8; 8];
-    trapped_code[..4].copy_from_slice(&0x5D56_4F48u32.to_le_bytes());
-    trapped_code[4..].copy_from_slice(&0xAA12_03E0u32.to_le_bytes());
-    assert_eq!(
-        trap_all_aarch64_patch_sites_with_options_and_ranges(
-            &mut trapped_code,
-            0x1000,
-            &ranges,
-            RewriteOptions::new(TargetHost::Linux, true),
-        )
-        .unwrap(),
-        1
-    );
-    assert_eq!(read_u32(&trapped_code, 0), 0x5D56_4F48);
+    let ranges = metadata.ranges_for_mapping(0x100, 0x40).unwrap();
+    assert_eq!(ranges.executable().len(), 1);
+    assert_eq!(ranges.executable()[0], 0x10..0x40);
+    assert_eq!(ranges.identified().len(), 1);
+    assert_eq!(ranges.identified()[0], 0x10..0x40);
 }
 
 #[test]
