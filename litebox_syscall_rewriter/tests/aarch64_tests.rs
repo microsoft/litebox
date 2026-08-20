@@ -14,7 +14,7 @@
 
 use litebox_syscall_rewriter::{
     Error, RewriteOptions, TRAMPOLINE_MAGIC, TargetHost, hook_syscalls_in_elf,
-    hook_syscalls_in_elf_with_options,
+    hook_syscalls_in_elf_with_options, patch_aarch64_code_segment_with_options_and_ranges,
 };
 
 const HELLO_AARCH64: &[u8] = include_bytes!("hello-aarch64");
@@ -232,6 +232,31 @@ fn aarch64_metadata_projects_text_into_file_mapping() {
     assert_eq!(ranges.executable()[0], 0x10..0x40);
     assert_eq!(ranges.identified().len(), 1);
     assert_eq!(ranges.identified()[0], 0x10..0x40);
+
+    let metadata = litebox_syscall_rewriter::aarch64::ElfCodeMetadata::parse_executable_in_place(
+        &mut aligned,
+        HELLO_AARCH64.len(),
+    )
+    .unwrap();
+    let ranges = metadata.ranges_for_mapping(0, 0x140).unwrap();
+    assert_eq!(ranges.executable().len(), 1);
+    assert_eq!(ranges.executable()[0], 0x110..0x140);
+    assert!(ranges.identified().is_empty());
+
+    let ranges = metadata.ranges_for_mapping(0x110, 4).unwrap();
+    let mut code = SVC_0.to_le_bytes();
+    let (gates, trapped) = patch_aarch64_code_segment_with_options_and_ranges(
+        &mut code,
+        0x1000,
+        &ranges,
+        0x2000,
+        0,
+        RewriteOptions::default(),
+    )
+    .unwrap();
+    assert!(!gates.is_empty());
+    assert!(trapped.is_empty());
+    assert_eq!(read_u32(&code, 0) & 0xFC00_0000, 0x1400_0000);
 }
 
 #[test]

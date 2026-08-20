@@ -219,28 +219,12 @@ impl aarch64::ElfCodeMetadata {
     /// Parse an ELF image in aligned storage, relocating an unaligned program
     /// header table within that storage if required by the object parser.
     pub fn parse_aligned_in_place(aligned: &mut [u64], byte_len: usize) -> Result<Self> {
-        let bytes = aligned.as_mut_bytes();
-        if byte_len > bytes.len() {
-            return Err(Error::ParseError(
-                "aligned ELF byte length exceeds storage".into(),
-            ));
-        }
-        fixup_phdr_alignment(&mut bytes[..byte_len]);
-        let file = object::File::parse(&bytes[..byte_len])
-            .map_err(|error| Error::ParseError(error.to_string()))?;
-        if file.architecture() != object::Architecture::Aarch64 {
-            return Err(Error::UnsupportedExecutable(
-                "code metadata requires an AArch64 ELF".into(),
-            ));
-        }
-        match aarch64_elf_code_metadata(&file) {
-            Ok(metadata) => Ok(metadata),
-            Err(InternalError::Public(error)) => Err(error),
-            Err(InternalError::NoTextSectionFound) => Err(Error::UnsupportedExecutable(
-                "AArch64 ELF has no executable code ranges".into(),
-            )),
-            Err(error) => unreachable!("unexpected metadata error: {error:?}"),
-        }
+        parse_aarch64_metadata_in_place(aligned, byte_len, true)
+    }
+
+    /// Parse only executable ELF section ranges, without symbols or unwind data.
+    pub fn parse_executable_in_place(aligned: &mut [u64], byte_len: usize) -> Result<Self> {
+        parse_aarch64_metadata_in_place(aligned, byte_len, false)
     }
 
     /// Project ELF file ranges into one file-backed mapping.
@@ -253,6 +237,35 @@ impl aarch64::ElfCodeMetadata {
             executable: project_file_ranges(&self.executable, file_offset, mapping_len)?,
             identified: project_file_ranges(&self.identified, file_offset, mapping_len)?,
         })
+    }
+}
+
+fn parse_aarch64_metadata_in_place(
+    aligned: &mut [u64],
+    byte_len: usize,
+    identify_code: bool,
+) -> Result<aarch64::ElfCodeMetadata> {
+    let bytes = aligned.as_mut_bytes();
+    if byte_len > bytes.len() {
+        return Err(Error::ParseError(
+            "aligned ELF byte length exceeds storage".into(),
+        ));
+    }
+    fixup_phdr_alignment(&mut bytes[..byte_len]);
+    let file = object::File::parse(&bytes[..byte_len])
+        .map_err(|error| Error::ParseError(error.to_string()))?;
+    if file.architecture() != object::Architecture::Aarch64 {
+        return Err(Error::UnsupportedExecutable(
+            "code metadata requires an AArch64 ELF".into(),
+        ));
+    }
+    match aarch64_elf_code_metadata(&file, identify_code) {
+        Ok(metadata) => Ok(metadata),
+        Err(InternalError::Public(error)) => Err(error),
+        Err(InternalError::NoTextSectionFound) => Err(Error::UnsupportedExecutable(
+            "AArch64 ELF has no executable code ranges".into(),
+        )),
+        Err(error) => unreachable!("unexpected metadata error: {error:?}"),
     }
 }
 
@@ -378,7 +391,7 @@ pub fn hook_syscalls_in_elf_with_options(
         };
 
         let (text_sections, aarch64_code_sections) = if arch == Arch::Aarch64 {
-            let metadata = match aarch64_elf_code_metadata(&file) {
+            let metadata = match aarch64_elf_code_metadata(&file, true) {
                 Ok(metadata) => metadata,
                 Err(InternalError::NoTextSectionFound) => return Ok(input_binary.to_vec()),
                 Err(InternalError::Public(error)) => return Err(error),
@@ -1090,9 +1103,14 @@ fn text_sections(
 
 fn aarch64_elf_code_metadata(
     file: &object::File<'_>,
+    identify_code: bool,
 ) -> core::result::Result<aarch64::ElfCodeMetadata, InternalError> {
     let executable = text_sections(file)?;
-    let identified = aarch64_code_sections(file, &executable);
+    let identified = if identify_code {
+        aarch64_code_sections(file, &executable)
+    } else {
+        Vec::new()
+    };
     Ok(aarch64::ElfCodeMetadata {
         executable,
         identified,
