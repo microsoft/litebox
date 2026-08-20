@@ -1552,7 +1552,6 @@ mod tests {
     use alloc::sync::Arc;
     use core::mem::size_of;
 
-    use litebox::utils::TruncateExt as _;
     use litebox_common_windows::nt_status::NtStatus;
 
     use super::*;
