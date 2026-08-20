@@ -507,19 +507,20 @@ fn reactor_preserves_udp_datagram_semantics() {
     server.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
     let server_address = socket_address_v4(server.local_addr().unwrap());
     let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
-    let socket_policy = SocketPolicy::from_udp_destination_rules(&[
-        DestinationRule::new(
-            CallerCredential::Unauthenticated,
-            Ipv4Cidr::new(Ipv4Address([127, 0, 0, 0]), 8).unwrap(),
-            DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
-        ),
-        DestinationRule::new(
-            CallerCredential::Unauthenticated,
-            Ipv4Cidr::new(Ipv4Address([255, 255, 255, 255]), 32).unwrap(),
-            DestinationPortRange::new(Port(9), Port(9)).unwrap(),
-        ),
-    ])
-    .unwrap();
+    let socket_policy = SocketPolicy::deny()
+        .with_udp_destination_rules(&[
+            DestinationRule::new(
+                CallerCredential::Unauthenticated,
+                Ipv4Cidr::new(Ipv4Address([127, 0, 0, 0]), 8).unwrap(),
+                DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
+            ),
+            DestinationRule::new(
+                CallerCredential::Unauthenticated,
+                Ipv4Cidr::new(Ipv4Address([255, 255, 255, 255]), 32).unwrap(),
+                DestinationPortRange::new(Port(9), Port(9)).unwrap(),
+            ),
+        ])
+        .unwrap();
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(socket_policy),
@@ -1812,19 +1813,20 @@ fn externally_connected_udp_preserves_guest_routing_identity() {
     external.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
     let external_address = socket_address_v4(external.local_addr().unwrap());
     let provider = Arc::new(LinuxSocketProvider::new(4, 2).unwrap());
-    let policy = SocketPolicy::from_udp_destination_rules(&[
-        DestinationRule::new(
-            CallerCredential::Unauthenticated,
-            Ipv4Cidr::new(Ipv4Address([127, 0, 0, 0]), 8).unwrap(),
-            DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
-        ),
-        DestinationRule::new(
-            CallerCredential::Unauthenticated,
-            Ipv4Cidr::new(Ipv4Address(local_ip.octets()), 32).unwrap(),
-            DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
-        ),
-    ])
-    .unwrap();
+    let policy = SocketPolicy::deny()
+        .with_udp_destination_rules(&[
+            DestinationRule::new(
+                CallerCredential::Unauthenticated,
+                Ipv4Cidr::new(Ipv4Address([127, 0, 0, 0]), 8).unwrap(),
+                DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
+            ),
+            DestinationRule::new(
+                CallerCredential::Unauthenticated,
+                Ipv4Cidr::new(Ipv4Address(local_ip.octets()), 32).unwrap(),
+                DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
+            ),
+        ])
+        .unwrap();
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all()).with_socket_policy(policy),
         BrokerCoreLimits::new_with_all_limits(6, 0, 4, 2),

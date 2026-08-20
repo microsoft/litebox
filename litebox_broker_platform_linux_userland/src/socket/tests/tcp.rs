@@ -1056,12 +1056,13 @@ fn guest_tcp_namespace_routes_across_sessions_and_hides_private_backend() {
 #[test]
 fn tcp_exact_bindings_coexist_and_wildcard_accepts_concrete_destinations() {
     let provider = Arc::new(LinuxSocketProvider::new(12, 8).unwrap());
-    let policy = SocketPolicy::from_tcp_destination_rules(&[DestinationRule::new(
-        CallerCredential::Unauthenticated,
-        Ipv4Cidr::new(Ipv4Address([0, 0, 0, 0]), 0).unwrap(),
-        DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
-    )])
-    .unwrap();
+    let policy = SocketPolicy::deny()
+        .with_tcp_destination_rules(&[DestinationRule::new(
+            CallerCredential::Unauthenticated,
+            Ipv4Cidr::new(Ipv4Address([0, 0, 0, 0]), 0).unwrap(),
+            DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
+        )])
+        .unwrap();
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all()).with_socket_policy(policy),
         BrokerCoreLimits::new_with_all_limits(20, 0, 12, 12),

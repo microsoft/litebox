@@ -224,35 +224,22 @@ impl SocketPolicy {
         }
     }
 
-    /// Creates a bounded policy from static IPv4 TCP destination rules.
-    pub fn from_tcp_destination_rules(
+    /// Enables TCP with bounded native IPv4 destination rules.
+    pub fn with_tcp_destination_rules(
+        mut self,
         rules: &[DestinationRule],
     ) -> Result<Self, SocketPolicyError> {
-        Ok(Self {
-            tcp: Some(copy_destination_rules(rules)?),
-            udp: None,
-        })
+        self.tcp = Some(copy_destination_rules(rules)?);
+        Ok(self)
     }
 
-    /// Creates a bounded policy from static IPv4 UDP destination rules.
-    pub fn from_udp_destination_rules(
+    /// Enables UDP with bounded native IPv4 destination rules.
+    pub fn with_udp_destination_rules(
+        mut self,
         rules: &[DestinationRule],
     ) -> Result<Self, SocketPolicyError> {
-        Ok(Self {
-            tcp: None,
-            udp: Some(copy_destination_rules(rules)?),
-        })
-    }
-
-    /// Creates a policy with independent static IPv4 TCP and UDP rules.
-    pub fn from_tcp_udp_destination_rules(
-        tcp_rules: &[DestinationRule],
-        udp_rules: &[DestinationRule],
-    ) -> Result<Self, SocketPolicyError> {
-        Ok(Self {
-            tcp: Some(copy_destination_rules(tcp_rules)?),
-            udp: Some(copy_destination_rules(udp_rules)?),
-        })
+        self.udp = Some(copy_destination_rules(rules)?);
+        Ok(self)
     }
 
     /// Returns the native TCP destination rules, or `None` when TCP is denied.
@@ -554,14 +541,16 @@ mod tests {
         );
         let maximum = [rule; MAX_DESTINATION_RULES];
         assert_eq!(
-            SocketPolicy::from_tcp_destination_rules(&maximum)
+            SocketPolicy::deny()
+                .with_tcp_destination_rules(&maximum)
                 .unwrap()
                 .tcp_destination_rules()
                 .unwrap(),
             &maximum
         );
         assert_eq!(
-            SocketPolicy::from_tcp_destination_rules(&maximum)
+            SocketPolicy::deny()
+                .with_tcp_destination_rules(&maximum)
                 .unwrap()
                 .udp_destination_rules(),
             None
@@ -569,7 +558,7 @@ mod tests {
 
         let excessive = [rule; MAX_DESTINATION_RULES + 1];
         assert_eq!(
-            SocketPolicy::from_tcp_destination_rules(&excessive),
+            SocketPolicy::deny().with_tcp_destination_rules(&excessive),
             Err(SocketPolicyError::TooManyRules {
                 maximum: MAX_DESTINATION_RULES,
                 actual: MAX_DESTINATION_RULES + 1,
@@ -586,14 +575,16 @@ mod tests {
         );
         let maximum = [rule; MAX_DESTINATION_RULES];
         assert_eq!(
-            SocketPolicy::from_udp_destination_rules(&maximum)
+            SocketPolicy::deny()
+                .with_udp_destination_rules(&maximum)
                 .unwrap()
                 .udp_destination_rules()
                 .unwrap(),
             &maximum
         );
         assert_eq!(
-            SocketPolicy::from_udp_destination_rules(&maximum)
+            SocketPolicy::deny()
+                .with_udp_destination_rules(&maximum)
                 .unwrap()
                 .tcp_destination_rules(),
             None
@@ -601,7 +592,7 @@ mod tests {
 
         let excessive = [rule; MAX_DESTINATION_RULES + 1];
         assert_eq!(
-            SocketPolicy::from_udp_destination_rules(&excessive),
+            SocketPolicy::deny().with_udp_destination_rules(&excessive),
             Err(SocketPolicyError::TooManyRules {
                 maximum: MAX_DESTINATION_RULES,
                 actual: MAX_DESTINATION_RULES + 1,
@@ -611,19 +602,20 @@ mod tests {
 
     #[test]
     fn destination_rules_enforce_principal_cidr_and_port() {
-        let socket_policy = SocketPolicy::from_tcp_destination_rules(&[
-            DestinationRule::new(
-                CallerCredential::Unauthenticated,
-                cidr([10, 8, 0, 0], 13),
-                ports(443, 444),
-            ),
-            DestinationRule::new(
-                CallerCredential::HostGuaranteed,
-                cidr([192, 0, 2, 7], 32),
-                ports(8443, 8443),
-            ),
-        ])
-        .unwrap();
+        let socket_policy = SocketPolicy::deny()
+            .with_tcp_destination_rules(&[
+                DestinationRule::new(
+                    CallerCredential::Unauthenticated,
+                    cidr([10, 8, 0, 0], 13),
+                    ports(443, 444),
+                ),
+                DestinationRule::new(
+                    CallerCredential::HostGuaranteed,
+                    cidr([192, 0, 2, 7], 32),
+                    ports(8443, 8443),
+                ),
+            ])
+            .unwrap();
         let unauthenticated = PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(socket_policy);
         assert_eq!(
@@ -737,7 +729,9 @@ mod tests {
         );
         let policy = PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(
-                SocketPolicy::from_tcp_udp_destination_rules(&[tcp_rule], &[]).unwrap(),
+                SocketPolicy::guest_network()
+                    .with_tcp_destination_rules(&[tcp_rule])
+                    .unwrap(),
             );
 
         assert_eq!(

@@ -139,7 +139,7 @@ fn configured_socket_policy(
             )
         })
         .collect::<Vec<_>>();
-    SocketPolicy::from_tcp_udp_destination_rules(&rules, &[])
+    SocketPolicy::guest_network().with_tcp_destination_rules(&rules)
 }
 
 fn serve_runner<Memory, SetupChannel, RequestSource, ResponseSink, NotificationChannel, Shutdown>(
