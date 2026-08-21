@@ -135,33 +135,32 @@ enum GuestBindingKey {
     Exact(SocketAddrV4),
 }
 
-struct GuestBindingReservation {
-    inner: Arc<GuestBindingReservationInner>,
-}
-
-struct GuestBindingReservationInner {
+/// Shared registration for one guest transport port.
+///
+/// The final owner removes the binding from the broker-wide namespace.
+struct GuestPortBinding {
     ports: BrokerSocketPorts,
     transport: GuestTransport,
     key: GuestBindingKey,
 }
 
-impl GuestBindingReservation {
+impl GuestPortBinding {
     fn is_wildcard(&self) -> bool {
-        matches!(self.inner.key, GuestBindingKey::Wildcard(_))
+        matches!(self.key, GuestBindingKey::Wildcard(_))
     }
 
     fn covers(&self, address: SocketAddrV4) -> bool {
         if address.port() == 0 || !is_guest_network_address(*address.ip()) {
             return false;
         }
-        match self.inner.key {
+        match self.key {
             GuestBindingKey::Wildcard(port) => address.port() == port,
             GuestBindingKey::Exact(reserved) => reserved == address,
         }
     }
 
     fn requested_address(&self) -> SocketAddrV4 {
-        match self.inner.key {
+        match self.key {
             GuestBindingKey::Wildcard(port) => SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port),
             GuestBindingKey::Exact(address) => address,
         }
@@ -170,13 +169,13 @@ impl GuestBindingReservation {
     /// Retains a TCP source binding across queued and accepted connection lifetimes.
     ///
     /// UDP datagrams snapshot source metadata when sent and need no lease.
-    fn guest_source_lease(&self, destination: SocketAddrV4) -> Option<GuestSourceLease> {
-        if self.inner.transport != GuestTransport::Tcp {
+    fn guest_source_lease(self: &Arc<Self>, destination: SocketAddrV4) -> Option<GuestSourceLease> {
+        if self.transport != GuestTransport::Tcp {
             return None;
         }
         let source_address = GuestSocketBinding::new(self).guest_source_address(destination)?;
         Some(GuestSourceLease {
-            _reservation: Arc::clone(&self.inner),
+            _binding: Arc::clone(self),
             source_address,
         })
     }
@@ -198,7 +197,7 @@ impl BrokerSocketPorts {
         &self,
         request: CreateSocketRequest,
         requested_address: SocketAddrV4,
-    ) -> Result<SocketOutcome<(SocketAddrV4, GuestBindingReservation)>> {
+    ) -> Result<SocketOutcome<(SocketAddrV4, Arc<GuestPortBinding>)>> {
         if !guest_binding_address_is_valid(requested_address) {
             return Ok(SocketOutcome::Failed(SocketError::AddressNotAvailable));
         }
@@ -227,13 +226,11 @@ impl BrokerSocketPorts {
         drop(state);
         Ok(SocketOutcome::Completed((
             local_address,
-            GuestBindingReservation {
-                inner: Arc::new(GuestBindingReservationInner {
-                    ports: self.clone(),
-                    transport,
-                    key,
-                }),
-            },
+            Arc::new(GuestPortBinding {
+                ports: self.clone(),
+                transport,
+                key,
+            }),
         )))
     }
 }
@@ -242,7 +239,7 @@ fn guest_binding_address_is_valid(address: SocketAddrV4) -> bool {
     address.ip().is_unspecified() || is_guest_network_address(*address.ip())
 }
 
-impl Drop for GuestBindingReservationInner {
+impl Drop for GuestPortBinding {
     fn drop(&mut self) {
         let mut state = self.ports.state.lock();
         let ports = match self.transport {
@@ -250,7 +247,7 @@ impl Drop for GuestBindingReservationInner {
             GuestTransport::Udp => &mut state.guest_udp,
         };
         let removed = ports.remove(self.key);
-        debug_assert!(removed, "live guest binding reservation must be registered");
+        debug_assert!(removed, "live guest port binding must be registered");
     }
 }
 
@@ -262,10 +259,10 @@ pub struct GuestSocketBinding {
 }
 
 impl GuestSocketBinding {
-    fn new(reservation: &GuestBindingReservation) -> Self {
+    fn new(binding: &GuestPortBinding) -> Self {
         Self {
-            requested: reservation.requested_address(),
-            transport: reservation.inner.transport,
+            requested: binding.requested_address(),
+            transport: binding.transport,
         }
     }
 
@@ -350,10 +347,10 @@ impl Eq for GuestSocketBinding {}
 /// Core creates this value from a live guest binding when a TCP connection
 /// targets the guest namespace. It grants no bind or listen authority. A
 /// platform may move the lease through a queued guest-local connection and
-/// return it from [`PlatformSocket::accept`]; dropping the final lease or
-/// binding reservation releases the original namespace reservation.
+/// return it from [`PlatformSocket::accept`]. Dropping the final binding
+/// reference releases the namespace entry.
 pub struct GuestSourceLease {
-    _reservation: Arc<GuestBindingReservationInner>,
+    _binding: Arc<GuestPortBinding>,
     source_address: SocketAddrV4,
 }
 
@@ -624,7 +621,7 @@ pub fn create(
         platform_socket: Once::new(),
         readiness,
         _quota: quota,
-        port_reservation: Mutex::new(None),
+        port_binding: Mutex::new(None),
         guest_source_lease: Mutex::new(None),
     });
     let platform_socket = match session.core.socket_provider.create(
@@ -721,8 +718,8 @@ pub fn connect(
                 }
             };
         match binding {
-            ReserveAndBindOutcome::Completed(local_address, reservation) => {
-                attach_binding(&object, local_address, reservation)?;
+            ReserveAndBindOutcome::Completed(local_address, port_binding) => {
+                attach_binding(&object, local_address, port_binding)?;
             }
             ReserveAndBindOutcome::Failed(error) => {
                 finish_connect(&object, SocketConnectionStatus::Unconnected);
@@ -796,8 +793,8 @@ pub fn bind(
         return Err(BrokerError::Internal);
     }
     match reserve_and_bind(session, create_request, &resource, address) {
-        Ok(ReserveAndBindOutcome::Completed(local_address, reservation)) => {
-            finish_configuration(&object, Some(local_address), Some(reservation), false)?;
+        Ok(ReserveAndBindOutcome::Completed(local_address, port_binding)) => {
+            finish_configuration(&object, Some(local_address), Some(port_binding), false)?;
             Ok(SocketOutcome::Completed(local_address))
         }
         Ok(ReserveAndBindOutcome::Failed(error)) => {
@@ -852,7 +849,7 @@ pub fn listen(
     };
 
     let mut local_address = existing_local_address;
-    let mut port_reservation = None;
+    let mut port_binding = None;
     if local_address.is_none() {
         let binding = match reserve_and_bind(
             session,
@@ -867,9 +864,9 @@ pub fn listen(
             }
         };
         match binding {
-            ReserveAndBindOutcome::Completed(address, reservation) => {
+            ReserveAndBindOutcome::Completed(address, binding) => {
                 local_address = Some(address);
-                port_reservation = Some(reservation);
+                port_binding = Some(binding);
             }
             ReserveAndBindOutcome::Failed(error) => {
                 finish_configuration(&object, None, None, false)?;
@@ -886,19 +883,19 @@ pub fn listen(
     match resource.listen(backlog) {
         Ok(SocketOutcome::Completed(address)) => {
             if local_address != Some(address) {
-                finish_retired_configuration(&object, local_address, port_reservation)?;
+                finish_retired_configuration(&object, local_address, port_binding)?;
                 resource.retire();
                 return Err(BrokerError::Internal);
             }
-            finish_configuration(&object, local_address, port_reservation, true)?;
+            finish_configuration(&object, local_address, port_binding, true)?;
             Ok(SocketOutcome::Completed(address))
         }
         Ok(SocketOutcome::Failed(error)) => {
-            finish_configuration(&object, local_address, port_reservation, false)?;
+            finish_configuration(&object, local_address, port_binding, false)?;
             Ok(SocketOutcome::Failed(error))
         }
         Err(error) => {
-            finish_configuration(&object, local_address, port_reservation, false)?;
+            finish_configuration(&object, local_address, port_binding, false)?;
             Err(error)
         }
     }
@@ -939,7 +936,7 @@ pub fn accept(
         platform_socket: Once::new(),
         readiness,
         _quota: quota,
-        port_reservation: Mutex::new(None),
+        port_binding: Mutex::new(None),
         guest_source_lease: Mutex::new(None),
     });
     let accepted = match listener_resource.accept(resource.readiness.clone()) {
@@ -953,7 +950,7 @@ pub fn accept(
             return Err(error);
         }
     };
-    if !listener_resource.port_reservation_covers(accepted.local_address)
+    if !listener_resource.port_binding_covers(accepted.local_address)
         || accepted.guest_source_lease.source_address() != accepted.remote_address
     {
         accepted.socket.retire();
@@ -1072,8 +1069,8 @@ pub fn send_to(
             &resource,
             DEFAULT_UDP_LOCAL_ADDRESS,
         ) {
-            Ok(ReserveAndBindOutcome::Completed(local_address, reservation)) => {
-                finish_configuration(&object, Some(local_address), Some(reservation), false)?;
+            Ok(ReserveAndBindOutcome::Completed(local_address, port_binding)) => {
+                finish_configuration(&object, Some(local_address), Some(port_binding), false)?;
             }
             Ok(ReserveAndBindOutcome::Failed(error)) => {
                 finish_configuration(&object, None, None, false)?;
@@ -1399,7 +1396,7 @@ fn datagram_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRes
             socket.configuration_in_flight,
             socket.datagram_connect_generation,
             socket.resource_retired,
-            socket.resource.port_reservation_is_wildcard(),
+            socket.resource.port_binding_is_wildcard(),
         )
     };
     if configuration_in_flight || resource_retired {
@@ -1545,7 +1542,7 @@ fn socket_state(
 }
 
 enum ReserveAndBindOutcome {
-    Completed(SocketAddrV4, GuestBindingReservation),
+    Completed(SocketAddrV4, Arc<GuestPortBinding>),
     Failed(SocketError),
     Retired,
 }
@@ -1556,7 +1553,7 @@ fn reserve_and_bind(
     resource: &SocketResource,
     requested_address: SocketAddrV4,
 ) -> Result<ReserveAndBindOutcome> {
-    let (local_address, reservation) = match session
+    let (local_address, port_binding) = match session
         .core
         .socket_ports
         .reserve(create_request, requested_address)?
@@ -1564,11 +1561,11 @@ fn reserve_and_bind(
         SocketOutcome::Completed(binding) => binding,
         SocketOutcome::Failed(error) => return Ok(ReserveAndBindOutcome::Failed(error)),
     };
-    let binding = GuestSocketBinding::new(&reservation);
+    let binding = GuestSocketBinding::new(&port_binding);
     match resource.bind(binding)? {
-        SocketOutcome::Completed(bound_address) if bound_address == local_address => {
-            Ok(ReserveAndBindOutcome::Completed(local_address, reservation))
-        }
+        SocketOutcome::Completed(bound_address) if bound_address == local_address => Ok(
+            ReserveAndBindOutcome::Completed(local_address, port_binding),
+        ),
         SocketOutcome::Completed(_) => Ok(ReserveAndBindOutcome::Retired),
         SocketOutcome::Failed(error) => Ok(ReserveAndBindOutcome::Failed(error)),
     }
@@ -1612,8 +1609,8 @@ fn connect_datagram(
             }
         };
         match binding {
-            ReserveAndBindOutcome::Completed(local_address, reservation) => {
-                attach_datagram_binding(object, local_address, reservation)?;
+            ReserveAndBindOutcome::Completed(local_address, port_binding) => {
+                attach_datagram_binding(object, local_address, port_binding)?;
             }
             ReserveAndBindOutcome::Failed(error) => {
                 finish_datagram_connect(object, previous_status, false);
@@ -1655,7 +1652,7 @@ fn connect_datagram(
 fn attach_datagram_binding(
     object: &spin::RwLock<ObjectEntry>,
     local_address: SocketAddrV4,
-    port_reservation: GuestBindingReservation,
+    port_binding: Arc<GuestPortBinding>,
 ) -> Result<()> {
     let duplicate = {
         let mut object = object.write();
@@ -1663,21 +1660,21 @@ fn attach_datagram_binding(
             return Err(BrokerError::Internal);
         };
         if socket.local_address.is_some() {
-            Some((Arc::clone(&socket.resource), port_reservation))
+            Some((Arc::clone(&socket.resource), port_binding))
         } else {
-            match socket.resource.set_port_reservation(port_reservation) {
+            match socket.resource.set_port_binding(port_binding) {
                 Ok(()) => {
                     socket.local_address = Some(local_address);
                     None
                 }
-                Err(port_reservation) => Some((Arc::clone(&socket.resource), port_reservation)),
+                Err(port_binding) => Some((Arc::clone(&socket.resource), port_binding)),
             }
         }
     };
-    if let Some((resource, port_reservation)) = duplicate {
+    if let Some((resource, port_binding)) = duplicate {
         finish_retired_datagram_connect(object);
         resource.retire();
-        drop(port_reservation);
+        drop(port_binding);
         return Err(BrokerError::Internal);
     }
     Ok(())
@@ -1732,29 +1729,29 @@ fn finish_retired_connect(object: &spin::RwLock<ObjectEntry>) {
 fn attach_binding(
     object: &spin::RwLock<ObjectEntry>,
     local_address: SocketAddrV4,
-    port_reservation: GuestBindingReservation,
+    port_binding: Arc<GuestPortBinding>,
 ) -> Result<()> {
     let duplicate = {
         let mut object = object.write();
         let ObjectEntry::Socket(socket) = &mut *object else {
             return Err(BrokerError::Internal);
         };
-        match socket.resource.set_port_reservation(port_reservation) {
+        match socket.resource.set_port_binding(port_binding) {
             Ok(()) => {
                 socket.local_address = Some(local_address);
                 None
             }
-            Err(port_reservation) => {
+            Err(port_binding) => {
                 socket.connect_in_flight = false;
                 socket.connection_status = SocketConnectionStatus::Failed(SocketError::Other);
                 socket.resource_retired = true;
-                Some((Arc::clone(&socket.resource), port_reservation))
+                Some((Arc::clone(&socket.resource), port_binding))
             }
         }
     };
-    if let Some((resource, port_reservation)) = duplicate {
+    if let Some((resource, port_binding)) = duplicate {
         resource.retire();
-        drop(port_reservation);
+        drop(port_binding);
         return Err(BrokerError::Internal);
     }
     Ok(())
@@ -1763,7 +1760,7 @@ fn attach_binding(
 fn finish_configuration(
     object: &spin::RwLock<ObjectEntry>,
     local_address: Option<SocketAddrV4>,
-    port_reservation: Option<GuestBindingReservation>,
+    port_binding: Option<Arc<GuestPortBinding>>,
     listening: bool,
 ) -> Result<()> {
     let duplicate = {
@@ -1772,12 +1769,12 @@ fn finish_configuration(
             return Err(BrokerError::Internal);
         };
         socket.configuration_in_flight = false;
-        let duplicate = port_reservation.and_then(|port_reservation| {
+        let duplicate = port_binding.and_then(|port_binding| {
             socket
                 .resource
-                .set_port_reservation(port_reservation)
+                .set_port_binding(port_binding)
                 .err()
-                .map(|port_reservation| (Arc::clone(&socket.resource), port_reservation))
+                .map(|port_binding| (Arc::clone(&socket.resource), port_binding))
         });
         if duplicate.is_some() {
             socket.listening = false;
@@ -1793,9 +1790,9 @@ fn finish_configuration(
         }
         duplicate
     };
-    if let Some((resource, port_reservation)) = duplicate {
+    if let Some((resource, port_binding)) = duplicate {
         resource.retire();
-        drop(port_reservation);
+        drop(port_binding);
         return Err(BrokerError::Internal);
     }
     Ok(())
@@ -1804,7 +1801,7 @@ fn finish_configuration(
 fn finish_retired_configuration(
     object: &spin::RwLock<ObjectEntry>,
     local_address: Option<SocketAddrV4>,
-    port_reservation: Option<GuestBindingReservation>,
+    port_binding: Option<Arc<GuestPortBinding>>,
 ) -> Result<()> {
     let duplicate = {
         let mut object = object.write();
@@ -1812,12 +1809,12 @@ fn finish_retired_configuration(
             return Err(BrokerError::Internal);
         };
         socket.configuration_in_flight = false;
-        let duplicate = port_reservation.and_then(|port_reservation| {
+        let duplicate = port_binding.and_then(|port_binding| {
             socket
                 .resource
-                .set_port_reservation(port_reservation)
+                .set_port_binding(port_binding)
                 .err()
-                .map(|port_reservation| (Arc::clone(&socket.resource), port_reservation))
+                .map(|port_binding| (Arc::clone(&socket.resource), port_binding))
         });
         socket.local_address = socket.local_address.or(local_address);
         socket.listening = false;
@@ -1828,9 +1825,9 @@ fn finish_retired_configuration(
         socket.resource_retired = true;
         duplicate
     };
-    if let Some((resource, port_reservation)) = duplicate {
+    if let Some((resource, port_binding)) = duplicate {
         resource.retire();
-        drop(port_reservation);
+        drop(port_binding);
         return Err(BrokerError::Internal);
     }
     Ok(())
@@ -1894,20 +1891,20 @@ pub(crate) struct SocketResource {
     platform_socket: Once<Arc<dyn PlatformSocket>>,
     readiness: ReadinessRegistration,
     _quota: Arc<SocketQuotaReservation>,
-    port_reservation: Mutex<Option<GuestBindingReservation>>,
+    port_binding: Mutex<Option<Arc<GuestPortBinding>>>,
     guest_source_lease: Mutex<Option<GuestSourceLease>>,
 }
 
 impl SocketResource {
-    fn set_port_reservation(
+    fn set_port_binding(
         &self,
-        reservation: GuestBindingReservation,
-    ) -> core::result::Result<(), GuestBindingReservation> {
-        let mut slot = self.port_reservation.lock();
+        binding: Arc<GuestPortBinding>,
+    ) -> core::result::Result<(), Arc<GuestPortBinding>> {
+        let mut slot = self.port_binding.lock();
         if slot.is_some() {
-            return Err(reservation);
+            return Err(binding);
         }
-        *slot = Some(reservation);
+        *slot = Some(binding);
         Ok(())
     }
 
@@ -1923,18 +1920,18 @@ impl SocketResource {
         Ok(())
     }
 
-    fn port_reservation_covers(&self, address: SocketAddrV4) -> bool {
-        self.port_reservation
+    fn port_binding_covers(&self, address: SocketAddrV4) -> bool {
+        self.port_binding
             .lock()
             .as_ref()
-            .is_some_and(|reservation| reservation.covers(address))
+            .is_some_and(|binding| binding.covers(address))
     }
 
-    fn port_reservation_is_wildcard(&self) -> bool {
-        self.port_reservation
+    fn port_binding_is_wildcard(&self) -> bool {
+        self.port_binding
             .lock()
             .as_ref()
-            .is_some_and(GuestBindingReservation::is_wildcard)
+            .is_some_and(|binding| binding.is_wildcard())
     }
 
     fn platform_socket(&self) -> &dyn PlatformSocket {
@@ -1964,10 +1961,10 @@ impl SocketResource {
         if !is_guest_network_address(*destination.ip()) {
             return Ok(None);
         }
-        self.port_reservation
+        self.port_binding
             .lock()
             .as_ref()
-            .and_then(|reservation| reservation.guest_source_lease(destination))
+            .and_then(|binding| binding.guest_source_lease(destination))
             .map(Some)
             .ok_or(BrokerError::Internal)
     }
@@ -1982,9 +1979,9 @@ impl SocketResource {
 
     fn retire(&self) {
         self.platform_socket().retire();
-        let port_reservation = self.port_reservation.lock().take();
+        let port_binding = self.port_binding.lock().take();
         let guest_source_lease = self.guest_source_lease.lock().take();
-        drop(port_reservation);
+        drop(port_binding);
         drop(guest_source_lease);
     }
 
@@ -2077,9 +2074,9 @@ impl Drop for SocketResource {
         if let Some(platform_socket) = self.platform_socket.get() {
             platform_socket.retire();
         }
-        let port_reservation = self.port_reservation.lock().take();
+        let port_binding = self.port_binding.lock().take();
         let guest_source_lease = self.guest_source_lease.lock().take();
-        drop(port_reservation);
+        drop(port_binding);
         drop(guest_source_lease);
         self.readiness.retire();
     }
@@ -2147,26 +2144,26 @@ pub(crate) mod tests {
         let ports = BrokerSocketPorts::default();
         let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 80);
 
-        let SocketOutcome::Completed((_, first_reservation)) =
+        let SocketOutcome::Completed((_, first_binding)) =
             ports.reserve(create_request(), address).unwrap()
         else {
-            panic!("first TCP reservation failed");
+            panic!("first TCP port binding failed");
         };
         assert!(matches!(
             ports.reserve(create_request(), address),
             Ok(SocketOutcome::Failed(SocketError::AddressInUse))
         ));
-        let SocketOutcome::Completed((_, udp_reservation)) =
+        let SocketOutcome::Completed((_, udp_binding)) =
             ports.reserve(create_udp_request(), address).unwrap()
         else {
-            panic!("UDP reservation must be independent from TCP");
+            panic!("UDP port binding must be independent from TCP");
         };
         assert!(matches!(
             ports.reserve(create_udp_request(), address),
             Ok(SocketOutcome::Failed(SocketError::AddressInUse))
         ));
 
-        drop(first_reservation);
+        drop(first_binding);
         assert!(matches!(
             ports.reserve(create_request(), address),
             Ok(SocketOutcome::Completed(_))
@@ -2175,7 +2172,7 @@ pub(crate) mod tests {
             ports.reserve(create_udp_request(), address),
             Ok(SocketOutcome::Failed(SocketError::AddressInUse))
         ));
-        drop(udp_reservation);
+        drop(udp_binding);
         assert!(matches!(
             ports.reserve(create_udp_request(), address),
             Ok(SocketOutcome::Completed(_))
@@ -2190,33 +2187,33 @@ pub(crate) mod tests {
         let private = SocketAddrV4::new(GUEST_IPV4_ADDRESS, 8080);
         let wildcard = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 8080);
 
-        let SocketOutcome::Completed((_, first_lease)) =
+        let SocketOutcome::Completed((_, first_binding)) =
             ports.reserve(create_request(), first).unwrap()
         else {
-            panic!("first exact reservation failed");
+            panic!("first exact port binding failed");
         };
-        let SocketOutcome::Completed((_, second_lease)) =
+        let SocketOutcome::Completed((_, second_binding)) =
             ports.reserve(create_request(), second).unwrap()
         else {
-            panic!("second exact reservation failed");
+            panic!("second exact port binding failed");
         };
-        let SocketOutcome::Completed((_, private_lease)) =
+        let SocketOutcome::Completed((_, private_binding)) =
             ports.reserve(create_request(), private).unwrap()
         else {
-            panic!("private exact reservation failed");
+            panic!("private exact port binding failed");
         };
         assert!(matches!(
             ports.reserve(create_request(), wildcard),
             Ok(SocketOutcome::Failed(SocketError::AddressInUse))
         ));
 
-        drop(first_lease);
-        drop(second_lease);
-        drop(private_lease);
-        let SocketOutcome::Completed((_, wildcard_lease)) =
+        drop(first_binding);
+        drop(second_binding);
+        drop(private_binding);
+        let SocketOutcome::Completed((_, wildcard_binding)) =
             ports.reserve(create_request(), wildcard).unwrap()
         else {
-            panic!("wildcard reservation failed");
+            panic!("wildcard port binding failed");
         };
         assert!(matches!(
             ports.reserve(create_request(), first),
@@ -2226,10 +2223,10 @@ pub(crate) mod tests {
             ports.reserve(create_request(), private),
             Ok(SocketOutcome::Failed(SocketError::AddressInUse))
         ));
-        assert!(wildcard_lease.covers(first));
-        assert!(wildcard_lease.covers(second));
-        assert!(wildcard_lease.covers(private));
-        let binding = GuestSocketBinding::new(&wildcard_lease);
+        assert!(wildcard_binding.covers(first));
+        assert!(wildcard_binding.covers(second));
+        assert!(wildcard_binding.covers(private));
+        let binding = GuestSocketBinding::new(&wildcard_binding);
         assert_eq!(
             binding.guest_source_address(first),
             Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080))
@@ -2247,36 +2244,36 @@ pub(crate) mod tests {
         ));
 
         let occupied = SocketAddrV4::new(Ipv4Addr::LOCALHOST, FIRST_EPHEMERAL_PORT);
-        let SocketOutcome::Completed((_, occupied_lease)) =
+        let SocketOutcome::Completed((_, occupied_binding)) =
             ports.reserve(create_request(), occupied).unwrap()
         else {
-            panic!("exact reservation failed");
+            panic!("exact port binding failed");
         };
-        let SocketOutcome::Completed((wildcard, wildcard_lease)) = ports
+        let SocketOutcome::Completed((wildcard, wildcard_binding)) = ports
             .reserve(
                 create_request(),
                 SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
             )
             .unwrap()
         else {
-            panic!("wildcard ephemeral reservation failed");
+            panic!("wildcard ephemeral port binding failed");
         };
         assert_eq!(wildcard.port(), FIRST_EPHEMERAL_PORT + 1);
-        drop(occupied_lease);
-        drop(wildcard_lease);
+        drop(occupied_binding);
+        drop(wildcard_binding);
     }
 
     #[test]
-    fn provider_binding_metadata_does_not_own_the_reservation() {
+    fn provider_binding_metadata_does_not_own_the_port_binding() {
         let ports = BrokerSocketPorts::default();
         let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080);
-        let SocketOutcome::Completed((_, reservation)) =
+        let SocketOutcome::Completed((_, port_binding)) =
             ports.reserve(create_request(), address).unwrap()
         else {
-            panic!("reservation failed");
+            panic!("port binding failed");
         };
-        let binding = GuestSocketBinding::new(&reservation);
-        drop(reservation);
+        let binding = GuestSocketBinding::new(&port_binding);
+        drop(port_binding);
         assert!(binding.is_valid());
         assert!(binding.covers(address));
         assert!(matches!(
@@ -2291,14 +2288,14 @@ pub(crate) mod tests {
         let wildcard = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 8081);
         let loopback = SocketAddrV4::new(Ipv4Addr::LOCALHOST, wildcard.port());
         let private = SocketAddrV4::new(GUEST_IPV4_ADDRESS, wildcard.port());
-        let SocketOutcome::Completed((_, reservation)) =
+        let SocketOutcome::Completed((_, port_binding)) =
             ports.reserve(create_request(), wildcard).unwrap()
         else {
-            panic!("wildcard reservation failed");
+            panic!("wildcard port binding failed");
         };
-        let lease = reservation.guest_source_lease(loopback).unwrap();
+        let lease = port_binding.guest_source_lease(loopback).unwrap();
         assert_eq!(lease.source_address(), loopback);
-        drop(reservation);
+        drop(port_binding);
         assert!(matches!(
             ports.reserve(create_request(), private),
             Ok(SocketOutcome::Failed(SocketError::AddressInUse))
@@ -2311,14 +2308,14 @@ pub(crate) mod tests {
 
         let exact = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8082);
         let other_exact = SocketAddrV4::new(GUEST_IPV4_ADDRESS, exact.port());
-        let SocketOutcome::Completed((_, reservation)) =
+        let SocketOutcome::Completed((_, port_binding)) =
             ports.reserve(create_request(), exact).unwrap()
         else {
-            panic!("exact reservation failed");
+            panic!("exact port binding failed");
         };
-        let lease = reservation.guest_source_lease(loopback_address()).unwrap();
+        let lease = port_binding.guest_source_lease(loopback_address()).unwrap();
         assert_eq!(lease.source_address(), exact);
-        drop(reservation);
+        drop(port_binding);
         assert!(matches!(
             ports.reserve(create_request(), exact),
             Ok(SocketOutcome::Failed(SocketError::AddressInUse))
@@ -2340,17 +2337,17 @@ pub(crate) mod tests {
         let wildcard = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 8083);
         let loopback = SocketAddrV4::new(Ipv4Addr::LOCALHOST, wildcard.port());
         let private = SocketAddrV4::new(GUEST_IPV4_ADDRESS, wildcard.port());
-        let SocketOutcome::Completed((_, reservation)) =
+        let SocketOutcome::Completed((_, port_binding)) =
             ports.reserve(create_request(), wildcard).unwrap()
         else {
-            panic!("wildcard reservation failed");
+            panic!("wildcard port binding failed");
         };
-        let loopback_lease = reservation.guest_source_lease(loopback).unwrap();
-        let private_lease = reservation.guest_source_lease(private).unwrap();
+        let loopback_lease = port_binding.guest_source_lease(loopback).unwrap();
+        let private_lease = port_binding.guest_source_lease(private).unwrap();
         assert_eq!(loopback_lease.source_address(), loopback);
         assert_eq!(private_lease.source_address(), private);
 
-        drop(reservation);
+        drop(port_binding);
         drop(loopback_lease);
         assert!(matches!(
             ports.reserve(create_request(), private),
@@ -2940,7 +2937,7 @@ pub(crate) mod tests {
         check_platform_socket_retires_before_last_arc_drop(broker, provider);
         check_socket_quotas(broker);
         check_invalid_bind_response_retires_socket(broker, provider);
-        check_duplicate_port_reservation_retires_socket(broker, provider);
+        check_duplicate_port_binding_retires_socket(broker, provider);
     }
 
     fn check_platform_socket_retires_before_last_arc_drop(
@@ -3100,7 +3097,7 @@ pub(crate) mod tests {
         );
     }
 
-    fn check_duplicate_port_reservation_retires_socket(
+    fn check_duplicate_port_binding_retires_socket(
         broker: &BrokerCore,
         provider: &TestSocketProvider,
     ) {
@@ -3121,18 +3118,18 @@ pub(crate) mod tests {
 
         let duplicate_ports = BrokerSocketPorts::default();
         let duplicate_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 42002);
-        let SocketOutcome::Completed((duplicate_address, duplicate_reservation)) = duplicate_ports
+        let SocketOutcome::Completed((duplicate_address, duplicate_binding)) = duplicate_ports
             .reserve(create_request(), duplicate_address)
             .unwrap()
         else {
-            panic!("duplicate-reservation test could not reserve a port");
+            panic!("duplicate-binding test could not reserve a port");
         };
         let object = session
             .authorized_object(handle, ObjectRights::WRITE)
             .unwrap();
         let retired_before = provider.state.retired_sockets.load(Ordering::Relaxed);
         assert_eq!(
-            attach_binding(&object, duplicate_address, duplicate_reservation),
+            attach_binding(&object, duplicate_address, duplicate_binding),
             Err(BrokerError::Internal)
         );
         assert_eq!(
