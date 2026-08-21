@@ -167,6 +167,9 @@ impl GuestBindingReservation {
         }
     }
 
+    /// Retains a TCP source binding across queued and accepted connection lifetimes.
+    ///
+    /// UDP datagrams snapshot source metadata when sent and need no lease.
     fn guest_source_lease(&self, destination: SocketAddrV4) -> Option<GuestSourceLease> {
         if self.inner.transport != GuestTransport::Tcp {
             return None;
