@@ -169,7 +169,7 @@ impl GuestPortBinding {
     /// Retains a TCP source binding across queued and accepted connection lifetimes.
     ///
     /// UDP datagrams snapshot source metadata when sent and need no lease.
-    fn guest_source_lease(self: &Arc<Self>, destination: SocketAddrV4) -> Option<GuestSourceLease> {
+    fn source_lease_for(self: &Arc<Self>, destination: SocketAddrV4) -> Option<GuestSourceLease> {
         if self.transport != GuestTransport::Tcp {
             return None;
         }
@@ -374,9 +374,9 @@ pub struct AcceptedPlatformSocket {
     /// guest-namespace endpoint; broker-internal native routing endpoints must
     /// not be exposed.
     pub remote_address: SocketAddrV4,
-    /// Guest TCP source lease returned with a guest-local accepted connection.
+    /// Retains the connecting peer's source binding.
     ///
-    /// Its exact source endpoint must equal `remote_address`.
+    /// Its source endpoint must equal the accepted socket's `remote_address`.
     pub guest_source_lease: GuestSourceLease,
 }
 
@@ -732,7 +732,7 @@ pub fn connect(
             }
         }
     }
-    let guest_source_lease = match resource.guest_source_lease(address) {
+    let guest_source_lease = match resource.source_lease_for_connect(address) {
         Ok(lease) => lease,
         Err(error) => {
             finish_retired_connect(&object);
@@ -957,7 +957,8 @@ pub fn accept(
         resource.readiness.retire();
         return Err(BrokerError::Internal);
     }
-    if let Err(guest_source_lease) = resource.set_guest_source_lease(accepted.guest_source_lease) {
+    if let Err(guest_source_lease) = resource.set_accepted_source_lease(accepted.guest_source_lease)
+    {
         accepted.socket.retire();
         resource.readiness.retire();
         drop(guest_source_lease);
@@ -1908,7 +1909,7 @@ impl SocketResource {
         Ok(())
     }
 
-    fn set_guest_source_lease(
+    fn set_accepted_source_lease(
         &self,
         lease: GuestSourceLease,
     ) -> core::result::Result<(), GuestSourceLease> {
@@ -1949,7 +1950,10 @@ impl SocketResource {
         self.platform_socket().connect(address, guest_source_lease)
     }
 
-    fn guest_source_lease(&self, destination: SocketAddrV4) -> Result<Option<GuestSourceLease>> {
+    fn source_lease_for_connect(
+        &self,
+        destination: SocketAddrV4,
+    ) -> Result<Option<GuestSourceLease>> {
         if destination.port() == 0 {
             return Ok(None);
         }
@@ -1964,7 +1968,7 @@ impl SocketResource {
         self.port_binding
             .lock()
             .as_ref()
-            .and_then(|binding| binding.guest_source_lease(destination))
+            .and_then(|binding| binding.source_lease_for(destination))
             .map(Some)
             .ok_or(BrokerError::Internal)
     }
@@ -2293,7 +2297,7 @@ pub(crate) mod tests {
         else {
             panic!("wildcard port binding failed");
         };
-        let lease = port_binding.guest_source_lease(loopback).unwrap();
+        let lease = port_binding.source_lease_for(loopback).unwrap();
         assert_eq!(lease.source_address(), loopback);
         drop(port_binding);
         assert!(matches!(
@@ -2313,7 +2317,7 @@ pub(crate) mod tests {
         else {
             panic!("exact port binding failed");
         };
-        let lease = port_binding.guest_source_lease(loopback_address()).unwrap();
+        let lease = port_binding.source_lease_for(loopback_address()).unwrap();
         assert_eq!(lease.source_address(), exact);
         drop(port_binding);
         assert!(matches!(
@@ -2342,8 +2346,8 @@ pub(crate) mod tests {
         else {
             panic!("wildcard port binding failed");
         };
-        let loopback_lease = port_binding.guest_source_lease(loopback).unwrap();
-        let private_lease = port_binding.guest_source_lease(private).unwrap();
+        let loopback_lease = port_binding.source_lease_for(loopback).unwrap();
+        let private_lease = port_binding.source_lease_for(private).unwrap();
         assert_eq!(loopback_lease.source_address(), loopback);
         assert_eq!(private_lease.source_address(), private);
 

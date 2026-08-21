@@ -96,7 +96,7 @@ pub(super) struct GuestTcpListenerState {
 pub(super) struct QueuedGuestTcpConnection {
     pub(super) socket: OwnedFd,
     pub(super) connection_id: u64,
-    pub(super) connector_id: u64,
+    pub(super) connector_socket_id: u64,
     pub(super) connector_session_id: SessionId,
     pub(super) local_address: SocketAddrV4,
     pub(super) remote_address: SocketAddrV4,
@@ -877,7 +877,9 @@ pub(super) fn shutdown_tcp_socket(
         return Ok(SocketOutcome::Failed(SocketError::NotConnected));
     }
     let guest_endpoint = socket.tcp_state()?.descriptor.is_guest();
-    let (kernel_mode, add, clear, shuts_down_read, shuts_down_write) = match mode {
+    // AF_UNIX read shutdown changes peer write behavior, so guest read
+    // shutdown remains logical while write shutdown reaches the kernel.
+    let (kernel_shutdown, add, clear, shuts_down_read, shuts_down_write) = match mode {
         ShutdownMode::Read => (
             (!guest_endpoint).then_some(LinuxShutdown::Read),
             ReadinessFlags::READ,
@@ -905,9 +907,9 @@ pub(super) fn shutdown_tcp_socket(
         ),
         _ => return Err(BrokerError::UnsupportedOperation),
     };
-    if let Some(kernel_mode) = kernel_mode {
+    if let Some(kernel_shutdown) = kernel_shutdown {
         loop {
-            match shutdown(socket.tcp_state()?.descriptor.socket()?, kernel_mode) {
+            match shutdown(socket.tcp_state()?.descriptor.socket()?, kernel_shutdown) {
                 Ok(()) => break,
                 Err(Errno::INTR) => {}
                 Err(Errno::NOTCONN) => {
@@ -1277,7 +1279,7 @@ impl Reactor {
 
     fn connect_guest_tcp_socketpair(
         &mut self,
-        connector_id: u64,
+        connector_socket_id: u64,
         connector_session_id: SessionId,
         listener_id: u64,
         local_address: SocketAddrV4,
@@ -1318,7 +1320,7 @@ impl Reactor {
         {
             let connector = self
                 .sockets
-                .get(&connector_id)
+                .get(&connector_socket_id)
                 .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?;
             if connector.connection_status != SocketConnectionStatus::Unconnected
                 || !matches!(
@@ -1347,7 +1349,7 @@ impl Reactor {
                 let status = SocketConnectionStatus::Failed(SocketError::ConnectionRefused);
                 let connector = self
                     .sockets
-                    .get_mut(&connector_id)
+                    .get_mut(&connector_socket_id)
                     .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?;
                 connector.connection_status = status;
                 update_snapshot(connector, Some(status), ReadinessFlags::ERROR)
@@ -1380,13 +1382,13 @@ impl Reactor {
         epoll::add(
             &self.epoll,
             &connector_socket,
-            epoll::EventData::new_u64(connector_id),
+            epoll::EventData::new_u64(connector_socket_id),
             active_epoll_events(),
         )
         .map_err(|error| PlatformConnectError::PeerUnchanged(broker_error_from_errno(error)))?;
 
         {
-            let connector = self.sockets.get_mut(&connector_id).ok_or(
+            let connector = self.sockets.get_mut(&connector_socket_id).ok_or(
                 PlatformConnectError::PeerIndeterminate(BrokerError::Internal),
             )?;
             let tcp = connector
@@ -1418,7 +1420,7 @@ impl Reactor {
             .push_back(QueuedGuestTcpConnection {
                 socket: accepted_socket,
                 connection_id,
-                connector_id,
+                connector_socket_id,
                 connector_session_id,
                 local_address,
                 remote_address,
@@ -1431,11 +1433,9 @@ impl Reactor {
             .pending_guest_connection_count = next_pending_count;
 
         if let Err(error) = update_snapshot(
-            self.sockets
-                .get(&connector_id)
-                .ok_or(PlatformConnectError::PeerIndeterminate(
-                    BrokerError::Internal,
-                ))?,
+            self.sockets.get(&connector_socket_id).ok_or(
+                PlatformConnectError::PeerIndeterminate(BrokerError::Internal),
+            )?,
             Some(SocketConnectionStatus::Connected),
             ReadinessFlags::WRITE,
         ) {
@@ -1571,7 +1571,7 @@ impl Reactor {
     ) {
         for connection in queued {
             self.release_queued_guest_connection(connection.connector_session_id);
-            if let Some(connector) = self.sockets.get_mut(&connection.connector_id)
+            if let Some(connector) = self.sockets.get_mut(&connection.connector_socket_id)
                 && let Ok(tcp) = connector.tcp_state_mut()
                 && let Some(endpoint) = tcp.guest_endpoint.as_mut()
                 && endpoint.connection_id == connection.connection_id
@@ -1579,7 +1579,7 @@ impl Reactor {
                 endpoint.queued_listener_id = None;
             }
             if reset_connectors {
-                self.mark_guest_socket_reset(connection.connector_id);
+                self.mark_guest_socket_reset(connection.connector_socket_id);
             }
         }
         self.sessions
@@ -1644,7 +1644,7 @@ impl Reactor {
             return false;
         };
         self.release_queued_guest_connection(connection.connector_session_id);
-        if let Some(connector) = self.sockets.get_mut(&connection.connector_id)
+        if let Some(connector) = self.sockets.get_mut(&connection.connector_socket_id)
             && let Ok(tcp) = connector.tcp_state_mut()
             && let Some(endpoint) = tcp.guest_endpoint.as_mut()
             && endpoint.connection_id == connection_id
@@ -1652,7 +1652,7 @@ impl Reactor {
             endpoint.queued_listener_id = None;
         }
         if reset_connector {
-            self.mark_guest_socket_reset(connection.connector_id);
+            self.mark_guest_socket_reset(connection.connector_socket_id);
         }
         let _ = self.publish_listener_queue_readiness(listener_id);
         self.sessions
@@ -1962,14 +1962,14 @@ impl Reactor {
         let QueuedGuestTcpConnection {
             socket,
             connection_id,
-            connector_id,
+            connector_socket_id,
             connector_session_id,
             local_address,
             remote_address,
             guest_source_lease,
         } = queued;
         self.release_queued_guest_connection(connector_session_id);
-        if let Some(connector) = self.sockets.get_mut(&connector_id)
+        if let Some(connector) = self.sockets.get_mut(&connector_socket_id)
             && let Ok(tcp) = connector.tcp_state_mut()
             && let Some(endpoint) = tcp.guest_endpoint.as_mut()
             && endpoint.connection_id == connection_id
@@ -2038,15 +2038,28 @@ pub(super) fn consume_pending_guest_reset(socket: &mut SocketEntry) -> BrokerRes
         true
     };
     if consumed {
-        let mut snapshot = socket
-            .snapshot
-            .lock()
-            .expect("Linux socket snapshot mutex poisoned");
-        if snapshot.pending_error == Some(SocketError::ConnectionReset) {
-            snapshot.pending_error = None;
-        }
-        if snapshot.pending_error.is_none() {
-            snapshot.readiness = ReadinessFlags(snapshot.readiness.0 & !ReadinessFlags::ERROR.0);
+        let cleared_readiness = {
+            let mut snapshot = socket
+                .snapshot
+                .lock()
+                .expect("Linux socket snapshot mutex poisoned");
+            if snapshot.pending_error == Some(SocketError::ConnectionReset) {
+                snapshot.pending_error = None;
+            }
+            if snapshot.pending_error.is_none()
+                && snapshot.readiness.contains(ReadinessFlags::ERROR)
+            {
+                snapshot.readiness =
+                    ReadinessFlags(snapshot.readiness.0 & !ReadinessFlags::ERROR.0);
+                Some(snapshot.readiness)
+            } else {
+                None
+            }
+        };
+        if let Some(readiness) = cleared_readiness {
+            // The synchronous operation reports the reset even if its
+            // readiness notification cannot be delivered.
+            let _ = socket.readiness.publish(readiness);
         }
     }
     Ok(consumed)

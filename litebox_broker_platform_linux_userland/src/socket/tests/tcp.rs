@@ -1148,6 +1148,15 @@ fn guest_tcp_direct_receive_reports_reset_once_then_eof() {
         ),
         Ok(SocketOutcome::Failed(SocketError::ConnectionReset))
     );
+    loop {
+        let (handle, readiness) = pair.publications.recv_timeout(TEST_TIMEOUT).unwrap();
+        if handle == pair.connector
+            && readiness.contains(ReadinessFlags::READ | ReadinessFlags::HANGUP)
+            && !readiness.contains(ReadinessFlags::ERROR)
+        {
+            break;
+        }
+    }
     let readiness = pair
         .connector_session
         .check_readiness(pair.connector)
