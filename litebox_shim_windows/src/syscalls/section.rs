@@ -96,7 +96,6 @@ pub(crate) struct MapViewOfSectionParameters<Platform: ShimPlatform> {
 
 pub(super) struct MappedPagefileSectionView {
     pub(super) base: usize,
-    pub(super) mapped_size: usize,
     pub(super) view_size: usize,
 }
 
@@ -795,11 +794,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 pages: committed_pages(base, mapped_size, page_protection),
             },
         );
-        Ok(MappedPagefileSectionView {
-            base,
-            mapped_size,
-            view_size,
-        })
+        Ok(MappedPagefileSectionView { base, view_size })
     }
 
     pub(super) fn rollback_pagefile_section_view(&self, base_address: usize) {

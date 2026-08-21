@@ -2906,7 +2906,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> RawHandleVisitor<Platform, FS>
     }
 
     fn lpc_port(&self, lpc_port: LpcPortHandleObject) {
-        Task::<Platform, FS>::close_lpc_port(lpc_port);
+        self.task.close_lpc_port(lpc_port);
     }
 
     fn timer(&self, timer: TimerHandleObject<Platform>) {

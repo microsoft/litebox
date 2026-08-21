@@ -23,6 +23,7 @@ const CSR_SERVER_PROCESS_ID: usize = 1;
 const USERSRV_SERVER_DLL_INDEX: u32 = 3;
 const USER_CONNECT_VERSION: u64 = 0x0e41_05d9;
 const USERSRV_BACKING_SIZE: usize = crate::PAGE_SIZE;
+const BASESRV_BACKING_SIZE: usize = crate::PAGE_SIZE;
 const USER_MESSAGE_BITMAP_ALIGNMENT: usize = 0x20;
 const RESERVED_MESSAGE_MAX_MESSAGES: [usize; 3] = [0x318, 0x318, 0x14];
 const FNID_MESSAGE_MAX_MESSAGES: [usize; 10] = [
@@ -67,6 +68,16 @@ enum LpcMessageType {
     ConnectionRequest = 10,
 }
 
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, IntEnum, PartialEq)]
+enum CsrApiNumber {
+    CsrClientConnect = 0,
+    // BASESRV `BasepCreateActivationContext2`. Identified by the request payload shape (0x210-byte
+    // V2 SxS message with manifest/policy streams), not the ordinal: BASESRV API numbers drift
+    // across Windows builds, so this value is anchored to the validated target Win11 trace.
+    BaseSrvCreateActivationContext2 = 0x0001_001e,
+}
+
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(crate) struct AlpcMessageFlags: u32 {
@@ -107,7 +118,11 @@ impl<Platform: ShimPlatform> crate::WindowsHandleSubsystem for LpcPortSubsystem<
 }
 
 pub(crate) enum LpcPortHandleObject {
-    CsrApi { usersrv_backing_base: usize },
+    CsrApi {
+        mapped_view_base: usize,
+        usersrv_backing_base: usize,
+        basesrv_backing_base: usize,
+    },
 }
 
 #[repr(C)]
@@ -171,10 +186,25 @@ pub(crate) struct PortMessage {
 #[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
 struct CsrClientConnect {
     server_dll_index: u32,
-    padding: u32,
+    padding_0: u32,
     connection_info: usize,
-    connection_info_size: usize,
+    connection_info_size: u32,
+    padding_1: u32,
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct CsrCaptureBufferFourPointers {
+    length: u32,
+    padding_0: u32,
+    related_capture_buffer: usize,
+    count_message_pointers: u32,
+    padding_1: u32,
+    free_space: usize,
+    message_pointer_offsets: [usize; 4],
+}
+
+const _: () = assert!(size_of::<CsrCaptureBufferFourPointers>() == 0x40);
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
@@ -185,7 +215,457 @@ struct CsrApiMessage {
     status: i32,
     reserved: u32,
     padding: u32,
+}
+
+const _: () = assert!(size_of::<CsrApiMessage>() == 0x40);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct CsrClientConnectMessage {
+    message: CsrApiMessage,
     client_connect: CsrClientConnect,
+}
+
+const _: () = assert!(size_of::<CsrClientConnectMessage>() == 0x58);
+
+bitflags::bitflags! {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct BaseMsgSxsFlags: u32 {
+        const MANIFEST_PRESENT = 0x0001;
+        const POLICY_PRESENT = 0x0002;
+        const SYSTEM_DEFAULT_TEXTUAL_ASSEMBLY_IDENTITY_PRESENT = 0x0004;
+        const TEXTUAL_ASSEMBLY_IDENTITY_PRESENT = 0x0008;
+        const NO_ISOLATION = 0x0020;
+        const REMOTE = 0x0040;
+        const DEV_OVERRIDE_PRESENT = 0x0080;
+        const MANIFEST_OVERRIDE_PRESENT = 0x0100;
+        const PACKAGE_IDENTITY_PRESENT = 0x0400;
+        const FULL_TRUST_INTEGRITY_PRESENT = 0x0800;
+
+        const _ = !0;
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct BaseMsgSxsStream {
+    file_type: u8,
+    path_type: u8,
+    handle_type: u8,
+    padding: [u8; 5],
+    path: UnicodeString,
+    file_handle: Handle,
+    handle: Handle,
+    offset: u64,
+    size: usize,
+}
+
+const _: () = assert!(size_of::<BaseMsgSxsStream>() == 0x38);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct ActivationContextRunLevelInformation {
+    flags: u32,
+    run_level: u32,
+    ui_access: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct SupportedOsInfo {
+    major_version: u16,
+    minor_version: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct BaseSxsCreateActivationContextMessageV2 {
+    flags: u32,
+    processor_architecture: u16,
+    padding_0: u16,
+    culture_fallbacks: UnicodeString,
+    manifest: BaseMsgSxsStream,
+    policy: BaseMsgSxsStream,
+    assembly_directory: UnicodeString,
+    textual_assembly_identity: UnicodeString,
+    file_last_write_time: i64,
+    resource_id: u64,
+    activation_context_data: usize,
+    activation_context_data_wow64: usize,
+    run_level: ActivationContextRunLevelInformation,
+    supported_os_info: SupportedOsInfo,
+    assembly_name: UnicodeString,
+    max_version_tested: u64,
+    application_user_model_id: [u16; 130],
+    application_user_model_id_length: u32,
+}
+
+const _: () = assert!(size_of::<BaseSxsCreateActivationContextMessageV2>() == 0x1f8);
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct ActivationContextData {
+    magic: u32,
+    header_size: u32,
+    format_version: u32,
+    total_size: u32,
+    default_toc_offset: u32,
+    extended_toc_offset: u32,
+    assembly_roster_offset: u32,
+    flags: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct ActivationContextDataAssemblyRosterHeader {
+    header_size: u32,
+    hash_algorithm: u32,
+    entry_count: u32,
+    first_entry_offset: u32,
+    assembly_information_section_offset: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct ActivationContextDataAssemblyRosterEntry {
+    flags: u32,
+    pseudo_key: u32,
+    assembly_name_offset: u32,
+    assembly_name_length: u32,
+    assembly_information_offset: u32,
+    assembly_information_length: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct ActivationContextDataTocHeader {
+    header_size: u32,
+    entry_count: u32,
+    first_entry_offset: u32,
+    flags: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct ActivationContextDataTocEntry {
+    id: u32,
+    offset: u32,
+    length: u32,
+    format: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct ActivationContextStringSectionHeader {
+    magic: u32,
+    header_size: u32,
+    format_version: u32,
+    data_format_version: u32,
+    flags: u32,
+    element_count: u32,
+    element_list_offset: u32,
+    hash_algorithm: u32,
+    search_structure_offset: u32,
+    user_data_offset: u32,
+    user_data_size: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct ActivationContextStringSectionEntry {
+    pseudo_key: u32,
+    key_offset: u32,
+    key_length: u32,
+    offset: u32,
+    length: u32,
+    assembly_roster_index: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct ActivationContextAssemblyGlobalInformation {
+    size: u32,
+    flags: u32,
+    policy_coherency_guid: [u8; 16],
+    policy_override_guid: [u8; 16],
+    application_directory_path_type: u32,
+    application_directory_length: u32,
+    application_directory_offset: u32,
+    resource_name: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct ActivationContextAssemblyInformation {
+    size: u32,
+    flags: u32,
+    encoded_assembly_identity_length: u32,
+    encoded_assembly_identity_offset: u32,
+    manifest_path_type: u32,
+    manifest_path_length: u32,
+    manifest_path_offset: u32,
+    manifest_last_write_time: [u32; 2],
+    policy_path_type: u32,
+    policy_path_length: u32,
+    policy_path_offset: u32,
+    policy_last_write_time: [u32; 2],
+    metadata_satellite_roster_index: u32,
+    unused: u32,
+    manifest_version_major: u32,
+    manifest_version_minor: u32,
+    policy_version_major: u32,
+    policy_version_minor: u32,
+    assembly_directory_name_length: u32,
+    assembly_directory_name_offset: u32,
+    number_of_files: u32,
+    language_length: u32,
+    language_offset: u32,
+    run_level: u32,
+    ui_access: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct ActivationContextAssemblySection {
+    header: ActivationContextStringSectionHeader,
+    global_information: ActivationContextAssemblyGlobalInformation,
+    application_directory: [u16; 88],
+    entry: ActivationContextStringSectionEntry,
+    assembly_information: ActivationContextAssemblyInformation,
+    encoded_assembly_identity: [u16; 76],
+    manifest_path: [u16; 104],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct ActivationContextGuidSectionHeader {
+    magic: u32,
+    header_size: u32,
+    format_version: u32,
+    data_format_version: u32,
+    flags: u32,
+    element_count: u32,
+    element_list_offset: u32,
+    search_structure_offset: u32,
+    user_data_offset: u32,
+    user_data_size: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct ActivationContextCompatibilityInformation {
+    element_count: u32,
+    elements_offset: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct ActivationContextBlob {
+    header: ActivationContextData,
+    roster: ActivationContextDataAssemblyRosterHeader,
+    roster_entries: [ActivationContextDataAssemblyRosterEntry; 2],
+    toc: ActivationContextDataTocHeader,
+    toc_entries: [ActivationContextDataTocEntry; 6],
+    assembly_section: ActivationContextAssemblySection,
+    empty_guid_sections: [ActivationContextGuidSectionHeader; 4],
+    compatibility_information: ActivationContextCompatibilityInformation,
+}
+
+const _: () = assert!(size_of::<ActivationContextAssemblyInformation>() == 0x6c);
+const _: () = assert!(size_of::<ActivationContextAssemblySection>() == 0x300);
+const _: () = assert!(size_of::<ActivationContextBlob>() == 0x47c);
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "all activation-context offsets and sizes are compile-time values below one page"
+)]
+fn build_activation_context_blob(run_level: u32, ui_access: u32) -> ActivationContextBlob {
+    const HEADER_MAGIC: u32 = 0x7874_6341;
+    const STRING_SECTION_MAGIC: u32 = 0x6448_7353;
+    const GUID_SECTION_MAGIC: u32 = 0x6448_7347;
+    const ASSEMBLY_SECTION_OFFSET: u32 =
+        core::mem::offset_of!(ActivationContextBlob, assembly_section) as u32;
+    const ASSEMBLY_INFORMATION_OFFSET: u32 = ASSEMBLY_SECTION_OFFSET
+        + core::mem::offset_of!(ActivationContextAssemblySection, assembly_information) as u32;
+    const ASSEMBLY_INFORMATION_LENGTH: u32 = (size_of::<ActivationContextAssemblyInformation>()
+        + size_of::<[u16; 76]>()
+        + size_of::<[u16; 104]>()) as u32;
+    const EMPTY_GUID_SECTION: ActivationContextGuidSectionHeader =
+        ActivationContextGuidSectionHeader {
+            magic: GUID_SECTION_MAGIC,
+            header_size: size_of::<ActivationContextGuidSectionHeader>() as u32,
+            format_version: 1,
+            data_format_version: 1,
+            flags: 1,
+            element_count: 0,
+            element_list_offset: 0,
+            search_structure_offset: 0,
+            user_data_offset: 0,
+            user_data_size: 0,
+        };
+    let guid_sections_offset =
+        core::mem::offset_of!(ActivationContextBlob, empty_guid_sections) as u32;
+    let compatibility_offset =
+        core::mem::offset_of!(ActivationContextBlob, compatibility_information) as u32;
+    ActivationContextBlob {
+        header: ActivationContextData {
+            magic: HEADER_MAGIC,
+            header_size: size_of::<ActivationContextData>() as u32,
+            format_version: 1,
+            total_size: size_of::<ActivationContextBlob>() as u32,
+            default_toc_offset: core::mem::offset_of!(ActivationContextBlob, toc) as u32,
+            extended_toc_offset: 0,
+            assembly_roster_offset: core::mem::offset_of!(ActivationContextBlob, roster) as u32,
+            flags: 0,
+        },
+        roster: ActivationContextDataAssemblyRosterHeader {
+            header_size: size_of::<ActivationContextDataAssemblyRosterHeader>() as u32,
+            hash_algorithm: 1,
+            entry_count: 2,
+            first_entry_offset: core::mem::offset_of!(ActivationContextBlob, roster_entries) as u32,
+            assembly_information_section_offset: ASSEMBLY_SECTION_OFFSET,
+        },
+        roster_entries: [
+            ActivationContextDataAssemblyRosterEntry {
+                flags: 1,
+                pseudo_key: 0,
+                assembly_name_offset: 0,
+                assembly_name_length: 0,
+                assembly_information_offset: 0,
+                assembly_information_length: 0,
+            },
+            ActivationContextDataAssemblyRosterEntry {
+                flags: 2,
+                pseudo_key: 0,
+                assembly_name_offset: 0,
+                assembly_name_length: 0,
+                assembly_information_offset: ASSEMBLY_INFORMATION_OFFSET,
+                assembly_information_length: ASSEMBLY_INFORMATION_LENGTH,
+            },
+        ],
+        toc: ActivationContextDataTocHeader {
+            header_size: size_of::<ActivationContextDataTocHeader>() as u32,
+            entry_count: 6,
+            first_entry_offset: core::mem::offset_of!(ActivationContextBlob, toc_entries) as u32,
+            flags: 2,
+        },
+        toc_entries: [
+            ActivationContextDataTocEntry {
+                id: 1,
+                offset: ASSEMBLY_SECTION_OFFSET,
+                length: size_of::<ActivationContextAssemblySection>() as u32,
+                format: 1,
+            },
+            ActivationContextDataTocEntry {
+                id: 4,
+                offset: guid_sections_offset,
+                length: size_of::<ActivationContextGuidSectionHeader>() as u32,
+                format: 2,
+            },
+            ActivationContextDataTocEntry {
+                id: 5,
+                offset: guid_sections_offset
+                    + size_of::<ActivationContextGuidSectionHeader>() as u32,
+                length: size_of::<ActivationContextGuidSectionHeader>() as u32,
+                format: 2,
+            },
+            ActivationContextDataTocEntry {
+                id: 6,
+                offset: guid_sections_offset
+                    + 2 * size_of::<ActivationContextGuidSectionHeader>() as u32,
+                length: size_of::<ActivationContextGuidSectionHeader>() as u32,
+                format: 2,
+            },
+            ActivationContextDataTocEntry {
+                id: 9,
+                offset: guid_sections_offset
+                    + 3 * size_of::<ActivationContextGuidSectionHeader>() as u32,
+                length: size_of::<ActivationContextGuidSectionHeader>() as u32,
+                format: 2,
+            },
+            ActivationContextDataTocEntry {
+                id: 11,
+                offset: compatibility_offset,
+                length: size_of::<ActivationContextCompatibilityInformation>() as u32,
+                format: 1,
+            },
+        ],
+        assembly_section: ActivationContextAssemblySection {
+            header: ActivationContextStringSectionHeader {
+                magic: STRING_SECTION_MAGIC,
+                header_size: size_of::<ActivationContextStringSectionHeader>() as u32,
+                format_version: 1,
+                data_format_version: 1,
+                flags: 3,
+                element_count: 1,
+                element_list_offset: core::mem::offset_of!(ActivationContextAssemblySection, entry)
+                    as u32,
+                hash_algorithm: 1,
+                search_structure_offset: 0,
+                user_data_offset: size_of::<ActivationContextStringSectionHeader>() as u32,
+                user_data_size: core::mem::offset_of!(ActivationContextAssemblySection, entry)
+                    as u32
+                    - size_of::<ActivationContextStringSectionHeader>() as u32,
+            },
+            global_information: ActivationContextAssemblyGlobalInformation {
+                size: core::mem::offset_of!(ActivationContextAssemblySection, entry) as u32
+                    - size_of::<ActivationContextStringSectionHeader>() as u32,
+                flags: 0,
+                policy_coherency_guid: [0; 16],
+                policy_override_guid: [0; 16],
+                application_directory_path_type: 0,
+                application_directory_length: 0,
+                application_directory_offset: 0,
+                resource_name: 0,
+            },
+            application_directory: [0; 88],
+            entry: ActivationContextStringSectionEntry {
+                pseudo_key: 0,
+                key_offset: 0,
+                key_length: 0,
+                offset: core::mem::offset_of!(
+                    ActivationContextAssemblySection,
+                    assembly_information
+                ) as u32,
+                length: ASSEMBLY_INFORMATION_LENGTH,
+                assembly_roster_index: 1,
+            },
+            assembly_information: ActivationContextAssemblyInformation {
+                size: size_of::<ActivationContextAssemblyInformation>() as u32,
+                flags: 0x11,
+                encoded_assembly_identity_length: 0,
+                encoded_assembly_identity_offset: 0,
+                manifest_path_type: 0,
+                manifest_path_length: 0,
+                manifest_path_offset: 0,
+                manifest_last_write_time: [0; 2],
+                policy_path_type: 0,
+                policy_path_length: 0,
+                policy_path_offset: 0,
+                policy_last_write_time: [0; 2],
+                metadata_satellite_roster_index: 0,
+                unused: 0,
+                manifest_version_major: 1,
+                manifest_version_minor: 0,
+                policy_version_major: 0,
+                policy_version_minor: 0,
+                assembly_directory_name_length: 0,
+                assembly_directory_name_offset: 0,
+                number_of_files: 0,
+                language_length: 0,
+                language_offset: 0,
+                run_level,
+                ui_access,
+            },
+            encoded_assembly_identity: [0; 76],
+            manifest_path: [0; 104],
+        },
+        empty_guid_sections: [EMPTY_GUID_SECTION; 4],
+        compatibility_information: ActivationContextCompatibilityInformation {
+            element_count: 0,
+            elements_offset: 0,
+        },
+    }
 }
 
 #[repr(C)]
@@ -377,7 +857,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Ok(mapped_view) => mapped_view,
             Err(status) => return status,
         };
-        let Some(client_view_size) = mapped_view.view_size.checked_sub(USERSRV_BACKING_SIZE) else {
+        let Some(client_view_size) = mapped_view
+            .view_size
+            .checked_sub(USERSRV_BACKING_SIZE + BASESRV_BACKING_SIZE)
+        else {
             self.rollback_pagefile_section_view(mapped_view.base);
             return NtStatus::INVALID_VIEW_SIZE;
         };
@@ -385,22 +868,34 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             self.rollback_pagefile_section_view(mapped_view.base);
             return NtStatus::INVALID_VIEW_SIZE;
         }
-        let usersrv_backing_base = mapped_view.base + client_view_size;
+        // ```
+        // CSRSS
+        //     ├── BaseSrv
+        //     │    └── process/session-related Win32 support
+        //     │
+        //     ├── ConSrv
+        //     │    └── console-related support
+        //     │
+        //     ├── UserSrv
+        //     │    └── some user/session support
+        //     │
+        //     └── CSRSRV
+        //         └── CSR infrastructure
+        // ```
+        let basesrv_backing_base = mapped_view.base + client_view_size;
+        let usersrv_backing_base = basesrv_backing_base + BASESRV_BACKING_SIZE;
         // TODO(usersrv-ro-section): replace this client-writable page with server-owned backing
         // exposed to the guest through a read-only mapping.
         let port = LpcPortHandleObject::CsrApi {
+            mapped_view_base: mapped_view.base,
             usersrv_backing_base,
+            basesrv_backing_base,
         };
-        let handle = match self.insert_typed_handle::<LpcPortSubsystem<Platform>>(
-            port,
-            0,
-            Self::close_lpc_port,
-        ) {
+        let handle = match self.insert_typed_handle::<LpcPortSubsystem<Platform>>(port, 0, |port| {
+            self.close_lpc_port(port);
+        }) {
             Ok(handle) => handle,
-            Err(status) => {
-                self.rollback_pagefile_section_view(mapped_view.base);
-                return status;
-            }
+            Err(status) => return status,
         };
 
         let mut written_client_view = client_view_value;
@@ -423,18 +918,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             || params.port_handle.write_at_offset(0, handle).is_none();
         if write_failed {
             self.close_lpc_port_handle(handle);
-            self.rollback_pagefile_section_view(mapped_view.base);
             return NtStatus::ACCESS_VIOLATION;
         }
 
         if let (Some(server_view), Some(mut server_view_value)) =
             (params.server_view, server_view_value)
         {
-            server_view_value.view_size = mapped_view.mapped_size;
-            server_view_value.view_base = mapped_view.base;
+            // CSRSS does not supply a server-created port section for this connection.
+            server_view_value.view_size = 0;
+            server_view_value.view_base = 0;
             if server_view.write_at_offset(0, server_view_value).is_none() {
                 self.close_lpc_port_handle(handle);
-                self.rollback_pagefile_section_view(mapped_view.base);
                 return NtStatus::ACCESS_VIOLATION;
             }
         }
@@ -485,8 +979,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Ok(entry) => entry.with_entry(|entry| match entry {
                 LpcPortHandleObject::CsrApi {
                     usersrv_backing_base,
+                    basesrv_backing_base,
+                    ..
                 } => Self::handle_csr_api_port_message(
                     *usersrv_backing_base,
+                    *basesrv_backing_base,
                     send_message,
                     receive_message,
                     buffer_length,
@@ -498,14 +995,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     fn handle_csr_api_port_message(
         usersrv_backing_base: usize,
+        basesrv_backing_base: usize,
         send_message: MutPtr<Platform, u8>,
         receive_message: MutPtr<Platform, u8>,
         buffer_length: MutPtr<Platform, usize>,
     ) -> NtStatus {
-        let send_message = MutPtr::<Platform, CsrApiMessage>::from_usize(send_message.as_usize());
-        let receive_message =
-            MutPtr::<Platform, CsrApiMessage>::from_usize(receive_message.as_usize());
-        let Some(mut message) = send_message.read_at_offset(0) else {
+        let api_message = ConstPtr::<Platform, CsrApiMessage>::from_usize(send_message.as_usize());
+        let Some(message) = api_message.read_at_offset(0) else {
             return NtStatus::ACCESS_VIOLATION;
         };
         let Some(receive_capacity) = buffer_length.read_at_offset(0) else {
@@ -514,21 +1010,82 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if receive_capacity < size_of::<CsrApiMessage>() {
             return NtStatus::BUFFER_TOO_SMALL;
         }
-        if message.api_number != 0
-            || message.client_connect.server_dll_index != USERSRV_SERVER_DLL_INDEX
+        match CsrApiNumber::try_from(message.api_number) {
+            Ok(CsrApiNumber::CsrClientConnect) => Self::handle_usersrv_client_connect(
+                message,
+                send_message,
+                receive_message,
+                buffer_length,
+                receive_capacity,
+                usersrv_backing_base,
+            ),
+            Ok(CsrApiNumber::BaseSrvCreateActivationContext2) => {
+                Self::handle_basesrv_create_activation_context2(
+                    message,
+                    send_message,
+                    receive_message,
+                    buffer_length,
+                    receive_capacity,
+                    basesrv_backing_base,
+                )
+            }
+            Err(_) => {
+                litebox_util_log::debug!(
+                    api_number:% = format_args!("{:#x}", message.api_number);
+                    "Unsupported CSR API request"
+                );
+                // TODO(csr-api-dispatch): dispatch other CSR APIs.
+                NtStatus::INVALID_PARAMETER
+            }
+        }
+    }
+
+    fn write_csr_api_reply(
+        mut message: CsrApiMessage,
+        receive_message: MutPtr<Platform, u8>,
+        buffer_length: MutPtr<Platform, usize>,
+        message_length: usize,
+    ) -> NtStatus {
+        message.header.message_type = LpcMessageType::Reply as u16;
+        message.status = NtStatus::SUCCESS.as_raw();
+        let receive_message =
+            MutPtr::<Platform, CsrApiMessage>::from_usize(receive_message.as_usize());
+        if receive_message.write_at_offset(0, message).is_none()
+            || buffer_length.write_at_offset(0, message_length).is_none()
         {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        NtStatus::SUCCESS
+    }
+
+    fn handle_usersrv_client_connect(
+        message: CsrApiMessage,
+        send_message: MutPtr<Platform, u8>,
+        receive_message: MutPtr<Platform, u8>,
+        buffer_length: MutPtr<Platform, usize>,
+        receive_capacity: usize,
+        usersrv_backing_base: usize,
+    ) -> NtStatus {
+        if receive_capacity < size_of::<CsrClientConnectMessage>() {
+            return NtStatus::BUFFER_TOO_SMALL;
+        }
+        let client_connect = ConstPtr::<Platform, CsrClientConnect>::from_usize(
+            send_message.as_usize() + size_of::<CsrApiMessage>(),
+        );
+        let Some(client_connect) = client_connect.read_at_offset(0) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        if client_connect.server_dll_index != USERSRV_SERVER_DLL_INDEX {
             litebox_util_log::debug!(
-                api_number:% = format_args!("{:#x}", message.api_number),
-                server_dll_index = message.client_connect.server_dll_index;
-                "Unsupported CSR API request"
+                server_dll_index = client_connect.server_dll_index;
+                "Unsupported CSR server DLL client-connect request"
             );
-            // TODO(csr-api-dispatch): dispatch other CSR APIs and server DLLs.
+            // TODO(csr-server-dll-dispatch): dispatch other CSR server DLLs.
             return NtStatus::INVALID_PARAMETER;
         }
         if message.header.data_length
-            != (size_of::<CsrApiMessage>() - core::mem::offset_of!(CsrApiMessage, capture_data))
-                .trunc()
-            || message.header.total_length != size_of::<CsrApiMessage>().trunc()
+            != (size_of::<CsrClientConnectMessage>() - size_of::<PortMessage>()).trunc()
+            || message.header.total_length != size_of::<CsrClientConnectMessage>().trunc()
             || !matches!(
                 LpcMessageType::try_from(message.header.message_type),
                 Ok(LpcMessageType::NewMessage)
@@ -544,21 +1101,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             );
             return NtStatus::INVALID_PARAMETER;
         }
-        if message.client_connect.connection_info_size != size_of::<UserConnect>() {
+        if client_connect.connection_info_size != size_of::<UserConnect>().trunc() {
             litebox_util_log::debug!(
-                connection_info_size = message.client_connect.connection_info_size;
+                connection_info_size = client_connect.connection_info_size;
                 "Invalid USERSRV connection information size"
             );
             return NtStatus::INVALID_PARAMETER;
         }
 
-        if probe_guest_output_preserving_value::<Platform, CsrApiMessage>(receive_message).is_err()
+        let receive_api_message =
+            MutPtr::<Platform, CsrApiMessage>::from_usize(receive_message.as_usize());
+        if probe_guest_output_preserving_value::<Platform, CsrApiMessage>(receive_api_message)
+            .is_err()
             || probe_guest_output_preserving_value::<Platform, usize>(buffer_length).is_err()
         {
             return NtStatus::ACCESS_VIOLATION;
         }
         let connection_info =
-            MutPtr::<Platform, UserConnect>::from_usize(message.client_connect.connection_info);
+            MutPtr::<Platform, UserConnect>::from_usize(client_connect.connection_info);
         if probe_guest_output_preserving_value::<Platform, UserConnect>(connection_info).is_err() {
             return NtStatus::ACCESS_VIOLATION;
         }
@@ -571,23 +1131,110 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::ACCESS_VIOLATION;
         }
 
-        message.header.message_type = LpcMessageType::Reply as u16;
-        message.status = NtStatus::SUCCESS.as_raw();
-        if receive_message.write_at_offset(0, message).is_none()
-            || buffer_length
-                .write_at_offset(0, size_of::<CsrApiMessage>())
-                .is_none()
+        Self::write_csr_api_reply(
+            message,
+            receive_message,
+            buffer_length,
+            size_of::<CsrClientConnectMessage>(),
+        )
+    }
+
+    fn handle_basesrv_create_activation_context2(
+        message: CsrApiMessage,
+        send_message: MutPtr<Platform, u8>,
+        receive_message: MutPtr<Platform, u8>,
+        buffer_length: MutPtr<Platform, usize>,
+        receive_capacity: usize,
+        basesrv_backing_base: usize,
+    ) -> NtStatus {
+        let message_length =
+            size_of::<CsrApiMessage>() + size_of::<BaseSxsCreateActivationContextMessageV2>();
+        let data_length = message_length - size_of::<PortMessage>();
+        if message.header.data_length != data_length.trunc()
+            || message.header.total_length != message_length.trunc()
+            || !matches!(
+                LpcMessageType::try_from(message.header.message_type),
+                Ok(LpcMessageType::NewMessage)
+            )
+            || message.header.data_info_offset != 0
+            || receive_capacity < message_length
+        {
+            return NtStatus::INVALID_PARAMETER;
+        }
+
+        let request = ConstPtr::<Platform, BaseSxsCreateActivationContextMessageV2>::from_usize(
+            send_message.as_usize() + size_of::<CsrApiMessage>(),
+        );
+        let Some(request) = request.read_at_offset(0) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        let flags = BaseMsgSxsFlags::from_bits_retain(request.flags);
+        if !flags.contains(BaseMsgSxsFlags::MANIFEST_PRESENT)
+            || request.processor_architecture != 9
+            || request.activation_context_data == 0
+            || request.activation_context_data_wow64 != 0
+        {
+            return NtStatus::INVALID_PARAMETER;
+        }
+
+        let capture =
+            ConstPtr::<Platform, CsrCaptureBufferFourPointers>::from_usize(message.capture_data);
+        let Some(capture) = capture.read_at_offset(0) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        if capture.count_message_pointers != 4
+            || capture.free_space != 0
+            || capture.length as usize > BASESRV_BACKING_SIZE
+            || capture
+                .message_pointer_offsets
+                .iter()
+                .any(|offset| *offset >= message.header.total_length as usize)
+        {
+            return NtStatus::INVALID_PARAMETER;
+        }
+
+        let output = MutPtr::<Platform, usize>::from_usize(request.activation_context_data);
+        let receive_api_message =
+            MutPtr::<Platform, CsrApiMessage>::from_usize(receive_message.as_usize());
+        if probe_guest_output_preserving_value::<Platform, usize>(output).is_err()
+            || probe_guest_output_preserving_value::<Platform, CsrApiMessage>(receive_api_message)
+                .is_err()
+            || probe_guest_output_preserving_value::<Platform, usize>(buffer_length).is_err()
         {
             return NtStatus::ACCESS_VIOLATION;
         }
-        NtStatus::SUCCESS
+
+        let data = MutPtr::<Platform, ActivationContextBlob>::from_usize(basesrv_backing_base);
+        let blob =
+            build_activation_context_blob(request.run_level.run_level, request.run_level.ui_access);
+        // TODO(multiple-activation-contexts): allocate distinct backing for each successful call
+        // instead of replacing the process-startup activation context.
+        if data.write_at_offset(0, blob).is_none()
+            || output.write_at_offset(0, basesrv_backing_base).is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+
+        // TODO(sxs-manifest-sections): populate captured manifest redirections and compatibility
+        // settings when a guest depends on activation-context lookup beyond process startup.
+        // The ALPC path requires send and receive to alias, so writing the fixed header preserves
+        // the request payload in place while the reply retains its full native message length.
+        Self::write_csr_api_reply(message, receive_message, buffer_length, message_length)
     }
 
     pub(crate) fn close_lpc_port_handle(&self, handle: Handle) {
-        self.close_typed_handle::<LpcPortSubsystem<Platform>>(handle, Self::close_lpc_port);
+        self.close_typed_handle::<LpcPortSubsystem<Platform>>(handle, |port| {
+            self.close_lpc_port(port);
+        });
     }
 
-    pub(crate) fn close_lpc_port(_port: LpcPortHandleObject) {}
+    pub(crate) fn close_lpc_port(&self, port: LpcPortHandleObject) {
+        match port {
+            LpcPortHandleObject::CsrApi {
+                mapped_view_base, ..
+            } => self.rollback_pagefile_section_view(mapped_view_base),
+        }
+    }
 
     fn csr_api_connect_info(&self) -> Option<CsrApiConnectInfo> {
         let read_only_shared_memory_base = crate::read_field_at_offset::<Platform, usize>(
@@ -799,7 +1446,7 @@ mod tests {
 
     fn create_client_section(task: &Task<TestPlatform, TestFS>, access: u32) -> Handle {
         let mut handle = Handle::default();
-        let size = i64::try_from(crate::PAGE_SIZE * 2).expect("test section size fits in i64");
+        let size = i64::try_from(crate::PAGE_SIZE * 3).expect("test section size fits in i64");
         assert_eq!(
             task.sys_nt_create_section(
                 mut_ptr(&mut handle),
@@ -831,9 +1478,15 @@ mod tests {
             padding: 0,
             section_handle,
             section_offset: 0,
-            view_size: crate::PAGE_SIZE * 2,
+            view_size: crate::PAGE_SIZE * 3,
             view_base: 0,
             view_remote_base: 0,
+        };
+        let mut server_view = RemotePortView {
+            length: size_of::<RemotePortView>().trunc(),
+            padding: 0,
+            view_size: usize::MAX,
+            view_base: usize::MAX,
         };
         let mut max_message_length = 0u32;
         let mut connection_info = empty_connect_info();
@@ -845,7 +1498,7 @@ mod tests {
                 port_name: const_ptr(&name),
                 security_qos: const_ptr(&qos),
                 client_view: Some(mut_ptr(&mut client_view)),
-                server_view: None,
+                server_view: Some(mut_ptr(&mut server_view)),
                 max_message_length: Some(mut_ptr(&mut max_message_length)),
                 connection_information: Some(mut_byte_ptr(&mut connection_info)),
                 connection_information_length: Some(mut_ptr(&mut connection_info_len)),
@@ -856,6 +1509,8 @@ mod tests {
         assert!(!handle.is_null());
         assert_ne!(client_view.view_base, 0);
         assert_eq!(client_view.view_remote_base, client_view.view_base);
+        assert_eq!(server_view.view_size, 0);
+        assert_eq!(server_view.view_base, 0);
         assert_eq!(max_message_length, CSR_MAX_MESSAGE_LENGTH);
         assert_eq!(
             connection_info.shared_section_base,
@@ -879,14 +1534,13 @@ mod tests {
         );
 
         let mut usersrv_info = UserConnect::new_zeroed();
-        let mut message = CsrApiMessage::new_zeroed();
-        message.header.data_length = (size_of::<CsrApiMessage>()
-            - core::mem::offset_of!(CsrApiMessage, capture_data))
-        .trunc();
-        message.header.total_length = size_of::<CsrApiMessage>().trunc();
+        let mut message = CsrClientConnectMessage::new_zeroed();
+        message.message.header.data_length =
+            (size_of::<CsrClientConnectMessage>() - size_of::<PortMessage>()).trunc();
+        message.message.header.total_length = size_of::<CsrClientConnectMessage>().trunc();
         message.client_connect.server_dll_index = USERSRV_SERVER_DLL_INDEX;
         message.client_connect.connection_info = core::ptr::from_mut(&mut usersrv_info) as usize;
-        message.client_connect.connection_info_size = size_of::<UserConnect>();
+        message.client_connect.connection_info_size = size_of::<UserConnect>().trunc();
         let mut receive_capacity = 0x3b8usize;
 
         let original_message = message;
@@ -918,8 +1572,103 @@ mod tests {
             ),
             NtStatus::SUCCESS
         );
-        assert_eq!(message.header.message_type, LpcMessageType::Reply as u16);
-        assert_eq!(message.status, NtStatus::SUCCESS.as_raw());
-        assert_eq!(receive_capacity, size_of::<CsrApiMessage>());
+        assert_eq!(
+            message.message.header.message_type,
+            LpcMessageType::Reply as u16
+        );
+        assert_eq!(message.message.status, NtStatus::SUCCESS.as_raw());
+        assert_eq!(receive_capacity, size_of::<CsrClientConnectMessage>());
+        assert_eq!(
+            message.client_connect.as_bytes(),
+            original_message.client_connect.as_bytes()
+        );
+
+        assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
+        client_view.view_size = crate::PAGE_SIZE * 3;
+        client_view.view_base = 0;
+        client_view.view_remote_base = 0;
+        assert_eq!(
+            task.sys_nt_connect_port(ConnectPortParameters {
+                port_handle: mut_ptr(&mut handle),
+                port_name: const_ptr(&name),
+                security_qos: const_ptr(&qos),
+                client_view: Some(mut_ptr(&mut client_view)),
+                server_view: Some(mut_ptr(&mut server_view)),
+                max_message_length: Some(mut_ptr(&mut max_message_length)),
+                connection_information: Some(mut_byte_ptr(&mut connection_info)),
+                connection_information_length: Some(mut_ptr(&mut connection_info_len)),
+            }),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
+    }
+
+    #[test]
+    fn basesrv_create_activation_context2_returns_guest_blob() {
+        const MESSAGE_LENGTH: usize =
+            size_of::<CsrApiMessage>() + size_of::<BaseSxsCreateActivationContextMessageV2>();
+        let mut activation_context_data = 0usize;
+        let mut capture = CsrCaptureBufferFourPointers::new_zeroed();
+        capture.length = size_of::<CsrCaptureBufferFourPointers>().trunc();
+        capture.count_message_pointers = 4;
+        capture.message_pointer_offsets = [0x40, 0x48, 0x50, 0x58];
+
+        let mut message = CsrApiMessage::new_zeroed();
+        message.header.data_length = (MESSAGE_LENGTH - size_of::<PortMessage>()).trunc();
+        message.header.total_length = MESSAGE_LENGTH.trunc();
+        message.capture_data = core::ptr::from_ref(&capture) as usize;
+        message.api_number = CsrApiNumber::BaseSrvCreateActivationContext2 as u32;
+
+        let mut request = BaseSxsCreateActivationContextMessageV2::new_zeroed();
+        request.flags = BaseMsgSxsFlags::MANIFEST_PRESENT.bits();
+        request.processor_architecture = 9;
+        request.activation_context_data =
+            core::ptr::from_mut(&mut activation_context_data) as usize;
+        request.run_level.run_level = 3;
+        request.run_level.ui_access = 1;
+
+        let mut message_storage = [0usize; MESSAGE_LENGTH / size_of::<usize>()];
+        let message_base = message_storage.as_mut_ptr() as usize;
+        assert!(
+            MutPtr::<TestPlatform, CsrApiMessage>::from_usize(message_base)
+                .write_at_offset(0, message)
+                .is_some()
+        );
+        assert!(
+            MutPtr::<TestPlatform, BaseSxsCreateActivationContextMessageV2>::from_usize(
+                message_base + size_of::<CsrApiMessage>(),
+            )
+            .write_at_offset(0, request)
+            .is_some()
+        );
+
+        let mut backing = ActivationContextBlob::new_zeroed();
+        let backing_base = core::ptr::from_mut(&mut backing) as usize;
+        let mut receive_capacity = MESSAGE_LENGTH;
+        assert_eq!(
+            Task::<TestPlatform, TestFS>::handle_csr_api_port_message(
+                0,
+                backing_base,
+                mut_byte_ptr(&mut message_storage),
+                mut_byte_ptr(&mut message_storage),
+                mut_ptr(&mut receive_capacity),
+            ),
+            NtStatus::SUCCESS
+        );
+
+        let response = MutPtr::<TestPlatform, CsrApiMessage>::from_usize(message_base)
+            .read_at_offset(0)
+            .unwrap();
+        assert_eq!(response.header.message_type, LpcMessageType::Reply as u16);
+        assert_eq!(response.status, NtStatus::SUCCESS.as_raw());
+        assert_eq!(receive_capacity, message_storage.len() * size_of::<usize>());
+        assert_eq!(activation_context_data, backing_base);
+        assert_eq!(backing.header.magic, 0x7874_6341);
+        assert_eq!(
+            backing.header.total_size as usize,
+            size_of::<ActivationContextBlob>()
+        );
+        assert_eq!(backing.assembly_section.assembly_information.run_level, 3);
+        assert_eq!(backing.assembly_section.assembly_information.ui_access, 1);
     }
 }
