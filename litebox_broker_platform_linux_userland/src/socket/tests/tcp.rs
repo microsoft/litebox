@@ -80,6 +80,16 @@ fn abort_and_close_accepted_peer(pair: &GuestTcpPair) {
     );
 }
 
+fn wait_for_guest_reset(
+    session: &BrokerSession,
+    publications: &Receiver<(ObjectHandle, ReadinessFlags)>,
+    handle: ObjectHandle,
+) {
+    let readiness = ReadinessFlags::READ | ReadinessFlags::ERROR | ReadinessFlags::HANGUP;
+    wait_for_readiness_publication(publications, handle, readiness);
+    assert!(session.check_readiness(handle).unwrap().contains(readiness));
+}
+
 #[test]
 fn reactor_drives_a_loopback_tcp_socket() {
     assert_eq!(
@@ -955,19 +965,29 @@ fn exhausted_tcp_peek_cache_refreshes_before_terminal_eof() {
 
     let peek_length = MAX_SOCKET_TRANSFER_SIZE * 2;
     let mut first = vec![0_u8; chunk];
-    assert_eq!(
-        receive_into(
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    loop {
+        match receive_into(
             &session,
             handle,
             &mut first,
             ReceiveFlags::PEEK,
             0,
             peek_length,
-        ),
-        Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(
-            MAX_SOCKET_TRANSFER_SIZE
-        )))
-    );
+        ) {
+            Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(
+                MAX_SOCKET_TRANSFER_SIZE,
+            ))) => break,
+            Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(_)))
+            | Err(BrokerError::WouldBlock) => {
+                deadline
+                    .checked_duration_since(Instant::now())
+                    .expect("timed out waiting for the first TCP peek chunk");
+                thread::yield_now();
+            }
+            outcome => panic!("unexpected first peek outcome: {outcome:?}"),
+        }
+    }
     assert!(first.iter().all(|byte| *byte == 0x41));
 
     send_second_chunk.send(()).unwrap();
@@ -1059,14 +1079,7 @@ fn accepted_guest_tcp_close_with_unread_data_preserves_reset() {
 
     connector_session.close_object_reference(connector).unwrap();
     assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), connector);
-    let reset_readiness = ReadinessFlags::READ | ReadinessFlags::ERROR | ReadinessFlags::HANGUP;
-    wait_for_readiness_publication(&publications, accepted, reset_readiness);
-    assert!(
-        listener_session
-            .check_readiness(accepted)
-            .unwrap()
-            .contains(reset_readiness)
-    );
+    wait_for_guest_reset(&listener_session, &publications, accepted);
     let mut byte = [0_u8; 1];
     assert_eq!(
         receive_into(
@@ -1098,13 +1111,7 @@ fn accepted_guest_tcp_close_with_unread_data_preserves_reset() {
     );
     connector_session.close_object_reference(aborting).unwrap();
     assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), aborting);
-    wait_for_readiness_publication(&publications, abort_peer.handle, reset_readiness);
-    assert!(
-        listener_session
-            .check_readiness(abort_peer.handle)
-            .unwrap()
-            .contains(reset_readiness)
-    );
+    wait_for_guest_reset(&listener_session, &publications, abort_peer.handle);
     assert_eq!(
         receive_into(
             &listener_session,
@@ -1122,12 +1129,7 @@ fn accepted_guest_tcp_close_with_unread_data_preserves_reset() {
 fn guest_tcp_direct_receive_reports_reset_once_then_eof() {
     let pair = connected_guest_tcp_pair(8101);
     abort_and_close_accepted_peer(&pair);
-    wait_until_ready(
-        &pair.connector_session,
-        &pair.publications,
-        pair.connector,
-        ReadinessFlags::ERROR,
-    );
+    wait_for_guest_reset(&pair.connector_session, &pair.publications, pair.connector);
 
     let mut byte = [0_u8; 1];
     assert_eq!(
@@ -1204,12 +1206,7 @@ fn guest_tcp_status_consumes_reset_before_buffered_data() {
         ReadinessFlags::READ,
     );
     abort_and_close_accepted_peer(&pair);
-    wait_until_ready(
-        &pair.connector_session,
-        &pair.publications,
-        pair.connector,
-        ReadinessFlags::ERROR,
-    );
+    wait_for_guest_reset(&pair.connector_session, &pair.publications, pair.connector);
 
     let status =
         litebox_broker_core::socket::status(&pair.connector_session, pair.connector).unwrap();
@@ -1689,12 +1686,7 @@ fn connector_and_session_teardown_clean_bounded_pending_state() {
     listener_session.close_object_reference(listener).unwrap();
     assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), listener);
     assert_eq!(provider.reactor.queued_guest_connection_count(), 0);
-    wait_until_ready(
-        &final_connector_session,
-        &publications,
-        final_connector,
-        ReadinessFlags::ERROR,
-    );
+    wait_for_guest_reset(&final_connector_session, &publications, final_connector);
     let mut byte = [0_u8; 1];
     assert_eq!(
         receive_into(
@@ -2205,12 +2197,7 @@ fn guest_tcp_read_shutdown_is_logical_and_unread_close_resets_peer() {
         pair.retirements.recv_timeout(TEST_TIMEOUT).unwrap(),
         pair.connector
     );
-    wait_until_ready(
-        &pair.listener_session,
-        &pair.publications,
-        pair.accepted,
-        ReadinessFlags::ERROR,
-    );
+    wait_for_guest_reset(&pair.listener_session, &pair.publications, pair.accepted);
     assert_eq!(
         receive_into(
             &pair.listener_session,
@@ -2265,12 +2252,7 @@ fn guest_tcp_both_shutdown_keeps_peer_send_open_and_closes_write_half() {
         pair.retirements.recv_timeout(TEST_TIMEOUT).unwrap(),
         pair.connector
     );
-    wait_until_ready(
-        &pair.listener_session,
-        &pair.publications,
-        pair.accepted,
-        ReadinessFlags::ERROR,
-    );
+    wait_for_guest_reset(&pair.listener_session, &pair.publications, pair.accepted);
     assert_eq!(
         receive_into(
             &pair.listener_session,
@@ -2389,12 +2371,7 @@ fn guest_tcp_accept_publication_failure_purges_registered_endpoint() {
             .unwrap()
             .contains(ReadinessFlags::READ)
     );
-    wait_until_ready(
-        &connector_session,
-        &publications,
-        connector,
-        ReadinessFlags::ERROR,
-    );
+    wait_for_guest_reset(&connector_session, &publications, connector);
     let mut byte = [0_u8; 1];
     assert_eq!(
         receive_into(
