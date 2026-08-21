@@ -836,6 +836,23 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 }
             })
         };
+        #[cfg(all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"))]
+        if !pre_patched {
+            if let Some(metadata) = &code_metadata {
+                let (executable_bytes, identified_bytes) = metadata.coverage_bytes();
+                litebox_util_log::debug!(
+                    fd:? = fd,
+                    executable_bytes:? = executable_bytes,
+                    identified_bytes:? = identified_bytes;
+                    "collected AArch64 code metadata"
+                );
+            } else {
+                litebox_util_log::warn!(
+                    fd:? = fd;
+                    "AArch64 code metadata unavailable; falling back to whole-mapping x18 scan"
+                );
+            }
+        }
 
         // Compute the trampoline virtual address.
         // - Pre-patched: use the exact address from the trampoline header (the

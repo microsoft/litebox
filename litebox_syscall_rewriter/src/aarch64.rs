@@ -195,6 +195,16 @@ impl ElfCodeMetadata {
             identified: project_file_ranges(&self.identified, file_offset, mapping_len)?,
         })
     }
+
+    /// Total executable and identified-code bytes represented by this metadata.
+    pub fn coverage_bytes(&self) -> (u64, u64) {
+        let total = |ranges: &[TextSectionInfo]| {
+            ranges
+                .iter()
+                .fold(0u64, |total, range| total.saturating_add(range.size))
+        };
+        (total(&self.executable), total(&self.identified))
+    }
 }
 
 pub(crate) fn elf_code_metadata(
@@ -252,14 +262,13 @@ fn code_sections(file: &object::File<'_>, executable: &[TextSectionInfo]) -> Vec
 
     if let Some(section) = file.section_by_name(".eh_frame")
         && let Ok(data) = section.uncompressed_data()
-        && let Some(eh_frame_ranges) = eh_frame_ranges(
+    {
+        ranges.extend(eh_frame_ranges(
             &data,
             section.address(),
             file.section_by_name(".text").map(|text| text.address()),
             file.section_by_name(".got").map(|got| got.address()),
-        )
-    {
-        ranges.extend(eh_frame_ranges);
+        ));
     }
 
     let has_function_metadata = !ranges_to_sections(ranges.clone(), executable).is_empty();
@@ -286,7 +295,7 @@ fn eh_frame_ranges(
     eh_frame_address: u64,
     text_address: Option<u64>,
     got_address: Option<u64>,
-) -> Option<Vec<(u64, u64)>> {
+) -> Vec<(u64, u64)> {
     let mut section = gimli::EhFrame::new(data, gimli::LittleEndian);
     section.set_address_size(8);
     let mut bases = gimli::BaseAddresses::default().set_eh_frame(eh_frame_address);
@@ -299,14 +308,12 @@ fn eh_frame_ranges(
     let mut entries = gimli::UnwindSection::entries(&section, &bases);
     let mut ranges = Vec::new();
     loop {
-        let entry = match entries.next() {
-            Ok(Some(entry)) => entry,
-            Ok(None) => return Some(ranges),
-            Err(_) => return None,
+        let Ok(Some(entry)) = entries.next() else {
+            return ranges;
         };
         if let gimli::CieOrFde::Fde(partial) = entry {
             let Ok(fde) = partial.parse(gimli::UnwindSection::cie_from_offset) else {
-                return None;
+                continue;
             };
             if fde.len() != 0
                 && let Some(end) = fde.initial_address().checked_add(fde.len())
