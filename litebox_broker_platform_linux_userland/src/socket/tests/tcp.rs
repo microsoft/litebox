@@ -731,7 +731,7 @@ fn native_tcp_readiness_failure_does_not_fail_shared_reactor() {
     let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(4, 0, 2, 2),
         provider,
     )
@@ -847,7 +847,7 @@ fn native_tcp_connect_completion_readiness_failure_does_not_fail_shared_reactor(
     let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+            .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
         provider,
     )
