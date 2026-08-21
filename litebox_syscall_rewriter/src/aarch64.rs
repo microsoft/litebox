@@ -104,8 +104,8 @@
 //! ## Guest x18 limits
 //!
 //! X18 virtualization handles ordinary register substitutions, `CBZ`/`CBNZ`,
-//! `TBZ`/`TBNZ`, and `ADR`/`ADRP` forms required by the supported workloads.
-//! Currently unsupported decoder layouts such as `ADC`/`SBC`, other PC-relative
+//! `TBZ`/`TBNZ`, `ADC`/`SBC`, `UDIV`/`SDIV`, and `ADR`/`ADRP` forms required by
+//! the supported workloads. Other unsupported decoder layouts, other PC-relative
 //! forms, and indirect control flow through x18 reject AOT rewriting and become
 //! traps during runtime rewriting.
 
@@ -1090,6 +1090,12 @@ fn substitute_x18(word: u32, replacement: u8) -> Option<u32> {
                         | DecodedOpcode::LSRV
                         | DecodedOpcode::ASRV
                         | DecodedOpcode::RORV
+                        | DecodedOpcode::ADC
+                        | DecodedOpcode::ADCS
+                        | DecodedOpcode::SBC
+                        | DecodedOpcode::SBCS
+                        | DecodedOpcode::UDIV
+                        | DecodedOpcode::SDIV
                         | DecodedOpcode::CSEL
                         | DecodedOpcode::CSINC
                         | DecodedOpcode::CSINV
@@ -4728,6 +4734,28 @@ mod tests {
             ), // casp
         ] {
             assert_eq!(classify_x18(word), expected, "word {word:#010x}");
+        }
+    }
+
+    #[test]
+    fn x18_arithmetic_substitution_rewrites_exact_register_fields() {
+        for (word, expected) in [
+            (0x9a12_018c, 0x9a11_018c),
+            (0x9a12_0042, 0x9a11_0042),
+            (0x9a12_0020, 0x9a11_0020),
+            (0xba12_0020, 0xba11_0020),
+            (0xda12_0020, 0xda11_0020),
+            (0xfa12_0020, 0xfa11_0020), // ADC/ADCS/SBC/SBCS
+            (0x9a12_0252, 0x9a11_0231), // adc x18, x18, x18
+            (0x9ad2_0820, 0x9ad1_0820), // udiv x0, x1, x18
+            (0x9ad2_0c20, 0x9ad1_0c20), // sdiv x0, x1, x18
+        ] {
+            let X18Classification::X18(X18TransformResult::Supported(transformation)) =
+                classify_x18(word)
+            else {
+                panic!("word {word:#010x} was not supported");
+            };
+            assert_eq!(transformation.word, expected, "word {word:#010x}");
         }
     }
 

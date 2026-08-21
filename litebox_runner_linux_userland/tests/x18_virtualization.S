@@ -36,6 +36,24 @@ _start:
     cmp x17, x0
     b.ne fail
 
+    mov x18, #5
+    mov x0, #7
+    cmp x0, x0                    // C = 1
+    adc x1, x0, x18
+    cmp x1, #13
+    b.ne fail
+    cmp x0, x0                    // C = 1
+    sbc x1, x0, x18
+    cmp x1, #2
+    b.ne fail
+    udiv x1, x0, x18
+    cmp x1, #1
+    b.ne fail
+    mov x0, #-7
+    sdiv x1, x0, x18
+    cmn x1, #1
+    b.ne fail
+
     adr x18, adr_value
     ldr x0, [x18]
     cmp x0, #0x44
