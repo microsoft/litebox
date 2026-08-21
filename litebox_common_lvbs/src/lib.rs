@@ -34,7 +34,9 @@ pub const MAX_CORES: usize = 128;
 /// VTL call parameters (`param[0]`: function ID, `param[1..4]`: parameters)
 pub const NUM_VTLCALL_PARAMS: usize = 4;
 
-/// Fallibly allocate a boxed value without first materializing it on the heap.
+/// Fallibly allocate heap storage and move `value` into the resulting box.
+///
+/// Replace this with `Box::try_new` once the `allocator_api` feature is stable.
 pub fn try_box<T>(value: T) -> Result<Box<T>, zerocopy::AllocError> {
     const { assert!(core::mem::size_of::<T>() != 0) };
     let layout = core::alloc::Layout::new::<T>();

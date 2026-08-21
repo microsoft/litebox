@@ -137,12 +137,12 @@ pub(crate) fn validate_kernel_module_against_elf(
         #[cfg(debug_assertions)]
         {
             let mut diffs = Vec::new();
+            diffs
+                .try_reserve_exact(section_from_elf.len())
+                .map_err(|_| KernelElfError::AllocationFailed)?;
             for non_reloc in reloc_ranges.gaps(&(0..section_from_elf.len())) {
                 for i in non_reloc {
                     if section_from_elf[i] != section_in_memory[i] {
-                        diffs
-                            .try_reserve(1)
-                            .map_err(|_| KernelElfError::AllocationFailed)?;
                         diffs.push(i);
                     }
                 }

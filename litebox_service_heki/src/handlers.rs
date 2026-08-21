@@ -127,6 +127,12 @@ impl<P: Vtl0Gate> Heki<P> {
 
         let heki_pages = copy_heki_pages_from_vtl0(&self.gate, pa, nranges)
             .ok_or(VsmError::HekiPagesCopyFailed)?;
+        let range_count = heki_pages.iter().map(|page| page.iter().len()).sum();
+        system_certs_mem.try_reserve_ranges(range_count)?;
+        kexec_trampoline_metadata.try_reserve_ranges(range_count)?;
+        patch_info_mem.try_reserve_ranges(range_count)?;
+        kinfo_mem.try_reserve_ranges(range_count)?;
+        kdata_mem.try_reserve_ranges(range_count)?;
 
         for heki_page in &heki_pages {
             for heki_range in heki_page {
@@ -270,6 +276,11 @@ impl<P: Vtl0Gate> Heki<P> {
 
         let heki_pages = copy_heki_pages_from_vtl0(&self.gate, pa, nranges)
             .ok_or(VsmError::HekiPagesCopyFailed)?;
+        let range_count = heki_pages.iter().map(|page| page.iter().len()).sum();
+        module_memory_metadata.try_reserve_ranges(range_count)?;
+        module_in_memory.try_reserve_ranges(range_count)?;
+        module_as_elf.try_reserve_ranges(range_count)?;
+        patch_info_for_module.try_reserve_ranges(range_count)?;
 
         for heki_page in &heki_pages {
             for heki_range in heki_page {
@@ -288,7 +299,7 @@ impl<P: Vtl0Gate> Heki<P> {
                         if !heki_range.is_aligned(Size4KiB::SIZE) {
                             return Err(VsmError::AddressNotPageAligned);
                         }
-                        module_memory_metadata.insert_heki_range(heki_range)?;
+                        module_memory_metadata.insert_heki_range(heki_range);
                         module_in_memory
                             .extend_range(heki_range.mod_mem_type(), heki_range)
                             .map_err(|_| VsmError::InvalidInputAddress)?;
@@ -487,6 +498,10 @@ impl<P: Vtl0Gate> Heki<P> {
 
         let heki_pages = copy_heki_pages_from_vtl0(&self.gate, pa, nranges)
             .ok_or(VsmError::HekiPagesCopyFailed)?;
+        let range_count = heki_pages.iter().map(|page| page.iter().len()).sum();
+        kexec_memory_metadata.try_reserve_ranges(range_count)?;
+        kexec_image.try_reserve_ranges(range_count)?;
+        kexec_kernel_blob.try_reserve_ranges(range_count)?;
 
         for heki_page in &heki_pages {
             for heki_range in heki_page {
@@ -560,12 +575,13 @@ impl<P: Vtl0Gate> Heki<P> {
                         .map_err(|_| VsmError::AllocationFailed)?;
                     segment_frame_ranges.extend(segment_ranges.iter().map(|r| r.phys_frame_range));
                     let reservation_statuses = txn.reserve(&segment_frame_ranges)?;
+                    kexec_memory_metadata.try_reserve_ranges(segment_ranges.len())?;
                     for (segment_range, status) in
                         segment_ranges.into_iter().zip(reservation_statuses)
                     {
                         if status == ReservationStatus::New {
                             txn.protect(segment_range.phys_frame_range, MemAttr::MEM_ATTR_READ)?;
-                            kexec_memory_metadata.insert_memory_range(segment_range)?;
+                            kexec_memory_metadata.insert_memory_range(segment_range);
                         }
                     }
                 }
@@ -692,7 +708,7 @@ fn copy_heki_pages_from_vtl0<P: Vtl0Gate>(
     nranges: u64,
 ) -> Option<Vec<HekiPage>> {
     let mut heki_pages = Vec::new();
-    heki_pages.try_reserve(nranges.trunc()).ok()?;
+    heki_pages.try_reserve_exact(nranges.trunc()).ok()?;
     let mut visited_pages = HashSet::new();
     let mut range: u64 = 0;
 
@@ -722,9 +738,29 @@ fn copy_heki_pages_from_vtl0<P: Vtl0Gate>(
 
 /// Parse a concatenated run of DER-encoded X.509 certificates.
 fn parse_certs(mut buf: &[u8]) -> Result<Vec<Certificate>, VsmError> {
-    let mut certs = Vec::new();
+    const DER_SEQUENCE_TAG: u8 = 0x30;
+    const DER_TWO_BYTE_LENGTH: u8 = 0x82;
 
-    while buf.len() >= 4 && buf[0] == 0x30 && buf[1] == 0x82 {
+    let mut certs = Vec::new();
+    let mut remaining = buf;
+    let mut cert_count = 0;
+    while remaining.len() >= 4
+        && remaining[0] == DER_SEQUENCE_TAG
+        && remaining[1] == DER_TWO_BYTE_LENGTH
+    {
+        let der_len = ((remaining[2] as usize) << 8) | (remaining[3] as usize);
+        let total_len = der_len + 4;
+        if remaining.len() < total_len {
+            break;
+        }
+        cert_count += 1;
+        remaining = &remaining[total_len..];
+    }
+    certs
+        .try_reserve_exact(cert_count)
+        .map_err(|_| VsmError::AllocationFailed)?;
+
+    while buf.len() >= 4 && buf[0] == DER_SEQUENCE_TAG && buf[1] == DER_TWO_BYTE_LENGTH {
         let der_len = ((buf[2] as usize) << 8) | (buf[3] as usize);
         let total_len = der_len + 4;
 
@@ -738,9 +774,6 @@ fn parse_certs(mut buf: &[u8]) -> Result<Vec<Certificate>, VsmError> {
         let cert_bytes = &buf[..total_len];
         let cert =
             Certificate::from_der(cert_bytes).map_err(|_| VsmError::CertificateParseFailed)?;
-        certs
-            .try_reserve(1)
-            .map_err(|_| VsmError::AllocationFailed)?;
         certs.push(cert);
         buf = &buf[total_len..];
     }

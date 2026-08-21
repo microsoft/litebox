@@ -122,7 +122,7 @@ impl ModuleMemoryMetadata {
     }
 
     #[inline]
-    pub(crate) fn insert_heki_range(&mut self, heki_range: &HekiRange) -> Result<(), VsmError> {
+    pub(crate) fn insert_heki_range(&mut self, heki_range: &HekiRange) {
         // `HekiRange::is_valid` already validated these addresses.
         let pa = heki_range.pa;
         let epa = heki_range.epa;
@@ -130,28 +130,29 @@ impl ModuleMemoryMetadata {
             pa,
             epa,
             heki_range.mod_mem_type(),
-        ))
+        ));
     }
 
-    #[inline]
-    pub(crate) fn insert_memory_range(
-        &mut self,
-        mem_range: ModuleMemoryRange,
-    ) -> Result<(), VsmError> {
+    pub(crate) fn try_reserve_ranges(&mut self, additional: usize) -> Result<(), VsmError> {
         self.ranges
-            .try_reserve(1)
-            .map_err(|_| VsmError::AllocationFailed)?;
-        self.ranges.push(mem_range);
-        Ok(())
+            .try_reserve_exact(additional)
+            .map_err(|_| VsmError::AllocationFailed)
     }
 
     #[inline]
-    pub(crate) fn insert_patch_target(&mut self, patch_target: PhysAddr) -> Result<(), VsmError> {
+    pub(crate) fn insert_memory_range(&mut self, mem_range: ModuleMemoryRange) {
+        self.ranges.push(mem_range);
+    }
+
+    pub(crate) fn try_reserve_patch_targets(&mut self, additional: usize) -> Result<(), VsmError> {
         self.patch_targets
-            .try_reserve(1)
-            .map_err(|_| VsmError::AllocationFailed)?;
+            .try_reserve_exact(additional)
+            .map_err(|_| VsmError::AllocationFailed)
+    }
+
+    #[inline]
+    pub(crate) fn insert_patch_target(&mut self, patch_target: PhysAddr) {
         self.patch_targets.push(patch_target);
-        Ok(())
     }
 
     // This function returns patch targets belonging to this module to remove them
@@ -376,6 +377,12 @@ impl ModuleMemory {
         }
     }
 
+    pub(crate) fn try_reserve_ranges(&mut self, additional: usize) -> Result<(), VsmError> {
+        self.text.try_reserve_ranges(additional)?;
+        self.init_text.try_reserve_ranges(additional)?;
+        self.init_rodata.try_reserve_ranges(additional)
+    }
+
     /// Return a memory container for a section of the module memory by its name
     pub(crate) fn find_section_by_name(&self, name: &str) -> Option<&MemoryContainer> {
         match name {
@@ -445,6 +452,12 @@ impl MemoryContainer {
         }
     }
 
+    pub(crate) fn try_reserve_ranges(&mut self, additional: usize) -> Result<(), VsmError> {
+        self.range
+            .try_reserve_exact(additional)
+            .map_err(|_| VsmError::AllocationFailed)
+    }
+
     /// Return the byte length of the memory container
     pub(crate) fn len(&self) -> usize {
         self.buf.len()
@@ -486,9 +499,6 @@ impl MemoryContainer {
             // TODO: This should be an error once patch_info is fixed from VTL0
             // It will simplify patch_info and heki_range parsing as well
         }
-        self.range
-            .try_reserve(1)
-            .map_err(|_| VsmError::AllocationFailed)?;
         self.range.push(MemoryRange {
             addr,
             phys_addr,
@@ -644,19 +654,19 @@ impl KexecMemoryMetadata {
         }
         let pa = heki_range.pa;
         let epa = heki_range.epa;
-        self.insert_memory_range(KexecMemoryRange::new_checked(pa, epa))
+        self.insert_memory_range(KexecMemoryRange::new_checked(pa, epa));
+        Ok(())
+    }
+
+    pub(crate) fn try_reserve_ranges(&mut self, additional: usize) -> Result<(), VsmError> {
+        self.ranges
+            .try_reserve_exact(additional)
+            .map_err(|_| VsmError::AllocationFailed)
     }
 
     #[inline]
-    pub(crate) fn insert_memory_range(
-        &mut self,
-        mem_range: KexecMemoryRange,
-    ) -> Result<(), VsmError> {
-        self.ranges
-            .try_reserve(1)
-            .map_err(|_| VsmError::AllocationFailed)?;
+    pub(crate) fn insert_memory_range(&mut self, mem_range: KexecMemoryRange) {
         self.ranges.push(mem_range);
-        Ok(())
     }
 
     #[inline]
@@ -786,6 +796,14 @@ impl PatchDataMap {
         }
 
         let mut parsed: Vec<(PhysAddr, HekiPatch)> = Vec::new();
+        let max_patch_targets = patch_info_buf
+            .len()
+            .checked_div(core::mem::size_of::<HekiPatch>())
+            .and_then(|count| count.checked_mul(2))
+            .ok_or(PatchDataMapError::InvalidHekiPatchInfo)?;
+        parsed
+            .try_reserve_exact(max_patch_targets)
+            .map_err(|_| PatchDataMapError::AllocationFailed)?;
 
         // the buffer looks like below:
         // [`HekiPatchInfo`, [`HekiPatch`, ...], `HekiPatchInfo`, [`HekiPatch`, ...], ...]
@@ -848,9 +866,6 @@ impl PatchDataMap {
                     }
                 }
 
-                parsed
-                    .try_reserve(if straddles_second_page { 2 } else { 1 })
-                    .map_err(|_| PatchDataMapError::AllocationFailed)?;
                 parsed.push((patch_target_pa_0, patch));
                 if straddles_second_page {
                     parsed.push((patch_target_pa_1, patch));
@@ -860,13 +875,16 @@ impl PatchDataMap {
         }
 
         // Commit every parsed patch and record its targets for later unload cleanup.
+        if let Some(ref mut mod_mem_meta) = module_memory_metadata {
+            mod_mem_meta
+                .try_reserve_patch_targets(parsed.len())
+                .map_err(|_| PatchDataMapError::AllocationFailed)?;
+        }
         let mut inner = self.inner.write();
         for (target, patch) in parsed {
             inner.insert(target, patch);
             if let Some(ref mut mod_mem_meta) = module_memory_metadata {
-                mod_mem_meta
-                    .insert_patch_target(target)
-                    .map_err(|_| PatchDataMapError::AllocationFailed)?;
+                mod_mem_meta.insert_patch_target(target);
             }
         }
 

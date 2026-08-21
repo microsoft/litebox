@@ -327,7 +327,7 @@ impl FrameReservation {
             .try_reserve_exact(reserve_count)
             .map_err(|_| VsmError::AllocationFailed)?;
         self.owned_ranges
-            .try_reserve(reserve_count)
+            .try_reserve_exact(reserve_count)
             .map_err(|_| VsmError::AllocationFailed)?;
 
         let vtl1 = crate::platform_low().vtl1_phys_frame_range();
