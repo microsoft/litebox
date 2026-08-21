@@ -110,13 +110,263 @@
 //! traps during runtime rewriting.
 
 use alloc::format;
+use alloc::string::ToString as _;
 use alloc::vec::Vec;
+use core::ops::Range;
+use object::read::{Object as _, ObjectSection as _, ObjectSymbol as _};
 use yaxpeax_arch::{Decoder, U8Reader};
 use yaxpeax_arm::armv8::a64::{
     InstDecoder, Instruction as DecodedInstruction, Opcode as DecodedOpcode, Operand,
 };
+use zerocopy::IntoBytes as _;
 
-use crate::{Error, Result, TextSectionInfo, checked_add_u64};
+use crate::{
+    Error, InternalError, Result, TextSectionInfo, checked_add_u64, fixup_phdr_alignment,
+    text_sections,
+};
+
+#[derive(Clone, Copy)]
+pub(crate) struct ScanSections<'a> {
+    pub(crate) executable: &'a [TextSectionInfo],
+    pub(crate) code: &'a [TextSectionInfo],
+}
+
+/// Mapping-relative ranges used by AArch64 patch-site scanning.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodeScanRanges {
+    pub(crate) executable: Vec<Range<usize>>,
+    pub(crate) identified: Vec<Range<usize>>,
+}
+
+impl CodeScanRanges {
+    /// Mapping-relative executable ranges.
+    pub fn executable(&self) -> &[Range<usize>] {
+        &self.executable
+    }
+
+    /// Mapping-relative ranges positively identified as code.
+    pub fn identified(&self) -> &[Range<usize>] {
+        &self.identified
+    }
+}
+
+/// Owned AArch64 ELF code metadata, independent of the parsed ELF buffer.
+pub struct ElfCodeMetadata {
+    pub(crate) executable: Vec<TextSectionInfo>,
+    pub(crate) identified: Vec<TextSectionInfo>,
+}
+
+impl ElfCodeMetadata {
+    /// Parse an ELF image in aligned storage, relocating an unaligned program
+    /// header table within that storage if required by the object parser.
+    pub fn parse_aligned_in_place(aligned: &mut [u64], byte_len: usize) -> Result<Self> {
+        let bytes = aligned.as_mut_bytes();
+        if byte_len > bytes.len() {
+            return Err(Error::ParseError(
+                "aligned ELF byte length exceeds storage".into(),
+            ));
+        }
+        fixup_phdr_alignment(&mut bytes[..byte_len]);
+        let file = object::File::parse(&bytes[..byte_len])
+            .map_err(|error| Error::ParseError(error.to_string()))?;
+        if file.architecture() != object::Architecture::Aarch64 {
+            return Err(Error::UnsupportedExecutable(
+                "code metadata requires an AArch64 ELF".into(),
+            ));
+        }
+        match elf_code_metadata(&file) {
+            Ok(metadata) => Ok(metadata),
+            Err(InternalError::Public(error)) => Err(error),
+            Err(InternalError::NoTextSectionFound) => Err(Error::UnsupportedExecutable(
+                "AArch64 ELF has no executable code ranges".into(),
+            )),
+            Err(error) => unreachable!("unexpected metadata error: {error:?}"),
+        }
+    }
+
+    /// Project ELF file ranges into one file-backed mapping.
+    pub fn ranges_for_mapping(
+        &self,
+        file_offset: u64,
+        mapping_len: usize,
+    ) -> Result<CodeScanRanges> {
+        Ok(CodeScanRanges {
+            executable: project_file_ranges(&self.executable, file_offset, mapping_len)?,
+            identified: project_file_ranges(&self.identified, file_offset, mapping_len)?,
+        })
+    }
+
+    /// Total executable and identified-code bytes represented by this metadata.
+    pub fn coverage_bytes(&self) -> (u64, u64) {
+        let total = |ranges: &[TextSectionInfo]| {
+            ranges
+                .iter()
+                .fold(0u64, |total, range| total.saturating_add(range.size))
+        };
+        (total(&self.executable), total(&self.identified))
+    }
+}
+
+pub(crate) fn elf_code_metadata(
+    file: &object::File<'_>,
+) -> core::result::Result<ElfCodeMetadata, InternalError> {
+    let executable = text_sections(file)?;
+    let identified = code_sections(file, &executable);
+    Ok(ElfCodeMetadata {
+        executable,
+        identified,
+    })
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the crate requires 64-bit pointers"
+)]
+fn project_file_ranges(
+    ranges: &[TextSectionInfo],
+    mapping_file_offset: u64,
+    mapping_len: usize,
+) -> Result<Vec<Range<usize>>> {
+    let mapping_end = mapping_file_offset
+        .checked_add(mapping_len as u64)
+        .ok_or_else(|| Error::AddressOverflow("mapping file range".into()))?;
+    let mut projected = Vec::new();
+    for range in ranges {
+        let range_end = range
+            .file_offset
+            .checked_add(range.size)
+            .ok_or_else(|| Error::AddressOverflow("ELF code file range".into()))?;
+        let start = range.file_offset.max(mapping_file_offset);
+        let end = range_end.min(mapping_end);
+        if start < end {
+            projected
+                .push((start - mapping_file_offset) as usize..(end - mapping_file_offset) as usize);
+        }
+    }
+    Ok(projected)
+}
+
+/// Builds ranges where metadata positively identifies AArch64 code. Executable
+/// bytes outside these ranges remain eligible for exact mandatory-site scans,
+/// but not heuristic x18 classification.
+fn code_sections(file: &object::File<'_>, executable: &[TextSectionInfo]) -> Vec<TextSectionInfo> {
+    let mut ranges = Vec::new();
+    for symbol in file.symbols().chain(file.dynamic_symbols()) {
+        if symbol.kind() == object::SymbolKind::Text
+            && symbol.size() != 0
+            && let Some(end) = symbol.address().checked_add(symbol.size())
+        {
+            ranges.push((symbol.address(), end));
+        }
+    }
+
+    if let Some(section) = file.section_by_name(".eh_frame")
+        && let Ok(data) = section.uncompressed_data()
+    {
+        ranges.extend(eh_frame_ranges(
+            &data,
+            section.address(),
+            file.section_by_name(".text").map(|text| text.address()),
+            file.section_by_name(".got").map(|got| got.address()),
+        ));
+    }
+
+    let has_function_metadata = !ranges_to_sections(ranges.clone(), executable).is_empty();
+    if !has_function_metadata {
+        return executable.to_vec();
+    }
+
+    for section in file.sections() {
+        let Ok(name) = section.name() else {
+            continue;
+        };
+        if (matches!(name, ".init" | ".fini" | ".plt" | ".iplt") || name.starts_with(".plt."))
+            && let Some(end) = section.address().checked_add(section.size())
+        {
+            ranges.push((section.address(), end));
+        }
+    }
+
+    ranges_to_sections(ranges, executable)
+}
+
+fn eh_frame_ranges(
+    data: &[u8],
+    eh_frame_address: u64,
+    text_address: Option<u64>,
+    got_address: Option<u64>,
+) -> Vec<(u64, u64)> {
+    let mut section = gimli::EhFrame::new(data, gimli::LittleEndian);
+    section.set_address_size(8);
+    let mut bases = gimli::BaseAddresses::default().set_eh_frame(eh_frame_address);
+    if let Some(text_address) = text_address {
+        bases = bases.set_text(text_address);
+    }
+    if let Some(got_address) = got_address {
+        bases = bases.set_got(got_address);
+    }
+    let mut entries = gimli::UnwindSection::entries(&section, &bases);
+    let mut ranges = Vec::new();
+    loop {
+        let Ok(Some(entry)) = entries.next() else {
+            return ranges;
+        };
+        if let gimli::CieOrFde::Fde(partial) = entry {
+            let Ok(fde) = partial.parse(gimli::UnwindSection::cie_from_offset) else {
+                continue;
+            };
+            if fde.len() != 0
+                && let Some(end) = fde.initial_address().checked_add(fde.len())
+            {
+                ranges.push((fde.initial_address(), end));
+            }
+        }
+    }
+}
+
+fn ranges_to_sections(
+    ranges: Vec<(u64, u64)>,
+    executable: &[TextSectionInfo],
+) -> Vec<TextSectionInfo> {
+    let mut clipped = Vec::new();
+    for (start, end) in ranges {
+        for section in executable {
+            let section_end = section.vaddr.saturating_add(section.size);
+            let start = start
+                .max(section.vaddr)
+                .checked_add(3)
+                .map_or(u64::MAX, |start| start & !3);
+            let end = end.min(section_end) & !3;
+            if start < end {
+                clipped.push((start, end, section));
+            }
+        }
+    }
+    clipped.sort_unstable_by_key(|(start, _, _)| *start);
+
+    let mut code: Vec<TextSectionInfo> = Vec::new();
+    for (start, end, section) in clipped {
+        if let Some(previous) = code.last_mut()
+            && start >= previous.vaddr
+            && previous.vaddr.saturating_add(previous.size) >= start
+            && previous.file_offset.saturating_add(start - previous.vaddr)
+                == section.file_offset.saturating_add(start - section.vaddr)
+        {
+            previous.size = end
+                .max(previous.vaddr.saturating_add(previous.size))
+                .saturating_sub(previous.vaddr);
+            continue;
+        }
+        code.push(TextSectionInfo {
+            vaddr: start,
+            file_offset: section
+                .file_offset
+                .saturating_add(start.saturating_sub(section.vaddr)),
+            size: end - start,
+        });
+    }
+    code
+}
 
 // ============================================================
 // Constants
@@ -1725,7 +1975,7 @@ const LDR_LITERAL_SHAPE_MASK: u32 = 0xFF00_001F;
 /// fields zeroed. An encoder selects a variant and ORs in its operands via
 /// [`Opcode::bits`]. (`MRS TPIDR_EL0` is encoded from [`Opcode::MrsTpidrEl0`],
 /// whose bits equal [`MRS_TPIDR_EL0_BITS`] — the scan-detection pattern in
-/// [`find_patch_sites`].)
+/// [`find_patch_sites_with_code_ranges`].)
 #[repr(u32)]
 #[derive(Clone, Copy)]
 enum Opcode {
@@ -2150,14 +2400,24 @@ enum PatchKind {
 ///
 /// `MRS XZR, TPIDR_EL0` is a discarded read (register 31 as an `LDR` base would
 /// mean `SP`), so it is left native; every other `MRS Xd, TPIDR_EL0` is gated.
+#[cfg(test)]
 fn find_patch_sites(
     sections: &[TextSectionInfo],
     buf: &[u8],
     config: RewriteConfig,
 ) -> Result<Vec<PatchSite>> {
+    find_patch_sites_with_code_ranges(sections, sections, buf, config)
+}
+
+fn find_patch_sites_with_code_ranges(
+    executable_sections: &[TextSectionInfo],
+    code_sections: &[TextSectionInfo],
+    buf: &[u8],
+    config: RewriteConfig,
+) -> Result<Vec<PatchSite>> {
     let mut sites = Vec::new();
 
-    for section in sections {
+    for section in executable_sections {
         let start = usize::try_from(section.file_offset)
             .map_err(|_| Error::ParseError("section file offset too large".into()))?;
         let size = usize::try_from(section.size)
@@ -2179,18 +2439,38 @@ fn find_patch_sites(
         }
         let section_data = &buf[start..end];
         let mut inside_exclusive_sequence = false;
+        let mut was_known_code = false;
+        let mut code_index = 0;
 
         for i in (0..section_data.len()).step_by(INSN_BYTES) {
             if i + INSN_BYTES > section_data.len() {
                 break;
             }
             let insn = u32::from_le_bytes(section_data[i..i + INSN_BYTES].try_into().unwrap());
-            let exclusive_boundary = exclusive_boundary(insn);
-            if exclusive_boundary == Some(ExclusiveBoundary::Load) {
-                inside_exclusive_sequence = true;
-            } else if exclusive_boundary == Some(ExclusiveBoundary::Store) {
+            let vaddr = checked_add_u64(section.vaddr, i as u64, "patch site")?;
+            while code_index < code_sections.len()
+                && code_sections[code_index]
+                    .vaddr
+                    .saturating_add(code_sections[code_index].size)
+                    <= vaddr
+            {
+                code_index += 1;
+            }
+            let known_code = code_sections.get(code_index).is_some_and(|code| {
+                vaddr >= code.vaddr && vaddr < code.vaddr.saturating_add(code.size)
+            });
+            if !known_code || !was_known_code {
                 inside_exclusive_sequence = false;
             }
+            if known_code {
+                let exclusive_boundary = exclusive_boundary(insn);
+                if exclusive_boundary == Some(ExclusiveBoundary::Load) {
+                    inside_exclusive_sequence = true;
+                } else if exclusive_boundary == Some(ExclusiveBoundary::Store) {
+                    inside_exclusive_sequence = false;
+                }
+            }
+            was_known_code = known_code;
             let kind = if (insn & SVC_OPCODE_MASK) == SVC_OPCODE_BITS {
                 if config.host != Host::Linux {
                     return Err(Error::UnsupportedExecutable(format!(
@@ -2235,8 +2515,7 @@ fn find_patch_sites(
                 } else {
                     PatchKind::MrsTpidr(rd)
                 }
-            } else if config.virtualize_x18 {
-                let vaddr = checked_add_u64(section.vaddr, i as u64, "x18 site")?;
+            } else if config.virtualize_x18 && known_code {
                 if let Some(branch) = classify_x18_conditional_branch(insn, vaddr) {
                     PatchKind::X18CompareBranch(branch)
                 } else if let Some(adr) = classify_adr_x18(insn, vaddr) {
@@ -2265,7 +2544,7 @@ fn find_patch_sites(
             }
             sites.push(PatchSite {
                 file_offset: start + i,
-                vaddr: checked_add_u64(section.vaddr, i as u64, "patch site")?,
+                vaddr,
                 kind,
             });
         }
@@ -2306,9 +2585,28 @@ pub(crate) struct HookOutcome {
 /// whose gate cannot branch back, is replaced with a trap and listed in
 /// [`HookOutcome::trapped_sites`] so the caller can reject the incomplete
 /// rewrite, mirroring the x86-64 unpatchable-syscall path.
+#[cfg(test)]
 pub(crate) fn hook_syscalls_aarch64(
     buf: &mut [u8],
     text_sections: &[TextSectionInfo],
+    trampoline_base_addr: u64,
+    callback: u64,
+    config: RewriteConfig,
+) -> Result<Option<HookOutcome>> {
+    hook_syscalls_aarch64_with_code_ranges(
+        buf,
+        text_sections,
+        text_sections,
+        trampoline_base_addr,
+        callback,
+        config,
+    )
+}
+
+pub(crate) fn hook_syscalls_aarch64_with_code_ranges(
+    buf: &mut [u8],
+    executable_sections: &[TextSectionInfo],
+    code_sections: &[TextSectionInfo],
     trampoline_base_addr: u64,
     callback: u64,
     config: RewriteConfig,
@@ -2318,7 +2616,7 @@ pub(crate) fn hook_syscalls_aarch64(
             "AArch64 trampoline base {trampoline_base_addr:#x} is not {GATE_ALIGNMENT}-byte aligned"
         )));
     }
-    let sites = find_patch_sites(text_sections, buf, config)?;
+    let sites = find_patch_sites_with_code_ranges(executable_sections, code_sections, buf, config)?;
 
     if sites.is_empty() {
         // No patch sites: nothing to redirect, so no trampoline is
@@ -2439,13 +2737,13 @@ fn trap_site(buf: &mut [u8], file_offset: usize) {
 ///
 /// The `cfg` tracks reachability, not capability: the scan and the rewrite are
 /// host-agnostic, but nothing calls this in an x86-64 build.
-#[cfg(any(test, target_arch = "aarch64"))]
-pub(crate) fn trap_all_patch_sites(
+pub(crate) fn trap_all_patch_sites_with_code_ranges(
     buf: &mut [u8],
-    text_sections: &[TextSectionInfo],
+    executable_sections: &[TextSectionInfo],
+    code_sections: &[TextSectionInfo],
     config: RewriteConfig,
 ) -> Result<usize> {
-    let sites = find_patch_sites(text_sections, buf, config)?;
+    let sites = find_patch_sites_with_code_ranges(executable_sections, code_sections, buf, config)?;
     for site in &sites {
         trap_site(buf, site.file_offset);
     }
@@ -4924,6 +5222,47 @@ mod tests {
             outcome.trampoline.len(),
             GATES_START_OFFSET + MSR_GATE_SIZE + MRS_GATE_SIZE
         );
+    }
+
+    #[test]
+    fn unknown_executable_bytes_scan_mandatory_sites_but_not_heuristic_x18() {
+        let words: [u32; 2] = [0xd400_0001, 0x5d56_4f48];
+        let bytes = words
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<_>>();
+        let executable = [TextSectionInfo {
+            vaddr: 0x1000,
+            file_offset: 0,
+            size: bytes.len() as u64,
+        }];
+
+        let sites =
+            find_patch_sites_with_code_ranges(&executable, &[], &bytes, x18_config(Host::Linux))
+                .unwrap();
+
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].vaddr, 0x1000);
+        assert_eq!(sites[0].kind, PatchKind::Svc);
+    }
+
+    #[test]
+    fn metadata_ranges_are_clipped_aligned_and_merged() {
+        let executable = [TextSectionInfo {
+            vaddr: 0x1000,
+            file_offset: 0x200,
+            size: 0x20,
+        }];
+
+        let ranges = ranges_to_sections(
+            vec![(0x0fff, 0x1006), (0x1004, 0x100d), (0x101e, 0x1024)],
+            &executable,
+        );
+
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].vaddr, 0x1000);
+        assert_eq!(ranges[0].file_offset, 0x200);
+        assert_eq!(ranges[0].size, 0xc);
     }
 
     #[test]

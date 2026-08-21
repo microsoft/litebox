@@ -29,6 +29,8 @@ use litebox::utils::ReinterpretUnsignedExt as _;
 use litebox::utils::TruncateExt as _;
 use object::elf::{ET_DYN, FileHeader64, PT_LOAD, ProgramHeader64};
 use object::endian::LittleEndian;
+#[cfg(all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"))]
+use zerocopy::FromZeros as _;
 
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("ELF patching code assumes 64-bit pointers (u64 <-> usize is lossless)");
@@ -104,6 +106,8 @@ pub(crate) struct ElfPatchState {
     runtime_patches_committed: bool,
     #[cfg(target_arch = "aarch64")]
     trampoline_invalidated: bool,
+    #[cfg(all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"))]
+    code_metadata: Option<litebox_syscall_rewriter::aarch64::ElfCodeMetadata>,
     /// Tracks file-backed mappings for this fd as (vaddr, len) pairs.
     /// Used to find mappings that need patching when mprotect adds PROT_EXEC.
     /// Cleared on munmap to allow re-patching.
@@ -812,6 +816,44 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let (pre_patched, tramp_file_offset, tramp_vaddr, tramp_file_size) =
             self.check_trampoline_magic(fd);
 
+        #[cfg(all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"))]
+        let code_metadata = if pre_patched {
+            None
+        } else {
+            self.sys_fstat(fd).ok().and_then(|stat| {
+                let file_size: usize = stat.st_size.reinterpret_as_unsigned().trunc();
+                let word_len = file_size.div_ceil(8);
+                let mut words = u64::new_vec_zeroed(word_len).ok()?;
+                let bytes = zerocopy::IntoBytes::as_mut_bytes(words.as_mut_slice());
+                match self.sys_read(fd, &mut bytes[..file_size], Some(0)) {
+                    Ok(n) if n == file_size => {
+                        litebox_syscall_rewriter::aarch64::ElfCodeMetadata::parse_aligned_in_place(
+                            &mut words, file_size,
+                        )
+                        .ok()
+                    }
+                    _ => None,
+                }
+            })
+        };
+        #[cfg(all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"))]
+        if !pre_patched {
+            if let Some(metadata) = &code_metadata {
+                let (executable_bytes, identified_bytes) = metadata.coverage_bytes();
+                litebox_util_log::debug!(
+                    fd:? = fd,
+                    executable_bytes:? = executable_bytes,
+                    identified_bytes:? = identified_bytes;
+                    "collected AArch64 code metadata"
+                );
+            } else {
+                litebox_util_log::warn!(
+                    fd:? = fd;
+                    "AArch64 code metadata unavailable; falling back to whole-mapping x18 scan"
+                );
+            }
+        }
+
         // Compute the trampoline virtual address.
         // - Pre-patched: use the exact address from the trampoline header (the
         //   code already contains JMPs there, so we MUST map at this address).
@@ -881,6 +923,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             runtime_patches_committed: false,
             #[cfg(target_arch = "aarch64")]
             trampoline_invalidated: false,
+            #[cfg(all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"))]
+            code_metadata,
             file_mappings: BTreeSet::new(),
             patched_ranges: BTreeSet::new(),
         });
@@ -959,7 +1003,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// and the initial mprotect RW is skipped.
     ///
     /// Panics on infrastructure failures (mprotect/read/write/disassembly).
-    fn apply_trap_fallback(&self, mapped_addr: UserPtrMut<u8>, len: usize, already_rw: bool) {
+    #[cfg(target_arch = "aarch64")]
+    fn apply_aarch64_trap_fallback(
+        &self,
+        mapped_addr: UserPtrMut<u8>,
+        len: usize,
+        already_rw: bool,
+        ranges: Option<&litebox_syscall_rewriter::aarch64::CodeScanRanges>,
+    ) {
         if !already_rw {
             self.sys_mprotect_raw(
                 mapped_addr,
@@ -975,16 +1026,60 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
         let mut code_buf = code_owned.into_vec();
         let code_vaddr = mapped_addr.as_usize() as u64;
-        #[cfg(target_arch = "aarch64")]
-        let count = litebox_syscall_rewriter::trap_all_syscalls_in_code_with_options(
-            &mut code_buf,
-            code_vaddr,
-            crate::aarch64_rewrite_options(),
-        )
+        let count = if let Some(ranges) = ranges {
+            litebox_syscall_rewriter::trap_all_aarch64_patch_sites_with_options_and_ranges(
+                &mut code_buf,
+                code_vaddr,
+                ranges,
+                crate::aarch64_rewrite_options(),
+            )
+        } else {
+            litebox_syscall_rewriter::trap_all_syscalls_in_code_with_options(
+                &mut code_buf,
+                code_vaddr,
+                crate::aarch64_rewrite_options(),
+            )
+        }
         .unwrap_or_else(|e| {
             panic!("fatal: failed to disassemble code segment for trap fallback: {e:?}");
         });
-        #[cfg(target_arch = "x86_64")]
+        if count > 0 {
+            litebox_util_log::warn!(
+                count:? = count, addr:? = mapped_addr.as_usize(), len:? = len;
+                "applied trap fallback to AArch64 patch sites"
+            );
+        }
+        assert!(
+            mapped_addr
+                .copy_from_slice::<Platform>(0, &code_buf)
+                .is_some(),
+            "fatal: failed to write trap bytes back to code segment"
+        );
+
+        // Restore RX.
+        self.sys_mprotect_raw(
+            mapped_addr,
+            len,
+            ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
+        )
+        .expect("fatal: failed to restore code segment to RX after trap fallback");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn apply_trap_fallback(&self, mapped_addr: UserPtrMut<u8>, len: usize, already_rw: bool) {
+        if !already_rw {
+            self.sys_mprotect_raw(
+                mapped_addr,
+                len,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+            )
+            .expect("fatal: failed to mprotect code segment RW for trap fallback");
+        }
+        let Some(code_owned) = mapped_addr.to_owned_slice::<Platform>(len) else {
+            panic!("fatal: failed to read code segment for trap fallback");
+        };
+        let mut code_buf = code_owned.into_vec();
+        let code_vaddr = mapped_addr.as_usize() as u64;
         let count = litebox_syscall_rewriter::trap_all_syscalls_in_code(&mut code_buf, code_vaddr)
             .unwrap_or_else(|e| {
                 panic!("fatal: failed to disassemble code segment for trap fallback: {e:?}");
@@ -1132,6 +1227,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         // ── Runtime patching path (unpatched binaries) ───────────────
 
+        #[cfg(all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"))]
+        let scan_ranges = file_offset.and_then(|file_offset| {
+            state
+                .code_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.ranges_for_mapping(file_offset as u64, len).ok())
+        });
+        #[cfg(all(target_arch = "aarch64", not(feature = "aarch64_virtualize_x18")))]
+        let scan_ranges: Option<litebox_syscall_rewriter::aarch64::CodeScanRanges> = None;
+        #[cfg(target_arch = "aarch64")]
+        let apply_trap_fallback = |mapped_addr, len, already_rw| {
+            self.apply_aarch64_trap_fallback(mapped_addr, len, already_rw, scan_ranges.as_ref());
+        };
+        #[cfg(target_arch = "x86_64")]
+        let apply_trap_fallback = |mapped_addr, len, already_rw| {
+            self.apply_trap_fallback(mapped_addr, len, already_rw);
+        };
+
         // Allocate the trampoline region if not yet done.
         let addr_usize = mapped_addr.as_usize();
         if !state.trampoline_mapped {
@@ -1158,7 +1271,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 });
             let Ok(actual_addr_ptr) = actual_addr else {
                 litebox_util_log::warn!("failed to allocate trampoline region");
-                self.apply_trap_fallback(mapped_addr, len, false);
+                apply_trap_fallback(mapped_addr, len, false);
                 return true;
             };
             let actual_addr = actual_addr_ptr.as_usize();
@@ -1173,7 +1286,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     "trampoline too far from code segment, skipping patching"
                 );
                 let _ = self.sys_munmap_raw(UserPtrMut::<u8>::from_usize(actual_addr), PAGE_SIZE);
-                self.apply_trap_fallback(mapped_addr, len, false);
+                apply_trap_fallback(mapped_addr, len, false);
                 return true;
             }
 
@@ -1188,7 +1301,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     litebox_util_log::warn!("failed to write syscall entry point to trampoline");
                     let _ =
                         self.sys_munmap_raw(UserPtrMut::<u8>::from_usize(actual_addr), PAGE_SIZE);
-                    self.apply_trap_fallback(mapped_addr, len, false);
+                    apply_trap_fallback(mapped_addr, len, false);
                     return true;
                 }
                 state.trampoline_cursor = litebox_syscall_rewriter::TRAMPOLINE_ENTRY_POINT_BYTES;
@@ -1266,13 +1379,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
 
         #[cfg(target_arch = "aarch64")]
-        let patch_result = litebox_syscall_rewriter::patch_code_segment_with_options(
-            &mut code_buf,
-            code_vaddr,
-            trampoline_write_vaddr,
-            syscall_entry_addr,
-            crate::aarch64_rewrite_options(),
-        );
+        let patch_result = if let Some(ranges) = &scan_ranges {
+            litebox_syscall_rewriter::patch_aarch64_code_segment_with_options_and_ranges(
+                &mut code_buf,
+                code_vaddr,
+                ranges,
+                trampoline_write_vaddr,
+                syscall_entry_addr,
+                crate::aarch64_rewrite_options(),
+            )
+        } else {
+            litebox_syscall_rewriter::patch_code_segment_with_options(
+                &mut code_buf,
+                code_vaddr,
+                trampoline_write_vaddr,
+                syscall_entry_addr,
+                crate::aarch64_rewrite_options(),
+            )
+        };
         #[cfg(target_arch = "x86_64")]
         let patch_result = litebox_syscall_rewriter::patch_code_segment(
             &mut code_buf,
@@ -1301,7 +1425,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     let mut stubs = stubs;
                     if let Err(e) = finalize_trampoline_gates(self.global.platform, &mut stubs) {
                         litebox_util_log::error!(err:% = e; "refusing to install runtime gates whose guest thread-pointer is not patched");
-                        self.apply_trap_fallback(mapped_addr, len, true);
+                        apply_trap_fallback(mapped_addr, len, true);
                         restore_trampoline_rx(self, state);
                         return true;
                     }
@@ -1309,7 +1433,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 };
                 let Some(new_cursor) = state.trampoline_cursor.checked_add(stubs.len()) else {
                     litebox_util_log::warn!("trampoline cursor overflow");
-                    self.apply_trap_fallback(mapped_addr, len, true);
+                    apply_trap_fallback(mapped_addr, len, true);
                     restore_trampoline_rx(self, state);
                     return true;
                 };
@@ -1329,7 +1453,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                         .is_err()
                     {
                         litebox_util_log::warn!("failed to expand trampoline region");
-                        self.apply_trap_fallback(mapped_addr, len, true);
+                        apply_trap_fallback(mapped_addr, len, true);
                         restore_trampoline_rx(self, state);
                         return true;
                     }
@@ -1386,7 +1510,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
             Err(e) => {
                 litebox_util_log::warn!(err:? = e; "patch_code_segment failed");
-                self.apply_trap_fallback(mapped_addr, len, true);
+                apply_trap_fallback(mapped_addr, len, true);
                 restore_trampoline_rx(self, state);
                 return true;
             }

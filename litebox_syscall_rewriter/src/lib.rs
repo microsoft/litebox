@@ -60,6 +60,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
+use core::ops::Range;
 
 use litebox_common_windows::NtSysno;
 use object::pe::{IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE};
@@ -204,6 +205,7 @@ struct TrampolineHeader64 {
 }
 
 /// Metadata about an executable section, extracted from a read-only object parse.
+#[derive(Clone, Copy)]
 struct TextSectionInfo {
     /// Virtual address of the section
     vaddr: u64,
@@ -322,7 +324,7 @@ pub fn hook_syscalls_in_elf_with_options(
     fixup_phdr_alignment(buf);
 
     // Parse the ELF and extract all metadata we need, then drop the borrow so we can mutate buf.
-    let (arch, text_sections, placement) = {
+    let (arch, text_sections, aarch64_code_sections, placement) = {
         let file = object::File::parse(&*buf).map_err(|e| Error::ParseError(e.to_string()))?;
 
         let arch = match file {
@@ -334,11 +336,22 @@ pub fn hook_syscalls_in_elf_with_options(
             _ => return Ok(input_binary.to_vec()),
         };
 
-        let text_sections = match text_sections(&file) {
-            Ok(sections) => sections,
-            Err(InternalError::NoTextSectionFound) => return Ok(input_binary.to_vec()),
-            Err(InternalError::Public(e)) => return Err(e),
-            Err(e) => unreachable!("unexpected internal error: {e:?}"),
+        let (text_sections, aarch64_code_sections) = if arch == Arch::Aarch64 {
+            let metadata = match aarch64::elf_code_metadata(&file) {
+                Ok(metadata) => metadata,
+                Err(InternalError::NoTextSectionFound) => return Ok(input_binary.to_vec()),
+                Err(InternalError::Public(error)) => return Err(error),
+                Err(error) => unreachable!("unexpected metadata error: {error:?}"),
+            };
+            (metadata.executable, metadata.identified)
+        } else {
+            let sections = match text_sections(&file) {
+                Ok(sections) => sections,
+                Err(InternalError::NoTextSectionFound) => return Ok(input_binary.to_vec()),
+                Err(InternalError::Public(error)) => return Err(error),
+                Err(error) => unreachable!("unexpected internal error: {error:?}"),
+            };
+            (sections, Vec::new())
         };
 
         if is_already_hooked(&*buf, arch) {
@@ -347,7 +360,7 @@ pub fn hook_syscalls_in_elf_with_options(
 
         let placement = find_addr_for_trampoline_code(&file)?;
 
-        (arch, text_sections, placement)
+        (arch, text_sections, aarch64_code_sections, placement)
     };
 
     // AArch64 uses a fully separate rewriting strategy (single-instruction
@@ -358,7 +371,10 @@ pub fn hook_syscalls_in_elf_with_options(
         return hook_aarch64_elf(
             input_binary,
             buf,
-            &text_sections,
+            aarch64::ScanSections {
+                executable: &text_sections,
+                code: &aarch64_code_sections,
+            },
             placement,
             trampoline.unwrap_or(0),
             options,
@@ -888,7 +904,7 @@ fn append_trampoline_footer(
 fn hook_aarch64_elf(
     input_binary: &[u8],
     buf: &mut [u8],
-    text_sections: &[TextSectionInfo],
+    sections: aarch64::ScanSections<'_>,
     placement: TrampolinePlacement,
     callback: u64,
     options: RewriteOptions,
@@ -898,7 +914,7 @@ fn hook_aarch64_elf(
         let out = hook_aarch64_elf_at(
             input_binary,
             &mut attempt,
-            text_sections,
+            sections,
             addr,
             Some(limit),
             callback,
@@ -921,7 +937,7 @@ fn hook_aarch64_elf(
     hook_aarch64_elf_at(
         input_binary,
         buf,
-        text_sections,
+        sections,
         placement.fallback_addr(),
         None,
         callback,
@@ -946,15 +962,16 @@ fn hook_aarch64_elf(
 fn hook_aarch64_elf_at(
     input_binary: &[u8],
     buf: &mut [u8],
-    text_sections: &[TextSectionInfo],
+    sections: aarch64::ScanSections<'_>,
     trampoline_base_addr: u64,
     trampoline_limit: Option<u64>,
     callback: u64,
     options: RewriteOptions,
 ) -> Result<Vec<u8>> {
-    let Some(outcome) = aarch64::hook_syscalls_aarch64(
+    let Some(outcome) = aarch64::hook_syscalls_aarch64_with_code_ranges(
         buf,
-        text_sections,
+        sections.executable,
+        sections.code,
         trampoline_base_addr,
         callback,
         aarch64::RewriteConfig::new(options.target_host(), options.effective_virtualize_x18()),
@@ -1659,14 +1676,42 @@ fn patch_aarch64_code_segment(
     syscall_entry_addr: u64,
     options: RewriteOptions,
 ) -> Result<(Vec<u8>, Vec<u64>)> {
-    let section = TextSectionInfo {
-        vaddr: code_vaddr,
-        file_offset: 0,
-        size: code.len() as u64,
-    };
-    let Some(outcome) = aarch64::hook_syscalls_aarch64(
+    let ranges = whole_code_scan_ranges(code.len());
+    patch_aarch64_code_segment_with_options_and_ranges(
         code,
-        &[section],
+        code_vaddr,
+        &ranges,
+        trampoline_write_vaddr,
+        syscall_entry_addr,
+        options,
+    )
+}
+
+#[cfg(any(test, target_arch = "aarch64"))]
+fn whole_code_scan_ranges(code_len: usize) -> aarch64::CodeScanRanges {
+    let executable: Vec<Range<usize>> = core::iter::once(0..code_len).collect();
+    let identified = executable.clone();
+    aarch64::CodeScanRanges {
+        executable,
+        identified,
+    }
+}
+
+/// Runtime AArch64 rewriting constrained by mapping-relative ELF code ranges.
+pub fn patch_aarch64_code_segment_with_options_and_ranges(
+    code: &mut [u8],
+    code_vaddr: u64,
+    ranges: &aarch64::CodeScanRanges,
+    trampoline_write_vaddr: u64,
+    syscall_entry_addr: u64,
+    options: RewriteOptions,
+) -> Result<(Vec<u8>, Vec<u64>)> {
+    let executable = scan_sections(code_vaddr, &ranges.executable, code.len())?;
+    let identified = scan_sections(code_vaddr, &ranges.identified, code.len())?;
+    let Some(outcome) = aarch64::hook_syscalls_aarch64_with_code_ranges(
+        code,
+        &executable,
+        &identified,
         trampoline_write_vaddr,
         syscall_entry_addr,
         aarch64::RewriteConfig::new(options.target_host(), options.effective_virtualize_x18()),
@@ -1676,6 +1721,30 @@ fn patch_aarch64_code_segment(
     };
 
     Ok((outcome.trampoline, outcome.trapped_sites))
+}
+
+fn scan_sections(
+    code_vaddr: u64,
+    ranges: &[Range<usize>],
+    code_len: usize,
+) -> Result<Vec<TextSectionInfo>> {
+    ranges
+        .iter()
+        .map(|range| {
+            if range.start > range.end || range.end > code_len {
+                return Err(Error::ParseError(
+                    "scan range extends beyond mapping".into(),
+                ));
+            }
+            Ok(TextSectionInfo {
+                vaddr: code_vaddr
+                    .checked_add(range.start as u64)
+                    .ok_or_else(|| Error::AddressOverflow("scan range address".into()))?,
+                file_offset: range.start as u64,
+                size: (range.end - range.start) as u64,
+            })
+        })
+        .collect()
 }
 
 /// Replace every syscall patch site in `code` with a trap instruction, so that
@@ -1734,14 +1803,23 @@ fn trap_all_aarch64_patch_sites(
     code_vaddr: u64,
     options: RewriteOptions,
 ) -> Result<usize> {
-    let section = TextSectionInfo {
-        vaddr: code_vaddr,
-        file_offset: 0,
-        size: code.len() as u64,
-    };
-    aarch64::trap_all_patch_sites(
+    let ranges = whole_code_scan_ranges(code.len());
+    trap_all_aarch64_patch_sites_with_options_and_ranges(code, code_vaddr, &ranges, options)
+}
+
+/// Trap runtime AArch64 patch sites selected by mapping-relative ELF ranges.
+pub fn trap_all_aarch64_patch_sites_with_options_and_ranges(
+    code: &mut [u8],
+    code_vaddr: u64,
+    ranges: &aarch64::CodeScanRanges,
+    options: RewriteOptions,
+) -> Result<usize> {
+    let executable = scan_sections(code_vaddr, &ranges.executable, code.len())?;
+    let identified = scan_sections(code_vaddr, &ranges.identified, code.len())?;
+    aarch64::trap_all_patch_sites_with_code_ranges(
         code,
-        &[section],
+        &executable,
+        &identified,
         aarch64::RewriteConfig::new(options.target_host(), options.effective_virtualize_x18()),
     )
 }
@@ -2525,7 +2603,10 @@ mod tests {
         let out = hook_aarch64_elf_at(
             &input,
             &mut elf,
-            &[section],
+            aarch64::ScanSections {
+                executable: &[section],
+                code: &[section],
+            },
             0x220000,
             None,
             0,
@@ -2548,8 +2629,12 @@ mod tests {
         elf[..4].copy_from_slice(b"\x7fELF");
         elf[4] = object::elf::ELFCLASS64;
         elf[5] = object::elf::ELFDATA2LSB;
+        elf[6] = object::elf::EV_CURRENT;
+        elf[16..18].copy_from_slice(&object::elf::ET_EXEC.to_le_bytes());
         elf[18..20].copy_from_slice(&object::elf::EM_AARCH64.to_le_bytes());
+        elf[20..24].copy_from_slice(&u32::from(object::elf::EV_CURRENT).to_le_bytes());
         elf[32..40].copy_from_slice(&(ELF_HEADER_BYTES as u64).to_le_bytes());
+        elf[52..54].copy_from_slice(&u16::try_from(ELF_HEADER_BYTES).unwrap().to_le_bytes());
         elf[54..56].copy_from_slice(&u16::try_from(PROGRAM_HEADER_BYTES).unwrap().to_le_bytes());
         elf[56..58].copy_from_slice(&1u16.to_le_bytes());
 
@@ -2557,6 +2642,8 @@ mod tests {
         elf[text..text + 4].copy_from_slice(&object::elf::PT_LOAD.to_le_bytes());
         elf[text + 4..text + 8]
             .copy_from_slice(&(object::elf::PF_R | object::elf::PF_X).to_le_bytes());
+        elf[text + 8..text + 16]
+            .copy_from_slice(&((ELF_HEADER_BYTES + PROGRAM_HEADER_BYTES) as u64).to_le_bytes());
         elf[text + 16..text + 24].copy_from_slice(&0x1000u64.to_le_bytes());
         elf[text + 32..text + 40].copy_from_slice(&4u64.to_le_bytes());
         elf[text + 40..text + 48].copy_from_slice(&4u64.to_le_bytes());
@@ -2589,7 +2676,10 @@ mod tests {
                 hook_aarch64_elf_at(
                     &input,
                     &mut direct,
-                    &[section()],
+                    aarch64::ScanSections {
+                        executable: &[section()],
+                        code: &[section()],
+                    },
                     UNREACHABLE_GAP,
                     None,
                     0,
@@ -2609,7 +2699,10 @@ mod tests {
         hook_aarch64_elf(
             &input,
             &mut elf,
-            &[section()],
+            aarch64::ScanSections {
+                executable: &[section()],
+                code: &[section()],
+            },
             placement,
             0,
             RewriteOptions::default(),
@@ -2723,7 +2816,10 @@ mod tests {
         let err = hook_aarch64_elf(
             &input,
             &mut buf,
-            &sections,
+            aarch64::ScanSections {
+                executable: &sections,
+                code: &sections,
+            },
             placement,
             0,
             RewriteOptions::default(),
