@@ -3,7 +3,7 @@
 
 use alloc::sync::{Arc, Weak};
 use core::{
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{SocketAddr, SocketAddrV4},
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -32,14 +32,6 @@ use crate::{
 };
 
 const _: () = assert!(MAX_SOCKET_PEEK_SIZE as usize == super::SOCKET_RECEIVE_OPERATION_SIZE);
-
-fn normalize_tcp_connect_address(address: SocketAddrV4) -> SocketAddrV4 {
-    if address.ip().is_unspecified() && address.port() != 0 {
-        SocketAddrV4::new(Ipv4Addr::LOCALHOST, address.port())
-    } else {
-        address
-    }
-}
 
 struct BrokerTcpSocketState {
     connection: SocketConnectionStatus,
@@ -192,7 +184,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
     }
 
     pub(super) fn start_connect(&self, address: SocketAddrV4) -> Result<(), ConnectError> {
-        let address = normalize_tcp_connect_address(address);
         let previous = self.state.lock().connection;
         let outcome = self
             .broker
@@ -1194,22 +1185,6 @@ impl From<BrokerSocketError> for SocketAsyncError {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn tcp_connect_normalizes_nonzero_unspecified_destination() {
-        assert_eq!(
-            normalize_tcp_connect_address(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 8080)),
-            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080)
-        );
-        assert_eq!(
-            normalize_tcp_connect_address(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
-            SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)
-        );
-        assert_eq!(
-            normalize_tcp_connect_address(SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 15), 8080)),
-            SocketAddrV4::new(Ipv4Addr::new(10, 0, 2, 15), 8080)
-        );
-    }
 
     #[test]
     fn restored_udp_error_precedes_prefetched_successor() {
