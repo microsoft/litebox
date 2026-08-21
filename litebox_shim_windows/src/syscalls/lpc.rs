@@ -24,6 +24,8 @@ const USERSRV_SERVER_DLL_INDEX: u32 = 3;
 const USER_CONNECT_VERSION: u64 = 0x0e41_05d9;
 const USERSRV_BACKING_SIZE: usize = crate::PAGE_SIZE;
 const BASESRV_BACKING_SIZE: usize = crate::PAGE_SIZE;
+const ASSEMBLY_IDENTITY_UTF16_CAPACITY: usize = 76;
+const MANIFEST_PATH_UTF16_CAPACITY: usize = 104;
 const USER_MESSAGE_BITMAP_ALIGNMENT: usize = 0x20;
 const RESERVED_MESSAGE_MAX_MESSAGES: [usize; 3] = [0x318, 0x318, 0x14];
 const FNID_MESSAGE_MAX_MESSAGES: [usize; 10] = [
@@ -432,8 +434,8 @@ struct ActivationContextAssemblySection {
     application_directory: [u16; 88],
     entry: ActivationContextStringSectionEntry,
     assembly_information: ActivationContextAssemblyInformation,
-    encoded_assembly_identity: [u16; 76],
-    manifest_path: [u16; 104],
+    encoded_assembly_identity: [u16; ASSEMBLY_IDENTITY_UTF16_CAPACITY],
+    manifest_path: [u16; MANIFEST_PATH_UTF16_CAPACITY],
 }
 
 #[repr(C)]
@@ -474,26 +476,27 @@ struct ActivationContextBlob {
 const _: () = assert!(size_of::<ActivationContextAssemblyInformation>() == 0x6c);
 const _: () = assert!(size_of::<ActivationContextAssemblySection>() == 0x300);
 const _: () = assert!(size_of::<ActivationContextBlob>() == 0x47c);
+// The blob is written into the BASESRV backing page; guarantee it fits so a future
+// blob or PAGE_SIZE change cannot silently spill into the adjacent USERSRV backing.
+const _: () = assert!(size_of::<ActivationContextBlob>() <= BASESRV_BACKING_SIZE);
 
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "all activation-context offsets and sizes are compile-time values below one page"
-)]
 fn build_activation_context_blob(run_level: u32, ui_access: u32) -> ActivationContextBlob {
     const HEADER_MAGIC: u32 = 0x7874_6341;
     const STRING_SECTION_MAGIC: u32 = 0x6448_7353;
     const GUID_SECTION_MAGIC: u32 = 0x6448_7347;
-    const ASSEMBLY_SECTION_OFFSET: u32 =
-        core::mem::offset_of!(ActivationContextBlob, assembly_section) as u32;
-    const ASSEMBLY_INFORMATION_OFFSET: u32 = ASSEMBLY_SECTION_OFFSET
-        + core::mem::offset_of!(ActivationContextAssemblySection, assembly_information) as u32;
-    const ASSEMBLY_INFORMATION_LENGTH: u32 = (size_of::<ActivationContextAssemblyInformation>()
-        + size_of::<[u16; 76]>()
-        + size_of::<[u16; 104]>()) as u32;
+    const ASSEMBLY_SECTION_OFFSET: usize =
+        core::mem::offset_of!(ActivationContextBlob, assembly_section);
+    const ASSEMBLY_INFORMATION_OFFSET: usize = ASSEMBLY_SECTION_OFFSET
+        + core::mem::offset_of!(ActivationContextAssemblySection, assembly_information);
+    const ASSEMBLY_INFORMATION_LENGTH: usize = size_of::<ActivationContextAssemblyInformation>()
+        + size_of::<[u16; ASSEMBLY_IDENTITY_UTF16_CAPACITY]>()
+        + size_of::<[u16; MANIFEST_PATH_UTF16_CAPACITY]>();
+    #[allow(clippy::cast_possible_truncation)]
+    const GUID_SECTION_SIZE: u32 = size_of::<ActivationContextGuidSectionHeader>() as u32;
     const EMPTY_GUID_SECTION: ActivationContextGuidSectionHeader =
         ActivationContextGuidSectionHeader {
             magic: GUID_SECTION_MAGIC,
-            header_size: size_of::<ActivationContextGuidSectionHeader>() as u32,
+            header_size: GUID_SECTION_SIZE,
             format_version: 1,
             data_format_version: 1,
             flags: 1,
@@ -504,26 +507,27 @@ fn build_activation_context_blob(run_level: u32, ui_access: u32) -> ActivationCo
             user_data_size: 0,
         };
     let guid_sections_offset =
-        core::mem::offset_of!(ActivationContextBlob, empty_guid_sections) as u32;
+        core::mem::offset_of!(ActivationContextBlob, empty_guid_sections).trunc();
     let compatibility_offset =
-        core::mem::offset_of!(ActivationContextBlob, compatibility_information) as u32;
+        core::mem::offset_of!(ActivationContextBlob, compatibility_information).trunc();
     ActivationContextBlob {
         header: ActivationContextData {
             magic: HEADER_MAGIC,
-            header_size: size_of::<ActivationContextData>() as u32,
+            header_size: size_of::<ActivationContextData>().trunc(),
             format_version: 1,
-            total_size: size_of::<ActivationContextBlob>() as u32,
-            default_toc_offset: core::mem::offset_of!(ActivationContextBlob, toc) as u32,
+            total_size: size_of::<ActivationContextBlob>().trunc(),
+            default_toc_offset: core::mem::offset_of!(ActivationContextBlob, toc).trunc(),
             extended_toc_offset: 0,
-            assembly_roster_offset: core::mem::offset_of!(ActivationContextBlob, roster) as u32,
+            assembly_roster_offset: core::mem::offset_of!(ActivationContextBlob, roster).trunc(),
             flags: 0,
         },
         roster: ActivationContextDataAssemblyRosterHeader {
-            header_size: size_of::<ActivationContextDataAssemblyRosterHeader>() as u32,
+            header_size: size_of::<ActivationContextDataAssemblyRosterHeader>().trunc(),
             hash_algorithm: 1,
             entry_count: 2,
-            first_entry_offset: core::mem::offset_of!(ActivationContextBlob, roster_entries) as u32,
-            assembly_information_section_offset: ASSEMBLY_SECTION_OFFSET,
+            first_entry_offset: core::mem::offset_of!(ActivationContextBlob, roster_entries)
+                .trunc(),
+            assembly_information_section_offset: ASSEMBLY_SECTION_OFFSET.trunc(),
         },
         roster_entries: [
             ActivationContextDataAssemblyRosterEntry {
@@ -539,77 +543,75 @@ fn build_activation_context_blob(run_level: u32, ui_access: u32) -> ActivationCo
                 pseudo_key: 0,
                 assembly_name_offset: 0,
                 assembly_name_length: 0,
-                assembly_information_offset: ASSEMBLY_INFORMATION_OFFSET,
-                assembly_information_length: ASSEMBLY_INFORMATION_LENGTH,
+                assembly_information_offset: ASSEMBLY_INFORMATION_OFFSET.trunc(),
+                assembly_information_length: ASSEMBLY_INFORMATION_LENGTH.trunc(),
             },
         ],
         toc: ActivationContextDataTocHeader {
-            header_size: size_of::<ActivationContextDataTocHeader>() as u32,
+            header_size: size_of::<ActivationContextDataTocHeader>().trunc(),
             entry_count: 6,
-            first_entry_offset: core::mem::offset_of!(ActivationContextBlob, toc_entries) as u32,
+            first_entry_offset: core::mem::offset_of!(ActivationContextBlob, toc_entries).trunc(),
             flags: 2,
         },
         toc_entries: [
             ActivationContextDataTocEntry {
                 id: 1,
-                offset: ASSEMBLY_SECTION_OFFSET,
-                length: size_of::<ActivationContextAssemblySection>() as u32,
+                offset: ASSEMBLY_SECTION_OFFSET.trunc(),
+                length: size_of::<ActivationContextAssemblySection>().trunc(),
                 format: 1,
             },
             ActivationContextDataTocEntry {
                 id: 4,
                 offset: guid_sections_offset,
-                length: size_of::<ActivationContextGuidSectionHeader>() as u32,
+                length: GUID_SECTION_SIZE,
                 format: 2,
             },
             ActivationContextDataTocEntry {
                 id: 5,
-                offset: guid_sections_offset
-                    + size_of::<ActivationContextGuidSectionHeader>() as u32,
-                length: size_of::<ActivationContextGuidSectionHeader>() as u32,
+                offset: guid_sections_offset + GUID_SECTION_SIZE,
+                length: GUID_SECTION_SIZE,
                 format: 2,
             },
             ActivationContextDataTocEntry {
                 id: 6,
-                offset: guid_sections_offset
-                    + 2 * size_of::<ActivationContextGuidSectionHeader>() as u32,
-                length: size_of::<ActivationContextGuidSectionHeader>() as u32,
+                offset: guid_sections_offset + 2 * GUID_SECTION_SIZE,
+                length: GUID_SECTION_SIZE,
                 format: 2,
             },
             ActivationContextDataTocEntry {
                 id: 9,
-                offset: guid_sections_offset
-                    + 3 * size_of::<ActivationContextGuidSectionHeader>() as u32,
-                length: size_of::<ActivationContextGuidSectionHeader>() as u32,
+                offset: guid_sections_offset + 3 * GUID_SECTION_SIZE,
+                length: GUID_SECTION_SIZE,
                 format: 2,
             },
             ActivationContextDataTocEntry {
                 id: 11,
                 offset: compatibility_offset,
-                length: size_of::<ActivationContextCompatibilityInformation>() as u32,
+                length: size_of::<ActivationContextCompatibilityInformation>().trunc(),
                 format: 1,
             },
         ],
         assembly_section: ActivationContextAssemblySection {
             header: ActivationContextStringSectionHeader {
                 magic: STRING_SECTION_MAGIC,
-                header_size: size_of::<ActivationContextStringSectionHeader>() as u32,
+                header_size: size_of::<ActivationContextStringSectionHeader>().trunc(),
                 format_version: 1,
                 data_format_version: 1,
                 flags: 3,
                 element_count: 1,
                 element_list_offset: core::mem::offset_of!(ActivationContextAssemblySection, entry)
-                    as u32,
+                    .trunc(),
                 hash_algorithm: 1,
                 search_structure_offset: 0,
-                user_data_offset: size_of::<ActivationContextStringSectionHeader>() as u32,
-                user_data_size: core::mem::offset_of!(ActivationContextAssemblySection, entry)
-                    as u32
-                    - size_of::<ActivationContextStringSectionHeader>() as u32,
+                user_data_offset: size_of::<ActivationContextStringSectionHeader>().trunc(),
+                user_data_size: (core::mem::offset_of!(ActivationContextAssemblySection, entry)
+                    - size_of::<ActivationContextStringSectionHeader>())
+                .trunc(),
             },
             global_information: ActivationContextAssemblyGlobalInformation {
-                size: core::mem::offset_of!(ActivationContextAssemblySection, entry) as u32
-                    - size_of::<ActivationContextStringSectionHeader>() as u32,
+                size: (core::mem::offset_of!(ActivationContextAssemblySection, entry)
+                    - size_of::<ActivationContextStringSectionHeader>())
+                .trunc(),
                 flags: 0,
                 policy_coherency_guid: [0; 16],
                 policy_override_guid: [0; 16],
@@ -626,12 +628,13 @@ fn build_activation_context_blob(run_level: u32, ui_access: u32) -> ActivationCo
                 offset: core::mem::offset_of!(
                     ActivationContextAssemblySection,
                     assembly_information
-                ) as u32,
-                length: ASSEMBLY_INFORMATION_LENGTH,
+                )
+                .trunc(),
+                length: ASSEMBLY_INFORMATION_LENGTH.trunc(),
                 assembly_roster_index: 1,
             },
             assembly_information: ActivationContextAssemblyInformation {
-                size: size_of::<ActivationContextAssemblyInformation>() as u32,
+                size: size_of::<ActivationContextAssemblyInformation>().trunc(),
                 flags: 0x11,
                 encoded_assembly_identity_length: 0,
                 encoded_assembly_identity_offset: 0,
@@ -657,8 +660,8 @@ fn build_activation_context_blob(run_level: u32, ui_access: u32) -> ActivationCo
                 run_level,
                 ui_access,
             },
-            encoded_assembly_identity: [0; 76],
-            manifest_path: [0; 104],
+            encoded_assembly_identity: [0; ASSEMBLY_IDENTITY_UTF16_CAPACITY],
+            manifest_path: [0; MANIFEST_PATH_UTF16_CAPACITY],
         },
         empty_guid_sections: [EMPTY_GUID_SECTION; 4],
         compatibility_information: ActivationContextCompatibilityInformation {
