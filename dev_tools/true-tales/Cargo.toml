@@ -1,0 +1,44 @@
+[dependencies]
+# Pinned to the vstd shipped with the Verus release in flake.nix. `builtin`
+# /`builtin_macros` (now `verus_builtin`/`verus_builtin_macros`) are pulled in
+# transitively from crates.io, so they are not declared here.
+vstd = "=0.0.0-2026-08-02-0125"
+
+[lints.clippy]
+# Verus only supports index-based `for i in 0..n` loops, since loop invariants
+# are stated over the index. The suggested `.iter().enumerate()` rewrite fails
+# to verify: vstd ships no `external_type_specification` for
+# `std::iter::Enumerate`, so the loop body becomes unsupported.
+needless_range_loop = "allow"
+# Same root cause as `needless_range_loop`: replacing an index loop with
+# `copy_from_slice` requires range-indexing a `Vec`, and Verus only supports
+# the `Index`/`IndexMut` operators for `(Vec<_>, usize)`.
+manual_memcpy = "allow"
+# `vec![x]` is opaque to Verus: there is no vstd specification relating the
+# macro's result to `seq![x]`, so replacing `Vec::new()` + `push` with the macro
+# loses the postcondition that the returned vector holds exactly that element.
+vec_init_then_push = "allow"
+
+[lints.rust]
+# Verus supports ghost code, code that is used for proofs but erased during compilation.
+# This means that ghost items that are imported via `use` will not exist during a normal
+# `cargo build`, leading to compilation errors. These errors can be prevented by guarding the
+# use statements with the feature flag `verus_only`, which Verus turns on during
+# verification.
+#
+# WARNING: this flag should only be used on import statements and setting config attributes,
+# see the documentation (https://verus-lang.github.io/verus/guide/erasure.html) for more details.
+#
+# This lint suppression prevents cargo from complaining about the
+# `verus_only` feature flag being undeclared.
+unexpected_cfgs = {level = "warn", check-cfg = [
+  'cfg(verus_only)'
+]}
+
+[package]
+name = "true-tales"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata.verus]
+verify = true

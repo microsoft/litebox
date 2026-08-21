@@ -187,34 +187,28 @@ impl<T: FromBytes + IntoBytes> RawMutPointer<T> for TransparentMutPtr<T> {
     }
     fn mutate_subslice_with<R>(
         self,
-        range: impl core::ops::RangeBounds<isize>,
-        f: impl FnOnce(&mut [T]) -> R,
+        _range: impl core::ops::RangeBounds<isize>,
+        _f: impl FnOnce(&mut [T]) -> R,
     ) -> Option<R> {
-        let ptr = self.as_ptr();
-        if ptr.is_null() || !ptr.is_aligned() {
-            return None;
+        unimplemented!("use write_slice_at_offset instead")
+    }
+
+    fn copy_from_slice(self, start_offset: usize, buf: &[T]) -> Option<()>
+    where
+        T: Copy,
+    {
+        if buf.is_empty() {
+            return Some(());
         }
-        let start = match range.start_bound() {
-            core::ops::Bound::Included(&x) => x,
-            core::ops::Bound::Excluded(_) => unreachable!(),
-            core::ops::Bound::Unbounded => 0,
-        };
-        let end = match range.end_bound() {
-            core::ops::Bound::Included(&x) => x.checked_add(1)?,
-            core::ops::Bound::Excluded(&x) => x,
-            core::ops::Bound::Unbounded => {
-                return None;
-            }
-        };
-        let len = if start <= end {
-            start.abs_diff(end)
-        } else {
-            return None;
-        };
-        let _ = start.checked_mul(size_of::<T>().try_into().ok()?)?;
-        let data = ptr.wrapping_offset(start);
-        let _ = isize::try_from(len.checked_mul(size_of::<T>())?).ok()?;
-        let slice = unsafe { core::slice::from_raw_parts_mut(data, len) };
-        Some(f(slice))
+        let dst = self.as_ptr().wrapping_add(start_offset);
+        // SAFETY: `T: Copy + IntoBytes` so reading from `buf` and writing the
+        // raw bytes to `dst` produces a valid `T` at the destination. The
+        // caller is responsible for ensuring `dst..dst + buf.len()` is a valid,
+        // writable region; this trivial provider performs no validation of
+        // user-supplied pointers (see `UserMutPtr` for the validating variant).
+        unsafe {
+            core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, buf.len());
+        }
+        Some(())
     }
 }

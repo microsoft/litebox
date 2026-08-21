@@ -8,6 +8,7 @@
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
 use std::cell::Cell;
+use std::cell::RefCell;
 use std::io::IsTerminal as _;
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::path::PathBuf;
@@ -105,6 +106,7 @@ pub struct LinuxUserland {
     /// reboots.
     boot_id: std::sync::OnceLock<Vec<u8>>,
     stdio_is_tty: [bool; 3],
+    foreign_memory: litebox::foreign_memory::domains::ForeignMemoryRuntime,
 }
 
 impl core::fmt::Debug for LinuxUserland {
@@ -239,8 +241,13 @@ impl LinuxUserland {
                 std::io::stdout().is_terminal(),
                 std::io::stderr().is_terminal(),
             ],
+            foreign_memory: litebox::foreign_memory::domains::ForeignMemoryRuntime::new(),
         };
         Box::leak(Box::new(platform))
+    }
+
+    pub fn foreign_memory(&self) -> litebox::foreign_memory::domains::ForeignMemoryRuntime {
+        self.foreign_memory.clone()
     }
 
     /// Initializes support for KDFs by using boot-specific uniqueness.
@@ -1777,20 +1784,44 @@ impl litebox::platform::SystemInfoProvider for LinuxUserland {
     }
 }
 
+struct PlatformThreadState {
+    shim_tls: Cell<*mut ()>,
+    hardware_thread: RefCell<true_tales::amd64::Amd64Thread<true_tales::rmem::rmem_stack::RmemNil>>,
+}
+
+impl PlatformThreadState {
+    fn new() -> Self {
+        Self {
+            shim_tls: Cell::new(core::ptr::null_mut()),
+            hardware_thread: RefCell::new(true_tales::amd64::Amd64Thread::new()),
+        }
+    }
+}
+
 thread_local! {
-    // Use `ManuallyDrop` for more efficient TLS accesses, since this is always
-    // dropped manually before the thread exits.
-    static PLATFORM_TLS: Cell<*mut ()> = const { Cell::new(core::ptr::null_mut()) };
+    static PLATFORM_TLS: PlatformThreadState = PlatformThreadState::new();
 }
 
 /// LinuxUserland platform's thread-local storage implementation.
 unsafe impl litebox::platform::ThreadLocalStorageProvider for LinuxUserland {
     fn get_thread_local_storage() -> *mut () {
-        PLATFORM_TLS.get()
+        PLATFORM_TLS.with(|state| state.shim_tls.get())
     }
 
     unsafe fn replace_thread_local_storage(value: *mut ()) -> *mut () {
-        PLATFORM_TLS.replace(value)
+        PLATFORM_TLS.with(|state| state.shim_tls.replace(value))
+    }
+}
+
+impl litebox::foreign_memory::thread::HardwareThreadProvider for LinuxUserland {
+    type HardwareThread = true_tales::amd64::Amd64Thread<true_tales::rmem::rmem_stack::RmemNil>;
+
+    fn with_thread<C, R>(
+        &self,
+        context: C,
+        operation: impl FnOnce(C, &mut Self::HardwareThread) -> R,
+    ) -> R {
+        PLATFORM_TLS.with(|state| operation(context, &mut state.hardware_thread.borrow_mut()))
     }
 }
 

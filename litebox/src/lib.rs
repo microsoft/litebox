@@ -18,6 +18,8 @@ extern crate alloc;
 
 pub mod event;
 pub mod fd;
+#[cfg(feature = "foreign_memory")]
+pub mod foreign_memory;
 pub mod fs;
 pub mod mm;
 pub mod net;

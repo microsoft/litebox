@@ -1,0 +1,12 @@
+[package]
+name = "litebox_e2e_harness"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+litebox = { version = "0.1.0", path = "../litebox", features = ["modeled_backend"] }
+true-tales = { path = "../dev_tools/true-tales" }
+zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
+
+[lints]
+workspace = true
