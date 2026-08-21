@@ -29,7 +29,7 @@ use litebox::utils::ReinterpretUnsignedExt as _;
 use litebox::utils::TruncateExt as _;
 use object::elf::{ET_DYN, FileHeader64, PT_LOAD, ProgramHeader64};
 use object::endian::LittleEndian;
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"))]
 use zerocopy::FromZeros as _;
 
 #[cfg(not(target_pointer_width = "64"))]
@@ -106,7 +106,7 @@ pub(crate) struct ElfPatchState {
     runtime_patches_committed: bool,
     #[cfg(target_arch = "aarch64")]
     trampoline_invalidated: bool,
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"))]
     code_metadata: Option<litebox_syscall_rewriter::aarch64::ElfCodeMetadata>,
     /// Tracks file-backed mappings for this fd as (vaddr, len) pairs.
     /// Used to find mappings that need patching when mprotect adds PROT_EXEC.
@@ -816,7 +816,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let (pre_patched, tramp_file_offset, tramp_vaddr, tramp_file_size) =
             self.check_trampoline_magic(fd);
 
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"))]
         let code_metadata = if pre_patched {
             None
         } else {
@@ -827,15 +827,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let bytes = zerocopy::IntoBytes::as_mut_bytes(words.as_mut_slice());
                 match self.sys_read(fd, &mut bytes[..file_size], Some(0)) {
                     Ok(n) if n == file_size => {
-                        #[cfg(feature = "aarch64_virtualize_x18")]
-                        let metadata = litebox_syscall_rewriter::aarch64::ElfCodeMetadata::parse_aligned_in_place(
-                                &mut words, file_size,
-                            );
-                        #[cfg(not(feature = "aarch64_virtualize_x18"))]
-                        let metadata = litebox_syscall_rewriter::aarch64::ElfCodeMetadata::parse_executable_in_place(
-                                &mut words, file_size,
-                            );
-                        metadata.ok()
+                        litebox_syscall_rewriter::aarch64::ElfCodeMetadata::parse_aligned_in_place(
+                            &mut words, file_size,
+                        )
+                        .ok()
                     }
                     _ => None,
                 }
@@ -911,7 +906,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             runtime_patches_committed: false,
             #[cfg(target_arch = "aarch64")]
             trampoline_invalidated: false,
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"))]
             code_metadata,
             file_mappings: BTreeSet::new(),
             patched_ranges: BTreeSet::new(),
@@ -1215,13 +1210,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         // ── Runtime patching path (unpatched binaries) ───────────────
 
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"))]
         let scan_ranges = file_offset.and_then(|file_offset| {
             state
                 .code_metadata
                 .as_ref()
                 .and_then(|metadata| metadata.ranges_for_mapping(file_offset as u64, len).ok())
         });
+        #[cfg(all(target_arch = "aarch64", not(feature = "aarch64_virtualize_x18")))]
+        let scan_ranges: Option<litebox_syscall_rewriter::aarch64::CodeScanRanges> = None;
         #[cfg(target_arch = "aarch64")]
         let apply_trap_fallback = |mapped_addr, len, already_rw| {
             self.apply_aarch64_trap_fallback(mapped_addr, len, already_rw, scan_ranges.as_ref());
