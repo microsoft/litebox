@@ -34,7 +34,7 @@ use litebox_common_linux::{
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::syscalls::unix::{CSockUnixAddr, UnixSocket, UnixSocketAddr};
-use crate::{GlobalState, ShimFS, ShimPlatform, Task};
+use crate::{GlobalState, ShimPlatform, Task};
 use crate::{UserPtr, UserPtrMut, syscalls::signal};
 
 /// Linux's hard cap on the number of iovecs per `*msg`-style call, and on the
@@ -57,7 +57,7 @@ macro_rules! convert_flags {
 
 pub(crate) type SocketFd<Platform> = litebox::net::SocketFd<Platform>;
 
-impl<Platform: ShimPlatform, FS: ShimFS> super::file::FilesState<Platform, FS> {
+impl<Platform: ShimPlatform> super::file::FilesState<Platform> {
     /// Helper to dispatch socket operations based on socket type (INET vs Unix).
     ///
     /// This method handles the common pattern of:
@@ -70,10 +70,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> super::file::FilesState<Platform, FS> {
     /// For Unix sockets, the `unix_op` closure is called with a cloned Arc to the socket.
     fn with_socket<R>(
         &self,
-        global: &GlobalState<Platform, FS>,
+        global: &GlobalState<Platform>,
         sockfd: u32,
         inet_op: impl FnOnce(&SocketFd<Platform>) -> Result<R, Errno>,
-        unix_op: impl FnOnce(&UnixSocket<Platform, FS>) -> Result<R, Errno>,
+        unix_op: impl FnOnce(&UnixSocket<Platform>) -> Result<R, Errno>,
     ) -> Result<R, Errno> {
         let raw_fd = sockfd as usize;
         let inet_fd = {
@@ -86,7 +86,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> super::file::FilesState<Platform, FS> {
         let unix = self
             .raw_descriptor_store
             .read()
-            .fd_from_raw_integer::<crate::syscalls::unix::UnixSocketSubsystem<Platform, FS>>(raw_fd)
+            .fd_from_raw_integer::<crate::syscalls::unix::UnixSocketSubsystem<Platform>>(raw_fd)
             .map_err(|err| match err {
                 litebox::fd::ErrRawIntFd::NotFound => Errno::EBADF,
                 litebox::fd::ErrRawIntFd::InvalidSubsystem => Errno::ENOTSOCK,
@@ -192,7 +192,7 @@ pub(super) enum SocketOptionValue {
 /// so that they can access `net` and the litebox descriptor table. This might
 /// change if the nature of the litebox descriptor table changes, or if network
 /// namespaces are implemented.
-impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
+impl<Platform: ShimPlatform> GlobalState<Platform> {
     pub(crate) fn initialize_socket(
         &self,
         fd: &SocketFd<Platform>,
@@ -946,7 +946,7 @@ fn parse_type_and_flags(type_and_flags: u32) -> Result<(SockType, SockFlags), Er
     Ok((ty, flags))
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `socket`
     pub(crate) fn sys_socket(
         &self,
@@ -1001,11 +1001,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             AddressFamily::UNIX => {
                 let _ = UnixProtocol::try_from(protocol).map_err(|_| Errno::EPROTONOSUPPORT)?;
                 let socket = UnixSocket::new(ty, flags).ok_or(Errno::ESOCKTNOSUPPORT)?;
-                let typed =
-                    self.global
-                        .litebox
-                        .descriptor_table_mut()
-                        .insert::<crate::syscalls::unix::UnixSocketSubsystem<Platform, FS>>(socket);
+                let typed = self
+                    .global
+                    .litebox
+                    .descriptor_table_mut()
+                    .insert::<crate::syscalls::unix::UnixSocketSubsystem<Platform>>(socket);
                 if flags.contains(SockFlags::CLOEXEC) {
                     let old = self
                         .global
@@ -1062,9 +1062,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let files = self.files.borrow();
                 let mut dt = self.global.litebox.descriptor_table_mut();
                 let typed1 =
-                    dt.insert::<crate::syscalls::unix::UnixSocketSubsystem<Platform, FS>>(sock1);
+                    dt.insert::<crate::syscalls::unix::UnixSocketSubsystem<Platform>>(sock1);
                 let typed2 =
-                    dt.insert::<crate::syscalls::unix::UnixSocketSubsystem<Platform, FS>>(sock2);
+                    dt.insert::<crate::syscalls::unix::UnixSocketSubsystem<Platform>>(sock2);
                 if flags.contains(SockFlags::CLOEXEC) {
                     let old = dt.set_fd_metadata(&typed1, FileDescriptorFlags::FD_CLOEXEC);
                     assert!(old.is_none());
@@ -1234,7 +1234,7 @@ fn copy_iovs_to_vec<Platform: ShimPlatform>(
     Ok(data)
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `accept`
     pub(crate) fn sys_accept(
         &self,
@@ -1293,9 +1293,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let accepted_file = file.accept(&self.wait_cx(), flags, socket_addr.as_mut())?;
                 let peer_addr = socket_addr.map(SocketAddress::Unix);
                 let mut dt = self.global.litebox.descriptor_table_mut();
-                let typed = dt.insert::<crate::syscalls::unix::UnixSocketSubsystem<Platform, FS>>(
-                    accepted_file,
-                );
+                let typed = dt
+                    .insert::<crate::syscalls::unix::UnixSocketSubsystem<Platform>>(accepted_file);
                 if flags.contains(SockFlags::CLOEXEC) {
                     let old = dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
                     assert!(old.is_none());
@@ -2087,10 +2086,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 mod tests {
     use core::net::SocketAddr;
 
-    type TestTask = crate::Task<
-        crate::syscalls::tests::TestPlatform,
-        crate::DefaultFS<crate::syscalls::tests::TestPlatform>,
-    >;
+    type TestTask = crate::Task<crate::syscalls::tests::TestPlatform>;
 
     use alloc::string::ToString as _;
     use litebox::utils::TruncateExt as _;
@@ -2853,10 +2849,7 @@ mod tests {
 mod unix_tests {
     use core::time::Duration;
 
-    type TestTask = crate::Task<
-        crate::syscalls::tests::TestPlatform,
-        crate::DefaultFS<crate::syscalls::tests::TestPlatform>,
-    >;
+    type TestTask = crate::Task<crate::syscalls::tests::TestPlatform>;
 
     use alloc::{string::ToString, vec::Vec};
     use litebox::event::Events;

@@ -31,19 +31,17 @@ use litebox_common_linux::{
 };
 
 use crate::{
-    FileFd, GlobalState, ShimFS, ShimPlatform, Task, UserPtr, UserPtrMut,
+    FileFd, GlobalState, LinuxFS, ShimPlatform, Task, UserPtr, UserPtrMut,
     channel::{Channel, ReadEnd, WriteEnd},
     syscalls::net::{SocketOptionValue, SocketOptions},
 };
 
-pub(crate) struct UnixSocketSubsystem<Platform: ShimPlatform, FS: ShimFS>(
-    core::marker::PhantomData<(Platform, FS)>,
-);
-impl<Platform: ShimPlatform, FS: ShimFS> FdEnabledSubsystem for UnixSocketSubsystem<Platform, FS> {
-    type Entry = UnixSocket<Platform, FS>;
+pub(crate) struct UnixSocketSubsystem<Platform: ShimPlatform>(core::marker::PhantomData<Platform>);
+impl<Platform: ShimPlatform> FdEnabledSubsystem for UnixSocketSubsystem<Platform> {
+    type Entry = UnixSocket<Platform>;
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> FdEnabledSubsystemEntry for UnixSocket<Platform, FS> {}
+impl<Platform: ShimPlatform> FdEnabledSubsystemEntry for UnixSocket<Platform> {}
 
 /// C-compatible structure for Unix socket addresses.
 const UNIX_PATH_MAX: usize = 108;
@@ -71,8 +69,8 @@ pub(crate) enum UnixSocketAddr {
 /// For path-based sockets, this includes a file descriptor to ensure
 /// the socket file remains accessible. The file is automatically closed
 /// when this structure is dropped.
-enum UnixBoundSocketAddr<FS: ShimFS> {
-    Path((String, FileFd<FS>, Arc<FS>)),
+enum UnixBoundSocketAddr<Platform: ShimPlatform> {
+    Path((String, FileFd<Platform>, Arc<LinuxFS<Platform>>)),
     Abstract(Vec<u8>),
 }
 
@@ -104,11 +102,11 @@ impl UnixSocketAddr {
     ///
     /// Returns an error if the address cannot be bound (e.g., file doesn't exist,
     /// permission denied).
-    fn bind<Platform: ShimPlatform, FS: ShimFS>(
+    fn bind<Platform: ShimPlatform>(
         self,
-        task: &Task<Platform, FS>,
+        task: &Task<Platform>,
         is_server: bool,
-    ) -> Result<UnixBoundSocketAddr<FS>, Errno> {
+    ) -> Result<UnixBoundSocketAddr<Platform>, Errno> {
         match self {
             UnixSocketAddr::Path(path) => {
                 let flags = if is_server {
@@ -158,7 +156,7 @@ impl UnixSocketAddr {
     }
 }
 
-impl<FS: ShimFS> UnixBoundSocketAddr<FS> {
+impl<Platform: ShimPlatform> UnixBoundSocketAddr<Platform> {
     /// Converts this bound address to a key for the global address table.
     fn to_key(&self) -> UnixSocketAddrKey {
         match self {
@@ -168,7 +166,7 @@ impl<FS: ShimFS> UnixBoundSocketAddr<FS> {
     }
 }
 
-impl<FS: ShimFS> Drop for UnixBoundSocketAddr<FS> {
+impl<Platform: ShimPlatform> Drop for UnixBoundSocketAddr<Platform> {
     fn drop(&mut self) {
         match self {
             Self::Path((_, file, fs)) => {
@@ -179,8 +177,8 @@ impl<FS: ShimFS> Drop for UnixBoundSocketAddr<FS> {
     }
 }
 
-impl<FS: ShimFS> From<&UnixBoundSocketAddr<FS>> for UnixSocketAddr {
-    fn from(addr: &UnixBoundSocketAddr<FS>) -> Self {
+impl<Platform: ShimPlatform> From<&UnixBoundSocketAddr<Platform>> for UnixSocketAddr {
+    fn from(addr: &UnixBoundSocketAddr<Platform>) -> Self {
         match addr {
             UnixBoundSocketAddr::Path((path, ..)) => UnixSocketAddr::Path(path.clone()),
             UnixBoundSocketAddr::Abstract(data) => UnixSocketAddr::Abstract(data.clone()),
@@ -192,15 +190,15 @@ impl<FS: ShimFS> From<&UnixBoundSocketAddr<FS>> for UnixSocketAddr {
 ///
 /// This is the state immediately after socket creation, before the socket
 /// has been connected, or put into listening mode.
-struct UnixInitStream<Platform: ShimPlatform, FS: ShimFS> {
+struct UnixInitStream<Platform: ShimPlatform> {
     /// Optional bound address for this socket
-    addr: Option<UnixBoundSocketAddr<FS>>,
+    addr: Option<UnixBoundSocketAddr<Platform>>,
     pollee: Pollee<Platform>,
     read_shutdown: AtomicBool,
     write_shutdown: AtomicBool,
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> UnixInitStream<Platform, FS> {
+impl<Platform: ShimPlatform> UnixInitStream<Platform> {
     fn new() -> Self {
         Self {
             addr: None,
@@ -220,7 +218,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixInitStream<Platform, FS> {
     }
 
     /// Binds this socket to the given address.
-    fn bind(&mut self, task: &Task<Platform, FS>, addr: UnixSocketAddr) -> Result<(), Errno> {
+    fn bind(&mut self, task: &Task<Platform>, addr: UnixSocketAddr) -> Result<(), Errno> {
         if self.addr.is_some() && !addr.is_unnamed() {
             return Err(Errno::EINVAL);
         }
@@ -239,8 +237,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixInitStream<Platform, FS> {
     fn listen(
         self,
         backlog: u16,
-        global: &Arc<GlobalState<Platform, FS>>,
-    ) -> Result<UnixListenStream<Platform, FS>, (Self, Errno)> {
+        global: &Arc<GlobalState<Platform>>,
+    ) -> Result<UnixListenStream<Platform>, (Self, Errno)> {
         let Some(addr) = self.addr else {
             return Err((self, Errno::EINVAL));
         };
@@ -259,11 +257,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixInitStream<Platform, FS> {
     /// Converts this initial socket into a connected stream pair.
     fn into_connected(
         self,
-        peer_addr: Arc<UnixBoundSocketAddr<FS>>,
-    ) -> (
-        UnixConnectedStream<Platform, FS>,
-        UnixConnectedStream<Platform, FS>,
-    ) {
+        peer_addr: Arc<UnixBoundSocketAddr<Platform>>,
+    ) -> (UnixConnectedStream<Platform>, UnixConnectedStream<Platform>) {
         let UnixInitStream {
             addr,
             pollee,
@@ -283,22 +278,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixInitStream<Platform, FS> {
 /// Connection backlog for a listening Unix socket.
 ///
 /// Manages the queue of pending connections and the maximum backlog limit.
-struct Backlog<Platform: ShimPlatform, FS: ShimFS> {
+struct Backlog<Platform: ShimPlatform> {
     /// The address this socket is listening on
-    addr: Arc<UnixBoundSocketAddr<FS>>,
-    state: Mutex<Platform, BacklogState<Platform, FS>>,
+    addr: Arc<UnixBoundSocketAddr<Platform>>,
+    state: Mutex<Platform, BacklogState<Platform>>,
     pollee: Pollee<Platform>,
 }
 
-struct BacklogState<Platform: ShimPlatform, FS: ShimFS> {
-    sockets: VecDeque<UnixConnectedStream<Platform, FS>>,
+struct BacklogState<Platform: ShimPlatform> {
+    sockets: VecDeque<UnixConnectedStream<Platform>>,
     /// Maximum number of pending connections
     limit: u16,
     is_shutdown: bool,
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Backlog<Platform, FS> {
-    fn new(addr: UnixBoundSocketAddr<FS>, backlog: u16, pollee: Pollee<Platform>) -> Self {
+impl<Platform: ShimPlatform> Backlog<Platform> {
+    fn new(addr: UnixBoundSocketAddr<Platform>, backlog: u16, pollee: Pollee<Platform>) -> Self {
         Self {
             addr: Arc::new(addr),
             state: litebox::sync::Mutex::new(BacklogState {
@@ -318,8 +313,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Backlog<Platform, FS> {
     /// Attempts to establish a connection without blocking.
     fn try_connect(
         &self,
-        init: UnixInitStream<Platform, FS>,
-    ) -> Result<UnixConnectedStream<Platform, FS>, (UnixInitStream<Platform, FS>, Errno)> {
+        init: UnixInitStream<Platform>,
+    ) -> Result<UnixConnectedStream<Platform>, (UnixInitStream<Platform>, Errno)> {
         let mut state = self.state.lock();
         if state.is_shutdown {
             return Err((init, Errno::ECONNREFUSED));
@@ -337,7 +332,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Backlog<Platform, FS> {
     }
 
     /// Attempts to accept a pending connection without blocking.
-    fn try_accept(&self) -> Result<UnixConnectedStream<Platform, FS>, TryOpError<Errno>> {
+    fn try_accept(&self) -> Result<UnixConnectedStream<Platform>, TryOpError<Errno>> {
         let mut state = self.state.lock();
         match state.sockets.pop_front() {
             Some(stream) => {
@@ -376,12 +371,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Backlog<Platform, FS> {
 }
 
 /// Represents a Unix stream socket in listening state.
-struct UnixListenStream<Platform: ShimPlatform, FS: ShimFS> {
-    backlog: Arc<Backlog<Platform, FS>>,
-    global: Arc<GlobalState<Platform, FS>>,
+struct UnixListenStream<Platform: ShimPlatform> {
+    backlog: Arc<Backlog<Platform>>,
+    global: Arc<GlobalState<Platform>>,
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> UnixListenStream<Platform, FS> {
+impl<Platform: ShimPlatform> UnixListenStream<Platform> {
     /// Updates the maximum backlog size for pending connections.
     fn listen(&self, backlog: u16) {
         self.backlog.set_backlog(backlog);
@@ -396,12 +391,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixListenStream<Platform, FS> {
     }
 
     /// Returns the local address this socket is bound to.
-    fn get_local_addr(&self) -> &UnixBoundSocketAddr<FS> {
+    fn get_local_addr(&self) -> &UnixBoundSocketAddr<Platform> {
         self.backlog.addr.as_ref()
     }
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Drop for UnixListenStream<Platform, FS> {
+impl<Platform: ShimPlatform> Drop for UnixListenStream<Platform> {
     fn drop(&mut self) {
         self.backlog.shutdown();
 
@@ -417,18 +412,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Drop for UnixListenStream<Platform, FS>
 }
 
 /// Tracks the local and peer addresses for a connected socket.
-struct AddrView<FS: ShimFS> {
-    addr: Option<Arc<UnixBoundSocketAddr<FS>>>,
-    peer: Option<Arc<UnixBoundSocketAddr<FS>>>,
+struct AddrView<Platform: ShimPlatform> {
+    addr: Option<Arc<UnixBoundSocketAddr<Platform>>>,
+    peer: Option<Arc<UnixBoundSocketAddr<Platform>>>,
 }
 
-impl<FS: ShimFS> AddrView<FS> {
+impl<Platform: ShimPlatform> AddrView<Platform> {
     /// Creates a pair of address views for two connected sockets.
     ///
     /// The local address of one becomes the peer address of the other.
     fn new_pair(
-        addr: Option<Arc<UnixBoundSocketAddr<FS>>>,
-        peer: Option<Arc<UnixBoundSocketAddr<FS>>>,
+        addr: Option<Arc<UnixBoundSocketAddr<Platform>>>,
+        peer: Option<Arc<UnixBoundSocketAddr<Platform>>>,
     ) -> (Self, Self) {
         let first = Self {
             addr: addr.clone(),
@@ -442,12 +437,12 @@ impl<FS: ShimFS> AddrView<FS> {
     }
 
     /// Returns the local address, if available.
-    fn get_local_addr(&self) -> Option<&UnixBoundSocketAddr<FS>> {
+    fn get_local_addr(&self) -> Option<&UnixBoundSocketAddr<Platform>> {
         self.addr.as_deref()
     }
 
     /// Returns the peer address, if available.
-    fn get_peer_addr(&self) -> Option<&UnixBoundSocketAddr<FS>> {
+    fn get_peer_addr(&self) -> Option<&UnixBoundSocketAddr<Platform>> {
         self.peer.as_deref()
     }
 }
@@ -460,8 +455,8 @@ struct Message {
 }
 
 /// Represents a connected Unix stream socket.
-struct UnixConnectedStream<Platform: ShimPlatform, FS: ShimFS> {
-    addr: AddrView<FS>,
+struct UnixConnectedStream<Platform: ShimPlatform> {
+    addr: AddrView<Platform>,
     /// The read end of the local socket's channel for receiving messages.
     recv_channel: crate::channel::ReadEnd<Platform, Message>,
     /// The write end of the connected peer socket for sending messages.
@@ -470,16 +465,16 @@ struct UnixConnectedStream<Platform: ShimPlatform, FS: ShimFS> {
 }
 
 const UNIX_BUF_SIZE: usize = 65536;
-impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
+impl<Platform: ShimPlatform> UnixConnectedStream<Platform> {
     /// Creates a pair of connected Unix stream sockets.
     ///
     /// `read_shutdown` and `write_shutdown` half-close the corresponding sides of the
     /// *first* returned socket only (used to carry pre-connect shutdown flags from
     /// `UnixInitStream` across `connect(2)` into the connected state).
     fn new_pair(
-        addr: Option<Arc<UnixBoundSocketAddr<FS>>>,
+        addr: Option<Arc<UnixBoundSocketAddr<Platform>>>,
         pollee: Option<Arc<Pollee<Platform>>>,
-        peer: Option<Arc<UnixBoundSocketAddr<FS>>>,
+        peer: Option<Arc<UnixBoundSocketAddr<Platform>>>,
         read_shutdown: bool,
         write_shutdown: bool,
     ) -> (Self, Self) {
@@ -592,20 +587,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixConnectedStream<Platform, FS> {
     }
 }
 
-enum UnixStreamState<Platform: ShimPlatform, FS: ShimFS> {
-    Init(UnixInitStream<Platform, FS>),
-    Listen(UnixListenStream<Platform, FS>),
-    Connected(UnixConnectedStream<Platform, FS>),
+enum UnixStreamState<Platform: ShimPlatform> {
+    Init(UnixInitStream<Platform>),
+    Listen(UnixListenStream<Platform>),
+    Connected(UnixConnectedStream<Platform>),
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> UnixStreamState<Platform, FS> {
-    fn connected(&self) -> Option<&UnixConnectedStream<Platform, FS>> {
+impl<Platform: ShimPlatform> UnixStreamState<Platform> {
+    fn connected(&self) -> Option<&UnixConnectedStream<Platform>> {
         match self {
             UnixStreamState::Connected(conn) => Some(conn),
             _ => None,
         }
     }
-    fn listen(&self) -> Option<&UnixListenStream<Platform, FS>> {
+    fn listen(&self) -> Option<&UnixListenStream<Platform>> {
         match self {
             UnixStreamState::Listen(listen) => Some(listen),
             _ => None,
@@ -613,12 +608,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStreamState<Platform, FS> {
     }
 }
 
-struct UnixStream<Platform: ShimPlatform, FS: ShimFS> {
-    state: RwLock<Platform, Option<UnixStreamState<Platform, FS>>>,
+struct UnixStream<Platform: ShimPlatform> {
+    state: RwLock<Platform, Option<UnixStreamState<Platform>>>,
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
-    fn new(state: UnixStreamState<Platform, FS>) -> Self {
+impl<Platform: ShimPlatform> UnixStream<Platform> {
+    fn new(state: UnixStreamState<Platform>) -> Self {
         Self {
             state: litebox::sync::RwLock::new(Some(state)),
         }
@@ -626,7 +621,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
 
     fn with_state_ref<F, R>(&self, f: F) -> R
     where
-        F: FnOnce(&UnixStreamState<Platform, FS>) -> R,
+        F: FnOnce(&UnixStreamState<Platform>) -> R,
     {
         let old = self.state.read();
         f(old.as_ref().expect("state should never be None"))
@@ -634,7 +629,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
 
     fn with_state_mut_ref<F, R>(&self, f: F) -> R
     where
-        F: FnOnce(&mut UnixStreamState<Platform, FS>) -> R,
+        F: FnOnce(&mut UnixStreamState<Platform>) -> R,
     {
         let mut old = self.state.write();
         f(old.as_mut().expect("state should never be None"))
@@ -642,7 +637,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
 
     fn with_state<F, R>(&self, f: F) -> R
     where
-        F: FnOnce(UnixStreamState<Platform, FS>) -> (UnixStreamState<Platform, FS>, R),
+        F: FnOnce(UnixStreamState<Platform>) -> (UnixStreamState<Platform>, R),
     {
         let mut old = self.state.write();
         let (new, result) = f(old.take().expect("state should never be None"));
@@ -650,7 +645,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
         result
     }
 
-    fn bind(&self, task: &Task<Platform, FS>, addr: UnixSocketAddr) -> Result<(), Errno> {
+    fn bind(&self, task: &Task<Platform>, addr: UnixSocketAddr) -> Result<(), Errno> {
         self.with_state_mut_ref(|state| {
             match state {
                 UnixStreamState::Init(init) => init.bind(task, addr),
@@ -664,7 +659,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
         })
     }
 
-    fn listen(&self, backlog: u16, global: &Arc<GlobalState<Platform, FS>>) -> Result<(), Errno> {
+    fn listen(&self, backlog: u16, global: &Arc<GlobalState<Platform>>) -> Result<(), Errno> {
         self.with_state(|state| {
             let ret = match state {
                 UnixStreamState::Init(init) => {
@@ -685,9 +680,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
 
     fn lookup(
         &self,
-        task: &Task<Platform, FS>,
+        task: &Task<Platform>,
         addr: &UnixSocketAddr,
-    ) -> Result<Arc<Backlog<Platform, FS>>, Errno> {
+    ) -> Result<Arc<Backlog<Platform>>, Errno> {
         let guard = task.global.unix_addr_table.read();
         let Some(key) = addr.to_key() else {
             return Err(Errno::EINVAL);
@@ -700,7 +695,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
             UnixEntryInner::Datagram(_) => Err(Errno::EPROTOTYPE),
         }
     }
-    fn try_connect(&self, backlog: &Backlog<Platform, FS>) -> Result<(), TryOpError<Errno>> {
+    fn try_connect(&self, backlog: &Backlog<Platform>) -> Result<(), TryOpError<Errno>> {
         self.with_state(|state| match state {
             UnixStreamState::Init(init) => match backlog.try_connect(init) {
                 Ok(connected) => (UnixStreamState::Connected(connected), Ok(())),
@@ -716,7 +711,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
     }
     fn connect(
         &self,
-        task: &Task<Platform, FS>,
+        task: &Task<Platform>,
         addr: UnixSocketAddr,
         is_nonblocking: bool,
     ) -> Result<(), Errno> {
@@ -741,12 +736,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixStream<Platform, FS> {
         cx: &WaitContext<'_, Platform>,
         mut peer: Option<&mut UnixSocketAddr>,
         is_nonblocking: bool,
-    ) -> Result<UnixSocketInner<Platform, FS>, Errno> {
-        let backlog =
-            self.with_state_ref(|state| -> Result<Arc<Backlog<Platform, FS>>, Errno> {
-                let listen = state.listen().ok_or(Errno::EINVAL)?;
-                Ok(listen.backlog.clone())
-            })?;
+    ) -> Result<UnixSocketInner<Platform>, Errno> {
+        let backlog = self.with_state_ref(|state| -> Result<Arc<Backlog<Platform>>, Errno> {
+            let listen = state.listen().ok_or(Errno::EINVAL)?;
+            Ok(listen.backlog.clone())
+        })?;
         let res = cx
             .wait_on_events(
                 is_nonblocking,
@@ -997,11 +991,11 @@ impl<Platform: ShimPlatform> ReadEnd<Platform, DatagramMessage> {
 
 /// The local address of a bound datagram socket together with the global state
 /// it was registered in (used to deregister the address on drop).
-type BoundDatagramAddr<Platform, FS> = (UnixBoundSocketAddr<FS>, Arc<GlobalState<Platform, FS>>);
+type BoundDatagramAddr<Platform> = (UnixBoundSocketAddr<Platform>, Arc<GlobalState<Platform>>);
 
-struct UnixDatagramInner<Platform: ShimPlatform, FS: ShimFS> {
+struct UnixDatagramInner<Platform: ShimPlatform> {
     /// The local address this socket is bound to, if any.
-    addr: Option<BoundDatagramAddr<Platform, FS>>,
+    addr: Option<BoundDatagramAddr<Platform>>,
     /// The read end of the local socket's channel for receiving messages.
     /// Set when the socket is bound via `bind` or `new_pair`.
     recv_channel: Option<ReadEnd<Platform, DatagramMessage>>,
@@ -1013,11 +1007,11 @@ struct UnixDatagramInner<Platform: ShimPlatform, FS: ShimFS> {
     pollee: Arc<Pollee<Platform>>,
 }
 /// Represents a Unix datagram socket.
-struct UnixDatagram<Platform: ShimPlatform, FS: ShimFS> {
-    inner: RwLock<Platform, UnixDatagramInner<Platform, FS>>,
+struct UnixDatagram<Platform: ShimPlatform> {
+    inner: RwLock<Platform, UnixDatagramInner<Platform>>,
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Drop for UnixDatagramInner<Platform, FS> {
+impl<Platform: ShimPlatform> Drop for UnixDatagramInner<Platform> {
     fn drop(&mut self) {
         if let Some((addr, global)) = self.addr.take() {
             let key = addr.to_key();
@@ -1033,9 +1027,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Drop for UnixDatagramInner<Platform, FS
     }
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagramInner<Platform, FS> {
+impl<Platform: ShimPlatform> UnixDatagramInner<Platform> {
     /// Binds this socket to the given address.
-    fn bind(&mut self, task: &Task<Platform, FS>, addr: UnixSocketAddr) -> Result<(), Errno> {
+    fn bind(&mut self, task: &Task<Platform>, addr: UnixSocketAddr) -> Result<(), Errno> {
         if self.addr.is_some() {
             if addr.is_unnamed() {
                 return Ok(());
@@ -1082,7 +1076,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagramInner<Platform, FS> {
     }
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
+impl<Platform: ShimPlatform> UnixDatagram<Platform> {
     fn new() -> Self {
         Self {
             inner: RwLock::new(UnixDatagramInner {
@@ -1096,7 +1090,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
         }
     }
 
-    fn new_pair() -> (UnixDatagram<Platform, FS>, UnixDatagram<Platform, FS>) {
+    fn new_pair() -> (UnixDatagram<Platform>, UnixDatagram<Platform>) {
         let pollee1 = Arc::new(Pollee::new());
         let pollee2 = Arc::new(Pollee::new());
         let (send_channel, recv_channel) =
@@ -1129,14 +1123,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
     }
 
     /// Binds this socket to the given address.
-    fn bind(&self, task: &Task<Platform, FS>, addr: UnixSocketAddr) -> Result<(), Errno> {
+    fn bind(&self, task: &Task<Platform>, addr: UnixSocketAddr) -> Result<(), Errno> {
         self.inner.write().bind(task, addr)
     }
 
     /// Looks up a socket address and returns its write endpoint.
     fn lookup(
         &self,
-        task: &Task<Platform, FS>,
+        task: &Task<Platform>,
         addr: UnixSocketAddr,
     ) -> Result<WriteEnd<Platform, DatagramMessage>, Errno> {
         let guard = task.global.unix_addr_table.read();
@@ -1157,7 +1151,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
     /// Connects this socket to a default peer address.
     ///
     /// Subsequent sends without an address will use this peer.
-    fn connect(&self, task: &Task<Platform, FS>, addr: UnixSocketAddr) -> Result<(), Errno> {
+    fn connect(&self, task: &Task<Platform>, addr: UnixSocketAddr) -> Result<(), Errno> {
         let send_channel = self.lookup(task, addr.clone())?;
         let mut inner = self.inner.write();
         if inner.write_shutdown {
@@ -1210,7 +1204,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
     /// connected peer (set via `connect()`).
     fn sendto(
         &self,
-        task: &Task<Platform, FS>,
+        task: &Task<Platform>,
         timeout: Option<Duration>,
         buf: &[u8],
         is_nonblocking: bool,
@@ -1300,18 +1294,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixDatagram<Platform, FS> {
     }
 }
 
-enum UnixSocketInner<Platform: ShimPlatform, FS: ShimFS> {
-    Stream(UnixStream<Platform, FS>),
-    Datagram(UnixDatagram<Platform, FS>),
+enum UnixSocketInner<Platform: ShimPlatform> {
+    Stream(UnixStream<Platform>),
+    Datagram(UnixDatagram<Platform>),
 }
-pub(crate) struct UnixSocket<Platform: ShimPlatform, FS: ShimFS> {
-    inner: UnixSocketInner<Platform, FS>,
+pub(crate) struct UnixSocket<Platform: ShimPlatform> {
+    inner: UnixSocketInner<Platform>,
     status: AtomicU32,
     options: Mutex<Platform, SocketOptions>,
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
-    fn new_with_inner(inner: UnixSocketInner<Platform, FS>, flags: SockFlags) -> Self {
+impl<Platform: ShimPlatform> UnixSocket<Platform> {
+    fn new_with_inner(inner: UnixSocketInner<Platform>, flags: SockFlags) -> Self {
         let mut status = OFlags::RDWR;
         status.set(OFlags::NONBLOCK, flags.contains(SockFlags::NONBLOCK));
         Self {
@@ -1335,11 +1329,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         Some(Self::new_with_inner(inner, flags))
     }
 
-    pub(super) fn bind(
-        &self,
-        task: &Task<Platform, FS>,
-        addr: UnixSocketAddr,
-    ) -> Result<(), Errno> {
+    pub(super) fn bind(&self, task: &Task<Platform>, addr: UnixSocketAddr) -> Result<(), Errno> {
         match &self.inner {
             UnixSocketInner::Stream(stream) => stream.bind(task, addr),
             UnixSocketInner::Datagram(datagram) => datagram.bind(task, addr),
@@ -1349,7 +1339,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
     pub(super) fn listen(
         &self,
         backlog: u16,
-        global: &Arc<GlobalState<Platform, FS>>,
+        global: &Arc<GlobalState<Platform>>,
     ) -> Result<(), Errno> {
         match &self.inner {
             UnixSocketInner::Stream(stream) => stream.listen(backlog, global),
@@ -1357,11 +1347,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         }
     }
 
-    pub(super) fn connect(
-        &self,
-        task: &Task<Platform, FS>,
-        addr: UnixSocketAddr,
-    ) -> Result<(), Errno> {
+    pub(super) fn connect(&self, task: &Task<Platform>, addr: UnixSocketAddr) -> Result<(), Errno> {
         match &self.inner {
             UnixSocketInner::Stream(stream) => {
                 stream.connect(task, addr, self.get_status().contains(OFlags::NONBLOCK))
@@ -1375,7 +1361,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
         cx: &WaitContext<'_, Platform>,
         flags: SockFlags,
         peer: Option<&mut UnixSocketAddr>,
-    ) -> Result<UnixSocket<Platform, FS>, Errno> {
+    ) -> Result<UnixSocket<Platform>, Errno> {
         match &self.inner {
             UnixSocketInner::Stream(stream) => {
                 let accepted = stream.accept(
@@ -1392,7 +1378,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
 
     pub(super) fn sendto(
         &self,
-        task: &Task<Platform, FS>,
+        task: &Task<Platform>,
         buf: &[u8],
         flags: SendFlags,
         addr: Option<UnixSocketAddr>,
@@ -1460,7 +1446,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
     pub(super) fn new_connected_pair(
         ty: SockType,
         flags: SockFlags,
-    ) -> Option<(UnixSocket<Platform, FS>, UnixSocket<Platform, FS>)> {
+    ) -> Option<(UnixSocket<Platform>, UnixSocket<Platform>)> {
         match ty {
             SockType::Stream => {
                 let (conn1, conn2) = UnixConnectedStream::new_pair(None, None, None, false, false);
@@ -1488,7 +1474,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
 
     pub(super) fn setsockopt(
         &self,
-        global: &GlobalState<Platform, FS>,
+        global: &GlobalState<Platform>,
         optname: SocketOptionName,
         optval: UserPtr<u8>,
         optlen: usize,
@@ -1554,7 +1540,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
     }
     pub(super) fn getsockopt(
         &self,
-        global: &GlobalState<Platform, FS>,
+        global: &GlobalState<Platform>,
         optname: SocketOptionName,
         optval: UserPtrMut<u8>,
         len: u32,
@@ -1635,7 +1621,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
     super::common_functions_for_file_status!();
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> IOPollable for UnixSocket<Platform, FS> {
+impl<Platform: ShimPlatform> IOPollable for UnixSocket<Platform> {
     fn register_observer(
         &self,
         observer: Weak<dyn litebox::event::observer::Observer<Events>>,
@@ -1663,11 +1649,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> IOPollable for UnixSocket<Platform, FS>
     }
 }
 
-pub(crate) struct UnixEntry<Platform: ShimPlatform, FS: ShimFS>(UnixEntryInner<Platform, FS>);
-enum UnixEntryInner<Platform: ShimPlatform, FS: ShimFS> {
-    Stream(Arc<Backlog<Platform, FS>>),
+pub(crate) struct UnixEntry<Platform: ShimPlatform>(UnixEntryInner<Platform>);
+enum UnixEntryInner<Platform: ShimPlatform> {
+    Stream(Arc<Backlog<Platform>>),
     Datagram(WriteEnd<Platform, DatagramMessage>),
 }
 
 /// Type alias for the global Unix socket address table.
-pub(crate) type UnixAddrTable<Platform, FS> = BTreeMap<UnixSocketAddrKey, UnixEntry<Platform, FS>>;
+pub(crate) type UnixAddrTable<Platform> = BTreeMap<UnixSocketAddrKey, UnixEntry<Platform>>;

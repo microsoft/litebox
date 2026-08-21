@@ -24,7 +24,9 @@ use litebox_common_linux::{
 };
 use thiserror::Error;
 
-use crate::{GlobalState, ShimFS, ShimPlatform, Task, UserPtr, UserPtrMut, syscalls::signal};
+use crate::{
+    FileFd, GlobalState, LinuxFS, ShimPlatform, Task, UserPtr, UserPtrMut, syscalls::signal,
+};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Clone, Copy)]
@@ -74,16 +76,16 @@ impl<Platform: ShimPlatform> FsState<Platform> {
 }
 
 /// Task state shared by `CLONE_FILES`.
-pub(crate) struct FilesState<Platform: ShimPlatform, FS: ShimFS> {
+pub(crate) struct FilesState<Platform: ShimPlatform> {
     /// The filesystem implementation, shared across tasks that share file system.
-    pub(crate) fs: alloc::sync::Arc<FS>,
+    pub(crate) fs: alloc::sync::Arc<LinuxFS<Platform>>,
     pub(crate) raw_descriptor_store:
         litebox::sync::RwLock<Platform, litebox::fd::RawDescriptorStorage>,
     max_fd: AtomicUsize,
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> FilesState<Platform, FS> {
-    pub(crate) fn new(fs: alloc::sync::Arc<FS>) -> Self {
+impl<Platform: ShimPlatform> FilesState<Platform> {
+    pub(crate) fn new(fs: alloc::sync::Arc<LinuxFS<Platform>>) -> Self {
         Self {
             fs,
             raw_descriptor_store: litebox::sync::RwLock::new(
@@ -185,7 +187,7 @@ impl FsPath {
     }
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     fn get_umask(&self) -> Mode {
         self.fs.borrow().umask()
     }
@@ -226,7 +228,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         path: impl path::Arg,
         flags: OFlags,
         mode: Mode,
-    ) -> Result<TypedFd<FS>, Errno> {
+    ) -> Result<FileFd<Platform>, Errno> {
         let mode = mode & !self.get_umask();
         self.files
             .borrow()
@@ -241,12 +243,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         pathname: impl path::Arg,
         flags: OFlags,
         mode: Mode,
-    ) -> Result<TypedFd<FS>, Errno> {
+    ) -> Result<FileFd<Platform>, Errno> {
         let path = self.resolve_path_at(dirfd, pathname)?;
         self.do_open(path, flags, mode)
     }
 
-    fn insert_raw_file_fd(&self, file: TypedFd<FS>, flags: OFlags) -> Result<u32, Errno> {
+    fn insert_raw_file_fd(&self, file: FileFd<Platform>, flags: OFlags) -> Result<u32, Errno> {
         if flags.contains(OFlags::CLOEXEC) {
             let None = self
                 .global
@@ -682,7 +684,7 @@ pub(crate) fn try_into_whence(value: i16) -> Result<SeekWhence, i16> {
     }
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `lseek`
     pub fn sys_lseek(&self, fd: i32, offset: isize, whence: SeekWhence) -> Result<usize, Errno> {
         let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
@@ -746,7 +748,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     pub(crate) fn do_close(&self, raw_fd: usize) -> Result<(), Errno> {
-        self.do_close_and_replace::<FS>(raw_fd, None)
+        self.do_close_and_replace::<LinuxFS<Platform>>(raw_fd, None)
     }
 
     /// Close the file at `raw_fd` and optionally place a new file in the same slot.
@@ -757,18 +759,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         raw_fd: usize,
         replace: Option<TypedFd<S>>,
     ) -> Result<(), Errno> {
-        enum ConsumedFd<Platform: ShimPlatform, FS: ShimFS> {
-            Fs(alloc::sync::Arc<TypedFd<FS>>),
+        enum ConsumedFd<Platform: ShimPlatform> {
+            Fs(alloc::sync::Arc<FileFd<Platform>>),
             Network(alloc::sync::Arc<TypedFd<litebox::net::Network<Platform>>>),
             Pipes(alloc::sync::Arc<TypedFd<litebox::pipes::Pipes<Platform>>>),
             Eventfd(alloc::sync::Arc<TypedFd<super::eventfd::EventfdSubsystem<Platform>>>),
-            Epoll(alloc::sync::Arc<TypedFd<super::epoll::EpollSubsystem<Platform, FS>>>),
-            Unix(alloc::sync::Arc<TypedFd<super::unix::UnixSocketSubsystem<Platform, FS>>>),
+            Epoll(alloc::sync::Arc<TypedFd<super::epoll::EpollSubsystem<Platform>>>),
+            Unix(alloc::sync::Arc<TypedFd<super::unix::UnixSocketSubsystem<Platform>>>),
         }
 
         let files = self.files.borrow();
         let mut rds = files.raw_descriptor_store.write();
-        let consumed: ConsumedFd<Platform, FS> = match rds.fd_consume_raw_integer::<FS>(raw_fd) {
+        let consumed: ConsumedFd<Platform> = match rds
+            .fd_consume_raw_integer::<LinuxFS<Platform>>(raw_fd)
+        {
             Ok(fd) => ConsumedFd::Fs(fd),
             Err(litebox::fd::ErrRawIntFd::NotFound) => {
                 if let Some(new_fd) = replace {
@@ -791,13 +795,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 {
                     ConsumedFd::Eventfd(fd)
                 } else if let Ok(fd) =
-                    rds.fd_consume_raw_integer::<super::epoll::EpollSubsystem<Platform, FS>>(raw_fd)
+                    rds.fd_consume_raw_integer::<super::epoll::EpollSubsystem<Platform>>(raw_fd)
                 {
                     ConsumedFd::Epoll(fd)
-                } else if let Ok(fd) = rds
-                    .fd_consume_raw_integer::<super::unix::UnixSocketSubsystem<Platform, FS>>(
-                        raw_fd,
-                    )
+                } else if let Ok(fd) =
+                    rds.fd_consume_raw_integer::<super::unix::UnixSocketSubsystem<Platform>>(raw_fd)
                 {
                     ConsumedFd::Unix(fd)
                 } else {
@@ -927,7 +929,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     fn check_raw_fd_exists(&self, fd: i32) -> Result<(), Errno> {
         let raw_fd = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
         if self
@@ -1065,7 +1067,7 @@ where
     Ok(total_written)
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `writev`
     pub(crate) fn sys_writev(
         &self,
@@ -1244,9 +1246,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 }
 
-fn descriptor_stat<Platform: ShimPlatform, FS: ShimFS, T>(
+fn descriptor_stat<Platform: ShimPlatform, T>(
     raw_fd: usize,
-    task: &Task<Platform, FS>,
+    task: &Task<Platform>,
 ) -> Result<T, Errno>
 where
     T: From<litebox::fs::FileStatus> + From<FileStat>,
@@ -1293,15 +1295,15 @@ where
         .flatten()
 }
 
-pub(crate) fn get_file_descriptor_flags<Platform: ShimPlatform, FS: ShimFS>(
+pub(crate) fn get_file_descriptor_flags<Platform: ShimPlatform>(
     raw_fd: usize,
-    global: &GlobalState<Platform, FS>,
-    files: &FilesState<Platform, FS>,
+    global: &GlobalState<Platform>,
+    files: &FilesState<Platform>,
 ) -> Result<FileDescriptorFlags, Errno> {
     // Currently, only one such flag is defined: FD_CLOEXEC, the close-on-exec flag.
     // See https://www.man7.org/linux/man-pages/man2/F_GETFD.2const.html
-    fn get_flags<Platform: ShimPlatform, FS: ShimFS, S: FdEnabledSubsystem>(
-        global: &GlobalState<Platform, FS>,
+    fn get_flags<Platform: ShimPlatform, S: FdEnabledSubsystem>(
+        global: &GlobalState<Platform>,
         fd: &TypedFd<S>,
     ) -> FileDescriptorFlags {
         global
@@ -1321,14 +1323,14 @@ pub(crate) fn get_file_descriptor_flags<Platform: ShimPlatform, FS: ShimFS>(
     )
 }
 
-fn set_file_descriptor_flags<Platform: ShimPlatform, FS: ShimFS>(
+fn set_file_descriptor_flags<Platform: ShimPlatform>(
     raw_fd: usize,
-    global: &GlobalState<Platform, FS>,
-    files: &FilesState<Platform, FS>,
+    global: &GlobalState<Platform>,
+    files: &FilesState<Platform>,
     flags: FileDescriptorFlags,
 ) -> Result<(), Errno> {
-    fn set_flags<Platform: ShimPlatform, FS: ShimFS, S: FdEnabledSubsystem>(
-        global: &GlobalState<Platform, FS>,
+    fn set_flags<Platform: ShimPlatform, S: FdEnabledSubsystem>(
+        global: &GlobalState<Platform>,
         fd: &TypedFd<S>,
         flags: FileDescriptorFlags,
     ) {
@@ -1350,7 +1352,7 @@ fn set_file_descriptor_flags<Platform: ShimPlatform, FS: ShimFS>(
     Ok(())
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     /// Get the file status of `pathname`.
     ///
     /// The `pathname` must be absolute.
@@ -1731,7 +1733,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `pipe2`
     pub fn sys_pipe2(&self, flags: OFlags) -> Result<(u32, u32), Errno> {
         let super::pipe::LinuxPipeEnds { reader, writer } = self.global.create_linux_pipe(flags)?;
@@ -1824,7 +1826,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
-    fn is_stdio(&self, fs: &FS, fd: &TypedFd<FS>) -> Result<bool, Errno> {
+    fn is_stdio(&self, fs: &LinuxFS<Platform>, fd: &FileFd<Platform>) -> Result<bool, Errno> {
         match fs.fd_file_status(fd) {
             Ok(status) => {
                 // See https://www.kernel.org/doc/Documentation/admin-guide/devices.txt
@@ -2011,7 +2013,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         let epoll_file = super::epoll::EpollFile::new();
         let mut dt = self.global.litebox.descriptor_table_mut();
-        let typed = dt.insert::<super::epoll::EpollSubsystem<Platform, FS>>(epoll_file);
+        let typed = dt.insert::<super::epoll::EpollSubsystem<Platform>>(epoll_file);
         if flags.contains(EpollCreateFlags::EPOLL_CLOEXEC) {
             let old = dt.set_fd_metadata(&typed, FileDescriptorFlags::FD_CLOEXEC);
             assert!(old.is_none());
@@ -2052,7 +2054,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let epoll_fd = files
             .raw_descriptor_store
             .read()
-            .fd_from_raw_integer::<super::epoll::EpollSubsystem<Platform, FS>>(epfd as usize)
+            .fd_from_raw_integer::<super::epoll::EpollSubsystem<Platform>>(epfd as usize)
             .map_err(|_| Errno::EBADF)?;
         let file_descriptor = super::epoll::EpollDescriptor::try_from(&files, fd as usize)?;
 
@@ -2105,7 +2107,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 let Ok(fd) = files
                     .raw_descriptor_store
                     .read()
-                    .fd_from_raw_integer::<crate::syscalls::epoll::EpollSubsystem<Platform, FS>>(
+                    .fd_from_raw_integer::<crate::syscalls::epoll::EpollSubsystem<Platform>>(
                     raw_fd,
                 ) else {
                     return Err(Errno::EBADF);
@@ -2373,9 +2375,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         flags: OFlags,
         target: DupFdRequest,
     ) -> Result<usize, DupFdError> {
-        fn dup<Platform: ShimPlatform, FS: ShimFS, S: FdEnabledSubsystem>(
-            task: &Task<Platform, FS>,
-            files: &FilesState<Platform, FS>,
+        fn dup<Platform: ShimPlatform, S: FdEnabledSubsystem>(
+            task: &Task<Platform>,
+            files: &FilesState<Platform>,
             fd: &TypedFd<S>,
             close_on_exec: bool,
             target: DupFdRequest,
@@ -2519,7 +2521,7 @@ struct Diroff(usize);
 const DIRENT_STRUCT_BYTES_WITHOUT_NAME: usize =
     core::mem::offset_of!(litebox_common_linux::LinuxDirent64, __name);
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `getdents64`
     pub(crate) fn sys_getdirent64(
         &self,

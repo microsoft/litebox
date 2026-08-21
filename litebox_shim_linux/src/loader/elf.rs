@@ -18,17 +18,17 @@ use crate::{
 };
 
 use super::stack::UserStack;
-use crate::{ShimFS, ShimPlatform, Task};
+use crate::{ShimPlatform, Task};
 
 // An opened elf file
-struct ElfFile<'a, Platform: ShimPlatform, FS: ShimFS> {
-    task: &'a Task<Platform, FS>,
+struct ElfFile<'a, Platform: ShimPlatform> {
+    task: &'a Task<Platform>,
     fd: i32,
     load_high: bool,
 }
 
-impl<'a, Platform: ShimPlatform, FS: ShimFS> ElfFile<'a, Platform, FS> {
-    fn new(task: &'a Task<Platform, FS>, path: impl litebox::path::Arg) -> Result<Self, Errno> {
+impl<'a, Platform: ShimPlatform> ElfFile<'a, Platform> {
+    fn new(task: &'a Task<Platform>, path: impl litebox::path::Arg) -> Result<Self, Errno> {
         let fd = task
             .sys_open(path, OFlags::RDONLY, Mode::empty())?
             .reinterpret_as_signed();
@@ -40,15 +40,13 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> ElfFile<'a, Platform, FS> {
     }
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Drop for ElfFile<'_, Platform, FS> {
+impl<Platform: ShimPlatform> Drop for ElfFile<'_, Platform> {
     fn drop(&mut self) {
         self.task.sys_close(self.fd).expect("failed to close fd");
     }
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> litebox_common_linux::loader::ReadAt
-    for &'_ ElfFile<'_, Platform, FS>
-{
+impl<Platform: ShimPlatform> litebox_common_linux::loader::ReadAt for &'_ ElfFile<'_, Platform> {
     type Error = Errno;
 
     fn read_at(&mut self, mut offset: u64, mut buf: &mut [u8]) -> Result<(), Self::Error> {
@@ -74,9 +72,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox_common_linux::loader::ReadAt
     }
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> litebox_common_linux::loader::MapMemory
-    for ElfFile<'_, Platform, FS>
-{
+impl<Platform: ShimPlatform> litebox_common_linux::loader::MapMemory for ElfFile<'_, Platform> {
     type Error = Errno;
 
     fn reserve(&mut self, len: usize, align: usize) -> Result<usize, Self::Error> {
@@ -181,20 +177,20 @@ pub struct ElfLoadInfo {
 }
 
 /// Loader for ELF files
-pub(crate) struct ElfLoader<'a, Platform: ShimPlatform, FS: ShimFS> {
+pub(crate) struct ElfLoader<'a, Platform: ShimPlatform> {
     path: &'a str,
-    main: FileAndParsed<'a, Platform, FS>,
-    interp: Option<FileAndParsed<'a, Platform, FS>>,
+    main: FileAndParsed<'a, Platform>,
+    interp: Option<FileAndParsed<'a, Platform>>,
 }
 
-struct FileAndParsed<'a, Platform: ShimPlatform, FS: ShimFS> {
-    file: ElfFile<'a, Platform, FS>,
+struct FileAndParsed<'a, Platform: ShimPlatform> {
+    file: ElfFile<'a, Platform>,
     parsed: ElfParsedFile,
 }
 
-impl<'a, Platform: ShimPlatform, FS: ShimFS> FileAndParsed<'a, Platform, FS> {
+impl<'a, Platform: ShimPlatform> FileAndParsed<'a, Platform> {
     fn new(
-        task: &'a Task<Platform, FS>,
+        task: &'a Task<Platform>,
         path: impl litebox::path::Arg,
     ) -> Result<Self, ElfLoaderError> {
         let file = ElfFile::new(task, path).map_err(ElfLoaderError::OpenError)?;
@@ -239,9 +235,9 @@ impl<'a, Platform: ShimPlatform, FS: ShimFS> FileAndParsed<'a, Platform, FS> {
     }
 }
 
-impl<'a, Platform: ShimPlatform, FS: ShimFS> ElfLoader<'a, Platform, FS> {
+impl<'a, Platform: ShimPlatform> ElfLoader<'a, Platform> {
     /// Parses an ELF file from the given path.
-    pub fn new(task: &'a Task<Platform, FS>, path: &'a str) -> Result<Self, ElfLoaderError> {
+    pub fn new(task: &'a Task<Platform>, path: &'a str) -> Result<Self, ElfLoaderError> {
         // Parse the main ELF file.
         let main = FileAndParsed::new(task, path)?;
 
@@ -477,11 +473,7 @@ mod tests {
         buf
     }
 
-    fn write_file(
-        task: &Task<TestPlatform, crate::DefaultFS<TestPlatform>>,
-        path: &str,
-        data: &[u8],
-    ) {
+    fn write_file(task: &Task<TestPlatform>, path: &str, data: &[u8]) {
         let fd = task
             .sys_open(path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
             .expect("failed to create test ELF");

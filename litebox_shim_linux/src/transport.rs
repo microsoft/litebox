@@ -12,23 +12,27 @@ use litebox::net::{ReceiveFlags, SendFlags};
 use litebox_common_linux::{SockFlags, SockType, errno::Errno};
 
 use crate::syscalls::net::SocketFd;
-use crate::{GlobalState, ShimFS, ShimPlatform};
+use crate::{GlobalState, ShimPlatform};
 
-/// Handles socket cleanup on drop without exposing the `FS` generic.
+/// Handles socket cleanup on drop without exposing the concrete socket/global-state types.
 ///
 /// This is stored as `Box<dyn DropGuard>` inside [`ShimTransport`] so that the
-/// transport itself does not need to be generic over `FS`.
+/// transport itself does not need to name them.
+// XXX: this erasure only existed to hide the old `FS` generic. Now that `SocketDropGuard`'s fields
+// are nameable from `Platform` alone, we could inline them into [`ShimTransport`] and drop this
+// trait. However, this `DropGuard` _may_ be worth keeping if a future non-socket backing (shared
+// memory, ...) needs to share `ShimTransport`.
 trait DropGuard: Send + Sync {
     fn close(&mut self);
 }
 
 /// Concrete, generic implementation of [`DropGuard`].
-struct SocketDropGuard<Platform: ShimPlatform, FS: ShimFS> {
-    global: Arc<GlobalState<Platform, FS>>,
+struct SocketDropGuard<Platform: ShimPlatform> {
+    global: Arc<GlobalState<Platform>>,
     sockfd: SocketFd<Platform>,
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> DropGuard for SocketDropGuard<Platform, FS> {
+impl<Platform: ShimPlatform> DropGuard for SocketDropGuard<Platform> {
     fn close(&mut self) {
         let _ = self
             .global
@@ -62,8 +66,8 @@ impl<Platform: ShimPlatform> ShimTransport<Platform> {
     ///
     /// Connection and all subsequent I/O use the [`NetworkProxy`] directly,
     /// spin-polling when the operation cannot complete immediately.
-    pub(crate) fn connect<FS: ShimFS>(
-        global: Arc<GlobalState<Platform, FS>>,
+    pub(crate) fn connect(
+        global: Arc<GlobalState<Platform>>,
         addr: core::net::SocketAddr,
     ) -> Result<Self, Errno> {
         // 1. Create the raw socket.
@@ -143,7 +147,7 @@ mod tests {
 
     use litebox::fs::nine_p::NineP;
     use litebox::fs::resolver::Resolver;
-    use litebox::fs::{FileSystem as _, Mode, OFlags};
+    use litebox::fs::{Mode, OFlags};
 
     use crate::syscalls::tests::init_platform;
 
@@ -259,10 +263,7 @@ mod tests {
     }
 
     fn connect_9p(
-        task: &crate::Task<
-            crate::syscalls::tests::TestPlatform,
-            crate::DefaultFS<crate::syscalls::tests::TestPlatform>,
-        >,
+        task: &crate::Task<crate::syscalls::tests::TestPlatform>,
         server: &DiodServer,
     ) -> Resolver<crate::syscalls::tests::TestPlatform, litebox::fs::composer::Composer> {
         let addr = socket_addr([10, 0, 0, 1], server.port);

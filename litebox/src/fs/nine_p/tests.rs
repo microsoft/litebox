@@ -14,7 +14,7 @@ use crate::fs::errors::{
 };
 use crate::fs::inode_allocator::InodeAllocator;
 use crate::fs::resolver::Resolver;
-use crate::fs::{FileSystem as _, Mode, OFlags};
+use crate::fs::{Mode, OFlags};
 use crate::platform::mock::MockPlatform;
 
 use super::{NineP, transport};
@@ -514,7 +514,7 @@ impl transport::Write for BrokenTransport {
     }
 }
 
-/// Helper: connect to a diod server and build a `FileSystem` backed by
+/// Helper: connect to a diod server and build a `Resolver` backed by
 /// `BrokenTransport` that will break after `allowed_writes` write calls.
 ///
 /// The version handshake and attach each consume one write, so
