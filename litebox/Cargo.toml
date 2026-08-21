@@ -3,6 +3,9 @@ name = "litebox"
 version = "0.1.0"
 edition = "2024"
 
+[package.metadata.verus]
+verify = true
+
 [dependencies]
 arrayvec = { version = "0.7.6", default-features = false, optional = true }
 bitflags = "2.13.1"
@@ -20,6 +23,8 @@ buddy_system_allocator = { version = "0.11.0", default-features = false, feature
 # Depend on (currently unreleased) slabmalloc `main`, which contains some fixes on top of `0.11.0`
 slabmalloc = { git = "https://github.com/gz/rust-slabmalloc.git", rev = "19480b2e82704210abafe575fb9699184c1be110" }
 litebox_util_log = { version = "0.1.0", path = "../litebox_util_log" }
+true-tales = { path = "../dev_tools/true-tales", optional = true }
+vstd = { version = "=0.0.0-2026-08-02-0125", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60.2", features = [
@@ -34,6 +39,10 @@ windows-sys = { version = "0.60.2", features = [
 lock_tracing = ["dep:arrayvec", "spin/mutex"]
 panic_on_unclosed_fd_drop = []
 enforce_singleton_litebox_instance = []
+foreign_memory = ["dep:true-tales", "dep:vstd"]
+verify = ["foreign_memory"]
+modeled_backend = ["foreign_memory"]
+loom = ["modeled_backend"]
 
 [lints]
 workspace = true

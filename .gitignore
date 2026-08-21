@@ -197,3 +197,7 @@ dev_bench/unixbench/*.zip
 ### Direnv ###
 .direnv
 .envrc
+
+## Nix result symlinks
+result
+result-*
