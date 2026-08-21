@@ -2302,6 +2302,17 @@ fn is_synchronous_memory_fault(signum: libc::c_int, code: libc::c_int) -> bool {
 }
 
 #[cfg(target_arch = "aarch64")]
+fn gate_interruption(signum: libc::c_int, code: libc::c_int) -> GateInterruption {
+    if is_synchronous_memory_fault(signum, code) {
+        GateInterruption::Synchronous
+    } else if signum == libc::SIGTRAP && code == libc::TRAP_BRKPT {
+        GateInterruption::Breakpoint
+    } else {
+        GateInterruption::Asynchronous
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
 fn signal_exception_fixup(signum: libc::c_int, code: libc::c_int, pc: usize) -> Option<usize> {
     is_synchronous_memory_fault(signum, code)
         .then(|| litebox::mm::exception_table::search_exception_tables(pc))
@@ -2382,26 +2393,34 @@ unsafe extern "C" fn exception_signal_handler(
     #[cfg(target_arch = "x86_64")]
     copy_signal_context(unsafe { &mut *regs }, context);
     #[cfg(target_arch = "aarch64")]
-    let interruption = if is_synchronous_memory_fault(signum, info.si_code) {
-        GateInterruption::Synchronous
-    } else {
-        GateInterruption::Asynchronous
-    };
-    #[cfg(target_arch = "aarch64")]
-    match canonicalize_runtime_aarch64_gate_signal_context(context, unsafe { &*regs }, interruption)
     {
-        Aarch64GateSignalResult::NotGate => copy_signal_context(unsafe { &mut *regs }, context),
-        Aarch64GateSignalResult::Canonicalized(canonical) => unsafe { regs.write(canonical) },
-        Aarch64GateSignalResult::PreserveSavedContext => {
-            // The register values are already the guest's; only the syscall
-            // bookkeeping is stale. The stub runs after `syscall_callback`
-            // recorded a number, so leaving it would tell the shim a syscall is
-            // in flight during an exception or an interrupt -- the same reason
-            // `copy_signal_context` clears it on every other path.
-            unsafe { (*regs).syscallno = litebox_common_linux::arch::NO_SYSCALL };
+        let interruption = gate_interruption(signum, info.si_code);
+        let mut resume_guest = false;
+        match canonicalize_runtime_aarch64_gate_signal_context(
+            context,
+            unsafe { &*regs },
+            interruption,
+        ) {
+            Aarch64GateSignalResult::NotGate => copy_signal_context(unsafe { &mut *regs }, context),
+            Aarch64GateSignalResult::Canonicalized(canonical) => unsafe { regs.write(canonical) },
+            Aarch64GateSignalResult::ResumeGuest(canonical) => {
+                unsafe { regs.write(canonical) };
+                resume_guest = true;
+            }
+            Aarch64GateSignalResult::PreserveSavedContext => {
+                // The saved registers are already authoritative, but the
+                // outbound stub retains the completed syscall number. Clear it
+                // before exposing this context to exception handling.
+                unsafe { (*regs).syscallno = litebox_common_linux::arch::NO_SYSCALL };
+            }
+            Aarch64GateSignalResult::InvalidRuntimeState => {
+                fatal_aarch64_gate_runtime_state();
+            }
         }
-        Aarch64GateSignalResult::InvalidRuntimeState => {
-            fatal_aarch64_gate_runtime_state();
+
+        if resume_guest {
+            set_signal_return(context, interrupt_callback, 0, 0, 0, 0);
+            return;
         }
     }
 
@@ -2685,7 +2704,8 @@ unsafe fn interrupt_signal_handler(
             GateInterruption::Asynchronous,
         ) {
             Aarch64GateSignalResult::NotGate => copy_signal_context(unsafe { &mut *regs }, context),
-            Aarch64GateSignalResult::Canonicalized(canonical) => unsafe { regs.write(canonical) },
+            Aarch64GateSignalResult::Canonicalized(canonical)
+            | Aarch64GateSignalResult::ResumeGuest(canonical) => unsafe { regs.write(canonical) },
             Aarch64GateSignalResult::PreserveSavedContext => {
                 // The outbound path preserves registers but leaves stale syscall state.
                 unsafe { (*regs).syscallno = litebox_common_linux::arch::NO_SYSCALL };

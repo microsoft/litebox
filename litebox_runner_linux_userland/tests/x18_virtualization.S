@@ -54,6 +54,40 @@ _start:
     cmn x1, #1
     b.ne fail
 
+    mov x27, #14
+    adr x18, br_x18_target
+    br x18
+    b fail
+br_x18_target:
+    adr x0, br_x18_target
+    cmp x18, x0
+    b.ne fail
+    cmp sp, x19
+    b.ne fail
+    cmp x30, x20
+    b.ne fail
+    mov x0, #0x1616
+    cmp x16, x0
+    b.ne fail
+    mov x0, #0x1717
+    cmp x17, x0
+    b.ne fail
+
+    adr x18, blr_x18_target
+    blr x18
+blr_x18_return:
+    adr x0, blr_x18_return
+    cmp x30, x0
+    b.ne fail
+    b indirect_x18_done
+blr_x18_target:
+    adr x0, blr_x18_target
+    cmp x18, x0
+    b.ne fail
+    mov x18, x30
+    ret x18
+indirect_x18_done:
+    mov x27, #11
     adr x18, adr_value
     ldr x0, [x18]
     cmp x0, #0x44

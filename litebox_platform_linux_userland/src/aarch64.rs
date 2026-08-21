@@ -14,7 +14,7 @@ use litebox_syscall_rewriter::aarch64::{
 #[cfg(feature = "aarch64_virtualize_x18")]
 use litebox_syscall_rewriter::aarch64::{
     X18_FRAME_BYTES, X18AdrOffset, X18CompareBranchOffset, X18FrameState, X18GateOffset, X18Resume,
-    X18ValueSource,
+    X18ValueSource, x18_branch_recovery_plan,
 };
 
 /// Overwrites the destination with the TLS control-block address derived from
@@ -1167,6 +1167,14 @@ pub(super) fn sync_instruction_stream(range: core::ops::Range<usize>) {
 pub(super) enum Aarch64GateSignalResult {
     NotGate,
     Canonicalized(litebox_common_linux::PtRegs),
+    #[cfg_attr(
+        not(feature = "aarch64_virtualize_x18"),
+        expect(
+            dead_code,
+            reason = "only the x18 indirect-branch gate resumes the guest transparently"
+        )
+    )]
+    ResumeGuest(litebox_common_linux::PtRegs),
     PreserveSavedContext,
     InvalidRuntimeState,
 }
@@ -1175,6 +1183,8 @@ pub(super) enum Aarch64GateSignalResult {
 pub(super) enum GateInterruption {
     /// A hardware fault attributed to the current gate instruction.
     Synchronous,
+    /// A synchronous breakpoint caused by the current gate instruction.
+    Breakpoint,
     /// An independently delivered signal interrupting the gate.
     Asynchronous,
 }
@@ -1231,7 +1241,7 @@ fn apply_x18_recovery(
     restored_registers: Option<[usize; 2]>,
     guest_sp: usize,
     guest_x18: usize,
-    resume_pc: Option<usize>,
+    resume_pc: usize,
 ) {
     if let Some([saved_scratch, saved_anchor]) = restored_registers {
         canonical.regs[usize::from(scratch)] = saved_scratch;
@@ -1239,9 +1249,22 @@ fn apply_x18_recovery(
     }
     canonical.sp = guest_sp;
     canonical.regs[18] = guest_x18;
-    if let Some(resume_pc) = resume_pc {
-        canonical.pc = resume_pc;
-    }
+    canonical.pc = resume_pc;
+}
+
+#[cfg(feature = "aarch64_virtualize_x18")]
+fn resolve_x18_recovery_pc(
+    resume: X18Resume,
+    site: usize,
+    guest_x18: usize,
+    conditional_target: Option<u64>,
+) -> Option<usize> {
+    Some(match resume {
+        X18Resume::Original => site,
+        X18Resume::Next => site.wrapping_add(4),
+        X18Resume::TakenTarget => conditional_target?.trunc(),
+        X18Resume::LogicalX18 => guest_x18,
+    })
 }
 
 /// Recognizes and canonicalizes an interrupted compact gate using only bounded,
@@ -1543,6 +1566,10 @@ fn canonicalize_aarch64_gate_signal_context_with_kind(
                     value
                 }
             };
+            let Some(resume_pc) = resolve_x18_recovery_pc(plan.resume, site, guest_x18, None)
+            else {
+                return Aarch64GateSignalResult::InvalidRuntimeState;
+            };
             apply_x18_recovery(
                 &mut canonical,
                 scratch,
@@ -1550,7 +1577,7 @@ fn canonicalize_aarch64_gate_signal_context_with_kind(
                 restored_registers,
                 guest_sp,
                 guest_x18,
-                (plan.resume == X18Resume::Next).then_some(site + 4),
+                resume_pc,
             );
         }
         #[cfg(feature = "aarch64_virtualize_x18")]
@@ -1578,15 +1605,10 @@ fn canonicalize_aarch64_gate_signal_context_with_kind(
             ) else {
                 return Aarch64GateSignalResult::InvalidRuntimeState;
             };
-            let resume_pc = match plan.resume {
-                X18Resume::Original => None,
-                X18Resume::Next => Some(site + 4),
-                X18Resume::TakenTarget => {
-                    let Some(target) = gate.conditional_target() else {
-                        return Aarch64GateSignalResult::NotGate;
-                    };
-                    Some(target.trunc())
-                }
+            let Some(resume_pc) =
+                resolve_x18_recovery_pc(plan.resume, site, guest_x18, gate.conditional_target())
+            else {
+                return Aarch64GateSignalResult::NotGate;
             };
             apply_x18_recovery(
                 &mut canonical,
@@ -1629,6 +1651,10 @@ fn canonicalize_aarch64_gate_signal_context_with_kind(
                     value
                 }
             };
+            let Some(resume_pc) = resolve_x18_recovery_pc(plan.resume, site, guest_x18, None)
+            else {
+                return Aarch64GateSignalResult::InvalidRuntimeState;
+            };
             apply_x18_recovery(
                 &mut canonical,
                 scratch,
@@ -1636,13 +1662,47 @@ fn canonicalize_aarch64_gate_signal_context_with_kind(
                 restored_registers,
                 guest_sp,
                 guest_x18,
-                (plan.resume == X18Resume::Next).then_some(site + 4),
+                resume_pc,
             );
+        }
+        #[cfg(feature = "aarch64_virtualize_x18")]
+        GateMetadata::X18Branch { kind } => {
+            let Some(plan) = x18_branch_recovery_plan(offset) else {
+                return Aarch64GateSignalResult::InvalidRuntimeState;
+            };
+            if plan.frame != X18FrameState::Absent
+                || plan.value != X18ValueSource::Slot
+                || plan.resume != X18Resume::LogicalX18
+                || plan.runtime_access != RuntimeAccess::NoAccess
+            {
+                return Aarch64GateSignalResult::InvalidRuntimeState;
+            }
+            let Some(guest_x18) = read_usize(
+                &mut read,
+                runtime.guest_thread_pointer_addr
+                    + litebox_syscall_rewriter::aarch64::GUEST_X18_OFFSET_FROM_GUEST_TP,
+            ) else {
+                return Aarch64GateSignalResult::InvalidRuntimeState;
+            };
+            canonical.regs[18] = guest_x18;
+            if interruption == GateInterruption::Breakpoint {
+                if kind.writes_link_register() {
+                    canonical.regs[30] = site.wrapping_add(4);
+                }
+                let Some(resume_pc) = resolve_x18_recovery_pc(plan.resume, site, guest_x18, None)
+                else {
+                    return Aarch64GateSignalResult::InvalidRuntimeState;
+                };
+                canonical.pc = resume_pc;
+                canonical.orig_x0 = canonical.regs[0];
+                return Aarch64GateSignalResult::ResumeGuest(canonical);
+            }
         }
         #[cfg(not(feature = "aarch64_virtualize_x18"))]
         GateMetadata::X18 { .. }
         | GateMetadata::X18CompareBranch { .. }
-        | GateMetadata::X18Adr { .. } => return Aarch64GateSignalResult::NotGate,
+        | GateMetadata::X18Adr { .. }
+        | GateMetadata::X18Branch { .. } => return Aarch64GateSignalResult::NotGate,
     }
     canonical.orig_x0 = canonical.regs[0];
     Aarch64GateSignalResult::Canonicalized(canonical)
@@ -2399,6 +2459,126 @@ mod tests {
             fixture_reader(&code, &trampoline, &[], &[0; 16]),
         );
         assert!(matches!(result, Aarch64GateSignalResult::NotGate));
+    }
+
+    #[test]
+    #[cfg(feature = "aarch64_virtualize_x18")]
+    fn indirect_x18_gates_resume_with_the_expected_link_register() {
+        const SITE: usize = 0x1000;
+        const SLOT: usize = 0x400010;
+        const LOGICAL_X18: usize = 0x1234_5678_9abc_def0;
+        let options = litebox_syscall_rewriter::RewriteOptions::new(
+            litebox_syscall_rewriter::TargetHost::Linux,
+            true,
+        );
+        for (word, name, writes_link) in [
+            (0xd61f_0240u32, "BR X18", false),
+            (0xd63f_0240, "BLR X18", true),
+            (0xd65f_0240, "RET X18", false),
+        ] {
+            let mut code = word.to_le_bytes().to_vec();
+            let (trampoline, trapped) = litebox_syscall_rewriter::patch_code_segment_with_options(
+                &mut code,
+                SITE as u64,
+                0x400000,
+                0,
+                options,
+            )
+            .unwrap();
+            assert!(trapped.is_empty());
+
+            let mut context: libc::ucontext_t = unsafe { core::mem::zeroed() };
+            for (index, reg) in context.uc_mcontext.regs.iter_mut().enumerate() {
+                *reg = 0xfeed_0000_0000_0000 | index as u64;
+            }
+            context.uc_mcontext.pc = SLOT as u64;
+            context.uc_mcontext.sp = 0x8000;
+            context.uc_mcontext.pstate = 0xa000_0000;
+            let saved = PtRegs::default();
+            let mut slots = [0u8; 16];
+            slots[8..].copy_from_slice(&LOGICAL_X18.to_ne_bytes());
+
+            let result = canonicalize_aarch64_gate_signal_context_with_kind(
+                &context,
+                &saved,
+                GateRuntimeState {
+                    guest_thread_pointer_addr: 0x500000,
+                    expected_outbound_stub: 0,
+                    expected_outbound_pc: 0,
+                },
+                GateInterruption::Breakpoint,
+                fixture_reader(&code, &trampoline, &[], &slots),
+            );
+            let Aarch64GateSignalResult::ResumeGuest(regs) = result else {
+                panic!("{name} trap gate did not request a transparent resume");
+            };
+            let mut expected = expected_signal_regs(&saved, &context);
+            expected.pc = LOGICAL_X18;
+            expected.regs[18] = LOGICAL_X18;
+            if writes_link {
+                expected.regs[30] = SITE + 4;
+            }
+            assert_ptregs_eq(&regs, &expected, name);
+
+            let result = canonicalize_aarch64_gate_signal_context(
+                &context,
+                &saved,
+                0x500000,
+                0,
+                0,
+                fixture_reader(&code, &trampoline, &[], &slots),
+            );
+            let Aarch64GateSignalResult::Canonicalized(regs) = result else {
+                panic!("asynchronous signal at {name} gate did not retry the guest branch");
+            };
+            assert_eq!(regs.pc, SITE);
+            assert_eq!(regs.regs[18], LOGICAL_X18);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "aarch64_virtualize_x18")]
+    fn breakpoint_at_ordinary_x18_gate_uses_normal_recovery() {
+        const SITE: usize = 0x1000;
+        const SLOT: usize = 0x400010;
+        const LOGICAL_X18: usize = 0x1818;
+        let options = litebox_syscall_rewriter::RewriteOptions::new(
+            litebox_syscall_rewriter::TargetHost::Linux,
+            true,
+        );
+        let mut code = 0xaa12_03f2u32.to_le_bytes().to_vec(); // mov x18, x18
+        let (trampoline, trapped) = litebox_syscall_rewriter::patch_code_segment_with_options(
+            &mut code,
+            SITE as u64,
+            0x400000,
+            0,
+            options,
+        )
+        .unwrap();
+        assert!(trapped.is_empty());
+        let mut context: libc::ucontext_t = unsafe { core::mem::zeroed() };
+        context.uc_mcontext.pc = SLOT as u64;
+        context.uc_mcontext.sp = 0x8000;
+        let saved = PtRegs::default();
+        let mut slots = [0u8; 16];
+        slots[8..].copy_from_slice(&LOGICAL_X18.to_ne_bytes());
+
+        let result = canonicalize_aarch64_gate_signal_context_with_kind(
+            &context,
+            &saved,
+            GateRuntimeState {
+                guest_thread_pointer_addr: 0x500000,
+                expected_outbound_stub: 0,
+                expected_outbound_pc: 0,
+            },
+            GateInterruption::Breakpoint,
+            fixture_reader(&code, &trampoline, &[], &slots),
+        );
+        let Aarch64GateSignalResult::Canonicalized(regs) = result else {
+            panic!("breakpoint changed ordinary x18 gate recovery");
+        };
+        assert_eq!(regs.pc, SITE);
+        assert_eq!(regs.regs[18], LOGICAL_X18);
     }
 
     #[test]

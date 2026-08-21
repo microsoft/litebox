@@ -104,10 +104,10 @@
 //! ## Guest x18 limits
 //!
 //! X18 virtualization handles ordinary register substitutions, `CBZ`/`CBNZ`,
-//! `TBZ`/`TBNZ`, `ADC`/`SBC`, `UDIV`/`SDIV`, and `ADR`/`ADRP` forms required by
-//! the supported workloads. Other unsupported decoder layouts, other PC-relative
-//! forms, and indirect control flow through x18 reject AOT rewriting and become
-//! traps during runtime rewriting.
+//! `TBZ`/`TBNZ`, `ADC`/`SBC`, `UDIV`/`SDIV`, `ADR`/`ADRP`, and unauthenticated
+//! `BR`/`BLR`/`RET` through x18. Other unsupported decoder layouts, other
+//! PC-relative forms, and authenticated control flow through x18 reject AOT
+//! rewriting and become traps during runtime rewriting.
 
 use alloc::format;
 use alloc::string::ToString as _;
@@ -399,6 +399,8 @@ const MRS_TPIDR_EL0_BITS: u32 = 0xD53B_D040;
 /// TODO: recognize this immediate in the runtime, to tell a rewriter trap from
 /// a guest breakpoint.
 const TRAP_BRK_IMM: u16 = 0xB10B;
+/// `BRK` immediate used by the transparent `BR X18` trap gate.
+const X18_BRANCH_BRK_IMM: u16 = 0xB18;
 
 /// Alignment every emitted gate slot starts on.
 pub const GATE_ALIGNMENT: usize = 16;
@@ -414,8 +416,10 @@ const X18_SLOT_BYTES: usize = 48;
 const X18_COMPARE_BRANCH_SLOT_BYTES: usize = 48;
 /// Byte size of a self-contained `ADR X18` gate slot.
 const X18_ADR_SLOT_BYTES: usize = 32;
+/// Byte size of a terminal `BR X18` trap gate slot.
+const X18_BRANCH_SLOT_BYTES: usize = 16;
 /// Distinct compact-slot sizes probed by classifiers and finalizers. Metadata
-/// distinguishes gate kinds that share the 48-byte size.
+/// distinguishes gate kinds that share a slot size.
 pub const GATE_SLOT_SIZES: [usize; 4] = [
     MRS_SLOT_BYTES,
     X18_ADR_SLOT_BYTES,
@@ -450,6 +454,7 @@ enum GateKind {
     X18 = 3,
     X18CompareBranch = 4,
     X18Adr = 5,
+    X18Branch = 6,
 }
 
 impl GateKind {
@@ -465,6 +470,7 @@ impl GateKind {
             Self::X18,
             Self::X18CompareBranch,
             Self::X18Adr,
+            Self::X18Branch,
         ]
         .into_iter()
         .find(|kind| kind.bits() == bits)
@@ -509,6 +515,22 @@ pub enum GateMetadata {
         /// Scratch register receiving the absolute address.
         scratch: u8,
     },
+    /// An indirect branch through logical x18 emulated by the exception handler.
+    X18Branch { kind: X18IndirectBranchKind },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum X18IndirectBranchKind {
+    Br = 0,
+    Blr = 1,
+    Ret = 2,
+}
+
+impl X18IndirectBranchKind {
+    pub const fn writes_link_register(self) -> bool {
+        matches!(self, Self::Blr)
+    }
 }
 
 #[repr(transparent)]
@@ -527,6 +549,7 @@ impl EncodedGateMetadata {
             GateMetadata::X18 { scratch } => (GateKind::X18, scratch),
             GateMetadata::X18CompareBranch { scratch } => (GateKind::X18CompareBranch, scratch),
             GateMetadata::X18Adr { scratch } => (GateKind::X18Adr, scratch),
+            GateMetadata::X18Branch { kind } => (GateKind::X18Branch, kind as u8),
         };
         if register > MAX_REGISTER {
             return None;
@@ -565,6 +588,14 @@ impl EncodedGateMetadata {
                 Some(GateMetadata::X18CompareBranch { scratch: register })
             }
             GateKind::X18Adr if register != XZR => Some(GateMetadata::X18Adr { scratch: register }),
+            GateKind::X18Branch => Some(GateMetadata::X18Branch {
+                kind: match register {
+                    0 => X18IndirectBranchKind::Br,
+                    1 => X18IndirectBranchKind::Blr,
+                    2 => X18IndirectBranchKind::Ret,
+                    _ => return None,
+                },
+            }),
             _ => None,
         }
     }
@@ -591,6 +622,7 @@ const X18: u16 = 18;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum X18Classification {
     None,
+    Branch(X18IndirectBranchKind),
     X18(X18TransformResult),
 }
 
@@ -884,6 +916,16 @@ fn classify_decoded_x18(instruction: &DecodedInstruction) -> DecodedX18Classific
 }
 
 fn classify_x18(word: u32) -> X18Classification {
+    if let Some(kind) = [
+        (Insn::Br(18), X18IndirectBranchKind::Br),
+        (Insn::Blr(18), X18IndirectBranchKind::Blr),
+        (Insn::Ret(18), X18IndirectBranchKind::Ret),
+    ]
+    .into_iter()
+    .find_map(|(instruction, kind)| (instruction.encode() == Some(word)).then_some(kind))
+    {
+        return X18Classification::Branch(kind);
+    }
     // yaxpeax-arm 0.4.0 truncates the five-bit Rt field of MSR (register).
     // Check the architectural encoding so an X18 source cannot fail open.
     if word & 0xFFF0_001F == 0xD510_0012 {
@@ -1255,6 +1297,7 @@ pub enum X18Resume {
     Original,
     Next,
     TakenTarget,
+    LogicalX18,
 }
 
 /// Host-neutral recovery semantics derived from an emitted x18 gate boundary.
@@ -1512,6 +1555,23 @@ impl X18AdrOffset {
             Self::Return => X18RecoveryPlan::new(Absent, Slot, Next, NoAccess),
             Self::ExecutableEnd => return None,
         })
+    }
+}
+
+const X18_BRANCH_PROVENANCE_OFFSET: usize = 4;
+
+/// Returns recovery semantics for an executable instruction boundary in the
+/// persisted unauthenticated x18 indirect-branch trap gate.
+pub const fn x18_branch_recovery_plan(offset: usize) -> Option<X18RecoveryPlan> {
+    if offset == 0 {
+        Some(X18RecoveryPlan::new(
+            X18FrameState::Absent,
+            X18ValueSource::Slot,
+            X18Resume::LogicalX18,
+            RuntimeAccess::NoAccess,
+        ))
+    } else {
+        None
     }
 }
 
@@ -1990,6 +2050,8 @@ enum Opcode {
     Adr = 0x1000_0000,
     Adrp = 0x9000_0000,
     Br = 0xD61F_0000,
+    Blr = 0xD63F_0000,
+    Ret = 0xD65F_0000,
     Movz = 0xD280_0000,
     SubImm = 0xD100_0000,
     AddImm = 0x9100_0000,
@@ -2139,6 +2201,10 @@ enum Insn {
     },
     /// `BR Xn` (branch to register).
     Br(u8),
+    /// `BLR Xn` (branch with link to register).
+    Blr(u8),
+    /// `RET Xn` (return to register).
+    Ret(u8),
     /// `MOVZ Xd, #imm16`.
     Movz {
         rd: u8,
@@ -2245,6 +2311,8 @@ impl Insn {
             Insn::Adrp { rd, page_off } => pcrel_imm21(Opcode::Adrp, rd, page_off),
             Insn::LdrLiteral { rt, off } => pcrel_imm19(Opcode::LdrLiteral, off, u32::from(rt)),
             Insn::Br(rn) => Some(Opcode::Br.bits() | (u32::from(rn) << RN_SHIFT)),
+            Insn::Blr(rn) => Some(Opcode::Blr.bits() | (u32::from(rn) << RN_SHIFT)),
+            Insn::Ret(rn) => Some(Opcode::Ret.bits() | (u32::from(rn) << RN_SHIFT)),
             Insn::Movz { rd, imm16 } => {
                 Some(Opcode::Movz.bits() | (u32::from(imm16) << RN_SHIFT) | u32::from(rd))
             }
@@ -2397,6 +2465,8 @@ enum PatchKind {
     X18CompareBranch(X18CompareBranch),
     /// An `ADR X18` with its original absolute target.
     X18Adr(X18Adr),
+    /// A terminal indirect branch through logical x18.
+    X18Branch(X18IndirectBranchKind),
 }
 
 /// Scans executable sections for Linux syscall/thread-pointer gates and, when
@@ -2531,6 +2601,7 @@ fn find_patch_sites_with_code_ranges(
                 } else {
                     match classify_x18(insn) {
                         X18Classification::None => continue,
+                        X18Classification::Branch(branch) => PatchKind::X18Branch(branch),
                         X18Classification::X18(result) => PatchKind::X18(result),
                     }
                 }
@@ -2540,7 +2611,10 @@ fn find_patch_sites_with_code_ranges(
             if inside_exclusive_sequence
                 && matches!(
                     kind,
-                    PatchKind::X18(_) | PatchKind::X18CompareBranch(_) | PatchKind::X18Adr(_)
+                    PatchKind::X18(_)
+                        | PatchKind::X18CompareBranch(_)
+                        | PatchKind::X18Adr(_)
+                        | PatchKind::X18Branch(_)
                 )
             {
                 return Err(Error::UnsupportedExecutable(format!(
@@ -2699,6 +2773,13 @@ pub(crate) fn hook_syscalls_aarch64_with_code_ranges(
                     site,
                     adr,
                     config.host,
+                )?,
+                PatchKind::X18Branch(branch) => emit_x18_branch_gate(
+                    &mut trampoline_data,
+                    gate_offset,
+                    trampoline_base_addr,
+                    site,
+                    branch,
                 )?,
             }
         } else {
@@ -3258,6 +3339,34 @@ fn emit_x18_adr_gate(
     Ok(GateBuild::Emitted)
 }
 
+fn emit_x18_branch_gate(
+    trampoline_data: &mut Vec<u8>,
+    gate_offset: usize,
+    trampoline_base_addr: u64,
+    site: &PatchSite,
+    branch: X18IndirectBranchKind,
+) -> Result<GateBuild> {
+    // Unlike ordinary gates, indirect x18 branches are exception-emulated
+    // because no physical scratch register can be consumed transparently.
+    let gate_vaddr = checked_add_u64(trampoline_base_addr, gate_offset as u64, "BR X18 gate")?;
+    let mut asm = Asm::new(gate_vaddr);
+    asm.emit(Insn::Brk(X18_BRANCH_BRK_IMM));
+    let return_addr = checked_add_u64(site.vaddr, INSN_BYTES_U64, "BR X18 provenance")?;
+    if !asm.branch_to(return_addr)? {
+        return Ok(GateBuild::Unreachable);
+    }
+    asm.push_word(NOP);
+    append_gate_slot(
+        trampoline_data,
+        asm.finish(),
+        trampoline_base_addr,
+        gate_vaddr,
+        GateMetadata::X18Branch { kind: branch },
+        X18_BRANCH_SLOT_BYTES,
+    )?;
+    Ok(GateBuild::Emitted)
+}
+
 fn append_gate_slot(
     trampoline_data: &mut Vec<u8>,
     mut code: Vec<u8>,
@@ -3694,6 +3803,11 @@ fn validate_gate_slot_inner_for_host(
                 )
                 && word(24) & OPCODE_TOP6_MASK == Opcode::B.bits()
         }
+        GateMetadata::X18Branch { .. } => {
+            exact(0, Insn::Brk(X18_BRANCH_BRK_IMM))
+                && word(4) & OPCODE_TOP6_MASK == Opcode::B.bits()
+                && word(8) == NOP
+        }
     }
 }
 
@@ -3707,14 +3821,15 @@ impl GateMetadata {
             GateMetadata::X18 { .. } => X18_SLOT_BYTES,
             GateMetadata::X18CompareBranch { .. } => X18_COMPARE_BRANCH_SLOT_BYTES,
             GateMetadata::X18Adr { .. } => X18_ADR_SLOT_BYTES,
+            GateMetadata::X18Branch { .. } => X18_BRANCH_SLOT_BYTES,
         }
     }
 
     /// First byte offset past the slot's executable body.
     ///
-    /// Everything from here to the trailing metadata word is `NOP` padding, so
-    /// a PC at or past it is not inside the gate proper and must not be
-    /// classified as one.
+    /// Bytes from here to the trailing metadata word are padding or recovery
+    /// data, not executed gate instructions. A PC at or past this offset must
+    /// therefore not be attributed to an interrupted gate.
     pub(crate) const fn executable_end(self) -> usize {
         match self {
             GateMetadata::Svc => SvcGateOffset::ExecutableEnd.as_usize(),
@@ -3725,6 +3840,7 @@ impl GateMetadata {
                 X18CompareBranchOffset::ExecutableEnd.as_usize()
             }
             GateMetadata::X18Adr { .. } => X18AdrOffset::ExecutableEnd.as_usize(),
+            GateMetadata::X18Branch { .. } => X18_BRANCH_PROVENANCE_OFFSET,
         }
     }
 
@@ -3740,6 +3856,7 @@ impl GateMetadata {
                 X18CompareBranchOffset::FallthroughBranch.as_usize()
             }
             GateMetadata::X18Adr { .. } => X18AdrOffset::Return.as_usize(),
+            GateMetadata::X18Branch { .. } => X18_BRANCH_PROVENANCE_OFFSET,
         }
     }
 }
@@ -3849,7 +3966,8 @@ pub fn classify_copied_gate_slot(slot: &[u8], slot_vaddr: u64, pc: u64) -> Optio
         | GateMetadata::MsrTpidr { .. }
         | GateMetadata::X18 { .. }
         | GateMetadata::X18CompareBranch { .. }
-        | GateMetadata::X18Adr { .. } => 0,
+        | GateMetadata::X18Adr { .. }
+        | GateMetadata::X18Branch { .. } => 0,
     };
     // For `Svc` the base was just recovered from the slot's own literal load,
     // so `validate_gate_slot`'s callback check is a tautology here. The other
@@ -4327,6 +4445,7 @@ fn validate_trampoline_and_collect_offsets(
             GateMetadata::X18 { .. }
                 | GateMetadata::X18CompareBranch { .. }
                 | GateMetadata::X18Adr { .. }
+                | GateMetadata::X18Branch { .. }
         );
         let instruction_offsets: &[usize] = match (metadata, x18) {
             (GateMetadata::MrsTpidr { .. }, false) => &[cursor + 4],
@@ -4555,6 +4674,21 @@ mod tests {
             )
             .unwrap();
             assert!(matches!(sites[0].kind, PatchKind::X18(_)));
+
+            for instruction in [Insn::Br(18), Insn::Blr(18), Insn::Ret(18)] {
+                let bytes = instruction.encode().unwrap().to_le_bytes();
+                let sites = find_patch_sites(
+                    &[TextSectionInfo {
+                        vaddr: 0x1000,
+                        file_offset: 0,
+                        size: 4,
+                    }],
+                    &bytes,
+                    config,
+                )
+                .unwrap();
+                assert!(matches!(sites[0].kind, PatchKind::X18Branch(_)));
+            }
         }
     }
 
@@ -4711,13 +4845,11 @@ mod tests {
 
     #[test]
     fn x18_unsupported_class_table() {
+        assert_eq!(
+            classify_x18(Insn::Br(18).encode().unwrap()),
+            X18Classification::Branch(X18IndirectBranchKind::Br)
+        );
         for (word, expected) in [
-            (
-                0xd61f_0240,
-                X18Classification::X18(X18TransformResult::Unsupported(
-                    X18Unsupported::ControlFlow,
-                )),
-            ), // br x18
             (
                 0xf000_0012,
                 X18Classification::X18(X18TransformResult::Unsupported(X18Unsupported::PcRelative)),
@@ -4807,6 +4939,8 @@ mod tests {
         assert_eq!(Insn::B(-4).encode().unwrap(), 0x17FF_FFFF);
         // `BR X16`.
         assert_eq!(Insn::Br(16).encode().unwrap(), 0xD61F_0200);
+        assert_eq!(Insn::Blr(18).encode().unwrap(), 0xD63F_0240);
+        assert_eq!(Insn::Ret(18).encode().unwrap(), 0xD65F_0240);
         // `ADR X16, .+12` — how an SVC gate names its outbound stub.
         assert_eq!(
             Insn::Adr {
@@ -4971,6 +5105,53 @@ mod tests {
                 EncodedGateMetadata::encode(GateMetadata::X18 { scratch: X17 })
                     .unwrap()
                     .0
+            );
+        }
+    }
+
+    #[test]
+    fn indirect_x18_control_flow_emits_persisted_trap_gates() {
+        for instruction in [Insn::Br(18), Insn::Blr(18), Insn::Ret(18)] {
+            let word = instruction.encode().unwrap();
+            let (patched, outcome) =
+                hook_words_opt_with_config(&[word], 0x1000, 0x400000, x18_config(Host::Linux));
+            let outcome = outcome.unwrap();
+
+            assert!(outcome.trapped_sites.is_empty(), "word {word:#010x}");
+            assert_eq!(word_at(&patched, 0) & OPCODE_TOP6_MASK, Opcode::B.bits());
+            let gate = &outcome.trampoline[GATES_START_OFFSET..];
+            assert_eq!(gate.len(), 16);
+            assert_eq!(word_at(gate, 0), Insn::Brk(0xB18).encode().unwrap());
+            assert_eq!(
+                decode_branch_target(word_at(gate, 4), 0x400000 + GATES_START_OFFSET as u64 + 4),
+                Some(0x1004)
+            );
+            assert_eq!(word_at(gate, 8), NOP);
+        }
+    }
+
+    #[test]
+    fn every_gate_metadata_slot_size_is_probed() {
+        for metadata in [
+            GateMetadata::Svc,
+            GateMetadata::MrsTpidr { destination: 9 },
+            GateMetadata::MsrTpidr { source: 9 },
+            GateMetadata::X18 { scratch: 17 },
+            GateMetadata::X18CompareBranch { scratch: 17 },
+            GateMetadata::X18Adr { scratch: 17 },
+            GateMetadata::X18Branch {
+                kind: X18IndirectBranchKind::Br,
+            },
+            GateMetadata::X18Branch {
+                kind: X18IndirectBranchKind::Blr,
+            },
+            GateMetadata::X18Branch {
+                kind: X18IndirectBranchKind::Ret,
+            },
+        ] {
+            assert!(
+                GATE_SLOT_SIZES.contains(&metadata.slot_size()),
+                "{metadata:?}"
             );
         }
     }
@@ -5882,6 +6063,24 @@ mod tests {
         assert_eq!(word(GateMetadata::Svc), 0x0001b807);
         assert_eq!(word(GateMetadata::MrsTpidr { destination: 9 }), 0x0911b807);
         assert_eq!(word(GateMetadata::MsrTpidr { source: 9 }), 0x0921b807);
+        assert_eq!(
+            word(GateMetadata::X18Branch {
+                kind: X18IndirectBranchKind::Br,
+            }),
+            0x0061b807
+        );
+        assert_eq!(
+            word(GateMetadata::X18Branch {
+                kind: X18IndirectBranchKind::Blr,
+            }),
+            0x0161b807
+        );
+        assert_eq!(
+            word(GateMetadata::X18Branch {
+                kind: X18IndirectBranchKind::Ret,
+            }),
+            0x0261b807
+        );
     }
 
     #[test]
@@ -5911,7 +6110,7 @@ mod tests {
                 );
             }
         }
-        for kind in 6..16 {
+        for kind in 7..16 {
             let invalid = (valid & !GATE_METADATA_KIND_MASK) | (kind << GATE_METADATA_KIND_SHIFT);
             assert_eq!(EncodedGateMetadata(invalid).decode(), None, "kind {kind}");
         }
@@ -6045,7 +6244,7 @@ mod tests {
                 );
             }
         }
-        for kind in 6..16 {
+        for kind in 7..16 {
             let word = (valid & !GATE_METADATA_KIND_MASK) | (kind << GATE_METADATA_KIND_SHIFT);
             assert_eq!(EncodedGateMetadata(word).decode(), None, "kind {kind}");
         }
@@ -6100,7 +6299,8 @@ mod tests {
                                 GateMetadata::Svc => 8,
                                 GateMetadata::X18 { .. }
                                 | GateMetadata::X18CompareBranch { .. }
-                                | GateMetadata::X18Adr { .. } => unreachable!(),
+                                | GateMetadata::X18Adr { .. }
+                                | GateMetadata::X18Branch { .. } => unreachable!(),
                             },
                         conditional_target: 0,
                         metadata,
@@ -6121,6 +6321,7 @@ mod tests {
             0xaa00_03f2, // mov x18, x0
             0x3500_0332, // cbnz w18, +0x64
             0x1000_0072, // adr x18, +0xc
+            0xd61f_0240, // br x18
         ];
         let base = 0x400000;
         let (_patched, outcome) =
@@ -6133,6 +6334,10 @@ mod tests {
             (
                 16 + X18_SLOT_BYTES + X18_COMPARE_BRANCH_SLOT_BYTES,
                 X18_ADR_SLOT_BYTES,
+            ),
+            (
+                16 + X18_SLOT_BYTES + X18_COMPARE_BRANCH_SLOT_BYTES + X18_ADR_SLOT_BYTES,
+                X18_BRANCH_SLOT_BYTES,
             ),
         ]
         .into_iter()
@@ -6149,6 +6354,7 @@ mod tests {
                 0 => matches!(metadata, GateMetadata::X18 { .. }),
                 1 => matches!(metadata, GateMetadata::X18CompareBranch { .. }),
                 2 => matches!(metadata, GateMetadata::X18Adr { .. }),
+                3 => matches!(metadata, GateMetadata::X18Branch { .. }),
                 _ => unreachable!(),
             });
             for offset in (0..metadata.executable_end()).step_by(INSN_BYTES) {
