@@ -65,7 +65,7 @@ use core::ops::Range;
 use litebox_common_windows::NtSysno;
 use object::pe::{IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE};
 use object::read::pe::{ImageNtHeaders as _, ImageOptionalHeader as _, PeFile64};
-use object::read::{Object as _, ObjectSection as _, ObjectSegment as _, ObjectSymbol as _};
+use object::read::{Object as _, ObjectSection as _, ObjectSegment as _};
 use thiserror::Error;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
@@ -215,47 +215,6 @@ struct TextSectionInfo {
     size: u64,
 }
 
-impl aarch64::ElfCodeMetadata {
-    /// Parse an ELF image in aligned storage, relocating an unaligned program
-    /// header table within that storage if required by the object parser.
-    pub fn parse_aligned_in_place(aligned: &mut [u64], byte_len: usize) -> Result<Self> {
-        let bytes = aligned.as_mut_bytes();
-        if byte_len > bytes.len() {
-            return Err(Error::ParseError(
-                "aligned ELF byte length exceeds storage".into(),
-            ));
-        }
-        fixup_phdr_alignment(&mut bytes[..byte_len]);
-        let file = object::File::parse(&bytes[..byte_len])
-            .map_err(|error| Error::ParseError(error.to_string()))?;
-        if file.architecture() != object::Architecture::Aarch64 {
-            return Err(Error::UnsupportedExecutable(
-                "code metadata requires an AArch64 ELF".into(),
-            ));
-        }
-        match aarch64_elf_code_metadata(&file) {
-            Ok(metadata) => Ok(metadata),
-            Err(InternalError::Public(error)) => Err(error),
-            Err(InternalError::NoTextSectionFound) => Err(Error::UnsupportedExecutable(
-                "AArch64 ELF has no executable code ranges".into(),
-            )),
-            Err(error) => unreachable!("unexpected metadata error: {error:?}"),
-        }
-    }
-
-    /// Project ELF file ranges into one file-backed mapping.
-    pub fn ranges_for_mapping(
-        &self,
-        file_offset: u64,
-        mapping_len: usize,
-    ) -> Result<aarch64::CodeScanRanges> {
-        Ok(aarch64::CodeScanRanges {
-            executable: project_file_ranges(&self.executable, file_offset, mapping_len)?,
-            identified: project_file_ranges(&self.identified, file_offset, mapping_len)?,
-        })
-    }
-}
-
 struct SyscallPatchResult {
     found_syscall: bool,
     skipped_addrs: Vec<u64>,
@@ -378,7 +337,7 @@ pub fn hook_syscalls_in_elf_with_options(
         };
 
         let (text_sections, aarch64_code_sections) = if arch == Arch::Aarch64 {
-            let metadata = match aarch64_elf_code_metadata(&file) {
+            let metadata = match aarch64::elf_code_metadata(&file) {
                 Ok(metadata) => metadata,
                 Err(InternalError::NoTextSectionFound) => return Ok(input_binary.to_vec()),
                 Err(InternalError::Public(error)) => return Err(error),
@@ -1086,175 +1045,6 @@ fn text_sections(
         return Err(InternalError::NoTextSectionFound);
     }
     Ok(text_sections)
-}
-
-fn aarch64_elf_code_metadata(
-    file: &object::File<'_>,
-) -> core::result::Result<aarch64::ElfCodeMetadata, InternalError> {
-    let executable = text_sections(file)?;
-    let identified = aarch64_code_sections(file, &executable);
-    Ok(aarch64::ElfCodeMetadata {
-        executable,
-        identified,
-    })
-}
-
-fn project_file_ranges(
-    ranges: &[TextSectionInfo],
-    mapping_file_offset: u64,
-    mapping_len: usize,
-) -> Result<Vec<Range<usize>>> {
-    let mapping_len =
-        u64::try_from(mapping_len).map_err(|_| Error::AddressOverflow("mapping length".into()))?;
-    let mapping_end = mapping_file_offset
-        .checked_add(mapping_len)
-        .ok_or_else(|| Error::AddressOverflow("mapping file range".into()))?;
-    let mut projected = Vec::new();
-    for range in ranges {
-        let range_end = range
-            .file_offset
-            .checked_add(range.size)
-            .ok_or_else(|| Error::AddressOverflow("ELF code file range".into()))?;
-        let start = range.file_offset.max(mapping_file_offset);
-        let end = range_end.min(mapping_end);
-        if start < end {
-            projected.push(
-                usize::try_from(start - mapping_file_offset)
-                    .map_err(|_| Error::AddressOverflow("projected range start".into()))?
-                    ..usize::try_from(end - mapping_file_offset)
-                        .map_err(|_| Error::AddressOverflow("projected range end".into()))?,
-            );
-        }
-    }
-    Ok(projected)
-}
-
-/// Builds ranges where metadata positively identifies AArch64 code. Executable
-/// bytes outside these ranges remain eligible for exact mandatory-site scans,
-/// but not heuristic x18 classification.
-fn aarch64_code_sections(
-    file: &object::File<'_>,
-    executable: &[TextSectionInfo],
-) -> Vec<TextSectionInfo> {
-    let mut ranges = Vec::new();
-    for symbol in file.symbols().chain(file.dynamic_symbols()) {
-        if symbol.kind() == object::SymbolKind::Text
-            && symbol.size() != 0
-            && let Some(end) = symbol.address().checked_add(symbol.size())
-        {
-            ranges.push((symbol.address(), end));
-        }
-    }
-
-    if let Some(section) = file.section_by_name(".eh_frame")
-        && let Ok(data) = section.uncompressed_data()
-        && let Some(eh_frame_ranges) = eh_frame_ranges(
-            &data,
-            section.address(),
-            file.section_by_name(".text").map(|text| text.address()),
-            file.section_by_name(".got").map(|got| got.address()),
-        )
-    {
-        ranges.extend(eh_frame_ranges);
-    }
-
-    let has_function_metadata = !aarch64_ranges_to_sections(ranges.clone(), executable).is_empty();
-    if !has_function_metadata {
-        return executable.to_vec();
-    }
-
-    for section in file.sections() {
-        let Ok(name) = section.name() else {
-            continue;
-        };
-        if (matches!(name, ".init" | ".fini" | ".plt" | ".iplt") || name.starts_with(".plt."))
-            && let Some(end) = section.address().checked_add(section.size())
-        {
-            ranges.push((section.address(), end));
-        }
-    }
-
-    aarch64_ranges_to_sections(ranges, executable)
-}
-
-fn eh_frame_ranges(
-    data: &[u8],
-    eh_frame_address: u64,
-    text_address: Option<u64>,
-    got_address: Option<u64>,
-) -> Option<Vec<(u64, u64)>> {
-    let mut section = gimli::EhFrame::new(data, gimli::LittleEndian);
-    section.set_address_size(8);
-    let mut bases = gimli::BaseAddresses::default().set_eh_frame(eh_frame_address);
-    if let Some(text_address) = text_address {
-        bases = bases.set_text(text_address);
-    }
-    if let Some(got_address) = got_address {
-        bases = bases.set_got(got_address);
-    }
-    let mut entries = gimli::UnwindSection::entries(&section, &bases);
-    let mut ranges = Vec::new();
-    loop {
-        let entry = match entries.next() {
-            Ok(Some(entry)) => entry,
-            Ok(None) => return Some(ranges),
-            Err(_) => return None,
-        };
-        if let gimli::CieOrFde::Fde(partial) = entry {
-            let Ok(fde) = partial.parse(gimli::UnwindSection::cie_from_offset) else {
-                return None;
-            };
-            if fde.len() != 0
-                && let Some(end) = fde.initial_address().checked_add(fde.len())
-            {
-                ranges.push((fde.initial_address(), end));
-            }
-        }
-    }
-}
-
-fn aarch64_ranges_to_sections(
-    ranges: Vec<(u64, u64)>,
-    executable: &[TextSectionInfo],
-) -> Vec<TextSectionInfo> {
-    let mut clipped = Vec::new();
-    for (start, end) in ranges {
-        for section in executable {
-            let section_end = section.vaddr.saturating_add(section.size);
-            let start = start
-                .max(section.vaddr)
-                .checked_add(3)
-                .map_or(u64::MAX, |start| start & !3);
-            let end = end.min(section_end) & !3;
-            if start < end {
-                clipped.push((start, end, section));
-            }
-        }
-    }
-    clipped.sort_unstable_by_key(|(start, _, _)| *start);
-
-    let mut code: Vec<TextSectionInfo> = Vec::new();
-    for (start, end, section) in clipped {
-        if let Some(previous) = code.last_mut()
-            && start >= previous.vaddr
-            && previous.vaddr.saturating_add(previous.size) >= start
-            && previous.file_offset.saturating_add(start - previous.vaddr)
-                == section.file_offset.saturating_add(start - section.vaddr)
-        {
-            previous.size = end
-                .max(previous.vaddr.saturating_add(previous.size))
-                .saturating_sub(previous.vaddr);
-            continue;
-        }
-        code.push(TextSectionInfo {
-            vaddr: start,
-            file_offset: section
-                .file_offset
-                .saturating_add(start.saturating_sub(section.vaddr)),
-            size: end - start,
-        });
-    }
-    code
 }
 
 /// Check if the binary is already hooked by looking for TRAMPOLINE_MAGIC at the end of the file.
@@ -2560,25 +2350,6 @@ fn hook_syscall_and_after(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn aarch64_ranges_are_clipped_aligned_and_merged() {
-        let executable = [TextSectionInfo {
-            vaddr: 0x1000,
-            file_offset: 0x200,
-            size: 0x20,
-        }];
-
-        let ranges = aarch64_ranges_to_sections(
-            vec![(0x0fff, 0x1006), (0x1004, 0x100d), (0x101e, 0x1024)],
-            &executable,
-        );
-
-        assert_eq!(ranges.len(), 1);
-        assert_eq!(ranges[0].vaddr, 0x1000);
-        assert_eq!(ranges[0].file_offset, 0x200);
-        assert_eq!(ranges[0].size, 0xc);
-    }
 
     fn seg(vaddr: u64, filesz: u64, memsz: u64, align: u64) -> LoadSegment {
         LoadSegment {
