@@ -703,6 +703,136 @@ fn tcp_status_publication_failure_preserves_consumed_error() {
 
 #[test]
 fn native_tcp_readiness_failure_does_not_fail_shared_reactor() {
+    // Session A owns the socket whose asynchronous reactor publication fails.
+    let listener_a = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address_a = listener_a.local_addr().unwrap();
+    let (send_reply_a, wait_to_send_reply_a) = channel();
+    let (release_a, wait_to_release_a) = channel();
+    let server_a = thread::spawn(move || {
+        let (mut stream, _) = listener_a.accept().unwrap();
+        wait_to_send_reply_a.recv_timeout(TEST_TIMEOUT).unwrap();
+        stream.write_all(b"reply").unwrap();
+        wait_to_release_a.recv_timeout(TEST_TIMEOUT).unwrap();
+    });
+
+    // Session B shares the same reactor. The original bug cleared every
+    // session's sockets, so B is the cross-session isolation witness.
+    let listener_b = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address_b = listener_b.local_addr().unwrap();
+    let (send_beta_b, wait_to_send_beta_b) = channel();
+    let (release_b, wait_to_release_b) = channel();
+    let server_b = thread::spawn(move || {
+        let (mut stream, _) = listener_b.accept().unwrap();
+        wait_to_send_beta_b.recv_timeout(TEST_TIMEOUT).unwrap();
+        stream.write_all(b"beta").unwrap();
+        wait_to_release_b.recv_timeout(TEST_TIMEOUT).unwrap();
+    });
+
+    let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
+    let broker = BrokerCore::new_with_limits(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(SocketPolicy::Ipv4Loopback),
+        BrokerCoreLimits::new_with_all_limits(4, 0, 2, 2),
+        provider,
+    )
+    .unwrap();
+
+    let session_a = broker
+        .create_session(CallerCredential::Unauthenticated)
+        .unwrap();
+    let (published_a, publications_a) = channel();
+    let (retired_a, _retirements_a) = channel();
+    let readiness_a = Arc::new(FailingReadinessSink {
+        inner: TestReadinessSink {
+            published: published_a,
+            retired: retired_a,
+        },
+        fail_next_publish: Mutex::new(None),
+    });
+    let handle_a = create_socket(&session_a, readiness_a.clone());
+    assert!(matches!(
+        litebox_broker_core::socket::connect(&session_a, handle_a, socket_address_v4(address_a),),
+        Ok(SocketOutcome::Completed(
+            SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
+        ))
+    ));
+    wait_until_connected(&session_a, handle_a, &publications_a);
+
+    // Session B gets its own readiness sink, mirroring production's
+    // per-association sinks.
+    let session_b = broker
+        .create_session(CallerCredential::Unauthenticated)
+        .unwrap();
+    let (published_b, publications_b) = channel();
+    let (retired_b, _retirements_b) = channel();
+    let readiness_b = Arc::new(FailingReadinessSink {
+        inner: TestReadinessSink {
+            published: published_b,
+            retired: retired_b,
+        },
+        fail_next_publish: Mutex::new(None),
+    });
+    let handle_b = create_socket(&session_b, readiness_b.clone());
+    assert!(matches!(
+        litebox_broker_core::socket::connect(&session_b, handle_b, socket_address_v4(address_b),),
+        Ok(SocketOutcome::Completed(
+            SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
+        ))
+    ));
+    wait_until_connected(&session_b, handle_b, &publications_b);
+
+    // Fail session A's asynchronous readiness publication at the moment the
+    // peer's data makes the socket readable. This exercises the shared-reactor
+    // event path (`handle_socket_event`), not a synchronous command: the reactor
+    // must absorb one association's publication failure and keep serving that
+    // socket rather than tearing down every session's sockets.
+    readiness_a.fail_next_publish_matching(
+        handle_a,
+        ReadinessFlags::READ,
+        ReadinessFlags::default(),
+    );
+    send_reply_a.send(()).unwrap();
+    readiness_a.wait_for_publish_failure_consumed();
+
+    // `update_snapshot` commits the cached snapshot before publishing, so the
+    // guest-visible readiness reflects READ even though the notification was
+    // dropped.
+    assert!(
+        session_a
+            .check_readiness(handle_a)
+            .unwrap()
+            .contains(ReadinessFlags::READ)
+    );
+
+    // Session A's own socket is still serviceable through the reactor.
+    let mut data_a = [0_u8; 5];
+    assert_eq!(
+        receive_into(&session_a, handle_a, &mut data_a, ReceiveFlags::NONE, 0, 0),
+        Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(5)))
+    );
+    assert_eq!(&data_a, b"reply");
+    readiness_a.assert_no_pending_publish_failure();
+
+    // Cross-session isolation: session B still transacts after A's failure.
+    // Under the original bug the reactor would have exited and cleared B's
+    // socket, so this receive would fail.
+    send_beta_b.send(()).unwrap();
+    wait_until_ready(&session_b, &publications_b, handle_b, ReadinessFlags::READ);
+    let mut data_b = [0_u8; 4];
+    assert_eq!(
+        receive_into(&session_b, handle_b, &mut data_b, ReceiveFlags::NONE, 0, 0),
+        Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(4)))
+    );
+    assert_eq!(&data_b, b"beta");
+
+    release_a.send(()).unwrap();
+    release_b.send(()).unwrap();
+    server_a.join().unwrap();
+    server_b.join().unwrap();
+}
+
+#[test]
+fn native_tcp_connect_completion_readiness_failure_does_not_fail_shared_reactor() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let (send_data, wait_to_send_data) = channel();
@@ -732,25 +862,41 @@ fn native_tcp_readiness_failure_does_not_fail_shared_reactor() {
         fail_next_publish: Mutex::new(None),
     });
     let handle = create_socket(&session, readiness.clone());
+
+    // Arm the failure before connecting. A non-blocking loopback connect
+    // returns EINPROGRESS, so the reactor publishes empty readiness
+    // synchronously (no WRITE, no match) and completes the connection
+    // asynchronously through `complete_connect`, whose best-effort WRITE
+    // publication is the site under test. Forbidding ERROR keeps a
+    // failed-connect publication from matching instead.
+    readiness.fail_next_publish_matching(handle, ReadinessFlags::WRITE, ReadinessFlags::ERROR);
     assert!(matches!(
         litebox_broker_core::socket::connect(&session, handle, socket_address_v4(address),),
         Ok(SocketOutcome::Completed(
             SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
         ))
     ));
-    wait_until_connected(&session, handle, &publications);
-
-    // Fail the reactor's asynchronous readiness publication at the moment the
-    // peer's data makes the socket readable. This exercises the shared-reactor
-    // event path (`handle_socket_event`), not a synchronous command: the reactor
-    // must absorb one association's publication failure and keep serving that
-    // socket rather than tearing down every session's sockets.
-    readiness.fail_next_publish_matching(handle, ReadinessFlags::READ, ReadinessFlags::default());
-    send_data.send(()).unwrap();
     readiness.wait_for_publish_failure_consumed();
 
-    // The reactor survived: the buffered data is still retrievable through it and
-    // the cached snapshot still reflects the readable state.
+    // The cached snapshot committed the connected, writable state before the
+    // dropped notification, so the guest still observes a usable socket.
+    assert_eq!(
+        litebox_broker_core::socket::status(&session, handle)
+            .unwrap()
+            .status,
+        SocketConnectionStatus::Connected
+    );
+    assert!(
+        session
+            .check_readiness(handle)
+            .unwrap()
+            .contains(ReadinessFlags::WRITE)
+    );
+
+    // The connection is fully usable despite the dropped connect-completion
+    // notification.
+    send_data.send(()).unwrap();
+    wait_until_ready(&session, &publications, handle, ReadinessFlags::READ);
     let mut data = [0_u8; 5];
     assert_eq!(
         receive_into(&session, handle, &mut data, ReceiveFlags::NONE, 0, 0),
