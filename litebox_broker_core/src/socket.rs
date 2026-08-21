@@ -368,15 +368,7 @@ pub struct AcceptedPlatformSocket {
     pub socket: Arc<dyn PlatformSocket>,
     /// Exact guest destination reached by the connector.
     pub local_address: SocketAddrV4,
-    /// Guest-visible peer endpoint of the accepted connection.
-    ///
-    /// For a guest-to-guest connection, this must be the connector's
-    /// guest-namespace endpoint; broker-internal native routing endpoints must
-    /// not be exposed.
-    pub remote_address: SocketAddrV4,
-    /// Retains the connecting peer's source binding.
-    ///
-    /// Its source endpoint must equal the accepted socket's `remote_address`.
+    /// Retains and identifies the connecting peer's guest-visible source.
     pub guest_source_lease: GuestSourceLease,
 }
 
@@ -932,46 +924,42 @@ pub fn accept(
         readiness_sink,
         Arc::clone(&quota),
     );
+    let accepted = match listener_resource.accept(readiness.clone()) {
+        Ok(SocketOutcome::Completed(accepted)) => accepted,
+        Ok(SocketOutcome::Failed(error)) => {
+            readiness.retire();
+            return Ok(SocketOutcome::Failed(error));
+        }
+        Err(error) => {
+            readiness.retire();
+            return Err(error);
+        }
+    };
+    let AcceptedPlatformSocket {
+        socket,
+        local_address,
+        guest_source_lease,
+    } = accepted;
+    if !listener_resource.port_binding_covers(local_address) {
+        socket.retire();
+        readiness.retire();
+        return Err(BrokerError::Internal);
+    }
+    let remote_address = guest_source_lease.source_address();
     let resource = Arc::new(SocketResource {
         platform_socket: Once::new(),
         readiness,
         _quota: quota,
         port_binding: Mutex::new(None),
-        guest_source_lease: Mutex::new(None),
+        guest_source_lease: Mutex::new(Some(guest_source_lease)),
     });
-    let accepted = match listener_resource.accept(resource.readiness.clone()) {
-        Ok(SocketOutcome::Completed(accepted)) => accepted,
-        Ok(SocketOutcome::Failed(error)) => {
-            resource.readiness.retire();
-            return Ok(SocketOutcome::Failed(error));
-        }
-        Err(error) => {
-            resource.readiness.retire();
-            return Err(error);
-        }
-    };
-    if !listener_resource.port_binding_covers(accepted.local_address)
-        || accepted.guest_source_lease.source_address() != accepted.remote_address
-    {
-        accepted.socket.retire();
-        resource.readiness.retire();
-        return Err(BrokerError::Internal);
-    }
-    if let Err(guest_source_lease) = resource.set_accepted_source_lease(accepted.guest_source_lease)
-    {
-        accepted.socket.retire();
-        resource.readiness.retire();
-        drop(guest_source_lease);
-        return Err(BrokerError::Internal);
-    }
-    resource.platform_socket.call_once(|| accepted.socket);
-    let accepted_socket =
-        SocketObject::new_connected(resource, create_request, accepted.local_address);
+    resource.platform_socket.call_once(|| socket);
+    let accepted_socket = SocketObject::new_connected(resource, create_request, local_address);
     let handle = reference.commit(ObjectEntry::Socket(accepted_socket))?;
     Ok(SocketOutcome::Completed(AcceptedBrokerSocket {
         handle,
-        local_address: accepted.local_address,
-        remote_address: accepted.remote_address,
+        local_address,
+        remote_address,
     }))
 }
 
@@ -1909,18 +1897,6 @@ impl SocketResource {
         Ok(())
     }
 
-    fn set_accepted_source_lease(
-        &self,
-        lease: GuestSourceLease,
-    ) -> core::result::Result<(), GuestSourceLease> {
-        let mut slot = self.guest_source_lease.lock();
-        if slot.is_some() {
-            return Err(lease);
-        }
-        *slot = Some(lease);
-        Ok(())
-    }
-
     fn port_binding_covers(&self, address: SocketAddrV4) -> bool {
         self.port_binding
             .lock()
@@ -2397,7 +2373,6 @@ pub(crate) mod tests {
         failed_readiness: StdMutex<Option<ReadinessRegistration>>,
         live_readiness: StdMutex<Option<ReadinessRegistration>>,
         queue_next_guest_connect: core::sync::atomic::AtomicBool,
-        accepted_remote_address: StdMutex<Option<SocketAddrV4>>,
         pending_accept: StdMutex<Option<PendingAcceptedConnection>>,
     }
 
@@ -2441,8 +2416,7 @@ pub(crate) mod tests {
             self.state.retain_next_socket.store(true, Ordering::Relaxed);
         }
 
-        fn queue_next_guest_connect(&self, remote_address: Option<SocketAddrV4>) {
-            *self.state.accepted_remote_address.lock().unwrap() = remote_address;
+        fn queue_next_guest_connect(&self) {
             self.state
                 .queue_next_guest_connect
                 .store(true, Ordering::Relaxed);
@@ -2557,13 +2531,6 @@ pub(crate) mod tests {
             let Some(pending) = self.state.pending_accept.lock().unwrap().take() else {
                 return Err(BrokerError::WouldBlock);
             };
-            let remote_address = self
-                .state
-                .accepted_remote_address
-                .lock()
-                .unwrap()
-                .take()
-                .unwrap_or_else(|| pending.guest_source_lease.source_address());
             let socket = Arc::new(TestPlatformSocket {
                 state: Arc::clone(&self.state),
                 readiness,
@@ -2575,7 +2542,6 @@ pub(crate) mod tests {
             Ok(SocketOutcome::Completed(AcceptedPlatformSocket {
                 socket,
                 local_address: pending.destination,
-                remote_address,
                 guest_source_lease: pending.guest_source_lease,
             }))
         }
@@ -2780,7 +2746,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn accepted_guest_source_lease_is_validated_and_retained() {
+    fn accepted_guest_source_lease_is_retained() {
         let provider = Arc::new(TestSocketProvider::default());
         let broker = test_broker(Arc::clone(&provider) as Arc<dyn SocketProvider>);
         let listener_session = broker
@@ -2805,44 +2771,6 @@ pub(crate) mod tests {
             Ok(SocketOutcome::Completed(listener_address))
         );
 
-        let mismatched_source = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 44001);
-        let connector = create(
-            &connector_session,
-            create_request(),
-            Arc::new(TestReadinessSink::default()),
-        )
-        .unwrap();
-        assert_eq!(
-            bind(&connector_session, connector, mismatched_source),
-            Ok(SocketOutcome::Completed(mismatched_source))
-        );
-        provider.queue_next_guest_connect(Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 44999)));
-        assert_eq!(
-            connect(&connector_session, connector, listener_address),
-            Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting))
-        );
-        connector_session.close_object_reference(connector).unwrap();
-        assert!(matches!(
-            broker
-                .socket_ports
-                .reserve(create_request(), mismatched_source),
-            Ok(SocketOutcome::Failed(SocketError::AddressInUse))
-        ));
-        assert!(matches!(
-            accept(
-                &listener_session,
-                listener,
-                Arc::new(TestReadinessSink::default())
-            ),
-            Err(BrokerError::Internal)
-        ));
-        assert!(matches!(
-            broker
-                .socket_ports
-                .reserve(create_request(), mismatched_source),
-            Ok(SocketOutcome::Completed(_))
-        ));
-
         let wildcard_source = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 44002);
         let concrete_source = SocketAddrV4::new(Ipv4Addr::LOCALHOST, wildcard_source.port());
         let connector = create(
@@ -2855,7 +2783,7 @@ pub(crate) mod tests {
             bind(&connector_session, connector, wildcard_source),
             Ok(SocketOutcome::Completed(wildcard_source))
         );
-        provider.queue_next_guest_connect(None);
+        provider.queue_next_guest_connect();
         assert_eq!(
             connect(&connector_session, connector, listener_address),
             Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting))

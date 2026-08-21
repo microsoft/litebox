@@ -269,7 +269,6 @@ impl PlatformSocket for LinuxSocket {
                 Ok(SocketOutcome::Completed(AcceptedPlatformSocket {
                     socket,
                     local_address: accepted.local_address,
-                    remote_address: accepted.remote_address,
                     guest_source_lease: accepted.guest_source_lease,
                 }))
             }

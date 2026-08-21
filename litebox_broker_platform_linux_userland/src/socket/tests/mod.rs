@@ -371,7 +371,10 @@ fn non_loopback_local_ipv4() -> Option<Ipv4Addr> {
     let probe = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
     probe.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).ok()?;
     let address = socket_address_v4(probe.local_addr().ok()?);
-    (!address.ip().is_unspecified() && !address.ip().is_loopback()).then_some(*address.ip())
+    (!address.ip().is_unspecified()
+        && !address.ip().is_loopback()
+        && *address.ip() != GUEST_IPV4_ADDRESS)
+        .then_some(*address.ip())
 }
 
 fn create_socket(
@@ -485,6 +488,23 @@ fn wait_for_readiness(
         readiness,
         Instant::now() + TEST_TIMEOUT,
     );
+}
+
+fn wait_for_readiness_publication(
+    publications: &Receiver<(ObjectHandle, ReadinessFlags)>,
+    handle: ObjectHandle,
+    readiness: ReadinessFlags,
+) {
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .expect("timed out waiting for socket readiness publication");
+        let (published_handle, published) = publications.recv_timeout(remaining).unwrap();
+        if published_handle == handle && published.contains(readiness) {
+            return;
+        }
+    }
 }
 
 fn wait_until_ready(
