@@ -41,12 +41,12 @@ const REQUEST_QUEUE_CAPACITY: usize = 64;
 const WORKER_COUNT: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct AllowedTcpDestination {
+struct AllowedDestination {
     destination: Ipv4Cidr,
     ports: DestinationPortRange,
 }
 
-impl FromStr for AllowedTcpDestination {
+impl FromStr for AllowedDestination {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
@@ -72,12 +72,12 @@ impl FromStr for AllowedTcpDestination {
             .map_or((ports, ports), |(start, end)| (start, end));
         let start = start
             .parse::<u16>()
-            .map_err(|error| format!("invalid TCP port: {error}"))?;
+            .map_err(|error| format!("invalid port: {error}"))?;
         let end = end
             .parse::<u16>()
-            .map_err(|error| format!("invalid TCP port: {error}"))?;
+            .map_err(|error| format!("invalid port: {error}"))?;
         let ports = DestinationPortRange::new(Port(start), Port(end))
-            .ok_or_else(|| "TCP port range must be ordered and exclude port zero".to_owned())?;
+            .ok_or_else(|| "port range must be ordered and exclude port zero".to_owned())?;
 
         Ok(Self { destination, ports })
     }
@@ -90,7 +90,13 @@ struct CliArgs {
     /// May be repeated to extend the default guest-network policy for TCP.
     /// `0.0.0.0/0:1-65535` permits every nonzero IPv4 TCP destination.
     #[arg(long, value_name = "CIDR:PORT[-PORT]")]
-    allow_tcp_destination: Vec<AllowedTcpDestination>,
+    allow_tcp_destination: Vec<AllowedDestination>,
+    /// Permit outbound UDP traffic to a destination CIDR and port range.
+    ///
+    /// May be repeated to extend the default guest-network policy for UDP.
+    /// `0.0.0.0/0:1-65535` permits every nonzero IPv4 UDP destination.
+    #[arg(long, value_name = "CIDR:PORT[-PORT]")]
+    allow_udp_destination: Vec<AllowedDestination>,
     /// Local runner executable to launch.
     #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::ExecutablePath)]
     runner: PathBuf,
@@ -124,12 +130,23 @@ fn run_runner_process(
 }
 
 fn configured_socket_policy(
-    allowed_destinations: &[AllowedTcpDestination],
+    allowed_tcp_destinations: &[AllowedDestination],
+    allowed_udp_destinations: &[AllowedDestination],
 ) -> Result<SocketPolicy, SocketPolicyError> {
-    if allowed_destinations.is_empty() {
-        return Ok(SocketPolicy::guest_network());
+    let mut policy = SocketPolicy::guest_network();
+    if !allowed_tcp_destinations.is_empty() {
+        let rules = destination_rules(allowed_tcp_destinations);
+        policy = policy.with_tcp_destination_rules(&rules)?;
     }
-    let rules = allowed_destinations
+    if !allowed_udp_destinations.is_empty() {
+        let rules = destination_rules(allowed_udp_destinations);
+        policy = policy.with_udp_destination_rules(&rules)?;
+    }
+    Ok(policy)
+}
+
+fn destination_rules(allowed_destinations: &[AllowedDestination]) -> Vec<DestinationRule> {
+    allowed_destinations
         .iter()
         .map(|allowed| {
             DestinationRule::new(
@@ -138,8 +155,7 @@ fn configured_socket_policy(
                 allowed.ports,
             )
         })
-        .collect::<Vec<_>>();
-    SocketPolicy::guest_network().with_tcp_destination_rules(&rules)
+        .collect()
 }
 
 fn serve_runner<Memory, SetupChannel, RequestSource, ResponseSink, NotificationChannel, Shutdown>(
@@ -545,11 +561,13 @@ mod cli_tests {
     use super::*;
 
     #[test]
-    fn cli_accepts_tcp_destination_argument() {
+    fn cli_accepts_tcp_and_udp_destination_arguments() {
         let args = CliArgs::try_parse_from([
             "litebox-broker-userland",
             "--allow-tcp-destination",
             "127.0.0.0/8:80",
+            "--allow-udp-destination",
+            "10.0.2.1/32:53",
             "--runner",
             "runner",
             "guest",
@@ -557,49 +575,48 @@ mod cli_tests {
         .unwrap();
 
         assert_eq!(args.allow_tcp_destination.len(), 1);
+        assert_eq!(args.allow_udp_destination.len(), 1);
     }
 
     #[test]
-    fn tcp_destination_argument_parses_canonical_cidr_and_ports() {
+    fn destination_argument_parses_canonical_cidr_and_ports() {
         let allowed = "203.0.113.0/24:443-444"
-            .parse::<AllowedTcpDestination>()
+            .parse::<AllowedDestination>()
             .unwrap();
 
         assert_eq!(
             allowed,
-            AllowedTcpDestination {
+            AllowedDestination {
                 destination: Ipv4Cidr::new(Ipv4Address([203, 0, 113, 0]), 24).unwrap(),
                 ports: DestinationPortRange::new(Port(443), Port(444)).unwrap(),
             }
         );
-        assert!(
-            "203.0.113.1/24:443"
-                .parse::<AllowedTcpDestination>()
-                .is_err()
-        );
-        assert!("203.0.113.0/24:0".parse::<AllowedTcpDestination>().is_err());
+        assert!("203.0.113.1/24:443".parse::<AllowedDestination>().is_err());
+        assert!("203.0.113.0/24:0".parse::<AllowedDestination>().is_err());
     }
 
     #[test]
-    fn tcp_destination_arguments_extend_the_guest_network_default() {
+    fn destination_arguments_extend_the_guest_network_default_by_protocol() {
         assert_eq!(
-            configured_socket_policy(&[]).unwrap(),
+            configured_socket_policy(&[], &[]).unwrap(),
             SocketPolicy::guest_network()
         );
 
-        let allowed = "0.0.0.0/0:80".parse::<AllowedTcpDestination>().unwrap();
-        let policy = configured_socket_policy(&[allowed]).unwrap();
-        let rules = policy.tcp_destination_rules().unwrap();
-        assert_eq!(rules.len(), 1);
+        let tcp = "0.0.0.0/0:80".parse::<AllowedDestination>().unwrap();
+        let udp = "10.0.2.1/32:53".parse::<AllowedDestination>().unwrap();
+        let policy = configured_socket_policy(&[tcp], &[udp]).unwrap();
+        let tcp_rules = policy.tcp_destination_rules().unwrap();
+        assert_eq!(tcp_rules.len(), 1);
         assert_eq!(
-            rules[0],
-            DestinationRule::new(
-                CallerCredential::HostGuaranteed,
-                allowed.destination,
-                allowed.ports,
-            )
+            tcp_rules[0],
+            DestinationRule::new(CallerCredential::HostGuaranteed, tcp.destination, tcp.ports,)
         );
-        assert_eq!(policy.udp_destination_rules().unwrap(), &[]);
+        let udp_rules = policy.udp_destination_rules().unwrap();
+        assert_eq!(udp_rules.len(), 1);
+        assert_eq!(
+            udp_rules[0],
+            DestinationRule::new(CallerCredential::HostGuaranteed, udp.destination, udp.ports,)
+        );
     }
 }
 

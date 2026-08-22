@@ -51,8 +51,9 @@ pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
     control_listener.set_nonblocking(true)?;
     let limits = BrokerCoreLimits::DEFAULT;
     let broker = BrokerCore::new_with_limits(
-        PolicyEngine::with_host_guaranteed_rights(ObjectRights::all())
-            .with_socket_policy(configured_socket_policy(&args.allow_tcp_destination)?),
+        PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()).with_socket_policy(
+            configured_socket_policy(&args.allow_tcp_destination, &args.allow_udp_destination)?,
+        ),
         limits,
         Arc::new(LinuxSocketProvider::new(
             limits.max_sockets,

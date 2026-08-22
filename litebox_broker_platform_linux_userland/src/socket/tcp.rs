@@ -4,14 +4,15 @@
 //! Linux TCP reactor state and transport-specific helpers.
 
 use std::collections::{HashMap, VecDeque};
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::SocketAddrV4;
 use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use litebox_broker_core::readiness::ReadinessRegistration;
 use litebox_broker_core::socket::{
-    GUEST_IPV4_ADDRESS, GuestSocketBinding, GuestSourceLease, PlatformConnectError,
+    GuestSocketBinding, GuestSourceLease, PlatformConnectError, SocketDestination,
+    classify_socket_destination,
 };
 use litebox_broker_core::{BrokerError, Result as BrokerResult, SessionId};
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -311,7 +312,10 @@ enum ResolvedTcpDestination {
         listener_id: u64,
         concrete_address: SocketAddrV4,
     },
-    Native(SocketAddrV4),
+    Native {
+        guest_visible_address: SocketAddrV4,
+        host_address: SocketAddrV4,
+    },
 }
 
 impl ReactorTcpState {
@@ -378,15 +382,6 @@ impl ReactorTcpState {
             .or_else(|| self.bindings.wildcard.get(&address.port()))
             .filter(|binding| binding.guest_binding.covers(address))
             .cloned()
-    }
-
-    pub(super) fn has_binding_on_port(&self, port: u16) -> bool {
-        self.bindings.wildcard.contains_key(&port)
-            || self
-                .bindings
-                .exact
-                .keys()
-                .any(|address| address.port() == port)
     }
 
     pub(super) fn binding_for_socket(&self, socket_id: u64) -> Option<ReactorTcpBinding> {
@@ -1322,14 +1317,10 @@ impl Reactor {
         guest_address: SocketAddrV4,
         guest_source_lease: Option<GuestSourceLease>,
     ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
-        let (session_id, reserved_local_address) = self
+        let session_id = self
             .sockets
             .get(&id)
-            .and_then(|socket| {
-                socket
-                    .guest_local_address
-                    .map(|address| (socket.session_id, address))
-            })
+            .and_then(|socket| socket.guest_local_address.map(|_| socket.session_id))
             .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?;
         let binding = self
             .tcp
@@ -1371,29 +1362,28 @@ impl Reactor {
             );
         }
         drop(guest_source_lease);
-        let ResolvedTcpDestination::Native(network_address) = destination else {
+        let ResolvedTcpDestination::Native {
+            guest_visible_address,
+            host_address,
+        } = destination
+        else {
             unreachable!("guest destination handled above");
         };
+        let local_guest_address = binding
+            .guest_binding
+            .source_address_for_destination(SocketDestination::Native {
+                guest_visible_address,
+                host_address,
+            })
+            .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?;
         let (status, readiness) = connect_tcp_socket(
             &self.epoll,
             id,
             self.sockets
                 .get_mut(&id)
                 .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?,
-            network_address,
+            host_address,
         )?;
-        let local_guest_address = if matches!(
-            status,
-            SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
-        ) {
-            if binding.guest_binding.is_wildcard() {
-                SocketAddrV4::new(Ipv4Addr::LOCALHOST, reserved_local_address.port())
-            } else {
-                reserved_local_address
-            }
-        } else {
-            reserved_local_address
-        };
         if matches!(
             status,
             SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
@@ -1879,34 +1869,36 @@ impl Reactor {
 
     fn resolve_guest_destination(
         &self,
-        mut address: SocketAddrV4,
+        address: SocketAddrV4,
     ) -> SocketOutcome<ResolvedTcpDestination> {
-        if address.ip().is_unspecified() {
-            address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, address.port());
-        }
-        if let Some(binding) = self.tcp.guest_binding(address) {
-            let listener_live = self
-                .sockets
-                .get(&binding.socket_id)
-                .and_then(|listener| listener.tcp_state().ok())
-                .and_then(|tcp| tcp.listener.as_ref())
-                .is_some();
-            if !listener_live {
-                return SocketOutcome::Failed(SocketError::ConnectionRefused);
+        match classify_socket_destination(address) {
+            Ok(SocketDestination::Guest(address)) => {
+                let Some(binding) = self.tcp.guest_binding(address) else {
+                    return SocketOutcome::Failed(SocketError::ConnectionRefused);
+                };
+                let listener_live = self
+                    .sockets
+                    .get(&binding.socket_id)
+                    .and_then(|listener| listener.tcp_state().ok())
+                    .and_then(|tcp| tcp.listener.as_ref())
+                    .is_some();
+                if !listener_live {
+                    return SocketOutcome::Failed(SocketError::ConnectionRefused);
+                }
+                SocketOutcome::Completed(ResolvedTcpDestination::Guest {
+                    listener_id: binding.socket_id,
+                    concrete_address: address,
+                })
             }
-            return SocketOutcome::Completed(ResolvedTcpDestination::Guest {
-                listener_id: binding.socket_id,
-                concrete_address: address,
-            });
+            Ok(SocketDestination::Native {
+                guest_visible_address,
+                host_address,
+            }) => SocketOutcome::Completed(ResolvedTcpDestination::Native {
+                guest_visible_address,
+                host_address,
+            }),
+            Err(error) => SocketOutcome::Failed(error),
         }
-        // TODO: Once gateway routing replaces host-loopback fallback, fail all
-        // unmatched guest-network destinations closed.
-        if *address.ip() == GUEST_IPV4_ADDRESS
-            || (address.ip().is_loopback() && self.tcp.has_binding_on_port(address.port()))
-        {
-            return SocketOutcome::Failed(SocketError::ConnectionRefused);
-        }
-        SocketOutcome::Completed(ResolvedTcpDestination::Native(address))
     }
 
     pub(super) fn listen_socket(

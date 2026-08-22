@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use super::*;
 use litebox_broker_core::readiness::ReadinessSink;
-use litebox_broker_core::socket::GUEST_IPV4_ADDRESS;
+use litebox_broker_core::socket::{GATEWAY_IPV4_ADDRESS, GUEST_IPV4_ADDRESS};
 use litebox_broker_core::{
     BrokerCore, BrokerCoreLimits, BrokerSession, CallerCredential, DestinationPortRange,
     DestinationRule, Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy,
@@ -26,6 +26,20 @@ mod tcp;
 mod udp;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn gateway_tcp_policy() -> SocketPolicy {
+    SocketPolicy::guest_network()
+        .with_tcp_destination_rules(&[DestinationRule::new(
+            CallerCredential::Unauthenticated,
+            Ipv4Cidr::new(Ipv4Address(GATEWAY_IPV4_ADDRESS.octets()), 32).unwrap(),
+            DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
+        )])
+        .unwrap()
+}
+
+fn gateway_address(host_address: SocketAddrV4) -> SocketAddrV4 {
+    SocketAddrV4::new(GATEWAY_IPV4_ADDRESS, host_address.port())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ReceivedPlatformDatagram {
@@ -312,7 +326,7 @@ fn directional_shutdown_survives_readiness_publication_failure() {
     let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::guest_network()),
+            .with_socket_policy(gateway_tcp_policy()),
         BrokerCoreLimits::new_with_all_limits(4, 0, 2, 2),
         provider,
     )
@@ -329,7 +343,11 @@ fn directional_shutdown_survives_readiness_publication_failure() {
 
     let tcp = create_socket(&session, readiness.clone());
     assert!(matches!(
-        litebox_broker_core::socket::connect(&session, tcp, socket_address_v4(address)),
+        litebox_broker_core::socket::connect(
+            &session,
+            tcp,
+            gateway_address(socket_address_v4(address)),
+        ),
         Ok(SocketOutcome::Completed(
             SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
         ))

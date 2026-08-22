@@ -30,6 +30,31 @@ const BROKER_ONLY_C_TESTS: &[&str] = &[
     "udp_broker_namespace.c",
 ];
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn gateway_destination_rule() -> litebox_broker_core::DestinationRule {
+    use litebox_broker_protocol::socket::{Ipv4Address, Port};
+
+    litebox_broker_core::DestinationRule::new(
+        litebox_broker_core::CallerCredential::HostGuaranteed,
+        litebox_broker_core::Ipv4Cidr::new(Ipv4Address([10, 0, 2, 1]), 32).unwrap(),
+        litebox_broker_core::DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
+    )
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn gateway_tcp_policy() -> litebox_broker_core::SocketPolicy {
+    litebox_broker_core::SocketPolicy::guest_network()
+        .with_tcp_destination_rules(&[gateway_destination_rule()])
+        .unwrap()
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn gateway_udp_policy() -> litebox_broker_core::SocketPolicy {
+    litebox_broker_core::SocketPolicy::guest_network()
+        .with_udp_destination_rules(&[gateway_destination_rule()])
+        .unwrap()
+}
+
 /// Debian multiarch library directory preserved at its guest-relative path.
 #[cfg(target_arch = "x86_64")]
 const MULTIARCH_LIB_DIR: &str = "lib/x86_64-linux-gnu";
@@ -667,7 +692,7 @@ fn test_runner_broker_tcp_client_with_rewriter() {
         litebox_broker_core::PolicyEngine::with_host_guaranteed_rights(
             litebox_broker_core::ObjectRights::all(),
         )
-        .with_socket_policy(litebox_broker_core::SocketPolicy::guest_network()),
+        .with_socket_policy(gateway_tcp_policy()),
         1,
     );
     Runner::new(&target, "broker_tcp_client_rewriter")
@@ -756,7 +781,7 @@ fn test_runner_broker_udp_with_rewriter() {
         litebox_broker_core::PolicyEngine::with_host_guaranteed_rights(
             litebox_broker_core::ObjectRights::all(),
         )
-        .with_socket_policy(litebox_broker_core::SocketPolicy::guest_network()),
+        .with_socket_policy(gateway_udp_policy()),
         1,
     );
     runner
@@ -1279,10 +1304,10 @@ fn test_broker_with_curl() {
         litebox_broker_core::PolicyEngine::with_host_guaranteed_rights(
             litebox_broker_core::ObjectRights::all(),
         )
-        .with_socket_policy(litebox_broker_core::SocketPolicy::guest_network()),
+        .with_socket_policy(gateway_tcp_policy()),
         1,
     );
-    let url = format!("http://127.0.0.1:{port}/something");
+    let url = format!("http://10.0.2.1:{port}/something");
     let output = Runner::new(&curl_path, "curl_rewriter")
         .args(["-sS", &url])
         .broker_socket(&control_socket_path)
@@ -1318,7 +1343,7 @@ fn test_broker_with_iperf3() {
         litebox_broker_core::PolicyEngine::with_host_guaranteed_rights(
             litebox_broker_core::ObjectRights::all(),
         )
-        .with_socket_policy(litebox_broker_core::SocketPolicy::guest_network()),
+        .with_socket_policy(gateway_tcp_policy()),
         1,
     );
 
@@ -1382,7 +1407,7 @@ fn test_broker_with_iperf3() {
     runner
         .args([
             "-c",
-            "127.0.0.1",
+            "10.0.2.1",
             "-p",
             &port.to_string(),
             "--connect-timeout",
