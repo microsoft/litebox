@@ -212,9 +212,13 @@ pub extern "C" fn sandbox_process_init(
         );
     };
     let composer = litebox::fs::composer::Composer::builder()
-        .mount("/", |allocator| {
-            let Ok(backend) = litebox::fs::nine_p::NineP::<Platform, _>::new(
-                transport, 65536, "root", "/tmp", allocator,
+        .mount_nestable("/", |allocators| {
+            let Ok(nine_p) = litebox::fs::nine_p::NineP::<Platform, _>::new(
+                transport,
+                65536,
+                "root",
+                "/tmp",
+                allocators.next(),
             ) else {
                 ghcb_prints("failed to create 9P filesystem");
                 litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::terminate(
@@ -222,21 +226,23 @@ pub extern "C" fn sandbox_process_init(
                     globals::SM_TERM_GENERAL,
                 );
             };
-            backend
+            litebox::fs::overlay::Overlay::new(
+                litebox,
+                litebox::fs::in_mem::InMem::<Platform>::new_initialized([(
+                    "/tmp",
+                    litebox::fs::in_mem::InitialNode::Directory {
+                        mode: litebox::fs::Mode::RWXU
+                            | litebox::fs::Mode::RWXG
+                            | litebox::fs::Mode::RWXO,
+                        owner: litebox::fs::UserInfo::ROOT,
+                    },
+                )]),
+                nine_p,
+                allocators.next(),
+            )
         })
         .mount("/dev", |allocator| {
             litebox::fs::devices::Devices::new(litebox, allocator)
-        })
-        .mount("/tmp", |_allocator| {
-            litebox::fs::in_mem::InMem::<Platform>::new_initialized([(
-                "/",
-                litebox::fs::in_mem::InitialNode::Directory {
-                    mode: litebox::fs::Mode::RWXU
-                        | litebox::fs::Mode::RWXG
-                        | litebox::fs::Mode::RWXO,
-                    owner: litebox::fs::UserInfo::ROOT,
-                },
-            )])
         })
         .build()
         .unwrap_or_else(
