@@ -2384,6 +2384,63 @@ fn guest_tcp_both_shutdown_keeps_peer_send_open_and_closes_write_half() {
 }
 
 #[test]
+fn drained_guest_read_shutdown_close_delivers_end_of_stream() {
+    let pair = connected_guest_tcp_pair(8107);
+    assert_eq!(
+        litebox_broker_core::socket::shutdown(
+            &pair.connector_session,
+            pair.connector,
+            ShutdownMode::Read,
+        ),
+        Ok(SocketOutcome::Completed(()))
+    );
+    assert_eq!(
+        send_bytes(
+            &pair.connector_session,
+            pair.connector,
+            b"drained",
+            SendFlags::NONE,
+        ),
+        Ok(SocketOutcome::Completed(7))
+    );
+    wait_until_ready(
+        &pair.listener_session,
+        &pair.publications,
+        pair.accepted,
+        ReadinessFlags::READ,
+    );
+    let mut data = [0_u8; 7];
+    assert_eq!(
+        receive_into(
+            &pair.listener_session,
+            pair.accepted,
+            &mut data,
+            ReceiveFlags::NONE,
+            0,
+            0,
+        ),
+        Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(7)))
+    );
+    assert_eq!(&data, b"drained");
+
+    pair.connector_session
+        .close_object_reference(pair.connector)
+        .unwrap();
+    assert_eq!(
+        pair.retirements.recv_timeout(TEST_TIMEOUT).unwrap(),
+        pair.connector
+    );
+    wait_for_end_of_stream(&pair.listener_session, pair.accepted, &pair.publications);
+    assert!(
+        !pair
+            .listener_session
+            .check_readiness(pair.accepted)
+            .unwrap()
+            .contains(ReadinessFlags::ERROR)
+    );
+}
+
+#[test]
 fn guest_tcp_connect_publication_failure_purges_committed_queue() {
     let provider = Arc::new(LinuxSocketProvider::new(4, 3).unwrap());
     let broker = BrokerCore::new_with_limits(
