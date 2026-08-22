@@ -24,8 +24,9 @@ use crate::LiteBox;
 use crate::sync::{Mutex, MutexGuard, RawSyncPrimitivesProvider};
 
 use super::backend::{
-    Backend, BackendHandles, DirHandle, FileHandle, Handle, HandleRef, Permissioned, SeekBehavior,
-    WalkOutcome, WalkStopReason, WalkedComponent, WalkingDirHandle,
+    Backend, BackendHandles, DirHandle, FileHandle, Handle, HandleRef, PermissionCheck,
+    PermissionInfo, Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkedComponent,
+    WalkingDirHandle,
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
@@ -877,7 +878,13 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
                     &status,
                     flags.contains(OFlags::TRUNC),
                 )?;
-                (OverlayFileLayer::Upper(upper), file.permissions)
+                // The lower open was substituted with a read-only one, so its `PermissionCheck`
+                // says nothing about the caller's write access; check the file's own mode instead.
+                let permissions = PermissionCheck::ByResolver(PermissionInfo {
+                    mode: status.mode,
+                    owner: status.owner,
+                });
+                (OverlayFileLayer::Upper(upper), permissions)
             } else {
                 let node = self.map_node(&mut self.state.lock().ids, Some(layer), status.node_info);
                 (
