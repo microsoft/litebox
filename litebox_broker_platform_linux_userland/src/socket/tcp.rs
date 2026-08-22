@@ -77,6 +77,20 @@ impl GuestTcpReadShutdown {
     }
 }
 
+fn guest_tcp_has_unread_data(tcp: &TcpSocketState) -> bool {
+    tcp.guest_read_shutdown
+        .as_ref()
+        .is_some_and(GuestTcpReadShutdown::has_unread_data)
+        || match ioctl_fionread(
+            tcp.descriptor
+                .socket()
+                .expect("guest endpoint descriptor missing"),
+        ) {
+            Ok(0) => false,
+            Ok(_) | Err(_) => true,
+        }
+}
+
 pub(super) enum TcpDescriptor {
     Unrealized,
     NativeInet(OwnedFd),
@@ -1596,18 +1610,7 @@ impl Reactor {
                 .and_then(|socket| socket.tcp_state().ok())
                 .is_some_and(|tcp| {
                     tcp.abortive_close
-                        || tcp.descriptor.is_guest()
-                            && tcp.guest_read_shutdown.as_ref().map_or_else(
-                                || match ioctl_fionread(
-                                    tcp.descriptor
-                                        .socket()
-                                        .expect("guest endpoint descriptor missing"),
-                                ) {
-                                    Ok(0) => false,
-                                    Ok(_) | Err(_) => true,
-                                },
-                                GuestTcpReadShutdown::has_unread_data,
-                            )
+                        || tcp.descriptor.is_guest() && guest_tcp_has_unread_data(tcp)
                 });
         let socket = self
             .sockets
@@ -2146,4 +2149,32 @@ pub(super) fn consume_pending_guest_reset(socket: &mut SocketEntry) -> BrokerRes
         }
     }
     Ok(consumed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guest_read_shutdown_detects_data_awaiting_discard() {
+        let (socket, peer) = socketpair(
+            rustix::net::AddressFamily::UNIX,
+            rustix::net::SocketType::STREAM,
+            LinuxSocketFlags::CLOEXEC | LinuxSocketFlags::NONBLOCK,
+            None,
+        )
+        .unwrap();
+        let SocketTransportState::Tcp(mut tcp) = create_tcp_transport() else {
+            unreachable!();
+        };
+        tcp.descriptor = TcpDescriptor::GuestUnix(socket);
+        tcp.guest_read_shutdown = Some(GuestTcpReadShutdown {
+            queued: Vec::new(),
+            consumed: 0,
+            discarded_data: false,
+        });
+
+        assert_eq!(send(&peer, b"x", LinuxSendFlags::NOSIGNAL).unwrap(), 1);
+        assert!(guest_tcp_has_unread_data(&tcp));
+    }
 }

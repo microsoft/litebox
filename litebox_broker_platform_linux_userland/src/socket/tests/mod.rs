@@ -513,7 +513,22 @@ fn wait_until_ready(
     handle: ObjectHandle,
     readiness: ReadinessFlags,
 ) {
-    let deadline = Instant::now() + TEST_TIMEOUT;
+    wait_until_ready_until(
+        session,
+        publications,
+        handle,
+        readiness,
+        Instant::now() + TEST_TIMEOUT,
+    );
+}
+
+fn wait_until_ready_until(
+    session: &litebox_broker_core::BrokerSession,
+    publications: &Receiver<(ObjectHandle, ReadinessFlags)>,
+    handle: ObjectHandle,
+    readiness: ReadinessFlags,
+    deadline: Instant,
+) {
     loop {
         if session.check_readiness(handle).unwrap().contains(readiness) {
             return;

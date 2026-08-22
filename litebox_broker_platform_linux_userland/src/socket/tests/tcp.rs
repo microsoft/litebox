@@ -2185,6 +2185,36 @@ fn guest_tcp_read_shutdown_is_logical_and_unread_close_resets_peer() {
     );
     assert_eq!(
         send_bytes(
+            &pair.connector_session,
+            pair.connector,
+            b"write remains open",
+            SendFlags::NONE,
+        ),
+        Ok(SocketOutcome::Completed(18))
+    );
+    wait_until_ready(
+        &pair.listener_session,
+        &pair.publications,
+        pair.accepted,
+        ReadinessFlags::READ,
+    );
+    let mut write_response = [0_u8; 18];
+    assert_eq!(
+        receive_into(
+            &pair.listener_session,
+            pair.accepted,
+            &mut write_response,
+            ReceiveFlags::NONE,
+            0,
+            0,
+        ),
+        Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(
+            18
+        )))
+    );
+    assert_eq!(&write_response, b"write remains open");
+    assert_eq!(
+        send_bytes(
             &pair.listener_session,
             pair.accepted,
             b"unread",
@@ -2194,6 +2224,7 @@ fn guest_tcp_read_shutdown_is_logical_and_unread_close_resets_peer() {
     );
     let payload = vec![0_u8; MAX_SOCKET_TRANSFER_SIZE as usize];
     let mut sent = 0;
+    let send_deadline = Instant::now() + TEST_TIMEOUT;
     while sent < 2 * 1024 * 1024 {
         match send_bytes(
             &pair.listener_session,
@@ -2202,6 +2233,13 @@ fn guest_tcp_read_shutdown_is_logical_and_unread_close_resets_peer() {
             SendFlags::NONE,
         ) {
             Ok(SocketOutcome::Completed(count)) if count != 0 => sent += count,
+            Err(BrokerError::WouldBlock) => wait_until_ready_until(
+                &pair.listener_session,
+                &pair.publications,
+                pair.accepted,
+                ReadinessFlags::WRITE,
+                send_deadline,
+            ),
             outcome => panic!("post-shutdown send stopped making progress: {outcome:?}"),
         }
     }
