@@ -58,11 +58,23 @@ pub(super) struct TcpSocketState {
     pub(super) listener: Option<GuestTcpListenerState>,
     pub(super) guest_endpoint: Option<GuestTcpEndpoint>,
     pub(super) peek_waitall_threshold: Option<usize>,
-    /// Bytes queued before logical guest read shutdown that may still be read.
-    pub(super) guest_read_shutdown_remaining: Option<usize>,
+    guest_read_shutdown: Option<GuestTcpReadShutdown>,
     pub(super) abortive_close: bool,
     pub(super) no_delay: bool,
     pub(super) keep_alive: bool,
+}
+
+/// Pre-shutdown bytes preserved while later guest data is discarded.
+struct GuestTcpReadShutdown {
+    queued: Vec<u8>,
+    consumed: usize,
+    discarded_data: bool,
+}
+
+impl GuestTcpReadShutdown {
+    fn has_unread_data(&self) -> bool {
+        self.consumed < self.queued.len() || self.discarded_data
+    }
 }
 
 pub(super) enum TcpDescriptor {
@@ -136,7 +148,7 @@ pub(super) fn create_tcp_transport() -> SocketTransportState {
         listener: None,
         guest_endpoint: None,
         peek_waitall_threshold: None,
-        guest_read_shutdown_remaining: None,
+        guest_read_shutdown: None,
         abortive_close: false,
         no_delay: false,
         keep_alive: false,
@@ -556,11 +568,17 @@ pub(super) fn receive_socket(
     if socket.kind() != SocketKind::Tcp {
         return Ok(ReactorReceiveOutcome::Failed(SocketError::InvalidArgument));
     }
-    let guest_read_shutdown_remaining = socket.tcp_state()?.guest_read_shutdown_remaining;
-    if guest_read_shutdown_remaining == Some(0) {
-        return Ok(ReactorReceiveOutcome::EndOfStream);
+    if socket.tcp_state()?.guest_read_shutdown.is_some() {
+        if !flags.contains(ReceiveFlags::PEEK)
+            && peek_cache
+                .as_ref()
+                .is_some_and(|cache| cache.socket_id == socket_id)
+        {
+            *peek_cache = None;
+        }
+        return receive_guest_read_shutdown(socket, length, flags, peek_offset, peek_length);
     }
-    if guest_read_shutdown_remaining.is_none() && guest_reset_pending(socket)? {
+    if guest_reset_pending(socket)? {
         let available = ioctl_fionread(socket.tcp_state()?.descriptor.socket()?)
             .map_err(broker_error_from_errno)?;
         if available == 0 {
@@ -701,9 +719,6 @@ fn receive_socket_once(
     mut data: Vec<u8>,
     flags: LinuxRecvFlags,
 ) -> BrokerResult<ReactorReceiveOutcome> {
-    if let Some(remaining) = socket.tcp_state()?.guest_read_shutdown_remaining {
-        data.truncate(data.len().min(remaining));
-    }
     loop {
         match recv(
             socket.tcp_state()?.descriptor.socket()?,
@@ -723,16 +738,6 @@ fn receive_socket_once(
             Ok((_buffer, received)) => {
                 confirm_tcp_connected(socket);
                 data.truncate(received);
-                if !flags.contains(LinuxRecvFlags::PEEK)
-                    && let Some(remaining) = socket
-                        .tcp_state_mut()?
-                        .guest_read_shutdown_remaining
-                        .as_mut()
-                {
-                    *remaining = remaining
-                        .checked_sub(received)
-                        .ok_or(BrokerError::Internal)?;
-                }
                 let terminal_readable = socket.read_shutdown
                     || socket
                         .snapshot
@@ -762,6 +767,125 @@ fn receive_socket_once(
             }
         }
     }
+}
+
+fn receive_guest_read_shutdown(
+    socket: &mut SocketEntry,
+    length: usize,
+    flags: ReceiveFlags,
+    peek_offset: usize,
+    peek_length: usize,
+) -> BrokerResult<ReactorReceiveOutcome> {
+    let peek = flags.contains(ReceiveFlags::PEEK);
+    let (relative_start, relative_end) = if peek {
+        let peek_end = peek_offset
+            .checked_add(length)
+            .ok_or(BrokerError::UnsupportedOperation)?;
+        let canonical_length = peek_length
+            .checked_sub(peek_offset)
+            .map(|remaining| remaining.min(MAX_SOCKET_TRANSFER_SIZE as usize));
+        if !peek_offset.is_multiple_of(MAX_SOCKET_TRANSFER_SIZE as usize)
+            || canonical_length != Some(length)
+            || peek_length < peek_end
+            || peek_length > MAX_SOCKET_PEEK_SIZE as usize
+        {
+            return Err(BrokerError::UnsupportedOperation);
+        }
+        (peek_offset, peek_end)
+    } else {
+        if peek_offset != 0 || peek_length != 0 {
+            return Err(BrokerError::UnsupportedOperation);
+        }
+        (0, length)
+    };
+
+    let shutdown = socket
+        .tcp_state_mut()?
+        .guest_read_shutdown
+        .as_mut()
+        .ok_or(BrokerError::Internal)?;
+    let start = shutdown
+        .consumed
+        .checked_add(relative_start)
+        .ok_or(BrokerError::Internal)?;
+    if start >= shutdown.queued.len() {
+        return Ok(ReactorReceiveOutcome::EndOfStream);
+    }
+    let end = shutdown
+        .consumed
+        .checked_add(relative_end)
+        .ok_or(BrokerError::Internal)?
+        .min(shutdown.queued.len());
+    let mut data = Vec::new();
+    data.try_reserve_exact(end - start)
+        .map_err(|_| BrokerError::OutOfMemory)?;
+    data.extend_from_slice(&shutdown.queued[start..end]);
+    if !peek {
+        shutdown.consumed = end;
+        if shutdown.consumed == shutdown.queued.len() {
+            shutdown.queued = Vec::new();
+            shutdown.consumed = 0;
+        }
+    }
+    Ok(ReactorReceiveOutcome::Received(data))
+}
+
+fn capture_guest_read_shutdown(
+    socket: &SocketEntry,
+    mut queued: Vec<u8>,
+) -> BrokerResult<GuestTcpReadShutdown> {
+    let mut received = 0;
+    while received < queued.len() {
+        match recv(
+            socket.tcp_state()?.descriptor.socket()?,
+            &mut queued[received..],
+            LinuxRecvFlags::WAITALL,
+        ) {
+            Ok((_buffer, 0)) => return Err(BrokerError::Internal),
+            Ok((_buffer, count)) => {
+                received = received.checked_add(count).ok_or(BrokerError::Internal)?;
+            }
+            Err(Errno::INTR) => {}
+            Err(_) => return Err(BrokerError::Internal),
+        }
+    }
+    Ok(GuestTcpReadShutdown {
+        queued,
+        consumed: 0,
+        discarded_data: false,
+    })
+}
+
+fn discard_guest_read_shutdown_data(socket: &mut SocketEntry) -> BrokerResult<()> {
+    if socket.tcp_state()?.guest_read_shutdown.is_none() {
+        return Ok(());
+    }
+    let mut data = [0_u8; 8192];
+    let mut discarded_data = false;
+    loop {
+        match recv(
+            socket.tcp_state()?.descriptor.socket()?,
+            &mut data,
+            LinuxRecvFlags::empty(),
+        ) {
+            Ok((_, 0)) | Err(Errno::AGAIN) => break,
+            Ok((_buffer, _)) => discarded_data = true,
+            Err(Errno::INTR) => {}
+            Err(error) => {
+                socket_operation_error_from_errno(error)?;
+                break;
+            }
+        }
+    }
+    if discarded_data {
+        socket
+            .tcp_state_mut()?
+            .guest_read_shutdown
+            .as_mut()
+            .ok_or(BrokerError::Internal)?
+            .discarded_data = true;
+    }
+    Ok(())
 }
 
 pub(super) fn set_tcp_option(socket: &mut SocketEntry, value: TcpOptionValue) -> BrokerResult<()> {
@@ -879,17 +1003,15 @@ pub(super) fn shutdown_tcp_socket(
         ),
         _ => return Err(BrokerError::UnsupportedOperation),
     };
-    let guest_read_shutdown_remaining: Option<usize> =
-        if guest_endpoint && shuts_down_read && !socket.read_shutdown {
-            Some(
-                ioctl_fionread(socket.tcp_state()?.descriptor.socket()?)
-                    .map_err(broker_error_from_errno)?
-                    .try_into()
-                    .map_err(|_| BrokerError::Internal)?,
-            )
-        } else {
-            None
-        };
+    let guest_read_shutdown_buffer = if guest_endpoint && shuts_down_read && !socket.read_shutdown {
+        let available: usize = ioctl_fionread(socket.tcp_state()?.descriptor.socket()?)
+            .map_err(broker_error_from_errno)?
+            .try_into()
+            .map_err(|_| BrokerError::Internal)?;
+        Some(zeroed_vec(available)?)
+    } else {
+        None
+    };
     if let Some(kernel_shutdown) = kernel_shutdown {
         loop {
             match shutdown(socket.tcp_state()?.descriptor.socket()?, kernel_shutdown) {
@@ -907,8 +1029,9 @@ pub(super) fn shutdown_tcp_socket(
             }
         }
     }
-    if let Some(remaining) = guest_read_shutdown_remaining {
-        socket.tcp_state_mut()?.guest_read_shutdown_remaining = Some(remaining);
+    if let Some(queued) = guest_read_shutdown_buffer {
+        let shutdown = capture_guest_read_shutdown(socket, queued)?;
+        socket.tcp_state_mut()?.guest_read_shutdown = Some(shutdown);
     }
     socket.read_shutdown |= shuts_down_read;
     socket.write_shutdown |= shuts_down_write;
@@ -948,6 +1071,9 @@ pub(super) fn handle_socket_event(
     if socket.kind() == SocketKind::Udp {
         let _ = update_snapshot(socket, None, readiness_from_epoll(socket, events));
         return Ok(());
+    }
+    if events.contains(epoll::EventFlags::IN) {
+        discard_guest_read_shutdown_data(socket)?;
     }
     let republish_readiness = if events.contains(epoll::EventFlags::IN)
         && let Some(threshold) = socket
@@ -1471,14 +1597,17 @@ impl Reactor {
                 .is_some_and(|tcp| {
                     tcp.abortive_close
                         || tcp.descriptor.is_guest()
-                            && match ioctl_fionread(
-                                tcp.descriptor
-                                    .socket()
-                                    .expect("guest endpoint descriptor missing"),
-                            ) {
-                                Ok(0) => false,
-                                Ok(_) | Err(_) => true,
-                            }
+                            && tcp.guest_read_shutdown.as_ref().map_or_else(
+                                || match ioctl_fionread(
+                                    tcp.descriptor
+                                        .socket()
+                                        .expect("guest endpoint descriptor missing"),
+                                ) {
+                                    Ok(0) => false,
+                                    Ok(_) | Err(_) => true,
+                                },
+                                GuestTcpReadShutdown::has_unread_data,
+                            )
                 });
         let socket = self
             .sockets
@@ -1943,7 +2072,7 @@ impl Reactor {
                         reset_state: GuestTcpResetState::None,
                     }),
                     peek_waitall_threshold: None,
-                    guest_read_shutdown_remaining: None,
+                    guest_read_shutdown: None,
                     abortive_close: false,
                     no_delay: listener_tcp_no_delay,
                     keep_alive: listener_tcp_keep_alive,

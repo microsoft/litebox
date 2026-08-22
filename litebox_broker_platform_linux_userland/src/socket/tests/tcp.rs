@@ -2192,6 +2192,19 @@ fn guest_tcp_read_shutdown_is_logical_and_unread_close_resets_peer() {
         ),
         Ok(SocketOutcome::Completed(6))
     );
+    let payload = vec![0_u8; MAX_SOCKET_TRANSFER_SIZE as usize];
+    let mut sent = 0;
+    while sent < 2 * 1024 * 1024 {
+        match send_bytes(
+            &pair.listener_session,
+            pair.accepted,
+            &payload,
+            SendFlags::NONE,
+        ) {
+            Ok(SocketOutcome::Completed(count)) if count != 0 => sent += count,
+            outcome => panic!("post-shutdown send stopped making progress: {outcome:?}"),
+        }
+    }
     let mut data = [0_u8; 12];
     assert_eq!(
         receive_into(
