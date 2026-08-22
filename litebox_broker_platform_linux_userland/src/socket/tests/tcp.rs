@@ -1308,6 +1308,72 @@ fn guest_tcp_buffered_data_precedes_direct_reset_and_eof() {
 }
 
 #[test]
+fn guest_read_shutdown_buffer_precedes_reset_and_eof() {
+    let pair = connected_guest_tcp_pair(8108);
+    assert_eq!(
+        send_bytes(
+            &pair.listener_session,
+            pair.accepted,
+            b"queued",
+            SendFlags::NONE,
+        ),
+        Ok(SocketOutcome::Completed(6))
+    );
+    wait_until_ready(
+        &pair.connector_session,
+        &pair.publications,
+        pair.connector,
+        ReadinessFlags::READ,
+    );
+    assert_eq!(
+        litebox_broker_core::socket::shutdown(
+            &pair.connector_session,
+            pair.connector,
+            ShutdownMode::Read,
+        ),
+        Ok(SocketOutcome::Completed(()))
+    );
+    abort_and_close_accepted_peer(&pair);
+    wait_for_guest_reset(&pair.connector_session, &pair.publications, pair.connector);
+
+    let mut data = [0_u8; 6];
+    assert_eq!(
+        receive_into(
+            &pair.connector_session,
+            pair.connector,
+            &mut data,
+            ReceiveFlags::NONE,
+            0,
+            0,
+        ),
+        Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(6)))
+    );
+    assert_eq!(&data, b"queued");
+    assert_eq!(
+        receive_into(
+            &pair.connector_session,
+            pair.connector,
+            &mut data,
+            ReceiveFlags::NONE,
+            0,
+            0,
+        ),
+        Ok(SocketOutcome::Failed(SocketError::ConnectionReset))
+    );
+    assert_eq!(
+        receive_into(
+            &pair.connector_session,
+            pair.connector,
+            &mut data,
+            ReceiveFlags::NONE,
+            0,
+            0,
+        ),
+        Ok(SocketOutcome::Completed(ReceiveSocketResponse::EndOfStream))
+    );
+}
+
+#[test]
 fn guest_tcp_namespace_routes_across_sessions_and_hides_private_backend() {
     let provider = Arc::new(LinuxSocketProvider::new(5, 3).unwrap());
     let broker = BrokerCore::new_with_limits(

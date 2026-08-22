@@ -590,7 +590,18 @@ pub(super) fn receive_socket(
         {
             *peek_cache = None;
         }
-        return receive_guest_read_shutdown(socket, length, flags, peek_offset, peek_length);
+        if let Some(outcome) =
+            receive_guest_read_shutdown(socket, length, flags, peek_offset, peek_length)?
+        {
+            return Ok(outcome);
+        }
+        if guest_reset_pending(socket)? {
+            if !consume_pending_guest_reset(socket)? {
+                return Err(BrokerError::Internal);
+            }
+            return Ok(ReactorReceiveOutcome::Failed(SocketError::ConnectionReset));
+        }
+        return Ok(ReactorReceiveOutcome::EndOfStream);
     }
     if guest_reset_pending(socket)? {
         let available = ioctl_fionread(socket.tcp_state()?.descriptor.socket()?)
@@ -789,7 +800,7 @@ fn receive_guest_read_shutdown(
     flags: ReceiveFlags,
     peek_offset: usize,
     peek_length: usize,
-) -> BrokerResult<ReactorReceiveOutcome> {
+) -> BrokerResult<Option<ReactorReceiveOutcome>> {
     let peek = flags.contains(ReceiveFlags::PEEK);
     let (relative_start, relative_end) = if peek {
         let peek_end = peek_offset
@@ -818,12 +829,15 @@ fn receive_guest_read_shutdown(
         .guest_read_shutdown
         .as_mut()
         .ok_or(BrokerError::Internal)?;
+    if shutdown.queued.is_empty() {
+        return Ok(None);
+    }
     let start = shutdown
         .consumed
         .checked_add(relative_start)
         .ok_or(BrokerError::Internal)?;
     if start >= shutdown.queued.len() {
-        return Ok(ReactorReceiveOutcome::EndOfStream);
+        return Ok(Some(ReactorReceiveOutcome::EndOfStream));
     }
     let end = shutdown
         .consumed
@@ -841,7 +855,7 @@ fn receive_guest_read_shutdown(
             shutdown.consumed = 0;
         }
     }
-    Ok(ReactorReceiveOutcome::Received(data))
+    Ok(Some(ReactorReceiveOutcome::Received(data)))
 }
 
 fn capture_guest_read_shutdown(
