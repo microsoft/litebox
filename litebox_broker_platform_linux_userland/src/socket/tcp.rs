@@ -91,6 +91,21 @@ fn guest_tcp_has_unread_data(tcp: &TcpSocketState) -> bool {
         }
 }
 
+#[cfg(test)]
+impl TcpSocketState {
+    pub(super) fn install_empty_guest_read_shutdown_for_test(&mut self) {
+        self.guest_read_shutdown = Some(GuestTcpReadShutdown {
+            queued: Vec::new(),
+            consumed: 0,
+            discarded_data: false,
+        });
+    }
+
+    pub(super) fn has_guest_unread_data_for_test(&self) -> bool {
+        guest_tcp_has_unread_data(self)
+    }
+}
+
 pub(super) enum TcpDescriptor {
     Unrealized,
     NativeInet(OwnedFd),
@@ -2163,32 +2178,4 @@ pub(super) fn consume_pending_guest_reset(socket: &mut SocketEntry) -> BrokerRes
         }
     }
     Ok(consumed)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn guest_read_shutdown_detects_data_awaiting_discard() {
-        let (socket, peer) = socketpair(
-            rustix::net::AddressFamily::UNIX,
-            rustix::net::SocketType::STREAM,
-            LinuxSocketFlags::CLOEXEC | LinuxSocketFlags::NONBLOCK,
-            None,
-        )
-        .unwrap();
-        let SocketTransportState::Tcp(mut tcp) = create_tcp_transport() else {
-            unreachable!();
-        };
-        tcp.descriptor = TcpDescriptor::GuestUnix(socket);
-        tcp.guest_read_shutdown = Some(GuestTcpReadShutdown {
-            queued: Vec::new(),
-            consumed: 0,
-            discarded_data: false,
-        });
-
-        assert_eq!(send(&peer, b"x", LinuxSendFlags::NOSIGNAL).unwrap(), 1);
-        assert!(guest_tcp_has_unread_data(&tcp));
-    }
 }

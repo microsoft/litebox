@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use super::super::tcp::{TcpDescriptor, create_tcp_transport};
 use super::*;
 use std::collections::VecDeque;
 
@@ -2365,6 +2366,28 @@ fn guest_tcp_read_shutdown_is_logical_and_unread_close_resets_peer() {
         ),
         Ok(SocketOutcome::Failed(SocketError::ConnectionReset))
     );
+}
+
+#[test]
+fn guest_read_shutdown_detects_data_awaiting_discard() {
+    let (socket, peer) = rustix::net::socketpair(
+        rustix::net::AddressFamily::UNIX,
+        rustix::net::SocketType::STREAM,
+        rustix::net::SocketFlags::CLOEXEC | rustix::net::SocketFlags::NONBLOCK,
+        None,
+    )
+    .unwrap();
+    let SocketTransportState::Tcp(mut tcp) = create_tcp_transport() else {
+        unreachable!();
+    };
+    tcp.descriptor = TcpDescriptor::GuestUnix(socket);
+    tcp.install_empty_guest_read_shutdown_for_test();
+
+    assert_eq!(
+        rustix::net::send(&peer, b"x", rustix::net::SendFlags::NOSIGNAL).unwrap(),
+        1
+    );
+    assert!(tcp.has_guest_unread_data_for_test());
 }
 
 #[test]
