@@ -58,6 +58,8 @@ pub(super) struct TcpSocketState {
     pub(super) listener: Option<GuestTcpListenerState>,
     pub(super) guest_endpoint: Option<GuestTcpEndpoint>,
     pub(super) peek_waitall_threshold: Option<usize>,
+    /// Bytes queued before logical guest read shutdown that may still be read.
+    pub(super) guest_read_shutdown_remaining: Option<usize>,
     pub(super) abortive_close: bool,
     pub(super) no_delay: bool,
     pub(super) keep_alive: bool,
@@ -134,6 +136,7 @@ pub(super) fn create_tcp_transport() -> SocketTransportState {
         listener: None,
         guest_endpoint: None,
         peek_waitall_threshold: None,
+        guest_read_shutdown_remaining: None,
         abortive_close: false,
         no_delay: false,
         keep_alive: false,
@@ -553,10 +556,11 @@ pub(super) fn receive_socket(
     if socket.kind() != SocketKind::Tcp {
         return Ok(ReactorReceiveOutcome::Failed(SocketError::InvalidArgument));
     }
-    if socket.read_shutdown && socket.tcp_state()?.descriptor.is_guest() {
+    let guest_read_shutdown_remaining = socket.tcp_state()?.guest_read_shutdown_remaining;
+    if guest_read_shutdown_remaining == Some(0) {
         return Ok(ReactorReceiveOutcome::EndOfStream);
     }
-    if guest_reset_pending(socket)? {
+    if guest_read_shutdown_remaining.is_none() && guest_reset_pending(socket)? {
         let available = ioctl_fionread(socket.tcp_state()?.descriptor.socket()?)
             .map_err(broker_error_from_errno)?;
         if available == 0 {
@@ -697,6 +701,9 @@ fn receive_socket_once(
     mut data: Vec<u8>,
     flags: LinuxRecvFlags,
 ) -> BrokerResult<ReactorReceiveOutcome> {
+    if let Some(remaining) = socket.tcp_state()?.guest_read_shutdown_remaining {
+        data.truncate(data.len().min(remaining));
+    }
     loop {
         match recv(
             socket.tcp_state()?.descriptor.socket()?,
@@ -716,6 +723,16 @@ fn receive_socket_once(
             Ok((_buffer, received)) => {
                 confirm_tcp_connected(socket);
                 data.truncate(received);
+                if !flags.contains(LinuxRecvFlags::PEEK)
+                    && let Some(remaining) = socket
+                        .tcp_state_mut()?
+                        .guest_read_shutdown_remaining
+                        .as_mut()
+                {
+                    *remaining = remaining
+                        .checked_sub(received)
+                        .ok_or(BrokerError::Internal)?;
+                }
                 let terminal_readable = socket.read_shutdown
                     || socket
                         .snapshot
@@ -862,6 +879,17 @@ pub(super) fn shutdown_tcp_socket(
         ),
         _ => return Err(BrokerError::UnsupportedOperation),
     };
+    let guest_read_shutdown_remaining: Option<usize> =
+        if guest_endpoint && shuts_down_read && !socket.read_shutdown {
+            Some(
+                ioctl_fionread(socket.tcp_state()?.descriptor.socket()?)
+                    .map_err(broker_error_from_errno)?
+                    .try_into()
+                    .map_err(|_| BrokerError::Internal)?,
+            )
+        } else {
+            None
+        };
     if let Some(kernel_shutdown) = kernel_shutdown {
         loop {
             match shutdown(socket.tcp_state()?.descriptor.socket()?, kernel_shutdown) {
@@ -878,6 +906,9 @@ pub(super) fn shutdown_tcp_socket(
                 }
             }
         }
+    }
+    if let Some(remaining) = guest_read_shutdown_remaining {
+        socket.tcp_state_mut()?.guest_read_shutdown_remaining = Some(remaining);
     }
     socket.read_shutdown |= shuts_down_read;
     socket.write_shutdown |= shuts_down_write;
@@ -1086,29 +1117,10 @@ impl Reactor {
             self.discard_queued_guest_connections(queued, true);
             return Ok(SocketOutcome::Completed(()));
         }
-        let queued_connection = (mode == ShutdownMode::Abort)
-            .then(|| {
-                self.sockets
-                    .get(&id)
-                    .and_then(|socket| socket.tcp_state().ok())
-                    .and_then(|tcp| tcp.guest_endpoint.as_ref())
-                    .and_then(|endpoint| {
-                        endpoint
-                            .queued_listener_id
-                            .map(|listener_id| (listener_id, endpoint.connector_socket_id))
-                    })
-            })
-            .flatten();
-        let outcome = shutdown_tcp_socket(
+        shutdown_tcp_socket(
             self.sockets.get_mut(&id).ok_or(BrokerError::Internal)?,
             mode,
-        );
-        if outcome == Ok(SocketOutcome::Completed(()))
-            && let Some((listener_id, connector_socket_id)) = queued_connection
-        {
-            self.remove_queued_guest_connection(listener_id, connector_socket_id, false);
-        }
-        outcome
+        )
     }
 
     pub(super) fn bind_tcp_socket(
@@ -1931,6 +1943,7 @@ impl Reactor {
                         reset_state: GuestTcpResetState::None,
                     }),
                     peek_waitall_threshold: None,
+                    guest_read_shutdown_remaining: None,
                     abortive_close: false,
                     no_delay: listener_tcp_no_delay,
                     keep_alive: listener_tcp_keep_alive,

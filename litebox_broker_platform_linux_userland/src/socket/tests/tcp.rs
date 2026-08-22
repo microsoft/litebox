@@ -2161,6 +2161,21 @@ fn guest_tcp_stream_preserves_options_peek_waitall_and_half_close() {
 fn guest_tcp_read_shutdown_is_logical_and_unread_close_resets_peer() {
     let pair = connected_guest_tcp_pair(8105);
     assert_eq!(
+        send_bytes(
+            &pair.listener_session,
+            pair.accepted,
+            b"queued",
+            SendFlags::NONE,
+        ),
+        Ok(SocketOutcome::Completed(6))
+    );
+    wait_until_ready(
+        &pair.connector_session,
+        &pair.publications,
+        pair.connector,
+        ReadinessFlags::READ,
+    );
+    assert_eq!(
         litebox_broker_core::socket::shutdown(
             &pair.connector_session,
             pair.connector,
@@ -2177,7 +2192,31 @@ fn guest_tcp_read_shutdown_is_logical_and_unread_close_resets_peer() {
         ),
         Ok(SocketOutcome::Completed(6))
     );
-    let mut data = [0_u8; 6];
+    let mut data = [0_u8; 12];
+    assert_eq!(
+        receive_into(
+            &pair.connector_session,
+            pair.connector,
+            &mut data,
+            ReceiveFlags(ReceiveFlags::PEEK.0 | ReceiveFlags::WAITALL.0),
+            0,
+            12,
+        ),
+        Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(6)))
+    );
+    assert_eq!(&data[..6], b"queued");
+    assert_eq!(
+        receive_into(
+            &pair.connector_session,
+            pair.connector,
+            &mut data,
+            ReceiveFlags::NONE,
+            0,
+            0,
+        ),
+        Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(6)))
+    );
+    assert_eq!(&data[..6], b"queued");
     assert_eq!(
         receive_into(
             &pair.connector_session,
@@ -2215,6 +2254,21 @@ fn guest_tcp_read_shutdown_is_logical_and_unread_close_resets_peer() {
 fn guest_tcp_both_shutdown_keeps_peer_send_open_and_closes_write_half() {
     let pair = connected_guest_tcp_pair(8106);
     assert_eq!(
+        send_bytes(
+            &pair.listener_session,
+            pair.accepted,
+            b"queued",
+            SendFlags::NONE,
+        ),
+        Ok(SocketOutcome::Completed(6))
+    );
+    wait_until_ready(
+        &pair.connector_session,
+        &pair.publications,
+        pair.connector,
+        ReadinessFlags::READ,
+    );
+    assert_eq!(
         litebox_broker_core::socket::shutdown(
             &pair.connector_session,
             pair.connector,
@@ -2232,7 +2286,19 @@ fn guest_tcp_both_shutdown_keeps_peer_send_open_and_closes_write_half() {
         ),
         Ok(SocketOutcome::Completed(6))
     );
-    let mut data = [0_u8; 6];
+    let mut data = [0_u8; 12];
+    assert_eq!(
+        receive_into(
+            &pair.connector_session,
+            pair.connector,
+            &mut data,
+            ReceiveFlags::NONE,
+            0,
+            0,
+        ),
+        Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(6)))
+    );
+    assert_eq!(&data[..6], b"queued");
     assert_eq!(
         receive_into(
             &pair.connector_session,
@@ -2545,8 +2611,32 @@ fn abortive_connector_close_releases_descriptor_capacity() {
         litebox_broker_core::socket::shutdown(&connector_session, connector, ShutdownMode::Abort,),
         Ok(SocketOutcome::Completed(()))
     );
+    assert_eq!(provider.reactor.queued_guest_connection_count(), 1);
+    let accepted =
+        match litebox_broker_core::socket::accept(&listener_session, listener, readiness.clone())
+            .unwrap()
+        {
+            SocketOutcome::Completed(accepted) => accepted.handle,
+            SocketOutcome::Failed(error) => panic!("accept after Abort failed: {error:?}"),
+        };
+    assert_eq!(provider.reactor.queued_guest_connection_count(), 0);
     connector_session.close_object_reference(connector).unwrap();
     assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), connector);
+    wait_for_guest_reset(&listener_session, &publications, accepted);
+    let mut byte = [0_u8; 1];
+    assert_eq!(
+        receive_into(
+            &listener_session,
+            accepted,
+            &mut byte,
+            ReceiveFlags::NONE,
+            0,
+            0,
+        ),
+        Ok(SocketOutcome::Failed(SocketError::ConnectionReset))
+    );
+    listener_session.close_object_reference(accepted).unwrap();
+    assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), accepted);
     assert_eq!(provider.reactor.queued_guest_connection_count(), 0);
 
     let replacement = create_socket(&connector_session, readiness);
