@@ -12,14 +12,13 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
-
 #[cfg(test)]
 use std::time::Duration;
 
 use litebox_broker_core::socket::{
-    AcceptedPlatformSocket, GuestSocketBinding, PlatformConnectError, PlatformDatagramReceive,
-    PlatformSocket, PlatformSocketStatus, PlatformStreamReceive, SocketProvider,
+    AcceptedPlatformSocket, GuestSocketBinding, GuestSourceLease, PlatformConnectError,
+    PlatformDatagramReceive, PlatformSocket, PlatformSocketStatus, PlatformStreamReceive,
+    SocketProvider,
 };
 use litebox_broker_core::{BrokerError, Result as BrokerResult, SessionId};
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -29,7 +28,7 @@ use litebox_broker_protocol::socket::{
     SocketType, TcpOptionName, TcpOptionValue,
 };
 use rustix::buffer::spare_capacity;
-use rustix::event::{EventfdFlags, Timespec, epoll, eventfd};
+use rustix::event::{EventfdFlags, epoll, eventfd};
 use rustix::io::{Errno, read, write};
 use rustix::net::{getsockname, sockopt};
 
@@ -40,14 +39,11 @@ use litebox_broker_protocol::socket::{MAX_SOCKET_TRANSFER_SIZE, SocketStatusResp
 mod tcp;
 mod udp;
 
+#[cfg(test)]
+use tcp::TcpDescriptor;
 use tcp::{
     AcceptedEndpoints, ReactorReceiveOutcome, ReactorTcpState, TcpSocketState,
-    create_tcp_transport, handle_socket_event,
-};
-#[cfg(test)]
-use tcp::{
-    MAX_UNMATCHED_ACCEPTS_PER_COMMAND, PENDING_CONNECT_DISCARD_LIFETIME,
-    PendingGuestConnectionMatch, PendingGuestTcpConnection,
+    consume_pending_guest_reset, create_tcp_transport, guest_reset_pending, handle_socket_event,
 };
 use udp::{
     ReactorUdpBinding, ReactorUdpPeer, ReactorUdpState, UDP_EVENT_TOKEN_FLAG, UdpReceiveOrigin,
@@ -273,7 +269,7 @@ impl PlatformSocket for LinuxSocket {
                 Ok(SocketOutcome::Completed(AcceptedPlatformSocket {
                     socket,
                     local_address: accepted.local_address,
-                    remote_address: accepted.remote_address,
+                    guest_source_lease: accepted.guest_source_lease,
                 }))
             }
             SocketOutcome::Failed(error) => Ok(SocketOutcome::Failed(error)),
@@ -283,8 +279,9 @@ impl PlatformSocket for LinuxSocket {
     fn connect(
         &self,
         address: SocketAddrV4,
+        guest_source_lease: Option<GuestSourceLease>,
     ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
-        self.reactor.connect(self.id, address)
+        self.reactor.connect(self.id, address, guest_source_lease)
     }
 
     fn send(&self, data: Vec<u8>, _flags: SendFlags) -> BrokerResult<SocketOutcome<usize>> {
@@ -525,11 +522,13 @@ impl ReactorClient {
         &self,
         id: u64,
         address: SocketAddrV4,
+        guest_source_lease: Option<GuestSourceLease>,
     ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
         let (response, receive) = sync_channel(1);
         let command = ReactorCommand::Connect {
             id,
             address,
+            guest_source_lease,
             response,
         };
         // Block until the reactor has queue space (see `request`): a transiently
@@ -578,20 +577,20 @@ impl ReactorClient {
     }
 
     #[cfg(test)]
-    fn pending_guest_connection_count(&self) -> usize {
+    fn queued_guest_connection_count(&self) -> usize {
         let (response, receive) = sync_channel(1);
         self.commands
-            .send(ReactorCommand::PendingGuestConnectionCount { response })
+            .send(ReactorCommand::QueuedGuestConnectionCount { response })
             .unwrap();
         self.signal().unwrap();
         receive.recv().unwrap()
     }
 
     #[cfg(test)]
-    fn retained_connector_count(&self) -> usize {
+    fn tcp_descriptor_counts(&self) -> (usize, usize, usize) {
         let (response, receive) = sync_channel(1);
         self.commands
-            .send(ReactorCommand::RetainedConnectorCount { response })
+            .send(ReactorCommand::TcpDescriptorCounts { response })
             .unwrap();
         self.signal().unwrap();
         receive.recv().unwrap()
@@ -693,32 +692,6 @@ impl ReactorClient {
         receive.recv().unwrap();
     }
 
-    #[cfg(test)]
-    fn expire_pending_guest_connections(&self) {
-        let (response, receive) = sync_channel(1);
-        self.commands
-            .send(ReactorCommand::ExpireDeadlinedState {
-                now: Instant::now() + PENDING_CONNECT_DISCARD_LIFETIME + Duration::from_secs(1),
-                response,
-            })
-            .unwrap();
-        self.signal().unwrap();
-        receive.recv().unwrap();
-    }
-
-    #[cfg(test)]
-    fn defer_untracked_guest_connection(&self, guest_port: u16) {
-        let (response, receive) = sync_channel(1);
-        self.commands
-            .send(ReactorCommand::DeferUntrackedGuestConnection {
-                guest_port,
-                response,
-            })
-            .unwrap();
-        self.signal().unwrap();
-        receive.recv().unwrap();
-    }
-
     fn close_session(&self, session_id: SessionId) {
         let (response, receive) = sync_channel(1);
         if self
@@ -792,6 +765,7 @@ enum ReactorCommand {
     Connect {
         id: u64,
         address: SocketAddrV4,
+        guest_source_lease: Option<GuestSourceLease>,
         response: SyncSender<core::result::Result<SocketConnectionStatus, PlatformConnectError>>,
     },
     Bind {
@@ -870,12 +844,12 @@ enum ReactorCommand {
         response: SyncSender<Option<SocketAddrV4>>,
     },
     #[cfg(test)]
-    PendingGuestConnectionCount {
+    QueuedGuestConnectionCount {
         response: SyncSender<usize>,
     },
     #[cfg(test)]
-    RetainedConnectorCount {
-        response: SyncSender<usize>,
+    TcpDescriptorCounts {
+        response: SyncSender<(usize, usize, usize)>,
     },
     #[cfg(test)]
     UdpQueuedDatagramCount {
@@ -919,16 +893,6 @@ enum ReactorCommand {
     },
     #[cfg(test)]
     ExhaustUdpEventTokens {
-        response: SyncSender<()>,
-    },
-    #[cfg(test)]
-    ExpireDeadlinedState {
-        now: Instant,
-        response: SyncSender<()>,
-    },
-    #[cfg(test)]
-    DeferUntrackedGuestConnection {
-        guest_port: u16,
         response: SyncSender<()>,
     },
     Stop {
@@ -1000,14 +964,13 @@ impl SocketEntry {
     }
 }
 
-/// Reactor-side per-session socket, retained-descriptor, and teardown state.
+/// Reactor-side per-session socket and teardown state.
 ///
 /// Sessions are ownership domains, not guest network namespaces.
 #[derive(Default)]
 struct ReactorSessionState {
     live_socket_count: usize,
     pending_guest_connection_count: usize,
-    retained_connector_count: usize,
     udp_external_peer_count: usize,
     udp_queued_datagrams: usize,
     udp_queued_bytes: usize,
@@ -1024,7 +987,6 @@ fn retain_session_state(state: &ReactorSessionState) -> bool {
     !state.closing
         || state.live_socket_count != 0
         || state.pending_guest_connection_count != 0
-        || state.retained_connector_count != 0
         || state.udp_external_peer_count != 0
         || state.udp_queued_datagrams != 0
         || state.udp_queued_bytes != 0
@@ -1120,6 +1082,7 @@ impl Reactor {
         &mut self,
         id: u64,
         guest_address: SocketAddrV4,
+        guest_source_lease: Option<GuestSourceLease>,
     ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
         let kind = self.sockets.get(&id).map(SocketEntry::kind).ok_or(
             PlatformConnectError::PeerIndeterminate(BrokerError::Internal),
@@ -1239,7 +1202,7 @@ impl Reactor {
                 .map_err(PlatformConnectError::PeerIndeterminate)?;
             return Ok(SocketConnectionStatus::Connected);
         }
-        self.connect_tcp_guest(id, guest_address)
+        self.connect_tcp_guest(id, guest_address, guest_source_lease)
     }
 
     fn send_to_socket(
@@ -1493,15 +1456,7 @@ impl Reactor {
         loop {
             let mut events = core::mem::take(&mut self.events);
             events.clear();
-            let now = Instant::now();
-            let timeout = self.next_cleanup_deadline().map(|deadline| {
-                let duration = deadline.saturating_duration_since(now);
-                Timespec {
-                    tv_sec: i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
-                    tv_nsec: i64::from(duration.subsec_nanos()),
-                }
-            });
-            match epoll::wait(&self.epoll, spare_capacity(&mut events), timeout.as_ref()) {
+            match epoll::wait(&self.epoll, spare_capacity(&mut events), None) {
                 Ok(_) => {}
                 Err(Errno::INTR) => {
                     self.events = events;
@@ -1509,8 +1464,6 @@ impl Reactor {
                 }
                 Err(error) => return Err(ReactorFailure::Io(error)),
             }
-            self.expire_deadlined_state(Instant::now());
-
             // Apply readiness observed by this wait before commands. A command
             // that then reaches EAGAIN records the newer authoritative state.
             let mut wake = false;
@@ -1521,25 +1474,8 @@ impl Reactor {
                 } else if id & UDP_EVENT_TOKEN_FLAG != 0 {
                     self.handle_udp_endpoint_event(id, event.flags)
                         .map_err(ReactorFailure::Broker)?;
-                } else {
-                    let failed_connection = if let Some(socket) = self.sockets.get_mut(&id) {
-                        if handle_socket_event(socket, event.flags)
-                            .map_err(ReactorFailure::Broker)?
-                        {
-                            socket
-                                .tcp_state()
-                                .ok()
-                                .and_then(|tcp| tcp.host_connection)
-                                .map(|connection| (connection, socket.session_id))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-                    if let Some((connection, session_id)) = failed_connection {
-                        self.discard_pending_guest_connection(connection, session_id);
-                    }
+                } else if let Some(socket) = self.sockets.get_mut(&id) {
+                    handle_socket_event(socket, event.flags).map_err(ReactorFailure::Broker)?;
                 }
             }
             self.events = events;
@@ -1593,10 +1529,20 @@ impl Reactor {
                 ReactorCommand::Connect {
                     id,
                     address,
+                    guest_source_lease,
                     response,
                 } => {
-                    let outcome = self.connect_socket(id, address);
-                    let _ = response.send(outcome);
+                    let outcome = self.connect_socket(id, address, guest_source_lease);
+                    let peer_may_have_changed =
+                        !matches!(&outcome, Err(PlatformConnectError::PeerUnchanged(_)));
+                    if response.send(outcome).is_err() && peer_may_have_changed {
+                        if let Some(socket) = self.sockets.get_mut(&id)
+                            && let Ok(tcp) = socket.tcp_state_mut()
+                        {
+                            tcp.abortive_close = true;
+                        }
+                        self.remove_socket(id);
+                    }
                 }
                 ReactorCommand::Bind {
                     id,
@@ -1638,6 +1584,11 @@ impl Reactor {
                         Ok(SocketOutcome::Completed(AcceptedEndpoints { .. }))
                     );
                     if response.send(outcome).is_err() && accepted {
+                        if let Some(socket) = self.sockets.get_mut(&accepted_id)
+                            && let Ok(tcp) = socket.tcp_state_mut()
+                        {
+                            tcp.abortive_close = true;
+                        }
                         self.remove_socket(accepted_id);
                         lifecycle.reactor_removed();
                     }
@@ -1714,7 +1665,7 @@ impl Reactor {
                     {
                         self.remove_socket(id);
                     }
-                    self.retire_session_connectors(session_id);
+                    self.purge_connector_session_queues(session_id);
                     self.sessions
                         .retain(|_, session| retain_session_state(session));
                     let _ = response.send(());
@@ -1725,28 +1676,37 @@ impl Reactor {
                     response,
                 } => {
                     let host_address = self
-                        .tcp
+                        .udp
                         .bindings
                         .get(guest_port)
-                        .and_then(|binding| binding.host_address)
-                        .or_else(|| {
-                            self.udp
-                                .bindings
-                                .get(guest_port)
-                                .and_then(|binding| self.sockets.get(&binding.socket_id))
-                                .and_then(|socket| socket.udp_state().ok())
-                                .and_then(|udp| udp.native_endpoint.as_ref())
-                                .map(|endpoint| endpoint.host_address)
-                        });
+                        .and_then(|binding| self.sockets.get(&binding.socket_id))
+                        .and_then(|socket| socket.udp_state().ok())
+                        .and_then(|udp| udp.native_endpoint.as_ref())
+                        .map(|endpoint| endpoint.host_address);
                     let _ = response.send(host_address);
                 }
                 #[cfg(test)]
-                ReactorCommand::PendingGuestConnectionCount { response } => {
-                    let _ = response.send(self.tcp.pending_guest_connections.len());
+                ReactorCommand::QueuedGuestConnectionCount { response } => {
+                    let _ = response.send(self.tcp.queued_guest_connection_count);
                 }
                 #[cfg(test)]
-                ReactorCommand::RetainedConnectorCount { response } => {
-                    let _ = response.send(self.tcp.retained_connector_count);
+                ReactorCommand::TcpDescriptorCounts { response } => {
+                    let mut unrealized = 0;
+                    let mut native = 0;
+                    let mut guest = 0;
+                    for descriptor in self
+                        .sockets
+                        .values()
+                        .filter_map(|socket| socket.tcp_state().ok())
+                        .map(|tcp| &tcp.descriptor)
+                    {
+                        match descriptor {
+                            TcpDescriptor::Unrealized => unrealized += 1,
+                            TcpDescriptor::NativeInet(_) => native += 1,
+                            TcpDescriptor::GuestUnix(_) => guest += 1,
+                        }
+                    }
+                    let _ = response.send((unrealized, native, guest));
                 }
                 #[cfg(test)]
                 ReactorCommand::UdpQueuedDatagramCount { response } => {
@@ -1858,28 +1818,6 @@ impl Reactor {
                     self.udp.next_event_token = UDP_EVENT_TOKEN_FLAG - 1;
                     let _ = response.send(());
                 }
-                #[cfg(test)]
-                ReactorCommand::ExpireDeadlinedState { now, response } => {
-                    self.expire_deadlined_state(now);
-                    let _ = response.send(());
-                }
-                #[cfg(test)]
-                ReactorCommand::DeferUntrackedGuestConnection {
-                    guest_port,
-                    response,
-                } => {
-                    let listener_id = self
-                        .tcp
-                        .bindings
-                        .get(guest_port)
-                        .expect("test guest listener binding missing")
-                        .socket_id;
-                    self.tcp.defer_untracked_connection(
-                        listener_id,
-                        Instant::now() + PENDING_CONNECT_DISCARD_LIFETIME,
-                    );
-                    let _ = response.send(());
-                }
                 ReactorCommand::Stop { response } => {
                     while let Some(id) = self.sockets.keys().next().copied() {
                         self.remove_socket(id);
@@ -1907,7 +1845,7 @@ impl Reactor {
         if self
             .sockets
             .len()
-            .checked_add(self.tcp.retained_connector_count)
+            .checked_add(self.tcp.queued_guest_connection_count)
             .is_none_or(|count| count >= self.max_sockets)
         {
             return Err(BrokerError::ResourceExhausted);
@@ -1927,16 +1865,13 @@ impl Reactor {
         }
         if session
             .live_socket_count
-            .checked_add(session.retained_connector_count)
+            .checked_add(session.pending_guest_connection_count)
             .is_none_or(|count| count >= self.max_sockets_per_session)
         {
             return Err(BrokerError::ResourceExhausted);
         }
         let (transport, initial_readiness) = match kind {
-            SocketKind::Tcp => (
-                create_tcp_transport(&self.epoll, id)?,
-                ReadinessFlags::default(),
-            ),
+            SocketKind::Tcp => (create_tcp_transport(), ReadinessFlags::default()),
             SocketKind::Udp => (
                 SocketTransportState::Udp(UdpSocketState::default()),
                 ReadinessFlags::WRITE,
@@ -2003,7 +1938,11 @@ fn zeroed_vec(length: usize) -> BrokerResult<Vec<u8>> {
 }
 
 fn take_socket_error(socket: &SocketEntry) -> BrokerResult<Option<SocketError>> {
-    let native_socket = &socket.tcp_state()?.socket;
+    let tcp = socket.tcp_state()?;
+    if !tcp.descriptor.is_native() {
+        return Ok(None);
+    }
+    let native_socket = tcp.descriptor.socket()?;
     match sockopt::socket_error(native_socket) {
         Ok(Ok(())) => Ok(None),
         Ok(Err(error)) | Err(error) => socket_operation_error_from_errno(error).map(Some),
@@ -2031,12 +1970,19 @@ fn status_socket(socket: &mut SocketEntry) -> BrokerResult<PlatformSocketStatus>
     } else {
         None
     };
+    let pending_guest_reset = guest_reset_pending(socket)?;
     let (response, readiness, republish_error) = {
         let mut snapshot = socket
             .snapshot
             .lock()
             .expect("Linux socket snapshot mutex poisoned");
         let cached_error = snapshot.pending_error.take();
+        let socket_error =
+            if pending_guest_reset && cached_error != Some(SocketError::ConnectionReset) {
+                Some(SocketError::ConnectionReset)
+            } else {
+                socket_error
+            };
         let (pending_error, next_pending_error) = shift_pending_error(cached_error, socket_error);
         snapshot.pending_error = next_pending_error;
         if pending_error.is_some() && next_pending_error.is_none() {
@@ -2052,6 +1998,12 @@ fn status_socket(socket: &mut SocketEntry) -> BrokerResult<PlatformSocketStatus>
             next_pending_error.is_some(),
         )
     };
+    if pending_guest_reset
+        && response.pending_error == Some(SocketError::ConnectionReset)
+        && !consume_pending_guest_reset(socket)?
+    {
+        return Err(BrokerError::Internal);
+    }
     let publication = if republish_error {
         socket.readiness.republish(readiness)
     } else if response.pending_error.is_some() {

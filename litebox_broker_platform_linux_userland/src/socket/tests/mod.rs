@@ -3,7 +3,7 @@
 
 use std::io::{Read as _, Write as _};
 use std::net::Ipv4Addr;
-use std::net::{Shutdown, TcpListener, TcpStream, UdpSocket};
+use std::net::{Shutdown, TcpListener, UdpSocket};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
@@ -211,7 +211,7 @@ impl ReadinessSink for TestReadinessSink {
 }
 
 struct PendingPublishFailure {
-    handle: ObjectHandle,
+    handle: Option<ObjectHandle>,
     required: ReadinessFlags,
     forbidden: ReadinessFlags,
 }
@@ -237,7 +237,15 @@ impl FailingReadinessSink {
         forbidden: ReadinessFlags,
     ) {
         *self.fail_next_publish.lock().unwrap() = Some(PendingPublishFailure {
-            handle,
+            handle: Some(handle),
+            required,
+            forbidden,
+        });
+    }
+
+    fn fail_next_publish_matching_any(&self, required: ReadinessFlags, forbidden: ReadinessFlags) {
+        *self.fail_next_publish.lock().unwrap() = Some(PendingPublishFailure {
+            handle: None,
             required,
             forbidden,
         });
@@ -270,7 +278,7 @@ impl ReadinessSink for FailingReadinessSink {
     fn publish(&self, handle: ObjectHandle, readiness: ReadinessFlags) -> BrokerResult<()> {
         let mut fail_next_publish = self.fail_next_publish.lock().unwrap();
         let should_fail = fail_next_publish.as_ref().is_some_and(|failure| {
-            failure.handle == handle
+            failure.handle.is_none_or(|failed| failed == handle)
                 && readiness.contains(failure.required)
                 && readiness.0 & failure.forbidden.0 == 0
         });
@@ -363,7 +371,10 @@ fn non_loopback_local_ipv4() -> Option<Ipv4Addr> {
     let probe = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
     probe.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).ok()?;
     let address = socket_address_v4(probe.local_addr().ok()?);
-    (!address.ip().is_unspecified() && !address.ip().is_loopback()).then_some(*address.ip())
+    (!address.ip().is_unspecified()
+        && !address.ip().is_loopback()
+        && *address.ip() != GUEST_IPV4_ADDRESS)
+        .then_some(*address.ip())
 }
 
 fn create_socket(
@@ -479,13 +490,45 @@ fn wait_for_readiness(
     );
 }
 
+fn wait_for_readiness_publication(
+    publications: &Receiver<(ObjectHandle, ReadinessFlags)>,
+    handle: ObjectHandle,
+    readiness: ReadinessFlags,
+) {
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .expect("timed out waiting for socket readiness publication");
+        let (published_handle, published) = publications.recv_timeout(remaining).unwrap();
+        if published_handle == handle && published.contains(readiness) {
+            return;
+        }
+    }
+}
+
 fn wait_until_ready(
     session: &litebox_broker_core::BrokerSession,
     publications: &Receiver<(ObjectHandle, ReadinessFlags)>,
     handle: ObjectHandle,
     readiness: ReadinessFlags,
 ) {
-    let deadline = Instant::now() + TEST_TIMEOUT;
+    wait_until_ready_until(
+        session,
+        publications,
+        handle,
+        readiness,
+        Instant::now() + TEST_TIMEOUT,
+    );
+}
+
+fn wait_until_ready_until(
+    session: &litebox_broker_core::BrokerSession,
+    publications: &Receiver<(ObjectHandle, ReadinessFlags)>,
+    handle: ObjectHandle,
+    readiness: ReadinessFlags,
+    deadline: Instant,
+) {
     loop {
         if session.check_readiness(handle).unwrap().contains(readiness) {
             return;

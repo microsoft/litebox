@@ -819,6 +819,7 @@ mod tests {
         fn connect(
             &self,
             _address: SocketAddrV4,
+            _guest_source_lease: Option<litebox_broker_core::socket::GuestSourceLease>,
         ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
             self.readiness
                 .publish(litebox_broker_protocol::readiness::ReadinessFlags::WRITE)
