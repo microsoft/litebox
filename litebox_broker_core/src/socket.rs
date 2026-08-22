@@ -384,7 +384,7 @@ impl GuestSocketBinding {
     /// Selects this binding's guest-visible source for a routed destination.
     ///
     /// Exact loopback bindings cannot leave the guest namespace. Wildcard
-    /// bindings use the requested loopback identity for guest loopback and the
+    /// bindings use the primary loopback identity for guest loopback and the
     /// fixed private guest identity for private-guest and native routes.
     #[must_use]
     pub fn source_address_for_destination(
@@ -403,7 +403,7 @@ impl GuestSocketBinding {
             return Some(self.requested);
         }
         let source_ip = match destination {
-            SocketDestination::Guest(address) if address.ip().is_loopback() => *address.ip(),
+            SocketDestination::Guest(address) if address.ip().is_loopback() => Ipv4Addr::LOCALHOST,
             SocketDestination::Guest(_) | SocketDestination::Native { .. } => GUEST_IPV4_ADDRESS,
         };
         Some(SocketAddrV4::new(source_ip, self.requested.port()))
@@ -2401,6 +2401,10 @@ pub(crate) mod tests {
         let binding = GuestSocketBinding::new(&wildcard_binding);
         assert_eq!(
             binding.guest_source_address(first),
+            Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080))
+        );
+        assert_eq!(
+            binding.guest_source_address(second),
             Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080))
         );
         assert_eq!(binding.guest_source_address(private), Some(private));

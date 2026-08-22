@@ -1666,6 +1666,11 @@ fn tcp_exact_bindings_coexist_and_wildcard_accepts_concrete_destinations() {
             ))
         ));
         wait_until_connected(&connector_session, connector, &publications);
+        let connector_address = litebox_broker_core::socket::status(&connector_session, connector)
+            .unwrap()
+            .local_address
+            .unwrap();
+        assert_eq!(*connector_address.ip(), Ipv4Addr::LOCALHOST);
         wait_until_ready(
             &listener_session,
             &publications,
@@ -1683,6 +1688,7 @@ fn tcp_exact_bindings_coexist_and_wildcard_accepts_concrete_destinations() {
             SocketOutcome::Failed(error) => panic!("exact accept failed: {error:?}"),
         };
         assert_eq!(accepted.local_address, destination);
+        assert_eq!(accepted.remote_address, connector_address);
     }
 
     let wildcard_listener = create_socket(&listener_session, readiness.clone());

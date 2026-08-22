@@ -1432,7 +1432,7 @@ fn udp_exact_bindings_coexist_and_wildcard_covers_guest_addresses() {
                 received: payload.len(),
                 datagram_length: payload.len(),
                 source_address: SocketAddrV4::new(
-                    *destination.ip(),
+                    Ipv4Addr::LOCALHOST,
                     litebox_broker_core::socket::status(&sender_session, sender)
                         .unwrap()
                         .local_address
