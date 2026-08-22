@@ -22,24 +22,20 @@ impl TestLauncher {
     ) -> Self {
         let platform = Platform::new();
         let shim_builder = litebox_shim_linux::LinuxShimBuilder::new(platform);
-        let litebox = shim_builder.litebox();
 
-        let in_mem_fs = litebox::fs::resolver::Resolver::new(
-            litebox,
-            litebox::fs::in_mem::InMem::new_initialized([(
-                "/",
-                litebox::fs::in_mem::InitialNode::Directory {
-                    mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
-                    owner: litebox::fs::UserInfo::ROOT,
-                },
-            )]),
-        );
+        let in_mem = litebox::fs::in_mem::InMem::new_initialized([(
+            "/",
+            litebox::fs::in_mem::InitialNode::Directory {
+                mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+                owner: litebox::fs::UserInfo::ROOT,
+            },
+        )]);
         let tar_data = if tar_data.is_empty() {
             litebox::fs::tar_ro::EMPTY_TAR_FILE.into()
         } else {
             tar_data.into()
         };
-        let fs = shim_builder.default_fs(in_mem_fs, tar_data);
+        let fs = shim_builder.default_fs(in_mem, tar_data);
         let mut this = Self {
             platform,
             shim_builder,

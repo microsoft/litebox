@@ -99,27 +99,21 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     } else {
         litebox_shim_linux::LinuxShimBuilder::new(platform)
     };
-    let litebox = shim_builder.litebox();
 
     // The program path is a Unix-style path inside the tar archive.
     let prog_path = &cli_args.program_and_arguments[0];
 
     let initial_file_system = {
-        let in_mem = litebox::fs::resolver::Resolver::new(
-            litebox,
-            litebox::fs::in_mem::InMem::new_initialized([(
-                "/tmp",
-                litebox::fs::in_mem::InitialNode::Directory {
-                    mode: litebox::fs::Mode::RWXU
-                        | litebox::fs::Mode::RWXG
-                        | litebox::fs::Mode::RWXO,
-                    owner: litebox::fs::UserInfo {
-                        user: 1000,
-                        group: 1000,
-                    },
+        let in_mem = litebox::fs::in_mem::InMem::new_initialized([(
+            "/tmp",
+            litebox::fs::in_mem::InitialNode::Directory {
+                mode: litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
+                owner: litebox::fs::UserInfo {
+                    user: 1000,
+                    group: 1000,
                 },
-            )]),
-        );
+            },
+        )]);
 
         shim_builder.default_fs(in_mem, tar_data.into())
     };
