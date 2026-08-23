@@ -411,7 +411,6 @@ where
 pub struct WindowsShimBuilder<Platform: ShimPlatform> {
     platform: &'static Platform,
     litebox: LiteBox<Platform>,
-    nt_gdi_init2: Option<fn(usize) -> usize>,
 }
 
 impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
@@ -423,20 +422,7 @@ impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
     /// Creates a builder backed by an existing LiteBox instance.
     #[must_use]
     pub fn new_with_litebox(platform: &'static Platform, litebox: LiteBox<Platform>) -> Self {
-        Self {
-            platform,
-            litebox,
-            nt_gdi_init2: None,
-        }
-    }
-
-    /// Configures the host-backed implementation used for `NtGdiInit2`.
-    ///
-    /// The callback receives the address of the guest process environment block.
-    #[must_use]
-    pub fn with_nt_gdi_init2(mut self, callback: fn(usize) -> usize) -> Self {
-        self.nt_gdi_init2 = Some(callback);
-        self
+        Self { platform, litebox }
     }
 
     #[must_use]
@@ -469,7 +455,6 @@ impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
             mui_generation: AtomicU32::new(1),
             qpc_boot_instant: TimeProvider::now(self.platform),
             litebox: self.litebox,
-            nt_gdi_init2: self.nt_gdi_init2,
             _fs: PhantomData,
         });
         WindowsShim(global)
@@ -589,7 +574,6 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     mui_generation: AtomicU32,
     qpc_boot_instant: <Platform as TimeProvider>::Instant,
     litebox: LiteBox<Platform>,
-    nt_gdi_init2: Option<fn(usize) -> usize>,
     _fs: PhantomData<FS>,
 }
 
@@ -620,6 +604,7 @@ pub struct Process<Platform: ShimPlatform> {
     wnf_notification_event: Mutex<Platform, Option<Arc<syscalls::event::EventObject<Platform>>>>,
     wnf_subscriptions: Mutex<Platform, syscalls::wnf::WnfProcessSubscriptions>,
     trace_notifications: Mutex<Platform, syscalls::trace::TraceNotifications<Platform>>,
+    gdi_state: Mutex<Platform, Option<syscalls::gdi::GdiProcessState>>,
     cookie: u32,
     exit_code: AtomicI32,
     next_thread_id: AtomicUsize,
@@ -716,6 +701,7 @@ impl<Platform: ShimPlatform> Process<Platform> {
             wnf_notification_event: Mutex::new(None),
             wnf_subscriptions: Mutex::new(syscalls::wnf::WnfProcessSubscriptions::default()),
             trace_notifications: Mutex::new(syscalls::trace::TraceNotifications::default()),
+            gdi_state: Mutex::new(None),
             cookie: syscalls::process::default_process_cookie(),
             exit_code: AtomicI32::new(DEFAULT_PROCESS_EXIT_CODE),
             next_thread_id: AtomicUsize::new(syscalls::process::INITIAL_THREAD_ID + 1),
@@ -990,10 +976,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     fn handle_syscall_request(&self, ctx: &mut litebox_common_linux::PtRegs) {
         if let Some(syscall) = Win32Sysno::from_raw(ctx.orig_rax) {
             ctx.rax = match syscall {
-                Win32Sysno::NtGdiInit2 => self
-                    .global
-                    .nt_gdi_init2
-                    .map_or(0, |callback| callback(self.process.peb_address)),
+                Win32Sysno::NtGdiInit2 => self.sys_nt_gdi_init2(),
             };
             return;
         }

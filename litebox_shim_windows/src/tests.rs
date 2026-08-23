@@ -242,8 +242,24 @@ fn unknown_syscall_returns_not_supported() {
 }
 
 #[test]
-fn nt_gdi_init2_without_host_callback_returns_null() {
-    let task = test_task();
+fn nt_gdi_init2_initializes_per_process_guest_state() {
+    let mut task = test_task();
+    let peb_length = litebox::mm::linux::NonZeroPageSize::new(
+        size_of::<crate::nt_types::ProcessEnvironmentBlock>().next_multiple_of(crate::PAGE_SIZE),
+    )
+    .unwrap();
+    // SAFETY: no fixed address is requested, so the page manager selects an unused test mapping.
+    let peb = unsafe {
+        task.global.page_manager.create_writable_pages(
+            None,
+            peb_length,
+            litebox::mm::linux::CreatePagesFlags::empty(),
+            |_| Ok(0),
+        )
+    }
+    .unwrap()
+    .as_usize();
+    Arc::get_mut(&mut task.process).unwrap().peb_address = peb;
     let mut context = litebox_common_linux::PtRegs {
         orig_rax: litebox_common_windows::Win32Sysno::NtGdiInit2.as_raw() as usize,
         ..Default::default()
@@ -251,7 +267,29 @@ fn nt_gdi_init2_without_host_callback_returns_null() {
 
     task.handle_syscall_request(&mut context);
 
-    assert_eq!(context.rax, 0);
+    let cookie = context.rax;
+    assert_ne!(cookie, 0);
+    let peb = ConstPtr::<TestPlatform, crate::nt_types::ProcessEnvironmentBlock>::from_usize(peb)
+        .read_at_offset(0)
+        .unwrap();
+    assert_ne!(peb.gdi_shared_handle_table, 0);
+    let stock_object = |table_offset, id| {
+        ConstPtr::<TestPlatform, u64>::from_usize(
+            peb.gdi_shared_handle_table + table_offset + id * size_of::<u64>(),
+        )
+        .read_at_offset(0)
+    };
+    assert_eq!(stock_object(0x1800b0, 17), Some(0));
+    assert_eq!(stock_object(0x1800b0, 18), Some(1));
+    assert_eq!(stock_object(0x1800b0, 19), Some(1));
+    assert_eq!(stock_object(0x1800b0, 20), Some(0));
+    assert_eq!(stock_object(0x180160, 18), Some(0));
+    assert_eq!(stock_object(0x180210, 18), Some(0));
+    assert_eq!(stock_object(0x180138, 0), Some(0));
+    assert_eq!(stock_object(0x1801e8, 0), Some(0));
+
+    task.handle_syscall_request(&mut context);
+    assert_eq!(context.rax, cookie);
 }
 
 #[test]
