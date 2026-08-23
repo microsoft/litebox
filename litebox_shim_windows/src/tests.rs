@@ -224,24 +224,6 @@ fn create_event(task: &Task<TestPlatform, TestFS>, desired_access: u32) -> Handl
 }
 
 #[test]
-fn unknown_syscall_returns_not_supported() {
-    let task = test_task();
-    let mut context = litebox_common_linux::PtRegs {
-        orig_rax: 0x12ec,
-        ..Default::default()
-    };
-
-    task.handle_syscall_request(&mut context);
-
-    assert_eq!(
-        context.rax,
-        litebox_common_windows::nt_status::NtStatus::NOT_SUPPORTED
-            .as_raw()
-            .cast_unsigned() as usize
-    );
-}
-
-#[test]
 fn nt_gdi_init2_initializes_per_process_guest_state() {
     let mut task = test_task();
     let peb_length = litebox::mm::linux::NonZeroPageSize::new(

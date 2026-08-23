@@ -63,6 +63,7 @@ use alloc::vec::Vec;
 use core::ops::Range;
 
 use litebox_common_windows::{NtSysno, Win32Sysno};
+use object::LittleEndian as LE;
 use object::pe::{IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE};
 use object::read::pe::{ImageNtHeaders as _, ImageOptionalHeader as _, PeFile64};
 use object::read::{Object as _, ObjectSection as _, ObjectSegment as _};
@@ -460,8 +461,11 @@ pub fn rewrite_pe_for_litebox(input_binary: &[u8], trampoline: Option<u64>) -> R
             Err(InternalError::Public(e)) => return Err(e),
             Err(e) => unreachable!("unexpected internal error: {e:?}"),
         };
-        let mut sysno_map = pe_ntdll_sysno_map(&file, buf, &text_sections)?;
-        sysno_map.extend(pe_win32u_sysno_map(&file, buf, &text_sections)?);
+        let sysno_map = match pe_syscall_dll(&pe)? {
+            Some(PeSyscallDll::Ntdll) => pe_ntdll_sysno_map(&file, buf, &text_sections)?,
+            Some(PeSyscallDll::Win32u) => pe_win32u_sysno_map(&file, buf, &text_sections)?,
+            None => BTreeMap::new(),
+        };
         (
             text_sections,
             sysno_map,
@@ -562,6 +566,41 @@ fn pe_text_sections(
     Ok(text_sections)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PeSyscallDll {
+    Ntdll,
+    Win32u,
+}
+
+fn pe_syscall_dll(file: &PeFile64<'_>) -> Result<Option<PeSyscallDll>> {
+    let Some(exports) = file
+        .export_table()
+        .map_err(|e| Error::ParseError(e.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let name_pointer = exports.directory().name.get(LE);
+    if name_pointer == 0 {
+        return Ok(None);
+    }
+    let name = exports
+        .name_from_pointer(name_pointer)
+        .map_err(|e| Error::ParseError(e.to_string()))?;
+    Ok(pe_syscall_dll_from_export_name(name))
+}
+
+// Syscall counts vary across Windows builds, but the export directory's DLL
+// name is the image's stable self-identification field.
+fn pe_syscall_dll_from_export_name(name: &[u8]) -> Option<PeSyscallDll> {
+    if name.eq_ignore_ascii_case(b"ntdll.dll") {
+        Some(PeSyscallDll::Ntdll)
+    } else if name.eq_ignore_ascii_case(b"win32u.dll") {
+        Some(PeSyscallDll::Win32u)
+    } else {
+        None
+    }
+}
+
 /// For ntdll-like PEs, walks `Nt*` exports of `file`, reads the build-specific
 /// sysno each stub loads into `eax`, and maps it to the stable LiteBox
 /// [`NtSysno`] for that name. `Nt*` and `Zw*` always share sysno numbering
@@ -573,8 +612,30 @@ fn pe_ntdll_sysno_map(
     buf: &[u8],
     text_sections: &[TextSectionInfo],
 ) -> Result<BTreeMap<u32, u32>> {
+    pe_sysno_map(file, buf, text_sections, |name| {
+        NtSysno::from_export_name(name).map(NtSysno::as_raw)
+    })
+}
+
+/// Maps build-specific Win32u service numbers to LiteBox's canonical Win32u
+/// syscall table by export name.
+fn pe_win32u_sysno_map(
+    file: &object::File<'_>,
+    buf: &[u8],
+    text_sections: &[TextSectionInfo],
+) -> Result<BTreeMap<u32, u32>> {
+    pe_sysno_map(file, buf, text_sections, |name| {
+        Win32Sysno::from_export_name(name).map(Win32Sysno::as_raw)
+    })
+}
+
+fn pe_sysno_map(
+    file: &object::File<'_>,
+    buf: &[u8],
+    text_sections: &[TextSectionInfo],
+    mut canonical_sysno: impl FnMut(&str) -> Option<u32>,
+) -> Result<BTreeMap<u32, u32>> {
     let mut map = BTreeMap::new();
-    let mut exports_ntdll_loader_entrypoint = false;
 
     for export in file
         .exports()
@@ -583,9 +644,8 @@ fn pe_ntdll_sysno_map(
         let Ok(name) = core::str::from_utf8(export.name()) else {
             continue;
         };
-        exports_ntdll_loader_entrypoint |= name == "LdrInitializeThunk";
 
-        let Some(sysno) = NtSysno::from_export_name(name) else {
+        let Some(sysno) = canonical_sysno(name) else {
             continue;
         };
 
@@ -602,52 +662,7 @@ fn pe_ntdll_sysno_map(
         let stub_offset = usize::try_from(addr - section.vaddr)
             .map_err(|_| Error::ParseError("export offset out of range".into()))?;
         if let Some(build_sysno) = read_nt_stub_sysno(section_data, stub_offset) {
-            map.insert(build_sysno, sysno.as_raw());
-        }
-    }
-
-    if !exports_ntdll_loader_entrypoint {
-        return Ok(BTreeMap::new());
-    }
-
-    Ok(map)
-}
-
-/// Maps the build-specific Win32u service numbers for the small set of
-/// Win32k syscalls that LiteBox explicitly handles into a namespace disjoint
-/// from ntdll's stable syscall numbers.
-fn pe_win32u_sysno_map(
-    file: &object::File<'_>,
-    buf: &[u8],
-    text_sections: &[TextSectionInfo],
-) -> Result<BTreeMap<u32, u32>> {
-    let mut map = BTreeMap::new();
-
-    for export in file
-        .exports()
-        .map_err(|e| Error::ParseError(e.to_string()))?
-    {
-        let Ok(name) = core::str::from_utf8(export.name()) else {
-            continue;
-        };
-        let Some(sysno) = Win32Sysno::from_export_name(name) else {
-            continue;
-        };
-
-        let addr = export.address();
-        let Some(section) = text_sections.iter().find(|section| {
-            section
-                .vaddr
-                .checked_add(section.size)
-                .is_some_and(|end| addr >= section.vaddr && addr < end)
-        }) else {
-            continue;
-        };
-        let section_data = section_slice(buf, section)?;
-        let stub_offset = usize::try_from(addr - section.vaddr)
-            .map_err(|_| Error::ParseError("export offset out of range".into()))?;
-        if let Some(build_sysno) = read_nt_stub_sysno(section_data, stub_offset) {
-            map.insert(build_sysno, sysno.as_raw());
+            map.insert(build_sysno, sysno);
         }
     }
 
@@ -3095,7 +3110,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_replaces_win32u_service_with_disjoint_stable_sysno() {
+    fn rewrite_replaces_win32u_service_with_canonical_sysno() {
         let mut stub = nt_stub_bytes();
         let mut map = BTreeMap::new();
         map.insert(NT_STUB_BUILD_SYSNO, Win32Sysno::NtGdiInit2.as_raw());

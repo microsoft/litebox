@@ -541,36 +541,42 @@ nt_sysnos! {
     (0x1e8, NtWaitLowEventPair),
 }
 
-/// Stable LiteBox syscall numbers for Win32u syscalls handled by the Windows shim.
-///
-/// Win32u uses a build-specific service table distinct from ntdll's NT service
-/// table. Keep its rewritten values in a disjoint range so dispatch cannot
-/// confuse a Win32u service with an NT syscall.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u32)]
-pub enum Win32Sysno {
-    NtGdiInit2 = 0x1000_0000,
+macro_rules! win32_sysnos {
+    ($(($number:literal, $name:ident)),+ $(,)?) => {
+        /// Canonical Win32u syscall numbers used by rewritten guest PE stubs.
+        ///
+        /// The values follow `win32u.dll` 10.0.26100.8875. The syscall
+        /// rewriter maps other builds into this table by export name.
+        #[allow(clippy::enum_variant_names, non_camel_case_types)]
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        #[repr(u32)]
+        pub enum Win32Sysno {
+            $($name = $number,)+
+        }
+
+        impl Win32Sysno {
+            #[must_use]
+            pub const fn from_raw(raw: usize) -> Option<Self> {
+                match raw {
+                    $($number => Some(Self::$name),)+
+                    _ => None,
+                }
+            }
+
+            #[must_use]
+            pub fn from_export_name(name: &str) -> Option<Self> {
+                match name {
+                    $(stringify!($name) => Some(Self::$name),)+
+                    _ => None,
+                }
+            }
+
+            #[must_use]
+            pub const fn as_raw(self) -> u32 {
+                self as u32
+            }
+        }
+    };
 }
 
-impl Win32Sysno {
-    #[must_use]
-    pub const fn from_raw(raw: usize) -> Option<Self> {
-        match raw {
-            0x1000_0000 => Some(Self::NtGdiInit2),
-            _ => None,
-        }
-    }
-
-    #[must_use]
-    pub fn from_export_name(name: &str) -> Option<Self> {
-        match name {
-            "NtGdiInit2" => Some(Self::NtGdiInit2),
-            _ => None,
-        }
-    }
-
-    #[must_use]
-    pub const fn as_raw(self) -> u32 {
-        self as u32
-    }
-}
+include!("win32_sysnos.rs");

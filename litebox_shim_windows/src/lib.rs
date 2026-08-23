@@ -977,6 +977,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if let Some(syscall) = Win32Sysno::from_raw(ctx.orig_rax) {
             ctx.rax = match syscall {
                 Win32Sysno::NtGdiInit2 => self.sys_nt_gdi_init2(),
+                _ => NtStatus::NOT_SUPPORTED.as_raw().cast_unsigned() as usize,
             };
             return;
         }
