@@ -3,7 +3,7 @@
 
 use core::net::SocketAddrV4;
 
-use crate::socket::is_internal_socket_destination;
+use crate::socket::is_internal_socket_address;
 use crate::{BrokerError, CallerCredential, ObjectRights};
 use litebox_broker_protocol::socket::{
     AddressFamily, CreateSocketRequest, IpProtocol, Ipv4Address, Port, SocketType,
@@ -268,7 +268,7 @@ impl SocketPolicy {
         destination: SocketAddrV4,
     ) -> bool {
         self.tcp.is_some_and(|policy| {
-            is_internal_socket_destination(destination)
+            is_internal_socket_address(destination)
                 || policy
                     .rules()
                     .iter()
@@ -282,7 +282,7 @@ impl SocketPolicy {
         destination: SocketAddrV4,
     ) -> bool {
         self.udp.is_some_and(|policy| {
-            is_internal_socket_destination(destination)
+            is_internal_socket_address(destination)
                 || policy
                     .rules()
                     .iter()

@@ -12,7 +12,7 @@ use std::time::Duration;
 use litebox_broker_core::readiness::ReadinessRegistration;
 use litebox_broker_core::socket::{
     GuestSocketBinding, GuestSourceLease, PlatformConnectError, host_socket_destination,
-    is_internal_socket_destination, normalize_socket_destination,
+    is_internal_socket_address, normalize_socket_destination,
 };
 use litebox_broker_core::{BrokerError, Result as BrokerResult, SessionId};
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -1866,7 +1866,7 @@ impl Reactor {
             Ok(destination) => destination,
             Err(error) => return SocketOutcome::Failed(error),
         };
-        if !is_internal_socket_destination(destination) {
+        if !is_internal_socket_address(destination) {
             return SocketOutcome::Completed(ResolvedTcpDestination::External(destination));
         }
         let Some(binding) = self.tcp.guest_binding(destination) else {

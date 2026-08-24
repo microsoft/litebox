@@ -14,7 +14,7 @@ use std::os::fd::OwnedFd;
 
 use litebox_broker_core::socket::{
     GUEST_IPV4_ADDRESS, GuestSocketBinding, PlatformConnectError, host_socket_destination,
-    is_internal_socket_destination, normalize_socket_destination,
+    is_internal_socket_address, normalize_socket_destination,
 };
 use litebox_broker_core::{BrokerError, Result as BrokerResult, SessionId};
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -307,7 +307,7 @@ impl Reactor {
             Ok(destination) => destination,
             Err(error) => return SocketOutcome::Failed(error),
         };
-        if !is_internal_socket_destination(destination) {
+        if !is_internal_socket_address(destination) {
             return if self.targets_private_udp_native_endpoint(host_socket_destination(destination))
             {
                 SocketOutcome::Failed(SocketError::ConnectionRefused)

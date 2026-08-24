@@ -34,14 +34,17 @@ pub const GUEST_IPV4_ADDRESS: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 15);
 /// Fixed guest-visible address used to reach host-loopback services.
 pub const HOST_GATEWAY_IPV4_ADDRESS: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 1);
 
-pub(crate) fn is_internal_network_address(address: Ipv4Addr) -> bool {
+fn is_concrete_internal_address(address: Ipv4Addr) -> bool {
     address.is_loopback() || address == GUEST_IPV4_ADDRESS
 }
 
-/// Returns whether a destination resolves within the sandbox's internal network.
+/// Returns whether the IP is unspecified, loopback, or [`GUEST_IPV4_ADDRESS`].
+///
+/// The port is ignored. [`HOST_GATEWAY_IPV4_ADDRESS`] remains external and
+/// subject to destination policy.
 #[must_use]
-pub fn is_internal_socket_destination(destination: SocketAddrV4) -> bool {
-    destination.ip().is_unspecified() || is_internal_network_address(*destination.ip())
+pub fn is_internal_socket_address(address: SocketAddrV4) -> bool {
+    address.ip().is_unspecified() || is_concrete_internal_address(*address.ip())
 }
 
 /// Returns the host-socket destination for a normalized external destination.
@@ -176,7 +179,7 @@ enum GuestBindingKey {
     Exact(SocketAddrV4),
 }
 
-/// Shared registration for one guest transport port.
+/// Shared registration for one exact or wildcard guest transport binding.
 ///
 /// The final owner removes the binding from the broker-wide namespace.
 struct GuestPortBinding {
@@ -226,7 +229,7 @@ impl BrokerSocketPorts {
         request: CreateSocketRequest,
         requested_address: SocketAddrV4,
     ) -> Result<SocketOutcome<(SocketAddrV4, Arc<GuestPortBinding>)>> {
-        if !guest_binding_address_is_valid(requested_address) {
+        if !is_internal_socket_address(requested_address) {
             return Ok(SocketOutcome::Failed(SocketError::AddressNotAvailable));
         }
         let transport = guest_transport(request).ok_or(BrokerError::Internal)?;
@@ -261,10 +264,6 @@ impl BrokerSocketPorts {
             }),
         )))
     }
-}
-
-fn guest_binding_address_is_valid(address: SocketAddrV4) -> bool {
-    address.ip().is_unspecified() || is_internal_network_address(*address.ip())
 }
 
 impl Drop for GuestPortBinding {
@@ -309,7 +308,7 @@ impl GuestSocketBinding {
     /// Checks that this value represents a supported guest binding.
     #[must_use]
     pub fn is_valid(&self) -> bool {
-        self.requested.port() != 0 && guest_binding_address_is_valid(self.requested)
+        self.requested.port() != 0 && is_internal_socket_address(self.requested)
     }
 
     /// Returns whether this binding belongs to the TCP guest namespace.
@@ -324,7 +323,7 @@ impl GuestSocketBinding {
         self.is_valid()
             && if self.is_wildcard() {
                 address.port() == self.requested.port()
-                    && is_internal_network_address(*address.ip())
+                    && is_concrete_internal_address(*address.ip())
             } else {
                 address == self.requested
             }
@@ -345,7 +344,7 @@ impl GuestSocketBinding {
         }
         let destination = normalize_socket_destination(destination).ok()?;
         if !self.is_wildcard() {
-            if self.requested.ip().is_loopback() && !is_internal_socket_destination(destination) {
+            if self.requested.ip().is_loopback() && !is_internal_socket_address(destination) {
                 return None;
             }
             return Some(self.requested);
@@ -380,8 +379,8 @@ impl Eq for GuestSocketBinding {}
 ///
 /// Core creates this value from a live guest binding when a TCP connection
 /// targets the guest namespace. It grants no bind or listen authority. A
-/// platform may move the lease through a queued guest-local connection and
-/// return it from [`PlatformSocket::accept`]. Dropping the final binding
+/// guest-local platform path must carry the lease through any queued connection
+/// and return it from [`PlatformSocket::accept`]. Dropping the final binding
 /// reference releases the namespace entry.
 pub struct GuestSourceLease {
     _binding: Arc<GuestPortBinding>,
@@ -430,7 +429,7 @@ pub struct AcceptedBrokerSocket {
 /// Owned platform result for one stream receive.
 #[derive(Debug, PartialEq, Eq)]
 pub enum PlatformStreamReceive {
-    /// Bytes received from the stream.
+    /// Nonempty bytes received from the stream, no longer than requested.
     Received(Vec<u8>),
     /// The stream's receive direction reached end of stream.
     EndOfStream,
@@ -439,15 +438,15 @@ pub enum PlatformStreamReceive {
 /// Owned platform result for one datagram receive.
 #[derive(Debug, PartialEq, Eq)]
 pub struct PlatformDatagramReceive {
-    /// Received datagram prefix, truncated to the requested capacity.
+    /// Received prefix, sized to the lesser of the datagram and requested lengths.
     pub data: Vec<u8>,
-    /// Original datagram length before truncation.
+    /// Original datagram length, no greater than [`MAX_UDP_DATAGRAM_SIZE`].
     pub datagram_length: usize,
-    /// Guest-visible source address of the datagram.
+    /// Normalized guest-visible source address of the datagram.
     ///
-    /// Platforms must return the sender's stable guest-namespace endpoint for
-    /// guest-to-guest datagrams. Broker-internal native endpoints must not be
-    /// exposed.
+    /// This must be unchanged by [`normalize_socket_destination`]. Platforms
+    /// must return a guest sender's stable guest-namespace endpoint and never
+    /// expose broker-internal native endpoints.
     pub source_address: SocketAddrV4,
 }
 
@@ -461,7 +460,10 @@ pub trait SocketProvider: Send + Sync {
     /// Creates one nonblocking socket resource for a broker session.
     ///
     /// Any provider-retained clones must become inert when
-    /// [`PlatformSocket::retire`] is called.
+    /// [`PlatformSocket::retire`] is called. On success, the returned socket
+    /// retains `readiness` and publishes any nonempty initial snapshot before
+    /// returning. On error, the provider releases all resources and session
+    /// accounting allocated by the attempt.
     fn create(
         &self,
         session_id: SessionId,
@@ -508,7 +510,10 @@ pub trait PlatformSocket: Send + Sync {
 
     /// Accepts one pending TCP connection without waiting.
     ///
-    /// An empty backlog returns [`BrokerError::WouldBlock`].
+    /// When no connection is pending, returns [`BrokerError::WouldBlock`]. The
+    /// returned socket follows the readiness contract of
+    /// [`SocketProvider::create`]. On a non-completed return, the provider
+    /// releases all resources allocated for an unreturned socket.
     fn accept(
         &self,
         readiness: ReadinessRegistration,
@@ -550,8 +555,9 @@ pub trait PlatformSocket: Send + Sync {
     /// the socket's connected peer. An explicit destination is normalized but
     /// remains guest-visible; the provider must validate it with
     /// [`normalize_socket_destination`] before choosing a host-socket target.
-    /// Partial successful sends are invalid. Resource failures are broker
-    /// errors rather than ordinary socket failures.
+    /// A temporarily full socket returns [`BrokerError::WouldBlock`]. Partial
+    /// successful sends are invalid. Resource failures are broker errors rather
+    /// than ordinary socket failures.
     fn send_to(
         &self,
         data: Vec<u8>,
@@ -575,8 +581,9 @@ pub trait PlatformSocket: Send + Sync {
     /// Receives one datagram without waiting for platform readiness.
     ///
     /// The original datagram length is returned even when the caller's buffer
-    /// is smaller, and zero-length datagrams are successful receives. The
-    /// source address follows [`PlatformDatagramReceive::source_address`].
+    /// is smaller, and zero-length datagrams are successful receives. When no
+    /// datagram is available, returns [`BrokerError::WouldBlock`]. The source
+    /// address follows [`PlatformDatagramReceive::source_address`].
     fn receive_from(
         &self,
         length: usize,
@@ -601,10 +608,13 @@ pub trait PlatformSocket: Send + Sync {
     /// error.
     ///
     /// For stream sockets, this advances an asynchronous connection attempt
-    /// from `Connecting` to `Connected` or `Failed`. For datagram sockets, the
-    /// broker owns the peer state; the platform reports pending asynchronous
-    /// errors and may specialize the local IP address after external routing,
-    /// but it must preserve the broker-reserved local port.
+    /// from `Connecting` to `Connected` or `Failed`; it must not report
+    /// `Unconnected`. For datagram sockets, the broker owns the peer state, so
+    /// the platform reports `Unconnected` or `Connected` and uses
+    /// `pending_error` for asynchronous failures. Any reported local address
+    /// must preserve the broker-reserved port and have an IP accepted by
+    /// [`is_internal_socket_address`]. An unbound datagram must not report a
+    /// local address, and native host addresses must never be exposed.
     fn status(&self) -> Result<PlatformSocketStatus>;
 
     /// Synchronously and idempotently ends this socket's platform authority.
@@ -614,8 +624,9 @@ pub trait PlatformSocket: Send + Sync {
 
     /// Returns the authoritative cached readiness snapshot.
     ///
-    /// This must not require access to a native resource that retirement may
-    /// already have removed.
+    /// Update this snapshot before publishing the corresponding readiness
+    /// change. Reading it must not require access to a native resource that
+    /// retirement may already have removed.
     fn readiness(&self) -> ReadinessFlags;
 }
 
@@ -676,11 +687,10 @@ pub fn create(
 
 /// Starts a nonblocking connection attempt.
 ///
-/// Policy denial is returned as a per-request [`SocketOutcome::Failed`] and
-/// does not alter the socket's existing connection or peer state, so a later
-/// authorized destination may still be attempted. An authorized attempt on an
-/// unbound stream or datagram socket first reserves a guest-visible local
-/// endpoint.
+/// An authorized attempt first binds an unbound socket. TCP connected and
+/// failed states are terminal. UDP connects complete synchronously, and a
+/// failed attempt preserves the previous peer. Policy denial is a per-request
+/// [`SocketOutcome::Failed`] that also preserves existing state.
 pub fn connect(
     session: &BrokerSession,
     handle: ObjectHandle,
@@ -851,7 +861,10 @@ pub fn bind(
     }
 }
 
-/// Starts a TCP listener in the broker's guest network namespace.
+/// Starts or reconfigures a TCP listener in the broker's guest network
+/// namespace.
+///
+/// An unbound socket is first bound to an ephemeral loopback endpoint.
 pub fn listen(
     session: &BrokerSession,
     handle: ObjectHandle,
@@ -1036,7 +1049,8 @@ pub fn send(
 ///
 /// The first valid send with an explicit destination on an unbound datagram
 /// socket reserves and binds a guest-visible local endpoint before invoking
-/// the platform.
+/// the platform. A temporarily full socket returns
+/// [`BrokerError::WouldBlock`].
 pub fn send_to(
     session: &BrokerSession,
     handle: ObjectHandle,
@@ -1190,6 +1204,8 @@ pub fn receive(
 }
 
 /// Receives one datagram without waiting for readiness.
+///
+/// When no datagram is available, returns [`BrokerError::WouldBlock`].
 pub fn receive_from(
     session: &BrokerSession,
     handle: ObjectHandle,
@@ -1262,8 +1278,10 @@ pub fn get_tcp_option(
 
 /// Applies a directional or TCP lifecycle shutdown mode.
 ///
-/// Read, write, and both apply to TCP and UDP. Abort and stop-listening are
-/// TCP-only.
+/// Read, write, and both apply to TCP and UDP but return `NotConnected` for a
+/// TCP listener. Abort and stop-listening are TCP-only. Stopping an active
+/// listener with `Completed` or `Failed(NotConnected)` transitions it to
+/// `Failed(NotConnected)`.
 pub fn shutdown(
     session: &BrokerSession,
     handle: ObjectHandle,
@@ -1323,10 +1341,11 @@ pub fn shutdown(
 /// Returns broker-authoritative socket state and consumes at most one pending
 /// asynchronous error.
 ///
-/// Stream status reconciles an asynchronous platform connection attempt.
-/// Datagram connects complete synchronously and may replace the peer, so
-/// datagram status preserves the broker-owned connection state while querying
-/// the platform only for pending errors and local-address specialization.
+/// Stream queries reconcile asynchronous connection completion. Datagram
+/// queries preserve broker-owned peer state while consuming platform errors,
+/// refining the local address, and validating the snapshot. A platform report
+/// that contradicts broker-owned state retires the socket, latches
+/// `Failed(Other)`, and returns [`BrokerError::Internal`].
 pub fn status(session: &BrokerSession, handle: ObjectHandle) -> Result<SocketStatusResponse> {
     let object = session.authorized_object(handle, ObjectRights::WAIT)?;
     let datagram = {
@@ -1344,7 +1363,6 @@ pub fn status(session: &BrokerSession, handle: ObjectHandle) -> Result<SocketSta
     }
 }
 
-/// Reconciles broker stream state with an asynchronous platform connection.
 fn stream_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusResponse> {
     let (resource, status, local_address, connect_in_flight) = {
         let object = object.read();
@@ -1413,8 +1431,8 @@ fn stream_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRespo
         return Err(BrokerError::Internal);
     };
     if let Some(observed) = platform_status.local_address {
-        let invalid_local_address = observed.port() != broker_local_address.port()
-            || !guest_binding_address_is_valid(observed);
+        let invalid_local_address =
+            observed.port() != broker_local_address.port() || !is_internal_socket_address(observed);
         if invalid_local_address {
             socket.listening = false;
             socket.connection_status = SocketConnectionStatus::Failed(SocketError::Other);
@@ -1435,10 +1453,10 @@ fn stream_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRespo
         resource.retire();
         return Err(BrokerError::Internal);
     }
+    // Do not overwrite a concurrent terminal transition.
     if socket.connection_status == SocketConnectionStatus::Connecting {
         socket.connection_status = platform_status.status;
     }
-    // Return the latest broker state rather than this potentially stale platform snapshot.
     Ok(SocketStatusResponse {
         status: socket.connection_status,
         local_address: socket.local_address,
@@ -1446,8 +1464,7 @@ fn stream_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRespo
     })
 }
 
-/// Queries datagram errors and address refinement without surrendering the
-/// broker-owned peer state to a potentially stale platform snapshot.
+/// Retries once if a concurrent datagram connect replaces the peer mid-query.
 fn datagram_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusResponse> {
     let (
         resource,
@@ -1540,8 +1557,7 @@ fn datagram_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRes
         let invalid_local_address = match (socket.local_address, platform_status.local_address) {
             (None, Some(_)) => true,
             (Some(broker_address), Some(observed)) => {
-                broker_address.port() != observed.port()
-                    || !guest_binding_address_is_valid(observed)
+                broker_address.port() != observed.port() || !is_internal_socket_address(observed)
             }
             _ => false,
         };
@@ -1569,9 +1585,9 @@ fn datagram_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRes
                 drop(object);
                 continue;
             }
-            // Continuous peer replacement can race both bounded queries.
-            // Do not let an unordered platform snapshot overwrite newer
-            // broker observations.
+            // A retry after consuming an error could consume another; after
+            // one retry, return broker state rather than apply an unordered
+            // snapshot.
             return Ok(SocketStatusResponse {
                 status: socket.connection_status,
                 local_address: socket.local_address,
@@ -2002,7 +2018,7 @@ impl SocketResource {
         &self,
         destination: SocketAddrV4,
     ) -> Result<Option<GuestSourceLease>> {
-        if !is_internal_socket_destination(destination) {
+        if !is_internal_socket_address(destination) {
             return Ok(None);
         }
         self.port_binding
@@ -2140,29 +2156,29 @@ pub(crate) mod tests {
     fn socket_destinations_are_normalized_validated_and_routed() {
         let port = 8080;
         let unspecified = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
-        assert!(is_internal_socket_destination(unspecified));
+        assert!(is_internal_socket_address(unspecified));
         let loopback = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
         assert_eq!(normalize_socket_destination(unspecified), Ok(loopback));
-        assert!(is_internal_socket_destination(loopback));
+        assert!(is_internal_socket_address(loopback));
         let loopback_alias = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), port);
         assert_eq!(
             normalize_socket_destination(loopback_alias),
             Ok(loopback_alias)
         );
-        assert!(is_internal_socket_destination(loopback_alias));
+        assert!(is_internal_socket_address(loopback_alias));
         let guest = SocketAddrV4::new(GUEST_IPV4_ADDRESS, port);
         assert_eq!(normalize_socket_destination(guest), Ok(guest));
-        assert!(is_internal_socket_destination(guest));
+        assert!(is_internal_socket_address(guest));
         let gateway = SocketAddrV4::new(HOST_GATEWAY_IPV4_ADDRESS, port);
         assert_eq!(normalize_socket_destination(gateway), Ok(gateway));
-        assert!(!is_internal_socket_destination(gateway));
+        assert!(!is_internal_socket_address(gateway));
         assert_eq!(
             host_socket_destination(gateway),
             SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)
         );
         let native = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), port);
         assert_eq!(normalize_socket_destination(native), Ok(native));
-        assert!(!is_internal_socket_destination(native));
+        assert!(!is_internal_socket_address(native));
         assert_eq!(host_socket_destination(native), native);
         for invalid in [
             Ipv4Addr::new(0, 0, 0, 1),
@@ -2746,7 +2762,7 @@ pub(crate) mod tests {
     }
 
     impl TestSocketProvider {
-        pub(crate) fn fail_next_create(&self) {
+        fn fail_next_create(&self) {
             self.state.fail_create.store(true, Ordering::Relaxed);
         }
 
@@ -3462,7 +3478,7 @@ pub(crate) mod tests {
         check_connect_errors_classify_peer_state(broker, provider);
         check_concurrent_status_preserves_terminal_state(broker, provider);
         check_stream_status_validates_local_address(broker, provider);
-        check_failed_status_preserves_local_address(broker, provider);
+        check_terminal_stream_status_preserves_refined_address(broker, provider);
         check_quota_waits_for_deferred_retirement(broker, provider);
         check_platform_socket_retires_before_last_arc_drop(broker, provider);
         check_socket_quotas(broker);
@@ -5877,7 +5893,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn check_failed_status_preserves_local_address(
+    fn check_terminal_stream_status_preserves_refined_address(
         broker: &BrokerCore,
         provider: &TestSocketProvider,
     ) {
