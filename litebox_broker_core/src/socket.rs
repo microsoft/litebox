@@ -1376,11 +1376,34 @@ fn stream_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRespo
         });
     }
 
-    let platform_status = resource.platform_socket.status()?;
+    let platform_status = match resource.platform_socket.status() {
+        Ok(status) => status,
+        Err(error) => {
+            let object = object.read();
+            let ObjectEntry::Socket(socket) = &*object else {
+                return Err(BrokerError::InvalidRights);
+            };
+            if socket.resource_retired {
+                return Ok(SocketStatusResponse {
+                    status: socket.connection_status,
+                    local_address: socket.local_address,
+                    pending_error: None,
+                });
+            }
+            return Err(error);
+        }
+    };
     let mut object = object.write();
     let ObjectEntry::Socket(socket) = &mut *object else {
         return Err(BrokerError::InvalidRights);
     };
+    if socket.resource_retired {
+        return Ok(SocketStatusResponse {
+            status: socket.connection_status,
+            local_address: socket.local_address,
+            pending_error: None,
+        });
+    }
     let Some(broker_local_address) = socket.local_address else {
         socket.listening = false;
         socket.connection_status = SocketConnectionStatus::Failed(SocketError::Other);
@@ -5542,6 +5565,60 @@ pub(crate) mod tests {
         );
         assert_eq!(
             status(&session, handle),
+            Ok(SocketStatusResponse {
+                status: SocketConnectionStatus::Failed(SocketError::Other),
+                local_address: Some(platform_local_address),
+                pending_error: None,
+            })
+        );
+        session.close_object_reference(handle).unwrap();
+
+        let handle = create(
+            &session,
+            create_request(),
+            Arc::new(TestReadinessSink::default()),
+        )
+        .unwrap();
+        assert_eq!(
+            connect(&session, handle, loopback_address()),
+            Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting))
+        );
+        let local_address = *provider
+            .state
+            .binds
+            .lock()
+            .unwrap()
+            .last()
+            .expect("automatic TCP bind was not recorded");
+        let platform_local_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, local_address.port());
+        *provider.state.status_responses.lock().unwrap() = std::collections::VecDeque::from([
+            PlatformSocketStatus {
+                status: SocketConnectionStatus::Connected,
+                local_address: Some(platform_local_address),
+                pending_error: None,
+            },
+            PlatformSocketStatus {
+                status: SocketConnectionStatus::Unconnected,
+                local_address: Some(platform_local_address),
+                pending_error: None,
+            },
+        ]);
+        provider.fail_next_status();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        *provider.state.status_block.lock().unwrap() = Some((started_tx, release_rx));
+        let status_session = Arc::clone(&session);
+        let in_flight = std::thread::spawn(move || status(&status_session, handle));
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let retired_before = provider.state.retired_sockets.load(Ordering::Relaxed);
+        assert_eq!(status(&session, handle), Err(BrokerError::Internal));
+        assert_eq!(
+            provider.state.retired_sockets.load(Ordering::Relaxed),
+            retired_before + 1
+        );
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            in_flight.join().unwrap(),
             Ok(SocketStatusResponse {
                 status: SocketConnectionStatus::Failed(SocketError::Other),
                 local_address: Some(platform_local_address),
