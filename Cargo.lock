@@ -1560,6 +1560,8 @@ dependencies = [
  "litebox",
  "litebox_common_linux",
  "num_enum",
+ "rsa",
+ "sha2",
  "zerocopy",
 ]
 

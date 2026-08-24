@@ -8,7 +8,7 @@
 
 extern crate alloc;
 
-use alloc::boxed::Box;
+use alloc::{boxed::Box, vec::Vec};
 use core::mem::size_of;
 use litebox::platform::RawConstPointer as _;
 use litebox::utils::TruncateExt;
@@ -986,6 +986,7 @@ impl TeeMemoryAccessRights {
 
 const TEE_ALG_AES_CTR: u32 = 0x1000_0210;
 const TEE_ALG_AES_GCM: u32 = 0x4000_0810;
+const TEE_ALG_RSASSA_PKCS1_PSS_MGF1_SHA256: u32 = 0x7041_4930;
 const TEE_ALG_RSASSA_PKCS1_V1_5_SHA256: u32 = 0x7000_4830;
 const TEE_ALG_RSASSA_PKCS1_V1_5_SHA512: u32 = 0x7000_6830;
 const TEE_ALG_HMAC_SHA256: u32 = 0x3000_0004;
@@ -1001,6 +1002,7 @@ const TEE_ALG_ILLEGAL_VALUE: u32 = 0xefff_ffff;
 pub enum TeeAlgorithm {
     AesCtr = TEE_ALG_AES_CTR,
     AesGcm = TEE_ALG_AES_GCM,
+    RsaPssSha256 = TEE_ALG_RSASSA_PKCS1_PSS_MGF1_SHA256,
     RsaPkcs1Sha256 = TEE_ALG_RSASSA_PKCS1_V1_5_SHA256,
     RsaPkcs1Sha512 = TEE_ALG_RSASSA_PKCS1_V1_5_SHA512,
     HmacSha256 = TEE_ALG_HMAC_SHA256,
@@ -1042,9 +1044,9 @@ impl From<TeeAlgorithm> for TeeAlgorithmClass {
         match algo {
             TeeAlgorithm::AesCtr | TeeAlgorithm::AesGcm => TeeAlgorithmClass::Cipher,
             TeeAlgorithm::HmacSha256 | TeeAlgorithm::HmacSha512 => TeeAlgorithmClass::Mac,
-            TeeAlgorithm::RsaPkcs1Sha256 | TeeAlgorithm::RsaPkcs1Sha512 => {
-                TeeAlgorithmClass::AsymmetricSignature
-            }
+            TeeAlgorithm::RsaPkcs1Sha256
+            | TeeAlgorithm::RsaPkcs1Sha512
+            | TeeAlgorithm::RsaPssSha256 => TeeAlgorithmClass::AsymmetricSignature,
             _ => TeeAlgorithmClass::Unknown,
         }
     }
@@ -2630,5 +2632,127 @@ mod tests {
             num_params: 0,
         };
         assert!(OpteeRpcArgs::from_header_and_raw_params(&header, &[]).is_err());
+    }
+}
+
+/// `Shdr` from `optee_os/core/include/signed_hdr.h`
+#[derive(Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C)]
+pub struct Shdr {
+    pub magic: u32,
+    pub img_type: u32,
+    pub img_size: u32,
+    pub algo: u32,
+    pub hash_size: u16,
+    pub sig_size: u16,
+}
+
+/// `SHDR_MAGIC` from `optee_os/core/include/signed_hdr.h`
+const SHDR_MAGIC: u32 = 0x4f54_5348;
+
+/// From `optee_os/core/include/signed_hdr.h`
+/// struct shdr_bootstrap_ta {
+/// 	uint8_t uuid[sizeof(TEE_UUID)];
+/// 	uint32_t ta_version;
+/// };
+/// and from `optee_os/core/include/tee_api_types.h`
+/// typedef struct {
+/// 	uint32_t timeLow;
+/// 	uint16_t timeMid;
+/// 	uint16_t timeHiAndVersion;
+/// 	uint8_t clockSeqAndNode[8];
+/// } TEE_UUID;
+const SHDR_UUID_LEN: usize = 16;
+const SHDR_VERSION_LEN: usize = 4;
+
+/// An RSA public key used to verify signed `.ta` files
+pub struct TaVerifyKey(rsa::RsaPublicKey);
+
+impl TaVerifyKey {
+    pub fn from_pem(pem: &str) -> Result<Self, &'static str> {
+        use rsa::pkcs8::DecodePublicKey;
+
+        rsa::RsaPublicKey::from_public_key_pem(pem)
+            .map(TaVerifyKey)
+            .map_err(|_| "Invalid RSA public key PEM")
+    }
+}
+
+/// Parse and verify an OP-TEE signed .ta file.
+/// A signed `.ta` file has the following layout:
+/// shdr || hash || sig || uuid || ta_version || img
+/// Return the parsed TaHead and the TA ELF binary.
+pub fn parse_and_verify_ta<'a>(
+    ta_data: &'a [u8],
+    verify_key: &TaVerifyKey,
+) -> Result<(TaHead, &'a [u8]), &'static str> {
+    let hdr_size = size_of::<Shdr>();
+    if ta_data.len() < hdr_size {
+        return Err("Invalid signed TA file");
+    }
+    let shdr =
+        Shdr::read_from_bytes(&ta_data[..hdr_size]).map_err(|_| "Invalid signed TA header")?;
+    if shdr.magic != SHDR_MAGIC {
+        return Err("Invalid TA magic");
+    }
+    let hash_size = shdr.hash_size as usize;
+    let sig_size = shdr.sig_size as usize;
+    let img_size = shdr.img_size as usize;
+
+    let hash_offset = hdr_size;
+    let sig_offset = hash_offset
+        .checked_add(hash_size)
+        .ok_or("Invalid signed TA file")?;
+    let uuid_offset = sig_offset
+        .checked_add(sig_size)
+        .ok_or("Invalid signed TA file")?;
+    let version_offset = uuid_offset
+        .checked_add(SHDR_UUID_LEN)
+        .ok_or("Invalid signed TA file")?;
+    let img_offset = version_offset
+        .checked_add(SHDR_VERSION_LEN)
+        .ok_or("Invalid signed TA file")?;
+    let end = img_offset
+        .checked_add(img_size)
+        .ok_or("Invalid signed TA file")?;
+    if end > ta_data.len() {
+        return Err("Invalid signed TA file");
+    }
+    let sig = &ta_data[sig_offset..uuid_offset];
+    let uuid_and_version = &ta_data[uuid_offset..img_offset];
+    let img = &ta_data[img_offset..end];
+
+    // The signed message is shdr || uuid || ta_version || img.
+    let mut signed_message = Vec::with_capacity(hdr_size + uuid_and_version.len() + img.len());
+    signed_message.extend_from_slice(&ta_data[..hdr_size]);
+    signed_message.extend_from_slice(uuid_and_version);
+    signed_message.extend_from_slice(img);
+    verify_shdr_signature(&signed_message, sig, shdr.algo, &verify_key.0)?;
+    let ta_head = parse_ta_head(img).ok_or("Invalid TA ELF binary")?;
+
+    Ok((ta_head, img))
+}
+
+/// Verify a signed `.ta` file's signature against the given RSA public key.
+/// TODO: Support more signature algorithms if needed.
+fn verify_shdr_signature(
+    message: &[u8],
+    signature: &[u8],
+    algo: u32,
+    rsa_pub_key: &rsa::RsaPublicKey,
+) -> Result<(), &'static str> {
+    use rsa::signature::Verifier;
+    use sha2::Sha256;
+
+    match algo {
+        TEE_ALG_RSASSA_PKCS1_PSS_MGF1_SHA256 => {
+            let verifying_key = rsa::pss::VerifyingKey::<Sha256>::new(rsa_pub_key.clone());
+            let sig =
+                rsa::pss::Signature::try_from(signature).map_err(|_| "Invalid PSS signature")?;
+            verifying_key
+                .verify(message, &sig)
+                .map_err(|_| "Signature verification failed")
+        }
+        _ => Err("Unsupported TA signature algorithm"),
     }
 }

@@ -1285,18 +1285,30 @@ const LDELF_BINARY: &[u8] = &[0u8; 0];
 const TA_BINARY: &[u8] = &[0u8; 0];
 const TA_BINARIES: &[&[u8]] = &[TA_BINARY];
 
-/// Look up TA binary by UUID.
+/// Look up TA binary by UUID, verify its signature, and return the TA ELF
 /// TODO: Handle PTA UUIDs
 fn find_ta_binary(ta_uuid: litebox_common_optee::TeeUuid) -> Option<&'static [u8]> {
-    use litebox_common_optee::parse_ta_head;
+    use litebox_common_optee::{TaVerifyKey, parse_and_verify_ta};
+
+    // Hard-coded public key for testing
+    const TA_VERIFY_KEY_PEM: &[u8] =
+        include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/signing_public_key.pem");
+    let verify_key_pem = core::str::from_utf8(TA_VERIFY_KEY_PEM).ok()?;
+    let verify_key = TaVerifyKey::from_pem(verify_key_pem).ok()?;
 
     for ta_binary in TA_BINARIES {
-        if let Some(ta_head) = parse_ta_head(ta_binary)
-            && ta_head.uuid == ta_uuid
-        {
-            return Some(ta_binary);
+        match parse_and_verify_ta(ta_binary, &verify_key) {
+            Ok((ta_head, ta_elf)) if ta_head.uuid == ta_uuid => {
+                return Some(ta_elf);
+            }
+            Ok(_) => continue,
+            Err(err) => {
+                debug_serial_println!("parse_and_verify_ta failed: {}", err);
+                continue;
+            }
         }
     }
+    debug_serial_println!("TA binary not found");
     None
 }
 
