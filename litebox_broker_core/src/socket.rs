@@ -369,12 +369,11 @@ impl GuestSocketBinding {
             }
             return Some(self.requested);
         }
-        let source_ip =
-            if is_internal_socket_destination(destination) && destination.ip().is_loopback() {
-                Ipv4Addr::LOCALHOST
-            } else {
-                GUEST_IPV4_ADDRESS
-            };
+        let source_ip = if destination.ip().is_loopback() {
+            Ipv4Addr::LOCALHOST
+        } else {
+            GUEST_IPV4_ADDRESS
+        };
         Some(SocketAddrV4::new(source_ip, self.requested.port()))
     }
 }
@@ -1045,7 +1044,7 @@ pub fn send(
     }
     let outcome = resource.platform_socket.send(data, flags)?;
     if let SocketOutcome::Completed(sent) = outcome
-        && sent > length
+        && (sent > length || (length != 0 && sent == 0))
     {
         return Err(BrokerError::Internal);
     }
@@ -1401,18 +1400,17 @@ fn stream_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRespo
     let ObjectEntry::Socket(socket) = &mut *object else {
         return Err(BrokerError::InvalidRights);
     };
-    if socket.local_address.is_none() {
+    let Some(broker_local_address) = socket.local_address else {
         socket.listening = false;
         socket.connection_status = SocketConnectionStatus::Failed(SocketError::Other);
         socket.resource_retired = true;
         drop(object);
         resource.retire();
         return Err(BrokerError::Internal);
-    }
+    };
     if let Some(observed) = platform_status.local_address {
-        let invalid_local_address = socket.local_address.is_none_or(|broker_address| {
-            observed.port() != broker_address.port() || !is_internal_network_address(*observed.ip())
-        });
+        let invalid_local_address = observed.port() != broker_local_address.port()
+            || !is_internal_network_address(*observed.ip());
         if invalid_local_address {
             socket.listening = false;
             socket.connection_status = SocketConnectionStatus::Failed(SocketError::Other);
@@ -1421,10 +1419,7 @@ fn stream_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRespo
             resource.retire();
             return Err(BrokerError::Internal);
         }
-        if socket
-            .local_address
-            .is_some_and(|address| address.ip().is_unspecified())
-        {
+        if broker_local_address.ip().is_unspecified() {
             socket.local_address = Some(observed);
         }
     }
@@ -2063,11 +2058,7 @@ const fn guest_transport(request: CreateSocketRequest) -> Option<GuestTransport>
 
 impl Drop for SocketResource {
     fn drop(&mut self) {
-        self.platform_socket.retire();
-        let port_binding = self.port_binding.lock().take();
-        let guest_source_lease = self.guest_source_lease.lock().take();
-        drop(port_binding);
-        drop(guest_source_lease);
+        self.retire();
         self.readiness.retire();
     }
 }
@@ -3941,10 +3932,19 @@ pub(crate) mod tests {
             send(&session, handle, vec![1, 2, 3], SendFlags::NONE),
             Err(BrokerError::Internal)
         );
+        provider.return_next_send_count(0);
+        assert_eq!(
+            send(&session, handle, vec![1, 2, 3], SendFlags::NONE),
+            Err(BrokerError::Internal)
+        );
         provider.return_next_send_count(2);
         assert_eq!(
             send(&session, handle, vec![1, 2, 3], SendFlags::NONE),
             Ok(SocketOutcome::Completed(2))
+        );
+        assert_eq!(
+            send(&session, handle, Vec::new(), SendFlags::NONE),
+            Ok(SocketOutcome::Completed(0))
         );
         let sent_before = provider.state.sent.lock().unwrap().len();
         assert_eq!(
@@ -4028,7 +4028,7 @@ pub(crate) mod tests {
         assert_eq!(session.reserved_sockets.load(Ordering::Relaxed), 0);
         assert_eq!(
             provider.state.sent.lock().unwrap().as_slice(),
-            [1, 2, 3, 1, 2, 3, 1, 2, 3]
+            [1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3]
         );
         assert_eq!(provider.state.connect_calls.load(Ordering::Relaxed), 1);
         assert_eq!(provider.state.status_calls.load(Ordering::Relaxed), 1);
