@@ -1151,6 +1151,9 @@ pub fn receive(
         return Err(BrokerError::UnsupportedOperation);
     }
     let peek = flags.contains(ReceiveFlags::PEEK);
+    if flags.contains(ReceiveFlags::WAITALL) && !peek {
+        return Err(BrokerError::UnsupportedOperation);
+    }
     let canonical_peek_length = peek_length
         .checked_sub(peek_offset)
         .and_then(|remaining| usize::try_from(remaining.min(MAX_SOCKET_TRANSFER_SIZE)).ok());
@@ -1506,7 +1509,6 @@ fn datagram_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRes
         if invalid_local_address {
             socket.configuration_in_flight = false;
             socket.connection_status = SocketConnectionStatus::Failed(SocketError::Other);
-            socket.datagram_connect_generation = socket.datagram_connect_generation.wrapping_add(1);
             socket.resource_retired = true;
             drop(object);
             resource.retire();
@@ -1518,7 +1520,6 @@ fn datagram_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRes
         ) {
             socket.configuration_in_flight = false;
             socket.connection_status = SocketConnectionStatus::Failed(SocketError::Other);
-            socket.datagram_connect_generation = socket.datagram_connect_generation.wrapping_add(1);
             socket.resource_retired = true;
             drop(object);
             resource.retire();
@@ -1752,9 +1753,8 @@ fn finish_datagram_connect(
         socket.connection_status = status;
         if peer_state_changed {
             // This distinguishes status snapshots from before a successful
-            // peer replacement or an indeterminate platform failure. A status
-            // call cannot overlap enough connects for wrapping to make a stale
-            // snapshot appear current.
+            // peer replacement. A status call cannot overlap enough connects
+            // for wrapping to make a stale snapshot appear current.
             socket.datagram_connect_generation = socket.datagram_connect_generation.wrapping_add(1);
         }
     }
@@ -1765,7 +1765,6 @@ fn finish_retired_datagram_connect(object: &spin::RwLock<ObjectEntry>) {
     if let ObjectEntry::Socket(socket) = &mut *object {
         socket.configuration_in_flight = false;
         socket.connection_status = SocketConnectionStatus::Failed(SocketError::Other);
-        socket.datagram_connect_generation = socket.datagram_connect_generation.wrapping_add(1);
         socket.resource_retired = true;
     }
 }
@@ -1840,10 +1839,6 @@ fn finish_configuration(
         if duplicate.is_some() {
             socket.listening = false;
             socket.connection_status = SocketConnectionStatus::Failed(SocketError::Other);
-            if is_udp(socket.create_request) {
-                socket.datagram_connect_generation =
-                    socket.datagram_connect_generation.wrapping_add(1);
-            }
             socket.resource_retired = true;
         } else {
             socket.local_address = socket.local_address.or(local_address);
@@ -1880,9 +1875,6 @@ fn finish_retired_configuration(
         socket.local_address = socket.local_address.or(local_address);
         socket.listening = false;
         socket.connection_status = SocketConnectionStatus::Failed(SocketError::Other);
-        if is_udp(socket.create_request) {
-            socket.datagram_connect_generation = socket.datagram_connect_generation.wrapping_add(1);
-        }
         socket.resource_retired = true;
         duplicate
     };
@@ -2838,6 +2830,20 @@ pub(crate) mod tests {
         keep_alive: bool,
     }
 
+    impl TestPlatformSocket {
+        fn discard_pending_accept(&self) {
+            if let Some(binding) = self.guest_binding.lock().unwrap().clone() {
+                let mut pending = self.state.pending_accept.lock().unwrap();
+                if pending
+                    .as_ref()
+                    .is_some_and(|pending| binding.covers(pending.destination))
+                {
+                    pending.take();
+                }
+            }
+        }
+    }
+
     impl PlatformSocket for TestPlatformSocket {
         fn bind(&self, binding: GuestSocketBinding) -> Result<SocketOutcome<SocketAddrV4>> {
             let address = binding.requested();
@@ -3070,10 +3076,13 @@ pub(crate) mod tests {
             }))
         }
 
-        fn shutdown(&self, _mode: ShutdownMode) -> Result<SocketOutcome<()>> {
+        fn shutdown(&self, mode: ShutdownMode) -> Result<SocketOutcome<()>> {
             self.state.shutdown_calls.fetch_add(1, Ordering::Relaxed);
             if self.state.fail_shutdown.swap(false, Ordering::Relaxed) {
                 return Err(BrokerError::ResourceExhausted);
+            }
+            if mode == ShutdownMode::StopListening {
+                self.discard_pending_accept();
             }
             Ok(SocketOutcome::Completed(()))
         }
@@ -3121,15 +3130,7 @@ pub(crate) mod tests {
 
         fn retire(&self) {
             if self.active.swap(false, Ordering::AcqRel) {
-                if let Some(binding) = self.guest_binding.lock().unwrap().clone() {
-                    let mut pending = self.state.pending_accept.lock().unwrap();
-                    if pending
-                        .as_ref()
-                        .is_some_and(|pending| binding.covers(pending.destination))
-                    {
-                        pending.take();
-                    }
-                }
+                self.discard_pending_accept();
                 let retire_block = self.state.retire_block.lock().unwrap().take();
                 if let Some((started, release)) = retire_block {
                     started.send(()).unwrap();
@@ -3269,7 +3270,16 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn queued_guest_source_lease_is_released_with_listener() {
+    fn queued_guest_source_lease_is_released_when_listener_retires() {
+        check_queued_guest_source_lease_release(false);
+    }
+
+    #[test]
+    fn queued_guest_source_lease_is_released_when_listener_stops() {
+        check_queued_guest_source_lease_release(true);
+    }
+
+    fn check_queued_guest_source_lease_release(stop_listener: bool) {
         let provider = Arc::new(TestSocketProvider::default());
         let broker = test_broker(Arc::clone(&provider) as Arc<dyn SocketProvider>);
         let listener_session = broker
@@ -3318,12 +3328,32 @@ pub(crate) mod tests {
             Ok(SocketOutcome::Failed(SocketError::AddressInUse))
         ));
 
-        listener_session.close_object_reference(listener).unwrap();
+        if stop_listener {
+            assert_eq!(
+                shutdown(&listener_session, listener, ShutdownMode::StopListening),
+                Ok(SocketOutcome::Completed(()))
+            );
+            assert!(matches!(
+                accept(
+                    &listener_session,
+                    listener,
+                    Arc::new(TestReadinessSink::default())
+                ),
+                Ok(SocketOutcome::Failed(SocketError::NotConnected))
+            ));
+        } else {
+            listener_session.close_object_reference(listener).unwrap();
+        }
         let source_binding = broker
             .socket_ports
             .reserve(create_request(), wildcard_source)
             .unwrap();
         assert!(matches!(source_binding, SocketOutcome::Completed(_)));
+
+        if stop_listener {
+            listener_session.close_object_reference(listener).unwrap();
+            return;
+        }
 
         let replacement = create(
             &listener_session,
@@ -4044,6 +4074,15 @@ pub(crate) mod tests {
             Err(BrokerError::UnsupportedOperation)
         );
         assert_eq!(provider.state.sent.lock().unwrap().len(), sent_before);
+        let receive_calls = provider.state.receive_calls.load(Ordering::Relaxed);
+        assert_eq!(
+            receive(&session, handle, 1, ReceiveFlags::WAITALL, 0, 0),
+            Err(BrokerError::UnsupportedOperation)
+        );
+        assert_eq!(
+            provider.state.receive_calls.load(Ordering::Relaxed),
+            receive_calls
+        );
         assert_eq!(
             receive(&session, handle, 4, ReceiveFlags::PEEK, 0, 4),
             Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(
