@@ -318,7 +318,7 @@ fn rdrand_seed() -> Option<CrngSeed> {
     Some(seed)
 }
 
-fn crng_seed_from_tpm_and_rdrand(seed: &[u8], rdrand_seed: CrngSeed) -> CrngSeed {
+fn crng_seed_from_rot_and_rdrand(seed: &[u8; CRNG_SEED_LEN], rdrand_seed: CrngSeed) -> CrngSeed {
     sha2::Sha256::new()
         .chain_update(b"litebox-lvbs-crng-seed-v1")
         .chain_update(seed)
