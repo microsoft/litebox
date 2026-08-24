@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use super::*;
 use litebox_broker_core::readiness::ReadinessSink;
-use litebox_broker_core::socket::{GATEWAY_IPV4_ADDRESS, GUEST_IPV4_ADDRESS};
+use litebox_broker_core::socket::{GUEST_IPV4_ADDRESS, HOST_GATEWAY_IPV4_ADDRESS};
 use litebox_broker_core::{
     BrokerCore, BrokerCoreLimits, BrokerSession, CallerCredential, DestinationPortRange,
     DestinationRule, Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy,
@@ -31,14 +31,14 @@ fn gateway_tcp_policy() -> SocketPolicy {
     SocketPolicy::guest_network()
         .with_tcp_destination_rules(&[DestinationRule::new(
             CallerCredential::Unauthenticated,
-            Ipv4Cidr::new(Ipv4Address(GATEWAY_IPV4_ADDRESS.octets()), 32).unwrap(),
+            Ipv4Cidr::new(Ipv4Address(HOST_GATEWAY_IPV4_ADDRESS.octets()), 32).unwrap(),
             DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
         )])
         .unwrap()
 }
 
 fn gateway_address(host_address: SocketAddrV4) -> SocketAddrV4 {
-    SocketAddrV4::new(GATEWAY_IPV4_ADDRESS, host_address.port())
+    SocketAddrV4::new(HOST_GATEWAY_IPV4_ADDRESS, host_address.port())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

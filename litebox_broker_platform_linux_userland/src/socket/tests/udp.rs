@@ -7,7 +7,7 @@ fn gateway_udp_policy() -> SocketPolicy {
     SocketPolicy::guest_network()
         .with_udp_destination_rules(&[DestinationRule::new(
             CallerCredential::Unauthenticated,
-            Ipv4Cidr::new(Ipv4Address(GATEWAY_IPV4_ADDRESS.octets()), 32).unwrap(),
+            Ipv4Cidr::new(Ipv4Address(HOST_GATEWAY_IPV4_ADDRESS.octets()), 32).unwrap(),
             DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
         )])
         .unwrap()
@@ -30,7 +30,7 @@ fn udp_gateway_translates_sources_filters_spoofing_and_reuses_endpoint() {
         .with_udp_destination_rules(&[
             DestinationRule::new(
                 CallerCredential::Unauthenticated,
-                Ipv4Cidr::new(Ipv4Address(GATEWAY_IPV4_ADDRESS.octets()), 32).unwrap(),
+                Ipv4Cidr::new(Ipv4Address(HOST_GATEWAY_IPV4_ADDRESS.octets()), 32).unwrap(),
                 DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
             ),
             DestinationRule::new(
@@ -731,7 +731,7 @@ fn reactor_preserves_udp_datagram_semantics() {
         .with_udp_destination_rules(&[
             DestinationRule::new(
                 CallerCredential::Unauthenticated,
-                Ipv4Cidr::new(Ipv4Address(GATEWAY_IPV4_ADDRESS.octets()), 32).unwrap(),
+                Ipv4Cidr::new(Ipv4Address(HOST_GATEWAY_IPV4_ADDRESS.octets()), 32).unwrap(),
                 DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
             ),
             DestinationRule::new(
@@ -1124,7 +1124,9 @@ fn guest_udp_namespace_routes_across_sessions_and_filters_private_endpoints() {
         Ok(SocketOutcome::Completed(receiver_guest_address))
     );
     assert_eq!(
-        provider.reactor.host_address(receiver_guest_address.port()),
+        provider
+            .reactor
+            .udp_guest_local_address(receiver_guest_address.port()),
         None
     );
     assert_eq!(provider.reactor.udp_native_endpoint_count(), 0);

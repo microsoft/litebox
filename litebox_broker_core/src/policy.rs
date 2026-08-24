@@ -3,7 +3,7 @@
 
 use core::net::SocketAddrV4;
 
-use crate::socket::SocketDestination;
+use crate::socket::is_internal_socket_destination;
 use crate::{BrokerError, CallerCredential, ObjectRights};
 use litebox_broker_protocol::socket::{
     AddressFamily, CreateSocketRequest, IpProtocol, Ipv4Address, Port, SocketType,
@@ -265,26 +265,28 @@ impl SocketPolicy {
     fn permits_tcp_destination(
         self,
         caller_credential: CallerCredential,
-        destination: SocketDestination,
+        destination: SocketAddrV4,
     ) -> bool {
         self.tcp.is_some_and(|policy| {
-            matches!(destination, SocketDestination::Guest(_))
-                || policy.rules().iter().any(|rule| {
-                    rule.permits(caller_credential, destination.guest_visible_address())
-                })
+            is_internal_socket_destination(destination)
+                || policy
+                    .rules()
+                    .iter()
+                    .any(|rule| rule.permits(caller_credential, destination))
         })
     }
 
     fn permits_udp_destination(
         self,
         caller_credential: CallerCredential,
-        destination: SocketDestination,
+        destination: SocketAddrV4,
     ) -> bool {
         self.udp.is_some_and(|policy| {
-            matches!(destination, SocketDestination::Guest(_))
-                || policy.rules().iter().any(|rule| {
-                    rule.permits(caller_credential, destination.guest_visible_address())
-                })
+            is_internal_socket_destination(destination)
+                || policy
+                    .rules()
+                    .iter()
+                    .any(|rule| rule.permits(caller_credential, destination))
         })
     }
 }
@@ -399,7 +401,7 @@ impl PolicyEngine {
         &self,
         caller_credential: CallerCredential,
         protocol: IpProtocol,
-        destination: SocketDestination,
+        destination: SocketAddrV4,
     ) -> Result<(), BrokerError> {
         let permitted = match protocol {
             IpProtocol::Tcp => self
@@ -427,8 +429,6 @@ impl Default for PolicyEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::net::Ipv4Addr;
-
     const IPV4_TCP: CreateSocketRequest = CreateSocketRequest {
         address_family: AddressFamily::Ipv4,
         socket_type: SocketType::Stream,
@@ -448,12 +448,9 @@ mod tests {
         DestinationPortRange::new(Port(start), Port(end)).unwrap()
     }
 
-    fn address(address: [u8; 4], port: u16) -> SocketAddrV4 {
-        SocketAddrV4::new(Ipv4Addr::from(address), port)
-    }
-
-    fn destination(address: [u8; 4], port: u16) -> SocketDestination {
-        crate::socket::classify_socket_destination(self::address(address, port)).unwrap()
+    fn normalized_destination(address: [u8; 4], port: u16) -> SocketAddrV4 {
+        crate::socket::normalize_socket_destination(SocketAddrV4::new(address.into(), port))
+            .unwrap()
     }
 
     #[test]
@@ -633,7 +630,7 @@ mod tests {
             unauthenticated.authorize_socket_connect(
                 CallerCredential::Unauthenticated,
                 IpProtocol::Tcp,
-                destination([10, 15, 0, 1], 443),
+                normalized_destination([10, 15, 0, 1], 443),
             ),
             Ok(())
         );
@@ -641,7 +638,7 @@ mod tests {
             unauthenticated.authorize_socket_connect(
                 CallerCredential::Unauthenticated,
                 IpProtocol::Tcp,
-                destination([10, 0, 2, 15], 1),
+                normalized_destination([10, 0, 2, 15], 1),
             ),
             Ok(())
         );
@@ -649,15 +646,15 @@ mod tests {
             unauthenticated.authorize_socket_connect(
                 CallerCredential::Unauthenticated,
                 IpProtocol::Tcp,
-                destination([10, 0, 2, 1], 8080),
+                normalized_destination([10, 0, 2, 1], 8080),
             ),
             Ok(())
         );
         for denied in [
-            destination([10, 16, 0, 1], 443),
-            destination([10, 15, 0, 1], 445),
-            destination([192, 0, 2, 7], 8443),
-            destination([10, 15, 0, 1], 0),
+            normalized_destination([10, 16, 0, 1], 443),
+            normalized_destination([10, 15, 0, 1], 445),
+            normalized_destination([192, 0, 2, 7], 8443),
+            normalized_destination([10, 15, 0, 1], 0),
         ] {
             assert_eq!(
                 unauthenticated.authorize_socket_connect(
@@ -681,7 +678,7 @@ mod tests {
             policy.authorize_socket_connect(
                 CallerCredential::Unauthenticated,
                 IpProtocol::Tcp,
-                destination([127, 255, 0, 1], 80),
+                normalized_destination([127, 255, 0, 1], 80),
             ),
             Ok(())
         );
@@ -689,7 +686,7 @@ mod tests {
             policy.authorize_socket_connect(
                 CallerCredential::Unauthenticated,
                 IpProtocol::Tcp,
-                destination([10, 0, 2, 15], 80),
+                normalized_destination([10, 0, 2, 15], 80),
             ),
             Ok(())
         );
@@ -697,7 +694,7 @@ mod tests {
             policy.authorize_socket_connect(
                 CallerCredential::Unauthenticated,
                 IpProtocol::Tcp,
-                destination([10, 0, 0, 1], 80),
+                normalized_destination([10, 0, 0, 1], 80),
             ),
             Err(BrokerError::PolicyDenied)
         );
@@ -705,7 +702,7 @@ mod tests {
             policy.authorize_socket_connect(
                 CallerCredential::Unauthenticated,
                 IpProtocol::Tcp,
-                destination([127, 0, 0, 1], 0),
+                normalized_destination([127, 0, 0, 1], 0),
             ),
             Ok(())
         );
@@ -713,7 +710,7 @@ mod tests {
             policy.authorize_socket_connect(
                 CallerCredential::Unauthenticated,
                 IpProtocol::Udp,
-                destination([127, 0, 0, 1], 53),
+                normalized_destination([127, 0, 0, 1], 53),
             ),
             Ok(())
         );
@@ -721,7 +718,7 @@ mod tests {
             policy.authorize_socket_connect(
                 CallerCredential::Unauthenticated,
                 IpProtocol::Udp,
-                destination([10, 0, 2, 15], 53),
+                normalized_destination([10, 0, 2, 15], 53),
             ),
             Ok(())
         );
@@ -729,7 +726,7 @@ mod tests {
             policy.authorize_socket_connect(
                 CallerCredential::Unauthenticated,
                 IpProtocol::Udp,
-                destination([10, 0, 0, 1], 53),
+                normalized_destination([10, 0, 0, 1], 53),
             ),
             Err(BrokerError::PolicyDenied)
         );
@@ -757,7 +754,7 @@ mod tests {
             policy.authorize_socket_connect(
                 CallerCredential::Unauthenticated,
                 IpProtocol::Udp,
-                destination([10, 0, 2, 15], 53),
+                normalized_destination([10, 0, 2, 15], 53),
             ),
             Ok(())
         );
@@ -765,7 +762,7 @@ mod tests {
             policy.authorize_socket_connect(
                 CallerCredential::Unauthenticated,
                 IpProtocol::Udp,
-                destination([192, 0, 2, 1], 443),
+                normalized_destination([192, 0, 2, 1], 443),
             ),
             Err(BrokerError::PolicyDenied)
         );

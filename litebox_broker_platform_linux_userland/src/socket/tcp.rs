@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use litebox_broker_core::readiness::ReadinessRegistration;
 use litebox_broker_core::socket::{
-    GuestSocketBinding, GuestSourceLease, PlatformConnectError, SocketDestination,
-    classify_socket_destination,
+    GuestSocketBinding, GuestSourceLease, PlatformConnectError, host_socket_destination,
+    is_internal_socket_destination, normalize_socket_destination,
 };
 use litebox_broker_core::{BrokerError, Result as BrokerResult, SessionId};
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -308,14 +308,11 @@ pub(super) struct ReactorTcpBinding {
 }
 
 enum ResolvedTcpDestination {
-    Guest {
+    Internal {
         listener_id: u64,
         concrete_address: SocketAddrV4,
     },
-    Native {
-        guest_visible_address: SocketAddrV4,
-        host_address: SocketAddrV4,
-    },
+    External(SocketAddrV4),
 }
 
 impl ReactorTcpState {
@@ -1311,10 +1308,10 @@ impl Reactor {
         Ok(SocketOutcome::Completed(guest_address))
     }
 
-    pub(super) fn connect_tcp_guest(
+    pub(super) fn connect_tcp_destination(
         &mut self,
         id: u64,
-        guest_address: SocketAddrV4,
+        requested_destination: SocketAddrV4,
         guest_source_lease: Option<GuestSourceLease>,
     ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
         let session_id = self
@@ -1326,7 +1323,7 @@ impl Reactor {
             .tcp
             .binding_for_socket(id)
             .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?;
-        let destination = match self.resolve_guest_destination(guest_address) {
+        let destination = match self.resolve_tcp_destination(requested_destination) {
             SocketOutcome::Completed(destination) => destination,
             SocketOutcome::Failed(error) => {
                 drop(guest_source_lease);
@@ -1341,14 +1338,14 @@ impl Reactor {
                 return Ok(status);
             }
         };
-        if let ResolvedTcpDestination::Guest {
+        if let ResolvedTcpDestination::Internal {
             listener_id,
             concrete_address,
         } = destination
         {
             let source_address = binding
                 .guest_binding
-                .guest_source_address(concrete_address)
+                .source_address_for_destination(concrete_address)
                 .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?;
             let guest_source_lease = guest_source_lease
                 .filter(|lease| lease.source_address() == source_address)
@@ -1362,19 +1359,13 @@ impl Reactor {
             );
         }
         drop(guest_source_lease);
-        let ResolvedTcpDestination::Native {
-            guest_visible_address,
-            host_address,
-        } = destination
-        else {
-            unreachable!("guest destination handled above");
+        let ResolvedTcpDestination::External(external_destination) = destination else {
+            unreachable!("internal destination handled above");
         };
-        let local_guest_address = binding
+        let native_destination = host_socket_destination(external_destination);
+        let guest_local_address = binding
             .guest_binding
-            .source_address_for_destination(SocketDestination::Native {
-                guest_visible_address,
-                host_address,
-            })
+            .source_address_for_destination(external_destination)
             .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?;
         let (status, readiness) = connect_tcp_socket(
             &self.epoll,
@@ -1382,7 +1373,7 @@ impl Reactor {
             self.sockets
                 .get_mut(&id)
                 .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?,
-            host_address,
+            native_destination,
         )?;
         if matches!(
             status,
@@ -1394,12 +1385,12 @@ impl Reactor {
                     .ok_or(PlatformConnectError::PeerIndeterminate(
                         BrokerError::Internal,
                     ))?;
-            socket.guest_local_address = Some(local_guest_address);
+            socket.guest_local_address = Some(guest_local_address);
             socket
                 .snapshot
                 .lock()
                 .expect("Linux socket snapshot mutex poisoned")
-                .local_address = Some(local_guest_address);
+                .local_address = Some(guest_local_address);
         }
         update_snapshot(
             self.sockets
@@ -1867,38 +1858,33 @@ impl Reactor {
         self.remove_queued_guest_connection(listener_id, connector_socket_id, true);
     }
 
-    fn resolve_guest_destination(
+    fn resolve_tcp_destination(
         &self,
-        address: SocketAddrV4,
+        requested_destination: SocketAddrV4,
     ) -> SocketOutcome<ResolvedTcpDestination> {
-        match classify_socket_destination(address) {
-            Ok(SocketDestination::Guest(address)) => {
-                let Some(binding) = self.tcp.guest_binding(address) else {
-                    return SocketOutcome::Failed(SocketError::ConnectionRefused);
-                };
-                let listener_live = self
-                    .sockets
-                    .get(&binding.socket_id)
-                    .and_then(|listener| listener.tcp_state().ok())
-                    .and_then(|tcp| tcp.listener.as_ref())
-                    .is_some();
-                if !listener_live {
-                    return SocketOutcome::Failed(SocketError::ConnectionRefused);
-                }
-                SocketOutcome::Completed(ResolvedTcpDestination::Guest {
-                    listener_id: binding.socket_id,
-                    concrete_address: address,
-                })
-            }
-            Ok(SocketDestination::Native {
-                guest_visible_address,
-                host_address,
-            }) => SocketOutcome::Completed(ResolvedTcpDestination::Native {
-                guest_visible_address,
-                host_address,
-            }),
-            Err(error) => SocketOutcome::Failed(error),
+        let destination = match normalize_socket_destination(requested_destination) {
+            Ok(destination) => destination,
+            Err(error) => return SocketOutcome::Failed(error),
+        };
+        if !is_internal_socket_destination(destination) {
+            return SocketOutcome::Completed(ResolvedTcpDestination::External(destination));
         }
+        let Some(binding) = self.tcp.guest_binding(destination) else {
+            return SocketOutcome::Failed(SocketError::ConnectionRefused);
+        };
+        let listener_live = self
+            .sockets
+            .get(&binding.socket_id)
+            .and_then(|listener| listener.tcp_state().ok())
+            .and_then(|tcp| tcp.listener.as_ref())
+            .is_some();
+        if !listener_live {
+            return SocketOutcome::Failed(SocketError::ConnectionRefused);
+        }
+        SocketOutcome::Completed(ResolvedTcpDestination::Internal {
+            listener_id: binding.socket_id,
+            concrete_address: destination,
+        })
     }
 
     pub(super) fn listen_socket(

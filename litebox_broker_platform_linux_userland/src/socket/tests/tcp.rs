@@ -512,11 +512,11 @@ fn native_tcp_gateway_uses_host_loopback_and_keeps_guest_identity() {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     listener.set_nonblocking(true).unwrap();
     let host_address = socket_address_v4(listener.local_addr().unwrap());
-    let destination = SocketAddrV4::new(GATEWAY_IPV4_ADDRESS, host_address.port());
+    let destination = SocketAddrV4::new(HOST_GATEWAY_IPV4_ADDRESS, host_address.port());
     let policy = SocketPolicy::deny()
         .with_tcp_destination_rules(&[DestinationRule::new(
             CallerCredential::Unauthenticated,
-            Ipv4Cidr::new(Ipv4Address(GATEWAY_IPV4_ADDRESS.octets()), 32).unwrap(),
+            Ipv4Cidr::new(Ipv4Address(HOST_GATEWAY_IPV4_ADDRESS.octets()), 32).unwrap(),
             DestinationPortRange::new(Port(destination.port()), Port(destination.port())).unwrap(),
         )])
         .unwrap();
