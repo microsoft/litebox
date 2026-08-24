@@ -1419,10 +1419,27 @@ fn register_embedded_ta(
     shim: &litebox_shim_optee::OpteeShim<Platform>,
     ta_binary: &'static [u8],
 ) -> bool {
-    let Some(ta_head) = litebox_common_optee::parse_ta_head(ta_binary) else {
+    use litebox_common_optee::{TaVerifyKey, parse_and_verify_ta};
+
+    // Hard-coded public key for testing
+    const TA_VERIFY_KEY_PEM: &[u8] =
+        include_bytes!("../../litebox_runner_optee_on_linux_userland/tests/signing_public_key.pem");
+    let Ok(verify_key_pem) = core::str::from_utf8(TA_VERIFY_KEY_PEM) else {
+        debug_serial_println!("TA verification key is not valid UTF-8");
         return false;
     };
-    shim.store_ta_bin(&ta_head.uuid, ta_binary)
+    let Ok(verify_key) = TaVerifyKey::from_pem(verify_key_pem) else {
+        debug_serial_println!("TA verification key is invalid");
+        return false;
+    };
+
+    match parse_and_verify_ta(ta_binary, &verify_key) {
+        Ok((ta_head, ta_elf)) => shim.store_ta_bin(&ta_head.uuid, ta_elf),
+        Err(err) => {
+            debug_serial_println!("parse_and_verify_ta failed: {}", err);
+            false
+        }
+    }
 }
 
 /// Register all TA binaries embedded in the runner image.
