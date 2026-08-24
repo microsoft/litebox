@@ -322,10 +322,9 @@ impl GuestSocketBinding {
     #[must_use]
     pub fn covers(&self, address: SocketAddrV4) -> bool {
         self.is_valid()
-            && address.port() != 0
-            && is_internal_network_address(*address.ip())
             && if self.is_wildcard() {
                 address.port() == self.requested.port()
+                    && is_internal_network_address(*address.ip())
             } else {
                 address == self.requested
             }
@@ -503,8 +502,8 @@ pub trait PlatformSocket: Send + Sync {
 
     /// Starts a TCP listener and returns its unchanged guest-visible address.
     ///
-    /// A failed outcome or broker error must leave the socket not listening
-    /// and retryable.
+    /// A failed outcome or broker error must leave the previous listener state
+    /// unchanged and retryable.
     fn listen(&self, backlog: u32) -> Result<SocketOutcome<SocketAddrV4>>;
 
     /// Accepts one pending TCP connection without waiting.
@@ -831,11 +830,6 @@ pub fn bind(
         socket.configuration_in_flight = true;
         (Arc::clone(&socket.resource), socket.create_request)
     };
-    if guest_transport(create_request).is_none() {
-        finish_retired_configuration(&object, None, None)?;
-        resource.retire();
-        return Err(BrokerError::Internal);
-    }
     match reserve_and_bind(session, create_request, &resource, address) {
         Ok(ReserveAndBindOutcome::Completed(local_address, port_binding)) => {
             finish_configuration(&object, Some(local_address), Some(port_binding), false)?;
