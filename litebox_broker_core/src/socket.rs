@@ -1478,7 +1478,23 @@ fn datagram_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRes
                 pending_error: None,
             });
         }
-        let platform_status = resource.platform_socket.status()?;
+        let platform_status = match resource.platform_socket.status() {
+            Ok(status) => status,
+            Err(error) => {
+                let object = object.read();
+                let ObjectEntry::Socket(socket) = &*object else {
+                    return Err(BrokerError::InvalidRights);
+                };
+                if socket.resource_retired {
+                    return Ok(SocketStatusResponse {
+                        status: socket.connection_status,
+                        local_address: socket.local_address,
+                        pending_error: None,
+                    });
+                }
+                return Err(error);
+            }
+        };
         pending_error = pending_error.or(platform_status.pending_error);
         let mut object = object.write();
         let ObjectEntry::Socket(socket) = &mut *object else {
@@ -2636,6 +2652,7 @@ pub(crate) mod tests {
         next_stream_receive: StdMutex<Option<PlatformStreamReceive>>,
         next_datagram_receive: StdMutex<Option<PlatformDatagramReceive>>,
         status_calls: AtomicUsize,
+        fail_status: core::sync::atomic::AtomicBool,
         status_responses: StdMutex<std::collections::VecDeque<PlatformSocketStatus>>,
         status_block: StdMutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
         binds: StdMutex<std::vec::Vec<SocketAddrV4>>,
@@ -2770,6 +2787,10 @@ pub(crate) mod tests {
 
         fn return_next_datagram_receive(&self, received: PlatformDatagramReceive) {
             *self.state.next_datagram_receive.lock().unwrap() = Some(received);
+        }
+
+        fn fail_next_status(&self) {
+            self.state.fail_status.store(true, Ordering::Relaxed);
         }
     }
 
@@ -3109,6 +3130,7 @@ pub(crate) mod tests {
 
         fn status(&self) -> Result<PlatformSocketStatus> {
             self.state.status_calls.fetch_add(1, Ordering::Relaxed);
+            let fail = self.state.fail_status.swap(false, Ordering::Relaxed);
             let status = self
                 .state
                 .status_responses
@@ -3124,6 +3146,9 @@ pub(crate) mod tests {
             if let Some((started, release)) = status_block {
                 started.send(()).unwrap();
                 release.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            if fail {
+                return Err(BrokerError::Internal);
             }
             Ok(status)
         }
@@ -5017,6 +5042,28 @@ pub(crate) mod tests {
         assert_eq!(
             status(&session, handle).unwrap().status,
             SocketConnectionStatus::Connected
+        );
+
+        provider.fail_next_status();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        *provider.state.status_block.lock().unwrap() = Some((started_tx, release_rx));
+        let status_session = Arc::clone(&session);
+        let in_flight = std::thread::spawn(move || status(&status_session, handle));
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        provider.fail_next_connect_indeterminate();
+        assert_eq!(
+            connect(&session, handle, SocketAddrV4::new(Ipv4Addr::LOCALHOST, 55),),
+            Err(BrokerError::Internal)
+        );
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            in_flight.join().unwrap(),
+            Ok(SocketStatusResponse {
+                status: SocketConnectionStatus::Failed(SocketError::Other),
+                local_address: Some(next_local_address),
+                pending_error: None,
+            })
         );
     }
 

@@ -392,7 +392,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
         if peek {
             broker_flags.0 |= BrokerReceiveFlags::PEEK.0;
         }
-        if wait_all {
+        if wait_all && peek {
             broker_flags.0 |= BrokerReceiveFlags::WAITALL.0;
         }
         let target = if peek {
