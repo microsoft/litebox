@@ -8,7 +8,7 @@ use crate::{
     host::per_cpu_variables::with_per_cpu_variables,
 };
 use digest::Digest;
-use litebox_common_lvbs::PRK_LEN;
+use litebox_common_lvbs::{CRNG_SEED_LEN, PRK_LEN};
 use rand_core::{RngCore, SeedableRng};
 use zeroize::Zeroizing;
 
@@ -105,14 +105,14 @@ unsafe impl litebox::platform::ThreadLocalStorageProvider for LvbsLinuxKernel {
 }
 
 impl litebox::platform::CrngProvider for LvbsLinuxKernel {
-    fn fill_bytes_crng(&self, buf: &mut [u8], seed: Option<&[u8]>) {
+    fn fill_bytes_crng(&self, buf: &mut [u8]) {
         static RANDOM: spin::mutex::SpinMutex<Option<LvbsCrng>> = spin::mutex::SpinMutex::new(None);
 
         let mut random = RANDOM.lock();
         random
             .get_or_insert_with(|| {
                 LvbsCrng::new(
-                    seed.expect("CRNG seed not provided"),
+                    CRNG_SEED_ONCE.get().expect("CRNG seed not set"),
                     rdrand_seed().expect("RDRAND unavailable during CRNG initialization"),
                 )
             })
@@ -176,6 +176,7 @@ impl LvbsCrng {
 }
 
 static PRK_ONCE: spin::Once<[u8; PRK_LEN]> = spin::Once::new();
+static CRNG_SEED_ONCE: spin::Once<[u8; CRNG_SEED_LEN]> = spin::Once::new();
 
 // Do not expose a raw PRK getter (i.e., no `get_platform_root_key`).
 // Consumers should provide key derivation function and context
@@ -190,6 +191,18 @@ pub(crate) fn set_platform_root_key(key: &[u8; PRK_LEN]) {
         let mut prk = Zeroizing::new([0u8; PRK_LEN]);
         prk.copy_from_slice(key);
         *prk
+    });
+}
+
+/// Sets the trusted CRNG seed for this platform.
+///
+/// This should be called once during platform initialization with a seed
+/// derived from a hardware root of trust (e.g., a TPM).
+pub(crate) fn set_crng_seed(seed: &[u8; CRNG_SEED_LEN]) {
+    CRNG_SEED_ONCE.call_once(|| {
+        let mut s = Zeroizing::new([0u8; CRNG_SEED_LEN]);
+        s.copy_from_slice(seed);
+        *s
     });
 }
 

@@ -26,11 +26,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         while offset < count {
             let len = (count - offset).min(kbuf.len());
             let kbuf = &mut kbuf[..len];
-            <_ as litebox::platform::CrngProvider>::fill_bytes_crng(
-                self.global.platform,
-                kbuf,
-                None,
-            );
+            <_ as litebox::platform::CrngProvider>::fill_bytes_crng(self.global.platform, kbuf);
             buf.copy_from_slice::<Platform>(offset, kbuf)
                 .ok_or(Errno::EFAULT)?;
             offset += len;

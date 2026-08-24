@@ -27,6 +27,9 @@ pub const PAGE_SHIFT: usize = 12;
 /// Length of the Platform Root Key in bytes.
 pub const PRK_LEN: usize = 32;
 
+/// Length of the CRNG seed.
+pub const CRNG_SEED_LEN: usize = 32;
+
 /// Maximum number of CPU cores addressable through the VTL0 `cpu_online_mask`
 /// ABI. Bounds how many bits of the mask VTL1 will honor when booting APs.
 pub const MAX_CORES: usize = 128;
@@ -48,9 +51,8 @@ pub const VSM_VTL_CALL_FUNC_ID_KEXEC_VALIDATE: u32 = 0x1_ffea;
 pub const VSM_VTL_CALL_FUNC_ID_PATCH_TEXT: u32 = 0x1_ffeb;
 pub const VSM_VTL_CALL_FUNC_ID_ALLOCATE_RINGBUFFER_MEMORY: u32 = 0x1_ffec;
 
-// This VSM function ID for setting the platform root key and generating the identity signing key is subject to change
-pub const VSM_VTL_CALL_FUNC_ID_SET_PLATFORM_ROOT_KEY_AND_GENERATE_IDENTITY_SIGNING_KEY: u32 =
-    0x1_ffed;
+// This VSM function ID for exchanging secrets is subject to change
+pub const VSM_VTL_CALL_FUNC_ID_EXCHANGE_SECRETS: u32 = 0x1_ffed;
 
 // This VSM function ID for OP-TEE messages is subject to change
 pub const VSM_VTL_CALL_FUNC_ID_OPTEE_MESSAGE: u32 = 0x1_fff0;
@@ -74,8 +76,7 @@ pub enum VsmFunction {
     PatchText = VSM_VTL_CALL_FUNC_ID_PATCH_TEXT,
     OpteeMessage = VSM_VTL_CALL_FUNC_ID_OPTEE_MESSAGE,
     AllocateRingbufferMemory = VSM_VTL_CALL_FUNC_ID_ALLOCATE_RINGBUFFER_MEMORY,
-    SetPlatformRootKeyAndGenerateIdentitySigningKey =
-        VSM_VTL_CALL_FUNC_ID_SET_PLATFORM_ROOT_KEY_AND_GENERATE_IDENTITY_SIGNING_KEY,
+    ExchangeSecrets = VSM_VTL_CALL_FUNC_ID_EXCHANGE_SECRETS,
 }
 
 // `HV_STATUS_*` constants used as discriminants for `HypervCallError`.
@@ -967,6 +968,9 @@ pub trait Vtl1Gate {
 
     /// Read the platform root key from VTL0 `key_pa` and store it in VTL1 state.
     fn set_platform_root_key(&self, key_pa: u64) -> Result<(), VsmError>;
+
+    /// Read a CRNG seed from VTL0 `trusted_seed_pa` and store it in VTL1.
+    fn set_crng_seed(&self, trusted_seed_pa: u64) -> Result<(), VsmError>;
 
     /// Close VTL1's window of trusting VTL0, making
     /// [`Vtl0Gate::end_of_boot_reached`] report `true` from here on. One-way:
