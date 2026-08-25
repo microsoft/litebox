@@ -6,7 +6,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddrV4;
 use std::os::fd::OwnedFd;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use litebox_broker_core::readiness::ReadinessRegistration;
@@ -227,11 +227,7 @@ fn readiness_from_epoll(socket: &SocketEntry, events: epoll::EventFlags) -> Read
     if events.contains(epoll::EventFlags::ERR) {
         readiness = readiness | ReadinessFlags::ERROR;
     }
-    let previous = socket
-        .snapshot
-        .lock()
-        .expect("Linux socket snapshot mutex poisoned")
-        .readiness;
+    let previous = socket.snapshot.load();
     ReadinessFlags(readiness.0 | previous.0)
 }
 
@@ -245,60 +241,29 @@ fn active_epoll_events() -> epoll::EventFlags {
 }
 
 fn add_readiness(socket: &SocketEntry, readiness: ReadinessFlags) -> BrokerResult<()> {
-    let current = socket
-        .snapshot
-        .lock()
-        .expect("Linux socket snapshot mutex poisoned")
-        .readiness;
-    update_snapshot(socket, None, ReadinessFlags(current.0 | readiness.0))
+    let current = socket.snapshot.load();
+    update_snapshot(socket, ReadinessFlags(current.0 | readiness.0))
 }
 
 fn clear_readiness(socket: &SocketEntry, readiness: ReadinessFlags) -> BrokerResult<()> {
-    let current = socket
-        .snapshot
-        .lock()
-        .expect("Linux socket snapshot mutex poisoned")
-        .readiness;
-    update_snapshot(socket, None, ReadinessFlags(current.0 & !readiness.0))
+    let current = socket.snapshot.load();
+    update_snapshot(socket, ReadinessFlags(current.0 & !readiness.0))
 }
 
-fn consume_synchronous_error(socket: &SocketEntry) -> BrokerResult<()> {
-    let query_socket_error = {
-        let snapshot = socket
-            .snapshot
-            .lock()
-            .expect("Linux socket snapshot mutex poisoned");
-        if !can_consume_synchronous_error(socket.kind(), socket.connection_status) {
-            return Ok(());
-        }
-        snapshot.pending_error.is_none()
-    };
-    let socket_error = if query_socket_error {
-        take_socket_error(socket)?
-    } else {
-        None
-    };
-    let (readiness, changed) = {
-        let mut snapshot = socket
-            .snapshot
-            .lock()
-            .expect("Linux socket snapshot mutex poisoned");
-        if snapshot.pending_error.is_none() {
-            snapshot.pending_error = socket_error;
-        }
-        let readiness = if snapshot.pending_error.is_some() {
-            snapshot.readiness | ReadinessFlags::ERROR
-        } else {
-            ReadinessFlags(snapshot.readiness.0 & !ReadinessFlags::ERROR.0)
-        };
-        let changed = readiness != snapshot.readiness;
-        snapshot.readiness = readiness;
-        (readiness, changed)
-    };
-    if changed {
-        socket.readiness.publish(readiness)?;
+fn consume_synchronous_error(socket: &mut SocketEntry) -> BrokerResult<()> {
+    if !can_consume_synchronous_error(socket.connection_status) {
+        return Ok(());
     }
-    Ok(())
+    if socket.pending_error.is_none() {
+        socket.pending_error = take_socket_error(socket)?;
+    }
+    let current = socket.snapshot.load();
+    let readiness = if socket.pending_error.is_some() {
+        current | ReadinessFlags::ERROR
+    } else {
+        ReadinessFlags(current.0 & !ReadinessFlags::ERROR.0)
+    };
+    update_snapshot(socket, readiness)
 }
 
 #[derive(Clone)]
@@ -396,12 +361,8 @@ fn confirm_tcp_connected(socket: &mut SocketEntry) {
         return;
     }
     socket.connection_status = SocketConnectionStatus::Connected;
-    let readiness = socket
-        .snapshot
-        .lock()
-        .expect("Linux socket snapshot mutex poisoned")
-        .readiness;
-    let _ = update_snapshot(socket, Some(SocketConnectionStatus::Connected), readiness);
+    let readiness = socket.snapshot.load();
+    let _ = update_snapshot(socket, readiness);
 }
 
 /// Records a terminal native operation while a connect is pending.
@@ -412,17 +373,8 @@ fn fail_connect(socket: &mut SocketEntry, error: SocketError) {
         return;
     }
     socket.connection_status = SocketConnectionStatus::Failed(error);
-    let readiness = socket
-        .snapshot
-        .lock()
-        .expect("Linux socket snapshot mutex poisoned")
-        .readiness
-        | ReadinessFlags::ERROR;
-    let _ = update_snapshot(
-        socket,
-        Some(SocketConnectionStatus::Failed(error)),
-        readiness,
-    );
+    let readiness = socket.snapshot.load() | ReadinessFlags::ERROR;
+    let _ = update_snapshot(socket, readiness);
 }
 
 pub(super) fn connect_tcp_socket(
@@ -489,12 +441,8 @@ pub(super) fn connect_tcp_socket(
                     Err(error) => {
                         socket.connection_status =
                             SocketConnectionStatus::Failed(SocketError::Other);
-                        update_snapshot(
-                            socket,
-                            Some(SocketConnectionStatus::Failed(SocketError::Other)),
-                            ReadinessFlags::ERROR,
-                        )
-                        .map_err(PlatformConnectError::PeerIndeterminate)?;
+                        update_snapshot(socket, ReadinessFlags::ERROR)
+                            .map_err(PlatformConnectError::PeerIndeterminate)?;
                         return Err(PlatformConnectError::PeerIndeterminate(error));
                     }
                 };
@@ -657,13 +605,10 @@ pub(super) fn receive_socket(
         return Err(BrokerError::UnsupportedOperation);
     }
     if flags.contains(ReceiveFlags::WAITALL) {
-        let snapshot = *socket
-            .snapshot
-            .lock()
-            .expect("Linux socket snapshot mutex poisoned");
+        let readiness = socket.snapshot.load();
         let terminal = socket.read_shutdown
-            || snapshot.readiness.contains(ReadinessFlags::HANGUP)
-            || snapshot.readiness.contains(ReadinessFlags::ERROR);
+            || readiness.contains(ReadinessFlags::HANGUP)
+            || readiness.contains(ReadinessFlags::ERROR);
         if socket.connection_status == SocketConnectionStatus::Connected
             && !terminal
             && ioctl_fionread(socket.tcp_state()?.descriptor.socket()?)
@@ -720,11 +665,7 @@ pub(super) fn receive_socket(
 
     let cache = peek_cache.as_ref().ok_or(BrokerError::Internal)?;
     if cache.data.len() <= peek_offset {
-        let readiness = socket
-            .snapshot
-            .lock()
-            .expect("Linux socket snapshot mutex poisoned")
-            .readiness;
+        let readiness = socket.snapshot.load();
         let terminal = socket.read_shutdown
             || readiness.contains(ReadinessFlags::HANGUP)
             || readiness.contains(ReadinessFlags::ERROR);
@@ -770,13 +711,8 @@ fn receive_socket_once(
             Ok((_buffer, received)) => {
                 confirm_tcp_connected(socket);
                 data.truncate(received);
-                let terminal_readable = socket.read_shutdown
-                    || socket
-                        .snapshot
-                        .lock()
-                        .expect("Linux socket snapshot mutex poisoned")
-                        .readiness
-                        .contains(ReadinessFlags::HANGUP);
+                let terminal_readable =
+                    socket.read_shutdown || socket.snapshot.load().contains(ReadinessFlags::HANGUP);
                 if !flags.contains(LinuxRecvFlags::PEEK) && !terminal_readable {
                     let no_queued_data = ioctl_fionread(socket.tcp_state()?.descriptor.socket()?)
                         .is_ok_and(|available| available == 0);
@@ -1076,14 +1012,10 @@ pub(super) fn shutdown_tcp_socket(
             .peek_waitall_threshold
             .take()
             .is_some();
-    let current = socket
-        .snapshot
-        .lock()
-        .expect("Linux socket snapshot mutex poisoned")
-        .readiness;
+    let current = socket.snapshot.load();
     let readiness = ReadinessFlags((current.0 & !clear.0) | add.0);
     // Native shutdown and the cached directional state are committed.
-    let _ = update_snapshot(socket, None, readiness);
+    let _ = update_snapshot(socket, readiness);
     if republish_readiness {
         let _ = socket.readiness.republish(readiness);
     }
@@ -1104,7 +1036,7 @@ pub(super) fn handle_socket_event(
     // setup, so this only absorbs a synthetic sink fault. Genuine host-syscall
     // or internal-consistency errors still propagate and remain fatal.
     if socket.kind() == SocketKind::Udp {
-        let _ = update_snapshot(socket, None, readiness_from_epoll(socket, events));
+        let _ = update_snapshot(socket, readiness_from_epoll(socket, events));
         return Ok(());
     }
     if events.contains(epoll::EventFlags::IN) {
@@ -1136,22 +1068,18 @@ pub(super) fn handle_socket_event(
             complete_connect(socket, events)?;
         }
         SocketConnectionStatus::Connected => {
-            let _ = update_snapshot(socket, None, readiness_from_epoll(socket, events));
+            let _ = update_snapshot(socket, readiness_from_epoll(socket, events));
         }
         SocketConnectionStatus::Failed(SocketError::NotConnected) if socket.read_shutdown => {
-            let _ = update_snapshot(socket, None, ReadinessFlags::WRITE | ReadinessFlags::HANGUP);
+            let _ = update_snapshot(socket, ReadinessFlags::WRITE | ReadinessFlags::HANGUP);
         }
         SocketConnectionStatus::Failed(_) => {
-            let _ = update_snapshot(socket, None, ReadinessFlags::ERROR);
+            let _ = update_snapshot(socket, ReadinessFlags::ERROR);
         }
         _ => return Err(BrokerError::Internal),
     }
     if republish_readiness {
-        let readiness = socket
-            .snapshot
-            .lock()
-            .expect("Linux socket snapshot mutex poisoned")
-            .readiness;
+        let readiness = socket.snapshot.load();
         let _ = socket.readiness.republish(readiness);
     }
     Ok(())
@@ -1169,9 +1097,8 @@ fn complete_connect(
     let status = match sockopt::socket_error(socket.tcp_state()?.descriptor.socket()?) {
         Ok(Ok(())) if events.contains(epoll::EventFlags::OUT) => SocketConnectionStatus::Connected,
         Ok(Ok(())) => SocketConnectionStatus::Connecting,
-        Ok(Err(error)) | Err(error) => {
-            SocketConnectionStatus::Failed(socket_error_from_errno(error))
-        }
+        Ok(Err(error)) => SocketConnectionStatus::Failed(socket_error_from_errno(error)),
+        Err(error) => return Err(broker_error_from_errno(error)),
     };
     let readiness = match status {
         SocketConnectionStatus::Connected => {
@@ -1182,7 +1109,7 @@ fn complete_connect(
         _ => return Err(BrokerError::Internal),
     };
     socket.connection_status = status;
-    let _ = update_snapshot(socket, Some(status), readiness);
+    let _ = update_snapshot(socket, readiness);
     Ok(status)
 }
 
@@ -1268,11 +1195,7 @@ impl Reactor {
                 socket.read_shutdown = true;
                 socket.connection_status =
                     SocketConnectionStatus::Failed(SocketError::NotConnected);
-                let _ = update_snapshot(
-                    socket,
-                    Some(SocketConnectionStatus::Failed(SocketError::NotConnected)),
-                    ReadinessFlags::WRITE | ReadinessFlags::HANGUP,
-                );
+                let _ = update_snapshot(socket, ReadinessFlags::WRITE | ReadinessFlags::HANGUP);
                 listener.queue
             };
             self.discard_queued_guest_connections(queued, true);
@@ -1300,11 +1223,6 @@ impl Reactor {
         })?;
         let socket = self.sockets.get_mut(&id).ok_or(BrokerError::Internal)?;
         socket.guest_local_address = Some(guest_address);
-        socket
-            .snapshot
-            .lock()
-            .expect("Linux socket snapshot mutex poisoned")
-            .local_address = Some(guest_address);
         Ok(SocketOutcome::Completed(guest_address))
     }
 
@@ -1333,7 +1251,7 @@ impl Reactor {
                     .get_mut(&id)
                     .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?;
                 socket.connection_status = status;
-                update_snapshot(socket, Some(status), ReadinessFlags::ERROR)
+                update_snapshot(socket, ReadinessFlags::ERROR)
                     .map_err(PlatformConnectError::PeerIndeterminate)?;
                 return Ok(status);
             }
@@ -1386,11 +1304,6 @@ impl Reactor {
                         BrokerError::Internal,
                     ))?;
             socket.guest_local_address = Some(guest_local_address);
-            socket
-                .snapshot
-                .lock()
-                .expect("Linux socket snapshot mutex poisoned")
-                .local_address = Some(guest_local_address);
         }
         update_snapshot(
             self.sockets
@@ -1398,7 +1311,6 @@ impl Reactor {
                 .ok_or(PlatformConnectError::PeerIndeterminate(
                     BrokerError::Internal,
                 ))?,
-            Some(status),
             readiness,
         )
         .map_err(PlatformConnectError::PeerIndeterminate)?;
@@ -1479,7 +1391,7 @@ impl Reactor {
                     .get_mut(&connector_socket_id)
                     .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?;
                 connector.connection_status = status;
-                update_snapshot(connector, Some(status), ReadinessFlags::ERROR)
+                update_snapshot(connector, ReadinessFlags::ERROR)
                     .map_err(PlatformConnectError::PeerIndeterminate)?;
                 return Ok(status);
             }
@@ -1525,11 +1437,6 @@ impl Reactor {
             });
             connector.guest_local_address = Some(source_address);
             connector.connection_status = SocketConnectionStatus::Connected;
-            connector
-                .snapshot
-                .lock()
-                .expect("Linux socket snapshot mutex poisoned")
-                .local_address = Some(source_address);
         }
         self.sockets
             .get_mut(&listener_id)
@@ -1557,7 +1464,6 @@ impl Reactor {
             self.sockets.get(&connector_socket_id).ok_or(
                 PlatformConnectError::PeerIndeterminate(BrokerError::Internal),
             )?,
-            Some(SocketConnectionStatus::Connected),
             ReadinessFlags::WRITE,
         ) {
             self.remove_queued_guest_connection(listener_id, connector_socket_id, false);
@@ -1790,21 +1696,17 @@ impl Reactor {
             GuestTcpResetState::Pending => {}
             GuestTcpResetState::Reported => return,
         }
-        let readiness = {
-            let mut snapshot = socket
-                .snapshot
-                .lock()
-                .expect("Linux socket snapshot mutex poisoned");
-            if snapshot.pending_error.is_none() {
-                snapshot.pending_error = Some(SocketError::ConnectionReset);
-            }
-            snapshot.readiness = snapshot.readiness
-                | ReadinessFlags::READ
-                | ReadinessFlags::ERROR
-                | ReadinessFlags::HANGUP;
-            snapshot.readiness
+        if socket.pending_error.is_none() {
+            socket.pending_error = Some(SocketError::ConnectionReset);
+        }
+        let current = socket.snapshot.load();
+        let readiness =
+            current | ReadinessFlags::READ | ReadinessFlags::ERROR | ReadinessFlags::HANGUP;
+        let _ = if readiness == current {
+            socket.readiness.republish(readiness)
+        } else {
+            update_snapshot(socket, readiness)
         };
-        let _ = socket.readiness.publish(readiness);
     }
 
     fn publish_listener_queue_readiness(&self, listener_id: u64) -> BrokerResult<()> {
@@ -1817,21 +1719,16 @@ impl Reactor {
             .listener
             .as_ref()
             .is_some_and(|state| !state.queue.is_empty());
-        let current = listener
-            .snapshot
-            .lock()
-            .expect("Linux socket snapshot mutex poisoned")
-            .readiness;
+        let current = listener.snapshot.load();
         if queue_nonempty {
             if current.contains(ReadinessFlags::READ) {
                 listener.readiness.republish(current)
             } else {
-                update_snapshot(listener, None, current | ReadinessFlags::READ)
+                update_snapshot(listener, current | ReadinessFlags::READ)
             }
         } else if current.contains(ReadinessFlags::READ) {
             update_snapshot(
                 listener,
-                None,
                 ReadinessFlags(current.0 & !ReadinessFlags::READ.0),
             )
         } else {
@@ -1933,7 +1830,7 @@ impl Reactor {
         listener_id: u64,
         accepted_id: u64,
         readiness: ReadinessRegistration,
-        snapshot: Arc<Mutex<SocketSnapshot>>,
+        snapshot: Arc<SocketSnapshot>,
         lifecycle: &SocketLifecycle,
     ) -> BrokerResult<SocketOutcome<AcceptedEndpoints>> {
         if self.sockets.contains_key(&accepted_id) {
@@ -1944,7 +1841,6 @@ impl Reactor {
             listener_tcp_no_delay,
             listener_tcp_keep_alive,
             queue_length,
-            accepted_local_address,
             accepted_connector_socket_id,
             accepted_connector_session_id,
         ) = {
@@ -1961,10 +1857,6 @@ impl Reactor {
                 tcp.no_delay,
                 tcp.keep_alive,
                 listener_state.queue.len(),
-                listener_state.queue.front().map_or(
-                    listener.guest_local_address.ok_or(BrokerError::Internal)?,
-                    |queued| queued.local_address,
-                ),
                 listener_state
                     .queue
                     .front()
@@ -2021,14 +1913,7 @@ impl Reactor {
                 return Err(error);
             }
         }
-        {
-            let mut snapshot = snapshot
-                .lock()
-                .expect("Linux socket snapshot mutex poisoned");
-            snapshot.status = SocketConnectionStatus::Connected;
-            snapshot.local_address = Some(accepted_local_address);
-            snapshot.readiness = ReadinessFlags::WRITE;
-        }
+        snapshot.store(ReadinessFlags::WRITE);
         if let Err(error) = readiness.publish(ReadinessFlags::WRITE) {
             self.purge_failed_accept_setup(listener_id, accepted_connector_socket_id);
             return Err(error);
@@ -2090,6 +1975,7 @@ impl Reactor {
                 readiness,
                 snapshot,
                 connection_status: SocketConnectionStatus::Connected,
+                pending_error: None,
                 read_shutdown: false,
                 write_shutdown: false,
                 guest_local_address: Some(local_address),
@@ -2131,20 +2017,15 @@ pub(super) fn consume_pending_guest_reset(socket: &mut SocketEntry) -> BrokerRes
         true
     };
     if consumed {
+        if socket.pending_error == Some(SocketError::ConnectionReset) {
+            socket.pending_error = None;
+        }
         let cleared_readiness = {
-            let mut snapshot = socket
-                .snapshot
-                .lock()
-                .expect("Linux socket snapshot mutex poisoned");
-            if snapshot.pending_error == Some(SocketError::ConnectionReset) {
-                snapshot.pending_error = None;
-            }
-            if snapshot.pending_error.is_none()
-                && snapshot.readiness.contains(ReadinessFlags::ERROR)
-            {
-                snapshot.readiness =
-                    ReadinessFlags(snapshot.readiness.0 & !ReadinessFlags::ERROR.0);
-                Some(snapshot.readiness)
+            let readiness = socket.snapshot.load();
+            if socket.pending_error.is_none() && readiness.contains(ReadinessFlags::ERROR) {
+                let readiness = ReadinessFlags(readiness.0 & !ReadinessFlags::ERROR.0);
+                socket.snapshot.store(readiness);
+                Some(readiness)
             } else {
                 None
             }

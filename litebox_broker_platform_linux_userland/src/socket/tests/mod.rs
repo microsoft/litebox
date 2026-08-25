@@ -95,6 +95,47 @@ fn concurrent_socket_retirement_waits_for_close_acknowledgement() {
     assert_eq!(lifecycle.load(), SocketLifecycleState::Retired);
 }
 
+#[test]
+fn failed_close_acknowledgement_waits_for_reactor_termination() {
+    let (commands, receiver) = sync_channel(1);
+    let wake = Arc::new(eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK).unwrap());
+    let (acknowledgement_dropped, wait_for_acknowledgement_drop) = sync_channel(1);
+    let (release_reactor, wait_to_release_reactor) = sync_channel(1);
+    let reactor_thread = thread::spawn(move || {
+        let ReactorCommand::Close { response, .. } = receiver.recv().unwrap() else {
+            panic!("unexpected reactor command");
+        };
+        drop(response);
+        acknowledgement_dropped.send(()).unwrap();
+        wait_to_release_reactor.recv_timeout(TEST_TIMEOUT).unwrap();
+    });
+    let reactor = Arc::new(ReactorClient {
+        commands,
+        wake,
+        next_socket_id: AtomicU64::new(1),
+        thread: Mutex::new(Some(reactor_thread)),
+    });
+
+    let closing_reactor = Arc::clone(&reactor);
+    let (close_finished, wait_for_close) = sync_channel(1);
+    let close = thread::spawn(move || {
+        closing_reactor.close_socket(1);
+        close_finished.send(()).unwrap();
+    });
+    wait_for_acknowledgement_drop
+        .recv_timeout(TEST_TIMEOUT)
+        .unwrap();
+    assert!(
+        wait_for_close
+            .recv_timeout(Duration::from_millis(100))
+            .is_err()
+    );
+
+    release_reactor.send(()).unwrap();
+    wait_for_close.recv_timeout(TEST_TIMEOUT).unwrap();
+    close.join().unwrap();
+}
+
 fn send_bytes(
     session: &BrokerSession,
     handle: ObjectHandle,
@@ -186,16 +227,10 @@ fn cached_socket_error_precedes_a_new_kernel_error() {
 #[test]
 fn synchronous_errors_do_not_consume_tcp_connect_status() {
     assert!(!can_consume_synchronous_error(
-        SocketKind::Tcp,
         SocketConnectionStatus::Connecting,
     ));
     assert!(can_consume_synchronous_error(
-        SocketKind::Tcp,
-        SocketConnectionStatus::Connected,
-    ));
-    assert!(can_consume_synchronous_error(
-        SocketKind::Udp,
-        SocketConnectionStatus::Unconnected,
+        SocketConnectionStatus::Connected
     ));
 }
 

@@ -33,8 +33,8 @@ use rustix::net::{
 
 use super::{
     PlatformSocketStatus, Reactor, ReactorReceiveFromOutcome, SocketKind, WAKE_TOKEN,
-    broker_error_from_errno, local_socket_address, socket_operation_error_from_errno,
-    update_snapshot, zeroed_vec,
+    broker_error_from_errno, local_socket_address, socket_error_from_errno,
+    socket_operation_error_from_errno, update_snapshot, zeroed_vec,
 };
 
 pub(super) const MAX_REJECTED_UDP_DATAGRAMS_PER_COMMAND: usize = 64;
@@ -463,12 +463,7 @@ impl Reactor {
     pub(super) fn udp_readiness(&self, socket_id: u64) -> BrokerResult<ReadinessFlags> {
         let socket = self.sockets.get(&socket_id).ok_or(BrokerError::Internal)?;
         let udp = socket.udp_state()?;
-        let cached_error = socket
-            .snapshot
-            .lock()
-            .expect("Linux socket snapshot mutex poisoned")
-            .pending_error
-            .is_some();
+        let cached_error = socket.pending_error.is_some();
         let mut readiness = ReadinessFlags::default();
         let native_readable = udp
             .native_endpoint
@@ -500,7 +495,7 @@ impl Reactor {
             .sockets
             .get_mut(&socket_id)
             .ok_or(BrokerError::Internal)?;
-        update_snapshot(socket, None, readiness)
+        update_snapshot(socket, readiness)
     }
 
     fn take_udp_error(&mut self, socket_id: u64) -> BrokerResult<Option<SocketError>> {
@@ -552,15 +547,14 @@ impl Reactor {
         socket_id: u64,
     ) -> BrokerResult<PlatformSocketStatus> {
         let (status, local_address, cached_error) = {
-            let socket = self.sockets.get(&socket_id).ok_or(BrokerError::Internal)?;
-            let mut snapshot = socket
-                .snapshot
-                .lock()
-                .expect("Linux socket snapshot mutex poisoned");
+            let socket = self
+                .sockets
+                .get_mut(&socket_id)
+                .ok_or(BrokerError::Internal)?;
             (
                 socket.connection_status,
-                snapshot.local_address,
-                snapshot.pending_error.take(),
+                socket.guest_local_address,
+                socket.pending_error.take(),
             )
         };
         let mut pending_error = cached_error;
@@ -581,7 +575,7 @@ impl Reactor {
             .sockets
             .get_mut(&socket_id)
             .ok_or(BrokerError::Internal)?;
-        let _ = update_snapshot(socket, None, readiness);
+        let _ = update_snapshot(socket, readiness);
         if republish_error {
             // Returning the cached error leaves another error pending without
             // changing readiness, so wake a waiter for the remaining error.
@@ -593,16 +587,9 @@ impl Reactor {
                     .sockets
                     .get_mut(&socket_id)
                     .expect("UDP status socket disappeared after rearm failure");
-                let readiness = {
-                    let mut snapshot = socket
-                        .snapshot
-                        .lock()
-                        .expect("Linux socket snapshot mutex poisoned");
-                    snapshot.pending_error = Some(pending_error);
-                    snapshot.readiness = snapshot.readiness | ReadinessFlags::ERROR;
-                    snapshot.readiness
-                };
-                let _ = socket.readiness.publish(readiness);
+                socket.pending_error = Some(pending_error);
+                let readiness = socket.snapshot.load() | ReadinessFlags::ERROR;
+                let _ = update_snapshot(socket, readiness);
             }
             return Err(error);
         }
@@ -630,14 +617,9 @@ impl Reactor {
             .sockets
             .get_mut(&socket_id)
             .ok_or(BrokerError::Internal)?;
-        {
-            let mut snapshot = socket
-                .snapshot
-                .lock()
-                .expect("Linux socket snapshot mutex poisoned");
-            snapshot.pending_error = Some(cached_error);
-            snapshot.readiness = snapshot.readiness | ReadinessFlags::ERROR;
-        }
+        socket.pending_error = Some(cached_error);
+        let readiness = socket.snapshot.load() | ReadinessFlags::ERROR;
+        let _ = update_snapshot(socket, readiness);
         socket
             .udp_state_mut()?
             .native_endpoint
@@ -718,8 +700,12 @@ impl Reactor {
             match udp.peer {
                 None => true,
                 Some(ReactorUdpPeer::Internal {
-                    socket_generation, ..
-                }) => socket_generation == source_socket_id,
+                    socket_generation,
+                    internal_address,
+                }) => {
+                    socket_generation == source_socket_id
+                        && internal_address == source_guest_address
+                }
                 Some(ReactorUdpPeer::External(_)) => false,
             }
         };
@@ -820,9 +806,7 @@ impl Reactor {
                 .get(&destination_id)
                 .expect("UDP destination disappeared during readiness rollback")
                 .snapshot
-                .lock()
-                .expect("Linux socket snapshot mutex poisoned")
-                .readiness = readiness;
+                .store(readiness);
         }
         Ok(SocketOutcome::Completed(payload.len()))
     }
@@ -1092,7 +1076,7 @@ impl Reactor {
         &mut self,
         socket_id: u64,
         external_destination: SocketAddrV4,
-    ) -> core::result::Result<SocketOutcome<SocketAddrV4>, PlatformConnectError> {
+    ) -> core::result::Result<SocketOutcome<()>, PlatformConnectError> {
         {
             let socket =
                 self.sockets
@@ -1150,7 +1134,7 @@ impl Reactor {
                     | ReactorReceiveFromOutcome::Failed(_),
                 ) => {}
                 Err(BrokerError::WouldBlock) => {
-                    let guest_local_address = {
+                    {
                         let socket = self.sockets.get_mut(&socket_id).ok_or(
                             PlatformConnectError::PeerIndeterminate(BrokerError::Internal),
                         )?;
@@ -1171,11 +1155,10 @@ impl Reactor {
                         let guest_local_address =
                             SocketAddrV4::new(GUEST_IPV4_ADDRESS, native_address.port());
                         endpoint.guest_local_address = guest_local_address;
-                        guest_local_address
-                    };
+                    }
                     self.rearm_udp_endpoint(socket_id)
                         .map_err(PlatformConnectError::PeerIndeterminate)?;
-                    return Ok(SocketOutcome::Completed(guest_local_address));
+                    return Ok(SocketOutcome::Completed(()));
                 }
                 Err(error) => return Err(PlatformConnectError::PeerIndeterminate(error)),
             }
@@ -1836,7 +1819,8 @@ fn receive_datagram_fd(
 fn take_udp_socket_error(socket: &OwnedFd) -> BrokerResult<Option<SocketError>> {
     match sockopt::socket_error(socket) {
         Ok(Ok(())) => Ok(None),
-        Ok(Err(error)) | Err(error) => socket_operation_error_from_errno(error).map(Some),
+        Ok(Err(error)) => Ok(Some(socket_error_from_errno(error))),
+        Err(error) => Err(broker_error_from_errno(error)),
     }
 }
 

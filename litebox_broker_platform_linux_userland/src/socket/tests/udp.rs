@@ -222,6 +222,42 @@ fn unmatched_guest_udp_destinations_fail_closed() {
 }
 
 #[test]
+fn failed_initial_udp_readiness_does_not_retain_session_state() {
+    let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
+    let broker = BrokerCore::new_with_limits(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(SocketPolicy::guest_network()),
+        BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
+        provider.clone(),
+    )
+    .unwrap();
+    let session = broker
+        .create_session(CallerCredential::Unauthenticated)
+        .unwrap();
+    let (published, _publications) = channel();
+    let (retired, _retirements) = channel();
+    let readiness = Arc::new(FailingReadinessSink {
+        inner: TestReadinessSink { published, retired },
+        fail_next_publish: Mutex::new(None),
+    });
+    readiness.fail_next_publish_matching_any(ReadinessFlags::WRITE, ReadinessFlags::default());
+
+    assert!(matches!(
+        litebox_broker_core::socket::create(
+            &session,
+            CreateSocketRequest {
+                address_family: AddressFamily::Ipv4,
+                socket_type: SocketType::Datagram,
+                protocol: IpProtocol::Udp,
+            },
+            readiness,
+        ),
+        Err(BrokerError::ResourceExhausted)
+    ));
+    assert_eq!(provider.reactor.session_state_count(), 0);
+}
+
+#[test]
 fn guest_udp_readiness_failure_rolls_back_enqueue() {
     let provider = Arc::new(LinuxSocketProvider::new(2, 1).unwrap());
     let broker = BrokerCore::new_with_limits(
@@ -2017,6 +2053,85 @@ fn connected_guest_udp_enforces_barriers_peek_and_peer_generations() {
         send_datagram(&first_session, first, b"stale peer", SendFlags::NONE, None),
         Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
     );
+}
+
+#[test]
+fn connected_guest_udp_filters_other_wildcard_peer_aliases() {
+    let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
+    let broker = BrokerCore::new_with_limits(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(SocketPolicy::guest_network()),
+        BrokerCoreLimits::new_with_all_limits(4, 0, 2, 2),
+        provider,
+    )
+    .unwrap();
+    let session = broker
+        .create_session(CallerCredential::Unauthenticated)
+        .unwrap();
+    let (published, publications) = channel();
+    let (retired, _retirements) = channel();
+    let readiness = Arc::new(TestReadinessSink { published, retired });
+    let sender_binding = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 18082);
+    let receiver_binding = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 18083);
+    let sender = create_udp_socket(&session, readiness.clone());
+    let receiver = create_udp_socket(&session, readiness);
+    assert_eq!(
+        litebox_broker_core::socket::bind(&session, sender, sender_binding),
+        Ok(SocketOutcome::Completed(sender_binding))
+    );
+    assert_eq!(
+        litebox_broker_core::socket::bind(&session, receiver, receiver_binding),
+        Ok(SocketOutcome::Completed(receiver_binding))
+    );
+    let connected_peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, sender_binding.port());
+    assert_eq!(
+        litebox_broker_core::socket::connect(&session, receiver, connected_peer),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+    );
+
+    let private_receiver = SocketAddrV4::new(GUEST_IPV4_ADDRESS, receiver_binding.port());
+    assert_eq!(
+        send_datagram(
+            &session,
+            sender,
+            b"wrong alias",
+            SendFlags::NONE,
+            Some(private_receiver),
+        ),
+        Ok(SocketOutcome::Completed(11))
+    );
+    let mut payload = [0_u8; 11];
+    assert_eq!(
+        receive_datagram_into(&session, receiver, &mut payload, ReceiveFromFlags::NONE,),
+        Err(BrokerError::WouldBlock)
+    );
+
+    let loopback_receiver = SocketAddrV4::new(Ipv4Addr::LOCALHOST, receiver_binding.port());
+    assert_eq!(
+        send_datagram(
+            &session,
+            sender,
+            b"connected",
+            SendFlags::NONE,
+            Some(loopback_receiver),
+        ),
+        Ok(SocketOutcome::Completed(9))
+    );
+    wait_until_ready(&session, &publications, receiver, ReadinessFlags::READ);
+    assert_eq!(
+        receive_datagram_into(
+            &session,
+            receiver,
+            &mut payload[..9],
+            ReceiveFromFlags::NONE,
+        ),
+        Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
+            received: 9,
+            datagram_length: 9,
+            source_address: connected_peer,
+        }))
+    );
+    assert_eq!(&payload[..9], b"connected");
 }
 
 #[test]
