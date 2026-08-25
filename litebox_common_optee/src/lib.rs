@@ -2136,6 +2136,34 @@ impl OpteeRpcArgs {
         }
     }
 
+    /// Set a parameter's attribute type by index with bounds checking against `num_params`.
+    pub fn set_param_attr_type(
+        &mut self,
+        index: usize,
+        attr_type: OpteeMsgAttrType,
+    ) -> Result<(), OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            Err(OpteeSmcReturnCode::ENotAvail)
+        } else {
+            self.params[index].attr = OpteeMsgAttr(attr_type as u64);
+            Ok(())
+        }
+    }
+
+    /// Set an rmem parameter by index with bounds checking against `num_params`.
+    pub fn set_param_rmem(
+        &mut self,
+        index: usize,
+        rmem: OpteeMsgParamRmem,
+    ) -> Result<(), OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            Err(OpteeSmcReturnCode::ENotAvail)
+        } else {
+            self.params[index].data.copy_from_slice(rmem.as_bytes());
+            Ok(())
+        }
+    }
+
     /// Set a tmem parameter by index with bounds checking against `num_params`.
     pub fn set_param_tmem(
         &mut self,
@@ -2149,10 +2177,6 @@ impl OpteeRpcArgs {
             Ok(())
         }
     }
-
-    // Note: RPC does not use rmem params. Rmem requires pre-registered shared memory
-    // references from the normal-world driver, which is a main-messaging-path concept.
-    // RPC uses tmem for buffer references since OP-TEE provides physical addresses directly.
 }
 
 /// Serialize the params portion as raw bytes into `buf`.
@@ -2638,6 +2662,58 @@ mod tests {
         assert_eq!(header_out.session, 0);
         assert_eq!(header_out.cancel_id, 0);
         assert_eq!(header_out.num_params, 2);
+    }
+
+    #[test]
+    fn test_optee_rpc_args_attr_and_rmem_setters() {
+        let header = OpteeMsgArgsHeader {
+            cmd: OpteeRpcCommand::LoadTa as u32,
+            func: 0,
+            session: 0,
+            cancel_id: 0,
+            pad: 0,
+            ret: 0,
+            ret_origin: 0,
+            num_params: 1,
+        };
+        let raw_params = [0u8; size_of::<OpteeMsgParam>()];
+        let mut rpc_args = OpteeRpcArgs::from_header_and_raw_params(&header, &raw_params)
+            .expect("should parse RPC args");
+
+        rpc_args.params[0].attr = OpteeMsgAttr::META_VALUE_INPUT;
+        rpc_args
+            .set_param_attr_type(0, OpteeMsgAttrType::RmemOutput)
+            .expect("attribute index should be available");
+        assert_eq!(
+            rpc_args.params[0].attr.attr_type(),
+            OpteeMsgAttrType::RmemOutput as u8
+        );
+        assert!(!rpc_args.params[0].attr.meta());
+        assert!(!rpc_args.params[0].attr.noncontig());
+
+        let rmem = OpteeMsgParamRmem {
+            offs: 0x0102_0304_0506_0708,
+            size: 0x1112_1314_1516_1718,
+            shm_ref: 0x2122_2324_2526_2728,
+        };
+        rpc_args
+            .set_param_rmem(0, rmem)
+            .expect("rmem index should be available");
+        assert_eq!(&rpc_args.params[0].data[0..8], &rmem.offs.to_le_bytes());
+        assert_eq!(&rpc_args.params[0].data[8..16], &rmem.size.to_le_bytes());
+        assert_eq!(
+            &rpc_args.params[0].data[16..24],
+            &rmem.shm_ref.to_le_bytes()
+        );
+
+        assert_eq!(
+            rpc_args.set_param_attr_type(1, OpteeMsgAttrType::RmemOutput),
+            Err(OpteeSmcReturnCode::ENotAvail)
+        );
+        assert_eq!(
+            rpc_args.set_param_rmem(1, rmem),
+            Err(OpteeSmcReturnCode::ENotAvail)
+        );
     }
 
     #[test]
