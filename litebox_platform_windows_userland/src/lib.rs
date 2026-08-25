@@ -7,7 +7,7 @@
 // Windows, but we _may_ allow for more in the future, if we find it useful to do so.
 #![cfg(all(target_os = "windows", target_arch = "x86_64"))]
 
-use core::cell::Cell;
+use core::cell::{Cell, UnsafeCell};
 use core::panic;
 use core::sync::atomic::{AtomicU32, Ordering};
 use core::time::Duration;
@@ -125,10 +125,12 @@ unsafe extern "system" fn vectored_exception_handler(
             return EXCEPTION_CONTINUE_SEARCH;
         }
     }
+
     tls.is_in_guest.set(false);
 
     let regs = unsafe { &mut *tls.guest_context_top.get().wrapping_sub(1) };
     save_guest_context(regs, context);
+    save_guest_fx_state(tls, context);
 
     // If it looks like fs base was cleared, then go through the interrupt path
     // instead of the exception path to restore the fs base and try again.
@@ -157,8 +159,13 @@ unsafe extern "system" fn vectored_exception_handler(
         context.Rip = exception_callback as *const () as usize as u64;
         context.Rsp = rsp as u64;
         context.Rbp = tls.host_bp.get() as u64;
+        // `host_sp` points at the slot where `run_thread_arch` saved its
+        // `ThreadContext` argument. The exception record moved RSP below that
+        // slot, so pass the argument explicitly instead of loading it from RSP.
+        context.Rcx = unsafe { tls.host_sp.get().cast::<usize>().read() } as u64;
         context.Rdx = exception_record_ptr as u64;
     }
+    set_context_to_host_fx_state(tls, context);
 
     EXCEPTION_CONTINUE_EXECUTION
 }
@@ -227,12 +234,12 @@ impl WindowsUserland {
         // the current `const` values in PageManagementProvider.
         #[cfg(debug_assertions)]
         {
-            println!("System information.");
-            println!(
+            eprintln!("System information.");
+            eprintln!(
                 "=> Max user address: {:#x}",
                 sys_info.lpMaximumApplicationAddress as usize
             );
-            println!(
+            eprintln!(
                 "=> Min user address: {:#x}",
                 sys_info.lpMinimumApplicationAddress as usize
             );
@@ -406,6 +413,21 @@ fn run_thread_inner(
     });
 }
 
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+struct FxState(windows_sys::Win32::System::Diagnostics::Debug::XSAVE_FORMAT);
+
+impl FxState {
+    fn capture() -> Self {
+        let mut state =
+            Self(windows_sys::Win32::System::Diagnostics::Debug::XSAVE_FORMAT::default());
+        unsafe {
+            core::arch::x86_64::_fxsave64((&raw mut state.0).cast());
+        }
+        state
+    }
+}
+
 static TLS_INDEX: AtomicU32 = AtomicU32::new(u32::MAX);
 
 struct TlsState {
@@ -417,6 +439,8 @@ struct TlsState {
     interrupt: Cell<bool>,
     continue_context:
         Box<std::cell::UnsafeCell<windows_sys::Win32::System::Diagnostics::Debug::CONTEXT>>,
+    host_fx_state: FxState,
+    guest_fx_state: UnsafeCell<FxState>,
     /// Bitmask of pending host-originated signals for this thread.
     pending_host_signals: AtomicU32,
     /// Pointer to the `Waker` currently being waited on, or null if not
@@ -427,6 +451,7 @@ struct TlsState {
 impl TlsState {
     /// Creates a new `TlsState` with all fields zeroed / defaulted.
     fn new() -> Self {
+        let host_fx_state = FxState::capture();
         Self {
             host_sp: Cell::new(core::ptr::null_mut()),
             host_bp: Cell::new(core::ptr::null_mut()),
@@ -435,6 +460,8 @@ impl TlsState {
             is_in_guest: false.into(),
             interrupt: false.into(),
             continue_context: Box::default(),
+            host_fx_state,
+            guest_fx_state: UnsafeCell::new(host_fx_state),
             pending_host_signals: AtomicU32::new(0),
             waiting_waker: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
         }
@@ -559,6 +586,8 @@ syscall_callback:
     mov     r11d, DWORD PTR [rip + {TLS_INDEX}]
     mov     r11, QWORD PTR gs:[r11 * 8 + TEB_TLS_SLOTS_OFFSET]
     mov     BYTE PTR [r11 + {IS_IN_GUEST}], 0
+    fxsave64 [r11 + {GUEST_FX_STATE}]
+    fxrstor64 [r11 + {HOST_FX_STATE}]
     // Set rsp to the top of the guest context.
     mov     QWORD PTR [r11 + {SCRATCH}], rsp
     mov     rsp, QWORD PTR [r11 + {GUEST_CONTEXT_TOP}]
@@ -602,7 +631,6 @@ exception_callback:
     // Handle the exception. The stack and frame pointers are already restored,
     // and the guest context is up to date. rcx contains a pointer to the
     // guest pt_regs, and rdx contains a pointer to the exception record.
-    mov  rcx, QWORD PTR [rsp] // thread_ctx
     call {exception_handler}
     jmp .Ldone
 
@@ -646,6 +674,8 @@ interrupt_callback:
     GUEST_CONTEXT_TOP = const core::mem::offset_of!(TlsState, guest_context_top),
     SCRATCH = const core::mem::offset_of!(TlsState, scratch),
     IS_IN_GUEST = const core::mem::offset_of!(TlsState, is_in_guest),
+    HOST_FX_STATE = const core::mem::offset_of!(TlsState, host_fx_state),
+    GUEST_FX_STATE = const core::mem::offset_of!(TlsState, guest_fx_state),
     );
 }
 
@@ -661,8 +691,12 @@ interrupt_callback:
 ///
 unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
     #[unsafe(naked)]
-    extern "C" fn switch_to_guest_sysret(ctx: &litebox_common_linux::PtRegs) -> ! {
+    extern "C" fn switch_to_guest_sysret(
+        ctx: &litebox_common_linux::PtRegs,
+        fx_state: *const FxState,
+    ) -> ! {
         core::arch::naked_asm!(
+            "fxrstor64 [rdx]",
             // Load all registers from the guest context structure.
             "switch_to_guest_start:",
             "mov rsp, rcx",
@@ -694,7 +728,7 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
     fn switch_to_guest_ntcontinue(tls: &TlsState, ctx: &litebox_common_linux::PtRegs) -> ! {
         use litebox::utils::ReinterpretSignedExt;
         use windows_sys::Win32::System::Diagnostics::Debug::{
-            CONTEXT, CONTEXT_CONTROL_AMD64, CONTEXT_INTEGER_AMD64,
+            CONTEXT, CONTEXT_CONTROL_AMD64, CONTEXT_FLOATING_POINT_AMD64, CONTEXT_INTEGER_AMD64,
         };
         #[link(name = "ntdll")]
         unsafe extern "system" {
@@ -704,10 +738,14 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
             ) -> windows_sys::Win32::Foundation::NTSTATUS;
         }
         let win_ctx = tls.continue_context.get();
+        let fx_state = unsafe { (*tls.guest_fx_state.get()).0 };
         // SAFETY: no other code accesses `continue_context` while `is_in_guest` is false.
         unsafe {
             win_ctx.write(CONTEXT {
-                ContextFlags: CONTEXT_CONTROL_AMD64 | CONTEXT_INTEGER_AMD64,
+                ContextFlags: CONTEXT_CONTROL_AMD64
+                    | CONTEXT_INTEGER_AMD64
+                    | CONTEXT_FLOATING_POINT_AMD64,
+                MxCsr: fx_state.MxCsr,
                 EFlags: ctx.eflags.trunc(),
                 Rax: ctx.rax as u64,
                 Rcx: ctx.rcx as u64,
@@ -726,6 +764,9 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
                 R14: ctx.r14 as u64,
                 R15: ctx.r15 as u64,
                 Rip: ctx.rip as u64,
+                Anonymous: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_0 {
+                    FltSave: fx_state,
+                },
                 ..CONTEXT::default()
             });
         }
@@ -760,7 +801,7 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
     // so it should not be on the critical path.
     if ctx.rcx == ctx.rip {
         tls.is_in_guest.set(true);
-        switch_to_guest_sysret(ctx)
+        switch_to_guest_sysret(ctx, tls.guest_fx_state.get().cast_const())
     } else {
         switch_to_guest_ntcontinue(tls, ctx)
     }
@@ -1142,7 +1183,8 @@ impl ThreadHandle {
         // Get the current register context.
         let mut context = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT {
             ContextFlags: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64
-                | windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_INTEGER_AMD64,
+                | windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_INTEGER_AMD64
+                | windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_FLOATING_POINT_AMD64,
             ..Default::default()
         };
         let r = unsafe {
@@ -1182,6 +1224,7 @@ impl ThreadHandle {
         } else {
             // Case 4: save the guest context and jump to interrupt callback.
             save_guest_context(unsafe { &mut *guest_context }, &context);
+            save_guest_fx_state(target_tls, &context);
             true
         };
         if run_interrupt_callback {
@@ -1208,6 +1251,29 @@ fn set_context_to_interrupt_callback(
     context.Rip = interrupt_callback as *const () as usize as u64;
     context.Rsp = tls.host_sp.get().addr() as u64;
     context.Rbp = tls.host_bp.get().addr() as u64;
+    set_context_to_host_fx_state(tls, context);
+}
+
+fn save_guest_fx_state(
+    tls: &TlsState,
+    context: &windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
+) {
+    unsafe {
+        (*tls.guest_fx_state.get()).0 = context.Anonymous.FltSave;
+    }
+}
+
+fn set_context_to_host_fx_state(
+    tls: &TlsState,
+    context: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
+) {
+    use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_FLOATING_POINT_AMD64;
+
+    context.ContextFlags |= CONTEXT_FLOATING_POINT_AMD64;
+    context.MxCsr = tls.host_fx_state.0.MxCsr;
+    context.Anonymous = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_0 {
+        FltSave: tls.host_fx_state.0,
+    };
 }
 
 /// Returns true if the given instruction pointer is in ntdll.dll or this module.
@@ -1626,15 +1692,16 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         debug_assert!(ALIGN.is_multiple_of(self.sys_info.read().unwrap().dwPageSize as usize));
         debug_assert_alignment!(suggested_range, ALIGN);
 
-        // A helper closure to reserve and commit memory in one go.
+        // A helper closure to reserve memory and commit it when accessible
+        // permissions are requested.
         //
         // Note that MEM_RESERVE requires the base address to be aligned to system allocation granularity,
         // while MEM_COMMIT only requires page-aligned address.
         //
         // To ensure future MEM_COMMIT calls on sub-ranges succeed, we always reserve the entire aligned range
         // (i.e., MEM_RESERVE size is also made aligned to system allocation granularity).
-        let reserve_and_commit = |r: core::ops::Range<usize>,
-                                  flags: Win32_Memory::PAGE_PROTECTION_FLAGS|
+        let reserve_and_maybe_commit = |r: core::ops::Range<usize>,
+                                        flags: Win32_Memory::PAGE_PROTECTION_FLAGS|
          -> *mut c_void {
             let aligned_start_addr = self.round_down_to_granu(r.start);
             let aligned_end_addr = self.round_up_to_granu(r.end);
@@ -1651,6 +1718,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             };
             if ptr.is_null() {
                 core::ptr::null_mut()
+            } else if flags == Win32_Memory::PAGE_NOACCESS {
+                ptr
             } else {
                 unsafe {
                     VirtualAlloc2(
@@ -1726,6 +1795,9 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                         unsafe { GetLastError() }
                                     );
                                 }
+                                if initial_permissions.is_empty() {
+                                    return Ok(true);
+                                }
                                 let ptr = unsafe {
                                     VirtualAlloc2(
                                         GetCurrentProcess(),
@@ -1741,8 +1813,10 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                             }
                             // In case the region is free, we need to reserve and commit it.
                             Win32_Memory::MEM_FREE => {
-                                let ptr =
-                                    reserve_and_commit(r.clone(), prot_flags(initial_permissions));
+                                let ptr = reserve_and_maybe_commit(
+                                    r.clone(),
+                                    prot_flags(initial_permissions),
+                                );
                                 !ptr.is_null()
                             }
                             _ => unimplemented!(
@@ -1763,7 +1837,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         }
 
         debug_assert!(base_addr.is_null());
-        let ptr = reserve_and_commit(0..size, prot_flags(initial_permissions));
+        let ptr = reserve_and_maybe_commit(0..size, prot_flags(initial_permissions));
         assert!(
             !ptr.is_null(),
             "VirtualAlloc2(RESERVE|COMMIT size=0x{:x}) failed: {}",
@@ -1812,17 +1886,36 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         process_memory_range_by_regions(
             range,
             |r, state| -> Result<bool, std::convert::Infallible> {
-                debug_assert_eq!(
-                    state,
-                    Win32_Memory::MEM_COMMIT,
-                    "Trying to change permissions on a non-committed region: {:p}-{:p}",
-                    r.start as *mut c_void,
-                    r.end as *mut c_void
-                );
-                let mut old_protect: u32 = 0;
-                Ok(unsafe {
-                    VirtualProtect(r.start as *mut c_void, r.len(), flags, &raw mut old_protect)
-                } != 0)
+                match state {
+                    Win32_Memory::MEM_RESERVE if flags == Win32_Memory::PAGE_NOACCESS => Ok(true),
+                    Win32_Memory::MEM_RESERVE => Ok(!unsafe {
+                        VirtualAlloc2(
+                            GetCurrentProcess(),
+                            r.start as *mut c_void,
+                            r.len(),
+                            Win32_Memory::MEM_COMMIT,
+                            flags,
+                            core::ptr::null_mut(),
+                            0,
+                        )
+                    }
+                    .is_null()),
+                    Win32_Memory::MEM_COMMIT => {
+                        let mut old_protect: u32 = 0;
+                        Ok(unsafe {
+                            VirtualProtect(
+                                r.start as *mut c_void,
+                                r.len(),
+                                flags,
+                                &raw mut old_protect,
+                            )
+                        } != 0)
+                    }
+                    _ => panic!(
+                        "Trying to change permissions on an unallocated region: {:p}-{:p}",
+                        r.start as *mut c_void, r.end as *mut c_void
+                    ),
+                }
             },
         )
         .expect("update_permissions failed");
