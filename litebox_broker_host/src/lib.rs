@@ -766,6 +766,7 @@ mod tests {
             Ok(Arc::new(TestPlatformSocket {
                 readiness,
                 create_request: request,
+                binding: Mutex::new(None),
                 local_address: Mutex::new(None),
             }))
         }
@@ -776,6 +777,7 @@ mod tests {
     struct TestPlatformSocket {
         readiness: ReadinessRegistration,
         create_request: CreateSocketRequest,
+        binding: Mutex<Option<litebox_broker_core::socket::GuestSocketBinding>>,
         local_address: Mutex<Option<SocketAddrV4>>,
     }
 
@@ -785,6 +787,7 @@ mod tests {
             binding: litebox_broker_core::socket::GuestSocketBinding,
         ) -> litebox_broker_core::Result<SocketOutcome<SocketAddrV4>> {
             let address = binding.local_address();
+            *self.binding.lock().unwrap() = Some(binding);
             if self.create_request.socket_type == SocketType::Stream {
                 *self.local_address.lock().unwrap() = Some(address);
                 return Ok(SocketOutcome::Completed(address));
@@ -818,9 +821,18 @@ mod tests {
 
         fn connect(
             &self,
-            _address: SocketAddrV4,
+            address: SocketAddrV4,
             _guest_source_lease: Option<litebox_broker_core::socket::GuestSourceLease>,
         ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
+            let source_address = self
+                .binding
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|binding| binding.source_address_for_destination(address));
+            if let Some(source_address) = source_address {
+                *self.local_address.lock().unwrap() = Some(source_address);
+            }
             self.readiness
                 .publish(litebox_broker_protocol::readiness::ReadinessFlags::WRITE)
                 .map_err(PlatformConnectError::PeerUnchanged)?;
@@ -896,7 +908,7 @@ mod tests {
         fn status(&self) -> litebox_broker_core::Result<PlatformSocketStatus> {
             Ok(PlatformSocketStatus {
                 status: SocketConnectionStatus::Connected,
-                local_address: None,
+                local_address: *self.local_address.lock().unwrap(),
                 pending_error: None,
             })
         }
