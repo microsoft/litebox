@@ -203,6 +203,11 @@ impl GlobalState {
         }
     }
 
+    /// Return whether a TA binary is cached for the given UUID.
+    pub(crate) fn contains_ta_bin(&self, ta_uuid: &TeeUuid) -> bool {
+        self.ta_uuid_map.contains(ta_uuid)
+    }
+
     /// Get the TA flags associated with the given TA UUID.
     pub(crate) fn get_ta_flags(&self, ta_uuid: &TeeUuid) -> TaFlags {
         self.ta_uuid_map.get_flags(ta_uuid).unwrap_or_default()
@@ -313,6 +318,11 @@ impl OpteeShim {
     /// Get the TA binary associated with the given TA UUID.
     pub fn get_ta_bin(&self, ta_uuid: &TeeUuid) -> Option<Arc<[u8]>> {
         self.0.get_ta_bin(ta_uuid)
+    }
+
+    /// Return whether a TA binary is cached for the given UUID.
+    pub fn contains_ta_bin(&self, ta_uuid: &TeeUuid) -> bool {
+        self.0.contains_ta_bin(ta_uuid)
     }
 
     /// Release all user-space memory mappings owned by this shim instance.
@@ -1360,6 +1370,10 @@ impl TaUuidMap {
 
     pub(crate) fn get(&self, uuid: &TeeUuid) -> Option<Arc<[u8]>> {
         self.inner.read().get(uuid).map(|info| info.binary.clone())
+    }
+
+    pub(crate) fn contains(&self, uuid: &TeeUuid) -> bool {
+        self.inner.read().contains_key(uuid)
     }
 
     /// Get the TA flags for a given UUID.
