@@ -679,12 +679,31 @@ impl TeeUuid {
         Self::from_bytes(bytes)
     }
 
+    #[allow(clippy::missing_panics_doc)]
+    pub fn to_u64_array(self) -> [u64; 2] {
+        let bytes = self.to_bytes();
+        [
+            u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+            u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+        ]
+    }
+
     /// Converts the UUID to a 16-byte array with little-endian encoding.
     pub fn to_le_bytes(self) -> [u8; 16] {
         let mut bytes = [0u8; 16];
         bytes[0..4].copy_from_slice(&self.time_low.to_le_bytes());
         bytes[4..6].copy_from_slice(&self.time_mid.to_le_bytes());
         bytes[6..8].copy_from_slice(&self.time_hi_and_version.to_le_bytes());
+        bytes[8..16].copy_from_slice(&self.clock_seq_and_node);
+        bytes
+    }
+
+    /// Converts the UUID to a 16-byte array with big-endian encoding (RFC 4122 format).
+    pub fn to_bytes(self) -> [u8; 16] {
+        let mut bytes = [0u8; 16];
+        bytes[0..4].copy_from_slice(&self.time_low.to_be_bytes());
+        bytes[4..6].copy_from_slice(&self.time_mid.to_be_bytes());
+        bytes[6..8].copy_from_slice(&self.time_hi_and_version.to_be_bytes());
         bytes[8..16].copy_from_slice(&self.clock_seq_and_node);
         bytes
     }
@@ -2517,6 +2536,11 @@ mod tests {
             uuid.clock_seq_and_node,
             [0xaf, 0x63, 0x00, 0x02, 0xa5, 0xd5, 0xc5, 0x1b]
         );
+        assert_eq!(
+            uuid.to_u64_array(),
+            [0xe311f8e7_e0b34f38, 0x1bc5d5a5_020063af]
+        );
+        assert_eq!(TeeUuid::from_u64_array(uuid.to_u64_array()), uuid);
     }
 
     #[test]
