@@ -161,8 +161,8 @@ impl SocketLifecycle {
 /// Linux-userland socket provider.
 ///
 /// One reactor thread owns every socket descriptor and all epoll state.
-/// Broker request workers submit bounded commands and wait only for one
-/// immediate nonblocking operation, never for network readiness.
+/// Broker request workers submit commands through a bounded queue and wait for
+/// reactor acknowledgment, never for network readiness.
 pub struct LinuxSocketProvider {
     reactor: Arc<ReactorClient>,
 }
@@ -931,7 +931,7 @@ enum ReactorReceiveFromOutcome {
     Failed(SocketError),
 }
 
-/// State owned and accessed exclusively by the socket reactor thread.
+/// Socket and epoll state managed by the reactor thread.
 struct Reactor {
     epoll: OwnedFd,
     wake: Arc<OwnedFd>,
@@ -951,7 +951,8 @@ enum SocketTransportState {
     Udp(UdpSocketState),
 }
 
-/// Reactor-owned shared socket state and transport-specific payload.
+/// Reactor-owned transport-independent socket state and its
+/// transport-specific payload.
 struct SocketEntry {
     session_id: SessionId,
     transport: SocketTransportState,
@@ -1017,9 +1018,8 @@ fn retain_session_state(state: &ReactorSessionState) -> bool {
 
 /// Cached readiness shared with the broker-facing handle.
 ///
-/// The reactor updates this snapshot whenever kernel state changes, allowing
-/// the handle to query readiness without transferring descriptor authority or
-/// submitting another reactor command.
+/// The reactor publishes readiness here so the handle can query it without
+/// accessing socket descriptors or submitting a command.
 #[derive(Default)]
 struct SocketSnapshot {
     readiness: AtomicU32,
