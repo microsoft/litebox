@@ -729,3 +729,18 @@ crate::fd::enable_fds_for_subsystem! {
     PipeEnd<Platform>;
     -> PipeFd<Platform>;
 }
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DescriptorEntry<Platform> {
+    /// Runs `f` with the [`IOPollable`] backing this pipe end.
+    ///
+    /// This lets a holder of a durable entry handle poll the pipe without a
+    /// live per-descriptor [`PipeFd`], which is required so that an epoll
+    /// interest survives closing the registered descriptor while a duplicate
+    /// referring to the same open file description remains open.
+    pub fn with_iopollable<R>(&self, f: impl FnOnce(&dyn IOPollable) -> R) -> R {
+        match &self.entry {
+            PipeEnd::Receiver(receiver) => f(receiver.as_ref()),
+            PipeEnd::Sender(sender) => f(sender.as_ref()),
+        }
+    }
+}

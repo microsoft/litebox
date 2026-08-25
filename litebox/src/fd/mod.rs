@@ -9,6 +9,7 @@
 )]
 
 use alloc::sync::Arc;
+use alloc::sync::Weak;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
@@ -555,6 +556,77 @@ impl<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>
 
     pub fn with_entry_mut<R>(&self, f: impl FnOnce(&mut Subsystem::Entry) -> R) -> R {
         f(self.0.entry.write().as_subsystem_mut::<Subsystem>())
+    }
+
+    /// Runs `f` with the aliased (open-file-description-level) metadata of type
+    /// `T`, if present.
+    ///
+    /// This reads the metadata stored via [`Descriptors::set_entry_metadata`],
+    /// which is shared by every descriptor referring to the same open file
+    /// description. Returns `None` if no such metadata exists.
+    pub fn with_shared_metadata<T, R>(&self, f: impl FnOnce(&T) -> R) -> Option<R>
+    where
+        T: core::any::Any + Clone + Send + Sync,
+    {
+        self.0.entry.read().metadata.get::<T>().map(f)
+    }
+
+    /// The address of the shared open file description this handle refers to.
+    ///
+    /// Duplicates of a descriptor share one open file description, so this
+    /// address is stable across `dup` and uniquely identifies the description
+    /// for as long as any duplicate keeps it alive.
+    #[must_use]
+    pub fn as_ptr(&self) -> *const () {
+        Arc::as_ptr(&self.0).cast()
+    }
+
+    /// Downgrades to a [`WeakEntryHandle`] that survives `dup`.
+    ///
+    /// The resulting handle upgrades for as long as *any* descriptor referring
+    /// to the same open file description remains open, even after the specific
+    /// descriptor this handle was obtained from has been closed.
+    #[must_use]
+    pub fn downgrade(&self) -> WeakEntryHandle<Platform, Subsystem> {
+        WeakEntryHandle(Arc::downgrade(&self.0), PhantomData)
+    }
+}
+
+/// A durable, `dup`-surviving weak reference to a descriptor's open file
+/// description.
+///
+/// Unlike a [`TypedFd`], which is tied to one descriptor slot, this upgrades as
+/// long as *any* descriptor referring to the same open file description is
+/// open. It is the correct anchor for interest that must outlive the closure of
+/// the specific descriptor it was registered against (for example, epoll
+/// interest, per Linux `epoll(7)` semantics).
+pub struct WeakEntryHandle<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>(
+    Weak<SharedEntry<Platform>>,
+    PhantomData<fn(Subsystem) -> Subsystem>,
+);
+
+impl<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>
+    WeakEntryHandle<Platform, Subsystem>
+{
+    /// Upgrades to a strong [`EntryHandle`] if the open file description is
+    /// still alive (i.e. at least one duplicate remains open).
+    #[must_use]
+    pub fn upgrade(&self) -> Option<EntryHandle<Platform, Subsystem>> {
+        self.0
+            .upgrade()
+            .map(|entry| EntryHandle(entry, PhantomData))
+    }
+
+    /// The address of the shared open file description, stable across `dup`.
+    ///
+    /// This is safe to use as a durable identity key. A [`WeakEntryHandle`]
+    /// keeps the underlying allocation reserved even after the open file
+    /// description is closed (every strong reference dropped), so this address
+    /// is never recycled for a different open file description while this handle
+    /// exists. The pointer is only ever compared, never dereferenced.
+    #[must_use]
+    pub fn as_ptr(&self) -> *const () {
+        self.0.as_ptr().cast()
     }
 }
 
