@@ -37,6 +37,7 @@ bitflags::bitflags! {
         const PAGE_GUARD = 0x100;
         const PAGE_NOCACHE = 0x200;
         const PAGE_WRITECOMBINE = 0x400;
+        const PAGE_TARGETS_INVALID = 0x40000000;
     }
 }
 
@@ -52,10 +53,19 @@ impl PageProtection {
         let guard = self.contains(Self::PAGE_GUARD);
         let nocache = self.contains(Self::PAGE_NOCACHE);
         let writecombine = self.contains(Self::PAGE_WRITECOMBINE);
+        let targets_invalid = self.contains(Self::PAGE_TARGETS_INVALID);
+        let executable = matches!(
+            self.base(),
+            value if value == Self::PAGE_EXECUTE.bits()
+                || value == Self::PAGE_EXECUTE_READ.bits()
+                || value == Self::PAGE_EXECUTE_READWRITE.bits()
+                || value == Self::PAGE_EXECUTE_WRITECOPY.bits()
+        );
 
         !(noaccess && (guard || nocache || writecombine)
             || guard && (nocache || writecombine)
-            || nocache && writecombine)
+            || nocache && writecombine
+            || targets_invalid && !executable)
     }
 }
 
@@ -286,6 +296,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Some(size) = region_size.read_at_offset(0) else {
             return NtStatus::ACCESS_VIOLATION;
         };
+        litebox_util_log::debug!(
+            base:% = format_args!("{base:#x}"),
+            size,
+            zero_bits:% = format_args!("{zero_bits:#x}"),
+            allocation_type:% = format_args!("{allocation_type:#x}"),
+            protect:% = format_args!("{protect:#x}");
+            "NtAllocateVirtualMemory request"
+        );
         if base_address.write_at_offset(0, base).is_none()
             || region_size.write_at_offset(0, size).is_none()
         {
@@ -303,6 +321,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             || (zero_bits > 21 && zero_bits < 32)
             || (zero_bits != 0 && base != 0)
         {
+            litebox_util_log::debug!(
+                base:% = format_args!("{base:#x}"),
+                size,
+                zero_bits:% = format_args!("{zero_bits:#x}"),
+                allocation_type:% = format_args!("{:#x}", allocation_type.bits()),
+                protect:% = format_args!("{protect:#x}");
+                "Rejected NtAllocateVirtualMemory parameters"
+            );
             return NtStatus::INVALID_PARAMETER;
         }
         if allocation_type.contains(AllocationType::MEM_RESET) {
@@ -452,13 +478,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         base_address: MutPtr<Platform, usize>,
         region_size: MutPtr<Platform, usize>,
     ) -> NtStatus {
-        if find_private_virtual_allocation(
-            &self.process.virtual_allocations,
-            aligned_base,
-            aligned_len,
-        )
-        .is_none()
-        {
+        let Some(allocation) =
+            find_virtual_allocation(&self.process.virtual_allocations, aligned_base, aligned_len)
+        else {
+            return NtStatus::INVALID_PARAMETER;
+        };
+        if !matches!(
+            allocation.type_,
+            MemoryType::MEM_PRIVATE | MemoryType::MEM_MAPPED
+        ) {
             return NtStatus::INVALID_PARAMETER;
         }
         if update_permissions(
@@ -519,7 +547,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         let Some((aligned_base, aligned_len)) =
-            free_region(&self.process.virtual_allocations, base, size, free_type)
+            free_region(&self.process.virtual_allocations, base, size)
         else {
             return NtStatus::INVALID_PARAMETER;
         };
@@ -548,10 +576,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             if unsafe { self.global.page_manager.remove_pages(ptr, aligned_len) }.is_err() {
                 return NtStatus::UNABLE_TO_FREE_VM;
             }
-            self.process
-                .virtual_allocations
-                .write()
-                .remove(&aligned_base);
+            split_virtual_allocation_around_released_region(
+                &self.process.virtual_allocations,
+                aligned_base,
+                aligned_len,
+            );
         }
         if base_address.write_at_offset(0, aligned_base).is_none()
             || region_size.write_at_offset(0, aligned_len).is_none()
@@ -1077,7 +1106,6 @@ fn free_region<Platform: ShimPlatform>(
     virtual_allocations: &WindowsVirtualAllocations<Platform>,
     base: usize,
     size: usize,
-    free_type: FreeType,
 ) -> Option<(usize, usize)> {
     if size == 0 {
         let allocation = virtual_allocations
@@ -1088,13 +1116,52 @@ fn free_region<Platform: ShimPlatform>(
         return Some((allocation.base, allocation.size));
     }
 
-    if free_type == FreeType::MEM_RELEASE {
-        return None;
-    }
-
     let (aligned_base, aligned_len) = page_aligned_region(base, size)?;
     find_private_virtual_allocation(virtual_allocations, aligned_base, aligned_len)?;
     Some((aligned_base, aligned_len))
+}
+
+fn split_virtual_allocation_around_released_region<Platform: ShimPlatform>(
+    virtual_allocations: &WindowsVirtualAllocations<Platform>,
+    released_base: usize,
+    released_size: usize,
+) {
+    let Some(released_end) = released_base.checked_add(released_size) else {
+        return;
+    };
+    let mut allocations = virtual_allocations.write();
+    let Some((&allocation_key, allocation)) = allocations.range(..=released_base).next_back()
+    else {
+        return;
+    };
+    let allocation = allocation.clone();
+    let Some(allocation_end) = allocation.base.checked_add(allocation.size) else {
+        return;
+    };
+    allocations.remove(&allocation_key);
+
+    for (base, end) in [
+        (allocation.base, released_base),
+        (released_end, allocation_end),
+    ] {
+        if base >= end {
+            continue;
+        }
+        let mut pages = RangeMap::new();
+        for (range, protect) in allocation.pages.overlapping(base..end) {
+            pages.insert(range.start.max(base)..range.end.min(end), *protect);
+        }
+        allocations.insert(
+            base,
+            WindowsVirtualAllocation {
+                base,
+                size: end - base,
+                allocation_protect: allocation.allocation_protect,
+                type_: allocation.type_,
+                pages,
+            },
+        );
+    }
 }
 
 fn committed_pages(
@@ -1779,6 +1846,27 @@ mod tests {
     }
 
     #[test]
+    fn page_targets_invalid_requires_executable_protection() {
+        let executable =
+            PageProtection::PAGE_EXECUTE_READWRITE | PageProtection::PAGE_TARGETS_INVALID;
+        assert_eq!(
+            parse_page_protection(executable.bits()),
+            Some((
+                executable,
+                MemoryRegionPermissions::READ
+                    | MemoryRegionPermissions::WRITE
+                    | MemoryRegionPermissions::EXEC,
+            ))
+        );
+        assert_eq!(
+            parse_page_protection(
+                (PageProtection::PAGE_READWRITE | PageProtection::PAGE_TARGETS_INVALID).bits()
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn read_virtual_memory_copies_across_chunks() {
         run_with_test_platform_pointers(|| {
             let source = std::vec![0x5au8; READ_VIRTUAL_MEMORY_CHUNK_BYTES + 1];
@@ -2234,6 +2322,90 @@ mod tests {
             assert_eq!(info.region_size, allocation_size);
 
             release_allocation(&task, base);
+        });
+    }
+
+    #[test]
+    fn free_virtual_memory_partial_release_preserves_suffix_for_commit() {
+        run_with_test_platform_pointers(|| {
+            let task = crate::tests::test_task();
+            let mut first_base = 0usize;
+            let mut first_size = 0x100000usize;
+            assert_eq!(
+                task.sys_nt_allocate_virtual_memory(
+                    ProcessHandle::CURRENT,
+                    mut_ptr(&mut first_base),
+                    0,
+                    mut_ptr(&mut first_size),
+                    AllocationType::MEM_RESERVE.bits(),
+                    PageProtection::PAGE_READWRITE.bits(),
+                ),
+                NtStatus::SUCCESS
+            );
+            let mut second_base = 0usize;
+            let mut second_size = 28080usize;
+            assert_eq!(
+                task.sys_nt_allocate_virtual_memory(
+                    ProcessHandle::CURRENT,
+                    mut_ptr(&mut second_base),
+                    0,
+                    mut_ptr(&mut second_size),
+                    AllocationType::MEM_RESERVE.bits(),
+                    PageProtection::PAGE_READWRITE.bits(),
+                ),
+                NtStatus::SUCCESS
+            );
+            let mut base = 0usize;
+            let mut region_size = 0x1d0000usize;
+            assert_eq!(
+                task.sys_nt_allocate_virtual_memory(
+                    ProcessHandle::CURRENT,
+                    mut_ptr(&mut base),
+                    0,
+                    mut_ptr(&mut region_size),
+                    AllocationType::MEM_RESERVE.bits(),
+                    PageProtection::PAGE_READWRITE.bits(),
+                ),
+                NtStatus::SUCCESS
+            );
+
+            let mut release_base = base;
+            let mut release_size = 0x1c0000usize;
+            assert_eq!(
+                task.sys_nt_free_virtual_memory(
+                    ProcessHandle::CURRENT,
+                    mut_ptr(&mut release_base),
+                    mut_ptr(&mut release_size),
+                    FreeType::MEM_RELEASE.bits(),
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(release_base, base);
+            assert_eq!(release_size, 0x1c0000);
+
+            let suffix_base = base + 0x1c0000;
+            let mut commit_base = suffix_base;
+            let mut commit_size = PAGE_SIZE * 2;
+            assert_eq!(
+                task.sys_nt_allocate_virtual_memory(
+                    ProcessHandle::CURRENT,
+                    mut_ptr(&mut commit_base),
+                    0,
+                    mut_ptr(&mut commit_size),
+                    AllocationType::MEM_COMMIT.bits(),
+                    PageProtection::PAGE_READWRITE.bits(),
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(commit_base, suffix_base);
+            assert_eq!(commit_size, PAGE_SIZE * 2);
+            let committed = MutPtr::<TestPlatform, u8>::from_usize(commit_base);
+            assert_eq!(committed.write_at_offset(0, 0x5a), Some(()));
+            assert_eq!(committed.read_at_offset(0), Some(0x5a));
+
+            release_allocation(&task, first_base);
+            release_allocation(&task, second_base);
+            release_allocation(&task, suffix_base);
         });
     }
 
