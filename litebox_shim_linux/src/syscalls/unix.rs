@@ -119,10 +119,12 @@ impl UnixSocketAddr {
                 // TODO: extend fs to support creating sock file (i.e., with type `InodeType::Socket`)
                 let file = {
                     let files = task.files.borrow();
+                    let fs = task.fs.borrow();
+                    let context = fs.context.read();
                     files
                         .fs
                         .open(
-                            &task.fs.borrow().context,
+                            &context,
                             path.as_str(),
                             flags,
                             Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,

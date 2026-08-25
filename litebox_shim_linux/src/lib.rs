@@ -266,7 +266,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
         files.set_max_fd(syscalls::process::RLIMIT_NOFILE_CUR - 1);
         let files = Arc::new(files);
         let fs_state = Arc::new(syscalls::file::FsState::new());
-        files.initialize_stdio_in_shared_descriptors_table(&self.0, &fs_state.context);
+        files.initialize_stdio_in_shared_descriptors_table(&self.0, &fs_state.context.read());
 
         let entrypoints = crate::LinuxShimEntrypoints {
             _not_send: core::marker::PhantomData,
@@ -1229,7 +1229,7 @@ mod test_utils {
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             let files = Arc::new(syscalls::file::FilesState::new(fs));
             let fs_state = Arc::new(syscalls::file::FsState::new());
-            files.initialize_stdio_in_shared_descriptors_table(&self, &fs_state.context);
+            files.initialize_stdio_in_shared_descriptors_table(&self, &fs_state.context.read());
             Task {
                 wait_state: wait::WaitState::new(self.platform),
                 thread: syscalls::process::ThreadState::new_process(pid),

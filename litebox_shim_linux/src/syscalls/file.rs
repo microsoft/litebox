@@ -47,20 +47,16 @@ impl From<litebox::fs::UserInfo> for AccessUserInfo {
 /// Task state shared by `CLONE_FS`.
 pub(crate) struct FsState<Platform: ShimPlatform> {
     umask: core::sync::atomic::AtomicU32,
-    /// The current working directory
-    ///
-    /// Must end with a '/'.
-    cwd: litebox::sync::RwLock<Platform, String>,
-    // TODO(jayb): simplify by removing [`FsState::cwd`] and instead use this
-    pub(crate) context: litebox::fs::resolver::Context,
+    // XXX: the context also stores credentials, might need to reconsider design when implementing
+    // `setuid` and similar.
+    pub(crate) context: litebox::sync::RwLock<Platform, litebox::fs::resolver::Context>,
 }
 
 impl<Platform: ShimPlatform> Clone for FsState<Platform> {
     fn clone(&self) -> Self {
         Self {
             umask: self.umask.load(Ordering::Relaxed).into(),
-            cwd: litebox::sync::RwLock::new(self.cwd.read().clone()),
-            context: self.context.clone(),
+            context: litebox::sync::RwLock::new(self.context.read().clone()),
         }
     }
 }
@@ -69,8 +65,7 @@ impl<Platform: ShimPlatform> FsState<Platform> {
     pub fn new() -> Self {
         Self {
             umask: (Mode::WGRP | Mode::WOTH).bits().into(),
-            cwd: litebox::sync::RwLock::new(String::from("/")),
-            context: litebox::fs::resolver::Context::new(),
+            context: litebox::sync::RwLock::new(litebox::fs::resolver::Context::new()),
         }
     }
 
@@ -196,6 +191,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.fs.borrow().umask()
     }
 
+    /// The current working directory, as a prefix that a relative path can be appended to.
+    ///
+    /// Always ends with a `/`.
+    fn cwd_prefix(&self) -> String {
+        let mut cwd = self.fs.borrow().context.read().cwd().to_string();
+        if !cwd.ends_with('/') {
+            cwd.push('/');
+        }
+        cwd
+    }
+
     /// Resolve a path against the current working directory.
     pub(crate) fn resolve_path(&self, path: impl path::Arg) -> Result<CString, Errno> {
         let path_str = path.as_rust_str().map_err(|_| Errno::EINVAL)?;
@@ -205,7 +211,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if path_str.starts_with('/') {
             CString::new(path_str.to_string()).map_err(|_| Errno::EINVAL)
         } else {
-            let mut cwd = self.fs.borrow().cwd.read().clone();
+            let mut cwd = self.cwd_prefix();
             cwd.push_str(path_str);
             CString::new(cwd).map_err(|_| Errno::EINVAL)
         }
@@ -215,7 +221,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// Note that an empty path is not valid for this function, and will be rejected with `ENOENT`.
     fn resolve_path_at(&self, dirfd: i32, pathname: impl path::Arg) -> Result<CString, Errno> {
-        let get_cwd = || self.fs.borrow().cwd.read().clone();
+        let get_cwd = || self.cwd_prefix();
         let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
         match fs_path {
             FsPath::Absolute { path } => Ok(path),
@@ -235,14 +241,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ) -> Result<FileFd<Platform>, Errno> {
         let mode = mode & !self.get_umask();
         let files = self.files.borrow();
+        let fs = self.fs.borrow();
+        let context = fs.context.read();
         files
             .fs
-            .open(
-                &self.fs.borrow().context,
-                path,
-                flags - OFlags::CLOEXEC,
-                mode,
-            )
+            .open(&context, path, flags - OFlags::CLOEXEC, mode)
             .map_err(Errno::from)
     }
 
@@ -378,16 +381,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         let path = self.resolve_path_at(dirfd, pathname)?;
         let files = self.files.borrow();
+        let fs = self.fs.borrow();
+        let context = fs.context.read();
         if flags.contains(AtFlags::AT_REMOVEDIR) {
-            files
-                .fs
-                .rmdir(&self.fs.borrow().context, path)
-                .map_err(Errno::from)
+            files.fs.rmdir(&context, path).map_err(Errno::from)
         } else {
-            files
-                .fs
-                .unlink(&self.fs.borrow().context, path)
-                .map_err(Errno::from)
+            files.fs.unlink(&context, path).map_err(Errno::from)
         }
     }
 
@@ -746,9 +745,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
     fn do_mkdir(&self, pathname: impl path::Arg, mode: Mode) -> Result<(), Errno> {
         let mode = mode & !self.get_umask();
         let files = self.files.borrow();
+        let fs = self.fs.borrow();
+        let context = fs.context.read();
         files
             .fs
-            .mkdir(&self.fs.borrow().context, pathname, mode)
+            .mkdir(&context, pathname, mode)
             .map_err(Errno::from)
     }
 
@@ -1170,7 +1171,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ) -> Result<(), Errno> {
         let status = {
             let files = self.files.borrow();
-            files.fs.file_status(&self.fs.borrow().context, pathname)?
+            let fs = self.fs.borrow();
+            let context = fs.context.read();
+            files.fs.file_status(&context, pathname)?
         };
         let owner = status.owner.into();
         Self::do_access_mode(status.mode, owner, caller, &mode)
@@ -1194,7 +1197,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         Self::validate_access_mode(&mode)?;
         let caller = self.access_user(&flags);
-        let get_cwd = || self.fs.borrow().cwd.read().clone();
+        let get_cwd = || self.cwd_prefix();
         let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
         match fs_path {
             FsPath::Absolute { path } => self.do_access(path, mode, caller),
@@ -1389,7 +1392,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
         let status = {
             let files = self.files.borrow();
-            files.fs.file_status(&self.fs.borrow().context, path)?
+            let fs = self.fs.borrow();
+            let context = fs.context.read();
+            files.fs.file_status(&context, path)?
         };
         Ok(T::from(status))
     }
@@ -1427,17 +1432,20 @@ impl<Platform: ShimPlatform> Task<Platform> {
     where
         T: From<litebox::fs::FileStatus> + From<FileStat>,
     {
-        let get_cwd = || self.fs.borrow().cwd.read().clone();
+        let get_cwd = || self.cwd_prefix();
         let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
         match fs_path {
             FsPath::Absolute { path } => {
                 self.do_stat(path, !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW))
             }
             FsPath::Cwd if flags.contains(AtFlags::AT_EMPTY_PATH) => {
+                // Take the cwd before locking the context: this lock is not recursive, so a
+                // waiting writer would deadlock a nested read.
+                let cwd = get_cwd();
                 let files = self.files.borrow();
-                Ok(T::from(
-                    files.fs.file_status(&self.fs.borrow().context, get_cwd())?,
-                ))
+                let fs = self.fs.borrow();
+                let context = fs.context.read();
+                Ok(T::from(files.fs.file_status(&context, cwd)?))
             }
             FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
                 descriptor_stat(fd as usize, self)
@@ -1705,7 +1713,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Handle syscall `getcwd`
     pub fn sys_getcwd(&self, buf: &mut [u8]) -> Result<usize, Errno> {
-        let cwd = self.fs.borrow().cwd.read().clone();
+        let cwd = self.fs.borrow().context.read().cwd().to_string();
         // need to account for the null terminator
         if cwd.len() >= buf.len() {
             return Err(Errno::ERANGE);
@@ -1723,41 +1731,38 @@ impl<Platform: ShimPlatform> Task<Platform> {
     pub fn sys_chdir(&self, pathname: impl path::Arg) -> Result<(), Errno> {
         use litebox::fs::FileType;
         use litebox::fs::errors::{FileStatusError, PathError};
-        use litebox::path::Arg as _;
 
-        // Resolve relative paths against CWD, then normalize (handle `.` / `..`).
-        let resolved = self.resolve_path(pathname)?;
-        let abs_path = resolved.normalized().map_err(|_| Errno::EINVAL)?;
+        let fs = self.fs.borrow();
+        // Resolve relative paths against the CWD, and normalize (handle `.` / `..`).
+        let target = fs
+            .context
+            .read()
+            .resolve(pathname)
+            .map_err(|_| Errno::EINVAL)?;
 
         // Verify the path exists and is a directory.
-        let files = self.files.borrow();
-        match files
-            .fs
-            .file_status(&self.fs.borrow().context, abs_path.as_str())
         {
-            Ok(status) => {
-                if status.file_type != FileType::Directory {
-                    return Err(Errno::ENOTDIR);
+            let files = self.files.borrow();
+            let context = fs.context.read();
+            match files.fs.file_status(&context, target.to_string()) {
+                Ok(status) => {
+                    if status.file_type != FileType::Directory {
+                        return Err(Errno::ENOTDIR);
+                    }
+                }
+                Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory)) => {
+                    return Err(Errno::ENOENT);
+                }
+                Err(FileStatusError::PathError(_)) => {
+                    return Err(Errno::EACCES);
+                }
+                Err(_) => {
+                    return Err(Errno::ENOENT);
                 }
             }
-            Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory)) => {
-                return Err(Errno::ENOENT);
-            }
-            Err(FileStatusError::PathError(_)) => {
-                return Err(Errno::EACCES);
-            }
-            Err(_) => {
-                return Err(Errno::ENOENT);
-            }
         }
 
-        // Ensure the CWD ends with '/'.
-        let mut new_cwd = abs_path;
-        if !new_cwd.ends_with('/') {
-            new_cwd.push('/');
-        }
-
-        *self.fs.borrow().cwd.write() = new_cwd;
+        fs.context.write().set_cwd(target);
         Ok(())
     }
 }
@@ -2842,7 +2847,7 @@ mod tests {
         task.sys_chdir("/test_chdir_dir").unwrap();
         let len = task.sys_getcwd(&mut buf).unwrap();
         let cwd = core::str::from_utf8(&buf[..len - 1]).unwrap();
-        assert_eq!(cwd, "/test_chdir_dir/");
+        assert_eq!(cwd, "/test_chdir_dir");
 
         // chdir to nonexistent path → ENOENT.
         assert_eq!(
@@ -2890,13 +2895,13 @@ mod tests {
         let mut buf = [0u8; 256];
         let len = task.sys_getcwd(&mut buf).unwrap();
         let cwd = core::str::from_utf8(&buf[..len - 1]).unwrap();
-        assert_eq!(cwd, "/rel_parent/rel_child/");
+        assert_eq!(cwd, "/rel_parent/rel_child");
 
-        // chdir("..") should normalize back to /rel_parent/.
+        // chdir("..") should normalize back to /rel_parent.
         task.sys_chdir("..").unwrap();
         let len = task.sys_getcwd(&mut buf).unwrap();
         let cwd = core::str::from_utf8(&buf[..len - 1]).unwrap();
-        assert_eq!(cwd, "/rel_parent/");
+        assert_eq!(cwd, "/rel_parent");
     }
 
     #[test]
