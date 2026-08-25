@@ -462,7 +462,7 @@ fn reactor_drives_a_loopback_tcp_socket() {
 }
 
 #[test]
-fn native_tcp_deferred_abortive_close_resets_peer() {
+fn external_tcp_deferred_abortive_close_resets_peer() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = gateway_address(socket_address_v4(listener.local_addr().unwrap()));
     let (accepted, wait_for_accept) = channel();
@@ -508,7 +508,7 @@ fn native_tcp_deferred_abortive_close_resets_peer() {
 }
 
 #[test]
-fn native_tcp_gateway_uses_host_loopback_and_keeps_guest_identity() {
+fn external_tcp_gateway_uses_host_loopback_and_keeps_guest_identity() {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     listener.set_nonblocking(true).unwrap();
     let host_address = socket_address_v4(listener.local_addr().unwrap());
@@ -576,7 +576,7 @@ fn native_tcp_gateway_uses_host_loopback_and_keeps_guest_identity() {
 }
 
 #[test]
-fn native_tcp_external_route_keeps_guest_private_identity() {
+fn external_tcp_route_keeps_guest_private_identity() {
     let local_ip = non_loopback_local_ipv4();
     if std::env::var_os("CI").is_some() {
         assert!(
@@ -783,7 +783,7 @@ fn tcp_status_publication_failure_preserves_consumed_error() {
 }
 
 #[test]
-fn native_tcp_readiness_failure_does_not_fail_shared_reactor() {
+fn external_tcp_readiness_failure_does_not_fail_shared_reactor() {
     // Session A owns the socket whose asynchronous reactor publication fails.
     let listener_a = TcpListener::bind("127.0.0.1:0").unwrap();
     let address_a = listener_a.local_addr().unwrap();
@@ -921,7 +921,7 @@ fn native_tcp_readiness_failure_does_not_fail_shared_reactor() {
 }
 
 #[test]
-fn native_tcp_connect_completion_readiness_failure_does_not_fail_shared_reactor() {
+fn external_tcp_connect_completion_readiness_failure_does_not_fail_shared_reactor() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let (send_data, wait_to_send_data) = channel();
@@ -2471,7 +2471,7 @@ fn guest_read_shutdown_detects_data_awaiting_discard() {
     let SocketTransportState::Tcp(mut tcp) = create_tcp_transport() else {
         unreachable!();
     };
-    tcp.descriptor = TcpDescriptor::GuestUnix(socket);
+    tcp.descriptor = TcpDescriptor::InternalUnix(socket);
     tcp.install_empty_guest_read_shutdown_for_test();
 
     assert_eq!(

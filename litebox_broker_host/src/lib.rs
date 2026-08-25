@@ -784,7 +784,7 @@ mod tests {
             &self,
             binding: litebox_broker_core::socket::GuestSocketBinding,
         ) -> litebox_broker_core::Result<SocketOutcome<SocketAddrV4>> {
-            let address = binding.requested();
+            let address = binding.local_address();
             if self.create_request.socket_type == SocketType::Stream {
                 *self.local_address.lock().unwrap() = Some(address);
                 return Ok(SocketOutcome::Completed(address));

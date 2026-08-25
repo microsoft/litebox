@@ -190,7 +190,7 @@ impl SocketProvider for LinuxSocketProvider {
         let id = self.reactor.allocate_socket_id()?;
         let snapshot = Arc::new(SocketSnapshot::default());
         let lifecycle = Arc::new(SocketLifecycle::pending());
-        // Allocate the provider object before the reactor creates an external
+        // Allocate the provider object before the reactor creates a host
         // resource, so successful creation has no remaining Arc allocation.
         let socket = Arc::new(LinuxSocket {
             id,
@@ -1058,9 +1058,9 @@ impl fmt::Display for ReactorFailure {
 }
 
 impl Reactor {
-    fn targets_private_udp_native_endpoint(&self, native_destination: SocketAddrV4) -> bool {
-        self.udp.is_native_endpoint_port(native_destination.port())
-            && is_local_ipv4_address(*native_destination.ip())
+    fn targets_broker_udp_endpoint(&self, host_destination: SocketAddrV4) -> bool {
+        self.udp.is_native_endpoint_port(host_destination.port())
+            && is_local_ipv4_address(*host_destination.ip())
     }
 
     fn bind_socket(
@@ -1068,7 +1068,7 @@ impl Reactor {
         id: u64,
         binding: GuestSocketBinding,
     ) -> BrokerResult<SocketOutcome<SocketAddrV4>> {
-        let requested_address = binding.requested();
+        let local_address = binding.local_address();
         let (kind, already_bound) = self
             .sockets
             .get(&id)
@@ -1091,8 +1091,8 @@ impl Reactor {
                 guest_binding: binding,
             })?;
             let socket = self.sockets.get_mut(&id).ok_or(BrokerError::Internal)?;
-            socket.guest_local_address = Some(requested_address);
-            return Ok(SocketOutcome::Completed(requested_address));
+            socket.guest_local_address = Some(local_address);
+            return Ok(SocketOutcome::Completed(local_address));
         }
         self.bind_tcp_socket(id, binding, already_bound)
     }
@@ -1234,7 +1234,7 @@ impl Reactor {
         };
         match peer {
             ReactorUdpPeer::Internal {
-                socket_generation,
+                socket_id: destination_id,
                 internal_address,
             } => {
                 let source_address = self
@@ -1248,12 +1248,12 @@ impl Reactor {
                     .ok_or(BrokerError::Internal)?;
                 if self
                     .udp
-                    .binding_for_socket(socket_generation)
+                    .binding_for_socket(destination_id)
                     .is_none_or(|binding| !binding.guest_binding.covers(internal_address))
                 {
                     return Ok(SocketOutcome::Failed(SocketError::ConnectionRefused));
                 }
-                self.enqueue_guest_datagram(id, socket_generation, source_address, data)
+                self.enqueue_internal_datagram(id, destination_id, source_address, data)
             }
             ReactorUdpPeer::External(destination) => {
                 let external_peer_added = if authorize_external_reply {
@@ -1386,13 +1386,13 @@ impl Reactor {
             .next_receive_origin;
         let first = pinned.unwrap_or(next);
         let second = match first {
-            UdpReceiveOrigin::Guest => UdpReceiveOrigin::Native,
-            UdpReceiveOrigin::Native => UdpReceiveOrigin::Guest,
+            UdpReceiveOrigin::Internal => UdpReceiveOrigin::External,
+            UdpReceiveOrigin::External => UdpReceiveOrigin::Internal,
         };
         for origin in [first, second] {
             let outcome = match origin {
-                UdpReceiveOrigin::Guest => self.receive_guest_udp(id, length, flags)?,
-                UdpReceiveOrigin::Native => self.receive_native_udp(id, length, flags)?,
+                UdpReceiveOrigin::Internal => self.receive_internal_udp(id, length, flags)?,
+                UdpReceiveOrigin::External => self.receive_external_udp(id, length, flags)?,
             };
             if let Some(outcome) = outcome {
                 return Ok(outcome);
@@ -1418,7 +1418,7 @@ impl Reactor {
             let _ = self.replace_udp_endpoint(id, None);
             if let Some(binding) = self.udp.binding_for_socket(id) {
                 self.udp
-                    .remove_binding(binding.guest_binding.requested().port(), id);
+                    .remove_binding(binding.guest_binding.local_address().port(), id);
             }
             let external_peer_count = self
                 .sockets
@@ -1691,8 +1691,8 @@ impl Reactor {
                 #[cfg(test)]
                 ReactorCommand::TcpDescriptorCounts { response } => {
                     let mut unrealized = 0;
-                    let mut native = 0;
-                    let mut guest = 0;
+                    let mut external = 0;
+                    let mut internal = 0;
                     for descriptor in self
                         .sockets
                         .values()
@@ -1701,11 +1701,11 @@ impl Reactor {
                     {
                         match descriptor {
                             TcpDescriptor::Unrealized => unrealized += 1,
-                            TcpDescriptor::NativeInet(_) => native += 1,
-                            TcpDescriptor::GuestUnix(_) => guest += 1,
+                            TcpDescriptor::ExternalInet(_) => external += 1,
+                            TcpDescriptor::InternalUnix(_) => internal += 1,
                         }
                     }
-                    let _ = response.send((unrealized, native, guest));
+                    let _ = response.send((unrealized, external, internal));
                 }
                 #[cfg(test)]
                 ReactorCommand::UdpQueuedDatagramCount { response } => {
@@ -1797,7 +1797,7 @@ impl Reactor {
                             .ok_or(BrokerError::Internal)?
                             .readable = true;
                         if self
-                            .receive_native_udp(socket_id, 1, ReceiveFromFlags::NONE)?
+                            .receive_external_udp(socket_id, 1, ReceiveFromFlags::NONE)?
                             .is_some()
                         {
                             return Err(BrokerError::Internal);
@@ -1936,11 +1936,11 @@ fn zeroed_vec(length: usize) -> BrokerResult<Vec<u8>> {
 
 fn take_socket_error(socket: &SocketEntry) -> BrokerResult<Option<SocketError>> {
     let tcp = socket.tcp_state()?;
-    if !tcp.descriptor.is_native() {
+    if !tcp.descriptor.is_external() {
         return Ok(None);
     }
-    let native_socket = tcp.descriptor.socket()?;
-    match sockopt::socket_error(native_socket) {
+    let external_socket = tcp.descriptor.socket()?;
+    match sockopt::socket_error(external_socket) {
         Ok(Ok(())) => Ok(None),
         Ok(Err(error)) => Ok(Some(socket_error_from_errno(error))),
         Err(error) => Err(broker_error_from_errno(error)),

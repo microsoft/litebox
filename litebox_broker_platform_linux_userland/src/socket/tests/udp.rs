@@ -74,12 +74,12 @@ fn udp_gateway_translates_sources_filters_spoofing_and_reuses_endpoint() {
         Ok(SocketOutcome::Completed(5))
     );
     let mut payload = [0; 6];
-    let (_, native_source) = first.recv_from(&mut payload).unwrap();
+    let (_, host_source) = first.recv_from(&mut payload).unwrap();
     assert_eq!(&payload[..5], b"first");
     assert_eq!(provider.reactor.udp_native_endpoint_count(), 1);
 
-    unauthorized.send_to(b"spoof", native_source).unwrap();
-    first.send_to(b"reply", native_source).unwrap();
+    unauthorized.send_to(b"spoof", host_source).unwrap();
+    first.send_to(b"reply", host_source).unwrap();
     wait_until_ready(&session, &publications, socket, ReadinessFlags::READ);
     payload.fill(0);
     assert_eq!(
@@ -105,7 +105,7 @@ fn udp_gateway_translates_sources_filters_spoofing_and_reuses_endpoint() {
     payload.fill(0);
     let (_, reused_source) = second.recv_from(&mut payload).unwrap();
     assert_eq!(&payload, b"second");
-    assert_eq!(reused_source.port(), native_source.port());
+    assert_eq!(reused_source.port(), host_source.port());
     assert_eq!(provider.reactor.udp_native_endpoint_count(), 1);
 
     second.send_to(b"native", reused_source).unwrap();
@@ -160,10 +160,10 @@ fn connected_udp_gateway_preserves_guest_visible_mapping() {
         Ok(SocketOutcome::Completed(7))
     );
     let mut payload = [0; 7];
-    let (_, native_source) = host.recv_from(&mut payload).unwrap();
+    let (_, host_source) = host.recv_from(&mut payload).unwrap();
     assert_eq!(&payload, b"request");
 
-    host.send_to(b"response", native_source).unwrap();
+    host.send_to(b"response", host_source).unwrap();
     wait_until_ready(&session, &publications, socket, ReadinessFlags::READ);
     let mut response = [0; 8];
     assert_eq!(
@@ -355,7 +355,7 @@ fn guest_udp_readiness_failure_rolls_back_enqueue() {
 }
 
 #[test]
-fn native_udp_readiness_failure_does_not_fail_shared_reactor() {
+fn external_udp_readiness_failure_does_not_fail_shared_reactor() {
     let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
@@ -388,11 +388,11 @@ fn native_udp_readiness_failure_does_not_fail_shared_reactor() {
         Ok(SocketOutcome::Completed(7))
     );
     let mut contact = [0; 7];
-    let (_, native_address) = external.recv_from(&mut contact).unwrap();
+    let (_, host_address) = external.recv_from(&mut contact).unwrap();
     assert_eq!(&contact, b"contact");
 
     readiness.fail_next_publish_matching(socket, ReadinessFlags::READ, ReadinessFlags::default());
-    external.send_to(b"reply", native_address).unwrap();
+    external.send_to(b"reply", host_address).unwrap();
     let deadline = Instant::now() + TEST_TIMEOUT;
     while !session
         .check_readiness(socket)
@@ -425,8 +425,8 @@ fn native_udp_readiness_failure_does_not_fail_shared_reactor() {
             .contains(ReadinessFlags::READ)
     );
 
-    external.send_to(b"first", native_address).unwrap();
-    external.send_to(b"second", native_address).unwrap();
+    external.send_to(b"first", host_address).unwrap();
+    external.send_to(b"second", host_address).unwrap();
     wait_until_ready(&session, &publications, socket, ReadinessFlags::READ);
     readiness.fail_next_publish_matching(socket, ReadinessFlags::default(), ReadinessFlags::READ);
     for (index, expected) in [b"first".as_slice(), b"second".as_slice()]
@@ -708,14 +708,14 @@ fn udp_external_peer_authorization_is_bounded_without_eviction() {
         Ok(SocketOutcome::Completed(1))
     );
     let mut byte = [0];
-    let (_, native_source) = first.recv_from(&mut byte).unwrap();
-    let native_source = socket_address_v4(native_source);
+    let (_, host_source) = first.recv_from(&mut byte).unwrap();
+    let host_source = socket_address_v4(host_source);
 
     let mut peers = Vec::new();
     while peers.len() < MAX_UDP_EXTERNAL_PEERS_PER_SOCKET - 1 {
         let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let address = gateway_address(socket_address_v4(peer.local_addr().unwrap()));
-        if address.port() == native_source.port() {
+        if address.port() == host_source.port() {
             continue;
         }
         assert_eq!(
@@ -726,7 +726,7 @@ fn udp_external_peer_authorization_is_bounded_without_eviction() {
     }
     let overflow = loop {
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        if socket.local_addr().unwrap().port() != native_source.port() {
+        if socket.local_addr().unwrap().port() != host_source.port() {
             break socket;
         }
     };
@@ -743,7 +743,7 @@ fn udp_external_peer_authorization_is_bounded_without_eviction() {
         Err(BrokerError::ResourceExhausted)
     );
 
-    first.send_to(b"reply", native_source).unwrap();
+    first.send_to(b"reply", host_source).unwrap();
     wait_until_ready(&session, &publications, handle, ReadinessFlags::READ);
     let mut reply = [0; 5];
     assert_eq!(
@@ -2332,7 +2332,7 @@ fn externally_connected_udp_preserves_guest_routing_identity() {
 }
 
 #[test]
-fn guest_connected_udp_drains_native_ingress_without_delivering_it() {
+fn internally_connected_udp_drains_external_datagrams_without_delivering_them() {
     let provider = Arc::new(LinuxSocketProvider::new(4, 2).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
@@ -2412,7 +2412,7 @@ fn guest_connected_udp_drains_native_ingress_without_delivering_it() {
         Ok(SocketOutcome::Completed(7))
     );
     let mut contact = [0; 7];
-    let (_, receiver_native_address) = attacker.recv_from(&mut contact).unwrap();
+    let (_, receiver_host_address) = attacker.recv_from(&mut contact).unwrap();
     assert_eq!(&contact, b"contact");
     assert_eq!(provider.reactor.udp_native_endpoint_count(), 1);
     let (ready, wait_until_ready) = sync_channel(1);
@@ -2431,10 +2431,10 @@ fn guest_connected_udp_drains_native_ingress_without_delivering_it() {
     provider.reactor.signal().unwrap();
     wait_until_ready.recv_timeout(TEST_TIMEOUT).unwrap();
     for _ in 0..MAX_REJECTED_UDP_DATAGRAMS_PER_COMMAND {
-        attacker.send_to(b"x", receiver_native_address).unwrap();
+        attacker.send_to(b"x", receiver_host_address).unwrap();
     }
     let sentinel = b"sentinel";
-    attacker.send_to(sentinel, receiver_native_address).unwrap();
+    attacker.send_to(sentinel, receiver_host_address).unwrap();
     proceed.send(()).unwrap();
     assert_eq!(
         receive_response.recv_timeout(TEST_TIMEOUT).unwrap(),

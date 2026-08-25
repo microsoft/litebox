@@ -189,7 +189,7 @@ struct GuestPortBinding {
 }
 
 impl GuestPortBinding {
-    fn requested_address(&self) -> SocketAddrV4 {
+    fn local_address(&self) -> SocketAddrV4 {
         match self.key {
             GuestBindingKey::Wildcard(port) => SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port),
             GuestBindingKey::Exact(address) => address,
@@ -216,8 +216,7 @@ impl GuestPortBinding {
 ///
 /// Socket resources own reservations. Sessions remain ownership, quota, and
 /// teardown domains rather than separate network namespaces. TCP and UDP use
-/// independent port spaces, and guest ports remain independent of native host
-/// ports.
+/// independent port spaces, and guest ports remain independent of host ports.
 #[derive(Clone, Default)]
 pub(crate) struct BrokerSocketPorts {
     state: Arc<Mutex<BrokerSocketPortState>>,
@@ -281,34 +280,34 @@ impl Drop for GuestPortBinding {
 /// Broker-authorized guest binding passed to a platform provider.
 #[derive(Clone)]
 pub struct GuestSocketBinding {
-    requested: SocketAddrV4,
+    local_address: SocketAddrV4,
     transport: GuestTransport,
 }
 
 impl GuestSocketBinding {
     fn new(binding: &GuestPortBinding) -> Self {
         Self {
-            requested: binding.requested_address(),
+            local_address: binding.local_address(),
             transport: binding.transport,
         }
     }
 
-    /// Returns the broker-reserved guest-visible binding.
+    /// Returns the broker-reserved guest-visible local address.
     #[must_use]
-    pub const fn requested(&self) -> SocketAddrV4 {
-        self.requested
+    pub const fn local_address(&self) -> SocketAddrV4 {
+        self.local_address
     }
 
     /// Returns whether the original binding used the wildcard address.
     #[must_use]
     pub const fn is_wildcard(&self) -> bool {
-        self.requested.ip().is_unspecified()
+        self.local_address.ip().is_unspecified()
     }
 
     /// Checks that this value represents a supported guest binding.
     #[must_use]
     pub fn is_valid(&self) -> bool {
-        self.requested.port() != 0 && is_internal_socket_address(self.requested)
+        self.local_address.port() != 0 && is_internal_socket_address(self.local_address)
     }
 
     /// Returns whether this binding belongs to the TCP guest namespace.
@@ -322,10 +321,10 @@ impl GuestSocketBinding {
     pub fn covers(&self, address: SocketAddrV4) -> bool {
         self.is_valid()
             && if self.is_wildcard() {
-                address.port() == self.requested.port()
+                address.port() == self.local_address.port()
                     && is_concrete_internal_address(*address.ip())
             } else {
-                address == self.requested
+                address == self.local_address
             }
     }
 
@@ -344,17 +343,17 @@ impl GuestSocketBinding {
         }
         let destination = normalize_socket_destination(destination).ok()?;
         if !self.is_wildcard() {
-            if self.requested.ip().is_loopback() && !is_internal_socket_address(destination) {
+            if self.local_address.ip().is_loopback() && !is_internal_socket_address(destination) {
                 return None;
             }
-            return Some(self.requested);
+            return Some(self.local_address);
         }
         let source_ip = if destination.ip().is_loopback() {
             Ipv4Addr::LOCALHOST
         } else {
             GUEST_IPV4_ADDRESS
         };
-        Some(SocketAddrV4::new(source_ip, self.requested.port()))
+        Some(SocketAddrV4::new(source_ip, self.local_address.port()))
     }
 }
 
@@ -362,14 +361,14 @@ impl fmt::Debug for GuestSocketBinding {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("GuestSocketBinding")
-            .field("requested", &self.requested)
+            .field("local_address", &self.local_address)
             .finish_non_exhaustive()
     }
 }
 
 impl PartialEq for GuestSocketBinding {
     fn eq(&self, other: &Self) -> bool {
-        self.requested == other.requested && self.transport == other.transport
+        self.local_address == other.local_address && self.transport == other.transport
     }
 }
 
@@ -379,7 +378,7 @@ impl Eq for GuestSocketBinding {}
 ///
 /// Core creates this value from a live guest binding when a TCP connection
 /// targets the guest namespace. It grants no bind or listen authority. A
-/// guest-local platform path must carry the lease through any queued connection
+/// internal platform path must carry the lease through any queued connection
 /// and return it from [`PlatformSocket::accept`]. Dropping the final binding
 /// reference releases the namespace entry.
 pub struct GuestSourceLease {
@@ -446,7 +445,7 @@ pub struct PlatformDatagramReceive {
     ///
     /// This must be unchanged by [`normalize_socket_destination`]. Platforms
     /// must return a guest sender's stable guest-namespace endpoint and never
-    /// expose broker-internal native endpoints.
+    /// expose host-socket endpoints.
     pub source_address: SocketAddrV4,
 }
 
@@ -486,18 +485,18 @@ pub trait SocketProvider: Send + Sync {
 /// portable authority, core explicitly retires the platform socket.
 ///
 /// Implementations own their authoritative platform lifecycle state, including
-/// any native resources. A request handler must record the start of a
+/// any host resources. A request handler must record the start of a
 /// transition before issuing it, and the corresponding synchronous result or
 /// asynchronous completion handler must finish that transition.
 /// [`status`](PlatformSocket::status) projects that platform-owned state for
-/// the guest; core may cache the projection but does not reconstruct native
-/// lifecycle state from status.
+/// the guest; core may cache the projection but does not reconstruct
+/// host-resource lifecycle state from status.
 pub trait PlatformSocket: Send + Sync {
     /// Binds this socket to a local address and echoes the assigned address.
     ///
     /// A broker-managed TCP or UDP socket receives a broker-reserved,
     /// guest-visible address with a nonzero port and must echo it unchanged. A
-    /// UDP bind may be entirely logical and need not allocate a native socket.
+    /// UDP bind may be entirely logical and need not allocate a host socket.
     /// A failed outcome or broker error must leave the socket unbound and
     /// retryable.
     fn bind(&self, binding: GuestSocketBinding) -> Result<SocketOutcome<SocketAddrV4>>;
@@ -526,12 +525,12 @@ pub trait PlatformSocket: Send + Sync {
     /// permits replacing its peer and treats synchronous failures as retryable
     /// operation outcomes. A datagram `Failed` status must leave the previous
     /// peer unchanged. Platform failures must distinguish a peer known to be
-    /// unchanged from one whose state is indeterminate. Once a native connect
-    /// may have started, implementations must retain enough platform state to
-    /// settle or conservatively retire it without reconstructing its lifecycle
-    /// during teardown. A guest TCP attempt receives a source lease. A
-    /// guest-local path must move it through to [`AcceptedPlatformSocket`];
-    /// native paths may drop it. Returning
+    /// unchanged from one whose state is indeterminate. Once an external
+    /// host-socket connect may have started, implementations must retain enough
+    /// platform state to settle or conservatively retire it without
+    /// reconstructing its lifecycle during teardown. A guest TCP attempt
+    /// receives a source lease. An internal path must move it through to
+    /// [`AcceptedPlatformSocket`]; external paths may drop it. Returning
     /// [`PlatformConnectError::PeerUnchanged`] requires releasing the lease;
     /// [`PlatformSocket::retire`] must release one retained by an indeterminate
     /// or in-progress operation. `address` is the normalized guest-visible
@@ -614,7 +613,7 @@ pub trait PlatformSocket: Send + Sync {
     /// `pending_error` for asynchronous failures. Any reported local address
     /// must preserve the broker-reserved port and have an IP accepted by
     /// [`is_internal_socket_address`]. An unbound datagram must not report a
-    /// local address, and native host addresses must never be exposed.
+    /// local address, and host addresses must never be exposed.
     fn status(&self) -> Result<PlatformSocketStatus>;
 
     /// Synchronously and idempotently ends this socket's platform authority.
@@ -625,7 +624,7 @@ pub trait PlatformSocket: Send + Sync {
     /// Returns the authoritative cached readiness snapshot.
     ///
     /// Update this snapshot before publishing the corresponding readiness
-    /// change. Reading it must not require access to a native resource that
+    /// change. Reading it must not require access to a host resource that
     /// retirement may already have removed.
     fn readiness(&self) -> ReadinessFlags;
 }

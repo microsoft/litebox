@@ -123,8 +123,8 @@ pub(super) struct ReactorUdpBinding {
 
 pub(super) struct UdpSocketState {
     pub(super) peer: Option<ReactorUdpPeer>,
-    guest_receive_queue: VecDeque<GuestDatagram>,
-    guest_receive_bytes: usize,
+    internal_receive_queue: VecDeque<InternalDatagram>,
+    internal_receive_bytes: usize,
     queued_by_source: HashMap<SessionId, UdpQueueAccounting>,
     pub(super) peeked_origin: Option<UdpReceiveOrigin>,
     pub(super) next_receive_origin: UdpReceiveOrigin,
@@ -136,11 +136,11 @@ impl Default for UdpSocketState {
     fn default() -> Self {
         Self {
             peer: None,
-            guest_receive_queue: VecDeque::new(),
-            guest_receive_bytes: 0,
+            internal_receive_queue: VecDeque::new(),
+            internal_receive_bytes: 0,
             queued_by_source: HashMap::new(),
             peeked_origin: None,
-            next_receive_origin: UdpReceiveOrigin::Guest,
+            next_receive_origin: UdpReceiveOrigin::Internal,
             native_endpoint: None,
             external_peers: HashMap::new(),
         }
@@ -174,10 +174,10 @@ impl UdpNativeErrorState {
     }
 }
 
-struct GuestDatagram {
+struct InternalDatagram {
     payload: Vec<u8>,
-    source_socket_generation: u64,
-    source_guest_address: SocketAddrV4,
+    source_socket_id: u64,
+    source_address: SocketAddrV4,
     source_session_id: SessionId,
 }
 
@@ -204,14 +204,14 @@ pub(super) struct UdpQueueAccounting {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum UdpReceiveOrigin {
-    Guest,
-    Native,
+    Internal,
+    External,
 }
 
 #[derive(Clone, Copy)]
 pub(super) enum ReactorUdpPeer {
     Internal {
-        socket_generation: u64,
+        socket_id: u64,
         internal_address: SocketAddrV4,
     },
     External(SocketAddrV4),
@@ -219,18 +219,18 @@ pub(super) enum ReactorUdpPeer {
 
 impl ReactorUdpState {
     pub(super) fn reserve_binding(&mut self, binding: &GuestSocketBinding) -> BrokerResult<()> {
-        let requested = binding.requested();
+        let local_address = binding.local_address();
         if !binding.is_valid()
             || if binding.is_wildcard() {
-                self.bindings.wildcard.contains_key(&requested.port())
+                self.bindings.wildcard.contains_key(&local_address.port())
                     || self
                         .bindings
                         .exact
                         .keys()
-                        .any(|address| address.port() == requested.port())
+                        .any(|address| address.port() == local_address.port())
             } else {
-                self.bindings.wildcard.contains_key(&requested.port())
-                    || self.bindings.exact.contains_key(&requested)
+                self.bindings.wildcard.contains_key(&local_address.port())
+                    || self.bindings.exact.contains_key(&local_address)
             }
         {
             return Err(BrokerError::Internal);
@@ -249,12 +249,12 @@ impl ReactorUdpState {
     }
 
     pub(super) fn insert_binding(&mut self, binding: ReactorUdpBinding) -> BrokerResult<()> {
-        let requested = binding.guest_binding.requested();
+        let local_address = binding.guest_binding.local_address();
         self.reserve_binding(&binding.guest_binding)?;
         if binding.guest_binding.is_wildcard() {
-            self.bindings.wildcard.insert(requested.port(), binding);
+            self.bindings.wildcard.insert(local_address.port(), binding);
         } else {
-            self.bindings.exact.insert(requested, binding);
+            self.bindings.exact.insert(local_address, binding);
         }
         Ok(())
     }
@@ -308,8 +308,7 @@ impl Reactor {
             Err(error) => return SocketOutcome::Failed(error),
         };
         if !is_internal_socket_address(destination) {
-            return if self.targets_private_udp_native_endpoint(host_socket_destination(destination))
-            {
+            return if self.targets_broker_udp_endpoint(host_socket_destination(destination)) {
                 SocketOutcome::Failed(SocketError::ConnectionRefused)
             } else {
                 SocketOutcome::Completed(ReactorUdpPeer::External(destination))
@@ -319,7 +318,7 @@ impl Reactor {
             return SocketOutcome::Failed(SocketError::ConnectionRefused);
         };
         SocketOutcome::Completed(ReactorUdpPeer::Internal {
-            socket_generation: binding.socket_id,
+            socket_id: binding.socket_id,
             internal_address: destination,
         })
     }
@@ -332,9 +331,8 @@ impl Reactor {
         let session_id = {
             let socket = self.sockets.get(&socket_id).ok_or(BrokerError::Internal)?;
             let udp = socket.udp_state()?;
-            let native_destination = host_socket_destination(external_destination);
-            if let Some(existing_external_destination) = udp.external_peers.get(&native_destination)
-            {
+            let host_destination = host_socket_destination(external_destination);
+            if let Some(existing_external_destination) = udp.external_peers.get(&host_destination) {
                 if *existing_external_destination != external_destination {
                     return Err(BrokerError::Internal);
                 }
@@ -408,11 +406,11 @@ impl Reactor {
         let Ok(udp) = socket.udp_state_mut() else {
             return;
         };
-        let native_destination = host_socket_destination(external_destination);
-        if udp.external_peers.get(&native_destination) != Some(&external_destination) {
+        let host_destination = host_socket_destination(external_destination);
+        if udp.external_peers.get(&host_destination) != Some(&external_destination) {
             return;
         }
-        udp.external_peers.remove(&native_destination);
+        udp.external_peers.remove(&host_destination);
         self.udp.external_peer_count = self
             .udp
             .external_peer_count
@@ -469,7 +467,7 @@ impl Reactor {
             .native_endpoint
             .as_ref()
             .is_some_and(|endpoint| endpoint.readable);
-        if socket.read_shutdown || !udp.guest_receive_queue.is_empty() || native_readable {
+        if socket.read_shutdown || !udp.internal_receive_queue.is_empty() || native_readable {
             readiness = readiness | ReadinessFlags::READ;
         }
         let native_write_blocked = udp
@@ -660,8 +658,9 @@ impl Reactor {
             self.udp_queue_limits();
 
         Ok(
-            udp.guest_receive_queue.len() >= MAX_UDP_QUEUE_DATAGRAMS_PER_SOCKET
-                || udp.guest_receive_bytes.saturating_add(length) > MAX_UDP_QUEUE_BYTES_PER_SOCKET
+            udp.internal_receive_queue.len() >= MAX_UDP_QUEUE_DATAGRAMS_PER_SOCKET
+                || udp.internal_receive_bytes.saturating_add(length)
+                    > MAX_UDP_QUEUE_BYTES_PER_SOCKET
                 || receiver_source.datagrams >= MAX_UDP_QUEUE_DATAGRAMS_PER_SOURCE
                 || receiver_source.bytes.saturating_add(length) > MAX_UDP_QUEUE_BYTES_PER_SOURCE
                 || self.udp.queued_datagrams >= global_datagrams
@@ -673,11 +672,11 @@ impl Reactor {
         )
     }
 
-    pub(super) fn enqueue_guest_datagram(
+    pub(super) fn enqueue_internal_datagram(
         &mut self,
         source_socket_id: u64,
-        destination_generation: u64,
-        source_guest_address: SocketAddrV4,
+        destination_socket_id: u64,
+        source_address: SocketAddrV4,
         payload: &[u8],
     ) -> BrokerResult<SocketOutcome<usize>> {
         let source_session_id = {
@@ -688,9 +687,8 @@ impl Reactor {
             source.udp_state()?;
             source.session_id
         };
-        let destination_id = destination_generation;
         let accepts_source = {
-            let Some(destination) = self.sockets.get(&destination_id) else {
+            let Some(destination) = self.sockets.get(&destination_socket_id) else {
                 return Ok(SocketOutcome::Failed(SocketError::ConnectionRefused));
             };
             if destination.kind() != SocketKind::Udp || destination.read_shutdown {
@@ -700,17 +698,14 @@ impl Reactor {
             match udp.peer {
                 None => true,
                 Some(ReactorUdpPeer::Internal {
-                    socket_generation,
+                    socket_id,
                     internal_address,
-                }) => {
-                    socket_generation == source_socket_id
-                        && internal_address == source_guest_address
-                }
+                }) => socket_id == source_socket_id && internal_address == source_address,
                 Some(ReactorUdpPeer::External(_)) => false,
             }
         };
         if !accepts_source
-            || self.udp_queue_would_drop(destination_id, source_session_id, payload.len())?
+            || self.udp_queue_would_drop(destination_socket_id, source_session_id, payload.len())?
         {
             return Ok(SocketOutcome::Completed(payload.len()));
         }
@@ -729,10 +724,10 @@ impl Reactor {
         {
             let destination = self
                 .sockets
-                .get_mut(&destination_id)
+                .get_mut(&destination_socket_id)
                 .ok_or(BrokerError::Internal)?;
             let udp = destination.udp_state_mut()?;
-            udp.guest_receive_queue
+            udp.internal_receive_queue
                 .try_reserve(1)
                 .map_err(|_| BrokerError::OutOfMemory)?;
             if !udp.queued_by_source.contains_key(&source_session_id) {
@@ -744,20 +739,20 @@ impl Reactor {
 
         let was_empty = self
             .sockets
-            .get(&destination_id)
+            .get(&destination_socket_id)
             .ok_or(BrokerError::Internal)?
             .udp_state()?
-            .guest_receive_queue
+            .internal_receive_queue
             .is_empty();
-        let datagram = GuestDatagram {
+        let datagram = InternalDatagram {
             payload: stored_payload,
-            source_socket_generation: source_socket_id,
-            source_guest_address,
+            source_socket_id,
+            source_address,
             source_session_id,
         };
         let receiver_session_id = self
             .sockets
-            .get(&destination_id)
+            .get(&destination_socket_id)
             .ok_or(BrokerError::Internal)?
             .session_id;
         let receiver_session = self
@@ -767,14 +762,14 @@ impl Reactor {
         {
             let destination = self
                 .sockets
-                .get_mut(&destination_id)
+                .get_mut(&destination_socket_id)
                 .ok_or(BrokerError::Internal)?;
             let udp = destination.udp_state_mut()?;
-            udp.guest_receive_bytes += datagram.payload.len();
+            udp.internal_receive_bytes += datagram.payload.len();
             let source = udp.queued_by_source.entry(source_session_id).or_default();
             source.datagrams += 1;
             source.bytes += datagram.payload.len();
-            udp.guest_receive_queue.push_back(datagram);
+            udp.internal_receive_queue.push_back(datagram);
             self.udp.queued_datagrams += 1;
             self.udp.queued_bytes += payload.len();
             let source = self
@@ -788,22 +783,22 @@ impl Reactor {
             receiver_session.udp_queued_bytes += payload.len();
         }
 
-        if was_empty && self.publish_udp_readiness(destination_id).is_err() {
+        if was_empty && self.publish_udp_readiness(destination_socket_id).is_err() {
             let datagram = self
                 .sockets
-                .get_mut(&destination_id)
+                .get_mut(&destination_socket_id)
                 .expect("queued UDP destination disappeared")
                 .udp_state_mut()
                 .expect("queued UDP destination changed kind")
-                .guest_receive_queue
+                .internal_receive_queue
                 .pop_back()
                 .expect("new UDP datagram disappeared before rollback");
-            self.release_udp_datagram_accounting(destination_id, &datagram);
+            self.release_udp_datagram_accounting(destination_socket_id, &datagram);
             let readiness = self
-                .udp_readiness(destination_id)
+                .udp_readiness(destination_socket_id)
                 .expect("UDP destination disappeared during readiness rollback");
             self.sockets
-                .get(&destination_id)
+                .get(&destination_socket_id)
                 .expect("UDP destination disappeared during readiness rollback")
                 .snapshot
                 .store(readiness);
@@ -811,7 +806,7 @@ impl Reactor {
         Ok(SocketOutcome::Completed(payload.len()))
     }
 
-    fn release_udp_datagram_accounting(&mut self, receiver_id: u64, datagram: &GuestDatagram) {
+    fn release_udp_datagram_accounting(&mut self, receiver_id: u64, datagram: &InternalDatagram) {
         let receiver = self
             .sockets
             .get_mut(&receiver_id)
@@ -820,8 +815,8 @@ impl Reactor {
         let udp = receiver
             .udp_state_mut()
             .expect("UDP receiver changed kind before accounting release");
-        udp.guest_receive_bytes = udp
-            .guest_receive_bytes
+        udp.internal_receive_bytes = udp
+            .internal_receive_bytes
             .checked_sub(datagram.payload.len())
             .expect("UDP receiver byte count underflow");
         let remove_receiver_source = {
@@ -895,7 +890,7 @@ impl Reactor {
                 .get_mut(&socket_id)
                 .ok_or(BrokerError::Internal)?
                 .udp_state_mut()?
-                .guest_receive_queue
+                .internal_receive_queue
                 .pop_front();
             let Some(datagram) = datagram else {
                 break;
@@ -991,10 +986,10 @@ impl Reactor {
                     }
                 }
             }
-            let native_local_address = local_socket_address(&socket)?;
+            let host_local_address = local_socket_address(&socket)?;
             if self.udp_port_conflicts(
                 socket_id,
-                native_local_address.port(),
+                host_local_address.port(),
                 current_external_destination,
             )? {
                 continue;
@@ -1012,17 +1007,13 @@ impl Reactor {
                     }
                 }
             }
-            let native_local_address = if connected_external_destination.is_some() {
+            let host_local_address = if connected_external_destination.is_some() {
                 local_socket_address(&socket)?
             } else {
-                native_local_address
+                host_local_address
             };
             let event_token = self.next_udp_event_token()?;
-            if !self
-                .udp
-                .native_endpoints
-                .insert(native_local_address.port())
-            {
+            if !self.udp.native_endpoints.insert(host_local_address.port()) {
                 return Err(BrokerError::Internal);
             }
             if self
@@ -1031,9 +1022,7 @@ impl Reactor {
                 .insert(event_token, UdpEventTarget { socket_id })
                 .is_some()
             {
-                self.udp
-                    .native_endpoints
-                    .remove(&native_local_address.port());
+                self.udp.native_endpoints.remove(&host_local_address.port());
                 return Err(BrokerError::Internal);
             }
             if let Err(error) = epoll::add(
@@ -1043,9 +1032,7 @@ impl Reactor {
                 udp_epoll_events(read_enabled, false),
             ) {
                 self.udp.event_tokens.remove(&event_token);
-                self.udp
-                    .native_endpoints
-                    .remove(&native_local_address.port());
+                self.udp.native_endpoints.remove(&host_local_address.port());
                 return Err(broker_error_from_errno(error));
             }
             return Ok(SocketOutcome::Completed(UdpNativeEndpoint {
@@ -1054,7 +1041,7 @@ impl Reactor {
                 event_token,
                 guest_local_address: SocketAddrV4::new(
                     GUEST_IPV4_ADDRESS,
-                    native_local_address.port(),
+                    host_local_address.port(),
                 ),
                 readable: false,
                 write_blocked: false,
@@ -1141,7 +1128,7 @@ impl Reactor {
                         let udp = socket
                             .udp_state_mut()
                             .map_err(PlatformConnectError::PeerIndeterminate)?;
-                        if udp.peeked_origin == Some(UdpReceiveOrigin::Native) {
+                        if udp.peeked_origin == Some(UdpReceiveOrigin::External) {
                             udp.peeked_origin = None;
                         }
                         let endpoint = udp.native_endpoint.as_mut().ok_or(
@@ -1150,10 +1137,10 @@ impl Reactor {
                         endpoint.write_blocked = false;
                         endpoint.error = UdpNativeErrorState::None;
                         endpoint.readable = false;
-                        let native_address = local_socket_address(&endpoint.socket)
+                        let host_address = local_socket_address(&endpoint.socket)
                             .map_err(PlatformConnectError::PeerIndeterminate)?;
                         let guest_local_address =
-                            SocketAddrV4::new(GUEST_IPV4_ADDRESS, native_address.port());
+                            SocketAddrV4::new(GUEST_IPV4_ADDRESS, host_address.port());
                         endpoint.guest_local_address = guest_local_address;
                     }
                     self.rearm_udp_endpoint(socket_id)
@@ -1197,7 +1184,7 @@ impl Reactor {
                 .get_mut(&socket_id)
                 .ok_or(BrokerError::Internal)?
                 .udp_state_mut()?;
-            if udp.peeked_origin == Some(UdpReceiveOrigin::Native) {
+            if udp.peeked_origin == Some(UdpReceiveOrigin::External) {
                 udp.peeked_origin = None;
             }
             std::mem::replace(&mut udp.native_endpoint, endpoint)
@@ -1244,7 +1231,7 @@ impl Reactor {
             }
         }
         if readable_event && !error_event {
-            self.drain_invalid_udp_ingress(target.socket_id)?;
+            self.drain_rejected_external_datagrams(target.socket_id)?;
         }
         self.rearm_udp_endpoint(target.socket_id)?;
         // The cached snapshot remains authoritative if this association cannot
@@ -1297,27 +1284,27 @@ impl Reactor {
         Ok(())
     }
 
-    fn guest_source_for_native_datagram(
+    fn resolve_external_udp_source(
         &self,
         socket_id: u64,
-        native_source: SocketAddrV4,
+        host_source: SocketAddrV4,
     ) -> BrokerResult<Option<SocketAddrV4>> {
         let socket = self.sockets.get(&socket_id).ok_or(BrokerError::Internal)?;
         if socket.read_shutdown {
             return Ok(None);
         }
         let udp = socket.udp_state()?;
-        Ok(if self.targets_private_udp_native_endpoint(native_source) {
+        Ok(if self.targets_broker_udp_endpoint(host_source) {
             None
         } else {
             match udp.peer {
                 Some(ReactorUdpPeer::External(peer))
-                    if host_socket_destination(peer) == native_source =>
+                    if host_socket_destination(peer) == host_source =>
                 {
                     Some(peer)
                 }
                 Some(ReactorUdpPeer::Internal { .. } | ReactorUdpPeer::External(_)) => None,
-                None => udp.external_peers.get(&native_source).copied(),
+                None => udp.external_peers.get(&host_source).copied(),
             }
         })
     }
@@ -1364,7 +1351,7 @@ impl Reactor {
         Ok(Some(ReactorReceiveFromOutcome::Failed(error)))
     }
 
-    fn drain_invalid_udp_ingress(&mut self, socket_id: u64) -> BrokerResult<()> {
+    fn drain_rejected_external_datagrams(&mut self, socket_id: u64) -> BrokerResult<()> {
         if let Some(endpoint) = self
             .sockets
             .get_mut(&socket_id)
@@ -1385,7 +1372,7 @@ impl Reactor {
                     .ok_or(BrokerError::Internal)?;
                 receive_datagram_fd(&endpoint.socket, 0, ReceiveFromFlags::PEEK)
             };
-            let source_address = match peek {
+            let host_source = match peek {
                 Ok(ReactorReceiveFromOutcome::Received { source_address, .. }) => source_address,
                 Ok(ReactorReceiveFromOutcome::Failed(error)) => {
                     self.record_udp_endpoint_error(socket_id, error)?;
@@ -1415,7 +1402,7 @@ impl Reactor {
                 Err(error) => return Err(error),
             };
             if self
-                .guest_source_for_native_datagram(socket_id, source_address)?
+                .resolve_external_udp_source(socket_id, host_source)?
                 .is_some()
             {
                 self.sockets
@@ -1525,7 +1512,7 @@ impl Reactor {
         }
     }
 
-    pub(super) fn receive_guest_udp(
+    pub(super) fn receive_internal_udp(
         &mut self,
         socket_id: u64,
         length: usize,
@@ -1533,15 +1520,15 @@ impl Reactor {
     ) -> BrokerResult<Option<ReactorReceiveFromOutcome>> {
         let Some((data, datagram_length, source_address)) = ({
             let socket = self.sockets.get(&socket_id).ok_or(BrokerError::Internal)?;
-            let datagram = socket.udp_state()?.guest_receive_queue.front();
+            let datagram = socket.udp_state()?.internal_receive_queue.front();
             datagram.map(|datagram| {
                 let copied = length.min(datagram.payload.len());
                 let mut data = Vec::new();
                 data.try_reserve_exact(copied)
                     .map_err(|_| BrokerError::OutOfMemory)?;
                 data.extend_from_slice(&datagram.payload[..copied]);
-                debug_assert_ne!(datagram.source_socket_generation, WAKE_TOKEN);
-                Ok::<_, BrokerError>((data, datagram.payload.len(), datagram.source_guest_address))
+                debug_assert_ne!(datagram.source_socket_id, WAKE_TOKEN);
+                Ok::<_, BrokerError>((data, datagram.payload.len(), datagram.source_address))
             })
         })
         .transpose()?
@@ -1554,14 +1541,14 @@ impl Reactor {
                 .get_mut(&socket_id)
                 .ok_or(BrokerError::Internal)?
                 .udp_state_mut()?
-                .peeked_origin = Some(UdpReceiveOrigin::Guest);
+                .peeked_origin = Some(UdpReceiveOrigin::Internal);
         } else {
             let datagram = self
                 .sockets
                 .get_mut(&socket_id)
                 .ok_or(BrokerError::Internal)?
                 .udp_state_mut()?
-                .guest_receive_queue
+                .internal_receive_queue
                 .pop_front()
                 .ok_or(BrokerError::Internal)?;
             self.release_udp_datagram_accounting(socket_id, &datagram);
@@ -1571,7 +1558,7 @@ impl Reactor {
                 .ok_or(BrokerError::Internal)?
                 .udp_state_mut()?;
             udp.peeked_origin = None;
-            udp.next_receive_origin = UdpReceiveOrigin::Native;
+            udp.next_receive_origin = UdpReceiveOrigin::External;
             // The dequeue is committed and the cached snapshot is authoritative
             // even if this association cannot accept the notification.
             let _ = self.publish_udp_readiness(socket_id);
@@ -1583,7 +1570,7 @@ impl Reactor {
         }))
     }
 
-    pub(super) fn receive_native_udp(
+    pub(super) fn receive_external_udp(
         &mut self,
         socket_id: u64,
         length: usize,
@@ -1611,7 +1598,7 @@ impl Reactor {
                     .ok_or(BrokerError::Internal)?;
                 receive_datagram_fd(&endpoint.socket, length, ReceiveFromFlags::PEEK)
             };
-            let (data, datagram_length, native_source) = match outcome {
+            let (data, datagram_length, host_source) = match outcome {
                 Ok(ReactorReceiveFromOutcome::Received {
                     data,
                     datagram_length,
@@ -1635,14 +1622,14 @@ impl Reactor {
                 }
                 Err(error) => return Err(error),
             };
-            let guest_source = self.guest_source_for_native_datagram(socket_id, native_source)?;
-            if let Some(source_address) = guest_source {
+            let external_source = self.resolve_external_udp_source(socket_id, host_source)?;
+            if let Some(source_address) = external_source {
                 if flags.contains(ReceiveFromFlags::PEEK) {
                     self.sockets
                         .get_mut(&socket_id)
                         .ok_or(BrokerError::Internal)?
                         .udp_state_mut()?
-                        .peeked_origin = Some(UdpReceiveOrigin::Native);
+                        .peeked_origin = Some(UdpReceiveOrigin::External);
                     return Ok(Some(ReactorReceiveFromOutcome::Received {
                         data,
                         datagram_length,
@@ -1711,12 +1698,12 @@ impl Reactor {
                     .ok_or(BrokerError::Internal)?
                     .udp_state_mut()?;
                 udp.peeked_origin = None;
-                udp.next_receive_origin = UdpReceiveOrigin::Guest;
+                udp.next_receive_origin = UdpReceiveOrigin::Internal;
                 // Consumption is committed. The endpoint was rearmed before
                 // the dequeue. Refresh the cached head state so another
                 // authorized datagram keeps READ asserted without requiring
                 // an asynchronous low-to-high publication.
-                let _ = self.drain_invalid_udp_ingress(socket_id);
+                let _ = self.drain_rejected_external_datagrams(socket_id);
                 // The cached snapshot remains authoritative if notification
                 // delivery fails after irreversible consumption.
                 let _ = self.publish_udp_readiness(socket_id);
@@ -1937,7 +1924,7 @@ mod tests {
     }
 
     #[test]
-    fn private_udp_native_ports_reject_only_local_destinations() {
+    fn broker_udp_endpoint_ports_reject_only_local_destinations() {
         let port = 49152;
         assert!(udp_destination_uses_local_port(
             SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),

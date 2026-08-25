@@ -267,7 +267,7 @@ fn guest_binding_namespaces_support_exact_and_wildcard_guest_addresses() {
     );
     assert_eq!(
         GuestSocketBinding {
-            requested: private,
+            local_address: private,
             transport: GuestTransport::Tcp,
         }
         .source_address_for_destination(external),
@@ -767,7 +767,7 @@ impl TestPlatformSocket {
 
 impl PlatformSocket for TestPlatformSocket {
     fn bind(&self, binding: GuestSocketBinding) -> Result<SocketOutcome<SocketAddrV4>> {
-        let address = binding.requested();
+        let address = binding.local_address();
         *self.guest_binding.lock().unwrap() = Some(binding);
         self.state.binds.lock().unwrap().push(address);
         let bound_address = self
