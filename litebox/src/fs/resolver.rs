@@ -4,6 +4,7 @@
 //! The path-management/permissions/... layer, that sits above [`super::backend`].
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -57,35 +58,48 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
 }
 
 /// Per-call resolution context.  The user may hold and mutate this as they wish.
+///
+/// This struct is deliberately cheap to clone.
+// NOTE(jayb): I generally dislike getters/setters for fields of a data-like struct (e.g., see
+// acting_user and set_acting_user here), but I'm putting these here since I am not yet convinced
+// that we won't need more things in the context, nor am I convinced that we might not need the
+// ability to lock down how contexts are made/used. In some sense, I am forcing some chokepoints
+// here. In the future, we might flatten these out and just allow access to the fields directly.
 #[derive(Clone, Debug)]
 pub struct Context {
     /// Current working directory.
-    ///
-    /// An empty list is equivalent to `/`. Guaranteed to never have `.` or `..`.
-    cwd: Vec<String>,
+    cwd: Arc<ResolvedPath>,
     /// Effective user for permission checks.
     user_info: UserInfo,
 }
 
 impl Context {
-    /// Set the acting user for all subsequent operations on this context, returning the previous
-    /// one.
-    ///
-    /// Non-test callers set up whatever needs a different user while constructing the backend;
-    /// this exists so that the tests can exercise operations that depend on the acting user.
-    ///
-    /// TODO(DO NOT COMMIT): Temporarily still kept as test-only, but within the same PR, we should
-    /// expose getters/setters for the context, or maybe make the fields public, while also making
-    /// it non-exhaustive or something?
-    #[cfg(test)]
-    pub(super) fn swap_acting_user(&mut self, user: UserInfo) -> UserInfo {
-        core::mem::replace(&mut self.user_info, user)
+    /// The user that operations on this context act as.
+    #[must_use]
+    pub fn acting_user(&self) -> UserInfo {
+        self.user_info
+    }
+
+    /// Set the user that operations on this context act as.
+    pub fn set_acting_user(&mut self, user: UserInfo) {
+        self.user_info = user;
+    }
+
+    /// The current working directory.
+    #[must_use]
+    pub fn cwd(&self) -> &ResolvedPath {
+        &self.cwd
+    }
+
+    /// Set the current working directory.
+    pub fn set_cwd(&mut self, cwd: ResolvedPath) {
+        self.cwd = Arc::new(cwd);
     }
 
     /// A new default context, anchored at `/` for a non-root user.
     pub fn new() -> Context {
         Self {
-            cwd: vec![],
+            cwd: Arc::new(ResolvedPath { components: vec![] }),
             user_info: UserInfo {
                 user: 1000,
                 group: 1000,
@@ -98,11 +112,11 @@ impl Context {
     // outside the chrooted part.
     // XXX(jayb): since we are migrating all resolution into the resolver, we probably don't need
     // `Arg` anymore, so could get rid of it in the future.
-    fn resolve(&self, path: impl Arg) -> Result<ResolvedPath, PathError> {
+    pub fn resolve(&self, path: impl Arg) -> Result<ResolvedPath, PathError> {
         let mut components = if path.as_rust_str()?.starts_with('/') {
             vec![]
         } else {
-            self.cwd.clone()
+            self.cwd.components.clone()
         };
         for component in path.components()? {
             match component {
@@ -156,8 +170,25 @@ impl Default for Context {
 }
 
 /// Absolute normalized path, must only be created from [`Context::resolve`].
-struct ResolvedPath {
+///
+/// Note that a resolved path does not imply that it exists within the file system, merely that it
+/// is an absolute normalized path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedPath {
+    // Note: an empty path is equivalent to `/`.
     components: Vec<String>,
+}
+
+impl core::fmt::Display for ResolvedPath {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for component in &self.components {
+            write!(f, "/{component}")?;
+        }
+        if self.components.is_empty() {
+            f.write_str("/")?;
+        }
+        Ok(())
+    }
 }
 
 impl ResolvedPath {

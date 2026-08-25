@@ -62,10 +62,10 @@ mod in_mem {
 
     #[test]
     fn root_file_creation_and_deletion() {
-        let mut ctx = crate::fs::resolver::Context::new();
+        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
 
-        in_mem::with_root_privileges(&mut super::in_mem_fs(&litebox), &mut ctx, |fs, ctx| {
+        in_mem::with_root_privileges(&mut super::in_mem_fs(&litebox), &ctx, |fs, ctx| {
             // Test file creation
             let path = "/testfile";
             let fd = fs
@@ -85,10 +85,10 @@ mod in_mem {
 
     #[test]
     fn root_file_read_write() {
-        let mut ctx = crate::fs::resolver::Context::new();
+        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
 
-        in_mem::with_root_privileges(&mut super::in_mem_fs(&litebox), &mut ctx, |fs, ctx| {
+        in_mem::with_root_privileges(&mut super::in_mem_fs(&litebox), &ctx, |fs, ctx| {
             // Create and write to a file
             let path = "/testfile";
             let fd = fs
@@ -114,10 +114,10 @@ mod in_mem {
 
     #[test]
     fn write_only_open_does_not_require_read_permission() {
-        let mut ctx = crate::fs::resolver::Context::new();
+        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
         let mut fs = super::in_mem_fs(&litebox);
-        in_mem::with_root_privileges(&mut fs, &mut ctx, |fs, ctx| {
+        in_mem::with_root_privileges(&mut fs, &ctx, |fs, ctx| {
             fs.mkdir(ctx, "/tmp", Mode::RWXU | Mode::RWXG | Mode::RWXO)
                 .expect("Failed to create /tmp");
         });
@@ -143,10 +143,10 @@ mod in_mem {
 
     #[test]
     fn newly_created_file_does_not_require_its_own_permissions() {
-        let mut ctx = crate::fs::resolver::Context::new();
+        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
         let mut fs = super::in_mem_fs(&litebox);
-        in_mem::with_root_privileges(&mut fs, &mut ctx, |fs, ctx| {
+        in_mem::with_root_privileges(&mut fs, &ctx, |fs, ctx| {
             fs.mkdir(ctx, "/tmp", Mode::RWXU | Mode::RWXG | Mode::RWXO)
                 .expect("Failed to create /tmp");
         });
@@ -168,10 +168,10 @@ mod in_mem {
 
     #[test]
     fn root_directory_creation_and_removal() {
-        let mut ctx = crate::fs::resolver::Context::new();
+        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
 
-        in_mem::with_root_privileges(&mut super::in_mem_fs(&litebox), &mut ctx, |fs, ctx| {
+        in_mem::with_root_privileges(&mut super::in_mem_fs(&litebox), &ctx, |fs, ctx| {
             // Test directory creation
             let path = "/testdir";
             fs.mkdir(ctx, path, Mode::RWXU)
@@ -188,10 +188,10 @@ mod in_mem {
 
     #[test]
     fn file_creation_and_deletion() {
-        let mut ctx = crate::fs::resolver::Context::new();
+        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
         let mut fs = super::in_mem_fs(&litebox);
-        in_mem::with_root_privileges(&mut fs, &mut ctx, |fs, ctx| {
+        in_mem::with_root_privileges(&mut fs, &ctx, |fs, ctx| {
             // Make `/tmp` and set up with reasonable privs so normal users can do things in there.
             fs.mkdir(ctx, "/tmp", Mode::RWXU | Mode::RWXG | Mode::RWXO)
                 .expect("Failed to create /tmp");
@@ -215,10 +215,10 @@ mod in_mem {
 
     #[test]
     fn file_read_write() {
-        let mut ctx = crate::fs::resolver::Context::new();
+        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
         let mut fs = super::in_mem_fs(&litebox);
-        in_mem::with_root_privileges(&mut fs, &mut ctx, |fs, ctx| {
+        in_mem::with_root_privileges(&mut fs, &ctx, |fs, ctx| {
             // Make `/tmp` and set up with reasonable privs so normal users can do things in there.
             fs.mkdir(ctx, "/tmp", Mode::RWXU | Mode::RWXG | Mode::RWXO)
                 .expect("Failed to create /tmp");
@@ -254,10 +254,10 @@ mod in_mem {
 
     #[test]
     fn directory_creation_and_removal() {
-        let mut ctx = crate::fs::resolver::Context::new();
+        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
         let mut fs = super::in_mem_fs(&litebox);
-        in_mem::with_root_privileges(&mut fs, &mut ctx, |fs, ctx| {
+        in_mem::with_root_privileges(&mut fs, &ctx, |fs, ctx| {
             // Make `/tmp` and set up with reasonable privs so normal users can do things in there.
             fs.mkdir(ctx, "/tmp", Mode::RWXU | Mode::RWXG | Mode::RWXO)
                 .expect("Failed to create /tmp");
@@ -278,10 +278,10 @@ mod in_mem {
 
     #[test]
     fn read_dir_empty() {
-        let mut ctx = crate::fs::resolver::Context::new();
+        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
 
-        in_mem::with_root_privileges(&mut super::in_mem_fs(&litebox), &mut ctx, |fs, ctx| {
+        in_mem::with_root_privileges(&mut super::in_mem_fs(&litebox), &ctx, |fs, ctx| {
             let fd = fs
                 .open(ctx, "/", OFlags::RDONLY, Mode::empty())
                 .expect("Failed to open root directory");
@@ -302,10 +302,10 @@ mod in_mem {
 
     #[test]
     fn read_dir_with_files_and_dirs() {
-        let mut ctx = crate::fs::resolver::Context::new();
+        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
 
-        in_mem::with_root_privileges(&mut super::in_mem_fs(&litebox), &mut ctx, |fs, ctx| {
+        in_mem::with_root_privileges(&mut super::in_mem_fs(&litebox), &ctx, |fs, ctx| {
             // Create a directory structure
             fs.mkdir(ctx, "/testdir", Mode::RWXU)
                 .expect("Failed to create directory");
@@ -378,10 +378,10 @@ mod in_mem {
 
     #[test]
     fn read_dir_file_not_directory() {
-        let mut ctx = crate::fs::resolver::Context::new();
+        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
 
-        in_mem::with_root_privileges(&mut super::in_mem_fs(&litebox), &mut ctx, |fs, ctx| {
+        in_mem::with_root_privileges(&mut super::in_mem_fs(&litebox), &ctx, |fs, ctx| {
             // Create a file
             let fd = fs
                 .open(ctx, "/testfile", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
@@ -404,11 +404,11 @@ mod in_mem {
 
     #[test]
     fn parent_dir_write_permissions_are_enforced() {
-        let mut ctx = crate::fs::resolver::Context::new();
+        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
         let mut fs = super::in_mem_fs(&litebox);
 
-        in_mem::with_root_privileges(&mut fs, &mut ctx, |fs, ctx| {
+        in_mem::with_root_privileges(&mut fs, &ctx, |fs, ctx| {
             // A root-owned 0755 directory, holding a file and a directory to try to remove.
             fs.mkdir(
                 ctx,
@@ -433,7 +433,7 @@ mod in_mem {
                 .expect("Failed to create directory");
         });
 
-        in_mem::with_user(&mut fs, &mut ctx, 1000, 1000, |fs, ctx| {
+        in_mem::with_user(&mut fs, &ctx, 1000, 1000, |fs, ctx| {
             assert!(matches!(
                 fs.open(
                     ctx,
@@ -477,12 +477,12 @@ mod in_mem {
 
     #[test]
     fn chown_test() {
-        let mut ctx = crate::fs::resolver::Context::new();
+        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
         let mut fs = super::in_mem_fs(&litebox);
 
         // Create a test file as root
-        in_mem::with_root_privileges(&mut fs, &mut ctx, |fs, ctx| {
+        in_mem::with_root_privileges(&mut fs, &ctx, |fs, ctx| {
             let path = "/testfile";
             let fd = fs
                 .open(ctx, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
@@ -496,13 +496,13 @@ mod in_mem {
 
         // Switch to user 1000 and test that owner can chown (should succeed)
         let path = "/testfile";
-        in_mem::with_user(&mut fs, &mut ctx, 1000, 1000, |fs, ctx| {
+        in_mem::with_user(&mut fs, &ctx, 1000, 1000, |fs, ctx| {
             fs.chown(ctx, path, Some(123), Some(456))
                 .expect("Failed to chown as owner");
         });
 
         // Switch to a different user and test that non-owner cannot chown (should fail)
-        in_mem::with_user(&mut fs, &mut ctx, 500, 500, |fs, ctx| {
+        in_mem::with_user(&mut fs, &ctx, 500, 500, |fs, ctx| {
             match fs.chown(ctx, path, Some(789), Some(101)) {
                 Err(crate::fs::errors::ChownError::NotTheOwner) => {
                     // Expected behavior
@@ -524,13 +524,13 @@ mod in_mem {
         }
 
         // Test partial chown (change only user, leave group unchanged)
-        in_mem::with_root_privileges(&mut fs, &mut ctx, |fs, ctx| {
+        in_mem::with_root_privileges(&mut fs, &ctx, |fs, ctx| {
             fs.chown(ctx, path, Some(999), None)
                 .expect("Failed to chown user only");
         });
 
         // Test partial chown (change only group, leave user unchanged)
-        in_mem::with_root_privileges(&mut fs, &mut ctx, |fs, ctx| {
+        in_mem::with_root_privileges(&mut fs, &ctx, |fs, ctx| {
             fs.chown(ctx, path, None, Some(888))
                 .expect("Failed to chown group only");
         });
@@ -538,11 +538,11 @@ mod in_mem {
 
     #[test]
     fn o_directory_flag_tests() {
-        let mut ctx = crate::fs::resolver::Context::new();
+        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
         let mut fs = super::in_mem_fs(&litebox);
 
-        in_mem::with_root_privileges(&mut fs, &mut ctx, |fs, ctx| {
+        in_mem::with_root_privileges(&mut fs, &ctx, |fs, ctx| {
             fs.chmod(ctx, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
                 .expect("Failed to chmod /");
         });
@@ -622,11 +622,11 @@ mod in_mem {
 
     #[test]
     fn o_excl_flag_tests() {
-        let mut ctx = crate::fs::resolver::Context::new();
+        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
         let mut fs = super::in_mem_fs(&litebox);
 
-        in_mem::with_root_privileges(&mut fs, &mut ctx, |fs, ctx| {
+        in_mem::with_root_privileges(&mut fs, &ctx, |fs, ctx| {
             fs.chmod(ctx, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
                 .expect("Failed to chmod /");
         });
@@ -697,11 +697,11 @@ mod in_mem {
 
     #[test]
     fn open_with_trunc() {
-        let mut ctx = crate::fs::resolver::Context::new();
+        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
         let mut fs = super::in_mem_fs(&litebox);
 
-        in_mem::with_root_privileges(&mut fs, &mut ctx, |fs, ctx| {
+        in_mem::with_root_privileges(&mut fs, &ctx, |fs, ctx| {
             fs.chmod(ctx, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
                 .expect("Failed to chmod /");
         });
@@ -791,11 +791,11 @@ mod in_mem {
     fn write_position_after_seek() {
         use crate::fs::SeekWhence;
 
-        let mut ctx = crate::fs::resolver::Context::new();
+        let ctx = crate::fs::resolver::Context::new();
 
         let litebox = LiteBox::new(MockPlatform::new());
         let mut fs = super::in_mem_fs(&litebox);
-        in_mem::with_root_privileges(&mut fs, &mut ctx, |fs, ctx| {
+        in_mem::with_root_privileges(&mut fs, &ctx, |fs, ctx| {
             // Allow regular user to create in root for this focused test
             fs.chmod(ctx, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
                 .expect("chmod / failed");
@@ -849,11 +849,11 @@ mod in_mem {
 
     #[test]
     fn o_append_flag_basic() {
-        let mut ctx = crate::fs::resolver::Context::new();
+        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
         let mut fs = super::in_mem_fs(&litebox);
 
-        in_mem::with_root_privileges(&mut fs, &mut ctx, |fs, ctx| {
+        in_mem::with_root_privileges(&mut fs, &ctx, |fs, ctx| {
             fs.chmod(ctx, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
                 .expect("Failed to chmod /");
         });
@@ -894,12 +894,12 @@ mod in_mem {
     fn o_append_flag_seek_ignored_for_write() {
         use crate::fs::SeekWhence;
 
-        let mut ctx = crate::fs::resolver::Context::new();
+        let ctx = crate::fs::resolver::Context::new();
 
         let litebox = LiteBox::new(MockPlatform::new());
         let mut fs = super::in_mem_fs(&litebox);
 
-        in_mem::with_root_privileges(&mut fs, &mut ctx, |fs, ctx| {
+        in_mem::with_root_privileges(&mut fs, &ctx, |fs, ctx| {
             fs.chmod(ctx, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
                 .expect("Failed to chmod /");
         });
@@ -944,12 +944,12 @@ mod in_mem {
     fn o_append_flag_with_rdwr() {
         use crate::fs::SeekWhence;
 
-        let mut ctx = crate::fs::resolver::Context::new();
+        let ctx = crate::fs::resolver::Context::new();
 
         let litebox = LiteBox::new(MockPlatform::new());
         let mut fs = super::in_mem_fs(&litebox);
 
-        in_mem::with_root_privileges(&mut fs, &mut ctx, |fs, ctx| {
+        in_mem::with_root_privileges(&mut fs, &ctx, |fs, ctx| {
             fs.chmod(ctx, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
                 .expect("Failed to chmod /");
         });
@@ -998,11 +998,11 @@ mod in_mem {
 
     #[test]
     fn o_append_pwrite_ignores_append_mode() {
-        let mut ctx = crate::fs::resolver::Context::new();
+        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
         let mut fs = super::in_mem_fs(&litebox);
 
-        in_mem::with_root_privileges(&mut fs, &mut ctx, |fs, ctx| {
+        in_mem::with_root_privileges(&mut fs, &ctx, |fs, ctx| {
             fs.chmod(ctx, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
                 .expect("Failed to chmod /");
         });
@@ -1040,11 +1040,11 @@ mod in_mem {
 
     #[test]
     fn o_append_with_trunc() {
-        let mut ctx = crate::fs::resolver::Context::new();
+        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
         let mut fs = super::in_mem_fs(&litebox);
 
-        in_mem::with_root_privileges(&mut fs, &mut ctx, |fs, ctx| {
+        in_mem::with_root_privileges(&mut fs, &ctx, |fs, ctx| {
             fs.chmod(ctx, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
                 .expect("Failed to chmod /");
         });

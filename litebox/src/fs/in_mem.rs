@@ -702,7 +702,7 @@ struct Permissions {
 #[cfg(test)]
 pub(super) fn with_root_privileges<Platform: sync::RawSyncPrimitivesProvider>(
     fs: &mut super::resolver::Resolver<Platform, InMem<Platform>>,
-    context: &mut super::resolver::Context,
+    context: &super::resolver::Context,
     f: impl FnOnce(&mut super::resolver::Resolver<Platform, InMem<Platform>>, &super::resolver::Context),
 ) {
     with_user(fs, context, UserInfo::ROOT.user, UserInfo::ROOT.group, f);
@@ -712,16 +712,16 @@ pub(super) fn with_root_privileges<Platform: sync::RawSyncPrimitivesProvider>(
 #[cfg(test)]
 pub(super) fn with_user<Platform: sync::RawSyncPrimitivesProvider>(
     fs: &mut super::resolver::Resolver<Platform, InMem<Platform>>,
-    context: &mut super::resolver::Context,
+    context: &super::resolver::Context,
     user: u16,
     group: u16,
     f: impl FnOnce(&mut super::resolver::Resolver<Platform, InMem<Platform>>, &super::resolver::Context),
 ) {
     let user = UserInfo { user, group };
-    let original_user = context.swap_acting_user(user);
+    let original_user = context.acting_user();
+    let mut context = context.clone();
+    context.set_acting_user(user);
     fs.backend_mut().current_user = user;
-    f(fs, context);
-    let user_again = context.swap_acting_user(original_user);
+    f(fs, &context);
     fs.backend_mut().current_user = original_user;
-    assert!(user_again.user == user.user && user_again.group == user.group);
 }
