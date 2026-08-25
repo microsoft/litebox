@@ -25,18 +25,12 @@ use super::{
 };
 
 /// The north-facing filesystem entry point, generic over a [`Backend`](super::backend::Backend).
-// NOTE(jayb): the `Context` separation is in preparation for multi-process support; specifically,
-// each guest process would have their own `Context` but would share the resolver. Currently, the
-// interfaces do not show the full actual separated context support (yet!); instead, callers share
-// the single `migration_context` below. Nonetheless, future changes will separate this out.
 pub struct Resolver<
     Platform: sync::RawSyncPrimitivesProvider,
     Backend: super::backend::Backend + 'static,
 > {
     litebox: LiteBox<Platform>,
     backend: Backend,
-    /// Stand-in for the per-caller context, until callers own their own. See the note above.
-    migration_context: Context,
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
@@ -48,20 +42,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         Self {
             litebox: litebox.clone(),
             backend,
-            migration_context: Context::new(),
         }
-    }
-
-    /// Set the acting user for all subsequent operations, returning the previous one.
-    ///
-    /// Non-test callers set up whatever needs a different user while constructing the backend;
-    /// this exists so that the tests can exercise operations that depend on the acting user.
-    ///
-    /// TODO(jayb): transitionary `pub(super)` accessor; this should go away once callers own their
-    /// own [`Context`], at which point they can set the acting user directly.
-    #[cfg(test)]
-    pub(super) fn swap_acting_user(&mut self, user: UserInfo) -> UserInfo {
-        core::mem::replace(&mut self.migration_context.user_info, user)
     }
 
     /// Direct access to the backend, so that the tests can reach backend-owned state (namely its
@@ -87,6 +68,20 @@ pub struct Context {
 }
 
 impl Context {
+    /// Set the acting user for all subsequent operations on this context, returning the previous
+    /// one.
+    ///
+    /// Non-test callers set up whatever needs a different user while constructing the backend;
+    /// this exists so that the tests can exercise operations that depend on the acting user.
+    ///
+    /// TODO(DO NOT COMMIT): Temporarily still kept as test-only, but within the same PR, we should
+    /// expose getters/setters for the context, or maybe make the fields public, while also making
+    /// it non-exhaustive or something?
+    #[cfg(test)]
+    pub(super) fn swap_acting_user(&mut self, user: UserInfo) -> UserInfo {
+        core::mem::replace(&mut self.user_info, user)
+    }
+
     /// A new default context, anchored at `/` for a non-root user.
     pub fn new() -> Context {
         Self {
@@ -419,16 +414,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     }
 }
 
-// NOTE(jayb): purely as a migration feature, until we have completely separated contexts. See
-// comment on [`Resolver`].
-impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
-    Resolver<Platform, Backend>
-{
-    fn context_pre_context_management_changes(&self) -> &Context {
-        &self.migration_context
-    }
-}
-
 impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
     Resolver<Platform, Backend>
 {
@@ -437,6 +422,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     /// The `mode` is only significant when creating a file
     pub fn open(
         &self,
+        context: &Context,
         path: impl Arg,
         mut flags: OFlags,
         mode: Mode,
@@ -465,7 +451,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             flags &= OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
         }
 
-        let context = self.context_pre_context_management_changes();
         let path = context.resolve(path)?;
         let access_mode = flags & (OFlags::WRONLY | OFlags::RDWR);
         let read_allowed = access_mode == OFlags::RDONLY || access_mode == OFlags::RDWR;
@@ -784,8 +769,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     }
 
     /// Change the permissions of a file
-    pub fn chmod(&self, path: impl Arg, mode: Mode) -> Result<(), ChmodError> {
-        let context = self.context_pre_context_management_changes();
+    pub fn chmod(&self, context: &Context, path: impl Arg, mode: Mode) -> Result<(), ChmodError> {
         let path = context.resolve(path)?;
         let handle = self
             .path_handle(context, &path)
@@ -799,11 +783,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     /// Change the owner of a file
     pub fn chown(
         &self,
+        context: &Context,
         path: impl Arg,
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError> {
-        let context = self.context_pre_context_management_changes();
         let path = context.resolve(path)?;
         let handle = self
             .path_handle(context, &path)
@@ -815,8 +799,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     }
 
     /// Unlink a file
-    pub fn unlink(&self, path: impl Arg) -> Result<(), UnlinkError> {
-        let context = self.context_pre_context_management_changes();
+    pub fn unlink(&self, context: &Context, path: impl Arg) -> Result<(), UnlinkError> {
         let path = context.resolve(path)?;
         let Some((parent, name)) =
             self.parent_dir_and_name(context, &path)
@@ -840,8 +823,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     }
 
     /// Create a new directory
-    pub fn mkdir(&self, path: impl Arg, mode: Mode) -> Result<(), MkdirError> {
-        let context = self.context_pre_context_management_changes();
+    pub fn mkdir(&self, context: &Context, path: impl Arg, mode: Mode) -> Result<(), MkdirError> {
         let path = context.resolve(path)?;
         let Some((parent, name)) =
             self.parent_dir_and_name(context, &path)
@@ -865,8 +847,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     }
 
     /// Remove a directory
-    pub fn rmdir(&self, path: impl Arg) -> Result<(), RmdirError> {
-        let context = self.context_pre_context_management_changes();
+    pub fn rmdir(&self, context: &Context, path: impl Arg) -> Result<(), RmdirError> {
         let path = context.resolve(path)?;
         let Some((parent, name)) =
             self.parent_dir_and_name(context, &path)
@@ -929,9 +910,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         clippy::missing_panics_doc,
         reason = "`CloseError` is uninhabited, so the internal close cannot fail"
     )]
-    pub fn file_status(&self, path: impl Arg) -> Result<super::FileStatus, FileStatusError> {
+    pub fn file_status(
+        &self,
+        context: &Context,
+        path: impl Arg,
+    ) -> Result<super::FileStatus, FileStatusError> {
         let fd = self
-            .open(path, OFlags::PATH, Mode::empty())
+            .open(context, path, OFlags::PATH, Mode::empty())
             .map_err(|error| match error {
                 OpenError::PathError(error) => error.into(),
                 OpenError::Io

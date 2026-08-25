@@ -51,6 +51,8 @@ pub(crate) struct FsState<Platform: ShimPlatform> {
     ///
     /// Must end with a '/'.
     cwd: litebox::sync::RwLock<Platform, String>,
+    // TODO(jayb): simplify by removing [`FsState::cwd`] and instead use this
+    pub(crate) context: litebox::fs::resolver::Context,
 }
 
 impl<Platform: ShimPlatform> Clone for FsState<Platform> {
@@ -58,6 +60,7 @@ impl<Platform: ShimPlatform> Clone for FsState<Platform> {
         Self {
             umask: self.umask.load(Ordering::Relaxed).into(),
             cwd: litebox::sync::RwLock::new(self.cwd.read().clone()),
+            context: self.context.clone(),
         }
     }
 }
@@ -67,6 +70,7 @@ impl<Platform: ShimPlatform> FsState<Platform> {
         Self {
             umask: (Mode::WGRP | Mode::WOTH).bits().into(),
             cwd: litebox::sync::RwLock::new(String::from("/")),
+            context: litebox::fs::resolver::Context::new(),
         }
     }
 
@@ -230,10 +234,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
         mode: Mode,
     ) -> Result<FileFd<Platform>, Errno> {
         let mode = mode & !self.get_umask();
-        self.files
-            .borrow()
+        let files = self.files.borrow();
+        files
             .fs
-            .open(path, flags - OFlags::CLOEXEC, mode)
+            .open(
+                &self.fs.borrow().context,
+                path,
+                flags - OFlags::CLOEXEC,
+                mode,
+            )
             .map_err(Errno::from)
     }
 
@@ -368,10 +377,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
 
         let path = self.resolve_path_at(dirfd, pathname)?;
+        let files = self.files.borrow();
         if flags.contains(AtFlags::AT_REMOVEDIR) {
-            self.files.borrow().fs.rmdir(path).map_err(Errno::from)
+            files
+                .fs
+                .rmdir(&self.fs.borrow().context, path)
+                .map_err(Errno::from)
         } else {
-            self.files.borrow().fs.unlink(path).map_err(Errno::from)
+            files
+                .fs
+                .unlink(&self.fs.borrow().context, path)
+                .map_err(Errno::from)
         }
     }
 
@@ -729,10 +745,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     fn do_mkdir(&self, pathname: impl path::Arg, mode: Mode) -> Result<(), Errno> {
         let mode = mode & !self.get_umask();
-        self.files
-            .borrow()
+        let files = self.files.borrow();
+        files
             .fs
-            .mkdir(pathname, mode)
+            .mkdir(&self.fs.borrow().context, pathname, mode)
             .map_err(Errno::from)
     }
 
@@ -1152,7 +1168,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         mode: AccessFlags,
         caller: AccessUserInfo,
     ) -> Result<(), Errno> {
-        let status = self.files.borrow().fs.file_status(pathname)?;
+        let status = {
+            let files = self.files.borrow();
+            files.fs.file_status(&self.fs.borrow().context, pathname)?
+        };
         let owner = status.owner.into();
         Self::do_access_mode(status.mode, owner, caller, &mode)
     }
@@ -1368,7 +1387,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         } else {
             normalized_path
         };
-        let status = self.files.borrow().fs.file_status(path)?;
+        let status = {
+            let files = self.files.borrow();
+            files.fs.file_status(&self.fs.borrow().context, path)?
+        };
         Ok(T::from(status))
     }
 
@@ -1412,7 +1434,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 self.do_stat(path, !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW))
             }
             FsPath::Cwd if flags.contains(AtFlags::AT_EMPTY_PATH) => {
-                Ok(T::from(self.files.borrow().fs.file_status(get_cwd())?))
+                let files = self.files.borrow();
+                Ok(T::from(
+                    files.fs.file_status(&self.fs.borrow().context, get_cwd())?,
+                ))
             }
             FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
                 descriptor_stat(fd as usize, self)
@@ -1705,7 +1730,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let abs_path = resolved.normalized().map_err(|_| Errno::EINVAL)?;
 
         // Verify the path exists and is a directory.
-        match self.files.borrow().fs.file_status(abs_path.as_str()) {
+        let files = self.files.borrow();
+        match files
+            .fs
+            .file_status(&self.fs.borrow().context, abs_path.as_str())
+        {
             Ok(status) => {
                 if status.file_type != FileType::Directory {
                     return Err(Errno::ENOTDIR);
