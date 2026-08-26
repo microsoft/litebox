@@ -145,6 +145,29 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
+    pub(crate) fn sys_nt_delay_execution(
+        &self,
+        alertable: bool,
+        delay_interval: ConstPtr<Platform, i64>,
+    ) -> NtStatus {
+        let Some(delay_interval) = delay_interval.read_at_offset(0) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        if alertable {
+            // TODO(windows-apc): deliver user APCs during alertable delays.
+            litebox_util_log::debug!("Treating alertable delay as non-alertable");
+        }
+
+        match self
+            .wait_cx()
+            .with_timeout(Some(self.wait_timeout_duration(delay_interval)))
+            .sleep()
+        {
+            WaitError::TimedOut => NtStatus::SUCCESS,
+            WaitError::Interrupted => NtStatus::ALERTED,
+        }
+    }
+
     fn duration_from_100ns(intervals: u64) -> core::time::Duration {
         const INTERVALS_PER_SECOND: u64 = 10_000_000;
 
@@ -172,5 +195,29 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .unwrap_or_default();
         let windows_now = core::time::Duration::from_secs(WINDOWS_TO_UNIX_EPOCH_SECONDS) + unix_now;
         target.saturating_sub(windows_now)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::{const_ptr, null_const_ptr, run_with_test_platform_pointers};
+
+    #[test]
+    fn nt_delay_execution_validates_interval_and_completes_zero_delay() {
+        run_with_test_platform_pointers(|| {
+            let task = crate::tests::test_task();
+
+            assert_eq!(
+                task.sys_nt_delay_execution(false, null_const_ptr()),
+                NtStatus::ACCESS_VIOLATION
+            );
+
+            let interval = 0;
+            assert_eq!(
+                task.sys_nt_delay_execution(false, const_ptr(&interval)),
+                NtStatus::SUCCESS
+            );
+        });
     }
 }
