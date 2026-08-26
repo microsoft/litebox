@@ -982,24 +982,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return;
         }
 
-        if NtSysno::from_raw(ctx.orig_rax).is_none() {
-            let caller = if ctx.rsp == 0 {
-                0
-            } else {
-                ConstPtr::<Platform, usize>::from_usize(ctx.rsp)
-                    .read_at_offset(0)
-                    .unwrap_or_default()
-            };
-            litebox_util_log::error!(
-                syscall_number:% = format_args!("{:#x}", ctx.orig_rax),
-                rip:% = format_args!("{:#x}", ctx.rip),
-                caller:% = format_args!("{caller:#x}");
-                "Unsupported Windows syscall"
-            );
-            ctx.rax = NtStatus::NOT_SUPPORTED.as_raw().cast_unsigned() as usize;
-            return;
-        }
-
         let Some(req) = SyscallRequest::<Platform>::try_from_raw(ctx) else {
             let caller = ConstPtr::<Platform, usize>::from_usize(ctx.rsp)
                 .read_at_offset(0)
