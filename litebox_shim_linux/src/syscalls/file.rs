@@ -62,10 +62,21 @@ impl<Platform: ShimPlatform> Clone for FsState<Platform> {
 }
 
 impl<Platform: ShimPlatform> FsState<Platform> {
-    pub fn new() -> Self {
+    /// Create the state for a task running as `credentials`.
+    pub fn new(credentials: &super::process::Credentials) -> Self {
+        let user_info = litebox::fs::UserInfo {
+            // XXX: Linux ids are 32-bit, but the core litebox file system uses 16-bit ones, so we
+            // may need to widen `UserInfo`.
+            user: u16::try_from(credentials.euid)
+                .unwrap_or_else(|_| unimplemented!("{}", credentials.euid)),
+            group: u16::try_from(credentials.egid)
+                .unwrap_or_else(|_| unimplemented!("{}", credentials.egid)),
+        };
+        let mut context = litebox::fs::resolver::Context::new();
+        context.set_acting_user(user_info);
         Self {
             umask: (Mode::WGRP | Mode::WOTH).bits().into(),
-            context: litebox::sync::RwLock::new(litebox::fs::resolver::Context::new()),
+            context: litebox::sync::RwLock::new(context),
         }
     }
 

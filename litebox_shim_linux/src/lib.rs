@@ -265,7 +265,13 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
         let files = syscalls::file::FilesState::new(fs);
         files.set_max_fd(syscalls::process::RLIMIT_NOFILE_CUR - 1);
         let files = Arc::new(files);
-        let fs_state = Arc::new(syscalls::file::FsState::new());
+        let credentials = Arc::new(syscalls::process::Credentials {
+            uid,
+            euid,
+            gid,
+            egid,
+        });
+        let fs_state = Arc::new(syscalls::file::FsState::new(&credentials));
         files.initialize_stdio_in_shared_descriptors_table(&self.0, &fs_state.context.read());
 
         let entrypoints = crate::LinuxShimEntrypoints {
@@ -277,13 +283,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
                 pid,
                 ppid,
                 tid: pid,
-                credentials: syscalls::process::Credentials {
-                    uid,
-                    euid,
-                    gid,
-                    egid,
-                }
-                .into(),
+                credentials,
                 comm: [0; litebox_common_linux::TASK_COMM_LEN].into(), // set at load time
                 fs: fs_state.into(),
                 files: files.into(),
@@ -1228,7 +1228,13 @@ mod test_utils {
                 .next_thread_id
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             let files = Arc::new(syscalls::file::FilesState::new(fs));
-            let fs_state = Arc::new(syscalls::file::FsState::new());
+            let credentials = Arc::new(syscalls::process::Credentials {
+                uid: 0,
+                euid: 0,
+                gid: 0,
+                egid: 0,
+            });
+            let fs_state = Arc::new(syscalls::file::FsState::new(&credentials));
             files.initialize_stdio_in_shared_descriptors_table(&self, &fs_state.context.read());
             Task {
                 wait_state: wait::WaitState::new(self.platform),
@@ -1236,12 +1242,7 @@ mod test_utils {
                 pid,
                 ppid: 0,
                 tid: pid,
-                credentials: Arc::new(syscalls::process::Credentials {
-                    uid: 0,
-                    euid: 0,
-                    gid: 0,
-                    egid: 0,
-                }),
+                credentials,
                 comm: Cell::new(*b"test\0\0\0\0\0\0\0\0\0\0\0\0"),
                 fs: fs_state.into(),
                 files: files.into(),
