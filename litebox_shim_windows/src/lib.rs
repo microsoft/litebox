@@ -676,6 +676,13 @@ impl<Platform: ShimPlatform> Process<Platform> {
             .collect()
     }
 
+    fn thread_by_id(
+        &self,
+        thread_id: usize,
+    ) -> Option<Arc<syscalls::thread::ThreadObject<Platform>>> {
+        self.threads.read().threads.get(&thread_id).cloned()
+    }
+
     /// Wait for the process to exit, returning its exit code.
     ///
     /// Currently a placeholder that returns a fixed exit code immediately.

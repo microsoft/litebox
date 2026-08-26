@@ -5,7 +5,7 @@ use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 
 use int_enum::IntEnum;
 use litebox::event::{Events, IOPollable, observer::Observer, polling::Pollee};
@@ -112,6 +112,9 @@ pub(crate) struct ThreadObject<Platform: ShimPlatform> {
     /// Set when the thread has been asked to exit, either by its own
     /// termination request or by a process-wide exit.
     is_exiting: AtomicBool,
+    suspend_count: AtomicU32,
+    alert_address: AtomicUsize,
+    alerted: AtomicBool,
     /// Handle used to interrupt the thread, published once by the thread itself
     /// when it starts running. Empty until then.
     wait_handle: once_cell::race::OnceBox<litebox::event::wait::ThreadHandle<Platform>>,
@@ -124,6 +127,10 @@ impl<Platform: ShimPlatform> ThreadObject<Platform> {
     const COMPLETE: u8 = 2;
 
     pub(crate) fn new(thread_id: usize, teb_address: usize) -> Self {
+        Self::new_with_suspend_count(thread_id, teb_address, 0)
+    }
+
+    fn new_with_suspend_count(thread_id: usize, teb_address: usize, suspend_count: u32) -> Self {
         Self {
             thread_id,
             teb_address,
@@ -131,6 +138,9 @@ impl<Platform: ShimPlatform> ThreadObject<Platform> {
             exit_status: core::sync::atomic::AtomicI32::new(NtStatus::PENDING.as_raw()),
             pollee: Pollee::new(),
             is_exiting: AtomicBool::new(false),
+            suspend_count: AtomicU32::new(suspend_count),
+            alert_address: AtomicUsize::new(0),
+            alerted: AtomicBool::new(false),
             wait_handle: once_cell::race::OnceBox::new(),
             owned_mutants: Mutex::new(Vec::new()),
         }
@@ -169,6 +179,60 @@ impl<Platform: ShimPlatform> ThreadObject<Platform> {
             if let Some(mutant) = mutant.upgrade() {
                 mutant.abandon(thread_id);
             }
+        }
+    }
+
+    fn new_suspended(thread_id: usize, teb_address: usize) -> Self {
+        Self::new_with_suspend_count(thread_id, teb_address, 1)
+    }
+
+    pub(crate) fn is_suspended(&self) -> bool {
+        self.suspend_count.load(Ordering::Acquire) != 0
+    }
+
+    fn resume(&self) -> u32 {
+        let mut previous = self.suspend_count.load(Ordering::Acquire);
+        loop {
+            if previous == 0 {
+                return 0;
+            }
+            match self.suspend_count.compare_exchange_weak(
+                previous,
+                previous - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    if previous == 1
+                        && let Some(handle) = self.wait_handle.get()
+                    {
+                        handle.interrupt();
+                    }
+                    return previous;
+                }
+                Err(current) => previous = current,
+            }
+        }
+    }
+
+    fn begin_alert_wait(&self, address: usize) {
+        self.alert_address.store(address, Ordering::Release);
+    }
+
+    fn take_alert(&self, _address: usize) -> bool {
+        self.alerted.swap(false, Ordering::AcqRel)
+    }
+
+    fn end_alert_wait(&self, address: usize) {
+        let _ =
+            self.alert_address
+                .compare_exchange(address, 0, Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    fn alert(&self) {
+        self.alerted.store(true, Ordering::Release);
+        if let Some(handle) = self.wait_handle.get() {
+            handle.interrupt();
         }
     }
 
@@ -325,8 +389,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::INVALID_HANDLE;
         }
         let create_flags = ThreadCreateFlags::from_bits_retain(create_flags);
-        if !create_flags.is_empty() {
-            // TODO(thread-model): support suspended creation and the remaining native flags.
+        if !create_flags
+            .difference(ThreadCreateFlags::CREATE_SUSPENDED)
+            .is_empty()
+        {
             litebox_util_log::debug!(
                 create_flags:? = create_flags;
                 "Rejecting NtCreateThreadEx with unsupported creation flags"
@@ -389,7 +455,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         child_ctx.rcx = environment.context;
         child_ctx.rdx = ntdll.mapping.base_addr;
 
-        let thread = Arc::new(ThreadObject::new(thread_id, environment.teb));
+        let thread = Arc::new(
+            if create_flags.contains(ThreadCreateFlags::CREATE_SUSPENDED) {
+                ThreadObject::new_suspended(thread_id, environment.teb)
+            } else {
+                ThreadObject::new(thread_id, environment.teb)
+            },
+        );
         if !self.process.attach_thread(thread_id, &thread) {
             // The process is tearing down; refuse to start another thread.
             return NtStatus::PROCESS_IS_TERMINATING;
@@ -435,6 +507,77 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if thread_handle.write_at_offset(0, handle).is_none() {
             return NtStatus::ACCESS_VIOLATION;
         }
+        NtStatus::SUCCESS
+    }
+
+    pub(crate) fn sys_nt_resume_thread(
+        &self,
+        thread_handle: ThreadHandle,
+        previous_suspend_count: Option<MutPtr<Platform, u32>>,
+    ) -> NtStatus {
+        if let Some(previous_suspend_count) = previous_suspend_count
+            && let Err(status) =
+                probe_guest_output_preserving_value::<Platform, _>(previous_suspend_count)
+        {
+            return status;
+        }
+        let entry = match self.typed_handle_entry_with_access::<ThreadSubsystem<Platform>>(
+            thread_handle.as_handle(),
+            ThreadAccess::SUSPEND_RESUME.bits(),
+        ) {
+            Ok(entry) => entry,
+            Err(status) => return status,
+        };
+        let previous = entry.with_entry(|entry| entry.thread.resume());
+        if let Some(previous_suspend_count) = previous_suspend_count
+            && previous_suspend_count
+                .write_at_offset(0, previous)
+                .is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        NtStatus::SUCCESS
+    }
+
+    pub(crate) fn sys_nt_wait_for_alert_by_thread_id(
+        &self,
+        address: usize,
+        timeout: Option<ConstPtr<Platform, i64>>,
+    ) -> NtStatus {
+        let timeout = match timeout {
+            Some(timeout) => match timeout.read_at_offset(0) {
+                Some(timeout) => Some(self.wait_timeout_duration(timeout)),
+                None => return NtStatus::ACCESS_VIOLATION,
+            },
+            None => None,
+        };
+        self.thread_object.begin_alert_wait(address);
+        let result = self
+            .wait_until(timeout, || self.thread_object.take_alert(address));
+        self.thread_object.end_alert_wait(address);
+        match result {
+            Ok(()) | Err(litebox::event::wait::WaitError::Interrupted) => NtStatus::ALERTED,
+            Err(litebox::event::wait::WaitError::TimedOut) => NtStatus::TIMEOUT,
+        }
+    }
+
+    pub(crate) fn sys_nt_alert_thread_by_thread_id_ex(
+        &self,
+        thread_id: usize,
+        _lock: usize,
+    ) -> NtStatus {
+        let Some(thread) = self.process.thread_by_id(thread_id) else {
+            return NtStatus::INVALID_CID;
+        };
+        thread.alert();
+        NtStatus::SUCCESS
+    }
+
+    pub(crate) fn sys_nt_alert_thread_by_thread_id(&self, thread_id: usize) -> NtStatus {
+        let Some(thread) = self.process.thread_by_id(thread_id) else {
+            return NtStatus::INVALID_CID;
+        };
+        thread.alert();
         NtStatus::SUCCESS
     }
 

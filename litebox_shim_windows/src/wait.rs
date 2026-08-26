@@ -23,6 +23,11 @@ impl<Platform: ShimPlatform> WaitState<Platform> {
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    /// Returns a wait context to use to perform interruptible waits.
+    fn wait_cx(&self) -> litebox::event::wait::WaitContext<'_, Platform> {
+        self.wait_state.0.context().with_check_for_interrupt(self)
+    }
+
     pub(crate) fn wait_on_events<R, E>(
         &self,
         nonblock: bool,
@@ -42,12 +47,24 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         self.suspend_io_completion_worker();
         let _resume_worker = litebox::utils::defer(|| self.resume_io_completion_worker());
         let wait_context = self
-            .wait_state
-            .0
-            .context()
-            .with_check_for_interrupt(self)
+            .wait_cx()
             .with_timeout(timeout);
         wait_context.wait_on_events(false, events, register_observer, try_op)
+    }
+
+    pub(crate) fn wait_until(
+        &self,
+        timeout: Option<core::time::Duration>,
+        mut ready: impl FnMut() -> bool,
+    ) -> Result<(), litebox::event::wait::WaitError> {
+        if ready() {
+            return Ok(());
+        }
+        self.suspend_io_completion_worker();
+        let _resume_worker = litebox::utils::defer(|| self.resume_io_completion_worker());
+        self.wait_cx()
+            .with_timeout(timeout)
+            .wait_until(ready)
     }
 
     /// Publishes the handle used by other threads to interrupt this one.
@@ -67,6 +84,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// exit instead.
     #[must_use]
     pub(crate) fn prepare_to_run_guest(&self, _ctx: &mut litebox_common_linux::PtRegs) -> bool {
+        if self.thread_object.is_suspended() {
+            self.publish_thread_handle();
+            let _ = self
+                .wait_until(None, || !self.thread_object.is_suspended());
+        }
         self.wait_state.0.prepare_to_run_guest(|| {
             // TODO(windows-apc): deliver pending user-mode APCs and alerts here.
             !self.thread_object.is_exiting()
