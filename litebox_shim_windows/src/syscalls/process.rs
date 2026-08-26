@@ -34,7 +34,7 @@ enum ProcessInformationClass {
     TlsInformation = 35,
     Cookie = 36,
     ConsoleHostProcess = 49,
-    ImageInformation = 53,
+    DynamicFunctionTableInformation = 53,
     SchedulerSharedData = 112,
 }
 
@@ -90,7 +90,8 @@ struct ProcessTlsInformationHeader {
 #[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
 struct ProcessTlsInformationExtendedHeader {
     header: ProcessTlsInformationHeader,
-    _reserved: usize,
+    previous_count: u32,
+    _padding0: u32,
 }
 
 #[repr(C)]
@@ -109,7 +110,7 @@ struct ProcessTlsThreadDataExtended {
     _padding0: u32,
     new_tls_data: usize,
     old_tls_data: usize,
-    _reserved: usize,
+    thread_id: usize,
 }
 
 enum ProcessTlsThreadData<Platform: RawPointerProvider> {
@@ -217,6 +218,21 @@ impl ProcessTlsLayout {
         }
     }
 
+    fn previous_count<Platform: RawPointerProvider>(
+        self,
+        base: MutPtr<Platform, u8>,
+        header: ProcessTlsInformationHeader,
+    ) -> Option<usize> {
+        match self {
+            Self::Simple => Some(header.tls_index as usize),
+            Self::Extended => crate::read_field_at_offset::<Platform, u32>(
+                base.as_usize(),
+                offset_of!(ProcessTlsInformationExtendedHeader, previous_count),
+            )
+            .map(|count| count as usize),
+        }
+    }
+
     fn thread_data<Platform: RawPointerProvider>(
         self,
         base: MutPtr<Platform, u8>,
@@ -308,7 +324,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             ),
             ProcessInformationClass::ConsoleHostProcess
             | ProcessInformationClass::TlsInformation
-            | ProcessInformationClass::ImageInformation
+            | ProcessInformationClass::DynamicFunctionTableInformation
             | ProcessInformationClass::SchedulerSharedData => {
                 litebox_util_log::debug!(
                     process_information_class:? = process_information_class;
@@ -359,6 +375,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 process_information,
                 process_information_length,
             ),
+            ProcessInformationClass::DynamicFunctionTableInformation => {
+                Self::set_process_dynamic_function_table_information(
+                    process_handle,
+                    process_information,
+                    process_information_length,
+                )
+            }
             // TODO: implement additional settable process information classes when a guest
             // exercises them.
             ProcessInformationClass::BasicInformation
@@ -367,8 +390,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             | ProcessInformationClass::Wow64Information
             | ProcessInformationClass::DebugFlags
             | ProcessInformationClass::Cookie
-            | ProcessInformationClass::ConsoleHostProcess
-            | ProcessInformationClass::ImageInformation => {
+            | ProcessInformationClass::ConsoleHostProcess => {
                 litebox_util_log::debug!(
                     process_information_class:? = process_information_class;
                     "Unsupported NtSetInformationProcess class"
@@ -386,6 +408,35 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         status
+    }
+
+    fn set_process_dynamic_function_table_information(
+        process_handle: ProcessHandle,
+        process_information: MutPtr<Platform, u8>,
+        process_information_length: u32,
+    ) -> NtStatus {
+        const INFORMATION_LENGTH: u32 = 16;
+
+        if !process_handle.is_current() {
+            return NtStatus::INVALID_HANDLE;
+        }
+        if process_information_length != INFORMATION_LENGTH {
+            return NtStatus::INFO_LENGTH_MISMATCH;
+        }
+        let table = MutPtr::<Platform, usize>::from_usize(process_information.as_usize());
+        let Some(table) = table.read_at_offset(0) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        let Some(remove) =
+            process_information.read_at_offset(size_of::<usize>().try_into().unwrap())
+        else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        if table == 0 || remove > 1 {
+            return NtStatus::INVALID_PARAMETER;
+        }
+
+        NtStatus::SUCCESS
     }
 
     fn write_process_information<T: Immutable + IntoBytes>(
@@ -508,6 +559,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         header: ProcessTlsInformationHeader,
         layout: ProcessTlsLayout,
     ) -> NtStatus {
+        let Some(previous_count) = layout.previous_count::<Platform>(process_information, header)
+        else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
         for index in 0..header.thread_data_count as usize {
             let Some(thread_data) = layout.thread_data::<Platform>(process_information, index)
             else {
@@ -531,7 +586,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 "Replacing process TLS vector"
             );
 
-            if let Err(status) = self.copy_initial_tls_slots(old_tls_data, new_tls_data) {
+            if let Err(status) = Self::copy_tls_slots(old_tls_data, new_tls_data, previous_count) {
                 return status;
             }
             let old_tls_data_for_guest = self.guest_visible_old_tls_vector(old_tls_data);
@@ -541,10 +596,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             {
                 return NtStatus::ACCESS_VIOLATION;
             }
-            if old_tls_data_for_guest == 0
-                && thread_data
-                    .write_flags(ProcessTlsThreadDataFlags::OLD_DATA_WRITTEN)
-                    .is_none()
+            if thread_data
+                .write_flags(ProcessTlsThreadDataFlags::OLD_DATA_WRITTEN)
+                .is_none()
             {
                 return NtStatus::ACCESS_VIOLATION;
             }
@@ -625,10 +679,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
-    fn copy_initial_tls_slots(
-        &self,
+    fn copy_tls_slots(
         old_tls_data: usize,
         new_tls_data: usize,
+        count: usize,
     ) -> Result<(), NtStatus> {
         if old_tls_data <= 0x10010 || new_tls_data <= 0x10010 {
             return Ok(());
@@ -643,7 +697,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
         let old_tls_slots = ConstPtr::<Platform, usize>::from_usize(old_tls_data);
         let new_tls_slots = MutPtr::<Platform, usize>::from_usize(new_tls_data);
-        for index in 0..TEB_TLS_SLOT_COUNT.cast_signed() {
+        for index in 0..count.cast_signed() {
             let slot_value = old_tls_slots
                 .read_at_offset(index)
                 .ok_or(NtStatus::ACCESS_VIOLATION)?;
@@ -700,6 +754,19 @@ mod tests {
     use crate::tests::{mut_byte_ptr, mut_ptr, null_mut_ptr, run_with_test_platform_pointers};
 
     const RETURN_LENGTH_SENTINEL: u32 = 0xaaaa_aaaa;
+
+    #[test]
+    fn process_tls_layout_matches_windows_abi() {
+        assert_eq!(size_of::<ProcessTlsInformationHeader>(), 16);
+        assert_eq!(size_of::<ProcessTlsThreadDataSimple>(), 24);
+        assert_eq!(offset_of!(ProcessTlsThreadDataSimple, tls_data), 8);
+
+        assert_eq!(size_of::<ProcessTlsInformationExtendedHeader>(), 24);
+        assert_eq!(size_of::<ProcessTlsThreadDataExtended>(), 32);
+        assert_eq!(offset_of!(ProcessTlsThreadDataExtended, new_tls_data), 8);
+        assert_eq!(offset_of!(ProcessTlsThreadDataExtended, old_tls_data), 16);
+        assert_eq!(offset_of!(ProcessTlsThreadDataExtended, thread_id), 24);
+    }
 
     #[test]
     fn nt_query_information_process_validates_arguments() {

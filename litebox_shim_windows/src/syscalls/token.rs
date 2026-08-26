@@ -231,6 +231,14 @@ pub(crate) struct TokenPrivileges {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, FromBytes, Immutable, IntoBytes, PartialEq)]
+struct TokenBnoIsolationInformation {
+    isolation_prefix: usize,
+    isolation_enabled: u8,
+    padding: [u8; 7],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, FromBytes, Immutable, IntoBytes, PartialEq)]
 pub(crate) struct TokenStatistics {
     token_id: Luid,
     authentication_id: Luid,
@@ -404,60 +412,83 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return status;
         }
 
-        let entry = match self.typed_handle_entry_with_access::<TokenSubsystem>(
-            token_handle,
-            TokenAccess::QUERY.bits(),
-        ) {
-            Ok(entry) => entry,
-            Err(status) => return status,
+        let token = if token_handle == Self::CURRENT_PROCESS_TOKEN
+            || token_handle == Self::CURRENT_THREAD_EFFECTIVE_TOKEN
+        {
+            Arc::clone(&self.process.token)
+        } else if token_handle == Self::CURRENT_THREAD_TOKEN {
+            return NtStatus::NO_TOKEN;
+        } else {
+            match self.typed_handle_entry_with_access::<TokenSubsystem>(
+                token_handle,
+                TokenAccess::QUERY.bits(),
+            ) {
+                Ok(entry) => entry.with_entry(|entry| Arc::clone(&entry.token)),
+                Err(status) => return status,
+            }
         };
 
         match class {
-            TokenInformationClass::User => entry.with_entry(|entry| {
-                Self::write_token_information_value(
-                    token_information,
-                    token_information_length,
-                    return_length,
-                    || {
-                        let sid_address = token_information
-                            .as_usize()
-                            .checked_add(size_of::<TokenUser>())
-                            .ok_or(NtStatus::ACCESS_VIOLATION)?;
-                        Ok(TokenUserInformation {
-                            user: TokenUser {
-                                user: SidAndAttributes {
-                                    sid: sid_address,
-                                    attributes: 0,
-                                    padding: 0,
-                                },
+            TokenInformationClass::User => Self::write_token_information_value(
+                token_information,
+                token_information_length,
+                return_length,
+                || {
+                    let sid_address = token_information
+                        .as_usize()
+                        .checked_add(size_of::<TokenUser>())
+                        .ok_or(NtStatus::ACCESS_VIOLATION)?;
+                    Ok(TokenUserInformation {
+                        user: TokenUser {
+                            user: SidAndAttributes {
+                                sid: sid_address,
+                                attributes: 0,
+                                padding: 0,
                             },
-                            sid: entry.token.user,
-                        })
-                    },
-                )
-            }),
+                        },
+                        sid: token.user,
+                    })
+                },
+            ),
             TokenInformationClass::Privileges => Self::write_token_information_value(
                 token_information,
                 token_information_length,
                 return_length,
                 || Ok(TokenPrivileges { privilege_count: 0 }),
             ),
-            TokenInformationClass::Statistics => entry.with_entry(|entry| {
-                Self::write_token_information_value(
-                    token_information,
-                    token_information_length,
-                    return_length,
-                    || Ok(entry.token.statistics),
-                )
-            }),
-            TokenInformationClass::SecurityAttributes => entry.with_entry(|entry| {
-                Self::write_token_security_attributes(
-                    &entry.token.security_attributes,
-                    token_information,
-                    token_information_length,
-                    return_length,
-                )
-            }),
+            TokenInformationClass::Statistics => Self::write_token_information_value(
+                token_information,
+                token_information_length,
+                return_length,
+                || Ok(token.statistics),
+            ),
+            TokenInformationClass::SessionId
+            | TokenInformationClass::Elevation
+            | TokenInformationClass::IsAppContainer
+            | TokenInformationClass::PrivateNameSpace => Self::write_token_information_value(
+                token_information,
+                token_information_length,
+                return_length,
+                || Ok(0_u32),
+            ),
+            TokenInformationClass::BnoIsolation => Self::write_token_information_value(
+                token_information,
+                token_information_length,
+                return_length,
+                || {
+                    Ok(TokenBnoIsolationInformation {
+                        isolation_prefix: 0,
+                        isolation_enabled: 0,
+                        padding: [0; 7],
+                    })
+                },
+            ),
+            TokenInformationClass::SecurityAttributes => Self::write_token_security_attributes(
+                &token.security_attributes,
+                token_information,
+                token_information_length,
+                return_length,
+            ),
             _ => {
                 // TODO(token-model): Add each information class when its backing token state is
                 // modeled; do not synthesize security-sensitive token data.
@@ -720,8 +751,8 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 mod tests {
     use super::*;
     use crate::tests::{
-        const_ptr, mut_byte_ptr, mut_ptr, null_const_ptr, null_mut_ptr, test_task, unicode_string,
-        utf16_units,
+        TestFS, TestPlatform, const_ptr, mut_byte_ptr, mut_ptr, null_const_ptr, null_mut_ptr,
+        test_task, unicode_string, utf16_units,
     };
 
     #[repr(C)]
@@ -793,6 +824,57 @@ mod tests {
         );
         assert_eq!(output.user.user.attributes, 0);
         assert_eq!(output.sid, LOCAL_SYSTEM_SID);
+    }
+
+    #[test]
+    fn process_token_is_not_in_a_private_namespace() {
+        let task = test_task();
+        let mut output = u32::MAX;
+        let mut return_length = 0;
+
+        assert_eq!(
+            task.sys_nt_query_information_token(
+                Task::<TestPlatform, TestFS>::CURRENT_PROCESS_TOKEN,
+                TokenInformationClass::PrivateNameSpace as u32,
+                mut_byte_ptr(&mut output),
+                size_of_val(&output).try_into().unwrap(),
+                mut_ptr(&mut return_length),
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(output, 0);
+        assert_eq!(return_length as usize, size_of_val(&output));
+    }
+
+    #[test]
+    fn process_token_has_bno_isolation_disabled() {
+        let task = test_task();
+        let mut output = TokenBnoIsolationInformation {
+            isolation_prefix: usize::MAX,
+            isolation_enabled: u8::MAX,
+            padding: [u8::MAX; 7],
+        };
+        let mut return_length = 0;
+
+        assert_eq!(
+            task.sys_nt_query_information_token(
+                Task::<TestPlatform, TestFS>::CURRENT_PROCESS_TOKEN,
+                TokenInformationClass::BnoIsolation as u32,
+                mut_byte_ptr(&mut output),
+                size_of_val(&output).try_into().unwrap(),
+                mut_ptr(&mut return_length),
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(
+            output,
+            TokenBnoIsolationInformation {
+                isolation_prefix: 0,
+                isolation_enabled: 0,
+                padding: [0; 7],
+            }
+        );
+        assert_eq!(return_length as usize, size_of_val(&output));
     }
 
     #[test]
