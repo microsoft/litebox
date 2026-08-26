@@ -111,11 +111,20 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         if value != expected_value {
             return Err(FutexError::ImmediatelyWokenBecauseValueMismatch);
         }
+
+        #[cfg(any(test, feature = "futex_ordering_stress"))]
+        crate::ordering_stress::waiter_registered();
+
         // Only return when woken--don't reevaluate the futex word. This
         // ensures that the rate control mechanisms provided by the futex
         // interface are effective.
-        cx.wait_until(|| entry.get().done.load(Ordering::Acquire))
-            .map_err(FutexError::WaitError)
+        cx.wait_until(|| {
+            let done = entry.get().done.load(Ordering::Acquire);
+            #[cfg(any(test, feature = "futex_ordering_stress"))]
+            crate::ordering_stress::record_waiter_done(done);
+            done
+        })
+        .map_err(FutexError::WaitError)
     }
 
     /// Wakes waiters on the given futex word.
@@ -160,6 +169,8 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         // Wake the waiters outside the `extract_if` closure to minimize the list's lock hold
         // time.
         for entry in entries {
+            #[cfg(any(test, feature = "futex_ordering_stress"))]
+            crate::ordering_stress::waker_rendezvous();
             entry.done.store(true, Ordering::Relaxed);
             entry.waker.wake();
         }
@@ -186,11 +197,11 @@ mod tests {
 
     use super::*;
     use crate::LiteBox;
-    use crate::event::wait::WaitState;
+    use crate::event::wait::{WaitError, WaitState};
     use crate::platform::mock::MockPlatform;
     use alloc::sync::Arc;
     use core::num::NonZeroU32;
-    use core::sync::atomic::{AtomicU32, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::Barrier;
     use std::thread;
     use std::time::Duration;
@@ -357,5 +368,120 @@ mod tests {
         }
 
         assert!((1..=3).contains(&woken));
+    }
+
+    /// Reproduces the store-buffering hazard in the original futex wake path: the waker's
+    /// relaxed `done` store and the waiter's `SeqCst` `WAITING` store can each read the
+    /// other's stale value, so the waker's `fetch_update` sees `RUNNING_IN_HOST` and skips
+    /// the wake while the waiter blocks and times out. Ignored because it is probabilistic;
+    /// run with `LITEBOX_FUTEX_STRESS_ITERS` to control the iteration count.
+    #[test]
+    #[ignore = "probabilistic weak-memory stress test"]
+    fn stress_registered_waiter_does_not_miss_wake() {
+        let platform = MockPlatform::new();
+        let _litebox = LiteBox::new(platform);
+        let futex_manager = Arc::new(FutexManager::new());
+        let futex_word = Arc::new(AtomicU32::new(0));
+        let iterations = std::env::var("LITEBOX_FUTEX_STRESS_ITERS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1_000_000);
+        crate::ordering_stress::activate();
+        let iteration_start = Arc::new(Barrier::new(3));
+        let iteration_finish = Arc::new(Barrier::new(3));
+        let waiter_result = Arc::new(AtomicU32::new(u32::MAX));
+        let was_selected = Arc::new(AtomicBool::new(false));
+        let waiter = {
+            let futex_manager = Arc::clone(&futex_manager);
+            let futex_word = Arc::clone(&futex_word);
+            let iteration_start = Arc::clone(&iteration_start);
+            let iteration_finish = Arc::clone(&iteration_finish);
+            let waiter_result = Arc::clone(&waiter_result);
+            thread::spawn(move || {
+                for _ in 0..iterations {
+                    iteration_start.wait();
+                    let futex_addr = <MockPlatform as crate::platform::RawPointerProvider>::RawMutPointer::from_usize(
+                        futex_word.as_ptr() as usize,
+                    );
+                    let result = futex_manager.wait(
+                        &WaitState::new(platform)
+                            .context()
+                            .with_timeout(Duration::from_millis(20)),
+                        futex_addr,
+                        0,
+                        None,
+                    );
+                    waiter_result.store(
+                        u32::from(matches!(
+                            result,
+                            Err(FutexError::WaitError(WaitError::TimedOut))
+                        )),
+                        Ordering::Relaxed,
+                    );
+                    iteration_finish.wait();
+                }
+            })
+        };
+        let waker = {
+            let futex_manager = Arc::clone(&futex_manager);
+            let futex_word = Arc::clone(&futex_word);
+            let iteration_start = Arc::clone(&iteration_start);
+            let iteration_finish = Arc::clone(&iteration_finish);
+            let was_selected = Arc::clone(&was_selected);
+            thread::spawn(move || {
+                for _ in 0..iterations {
+                    iteration_start.wait();
+                    while !crate::ordering_stress::waiter_is_registered() {
+                        core::hint::spin_loop();
+                    }
+                    let futex_addr = <MockPlatform as crate::platform::RawPointerProvider>::RawMutPointer::from_usize(
+                        futex_word.as_ptr() as usize,
+                    );
+                    was_selected.store(
+                        futex_manager
+                            .wake(futex_addr, NonZeroU32::new(1).unwrap(), None)
+                            .unwrap()
+                            == 1,
+                        Ordering::Relaxed,
+                    );
+                    iteration_finish.wait();
+                }
+            })
+        };
+        let mut selected = 0;
+        let mut both_old = 0;
+        let mut lost_wakeups = 0;
+
+        for _ in 0..iterations {
+            futex_word.store(0, Ordering::Relaxed);
+            crate::ordering_stress::begin_round();
+            waiter_result.store(u32::MAX, Ordering::Relaxed);
+            was_selected.store(false, Ordering::Relaxed);
+            iteration_start.wait();
+            crate::ordering_stress::wait_until_parked();
+            crate::ordering_stress::release();
+            iteration_finish.wait();
+            if was_selected.load(Ordering::Relaxed) {
+                selected += 1;
+                if crate::ordering_stress::observed_both_old() {
+                    both_old += 1;
+                }
+                if waiter_result.load(Ordering::Relaxed) == 1 {
+                    lost_wakeups += 1;
+                }
+            }
+        }
+
+        waiter.join().unwrap();
+        waker.join().unwrap();
+        crate::ordering_stress::deactivate();
+        std::eprintln!(
+            "iterations={iterations} selected={selected} both_old={both_old} lost_wakeups={lost_wakeups}"
+        );
+        assert_eq!(
+            both_old, 0,
+            "the original futex wake path saw both old values"
+        );
+        assert_eq!(lost_wakeups, 0, "a selected futex waiter missed its wake");
     }
 }

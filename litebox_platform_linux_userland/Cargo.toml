@@ -16,6 +16,15 @@ syscalls = { version = "0.6", default-features = false }
 zerocopy = { version = "0.8", default-features = false }
 seccompiler = { version = "0.5.0" }
 
+[dev-dependencies]
+# Re-declare litebox with the ordering-stress instrumentation enabled so the
+# real-platform futex reproduction test can drive the rendezvous hooks. The
+# feature is active only for this crate's own test builds, never for normal
+# builds or when this crate is used as a dependency.
+litebox = { path = "../litebox/", version = "0.1.0", features = [
+    "futex_ordering_stress",
+] }
+
 [features]
 default = ["linux_syscall"]
 linux_syscall = []

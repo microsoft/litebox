@@ -174,6 +174,8 @@ impl<Platform: RawSyncPrimitivesProvider> WaitStateInner<Platform> {
                 state => unreachable!("{state:?}"),
             },
         );
+        #[cfg(any(test, feature = "futex_ordering_stress"))]
+        crate::ordering_stress::record_waker_result(v);
         match v.map(ThreadState) {
             Ok(ThreadState::WAITING) => {
                 condvar.wake_one();
@@ -375,6 +377,8 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
     /// missed.
     fn start_wait(&self) {
         self.waker.0.platform.update_waker(Some(self.waker.clone()));
+        #[cfg(any(test, feature = "futex_ordering_stress"))]
+        crate::ordering_stress::waiter_rendezvous();
         self.waker
             .0
             .set_state(ThreadState::WAITING, Ordering::SeqCst);
