@@ -17,7 +17,6 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::nt_types::{AccessMask, ObjectAttributes, ObjectAttributesFlags};
 use crate::syscalls::Handle;
-use crate::syscalls::object_manager::read_dispatcher_object_attributes;
 use crate::{ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value};
 
 #[repr(u32)]
@@ -226,7 +225,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         let (object_attributes, event_name) =
-            match read_dispatcher_object_attributes::<Platform>(object_attributes, false) {
+            match self.read_dispatcher_object_attributes(object_attributes, false) {
                 Ok(value) => value,
                 Err(status) => return status,
             };
@@ -288,12 +287,11 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if let Err(status) = probe_guest_output_preserving_value::<Platform, _>(event_handle) {
             return status;
         }
-        let event_name =
-            match read_dispatcher_object_attributes::<Platform>(object_attributes, true) {
-                Ok((_, Some(event_name))) => event_name,
-                Ok((_, None)) => return NtStatus::OBJECT_NAME_INVALID,
-                Err(status) => return status,
-            };
+        let event_name = match self.read_dispatcher_object_attributes(object_attributes, true) {
+            Ok((_, Some(event_name))) => event_name,
+            Ok((_, None)) => return NtStatus::OBJECT_NAME_INVALID,
+            Err(status) => return status,
+        };
         let event = match self.process.object_manager.resolve_event(&event_name) {
             Ok(event) => event,
             Err(status) => return status,

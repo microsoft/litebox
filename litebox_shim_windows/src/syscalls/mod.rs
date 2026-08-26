@@ -12,6 +12,7 @@ pub(crate) mod ksecdd;
 pub(crate) mod license;
 pub(crate) mod lpc;
 pub(crate) mod mm;
+pub(crate) mod mutant;
 pub(crate) mod nls;
 pub(crate) mod object_manager;
 pub(crate) mod process;
