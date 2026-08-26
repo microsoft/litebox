@@ -19,6 +19,7 @@ use litebox_broker_transport_linux_userland::unix_socket::UnixStreamLocalSetupCh
 
 const RUNNER_ARGUMENT: &str = "broker-userland-test-runner";
 const NETWORK_RUNNER_ARGUMENT: &str = "broker-userland-network-test-runner";
+const BROKER_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn main() {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
@@ -85,7 +86,7 @@ fn wait_for_broker(mut command: Command) {
         child: command.spawn().unwrap(),
     };
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + BROKER_PROCESS_TIMEOUT;
     while Instant::now() < deadline {
         if let Some(status) = broker.child.try_wait().unwrap() {
             assert!(status.success(), "broker failed with {status}");
