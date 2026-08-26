@@ -157,7 +157,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         )
     }
 
-    fn wait_timeout_duration(&self, timeout: i64) -> core::time::Duration {
+    pub(crate) fn wait_timeout_duration(&self, timeout: i64) -> core::time::Duration {
         const WINDOWS_TO_UNIX_EPOCH_SECONDS: u64 = 11_644_473_600;
 
         if timeout <= 0 {

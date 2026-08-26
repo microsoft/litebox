@@ -3,16 +3,25 @@
 
 //! Windows NT I/O completion port syscalls.
 
-use alloc::sync::Arc;
+use alloc::collections::VecDeque;
+use alloc::sync::{Arc, Weak};
 use core::marker::PhantomData;
 
+use litebox::event::observer::Observer;
+use litebox::event::polling::{Pollee, TryOpError};
+use litebox::event::wait::WaitError;
+use litebox::event::{Events, IOPollable};
 use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry};
-use litebox::platform::{RawMutPointer as _, RawPointerProvider};
+use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider};
+use litebox::sync::Mutex;
 use litebox_common_windows::nt_status::NtStatus;
+use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::nt_types::{AccessMask, ObjectAttributes, read_object_attributes};
 use crate::syscalls::Handle;
-use crate::{ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value};
+use crate::{
+    ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_buffer, probe_guest_output_preserving_value,
+};
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -65,14 +74,50 @@ pub(crate) struct IoCompletionHandleObject<Platform: crate::ShimPlatform> {
 
 pub(crate) struct IoCompletionObject<Platform: crate::ShimPlatform> {
     _number_of_concurrent_threads: u32,
-    _not_send_without_platform: PhantomData<fn(Platform)>,
+    packets: Mutex<Platform, VecDeque<IoCompletionPacket>>,
+    pollee: Pollee<Platform>,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes)]
+pub(crate) struct IoCompletionPacket {
+    completion_key: usize,
+    completion_value: usize,
+    status: usize,
+    information: usize,
 }
 
 impl<Platform: crate::ShimPlatform> IoCompletionObject<Platform> {
     fn new(number_of_concurrent_threads: u32) -> Self {
         Self {
             _number_of_concurrent_threads: number_of_concurrent_threads,
-            _not_send_without_platform: PhantomData,
+            packets: Mutex::new(VecDeque::new()),
+            pollee: Pollee::new(),
+        }
+    }
+
+    fn post(&self, packet: IoCompletionPacket) {
+        self.packets.lock().push_back(packet);
+        self.pollee.notify_observers(Events::IN);
+    }
+
+    fn remove(&self, count: usize) -> VecDeque<IoCompletionPacket> {
+        let mut packets = self.packets.lock();
+        let remove_count = count.min(packets.len());
+        packets.drain(..remove_count).collect()
+    }
+}
+
+impl<Platform: crate::ShimPlatform> IOPollable for IoCompletionObject<Platform> {
+    fn register_observer(&self, observer: Weak<dyn Observer<Events>>, mask: Events) {
+        self.pollee.register_observer(observer, mask);
+    }
+
+    fn check_io_events(&self) -> Events {
+        if self.packets.lock().is_empty() {
+            Events::empty()
+        } else {
+            Events::IN
         }
     }
 }
@@ -147,6 +192,117 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::ACCESS_VIOLATION;
         }
         NtStatus::SUCCESS
+    }
+
+    pub(crate) fn sys_nt_set_io_completion(
+        &self,
+        io_completion_handle: Handle,
+        completion_key: usize,
+        completion_value: usize,
+        status: i32,
+        information: usize,
+    ) -> NtStatus {
+        let entry = match self.typed_handle_entry_with_access::<IoCompletionSubsystem<Platform>>(
+            io_completion_handle,
+            IoCompletionAccess::MODIFY_STATE.bits(),
+        ) {
+            Ok(entry) => entry,
+            Err(status) => return status,
+        };
+        entry.with_entry(|entry| {
+            entry.port.post(IoCompletionPacket {
+                completion_key,
+                completion_value,
+                status: status.cast_unsigned() as usize,
+                information,
+            });
+        });
+        NtStatus::SUCCESS
+    }
+
+    pub(crate) fn sys_nt_remove_io_completion_ex(
+        &self,
+        io_completion_handle: Handle,
+        io_completion_information: MutPtr<Platform, IoCompletionPacket>,
+        count: u32,
+        num_entries_removed: MutPtr<Platform, u32>,
+        timeout: Option<ConstPtr<Platform, i64>>,
+        alertable: bool,
+    ) -> NtStatus {
+        if count == 0 {
+            return NtStatus::INVALID_PARAMETER;
+        }
+        if let Err(status) = probe_guest_output_buffer::<Platform>(
+            MutPtr::<Platform, u8>::from_usize(io_completion_information.as_usize()),
+            (count as usize).saturating_mul(core::mem::size_of::<IoCompletionPacket>()),
+        ) {
+            return status;
+        }
+        if let Err(status) = probe_guest_output_preserving_value::<Platform, _>(num_entries_removed)
+        {
+            return status;
+        }
+        let timeout = match timeout {
+            Some(timeout) => match timeout.read_at_offset(0) {
+                Some(timeout) => Some(self.wait_timeout_duration(timeout)),
+                None => return NtStatus::ACCESS_VIOLATION,
+            },
+            None => None,
+        };
+        let entry = match self.typed_handle_entry_with_access::<IoCompletionSubsystem<Platform>>(
+            io_completion_handle,
+            IoCompletionAccess::MODIFY_STATE.bits(),
+        ) {
+            Ok(entry) => entry,
+            Err(status) => return status,
+        };
+        let port = entry.with_entry(IoCompletionHandleObject::port);
+        if alertable {
+            litebox_util_log::debug!("Treating alertable IOCP wait as non-alertable");
+        }
+
+        let wait_cx = self.wait_cx().with_timeout(timeout);
+        match wait_cx.wait_on_events(
+            false,
+            Events::IN,
+            |observer, mask| {
+                port.register_observer(observer, mask);
+                Ok(())
+            },
+            || {
+                let packets = port.remove(count as usize);
+                if packets.is_empty() {
+                    return Err(TryOpError::<NtStatus>::TryAgain);
+                }
+                for (index, packet) in packets.iter().copied().enumerate() {
+                    if io_completion_information
+                        .write_at_offset(
+                            index.try_into().expect("packet count fits in isize"),
+                            packet,
+                        )
+                        .is_none()
+                    {
+                        return Err(TryOpError::Other(NtStatus::ACCESS_VIOLATION));
+                    }
+                }
+                Ok(packets
+                    .len()
+                    .try_into()
+                    .expect("packet count is bounded by the u32 input count"))
+            },
+        ) {
+            Ok(removed) => {
+                if num_entries_removed.write_at_offset(0, removed).is_none() {
+                    NtStatus::ACCESS_VIOLATION
+                } else {
+                    NtStatus::SUCCESS
+                }
+            }
+            Err(TryOpError::WaitError(WaitError::TimedOut)) => NtStatus::TIMEOUT,
+            Err(TryOpError::WaitError(WaitError::Interrupted)) => NtStatus::ALERTED,
+            Err(TryOpError::TryAgain) => unreachable!("blocking wait cannot return TryAgain"),
+            Err(TryOpError::Other(status)) => status,
+        }
     }
 }
 
