@@ -10,8 +10,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::backend::{
-    Backend, BackendHandles, DirHandle, FileHandle, HandleRef, PermissionCheck, Permissioned,
-    SeekBehavior, WalkOutcome, WalkStopReason, WalkedComponent, WalkingDirHandle,
+    Backend, BackendHandles, DirHandle, FileHandle, HandleRef, NewNode, PermissionCheck,
+    Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkedComponent, WalkingDirHandle,
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
@@ -701,7 +701,7 @@ impl Backend for Composer {
         &self,
         dir: DirHandle,
         name: &str,
-        mode: Mode,
+        node: NewNode,
     ) -> Result<FileHandle, OpenError> {
         let dir = dir.into_typed::<Self>();
         match dir.inner {
@@ -714,7 +714,7 @@ impl Backend for Composer {
                 self.checked_child_path(path, name, OpenError::ReadOnlyFileSystem)?;
                 self.mounts[mount_index]
                     .backend
-                    .create_file_at(handle, name, mode)
+                    .create_file_at(handle, name, node)
                     .map(|handle| {
                         FileHandle::from_typed::<Self>(ComposerFileHandle {
                             mount_index,
@@ -725,7 +725,7 @@ impl Backend for Composer {
         }
     }
 
-    fn mkdir_at(&self, dir: DirHandle, name: &str, mode: Mode) -> Result<DirHandle, MkdirError> {
+    fn mkdir_at(&self, dir: DirHandle, name: &str, node: NewNode) -> Result<DirHandle, MkdirError> {
         let dir = dir.into_typed::<Self>();
         match dir.inner {
             ComposerDirHandleInner::Virtual { .. } => Err(MkdirError::ReadOnlyFileSystem),
@@ -737,7 +737,7 @@ impl Backend for Composer {
                 let path = self.checked_child_path(path, name, MkdirError::ReadOnlyFileSystem)?;
                 self.mounts[mount_index]
                     .backend
-                    .mkdir_at(handle, name, mode)
+                    .mkdir_at(handle, name, node)
                     .map(|handle| {
                         DirHandle::from_typed::<Self>(
                             ComposerDirHandleInner::Mounted {

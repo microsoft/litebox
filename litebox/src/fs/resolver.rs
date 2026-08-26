@@ -20,8 +20,8 @@ use super::errors::{
 use super::{
     FileType, Mode, OFlags,
     backend::{
-        DirHandle, Handle, HandleRef, PermissionCheck, PermissionInfo, SeekBehavior, WalkOutcome,
-        WalkStopReason, WalkingDirHandle,
+        DirHandle, Handle, HandleRef, NewNode, PermissionCheck, PermissionInfo, Permissioned,
+        SeekBehavior, WalkOutcome, WalkStopReason, WalkingDirHandle,
     },
 };
 
@@ -44,16 +44,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             litebox: litebox.clone(),
             backend,
         }
-    }
-
-    /// Direct access to the backend, so that the tests can reach backend-owned state (namely its
-    /// own copy of the acting user).
-    ///
-    /// TODO(jayb): transitionary `pub(super)` accessor; this should go away along with the
-    /// backend's copy of the acting user.
-    #[cfg(test)]
-    pub(super) fn backend_mut(&mut self) -> &mut Backend {
-        &mut self.backend
     }
 }
 
@@ -269,11 +259,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             })
     }
 
-    /// Resolve `path` to an owned handle on the file or directory it names.
+    /// Resolve `path` to an owned handle on the file or directory it names, plus how permissions
+    /// on it are to be checked.
     ///
     /// The handle is taken with [`OFlags::PATH`], as it addresses the object for operations that
     /// do not read or write its contents, and thus needs no access permissions on it.
-    fn path_handle(&self, context: &Context, path: &ResolvedPath) -> Result<Handle, WalkError> {
+    fn path_handle(
+        &self,
+        context: &Context,
+        path: &ResolvedPath,
+    ) -> Result<Permissioned<Handle>, WalkError> {
         let map_open_error = |error| match error {
             OpenError::PathError(error) => WalkError::PathError(error),
             _ => WalkError::Io,
@@ -284,7 +279,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 .backend
                 .owned_dir_at(self.backend.root(), OFlags::PATH)
                 .map_err(map_open_error)?;
-            return Ok(Handle::Dir(root));
+            // A backend root reports no permission metadata, so the backend is left to enforce
+            // whatever it wants on it.
+            return Ok(Permissioned {
+                item: Handle::Dir(root),
+                permissions: PermissionCheck::ByBackend,
+            });
         }
         let (outcome, walked) = self.walk_path(
             context,
@@ -295,17 +295,32 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             SearchScope::ParentsOnly,
         )?;
         match outcome.stop_reason {
-            WalkStopReason::CompleteDirectory => Ok(Handle::Dir(
-                self.backend
+            WalkStopReason::CompleteDirectory => {
+                let permissions = outcome
+                    .components
+                    .last()
+                    .map_or(PermissionCheck::ByBackend, |component| {
+                        component.permissions.clone()
+                    });
+                let dir = self
+                    .backend
                     .owned_dir_at(outcome.last, OFlags::PATH)
-                    .map_err(map_open_error)?,
-            )),
-            WalkStopReason::StoppedAtNonDirectory => Ok(Handle::File(
-                self.backend
+                    .map_err(map_open_error)?;
+                Ok(Permissioned {
+                    item: Handle::Dir(dir),
+                    permissions,
+                })
+            }
+            WalkStopReason::StoppedAtNonDirectory => {
+                let file = self
+                    .backend
                     .open_file_at(outcome.last, components[walked], OFlags::PATH)
-                    .map_err(map_open_error)?
-                    .item,
-            )),
+                    .map_err(map_open_error)?;
+                Ok(Permissioned {
+                    item: Handle::File(file.item),
+                    permissions: file.permissions,
+                })
+            }
             WalkStopReason::Continue => {
                 // `walk_path` validates stop reasons before returning.
                 unreachable!()
@@ -584,7 +599,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                         WalkError::Io => OpenError::Io,
                         WalkError::PathError(error) => error.into(),
                     })?;
-                let file = self.backend.create_file_at(parent, name, mode)?;
+                let file = self.backend.create_file_at(
+                    parent,
+                    name,
+                    NewNode {
+                        mode,
+                        owner: context.acting_user(),
+                    },
+                )?;
                 let seek_behavior = self.backend.seek_behavior(&file);
                 Ok(insert(Handle::File(file), seek_behavior))
             }
@@ -799,6 +821,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         Ok(())
     }
 
+    fn may_change_metadata(context: &Context, permissions: &PermissionCheck) -> bool {
+        let PermissionCheck::ByResolver(permissions) = permissions else {
+            return true;
+        };
+        let acting = context.acting_user();
+        acting.user == UserInfo::ROOT.user || acting.user == permissions.owner.user
+    }
+
     /// Change the permissions of a file
     pub fn chmod(&self, context: &Context, path: impl Arg, mode: Mode) -> Result<(), ChmodError> {
         let path = context.resolve(path)?;
@@ -808,7 +838,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 WalkError::Io => ChmodError::Io,
                 WalkError::PathError(error) => error.into(),
             })?;
-        self.backend.chmod(handle.as_ref(), mode)
+        if !Self::may_change_metadata(context, &handle.permissions) {
+            return Err(ChmodError::NotTheOwner);
+        }
+        self.backend.chmod(handle.item.as_ref(), mode)
     }
 
     /// Change the owner of a file
@@ -826,7 +859,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 WalkError::Io => ChownError::Io,
                 WalkError::PathError(error) => error.into(),
             })?;
-        self.backend.chown(handle.as_ref(), user, group)
+        if !Self::may_change_metadata(context, &handle.permissions) {
+            return Err(ChownError::NotTheOwner);
+        }
+        self.backend.chown(handle.item.as_ref(), user, group)
     }
 
     /// Unlink a file
@@ -874,7 +910,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 WalkError::Io => MkdirError::Io,
                 WalkError::PathError(error) => error.into(),
             })?;
-        self.backend.mkdir_at(parent, name, mode).map(|_| ())
+        self.backend
+            .mkdir_at(
+                parent,
+                name,
+                NewNode {
+                    mode,
+                    owner: context.acting_user(),
+                },
+            )
+            .map(|_| ())
     }
 
     /// Remove a directory

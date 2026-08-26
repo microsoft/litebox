@@ -129,16 +129,16 @@ pub trait Backend: private::Sealed + Send + Sync + Any {
     /// Status of an open file or directory handle.
     fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError>;
 
-    /// Create a new file at `parent` with the given `name` and `mode`.
+    /// Create a new file at `parent` with the given `name` and metadata.
     fn create_file_at(
         &self,
         dir: DirHandle,
         name: &str,
-        mode: Mode,
+        node: NewNode,
     ) -> Result<FileHandle, OpenError>;
 
-    /// Create a new directory at `parent` with the given `name` and `mode`.
-    fn mkdir_at(&self, dir: DirHandle, name: &str, mode: Mode) -> Result<DirHandle, MkdirError>;
+    /// Create a new directory at `parent` with the given `name` and metadata.
+    fn mkdir_at(&self, dir: DirHandle, name: &str, node: NewNode) -> Result<DirHandle, MkdirError>;
 
     /// Remove the file `name` at `parent`.
     fn unlink_at(&self, dir: DirHandle, name: &str) -> Result<(), UnlinkError>;
@@ -332,6 +332,16 @@ pub(super) enum WalkStopReason {
     /// The backend stopped early; the resolver should continue walking from `last`.
     #[expect(dead_code, reason = "no backend currently returns partial walks")]
     Continue,
+}
+
+/// The metadata a backend stamps onto a newly created file or directory.
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub struct NewNode {
+    /// Permission bits for the new node.
+    pub mode: Mode,
+    /// Owner of the new node.
+    pub owner: UserInfo,
 }
 
 /// A backend item plus permission metadata for resolver-side checks.
