@@ -766,12 +766,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             // anonymous backing that avoids kernel-side content storage.
             return Err(NtStatus::NOT_SUPPORTED);
         }
+        let is_reserved = section
+            .attributes
+            .contains(SectionAllocationAttributes::SEC_RESERVE);
+        let initial_permissions = if is_reserved {
+            MemoryRegionPermissions::empty()
+        } else {
+            permissions
+        };
         let mapping = create_pages(
             &self.global.page_manager,
             None,
             length,
             CreatePagesFlags::empty(),
-            permissions,
+            initial_permissions,
             |_| Ok(0),
         )
         .map_err(|_| {
@@ -794,7 +802,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 size: mapped_size,
                 allocation_protect: section.protection,
                 type_: MemoryType::MEM_MAPPED,
-                pages: committed_pages(base, mapped_size, page_protection),
+                pages: if is_reserved {
+                    RangeMap::new()
+                } else {
+                    committed_pages(base, mapped_size, page_protection)
+                },
             },
         );
         Ok(MappedPagefileSectionView { base, view_size })
