@@ -29,8 +29,8 @@ use litebox::platform::{
 use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
 use litebox::sync::{Mutex, RawSyncPrimitivesProvider};
 use litebox::utils::TruncateExt as _;
-use litebox_common_windows::NtSysno;
 use litebox_common_windows::loader::PAGE_SIZE;
+use litebox_common_windows::{NtSysno, Win32Sysno};
 
 use crate::syscalls::event::{EventHandleObject, EventSubsystem};
 use crate::syscalls::file::{FileObject, FileObjectSubsystem};
@@ -604,6 +604,7 @@ pub struct Process<Platform: ShimPlatform> {
     wnf_notification_event: Mutex<Platform, Option<Arc<syscalls::event::EventObject<Platform>>>>,
     wnf_subscriptions: Mutex<Platform, syscalls::wnf::WnfProcessSubscriptions>,
     trace_notifications: Mutex<Platform, syscalls::trace::TraceNotifications<Platform>>,
+    gdi_state: Mutex<Platform, Option<syscalls::gdi::GdiProcessState>>,
     cookie: u32,
     exit_code: AtomicI32,
     next_thread_id: AtomicUsize,
@@ -700,6 +701,7 @@ impl<Platform: ShimPlatform> Process<Platform> {
             wnf_notification_event: Mutex::new(None),
             wnf_subscriptions: Mutex::new(syscalls::wnf::WnfProcessSubscriptions::default()),
             trace_notifications: Mutex::new(syscalls::trace::TraceNotifications::default()),
+            gdi_state: Mutex::new(None),
             cookie: syscalls::process::default_process_cookie(),
             exit_code: AtomicI32::new(DEFAULT_PROCESS_EXIT_CODE),
             next_thread_id: AtomicUsize::new(syscalls::process::INITIAL_THREAD_ID + 1),
@@ -972,6 +974,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     fn handle_syscall_request(&self, ctx: &mut litebox_common_linux::PtRegs) {
+        if let Some(syscall) = Win32Sysno::from_raw(ctx.orig_rax) {
+            ctx.rax = match syscall {
+                Win32Sysno::NtGdiInit2 => self.sys_nt_gdi_init2(),
+                _ => NtStatus::NOT_SUPPORTED.as_raw().cast_unsigned() as usize,
+            };
+            return;
+        }
+
         let Some(req) = SyscallRequest::<Platform>::try_from_raw(ctx) else {
             let caller = ConstPtr::<Platform, usize>::from_usize(ctx.rsp)
                 .read_at_offset(0)
