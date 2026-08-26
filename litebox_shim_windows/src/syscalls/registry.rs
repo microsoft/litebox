@@ -102,6 +102,12 @@ const DEFAULT_SESSION_MANAGER_KEY: &str =
 const DEFAULT_SEGMENT_HEAP_KEY: &str =
     "\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Session Manager\\Segment Heap";
 const DEFAULT_IMAGE_FILE_EXECUTION_OPTIONS_KEY: &str = "\\Registry\\Machine\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options";
+const DEFAULT_WINSOCK_PARAMETERS_KEY: &str =
+    "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\WinSock2\\Parameters";
+const DEFAULT_WINSOCK_PROTOCOL_CATALOG_KEY: &str = "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\WinSock2\\Parameters\\Protocol_Catalog9";
+const DEFAULT_WINSOCK_PROTOCOL_ENTRY_KEY: &str = "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\WinSock2\\Parameters\\Protocol_Catalog9\\Catalog_Entries64\\000000000001";
+const DEFAULT_WINSOCK_NAMESPACE_CATALOG_KEY: &str = "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\WinSock2\\Parameters\\NameSpace_Catalog5";
+const DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY: &str = "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\WinSock2\\Parameters\\NameSpace_Catalog5\\Catalog_Entries64\\000000000001";
 const DEFAULT_ACP_VALUE: &[u8] = &[b'1', 0, b'2', 0, b'5', 0, b'2', 0, 0, 0];
 const DEFAULT_OEMCP_VALUE: &[u8] = &[b'4', 0, b'3', 0, b'7', 0, 0, 0];
 const DEFAULT_MACCP_VALUE: &[u8] = &[b'1', 0, b'0', 0, b'0', 0, b'0', 0, b'0', 0, 0, 0];
@@ -463,6 +469,11 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
                 DEFAULT_SESSION_MANAGER_KEY,
                 DEFAULT_SEGMENT_HEAP_KEY,
                 DEFAULT_IMAGE_FILE_EXECUTION_OPTIONS_KEY,
+                DEFAULT_WINSOCK_PARAMETERS_KEY,
+                DEFAULT_WINSOCK_PROTOCOL_CATALOG_KEY,
+                DEFAULT_WINSOCK_PROTOCOL_ENTRY_KEY,
+                DEFAULT_WINSOCK_NAMESPACE_CATALOG_KEY,
+                DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY,
             ] {
                 if let Err(status) = create_key_in_fs(fs, key) {
                     litebox_util_log::error!(key:% = key, status:? = status; "failed to initialize registry key");
@@ -478,6 +489,126 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
                     write_value_in_fs(fs, DEFAULT_CODE_PAGE_KEY, name, RegistryValueType::Sz, value)
                 {
                     litebox_util_log::error!(name:% = name, status:? = status; "failed to initialize registry value");
+                    break;
+                }
+            }
+
+            let winsock_values = [
+                (
+                    DEFAULT_WINSOCK_PARAMETERS_KEY,
+                    "WinSock_Registry_Version",
+                    RegistryValueType::Sz,
+                    utf16le_nul("2.0"),
+                ),
+                (
+                    DEFAULT_WINSOCK_PARAMETERS_KEY,
+                    "Current_Protocol_Catalog",
+                    RegistryValueType::Sz,
+                    utf16le_nul("Protocol_Catalog9"),
+                ),
+                (
+                    DEFAULT_WINSOCK_PARAMETERS_KEY,
+                    "Current_NameSpace_Catalog",
+                    RegistryValueType::Sz,
+                    utf16le_nul("NameSpace_Catalog5"),
+                ),
+                (
+                    DEFAULT_WINSOCK_PROTOCOL_CATALOG_KEY,
+                    "Num_Catalog_Entries64",
+                    RegistryValueType::Dword,
+                    1u32.to_le_bytes().to_vec(),
+                ),
+                (
+                    DEFAULT_WINSOCK_PROTOCOL_CATALOG_KEY,
+                    "Next_Catalog_Entry_ID",
+                    RegistryValueType::Dword,
+                    2u32.to_le_bytes().to_vec(),
+                ),
+                (
+                    DEFAULT_WINSOCK_PROTOCOL_CATALOG_KEY,
+                    "Serial_Access_Num",
+                    RegistryValueType::Dword,
+                    1u32.to_le_bytes().to_vec(),
+                ),
+                (
+                    DEFAULT_WINSOCK_PROTOCOL_ENTRY_KEY,
+                    "PackedCatalogItem",
+                    RegistryValueType::Binary,
+                    default_winsock_protocol_catalog_item(),
+                ),
+                (
+                    DEFAULT_WINSOCK_PROTOCOL_ENTRY_KEY,
+                    "ProtocolName",
+                    RegistryValueType::Sz,
+                    utf16le_nul("@%SystemRoot%\\System32\\mswsock.dll,-60100"),
+                ),
+                (
+                    DEFAULT_WINSOCK_NAMESPACE_CATALOG_KEY,
+                    "Num_Catalog_Entries64",
+                    RegistryValueType::Dword,
+                    1u32.to_le_bytes().to_vec(),
+                ),
+                (
+                    DEFAULT_WINSOCK_NAMESPACE_CATALOG_KEY,
+                    "Serial_Access_Num",
+                    RegistryValueType::Dword,
+                    1u32.to_le_bytes().to_vec(),
+                ),
+                (
+                    DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY,
+                    "LibraryPath",
+                    RegistryValueType::Sz,
+                    utf16le_nul("%SystemRoot%\\System32\\mswsock.dll"),
+                ),
+                (
+                    DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY,
+                    "DisplayString",
+                    RegistryValueType::Sz,
+                    utf16le_nul("@%SystemRoot%\\system32\\wshtcpip.dll,-60103"),
+                ),
+                (
+                    DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY,
+                    "ProviderId",
+                    RegistryValueType::Binary,
+                    vec![
+                        0x40, 0x9d, 0x05, 0x22, 0x9e, 0x7e, 0xcf, 0x11, 0xae, 0x5a, 0x00,
+                        0xaa, 0x00, 0xa7, 0x11, 0x2b,
+                    ],
+                ),
+                (
+                    DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY,
+                    "SupportedNameSpace",
+                    RegistryValueType::Dword,
+                    12u32.to_le_bytes().to_vec(),
+                ),
+                (
+                    DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY,
+                    "Enabled",
+                    RegistryValueType::Dword,
+                    1u32.to_le_bytes().to_vec(),
+                ),
+                (
+                    DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY,
+                    "Version",
+                    RegistryValueType::Dword,
+                    0u32.to_le_bytes().to_vec(),
+                ),
+                (
+                    DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY,
+                    "StoresServiceClassInfo",
+                    RegistryValueType::Dword,
+                    0u32.to_le_bytes().to_vec(),
+                ),
+                (
+                    DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY,
+                    "ProviderInfo",
+                    RegistryValueType::Binary,
+                    Vec::new(),
+                ),
+            ];
+            for (key, name, value_type, value) in winsock_values {
+                if let Err(status) = write_value_in_fs(fs, key, name, value_type, &value) {
+                    litebox_util_log::error!(name:% = name, status:? = status; "failed to initialize Winsock registry value");
                     break;
                 }
             }
@@ -1028,7 +1159,14 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             result_length,
         ) {
             Ok(()) => NtStatus::SUCCESS,
-            Err(status) => status,
+            Err(status) => {
+                litebox_util_log::debug!(
+                    value_name:? = value_name.read_string::<Platform>(),
+                    status:? = status;
+                    "NtQueryValueKey failed"
+                );
+                status
+            }
         }
     }
 
@@ -1821,6 +1959,47 @@ fn utf16le(value: &str) -> Vec<u8> {
         bytes.extend_from_slice(&code_unit.to_le_bytes());
     }
     bytes
+}
+
+fn utf16le_nul(value: &str) -> Vec<u8> {
+    let mut bytes = utf16le(value);
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    bytes
+}
+
+fn default_winsock_protocol_catalog_item() -> Vec<u8> {
+    const PROVIDER_PATH_SIZE: usize = 260;
+    const PROTOCOL_INFO_SIZE: usize = 628;
+    const PROTOCOL_INFO_OFFSET: usize = PROVIDER_PATH_SIZE;
+    const PROTOCOL_NAME_OFFSET: usize = PROTOCOL_INFO_OFFSET + 116;
+
+    fn write_u32(item: &mut [u8], offset: usize, value: u32) {
+        item[offset..offset + size_of::<u32>()].copy_from_slice(&value.to_le_bytes());
+    }
+
+    let mut item = vec![0; PROVIDER_PATH_SIZE + PROTOCOL_INFO_SIZE];
+    let provider_path = b"%SystemRoot%\\system32\\mswsock.dll\0";
+    item[..provider_path.len()].copy_from_slice(provider_path);
+
+    write_u32(&mut item, PROTOCOL_INFO_OFFSET, 0x0002_0066);
+    write_u32(&mut item, PROTOCOL_INFO_OFFSET + 16, 8);
+    item[PROTOCOL_INFO_OFFSET + 20..PROTOCOL_INFO_OFFSET + 36].copy_from_slice(&[
+        0xa0, 0x1a, 0x0f, 0xe7, 0x8b, 0xab, 0xcf, 0x11, 0x8c, 0xa3, 0x00, 0x80, 0x5f, 0x48, 0xa1,
+        0x92,
+    ]);
+    write_u32(&mut item, PROTOCOL_INFO_OFFSET + 36, 1);
+    write_u32(&mut item, PROTOCOL_INFO_OFFSET + 40, 1);
+    write_u32(&mut item, PROTOCOL_INFO_OFFSET + 72, 2);
+    write_u32(&mut item, PROTOCOL_INFO_OFFSET + 76, 2);
+    write_u32(&mut item, PROTOCOL_INFO_OFFSET + 80, 16);
+    write_u32(&mut item, PROTOCOL_INFO_OFFSET + 84, 16);
+    write_u32(&mut item, PROTOCOL_INFO_OFFSET + 88, 1);
+    write_u32(&mut item, PROTOCOL_INFO_OFFSET + 92, 6);
+
+    let protocol_name = utf16le_nul("@%SystemRoot%\\System32\\mswsock.dll,-60100");
+    item[PROTOCOL_NAME_OFFSET..PROTOCOL_NAME_OFFSET + protocol_name.len()]
+        .copy_from_slice(&protocol_name);
+    item
 }
 
 fn absolute_nt_key_name_to_fs_path(name: &str) -> Result<String, NtStatus> {
