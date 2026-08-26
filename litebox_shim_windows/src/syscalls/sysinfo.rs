@@ -21,6 +21,7 @@ const QPC_FREQUENCY_HZ: i64 = 1_000_000_000;
 // They avoid leaking host topology while satisfying Windows CRT/environment
 // probes that require plausible system-information success outputs.
 const TIMER_RESOLUTION_100NS: u32 = 156_250;
+const MINIMUM_TIMER_RESOLUTION_100NS: u32 = 5_000;
 const DEFAULT_PHYSICAL_PAGES: u32 = 1024 * 1024;
 const NUMBER_OF_PROCESSORS: u8 = 1;
 const PROCESSOR_AFFINITY_MASK: usize = (1usize << NUMBER_OF_PROCESSORS) - 1;
@@ -34,6 +35,8 @@ const NUMA_NODE_COUNT: usize = NUMBER_OF_PROCESSORS as usize;
 const PROCESSOR_ARCHITECTURE_AMD64: u16 = 9;
 const SYSTEM_VERIFIER_INFORMATION_LENGTH: u32 = 0x90;
 const SYSTEM_VERIFIER_INFORMATION_LENGTH_USIZE: usize = 0x90;
+const SYSTEM_FEATURE_CONFIGURATION_INFORMATION_LENGTH: u32 = 0x18;
+const FEATURE_CONFIGURATION_CHANGE_STAMP: u64 = 0x13;
 const X64_SYSTEM_RANGE_START: usize = 0xffff_8000_0000_0000;
 
 #[repr(C)]
@@ -67,6 +70,7 @@ enum SystemInformationClass {
     LogicalProcessorAndGroup = 107,
     Flush = 192,
     HypervisorSharedPage = 197,
+    FeatureConfiguration = 210,
     FeatureConfigurationSection = 211,
     ProcessorFeaturesBitMap = 250,
 }
@@ -143,6 +147,22 @@ struct SystemRangeStartInformation {
 #[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
 struct SystemProcessorFeaturesBitMapInformation {
     feature_bits: [u64; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct SystemFeatureConfigurationQuery {
+    configuration_type: u32,
+    feature_id: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, Immutable, IntoBytes)]
+struct SystemFeatureConfigurationInformation {
+    change_stamp: u64,
+    feature_id: u32,
+    configuration: u32,
+    variant_payload: u64,
 }
 
 #[repr(C)]
@@ -324,6 +344,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 },
             ),
             SystemInformationClass::LogicalProcessorAndGroup
+            | SystemInformationClass::FeatureConfiguration
             | SystemInformationClass::FeatureConfigurationSection => NtStatus::INVALID_INFO_CLASS,
         };
 
@@ -372,6 +393,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     return_length,
                 )
             }
+            SystemInformationClass::FeatureConfiguration => Self::query_feature_configuration(
+                input_buffer,
+                input_buffer_length,
+                system_information,
+                system_information_length,
+                return_length,
+            ),
             // TODO: Windows returns section handles for this class. LiteBox does not yet model those
             // NT section objects, so do not publish a fabricated success payload.
             SystemInformationClass::FeatureConfigurationSection => NtStatus::INVALID_INFO_CLASS,
@@ -393,6 +421,66 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         status
+    }
+
+    fn query_feature_configuration(
+        input_buffer: ConstPtr<Platform, u8>,
+        input_buffer_length: u32,
+        system_information: MutPtr<Platform, u8>,
+        system_information_length: u32,
+        return_length: Option<MutPtr<Platform, u32>>,
+    ) -> NtStatus {
+        if input_buffer_length != size_of::<SystemFeatureConfigurationQuery>().trunc() {
+            if Self::write_return_length(return_length, 0).is_err() {
+                return NtStatus::ACCESS_VIOLATION;
+            }
+            return NtStatus::INFO_LENGTH_MISMATCH;
+        }
+
+        let input_buffer = ConstPtr::<Platform, SystemFeatureConfigurationQuery>::from_usize(
+            input_buffer.as_usize(),
+        );
+        let Some(query) = input_buffer.read_at_offset(0) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        if query.configuration_type > 1 {
+            if Self::write_return_length(return_length, 0).is_err() {
+                return NtStatus::ACCESS_VIOLATION;
+            }
+            return NtStatus::INVALID_PARAMETER;
+        }
+
+        if system_information_length != SYSTEM_FEATURE_CONFIGURATION_INFORMATION_LENGTH {
+            return Self::write_return_length_for_short_buffer(
+                return_length,
+                SYSTEM_FEATURE_CONFIGURATION_INFORMATION_LENGTH,
+            );
+        }
+
+        let configuration = match query.feature_id {
+            58_599_559 | 58_989_021 | 58_599_563 => Some(0x2f),
+            58_989_070 | 58_989_092 => Some(0x64),
+            _ => None,
+        };
+        let information = SystemFeatureConfigurationInformation {
+            change_stamp: FEATURE_CONFIGURATION_CHANGE_STAMP,
+            feature_id: configuration.map_or(0, |_| query.feature_id),
+            configuration: configuration.unwrap_or(0),
+            variant_payload: 0,
+        };
+        if system_information
+            .write_slice_at_offset(0, information.as_bytes())
+            .is_none()
+            || Self::write_return_length(
+                return_length,
+                SYSTEM_FEATURE_CONFIGURATION_INFORMATION_LENGTH,
+            )
+            .is_err()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+
+        configuration.map_or(NtStatus::NOT_FOUND, |_| NtStatus::SUCCESS)
     }
 
     fn write_logical_processor_and_group_information(
@@ -654,6 +742,27 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             performance_frequency = QPC_FREQUENCY_HZ;
             "Handled NtQueryPerformanceCounter syscall"
         );
+        NtStatus::SUCCESS
+    }
+
+    pub(crate) fn sys_nt_query_timer_resolution(
+        maximum_time: MutPtr<Platform, u32>,
+        minimum_time: MutPtr<Platform, u32>,
+        current_time: MutPtr<Platform, u32>,
+    ) -> NtStatus {
+        if maximum_time
+            .write_at_offset(0, TIMER_RESOLUTION_100NS)
+            .is_none()
+            || minimum_time
+                .write_at_offset(0, MINIMUM_TIMER_RESOLUTION_100NS)
+                .is_none()
+            || current_time
+                .write_at_offset(0, TIMER_RESOLUTION_100NS)
+                .is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+
         NtStatus::SUCCESS
     }
 
@@ -986,6 +1095,123 @@ mod tests {
                     None,
                 ),
                 NtStatus::INVALID_INFO_CLASS
+            );
+        });
+    }
+
+    #[test]
+    fn nt_query_system_information_ex_reports_unconfigured_features() {
+        run_with_test_platform_pointers(|| {
+            let query = SystemFeatureConfigurationQuery {
+                configuration_type: 0,
+                feature_id: 0x1234,
+            };
+            let mut output = SystemFeatureConfigurationInformation {
+                change_stamp: u64::MAX,
+                feature_id: u32::MAX,
+                configuration: u32::MAX,
+                variant_payload: u64::MAX,
+            };
+            let mut return_length = 0;
+
+            assert_eq!(
+                TestTask::sys_nt_query_system_information_ex(
+                    SystemInformationClass::FeatureConfiguration as u32,
+                    Some(const_byte_ptr(&query)),
+                    size_of::<SystemFeatureConfigurationQuery>().trunc(),
+                    mut_byte_ptr(&mut output),
+                    size_of::<SystemFeatureConfigurationInformation>().trunc(),
+                    Some(mut_ptr(&mut return_length)),
+                ),
+                NtStatus::NOT_FOUND
+            );
+            assert_eq!(output.change_stamp, FEATURE_CONFIGURATION_CHANGE_STAMP);
+            assert_eq!(output.feature_id, 0);
+            assert_eq!(output.configuration, 0);
+            assert_eq!(output.variant_payload, 0);
+            assert_eq!(
+                return_length,
+                SYSTEM_FEATURE_CONFIGURATION_INFORMATION_LENGTH
+            );
+        });
+    }
+
+    #[test]
+    fn nt_query_system_information_ex_reports_configured_features() {
+        run_with_test_platform_pointers(|| {
+            for (feature_id, expected_configuration) in [
+                (58_599_559, 0x2f),
+                (58_989_070, 0x64),
+                (58_989_021, 0x2f),
+                (58_599_563, 0x2f),
+                (58_989_092, 0x64),
+            ] {
+                let query = SystemFeatureConfigurationQuery {
+                    configuration_type: 0,
+                    feature_id,
+                };
+                let mut output = SystemFeatureConfigurationInformation::default();
+
+                assert_eq!(
+                    TestTask::sys_nt_query_system_information_ex(
+                        SystemInformationClass::FeatureConfiguration as u32,
+                        Some(const_byte_ptr(&query)),
+                        size_of::<SystemFeatureConfigurationQuery>().trunc(),
+                        mut_byte_ptr(&mut output),
+                        size_of::<SystemFeatureConfigurationInformation>().trunc(),
+                        None,
+                    ),
+                    NtStatus::SUCCESS
+                );
+                assert_eq!(output.change_stamp, FEATURE_CONFIGURATION_CHANGE_STAMP);
+                assert_eq!(output.feature_id, feature_id);
+                assert_eq!(output.configuration, expected_configuration);
+                assert_eq!(output.variant_payload, 0);
+            }
+        });
+    }
+
+    #[test]
+    fn nt_query_system_information_ex_validates_feature_configuration_query() {
+        run_with_test_platform_pointers(|| {
+            let query = SystemFeatureConfigurationQuery {
+                configuration_type: 2,
+                feature_id: 0,
+            };
+            let mut output = SystemFeatureConfigurationInformation::default();
+            let mut return_length = u32::MAX;
+
+            assert_eq!(
+                TestTask::sys_nt_query_system_information_ex(
+                    SystemInformationClass::FeatureConfiguration as u32,
+                    Some(const_byte_ptr(&query)),
+                    size_of::<SystemFeatureConfigurationQuery>().trunc(),
+                    mut_byte_ptr(&mut output),
+                    size_of::<SystemFeatureConfigurationInformation>().trunc(),
+                    Some(mut_ptr(&mut return_length)),
+                ),
+                NtStatus::INVALID_PARAMETER
+            );
+            assert_eq!(return_length, 0);
+
+            let valid_query = SystemFeatureConfigurationQuery {
+                configuration_type: 0,
+                feature_id: 0,
+            };
+            assert_eq!(
+                TestTask::sys_nt_query_system_information_ex(
+                    SystemInformationClass::FeatureConfiguration as u32,
+                    Some(const_byte_ptr(&valid_query)),
+                    size_of::<SystemFeatureConfigurationQuery>().trunc(),
+                    mut_byte_ptr(&mut output),
+                    SYSTEM_FEATURE_CONFIGURATION_INFORMATION_LENGTH - 1,
+                    Some(mut_ptr(&mut return_length)),
+                ),
+                NtStatus::INFO_LENGTH_MISMATCH
+            );
+            assert_eq!(
+                return_length,
+                SYSTEM_FEATURE_CONFIGURATION_INFORMATION_LENGTH
             );
         });
     }
@@ -1583,6 +1809,36 @@ mod tests {
                     Some(mut_ptr(&mut conversion_error)),
                 ),
                 NtStatus::NOT_SUPPORTED
+            );
+        });
+    }
+
+    #[test]
+    fn nt_query_timer_resolution_returns_synthetic_clock_values() {
+        run_with_test_platform_pointers(|| {
+            let mut maximum_time = 0;
+            let mut minimum_time = 0;
+            let mut current_time = 0;
+
+            assert_eq!(
+                TestTask::sys_nt_query_timer_resolution(
+                    mut_ptr(&mut maximum_time),
+                    mut_ptr(&mut minimum_time),
+                    mut_ptr(&mut current_time),
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(maximum_time, TIMER_RESOLUTION_100NS);
+            assert_eq!(minimum_time, MINIMUM_TIMER_RESOLUTION_100NS);
+            assert_eq!(current_time, TIMER_RESOLUTION_100NS);
+
+            assert_eq!(
+                TestTask::sys_nt_query_timer_resolution(
+                    null_mut_ptr(),
+                    mut_ptr(&mut minimum_time),
+                    mut_ptr(&mut current_time),
+                ),
+                NtStatus::ACCESS_VIOLATION
             );
         });
     }
