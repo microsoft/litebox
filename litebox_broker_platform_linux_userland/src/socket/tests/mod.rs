@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use super::*;
 use litebox_broker_core::readiness::ReadinessSink;
-use litebox_broker_core::socket::GUEST_IPV4_ADDRESS;
+use litebox_broker_core::socket::{GUEST_IPV4_ADDRESS, HOST_GATEWAY_IPV4_ADDRESS};
 use litebox_broker_core::{
     BrokerCore, BrokerCoreLimits, BrokerSession, CallerCredential, DestinationPortRange,
     DestinationRule, Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy,
@@ -26,6 +26,20 @@ mod tcp;
 mod udp;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn gateway_tcp_policy() -> SocketPolicy {
+    SocketPolicy::guest_network()
+        .with_tcp_destination_rules(&[DestinationRule::new(
+            CallerCredential::Unauthenticated,
+            Ipv4Cidr::new(Ipv4Address(HOST_GATEWAY_IPV4_ADDRESS.octets()), 32).unwrap(),
+            DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
+        )])
+        .unwrap()
+}
+
+fn gateway_address(host_address: SocketAddrV4) -> SocketAddrV4 {
+    SocketAddrV4::new(HOST_GATEWAY_IPV4_ADDRESS, host_address.port())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ReceivedPlatformDatagram {
@@ -79,6 +93,47 @@ fn concurrent_socket_retirement_waits_for_close_acknowledgement() {
     second_finished_receive.recv_timeout(TEST_TIMEOUT).unwrap();
     second.join().unwrap();
     assert_eq!(lifecycle.load(), SocketLifecycleState::Retired);
+}
+
+#[test]
+fn failed_close_acknowledgement_waits_for_reactor_termination() {
+    let (commands, receiver) = sync_channel(1);
+    let wake = Arc::new(eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK).unwrap());
+    let (acknowledgement_dropped, wait_for_acknowledgement_drop) = sync_channel(1);
+    let (release_reactor, wait_to_release_reactor) = sync_channel(1);
+    let reactor_thread = thread::spawn(move || {
+        let ReactorCommand::Close { response, .. } = receiver.recv().unwrap() else {
+            panic!("unexpected reactor command");
+        };
+        drop(response);
+        acknowledgement_dropped.send(()).unwrap();
+        wait_to_release_reactor.recv_timeout(TEST_TIMEOUT).unwrap();
+    });
+    let reactor = Arc::new(ReactorClient {
+        commands,
+        wake,
+        next_socket_id: AtomicU64::new(1),
+        thread: Mutex::new(Some(reactor_thread)),
+    });
+
+    let closing_reactor = Arc::clone(&reactor);
+    let (close_finished, wait_for_close) = sync_channel(1);
+    let close = thread::spawn(move || {
+        closing_reactor.close_socket(1);
+        close_finished.send(()).unwrap();
+    });
+    wait_for_acknowledgement_drop
+        .recv_timeout(TEST_TIMEOUT)
+        .unwrap();
+    assert!(
+        wait_for_close
+            .recv_timeout(Duration::from_millis(100))
+            .is_err()
+    );
+
+    release_reactor.send(()).unwrap();
+    wait_for_close.recv_timeout(TEST_TIMEOUT).unwrap();
+    close.join().unwrap();
 }
 
 fn send_bytes(
@@ -172,16 +227,10 @@ fn cached_socket_error_precedes_a_new_kernel_error() {
 #[test]
 fn synchronous_errors_do_not_consume_tcp_connect_status() {
     assert!(!can_consume_synchronous_error(
-        SocketKind::Tcp,
         SocketConnectionStatus::Connecting,
     ));
     assert!(can_consume_synchronous_error(
-        SocketKind::Tcp,
-        SocketConnectionStatus::Connected,
-    ));
-    assert!(can_consume_synchronous_error(
-        SocketKind::Udp,
-        SocketConnectionStatus::Unconnected,
+        SocketConnectionStatus::Connected
     ));
 }
 
@@ -312,7 +361,7 @@ fn directional_shutdown_survives_readiness_publication_failure() {
     let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-            .with_socket_policy(SocketPolicy::guest_network()),
+            .with_socket_policy(gateway_tcp_policy()),
         BrokerCoreLimits::new_with_all_limits(4, 0, 2, 2),
         provider,
     )
@@ -329,7 +378,11 @@ fn directional_shutdown_survives_readiness_publication_failure() {
 
     let tcp = create_socket(&session, readiness.clone());
     assert!(matches!(
-        litebox_broker_core::socket::connect(&session, tcp, socket_address_v4(address)),
+        litebox_broker_core::socket::connect(
+            &session,
+            tcp,
+            gateway_address(socket_address_v4(address)),
+        ),
         Ok(SocketOutcome::Completed(
             SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
         ))

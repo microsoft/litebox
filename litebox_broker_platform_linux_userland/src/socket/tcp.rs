@@ -4,14 +4,15 @@
 //! Linux TCP reactor state and transport-specific helpers.
 
 use std::collections::{HashMap, VecDeque};
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::SocketAddrV4;
 use std::os::fd::OwnedFd;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use litebox_broker_core::readiness::ReadinessRegistration;
 use litebox_broker_core::socket::{
-    GUEST_IPV4_ADDRESS, GuestSocketBinding, GuestSourceLease, PlatformConnectError,
+    GuestSocketBinding, GuestSourceLease, PlatformConnectError, host_socket_destination,
+    is_internal_socket_address, normalize_socket_destination,
 };
 use litebox_broker_core::{BrokerError, Result as BrokerResult, SessionId};
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -108,24 +109,24 @@ impl TcpSocketState {
 
 pub(super) enum TcpDescriptor {
     Unrealized,
-    NativeInet(OwnedFd),
-    GuestUnix(OwnedFd),
+    ExternalInet(OwnedFd),
+    InternalUnix(OwnedFd),
 }
 
 impl TcpDescriptor {
     pub(super) fn socket(&self) -> BrokerResult<&OwnedFd> {
         match self {
-            Self::NativeInet(socket) | Self::GuestUnix(socket) => Ok(socket),
+            Self::ExternalInet(socket) | Self::InternalUnix(socket) => Ok(socket),
             Self::Unrealized => Err(BrokerError::Internal),
         }
     }
 
-    pub(super) fn is_native(&self) -> bool {
-        matches!(self, Self::NativeInet(_))
+    pub(super) fn is_external(&self) -> bool {
+        matches!(self, Self::ExternalInet(_))
     }
 
-    fn is_guest(&self) -> bool {
-        matches!(self, Self::GuestUnix(_))
+    fn is_internal(&self) -> bool {
+        matches!(self, Self::InternalUnix(_))
     }
 }
 
@@ -226,11 +227,7 @@ fn readiness_from_epoll(socket: &SocketEntry, events: epoll::EventFlags) -> Read
     if events.contains(epoll::EventFlags::ERR) {
         readiness = readiness | ReadinessFlags::ERROR;
     }
-    let previous = socket
-        .snapshot
-        .lock()
-        .expect("Linux socket snapshot mutex poisoned")
-        .readiness;
+    let previous = socket.snapshot.load();
     ReadinessFlags(readiness.0 | previous.0)
 }
 
@@ -244,60 +241,29 @@ fn active_epoll_events() -> epoll::EventFlags {
 }
 
 fn add_readiness(socket: &SocketEntry, readiness: ReadinessFlags) -> BrokerResult<()> {
-    let current = socket
-        .snapshot
-        .lock()
-        .expect("Linux socket snapshot mutex poisoned")
-        .readiness;
-    update_snapshot(socket, None, ReadinessFlags(current.0 | readiness.0))
+    let current = socket.snapshot.load();
+    update_snapshot(socket, ReadinessFlags(current.0 | readiness.0))
 }
 
 fn clear_readiness(socket: &SocketEntry, readiness: ReadinessFlags) -> BrokerResult<()> {
-    let current = socket
-        .snapshot
-        .lock()
-        .expect("Linux socket snapshot mutex poisoned")
-        .readiness;
-    update_snapshot(socket, None, ReadinessFlags(current.0 & !readiness.0))
+    let current = socket.snapshot.load();
+    update_snapshot(socket, ReadinessFlags(current.0 & !readiness.0))
 }
 
-fn consume_synchronous_error(socket: &SocketEntry) -> BrokerResult<()> {
-    let query_socket_error = {
-        let snapshot = socket
-            .snapshot
-            .lock()
-            .expect("Linux socket snapshot mutex poisoned");
-        if !can_consume_synchronous_error(socket.kind(), socket.connection_status) {
-            return Ok(());
-        }
-        snapshot.pending_error.is_none()
-    };
-    let socket_error = if query_socket_error {
-        take_socket_error(socket)?
-    } else {
-        None
-    };
-    let (readiness, changed) = {
-        let mut snapshot = socket
-            .snapshot
-            .lock()
-            .expect("Linux socket snapshot mutex poisoned");
-        if snapshot.pending_error.is_none() {
-            snapshot.pending_error = socket_error;
-        }
-        let readiness = if snapshot.pending_error.is_some() {
-            snapshot.readiness | ReadinessFlags::ERROR
-        } else {
-            ReadinessFlags(snapshot.readiness.0 & !ReadinessFlags::ERROR.0)
-        };
-        let changed = readiness != snapshot.readiness;
-        snapshot.readiness = readiness;
-        (readiness, changed)
-    };
-    if changed {
-        socket.readiness.publish(readiness)?;
+fn consume_synchronous_error(socket: &mut SocketEntry) -> BrokerResult<()> {
+    if !can_consume_synchronous_error(socket.connection_status) {
+        return Ok(());
     }
-    Ok(())
+    if socket.pending_error.is_none() {
+        socket.pending_error = take_socket_error(socket)?;
+    }
+    let current = socket.snapshot.load();
+    let readiness = if socket.pending_error.is_some() {
+        current | ReadinessFlags::ERROR
+    } else {
+        ReadinessFlags(current.0 & !ReadinessFlags::ERROR.0)
+    };
+    update_snapshot(socket, readiness)
 }
 
 #[derive(Clone)]
@@ -307,11 +273,11 @@ pub(super) struct ReactorTcpBinding {
 }
 
 enum ResolvedTcpDestination {
-    Guest {
+    Internal {
         listener_id: u64,
         concrete_address: SocketAddrV4,
     },
-    Native(SocketAddrV4),
+    External(SocketAddrV4),
 }
 
 impl ReactorTcpState {
@@ -322,18 +288,18 @@ impl ReactorTcpState {
     }
 
     pub(super) fn insert_binding(&mut self, binding: ReactorTcpBinding) -> BrokerResult<()> {
-        let requested = binding.guest_binding.requested();
+        let local_address = binding.guest_binding.local_address();
         if !binding.guest_binding.is_valid()
             || if binding.guest_binding.is_wildcard() {
-                self.bindings.wildcard.contains_key(&requested.port())
+                self.bindings.wildcard.contains_key(&local_address.port())
                     || self
                         .bindings
                         .exact
                         .keys()
-                        .any(|address| address.port() == requested.port())
+                        .any(|address| address.port() == local_address.port())
             } else {
-                self.bindings.wildcard.contains_key(&requested.port())
-                    || self.bindings.exact.contains_key(&requested)
+                self.bindings.wildcard.contains_key(&local_address.port())
+                    || self.bindings.exact.contains_key(&local_address)
             }
         {
             return Err(BrokerError::Internal);
@@ -343,13 +309,13 @@ impl ReactorTcpState {
                 .wildcard
                 .try_reserve(1)
                 .map_err(|_| BrokerError::OutOfMemory)?;
-            self.bindings.wildcard.insert(requested.port(), binding);
+            self.bindings.wildcard.insert(local_address.port(), binding);
         } else {
             self.bindings
                 .exact
                 .try_reserve(1)
                 .map_err(|_| BrokerError::OutOfMemory)?;
-            self.bindings.exact.insert(requested, binding);
+            self.bindings.exact.insert(local_address, binding);
         }
         Ok(())
     }
@@ -380,15 +346,6 @@ impl ReactorTcpState {
             .cloned()
     }
 
-    pub(super) fn has_binding_on_port(&self, port: u16) -> bool {
-        self.bindings.wildcard.contains_key(&port)
-            || self
-                .bindings
-                .exact
-                .keys()
-                .any(|address| address.port() == port)
-    }
-
     pub(super) fn binding_for_socket(&self, socket_id: u64) -> Option<ReactorTcpBinding> {
         self.bindings
             .values()
@@ -404,15 +361,9 @@ fn confirm_tcp_connected(socket: &mut SocketEntry) {
         return;
     }
     socket.connection_status = SocketConnectionStatus::Connected;
-    let readiness = socket
-        .snapshot
-        .lock()
-        .expect("Linux socket snapshot mutex poisoned")
-        .readiness;
-    let _ = update_snapshot(socket, Some(SocketConnectionStatus::Connected), readiness);
 }
 
-/// Records a terminal native operation while a connect is pending.
+/// Records a terminal external operation while a connect is pending.
 fn fail_connect(socket: &mut SocketEntry, error: SocketError) {
     if socket.kind() != SocketKind::Tcp
         || socket.connection_status != SocketConnectionStatus::Connecting
@@ -420,20 +371,11 @@ fn fail_connect(socket: &mut SocketEntry, error: SocketError) {
         return;
     }
     socket.connection_status = SocketConnectionStatus::Failed(error);
-    let readiness = socket
-        .snapshot
-        .lock()
-        .expect("Linux socket snapshot mutex poisoned")
-        .readiness
-        | ReadinessFlags::ERROR;
-    let _ = update_snapshot(
-        socket,
-        Some(SocketConnectionStatus::Failed(error)),
-        readiness,
-    );
+    let readiness = socket.snapshot.load() | ReadinessFlags::ERROR;
+    let _ = update_snapshot(socket, readiness);
 }
 
-pub(super) fn connect_tcp_socket(
+pub(super) fn connect_external_tcp_socket(
     epoll_fd: &OwnedFd,
     id: u64,
     socket: &mut SocketEntry,
@@ -455,18 +397,18 @@ pub(super) fn connect_tcp_socket(
     if !unrealized {
         return Err(PlatformConnectError::PeerUnchanged(BrokerError::Internal));
     }
-    let native_socket = socket_with(
+    let external_socket = socket_with(
         rustix::net::AddressFamily::INET,
         rustix::net::SocketType::STREAM,
         LinuxSocketFlags::CLOEXEC | LinuxSocketFlags::NONBLOCK,
         Some(ipproto::TCP),
     )
     .map_err(|error| PlatformConnectError::PeerUnchanged(broker_error_from_errno(error)))?;
-    apply_tcp_options(&native_socket, no_delay, keep_alive)
+    apply_tcp_options(&external_socket, no_delay, keep_alive)
         .map_err(PlatformConnectError::PeerUnchanged)?;
     epoll::add(
         epoll_fd,
-        &native_socket,
+        &external_socket,
         epoll::EventData::new_u64(id),
         active_epoll_events(),
     )
@@ -474,7 +416,7 @@ pub(super) fn connect_tcp_socket(
     socket
         .tcp_state_mut()
         .map_err(PlatformConnectError::PeerUnchanged)?
-        .descriptor = TcpDescriptor::NativeInet(native_socket);
+        .descriptor = TcpDescriptor::ExternalInet(external_socket);
     socket.connection_status = SocketConnectionStatus::Connecting;
     let status = loop {
         match connect(
@@ -497,12 +439,8 @@ pub(super) fn connect_tcp_socket(
                     Err(error) => {
                         socket.connection_status =
                             SocketConnectionStatus::Failed(SocketError::Other);
-                        update_snapshot(
-                            socket,
-                            Some(SocketConnectionStatus::Failed(SocketError::Other)),
-                            ReadinessFlags::ERROR,
-                        )
-                        .map_err(PlatformConnectError::PeerIndeterminate)?;
+                        update_snapshot(socket, ReadinessFlags::ERROR)
+                            .map_err(PlatformConnectError::PeerIndeterminate)?;
                         return Err(PlatformConnectError::PeerIndeterminate(error));
                     }
                 };
@@ -512,20 +450,9 @@ pub(super) fn connect_tcp_socket(
     };
     socket.connection_status = status;
     let readiness = match status {
-        SocketConnectionStatus::Connected | SocketConnectionStatus::Connecting => {
-            if socket.guest_local_address.is_none() {
-                return Err(PlatformConnectError::PeerIndeterminate(
-                    BrokerError::Internal,
-                ));
-            }
-            if status == SocketConnectionStatus::Connected {
-                ReadinessFlags::WRITE
-            } else {
-                ReadinessFlags::default()
-            }
-        }
+        SocketConnectionStatus::Connected => ReadinessFlags::WRITE,
+        SocketConnectionStatus::Connecting => ReadinessFlags::default(),
         SocketConnectionStatus::Failed(_) => ReadinessFlags::ERROR,
-        SocketConnectionStatus::Unconnected => ReadinessFlags::default(),
         _ => {
             return Err(PlatformConnectError::PeerIndeterminate(
                 BrokerError::Internal,
@@ -583,6 +510,26 @@ pub(super) fn send_socket(
             }
         }
     }
+}
+
+fn validate_peek_window(
+    length: usize,
+    peek_offset: usize,
+    peek_length: usize,
+) -> BrokerResult<usize> {
+    let peek_end = peek_offset
+        .checked_add(length)
+        .ok_or(BrokerError::UnsupportedOperation)?;
+    let canonical_length = peek_length
+        .checked_sub(peek_offset)
+        .map(|remaining| remaining.min(MAX_SOCKET_TRANSFER_SIZE as usize));
+    if !peek_offset.is_multiple_of(MAX_SOCKET_TRANSFER_SIZE as usize)
+        || canonical_length != Some(length)
+        || peek_length > MAX_SOCKET_PEEK_SIZE as usize
+    {
+        return Err(BrokerError::UnsupportedOperation);
+    }
+    Ok(peek_end)
 }
 
 pub(super) fn receive_socket(
@@ -651,29 +598,13 @@ pub(super) fn receive_socket(
         return receive_socket_once(socket, zeroed_vec(length)?, LinuxRecvFlags::empty());
     }
 
-    let peek_end = peek_offset
-        .checked_add(length)
-        .ok_or(BrokerError::UnsupportedOperation)?;
-    let canonical_length = peek_length
-        .checked_sub(peek_offset)
-        .map(|remaining| remaining.min(MAX_SOCKET_TRANSFER_SIZE as usize));
-    if !peek_offset.is_multiple_of(MAX_SOCKET_TRANSFER_SIZE as usize)
-        || canonical_length != Some(length)
-        || peek_length < peek_end
-        || peek_length > MAX_SOCKET_PEEK_SIZE as usize
-    {
-        return Err(BrokerError::UnsupportedOperation);
-    }
+    let peek_end = validate_peek_window(length, peek_offset, peek_length)?;
     if flags.contains(ReceiveFlags::WAITALL) {
-        let snapshot = *socket
-            .snapshot
-            .lock()
-            .expect("Linux socket snapshot mutex poisoned");
+        let readiness = socket.snapshot.load();
         let terminal = socket.read_shutdown
-            || snapshot.readiness.contains(ReadinessFlags::HANGUP)
-            || snapshot.readiness.contains(ReadinessFlags::ERROR);
-        if socket.connection_status == SocketConnectionStatus::Connected
-            && !terminal
+            || readiness.contains(ReadinessFlags::HANGUP)
+            || readiness.contains(ReadinessFlags::ERROR);
+        if !terminal
             && ioctl_fionread(socket.tcp_state()?.descriptor.socket()?)
                 .map_err(broker_error_from_errno)?
                 < peek_length.try_into().map_err(|_| BrokerError::Internal)?
@@ -728,11 +659,7 @@ pub(super) fn receive_socket(
 
     let cache = peek_cache.as_ref().ok_or(BrokerError::Internal)?;
     if cache.data.len() <= peek_offset {
-        let readiness = socket
-            .snapshot
-            .lock()
-            .expect("Linux socket snapshot mutex poisoned")
-            .readiness;
+        let readiness = socket.snapshot.load();
         let terminal = socket.read_shutdown
             || readiness.contains(ReadinessFlags::HANGUP)
             || readiness.contains(ReadinessFlags::ERROR);
@@ -778,13 +705,8 @@ fn receive_socket_once(
             Ok((_buffer, received)) => {
                 confirm_tcp_connected(socket);
                 data.truncate(received);
-                let terminal_readable = socket.read_shutdown
-                    || socket
-                        .snapshot
-                        .lock()
-                        .expect("Linux socket snapshot mutex poisoned")
-                        .readiness
-                        .contains(ReadinessFlags::HANGUP);
+                let terminal_readable =
+                    socket.read_shutdown || socket.snapshot.load().contains(ReadinessFlags::HANGUP);
                 if !flags.contains(LinuxRecvFlags::PEEK) && !terminal_readable {
                     let no_queued_data = ioctl_fionread(socket.tcp_state()?.descriptor.socket()?)
                         .is_ok_and(|available| available == 0);
@@ -818,20 +740,10 @@ fn receive_guest_read_shutdown(
 ) -> BrokerResult<Option<ReactorReceiveOutcome>> {
     let peek = flags.contains(ReceiveFlags::PEEK);
     let (relative_start, relative_end) = if peek {
-        let peek_end = peek_offset
-            .checked_add(length)
-            .ok_or(BrokerError::UnsupportedOperation)?;
-        let canonical_length = peek_length
-            .checked_sub(peek_offset)
-            .map(|remaining| remaining.min(MAX_SOCKET_TRANSFER_SIZE as usize));
-        if !peek_offset.is_multiple_of(MAX_SOCKET_TRANSFER_SIZE as usize)
-            || canonical_length != Some(length)
-            || peek_length < peek_end
-            || peek_length > MAX_SOCKET_PEEK_SIZE as usize
-        {
-            return Err(BrokerError::UnsupportedOperation);
-        }
-        (peek_offset, peek_end)
+        (
+            peek_offset,
+            validate_peek_window(length, peek_offset, peek_length)?,
+        )
     } else {
         if peek_offset != 0 || peek_length != 0 {
             return Err(BrokerError::UnsupportedOperation);
@@ -873,10 +785,7 @@ fn receive_guest_read_shutdown(
     Ok(Some(ReactorReceiveOutcome::Received(data)))
 }
 
-fn capture_guest_read_shutdown(
-    socket: &SocketEntry,
-    mut queued: Vec<u8>,
-) -> BrokerResult<GuestTcpReadShutdown> {
+fn capture_guest_read_shutdown(socket: &SocketEntry, queued: &mut Vec<u8>) -> BrokerResult<()> {
     let mut received = 0;
     while received < queued.len() {
         match recv(
@@ -884,19 +793,21 @@ fn capture_guest_read_shutdown(
             &mut queued[received..],
             LinuxRecvFlags::WAITALL,
         ) {
-            Ok((_buffer, 0)) => return Err(BrokerError::Internal),
+            Ok((_buffer, 0)) => {
+                queued.truncate(received);
+                return Err(BrokerError::Internal);
+            }
             Ok((_buffer, count)) => {
-                received = received.checked_add(count).ok_or(BrokerError::Internal)?;
+                received += count;
             }
             Err(Errno::INTR) => {}
-            Err(_) => return Err(BrokerError::Internal),
+            Err(_) => {
+                queued.truncate(received);
+                return Err(BrokerError::Internal);
+            }
         }
     }
-    Ok(GuestTcpReadShutdown {
-        queued,
-        consumed: 0,
-        discarded_data: false,
-    })
+    Ok(())
 }
 
 fn discard_guest_read_shutdown_data(socket: &mut SocketEntry) -> BrokerResult<()> {
@@ -904,7 +815,6 @@ fn discard_guest_read_shutdown_data(socket: &mut SocketEntry) -> BrokerResult<()
         return Ok(());
     }
     let mut data = [0_u8; 8192];
-    let mut discarded_data = false;
     loop {
         match recv(
             socket.tcp_state()?.descriptor.socket()?,
@@ -912,21 +822,20 @@ fn discard_guest_read_shutdown_data(socket: &mut SocketEntry) -> BrokerResult<()
             LinuxRecvFlags::empty(),
         ) {
             Ok((_, 0)) | Err(Errno::AGAIN) => break,
-            Ok((_buffer, _)) => discarded_data = true,
+            Ok((_buffer, _)) => {
+                socket
+                    .tcp_state_mut()?
+                    .guest_read_shutdown
+                    .as_mut()
+                    .ok_or(BrokerError::Internal)?
+                    .discarded_data = true;
+            }
             Err(Errno::INTR) => {}
             Err(error) => {
                 socket_operation_error_from_errno(error)?;
                 break;
             }
         }
-    }
-    if discarded_data {
-        socket
-            .tcp_state_mut()?
-            .guest_read_shutdown
-            .as_mut()
-            .ok_or(BrokerError::Internal)?
-            .discarded_data = true;
     }
     Ok(())
 }
@@ -937,14 +846,14 @@ pub(super) fn set_tcp_option(socket: &mut SocketEntry, value: TcpOptionValue) ->
     }
     match value {
         TcpOptionValue::NoDelay(value) => {
-            if socket.tcp_state()?.descriptor.is_native() {
+            if socket.tcp_state()?.descriptor.is_external() {
                 sockopt::set_tcp_nodelay(socket.tcp_state()?.descriptor.socket()?, value)
                     .map_err(broker_error_from_errno)?;
             }
             socket.tcp_state_mut()?.no_delay = value;
         }
         TcpOptionValue::KeepAlive(value) => {
-            if socket.tcp_state()?.descriptor.is_native() {
+            if socket.tcp_state()?.descriptor.is_external() {
                 sockopt::set_socket_keepalive(socket.tcp_state()?.descriptor.socket()?, value)
                     .map_err(broker_error_from_errno)?;
             }
@@ -972,13 +881,13 @@ pub(super) fn get_tcp_option(
         return Err(BrokerError::UnsupportedOperation);
     }
     match name {
-        TcpOptionName::NoDelay if socket.tcp_state()?.descriptor.is_native() => {
+        TcpOptionName::NoDelay if socket.tcp_state()?.descriptor.is_external() => {
             sockopt::tcp_nodelay(socket.tcp_state()?.descriptor.socket()?)
                 .map(TcpOptionValue::NoDelay)
                 .map_err(broker_error_from_errno)
         }
         TcpOptionName::NoDelay => Ok(TcpOptionValue::NoDelay(socket.tcp_state()?.no_delay)),
-        TcpOptionName::KeepAlive if socket.tcp_state()?.descriptor.is_native() => {
+        TcpOptionName::KeepAlive if socket.tcp_state()?.descriptor.is_external() => {
             sockopt::socket_keepalive(socket.tcp_state()?.descriptor.socket()?)
                 .map(TcpOptionValue::KeepAlive)
                 .map_err(broker_error_from_errno)
@@ -996,7 +905,7 @@ pub(super) fn shutdown_tcp_socket(
         return Err(BrokerError::Internal);
     }
     if mode == ShutdownMode::Abort {
-        if socket.tcp_state()?.descriptor.is_native() {
+        if socket.tcp_state()?.descriptor.is_external() {
             sockopt::set_socket_linger(
                 socket.tcp_state()?.descriptor.socket()?,
                 Some(Duration::ZERO),
@@ -1015,12 +924,12 @@ pub(super) fn shutdown_tcp_socket(
     if matches!(socket.tcp_state()?.descriptor, TcpDescriptor::Unrealized) {
         return Ok(SocketOutcome::Failed(SocketError::NotConnected));
     }
-    let guest_endpoint = socket.tcp_state()?.descriptor.is_guest();
+    let internal_endpoint = socket.tcp_state()?.descriptor.is_internal();
     // AF_UNIX read shutdown changes peer write behavior, so guest read
     // shutdown remains logical while write shutdown reaches the kernel.
     let (kernel_shutdown, add, clear, shuts_down_read, shuts_down_write) = match mode {
         ShutdownMode::Read => (
-            (!guest_endpoint).then_some(LinuxShutdown::Read),
+            (!internal_endpoint).then_some(LinuxShutdown::Read),
             ReadinessFlags::READ,
             ReadinessFlags::default(),
             true,
@@ -1034,7 +943,7 @@ pub(super) fn shutdown_tcp_socket(
             true,
         ),
         ShutdownMode::Both => (
-            Some(if guest_endpoint {
+            Some(if internal_endpoint {
                 LinuxShutdown::Write
             } else {
                 LinuxShutdown::Both
@@ -1046,15 +955,16 @@ pub(super) fn shutdown_tcp_socket(
         ),
         _ => return Err(BrokerError::UnsupportedOperation),
     };
-    let guest_read_shutdown_buffer = if guest_endpoint && shuts_down_read && !socket.read_shutdown {
-        let available: usize = ioctl_fionread(socket.tcp_state()?.descriptor.socket()?)
-            .map_err(broker_error_from_errno)?
-            .try_into()
-            .map_err(|_| BrokerError::Internal)?;
-        Some(zeroed_vec(available)?)
-    } else {
-        None
-    };
+    let guest_read_shutdown_buffer =
+        if internal_endpoint && shuts_down_read && !socket.read_shutdown {
+            let available: usize = ioctl_fionread(socket.tcp_state()?.descriptor.socket()?)
+                .map_err(broker_error_from_errno)?
+                .try_into()
+                .map_err(|_| BrokerError::Internal)?;
+            Some(zeroed_vec(available)?)
+        } else {
+            None
+        };
     if let Some(kernel_shutdown) = kernel_shutdown {
         loop {
             match shutdown(socket.tcp_state()?.descriptor.socket()?, kernel_shutdown) {
@@ -1072,10 +982,18 @@ pub(super) fn shutdown_tcp_socket(
             }
         }
     }
-    if let Some(queued) = guest_read_shutdown_buffer {
-        let shutdown = capture_guest_read_shutdown(socket, queued)?;
-        socket.tcp_state_mut()?.guest_read_shutdown = Some(shutdown);
-    }
+    let shutdown_error = if let Some(mut queued) = guest_read_shutdown_buffer {
+        let capture_error = capture_guest_read_shutdown(socket, &mut queued).err();
+        socket.tcp_state_mut()?.guest_read_shutdown = Some(GuestTcpReadShutdown {
+            queued,
+            consumed: 0,
+            discarded_data: capture_error.is_some(),
+        });
+        let discard_error = discard_guest_read_shutdown_data(socket).err();
+        capture_error.or(discard_error)
+    } else {
+        None
+    };
     socket.read_shutdown |= shuts_down_read;
     socket.write_shutdown |= shuts_down_write;
     let republish_readiness = shuts_down_read
@@ -1084,16 +1002,15 @@ pub(super) fn shutdown_tcp_socket(
             .peek_waitall_threshold
             .take()
             .is_some();
-    let current = socket
-        .snapshot
-        .lock()
-        .expect("Linux socket snapshot mutex poisoned")
-        .readiness;
+    let current = socket.snapshot.load();
     let readiness = ReadinessFlags((current.0 & !clear.0) | add.0);
-    // Native shutdown and the cached directional state are committed.
-    let _ = update_snapshot(socket, None, readiness);
+    // Kernel shutdown and the cached directional state are committed.
+    let _ = update_snapshot(socket, readiness);
     if republish_readiness {
         let _ = socket.readiness.republish(readiness);
+    }
+    if let Some(error) = shutdown_error {
+        return Err(error);
     }
     Ok(SocketOutcome::Completed(()))
 }
@@ -1112,7 +1029,7 @@ pub(super) fn handle_socket_event(
     // setup, so this only absorbs a synthetic sink fault. Genuine host-syscall
     // or internal-consistency errors still propagate and remain fatal.
     if socket.kind() == SocketKind::Udp {
-        let _ = update_snapshot(socket, None, readiness_from_epoll(socket, events));
+        let _ = update_snapshot(socket, readiness_from_epoll(socket, events));
         return Ok(());
     }
     if events.contains(epoll::EventFlags::IN) {
@@ -1144,54 +1061,44 @@ pub(super) fn handle_socket_event(
             complete_connect(socket, events)?;
         }
         SocketConnectionStatus::Connected => {
-            let _ = update_snapshot(socket, None, readiness_from_epoll(socket, events));
+            let _ = update_snapshot(socket, readiness_from_epoll(socket, events));
         }
         SocketConnectionStatus::Failed(SocketError::NotConnected) if socket.read_shutdown => {
-            let _ = update_snapshot(socket, None, ReadinessFlags::WRITE | ReadinessFlags::HANGUP);
+            let _ = update_snapshot(socket, ReadinessFlags::WRITE | ReadinessFlags::HANGUP);
         }
         SocketConnectionStatus::Failed(_) => {
-            let _ = update_snapshot(socket, None, ReadinessFlags::ERROR);
+            let _ = update_snapshot(socket, ReadinessFlags::ERROR);
         }
         _ => return Err(BrokerError::Internal),
     }
     if republish_readiness {
-        let readiness = socket
-            .snapshot
-            .lock()
-            .expect("Linux socket snapshot mutex poisoned")
-            .readiness;
+        let readiness = socket.snapshot.load();
         let _ = socket.readiness.republish(readiness);
     }
     Ok(())
 }
 
-fn complete_connect(
-    socket: &mut SocketEntry,
-    events: epoll::EventFlags,
-) -> BrokerResult<SocketConnectionStatus> {
+fn complete_connect(socket: &mut SocketEntry, events: epoll::EventFlags) -> BrokerResult<()> {
     // Epoll re-polls the descriptor when waiting, so OUT here reflects the
     // current post-connect state rather than readiness cached before connect.
-    if !socket.tcp_state()?.descriptor.is_native() {
+    if !socket.tcp_state()?.descriptor.is_external() {
         return Err(BrokerError::Internal);
     }
     let status = match sockopt::socket_error(socket.tcp_state()?.descriptor.socket()?) {
         Ok(Ok(())) if events.contains(epoll::EventFlags::OUT) => SocketConnectionStatus::Connected,
         Ok(Ok(())) => SocketConnectionStatus::Connecting,
-        Ok(Err(error)) | Err(error) => {
-            SocketConnectionStatus::Failed(socket_error_from_errno(error))
-        }
+        Ok(Err(error)) => SocketConnectionStatus::Failed(socket_error_from_errno(error)),
+        Err(error) => return Err(broker_error_from_errno(error)),
     };
     let readiness = match status {
-        SocketConnectionStatus::Connected => {
-            readiness_from_epoll(socket, events) | ReadinessFlags::WRITE
-        }
+        SocketConnectionStatus::Connected => readiness_from_epoll(socket, events),
         SocketConnectionStatus::Connecting => ReadinessFlags::default(),
         SocketConnectionStatus::Failed(_) => ReadinessFlags::ERROR,
         _ => return Err(BrokerError::Internal),
     };
     socket.connection_status = status;
-    let _ = update_snapshot(socket, Some(status), readiness);
-    Ok(status)
+    let _ = update_snapshot(socket, readiness);
+    Ok(())
 }
 
 impl Reactor {
@@ -1276,11 +1183,7 @@ impl Reactor {
                 socket.read_shutdown = true;
                 socket.connection_status =
                     SocketConnectionStatus::Failed(SocketError::NotConnected);
-                let _ = update_snapshot(
-                    socket,
-                    Some(SocketConnectionStatus::Failed(SocketError::NotConnected)),
-                    ReadinessFlags::WRITE | ReadinessFlags::HANGUP,
-                );
+                let _ = update_snapshot(socket, ReadinessFlags::WRITE | ReadinessFlags::HANGUP);
                 listener.queue
             };
             self.discard_queued_guest_connections(queued, true);
@@ -1301,41 +1204,32 @@ impl Reactor {
         if already_bound {
             return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
         }
-        let guest_address = binding.requested();
+        let guest_address = binding.local_address();
         self.tcp.insert_binding(ReactorTcpBinding {
             socket_id: id,
             guest_binding: binding,
         })?;
         let socket = self.sockets.get_mut(&id).ok_or(BrokerError::Internal)?;
         socket.guest_local_address = Some(guest_address);
-        socket
-            .snapshot
-            .lock()
-            .expect("Linux socket snapshot mutex poisoned")
-            .local_address = Some(guest_address);
         Ok(SocketOutcome::Completed(guest_address))
     }
 
-    pub(super) fn connect_tcp_guest(
+    pub(super) fn connect_tcp_destination(
         &mut self,
         id: u64,
-        guest_address: SocketAddrV4,
+        requested_destination: SocketAddrV4,
         guest_source_lease: Option<GuestSourceLease>,
     ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
-        let (session_id, reserved_local_address) = self
+        let session_id = self
             .sockets
             .get(&id)
-            .and_then(|socket| {
-                socket
-                    .guest_local_address
-                    .map(|address| (socket.session_id, address))
-            })
+            .and_then(|socket| socket.guest_local_address.map(|_| socket.session_id))
             .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?;
         let binding = self
             .tcp
             .binding_for_socket(id)
             .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?;
-        let destination = match self.resolve_guest_destination(guest_address) {
+        let destination = match self.resolve_tcp_destination(requested_destination) {
             SocketOutcome::Completed(destination) => destination,
             SocketOutcome::Failed(error) => {
                 drop(guest_source_lease);
@@ -1345,24 +1239,24 @@ impl Reactor {
                     .get_mut(&id)
                     .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?;
                 socket.connection_status = status;
-                update_snapshot(socket, Some(status), ReadinessFlags::ERROR)
+                update_snapshot(socket, ReadinessFlags::ERROR)
                     .map_err(PlatformConnectError::PeerIndeterminate)?;
                 return Ok(status);
             }
         };
-        if let ResolvedTcpDestination::Guest {
+        if let ResolvedTcpDestination::Internal {
             listener_id,
             concrete_address,
         } = destination
         {
             let source_address = binding
                 .guest_binding
-                .guest_source_address(concrete_address)
+                .source_address_for_destination(concrete_address)
                 .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?;
             let guest_source_lease = guest_source_lease
                 .filter(|lease| lease.source_address() == source_address)
                 .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?;
-            return self.connect_guest_tcp_socketpair(
+            return self.connect_internal_tcp_socketpair(
                 id,
                 session_id,
                 listener_id,
@@ -1371,29 +1265,22 @@ impl Reactor {
             );
         }
         drop(guest_source_lease);
-        let ResolvedTcpDestination::Native(network_address) = destination else {
-            unreachable!("guest destination handled above");
+        let ResolvedTcpDestination::External(external_destination) = destination else {
+            unreachable!("internal destination handled above");
         };
-        let (status, readiness) = connect_tcp_socket(
+        let host_destination = host_socket_destination(external_destination);
+        let guest_local_address = binding
+            .guest_binding
+            .source_address_for_destination(external_destination)
+            .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?;
+        let (status, readiness) = connect_external_tcp_socket(
             &self.epoll,
             id,
             self.sockets
                 .get_mut(&id)
                 .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?,
-            network_address,
+            host_destination,
         )?;
-        let local_guest_address = if matches!(
-            status,
-            SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
-        ) {
-            if binding.guest_binding.is_wildcard() {
-                SocketAddrV4::new(Ipv4Addr::LOCALHOST, reserved_local_address.port())
-            } else {
-                reserved_local_address
-            }
-        } else {
-            reserved_local_address
-        };
         if matches!(
             status,
             SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
@@ -1404,12 +1291,7 @@ impl Reactor {
                     .ok_or(PlatformConnectError::PeerIndeterminate(
                         BrokerError::Internal,
                     ))?;
-            socket.guest_local_address = Some(local_guest_address);
-            socket
-                .snapshot
-                .lock()
-                .expect("Linux socket snapshot mutex poisoned")
-                .local_address = Some(local_guest_address);
+            socket.guest_local_address = Some(guest_local_address);
         }
         update_snapshot(
             self.sockets
@@ -1417,14 +1299,13 @@ impl Reactor {
                 .ok_or(PlatformConnectError::PeerIndeterminate(
                     BrokerError::Internal,
                 ))?,
-            Some(status),
             readiness,
         )
         .map_err(PlatformConnectError::PeerIndeterminate)?;
         Ok(status)
     }
 
-    fn connect_guest_tcp_socketpair(
+    fn connect_internal_tcp_socketpair(
         &mut self,
         connector_socket_id: u64,
         connector_session_id: SessionId,
@@ -1433,14 +1314,16 @@ impl Reactor {
         guest_source_lease: GuestSourceLease,
     ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
         let source_address = guest_source_lease.source_address();
-        let combined_count = self
-            .sockets
-            .len()
-            .checked_add(self.tcp.queued_guest_connection_count)
-            .and_then(|count| count.checked_add(1))
+        let next_queued_count = self
+            .tcp
+            .queued_guest_connection_count
+            .checked_add(1)
             .ok_or(PlatformConnectError::PeerUnchanged(
                 BrokerError::ResourceExhausted,
             ))?;
+        let combined_count = self.sockets.len().checked_add(next_queued_count).ok_or(
+            PlatformConnectError::PeerUnchanged(BrokerError::ResourceExhausted),
+        )?;
         let session = self
             .sessions
             .get(&connector_session_id)
@@ -1498,7 +1381,7 @@ impl Reactor {
                     .get_mut(&connector_socket_id)
                     .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?;
                 connector.connection_status = status;
-                update_snapshot(connector, Some(status), ReadinessFlags::ERROR)
+                update_snapshot(connector, ReadinessFlags::ERROR)
                     .map_err(PlatformConnectError::PeerIndeterminate)?;
                 return Ok(status);
             }
@@ -1536,7 +1419,7 @@ impl Reactor {
             let tcp = connector
                 .tcp_state_mut()
                 .map_err(PlatformConnectError::PeerIndeterminate)?;
-            tcp.descriptor = TcpDescriptor::GuestUnix(connector_socket);
+            tcp.descriptor = TcpDescriptor::InternalUnix(connector_socket);
             tcp.guest_endpoint = Some(GuestTcpEndpoint {
                 connector_socket_id,
                 queued_listener_id: Some(listener_id),
@@ -1544,11 +1427,6 @@ impl Reactor {
             });
             connector.guest_local_address = Some(source_address);
             connector.connection_status = SocketConnectionStatus::Connected;
-            connector
-                .snapshot
-                .lock()
-                .expect("Linux socket snapshot mutex poisoned")
-                .local_address = Some(source_address);
         }
         self.sockets
             .get_mut(&listener_id)
@@ -1566,7 +1444,7 @@ impl Reactor {
                 local_address,
                 guest_source_lease,
             });
-        self.tcp.queued_guest_connection_count = combined_count - self.sockets.len();
+        self.tcp.queued_guest_connection_count = next_queued_count;
         self.sessions
             .get_mut(&connector_session_id)
             .expect("validated connector session missing")
@@ -1576,7 +1454,6 @@ impl Reactor {
             self.sockets.get(&connector_socket_id).ok_or(
                 PlatformConnectError::PeerIndeterminate(BrokerError::Internal),
             )?,
-            Some(SocketConnectionStatus::Connected),
             ReadinessFlags::WRITE,
         ) {
             self.remove_queued_guest_connection(listener_id, connector_socket_id, false);
@@ -1639,7 +1516,7 @@ impl Reactor {
                 .and_then(|socket| socket.tcp_state().ok())
                 .is_some_and(|tcp| {
                     tcp.abortive_close
-                        || tcp.descriptor.is_guest() && guest_tcp_has_unread_data(tcp)
+                        || tcp.descriptor.is_internal() && guest_tcp_has_unread_data(tcp)
                 });
         let socket = self
             .sockets
@@ -1654,9 +1531,9 @@ impl Reactor {
             unreachable!("checked TCP socket changed transport");
         };
         if tcp.abortive_close
-            && let TcpDescriptor::NativeInet(socket) = &tcp.descriptor
+            && let TcpDescriptor::ExternalInet(socket) = &tcp.descriptor
         {
-            // Abort may be requested before lazy native realization or after
+            // Abort may be requested before lazy external realization or after
             // the response receiver disappears, so enforce it again at close.
             let _ = sockopt::set_socket_linger(socket, Some(Duration::ZERO));
         }
@@ -1667,7 +1544,7 @@ impl Reactor {
             self.discard_queued_guest_connections(listener.queue, true);
         }
         if reset_peer && let Some(connector_socket_id) = guest_connector_socket_id {
-            self.mark_guest_peer_reset(connector_socket_id, id);
+            self.mark_guest_peer_reset(connector_socket_id);
         }
         if let Some(session) = self.sessions.get_mut(&session_id) {
             session.live_socket_count = session
@@ -1779,15 +1656,14 @@ impl Reactor {
         true
     }
 
-    fn mark_guest_peer_reset(&mut self, connector_socket_id: u64, excluded_id: u64) {
+    fn mark_guest_peer_reset(&mut self, connector_socket_id: u64) {
         let peer_id = self.sockets.iter().find_map(|(id, socket)| {
-            (*id != excluded_id
-                && socket
-                    .tcp_state()
-                    .ok()
-                    .and_then(|tcp| tcp.guest_endpoint.as_ref())
-                    .is_some_and(|endpoint| endpoint.connector_socket_id == connector_socket_id))
-            .then_some(*id)
+            socket
+                .tcp_state()
+                .ok()
+                .and_then(|tcp| tcp.guest_endpoint.as_ref())
+                .is_some_and(|endpoint| endpoint.connector_socket_id == connector_socket_id)
+                .then_some(*id)
         });
         if let Some(peer_id) = peer_id {
             self.mark_guest_socket_reset(peer_id);
@@ -1809,21 +1685,17 @@ impl Reactor {
             GuestTcpResetState::Pending => {}
             GuestTcpResetState::Reported => return,
         }
-        let readiness = {
-            let mut snapshot = socket
-                .snapshot
-                .lock()
-                .expect("Linux socket snapshot mutex poisoned");
-            if snapshot.pending_error.is_none() {
-                snapshot.pending_error = Some(SocketError::ConnectionReset);
-            }
-            snapshot.readiness = snapshot.readiness
-                | ReadinessFlags::READ
-                | ReadinessFlags::ERROR
-                | ReadinessFlags::HANGUP;
-            snapshot.readiness
+        if socket.pending_error.is_none() {
+            socket.pending_error = Some(SocketError::ConnectionReset);
+        }
+        let current = socket.snapshot.load();
+        let readiness =
+            current | ReadinessFlags::READ | ReadinessFlags::ERROR | ReadinessFlags::HANGUP;
+        let _ = if readiness == current {
+            socket.readiness.republish(readiness)
+        } else {
+            update_snapshot(socket, readiness)
         };
-        let _ = socket.readiness.publish(readiness);
     }
 
     fn publish_listener_queue_readiness(&self, listener_id: u64) -> BrokerResult<()> {
@@ -1836,21 +1708,16 @@ impl Reactor {
             .listener
             .as_ref()
             .is_some_and(|state| !state.queue.is_empty());
-        let current = listener
-            .snapshot
-            .lock()
-            .expect("Linux socket snapshot mutex poisoned")
-            .readiness;
+        let current = listener.snapshot.load();
         if queue_nonempty {
             if current.contains(ReadinessFlags::READ) {
                 listener.readiness.republish(current)
             } else {
-                update_snapshot(listener, None, current | ReadinessFlags::READ)
+                update_snapshot(listener, current | ReadinessFlags::READ)
             }
         } else if current.contains(ReadinessFlags::READ) {
             update_snapshot(
                 listener,
-                None,
                 ReadinessFlags(current.0 & !ReadinessFlags::READ.0),
             )
         } else {
@@ -1877,36 +1744,33 @@ impl Reactor {
         self.remove_queued_guest_connection(listener_id, connector_socket_id, true);
     }
 
-    fn resolve_guest_destination(
+    fn resolve_tcp_destination(
         &self,
-        mut address: SocketAddrV4,
+        requested_destination: SocketAddrV4,
     ) -> SocketOutcome<ResolvedTcpDestination> {
-        if address.ip().is_unspecified() {
-            address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, address.port());
+        let destination = match normalize_socket_destination(requested_destination) {
+            Ok(destination) => destination,
+            Err(error) => return SocketOutcome::Failed(error),
+        };
+        if !is_internal_socket_address(destination) {
+            return SocketOutcome::Completed(ResolvedTcpDestination::External(destination));
         }
-        if let Some(binding) = self.tcp.guest_binding(address) {
-            let listener_live = self
-                .sockets
-                .get(&binding.socket_id)
-                .and_then(|listener| listener.tcp_state().ok())
-                .and_then(|tcp| tcp.listener.as_ref())
-                .is_some();
-            if !listener_live {
-                return SocketOutcome::Failed(SocketError::ConnectionRefused);
-            }
-            return SocketOutcome::Completed(ResolvedTcpDestination::Guest {
-                listener_id: binding.socket_id,
-                concrete_address: address,
-            });
-        }
-        // TODO: Once gateway routing replaces host-loopback fallback, fail all
-        // unmatched guest-network destinations closed.
-        if *address.ip() == GUEST_IPV4_ADDRESS
-            || (address.ip().is_loopback() && self.tcp.has_binding_on_port(address.port()))
-        {
+        let Some(binding) = self.tcp.guest_binding(destination) else {
+            return SocketOutcome::Failed(SocketError::ConnectionRefused);
+        };
+        let listener_live = self
+            .sockets
+            .get(&binding.socket_id)
+            .and_then(|listener| listener.tcp_state().ok())
+            .and_then(|tcp| tcp.listener.as_ref())
+            .is_some();
+        if !listener_live {
             return SocketOutcome::Failed(SocketError::ConnectionRefused);
         }
-        SocketOutcome::Completed(ResolvedTcpDestination::Native(address))
+        SocketOutcome::Completed(ResolvedTcpDestination::Internal {
+            listener_id: binding.socket_id,
+            concrete_address: destination,
+        })
     }
 
     pub(super) fn listen_socket(
@@ -1925,7 +1789,7 @@ impl Reactor {
         let guest_address = guest_address.ok_or(BrokerError::Internal)?;
         self.tcp
             .binding_for_socket(id)
-            .filter(|binding| binding.guest_binding.requested() == guest_address)
+            .filter(|binding| binding.guest_binding.local_address() == guest_address)
             .ok_or(BrokerError::Internal)?;
         let backlog = usize::try_from(backlog)
             .map_err(|_| BrokerError::UnsupportedOperation)?
@@ -1955,7 +1819,7 @@ impl Reactor {
         listener_id: u64,
         accepted_id: u64,
         readiness: ReadinessRegistration,
-        snapshot: Arc<Mutex<SocketSnapshot>>,
+        snapshot: Arc<SocketSnapshot>,
         lifecycle: &SocketLifecycle,
     ) -> BrokerResult<SocketOutcome<AcceptedEndpoints>> {
         if self.sockets.contains_key(&accepted_id) {
@@ -1966,7 +1830,6 @@ impl Reactor {
             listener_tcp_no_delay,
             listener_tcp_keep_alive,
             queue_length,
-            accepted_local_address,
             accepted_connector_socket_id,
             accepted_connector_session_id,
         ) = {
@@ -1983,10 +1846,6 @@ impl Reactor {
                 tcp.no_delay,
                 tcp.keep_alive,
                 listener_state.queue.len(),
-                listener_state.queue.front().map_or(
-                    listener.guest_local_address.ok_or(BrokerError::Internal)?,
-                    |queued| queued.local_address,
-                ),
                 listener_state
                     .queue
                     .front()
@@ -2043,14 +1902,7 @@ impl Reactor {
                 return Err(error);
             }
         }
-        {
-            let mut snapshot = snapshot
-                .lock()
-                .expect("Linux socket snapshot mutex poisoned");
-            snapshot.status = SocketConnectionStatus::Connected;
-            snapshot.local_address = Some(accepted_local_address);
-            snapshot.readiness = ReadinessFlags::WRITE;
-        }
+        snapshot.store(ReadinessFlags::WRITE);
         if let Err(error) = readiness.publish(ReadinessFlags::WRITE) {
             self.purge_failed_accept_setup(listener_id, accepted_connector_socket_id);
             return Err(error);
@@ -2096,7 +1948,7 @@ impl Reactor {
             SocketEntry {
                 session_id: listener_session_id,
                 transport: SocketTransportState::Tcp(TcpSocketState {
-                    descriptor: TcpDescriptor::GuestUnix(socket),
+                    descriptor: TcpDescriptor::InternalUnix(socket),
                     listener: None,
                     guest_endpoint: Some(GuestTcpEndpoint {
                         connector_socket_id,
@@ -2112,6 +1964,7 @@ impl Reactor {
                 readiness,
                 snapshot,
                 connection_status: SocketConnectionStatus::Connected,
+                pending_error: None,
                 read_shutdown: false,
                 write_shutdown: false,
                 guest_local_address: Some(local_address),
@@ -2153,20 +2006,15 @@ pub(super) fn consume_pending_guest_reset(socket: &mut SocketEntry) -> BrokerRes
         true
     };
     if consumed {
+        if socket.pending_error == Some(SocketError::ConnectionReset) {
+            socket.pending_error = None;
+        }
         let cleared_readiness = {
-            let mut snapshot = socket
-                .snapshot
-                .lock()
-                .expect("Linux socket snapshot mutex poisoned");
-            if snapshot.pending_error == Some(SocketError::ConnectionReset) {
-                snapshot.pending_error = None;
-            }
-            if snapshot.pending_error.is_none()
-                && snapshot.readiness.contains(ReadinessFlags::ERROR)
-            {
-                snapshot.readiness =
-                    ReadinessFlags(snapshot.readiness.0 & !ReadinessFlags::ERROR.0);
-                Some(snapshot.readiness)
+            let readiness = socket.snapshot.load();
+            if socket.pending_error.is_none() && readiness.contains(ReadinessFlags::ERROR) {
+                let readiness = ReadinessFlags(readiness.0 & !ReadinessFlags::ERROR.0);
+                socket.snapshot.store(readiness);
+                Some(readiness)
             } else {
                 None
             }

@@ -13,11 +13,13 @@ use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::{
     SHARED_BUFFER_POOL_SIZE, SharedBufferDescriptor, SharedBufferSlotIndex,
 };
+use litebox_broker_protocol::socket::{ReceiveFromFlags, SendFlags, SocketConnectionStatus};
 use litebox_broker_transport::control_ring::ControlRing;
 use litebox_broker_transport_linux_userland::unix_socket::UnixStreamLocalSetupChannel;
 
 const RUNNER_ARGUMENT: &str = "broker-userland-test-runner";
 const NETWORK_RUNNER_ARGUMENT: &str = "broker-userland-network-test-runner";
+const BROKER_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn main() {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
@@ -47,47 +49,36 @@ fn run_parent_test() {
         .arg(RUNNER_ARGUMENT);
     wait_for_broker(event_command);
 
-    let Some((host_address, listener)) = non_loopback_listener() else {
-        return;
-    };
-    let port = listener.local_addr().unwrap().port();
+    let gateway = std::net::Ipv4Addr::new(10, 0, 2, 1);
+    let tcp_listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let tcp_port = tcp_listener.local_addr().unwrap().port();
+    let udp_socket = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    udp_socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let udp_port = udp_socket.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (_stream, peer_address) = tcp_listener.accept().unwrap();
+        assert!(peer_address.ip().is_loopback());
+
+        let mut request = [0; 16];
+        let (received, source) = udp_socket.recv_from(&mut request).unwrap();
+        assert_eq!(&request[..received], b"gateway request");
+        udp_socket.send_to(b"gateway reply", source).unwrap();
+    });
     let mut network_command = Command::new(env!("CARGO_BIN_EXE_litebox-broker-userland"));
     network_command
         .arg("--allow-tcp-destination")
-        .arg(format!("{host_address}/32:{port}"))
+        .arg(format!("{gateway}/32:{tcp_port}"))
+        .arg("--allow-udp-destination")
+        .arg(format!("{gateway}/32:{udp_port}"))
         .arg("--runner")
         .arg(std::env::current_exe().unwrap())
         .arg(NETWORK_RUNNER_ARGUMENT)
-        .arg(host_address.to_string())
-        .arg(port.to_string());
+        .arg(tcp_port.to_string())
+        .arg(udp_port.to_string());
     wait_for_broker(network_command);
-
-    let (_stream, peer_address) = listener.accept().unwrap();
-    assert_eq!(peer_address.ip(), host_address);
-}
-
-fn non_loopback_listener() -> Option<(std::net::Ipv4Addr, std::net::TcpListener)> {
-    let probe = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).unwrap();
-    if let Err(error) = probe.connect((std::net::Ipv4Addr::new(192, 0, 2, 1), 9)) {
-        eprintln!("skipping non-loopback broker TCP test: IPv4 route unavailable: {error}");
-        return None;
-    }
-    let std::net::IpAddr::V4(host_address) = probe.local_addr().unwrap().ip() else {
-        unreachable!("an IPv4 route probe must select an IPv4 source address");
-    };
-    if host_address.is_loopback() || host_address.is_unspecified() {
-        eprintln!(
-            "skipping non-loopback broker TCP test: route selected unusable address {host_address}"
-        );
-        return None;
-    }
-    match std::net::TcpListener::bind((host_address, 0)) {
-        Ok(listener) => Some((host_address, listener)),
-        Err(error) => {
-            eprintln!("skipping non-loopback broker TCP test: cannot bind {host_address}: {error}");
-            None
-        }
-    }
+    server.join().unwrap();
 }
 
 fn wait_for_broker(mut command: Command) {
@@ -95,7 +86,7 @@ fn wait_for_broker(mut command: Command) {
         child: command.spawn().unwrap(),
     };
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + BROKER_PROCESS_TIMEOUT;
     while Instant::now() < deadline {
         if let Some(status) = broker.child.try_wait().unwrap() {
             assert!(status.success(), "broker failed with {status}");
@@ -138,18 +129,13 @@ fn run_fake_runner(args: &[OsString]) {
     let local = Arc::new(local);
 
     if args.get(3).and_then(|argument| argument.to_str()) == Some(NETWORK_RUNNER_ARGUMENT) {
-        use litebox_broker_protocol::socket::SocketConnectionStatus;
-
         assert_eq!(args.len(), 6, "unexpected runner arguments: {args:?}");
-        let address = args[4]
-            .to_str()
-            .unwrap()
-            .parse::<std::net::Ipv4Addr>()
-            .unwrap();
-        let port = args[5].to_str().unwrap().parse::<u16>().unwrap();
+        let tcp_port = args[4].to_str().unwrap().parse::<u16>().unwrap();
+        let udp_port = args[5].to_str().unwrap().parse::<u16>().unwrap();
+        let gateway = std::net::Ipv4Addr::new(10, 0, 2, 1);
         let handle = local.create_tcp_socket().unwrap();
         let mut status = local
-            .connect_socket(handle, std::net::SocketAddrV4::new(address, port))
+            .connect_socket(handle, std::net::SocketAddrV4::new(gateway, tcp_port))
             .unwrap()
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -158,6 +144,59 @@ fn run_fake_runner(args: &[OsString]) {
             status = local.socket_status(handle).unwrap().status;
         }
         assert_eq!(status, SocketConnectionStatus::Connected);
+        local.close_object(handle).unwrap();
+
+        let handle = local.create_udp_socket().unwrap();
+        let request = b"gateway request";
+        assert_eq!(
+            local
+                .send_to_socket(
+                    handle,
+                    SharedBufferDescriptor {
+                        slot_index: SharedBufferSlotIndex(0),
+                        length: request.len().try_into().unwrap(),
+                    },
+                    request,
+                    SendFlags::NONE,
+                    Some(std::net::SocketAddrV4::new(gateway, udp_port)),
+                )
+                .unwrap(),
+            Ok(request.len())
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !local
+            .check_readiness(handle)
+            .unwrap()
+            .contains(ReadinessFlags::READ)
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            local
+                .check_readiness(handle)
+                .unwrap()
+                .contains(ReadinessFlags::READ),
+            "timed out waiting for gateway UDP reply"
+        );
+        let mut reply = [0; 16];
+        let received = local
+            .receive_from_socket(
+                handle,
+                SharedBufferDescriptor {
+                    slot_index: SharedBufferSlotIndex(1),
+                    length: reply.len().try_into().unwrap(),
+                },
+                &mut reply,
+                ReceiveFromFlags::NONE,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(&reply[..received.received as usize], b"gateway reply");
+        assert_eq!(
+            received.source_address,
+            std::net::SocketAddrV4::new(gateway, udp_port)
+        );
         local.close_object(handle).unwrap();
         return;
     }
