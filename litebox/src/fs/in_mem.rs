@@ -672,30 +672,3 @@ struct Permissions {
     mode: Mode,
     userinfo: UserInfo,
 }
-
-/// Run `f` with the acting user set to root.
-///
-/// Non-test callers set up root-owned state via [`InMem::new_initialized`] instead; this exists so
-/// that the tests can exercise operations that depend on the acting user.
-#[cfg(test)]
-pub(super) fn with_root_privileges<Platform: sync::RawSyncPrimitivesProvider>(
-    fs: &mut super::resolver::Resolver<Platform, InMem<Platform>>,
-    context: &super::resolver::Context,
-    f: impl FnOnce(&mut super::resolver::Resolver<Platform, InMem<Platform>>, &super::resolver::Context),
-) {
-    with_user(fs, context, UserInfo::ROOT.user, UserInfo::ROOT.group, f);
-}
-
-/// Run `f` with the acting user set to `user`/`group`. See [`with_root_privileges`].
-#[cfg(test)]
-pub(super) fn with_user<Platform: sync::RawSyncPrimitivesProvider>(
-    fs: &mut super::resolver::Resolver<Platform, InMem<Platform>>,
-    context: &super::resolver::Context,
-    user: u16,
-    group: u16,
-    f: impl FnOnce(&mut super::resolver::Resolver<Platform, InMem<Platform>>, &super::resolver::Context),
-) {
-    let mut context = context.clone();
-    context.set_acting_user(UserInfo { user, group });
-    f(fs, &context);
-}
