@@ -1332,7 +1332,7 @@ mod tests {
     }
 
     #[test]
-    fn section_apis_handle_page_targets_invalid_like_host() {
+    fn section_apis_handle_page_targets_invalid() {
         let task = test_task();
         let size = i64::try_from(PAGE_SIZE).unwrap();
         let cfg_protection =

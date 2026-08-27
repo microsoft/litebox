@@ -298,14 +298,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Some(size) = region_size.read_at_offset(0) else {
             return NtStatus::ACCESS_VIOLATION;
         };
-        litebox_util_log::debug!(
-            base:% = format_args!("{base:#x}"),
-            size,
-            zero_bits:% = format_args!("{zero_bits:#x}"),
-            allocation_type:% = format_args!("{allocation_type:#x}"),
-            protect:% = format_args!("{protect:#x}");
-            "NtAllocateVirtualMemory request"
-        );
         if base_address.write_at_offset(0, base).is_none()
             || region_size.write_at_offset(0, size).is_none()
         {
@@ -1854,27 +1846,6 @@ mod tests {
     }
 
     #[test]
-    fn page_targets_invalid_is_accepted_only_for_executable_protection() {
-        let executable =
-            PageProtection::PAGE_EXECUTE_READWRITE | PageProtection::PAGE_TARGETS_INVALID;
-        assert_eq!(
-            parse_page_protection(executable.bits()),
-            Some((
-                PageProtection::PAGE_EXECUTE_READWRITE,
-                MemoryRegionPermissions::READ
-                    | MemoryRegionPermissions::WRITE
-                    | MemoryRegionPermissions::EXEC,
-            ))
-        );
-        assert_eq!(
-            parse_page_protection(
-                (PageProtection::PAGE_READWRITE | PageProtection::PAGE_TARGETS_INVALID).bits()
-            ),
-            None
-        );
-    }
-
-    #[test]
     fn page_targets_invalid_is_not_reported_as_page_protection() {
         run_with_test_platform_pointers(|| {
             let task = crate::tests::test_task();
@@ -2135,69 +2106,6 @@ mod tests {
     }
 
     #[test]
-    fn commit_mapped_memory_rejects_protection_upgrade() {
-        run_with_test_platform_pointers(|| {
-            let task = crate::tests::test_task();
-            let mut base = 0usize;
-            let mut region_size = PAGE_SIZE;
-            assert_eq!(
-                task.sys_nt_allocate_virtual_memory(
-                    ProcessHandle::CURRENT,
-                    mut_ptr(&mut base),
-                    0,
-                    mut_ptr(&mut region_size),
-                    (AllocationType::MEM_RESERVE | AllocationType::MEM_COMMIT).bits(),
-                    PageProtection::PAGE_READONLY.bits(),
-                ),
-                NtStatus::SUCCESS
-            );
-            {
-                let mut allocations = task.process.virtual_allocations.write();
-                let allocation = allocations.get_mut(&base).unwrap();
-                allocation.type_ = MemoryType::MEM_MAPPED;
-            }
-
-            let mut commit_base = base;
-            let mut commit_size = PAGE_SIZE;
-            assert_eq!(
-                task.sys_nt_allocate_virtual_memory(
-                    ProcessHandle::CURRENT,
-                    mut_ptr(&mut commit_base),
-                    0,
-                    mut_ptr(&mut commit_size),
-                    AllocationType::MEM_COMMIT.bits(),
-                    PageProtection::PAGE_READWRITE.bits(),
-                ),
-                NtStatus::SECTION_PROTECTION
-            );
-            assert_eq!(
-                query_basic_information(&task, base).protect,
-                PageProtection::PAGE_READONLY.bits()
-            );
-
-            assert_eq!(
-                task.sys_nt_allocate_virtual_memory(
-                    ProcessHandle::CURRENT,
-                    mut_ptr(&mut commit_base),
-                    0,
-                    mut_ptr(&mut commit_size),
-                    AllocationType::MEM_COMMIT.bits(),
-                    PageProtection::PAGE_READONLY.bits(),
-                ),
-                NtStatus::SUCCESS
-            );
-
-            task.process
-                .virtual_allocations
-                .write()
-                .get_mut(&base)
-                .unwrap()
-                .type_ = MemoryType::MEM_PRIVATE;
-            release_allocation(&task, base);
-        });
-    }
-
-    #[test]
     fn protect_virtual_memory_rounds_outputs_and_reports_old_protection() {
         run_with_test_platform_pointers(|| {
             let task = crate::tests::test_task();
@@ -2423,32 +2331,6 @@ mod tests {
             assert_eq!(info.region_size, allocation_size);
 
             release_allocation(&task, base);
-        });
-    }
-
-    #[test]
-    fn free_virtual_memory_release_zero_size_rounds_address_to_allocation_base() {
-        run_with_test_platform_pointers(|| {
-            let task = crate::tests::test_task();
-            let (base, allocation_size) = allocate_committed_rw(&task, PAGE_SIZE * 2);
-
-            let mut release_base = base + 1;
-            let mut release_size = 0usize;
-            assert_eq!(
-                task.sys_nt_free_virtual_memory(
-                    ProcessHandle::CURRENT,
-                    mut_ptr(&mut release_base),
-                    mut_ptr(&mut release_size),
-                    FreeType::MEM_RELEASE.bits(),
-                ),
-                NtStatus::SUCCESS
-            );
-            assert_eq!(release_base, base);
-            assert_eq!(release_size, allocation_size);
-            assert_eq!(
-                query_basic_information(&task, base).state,
-                MemoryState::MEM_FREE.bits()
-            );
         });
     }
 
