@@ -271,6 +271,10 @@ impl SocketAddress {
 }
 
 #[derive(Default, Clone)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Linux socket options are independent boolean settings"
+)]
 pub(super) struct SocketOptions {
     pub(super) reuse_address: bool,
     pub(super) keep_alive: bool,

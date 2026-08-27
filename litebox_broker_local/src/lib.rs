@@ -89,6 +89,12 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     }
 
     /// Negotiates the broker protocol and returns the negotiated capabilities.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker reports an unrecoverable error, returns a protocol
+    /// response that does not match the negotiation request, or setup returns
+    /// shared memory with an invalid size.
     pub fn negotiate_with_capabilities<
         Setup: LocalSetupChannel<Error = Channel::Error>,
         Activated,

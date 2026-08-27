@@ -195,9 +195,7 @@ impl DnsMappings {
         }
         let question_type = read_u16(query, question.name_end);
         let question_class = read_u16(query, question.name_end + 2);
-        let (response_code, answer) = if question_class != 1 {
-            (4, None)
-        } else {
+        let (response_code, answer) = if question_class == 1 {
             match question
                 .lookup_name
                 .as_deref()
@@ -206,6 +204,8 @@ impl DnsMappings {
                 Some(mapping) => (0, (question_type == 1).then_some(mapping.synthetic_address)),
                 None => (3, None),
             }
+        } else {
+            (4, None)
         };
 
         let answer_size = if answer.is_some() { 16 } else { 0 };

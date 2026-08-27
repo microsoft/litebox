@@ -166,13 +166,11 @@ fn merge_nsswitch(contents: &[u8]) -> Result<Vec<u8>> {
     let tail = &contents[offset..];
     if active_hosts_seen {
         append_nss_bytes(&mut output, tail)?;
-    } else if tail.is_empty() {
-        append_nss_bytes(&mut output, GENERATED_NSS_HOSTS)?;
-    } else if is_hosts_candidate(tail) {
-        append_nss_bytes(&mut output, GENERATED_NSS_HOSTS)?;
     } else {
         append_nss_bytes(&mut output, GENERATED_NSS_HOSTS)?;
-        append_nss_bytes(&mut output, tail)?;
+        if !tail.is_empty() && !is_hosts_candidate(tail) {
+            append_nss_bytes(&mut output, tail)?;
+        }
     }
     Ok(output)
 }
