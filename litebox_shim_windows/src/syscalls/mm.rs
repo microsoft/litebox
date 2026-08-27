@@ -11,7 +11,7 @@ use litebox_common_windows::nt_status::NtStatus;
 use rangemap::RangeMap;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-use crate::syscalls::ProcessHandle;
+use crate::syscalls::{ProcessHandle, section::pagefile_view_protection_is_compatible};
 use crate::{
     ConstPtr, MutPtr, PAGE_SIZE, ShimFS, ShimPlatform, Task, WindowsPageManager,
     WindowsVirtualAllocation, WindowsVirtualAllocations,
@@ -53,6 +53,8 @@ impl PageProtection {
         let guard = self.contains(Self::PAGE_GUARD);
         let nocache = self.contains(Self::PAGE_NOCACHE);
         let writecombine = self.contains(Self::PAGE_WRITECOMBINE);
+        // TODO(windows-cfg): Enforce target invalidation for allocations and no-update semantics
+        // for protection changes; currently this operation flag is only validated.
         let targets_invalid = self.contains(Self::PAGE_TARGETS_INVALID);
         let executable = matches!(
             self.base(),
@@ -488,6 +490,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             MemoryType::MEM_PRIVATE | MemoryType::MEM_MAPPED
         ) {
             return NtStatus::INVALID_PARAMETER;
+        }
+        if allocation.type_ == MemoryType::MEM_MAPPED
+            && !pagefile_view_protection_is_compatible(allocation.allocation_protect, protect)
+        {
+            return NtStatus::SECTION_PROTECTION;
         }
         if update_permissions(
             &self.global.page_manager,
@@ -1108,9 +1115,10 @@ fn free_region<Platform: ShimPlatform>(
     size: usize,
 ) -> Option<(usize, usize)> {
     if size == 0 {
+        let allocation_base = base & !(PAGE_SIZE - 1);
         let allocation = virtual_allocations
             .read()
-            .get(&base)
+            .get(&allocation_base)
             .filter(|allocation| allocation.type_ == MemoryType::MEM_PRIVATE)
             .cloned()?;
         return Some((allocation.base, allocation.size));
@@ -1299,7 +1307,7 @@ pub(super) fn parse_page_protection(
 ) -> Option<(PageProtection, MemoryRegionPermissions)> {
     let protect = PageProtection::from_bits(protect)?;
     let permissions = page_protect_to_permissions(protect)?;
-    Some((protect, permissions))
+    Some((protect - PageProtection::PAGE_TARGETS_INVALID, permissions))
 }
 
 fn page_protect_to_permissions(protect: PageProtection) -> Option<MemoryRegionPermissions> {
@@ -1846,13 +1854,13 @@ mod tests {
     }
 
     #[test]
-    fn page_targets_invalid_requires_executable_protection() {
+    fn page_targets_invalid_is_accepted_only_for_executable_protection() {
         let executable =
             PageProtection::PAGE_EXECUTE_READWRITE | PageProtection::PAGE_TARGETS_INVALID;
         assert_eq!(
             parse_page_protection(executable.bits()),
             Some((
-                executable,
+                PageProtection::PAGE_EXECUTE_READWRITE,
                 MemoryRegionPermissions::READ
                     | MemoryRegionPermissions::WRITE
                     | MemoryRegionPermissions::EXEC,
@@ -1864,6 +1872,36 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn page_targets_invalid_is_not_reported_as_page_protection() {
+        run_with_test_platform_pointers(|| {
+            let task = crate::tests::test_task();
+            let mut base = 0usize;
+            let mut region_size = PAGE_SIZE;
+            assert_eq!(
+                task.sys_nt_allocate_virtual_memory(
+                    ProcessHandle::CURRENT,
+                    mut_ptr(&mut base),
+                    0,
+                    mut_ptr(&mut region_size),
+                    (AllocationType::MEM_RESERVE | AllocationType::MEM_COMMIT).bits(),
+                    (PageProtection::PAGE_EXECUTE_READ | PageProtection::PAGE_TARGETS_INVALID)
+                        .bits(),
+                ),
+                NtStatus::SUCCESS
+            );
+
+            let info = query_basic_information(&task, base);
+            assert_eq!(
+                info.allocation_protect,
+                PageProtection::PAGE_EXECUTE_READ.bits()
+            );
+            assert_eq!(info.protect, PageProtection::PAGE_EXECUTE_READ.bits());
+
+            release_allocation(&task, base);
+        });
     }
 
     #[test]
@@ -2092,6 +2130,69 @@ mod tests {
                 NtStatus::INVALID_PARAMETER
             );
 
+            release_allocation(&task, base);
+        });
+    }
+
+    #[test]
+    fn commit_mapped_memory_rejects_protection_upgrade() {
+        run_with_test_platform_pointers(|| {
+            let task = crate::tests::test_task();
+            let mut base = 0usize;
+            let mut region_size = PAGE_SIZE;
+            assert_eq!(
+                task.sys_nt_allocate_virtual_memory(
+                    ProcessHandle::CURRENT,
+                    mut_ptr(&mut base),
+                    0,
+                    mut_ptr(&mut region_size),
+                    (AllocationType::MEM_RESERVE | AllocationType::MEM_COMMIT).bits(),
+                    PageProtection::PAGE_READONLY.bits(),
+                ),
+                NtStatus::SUCCESS
+            );
+            {
+                let mut allocations = task.process.virtual_allocations.write();
+                let allocation = allocations.get_mut(&base).unwrap();
+                allocation.type_ = MemoryType::MEM_MAPPED;
+            }
+
+            let mut commit_base = base;
+            let mut commit_size = PAGE_SIZE;
+            assert_eq!(
+                task.sys_nt_allocate_virtual_memory(
+                    ProcessHandle::CURRENT,
+                    mut_ptr(&mut commit_base),
+                    0,
+                    mut_ptr(&mut commit_size),
+                    AllocationType::MEM_COMMIT.bits(),
+                    PageProtection::PAGE_READWRITE.bits(),
+                ),
+                NtStatus::SECTION_PROTECTION
+            );
+            assert_eq!(
+                query_basic_information(&task, base).protect,
+                PageProtection::PAGE_READONLY.bits()
+            );
+
+            assert_eq!(
+                task.sys_nt_allocate_virtual_memory(
+                    ProcessHandle::CURRENT,
+                    mut_ptr(&mut commit_base),
+                    0,
+                    mut_ptr(&mut commit_size),
+                    AllocationType::MEM_COMMIT.bits(),
+                    PageProtection::PAGE_READONLY.bits(),
+                ),
+                NtStatus::SUCCESS
+            );
+
+            task.process
+                .virtual_allocations
+                .write()
+                .get_mut(&base)
+                .unwrap()
+                .type_ = MemoryType::MEM_PRIVATE;
             release_allocation(&task, base);
         });
     }
@@ -2326,6 +2427,32 @@ mod tests {
     }
 
     #[test]
+    fn free_virtual_memory_release_zero_size_rounds_address_to_allocation_base() {
+        run_with_test_platform_pointers(|| {
+            let task = crate::tests::test_task();
+            let (base, allocation_size) = allocate_committed_rw(&task, PAGE_SIZE * 2);
+
+            let mut release_base = base + 1;
+            let mut release_size = 0usize;
+            assert_eq!(
+                task.sys_nt_free_virtual_memory(
+                    ProcessHandle::CURRENT,
+                    mut_ptr(&mut release_base),
+                    mut_ptr(&mut release_size),
+                    FreeType::MEM_RELEASE.bits(),
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(release_base, base);
+            assert_eq!(release_size, allocation_size);
+            assert_eq!(
+                query_basic_information(&task, base).state,
+                MemoryState::MEM_FREE.bits()
+            );
+        });
+    }
+
+    #[test]
     fn free_virtual_memory_partial_release_preserves_suffix_for_commit() {
         run_with_test_platform_pointers(|| {
             let task = crate::tests::test_task();
@@ -2405,6 +2532,72 @@ mod tests {
 
             release_allocation(&task, first_base);
             release_allocation(&task, second_base);
+            release_allocation(&task, suffix_base);
+        });
+    }
+
+    #[test]
+    fn free_virtual_memory_middle_release_preserves_fragment_protections() {
+        run_with_test_platform_pointers(|| {
+            let task = crate::tests::test_task();
+            let (base, _) = allocate_committed_rw(&task, PAGE_SIZE * 3);
+
+            let mut prefix_base = base;
+            let mut prefix_size = PAGE_SIZE;
+            let mut old_protect = 0u32;
+            assert_eq!(
+                task.sys_nt_protect_virtual_memory(
+                    ProcessHandle::CURRENT,
+                    mut_ptr(&mut prefix_base),
+                    mut_ptr(&mut prefix_size),
+                    PageProtection::PAGE_READONLY.bits(),
+                    mut_ptr(&mut old_protect),
+                ),
+                NtStatus::SUCCESS
+            );
+
+            let suffix_base = base + PAGE_SIZE * 2;
+            let mut protect_suffix_base = suffix_base;
+            let mut suffix_size = PAGE_SIZE;
+            assert_eq!(
+                task.sys_nt_protect_virtual_memory(
+                    ProcessHandle::CURRENT,
+                    mut_ptr(&mut protect_suffix_base),
+                    mut_ptr(&mut suffix_size),
+                    PageProtection::PAGE_EXECUTE_READ.bits(),
+                    mut_ptr(&mut old_protect),
+                ),
+                NtStatus::SUCCESS
+            );
+
+            let mut release_base = base + PAGE_SIZE;
+            let mut release_size = PAGE_SIZE;
+            assert_eq!(
+                task.sys_nt_free_virtual_memory(
+                    ProcessHandle::CURRENT,
+                    mut_ptr(&mut release_base),
+                    mut_ptr(&mut release_size),
+                    FreeType::MEM_RELEASE.bits(),
+                ),
+                NtStatus::SUCCESS
+            );
+
+            let prefix = query_basic_information(&task, base);
+            assert_eq!(prefix.allocation_base, base);
+            assert_eq!(prefix.region_size, PAGE_SIZE);
+            assert_eq!(prefix.protect, PageProtection::PAGE_READONLY.bits());
+
+            let released = query_basic_information(&task, base + PAGE_SIZE);
+            assert_eq!(released.allocation_base, 0);
+            assert_eq!(released.region_size, PAGE_SIZE);
+            assert_eq!(released.state, MemoryState::MEM_FREE.bits());
+
+            let suffix = query_basic_information(&task, suffix_base);
+            assert_eq!(suffix.allocation_base, suffix_base);
+            assert_eq!(suffix.region_size, PAGE_SIZE);
+            assert_eq!(suffix.protect, PageProtection::PAGE_EXECUTE_READ.bits());
+
+            release_allocation(&task, base);
             release_allocation(&task, suffix_base);
         });
     }
