@@ -260,6 +260,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if granted_access.is_empty() {
             return NtStatus::ACCESS_DENIED;
         }
+        if section_page_protection & PageProtection::PAGE_TARGETS_INVALID.bits() != 0 {
+            return NtStatus::INVALID_PAGE_PROTECTION;
+        }
         let Some((protection, _)) = parse_page_protection(section_page_protection) else {
             return NtStatus::INVALID_PAGE_PROTECTION;
         };
@@ -1077,7 +1080,7 @@ fn required_map_access(protection: PageProtection) -> SectionAccess {
     }
 }
 
-fn pagefile_view_protection_is_compatible(
+pub(super) fn pagefile_view_protection_is_compatible(
     section_protection: PageProtection,
     view_protection: PageProtection,
 ) -> bool {
@@ -1326,6 +1329,58 @@ mod tests {
             NtStatus::SUCCESS
         );
         (base, view_size)
+    }
+
+    #[test]
+    fn section_apis_handle_page_targets_invalid() {
+        let task = test_task();
+        let size = i64::try_from(PAGE_SIZE).unwrap();
+        let cfg_protection =
+            PageProtection::PAGE_EXECUTE_READ | PageProtection::PAGE_TARGETS_INVALID;
+        let mut rejected_handle = Handle::default();
+        assert_eq!(
+            task.sys_nt_create_section(
+                mut_ptr(&mut rejected_handle),
+                SectionAccess::ALL_ACCESS.bits(),
+                None,
+                Some(const_ptr(&size)),
+                cfg_protection.bits(),
+                SectionAllocationAttributes::SEC_COMMIT.bits(),
+                Handle::default(),
+            ),
+            NtStatus::INVALID_PAGE_PROTECTION
+        );
+
+        let handle = create_pagefile_section(
+            &task,
+            SectionAccess::ALL_ACCESS.bits(),
+            size,
+            PageProtection::PAGE_EXECUTE_READ,
+        );
+        let mut base = 0usize;
+        let mut view_size = 0usize;
+        assert_eq!(
+            task.sys_nt_map_view_of_section(MapViewOfSectionParameters {
+                section_handle: handle,
+                process_handle: ProcessHandle::CURRENT,
+                base_address: mut_ptr(&mut base),
+                zero_bits: 0,
+                commit_size: 0,
+                section_offset: None,
+                view_size: mut_ptr(&mut view_size),
+                inherit_disposition: VIEW_SHARE,
+                allocation_type: 0,
+                page_protection: cfg_protection.bits(),
+            }),
+            NtStatus::SUCCESS
+        );
+        assert_ne!(base, 0);
+        assert_eq!(view_size, PAGE_SIZE);
+        assert_eq!(
+            task.sys_nt_unmap_view_of_section(ProcessHandle::CURRENT, base),
+            NtStatus::SUCCESS
+        );
+        task.close_section_handle(handle);
     }
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
