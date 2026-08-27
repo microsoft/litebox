@@ -746,17 +746,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     pub(crate) fn sys_nt_query_timer_resolution(
-        maximum_time: MutPtr<Platform, u32>,
-        minimum_time: MutPtr<Platform, u32>,
-        current_time: MutPtr<Platform, u32>,
+        minimum_resolution: MutPtr<Platform, u32>,
+        maximum_resolution: MutPtr<Platform, u32>,
+        current_resolution: MutPtr<Platform, u32>,
     ) -> NtStatus {
-        if maximum_time
+        if minimum_resolution
             .write_at_offset(0, TIMER_RESOLUTION_100NS)
             .is_none()
-            || minimum_time
+            || maximum_resolution
                 .write_at_offset(0, MINIMUM_TIMER_RESOLUTION_100NS)
                 .is_none()
-            || current_time
+            || current_resolution
                 .write_at_offset(0, TIMER_RESOLUTION_100NS)
                 .is_none()
         {
@@ -1816,27 +1816,27 @@ mod tests {
     #[test]
     fn nt_query_timer_resolution_returns_synthetic_clock_values() {
         run_with_test_platform_pointers(|| {
-            let mut maximum_time = 0;
-            let mut minimum_time = 0;
-            let mut current_time = 0;
+            let mut minimum_resolution = 0;
+            let mut maximum_resolution = 0;
+            let mut current_resolution = 0;
 
             assert_eq!(
                 TestTask::sys_nt_query_timer_resolution(
-                    mut_ptr(&mut maximum_time),
-                    mut_ptr(&mut minimum_time),
-                    mut_ptr(&mut current_time),
+                    mut_ptr(&mut minimum_resolution),
+                    mut_ptr(&mut maximum_resolution),
+                    mut_ptr(&mut current_resolution),
                 ),
                 NtStatus::SUCCESS
             );
-            assert_eq!(maximum_time, TIMER_RESOLUTION_100NS);
-            assert_eq!(minimum_time, MINIMUM_TIMER_RESOLUTION_100NS);
-            assert_eq!(current_time, TIMER_RESOLUTION_100NS);
+            assert_eq!(minimum_resolution, TIMER_RESOLUTION_100NS);
+            assert_eq!(maximum_resolution, MINIMUM_TIMER_RESOLUTION_100NS);
+            assert_eq!(current_resolution, TIMER_RESOLUTION_100NS);
 
             assert_eq!(
                 TestTask::sys_nt_query_timer_resolution(
                     null_mut_ptr(),
-                    mut_ptr(&mut minimum_time),
-                    mut_ptr(&mut current_time),
+                    mut_ptr(&mut maximum_resolution),
+                    mut_ptr(&mut current_resolution),
                 ),
                 NtStatus::ACCESS_VIOLATION
             );
