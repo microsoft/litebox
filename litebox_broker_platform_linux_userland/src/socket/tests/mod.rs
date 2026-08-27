@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 
 use super::*;
 use litebox_broker_core::readiness::ReadinessSink;
-use litebox_broker_core::socket::{GUEST_IPV4_ADDRESS, HOST_GATEWAY_IPV4_ADDRESS};
+use litebox_broker_core::socket::{
+    BROKER_DNS_IPV4_ADDRESS, GUEST_IPV4_ADDRESS, HOST_GATEWAY_IPV4_ADDRESS,
+};
 use litebox_broker_core::{
     BrokerCore, BrokerCoreLimits, BrokerSession, CallerCredential, DestinationPortRange,
     DestinationRule, Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy,

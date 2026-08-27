@@ -275,6 +275,7 @@ pub(super) struct SocketOptions {
     pub(super) reuse_address: bool,
     pub(super) keep_alive: bool,
     pub(super) broadcast: bool,
+    pub(super) ip_recverr: bool,
     /// Receiving timeout, None (default value) means no timeout
     pub(super) recv_timeout: Option<core::time::Duration>,
     /// Sending timeout, None (default value) means no timeout
@@ -600,6 +601,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
                     litebox_util_log::debug!("accepting and ignoring setsockopt(IP_TOS)");
                     return Ok(());
                 }
+                // The broker already reports asynchronous network failures
+                // through normal socket error state, but does not expose
+                // Linux's ancillary extended-error records. Accept the option
+                // so libc resolvers can use the socket's ordinary error path.
+                litebox_common_linux::IpOption::RECVERR => {
+                    let enabled = super::read_from_user::<u32, Platform>(optval, optlen)? != 0;
+                    self.with_socket_options_mut(fd, |options| {
+                        options.ip_recverr = enabled;
+                    });
+                    return Ok(());
+                }
             },
             SocketOptionName::Socket(so) => match so {
                 // handled by `setsockopt_common`
@@ -773,7 +785,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
 
         let val: u32 = match optname {
             SocketOptionName::IP(ipopt) => match ipopt {
-                litebox_common_linux::IpOption::TOS => return Err(Errno::EOPNOTSUPP),
+                litebox_common_linux::IpOption::TOS => {
+                    return Err(Errno::EOPNOTSUPP);
+                }
+                litebox_common_linux::IpOption::RECVERR => {
+                    u32::from(self.with_socket_options(fd, |options| options.ip_recverr))
+                }
             },
             SocketOptionName::Socket(sopt) => match sopt {
                 // handled by `getsockopt_common`
@@ -1090,6 +1107,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
         context: ReceiveContext<Platform::Instant>,
         mut source_addr: Option<&mut Option<SocketAddr>>,
     ) -> Result<usize, Errno> {
+        if flags.contains(ReceiveFlags::ERRQUEUE) {
+            return self.receive_socket_error(socket);
+        }
         let timeout = context
             .deadline
             .map(|deadline| {
@@ -1113,7 +1133,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
             ReceiveFlags,
             litebox::net::ReceiveFlags,
             CMSG_CLOEXEC,
-            ERRQUEUE,
             OOB,
             PEEK,
             WAITALL,
@@ -1357,6 +1376,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
             );
         }
         result
+    }
+
+    fn receive_socket_error(
+        &self,
+        socket: &InetSocketPin<'_, Platform, FS>,
+    ) -> Result<usize, Errno> {
+        if !matches!(socket.socket_type, SockType::Datagram) {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        match socket.proxy.get_async_error(true) {
+            Some(error) => Err(error.into()),
+            None => Err(Errno::EAGAIN),
+        }
     }
 
     fn close_unpublished_socket(&self, fd: &SocketFd<Platform>) {
@@ -1746,10 +1778,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     self.global
                         .accept(&self.wait_cx(), fd, socket_addr.as_mut())?;
                 let peer_addr = socket_addr.map(SocketAddress::Inet);
+                let ip_recverr = self
+                    .global
+                    .with_socket_options(fd, |options| options.ip_recverr);
 
                 let proxy = self
                     .global
                     .initialize_socket(&accepted_file, sock_type, flags);
+                self.global
+                    .with_socket_options_mut(&accepted_file, |options| {
+                        options.ip_recverr = ip_recverr;
+                    });
                 proxy.set_state(SocketState::Connected);
                 let raw_fd = files
                     .insert_raw_fd(accepted_file)
@@ -2068,6 +2107,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .files
             .borrow()
             .pin_receive_socket(&self.global, sockfd)?;
+        if flags.contains(ReceiveFlags::ERRQUEUE) {
+            return match &socket {
+                ReceiveSocket::Inet(socket) => self.global.receive_socket_error(socket),
+                ReceiveSocket::Unix(_) => Err(Errno::EOPNOTSUPP),
+            };
+        }
         let (chunk_waitall, preflight_stream, deadline) =
             self.inet_stream_receive_plan(&socket, flags)?;
         let copy_received = Self::receive_copies_data(&socket, flags);
@@ -2310,7 +2355,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let supported_flags = ReceiveFlags::DONTWAIT
             | ReceiveFlags::PEEK
             | ReceiveFlags::TRUNC
-            | ReceiveFlags::WAITALL;
+            | ReceiveFlags::WAITALL
+            | ReceiveFlags::ERRQUEUE;
         if flags.intersects(supported_flags.complement()) {
             log_unsupported!("Unsupported recvmsg flags: {:?}", flags);
             return Err(Errno::EINVAL);
@@ -2320,6 +2366,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .files
             .borrow()
             .pin_receive_socket(&self.global, sockfd)?;
+        if flags.contains(ReceiveFlags::ERRQUEUE) {
+            return match &socket {
+                ReceiveSocket::Inet(socket) => self.global.receive_socket_error(socket),
+                ReceiveSocket::Unix(_) => Err(Errno::EOPNOTSUPP),
+            };
+        }
         self.do_recvmsg(&socket, msg_ptr, flags)
     }
     fn do_recvmsg(
@@ -2501,7 +2553,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             | ReceiveFlags::PEEK
             | ReceiveFlags::TRUNC
             | ReceiveFlags::WAITALL
-            | ReceiveFlags::WAITFORONE;
+            | ReceiveFlags::WAITFORONE
+            | ReceiveFlags::ERRQUEUE;
         if flags.intersects(supported_flags.complement()) {
             log_unsupported!("Unsupported recvmmsg flags: {:?}", flags);
             return Err(Errno::EINVAL);
@@ -2526,6 +2579,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         if vlen == 0 {
             return Ok(0);
+        }
+        if flags.contains(ReceiveFlags::ERRQUEUE) {
+            return match &socket {
+                ReceiveSocket::Inet(socket) => self.global.receive_socket_error(socket),
+                ReceiveSocket::Unix(_) => Err(Errno::EOPNOTSUPP),
+            };
         }
 
         // A `None` deadline means either no user-supplied timeout or a saturating overflow
@@ -2812,7 +2871,7 @@ mod tests {
     use alloc::string::ToString as _;
     use litebox::utils::TruncateExt as _;
     use litebox_common_linux::{
-        AddressFamily, MapFlags, ProtFlags, ReceiveFlags, SendFlags, SockFlags, SockType,
+        AddressFamily, IpOption, MapFlags, ProtFlags, ReceiveFlags, SendFlags, SockFlags, SockType,
         SocketOption, SocketOptionName, errno::Errno,
     };
     use zerocopy::FromZeros as _;
@@ -3072,6 +3131,121 @@ mod tests {
             .expect("getsockopt SO_ERROR failed");
         assert_eq!(len, core::mem::size_of::<u32>());
         optval
+    }
+
+    fn set_ip_recverr(task: &TestTask, sockfd: u32, enabled: bool) {
+        let value = u32::from(enabled);
+        task.do_setsockopt(
+            sockfd,
+            SocketOptionName::IP(IpOption::RECVERR),
+            UserPtr::from_usize((&raw const value).cast::<u8>() as usize),
+            core::mem::size_of_val(&value),
+        )
+        .unwrap();
+    }
+
+    fn get_ip_recverr(task: &TestTask, sockfd: u32) -> bool {
+        let mut value = 0u32;
+        let len = task
+            .do_getsockopt(
+                sockfd,
+                SocketOptionName::IP(IpOption::RECVERR),
+                UserPtrMut::from_usize((&raw mut value).cast::<u8>() as usize),
+                core::mem::size_of_val(&value).trunc(),
+            )
+            .unwrap();
+        assert_eq!(len, core::mem::size_of::<u32>());
+        value != 0
+    }
+
+    #[test]
+    #[ignore = "requires broker-backed socket test setup"]
+    fn ip_recverr_defaults_false_and_is_shared_by_duplicates() {
+        let task = init_platform();
+        let socket_fd = task
+            .do_socket(
+                AddressFamily::INET,
+                SockType::Datagram,
+                SockFlags::empty(),
+                0,
+            )
+            .unwrap();
+        assert!(!get_ip_recverr(&task, socket_fd));
+
+        set_ip_recverr(&task, socket_fd, true);
+        let duplicate = task
+            .sys_dup(i32::try_from(socket_fd).unwrap(), None, None)
+            .unwrap();
+        assert!(get_ip_recverr(&task, duplicate));
+
+        set_ip_recverr(&task, duplicate, false);
+        assert!(!get_ip_recverr(&task, socket_fd));
+    }
+
+    #[test]
+    #[ignore = "requires broker-backed socket test setup"]
+    fn msg_errqueue_consumes_internet_datagram_errors_without_blocking() {
+        let task = init_platform();
+        let socket_fd = task
+            .do_socket(
+                AddressFamily::INET,
+                SockType::Datagram,
+                SockFlags::empty(),
+                0,
+            )
+            .unwrap();
+        {
+            let socket = task
+                .files
+                .borrow()
+                .try_pin_inet_socket(&task.global, socket_fd as usize)
+                .unwrap()
+                .unwrap();
+            socket
+                .proxy
+                .set_async_error(litebox::net::errors::SocketAsyncError::ConnectionRefused);
+        }
+
+        assert_eq!(
+            task.do_recvfrom(socket_fd, &mut [], ReceiveFlags::ERRQUEUE, None)
+                .unwrap_err(),
+            Errno::ECONNREFUSED
+        );
+        assert_eq!(
+            task.do_recvfrom(socket_fd, &mut [], ReceiveFlags::ERRQUEUE, None)
+                .unwrap_err(),
+            Errno::EAGAIN
+        );
+    }
+
+    #[test]
+    #[ignore = "requires broker-backed socket test setup"]
+    fn msg_errqueue_rejects_streams_without_consuming_so_error() {
+        let task = init_platform();
+        let socket_fd = task
+            .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
+            .unwrap();
+        {
+            let socket = task
+                .files
+                .borrow()
+                .try_pin_inet_socket(&task.global, socket_fd as usize)
+                .unwrap()
+                .unwrap();
+            socket
+                .proxy
+                .set_async_error(litebox::net::errors::SocketAsyncError::ConnectionRefused);
+        }
+
+        assert_eq!(
+            task.do_recvfrom(socket_fd, &mut [], ReceiveFlags::ERRQUEUE, None)
+                .unwrap_err(),
+            Errno::EOPNOTSUPP
+        );
+        assert_eq!(
+            get_so_error(&task, socket_fd),
+            i32::from(Errno::ECONNREFUSED).cast_unsigned()
+        );
     }
 
     fn epoll_add(task: &TestTask, epfd: i32, target_fd: u32, events: litebox::event::Events) {

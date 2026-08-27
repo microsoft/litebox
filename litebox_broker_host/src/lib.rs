@@ -218,6 +218,7 @@ where
         let response = if negotiated {
             BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
+                capabilities: core.capabilities(),
             }
         } else {
             BrokerHandshakeResponse::VersionMismatch {
@@ -698,7 +699,7 @@ mod tests {
     use litebox_broker_core::readiness::ReadinessRegistration;
     use litebox_broker_core::socket::{
         AcceptedPlatformSocket, PlatformConnectError, PlatformDatagramReceive, PlatformSocket,
-        PlatformSocketStatus, PlatformStreamReceive, SocketProvider,
+        PlatformSocketDestination, PlatformSocketStatus, PlatformStreamReceive, SocketProvider,
     };
     use litebox_broker_core::{ObjectRights, PolicyEngine, SessionId, SocketPolicy};
     use litebox_broker_protocol::event::{
@@ -757,6 +758,23 @@ mod tests {
     struct TestSocketProvider;
 
     impl SocketProvider for TestSocketProvider {
+        fn capabilities(&self) -> litebox_broker_protocol::BrokerCapabilities {
+            litebox_broker_protocol::BrokerCapabilities::BROKER_DNS
+        }
+
+        fn route_destination(
+            &self,
+            destination: core::net::SocketAddrV4,
+        ) -> litebox_broker_core::Result<
+            litebox_broker_protocol::socket::SocketOutcome<
+                litebox_broker_core::socket::PlatformSocketDestination,
+            >,
+        > {
+            Ok(litebox_broker_protocol::socket::SocketOutcome::Completed(
+                litebox_broker_core::socket::PlatformSocketDestination::standard(destination),
+            ))
+        }
+
         fn create(
             &self,
             _session_id: SessionId,
@@ -821,9 +839,10 @@ mod tests {
 
         fn connect(
             &self,
-            address: SocketAddrV4,
+            destination: PlatformSocketDestination,
             _guest_source_lease: Option<litebox_broker_core::socket::GuestSourceLease>,
         ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
+            let address = destination.guest_address();
             let source_address = self
                 .binding
                 .lock()
@@ -855,7 +874,7 @@ mod tests {
             &self,
             data: Vec<u8>,
             _flags: SendFlags,
-            _destination: Option<SocketAddrV4>,
+            _destination: Option<PlatformSocketDestination>,
         ) -> litebox_broker_core::Result<SocketOutcome<usize>> {
             Ok(SocketOutcome::Completed(data.len()))
         }
@@ -970,7 +989,8 @@ mod tests {
         assert_eq!(
             channel.handshake_responses[0],
             BrokerHandshakeResponse::Negotiated {
-                broker_protocol_version: BROKER_PROTOCOL_VERSION
+                broker_protocol_version: BROKER_PROTOCOL_VERSION,
+                capabilities: litebox_broker_protocol::BrokerCapabilities::BROKER_DNS,
             }
         );
         let handle = match &channel.results[0] {
@@ -1004,7 +1024,8 @@ mod tests {
                     broker_protocol_version: BROKER_PROTOCOL_VERSION
                 },
                 BrokerHandshakeResponse::Negotiated {
-                    broker_protocol_version: BROKER_PROTOCOL_VERSION
+                    broker_protocol_version: BROKER_PROTOCOL_VERSION,
+                    capabilities: litebox_broker_protocol::BrokerCapabilities::BROKER_DNS,
                 }
             ]
         );
@@ -1069,7 +1090,8 @@ mod tests {
         assert_eq!(
             channel.handshake_responses,
             [BrokerHandshakeResponse::Negotiated {
-                broker_protocol_version: BROKER_PROTOCOL_VERSION
+                broker_protocol_version: BROKER_PROTOCOL_VERSION,
+                capabilities: litebox_broker_protocol::BrokerCapabilities::BROKER_DNS,
             }]
         );
         assert!(channel.results.is_empty());

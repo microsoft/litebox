@@ -17,10 +17,11 @@ use std::time::Duration;
 
 use litebox_broker_core::socket::{
     AcceptedPlatformSocket, GuestSocketBinding, GuestSourceLease, PlatformConnectError,
-    PlatformDatagramReceive, PlatformSocket, PlatformSocketStatus, PlatformStreamReceive,
-    SocketProvider,
+    PlatformDatagramReceive, PlatformSocket, PlatformSocketDestination, PlatformSocketStatus,
+    PlatformStreamReceive, SocketProvider,
 };
 use litebox_broker_core::{BrokerError, Result as BrokerResult, SessionId};
+use litebox_broker_protocol::BrokerCapabilities;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
     AddressFamily, CreateSocketRequest, IpProtocol, MAX_UDP_DATAGRAM_SIZE, ReceiveFlags,
@@ -36,8 +37,12 @@ use litebox_broker_core::readiness::ReadinessRegistration;
 #[cfg(test)]
 use litebox_broker_protocol::socket::{MAX_SOCKET_TRANSFER_SIZE, SocketStatusResponse};
 
+mod dns;
 mod tcp;
 mod udp;
+
+pub use dns::DnsARecord;
+use dns::DnsMappings;
 
 #[cfg(test)]
 use tcp::TcpDescriptor;
@@ -165,18 +170,49 @@ impl SocketLifecycle {
 /// reactor acknowledgment, never for network readiness.
 pub struct LinuxSocketProvider {
     reactor: Arc<ReactorClient>,
+    dns: Arc<DnsMappings>,
 }
 
 impl LinuxSocketProvider {
     /// Starts a provider with global and per-session socket limits.
     pub fn new(max_sockets: usize, max_sockets_per_session: usize) -> IoResult<Self> {
+        Self::new_with_dns_records(max_sockets, max_sockets_per_session, &[])
+    }
+
+    /// Starts a provider with socket limits and immutable static DNS A records.
+    pub fn new_with_dns_records(
+        max_sockets: usize,
+        max_sockets_per_session: usize,
+        dns_records: &[DnsARecord],
+    ) -> IoResult<Self> {
+        let dns = Arc::new(DnsMappings::new(dns_records)?);
         Ok(Self {
-            reactor: Arc::new(ReactorClient::start(max_sockets, max_sockets_per_session)?),
+            reactor: Arc::new(ReactorClient::start(
+                max_sockets,
+                max_sockets_per_session,
+                Arc::clone(&dns),
+            )?),
+            dns,
         })
     }
 }
 
 impl SocketProvider for LinuxSocketProvider {
+    fn capabilities(&self) -> BrokerCapabilities {
+        if self.dns.is_enabled() {
+            BrokerCapabilities::BROKER_DNS
+        } else {
+            BrokerCapabilities::NONE
+        }
+    }
+
+    fn route_destination(
+        &self,
+        destination: SocketAddrV4,
+    ) -> BrokerResult<SocketOutcome<PlatformSocketDestination>> {
+        Ok(self.dns.route_destination(destination))
+    }
+
     fn create(
         &self,
         session_id: SessionId,
@@ -277,10 +313,11 @@ impl PlatformSocket for LinuxSocket {
 
     fn connect(
         &self,
-        address: SocketAddrV4,
+        destination: PlatformSocketDestination,
         guest_source_lease: Option<GuestSourceLease>,
     ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
-        self.reactor.connect(self.id, address, guest_source_lease)
+        self.reactor
+            .connect(self.id, destination, guest_source_lease)
     }
 
     fn send(&self, data: Vec<u8>, _flags: SendFlags) -> BrokerResult<SocketOutcome<usize>> {
@@ -295,7 +332,7 @@ impl PlatformSocket for LinuxSocket {
         &self,
         data: Vec<u8>,
         _flags: SendFlags,
-        destination: Option<SocketAddrV4>,
+        destination: Option<PlatformSocketDestination>,
     ) -> BrokerResult<SocketOutcome<usize>> {
         self.reactor.request(|response| ReactorCommand::SendTo {
             id: self.id,
@@ -417,7 +454,11 @@ struct ReactorClient {
 }
 
 impl ReactorClient {
-    fn start(max_sockets: usize, max_sockets_per_session: usize) -> IoResult<Self> {
+    fn start(
+        max_sockets: usize,
+        max_sockets_per_session: usize,
+        dns: Arc<DnsMappings>,
+    ) -> IoResult<Self> {
         let epoll_fd = epoll::create(epoll::CreateFlags::CLOEXEC)?;
         let wake = Arc::new(eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK)?);
         epoll::add(
@@ -452,6 +493,7 @@ impl ReactorClient {
                     sessions: HashMap::new(),
                     max_sockets,
                     max_sockets_per_session,
+                    dns,
                     events,
                 };
                 if started.send(true).is_err() {
@@ -518,13 +560,13 @@ impl ReactorClient {
     fn connect(
         &self,
         id: u64,
-        address: SocketAddrV4,
+        destination: PlatformSocketDestination,
         guest_source_lease: Option<GuestSourceLease>,
     ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
         let (response, receive) = sync_channel(1);
         let command = ReactorCommand::Connect {
             id,
-            address,
+            destination,
             guest_source_lease,
             response,
         };
@@ -782,7 +824,7 @@ enum ReactorCommand {
     },
     Connect {
         id: u64,
-        address: SocketAddrV4,
+        destination: PlatformSocketDestination,
         guest_source_lease: Option<GuestSourceLease>,
         response: SyncSender<core::result::Result<SocketConnectionStatus, PlatformConnectError>>,
     },
@@ -812,7 +854,7 @@ enum ReactorCommand {
     SendTo {
         id: u64,
         data: Vec<u8>,
-        destination: Option<SocketAddrV4>,
+        destination: Option<PlatformSocketDestination>,
         response: SyncSender<BrokerResult<SocketOutcome<usize>>>,
     },
     Receive {
@@ -942,6 +984,7 @@ struct Reactor {
     sessions: HashMap<SessionId, ReactorSessionState>,
     max_sockets: usize,
     max_sockets_per_session: usize,
+    dns: Arc<DnsMappings>,
     events: Vec<epoll::Event>,
 }
 
@@ -1100,7 +1143,7 @@ impl Reactor {
     fn connect_socket(
         &mut self,
         id: u64,
-        requested_destination: SocketAddrV4,
+        requested_destination: PlatformSocketDestination,
         guest_source_lease: Option<GuestSourceLease>,
     ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
         let kind = self.sockets.get(&id).map(SocketEntry::kind).ok_or(
@@ -1115,7 +1158,7 @@ impl Reactor {
             };
             let mut reused_native_endpoint = false;
             let mut staged_endpoint = match peer {
-                ReactorUdpPeer::Internal { .. } => None,
+                ReactorUdpPeer::Internal { .. } | ReactorUdpPeer::BrokerDns(_) => None,
                 ReactorUdpPeer::External(destination) => {
                     if self
                         .sockets
@@ -1164,7 +1207,8 @@ impl Reactor {
                     ReactorUdpPeer::Internal {
                         internal_address, ..
                     } => internal_address,
-                    ReactorUdpPeer::External(destination) => destination,
+                    ReactorUdpPeer::External(destination) => destination.guest_address,
+                    ReactorUdpPeer::BrokerDns(address) => address,
                 };
                 binding
                     .guest_binding
@@ -1210,9 +1254,9 @@ impl Reactor {
         &mut self,
         id: u64,
         data: &[u8],
-        destination: Option<SocketAddrV4>,
+        destination: Option<PlatformSocketDestination>,
     ) -> BrokerResult<SocketOutcome<usize>> {
-        let (peer, authorize_external_reply) = {
+        let (peer, connected_peer, read_shutdown, authorize_external_reply) = {
             let socket = self.sockets.get(&id).ok_or(BrokerError::Internal)?;
             if socket.kind() != SocketKind::Udp || data.len() > MAX_UDP_DATAGRAM_SIZE as usize {
                 return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
@@ -1223,11 +1267,13 @@ impl Reactor {
             let udp = socket.udp_state()?;
             match destination {
                 Some(address) => match self.resolve_udp_destination(address) {
-                    SocketOutcome::Completed(peer) => (peer, udp.peer.is_none()),
+                    SocketOutcome::Completed(peer) => {
+                        (peer, udp.peer, socket.read_shutdown, udp.peer.is_none())
+                    }
                     SocketOutcome::Failed(error) => return Ok(SocketOutcome::Failed(error)),
                 },
                 None => match udp.peer {
-                    Some(peer) => (peer, false),
+                    Some(peer) => (peer, udp.peer, socket.read_shutdown, false),
                     None => return Ok(SocketOutcome::Failed(SocketError::NotConnected)),
                 },
             }
@@ -1256,8 +1302,21 @@ impl Reactor {
                 self.enqueue_internal_datagram(id, destination_id, source_address, data)
             }
             ReactorUdpPeer::External(destination) => {
+                if matches!(
+                    connected_peer,
+                    Some(ReactorUdpPeer::External(connected))
+                        if connected.host_address == destination.host_address
+                            && connected.guest_address != destination.guest_address
+                ) {
+                    return Ok(SocketOutcome::Failed(SocketError::AddressNotAvailable));
+                }
                 let external_peer_added = if authorize_external_reply {
-                    self.reserve_udp_external_peer(id, destination)?
+                    match self.reserve_udp_external_peer(id, destination)? {
+                        SocketOutcome::Completed(added) => added,
+                        SocketOutcome::Failed(error) => {
+                            return Ok(SocketOutcome::Failed(error));
+                        }
+                    }
                 } else {
                     false
                 };
@@ -1292,6 +1351,26 @@ impl Reactor {
                     self.remove_udp_external_peer(id, destination);
                 }
                 outcome
+            }
+            ReactorUdpPeer::BrokerDns(source_address) => {
+                if read_shutdown
+                    || matches!(
+                        connected_peer,
+                        Some(peer) if !matches!(
+                            peer,
+                            ReactorUdpPeer::BrokerDns(address) if address == source_address
+                        )
+                    )
+                {
+                    return Ok(SocketOutcome::Completed(data.len()));
+                }
+                let Some(response) = self.dns.response(data)? else {
+                    return Ok(SocketOutcome::Completed(data.len()));
+                };
+                match self.enqueue_dns_response(id, source_address, &response)? {
+                    SocketOutcome::Completed(_) => Ok(SocketOutcome::Completed(data.len())),
+                    SocketOutcome::Failed(error) => Ok(SocketOutcome::Failed(error)),
+                }
             }
         }
     }
@@ -1527,11 +1606,11 @@ impl Reactor {
                 }
                 ReactorCommand::Connect {
                     id,
-                    address,
+                    destination,
                     guest_source_lease,
                     response,
                 } => {
-                    let outcome = self.connect_socket(id, address, guest_source_lease);
+                    let outcome = self.connect_socket(id, destination, guest_source_lease);
                     let peer_may_have_changed =
                         !matches!(&outcome, Err(PlatformConnectError::PeerUnchanged(_)));
                     if response.send(outcome).is_err() && peer_may_have_changed {

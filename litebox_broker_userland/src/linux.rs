@@ -55,9 +55,10 @@ pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
             configured_socket_policy(&args.allow_tcp_destination, &args.allow_udp_destination)?,
         ),
         limits,
-        Arc::new(LinuxSocketProvider::new(
+        Arc::new(LinuxSocketProvider::new_with_dns_records(
             limits.max_sockets,
             limits.max_sockets_per_session,
+            &args.dns_a_record,
         )?),
     )?;
 

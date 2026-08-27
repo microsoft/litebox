@@ -4,6 +4,7 @@
 use super::*;
 use crate::readiness::tests::TestReadinessSink;
 use crate::{BrokerCore, CallerCredential};
+use litebox_broker_protocol::BrokerCapabilities;
 use litebox_broker_protocol::socket::{AddressFamily, IpProtocol, SocketType};
 use std::net::Ipv4Addr;
 use std::sync::{Mutex as StdMutex, mpsc};
@@ -158,6 +159,244 @@ fn gateway_destinations_reach_the_platform_untranslated() {
         host_socket_destination(gateway),
         SocketAddrV4::new(Ipv4Addr::LOCALHOST, gateway.port())
     );
+}
+
+#[test]
+fn provider_routes_are_authorized_by_pinned_destination_before_platform_dispatch() {
+    let provider = Arc::new(TestSocketProvider::default());
+    let synthetic = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 1), 443);
+    let pinned = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 443);
+    let route = PlatformSocketDestination::External {
+        guest_address: synthetic,
+        policy_address: pinned,
+        host_address: pinned,
+    };
+    let policy = crate::SocketPolicy::guest_network()
+        .with_tcp_destination_rules(&[destination_rule(*pinned.ip(), pinned.port())])
+        .unwrap();
+    let broker = test_broker_with_policy(Arc::clone(&provider) as Arc<dyn SocketProvider>, &policy);
+    let session = broker
+        .create_session(CallerCredential::Unauthenticated)
+        .unwrap();
+    let allowed = create(
+        &session,
+        create_request(),
+        Arc::new(TestReadinessSink::default()),
+    )
+    .unwrap();
+    provider.return_next_route(SocketOutcome::Completed(route));
+
+    assert_eq!(
+        connect(&session, allowed, synthetic),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting))
+    );
+    assert_eq!(
+        provider
+            .state
+            .platform_destinations
+            .lock()
+            .unwrap()
+            .as_slice(),
+        [route]
+    );
+
+    let denied = create(
+        &session,
+        create_request(),
+        Arc::new(TestReadinessSink::default()),
+    )
+    .unwrap();
+    let denied_route = PlatformSocketDestination::External {
+        guest_address: synthetic,
+        policy_address: SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 8), 443),
+        host_address: SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 8), 443),
+    };
+    provider.return_next_route(SocketOutcome::Completed(denied_route));
+    assert_eq!(
+        connect(&session, denied, synthetic),
+        Ok(SocketOutcome::Failed(SocketError::PolicyDenied))
+    );
+    assert_eq!(
+        provider
+            .state
+            .platform_destinations
+            .lock()
+            .unwrap()
+            .as_slice(),
+        [route]
+    );
+
+    let unmapped = create(
+        &session,
+        create_request(),
+        Arc::new(TestReadinessSink::default()),
+    )
+    .unwrap();
+    provider.return_next_route(SocketOutcome::Failed(SocketError::ConnectionRefused));
+    assert_eq!(
+        connect(&session, unmapped, synthetic),
+        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+    );
+    assert_eq!(
+        provider.state.route_requests.lock().unwrap().as_slice(),
+        [synthetic, synthetic, synthetic]
+    );
+}
+
+#[test]
+fn broker_dns_route_is_udp_only_and_does_not_require_native_policy() {
+    let provider = Arc::new(TestSocketProvider::default());
+    provider.enable_broker_dns();
+    let broker = test_broker(Arc::clone(&provider) as Arc<dyn SocketProvider>);
+    let session = broker
+        .create_session(CallerCredential::Unauthenticated)
+        .unwrap();
+    let dns = SocketAddrV4::new(BROKER_DNS_IPV4_ADDRESS, 53);
+    let udp = create(
+        &session,
+        create_udp_request(),
+        Arc::new(TestReadinessSink::default()),
+    )
+    .unwrap();
+    provider.return_next_route(SocketOutcome::Completed(
+        PlatformSocketDestination::BrokerDns(dns),
+    ));
+    assert_eq!(
+        send_to(&session, udp, b"query".to_vec(), SendFlags::NONE, Some(dns),),
+        Ok(SocketOutcome::Completed(5))
+    );
+
+    let tcp = create(
+        &session,
+        create_request(),
+        Arc::new(TestReadinessSink::default()),
+    )
+    .unwrap();
+    provider.return_next_route(SocketOutcome::Completed(
+        PlatformSocketDestination::BrokerDns(dns),
+    ));
+    assert_eq!(
+        connect(&session, tcp, dns),
+        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+    );
+}
+
+#[test]
+fn broker_dns_route_requires_provider_capability() {
+    let provider = Arc::new(TestSocketProvider::default());
+    let broker = test_broker(Arc::clone(&provider) as Arc<dyn SocketProvider>);
+    let session = broker
+        .create_session(CallerCredential::Unauthenticated)
+        .unwrap();
+    let dns = SocketAddrV4::new(BROKER_DNS_IPV4_ADDRESS, 53);
+    let udp = create(
+        &session,
+        create_udp_request(),
+        Arc::new(TestReadinessSink::default()),
+    )
+    .unwrap();
+    provider.return_next_route(SocketOutcome::Completed(
+        PlatformSocketDestination::BrokerDns(dns),
+    ));
+
+    assert_eq!(
+        send_to(&session, udp, b"query".to_vec(), SendFlags::NONE, Some(dns)),
+        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+    );
+}
+
+#[test]
+fn broker_dns_endpoint_is_reserved_before_policy_for_standard_routes() {
+    let provider = Arc::new(TestSocketProvider::default());
+    let dns = SocketAddrV4::new(BROKER_DNS_IPV4_ADDRESS, 53);
+    let policy = crate::SocketPolicy::guest_network()
+        .with_tcp_destination_rules(&[destination_rule(*dns.ip(), dns.port())])
+        .unwrap()
+        .with_udp_destination_rules(&[destination_rule(*dns.ip(), dns.port())])
+        .unwrap();
+    let broker = test_broker_with_policy(Arc::clone(&provider) as Arc<dyn SocketProvider>, &policy);
+    let session = broker
+        .create_session(CallerCredential::Unauthenticated)
+        .unwrap();
+    let tcp = create(
+        &session,
+        create_request(),
+        Arc::new(TestReadinessSink::default()),
+    )
+    .unwrap();
+    let udp = create(
+        &session,
+        create_udp_request(),
+        Arc::new(TestReadinessSink::default()),
+    )
+    .unwrap();
+
+    assert_eq!(
+        connect(&session, tcp, dns),
+        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+    );
+    assert_eq!(
+        send_to(&session, udp, b"x".to_vec(), SendFlags::NONE, Some(dns)),
+        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+    );
+    assert_eq!(provider.state.connect_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(provider.state.send_calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn provider_cannot_change_port_or_pin_to_broker_dns() {
+    let provider = Arc::new(TestSocketProvider::default());
+    let requested = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 1), 443);
+    let pinned_ip = Ipv4Addr::new(203, 0, 113, 7);
+    let dns = SocketAddrV4::new(BROKER_DNS_IPV4_ADDRESS, 53);
+    let policy = crate::SocketPolicy::guest_network()
+        .with_tcp_destination_rules(&[
+            destination_rule(pinned_ip, 22),
+            destination_rule(*dns.ip(), dns.port()),
+        ])
+        .unwrap();
+    let broker = test_broker_with_policy(Arc::clone(&provider) as Arc<dyn SocketProvider>, &policy);
+    let session = broker
+        .create_session(CallerCredential::Unauthenticated)
+        .unwrap();
+
+    let wrong_port = create(
+        &session,
+        create_request(),
+        Arc::new(TestReadinessSink::default()),
+    )
+    .unwrap();
+    let pinned = SocketAddrV4::new(pinned_ip, 22);
+    provider.return_next_route(SocketOutcome::Completed(
+        PlatformSocketDestination::External {
+            guest_address: requested,
+            policy_address: pinned,
+            host_address: pinned,
+        },
+    ));
+    assert_eq!(
+        connect(&session, wrong_port, requested),
+        Err(BrokerError::Internal)
+    );
+
+    let broker_dns_target = create(
+        &session,
+        create_request(),
+        Arc::new(TestReadinessSink::default()),
+    )
+    .unwrap();
+    provider.return_next_route(SocketOutcome::Completed(
+        PlatformSocketDestination::External {
+            guest_address: requested,
+            policy_address: dns,
+            host_address: dns,
+        },
+    ));
+    assert_eq!(
+        connect(&session, broker_dns_target, requested),
+        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+    );
+    assert_eq!(provider.state.connect_calls.load(Ordering::Relaxed), 0);
 }
 
 #[test]
@@ -546,6 +785,7 @@ struct TestSocketState {
     next_send_count: StdMutex<Option<usize>>,
     connect_calls: AtomicUsize,
     connect_destinations: StdMutex<std::vec::Vec<SocketAddrV4>>,
+    platform_destinations: StdMutex<std::vec::Vec<PlatformSocketDestination>>,
     connect_source_addresses: StdMutex<std::vec::Vec<Option<SocketAddrV4>>>,
     send_destinations: StdMutex<std::vec::Vec<Option<SocketAddrV4>>>,
     send_calls: AtomicUsize,
@@ -580,6 +820,9 @@ struct TestSocketState {
     live_readiness: StdMutex<Option<ReadinessRegistration>>,
     queue_next_guest_connect: core::sync::atomic::AtomicBool,
     pending_accept: StdMutex<Option<PendingAcceptedConnection>>,
+    route_requests: StdMutex<std::vec::Vec<SocketAddrV4>>,
+    next_route: StdMutex<Option<SocketOutcome<PlatformSocketDestination>>>,
+    broker_dns_enabled: core::sync::atomic::AtomicBool,
 }
 
 struct PendingAcceptedConnection {
@@ -631,6 +874,14 @@ fn invalid_address(address: SocketAddrV4, kind: TestInvalidAddress) -> SocketAdd
 }
 
 impl TestSocketProvider {
+    fn enable_broker_dns(&self) {
+        self.state.broker_dns_enabled.store(true, Ordering::Relaxed);
+    }
+
+    fn return_next_route(&self, route: SocketOutcome<PlatformSocketDestination>) {
+        *self.state.next_route.lock().unwrap() = Some(route);
+    }
+
     fn fail_next_create(&self) {
         self.state.fail_create.store(true, Ordering::Relaxed);
     }
@@ -695,6 +946,30 @@ impl TestSocketProvider {
 }
 
 impl SocketProvider for TestSocketProvider {
+    fn capabilities(&self) -> BrokerCapabilities {
+        if self.state.broker_dns_enabled.load(Ordering::Relaxed) {
+            BrokerCapabilities::BROKER_DNS
+        } else {
+            BrokerCapabilities::NONE
+        }
+    }
+
+    fn route_destination(
+        &self,
+        destination: SocketAddrV4,
+    ) -> Result<SocketOutcome<PlatformSocketDestination>> {
+        self.state.route_requests.lock().unwrap().push(destination);
+        Ok(self
+            .state
+            .next_route
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or_else(|| {
+                SocketOutcome::Completed(PlatformSocketDestination::standard(destination))
+            }))
+    }
+
     fn create(
         &self,
         session_id: SessionId,
@@ -861,9 +1136,15 @@ impl PlatformSocket for TestPlatformSocket {
 
     fn connect(
         &self,
-        address: SocketAddrV4,
+        destination: PlatformSocketDestination,
         guest_source_lease: Option<GuestSourceLease>,
     ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
+        let address = destination.guest_address();
+        self.state
+            .platform_destinations
+            .lock()
+            .unwrap()
+            .push(destination);
         self.state.connect_calls.fetch_add(1, Ordering::Relaxed);
         self.state
             .connect_destinations
@@ -942,14 +1223,21 @@ impl PlatformSocket for TestPlatformSocket {
         &self,
         data: Vec<u8>,
         _flags: SendFlags,
-        destination: Option<SocketAddrV4>,
+        destination: Option<PlatformSocketDestination>,
     ) -> Result<SocketOutcome<usize>> {
+        if let Some(destination) = destination {
+            self.state
+                .platform_destinations
+                .lock()
+                .unwrap()
+                .push(destination);
+        }
         self.state.send_calls.fetch_add(1, Ordering::Relaxed);
         self.state
             .send_destinations
             .lock()
             .unwrap()
-            .push(destination);
+            .push(destination.map(PlatformSocketDestination::guest_address));
         self.state.sent.lock().unwrap().extend_from_slice(&data);
         let sent = self
             .state

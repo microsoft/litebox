@@ -25,6 +25,7 @@ const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const RETRY_DELAY: Duration = Duration::from_millis(20);
 
 pub(crate) struct BrokerConnection {
+    pub(crate) capabilities: litebox_broker_protocol::BrokerCapabilities,
     pub(crate) local: BrokerLocal<UnixControlRingLocalCallChannel>,
     pub(crate) notifications: BrokerNotifications<UnixControlRingLocalNotificationChannel>,
     pub(crate) coordinator: Arc<BrokerAssociationFailureCoordinator>,
@@ -47,8 +48,8 @@ pub(crate) fn connect(control_socket_path: &Path) -> Result<BrokerConnection> {
         )
     })?;
     let association_coordinator = Arc::new(BrokerAssociationFailureCoordinator::new());
-    let (local, (notification_channel, positional_io_fds, shutdown_fd)) =
-        BrokerLocal::negotiate(setup_channel, |mut setup| {
+    let (local, capabilities, (notification_channel, positional_io_fds, shutdown_fd)) =
+        BrokerLocal::negotiate_with_capabilities(setup_channel, |mut setup| {
             let shared_memory =
                 setup.receive_memfd(SHARED_BUFFER_POOL_SIZE, Some(setup_deadline))?;
             let control_memory = setup.receive_control_ring(Some(setup_deadline))?;
@@ -79,6 +80,7 @@ pub(crate) fn connect(control_socket_path: &Path) -> Result<BrokerConnection> {
         })
         .context("broker negotiation failed")?;
     Ok(BrokerConnection {
+        capabilities,
         local,
         notifications: BrokerNotifications::new(notification_channel),
         coordinator: association_coordinator,
@@ -247,6 +249,7 @@ mod tests {
         host.send_handshake_response(
             &litebox_broker_protocol::message::BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: litebox_broker_protocol::BROKER_PROTOCOL_VERSION,
+                capabilities: litebox_broker_protocol::BrokerCapabilities::NONE,
             },
         )
         .unwrap();

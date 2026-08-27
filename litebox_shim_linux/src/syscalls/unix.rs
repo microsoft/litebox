@@ -1562,7 +1562,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
 
         match optname {
             SocketOptionName::IP(ip) => match ip {
-                IpOption::TOS => Err(Errno::EOPNOTSUPP),
+                IpOption::TOS | IpOption::RECVERR => Err(Errno::EOPNOTSUPP),
             },
             SocketOptionName::Socket(so) => match so {
                 // handled by `setsockopt_common`
@@ -1619,7 +1619,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> UnixSocket<Platform, FS> {
 
         let val: u32 = match optname {
             SocketOptionName::IP(ip) => match ip {
-                IpOption::TOS => return Err(Errno::EOPNOTSUPP),
+                IpOption::TOS | IpOption::RECVERR => return Err(Errno::EOPNOTSUPP),
             },
             SocketOptionName::Socket(so) => match so {
                 // handled by `getsockopt_common`

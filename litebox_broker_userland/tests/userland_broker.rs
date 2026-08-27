@@ -72,6 +72,8 @@ fn run_parent_test() {
         .arg(format!("{gateway}/32:{tcp_port}"))
         .arg("--allow-udp-destination")
         .arg(format!("{gateway}/32:{udp_port}"))
+        .arg("--dns-a-record")
+        .arg(format!("gateway.test={gateway}"))
         .arg("--runner")
         .arg(std::env::current_exe().unwrap())
         .arg(NETWORK_RUNNER_ARGUMENT)
@@ -132,10 +134,13 @@ fn run_fake_runner(args: &[OsString]) {
         assert_eq!(args.len(), 6, "unexpected runner arguments: {args:?}");
         let tcp_port = args[4].to_str().unwrap().parse::<u16>().unwrap();
         let udp_port = args[5].to_str().unwrap().parse::<u16>().unwrap();
-        let gateway = std::net::Ipv4Addr::new(10, 0, 2, 1);
+        let pinned_gateway = std::net::Ipv4Addr::new(198, 51, 100, 1);
         let handle = local.create_tcp_socket().unwrap();
         let mut status = local
-            .connect_socket(handle, std::net::SocketAddrV4::new(gateway, tcp_port))
+            .connect_socket(
+                handle,
+                std::net::SocketAddrV4::new(pinned_gateway, tcp_port),
+            )
             .unwrap()
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -158,7 +163,7 @@ fn run_fake_runner(args: &[OsString]) {
                     },
                     request,
                     SendFlags::NONE,
-                    Some(std::net::SocketAddrV4::new(gateway, udp_port)),
+                    Some(std::net::SocketAddrV4::new(pinned_gateway, udp_port)),
                 )
                 .unwrap(),
             Ok(request.len())
@@ -195,7 +200,7 @@ fn run_fake_runner(args: &[OsString]) {
         assert_eq!(&reply[..received.received as usize], b"gateway reply");
         assert_eq!(
             received.source_address,
-            std::net::SocketAddrV4::new(gateway, udp_port)
+            std::net::SocketAddrV4::new(pinned_gateway, udp_port)
         );
         local.close_object(handle).unwrap();
         return;

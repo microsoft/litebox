@@ -587,6 +587,7 @@ mod tests {
         ));
         host.send_handshake_response(&BrokerHandshakeResponse::Negotiated {
             broker_protocol_version: BROKER_PROTOCOL_VERSION,
+            capabilities: litebox_broker_protocol::BrokerCapabilities::NONE,
         })
         .unwrap();
         assert!(matches!(

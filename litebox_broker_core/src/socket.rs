@@ -10,7 +10,6 @@ use core::net::{Ipv4Addr, SocketAddrV4};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use hashbrown::HashSet;
-use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
     CreateSocketRequest, IpProtocol, MAX_SOCKET_TRANSFER_SIZE, MAX_TCP_LISTEN_BACKLOG,
@@ -18,6 +17,7 @@ use litebox_broker_protocol::socket::{
     SocketConnectionStatus, SocketError, SocketOutcome, SocketStatusResponse, SocketType,
     TcpOptionName, TcpOptionValue,
 };
+use litebox_broker_protocol::{BrokerCapabilities, ObjectHandle};
 use spin::Mutex;
 
 use crate::readiness::{ReadinessRegistration, ReadinessSink};
@@ -33,6 +33,9 @@ pub const GUEST_IPV4_ADDRESS: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 15);
 
 /// Fixed guest-visible address used to reach host-loopback services.
 pub const HOST_GATEWAY_IPV4_ADDRESS: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 1);
+
+/// Fixed guest-visible address of the broker-provided DNS service.
+pub const BROKER_DNS_IPV4_ADDRESS: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 3);
 
 fn is_concrete_internal_address(address: Ipv4Addr) -> bool {
     address.is_loopback() || address == GUEST_IPV4_ADDRESS
@@ -456,6 +459,18 @@ pub struct PlatformDatagramReceive {
 /// and accounting domains, not separate provider namespaces. Operations on an
 /// individual socket belong to [`PlatformSocket`], not this shared provider.
 pub trait SocketProvider: Send + Sync {
+    /// Returns immutable features implemented by this provider.
+    fn capabilities(&self) -> BrokerCapabilities;
+
+    /// Resolves a normalized guest-requested address into a trusted platform route.
+    ///
+    /// The core authorizes the route's policy address before handing the route
+    /// to a platform socket.
+    fn route_destination(
+        &self,
+        destination: SocketAddrV4,
+    ) -> Result<SocketOutcome<PlatformSocketDestination>>;
+
     /// Creates one nonblocking socket resource for a broker session.
     ///
     /// Any provider-retained clones must become inert when
@@ -533,12 +548,11 @@ pub trait PlatformSocket: Send + Sync {
     /// [`AcceptedPlatformSocket`]; external paths may drop it. Returning
     /// [`PlatformConnectError::PeerUnchanged`] requires releasing the lease;
     /// [`PlatformSocket::retire`] must release one retained by an indeterminate
-    /// or in-progress operation. `address` is the normalized guest-visible
-    /// destination; the provider must validate it with
-    /// [`normalize_socket_destination`] before choosing a host-socket target.
+    /// or in-progress operation. `destination` is a provider-resolved route
+    /// already validated and authorized by core.
     fn connect(
         &self,
-        address: SocketAddrV4,
+        destination: PlatformSocketDestination,
         guest_source_lease: Option<GuestSourceLease>,
     ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError>;
 
@@ -551,9 +565,8 @@ pub trait PlatformSocket: Send + Sync {
     /// Sends one complete datagram without waiting for platform readiness.
     ///
     /// A destination is required for an unconnected socket and omitted to use
-    /// the socket's connected peer. An explicit destination is normalized but
-    /// remains guest-visible; the provider must validate it with
-    /// [`normalize_socket_destination`] before choosing a host-socket target.
+    /// the socket's connected peer. An explicit destination is a
+    /// provider-resolved route already validated and authorized by core.
     /// A temporarily full socket returns [`BrokerError::WouldBlock`]. Partial
     /// successful sends are invalid. Resource failures are broker errors rather
     /// than ordinary socket failures.
@@ -561,7 +574,7 @@ pub trait PlatformSocket: Send + Sync {
         &self,
         data: Vec<u8>,
         flags: SendFlags,
-        destination: Option<SocketAddrV4>,
+        destination: Option<PlatformSocketDestination>,
     ) -> Result<SocketOutcome<usize>>;
 
     /// Receives bytes without waiting for platform readiness.
@@ -629,10 +642,99 @@ pub trait PlatformSocket: Send + Sync {
     fn readiness(&self) -> ReadinessFlags;
 }
 
+/// A trusted platform route for a normalized guest-requested destination.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlatformSocketDestination {
+    /// A destination served by another guest socket in this broker core.
+    Internal(SocketAddrV4),
+    /// A destination served by the host networking stack.
+    External {
+        /// The address visible to the guest.
+        guest_address: SocketAddrV4,
+        /// The address against which broker policy is evaluated.
+        policy_address: SocketAddrV4,
+        /// The address passed to the host networking stack.
+        host_address: SocketAddrV4,
+    },
+    /// The broker-provided DNS service.
+    BrokerDns(SocketAddrV4),
+}
+
+impl PlatformSocketDestination {
+    /// Constructs the ordinary internal or external route for a normalized address.
+    #[must_use]
+    pub fn standard(destination: SocketAddrV4) -> Self {
+        if is_internal_socket_address(destination) {
+            Self::Internal(destination)
+        } else {
+            Self::External {
+                guest_address: destination,
+                policy_address: destination,
+                host_address: host_socket_destination(destination),
+            }
+        }
+    }
+
+    /// Returns the address visible to the guest.
+    #[must_use]
+    pub fn guest_address(self) -> SocketAddrV4 {
+        match self {
+            Self::Internal(address) | Self::BrokerDns(address) => address,
+            Self::External { guest_address, .. } => guest_address,
+        }
+    }
+
+    /// Returns the address against which broker policy is evaluated.
+    ///
+    /// Broker services do not require a native destination policy rule.
+    #[must_use]
+    pub fn policy_address(self) -> Option<SocketAddrV4> {
+        match self {
+            Self::Internal(address) => Some(address),
+            Self::External { policy_address, .. } => Some(policy_address),
+            Self::BrokerDns(_) => None,
+        }
+    }
+
+    fn is_valid_for(self, requested: SocketAddrV4) -> bool {
+        if self.guest_address() != requested {
+            return false;
+        }
+        match self {
+            Self::Internal(address) => is_internal_socket_address(address),
+            Self::External {
+                policy_address,
+                host_address,
+                ..
+            } => {
+                !is_internal_socket_address(requested)
+                    && policy_address.port() == requested.port()
+                    && normalize_socket_destination(policy_address) == Ok(policy_address)
+                    && !is_internal_socket_address(policy_address)
+                    && host_address == host_socket_destination(policy_address)
+            }
+            Self::BrokerDns(address) => address == SocketAddrV4::new(BROKER_DNS_IPV4_ADDRESS, 53),
+        }
+    }
+}
+
 /// Provider for broker configurations that deliberately disable sockets.
 pub struct UnsupportedSocketProvider;
 
 impl SocketProvider for UnsupportedSocketProvider {
+    fn capabilities(&self) -> BrokerCapabilities {
+        BrokerCapabilities::NONE
+    }
+
+    fn route_destination(
+        &self,
+        destination: SocketAddrV4,
+    ) -> Result<SocketOutcome<PlatformSocketDestination>> {
+        Ok(SocketOutcome::Completed(
+            PlatformSocketDestination::standard(destination),
+        ))
+    }
+
     fn create(
         &self,
         _session_id: SessionId,
@@ -684,6 +786,62 @@ pub fn create(
     Ok(handle)
 }
 
+fn route_and_authorize_destination(
+    session: &BrokerSession,
+    create_request: CreateSocketRequest,
+    requested: SocketAddrV4,
+) -> Result<SocketOutcome<PlatformSocketDestination>> {
+    let destination = match session.core.socket_provider.route_destination(requested)? {
+        SocketOutcome::Completed(destination) => destination,
+        SocketOutcome::Failed(error) => return Ok(SocketOutcome::Failed(error)),
+    };
+    let broker_dns_address = SocketAddrV4::new(BROKER_DNS_IPV4_ADDRESS, 53);
+    if requested == broker_dns_address {
+        match destination {
+            PlatformSocketDestination::BrokerDns(_) => {
+                if !is_udp(create_request)
+                    || !session
+                        .core
+                        .socket_provider
+                        .capabilities()
+                        .contains(BrokerCapabilities::BROKER_DNS)
+                {
+                    return Ok(SocketOutcome::Failed(SocketError::ConnectionRefused));
+                }
+            }
+            PlatformSocketDestination::Internal(_) | PlatformSocketDestination::External { .. } => {
+                return Ok(SocketOutcome::Failed(SocketError::ConnectionRefused));
+            }
+        }
+    }
+    if destination.policy_address() == Some(broker_dns_address) {
+        return Ok(SocketOutcome::Failed(SocketError::ConnectionRefused));
+    }
+    if !destination.is_valid_for(requested) {
+        return Err(BrokerError::Internal);
+    }
+
+    let Some(policy_address) = destination.policy_address() else {
+        return if is_udp(create_request) {
+            Ok(SocketOutcome::Completed(destination))
+        } else {
+            Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+        };
+    };
+
+    // Destination denial is an operation-level socket failure. Failures while
+    // evaluating policy remain broker errors.
+    match session.core.policy.authorize_socket_connect(
+        session.caller_credential,
+        create_request.protocol,
+        policy_address,
+    ) {
+        Ok(()) => Ok(SocketOutcome::Completed(destination)),
+        Err(BrokerError::PolicyDenied) => Ok(SocketOutcome::Failed(SocketError::PolicyDenied)),
+        Err(error) => Err(error),
+    }
+}
+
 /// Starts a nonblocking connection attempt.
 ///
 /// An authorized attempt first binds an unbound socket. TCP connected and
@@ -707,24 +865,16 @@ pub fn connect(
     if address.port() == 0 {
         return Ok(SocketOutcome::Failed(SocketError::ConnectionRefused));
     }
-    let destination = match normalize_socket_destination(address) {
+    let requested_destination = match normalize_socket_destination(address) {
         Ok(destination) => destination,
         Err(error) => return Ok(SocketOutcome::Failed(error)),
     };
 
-    // Destination denial is an operation-level socket failure. Failures while
-    // evaluating policy remain broker errors.
-    match session.core.policy.authorize_socket_connect(
-        session.caller_credential,
-        create_request.protocol,
-        destination,
-    ) {
-        Ok(()) => {}
-        Err(BrokerError::PolicyDenied) => {
-            return Ok(SocketOutcome::Failed(SocketError::PolicyDenied));
-        }
-        Err(error) => return Err(error),
-    }
+    let destination =
+        match route_and_authorize_destination(session, create_request, requested_destination)? {
+            SocketOutcome::Completed(destination) => destination,
+            SocketOutcome::Failed(error) => return Ok(SocketOutcome::Failed(error)),
+        };
 
     if is_udp(create_request) {
         return connect_datagram(session, &object, create_request, destination);
@@ -775,13 +925,13 @@ pub fn connect(
         }
     }
     if resource
-        .source_address_for_destination(destination)
+        .source_address_for_destination(destination.guest_address())
         .is_none()
     {
         finish_connect(&object, SocketConnectionStatus::Unconnected);
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
-    let guest_source_lease = match resource.source_lease_for_connect(destination) {
+    let guest_source_lease = match resource.source_lease_for_connect(destination.guest_address()) {
         Ok(lease) => lease,
         Err(error) => {
             finish_retired_connect(&object);
@@ -1074,24 +1224,18 @@ pub fn send_to(
             return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
         }
         Some(destination) => match normalize_socket_destination(destination) {
-            Ok(destination) => Some(destination),
+            Ok(destination) => {
+                match route_and_authorize_destination(session, create_request, destination)? {
+                    SocketOutcome::Completed(destination) => Some(destination),
+                    SocketOutcome::Failed(error) => {
+                        return Ok(SocketOutcome::Failed(error));
+                    }
+                }
+            }
             Err(error) => return Ok(SocketOutcome::Failed(error)),
         },
         None => None,
     };
-    if let Some(destination) = destination {
-        match session.core.policy.authorize_socket_connect(
-            session.caller_credential,
-            create_request.protocol,
-            destination,
-        ) {
-            Ok(()) => {}
-            Err(BrokerError::PolicyDenied) => {
-                return Ok(SocketOutcome::Failed(SocketError::PolicyDenied));
-            }
-            Err(error) => return Err(error),
-        }
-    }
     let (resource, needs_bind) = {
         let mut object = object.write();
         let ObjectEntry::Socket(socket) = &mut *object else {
@@ -1137,7 +1281,7 @@ pub fn send_to(
     }
     if destination.is_some_and(|destination| {
         resource
-            .source_address_for_destination(destination)
+            .source_address_for_destination(destination.guest_address())
             .is_none()
     }) {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
@@ -1680,7 +1824,7 @@ fn connect_datagram(
     session: &BrokerSession,
     object: &spin::RwLock<ObjectEntry>,
     create_request: CreateSocketRequest,
-    destination: SocketAddrV4,
+    destination: PlatformSocketDestination,
 ) -> Result<SocketOutcome<SocketConnectionStatus>> {
     let (resource, previous_status, needs_bind) = {
         let mut object = object.write();
@@ -1725,7 +1869,7 @@ fn connect_datagram(
         }
     }
     if resource
-        .source_address_for_destination(destination)
+        .source_address_for_destination(destination.guest_address())
         .is_none()
     {
         finish_datagram_connect(object, previous_status, false);

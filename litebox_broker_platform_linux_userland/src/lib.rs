@@ -11,4 +11,4 @@
 
 mod socket;
 
-pub use socket::LinuxSocketProvider;
+pub use socket::{DnsARecord, LinuxSocketProvider};

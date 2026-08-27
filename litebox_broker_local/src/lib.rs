@@ -35,7 +35,9 @@ use litebox_broker_protocol::message::{
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_LAYOUT;
-use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, ObjectHandle, RequestId};
+use litebox_broker_protocol::{
+    BROKER_PROTOCOL_VERSION, BrokerCapabilities, ObjectHandle, RequestId,
+};
 use litebox_broker_transport::channel::{
     LocalCallChannel, LocalNotificationChannel, LocalSetupChannel,
 };
@@ -74,7 +76,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     /// response that does not match the negotiation request, or setup returns
     /// shared memory with an invalid size.
     pub fn negotiate<Setup: LocalSetupChannel<Error = Channel::Error>, Activated>(
-        mut setup: Setup,
+        setup: Setup,
         activate: impl FnOnce(
             Setup,
         ) -> core::result::Result<
@@ -82,6 +84,23 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             Channel::Error,
         >,
     ) -> Result<(Self, Activated), Channel::Error> {
+        let (local, _capabilities, activated) = Self::negotiate_with_capabilities(setup, activate)?;
+        Ok((local, activated))
+    }
+
+    /// Negotiates the broker protocol and returns the negotiated capabilities.
+    pub fn negotiate_with_capabilities<
+        Setup: LocalSetupChannel<Error = Channel::Error>,
+        Activated,
+    >(
+        mut setup: Setup,
+        activate: impl FnOnce(
+            Setup,
+        ) -> core::result::Result<
+            (Channel, Arc<dyn SharedMemory>, Activated),
+            Channel::Error,
+        >,
+    ) -> Result<(Self, BrokerCapabilities, Activated), Channel::Error> {
         let requested = BROKER_PROTOCOL_VERSION;
         let request = BrokerHandshakeRequest {
             protocol_version: requested,
@@ -96,6 +115,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         {
             response @ BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version,
+                capabilities,
             } => {
                 assert_eq!(
                     requested, broker_protocol_version,
@@ -111,6 +131,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                         shared_buffers,
                         next_request_id: AtomicU64::new(0),
                     },
+                    capabilities,
                     activated,
                 ))
             }
@@ -254,6 +275,7 @@ mod tests {
         let channel = FakeControlChannel::new(
             Some(BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
+                capabilities: BrokerCapabilities::NONE,
             }),
             None,
         );
@@ -274,6 +296,25 @@ mod tests {
             })
         );
         assert_eq!(setup_calls.get(), 1);
+    }
+
+    #[test]
+    fn negotiate_returns_broker_capabilities() {
+        let channel = FakeControlChannel::new(
+            Some(BrokerHandshakeResponse::Negotiated {
+                broker_protocol_version: BROKER_PROTOCOL_VERSION,
+                capabilities: BrokerCapabilities::BROKER_DNS,
+            }),
+            None,
+        );
+
+        let (_local, capabilities, ()) =
+            BrokerLocal::negotiate_with_capabilities(channel, |channel| {
+                Ok((channel, noop_shared_memory(), ()))
+            })
+            .unwrap();
+
+        assert_eq!(capabilities, BrokerCapabilities::BROKER_DNS);
     }
 
     #[test]
@@ -432,6 +473,7 @@ mod tests {
         let channel = FakeControlChannel::new(
             Some(BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version,
+                capabilities: BrokerCapabilities::NONE,
             }),
             None,
         );
@@ -505,6 +547,7 @@ mod tests {
         let channel = FakeControlChannel::new(
             Some(BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
+                capabilities: BrokerCapabilities::NONE,
             }),
             None,
         );
@@ -527,6 +570,7 @@ mod tests {
         let channel = FakeControlChannel::new(
             Some(BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
+                capabilities: BrokerCapabilities::NONE,
             }),
             None,
         );
@@ -691,6 +735,7 @@ mod tests {
         ) -> core::result::Result<Option<BrokerHandshakeResponse>, Self::Error> {
             Ok(Some(BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
+                capabilities: BrokerCapabilities::NONE,
             }))
         }
     }

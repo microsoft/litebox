@@ -13,6 +13,266 @@ fn gateway_udp_policy() -> SocketPolicy {
         .unwrap()
 }
 
+fn dns_query(name: &str) -> Vec<u8> {
+    let mut query = Vec::from([
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ]);
+    for label in name.split('.') {
+        query.push(u8::try_from(label.len()).unwrap());
+        query.extend_from_slice(label.as_bytes());
+    }
+    query.extend_from_slice(&[0, 0, 1, 0, 1]);
+    query
+}
+
+#[test]
+fn broker_dns_answers_unconnected_and_connected_udp_without_native_endpoint() {
+    let provider = Arc::new(
+        LinuxSocketProvider::new_with_dns_records(
+            1,
+            1,
+            &["service.example=203.0.113.7".parse().unwrap()],
+        )
+        .unwrap(),
+    );
+    let broker = BrokerCore::new_with_limits(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(SocketPolicy::guest_network()),
+        BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
+        provider.clone(),
+    )
+    .unwrap();
+    let session = broker
+        .create_session(CallerCredential::Unauthenticated)
+        .unwrap();
+    let (published, publications) = channel();
+    let (retired, _retirements) = channel();
+    let socket = create_udp_socket(&session, Arc::new(TestReadinessSink { published, retired }));
+    let dns_address = SocketAddrV4::new(BROKER_DNS_IPV4_ADDRESS, 53);
+    let query = dns_query("service.example");
+
+    assert_eq!(
+        send_datagram(&session, socket, &query, SendFlags::NONE, Some(dns_address),),
+        Ok(SocketOutcome::Completed(query.len()))
+    );
+    wait_until_ready(&session, &publications, socket, ReadinessFlags::READ);
+    let mut response = [0; 512];
+    let received =
+        receive_datagram_into(&session, socket, &mut response, ReceiveFromFlags::NONE).unwrap();
+    let SocketOutcome::Completed(received) = received else {
+        panic!("broker DNS response missing");
+    };
+    assert_eq!(received.source_address, dns_address);
+    assert_eq!(
+        &response[received.received - 4..received.received],
+        &Ipv4Addr::new(198, 51, 100, 1).octets()
+    );
+
+    assert_eq!(
+        litebox_broker_core::socket::connect(&session, socket, dns_address),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+    );
+    assert_eq!(
+        send_datagram(&session, socket, &query, SendFlags::NONE, None),
+        Ok(SocketOutcome::Completed(query.len()))
+    );
+    wait_until_ready(&session, &publications, socket, ReadinessFlags::READ);
+    response.fill(0);
+    let received =
+        receive_datagram_into(&session, socket, &mut response, ReceiveFromFlags::NONE).unwrap();
+    let SocketOutcome::Completed(received) = received else {
+        panic!("connected broker DNS response missing");
+    };
+    assert_eq!(received.source_address, dns_address);
+    assert_eq!(
+        &response[received.received - 4..received.received],
+        &Ipv4Addr::new(198, 51, 100, 1).octets()
+    );
+    assert_eq!(provider.reactor.udp_native_endpoint_count(), 0);
+}
+
+#[test]
+fn udp_native_and_synthetic_alias_collision_is_an_operation_failure() {
+    let provider = Arc::new(
+        LinuxSocketProvider::new_with_dns_records(
+            4,
+            4,
+            &["service.example=10.0.2.1".parse().unwrap()],
+        )
+        .unwrap(),
+    );
+    let broker = BrokerCore::new_with_limits(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(gateway_udp_policy()),
+        BrokerCoreLimits::new_with_all_limits(6, 0, 4, 4),
+        provider,
+    )
+    .unwrap();
+    let session = broker
+        .create_session(CallerCredential::Unauthenticated)
+        .unwrap();
+    let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    server.set_read_timeout(Some(TEST_TIMEOUT)).unwrap();
+    let gateway = gateway_address(socket_address_v4(server.local_addr().unwrap()));
+    let synthetic = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 1), gateway.port());
+    let (published, _publications) = channel();
+    let (retired, _retirements) = channel();
+    let readiness = Arc::new(TestReadinessSink { published, retired });
+
+    let synthetic_first = create_udp_socket(&session, readiness.clone());
+    assert_eq!(
+        send_datagram(
+            &session,
+            synthetic_first,
+            b"synthetic",
+            SendFlags::NONE,
+            Some(synthetic),
+        ),
+        Ok(SocketOutcome::Completed(9))
+    );
+    let mut payload = [0; 9];
+    assert_eq!(server.recv(&mut payload).unwrap(), payload.len());
+    assert_eq!(&payload, b"synthetic");
+    assert_eq!(
+        send_datagram(
+            &session,
+            synthetic_first,
+            b"native",
+            SendFlags::NONE,
+            Some(gateway),
+        ),
+        Ok(SocketOutcome::Failed(SocketError::AddressNotAvailable))
+    );
+
+    let native_first = create_udp_socket(&session, readiness.clone());
+    assert_eq!(
+        send_datagram(
+            &session,
+            native_first,
+            b"native",
+            SendFlags::NONE,
+            Some(gateway),
+        ),
+        Ok(SocketOutcome::Completed(6))
+    );
+    let mut payload = [0; 6];
+    assert_eq!(server.recv(&mut payload).unwrap(), payload.len());
+    assert_eq!(&payload, b"native");
+    assert_eq!(
+        send_datagram(
+            &session,
+            native_first,
+            b"synthetic",
+            SendFlags::NONE,
+            Some(synthetic),
+        ),
+        Ok(SocketOutcome::Failed(SocketError::AddressNotAvailable))
+    );
+
+    let synthetic_connected = create_udp_socket(&session, readiness.clone());
+    assert_eq!(
+        litebox_broker_core::socket::connect(&session, synthetic_connected, synthetic),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+    );
+    assert_eq!(
+        send_datagram(
+            &session,
+            synthetic_connected,
+            b"native",
+            SendFlags::NONE,
+            Some(gateway),
+        ),
+        Ok(SocketOutcome::Failed(SocketError::AddressNotAvailable))
+    );
+
+    let native_connected = create_udp_socket(&session, readiness);
+    assert_eq!(
+        litebox_broker_core::socket::connect(&session, native_connected, gateway),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+    );
+    assert_eq!(
+        send_datagram(
+            &session,
+            native_connected,
+            b"synthetic",
+            SendFlags::NONE,
+            Some(synthetic),
+        ),
+        Ok(SocketOutcome::Failed(SocketError::AddressNotAvailable))
+    );
+}
+
+#[test]
+fn broker_dns_discards_unreceivable_replies_without_readiness() {
+    let provider = Arc::new(
+        LinuxSocketProvider::new_with_dns_records(
+            2,
+            2,
+            &["service.example=10.0.2.1".parse().unwrap()],
+        )
+        .unwrap(),
+    );
+    let broker = BrokerCore::new_with_limits(
+        PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+            .with_socket_policy(gateway_udp_policy()),
+        BrokerCoreLimits::new_with_all_limits(4, 0, 2, 2),
+        provider,
+    )
+    .unwrap();
+    let session = broker
+        .create_session(CallerCredential::Unauthenticated)
+        .unwrap();
+    let dns_address = SocketAddrV4::new(BROKER_DNS_IPV4_ADDRESS, 53);
+    let query = dns_query("service.example");
+
+    let (published, publications) = channel();
+    let (retired, _retirements) = channel();
+    let receive_shut =
+        create_udp_socket(&session, Arc::new(TestReadinessSink { published, retired }));
+    assert_eq!(
+        litebox_broker_core::socket::shutdown(&session, receive_shut, ShutdownMode::Read,),
+        Ok(SocketOutcome::Completed(()))
+    );
+    while publications.try_recv().is_ok() {}
+    assert_eq!(
+        send_datagram(
+            &session,
+            receive_shut,
+            &query,
+            SendFlags::NONE,
+            Some(dns_address),
+        ),
+        Ok(SocketOutcome::Completed(query.len()))
+    );
+    assert!(publications.try_recv().is_err());
+
+    let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let gateway = gateway_address(socket_address_v4(server.local_addr().unwrap()));
+    let (published, _publications) = channel();
+    let (retired, _retirements) = channel();
+    let external = create_udp_socket(&session, Arc::new(TestReadinessSink { published, retired }));
+    assert_eq!(
+        litebox_broker_core::socket::connect(&session, external, gateway),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+    );
+    assert_eq!(
+        send_datagram(
+            &session,
+            external,
+            &query,
+            SendFlags::NONE,
+            Some(dns_address),
+        ),
+        Ok(SocketOutcome::Completed(query.len()))
+    );
+    assert!(
+        !session
+            .check_readiness(external)
+            .unwrap()
+            .contains(ReadinessFlags::READ)
+    );
+}
+
 #[test]
 fn udp_gateway_translates_sources_filters_spoofing_and_reuses_endpoint() {
     let native_ip = non_loopback_local_ipv4();

@@ -158,6 +158,12 @@ impl BrokerCore {
         self.limits
     }
 
+    /// Returns the immutable capabilities of this core's socket provider.
+    #[must_use]
+    pub fn capabilities(&self) -> litebox_broker_protocol::BrokerCapabilities {
+        self.socket_provider.capabilities()
+    }
+
     pub(crate) fn allocate_reference_handle(&self) -> Result<ObjectHandle> {
         let mut next_reference_handle = self.next_reference_handle.write();
         let handle = ObjectHandle(*next_reference_handle);

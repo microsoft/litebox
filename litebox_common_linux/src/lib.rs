@@ -810,6 +810,7 @@ pub enum UnixProtocol {
 #[derive(Debug, IntEnum, Clone, Copy)]
 pub enum IpOption {
     TOS = 1,
+    RECVERR = 11,
 }
 
 #[repr(u32)]

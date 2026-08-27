@@ -18,6 +18,7 @@
 use alloc::vec::Vec;
 use thiserror::Error;
 
+use crate::BrokerCapabilities;
 use crate::error::ErrorCode;
 use crate::message::{
     BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerOperation,
@@ -67,6 +68,8 @@ pub enum WireError {
     TrailingBytes,
     #[error("invalid broker wire tag")]
     InvalidTag,
+    #[error("broker wire capabilities contain unknown bits")]
+    UnknownCapabilities,
     #[error("broker wire message is not valid in this protocol phase")]
     WrongMessagePhase,
     #[error("broker wire offset overflow")]
@@ -183,9 +186,11 @@ pub fn encode_handshake_response(response: BrokerHandshakeResponse) -> Vec<u8> {
     match response {
         BrokerHandshakeResponse::Negotiated {
             broker_protocol_version,
+            capabilities,
         } => {
             encoder.u8(RESPONSE_TAG_NEGOTIATED);
             encoder.protocol_version(broker_protocol_version);
+            encoder.u64(capabilities.bits());
         }
         BrokerHandshakeResponse::VersionMismatch {
             broker_protocol_version,
@@ -208,6 +213,8 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
     let response = match tag {
         RESPONSE_TAG_NEGOTIATED => BrokerHandshakeResponse::Negotiated {
             broker_protocol_version: decoder.protocol_version()?,
+            capabilities: BrokerCapabilities::from_bits(decoder.u64()?)
+                .ok_or(WireError::UnknownCapabilities)?,
         },
         RESPONSE_TAG_EVENT
         | RESPONSE_TAG_OBJECT_CLOSED
@@ -337,6 +344,8 @@ pub fn decode_notification(frame: &[u8]) -> Result<BrokerNotification, WireError
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::*;
     use crate::event::{
         AddEventRequest, AddEventResponse, ConsumeEventRequest, CreateEventRequest,
@@ -361,7 +370,7 @@ mod tests {
         ShutdownSocketRequest, SocketConnectionStatus, SocketError, SocketStatusRequest,
         SocketStatusResponse, SocketType, TcpOptionName, TcpOptionValue,
     };
-    use crate::{ObjectHandle, ProtocolVersion, RequestId};
+    use crate::{BrokerCapabilities, ObjectHandle, ProtocolVersion, RequestId};
     use core::net::{Ipv4Addr, SocketAddrV4};
 
     const TEST_REQUEST_ID: RequestId = RequestId(0x0102_0304_0506_0708);
@@ -661,6 +670,7 @@ mod tests {
         let responses = [
             BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: ProtocolVersion(1),
+                capabilities: BrokerCapabilities::BROKER_DNS,
             },
             BrokerHandshakeResponse::VersionMismatch {
                 broker_protocol_version: ProtocolVersion(1),
@@ -675,6 +685,17 @@ mod tests {
                 response
             );
         }
+    }
+
+    #[test]
+    fn handshake_response_rejects_unknown_capabilities() {
+        let mut frame = vec![RESPONSE_TAG_NEGOTIATED];
+        frame.extend_from_slice(&ProtocolVersion(1).0.to_le_bytes());
+        frame.extend_from_slice(&(1u64 << 63).to_le_bytes());
+        assert_eq!(
+            decode_handshake_response(&frame),
+            Err(WireError::UnknownCapabilities)
+        );
     }
 
     #[test]
@@ -1131,6 +1152,7 @@ mod tests {
 
         let mut frame = encode_handshake_response(BrokerHandshakeResponse::Negotiated {
             broker_protocol_version: ProtocolVersion(1),
+            capabilities: BrokerCapabilities::NONE,
         });
         frame.push(0xff);
         assert_eq!(
@@ -1148,6 +1170,7 @@ mod tests {
         for response in [
             BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: ProtocolVersion(1),
+                capabilities: BrokerCapabilities::NONE,
             },
             BrokerHandshakeResponse::VersionMismatch {
                 broker_protocol_version: ProtocolVersion(1),

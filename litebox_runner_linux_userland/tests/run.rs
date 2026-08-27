@@ -23,6 +23,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
 
 const BROKER_ONLY_C_TESTS: &[&str] = &[
     "eventfd.c",
+    "dns_broker.c",
     "pipe_broker.c",
     "tcp_broker.c",
     "tcp_broker_server.c",
@@ -366,7 +367,29 @@ fn spawn_test_broker(
     policy: litebox_broker_core::PolicyEngine,
     connection_count: usize,
 ) -> TestBroker {
-    spawn_test_broker_with_mode(control_socket_path, policy, connection_count, false)
+    spawn_test_broker_with_mode(
+        control_socket_path,
+        policy,
+        connection_count,
+        Vec::new(),
+        false,
+    )
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn spawn_test_broker_with_dns(
+    control_socket_path: &Path,
+    policy: litebox_broker_core::PolicyEngine,
+    connection_count: usize,
+    dns_records: Vec<litebox_broker_platform_linux_userland::DnsARecord>,
+) -> TestBroker {
+    spawn_test_broker_with_mode(
+        control_socket_path,
+        policy,
+        connection_count,
+        dns_records,
+        false,
+    )
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -375,7 +398,13 @@ fn spawn_concurrent_test_broker(
     policy: litebox_broker_core::PolicyEngine,
     connection_count: usize,
 ) -> TestBroker {
-    spawn_test_broker_with_mode(control_socket_path, policy, connection_count, true)
+    spawn_test_broker_with_mode(
+        control_socket_path,
+        policy,
+        connection_count,
+        Vec::new(),
+        true,
+    )
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -383,6 +412,7 @@ fn spawn_test_broker_with_mode(
     control_socket_path: &Path,
     policy: litebox_broker_core::PolicyEngine,
     connection_count: usize,
+    dns_records: Vec<litebox_broker_platform_linux_userland::DnsARecord>,
     concurrent: bool,
 ) -> TestBroker {
     let _ = std::fs::remove_file(control_socket_path);
@@ -402,9 +432,10 @@ fn spawn_test_broker_with_mode(
                 policy,
                 limits,
                 std::sync::Arc::new(
-                    litebox_broker_platform_linux_userland::LinuxSocketProvider::new(
+                    litebox_broker_platform_linux_userland::LinuxSocketProvider::new_with_dns_records(
                         limits.max_sockets,
                         limits.max_sockets_per_session,
+                        &dns_records,
                     )
                     .expect("failed to create broker test socket provider"),
                 ),
@@ -701,6 +732,48 @@ fn test_runner_broker_tcp_client_with_rewriter() {
         .broker_socket(&control_socket_path)
         .run();
     assert_eq!(broker.next_close_object_count(), 9);
+    broker.join();
+    server.join().unwrap();
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn test_runner_broker_dns_pins_hostname_to_gateway() {
+    use std::io::Read as _;
+    use std::net::{Ipv4Addr, TcpListener};
+
+    let target = common::compile(
+        "./tests/dns_broker.c",
+        "broker_dns_client_rewriter",
+        false,
+        false,
+    );
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut stream, peer) = listener.accept().unwrap();
+        assert!(peer.ip().is_loopback());
+        let mut request = [0; 19];
+        stream.read_exact(&mut request).unwrap();
+        assert_eq!(&request, b"dns-pinned request\0");
+    });
+
+    let control_socket_path = unique_test_socket_path("runner-broker-dns-control");
+    let broker = spawn_test_broker_with_dns(
+        &control_socket_path,
+        litebox_broker_core::PolicyEngine::with_host_guaranteed_rights(
+            litebox_broker_core::ObjectRights::all(),
+        )
+        .with_socket_policy(gateway_tcp_policy()),
+        1,
+        vec!["service.example=10.0.2.1".parse().unwrap()],
+    );
+    let mut runner = Runner::new(&target, "broker_dns_client_rewriter");
+    runner
+        .arg(port.to_string())
+        .broker_socket(&control_socket_path)
+        .run();
+    assert!(broker.next_close_object_count() >= 2);
     broker.join();
     server.join().unwrap();
 }

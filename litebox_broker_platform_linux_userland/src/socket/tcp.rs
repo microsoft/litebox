@@ -11,8 +11,7 @@ use std::time::Duration;
 
 use litebox_broker_core::readiness::ReadinessRegistration;
 use litebox_broker_core::socket::{
-    GuestSocketBinding, GuestSourceLease, PlatformConnectError, host_socket_destination,
-    is_internal_socket_address, normalize_socket_destination,
+    GuestSocketBinding, GuestSourceLease, PlatformConnectError, PlatformSocketDestination,
 };
 use litebox_broker_core::{BrokerError, Result as BrokerResult, SessionId};
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -277,7 +276,10 @@ enum ResolvedTcpDestination {
         listener_id: u64,
         concrete_address: SocketAddrV4,
     },
-    External(SocketAddrV4),
+    External {
+        guest_address: SocketAddrV4,
+        host_address: SocketAddrV4,
+    },
 }
 
 impl ReactorTcpState {
@@ -1217,7 +1219,7 @@ impl Reactor {
     pub(super) fn connect_tcp_destination(
         &mut self,
         id: u64,
-        requested_destination: SocketAddrV4,
+        requested_destination: PlatformSocketDestination,
         guest_source_lease: Option<GuestSourceLease>,
     ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
         let session_id = self
@@ -1265,13 +1267,16 @@ impl Reactor {
             );
         }
         drop(guest_source_lease);
-        let ResolvedTcpDestination::External(external_destination) = destination else {
+        let ResolvedTcpDestination::External {
+            guest_address,
+            host_address,
+        } = destination
+        else {
             unreachable!("internal destination handled above");
         };
-        let host_destination = host_socket_destination(external_destination);
         let guest_local_address = binding
             .guest_binding
-            .source_address_for_destination(external_destination)
+            .source_address_for_destination(guest_address)
             .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?;
         let (status, readiness) = connect_external_tcp_socket(
             &self.epoll,
@@ -1279,7 +1284,7 @@ impl Reactor {
             self.sockets
                 .get_mut(&id)
                 .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?,
-            host_destination,
+            host_address,
         )?;
         if matches!(
             status,
@@ -1746,15 +1751,24 @@ impl Reactor {
 
     fn resolve_tcp_destination(
         &self,
-        requested_destination: SocketAddrV4,
+        destination: PlatformSocketDestination,
     ) -> SocketOutcome<ResolvedTcpDestination> {
-        let destination = match normalize_socket_destination(requested_destination) {
-            Ok(destination) => destination,
-            Err(error) => return SocketOutcome::Failed(error),
+        let destination = match destination {
+            PlatformSocketDestination::Internal(destination) => destination,
+            PlatformSocketDestination::External {
+                guest_address,
+                host_address,
+                ..
+            } => {
+                return SocketOutcome::Completed(ResolvedTcpDestination::External {
+                    guest_address,
+                    host_address,
+                });
+            }
+            PlatformSocketDestination::BrokerDns(_) => {
+                return SocketOutcome::Failed(SocketError::ConnectionRefused);
+            }
         };
-        if !is_internal_socket_address(destination) {
-            return SocketOutcome::Completed(ResolvedTcpDestination::External(destination));
-        }
         let Some(binding) = self.tcp.guest_binding(destination) else {
             return SocketOutcome::Failed(SocketError::ConnectionRefused);
         };

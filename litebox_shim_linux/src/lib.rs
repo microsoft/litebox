@@ -62,17 +62,21 @@ mod wait;
 
 use crate::syscalls::file::get_file_descriptor_flags;
 
-pub type DefaultFS<Platform> = LinuxFS<Platform>;
+/// Lower filesystem used by [`LinuxShimBuilder::default_fs`].
+pub type DefaultLowerFS<Platform> = litebox::fs::layered::FileSystem<
+    Platform,
+    litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>,
+    litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>,
+>;
 
-pub(crate) type LinuxFS<Platform> = litebox::fs::layered::FileSystem<
+/// Default layered filesystem used by the Linux shim.
+pub type DefaultFS<Platform> = litebox::fs::layered::FileSystem<
     Platform,
     litebox::fs::in_mem::FileSystem<Platform>,
-    litebox::fs::layered::FileSystem<
-        Platform,
-        litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>,
-        litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>,
-    >,
+    DefaultLowerFS<Platform>,
 >;
+
+pub(crate) type LinuxFS<Platform> = DefaultFS<Platform>;
 
 pub(crate) type FileFd<FS> = litebox::fd::TypedFd<FS>;
 
@@ -249,6 +253,21 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         default_fs(&self.litebox, in_mem_fs, tar_data)
     }
 
+    /// Creates the default filesystem after configuring its in-memory upper.
+    pub fn default_fs_with_hook<Error>(
+        &self,
+        mut in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
+        tar_data: Cow<'static, [u8]>,
+        hook: impl FnOnce(
+            &DefaultLowerFS<Platform>,
+            &mut litebox::fs::in_mem::FileSystem<Platform>,
+        ) -> core::result::Result<(), Error>,
+    ) -> core::result::Result<DefaultFS<Platform>, Error> {
+        let lower = default_lower_fs(&self.litebox, tar_data);
+        hook(&lower, &mut in_mem_fs)?;
+        Ok(compose_default_fs(&self.litebox, in_mem_fs, lower))
+    }
+
     /// Build the shim.
     pub fn build<FS: ShimFS>(self) -> LinuxShim<Platform, FS> {
         let net = Network::new(&self.litebox);
@@ -393,6 +412,14 @@ fn default_fs<Platform: ShimPlatform>(
     in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
     tar_data: Cow<'static, [u8]>,
 ) -> LinuxFS<Platform> {
+    let lower = default_lower_fs(litebox, tar_data);
+    compose_default_fs(litebox, in_mem_fs, lower)
+}
+
+fn default_lower_fs<Platform: ShimPlatform>(
+    litebox: &LiteBox<Platform>,
+    tar_data: Cow<'static, [u8]>,
+) -> DefaultLowerFS<Platform> {
     let dev_stdio = litebox::fs::resolver::Resolver::new(
         litebox,
         litebox::fs::composer::Composer::builder()
@@ -413,13 +440,21 @@ fn default_fs<Platform: ShimPlatform>(
     );
     litebox::fs::layered::FileSystem::new(
         litebox,
+        dev_stdio,
+        tar_ro,
+        litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
+    )
+}
+
+fn compose_default_fs<Platform: ShimPlatform>(
+    litebox: &LiteBox<Platform>,
+    in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
+    lower: DefaultLowerFS<Platform>,
+) -> DefaultFS<Platform> {
+    litebox::fs::layered::FileSystem::new(
+        litebox,
         in_mem_fs,
-        litebox::fs::layered::FileSystem::new(
-            litebox,
-            dev_stdio,
-            tar_ro,
-            litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
-        ),
+        lower,
         litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
     )
 }

@@ -21,6 +21,8 @@ use litebox_broker_core::{
     SocketPolicyError,
 };
 use litebox_broker_host::{BrokerHostAssociation, ConnectionTermination, setup_connection};
+#[cfg(target_os = "linux")]
+use litebox_broker_platform_linux_userland::DnsARecord;
 use litebox_broker_protocol::message::{BrokerRequest, BrokerResponse};
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_LAYOUT;
 use litebox_broker_protocol::socket::{Ipv4Address, Port};
@@ -97,6 +99,14 @@ struct CliArgs {
     /// `0.0.0.0/0:1-65535` permits every nonzero IPv4 UDP destination.
     #[arg(long, value_name = "CIDR:PORT[-PORT]")]
     allow_udp_destination: Vec<AllowedDestination>,
+    /// Publish an exact static IPv4 DNS record as a broker-pinned identity.
+    ///
+    /// May be repeated for up to 64 unique names and destination addresses.
+    /// Resolving the name does not grant access to the pinned destination; the
+    /// matching TCP or UDP destination policy must allow it.
+    #[cfg(target_os = "linux")]
+    #[arg(long, value_name = "NAME=IP")]
+    dns_a_record: Vec<DnsARecord>,
     /// Local runner executable to launch.
     #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::ExecutablePath)]
     runner: PathBuf,
@@ -578,6 +588,27 @@ mod cli_tests {
         assert_eq!(args.allow_udp_destination.len(), 1);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cli_accepts_dns_a_records() {
+        let args = CliArgs::try_parse_from([
+            "litebox-broker-userland",
+            "--dns-a-record",
+            "service.test=203.0.113.7",
+            "--runner",
+            "runner",
+            "guest",
+        ])
+        .unwrap();
+
+        assert_eq!(args.dns_a_record.len(), 1);
+        assert_eq!(args.dns_a_record[0].name(), "service.test");
+        assert_eq!(
+            args.dns_a_record[0].address(),
+            Ipv4Addr::new(203, 0, 113, 7)
+        );
+    }
+
     #[test]
     fn destination_argument_parses_canonical_cidr_and_ports() {
         let allowed = "203.0.113.0/24:443-444"
@@ -671,6 +702,7 @@ mod tests {
         control_channel
             .send_handshake_response(&BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
+                capabilities: litebox_broker_protocol::BrokerCapabilities::NONE,
             })
             .unwrap();
         local_setup.recv_handshake_response().unwrap().unwrap();

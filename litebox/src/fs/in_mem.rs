@@ -70,16 +70,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider> FileSystem<Platform> {
     ///
     /// This function primarily exists to initialize files. Most regular interaction with the file
     /// system should be done without this function.
-    pub fn with_root_privileges<F>(&mut self, f: F)
+    pub fn with_root_privileges<F, R>(&mut self, f: F) -> R
     where
-        F: FnOnce(&mut Self),
+        F: FnOnce(&mut Self) -> R,
     {
         let original_user = core::mem::replace(&mut self.current_user, UserInfo::ROOT);
-        f(self);
+        let result = f(self);
         let root_again = core::mem::replace(&mut self.current_user, original_user);
         if root_again.user != UserInfo::ROOT.user || root_again.group != UserInfo::ROOT.group {
             unreachable!()
         }
+        result
     }
 
     /// Initialize a primarily read-heavy file with static data.

@@ -20,7 +20,7 @@ use crate::socket::{
     SendToSocketResponse, SetTcpOptionRequest, ShutdownSocketRequest, SocketError,
     SocketStatusRequest, SocketStatusResponse,
 };
-use crate::{ObjectHandle, ProtocolVersion, RequestId};
+use crate::{BrokerCapabilities, ObjectHandle, ProtocolVersion, RequestId};
 
 /// Broker handshake request sent before the control channel is active.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -63,6 +63,8 @@ pub enum BrokerHandshakeResponse {
         /// The broker returns its supported version after validating that the
         /// requested version matches it.
         broker_protocol_version: ProtocolVersion,
+        /// Immutable features exposed by the broker for this association.
+        capabilities: BrokerCapabilities,
     },
     /// Negotiation failed because the requested version is unsupported.
     ///
