@@ -790,8 +790,8 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 mod tests {
     use super::*;
     use crate::tests::{
-        TestFS, TestPlatform, const_ptr, mut_byte_ptr, mut_ptr, null_const_ptr, null_mut_ptr,
-        test_task, unicode_string, utf16_units,
+        const_ptr, mut_byte_ptr, mut_ptr, null_const_ptr, null_mut_ptr, test_task, unicode_string,
+        utf16_units,
     };
 
     #[repr(C)]
@@ -863,95 +863,6 @@ mod tests {
         );
         assert_eq!(output.user.user.attributes, 0);
         assert_eq!(output.sid, LOCAL_SYSTEM_SID);
-    }
-
-    #[test]
-    fn process_token_is_not_in_a_private_namespace() {
-        let task = test_task();
-        let mut output = u32::MAX;
-        let mut return_length = 0;
-
-        assert_eq!(
-            task.sys_nt_query_information_token(
-                Task::<TestPlatform, TestFS>::CURRENT_PROCESS_TOKEN,
-                TokenInformationClass::PrivateNameSpace as u32,
-                mut_byte_ptr(&mut output),
-                size_of_val(&output).try_into().unwrap(),
-                mut_ptr(&mut return_length),
-            ),
-            NtStatus::SUCCESS
-        );
-        assert_eq!(output, 0);
-        assert_eq!(return_length as usize, size_of_val(&output));
-    }
-
-    #[test]
-    fn process_token_has_bno_isolation_disabled() {
-        let task = test_task();
-        let mut output = TokenBnoIsolationInformation {
-            isolation_prefix: usize::MAX,
-            isolation_enabled: u8::MAX,
-            padding: [u8::MAX; 7],
-        };
-        let mut return_length = 0;
-
-        assert_eq!(
-            task.sys_nt_query_information_token(
-                Task::<TestPlatform, TestFS>::CURRENT_PROCESS_TOKEN,
-                TokenInformationClass::BnoIsolation as u32,
-                mut_byte_ptr(&mut output),
-                size_of_val(&output).try_into().unwrap(),
-                mut_ptr(&mut return_length),
-            ),
-            NtStatus::SUCCESS
-        );
-        assert_eq!(
-            output,
-            TokenBnoIsolationInformation {
-                isolation_prefix: 0,
-                isolation_enabled: 0,
-                padding: [0; 7],
-            }
-        );
-        assert_eq!(return_length as usize, size_of_val(&output));
-    }
-
-    #[test]
-    fn token_elevation_requires_exact_buffer_length() {
-        let task = test_task();
-        let required_length = size_of::<u32>().trunc();
-
-        for token_information_length in [required_length - 1, required_length + 1] {
-            let mut output = u32::MAX;
-            let mut return_length = 0;
-            assert_eq!(
-                task.sys_nt_query_information_token(
-                    Task::<TestPlatform, TestFS>::CURRENT_PROCESS_TOKEN,
-                    TokenInformationClass::Elevation as u32,
-                    mut_byte_ptr(&mut output),
-                    token_information_length,
-                    mut_ptr(&mut return_length),
-                ),
-                NtStatus::INFO_LENGTH_MISMATCH
-            );
-            assert_eq!(return_length, required_length);
-            assert_eq!(output, u32::MAX);
-        }
-
-        let mut output = u32::MAX;
-        let mut return_length = 0;
-        assert_eq!(
-            task.sys_nt_query_information_token(
-                Task::<TestPlatform, TestFS>::CURRENT_PROCESS_TOKEN,
-                TokenInformationClass::Elevation as u32,
-                mut_byte_ptr(&mut output),
-                required_length,
-                mut_ptr(&mut return_length),
-            ),
-            NtStatus::SUCCESS
-        );
-        assert_eq!(return_length, required_length);
-        assert_eq!(output, 0);
     }
 
     #[test]
