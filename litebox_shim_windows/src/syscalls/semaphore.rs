@@ -286,7 +286,6 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 }
 
 // TODO(semaphore-query): Implement NtQuerySemaphore.
-// TODO(mutants): Implement NT mutant dispatcher objects and syscalls.
 
 #[cfg(test)]
 mod tests {

@@ -163,7 +163,10 @@ pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<Test
         crate::syscalls::section::load_time_windows_shared_section(windows_shared_section_base);
 
     let process = Arc::new(Process::default(None, windows_shared_section));
-    let thread_object = Arc::new(crate::syscalls::thread::ThreadObject::new());
+    let thread_object = Arc::new(crate::syscalls::thread::ThreadObject::new(
+        crate::syscalls::process::INITIAL_THREAD_ID,
+        0,
+    ));
     assert!(process.attach_thread(crate::syscalls::process::INITIAL_THREAD_ID, &thread_object));
 
     Task {
@@ -174,8 +177,6 @@ pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<Test
         entry_point: 0,
         stack_top: 0,
         context: 0,
-        teb_address: 0,
-        thread_id: crate::syscalls::process::INITIAL_THREAD_ID,
         thread_object,
     }
 }
@@ -195,7 +196,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// zeroed because such a task never runs guest code.
     pub(crate) fn clone_for_test(&self) -> Option<Self> {
         let thread_id = self.process.allocate_thread_id();
-        let thread_object = Arc::new(crate::syscalls::thread::ThreadObject::new());
+        let thread_object = Arc::new(crate::syscalls::thread::ThreadObject::new(thread_id, 0));
         if !self.process.attach_thread(thread_id, &thread_object) {
             return None;
         }
@@ -207,8 +208,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             entry_point: 0,
             stack_top: 0,
             context: 0,
-            teb_address: 0,
-            thread_id,
             thread_object,
         })
     }

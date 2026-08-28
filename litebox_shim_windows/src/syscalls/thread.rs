@@ -3,6 +3,7 @@
 
 use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
@@ -10,13 +11,15 @@ use int_enum::IntEnum;
 use litebox::event::{Events, IOPollable, observer::Observer, polling::Pollee};
 use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
+use litebox::sync::Mutex;
 use litebox::utils::TruncateExt as _;
 use litebox_common_windows::nt_status::NtStatus;
-use zerocopy::{FromBytes, Immutable};
+use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::loader::create_thread_environment;
 use crate::nt_types::{AccessMask, ClientId, ObjectAttributes, X64Context};
 use crate::syscalls::ProcessHandle;
+use crate::syscalls::mutant::MutantObject;
 use crate::syscalls::{Handle, ThreadHandle};
 use crate::{
     ConstPtr, MutPtr, ShimFS, ShimPlatform, Task, WindowsShimEntrypoints,
@@ -101,6 +104,8 @@ pub(crate) struct ThreadHandleObject<Platform: ShimPlatform> {
 }
 
 pub(crate) struct ThreadObject<Platform: ShimPlatform> {
+    thread_id: usize,
+    teb_address: usize,
     completion_state: AtomicU8,
     exit_status: core::sync::atomic::AtomicI32,
     pollee: Pollee<Platform>,
@@ -110,6 +115,7 @@ pub(crate) struct ThreadObject<Platform: ShimPlatform> {
     /// Handle used to interrupt the thread, published once by the thread itself
     /// when it starts running. Empty until then.
     wait_handle: once_cell::race::OnceBox<litebox::event::wait::ThreadHandle<Platform>>,
+    owned_mutants: Mutex<Platform, Vec<Weak<MutantObject<Platform>>>>,
 }
 
 impl<Platform: ShimPlatform> ThreadObject<Platform> {
@@ -117,13 +123,52 @@ impl<Platform: ShimPlatform> ThreadObject<Platform> {
     const COMPLETING: u8 = 1;
     const COMPLETE: u8 = 2;
 
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(thread_id: usize, teb_address: usize) -> Self {
         Self {
+            thread_id,
+            teb_address,
             completion_state: AtomicU8::new(Self::RUNNING),
-            exit_status: core::sync::atomic::AtomicI32::new(0),
+            exit_status: core::sync::atomic::AtomicI32::new(NtStatus::PENDING.as_raw()),
             pollee: Pollee::new(),
             is_exiting: AtomicBool::new(false),
             wait_handle: once_cell::race::OnceBox::new(),
+            owned_mutants: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn thread_id(&self) -> usize {
+        self.thread_id
+    }
+
+    pub(crate) fn teb_address(&self) -> usize {
+        self.teb_address
+    }
+
+    pub(crate) fn register_owned_mutant(&self, mutant: &Arc<MutantObject<Platform>>) {
+        let mutant_ptr = Arc::as_ptr(mutant);
+        let mut owned_mutants = self.owned_mutants.lock();
+        owned_mutants.retain(|owned| owned.strong_count() != 0);
+        if !owned_mutants
+            .iter()
+            .any(|owned| owned.as_ptr() == mutant_ptr)
+        {
+            owned_mutants.push(Arc::downgrade(mutant));
+        }
+    }
+
+    pub(crate) fn unregister_owned_mutant(&self, mutant: &Arc<MutantObject<Platform>>) {
+        let mutant_ptr = Arc::as_ptr(mutant);
+        self.owned_mutants
+            .lock()
+            .retain(|owned| owned.strong_count() != 0 && owned.as_ptr() != mutant_ptr);
+    }
+
+    pub(crate) fn abandon_owned_mutants(&self, thread_id: usize) {
+        let owned_mutants = core::mem::take(&mut *self.owned_mutants.lock());
+        for mutant in owned_mutants {
+            if let Some(mutant) = mutant.upgrade() {
+                mutant.abandon(thread_id);
+            }
         }
     }
 
@@ -227,7 +272,20 @@ enum ThreadInformationClass {
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, IntEnum)]
 enum QueryThreadInformationClass {
+    BasicInformation = 0,
     AmILastThread = 12,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, FromBytes, Immutable, IntoBytes, PartialEq)]
+struct ThreadBasicInformation {
+    exit_status: i32,
+    _padding0: u32,
+    teb_base_address: usize,
+    client_id: ClientId,
+    affinity_mask: usize,
+    priority: i32,
+    base_priority: i32,
 }
 
 #[repr(C)]
@@ -331,7 +389,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         child_ctx.rcx = environment.context;
         child_ctx.rdx = ntdll.mapping.base_addr;
 
-        let thread = Arc::new(ThreadObject::new());
+        let thread = Arc::new(ThreadObject::new(thread_id, environment.teb));
         if !self.process.attach_thread(thread_id, &thread) {
             // The process is tearing down; refuse to start another thread.
             return NtStatus::PROCESS_IS_TERMINATING;
@@ -358,8 +416,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             entry_point: ntdll.ldr_initialize_thunk,
             stack_top: environment.stack_top,
             context: environment.context,
-            teb_address: environment.teb,
-            thread_id,
             thread_object: thread,
         };
         // SAFETY: `child_ctx` points at mapped guest code and stack created above, and the
@@ -389,27 +445,83 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         thread_information_length: u32,
         return_length: Option<MutPtr<Platform, u32>>,
     ) -> NtStatus {
-        let Ok(QueryThreadInformationClass::AmILastThread) =
+        let Ok(thread_information_class) =
             QueryThreadInformationClass::try_from(thread_information_class)
         else {
+            litebox_util_log::debug!(
+                thread_information_class = thread_information_class;
+                "Unsupported NtQueryInformationThread class"
+            );
             return NtStatus::INVALID_INFO_CLASS;
         };
-        if thread_information_length as usize != core::mem::size_of::<u32>() {
+
+        match thread_information_class {
+            QueryThreadInformationClass::BasicInformation => {
+                let thread = if thread_handle.is_current() {
+                    Arc::clone(&self.thread_object)
+                } else {
+                    let entry = match self
+                        .typed_handle_entry_with_access::<ThreadSubsystem<Platform>>(
+                            thread_handle.as_handle(),
+                            ThreadAccess::QUERY_INFORMATION.bits(),
+                        ) {
+                        Ok(entry) => entry,
+                        Err(status) => return status,
+                    };
+                    entry.with_entry(|entry| Arc::clone(&entry.thread))
+                };
+                let information = ThreadBasicInformation {
+                    exit_status: thread.exit_status(),
+                    _padding0: 0,
+                    teb_base_address: thread.teb_address,
+                    client_id: ClientId {
+                        unique_process: self.process.id,
+                        unique_thread: thread.thread_id,
+                    },
+                    affinity_mask: 1,
+                    priority: 8,
+                    base_priority: 8,
+                };
+                Self::write_thread_information(
+                    thread_information,
+                    thread_information_length,
+                    return_length,
+                    &information,
+                )
+            }
+            QueryThreadInformationClass::AmILastThread => {
+                if !thread_handle.is_current() {
+                    return NtStatus::NOT_SUPPORTED;
+                }
+                let is_last_thread = u32::from(self.process.live_thread_count() == 1);
+                Self::write_thread_information(
+                    thread_information,
+                    thread_information_length,
+                    return_length,
+                    &is_last_thread,
+                )
+            }
+        }
+    }
+
+    fn write_thread_information<T: Immutable + IntoBytes>(
+        thread_information: MutPtr<Platform, u8>,
+        thread_information_length: u32,
+        return_length: Option<MutPtr<Platform, u32>>,
+        information: &T,
+    ) -> NtStatus {
+        let required_length = size_of::<T>().trunc();
+        if thread_information_length < required_length {
             return NtStatus::INFO_LENGTH_MISMATCH;
         }
-        if !thread_handle.is_current() {
-            return NtStatus::NOT_SUPPORTED;
-        }
-
-        let is_last_thread = u32::from(self.process.live_thread_count() == 1);
-        let output = MutPtr::<Platform, u32>::from_usize(thread_information.as_usize());
-        if output.write_at_offset(0, is_last_thread).is_none() {
+        if thread_information
+            .write_slice_at_offset(0, information.as_bytes())
+            .is_none()
+        {
             return NtStatus::ACCESS_VIOLATION;
         }
         if let Some(return_length) = return_length
-            && return_length
-                .write_at_offset(0, core::mem::size_of::<u32>().trunc())
-                .is_none()
+            && return_length.write_at_offset(0, required_length).is_none()
         {
             return NtStatus::ACCESS_VIOLATION;
         }
@@ -531,6 +643,21 @@ mod tests {
     type TestPlatform = crate::tests::TestPlatform;
     type TestTask = Task<TestPlatform, crate::tests::TestFS>;
 
+    fn empty_thread_basic_information() -> ThreadBasicInformation {
+        ThreadBasicInformation {
+            exit_status: i32::MIN,
+            _padding0: u32::MAX,
+            teb_base_address: usize::MAX,
+            client_id: ClientId {
+                unique_process: usize::MAX,
+                unique_thread: usize::MAX,
+            },
+            affinity_mask: usize::MAX,
+            priority: i32::MIN,
+            base_priority: i32::MIN,
+        }
+    }
+
     fn const_byte_ptr<T>(value: &T) -> ConstPtr<TestPlatform, u8> {
         ConstPtr::<TestPlatform, u8>::from_usize(core::ptr::from_ref(value).cast::<u8>() as usize)
     }
@@ -590,6 +717,100 @@ mod tests {
             assert_eq!(is_last_thread, 1);
             assert_eq!(return_length as usize, size_of::<u32>());
             assert_eq!(parent.process.live_thread_count(), 1);
+        });
+    }
+
+    #[test]
+    fn basic_information_reports_running_and_completed_thread_status() {
+        run_with_test_platform_pointers(|| {
+            let parent = crate::tests::test_task();
+            let mut information = empty_thread_basic_information();
+            let mut return_length = 0;
+            assert_eq!(
+                parent.sys_nt_query_information_thread(
+                    ThreadHandle::CURRENT,
+                    QueryThreadInformationClass::BasicInformation as u32,
+                    mut_byte_ptr(&mut information),
+                    size_of::<ThreadBasicInformation>().trunc(),
+                    Some(mut_ptr(&mut return_length)),
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(information.exit_status, NtStatus::PENDING.as_raw());
+            assert_eq!(
+                information.teb_base_address,
+                parent.thread_object.teb_address()
+            );
+            assert_eq!(information.client_id.unique_process, parent.process.id);
+            assert_eq!(
+                information.client_id.unique_thread,
+                parent.thread_object.thread_id()
+            );
+            assert_eq!(return_length as usize, size_of::<ThreadBasicInformation>());
+
+            information = empty_thread_basic_information();
+            assert_eq!(
+                parent.sys_nt_query_information_thread(
+                    ThreadHandle::CURRENT,
+                    QueryThreadInformationClass::BasicInformation as u32,
+                    mut_byte_ptr(&mut information),
+                    (size_of::<ThreadBasicInformation>() - 1).trunc(),
+                    None,
+                ),
+                NtStatus::INFO_LENGTH_MISMATCH
+            );
+            assert_eq!(information, empty_thread_basic_information());
+
+            let child = parent.clone_for_test().expect("process is live");
+            let child_id = child.thread_object.thread_id();
+            let child_thread = Arc::clone(&child.thread_object);
+            let handle = parent
+                .insert_typed_handle::<ThreadSubsystem<TestPlatform>>(
+                    ThreadHandleObject {
+                        thread: Arc::clone(&child_thread),
+                    },
+                    ThreadAccess::QUERY_INFORMATION.bits(),
+                    drop,
+                )
+                .expect("thread handle insertion should succeed");
+            child_thread.exit_thread(NtStatus::UNSUCCESSFUL.as_raw());
+            child.complete_current_thread();
+
+            information = empty_thread_basic_information();
+            assert_eq!(
+                parent.sys_nt_query_information_thread(
+                    ThreadHandle::from_raw(handle.as_raw()),
+                    QueryThreadInformationClass::BasicInformation as u32,
+                    mut_byte_ptr(&mut information),
+                    size_of::<ThreadBasicInformation>().trunc(),
+                    None,
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(information.exit_status, NtStatus::UNSUCCESSFUL.as_raw());
+            assert_eq!(information.client_id.unique_thread, child_id);
+            assert_eq!(parent.sys_nt_close(handle), NtStatus::SUCCESS);
+
+            let handle = parent
+                .insert_typed_handle::<ThreadSubsystem<TestPlatform>>(
+                    ThreadHandleObject {
+                        thread: child_thread,
+                    },
+                    AccessMask::SYNCHRONIZE.bits(),
+                    drop,
+                )
+                .expect("thread handle insertion should succeed");
+            assert_eq!(
+                parent.sys_nt_query_information_thread(
+                    ThreadHandle::from_raw(handle.as_raw()),
+                    QueryThreadInformationClass::BasicInformation as u32,
+                    mut_byte_ptr(&mut information),
+                    size_of::<ThreadBasicInformation>().trunc(),
+                    None,
+                ),
+                NtStatus::ACCESS_DENIED
+            );
+            assert_eq!(parent.sys_nt_close(handle), NtStatus::SUCCESS);
         });
     }
 

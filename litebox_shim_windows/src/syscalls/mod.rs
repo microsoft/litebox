@@ -38,6 +38,11 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::nt_types;
 
+pub(crate) enum WaitAcquireResult {
+    Acquired,
+    Abandoned,
+}
+
 const FIRST_STACK_ARGUMENT_OFFSET: usize = 0x28;
 const HANDLE_SHIFT: u32 = 2;
 const HANDLE_TAG_MASK: usize = (1usize << HANDLE_SHIFT) - 1;
@@ -130,6 +135,11 @@ impl ThreadHandle {
     pub(crate) fn is_null(self) -> bool {
         self.0.is_null()
     }
+
+    #[must_use]
+    pub(crate) const fn as_handle(self) -> Handle {
+        self.0
+    }
 }
 
 #[allow(clippy::enum_variant_names)]
@@ -153,6 +163,12 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
         event_type: u32,
         initial_state: u8,
+    },
+    NtCreateMutant {
+        mutant_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+        initial_owner: u8,
     },
     NtCreateSemaphore {
         semaphore_handle: Platform::RawMutPointer<Handle>,
@@ -316,10 +332,19 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         desired_access: u32,
         object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
     },
+    NtOpenMutant {
+        mutant_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+    },
     NtOpenSemaphore {
         semaphore_handle: Platform::RawMutPointer<Handle>,
         desired_access: u32,
         object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+    },
+    NtReleaseMutant {
+        mutant_handle: Handle,
+        previous_count: Option<Platform::RawMutPointer<i32>>,
     },
     NtReleaseSemaphore {
         semaphore_handle: Handle,
@@ -346,6 +371,13 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         event_information_class: u32,
         event_information: Platform::RawMutPointer<event::EventBasicInformation>,
         event_information_length: u32,
+        return_length: Option<Platform::RawMutPointer<u32>>,
+    },
+    NtQueryMutant {
+        mutant_handle: Handle,
+        mutant_information_class: u32,
+        mutant_information: Platform::RawMutPointer<mutant::MutantBasicInformation>,
+        mutant_information_length: u32,
         return_length: Option<Platform::RawMutPointer<u32>>,
     },
     NtSetEventBoostPriority {
@@ -917,6 +949,12 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 event_type,
                 initial_state,
             })),
+            NtSysno::NtCreateMutant => Some(sys_req!(NtCreateMutant {
+                mutant_handle:*,
+                desired_access,
+                object_attributes:*,
+                initial_owner,
+            })),
             NtSysno::NtCreateSemaphore => Some(sys_req!(NtCreateSemaphore {
                 semaphore_handle:*,
                 desired_access,
@@ -1083,10 +1121,19 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 desired_access,
                 object_attributes:*,
             })),
+            NtSysno::NtOpenMutant => Some(sys_req!(NtOpenMutant {
+                mutant_handle:*,
+                desired_access,
+                object_attributes:*,
+            })),
             NtSysno::NtOpenSemaphore => Some(sys_req!(NtOpenSemaphore {
                 semaphore_handle:*,
                 desired_access,
                 object_attributes:*,
+            })),
+            NtSysno::NtReleaseMutant => Some(sys_req!(NtReleaseMutant {
+                mutant_handle:{Handle::from_raw},
+                previous_count:*,
             })),
             NtSysno::NtReleaseSemaphore => Some(sys_req!(NtReleaseSemaphore {
                 semaphore_handle:{Handle::from_raw},
@@ -1113,6 +1160,13 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 event_information_class,
                 event_information:*,
                 event_information_length,
+                return_length:*,
+            })),
+            NtSysno::NtQueryMutant => Some(sys_req!(NtQueryMutant {
+                mutant_handle:{Handle::from_raw},
+                mutant_information_class,
+                mutant_information:*,
+                mutant_information_length,
                 return_length:*,
             })),
             NtSysno::NtSetEventBoostPriority => Some(sys_req!(NtSetEventBoostPriority {
