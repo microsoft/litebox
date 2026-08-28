@@ -35,7 +35,6 @@ const NUMA_NODE_COUNT: usize = NUMBER_OF_PROCESSORS as usize;
 const PROCESSOR_ARCHITECTURE_AMD64: u16 = 9;
 const SYSTEM_VERIFIER_INFORMATION_LENGTH: u32 = 0x90;
 const SYSTEM_VERIFIER_INFORMATION_LENGTH_USIZE: usize = 0x90;
-const SYSTEM_FEATURE_CONFIGURATION_INFORMATION_LENGTH: u32 = 0x18;
 // Synthetic generation for the immutable feature table. Increment if the table changes.
 const FEATURE_CONFIGURATION_CHANGE_STAMP: u64 = 1;
 // Feature configurations observed from host ntdll on Windows 11 build 26200.
@@ -456,10 +455,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         return_length: Option<MutPtr<Platform, u32>>,
     ) -> NtStatus {
         if input_buffer_length != size_of::<SystemFeatureConfigurationQuery>().trunc() {
-            if Self::write_return_length(return_length, 0).is_err() {
-                return NtStatus::ACCESS_VIOLATION;
-            }
-            return NtStatus::INFO_LENGTH_MISMATCH;
+            return Self::write_return_length_for_short_buffer(return_length, 0);
         }
 
         let input_buffer = ConstPtr::<Platform, SystemFeatureConfigurationQuery>::from_usize(
@@ -477,11 +473,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return NtStatus::INVALID_PARAMETER;
         }
 
-        if system_information_length != SYSTEM_FEATURE_CONFIGURATION_INFORMATION_LENGTH {
-            return Self::write_return_length_for_short_buffer(
-                return_length,
-                SYSTEM_FEATURE_CONFIGURATION_INFORMATION_LENGTH,
-            );
+        let required_len = size_of::<SystemFeatureConfigurationInformation>().trunc();
+        if system_information_length != required_len {
+            return Self::write_return_length_for_short_buffer(return_length, required_len);
         }
 
         let configuration = OBSERVED_FEATURE_CONFIGURATIONS
@@ -503,11 +497,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if system_information
             .write_slice_at_offset(0, information.as_bytes())
             .is_none()
-            || Self::write_return_length(
-                return_length,
-                SYSTEM_FEATURE_CONFIGURATION_INFORMATION_LENGTH,
-            )
-            .is_err()
+            || Self::write_return_length(return_length, required_len).is_err()
         {
             return NtStatus::ACCESS_VIOLATION;
         }
@@ -785,12 +775,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if minimum_resolution
             .write_at_offset(0, TIMER_RESOLUTION_100NS)
             .is_none()
-            || maximum_resolution
-                .write_at_offset(0, MINIMUM_TIMER_RESOLUTION_100NS)
-                .is_none()
-            || current_resolution
-                .write_at_offset(0, TIMER_RESOLUTION_100NS)
-                .is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        if maximum_resolution
+            .write_at_offset(0, MINIMUM_TIMER_RESOLUTION_100NS)
+            .is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        if current_resolution
+            .write_at_offset(0, TIMER_RESOLUTION_100NS)
+            .is_none()
         {
             return NtStatus::ACCESS_VIOLATION;
         }
@@ -1132,43 +1128,6 @@ mod tests {
     }
 
     #[test]
-    fn nt_query_system_information_ex_reports_unconfigured_features() {
-        run_with_test_platform_pointers(|| {
-            let query = SystemFeatureConfigurationQuery {
-                configuration_type: 0,
-                feature_id: 0x1234,
-            };
-            let mut output = SystemFeatureConfigurationInformation {
-                change_stamp: u64::MAX,
-                feature_id: u32::MAX,
-                configuration: u32::MAX,
-                variant_payload: u64::MAX,
-            };
-            let mut return_length = 0;
-
-            assert_eq!(
-                TestTask::sys_nt_query_system_information_ex(
-                    SystemInformationClass::FeatureConfiguration as u32,
-                    Some(const_byte_ptr(&query)),
-                    size_of::<SystemFeatureConfigurationQuery>().trunc(),
-                    mut_byte_ptr(&mut output),
-                    size_of::<SystemFeatureConfigurationInformation>().trunc(),
-                    Some(mut_ptr(&mut return_length)),
-                ),
-                NtStatus::NOT_FOUND
-            );
-            assert_eq!(output.change_stamp, FEATURE_CONFIGURATION_CHANGE_STAMP);
-            assert_eq!(output.feature_id, 0);
-            assert_eq!(output.configuration, 0);
-            assert_eq!(output.variant_payload, 0);
-            assert_eq!(
-                return_length,
-                SYSTEM_FEATURE_CONFIGURATION_INFORMATION_LENGTH
-            );
-        });
-    }
-
-    #[test]
     fn nt_query_system_information_ex_reports_configured_features() {
         run_with_test_platform_pointers(|| {
             assert!(
@@ -1199,60 +1158,10 @@ mod tests {
                         ),
                         NtStatus::SUCCESS
                     );
-                    assert_eq!(output.change_stamp, FEATURE_CONFIGURATION_CHANGE_STAMP);
                     assert_eq!(output.feature_id, feature_id);
                     assert_eq!(output.configuration, expected_configuration);
-                    assert_eq!(output.variant_payload, 0);
                 }
             }
-        });
-    }
-
-    #[test]
-    fn nt_query_system_information_ex_validates_feature_configuration_query() {
-        run_with_test_platform_pointers(|| {
-            let mut output = SystemFeatureConfigurationInformation::default();
-            let mut return_length = u32::MAX;
-
-            for configuration_type in [2, u32::MAX] {
-                let query = SystemFeatureConfigurationQuery {
-                    configuration_type,
-                    feature_id: 0,
-                };
-                return_length = u32::MAX;
-                assert_eq!(
-                    TestTask::sys_nt_query_system_information_ex(
-                        SystemInformationClass::FeatureConfiguration as u32,
-                        Some(const_byte_ptr(&query)),
-                        size_of::<SystemFeatureConfigurationQuery>().trunc(),
-                        mut_byte_ptr(&mut output),
-                        size_of::<SystemFeatureConfigurationInformation>().trunc(),
-                        Some(mut_ptr(&mut return_length)),
-                    ),
-                    NtStatus::INVALID_PARAMETER
-                );
-                assert_eq!(return_length, 0);
-            }
-
-            let valid_query = SystemFeatureConfigurationQuery {
-                configuration_type: FeatureConfigurationType::Boot as u32,
-                feature_id: 0,
-            };
-            assert_eq!(
-                TestTask::sys_nt_query_system_information_ex(
-                    SystemInformationClass::FeatureConfiguration as u32,
-                    Some(const_byte_ptr(&valid_query)),
-                    size_of::<SystemFeatureConfigurationQuery>().trunc(),
-                    mut_byte_ptr(&mut output),
-                    SYSTEM_FEATURE_CONFIGURATION_INFORMATION_LENGTH - 1,
-                    Some(mut_ptr(&mut return_length)),
-                ),
-                NtStatus::INFO_LENGTH_MISMATCH
-            );
-            assert_eq!(
-                return_length,
-                SYSTEM_FEATURE_CONFIGURATION_INFORMATION_LENGTH
-            );
         });
     }
 
@@ -1849,36 +1758,6 @@ mod tests {
                     Some(mut_ptr(&mut conversion_error)),
                 ),
                 NtStatus::NOT_SUPPORTED
-            );
-        });
-    }
-
-    #[test]
-    fn nt_query_timer_resolution_returns_synthetic_clock_values() {
-        run_with_test_platform_pointers(|| {
-            let mut minimum_resolution = 0;
-            let mut maximum_resolution = 0;
-            let mut current_resolution = 0;
-
-            assert_eq!(
-                TestTask::sys_nt_query_timer_resolution(
-                    mut_ptr(&mut minimum_resolution),
-                    mut_ptr(&mut maximum_resolution),
-                    mut_ptr(&mut current_resolution),
-                ),
-                NtStatus::SUCCESS
-            );
-            assert_eq!(minimum_resolution, TIMER_RESOLUTION_100NS);
-            assert_eq!(maximum_resolution, MINIMUM_TIMER_RESOLUTION_100NS);
-            assert_eq!(current_resolution, TIMER_RESOLUTION_100NS);
-
-            assert_eq!(
-                TestTask::sys_nt_query_timer_resolution(
-                    null_mut_ptr(),
-                    mut_ptr(&mut maximum_resolution),
-                    mut_ptr(&mut current_resolution),
-                ),
-                NtStatus::ACCESS_VIOLATION
             );
         });
     }

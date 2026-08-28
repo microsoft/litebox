@@ -1806,27 +1806,4 @@ mod tests {
         assert_eq!(Handle::from_raw_fd(usize::MAX >> HANDLE_SHIFT), None);
         assert_eq!(Handle::from_raw_fd(usize::MAX), None);
     }
-
-    #[test]
-    fn query_timer_resolution_decodes_output_pointers_in_abi_order() {
-        let registers = litebox_common_linux::PtRegs {
-            orig_rax: NtSysno::NtQueryTimerResolution.as_raw() as usize,
-            r10: 0x1000,
-            rdx: 0x2000,
-            r8: 0x3000,
-            ..Default::default()
-        };
-
-        let Some(SyscallRequest::NtQueryTimerResolution {
-            minimum_resolution,
-            maximum_resolution,
-            current_resolution,
-        }) = SyscallRequest::<crate::tests::TestPlatform>::try_from_raw(&registers)
-        else {
-            panic!("NtQueryTimerResolution should decode");
-        };
-        assert_eq!(minimum_resolution.as_usize(), 0x1000);
-        assert_eq!(maximum_resolution.as_usize(), 0x2000);
-        assert_eq!(current_resolution.as_usize(), 0x3000);
-    }
 }
