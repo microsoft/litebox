@@ -109,7 +109,7 @@ pub struct BrokerTcpSocket<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     handle: ObjectHandle,
     pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
     pollee: Arc<Pollee<Platform>>,
-    configuration_lock: Mutex<Platform, ()>,
+    status_lock: Mutex<Platform, ()>,
     receive_lock: Mutex<Platform, ()>,
     state: Mutex<Platform, BrokerTcpSocketState>,
     write_shutdown: AtomicBool,
@@ -129,7 +129,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
             handle,
             pollable_registry,
             pollee: Arc::new(Pollee::new()),
-            configuration_lock: Mutex::new(()),
+            status_lock: Mutex::new(()),
             receive_lock: Mutex::new(()),
             state: Mutex::new(BrokerTcpSocketState {
                 connection: SocketConnectionStatus::Unconnected,
@@ -158,7 +158,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
             handle: accepted.handle,
             pollable_registry,
             pollee: Arc::new(Pollee::new()),
-            configuration_lock: Mutex::new(()),
+            status_lock: Mutex::new(()),
             receive_lock: Mutex::new(()),
             state: Mutex::new(BrokerTcpSocketState {
                 connection: SocketConnectionStatus::Connected,
@@ -238,7 +238,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
     }
 
     pub(super) fn start_connect(&self, address: SocketAddrV4) -> Result<(), ConnectError> {
-        let configuration = self.configuration_lock.lock();
+        let status_guard = self.status_lock.lock();
         let previous = self.state.lock().connection;
         let outcome = self
             .broker
@@ -268,7 +268,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
             SocketConnectionStatus::Failed(error) => {
                 let error = error.into();
                 self.state.lock().take_connection_failure();
-                drop(configuration);
+                drop(status_guard);
                 self.pollee.wake_observers();
                 self.pollee
                     .notify_observers(Events::IN | Events::OUT | Events::HUP);
@@ -279,12 +279,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
                 SocketAsyncError::BackendFailure,
             )),
         };
-        drop(configuration);
+        drop(status_guard);
         result
     }
 
     pub(super) fn check_connect_progress(&self) -> Result<(), ConnectError> {
-        let configuration = self.configuration_lock.lock();
+        let status_guard = self.status_lock.lock();
         let response = self.broker.socket_status(self.handle).map_err(|error| {
             ConnectError::OperationFailed(BrokerObjectError::from(error).into())
         })?;
@@ -293,14 +293,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
             let error = error.into();
             self.apply_socket_status(response);
             self.state.lock().take_connection_failure();
-            drop(configuration);
+            drop(status_guard);
             self.pollee.wake_observers();
             self.pollee
                 .notify_observers(Events::IN | Events::OUT | Events::HUP);
             return Err(ConnectError::OperationFailed(error));
         }
         self.apply_socket_status(response);
-        drop(configuration);
+        drop(status_guard);
         match status {
             SocketConnectionStatus::Connected => Ok(()),
             SocketConnectionStatus::Connecting => Err(ConnectError::InProgress),
@@ -446,9 +446,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
         if self.closed.load(Ordering::Acquire) {
             return;
         }
-        let configuration = self.configuration_lock.lock();
+        let status_guard = self.status_lock.lock();
         self.state.lock().prepend_async_error(error);
-        drop(configuration);
+        drop(status_guard);
         self.pollee.notify_observers(Events::ERR);
     }
 
@@ -456,7 +456,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
         if self.closed.load(Ordering::Acquire) {
             return None;
         }
-        let configuration = self.configuration_lock.lock();
+        let status_guard = self.status_lock.lock();
         self.refresh_connection_status_locked(true);
         let mut state = self.state.lock();
         let error = if clear {
@@ -471,7 +471,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
             if needs_refill {
                 self.refresh_connection_status_locked(true);
             }
-            drop(configuration);
+            drop(status_guard);
             self.pollee.wake_observers();
             if failed {
                 self.pollee
@@ -605,7 +605,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
     }
 
     fn refresh_connection_status(&self, include_connected: bool) {
-        let _configuration = self.configuration_lock.lock();
+        let _status_guard = self.status_lock.lock();
         self.refresh_connection_status_locked(include_connected);
     }
 
@@ -668,7 +668,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
     }
 
     fn refresh_after_synchronous_error(&self) {
-        let configuration = self.configuration_lock.lock();
+        let status_guard = self.status_lock.lock();
         for _ in 0..2 {
             if self.closed.load(Ordering::Acquire) {
                 break;
@@ -702,7 +702,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
             SocketConnectionStatus::Failed(_)
         );
         self.state.lock().take_connection_failure();
-        drop(configuration);
+        drop(status_guard);
         self.pollee.wake_observers();
         if failed {
             self.pollee
