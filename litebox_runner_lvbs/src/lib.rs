@@ -13,7 +13,9 @@ use litebox::{
     utils::{ReinterpretSignedExt, TruncateExt},
 };
 use litebox_common_linux::errno::Errno;
-use litebox_common_lvbs::{NUM_VTLCALL_PARAMS, PRK_LEN, VsmError, VsmFunction};
+use litebox_common_lvbs::{
+    ExchangeSecretsRequest, NUM_VTLCALL_PARAMS, PRK_LEN, VsmError, VsmFunction,
+};
 use litebox_common_optee::{
     OpteeMessageCommand, OpteeMsgArgs, OpteeRpcArgs, OpteeSmcArgs, OpteeSmcResult,
     OpteeSmcReturnCode, TeeOrigin, TeeResult, UteeEntryFunc, UteeParams, optee_msg_args_total_size,
@@ -262,15 +264,59 @@ fn vtlcall_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> i64 {
             optee_smc_handler_entry(smc_args_pfn)
         }
         VsmFunction::ExchangeSecrets => {
-            let public_key_pa = params[2];
-            let key_alg = params[3];
+            let request_pa = params[1];
+            let request_ptr = match NormalWorldConstPtr::<ExchangeSecretsRequest, PAGE_SIZE>::with_usize(
+                request_pa.trunc(),
+            ) {
+                Ok(ptr) => ptr,
+                Err(_) => return Errno::EFAULT.as_neg().into(),
+            };
+            let request = match request_ptr.read_at_offset(0) {
+                Ok(request) => request,
+                Err(_) => return Errno::EFAULT.as_neg().into(),
+            };
 
             let return_code = vsm_dispatch(VsmFunction::ExchangeSecrets, &params[1..2]);
             if return_code < 0 {
                 return return_code;
             }
 
-            litebox_shim_optee::idk::generate_identity_signing_key(public_key_pa, key_alg)
+            let public_key_pa = request_pa
+                .checked_add(core::mem::offset_of!(ExchangeSecretsRequest, idks_pub) as u64)
+                .ok_or(Errno::EINVAL);
+            let public_key_pa = match public_key_pa {
+                Ok(pa) => pa,
+                Err(error) => return error.as_neg().into(),
+            };
+
+            let return_code = litebox_shim_optee::idk::generate_identity_signing_key(
+                public_key_pa,
+                request.key_alg_variant as u64,
+            );
+            if return_code < 0 {
+                return return_code;
+            }
+
+            let public_key_len_pa = request_pa
+                .checked_add(core::mem::offset_of!(ExchangeSecretsRequest, idks_pub_len) as u64)
+                .ok_or(Errno::EINVAL);
+            let public_key_len_pa = match public_key_len_pa {
+                Ok(pa) => pa,
+                Err(error) => return error.as_neg().into(),
+            };
+            let public_key_len_ptr = match NormalWorldMutPtr::<u32, PAGE_SIZE>::with_usize(
+                public_key_len_pa.trunc(),
+            ) {
+                Ok(ptr) => ptr,
+                Err(_) => return Errno::EFAULT.as_neg().into(),
+            };
+            if public_key_len_ptr
+                .write_at_offset(0, request.idks_pub.len() as u32)
+                .is_err()
+            {
+                return Errno::EFAULT.as_neg().into();
+            }
+            0
         }
         _ => vsm_dispatch(func_id, &params[1..]),
     }
