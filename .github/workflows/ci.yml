@@ -290,6 +290,9 @@ jobs:
           # - `litebox_broker_userland` is allowed to have `std` access,
           #   since it is the hosted userland broker executable.
           #
+          # - `litebox_egress_proxy` is allowed to have `std` access because
+          #   its controlled DNS resolver runs in hosted userland.
+          #
           # - `litebox_platform_lvbs` has a custom target (`no_std`), so it does
           #   not work with the current no_std checker.
           #
@@ -351,6 +354,7 @@ jobs:
             -not -path './litebox_broker_transport_linux_userland/Cargo.toml' \
             -not -path './litebox_broker_transport_windows_userland/Cargo.toml' \
             -not -path './litebox_broker_userland/Cargo.toml' \
+            -not -path './litebox_egress_proxy/Cargo.toml' \
             -not -path './litebox_platform_linux_userland/Cargo.toml' \
             -not -path './litebox_platform_windows_userland/Cargo.toml' \
             -not -path './litebox_runner_linux_on_windows_userland/Cargo.toml' \
