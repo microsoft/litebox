@@ -376,7 +376,7 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
     NtQueryMutant {
         mutant_handle: Handle,
         mutant_information_class: u32,
-        mutant_information: Platform::RawMutPointer<mutant::MutantBasicInformation>,
+        mutant_information: Platform::RawMutPointer<u8>,
         mutant_information_length: u32,
         return_length: Option<Platform::RawMutPointer<u32>>,
     },

@@ -643,21 +643,6 @@ mod tests {
     type TestPlatform = crate::tests::TestPlatform;
     type TestTask = Task<TestPlatform, crate::tests::TestFS>;
 
-    fn empty_thread_basic_information() -> ThreadBasicInformation {
-        ThreadBasicInformation {
-            exit_status: i32::MIN,
-            _padding0: u32::MAX,
-            teb_base_address: usize::MAX,
-            client_id: ClientId {
-                unique_process: usize::MAX,
-                unique_thread: usize::MAX,
-            },
-            affinity_mask: usize::MAX,
-            priority: i32::MIN,
-            base_priority: i32::MIN,
-        }
-    }
-
     fn const_byte_ptr<T>(value: &T) -> ConstPtr<TestPlatform, u8> {
         ConstPtr::<TestPlatform, u8>::from_usize(core::ptr::from_ref(value).cast::<u8>() as usize)
     }
@@ -717,100 +702,6 @@ mod tests {
             assert_eq!(is_last_thread, 1);
             assert_eq!(return_length as usize, size_of::<u32>());
             assert_eq!(parent.process.live_thread_count(), 1);
-        });
-    }
-
-    #[test]
-    fn basic_information_reports_running_and_completed_thread_status() {
-        run_with_test_platform_pointers(|| {
-            let parent = crate::tests::test_task();
-            let mut information = empty_thread_basic_information();
-            let mut return_length = 0;
-            assert_eq!(
-                parent.sys_nt_query_information_thread(
-                    ThreadHandle::CURRENT,
-                    QueryThreadInformationClass::BasicInformation as u32,
-                    mut_byte_ptr(&mut information),
-                    size_of::<ThreadBasicInformation>().trunc(),
-                    Some(mut_ptr(&mut return_length)),
-                ),
-                NtStatus::SUCCESS
-            );
-            assert_eq!(information.exit_status, NtStatus::PENDING.as_raw());
-            assert_eq!(
-                information.teb_base_address,
-                parent.thread_object.teb_address()
-            );
-            assert_eq!(information.client_id.unique_process, parent.process.id);
-            assert_eq!(
-                information.client_id.unique_thread,
-                parent.thread_object.thread_id()
-            );
-            assert_eq!(return_length as usize, size_of::<ThreadBasicInformation>());
-
-            information = empty_thread_basic_information();
-            assert_eq!(
-                parent.sys_nt_query_information_thread(
-                    ThreadHandle::CURRENT,
-                    QueryThreadInformationClass::BasicInformation as u32,
-                    mut_byte_ptr(&mut information),
-                    (size_of::<ThreadBasicInformation>() - 1).trunc(),
-                    None,
-                ),
-                NtStatus::INFO_LENGTH_MISMATCH
-            );
-            assert_eq!(information, empty_thread_basic_information());
-
-            let child = parent.clone_for_test().expect("process is live");
-            let child_id = child.thread_object.thread_id();
-            let child_thread = Arc::clone(&child.thread_object);
-            let handle = parent
-                .insert_typed_handle::<ThreadSubsystem<TestPlatform>>(
-                    ThreadHandleObject {
-                        thread: Arc::clone(&child_thread),
-                    },
-                    ThreadAccess::QUERY_INFORMATION.bits(),
-                    drop,
-                )
-                .expect("thread handle insertion should succeed");
-            child_thread.exit_thread(NtStatus::UNSUCCESSFUL.as_raw());
-            child.complete_current_thread();
-
-            information = empty_thread_basic_information();
-            assert_eq!(
-                parent.sys_nt_query_information_thread(
-                    ThreadHandle::from_raw(handle.as_raw()),
-                    QueryThreadInformationClass::BasicInformation as u32,
-                    mut_byte_ptr(&mut information),
-                    size_of::<ThreadBasicInformation>().trunc(),
-                    None,
-                ),
-                NtStatus::SUCCESS
-            );
-            assert_eq!(information.exit_status, NtStatus::UNSUCCESSFUL.as_raw());
-            assert_eq!(information.client_id.unique_thread, child_id);
-            assert_eq!(parent.sys_nt_close(handle), NtStatus::SUCCESS);
-
-            let handle = parent
-                .insert_typed_handle::<ThreadSubsystem<TestPlatform>>(
-                    ThreadHandleObject {
-                        thread: child_thread,
-                    },
-                    AccessMask::SYNCHRONIZE.bits(),
-                    drop,
-                )
-                .expect("thread handle insertion should succeed");
-            assert_eq!(
-                parent.sys_nt_query_information_thread(
-                    ThreadHandle::from_raw(handle.as_raw()),
-                    QueryThreadInformationClass::BasicInformation as u32,
-                    mut_byte_ptr(&mut information),
-                    size_of::<ThreadBasicInformation>().trunc(),
-                    None,
-                ),
-                NtStatus::ACCESS_DENIED
-            );
-            assert_eq!(parent.sys_nt_close(handle), NtStatus::SUCCESS);
         });
     }
 

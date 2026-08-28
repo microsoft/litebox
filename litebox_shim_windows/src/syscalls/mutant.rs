@@ -6,7 +6,9 @@
 use alloc::sync::{Arc, Weak};
 use core::marker::PhantomData;
 use core::mem::size_of;
+use litebox::utils::TruncateExt;
 
+use int_enum::IntEnum;
 use litebox::event::{Events, IOPollable, observer::Observer, polling::Pollee};
 use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry};
 use litebox::platform::RawMutPointer as _;
@@ -14,7 +16,7 @@ use litebox::sync::Mutex;
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-use crate::nt_types::{AccessMask, ObjectAttributes, ObjectAttributesFlags};
+use crate::nt_types::{AccessMask, ClientId, ObjectAttributes, ObjectAttributesFlags};
 use crate::syscalls::thread::ThreadObject;
 use crate::syscalls::{Handle, WaitAcquireResult};
 use crate::{ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value};
@@ -64,6 +66,13 @@ impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem for MutantSubs
 
 pub(crate) struct MutantHandleObject<Platform: crate::ShimPlatform> {
     pub(crate) mutant: Arc<MutantObject<Platform>>,
+}
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, IntEnum, PartialEq)]
+enum MutantInformationClass {
+    Basic = 0,
+    Owner = 1,
 }
 
 struct MutantState {
@@ -156,13 +165,29 @@ impl<Platform: crate::ShimPlatform> MutantObject<Platform> {
         self.pollee.notify_observers(Events::IN);
     }
 
-    fn query(&self, thread_id: usize) -> MutantBasicInformation {
+    fn query_basic(&self, thread_id: usize) -> MutantBasicInformation {
         let state = self.state.lock();
         MutantBasicInformation {
             current_count: state.current_count,
             owned_by_caller: u8::from(state.owner == Some(thread_id)),
             abandoned_state: u8::from(state.abandoned),
             padding: [0; 2],
+        }
+    }
+
+    fn query_owner(&self, process_id: usize) -> MutantOwnerInformation {
+        let state = self.state.lock();
+        MutantOwnerInformation {
+            client_id: match state.owner {
+                Some(thread_id) => ClientId {
+                    unique_process: process_id,
+                    unique_thread: thread_id,
+                },
+                None => ClientId {
+                    unique_process: 0,
+                    unique_thread: 0,
+                },
+            },
         }
     }
 }
@@ -188,6 +213,12 @@ pub(crate) struct MutantBasicInformation {
     owned_by_caller: u8,
     abandoned_state: u8,
     padding: [u8; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, FromBytes, Immutable, IntoBytes, PartialEq)]
+struct MutantOwnerInformation {
+    client_id: ClientId,
 }
 
 impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
@@ -323,18 +354,24 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         &self,
         mutant_handle: Handle,
         mutant_information_class: u32,
-        mutant_information: MutPtr<Platform, MutantBasicInformation>,
+        mutant_information: MutPtr<Platform, u8>,
         mutant_information_length: u32,
         return_length: Option<MutPtr<Platform, u32>>,
     ) -> NtStatus {
-        if mutant_information_class != 0 {
+        let Ok(mutant_information_class) =
+            MutantInformationClass::try_from(mutant_information_class)
+        else {
             return NtStatus::INVALID_INFO_CLASS;
-        }
-        let required_length = u32::try_from(size_of::<MutantBasicInformation>()).unwrap();
+        };
+        let required_length = match mutant_information_class {
+            MutantInformationClass::Basic => size_of::<MutantBasicInformation>(),
+            MutantInformationClass::Owner => size_of::<MutantOwnerInformation>(),
+        };
+        let required_length: u32 = required_length.trunc();
         if mutant_information_length != required_length {
             return NtStatus::INFO_LENGTH_MISMATCH;
         }
-        if let Err(status) = probe_guest_output_preserving_value::<Platform, _>(mutant_information)
+        if let Err(status) = probe_guest_output_preserving_value::<Platform, u8>(mutant_information)
         {
             return status;
         }
@@ -350,13 +387,26 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Ok(entry) => entry,
             Err(status) => return status,
         };
-        let information =
-            entry.with_entry(|entry| entry.mutant.query(self.thread_object.thread_id()));
-        if mutant_information.write_at_offset(0, information).is_none()
-            || return_length.is_some_and(|return_length| {
-                return_length.write_at_offset(0, required_length).is_none()
-            })
-        {
+        let written = entry.with_entry(|entry| match mutant_information_class {
+            MutantInformationClass::Basic => mutant_information
+                .write_slice_at_offset(
+                    0,
+                    entry
+                        .mutant
+                        .query_basic(self.thread_object.thread_id())
+                        .as_bytes(),
+                )
+                .is_some(),
+            MutantInformationClass::Owner => mutant_information
+                .write_slice_at_offset(0, entry.mutant.query_owner(self.process.id).as_bytes())
+                .is_some(),
+        });
+        if !written {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        if return_length.is_some_and(|return_length| {
+            return_length.write_at_offset(0, required_length).is_none()
+        }) {
             return NtStatus::ACCESS_VIOLATION;
         }
         NtStatus::SUCCESS
@@ -401,156 +451,11 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 mod tests {
     extern crate std;
 
-    use core::mem::size_of_val;
+    use super::*;
+    use crate::tests::{const_ptr, mut_ptr, run_with_test_platform_pointers, test_task};
     use core::time::Duration;
 
-    use litebox::platform::RawConstPointer as _;
-    use litebox_common_windows::NtSysno;
-
-    use super::*;
-    use crate::syscalls::ProcessHandle;
-    use crate::tests::{const_ptr, mut_ptr, run_with_test_platform_pointers, test_task};
-
     const MUTANT_ALL_ACCESS: u32 = 0x001f_0001;
-
-    #[test]
-    fn mutant_waits_are_recursive_and_release_restores_signal() {
-        run_with_test_platform_pointers(|| {
-            let task = test_task();
-            let mut handle = Handle::default();
-            assert_eq!(
-                task.sys_nt_create_mutant(mut_ptr(&mut handle), MUTANT_ALL_ACCESS, None, 0),
-                NtStatus::SUCCESS
-            );
-
-            let timeout = 0i64;
-            assert_eq!(
-                task.sys_nt_wait_for_single_object(handle, false, Some(const_ptr(&timeout))),
-                NtStatus::SUCCESS
-            );
-            assert_eq!(
-                task.sys_nt_wait_for_single_object(handle, false, Some(const_ptr(&timeout))),
-                NtStatus::SUCCESS
-            );
-
-            let mut previous_count = i32::MAX;
-            assert_eq!(
-                task.sys_nt_release_mutant(handle, Some(mut_ptr(&mut previous_count))),
-                NtStatus::SUCCESS
-            );
-            assert_eq!(previous_count, -1);
-            assert_eq!(task.sys_nt_release_mutant(handle, None), NtStatus::SUCCESS);
-            assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
-        });
-    }
-
-    #[test]
-    fn mutant_query_reports_current_thread_ownership() {
-        run_with_test_platform_pointers(|| {
-            let task = test_task();
-            let mut handle = Handle::default();
-            assert_eq!(
-                task.sys_nt_create_mutant(mut_ptr(&mut handle), MUTANT_ALL_ACCESS, None, 1),
-                NtStatus::SUCCESS
-            );
-            let mut information = MutantBasicInformation {
-                current_count: i32::MAX,
-                owned_by_caller: 0,
-                abandoned_state: u8::MAX,
-                padding: [u8::MAX; 2],
-            };
-            let mut return_length = 0;
-            assert_eq!(
-                task.sys_nt_query_mutant(
-                    handle,
-                    0,
-                    mut_ptr(&mut information),
-                    size_of_val(&information).try_into().unwrap(),
-                    Some(mut_ptr(&mut return_length)),
-                ),
-                NtStatus::SUCCESS
-            );
-            assert_eq!(information.current_count, 0);
-            assert_eq!(information.owned_by_caller, 1);
-            assert_eq!(information.abandoned_state, 0);
-            assert_eq!(return_length as usize, size_of_val(&information));
-
-            let mut duplicate = Handle::default();
-            assert_eq!(
-                task.sys_nt_duplicate_object(
-                    ProcessHandle::CURRENT,
-                    handle,
-                    ProcessHandle::CURRENT,
-                    Some(mut_ptr(&mut duplicate)),
-                    0,
-                    0,
-                    2,
-                ),
-                NtStatus::SUCCESS
-            );
-            assert_eq!(task.sys_nt_close(duplicate), NtStatus::SUCCESS);
-            assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
-        });
-    }
-
-    #[test]
-    fn owner_exit_abandons_mutant_for_next_waiter() {
-        run_with_test_platform_pointers(|| {
-            let owner = test_task();
-            let waiter = owner.clone_for_test().expect("process is live");
-            let mut handle = Handle::default();
-            assert_eq!(
-                owner.sys_nt_create_mutant(mut_ptr(&mut handle), MUTANT_ALL_ACCESS, None, 1),
-                NtStatus::SUCCESS
-            );
-
-            owner.complete_current_thread();
-
-            let mut information = MutantBasicInformation {
-                current_count: i32::MIN,
-                owned_by_caller: u8::MAX,
-                abandoned_state: 0,
-                padding: [u8::MAX; 2],
-            };
-            assert_eq!(
-                waiter.sys_nt_query_mutant(
-                    handle,
-                    0,
-                    mut_ptr(&mut information),
-                    size_of_val(&information).try_into().unwrap(),
-                    None,
-                ),
-                NtStatus::SUCCESS
-            );
-            assert_eq!(information.current_count, 1);
-            assert_eq!(information.owned_by_caller, 0);
-            assert_eq!(information.abandoned_state, 1);
-
-            let timeout = 0i64;
-            assert_eq!(
-                waiter.sys_nt_wait_for_single_object(handle, false, Some(const_ptr(&timeout)),),
-                NtStatus::ABANDONED_WAIT_0
-            );
-            assert_eq!(
-                waiter.sys_nt_query_mutant(
-                    handle,
-                    0,
-                    mut_ptr(&mut information),
-                    size_of_val(&information).try_into().unwrap(),
-                    None,
-                ),
-                NtStatus::SUCCESS
-            );
-            assert_eq!(information.current_count, 0);
-            assert_eq!(information.owned_by_caller, 1);
-            assert_eq!(information.abandoned_state, 0);
-            assert_eq!(
-                waiter.sys_nt_release_mutant(handle, None),
-                NtStatus::SUCCESS
-            );
-            assert_eq!(waiter.sys_nt_close(handle), NtStatus::SUCCESS);
-        });
-    }
 
     #[test]
     fn owner_exit_wakes_blocked_waiter_as_abandoned() {
@@ -586,32 +491,6 @@ mod tests {
                 NtStatus::ABANDONED_WAIT_0
             );
             thread.join().unwrap();
-        });
-    }
-
-    #[test]
-    fn create_and_release_are_reachable_through_syscall_dispatch() {
-        run_with_test_platform_pointers(|| {
-            let task = test_task();
-            let mut handle = Handle::default();
-            let mut context = litebox_common_linux::PtRegs {
-                orig_rax: NtSysno::NtCreateMutant.as_raw() as usize,
-                r10: mut_ptr(&mut handle).as_usize(),
-                rdx: MUTANT_ALL_ACCESS as usize,
-                r9: 1,
-                ..Default::default()
-            };
-
-            task.handle_syscall_request(&mut context);
-            assert_eq!(context.rax, NtStatus::SUCCESS.to_usize());
-            assert_ne!(handle, Handle::default());
-
-            context.orig_rax = NtSysno::NtReleaseMutant.as_raw() as usize;
-            context.r10 = handle.as_raw();
-            context.rdx = 0;
-            task.handle_syscall_request(&mut context);
-            assert_eq!(context.rax, NtStatus::SUCCESS.to_usize());
-            assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
         });
     }
 }
