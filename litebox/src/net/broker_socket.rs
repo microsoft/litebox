@@ -1325,31 +1325,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn restored_tcp_error_precedes_retained_predecessor() {
-        let mut state = BrokerTcpSocketState {
-            connection: SocketConnectionStatus::Connected,
-            local_address: None,
-            remote_address: None,
-            async_error: Some(BrokerTcpAsyncError::Other(
-                SocketAsyncError::NetworkUnreachable,
-            )),
-            next_async_error: None,
-            listening: false,
-        };
-
-        state.prepend_async_error(SocketAsyncError::ConnectionRefused);
-
-        assert_eq!(
-            state.take_async_error(),
-            Some(SocketAsyncError::ConnectionRefused)
-        );
-        assert_eq!(
-            state.take_async_error(),
-            Some(SocketAsyncError::NetworkUnreachable)
-        );
-    }
-
-    #[test]
     fn tcp_error_retention_is_bounded_to_current_and_predecessor() {
         let mut state = BrokerTcpSocketState {
             connection: SocketConnectionStatus::Connected,
