@@ -2565,7 +2565,7 @@ mod tests {
 
     /// Reproduces the futex wake-path store-buffering bug over the **real** Linux platform
     /// by driving `litebox`'s `ordering_stress` rendezvous hooks (enabled via the
-    /// `futex_ordering_stress` dev-dependency feature). Unlike the in-crate mock test, this
+    /// `ordering_stress` dev-dependency feature). Unlike the in-crate mock test, this
     /// runs the waiter's `WAITING` store and the waker's relaxed `done` store through real
     /// `FUTEX_WAIT`/`FUTEX_WAKE`, and fails if either side reads the other's stale value.
     ///

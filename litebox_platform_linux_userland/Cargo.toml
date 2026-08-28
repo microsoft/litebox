@@ -22,7 +22,7 @@ seccompiler = { version = "0.5.0" }
 # feature is active only for this crate's own test builds, never for normal
 # builds or when this crate is used as a dependency.
 litebox = { path = "../litebox/", version = "0.1.0", features = [
-    "futex_ordering_stress",
+    "ordering_stress",
 ] }
 
 [features]

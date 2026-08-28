@@ -34,10 +34,10 @@ windows-sys = { version = "0.60.2", features = [
 lock_tracing = ["dep:arrayvec", "spin/mutex"]
 panic_on_unclosed_fd_drop = []
 enforce_singleton_litebox_instance = []
-# Exposes the futex wake-path ordering stress instrumentation (see
-# `src/ordering_stress.rs`) to dependent crates so they can drive the reproduction
-# over a real platform. Test-only; never enable in production builds.
-futex_ordering_stress = []
+# Exposes the wake-path ordering stress instrumentation (see `src/ordering_stress.rs`)
+# to dependent crates so they can drive the reproductions over a real platform.
+# Test-only; never enable in production builds.
+ordering_stress = []
 
 [lints]
 workspace = true

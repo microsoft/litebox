@@ -28,11 +28,11 @@ pub mod shim;
 pub mod sync;
 pub mod tls;
 
-// Test-only instrumentation for the futex wake-path store-buffering stress test.
-// Compiled under `cfg(test)` for the in-crate mock test, or the
-// `futex_ordering_stress` feature so a dependent crate can drive the same
-// reproduction over a real platform. Never enable in production builds.
-#[cfg(any(test, feature = "futex_ordering_stress"))]
+// Test-only instrumentation for the wake-path store-buffering stress tests.
+// Compiled under `cfg(test)` for the in-crate mock tests, or the `ordering_stress`
+// feature so a dependent crate can drive the same reproductions over a real
+// platform. Never enable in production builds.
+#[cfg(any(test, feature = "ordering_stress"))]
 pub mod ordering_stress;
 
 // The core [`LiteBox`] object itself, re-exported here publicly, just to keep management of the

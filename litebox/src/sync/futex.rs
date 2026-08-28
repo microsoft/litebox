@@ -112,7 +112,7 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
             return Err(FutexError::ImmediatelyWokenBecauseValueMismatch);
         }
 
-        #[cfg(any(test, feature = "futex_ordering_stress"))]
+        #[cfg(any(test, feature = "ordering_stress"))]
         crate::ordering_stress::waiter_registered();
 
         // Only return when woken--don't reevaluate the futex word. This
@@ -120,7 +120,7 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         // interface are effective.
         cx.wait_until(|| {
             let done = entry.get().done.load(Ordering::Acquire);
-            #[cfg(any(test, feature = "futex_ordering_stress"))]
+            #[cfg(any(test, feature = "ordering_stress"))]
             crate::ordering_stress::record_waiter_done(done);
             done
         })
@@ -169,7 +169,7 @@ impl<Platform: RawSyncPrimitivesProvider + RawPointerProvider + TimeProvider>
         // Wake the waiters outside the `extract_if` closure to minimize the list's lock hold
         // time.
         for entry in entries {
-            #[cfg(any(test, feature = "futex_ordering_stress"))]
+            #[cfg(any(test, feature = "ordering_stress"))]
             crate::ordering_stress::waker_rendezvous();
             entry.done.store(true, Ordering::Relaxed);
             entry.waker.wake();

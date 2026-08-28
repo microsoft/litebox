@@ -68,6 +68,9 @@ impl<Platform: RawSyncPrimitivesProvider> Waker<Platform> {
     /// Causes the thread blocked in [`WaitContext::wait_until`] to wake up and
     /// reevaluate its wait condition.
     ///
+    /// Callers must publish whatever condition the waiter tests *before* calling this;
+    /// the fence inside pairs with the one in `start_wait` to make that store visible.
+    ///
     /// Note that this does not interrupt guest execution; to interrupt guest
     /// execution, use [`ThreadHandle::interrupt`].
     pub fn wake(&self) {
@@ -161,6 +164,12 @@ impl<Platform: RawSyncPrimitivesProvider> WaitState<Platform> {
 impl<Platform: RawSyncPrimitivesProvider> WaitStateInner<Platform> {
     /// Wakes up the thread if it is waiting (but not if it is running in the guest).
     fn wake(&self) {
+        // Callers publish their condition flag immediately before this call. Without a
+        // fence on *both* sides, that store and the state read below are a store-buffering
+        // pair: each thread can read the other's stale value, so the waiter blocks on an
+        // unset condition while this skips the wake on a stale `RUNNING_IN_HOST`.
+        // Acquire/Release cannot express this -- only a store-load barrier can.
+        core::sync::atomic::fence(Ordering::SeqCst);
         let condvar = &self.condvar;
         let v = condvar.underlying_atomic().fetch_update(
             Ordering::Release,
@@ -174,7 +183,7 @@ impl<Platform: RawSyncPrimitivesProvider> WaitStateInner<Platform> {
                 state => unreachable!("{state:?}"),
             },
         );
-        #[cfg(any(test, feature = "futex_ordering_stress"))]
+        #[cfg(any(test, feature = "ordering_stress"))]
         crate::ordering_stress::record_waker_result(v);
         match v.map(ThreadState) {
             Ok(ThreadState::WAITING) => {
@@ -213,6 +222,10 @@ impl<Platform: RawSyncPrimitivesProvider + ThreadProvider> ThreadHandle<Platform
     /// condition and interrupt condition. If it is running guest code, the
     /// platform will interrupt the thread and re-enter the shim.
     pub fn interrupt(&self) {
+        // See the fence in `WaitStateInner::wake`: callers publish their interrupt
+        // condition (e.g. `is_exiting`) immediately before this call, and
+        // `check_for_interrupt` reads it after the waiter's `WAITING` store.
+        core::sync::atomic::fence(Ordering::SeqCst);
         let condvar = &self.waker.0.condvar;
         let v = condvar.underlying_atomic().fetch_update(
             Ordering::Release,
@@ -226,6 +239,8 @@ impl<Platform: RawSyncPrimitivesProvider + ThreadProvider> ThreadHandle<Platform
                 state => unreachable!("{state:?}"),
             },
         );
+        #[cfg(any(test, feature = "ordering_stress"))]
+        crate::ordering_stress::record_waker_result(v);
         match v.map(ThreadState) {
             Ok(ThreadState::WAITING) => {
                 condvar.wake_one();
@@ -377,11 +392,14 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
     /// missed.
     fn start_wait(&self) {
         self.waker.0.platform.update_waker(Some(self.waker.clone()));
-        #[cfg(any(test, feature = "futex_ordering_stress"))]
+        #[cfg(any(test, feature = "ordering_stress"))]
         crate::ordering_stress::waiter_rendezvous();
         self.waker
             .0
             .set_state(ThreadState::WAITING, Ordering::SeqCst);
+        // Pairs with the fences in `WaitStateInner::wake` and `ThreadHandle::interrupt`;
+        // both sides need one to forbid the store-buffering outcome.
+        core::sync::atomic::fence(Ordering::SeqCst);
     }
 
     /// Returns the thread to the running state after a wait.
@@ -483,4 +501,141 @@ pub enum WaitError {
     Interrupted,
     #[error("wait timed out")]
     TimedOut,
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::{CheckForInterrupt, WaitError, WaitState};
+    use crate::LiteBox;
+    use crate::platform::mock::MockPlatform;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Barrier;
+    use std::thread;
+
+    /// Stands in for the shim's `is_exiting`: published with a plain relaxed store by the
+    /// interrupting thread and read by the waiter inside `check_for_interrupt`.
+    struct ExitFlag(AtomicBool);
+
+    impl CheckForInterrupt for ExitFlag {
+        fn check_for_interrupt(&self) -> bool {
+            let exiting = self.0.load(Ordering::Relaxed);
+            crate::ordering_stress::record_waiter_done(exiting);
+            exiting
+        }
+    }
+
+    /// The third instance of the wake-path store-buffering hazard, alongside the futex and
+    /// polling ones: an interrupter publishes its flag and then calls
+    /// [`ThreadHandle::interrupt`], whose `fetch_update` reads the thread state, while the
+    /// waiter stores `WAITING` and then reads that flag via `check_for_interrupt`. Both
+    /// sides can read the other's stale value, so the interrupt is skipped on
+    /// `RUNNING_IN_HOST` while the waiter blocks on a stale flag.
+    ///
+    /// The wait deliberately has **no deadline**, for two reasons: it is the case that
+    /// actually hangs in production (`kill_other_threads` during `execve` waits forever for
+    /// a thread that never got its interrupt), and a deadline makes `commit_wait` call
+    /// `remaining_timeout()` between the `WAITING` store and the flag read, which widens the
+    /// window enough to hide the race entirely. To keep the suite from hanging, the
+    /// interrupter issues a second, rescue interrupt; by then the `WAITING` store has
+    /// drained, so it always lands. `record_waker_result` is first-write-wins, so the rescue
+    /// cannot overwrite the racing result.
+    ///
+    /// Ignored because it is probabilistic; run with `LITEBOX_INTERRUPT_STRESS_ITERS` to
+    /// control the iteration count.
+    #[test]
+    #[ignore = "probabilistic weak-memory stress test"]
+    fn stress_interrupted_waiter_is_not_missed() {
+        let platform = MockPlatform::new();
+        let _litebox = LiteBox::new(platform);
+        let iterations = std::env::var("LITEBOX_INTERRUPT_STRESS_ITERS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(200_000);
+        crate::ordering_stress::activate();
+        let iteration_start = Arc::new(Barrier::new(3));
+        let iteration_finish = Arc::new(Barrier::new(3));
+        let exit_flag = Arc::new(ExitFlag(AtomicBool::new(false)));
+        let waiter_interrupted = Arc::new(AtomicBool::new(false));
+        let (handle_tx, handle_rx) = std::sync::mpsc::channel();
+
+        let waiter = {
+            let iteration_start = Arc::clone(&iteration_start);
+            let iteration_finish = Arc::clone(&iteration_finish);
+            let exit_flag = Arc::clone(&exit_flag);
+            let waiter_interrupted = Arc::clone(&waiter_interrupted);
+            thread::spawn(move || {
+                // `WaitState` is `!Sync`, so it must live on the waiting thread; only its
+                // `ThreadHandle` crosses over to the interrupter.
+                let wait_state = WaitState::new(platform);
+                handle_tx.send(wait_state.thread_handle()).unwrap();
+                for _ in 0..iterations {
+                    iteration_start.wait();
+                    crate::ordering_stress::waiter_registered();
+                    let err = wait_state
+                        .context()
+                        .with_check_for_interrupt(&*exit_flag)
+                        .sleep();
+                    waiter_interrupted
+                        .store(matches!(err, WaitError::Interrupted), Ordering::Relaxed);
+                    iteration_finish.wait();
+                }
+            })
+        };
+
+        let handle = handle_rx.recv().unwrap();
+        let interrupter = {
+            let iteration_start = Arc::clone(&iteration_start);
+            let iteration_finish = Arc::clone(&iteration_finish);
+            let exit_flag = Arc::clone(&exit_flag);
+            thread::spawn(move || {
+                for _ in 0..iterations {
+                    iteration_start.wait();
+                    while !crate::ordering_stress::waiter_is_registered() {
+                        core::hint::spin_loop();
+                    }
+                    crate::ordering_stress::waker_rendezvous();
+                    exit_flag.0.store(true, Ordering::Relaxed);
+                    handle.interrupt();
+                    // Liveness rescue: if the first interrupt was dropped on a stale
+                    // `RUNNING_IN_HOST`, production would hang here forever.
+                    handle.interrupt();
+                    iteration_finish.wait();
+                }
+            })
+        };
+
+        let mut both_old = 0;
+        let mut not_interrupted = 0;
+
+        for _ in 0..iterations {
+            crate::ordering_stress::begin_round();
+            exit_flag.0.store(false, Ordering::Relaxed);
+            waiter_interrupted.store(false, Ordering::Relaxed);
+            iteration_start.wait();
+            crate::ordering_stress::wait_until_parked();
+            crate::ordering_stress::release();
+            iteration_finish.wait();
+            if crate::ordering_stress::observed_both_old() {
+                both_old += 1;
+            }
+            if !waiter_interrupted.load(Ordering::Relaxed) {
+                not_interrupted += 1;
+            }
+        }
+
+        waiter.join().unwrap();
+        interrupter.join().unwrap();
+        crate::ordering_stress::deactivate();
+        std::eprintln!(
+            "iterations={iterations} both_old={both_old} not_interrupted={not_interrupted}"
+        );
+        assert_eq!(not_interrupted, 0, "a wait ended without being interrupted");
+        assert_eq!(
+            both_old, 0,
+            "the interrupt path saw both old values (each one hangs without the rescue)"
+        );
+    }
 }
