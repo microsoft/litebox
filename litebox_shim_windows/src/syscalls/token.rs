@@ -463,9 +463,14 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 || Ok(token.statistics),
             ),
             TokenInformationClass::SessionId
-            | TokenInformationClass::Elevation
             | TokenInformationClass::IsAppContainer
             | TokenInformationClass::PrivateNameSpace => Self::write_token_information_value(
+                token_information,
+                token_information_length,
+                return_length,
+                || Ok(0_u32),
+            ),
+            TokenInformationClass::Elevation => Self::write_exact_token_information_value(
                 token_information,
                 token_information_length,
                 return_length,
@@ -718,9 +723,43 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         return_length: MutPtr<Platform, u32>,
         build_information: impl FnOnce() -> Result<T, NtStatus>,
     ) -> NtStatus {
+        Self::write_token_information_value_with_length_check(
+            token_information,
+            token_information_length,
+            return_length,
+            false,
+            build_information,
+        )
+    }
+
+    fn write_exact_token_information_value<T: Immutable + IntoBytes>(
+        token_information: MutPtr<Platform, u8>,
+        token_information_length: u32,
+        return_length: MutPtr<Platform, u32>,
+        build_information: impl FnOnce() -> Result<T, NtStatus>,
+    ) -> NtStatus {
+        Self::write_token_information_value_with_length_check(
+            token_information,
+            token_information_length,
+            return_length,
+            true,
+            build_information,
+        )
+    }
+
+    fn write_token_information_value_with_length_check<T: Immutable + IntoBytes>(
+        token_information: MutPtr<Platform, u8>,
+        token_information_length: u32,
+        return_length: MutPtr<Platform, u32>,
+        require_exact_length: bool,
+        build_information: impl FnOnce() -> Result<T, NtStatus>,
+    ) -> NtStatus {
         let required_length = size_of::<T>().trunc();
         if return_length.write_at_offset(0, required_length).is_none() {
             return NtStatus::ACCESS_VIOLATION;
+        }
+        if require_exact_length && token_information_length != required_length {
+            return NtStatus::INFO_LENGTH_MISMATCH;
         }
         if token_information_length < required_length {
             return NtStatus::BUFFER_TOO_SMALL;
@@ -875,6 +914,44 @@ mod tests {
             }
         );
         assert_eq!(return_length as usize, size_of_val(&output));
+    }
+
+    #[test]
+    fn token_elevation_requires_exact_buffer_length() {
+        let task = test_task();
+        let required_length = size_of::<u32>().trunc();
+
+        for token_information_length in [required_length - 1, required_length + 1] {
+            let mut output = u32::MAX;
+            let mut return_length = 0;
+            assert_eq!(
+                task.sys_nt_query_information_token(
+                    Task::<TestPlatform, TestFS>::CURRENT_PROCESS_TOKEN,
+                    TokenInformationClass::Elevation as u32,
+                    mut_byte_ptr(&mut output),
+                    token_information_length,
+                    mut_ptr(&mut return_length),
+                ),
+                NtStatus::INFO_LENGTH_MISMATCH
+            );
+            assert_eq!(return_length, required_length);
+            assert_eq!(output, u32::MAX);
+        }
+
+        let mut output = u32::MAX;
+        let mut return_length = 0;
+        assert_eq!(
+            task.sys_nt_query_information_token(
+                Task::<TestPlatform, TestFS>::CURRENT_PROCESS_TOKEN,
+                TokenInformationClass::Elevation as u32,
+                mut_byte_ptr(&mut output),
+                required_length,
+                mut_ptr(&mut return_length),
+            ),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(return_length, required_length);
+        assert_eq!(output, 0);
     }
 
     #[test]

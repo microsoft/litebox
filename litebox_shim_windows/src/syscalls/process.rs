@@ -9,7 +9,7 @@ use litebox::utils::TruncateExt;
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-use crate::nt_types::ThreadEnvironmentBlock;
+use crate::nt_types::{ListEntry, ThreadEnvironmentBlock};
 use crate::syscalls::ProcessHandle;
 use crate::{ConstPtr, MutPtr, ShimFS, ShimPlatform, Task};
 
@@ -21,8 +21,6 @@ const GUEST_PARENT_PROCESS_ID: usize = 0;
 const GUEST_PROCESS_AFFINITY_MASK: usize = 1;
 const PROCESS_DEBUG_FLAGS_NO_DEBUGGER: u32 = 1;
 const PROCESS_COOKIE: u32 = 0xdead_beef;
-const TEB_TLS_SLOT_COUNT: usize = 64;
-
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, IntEnum)]
 enum ProcessInformationClass {
@@ -75,6 +73,39 @@ struct ProcessDefaultHardErrorMode {
 #[derive(Clone, Copy, Debug, FromBytes, Immutable)]
 struct ProcessSchedulerSharedDataSlotInformation {
     scheduler_shared_data_handle: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct ProcessDynamicFunctionTableInformation {
+    dynamic_function_table: usize,
+    remove: u8,
+    _padding0: [u8; 7],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable)]
+struct RtlBalancedNode {
+    children: [usize; 2],
+    parent_value: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable)]
+struct DynamicFunctionTable {
+    list_entry: ListEntry,
+    function_table: usize,
+    time_stamp: i64,
+    minimum_address: u64,
+    maximum_address: u64,
+    base_address: u64,
+    callback: usize,
+    context: usize,
+    out_of_process_callback_dll: usize,
+    table_type: u32,
+    entry_count: u32,
+    tree_node_min: RtlBalancedNode,
+    tree_node_max: RtlBalancedNode,
 }
 
 #[repr(C)]
@@ -158,6 +189,16 @@ impl<Platform: RawPointerProvider> ProcessTlsThreadData<Platform> {
                 ptr.as_usize(),
                 offset_of!(ProcessTlsThreadDataExtended, flags),
                 flags.bits(),
+            ),
+        }
+    }
+
+    fn read_thread_id(&self) -> Option<usize> {
+        match self {
+            Self::Simple(_) => None,
+            Self::Extended(ptr) => crate::read_field_at_offset::<Platform, _>(
+                ptr.as_usize(),
+                offset_of!(ProcessTlsThreadDataExtended, thread_id),
             ),
         }
     }
@@ -415,27 +456,41 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         process_information: MutPtr<Platform, u8>,
         process_information_length: u32,
     ) -> NtStatus {
-        const INFORMATION_LENGTH: u32 = 16;
-
         if !process_handle.is_current() {
-            return NtStatus::INVALID_HANDLE;
-        }
-        if process_information_length != INFORMATION_LENGTH {
-            return NtStatus::INFO_LENGTH_MISMATCH;
-        }
-        let table = MutPtr::<Platform, usize>::from_usize(process_information.as_usize());
-        let Some(table) = table.read_at_offset(0) else {
-            return NtStatus::ACCESS_VIOLATION;
-        };
-        let Some(remove) =
-            process_information.read_at_offset(size_of::<usize>().try_into().unwrap())
-        else {
-            return NtStatus::ACCESS_VIOLATION;
-        };
-        if table == 0 || remove > 1 {
+            litebox_util_log::debug!(
+                process_handle:% = format_args!("{:#x}", process_handle.as_handle().as_raw());
+                "Rejected process dynamic function table information for non-current process"
+            );
             return NtStatus::INVALID_PARAMETER;
         }
+        if process_information_length != size_of::<ProcessDynamicFunctionTableInformation>().trunc()
+        {
+            return NtStatus::INFO_LENGTH_MISMATCH;
+        }
+        let information = ConstPtr::<Platform, ProcessDynamicFunctionTableInformation>::from_usize(
+            process_information.as_usize(),
+        );
+        let Some(information) = information.read_at_offset(0) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        if information.dynamic_function_table == 0 || information.remove > 1 {
+            return NtStatus::INVALID_PARAMETER;
+        }
+        let table = ConstPtr::<Platform, DynamicFunctionTable>::from_usize(
+            information.dynamic_function_table,
+        );
+        // Probe the guest table as Windows does.
+        // TODO(dynamic-function-tables): register or remove this table and use it for dynamic-code
+        // unwind lookup. Until then, a valid request is a compatibility no-op.
+        if table.read_at_offset(0).is_none() {
+            return NtStatus::ACCESS_VIOLATION;
+        }
 
+        litebox_util_log::debug!(
+            dynamic_function_table:% = format_args!("{:#x}", information.dynamic_function_table),
+            remove = information.remove != 0;
+            "Handled process dynamic function table information"
+        );
         NtStatus::SUCCESS
     }
 
@@ -527,13 +582,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             "Handling ProcessTlsInformation"
         );
 
-        if header.thread_data_count > 1 {
-            // TODO(multi-thread-tls): PROCESS_TLS_INFORMATION entries are positional per-thread
-            // data. The shim currently models only the active TEB, so handling multiple entries
-            // would corrupt prior TLS values by repeatedly writing one TEB's vector.
-            return NtStatus::NOT_SUPPORTED;
-        }
-
         match ProcessTlsOperation::try_from(header.operation_type) {
             Ok(ProcessTlsOperation::ReplaceVector) => {
                 self.replace_tls_vector(process_information, header, layout)
@@ -563,6 +611,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         else {
             return NtStatus::ACCESS_VIOLATION;
         };
+        let simple_teb_addresses = self.simple_tls_teb_addresses(layout);
         for index in 0..header.thread_data_count as usize {
             let Some(thread_data) = layout.thread_data::<Platform>(process_information, index)
             else {
@@ -571,10 +620,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let Some(new_tls_data) = thread_data.read_tls_data() else {
                 return NtStatus::ACCESS_VIOLATION;
             };
-            // TODO(multi-thread-tls): read ith thread's tls
-            let teb = MutPtr::<Platform, ThreadEnvironmentBlock>::from_usize(
-                self.thread_object.teb_address(),
-            );
+            let teb_address = match self.tls_thread_teb_address(
+                layout,
+                &thread_data,
+                index,
+                &simple_teb_addresses,
+            ) {
+                Ok(teb_address) => teb_address,
+                Err(status) => return status,
+            };
+            let teb = MutPtr::<Platform, ThreadEnvironmentBlock>::from_usize(teb_address);
             let Some(old_tls_data) = Self::read_teb_tls_pointer(teb) else {
                 return NtStatus::ACCESS_VIOLATION;
             };
@@ -589,7 +644,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             if let Err(status) = Self::copy_tls_slots(old_tls_data, new_tls_data, previous_count) {
                 return status;
             }
-            let old_tls_data_for_guest = self.guest_visible_old_tls_vector(old_tls_data);
+            let old_tls_data_for_guest =
+                Self::guest_visible_old_tls_vector(old_tls_data, teb_address);
 
             if thread_data.write_tls_data(old_tls_data_for_guest).is_none()
                 || Self::write_teb_tls_pointer(teb, new_tls_data).is_none()
@@ -614,10 +670,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         layout: ProcessTlsLayout,
     ) -> NtStatus {
         let tls_index = header.tls_index as usize;
-        if tls_index >= TEB_TLS_SLOT_COUNT {
-            return NtStatus::INVALID_PARAMETER;
-        }
 
+        let simple_teb_addresses = self.simple_tls_teb_addresses(layout);
         for index in 0..header.thread_data_count as usize {
             let Some(thread_data) = layout.thread_data::<Platform>(process_information, index)
             else {
@@ -626,10 +680,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let Some(new_tls_data) = thread_data.read_tls_data() else {
                 return NtStatus::ACCESS_VIOLATION;
             };
-            // TODO(multi-thread-tls): read ith thread's tls
-            let teb = ConstPtr::<Platform, ThreadEnvironmentBlock>::from_usize(
-                self.thread_object.teb_address(),
-            );
+            let teb_address = match self.tls_thread_teb_address(
+                layout,
+                &thread_data,
+                index,
+                &simple_teb_addresses,
+            ) {
+                Ok(teb_address) => teb_address,
+                Err(status) => return status,
+            };
+            let teb = ConstPtr::<Platform, ThreadEnvironmentBlock>::from_usize(teb_address);
             let Some(tls_array) = Self::read_teb_tls_pointer(teb) else {
                 return NtStatus::ACCESS_VIOLATION;
             };
@@ -665,8 +725,37 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         NtStatus::SUCCESS
     }
 
-    fn guest_visible_old_tls_vector(&self, old_tls_data: usize) -> usize {
-        let teb_address = self.thread_object.teb_address();
+    fn simple_tls_teb_addresses(&self, layout: ProcessTlsLayout) -> alloc::vec::Vec<usize> {
+        match layout {
+            ProcessTlsLayout::Simple => self.process.thread_teb_addresses(),
+            ProcessTlsLayout::Extended => alloc::vec::Vec::new(),
+        }
+    }
+
+    fn tls_thread_teb_address(
+        &self,
+        layout: ProcessTlsLayout,
+        thread_data: &ProcessTlsThreadData<Platform>,
+        index: usize,
+        simple_teb_addresses: &[usize],
+    ) -> Result<usize, NtStatus> {
+        match layout {
+            ProcessTlsLayout::Simple => simple_teb_addresses
+                .get(index)
+                .copied()
+                .ok_or(NtStatus::INVALID_CID),
+            ProcessTlsLayout::Extended => {
+                let thread_id = thread_data
+                    .read_thread_id()
+                    .ok_or(NtStatus::ACCESS_VIOLATION)?;
+                self.process
+                    .thread_teb_address(thread_id)
+                    .ok_or(NtStatus::INVALID_CID)
+            }
+        }
+    }
+
+    fn guest_visible_old_tls_vector(old_tls_data: usize, teb_address: usize) -> usize {
         if old_tls_data > 0x10010
             && old_tls_data >= teb_address
             && old_tls_data < teb_address.saturating_add(size_of::<ThreadEnvironmentBlock>())
@@ -766,6 +855,214 @@ mod tests {
         assert_eq!(offset_of!(ProcessTlsThreadDataExtended, new_tls_data), 8);
         assert_eq!(offset_of!(ProcessTlsThreadDataExtended, old_tls_data), 16);
         assert_eq!(offset_of!(ProcessTlsThreadDataExtended, thread_id), 24);
+    }
+
+    #[test]
+    fn dynamic_function_table_layout_matches_windows_abi() {
+        assert_eq!(size_of::<RtlBalancedNode>(), 24);
+        assert_eq!(size_of::<DynamicFunctionTable>(), 136);
+        assert_eq!(offset_of!(DynamicFunctionTable, function_table), 16);
+        assert_eq!(offset_of!(DynamicFunctionTable, table_type), 80);
+        assert_eq!(offset_of!(DynamicFunctionTable, tree_node_min), 88);
+        assert_eq!(offset_of!(DynamicFunctionTable, tree_node_max), 112);
+    }
+
+    #[test]
+    fn simple_tls_vector_layout_uses_header_count() {
+        const PREVIOUS_COUNT: usize = 7;
+        let header = ProcessTlsInformationHeader {
+            flags: 0,
+            operation_type: ProcessTlsOperation::ReplaceVector as u32,
+            thread_data_count: 0,
+            tls_index: PREVIOUS_COUNT.trunc(),
+        };
+
+        assert_eq!(
+            ProcessTlsLayout::Simple
+                .previous_count::<crate::tests::TestPlatform>(null_mut_ptr(), header),
+            Some(PREVIOUS_COUNT)
+        );
+    }
+
+    #[test]
+    fn extended_tls_entries_update_threads_selected_by_id() {
+        #[repr(C)]
+        struct ExtendedTlsRequest {
+            header: ProcessTlsInformationExtendedHeader,
+            thread_data: [ProcessTlsThreadDataExtended; 2],
+        }
+
+        run_with_test_platform_pointers(|| {
+            const TLS_VECTOR_LEN: usize = 66;
+            const TLS_INDEX: usize = 65;
+            const PREVIOUS_COUNT: usize = 3;
+
+            let task = crate::tests::test_task();
+            let mut first_teb = <ThreadEnvironmentBlock as zerocopy::FromZeros>::new_zeroed();
+            let mut second_teb = <ThreadEnvironmentBlock as zerocopy::FromZeros>::new_zeroed();
+            let mut first_tls = [0x11usize; TLS_VECTOR_LEN];
+            let mut second_tls = [0x22usize; TLS_VECTOR_LEN];
+            first_teb.thread_local_storage_pointer = first_tls.as_mut_ptr() as usize;
+            second_teb.thread_local_storage_pointer = second_tls.as_mut_ptr() as usize;
+
+            let first_thread = task
+                .clone_for_test_with_teb(core::ptr::addr_of!(first_teb) as usize)
+                .expect("first sibling thread should attach");
+            let second_thread = task
+                .clone_for_test_with_teb(core::ptr::addr_of!(second_teb) as usize)
+                .expect("second sibling thread should attach");
+            let tls_index: u32 = TLS_INDEX.trunc();
+            let mut request = ExtendedTlsRequest {
+                header: ProcessTlsInformationExtendedHeader {
+                    header: ProcessTlsInformationHeader {
+                        flags: 0,
+                        operation_type: ProcessTlsOperation::ReplaceIndex as u32,
+                        thread_data_count: 2,
+                        tls_index,
+                    },
+                    previous_count: TLS_VECTOR_LEN.trunc(),
+                    _padding0: 0,
+                },
+                thread_data: [
+                    ProcessTlsThreadDataExtended {
+                        flags: 0,
+                        _padding0: 0,
+                        new_tls_data: 0xbb,
+                        old_tls_data: 0,
+                        thread_id: second_thread.thread_id,
+                    },
+                    ProcessTlsThreadDataExtended {
+                        flags: 0,
+                        _padding0: 0,
+                        new_tls_data: 0xaa,
+                        old_tls_data: 0,
+                        thread_id: first_thread.thread_id,
+                    },
+                ],
+            };
+
+            assert_eq!(
+                task.sys_nt_set_information_process(
+                    ProcessHandle::CURRENT,
+                    ProcessInformationClass::TlsInformation as u32,
+                    mut_byte_ptr(&mut request),
+                    size_of::<ExtendedTlsRequest>().trunc(),
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(first_tls[tls_index as usize], 0xaa);
+            assert_eq!(second_tls[tls_index as usize], 0xbb);
+            assert_eq!(request.thread_data[0].old_tls_data, 0x22);
+            assert_eq!(request.thread_data[1].old_tls_data, 0x11);
+            assert_eq!(
+                request.thread_data[0].flags,
+                ProcessTlsThreadDataFlags::OLD_DATA_WRITTEN.bits()
+            );
+            assert_eq!(
+                request.thread_data[1].flags,
+                ProcessTlsThreadDataFlags::OLD_DATA_WRITTEN.bits()
+            );
+
+            let mut first_old_tls = [0usize; PREVIOUS_COUNT];
+            let mut second_old_tls = [0usize; PREVIOUS_COUNT];
+            first_old_tls[0] = 0x1111;
+            second_old_tls[0] = 0x2222;
+            first_teb.thread_local_storage_pointer = first_old_tls.as_mut_ptr() as usize;
+            second_teb.thread_local_storage_pointer = second_old_tls.as_mut_ptr() as usize;
+            let mut first_new_tls = [0usize; PREVIOUS_COUNT];
+            let mut second_new_tls = [0usize; PREVIOUS_COUNT];
+            request.header.header.operation_type = ProcessTlsOperation::ReplaceVector as u32;
+            request.header.previous_count = PREVIOUS_COUNT.trunc();
+            request.thread_data[0].new_tls_data = second_new_tls.as_mut_ptr() as usize;
+            request.thread_data[0].old_tls_data = usize::MAX;
+            request.thread_data[0].flags = 0;
+            request.thread_data[1].new_tls_data = first_new_tls.as_mut_ptr() as usize;
+            request.thread_data[1].old_tls_data = usize::MAX;
+            request.thread_data[1].flags = 0;
+
+            assert_eq!(
+                task.sys_nt_set_information_process(
+                    ProcessHandle::CURRENT,
+                    ProcessInformationClass::TlsInformation as u32,
+                    mut_byte_ptr(&mut request),
+                    size_of::<ExtendedTlsRequest>().trunc(),
+                ),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(first_new_tls[0], 0x1111);
+            assert_eq!(second_new_tls[0], 0x2222);
+            assert_eq!(
+                first_teb.thread_local_storage_pointer,
+                first_new_tls.as_ptr() as usize
+            );
+            assert_eq!(
+                second_teb.thread_local_storage_pointer,
+                second_new_tls.as_ptr() as usize
+            );
+            assert_eq!(
+                request.thread_data[0].old_tls_data,
+                second_old_tls.as_ptr() as usize
+            );
+            assert_eq!(
+                request.thread_data[1].old_tls_data,
+                first_old_tls.as_ptr() as usize
+            );
+        });
+    }
+
+    #[test]
+    fn nt_set_information_process_dynamic_function_table_validates_arguments() {
+        run_with_test_platform_pointers(|| {
+            let task = crate::tests::test_task();
+            let table = <DynamicFunctionTable as zerocopy::FromZeros>::new_zeroed();
+            let mut information = ProcessDynamicFunctionTableInformation {
+                dynamic_function_table: core::ptr::from_ref(&table) as usize,
+                remove: 0,
+                _padding0: [0; 7],
+            };
+            let information_len = size_of::<ProcessDynamicFunctionTableInformation>().trunc();
+
+            assert_eq!(
+                task.sys_nt_set_information_process(
+                    ProcessHandle::from_raw(0x1234),
+                    ProcessInformationClass::DynamicFunctionTableInformation as u32,
+                    mut_byte_ptr(&mut information),
+                    information_len,
+                ),
+                NtStatus::INVALID_PARAMETER
+            );
+            assert_eq!(
+                task.sys_nt_set_information_process(
+                    ProcessHandle::CURRENT,
+                    ProcessInformationClass::DynamicFunctionTableInformation as u32,
+                    mut_byte_ptr(&mut information),
+                    information_len - 1,
+                ),
+                NtStatus::INFO_LENGTH_MISMATCH
+            );
+
+            information.dynamic_function_table = usize::MAX;
+            assert_eq!(
+                task.sys_nt_set_information_process(
+                    ProcessHandle::CURRENT,
+                    ProcessInformationClass::DynamicFunctionTableInformation as u32,
+                    mut_byte_ptr(&mut information),
+                    information_len,
+                ),
+                NtStatus::ACCESS_VIOLATION
+            );
+
+            information.dynamic_function_table = core::ptr::from_ref(&table) as usize;
+            assert_eq!(
+                task.sys_nt_set_information_process(
+                    ProcessHandle::CURRENT,
+                    ProcessInformationClass::DynamicFunctionTableInformation as u32,
+                    mut_byte_ptr(&mut information),
+                    information_len,
+                ),
+                NtStatus::SUCCESS
+            );
+        });
     }
 
     #[test]
