@@ -207,24 +207,6 @@ fn receive_datagram_into(
 }
 
 #[test]
-fn cached_socket_error_precedes_a_new_kernel_error() {
-    assert_eq!(
-        shift_pending_error(
-            Some(SocketError::ConnectionRefused),
-            Some(SocketError::NetworkUnreachable),
-        ),
-        (
-            Some(SocketError::ConnectionRefused),
-            Some(SocketError::NetworkUnreachable),
-        )
-    );
-    assert_eq!(
-        shift_pending_error(None, Some(SocketError::NetworkUnreachable)),
-        (Some(SocketError::NetworkUnreachable), None)
-    );
-}
-
-#[test]
 fn synchronous_errors_do_not_consume_tcp_connect_status() {
     assert!(!can_consume_synchronous_error(
         SocketConnectionStatus::Connecting,
