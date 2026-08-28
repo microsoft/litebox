@@ -667,6 +667,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
             })
     }
 
+    /// Refreshes status after a synchronous failure, draining both backend error slots.
     fn refresh_after_synchronous_error(&self) {
         let status_guard = self.status_lock.lock();
         for _ in 0..2 {
