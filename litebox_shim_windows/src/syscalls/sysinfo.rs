@@ -36,7 +36,25 @@ const PROCESSOR_ARCHITECTURE_AMD64: u16 = 9;
 const SYSTEM_VERIFIER_INFORMATION_LENGTH: u32 = 0x90;
 const SYSTEM_VERIFIER_INFORMATION_LENGTH_USIZE: usize = 0x90;
 const SYSTEM_FEATURE_CONFIGURATION_INFORMATION_LENGTH: u32 = 0x18;
-const FEATURE_CONFIGURATION_CHANGE_STAMP: u64 = 0x13;
+// Synthetic generation for the immutable feature table. Increment if the table changes.
+const FEATURE_CONFIGURATION_CHANGE_STAMP: u64 = 1;
+// Feature configurations observed from host ntdll on Windows 11 build 26200.
+// This is the subset found in the scanned ID ranges, not an exhaustive feature list.
+// Keep entries sorted by feature ID for binary search.
+const OBSERVED_FEATURE_CONFIGURATIONS: &[(u32, u32)] = &[
+    (58_599_532, 0x2f),
+    (58_599_550, 0x2f),
+    (58_599_553, 0x2f),
+    (58_599_559, 0x2f),
+    (58_599_563, 0x2f),
+    (58_599_570, 0x2f),
+    (58_988_972, 0x2f),
+    (58_989_002, 0x2f),
+    (58_989_021, 0x2f),
+    (58_989_070, 0x64),
+    (58_989_092, 0x64),
+    (58_989_177, 0x64),
+];
 const X64_SYSTEM_RANGE_START: usize = 0xffff_8000_0000_0000;
 
 #[repr(C)]
@@ -85,6 +103,13 @@ enum LogicalProcessorRelationship {
     Group = 4,
     NumaNodeEx = 6,
     All = 0xffff,
+}
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, IntEnum)]
+enum FeatureConfigurationType {
+    Boot = 0,
+    Runtime = 1,
 }
 
 #[repr(C)]
@@ -443,7 +468,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Some(query) = input_buffer.read_at_offset(0) else {
             return NtStatus::ACCESS_VIOLATION;
         };
-        if query.configuration_type > 1 {
+        // Boot and Runtime returned identical values for every observed feature. Validate the
+        // selector to match Windows, but use the same deterministic table for both.
+        if FeatureConfigurationType::try_from(query.configuration_type).is_err() {
             if Self::write_return_length(return_length, 0).is_err() {
                 return NtStatus::ACCESS_VIOLATION;
             }
@@ -457,11 +484,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             );
         }
 
-        let configuration = match query.feature_id {
-            58_599_559 | 58_989_021 | 58_599_563 => Some(0x2f),
-            58_989_070 | 58_989_092 => Some(0x64),
-            _ => None,
-        };
+        let configuration = OBSERVED_FEATURE_CONFIGURATIONS
+            .binary_search_by_key(&query.feature_id, |&(feature_id, _)| feature_id)
+            .ok()
+            .map(|index| OBSERVED_FEATURE_CONFIGURATIONS[index].1);
+        if configuration.is_none() {
+            litebox_util_log::debug!(
+                feature_id = query.feature_id;
+                "No observed feature configuration"
+            );
+        }
         let information = SystemFeatureConfigurationInformation {
             change_stamp: FEATURE_CONFIGURATION_CHANGE_STAMP,
             feature_id: configuration.map_or(0, |_| query.feature_id),
@@ -1139,34 +1171,39 @@ mod tests {
     #[test]
     fn nt_query_system_information_ex_reports_configured_features() {
         run_with_test_platform_pointers(|| {
-            for (feature_id, expected_configuration) in [
-                (58_599_559, 0x2f),
-                (58_989_070, 0x64),
-                (58_989_021, 0x2f),
-                (58_599_563, 0x2f),
-                (58_989_092, 0x64),
-            ] {
-                let query = SystemFeatureConfigurationQuery {
-                    configuration_type: 0,
-                    feature_id,
-                };
-                let mut output = SystemFeatureConfigurationInformation::default();
+            assert!(
+                OBSERVED_FEATURE_CONFIGURATIONS
+                    .windows(2)
+                    .all(|entries| entries[0].0 < entries[1].0)
+            );
 
-                assert_eq!(
-                    TestTask::sys_nt_query_system_information_ex(
-                        SystemInformationClass::FeatureConfiguration as u32,
-                        Some(const_byte_ptr(&query)),
-                        size_of::<SystemFeatureConfigurationQuery>().trunc(),
-                        mut_byte_ptr(&mut output),
-                        size_of::<SystemFeatureConfigurationInformation>().trunc(),
-                        None,
-                    ),
-                    NtStatus::SUCCESS
-                );
-                assert_eq!(output.change_stamp, FEATURE_CONFIGURATION_CHANGE_STAMP);
-                assert_eq!(output.feature_id, feature_id);
-                assert_eq!(output.configuration, expected_configuration);
-                assert_eq!(output.variant_payload, 0);
+            for configuration_type in [
+                FeatureConfigurationType::Boot,
+                FeatureConfigurationType::Runtime,
+            ] {
+                for &(feature_id, expected_configuration) in OBSERVED_FEATURE_CONFIGURATIONS {
+                    let query = SystemFeatureConfigurationQuery {
+                        configuration_type: configuration_type as u32,
+                        feature_id,
+                    };
+                    let mut output = SystemFeatureConfigurationInformation::default();
+
+                    assert_eq!(
+                        TestTask::sys_nt_query_system_information_ex(
+                            SystemInformationClass::FeatureConfiguration as u32,
+                            Some(const_byte_ptr(&query)),
+                            size_of::<SystemFeatureConfigurationQuery>().trunc(),
+                            mut_byte_ptr(&mut output),
+                            size_of::<SystemFeatureConfigurationInformation>().trunc(),
+                            None,
+                        ),
+                        NtStatus::SUCCESS
+                    );
+                    assert_eq!(output.change_stamp, FEATURE_CONFIGURATION_CHANGE_STAMP);
+                    assert_eq!(output.feature_id, feature_id);
+                    assert_eq!(output.configuration, expected_configuration);
+                    assert_eq!(output.variant_payload, 0);
+                }
             }
         });
     }
@@ -1174,28 +1211,31 @@ mod tests {
     #[test]
     fn nt_query_system_information_ex_validates_feature_configuration_query() {
         run_with_test_platform_pointers(|| {
-            let query = SystemFeatureConfigurationQuery {
-                configuration_type: 2,
-                feature_id: 0,
-            };
             let mut output = SystemFeatureConfigurationInformation::default();
             let mut return_length = u32::MAX;
 
-            assert_eq!(
-                TestTask::sys_nt_query_system_information_ex(
-                    SystemInformationClass::FeatureConfiguration as u32,
-                    Some(const_byte_ptr(&query)),
-                    size_of::<SystemFeatureConfigurationQuery>().trunc(),
-                    mut_byte_ptr(&mut output),
-                    size_of::<SystemFeatureConfigurationInformation>().trunc(),
-                    Some(mut_ptr(&mut return_length)),
-                ),
-                NtStatus::INVALID_PARAMETER
-            );
-            assert_eq!(return_length, 0);
+            for configuration_type in [2, u32::MAX] {
+                let query = SystemFeatureConfigurationQuery {
+                    configuration_type,
+                    feature_id: 0,
+                };
+                return_length = u32::MAX;
+                assert_eq!(
+                    TestTask::sys_nt_query_system_information_ex(
+                        SystemInformationClass::FeatureConfiguration as u32,
+                        Some(const_byte_ptr(&query)),
+                        size_of::<SystemFeatureConfigurationQuery>().trunc(),
+                        mut_byte_ptr(&mut output),
+                        size_of::<SystemFeatureConfigurationInformation>().trunc(),
+                        Some(mut_ptr(&mut return_length)),
+                    ),
+                    NtStatus::INVALID_PARAMETER
+                );
+                assert_eq!(return_length, 0);
+            }
 
             let valid_query = SystemFeatureConfigurationQuery {
-                configuration_type: 0,
+                configuration_type: FeatureConfigurationType::Boot as u32,
                 feature_id: 0,
             };
             assert_eq!(
