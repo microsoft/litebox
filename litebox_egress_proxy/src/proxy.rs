@@ -5,7 +5,7 @@
 //! CONNECT tunnelling.
 //!
 //! Every raw-validated request is authorized before any DNS or upstream
-//! activity against the immutable policy and pinned address table. Plain HTTP
+//! activity against the immutable policy. Plain HTTP
 //! responses close the client connection, so no pipelined second request can
 //! bypass raw validation. A successful CONNECT consumes its connection by
 //! upgrading it to a tunnel. No upstream connection is ever reused.
@@ -33,13 +33,13 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 
 use crate::authority::{DEFAULT_HTTP_PORT, RequestAuthority, host_header_matches, parse_authority};
-use crate::dns::PinnedTable;
+use crate::dns::HostResolver;
 use crate::headers::{
     remove_framing_headers, strip_hop_by_hop, validate_connect_framing, validate_request_framing,
     validate_response_framing,
 };
 use crate::limits::{
-    CLIENT_CLOSE_DRAIN_TIMEOUT, IDLE_TIMEOUT, MAX_CLIENT_CLOSE_DRAIN_BYTES,
+    CLIENT_CLOSE_DRAIN_TIMEOUT, DNS_QUERY_TIMEOUT, IDLE_TIMEOUT, MAX_CLIENT_CLOSE_DRAIN_BYTES,
     MAX_CONCURRENT_CLIENT_CONNECTIONS, MAX_HEADER_FIELDS, MAX_REQUEST_HEADER_BYTES,
     MAX_RESPONSE_HEADER_BYTES, REQUEST_HEADER_READ_TIMEOUT, TOTAL_REQUEST_TIMEOUT,
     UPSTREAM_CONNECT_TIMEOUT,
@@ -57,37 +57,26 @@ type ProxyBody = BoxBody<Bytes, BoxError>;
 
 /// Immutable state shared by every connection.
 ///
-/// The policy and the pinned table are fixed at startup; the connector is an
-/// injected abstraction so that the request path can be exercised without a
-/// real network.
+/// The policy is fixed at startup; the resolver and connector are injected so
+/// that the request path can be exercised without a real network.
 pub struct ProxyState {
     policy: HostPolicy,
-    pinned: PinnedTable,
+    resolver: Arc<dyn HostResolver>,
     connector: Arc<dyn UpstreamConnector>,
 }
 
 impl ProxyState {
-    /// Builds the shared state from an already validated policy and table.
+    /// Builds the shared state from validated policy and network components.
     pub fn new(
         policy: HostPolicy,
-        pinned: PinnedTable,
+        resolver: Arc<dyn HostResolver>,
         connector: Arc<dyn UpstreamConnector>,
     ) -> Self {
         Self {
             policy,
-            pinned,
+            resolver,
             connector,
         }
-    }
-
-    /// Returns the policy in force.
-    pub fn policy(&self) -> &HostPolicy {
-        &self.policy
-    }
-
-    /// Returns the immutable startup resolution table.
-    pub fn pinned(&self) -> &PinnedTable {
-        &self.pinned
     }
 }
 
@@ -453,12 +442,11 @@ fn host_header_is_consistent(
 /// Reason no upstream connection could be established.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UpstreamFailure {
-    /// The hostname had no pinned address. Authorized hostnames always have
-    /// one, so this can only be an internal inconsistency.
-    NoPinnedAddress,
-    /// Every pinned address refused the connection or failed.
+    /// The configured resolver did not return usable IPv4 addresses.
+    ResolutionFailed,
+    /// Every resolved address refused the connection or failed.
     AllAttemptsFailed,
-    /// At least one attempt exceeded the connect timeout and none succeeded.
+    /// DNS resolution or the shared connection budget timed out.
     TimedOut,
 }
 
@@ -466,25 +454,28 @@ impl UpstreamFailure {
     /// Maps the failure onto the status reported to the client.
     fn status(self) -> StatusCode {
         match self {
-            Self::NoPinnedAddress | Self::AllAttemptsFailed => StatusCode::BAD_GATEWAY,
+            Self::ResolutionFailed | Self::AllAttemptsFailed => StatusCode::BAD_GATEWAY,
             Self::TimedOut => StatusCode::GATEWAY_TIMEOUT,
         }
     }
 }
 
-/// Attempts pinned addresses in their stable startup order.
+/// Resolves an authorized hostname and attempts the returned addresses in order.
 async fn connect_upstream(
     state: &ProxyState,
     authority: &RequestAuthority,
 ) -> Result<BoxedUpstreamStream, UpstreamFailure> {
-    let addresses = state.pinned.addresses(authority.host());
-    if addresses.is_empty() {
-        return Err(UpstreamFailure::NoPinnedAddress);
-    }
+    let addresses = timeout(
+        DNS_QUERY_TIMEOUT,
+        state.resolver.resolve(authority.host().clone()),
+    )
+    .await
+    .map_err(|_elapsed| UpstreamFailure::TimedOut)?
+    .map_err(|_error| UpstreamFailure::ResolutionFailed)?;
 
     let attempts = async {
         for address in addresses {
-            let target = SocketAddrV4::new(*address, authority.port());
+            let target = SocketAddrV4::new(address, authority.port());
             if let Ok(stream) = state.connector.connect(target).await {
                 return Ok(stream);
             }
@@ -581,7 +572,7 @@ mod tests {
             StatusCode::BAD_GATEWAY
         );
         assert_eq!(
-            UpstreamFailure::NoPinnedAddress.status(),
+            UpstreamFailure::ResolutionFailed.status(),
             StatusCode::BAD_GATEWAY
         );
         assert_eq!(

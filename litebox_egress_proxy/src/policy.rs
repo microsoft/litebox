@@ -6,7 +6,7 @@
 //! The policy is parsed once, before any listener is announced, and is never
 //! mutated afterwards. Only canonical values reach the request path: a
 //! [`Hostname`] is always lowercase, dot-normalised and syntactically valid,
-//! and a [`PortRange`] never spans a reserved DNS port.
+//! and a [`PortRange`] always contains valid nonzero destination ports.
 
 use core::fmt;
 use core::str::FromStr;
@@ -21,13 +21,6 @@ const MAX_HOSTNAME_BYTES: usize = 253;
 
 /// Maximum length of a single DNS label, in bytes.
 const MAX_LABEL_BYTES: usize = 63;
-
-/// Well-known DNS ports that a proxy rule may never authorize.
-///
-/// Port 53 is plain DNS and port 853 is DNS-over-TLS. Both remain reserved for
-/// the configured resolver path, so that a proxy rule can never be used to
-/// reach an arbitrary resolver.
-pub const RESERVED_DNS_PORTS: [u16; 2] = [53, 853];
 
 /// Reason a hostname was rejected.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -56,9 +49,6 @@ pub enum HostnameError {
     /// the direct IP/CIDR policy, never to the hostname policy.
     #[error("hostname is an IP literal or numeric form")]
     NumericForm,
-    /// The name was `localhost` or one of its descendants.
-    #[error("`localhost` and its descendants are not proxy hostnames")]
-    Localhost,
 }
 
 /// A canonical, exact DNS hostname that a proxy rule or request may name.
@@ -115,10 +105,6 @@ impl Hostname {
             return Err(HostnameError::NumericForm);
         }
 
-        if canonical == "localhost" || canonical.ends_with(".localhost") {
-            return Err(HostnameError::Localhost);
-        }
-
         Ok(Self(canonical))
     }
 
@@ -154,9 +140,6 @@ pub enum PortRangeError {
     /// The range end was smaller than its start.
     #[error("port range end is smaller than its start")]
     Inverted,
-    /// The range contained port 53 or port 853.
-    #[error("port range contains reserved DNS port 53 or 853")]
-    ReservedDnsPort,
 }
 
 /// An inclusive range of destination ports.
@@ -167,20 +150,13 @@ pub struct PortRange {
 }
 
 impl PortRange {
-    /// Creates an inclusive range, rejecting port zero, inverted ranges, and
-    /// any range containing a reserved DNS port.
+    /// Creates an inclusive range, rejecting port zero and inverted ranges.
     pub fn new(start: u16, end: u16) -> Result<Self, PortRangeError> {
         if start == 0 || end == 0 {
             return Err(PortRangeError::ZeroPort);
         }
         if start > end {
             return Err(PortRangeError::Inverted);
-        }
-        if RESERVED_DNS_PORTS
-            .iter()
-            .any(|reserved| (start..=end).contains(reserved))
-        {
-            return Err(PortRangeError::ReservedDnsPort);
         }
         Ok(Self { start, end })
     }
@@ -284,11 +260,6 @@ pub enum PolicyError {
     /// More than [`MAX_HOST_RULES`] distinct canonical hostnames were given.
     #[error("policy contains more than {MAX_HOST_RULES} canonical hostnames")]
     TooManyHosts,
-    /// Merging overlapping ranges produced a range spanning a reserved DNS
-    /// port. This cannot happen for validated inputs and is checked anyway so
-    /// that the reserved-port invariant holds for the stored ranges.
-    #[error("merged port range is invalid: {0}")]
-    MergedRange(#[from] PortRangeError),
 }
 
 /// The immutable proxy policy: exact hostnames mapped to allowed destination
@@ -317,7 +288,7 @@ impl HostPolicy {
             return Err(PolicyError::TooManyHosts);
         }
         for ranges in entries.values_mut() {
-            *ranges = merge_ranges(ranges)?;
+            *ranges = merge_ranges(ranges);
         }
         Ok(Self { entries })
     }
@@ -351,7 +322,7 @@ impl HostPolicy {
 }
 
 /// Sorts and folds overlapping or adjacent ranges.
-fn merge_ranges(ranges: &[PortRange]) -> Result<Vec<PortRange>, PortRangeError> {
+fn merge_ranges(ranges: &[PortRange]) -> Vec<PortRange> {
     let mut sorted = ranges.to_vec();
     sorted.sort_unstable();
 
@@ -360,15 +331,12 @@ fn merge_ranges(ranges: &[PortRange]) -> Result<Vec<PortRange>, PortRangeError> 
         match merged.last_mut() {
             // `saturating_add` keeps adjacency well-defined at 65535.
             Some(previous) if range.start() <= previous.end().saturating_add(1) => {
-                let end = previous.end().max(range.end());
-                // Re-validate: a merged range must still exclude reserved DNS
-                // ports.
-                *previous = PortRange::new(previous.start(), end)?;
+                previous.end = previous.end().max(range.end());
             }
             _ => merged.push(range),
         }
     }
-    Ok(merged)
+    merged
 }
 
 #[cfg(test)]
@@ -420,12 +388,6 @@ mod tests {
         );
         assert_eq!(Hostname::parse("12345"), Err(HostnameError::NumericForm));
         assert_eq!(Hostname::parse("[::1]"), Err(HostnameError::LabelCharacter));
-        assert_eq!(Hostname::parse("localhost"), Err(HostnameError::Localhost));
-        assert_eq!(Hostname::parse("LOCALHOST."), Err(HostnameError::Localhost));
-        assert_eq!(
-            Hostname::parse("a.localhost"),
-            Err(HostnameError::Localhost)
-        );
     }
 
     #[test]
@@ -446,27 +408,6 @@ mod tests {
         );
         assert_eq!(at_limit.len(), 253);
         assert!(Hostname::parse(&at_limit).is_ok());
-    }
-
-    #[test]
-    fn port_ranges_reject_reserved_dns_ports() {
-        assert_eq!(
-            "53".parse::<PortRange>(),
-            Err(PortRangeError::ReservedDnsPort)
-        );
-        assert_eq!(
-            "853".parse::<PortRange>(),
-            Err(PortRangeError::ReservedDnsPort)
-        );
-        assert_eq!(
-            "50-60".parse::<PortRange>(),
-            Err(PortRangeError::ReservedDnsPort)
-        );
-        assert_eq!(
-            "1-65535".parse::<PortRange>(),
-            Err(PortRangeError::ReservedDnsPort)
-        );
-        assert!("54-852".parse::<PortRange>().is_ok());
     }
 
     #[test]
@@ -526,15 +467,15 @@ mod tests {
     }
 
     #[test]
-    fn policy_merge_never_spans_a_reserved_port() {
-        let rules = ["a.example:40-52", "a.example:54-60"]
+    fn policy_merges_adjacent_ranges() {
+        let rules = ["a.example:40-52", "a.example:53-60"]
             .into_iter()
             .map(|rule| rule.parse::<HostRule>().unwrap());
         let policy = HostPolicy::from_rules(rules).unwrap();
         let host = Hostname::parse("a.example").unwrap();
 
-        assert_eq!(policy.port_ranges(&host).len(), 2);
-        assert!(!policy.allows(&host, 53));
+        assert_eq!(policy.port_ranges(&host).len(), 1);
+        assert!(policy.allows(&host, 53));
     }
 
     #[test]

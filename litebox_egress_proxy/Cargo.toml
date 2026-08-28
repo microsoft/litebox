@@ -37,8 +37,6 @@ hyper-util = { version = "0.1.20", default-features = false, features = [
 ] }
 # Raw request-head validation before `hyper` applies RFC framing normalization.
 httparse = { version = "1.10.1", default-features = false }
-# Canonical IPv4 CIDRs for the proxy-only resolved-destination envelope.
-ipnet = { version = "2.11", default-features = false }
 thiserror = { version = "2.0", default-features = false, features = ["std"] }
 tokio = { version = "1.50", default-features = false, features = [
     "io-util",

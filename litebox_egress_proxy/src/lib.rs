@@ -7,12 +7,10 @@
 //! # Model
 //!
 //! The proxy is a separate trusted process. It authorizes each request against
-//! an immutable, exact-hostname policy and connects only to addresses that were
-//! resolved through one explicitly configured DNS server before the listener
-//! was announced as ready. It never consults the host resolver configuration,
-//! never re-resolves a hostname, and never grants direct access to a resolved
-//! address: a hostname rule authorizes an endpoint reached through this proxy
-//! and nothing else.
+//! an immutable, exact-hostname policy, resolves an authorized hostname through
+//! one explicitly configured DNS server, and connects to a returned numeric
+//! address. It never consults the host resolver configuration, and a hostname
+//! rule authorizes an endpoint reached through this proxy and nothing else.
 //!
 //! Two request forms are supported:
 //!
@@ -41,23 +39,20 @@
 //!     --allow-host HOST:PORT[-PORT] ...
 //! ```
 //!
-//! After the listener is acquired, every policy hostname is resolved, and all
-//! startup validation has passed, exactly one line is written to standard
-//! output:
+//! After the listener and configured DNS resolver are ready, exactly one line
+//! is written to standard output:
 //!
 //! ```text
 //! READY 127.0.0.1:PORT
 //! ```
 //!
 //! Diagnostics go to standard error only, and no readiness line is written on
-//! failure. Startup as a whole is bounded by [`limits::STARTUP_BUDGET`].
+//! failure.
 //!
 //! # Testing
 //!
 //! [`dns::HostResolver`] and [`upstream::UpstreamConnector`] are injected
 //! abstractions, so the request path can be driven hermetically over loopback.
-//! The shared pinning path applies the same destination policy to production
-//! and injected DNS answers.
 
 pub mod authority;
 pub mod config;
@@ -78,11 +73,9 @@ use std::sync::Arc;
 
 use thiserror::Error;
 use tokio::net::TcpListener;
-use tokio::time::timeout;
 
 use crate::config::ProxyConfig;
-use crate::dns::{ConfiguredDnsResolver, PinError, PinnedTable, ResolveError};
-use crate::limits::STARTUP_BUDGET;
+use crate::dns::{ConfiguredDnsResolver, ResolveError};
 use crate::listener::ListenerError;
 use crate::proxy::ProxyState;
 use crate::upstream::TcpUpstreamConnector;
@@ -96,12 +89,6 @@ pub enum StartupError {
     /// The resolver could not be constructed.
     #[error("failed to configure the DNS resolver: {0}")]
     Resolver(#[from] ResolveError),
-    /// A policy hostname could not be pinned.
-    #[error(transparent)]
-    Pin(#[from] PinError),
-    /// Startup exceeded its total budget.
-    #[error("startup exceeded its {}s budget", STARTUP_BUDGET.as_secs())]
-    Budget,
     /// An I/O operation failed during startup or while serving.
     #[error(transparent)]
     Io(#[from] io::Error),
@@ -126,12 +113,11 @@ impl StartedProxy {
     }
 }
 
-/// Acquires the listener, pins every policy hostname, and prepares the shared
-/// state.
+/// Acquires the listener and prepares the shared state.
 ///
 /// No client connection is served and no readiness line is written until this
 /// has succeeded, so a partially configured proxy is never observable.
-pub async fn start(config: &ProxyConfig) -> Result<StartedProxy, StartupError> {
+pub fn start(config: &ProxyConfig) -> Result<StartedProxy, StartupError> {
     let listener = listener::acquire(config.listener)?;
     let listener = TcpListener::from_std(listener)?;
     let SocketAddr::V4(local_address) = listener.local_addr()? else {
@@ -140,12 +126,9 @@ pub async fn start(config: &ProxyConfig) -> Result<StartedProxy, StartupError> {
         )));
     };
 
-    let resolver = ConfiguredDnsResolver::new(config.dns_server)?;
-    let pinned = PinnedTable::resolve(&config.policy, &config.targets, Arc::new(resolver)).await?;
-
     let state = Arc::new(ProxyState::new(
         config.policy.clone(),
-        pinned,
+        Arc::new(ConfiguredDnsResolver::new(config.dns_server)?),
         Arc::new(TcpUpstreamConnector),
     ));
 
@@ -166,11 +149,9 @@ pub fn write_readiness(writer: &mut impl Write, address: SocketAddrV4) -> io::Re
     writer.flush()
 }
 
-/// Runs the proxy: bounded startup, readiness announcement, then serving.
+/// Runs the proxy: startup, readiness announcement, then serving.
 pub async fn run(config: &ProxyConfig) -> Result<(), StartupError> {
-    let started = timeout(STARTUP_BUDGET, start(config))
-        .await
-        .map_err(|_elapsed| StartupError::Budget)??;
+    let started = start(config)?;
 
     let mut stdout = io::stdout().lock();
     write_readiness(&mut stdout, started.local_address())?;

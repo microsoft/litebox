@@ -1739,7 +1739,6 @@ dependencies = [
  "httparse",
  "hyper",
  "hyper-util",
- "ipnet",
  "libc",
  "thiserror",
  "tokio",

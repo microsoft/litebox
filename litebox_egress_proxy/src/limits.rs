@@ -11,11 +11,8 @@ use core::time::Duration;
 /// Maximum number of distinct canonical hostnames in the policy.
 pub const MAX_HOST_RULES: usize = 64;
 
-/// Maximum number of pinned IPv4 addresses retained per hostname.
-pub const MAX_PINNED_ADDRESSES_PER_HOST: usize = 16;
-
-/// Maximum number of additional proxy-only resolved-destination CIDRs.
-pub const MAX_RESOLVED_DESTINATION_RULES: usize = 64;
+/// Maximum number of IPv4 addresses used from one DNS answer.
+pub const MAX_RESOLVED_ADDRESSES: usize = 16;
 
 /// Maximum number of client connections served concurrently.
 ///
@@ -37,10 +34,7 @@ pub const MAX_HEADER_FIELDS: usize = 100;
 /// back to TCP.
 pub const MAX_UDP_DNS_RESPONSE_BYTES: u16 = 1232;
 
-/// Maximum number of hostname resolutions performed concurrently at startup.
-pub const MAX_CONCURRENT_STARTUP_RESOLUTIONS: usize = 16;
-
-/// Per-hostname DNS resolution timeout.
+/// Total timeout for one on-demand hostname resolution.
 pub const DNS_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Timeout for one DNS transport attempt within a hostname lookup.
@@ -49,15 +43,7 @@ pub const DNS_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 /// fall back from UDP to TCP before the whole hostname lookup expires.
 pub const DNS_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Total startup budget, covering listener acquisition and every resolution.
-pub const STARTUP_BUDGET: Duration = Duration::from_secs(30);
-
-const _: () = assert!(
-    MAX_HOST_RULES.div_ceil(MAX_CONCURRENT_STARTUP_RESOLUTIONS) <= 5
-        && DNS_QUERY_TIMEOUT.as_secs() * 5 < STARTUP_BUDGET.as_secs()
-);
-
-/// Total timeout shared by all pinned-address connection attempts.
+/// Total timeout shared by all resolved-address connection attempts.
 pub const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Idle timeout applied to HTTP bodies and CONNECT tunnels.

@@ -4,11 +4,8 @@
 //! Hermetic loopback tests for the proxy request path.
 //!
 //! The tests inject a [`HostResolver`] and an [`UpstreamConnector`] instead of
-//! touching DNS or the network. The injected resolver answers with ordinary
-//! globally routable addresses, so the pinned table is built under exactly the
-//! production address rules, and only the injected connector maps those pinned
-//! addresses onto loopback test servers. No production validation is relaxed
-//! for these tests.
+//! touching DNS or external networks. Only the injected connector maps
+//! resolved addresses onto loopback test servers.
 
 use std::collections::HashMap;
 use std::io;
@@ -17,9 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use litebox_egress_proxy::dns::{
-    HostResolver, PinnedTable, ResolveError, ResolveFuture, TargetPolicy,
-};
+use litebox_egress_proxy::dns::{HostResolver, ResolveError, ResolveFuture};
 use litebox_egress_proxy::listener::{ListenerSource, acquire};
 use litebox_egress_proxy::policy::{HostPolicy, HostRule, Hostname};
 use litebox_egress_proxy::proxy::{ProxyState, serve};
@@ -35,10 +30,12 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// A resolver with a fixed, hermetic answer table.
 struct StaticResolver {
     answers: HashMap<Hostname, Vec<Ipv4Addr>>,
+    resolutions: Arc<AtomicUsize>,
 }
 
 impl HostResolver for StaticResolver {
     fn resolve(&self, host: Hostname) -> ResolveFuture<'_> {
+        self.resolutions.fetch_add(1, Ordering::SeqCst);
         let answer = self
             .answers
             .get(&host)
@@ -48,7 +45,7 @@ impl HostResolver for StaticResolver {
     }
 }
 
-/// A connector that routes pinned addresses to loopback test servers.
+/// A connector that routes resolved addresses to loopback test servers.
 struct LoopbackConnector {
     routes: HashMap<SocketAddrV4, SocketAddr>,
     attempts: Arc<AtomicUsize>,
@@ -72,15 +69,15 @@ impl UpstreamConnector for LoopbackConnector {
 struct TestProxy {
     address: SocketAddrV4,
     attempts: Arc<AtomicUsize>,
+    resolutions: Arc<AtomicUsize>,
 }
 
 impl TestProxy {
     /// Starts a proxy with `rules` in force, routing `routes` to loopback.
     ///
-    /// Every policy hostname resolves to a distinct globally routable address
-    /// that satisfies the production address rules, and only the listed
-    /// `(host, port)` pairs have a working upstream.
-    async fn start(rules: &[&str], routes: &[(&str, u16, SocketAddr)]) -> Self {
+    /// Every policy hostname resolves to a distinct address, and only the
+    /// listed `(host, port)` pairs have a working upstream.
+    fn start(rules: &[&str], routes: &[(&str, u16, SocketAddr)]) -> Self {
         let policy = HostPolicy::from_rules(
             rules
                 .iter()
@@ -98,22 +95,25 @@ impl TestProxy {
         let mut mapped = HashMap::new();
         for (host, port, address) in routes {
             let host = Hostname::parse(host).expect("valid hostname");
-            let pinned = answers.get(&host).expect("routed host is in policy")[0];
-            mapped.insert(SocketAddrV4::new(pinned, *port), *address);
+            let resolved = answers.get(&host).expect("routed host is in policy")[0];
+            mapped.insert(SocketAddrV4::new(resolved, *port), *address);
         }
 
-        let resolver = StaticResolver { answers };
-        let pinned =
-            PinnedTable::resolve(&policy, &TargetPolicy::public_only(), Arc::new(resolver))
-                .await
-                .expect("hermetic resolution succeeds");
-
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        let resolver = StaticResolver {
+            answers,
+            resolutions: Arc::clone(&resolutions),
+        };
         let attempts = Arc::new(AtomicUsize::new(0));
         let connector = LoopbackConnector {
             routes: mapped,
             attempts: Arc::clone(&attempts),
         };
-        let state = Arc::new(ProxyState::new(policy, pinned, Arc::new(connector)));
+        let state = Arc::new(ProxyState::new(
+            policy,
+            Arc::new(resolver),
+            Arc::new(connector),
+        ));
 
         let listener = acquire(ListenerSource::Bind(SocketAddrV4::new(
             Ipv4Addr::LOCALHOST,
@@ -129,12 +129,21 @@ impl TestProxy {
             let _ = serve(listener, state).await;
         });
 
-        Self { address, attempts }
+        Self {
+            address,
+            attempts,
+            resolutions,
+        }
     }
 
     /// Number of upstream connection attempts made so far.
     fn upstream_attempts(&self) -> usize {
         self.attempts.load(Ordering::SeqCst)
+    }
+
+    /// Number of hostname resolutions made so far.
+    fn resolutions(&self) -> usize {
+        self.resolutions.load(Ordering::SeqCst)
     }
 
     /// Opens a client connection to the proxy.
@@ -335,8 +344,7 @@ async fn forward_request_is_rewritten_and_relayed() {
     let proxy = TestProxy::start(
         &["allowed.example:80"],
         &[("allowed.example", 80, upstream)],
-    )
-    .await;
+    );
 
     let response = proxy
         .request(concat!(
@@ -373,13 +381,31 @@ async fn forward_request_is_rewritten_and_relayed() {
 }
 
 #[tokio::test]
+async fn allowed_hostname_is_resolved_for_each_request() {
+    let (upstream, _requests) = recording_upstream(OK_RESPONSE).await;
+    let proxy = TestProxy::start(
+        &["allowed.example:80"],
+        &[("allowed.example", 80, upstream)],
+    );
+
+    for _ in 0..2 {
+        let response = proxy
+            .request("GET http://allowed.example/ HTTP/1.1\r\nHost: allowed.example\r\n\r\n")
+            .await;
+        assert_eq!(response.status, 200);
+    }
+
+    assert_eq!(proxy.resolutions(), 2);
+    assert_eq!(proxy.upstream_attempts(), 2);
+}
+
+#[tokio::test]
 async fn empty_absolute_path_with_query_is_normalized() {
     let (upstream, mut requests) = recording_upstream(OK_RESPONSE).await;
     let proxy = TestProxy::start(
         &["allowed.example:80"],
         &[("allowed.example", 80, upstream)],
-    )
-    .await;
+    );
 
     let response = proxy
         .request("GET http://allowed.example?query=1 HTTP/1.1\r\nHost: allowed.example\r\n\r\n")
@@ -399,8 +425,7 @@ async fn forward_request_body_is_relayed() {
     let proxy = TestProxy::start(
         &["allowed.example:8080"],
         &[("allowed.example", 8080, upstream)],
-    )
-    .await;
+    );
 
     let response = proxy
         .request(concat!(
@@ -436,14 +461,14 @@ async fn disallowed_host_is_denied_without_upstream_activity() {
     let proxy = TestProxy::start(
         &["allowed.example:80"],
         &[("allowed.example", 80, upstream)],
-    )
-    .await;
+    );
 
     let response = proxy
         .request("GET http://denied.example/ HTTP/1.1\r\nHost: denied.example\r\n\r\n")
         .await;
 
     assert_eq!(response.status, 403);
+    assert_eq!(proxy.resolutions(), 0);
     assert_eq!(proxy.upstream_attempts(), 0);
 }
 
@@ -453,8 +478,7 @@ async fn denied_request_body_is_drained_before_close() {
     let proxy = TestProxy::start(
         &["allowed.example:80"],
         &[("allowed.example", 80, upstream)],
-    )
-    .await;
+    );
 
     let body = "x".repeat(32 * 1024);
     let request = format!(
@@ -480,32 +504,32 @@ async fn disallowed_port_is_denied() {
     let proxy = TestProxy::start(
         &["allowed.example:80"],
         &[("allowed.example", 80, upstream)],
-    )
-    .await;
+    );
 
     let response = proxy
         .request("GET http://allowed.example:8443/ HTTP/1.1\r\nHost: allowed.example:8443\r\n\r\n")
         .await;
 
     assert_eq!(response.status, 403);
+    assert_eq!(proxy.resolutions(), 0);
     assert_eq!(proxy.upstream_attempts(), 0);
 }
 
 #[tokio::test]
-async fn reserved_dns_port_is_denied() {
+async fn explicitly_allowed_dns_port_is_forwarded() {
     let (upstream, _requests) = recording_upstream(OK_RESPONSE).await;
     let proxy = TestProxy::start(
-        &["allowed.example:80"],
-        &[("allowed.example", 80, upstream)],
-    )
-    .await;
+        &["allowed.example:53"],
+        &[("allowed.example", 53, upstream)],
+    );
 
     let response = proxy
-        .request("CONNECT allowed.example:53 HTTP/1.1\r\nHost: allowed.example:53\r\n\r\n")
+        .request("GET http://allowed.example:53/ HTTP/1.1\r\nHost: allowed.example:53\r\n\r\n")
         .await;
 
-    assert_eq!(response.status, 403);
-    assert_eq!(proxy.upstream_attempts(), 0);
+    assert_eq!(response.status, 200);
+    assert_eq!(proxy.resolutions(), 1);
+    assert_eq!(proxy.upstream_attempts(), 1);
 }
 
 #[tokio::test]
@@ -514,8 +538,7 @@ async fn malformed_and_unsupported_requests_are_rejected() {
     let proxy = TestProxy::start(
         &["allowed.example:80"],
         &[("allowed.example", 80, upstream)],
-    )
-    .await;
+    );
 
     // Host header disagreeing with the request target.
     let mismatched = proxy
@@ -599,8 +622,7 @@ async fn upgrade_request_is_rejected() {
     let proxy = TestProxy::start(
         &["allowed.example:80"],
         &[("allowed.example", 80, upstream)],
-    )
-    .await;
+    );
 
     let response = proxy
         .request(concat!(
@@ -617,8 +639,8 @@ async fn upgrade_request_is_rejected() {
 
 #[tokio::test]
 async fn unreachable_upstream_yields_bad_gateway() {
-    // The hostname is allowed and pinned, but nothing routes its address.
-    let proxy = TestProxy::start(&["allowed.example:80"], &[]).await;
+    // The hostname is allowed and resolved, but nothing routes its address.
+    let proxy = TestProxy::start(&["allowed.example:80"], &[]);
 
     let response = proxy
         .request("GET http://allowed.example/ HTTP/1.1\r\nHost: allowed.example\r\n\r\n")
@@ -634,8 +656,7 @@ async fn connect_tunnel_relays_bytes() {
     let proxy = TestProxy::start(
         &["allowed.example:443"],
         &[("allowed.example", 443, upstream)],
-    )
-    .await;
+    );
 
     let mut client = proxy.connect().await;
     client
@@ -671,8 +692,7 @@ async fn connect_requests_are_validated() {
     let proxy = TestProxy::start(
         &["allowed.example:443"],
         &[("allowed.example", 443, upstream)],
-    )
-    .await;
+    );
 
     let denied = proxy
         .request("CONNECT denied.example:443 HTTP/1.1\r\nHost: denied.example:443\r\n\r\n")
@@ -703,8 +723,7 @@ async fn denied_connect_early_bytes_are_drained_before_close() {
     let proxy = TestProxy::start(
         &["allowed.example:443"],
         &[("allowed.example", 443, upstream)],
-    )
-    .await;
+    );
 
     let early = "x".repeat(32 * 1024);
     let request = format!(
@@ -728,8 +747,7 @@ async fn each_connection_serves_one_independently_authorized_request() {
     let proxy = TestProxy::start(
         &["allowed.example:80"],
         &[("allowed.example", 80, upstream)],
-    )
-    .await;
+    );
 
     let mut client = proxy.connect().await;
     client
@@ -778,8 +796,7 @@ async fn malformed_header_syntax_is_rejected() {
     let proxy = TestProxy::start(
         &["allowed.example:80"],
         &[("allowed.example", 80, upstream)],
-    )
-    .await;
+    );
 
     // Whitespace before a header colon.
     let spaced = proxy
@@ -807,8 +824,7 @@ async fn oversized_request_head_is_bounded() {
     let proxy = TestProxy::start(
         &["allowed.example:80"],
         &[("allowed.example", 80, upstream)],
-    )
-    .await;
+    );
 
     let mut request =
         String::from("GET http://allowed.example/ HTTP/1.1\r\nHost: allowed.example\r\nX-Big: ");
@@ -828,8 +844,7 @@ async fn http_1_0_requests_are_forwarded_as_http_1_1() {
     let proxy = TestProxy::start(
         &["allowed.example:80"],
         &[("allowed.example", 80, upstream)],
-    )
-    .await;
+    );
 
     let response = proxy
         .request("GET http://allowed.example/legacy HTTP/1.0\r\n\r\n")

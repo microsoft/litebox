@@ -12,7 +12,6 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use clap::{ArgGroup, Parser};
 use thiserror::Error;
 
-use crate::dns::{TargetPolicy, TargetPolicyError, is_permitted_dns_server_ipv4};
 use crate::listener::ListenerSource;
 use crate::policy::{HostPolicy, HostRule, HostRuleError, PolicyError, parse_port};
 
@@ -46,13 +45,6 @@ pub struct Cli {
     /// Allowed hostname and destination ports, repeatable.
     #[arg(long = "allow-host", value_name = "HOST:PORT[-PORT]")]
     allow_host: Vec<String>,
-
-    /// Additional proxy-only CIDRs to which policy hostnames may resolve.
-    ///
-    /// Public IPv4 targets are permitted by default. This option deliberately
-    /// does not grant the guest direct access to the CIDR.
-    #[arg(long = "allow-resolved-destination", value_name = "CIDR")]
-    allow_resolved_destination: Vec<String>,
 }
 
 /// Reason the arguments were rejected.
@@ -67,24 +59,12 @@ pub enum ConfigError {
     /// `--dns-server` was not an IPv4 address with an optional port.
     #[error("--dns-server must be an IPv4 address with an optional port")]
     DnsServerAddress,
-    /// `--dns-server` was not an externally usable unicast address.
-    #[error(
-        "--dns-server must be a non-loopback unicast IPv4 address; unspecified, multicast, \
-         broadcast, and reserved addresses are rejected"
-    )]
-    DnsServerNotExternal,
     /// An `--allow-host` rule was invalid.
     #[error("invalid --allow-host rule: {0}")]
     Rule(#[from] HostRuleError),
     /// The rules could not be combined into a policy.
     #[error("invalid policy: {0}")]
     Policy(#[from] PolicyError),
-    /// A proxy-only resolved-destination CIDR was invalid.
-    #[error("invalid --allow-resolved-destination CIDR: {0}")]
-    ResolvedDestination(String),
-    /// Too many resolved-destination CIDRs were configured.
-    #[error("invalid resolved-destination policy: {0}")]
-    TargetPolicy(#[from] TargetPolicyError),
 }
 
 /// The validated configuration of one proxy process.
@@ -92,12 +72,10 @@ pub enum ConfigError {
 pub struct ProxyConfig {
     /// Where the listener comes from.
     pub listener: ListenerSource,
-    /// The single DNS server used for startup resolution.
+    /// The single DNS server used for request resolution.
     pub dns_server: SocketAddrV4,
     /// The immutable hostname policy.
     pub policy: HostPolicy,
-    /// Permitted resolved upstream addresses.
-    pub targets: TargetPolicy,
 }
 
 impl Cli {
@@ -117,33 +95,13 @@ impl Cli {
             rules.push(rule.parse::<HostRule>()?);
         }
         let policy = HostPolicy::from_rules(rules)?;
-        let targets = TargetPolicy::new(
-            self.allow_resolved_destination
-                .iter()
-                .map(|cidr| parse_resolved_destination(cidr))
-                .collect::<Result<Vec<_>, _>>()?,
-        )?;
 
         Ok(ProxyConfig {
             listener,
             dns_server,
             policy,
-            targets,
         })
     }
-}
-
-/// Parses one canonical proxy-only resolved-destination CIDR.
-fn parse_resolved_destination(raw: &str) -> Result<ipnet::Ipv4Net, ConfigError> {
-    let network: ipnet::Ipv4Net = raw
-        .parse()
-        .map_err(|error| ConfigError::ResolvedDestination(format!("{raw}: {error}")))?;
-    if network.addr() != network.network() {
-        return Err(ConfigError::ResolvedDestination(format!(
-            "{raw}: network address contains host bits"
-        )));
-    }
-    Ok(network)
 }
 
 /// Parses `--listen`, which is restricted to canonical IPv4 loopback.
@@ -156,10 +114,6 @@ fn parse_listen_address(raw: &str) -> Result<SocketAddrV4, ConfigError> {
 }
 
 /// Parses `--dns-server`, which accepts an optional port.
-///
-/// The server must be an externally usable unicast IPv4 address. Private and
-/// link-local servers are accepted because this address is selected directly
-/// by the trusted operator rather than learned from an untrusted DNS answer.
 fn parse_dns_server(raw: &str) -> Result<SocketAddrV4, ConfigError> {
     let (address, port) = match raw.split_once(':') {
         Some((address, port)) => (
@@ -170,9 +124,6 @@ fn parse_dns_server(raw: &str) -> Result<SocketAddrV4, ConfigError> {
     };
 
     let address: Ipv4Addr = address.parse().map_err(|_| ConfigError::DnsServerAddress)?;
-    if !is_permitted_dns_server_ipv4(address) {
-        return Err(ConfigError::DnsServerNotExternal);
-    }
     Ok(SocketAddrV4::new(address, port))
 }
 
@@ -199,8 +150,6 @@ mod tests {
             "Example.COM:443",
             "--allow-host",
             "example.com:8000-8100",
-            "--allow-resolved-destination",
-            "10.0.0.0/8",
         ])
         .unwrap();
 
@@ -218,7 +167,6 @@ mod tests {
         assert!(config.policy.allows(&host, 443));
         assert!(config.policy.allows(&host, 8100));
         assert!(!config.policy.allows(&host, 80));
-        assert!(config.targets.allows(Ipv4Addr::new(10, 1, 2, 3)));
     }
 
     #[test]
@@ -263,52 +211,17 @@ mod tests {
     }
 
     #[test]
-    fn accepts_explicit_private_dns_servers_but_rejects_invalid_endpoints() {
+    fn accepts_operator_selected_dns_servers_but_rejects_invalid_endpoints() {
         assert!(parse(&["--listen", "127.0.0.1:0", "--dns-server", "10.0.0.1"]).is_ok());
         assert!(parse(&["--listen", "127.0.0.1:0", "--dns-server", "169.254.169.253",]).is_ok());
-
-        for server in ["127.0.0.1:5353", "224.0.0.1", "240.0.0.1", "0.0.0.0"] {
-            assert!(
-                matches!(
-                    parse(&["--listen", "127.0.0.1:0", "--dns-server", server]),
-                    Err(ConfigError::DnsServerNotExternal)
-                ),
-                "{server} must be rejected"
-            );
-        }
+        assert!(parse(&["--listen", "127.0.0.1:0", "--dns-server", "127.0.0.1:5353"]).is_ok());
         assert!(matches!(
             parse(&["--listen", "127.0.0.1:0", "--dns-server", "not-an-address"]),
             Err(ConfigError::DnsServerAddress)
         ));
-    }
-
-    #[test]
-    fn rejects_reserved_dns_ports_in_rules() {
         assert!(matches!(
-            parse(&[
-                "--listen",
-                "127.0.0.1:0",
-                "--dns-server",
-                "9.9.9.9",
-                "--allow-host",
-                "example.com:853",
-            ]),
-            Err(ConfigError::Rule(_))
-        ));
-    }
-
-    #[test]
-    fn rejects_invalid_resolved_destination_cidr() {
-        assert!(matches!(
-            parse(&[
-                "--listen",
-                "127.0.0.1:0",
-                "--dns-server",
-                "9.9.9.9",
-                "--allow-resolved-destination",
-                "10.0.0.1/8",
-            ]),
-            Err(ConfigError::ResolvedDestination(_))
+            parse(&["--listen", "127.0.0.1:0", "--dns-server", "9.9.9.9:0"]),
+            Err(ConfigError::DnsServerAddress)
         ));
     }
 }

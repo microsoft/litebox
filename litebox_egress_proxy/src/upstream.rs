@@ -3,10 +3,9 @@
 
 //! Upstream connection abstraction.
 //!
-//! Request handling only ever dials an address that came from the immutable
-//! startup resolution table. The connector is an injected abstraction so that
-//! tests can drive the proxy against loopback services without relaxing the
-//! address validation that the production resolver performs.
+//! Request handling dials numeric addresses returned by the configured
+//! resolver. The connector is an injected abstraction so tests can drive the
+//! proxy against loopback services without external network access.
 
 use core::future::Future;
 use core::pin::Pin;
@@ -28,9 +27,9 @@ pub type BoxedUpstreamStream = Box<dyn UpstreamStream>;
 pub type ConnectFuture<'a> =
     Pin<Box<dyn Future<Output = io::Result<BoxedUpstreamStream>> + Send + 'a>>;
 
-/// Opens upstream TCP connections to pinned addresses.
+/// Opens upstream TCP connections to resolved addresses.
 pub trait UpstreamConnector: Send + Sync + 'static {
-    /// Connects to `target`, which is always a pinned address combined with an
+    /// Connects to `target`, which combines a resolved address with an
     /// authorized destination port.
     fn connect(&self, target: SocketAddrV4) -> ConnectFuture<'_>;
 }
