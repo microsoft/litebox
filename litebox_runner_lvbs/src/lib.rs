@@ -323,7 +323,12 @@ fn vsm_dispatch(func_id: VsmFunction, params: &[u64]) -> i64 {
         }
         VsmFunction::ExchangeSecrets => vtl1
             .set_platform_root_key(params[0])
-            .and_then(|()| vtl1.set_crng_seed(params[0] + PRK_LEN as u64))
+            .and_then(|()| {
+                params[0]
+                    .checked_add(PRK_LEN as u64)
+                    .ok_or(VsmError::IntegerOverflow)
+            })
+            .and_then(|crng_seed_pa| vtl1.set_crng_seed(crng_seed_pa))
             .map(|()| 0),
         VsmFunction::OpteeMessage => Err(VsmError::OperationNotSupported("OP-TEE communication")),
     };
