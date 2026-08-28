@@ -569,6 +569,11 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         performance_counter: Platform::RawMutPointer<i64>,
         performance_frequency: Option<Platform::RawMutPointer<i64>>,
     },
+    NtQueryTimerResolution {
+        minimum_resolution: Platform::RawMutPointer<u32>,
+        maximum_resolution: Platform::RawMutPointer<u32>,
+        current_resolution: Platform::RawMutPointer<u32>,
+    },
     NtQueryLicenseValue {
         value_name: Platform::RawConstPointer<nt_types::UnicodeString>,
         value_type: Platform::RawMutPointer<u32>,
@@ -1332,6 +1337,11 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
             NtSysno::NtQueryPerformanceCounter => Some(sys_req!(NtQueryPerformanceCounter {
                 performance_counter:*,
                 performance_frequency:*,
+            })),
+            NtSysno::NtQueryTimerResolution => Some(sys_req!(NtQueryTimerResolution {
+                minimum_resolution:*,
+                maximum_resolution:*,
+                current_resolution:*,
             })),
             NtSysno::NtQueryLicenseValue => Some(sys_req!(NtQueryLicenseValue {
                 value_name:*,

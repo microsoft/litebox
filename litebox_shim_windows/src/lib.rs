@@ -1744,6 +1744,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 performance_counter,
                 performance_frequency,
             } => self.sys_nt_query_performance_counter(performance_counter, performance_frequency),
+            SyscallRequest::NtQueryTimerResolution {
+                minimum_resolution,
+                maximum_resolution,
+                current_resolution,
+            } => Self::sys_nt_query_timer_resolution(
+                minimum_resolution,
+                maximum_resolution,
+                current_resolution,
+            ),
             SyscallRequest::NtQueryLicenseValue {
                 value_name,
                 value_type,
