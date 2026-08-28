@@ -251,6 +251,13 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
         })?;
         let status = response.status;
         self.apply_socket_status(response);
+        if let SocketConnectionStatus::Failed(error) = status {
+            let error = error.into();
+            let failed = self.consume_synchronous_error_locked(error);
+            drop(configuration);
+            self.notify_synchronous_error_consumed(failed);
+            return Err(ConnectError::OperationFailed(error));
+        }
         drop(configuration);
         self.handle_connect_status(status, None)
     }
@@ -630,6 +637,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
 
     fn consume_synchronous_error(&self, synchronous_error: SocketAsyncError) {
         let configuration = self.configuration_lock.lock();
+        let failed = self.consume_synchronous_error_locked(synchronous_error);
+        drop(configuration);
+        self.notify_synchronous_error_consumed(failed);
+    }
+
+    fn consume_synchronous_error_locked(&self, synchronous_error: SocketAsyncError) -> bool {
         let mut matched = self.state.lock().remove_async_error(synchronous_error);
         for _ in 0..2 {
             if self.closed.load(Ordering::Acquire) {
@@ -681,7 +694,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
         let state = self.state.lock();
         let failed = matches!(state.connection, SocketConnectionStatus::Failed(_));
         drop(state);
-        drop(configuration);
+        failed
+    }
+
+    fn notify_synchronous_error_consumed(&self, failed: bool) {
         self.pollee.wake_observers();
         if failed {
             self.pollee
