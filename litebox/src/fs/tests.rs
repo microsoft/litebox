@@ -54,7 +54,7 @@ fn overlay_fs(
 mod in_mem {
     use crate::LiteBox;
     use crate::fs::in_mem;
-    use crate::fs::{FileSystem as _, Mode, OFlags};
+    use crate::fs::{Mode, OFlags};
     use crate::platform::mock::MockPlatform;
     use alloc::vec;
     use alloc::vec::Vec;
@@ -1020,7 +1020,7 @@ mod in_mem {
 
 mod tar_ro {
     use crate::LiteBox;
-    use crate::fs::{FileSystem as _, Mode, OFlags};
+    use crate::fs::{Mode, OFlags};
     use crate::platform::mock::MockPlatform;
     use alloc::vec;
     use alloc::vec::Vec;
@@ -1191,7 +1191,7 @@ mod tar_ro {
 mod overlay {
     use crate::LiteBox;
     use crate::fs::in_mem::{InMem, InitialNode};
-    use crate::fs::{FileSystem as _, FileType, Mode, OFlags, UserInfo};
+    use crate::fs::{FileType, Mode, OFlags, UserInfo};
     use crate::platform::mock::MockPlatform;
     use alloc::vec;
     use alloc::vec::Vec;
@@ -1947,7 +1947,7 @@ mod stdio {
     use crate::LiteBox;
     use crate::fs::devices::Devices;
     use crate::fs::resolver::Resolver;
-    use crate::fs::{FileSystem as _, Mode, OFlags};
+    use crate::fs::{Mode, OFlags};
     use crate::platform::mock::MockPlatform;
     use alloc::vec;
     extern crate std;
@@ -2032,7 +2032,7 @@ mod composed_stdio {
     use crate::fs::devices::Devices;
     use crate::fs::in_mem::{InMem, InitialNode};
     use crate::fs::resolver::Resolver;
-    use crate::fs::{FileSystem as _, Mode, OFlags, UserInfo};
+    use crate::fs::{Mode, OFlags, UserInfo};
     use crate::platform::mock::MockPlatform;
     use alloc::vec;
     extern crate std;

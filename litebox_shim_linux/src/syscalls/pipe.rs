@@ -17,7 +17,7 @@ use litebox::{
 };
 use litebox_common_linux::{FileDescriptorFlags, InodeType, errno::Errno};
 
-use crate::{GlobalState, ShimFS, ShimPlatform};
+use crate::{GlobalState, ShimPlatform};
 
 const DEFAULT_PIPE_BUF_SIZE: usize = 64 * 1024;
 
@@ -38,7 +38,7 @@ pub(crate) struct LinuxPipeEnds<Platform: ShimPlatform> {
     pub(crate) writer: PipeFd<Platform>,
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
+impl<Platform: ShimPlatform> GlobalState<Platform> {
     pub(crate) fn create_linux_pipe(
         &self,
         flags: OFlags,

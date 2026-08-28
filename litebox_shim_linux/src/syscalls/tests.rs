@@ -68,7 +68,7 @@ fn test_broker() -> &'static BrokerCore {
 }
 
 #[must_use]
-pub(crate) fn init_platform() -> crate::Task<TestPlatform, crate::DefaultFS<TestPlatform>> {
+pub(crate) fn init_platform() -> crate::Task<TestPlatform> {
     let platform = test_platform();
 
     init_platform_with_builder(crate::LinuxShimBuilder::new(platform))

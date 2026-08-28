@@ -14,7 +14,6 @@ use litebox::{
 };
 use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
 
-use crate::ShimFS;
 use crate::ShimPlatform;
 use crate::Task;
 use crate::UserPtrMut;
@@ -168,7 +167,7 @@ fn align_down(addr: usize, align: usize) -> usize {
     addr & !(align - 1)
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     #[inline]
     fn do_mmap(
         &self,
