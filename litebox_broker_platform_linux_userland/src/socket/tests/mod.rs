@@ -17,6 +17,7 @@ use litebox_broker_core::{
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::socket::{Ipv4Address, Port, ReceiveSocketResponse};
 
+use super::tcp::TcpPendingErrors;
 use super::udp::{
     MAX_REJECTED_UDP_DATAGRAMS_PER_COMMAND, MAX_UDP_EXTERNAL_PEERS_PER_SOCKET,
     MAX_UDP_NATIVE_RECEIVE_BUFFER, MAX_UDP_QUEUE_DATAGRAMS_PER_SOURCE,
@@ -26,6 +27,22 @@ mod tcp;
 mod udp;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[test]
+fn tcp_pending_errors_preserve_order_and_source() {
+    let mut errors = TcpPendingErrors::default();
+    errors.append(TcpPendingError::Socket(SocketError::ConnectionReset));
+    errors.append(TcpPendingError::GuestReset);
+    errors.append(TcpPendingError::GuestReset);
+
+    assert!(errors.contains_guest_reset());
+    assert_eq!(
+        errors.take(),
+        Some(TcpPendingError::Socket(SocketError::ConnectionReset))
+    );
+    assert_eq!(errors.take(), Some(TcpPendingError::GuestReset));
+    assert!(errors.is_empty());
+}
 
 fn gateway_tcp_policy() -> SocketPolicy {
     SocketPolicy::guest_network()

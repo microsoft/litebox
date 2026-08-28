@@ -42,7 +42,7 @@ mod udp;
 #[cfg(test)]
 use tcp::TcpDescriptor;
 use tcp::{
-    AcceptedEndpoints, ReactorReceiveOutcome, ReactorTcpState, TcpSocketState,
+    AcceptedEndpoints, ReactorReceiveOutcome, ReactorTcpState, TcpPendingError, TcpSocketState,
     consume_pending_guest_reset, create_tcp_transport, guest_reset_pending, handle_socket_event,
 };
 use udp::{
@@ -1956,40 +1956,34 @@ fn status_socket(socket: &mut SocketEntry) -> BrokerResult<PlatformSocketStatus>
     let query_socket_error = socket.connection_status == SocketConnectionStatus::Connected
         && socket.snapshot.load().contains(ReadinessFlags::ERROR);
     if query_socket_error && let Some(error) = take_socket_error(socket)? {
-        if socket.pending_error.is_none() {
-            socket.pending_error = Some(error);
-        } else if socket.tcp_state()?.next_pending_error.is_none() {
-            socket.tcp_state_mut()?.next_pending_error = Some(error);
-        }
+        socket
+            .tcp_state_mut()?
+            .pending_errors
+            .append(TcpPendingError::Socket(error));
     }
     let pending_guest_reset = guest_reset_pending(socket)?;
     let status = socket.connection_status;
     let local_address = socket.guest_local_address;
-    if pending_guest_reset
-        && socket.pending_error != Some(SocketError::ConnectionReset)
-        && socket.tcp_state()?.next_pending_error != Some(SocketError::ConnectionReset)
-    {
-        if socket.pending_error.is_none() {
-            socket.pending_error = Some(SocketError::ConnectionReset);
-        } else if socket.tcp_state()?.next_pending_error.is_none() {
-            socket.tcp_state_mut()?.next_pending_error = Some(SocketError::ConnectionReset);
-        }
+    if pending_guest_reset && !socket.tcp_state()?.pending_errors.contains_guest_reset() {
+        socket
+            .tcp_state_mut()?
+            .pending_errors
+            .append(TcpPendingError::GuestReset);
     }
-    let pending_error = socket.pending_error.take();
-    socket.pending_error = socket.tcp_state_mut()?.next_pending_error.take();
+    let pending_error = socket.tcp_state_mut()?.pending_errors.take();
     let mut readiness = socket.snapshot.load();
-    if pending_error.is_some() && socket.pending_error.is_none() {
+    if pending_error.is_some() && socket.tcp_state()?.pending_errors.is_empty() {
         readiness = ReadinessFlags(readiness.0 & !ReadinessFlags::ERROR.0);
         socket.snapshot.store(readiness);
     }
     let response = PlatformSocketStatus {
         status,
         local_address,
-        pending_error,
+        pending_error: pending_error.map(TcpPendingError::error),
     };
-    let republish_error = socket.pending_error.is_some();
+    let republish_error = !socket.tcp_state()?.pending_errors.is_empty();
     if pending_guest_reset
-        && response.pending_error == Some(SocketError::ConnectionReset)
+        && matches!(pending_error, Some(TcpPendingError::GuestReset))
         && !consume_pending_guest_reset(socket, false)?
     {
         return Err(BrokerError::Internal);

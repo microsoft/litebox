@@ -53,13 +53,70 @@ pub(super) struct PeekCache {
     pub(super) data: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TcpPendingError {
+    Socket(SocketError),
+    GuestReset,
+}
+
+impl TcpPendingError {
+    pub(super) fn error(self) -> SocketError {
+        match self {
+            Self::Socket(error) => error,
+            Self::GuestReset => SocketError::ConnectionReset,
+        }
+    }
+}
+
+#[derive(Default)]
+pub(super) struct TcpPendingErrors {
+    current: Option<TcpPendingError>,
+    next: Option<TcpPendingError>,
+}
+
+impl TcpPendingErrors {
+    pub(super) fn append(&mut self, error: TcpPendingError) {
+        if error == TcpPendingError::GuestReset && self.contains_guest_reset() {
+            return;
+        }
+        if self.current.is_none() {
+            self.current = Some(error);
+        } else if self.next.is_none() {
+            self.next = Some(error);
+        }
+    }
+
+    pub(super) fn take(&mut self) -> Option<TcpPendingError> {
+        let error = self.current.take();
+        self.current = self.next.take();
+        error
+    }
+
+    pub(super) fn contains_guest_reset(&self) -> bool {
+        matches!(self.current, Some(TcpPendingError::GuestReset))
+            || matches!(self.next, Some(TcpPendingError::GuestReset))
+    }
+
+    pub(super) fn remove_guest_reset(&mut self) {
+        if matches!(self.next, Some(TcpPendingError::GuestReset)) {
+            self.next = None;
+        } else if matches!(self.current, Some(TcpPendingError::GuestReset)) {
+            self.take();
+        }
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.current.is_none()
+    }
+}
+
 /// Reactor-owned TCP descriptor and transport-specific lifecycle state.
 pub(super) struct TcpSocketState {
     pub(super) descriptor: TcpDescriptor,
     pub(super) listener: Option<GuestTcpListenerState>,
     pub(super) guest_endpoint: Option<GuestTcpEndpoint>,
     pub(super) peek_waitall_threshold: Option<usize>,
-    pub(super) next_pending_error: Option<SocketError>,
+    pub(super) pending_errors: TcpPendingErrors,
     guest_read_shutdown: Option<GuestTcpReadShutdown>,
     pub(super) abortive_close: bool,
     pub(super) no_delay: bool,
@@ -179,7 +236,7 @@ pub(super) fn create_tcp_transport() -> SocketTransportState {
         listener: None,
         guest_endpoint: None,
         peek_waitall_threshold: None,
-        next_pending_error: None,
+        pending_errors: TcpPendingErrors::default(),
         guest_read_shutdown: None,
         abortive_close: false,
         no_delay: false,
@@ -257,19 +314,17 @@ fn consume_synchronous_error(socket: &mut SocketEntry) -> BrokerResult<()> {
         return Ok(());
     }
     if let Some(error) = take_socket_error(socket)? {
-        if socket.pending_error.is_none() {
-            socket.pending_error = Some(error);
-        } else if socket.tcp_state()?.next_pending_error.is_none() {
-            socket.tcp_state_mut()?.next_pending_error = Some(error);
-        }
+        socket
+            .tcp_state_mut()?
+            .pending_errors
+            .append(TcpPendingError::Socket(error));
     }
     let current = socket.snapshot.load();
-    let readiness =
-        if socket.pending_error.is_some() || socket.tcp_state()?.next_pending_error.is_some() {
-            current | ReadinessFlags::ERROR
-        } else {
-            ReadinessFlags(current.0 & !ReadinessFlags::ERROR.0)
-        };
+    let readiness = if socket.tcp_state()?.pending_errors.is_empty() {
+        ReadinessFlags(current.0 & !ReadinessFlags::ERROR.0)
+    } else {
+        current | ReadinessFlags::ERROR
+    };
     update_snapshot(socket, readiness)
 }
 
@@ -1692,9 +1747,7 @@ impl Reactor {
             GuestTcpResetState::Pending => {}
             GuestTcpResetState::Reported => return,
         }
-        if socket.pending_error.is_none() {
-            socket.pending_error = Some(SocketError::ConnectionReset);
-        }
+        tcp.pending_errors.append(TcpPendingError::GuestReset);
         let current = socket.snapshot.load();
         let readiness =
             current | ReadinessFlags::READ | ReadinessFlags::ERROR | ReadinessFlags::HANGUP;
@@ -1963,7 +2016,7 @@ impl Reactor {
                         reset_state: GuestTcpResetState::None,
                     }),
                     peek_waitall_threshold: None,
-                    next_pending_error: None,
+                    pending_errors: TcpPendingErrors::default(),
                     guest_read_shutdown: None,
                     abortive_close: false,
                     no_delay: listener_tcp_no_delay,
@@ -2017,17 +2070,12 @@ pub(super) fn consume_pending_guest_reset(
         true
     };
     if consumed && remove_queued_error {
-        if socket.tcp_state()?.next_pending_error == Some(SocketError::ConnectionReset) {
-            socket.tcp_state_mut()?.next_pending_error = None;
-        } else if socket.pending_error == Some(SocketError::ConnectionReset) {
-            socket.pending_error = socket.tcp_state_mut()?.next_pending_error.take();
-        }
+        socket.tcp_state_mut()?.pending_errors.remove_guest_reset();
     }
     if consumed {
         let cleared_readiness = {
             let readiness = socket.snapshot.load();
-            if socket.pending_error.is_none()
-                && socket.tcp_state()?.next_pending_error.is_none()
+            if socket.tcp_state()?.pending_errors.is_empty()
                 && readiness.contains(ReadinessFlags::ERROR)
             {
                 let readiness = ReadinessFlags(readiness.0 & !ReadinessFlags::ERROR.0);
