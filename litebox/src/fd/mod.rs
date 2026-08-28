@@ -146,11 +146,33 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
             // Unique, so we can just return it if allowed.
             if can_close_immediately(old.x.entry.read().as_subsystem::<Subsystem>()) {
                 fd.x.mark_as_closed();
-                let entry = Arc::into_inner(old.x)
-                    .map(|shared| RwLock::into_inner(shared.entry))
-                    .map(DescriptorEntry::into_subsystem_entry::<Subsystem>)
-                    .unwrap();
-                Some(CloseResult::Closed(entry))
+                match Arc::try_unwrap(old.x) {
+                    Ok(shared) => {
+                        let entry = DescriptorEntry::into_subsystem_entry::<Subsystem>(
+                            RwLock::into_inner(shared.entry),
+                        );
+                        Some(CloseResult::Closed(entry))
+                    }
+                    Err(x) => {
+                        // The strong count was 1 above, but a lock-free
+                        // `WeakEntryHandle::upgrade` on another thread (e.g. an
+                        // epoll re-poll of a still-registered interest) can
+                        // transiently re-share the entry before we take
+                        // ownership. Fall back to the shared path: duplicate the
+                        // descriptor so it is closed once that reference drops,
+                        // rather than dropping the entry without an orderly
+                        // close.
+                        let replaced = self.entries[idx].replace(IndividualEntry {
+                            x,
+                            metadata: old.metadata,
+                        });
+                        assert!(replaced.is_none());
+                        Some(CloseResult::Duplicated(TypedFd {
+                            _phantom: PhantomData,
+                            x: OwnedFd::new(idx),
+                        }))
+                    }
+                }
             } else {
                 // Put it back
                 let old = self.entries[idx].replace(old);
