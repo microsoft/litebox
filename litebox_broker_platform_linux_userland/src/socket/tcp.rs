@@ -53,12 +53,72 @@ pub(super) struct PeekCache {
     pub(super) data: Vec<u8>,
 }
 
+/// Retains an error's source so a guest reset remains distinguishable from an
+/// independent socket `ConnectionReset` even though both have the same public value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TcpPendingError {
+    Socket(SocketError),
+    GuestReset,
+}
+
+impl TcpPendingError {
+    pub(super) fn error(self) -> SocketError {
+        match self {
+            Self::Socket(error) => error,
+            Self::GuestReset => SocketError::ConnectionReset,
+        }
+    }
+}
+
+#[derive(Default)]
+pub(super) struct TcpPendingErrors {
+    current: Option<TcpPendingError>,
+    next: Option<TcpPendingError>,
+}
+
+impl TcpPendingErrors {
+    pub(super) fn append(&mut self, error: TcpPendingError) {
+        if error == TcpPendingError::GuestReset && self.contains_guest_reset() {
+            return;
+        }
+        if self.current.is_none() {
+            self.current = Some(error);
+        } else if self.next.is_none() {
+            self.next = Some(error);
+        }
+    }
+
+    pub(super) fn take(&mut self) -> Option<TcpPendingError> {
+        let error = self.current.take();
+        self.current = self.next.take();
+        error
+    }
+
+    pub(super) fn contains_guest_reset(&self) -> bool {
+        matches!(self.current, Some(TcpPendingError::GuestReset))
+            || matches!(self.next, Some(TcpPendingError::GuestReset))
+    }
+
+    pub(super) fn remove_guest_reset(&mut self) {
+        if matches!(self.next, Some(TcpPendingError::GuestReset)) {
+            self.next = None;
+        } else if matches!(self.current, Some(TcpPendingError::GuestReset)) {
+            self.take();
+        }
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.current.is_none()
+    }
+}
+
 /// Reactor-owned TCP descriptor and transport-specific lifecycle state.
 pub(super) struct TcpSocketState {
     pub(super) descriptor: TcpDescriptor,
     pub(super) listener: Option<GuestTcpListenerState>,
     pub(super) guest_endpoint: Option<GuestTcpEndpoint>,
     pub(super) peek_waitall_threshold: Option<usize>,
+    pub(super) pending_errors: TcpPendingErrors,
     guest_read_shutdown: Option<GuestTcpReadShutdown>,
     pub(super) abortive_close: bool,
     pub(super) no_delay: bool,
@@ -178,6 +238,7 @@ pub(super) fn create_tcp_transport() -> SocketTransportState {
         listener: None,
         guest_endpoint: None,
         peek_waitall_threshold: None,
+        pending_errors: TcpPendingErrors::default(),
         guest_read_shutdown: None,
         abortive_close: false,
         no_delay: false,
@@ -254,14 +315,17 @@ fn consume_synchronous_error(socket: &mut SocketEntry) -> BrokerResult<()> {
     if !can_consume_synchronous_error(socket.connection_status) {
         return Ok(());
     }
-    if socket.pending_error.is_none() {
-        socket.pending_error = take_socket_error(socket)?;
+    if let Some(error) = take_socket_error(socket)? {
+        socket
+            .tcp_state_mut()?
+            .pending_errors
+            .append(TcpPendingError::Socket(error));
     }
     let current = socket.snapshot.load();
-    let readiness = if socket.pending_error.is_some() {
-        current | ReadinessFlags::ERROR
-    } else {
+    let readiness = if socket.tcp_state()?.pending_errors.is_empty() {
         ReadinessFlags(current.0 & !ReadinessFlags::ERROR.0)
+    } else {
+        current | ReadinessFlags::ERROR
     };
     update_snapshot(socket, readiness)
 }
@@ -473,7 +537,7 @@ pub(super) fn send_socket(
         return Ok(SocketOutcome::Failed(SocketError::Other));
     }
     if guest_reset_pending(socket)? {
-        if !consume_pending_guest_reset(socket)? {
+        if !consume_pending_guest_reset(socket, true)? {
             return Err(BrokerError::Internal);
         }
         return Ok(SocketOutcome::Failed(SocketError::ConnectionReset));
@@ -558,7 +622,7 @@ pub(super) fn receive_socket(
             return Ok(outcome);
         }
         if guest_reset_pending(socket)? {
-            if !consume_pending_guest_reset(socket)? {
+            if !consume_pending_guest_reset(socket, true)? {
                 return Err(BrokerError::Internal);
             }
             return Ok(ReactorReceiveOutcome::Failed(SocketError::ConnectionReset));
@@ -569,7 +633,7 @@ pub(super) fn receive_socket(
         let available = ioctl_fionread(socket.tcp_state()?.descriptor.socket()?)
             .map_err(broker_error_from_errno)?;
         if available == 0 {
-            if !consume_pending_guest_reset(socket)? {
+            if !consume_pending_guest_reset(socket, true)? {
                 return Err(BrokerError::Internal);
             }
             return Ok(ReactorReceiveOutcome::Failed(SocketError::ConnectionReset));
@@ -1685,9 +1749,7 @@ impl Reactor {
             GuestTcpResetState::Pending => {}
             GuestTcpResetState::Reported => return,
         }
-        if socket.pending_error.is_none() {
-            socket.pending_error = Some(SocketError::ConnectionReset);
-        }
+        tcp.pending_errors.append(TcpPendingError::GuestReset);
         let current = socket.snapshot.load();
         let readiness =
             current | ReadinessFlags::READ | ReadinessFlags::ERROR | ReadinessFlags::HANGUP;
@@ -1956,6 +2018,7 @@ impl Reactor {
                         reset_state: GuestTcpResetState::None,
                     }),
                     peek_waitall_threshold: None,
+                    pending_errors: TcpPendingErrors::default(),
                     guest_read_shutdown: None,
                     abortive_close: false,
                     no_delay: listener_tcp_no_delay,
@@ -1993,7 +2056,10 @@ pub(super) fn guest_reset_pending(socket: &SocketEntry) -> BrokerResult<bool> {
         .is_some_and(|endpoint| endpoint.reset_state == GuestTcpResetState::Pending))
 }
 
-pub(super) fn consume_pending_guest_reset(socket: &mut SocketEntry) -> BrokerResult<bool> {
+pub(super) fn consume_pending_guest_reset(
+    socket: &mut SocketEntry,
+    remove_queued_error: bool,
+) -> BrokerResult<bool> {
     let consumed = {
         let tcp = socket.tcp_state_mut()?;
         let Some(endpoint) = tcp.guest_endpoint.as_mut() else {
@@ -2005,13 +2071,15 @@ pub(super) fn consume_pending_guest_reset(socket: &mut SocketEntry) -> BrokerRes
         endpoint.reset_state = GuestTcpResetState::Reported;
         true
     };
+    if consumed && remove_queued_error {
+        socket.tcp_state_mut()?.pending_errors.remove_guest_reset();
+    }
     if consumed {
-        if socket.pending_error == Some(SocketError::ConnectionReset) {
-            socket.pending_error = None;
-        }
         let cleared_readiness = {
             let readiness = socket.snapshot.load();
-            if socket.pending_error.is_none() && readiness.contains(ReadinessFlags::ERROR) {
+            if socket.tcp_state()?.pending_errors.is_empty()
+                && readiness.contains(ReadinessFlags::ERROR)
+            {
                 let readiness = ReadinessFlags(readiness.0 & !ReadinessFlags::ERROR.0);
                 socket.snapshot.store(readiness);
                 Some(readiness)
