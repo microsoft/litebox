@@ -53,6 +53,8 @@ pub(super) struct PeekCache {
     pub(super) data: Vec<u8>,
 }
 
+/// Retains an error's source so a guest reset remains distinguishable from an
+/// independent socket `ConnectionReset` even though both have the same public value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum TcpPendingError {
     Socket(SocketError),
