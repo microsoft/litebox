@@ -270,6 +270,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
             SocketConnectionStatus::Connecting => Err(ConnectError::InProgress),
             SocketConnectionStatus::Failed(error) => {
                 let error = error.into();
+                self.state.lock().take_connection_failure();
+                drop(configuration);
+                self.pollee.wake_observers();
+                self.pollee
+                    .notify_observers(Events::IN | Events::OUT | Events::HUP);
                 return Err(ConnectError::OperationFailed(error));
             }
             SocketConnectionStatus::Unconnected => Err(ConnectError::InvalidState),
@@ -700,6 +705,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
             self.state.lock().connection,
             SocketConnectionStatus::Failed(_)
         );
+        self.state.lock().take_connection_failure();
         drop(configuration);
         self.pollee.wake_observers();
         if failed {

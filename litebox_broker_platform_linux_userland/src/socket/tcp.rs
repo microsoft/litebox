@@ -252,16 +252,11 @@ fn clear_readiness(socket: &SocketEntry, readiness: ReadinessFlags) -> BrokerRes
     update_snapshot(socket, ReadinessFlags(current.0 & !readiness.0))
 }
 
-fn consume_synchronous_error(
-    socket: &mut SocketEntry,
-    synchronous_error: SocketError,
-) -> BrokerResult<()> {
+fn consume_synchronous_error(socket: &mut SocketEntry) -> BrokerResult<()> {
     if !can_consume_synchronous_error(socket.connection_status) {
         return Ok(());
     }
-    if let Some(error) = take_socket_error(socket)?
-        && error != synchronous_error
-    {
+    if let Some(error) = take_socket_error(socket)? {
         if socket.pending_error.is_none() {
             socket.pending_error = Some(error);
         } else if socket.tcp_state()?.next_pending_error.is_none() {
@@ -517,7 +512,7 @@ pub(super) fn send_socket(
             Err(error) => {
                 let error = socket_operation_error_from_errno(error)?;
                 fail_connect(socket, error);
-                let _ = consume_synchronous_error(socket, error);
+                let _ = consume_synchronous_error(socket);
                 return Ok(SocketOutcome::Failed(error));
             }
         }
@@ -736,7 +731,7 @@ fn receive_socket_once(
             Err(error) => {
                 let error = socket_operation_error_from_errno(error)?;
                 fail_connect(socket, error);
-                let _ = consume_synchronous_error(socket, error);
+                let _ = consume_synchronous_error(socket);
                 return Ok(ReactorReceiveOutcome::Failed(error));
             }
         }
