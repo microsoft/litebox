@@ -14,7 +14,7 @@ use crate::policy::{HostPolicy, PolicyError};
 #[derive(Debug, Parser)]
 #[command(
     name = "litebox_egress_proxy",
-    about = "Hostname-filtering CONNECT egress proxy"
+    about = "Hostname-filtering HTTP/HTTPS egress proxy"
 )]
 pub struct Cli {
     /// Loopback address to bind, for example `127.0.0.1:0`.

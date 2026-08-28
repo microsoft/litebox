@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Hermetic loopback tests for the CONNECT proxy.
+//! Hermetic loopback tests for the HTTP and CONNECT proxy.
 
 use std::collections::HashMap;
 use std::io;
@@ -15,6 +15,7 @@ use litebox_egress_proxy::policy::{HostPolicy, Hostname};
 use litebox_egress_proxy::proxy::{ProxyState, serve};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -145,7 +146,7 @@ impl ProxyClient {
         while self.buffer.len() < length {
             assert!(
                 self.fill().await,
-                "connection closed before the tunnel data"
+                "connection closed before the expected data"
             );
         }
         self.buffer.drain(..length).collect()
@@ -156,6 +157,66 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines().skip(1).find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.trim().eq_ignore_ascii_case(name).then(|| value.trim())
+    })
+}
+
+async fn recording_upstream() -> (SocketAddr, mpsc::UnboundedReceiver<String>) {
+    let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("upstream listener");
+    let address = listener.local_addr().expect("upstream address");
+    let (sender, receiver) = mpsc::unbounded_channel();
+
+    tokio::spawn(async move {
+        while let Ok((mut stream, _peer)) = listener.accept().await {
+            let sender = sender.clone();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                let head_end = loop {
+                    let Ok(read) = stream.read(&mut chunk).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    if let Some(index) = find_subslice(&request, b"\r\n\r\n") {
+                        break index + 4;
+                    }
+                };
+
+                let head = String::from_utf8_lossy(&request[..head_end]);
+                let body_length = header_value(&head, "content-length")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+                while request.len() < head_end + body_length {
+                    let Ok(read) = stream.read(&mut chunk).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                }
+
+                let _ = sender.send(String::from_utf8_lossy(&request).into_owned());
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nhi",
+                    )
+                    .await;
+            });
+        }
+    });
+
+    (address, receiver)
 }
 
 async fn echo_upstream() -> SocketAddr {
@@ -174,6 +235,51 @@ async fn echo_upstream() -> SocketAddr {
     });
 
     address
+}
+
+#[tokio::test]
+async fn http_request_is_rewritten_and_relayed() {
+    let (upstream, mut requests) = recording_upstream().await;
+    let proxy = TestProxy::start(
+        &["allowed.example:80"],
+        &[("allowed.example", 80, upstream)],
+    )
+    .await;
+
+    let mut client = proxy.connect().await;
+    client
+        .send(
+            concat!(
+                "POST http://Allowed.Example/path?q=1 HTTP/1.1\r\n",
+                "Host: allowed.example\r\n",
+                "Content-Length: 5\r\n",
+                "Proxy-Connection: keep-alive\r\n",
+                "Connection: X-Secret\r\n",
+                "X-Secret: value\r\n",
+                "X-Kept: value\r\n",
+                "\r\n",
+                "hello"
+            )
+            .as_bytes(),
+        )
+        .await;
+
+    assert_eq!(client.read_response().await, 200);
+    assert_eq!(client.read_exact(2).await, b"hi");
+    assert!(!client.fill().await);
+
+    let forwarded = timeout(TEST_TIMEOUT, requests.recv())
+        .await
+        .expect("upstream request did not time out")
+        .expect("upstream received the request");
+    assert!(forwarded.starts_with("POST /path?q=1 HTTP/1.1\r\n"));
+    assert_eq!(header_value(&forwarded, "host"), Some("allowed.example"));
+    assert_eq!(header_value(&forwarded, "content-length"), Some("5"));
+    assert!(header_value(&forwarded, "proxy-connection").is_none());
+    assert!(header_value(&forwarded, "connection").is_none());
+    assert!(header_value(&forwarded, "x-secret").is_none());
+    assert_eq!(header_value(&forwarded, "x-kept"), Some("value"));
+    assert!(forwarded.ends_with("hello"));
 }
 
 #[tokio::test]
@@ -209,7 +315,7 @@ async fn connect_tunnel_relays_bytes() {
 async fn firewall_rejects_without_network_activity() {
     let upstream = echo_upstream().await;
     let proxy = TestProxy::start(
-        &["allowed.example:443"],
+        &["allowed.example:80", "allowed.example:443"],
         &[("allowed.example", 443, upstream)],
     )
     .await;
@@ -248,8 +354,44 @@ async fn firewall_rejects_without_network_activity() {
             400,
         ),
         (
-            "GET http://allowed.example/ HTTP/1.1\r\nHost: allowed.example\r\n\r\n",
+            "GET http://denied.example/ HTTP/1.1\r\nHost: denied.example\r\n\r\n",
+            403,
+        ),
+        (
+            "GET http://allowed.example:8080/ HTTP/1.1\r\nHost: allowed.example:8080\r\n\r\n",
+            403,
+        ),
+        (
+            "GET https://allowed.example/ HTTP/1.1\r\nHost: allowed.example\r\n\r\n",
+            400,
+        ),
+        (
+            "GET /relative HTTP/1.1\r\nHost: allowed.example\r\n\r\n",
+            400,
+        ),
+        (
+            "GET http://93.184.216.1/ HTTP/1.1\r\nHost: 93.184.216.1\r\n\r\n",
+            400,
+        ),
+        (
+            "GET http://allowed.example/ HTTP/1.1\r\nHost: other.example\r\n\r\n",
+            400,
+        ),
+        (
+            "GET http://allowed.example/ HTTP/1.1\r\nHost: allowed.example\r\nHost: allowed.example\r\n\r\n",
+            400,
+        ),
+        (
+            "GET http://allowed.example/ HTTP/1.1\r\nHost: allowed.example\r\nUpgrade: websocket\r\n\r\n",
             501,
+        ),
+        (
+            "POST http://allowed.example/ HTTP/1.1\r\nHost: allowed.example\r\nExpect: 100-continue\r\nContent-Length: 0\r\n\r\n",
+            417,
+        ),
+        (
+            "GET http://allowed.example/ HTTP/1.1\r\nHost: allowed.example\r\nConnection: bad token\r\n\r\n",
+            400,
         ),
     ] {
         assert_eq!(proxy.request(request).await, expected_status, "{request:?}");

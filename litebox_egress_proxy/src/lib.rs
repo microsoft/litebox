@@ -1,11 +1,12 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! A standalone, hostname-filtering CONNECT egress proxy for LiteBox.
+//! A standalone, hostname-filtering HTTP and HTTPS egress proxy for LiteBox.
 //!
 //! Authorized hostnames are resolved on demand through the trusted host
-//! resolver, then connected using the returned numeric addresses. CONNECT
-//! tunnels relay bytes without inspecting or terminating TLS.
+//! resolver, then connected using the returned numeric addresses. Plain HTTP
+//! requests are forwarded without buffering their bodies; CONNECT tunnels
+//! relay bytes without inspecting or terminating TLS.
 
 extern crate alloc;
 
@@ -15,6 +16,7 @@ pub mod connector;
 pub mod policy;
 pub mod proxy;
 
+mod headers;
 mod idle_timeout;
 
 use std::io::{self, Write};
