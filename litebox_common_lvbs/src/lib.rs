@@ -70,6 +70,8 @@ pub const VSM_VTL_CALL_FUNC_ID_EXCHANGE_SECRETS: u32 = 0x1_ffed;
 // This VSM function ID for OP-TEE messages is subject to change
 pub const VSM_VTL_CALL_FUNC_ID_OPTEE_MESSAGE: u32 = 0x1_fff0;
 
+pub const VSM_VTL_CALL_FUNC_ID_IDENTITY_SIGNING_KEY_TEST: u32 = 0x1_fff2;
+
 /// VSM Functions
 #[derive(Debug, PartialEq, TryFromPrimitive)]
 #[repr(u32)]
@@ -90,6 +92,7 @@ pub enum VsmFunction {
     OpteeMessage = VSM_VTL_CALL_FUNC_ID_OPTEE_MESSAGE,
     AllocateRingbufferMemory = VSM_VTL_CALL_FUNC_ID_ALLOCATE_RINGBUFFER_MEMORY,
     ExchangeSecrets = VSM_VTL_CALL_FUNC_ID_EXCHANGE_SECRETS,
+    IdentitySigningKeyTest = VSM_VTL_CALL_FUNC_ID_IDENTITY_SIGNING_KEY_TEST,
 }
 
 // `HV_STATUS_*` constants used as discriminants for `HypervCallError`.

@@ -2,10 +2,12 @@
 // Licensed under the MIT license.
 
 use crate::NormalWorldMutPtr;
+use alloc::boxed::Box;
 use litebox::{mm::linux::PAGE_SIZE, platform::CrngProvider, utils::TruncateExt};
 use litebox_common_linux::errno::Errno;
+use litebox_platform_lvbs::arch::ioport::serial_print_string;
 use num_enum::TryFromPrimitive;
-use p384::{NonZeroScalar, elliptic_curve::sec1::ToEncodedPoint};
+use p384::{NonZeroScalar, ecdsa::Signature, ecdsa::SigningKey, ecdsa::signature::Signer, elliptic_curve::sec1::ToEncodedPoint};
 use spin::Once;
 use zeroize::Zeroizing;
 
@@ -143,6 +145,69 @@ fn identity_signing_public_key_from_private_key(
     let mut public_key_bytes = [0u8; IDENTITY_SIGNING_PUBLIC_KEY_LEN];
     public_key_bytes.copy_from_slice(encoded_point.as_bytes());
     Ok(public_key_bytes)
+}
+
+pub fn identity_signing_key_test(message_pa: u64, signature_pa: u64, signature_len_pa: u64) -> i64 {
+    match identity_signing_key_test_inner(message_pa, signature_pa, signature_len_pa) {
+        Ok(()) => 0,
+        Err(e) => e.as_neg().into(),
+    }
+}
+
+fn identity_signing_key_test_inner(
+    message_pa: u64,
+    signature_pa: u64,
+    signature_len_pa: u64,
+) -> Result<(), Errno> {
+    const TEST_MESSAGE_LEN: usize = 11;
+    let message_ptr =
+        NormalWorldMutPtr::<[u8; TEST_MESSAGE_LEN], PAGE_SIZE>::with_usize(message_pa.trunc())
+            .map_err(|_| Errno::EINVAL)?;
+    let signature_ptr = NormalWorldMutPtr::<[u8; 128], PAGE_SIZE>::with_usize(signature_pa.trunc())
+        .map_err(|_| Errno::EINVAL)?;
+    let sig_len_ptr = NormalWorldMutPtr::<u32, PAGE_SIZE>::with_usize(signature_len_pa.trunc())
+        .map_err(|_| Errno::EINVAL)?;
+
+    let message: Box<[u8; TEST_MESSAGE_LEN]> =
+        message_ptr.read_at_offset(0).map_err(|_| Errno::EFAULT)?;
+
+    let private_key = get_identity_signing_key_pair()?.private_key.clone();
+    let signing_key = SigningKey::from_slice(&private_key[..]).unwrap();
+    let signature: Signature = signing_key.sign(&message[..]);
+
+    let der = signature.to_der();
+    let der_bytes = der.as_bytes();
+
+    let mut out = [0u8; 128];
+
+    if der_bytes.len() > out.len() {
+        return Err(Errno::EINVAL);
+    }
+
+    out[..der_bytes.len()].copy_from_slice(der_bytes);
+    serial_print_string("signature: ");
+    for &byte in &out[..der_bytes.len()] {
+        let hex_bytes = [
+            b"0123456789abcdef"[(byte >> 4) as usize],
+            b"0123456789abcdef"[(byte & 0x0f) as usize],
+        ];
+        let s = core::str::from_utf8(&hex_bytes).unwrap();
+        serial_print_string(s);
+    }
+    serial_print_string("\n");
+
+    signature_ptr
+        .write_at_offset(0, out)
+        .map_err(|_| Errno::EFAULT)?;
+
+    sig_len_ptr
+        .write_at_offset(
+            0,
+            u32::try_from(der_bytes.len()).map_err(|_| Errno::EINVAL)?,
+        )
+        .map_err(|_| Errno::EFAULT)?;
+
+    Ok(())
 }
 
 #[cfg(test)]
