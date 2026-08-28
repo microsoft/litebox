@@ -62,10 +62,6 @@ impl BrokerTcpSocketState {
         self.async_error = Some(BrokerTcpAsyncError::Other(error));
     }
 
-    fn append_async_error(&mut self, error: SocketAsyncError) {
-        self.append_retained_error(BrokerTcpAsyncError::Other(error));
-    }
-
     fn append_retained_error(&mut self, error: BrokerTcpAsyncError) {
         let error = Some(error);
         if self.async_error.is_none() {
@@ -689,7 +685,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
                 Err(error) if !self.closed.load(Ordering::Acquire) => {
                     self.state
                         .lock()
-                        .append_async_error(BrokerObjectError::from(error).into());
+                        .append_retained_error(BrokerTcpAsyncError::Other(
+                            BrokerObjectError::from(error).into(),
+                        ));
                     break;
                 }
                 Err(_) => break,
@@ -1386,7 +1384,9 @@ mod tests {
             listening: false,
         };
 
-        state.append_async_error(SocketAsyncError::ConnectionRefused);
+        state.append_retained_error(BrokerTcpAsyncError::Other(
+            SocketAsyncError::ConnectionRefused,
+        ));
 
         assert_eq!(
             state.take_async_error(),
