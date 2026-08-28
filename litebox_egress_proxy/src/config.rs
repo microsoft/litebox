@@ -1,0 +1,153 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+//! Executable configuration.
+
+use std::net::{Ipv4Addr, SocketAddrV4};
+
+use clap::{ArgGroup, Parser};
+use thiserror::Error;
+
+use crate::listener::ListenerSource;
+use crate::policy::{HostPolicy, PolicyError};
+
+/// The standalone egress proxy for LiteBox sandboxes.
+#[derive(Debug, Parser)]
+#[command(
+    name = "litebox_egress_proxy",
+    about = "Hostname-filtering CONNECT egress proxy",
+    group(ArgGroup::new("listener").required(true).args(["listen", "listener_fd"]))
+)]
+pub struct Cli {
+    /// Loopback address to bind, for example `127.0.0.1:0`.
+    #[arg(long, value_name = "IPV4:PORT")]
+    listen: Option<String>,
+
+    /// Inherited, already-bound loopback listener descriptor.
+    #[arg(long, value_name = "FD", conflicts_with = "listen")]
+    listener_fd: Option<i32>,
+
+    /// Allowed hostname and destination ports, repeatable.
+    #[arg(long = "allow-host", value_name = "HOST:PORT[-PORT]")]
+    allow_host: Vec<String>,
+}
+
+/// Reason the arguments were rejected.
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    /// `--listen` was not a socket address.
+    #[error("--listen must be an IPv4 address and port, for example 127.0.0.1:0")]
+    ListenAddress,
+    /// `--listen` was not canonical IPv4 loopback.
+    #[error("--listen must use the canonical loopback address 127.0.0.1")]
+    ListenNotLoopback,
+    /// An `--allow-host` rule was invalid.
+    #[error("invalid --allow-host rule: {0}")]
+    Policy(#[from] PolicyError),
+}
+
+/// The validated configuration of one proxy process.
+#[derive(Clone, Debug)]
+pub struct ProxyConfig {
+    /// Where the listener comes from.
+    pub listener: ListenerSource,
+    /// The immutable hostname policy.
+    pub policy: HostPolicy,
+}
+
+impl Cli {
+    /// Converts parsed arguments into a validated configuration.
+    pub fn into_config(self) -> Result<ProxyConfig, ConfigError> {
+        let listener = match (self.listen, self.listener_fd) {
+            (Some(address), _) => ListenerSource::Bind(parse_listen_address(&address)?),
+            (None, Some(descriptor)) => ListenerSource::Inherited(descriptor),
+            (None, None) => return Err(ConfigError::ListenAddress),
+        };
+        let policy = HostPolicy::from_rules(&self.allow_host)?;
+
+        Ok(ProxyConfig { listener, policy })
+    }
+}
+
+fn parse_listen_address(raw: &str) -> Result<SocketAddrV4, ConfigError> {
+    let address: SocketAddrV4 = raw.parse().map_err(|_| ConfigError::ListenAddress)?;
+    if *address.ip() != Ipv4Addr::LOCALHOST {
+        return Err(ConfigError::ListenNotLoopback);
+    }
+    Ok(address)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::policy::Hostname;
+
+    fn parse(arguments: &[&str]) -> Result<ProxyConfig, ConfigError> {
+        let mut all = vec!["litebox_egress_proxy"];
+        all.extend_from_slice(arguments);
+        Cli::try_parse_from(all).unwrap().into_config()
+    }
+
+    #[test]
+    fn parses_a_standalone_configuration() {
+        let config = parse(&[
+            "--listen",
+            "127.0.0.1:0",
+            "--allow-host",
+            "Example.COM:443",
+            "--allow-host",
+            "example.com:8000-8100",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            config.listener,
+            ListenerSource::Bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        );
+
+        let host = Hostname::parse("example.com").unwrap();
+        assert!(config.policy.allows(&host, 443));
+        assert!(config.policy.allows(&host, 8100));
+        assert!(!config.policy.allows(&host, 80));
+    }
+
+    #[test]
+    fn parses_an_inherited_listener_configuration() {
+        let config = parse(&["--listener-fd", "7"]).unwrap();
+        let host = Hostname::parse("example.com").unwrap();
+        assert_eq!(config.listener, ListenerSource::Inherited(7));
+        assert!(!config.policy.allows(&host, 443));
+    }
+
+    #[test]
+    fn listener_modes_are_mutually_exclusive_and_required() {
+        assert!(
+            Cli::try_parse_from([
+                "litebox_egress_proxy",
+                "--listen",
+                "127.0.0.1:0",
+                "--listener-fd",
+                "3",
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["litebox_egress_proxy"]).is_err());
+    }
+
+    #[test]
+    fn rejects_non_loopback_listen_addresses() {
+        assert!(matches!(
+            parse(&["--listen", "0.0.0.0:8080"]),
+            Err(ConfigError::ListenNotLoopback)
+        ));
+        assert!(matches!(
+            parse(&["--listen", "127.0.0.2:8080"]),
+            Err(ConfigError::ListenNotLoopback)
+        ));
+        assert!(matches!(
+            parse(&["--listen", "localhost:8080"]),
+            Err(ConfigError::ListenAddress)
+        ));
+    }
+}

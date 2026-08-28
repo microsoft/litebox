@@ -1,0 +1,58 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+//! Upstream hostname resolution and connection.
+
+use core::future::Future;
+use core::pin::Pin;
+use std::io;
+
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::{TcpStream, lookup_host};
+
+use crate::policy::Hostname;
+
+/// A bidirectional upstream byte stream.
+pub trait UpstreamStream: AsyncRead + AsyncWrite + Send + Unpin {}
+
+impl<T: AsyncRead + AsyncWrite + Send + Unpin + ?Sized> UpstreamStream for T {}
+
+/// An owned upstream byte stream.
+pub type BoxedUpstreamStream = Box<dyn UpstreamStream>;
+
+/// A future returned by an [`UpstreamConnector`].
+pub type ConnectFuture<'a> =
+    Pin<Box<dyn Future<Output = io::Result<BoxedUpstreamStream>> + Send + 'a>>;
+
+/// Resolves and connects to an authorized hostname and port.
+pub trait UpstreamConnector: Send + Sync + 'static {
+    /// Opens an upstream connection.
+    fn connect(&self, host: Hostname, port: u16) -> ConnectFuture<'_>;
+}
+
+/// The production connector, using the trusted host resolver.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TcpUpstreamConnector;
+
+impl UpstreamConnector for TcpUpstreamConnector {
+    fn connect(&self, host: Hostname, port: u16) -> ConnectFuture<'_> {
+        Box::pin(async move {
+            let addresses = lookup_host((host.as_str(), port)).await?;
+            let mut last_error = None;
+
+            for address in addresses {
+                match TcpStream::connect(address).await {
+                    Ok(stream) => {
+                        stream.set_nodelay(true)?;
+                        return Ok(Box::new(stream) as BoxedUpstreamStream);
+                    }
+                    Err(error) => last_error = Some(error),
+                }
+            }
+
+            Err(last_error.unwrap_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "hostname resolved to no addresses")
+            }))
+        })
+    }
+}
