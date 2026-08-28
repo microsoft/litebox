@@ -1,0 +1,70 @@
+[package]
+name = "litebox_egress_proxy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# `bytes` is the buffer type used by `hyper` bodies; only `std` support is
+# needed here.
+bytes = { version = "1.10", default-features = false, features = ["std"] }
+# Argument parsing for the standalone executable. The workspace already uses
+# `clap` with the derive interface elsewhere.
+clap = { version = "4.5", default-features = false, features = [
+    "derive",
+    "error-context",
+    "help",
+    "std",
+    "usage",
+] }
+# Controlled DNS. Only the tokio runtime integration is enabled; notably the
+# `system-config` default feature is disabled so that the process can never
+# read the host resolver configuration.
+hickory-resolver = { version = "0.26.1", default-features = false, features = [
+    "tokio",
+] }
+# Body combinators (`BoxBody`, `Empty`) for the proxied bodies.
+http-body-util = { version = "0.1.3", default-features = false }
+# HTTP/1 framing for both the client-facing server and the per-request upstream
+# connection. No HTTP/2 support is enabled.
+hyper = { version = "1.8", default-features = false, features = [
+    "client",
+    "http1",
+    "server",
+] }
+# `hyper` runtime adapters (`TokioIo`, `TokioTimer`) only.
+hyper-util = { version = "0.1.20", default-features = false, features = [
+    "tokio",
+] }
+# Raw request-head validation before `hyper` applies RFC framing normalization.
+httparse = { version = "1.10.1", default-features = false }
+# Canonical IPv4 CIDRs for the proxy-only resolved-destination envelope.
+ipnet = { version = "2.11", default-features = false }
+thiserror = { version = "2.0", default-features = false, features = ["std"] }
+tokio = { version = "1.50", default-features = false, features = [
+    "io-util",
+    "net",
+    "rt",
+    "sync",
+    "time",
+] }
+
+[dev-dependencies]
+# Loopback integration tests drive the proxy on a multi-threaded runtime and
+# use tokio's time control to exercise the stream timeouts.
+tokio = { version = "1.50", default-features = false, features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "test-util",
+    "time",
+] }
+
+# Only the Linux inherited-listener path needs raw socket introspection.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { version = "0.2", default-features = false }
+
+[lints]
+workspace = true
