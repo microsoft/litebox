@@ -646,6 +646,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             if let Err(status) = Self::copy_tls_slots(old_tls_data, new_tls_data, previous_count) {
                 return status;
             }
+            // ntdll uses the address of this TEB field as its initial empty-vector sentinel.
+            // Report it as null so the caller does not try to free TEB memory.
+            let old_tls_data = if old_tls_data
+                == teb_address + offset_of!(ThreadEnvironmentBlock, thread_local_storage_pointer)
+            {
+                0
+            } else {
+                old_tls_data
+            };
 
             if thread_data.write_tls_data(old_tls_data).is_none()
                 || Self::write_teb_tls_pointer(teb, new_tls_data).is_none()
