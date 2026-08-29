@@ -117,19 +117,23 @@ impl UnixSocketAddr {
                     OFlags::RDWR
                 };
                 // TODO: extend fs to support creating sock file (i.e., with type `InodeType::Socket`)
-                let file = task
-                    .files
-                    .borrow()
-                    .fs
-                    .open(
-                        path.as_str(),
-                        flags,
-                        Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
-                    )
-                    .map_err(|err| match err {
-                        OpenError::AlreadyExists => Errno::EADDRINUSE,
-                        other => Errno::from(other),
-                    })?;
+                let file = {
+                    let files = task.files.borrow();
+                    let fs = task.fs.borrow();
+                    let context = fs.context.read();
+                    files
+                        .fs
+                        .open(
+                            &context,
+                            path.as_str(),
+                            flags,
+                            Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
+                        )
+                        .map_err(|err| match err {
+                            OpenError::AlreadyExists => Errno::EADDRINUSE,
+                            other => Errno::from(other),
+                        })?
+                };
                 Ok(UnixBoundSocketAddr::Path((
                     path,
                     file,

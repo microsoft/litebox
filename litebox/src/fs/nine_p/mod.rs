@@ -501,16 +501,23 @@ where
         &self,
         dir: DirHandle,
         name: &str,
-        mode: super::Mode,
+        metadata: super::backend::CreationMetadata,
     ) -> Result<FileHandle, OpenError> {
         // `Tlcreate` turns the directory fid into the new file's fid server-side, so it must be
         // handed a private clone rather than the caller's directory handle.
         let fid = self.client.clone_fid(&dir.get_typed::<Self>().fid.fid)?;
         // NOTE: 9P needs to commit to an access mode at creation time. The resolver still enforces
         // the caller's read/write intent via its own `read_allowed`/`write_allowed`.
-        let (_, fid) = self
-            .client
-            .create(fid, name, fcall::LOpenFlags::O_RDWR, mode.bits(), 0)?;
+        //
+        // XXX: `Tlcreate` only carries a gid; the owning uid is whichever user the connection
+        // attached as, so `metadata.owner.user` cannot be honored here.
+        let (_, fid) = self.client.create(
+            fid,
+            name,
+            fcall::LOpenFlags::O_RDWR,
+            metadata.mode.bits(),
+            u32::from(metadata.owner.group),
+        )?;
         Ok(FileHandle::from_typed::<Self>(NinePFileHandle {
             fid: self.own(fid),
         }))
@@ -520,10 +527,16 @@ where
         &self,
         dir: DirHandle,
         name: &str,
-        mode: super::Mode,
+        metadata: super::backend::CreationMetadata,
     ) -> Result<DirHandle, MkdirError> {
         let dir = dir.into_typed::<Self>();
-        self.client.mkdir(&dir.fid.fid, name, mode.bits(), 0)?;
+        // XXX: as in `create_file_at`, `Tmkdir` cannot set the owning uid.
+        self.client.mkdir(
+            &dir.fid.fid,
+            name,
+            metadata.mode.bits(),
+            u32::from(metadata.owner.group),
+        )?;
         // `Tmkdir` only reports the new directory's qid, so a walk is needed to address it.
         //
         // TODO(jayb): the resolver discards this handle, so the walk is pure overhead, and worse, a

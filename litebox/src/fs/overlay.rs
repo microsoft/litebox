@@ -24,16 +24,16 @@ use crate::LiteBox;
 use crate::sync::{Mutex, MutexGuard, RawSyncPrimitivesProvider};
 
 use super::backend::{
-    Backend, BackendHandles, DirHandle, FileHandle, Handle, HandleRef, PermissionCheck,
-    PermissionInfo, Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkedComponent,
-    WalkingDirHandle,
+    Backend, BackendHandles, CreationMetadata, DirHandle, FileHandle, Handle, HandleRef,
+    PermissionCheck, PermissionInfo, Permissioned, SeekBehavior, WalkOutcome, WalkStopReason,
+    WalkedComponent, WalkingDirHandle,
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
     ReadError, RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::inode_allocator::InodeAllocator;
-use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags};
+use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
 
 /// The reserved namespace prefix; no overlay-visible name may start with it.
 const MARKER_PREFIX: &str = ".litebox-overlay-";
@@ -268,28 +268,19 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
         truncate: bool,
     ) -> Result<FileHandle, OpenError> {
         let (layer, lower) = lower;
-        let upper = self
-            .upper
-            .create_file_at(upper_dir.clone(), name, status.mode)?;
-        let copied = self
-            .upper
-            .chown(
-                HandleRef::File(&upper),
-                Some(status.owner.user),
-                Some(status.owner.group),
-            )
-            .map_err(|error| match error {
-                ChownError::PathError(error) => OpenError::PathError(error),
-                ChownError::ReadOnlyFileSystem => OpenError::ReadOnlyFileSystem,
-                _ => OpenError::Io,
-            });
-
-        let copied = copied.and_then(|()| {
-            if truncate {
-                return Ok(());
-            }
+        let upper = self.upper.create_file_at(
+            upper_dir.clone(),
+            name,
+            CreationMetadata {
+                mode: status.mode,
+                owner: status.owner,
+            },
+        )?;
+        let copied = if truncate {
+            Ok(())
+        } else {
             self.copy_bytes(layer, lower, &upper)
-        });
+        };
 
         if let Err(error) = copied {
             // Ancestor directories materialised for this copy-up deliberately stay behind.
@@ -400,8 +391,16 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
         {
             return Ok(());
         }
-        self.upper
-            .create_file_at(dir.clone(), marker, Mode::empty())?;
+        // Markers are overlay-internal bookkeeping, never visible to callers, so they are owned by
+        // root rather than by whoever happened to trigger the write.
+        self.upper.create_file_at(
+            dir.clone(),
+            marker,
+            CreationMetadata {
+                mode: Mode::empty(),
+                owner: UserInfo::ROOT,
+            },
+        )?;
         Ok(())
     }
 
@@ -474,7 +473,14 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
             .map_err(file_status_to_open_error)?;
         let child = self
             .upper
-            .mkdir_at(parent.clone(), name, status.mode)
+            .mkdir_at(
+                parent.clone(),
+                name,
+                CreationMetadata {
+                    mode: status.mode,
+                    owner: status.owner,
+                },
+            )
             .map_err(|error| match error {
                 MkdirError::PathError(error) => OpenError::PathError(error),
                 MkdirError::AlreadyExists => OpenError::AlreadyExists,
@@ -482,30 +488,11 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
                 MkdirError::NoWritePerms => OpenError::NoWritePerms,
                 _ => OpenError::Io,
             })?;
-        // XXX(jayb): an atomic create-with-metadata `Backend` operation would avoid this
-        // best-effort rollback path.
-        match self.upper.chown(
-            HandleRef::Dir(&child),
-            Some(status.owner.user),
-            Some(status.owner.group),
-        ) {
-            Ok(()) => {
-                // A materialised directory stands in for the lower one, so it keeps its identity.
-                if let (Some(layer), Ok(upper)) = (layer, self.upper.status(HandleRef::Dir(&child)))
-                {
-                    self.bind_copy_up(layer, status.node_info, upper.node_info, None);
-                }
-                Ok(child)
-            }
-            Err(error) => {
-                let _rollback_result = self.upper.rmdir_at(parent.clone(), name);
-                Err(match error {
-                    ChownError::PathError(error) => OpenError::PathError(error),
-                    ChownError::ReadOnlyFileSystem => OpenError::ReadOnlyFileSystem,
-                    _ => OpenError::Io,
-                })
-            }
+        // A materialised directory stands in for the lower one, so it keeps its identity.
+        if let (Some(layer), Ok(upper)) = (layer, self.upper.status(HandleRef::Dir(&child))) {
+            self.bind_copy_up(layer, status.node_info, upper.node_info, None);
         }
+        Ok(child)
     }
 
     /// The layer that owns a resolved directory, and its handle within that layer: the upper
@@ -984,7 +971,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         &self,
         dir: DirHandle,
         name: &str,
-        mode: Mode,
+        metadata: CreationMetadata,
     ) -> Result<FileHandle, OpenError> {
         if !valid(name) {
             return Err(PathError::InvalidPathname.into());
@@ -995,7 +982,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
             return Err(OpenError::AlreadyExists);
         }
         let upper = self.ensure_upper_dir(&locked, &path)?;
-        let file = self.upper.create_file_at(upper.clone(), name, mode)?;
+        let file = self.upper.create_file_at(upper.clone(), name, metadata)?;
         if let Err(error) = self.remove_marker(&locked, &upper, &whiteout(name)) {
             let _rollback_result = self.upper.unlink_at(upper, name);
             return Err(unlink_to_open_error(error));
@@ -1007,7 +994,12 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         }))
     }
 
-    fn mkdir_at(&self, dir: DirHandle, name: &str, mode: Mode) -> Result<DirHandle, MkdirError> {
+    fn mkdir_at(
+        &self,
+        dir: DirHandle,
+        name: &str,
+        metadata: CreationMetadata,
+    ) -> Result<DirHandle, MkdirError> {
         fn open_to_mkdir_error(error: OpenError) -> MkdirError {
             match error {
                 OpenError::PathError(error) => MkdirError::PathError(error),
@@ -1033,7 +1025,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         let recreated = self
             .marker_present(&upper, &whiteout)
             .map_err(|_| MkdirError::Io)?;
-        let child = self.upper.mkdir_at(upper.clone(), name, mode)?;
+        let child = self.upper.mkdir_at(upper.clone(), name, metadata)?;
 
         // A directory recreated over a whiteout must not re-merge with the lower directory it
         // replaces, so it starts out opaque.

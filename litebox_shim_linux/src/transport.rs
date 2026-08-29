@@ -292,6 +292,7 @@ mod tests {
     #[test]
     #[ignore = "requires broker-backed socket test setup"]
     fn test_nine_p_create_and_read_file() {
+        let ctx = litebox::fs::resolver::Context::new();
         let task = init_platform();
 
         let server = DiodServer::start();
@@ -299,7 +300,12 @@ mod tests {
 
         // Create a file and write to it.
         let fd = fs
-            .open("/hello.txt", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .open(
+                &ctx,
+                "/hello.txt",
+                OFlags::CREAT | OFlags::WRONLY,
+                Mode::RWXU,
+            )
             .expect("failed to create file via 9P");
 
         let data = b"Hello from litebox shim 9P!";
@@ -315,7 +321,7 @@ mod tests {
 
         // Read back through 9P.
         let fd = fs
-            .open("/hello.txt", OFlags::RDONLY, Mode::empty())
+            .open(&ctx, "/hello.txt", OFlags::RDONLY, Mode::empty())
             .expect("failed to open file for reading");
 
         let mut buf = alloc::vec![0u8; 256];
@@ -327,6 +333,7 @@ mod tests {
     #[test]
     #[ignore = "requires broker-backed socket test setup"]
     fn test_nine_p_host_files_visible() {
+        let ctx = litebox::fs::resolver::Context::new();
         let task = init_platform();
 
         let server = DiodServer::start();
@@ -344,7 +351,7 @@ mod tests {
 
         // Read file created on the host through 9P.
         let fd = fs
-            .open("/host_file.txt", OFlags::RDONLY, Mode::empty())
+            .open(&ctx, "/host_file.txt", OFlags::RDONLY, Mode::empty())
             .expect("failed to open host file via 9P");
         let mut buf = alloc::vec![0u8; 256];
         let n = fs.read(&fd, &mut buf, None).unwrap();
@@ -354,6 +361,7 @@ mod tests {
         // List host directory through 9P.
         let fd = fs
             .open(
+                &ctx,
                 "/host_dir",
                 OFlags::RDONLY | OFlags::DIRECTORY,
                 Mode::empty(),

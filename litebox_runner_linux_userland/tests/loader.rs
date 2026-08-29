@@ -13,6 +13,7 @@ struct TestLauncher {
     platform: &'static Platform,
     shim_builder: litebox_shim_linux::LinuxShimBuilder<Platform>,
     fs: litebox_shim_linux::DefaultFS<Platform>,
+    context: litebox::fs::resolver::Context,
 }
 
 impl TestLauncher {
@@ -37,6 +38,7 @@ impl TestLauncher {
             platform,
             shim_builder,
             fs,
+            context: litebox::fs::resolver::Context::new(),
         };
 
         for each in initial_files {
@@ -66,13 +68,15 @@ impl TestLauncher {
     }
 
     fn install_dir(&mut self, path: &str) -> Result<(), litebox::fs::errors::MkdirError> {
-        self.fs.mkdir(path, Mode::RWXU | Mode::RWXG | Mode::RWXO)
+        self.fs
+            .mkdir(&self.context, path, Mode::RWXU | Mode::RWXG | Mode::RWXO)
     }
 
     fn install_file(&mut self, contents: Vec<u8>, out: &str) {
         let fd = self
             .fs
             .open(
+                &self.context,
                 out,
                 OFlags::CREAT | OFlags::WRONLY,
                 Mode::RWXG | Mode::RWXO | Mode::RWXU,
