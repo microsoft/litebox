@@ -13,7 +13,7 @@ use crate::LiteBox;
 use crate::sync::RawSyncPrimitivesProvider;
 
 use super::backend::{
-    Backend, BackendHandles, DirHandle, FileHandle, HandleRef, NewNode, PermissionCheck,
+    Backend, BackendHandles, CreationMetadata, DirHandle, FileHandle, HandleRef, PermissionCheck,
     Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkingDirHandle,
 };
 use super::errors::{
@@ -359,7 +359,7 @@ where
         &self,
         _dir: DirHandle,
         _name: &str,
-        _node: NewNode,
+        _metadata: CreationMetadata,
     ) -> Result<FileHandle, OpenError> {
         Err(OpenError::ReadOnlyFileSystem)
     }
@@ -368,7 +368,7 @@ where
         &self,
         _dir: DirHandle,
         _name: &str,
-        _node: NewNode,
+        _metadata: CreationMetadata,
     ) -> Result<DirHandle, MkdirError> {
         Err(MkdirError::ReadOnlyFileSystem)
     }

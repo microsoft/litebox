@@ -24,9 +24,9 @@ use crate::LiteBox;
 use crate::sync::{Mutex, MutexGuard, RawSyncPrimitivesProvider};
 
 use super::backend::{
-    Backend, BackendHandles, DirHandle, FileHandle, Handle, HandleRef, NewNode, PermissionCheck,
-    PermissionInfo, Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkedComponent,
-    WalkingDirHandle,
+    Backend, BackendHandles, CreationMetadata, DirHandle, FileHandle, Handle, HandleRef,
+    PermissionCheck, PermissionInfo, Permissioned, SeekBehavior, WalkOutcome, WalkStopReason,
+    WalkedComponent, WalkingDirHandle,
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
@@ -271,7 +271,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
         let upper = self.upper.create_file_at(
             upper_dir.clone(),
             name,
-            NewNode {
+            CreationMetadata {
                 mode: status.mode,
                 owner: status.owner,
             },
@@ -396,7 +396,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
         self.upper.create_file_at(
             dir.clone(),
             marker,
-            NewNode {
+            CreationMetadata {
                 mode: Mode::empty(),
                 owner: UserInfo::ROOT,
             },
@@ -476,7 +476,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
             .mkdir_at(
                 parent.clone(),
                 name,
-                NewNode {
+                CreationMetadata {
                     mode: status.mode,
                     owner: status.owner,
                 },
@@ -971,7 +971,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         &self,
         dir: DirHandle,
         name: &str,
-        node: NewNode,
+        metadata: CreationMetadata,
     ) -> Result<FileHandle, OpenError> {
         if !valid(name) {
             return Err(PathError::InvalidPathname.into());
@@ -982,7 +982,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
             return Err(OpenError::AlreadyExists);
         }
         let upper = self.ensure_upper_dir(&locked, &path)?;
-        let file = self.upper.create_file_at(upper.clone(), name, node)?;
+        let file = self.upper.create_file_at(upper.clone(), name, metadata)?;
         if let Err(error) = self.remove_marker(&locked, &upper, &whiteout(name)) {
             let _rollback_result = self.upper.unlink_at(upper, name);
             return Err(unlink_to_open_error(error));
@@ -994,7 +994,12 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         }))
     }
 
-    fn mkdir_at(&self, dir: DirHandle, name: &str, node: NewNode) -> Result<DirHandle, MkdirError> {
+    fn mkdir_at(
+        &self,
+        dir: DirHandle,
+        name: &str,
+        metadata: CreationMetadata,
+    ) -> Result<DirHandle, MkdirError> {
         fn open_to_mkdir_error(error: OpenError) -> MkdirError {
             match error {
                 OpenError::PathError(error) => MkdirError::PathError(error),
@@ -1020,7 +1025,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         let recreated = self
             .marker_present(&upper, &whiteout)
             .map_err(|_| MkdirError::Io)?;
-        let child = self.upper.mkdir_at(upper.clone(), name, node)?;
+        let child = self.upper.mkdir_at(upper.clone(), name, metadata)?;
 
         // A directory recreated over a whiteout must not re-merge with the lower directory it
         // replaces, so it starts out opaque.

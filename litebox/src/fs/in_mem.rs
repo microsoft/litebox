@@ -479,7 +479,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         &self,
         dir: super::backend::DirHandle,
         name: &str,
-        node: super::backend::NewNode,
+        metadata: super::backend::CreationMetadata,
     ) -> Result<super::backend::FileHandle, OpenError> {
         // TODO(jayb): Nothing checks write permission on the parent directory before creating;
         // the resolver should do so before calling this.
@@ -490,8 +490,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         }
         let file = Arc::new(sync::RwLock::new(FileData {
             perms: Permissions {
-                mode: node.mode,
-                userinfo: node.owner,
+                mode: metadata.mode,
+                userinfo: metadata.owner,
             },
             data: Vec::new().into(),
             node_info: self.inode_allocator.next(),
@@ -509,7 +509,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         &self,
         dir: super::backend::DirHandle,
         name: &str,
-        node: super::backend::NewNode,
+        metadata: super::backend::CreationMetadata,
     ) -> Result<super::backend::DirHandle, MkdirError> {
         // TODO(jayb): Nothing checks write permission on the parent directory before creating;
         // the resolver should do so before calling this.
@@ -520,8 +520,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         }
         let child = Arc::new(sync::RwLock::new(DirData {
             perms: Permissions {
-                mode: node.mode,
-                userinfo: node.owner,
+                mode: metadata.mode,
+                userinfo: metadata.owner,
             },
             children: HashMap::default(),
             node_info: self.inode_allocator.next(),

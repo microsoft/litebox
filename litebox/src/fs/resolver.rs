@@ -20,8 +20,8 @@ use super::errors::{
 use super::{
     FileType, Mode, OFlags,
     backend::{
-        DirHandle, Handle, HandleRef, NewNode, PermissionCheck, PermissionInfo, Permissioned,
-        SeekBehavior, WalkOutcome, WalkStopReason, WalkingDirHandle,
+        CreationMetadata, DirHandle, Handle, HandleRef, PermissionCheck, PermissionInfo,
+        Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkingDirHandle,
     },
 };
 
@@ -602,7 +602,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 let file = self.backend.create_file_at(
                     parent,
                     name,
-                    NewNode {
+                    CreationMetadata {
                         mode,
                         owner: context.acting_user(),
                     },
@@ -914,7 +914,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             .mkdir_at(
                 parent,
                 name,
-                NewNode {
+                CreationMetadata {
                     mode,
                     owner: context.acting_user(),
                 },
