@@ -640,7 +640,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 "Replacing process TLS vector"
             );
 
-            if let Err(status) = Self::copy_tls_slots(old_tls_data, new_tls_data, previous_count) {
+            if let Err(status) = self.copy_tls_slots(old_tls_data, new_tls_data, previous_count) {
                 return status;
             }
             let old_tls_data_for_guest =
@@ -768,6 +768,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     fn copy_tls_slots(
+        &self,
         old_tls_data: usize,
         new_tls_data: usize,
         count: usize,
