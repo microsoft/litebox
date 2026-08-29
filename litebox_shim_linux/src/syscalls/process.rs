@@ -3,7 +3,7 @@
 
 //! Process/thread related syscalls.
 
-use crate::{ShimFS, ShimPlatform, Task, UserPtr, UserPtrMut};
+use crate::{ShimPlatform, Task, UserPtr, UserPtrMut};
 use alloc::boxed::Box;
 use alloc::collections::btree_map::BTreeMap;
 use alloc::sync::Arc;
@@ -250,7 +250,7 @@ impl<Platform: ShimPlatform> Process<Platform> {
     }
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     /// Updates the process exit status for a thread exit.
     fn exit_thread(&self, code: i8) {
         let mut inner = self.thread.process.inner.lock();
@@ -342,7 +342,7 @@ pub(crate) struct Credentials {
     pub egid: u32,
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     pub(crate) fn process(&self) -> &Arc<Process<Platform>> {
         &self.thread.process
     }
@@ -482,7 +482,7 @@ fn wake_robust_list<Platform: ShimPlatform>(
     Ok(())
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     /// Called when the task is exiting.
     pub(crate) fn prepare_for_exit(&mut self) {
         self.thread.detach_from_process();
@@ -523,12 +523,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 #[cfg(target_arch = "x86_64")]
 type ThreadLocalDescriptor = UserPtrMut<u8>;
 
-struct NewThreadArgs<Platform: ShimPlatform, FS: ShimFS> {
+struct NewThreadArgs<Platform: ShimPlatform> {
     /// Task struct that maintains all per-thread data
-    task: Task<Platform, FS>,
+    task: Task<Platform>,
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::InitThread for NewThreadArgs<Platform, FS> {
+impl<Platform: ShimPlatform> litebox::shim::InitThread for NewThreadArgs<Platform> {
     type ExecutionContext = litebox_common_linux::PtRegs;
 
     fn init(
@@ -544,7 +544,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::InitThread for NewThread
     }
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     pub(crate) fn sys_clone(
         &self,
         ctx: &litebox_common_linux::PtRegs,
@@ -787,7 +787,7 @@ impl<Platform: ShimPlatform> ResourceLimits<Platform> {
     }
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     /// Get resource limits, and optionally set new limits.
     pub(crate) fn do_prlimit(
         &self,
@@ -1256,7 +1256,7 @@ impl CpuSet {
     }
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `sched_getaffinity`.
     ///
     /// Note this is a dummy implementation that always returns the same CPU set
@@ -1267,7 +1267,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `futex`
     pub(crate) fn sys_futex(&self, arg: litebox_common_linux::FutexArgs) -> Result<usize, Errno> {
         /// Note our mutex implementation assumes futexes are private as we don't support shared memory yet.
@@ -1376,7 +1376,7 @@ fn parse_shebang(buf: &[u8]) -> Option<(&str, Option<&str>)> {
     }
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     /// Resolve shebang (`#!`) chains for the given path and argv if the file starts with a shebang line.
     /// Otherwise, returns the original path and argv.
     pub(crate) fn resolve_shebang(
@@ -1525,7 +1525,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// to start executing it.
     pub(crate) fn load_program(
         &self,
-        mut loader: crate::loader::elf::ElfLoader<'_, Platform, FS>,
+        mut loader: crate::loader::elf::ElfLoader<'_, Platform>,
         argv: Vec<alloc::ffi::CString>,
         envp: Vec<alloc::ffi::CString>,
     ) -> Result<(), crate::loader::elf::ElfLoaderError> {

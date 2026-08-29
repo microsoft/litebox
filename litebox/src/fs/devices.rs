@@ -13,8 +13,8 @@ use crate::LiteBox;
 use crate::sync::RawSyncPrimitivesProvider;
 
 use super::backend::{
-    Backend, BackendHandles, DirHandle, FileHandle, HandleRef, PermissionCheck, Permissioned,
-    SeekBehavior, WalkOutcome, WalkStopReason, WalkingDirHandle,
+    Backend, BackendHandles, CreationMetadata, DirHandle, FileHandle, HandleRef, PermissionCheck,
+    Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkingDirHandle,
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
@@ -359,12 +359,17 @@ where
         &self,
         _dir: DirHandle,
         _name: &str,
-        _mode: Mode,
+        _metadata: CreationMetadata,
     ) -> Result<FileHandle, OpenError> {
         Err(OpenError::ReadOnlyFileSystem)
     }
 
-    fn mkdir_at(&self, _dir: DirHandle, _name: &str, _mode: Mode) -> Result<DirHandle, MkdirError> {
+    fn mkdir_at(
+        &self,
+        _dir: DirHandle,
+        _name: &str,
+        _metadata: CreationMetadata,
+    ) -> Result<DirHandle, MkdirError> {
         Err(MkdirError::ReadOnlyFileSystem)
     }
 

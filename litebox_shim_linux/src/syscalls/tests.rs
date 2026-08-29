@@ -46,9 +46,7 @@ pub(crate) fn test_platform(tun_device_name: Option<&str>) -> &'static TestPlatf
 }
 
 #[must_use]
-pub(crate) fn init_platform(
-    tun_device_name: Option<&str>,
-) -> crate::Task<TestPlatform, crate::DefaultFS<TestPlatform>> {
+pub(crate) fn init_platform(tun_device_name: Option<&str>) -> crate::Task<TestPlatform> {
     let platform = test_platform(tun_device_name);
 
     let shim_builder = crate::LinuxShimBuilder::new(platform);

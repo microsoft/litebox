@@ -34,9 +34,7 @@ impl log::Log for HostLogger {
 static HOST_LOGGER: HostLogger = HostLogger;
 
 type Platform = litebox_platform_linux_kernel::host::snp::snp_impl::SnpLinuxKernel;
-type DefaultFS = litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>;
-
-type Shim = litebox_shim_linux::LinuxShim<Platform, DefaultFS>;
+type Shim = litebox_shim_linux::LinuxShim<Platform>;
 
 // FUTURE: eliminate this entirely (ideal).
 static SHIM: once_cell::race::OnceBox<Shim> = once_cell::race::OnceBox::new();

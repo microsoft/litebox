@@ -4,6 +4,7 @@
 //! The path-management/permissions/... layer, that sits above [`super::backend`].
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -19,24 +20,18 @@ use super::errors::{
 use super::{
     FileType, Mode, OFlags,
     backend::{
-        DirHandle, Handle, HandleRef, PermissionCheck, PermissionInfo, SeekBehavior, WalkOutcome,
-        WalkStopReason, WalkingDirHandle,
+        CreationMetadata, DirHandle, Handle, HandleRef, PermissionCheck, PermissionInfo,
+        Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkingDirHandle,
     },
 };
 
 /// The north-facing filesystem entry point, generic over a [`Backend`](super::backend::Backend).
-// NOTE(jayb): the `Context` separation is in preparation for multi-process support; specifically,
-// each guest process would have their own `Context` but would share the resolver. Currently, since
-// we are using the `FileSystem` trait for migration, the interfaces do not show the full actual
-// separated context support (yet!). Nonetheless, future changes will separate this out.
 pub struct Resolver<
     Platform: sync::RawSyncPrimitivesProvider,
     Backend: super::backend::Backend + 'static,
 > {
     litebox: LiteBox<Platform>,
     backend: Backend,
-    /// Stand-in for the per-caller context, until callers own their own. See the note above.
-    migration_context: Context,
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
@@ -48,49 +43,53 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         Self {
             litebox: litebox.clone(),
             backend,
-            migration_context: Context::new(),
         }
-    }
-
-    /// Set the acting user for all subsequent operations, returning the previous one.
-    ///
-    /// Non-test callers set up whatever needs a different user while constructing the backend;
-    /// this exists so that the tests can exercise operations that depend on the acting user.
-    ///
-    /// TODO(jayb): transitionary `pub(super)` accessor; this should go away once callers own their
-    /// own [`Context`], at which point they can set the acting user directly.
-    #[cfg(test)]
-    pub(super) fn swap_acting_user(&mut self, user: UserInfo) -> UserInfo {
-        core::mem::replace(&mut self.migration_context.user_info, user)
-    }
-
-    /// Direct access to the backend, so that the tests can reach backend-owned state (namely its
-    /// own copy of the acting user).
-    ///
-    /// TODO(jayb): transitionary `pub(super)` accessor; this should go away along with the
-    /// backend's copy of the acting user.
-    #[cfg(test)]
-    pub(super) fn backend_mut(&mut self) -> &mut Backend {
-        &mut self.backend
     }
 }
 
 /// Per-call resolution context.  The user may hold and mutate this as they wish.
+///
+/// This struct is deliberately cheap to clone.
+// NOTE(jayb): I generally dislike getters/setters for fields of a data-like struct (e.g., see
+// acting_user and set_acting_user here), but I'm putting these here since I am not yet convinced
+// that we won't need more things in the context, nor am I convinced that we might not need the
+// ability to lock down how contexts are made/used. In some sense, I am forcing some chokepoints
+// here. In the future, we might flatten these out and just allow access to the fields directly.
 #[derive(Clone, Debug)]
 pub struct Context {
     /// Current working directory.
-    ///
-    /// An empty list is equivalent to `/`. Guaranteed to never have `.` or `..`.
-    cwd: Vec<String>,
+    cwd: Arc<ResolvedPath>,
     /// Effective user for permission checks.
     user_info: UserInfo,
 }
 
 impl Context {
+    /// The user that operations on this context act as.
+    #[must_use]
+    pub fn acting_user(&self) -> UserInfo {
+        self.user_info
+    }
+
+    /// Set the user that operations on this context act as.
+    pub fn set_acting_user(&mut self, user: UserInfo) {
+        self.user_info = user;
+    }
+
+    /// The current working directory.
+    #[must_use]
+    pub fn cwd(&self) -> &ResolvedPath {
+        &self.cwd
+    }
+
+    /// Set the current working directory.
+    pub fn set_cwd(&mut self, cwd: ResolvedPath) {
+        self.cwd = Arc::new(cwd);
+    }
+
     /// A new default context, anchored at `/` for a non-root user.
     pub fn new() -> Context {
         Self {
-            cwd: vec![],
+            cwd: Arc::new(ResolvedPath { components: vec![] }),
             user_info: UserInfo {
                 user: 1000,
                 group: 1000,
@@ -103,11 +102,11 @@ impl Context {
     // outside the chrooted part.
     // XXX(jayb): since we are migrating all resolution into the resolver, we probably don't need
     // `Arg` anymore, so could get rid of it in the future.
-    fn resolve(&self, path: impl Arg) -> Result<ResolvedPath, PathError> {
+    pub fn resolve(&self, path: impl Arg) -> Result<ResolvedPath, PathError> {
         let mut components = if path.as_rust_str()?.starts_with('/') {
             vec![]
         } else {
-            self.cwd.clone()
+            self.cwd.components.clone()
         };
         for component in path.components()? {
             match component {
@@ -161,8 +160,25 @@ impl Default for Context {
 }
 
 /// Absolute normalized path, must only be created from [`Context::resolve`].
-struct ResolvedPath {
+///
+/// Note that a resolved path does not imply that it exists within the file system, merely that it
+/// is an absolute normalized path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedPath {
+    // Note: an empty path is equivalent to `/`.
     components: Vec<String>,
+}
+
+impl core::fmt::Display for ResolvedPath {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for component in &self.components {
+            write!(f, "/{component}")?;
+        }
+        if self.components.is_empty() {
+            f.write_str("/")?;
+        }
+        Ok(())
+    }
 }
 
 impl ResolvedPath {
@@ -190,11 +206,6 @@ enum SearchScope {
     /// Like [`SearchScope::ParentsOnly`], but the final directory component is checked to be
     /// readable.
     AndReadableTarget,
-}
-
-impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
-    super::private::Sealed for Resolver<Platform, Backend>
-{
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
@@ -248,11 +259,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             })
     }
 
-    /// Resolve `path` to an owned handle on the file or directory it names.
+    /// Resolve `path` to an owned handle on the file or directory it names, plus how permissions
+    /// on it are to be checked.
     ///
     /// The handle is taken with [`OFlags::PATH`], as it addresses the object for operations that
     /// do not read or write its contents, and thus needs no access permissions on it.
-    fn path_handle(&self, context: &Context, path: &ResolvedPath) -> Result<Handle, WalkError> {
+    fn path_handle(
+        &self,
+        context: &Context,
+        path: &ResolvedPath,
+    ) -> Result<Permissioned<Handle>, WalkError> {
         let map_open_error = |error| match error {
             OpenError::PathError(error) => WalkError::PathError(error),
             _ => WalkError::Io,
@@ -263,7 +279,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 .backend
                 .owned_dir_at(self.backend.root(), OFlags::PATH)
                 .map_err(map_open_error)?;
-            return Ok(Handle::Dir(root));
+            // A backend root reports no permission metadata, so the backend is left to enforce
+            // whatever it wants on it.
+            return Ok(Permissioned {
+                item: Handle::Dir(root),
+                permissions: PermissionCheck::ByBackend,
+            });
         }
         let (outcome, walked) = self.walk_path(
             context,
@@ -274,17 +295,32 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             SearchScope::ParentsOnly,
         )?;
         match outcome.stop_reason {
-            WalkStopReason::CompleteDirectory => Ok(Handle::Dir(
-                self.backend
+            WalkStopReason::CompleteDirectory => {
+                let permissions = outcome
+                    .components
+                    .last()
+                    .map_or(PermissionCheck::ByBackend, |component| {
+                        component.permissions.clone()
+                    });
+                let dir = self
+                    .backend
                     .owned_dir_at(outcome.last, OFlags::PATH)
-                    .map_err(map_open_error)?,
-            )),
-            WalkStopReason::StoppedAtNonDirectory => Ok(Handle::File(
-                self.backend
+                    .map_err(map_open_error)?;
+                Ok(Permissioned {
+                    item: Handle::Dir(dir),
+                    permissions,
+                })
+            }
+            WalkStopReason::StoppedAtNonDirectory => {
+                let file = self
+                    .backend
                     .open_file_at(outcome.last, components[walked], OFlags::PATH)
-                    .map_err(map_open_error)?
-                    .item,
-            )),
+                    .map_err(map_open_error)?;
+                Ok(Permissioned {
+                    item: Handle::File(file.item),
+                    permissions: file.permissions,
+                })
+            }
             WalkStopReason::Continue => {
                 // `walk_path` validates stop reasons before returning.
                 unreachable!()
@@ -424,21 +460,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     }
 }
 
-// NOTE(jayb): purely as a migration feature, until we have completely separated contexts. See
-// comment on [`Resolver`].
 impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
     Resolver<Platform, Backend>
 {
-    fn context_pre_context_management_changes(&self) -> &Context {
-        &self.migration_context
-    }
-}
-
-impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
-    super::FileSystem for Resolver<Platform, Backend>
-{
-    fn open(
+    /// Opens a file
+    ///
+    /// The `mode` is only significant when creating a file
+    pub fn open(
         &self,
+        context: &Context,
         path: impl Arg,
         mut flags: OFlags,
         mode: Mode,
@@ -467,7 +497,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             flags &= OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
         }
 
-        let context = self.context_pre_context_management_changes();
         let path = context.resolve(path)?;
         let access_mode = flags & (OFlags::WRONLY | OFlags::RDWR);
         let read_allowed = access_mode == OFlags::RDONLY || access_mode == OFlags::RDWR;
@@ -570,7 +599,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                         WalkError::Io => OpenError::Io,
                         WalkError::PathError(error) => error.into(),
                     })?;
-                let file = self.backend.create_file_at(parent, name, mode)?;
+                let file = self.backend.create_file_at(
+                    parent,
+                    name,
+                    CreationMetadata {
+                        mode,
+                        owner: context.acting_user(),
+                    },
+                )?;
                 let seek_behavior = self.backend.seek_behavior(&file);
                 Ok(insert(Handle::File(file), seek_behavior))
             }
@@ -581,7 +617,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         }
     }
 
-    fn close(&self, fd: &TypedFd<Self>) -> Result<(), CloseError> {
+    /// Close the file at `fd`.
+    ///
+    /// Future operations on the `fd` will start to return `ClosedFd` errors.
+    pub fn close(&self, fd: &TypedFd<Self>) -> Result<(), CloseError> {
         let mut dt = self.litebox.descriptor_table_mut();
         let removed = dt.remove(fd);
         drop(dt);
@@ -591,7 +630,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         Ok(())
     }
 
-    fn read(
+    /// Read from a file descriptor at `offset` into a buffer
+    ///
+    /// If `offset` is None, the read will start at the current file offset and update the file
+    /// offset to the end of the read.
+    /// If `offset` is Some, the file offset is not changed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the updated file offset would overflow `usize`.
+    pub fn read(
         &self,
         fd: &TypedFd<Self>,
         buf: &mut [u8],
@@ -630,7 +678,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         Ok(read)
     }
 
-    fn write(
+    /// Write from a buffer to a file descriptor at `offset`
+    ///
+    /// If `offset` is None, the write will start at the current file offset and update the file
+    /// offset to the end of the write.
+    /// If `offset` is Some, the file offset is not changed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the updated file offset would overflow `usize`.
+    pub fn write(
         &self,
         fd: &TypedFd<Self>,
         buf: &[u8],
@@ -675,7 +732,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         Ok(written)
     }
 
-    fn seek(
+    /// Reposition read/write file offset, by changing it to `offset` relative to `whence`.
+    ///
+    /// Returns the resulting offset (in bytes from start of file) on success.
+    pub fn seek(
         &self,
         fd: &TypedFd<Self>,
         offset: isize,
@@ -724,7 +784,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         }
     }
 
-    fn truncate(
+    /// Truncate the file to the specified length.
+    ///
+    /// If shorter than existing size, extra data is lost. If longer than existing size, resize by
+    /// adding `\0`s.
+    ///
+    /// If `reset_offset` is true, the offset is reset to zero; otherwise, it remains unchanged.
+    pub fn truncate(
         &self,
         fd: &TypedFd<Self>,
         length: usize,
@@ -755,8 +821,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         Ok(())
     }
 
-    fn chmod(&self, path: impl Arg, mode: Mode) -> Result<(), ChmodError> {
-        let context = self.context_pre_context_management_changes();
+    fn may_change_metadata(context: &Context, permissions: &PermissionCheck) -> bool {
+        let PermissionCheck::ByResolver(permissions) = permissions else {
+            return true;
+        };
+        let acting = context.acting_user();
+        acting.user == UserInfo::ROOT.user || acting.user == permissions.owner.user
+    }
+
+    /// Change the permissions of a file
+    pub fn chmod(&self, context: &Context, path: impl Arg, mode: Mode) -> Result<(), ChmodError> {
         let path = context.resolve(path)?;
         let handle = self
             .path_handle(context, &path)
@@ -764,16 +838,20 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 WalkError::Io => ChmodError::Io,
                 WalkError::PathError(error) => error.into(),
             })?;
-        self.backend.chmod(handle.as_ref(), mode)
+        if !Self::may_change_metadata(context, &handle.permissions) {
+            return Err(ChmodError::NotTheOwner);
+        }
+        self.backend.chmod(handle.item.as_ref(), mode)
     }
 
-    fn chown(
+    /// Change the owner of a file
+    pub fn chown(
         &self,
+        context: &Context,
         path: impl Arg,
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError> {
-        let context = self.context_pre_context_management_changes();
         let path = context.resolve(path)?;
         let handle = self
             .path_handle(context, &path)
@@ -781,11 +859,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 WalkError::Io => ChownError::Io,
                 WalkError::PathError(error) => error.into(),
             })?;
-        self.backend.chown(handle.as_ref(), user, group)
+        if !Self::may_change_metadata(context, &handle.permissions) {
+            return Err(ChownError::NotTheOwner);
+        }
+        self.backend.chown(handle.item.as_ref(), user, group)
     }
 
-    fn unlink(&self, path: impl Arg) -> Result<(), UnlinkError> {
-        let context = self.context_pre_context_management_changes();
+    /// Unlink a file
+    pub fn unlink(&self, context: &Context, path: impl Arg) -> Result<(), UnlinkError> {
         let path = context.resolve(path)?;
         let Some((parent, name)) =
             self.parent_dir_and_name(context, &path)
@@ -808,8 +889,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         self.backend.unlink_at(parent, name)
     }
 
-    fn mkdir(&self, path: impl Arg, mode: Mode) -> Result<(), MkdirError> {
-        let context = self.context_pre_context_management_changes();
+    /// Create a new directory
+    pub fn mkdir(&self, context: &Context, path: impl Arg, mode: Mode) -> Result<(), MkdirError> {
         let path = context.resolve(path)?;
         let Some((parent, name)) =
             self.parent_dir_and_name(context, &path)
@@ -829,11 +910,20 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 WalkError::Io => MkdirError::Io,
                 WalkError::PathError(error) => error.into(),
             })?;
-        self.backend.mkdir_at(parent, name, mode).map(|_| ())
+        self.backend
+            .mkdir_at(
+                parent,
+                name,
+                CreationMetadata {
+                    mode,
+                    owner: context.acting_user(),
+                },
+            )
+            .map(|_| ())
     }
 
-    fn rmdir(&self, path: impl Arg) -> Result<(), RmdirError> {
-        let context = self.context_pre_context_management_changes();
+    /// Remove a directory
+    pub fn rmdir(&self, context: &Context, path: impl Arg) -> Result<(), RmdirError> {
         let path = context.resolve(path)?;
         let Some((parent, name)) =
             self.parent_dir_and_name(context, &path)
@@ -856,7 +946,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         self.backend.rmdir_at(parent, name)
     }
 
-    fn read_dir(&self, fd: &TypedFd<Self>) -> Result<Vec<super::DirEntry>, ReadDirError> {
+    /// Read directory entries from a directory file descriptor.
+    ///
+    /// Returns a list of file/directory names (explicitly _not_ including `.` or `..`).
+    pub fn read_dir(&self, fd: &TypedFd<Self>) -> Result<Vec<super::DirEntry>, ReadDirError> {
         let entry = self
             .litebox
             .descriptor_table()
@@ -888,9 +981,18 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         Ok(entries)
     }
 
-    fn file_status(&self, path: impl Arg) -> Result<super::FileStatus, FileStatusError> {
+    /// Obtain the status of a file/directory/... on the file-system.
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "`CloseError` is uninhabited, so the internal close cannot fail"
+    )]
+    pub fn file_status(
+        &self,
+        context: &Context,
+        path: impl Arg,
+    ) -> Result<super::FileStatus, FileStatusError> {
         let fd = self
-            .open(path, OFlags::PATH, Mode::empty())
+            .open(context, path, OFlags::PATH, Mode::empty())
             .map_err(|error| match error {
                 OpenError::PathError(error) => error.into(),
                 OpenError::Io
@@ -905,7 +1007,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         status
     }
 
-    fn fd_file_status(&self, fd: &TypedFd<Self>) -> Result<super::FileStatus, FileStatusError> {
+    /// Equivalent to [`Self::file_status`], but on an open `fd` instead.
+    pub fn fd_file_status(&self, fd: &TypedFd<Self>) -> Result<super::FileStatus, FileStatusError> {
         let entry = self
             .litebox
             .descriptor_table()
@@ -915,7 +1018,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         self.backend.status(entry.entry.handle.as_ref())
     }
 
-    fn get_static_backing_data(&self, fd: &TypedFd<Self>) -> Option<&'static [u8]> {
+    /// Get static backing data for a file, if available and supported.
+    ///
+    /// This method returns the (entire) underlying static byte slice if the file's contents are
+    /// backed by borrowed static data (e.g., set up via [`super::in_mem::InitialNode::File`]).
+    ///
+    /// Returns `None` if no static backing data is available/supported.
+    pub fn get_static_backing_data(&self, fd: &TypedFd<Self>) -> Option<&'static [u8]> {
         let entry = self.litebox.descriptor_table().entry_handle(fd)?;
         let entry = entry.get_entry();
         match &entry.entry.handle {

@@ -33,7 +33,7 @@ use crate::fs::{DirEntry, FileType};
 
 use super::{
     Mode, NodeInfo, OFlags, UserInfo,
-    backend::{DirHandle, FileHandle, HandleRef, WalkingDirHandle},
+    backend::{CreationMetadata, DirHandle, FileHandle, HandleRef, WalkingDirHandle},
     errors::{
         ChmodError, ChownError, MkdirError, OpenError, PathError, ReadDirError, ReadError,
         RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
@@ -259,12 +259,17 @@ impl super::backend::Backend for TarRo {
         &self,
         _dir: DirHandle,
         _name: &str,
-        _mode: Mode,
+        _metadata: CreationMetadata,
     ) -> Result<FileHandle, OpenError> {
         Err(OpenError::ReadOnlyFileSystem)
     }
 
-    fn mkdir_at(&self, _dir: DirHandle, _name: &str, _mode: Mode) -> Result<DirHandle, MkdirError> {
+    fn mkdir_at(
+        &self,
+        _dir: DirHandle,
+        _name: &str,
+        _metadata: CreationMetadata,
+    ) -> Result<DirHandle, MkdirError> {
         Err(MkdirError::ReadOnlyFileSystem)
     }
 

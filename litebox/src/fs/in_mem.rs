@@ -27,10 +27,6 @@ pub struct InMem<Platform: sync::RawSyncPrimitivesProvider> {
     // TODO: Possibly support a single-threaded variant that doesn't have the cost of requiring a
     // sync-primitives platform, as well as cost of mutexes and such?
     root: DirNode<Platform>,
-    // TODO(jayb): This duplicates the resolver's `Context::user_info`, which is supposed to own
-    // this. This exists as a transition until we update callers to either manage the perm checks or
-    // pass down the UserInfo.
-    current_user: UserInfo,
     inode_allocator: InodeAllocator,
 }
 
@@ -48,10 +44,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
         }));
         Self {
             root,
-            current_user: UserInfo {
-                user: 1000,
-                group: 1000,
-            },
             inode_allocator,
         }
     }
@@ -487,7 +479,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         &self,
         dir: super::backend::DirHandle,
         name: &str,
-        mode: Mode,
+        metadata: super::backend::CreationMetadata,
     ) -> Result<super::backend::FileHandle, OpenError> {
         // TODO(jayb): Nothing checks write permission on the parent directory before creating;
         // the resolver should do so before calling this.
@@ -498,8 +490,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         }
         let file = Arc::new(sync::RwLock::new(FileData {
             perms: Permissions {
-                mode,
-                userinfo: self.current_user,
+                mode: metadata.mode,
+                userinfo: metadata.owner,
             },
             data: Vec::new().into(),
             node_info: self.inode_allocator.next(),
@@ -517,7 +509,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         &self,
         dir: super::backend::DirHandle,
         name: &str,
-        mode: Mode,
+        metadata: super::backend::CreationMetadata,
     ) -> Result<super::backend::DirHandle, MkdirError> {
         // TODO(jayb): Nothing checks write permission on the parent directory before creating;
         // the resolver should do so before calling this.
@@ -528,8 +520,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         }
         let child = Arc::new(sync::RwLock::new(DirData {
             perms: Permissions {
-                mode,
-                userinfo: self.current_user,
+                mode: metadata.mode,
+                userinfo: metadata.owner,
             },
             children: HashMap::default(),
             node_info: self.inode_allocator.next(),
@@ -580,8 +572,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
     }
 
     fn chmod(&self, h: super::backend::HandleRef<'_>, mode: Mode) -> Result<(), ChmodError> {
-        // TODO(jayb): This checks ownership against the backend's own `current_user`, rather than
-        // the resolver's context user.
         let mut perms = match h {
             super::backend::HandleRef::File(h) => {
                 sync::RwLockWriteGuard::map(h.get_typed::<Self>().file.write(), |f| &mut f.perms)
@@ -590,11 +580,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                 sync::RwLockWriteGuard::map(h.get_typed::<Self>().dir.write(), |d| &mut d.perms)
             }
         };
-        if !(self.current_user.user == UserInfo::ROOT.user
-            || self.current_user.user == perms.userinfo.user)
-        {
-            return Err(ChmodError::NotTheOwner);
-        }
         perms.mode = mode;
         Ok(())
     }
@@ -605,8 +590,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError> {
-        // TODO(jayb): This checks ownership against the backend's own `current_user`, rather than
-        // the resolver's context user.
         let mut perms = match h {
             super::backend::HandleRef::File(h) => {
                 sync::RwLockWriteGuard::map(h.get_typed::<Self>().file.write(), |f| &mut f.perms)
@@ -615,11 +598,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                 sync::RwLockWriteGuard::map(h.get_typed::<Self>().dir.write(), |d| &mut d.perms)
             }
         };
-        if !(self.current_user.user == UserInfo::ROOT.user
-            || self.current_user.user == perms.userinfo.user)
-        {
-            return Err(ChownError::NotTheOwner);
-        }
         if let Some(new_user) = user {
             perms.userinfo.user = new_user;
         }
@@ -693,33 +671,4 @@ struct FileData {
 struct Permissions {
     mode: Mode,
     userinfo: UserInfo,
-}
-
-/// Run `f` with the acting user set to root.
-///
-/// Non-test callers set up root-owned state via [`InMem::new_initialized`] instead; this exists so
-/// that the tests can exercise operations that depend on the acting user.
-#[cfg(test)]
-pub(super) fn with_root_privileges<Platform: sync::RawSyncPrimitivesProvider>(
-    fs: &mut super::resolver::Resolver<Platform, InMem<Platform>>,
-    f: impl FnOnce(&mut super::resolver::Resolver<Platform, InMem<Platform>>),
-) {
-    with_user(fs, UserInfo::ROOT.user, UserInfo::ROOT.group, f);
-}
-
-/// Run `f` with the acting user set to `user`/`group`. See [`with_root_privileges`].
-#[cfg(test)]
-pub(super) fn with_user<Platform: sync::RawSyncPrimitivesProvider>(
-    fs: &mut super::resolver::Resolver<Platform, InMem<Platform>>,
-    user: u16,
-    group: u16,
-    f: impl FnOnce(&mut super::resolver::Resolver<Platform, InMem<Platform>>),
-) {
-    let user = UserInfo { user, group };
-    let original_user = fs.swap_acting_user(user);
-    fs.backend_mut().current_user = user;
-    f(fs);
-    let user_again = fs.swap_acting_user(original_user);
-    fs.backend_mut().current_user = original_user;
-    assert!(user_again.user == user.user && user_again.group == user.group);
 }

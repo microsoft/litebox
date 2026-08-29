@@ -12,7 +12,7 @@ use x86_64 as arch;
 use zerocopy::FromZeros;
 
 use crate::syscalls::process::ExitStatus;
-use crate::{ShimFS, ShimPlatform, Task, UserPtr, UserPtrMut};
+use crate::{ShimPlatform, Task, UserPtr, UserPtrMut};
 use alloc::collections::vec_deque::VecDeque;
 use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
@@ -386,7 +386,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
 /// A fault when delivering a signal.
 struct DeliverFault;
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     pub(crate) fn with_temporary_signal_mask<R>(&self, mask: SigSet, f: impl FnOnce() -> R) -> R {
         let old = self.signals.blocked.get();
         self.signals.set_signal_mask(mask);
