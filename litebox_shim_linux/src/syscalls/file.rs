@@ -1744,6 +1744,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
         use litebox::fs::errors::{FileStatusError, PathError};
 
         let fs = self.fs.borrow();
+        if pathname
+            .as_rust_str()
+            .map_err(|_| Errno::EINVAL)?
+            .is_empty()
+        {
+            return Err(Errno::ENOENT);
+        }
+
         // Resolve relative paths against the CWD, and normalize (handle `.` / `..`).
         let target = fs
             .context
@@ -2865,6 +2873,7 @@ mod tests {
             task.sys_chdir("/does_not_exist").unwrap_err(),
             Errno::ENOENT
         );
+        assert_eq!(task.sys_chdir("").unwrap_err(), Errno::ENOENT);
 
         // chdir to a regular file → ENOTDIR.
         let fd = task
