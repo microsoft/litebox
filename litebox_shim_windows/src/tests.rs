@@ -200,7 +200,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     pub(crate) fn clone_for_test_with_teb(&self, teb_address: usize) -> Option<Self> {
         let thread_id = self.process.allocate_thread_id();
-        let thread_object = Arc::new(crate::syscalls::thread::ThreadObject::new(thread_id, 0));
+        let thread_object = Arc::new(crate::syscalls::thread::ThreadObject::new(
+            thread_id,
+            teb_address,
+        ));
         if !self.process.attach_thread(thread_id, &thread_object) {
             return None;
         }
