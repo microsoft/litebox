@@ -640,13 +640,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 "Replacing process TLS vector"
             );
 
-            if let Err(status) = self.copy_tls_slots(old_tls_data, new_tls_data, previous_count) {
+            if old_tls_data == 0 {
+                continue;
+            }
+            if let Err(status) = Self::copy_tls_slots(old_tls_data, new_tls_data, previous_count) {
                 return status;
             }
-            let old_tls_data_for_guest =
-                Self::guest_visible_old_tls_vector(old_tls_data, teb_address);
 
-            if thread_data.write_tls_data(old_tls_data_for_guest).is_none()
+            if thread_data.write_tls_data(old_tls_data).is_none()
                 || Self::write_teb_tls_pointer(teb, new_tls_data).is_none()
             {
                 return NtStatus::ACCESS_VIOLATION;
@@ -754,35 +755,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
-    fn guest_visible_old_tls_vector(old_tls_data: usize, teb_address: usize) -> usize {
-        if old_tls_data > 0x10010
-            && old_tls_data >= teb_address
-            && old_tls_data < teb_address.saturating_add(size_of::<ThreadEnvironmentBlock>())
-        {
-            // The loader frees the returned old vector. The initial vector lives inside
-            // TEB.tls_slots, so report no heap-backed vector instead of exposing TEB memory.
-            0
-        } else {
-            old_tls_data
-        }
-    }
-
     fn copy_tls_slots(
-        &self,
         old_tls_data: usize,
         new_tls_data: usize,
         count: usize,
     ) -> Result<(), NtStatus> {
-        if old_tls_data <= 0x10010 || new_tls_data <= 0x10010 {
+        if count == 0 {
             return Ok(());
         }
-        let initial_tls_slots = self
-            .thread_object
-            .teb_address()
-            .checked_add(offset_of!(ThreadEnvironmentBlock, tls_slots))
-            .ok_or(NtStatus::INVALID_PARAMETER)?;
-        if old_tls_data != initial_tls_slots {
-            return Ok(());
+        if !old_tls_data.is_multiple_of(align_of::<usize>())
+            || !new_tls_data.is_multiple_of(align_of::<usize>())
+        {
+            return Err(NtStatus::DATATYPE_MISALIGNMENT);
         }
         let old_tls_slots = ConstPtr::<Platform, usize>::from_usize(old_tls_data);
         let new_tls_slots = MutPtr::<Platform, usize>::from_usize(new_tls_data);
