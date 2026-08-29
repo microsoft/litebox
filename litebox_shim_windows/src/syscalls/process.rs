@@ -517,7 +517,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 return NtStatus::ACCESS_VIOLATION;
             };
             // TODO(multi-thread-tls): read ith thread's tls
-            let teb = MutPtr::<Platform, ThreadEnvironmentBlock>::from_usize(self.teb_address);
+            let teb = MutPtr::<Platform, ThreadEnvironmentBlock>::from_usize(
+                self.thread_object.teb_address(),
+            );
             let Some(old_tls_data) = Self::read_teb_tls_pointer(teb) else {
                 return NtStatus::ACCESS_VIOLATION;
             };
@@ -571,7 +573,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 return NtStatus::ACCESS_VIOLATION;
             };
             // TODO(multi-thread-tls): read ith thread's tls
-            let teb = ConstPtr::<Platform, ThreadEnvironmentBlock>::from_usize(self.teb_address);
+            let teb = ConstPtr::<Platform, ThreadEnvironmentBlock>::from_usize(
+                self.thread_object.teb_address(),
+            );
             let Some(tls_array) = Self::read_teb_tls_pointer(teb) else {
                 return NtStatus::ACCESS_VIOLATION;
             };
@@ -608,12 +612,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     fn guest_visible_old_tls_vector(&self, old_tls_data: usize) -> usize {
+        let teb_address = self.thread_object.teb_address();
         if old_tls_data > 0x10010
-            && old_tls_data >= self.teb_address
-            && old_tls_data
-                < self
-                    .teb_address
-                    .saturating_add(size_of::<ThreadEnvironmentBlock>())
+            && old_tls_data >= teb_address
+            && old_tls_data < teb_address.saturating_add(size_of::<ThreadEnvironmentBlock>())
         {
             // The loader frees the returned old vector. The initial vector lives inside
             // TEB.tls_slots, so report no heap-backed vector instead of exposing TEB memory.
@@ -632,7 +634,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return Ok(());
         }
         let initial_tls_slots = self
-            .teb_address
+            .thread_object
+            .teb_address()
             .checked_add(offset_of!(ThreadEnvironmentBlock, tls_slots))
             .ok_or(NtStatus::INVALID_PARAMETER)?;
         if old_tls_data != initial_tls_slots {

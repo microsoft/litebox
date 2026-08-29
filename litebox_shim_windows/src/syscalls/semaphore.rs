@@ -14,7 +14,6 @@ use litebox_common_windows::nt_status::NtStatus;
 
 use crate::nt_types::{AccessMask, ObjectAttributes, ObjectAttributesFlags};
 use crate::syscalls::Handle;
-use crate::syscalls::object_manager::read_dispatcher_object_attributes;
 use crate::{ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value};
 
 bitflags::bitflags! {
@@ -160,7 +159,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         let (object_attributes, semaphore_name) =
-            match read_dispatcher_object_attributes::<Platform>(object_attributes, false) {
+            match self.read_dispatcher_object_attributes(object_attributes, false) {
                 Ok(value) => value,
                 Err(status) => return status,
             };
@@ -224,12 +223,11 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if let Err(status) = probe_guest_output_preserving_value::<Platform, _>(semaphore_handle) {
             return status;
         }
-        let semaphore_name =
-            match read_dispatcher_object_attributes::<Platform>(object_attributes, true) {
-                Ok((_, Some(semaphore_name))) => semaphore_name,
-                Ok((_, None)) => return NtStatus::OBJECT_NAME_INVALID,
-                Err(status) => return status,
-            };
+        let semaphore_name = match self.read_dispatcher_object_attributes(object_attributes, true) {
+            Ok((_, Some(semaphore_name))) => semaphore_name,
+            Ok((_, None)) => return NtStatus::OBJECT_NAME_INVALID,
+            Err(status) => return status,
+        };
         let semaphore = match self
             .process
             .object_manager
@@ -288,7 +286,6 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 }
 
 // TODO(semaphore-query): Implement NtQuerySemaphore.
-// TODO(mutants): Implement NT mutant dispatcher objects and syscalls.
 
 #[cfg(test)]
 mod tests {

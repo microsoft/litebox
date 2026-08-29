@@ -13,16 +13,18 @@ use litebox::platform::{RawConstPointer as _, SystemTime as _};
 use litebox_common_windows::nt_status::NtStatus;
 
 use crate::nt_types::AccessMask;
-use crate::syscalls::Handle;
 use crate::syscalls::event::{EventObject, EventSubsystem};
+use crate::syscalls::mutant::{MutantObject, MutantSubsystem};
 use crate::syscalls::semaphore::{SemaphoreObject, SemaphoreSubsystem};
 use crate::syscalls::thread::{ThreadObject, ThreadSubsystem};
+use crate::syscalls::{Handle, WaitAcquireResult};
 use crate::{ConstPtr, ShimFS, ShimPlatform, Task};
 
 /// A dispatcher object that a guest thread can block on.
 enum WaitableObject<Platform: ShimPlatform> {
     Thread(Arc<ThreadObject<Platform>>),
     Event(Arc<EventObject<Platform>>),
+    Mutant(Arc<MutantObject<Platform>>),
     Semaphore(Arc<SemaphoreObject<Platform>>),
 }
 
@@ -32,18 +34,29 @@ impl<Platform: ShimPlatform> WaitableObject<Platform> {
         match self {
             Self::Thread(thread) => thread.register_observer(observer, mask),
             Self::Event(event) => event.register_observer(observer, mask),
+            Self::Mutant(mutant) => mutant.register_observer(observer, mask),
             Self::Semaphore(semaphore) => semaphore.register_observer(observer, mask),
         }
     }
 
     /// Attempts to satisfy a wait, consuming the signal if the object
-    /// auto-resets. Returns `false` while the object is nonsignaled.
-    fn try_acquire(&self) -> bool {
+    /// auto-resets. Returns `None` while the object is nonsignaled.
+    fn try_acquire(
+        &self,
+        thread_id: usize,
+        thread: &ThreadObject<Platform>,
+    ) -> Option<WaitAcquireResult> {
         match self {
             // Thread completion is terminal, so readiness is enough.
-            Self::Thread(thread) => thread.check_io_events().contains(Events::IN),
-            Self::Event(event) => event.try_acquire(),
-            Self::Semaphore(semaphore) => semaphore.try_acquire(),
+            Self::Thread(thread) => thread
+                .check_io_events()
+                .contains(Events::IN)
+                .then_some(WaitAcquireResult::Acquired),
+            Self::Event(event) => event.try_acquire().then_some(WaitAcquireResult::Acquired),
+            Self::Mutant(mutant) => mutant.try_acquire(thread_id, thread),
+            Self::Semaphore(semaphore) => semaphore
+                .try_acquire()
+                .then_some(WaitAcquireResult::Acquired),
         }
     }
 }
@@ -72,9 +85,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
         try_wait!(ThreadSubsystem<Platform>, Thread, thread);
         try_wait!(EventSubsystem<Platform>, Event, event);
+        try_wait!(MutantSubsystem<Platform>, Mutant, mutant);
         try_wait!(SemaphoreSubsystem<Platform>, Semaphore, semaphore);
 
-        // TODO(waitable-objects): timers, mutants, processes and
+        // TODO(waitable-objects): timers, processes and
         // I/O completion ports are waitable on the host but not yet modeled.
         litebox_util_log::debug!(
             handle:? = handle;
@@ -116,26 +130,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Ok(())
             },
             || {
-                if object.try_acquire() {
-                    Ok(())
-                } else {
-                    Err(TryOpError::<NtStatus>::TryAgain)
-                }
+                object
+                    .try_acquire(self.thread_object.thread_id(), &self.thread_object)
+                    .ok_or(TryOpError::<NtStatus>::TryAgain)
             },
         ) {
-            Ok(()) => {
-                match &object {
-                    WaitableObject::Thread(thread) => litebox_util_log::debug!(
-                        exit_status = thread.exit_status();
-                        "Thread wait completed"
-                    ),
-                    WaitableObject::Event(_) => litebox_util_log::debug!("Event wait completed"),
-                    WaitableObject::Semaphore(_) => {
-                        litebox_util_log::debug!("Semaphore wait completed");
-                    }
-                }
-                NtStatus::SUCCESS
-            }
+            Ok(acquire_result) => match acquire_result {
+                WaitAcquireResult::Acquired => NtStatus::SUCCESS,
+                WaitAcquireResult::Abandoned => NtStatus::ABANDONED_WAIT_0,
+            },
             Err(TryOpError::WaitError(WaitError::TimedOut)) => NtStatus::TIMEOUT,
             Err(TryOpError::WaitError(WaitError::Interrupted)) => NtStatus::ALERTED,
             Err(TryOpError::TryAgain) => unreachable!("blocking wait cannot return TryAgain"),

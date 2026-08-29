@@ -36,6 +36,7 @@ use crate::syscalls::event::{EventHandleObject, EventSubsystem};
 use crate::syscalls::file::{FileObject, FileObjectSubsystem};
 use crate::syscalls::iocp::{IoCompletionHandleObject, IoCompletionSubsystem};
 use crate::syscalls::lpc::{LpcPortHandleObject, LpcPortSubsystem};
+use crate::syscalls::mutant::{MutantHandleObject, MutantSubsystem};
 use crate::syscalls::object_manager::{
     DirectoryHandleObject, DirectoryObjectSubsystem, ObjectManager,
 };
@@ -541,7 +542,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
         process.ntdll = load_info.ntdll;
         process.peb_address = load_info.environment.peb;
         let process = Arc::new(process);
-        let thread_object = Arc::new(syscalls::thread::ThreadObject::new());
+        let thread_object = Arc::new(syscalls::thread::ThreadObject::new(
+            syscalls::process::INITIAL_THREAD_ID,
+            load_info.environment.teb,
+        ));
         let attached = process.attach_thread(syscalls::process::INITIAL_THREAD_ID, &thread_object);
         debug_assert!(attached, "a freshly created process cannot be exiting");
         Ok(LoadedProgram {
@@ -553,9 +557,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
                     wait_state: wait::WaitState::new(self.0.platform),
                     entry_point: load_info.entry_point,
                     stack_top: load_info.stack_top,
-                    teb_address: load_info.environment.teb,
                     context: load_info.environment.context,
-                    thread_id: syscalls::process::INITIAL_THREAD_ID,
                     thread_object,
                 },
                 _not_send: PhantomData,
@@ -721,17 +723,16 @@ struct Task<Platform: ShimPlatform, FS: ShimFS> {
     entry_point: usize,
     stack_top: usize,
     context: usize,
-    teb_address: usize,
-    /// The NT thread ID of this task, used as its key in [`ProcessThreads`].
-    thread_id: usize,
     /// The NT thread object backing this task.
     thread_object: Arc<syscalls::thread::ThreadObject<Platform>>,
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     fn complete_current_thread(&self) {
+        let thread_id = self.thread_object.thread_id();
         self.thread_object.complete(|| {
-            self.process.detach_thread(self.thread_id);
+            self.thread_object.abandon_owned_mutants(thread_id);
+            self.process.detach_thread(thread_id);
         });
     }
 
@@ -761,7 +762,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     fn exit_other_threads(&self, exit_status: i32) {
         let threads = self.process.threads.read();
         for (thread_id, thread) in &threads.threads {
-            if *thread_id != self.thread_id {
+            if *thread_id != self.thread_object.thread_id() {
                 thread.begin_exit(exit_status);
             }
         }
@@ -772,7 +773,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // the thread itself, because the handle captures the current platform
         // thread.
         self.publish_thread_handle();
-        if !set_guest_teb(self.global.platform, self.teb_address) {
+        if !set_guest_teb(self.global.platform, self.thread_object.teb_address()) {
             self.exit_thread(NtStatus::ACCESS_VIOLATION.as_raw());
             return;
         }
@@ -1038,6 +1039,17 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 object_attributes,
                 event_type,
                 initial_state,
+            ),
+            SyscallRequest::NtCreateMutant {
+                mutant_handle,
+                desired_access,
+                object_attributes,
+                initial_owner,
+            } => self.sys_nt_create_mutant(
+                mutant_handle,
+                desired_access,
+                object_attributes,
+                initial_owner,
             ),
             SyscallRequest::NtCreateSemaphore {
                 semaphore_handle,
@@ -1326,11 +1338,20 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 desired_access,
                 object_attributes,
             } => self.sys_nt_open_event(event_handle, desired_access, object_attributes),
+            SyscallRequest::NtOpenMutant {
+                mutant_handle,
+                desired_access,
+                object_attributes,
+            } => self.sys_nt_open_mutant(mutant_handle, desired_access, object_attributes),
             SyscallRequest::NtOpenSemaphore {
                 semaphore_handle,
                 desired_access,
                 object_attributes,
             } => self.sys_nt_open_semaphore(semaphore_handle, desired_access, object_attributes),
+            SyscallRequest::NtReleaseMutant {
+                mutant_handle,
+                previous_count,
+            } => self.sys_nt_release_mutant(mutant_handle, previous_count),
             SyscallRequest::NtReleaseSemaphore {
                 semaphore_handle,
                 release_count,
@@ -1360,6 +1381,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 event_information_class,
                 event_information,
                 event_information_length,
+                return_length,
+            ),
+            SyscallRequest::NtQueryMutant {
+                mutant_handle,
+                mutant_information_class,
+                mutant_information,
+                mutant_information_length,
+                return_length,
+            } => self.sys_nt_query_mutant(
+                mutant_handle,
+                mutant_information_class,
+                mutant_information,
+                mutant_information_length,
                 return_length,
             ),
             SyscallRequest::NtSetEventBoostPriority { event_handle } => {
@@ -2392,6 +2426,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         try_metadata!(FileObjectSubsystem<FS>);
         try_metadata!(RegistryKeySubsystem<Platform>);
         try_metadata!(EventSubsystem<Platform>);
+        try_metadata!(MutantSubsystem<Platform>);
         try_metadata!(SemaphoreSubsystem<Platform>);
         try_metadata!(DirectoryObjectSubsystem<Platform>);
         try_metadata!(SymbolicLinkSubsystem<Platform>);
@@ -2441,6 +2476,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         try_set_attributes!(FileObjectSubsystem<FS>);
         try_set_attributes!(RegistryKeySubsystem<Platform>);
         try_set_attributes!(EventSubsystem<Platform>);
+        try_set_attributes!(MutantSubsystem<Platform>);
         try_set_attributes!(SemaphoreSubsystem<Platform>);
         try_set_attributes!(DirectoryObjectSubsystem<Platform>);
         try_set_attributes!(SymbolicLinkSubsystem<Platform>);
@@ -2586,6 +2622,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         try_duplicate!(FileObjectSubsystem<FS>);
         try_duplicate!(RegistryKeySubsystem<Platform>);
         try_duplicate!(EventSubsystem<Platform>);
+        try_duplicate!(MutantSubsystem<Platform>);
         try_duplicate!(SemaphoreSubsystem<Platform>);
         try_duplicate!(DirectoryObjectSubsystem<Platform>);
         try_duplicate!(SymbolicLinkSubsystem<Platform>);
@@ -2695,6 +2732,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         try_close!(FileObjectSubsystem<FS>, file);
         try_close!(RegistryKeySubsystem<Platform>, registry_key);
         try_close!(EventSubsystem<Platform>, event);
+        try_close!(MutantSubsystem<Platform>, mutant);
         try_close!(SemaphoreSubsystem<Platform>, semaphore);
         try_close!(DirectoryObjectSubsystem<Platform>, directory);
         try_close!(SymbolicLinkSubsystem<Platform>, symbolic_link);
@@ -2863,6 +2901,8 @@ trait RawHandleVisitor<Platform: ShimPlatform, FS: ShimFS> {
 
     fn event(&self, event: EventHandleObject<Platform>);
 
+    fn mutant(&self, mutant: MutantHandleObject<Platform>);
+
     fn semaphore(&self, semaphore: SemaphoreHandleObject<Platform>);
 
     fn directory(&self, directory: DirectoryHandleObject<Platform>);
@@ -2906,6 +2946,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> RawHandleVisitor<Platform, FS>
 
     fn event(&self, event: EventHandleObject<Platform>) {
         Task::<Platform, FS>::close_event(event);
+    }
+
+    fn mutant(&self, mutant: MutantHandleObject<Platform>) {
+        Task::<Platform, FS>::close_mutant(mutant);
     }
 
     fn semaphore(&self, semaphore: SemaphoreHandleObject<Platform>) {

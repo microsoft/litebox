@@ -24,6 +24,7 @@ use crate::nt_types::{
 };
 use crate::syscalls::Handle;
 use crate::syscalls::event::EventObject;
+use crate::syscalls::mutant::MutantObject;
 use crate::syscalls::section::{
     SectionObject, WINDOWS_SESSION_SHARED_SECTION_OBJECT, WINDOWS_SHARED_SECTION_OBJECT,
 };
@@ -88,6 +89,7 @@ const SEEDED_DIRECTORY_PATHS: &[&str] = &[
     r"\",
     r"\??",
     r"\BaseNamedObjects",
+    r"\BaseNamedObjects\Local",
     r"\Device",
     r"\Driver",
     r"\KnownDlls",
@@ -97,6 +99,7 @@ const SEEDED_DIRECTORY_PATHS: &[&str] = &[
     r"\Sessions",
     r"\Sessions\0",
     r"\Sessions\0\BaseNamedObjects",
+    r"\Sessions\0\BaseNamedObjects\Local",
     r"\Sessions\0\DosDevices",
     r"\Sessions\0\Windows",
     r"\Sessions\0\Windows\WindowStations",
@@ -207,6 +210,9 @@ enum NamedObject<Platform: crate::ShimPlatform> {
     },
     Event {
         event: Weak<EventObject<Platform>>,
+    },
+    Mutant {
+        mutant: Weak<MutantObject<Platform>>,
     },
     Semaphore {
         semaphore: Weak<SemaphoreObject<Platform>>,
@@ -385,6 +391,7 @@ impl<Platform: crate::ShimPlatform> ObjectNode<Platform> {
         new_directory() => NamedObject::Directory { children: BTreeMap::new() };
         new_symlink(target: String) => NamedObject::Symlink { target };
         new_event(event: Weak<EventObject<Platform>>) => NamedObject::Event { event };
+        new_mutant(mutant: Weak<MutantObject<Platform>>) => NamedObject::Mutant { mutant };
         new_semaphore(semaphore: Weak<SemaphoreObject<Platform>>) => NamedObject::Semaphore { semaphore };
         new_section(section: Weak<SectionObject<Platform>>) => NamedObject::Section { section };
         new_file_device(device: FileDeviceObject) => NamedObject::FileDevice { device };
@@ -431,6 +438,7 @@ impl<Platform: crate::ShimPlatform> ObjectNode<Platform> {
         directory_object, ObjectLeafLookup<()>, NamedObject::Directory { .. } => ObjectLeafLookup::Live(());
         pub(super) symlink_target, ObjectLeafLookup<String>, NamedObject::Symlink { target } => ObjectLeafLookup::Live(target.clone());
         event_object, ObjectLeafLookup<Arc<EventObject<Platform>>>, NamedObject::Event { event } => ObjectLeafLookup::from_weak(event);
+        mutant_object, ObjectLeafLookup<Arc<MutantObject<Platform>>>, NamedObject::Mutant { mutant } => ObjectLeafLookup::from_weak(mutant);
         semaphore_object, ObjectLeafLookup<Arc<SemaphoreObject<Platform>>>, NamedObject::Semaphore { semaphore } => ObjectLeafLookup::from_weak(semaphore);
         section_object, ObjectLeafLookup<Arc<SectionObject<Platform>>>, NamedObject::Section { section } => ObjectLeafLookup::from_weak(section);
         file_device_object, ObjectLeafLookup<FileDeviceObject>, NamedObject::FileDevice { device } => ObjectLeafLookup::Live(device.clone());
@@ -442,6 +450,7 @@ impl<Platform: crate::ShimPlatform> ObjectNode<Platform> {
             NamedObject::Directory { .. } => Some("Directory"),
             NamedObject::Symlink { .. } => Some("SymbolicLink"),
             NamedObject::Event { event } => event.upgrade().map(|_| "Event"),
+            NamedObject::Mutant { mutant } => mutant.upgrade().map(|_| "Mutant"),
             NamedObject::Semaphore { semaphore } => semaphore.upgrade().map(|_| "Semaphore"),
             NamedObject::Section { section } => section.upgrade().map(|_| "Section"),
             NamedObject::FileDevice { .. } => Some("Device"),
@@ -534,6 +543,24 @@ impl<Platform: crate::ShimPlatform> ObjectManager<Platform> {
             path,
             |node| node.event_object(),
             |path, parent, name| ObjectNode::new_event(path, parent, name, event),
+            NtStatus::OBJECT_TYPE_MISMATCH,
+            on_exists,
+            |_| on_created(),
+        )
+    }
+
+    pub(super) fn create_mutant(
+        &self,
+        path: &str,
+        mutant: &Arc<MutantObject<Platform>>,
+        on_exists: impl FnOnce(Arc<MutantObject<Platform>>) -> NtStatus,
+        on_created: impl FnOnce() -> NtStatus,
+    ) -> NtStatus {
+        let mutant = Arc::downgrade(mutant);
+        self.create_child(
+            path,
+            |node| node.mutant_object(),
+            |path, parent, name| ObjectNode::new_mutant(path, parent, name, mutant),
             NtStatus::OBJECT_TYPE_MISMATCH,
             on_exists,
             |_| on_created(),
@@ -685,6 +712,13 @@ impl<Platform: crate::ShimPlatform> ObjectManager<Platform> {
 
     pub(super) fn resolve_event(&self, path: &str) -> Result<Arc<EventObject<Platform>>, NtStatus> {
         self.resolve_object_leaf(path, false, |node| node.event_object())
+    }
+
+    pub(super) fn resolve_mutant(
+        &self,
+        path: &str,
+    ) -> Result<Arc<MutantObject<Platform>>, NtStatus> {
+        self.resolve_object_leaf(path, false, |node| node.mutant_object())
     }
 
     pub(super) fn resolve_semaphore(
@@ -922,46 +956,6 @@ fn read_directory_name_string<Platform: RawPointerProvider>(
         return Err(NtStatus::ACCESS_VIOLATION);
     }
     Ok(Some(unicode_string.read_string::<Platform>()?))
-}
-
-pub(super) fn read_dispatcher_object_attributes<Platform: RawPointerProvider>(
-    object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
-    require_name: bool,
-) -> Result<(Option<ObjectAttributes>, Option<String>), NtStatus> {
-    let Some(object_attributes_ptr) = object_attributes else {
-        if require_name {
-            return Err(NtStatus::INVALID_PARAMETER);
-        }
-        return Ok((None, None));
-    };
-    let object_attributes = read_object_attributes::<Platform>(object_attributes_ptr)?;
-    if ObjectAttributesFlags::from_bits_retain(object_attributes.attributes)
-        .contains(ObjectAttributesFlags::OPENLINK)
-    {
-        return Err(NtStatus::INVALID_PARAMETER);
-    }
-    if object_attributes.object_name == 0 {
-        if !object_attributes.root_directory.is_null() {
-            return Err(NtStatus::OBJECT_NAME_INVALID);
-        }
-        if require_name {
-            return Err(NtStatus::OBJECT_NAME_INVALID);
-        }
-        return Ok((Some(object_attributes), None));
-    }
-    if !object_attributes.root_directory.is_null() {
-        return Err(NtStatus::OBJECT_PATH_NOT_FOUND);
-    }
-
-    let Some(original_path) =
-        read_directory_name_string::<Platform>(object_attributes.object_name)?
-    else {
-        return Err(NtStatus::OBJECT_NAME_INVALID);
-    };
-    if original_path.is_empty() {
-        return Err(NtStatus::OBJECT_NAME_INVALID);
-    }
-    Ok((Some(object_attributes), Some(original_path)))
 }
 
 fn utf16_byte_len(value: &str) -> Result<usize, NtStatus> {
@@ -1244,6 +1238,31 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok((
             Some(object_attributes),
             Some(DirectoryName { original_path }),
+        ))
+    }
+
+    pub(super) fn read_dispatcher_object_attributes(
+        &self,
+        object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
+        require_name: bool,
+    ) -> Result<(Option<ObjectAttributes>, Option<String>), NtStatus> {
+        let Some(object_attributes_ptr) = object_attributes else {
+            if require_name {
+                return Err(NtStatus::INVALID_PARAMETER);
+            }
+            return Ok((None, None));
+        };
+        let (object_attributes, name) =
+            self.read_directory_object_attributes(Some(object_attributes_ptr), require_name)?;
+        if object_attributes.is_some_and(|object_attributes| {
+            ObjectAttributesFlags::from_bits_retain(object_attributes.attributes)
+                .contains(ObjectAttributesFlags::OPENLINK)
+        }) {
+            return Err(NtStatus::INVALID_PARAMETER);
+        }
+        Ok((
+            object_attributes,
+            name.map(|DirectoryName { original_path }| original_path),
         ))
     }
 
@@ -2168,14 +2187,26 @@ mod tests {
     fn directory_lookup_is_case_insensitive_and_case_preserving() {
         run_with_test_platform_pointers(|| {
             let task = test_task();
-            let mixed = create_named_directory(&task, r"\BaseNamedObjects\LiteBoxCaseMixed");
-            let lower_open = open_named_directory(&task, r"\basenamedobjects\liteboxcasemixed");
-            let trailing_open = open_named_directory(&task, r"\BaseNamedObjects\LiteBoxCaseMixed\");
-            let lower_created =
-                create_named_directory(&task, r"\BaseNamedObjects\liteboxcaselower");
-            let upper_open = open_named_directory(&task, r"\BASENAMEDOBJECTS\LITEBOXCASELOWER");
+            let case_root = create_named_directory(&task, r"\BaseNamedObjects\LiteBoxCaseRoot");
+            let mixed = create_named_directory(
+                &task,
+                r"\BaseNamedObjects\LiteBoxCaseRoot\LiteBoxCaseMixed",
+            );
+            let lower_open =
+                open_named_directory(&task, r"\basenamedobjects\liteboxcaseroot\liteboxcasemixed");
+            let trailing_open = open_named_directory(
+                &task,
+                r"\BaseNamedObjects\LiteBoxCaseRoot\LiteBoxCaseMixed\",
+            );
+            let lower_created = create_named_directory(
+                &task,
+                r"\BaseNamedObjects\LiteBoxCaseRoot\liteboxcaselower",
+            );
+            let upper_open =
+                open_named_directory(&task, r"\BASENAMEDOBJECTS\LITEBOXCASEROOT\LITEBOXCASELOWER");
 
-            let duplicate_units = utf16_units(r"\basenamedobjects\liteboxcasemixed\");
+            let duplicate_units =
+                utf16_units(r"\basenamedobjects\liteboxcaseroot\liteboxcasemixed\");
             let duplicate_name = unicode_string(&duplicate_units);
             let duplicate_attrs = object_attributes(
                 &duplicate_name,
@@ -2194,7 +2225,7 @@ mod tests {
             );
             assert_eq!(duplicate, Handle::default());
 
-            let parent = open_named_directory(&task, r"\BaseNamedObjects");
+            let parent = open_named_directory(&task, r"\BaseNamedObjects\LiteBoxCaseRoot");
             let mut buffer = [0u8; 512];
             let mut context = 0u32;
             let mut return_length = 0u32;
@@ -2247,6 +2278,7 @@ mod tests {
             assert_eq!(task.sys_nt_close(trailing_open), NtStatus::SUCCESS);
             assert_eq!(task.sys_nt_close(lower_open), NtStatus::SUCCESS);
             assert_eq!(task.sys_nt_close(mixed), NtStatus::SUCCESS);
+            assert_eq!(task.sys_nt_close(case_root), NtStatus::SUCCESS);
         });
     }
 
@@ -2404,18 +2436,7 @@ mod tests {
     fn query_empty_directory_reports_no_more_entries() {
         run_with_test_platform_pointers(|| {
             let task = test_task();
-            let name_units = utf16_units(r"\BaseNamedObjects");
-            let name = unicode_string(&name_units);
-            let attrs = object_attributes(&name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
-            let mut handle = Handle::default();
-            assert_eq!(
-                task.sys_nt_open_directory_object(
-                    mut_ptr(&mut handle),
-                    DIRECTORY_QUERY,
-                    Some(const_ptr(&attrs)),
-                ),
-                NtStatus::SUCCESS
-            );
+            let handle = create_named_directory(&task, r"\BaseNamedObjects\LiteBoxEmpty");
 
             let mut buffer = [0xffu8; 32];
             let mut context = 99u32;
@@ -2443,9 +2464,11 @@ mod tests {
     fn query_directory_enumerates_children_in_stable_order() {
         run_with_test_platform_pointers(|| {
             let task = test_task();
-            let first = create_named_directory(&task, r"\BaseNamedObjects\LiteBoxEnumB");
-            let second = create_named_directory(&task, r"\BaseNamedObjects\LiteBoxEnumA");
-            let handle = open_named_directory(&task, r"\BaseNamedObjects");
+            let handle = create_named_directory(&task, r"\BaseNamedObjects\LiteBoxEnumRoot");
+            let first =
+                create_named_directory(&task, r"\BaseNamedObjects\LiteBoxEnumRoot\LiteBoxEnumB");
+            let second =
+                create_named_directory(&task, r"\BaseNamedObjects\LiteBoxEnumRoot\LiteBoxEnumA");
             let mut buffer = [0u8; 512];
             let mut context = u32::MAX;
             let mut return_length = 0u32;
@@ -2502,9 +2525,15 @@ mod tests {
     fn query_directory_single_entry_uses_context_cookie() {
         run_with_test_platform_pointers(|| {
             let task = test_task();
-            let first = create_named_directory(&task, r"\BaseNamedObjects\LiteBoxSingleA");
-            let second = create_named_directory(&task, r"\BaseNamedObjects\LiteBoxSingleB");
-            let handle = open_named_directory(&task, r"\BaseNamedObjects");
+            let handle = create_named_directory(&task, r"\BaseNamedObjects\LiteBoxSingleRoot");
+            let first = create_named_directory(
+                &task,
+                r"\BaseNamedObjects\LiteBoxSingleRoot\LiteBoxSingleA",
+            );
+            let second = create_named_directory(
+                &task,
+                r"\BaseNamedObjects\LiteBoxSingleRoot\LiteBoxSingleB",
+            );
             let mut buffer = [0u8; 256];
             let mut context = 123u32;
             let mut return_length = 0u32;
@@ -2562,8 +2591,9 @@ mod tests {
     fn query_directory_too_small_reports_required_length_without_advancing_context() {
         run_with_test_platform_pointers(|| {
             let task = test_task();
-            let child = create_named_directory(&task, r"\BaseNamedObjects\LiteBoxSmall");
-            let handle = open_named_directory(&task, r"\BaseNamedObjects");
+            let handle = create_named_directory(&task, r"\BaseNamedObjects\LiteBoxSmallRoot");
+            let child =
+                create_named_directory(&task, r"\BaseNamedObjects\LiteBoxSmallRoot\LiteBoxSmall");
             let mut buffer = [0xffu8; 8];
             let mut context = 99u32;
             let mut return_length = 0u32;
