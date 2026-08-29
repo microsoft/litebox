@@ -9,7 +9,7 @@ use litebox::utils::TruncateExt;
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-use crate::nt_types::ThreadEnvironmentBlock;
+use crate::nt_types::{ListEntry, ThreadEnvironmentBlock};
 use crate::syscalls::ProcessHandle;
 use crate::{ConstPtr, MutPtr, ShimFS, ShimPlatform, Task};
 
@@ -21,8 +21,6 @@ const GUEST_PARENT_PROCESS_ID: usize = 0;
 const GUEST_PROCESS_AFFINITY_MASK: usize = 1;
 const PROCESS_DEBUG_FLAGS_NO_DEBUGGER: u32 = 1;
 const PROCESS_COOKIE: u32 = 0xdead_beef;
-const TEB_TLS_SLOT_COUNT: usize = 64;
-
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, IntEnum)]
 enum ProcessInformationClass {
@@ -34,7 +32,7 @@ enum ProcessInformationClass {
     TlsInformation = 35,
     Cookie = 36,
     ConsoleHostProcess = 49,
-    ImageInformation = 53,
+    DynamicFunctionTableInformation = 53,
     SchedulerSharedData = 112,
 }
 
@@ -79,6 +77,39 @@ struct ProcessSchedulerSharedDataSlotInformation {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
+struct ProcessDynamicFunctionTableInformation {
+    dynamic_function_table: usize,
+    remove: u8,
+    _padding0: [u8; 7],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable)]
+struct RtlBalancedNode {
+    children: [usize; 2],
+    parent_value: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable)]
+struct DynamicFunctionTable {
+    list_entry: ListEntry,
+    function_table: usize,
+    time_stamp: i64,
+    minimum_address: u64,
+    maximum_address: u64,
+    base_address: u64,
+    callback: usize,
+    context: usize,
+    out_of_process_callback_dll: usize,
+    table_type: u32,
+    entry_count: u32,
+    tree_node_min: RtlBalancedNode,
+    tree_node_max: RtlBalancedNode,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
 struct ProcessTlsInformationHeader {
     flags: u32,
     operation_type: u32,
@@ -90,7 +121,8 @@ struct ProcessTlsInformationHeader {
 #[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes)]
 struct ProcessTlsInformationExtendedHeader {
     header: ProcessTlsInformationHeader,
-    _reserved: usize,
+    previous_count: u32,
+    _padding0: u32,
 }
 
 #[repr(C)]
@@ -109,7 +141,7 @@ struct ProcessTlsThreadDataExtended {
     _padding0: u32,
     new_tls_data: usize,
     old_tls_data: usize,
-    _reserved: usize,
+    thread_id: usize,
 }
 
 enum ProcessTlsThreadData<Platform: RawPointerProvider> {
@@ -157,6 +189,16 @@ impl<Platform: RawPointerProvider> ProcessTlsThreadData<Platform> {
                 ptr.as_usize(),
                 offset_of!(ProcessTlsThreadDataExtended, flags),
                 flags.bits(),
+            ),
+        }
+    }
+
+    fn read_thread_id(&self) -> Option<usize> {
+        match self {
+            Self::Simple(_) => None,
+            Self::Extended(ptr) => crate::read_field_at_offset::<Platform, _>(
+                ptr.as_usize(),
+                offset_of!(ProcessTlsThreadDataExtended, thread_id),
             ),
         }
     }
@@ -214,6 +256,21 @@ impl ProcessTlsLayout {
         match self {
             Self::Simple => offset_of!(ProcessTlsThreadDataSimple, tls_data),
             Self::Extended => offset_of!(ProcessTlsThreadDataExtended, old_tls_data),
+        }
+    }
+
+    fn previous_count<Platform: RawPointerProvider>(
+        self,
+        base: MutPtr<Platform, u8>,
+        header: ProcessTlsInformationHeader,
+    ) -> Option<usize> {
+        match self {
+            Self::Simple => Some(header.tls_index as usize),
+            Self::Extended => crate::read_field_at_offset::<Platform, u32>(
+                base.as_usize(),
+                offset_of!(ProcessTlsInformationExtendedHeader, previous_count),
+            )
+            .map(|count| count as usize),
         }
     }
 
@@ -308,7 +365,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             ),
             ProcessInformationClass::ConsoleHostProcess
             | ProcessInformationClass::TlsInformation
-            | ProcessInformationClass::ImageInformation
+            | ProcessInformationClass::DynamicFunctionTableInformation
             | ProcessInformationClass::SchedulerSharedData => {
                 litebox_util_log::debug!(
                     process_information_class:? = process_information_class;
@@ -359,6 +416,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 process_information,
                 process_information_length,
             ),
+            ProcessInformationClass::DynamicFunctionTableInformation => {
+                Self::set_process_dynamic_function_table_information(
+                    process_handle,
+                    process_information,
+                    process_information_length,
+                )
+            }
             // TODO: implement additional settable process information classes when a guest
             // exercises them.
             ProcessInformationClass::BasicInformation
@@ -367,8 +431,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             | ProcessInformationClass::Wow64Information
             | ProcessInformationClass::DebugFlags
             | ProcessInformationClass::Cookie
-            | ProcessInformationClass::ConsoleHostProcess
-            | ProcessInformationClass::ImageInformation => {
+            | ProcessInformationClass::ConsoleHostProcess => {
                 litebox_util_log::debug!(
                     process_information_class:? = process_information_class;
                     "Unsupported NtSetInformationProcess class"
@@ -386,6 +449,48 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
 
         status
+    }
+
+    fn set_process_dynamic_function_table_information(
+        process_handle: ProcessHandle,
+        process_information: MutPtr<Platform, u8>,
+        process_information_length: u32,
+    ) -> NtStatus {
+        if !process_handle.is_current() {
+            litebox_util_log::debug!(
+                process_handle:% = format_args!("{:#x}", process_handle.as_handle().as_raw());
+                "Rejected process dynamic function table information for non-current process"
+            );
+            return NtStatus::INVALID_PARAMETER;
+        }
+        if process_information_length != size_of::<ProcessDynamicFunctionTableInformation>().trunc()
+        {
+            return NtStatus::INFO_LENGTH_MISMATCH;
+        }
+        let information = ConstPtr::<Platform, ProcessDynamicFunctionTableInformation>::from_usize(
+            process_information.as_usize(),
+        );
+        let Some(information) = information.read_at_offset(0) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        if information.dynamic_function_table == 0 || information.remove > 1 {
+            return NtStatus::INVALID_PARAMETER;
+        }
+        let table = ConstPtr::<Platform, DynamicFunctionTable>::from_usize(
+            information.dynamic_function_table,
+        );
+        // TODO(dynamic-function-tables): register or remove this table and use it for dynamic-code
+        // unwind lookup. Until then, a valid request is a compatibility no-op.
+        if table.read_at_offset(0).is_none() {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+
+        litebox_util_log::debug!(
+            dynamic_function_table:% = format_args!("{:#x}", information.dynamic_function_table),
+            remove = information.remove != 0;
+            "Dummy handler for process dynamic function table"
+        );
+        NtStatus::SUCCESS
     }
 
     fn write_process_information<T: Immutable + IntoBytes>(
@@ -476,13 +581,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             "Handling ProcessTlsInformation"
         );
 
-        if header.thread_data_count > 1 {
-            // TODO(multi-thread-tls): PROCESS_TLS_INFORMATION entries are positional per-thread
-            // data. The shim currently models only the active TEB, so handling multiple entries
-            // would corrupt prior TLS values by repeatedly writing one TEB's vector.
-            return NtStatus::NOT_SUPPORTED;
-        }
-
         match ProcessTlsOperation::try_from(header.operation_type) {
             Ok(ProcessTlsOperation::ReplaceVector) => {
                 self.replace_tls_vector(process_information, header, layout)
@@ -508,6 +606,11 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         header: ProcessTlsInformationHeader,
         layout: ProcessTlsLayout,
     ) -> NtStatus {
+        let Some(previous_count) = layout.previous_count::<Platform>(process_information, header)
+        else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        let simple_teb_addresses = self.simple_tls_teb_addresses(layout);
         for index in 0..header.thread_data_count as usize {
             let Some(thread_data) = layout.thread_data::<Platform>(process_information, index)
             else {
@@ -516,10 +619,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let Some(new_tls_data) = thread_data.read_tls_data() else {
                 return NtStatus::ACCESS_VIOLATION;
             };
-            // TODO(multi-thread-tls): read ith thread's tls
-            let teb = MutPtr::<Platform, ThreadEnvironmentBlock>::from_usize(
-                self.thread_object.teb_address(),
-            );
+            let teb_address = match self.tls_thread_teb_address(
+                layout,
+                &thread_data,
+                index,
+                &simple_teb_addresses,
+            ) {
+                Ok(teb_address) => teb_address,
+                Err(status) => return status,
+            };
+            let teb = MutPtr::<Platform, ThreadEnvironmentBlock>::from_usize(teb_address);
             let Some(old_tls_data) = Self::read_teb_tls_pointer(teb) else {
                 return NtStatus::ACCESS_VIOLATION;
             };
@@ -531,20 +640,30 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 "Replacing process TLS vector"
             );
 
-            if let Err(status) = self.copy_initial_tls_slots(old_tls_data, new_tls_data) {
+            if old_tls_data == 0 {
+                continue;
+            }
+            if let Err(status) = Self::copy_tls_slots(old_tls_data, new_tls_data, previous_count) {
                 return status;
             }
-            let old_tls_data_for_guest = self.guest_visible_old_tls_vector(old_tls_data);
+            // ntdll uses the address of this TEB field as its initial empty-vector sentinel.
+            // Report it as null so the caller does not try to free TEB memory.
+            let old_tls_data = if old_tls_data
+                == teb_address + offset_of!(ThreadEnvironmentBlock, thread_local_storage_pointer)
+            {
+                0
+            } else {
+                old_tls_data
+            };
 
-            if thread_data.write_tls_data(old_tls_data_for_guest).is_none()
+            if thread_data.write_tls_data(old_tls_data).is_none()
                 || Self::write_teb_tls_pointer(teb, new_tls_data).is_none()
             {
                 return NtStatus::ACCESS_VIOLATION;
             }
-            if old_tls_data_for_guest == 0
-                && thread_data
-                    .write_flags(ProcessTlsThreadDataFlags::OLD_DATA_WRITTEN)
-                    .is_none()
+            if thread_data
+                .write_flags(ProcessTlsThreadDataFlags::OLD_DATA_WRITTEN)
+                .is_none()
             {
                 return NtStatus::ACCESS_VIOLATION;
             }
@@ -560,10 +679,8 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         layout: ProcessTlsLayout,
     ) -> NtStatus {
         let tls_index = header.tls_index as usize;
-        if tls_index >= TEB_TLS_SLOT_COUNT {
-            return NtStatus::INVALID_PARAMETER;
-        }
 
+        let simple_teb_addresses = self.simple_tls_teb_addresses(layout);
         for index in 0..header.thread_data_count as usize {
             let Some(thread_data) = layout.thread_data::<Platform>(process_information, index)
             else {
@@ -572,10 +689,16 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             let Some(new_tls_data) = thread_data.read_tls_data() else {
                 return NtStatus::ACCESS_VIOLATION;
             };
-            // TODO(multi-thread-tls): read ith thread's tls
-            let teb = ConstPtr::<Platform, ThreadEnvironmentBlock>::from_usize(
-                self.thread_object.teb_address(),
-            );
+            let teb_address = match self.tls_thread_teb_address(
+                layout,
+                &thread_data,
+                index,
+                &simple_teb_addresses,
+            ) {
+                Ok(teb_address) => teb_address,
+                Err(status) => return status,
+            };
+            let teb = ConstPtr::<Platform, ThreadEnvironmentBlock>::from_usize(teb_address);
             let Some(tls_array) = Self::read_teb_tls_pointer(teb) else {
                 return NtStatus::ACCESS_VIOLATION;
             };
@@ -611,39 +734,52 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         NtStatus::SUCCESS
     }
 
-    fn guest_visible_old_tls_vector(&self, old_tls_data: usize) -> usize {
-        let teb_address = self.thread_object.teb_address();
-        if old_tls_data > 0x10010
-            && old_tls_data >= teb_address
-            && old_tls_data < teb_address.saturating_add(size_of::<ThreadEnvironmentBlock>())
-        {
-            // The loader frees the returned old vector. The initial vector lives inside
-            // TEB.tls_slots, so report no heap-backed vector instead of exposing TEB memory.
-            0
-        } else {
-            old_tls_data
+    fn simple_tls_teb_addresses(&self, layout: ProcessTlsLayout) -> alloc::vec::Vec<usize> {
+        match layout {
+            ProcessTlsLayout::Simple => self.process.thread_teb_addresses(),
+            ProcessTlsLayout::Extended => alloc::vec::Vec::new(),
         }
     }
 
-    fn copy_initial_tls_slots(
+    fn tls_thread_teb_address(
         &self,
+        layout: ProcessTlsLayout,
+        thread_data: &ProcessTlsThreadData<Platform>,
+        index: usize,
+        simple_teb_addresses: &[usize],
+    ) -> Result<usize, NtStatus> {
+        match layout {
+            ProcessTlsLayout::Simple => simple_teb_addresses
+                .get(index)
+                .copied()
+                .ok_or(NtStatus::INVALID_CID),
+            ProcessTlsLayout::Extended => {
+                let thread_id = thread_data
+                    .read_thread_id()
+                    .ok_or(NtStatus::ACCESS_VIOLATION)?;
+                self.process
+                    .thread_teb_address(thread_id)
+                    .ok_or(NtStatus::INVALID_CID)
+            }
+        }
+    }
+
+    fn copy_tls_slots(
         old_tls_data: usize,
         new_tls_data: usize,
+        count: usize,
     ) -> Result<(), NtStatus> {
-        if old_tls_data <= 0x10010 || new_tls_data <= 0x10010 {
+        if count == 0 {
             return Ok(());
         }
-        let initial_tls_slots = self
-            .thread_object
-            .teb_address()
-            .checked_add(offset_of!(ThreadEnvironmentBlock, tls_slots))
-            .ok_or(NtStatus::INVALID_PARAMETER)?;
-        if old_tls_data != initial_tls_slots {
-            return Ok(());
+        if !old_tls_data.is_multiple_of(align_of::<usize>())
+            || !new_tls_data.is_multiple_of(align_of::<usize>())
+        {
+            return Err(NtStatus::DATATYPE_MISALIGNMENT);
         }
         let old_tls_slots = ConstPtr::<Platform, usize>::from_usize(old_tls_data);
         let new_tls_slots = MutPtr::<Platform, usize>::from_usize(new_tls_data);
-        for index in 0..TEB_TLS_SLOT_COUNT.cast_signed() {
+        for index in 0..count.cast_signed() {
             let slot_value = old_tls_slots
                 .read_at_offset(index)
                 .ok_or(NtStatus::ACCESS_VIOLATION)?;

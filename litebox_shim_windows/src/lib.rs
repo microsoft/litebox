@@ -658,6 +658,23 @@ impl<Platform: ShimPlatform> Process<Platform> {
         self.threads.read().threads.len()
     }
 
+    fn thread_teb_address(&self, thread_id: usize) -> Option<usize> {
+        self.threads
+            .read()
+            .threads
+            .get(&thread_id)
+            .map(|thread| thread.teb_address())
+    }
+
+    fn thread_teb_addresses(&self) -> Vec<usize> {
+        self.threads
+            .read()
+            .threads
+            .values()
+            .map(|thread| thread.teb_address())
+            .collect()
+    }
+
     /// Wait for the process to exit, returning its exit code.
     ///
     /// Currently a placeholder that returns a fixed exit code immediately.

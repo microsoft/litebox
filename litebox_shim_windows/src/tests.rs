@@ -195,8 +195,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// through the shim entrypoints synchronously. The guest addresses are left
     /// zeroed because such a task never runs guest code.
     pub(crate) fn clone_for_test(&self) -> Option<Self> {
+        self.clone_for_test_with_teb(0)
+    }
+
+    pub(crate) fn clone_for_test_with_teb(&self, teb_address: usize) -> Option<Self> {
         let thread_id = self.process.allocate_thread_id();
-        let thread_object = Arc::new(crate::syscalls::thread::ThreadObject::new(thread_id, 0));
+        let thread_object = Arc::new(crate::syscalls::thread::ThreadObject::new(
+            thread_id,
+            teb_address,
+        ));
         if !self.process.attach_thread(thread_id, &thread_object) {
             return None;
         }

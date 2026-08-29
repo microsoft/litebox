@@ -231,6 +231,14 @@ pub(crate) struct TokenPrivileges {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, FromBytes, Immutable, IntoBytes, PartialEq)]
+struct TokenBnoIsolationInformation {
+    isolation_prefix: usize,
+    isolation_enabled: u8,
+    padding: [u8; 7],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, FromBytes, Immutable, IntoBytes, PartialEq)]
 pub(crate) struct TokenStatistics {
     token_id: Luid,
     authentication_id: Luid,
@@ -404,60 +412,88 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             return status;
         }
 
-        let entry = match self.typed_handle_entry_with_access::<TokenSubsystem>(
-            token_handle,
-            TokenAccess::QUERY.bits(),
-        ) {
-            Ok(entry) => entry,
-            Err(status) => return status,
+        let token = if token_handle == Self::CURRENT_PROCESS_TOKEN
+            || token_handle == Self::CURRENT_THREAD_EFFECTIVE_TOKEN
+        {
+            Arc::clone(&self.process.token)
+        } else if token_handle == Self::CURRENT_THREAD_TOKEN {
+            return NtStatus::NO_TOKEN;
+        } else {
+            match self.typed_handle_entry_with_access::<TokenSubsystem>(
+                token_handle,
+                TokenAccess::QUERY.bits(),
+            ) {
+                Ok(entry) => entry.with_entry(|entry| Arc::clone(&entry.token)),
+                Err(status) => return status,
+            }
         };
 
         match class {
-            TokenInformationClass::User => entry.with_entry(|entry| {
-                Self::write_token_information_value(
-                    token_information,
-                    token_information_length,
-                    return_length,
-                    || {
-                        let sid_address = token_information
-                            .as_usize()
-                            .checked_add(size_of::<TokenUser>())
-                            .ok_or(NtStatus::ACCESS_VIOLATION)?;
-                        Ok(TokenUserInformation {
-                            user: TokenUser {
-                                user: SidAndAttributes {
-                                    sid: sid_address,
-                                    attributes: 0,
-                                    padding: 0,
-                                },
+            TokenInformationClass::User => Self::write_token_information_value(
+                token_information,
+                token_information_length,
+                return_length,
+                || {
+                    let sid_address = token_information
+                        .as_usize()
+                        .checked_add(size_of::<TokenUser>())
+                        .ok_or(NtStatus::ACCESS_VIOLATION)?;
+                    Ok(TokenUserInformation {
+                        user: TokenUser {
+                            user: SidAndAttributes {
+                                sid: sid_address,
+                                attributes: 0,
+                                padding: 0,
                             },
-                            sid: entry.token.user,
-                        })
-                    },
-                )
-            }),
+                        },
+                        sid: token.user,
+                    })
+                },
+            ),
             TokenInformationClass::Privileges => Self::write_token_information_value(
                 token_information,
                 token_information_length,
                 return_length,
                 || Ok(TokenPrivileges { privilege_count: 0 }),
             ),
-            TokenInformationClass::Statistics => entry.with_entry(|entry| {
-                Self::write_token_information_value(
-                    token_information,
-                    token_information_length,
-                    return_length,
-                    || Ok(entry.token.statistics),
-                )
-            }),
-            TokenInformationClass::SecurityAttributes => entry.with_entry(|entry| {
-                Self::write_token_security_attributes(
-                    &entry.token.security_attributes,
-                    token_information,
-                    token_information_length,
-                    return_length,
-                )
-            }),
+            TokenInformationClass::Statistics => Self::write_token_information_value(
+                token_information,
+                token_information_length,
+                return_length,
+                || Ok(token.statistics),
+            ),
+            TokenInformationClass::SessionId
+            | TokenInformationClass::IsAppContainer
+            | TokenInformationClass::PrivateNameSpace => Self::write_token_information_value(
+                token_information,
+                token_information_length,
+                return_length,
+                || Ok(0_u32),
+            ),
+            TokenInformationClass::Elevation => Self::write_exact_token_information_value(
+                token_information,
+                token_information_length,
+                return_length,
+                || Ok(0_u32),
+            ),
+            TokenInformationClass::BnoIsolation => Self::write_token_information_value(
+                token_information,
+                token_information_length,
+                return_length,
+                || {
+                    Ok(TokenBnoIsolationInformation {
+                        isolation_prefix: 0,
+                        isolation_enabled: 0,
+                        padding: [0; 7],
+                    })
+                },
+            ),
+            TokenInformationClass::SecurityAttributes => Self::write_token_security_attributes(
+                &token.security_attributes,
+                token_information,
+                token_information_length,
+                return_length,
+            ),
             _ => {
                 // TODO(token-model): Add each information class when its backing token state is
                 // modeled; do not synthesize security-sensitive token data.
@@ -687,9 +723,43 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         return_length: MutPtr<Platform, u32>,
         build_information: impl FnOnce() -> Result<T, NtStatus>,
     ) -> NtStatus {
+        Self::write_token_information_value_with_length_check(
+            token_information,
+            token_information_length,
+            return_length,
+            false,
+            build_information,
+        )
+    }
+
+    fn write_exact_token_information_value<T: Immutable + IntoBytes>(
+        token_information: MutPtr<Platform, u8>,
+        token_information_length: u32,
+        return_length: MutPtr<Platform, u32>,
+        build_information: impl FnOnce() -> Result<T, NtStatus>,
+    ) -> NtStatus {
+        Self::write_token_information_value_with_length_check(
+            token_information,
+            token_information_length,
+            return_length,
+            true,
+            build_information,
+        )
+    }
+
+    fn write_token_information_value_with_length_check<T: Immutable + IntoBytes>(
+        token_information: MutPtr<Platform, u8>,
+        token_information_length: u32,
+        return_length: MutPtr<Platform, u32>,
+        require_exact_length: bool,
+        build_information: impl FnOnce() -> Result<T, NtStatus>,
+    ) -> NtStatus {
         let required_length = size_of::<T>().trunc();
         if return_length.write_at_offset(0, required_length).is_none() {
             return NtStatus::ACCESS_VIOLATION;
+        }
+        if require_exact_length && token_information_length != required_length {
+            return NtStatus::INFO_LENGTH_MISMATCH;
         }
         if token_information_length < required_length {
             return NtStatus::BUFFER_TOO_SMALL;
