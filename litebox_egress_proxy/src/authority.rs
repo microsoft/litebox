@@ -10,6 +10,9 @@
 
 use core::fmt;
 
+use alloc::borrow::ToOwned;
+use alloc::format;
+use alloc::string::String;
 use thiserror::Error;
 
 use crate::policy::{Hostname, HostnameError, PortRangeError, parse_port};
@@ -161,6 +164,8 @@ pub fn host_header_matches(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use alloc::string::ToString;
 
     fn authority(raw: &str, default_port: Option<u16>) -> RequestAuthority {
         parse_authority(raw, default_port).unwrap()

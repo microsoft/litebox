@@ -4,13 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-# Controlled DNS. Only the tokio runtime integration is enabled; notably the
-# `system-config` default feature is disabled so that the process can never
-# read the host resolver configuration.
-hickory-resolver = { version = "0.26.1", default-features = false, features = [
-    "tokio",
-] }
-thiserror = { version = "2.0", default-features = false, features = ["std"] }
+thiserror = { version = "2.0", default-features = false }
 
 [lints]
 workspace = true

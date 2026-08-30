@@ -10,17 +10,20 @@
 
 use core::fmt;
 use core::str::FromStr;
-use std::collections::BTreeMap;
 
+use alloc::collections::BTreeMap;
+use alloc::string::String;
+use alloc::vec::Vec;
 use thiserror::Error;
-
-use crate::limits::MAX_HOST_RULES;
 
 /// Maximum total length of a canonical DNS name, in bytes.
 const MAX_HOSTNAME_BYTES: usize = 253;
 
 /// Maximum length of a single DNS label, in bytes.
 const MAX_LABEL_BYTES: usize = 63;
+
+/// Maximum number of distinct canonical hostnames in one policy.
+const MAX_HOST_RULES: usize = 64;
 
 /// Reason a hostname was rejected.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -257,7 +260,7 @@ impl FromStr for HostRule {
 /// Reason a set of rules could not become a policy.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum PolicyError {
-    /// More than [`MAX_HOST_RULES`] distinct canonical hostnames were given.
+    /// More than 64 distinct canonical hostnames were given.
     #[error("policy contains more than {MAX_HOST_RULES} canonical hostnames")]
     TooManyHosts,
 }
@@ -342,6 +345,8 @@ fn merge_ranges(ranges: &[PortRange]) -> Vec<PortRange> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use alloc::format;
 
     #[test]
     fn hostname_is_canonicalized() {
