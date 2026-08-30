@@ -4,7 +4,13 @@
 //! Wait state management.
 //!
 //! Use a dedicated module to prevent code from accidentally accessing
-//! `wait_state` without going through `wait_cx()`.
+//! `wait_state` without going through `wait_on_events()`.
+
+use alloc::sync::Weak;
+
+use litebox::event::Events;
+use litebox::event::observer::Observer;
+use litebox::event::polling::TryOpError;
 
 use crate::{ShimFS, ShimPlatform, Task};
 
@@ -17,9 +23,31 @@ impl<Platform: ShimPlatform> WaitState<Platform> {
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
-    /// Returns a wait context to use to perform interruptible waits.
-    pub(crate) fn wait_cx(&self) -> litebox::event::wait::WaitContext<'_, Platform> {
-        self.wait_state.0.context().with_check_for_interrupt(self)
+    pub(crate) fn wait_on_events<R, E>(
+        &self,
+        nonblock: bool,
+        timeout: Option<core::time::Duration>,
+        events: Events,
+        register_observer: impl FnOnce(Weak<dyn Observer<Events>>, Events) -> Result<(), E>,
+        mut try_op: impl FnMut() -> Result<R, TryOpError<E>>,
+    ) -> Result<R, TryOpError<E>> {
+        match try_op() {
+            Err(TryOpError::TryAgain) if !nonblock => {}
+            ret => return ret,
+        }
+
+        // The core helper probes again before blocking, so readiness racing with this point can
+        // briefly release the IOCP slot without a host block. Exact accounting requires a hook
+        // around WaitContext's platform block; keep this approximation local to the Windows shim.
+        self.suspend_io_completion_worker();
+        let _resume_worker = litebox::utils::defer(|| self.resume_io_completion_worker());
+        let wait_context = self
+            .wait_state
+            .0
+            .context()
+            .with_check_for_interrupt(self)
+            .with_timeout(timeout);
+        wait_context.wait_on_events(false, events, register_observer, try_op)
     }
 
     /// Publishes the handle used by other threads to interrupt this one.

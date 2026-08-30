@@ -121,9 +121,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             litebox_util_log::debug!("Treating alertable wait as non-alertable");
         }
 
-        let wait_cx = self.wait_cx().with_timeout(timeout);
-        match wait_cx.wait_on_events(
+        match self.wait_on_events(
             false,
+            timeout,
             Events::IN,
             |observer, mask| {
                 object.register_observer(observer, mask);
@@ -157,7 +157,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         )
     }
 
-    fn wait_timeout_duration(&self, timeout: i64) -> core::time::Duration {
+    pub(crate) fn wait_timeout_duration(&self, timeout: i64) -> core::time::Duration {
         const WINDOWS_TO_UNIX_EPOCH_SECONDS: u64 = 11_644_473_600;
 
         if timeout <= 0 {

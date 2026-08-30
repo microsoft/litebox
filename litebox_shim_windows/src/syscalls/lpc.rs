@@ -781,6 +781,26 @@ pub(crate) struct ConnectPortParameters<Platform: ShimPlatform> {
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    pub(crate) fn sys_nt_alpc_connect_port(
+        port_handle: MutPtr<Platform, Handle>,
+        port_name: ConstPtr<Platform, UnicodeString>,
+    ) -> NtStatus {
+        if port_handle.write_at_offset(0, Handle::default()).is_none() {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        let port_name = match port_name
+            .read_at_offset(0)
+            .ok_or(NtStatus::ACCESS_VIOLATION)
+            .and_then(UnicodeString::read_string::<Platform>)
+        {
+            Ok(name) => name,
+            Err(status) => return status,
+        };
+
+        litebox_util_log::debug!(port_name:% = port_name; "ALPC port is unavailable");
+        NtStatus::OBJECT_NAME_NOT_FOUND
+    }
+
     pub(crate) fn sys_nt_connect_port(&self, params: ConnectPortParameters<Platform>) -> NtStatus {
         if params.security_qos.read_at_offset(0).is_none() {
             return NtStatus::ACCESS_VIOLATION;

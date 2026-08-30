@@ -413,6 +413,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             process: self.process.clone(),
             fs: self.fs.clone(),
             wait_state: crate::wait::WaitState::new(self.global.platform),
+            io_completion_worker: Mutex::new(super::iocp::IoCompletionWorkerState::new()),
             entry_point: ntdll.ldr_initialize_thunk,
             stack_top: environment.stack_top,
             context: environment.context,

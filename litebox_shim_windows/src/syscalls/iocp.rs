@@ -3,16 +3,25 @@
 
 //! Windows NT I/O completion port syscalls.
 
-use alloc::sync::Arc;
+use alloc::collections::{BTreeSet, VecDeque};
+use alloc::sync::{Arc, Weak};
 use core::marker::PhantomData;
 
+use litebox::event::observer::Observer;
+use litebox::event::polling::{Pollee, TryOpError};
+use litebox::event::wait::WaitError;
+use litebox::event::{Events, IOPollable};
 use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry};
-use litebox::platform::{RawMutPointer as _, RawPointerProvider};
+use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
+use litebox::sync::Mutex;
 use litebox_common_windows::nt_status::NtStatus;
+use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-use crate::nt_types::{AccessMask, ObjectAttributes, read_object_attributes};
+use crate::nt_types::{AccessMask, ObjectAttributes, ObjectAttributesFlags};
 use crate::syscalls::Handle;
-use crate::{ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value};
+use crate::{
+    ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_buffer, probe_guest_output_preserving_value,
+};
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,15 +73,117 @@ pub(crate) struct IoCompletionHandleObject<Platform: crate::ShimPlatform> {
 }
 
 pub(crate) struct IoCompletionObject<Platform: crate::ShimPlatform> {
-    _number_of_concurrent_threads: u32,
-    _not_send_without_platform: PhantomData<fn(Platform)>,
+    concurrency_limit: usize,
+    active_threads: Mutex<Platform, BTreeSet<usize>>,
+    packets: Mutex<Platform, VecDeque<IoCompletionPacket>>,
+    pollee: Pollee<Platform>,
+}
+
+pub(crate) struct IoCompletionWorkerState<Platform: crate::ShimPlatform> {
+    port: Option<Weak<IoCompletionObject<Platform>>>,
+    suspended: bool,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, FromBytes, Immutable, IntoBytes)]
+pub(crate) struct IoCompletionPacket {
+    completion_key: usize,
+    completion_value: usize,
+    status: usize,
+    information: usize,
 }
 
 impl<Platform: crate::ShimPlatform> IoCompletionObject<Platform> {
     fn new(number_of_concurrent_threads: u32) -> Self {
         Self {
-            _number_of_concurrent_threads: number_of_concurrent_threads,
-            _not_send_without_platform: PhantomData,
+            concurrency_limit: number_of_concurrent_threads.max(1) as usize,
+            active_threads: Mutex::new(BTreeSet::new()),
+            packets: Mutex::new(VecDeque::new()),
+            pollee: Pollee::new(),
+        }
+    }
+
+    fn post(&self, packet: IoCompletionPacket) {
+        // TODO(windows-iocp-file-posting): Post packets when associated asynchronous file I/O
+        // completes, rather than relying exclusively on NtSetIoCompletion.
+        self.packets.lock().push_back(packet);
+        self.pollee.notify_observers(Events::IN);
+    }
+
+    fn remove_with(
+        &self,
+        count: usize,
+        mut write_packet: impl FnMut(usize, IoCompletionPacket) -> Result<(), NtStatus>,
+        mut write_count: impl FnMut(u32) -> Result<(), NtStatus>,
+    ) -> Result<bool, NtStatus> {
+        let mut packets = self.packets.lock();
+        let remove_count = count.min(packets.len());
+        if remove_count == 0 {
+            return Ok(false);
+        }
+        for (index, packet) in packets.iter().take(remove_count).copied().enumerate() {
+            write_packet(index, packet)?;
+        }
+        write_count(
+            remove_count
+                .try_into()
+                .expect("packet count is bounded by the u32 input count"),
+        )?;
+        packets.drain(..remove_count);
+        Ok(true)
+    }
+
+    fn remove_with_capacity(
+        &self,
+        thread_id: usize,
+        count: usize,
+        write_packet: impl FnMut(usize, IoCompletionPacket) -> Result<(), NtStatus>,
+        write_count: impl FnMut(u32) -> Result<(), NtStatus>,
+    ) -> Result<bool, NtStatus> {
+        let mut active_threads = self.active_threads.lock();
+        let already_active = active_threads.contains(&thread_id);
+        if !already_active && active_threads.len() >= self.concurrency_limit {
+            return Ok(false);
+        }
+        let removed = self.remove_with(count, write_packet, write_count)?;
+        if removed && !already_active {
+            active_threads.insert(thread_id);
+        }
+        Ok(removed)
+    }
+
+    fn deactivate(&self, thread_id: usize) {
+        if self.active_threads.lock().remove(&thread_id) {
+            self.pollee.notify_observers(Events::IN);
+        }
+    }
+
+    fn reactivate(&self, thread_id: usize) {
+        // Windows permits a previously associated worker that blocked elsewhere to resume even
+        // when this temporarily exceeds the port's concurrency limit.
+        self.active_threads.lock().insert(thread_id);
+    }
+}
+
+impl<Platform: crate::ShimPlatform> IoCompletionWorkerState<Platform> {
+    pub(crate) fn new() -> Self {
+        Self {
+            port: None,
+            suspended: false,
+        }
+    }
+}
+
+impl<Platform: crate::ShimPlatform> IOPollable for IoCompletionObject<Platform> {
+    fn register_observer(&self, observer: Weak<dyn Observer<Events>>, mask: Events) {
+        self.pollee.register_observer(observer, mask);
+    }
+
+    fn check_io_events(&self) -> Events {
+        if self.packets.lock().is_empty() {
+            Events::empty()
+        } else {
+            Events::IN
         }
     }
 }
@@ -83,20 +194,65 @@ impl<Platform: crate::ShimPlatform> IoCompletionHandleObject<Platform> {
     }
 }
 
-fn validate_io_completion_object_attributes<Platform: RawPointerProvider>(
-    object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
-) -> Result<(), NtStatus> {
-    let Some(object_attributes) = object_attributes else {
-        return Ok(());
-    };
-    let object_attributes = read_object_attributes::<Platform>(object_attributes)?;
-    if object_attributes.object_name == 0 && !object_attributes.root_directory.is_null() {
-        return Err(NtStatus::OBJECT_NAME_INVALID);
-    }
-    Ok(())
-}
-
 impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    pub(crate) fn suspend_io_completion_worker(&self) {
+        let mut worker = self.io_completion_worker.lock();
+        debug_assert!(!worker.suspended);
+        if let Some(port) = worker.port.as_ref().and_then(Weak::upgrade) {
+            port.deactivate(self.thread_object.thread_id());
+            worker.suspended = true;
+        } else {
+            worker.port = None;
+        }
+    }
+
+    pub(crate) fn resume_io_completion_worker(&self) {
+        let mut worker = self.io_completion_worker.lock();
+        if worker.suspended {
+            if let Some(port) = worker.port.as_ref().and_then(Weak::upgrade) {
+                port.reactivate(self.thread_object.thread_id());
+            } else {
+                worker.port = None;
+            }
+            worker.suspended = false;
+        }
+    }
+
+    pub(crate) fn release_io_completion_worker(&self) {
+        let mut worker = self.io_completion_worker.lock();
+        if let Some(port) = worker.port.take()
+            && !worker.suspended
+            && let Some(port) = port.upgrade()
+        {
+            port.deactivate(self.thread_object.thread_id());
+        }
+        worker.suspended = false;
+    }
+
+    /// Check if the task is associated with the given IO completion port. If the task is
+    /// associated with a different port, it will be deactivated from that port.
+    fn prepare_io_completion_wait(&self, port: &Arc<IoCompletionObject<Platform>>) -> bool {
+        let mut worker = self.io_completion_worker.lock();
+        debug_assert!(!worker.suspended);
+        if worker
+            .port
+            .as_ref()
+            .is_some_and(|active_port| active_port.as_ptr() == Arc::as_ptr(port))
+        {
+            return true;
+        }
+        if let Some(active_port) = worker.port.take().and_then(|port| port.upgrade()) {
+            active_port.deactivate(self.thread_object.thread_id());
+        }
+        false
+    }
+
+    fn associate_io_completion_worker(&self, port: &Arc<IoCompletionObject<Platform>>) {
+        let mut worker = self.io_completion_worker.lock();
+        debug_assert!(worker.port.is_none());
+        worker.port = Some(Arc::downgrade(port));
+    }
+
     fn insert_io_completion_handle(
         &self,
         port: Arc<IoCompletionObject<Platform>>,
@@ -129,16 +285,60 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         {
             return status;
         }
-        if let Err(status) = validate_io_completion_object_attributes::<Platform>(object_attributes)
-        {
-            return status;
+        let (object_attributes, io_completion_name) =
+            match self.read_dispatcher_object_attributes(object_attributes, false) {
+                Ok(value) => value,
+                Err(status) => return status,
+            };
+        let granted_access = IoCompletionAccess::from_desired_access(desired_access);
+        if let Some(io_completion_name) = io_completion_name {
+            let port = Arc::new(IoCompletionObject::new(number_of_concurrent_threads));
+            return self.process.object_manager.create_io_completion(
+                &io_completion_name,
+                &port,
+                |port| {
+                    let Some(object_attributes) = object_attributes else {
+                        return NtStatus::INVALID_PARAMETER;
+                    };
+                    if !ObjectAttributesFlags::from_bits_retain(object_attributes.attributes)
+                        .contains(ObjectAttributesFlags::OPENIF)
+                    {
+                        return NtStatus::OBJECT_NAME_COLLISION;
+                    }
+                    self.publish_io_completion_handle(
+                        io_completion_handle,
+                        port,
+                        granted_access,
+                        NtStatus::OBJECT_NAME_EXISTS,
+                    )
+                },
+                || {
+                    self.publish_io_completion_handle(
+                        io_completion_handle,
+                        Arc::clone(&port),
+                        granted_access,
+                        NtStatus::SUCCESS,
+                    )
+                },
+            );
         }
 
-        // TODO: model the IOCP packet queue, concurrency accounting, named-object lookup,
-        // and file-handle association once completion posting/removal and file completion
-        // context syscalls are implemented.
         let port = Arc::new(IoCompletionObject::new(number_of_concurrent_threads));
-        let granted_access = IoCompletionAccess::from_desired_access(desired_access);
+        self.publish_io_completion_handle(
+            io_completion_handle,
+            port,
+            granted_access,
+            NtStatus::SUCCESS,
+        )
+    }
+
+    fn publish_io_completion_handle(
+        &self,
+        io_completion_handle: MutPtr<Platform, Handle>,
+        port: Arc<IoCompletionObject<Platform>>,
+        granted_access: IoCompletionAccess,
+        success_status: NtStatus,
+    ) -> NtStatus {
         let Ok(handle) = self.insert_io_completion_handle(port, granted_access) else {
             return NtStatus::QUOTA_EXCEEDED;
         };
@@ -146,7 +346,154 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             self.close_io_completion_handle(handle);
             return NtStatus::ACCESS_VIOLATION;
         }
+        success_status
+    }
+
+    pub(crate) fn sys_nt_open_io_completion(
+        &self,
+        io_completion_handle: MutPtr<Platform, Handle>,
+        desired_access: u32,
+        object_attributes: Option<ConstPtr<Platform, ObjectAttributes>>,
+    ) -> NtStatus {
+        if let Err(status) =
+            probe_guest_output_preserving_value::<Platform, _>(io_completion_handle)
+        {
+            return status;
+        }
+        let io_completion_name =
+            match self.read_dispatcher_object_attributes(object_attributes, true) {
+                Ok((_, Some(name))) => name,
+                Ok((_, None)) => return NtStatus::OBJECT_NAME_INVALID,
+                Err(status) => return status,
+            };
+        let port = match self
+            .process
+            .object_manager
+            .resolve_io_completion(&io_completion_name)
+        {
+            Ok(port) => port,
+            Err(status) => return status,
+        };
+        self.publish_io_completion_handle(
+            io_completion_handle,
+            port,
+            IoCompletionAccess::from_desired_access(desired_access),
+            NtStatus::SUCCESS,
+        )
+    }
+
+    pub(crate) fn sys_nt_set_io_completion(
+        &self,
+        io_completion_handle: Handle,
+        completion_key: usize,
+        completion_value: usize,
+        status: i32,
+        information: usize,
+    ) -> NtStatus {
+        let entry = match self.typed_handle_entry_with_access::<IoCompletionSubsystem<Platform>>(
+            io_completion_handle,
+            IoCompletionAccess::MODIFY_STATE.bits(),
+        ) {
+            Ok(entry) => entry,
+            Err(status) => return status,
+        };
+        entry.with_entry(|entry| {
+            entry.port.post(IoCompletionPacket {
+                completion_key,
+                completion_value,
+                status: status.cast_unsigned() as usize,
+                information,
+            });
+        });
         NtStatus::SUCCESS
+    }
+
+    pub(crate) fn sys_nt_remove_io_completion_ex(
+        &self,
+        io_completion_handle: Handle,
+        io_completion_information: MutPtr<Platform, IoCompletionPacket>,
+        count: u32,
+        num_entries_removed: MutPtr<Platform, u32>,
+        timeout: Option<ConstPtr<Platform, i64>>,
+        alertable: bool,
+    ) -> NtStatus {
+        if count == 0 {
+            return NtStatus::INVALID_PARAMETER;
+        }
+        let Some(buffer_length) =
+            (count as usize).checked_mul(core::mem::size_of::<IoCompletionPacket>())
+        else {
+            return NtStatus::INVALID_PARAMETER;
+        };
+        if let Err(status) = probe_guest_output_buffer::<Platform>(
+            MutPtr::<Platform, u8>::from_usize(io_completion_information.as_usize()),
+            buffer_length,
+        ) {
+            return status;
+        }
+        if let Err(status) = probe_guest_output_preserving_value::<Platform, _>(num_entries_removed)
+        {
+            return status;
+        }
+        let timeout = match timeout {
+            Some(timeout) => match timeout.read_at_offset(0) {
+                Some(timeout) => Some(self.wait_timeout_duration(timeout)),
+                None => return NtStatus::ACCESS_VIOLATION,
+            },
+            None => None,
+        };
+        let entry = match self.typed_handle_entry_with_access::<IoCompletionSubsystem<Platform>>(
+            io_completion_handle,
+            IoCompletionAccess::MODIFY_STATE.bits(),
+        ) {
+            Ok(entry) => entry,
+            Err(status) => return status,
+        };
+        let port = entry.with_entry(IoCompletionHandleObject::port);
+        let already_associated = self.prepare_io_completion_wait(&port);
+        if alertable {
+            // TODO(windows-apc): Interrupt alertable IOCP waits to deliver queued user APCs.
+            litebox_util_log::debug!("Treating alertable IOCP wait as non-alertable");
+        }
+
+        match self.wait_on_events(
+            false,
+            timeout,
+            Events::IN,
+            |observer, mask| {
+                port.register_observer(observer, mask);
+                Ok(())
+            },
+            || match port.remove_with_capacity(
+                self.thread_object.thread_id(),
+                count as usize,
+                |index, packet| {
+                    io_completion_information
+                        .write_at_offset(index.cast_signed(), packet)
+                        .ok_or(NtStatus::ACCESS_VIOLATION)
+                },
+                |removed| {
+                    num_entries_removed
+                        .write_at_offset(0, removed)
+                        .ok_or(NtStatus::ACCESS_VIOLATION)
+                },
+            ) {
+                Ok(true) => {
+                    if !already_associated {
+                        self.associate_io_completion_worker(&port);
+                    }
+                    Ok(())
+                }
+                Ok(false) => Err(TryOpError::TryAgain),
+                Err(status) => Err(TryOpError::Other(status)),
+            },
+        ) {
+            Ok(()) => NtStatus::SUCCESS,
+            Err(TryOpError::WaitError(WaitError::TimedOut)) => NtStatus::TIMEOUT,
+            Err(TryOpError::WaitError(WaitError::Interrupted)) => NtStatus::ALERTED,
+            Err(TryOpError::TryAgain) => unreachable!("blocking wait cannot return TryAgain"),
+            Err(TryOpError::Other(status)) => status,
+        }
     }
 }
 
@@ -165,6 +512,137 @@ mod tests {
 
     fn object_attributes_size() -> u32 {
         size_of::<ObjectAttributes>().trunc()
+    }
+
+    fn packet(completion_key: usize) -> IoCompletionPacket {
+        IoCompletionPacket {
+            completion_key,
+            completion_value: 0,
+            status: 0,
+            information: 0,
+        }
+    }
+
+    fn remove_one<FS: ShimFS>(
+        task: &Task<crate::tests::TestPlatform, FS>,
+        port: &Arc<IoCompletionObject<crate::tests::TestPlatform>>,
+    ) -> Result<Option<IoCompletionPacket>, NtStatus> {
+        let already_associated = task.prepare_io_completion_wait(port);
+        let mut packet = None;
+        let removed = port.remove_with_capacity(
+            task.thread_object.thread_id(),
+            1,
+            |_, value| {
+                packet = Some(value);
+                Ok(())
+            },
+            |_| Ok(()),
+        )?;
+        if removed && !already_associated {
+            task.associate_io_completion_worker(port);
+        }
+        Ok(packet)
+    }
+
+    #[test]
+    fn concurrency_limit_throttles_other_workers() {
+        let first = test_task();
+        let second = first.clone_for_test().unwrap();
+        let port = Arc::new(IoCompletionObject::new(1));
+        port.post(packet(1));
+        port.post(packet(2));
+
+        assert_eq!(
+            remove_one(&first, &port).unwrap().unwrap().completion_key,
+            1
+        );
+        assert!(remove_one(&second, &port).unwrap().is_none());
+        assert_eq!(port.packets.lock().len(), 1);
+
+        assert_eq!(
+            remove_one(&first, &port).unwrap().unwrap().completion_key,
+            2
+        );
+        first.release_io_completion_worker();
+        second.release_io_completion_worker();
+    }
+
+    #[test]
+    fn blocking_worker_releases_concurrency_capacity() {
+        let first = test_task();
+        let second = first.clone_for_test().unwrap();
+        let port = Arc::new(IoCompletionObject::new(1));
+        port.post(packet(1));
+        port.post(packet(2));
+
+        assert!(remove_one(&first, &port).unwrap().is_some());
+        first.suspend_io_completion_worker();
+        assert_eq!(
+            remove_one(&second, &port).unwrap().unwrap().completion_key,
+            2
+        );
+
+        port.post(packet(3));
+        assert!(
+            !port
+                .remove_with_capacity(
+                    first.thread_object.thread_id(),
+                    1,
+                    |_, _| unreachable!("a suspended worker must not dequeue at capacity"),
+                    |_| unreachable!("a suspended worker must not dequeue at capacity"),
+                )
+                .unwrap()
+        );
+        assert_eq!(port.packets.lock().len(), 1);
+
+        first.resume_io_completion_worker();
+        assert_eq!(port.active_threads.lock().len(), 2);
+        first.release_io_completion_worker();
+        second.release_io_completion_worker();
+        assert!(port.active_threads.lock().is_empty());
+    }
+
+    #[test]
+    fn timed_out_wait_restores_worker_capacity() {
+        let task = test_task();
+        let port = Arc::new(IoCompletionObject::new(1));
+        port.post(packet(1));
+        assert!(remove_one(&task, &port).unwrap().is_some());
+
+        let nonblocking_result: Result<(), TryOpError<NtStatus>> = task.wait_on_events(
+            true,
+            None,
+            Events::IN,
+            |_, _| unreachable!("a nonblocking wait must not register an observer"),
+            || Err(TryOpError::TryAgain),
+        );
+        assert!(matches!(nonblocking_result, Err(TryOpError::TryAgain)));
+        assert!(
+            port.active_threads
+                .lock()
+                .contains(&task.thread_object.thread_id())
+        );
+        assert!(!task.io_completion_worker.lock().suspended);
+
+        let result: Result<(), TryOpError<NtStatus>> = task.wait_on_events(
+            false,
+            Some(core::time::Duration::ZERO),
+            Events::IN,
+            |_, _| Ok::<(), NtStatus>(()),
+            || Err(TryOpError::TryAgain),
+        );
+
+        assert!(matches!(
+            result,
+            Err(TryOpError::WaitError(WaitError::TimedOut))
+        ));
+        assert!(
+            port.active_threads
+                .lock()
+                .contains(&task.thread_object.thread_id())
+        );
+        assert!(!task.io_completion_worker.lock().suspended);
+        task.release_io_completion_worker();
     }
 
     #[test]

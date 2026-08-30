@@ -24,6 +24,7 @@ use crate::nt_types::{
 };
 use crate::syscalls::Handle;
 use crate::syscalls::event::EventObject;
+use crate::syscalls::iocp::IoCompletionObject;
 use crate::syscalls::mutant::MutantObject;
 use crate::syscalls::section::{
     SectionObject, WINDOWS_SESSION_SHARED_SECTION_OBJECT, WINDOWS_SHARED_SECTION_OBJECT,
@@ -211,6 +212,9 @@ enum NamedObject<Platform: crate::ShimPlatform> {
     Event {
         event: Weak<EventObject<Platform>>,
     },
+    IoCompletion {
+        io_completion: Weak<IoCompletionObject<Platform>>,
+    },
     Mutant {
         mutant: Weak<MutantObject<Platform>>,
     },
@@ -391,6 +395,7 @@ impl<Platform: crate::ShimPlatform> ObjectNode<Platform> {
         new_directory() => NamedObject::Directory { children: BTreeMap::new() };
         new_symlink(target: String) => NamedObject::Symlink { target };
         new_event(event: Weak<EventObject<Platform>>) => NamedObject::Event { event };
+        new_io_completion(io_completion: Weak<IoCompletionObject<Platform>>) => NamedObject::IoCompletion { io_completion };
         new_mutant(mutant: Weak<MutantObject<Platform>>) => NamedObject::Mutant { mutant };
         new_semaphore(semaphore: Weak<SemaphoreObject<Platform>>) => NamedObject::Semaphore { semaphore };
         new_section(section: Weak<SectionObject<Platform>>) => NamedObject::Section { section };
@@ -438,6 +443,7 @@ impl<Platform: crate::ShimPlatform> ObjectNode<Platform> {
         directory_object, ObjectLeafLookup<()>, NamedObject::Directory { .. } => ObjectLeafLookup::Live(());
         pub(super) symlink_target, ObjectLeafLookup<String>, NamedObject::Symlink { target } => ObjectLeafLookup::Live(target.clone());
         event_object, ObjectLeafLookup<Arc<EventObject<Platform>>>, NamedObject::Event { event } => ObjectLeafLookup::from_weak(event);
+        io_completion_object, ObjectLeafLookup<Arc<IoCompletionObject<Platform>>>, NamedObject::IoCompletion { io_completion } => ObjectLeafLookup::from_weak(io_completion);
         mutant_object, ObjectLeafLookup<Arc<MutantObject<Platform>>>, NamedObject::Mutant { mutant } => ObjectLeafLookup::from_weak(mutant);
         semaphore_object, ObjectLeafLookup<Arc<SemaphoreObject<Platform>>>, NamedObject::Semaphore { semaphore } => ObjectLeafLookup::from_weak(semaphore);
         section_object, ObjectLeafLookup<Arc<SectionObject<Platform>>>, NamedObject::Section { section } => ObjectLeafLookup::from_weak(section);
@@ -450,6 +456,9 @@ impl<Platform: crate::ShimPlatform> ObjectNode<Platform> {
             NamedObject::Directory { .. } => Some("Directory"),
             NamedObject::Symlink { .. } => Some("SymbolicLink"),
             NamedObject::Event { event } => event.upgrade().map(|_| "Event"),
+            NamedObject::IoCompletion { io_completion } => {
+                io_completion.upgrade().map(|_| "IoCompletion")
+            }
             NamedObject::Mutant { mutant } => mutant.upgrade().map(|_| "Mutant"),
             NamedObject::Semaphore { semaphore } => semaphore.upgrade().map(|_| "Semaphore"),
             NamedObject::Section { section } => section.upgrade().map(|_| "Section"),
@@ -543,6 +552,24 @@ impl<Platform: crate::ShimPlatform> ObjectManager<Platform> {
             path,
             |node| node.event_object(),
             |path, parent, name| ObjectNode::new_event(path, parent, name, event),
+            NtStatus::OBJECT_TYPE_MISMATCH,
+            on_exists,
+            |_| on_created(),
+        )
+    }
+
+    pub(super) fn create_io_completion(
+        &self,
+        path: &str,
+        io_completion: &Arc<IoCompletionObject<Platform>>,
+        on_exists: impl FnOnce(Arc<IoCompletionObject<Platform>>) -> NtStatus,
+        on_created: impl FnOnce() -> NtStatus,
+    ) -> NtStatus {
+        let io_completion = Arc::downgrade(io_completion);
+        self.create_child(
+            path,
+            |node| node.io_completion_object(),
+            |path, parent, name| ObjectNode::new_io_completion(path, parent, name, io_completion),
             NtStatus::OBJECT_TYPE_MISMATCH,
             on_exists,
             |_| on_created(),
@@ -712,6 +739,13 @@ impl<Platform: crate::ShimPlatform> ObjectManager<Platform> {
 
     pub(super) fn resolve_event(&self, path: &str) -> Result<Arc<EventObject<Platform>>, NtStatus> {
         self.resolve_object_leaf(path, false, |node| node.event_object())
+    }
+
+    pub(super) fn resolve_io_completion(
+        &self,
+        path: &str,
+    ) -> Result<Arc<IoCompletionObject<Platform>>, NtStatus> {
+        self.resolve_object_leaf(path, false, |node| node.io_completion_object())
     }
 
     pub(super) fn resolve_mutant(

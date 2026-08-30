@@ -174,6 +174,9 @@ pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<Test
         process,
         fs,
         wait_state: crate::wait::WaitState::new(platform),
+        io_completion_worker: litebox::sync::Mutex::new(
+            crate::syscalls::iocp::IoCompletionWorkerState::new(),
+        ),
         entry_point: 0,
         stack_top: 0,
         context: 0,
@@ -212,6 +215,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             process: self.process.clone(),
             fs: self.fs.clone(),
             wait_state: crate::wait::WaitState::new(self.global.platform),
+            io_completion_worker: litebox::sync::Mutex::new(
+                crate::syscalls::iocp::IoCompletionWorkerState::new(),
+            ),
             entry_point: 0,
             stack_top: 0,
             context: 0,

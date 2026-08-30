@@ -1286,6 +1286,8 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         length: u32,
         file_information_class: u32,
     ) -> NtStatus {
+        // TODO(windows-file-completion): Support FileCompletionInformation to associate a file
+        // handle with an IO completion port and its completion key.
         if FileHandleInformationClass::try_from(file_information_class)
             != Ok(FileHandleInformationClass::FilePositionInformation)
         {
