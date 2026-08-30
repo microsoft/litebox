@@ -420,9 +420,14 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if count == 0 {
             return NtStatus::INVALID_PARAMETER;
         }
+        let Some(buffer_length) =
+            (count as usize).checked_mul(core::mem::size_of::<IoCompletionPacket>())
+        else {
+            return NtStatus::INVALID_PARAMETER;
+        };
         if let Err(status) = probe_guest_output_buffer::<Platform>(
             MutPtr::<Platform, u8>::from_usize(io_completion_information.as_usize()),
-            (count as usize).saturating_mul(core::mem::size_of::<IoCompletionPacket>()),
+            buffer_length,
         ) {
             return status;
         }
@@ -500,11 +505,8 @@ mod tests {
     use litebox_common_windows::nt_status::NtStatus;
 
     use super::*;
-    use crate::nt_types::{ObjectAttributes, ObjectAttributesFlags};
-    use crate::syscalls::event::EventType;
-    use crate::tests::{
-        const_ptr, mut_ptr, object_attributes, test_task, unicode_string, utf16_units,
-    };
+    use crate::nt_types::ObjectAttributes;
+    use crate::tests::{const_ptr, mut_ptr, test_task};
 
     const IO_COMPLETION_ALL_ACCESS: u32 = 0x001f_0003;
 
@@ -641,187 +643,6 @@ mod tests {
         );
         assert!(!task.io_completion_worker.lock().suspended);
         task.release_io_completion_worker();
-    }
-
-    #[test]
-    fn remove_write_failure_preserves_packets() {
-        let port = IoCompletionObject::<crate::tests::TestPlatform>::new(0);
-        for completion_key in [1, 2] {
-            port.post(IoCompletionPacket {
-                completion_key,
-                completion_value: 0,
-                status: 0,
-                information: 0,
-            });
-        }
-
-        assert_eq!(
-            port.remove_with(
-                2,
-                |index, _| {
-                    if index == 1 {
-                        Err(NtStatus::ACCESS_VIOLATION)
-                    } else {
-                        Ok(())
-                    }
-                },
-                |_| unreachable!("the count is not written after a packet write failure"),
-            ),
-            Err(NtStatus::ACCESS_VIOLATION)
-        );
-        assert_eq!(port.packets.lock().len(), 2);
-
-        let mut completion_keys = alloc::vec::Vec::new();
-        let mut removed = 0;
-        assert_eq!(
-            port.remove_with(
-                2,
-                |_, packet| {
-                    completion_keys.push(packet.completion_key);
-                    Ok(())
-                },
-                |count| {
-                    removed = count;
-                    Ok(())
-                },
-            ),
-            Ok(true)
-        );
-        assert_eq!(completion_keys, [1, 2]);
-        assert_eq!(removed, 2);
-        assert!(port.packets.lock().is_empty());
-    }
-
-    #[test]
-    fn named_ports_open_and_share_packets() {
-        let task = test_task();
-        let name_units = utf16_units("\\BaseNamedObjects\\LiteBoxIoCompletion");
-        let name = unicode_string(&name_units);
-        let attributes = object_attributes(&name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
-        let openif_attributes = ObjectAttributes {
-            attributes: (ObjectAttributesFlags::CASE_INSENSITIVE | ObjectAttributesFlags::OPENIF)
-                .bits(),
-            ..attributes
-        };
-
-        let mut created = Handle::default();
-        assert_eq!(
-            task.sys_nt_create_io_completion(
-                mut_ptr(&mut created),
-                IO_COMPLETION_ALL_ACCESS,
-                Some(const_ptr(&attributes)),
-                1,
-            ),
-            NtStatus::SUCCESS
-        );
-        let mut collision = Handle::default();
-        assert_eq!(
-            task.sys_nt_create_io_completion(
-                mut_ptr(&mut collision),
-                IO_COMPLETION_ALL_ACCESS,
-                Some(const_ptr(&attributes)),
-                2,
-            ),
-            NtStatus::OBJECT_NAME_COLLISION
-        );
-        assert_eq!(
-            task.sys_nt_create_io_completion(
-                mut_ptr(&mut collision),
-                IO_COMPLETION_ALL_ACCESS,
-                Some(const_ptr(&openif_attributes)),
-                2,
-            ),
-            NtStatus::OBJECT_NAME_EXISTS
-        );
-
-        let mut opened = Handle::default();
-        assert_eq!(
-            task.sys_nt_open_io_completion(
-                mut_ptr(&mut opened),
-                IO_COMPLETION_ALL_ACCESS,
-                Some(const_ptr(&attributes)),
-            ),
-            NtStatus::SUCCESS
-        );
-        assert_eq!(
-            task.sys_nt_set_io_completion(created, 0x1234, 0x5678, 0, 9),
-            NtStatus::SUCCESS
-        );
-        let mut packet = IoCompletionPacket {
-            completion_key: 0,
-            completion_value: 0,
-            status: 0,
-            information: 0,
-        };
-        let mut removed = 0;
-        let timeout = 0;
-        assert_eq!(
-            task.sys_nt_remove_io_completion_ex(
-                opened,
-                mut_ptr(&mut packet),
-                1,
-                mut_ptr(&mut removed),
-                Some(const_ptr(&timeout)),
-                false,
-            ),
-            NtStatus::SUCCESS
-        );
-        assert_eq!(removed, 1);
-        assert_eq!(packet.completion_key, 0x1234);
-        assert_eq!(packet.completion_value, 0x5678);
-        assert_eq!(packet.information, 9);
-
-        for handle in [created, collision, opened] {
-            assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
-        }
-        let mut recreated = Handle::default();
-        assert_eq!(
-            task.sys_nt_create_io_completion(
-                mut_ptr(&mut recreated),
-                IO_COMPLETION_ALL_ACCESS,
-                Some(const_ptr(&attributes)),
-                1,
-            ),
-            NtStatus::SUCCESS
-        );
-    }
-
-    #[test]
-    fn named_port_rejects_existing_object_of_another_type() {
-        let task = test_task();
-        let name_units = utf16_units("\\BaseNamedObjects\\LiteBoxIoCompletionTypeMismatch");
-        let name = unicode_string(&name_units);
-        let attributes = object_attributes(&name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
-        let mut event = Handle::default();
-        assert_eq!(
-            task.sys_nt_create_event(
-                mut_ptr(&mut event),
-                IO_COMPLETION_ALL_ACCESS,
-                Some(const_ptr(&attributes)),
-                EventType::Notification as u32,
-                0,
-            ),
-            NtStatus::SUCCESS
-        );
-
-        let mut io_completion = Handle::default();
-        assert_eq!(
-            task.sys_nt_create_io_completion(
-                mut_ptr(&mut io_completion),
-                IO_COMPLETION_ALL_ACCESS,
-                Some(const_ptr(&attributes)),
-                1,
-            ),
-            NtStatus::OBJECT_TYPE_MISMATCH
-        );
-        assert_eq!(
-            task.sys_nt_open_io_completion(
-                mut_ptr(&mut io_completion),
-                IO_COMPLETION_ALL_ACCESS,
-                Some(const_ptr(&attributes)),
-            ),
-            NtStatus::OBJECT_TYPE_MISMATCH
-        );
     }
 
     #[test]

@@ -981,13 +981,11 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             Ok(status) => status,
             Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory)) => {
                 let parent = parent_directory_path(&path);
-                let status = if self.fs.file_status(parent).is_ok() {
+                return if self.fs.file_status(parent).is_ok() {
                     NtStatus::OBJECT_NAME_NOT_FOUND
                 } else {
                     NtStatus::OBJECT_PATH_NOT_FOUND
                 };
-                litebox_util_log::debug!(path:% = path, status:? = status; "NtQueryAttributesFile path not found");
-                return status;
             }
             Err(error) => return map_file_status_error(error),
         };
