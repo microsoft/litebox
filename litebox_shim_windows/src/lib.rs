@@ -555,6 +555,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
                     process: process.clone(),
                     fs,
                     wait_state: wait::WaitState::new(self.0.platform),
+                    io_completion_worker: Mutex::new(syscalls::iocp::IoCompletionWorkerState::new()),
                     entry_point: load_info.entry_point,
                     stack_top: load_info.stack_top,
                     context: load_info.environment.context,
@@ -737,6 +738,7 @@ struct Task<Platform: ShimPlatform, FS: ShimFS> {
     process: Arc<Process<Platform>>,
     fs: Arc<FS>,
     wait_state: wait::WaitState<Platform>,
+    io_completion_worker: Mutex<Platform, syscalls::iocp::IoCompletionWorkerState<Platform>>,
     entry_point: usize,
     stack_top: usize,
     context: usize,
@@ -748,6 +750,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     fn complete_current_thread(&self) {
         let thread_id = self.thread_object.thread_id();
         self.thread_object.complete(|| {
+            self.release_io_completion_worker();
             self.thread_object.abandon_owned_mutants(thread_id);
             self.process.detach_thread(thread_id);
         });
@@ -1174,6 +1177,47 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 object_attributes,
                 number_of_concurrent_threads,
             ),
+            SyscallRequest::NtOpenIoCompletion {
+                io_completion_handle,
+                desired_access,
+                object_attributes,
+            } => self.sys_nt_open_io_completion(
+                io_completion_handle,
+                desired_access,
+                object_attributes,
+            ),
+            SyscallRequest::NtSetIoCompletion {
+                io_completion_handle,
+                completion_key,
+                completion_value,
+                status,
+                information,
+            } => self.sys_nt_set_io_completion(
+                io_completion_handle,
+                completion_key,
+                completion_value,
+                status,
+                information,
+            ),
+            SyscallRequest::NtRemoveIoCompletionEx {
+                io_completion_handle,
+                io_completion_information,
+                count,
+                num_entries_removed,
+                timeout,
+                alertable,
+            } => self.sys_nt_remove_io_completion_ex(
+                io_completion_handle,
+                io_completion_information,
+                count,
+                num_entries_removed,
+                timeout,
+                alertable,
+            ),
+            SyscallRequest::NtAlpcConnectPort {
+                port_handle,
+                port_name,
+            } => Self::sys_nt_alpc_connect_port(port_handle, port_name),
             SyscallRequest::NtConnectPort {
                 port_handle,
                 port_name,

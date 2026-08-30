@@ -230,6 +230,30 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
         number_of_concurrent_threads: u32,
     },
+    NtOpenIoCompletion {
+        io_completion_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+    },
+    NtSetIoCompletion {
+        io_completion_handle: Handle,
+        completion_key: usize,
+        completion_value: usize,
+        status: i32,
+        information: usize,
+    },
+    NtRemoveIoCompletionEx {
+        io_completion_handle: Handle,
+        io_completion_information: Platform::RawMutPointer<iocp::IoCompletionPacket>,
+        count: u32,
+        num_entries_removed: Platform::RawMutPointer<u32>,
+        timeout: Option<Platform::RawConstPointer<i64>>,
+        alertable: bool,
+    },
+    NtAlpcConnectPort {
+        port_handle: Platform::RawMutPointer<Handle>,
+        port_name: Platform::RawConstPointer<nt_types::UnicodeString>,
+    },
     NtConnectPort {
         port_handle: Platform::RawMutPointer<Handle>,
         port_name: Platform::RawConstPointer<nt_types::UnicodeString>,
@@ -1014,6 +1038,30 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 desired_access,
                 object_attributes:*,
                 number_of_concurrent_threads,
+            })),
+            NtSysno::NtOpenIoCompletion => Some(sys_req!(NtOpenIoCompletion {
+                io_completion_handle:*,
+                desired_access,
+                object_attributes:*,
+            })),
+            NtSysno::NtSetIoCompletion => Some(sys_req!(NtSetIoCompletion {
+                io_completion_handle: { Handle::from_raw },
+                completion_key,
+                completion_value,
+                status,
+                information,
+            })),
+            NtSysno::NtRemoveIoCompletionEx => Some(sys_req!(NtRemoveIoCompletionEx {
+                io_completion_handle:{ Handle::from_raw },
+                io_completion_information:*,
+                count,
+                num_entries_removed:*,
+                timeout:*,
+                alertable:{ |value: u8| value != 0 },
+            })),
+            NtSysno::NtAlpcConnectPort => Some(sys_req!(NtAlpcConnectPort {
+                port_handle:*,
+                port_name:*,
             })),
             NtSysno::NtConnectPort => Some(sys_req!(NtConnectPort {
                 port_handle:*,
@@ -1835,6 +1883,78 @@ impl<T: zerocopy::FromBytes, P: litebox::platform::RawConstPointer<T>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn open_io_completion_decodes_arguments() {
+        let registers = litebox_common_linux::PtRegs {
+            orig_rax: NtSysno::NtOpenIoCompletion.as_raw() as usize,
+            r10: 0x1000,
+            rdx: 0x001f_0003,
+            r8: 0x2000,
+            ..Default::default()
+        };
+
+        let Some(SyscallRequest::NtOpenIoCompletion {
+            io_completion_handle,
+            desired_access,
+            object_attributes,
+        }) = SyscallRequest::<crate::tests::TestPlatform>::try_from_raw(&registers)
+        else {
+            panic!("NtOpenIoCompletion should decode");
+        };
+
+        assert_eq!(io_completion_handle.as_usize(), 0x1000);
+        assert_eq!(desired_access, 0x001f_0003);
+        assert_eq!(
+            object_attributes
+                .expect("object attributes should be present")
+                .as_usize(),
+            0x2000
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn remove_io_completion_ex_decodes_register_and_stack_arguments() {
+        let timeout = -10i64;
+        let mut stack = [0usize; 7];
+        stack[5] = (&raw const timeout).addr();
+        stack[6] = 1;
+        let registers = litebox_common_linux::PtRegs {
+            orig_rax: NtSysno::NtRemoveIoCompletionEx.as_raw() as usize,
+            r10: 0x40,
+            rdx: 0x1000,
+            r8: 3,
+            r9: 0x2000,
+            rsp: stack.as_ptr().addr(),
+            ..Default::default()
+        };
+
+        let Some(SyscallRequest::NtRemoveIoCompletionEx {
+            io_completion_handle,
+            io_completion_information,
+            count,
+            num_entries_removed,
+            timeout: decoded_timeout,
+            alertable,
+        }) = SyscallRequest::<crate::tests::TestPlatform>::try_from_raw(&registers)
+        else {
+            panic!("NtRemoveIoCompletionEx should decode");
+        };
+
+        assert_eq!(io_completion_handle, Handle::from_raw(0x40));
+        assert_eq!(io_completion_information.as_usize(), 0x1000);
+        assert_eq!(count, 3);
+        assert_eq!(num_entries_removed.as_usize(), 0x2000);
+        assert_eq!(
+            decoded_timeout
+                .expect("timeout should be present")
+                .as_usize(),
+            (&raw const timeout).addr()
+        );
+        assert!(alertable);
+    }
 
     #[test]
     fn handle_encodes_raw_fds_and_rejects_invalid_values() {

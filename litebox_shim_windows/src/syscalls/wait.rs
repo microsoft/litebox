@@ -121,9 +121,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             litebox_util_log::debug!("Treating alertable wait as non-alertable");
         }
 
-        let wait_cx = self.wait_cx().with_timeout(timeout);
-        match wait_cx.wait_on_events(
+        match self.wait_on_events(
             false,
+            timeout,
             Events::IN,
             |observer, mask| {
                 object.register_observer(observer, mask);

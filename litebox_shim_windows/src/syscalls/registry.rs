@@ -1187,23 +1187,30 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 completion_filter,
                 params.watch_tree,
             );
-            let wait_cx = self.wait_cx();
-            let wait_result =
-                self.global
-                    .registry
-                    .notification_pollee
-                    .wait(&wait_cx, false, Events::IN, || {
-                        if self.global.registry.notification_generation(
-                            &path,
-                            completion_filter,
-                            params.watch_tree,
-                        ) == generation
-                        {
-                            Err(TryOpError::<NtStatus>::TryAgain)
-                        } else {
-                            Ok(())
-                        }
-                    });
+            let wait_result = self.wait_on_events(
+                false,
+                None,
+                Events::IN,
+                |observer, mask| {
+                    self.global
+                        .registry
+                        .notification_pollee
+                        .register_observer(observer, mask);
+                    Ok(())
+                },
+                || {
+                    if self.global.registry.notification_generation(
+                        &path,
+                        completion_filter,
+                        params.watch_tree,
+                    ) == generation
+                    {
+                        Err(TryOpError::<NtStatus>::TryAgain)
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
             let status = match wait_result {
                 Ok(()) => NtStatus::NOTIFY_ENUM_DIR,
                 Err(TryOpError::WaitError(litebox::event::wait::WaitError::Interrupted)) => {
