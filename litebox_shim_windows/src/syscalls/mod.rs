@@ -145,6 +145,16 @@ impl ThreadHandle {
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug)]
 pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
+    NtAccessCheck {
+        security_descriptor: Platform::RawConstPointer<u8>,
+        client_token: Handle,
+        desired_access: u32,
+        generic_mapping: Platform::RawConstPointer<[u32; 4]>,
+        privilege_set: Platform::RawMutPointer<u8>,
+        privilege_set_length: Platform::RawMutPointer<u32>,
+        granted_access: Platform::RawMutPointer<u32>,
+        access_status: Platform::RawMutPointer<u32>,
+    },
     NtClose {
         handle: Handle,
     },
@@ -976,6 +986,16 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
         }
 
         match NtSysno::from_raw(pt_regs.orig_rax)? {
+            NtSysno::NtAccessCheck => Some(sys_req!(NtAccessCheck {
+                security_descriptor:*,
+                client_token: { Handle::from_raw },
+                desired_access,
+                generic_mapping:*,
+                privilege_set:*,
+                privilege_set_length:*,
+                granted_access:*,
+                access_status:*,
+            })),
             NtSysno::NtClose => Some(sys_req!(NtClose {
                 handle: { Handle::from_raw },
             })),

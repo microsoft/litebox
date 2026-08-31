@@ -891,7 +891,7 @@ pub(crate) struct KUserSharedData {
     shared_data_flags: u32,
     data_flags_pad: [u32; 1],
     test_ret_instruction: u64,
-    qpc_frequency: i64,
+    pub(crate) qpc_frequency: i64,
     system_call: u32,
     user_cet_available_environments: u32,
     system_call_pad: [u64; 2],

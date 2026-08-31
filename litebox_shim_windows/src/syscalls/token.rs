@@ -324,10 +324,107 @@ impl WindowsHandleSubsystem for TokenSubsystem {
     }
 }
 
+pub(crate) struct AccessCheckParameters<Platform: crate::ShimPlatform> {
+    pub(crate) security_descriptor: ConstPtr<Platform, u8>,
+    pub(crate) client_token: Handle,
+    pub(crate) desired_access: u32,
+    pub(crate) generic_mapping: ConstPtr<Platform, [u32; 4]>,
+    pub(crate) privilege_set: MutPtr<Platform, u8>,
+    pub(crate) privilege_set_length: MutPtr<Platform, u32>,
+    pub(crate) granted_access: MutPtr<Platform, u32>,
+    pub(crate) access_status: MutPtr<Platform, u32>,
+}
+
 impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     const CURRENT_PROCESS_TOKEN: Handle = Handle::from_raw(usize::MAX - 3);
     const CURRENT_THREAD_TOKEN: Handle = Handle::from_raw(usize::MAX - 4);
     const CURRENT_THREAD_EFFECTIVE_TOKEN: Handle = Handle::from_raw(usize::MAX - 5);
+
+    pub(crate) fn sys_nt_access_check(
+        &self,
+        parameters: AccessCheckParameters<Platform>,
+    ) -> NtStatus {
+        const EMPTY_PRIVILEGE_SET_SIZE: u32 = 8;
+
+        if parameters.security_descriptor.read_at_offset(0).is_none() {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        let Some(generic_mapping) = parameters.generic_mapping.read_at_offset(0) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        let Some(privilege_set_capacity) = parameters.privilege_set_length.read_at_offset(0) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        if let Err(status) =
+            probe_guest_output_preserving_value::<Platform, _>(parameters.privilege_set_length)
+        {
+            return status;
+        }
+        if let Err(status) =
+            probe_guest_output_preserving_value::<Platform, _>(parameters.granted_access)
+        {
+            return status;
+        }
+        if let Err(status) =
+            probe_guest_output_preserving_value::<Platform, _>(parameters.access_status)
+        {
+            return status;
+        }
+
+        if parameters.client_token == Self::CURRENT_THREAD_TOKEN {
+            return NtStatus::NO_TOKEN;
+        }
+        if parameters.client_token != Self::CURRENT_PROCESS_TOKEN
+            && parameters.client_token != Self::CURRENT_THREAD_EFFECTIVE_TOKEN
+            && let Err(status) = self
+                .typed_handle_entry_with_access::<TokenSubsystem>(
+                    parameters.client_token,
+                    TokenAccess::QUERY.bits(),
+                )
+                .map(drop)
+        {
+            return status;
+        }
+
+        if parameters
+            .privilege_set_length
+            .write_at_offset(0, EMPTY_PRIVILEGE_SET_SIZE)
+            .is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+        if privilege_set_capacity < EMPTY_PRIVILEGE_SET_SIZE {
+            return NtStatus::BUFFER_TOO_SMALL;
+        }
+        if let Err(status) = probe_guest_output_buffer::<Platform>(
+            parameters.privilege_set,
+            EMPTY_PRIVILEGE_SET_SIZE as usize,
+        ) {
+            return status;
+        }
+
+        let expanded_access = AccessMask::expand_generic_access(
+            parameters.desired_access,
+            generic_mapping[0],
+            generic_mapping[1],
+            generic_mapping[2],
+            generic_mapping[3],
+        );
+        if parameters
+            .privilege_set
+            .copy_from_slice(0, &[0; EMPTY_PRIVILEGE_SET_SIZE as usize])
+            .is_none()
+            || parameters
+                .granted_access
+                .write_at_offset(0, expanded_access)
+                .is_none()
+            || parameters.access_status.write_at_offset(0, 0).is_none()
+        {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+
+        NtStatus::SUCCESS
+    }
 
     pub(crate) fn sys_nt_open_process_token(
         &self,
@@ -800,6 +897,51 @@ mod tests {
         user: TokenUser,
         sid: Sid,
         padding: u32,
+    }
+
+    #[test]
+    fn access_check_grants_mapped_access_and_reports_privilege_set_size() {
+        let task = test_task();
+        let security_descriptor = 1u8;
+        let generic_mapping = [0x10, 0x20, 0x40, 0x80];
+        let mut privilege_set = [u8::MAX; 8];
+        let mut privilege_set_length = privilege_set.len().try_into().unwrap();
+        let mut granted_access = 0;
+        let mut access_status = u32::MAX;
+
+        assert_eq!(
+            task.sys_nt_access_check(AccessCheckParameters {
+                security_descriptor: const_ptr(&security_descriptor),
+                client_token: Task::<TestPlatform, TestFS>::CURRENT_PROCESS_TOKEN,
+                desired_access: AccessMask::GENERIC_READ.bits() | 1,
+                generic_mapping: const_ptr(&generic_mapping),
+                privilege_set: mut_byte_ptr(&mut privilege_set),
+                privilege_set_length: mut_ptr(&mut privilege_set_length),
+                granted_access: mut_ptr(&mut granted_access),
+                access_status: mut_ptr(&mut access_status),
+            }),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(privilege_set, [0; 8]);
+        assert_eq!(privilege_set_length, 8);
+        assert_eq!(granted_access, 0x11);
+        assert_eq!(access_status, 0);
+
+        privilege_set_length = 0;
+        assert_eq!(
+            task.sys_nt_access_check(AccessCheckParameters {
+                security_descriptor: const_ptr(&security_descriptor),
+                client_token: Task::<TestPlatform, TestFS>::CURRENT_PROCESS_TOKEN,
+                desired_access: 1,
+                generic_mapping: const_ptr(&generic_mapping),
+                privilege_set: null_mut_ptr(),
+                privilege_set_length: mut_ptr(&mut privilege_set_length),
+                granted_access: mut_ptr(&mut granted_access),
+                access_status: mut_ptr(&mut access_status),
+            }),
+            NtStatus::BUFFER_TOO_SMALL
+        );
+        assert_eq!(privilege_set_length, 8);
     }
 
     #[test]
