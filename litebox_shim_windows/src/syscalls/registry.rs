@@ -102,16 +102,160 @@ const DEFAULT_SESSION_MANAGER_KEY: &str =
 const DEFAULT_SEGMENT_HEAP_KEY: &str =
     "\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Session Manager\\Segment Heap";
 const DEFAULT_IMAGE_FILE_EXECUTION_OPTIONS_KEY: &str = "\\Registry\\Machine\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options";
+
+/* Seed separate providers for TCP streams and UDP datagrams in both IPv4 and
+IPv6 so Winsock can resolve each address-family, socket-type, and protocol
+combination used by applications. */
 const DEFAULT_WINSOCK_PARAMETERS_KEY: &str =
     "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\WinSock2\\Parameters";
 const DEFAULT_WINSOCK_PROTOCOL_CATALOG_KEY: &str = "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\WinSock2\\Parameters\\Protocol_Catalog9";
-const DEFAULT_WINSOCK_PROTOCOL_ENTRY_KEY: &str = "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\WinSock2\\Parameters\\Protocol_Catalog9\\Catalog_Entries64\\000000000001";
+/// IPv4 TCP
+const DEFAULT_WINSOCK_IPV4_TCP_ENTRY_KEY: &str = "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\WinSock2\\Parameters\\Protocol_Catalog9\\Catalog_Entries64\\000000000001";
+/// IPv4 UDP
+const DEFAULT_WINSOCK_IPV4_UDP_ENTRY_KEY: &str = "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\WinSock2\\Parameters\\Protocol_Catalog9\\Catalog_Entries64\\000000000002";
+/// IPv6 TCP
+const DEFAULT_WINSOCK_IPV6_TCP_ENTRY_KEY: &str = "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\WinSock2\\Parameters\\Protocol_Catalog9\\Catalog_Entries64\\000000000003";
+/// IPv6 UDP
+const DEFAULT_WINSOCK_IPV6_UDP_ENTRY_KEY: &str = "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\WinSock2\\Parameters\\Protocol_Catalog9\\Catalog_Entries64\\000000000004";
 const DEFAULT_WINSOCK_NAMESPACE_CATALOG_KEY: &str = "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\WinSock2\\Parameters\\NameSpace_Catalog5";
+/// DNS/name-resolution providers
 const DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY: &str = "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\WinSock2\\Parameters\\NameSpace_Catalog5\\Catalog_Entries64\\000000000001";
 const DEFAULT_ACP_VALUE: &[u8] = &[b'1', 0, b'2', 0, b'5', 0, b'2', 0, 0, 0];
 const DEFAULT_OEMCP_VALUE: &[u8] = &[b'4', 0, b'3', 0, b'7', 0, 0, 0];
 const DEFAULT_MACCP_VALUE: &[u8] = &[b'1', 0, b'0', 0, b'0', 0, b'0', 0, b'0', 0, 0, 0];
 const REGISTRY_VALUE_TYPE_SIZE: usize = size_of::<u32>();
+
+const WINSOCK_IPV4_PROVIDER_ID: [u8; 16] = [
+    0xa0, 0x1a, 0x0f, 0xe7, 0x8b, 0xab, 0xcf, 0x11, 0x8c, 0xa3, 0x00, 0x80, 0x5f, 0x48, 0xa1, 0x92,
+];
+const WINSOCK_IPV6_PROVIDER_ID: [u8; 16] = [
+    0xc0, 0xb0, 0xea, 0xf9, 0xd4, 0x26, 0xd0, 0x11, 0xbb, 0xbf, 0x00, 0xaa, 0x00, 0x6c, 0x34, 0xe4,
+];
+/// Number of TCP/UDP providers across IPv4 and IPv6 in `Protocol_Catalog9`.
+const WINSOCK_PROTOCOL_CATALOG_ENTRY_COUNT: u32 = 4;
+/// First catalog entry ID available after the four seeded protocol providers.
+const WINSOCK_NEXT_PROTOCOL_CATALOG_ENTRY_ID: u32 = 5;
+/// Initial catalog revision used by Winsock to detect catalog changes.
+const WINSOCK_INITIAL_CATALOG_SERIAL: u32 = 1;
+/// Number of name-resolution providers in `NameSpace_Catalog5`.
+const WINSOCK_NAMESPACE_CATALOG_ENTRY_COUNT: u32 = 1;
+/// `NS_DNS`: the Winsock namespace identifier for DNS name resolution.
+const WINSOCK_NAMESPACE_DNS: u32 = 12;
+/// Microsoft TCP/IP namespace provider GUID, encoded using the Windows GUID layout.
+const WINSOCK_NAMESPACE_PROVIDER_ID: [u8; 16] = [
+    0x40, 0x9d, 0x05, 0x22, 0x9e, 0x7e, 0xcf, 0x11, 0xae, 0x5a, 0x00, 0xaa, 0x00, 0xa7, 0x11, 0x2b,
+];
+/// The seeded DNS namespace provider is active.
+const WINSOCK_NAMESPACE_PROVIDER_ENABLED: u32 = 1;
+/// Version reported by the built-in Microsoft DNS namespace provider.
+const WINSOCK_NAMESPACE_PROVIDER_VERSION: u32 = 0;
+/// The DNS provider does not persist Winsock service-class metadata.
+const WINSOCK_NAMESPACE_STORES_SERVICE_CLASS_INFO: u32 = 0;
+const WINSOCK_PROVIDER_PATH_SIZE: usize = 260;
+
+#[derive(Clone, Copy)]
+struct DefaultWinsockProtocol {
+    entry_key: &'static str,
+    catalog_entry_id: u32,
+    service_flags: u32,
+    provider_id: [u8; 16],
+    address_family: i32,
+    socket_address_size: i32,
+    socket_type: i32,
+    protocol: i32,
+    message_size: u32,
+    protocol_name: &'static str,
+}
+
+const DEFAULT_WINSOCK_PROTOCOLS: [DefaultWinsockProtocol; 4] = [
+    DefaultWinsockProtocol {
+        entry_key: DEFAULT_WINSOCK_IPV4_TCP_ENTRY_KEY,
+        catalog_entry_id: 1,
+        service_flags: 0x0002_0066,
+        provider_id: WINSOCK_IPV4_PROVIDER_ID,
+        address_family: 2,
+        socket_address_size: 16,
+        socket_type: 1,
+        protocol: 6,
+        message_size: 0,
+        protocol_name: "@%SystemRoot%\\System32\\mswsock.dll,-60100",
+    },
+    DefaultWinsockProtocol {
+        entry_key: DEFAULT_WINSOCK_IPV4_UDP_ENTRY_KEY,
+        catalog_entry_id: 2,
+        service_flags: 0x0002_0609,
+        provider_id: WINSOCK_IPV4_PROVIDER_ID,
+        address_family: 2,
+        socket_address_size: 16,
+        socket_type: 2,
+        protocol: 17,
+        message_size: 65_527,
+        protocol_name: "@%SystemRoot%\\System32\\mswsock.dll,-60101",
+    },
+    DefaultWinsockProtocol {
+        entry_key: DEFAULT_WINSOCK_IPV6_TCP_ENTRY_KEY,
+        catalog_entry_id: 3,
+        service_flags: 0x0002_0066,
+        provider_id: WINSOCK_IPV6_PROVIDER_ID,
+        address_family: 23,
+        socket_address_size: 28,
+        socket_type: 1,
+        protocol: 6,
+        message_size: 0,
+        protocol_name: "@%SystemRoot%\\System32\\mswsock.dll,-60200",
+    },
+    DefaultWinsockProtocol {
+        entry_key: DEFAULT_WINSOCK_IPV6_UDP_ENTRY_KEY,
+        catalog_entry_id: 4,
+        service_flags: 0x0002_0609,
+        provider_id: WINSOCK_IPV6_PROVIDER_ID,
+        address_family: 23,
+        socket_address_size: 28,
+        socket_type: 2,
+        protocol: 17,
+        message_size: 65_527,
+        protocol_name: "@%SystemRoot%\\System32\\mswsock.dll,-60201",
+    },
+];
+
+#[repr(C)]
+#[derive(Immutable, IntoBytes)]
+struct WinsockPackedCatalogItem {
+    provider_path: [u8; WINSOCK_PROVIDER_PATH_SIZE],
+    protocol_info: WsaProtocolInfo,
+}
+
+#[repr(C)]
+#[derive(Immutable, IntoBytes)]
+struct WsaProtocolChain {
+    chain_len: i32,
+    chain_entries: [u32; 7],
+}
+
+#[repr(C)]
+#[derive(Immutable, IntoBytes)]
+struct WsaProtocolInfo {
+    service_flags1: u32,
+    service_flags2: u32,
+    service_flags3: u32,
+    service_flags4: u32,
+    provider_flags: u32,
+    provider_id: [u8; 16],
+    catalog_entry_id: u32,
+    protocol_chain: WsaProtocolChain,
+    version: i32,
+    address_family: i32,
+    max_socket_address: i32,
+    min_socket_address: i32,
+    socket_type: i32,
+    protocol: i32,
+    protocol_max_offset: i32,
+    network_byte_order: i32,
+    security_scheme: i32,
+    message_size: u32,
+    provider_reserved: u32,
+    protocol_name: [u16; 256],
+}
 
 bitflags::bitflags! {
     /// Registry key `ACCESS_MASK` rights accepted by `NtOpenKey`/`NtCreateKey`.
@@ -471,7 +615,10 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
                 DEFAULT_IMAGE_FILE_EXECUTION_OPTIONS_KEY,
                 DEFAULT_WINSOCK_PARAMETERS_KEY,
                 DEFAULT_WINSOCK_PROTOCOL_CATALOG_KEY,
-                DEFAULT_WINSOCK_PROTOCOL_ENTRY_KEY,
+                DEFAULT_WINSOCK_IPV4_TCP_ENTRY_KEY,
+                DEFAULT_WINSOCK_IPV4_UDP_ENTRY_KEY,
+                DEFAULT_WINSOCK_IPV6_TCP_ENTRY_KEY,
+                DEFAULT_WINSOCK_IPV6_UDP_ENTRY_KEY,
                 DEFAULT_WINSOCK_NAMESPACE_CATALOG_KEY,
                 DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY,
             ] {
@@ -493,7 +640,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
                 }
             }
 
-            let winsock_values = [
+            let mut winsock_values = vec![
                 (
                     DEFAULT_WINSOCK_PARAMETERS_KEY,
                     "WinSock_Registry_Version",
@@ -516,43 +663,37 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
                     DEFAULT_WINSOCK_PROTOCOL_CATALOG_KEY,
                     "Num_Catalog_Entries64",
                     RegistryValueType::Dword,
-                    1u32.to_le_bytes().to_vec(),
+                    WINSOCK_PROTOCOL_CATALOG_ENTRY_COUNT
+                        .to_le_bytes()
+                        .to_vec(),
                 ),
                 (
                     DEFAULT_WINSOCK_PROTOCOL_CATALOG_KEY,
                     "Next_Catalog_Entry_ID",
                     RegistryValueType::Dword,
-                    2u32.to_le_bytes().to_vec(),
+                    WINSOCK_NEXT_PROTOCOL_CATALOG_ENTRY_ID
+                        .to_le_bytes()
+                        .to_vec(),
                 ),
                 (
                     DEFAULT_WINSOCK_PROTOCOL_CATALOG_KEY,
                     "Serial_Access_Num",
                     RegistryValueType::Dword,
-                    1u32.to_le_bytes().to_vec(),
-                ),
-                (
-                    DEFAULT_WINSOCK_PROTOCOL_ENTRY_KEY,
-                    "PackedCatalogItem",
-                    RegistryValueType::Binary,
-                    default_winsock_protocol_catalog_item(),
-                ),
-                (
-                    DEFAULT_WINSOCK_PROTOCOL_ENTRY_KEY,
-                    "ProtocolName",
-                    RegistryValueType::Sz,
-                    utf16le_nul("@%SystemRoot%\\System32\\mswsock.dll,-60100"),
+                    WINSOCK_INITIAL_CATALOG_SERIAL.to_le_bytes().to_vec(),
                 ),
                 (
                     DEFAULT_WINSOCK_NAMESPACE_CATALOG_KEY,
                     "Num_Catalog_Entries64",
                     RegistryValueType::Dword,
-                    1u32.to_le_bytes().to_vec(),
+                    WINSOCK_NAMESPACE_CATALOG_ENTRY_COUNT
+                        .to_le_bytes()
+                        .to_vec(),
                 ),
                 (
                     DEFAULT_WINSOCK_NAMESPACE_CATALOG_KEY,
                     "Serial_Access_Num",
                     RegistryValueType::Dword,
-                    1u32.to_le_bytes().to_vec(),
+                    WINSOCK_INITIAL_CATALOG_SERIAL.to_le_bytes().to_vec(),
                 ),
                 (
                     DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY,
@@ -570,34 +711,37 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
                     DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY,
                     "ProviderId",
                     RegistryValueType::Binary,
-                    vec![
-                        0x40, 0x9d, 0x05, 0x22, 0x9e, 0x7e, 0xcf, 0x11, 0xae, 0x5a, 0x00,
-                        0xaa, 0x00, 0xa7, 0x11, 0x2b,
-                    ],
+                    WINSOCK_NAMESPACE_PROVIDER_ID.to_vec(),
                 ),
                 (
                     DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY,
                     "SupportedNameSpace",
                     RegistryValueType::Dword,
-                    12u32.to_le_bytes().to_vec(),
+                    WINSOCK_NAMESPACE_DNS.to_le_bytes().to_vec(),
                 ),
                 (
                     DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY,
                     "Enabled",
                     RegistryValueType::Dword,
-                    1u32.to_le_bytes().to_vec(),
+                    WINSOCK_NAMESPACE_PROVIDER_ENABLED
+                        .to_le_bytes()
+                        .to_vec(),
                 ),
                 (
                     DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY,
                     "Version",
                     RegistryValueType::Dword,
-                    0u32.to_le_bytes().to_vec(),
+                    WINSOCK_NAMESPACE_PROVIDER_VERSION
+                        .to_le_bytes()
+                        .to_vec(),
                 ),
                 (
                     DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY,
                     "StoresServiceClassInfo",
                     RegistryValueType::Dword,
-                    0u32.to_le_bytes().to_vec(),
+                    WINSOCK_NAMESPACE_STORES_SERVICE_CLASS_INFO
+                        .to_le_bytes()
+                        .to_vec(),
                 ),
                 (
                     DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY,
@@ -606,6 +750,20 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
                     Vec::new(),
                 ),
             ];
+            for protocol in &DEFAULT_WINSOCK_PROTOCOLS {
+                winsock_values.push((
+                    protocol.entry_key,
+                    "PackedCatalogItem",
+                    RegistryValueType::Binary,
+                    default_winsock_protocol_catalog_item(protocol),
+                ));
+                winsock_values.push((
+                    protocol.entry_key,
+                    "ProtocolName",
+                    RegistryValueType::Sz,
+                    utf16le_nul(protocol.protocol_name),
+                ));
+            }
             for (key, name, value_type, value) in winsock_values {
                 if let Err(status) = write_value_in_fs(fs, key, name, value_type, &value) {
                     litebox_util_log::error!(name:% = name, status:? = status; "failed to initialize Winsock registry value");
@@ -1967,39 +2125,45 @@ fn utf16le_nul(value: &str) -> Vec<u8> {
     bytes
 }
 
-fn default_winsock_protocol_catalog_item() -> Vec<u8> {
-    const PROVIDER_PATH_SIZE: usize = 260;
-    const PROTOCOL_INFO_SIZE: usize = 628;
-    const PROTOCOL_INFO_OFFSET: usize = PROVIDER_PATH_SIZE;
-    const PROTOCOL_NAME_OFFSET: usize = PROTOCOL_INFO_OFFSET + 116;
-
-    fn write_u32(item: &mut [u8], offset: usize, value: u32) {
-        item[offset..offset + size_of::<u32>()].copy_from_slice(&value.to_le_bytes());
-    }
-
-    let mut item = vec![0; PROVIDER_PATH_SIZE + PROTOCOL_INFO_SIZE];
+fn default_winsock_protocol_catalog_item(protocol: &DefaultWinsockProtocol) -> Vec<u8> {
     let provider_path = b"%SystemRoot%\\system32\\mswsock.dll\0";
-    item[..provider_path.len()].copy_from_slice(provider_path);
+    let mut packed_provider_path = [0; WINSOCK_PROVIDER_PATH_SIZE];
+    packed_provider_path[..provider_path.len()].copy_from_slice(provider_path);
 
-    write_u32(&mut item, PROTOCOL_INFO_OFFSET, 0x0002_0066);
-    write_u32(&mut item, PROTOCOL_INFO_OFFSET + 16, 8);
-    item[PROTOCOL_INFO_OFFSET + 20..PROTOCOL_INFO_OFFSET + 36].copy_from_slice(&[
-        0xa0, 0x1a, 0x0f, 0xe7, 0x8b, 0xab, 0xcf, 0x11, 0x8c, 0xa3, 0x00, 0x80, 0x5f, 0x48, 0xa1,
-        0x92,
-    ]);
-    write_u32(&mut item, PROTOCOL_INFO_OFFSET + 36, 1);
-    write_u32(&mut item, PROTOCOL_INFO_OFFSET + 40, 1);
-    write_u32(&mut item, PROTOCOL_INFO_OFFSET + 72, 2);
-    write_u32(&mut item, PROTOCOL_INFO_OFFSET + 76, 2);
-    write_u32(&mut item, PROTOCOL_INFO_OFFSET + 80, 16);
-    write_u32(&mut item, PROTOCOL_INFO_OFFSET + 84, 16);
-    write_u32(&mut item, PROTOCOL_INFO_OFFSET + 88, 1);
-    write_u32(&mut item, PROTOCOL_INFO_OFFSET + 92, 6);
+    let protocol_name: Vec<u16> = protocol.protocol_name.encode_utf16().collect();
+    let mut packed_protocol_name = [0; 256];
+    assert!(protocol_name.len() < packed_protocol_name.len());
+    packed_protocol_name[..protocol_name.len()].copy_from_slice(&protocol_name);
 
-    let protocol_name = utf16le_nul("@%SystemRoot%\\System32\\mswsock.dll,-60100");
-    item[PROTOCOL_NAME_OFFSET..PROTOCOL_NAME_OFFSET + protocol_name.len()]
-        .copy_from_slice(&protocol_name);
-    item
+    let item = WinsockPackedCatalogItem {
+        provider_path: packed_provider_path,
+        protocol_info: WsaProtocolInfo {
+            service_flags1: protocol.service_flags,
+            service_flags2: 0,
+            service_flags3: 0,
+            service_flags4: 0,
+            provider_flags: 8,
+            provider_id: protocol.provider_id,
+            catalog_entry_id: protocol.catalog_entry_id,
+            protocol_chain: WsaProtocolChain {
+                chain_len: 1,
+                chain_entries: [0; 7],
+            },
+            version: 2,
+            address_family: protocol.address_family,
+            max_socket_address: protocol.socket_address_size,
+            min_socket_address: protocol.socket_address_size,
+            socket_type: protocol.socket_type,
+            protocol: protocol.protocol,
+            protocol_max_offset: 0,
+            network_byte_order: 0,
+            security_scheme: 0,
+            message_size: protocol.message_size,
+            provider_reserved: 0,
+            protocol_name: packed_protocol_name,
+        },
+    };
+    item.as_bytes().to_vec()
 }
 
 fn absolute_nt_key_name_to_fs_path(name: &str) -> Result<String, NtStatus> {
