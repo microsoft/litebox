@@ -15,50 +15,15 @@ use alloc::format;
 use alloc::string::String;
 use thiserror::Error;
 
-use crate::policy::{Hostname, HostnameError, PortRangeError, parse_port};
+use crate::policy::{Hostname, parse_port};
 
 /// Default destination port of a plain `http` request target.
 pub const DEFAULT_HTTP_PORT: u16 = 80;
 
-/// Reason an authority was rejected.
+/// Indicates that a request authority is invalid.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
-pub enum AuthorityError {
-    /// The authority was empty.
-    #[error("authority is empty")]
-    Empty,
-    /// The authority contained non-ASCII bytes.
-    #[error("authority is not ASCII")]
-    NotAscii,
-    /// The authority contained a control byte or ASCII whitespace.
-    #[error("authority contains a control byte or whitespace")]
-    ControlOrWhitespace,
-    /// The authority contained a percent sign; percent-decoding could change
-    /// how the authority is interpreted.
-    #[error("authority contains percent-encoding")]
-    PercentEncoding,
-    /// The authority contained `@`, i.e. userinfo, which is never accepted.
-    #[error("authority contains userinfo")]
-    UserInfo,
-    /// The authority contained a delimiter that would let the authority be
-    /// re-split into a different URI.
-    #[error("authority contains a URI delimiter")]
-    Delimiter,
-    /// The authority contained an IP literal, including bracketed IPv6.
-    #[error("authority is an IP literal")]
-    IpLiteral,
-    /// The authority contained more than one colon.
-    #[error("authority contains more than one port separator")]
-    AmbiguousPort,
-    /// The request form requires an explicit port and none was present.
-    #[error("authority is missing an explicit port")]
-    MissingPort,
-    /// The port was not a valid destination port.
-    #[error("invalid port: {0}")]
-    Port(#[from] PortRangeError),
-    /// The host part was not a valid hostname.
-    #[error("invalid hostname: {0}")]
-    Hostname(#[from] HostnameError),
-}
+#[error("invalid request authority")]
+pub struct AuthorityError;
 
 /// A canonical request authority: an exact hostname and an effective
 /// destination port.
@@ -111,21 +76,16 @@ pub fn parse_authority(
     raw: &str,
     default_port: Option<u16>,
 ) -> Result<RequestAuthority, AuthorityError> {
-    if raw.is_empty() {
-        return Err(AuthorityError::Empty);
-    }
-    if !raw.is_ascii() {
-        return Err(AuthorityError::NotAscii);
+    if raw.is_empty() || !raw.is_ascii() {
+        return Err(AuthorityError);
     }
 
     for byte in raw.bytes() {
         match byte {
             // Everything up to and including SPACE, plus DEL.
-            0x00..=0x20 | 0x7f => return Err(AuthorityError::ControlOrWhitespace),
-            b'%' => return Err(AuthorityError::PercentEncoding),
-            b'@' => return Err(AuthorityError::UserInfo),
-            b'[' | b']' => return Err(AuthorityError::IpLiteral),
-            b'/' | b'\\' | b'?' | b'#' => return Err(AuthorityError::Delimiter),
+            0x00..=0x20 | 0x7f | b'%' | b'@' | b'[' | b']' | b'/' | b'\\' | b'?' | b'#' => {
+                return Err(AuthorityError);
+            }
             _ => {}
         }
     }
@@ -136,14 +96,14 @@ pub fn parse_authority(
     };
 
     let port = match port_part {
-        Some(port) if port.contains(':') => return Err(AuthorityError::AmbiguousPort),
-        Some(port) => parse_port(port)?,
-        None => default_port.ok_or(AuthorityError::MissingPort)?,
+        Some(port) if port.contains(':') => return Err(AuthorityError),
+        Some(port) => parse_port(port).map_err(|_| AuthorityError)?,
+        None => default_port.ok_or(AuthorityError)?,
     };
 
     // The hostname parser rejects IP literals and numeric forms, keeping
     // addresses out of hostname policy entirely.
-    let host = Hostname::parse(host_part)?;
+    let host = Hostname::parse(host_part).map_err(|_| AuthorityError)?;
     Ok(RequestAuthority { host, port })
 }
 
@@ -182,67 +142,32 @@ mod tests {
     #[test]
     fn applies_default_port_only_when_provided() {
         assert_eq!(authority("example.com", Some(DEFAULT_HTTP_PORT)).port(), 80);
-        assert_eq!(
-            parse_authority("example.com", None),
-            Err(AuthorityError::MissingPort)
-        );
+        assert_eq!(parse_authority("example.com", None), Err(AuthorityError));
     }
 
     #[test]
     fn rejects_reinterpretable_authorities() {
-        assert_eq!(parse_authority("", None), Err(AuthorityError::Empty));
-        assert_eq!(
-            parse_authority("exa\u{fe}mple.com:80", None),
-            Err(AuthorityError::NotAscii)
-        );
-        assert_eq!(
-            parse_authority("example.com\r\n:80", None),
-            Err(AuthorityError::ControlOrWhitespace)
-        );
-        assert_eq!(
-            parse_authority("example.com :80", None),
-            Err(AuthorityError::ControlOrWhitespace)
-        );
-        assert_eq!(
-            parse_authority("exam%70le.com:80", None),
-            Err(AuthorityError::PercentEncoding)
-        );
-        assert_eq!(
-            parse_authority("user@example.com:80", None),
-            Err(AuthorityError::UserInfo)
-        );
-        assert_eq!(
-            parse_authority("example.com:80/evil.com", None),
-            Err(AuthorityError::Delimiter)
-        );
-        assert_eq!(
-            parse_authority("example.com:80#frag", None),
-            Err(AuthorityError::Delimiter)
-        );
-        assert_eq!(
-            parse_authority("[2001:db8::1]:443", None),
-            Err(AuthorityError::IpLiteral)
-        );
-        assert_eq!(
-            parse_authority("example.com:80:443", None),
-            Err(AuthorityError::AmbiguousPort)
-        );
+        for raw in [
+            "",
+            "exa\u{fe}mple.com:80",
+            "example.com\r\n:80",
+            "example.com :80",
+            "exam%70le.com:80",
+            "user@example.com:80",
+            "example.com:80/evil.com",
+            "example.com:80#frag",
+            "[2001:db8::1]:443",
+            "example.com:80:443",
+        ] {
+            assert_eq!(parse_authority(raw, None), Err(AuthorityError), "{raw:?}");
+        }
     }
 
     #[test]
     fn rejects_ip_and_invalid_ports() {
-        assert!(matches!(
-            parse_authority("192.0.2.10:443", None),
-            Err(AuthorityError::Hostname(HostnameError::NumericForm))
-        ));
-        assert!(matches!(
-            parse_authority("example.com:0", None),
-            Err(AuthorityError::Port(PortRangeError::ZeroPort))
-        ));
-        assert!(matches!(
-            parse_authority("example.com:http", None),
-            Err(AuthorityError::Port(PortRangeError::NotANumber))
-        ));
+        for raw in ["192.0.2.10:443", "example.com:0", "example.com:http"] {
+            assert_eq!(parse_authority(raw, None), Err(AuthorityError), "{raw}");
+        }
     }
 
     #[test]
