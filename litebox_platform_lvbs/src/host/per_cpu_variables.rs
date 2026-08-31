@@ -11,7 +11,7 @@ use crate::{
     },
 };
 use aligned_vec::avec;
-use alloc::boxed::Box;
+use alloc::{boxed::Box, sync::Arc};
 use core::cell::{Cell, UnsafeCell};
 use core::mem::offset_of;
 use litebox::utils::TruncateExt;
@@ -64,6 +64,8 @@ pub struct PerCpuVariables {
     pub(crate) preemption_armed: Cell<bool>,
     /// Set when a preemption timer killed user-mode code.
     pub(crate) preemption_timeout_killed_user: Cell<bool>,
+    /// Reference to the currently loaded page table (`None`: the base page table).
+    active_page_table: UnsafeCell<Option<(usize, Arc<crate::mm::PageTable<PAGE_SIZE>>)>>,
 }
 
 // These Hyper-V pages must be page-aligned.
@@ -239,6 +241,32 @@ impl PerCpuVariables {
         pcv_asm.set_vtl1_kernel_xsave_area_addr(vtl1_kernel_xsave_area.as_ptr() as usize);
         pcv_asm.set_vtl1_user_xsave_area_addr(vtl1_user_xsave_area.as_ptr() as usize);
         pcv_asm.set_vtl1_xsave_mask(vtl1_xsave_mask);
+    }
+
+    /// Returns the active task page table matching `page_table_id`.
+    pub(crate) fn active_page_table(
+        &self,
+        page_table_id: usize,
+    ) -> Option<Arc<crate::mm::PageTable<PAGE_SIZE>>> {
+        // SAFETY: This field is private to the current core.
+        unsafe { &*self.active_page_table.get() }
+            .as_ref()
+            .filter(|(id, _)| *id == page_table_id)
+            .map(|(_, page_table)| Arc::clone(page_table))
+    }
+
+    /// # Safety
+    ///
+    /// CR3 must no longer reference the previous table. A new ID must match
+    /// CR3. Must not be called from interrupt or exception context.
+    pub(crate) unsafe fn set_active_page_table(
+        &self,
+        page_table: Option<(usize, Arc<crate::mm::PageTable<PAGE_SIZE>>)>,
+    ) {
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            // SAFETY: Guaranteed by the caller and per-CPU allocation.
+            unsafe { *self.active_page_table.get() = page_table }
+        });
     }
 }
 
@@ -493,6 +521,7 @@ pub fn allocate_per_cpu_variables() {
     let per_cpu_variables = unsafe {
         let ptr = per_cpu_variables.as_mut_ptr();
         ptr.write_bytes(0, 1);
+        core::ptr::addr_of_mut!((*ptr).active_page_table).write(UnsafeCell::new(None));
         // Set the "uninitialized" sentinel for vp_index (0 is a valid VP index).
         core::ptr::addr_of_mut!((*ptr).vp_index).write(Cell::new(u32::MAX));
         per_cpu_variables.assume_init()

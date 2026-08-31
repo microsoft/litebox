@@ -408,13 +408,11 @@ unsafe fn switch_to_task_page_table(task_pt_id: usize) -> Result<(), OpteeSmcRet
 /// The caller must ensure that no references or pointers to memory mapped
 /// by this page table are held after deletion.
 #[inline]
-unsafe fn delete_task_page_table(task_pt_id: usize) -> Result<(), OpteeSmcReturnCode> {
+unsafe fn delete_task_page_table(task_pt_id: usize) {
     let platform = litebox_platform_multiplex::platform();
     // Safety: caller guarantees no dangling references
-    unsafe {
-        platform
-            .delete_task_page_table(task_pt_id)
-            .map_err(|_| OpteeSmcReturnCode::EBadCmd)
+    if let Err(error) = unsafe { platform.delete_task_page_table(task_pt_id) } {
+        log::error!("failed to delete TA page table: {error:?}");
     }
 }
 
@@ -459,8 +457,7 @@ unsafe fn teardown_ta_page_table(shim: &litebox_shim_optee::OpteeShim, task_pt_i
         // still be on the TA's page table.
         shim.release_user_mappings();
         switch_to_base_page_table();
-        // Now delete the TA's page table without memory leak.
-        let _ = delete_task_page_table(task_pt_id);
+        delete_task_page_table(task_pt_id);
     }
 }
 
@@ -803,7 +800,7 @@ fn open_session_new_instance(
 
     let _task_pt_guard = TaskPageTableGuard::enter(task_pt_id).inspect_err(|_| {
         // Safety: switch_to_task_page_table failed, so task page table is not active.
-        let _ = unsafe { delete_task_page_table(task_pt_id) };
+        unsafe { delete_task_page_table(task_pt_id) };
     })?;
 
     // Load ldelf and TA - Box immediately to keep at fixed heap address
