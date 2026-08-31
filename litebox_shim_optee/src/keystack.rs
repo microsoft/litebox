@@ -10,7 +10,7 @@
 use crate::syscalls::Cleanup;
 use crate::syscalls::pta::{
     HmacSha256, PTA_DEFAULT_FLAGS, TA_DERIVED_EXTRA_DATA_MAX_SIZE, TA_DERIVED_KEY_MAX_SIZE,
-    TA_DERIVED_KEY_MIN_SIZE, huk_subkey_derive, open_default_pta_session,
+    TA_DERIVED_KEY_MIN_SIZE, huk_subkey_derive, open_pta_session_no_params,
 };
 use crate::{Task, UserConstPtr, UserMutPtr};
 use alloc::{vec, vec::Vec};
@@ -46,7 +46,7 @@ impl KeyStackPta {
     };
 
     pub(crate) fn open_session(params: &UteeParams) -> Result<u32, TeeResult> {
-        open_default_pta_session(params)
+        open_pta_session_no_params(params)
     }
 
     pub(crate) fn close_session(_task: &Task, _session_id: u32) {

@@ -85,9 +85,8 @@ pub(crate) const PTA_DEFAULT_FLAGS: TaFlags = TaFlags::SINGLE_INSTANCE
 
 const MAX_PTA_SESSIONS_PER_TASK: usize = 100;
 
-/// Open a session to a PTA that carries no per-session state and takes no
-/// parameters at session-open time.
-pub(crate) fn open_default_pta_session(params: &UteeParams) -> Result<u32, TeeResult> {
+/// Helper for opening a session to a PTA that takes no parameters.
+pub(crate) fn open_pta_session_no_params(params: &UteeParams) -> Result<u32, TeeResult> {
     if !params.has_types([
         TeeParamType::None,
         TeeParamType::None,
@@ -243,7 +242,7 @@ impl SystemPta {
     };
 
     fn open_session(params: &UteeParams) -> Result<u32, TeeResult> {
-        open_default_pta_session(params)
+        open_pta_session_no_params(params)
     }
 
     fn close_session(_task: &Task, _session_id: u32) {
