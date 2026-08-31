@@ -248,7 +248,7 @@ impl PerCpuVariables {
         &self,
         page_table_id: usize,
     ) -> Option<Arc<crate::mm::PageTable<PAGE_SIZE>>> {
-        // SAFETY: This field is private to the current core.
+        // Safety: This field is private to the current core.
         unsafe { &*self.active_page_table.get() }
             .as_ref()
             .filter(|(id, _)| *id == page_table_id)
@@ -264,7 +264,8 @@ impl PerCpuVariables {
         page_table: Option<(usize, Arc<crate::mm::PageTable<PAGE_SIZE>>)>,
     ) {
         x86_64::instructions::interrupts::without_interrupts(|| {
-            // SAFETY: Guaranteed by the caller and per-CPU allocation.
+            // Safety: Only this core accesses the field, interrupts are disabled,
+            // and the update cannot fault.
             unsafe { *self.active_page_table.get() = page_table }
         });
     }

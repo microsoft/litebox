@@ -149,6 +149,38 @@ const USER_ADDR_MAX: usize = 0x0000_7FFF_FFFF_F000;
 /// <https://cateee.net/lkddb/web-lkddb/LSM_MMAP_MIN_ADDR.html>
 const USER_ADDR_MIN: usize = 0x0000_0000_0001_0000;
 
+/// Provide access to a page table
+pub struct PageTableHandle<'a>(PageTableHandleInner<'a>);
+
+enum PageTableHandleInner<'a> {
+    Base(&'a mm::PageTable<PAGE_SIZE>),
+    Task(Arc<mm::PageTable<PAGE_SIZE>>),
+}
+
+impl<'a> PageTableHandle<'a> {
+    #[inline]
+    fn base(page_table: &'a mm::PageTable<PAGE_SIZE>) -> Self {
+        Self(PageTableHandleInner::Base(page_table))
+    }
+
+    #[inline]
+    fn task(page_table: Arc<mm::PageTable<PAGE_SIZE>>) -> Self {
+        Self(PageTableHandleInner::Task(page_table))
+    }
+}
+
+impl core::ops::Deref for PageTableHandle<'_> {
+    type Target = mm::PageTable<PAGE_SIZE>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        match &self.0 {
+            PageTableHandleInner::Base(page_table) => page_table,
+            PageTableHandleInner::Task(page_table) => page_table,
+        }
+    }
+}
+
 /// Manages base and task page tables.
 ///
 /// This struct maintains:
@@ -168,7 +200,7 @@ const USER_ADDR_MIN: usize = 0x0000_0000_0001_0000;
 /// exposed to user TAs, mitigating potential side-channel attacks.
 pub struct PageTableManager {
     /// The base page table, containing only VTL1 kernel mappings (no user-space).
-    base_page_table: Arc<mm::PageTable<PAGE_SIZE>>,
+    base_page_table: mm::PageTable<PAGE_SIZE>,
     /// Cached physical frame of the base page table (for fast CR3 comparison).
     base_page_table_frame: PhysFrame<Size4KiB>,
     /// Task page tables keyed by their P4 frame start address (the page table ID).
@@ -185,13 +217,13 @@ impl PageTableManager {
     fn new(base_pt: mm::PageTable<PAGE_SIZE>) -> Self {
         let base_frame = base_pt.get_physical_frame();
         Self {
-            base_page_table: Arc::new(base_pt),
+            base_page_table: base_pt,
             base_page_table_frame: base_frame,
             task_page_tables: spin::RwLock::new(HashMap::new()),
         }
     }
 
-    /// Returns a shared handle to the current page table.
+    /// Returns a handle to the current page table.
     ///
     /// This reads the current CR3 value and finds the matching page table.
     /// If CR3 matches the base page table, returns that. Otherwise, it
@@ -202,23 +234,23 @@ impl PageTableManager {
     /// Panics if CR3 contains an unknown page table address (should never happen
     /// in normal operation).
     #[inline]
-    pub fn current_page_table(&self) -> Arc<mm::PageTable<PAGE_SIZE>> {
+    pub fn current_page_table(&self) -> PageTableHandle<'_> {
         let (cr3_frame, _) = x86_64::registers::control::Cr3::read();
 
         // Fast path: check base page table first (most common case)
         if self.base_page_table_frame == cr3_frame {
-            return Arc::clone(&self.base_page_table);
+            return PageTableHandle::base(&self.base_page_table);
         }
 
         let cr3_id: usize = cr3_frame.start_address().as_u64().trunc();
         if let Some(pt) = with_per_cpu_variables(|pcv| pcv.active_page_table(cr3_id)) {
-            return pt;
+            return PageTableHandle::task(pt);
         }
 
         // The anchor can lag CR3 briefly while switching page tables.
         let task_pts = self.task_page_tables.read();
         if let Some(pt) = task_pts.get(&cr3_id) {
-            return Arc::clone(pt);
+            return PageTableHandle::task(Arc::clone(pt));
         }
 
         // CR3 doesn't match any known page table - this shouldn't happen
@@ -266,7 +298,7 @@ impl PageTableManager {
     ///   after the switch (including the code being executed and stack)
     /// - No references to user-space memory are held across the switch
     pub unsafe fn load_base(&self) {
-        // The active table must remain owned until CR3 no longer references it.
+        // Release task ownership only after switching CR3.
         self.base_page_table.load();
         with_per_cpu_variables(|pcv| {
             // Safety: CR3 now references the base page table.
