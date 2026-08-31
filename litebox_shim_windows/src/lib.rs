@@ -2110,6 +2110,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 thread_handle,
                 previous_suspend_count,
             } => self.sys_nt_resume_thread(thread_handle, previous_suspend_count),
+            SyscallRequest::NtAlertThread { thread_handle } => {
+                self.sys_nt_alert_thread(thread_handle)
+            }
             SyscallRequest::NtWaitForAlertByThreadId { address, timeout } => {
                 self.sys_nt_wait_for_alert_by_thread_id(address, timeout)
             }
@@ -2353,7 +2356,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             SyscallRequest::NtContinue {
                 context,
                 test_alert,
-            } => match Self::sys_nt_continue(ctx, context, test_alert) {
+            } => match self.sys_nt_continue(ctx, context, test_alert) {
                 Ok(()) => return,
                 Err(status) => status,
             },
@@ -2407,10 +2410,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     NtStatus::SUCCESS
                 }
             }
-            SyscallRequest::NtTestAlert => {
-                Self::test_alert();
-                NtStatus::SUCCESS
-            }
+            SyscallRequest::NtTestAlert => self.test_alert(),
             SyscallRequest::NtManageHotPatch => NtStatus::NOT_IMPLEMENTED,
         };
 
@@ -2418,6 +2418,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     fn sys_nt_continue(
+        &self,
         ctx: &mut litebox_common_linux::PtRegs,
         context: ConstPtr<Platform, nt_types::X64Context>,
         test_alert: bool,
@@ -2430,7 +2431,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .ok_or(NtStatus::ACCESS_VIOLATION)?;
 
         if test_alert {
-            Self::test_alert();
+            self.test_alert();
         }
 
         let context_flags = nt_types::ContextFlags::from_bits_retain(context.context_flags);
@@ -2481,12 +2482,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(())
     }
 
-    fn test_alert() {
-        // TODO(apc-model): Deliver queued user-mode APCs once thread alert and APC state
-        // are modeled.
-        litebox_util_log::debug!(
-            "NtTestAlert is a no-op; user-mode APC delivery is not yet modeled"
-        );
+    fn test_alert(&self) -> NtStatus {
+        // TODO(windows-apc): Deliver queued user-mode APCs here.
+        if self.thread_object.take_pending_thread_alert() {
+            NtStatus::ALERTED
+        } else {
+            NtStatus::SUCCESS
+        }
     }
 
     pub(crate) fn sys_nt_close(&self, handle: syscalls::Handle) -> NtStatus {

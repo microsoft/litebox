@@ -451,41 +451,43 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         };
         let port = entry.with_entry(IoCompletionHandleObject::port);
         let already_associated = self.prepare_io_completion_wait(&port);
-        if alertable {
-            // TODO(windows-apc): Interrupt alertable IOCP waits to deliver queued user APCs.
-            litebox_util_log::debug!("Treating alertable IOCP wait as non-alertable");
-        }
 
         match self.wait_on_events(
             false,
+            alertable,
             timeout,
             Events::IN,
             |observer, mask| {
                 port.register_observer(observer, mask);
                 Ok(())
             },
-            || match port.remove_with_capacity(
-                self.thread_object.thread_id(),
-                count as usize,
-                |index, packet| {
-                    io_completion_information
-                        .write_at_offset(index.cast_signed(), packet)
-                        .ok_or(NtStatus::ACCESS_VIOLATION)
-                },
-                |removed| {
-                    num_entries_removed
-                        .write_at_offset(0, removed)
-                        .ok_or(NtStatus::ACCESS_VIOLATION)
-                },
-            ) {
-                Ok(true) => {
-                    if !already_associated {
-                        self.associate_io_completion_worker(&port);
-                    }
-                    Ok(())
+            || {
+                if alertable && self.thread_object.take_pending_thread_alert() {
+                    return Err(TryOpError::WaitError(WaitError::Interrupted));
                 }
-                Ok(false) => Err(TryOpError::TryAgain),
-                Err(status) => Err(TryOpError::Other(status)),
+                match port.remove_with_capacity(
+                    self.thread_object.thread_id(),
+                    count as usize,
+                    |index, packet| {
+                        io_completion_information
+                            .write_at_offset(index.cast_signed(), packet)
+                            .ok_or(NtStatus::ACCESS_VIOLATION)
+                    },
+                    |removed| {
+                        num_entries_removed
+                            .write_at_offset(0, removed)
+                            .ok_or(NtStatus::ACCESS_VIOLATION)
+                    },
+                ) {
+                    Ok(true) => {
+                        if !already_associated {
+                            self.associate_io_completion_worker(&port);
+                        }
+                        Ok(())
+                    }
+                    Ok(false) => Err(TryOpError::TryAgain),
+                    Err(status) => Err(TryOpError::Other(status)),
+                }
             },
         ) {
             Ok(()) => NtStatus::SUCCESS,
@@ -611,6 +613,7 @@ mod tests {
 
         let nonblocking_result: Result<(), TryOpError<NtStatus>> = task.wait_on_events(
             true,
+            false,
             None,
             Events::IN,
             |_, _| unreachable!("a nonblocking wait must not register an observer"),
@@ -625,6 +628,7 @@ mod tests {
         assert!(!task.io_completion_worker.lock().suspended);
 
         let result: Result<(), TryOpError<NtStatus>> = task.wait_on_events(
+            false,
             false,
             Some(core::time::Duration::ZERO),
             Events::IN,

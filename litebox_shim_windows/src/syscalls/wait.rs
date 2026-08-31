@@ -116,13 +116,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             }
             None => None,
         };
-        if alertable {
-            // TODO(windows-apc): interrupt alertable waits when user APC delivery is modeled.
-            litebox_util_log::debug!("Treating alertable wait as non-alertable");
-        }
-
         match self.wait_on_events(
             false,
+            alertable,
             timeout,
             Events::IN,
             |observer, mask| {
@@ -130,6 +126,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 Ok(())
             },
             || {
+                if alertable && self.thread_object.take_pending_thread_alert() {
+                    return Err(TryOpError::WaitError(WaitError::Interrupted));
+                }
                 object
                     .try_acquire(self.thread_object.thread_id(), &self.thread_object)
                     .ok_or(TryOpError::<NtStatus>::TryAgain)

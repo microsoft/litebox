@@ -775,6 +775,9 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         thread_handle: ThreadHandle,
         previous_suspend_count: Option<Platform::RawMutPointer<u32>>,
     },
+    NtAlertThread {
+        thread_handle: ThreadHandle,
+    },
     NtWaitForAlertByThreadId {
         address: usize,
         timeout: Option<Platform::RawConstPointer<i64>>,
@@ -1610,6 +1613,9 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
             NtSysno::NtResumeThread => Some(sys_req!(NtResumeThread {
                 thread_handle: { ThreadHandle::from_raw },
                 previous_suspend_count:*,
+            })),
+            NtSysno::NtAlertThread => Some(sys_req!(NtAlertThread {
+                thread_handle: { ThreadHandle::from_raw },
             })),
             NtSysno::NtWaitForAlertByThreadId => Some(sys_req!(NtWaitForAlertByThreadId {
                 address,

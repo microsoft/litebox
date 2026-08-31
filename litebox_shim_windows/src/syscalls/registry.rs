@@ -1485,6 +1485,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             );
             let wait_result = self.wait_on_events(
                 false,
+                false,
                 None,
                 Events::IN,
                 |observer, mask| {
