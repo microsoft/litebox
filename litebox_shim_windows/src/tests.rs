@@ -277,6 +277,36 @@ fn nt_duplicate_object_preserves_identity_with_independent_access() {
 }
 
 #[test]
+fn nt_duplicate_object_materializes_current_thread_pseudo_handle() {
+    let task = test_task();
+    let mut duplicate = Handle::default();
+
+    assert_eq!(
+        task.sys_nt_duplicate_object(
+            crate::syscalls::ProcessHandle::CURRENT,
+            Handle::from_raw(usize::MAX - 1),
+            crate::syscalls::ProcessHandle::CURRENT,
+            Some(mut_ptr(&mut duplicate)),
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        ),
+        litebox_common_windows::nt_status::NtStatus::SUCCESS
+    );
+    assert!(!duplicate.is_null());
+
+    let timeout = 0;
+    assert_eq!(
+        task.sys_nt_wait_for_single_object(duplicate, false, Some(const_ptr(&timeout))),
+        litebox_common_windows::nt_status::NtStatus::TIMEOUT
+    );
+    assert_eq!(
+        task.sys_nt_close(duplicate),
+        litebox_common_windows::nt_status::NtStatus::SUCCESS
+    );
+}
+
+#[test]
 fn nt_duplicate_object_can_atomically_replace_the_source_handle() {
     let task = test_task();
     let source = create_event(&task, EVENT_MODIFY_STATE);

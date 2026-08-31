@@ -2106,6 +2106,19 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 maximum_stack_size,
                 attribute_list,
             ),
+            SyscallRequest::NtResumeThread {
+                thread_handle,
+                previous_suspend_count,
+            } => self.sys_nt_resume_thread(thread_handle, previous_suspend_count),
+            SyscallRequest::NtWaitForAlertByThreadId { address, timeout } => {
+                self.sys_nt_wait_for_alert_by_thread_id(address, timeout)
+            }
+            SyscallRequest::NtAlertThreadByThreadIdEx { thread_id, address } => {
+                self.sys_nt_alert_thread_by_thread_id_ex(thread_id, address)
+            }
+            SyscallRequest::NtAlertThreadByThreadId { thread_id } => {
+                self.sys_nt_alert_thread_by_thread_id(thread_id)
+            }
             SyscallRequest::NtWaitForSingleObject {
                 handle,
                 alertable,
@@ -2674,6 +2687,32 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         handle_attributes: u32,
         options: DuplicateOptions,
     ) -> Result<syscalls::Handle, NtStatus> {
+        if syscalls::ThreadHandle::from_raw(source_handle.as_raw()).is_current() {
+            let duplicate_access = if options.contains(DuplicateOptions::SAME_ACCESS) {
+                u32::MAX
+            } else {
+                <ThreadSubsystem<Platform> as WindowsHandleSubsystem>::normalize_desired_access(
+                    desired_access,
+                )
+            };
+            let duplicate_attributes = HandleAttributes::from_duplicate_attributes(
+                if options.contains(DuplicateOptions::SAME_ATTRIBUTES) {
+                    0
+                } else {
+                    handle_attributes
+                },
+            )
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+            return self.insert_typed_handle_with_attributes::<ThreadSubsystem<Platform>>(
+                ThreadHandleObject {
+                    thread: self.thread_object.clone(),
+                },
+                duplicate_access,
+                duplicate_attributes,
+                drop,
+            );
+        }
+
         macro_rules! try_duplicate {
             ($subsystem:ty) => {
                 if let Some(result) = self.try_duplicate_handle::<$subsystem>(
@@ -2701,6 +2740,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         try_duplicate!(WorkerFactorySubsystem<Platform>);
         try_duplicate!(SectionSubsystem<Platform>);
         try_duplicate!(TokenSubsystem);
+        try_duplicate!(ThreadSubsystem<Platform>);
 
         Err(NtStatus::INVALID_HANDLE)
     }

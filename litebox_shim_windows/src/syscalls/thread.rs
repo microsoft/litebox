@@ -5,7 +5,7 @@ use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use int_enum::IntEnum;
 use litebox::event::{Events, IOPollable, observer::Observer, polling::Pollee};
@@ -103,6 +103,12 @@ pub(crate) struct ThreadHandleObject<Platform: ShimPlatform> {
     pub(crate) thread: Arc<ThreadObject<Platform>>,
 }
 
+#[derive(Default)]
+struct ThreadAlertState {
+    wait_address: Option<usize>,
+    pending: bool,
+}
+
 pub(crate) struct ThreadObject<Platform: ShimPlatform> {
     thread_id: usize,
     teb_address: usize,
@@ -113,11 +119,10 @@ pub(crate) struct ThreadObject<Platform: ShimPlatform> {
     /// termination request or by a process-wide exit.
     is_exiting: AtomicBool,
     suspend_count: AtomicU32,
-    alert_address: AtomicUsize,
-    alerted: AtomicBool,
     /// Handle used to interrupt the thread, published once by the thread itself
     /// when it starts running. Empty until then.
     wait_handle: once_cell::race::OnceBox<litebox::event::wait::ThreadHandle<Platform>>,
+    alert_state: Mutex<Platform, ThreadAlertState>,
     owned_mutants: Mutex<Platform, Vec<Weak<MutantObject<Platform>>>>,
 }
 
@@ -139,9 +144,8 @@ impl<Platform: ShimPlatform> ThreadObject<Platform> {
             pollee: Pollee::new(),
             is_exiting: AtomicBool::new(false),
             suspend_count: AtomicU32::new(suspend_count),
-            alert_address: AtomicUsize::new(0),
-            alerted: AtomicBool::new(false),
             wait_handle: once_cell::race::OnceBox::new(),
+            alert_state: Mutex::new(ThreadAlertState::default()),
             owned_mutants: Mutex::new(Vec::new()),
         }
     }
@@ -216,21 +220,31 @@ impl<Platform: ShimPlatform> ThreadObject<Platform> {
     }
 
     fn begin_alert_wait(&self, address: usize) {
-        self.alert_address.store(address, Ordering::Release);
+        let mut state = self.alert_state.lock();
+        debug_assert!(state.wait_address.is_none());
+        state.wait_address = Some(address);
     }
 
-    fn take_alert(&self, _address: usize) -> bool {
-        self.alerted.swap(false, Ordering::AcqRel)
+    fn take_alert(&self, address: usize) -> bool {
+        let mut state = self.alert_state.lock();
+        debug_assert_eq!(state.wait_address, Some(address));
+        core::mem::take(&mut state.pending)
     }
 
-    fn end_alert_wait(&self, address: usize) {
-        let _ =
-            self.alert_address
-                .compare_exchange(address, 0, Ordering::AcqRel, Ordering::Acquire);
+    fn end_alert_wait(&self, address: usize) -> bool {
+        let mut state = self.alert_state.lock();
+        debug_assert_eq!(state.wait_address, Some(address));
+        state.wait_address = None;
+        core::mem::take(&mut state.pending)
     }
 
-    fn alert(&self) {
-        self.alerted.store(true, Ordering::Release);
+    fn alert(&self, address: Option<usize>) {
+        let mut state = self.alert_state.lock();
+        if address.is_some() && state.wait_address != address {
+            return;
+        }
+        state.pending = true;
+        drop(state);
         if let Some(handle) = self.wait_handle.get() {
             handle.interrupt();
         }
@@ -552,11 +566,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             None => None,
         };
         self.thread_object.begin_alert_wait(address);
-        let result = self
-            .wait_until(timeout, || self.thread_object.take_alert(address));
-        self.thread_object.end_alert_wait(address);
+        let result = self.wait_until(timeout, || self.thread_object.take_alert(address));
+        let alert_raced_with_completion = self.thread_object.end_alert_wait(address);
         match result {
             Ok(()) | Err(litebox::event::wait::WaitError::Interrupted) => NtStatus::ALERTED,
+            Err(litebox::event::wait::WaitError::TimedOut) if alert_raced_with_completion => {
+                NtStatus::ALERTED
+            }
             Err(litebox::event::wait::WaitError::TimedOut) => NtStatus::TIMEOUT,
         }
     }
@@ -564,12 +580,12 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     pub(crate) fn sys_nt_alert_thread_by_thread_id_ex(
         &self,
         thread_id: usize,
-        _lock: usize,
+        address: usize,
     ) -> NtStatus {
         let Some(thread) = self.process.thread_by_id(thread_id) else {
             return NtStatus::INVALID_CID;
         };
-        thread.alert();
+        thread.alert(Some(address));
         NtStatus::SUCCESS
     }
 
@@ -577,7 +593,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         let Some(thread) = self.process.thread_by_id(thread_id) else {
             return NtStatus::INVALID_CID;
         };
-        thread.alert();
+        thread.alert(None);
         NtStatus::SUCCESS
     }
 
@@ -846,6 +862,35 @@ mod tests {
             assert_eq!(is_last_thread, 1);
             assert_eq!(return_length as usize, size_of::<u32>());
             assert_eq!(parent.process.live_thread_count(), 1);
+        });
+    }
+
+    #[test]
+    fn alert_thread_by_id_ex_filters_by_wait_address() {
+        run_with_test_platform_pointers(|| {
+            let task = crate::tests::test_task();
+            let thread_id = task.thread_object.thread_id();
+            let wait_address = 0x1234;
+
+            task.thread_object.begin_alert_wait(wait_address);
+            assert_eq!(
+                task.sys_nt_alert_thread_by_thread_id_ex(thread_id, 0x5678),
+                NtStatus::SUCCESS
+            );
+            assert!(!task.thread_object.take_alert(wait_address));
+
+            assert_eq!(
+                task.sys_nt_alert_thread_by_thread_id_ex(thread_id, wait_address),
+                NtStatus::SUCCESS
+            );
+            assert!(task.thread_object.take_alert(wait_address));
+
+            assert_eq!(
+                task.sys_nt_alert_thread_by_thread_id(thread_id),
+                NtStatus::SUCCESS
+            );
+            assert!(task.thread_object.take_alert(wait_address));
+            assert!(!task.thread_object.end_alert_wait(wait_address));
         });
     }
 

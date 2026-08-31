@@ -771,6 +771,21 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         maximum_stack_size: usize,
         attribute_list: Option<Platform::RawConstPointer<u8>>,
     },
+    NtResumeThread {
+        thread_handle: ThreadHandle,
+        previous_suspend_count: Option<Platform::RawMutPointer<u32>>,
+    },
+    NtWaitForAlertByThreadId {
+        address: usize,
+        timeout: Option<Platform::RawConstPointer<i64>>,
+    },
+    NtAlertThreadByThreadIdEx {
+        thread_id: usize,
+        address: usize,
+    },
+    NtAlertThreadByThreadId {
+        thread_id: usize,
+    },
     NtWaitForSingleObject {
         handle: Handle,
         alertable: bool,
@@ -1592,6 +1607,20 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 maximum_stack_size,
                 attribute_list:*,
             })),
+            NtSysno::NtResumeThread => Some(sys_req!(NtResumeThread {
+                thread_handle: { ThreadHandle::from_raw },
+                previous_suspend_count:*,
+            })),
+            NtSysno::NtWaitForAlertByThreadId => Some(sys_req!(NtWaitForAlertByThreadId {
+                address,
+                timeout:*,
+            })),
+            NtSysno::NtAlertThreadByThreadIdEx => {
+                Some(sys_req!(NtAlertThreadByThreadIdEx { thread_id, address }))
+            }
+            NtSysno::NtAlertThreadByThreadId => {
+                Some(sys_req!(NtAlertThreadByThreadId { thread_id }))
+            }
             NtSysno::NtWaitForSingleObject => Some(sys_req!(NtWaitForSingleObject {
                 handle: { Handle::from_raw },
                 alertable: { |value: u8| value != 0 },
