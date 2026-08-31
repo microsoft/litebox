@@ -812,12 +812,6 @@ fn open_session_new_instance(
         unsafe { teardown_ta_page_table(&shim, task_pt_id) };
         OpteeSmcReturnCode::ENomem
     })?;
-    let loaded_program = litebox_common_lvbs::try_box(loaded_program)
-        .map_err(|_| OpteeSmcReturnCode::ENomem)
-        .inspect_err(|_| {
-            // Safety: No TA user-space references have been created yet.
-            unsafe { teardown_ta_page_table(&shim, task_pt_id) };
-        })?;
 
     let ta_flags = loaded_program.ta_flags;
 

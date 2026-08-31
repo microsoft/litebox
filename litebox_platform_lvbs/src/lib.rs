@@ -359,7 +359,6 @@ impl PageTableManager {
         let task_pt_id: usize = pt.get_physical_frame().start_address().as_u64().trunc();
 
         let mut task_pts = self.task_page_tables.write();
-        task_pts.try_reserve(1).map_err(|_| Errno::ENOMEM)?;
         task_pts.insert(task_pt_id, pt);
 
         Ok(task_pt_id)
@@ -1202,9 +1201,7 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
         // rejects duplicate/shared mappings, but this keeps the error local to the input array.
         // A single page can never collide with itself, so skip the set allocation.
         if pages.len() > 1 {
-            let mut seen = hashbrown::HashSet::new();
-            seen.try_reserve(pages.len())
-                .map_err(|_| PhysPointerError::AllocError)?;
+            let mut seen = hashbrown::HashSet::with_capacity(pages.len());
             for page in pages {
                 if !seen.insert(page.as_usize()) {
                     return Err(PhysPointerError::DuplicatePhysicalAddress(page.as_usize()));

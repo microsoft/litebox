@@ -8,7 +8,7 @@
 
 extern crate alloc;
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::vec::Vec;
 use core::mem;
 use litebox::utils::TruncateExt;
 use litebox_common_linux::errno::Errno;
@@ -33,24 +33,6 @@ pub const MAX_CORES: usize = 128;
 
 /// VTL call parameters (`param[0]`: function ID, `param[1..4]`: parameters)
 pub const NUM_VTLCALL_PARAMS: usize = 4;
-
-/// Fallibly allocate heap storage and move `value` into the resulting box.
-///
-/// Replace this with `Box::try_new` once the `allocator_api` feature is stable.
-pub fn try_box<T>(value: T) -> Result<Box<T>, zerocopy::AllocError> {
-    const { assert!(core::mem::size_of::<T>() != 0) };
-    let layout = core::alloc::Layout::new::<T>();
-    // SAFETY: `layout` describes exactly one non-zero-sized `T`. A successful
-    // allocation is aligned for `T`, and the value is written before constructing
-    // the owning Box.
-    unsafe {
-        let ptr = core::ptr::NonNull::new(alloc::alloc::alloc(layout))
-            .ok_or(zerocopy::AllocError)?
-            .cast::<T>();
-        ptr.write(value);
-        Ok(Box::from_raw(ptr.as_ptr()))
-    }
-}
 
 pub const VSM_VTL_CALL_FUNC_ID_ENABLE_APS_VTL: u32 = 0x1_ffe0;
 pub const VSM_VTL_CALL_FUNC_ID_BOOT_APS: u32 = 0x1_ffe1;
