@@ -46,9 +46,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // around WaitContext's platform block; keep this approximation local to the Windows shim.
         self.suspend_io_completion_worker();
         let _resume_worker = litebox::utils::defer(|| self.resume_io_completion_worker());
-        let wait_context = self
-            .wait_cx()
-            .with_timeout(timeout);
+        let wait_context = self.wait_cx().with_timeout(timeout);
         wait_context.wait_on_events(false, events, register_observer, try_op)
     }
 
@@ -62,9 +60,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
         self.suspend_io_completion_worker();
         let _resume_worker = litebox::utils::defer(|| self.resume_io_completion_worker());
-        self.wait_cx()
-            .with_timeout(timeout)
-            .wait_until(ready)
+        self.wait_cx().with_timeout(timeout).wait_until(ready)
     }
 
     /// Publishes the handle used by other threads to interrupt this one.
@@ -85,9 +81,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     #[must_use]
     pub(crate) fn prepare_to_run_guest(&self, _ctx: &mut litebox_common_linux::PtRegs) -> bool {
         if self.thread_object.is_suspended() {
-            self.publish_thread_handle();
-            let _ = self
-                .wait_until(None, || !self.thread_object.is_suspended());
+            let _ = self.wait_until(None, || !self.thread_object.is_suspended());
         }
         self.wait_state.0.prepare_to_run_guest(|| {
             // TODO(windows-apc): deliver pending user-mode APCs and alerts here.

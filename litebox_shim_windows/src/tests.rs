@@ -13,6 +13,7 @@ use litebox::utils::TruncateExt as _;
 
 use crate::nt_types::{ObjectAttributes, UnicodeString};
 use crate::syscalls::Handle;
+use crate::syscalls::thread::{ThreadAccess, ThreadSubsystem};
 use crate::{ConstPtr, DefaultFS, MutPtr, Process, ShimFS, ShimPlatform, Task, WindowsShim};
 
 #[cfg(target_os = "linux")]
@@ -294,6 +295,15 @@ fn nt_duplicate_object_materializes_current_thread_pseudo_handle() {
         litebox_common_windows::nt_status::NtStatus::SUCCESS
     );
     assert!(!duplicate.is_null());
+    let typed = task
+        .typed_handle::<ThreadSubsystem<TestPlatform>>(duplicate)
+        .expect("duplicate should be a thread handle");
+    assert_eq!(
+        task.typed_handle_metadata(&typed)
+            .expect("duplicate should have handle metadata")
+            .granted_access,
+        ThreadAccess::ALL_ACCESS.bits()
+    );
 
     let timeout = 0;
     assert_eq!(

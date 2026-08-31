@@ -186,7 +186,7 @@ impl<Platform: ShimPlatform> ThreadObject<Platform> {
         }
     }
 
-    fn new_suspended(thread_id: usize, teb_address: usize) -> Self {
+    pub(crate) fn new_suspended(thread_id: usize, teb_address: usize) -> Self {
         Self::new_with_suspend_count(thread_id, teb_address, 1)
     }
 
@@ -535,14 +535,18 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         {
             return status;
         }
-        let entry = match self.typed_handle_entry_with_access::<ThreadSubsystem<Platform>>(
-            thread_handle.as_handle(),
-            ThreadAccess::SUSPEND_RESUME.bits(),
-        ) {
-            Ok(entry) => entry,
-            Err(status) => return status,
+        let previous = if thread_handle.is_current() {
+            self.thread_object.resume()
+        } else {
+            let entry = match self.typed_handle_entry_with_access::<ThreadSubsystem<Platform>>(
+                thread_handle.as_handle(),
+                ThreadAccess::SUSPEND_RESUME.bits(),
+            ) {
+                Ok(entry) => entry,
+                Err(status) => return status,
+            };
+            entry.with_entry(|entry| entry.thread.resume())
         };
-        let previous = entry.with_entry(|entry| entry.thread.resume());
         if let Some(previous_suspend_count) = previous_suspend_count
             && previous_suspend_count
                 .write_at_offset(0, previous)
@@ -796,9 +800,15 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
-    use crate::tests::{mut_byte_ptr, mut_ptr, null_const_ptr, run_with_test_platform_pointers};
+    use crate::tests::{
+        const_ptr, mut_byte_ptr, mut_ptr, null_const_ptr, run_with_test_platform_pointers,
+    };
     use litebox::shim::{ContinueOperation, EnterShim, Exception, ExceptionInfo};
+    use std::sync::mpsc::TryRecvError;
+    use std::time::{Duration, Instant};
 
     type TestPlatform = crate::tests::TestPlatform;
     type TestTask = Task<TestPlatform, crate::tests::TestFS>;
@@ -866,31 +876,108 @@ mod tests {
     }
 
     #[test]
-    fn alert_thread_by_id_ex_filters_by_wait_address() {
+    fn wait_for_alert_by_thread_id_blocks_until_matching_alert() {
         run_with_test_platform_pointers(|| {
-            let task = crate::tests::test_task();
-            let thread_id = task.thread_object.thread_id();
+            let alerter = crate::tests::test_task();
+            let waiter = alerter
+                .clone_for_test()
+                .expect("a live process should accept another thread");
+            let waiter_thread = Arc::clone(&waiter.thread_object);
+            let thread_id = waiter_thread.thread_id();
             let wait_address = 0x1234;
+            let (result_tx, result_rx) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                run_with_test_platform_pointers(|| {
+                    waiter.publish_thread_handle();
+                    let timeout = -10_000_000i64;
+                    result_tx
+                        .send(waiter.sys_nt_wait_for_alert_by_thread_id(
+                            wait_address,
+                            Some(const_ptr(&timeout)),
+                        ))
+                        .unwrap();
+                });
+            });
 
-            task.thread_object.begin_alert_wait(wait_address);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while waiter_thread.alert_state.lock().wait_address != Some(wait_address) {
+                assert!(Instant::now() < deadline, "waiter did not enter alert wait");
+                std::thread::yield_now();
+            }
+            assert_eq!(result_rx.try_recv(), Err(TryRecvError::Empty));
             assert_eq!(
-                task.sys_nt_alert_thread_by_thread_id_ex(thread_id, 0x5678),
+                alerter.sys_nt_alert_thread_by_thread_id_ex(thread_id, wait_address),
                 NtStatus::SUCCESS
             );
-            assert!(!task.thread_object.take_alert(wait_address));
-
             assert_eq!(
-                task.sys_nt_alert_thread_by_thread_id_ex(thread_id, wait_address),
+                result_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                NtStatus::ALERTED
+            );
+            thread.join().unwrap();
+
+            let timeout = 0i64;
+            assert_eq!(
+                alerter
+                    .sys_nt_wait_for_alert_by_thread_id(wait_address, Some(const_ptr(&timeout)),),
+                NtStatus::TIMEOUT
+            );
+        });
+    }
+
+    #[test]
+    fn suspended_thread_does_not_enter_guest_until_resumed() {
+        run_with_test_platform_pointers(|| {
+            let parent = crate::tests::test_task();
+            let child = parent
+                .clone_for_test()
+                .expect("a live process should accept another thread");
+            let handle = parent
+                .insert_typed_handle::<ThreadSubsystem<_>>(
+                    ThreadHandleObject {
+                        thread: Arc::clone(&child.thread_object),
+                    },
+                    ThreadAccess::SUSPEND_RESUME.bits(),
+                    drop,
+                )
+                .unwrap();
+            let handle = ThreadHandle::from_raw(handle.as_raw());
+            child
+                .thread_object
+                .suspend_count
+                .store(1, Ordering::Release);
+            let suspended_thread = Arc::clone(&child.thread_object);
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (result_tx, result_rx) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                run_with_test_platform_pointers(|| {
+                    child.publish_thread_handle();
+                    started_tx.send(()).unwrap();
+                    let mut ctx = litebox_common_linux::PtRegs::default();
+                    let ready = child.prepare_to_run_guest(&mut ctx);
+                    result_tx.send(ready).unwrap();
+                });
+            });
+
+            started_rx.recv().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while suspended_thread.wait_handle.get().is_none() {
+                assert!(
+                    Instant::now() < deadline,
+                    "child did not publish wait handle"
+                );
+                std::thread::yield_now();
+            }
+            assert_eq!(result_rx.try_recv(), Err(TryRecvError::Empty));
+            let mut previous_suspend_count = u32::MAX;
+            assert_eq!(
+                parent.sys_nt_resume_thread(handle, Some(mut_ptr(&mut previous_suspend_count))),
                 NtStatus::SUCCESS
             );
-            assert!(task.thread_object.take_alert(wait_address));
-
-            assert_eq!(
-                task.sys_nt_alert_thread_by_thread_id(thread_id),
-                NtStatus::SUCCESS
-            );
-            assert!(task.thread_object.take_alert(wait_address));
-            assert!(!task.thread_object.end_alert_wait(wait_address));
+            assert_eq!(previous_suspend_count, 1);
+            assert!(result_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+            thread.join().unwrap();
+            assert!(!suspended_thread.is_suspended());
+            assert_eq!(parent.sys_nt_close(handle.as_handle()), NtStatus::SUCCESS);
         });
     }
 

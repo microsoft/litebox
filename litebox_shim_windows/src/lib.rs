@@ -48,7 +48,7 @@ use crate::syscalls::section::{
 };
 use crate::syscalls::semaphore::{SemaphoreHandleObject, SemaphoreSubsystem};
 use crate::syscalls::symlink::{SymbolicLinkHandleObject, SymbolicLinkSubsystem};
-use crate::syscalls::thread::{ThreadHandleObject, ThreadSubsystem};
+use crate::syscalls::thread::{ThreadAccess, ThreadHandleObject, ThreadSubsystem};
 use crate::syscalls::timer::{TimerCreateParameters, TimerHandleObject, TimerSubsystem};
 use crate::syscalls::token::{TokenHandleObject, TokenObject, TokenSubsystem};
 use crate::syscalls::wait_completion_packet::{
@@ -2689,7 +2689,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     ) -> Result<syscalls::Handle, NtStatus> {
         if syscalls::ThreadHandle::from_raw(source_handle.as_raw()).is_current() {
             let duplicate_access = if options.contains(DuplicateOptions::SAME_ACCESS) {
-                u32::MAX
+                ThreadAccess::ALL_ACCESS.bits()
             } else {
                 <ThreadSubsystem<Platform> as WindowsHandleSubsystem>::normalize_desired_access(
                     desired_access,
