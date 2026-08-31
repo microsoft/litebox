@@ -13,6 +13,7 @@ use litebox::utils::TruncateExt as _;
 
 use crate::nt_types::{ObjectAttributes, UnicodeString};
 use crate::syscalls::Handle;
+use crate::syscalls::thread::{ThreadAccess, ThreadSubsystem};
 use crate::{ConstPtr, DefaultFS, MutPtr, Process, ShimFS, ShimPlatform, Task, WindowsShim};
 
 #[cfg(target_os = "linux")]
@@ -269,6 +270,45 @@ fn nt_duplicate_object_preserves_identity_with_independent_access() {
     assert_eq!(
         task.sys_nt_set_event(duplicate, None),
         litebox_common_windows::nt_status::NtStatus::SUCCESS
+    );
+    assert_eq!(
+        task.sys_nt_close(duplicate),
+        litebox_common_windows::nt_status::NtStatus::SUCCESS
+    );
+}
+
+#[test]
+fn nt_duplicate_object_materializes_current_thread_pseudo_handle() {
+    let task = test_task();
+    let mut duplicate = Handle::default();
+
+    assert_eq!(
+        task.sys_nt_duplicate_object(
+            crate::syscalls::ProcessHandle::CURRENT,
+            Handle::from_raw(usize::MAX - 1),
+            crate::syscalls::ProcessHandle::CURRENT,
+            Some(mut_ptr(&mut duplicate)),
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        ),
+        litebox_common_windows::nt_status::NtStatus::SUCCESS
+    );
+    assert!(!duplicate.is_null());
+    let typed = task
+        .typed_handle::<ThreadSubsystem<TestPlatform>>(duplicate)
+        .expect("duplicate should be a thread handle");
+    assert_eq!(
+        task.typed_handle_metadata(&typed)
+            .expect("duplicate should have handle metadata")
+            .granted_access,
+        ThreadAccess::ALL_ACCESS.bits()
+    );
+
+    let timeout = 0;
+    assert_eq!(
+        task.sys_nt_wait_for_single_object(duplicate, false, Some(const_ptr(&timeout))),
+        litebox_common_windows::nt_status::NtStatus::TIMEOUT
     );
     assert_eq!(
         task.sys_nt_close(duplicate),

@@ -48,7 +48,7 @@ use crate::syscalls::section::{
 };
 use crate::syscalls::semaphore::{SemaphoreHandleObject, SemaphoreSubsystem};
 use crate::syscalls::symlink::{SymbolicLinkHandleObject, SymbolicLinkSubsystem};
-use crate::syscalls::thread::{ThreadHandleObject, ThreadSubsystem};
+use crate::syscalls::thread::{ThreadAccess, ThreadHandleObject, ThreadSubsystem};
 use crate::syscalls::timer::{TimerCreateParameters, TimerHandleObject, TimerSubsystem};
 use crate::syscalls::token::{TokenHandleObject, TokenObject, TokenSubsystem};
 use crate::syscalls::wait_completion_packet::{
@@ -674,6 +674,13 @@ impl<Platform: ShimPlatform> Process<Platform> {
             .values()
             .map(|thread| thread.teb_address())
             .collect()
+    }
+
+    fn thread_by_id(
+        &self,
+        thread_id: usize,
+    ) -> Option<Arc<syscalls::thread::ThreadObject<Platform>>> {
+        self.threads.read().threads.get(&thread_id).cloned()
     }
 
     /// Wait for the process to exit, returning its exit code.
@@ -2099,6 +2106,22 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 maximum_stack_size,
                 attribute_list,
             ),
+            SyscallRequest::NtResumeThread {
+                thread_handle,
+                previous_suspend_count,
+            } => self.sys_nt_resume_thread(thread_handle, previous_suspend_count),
+            SyscallRequest::NtAlertThread { thread_handle } => {
+                self.sys_nt_alert_thread(thread_handle)
+            }
+            SyscallRequest::NtWaitForAlertByThreadId { address, timeout } => {
+                self.sys_nt_wait_for_alert_by_thread_id(address, timeout)
+            }
+            SyscallRequest::NtAlertThreadByThreadIdEx { thread_id, address } => {
+                self.sys_nt_alert_thread_by_thread_id_ex(thread_id, address)
+            }
+            SyscallRequest::NtAlertThreadByThreadId { thread_id } => {
+                self.sys_nt_alert_thread_by_thread_id(thread_id)
+            }
             SyscallRequest::NtWaitForSingleObject {
                 handle,
                 alertable,
@@ -2333,7 +2356,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             SyscallRequest::NtContinue {
                 context,
                 test_alert,
-            } => match Self::sys_nt_continue(ctx, context, test_alert) {
+            } => match self.sys_nt_continue(ctx, context, test_alert) {
                 Ok(()) => return,
                 Err(status) => status,
             },
@@ -2387,10 +2410,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                     NtStatus::SUCCESS
                 }
             }
-            SyscallRequest::NtTestAlert => {
-                Self::test_alert();
-                NtStatus::SUCCESS
-            }
+            SyscallRequest::NtTestAlert => self.test_alert(),
             SyscallRequest::NtManageHotPatch => NtStatus::NOT_IMPLEMENTED,
         };
 
@@ -2398,6 +2418,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 
     fn sys_nt_continue(
+        &self,
         ctx: &mut litebox_common_linux::PtRegs,
         context: ConstPtr<Platform, nt_types::X64Context>,
         test_alert: bool,
@@ -2410,7 +2431,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .ok_or(NtStatus::ACCESS_VIOLATION)?;
 
         if test_alert {
-            Self::test_alert();
+            self.test_alert();
         }
 
         let context_flags = nt_types::ContextFlags::from_bits_retain(context.context_flags);
@@ -2461,12 +2482,13 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         Ok(())
     }
 
-    fn test_alert() {
-        // TODO(apc-model): Deliver queued user-mode APCs once thread alert and APC state
-        // are modeled.
-        litebox_util_log::debug!(
-            "NtTestAlert is a no-op; user-mode APC delivery is not yet modeled"
-        );
+    fn test_alert(&self) -> NtStatus {
+        // TODO(windows-apc): Deliver queued user-mode APCs here.
+        if self.thread_object.take_pending_thread_alert() {
+            NtStatus::ALERTED
+        } else {
+            NtStatus::SUCCESS
+        }
     }
 
     pub(crate) fn sys_nt_close(&self, handle: syscalls::Handle) -> NtStatus {
@@ -2667,6 +2689,32 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         handle_attributes: u32,
         options: DuplicateOptions,
     ) -> Result<syscalls::Handle, NtStatus> {
+        if syscalls::ThreadHandle::from_raw(source_handle.as_raw()).is_current() {
+            let duplicate_access = if options.contains(DuplicateOptions::SAME_ACCESS) {
+                ThreadAccess::ALL_ACCESS.bits()
+            } else {
+                <ThreadSubsystem<Platform> as WindowsHandleSubsystem>::normalize_desired_access(
+                    desired_access,
+                )
+            };
+            let duplicate_attributes = HandleAttributes::from_duplicate_attributes(
+                if options.contains(DuplicateOptions::SAME_ATTRIBUTES) {
+                    0
+                } else {
+                    handle_attributes
+                },
+            )
+            .ok_or(NtStatus::INVALID_PARAMETER)?;
+            return self.insert_typed_handle_with_attributes::<ThreadSubsystem<Platform>>(
+                ThreadHandleObject {
+                    thread: self.thread_object.clone(),
+                },
+                duplicate_access,
+                duplicate_attributes,
+                drop,
+            );
+        }
+
         macro_rules! try_duplicate {
             ($subsystem:ty) => {
                 if let Some(result) = self.try_duplicate_handle::<$subsystem>(
@@ -2694,6 +2742,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         try_duplicate!(WorkerFactorySubsystem<Platform>);
         try_duplicate!(SectionSubsystem<Platform>);
         try_duplicate!(TokenSubsystem);
+        try_duplicate!(ThreadSubsystem<Platform>);
 
         Err(NtStatus::INVALID_HANDLE)
     }
