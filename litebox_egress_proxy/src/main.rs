@@ -30,7 +30,7 @@ fn main() -> ExitCode {
         Err(error) => return fail(&error),
     };
 
-    match runtime.block_on(run(&config)) {
+    match runtime.block_on(run(config)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => fail(&error),
     }

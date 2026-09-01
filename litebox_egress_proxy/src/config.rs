@@ -41,7 +41,7 @@ pub enum ConfigError {
 }
 
 /// The validated configuration of one proxy process.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ProxyConfig {
     /// IPv4 loopback address to bind.
     pub listen: SocketAddrV4,

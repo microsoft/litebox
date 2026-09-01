@@ -27,11 +27,11 @@ use crate::proxy::ProxyState;
 use crate::upstream::TcpUpstreamConnector;
 
 /// Runs the proxy: startup, readiness announcement, then serving.
-pub async fn run(config: &ProxyConfig) -> io::Result<()> {
+pub async fn run(config: ProxyConfig) -> io::Result<()> {
     let listener = TcpListener::bind(config.listen).await?;
     let local_address = listener.local_addr()?;
     let state = Arc::new(ProxyState::new(
-        config.policy.clone(),
+        config.policy,
         Box::new(TcpUpstreamConnector),
     ));
 

@@ -31,7 +31,6 @@ pub trait UpstreamConnector: Send + Sync + 'static {
 }
 
 /// The production connector, using the trusted host resolver.
-#[derive(Clone, Copy, Debug, Default)]
 pub struct TcpUpstreamConnector;
 
 impl UpstreamConnector for TcpUpstreamConnector {
