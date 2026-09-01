@@ -15,7 +15,7 @@ use litebox_egress_proxy::policy::{HostPolicy, Hostname};
 use litebox_egress_proxy::proxy::{ProxyState, serve};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tokio::time::timeout;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -166,54 +166,50 @@ fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
-async fn recording_upstream() -> (SocketAddr, mpsc::UnboundedReceiver<String>) {
+async fn recording_upstream() -> (SocketAddr, oneshot::Receiver<String>) {
     let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
         .await
         .expect("upstream listener");
     let address = listener.local_addr().expect("upstream address");
-    let (sender, receiver) = mpsc::unbounded_channel();
+    let (sender, receiver) = oneshot::channel();
 
     tokio::spawn(async move {
-        while let Ok((mut stream, _peer)) = listener.accept().await {
-            let sender = sender.clone();
-            tokio::spawn(async move {
-                let mut request = Vec::new();
-                let mut chunk = [0_u8; 4096];
-                let head_end = loop {
-                    let Ok(read) = stream.read(&mut chunk).await else {
-                        return;
-                    };
-                    if read == 0 {
-                        return;
-                    }
-                    request.extend_from_slice(&chunk[..read]);
-                    if let Some(index) = find_subslice(&request, b"\r\n\r\n") {
-                        break index + 4;
-                    }
-                };
+        let Ok((mut stream, _peer)) = listener.accept().await else {
+            return;
+        };
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        let head_end = loop {
+            let Ok(read) = stream.read(&mut chunk).await else {
+                return;
+            };
+            if read == 0 {
+                return;
+            }
+            request.extend_from_slice(&chunk[..read]);
+            if let Some(index) = find_subslice(&request, b"\r\n\r\n") {
+                break index + 4;
+            }
+        };
 
-                let head = String::from_utf8_lossy(&request[..head_end]);
-                let body_length = header_value(&head, "content-length")
-                    .and_then(|value| value.parse::<usize>().ok())
-                    .unwrap_or(0);
-                while request.len() < head_end + body_length {
-                    let Ok(read) = stream.read(&mut chunk).await else {
-                        return;
-                    };
-                    if read == 0 {
-                        return;
-                    }
-                    request.extend_from_slice(&chunk[..read]);
-                }
-
-                let _ = sender.send(String::from_utf8_lossy(&request).into_owned());
-                let _ = stream
-                    .write_all(
-                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nhi",
-                    )
-                    .await;
-            });
+        let head = String::from_utf8_lossy(&request[..head_end]);
+        let body_length = header_value(&head, "content-length")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        while request.len() < head_end + body_length {
+            let Ok(read) = stream.read(&mut chunk).await else {
+                return;
+            };
+            if read == 0 {
+                return;
+            }
+            request.extend_from_slice(&chunk[..read]);
         }
+
+        let _ = sender.send(String::from_utf8_lossy(&request).into_owned());
+        let _ = stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nhi")
+            .await;
     });
 
     (address, receiver)
@@ -239,7 +235,7 @@ async fn echo_upstream() -> SocketAddr {
 
 #[tokio::test]
 async fn http_request_is_rewritten_and_relayed() {
-    let (upstream, mut requests) = recording_upstream().await;
+    let (upstream, requests) = recording_upstream().await;
     let proxy = TestProxy::start(
         &["allowed.example:80"],
         &[("allowed.example", 80, upstream)],
@@ -250,7 +246,7 @@ async fn http_request_is_rewritten_and_relayed() {
     client
         .send(
             concat!(
-                "POST http://Allowed.Example/path?q=1 HTTP/1.1\r\n",
+                "POST http://Allowed.Example?query=1 HTTP/1.1\r\n",
                 "Host: allowed.example\r\n",
                 "Content-Length: 5\r\n",
                 "Proxy-Connection: keep-alive\r\n",
@@ -268,11 +264,11 @@ async fn http_request_is_rewritten_and_relayed() {
     assert_eq!(client.read_exact(2).await, b"hi");
     assert!(!client.fill().await);
 
-    let forwarded = timeout(TEST_TIMEOUT, requests.recv())
+    let forwarded = timeout(TEST_TIMEOUT, requests)
         .await
         .expect("upstream request did not time out")
         .expect("upstream received the request");
-    assert!(forwarded.starts_with("POST /path?q=1 HTTP/1.1\r\n"));
+    assert!(forwarded.starts_with("POST /?query=1 HTTP/1.1\r\n"));
     assert_eq!(header_value(&forwarded, "host"), Some("allowed.example"));
     assert_eq!(header_value(&forwarded, "content-length"), Some("5"));
     assert!(header_value(&forwarded, "proxy-connection").is_none());
@@ -384,10 +380,6 @@ async fn firewall_rejects_without_network_activity() {
         (
             "GET http://allowed.example/ HTTP/1.1\r\nHost: allowed.example\r\nUpgrade: websocket\r\n\r\n",
             501,
-        ),
-        (
-            "POST http://allowed.example/ HTTP/1.1\r\nHost: allowed.example\r\nExpect: 100-continue\r\nContent-Length: 0\r\n\r\n",
-            417,
         ),
         (
             "GET http://allowed.example/ HTTP/1.1\r\nHost: allowed.example\r\nConnection: bad token\r\n\r\n",

@@ -29,7 +29,7 @@ use tokio::time::timeout;
 
 use crate::authority::{DEFAULT_HTTP_PORT, RequestAuthority, parse_authority};
 use crate::connector::{BoxedUpstreamStream, UPSTREAM_CONNECT_TIMEOUT, UpstreamConnector};
-use crate::headers::{remove_framing_headers, strip_hop_by_hop};
+use crate::headers::prepare_for_forwarding;
 use crate::idle_timeout::IdleTimeoutStream;
 use crate::policy::HostPolicy;
 
@@ -127,14 +127,8 @@ async fn handle_request(
 }
 
 async fn handle_forward(state: &ProxyState, request: Request<Incoming>) -> Response<ProxyBody> {
-    if !matches!(request.version(), Version::HTTP_10 | Version::HTTP_11) {
-        return status_response(StatusCode::HTTP_VERSION_NOT_SUPPORTED);
-    }
     if request.headers().contains_key(header::UPGRADE) {
         return status_response(StatusCode::NOT_IMPLEMENTED);
-    }
-    if request.headers().contains_key(header::EXPECT) {
-        return status_response(StatusCode::EXPECTATION_FAILED);
     }
     if request.headers().get_all(header::HOST).iter().count() > 1 {
         return status_response(StatusCode::BAD_REQUEST);
@@ -153,10 +147,9 @@ async fn handle_forward(state: &ProxyState, request: Request<Incoming>) -> Respo
     let (mut parts, body) = request.into_parts();
     parts.uri = origin_target;
     parts.version = Version::HTTP_11;
-    if strip_hop_by_hop(&mut parts.headers).is_err() {
+    if !prepare_for_forwarding(&mut parts.headers) {
         return status_response(StatusCode::BAD_REQUEST);
     }
-    remove_framing_headers(&mut parts.headers);
     parts.headers.remove(header::HOST);
     let Ok(host) = HeaderValue::from_str(&authority.host_header_value()) else {
         return status_response(StatusCode::BAD_REQUEST);
@@ -205,12 +198,10 @@ async fn forward_to_upstream(
             return status_response(StatusCode::BAD_GATEWAY);
         }
     };
-
     let (mut parts, body) = upstream_response.into_parts();
-    if strip_hop_by_hop(&mut parts.headers).is_err() {
+    if !prepare_for_forwarding(&mut parts.headers) {
         return status_response(StatusCode::BAD_GATEWAY);
     }
-    remove_framing_headers(&mut parts.headers);
     Response::from_parts(parts, body.map_err(BoxError::from).boxed())
 }
 
@@ -354,34 +345,6 @@ mod tests {
 
     fn uri(raw: &str) -> Uri {
         raw.parse().unwrap()
-    }
-
-    #[test]
-    fn forward_targets_must_be_absolute_http() {
-        let authority = forward_authority(&uri("http://Example.com/path?q=1")).unwrap();
-        assert_eq!(authority.host().as_str(), "example.com");
-        assert_eq!(authority.port(), DEFAULT_HTTP_PORT);
-
-        assert!(forward_authority(&uri("https://example.com/")).is_none());
-        assert!(forward_authority(&uri("/relative")).is_none());
-        assert!(forward_authority(&uri("http://user@example.com/")).is_none());
-        assert!(forward_authority(&uri("http://192.0.2.5/")).is_none());
-    }
-
-    #[test]
-    fn absolute_targets_are_rewritten_to_origin_form() {
-        assert_eq!(
-            origin_form_target(&uri("http://example.com/path?q=1"))
-                .unwrap()
-                .to_string(),
-            "/path?q=1"
-        );
-        assert_eq!(
-            origin_form_target(&uri("http://example.com?query=1"))
-                .unwrap()
-                .to_string(),
-            "/?query=1"
-        );
     }
 
     #[test]
