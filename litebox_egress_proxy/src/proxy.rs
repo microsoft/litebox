@@ -1,42 +1,56 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Connection acceptance, authorization, and CONNECT tunnelling.
+//! Connection acceptance, authorization, HTTP forwarding, and CONNECT tunnelling.
 //!
-//! Every CONNECT request is authorized before DNS or upstream activity. A
-//! successful request consumes its client connection by upgrading it to one
-//! bounded bidirectional tunnel.
+//! Every request is authorized before DNS or upstream activity. Plain HTTP
+//! requests use a dedicated upstream connection; CONNECT consumes its client
+//! connection by upgrading it to a bounded tunnel.
 
 use core::convert::Infallible;
+use core::error::Error as StdError;
 use core::time::Duration;
 use std::io;
 use std::sync::Arc;
 
-use http_body_util::Empty;
-use hyper::body::{Bytes, Incoming};
-use hyper::header::{self, HeaderValue};
+use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Empty};
+use hyper::body::{Body, Bytes, Incoming};
+use hyper::client::conn::http1 as client_http1;
+use hyper::header::{self, HeaderName, HeaderValue};
 use hyper::http::uri::Authority;
 use hyper::server::conn::http1 as server_http1;
 use hyper::service::service_fn;
-use hyper::{Method, Request, Response, StatusCode, Uri};
+use hyper::{HeaderMap, Method, Request, Response, StatusCode, Uri, Version};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 
-use crate::authority::{RequestAuthority, parse_authority};
+use crate::authority::{DEFAULT_HTTP_PORT, RequestAuthority, parse_authority};
 use crate::connector::{BoxedUpstreamStream, UPSTREAM_CONNECT_TIMEOUT, UpstreamConnector};
 use crate::idle_timeout::IdleTimeoutStream;
 use crate::policy::HostPolicy;
 
 const MAX_CONCURRENT_CLIENT_CONNECTIONS: usize = 256;
-const MAX_REQUEST_HEADER_BYTES: usize = 16 * 1024;
+const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_HEADER_FIELDS: usize = 100;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const REQUEST_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const HOP_BY_HOP_HEADERS: [&str; 9] = [
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
 
-/// Response body type produced by the proxy.
-type ProxyBody = Empty<Bytes>;
+type BoxError = Box<dyn StdError + Send + Sync>;
+type ProxyBody = BoxBody<Bytes, BoxError>;
 
 /// Immutable state shared by every connection.
 pub struct ProxyState {
@@ -80,7 +94,7 @@ pub async fn serve(listener: TcpListener, state: Arc<ProxyState>) -> io::Result<
     }
 }
 
-/// Serves one CONNECT tunnel or rejection on a client connection.
+/// Serves one HTTP request or CONNECT tunnel on a client connection.
 async fn serve_connection(state: Arc<ProxyState>, stream: TcpStream, permit: OwnedSemaphorePermit) {
     if stream.set_nodelay(true).is_err() {
         return;
@@ -98,7 +112,7 @@ async fn serve_connection(state: Arc<ProxyState>, stream: TcpStream, permit: Own
     builder
         .timer(TokioTimer::new())
         .header_read_timeout(Some(REQUEST_HEADER_READ_TIMEOUT))
-        .max_buf_size(MAX_REQUEST_HEADER_BYTES)
+        .max_buf_size(MAX_HEADER_BYTES)
         .max_headers(MAX_HEADER_FIELDS);
 
     if let Err(error) = builder.serve_connection(io, service).with_upgrades().await {
@@ -106,19 +120,170 @@ async fn serve_connection(state: Arc<ProxyState>, stream: TcpStream, permit: Own
     }
 }
 
-/// Dispatches one request.
 async fn handle_request(
     state: Arc<ProxyState>,
     permit: Arc<OwnedSemaphorePermit>,
     request: Request<Incoming>,
 ) -> Response<ProxyBody> {
-    if request.method() != Method::CONNECT {
-        return status_response(StatusCode::NOT_IMPLEMENTED);
+    if request.method() == Method::CONNECT {
+        handle_connect(&state, permit, request).await
+    } else {
+        let mut response = handle_forward(&state, request).await;
+        response
+            .headers_mut()
+            .insert(header::CONNECTION, HeaderValue::from_static("close"));
+        response
     }
-    handle_connect(&state, permit, request).await
 }
 
-/// Handles one CONNECT tunnel request.
+async fn handle_forward(state: &ProxyState, request: Request<Incoming>) -> Response<ProxyBody> {
+    if request.headers().contains_key(header::UPGRADE) {
+        return status_response(StatusCode::NOT_IMPLEMENTED);
+    }
+    if request.headers().get_all(header::HOST).iter().count() > 1 {
+        return status_response(StatusCode::BAD_REQUEST);
+    }
+
+    let Some(authority) = forward_authority(request.uri()) else {
+        return status_response(StatusCode::BAD_REQUEST);
+    };
+    let Some(origin_target) = origin_form_target(request.uri()) else {
+        return status_response(StatusCode::BAD_REQUEST);
+    };
+    if !host_header_is_consistent(&request, &authority, Some(DEFAULT_HTTP_PORT)) {
+        return status_response(StatusCode::BAD_REQUEST);
+    }
+    let Some(is_chunked) = chunked_transfer_encoding(request.headers()) else {
+        return status_response(StatusCode::NOT_IMPLEMENTED);
+    };
+    let had_content_length = request.headers().contains_key(header::CONTENT_LENGTH);
+
+    let (mut parts, body) = request.into_parts();
+    parts.uri = origin_target;
+    parts.version = Version::HTTP_11;
+    if !strip_hop_by_hop_headers(&mut parts.headers) {
+        return status_response(StatusCode::BAD_REQUEST);
+    }
+    parts.headers.remove(header::CONTENT_LENGTH);
+    if is_chunked {
+        parts.headers.insert(
+            header::TRANSFER_ENCODING,
+            HeaderValue::from_static("chunked"),
+        );
+    } else if had_content_length {
+        let Some(length) = body.size_hint().exact() else {
+            return status_response(StatusCode::BAD_REQUEST);
+        };
+        let Ok(length) = HeaderValue::from_str(&length.to_string()) else {
+            return status_response(StatusCode::BAD_REQUEST);
+        };
+        parts.headers.insert(header::CONTENT_LENGTH, length);
+    }
+    parts.headers.remove(header::HOST);
+    let Ok(host) = HeaderValue::from_str(&authority.host_header_value()) else {
+        return status_response(StatusCode::BAD_REQUEST);
+    };
+    parts.headers.insert(header::HOST, host);
+
+    if !state.policy.allows(authority.host(), authority.port()) {
+        return status_response(StatusCode::FORBIDDEN);
+    }
+
+    let upstream = match connect_upstream(state, &authority).await {
+        Ok(stream) => IdleTimeoutStream::new(stream, IDLE_TIMEOUT),
+        Err(status) => return status_response(status),
+    };
+
+    forward_to_upstream(Request::from_parts(parts, body), upstream).await
+}
+
+async fn forward_to_upstream(
+    request: Request<Incoming>,
+    upstream: IdleTimeoutStream<BoxedUpstreamStream>,
+) -> Response<ProxyBody> {
+    let handshake = client_http1::Builder::new()
+        .max_buf_size(MAX_HEADER_BYTES)
+        .max_headers(MAX_HEADER_FIELDS)
+        .handshake(TokioIo::new(upstream))
+        .await;
+    let (mut sender, connection) = match handshake {
+        Ok(pair) => pair,
+        Err(error) => {
+            diagnostic(format_args!("upstream handshake failed: {error}"));
+            return status_response(StatusCode::BAD_GATEWAY);
+        }
+    };
+
+    tokio::spawn(async move {
+        if let Err(error) = connection.await {
+            diagnostic(format_args!("upstream connection ended: {error}"));
+        }
+    });
+
+    let upstream_response = match sender.send_request(request).await {
+        Ok(response) => response,
+        Err(error) => {
+            diagnostic(format_args!("upstream request failed: {error}"));
+            return status_response(StatusCode::BAD_GATEWAY);
+        }
+    };
+    if upstream_response.status() == StatusCode::SWITCHING_PROTOCOLS {
+        return status_response(StatusCode::BAD_GATEWAY);
+    }
+    let (mut parts, body) = upstream_response.into_parts();
+    let Some(is_chunked) = chunked_transfer_encoding(&parts.headers) else {
+        return status_response(StatusCode::BAD_GATEWAY);
+    };
+    if !strip_hop_by_hop_headers(&mut parts.headers) {
+        return status_response(StatusCode::BAD_GATEWAY);
+    }
+    if is_chunked {
+        parts.headers.remove(header::CONTENT_LENGTH);
+    }
+    Response::from_parts(parts, body.map_err(BoxError::from).boxed())
+}
+
+fn chunked_transfer_encoding(headers: &HeaderMap) -> Option<bool> {
+    let mut found = false;
+    for value in headers.get_all(header::TRANSFER_ENCODING) {
+        let text = value.to_str().ok()?;
+        for coding in text.split(',') {
+            if found || !coding.trim().eq_ignore_ascii_case("chunked") {
+                return None;
+            }
+            found = true;
+        }
+    }
+    Some(found)
+}
+
+fn strip_hop_by_hop_headers(headers: &mut HeaderMap) -> bool {
+    let mut connection_named = Vec::new();
+    for value in headers.get_all(header::CONNECTION) {
+        let Ok(text) = value.to_str() else {
+            return false;
+        };
+        for token in text.split(',') {
+            let token = token.trim();
+            if token.is_empty() {
+                return false;
+            }
+            let Ok(name) = HeaderName::from_bytes(token.as_bytes()) else {
+                return false;
+            };
+            connection_named.push(name);
+        }
+    }
+
+    for name in connection_named {
+        headers.remove(name);
+    }
+    for name in HOP_BY_HOP_HEADERS {
+        headers.remove(name);
+    }
+    true
+}
+
 async fn handle_connect(
     state: &ProxyState,
     permit: Arc<OwnedSemaphorePermit>,
@@ -138,7 +303,7 @@ async fn handle_connect(
         return status_response(StatusCode::BAD_REQUEST);
     };
 
-    if !host_header_is_consistent(&request, &authority) {
+    if !host_header_is_consistent(&request, &authority, None) {
         return status_response(StatusCode::BAD_REQUEST);
     }
 
@@ -167,12 +332,29 @@ async fn handle_connect(
         }
     });
 
-    let mut response = Response::new(Empty::new());
+    let mut response = Response::new(empty_body());
     *response.status_mut() = StatusCode::OK;
     response
 }
 
-/// Canonicalizes the authority-form target of a CONNECT request.
+fn forward_authority(uri: &Uri) -> Option<RequestAuthority> {
+    if !uri.scheme_str()?.eq_ignore_ascii_case("http") {
+        return None;
+    }
+    let raw = uri.authority().map(Authority::as_str)?;
+    parse_authority(raw, Some(DEFAULT_HTTP_PORT)).ok()
+}
+
+fn origin_form_target(uri: &Uri) -> Option<Uri> {
+    let target = uri
+        .path_and_query()
+        .map_or("/", hyper::http::uri::PathAndQuery::as_str);
+    match target.strip_prefix('?') {
+        Some(query) => format!("/?{query}").parse().ok(),
+        None => target.parse().ok(),
+    }
+}
+
 fn connect_authority(uri: &Uri) -> Option<RequestAuthority> {
     if uri.scheme_str().is_some() || !uri.path().is_empty() || uri.query().is_some() {
         return None;
@@ -181,19 +363,21 @@ fn connect_authority(uri: &Uri) -> Option<RequestAuthority> {
     parse_authority(raw, None).ok()
 }
 
-/// Returns whether a CONNECT Host header matches the request target.
-fn host_header_is_consistent(request: &Request<Incoming>, authority: &RequestAuthority) -> bool {
+fn host_header_is_consistent(
+    request: &Request<Incoming>,
+    authority: &RequestAuthority,
+    default_port: Option<u16>,
+) -> bool {
     let Some(value) = request.headers().get(header::HOST) else {
         return true;
     };
     value
         .to_str()
         .ok()
-        .and_then(|raw| parse_authority(raw, None).ok())
+        .and_then(|raw| parse_authority(raw, default_port).ok())
         .is_some_and(|host_header| &host_header == authority)
 }
 
-/// Resolves and connects to an authorized hostname.
 async fn connect_upstream(
     state: &ProxyState,
     authority: &RequestAuthority,
@@ -215,8 +399,14 @@ async fn connect_upstream(
     }
 }
 
+fn empty_body() -> ProxyBody {
+    Empty::<Bytes>::new()
+        .map_err(|never| match never {})
+        .boxed()
+}
+
 fn status_response(status: StatusCode) -> Response<ProxyBody> {
-    let mut response = Response::new(Empty::new());
+    let mut response = Response::new(empty_body());
     *response.status_mut() = status;
     response
         .headers_mut()
@@ -245,5 +435,23 @@ mod tests {
         assert!(connect_authority(&uri("http://example.com:443")).is_none());
         assert!(connect_authority(&uri("example.com")).is_none());
         assert!(connect_authority(&uri("example.com:0")).is_none());
+    }
+
+    #[test]
+    fn accepts_only_a_single_chunked_transfer_coding() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(chunked_transfer_encoding(&headers), Some(false));
+
+        headers.insert(
+            header::TRANSFER_ENCODING,
+            HeaderValue::from_static("Chunked"),
+        );
+        assert_eq!(chunked_transfer_encoding(&headers), Some(true));
+
+        headers.insert(
+            header::TRANSFER_ENCODING,
+            HeaderValue::from_static("gzip, chunked"),
+        );
+        assert_eq!(chunked_transfer_encoding(&headers), None);
     }
 }
