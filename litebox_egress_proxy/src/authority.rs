@@ -97,7 +97,7 @@ pub fn parse_authority(
 
     let port = match port_part {
         Some(port) if port.contains(':') => return Err(AuthorityError),
-        Some(port) => parse_port(port).map_err(|_| AuthorityError)?,
+        Some(port) => parse_port(port).ok_or(AuthorityError)?,
         None => default_port
             .filter(|port| *port != 0)
             .ok_or(AuthorityError)?,
