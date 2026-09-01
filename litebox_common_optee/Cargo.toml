@@ -9,9 +9,12 @@ elf = { version = "0.8.0", default-features = false }
 litebox = { path = "../litebox/", version = "0.1.0" }
 litebox_common_linux = { path = "../litebox_common_linux/", version = "0.1.0" }
 num_enum = { version = "0.7.3", default-features = false }
-rsa = { version = "0.9.10", default-features = false, features = ["pem"] }
-sha2 = { version = "0.10.9", default-features = false, features = ["oid"] }
+rsa = { version = "0.9.10", default-features = false, features = ["pem"], optional = true }
+sha2 = { version = "0.10.9", default-features = false, features = ["oid"], optional = true }
 zerocopy = { version = "0.8", features = ["derive"] }
+
+[features]
+signed-ta-rsa = ["dep:rsa", "dep:sha2"]
 
 [lints]
 workspace = true
