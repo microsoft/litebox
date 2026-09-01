@@ -107,20 +107,6 @@ pub fn parse_authority(
     Ok(RequestAuthority { host, port })
 }
 
-/// Returns whether a `Host` header identifies the same canonical host and
-/// effective port as the request target.
-///
-/// `default_port` must be the default that applies to the request form: the
-/// `http` default for absolute-form requests, and [`None`] for CONNECT, where
-/// the header has to state the port explicitly to be unambiguous.
-pub fn host_header_matches(
-    raw_header: &str,
-    target: &RequestAuthority,
-    default_port: Option<u16>,
-) -> bool {
-    parse_authority(raw_header, default_port).is_ok_and(|header| &header == target)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,31 +154,5 @@ mod tests {
         for raw in ["192.0.2.10:443", "example.com:0", "example.com:http"] {
             assert_eq!(parse_authority(raw, None), Err(AuthorityError), "{raw}");
         }
-    }
-
-    #[test]
-    fn host_header_comparison() {
-        let target = authority("example.com:8080", None);
-        assert!(host_header_matches("Example.com:8080", &target, None));
-        assert!(!host_header_matches("other.example:8080", &target, None));
-        assert!(!host_header_matches("example.com", &target, None));
-        assert!(!host_header_matches("example.com:80", &target, None));
-
-        let default_target = authority("example.com", Some(DEFAULT_HTTP_PORT));
-        assert!(host_header_matches(
-            "example.com",
-            &default_target,
-            Some(DEFAULT_HTTP_PORT)
-        ));
-        assert!(host_header_matches(
-            "example.com:80",
-            &default_target,
-            Some(DEFAULT_HTTP_PORT)
-        ));
-        assert!(!host_header_matches(
-            "example.com:8080",
-            &default_target,
-            Some(DEFAULT_HTTP_PORT)
-        ));
     }
 }
