@@ -289,7 +289,8 @@ impl PageTableManager {
     /// - No references to user-space memory are held across the switch
     pub unsafe fn load_base(&self) {
         x86_64::instructions::interrupts::without_interrupts(|| {
-            // Keep the previous page table alive until after switching CR3.
+            // Ensure decreasing/dropping `Arc` for the previous page table (`set_active_page_table()`)
+            // only after switching CR3 (`mm::PageTable::load()`).
             self.base_page_table.load();
             with_per_cpu_variables(|pcv| {
                 // Safety: CR3 now references the base page table and interrupts are disabled.
@@ -324,7 +325,8 @@ impl PageTableManager {
         };
 
         x86_64::instructions::interrupts::without_interrupts(|| {
-            // Keep the previous page table alive until after switching CR3.
+            // Ensure decreasing/dropping `Arc` for the previous page table (`set_active_page_table()`)
+            // only after switching CR3 (`mm::PageTable::load()`).
             pt.load();
             with_per_cpu_variables(|pcv| {
                 // Safety: CR3 now references `pt` and interrupts are disabled.
