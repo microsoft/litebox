@@ -2731,6 +2731,7 @@ mod tests {
         #[test]
         fn reserve_alignment_outputs_match_host_ntdll() {
             run_with_test_platform_pointers(|| {
+                let task = crate::tests::test_task();
                 let mut probe_base = core::ptr::null_mut::<c_void>();
                 let mut probe_region_size = ALLOCATION_GRANULARITY * 2;
                 // SAFETY: The output pointers are valid locals and the current-process pseudo
@@ -2791,7 +2792,6 @@ mod tests {
                 };
                 assert_eq!(host_free_status, NtStatus::SUCCESS);
 
-                let task = crate::tests::test_task();
                 let mut guest_base = requested_base as usize;
                 let mut guest_region_size = 1usize;
                 let guest_allocate_status = task.sys_nt_allocate_virtual_memory(
