@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Hermetic loopback tests for the HTTP and CONNECT proxy.
+//! Hermetic loopback tests for HTTP forwarding and CONNECT tunneling.
 
 use std::collections::HashMap;
 use std::io;
@@ -124,6 +124,14 @@ impl ProxyClient {
     }
 
     async fn read_response(&mut self) -> u16 {
+        let head = self.read_response_head().await;
+        head.split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse::<u16>().ok())
+            .expect("status code")
+    }
+
+    async fn read_response_head(&mut self) -> String {
         let head_end = loop {
             if let Some(index) = find_subslice(&self.buffer, b"\r\n\r\n") {
                 break index + 4;
@@ -136,10 +144,7 @@ impl ProxyClient {
 
         let head = String::from_utf8(self.buffer[..head_end].to_vec()).expect("ASCII head");
         self.buffer.drain(..head_end);
-        head.split_whitespace()
-            .nth(1)
-            .and_then(|code| code.parse::<u16>().ok())
-            .expect("status code")
+        head
     }
 
     async fn read_exact(&mut self, length: usize) -> Vec<u8> {
@@ -166,6 +171,39 @@ fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
+async fn recording_upstream(
+    request_end: &'static [u8],
+    response: &'static [u8],
+) -> (SocketAddr, oneshot::Receiver<String>) {
+    let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("upstream listener");
+    let address = listener.local_addr().expect("upstream address");
+    let (sender, receiver) = oneshot::channel();
+
+    tokio::spawn(async move {
+        let Ok((mut stream, _peer)) = listener.accept().await else {
+            return;
+        };
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        while find_subslice(&request, request_end).is_none() {
+            let Ok(read) = stream.read(&mut chunk).await else {
+                return;
+            };
+            if read == 0 {
+                return;
+            }
+            request.extend_from_slice(&chunk[..read]);
+        }
+
+        let _ = sender.send(String::from_utf8_lossy(&request).into_owned());
+        let _ = stream.write_all(response).await;
+    });
+
+    (address, receiver)
+}
+
 async fn echo_upstream() -> SocketAddr {
     let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
         .await
@@ -186,49 +224,11 @@ async fn echo_upstream() -> SocketAddr {
 
 #[tokio::test]
 async fn http_request_is_rewritten_and_relayed() {
-    let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
-        .await
-        .expect("upstream listener");
-    let upstream = listener.local_addr().expect("upstream address");
-    let (sender, requests) = oneshot::channel();
-    tokio::spawn(async move {
-        let Ok((mut stream, _peer)) = listener.accept().await else {
-            return;
-        };
-        let mut request = Vec::new();
-        let mut chunk = [0_u8; 4096];
-        let head_end = loop {
-            let Ok(read) = stream.read(&mut chunk).await else {
-                return;
-            };
-            if read == 0 {
-                return;
-            }
-            request.extend_from_slice(&chunk[..read]);
-            if let Some(index) = find_subslice(&request, b"\r\n\r\n") {
-                break index + 4;
-            }
-        };
-
-        let head = String::from_utf8_lossy(&request[..head_end]);
-        let body_length = header_value(&head, "content-length")
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(0);
-        while request.len() < head_end + body_length {
-            let Ok(read) = stream.read(&mut chunk).await else {
-                return;
-            };
-            if read == 0 {
-                return;
-            }
-            request.extend_from_slice(&chunk[..read]);
-        }
-
-        let _ = sender.send(String::from_utf8_lossy(&request).into_owned());
-        let _ = stream
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nhi")
-            .await;
-    });
+    let (upstream, requests) = recording_upstream(
+        b"\r\n\r\nhello",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nhi",
+    )
+    .await;
 
     let proxy = TestProxy::start(
         &["allowed.example:80"],
@@ -270,6 +270,122 @@ async fn http_request_is_rewritten_and_relayed() {
     assert!(header_value(&forwarded, "x-secret").is_none());
     assert_eq!(header_value(&forwarded, "x-kept"), Some("value"));
     assert!(forwarded.ends_with("hello"));
+}
+
+#[tokio::test]
+async fn chunked_get_body_is_relayed() {
+    let (upstream, requests) = recording_upstream(
+        b"\r\n0\r\n\r\n",
+        b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    let proxy = TestProxy::start(
+        &["allowed.example:80"],
+        &[("allowed.example", 80, upstream)],
+    )
+    .await;
+
+    let mut client = proxy.connect().await;
+    client
+        .send(
+            concat!(
+                "GET http://allowed.example/search HTTP/1.1\r\n",
+                "Host: allowed.example\r\n",
+                "Transfer-Encoding: chunked\r\n",
+                "\r\n",
+                "5\r\nhello\r\n0\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await;
+
+    assert_eq!(client.read_response().await, 204);
+    let forwarded = timeout(TEST_TIMEOUT, requests)
+        .await
+        .expect("upstream request did not time out")
+        .expect("upstream received the request");
+    assert!(forwarded.starts_with("GET /search HTTP/1.1\r\n"));
+    assert_eq!(
+        header_value(&forwarded, "transfer-encoding"),
+        Some("chunked")
+    );
+    assert!(header_value(&forwarded, "content-length").is_none());
+    assert!(forwarded.ends_with("5\r\nhello\r\n0\r\n\r\n"));
+}
+
+#[tokio::test]
+async fn empty_post_preserves_content_length() {
+    let (upstream, requests) = recording_upstream(
+        b"\r\n\r\n",
+        b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    let proxy = TestProxy::start(
+        &["allowed.example:80"],
+        &[("allowed.example", 80, upstream)],
+    )
+    .await;
+
+    assert_eq!(
+        proxy
+            .request(
+                "POST http://allowed.example/upload HTTP/1.1\r\nHost: allowed.example\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await,
+        204
+    );
+    let forwarded = timeout(TEST_TIMEOUT, requests)
+        .await
+        .expect("upstream request did not time out")
+        .expect("upstream received the request");
+    assert_eq!(header_value(&forwarded, "content-length"), Some("0"));
+    assert!(header_value(&forwarded, "transfer-encoding").is_none());
+}
+
+#[tokio::test]
+async fn head_response_preserves_content_length() {
+    let (upstream, _requests) = recording_upstream(
+        b"\r\n\r\n",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 123\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    let proxy = TestProxy::start(
+        &["allowed.example:80"],
+        &[("allowed.example", 80, upstream)],
+    )
+    .await;
+
+    let mut client = proxy.connect().await;
+    client
+        .send(b"HEAD http://allowed.example/file HTTP/1.1\r\nHost: allowed.example\r\n\r\n")
+        .await;
+
+    let response = client.read_response_head().await;
+    assert!(response.starts_with("HTTP/1.1 200 "));
+    assert_eq!(header_value(&response, "content-length"), Some("123"));
+    assert!(!client.fill().await);
+}
+
+#[tokio::test]
+async fn invalid_upstream_responses_yield_bad_gateway() {
+    for response in [
+        &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n"[..],
+        &b"HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n"[..],
+    ] {
+        let (upstream, _requests) = recording_upstream(b"\r\n\r\n", response).await;
+        let proxy = TestProxy::start(
+            &["allowed.example:80"],
+            &[("allowed.example", 80, upstream)],
+        )
+        .await;
+
+        assert_eq!(
+            proxy
+                .request("GET http://allowed.example/ HTTP/1.1\r\nHost: allowed.example\r\n\r\n")
+                .await,
+            502
+        );
+    }
 }
 
 #[tokio::test]
@@ -378,6 +494,10 @@ async fn firewall_rejects_without_network_activity() {
         (
             "GET http://allowed.example/ HTTP/1.1\r\nHost: allowed.example\r\nConnection: bad token\r\n\r\n",
             400,
+        ),
+        (
+            "POST http://allowed.example/ HTTP/1.1\r\nHost: allowed.example\r\nTransfer-Encoding: gzip, chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n",
+            501,
         ),
     ] {
         assert_eq!(proxy.request(request).await, expected_status, "{request:?}");

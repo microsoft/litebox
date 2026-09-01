@@ -5,8 +5,8 @@
 //!
 //! Authorized hostnames are resolved on demand through the trusted host
 //! resolver, then connected using the returned numeric addresses. Plain HTTP
-//! requests are forwarded without buffering their bodies; CONNECT tunnels
-//! relay bytes without inspecting or terminating TLS.
+//! requests are forwarded without buffering their bodies; HTTPS connections
+//! use CONNECT tunnels that relay bytes without inspecting or terminating TLS.
 
 extern crate alloc;
 

@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Empty};
-use hyper::body::{Bytes, Incoming};
+use hyper::body::{Body, Bytes, Incoming};
 use hyper::client::conn::http1 as client_http1;
 use hyper::header::{self, HeaderName, HeaderValue};
 use hyper::http::uri::Authority;
@@ -153,12 +153,31 @@ async fn handle_forward(state: &ProxyState, request: Request<Incoming>) -> Respo
     if !host_header_is_consistent(&request, &authority, Some(DEFAULT_HTTP_PORT)) {
         return status_response(StatusCode::BAD_REQUEST);
     }
+    let Some(is_chunked) = chunked_transfer_encoding(request.headers()) else {
+        return status_response(StatusCode::NOT_IMPLEMENTED);
+    };
+    let had_content_length = request.headers().contains_key(header::CONTENT_LENGTH);
 
     let (mut parts, body) = request.into_parts();
     parts.uri = origin_target;
     parts.version = Version::HTTP_11;
-    if !prepare_for_forwarding(&mut parts.headers) {
+    if !strip_hop_by_hop_headers(&mut parts.headers) {
         return status_response(StatusCode::BAD_REQUEST);
+    }
+    parts.headers.remove(header::CONTENT_LENGTH);
+    if is_chunked {
+        parts.headers.insert(
+            header::TRANSFER_ENCODING,
+            HeaderValue::from_static("chunked"),
+        );
+    } else if had_content_length {
+        let Some(length) = body.size_hint().exact() else {
+            return status_response(StatusCode::BAD_REQUEST);
+        };
+        let Ok(length) = HeaderValue::from_str(&length.to_string()) else {
+            return status_response(StatusCode::BAD_REQUEST);
+        };
+        parts.headers.insert(header::CONTENT_LENGTH, length);
     }
     parts.headers.remove(header::HOST);
     let Ok(host) = HeaderValue::from_str(&authority.host_header_value()) else {
@@ -208,14 +227,37 @@ async fn forward_to_upstream(
             return status_response(StatusCode::BAD_GATEWAY);
         }
     };
-    let (mut parts, body) = upstream_response.into_parts();
-    if !prepare_for_forwarding(&mut parts.headers) {
+    if upstream_response.status() == StatusCode::SWITCHING_PROTOCOLS {
         return status_response(StatusCode::BAD_GATEWAY);
+    }
+    let (mut parts, body) = upstream_response.into_parts();
+    let Some(is_chunked) = chunked_transfer_encoding(&parts.headers) else {
+        return status_response(StatusCode::BAD_GATEWAY);
+    };
+    if !strip_hop_by_hop_headers(&mut parts.headers) {
+        return status_response(StatusCode::BAD_GATEWAY);
+    }
+    if is_chunked {
+        parts.headers.remove(header::CONTENT_LENGTH);
     }
     Response::from_parts(parts, body.map_err(BoxError::from).boxed())
 }
 
-fn prepare_for_forwarding(headers: &mut HeaderMap) -> bool {
+fn chunked_transfer_encoding(headers: &HeaderMap) -> Option<bool> {
+    let mut found = false;
+    for value in headers.get_all(header::TRANSFER_ENCODING) {
+        let text = value.to_str().ok()?;
+        for coding in text.split(',') {
+            if found || !coding.trim().eq_ignore_ascii_case("chunked") {
+                return None;
+            }
+            found = true;
+        }
+    }
+    Some(found)
+}
+
+fn strip_hop_by_hop_headers(headers: &mut HeaderMap) -> bool {
     let mut connection_named = Vec::new();
     for value in headers.get_all(header::CONNECTION) {
         let Ok(text) = value.to_str() else {
@@ -239,7 +281,6 @@ fn prepare_for_forwarding(headers: &mut HeaderMap) -> bool {
     for name in HOP_BY_HOP_HEADERS {
         headers.remove(name);
     }
-    headers.remove(header::CONTENT_LENGTH);
     true
 }
 
@@ -394,5 +435,23 @@ mod tests {
         assert!(connect_authority(&uri("http://example.com:443")).is_none());
         assert!(connect_authority(&uri("example.com")).is_none());
         assert!(connect_authority(&uri("example.com:0")).is_none());
+    }
+
+    #[test]
+    fn accepts_only_a_single_chunked_transfer_coding() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(chunked_transfer_encoding(&headers), Some(false));
+
+        headers.insert(
+            header::TRANSFER_ENCODING,
+            HeaderValue::from_static("Chunked"),
+        );
+        assert_eq!(chunked_transfer_encoding(&headers), Some(true));
+
+        headers.insert(
+            header::TRANSFER_ENCODING,
+            HeaderValue::from_static("gzip, chunked"),
+        );
+        assert_eq!(chunked_transfer_encoding(&headers), None);
     }
 }
