@@ -10,9 +10,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use litebox_egress_proxy::connector::{BoxedUpstreamStream, ConnectFuture, UpstreamConnector};
 use litebox_egress_proxy::policy::{HostPolicy, Hostname};
 use litebox_egress_proxy::proxy::{ProxyState, serve};
-use litebox_egress_proxy::upstream::{BoxedUpstreamStream, ConnectFuture, UpstreamConnector};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;

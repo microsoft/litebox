@@ -25,9 +25,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 
 use crate::authority::{RequestAuthority, parse_authority};
+use crate::connector::{BoxedUpstreamStream, UpstreamConnector};
+use crate::idle_timeout::IdleTimeoutStream;
 use crate::policy::HostPolicy;
-use crate::stream::IdleTimeoutStream;
-use crate::upstream::{BoxedUpstreamStream, UpstreamConnector};
 
 const MAX_CONCURRENT_CLIENT_CONNECTIONS: usize = 256;
 const MAX_REQUEST_HEADER_BYTES: usize = 16 * 1024;

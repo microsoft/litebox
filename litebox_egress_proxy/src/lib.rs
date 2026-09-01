@@ -11,11 +11,11 @@ extern crate alloc;
 
 pub mod authority;
 pub mod config;
+pub mod connector;
 pub mod policy;
 pub mod proxy;
-pub mod upstream;
 
-mod stream;
+mod idle_timeout;
 
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -23,8 +23,8 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 
 use crate::config::ProxyConfig;
+use crate::connector::TcpUpstreamConnector;
 use crate::proxy::ProxyState;
-use crate::upstream::TcpUpstreamConnector;
 
 /// Runs the proxy: startup, readiness announcement, then serving.
 pub async fn run(config: ProxyConfig) -> io::Result<()> {
