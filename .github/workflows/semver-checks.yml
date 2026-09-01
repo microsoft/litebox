@@ -8,6 +8,11 @@ on:
       - synchronize
       - reopened
       - edited
+  issue_comment:
+    types:
+      - created
+      - edited
+      - deleted
   merge_group:
 
 # If a new commit is pushed to the branch before ongoing runs finish, cancel the ongoing runs
@@ -24,8 +29,59 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  rerun_fork_check:
+    name: Re-run fork semver check
+    if: >-
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      (github.event.action == 'deleted' ||
+      contains(github.event.comment.body, ':robot: SemverChecks :robot:'))
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: read
+      issues: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Re-run the pull request check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          API_URL: ${{ github.api_url }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          PR=$(curl --fail-with-body -sS \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            "$API_URL/repos/$REPOSITORY/pulls/$PR_NUMBER")
+          IS_OPEN=$(jq -r '.state == "open"' <<<"$PR")
+          IS_FORK=$(jq -r '.head.repo.fork == true' <<<"$PR")
+          COMMENTER_IS_AUTHOR=$(jq -r --arg login "${{ github.event.comment.user.login }}" '.user.login == $login' <<<"$PR")
+          COMMENTER_IS_MAINTAINER=$(case '${{ github.event.comment.author_association }}' in OWNER|MEMBER|COLLABORATOR) echo true;; *) echo false;; esac)
+          if [ "$IS_OPEN" != true ] || [ "$IS_FORK" != true ] || \
+             { [ "$COMMENTER_IS_AUTHOR" != true ] && [ "$COMMENTER_IS_MAINTAINER" != true ]; }; then
+            echo 'Ignoring comment from an unauthorized user or on a non-open fork PR.'
+            exit 0
+          fi
+          HEAD_SHA=$(jq -r '.head.sha' <<<"$PR")
+          RUN_ID=$(curl --fail-with-body -sS \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            "$API_URL/repos/$REPOSITORY/actions/workflows/semver-checks.yml/runs?event=pull_request&head_sha=$HEAD_SHA&per_page=10" | \
+            jq -r --argjson pr_number "$PR_NUMBER" '[.workflow_runs[] | select(any(.pull_requests[]?; .number == $pr_number))] | first | .id // empty')
+          if [ -z "$RUN_ID" ]; then
+            echo 'No pull_request semver-checks run exists for this commit yet.' >&2
+            exit 1
+          fi
+          curl --fail-with-body -sS -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            "$API_URL/repos/$REPOSITORY/actions/runs/$RUN_ID/rerun"
+
   semver_checks:
     name: Check SemVer Correctness
+    if: ${{ github.event_name != 'issue_comment' }}
     runs-on: ubuntu-latest
     steps:
       - name: Check out repo
@@ -101,7 +157,7 @@ jobs:
       #     https://api.github.com/repos/${{ github.repository_owner }}/${{ github.event.repository.name }}/issues/${{ github.event.number }}/reactions \
       #     -d '{"content":"${{ steps.semver_check.outputs.reaction }}"}'
       - name: Delete old semver checks comments, if any
-        if: github.event_name == 'pull_request'
+        if: ${{ github.event_name == 'pull_request' && !github.event.pull_request.head.repo.fork }}
         run: |
           # Get the old comments
           COMMENT_IDS=$(curl -L \
@@ -120,7 +176,7 @@ jobs:
             https://api.github.com/repos/${{ github.repository_owner }}/${{ github.event.repository.name }}/issues/comments/$ID
           done
       - name: Add a new issue comment if needed
-        if: github.event_name == 'pull_request'
+        if: ${{ github.event_name == 'pull_request' && !github.event.pull_request.head.repo.fork }}
         run: |
           BASE_NOTE=""
           if [ "${{ steps.baseline.outputs.ref }}" != "main" ] && [ "${{ steps.baseline.outputs.ref }}" != "ulitebox" ]; then
@@ -141,3 +197,44 @@ jobs:
           -H "X-GitHub-Api-Version: 2022-11-28" \
           https://api.github.com/repos/${{ github.repository_owner }}/${{ github.event.repository.name }}/issues/${{ github.event.number }}/comments \
           -d "$(printf '%s' "$BODY" | jq -sR '{body: .}')"
+      - name: Require documentation from fork
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
+        env:
+          API_URL: ${{ github.api_url }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          BASE_NOTE=""
+          if [ "${{ steps.baseline.outputs.ref }}" != "main" ] && [ "${{ steps.baseline.outputs.ref }}" != "ulitebox" ]; then
+            BASE_NOTE=":information_source: **Note:** This semver check was run against the \`${{ steps.baseline.outputs.ref }}\` branch, not \`main\` or \`ulitebox\`.\n\n"
+          fi
+          if [ "${{ steps.packages.outputs.has_packages }}" != "true" ]; then
+            BODY="$(echo -e "${BASE_NOTE}"':robot: SemverChecks :robot: No semver-relevant crate changes detected; skipped cargo-semver-checks.')"
+          elif [ -s /tmp/semver-checks-stdout ]; then
+            BODY="$(echo -e "${BASE_NOTE}"':robot: SemverChecks :robot: :warning: Potential breaking API changes detected :warning:\n\n<details><summary>Click for details</summary>\n\n```'"$(cat /tmp/semver-checks-stdout)"'\n```\n</details>')"
+          else
+            BODY="$(echo -e "${BASE_NOTE}"':robot: SemverChecks :robot: No breaking API changes detected\n\nNote: this does not mean API is unchanged, or even that there are no breaking changes; simply, none of the detections triggered.')"
+          fi
+          PREFIX='Documenting semver-checks CI text here:'
+          COMMENTS=$(curl --fail-with-body -sS \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H 'Accept: application/vnd.github+json' \
+            "$API_URL/repos/$REPOSITORY/issues/$PR_NUMBER/comments?per_page=100&sort=created&direction=desc")
+          HAS_SEMVER_COMMENT=$(jq -r '[.[] | select(.body | contains(":robot: SemverChecks :robot:"))] | length > 0' <<<"$COMMENTS")
+          if [ "$HAS_SEMVER_COMMENT" = "false" ] && [ ! -s /tmp/semver-checks-stdout ]; then
+            echo 'No breaking changes and no prior semver-checks comment; documentation is unnecessary.'
+            exit 0
+          fi
+          LAST=$(jq -r --arg prefix "$PREFIX" '[.[] | select(.body | startswith($prefix))] | last | if . then .body else "" end' <<<"$COMMENTS")
+          EXPECTED=$(printf '%s\n\n%s' "$PREFIX" "$BODY")
+          if [ "$LAST" != "$EXPECTED" ]; then
+            echo 'The latest semver documentation comment is missing or out of date.' >&2
+            {
+              printf '## Semver-checks documentation required\n\n'
+              printf 'Copy and paste the following as a comment on the PR (not in the PR description):\n\n'
+              printf '````markdown\n%s\n````\n' "$EXPECTED"
+            } >> "$GITHUB_STEP_SUMMARY"
+            printf '\nCopy and paste this as a comment on the PR (not in the PR description):\n\n```markdown\n%s\n```\n' "$EXPECTED"
+            exit 1
+          fi
