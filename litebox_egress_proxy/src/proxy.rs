@@ -17,11 +17,11 @@ use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Empty};
 use hyper::body::{Bytes, Incoming};
 use hyper::client::conn::http1 as client_http1;
-use hyper::header::{self, HeaderValue};
+use hyper::header::{self, HeaderName, HeaderValue};
 use hyper::http::uri::Authority;
 use hyper::server::conn::http1 as server_http1;
 use hyper::service::service_fn;
-use hyper::{Method, Request, Response, StatusCode, Uri, Version};
+use hyper::{HeaderMap, Method, Request, Response, StatusCode, Uri, Version};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -29,7 +29,6 @@ use tokio::time::timeout;
 
 use crate::authority::{DEFAULT_HTTP_PORT, RequestAuthority, parse_authority};
 use crate::connector::{BoxedUpstreamStream, UPSTREAM_CONNECT_TIMEOUT, UpstreamConnector};
-use crate::headers::prepare_for_forwarding;
 use crate::idle_timeout::IdleTimeoutStream;
 use crate::policy::HostPolicy;
 
@@ -38,6 +37,17 @@ const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_HEADER_FIELDS: usize = 100;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const REQUEST_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const HOP_BY_HOP_HEADERS: [&str; 9] = [
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
 
 type BoxError = Box<dyn StdError + Send + Sync>;
 type ProxyBody = BoxBody<Bytes, BoxError>;
@@ -203,6 +213,34 @@ async fn forward_to_upstream(
         return status_response(StatusCode::BAD_GATEWAY);
     }
     Response::from_parts(parts, body.map_err(BoxError::from).boxed())
+}
+
+fn prepare_for_forwarding(headers: &mut HeaderMap) -> bool {
+    let mut connection_named = Vec::new();
+    for value in headers.get_all(header::CONNECTION) {
+        let Ok(text) = value.to_str() else {
+            return false;
+        };
+        for token in text.split(',') {
+            let token = token.trim();
+            if token.is_empty() {
+                return false;
+            }
+            let Ok(name) = HeaderName::from_bytes(token.as_bytes()) else {
+                return false;
+            };
+            connection_named.push(name);
+        }
+    }
+
+    for name in connection_named {
+        headers.remove(name);
+    }
+    for name in HOP_BY_HOP_HEADERS {
+        headers.remove(name);
+    }
+    headers.remove(header::CONTENT_LENGTH);
+    true
 }
 
 async fn handle_connect(

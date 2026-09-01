@@ -16,7 +16,6 @@ pub mod connector;
 pub mod policy;
 pub mod proxy;
 
-mod headers;
 mod idle_timeout;
 
 use std::io::{self, Write};

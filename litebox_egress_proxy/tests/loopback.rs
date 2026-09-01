@@ -166,13 +166,31 @@ fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
-async fn recording_upstream() -> (SocketAddr, oneshot::Receiver<String>) {
+async fn echo_upstream() -> SocketAddr {
+    let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("echo listener");
+    let address = listener.local_addr().expect("echo address");
+
+    tokio::spawn(async move {
+        while let Ok((mut stream, _peer)) = listener.accept().await {
+            tokio::spawn(async move {
+                let (mut reader, mut writer) = stream.split();
+                let _ = tokio::io::copy(&mut reader, &mut writer).await;
+            });
+        }
+    });
+
+    address
+}
+
+#[tokio::test]
+async fn http_request_is_rewritten_and_relayed() {
     let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
         .await
         .expect("upstream listener");
-    let address = listener.local_addr().expect("upstream address");
-    let (sender, receiver) = oneshot::channel();
-
+    let upstream = listener.local_addr().expect("upstream address");
+    let (sender, requests) = oneshot::channel();
     tokio::spawn(async move {
         let Ok((mut stream, _peer)) = listener.accept().await else {
             return;
@@ -212,30 +230,6 @@ async fn recording_upstream() -> (SocketAddr, oneshot::Receiver<String>) {
             .await;
     });
 
-    (address, receiver)
-}
-
-async fn echo_upstream() -> SocketAddr {
-    let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
-        .await
-        .expect("echo listener");
-    let address = listener.local_addr().expect("echo address");
-
-    tokio::spawn(async move {
-        while let Ok((mut stream, _peer)) = listener.accept().await {
-            tokio::spawn(async move {
-                let (mut reader, mut writer) = stream.split();
-                let _ = tokio::io::copy(&mut reader, &mut writer).await;
-            });
-        }
-    });
-
-    address
-}
-
-#[tokio::test]
-async fn http_request_is_rewritten_and_relayed() {
-    let (upstream, requests) = recording_upstream().await;
     let proxy = TestProxy::start(
         &["allowed.example:80"],
         &[("allowed.example", 80, upstream)],
