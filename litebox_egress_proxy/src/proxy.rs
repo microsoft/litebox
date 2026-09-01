@@ -329,10 +329,7 @@ mod tests {
 
     #[test]
     fn upstream_failures_map_to_statuses() {
-        assert_eq!(
-            UpstreamFailure::Failed.status(),
-            StatusCode::BAD_GATEWAY
-        );
+        assert_eq!(UpstreamFailure::Failed.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(
             UpstreamFailure::TimedOut.status(),
             StatusCode::GATEWAY_TIMEOUT

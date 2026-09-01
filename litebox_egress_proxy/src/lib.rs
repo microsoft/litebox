@@ -7,6 +7,8 @@
 //! resolver, then connected using the returned numeric addresses. CONNECT
 //! tunnels relay bytes without inspecting or terminating TLS.
 
+extern crate alloc;
+
 pub mod authority;
 pub mod config;
 pub mod headers;

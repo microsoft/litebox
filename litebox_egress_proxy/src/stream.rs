@@ -260,5 +260,4 @@ mod tests {
             assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         });
     }
-
 }
