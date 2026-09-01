@@ -231,10 +231,17 @@ impl SessionMap {
     }
 
     /// Insert a live session into the map.
-    fn insert_live(&self, session_id: u32, instance: Arc<TaInstance>) {
-        self.inner
-            .lock()
-            .insert(session_id, SessionEntry::Live(instance));
+    fn insert_live(
+        &self,
+        session_id: u32,
+        instance: Arc<TaInstance>,
+    ) -> Result<(), OpteeSmcReturnCode> {
+        let mut inner = self.inner.lock();
+        inner
+            .try_reserve(1)
+            .map_err(|_| OpteeSmcReturnCode::ENomem)?;
+        inner.insert(session_id, SessionEntry::Live(instance));
+        Ok(())
     }
 
     /// Remove a session from the map.
@@ -297,11 +304,6 @@ impl SingleInstanceCache {
     /// Get a cached single-instance TA by UUID.
     fn get(&self, uuid: &TeeUuid) -> Option<Arc<TaInstance>> {
         self.inner.lock().get(uuid).cloned()
-    }
-
-    /// Cache a single-instance TA by UUID.
-    fn insert(&self, uuid: TeeUuid, instance: Arc<TaInstance>) {
-        self.inner.lock().insert(uuid, instance);
     }
 
     /// Evict only if the cached instance matches `task_page_table_id`.
@@ -523,7 +525,11 @@ impl SessionManager {
         // The id pool's hint+wrap allocator defers reuse of recycled ids,
         // so a freshly-allocated id can never collide with a marker slot
         // that's still held by a previous owner.
-        let inserted = self.active_sessions.lock().insert(session_id);
+        let mut active_sessions = self.active_sessions.lock();
+        active_sessions
+            .try_reserve(1)
+            .map_err(|_| OpteeSmcReturnCode::ENomem)?;
+        let inserted = active_sessions.insert(session_id);
         if !inserted && !cfg!(debug_assertions) {
             litebox_util_log::warn!(session_id = session_id; "freshly-allocated session_id collided with an active marker");
         }
@@ -567,14 +573,22 @@ impl SessionManager {
     }
 
     /// Try to take the per-UUID serialization state non-blockingly.
-    fn try_acquire_uuid_lock(&self, uuid: TeeUuid) -> Option<HeldUuidLock> {
+    fn try_acquire_uuid_lock(
+        &self,
+        uuid: TeeUuid,
+    ) -> Result<Option<HeldUuidLock>, OpteeSmcReturnCode> {
         let mut locks = self.single_instance_locks.lock();
+        if !locks.contains_key(&uuid) {
+            locks
+                .try_reserve(1)
+                .map_err(|_| OpteeSmcReturnCode::ENomem)?;
+        }
         let held = locks.entry(uuid).or_insert(false);
         if *held {
-            None
+            Ok(None)
         } else {
             *held = true;
-            Some(HeldUuidLock::SingleInstance(uuid))
+            Ok(Some(HeldUuidLock::SingleInstance(uuid)))
         }
     }
 
@@ -617,7 +631,7 @@ impl SessionManager {
     fn try_acquire_for_open(&self, uuid: TeeUuid) -> Result<SessionToken<'_>, OpteeSmcReturnCode> {
         let uuid_lock = match self.get_known_flags(&uuid) {
             Some(flags) if flags.is_single_instance() => Some(
-                self.try_acquire_uuid_lock(uuid)
+                self.try_acquire_uuid_lock(uuid)?
                     .ok_or(OpteeSmcReturnCode::EThreadLimit)?,
             ),
             Some(_) => None,
@@ -675,9 +689,16 @@ impl SessionManager {
         let pre_marker_uuid = entry.ta_uuid();
         let pre_marker_single = entry.ta_flags().is_single_instance();
 
-        if !self.active_sessions.lock().insert(session_id) {
+        let mut active_sessions = self.active_sessions.lock();
+        if active_sessions.contains(&session_id) {
             return Err(OpteeSmcReturnCode::EThreadLimit);
         }
+        active_sessions
+            .try_reserve(1)
+            .map_err(|_| OpteeSmcReturnCode::ENomem)?;
+        let inserted = active_sessions.insert(session_id);
+        debug_assert!(inserted);
+        drop(active_sessions);
         let mut token = SessionToken {
             manager: self,
             uuid_lock: None,
@@ -691,7 +712,7 @@ impl SessionManager {
         // token's `Drop` releases the marker we already took.
         if pre_marker_single {
             token.uuid_lock = Some(
-                self.try_acquire_uuid_lock(pre_marker_uuid)
+                self.try_acquire_uuid_lock(pre_marker_uuid)?
                     .ok_or(OpteeSmcReturnCode::EThreadLimit)?,
             );
         }
@@ -758,11 +779,9 @@ impl SessionManager {
     /// channel, so concurrent `with_ta` calls for different UUIDs cannot
     /// interfere with each other's adoptions.
     ///
-    /// `try_acquire_uuid_lock` succeeds only on the load-lock path (caller
-    /// holds `ta_load_lock`, no sessions or `known_flags` entry for
-    /// `uuid` yet). On the known-cache-evicted path the caller already
-    /// holds the per-UUID state and acquisition returns `None`, so
-    /// nothing changes (the caller's existing lock is sufficient).
+    /// Per-UUID state is created only on the load-lock path (where there
+    /// are no sessions or `known_flags` entry for `uuid`). On the
+    /// known-cache-evicted path the caller already holds the existing state.
     pub fn register_new_session(
         &self,
         session_id: u32,
@@ -770,7 +789,7 @@ impl SessionManager {
         loaded_program: alloc::boxed::Box<LoadedProgram>,
         task_page_table_id: usize,
         ta_uuid: TeeUuid,
-    ) {
+    ) -> Result<(), OpteeSmcReturnCode> {
         let ta_flags = loaded_program.ta_flags;
         let arc = Arc::new(TaInstance {
             shim,
@@ -779,19 +798,43 @@ impl SessionManager {
             ta_uuid,
         });
 
-        // Pre-hold per-UUID state for atomic unknown→per-UUID transition
-        // (see method doc). On known-cache-evicted paths this returns
-        // `None` because the caller already owns the per-UUID state.
+        // Keep the guards held so the reserved capacity cannot be consumed concurrently.
+        let mut sessions = self.sessions.inner.lock();
+        sessions
+            .try_reserve(1)
+            .map_err(|_| OpteeSmcReturnCode::ENomem)?;
+        let mut known_flags = self.known_flags.lock();
+        if !known_flags.contains_key(&ta_uuid) {
+            known_flags
+                .try_reserve(1)
+                .map_err(|_| OpteeSmcReturnCode::ENomem)?;
+        }
+        let mut single_instance_locks = self.single_instance_locks.lock();
+        let mut single_instance_cache = self.single_instance_cache.inner.lock();
         if ta_flags.is_single_instance() {
-            let _ = self.try_acquire_uuid_lock(ta_uuid);
+            if !single_instance_locks.contains_key(&ta_uuid) {
+                single_instance_locks
+                    .try_reserve(1)
+                    .map_err(|_| OpteeSmcReturnCode::ENomem)?;
+            }
+            single_instance_cache
+                .try_reserve(1)
+                .map_err(|_| OpteeSmcReturnCode::ENomem)?;
         }
 
-        self.sessions.insert_live(session_id, arc.clone());
+        // Pre-hold per-UUID state for atomic unknown→per-UUID transition
+        // (see method doc). On known-cache-evicted paths the existing state
+        // remains held.
         if ta_flags.is_single_instance() {
-            self.single_instance_cache.insert(ta_uuid, arc);
+            *single_instance_locks.entry(ta_uuid).or_insert(false) = true;
+        }
+        sessions.insert(session_id, SessionEntry::Live(arc.clone()));
+        if ta_flags.is_single_instance() {
+            single_instance_cache.insert(ta_uuid, arc);
         }
         // Publish `known_flags` last — this is the gate other openers check.
-        self.known_flags.lock().entry(ta_uuid).or_insert(ta_flags);
+        known_flags.entry(ta_uuid).or_insert(ta_flags);
+        Ok(())
     }
 
     /// Register a session that re-uses an existing single-instance TA.
@@ -810,15 +853,23 @@ impl SessionManager {
             .ok_or(OpteeSmcReturnCode::EBadCmd)?;
         // `known_flags` is already populated for this UUID — sibling path
         // implies the instance was previously registered.
-        self.sessions.insert_live(session_id, arc);
-        Ok(())
+        self.sessions.insert_live(session_id, arc)
     }
 
     /// Record the client identity for `session_id`.
-    pub fn set_session_client_identity(&self, session_id: u32, identity: Option<TeeIdentity>) {
-        self.session_client_identities
-            .lock()
-            .insert(session_id, identity.unwrap_or(ANONYMOUS_CLIENT_IDENTITY));
+    pub fn set_session_client_identity(
+        &self,
+        session_id: u32,
+        identity: Option<TeeIdentity>,
+    ) -> Result<(), OpteeSmcReturnCode> {
+        let mut identities = self.session_client_identities.lock();
+        if !identities.contains_key(&session_id) {
+            identities
+                .try_reserve(1)
+                .map_err(|_| OpteeSmcReturnCode::ENomem)?;
+        }
+        identities.insert(session_id, identity.unwrap_or(ANONYMOUS_CLIENT_IDENTITY));
+        Ok(())
     }
 
     /// The client identity recorded for `session_id`, or the anonymous public
@@ -1019,13 +1070,15 @@ mod tests {
         task_page_table_id: usize,
         ta_uuid: TeeUuid,
     ) {
-        manager.register_new_session(
-            session_id,
-            make_shim(),
-            make_loaded_program(ta_flags),
-            task_page_table_id,
-            ta_uuid,
-        );
+        manager
+            .register_new_session(
+                session_id,
+                make_shim(),
+                make_loaded_program(ta_flags),
+                task_page_table_id,
+                ta_uuid,
+            )
+            .unwrap();
         if ta_flags.is_single_instance()
             && let Some(held) = manager.single_instance_locks.lock().get_mut(&ta_uuid)
         {
@@ -1108,7 +1161,7 @@ mod tests {
                     make_loaded_program(TaFlags::default()),
                     80,
                     uuid_multi,
-                );
+                )?;
                 Ok(())
             })
             .unwrap();
@@ -1141,7 +1194,7 @@ mod tests {
                     make_loaded_program(single_instance_flags()),
                     90,
                     uuid,
-                );
+                )?;
                 Ok(())
             })
             .unwrap();
@@ -1150,7 +1203,7 @@ mod tests {
             manager.single_instance_locks.lock().get(&uuid),
             Some(&false)
         );
-        assert!(manager.try_acquire_uuid_lock(uuid).is_some());
+        assert!(manager.try_acquire_uuid_lock(uuid).unwrap().is_some());
     }
 
     /// A concurrent `with_ta` for an unrelated UUID must NOT adopt or
@@ -1167,7 +1220,12 @@ mod tests {
         // Simulate the "lock pre-taken during a first-load" state. This
         // mirrors what `register_new_session` does mid-first-load before
         // `with_ta` adopts.
-        assert!(manager.try_acquire_uuid_lock(uuid_locked).is_some());
+        assert!(
+            manager
+                .try_acquire_uuid_lock(uuid_locked)
+                .unwrap()
+                .is_some()
+        );
 
         // A `with_ta` call for a completely different UUID must not touch
         // `uuid_locked`'s lock. The closure registers nothing, but the

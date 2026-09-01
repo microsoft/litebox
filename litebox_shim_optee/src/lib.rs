@@ -184,8 +184,8 @@ struct GlobalState {
 impl GlobalState {
     /// Store the TA binary associated with the given TA UUID.
     ///
-    /// Returns `true` if the binary was successfully stored, `false` if the binary's
-    /// UUID (from `.ta_head` section) doesn't match the provided UUID or parsing failed.
+    /// Returns `true` if the binary was successfully stored. Returns `false` if parsing or
+    /// allocation fails, or if the binary's UUID doesn't match the provided UUID.
     pub(crate) fn store_ta_bin(&self, ta_uuid: &TeeUuid, ta_bin: &[u8]) -> bool {
         self.ta_uuid_map.insert(*ta_uuid, ta_bin.into())
     }
@@ -304,8 +304,8 @@ impl OpteeShim {
 
     /// Store a TA binary associated with the given TA UUID.
     ///
-    /// Returns `true` if the binary was successfully stored, `false` if the binary's
-    /// UUID (from `.ta_head` section) doesn't match the provided UUID or parsing failed.
+    /// Returns `true` if the binary was successfully stored. Returns `false` if parsing or
+    /// allocation fails, or if the binary's UUID doesn't match the provided UUID.
     pub fn store_ta_bin(&self, ta_uuid: &TeeUuid, ta_bin: &[u8]) -> bool {
         self.0.store_ta_bin(ta_uuid, ta_bin)
     }
@@ -1069,19 +1069,22 @@ impl TeeObjMap {
         }
     }
 
-    pub fn allocate(&self, tee_obj: &TeeObj) -> TeeObjHandle {
+    pub fn allocate(&self, tee_obj: &TeeObj) -> Result<TeeObjHandle, TeeResult> {
         let mut inner = self.inner.lock();
         let handle = match inner.keys().max() {
             Some(max_handle) => TeeObjHandle(max_handle.0 + 1),
             None => TeeObjHandle(1), // start from 1 since 0 means an invalid handle
         };
+        inner.try_reserve(1).map_err(|_| TeeResult::OutOfMemory)?;
         inner.insert(handle, tee_obj.clone());
-        handle
+        Ok(handle)
     }
 
-    pub fn replace(&self, handle: TeeObjHandle, tee_obj: &TeeObj) {
+    pub fn replace(&self, handle: TeeObjHandle, tee_obj: &TeeObj) -> Result<(), TeeResult> {
         let mut inner = self.inner.lock();
+        inner.try_reserve(1).map_err(|_| TeeResult::OutOfMemory)?;
         inner.insert(handle, tee_obj.clone());
+        Ok(())
     }
 
     pub fn populate(
@@ -1239,14 +1242,15 @@ impl TeeCrypStateMap {
         }
     }
 
-    pub fn allocate(&self, tee_cryp_state: &TeeCrypState) -> TeeCrypStateHandle {
+    pub fn allocate(&self, tee_cryp_state: &TeeCrypState) -> Result<TeeCrypStateHandle, TeeResult> {
         let mut inner = self.inner.lock();
         let handle = match inner.keys().max() {
             Some(max_handle) => TeeCrypStateHandle(max_handle.0 + 1),
             None => TeeCrypStateHandle(1), // start from 1 since 0 means an invalid handle
         };
+        inner.try_reserve(1).map_err(|_| TeeResult::OutOfMemory)?;
         inner.insert(handle, tee_cryp_state.clone());
-        handle
+        Ok(handle)
     }
 
     pub fn set_cipher(&self, handle: TeeCrypStateHandle, cipher: &Cipher) -> Result<(), TeeResult> {
@@ -1299,13 +1303,14 @@ impl TaHandleMap {
         }
     }
 
-    pub(crate) fn insert(&self, uuid: TeeUuid) -> u32 {
+    pub(crate) fn insert(&self, uuid: TeeUuid) -> Result<u32, TeeResult> {
+        let mut inner = self.inner.lock();
+        inner.try_reserve(1).map_err(|_| TeeResult::OutOfMemory)?;
         let handle = self
             .next_handle
             .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
-        let mut inner = self.inner.lock();
         inner.insert(handle, uuid);
-        handle
+        Ok(handle)
     }
 
     pub(crate) fn get(&self, handle: u32) -> Option<TeeUuid> {
@@ -1348,7 +1353,11 @@ impl TaUuidMap {
             return false;
         }
 
-        let _replaced = self.inner.write().insert(
+        let mut inner = self.inner.write();
+        if !inner.contains_key(&uuid) && inner.try_reserve(1).is_err() {
+            return false;
+        }
+        let _replaced = inner.insert(
             uuid,
             TaInfo {
                 binary: ta_bin,

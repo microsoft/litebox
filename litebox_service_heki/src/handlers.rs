@@ -210,7 +210,10 @@ impl<P: Vtl0Gate> Heki<P> {
             let patch_info_buf = &patch_info_mem[..];
             self.precomputed_patches
                 .insert_patch_data_from_bytes(patch_info_buf, None)
-                .map_err(|_| VsmError::Vtl0CopyFailed)?;
+                .map_err(|error| match error {
+                    crate::PatchDataMapError::AllocationFailed => VsmError::AllocationFailed,
+                    _ => VsmError::Vtl0CopyFailed,
+                })?;
         }
 
         if kinfo_mem.is_empty() || kdata_mem.is_empty() {
@@ -376,7 +379,12 @@ impl<P: Vtl0Gate> Heki<P> {
                             patch_info_buf,
                             Some(&mut module_memory_metadata),
                         )
-                        .map_err(|_| VsmError::Vtl0CopyFailed)?;
+                        .map_err(|error| match error {
+                            crate::PatchDataMapError::AllocationFailed => {
+                                VsmError::AllocationFailed
+                            }
+                            _ => VsmError::Vtl0CopyFailed,
+                        })?;
                 }
                 Ok(())
             })?;
@@ -385,7 +393,7 @@ impl<P: Vtl0Gate> Heki<P> {
         // register the module memory in the global map and obtain a unique token for it
         let token = self
             .module_memory_metadata
-            .register_module_memory_metadata(module_memory_metadata);
+            .register_module_memory_metadata(module_memory_metadata)?;
         Ok(token)
     }
 
@@ -705,6 +713,7 @@ fn copy_heki_pages_from_vtl0<P: Vtl0Gate>(
     let mut heki_pages = Vec::new();
     heki_pages.try_reserve(nranges.trunc()).ok()?;
     let mut visited_pages = HashSet::new();
+    visited_pages.try_reserve(nranges.trunc()).ok()?;
     let mut range: u64 = 0;
 
     let mut cur_pa = PhysAddr::try_new(pa).ok()?;

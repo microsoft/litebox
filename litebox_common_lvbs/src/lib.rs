@@ -191,6 +191,9 @@ pub enum VsmError {
     InvalidPhysicalAddress,
 
     // Memory/Data Errors
+    #[error("memory allocation failed")]
+    AllocationFailed,
+
     #[error("invalid memory attributes")]
     MemoryAttributeInvalid,
 
@@ -309,6 +312,8 @@ impl From<VerificationError> for VsmError {
 impl From<VsmError> for Errno {
     fn from(e: VsmError) -> Self {
         match e {
+            VsmError::AllocationFailed => Errno::ENOMEM,
+
             // Address/pointer errors and memory copy failures - memory access fault
             VsmError::InvalidInputAddress
             | VsmError::InvalidPhysicalAddress

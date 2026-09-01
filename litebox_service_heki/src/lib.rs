@@ -227,7 +227,7 @@ impl ModuleMemoryMetadataMap {
     pub(crate) fn register_module_memory_metadata(
         &self,
         module_memory: ModuleMemoryMetadata,
-    ) -> i64 {
+    ) -> Result<i64, VsmError> {
         let key = self.gen_unique_key();
 
         let mut map = self.inner.lock();
@@ -235,9 +235,10 @@ impl ModuleMemoryMetadataMap {
             !map.contains_key(&key),
             "HEKI: Key {key} already exists in the module memory map",
         );
+        map.try_reserve(1).map_err(|_| VsmError::AllocationFailed)?;
         let _ = map.insert(key, module_memory);
 
-        key
+        Ok(key)
     }
 
     pub(crate) fn remove(&self, key: i64) -> bool {
@@ -804,6 +805,9 @@ impl PatchDataMap {
 
         // Commit every parsed patch and record its targets for later unload cleanup.
         let mut inner = self.inner.write();
+        inner
+            .try_reserve(parsed.len())
+            .map_err(|_| PatchDataMapError::AllocationFailed)?;
         for (target, patch) in parsed {
             inner.insert(target, patch);
             if let Some(ref mut mod_mem_meta) = module_memory_metadata {
@@ -819,6 +823,8 @@ impl PatchDataMap {
 #[derive(Debug, Error, PartialEq)]
 #[non_exhaustive]
 pub(crate) enum PatchDataMapError {
+    #[error("memory allocation failed")]
+    AllocationFailed,
     #[error("invalid HEKI patch info")]
     InvalidHekiPatchInfo,
     #[error("invalid HEKI patch")]
@@ -926,7 +932,9 @@ impl SymbolTable {
         let mut kinfo_addr = start;
         let ksym_count = kinfo_len / HekiKernelSymbol::KSYM_LEN;
         let mut inner = self.inner.write();
-        inner.reserve(ksym_count);
+        inner
+            .try_reserve(ksym_count)
+            .map_err(|_| VsmError::AllocationFailed)?;
 
         for _ in 0..ksym_count {
             let (name, sym) = Symbol::from_bytes(kinfo_offset, kinfo_addr, buf)?;

@@ -64,7 +64,7 @@ impl Task {
             },
         );
 
-        let handle = tee_cryp_state_map.allocate(&cryp_state);
+        let handle = tee_cryp_state_map.allocate(&cryp_state)?;
         state
             .write_at_offset(0, handle)
             .ok_or(TeeResult::BadParameters)?;
@@ -230,7 +230,7 @@ impl Task {
     ) -> Result<(), TeeResult> {
         let tee_obj_map = &self.tee_obj_map;
         let tee_obj = TeeObj::new(typ, max_size);
-        let handle = tee_obj_map.allocate(&tee_obj);
+        let handle = tee_obj_map.allocate(&tee_obj)?;
         if let Some(()) = obj.write_at_offset(0, handle) {
             Ok(())
         } else {
@@ -300,8 +300,7 @@ impl Task {
             return Err(TeeResult::BadParameters);
         }
 
-        tee_obj_map.replace(dst, &src_obj);
-        Ok(())
+        tee_obj_map.replace(dst, &src_obj)
     }
 
     #[allow(clippy::unnecessary_wraps)]

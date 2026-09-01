@@ -772,6 +772,9 @@ impl<const ALIGN: usize> ShmRefMap<ALIGN> {
         } else if guard.len() >= MAX_SHM_REF_MAP_ENTRIES {
             Err(OpteeSmcReturnCode::ENomem)
         } else {
+            guard
+                .try_reserve(1)
+                .map_err(|_| OpteeSmcReturnCode::ENomem)?;
             let _ = guard.insert(shm_ref, info);
             Ok(())
         }
@@ -816,6 +819,9 @@ impl<const ALIGN: usize> ShmRefMap<ALIGN> {
         let num_pages = aligned_size_usize / ALIGN;
         let mut pages = Vec::with_capacity(num_pages);
         let mut visited_pages_data = HashSet::new();
+        visited_pages_data
+            .try_reserve(num_pages.div_ceil(ShmRefPagesData::PAGELIST_ENTRIES_PER_PAGE))
+            .map_err(|_| OpteeSmcReturnCode::ENomem)?;
         let mut cur_addr: usize = shm_ref_pages_data_phys_addr.trunc();
         loop {
             if visited_pages_data.contains(&cur_addr) {

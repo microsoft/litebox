@@ -632,7 +632,7 @@ fn open_session_single_instance(
     let runner_session_id = session_token.session_id().unwrap();
 
     // Record the client identity before running OpenSession
-    session_manager().set_session_client_identity(runner_session_id, client_identity);
+    session_manager().set_session_client_identity(runner_session_id, client_identity)?;
 
     debug_serial_println!(
         "Reusing single-instance TA: uuid={:?}, task_pt_id={}, session_id={}",
@@ -860,7 +860,13 @@ fn open_session_new_instance(
     }
 
     // Record the client identity before running OpenSession
-    session_manager().set_session_client_identity(runner_session_id, client_identity);
+    if let Err(error) =
+        session_manager().set_session_client_identity(runner_session_id, client_identity)
+    {
+        // SAFETY: The session was not published.
+        unsafe { teardown_ta_page_table(&shim, task_pt_id) };
+        return Err(error);
+    }
 
     // Load TA context with parameters for OpenSession - pass actual session_id
     loaded_program.entrypoints.as_ref().ok_or_else(|| {
@@ -959,13 +965,17 @@ fn open_session_new_instance(
     })?;
 
     // Success: register the new session with the manager.
-    session_manager().register_new_session(
+    if let Err(error) = session_manager().register_new_session(
         runner_session_id,
-        shim,
+        shim.clone(),
         loaded_program,
         task_pt_id,
         ta_uuid,
-    );
+    ) {
+        // SAFETY: Registration failed before publishing the session.
+        unsafe { teardown_ta_page_table(&shim, task_pt_id) };
+        return Err(error);
+    }
     session_token.disarm();
 
     debug_serial_println!(

@@ -66,7 +66,9 @@ pub fn run_ta_with_test_commands(
                 },
                 ClientIdentityJson::to_tee_identity,
             );
-            session_manager().set_session_client_identity(open_session_id, Some(client_identity));
+            session_manager()
+                .set_session_client_identity(open_session_id, Some(client_identity))
+                .unwrap();
             let loaded = shim
                 .load_ldelf(ldelf_bin, ta_head.uuid)
                 .map_err(|_| {

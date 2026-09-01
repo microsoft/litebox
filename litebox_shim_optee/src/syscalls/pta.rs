@@ -150,6 +150,7 @@ impl Task {
             return Err(TeeResult::Busy);
         }
 
+        busy.try_reserve(1).map_err(|_| TeeResult::OutOfMemory)?;
         busy.insert(pta);
         Ok(Some(PtaBusyGuard { task: self, pta }))
     }
@@ -166,10 +167,14 @@ impl Task {
         // IDs or memory. The cap is checked while holding the lock, then the lock
         // is released before `open_session` runs.
         {
-            let pta_sessions = self.pta_sessions.lock();
+            let mut pta_sessions = self.pta_sessions.lock();
             if pta_sessions.len() >= MAX_PTA_SESSIONS_PER_TASK {
                 return Err(TeeResult::Busy);
             }
+            // Task serialization preserves this capacity until the insert below.
+            pta_sessions
+                .try_reserve(1)
+                .map_err(|_| TeeResult::OutOfMemory)?;
         }
 
         // Run the PTA hook without holding `pta_sessions`. OP-TEE `Task` is

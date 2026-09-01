@@ -255,7 +255,7 @@ impl Task {
         if self.global.get_ta_bin(&ta_uuid).is_none() {
             return Err(TeeResult::ItemNotFound);
         }
-        let new_handle = self.ta_handle_map.insert(ta_uuid);
+        let new_handle = self.ta_handle_map.insert(ta_uuid)?;
         let _ = handle.write_at_offset(0, new_handle);
 
         Ok(())
