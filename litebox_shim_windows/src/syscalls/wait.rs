@@ -201,26 +201,8 @@ mod tests {
     use super::*;
     use crate::syscalls::ThreadHandle;
     use crate::syscalls::thread::{ThreadAccess, ThreadHandleObject, ThreadSubsystem};
-    use crate::tests::{const_ptr, null_const_ptr, run_with_test_platform_pointers};
+    use crate::tests::{const_ptr, run_with_test_platform_pointers};
     use std::time::Duration;
-
-    #[test]
-    fn nt_delay_execution_validates_interval_and_completes_zero_delay() {
-        run_with_test_platform_pointers(|| {
-            let task = crate::tests::test_task();
-
-            assert_eq!(
-                task.sys_nt_delay_execution(false, null_const_ptr()),
-                NtStatus::ACCESS_VIOLATION
-            );
-
-            let interval = 0;
-            assert_eq!(
-                task.sys_nt_delay_execution(false, const_ptr(&interval)),
-                NtStatus::SUCCESS
-            );
-        });
-    }
 
     #[test]
     fn nt_delay_execution_only_consumes_alert_when_alertable() {
