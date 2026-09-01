@@ -225,19 +225,16 @@ impl PageTableManager {
 
     /// Returns a handle to the current page table.
     ///
-    /// This reads the current CR3 value and finds the matching page table.
-    /// If CR3 matches the base page table, returns that. Otherwise, it
-    /// looks up the task page table by physical frame.
+    /// This returns the base page table or the task page table retained by the
+    /// current core.
     ///
     /// # Panics
     ///
-    /// Panics if CR3 contains an unknown page table address (should never happen
-    /// in normal operation).
+    /// Panics if CR3 does not match the current core's retained page table.
     #[inline]
     pub fn current_page_table(&self) -> PageTableHandle<'_> {
         let (cr3_frame, _) = x86_64::registers::control::Cr3::read();
 
-        // Fast path: check base page table first (most common case)
         if self.base_page_table_frame == cr3_frame {
             return PageTableHandle::base(&self.base_page_table);
         }
@@ -247,9 +244,8 @@ impl PageTableManager {
             return PageTableHandle::task(pt);
         }
 
-        // CR3 doesn't match any known page table - this shouldn't happen
         unreachable!(
-            "CR3 contains unknown page table: {:?}",
+            "CR3 does not match the per-CPU page table: {:?}",
             cr3_frame.start_address()
         );
     }
