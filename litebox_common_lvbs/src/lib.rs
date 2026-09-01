@@ -30,6 +30,20 @@ pub const PRK_LEN: usize = 32;
 /// Length of the CRNG seed.
 pub const CRNG_SEED_LEN: usize = 32;
 
+/// Max length of the IDK_S public key.
+/// Currently, the key is an uncompressed SEC1 P-384 (97 bytes).
+pub const IDKS_PUB_MAX_LEN: usize = 97;
+
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, KnownLayout)]
+#[repr(C)]
+pub struct ExchangeSecretsRequest {
+    pub prk: [u8; PRK_LEN],
+    pub idks_seed: [u8; CRNG_SEED_LEN],
+    pub key_alg_variant: u32,
+    pub idks_pub_len: u32,
+    pub idks_pub: [u8; IDKS_PUB_MAX_LEN],
+}
+
 /// Maximum number of CPU cores addressable through the VTL0 `cpu_online_mask`
 /// ABI. Bounds how many bits of the mask VTL1 will honor when booting APs.
 pub const MAX_CORES: usize = 128;
