@@ -6,9 +6,9 @@
 use core::fmt;
 use core::ops::RangeInclusive;
 
-use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
+use hashbrown::HashMap;
 use thiserror::Error;
 
 const MAX_HOSTNAME_BYTES: usize = 253;
@@ -23,7 +23,7 @@ pub struct HostnameError;
 ///
 /// Canonicalization lowercases the name and removes at most one trailing dot.
 /// IP literals and legacy numeric IPv4 forms are rejected.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Hostname(String);
 
 impl Hostname {
@@ -132,7 +132,7 @@ pub struct PolicyError;
 /// An immutable, default-deny hostname and destination-port policy.
 #[derive(Clone, Debug)]
 pub struct HostPolicy {
-    entries: BTreeMap<Hostname, Vec<RangeInclusive<u16>>>,
+    entries: HashMap<Hostname, Vec<RangeInclusive<u16>>>,
 }
 
 impl HostPolicy {
@@ -141,7 +141,7 @@ impl HostPolicy {
     where
         S: AsRef<str>,
     {
-        let mut entries: BTreeMap<Hostname, Vec<RangeInclusive<u16>>> = BTreeMap::new();
+        let mut entries: HashMap<Hostname, Vec<RangeInclusive<u16>>> = HashMap::new();
         for rule in rules {
             let (host, ports) = parse_rule(rule.as_ref())?;
             entries.entry(host).or_default().push(ports);
