@@ -1,0 +1,11 @@
+[package]
+name = "litebox_egress_proxy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+hashbrown = "0.15.2"
+thiserror = { version = "2.0", default-features = false }
+
+[lints]
+workspace = true
