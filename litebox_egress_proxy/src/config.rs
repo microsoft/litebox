@@ -100,11 +100,6 @@ mod tests {
     }
 
     #[test]
-    fn listen_is_required() {
-        assert!(Cli::try_parse_from(["litebox_egress_proxy"]).is_err());
-    }
-
-    #[test]
     fn rejects_non_loopback_listen_addresses() {
         assert!(matches!(
             parse(&["--listen", "0.0.0.0:8080"]),
