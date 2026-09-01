@@ -263,7 +263,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
         } = task;
 
         let files = syscalls::file::FilesState::new(fs);
-        files.set_fd_limit(syscalls::process::RLIMIT_NOFILE_CUR);
+        files.set_max_fd(syscalls::process::RLIMIT_NOFILE_CUR - 1);
         let files = Arc::new(files);
         let credentials = Arc::new(syscalls::process::Credentials {
             uid,

@@ -91,7 +91,7 @@ pub(crate) struct FilesState<Platform: ShimPlatform> {
     pub(crate) fs: alloc::sync::Arc<LinuxFS<Platform>>,
     pub(crate) raw_descriptor_store:
         litebox::sync::RwLock<Platform, litebox::fd::RawDescriptorStorage>,
-    fd_limit: AtomicUsize,
+    max_fd: AtomicUsize,
 }
 
 impl<Platform: ShimPlatform> FilesState<Platform> {
@@ -101,12 +101,12 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
             raw_descriptor_store: litebox::sync::RwLock::new(
                 litebox::fd::RawDescriptorStorage::new(),
             ),
-            fd_limit: AtomicUsize::new(usize::MAX),
+            max_fd: AtomicUsize::new(usize::MAX),
         }
     }
 
-    pub(crate) fn set_fd_limit(&self, fd_limit: usize) {
-        self.fd_limit.store(fd_limit, Ordering::Relaxed);
+    pub(crate) fn set_max_fd(&self, max_fd: usize) {
+        self.max_fd.store(max_fd, Ordering::Relaxed);
     }
 
     // Returns Ok(raw_fd) if it fits within the max limits already set up; otherwise returns the
@@ -124,18 +124,18 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
         rds: &mut litebox::fd::RawDescriptorStorage,
         typed_fd: TypedFd<Subsystem>,
     ) -> Result<usize, TypedFd<Subsystem>> {
-        let fd_limit = self.fd_limit.load(Ordering::Relaxed);
-        self.insert_raw_fd_at_or_above_locked(rds, typed_fd, 0, fd_limit)
+        let max_fd = self.max_fd.load(Ordering::Relaxed);
+        self.insert_raw_fd_at_or_above_locked(rds, typed_fd, 0, max_fd)
     }
 
     fn insert_raw_fd_at_or_above<Subsystem: FdEnabledSubsystem>(
         &self,
         typed_fd: TypedFd<Subsystem>,
         min_fd: usize,
-        fd_limit: usize,
+        max_fd: usize,
     ) -> Result<usize, TypedFd<Subsystem>> {
         let mut rds = self.raw_descriptor_store.write();
-        self.insert_raw_fd_at_or_above_locked(&mut rds, typed_fd, min_fd, fd_limit)
+        self.insert_raw_fd_at_or_above_locked(&mut rds, typed_fd, min_fd, max_fd)
     }
 
     fn insert_raw_fd_at_or_above_locked<Subsystem: FdEnabledSubsystem>(
@@ -143,9 +143,9 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
         rds: &mut litebox::fd::RawDescriptorStorage,
         typed_fd: TypedFd<Subsystem>,
         min_fd: usize,
-        fd_limit: usize,
+        max_fd: usize,
     ) -> Result<usize, TypedFd<Subsystem>> {
-        if min_fd >= fd_limit {
+        if min_fd > max_fd {
             return Err(typed_fd);
         }
 
@@ -156,7 +156,7 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
             }
             raw_fd += 1;
         }
-        if raw_fd >= fd_limit {
+        if raw_fd > max_fd {
             return Err(typed_fd);
         }
         let success = rds.fd_into_specific_raw_integer(typed_fd, raw_fd);
@@ -2459,14 +2459,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
             target: DupFdRequest,
             close_typed_fd: impl FnOnce(TypedFd<S>),
         ) -> Result<usize, DupFdError> {
-            let fd_limit = files.fd_limit.load(Ordering::Relaxed);
+            let max_fd = files.max_fd.load(Ordering::Relaxed);
             match target {
                 DupFdRequest::Exact(target) | DupFdRequest::LowestAtOrAbove(target)
-                    if target >= fd_limit =>
+                    if target > max_fd =>
                 {
                     return Err(DupFdError::TargetFdExceedsLimit);
                 }
-                DupFdRequest::LowestAvailable if fd_limit == 0 => {
+                DupFdRequest::LowestAvailable if max_fd == 0 => {
                     return Err(DupFdError::TooManyFiles);
                 }
                 _ => {}
@@ -2486,7 +2486,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     target
                 }
                 DupFdRequest::LowestAvailable => {
-                    match files.insert_raw_fd_at_or_above(fd, 0, fd_limit) {
+                    match files.insert_raw_fd_at_or_above(fd, 0, max_fd) {
                         Ok(fd) => fd,
                         Err(fd) => {
                             close_typed_fd(fd);
@@ -2495,7 +2495,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     }
                 }
                 DupFdRequest::LowestAtOrAbove(min_fd) => {
-                    match files.insert_raw_fd_at_or_above(fd, min_fd, fd_limit) {
+                    match files.insert_raw_fd_at_or_above(fd, min_fd, max_fd) {
                         Ok(fd) => fd,
                         Err(fd) => {
                             close_typed_fd(fd);
