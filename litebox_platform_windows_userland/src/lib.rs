@@ -1653,6 +1653,10 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         //
         // To ensure future MEM_COMMIT calls on sub-ranges succeed, we always reserve the entire aligned range
         // (i.e., MEM_RESERVE size is also made aligned to system allocation granularity).
+        //
+        // TODO: Empty permissions cannot distinguish a reserve-only mapping from Windows
+        // MEM_COMMIT | PAGE_NOACCESS. Represent commitment separately from permissions before
+        // supporting committed inaccessible pages.
         let reserve_and_maybe_commit = |r: core::ops::Range<usize>,
                                         flags: Win32_Memory::PAGE_PROTECTION_FLAGS|
          -> *mut c_void {
