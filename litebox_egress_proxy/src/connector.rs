@@ -5,12 +5,16 @@
 
 use core::future::Future;
 use core::pin::Pin;
+use core::time::Duration;
 use std::io;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, lookup_host};
+use tokio::time::timeout;
 
 use crate::policy::Hostname;
+
+const UPSTREAM_ADDRESS_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A bidirectional upstream byte stream.
 pub trait UpstreamStream: AsyncRead + AsyncWrite + Send + Unpin {}
@@ -40,12 +44,23 @@ impl UpstreamConnector for TcpUpstreamConnector {
             let mut last_error = None;
 
             for address in addresses {
-                match TcpStream::connect(address).await {
-                    Ok(stream) => {
+                match timeout(
+                    UPSTREAM_ADDRESS_CONNECT_TIMEOUT,
+                    TcpStream::connect(address),
+                )
+                .await
+                {
+                    Ok(Ok(stream)) => {
                         stream.set_nodelay(true)?;
                         return Ok(Box::new(stream) as BoxedUpstreamStream);
                     }
-                    Err(error) => last_error = Some(error),
+                    Ok(Err(error)) => last_error = Some(error),
+                    Err(_elapsed) => {
+                        last_error = Some(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "upstream address connection timed out",
+                        ));
+                    }
                 }
             }
 

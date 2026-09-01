@@ -208,6 +208,9 @@ async fn connect_upstream(
     .await;
     match result {
         Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(error)) if error.kind() == io::ErrorKind::TimedOut => {
+            Err(StatusCode::GATEWAY_TIMEOUT)
+        }
         Ok(Err(_error)) => Err(StatusCode::BAD_GATEWAY),
         Err(_elapsed) => Err(StatusCode::GATEWAY_TIMEOUT),
     }
