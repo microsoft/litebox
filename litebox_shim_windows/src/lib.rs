@@ -2127,6 +2127,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 alertable,
                 timeout,
             } => self.sys_nt_wait_for_single_object(handle, alertable, timeout),
+            SyscallRequest::NtDelayExecution {
+                alertable,
+                delay_interval,
+            } => self.sys_nt_delay_execution(alertable, delay_interval),
             SyscallRequest::NtOpenThreadToken {
                 thread_handle,
                 desired_access,

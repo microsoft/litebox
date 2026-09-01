@@ -794,6 +794,10 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
         alertable: bool,
         timeout: Option<Platform::RawConstPointer<i64>>,
     },
+    NtDelayExecution {
+        alertable: bool,
+        delay_interval: Platform::RawConstPointer<i64>,
+    },
     NtOpenThreadToken {
         thread_handle: ThreadHandle,
         desired_access: u32,
@@ -1631,6 +1635,10 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 handle: { Handle::from_raw },
                 alertable: { |value: u8| value != 0 },
                 timeout:*,
+            })),
+            NtSysno::NtDelayExecution => Some(sys_req!(NtDelayExecution {
+                alertable: { |value: u8| value != 0 },
+                delay_interval:*,
             })),
             NtSysno::NtOpenThreadToken => Some(sys_req!(NtOpenThreadToken {
                 thread_handle: { ThreadHandle::from_raw },

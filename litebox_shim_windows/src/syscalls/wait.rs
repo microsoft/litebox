@@ -145,6 +145,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         }
     }
 
+    pub(crate) fn sys_nt_delay_execution(
+        &self,
+        alertable: bool,
+        delay_interval: ConstPtr<Platform, i64>,
+    ) -> NtStatus {
+        let Some(delay_interval) = delay_interval.read_at_offset(0) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        // TODO(windows-apc): deliver user APCs during alertable delays.
+        if alertable && self.thread_object.take_pending_thread_alert() {
+            return NtStatus::ALERTED;
+        }
+
+        match self.sleep(alertable, self.wait_timeout_duration(delay_interval)) {
+            WaitError::TimedOut => NtStatus::SUCCESS,
+            WaitError::Interrupted => NtStatus::ALERTED,
+        }
+    }
+
     fn duration_from_100ns(intervals: u64) -> core::time::Duration {
         const INTERVALS_PER_SECOND: u64 = 10_000_000;
 
@@ -172,5 +191,82 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             .unwrap_or_default();
         let windows_now = core::time::Duration::from_secs(WINDOWS_TO_UNIX_EPOCH_SECONDS) + unix_now;
         target.saturating_sub(windows_now)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::*;
+    use crate::syscalls::ThreadHandle;
+    use crate::syscalls::thread::{ThreadAccess, ThreadHandleObject, ThreadSubsystem};
+    use crate::tests::{const_ptr, run_with_test_platform_pointers};
+    use std::time::Duration;
+
+    #[test]
+    fn nt_delay_execution_only_consumes_alert_when_alertable() {
+        run_with_test_platform_pointers(|| {
+            let task = crate::tests::test_task();
+            let interval = 0;
+
+            assert_eq!(
+                task.sys_nt_alert_thread(crate::syscalls::ThreadHandle::CURRENT),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(
+                task.sys_nt_delay_execution(false, const_ptr(&interval)),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(
+                task.sys_nt_delay_execution(true, const_ptr(&interval)),
+                NtStatus::ALERTED
+            );
+            assert_eq!(
+                task.sys_nt_delay_execution(true, const_ptr(&interval)),
+                NtStatus::SUCCESS
+            );
+        });
+    }
+
+    #[test]
+    fn nt_delay_execution_alertable_wait_wakes_for_alert() {
+        run_with_test_platform_pointers(|| {
+            let alerter = crate::tests::test_task();
+            let waiter = alerter
+                .clone_for_test()
+                .expect("a live process should accept another thread");
+            let handle = alerter
+                .insert_typed_handle::<ThreadSubsystem<_>>(
+                    ThreadHandleObject {
+                        thread: Arc::clone(&waiter.thread_object),
+                    },
+                    ThreadAccess::ALERT.bits(),
+                    drop,
+                )
+                .unwrap();
+            let handle = ThreadHandle::from_raw(handle.as_raw());
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (result_tx, result_rx) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                run_with_test_platform_pointers(|| {
+                    waiter.publish_thread_handle();
+                    started_tx.send(()).unwrap();
+                    let interval = -100_000_000i64;
+                    result_tx
+                        .send(waiter.sys_nt_delay_execution(true, const_ptr(&interval)))
+                        .unwrap();
+                });
+            });
+
+            started_rx.recv().unwrap();
+            assert_eq!(alerter.sys_nt_alert_thread(handle), NtStatus::SUCCESS);
+            assert_eq!(
+                result_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                NtStatus::ALERTED
+            );
+            thread.join().unwrap();
+            assert_eq!(alerter.sys_nt_close(handle.as_handle()), NtStatus::SUCCESS);
+        });
     }
 }
