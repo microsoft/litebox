@@ -1645,15 +1645,16 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         debug_assert!(ALIGN.is_multiple_of(self.sys_info.read().unwrap().dwPageSize as usize));
         debug_assert_alignment!(suggested_range, ALIGN);
 
-        // A helper closure to reserve and commit memory in one go.
+        // A helper closure to reserve memory and commit it when accessible
+        // permissions are requested.
         //
         // Note that MEM_RESERVE requires the base address to be aligned to system allocation granularity,
         // while MEM_COMMIT only requires page-aligned address.
         //
         // To ensure future MEM_COMMIT calls on sub-ranges succeed, we always reserve the entire aligned range
         // (i.e., MEM_RESERVE size is also made aligned to system allocation granularity).
-        let reserve_and_commit = |r: core::ops::Range<usize>,
-                                  flags: Win32_Memory::PAGE_PROTECTION_FLAGS|
+        let reserve_and_maybe_commit = |r: core::ops::Range<usize>,
+                                        flags: Win32_Memory::PAGE_PROTECTION_FLAGS|
          -> *mut c_void {
             let aligned_start_addr = self.round_down_to_granu(r.start);
             let aligned_end_addr = self.round_up_to_granu(r.end);
@@ -1670,6 +1671,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             };
             if ptr.is_null() {
                 core::ptr::null_mut()
+            } else if flags == Win32_Memory::PAGE_NOACCESS {
+                ptr
             } else {
                 unsafe {
                     VirtualAlloc2(
@@ -1745,6 +1748,9 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                         unsafe { GetLastError() }
                                     );
                                 }
+                                if initial_permissions.is_empty() {
+                                    return Ok(true);
+                                }
                                 let ptr = unsafe {
                                     VirtualAlloc2(
                                         GetCurrentProcess(),
@@ -1760,8 +1766,10 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                             }
                             // In case the region is free, we need to reserve and commit it.
                             Win32_Memory::MEM_FREE => {
-                                let ptr =
-                                    reserve_and_commit(r.clone(), prot_flags(initial_permissions));
+                                let ptr = reserve_and_maybe_commit(
+                                    r.clone(),
+                                    prot_flags(initial_permissions),
+                                );
                                 !ptr.is_null()
                             }
                             _ => unimplemented!(
@@ -1782,7 +1790,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         }
 
         debug_assert!(base_addr.is_null());
-        let ptr = reserve_and_commit(0..size, prot_flags(initial_permissions));
+        let ptr = reserve_and_maybe_commit(0..size, prot_flags(initial_permissions));
         assert!(
             !ptr.is_null(),
             "VirtualAlloc2(RESERVE|COMMIT size=0x{:x}) failed: {}",
@@ -1831,17 +1839,36 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         process_memory_range_by_regions(
             range,
             |r, state| -> Result<bool, std::convert::Infallible> {
-                debug_assert_eq!(
-                    state,
-                    Win32_Memory::MEM_COMMIT,
-                    "Trying to change permissions on a non-committed region: {:p}-{:p}",
-                    r.start as *mut c_void,
-                    r.end as *mut c_void
-                );
-                let mut old_protect: u32 = 0;
-                Ok(unsafe {
-                    VirtualProtect(r.start as *mut c_void, r.len(), flags, &raw mut old_protect)
-                } != 0)
+                match state {
+                    Win32_Memory::MEM_RESERVE if flags == Win32_Memory::PAGE_NOACCESS => Ok(true),
+                    Win32_Memory::MEM_RESERVE => Ok(!unsafe {
+                        VirtualAlloc2(
+                            GetCurrentProcess(),
+                            r.start as *mut c_void,
+                            r.len(),
+                            Win32_Memory::MEM_COMMIT,
+                            flags,
+                            core::ptr::null_mut(),
+                            0,
+                        )
+                    }
+                    .is_null()),
+                    Win32_Memory::MEM_COMMIT => {
+                        let mut old_protect: u32 = 0;
+                        Ok(unsafe {
+                            VirtualProtect(
+                                r.start as *mut c_void,
+                                r.len(),
+                                flags,
+                                &raw mut old_protect,
+                            )
+                        } != 0)
+                    }
+                    _ => panic!(
+                        "Trying to change permissions on an unallocated region: {:p}-{:p}",
+                        r.start as *mut c_void, r.end as *mut c_void
+                    ),
+                }
             },
         )
         .expect("update_permissions failed");
