@@ -10,11 +10,11 @@ use std::io;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, lookup_host};
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout};
 
 use crate::policy::Hostname;
 
-const UPSTREAM_ADDRESS_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A bidirectional upstream byte stream.
 pub trait UpstreamStream: AsyncRead + AsyncWrite + Send + Unpin {}
@@ -40,16 +40,17 @@ pub struct TcpUpstreamConnector;
 impl UpstreamConnector for TcpUpstreamConnector {
     fn connect(&self, host: Hostname, port: u16) -> ConnectFuture<'_> {
         Box::pin(async move {
-            let addresses = lookup_host((host.as_str(), port)).await?;
+            let deadline = Instant::now() + UPSTREAM_CONNECT_TIMEOUT;
+            let addresses: Vec<_> = lookup_host((host.as_str(), port)).await?.collect();
+            let address_count = addresses.len();
             let mut last_error = None;
 
-            for address in addresses {
-                match timeout(
-                    UPSTREAM_ADDRESS_CONNECT_TIMEOUT,
-                    TcpStream::connect(address),
-                )
-                .await
-                {
+            for (index, address) in addresses.into_iter().enumerate() {
+                let attempts_left = u32::try_from(address_count - index).unwrap_or(u32::MAX);
+                let attempt_timeout =
+                    deadline.saturating_duration_since(Instant::now()) / attempts_left;
+
+                match timeout(attempt_timeout, TcpStream::connect(address)).await {
                     Ok(Ok(stream)) => {
                         stream.set_nodelay(true)?;
                         return Ok(Box::new(stream) as BoxedUpstreamStream);

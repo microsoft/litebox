@@ -25,14 +25,13 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 
 use crate::authority::{RequestAuthority, parse_authority};
-use crate::connector::{BoxedUpstreamStream, UpstreamConnector};
+use crate::connector::{BoxedUpstreamStream, UPSTREAM_CONNECT_TIMEOUT, UpstreamConnector};
 use crate::idle_timeout::IdleTimeoutStream;
 use crate::policy::HostPolicy;
 
 const MAX_CONCURRENT_CLIENT_CONNECTIONS: usize = 256;
 const MAX_REQUEST_HEADER_BYTES: usize = 16 * 1024;
 const MAX_HEADER_FIELDS: usize = 100;
-const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const REQUEST_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
