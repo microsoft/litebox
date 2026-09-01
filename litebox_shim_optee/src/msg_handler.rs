@@ -65,10 +65,6 @@ const MAX_NOTIF_VALUE: usize = 0;
 const MAX_SHM_MEMREF_SIZE: usize = 8 * 1024 * 1024;
 const MAX_SHM_REF_MAP_ENTRIES: usize = 1024;
 
-fn allocate_zeroed_vec(len: usize) -> Result<Vec<u8>, OpteeSmcReturnCode> {
-    u8::new_vec_zeroed(len).map_err(|_| OpteeSmcReturnCode::ENomem)
-}
-
 #[inline]
 fn page_align_down(address: u64) -> u64 {
     address & !(PAGE_SIZE as u64 - 1)
@@ -198,7 +194,7 @@ pub fn read_optee_msg_args_from_phys(
         main_max
     };
 
-    let mut blob = allocate_zeroed_vec(copy_size)?;
+    let mut blob = u8::new_vec_zeroed(copy_size).map_err(|_| OpteeSmcReturnCode::ENomem)?;
 
     let blob_ptr =
         NormalWorldConstPtr::<u8, PAGE_SIZE>::with_contiguous_pages(phys_addr, copy_size)
@@ -256,7 +252,7 @@ pub fn handle_optee_smc_args(
             let copy_size =
                 main_max + optee_msg_args_total_size(OpteeRpcArgs::MAX_RPC_ARG_PARAM_COUNT.trunc());
 
-            let mut blob = allocate_zeroed_vec(copy_size)?;
+            let mut blob = u8::new_vec_zeroed(copy_size).map_err(|_| OpteeSmcReturnCode::ENomem)?;
             shm_info.read_at(offset, &mut blob)?;
             let (msg_args, rpc_args) = parse_optee_msg_args(&blob, true)?;
 
@@ -570,7 +566,7 @@ fn build_memref_input(
     shm_info: &ShmInfo<PAGE_SIZE>,
     data_size: usize,
 ) -> Result<UteeParamOwned, OpteeSmcReturnCode> {
-    let mut data = allocate_zeroed_vec(data_size)?;
+    let mut data = u8::new_vec_zeroed(data_size).map_err(|_| OpteeSmcReturnCode::ENomem)?;
     shm_info.read_at(0, &mut data)?;
     Ok(UteeParamOwned::MemrefInput { data: data.into() })
 }
@@ -580,7 +576,7 @@ fn build_memref_inout(
     shm_info: &ShmInfo<PAGE_SIZE>,
     buffer_size: usize,
 ) -> Result<UteeParamOwned, OpteeSmcReturnCode> {
-    let mut buffer = allocate_zeroed_vec(buffer_size)?;
+    let mut buffer = u8::new_vec_zeroed(buffer_size).map_err(|_| OpteeSmcReturnCode::ENomem)?;
     shm_info.read_at(0, &mut buffer)?;
     Ok(UteeParamOwned::MemrefInout {
         data: buffer.into(),
