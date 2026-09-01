@@ -22,6 +22,7 @@ x86_64 = { version = "0.15.2", default-features = false, features = ["instructio
 [features]
 devbox = ["litebox_platform_lvbs/devbox"]
 preemption_test_quantum = ["litebox_platform_lvbs/preemption_test_quantum"]
+signed-ta-rsa = ["litebox_common_optee/signed-ta-rsa"]
 
 [lints]
 workspace = true
