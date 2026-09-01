@@ -98,7 +98,9 @@ pub fn parse_authority(
     let port = match port_part {
         Some(port) if port.contains(':') => return Err(AuthorityError),
         Some(port) => parse_port(port).map_err(|_| AuthorityError)?,
-        None => default_port.ok_or(AuthorityError)?,
+        None => default_port
+            .filter(|port| *port != 0)
+            .ok_or(AuthorityError)?,
     };
 
     // The hostname parser rejects IP literals and numeric forms, keeping
@@ -129,6 +131,7 @@ mod tests {
     fn applies_default_port_only_when_provided() {
         assert_eq!(authority("example.com", Some(DEFAULT_HTTP_PORT)).port(), 80);
         assert_eq!(parse_authority("example.com", None), Err(AuthorityError));
+        assert_eq!(parse_authority("example.com", Some(0)), Err(AuthorityError));
     }
 
     #[test]

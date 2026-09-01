@@ -84,7 +84,6 @@ impl Hostname {
         }
 
         let canonical = trimmed.to_ascii_lowercase();
-        let mut last_label = "";
         for label in canonical.split('.') {
             if label.is_empty() || label.len() > MAX_LABEL_BYTES {
                 return Err(HostnameError::LabelLength);
@@ -98,13 +97,11 @@ impl Hostname {
             if label.starts_with('-') || label.ends_with('-') {
                 return Err(HostnameError::LabelHyphen);
             }
-            last_label = label;
         }
 
-        // An all-digit rightmost label covers dotted-quad IPv4 literals and
-        // every other numeric-looking form. IPv6 literals and their brackets
-        // are already rejected by the label character check.
-        if last_label.bytes().all(|byte| byte.is_ascii_digit()) {
+        // Resolvers may accept legacy one-to-four-part IPv4 forms, including
+        // octal and hexadecimal components.
+        if is_ipv4_numeric_form(&canonical) {
             return Err(HostnameError::NumericForm);
         }
 
@@ -115,6 +112,50 @@ impl Hostname {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// Returns whether `host` is an IPv4 address in the historical `inet_aton`
+/// grammar.
+fn is_ipv4_numeric_form(host: &str) -> bool {
+    let mut values = [0_u64; 4];
+    let mut count = 0;
+
+    for component in host.split('.') {
+        if count == values.len() {
+            return false;
+        }
+        let Some(value) = parse_ipv4_component(component) else {
+            return false;
+        };
+        values[count] = value;
+        count += 1;
+    }
+
+    match count {
+        1 => u32::try_from(values[0]).is_ok(),
+        2 => u8::try_from(values[0]).is_ok() && values[1] <= 0x00ff_ffff,
+        3 => {
+            u8::try_from(values[0]).is_ok()
+                && u8::try_from(values[1]).is_ok()
+                && u16::try_from(values[2]).is_ok()
+        }
+        4 => values.iter().all(|value| u8::try_from(*value).is_ok()),
+        _ => false,
+    }
+}
+
+fn parse_ipv4_component(component: &str) -> Option<u64> {
+    let (digits, radix) = if let Some(hex) = component.strip_prefix("0x") {
+        (hex, 16)
+    } else if component.len() > 1 && component.starts_with('0') {
+        (component, 8)
+    } else {
+        (component, 10)
+    };
+
+    (!digits.is_empty())
+        .then(|| u64::from_str_radix(digits, radix).ok())
+        .flatten()
 }
 
 impl fmt::Display for Hostname {
@@ -393,6 +434,36 @@ mod tests {
         );
         assert_eq!(Hostname::parse("12345"), Err(HostnameError::NumericForm));
         assert_eq!(Hostname::parse("[::1]"), Err(HostnameError::LabelCharacter));
+    }
+
+    #[test]
+    fn hostname_distinguishes_legacy_ipv4_forms_from_dns_names() {
+        for numeric in [
+            "127.1",
+            "0177.0.0.1",
+            "0x7f000001",
+            "0x7f.0x0.0x0.0x1",
+            "127.0.0.0x1",
+            "4294967295",
+        ] {
+            assert_eq!(
+                Hostname::parse(numeric),
+                Err(HostnameError::NumericForm),
+                "{numeric}"
+            );
+        }
+
+        for hostname in [
+            "service.123",
+            "0xservice",
+            "09",
+            "1.2.3.09",
+            "08.1",
+            "4294967296",
+            "1.2.3.4.5",
+        ] {
+            assert!(Hostname::parse(hostname).is_ok(), "{hostname}");
+        }
     }
 
     #[test]
