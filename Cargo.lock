@@ -1541,7 +1541,6 @@ dependencies = [
 name = "litebox_egress_proxy"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "clap",
  "hashbrown",
  "http-body-util",

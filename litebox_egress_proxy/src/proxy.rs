@@ -12,9 +12,8 @@ use core::time::Duration;
 use std::io;
 use std::sync::Arc;
 
-use bytes::Bytes;
 use http_body_util::Empty;
-use hyper::body::Incoming;
+use hyper::body::{Bytes, Incoming};
 use hyper::header::{self, HeaderValue};
 use hyper::http::uri::Authority;
 use hyper::server::conn::http1 as server_http1;

@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bytes = { version = "1.10", default-features = false, features = ["std"] }
 clap = { version = "4.5", default-features = false, features = [
     "derive",
     "error-context",
@@ -21,7 +20,7 @@ hyper = { version = "1.8", default-features = false, features = [
 hyper-util = { version = "0.1.20", default-features = false, features = [
     "tokio",
 ] }
-thiserror = { version = "2.0", default-features = false, features = ["std"] }
+thiserror = { version = "2.0", default-features = false }
 tokio = { version = "1.50", default-features = false, features = [
     "io-util",
     "net",
@@ -32,14 +31,8 @@ tokio = { version = "1.50", default-features = false, features = [
 
 [dev-dependencies]
 tokio = { version = "1.50", default-features = false, features = [
-    "io-util",
     "macros",
-    "net",
-    "rt",
-    "rt-multi-thread",
-    "sync",
     "test-util",
-    "time",
 ] }
 
 [lints]
