@@ -37,6 +37,12 @@ impl<Platform: ShimPlatform> WaitState<Platform> {
 }
 
 impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    fn with_io_completion_worker_suspended<R>(&self, wait: impl FnOnce() -> R) -> R {
+        self.suspend_io_completion_worker();
+        let _resume_worker = litebox::utils::defer(|| self.resume_io_completion_worker());
+        wait()
+    }
+
     /// Returns a wait context to use to perform interruptible waits.
     fn wait_cx<'a>(
         &'a self,
@@ -65,14 +71,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         // The core helper probes again before blocking, so readiness racing with this point can
         // briefly release the IOCP slot without a host block. Exact accounting requires a hook
         // around WaitContext's platform block; keep this approximation local to the Windows shim.
-        self.suspend_io_completion_worker();
-        let _resume_worker = litebox::utils::defer(|| self.resume_io_completion_worker());
-        let interrupt = WaitInterrupt {
-            task: self,
-            alertable,
-        };
-        let wait_context = self.wait_cx(&interrupt).with_timeout(timeout);
-        wait_context.wait_on_events(false, events, register_observer, try_op)
+        self.with_io_completion_worker_suspended(|| {
+            let interrupt = WaitInterrupt {
+                task: self,
+                alertable,
+            };
+            let wait_context = self.wait_cx(&interrupt).with_timeout(timeout);
+            wait_context.wait_on_events(false, events, register_observer, try_op)
+        })
     }
 
     pub(crate) fn wait_until(
@@ -83,15 +89,29 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         if ready() {
             return Ok(());
         }
-        self.suspend_io_completion_worker();
-        let _resume_worker = litebox::utils::defer(|| self.resume_io_completion_worker());
-        let interrupt = WaitInterrupt {
-            task: self,
-            alertable: false,
-        };
-        self.wait_cx(&interrupt)
-            .with_timeout(timeout)
-            .wait_until(ready)
+        self.with_io_completion_worker_suspended(|| {
+            let interrupt = WaitInterrupt {
+                task: self,
+                alertable: false,
+            };
+            self.wait_cx(&interrupt)
+                .with_timeout(timeout)
+                .wait_until(ready)
+        })
+    }
+
+    pub(crate) fn sleep(
+        &self,
+        alertable: bool,
+        timeout: core::time::Duration,
+    ) -> litebox::event::wait::WaitError {
+        self.with_io_completion_worker_suspended(|| {
+            let interrupt = WaitInterrupt {
+                task: self,
+                alertable,
+            };
+            self.wait_cx(&interrupt).with_timeout(timeout).sleep()
+        })
     }
 
     /// Publishes the handle used by other threads to interrupt this one.
