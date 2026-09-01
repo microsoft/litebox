@@ -3007,7 +3007,7 @@ mod tests {
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
         let worker_lock = alloc::sync::Arc::clone(&lock);
-        task.spawn_clone_for_test(move |task| {
+        let worker = task.spawn_clone_for_test(move |task| {
             started_tx.send(()).unwrap();
             let _guard = worker_lock.lock_interruptibly(&task.wait_cx()).unwrap();
             acquired_tx.send(()).unwrap();
@@ -3025,6 +3025,7 @@ mod tests {
         acquired_rx
             .recv_timeout(core::time::Duration::from_secs(1))
             .unwrap();
+        worker.join().unwrap();
     }
 
     #[test]
