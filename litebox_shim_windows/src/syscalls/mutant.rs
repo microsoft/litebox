@@ -19,7 +19,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 use crate::nt_types::{AccessMask, ClientId, ObjectAttributes, ObjectAttributesFlags};
 use crate::syscalls::thread::ThreadObject;
 use crate::syscalls::{Handle, WaitAcquireResult};
-use crate::{ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value};
+use crate::{ConstPtr, MutPtr, Task, probe_guest_output_preserving_value};
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -221,7 +221,7 @@ struct MutantOwnerInformation {
     client_id: ClientId,
 }
 
-impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: crate::ShimPlatform> Task<Platform> {
     fn insert_mutant_handle(
         &self,
         mutant: Arc<MutantObject<Platform>>,

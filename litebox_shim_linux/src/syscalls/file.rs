@@ -987,7 +987,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     fn read_datagram_from_iovec(
         &self,
-        socket: &super::net::InetSocketPin<'_, Platform, FS>,
+        socket: &super::net::InetSocketPin<'_, Platform>,
         iovs: &[IoReadVec],
     ) -> Result<usize, Errno> {
         check_iov_lens(iovs.iter().map(|iov| iov.iov_len))?;
@@ -1052,7 +1052,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     fn write_datagram_to_iovec(
         &self,
-        socket: &super::net::InetSocketPin<'_, Platform, FS>,
+        socket: &super::net::InetSocketPin<'_, Platform>,
         iovs: &[IoWriteVec],
     ) -> Result<usize, Errno> {
         check_iov_lens(iovs.iter().map(|iov| iov.iov_len))?;

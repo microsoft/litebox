@@ -43,7 +43,7 @@ use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd};
 use litebox::fs::errors::{
     FileStatusError, MkdirError, OpenError, PathError, ReadDirError, ReadError, WriteError,
 };
-use litebox::fs::{FileSystem as _, FileType, Mode, OFlags};
+use litebox::fs::{FileType, Mode, OFlags};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox::sync::Mutex;
 use litebox::utils::TruncateExt;
@@ -51,9 +51,7 @@ use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::syscalls::Handle;
-use crate::{
-    ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value, raw_handle_entry,
-};
+use crate::{ConstPtr, MutPtr, Task, probe_guest_output_preserving_value, raw_handle_entry};
 
 use crate::nt_types::{
     AccessMask, IoStatusBlock, ObjectAttributes, UnicodeString, read_object_attributes,
@@ -1049,7 +1047,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
     }
 }
 
-impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: crate::ShimPlatform> Task<Platform> {
     fn registry_key_entry(
         &self,
         handle: Handle,
@@ -2206,8 +2204,8 @@ fn is_valid_key_component(component: &str) -> bool {
         && !component.contains('/')
 }
 
-fn write_value_in_fs<FS: litebox::fs::FileSystem>(
-    fs: &FS,
+fn write_value_in_fs<Platform: crate::ShimPlatform>(
+    fs: &RegistryFileSystem<Platform>,
     key_nt_path: &str,
     value_name: &str,
     value_type: RegistryValueType,
@@ -2217,8 +2215,8 @@ fn write_value_in_fs<FS: litebox::fs::FileSystem>(
     write_value_at_path(fs, &key_path, value_name, value_type.into(), value)
 }
 
-fn write_value_at_path<FS: litebox::fs::FileSystem>(
-    fs: &FS,
+fn write_value_at_path<Platform: crate::ShimPlatform>(
+    fs: &RegistryFileSystem<Platform>,
     key_path: &str,
     value_name: &str,
     value_type: u32,
@@ -2248,8 +2246,8 @@ fn write_value_at_path<FS: litebox::fs::FileSystem>(
     Ok(())
 }
 
-fn create_key_in_fs<FS: litebox::fs::FileSystem>(
-    fs: &FS,
+fn create_key_in_fs<Platform: crate::ShimPlatform>(
+    fs: &RegistryFileSystem<Platform>,
     nt_path: &str,
 ) -> Result<String, NtStatus> {
     let path = absolute_nt_key_name_to_fs_path(nt_path)?;
@@ -2257,8 +2255,8 @@ fn create_key_in_fs<FS: litebox::fs::FileSystem>(
     Ok(path)
 }
 
-fn create_key_path_in_fs<FS: litebox::fs::FileSystem>(
-    fs: &FS,
+fn create_key_path_in_fs<Platform: crate::ShimPlatform>(
+    fs: &RegistryFileSystem<Platform>,
     path: &str,
 ) -> Result<Vec<String>, NtStatus> {
     let mut current = String::new();
@@ -2281,8 +2279,8 @@ fn create_key_path_in_fs<FS: litebox::fs::FileSystem>(
     Ok(created_keys)
 }
 
-fn ensure_directory_in_fs<FS: litebox::fs::FileSystem>(
-    fs: &FS,
+fn ensure_directory_in_fs<Platform: crate::ShimPlatform>(
+    fs: &RegistryFileSystem<Platform>,
     path: &str,
 ) -> Result<bool, NtStatus> {
     match fs.file_status(path) {
@@ -2390,7 +2388,7 @@ fn map_read_dir_error(error: ReadDirError) -> NtStatus {
 #[cfg(test)]
 mod tests {
     use crate::tests::{
-        TestFS, TestPlatform, const_ptr, mut_byte_ptr, mut_ptr, object_attributes, test_platform,
+        TestPlatform, const_ptr, mut_byte_ptr, mut_ptr, object_attributes, test_platform,
         unicode_string, utf16_units as utf16,
     };
 
@@ -2465,7 +2463,7 @@ mod tests {
     }
 
     fn open_key(
-        task: &Task<TestPlatform, TestFS>,
+        task: &Task<TestPlatform>,
         object_attributes: ObjectAttributes,
     ) -> Result<Handle, NtStatus> {
         task.do_nt_open_key(RegistryKeyAccess::READ.bits(), object_attributes)
@@ -2475,7 +2473,7 @@ mod tests {
         ConstPtr::<TestPlatform, u8>::from_usize(core::ptr::from_ref(value).cast::<u8>() as usize)
     }
 
-    fn open_code_page_key(task: &Task<TestPlatform, TestFS>) -> Handle {
+    fn open_code_page_key(task: &Task<TestPlatform>) -> Handle {
         let code_page_name = utf16(DEFAULT_CODE_PAGE_KEY);
         let code_page_name = unicode_string(&code_page_name);
         let object_attributes = object_attributes(&code_page_name, 0);

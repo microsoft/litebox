@@ -25,13 +25,13 @@ use rangemap::RangeMap;
 use thiserror::Error;
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
+use crate::MutPtr;
 use crate::nt_types::{
     ClientId, Luid, PebBitField, ProcessEnvironmentBlock, RtlUserProcFlags,
     RtlUserProcessParameters, ThreadEnvironmentBlock, UnicodeString, X64Context,
 };
 use crate::syscalls::mm::{MemoryType, PageProtection};
 use crate::syscalls::process::{INITIAL_PROCESS_ID, INITIAL_THREAD_ID};
-use crate::{MutPtr, ShimFS};
 
 const NTDLL_WRITABLE_SECTIONS: &[&[u8]] = &[b".mrdata"];
 const NTDLL_PATH: &str = "/Windows/System32/ntdll.dll";
@@ -100,16 +100,16 @@ pub(crate) struct WindowsThreadEnvironment {
     pub(crate) stack_top: usize,
 }
 
-pub(crate) struct PeLoader<'a, Platform: crate::ShimPlatform, FS: ShimFS> {
+pub(crate) struct PeLoader<'a, Platform: crate::ShimPlatform> {
     platform: &'static Platform,
-    fs: Arc<FS>,
+    fs: Arc<crate::WindowsFS<Platform>>,
     page_manager: &'a crate::WindowsPageManager<Platform>,
 }
 
-impl<'a, Platform: crate::ShimPlatform, FS: ShimFS> PeLoader<'a, Platform, FS> {
+impl<'a, Platform: crate::ShimPlatform> PeLoader<'a, Platform> {
     pub(crate) fn new(
         platform: &'static Platform,
-        fs: Arc<FS>,
+        fs: Arc<crate::WindowsFS<Platform>>,
         page_manager: &'a crate::WindowsPageManager<Platform>,
     ) -> Self {
         Self {
@@ -910,9 +910,9 @@ struct NtDllExports {
     ki_user_inverted_function_table: usize,
 }
 
-fn load_ntdll<Platform: crate::ShimPlatform, FS: crate::ShimFS>(
+fn load_ntdll<Platform: crate::ShimPlatform>(
     platform: &'static Platform,
-    fs: Arc<FS>,
+    fs: Arc<crate::WindowsFS<Platform>>,
     page_manager: &crate::WindowsPageManager<Platform>,
 ) -> Result<Option<LoadedNtDll>, WindowsLoadError> {
     match load_image_with_writable_sections(
@@ -935,18 +935,18 @@ fn load_ntdll<Platform: crate::ShimPlatform, FS: crate::ShimFS>(
     }
 }
 
-fn load_image<Platform: crate::ShimPlatform, FS: ShimFS>(
+fn load_image<Platform: crate::ShimPlatform>(
     platform: &'static Platform,
-    fs: Arc<FS>,
+    fs: Arc<crate::WindowsFS<Platform>>,
     path: &str,
     page_manager: &crate::WindowsPageManager<Platform>,
 ) -> Result<LoadedImage, WindowsLoadError> {
     load_image_with_writable_sections(fs, path, platform, page_manager, &[])
 }
 
-pub(crate) fn load_image_section<Platform: crate::ShimPlatform, FS: ShimFS>(
+pub(crate) fn load_image_section<Platform: crate::ShimPlatform>(
     platform: &'static Platform,
-    fs: Arc<FS>,
+    fs: Arc<crate::WindowsFS<Platform>>,
     path: &str,
     page_manager: &crate::WindowsPageManager<Platform>,
     virtual_allocations: &crate::WindowsVirtualAllocations<Platform>,
@@ -968,8 +968,8 @@ pub(crate) struct ImageSectionMetadata {
     pub(crate) machine: u16,
 }
 
-pub(crate) fn image_section_metadata<FS: ShimFS>(
-    fs: Arc<FS>,
+pub(crate) fn image_section_metadata<Platform: crate::ShimPlatform>(
+    fs: Arc<crate::WindowsFS<Platform>>,
     path: &str,
 ) -> Result<ImageSectionMetadata, WindowsLoadError> {
     let file = PeImageFile::open(fs, path)?;
@@ -996,8 +996,8 @@ pub(crate) fn image_section_metadata<FS: ShimFS>(
     })
 }
 
-fn load_image_with_writable_sections<Platform: crate::ShimPlatform, FS: ShimFS>(
-    fs: Arc<FS>,
+fn load_image_with_writable_sections<Platform: crate::ShimPlatform>(
+    fs: Arc<crate::WindowsFS<Platform>>,
     path: &str,
     platform: &'static Platform,
     page_manager: &crate::WindowsPageManager<Platform>,
@@ -1107,13 +1107,13 @@ fn is_missing_file_error(error: &WindowsLoadError) -> bool {
     )
 }
 
-struct PeImageFile<FS: ShimFS> {
-    fs: Arc<FS>,
-    fd: litebox::fd::TypedFd<FS>,
+struct PeImageFile<Platform: crate::ShimPlatform> {
+    fs: Arc<crate::WindowsFS<Platform>>,
+    fd: litebox::fd::TypedFd<crate::WindowsFS<Platform>>,
 }
 
-impl<FS: ShimFS> PeImageFile<FS> {
-    fn open(fs: Arc<FS>, path: &str) -> Result<Self, PeImageAccessError> {
+impl<Platform: crate::ShimPlatform> PeImageFile<Platform> {
+    fn open(fs: Arc<crate::WindowsFS<Platform>>, path: &str) -> Result<Self, PeImageAccessError> {
         let fd = fs.open(path, OFlags::RDONLY, Mode::empty())?;
         Ok(Self { fs, fd })
     }
@@ -1137,7 +1137,7 @@ impl<FS: ShimFS> PeImageFile<FS> {
     }
 }
 
-impl<FS: ShimFS> Drop for PeImageFile<FS> {
+impl<Platform: crate::ShimPlatform> Drop for PeImageFile<Platform> {
     fn drop(&mut self) {
         if let Err(e) = self.fs.close(&self.fd) {
             litebox_util_log::warn!(error:? = e; "failed to close PE image file");
@@ -1145,7 +1145,7 @@ impl<FS: ShimFS> Drop for PeImageFile<FS> {
     }
 }
 
-impl<FS: ShimFS> ReadAt for &'_ PeImageFile<FS> {
+impl<Platform: crate::ShimPlatform> ReadAt for &'_ PeImageFile<Platform> {
     type Error = PeImageAccessError;
 
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), Self::Error> {
@@ -1166,15 +1166,15 @@ impl<FS: ShimFS> ReadAt for &'_ PeImageFile<FS> {
     }
 }
 
-struct PeImageMapper<'a, Platform: crate::ShimPlatform, FS: ShimFS> {
-    file: &'a PeImageFile<FS>,
+struct PeImageMapper<'a, Platform: crate::ShimPlatform> {
+    file: &'a PeImageFile<Platform>,
     page_manager: &'a crate::WindowsPageManager<Platform>,
     /// Reusable per-call I/O staging buffer for [`MapMemory::map_file`].
     chunk: Vec<u8>,
     pages: RangeMap<usize, PageProtection>,
 }
 
-impl<Platform: crate::ShimPlatform, FS: ShimFS> PeImageMapper<'_, Platform, FS> {
+impl<Platform: crate::ShimPlatform> PeImageMapper<'_, Platform> {
     fn record_pages(
         &mut self,
         address: usize,
@@ -1203,7 +1203,7 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> PeImageMapper<'_, Platform, FS> 
     }
 }
 
-impl<Platform: crate::ShimPlatform, FS: ShimFS> MapMemory for PeImageMapper<'_, Platform, FS> {
+impl<Platform: crate::ShimPlatform> MapMemory for PeImageMapper<'_, Platform> {
     type Error = PeImageAccessError;
 
     fn reserve(
@@ -2543,9 +2543,12 @@ mod tests {
         let page_manager = crate::WindowsPageManager::<crate::tests::TestPlatform>::new(&litebox);
         let fs = Arc::new(litebox::fs::resolver::Resolver::new(
             &litebox,
-            litebox::fs::in_mem::InMem::<crate::tests::TestPlatform>::new_initialized(
-                core::iter::empty::<(&str, litebox::fs::in_mem::InitialNode)>(),
-            ),
+            litebox::fs::composer::Composer::builder()
+                .mount("/", |allocator| {
+                    litebox::fs::in_mem::InMem::<crate::tests::TestPlatform>::new(allocator)
+                })
+                .build()
+                .expect("valid test filesystem"),
         ));
         let loader = PeLoader::new(platform, fs, &page_manager);
         let image = loaded_module_image(application_module_base());

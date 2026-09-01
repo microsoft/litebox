@@ -18,7 +18,7 @@ use crate::syscalls::mutant::{MutantObject, MutantSubsystem};
 use crate::syscalls::semaphore::{SemaphoreObject, SemaphoreSubsystem};
 use crate::syscalls::thread::{ThreadObject, ThreadSubsystem};
 use crate::syscalls::{Handle, WaitAcquireResult};
-use crate::{ConstPtr, ShimFS, ShimPlatform, Task};
+use crate::{ConstPtr, ShimPlatform, Task};
 
 /// A dispatcher object that a guest thread can block on.
 enum WaitableObject<Platform: ShimPlatform> {
@@ -61,7 +61,7 @@ impl<Platform: ShimPlatform> WaitableObject<Platform> {
     }
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     /// Resolves `handle` to the dispatcher object it names, requiring
     /// `SYNCHRONIZE` access.
     fn waitable_object(&self, handle: Handle) -> Result<WaitableObject<Platform>, NtStatus> {

@@ -12,7 +12,7 @@ use litebox_common_windows::nt_status::NtStatus;
 
 use crate::nt_types::{AccessMask, ObjectAttributes};
 use crate::syscalls::Handle;
-use crate::{ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value};
+use crate::{ConstPtr, MutPtr, Task, probe_guest_output_preserving_value};
 
 const TIMER2_ATTRIBUTE_IR_TIMER: u32 = 0x0000_0002;
 const TIMER2_ATTRIBUTE_HIGH_RESOLUTION: u32 = 0x0000_0004;
@@ -123,7 +123,7 @@ fn validate_timer2_after_output<Platform: RawPointerProvider>(
     }
 }
 
-impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: crate::ShimPlatform> Task<Platform> {
     fn insert_timer_handle(
         &self,
         timer: Arc<TimerObject<Platform>>,
@@ -230,7 +230,7 @@ mod tests {
     }
 
     fn create_timer2(
-        task: &Task<TestPlatform, crate::tests::TestFS>,
+        task: &Task<TestPlatform>,
         handle: &mut Handle,
         timer_id: Option<ConstPtr<TestPlatform, u32>>,
         object_attributes: Option<ConstPtr<TestPlatform, ObjectAttributes>>,

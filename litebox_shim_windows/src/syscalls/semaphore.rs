@@ -14,7 +14,7 @@ use litebox_common_windows::nt_status::NtStatus;
 
 use crate::nt_types::{AccessMask, ObjectAttributes, ObjectAttributesFlags};
 use crate::syscalls::Handle;
-use crate::{ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value};
+use crate::{ConstPtr, MutPtr, Task, probe_guest_output_preserving_value};
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -122,7 +122,7 @@ impl<Platform: crate::ShimPlatform> IOPollable for SemaphoreObject<Platform> {
     }
 }
 
-impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: crate::ShimPlatform> Task<Platform> {
     fn insert_semaphore_handle(
         &self,
         semaphore: Arc<SemaphoreObject<Platform>>,
@@ -298,16 +298,12 @@ mod tests {
     use super::*;
     use crate::nt_types::ObjectAttributesFlags;
     use crate::tests::{
-        TestFS, TestPlatform, const_ptr, mut_ptr, object_attributes, test_task, unicode_string,
-        utf16_units,
+        TestPlatform, const_ptr, mut_ptr, object_attributes, test_task, unicode_string, utf16_units,
     };
 
     const SEMAPHORE_ALL_ACCESS: u32 = 0x001f_0003;
 
-    fn create_semaphore(
-        initial_count: i32,
-        maximum_count: i32,
-    ) -> (Task<TestPlatform, TestFS>, Handle) {
+    fn create_semaphore(initial_count: i32, maximum_count: i32) -> (Task<TestPlatform>, Handle) {
         let task = test_task();
         let mut handle = Handle::default();
         assert_eq!(
@@ -323,7 +319,7 @@ mod tests {
         (task, handle)
     }
 
-    fn zero_timeout_wait(task: &Task<TestPlatform, TestFS>, handle: Handle) -> NtStatus {
+    fn zero_timeout_wait(task: &Task<TestPlatform>, handle: Handle) -> NtStatus {
         let timeout = 0i64;
         task.sys_nt_wait_for_single_object(handle, false, Some(const_ptr(&timeout)))
     }

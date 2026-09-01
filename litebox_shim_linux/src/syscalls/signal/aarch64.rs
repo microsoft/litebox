@@ -6,7 +6,7 @@
 //! LiteBox supplies a fallback restorer because it exposes no guest vDSO.
 
 use crate::syscalls::signal::{DeliverFault, SignalState};
-use crate::{ShimFS, ShimPlatform, Task, UserPtrMut};
+use crate::{ShimPlatform, Task, UserPtrMut};
 use core::mem::offset_of;
 use litebox::mm::linux::PAGE_SIZE;
 use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
@@ -66,8 +66,8 @@ fn handler_arguments(action: &SigAction, frame_addr: usize) -> Option<(usize, us
 
 /// Returns a cached synthetic `rt_sigreturn` guest mapping.
 /// The cache is reset on `execve`; guest VM operations can invalidate it.
-pub(super) fn sigreturn_trampoline<Platform: ShimPlatform, FS: ShimFS>(
-    task: &Task<Platform, FS>,
+pub(super) fn sigreturn_trampoline<Platform: ShimPlatform>(
+    task: &Task<Platform>,
     action: &SigAction,
 ) -> Result<usize, DeliverFault> {
     if let Some(restorer) = requested_restorer(action) {

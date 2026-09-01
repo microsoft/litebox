@@ -14,7 +14,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 use crate::nt_types::Guid;
 use crate::syscalls::Handle;
 use crate::syscalls::event::{EventAccess, EventObject, EventSubsystem};
-use crate::{ConstPtr, MutPtr, ShimFS, ShimPlatform, Task};
+use crate::{ConstPtr, MutPtr, ShimPlatform, Task};
 
 const ETW_NT_TRACE_TYPE_MASK: u32 = 0x0000_ff00;
 const ETW_MAX_DATA_BLOCK_BUFFER_SIZE: u32 = 65_536;
@@ -137,7 +137,7 @@ pub(crate) struct EventHeader {
 const _: () = assert!(size_of::<EventDescriptor>() == 16);
 const _: () = assert!(size_of::<EventHeader>() == 80);
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     pub(crate) fn sys_nt_trace_control(
         &self,
         function_code: u32,

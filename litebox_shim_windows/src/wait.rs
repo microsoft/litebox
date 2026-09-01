@@ -12,15 +12,15 @@ use litebox::event::Events;
 use litebox::event::observer::Observer;
 use litebox::event::polling::TryOpError;
 
-use crate::{ShimFS, ShimPlatform, Task};
+use crate::{ShimPlatform, Task};
 
-struct WaitInterrupt<'a, Platform: ShimPlatform, FS: ShimFS> {
-    task: &'a Task<Platform, FS>,
+struct WaitInterrupt<'a, Platform: ShimPlatform> {
+    task: &'a Task<Platform>,
     alertable: bool,
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> litebox::event::wait::CheckForInterrupt
-    for WaitInterrupt<'_, Platform, FS>
+impl<Platform: ShimPlatform> litebox::event::wait::CheckForInterrupt
+    for WaitInterrupt<'_, Platform>
 {
     fn check_for_interrupt(&self) -> bool {
         self.task.thread_object.is_exiting()
@@ -36,7 +36,7 @@ impl<Platform: ShimPlatform> WaitState<Platform> {
     }
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     fn with_io_completion_worker_suspended<R>(&self, wait: impl FnOnce() -> R) -> R {
         self.suspend_io_completion_worker();
         let _resume_worker = litebox::utils::defer(|| self.resume_io_completion_worker());
@@ -46,7 +46,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     /// Returns a wait context to use to perform interruptible waits.
     fn wait_cx<'a>(
         &'a self,
-        interrupt: &'a WaitInterrupt<'a, Platform, FS>,
+        interrupt: &'a WaitInterrupt<'a, Platform>,
     ) -> litebox::event::wait::WaitContext<'a, Platform> {
         self.wait_state
             .0

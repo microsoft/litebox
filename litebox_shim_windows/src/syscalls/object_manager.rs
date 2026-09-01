@@ -31,7 +31,7 @@ use crate::syscalls::section::{
 };
 use crate::syscalls::semaphore::SemaphoreObject;
 use crate::{
-    ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_buffer, probe_guest_output_preserving_value,
+    ConstPtr, MutPtr, Task, probe_guest_output_buffer, probe_guest_output_preserving_value,
 };
 
 const MAX_SYMLINK_REPARSE_DEPTH: usize = 64;
@@ -1115,7 +1115,7 @@ fn write_directory_records<Platform: RawPointerProvider>(
     Ok(())
 }
 
-impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: crate::ShimPlatform> Task<Platform> {
     pub(crate) fn sys_nt_query_object(
         &self,
         handle: Handle,
@@ -1771,10 +1771,7 @@ mod tests {
         assert_eq!(read_usize(buffer, offset + 24), 0);
     }
 
-    fn create_named_directory(
-        task: &Task<TestPlatform, crate::tests::TestFS>,
-        path: &str,
-    ) -> Handle {
+    fn create_named_directory(task: &Task<TestPlatform>, path: &str) -> Handle {
         let name_units = utf16_units(path);
         let name = unicode_string(&name_units);
         let attrs = object_attributes(&name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
@@ -1792,7 +1789,7 @@ mod tests {
         handle
     }
 
-    fn open_named_directory(task: &Task<TestPlatform, crate::tests::TestFS>, path: &str) -> Handle {
+    fn open_named_directory(task: &Task<TestPlatform>, path: &str) -> Handle {
         let name_units = utf16_units(path);
         let name = unicode_string(&name_units);
         let attrs = object_attributes(&name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());

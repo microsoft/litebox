@@ -13,8 +13,8 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::syscalls::{ProcessHandle, section::pagefile_view_protection_is_compatible};
 use crate::{
-    ConstPtr, MutPtr, PAGE_SIZE, ShimFS, ShimPlatform, Task, WindowsPageManager,
-    WindowsVirtualAllocation, WindowsVirtualAllocations,
+    ConstPtr, MutPtr, PAGE_SIZE, ShimPlatform, Task, WindowsPageManager, WindowsVirtualAllocation,
+    WindowsVirtualAllocations,
 };
 
 pub(super) const ALLOCATION_GRANULARITY: usize = 0x1_0000;
@@ -250,7 +250,7 @@ fn validate_memory_extended_parameter<Platform: ShimPlatform>(
     }
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     pub(crate) fn sys_nt_allocate_virtual_memory_ex(
         &self,
         process_handle: ProcessHandle,
@@ -1794,7 +1794,7 @@ mod tests {
     extern crate std;
 
     type TestPlatform = crate::tests::TestPlatform;
-    type TestTask = Task<TestPlatform, crate::tests::TestFS>;
+    type TestTask = Task<TestPlatform>;
 
     fn allocate_committed_rw(task: &TestTask, size: usize) -> (usize, usize) {
         let mut base = 0usize;

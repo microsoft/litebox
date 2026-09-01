@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 use crate::syscalls::signal::{DeliverFault, SignalState};
-use crate::{ShimFS, ShimPlatform, Task, UserPtrMut};
+use crate::{ShimPlatform, Task, UserPtrMut};
 use core::mem::offset_of;
 use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
 use litebox_common_linux::{
@@ -48,8 +48,8 @@ pub(super) fn get_signal_frame(sp: usize, _action: &SigAction) -> usize {
 }
 
 /// Requires the guest's own `sa_restorer`; LiteBox has no x86-64 vDSO fallback.
-pub(super) fn sigreturn_trampoline<Platform: ShimPlatform, FS: ShimFS>(
-    _task: &Task<Platform, FS>,
+pub(super) fn sigreturn_trampoline<Platform: ShimPlatform>(
+    _task: &Task<Platform>,
     action: &SigAction,
 ) -> Result<usize, DeliverFault> {
     if !action.flags.contains(SaFlags::RESTORER) {

@@ -17,7 +17,7 @@ use litebox_common_windows::nt_status::NtStatus;
 use crate::nt_types::{AccessMask, ObjectAttributes, ObjectAttributesFlags, UnicodeString};
 use crate::syscalls::Handle;
 use crate::syscalls::object_manager::{DirectoryName, ObjectNode};
-use crate::{ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value};
+use crate::{ConstPtr, MutPtr, Task, probe_guest_output_preserving_value};
 
 const STANDARD_RIGHTS_REQUIRED: u32 = AccessMask::DELETE.bits()
     | AccessMask::READ_CONTROL.bits()
@@ -82,7 +82,7 @@ fn utf16_units(value: &str) -> Result<Vec<u16>, NtStatus> {
     Ok(units)
 }
 
-impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: crate::ShimPlatform> Task<Platform> {
     fn insert_symbolic_link_handle(
         &self,
         link: Arc<ObjectNode<Platform>>,
@@ -341,11 +341,7 @@ mod tests {
         (units, unicode)
     }
 
-    fn create_link(
-        task: &Task<TestPlatform, crate::tests::TestFS>,
-        path: &str,
-        target: &str,
-    ) -> Handle {
+    fn create_link(task: &Task<TestPlatform>, path: &str, target: &str) -> Handle {
         let path_units = test_utf16_units(path);
         let name = unicode_string(&path_units);
         let attrs = object_attributes(&name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
@@ -363,7 +359,7 @@ mod tests {
         handle
     }
 
-    fn create_directory(task: &Task<TestPlatform, crate::tests::TestFS>, path: &str) -> Handle {
+    fn create_directory(task: &Task<TestPlatform>, path: &str) -> Handle {
         let path_units = test_utf16_units(path);
         let name = unicode_string(&path_units);
         let attrs = object_attributes(&name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
@@ -381,7 +377,7 @@ mod tests {
         handle
     }
 
-    fn open_directory(task: &Task<TestPlatform, crate::tests::TestFS>, path: &str) -> Handle {
+    fn open_directory(task: &Task<TestPlatform>, path: &str) -> Handle {
         let path_units = test_utf16_units(path);
         let name = unicode_string(&path_units);
         let attrs = object_attributes(&name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
@@ -397,7 +393,7 @@ mod tests {
         handle
     }
 
-    fn open_link(task: &Task<TestPlatform, crate::tests::TestFS>, path: &str) -> Handle {
+    fn open_link(task: &Task<TestPlatform>, path: &str) -> Handle {
         let path_units = test_utf16_units(path);
         let name = unicode_string(&path_units);
         let attrs = object_attributes(
@@ -416,10 +412,7 @@ mod tests {
         handle
     }
 
-    fn open_link_without_openlink(
-        task: &Task<TestPlatform, crate::tests::TestFS>,
-        path: &str,
-    ) -> Handle {
+    fn open_link_without_openlink(task: &Task<TestPlatform>, path: &str) -> Handle {
         let path_units = test_utf16_units(path);
         let name = unicode_string(&path_units);
         let attrs = object_attributes(&name, ObjectAttributesFlags::CASE_INSENSITIVE.bits());
@@ -436,7 +429,7 @@ mod tests {
     }
 
     fn query_link(
-        task: &Task<TestPlatform, crate::tests::TestFS>,
+        task: &Task<TestPlatform>,
         handle: Handle,
         output_units: &mut [u16],
     ) -> (UnicodeString, u32) {

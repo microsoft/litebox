@@ -14,7 +14,7 @@ use crate::nt_types::Guid;
 use crate::syscalls::Handle;
 use crate::syscalls::event::{EventAccess, EventSubsystem};
 use crate::{
-    ConstPtr, MutPtr, ShimFS, ShimPlatform, Task, probe_guest_output_buffer,
+    ConstPtr, MutPtr, ShimPlatform, Task, probe_guest_output_buffer,
     probe_guest_output_preserving_value,
 };
 
@@ -147,7 +147,7 @@ pub(crate) struct WnfUpdateStateDataParameters<Platform: litebox::platform::RawP
     pub(crate) check_stamp: i32,
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     pub(crate) fn sys_nt_set_wnf_process_notification_event(
         &self,
         notification_event: Handle,
@@ -699,12 +699,12 @@ mod tests {
 
     use super::*;
     use crate::syscalls::event::{EventAccess, EventType};
-    use crate::tests::{TestFS, TestPlatform, const_ptr, mut_byte_ptr, mut_ptr, test_task};
+    use crate::tests::{TestPlatform, const_ptr, mut_byte_ptr, mut_ptr, test_task};
 
     const SECURITY_DESCRIPTOR_REVISION: u8 = 1;
 
     fn create_state(
-        task: &Task<TestPlatform, TestFS>,
+        task: &Task<TestPlatform>,
         type_id: Option<Guid>,
         maximum_state_size: u32,
     ) -> u64 {
@@ -725,7 +725,7 @@ mod tests {
     }
 
     fn update_state(
-        task: &Task<TestPlatform, TestFS>,
+        task: &Task<TestPlatform>,
         state_name: u64,
         data: &[u8],
         type_id: Option<&Guid>,

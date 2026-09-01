@@ -14,7 +14,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 use super::Handle;
 use crate::nt_types::{ProcessEnvironmentBlock, ThreadEnvironmentBlock, UnicodeString};
 use crate::syscalls::object_manager::WINDOWS_API_PORT;
-use crate::{ConstPtr, MutPtr, ShimFS, ShimPlatform, Task, probe_guest_output_preserving_value};
+use crate::{ConstPtr, MutPtr, ShimPlatform, Task, probe_guest_output_preserving_value};
 
 // Maximum total message length advertised by `\Windows\ApiPort` on the target x64 Windows build.
 // TODO(csr-api-message-union): model the full CSR API message union and derive this from its size.
@@ -780,7 +780,7 @@ pub(crate) struct ConnectPortParameters<Platform: ShimPlatform> {
     pub(crate) connection_information_length: Option<MutPtr<Platform, u32>>,
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     pub(crate) fn sys_nt_alpc_connect_port(
         port_handle: MutPtr<Platform, Handle>,
         port_name: ConstPtr<Platform, UnicodeString>,
@@ -1422,15 +1422,14 @@ mod tests {
     use super::*;
     use crate::syscalls::mm::PageProtection;
     use crate::tests::{
-        TestFS, TestPlatform, const_ptr, mut_byte_ptr, mut_ptr, test_task, unicode_string,
-        utf16_units,
+        TestPlatform, const_ptr, mut_byte_ptr, mut_ptr, test_task, unicode_string, utf16_units,
     };
 
     const SECTION_MAP_WRITE: u32 = 0x0002;
     const SECTION_MAP_READ: u32 = 0x0004;
     const SEC_COMMIT: u32 = 0x0800_0000;
 
-    fn task_with_peb(peb: &mut ProcessEnvironmentBlock) -> Task<TestPlatform, TestFS> {
+    fn task_with_peb(peb: &mut ProcessEnvironmentBlock) -> Task<TestPlatform> {
         let mut task = test_task();
         alloc::sync::Arc::get_mut(&mut task.process)
             .expect("test task has a unique process reference")
@@ -1467,7 +1466,7 @@ mod tests {
         }
     }
 
-    fn create_client_section(task: &Task<TestPlatform, TestFS>, access: u32) -> Handle {
+    fn create_client_section(task: &Task<TestPlatform>, access: u32) -> Handle {
         let mut handle = Handle::default();
         let size = i64::try_from(crate::PAGE_SIZE * 3).expect("test section size fits in i64");
         assert_eq!(
@@ -1669,7 +1668,7 @@ mod tests {
         let backing_base = core::ptr::from_mut(&mut backing) as usize;
         let mut receive_capacity = MESSAGE_LENGTH;
         assert_eq!(
-            Task::<TestPlatform, TestFS>::handle_csr_api_port_message(
+            Task::<TestPlatform>::handle_csr_api_port_message(
                 0,
                 backing_base,
                 mut_byte_ptr(&mut message_storage),
