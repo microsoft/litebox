@@ -173,6 +173,7 @@ impl NtStatus {
             0xC000004F => "STATUS_EAS_NOT_SUPPORTED: EAS not supported",
             0xC0000050 => "STATUS_EA_TOO_LARGE: EA too large",
             0xC0000056 => "STATUS_DELETE_PENDING: Delete pending",
+            0xC000005C => "STATUS_NO_IMPERSONATION_TOKEN: No impersonation token",
             0xC000005F => "STATUS_NO_SUCH_LOGON_SESSION: No such logon session",
             0xC0000060 => "STATUS_NO_SUCH_PRIVILEGE: No such privilege",
             0xC0000061 => "STATUS_PRIVILEGE_NOT_HELD: Privilege not held",
@@ -492,6 +493,9 @@ impl NtStatus {
 
     /// STATUS_DELETE_PENDING
     pub const DELETE_PENDING: Self = Self::from_raw(0xC0000056);
+
+    /// STATUS_NO_IMPERSONATION_TOKEN
+    pub const NO_IMPERSONATION_TOKEN: Self = Self::from_raw(0xC000005C);
 
     /// STATUS_NO_SUCH_LOGON_SESSION
     pub const NO_SUCH_LOGON_SESSION: Self = Self::from_raw(0xC000005F);

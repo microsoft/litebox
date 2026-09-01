@@ -509,6 +509,7 @@ fn windows_user_shared_data() -> nt_types::KUserSharedData {
     shared_data.product_type_is_valid = 1;
     shared_data.nt_major_version = u32::from(syscalls::sysinfo::WINDOWS_OS_MAJOR_VERSION);
     shared_data.nt_minor_version = u32::from(syscalls::sysinfo::WINDOWS_OS_MINOR_VERSION);
+    shared_data.qpc_frequency = syscalls::sysinfo::QPC_FREQUENCY_HZ;
     for (index, code_unit) in r"C:\Windows".encode_utf16().enumerate() {
         shared_data.nt_system_root[index] = code_unit;
     }
@@ -1036,6 +1037,25 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             "Handling Windows syscall"
         );
         let result = match req {
+            SyscallRequest::NtAccessCheck {
+                security_descriptor,
+                client_token,
+                desired_access,
+                generic_mapping,
+                privilege_set,
+                privilege_set_length,
+                granted_access,
+                access_status,
+            } => self.sys_nt_access_check(syscalls::token::AccessCheckParameters {
+                security_descriptor,
+                client_token,
+                desired_access,
+                generic_mapping,
+                privilege_set,
+                privilege_set_length,
+                granted_access,
+                access_status,
+            }),
             SyscallRequest::NtClose { handle } => self.sys_nt_close(handle),
             SyscallRequest::NtDuplicateObject {
                 source_process_handle,

@@ -133,6 +133,13 @@ pub(crate) enum TokenInformationClass {
     LoggingInformation = 49,
 }
 
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Eq, IntEnum, PartialEq)]
+enum TokenType {
+    Primary = 1,
+    Impersonation = 2,
+}
+
 #[repr(u16)]
 #[derive(Clone, Copy, Debug, Eq, IntEnum, PartialEq)]
 enum TokenSecurityAttributeValueType {
@@ -252,7 +259,6 @@ pub(crate) struct TokenStatistics {
     modified_id: Luid,
 }
 
-const TOKEN_TYPE_PRIMARY: u32 = 1;
 const SECURITY_ANONYMOUS: u32 = 0;
 
 // TODO(token-luid-allocation): Allocate these from sandbox-wide state once multiple token objects
@@ -293,7 +299,7 @@ impl TokenObject {
                 token_id: PRIMARY_TOKEN_ID,
                 authentication_id: SYSTEM_LUID,
                 expiration_time: i64::MAX,
-                token_type: TOKEN_TYPE_PRIMARY,
+                token_type: TokenType::Primary as u32,
                 impersonation_level: SECURITY_ANONYMOUS,
                 dynamic_charged: 0,
                 dynamic_available: 0,
@@ -324,10 +330,139 @@ impl WindowsHandleSubsystem for TokenSubsystem {
     }
 }
 
+pub(crate) struct AccessCheckParameters<Platform: crate::ShimPlatform> {
+    pub(crate) security_descriptor: ConstPtr<Platform, u8>,
+    pub(crate) client_token: Handle,
+    pub(crate) desired_access: u32,
+    pub(crate) generic_mapping: ConstPtr<Platform, [u32; 4]>,
+    pub(crate) privilege_set: MutPtr<Platform, u8>,
+    pub(crate) privilege_set_length: MutPtr<Platform, u32>,
+    pub(crate) granted_access: MutPtr<Platform, u32>,
+    pub(crate) access_status: MutPtr<Platform, u32>,
+}
+
 impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     const CURRENT_PROCESS_TOKEN: Handle = Handle::from_raw(usize::MAX - 3);
     const CURRENT_THREAD_TOKEN: Handle = Handle::from_raw(usize::MAX - 4);
     const CURRENT_THREAD_EFFECTIVE_TOKEN: Handle = Handle::from_raw(usize::MAX - 5);
+
+    pub(crate) fn sys_nt_access_check(
+        &self,
+        parameters: AccessCheckParameters<Platform>,
+    ) -> NtStatus {
+        const EMPTY_PRIVILEGE_SET_SIZE: u32 = 8;
+
+        let Some(generic_mapping) = parameters.generic_mapping.read_at_offset(0) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        let Some(privilege_set_capacity) = parameters.privilege_set_length.read_at_offset(0) else {
+            return NtStatus::ACCESS_VIOLATION;
+        };
+        if let Err(status) =
+            probe_guest_output_preserving_value::<Platform, _>(parameters.privilege_set_length)
+        {
+            return status;
+        }
+        if let Err(status) = probe_guest_output_buffer::<Platform>(
+            parameters.privilege_set,
+            privilege_set_capacity as usize,
+        ) {
+            return status;
+        }
+        if let Err(status) =
+            probe_guest_output_preserving_value::<Platform, _>(parameters.granted_access)
+        {
+            return status;
+        }
+        if let Err(status) =
+            probe_guest_output_preserving_value::<Platform, _>(parameters.access_status)
+        {
+            return status;
+        }
+
+        let token = if parameters.client_token == Self::CURRENT_PROCESS_TOKEN
+            || parameters.client_token == Self::CURRENT_THREAD_EFFECTIVE_TOKEN
+        {
+            Arc::clone(&self.process.token)
+        } else if parameters.client_token == Self::CURRENT_THREAD_TOKEN {
+            return NtStatus::NO_TOKEN;
+        } else {
+            match self.typed_handle_entry_with_access::<TokenSubsystem>(
+                parameters.client_token,
+                TokenAccess::QUERY.bits(),
+            ) {
+                Ok(entry) => entry.with_entry(|entry| Arc::clone(&entry.token)),
+                Err(status) => return status,
+            }
+        };
+        if parameters.security_descriptor.read_at_offset(0).is_none() {
+            return NtStatus::ACCESS_VIOLATION;
+        }
+
+        if Arc::ptr_eq(&token, &self.process.token) {
+            if parameters
+                .privilege_set_length
+                .write_at_offset(0, EMPTY_PRIVILEGE_SET_SIZE)
+                .is_none()
+            {
+                return NtStatus::ACCESS_VIOLATION;
+            }
+            if privilege_set_capacity < EMPTY_PRIVILEGE_SET_SIZE {
+                return NtStatus::BUFFER_TOO_SMALL;
+            }
+
+            let maximum_allowed = parameters.desired_access & AccessMask::MAXIMUM_ALLOWED.bits();
+            let explicit_access = parameters.desired_access & !AccessMask::MAXIMUM_ALLOWED.bits();
+            let mut granted_access = AccessMask::expand_generic_access(
+                explicit_access,
+                generic_mapping[0],
+                generic_mapping[1],
+                generic_mapping[2],
+                generic_mapping[3],
+            );
+            if maximum_allowed != 0 {
+                granted_access |= generic_mapping[3];
+            }
+
+            if parameters
+                .privilege_set
+                .copy_from_slice(0, &[0; EMPTY_PRIVILEGE_SET_SIZE as usize])
+                .is_none()
+                || parameters
+                    .granted_access
+                    .write_at_offset(0, granted_access)
+                    .is_none()
+                || parameters.access_status.write_at_offset(0, 0).is_none()
+            {
+                return NtStatus::ACCESS_VIOLATION;
+            }
+
+            litebox_util_log::warn!(
+                desired_access:% = format_args!("{:#x}", parameters.desired_access),
+                granted_access:% = format_args!("{granted_access:#x}");
+                "Granted synthetic process-token access without DACL evaluation"
+            );
+            return NtStatus::SUCCESS;
+        }
+
+        let generic_access = AccessMask::GENERIC_READ.bits()
+            | AccessMask::GENERIC_WRITE.bits()
+            | AccessMask::GENERIC_EXECUTE.bits()
+            | AccessMask::GENERIC_ALL.bits();
+        if parameters.desired_access & generic_access != 0 {
+            return NtStatus::GENERIC_NOT_MAPPED;
+        }
+        if token.statistics.token_type != TokenType::Impersonation as u32 {
+            return NtStatus::NO_IMPERSONATION_TOKEN;
+        }
+
+        litebox_util_log::warn!(
+            desired_access:% = format_args!("{:#x}", parameters.desired_access),
+            impersonation_level = token.statistics.impersonation_level;
+            "NtAccessCheck DACL evaluation for impersonation tokens is not implemented"
+        );
+        NtStatus::NOT_IMPLEMENTED
+    }
 
     pub(crate) fn sys_nt_open_process_token(
         &self,

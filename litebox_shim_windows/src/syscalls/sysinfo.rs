@@ -15,7 +15,7 @@ use crate::nt_types::GroupAffinity;
 use crate::syscalls::mm::ALLOCATION_GRANULARITY;
 use crate::{ConstPtr, MutPtr, PAGE_SIZE, ShimFS, ShimPlatform, Task};
 
-const QPC_FREQUENCY_HZ: i64 = 1_000_000_000;
+pub(crate) const QPC_FREQUENCY_HZ: i64 = 1_000_000_000;
 // These fixed values are deterministic sandbox answers: a default 15.625 ms
 // timer tick, one synthetic processor, and a stable 4 GiB physical-memory view.
 // They avoid leaking host topology while satisfying Windows CRT/environment
