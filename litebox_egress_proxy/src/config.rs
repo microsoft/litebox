@@ -5,27 +5,21 @@
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 
-use clap::{ArgGroup, Parser};
+use clap::Parser;
 use thiserror::Error;
 
-use crate::listener::ListenerSource;
 use crate::policy::{HostPolicy, PolicyError};
 
 /// The standalone egress proxy for LiteBox sandboxes.
 #[derive(Debug, Parser)]
 #[command(
     name = "litebox_egress_proxy",
-    about = "Hostname-filtering CONNECT egress proxy",
-    group(ArgGroup::new("listener").required(true).args(["listen", "listener_fd"]))
+    about = "Hostname-filtering CONNECT egress proxy"
 )]
 pub struct Cli {
     /// Loopback address to bind, for example `127.0.0.1:0`.
     #[arg(long, value_name = "IPV4:PORT")]
-    listen: Option<String>,
-
-    /// Inherited, already-bound loopback listener descriptor.
-    #[arg(long, value_name = "FD", conflicts_with = "listen")]
-    listener_fd: Option<i32>,
+    listen: String,
 
     /// Allowed hostname and destination ports, repeatable.
     #[arg(long = "allow-host", value_name = "HOST:PORT[-PORT]")]
@@ -49,8 +43,8 @@ pub enum ConfigError {
 /// The validated configuration of one proxy process.
 #[derive(Clone, Debug)]
 pub struct ProxyConfig {
-    /// Where the listener comes from.
-    pub listener: ListenerSource,
+    /// IPv4 loopback address to bind.
+    pub listen: SocketAddrV4,
     /// The immutable hostname policy.
     pub policy: HostPolicy,
 }
@@ -58,14 +52,10 @@ pub struct ProxyConfig {
 impl Cli {
     /// Converts parsed arguments into a validated configuration.
     pub fn into_config(self) -> Result<ProxyConfig, ConfigError> {
-        let listener = match (self.listen, self.listener_fd) {
-            (Some(address), _) => ListenerSource::Bind(parse_listen_address(&address)?),
-            (None, Some(descriptor)) => ListenerSource::Inherited(descriptor),
-            (None, None) => return Err(ConfigError::ListenAddress),
-        };
+        let listen = parse_listen_address(&self.listen)?;
         let policy = HostPolicy::from_rules(&self.allow_host)?;
 
-        Ok(ProxyConfig { listener, policy })
+        Ok(ProxyConfig { listen, policy })
     }
 }
 
@@ -101,10 +91,7 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(
-            config.listener,
-            ListenerSource::Bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
-        );
+        assert_eq!(config.listen, SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
 
         let host = Hostname::parse("example.com").unwrap();
         assert!(config.policy.allows(&host, 443));
@@ -113,25 +100,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_an_inherited_listener_configuration() {
-        let config = parse(&["--listener-fd", "7"]).unwrap();
-        let host = Hostname::parse("example.com").unwrap();
-        assert_eq!(config.listener, ListenerSource::Inherited(7));
-        assert!(!config.policy.allows(&host, 443));
-    }
-
-    #[test]
-    fn listener_modes_are_mutually_exclusive_and_required() {
-        assert!(
-            Cli::try_parse_from([
-                "litebox_egress_proxy",
-                "--listen",
-                "127.0.0.1:0",
-                "--listener-fd",
-                "3",
-            ])
-            .is_err()
-        );
+    fn listen_is_required() {
         assert!(Cli::try_parse_from(["litebox_egress_proxy"]).is_err());
     }
 

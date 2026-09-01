@@ -11,7 +11,6 @@ extern crate alloc;
 
 pub mod authority;
 pub mod config;
-pub mod listener;
 pub mod policy;
 pub mod proxy;
 pub mod upstream;
@@ -21,29 +20,16 @@ mod stream;
 use std::io::{self, Write};
 use std::sync::Arc;
 
-use thiserror::Error;
 use tokio::net::TcpListener;
 
 use crate::config::ProxyConfig;
-use crate::listener::ListenerError;
 use crate::proxy::ProxyState;
 use crate::upstream::TcpUpstreamConnector;
 
-/// Reason the proxy could not start.
-#[derive(Debug, Error)]
-pub enum StartupError {
-    /// The listener could not be acquired or validated.
-    #[error(transparent)]
-    Listener(#[from] ListenerError),
-    /// An I/O operation failed during startup or while serving.
-    #[error(transparent)]
-    Io(#[from] io::Error),
-}
-
 /// Runs the proxy: startup, readiness announcement, then serving.
-pub async fn run(config: &ProxyConfig) -> Result<(), StartupError> {
-    let (listener, local_address) = listener::acquire(config.listener)?;
-    let listener = TcpListener::from_std(listener)?;
+pub async fn run(config: &ProxyConfig) -> io::Result<()> {
+    let listener = TcpListener::bind(config.listen).await?;
+    let local_address = listener.local_addr()?;
     let state = Arc::new(ProxyState::new(
         config.policy.clone(),
         Box::new(TcpUpstreamConnector),

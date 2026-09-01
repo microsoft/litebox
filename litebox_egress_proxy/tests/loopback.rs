@@ -10,7 +10,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use litebox_egress_proxy::listener::{ListenerSource, acquire};
 use litebox_egress_proxy::policy::{HostPolicy, Hostname};
 use litebox_egress_proxy::proxy::{ProxyState, serve};
 use litebox_egress_proxy::upstream::{BoxedUpstreamStream, ConnectFuture, UpstreamConnector};
@@ -45,7 +44,7 @@ struct TestProxy {
 }
 
 impl TestProxy {
-    fn start(rules: &[&str], routes: &[(&str, u16, SocketAddr)]) -> Self {
+    async fn start(rules: &[&str], routes: &[(&str, u16, SocketAddr)]) -> Self {
         let policy = HostPolicy::from_rules(rules.iter().copied()).expect("valid policy");
 
         let mut mapped = HashMap::new();
@@ -61,12 +60,12 @@ impl TestProxy {
         };
         let state = Arc::new(ProxyState::new(policy, Box::new(connector)));
 
-        let (listener, address) = acquire(ListenerSource::Bind(SocketAddrV4::new(
-            Ipv4Addr::LOCALHOST,
-            0,
-        )))
-        .expect("loopback listener");
-        let listener = TcpListener::from_std(listener).expect("async listener");
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("loopback listener");
+        let SocketAddr::V4(address) = listener.local_addr().expect("listener address") else {
+            panic!("expected IPv4 loopback");
+        };
 
         tokio::spawn(async move {
             let _ = serve(listener, state).await;
@@ -190,7 +189,8 @@ async fn connect_tunnel_relays_bytes() {
     let proxy = TestProxy::start(
         &["allowed.example:443"],
         &[("allowed.example", 443, upstream)],
-    );
+    )
+    .await;
 
     let mut client = proxy.connect().await;
     client
@@ -225,7 +225,8 @@ async fn allowed_hostname_is_connected_for_each_request() {
     let proxy = TestProxy::start(
         &["allowed.example:443"],
         &[("allowed.example", 443, upstream)],
-    );
+    )
+    .await;
 
     for _ in 0..2 {
         let response = proxy
@@ -243,7 +244,8 @@ async fn denied_host_and_port_do_not_trigger_network_activity() {
     let proxy = TestProxy::start(
         &["allowed.example:443"],
         &[("allowed.example", 443, upstream)],
-    );
+    )
+    .await;
 
     let denied_host = proxy
         .request("CONNECT denied.example:443 HTTP/1.1\r\nHost: denied.example:443\r\n\r\n")
@@ -264,7 +266,8 @@ async fn connect_authority_and_framing_are_validated() {
     let proxy = TestProxy::start(
         &["allowed.example:443"],
         &[("allowed.example", 443, upstream)],
-    );
+    )
+    .await;
 
     for request in [
         "CONNECT allowed.example HTTP/1.1\r\nHost: allowed.example\r\n\r\n",
@@ -286,7 +289,8 @@ async fn explicitly_allowed_dns_port_is_forwarded() {
     let proxy = TestProxy::start(
         &["allowed.example:53"],
         &[("allowed.example", 53, upstream)],
-    );
+    )
+    .await;
 
     let response = proxy
         .request("CONNECT allowed.example:53 HTTP/1.1\r\nHost: allowed.example:53\r\n\r\n")
@@ -297,7 +301,7 @@ async fn explicitly_allowed_dns_port_is_forwarded() {
 
 #[tokio::test]
 async fn unreachable_upstream_yields_bad_gateway() {
-    let proxy = TestProxy::start(&["allowed.example:443"], &[]);
+    let proxy = TestProxy::start(&["allowed.example:443"], &[]).await;
 
     let response = proxy
         .request("CONNECT allowed.example:443 HTTP/1.1\r\nHost: allowed.example:443\r\n\r\n")
@@ -312,7 +316,8 @@ async fn unsupported_methods_are_rejected_without_network_activity() {
     let proxy = TestProxy::start(
         &["allowed.example:443"],
         &[("allowed.example", 443, upstream)],
-    );
+    )
+    .await;
 
     let response = proxy
         .request("GET http://allowed.example/ HTTP/1.1\r\nHost: allowed.example\r\n\r\n")
