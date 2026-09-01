@@ -91,6 +91,7 @@ pub(crate) struct FilesState<Platform: ShimPlatform> {
     pub(crate) fs: alloc::sync::Arc<LinuxFS<Platform>>,
     pub(crate) raw_descriptor_store:
         litebox::sync::RwLock<Platform, litebox::fd::RawDescriptorStorage>,
+    /// Exclusive upper bound for raw file descriptor values.
     max_fd: AtomicUsize,
 }
 
@@ -145,10 +146,11 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
         min_fd: usize,
         max_fd: usize,
     ) -> Result<usize, TypedFd<Subsystem>> {
-        if min_fd > max_fd {
+        if min_fd >= max_fd {
             return Err(typed_fd);
         }
 
+        // XXX: Can clean+speed this up by exposing a new method at RawDescriptorStorage
         let mut raw_fd = min_fd;
         for occupied_raw_fd in rds.iter_alive().skip_while(|&fd| fd < min_fd) {
             if occupied_raw_fd != raw_fd {
@@ -156,7 +158,7 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
             }
             raw_fd += 1;
         }
-        if raw_fd > max_fd {
+        if raw_fd >= max_fd {
             return Err(typed_fd);
         }
         let success = rds.fd_into_specific_raw_integer(typed_fd, raw_fd);
@@ -2462,7 +2464,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let max_fd = files.max_fd.load(Ordering::Relaxed);
             match target {
                 DupFdRequest::Exact(target) | DupFdRequest::LowestAtOrAbove(target)
-                    if target > max_fd =>
+                    if target >= max_fd =>
                 {
                     return Err(DupFdError::TargetFdExceedsLimit);
                 }
