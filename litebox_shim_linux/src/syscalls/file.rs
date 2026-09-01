@@ -102,12 +102,12 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
             raw_descriptor_store: litebox::sync::RwLock::new(
                 litebox::fd::RawDescriptorStorage::new(),
             ),
-            fd_limit: AtomicUsize::new(usize::MAX),
+            max_fd: AtomicUsize::new(usize::MAX),
         }
     }
 
-    pub(crate) fn set_fd_limit(&self, fd_limit: usize) {
-        self.fd_limit.store(fd_limit, Ordering::Relaxed);
+    pub(crate) fn set_max_fd(&self, max_fd: usize) {
+        self.max_fd.store(max_fd, Ordering::Relaxed);
     }
 
     // Returns Ok(raw_fd) if it fits within the max limits already set up; otherwise returns the
