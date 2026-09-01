@@ -109,7 +109,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     } else {
         litebox_shim_windows::WindowsShimBuilder::new(platform)
     };
-    let litebox = shim_builder.litebox();
 
     let (program_path, program_args) = cli_args
         .program_and_arguments
@@ -117,21 +116,16 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         .context("program path missing — clap should have required at least one argument")?;
 
     let initial_file_system = {
-        let in_mem = litebox::fs::resolver::Resolver::new(
-            litebox,
-            litebox::fs::in_mem::InMem::new_initialized([(
-                "/tmp",
-                litebox::fs::in_mem::InitialNode::Directory {
-                    mode: litebox::fs::Mode::RWXU
-                        | litebox::fs::Mode::RWXG
-                        | litebox::fs::Mode::RWXO,
-                    owner: litebox::fs::UserInfo {
-                        user: 1000,
-                        group: 1000,
-                    },
+        let in_mem = litebox::fs::in_mem::InMem::new_initialized([(
+            "/tmp",
+            litebox::fs::in_mem::InitialNode::Directory {
+                mode: litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
+                owner: litebox::fs::UserInfo {
+                    user: 1000,
+                    group: 1000,
                 },
-            )]),
-        );
+            },
+        )]);
 
         shim_builder.default_fs(in_mem, tar_data.into())
     };
