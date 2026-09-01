@@ -258,16 +258,14 @@ impl PerCpuVariables {
     /// # Safety
     ///
     /// CR3 must no longer reference the previous table. A new ID must match
-    /// CR3. Must not be called from interrupt or exception context.
+    /// CR3. Interrupts must be disabled, and this must not run in exception context.
     pub(crate) unsafe fn set_active_page_table(
         &self,
         page_table: Option<(usize, Arc<crate::mm::PageTable<PAGE_SIZE>>)>,
     ) {
-        x86_64::instructions::interrupts::without_interrupts(|| {
-            // Safety: Only this core accesses the field, interrupts are disabled,
-            // and the update cannot fault.
-            unsafe { *self.active_page_table.get() = page_table }
-        });
+        // Safety: Only this core accesses the field, interrupts are disabled,
+        // and the update cannot fault.
+        unsafe { *self.active_page_table.get() = page_table }
     }
 }
 

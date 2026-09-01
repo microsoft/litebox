@@ -247,12 +247,6 @@ impl PageTableManager {
             return PageTableHandle::task(pt);
         }
 
-        // The anchor can lag CR3 briefly while switching page tables.
-        let task_pts = self.task_page_tables.read();
-        if let Some(pt) = task_pts.get(&cr3_id) {
-            return PageTableHandle::task(Arc::clone(pt));
-        }
-
         // CR3 doesn't match any known page table - this shouldn't happen
         unreachable!(
             "CR3 contains unknown page table: {:?}",
@@ -298,11 +292,13 @@ impl PageTableManager {
     ///   after the switch (including the code being executed and stack)
     /// - No references to user-space memory are held across the switch
     pub unsafe fn load_base(&self) {
-        // Release task ownership only after switching CR3.
-        self.base_page_table.load();
-        with_per_cpu_variables(|pcv| {
-            // Safety: CR3 now references the base page table.
-            unsafe { pcv.set_active_page_table(None) }
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            // Keep the previous page table alive until after switching CR3.
+            self.base_page_table.load();
+            with_per_cpu_variables(|pcv| {
+                // Safety: CR3 now references the base page table and interrupts are disabled.
+                unsafe { pcv.set_active_page_table(None) }
+            });
         });
     }
 
@@ -331,11 +327,13 @@ impl PageTableManager {
             Arc::clone(task_pts.get(&task_pt_id).ok_or(Errno::ENOENT)?)
         };
 
-        // Keep both page tables owned across the CR3 switch.
-        pt.load();
-        with_per_cpu_variables(|pcv| {
-            // Safety: CR3 now references `pt`.
-            unsafe { pcv.set_active_page_table(Some((task_pt_id, pt))) }
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            // Keep the previous page table alive until after switching CR3.
+            pt.load();
+            with_per_cpu_variables(|pcv| {
+                // Safety: CR3 now references `pt` and interrupts are disabled.
+                unsafe { pcv.set_active_page_table(Some((task_pt_id, pt))) }
+            });
         });
         Ok(())
     }
