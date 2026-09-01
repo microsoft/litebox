@@ -13,8 +13,8 @@ use crate::LiteBox;
 use crate::sync::RawSyncPrimitivesProvider;
 
 use super::backend::{
-    Backend, BackendHandles, DirHandle, FileHandle, PermissionCheck, Permissioned, SeekBehavior,
-    WalkOutcome, WalkStopReason, WalkingDirHandle,
+    Backend, BackendHandles, DirHandle, FileHandle, HandleRef, PermissionCheck, Permissioned,
+    SeekBehavior, WalkOutcome, WalkStopReason, WalkingDirHandle,
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
@@ -338,20 +338,21 @@ where
         }
     }
 
-    fn file_status(&self, h: &FileHandle) -> Result<FileStatus, FileStatusError> {
-        Ok(h.get_typed::<Self>().device.file_status())
-    }
-
-    fn dir_status(&self, h: &DirHandle) -> Result<FileStatus, FileStatusError> {
-        let _h = h.get_typed::<Self>();
-        Ok(FileStatus {
-            file_type: FileType::Directory,
-            mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
-            size: super::DEFAULT_DIRECTORY_SIZE,
-            owner: UserInfo::ROOT,
-            node_info: self.root_inode.clone(),
-            blksize: super::DEFAULT_DIRECTORY_SIZE,
-        })
+    fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError> {
+        match h {
+            HandleRef::File(h) => Ok(h.get_typed::<Self>().device.file_status()),
+            HandleRef::Dir(h) => {
+                let _h = h.get_typed::<Self>();
+                Ok(FileStatus {
+                    file_type: FileType::Directory,
+                    mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
+                    size: super::DEFAULT_DIRECTORY_SIZE,
+                    owner: UserInfo::ROOT,
+                    node_info: self.root_inode.clone(),
+                    blksize: super::DEFAULT_DIRECTORY_SIZE,
+                })
+            }
+        }
     }
 
     fn create_file_at(
@@ -375,14 +376,13 @@ where
         Err(RmdirError::ReadOnlyFileSystem)
     }
 
-    fn chmod_at(&self, _dir: DirHandle, _name: &str, _mode: Mode) -> Result<(), ChmodError> {
+    fn chmod(&self, _h: HandleRef<'_>, _mode: Mode) -> Result<(), ChmodError> {
         Err(ChmodError::ReadOnlyFileSystem)
     }
 
-    fn chown_at(
+    fn chown(
         &self,
-        _dir: DirHandle,
-        _name: &str,
+        _h: HandleRef<'_>,
         _user: Option<u16>,
         _group: Option<u16>,
     ) -> Result<(), ChownError> {

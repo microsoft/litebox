@@ -19,7 +19,7 @@ use super::errors::{
 use super::{
     FileType, Mode, OFlags,
     backend::{
-        DirHandle, FileHandle, PermissionCheck, PermissionInfo, SeekBehavior, WalkOutcome,
+        DirHandle, Handle, HandleRef, PermissionCheck, PermissionInfo, SeekBehavior, WalkOutcome,
         WalkStopReason, WalkingDirHandle,
     },
 };
@@ -191,6 +191,49 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             })
     }
 
+    /// Resolve `path` to an owned handle on the file or directory it names.
+    ///
+    /// The handle is taken with [`OFlags::PATH`], as it addresses the object for operations that
+    /// do not read or write its contents, and thus needs no access permissions on it.
+    fn path_handle(&self, context: &Context, path: &ResolvedPath) -> Result<Handle, WalkError> {
+        let map_open_error = |error| match error {
+            OpenError::PathError(error) => WalkError::PathError(error),
+            _ => WalkError::Io,
+        };
+        let components: Vec<_> = path.components.iter().map(String::as_str).collect();
+        if components.is_empty() {
+            let root = self
+                .backend
+                .owned_dir_at(self.backend.root(), OFlags::PATH)
+                .map_err(map_open_error)?;
+            return Ok(Handle::Dir(root));
+        }
+        let (outcome, walked) = self.walk_path(
+            context,
+            self.backend.root(),
+            &components,
+            #[cfg(debug_assertions)]
+            &components,
+        )?;
+        match outcome.stop_reason {
+            WalkStopReason::CompleteDirectory => Ok(Handle::Dir(
+                self.backend
+                    .owned_dir_at(outcome.last, OFlags::PATH)
+                    .map_err(map_open_error)?,
+            )),
+            WalkStopReason::StoppedAtNonDirectory => Ok(Handle::File(
+                self.backend
+                    .open_file_at(outcome.last, components[walked], OFlags::PATH)
+                    .map_err(map_open_error)?
+                    .item,
+            )),
+            WalkStopReason::Continue => {
+                // `walk_path` validates stop reasons before returning.
+                unreachable!()
+            }
+        }
+    }
+
     fn walk_to_directory<'a>(
         &'a self,
         context: &Context,
@@ -355,7 +398,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 return Err(OpenError::AlreadyExists);
             }
             return Ok(insert(
-                OwnedHandle::Dir(self.backend.owned_dir_at(self.backend.root(), flags)?),
+                Handle::Dir(self.backend.owned_dir_at(self.backend.root(), flags)?),
                 SeekBehavior::NonSeekable,
             ));
         }
@@ -374,7 +417,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                     return Err(OpenError::AlreadyExists);
                 }
                 Ok(insert(
-                    OwnedHandle::Dir(self.backend.owned_dir_at(outcome.last, flags)?),
+                    Handle::Dir(self.backend.owned_dir_at(outcome.last, flags)?),
                     SeekBehavior::NonSeekable,
                 ))
             }
@@ -396,7 +439,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                     return Err(OpenError::AccessNotAllowed);
                 }
                 let seek_behavior = self.backend.seek_behavior(&file.item);
-                Ok(insert(OwnedHandle::File(file.item), seek_behavior))
+                Ok(insert(Handle::File(file.item), seek_behavior))
             }
             Ok(_) => {
                 // `walk_path` validates stop reasons before returning.
@@ -426,7 +469,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 })?;
                 let file = self.backend.create_file_at(parent, name, mode)?;
                 let seek_behavior = self.backend.seek_behavior(&file);
-                Ok(insert(OwnedHandle::File(file), seek_behavior))
+                Ok(insert(Handle::File(file), seek_behavior))
             }
             Err(error) => match error {
                 WalkError::Io => Err(OpenError::Io),
@@ -456,8 +499,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         // smaller per-open-file-description primitive for position/append serialization, so the
         // descriptor entry can be unlocked before potentially blocking backend calls.
         let file = match &entry.entry.handle {
-            OwnedHandle::File(file) => file,
-            OwnedHandle::Dir(_) => return Err(ReadError::NotAFile),
+            Handle::File(file) => file,
+            Handle::Dir(_) => return Err(ReadError::NotAFile),
         };
         let seek_behavior = entry.entry.seek_behavior;
         if !entry.entry.read_allowed {
@@ -495,8 +538,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         // smaller per-open-file-description primitive for position/append serialization, so the
         // descriptor entry can be unlocked before potentially blocking backend calls.
         let file = match &entry.entry.handle {
-            OwnedHandle::File(file) => file,
-            OwnedHandle::Dir(_) => return Err(WriteError::NotAFile),
+            Handle::File(file) => file,
+            Handle::Dir(_) => return Err(WriteError::NotAFile),
         };
         let seek_behavior = entry.entry.seek_behavior;
         if !entry.entry.write_allowed {
@@ -511,7 +554,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             SeekBehavior::NonSeekable | SeekBehavior::ZeroPosition => 0,
             SeekBehavior::PositionBased if entry.entry.append_mode && offset.is_none() => {
                 self.backend
-                    .file_status(file)
+                    .status(HandleRef::File(file))
                     .map_err(|_| WriteError::Io)?
                     .size
             }
@@ -537,8 +580,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             .ok_or(SeekError::ClosedFd)?;
         let mut entry = entry.get_entry_mut();
         let file = match &entry.entry.handle {
-            OwnedHandle::File(file) => file,
-            OwnedHandle::Dir(_) => return Err(SeekError::NotAFile),
+            Handle::File(file) => file,
+            Handle::Dir(_) => return Err(SeekError::NotAFile),
         };
         if entry.entry.path_only {
             // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
@@ -551,7 +594,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             SeekBehavior::PositionBased => {
                 let file_len = self
                     .backend
-                    .file_status(file)
+                    .status(HandleRef::File(file))
                     .map_err(|_| SeekError::Io)?
                     .size;
                 let base = match whence {
@@ -586,8 +629,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             .ok_or(TruncateError::ClosedFd)?;
         let mut entry = entry.get_entry_mut();
         let file = match &entry.entry.handle {
-            OwnedHandle::File(file) => file,
-            OwnedHandle::Dir(_) => return Err(TruncateError::IsDirectory),
+            Handle::File(file) => file,
+            Handle::Dir(_) => return Err(TruncateError::IsDirectory),
         };
         if !entry.entry.write_allowed {
             return Err(TruncateError::NotForWriting);
@@ -607,21 +650,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     fn chmod(&self, path: impl Arg, mode: Mode) -> Result<(), ChmodError> {
         let context = default_context_pre_context_management_changes();
         let path = context.resolve(path)?;
-        let Some((parent, name)) =
-            self.parent_dir_and_name(&context, &path)
-                .map_err(|error| match error {
-                    WalkError::Io => ChmodError::Io,
-                    WalkError::PathError(error) => error.into(),
-                })?
-        else {
-            // TODO(jayb): Add backend support for mutating the root directory itself.
-            unimplemented!("chmod root directory")
-        };
-        let parent = self.owned_parent_dir(parent).map_err(|error| match error {
-            WalkError::Io => ChmodError::Io,
-            WalkError::PathError(error) => error.into(),
-        })?;
-        self.backend.chmod_at(parent, name, mode)
+        let handle = self
+            .path_handle(&context, &path)
+            .map_err(|error| match error {
+                WalkError::Io => ChmodError::Io,
+                WalkError::PathError(error) => error.into(),
+            })?;
+        self.backend.chmod(handle.as_ref(), mode)
     }
 
     fn chown(
@@ -632,21 +667,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     ) -> Result<(), ChownError> {
         let context = default_context_pre_context_management_changes();
         let path = context.resolve(path)?;
-        let Some((parent, name)) =
-            self.parent_dir_and_name(&context, &path)
-                .map_err(|error| match error {
-                    WalkError::Io => ChownError::Io,
-                    WalkError::PathError(error) => error.into(),
-                })?
-        else {
-            // TODO(jayb): Add backend support for mutating the root directory itself.
-            unimplemented!("chown root directory")
-        };
-        let parent = self.owned_parent_dir(parent).map_err(|error| match error {
-            WalkError::Io => ChownError::Io,
-            WalkError::PathError(error) => error.into(),
-        })?;
-        self.backend.chown_at(parent, name, user, group)
+        let handle = self
+            .path_handle(&context, &path)
+            .map_err(|error| match error {
+                WalkError::Io => ChownError::Io,
+                WalkError::PathError(error) => error.into(),
+            })?;
+        self.backend.chown(handle.as_ref(), user, group)
     }
 
     fn unlink(&self, path: impl Arg) -> Result<(), UnlinkError> {
@@ -718,8 +745,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             unimplemented!("read_dir on O_PATH fd")
         }
         let dir = match &entry.entry.handle {
-            OwnedHandle::File(_) => return Err(ReadDirError::NotADirectory),
-            OwnedHandle::Dir(dir) => dir,
+            Handle::File(_) => return Err(ReadDirError::NotADirectory),
+            Handle::Dir(dir) => dir,
         };
 
         let mut entries = Vec::new();
@@ -762,26 +789,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             .entry_handle(fd)
             .ok_or(FileStatusError::ClosedFd)?;
         let entry = entry.get_entry();
-        match &entry.entry.handle {
-            OwnedHandle::File(file) => self.backend.file_status(file),
-            OwnedHandle::Dir(dir) => self.backend.dir_status(dir),
-        }
+        self.backend.status(entry.entry.handle.as_ref())
     }
 
     fn get_static_backing_data(&self, fd: &TypedFd<Self>) -> Option<&'static [u8]> {
         let entry = self.litebox.descriptor_table().entry_handle(fd)?;
         let entry = entry.get_entry();
         match &entry.entry.handle {
-            OwnedHandle::File(file) => self.backend.get_static_backing_data(file),
-            OwnedHandle::Dir(_) => None,
+            Handle::File(file) => self.backend.get_static_backing_data(file),
+            Handle::Dir(_) => None,
         }
     }
-}
-
-/// A file or a directory handle
-enum OwnedHandle {
-    File(FileHandle),
-    Dir(DirHandle),
 }
 
 #[expect(
@@ -789,7 +807,7 @@ enum OwnedHandle {
     reason = "resolver fd entries carry independent descriptor flags"
 )]
 struct ResolverEntry<Backend: super::backend::Backend> {
-    handle: OwnedHandle,
+    handle: Handle,
     _backend: core::marker::PhantomData<Backend>,
     read_allowed: bool,
     write_allowed: bool,

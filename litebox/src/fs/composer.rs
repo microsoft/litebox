@@ -10,8 +10,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::backend::{
-    Backend, BackendHandles, DirHandle, FileHandle, PermissionCheck, Permissioned, SeekBehavior,
-    WalkOutcome, WalkStopReason, WalkedComponent, WalkingDirHandle,
+    Backend, BackendHandles, DirHandle, FileHandle, HandleRef, PermissionCheck, Permissioned,
+    SeekBehavior, WalkOutcome, WalkStopReason, WalkedComponent, WalkingDirHandle,
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
@@ -668,20 +668,24 @@ impl Backend for Composer {
         self.mounts[h.mount_index].backend.seek_behavior(&h.handle)
     }
 
-    fn file_status(&self, h: &FileHandle) -> Result<FileStatus, FileStatusError> {
-        let h = h.get_typed::<Self>();
-        self.mounts[h.mount_index].backend.file_status(&h.handle)
-    }
-
-    fn dir_status(&self, h: &DirHandle) -> Result<FileStatus, FileStatusError> {
-        let h = h.get_typed::<Self>();
-        match &h.inner {
-            ComposerDirHandleInner::Virtual { path } => Ok(self.virtual_dir_status(path)),
-            ComposerDirHandleInner::Mounted {
-                mount_index,
-                handle,
-                ..
-            } => self.mounts[*mount_index].backend.dir_status(handle),
+    fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError> {
+        match h {
+            HandleRef::File(h) => {
+                let h = h.get_typed::<Self>();
+                self.mounts[h.mount_index]
+                    .backend
+                    .status(HandleRef::File(&h.handle))
+            }
+            HandleRef::Dir(h) => match &h.get_typed::<Self>().inner {
+                ComposerDirHandleInner::Virtual { path } => Ok(self.virtual_dir_status(path)),
+                ComposerDirHandleInner::Mounted {
+                    mount_index,
+                    handle,
+                    ..
+                } => self.mounts[*mount_index]
+                    .backend
+                    .status(HandleRef::Dir(handle)),
+            },
         }
     }
 
@@ -770,43 +774,50 @@ impl Backend for Composer {
         }
     }
 
-    fn chmod_at(&self, dir: DirHandle, name: &str, mode: Mode) -> Result<(), ChmodError> {
-        let dir = dir.into_typed::<Self>();
-        match dir.inner {
-            ComposerDirHandleInner::Virtual { .. } => Err(ChmodError::ReadOnlyFileSystem),
-            ComposerDirHandleInner::Mounted {
-                path,
-                mount_index,
-                handle,
-            } => {
-                self.checked_child_path(path, name, ChmodError::ReadOnlyFileSystem)?;
-                self.mounts[mount_index]
+    fn chmod(&self, h: HandleRef<'_>, mode: Mode) -> Result<(), ChmodError> {
+        match h {
+            HandleRef::File(h) => {
+                let h = h.get_typed::<Self>();
+                self.mounts[h.mount_index]
                     .backend
-                    .chmod_at(handle, name, mode)
+                    .chmod(HandleRef::File(&h.handle), mode)
             }
+            HandleRef::Dir(h) => match &h.get_typed::<Self>().inner {
+                ComposerDirHandleInner::Virtual { .. } => Err(ChmodError::ReadOnlyFileSystem),
+                ComposerDirHandleInner::Mounted {
+                    mount_index,
+                    handle,
+                    ..
+                } => self.mounts[*mount_index]
+                    .backend
+                    .chmod(HandleRef::Dir(handle), mode),
+            },
         }
     }
 
-    fn chown_at(
+    fn chown(
         &self,
-        dir: DirHandle,
-        name: &str,
+        h: HandleRef<'_>,
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError> {
-        let dir = dir.into_typed::<Self>();
-        match dir.inner {
-            ComposerDirHandleInner::Virtual { .. } => Err(ChownError::ReadOnlyFileSystem),
-            ComposerDirHandleInner::Mounted {
-                path,
-                mount_index,
-                handle,
-            } => {
-                self.checked_child_path(path, name, ChownError::ReadOnlyFileSystem)?;
-                self.mounts[mount_index]
+        match h {
+            HandleRef::File(h) => {
+                let h = h.get_typed::<Self>();
+                self.mounts[h.mount_index]
                     .backend
-                    .chown_at(handle, name, user, group)
+                    .chown(HandleRef::File(&h.handle), user, group)
             }
+            HandleRef::Dir(h) => match &h.get_typed::<Self>().inner {
+                ComposerDirHandleInner::Virtual { .. } => Err(ChownError::ReadOnlyFileSystem),
+                ComposerDirHandleInner::Mounted {
+                    mount_index,
+                    handle,
+                    ..
+                } => self.mounts[*mount_index]
+                    .backend
+                    .chown(HandleRef::Dir(handle), user, group),
+            },
         }
     }
 }
