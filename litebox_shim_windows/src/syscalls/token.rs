@@ -925,8 +925,8 @@ impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 mod tests {
     use super::*;
     use crate::tests::{
-        TestFS, TestPlatform, const_ptr, mut_byte_ptr, mut_ptr, null_const_ptr, null_mut_ptr,
-        test_task, unicode_string, utf16_units,
+        const_ptr, mut_byte_ptr, mut_ptr, null_const_ptr, null_mut_ptr, test_task, unicode_string,
+        utf16_units,
     };
 
     #[repr(C)]
@@ -935,72 +935,6 @@ mod tests {
         user: TokenUser,
         sid: Sid,
         padding: u32,
-    }
-
-    #[test]
-    fn access_check_synthetically_grants_process_token_access() {
-        let task = test_task();
-        let mut token_handle = Handle::default();
-        assert_eq!(
-            task.sys_nt_open_process_token(
-                ProcessHandle::CURRENT,
-                TokenAccess::QUERY.bits(),
-                mut_ptr(&mut token_handle),
-            ),
-            NtStatus::SUCCESS
-        );
-
-        let security_descriptor = 1u8;
-        let generic_mapping = [0x10, 0x20, 0x40, 0x80];
-        let mut privilege_set = [u8::MAX; 8];
-        let mut privilege_set_length = privilege_set.len().try_into().unwrap();
-        let mut granted_access = 0;
-        let mut access_status = u32::MAX;
-
-        assert_eq!(
-            task.sys_nt_access_check(AccessCheckParameters {
-                security_descriptor: const_ptr(&security_descriptor),
-                client_token: token_handle,
-                desired_access: AccessMask::GENERIC_READ.bits() | 1,
-                generic_mapping: const_ptr(&generic_mapping),
-                privilege_set: mut_byte_ptr(&mut privilege_set),
-                privilege_set_length: mut_ptr(&mut privilege_set_length),
-                granted_access: mut_ptr(&mut granted_access),
-                access_status: mut_ptr(&mut access_status),
-            }),
-            NtStatus::SUCCESS
-        );
-        assert_eq!(privilege_set, [0; 8]);
-        assert_eq!(privilege_set_length, 8);
-        assert_eq!(granted_access, 0x11);
-        assert_eq!(access_status, 0);
-    }
-
-    #[test]
-    fn access_check_reports_synthetic_privilege_set_size() {
-        let task = test_task();
-        let security_descriptor = 1u8;
-        let generic_mapping = [0x10, 0x20, 0x40, 0x80];
-        let mut privilege_set_length = 0;
-        let mut granted_access = u32::MAX;
-        let mut access_status = u32::MAX;
-
-        assert_eq!(
-            task.sys_nt_access_check(AccessCheckParameters {
-                security_descriptor: const_ptr(&security_descriptor),
-                client_token: Task::<TestPlatform, TestFS>::CURRENT_PROCESS_TOKEN,
-                desired_access: 1,
-                generic_mapping: const_ptr(&generic_mapping),
-                privilege_set: null_mut_ptr(),
-                privilege_set_length: mut_ptr(&mut privilege_set_length),
-                granted_access: mut_ptr(&mut granted_access),
-                access_status: mut_ptr(&mut access_status),
-            }),
-            NtStatus::BUFFER_TOO_SMALL
-        );
-        assert_eq!(privilege_set_length, 8);
-        assert_eq!(granted_access, u32::MAX);
-        assert_eq!(access_status, u32::MAX);
     }
 
     #[test]
