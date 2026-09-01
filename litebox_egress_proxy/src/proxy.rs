@@ -26,7 +26,7 @@ use tokio::time::timeout;
 
 use crate::authority::{RequestAuthority, parse_authority};
 use crate::policy::HostPolicy;
-use crate::stream::LimitedStream;
+use crate::stream::IdleTimeoutStream;
 use crate::upstream::{BoxedUpstreamStream, UpstreamConnector};
 
 const MAX_CONCURRENT_CLIENT_CONNECTIONS: usize = 256;
@@ -87,7 +87,7 @@ async fn serve_connection(state: Arc<ProxyState>, stream: TcpStream, permit: Own
         return;
     }
 
-    let io = TokioIo::new(LimitedStream::new(stream, IDLE_TIMEOUT));
+    let io = TokioIo::new(IdleTimeoutStream::new(stream, IDLE_TIMEOUT));
     let permit = Arc::new(permit);
     let service = service_fn(move |request: Request<Incoming>| {
         let state = Arc::clone(&state);
@@ -148,7 +148,7 @@ async fn handle_connect(
     }
 
     let upstream = match connect_upstream(state, &authority).await {
-        Ok(stream) => LimitedStream::new(stream, IDLE_TIMEOUT),
+        Ok(stream) => IdleTimeoutStream::new(stream, IDLE_TIMEOUT),
         Err(status) => return status_response(status),
     };
 

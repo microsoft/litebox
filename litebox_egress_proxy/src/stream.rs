@@ -13,13 +13,13 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::{Instant, Sleep, sleep_until};
 
 /// A stream that fails after making no progress for its idle timeout.
-pub(crate) struct LimitedStream<S> {
+pub(crate) struct IdleTimeoutStream<S> {
     inner: S,
     idle: Duration,
     timer: Pin<Box<Sleep>>,
 }
 
-impl<S> LimitedStream<S> {
+impl<S> IdleTimeoutStream<S> {
     pub(crate) fn new(inner: S, idle: Duration) -> Self {
         Self {
             inner,
@@ -41,7 +41,7 @@ fn timed_out() -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, "stream idle timeout exceeded")
 }
 
-impl<S: AsyncRead + Unpin> AsyncRead for LimitedStream<S> {
+impl<S: AsyncRead + Unpin> AsyncRead for IdleTimeoutStream<S> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -59,7 +59,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for LimitedStream<S> {
     }
 }
 
-impl<S: AsyncWrite + Unpin> AsyncWrite for LimitedStream<S> {
+impl<S: AsyncWrite + Unpin> AsyncWrite for IdleTimeoutStream<S> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -110,7 +110,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn idle_stream_times_out() {
         let (client, _server) = duplex(64);
-        let mut limited = LimitedStream::new(client, Duration::from_secs(60));
+        let mut limited = IdleTimeoutStream::new(client, Duration::from_secs(60));
         let mut buffer = [0_u8; 8];
         let error = limited.read(&mut buffer).await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
