@@ -3,18 +3,17 @@
 
 //! Connection acceptance, authorization, and CONNECT tunnelling.
 //!
-//! Every raw-validated CONNECT request is authorized before DNS or upstream
-//! activity. A successful request consumes its client connection by upgrading
-//! it to one bounded bidirectional tunnel.
+//! Every CONNECT request is authorized before DNS or upstream activity. A
+//! successful request consumes its client connection by upgrading it to one
+//! bounded bidirectional tunnel.
 
 use core::convert::Infallible;
-use core::error::Error as StdError;
+use core::time::Duration;
 use std::io;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Empty};
+use http_body_util::Empty;
 use hyper::body::Incoming;
 use hyper::header::{self, HeaderValue};
 use hyper::http::uri::Authority;
@@ -22,38 +21,34 @@ use hyper::server::conn::http1 as server_http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode, Uri};
 use hyper_util::rt::{TokioIo, TokioTimer};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 
 use crate::authority::{RequestAuthority, parse_authority};
-use crate::headers::validate_connect_framing;
-use crate::limits::{
-    CLIENT_CLOSE_DRAIN_TIMEOUT, IDLE_TIMEOUT, MAX_CLIENT_CLOSE_DRAIN_BYTES,
-    MAX_CONCURRENT_CLIENT_CONNECTIONS, MAX_HEADER_FIELDS, MAX_REQUEST_HEADER_BYTES,
-    REQUEST_HEADER_READ_TIMEOUT, UPSTREAM_CONNECT_TIMEOUT,
-};
 use crate::policy::HostPolicy;
-use crate::request_head::read_validated_request_prefix;
-use crate::stream::{LimitedStream, PrefixedStream, share_tcp_read};
+use crate::stream::LimitedStream;
 use crate::upstream::{BoxedUpstreamStream, UpstreamConnector};
 
-/// Boxed error type used by response bodies.
-type BoxError = Box<dyn StdError + Send + Sync>;
+const MAX_CONCURRENT_CLIENT_CONNECTIONS: usize = 256;
+const MAX_REQUEST_HEADER_BYTES: usize = 16 * 1024;
+const MAX_HEADER_FIELDS: usize = 100;
+const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const REQUEST_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Response body type produced by the proxy.
-type ProxyBody = BoxBody<Bytes, BoxError>;
+type ProxyBody = Empty<Bytes>;
 
 /// Immutable state shared by every connection.
 pub struct ProxyState {
     policy: HostPolicy,
-    connector: Arc<dyn UpstreamConnector>,
+    connector: Box<dyn UpstreamConnector>,
 }
 
 impl ProxyState {
     /// Builds shared state from a validated policy and upstream connector.
-    pub fn new(policy: HostPolicy, connector: Arc<dyn UpstreamConnector>) -> Self {
+    pub fn new(policy: HostPolicy, connector: Box<dyn UpstreamConnector>) -> Self {
         Self { policy, connector }
     }
 }
@@ -93,32 +88,12 @@ async fn serve_connection(state: Arc<ProxyState>, stream: TcpStream, permit: Own
         return;
     }
 
-    let (stream, mut drain_handle) = share_tcp_read(stream);
-    let mut stream = LimitedStream::new(stream, IDLE_TIMEOUT);
-    let prefix = match read_validated_request_prefix(&mut stream).await {
-        Ok(prefix) => prefix.into_bytes(),
-        Err(error) => {
-            if let Some(response) = error.response() {
-                if let Err(write_error) = stream.write_all(response).await {
-                    diagnostic(format_args!(
-                        "failed to write request rejection after {error}: {write_error}"
-                    ));
-                } else {
-                    let _ = stream.shutdown().await;
-                    drain_client_input(&mut stream).await;
-                }
-            }
-            return;
-        }
-    };
-
-    let io = TokioIo::new(PrefixedStream::new(prefix, stream));
-    let connection_slot = Arc::new(Mutex::new(Some(permit)));
-    let service_connection_slot = Arc::clone(&connection_slot);
+    let io = TokioIo::new(LimitedStream::new(stream, IDLE_TIMEOUT));
+    let permit = Arc::new(permit);
     let service = service_fn(move |request: Request<Incoming>| {
         let state = Arc::clone(&state);
-        let connection_slot = Arc::clone(&service_connection_slot);
-        async move { Ok::<_, Infallible>(handle_request(state, connection_slot, request).await) }
+        let permit = Arc::clone(&permit);
+        async move { Ok::<_, Infallible>(handle_request(state, permit, request).await) }
     });
 
     let mut builder = server_http1::Builder::new();
@@ -126,72 +101,38 @@ async fn serve_connection(state: Arc<ProxyState>, stream: TcpStream, permit: Own
         .timer(TokioTimer::new())
         .header_read_timeout(Some(REQUEST_HEADER_READ_TIMEOUT))
         .max_buf_size(MAX_REQUEST_HEADER_BYTES)
-        .max_headers(MAX_HEADER_FIELDS)
-        .keep_alive(true)
-        .half_close(true);
+        .max_headers(MAX_HEADER_FIELDS);
 
-    let result = builder.serve_connection(io, service).with_upgrades().await;
-    let upgraded = connection_slot.lock().await.is_none();
-    if !upgraded {
-        drain_client_input(&mut drain_handle).await;
-    }
-    if let Err(error) = result {
+    if let Err(error) = builder.serve_connection(io, service).with_upgrades().await {
         diagnostic(format_args!("client connection ended: {error}"));
     }
-}
-
-/// Drains bounded client input so unread bytes cannot reset a rejection.
-async fn drain_client_input<S>(stream: &mut S)
-where
-    S: tokio::io::AsyncRead + Unpin,
-{
-    let drain = async {
-        let mut remaining = MAX_CLIENT_CLOSE_DRAIN_BYTES;
-        let mut buffer = [0_u8; 1024];
-        while remaining != 0 {
-            let capacity = remaining.min(buffer.len());
-            let read = stream.read(&mut buffer[..capacity]).await?;
-            if read == 0 {
-                break;
-            }
-            remaining -= read;
-        }
-        Ok::<(), io::Error>(())
-    };
-    let _ = timeout(CLIENT_CLOSE_DRAIN_TIMEOUT, drain).await;
 }
 
 /// Dispatches one request.
 async fn handle_request(
     state: Arc<ProxyState>,
-    connection_slot: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
+    permit: Arc<OwnedSemaphorePermit>,
     request: Request<Incoming>,
 ) -> Response<ProxyBody> {
-    let is_connect = request.method() == Method::CONNECT;
-    let mut response = if is_connect {
-        handle_connect(&state, connection_slot, request).await
-    } else {
-        status_response(StatusCode::NOT_IMPLEMENTED)
-    };
-
-    if !is_connect || !response.status().is_success() {
-        response
-            .headers_mut()
-            .insert(header::CONNECTION, HeaderValue::from_static("close"));
+    if request.method() != Method::CONNECT {
+        return status_response(StatusCode::NOT_IMPLEMENTED);
     }
-    response
+    handle_connect(&state, permit, request).await
 }
 
 /// Handles one CONNECT tunnel request.
 async fn handle_connect(
     state: &ProxyState,
-    connection_slot: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
+    permit: Arc<OwnedSemaphorePermit>,
     mut request: Request<Incoming>,
 ) -> Response<ProxyBody> {
     if request.headers().contains_key(header::UPGRADE) {
         return status_response(StatusCode::NOT_IMPLEMENTED);
     }
-    if validate_connect_framing(request.headers()).is_err() {
+    if request.headers().contains_key(header::TRANSFER_ENCODING)
+        || request.headers().contains_key(header::CONTENT_LENGTH)
+        || request.headers().get_all(header::HOST).iter().count() > 1
+    {
         return status_response(StatusCode::BAD_REQUEST);
     }
 
@@ -209,12 +150,9 @@ async fn handle_connect(
 
     let upstream = match connect_upstream(state, &authority).await {
         Ok(stream) => LimitedStream::new(stream, IDLE_TIMEOUT),
-        Err(failure) => return status_response(failure.status()),
+        Err(status) => return status_response(status),
     };
 
-    let Some(permit) = connection_slot.lock().await.take() else {
-        return status_response(StatusCode::SERVICE_UNAVAILABLE);
-    };
     let upgrade = hyper::upgrade::on(&mut request);
     tokio::spawn(async move {
         let _permit = permit;
@@ -231,7 +169,7 @@ async fn handle_connect(
         }
     });
 
-    let mut response = Response::new(empty_body());
+    let mut response = Response::new(Empty::new());
     *response.status_mut() = StatusCode::OK;
     response
 }
@@ -257,46 +195,27 @@ fn host_header_is_consistent(request: &Request<Incoming>, authority: &RequestAut
         .is_some_and(|host_header| &host_header == authority)
 }
 
-/// Reason no upstream connection could be established.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum UpstreamFailure {
-    Failed,
-    TimedOut,
-}
-
-impl UpstreamFailure {
-    fn status(self) -> StatusCode {
-        match self {
-            Self::Failed => StatusCode::BAD_GATEWAY,
-            Self::TimedOut => StatusCode::GATEWAY_TIMEOUT,
-        }
-    }
-}
-
 /// Resolves and connects to an authorized hostname.
 async fn connect_upstream(
     state: &ProxyState,
     authority: &RequestAuthority,
-) -> Result<BoxedUpstreamStream, UpstreamFailure> {
-    timeout(
+) -> Result<BoxedUpstreamStream, StatusCode> {
+    let result = timeout(
         UPSTREAM_CONNECT_TIMEOUT,
         state
             .connector
             .connect(authority.host().clone(), authority.port()),
     )
-    .await
-    .map_err(|_elapsed| UpstreamFailure::TimedOut)?
-    .map_err(|_error| UpstreamFailure::Failed)
-}
-
-fn empty_body() -> ProxyBody {
-    Empty::<Bytes>::new()
-        .map_err(|never| match never {})
-        .boxed()
+    .await;
+    match result {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(_error)) => Err(StatusCode::BAD_GATEWAY),
+        Err(_elapsed) => Err(StatusCode::GATEWAY_TIMEOUT),
+    }
 }
 
 fn status_response(status: StatusCode) -> Response<ProxyBody> {
-    let mut response = Response::new(empty_body());
+    let mut response = Response::new(Empty::new());
     *response.status_mut() = status;
     response
         .headers_mut()
@@ -325,14 +244,5 @@ mod tests {
         assert!(connect_authority(&uri("http://example.com:443")).is_none());
         assert!(connect_authority(&uri("example.com")).is_none());
         assert!(connect_authority(&uri("example.com:0")).is_none());
-    }
-
-    #[test]
-    fn upstream_failures_map_to_statuses() {
-        assert_eq!(UpstreamFailure::Failed.status(), StatusCode::BAD_GATEWAY);
-        assert_eq!(
-            UpstreamFailure::TimedOut.status(),
-            StatusCode::GATEWAY_TIMEOUT
-        );
     }
 }

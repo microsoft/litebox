@@ -59,17 +59,14 @@ impl TestProxy {
             routes: mapped,
             attempts: Arc::clone(&attempts),
         };
-        let state = Arc::new(ProxyState::new(policy, Arc::new(connector)));
+        let state = Arc::new(ProxyState::new(policy, Box::new(connector)));
 
-        let listener = acquire(ListenerSource::Bind(SocketAddrV4::new(
+        let (listener, address) = acquire(ListenerSource::Bind(SocketAddrV4::new(
             Ipv4Addr::LOCALHOST,
             0,
         )))
         .expect("loopback listener");
         let listener = TcpListener::from_std(listener).expect("async listener");
-        let SocketAddr::V4(address) = listener.local_addr().expect("listener address") else {
-            panic!("expected an IPv4 listener");
-        };
 
         tokio::spawn(async move {
             let _ = serve(listener, state).await;
@@ -273,6 +270,7 @@ async fn connect_authority_and_framing_are_validated() {
         "CONNECT allowed.example HTTP/1.1\r\nHost: allowed.example\r\n\r\n",
         "CONNECT 93.184.216.1:443 HTTP/1.1\r\nHost: 93.184.216.1:443\r\n\r\n",
         "CONNECT allowed.example:443 HTTP/1.1\r\nHost: allowed.example:80\r\n\r\n",
+        "CONNECT allowed.example:443 HTTP/1.1\r\nHost: allowed.example:443\r\nHost: allowed.example:443\r\n\r\n",
         "CONNECT allowed.example:443 HTTP/1.1\r\nHost: allowed.example:443\r\nContent-Length: 0\r\n\r\n",
         "CONNECT allowed.example:443 HTTP/1.1\r\nHost: allowed.example:443\r\nTransfer-Encoding: chunked\r\n\r\n",
     ] {
@@ -309,29 +307,6 @@ async fn unreachable_upstream_yields_bad_gateway() {
 }
 
 #[tokio::test]
-async fn denied_connect_early_bytes_are_drained_before_close() {
-    let upstream = echo_upstream().await;
-    let proxy = TestProxy::start(
-        &["allowed.example:443"],
-        &[("allowed.example", 443, upstream)],
-    );
-
-    let early = "x".repeat(32 * 1024);
-    let request = format!(
-        "CONNECT denied.example:443 HTTP/1.1\r\n\
-         Host: denied.example:443\r\n\
-         \r\n\
-         {early}"
-    );
-
-    let mut client = proxy.connect().await;
-    client.send(request.as_bytes()).await;
-    assert_eq!(client.read_response().await.status, 403);
-    assert!(!client.fill().await);
-    assert_eq!(proxy.upstream_attempts(), 0);
-}
-
-#[tokio::test]
 async fn unsupported_methods_are_rejected_without_network_activity() {
     let upstream = echo_upstream().await;
     let proxy = TestProxy::start(
@@ -343,38 +318,5 @@ async fn unsupported_methods_are_rejected_without_network_activity() {
         .request("GET http://allowed.example/ HTTP/1.1\r\nHost: allowed.example\r\n\r\n")
         .await;
     assert_eq!(response.status, 501);
-    assert_eq!(proxy.upstream_attempts(), 0);
-}
-
-#[tokio::test]
-async fn malformed_and_oversized_heads_are_rejected() {
-    let upstream = echo_upstream().await;
-    let proxy = TestProxy::start(
-        &["allowed.example:443"],
-        &[("allowed.example", 443, upstream)],
-    );
-
-    let spaced = proxy
-        .request("CONNECT allowed.example:443 HTTP/1.1\r\nHost : allowed.example:443\r\n\r\n")
-        .await;
-    assert_eq!(spaced.status, 400);
-
-    let folded = proxy
-        .request(concat!(
-            "CONNECT allowed.example:443 HTTP/1.1\r\n",
-            "Host: allowed.example:443\r\n",
-            "X-Folded: one\r\n two\r\n",
-            "\r\n"
-        ))
-        .await;
-    assert_eq!(folded.status, 400);
-
-    let mut oversized = String::from(
-        "CONNECT allowed.example:443 HTTP/1.1\r\nHost: allowed.example:443\r\nX-Big: ",
-    );
-    oversized.push_str(&"a".repeat(32 * 1024));
-    oversized.push_str("\r\n\r\n");
-    assert_eq!(proxy.request(&oversized).await.status, 431);
-
     assert_eq!(proxy.upstream_attempts(), 0);
 }

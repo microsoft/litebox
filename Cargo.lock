@@ -1545,7 +1545,6 @@ dependencies = [
  "clap",
  "hashbrown",
  "http-body-util",
- "httparse",
  "hyper",
  "hyper-util",
  "libc",
