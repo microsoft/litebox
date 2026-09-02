@@ -80,7 +80,7 @@ impl IdksPta {
     };
 
     pub(crate) fn open_session(params: &UteeParams) -> Result<u32, TeeResult> {
-        crate::syscalls::pta::open_default_pta_session(params)
+        crate::syscalls::pta::open_pta_session_no_params(params)
     }
 
     pub(crate) fn close_session<Platform: crate::OpteeShimPlatform>(
