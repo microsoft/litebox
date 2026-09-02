@@ -132,6 +132,12 @@ fn mmapped_file(path: impl AsRef<Path>) -> Result<MmappedFile> {
 /// panic. If it does actually panic, then ping the authors of LiteBox, and likely a better error
 /// message could be thrown instead.
 pub fn run(cli_args: CliArgs) -> Result<()> {
+    if cli_args.broker_proxy_url.is_some() && cli_args.broker_control_channel.is_none() {
+        return Err(anyhow!(
+            "--broker-proxy-url requires --broker-control-channel"
+        ));
+    }
+
     tracing_subscriber::fmt()
         .with_timer(tracing_subscriber::fmt::time::uptime())
         .with_level(true)
@@ -449,6 +455,19 @@ fn apply_broker_proxy_environment(environment: &mut Vec<String>, proxy_url: Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn programmatic_proxy_url_requires_broker_channel() {
+        let mut args = CliArgs::try_parse_from(["runner", "/bin/true"]).unwrap();
+        args.broker_proxy_url = Some("http://10.0.2.1:49152".to_owned());
+
+        let error = run(args).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "--broker-proxy-url requires --broker-control-channel"
+        );
+    }
 
     #[test]
     fn broker_proxy_replaces_proxy_environment() {
