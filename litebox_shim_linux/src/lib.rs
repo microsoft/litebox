@@ -296,7 +296,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> LinuxShim<Platform, FS> {
         } = task;
 
         let files = syscalls::file::FilesState::new(fs);
-        files.set_max_fd(syscalls::process::RLIMIT_NOFILE_CUR - 1);
+        files.set_max_fd(syscalls::process::RLIMIT_NOFILE_CUR);
         let files = Arc::new(files);
         files.initialize_stdio_in_shared_descriptors_table(&self.0);
 
