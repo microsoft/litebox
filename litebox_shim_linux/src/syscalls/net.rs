@@ -3354,7 +3354,7 @@ mod unix_tests {
     #[test]
     fn test_socketpair_race_with_concurrent_close() {
         let task = init_platform(None);
-        task.files.borrow().set_fd_limit(3);
+        task.files.borrow().set_max_fd(4);
 
         let stop = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
         let stop_closer = stop.clone();
