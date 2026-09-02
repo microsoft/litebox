@@ -115,7 +115,10 @@ impl<V: ValidateAccess, T> UserConstPtr<V, T> {
     /// # Safety
     ///
     /// `dst` must be either non-Rust memory or Rust memory with exclusive access.
-    pub unsafe fn copy_to_raw(self, dst: *mut T, len: usize) -> Option<()> {
+    pub unsafe fn copy_to_raw(self, dst: *mut T, len: usize) -> Option<()>
+    where
+        T: FromBytes,
+    {
         if len == 0 {
             return Some(());
         }
@@ -280,7 +283,10 @@ impl<V: ValidateAccess, T> UserMutPtr<V, T> {
     /// # Safety
     ///
     /// `src` must be either non-Rust memory or Rust memory without concurrent modification.
-    pub unsafe fn copy_from_raw(self, src: *const T, len: usize) -> Option<()> {
+    pub unsafe fn copy_from_raw(self, src: *const T, len: usize) -> Option<()>
+    where
+        T: FromBytes + IntoBytes,
+    {
         if len == 0 {
             return Some(());
         }
