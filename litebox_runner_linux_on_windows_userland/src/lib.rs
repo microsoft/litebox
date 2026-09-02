@@ -105,16 +105,21 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let prog_path = &cli_args.program_and_arguments[0];
 
     let initial_file_system = {
-        let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
-        in_mem.with_root_privileges(|fs| {
-            use litebox::fs::FileSystem as _;
-            fs.mkdir(
+        let in_mem = litebox::fs::resolver::Resolver::new(
+            litebox,
+            litebox::fs::in_mem::InMem::new_initialized([(
                 "/tmp",
-                litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
-            )
-            .unwrap();
-            fs.chown("/tmp", Some(1000), Some(1000)).unwrap();
-        });
+                litebox::fs::in_mem::InitialNode::Directory {
+                    mode: litebox::fs::Mode::RWXU
+                        | litebox::fs::Mode::RWXG
+                        | litebox::fs::Mode::RWXO,
+                    owner: litebox::fs::UserInfo {
+                        user: 1000,
+                        group: 1000,
+                    },
+                },
+            )]),
+        );
 
         shim_builder.default_fs(in_mem, tar_data.into())
     };

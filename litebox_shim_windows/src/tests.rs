@@ -114,8 +114,18 @@ pub(crate) fn test_task() -> Task<TestPlatform, TestFS> {
 pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<TestPlatform, TestFS> {
     let platform = test_platform();
     let litebox = LiteBox::new(platform);
-    let mut in_mem = litebox::fs::in_mem::FileSystem::new(&litebox);
-    in_mem.with_root_privileges(|fs| {
+    let in_mem = litebox::fs::resolver::Resolver::new(
+        &litebox,
+        litebox::fs::in_mem::InMem::new_initialized([(
+            "/",
+            litebox::fs::in_mem::InitialNode::Directory {
+                mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+                owner: litebox::fs::UserInfo::ROOT,
+            },
+        )]),
+    );
+    {
+        let fs = &in_mem;
         fs.mkdir(
             "/tmp",
             litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
@@ -152,7 +162,7 @@ pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<Test
                 .expect("NLS fixture write should succeed");
             fs.close(&fd).expect("NLS fixture close should succeed");
         }
-    });
+    }
     let shim_builder = crate::WindowsShimBuilder::<TestPlatform>::new(platform);
     let fs = Arc::new(shim_builder.default_fs(in_mem, litebox::fs::tar_ro::EMPTY_TAR_FILE.into()));
     let shim = shim_builder.build();

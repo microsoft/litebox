@@ -2541,7 +2541,12 @@ mod tests {
         let platform = crate::tests::test_platform();
         let litebox = litebox::LiteBox::new(platform);
         let page_manager = crate::WindowsPageManager::<crate::tests::TestPlatform>::new(&litebox);
-        let fs = Arc::new(litebox::fs::in_mem::FileSystem::new(&litebox));
+        let fs = Arc::new(litebox::fs::resolver::Resolver::new(
+            &litebox,
+            litebox::fs::in_mem::InMem::<crate::tests::TestPlatform>::new_initialized(
+                core::iter::empty::<(&str, litebox::fs::in_mem::InitialNode)>(),
+            ),
+        ));
         let loader = PeLoader::new(platform, fs, &page_manager);
         let image = loaded_module_image(application_module_base());
 
