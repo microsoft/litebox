@@ -69,6 +69,8 @@ struct Runner {
     unique_name: String,
     cmd_path: PathBuf,
     cmd_args: Vec<OsString>,
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    managed_proxy_hosts: Vec<OsString>,
     has_run: bool,
 }
 
@@ -125,6 +127,8 @@ impl Runner {
             tar_dir,
             cmd_path: target_guest_path,
             cmd_args: Vec::new(),
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            managed_proxy_hosts: Vec::new(),
             has_run: false,
             unique_name: unique_name.to_owned(),
         }
@@ -171,6 +175,19 @@ impl Runner {
         self
     }
 
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    fn managed_proxy(
+        &mut self,
+        allowed_hosts: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
+    ) -> &mut Self {
+        self.managed_proxy_hosts.extend(
+            allowed_hosts
+                .into_iter()
+                .map(|host| host.as_ref().to_os_string()),
+        );
+        self
+    }
+
     fn with_fs_path(&mut self, f: impl FnOnce(&Path)) -> &mut Self {
         f(&self.tar_dir);
         self
@@ -202,6 +219,31 @@ impl Runner {
             .arg(tar_file)
             .arg(&self.cmd_path)
             .args(&self.cmd_args);
+
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        if !self.managed_proxy_hosts.is_empty() {
+            let runner = self.command.get_program().to_os_string();
+            let runner_arguments = self
+                .command
+                .get_args()
+                .filter(|argument| *argument != "--unstable")
+                .map(std::ffi::OsStr::to_os_string)
+                .collect::<Vec<_>>();
+            let broker = Path::new(&runner).with_file_name("litebox-broker-userland");
+            let proxy = Path::new(&runner).with_file_name("litebox_egress_proxy");
+            assert!(
+                broker.is_file() && proxy.is_file(),
+                "managed proxy tests require a workspace build producing {} and {}",
+                broker.display(),
+                proxy.display()
+            );
+            let mut command = std::process::Command::new(broker);
+            for host in &self.managed_proxy_hosts {
+                command.arg("--allow-host").arg(host);
+            }
+            command.arg("--runner").arg(runner).args(runner_arguments);
+            self.command = command;
+        }
     }
 
     fn run_inner(&mut self, capture_stdout: bool) -> Vec<u8> {
@@ -1319,6 +1361,61 @@ fn test_broker_with_curl() {
 
     let output_str = String::from_utf8_lossy(&output);
     assert!(output_str.contains(RESPONSE_BODY), "Unexpected curl output");
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn test_managed_egress_proxy_with_curl() {
+    const CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
+
+    let probe = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
+        .expect("failed to create IPv4 route probe");
+    if let Err(error) = probe.connect((std::net::Ipv4Addr::new(192, 0, 2, 1), 9)) {
+        if error.kind() == std::io::ErrorKind::NetworkUnreachable {
+            eprintln!("skipping managed egress proxy test: IPv4 route unavailable: {error}");
+            return;
+        }
+        panic!("IPv4 route probe failed: {error}");
+    }
+
+    assert!(
+        Path::new(CA_BUNDLE).is_file(),
+        "system CA bundle is unavailable at {CA_BUNDLE}"
+    );
+
+    let curl_path = run_which("curl");
+    let mut runner = Runner::new(&curl_path, "managed_egress_proxy_curl");
+    runner
+        .env("HTTPS_PROXY=http://wrong.example:8080")
+        .env("NO_PROXY=*")
+        .with_fs_path(|root| {
+            let destination = root.join(CA_BUNDLE.trim_start_matches('/'));
+            std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            std::fs::copy(CA_BUNDLE, destination).unwrap();
+        })
+        .managed_proxy(["bing.com:443"])
+        .args([
+            "--silent",
+            "--show-error",
+            "--output",
+            "/dev/null",
+            "--write-out",
+            "%{http_code}",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "30",
+            "--cacert",
+            CA_BUNDLE,
+            "https://bing.com/",
+        ]);
+
+    let output = runner.output();
+    let status = String::from_utf8(output).expect("curl emitted non-UTF-8 status");
+    assert!(
+        status.len() == 3 && status.bytes().all(|byte| byte.is_ascii_digit()) && status != "000",
+        "curl did not receive an HTTPS response from bing.com: {status:?}"
+    );
 }
 
 /// Exercises sustained brokered TCP traffic and backpressure with iperf3.

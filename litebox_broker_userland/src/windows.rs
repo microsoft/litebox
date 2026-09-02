@@ -53,12 +53,16 @@ pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
     let control_listener = WindowsNamedPipeListener::bind(&control_pipe)?;
     let broker = BrokerCore::new(
         PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()).with_socket_policy(
-            configured_socket_policy(&args.allow_tcp_destination, &args.allow_udp_destination)?,
+            configured_socket_policy(
+                &args.allow_tcp_destination,
+                &args.allow_udp_destination,
+                None,
+            )?,
         ),
         Arc::new(UnsupportedSocketProvider),
     )?;
 
-    crate::run_runner_process(&args, &control_pipe, |runner, runner_process_id| {
+    crate::run_runner_process(&args, &control_pipe, None, |runner, runner_process_id| {
         serve_runner(&broker, control_listener, runner, runner_process_id)
     })
 }

@@ -39,6 +39,7 @@ const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(10);
 const REQUEST_QUEUE_CAPACITY: usize = 64;
 const WORKER_COUNT: usize = 8;
+const BROKER_PROXY_URL_ENV: &str = "LITEBOX_BROKER_PROXY_URL";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AllowedDestination {
@@ -85,6 +86,10 @@ impl FromStr for AllowedDestination {
 
 #[derive(Parser, Debug)]
 struct CliArgs {
+    /// Permit HTTP and HTTPS proxy requests to a hostname and destination ports.
+    #[cfg(target_os = "linux")]
+    #[arg(long = "allow-host", value_name = "HOST:PORT[-PORT]")]
+    allow_host: Vec<String>,
     /// Permit outbound TCP connections to a destination CIDR and port range.
     ///
     /// May be repeated to extend the default guest-network policy for TCP.
@@ -108,14 +113,20 @@ struct CliArgs {
 fn run_runner_process(
     args: &CliArgs,
     control_channel: &OsStr,
+    proxy_url: Option<&str>,
     serve: impl FnOnce(&mut Child, u32) -> Result<(), Box<dyn Error>>,
 ) -> Result<(), Box<dyn Error>> {
-    let mut runner = Command::new(&args.runner)
+    let mut command = Command::new(&args.runner);
+    command
         .arg("--unstable")
         .arg("--broker-control-channel")
-        .arg(control_channel)
-        .args(&args.runner_arguments)
-        .spawn()?;
+        .arg(control_channel);
+    if let Some(proxy_url) = proxy_url {
+        command.env(BROKER_PROXY_URL_ENV, proxy_url);
+    } else {
+        command.env_remove(BROKER_PROXY_URL_ENV);
+    }
+    let mut runner = command.args(&args.runner_arguments).spawn()?;
     let runner_process_id = runner.id();
     let association_result = serve(&mut runner, runner_process_id);
     if association_result.is_err() {
@@ -132,10 +143,14 @@ fn run_runner_process(
 fn configured_socket_policy(
     allowed_tcp_destinations: &[AllowedDestination],
     allowed_udp_destinations: &[AllowedDestination],
+    proxy_destination: Option<AllowedDestination>,
 ) -> Result<SocketPolicy, SocketPolicyError> {
     let mut policy = SocketPolicy::guest_network();
-    if !allowed_tcp_destinations.is_empty() {
-        let rules = destination_rules(allowed_tcp_destinations);
+    if !allowed_tcp_destinations.is_empty() || proxy_destination.is_some() {
+        let mut rules = destination_rules(allowed_tcp_destinations);
+        if let Some(proxy_destination) = proxy_destination {
+            rules.extend(destination_rules(&[proxy_destination]));
+        }
         policy = policy.with_tcp_destination_rules(&rules)?;
     }
     if !allowed_udp_destinations.is_empty() {
@@ -578,6 +593,22 @@ mod cli_tests {
         assert_eq!(args.allow_udp_destination.len(), 1);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cli_accepts_hostname_proxy_arguments() {
+        let args = CliArgs::try_parse_from([
+            "litebox-broker-userland",
+            "--allow-host",
+            "example.com:443",
+            "--runner",
+            "runner",
+            "guest",
+        ])
+        .unwrap();
+
+        assert_eq!(args.allow_host, ["example.com:443"]);
+    }
+
     #[test]
     fn destination_argument_parses_canonical_cidr_and_ports() {
         let allowed = "203.0.113.0/24:443-444"
@@ -598,18 +629,27 @@ mod cli_tests {
     #[test]
     fn destination_arguments_extend_the_guest_network_default_by_protocol() {
         assert_eq!(
-            configured_socket_policy(&[], &[]).unwrap(),
+            configured_socket_policy(&[], &[], None).unwrap(),
             SocketPolicy::guest_network()
         );
 
         let tcp = "0.0.0.0/0:80".parse::<AllowedDestination>().unwrap();
         let udp = "10.0.2.1/32:53".parse::<AllowedDestination>().unwrap();
-        let policy = configured_socket_policy(&[tcp], &[udp]).unwrap();
+        let proxy = "10.0.2.1/32:3128".parse::<AllowedDestination>().unwrap();
+        let policy = configured_socket_policy(&[tcp], &[udp], Some(proxy)).unwrap();
         let tcp_rules = policy.tcp_destination_rules().unwrap();
-        assert_eq!(tcp_rules.len(), 1);
+        assert_eq!(tcp_rules.len(), 2);
         assert_eq!(
             tcp_rules[0],
             DestinationRule::new(CallerCredential::HostGuaranteed, tcp.destination, tcp.ports,)
+        );
+        assert_eq!(
+            tcp_rules[1],
+            DestinationRule::new(
+                CallerCredential::HostGuaranteed,
+                proxy.destination,
+                proxy.ports,
+            )
         );
         let udp_rules = policy.udp_destination_rules().unwrap();
         assert_eq!(udp_rules.len(), 1);
