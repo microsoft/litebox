@@ -44,7 +44,12 @@ pub async fn run(config: ProxyConfig) -> io::Result<()> {
     }
 
     if config.exit_on_stdin_close {
-        let stdin_closed = watch_stdin_close();
+        let (sender, stdin_closed) = oneshot::channel();
+        std::thread::spawn(move || {
+            let mut stdin = io::stdin().lock();
+            let result = io::copy(&mut stdin, &mut io::sink()).map(|_read| ());
+            let _ = sender.send(result);
+        });
         tokio::select! {
             result = proxy::serve(listener, state) => result?,
             result = stdin_closed => {
@@ -55,14 +60,4 @@ pub async fn run(config: ProxyConfig) -> io::Result<()> {
         proxy::serve(listener, state).await?;
     }
     Ok(())
-}
-
-fn watch_stdin_close() -> oneshot::Receiver<io::Result<()>> {
-    let (sender, receiver) = oneshot::channel();
-    std::thread::spawn(move || {
-        let mut stdin = io::stdin().lock();
-        let result = io::copy(&mut stdin, &mut io::sink()).map(|_read| ());
-        let _ = sender.send(result);
-    });
-    receiver
 }
