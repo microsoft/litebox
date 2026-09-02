@@ -175,19 +175,6 @@ impl Runner {
         self
     }
 
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    fn managed_proxy(
-        &mut self,
-        allowed_hosts: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
-    ) -> &mut Self {
-        self.managed_proxy_hosts.extend(
-            allowed_hosts
-                .into_iter()
-                .map(|host| host.as_ref().to_os_string()),
-        );
-        self
-    }
-
     fn with_fs_path(&mut self, f: impl FnOnce(&Path)) -> &mut Self {
         f(&self.tar_dir);
         self
@@ -1385,6 +1372,7 @@ fn test_managed_egress_proxy_with_curl() {
 
     let curl_path = run_which("curl");
     let mut runner = Runner::new(&curl_path, "managed_egress_proxy_curl");
+    runner.managed_proxy_hosts.push("bing.com:443".into());
     runner
         .env("HTTPS_PROXY=http://wrong.example:8080")
         .env("NO_PROXY=*")
@@ -1393,7 +1381,6 @@ fn test_managed_egress_proxy_with_curl() {
             std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
             std::fs::copy(CA_BUNDLE, destination).unwrap();
         })
-        .managed_proxy(["bing.com:443"])
         .args([
             "--silent",
             "--show-error",
