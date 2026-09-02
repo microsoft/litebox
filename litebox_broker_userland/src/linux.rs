@@ -47,16 +47,15 @@ impl HostAssociationShutdown for UnixControlRingHostShutdown {
     }
 }
 
-pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
+pub(super) fn run(mut args: super::CliArgs) -> Result<(), Box<dyn Error>> {
     let proxy = if args.allow_host.is_empty() {
         None
     } else {
         Some(ManagedEgressProxy::start(&args.allow_host)?)
     };
-    let proxy_destination = proxy
-        .as_ref()
-        .map(ManagedEgressProxy::guest_destination)
-        .transpose()?;
+    if let Some(proxy) = &proxy {
+        args.allow_tcp_destination.push(proxy.guest_destination()?);
+    }
     let proxy_url = proxy.as_ref().map(ManagedEgressProxy::guest_url);
 
     let socket_dir = tempfile::Builder::new()
@@ -68,11 +67,7 @@ pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
     let limits = BrokerCoreLimits::DEFAULT;
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()).with_socket_policy(
-            configured_socket_policy(
-                &args.allow_tcp_destination,
-                &args.allow_udp_destination,
-                proxy_destination,
-            )?,
+            configured_socket_policy(&args.allow_tcp_destination, &args.allow_udp_destination)?,
         ),
         limits,
         Arc::new(LinuxSocketProvider::new(

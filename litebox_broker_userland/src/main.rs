@@ -39,7 +39,6 @@ const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(10);
 const REQUEST_QUEUE_CAPACITY: usize = 64;
 const WORKER_COUNT: usize = 8;
-const BROKER_PROXY_URL_ENV: &str = "LITEBOX_BROKER_PROXY_URL";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AllowedDestination {
@@ -122,9 +121,7 @@ fn run_runner_process(
         .arg("--broker-control-channel")
         .arg(control_channel);
     if let Some(proxy_url) = proxy_url {
-        command.env(BROKER_PROXY_URL_ENV, proxy_url);
-    } else {
-        command.env_remove(BROKER_PROXY_URL_ENV);
+        command.arg("--broker-proxy-url").arg(proxy_url);
     }
     let mut runner = command.args(&args.runner_arguments).spawn()?;
     let runner_process_id = runner.id();
@@ -143,14 +140,10 @@ fn run_runner_process(
 fn configured_socket_policy(
     allowed_tcp_destinations: &[AllowedDestination],
     allowed_udp_destinations: &[AllowedDestination],
-    proxy_destination: Option<AllowedDestination>,
 ) -> Result<SocketPolicy, SocketPolicyError> {
     let mut policy = SocketPolicy::guest_network();
-    if !allowed_tcp_destinations.is_empty() || proxy_destination.is_some() {
-        let mut rules = destination_rules(allowed_tcp_destinations);
-        if let Some(proxy_destination) = proxy_destination {
-            rules.extend(destination_rules(&[proxy_destination]));
-        }
+    if !allowed_tcp_destinations.is_empty() {
+        let rules = destination_rules(allowed_tcp_destinations);
         policy = policy.with_tcp_destination_rules(&rules)?;
     }
     if !allowed_udp_destinations.is_empty() {
@@ -629,14 +622,14 @@ mod cli_tests {
     #[test]
     fn destination_arguments_extend_the_guest_network_default_by_protocol() {
         assert_eq!(
-            configured_socket_policy(&[], &[], None).unwrap(),
+            configured_socket_policy(&[], &[]).unwrap(),
             SocketPolicy::guest_network()
         );
 
         let tcp = "0.0.0.0/0:80".parse::<AllowedDestination>().unwrap();
         let udp = "10.0.2.1/32:53".parse::<AllowedDestination>().unwrap();
         let proxy = "10.0.2.1/32:3128".parse::<AllowedDestination>().unwrap();
-        let policy = configured_socket_policy(&[tcp], &[udp], Some(proxy)).unwrap();
+        let policy = configured_socket_policy(&[tcp, proxy], &[udp]).unwrap();
         let tcp_rules = policy.tcp_destination_rules().unwrap();
         assert_eq!(tcp_rules.len(), 2);
         assert_eq!(

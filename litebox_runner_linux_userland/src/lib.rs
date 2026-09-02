@@ -17,18 +17,12 @@ extern crate alloc;
 // credentials aligned with the in-memory filesystem default user and avoids truncating high host IDs.
 const DEFAULT_GUEST_UID: u16 = 1000;
 const DEFAULT_GUEST_GID: u16 = 1000;
-const BROKER_PROXY_URL_ENV: &str = "LITEBOX_BROKER_PROXY_URL";
-const MANAGED_PROXY_ENV_KEYS: [&str; 10] = [
+const MANAGED_PROXY_ENV_KEYS: [&str; 5] = [
     "HTTP_PROXY",
-    "http_proxy",
     "HTTPS_PROXY",
-    "https_proxy",
     "ALL_PROXY",
-    "all_proxy",
     "FTP_PROXY",
-    "ftp_proxy",
     "NO_PROXY",
-    "no_proxy",
 ];
 
 /// Run Linux programs with LiteBox on unmodified Linux
@@ -95,6 +89,15 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub broker_control_channel: Option<PathBuf>,
+    /// Broker-supplied proxy URL for managed HTTP and HTTPS egress.
+    #[arg(
+        long = "broker-proxy-url",
+        value_name = "URL",
+        hide = true,
+        requires = "broker_control_channel",
+        help_heading = "Unstable Options"
+    )]
+    pub broker_proxy_url: Option<String>,
 }
 
 struct MmappedFile {
@@ -378,15 +381,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         .iter()
         .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
         .collect();
-    let mut environment = cli_args.environment_variables.clone();
+    let proxy_url = cli_args.broker_proxy_url;
+    let mut environment = cli_args.environment_variables;
     if cli_args.forward_environment_variables {
         environment.extend(std::env::vars().map(|(key, value)| format!("{key}={value}")));
     }
-    let proxy_url = if cli_args.broker_control_channel.is_some() {
-        std::env::var(BROKER_PROXY_URL_ENV).ok()
-    } else {
-        None
-    };
     apply_broker_proxy_environment(&mut environment, proxy_url.as_deref());
     let envp = environment
         .iter()
@@ -432,11 +431,10 @@ fn apply_broker_proxy_environment(environment: &mut Vec<String>, proxy_url: Opti
         let key = entry
             .split_once('=')
             .map_or(entry.as_str(), |(key, _value)| key);
-        key != BROKER_PROXY_URL_ENV
-            && (proxy_url.is_none()
-                || !MANAGED_PROXY_ENV_KEYS
-                    .iter()
-                    .any(|managed| managed.eq_ignore_ascii_case(key)))
+        proxy_url.is_none()
+            || !MANAGED_PROXY_ENV_KEYS
+                .iter()
+                .any(|managed| managed.eq_ignore_ascii_case(key))
     });
 
     if let Some(proxy_url) = proxy_url {
@@ -459,7 +457,6 @@ mod tests {
             "HTTPS_PROXY=http://wrong.example:8080".to_owned(),
             "No_Proxy=*".to_owned(),
             "ALL_PROXY=http://wrong.example:8080".to_owned(),
-            format!("{BROKER_PROXY_URL_ENV}=internal"),
         ];
 
         apply_broker_proxy_environment(&mut environment, Some("http://10.0.2.1:49152"));

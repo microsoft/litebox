@@ -53,11 +53,7 @@ pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
     let control_listener = WindowsNamedPipeListener::bind(&control_pipe)?;
     let broker = BrokerCore::new(
         PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()).with_socket_policy(
-            configured_socket_policy(
-                &args.allow_tcp_destination,
-                &args.allow_udp_destination,
-                None,
-            )?,
+            configured_socket_policy(&args.allow_tcp_destination, &args.allow_udp_destination)?,
         ),
         Arc::new(UnsupportedSocketProvider),
     )?;
