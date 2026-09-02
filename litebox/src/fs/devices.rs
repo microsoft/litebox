@@ -8,6 +8,7 @@
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 
 use crate::LiteBox;
 use crate::sync::RawSyncPrimitivesProvider;
@@ -113,10 +114,7 @@ impl Device {
 /// A [`super::backend::Backend`] that supports Unix-y devices.
 pub struct Devices<Platform>
 where
-    Platform: RawSyncPrimitivesProvider
-        + crate::platform::StdioProvider
-        + crate::platform::CrngProvider
-        + 'static,
+    Platform: RawSyncPrimitivesProvider + crate::platform::StdioProvider + 'static,
 {
     litebox: LiteBox<Platform>,
     /// Stable inode info for this backend's root directory.
@@ -126,10 +124,7 @@ where
 
 impl<Platform> Devices<Platform>
 where
-    Platform: RawSyncPrimitivesProvider
-        + crate::platform::StdioProvider
-        + crate::platform::CrngProvider
-        + 'static,
+    Platform: RawSyncPrimitivesProvider + crate::platform::StdioProvider + 'static,
 {
     /// Construct a new `Devices` backend.
     #[must_use]
@@ -156,19 +151,13 @@ pub struct DeviceFileHandle {
 pub struct DeviceDirHandle;
 
 impl<Platform> super::backend::private::Sealed for Devices<Platform> where
-    Platform: RawSyncPrimitivesProvider
-        + crate::platform::StdioProvider
-        + crate::platform::CrngProvider
-        + 'static
+    Platform: RawSyncPrimitivesProvider + crate::platform::StdioProvider + 'static
 {
 }
 
 impl<Platform> BackendHandles for Devices<Platform>
 where
-    Platform: RawSyncPrimitivesProvider
-        + crate::platform::StdioProvider
-        + crate::platform::CrngProvider
-        + 'static,
+    Platform: RawSyncPrimitivesProvider + crate::platform::StdioProvider + 'static,
 {
     type WalkingDirHandle<'a> = DeviceDirHandle;
     type FileHandle = DeviceFileHandle;
@@ -177,10 +166,7 @@ where
 
 impl<Platform> Backend for Devices<Platform>
 where
-    Platform: RawSyncPrimitivesProvider
-        + crate::platform::StdioProvider
-        + crate::platform::CrngProvider
-        + 'static,
+    Platform: RawSyncPrimitivesProvider + crate::platform::StdioProvider + 'static,
 {
     fn root(&self) -> WalkingDirHandle<'_> {
         WalkingDirHandle::from_typed::<Self>(DeviceDirHandle)
@@ -293,7 +279,9 @@ where
                 Ok(0)
             }
             Device::URandom => {
-                self.litebox.x.platform.fill_bytes_crng(buf);
+                for chunk in buf.chunks_mut(MAX_RANDOM_TRANSFER_SIZE as usize) {
+                    self.litebox.fill_random(chunk).map_err(|_| ReadError::Io)?;
+                }
                 Ok(buf.len())
             }
         }
@@ -387,5 +375,31 @@ where
         _group: Option<u16>,
     ) -> Result<(), ChownError> {
         Err(ChownError::ReadOnlyFileSystem)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platform::mock::MockPlatform;
+
+    #[test]
+    fn urandom_requires_broker_only_for_nonempty_reads() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let devices = Devices::new(&litebox, InodeAllocator::standalone());
+        let urandom = open_urandom(&devices);
+
+        assert_eq!(devices.read(&urandom, &mut [], 0).unwrap(), 0);
+        assert!(matches!(
+            devices.read(&urandom, &mut [0], 0),
+            Err(ReadError::Io)
+        ));
+    }
+
+    fn open_urandom(devices: &Devices<MockPlatform>) -> FileHandle {
+        devices
+            .open_file_at(devices.root(), "urandom", OFlags::RDONLY)
+            .unwrap()
+            .item
     }
 }
