@@ -10,8 +10,8 @@ use crate::pipe::{
     CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
     WritePipeResponse,
 };
-use crate::random::FillRandomRequest;
 use crate::readiness::ReadinessFlags;
+use crate::shared_buffer::SharedBufferDescriptor;
 use crate::socket::{
     AcceptSocketRequest, AcceptSocketResponse, BindSocketRequest, BindSocketResponse,
     ConnectSocketRequest, ConnectSocketResponse, CreateSocketRequest, CreateSocketResponse,
@@ -44,7 +44,7 @@ pub enum BrokerOperation {
     /// Socket object request family.
     Socket(SocketRequest),
     /// Fill a shared buffer with cryptographically secure random bytes.
-    FillRandom(FillRandomRequest),
+    FillRandom(SharedBufferDescriptor),
 }
 
 /// Request sent over an active broker control channel.

@@ -34,7 +34,7 @@ use litebox_broker_protocol::message::{
 use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
 };
-use litebox_broker_protocol::random::{FillRandomRequest, MAX_RANDOM_TRANSFER_SIZE};
+use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::shared_buffer::{
     SHARED_BUFFER_LAYOUT, SHARED_BUFFER_SLOT_COUNT, SharedBufferDescriptor, SharedBufferSlotIndex,
 };
@@ -91,7 +91,7 @@ impl<Memory: SharedMemory> BrokerHostAssociation<'_, Memory> {
             operation,
         } = request;
         let buffer_descriptor = match &operation {
-            BrokerOperation::FillRandom(request) => Some(request.buffer),
+            BrokerOperation::FillRandom(buffer) => Some(*buffer),
             BrokerOperation::Pipe(PipeRequest::Read(request)) => Some(request.buffer),
             BrokerOperation::Pipe(PipeRequest::Write(request)) => Some(request.buffer),
             BrokerOperation::Socket(SocketRequest::Send(request)) => Some(request.buffer),
@@ -356,28 +356,20 @@ fn handle_request<Memory: SharedMemory>(
             handle_socket_request(session, request, shared_buffers, readiness_sink)
                 .map(BrokerResult::Socket)
         }
-        BrokerOperation::FillRandom(request) => {
-            handle_fill_random_request(session, request, shared_buffers)
+        BrokerOperation::FillRandom(buffer) => {
+            if buffer.length > MAX_RANDOM_TRANSFER_SIZE {
+                return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
+            }
+            let length = buffer.length as usize;
+            let mut data = [0u8; MAX_RANDOM_TRANSFER_SIZE as usize];
+            let data = &mut data[..length];
+            litebox_broker_core::random::fill(session, data).map_err(RequestFailure::from)?;
+            shared_buffers
+                .write(buffer.slot_index, data)
+                .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
+            Ok(BrokerResult::RandomFilled)
         }
     }
-}
-
-fn handle_fill_random_request<Memory: SharedMemory>(
-    session: &BrokerSession,
-    request: FillRandomRequest,
-    shared_buffers: &SharedBufferPool<Memory>,
-) -> RequestResult<BrokerResult> {
-    if request.buffer.length > MAX_RANDOM_TRANSFER_SIZE {
-        return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
-    }
-    let length = request.buffer.length as usize;
-    let mut data = [0u8; MAX_RANDOM_TRANSFER_SIZE as usize];
-    let data = &mut data[..length];
-    litebox_broker_core::random::fill(session, data).map_err(RequestFailure::from)?;
-    shared_buffers
-        .write(request.buffer.slot_index, data)
-        .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
-    Ok(BrokerResult::RandomFilled)
 }
 
 fn handle_socket_request<Memory: SharedMemory>(
@@ -730,7 +722,7 @@ mod tests {
     };
     use litebox_broker_protocol::message::BrokerHandshakeRequest;
     use litebox_broker_protocol::pipe::{CreatePipeRequest, ReadPipeRequest, WritePipeRequest};
-    use litebox_broker_protocol::random::{FillRandomRequest, MAX_RANDOM_TRANSFER_SIZE};
+    use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
     use litebox_broker_protocol::shared_buffer::{
         SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SHARED_BUFFER_SLOT_SIZE,
         SharedBufferDescriptor,
@@ -745,11 +737,7 @@ mod tests {
     };
     use litebox_broker_protocol::{ObjectHandle, ProtocolVersion, RequestId};
     use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemoryError};
-    use std::sync::{
-        Arc, Condvar, Mutex,
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    };
+    use std::sync::{Arc, Condvar, Mutex, mpsc};
     use std::time::Duration;
 
     struct TestReadinessSink;
@@ -803,14 +791,11 @@ mod tests {
         fn close_session(&self, _session_id: SessionId) {}
     }
 
-    #[derive(Default)]
-    struct TestRandomProvider {
-        fail: AtomicBool,
-    }
+    struct TestRandomProvider;
 
     impl RandomProvider for TestRandomProvider {
         fn fill(&self, output: &mut [u8]) -> core::result::Result<(), RandomProviderError> {
-            if self.fail.load(Ordering::SeqCst) {
+            if output.len() == 2 {
                 output.fill(0xcc);
                 return Err(RandomProviderError);
             }
@@ -968,12 +953,11 @@ mod tests {
 
     #[test]
     fn host_request_handling_uses_one_broker_core() {
-        let random_provider = Arc::new(TestRandomProvider::default());
         let broker = BrokerCore::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_socket_policy(SocketPolicy::guest_network()),
             Arc::new(TestSocketProvider),
-            random_provider.clone(),
+            Arc::new(TestRandomProvider),
         )
         .unwrap();
 
@@ -991,17 +975,14 @@ mod tests {
         active_request_closes_object_reference(&broker);
         association_shared_buffer_descriptors_stage_pipe_data(&broker);
         association_shared_buffer_descriptors_stage_socket_data(&broker);
-        association_shared_buffer_descriptor_stages_random_data(&broker, &random_provider);
+        association_shared_buffer_descriptor_stages_random_data(&broker);
         shared_buffer_usage_rejects_invalid_descriptors();
         association_executes_distinct_slots_concurrently(&broker);
         association_allows_slot_reuse_during_response_emission(&broker);
         association_allows_out_of_order_responses(&broker);
     }
 
-    fn association_shared_buffer_descriptor_stages_random_data(
-        broker: &BrokerCore,
-        random_provider: &TestRandomProvider,
-    ) {
+    fn association_shared_buffer_descriptor_stages_random_data(broker: &BrokerCore) {
         let session = broker
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();
@@ -1013,9 +994,7 @@ mod tests {
         assert_eq!(
             handle_test_request_with_buffers(
                 &session,
-                BrokerOperation::FillRandom(FillRandomRequest {
-                    buffer: descriptor(3, 3),
-                }),
+                BrokerOperation::FillRandom(descriptor(3, 3)),
                 &shared_buffers,
             ),
             BrokerResult::RandomFilled
@@ -1029,9 +1008,7 @@ mod tests {
         assert_eq!(
             handle_request(
                 &session,
-                BrokerOperation::FillRandom(FillRandomRequest {
-                    buffer: descriptor(3, MAX_RANDOM_TRANSFER_SIZE + 1),
-                }),
+                BrokerOperation::FillRandom(descriptor(3, MAX_RANDOM_TRANSFER_SIZE + 1)),
                 &shared_buffers,
                 &test_readiness_sink(),
             ),
@@ -1039,25 +1016,22 @@ mod tests {
         );
 
         shared_buffers
-            .write(SharedBufferSlotIndex(3), &[0xa5; 3])
+            .write(SharedBufferSlotIndex(3), &[0xa5; 2])
             .unwrap();
-        random_provider.fail.store(true, Ordering::SeqCst);
         assert_eq!(
             handle_request(
                 &session,
-                BrokerOperation::FillRandom(FillRandomRequest {
-                    buffer: descriptor(3, 3),
-                }),
+                BrokerOperation::FillRandom(descriptor(3, 2)),
                 &shared_buffers,
                 &test_readiness_sink(),
             ),
             Err(RequestFailure::Abort(ErrorCode::Internal))
         );
-        let mut output = [0u8; 3];
+        let mut output = [0u8; 2];
         shared_buffers
             .read(SharedBufferSlotIndex(3), &mut output)
             .unwrap();
-        assert_eq!(output, [0xa5; 3]);
+        assert_eq!(output, [0xa5; 2]);
     }
 
     fn test_channel_negotiates_routes_one_request_and_returns_peer_closed(broker: &BrokerCore) {

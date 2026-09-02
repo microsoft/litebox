@@ -23,9 +23,7 @@ use crate::message::{
     BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerOperation,
     BrokerRequest, BrokerResponse, BrokerResult, ReadinessNotification,
 };
-use crate::random::FillRandomRequest;
 use crate::readiness::ReadinessFlags;
-use crate::shared_buffer::{SharedBufferDescriptor, SharedBufferSlotIndex};
 
 use primitive::{Decoder, Encoder};
 
@@ -146,11 +144,10 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
             encoder.request_id(request_id);
             socket::encode_socket_request(&mut encoder, request);
         }
-        BrokerOperation::FillRandom(request) => {
+        BrokerOperation::FillRandom(buffer) => {
             encoder.u8(REQUEST_TAG_FILL_RANDOM);
             encoder.request_id(request_id);
-            encoder.u32(request.buffer.slot_index.0);
-            encoder.u32(request.buffer.length);
+            encoder.shared_buffer_descriptor(buffer);
         }
     }
     encoder.finish()
@@ -177,12 +174,7 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         REQUEST_TAG_EVENT => BrokerOperation::Event(event::decode_event_request(&mut decoder)?),
         REQUEST_TAG_PIPE => BrokerOperation::Pipe(pipe::decode_pipe_request(&mut decoder)?),
         REQUEST_TAG_SOCKET => BrokerOperation::Socket(socket::decode_socket_request(&mut decoder)?),
-        REQUEST_TAG_FILL_RANDOM => BrokerOperation::FillRandom(FillRandomRequest {
-            buffer: SharedBufferDescriptor {
-                slot_index: SharedBufferSlotIndex(decoder.u32()?),
-                length: decoder.u32()?,
-            },
-        }),
+        REQUEST_TAG_FILL_RANDOM => BrokerOperation::FillRandom(decoder.shared_buffer_descriptor()?),
         _ => unreachable!("active request tag was validated"),
     };
     decoder.finish()?;
@@ -374,7 +366,6 @@ mod tests {
         CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
         WritePipeResponse,
     };
-    use crate::random::FillRandomRequest;
     use crate::shared_buffer::{SharedBufferDescriptor, SharedBufferSlotIndex};
     use crate::socket::{
         AcceptSocketRequest, AcceptSocketResponse, AddressFamily, BindSocketRequest,
@@ -453,11 +444,9 @@ mod tests {
                     length: 3,
                 },
             })),
-            BrokerOperation::FillRandom(FillRandomRequest {
-                buffer: SharedBufferDescriptor {
-                    slot_index: SharedBufferSlotIndex(7),
-                    length: 256,
-                },
+            BrokerOperation::FillRandom(SharedBufferDescriptor {
+                slot_index: SharedBufferSlotIndex(7),
+                length: 256,
             }),
             BrokerOperation::Socket(SocketRequest::Create(CreateSocketRequest {
                 address_family: AddressFamily::Ipv4,

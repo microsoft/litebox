@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult};
-use litebox_broker_protocol::random::{FillRandomRequest, MAX_RANDOM_TRANSFER_SIZE};
+use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::shared_buffer::SharedBufferDescriptor;
 use litebox_broker_transport::channel::LocalCallChannel;
 
@@ -33,7 +33,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             .layout()
             .range(buffer.slot_index, output.len())
             .expect("shared random descriptor must identify a valid slot range");
-        match self.request(BrokerOperation::FillRandom(FillRandomRequest { buffer }))? {
+        match self.request(BrokerOperation::FillRandom(buffer))? {
             BrokerResult::RandomFilled => {
                 self.shared_buffers
                     .read(buffer.slot_index, output)
