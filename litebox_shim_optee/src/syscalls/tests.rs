@@ -23,7 +23,6 @@ fn ensure_platform() {
         #[cfg(not(target_os = "linux"))]
         let platform = Platform::new();
 
-        // Required for `derive_key` to succeed; the key-stack tests depend on it.
         #[cfg(target_os = "linux")]
         platform.initialize_boot_specific_kdf_support();
 
@@ -110,7 +109,6 @@ fn test_sys_map_zi_uses_bottom_up_placement() {
 
 const KEY_STACK_CMD: u32 = KeyStackCommandId::DeriveTaSvnKeyStack as u32;
 
-/// A single differential case: the inputs to one key stack derivation.
 struct Case {
     key_size: u32,
     stack_size: u32,
@@ -119,8 +117,6 @@ struct Case {
     extra_data: Vec<u8>,
 }
 
-/// Compile `tests/keystack_ref.c`, the re-hosted C original, into `dir` and
-/// return the path to the resulting binary.
 fn compile_c_reference(dir: &std::path::Path) -> std::path::PathBuf {
     let src = alloc::format!("{}/tests/keystack_ref.c", env!("CARGO_MANIFEST_DIR"));
     let out = dir.join("keystack_ref");
@@ -139,13 +135,10 @@ fn compile_c_reference(dir: &std::path::Path) -> std::path::PathBuf {
     out
 }
 
-/// Run the C reference over `cases`, returning one `<result_hex> <key_stack_hex>`
-/// line per case.
 fn run_c_reference(cases: &[Case]) -> Vec<alloc::string::String> {
     use alloc::string::{String, ToString};
     use core::fmt::Write as _;
 
-    // Scratch space for the compiled reference and its input.
     let dir = tempfile::tempdir().expect("create temp dir");
     let bin = compile_c_reference(dir.path());
 
@@ -191,7 +184,6 @@ fn run_c_reference(cases: &[Case]) -> Vec<alloc::string::String> {
         .collect()
 }
 
-/// Run one case through the actual PTA, formatted like the C reference output.
 fn run_rust_implementation(case: &Case) -> alloc::string::String {
     use alloc::string::String;
     use core::fmt::Write as _;
@@ -208,8 +200,6 @@ fn run_rust_implementation(case: &Case) -> alloc::string::String {
         case.ta_svn,
     );
 
-    // The C sizes its output buffer `key_size * (ta_svn + 1)`; match it so the
-    // full buffer, including any region the C leaves zeroed, is compared.
     let buf_len = case.key_size as usize * (case.ta_svn as usize + 1);
     let mut key_buf = vec![0u8; buf_len];
     let mut params = key_stack_params(
@@ -232,8 +222,6 @@ fn run_rust_implementation(case: &Case) -> alloc::string::String {
     out
 }
 
-/// Invoke the key stack PTA, discarding the (always-`None`) cleanup token so
-/// the result can be compared/unwrapped in assertions.
 fn invoke_key_stack(
     task: &crate::Task,
     cmd_id: u32,
@@ -244,7 +232,6 @@ fn invoke_key_stack(
         .map(|_| ())
 }
 
-/// Build a well-formed [`KeyStackCommandId::DeriveTaSvnKeyStack`] parameter set.
 fn key_stack_params(
     key_size: u64,
     stack_size: u64,
@@ -266,9 +253,6 @@ fn key_stack_params(
     params
 }
 
-/// The cases both implementations are run over: hand-picked boundaries first,
-/// then a deterministic pseudorandom sweep to cover combinations the boundary
-/// list would miss.
 fn differential_cases() -> Vec<Case> {
     let min_key_size = u32::try_from(TA_DERIVED_KEY_MIN_SIZE).unwrap();
     let max_key_size = u32::try_from(TA_DERIVED_KEY_MAX_SIZE).unwrap();
@@ -304,10 +288,7 @@ fn differential_cases() -> Vec<Case> {
         (32, 1, 0, 8),
         (32, 4096, 2, 8),
         (32, 4095, 0, 8),
-        // Inputs both implementations must reject, pinning the shared
-        // parameter validation as well as the derivation. The C and the port
-        // report the same code for each of these (TEE_ERROR_BAD_PARAMETERS),
-        // so they compare like any other case.
+        // Inputs both implementations must reject.
         (min_key_size - 1, 8, 0, 8),                    // key too small
         (max_key_size + 1, 8, 0, 8),                    // key too large
         (32, 8, 0, TA_DERIVED_EXTRA_DATA_MAX_SIZE + 1), // extra data too long
@@ -328,7 +309,6 @@ fn differential_cases() -> Vec<Case> {
         })
         .collect();
 
-    // Deterministic xorshift so failures are reproducible.
     let mut state: u64 = 0x2545_f491_4f6c_dd1d;
     let mut next = |n: u64| {
         state ^= state << 13;
@@ -337,7 +317,7 @@ fn differential_cases() -> Vec<Case> {
         state % n
     };
     for _ in 0..200 {
-        let key_size = 16 + u32::try_from(next(17)).unwrap(); // 16..=32
+        let key_size = 16 + u32::try_from(next(17)).unwrap();
         let stack_size = 1 + u32::try_from(next(64)).unwrap();
         let ta_svn = u32::try_from(next(16)).unwrap();
         let extra_len = usize::try_from(next(64)).unwrap();
@@ -358,13 +338,9 @@ fn differential_cases() -> Vec<Case> {
     cases
 }
 
-/// Differential test: the Rust port must agree byte for byte with the C
-/// original in `tests/keystack_ref.c`, which is compiled and run as part of
-/// this test.
+/// Differential test.
 ///
-/// Both sides derive from the same HUK (the platform feeds the KDF
-/// `/proc/sys/kernel/random/boot_id`, which the C reads directly), so the
-/// comparison covers the real derivation rather than a restatement of it.
+/// Both Rust and C sides derive from the same seed/base key.
 #[test]
 fn key_stack_matches_c_reference() {
     ensure_platform();
@@ -383,9 +359,6 @@ fn key_stack_matches_c_reference() {
     let mut rejected = 0;
     for (index, (case, expected)) in cases.iter().zip(c_output.iter()).enumerate() {
         let actual = run_rust_implementation(case);
-        // `differential_cases()` is deterministic, so the index alone is enough
-        // to identify and reproduce a failing case; the UUID is deliberately
-        // not reported here to keep derivation inputs out of test output.
         assert_eq!(
             &actual,
             expected,
@@ -403,8 +376,6 @@ fn key_stack_matches_c_reference() {
         }
     }
 
-    // Guard against a matrix that agrees only because nothing derives a key,
-    // or one that quietly stops covering the rejection paths.
     assert!(
         derived > 0 && rejected >= 5,
         "derived={derived} rejected={rejected}"

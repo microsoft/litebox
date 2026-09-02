@@ -2,10 +2,6 @@
 // Licensed under the MIT license.
 
 //! Implementation of the SVN key stack pseudo TA.
-//!
-//! This PTA derives a stack of TA-unique keys, one per Secure Version Number (SVN),
-//! so that a TA running at SVN `n` can unseal data sealed by any of its older
-//! versions while remaining unable to derive the keys of any newer version.
 
 use crate::syscalls::Cleanup;
 use crate::syscalls::pta::{
@@ -127,8 +123,6 @@ impl KeyStackPta {
         let required_stack_buffer_size_u64 =
             u64::try_from(required_stack_buffer_size).map_err(|_| TeeResult::BadParameters)?;
         if key_stack_buffer_size_u64 < required_stack_buffer_size_u64 {
-            // Report the required size so the caller can probe with a small
-            // buffer and retry, mirroring the GP short-buffer convention.
             params
                 .set_values(2, key_stack_addr, required_stack_buffer_size_u64)
                 .map_err(|_| TeeResult::BadParameters)?;
@@ -144,9 +138,8 @@ impl KeyStackPta {
                 .ok_or(TeeResult::BadParameters)?
         };
 
-        // Unlike OP-TEE OS, `UserMutPtr` (and `UserConstPtr`) in LiteBox ensure this
-        // pointer can never be used to access normal-world memory. That is, we don't
-        // need extra security check for detecting key leakage here.
+        // Unlike OP-TEE OS, `UserMutPtr`/`UserConstPtr` ensure this pointer can never
+        // be used to access normal-world memory.
         let key_stack_ptr = UserMutPtr::<u8>::from_usize(key_stack_addr.trunc());
 
         // First stage: derive base key = KDF(huk, usage || ta_uuid || extra data)

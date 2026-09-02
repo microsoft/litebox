@@ -2,27 +2,19 @@
 // Licensed under the MIT license.
 
 // Re-hosted reference implementation of `system_derive_ta_svn_key_stack()`
-// from the Microsoft OP-TEE fork, used for differential testing against the
-// Rust port in `litebox_shim_optee::keystack`.
+// from the Microsoft OP-TEE fork for differential testing.
 //
-// The derivation logic in `system_derive_ta_svn_key_stack()` below is copied
-// verbatim from the C original. Only the surrounding OP-TEE services are
-// re-hosted, none of which affect the derived bytes:
+// The derivation logic in `system_derive_ta_svn_key_stack()` is copied verbatim
+// from the C original. Only the surrounding OP-TEE services are re-hosted:
 //
-//   vm_check_access_rights()  -> dropped; a memory-safety check, and the Rust
-//                                port relies on UserMutPtr instead.
+//   vm_check_access_rights()  -> dropped; a memory-safety check.
 //   system_get_ta_version()   -> injected TA SVN.
 //   huk_subkey_derive()       -> HMAC-SHA256(HUK, LE32(usage) || data), per
 //                                optee_os core/kernel/huk_subkey.c.
 //   crypto_mac_*()            -> the HMAC-SHA256 below.
-//   HUK                       -> /proc/sys/kernel/random/boot_id, which is the
-//                                key the LiteBox Linux-userland platform feeds
-//                                its KDF.
+//   HUK                       -> /proc/sys/kernel/random/boot_id.
 //
 // Usage: keystack_ref <cases-file>
-// Each non-comment line is: key_size stack_size ta_svn uuid_hex extra_hex
-// ('-' denotes empty extra data). Prints "<tee_result_hex> <key_stack_hex>"
-// per case, where the key stack is `key_size * (ta_svn + 1)` bytes.
 
 #include <openssl/hmac.h>
 #include <openssl/evp.h>
@@ -342,8 +334,7 @@ int main(int argc, char **argv)
 		uint8_t uuid_bytes[16] = { 0 };
 		/*
 		 * Deliberately larger than the accepted maximum so that
-		 * over-size extra data reaches the length check below intact
-		 * rather than being silently truncated into a valid case.
+		 * over-size extra data reaches the length check below intact.
 		 */
 		uint8_t extra[TA_DERIVED_EXTRA_DATA_MAX_SIZE + 64];
 		size_t extra_len, stack_len, i;
@@ -357,7 +348,6 @@ int main(int argc, char **argv)
 			continue;
 
 		hex2bin(uuid_hex, uuid_bytes, 16);
-		/* Raw struct bytes, exactly what the original memcpy'd. */
 		memcpy(&g_uuid, uuid_bytes, 16);
 		if (strcmp(extra_hex, "-") && strlen(extra_hex) / 2 > sizeof(extra)) {
 			fprintf(stderr, "extra data too large for harness buffer\n");
