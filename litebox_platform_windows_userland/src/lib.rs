@@ -158,8 +158,8 @@ unsafe extern "system" fn vectored_exception_handler(
         context.Rsp = rsp as u64;
         context.Rbp = tls.host_bp.get() as u64;
         // `host_sp` points at the slot where `run_thread_arch` saved its
-        // `ThreadContext` argument. The exception record moved RSP below that
-        // slot, so pass the argument explicitly instead of loading it from RSP.
+        // `ThreadContext` argument. Set it to `rcx` (i.e., the first argument) so
+        // that [`exception_handler`] can access it.
         context.Rcx = unsafe { tls.host_sp.get().cast::<usize>().read() } as u64;
         context.Rdx = exception_record_ptr as u64;
     }
