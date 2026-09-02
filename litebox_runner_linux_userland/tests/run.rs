@@ -43,6 +43,7 @@ const BROKER_ONLY_C_TESTS: &[&str] = &[
     "tcp_broker_server.c",
     "udp_broker.c",
     "udp_broker_namespace.c",
+    "urandom_broker.c",
 ];
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -613,13 +614,19 @@ console.log(content);
         false,
         false,
     );
+    let urandom_target = common::compile(
+        "./tests/urandom_broker.c",
+        "broker_urandom_rewriter",
+        false,
+        false,
+    );
     let control_socket_path = unique_test_socket_path("runner-broker-control");
     let broker_thread = spawn_test_broker(
         &control_socket_path,
         litebox_broker_core::PolicyEngine::with_host_guaranteed_rights(
             litebox_broker_core::ObjectRights::all(),
         ),
-        4,
+        5,
     );
 
     Runner::new(&true_path, "broker_true_rewriter")
@@ -638,6 +645,11 @@ console.log(content);
         .run();
     // pipe_broker.c creates five pipes; each endpoint owns one broker object.
     assert_eq!(broker_thread.next_close_object_count(), 10);
+
+    Runner::new(&urandom_target, "broker_urandom_rewriter")
+        .broker_socket(&control_socket_path)
+        .run();
+    assert_eq!(broker_thread.next_close_object_count(), 0);
 
     Runner::new(&node_path, "hello_node_broker_rewriter")
         .broker_socket(&control_socket_path)
