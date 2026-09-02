@@ -387,19 +387,15 @@ mod tests {
     fn urandom_requires_broker_only_for_nonempty_reads() {
         let litebox = LiteBox::new(MockPlatform::new());
         let devices = Devices::new(&litebox, InodeAllocator::standalone());
-        let urandom = open_urandom(&devices);
+        let urandom = devices
+            .open_file_at(devices.root(), "urandom", OFlags::RDONLY)
+            .unwrap()
+            .item;
 
         assert_eq!(devices.read(&urandom, &mut [], 0).unwrap(), 0);
         assert!(matches!(
             devices.read(&urandom, &mut [0], 0),
             Err(ReadError::Io)
         ));
-    }
-
-    fn open_urandom(devices: &Devices<MockPlatform>) -> FileHandle {
-        devices
-            .open_file_at(devices.root(), "urandom", OFlags::RDONLY)
-            .unwrap()
-            .item
     }
 }
