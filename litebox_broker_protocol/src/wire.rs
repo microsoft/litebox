@@ -38,16 +38,21 @@ const REQUEST_TAG_CLOSE_OBJECT: u8 = 2;
 const REQUEST_TAG_PIPE: u8 = 3;
 const REQUEST_TAG_CHECK_READINESS: u8 = 4;
 const REQUEST_TAG_SOCKET: u8 = 5;
+const REQUEST_TAG_FILL_RANDOM: u8 = 6;
 
+// Paired request and successful-response tags intentionally share values.
 const RESPONSE_TAG_NEGOTIATED: u8 = 0;
 const RESPONSE_TAG_EVENT: u8 = 1;
-const RESPONSE_TAG_HANDSHAKE_ERROR: u8 = 2;
-const RESPONSE_TAG_VERSION_MISMATCH: u8 = 3;
-const RESPONSE_TAG_OBJECT_CLOSED: u8 = 4;
-const RESPONSE_TAG_PIPE: u8 = 5;
-const RESPONSE_TAG_READINESS: u8 = 6;
-const RESPONSE_TAG_ERROR: u8 = 7;
-const RESPONSE_TAG_SOCKET: u8 = 8;
+const RESPONSE_TAG_OBJECT_CLOSED: u8 = 2;
+const RESPONSE_TAG_PIPE: u8 = 3;
+const RESPONSE_TAG_READINESS: u8 = 4;
+const RESPONSE_TAG_SOCKET: u8 = 5;
+const RESPONSE_TAG_RANDOM_FILLED: u8 = 6;
+
+// Reserve the top of the tag space for responses without paired requests.
+const RESPONSE_TAG_ERROR: u8 = 253;
+const RESPONSE_TAG_HANDSHAKE_ERROR: u8 = 254;
+const RESPONSE_TAG_VERSION_MISMATCH: u8 = 255;
 
 const NOTIFICATION_TAG_READINESS: u8 = 0;
 
@@ -96,7 +101,8 @@ pub fn decode_handshake_request(frame: &[u8]) -> Result<BrokerHandshakeRequest, 
         | REQUEST_TAG_CLOSE_OBJECT
         | REQUEST_TAG_PIPE
         | REQUEST_TAG_CHECK_READINESS
-        | REQUEST_TAG_SOCKET => {
+        | REQUEST_TAG_SOCKET
+        | REQUEST_TAG_FILL_RANDOM => {
             return Err(WireError::WrongMessagePhase);
         }
         _ => return Err(WireError::InvalidTag),
@@ -141,6 +147,11 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
             encoder.request_id(request_id);
             socket::encode_socket_request(&mut encoder, request);
         }
+        BrokerOperation::FillRandom(buffer) => {
+            encoder.u8(REQUEST_TAG_FILL_RANDOM);
+            encoder.request_id(request_id);
+            encoder.shared_buffer_descriptor(buffer);
+        }
     }
     encoder.finish()
 }
@@ -155,7 +166,8 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         | REQUEST_TAG_CHECK_READINESS
         | REQUEST_TAG_EVENT
         | REQUEST_TAG_PIPE
-        | REQUEST_TAG_SOCKET => {}
+        | REQUEST_TAG_SOCKET
+        | REQUEST_TAG_FILL_RANDOM => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -165,6 +177,7 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         REQUEST_TAG_EVENT => BrokerOperation::Event(event::decode_event_request(&mut decoder)?),
         REQUEST_TAG_PIPE => BrokerOperation::Pipe(pipe::decode_pipe_request(&mut decoder)?),
         REQUEST_TAG_SOCKET => BrokerOperation::Socket(socket::decode_socket_request(&mut decoder)?),
+        REQUEST_TAG_FILL_RANDOM => BrokerOperation::FillRandom(decoder.shared_buffer_descriptor()?),
         _ => unreachable!("active request tag was validated"),
     };
     decoder.finish()?;
@@ -214,7 +227,8 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
         | RESPONSE_TAG_PIPE
         | RESPONSE_TAG_READINESS
         | RESPONSE_TAG_ERROR
-        | RESPONSE_TAG_SOCKET => {
+        | RESPONSE_TAG_SOCKET
+        | RESPONSE_TAG_RANDOM_FILLED => {
             return Err(WireError::WrongMessagePhase);
         }
         RESPONSE_TAG_VERSION_MISMATCH => BrokerHandshakeResponse::VersionMismatch {
@@ -262,6 +276,10 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
             encoder.request_id(request_id);
             socket::encode_socket_response(&mut encoder, response);
         }
+        BrokerResult::RandomFilled => {
+            encoder.u8(RESPONSE_TAG_RANDOM_FILLED);
+            encoder.request_id(request_id);
+        }
         BrokerResult::Error(error) => {
             encoder.u8(RESPONSE_TAG_ERROR);
             encoder.request_id(request_id);
@@ -284,7 +302,8 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         | RESPONSE_TAG_PIPE
         | RESPONSE_TAG_READINESS
         | RESPONSE_TAG_ERROR
-        | RESPONSE_TAG_SOCKET => {}
+        | RESPONSE_TAG_SOCKET
+        | RESPONSE_TAG_RANDOM_FILLED => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -298,6 +317,7 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         }
         RESPONSE_TAG_OBJECT_CLOSED => BrokerResult::ObjectClosed,
         RESPONSE_TAG_READINESS => BrokerResult::Readiness(ReadinessFlags(decoder.u32()?)),
+        RESPONSE_TAG_RANDOM_FILLED => BrokerResult::RandomFilled,
         _ => unreachable!("active response tag was validated"),
     };
     decoder.finish()?;
@@ -375,6 +395,38 @@ mod tests {
     }
 
     #[test]
+    fn successful_response_tags_match_request_tags() {
+        assert_eq!(
+            [
+                RESPONSE_TAG_NEGOTIATED,
+                RESPONSE_TAG_EVENT,
+                RESPONSE_TAG_OBJECT_CLOSED,
+                RESPONSE_TAG_PIPE,
+                RESPONSE_TAG_READINESS,
+                RESPONSE_TAG_SOCKET,
+                RESPONSE_TAG_RANDOM_FILLED,
+            ],
+            [
+                REQUEST_TAG_NEGOTIATE,
+                REQUEST_TAG_EVENT,
+                REQUEST_TAG_CLOSE_OBJECT,
+                REQUEST_TAG_PIPE,
+                REQUEST_TAG_CHECK_READINESS,
+                REQUEST_TAG_SOCKET,
+                REQUEST_TAG_FILL_RANDOM,
+            ]
+        );
+        assert_eq!(
+            [
+                RESPONSE_TAG_ERROR,
+                RESPONSE_TAG_HANDSHAKE_ERROR,
+                RESPONSE_TAG_VERSION_MISMATCH,
+            ],
+            [253, 254, 255]
+        );
+    }
+
+    #[test]
     fn handshake_request_codec_round_trips_all_variants() {
         let requests = [BrokerHandshakeRequest {
             protocol_version: ProtocolVersion(1),
@@ -427,6 +479,10 @@ mod tests {
                     length: 3,
                 },
             })),
+            BrokerOperation::FillRandom(SharedBufferDescriptor {
+                slot_index: SharedBufferSlotIndex(7),
+                length: 256,
+            }),
             BrokerOperation::Socket(SocketRequest::Create(CreateSocketRequest {
                 address_family: AddressFamily::Ipv4,
                 socket_type: SocketType::Stream,
@@ -760,6 +816,7 @@ mod tests {
                 SocketConnectionStatus::Failed(SocketError::TimedOut),
             ))),
             BrokerResult::Socket(SocketResponse::Failed(SocketError::ConnectionReset)),
+            BrokerResult::RandomFilled,
             BrokerResult::Error(ErrorCode::PolicyDenied),
             BrokerResult::Error(ErrorCode::WouldBlock),
             BrokerResult::Error(ErrorCode::PeerClosed),
@@ -1094,7 +1151,7 @@ mod tests {
     #[test]
     fn decode_rejects_malformed_handshake_response_frames() {
         assert_eq!(
-            decode_handshake_response(&[0xff, 1, 2, 3]),
+            decode_handshake_response(&[0xfc, 1, 2, 3]),
             Err(WireError::InvalidTag)
         );
         assert_eq!(
@@ -1102,7 +1159,7 @@ mod tests {
             Err(WireError::TruncatedFrame)
         );
         assert_eq!(
-            decode_handshake_response(&[2, 0xff, 0xff]),
+            decode_handshake_response(&[254, 0xff, 0xff]),
             Err(WireError::InvalidTag)
         );
         assert_eq!(
@@ -1142,7 +1199,7 @@ mod tests {
     #[test]
     fn decode_rejects_malformed_response_frames() {
         assert_eq!(
-            decode_response(&[0xff, 1, 2, 3]),
+            decode_response(&[0xfc, 1, 2, 3]),
             Err(WireError::InvalidTag)
         );
         for response in [
@@ -1286,7 +1343,7 @@ mod tests {
                 request_id: RequestId(13),
                 result: BrokerResult::Socket(SocketResponse::Failed(SocketError::ConnectionReset,)),
             }),
-            [8, 13, 0, 0, 0, 0, 0, 0, 0, 6, 2]
+            [5, 13, 0, 0, 0, 0, 0, 0, 0, 6, 2]
         );
     }
 
@@ -1302,7 +1359,7 @@ mod tests {
                 })),
             }),
             [
-                8, 13, 0, 0, 0, 0, 0, 0, 0, 9, 9, 0, 0, 0, 0, 0, 0, 0, 127, 0, 0, 1, 0, 192, 203,
+                5, 13, 0, 0, 0, 0, 0, 0, 0, 9, 9, 0, 0, 0, 0, 0, 0, 0, 127, 0, 0, 1, 0, 192, 203,
                 0, 113, 7, 187, 1,
             ]
         );

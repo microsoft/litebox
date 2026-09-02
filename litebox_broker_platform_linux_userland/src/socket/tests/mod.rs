@@ -8,6 +8,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
 use super::*;
+use litebox_broker_core::random::{RandomProvider, RandomProviderError};
 use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_core::socket::{GUEST_IPV4_ADDRESS, HOST_GATEWAY_IPV4_ADDRESS};
 use litebox_broker_core::{
@@ -27,6 +28,28 @@ mod tcp;
 mod udp;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+struct TestRandomProvider;
+
+impl RandomProvider for TestRandomProvider {
+    fn fill(&self, output: &mut [u8]) -> Result<(), RandomProviderError> {
+        output.fill(0x5a);
+        Ok(())
+    }
+}
+
+fn test_broker_core(
+    policy: PolicyEngine,
+    limits: BrokerCoreLimits,
+    socket_provider: Arc<LinuxSocketProvider>,
+) -> litebox_broker_core::Result<BrokerCore> {
+    BrokerCore::new_with_limits(
+        policy,
+        limits,
+        socket_provider,
+        Arc::new(TestRandomProvider),
+    )
+}
 
 #[test]
 fn tcp_pending_errors_preserve_order_and_source() {
@@ -358,7 +381,7 @@ fn directional_shutdown_survives_readiness_publication_failure() {
     });
 
     let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
-    let broker = BrokerCore::new_with_limits(
+    let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(gateway_tcp_policy()),
         BrokerCoreLimits::new_with_all_limits(4, 0, 2, 2),

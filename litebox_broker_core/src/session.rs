@@ -544,6 +544,7 @@ mod tests {
                 .with_socket_policy(SocketPolicy::guest_network()),
             BrokerCoreLimits::new_with_all_limits(2, 4, 2, 1),
             socket_provider.clone(),
+            Arc::new(crate::random::TestRandomProvider),
         )
         .unwrap();
 

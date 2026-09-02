@@ -4,7 +4,6 @@
 use core::net::{Ipv4Addr, SocketAddrV4};
 
 use crate::message::{SocketRequest, SocketResponse};
-use crate::shared_buffer::{SharedBufferDescriptor, SharedBufferSlotIndex};
 use crate::socket::{
     AcceptSocketRequest, AcceptSocketResponse, AddressFamily, BindSocketRequest,
     BindSocketResponse, ConnectSocketRequest, ConnectSocketResponse, CreateSocketRequest,
@@ -98,20 +97,20 @@ pub(super) fn encode_socket_request(encoder: &mut Encoder, request: SocketReques
         SocketRequest::Send(request) => {
             encoder.u8(SOCKET_TAG_SEND);
             encoder.handle(request.handle);
-            encode_shared_buffer_descriptor(encoder, request.buffer);
+            encoder.shared_buffer_descriptor(request.buffer);
             encoder.u32(request.flags.0);
         }
         SocketRequest::SendTo(request) => {
             encoder.u8(SOCKET_TAG_SEND_TO);
             encoder.handle(request.handle);
-            encode_shared_buffer_descriptor(encoder, request.buffer);
+            encoder.shared_buffer_descriptor(request.buffer);
             encoder.u32(request.flags.0);
             encode_optional_address(encoder, request.destination);
         }
         SocketRequest::Receive(request) => {
             encoder.u8(SOCKET_TAG_RECEIVE);
             encoder.handle(request.handle);
-            encode_shared_buffer_descriptor(encoder, request.buffer);
+            encoder.shared_buffer_descriptor(request.buffer);
             encoder.u32(request.flags.0);
             encoder.u32(request.peek_offset);
             encoder.u32(request.peek_length);
@@ -119,7 +118,7 @@ pub(super) fn encode_socket_request(encoder: &mut Encoder, request: SocketReques
         SocketRequest::ReceiveFrom(request) => {
             encoder.u8(SOCKET_TAG_RECEIVE_FROM);
             encoder.handle(request.handle);
-            encode_shared_buffer_descriptor(encoder, request.buffer);
+            encoder.shared_buffer_descriptor(request.buffer);
             encoder.u32(request.flags.0);
         }
         SocketRequest::Shutdown(request) => {
@@ -185,25 +184,25 @@ pub(super) fn decode_socket_request(decoder: &mut Decoder<'_>) -> Result<SocketR
         })),
         SOCKET_TAG_SEND => Ok(SocketRequest::Send(SendSocketRequest {
             handle: decoder.handle()?,
-            buffer: decode_shared_buffer_descriptor(decoder)?,
+            buffer: decoder.shared_buffer_descriptor()?,
             flags: SendFlags(decoder.u32()?),
         })),
         SOCKET_TAG_SEND_TO => Ok(SocketRequest::SendTo(SendToSocketRequest {
             handle: decoder.handle()?,
-            buffer: decode_shared_buffer_descriptor(decoder)?,
+            buffer: decoder.shared_buffer_descriptor()?,
             flags: SendFlags(decoder.u32()?),
             destination: decode_optional_address(decoder)?,
         })),
         SOCKET_TAG_RECEIVE => Ok(SocketRequest::Receive(ReceiveSocketRequest {
             handle: decoder.handle()?,
-            buffer: decode_shared_buffer_descriptor(decoder)?,
+            buffer: decoder.shared_buffer_descriptor()?,
             flags: ReceiveFlags(decoder.u32()?),
             peek_offset: decoder.u32()?,
             peek_length: decoder.u32()?,
         })),
         SOCKET_TAG_RECEIVE_FROM => Ok(SocketRequest::ReceiveFrom(ReceiveFromSocketRequest {
             handle: decoder.handle()?,
-            buffer: decode_shared_buffer_descriptor(decoder)?,
+            buffer: decoder.shared_buffer_descriptor()?,
             flags: ReceiveFromFlags(decoder.u32()?),
         })),
         SOCKET_TAG_SHUTDOWN => Ok(SocketRequest::Shutdown(ShutdownSocketRequest {
@@ -474,18 +473,4 @@ fn decode_optional_socket_error(
         1 => decode_socket_error(decoder).map(Some),
         _ => Err(WireError::InvalidTag),
     }
-}
-
-fn encode_shared_buffer_descriptor(encoder: &mut Encoder, descriptor: SharedBufferDescriptor) {
-    encoder.u32(descriptor.slot_index.0);
-    encoder.u32(descriptor.length);
-}
-
-fn decode_shared_buffer_descriptor(
-    decoder: &mut Decoder<'_>,
-) -> Result<SharedBufferDescriptor, WireError> {
-    Ok(SharedBufferDescriptor {
-        slot_index: SharedBufferSlotIndex(decoder.u32()?),
-        length: decoder.u32()?,
-    })
 }

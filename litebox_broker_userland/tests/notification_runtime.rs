@@ -3,10 +3,19 @@
 
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
+
+struct FailingRandomProvider;
+
+impl RandomProvider for FailingRandomProvider {
+    fn fill(&self, _output: &mut [u8]) -> Result<(), RandomProviderError> {
+        Err(RandomProviderError)
+    }
+}
 use std::sync::mpsc::{Receiver, channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use litebox_broker_core::random::{RandomProvider, RandomProviderError};
 use litebox_broker_core::socket::UnsupportedSocketProvider;
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
 use litebox_broker_host::{ConnectionTermination, setup_connection};
@@ -49,6 +58,7 @@ fn spawn_host(
         let broker = BrokerCore::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all()),
             Arc::new(UnsupportedSocketProvider),
+            Arc::new(FailingRandomProvider),
         )
         .unwrap();
         let shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();
@@ -131,6 +141,7 @@ fn host_serves_control_requests_and_notifications_over_shared_rings() {
     let broker = BrokerCore::new(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all()),
         Arc::new(UnsupportedSocketProvider),
+        Arc::new(FailingRandomProvider),
     )
     .unwrap();
     let (local_control, host_control) = UnixStream::pair().unwrap();

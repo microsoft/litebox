@@ -11,6 +11,20 @@ use std::{
 
 #[cfg(target_arch = "x86_64")]
 const BROKER_HELPER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+struct TestRandomProvider;
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+impl litebox_broker_core::random::RandomProvider for TestRandomProvider {
+    fn fill(
+        &self,
+        output: &mut [u8],
+    ) -> Result<(), litebox_broker_core::random::RandomProviderError> {
+        output.fill(0x5a);
+        Ok(())
+    }
+}
 // Dedicated fixtures build static binaries concurrently; exclude them to avoid
 // colliding with this sweep's dynamic `<stem>_rewriter` outputs.
 const DEDICATED_C_TESTS: &[&str] = &[
@@ -23,6 +37,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
 
 const BROKER_ONLY_C_TESTS: &[&str] = &[
     "eventfd.c",
+    "getrandom_broker.c",
     "pipe_broker.c",
     "tcp_broker.c",
     "tcp_broker_server.c",
@@ -71,6 +86,8 @@ struct Runner {
     cmd_args: Vec<OsString>,
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     managed_proxy_hosts: Vec<OsString>,
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    use_userland_broker: bool,
     has_run: bool,
 }
 
@@ -129,6 +146,8 @@ impl Runner {
             cmd_args: Vec::new(),
             #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
             managed_proxy_hosts: Vec::new(),
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            use_userland_broker: false,
             has_run: false,
             unique_name: unique_name.to_owned(),
         }
@@ -208,7 +227,7 @@ impl Runner {
             .args(&self.cmd_args);
 
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-        if !self.managed_proxy_hosts.is_empty() {
+        if self.use_userland_broker || !self.managed_proxy_hosts.is_empty() {
             let runner = self.command.get_program().to_os_string();
             let runner_arguments = self
                 .command
@@ -219,11 +238,17 @@ impl Runner {
             let broker = Path::new(&runner).with_file_name("litebox-broker-userland");
             let proxy = Path::new(&runner).with_file_name("litebox_egress_proxy");
             assert!(
-                broker.is_file() && proxy.is_file(),
-                "managed proxy tests require a workspace build producing {} and {}",
-                broker.display(),
-                proxy.display()
+                broker.is_file(),
+                "userland broker tests require a workspace build producing {}",
+                broker.display()
             );
+            if !self.managed_proxy_hosts.is_empty() {
+                assert!(
+                    proxy.is_file(),
+                    "managed proxy tests require a workspace build producing {}",
+                    proxy.display()
+                );
+            }
             let mut command = std::process::Command::new(broker);
             for host in &self.managed_proxy_hosts {
                 command.arg("--allow-host").arg(host);
@@ -437,6 +462,7 @@ fn spawn_test_broker_with_mode(
                     )
                     .expect("failed to create broker test socket provider"),
                 ),
+                std::sync::Arc::new(TestRandomProvider),
             )
             .expect("failed to create broker core");
             ready_tx.send(()).expect("failed to report broker ready");
@@ -623,6 +649,20 @@ console.log(content);
     assert!(broker_thread.next_close_object_count() > 0);
 
     broker_thread.join();
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn brokered_getrandom() {
+    let target = common::compile(
+        "./tests/getrandom_broker.c",
+        "brokered_getrandom",
+        false,
+        false,
+    );
+    let mut runner = Runner::new(&target, "brokered_getrandom");
+    runner.use_userland_broker = true;
+    runner.run();
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -1145,6 +1185,8 @@ fn python_runner(unique_name: &str) -> Runner {
             // LiteBox does not support timestamp yet, so pre-compiled .pyc files are not usable.
             // Avoid creating .pyc files as tar filesystem is read-only.
             "PYTHONDONTWRITEBYTECODE=1",
+            // These tests run without a broker and do not exercise Python hash randomization.
+            "PYTHONHASHSEED=0",
         ])
         .with_fs_path(|out_dir| {
             for source_path in &paths_to_stage {

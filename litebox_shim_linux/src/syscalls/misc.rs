@@ -26,7 +26,10 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
         while offset < count {
             let len = (count - offset).min(kbuf.len());
             let kbuf = &mut kbuf[..len];
-            <_ as litebox::platform::CrngProvider>::fill_bytes_crng(self.global.platform, kbuf);
+            self.global
+                .litebox
+                .fill_random(kbuf)
+                .map_err(|_| Errno::EIO)?;
             buf.copy_from_slice::<Platform>(offset, kbuf)
                 .ok_or(Errno::EFAULT)?;
             offset += len;
@@ -166,26 +169,28 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 #[cfg(test)]
 mod tests {
     use crate::syscalls::tests::init_platform;
+    use litebox_common_linux::errno::Errno;
     use litebox_common_linux::user_pointers::UserPtrMut;
     use zerocopy::FromZeros as _;
 
     #[test]
-    fn test_getrandom() {
+    fn test_getrandom_requires_broker() {
         use litebox_common_linux::RngFlags;
 
         let task = init_platform();
 
         let mut buf = [0u8; 16];
         let ptr = UserPtrMut::from_ptr(buf.as_mut_ptr());
-        let count = task
-            .sys_getrandom(ptr, buf.len() - 1, RngFlags::empty())
-            .expect("getrandom failed");
-        assert_eq!(count, buf.len() - 1);
-        assert!(
-            !buf.iter().all(|&b| b == 0),
-            "buffer should not be all zeros"
+        assert_eq!(
+            task.sys_getrandom(ptr, 0, RngFlags::empty()),
+            Ok(0),
+            "zero-length getrandom must not require a broker"
         );
-        assert!(buf[buf.len() - 1] == 0, "last byte should stay zero");
+        assert_eq!(
+            task.sys_getrandom(ptr, buf.len() - 1, RngFlags::empty()),
+            Err(Errno::EIO)
+        );
+        assert_eq!(buf, [0; 16]);
     }
 
     #[test]

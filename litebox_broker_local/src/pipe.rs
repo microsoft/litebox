@@ -127,10 +127,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         match self.request(BrokerOperation::Pipe(request))? {
             BrokerResult::Pipe(response) => Ok(response),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
-            response @ (BrokerResult::ObjectClosed
-            | BrokerResult::Readiness(_)
-            | BrokerResult::Event(_)
-            | BrokerResult::Socket(_)) => {
+            response => {
                 panic!("broker returned unexpected pipe response: {response:?}");
             }
         }

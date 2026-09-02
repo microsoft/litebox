@@ -24,6 +24,7 @@ pub mod net;
 pub mod path;
 pub mod pipes;
 pub mod platform;
+pub mod random;
 pub mod shim;
 pub mod sync;
 pub mod tls;

@@ -23,6 +23,7 @@ extern crate std;
 mod error;
 mod event;
 mod pipe;
+mod random;
 mod socket;
 
 use alloc::sync::Arc;
@@ -179,11 +180,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                 | ErrorCode::Internal => panic!("broker returned unrecoverable error: {error}"),
                 _ => panic!("broker returned unsupported error: {error}"),
             },
-            result @ (BrokerResult::Event(_)
-            | BrokerResult::Pipe(_)
-            | BrokerResult::Socket(_)
-            | BrokerResult::ObjectClosed
-            | BrokerResult::Readiness(_)) => Ok(result),
+            result => Ok(result),
         }
     }
 
@@ -211,10 +208,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         match self.request(BrokerOperation::CloseObject(handle))? {
             BrokerResult::ObjectClosed => Ok(()),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
-            response @ (BrokerResult::Event(_)
-            | BrokerResult::Pipe(_)
-            | BrokerResult::Socket(_)
-            | BrokerResult::Readiness(_)) => {
+            response => {
                 panic!("broker returned unexpected close response: {response:?}");
             }
         }

@@ -13,6 +13,7 @@ use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{ConsumeEventResponse, EventConsumeMode};
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
+use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
     AcceptSocketResponse, MAX_SOCKET_TRANSFER_SIZE, MAX_UDP_DATAGRAM_SIZE,
@@ -41,6 +42,8 @@ use shared_buffer::{SlotAllocator, SlotLease};
 /// Longer-term broker integrations should move away from blocking control calls
 /// once the local-core wait and notification model supports that shape.
 pub(crate) trait BrokerControl: Send + Sync {
+    fn fill_random(&self, output: &mut [u8]) -> core::result::Result<(), BrokerControlError>;
+
     fn create_tcp_socket(&self) -> core::result::Result<ObjectHandle, BrokerControlError>;
 
     fn create_udp_socket(&self) -> core::result::Result<ObjectHandle, BrokerControlError>;
@@ -300,6 +303,16 @@ where
     Platform: RawSyncPrimitivesProvider + TimeProvider,
     Channel: LocalCallChannel + Send + Sync,
 {
+    fn fill_random(&self, output: &mut [u8]) -> core::result::Result<(), BrokerControlError> {
+        if output.len() > MAX_RANDOM_TRANSFER_SIZE as usize {
+            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
+        }
+        let length =
+            u32::try_from(output.len()).expect("validated random transfer length must fit in u32");
+        let lease = self.acquire_shared_buffer(length)?;
+        self.request(|local| local.fill_random(lease.descriptor(), output))
+    }
+
     fn create_tcp_socket(&self) -> core::result::Result<ObjectHandle, BrokerControlError> {
         self.request(BrokerLocal::create_tcp_socket)
     }

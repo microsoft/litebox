@@ -16,6 +16,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+use litebox_broker_core::random::{RandomProvider, RandomProviderError};
 use litebox_broker_core::{
     BrokerCore, CallerCredential, DestinationPortRange, DestinationRule, Ipv4Cidr, SocketPolicy,
     SocketPolicyError,
@@ -39,6 +40,14 @@ const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(10);
 const REQUEST_QUEUE_CAPACITY: usize = 64;
 const WORKER_COUNT: usize = 8;
+
+struct UserlandRandomProvider;
+
+impl RandomProvider for UserlandRandomProvider {
+    fn fill(&self, output: &mut [u8]) -> Result<(), RandomProviderError> {
+        getrandom::fill(output).map_err(|_| RandomProviderError)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AllowedDestination {
@@ -769,6 +778,7 @@ mod tests {
             let broker = BrokerCore::new(
                 PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()),
                 Arc::new(UnsupportedSocketProvider),
+                Arc::new(UserlandRandomProvider),
             )
             .unwrap();
             let shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();

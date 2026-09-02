@@ -22,6 +22,7 @@ mod error;
 pub mod event;
 pub mod pipe;
 mod policy;
+pub mod random;
 pub mod readiness;
 mod session;
 pub mod socket;
@@ -38,6 +39,7 @@ pub use policy::{
     DestinationPortRange, DestinationRule, Ipv4Cidr, MAX_DESTINATION_RULES, PolicyEngine,
     PolicyProfile, SocketPolicy, SocketPolicyError,
 };
+use random::RandomProvider;
 use session::ObjectReference;
 pub use session::{BrokerSession, CallerCredential, ObjectRights, SessionId};
 use socket::{BrokerSocketPorts, SocketProvider};
@@ -116,6 +118,7 @@ pub struct BrokerCore {
     pub(crate) pending_references: Arc<AtomicUsize>,
     pub(crate) reserved_pipe_capacity: Arc<AtomicUsize>,
     pub(crate) reserved_sockets: Arc<AtomicUsize>,
+    pub(crate) random_provider: Arc<dyn RandomProvider>,
     pub(crate) socket_provider: Arc<dyn SocketProvider>,
     pub(crate) socket_ports: BrokerSocketPorts,
 }
@@ -124,8 +127,17 @@ static BROKER_CORE_CREATED: AtomicBool = AtomicBool::new(false);
 
 impl BrokerCore {
     /// Creates the broker core with a broker-wide platform socket provider.
-    pub fn new(policy: PolicyEngine, socket_provider: Arc<dyn SocketProvider>) -> Result<Self> {
-        Self::new_with_limits(policy, BrokerCoreLimits::DEFAULT, socket_provider)
+    pub fn new(
+        policy: PolicyEngine,
+        socket_provider: Arc<dyn SocketProvider>,
+        random_provider: Arc<dyn RandomProvider>,
+    ) -> Result<Self> {
+        Self::new_with_limits(
+            policy,
+            BrokerCoreLimits::DEFAULT,
+            socket_provider,
+            random_provider,
+        )
     }
 
     /// Creates the broker core with explicit limits and a socket provider.
@@ -133,6 +145,7 @@ impl BrokerCore {
         policy: PolicyEngine,
         limits: BrokerCoreLimits,
         socket_provider: Arc<dyn SocketProvider>,
+        random_provider: Arc<dyn RandomProvider>,
     ) -> Result<Self> {
         BROKER_CORE_CREATED
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -147,6 +160,7 @@ impl BrokerCore {
             pending_references: Arc::new(AtomicUsize::new(0)),
             reserved_pipe_capacity: Arc::new(AtomicUsize::new(0)),
             reserved_sockets: Arc::new(AtomicUsize::new(0)),
+            random_provider,
             socket_provider,
             socket_ports: BrokerSocketPorts::default(),
         })

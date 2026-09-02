@@ -11,6 +11,7 @@ use crate::pipe::{
     WritePipeResponse,
 };
 use crate::readiness::ReadinessFlags;
+use crate::shared_buffer::SharedBufferDescriptor;
 use crate::socket::{
     AcceptSocketRequest, AcceptSocketResponse, BindSocketRequest, BindSocketResponse,
     ConnectSocketRequest, ConnectSocketResponse, CreateSocketRequest, CreateSocketResponse,
@@ -42,6 +43,8 @@ pub enum BrokerOperation {
     Pipe(PipeRequest),
     /// Socket object request family.
     Socket(SocketRequest),
+    /// Fill a shared buffer with cryptographically secure random bytes.
+    FillRandom(SharedBufferDescriptor),
 }
 
 /// Request sent over an active broker control channel.
@@ -143,6 +146,8 @@ pub enum BrokerResult {
     Pipe(PipeResponse),
     /// Socket object response family.
     Socket(SocketResponse),
+    /// The requested shared buffer was filled with random bytes.
+    RandomFilled,
     /// Operation failed with an ABI-neutral broker error.
     Error(ErrorCode),
 }

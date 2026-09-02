@@ -663,10 +663,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         match self.request(BrokerOperation::Socket(request))? {
             BrokerResult::Socket(response) => Ok(response),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
-            response @ (BrokerResult::ObjectClosed
-            | BrokerResult::Readiness(_)
-            | BrokerResult::Event(_)
-            | BrokerResult::Pipe(_)) => {
+            response => {
                 panic!("broker returned unexpected socket response: {response:?}");
             }
         }
