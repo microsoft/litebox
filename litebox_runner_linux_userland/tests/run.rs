@@ -21,7 +21,8 @@ impl litebox_broker_core::random::RandomProvider for TestRandomProvider {
         &self,
         output: &mut [u8],
     ) -> Result<(), litebox_broker_core::random::RandomProviderError> {
-        getrandom::fill(output).map_err(|_| litebox_broker_core::random::RandomProviderError)
+        output.fill(0x5a);
+        Ok(())
     }
 }
 // Dedicated fixtures build static binaries concurrently; exclude them to avoid
