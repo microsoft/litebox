@@ -22,6 +22,7 @@ use std::io::{self, Write};
 use std::sync::Arc;
 
 use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 
 use crate::config::ProxyConfig;
 use crate::connector::TcpUpstreamConnector;
@@ -42,6 +43,21 @@ pub async fn run(config: ProxyConfig) -> io::Result<()> {
         stdout.flush()?;
     }
 
-    proxy::serve(listener, state).await?;
+    if config.exit_on_stdin_close {
+        let (sender, stdin_closed) = oneshot::channel();
+        std::thread::spawn(move || {
+            let mut stdin = io::stdin().lock();
+            let result = io::copy(&mut stdin, &mut io::sink()).map(|_read| ());
+            let _ = sender.send(result);
+        });
+        tokio::select! {
+            result = proxy::serve(listener, state) => result?,
+            result = stdin_closed => {
+                result.map_err(|_| io::Error::other("standard input watcher stopped"))??;
+            }
+        }
+    } else {
+        proxy::serve(listener, state).await?;
+    }
     Ok(())
 }

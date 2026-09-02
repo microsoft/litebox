@@ -24,6 +24,10 @@ pub struct Cli {
     /// Allowed hostname and destination ports, repeatable.
     #[arg(long = "allow-host", value_name = "HOST:PORT[-PORT]")]
     allow_host: Vec<String>,
+
+    /// Exit when standard input closes.
+    #[arg(long, hide = true)]
+    exit_on_stdin_close: bool,
 }
 
 /// Reason the arguments were rejected.
@@ -47,6 +51,8 @@ pub struct ProxyConfig {
     pub listen: SocketAddrV4,
     /// The immutable hostname policy.
     pub policy: HostPolicy,
+    /// Whether parent-process lifetime is signaled through standard input.
+    pub exit_on_stdin_close: bool,
 }
 
 impl Cli {
@@ -55,7 +61,11 @@ impl Cli {
         let listen = parse_listen_address(&self.listen)?;
         let policy = HostPolicy::from_rules(&self.allow_host)?;
 
-        Ok(ProxyConfig { listen, policy })
+        Ok(ProxyConfig {
+            listen,
+            policy,
+            exit_on_stdin_close: self.exit_on_stdin_close,
+        })
     }
 }
 
@@ -92,6 +102,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.listen, SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+        assert!(!config.exit_on_stdin_close);
 
         let host = Hostname::parse("example.com").unwrap();
         assert!(config.policy.allows(&host, 443));

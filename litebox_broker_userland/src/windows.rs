@@ -58,7 +58,7 @@ pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
         Arc::new(UnsupportedSocketProvider),
     )?;
 
-    crate::run_runner_process(&args, &control_pipe, |runner, runner_process_id| {
+    crate::run_runner_process(&args, &control_pipe, None, |runner, runner_process_id| {
         serve_runner(&broker, control_listener, runner, runner_process_id)
     })
 }

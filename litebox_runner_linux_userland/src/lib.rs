@@ -17,6 +17,13 @@ extern crate alloc;
 // credentials aligned with the in-memory filesystem default user and avoids truncating high host IDs.
 const DEFAULT_GUEST_UID: u16 = 1000;
 const DEFAULT_GUEST_GID: u16 = 1000;
+const MANAGED_PROXY_ENV_KEYS: [&str; 5] = [
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "FTP_PROXY",
+    "NO_PROXY",
+];
 
 /// Run Linux programs with LiteBox on unmodified Linux
 ///
@@ -82,6 +89,15 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub broker_control_channel: Option<PathBuf>,
+    /// Broker-supplied proxy URL for managed HTTP and HTTPS egress.
+    #[arg(
+        long = "broker-proxy-url",
+        value_name = "URL",
+        hide = true,
+        requires = "broker_control_channel",
+        help_heading = "Unstable Options"
+    )]
+    pub broker_proxy_url: Option<String>,
 }
 
 struct MmappedFile {
@@ -116,6 +132,12 @@ fn mmapped_file(path: impl AsRef<Path>) -> Result<MmappedFile> {
 /// panic. If it does actually panic, then ping the authors of LiteBox, and likely a better error
 /// message could be thrown instead.
 pub fn run(cli_args: CliArgs) -> Result<()> {
+    if cli_args.broker_proxy_url.is_some() && cli_args.broker_control_channel.is_none() {
+        return Err(anyhow!(
+            "--broker-proxy-url requires --broker-control-channel"
+        ));
+    }
+
     tracing_subscriber::fmt()
         .with_timer(tracing_subscriber::fmt::time::uptime())
         .with_level(true)
@@ -363,21 +385,16 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         .iter()
         .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
         .collect();
-    let envp: Vec<_> = cli_args
-        .environment_variables
+    let proxy_url = cli_args.broker_proxy_url;
+    let mut environment = cli_args.environment_variables;
+    if cli_args.forward_environment_variables {
+        environment.extend(std::env::vars().map(|(key, value)| format!("{key}={value}")));
+    }
+    apply_broker_proxy_environment(&mut environment, proxy_url.as_deref());
+    let envp = environment
         .iter()
-        .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
+        .map(|value| std::ffi::CString::new(value.as_bytes()).unwrap())
         .collect();
-    let envp = if cli_args.forward_environment_variables {
-        envp.into_iter()
-            .chain(std::env::vars().map(|(k, v)| {
-                std::ffi::CString::new(k.bytes().chain(*b"=").chain(v.bytes()).collect::<Vec<u8>>())
-                    .unwrap()
-            }))
-            .collect()
-    } else {
-        envp
-    };
 
     litebox_platform_linux_userland::LinuxUserland::enable_seccomp_filter(
         &broker_positional_io_fds,
@@ -411,4 +428,67 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     }
 
     std::process::exit(program.process.wait())
+}
+
+fn apply_broker_proxy_environment(environment: &mut Vec<String>, proxy_url: Option<&str>) {
+    environment.retain(|entry| {
+        let key = entry
+            .split_once('=')
+            .map_or(entry.as_str(), |(key, _value)| key);
+        proxy_url.is_none()
+            || !MANAGED_PROXY_ENV_KEYS
+                .iter()
+                .any(|managed| managed.eq_ignore_ascii_case(key))
+    });
+
+    if let Some(proxy_url) = proxy_url {
+        for key in ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"] {
+            environment.push(format!("{key}={proxy_url}"));
+        }
+        environment.push("NO_PROXY=".to_owned());
+        environment.push("no_proxy=".to_owned());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn programmatic_proxy_url_requires_broker_channel() {
+        let mut args = CliArgs::try_parse_from(["runner", "/bin/true"]).unwrap();
+        args.broker_proxy_url = Some("http://10.0.2.1:49152".to_owned());
+
+        let error = run(args).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "--broker-proxy-url requires --broker-control-channel"
+        );
+    }
+
+    #[test]
+    fn broker_proxy_replaces_proxy_environment() {
+        let mut environment = vec![
+            "PATH=/bin".to_owned(),
+            "HTTPS_PROXY=http://wrong.example:8080".to_owned(),
+            "No_Proxy=*".to_owned(),
+            "ALL_PROXY=http://wrong.example:8080".to_owned(),
+        ];
+
+        apply_broker_proxy_environment(&mut environment, Some("http://10.0.2.1:49152"));
+
+        assert_eq!(
+            environment,
+            [
+                "PATH=/bin",
+                "HTTP_PROXY=http://10.0.2.1:49152",
+                "http_proxy=http://10.0.2.1:49152",
+                "HTTPS_PROXY=http://10.0.2.1:49152",
+                "https_proxy=http://10.0.2.1:49152",
+                "NO_PROXY=",
+                "no_proxy=",
+            ]
+        );
+    }
 }

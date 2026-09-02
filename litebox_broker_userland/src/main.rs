@@ -85,6 +85,10 @@ impl FromStr for AllowedDestination {
 
 #[derive(Parser, Debug)]
 struct CliArgs {
+    /// Permit HTTP and HTTPS proxy requests to a hostname and destination ports.
+    #[cfg(target_os = "linux")]
+    #[arg(long = "allow-host", value_name = "HOST:PORT[-PORT]")]
+    allow_host: Vec<String>,
     /// Permit outbound TCP connections to a destination CIDR and port range.
     ///
     /// May be repeated to extend the default guest-network policy for TCP.
@@ -108,14 +112,18 @@ struct CliArgs {
 fn run_runner_process(
     args: &CliArgs,
     control_channel: &OsStr,
+    proxy_url: Option<&str>,
     serve: impl FnOnce(&mut Child, u32) -> Result<(), Box<dyn Error>>,
 ) -> Result<(), Box<dyn Error>> {
-    let mut runner = Command::new(&args.runner)
+    let mut command = Command::new(&args.runner);
+    command
         .arg("--unstable")
         .arg("--broker-control-channel")
-        .arg(control_channel)
-        .args(&args.runner_arguments)
-        .spawn()?;
+        .arg(control_channel);
+    if let Some(proxy_url) = proxy_url {
+        command.arg("--broker-proxy-url").arg(proxy_url);
+    }
+    let mut runner = command.args(&args.runner_arguments).spawn()?;
     let runner_process_id = runner.id();
     let association_result = serve(&mut runner, runner_process_id);
     if association_result.is_err() {
@@ -604,12 +612,21 @@ mod cli_tests {
 
         let tcp = "0.0.0.0/0:80".parse::<AllowedDestination>().unwrap();
         let udp = "10.0.2.1/32:53".parse::<AllowedDestination>().unwrap();
-        let policy = configured_socket_policy(&[tcp], &[udp]).unwrap();
+        let proxy = "10.0.2.1/32:3128".parse::<AllowedDestination>().unwrap();
+        let policy = configured_socket_policy(&[tcp, proxy], &[udp]).unwrap();
         let tcp_rules = policy.tcp_destination_rules().unwrap();
-        assert_eq!(tcp_rules.len(), 1);
+        assert_eq!(tcp_rules.len(), 2);
         assert_eq!(
             tcp_rules[0],
             DestinationRule::new(CallerCredential::HostGuaranteed, tcp.destination, tcp.ports,)
+        );
+        assert_eq!(
+            tcp_rules[1],
+            DestinationRule::new(
+                CallerCredential::HostGuaranteed,
+                proxy.destination,
+                proxy.ports,
+            )
         );
         let udp_rules = policy.udp_destination_rules().unwrap();
         assert_eq!(udp_rules.len(), 1);
