@@ -157,6 +157,10 @@ unsafe extern "system" fn vectored_exception_handler(
         context.Rip = exception_callback as *const () as usize as u64;
         context.Rsp = rsp as u64;
         context.Rbp = tls.host_bp.get() as u64;
+        // `host_sp` points at the slot where `run_thread_arch` saved its
+        // `ThreadContext` argument. The exception record moved RSP below that
+        // slot, so pass the argument explicitly instead of loading it from RSP.
+        context.Rcx = unsafe { tls.host_sp.get().cast::<usize>().read() } as u64;
         context.Rdx = exception_record_ptr as u64;
     }
 
@@ -602,7 +606,6 @@ exception_callback:
     // Handle the exception. The stack and frame pointers are already restored,
     // and the guest context is up to date. rcx contains a pointer to the
     // guest pt_regs, and rdx contains a pointer to the exception record.
-    mov  rcx, QWORD PTR [rsp] // thread_ctx
     call {exception_handler}
     jmp .Ldone
 
