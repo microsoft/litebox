@@ -221,7 +221,7 @@ pub type DefaultFS<Platform> = WindowsFS<Platform>;
 
 pub type WindowsFS<Platform> = litebox::fs::layered::FileSystem<
     Platform,
-    litebox::fs::in_mem::FileSystem<Platform>,
+    litebox::fs::resolver::Resolver<Platform, litebox::fs::in_mem::InMem<Platform>>,
     litebox::fs::layered::FileSystem<
         Platform,
         litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>,
@@ -435,7 +435,7 @@ impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
     #[must_use]
     pub fn default_fs(
         &self,
-        in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
+        in_mem_fs: litebox::fs::resolver::Resolver<Platform, litebox::fs::in_mem::InMem<Platform>>,
         tar_data: Cow<'static, [u8]>,
     ) -> DefaultFS<Platform>
     where
@@ -3204,7 +3204,7 @@ pub struct LoadedProgram<Platform: ShimPlatform, FS: ShimFS> {
 
 fn default_fs<Platform>(
     litebox: &LiteBox<Platform>,
-    in_mem_fs: litebox::fs::in_mem::FileSystem<Platform>,
+    in_mem_fs: litebox::fs::resolver::Resolver<Platform, litebox::fs::in_mem::InMem<Platform>>,
     tar_data: Cow<'static, [u8]>,
 ) -> WindowsFS<Platform>
 where

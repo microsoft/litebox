@@ -62,7 +62,7 @@ use crate::nt_types::{
 
 type RegistryFileSystem<Platform> = litebox::fs::layered::FileSystem<
     Platform,
-    litebox::fs::in_mem::FileSystem<Platform>,
+    litebox::fs::resolver::Resolver<Platform, litebox::fs::in_mem::InMem<Platform>>,
     litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>,
 >;
 
@@ -607,8 +607,18 @@ struct RegistryValue {
 
 impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
     pub(crate) fn new(litebox: &LiteBox<Platform>) -> Self {
-        let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
-        in_mem.with_root_privileges(|fs| {
+        let in_mem = litebox::fs::resolver::Resolver::new(
+            litebox,
+            litebox::fs::in_mem::InMem::new_initialized([(
+                "/",
+                litebox::fs::in_mem::InitialNode::Directory {
+                    mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+                    owner: litebox::fs::UserInfo::ROOT,
+                },
+            )]),
+        );
+        {
+            let fs = &in_mem;
             for key in [
                 DEFAULT_SESSION_MANAGER_KEY,
                 DEFAULT_SEGMENT_HEAP_KEY,
@@ -632,9 +642,13 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
                 ("OEMCP", DEFAULT_OEMCP_VALUE),
                 ("MACCP", DEFAULT_MACCP_VALUE),
             ] {
-                if let Err(status) =
-                    write_value_in_fs(fs, DEFAULT_CODE_PAGE_KEY, name, RegistryValueType::Sz, value)
-                {
+                if let Err(status) = write_value_in_fs(
+                    fs,
+                    DEFAULT_CODE_PAGE_KEY,
+                    name,
+                    RegistryValueType::Sz,
+                    value,
+                ) {
                     litebox_util_log::error!(name:% = name, status:? = status; "failed to initialize registry value");
                     break;
                 }
@@ -663,9 +677,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
                     DEFAULT_WINSOCK_PROTOCOL_CATALOG_KEY,
                     "Num_Catalog_Entries64",
                     RegistryValueType::Dword,
-                    WINSOCK_PROTOCOL_CATALOG_ENTRY_COUNT
-                        .to_le_bytes()
-                        .to_vec(),
+                    WINSOCK_PROTOCOL_CATALOG_ENTRY_COUNT.to_le_bytes().to_vec(),
                 ),
                 (
                     DEFAULT_WINSOCK_PROTOCOL_CATALOG_KEY,
@@ -685,9 +697,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
                     DEFAULT_WINSOCK_NAMESPACE_CATALOG_KEY,
                     "Num_Catalog_Entries64",
                     RegistryValueType::Dword,
-                    WINSOCK_NAMESPACE_CATALOG_ENTRY_COUNT
-                        .to_le_bytes()
-                        .to_vec(),
+                    WINSOCK_NAMESPACE_CATALOG_ENTRY_COUNT.to_le_bytes().to_vec(),
                 ),
                 (
                     DEFAULT_WINSOCK_NAMESPACE_CATALOG_KEY,
@@ -723,17 +733,13 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
                     DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY,
                     "Enabled",
                     RegistryValueType::Dword,
-                    WINSOCK_NAMESPACE_PROVIDER_ENABLED
-                        .to_le_bytes()
-                        .to_vec(),
+                    WINSOCK_NAMESPACE_PROVIDER_ENABLED.to_le_bytes().to_vec(),
                 ),
                 (
                     DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY,
                     "Version",
                     RegistryValueType::Dword,
-                    WINSOCK_NAMESPACE_PROVIDER_VERSION
-                        .to_le_bytes()
-                        .to_vec(),
+                    WINSOCK_NAMESPACE_PROVIDER_VERSION.to_le_bytes().to_vec(),
                 ),
                 (
                     DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY,
@@ -770,7 +776,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
                     break;
                 }
             }
-        });
+        }
 
         let tar_ro = litebox::fs::resolver::Resolver::new(
             litebox,
