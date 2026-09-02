@@ -1185,6 +1185,8 @@ fn python_runner(unique_name: &str) -> Runner {
             // LiteBox does not support timestamp yet, so pre-compiled .pyc files are not usable.
             // Avoid creating .pyc files as tar filesystem is read-only.
             "PYTHONDONTWRITEBYTECODE=1",
+            // These tests run without a broker and do not exercise Python hash randomization.
+            "PYTHONHASHSEED=0",
         ])
         .with_fs_path(|out_dir| {
             for source_path in &paths_to_stage {
