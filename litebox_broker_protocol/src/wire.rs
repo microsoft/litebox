@@ -40,16 +40,19 @@ const REQUEST_TAG_CHECK_READINESS: u8 = 4;
 const REQUEST_TAG_SOCKET: u8 = 5;
 const REQUEST_TAG_FILL_RANDOM: u8 = 6;
 
+// Paired request and successful-response tags intentionally share values.
 const RESPONSE_TAG_NEGOTIATED: u8 = 0;
 const RESPONSE_TAG_EVENT: u8 = 1;
-const RESPONSE_TAG_HANDSHAKE_ERROR: u8 = 2;
-const RESPONSE_TAG_VERSION_MISMATCH: u8 = 3;
-const RESPONSE_TAG_OBJECT_CLOSED: u8 = 4;
-const RESPONSE_TAG_PIPE: u8 = 5;
-const RESPONSE_TAG_READINESS: u8 = 6;
-const RESPONSE_TAG_ERROR: u8 = 7;
-const RESPONSE_TAG_SOCKET: u8 = 8;
-const RESPONSE_TAG_RANDOM_FILLED: u8 = 9;
+const RESPONSE_TAG_OBJECT_CLOSED: u8 = 2;
+const RESPONSE_TAG_PIPE: u8 = 3;
+const RESPONSE_TAG_READINESS: u8 = 4;
+const RESPONSE_TAG_SOCKET: u8 = 5;
+const RESPONSE_TAG_RANDOM_FILLED: u8 = 6;
+
+// Reserve the top of the tag space for responses without paired requests.
+const RESPONSE_TAG_ERROR: u8 = 253;
+const RESPONSE_TAG_HANDSHAKE_ERROR: u8 = 254;
+const RESPONSE_TAG_VERSION_MISMATCH: u8 = 255;
 
 const NOTIFICATION_TAG_READINESS: u8 = 0;
 
@@ -389,6 +392,38 @@ mod tests {
             local_address: None,
             pending_error: None,
         }
+    }
+
+    #[test]
+    fn successful_response_tags_match_request_tags() {
+        assert_eq!(
+            [
+                RESPONSE_TAG_NEGOTIATED,
+                RESPONSE_TAG_EVENT,
+                RESPONSE_TAG_OBJECT_CLOSED,
+                RESPONSE_TAG_PIPE,
+                RESPONSE_TAG_READINESS,
+                RESPONSE_TAG_SOCKET,
+                RESPONSE_TAG_RANDOM_FILLED,
+            ],
+            [
+                REQUEST_TAG_NEGOTIATE,
+                REQUEST_TAG_EVENT,
+                REQUEST_TAG_CLOSE_OBJECT,
+                REQUEST_TAG_PIPE,
+                REQUEST_TAG_CHECK_READINESS,
+                REQUEST_TAG_SOCKET,
+                REQUEST_TAG_FILL_RANDOM,
+            ]
+        );
+        assert_eq!(
+            [
+                RESPONSE_TAG_ERROR,
+                RESPONSE_TAG_HANDSHAKE_ERROR,
+                RESPONSE_TAG_VERSION_MISMATCH,
+            ],
+            [253, 254, 255]
+        );
     }
 
     #[test]
@@ -1116,7 +1151,7 @@ mod tests {
     #[test]
     fn decode_rejects_malformed_handshake_response_frames() {
         assert_eq!(
-            decode_handshake_response(&[0xff, 1, 2, 3]),
+            decode_handshake_response(&[0xfc, 1, 2, 3]),
             Err(WireError::InvalidTag)
         );
         assert_eq!(
@@ -1124,7 +1159,7 @@ mod tests {
             Err(WireError::TruncatedFrame)
         );
         assert_eq!(
-            decode_handshake_response(&[2, 0xff, 0xff]),
+            decode_handshake_response(&[254, 0xff, 0xff]),
             Err(WireError::InvalidTag)
         );
         assert_eq!(
@@ -1164,7 +1199,7 @@ mod tests {
     #[test]
     fn decode_rejects_malformed_response_frames() {
         assert_eq!(
-            decode_response(&[0xff, 1, 2, 3]),
+            decode_response(&[0xfc, 1, 2, 3]),
             Err(WireError::InvalidTag)
         );
         for response in [
@@ -1308,7 +1343,7 @@ mod tests {
                 request_id: RequestId(13),
                 result: BrokerResult::Socket(SocketResponse::Failed(SocketError::ConnectionReset,)),
             }),
-            [8, 13, 0, 0, 0, 0, 0, 0, 0, 6, 2]
+            [5, 13, 0, 0, 0, 0, 0, 0, 0, 6, 2]
         );
     }
 
@@ -1324,7 +1359,7 @@ mod tests {
                 })),
             }),
             [
-                8, 13, 0, 0, 0, 0, 0, 0, 0, 9, 9, 0, 0, 0, 0, 0, 0, 0, 127, 0, 0, 1, 0, 192, 203,
+                5, 13, 0, 0, 0, 0, 0, 0, 0, 9, 9, 0, 0, 0, 0, 0, 0, 0, 127, 0, 0, 1, 0, 192, 203,
                 0, 113, 7, 187, 1,
             ]
         );
