@@ -38,6 +38,9 @@ use crate::vmap::{
     VmapManager,
 };
 use core::marker::PhantomData;
+use litebox::platform::common_providers::userspace_pointers::{
+    UserConstPtr, UserMutPtr, ValidateAccess,
+};
 use zerocopy::{FromBytes, IntoBytes};
 
 /// The concrete [`PhysPageMapInfo`] produced by the `VmapManager` behind a [`GlobalVmapManager`].
@@ -358,6 +361,47 @@ where
     }
 }
 
+impl<const ALIGN: usize, V> PhysMutPtr<u8, ALIGN, V>
+where
+    V: GlobalVmapManager<ALIGN>,
+{
+    /// Copy data to non-Rust userspace memory.
+    pub fn copy_to_user<U: ValidateAccess>(
+        &self,
+        dst: UserMutPtr<U, u8>,
+        len: usize,
+    ) -> Result<(), PhysPointerError> {
+        if len > self.count {
+            return Err(PhysPointerError::IndexOutOfBounds(len, self.count));
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        let guard = self.map_and_get_ptr_guard(0, len, PhysPageMapPermissions::READ)?;
+        guard.copy_to_user(dst)
+    }
+
+    /// Copy data from non-Rust userspace memory.
+    pub fn copy_from_user<U: ValidateAccess>(
+        &self,
+        src: UserConstPtr<U, u8>,
+        len: usize,
+    ) -> Result<(), PhysPointerError> {
+        if len > self.count {
+            return Err(PhysPointerError::IndexOutOfBounds(len, self.count));
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        let guard = self.map_and_get_ptr_guard(
+            0,
+            len,
+            PhysPageMapPermissions::READ | PhysPageMapPermissions::WRITE,
+        )?;
+        guard.copy_from_user(src)
+    }
+}
+
 /// RAII guard that unmaps physical pages when dropped.
 ///
 /// Created by `map_and_get_ptr_guard`. Its lifetime is tied to the parent
@@ -377,6 +421,24 @@ struct MappedGuard<'a, T, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> {
 }
 
 impl<T, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> MappedGuard<'_, T, ALIGN, V> {
+    fn copy_to_user<U: ValidateAccess>(
+        &self,
+        dst: UserMutPtr<U, u8>,
+    ) -> Result<(), PhysPointerError> {
+        // SAFETY: `PhysConstPtr`/`PhysMutPtr` only point to non-Rust memory.
+        unsafe { dst.copy_from_raw(self.ptr.cast::<u8>().cast_const(), self.size) }
+            .ok_or(PhysPointerError::CopyFailed)
+    }
+
+    fn copy_from_user<U: ValidateAccess>(
+        &self,
+        src: UserConstPtr<U, u8>,
+    ) -> Result<(), PhysPointerError> {
+        // SAFETY: `PhysMutPtr` only points to non-Rust memory.
+        unsafe { src.copy_to_raw(self.ptr.cast::<u8>(), self.size) }
+            .ok_or(PhysPointerError::CopyFailed)
+    }
+
     /// Copy the `self.size` mapped bytes out into `dst`.
     ///
     /// This is the only path through which the raw mapped pointer is dereferenced.
@@ -499,6 +561,20 @@ where
         T: FromBytes,
     {
         self.inner.read_slice_at_offset(count, values)
+    }
+}
+
+impl<const ALIGN: usize, V> PhysConstPtr<u8, ALIGN, V>
+where
+    V: GlobalVmapManager<ALIGN>,
+{
+    /// Copy data to non-Rust userspace memory.
+    pub fn copy_to_user<U: ValidateAccess>(
+        &self,
+        dst: UserMutPtr<U, u8>,
+        len: usize,
+    ) -> Result<(), PhysPointerError> {
+        self.inner.copy_to_user(dst, len)
     }
 }
 
