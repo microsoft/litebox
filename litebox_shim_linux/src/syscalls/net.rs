@@ -1090,12 +1090,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 let raw_fd2 = match files.insert_raw_fd_locked(&mut rds, typed2) {
                     Ok(raw_fd) => raw_fd,
                     Err(typed2) => {
-                        let typed1 = rds
-                            .fd_consume_raw_integer::<crate::syscalls::unix::UnixSocketSubsystem<
-                                Platform,
-                                FS,
-                            >>(raw_fd1)
-                            .unwrap();
+                        let typed1 = rds.fd_consume_raw_integer::<crate::syscalls::unix::UnixSocketSubsystem<Platform>>(raw_fd1).unwrap();
                         drop(rds);
                         self.remove_and_drop_descriptor(&typed1);
                         self.remove_and_drop_descriptor(&typed2);
