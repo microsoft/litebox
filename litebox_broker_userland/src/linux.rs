@@ -140,7 +140,7 @@ impl ManagedEgressProxy {
         if reader.join().is_err() {
             return Err(IoError::other("egress proxy readiness reader panicked"));
         }
-        let address = parse_proxy_ready(&readiness?)?;
+        let address = readiness?;
         match proxy.child.try_wait() {
             Ok(None) => {}
             Ok(Some(status)) => {
@@ -159,11 +159,23 @@ impl ManagedEgressProxy {
 
 impl Drop for ManagedEgressProxy {
     fn drop(&mut self) {
-        stop_proxy(&mut self.child);
+        self.child.stdin.take();
+        let deadline = Instant::now() + PROXY_SHUTDOWN_TIMEOUT;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_status)) => return,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
-fn read_proxy_ready(stdout: ChildStdout) -> IoResult<String> {
+fn read_proxy_ready(stdout: ChildStdout) -> IoResult<SocketAddrV4> {
     let mut reader = BufReader::new(stdout);
     let mut line = String::new();
     if reader.read_line(&mut line)? == 0 {
@@ -172,32 +184,10 @@ fn read_proxy_ready(stdout: ChildStdout) -> IoResult<String> {
             "egress proxy exited before reporting readiness",
         ));
     }
-    Ok(line)
-}
-
-fn parse_proxy_ready(line: &str) -> IoResult<SocketAddrV4> {
-    let address = line
-        .strip_prefix("READY ")
+    line.strip_prefix("READY ")
         .and_then(|value| value.trim_end().parse::<SocketAddrV4>().ok())
         .filter(|address| *address.ip() == Ipv4Addr::LOCALHOST && address.port() != 0)
-        .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "invalid egress proxy readiness"))?;
-    Ok(address)
-}
-
-fn stop_proxy(child: &mut Child) {
-    child.stdin.take();
-    let deadline = Instant::now() + PROXY_SHUTDOWN_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_status)) => return,
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Ok(None) | Err(_) => break,
-        }
-    }
-    let _ = child.kill();
-    let _ = child.wait();
+        .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "invalid egress proxy readiness"))
 }
 
 fn serve_runner(
