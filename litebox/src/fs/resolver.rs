@@ -505,8 +505,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             &components,
             if path_only {
                 SearchScope::ParentsOnly
-            } else {
+            } else if read_allowed {
                 SearchScope::AndReadableTarget
+            } else {
+                // XXX: necessary due to #884/#888, ideally we would not have this path hit
+                SearchScope::AllComponents
             },
         );
         match walk {
