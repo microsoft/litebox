@@ -307,15 +307,35 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
     ) -> Result<super::backend::DirHandle, OpenError> {
         assert_supported_oflags(flags);
         if flags.intersects(super::OFlags::WRONLY | super::OFlags::RDWR) {
-            // TODO(jayb): POSIX requires `EISDIR` when write access is requested on a directory,
-            // but `OpenError` has no such variant yet.
-            unimplemented!()
+            // XXX(jayb): POSIX requires `EISDIR` when write access is requested on a directory, but
+            // `OpenError` has no such variant yet. Allowing write-mode directory handles here is a
+            // workaround for the Windows access-to-`OFlags` mapping introduced by PR #894
+            // (afe6cddc): Windows directory modification rights (such as `DELETE`) use write mode
+            // to trigger permission checks even though the handle is not used as a writable byte
+            // stream. A cleaner design would separate permission-check intent from handle I/O mode,
+            // allowing the Windows shim to request modification permission on a non-stream
+            // directory handle while POSIX opens with `WRONLY` or `RDWR` return `EISDIR`.
+            litebox_util_log::debug!(
+                flags:? = flags;
+                "using writable-directory workaround for permission checks"
+            );
+        }
+        let dir = dir.into_typed::<Self>();
+        if !flags.contains(super::OFlags::PATH) {
+            let access_mode = flags & (super::OFlags::WRONLY | super::OFlags::RDWR);
+            let wants_read =
+                access_mode == super::OFlags::RDONLY || access_mode == super::OFlags::RDWR;
+            let wants_write =
+                access_mode == super::OFlags::WRONLY || access_mode == super::OFlags::RDWR;
+            let permissions = &dir.dir.read().perms;
+            if (wants_read && !permissions.can_read_by(self.current_user))
+                || (wants_write && !permissions.can_write_by(self.current_user))
+            {
+                return Err(OpenError::AccessNotAllowed);
+            }
         }
         Ok(super::backend::DirHandle::from_typed::<Self>(
-            InMemDirHandle {
-                flags,
-                ..dir.into_typed::<Self>()
-            },
+            InMemDirHandle { flags, ..dir },
         ))
     }
 
@@ -693,6 +713,28 @@ struct FileData {
 struct Permissions {
     mode: Mode,
     userinfo: UserInfo,
+}
+
+impl Permissions {
+    fn can_read_by(&self, current: UserInfo) -> bool {
+        if self.userinfo.user == current.user {
+            self.mode.contains(Mode::RUSR)
+        } else if self.userinfo.group == current.group {
+            self.mode.contains(Mode::RGRP)
+        } else {
+            self.mode.contains(Mode::ROTH)
+        }
+    }
+
+    fn can_write_by(&self, current: UserInfo) -> bool {
+        if self.userinfo.user == current.user {
+            self.mode.contains(Mode::WUSR)
+        } else if self.userinfo.group == current.group {
+            self.mode.contains(Mode::WGRP)
+        } else {
+            self.mode.contains(Mode::WOTH)
+        }
+    }
 }
 
 /// Run `f` with the acting user set to root.
