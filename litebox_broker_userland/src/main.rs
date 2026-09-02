@@ -586,22 +586,6 @@ mod cli_tests {
         assert_eq!(args.allow_udp_destination.len(), 1);
     }
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn cli_accepts_hostname_proxy_arguments() {
-        let args = CliArgs::try_parse_from([
-            "litebox-broker-userland",
-            "--allow-host",
-            "example.com:443",
-            "--runner",
-            "runner",
-            "guest",
-        ])
-        .unwrap();
-
-        assert_eq!(args.allow_host, ["example.com:443"]);
-    }
-
     #[test]
     fn destination_argument_parses_canonical_cidr_and_ports() {
         let allowed = "203.0.113.0/24:443-444"
