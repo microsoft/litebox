@@ -56,6 +56,7 @@ pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
             configured_socket_policy(&args.allow_tcp_destination, &args.allow_udp_destination)?,
         ),
         Arc::new(UnsupportedSocketProvider),
+        Arc::new(super::UserlandRandomProvider),
     )?;
 
     crate::run_runner_process(&args, &control_pipe, None, |runner, runner_process_id| {

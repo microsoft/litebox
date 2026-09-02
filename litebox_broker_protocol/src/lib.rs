@@ -20,6 +20,7 @@ pub mod error;
 pub mod event;
 pub mod message;
 pub mod pipe;
+pub mod random;
 pub mod readiness;
 pub mod shared_buffer;
 pub mod socket;

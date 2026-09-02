@@ -1327,6 +1327,7 @@ fn test_broker_with_policy(
         pending_references: Arc::new(AtomicUsize::new(0)),
         reserved_pipe_capacity: Arc::new(AtomicUsize::new(0)),
         reserved_sockets: Arc::new(AtomicUsize::new(0)),
+        random_provider: Arc::new(crate::random::TestRandomProvider),
         socket_provider,
         socket_ports: BrokerSocketPorts::default(),
     }

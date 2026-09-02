@@ -23,7 +23,9 @@ use crate::message::{
     BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerOperation,
     BrokerRequest, BrokerResponse, BrokerResult, ReadinessNotification,
 };
+use crate::random::FillRandomRequest;
 use crate::readiness::ReadinessFlags;
+use crate::shared_buffer::{SharedBufferDescriptor, SharedBufferSlotIndex};
 
 use primitive::{Decoder, Encoder};
 
@@ -38,6 +40,7 @@ const REQUEST_TAG_CLOSE_OBJECT: u8 = 2;
 const REQUEST_TAG_PIPE: u8 = 3;
 const REQUEST_TAG_CHECK_READINESS: u8 = 4;
 const REQUEST_TAG_SOCKET: u8 = 5;
+const REQUEST_TAG_FILL_RANDOM: u8 = 6;
 
 const RESPONSE_TAG_NEGOTIATED: u8 = 0;
 const RESPONSE_TAG_EVENT: u8 = 1;
@@ -48,6 +51,7 @@ const RESPONSE_TAG_PIPE: u8 = 5;
 const RESPONSE_TAG_READINESS: u8 = 6;
 const RESPONSE_TAG_ERROR: u8 = 7;
 const RESPONSE_TAG_SOCKET: u8 = 8;
+const RESPONSE_TAG_RANDOM_FILLED: u8 = 9;
 
 const NOTIFICATION_TAG_READINESS: u8 = 0;
 
@@ -96,7 +100,8 @@ pub fn decode_handshake_request(frame: &[u8]) -> Result<BrokerHandshakeRequest, 
         | REQUEST_TAG_CLOSE_OBJECT
         | REQUEST_TAG_PIPE
         | REQUEST_TAG_CHECK_READINESS
-        | REQUEST_TAG_SOCKET => {
+        | REQUEST_TAG_SOCKET
+        | REQUEST_TAG_FILL_RANDOM => {
             return Err(WireError::WrongMessagePhase);
         }
         _ => return Err(WireError::InvalidTag),
@@ -141,6 +146,12 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
             encoder.request_id(request_id);
             socket::encode_socket_request(&mut encoder, request);
         }
+        BrokerOperation::FillRandom(request) => {
+            encoder.u8(REQUEST_TAG_FILL_RANDOM);
+            encoder.request_id(request_id);
+            encoder.u32(request.buffer.slot_index.0);
+            encoder.u32(request.buffer.length);
+        }
     }
     encoder.finish()
 }
@@ -155,7 +166,8 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         | REQUEST_TAG_CHECK_READINESS
         | REQUEST_TAG_EVENT
         | REQUEST_TAG_PIPE
-        | REQUEST_TAG_SOCKET => {}
+        | REQUEST_TAG_SOCKET
+        | REQUEST_TAG_FILL_RANDOM => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -165,6 +177,12 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         REQUEST_TAG_EVENT => BrokerOperation::Event(event::decode_event_request(&mut decoder)?),
         REQUEST_TAG_PIPE => BrokerOperation::Pipe(pipe::decode_pipe_request(&mut decoder)?),
         REQUEST_TAG_SOCKET => BrokerOperation::Socket(socket::decode_socket_request(&mut decoder)?),
+        REQUEST_TAG_FILL_RANDOM => BrokerOperation::FillRandom(FillRandomRequest {
+            buffer: SharedBufferDescriptor {
+                slot_index: SharedBufferSlotIndex(decoder.u32()?),
+                length: decoder.u32()?,
+            },
+        }),
         _ => unreachable!("active request tag was validated"),
     };
     decoder.finish()?;
@@ -214,7 +232,8 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
         | RESPONSE_TAG_PIPE
         | RESPONSE_TAG_READINESS
         | RESPONSE_TAG_ERROR
-        | RESPONSE_TAG_SOCKET => {
+        | RESPONSE_TAG_SOCKET
+        | RESPONSE_TAG_RANDOM_FILLED => {
             return Err(WireError::WrongMessagePhase);
         }
         RESPONSE_TAG_VERSION_MISMATCH => BrokerHandshakeResponse::VersionMismatch {
@@ -262,6 +281,10 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
             encoder.request_id(request_id);
             socket::encode_socket_response(&mut encoder, response);
         }
+        BrokerResult::RandomFilled => {
+            encoder.u8(RESPONSE_TAG_RANDOM_FILLED);
+            encoder.request_id(request_id);
+        }
         BrokerResult::Error(error) => {
             encoder.u8(RESPONSE_TAG_ERROR);
             encoder.request_id(request_id);
@@ -284,7 +307,8 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         | RESPONSE_TAG_PIPE
         | RESPONSE_TAG_READINESS
         | RESPONSE_TAG_ERROR
-        | RESPONSE_TAG_SOCKET => {}
+        | RESPONSE_TAG_SOCKET
+        | RESPONSE_TAG_RANDOM_FILLED => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -298,6 +322,7 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         }
         RESPONSE_TAG_OBJECT_CLOSED => BrokerResult::ObjectClosed,
         RESPONSE_TAG_READINESS => BrokerResult::Readiness(ReadinessFlags(decoder.u32()?)),
+        RESPONSE_TAG_RANDOM_FILLED => BrokerResult::RandomFilled,
         _ => unreachable!("active response tag was validated"),
     };
     decoder.finish()?;
@@ -349,6 +374,7 @@ mod tests {
         CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
         WritePipeResponse,
     };
+    use crate::random::FillRandomRequest;
     use crate::shared_buffer::{SharedBufferDescriptor, SharedBufferSlotIndex};
     use crate::socket::{
         AcceptSocketRequest, AcceptSocketResponse, AddressFamily, BindSocketRequest,
@@ -427,6 +453,12 @@ mod tests {
                     length: 3,
                 },
             })),
+            BrokerOperation::FillRandom(FillRandomRequest {
+                buffer: SharedBufferDescriptor {
+                    slot_index: SharedBufferSlotIndex(7),
+                    length: 256,
+                },
+            }),
             BrokerOperation::Socket(SocketRequest::Create(CreateSocketRequest {
                 address_family: AddressFamily::Ipv4,
                 socket_type: SocketType::Stream,
@@ -760,6 +792,7 @@ mod tests {
                 SocketConnectionStatus::Failed(SocketError::TimedOut),
             ))),
             BrokerResult::Socket(SocketResponse::Failed(SocketError::ConnectionReset)),
+            BrokerResult::RandomFilled,
             BrokerResult::Error(ErrorCode::PolicyDenied),
             BrokerResult::Error(ErrorCode::WouldBlock),
             BrokerResult::Error(ErrorCode::PeerClosed),

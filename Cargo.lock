@@ -1478,6 +1478,7 @@ name = "litebox_broker_userland"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "getrandom 0.3.4",
  "litebox_broker_core",
  "litebox_broker_host",
  "litebox_broker_local",
@@ -1688,6 +1689,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "getrandom 0.3.4",
  "glob",
  "libc",
  "litebox",

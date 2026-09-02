@@ -23,6 +23,7 @@ extern crate std;
 mod error;
 mod event;
 mod pipe;
+mod random;
 mod socket;
 
 use alloc::sync::Arc;
@@ -183,7 +184,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             | BrokerResult::Pipe(_)
             | BrokerResult::Socket(_)
             | BrokerResult::ObjectClosed
-            | BrokerResult::Readiness(_)) => Ok(result),
+            | BrokerResult::Readiness(_)
+            | BrokerResult::RandomFilled) => Ok(result),
         }
     }
 
@@ -214,7 +216,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             response @ (BrokerResult::Event(_)
             | BrokerResult::Pipe(_)
             | BrokerResult::Socket(_)
-            | BrokerResult::Readiness(_)) => {
+            | BrokerResult::Readiness(_)
+            | BrokerResult::RandomFilled) => {
                 panic!("broker returned unexpected close response: {response:?}");
             }
         }

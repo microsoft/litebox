@@ -16,7 +16,7 @@ struct GuestTcpPair {
 
 fn connected_guest_tcp_pair(port: u16) -> GuestTcpPair {
     let provider = Arc::new(LinuxSocketProvider::new(4, 3).unwrap());
-    let broker = BrokerCore::new_with_limits(
+    let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(8, 0, 4, 4),
@@ -146,7 +146,7 @@ fn reactor_drives_a_loopback_tcp_socket() {
     });
 
     let provider = Arc::new(LinuxSocketProvider::new(8, 8).unwrap());
-    let broker = BrokerCore::new_with_limits(
+    let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(gateway_tcp_policy()),
         BrokerCoreLimits::new_with_all_limits(16, 0, 8, 8),
@@ -475,7 +475,7 @@ fn external_tcp_deferred_abortive_close_resets_peer() {
     });
 
     let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
-    let broker = BrokerCore::new_with_limits(
+    let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(gateway_tcp_policy()),
         BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
@@ -521,7 +521,7 @@ fn external_tcp_gateway_uses_host_loopback_and_keeps_guest_identity() {
         )])
         .unwrap();
     let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
-    let broker = BrokerCore::new_with_limits(
+    let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all()).with_socket_policy(policy),
         BrokerCoreLimits::new_with_all_limits(3, 0, 2, 2),
         provider,
@@ -597,7 +597,7 @@ fn external_tcp_route_keeps_guest_private_identity() {
         )])
         .unwrap();
     let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
-    let broker = BrokerCore::new_with_limits(
+    let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all()).with_socket_policy(policy),
         BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
         provider,
@@ -637,7 +637,7 @@ fn external_tcp_route_keeps_guest_private_identity() {
 #[test]
 fn tcp_connect_to_zero_port_returns_an_ordinary_socket_outcome() {
     let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
-    let broker = BrokerCore::new_with_limits(
+    let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
@@ -675,7 +675,7 @@ fn tcp_receive_survives_readiness_publication_failure() {
     });
 
     let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
-    let broker = BrokerCore::new_with_limits(
+    let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(gateway_tcp_policy()),
         BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
@@ -737,7 +737,7 @@ fn tcp_status_publication_failure_preserves_consumed_error() {
     });
 
     let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
-    let broker = BrokerCore::new_with_limits(
+    let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(gateway_tcp_policy()),
         BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
@@ -810,7 +810,7 @@ fn external_tcp_readiness_failure_does_not_fail_shared_reactor() {
     });
 
     let provider = Arc::new(LinuxSocketProvider::new(2, 2).unwrap());
-    let broker = BrokerCore::new_with_limits(
+    let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(gateway_tcp_policy()),
         BrokerCoreLimits::new_with_all_limits(4, 0, 2, 2),
@@ -934,7 +934,7 @@ fn external_tcp_connect_completion_readiness_failure_does_not_fail_shared_reacto
     });
 
     let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
-    let broker = BrokerCore::new_with_limits(
+    let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(gateway_tcp_policy()),
         BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
@@ -1021,7 +1021,7 @@ fn exhausted_tcp_peek_cache_refreshes_before_terminal_eof() {
     });
 
     let provider = Arc::new(LinuxSocketProvider::new(1, 1).unwrap());
-    let broker = BrokerCore::new_with_limits(
+    let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(gateway_tcp_policy()),
         BrokerCoreLimits::new_with_all_limits(2, 0, 1, 1),
@@ -1104,7 +1104,7 @@ fn exhausted_tcp_peek_cache_refreshes_before_terminal_eof() {
 #[test]
 fn accepted_guest_tcp_close_with_unread_data_preserves_reset() {
     let provider = Arc::new(LinuxSocketProvider::new(3, 2).unwrap());
-    let broker = BrokerCore::new_with_limits(
+    let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(6, 0, 3, 3),
@@ -1462,7 +1462,7 @@ fn guest_read_shutdown_buffer_precedes_reset_and_eof() {
 #[test]
 fn guest_tcp_namespace_routes_across_sessions_and_hides_private_backend() {
     let provider = Arc::new(LinuxSocketProvider::new(5, 3).unwrap());
-    let broker = BrokerCore::new_with_limits(
+    let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(8, 0, 5, 4),
@@ -1605,7 +1605,7 @@ fn tcp_exact_bindings_coexist_and_wildcard_accepts_concrete_destinations() {
             DestinationPortRange::new(Port(1), Port(u16::MAX)).unwrap(),
         )])
         .unwrap();
-    let broker = BrokerCore::new_with_limits(
+    let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all()).with_socket_policy(policy),
         BrokerCoreLimits::new_with_all_limits(20, 0, 12, 12),
         provider,
@@ -1756,7 +1756,7 @@ fn tcp_exact_bindings_coexist_and_wildcard_accepts_concrete_destinations() {
 #[test]
 fn connector_and_session_teardown_clean_bounded_pending_state() {
     let provider = Arc::new(LinuxSocketProvider::new(4, 2).unwrap());
-    let broker = BrokerCore::new_with_limits(
+    let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(8, 0, 4, 4),
@@ -1862,7 +1862,7 @@ fn connector_and_session_teardown_clean_bounded_pending_state() {
 #[test]
 fn graceful_connector_close_preserves_late_accept_and_eof() {
     let provider = Arc::new(LinuxSocketProvider::new(4, 2).unwrap());
-    let broker = BrokerCore::new_with_limits(
+    let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(8, 0, 4, 4),
@@ -1957,7 +1957,7 @@ fn guest_tcp_zero_backlog_accepts_one_unspecified_destination() {
         )])
         .unwrap();
     let provider = Arc::new(LinuxSocketProvider::new(6, 4).unwrap());
-    let broker = BrokerCore::new_with_limits(
+    let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all()).with_socket_policy(policy),
         BrokerCoreLimits::new_with_all_limits(10, 0, 6, 6),
         provider,
@@ -2044,7 +2044,7 @@ fn guest_tcp_zero_backlog_accepts_one_unspecified_destination() {
 #[test]
 fn guest_tcp_backlog_relisten_and_fifo_are_bounded() {
     let provider = Arc::new(LinuxSocketProvider::new(10, 8).unwrap());
-    let broker = BrokerCore::new_with_limits(
+    let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(16, 0, 10, 10),
@@ -2163,7 +2163,7 @@ fn guest_tcp_backlog_relisten_and_fifo_are_bounded() {
 #[test]
 fn guest_tcp_stream_preserves_options_peek_waitall_and_half_close() {
     let provider = Arc::new(LinuxSocketProvider::new(6, 4).unwrap());
-    let broker = BrokerCore::new_with_limits(
+    let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(12, 0, 6, 6),
@@ -2623,7 +2623,7 @@ fn drained_guest_read_shutdown_close_delivers_end_of_stream() {
 #[test]
 fn guest_tcp_connect_publication_failure_purges_committed_queue() {
     let provider = Arc::new(LinuxSocketProvider::new(4, 3).unwrap());
-    let broker = BrokerCore::new_with_limits(
+    let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(8, 0, 4, 4),
@@ -2678,7 +2678,7 @@ fn guest_tcp_connect_publication_failure_purges_committed_queue() {
 #[test]
 fn guest_tcp_accept_publication_failure_purges_registered_endpoint() {
     let provider = Arc::new(LinuxSocketProvider::new(4, 3).unwrap());
-    let broker = BrokerCore::new_with_limits(
+    let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(8, 0, 4, 4),
@@ -2743,7 +2743,7 @@ fn guest_tcp_accept_publication_failure_purges_registered_endpoint() {
 #[test]
 fn queued_guest_accept_transfers_capacity_without_global_growth() {
     let provider = Arc::new(LinuxSocketProvider::new(5, 3).unwrap());
-    let broker = BrokerCore::new_with_limits(
+    let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(10, 0, 5, 5),
@@ -2803,7 +2803,7 @@ fn queued_guest_accept_transfers_capacity_without_global_growth() {
 #[test]
 fn queued_guest_accept_rejects_exhausted_listener_session_capacity() {
     let provider = Arc::new(LinuxSocketProvider::new(6, 3).unwrap());
-    let broker = BrokerCore::new_with_limits(
+    let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(10, 0, 6, 6),
@@ -2860,7 +2860,7 @@ fn queued_guest_accept_rejects_exhausted_listener_session_capacity() {
 #[test]
 fn abortive_connector_close_releases_descriptor_capacity() {
     let provider = Arc::new(LinuxSocketProvider::new(3, 2).unwrap());
-    let broker = BrokerCore::new_with_limits(
+    let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(8, 0, 3, 3),
@@ -2941,7 +2941,7 @@ fn abortive_connector_close_releases_descriptor_capacity() {
 #[test]
 fn stop_listening_cleanup_survives_readiness_failure() {
     let provider = Arc::new(LinuxSocketProvider::new(3, 2).unwrap());
-    let broker = BrokerCore::new_with_limits(
+    let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(8, 0, 3, 3),
@@ -3025,7 +3025,7 @@ fn stop_listening_cleanup_survives_readiness_failure() {
 #[test]
 fn reactor_drives_a_loopback_tcp_listener() {
     let provider = Arc::new(LinuxSocketProvider::new(6, 6).unwrap());
-    let broker = BrokerCore::new_with_limits(
+    let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
             .with_socket_policy(SocketPolicy::guest_network()),
         BrokerCoreLimits::new_with_all_limits(8, 0, 6, 6),
