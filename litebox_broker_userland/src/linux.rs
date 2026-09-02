@@ -23,8 +23,8 @@ use litebox_broker_transport_linux_userland::unix_socket::{
 };
 
 use super::{
-    AllowedDestination, HostAssociationShutdown, HostRequestSource, HostResponseSink,
-    SETUP_TIMEOUT, configured_socket_policy,
+    HostAssociationShutdown, HostRequestSource, HostResponseSink, SETUP_TIMEOUT,
+    configured_socket_policy,
 };
 
 const PROXY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -54,9 +54,14 @@ pub(super) fn run(mut args: super::CliArgs) -> Result<(), Box<dyn Error>> {
         Some(ManagedEgressProxy::start(&args.allow_host)?)
     };
     if let Some(proxy) = &proxy {
-        args.allow_tcp_destination.push(proxy.guest_destination()?);
+        let proxy_destination = format!("{HOST_GATEWAY_IPV4_ADDRESS}/32:{}", proxy.port)
+            .parse()
+            .map_err(|error: String| IoError::new(ErrorKind::InvalidData, error))?;
+        args.allow_tcp_destination.push(proxy_destination);
     }
-    let proxy_url = proxy.as_ref().map(ManagedEgressProxy::guest_url);
+    let proxy_url = proxy
+        .as_ref()
+        .map(|proxy| format!("http://{HOST_GATEWAY_IPV4_ADDRESS}:{}", proxy.port));
 
     let socket_dir = tempfile::Builder::new()
         .prefix("litebox-broker-userland-")
@@ -149,16 +154,6 @@ impl ManagedEgressProxy {
 
         proxy.port = address.port();
         Ok(proxy)
-    }
-
-    fn guest_destination(&self) -> IoResult<AllowedDestination> {
-        format!("{HOST_GATEWAY_IPV4_ADDRESS}/32:{}", self.port)
-            .parse()
-            .map_err(|error: String| IoError::new(ErrorKind::InvalidData, error))
-    }
-
-    fn guest_url(&self) -> String {
-        format!("http://{HOST_GATEWAY_IPV4_ADDRESS}:{}", self.port)
     }
 }
 
