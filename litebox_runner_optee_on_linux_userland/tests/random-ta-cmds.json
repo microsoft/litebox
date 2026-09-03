@@ -11,7 +11,7 @@
     "args": [
       {
         "param_type": "memref_output",
-        "buffer_size": 64
+        "buffer_size": 1024
       }
     ]
   },
@@ -19,4 +19,3 @@
     "func_id": "close_session"
   }
 ]
-

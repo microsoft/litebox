@@ -304,15 +304,11 @@ impl Task {
         Ok(())
     }
 
-    #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn sys_cryp_random_number_generate(&self, buf: &mut [u8]) -> Result<(), TeeResult> {
-        if !buf.is_empty() {
-            <crate::Platform as litebox::platform::CrngProvider>::fill_bytes_crng(
-                self.global.platform,
-                buf,
-            );
-        }
-        Ok(())
+        self.global
+            .litebox
+            .fill_random(buf)
+            .map_err(|_| TeeResult::CommunicationError)
     }
 }
 

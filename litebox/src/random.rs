@@ -3,6 +3,7 @@
 
 //! Broker-provided cryptographic randomness.
 
+use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use thiserror::Error;
 
 use crate::{LiteBox, sync::RawSyncPrimitivesProvider};
@@ -15,15 +16,15 @@ pub struct FillRandomError;
 impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     /// Fills `output` completely with cryptographically secure random bytes.
     ///
-    /// Non-empty requests require a negotiated broker and may contain at most
-    /// 256 bytes.
+    /// Non-empty requests require a negotiated broker.
     pub fn fill_random(&self, output: &mut [u8]) -> Result<(), FillRandomError> {
         if output.is_empty() {
             return Ok(());
         }
-        self.broker_control()
-            .ok_or(FillRandomError)?
-            .fill_random(output)
-            .map_err(|_| FillRandomError)
+        let broker = self.broker_control().ok_or(FillRandomError)?;
+        for chunk in output.chunks_mut(MAX_RANDOM_TRANSFER_SIZE as usize) {
+            broker.fill_random(chunk).map_err(|_| FillRandomError)?;
+        }
+        Ok(())
     }
 }

@@ -148,7 +148,7 @@ impl OpteeShimBuilder {
             platform: self.platform,
             boot_instant: TimeProvider::now(self.platform),
             pm: PageManager::new(&self.litebox),
-            _litebox: self.litebox,
+            litebox: self.litebox,
             ta_uuid_map: TaUuidMap::new(),
             pta_busy: spin::mutex::SpinMutex::new(HashSet::new()),
         });
@@ -167,7 +167,7 @@ struct GlobalState {
     /// The page manager for managing virtual memory.
     pm: litebox::mm::PageManager<Platform, { PAGE_SIZE }>,
     /// The LiteBox instance used throughout the shim.
-    _litebox: litebox::LiteBox<Platform>,
+    litebox: litebox::LiteBox<Platform>,
     /// The TA UUID to binary map for TA loading.
     ta_uuid_map: TaUuidMap,
     /// Tracks which non-concurrent PTAs (i.e., PTAs w/o `TaFlags::CONCURRENT`)
