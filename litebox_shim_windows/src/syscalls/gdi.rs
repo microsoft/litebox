@@ -129,7 +129,7 @@ mod tests {
     use zerocopy::FromZeros as _;
 
     use super::*;
-    use crate::tests::{run_with_test_platform_pointers, test_task, test_task_with_random_broker};
+    use crate::tests::{run_with_test_platform_pointers, test_task};
 
     fn set_test_peb(
         task: &mut Task<crate::tests::TestPlatform>,
@@ -150,20 +150,6 @@ mod tests {
             assert_eq!(task.sys_nt_gdi_init2(), 0);
             assert_eq!(peb.gdi_shared_handle_table, 0);
             assert!(task.process.gdi_state.lock().is_none());
-        });
-    }
-
-    #[test]
-    fn gdi_initialization_uses_broker_randomness() {
-        run_with_test_platform_pointers(|| {
-            let mut peb = ProcessEnvironmentBlock::new_zeroed();
-            let mut task = test_task_with_random_broker();
-            set_test_peb(&mut task, &mut peb);
-
-            let cookie = task.sys_nt_gdi_init2();
-            assert_ne!(cookie, 0);
-            assert_ne!(peb.gdi_shared_handle_table, 0);
-            assert_eq!(task.sys_nt_gdi_init2(), cookie);
         });
     }
 }

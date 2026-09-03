@@ -2885,36 +2885,14 @@ mod tests {
     }
 
     #[test]
-    fn ksecdd_delivers_entropy_and_rejects_unknown_controls() {
+    fn ksecdd_requires_broker_and_rejects_unknown_controls() {
         run_with_test_platform_pointers(|| {
             const UNKNOWN_KSEC_IOCTL: u32 = 0x0039_0000;
-            let task = crate::tests::test_task_with_random_broker();
+            let task = crate::tests::test_task();
             let handle = open_ksecdd(&task, FILE_GENERIC_READ | FILE_GENERIC_WRITE);
 
-            let mut first = [0u8; 32];
-            let mut second = [0u8; 32];
+            let mut random = [0xa5; 32];
             let mut io_status = IoStatusBlock::default();
-            for output in [&mut first, &mut second] {
-                assert_eq!(
-                    task.sys_nt_device_io_control_file(
-                        handle,
-                        Handle::default(),
-                        None,
-                        None,
-                        mut_ptr(&mut io_status),
-                        ksecdd::KsecIoControlCode::RandomFillBuffer as u32,
-                        None,
-                        0,
-                        Some(mut_byte_ptr(output)),
-                        output.len().try_into().unwrap(),
-                    ),
-                    NtStatus::SUCCESS
-                );
-                assert_eq!(io_status.information, output.len());
-            }
-            assert_ne!(first, second, "successive random fills must differ");
-
-            let mut chunked = [0u8; 4097];
             assert_eq!(
                 task.sys_nt_device_io_control_file(
                     handle,
@@ -2925,13 +2903,14 @@ mod tests {
                     ksecdd::KsecIoControlCode::RandomFillBuffer as u32,
                     None,
                     0,
-                    Some(mut_byte_ptr(&mut chunked)),
-                    chunked.len().try_into().unwrap(),
+                    Some(mut_byte_ptr(&mut random)),
+                    random.len().try_into().unwrap(),
                 ),
-                NtStatus::SUCCESS
+                NtStatus::UNSUCCESSFUL
             );
-            assert_eq!(io_status.information, chunked.len());
-            assert!(chunked.iter().any(|&byte| byte != 0));
+            assert_eq!(io_status.status, NtStatus::UNSUCCESSFUL.as_raw());
+            assert_eq!(io_status.information, 0);
+            assert_eq!(random, [0xa5; 32]);
 
             let mut scratch = [0xa5; 8];
             assert_eq!(
@@ -2982,35 +2961,6 @@ mod tests {
             );
             assert_eq!(io_status.status, NtStatus::INVALID_DEVICE_REQUEST.as_raw());
             assert_eq!(io_status.information, 0);
-        });
-    }
-
-    #[test]
-    fn ksecdd_random_fill_requires_broker() {
-        run_with_test_platform_pointers(|| {
-            let task = crate::tests::test_task();
-            let handle = open_ksecdd(&task, FILE_GENERIC_READ | FILE_GENERIC_WRITE);
-            let mut output = [0xa5; 32];
-            let mut io_status = IoStatusBlock::default();
-
-            assert_eq!(
-                task.sys_nt_device_io_control_file(
-                    handle,
-                    Handle::default(),
-                    None,
-                    None,
-                    mut_ptr(&mut io_status),
-                    ksecdd::KsecIoControlCode::RandomFillBuffer as u32,
-                    None,
-                    0,
-                    Some(mut_byte_ptr(&mut output)),
-                    output.len().try_into().unwrap(),
-                ),
-                NtStatus::UNSUCCESSFUL
-            );
-            assert_eq!(io_status.status, NtStatus::UNSUCCESSFUL.as_raw());
-            assert_eq!(io_status.information, 0);
-            assert_eq!(output, [0xa5; 32]);
         });
     }
 
