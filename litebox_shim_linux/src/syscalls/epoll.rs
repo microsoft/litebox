@@ -683,7 +683,7 @@ mod test {
 
         // spawn a thread to write to the pipe
         let global = task.global.clone();
-        std::thread::spawn(move || {
+        let writer = std::thread::spawn(move || {
             std::thread::sleep(core::time::Duration::from_millis(100));
             assert_eq!(
                 global
@@ -702,6 +702,7 @@ mod test {
             .read(&WaitState::new(platform()).context(), &consumer, &mut buf)
             .unwrap();
         assert_eq!(buf, [1, 2]);
+        writer.join().unwrap();
     }
 
     #[test]
@@ -746,7 +747,7 @@ mod test {
         .unwrap_err();
         assert!(revents(&set).is_empty());
 
-        task.spawn_clone_for_test(move |task| {
+        let writer = task.spawn_clone_for_test(move |task| {
             std::thread::sleep(core::time::Duration::from_millis(100));
             assert_eq!(task.sys_write(wfd, &[1], None).unwrap(), 1);
         });
@@ -757,6 +758,7 @@ mod test {
 
         let _ = task.sys_close(rfd);
         let _ = task.sys_close(wfd);
+        writer.join().unwrap();
     }
 
     #[test]
@@ -769,7 +771,7 @@ mod test {
         let rfd = i32::try_from(rfd_u).unwrap();
         let wfd = i32::try_from(wfd_u).unwrap();
 
-        task.spawn_clone_for_test(move |task| {
+        let writer = task.spawn_clone_for_test(move |task| {
             std::thread::sleep(core::time::Duration::from_millis(100));
             // write a byte
             let buf = [0x41u8];
@@ -796,6 +798,7 @@ mod test {
 
         let _ = task.sys_close(rfd);
         let _ = task.sys_close(wfd);
+        writer.join().unwrap();
     }
 
     #[test]
@@ -808,7 +811,7 @@ mod test {
         let rfd = i32::try_from(rfd_u).unwrap();
         let wfd = i32::try_from(wfd_u).unwrap();
 
-        task.spawn_clone_for_test(move |task| {
+        let closer = task.spawn_clone_for_test(move |task| {
             std::thread::sleep(core::time::Duration::from_millis(100));
             task.sys_close(wfd).expect("close writer failed");
         });
@@ -837,6 +840,7 @@ mod test {
         assert_eq!(n, 0, "read should return 0 on EOF");
 
         let _ = task.sys_close(rfd);
+        closer.join().unwrap();
     }
 
     #[test]
