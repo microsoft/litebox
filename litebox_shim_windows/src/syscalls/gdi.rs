@@ -31,6 +31,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return self.publish_gdi_state(state);
         }
 
+        let mut cookie_bytes = [0_u8; size_of::<usize>()];
+        if self.global.litebox.fill_random(&mut cookie_bytes).is_err() {
+            return 0;
+        }
+        let cookie = usize::from_ne_bytes(cookie_bytes).max(1);
+
         let Some(length) = NonZeroPageSize::<PAGE_SIZE>::new(GDI_SHARED_TABLE_SIZE) else {
             return 0;
         };
@@ -64,9 +70,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             },
         );
 
-        let mut cookie_bytes = [0_u8; size_of::<usize>()];
-        self.global.platform.fill_bytes_crng(&mut cookie_bytes);
-        let cookie = usize::from_ne_bytes(cookie_bytes).max(1);
         let new_state = GdiProcessState {
             shared_table,
             cookie,

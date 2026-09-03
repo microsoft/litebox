@@ -107,7 +107,7 @@ struct KsecCngBufferTooSmallResponse {
 }
 
 pub(crate) fn handle_ioctl<Platform: crate::ShimPlatform>(
-    platform: &Platform,
+    litebox: &litebox::LiteBox<Platform>,
     io_control_code: u32,
     input_buffer: Option<ConstPtr<Platform, u8>>,
     input_buffer_length: u32,
@@ -144,7 +144,9 @@ pub(crate) fn handle_ioctl<Platform: crate::ShimPlatform>(
             let mut offset = 0;
             while offset < output_length {
                 let chunk_length = (output_length - offset).min(random.len());
-                platform.fill_bytes_crng(&mut random[..chunk_length]);
+                if litebox.fill_random(&mut random[..chunk_length]).is_err() {
+                    return IoStatusBlock::failure(NtStatus::UNSUCCESSFUL);
+                }
                 if write_slice::<Platform, u8>(output_address + offset, &random[..chunk_length])
                     .is_none()
                 {
