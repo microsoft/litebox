@@ -9,7 +9,7 @@ use memmap2::Mmap;
 use std::os::linux::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
-mod broker;
+use litebox_broker_transport_linux_userland::broker;
 
 extern crate alloc;
 

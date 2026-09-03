@@ -11,28 +11,35 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::unix_socket::{
+    UnixControlRingLocalCallChannel, UnixControlRingLocalNotificationChannel,
+    UnixControlRingLocalShutdown, UnixStreamLocalSetupChannel,
+};
 use anyhow::{Context as _, Result};
 use litebox_broker_local::{BrokerLocal, BrokerNotifications};
 use litebox_broker_protocol::message::BrokerNotification;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport::control_ring::ControlRing;
-use litebox_broker_transport_linux_userland::unix_socket::{
-    UnixControlRingLocalCallChannel, UnixControlRingLocalNotificationChannel,
-    UnixControlRingLocalShutdown, UnixStreamLocalSetupChannel,
-};
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const RETRY_DELAY: Duration = Duration::from_millis(20);
 
-pub(crate) struct BrokerConnection {
-    pub(crate) local: BrokerLocal<UnixControlRingLocalCallChannel>,
-    pub(crate) notifications: BrokerNotifications<UnixControlRingLocalNotificationChannel>,
-    pub(crate) coordinator: Arc<BrokerAssociationFailureCoordinator>,
-    pub(crate) positional_io_fds: [RawFd; 2],
-    pub(crate) shutdown_fd: RawFd,
+/// An active Linux-userland broker association.
+pub struct BrokerConnection {
+    /// Synchronous broker request channel.
+    pub local: BrokerLocal<UnixControlRingLocalCallChannel>,
+    /// Asynchronous broker notification channel.
+    pub notifications: BrokerNotifications<UnixControlRingLocalNotificationChannel>,
+    /// Coordinates transport shutdown and LiteBox failure notification.
+    pub coordinator: Arc<BrokerAssociationFailureCoordinator>,
+    /// Shared-memory descriptors that a runner's syscall filter must permit.
+    pub positional_io_fds: [RawFd; 2],
+    /// Association-shutdown descriptor that a runner's syscall filter must permit.
+    pub shutdown_fd: RawFd,
 }
 
-pub(crate) fn connect(control_socket_path: &Path) -> Result<BrokerConnection> {
+/// Connects to and negotiates an association with a Linux-userland broker.
+pub fn connect(control_socket_path: &Path) -> Result<BrokerConnection> {
     let setup_deadline = Instant::now() + SETUP_TIMEOUT;
     let setup_channel = connect_with_retry(
         control_socket_path,
@@ -87,7 +94,8 @@ pub(crate) fn connect(control_socket_path: &Path) -> Result<BrokerConnection> {
     })
 }
 
-pub(crate) fn start_notification_receiver(
+/// Starts the broker notification receiver for an active association.
+pub fn start_notification_receiver(
     mut notifications: BrokerNotifications<UnixControlRingLocalNotificationChannel>,
     association_coordinator: Arc<BrokerAssociationFailureCoordinator>,
     dispatch_notification: impl Fn(BrokerNotification) + Send + 'static,
@@ -111,7 +119,8 @@ pub(crate) fn start_notification_receiver(
     Ok(())
 }
 
-pub(crate) struct BrokerAssociationFailureCoordinator {
+/// Coordinates failure across the broker call and notification channels.
+pub struct BrokerAssociationFailureCoordinator {
     failed: AtomicBool,
     shutdown: Mutex<Option<UnixControlRingLocalShutdown>>,
     dispatch_failure: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -146,7 +155,12 @@ impl BrokerAssociationFailureCoordinator {
         Ok(())
     }
 
-    pub(crate) fn install_dispatch(&self, dispatch_failure: impl FnOnce() + Send + 'static) {
+    /// Installs the callback used to fail broker-backed LiteBox resources.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a failure callback was already installed or an internal mutex is poisoned.
+    pub fn install_dispatch(&self, dispatch_failure: impl FnOnce() + Send + 'static) {
         let mut installed = self
             .dispatch_failure
             .lock()
@@ -210,20 +224,20 @@ fn connect_with_retry<Channel>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memfd::MemfdSharedMemory;
+    use crate::unix_socket::{
+        UnixControlRingHostNotificationChannel, UnixControlRingHostRequestSource,
+        UnixControlRingHostResponseSink, UnixControlRingHostShutdown, UnixStreamHostSetupChannel,
+    };
+    use crate::unix_socket::{
+        UnixControlRingLocalCallChannel, UnixControlRingLocalNotificationChannel,
+        UnixControlRingLocalShutdown, UnixStreamLocalSetupChannel,
+    };
     use litebox_broker_protocol::ObjectHandle;
     use litebox_broker_protocol::message::{BrokerNotification, ReadinessNotification};
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_transport::channel::{
         HostNotificationChannel, HostReceive, HostSetupChannel, LocalSetupChannel,
-    };
-    use litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory;
-    use litebox_broker_transport_linux_userland::unix_socket::{
-        UnixControlRingHostNotificationChannel, UnixControlRingHostRequestSource,
-        UnixControlRingHostResponseSink, UnixControlRingHostShutdown, UnixStreamHostSetupChannel,
-    };
-    use litebox_broker_transport_linux_userland::unix_socket::{
-        UnixControlRingLocalCallChannel, UnixControlRingLocalNotificationChannel,
-        UnixControlRingLocalShutdown, UnixStreamLocalSetupChannel,
     };
     use std::io::ErrorKind;
     use std::os::fd::AsFd;
