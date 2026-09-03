@@ -51,24 +51,19 @@ pub(crate) use litebox_platform_windows_userland::WindowsUserland as TestPlatfor
 
 /// Returns the process-wide test platform, initializing it once.
 pub(crate) fn test_platform() -> &'static TestPlatform {
-    test_environment().platform
+    static PLATFORM: std::sync::OnceLock<&'static TestPlatform> = std::sync::OnceLock::new();
+    PLATFORM.get_or_init(TestPlatform::new)
 }
 
-struct TestEnvironment {
-    platform: &'static TestPlatform,
-    broker: BrokerCore,
-}
-
-fn test_environment() -> &'static TestEnvironment {
-    static ENVIRONMENT: std::sync::OnceLock<TestEnvironment> = std::sync::OnceLock::new();
-    ENVIRONMENT.get_or_init(|| TestEnvironment {
-        platform: TestPlatform::new(),
-        broker: BrokerCore::new(
+fn test_broker() -> &'static BrokerCore {
+    static BROKER: std::sync::OnceLock<BrokerCore> = std::sync::OnceLock::new();
+    BROKER.get_or_init(|| {
+        BrokerCore::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all()),
             alloc::sync::Arc::new(PipeOnlySocketProvider),
             alloc::sync::Arc::new(UnusedRandomProvider),
         )
-        .unwrap(),
+        .unwrap()
     })
 }
 
@@ -120,8 +115,7 @@ impl PipeBrokerSetup {
     fn new() -> Self {
         Self {
             memory: alloc::sync::Arc::new(TestSharedMemory::new()),
-            session: test_environment()
-                .broker
+            session: test_broker()
                 .create_session(CallerCredential::Unauthenticated)
                 .unwrap(),
         }
