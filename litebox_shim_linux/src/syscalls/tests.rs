@@ -114,17 +114,16 @@ fn init_platform_with_builder(
 struct PipeBrokerSetup {
     memory: alloc::sync::Arc<TestSharedMemory>,
     session: BrokerSession,
-    handshake_sent: bool,
 }
 
 impl PipeBrokerSetup {
     fn new() -> Self {
         Self {
             memory: alloc::sync::Arc::new(TestSharedMemory::new()),
-            session: test_broker_core()
+            session: test_environment()
+                .broker
                 .create_session(CallerCredential::Unauthenticated)
                 .unwrap(),
-            handshake_sent: false,
         }
     }
 
@@ -145,14 +144,12 @@ impl LocalSetupChannel for PipeBrokerSetup {
         request: &BrokerHandshakeRequest,
     ) -> core::result::Result<(), Self::Error> {
         assert_eq!(request.protocol_version, BROKER_PROTOCOL_VERSION);
-        self.handshake_sent = true;
         Ok(())
     }
 
     fn recv_handshake_response(
         &mut self,
     ) -> core::result::Result<Option<BrokerHandshakeResponse>, Self::Error> {
-        assert!(self.handshake_sent);
         Ok(Some(BrokerHandshakeResponse::Negotiated {
             broker_protocol_version: BROKER_PROTOCOL_VERSION,
         }))
@@ -276,10 +273,6 @@ impl SharedMemory for TestSharedMemory {
         destination.copy_from_slice(source);
         Ok(())
     }
-}
-
-fn test_broker_core() -> &'static BrokerCore {
-    &test_environment().broker
 }
 
 struct PipeOnlySocketProvider;

@@ -79,8 +79,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
             atomic_slice_guarantee_size,
         )?;
         let mut dt = self.litebox.descriptor_table_mut();
-        let sender = dt.insert(PipeEnd::Sender(sender));
-        let receiver = dt.insert(PipeEnd::Receiver(receiver));
+        let sender = dt.insert(PipeEnd(sender));
+        let receiver = dt.insert(PipeEnd(receiver));
         Ok((sender, receiver))
     }
 
@@ -106,9 +106,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
         buf: &mut [u8],
     ) -> Result<usize, errors::ReadError> {
         let dt = self.litebox.descriptor_table();
-        let p = match &dt.get_entry(fd).ok_or(errors::ReadError::ClosedFd)?.entry {
-            PipeEnd::Receiver(p) => Arc::clone(p),
-            PipeEnd::Sender(_) => return Err(errors::ReadError::NotForReading),
+        let p = {
+            let entry = dt.get_entry(fd).ok_or(errors::ReadError::ClosedFd)?;
+            if entry.entry.0.endpoint_type != HalfPipeType::ReceiverHalf {
+                return Err(errors::ReadError::NotForReading);
+            }
+            Arc::clone(&entry.entry.0)
         };
         drop(dt);
         p.read(cx, buf).map_err(From::from)
@@ -124,9 +127,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
         buf: &[u8],
     ) -> Result<usize, errors::WriteError> {
         let dt = self.litebox.descriptor_table();
-        let p = match &dt.get_entry(fd).ok_or(errors::WriteError::ClosedFd)?.entry {
-            PipeEnd::Sender(p) => Arc::clone(p),
-            PipeEnd::Receiver(_) => return Err(errors::WriteError::NotForWriting),
+        let p = {
+            let entry = dt.get_entry(fd).ok_or(errors::WriteError::ClosedFd)?;
+            if entry.entry.0.endpoint_type != HalfPipeType::SenderHalf {
+                return Err(errors::WriteError::NotForWriting);
+            }
+            Arc::clone(&entry.entry.0)
         };
         drop(dt);
         p.write(cx, buf).map_err(From::from)
@@ -138,19 +144,23 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
         fd: &PipeFd<Platform>,
     ) -> Result<HalfPipeType, errors::ClosedError> {
         let dt = self.litebox.descriptor_table();
-        match dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
-            PipeEnd::Sender(_) => Ok(HalfPipeType::SenderHalf),
-            PipeEnd::Receiver(_) => Ok(HalfPipeType::ReceiverHalf),
-        }
+        Ok(dt
+            .get_entry(fd)
+            .ok_or(errors::ClosedError::ClosedFd)?
+            .entry
+            .0
+            .endpoint_type)
     }
 
     /// Get the flags set on the pipe at `fd`.
     pub fn get_flags(&self, fd: &PipeFd<Platform>) -> Result<Flags, errors::ClosedError> {
         let dt = self.litebox.descriptor_table();
-        let oflags = match &dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
-            PipeEnd::Receiver(p) | PipeEnd::Sender(p) => p.get_status(),
-        };
-        Ok(Flags::from_oflags_truncate(oflags))
+        let p = &dt
+            .get_entry(fd)
+            .ok_or(errors::ClosedError::ClosedFd)?
+            .entry
+            .0;
+        Ok(Flags::from_oflags_truncate(p.get_status()))
     }
 
     /// Update the flags set on the pipe at `fd`.
@@ -163,11 +173,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
         on: bool,
     ) -> Result<(), errors::ClosedError> {
         let dt = self.litebox.descriptor_table();
-        match &dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
-            PipeEnd::Receiver(p) | PipeEnd::Sender(p) => {
-                p.set_status(OFlags::from(mask), on);
-            }
-        }
+        let p = &dt
+            .get_entry(fd)
+            .ok_or(errors::ClosedError::ClosedFd)?
+            .entry
+            .0;
+        p.set_status(OFlags::from(mask), on);
         Ok(())
     }
 
@@ -178,9 +189,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
         f: impl FnOnce(&dyn IOPollable) -> R,
     ) -> Result<R, errors::ClosedError> {
         let dt = self.litebox.descriptor_table();
-        match &dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
-            PipeEnd::Receiver(p) | PipeEnd::Sender(p) => Ok(f(p)),
-        }
+        let p = &dt
+            .get_entry(fd)
+            .ok_or(errors::ClosedError::ClosedFd)?
+            .entry
+            .0;
+        Ok(f(p))
     }
 }
 
@@ -191,10 +205,7 @@ pub enum HalfPipeType {
     ReceiverHalf,
 }
 
-enum PipeEnd<Platform: RawSyncPrimitivesProvider + TimeProvider> {
-    Receiver(Arc<BrokerPipeEnd<Platform>>),
-    Sender(Arc<BrokerPipeEnd<Platform>>),
-}
+struct PipeEnd<Platform: RawSyncPrimitivesProvider + TimeProvider>(Arc<BrokerPipeEnd<Platform>>);
 
 bitflags::bitflags! {
     /// Flags for controlling the pipe behaviors.
