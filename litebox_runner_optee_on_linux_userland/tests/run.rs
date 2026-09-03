@@ -28,10 +28,17 @@ fn rewrite_binary(input: &str, output: &str) {
 }
 
 fn run(name: &str) {
-    let binary_path = std::env::var("NEXTEST_BIN_EXE_litebox_runner_optee_on_linux_userland")
-        .unwrap_or_else(|_| {
-            env!("CARGO_BIN_EXE_litebox_runner_optee_on_linux_userland").to_string()
-        });
+    let runner_path = PathBuf::from(
+        std::env::var("NEXTEST_BIN_EXE_litebox_runner_optee_on_linux_userland").unwrap_or_else(
+            |_| env!("CARGO_BIN_EXE_litebox_runner_optee_on_linux_userland").to_string(),
+        ),
+    );
+    let broker_path = runner_path.with_file_name("litebox-broker-userland");
+    assert!(
+        broker_path.is_file(),
+        "OP-TEE broker tests require a workspace build producing {}",
+        broker_path.display()
+    );
 
     // Create a temporary directory for the hooked binaries
     let temp_dir = std::env::temp_dir().join(format!("litebox_test_{name}_{}", std::process::id()));
@@ -51,15 +58,15 @@ fn run(name: &str) {
 
     let cmds_path = format!("tests/{name}-cmds.json");
 
-    let mut command = std::process::Command::new(&binary_path);
-    command.args([
+    let mut command = std::process::Command::new(&broker_path);
+    command.arg("--runner").arg(&runner_path).args([
         ldelf_hooked.to_str().unwrap(),
         ta_hooked.to_str().unwrap(),
         &cmds_path,
     ]);
     println!("Running `{command:?}`");
     let status = command.status().unwrap_or_else(|err| {
-        panic!("Failed to run litebox_runner_optee_on_linux_userland against {name}.elf: {err}")
+        panic!("Failed to run brokered OP-TEE runner against {name}.elf: {err}")
     });
 
     // Clean up temporary files
@@ -67,7 +74,7 @@ fn run(name: &str) {
 
     assert!(
         status.success(),
-        "failed to run litebox_runner_optee_on_linux_userland against {name}.elf: {status}",
+        "failed to run brokered OP-TEE runner against {name}.elf: {status}",
     );
 }
 

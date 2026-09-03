@@ -3,6 +3,7 @@
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
+use litebox_broker_local_userland as broker;
 use litebox_common_optee::{TeeUuid, UteeEntryFunc, UteeParamOwned};
 use litebox_platform_multiplex::Platform;
 use litebox_shim_optee::session::session_manager;
@@ -24,6 +25,15 @@ pub struct CliArgs {
     /// Allow using unstable options
     #[arg(short = 'Z', long = "unstable")]
     pub unstable: bool,
+    /// Broker-supplied Unix socket for the local control channel.
+    #[arg(
+        long = "broker-control-channel",
+        value_name = "PATH",
+        hide = true,
+        requires = "unstable",
+        help_heading = "Unstable Options"
+    )]
+    pub broker_control_channel: PathBuf,
     /// Apply syscall-rewriter to the ELF file before running it
     ///
     /// This is meant as a convenience feature; real deployments would likely prefer ahead-of-time
@@ -36,7 +46,9 @@ pub struct CliArgs {
     pub rewrite_syscalls: bool,
 }
 
-/// Test OP-TEE TAs with LiteBox on unmodified Linux
+/// Test OP-TEE TAs with LiteBox on unmodified Linux.
+///
+/// The userland broker launches this runner and supplies its control channel.
 ///
 /// # Panics
 ///
@@ -81,9 +93,20 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // TODO(jb): Clean up platform initialization once we have https://github.com/MSRSSP/litebox/issues/24
     let platform = Platform::new();
     litebox_platform_multiplex::set_platform(platform);
-    let shim_builder = litebox_shim_optee::OpteeShimBuilder::new();
-    let _litebox = shim_builder.litebox();
-    let shim = shim_builder.build();
+    let broker::BrokerConnection {
+        local,
+        notifications,
+        coordinator,
+        ..
+    } = broker::connect(&cli_args.broker_control_channel)?;
+    let litebox = litebox::LiteBox::new_with_broker_local(platform, local);
+    coordinator.install_dispatch(litebox.broker_failure_dispatcher());
+    broker::start_notification_receiver(
+        notifications,
+        coordinator,
+        litebox.broker_notification_dispatcher(),
+    )?;
+    let shim = litebox_shim_optee::OpteeShimBuilder::new_with_litebox(platform, litebox).build();
 
     platform.initialize_boot_specific_kdf_support();
 

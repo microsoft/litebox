@@ -129,10 +129,12 @@ impl OpteeShimBuilder {
     /// Returns a new shim builder.
     pub fn new() -> Self {
         let platform = litebox_platform_multiplex::platform();
-        Self {
-            platform,
-            litebox: LiteBox::new(platform),
-        }
+        Self::new_with_litebox(platform, LiteBox::new(platform))
+    }
+
+    /// Creates a builder backed by an existing LiteBox instance.
+    pub fn new_with_litebox(platform: &'static Platform, litebox: LiteBox<Platform>) -> Self {
+        Self { platform, litebox }
     }
 
     /// Returns the litebox object for the shim.
