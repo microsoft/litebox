@@ -322,6 +322,14 @@ fn has_dedicated_c_test(path: &Path) -> bool {
         .is_some_and(|name| DEDICATED_C_TESTS.contains(&name))
 }
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn configure_pipe_broker(path: &Path, runner: &mut Runner) {
+    if path.file_name().and_then(|name| name.to_str()) == Some("sendfile.c") {
+        runner.use_userland_broker = true;
+        runner.env("LITEBOX_PIPE_BROKER=1");
+    }
+}
+
 #[test]
 fn test_dynamic_lib_with_rewriter() {
     for path in find_c_test_files("./tests") {
@@ -334,7 +342,10 @@ fn test_dynamic_lib_with_rewriter() {
             .expect("failed to get file stem");
         let unique_name = format!("{stem}_rewriter");
         let target = common::compile(path.to_str().unwrap(), &unique_name, false, false);
-        Runner::new(&target, &unique_name).run();
+        let mut runner = Runner::new(&target, &unique_name);
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        configure_pipe_broker(&path, &mut runner);
+        runner.run();
     }
 }
 
@@ -350,7 +361,10 @@ fn test_static_exec_with_rewriter() {
             .expect("failed to get file stem");
         let unique_name = format!("{stem}_exec_rewriter");
         let target = common::compile(path.to_str().unwrap(), &unique_name, true, false);
-        Runner::new(&target, &unique_name).run();
+        let mut runner = Runner::new(&target, &unique_name);
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        configure_pipe_broker(&path, &mut runner);
+        runner.run();
     }
 }
 

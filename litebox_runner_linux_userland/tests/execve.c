@@ -4,7 +4,7 @@
 // Test execve behavior:
 //
 // Phase 1:
-//   - Create two pipe descriptors: one with O_CLOEXEC, one without.
+//   - Open two file descriptors: one with O_CLOEXEC, one without.
 //   - Exec self, passing their numeric values as argv[1] (cloexec) and argv[2] (keep).
 // Phase 2 (after exec):
 //   - Verify the CLOEXEC fd is closed (fcntl -> EBADF).
@@ -21,6 +21,9 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+
+#define CLO_PATH "/tmp/execve_clo"
+#define KEEP_PATH "/tmp/execve_keep"
 
 static void die(const char *msg) {
     perror(msg);
@@ -47,12 +50,10 @@ int main(int argc, char *argv[], char *envp[]) {
 
     if (!phase) {
         // Phase 1: set up descriptors and exec self.
-        int clo_pipe[2];
-        if (pipe2(clo_pipe, O_CLOEXEC) != 0) die("pipe2 cloexec");
-        int keep_pipe[2];
-        if (pipe(keep_pipe) != 0) die("pipe keep");
-        int fd_clo = clo_pipe[0];
-        int fd_keep = keep_pipe[0];
+        int fd_clo = open(CLO_PATH, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        if (fd_clo < 0) die("open cloexec");
+        int fd_keep = open(KEEP_PATH, O_RDWR | O_CREAT | O_TRUNC, 0600);
+        if (fd_keep < 0) die("open keep");
 
         char clo_buf[32], keep_buf[32];
         snprintf(clo_buf, sizeof clo_buf, "%d", fd_clo);
@@ -122,6 +123,11 @@ int main(int argc, char *argv[], char *envp[]) {
                 fd_keep, keep_errno);
         ok = 0;
     }
+    if (keep_flags != -1) {
+        close(fd_keep);
+    }
+    unlink(CLO_PATH);
+    unlink(KEEP_PATH);
 
     if (ok) {
         printf("[OK] cloexec fd %d closed; keep fd %d open\n", fd_clo, fd_keep);

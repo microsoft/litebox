@@ -139,19 +139,20 @@ static void test_negative_offset(void) {
     unlink(path);
 }
 
-static void test_pipe_espipe(void) {
-    int p[2];
-    TEST_ASSERT(pipe(p) == 0, "pipe creation failed");
+static void test_socket_espipe(void) {
+    int sockets[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0,
+                "socketpair creation failed");
 
     char buf[4] = "data";
     struct iovec iov[1] = {{.iov_base = buf, .iov_len = sizeof(buf)}};
     errno = 0;
-    ssize_t n = raw_pwritev(p[1], iov, 1, 0);
+    ssize_t n = raw_pwritev(sockets[1], iov, 1, 0);
     TEST_ASSERT(n == -1 && errno == ESPIPE,
-           "pwritev on a pipe should fail with ESPIPE");
+           "pwritev on a socket should fail with ESPIPE");
 
-    close(p[0]);
-    close(p[1]);
+    close(sockets[0]);
+    close(sockets[1]);
 }
 
 static void test_readonly_fd(void) {
@@ -182,7 +183,7 @@ int main(void) {
     test_zero_iovcnt();
     test_bad_fd();
     test_negative_offset();
-    test_pipe_espipe();
+    test_socket_espipe();
     test_readonly_fd();
     printf("All pwritev tests passed.\n");
     return 0;

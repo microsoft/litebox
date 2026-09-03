@@ -51,16 +51,24 @@ pub(crate) use litebox_platform_windows_userland::WindowsUserland as TestPlatfor
 
 /// Returns the process-wide test platform, initializing it once.
 pub(crate) fn test_platform() -> &'static TestPlatform {
-    static PLATFORM: std::sync::OnceLock<&'static TestPlatform> = std::sync::OnceLock::new();
-    PLATFORM.get_or_init(|| {
-        #[cfg(target_os = "linux")]
-        {
-            TestPlatform::new()
-        }
-        #[cfg(target_os = "windows")]
-        {
-            TestPlatform::new()
-        }
+    test_environment().platform
+}
+
+struct TestEnvironment {
+    platform: &'static TestPlatform,
+    broker: BrokerCore,
+}
+
+fn test_environment() -> &'static TestEnvironment {
+    static ENVIRONMENT: std::sync::OnceLock<TestEnvironment> = std::sync::OnceLock::new();
+    ENVIRONMENT.get_or_init(|| TestEnvironment {
+        platform: TestPlatform::new(),
+        broker: BrokerCore::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all()),
+            alloc::sync::Arc::new(PipeOnlySocketProvider),
+            alloc::sync::Arc::new(UnusedRandomProvider),
+        )
+        .unwrap(),
     })
 }
 
@@ -271,15 +279,7 @@ impl SharedMemory for TestSharedMemory {
 }
 
 fn test_broker_core() -> &'static BrokerCore {
-    static BROKER: std::sync::OnceLock<BrokerCore> = std::sync::OnceLock::new();
-    BROKER.get_or_init(|| {
-        BrokerCore::new(
-            PolicyEngine::with_unauthenticated_rights(ObjectRights::all()),
-            alloc::sync::Arc::new(PipeOnlySocketProvider),
-            alloc::sync::Arc::new(UnusedRandomProvider),
-        )
-        .unwrap()
-    })
+    &test_environment().broker
 }
 
 struct PipeOnlySocketProvider;
