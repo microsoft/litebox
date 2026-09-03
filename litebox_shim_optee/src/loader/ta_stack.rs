@@ -191,14 +191,11 @@ impl TaStack {
         }
         match param_type {
             TeeParamType::MemrefInput | TeeParamType::MemrefInout => {
-                if let Some(bytes) = bytes {
-                    if len > bytes.len() {
-                        self.pos = self.pos.checked_sub(len - bytes.len())?;
-                    }
-                    self.push_bytes(bytes)?;
-                } else {
-                    self.pos = self.pos.checked_sub(len)?;
+                let bytes = bytes.unwrap_or(&[]);
+                if len > bytes.len() {
+                    self.pos = self.pos.checked_sub(len - bytes.len())?;
                 }
+                self.push_bytes(bytes)?;
             }
             TeeParamType::MemrefOutput => self.pos = self.pos.checked_sub(len)?,
             _ => return None,
