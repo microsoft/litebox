@@ -43,7 +43,7 @@ use litebox_shim_optee::msg_handler::{
     decode_ta_request, handle_optee_msg_args, handle_optee_smc_args, update_optee_msg_args,
 };
 use litebox_shim_optee::session::{OpenSessionTarget, TaInstance, session_manager};
-use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr, UserConstPtr};
+use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr, TaMemrefAddresses, UserConstPtr};
 
 /// Seed the initial heap regions so the global allocator has enough memory
 /// for slab-backed allocations (the slab needs >= 2 MB backing pages).
@@ -645,13 +645,14 @@ fn open_session_single_instance(
     let _task_pt_guard = TaskPageTableGuard::enter(task_pt_id)?;
 
     // Load TA context with parameters for OpenSession - pass actual session_id
-    instance
+    let memref_addresses = instance
         .loaded_program()
         .entrypoints
         .as_ref()
         .ok_or(OpteeSmcReturnCode::EBadCmd)?
-        .load_ta_context(
+        .load_ta_context_with_shm(
             params,
+            &ta_req_info.shm_info,
             runner_session_id,
             UteeEntryFunc::OpenSession as u32,
             None,
@@ -698,6 +699,7 @@ fn open_session_single_instance(
             None, // No session ID on failure
             Some(&ta_params),
             Some(ta_req_info),
+            Some(&memref_addresses),
         );
 
         // For single-instance TAs, only clean up on TARGET_DEAD (panic).
@@ -730,6 +732,7 @@ fn open_session_single_instance(
         Some(runner_session_id),
         Some(&ta_params),
         Some(ta_req_info),
+        Some(&memref_addresses),
     );
 
     // Write-back failure: OpenSession succeeded inside the TA, but we cannot
@@ -849,6 +852,7 @@ fn open_session_new_instance(
             None, // No session ID on failure
             None,
             Some(ta_req_info),
+            None,
         );
 
         // Safety: We are about to tear down this TA instance;
@@ -869,12 +873,13 @@ fn open_session_new_instance(
         unsafe { teardown_ta_page_table(&shim, task_pt_id) };
         OpteeSmcReturnCode::EBadCmd
     })?;
-    loaded_program
+    let memref_addresses = loaded_program
         .entrypoints
         .as_ref()
         .unwrap()
-        .load_ta_context(
+        .load_ta_context_with_shm(
             params,
+            &ta_req_info.shm_info,
             runner_session_id,
             UteeEntryFunc::OpenSession as u32,
             None,
@@ -931,6 +936,7 @@ fn open_session_new_instance(
             None, // No session ID on failure
             Some(&ta_params),
             Some(ta_req_info),
+            Some(&memref_addresses),
         );
 
         // Safety: We are about to tear down this TA instance;
@@ -951,6 +957,7 @@ fn open_session_new_instance(
         Some(runner_session_id),
         Some(&ta_params),
         Some(ta_req_info),
+        Some(&memref_addresses),
     )
     .inspect_err(|_| {
         // Safety: We are about to tear down this TA instance;
@@ -1041,9 +1048,10 @@ fn handle_invoke_command(
 
         // Set up the entry-point parameters for InvokeCommand.
         let entrypoints_ref = instance.loaded_program().entrypoints.as_ref().unwrap();
-        entrypoints_ref
-            .load_ta_context(
+        let memref_addresses = entrypoints_ref
+            .load_ta_context_with_shm(
                 params.as_slice(),
+                &ta_req_info.shm_info,
                 session_id,
                 UteeEntryFunc::InvokeCommand as u32,
                 Some(cmd_id),
@@ -1080,6 +1088,7 @@ fn handle_invoke_command(
             None,
             Some(&ta_params),
             Some(&ta_req_info),
+            Some(&memref_addresses),
         );
 
         // Per OP-TEE OS: if TA panics (TARGET_DEAD), the TA context is
@@ -1179,6 +1188,7 @@ fn handle_close_session(
             None,
             None,
             None,
+            None,
         );
 
         let removed_flags = session_manager().unregister_session(session_id);
@@ -1251,6 +1261,7 @@ fn write_msg_args_to_normal_world(
     session_id: Option<u32>,
     ta_params: Option<&UteeParams>,
     ta_req_info: Option<&litebox_shim_optee::msg_handler::TaRequestInfo<PAGE_SIZE>>,
+    memref_addresses: Option<&TaMemrefAddresses>,
 ) -> Result<(), OpteeSmcReturnCode> {
     // Ensure we're on a task page table, not the base page table.
     // Accessing TA userspace memory requires the TA's page table to be active.
@@ -1273,6 +1284,7 @@ fn write_msg_args_to_normal_world(
         session_id,
         ta_params,
         ta_req_info,
+        memref_addresses,
         msg_args,
     )?;
 

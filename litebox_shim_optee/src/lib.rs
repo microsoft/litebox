@@ -236,6 +236,7 @@ impl GlobalState {
 
 type UserMutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
 pub type UserConstPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<T>;
+pub type TaMemrefAddresses = [Option<usize>; litebox_common_optee::UteeParams::TEE_NUM_PARAMS];
 
 type MutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
 
@@ -341,11 +342,30 @@ impl OpteeShimEntrypoints {
         func_id: u32,
         cmd_id: Option<u32>,
     ) -> Result<(), loader::elf::ElfLoaderError> {
+        self.load_ta_context_with_shm(params, &[], session_id, func_id, cmd_id)
+            .map(|_| ())
+    }
+
+    /// Load the TA context with shared-memory sources for its input buffers.
+    pub fn load_ta_context_with_shm(
+        &self,
+        params: &[litebox_common_optee::UteeParamOwned],
+        shm_info: &[Option<msg_handler::ShmInfo<PAGE_SIZE>>],
+        session_id: u32,
+        func_id: u32,
+        cmd_id: Option<u32>,
+    ) -> Result<TaMemrefAddresses, loader::elf::ElfLoaderError> {
         let init_state = self
             .task
-            .load_ta_context(params, session_id, func_id, cmd_id)?;
+            .load_ta_context(params, shm_info, session_id, func_id, cmd_id)?;
+        let ThreadInitState::Ta {
+            memref_addresses, ..
+        } = init_state
+        else {
+            return Err(loader::elf::ElfLoaderError::InvalidStackAddr);
+        };
         self.task.thread.init_state.set(init_state);
-        Ok(())
+        Ok(memref_addresses)
     }
 }
 
@@ -658,6 +678,7 @@ impl Task {
                 func_id,
                 entry_point,
                 stack_top,
+                ..
             } => {
                 #[cfg(target_arch = "x86_64")]
                 {
@@ -792,6 +813,7 @@ impl Task {
     fn load_ta_context(
         &self,
         params: &[litebox_common_optee::UteeParamOwned],
+        shm_info: &[Option<msg_handler::ShmInfo<PAGE_SIZE>>],
         session_id: u32,
         func_id: u32,
         cmd_id: Option<u32>,
@@ -817,8 +839,8 @@ impl Task {
             crate::loader::ta_stack::allocate_stack(self, self.get_ta_stack_base_addr()).ok_or(
                 ElfLoaderError::MappingError(litebox::mm::linux::MappingError::OutOfMemory),
             )?;
-        ta_stack
-            .init(self.global.platform, params)
+        let memref_addresses = ta_stack
+            .init(self.global.platform, params, shm_info)
             .ok_or(ElfLoaderError::InvalidStackAddr)?;
 
         Ok(ThreadInitState::Ta {
@@ -828,6 +850,7 @@ impl Task {
             func_id: func_id as usize,
             entry_point: self.get_ta_entry_point(),
             stack_top: ta_stack.get_cur_stack_top(),
+            memref_addresses,
         })
     }
 
@@ -1447,6 +1470,7 @@ pub(crate) enum ThreadInitState {
         func_id: usize,
         entry_point: usize,
         stack_top: usize,
+        memref_addresses: TaMemrefAddresses,
     },
 }
 

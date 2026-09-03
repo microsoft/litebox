@@ -311,7 +311,7 @@ impl TaCommandParamsBase64 {
                 value_b: *value_b,
             },
             TaCommandParamsBase64::MemrefInput { data_base64 } => UteeParamOwned::MemrefInput {
-                data: Self::decode_base64(data_base64).into_boxed_slice(),
+                data: Some(Self::decode_base64(data_base64).into_boxed_slice()),
             },
             TaCommandParamsBase64::MemrefOutput { buffer_size } => UteeParamOwned::MemrefOutput {
                 buffer_size: usize::try_from(*buffer_size).unwrap(),
@@ -327,7 +327,7 @@ impl TaCommandParamsBase64 {
                     "Buffer size is smaller than input data size"
                 );
                 UteeParamOwned::MemrefInout {
-                    data: decoded_data.into_boxed_slice(),
+                    data: Some(decoded_data.into_boxed_slice()),
                     buffer_size,
                 }
             }
