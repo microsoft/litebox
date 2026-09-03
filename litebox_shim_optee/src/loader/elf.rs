@@ -287,6 +287,8 @@ pub enum ElfLoaderError {
     MappingError(#[from] MappingError),
     #[error("TA binary UUID does not match expected UUID")]
     InvalidUuid,
+    #[error("failed to generate stack canary")]
+    StackCanaryError(#[from] litebox::random::FillRandomError),
 }
 
 impl From<ElfLoaderError> for litebox_common_linux::errno::Errno {
@@ -299,6 +301,7 @@ impl From<ElfLoaderError> for litebox_common_linux::errno::Errno {
             }
             ElfLoaderError::LoadError(e) => e.into(),
             ElfLoaderError::InvalidUuid => litebox_common_linux::errno::Errno::EINVAL,
+            ElfLoaderError::StackCanaryError(_) => litebox_common_linux::errno::Errno::EIO,
         }
     }
 }

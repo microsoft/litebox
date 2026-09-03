@@ -10,7 +10,7 @@ use litebox::{
 use litebox_common_optee::{LdelfArg, TeeParamType, UteeParamOwned, UteeParams};
 use zerocopy::IntoBytes;
 
-use crate::{Platform, UserMutPtr};
+use crate::UserMutPtr;
 
 #[inline]
 fn align_down(addr: usize, align: usize) -> usize {
@@ -223,7 +223,7 @@ impl TaStack {
         Some(())
     }
 
-    pub(crate) fn init(&mut self, platform: &Platform, params: &[UteeParamOwned]) -> Option<()> {
+    pub(crate) fn init(&mut self, params: &[UteeParamOwned], stack_canary: [u8; 16]) -> Option<()> {
         if params.len() > UteeParams::TEE_NUM_PARAMS {
             return None;
         }
@@ -256,10 +256,7 @@ impl TaStack {
 
         self.set_utee_params()?;
 
-        // Random 16-byte stack canary
-        let mut canary = [0u8; 16];
-        <Platform as litebox::platform::CrngProvider>::fill_bytes_crng(platform, &mut canary);
-        self.push_bytes(&canary)?;
+        self.push_bytes(&stack_canary)?;
 
         // `reenter_thread` *jumps* into the TA entry point (which is a function) rather than
         // calls it. Adjust the stack pointer to ensure post-call stack alignment.
