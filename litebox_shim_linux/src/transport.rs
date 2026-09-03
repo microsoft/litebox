@@ -141,7 +141,8 @@ mod tests {
     use std::net::TcpListener;
     use std::path::Path;
 
-    use litebox::fs::nine_p;
+    use litebox::fs::nine_p::NineP;
+    use litebox::fs::resolver::Resolver;
     use litebox::fs::{FileSystem as _, Mode, OFlags};
 
     use crate::syscalls::tests::init_platform;
@@ -261,10 +262,7 @@ mod tests {
             crate::DefaultFS<crate::syscalls::tests::TestPlatform>,
         >,
         server: &DiodServer,
-    ) -> nine_p::FileSystem<
-        crate::syscalls::tests::TestPlatform,
-        ShimTransport<crate::syscalls::tests::TestPlatform>,
-    > {
+    ) -> Resolver<crate::syscalls::tests::TestPlatform, litebox::fs::composer::Composer> {
         let addr = socket_addr([127, 0, 0, 1], server.port);
         let transport = ShimTransport::connect(task.global.clone(), addr)
             .expect("failed to connect to 9P server via shim network");
@@ -274,8 +272,16 @@ mod tests {
             .or_else(|_| std::env::var("LOGNAME"))
             .unwrap_or_else(|_| std::string::String::from("nobody"));
 
-        nine_p::FileSystem::new(&task.global.litebox, transport, 65536, &username, aname)
-            .expect("failed to create 9P filesystem")
+        let composer = litebox::fs::composer::Composer::builder()
+            .mount("/", |allocator| {
+                NineP::<crate::syscalls::tests::TestPlatform, _>::new(
+                    transport, 65536, &username, aname, allocator,
+                )
+                .expect("failed to create 9P filesystem")
+            })
+            .build()
+            .expect("a single mount at `/`");
+        Resolver::new(&task.global.litebox, composer)
     }
 
     // -----------------------------------------------------------------------

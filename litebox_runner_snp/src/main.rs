@@ -40,10 +40,7 @@ type DefaultFS = litebox::fs::layered::FileSystem<
     litebox::fs::layered::FileSystem<
         Platform,
         litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>,
-        litebox::fs::nine_p::FileSystem<
-            Platform,
-            litebox_shim_linux::transport::ShimTransport<Platform>,
-        >,
+        litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>,
     >,
 >;
 
@@ -232,15 +229,26 @@ pub extern "C" fn sandbox_process_init(
             globals::SM_TERM_GENERAL,
         );
     };
-    let Ok(nine_p) =
-        litebox::fs::nine_p::FileSystem::new(litebox, transport, 65536, "root", "/tmp")
-    else {
-        ghcb_prints("failed to create 9P filesystem");
-        litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::terminate(
-            globals::SM_SEV_TERM_SET,
-            globals::SM_TERM_GENERAL,
+    let nine_p_composer = litebox::fs::composer::Composer::builder()
+        .mount("/", |allocator| {
+            let Ok(backend) = litebox::fs::nine_p::NineP::<Platform, _>::new(
+                transport, 65536, "root", "/tmp", allocator,
+            ) else {
+                ghcb_prints("failed to create 9P filesystem");
+                litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::terminate(
+                    globals::SM_SEV_TERM_SET,
+                    globals::SM_TERM_GENERAL,
+                );
+            };
+            backend
+        })
+        .build()
+        .unwrap_or_else(
+            |(litebox::fs::composer::BuildError::NoMounts
+             | litebox::fs::composer::BuildError::InvalidMountPath
+             | litebox::fs::composer::BuildError::DuplicateMountPath)| unreachable!(),
         );
-    };
+    let nine_p = litebox::fs::resolver::Resolver::new(litebox, nine_p_composer);
     let dev_stdio_composer = litebox::fs::composer::Composer::builder()
         .mount("/dev", |allocator| {
             litebox::fs::devices::Devices::new(litebox, allocator)

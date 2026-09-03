@@ -38,9 +38,15 @@ impl InodeAllocator {
     pub fn next(&self) -> NodeInfo {
         let ino = self.counter.fetch_add(1, Ordering::Relaxed);
         NodeInfo {
-            dev: self.device_id.try_into().unwrap(),
+            dev: self.device_id(),
             ino: ino.try_into().unwrap(),
             rdev: None,
         }
+    }
+
+    /// The device id this allocator hands out.
+    #[must_use]
+    pub fn device_id(&self) -> usize {
+        self.device_id.try_into().unwrap()
     }
 }

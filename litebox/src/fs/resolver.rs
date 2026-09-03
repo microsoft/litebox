@@ -585,7 +585,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     }
 
     fn close(&self, fd: &TypedFd<Self>) -> Result<(), CloseError> {
-        self.litebox.descriptor_table_mut().remove(fd);
+        let mut dt = self.litebox.descriptor_table_mut();
+        let removed = dt.remove(fd);
+        drop(dt);
+        // some backends might block while closing an fd, so we've released the descriptor table
+        // lock _before_ we let the backend handle the close.
+        drop(removed);
         Ok(())
     }
 
