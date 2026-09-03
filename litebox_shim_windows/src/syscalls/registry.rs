@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 //! Windows registry syscalls backed by a private file-system-shaped store (i.e.,
-//! a layered file system with in-mem and tar filesystems).
+//! an overlay file system with in-memory and tar backends).
 //!
 //! Registry keys are represented as directories and values as files under each
 //! key's `.values` directory:
@@ -60,11 +60,8 @@ use crate::nt_types::{
     read_unicode_string_at,
 };
 
-type RegistryFileSystem<Platform> = litebox::fs::layered::FileSystem<
-    Platform,
-    litebox::fs::resolver::Resolver<Platform, litebox::fs::in_mem::InMem<Platform>>,
-    litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>,
->;
+type RegistryFileSystem<Platform> =
+    litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>;
 
 pub(crate) struct RegistryKeySubsystem<Platform>(PhantomData<fn(Platform)>);
 
@@ -607,18 +604,33 @@ struct RegistryValue {
 
 impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
     pub(crate) fn new(litebox: &LiteBox<Platform>) -> Self {
-        let in_mem = litebox::fs::resolver::Resolver::new(
+        let in_mem = litebox::fs::in_mem::InMem::<Platform>::new_initialized([(
+            "/",
+            litebox::fs::in_mem::InitialNode::Directory {
+                mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+                owner: litebox::fs::UserInfo::ROOT,
+            },
+        )]);
+        let fs = litebox::fs::resolver::Resolver::new(
             litebox,
-            litebox::fs::in_mem::InMem::new_initialized([(
-                "/",
-                litebox::fs::in_mem::InitialNode::Directory {
-                    mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
-                    owner: litebox::fs::UserInfo::ROOT,
-                },
-            )]),
+            litebox::fs::composer::Composer::builder()
+                .mount_nestable("/", |allocators| {
+                    litebox::fs::overlay::Overlay::new(
+                        litebox,
+                        in_mem,
+                        litebox::fs::tar_ro::TarRo::new(
+                            // TODO: Replace with tar file provided by the user
+                            litebox::fs::tar_ro::EMPTY_TAR_FILE.into(),
+                            allocators.next(),
+                        ),
+                        allocators.next(),
+                    )
+                })
+                .build()
+                .unwrap(),
         );
         {
-            let fs = &in_mem;
+            let fs = &fs;
             for key in [
                 DEFAULT_SESSION_MANAGER_KEY,
                 DEFAULT_SEGMENT_HEAP_KEY,
@@ -777,27 +789,6 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
                 }
             }
         }
-
-        let tar_ro = litebox::fs::resolver::Resolver::new(
-            litebox,
-            litebox::fs::composer::Composer::builder()
-                .mount("/", |allocator| {
-                    litebox::fs::tar_ro::TarRo::new(
-                        // TODO: Replace with tar file provided by the user
-                        litebox::fs::tar_ro::EMPTY_TAR_FILE.into(),
-                        allocator,
-                    )
-                })
-                .build()
-                .unwrap(),
-        );
-        let fs = litebox::fs::layered::FileSystem::new(
-            litebox,
-            in_mem,
-            tar_ro,
-            litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
-        );
-
         Self {
             fs,
             notification_state: Mutex::new(RegistryNotificationState::default()),

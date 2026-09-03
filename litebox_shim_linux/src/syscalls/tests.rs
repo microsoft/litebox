@@ -91,18 +91,14 @@ pub(crate) fn init_platform_with_pipe_broker()
 fn init_platform_with_builder(
     shim_builder: crate::LinuxShimBuilder<TestPlatform>,
 ) -> crate::Task<TestPlatform, crate::DefaultFS<TestPlatform>> {
-    let litebox = shim_builder.litebox();
-    let in_mem_fs = litebox::fs::resolver::Resolver::new(
-        litebox,
-        litebox::fs::in_mem::InMem::new_initialized([(
-            "/",
-            litebox::fs::in_mem::InitialNode::Directory {
-                mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
-                owner: litebox::fs::UserInfo::ROOT,
-            },
-        )]),
-    );
-    let fs = alloc::sync::Arc::new(shim_builder.default_fs(in_mem_fs, TEST_TAR_FILE.into()));
+    let in_mem = litebox::fs::in_mem::InMem::new_initialized([(
+        "/",
+        litebox::fs::in_mem::InitialNode::Directory {
+            mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+            owner: litebox::fs::UserInfo::ROOT,
+        },
+    )]);
+    let fs = alloc::sync::Arc::new(shim_builder.default_fs(in_mem, TEST_TAR_FILE.into()));
     shim_builder.build().0.new_test_task(fs)
 }
 
