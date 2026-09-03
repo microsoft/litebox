@@ -33,7 +33,12 @@ fn run(name: &str) {
             |_| env!("CARGO_BIN_EXE_litebox_runner_optee_on_linux_userland").to_string(),
         ),
     );
-    let broker_path = broker_path(&runner_path);
+    let broker_path = runner_path.with_file_name("litebox-broker-userland");
+    assert!(
+        broker_path.is_file(),
+        "OP-TEE broker tests require a workspace build producing {}",
+        broker_path.display()
+    );
 
     // Create a temporary directory for the hooked binaries
     let temp_dir = std::env::temp_dir().join(format!("litebox_test_{name}_{}", std::process::id()));
@@ -71,29 +76,6 @@ fn run(name: &str) {
         status.success(),
         "failed to run brokered OP-TEE runner against {name}.elf: {status}",
     );
-}
-
-fn broker_path(runner_path: &std::path::Path) -> PathBuf {
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let status = std::process::Command::new(cargo)
-        .args([
-            "build",
-            "-p",
-            "litebox_broker_userland",
-            "--bin",
-            "litebox-broker-userland",
-        ])
-        .status()
-        .expect("failed to build litebox-broker-userland");
-    assert!(status.success(), "failed to build litebox-broker-userland");
-
-    let broker_path = runner_path.with_file_name("litebox-broker-userland");
-    assert!(
-        broker_path.is_file(),
-        "broker executable not found at {}",
-        broker_path.display()
-    );
-    broker_path
 }
 
 #[test]
