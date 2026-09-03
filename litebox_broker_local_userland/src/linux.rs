@@ -11,15 +11,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::unix_socket::{
-    UnixControlRingLocalCallChannel, UnixControlRingLocalNotificationChannel,
-    UnixControlRingLocalShutdown, UnixStreamLocalSetupChannel,
-};
 use anyhow::{Context as _, Result};
 use litebox_broker_local::{BrokerLocal, BrokerNotifications};
 use litebox_broker_protocol::message::BrokerNotification;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport::control_ring::ControlRing;
+use litebox_broker_transport_linux_userland::unix_socket::{
+    UnixControlRingLocalCallChannel, UnixControlRingLocalNotificationChannel,
+    UnixControlRingLocalShutdown, UnixStreamLocalSetupChannel,
+};
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const RETRY_DELAY: Duration = Duration::from_millis(20);
@@ -224,20 +224,20 @@ fn connect_with_retry<Channel>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memfd::MemfdSharedMemory;
-    use crate::unix_socket::{
-        UnixControlRingHostNotificationChannel, UnixControlRingHostRequestSource,
-        UnixControlRingHostResponseSink, UnixControlRingHostShutdown, UnixStreamHostSetupChannel,
-    };
-    use crate::unix_socket::{
-        UnixControlRingLocalCallChannel, UnixControlRingLocalNotificationChannel,
-        UnixControlRingLocalShutdown, UnixStreamLocalSetupChannel,
-    };
     use litebox_broker_protocol::ObjectHandle;
     use litebox_broker_protocol::message::{BrokerNotification, ReadinessNotification};
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_transport::channel::{
         HostNotificationChannel, HostReceive, HostSetupChannel, LocalSetupChannel,
+    };
+    use litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory;
+    use litebox_broker_transport_linux_userland::unix_socket::{
+        UnixControlRingHostNotificationChannel, UnixControlRingHostRequestSource,
+        UnixControlRingHostResponseSink, UnixControlRingHostShutdown, UnixStreamHostSetupChannel,
+    };
+    use litebox_broker_transport_linux_userland::unix_socket::{
+        UnixControlRingLocalCallChannel, UnixControlRingLocalNotificationChannel,
+        UnixControlRingLocalShutdown, UnixStreamLocalSetupChannel,
     };
     use std::io::ErrorKind;
     use std::os::fd::AsFd;

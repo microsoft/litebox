@@ -1,0 +1,19 @@
+[package]
+name = "litebox_broker_local_userland"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = { version = "1.0.97", default-features = false }
+litebox_broker_local = { path = "../litebox_broker_local", version = "0.1.0" }
+litebox_broker_protocol = { path = "../litebox_broker_protocol", version = "0.1.0" }
+litebox_broker_transport = { path = "../litebox_broker_transport", version = "0.1.0" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+litebox_broker_transport_linux_userland = { path = "../litebox_broker_transport_linux_userland", version = "0.1.0" }
+
+[target.'cfg(all(windows, target_arch = "x86_64"))'.dependencies]
+litebox_broker_transport_windows_userland = { path = "../litebox_broker_transport_windows_userland", version = "0.1.0" }
+
+[lints]
+workspace = true

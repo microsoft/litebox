@@ -22,7 +22,6 @@
 mod pending_calls;
 mod setup;
 
-pub mod broker;
 pub mod memfd;
 
 mod unix_io;

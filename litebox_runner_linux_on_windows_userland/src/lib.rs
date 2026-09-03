@@ -9,7 +9,7 @@ extern crate alloc;
 
 use anyhow::{Result, anyhow};
 use clap::Parser;
-use litebox_broker_transport_windows_userland::broker;
+use litebox_broker_local_userland as broker;
 use litebox_platform_windows_userland::WindowsUserland as Platform;
 use std::path::PathBuf;
 

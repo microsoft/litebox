@@ -5,23 +5,27 @@ use std::ffi::OsStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::control_ring::{
-    WindowsControlRingLocalCallChannel, WindowsControlRingLocalNotificationChannel,
-};
-use crate::named_pipe::WindowsNamedPipeLocalSetupChannel;
 use anyhow::{Context as _, Result};
 use litebox_broker_local::{BrokerLocal, BrokerNotifications};
 use litebox_broker_protocol::message::BrokerNotification;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport::control_ring::ControlRing;
+use litebox_broker_transport_windows_userland::control_ring::{
+    WindowsControlRingLocalCallChannel, WindowsControlRingLocalNotificationChannel,
+};
+use litebox_broker_transport_windows_userland::named_pipe::WindowsNamedPipeLocalSetupChannel;
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// An active Windows-userland broker association.
 pub struct BrokerConnection {
+    /// Synchronous broker request channel.
     pub local: BrokerLocal<WindowsControlRingLocalCallChannel>,
+    /// Asynchronous broker notification channel.
     pub notifications: BrokerNotifications<WindowsControlRingLocalNotificationChannel>,
 }
 
+/// Connects to and negotiates an association with a Windows-userland broker.
 pub fn connect(control_pipe: &OsStr) -> Result<BrokerConnection> {
     let deadline = Instant::now() + SETUP_TIMEOUT;
     let setup =
@@ -51,6 +55,7 @@ pub fn connect(control_pipe: &OsStr) -> Result<BrokerConnection> {
     })
 }
 
+/// Starts the broker notification receiver for an active association.
 pub fn start_notification_receiver(
     mut notifications: BrokerNotifications<WindowsControlRingLocalNotificationChannel>,
     dispatch_notification: impl Fn(BrokerNotification) + Send + 'static,

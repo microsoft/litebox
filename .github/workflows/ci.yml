@@ -205,6 +205,7 @@ jobs:
         -p litebox_packager
         -p litebox_broker_protocol
         -p litebox_broker_transport
+        -p litebox_broker_local_userland
         -p litebox_broker_core
         -p litebox_broker_local
         -p litebox_broker_host
@@ -281,6 +282,10 @@ jobs:
           #   both the local and the broker/host endpoints of the current
           #   Unix-domain-socket control channel.
           #
+          # - `litebox_broker_local_userland` is allowed to have `std` access,
+          #   since it binds the portable broker local endpoint to the hosted
+          #   Linux or Windows userland transport.
+          #
           # - `litebox_broker_transport_windows_userland` is allowed to have
           #   `std` access, since it is the Windows-userland binding for the
           #   broker control channel.
@@ -352,6 +357,7 @@ jobs:
           #   can safely use std.
           find . -type f -name 'Cargo.toml' \
             -not -path './Cargo.toml' \
+            -not -path './litebox_broker_local_userland/Cargo.toml' \
             -not -path './litebox_broker_platform_linux_userland/Cargo.toml' \
             -not -path './litebox_broker_transport_linux_userland/Cargo.toml' \
             -not -path './litebox_broker_transport_windows_userland/Cargo.toml' \
