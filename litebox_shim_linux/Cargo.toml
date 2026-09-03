@@ -23,6 +23,10 @@ alarm_fallback = []
 aarch64_virtualize_x18 = []
 
 [dev-dependencies]
+litebox_broker_core = { path = "../litebox_broker_core", version = "0.1.0" }
+litebox_broker_local = { path = "../litebox_broker_local", version = "0.1.0" }
+litebox_broker_protocol = { path = "../litebox_broker_protocol", version = "0.1.0" }
+litebox_broker_transport = { path = "../litebox_broker_transport", version = "0.1.0" }
 spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }
 libc = "0.2.177"
 tempfile = "3"
