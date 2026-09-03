@@ -21,8 +21,8 @@ use litebox::utils::TruncateExt;
 use litebox_common_linux::vmap::PhysPageAddr;
 use litebox_common_lvbs::{
     HekiKdataType, HekiKernelInfo, HekiKexecType, HekiPage, HekiPatch, KEXEC_SEGMENT_MAX, Kimage,
-    MemAttr, ModMemType, PAGE_SIZE, ReservationStatus, VsmError, Vtl0Gate, Vtl0PrivilegedWrite,
-    mod_mem_type_to_mem_attr,
+    MemAttr, ModMemType, PAGE_SIZE, POKE_MAX_OPCODE_SIZE, ReservationStatus, VsmError, Vtl0Gate,
+    Vtl0PrivilegedWrite, mod_mem_type_to_mem_attr,
 };
 use x86_64::{
     PhysAddr, VirtAddr,
@@ -400,6 +400,10 @@ impl<P: Vtl0Gate> Heki<P> {
             return Err(VsmError::ModuleTokenInvalid);
         }
 
+        let _patch_guard = self
+            .module_memory_metadata
+            .has_init_patch_targets(token)
+            .then(|| self.text_patch_lock.lock());
         let mut result: Result<(), VsmError> = Ok(());
         if let Some(entry) = self.module_memory_metadata.iter_entry(token) {
             for mod_mem_range in entry.iter_mem_ranges() {
@@ -443,13 +447,18 @@ impl<P: Vtl0Gate> Heki<P> {
             return Err(VsmError::ModuleTokenInvalid);
         }
 
+        let patch_targets = self
+            .module_memory_metadata
+            .get_patch_targets(token)
+            .unwrap_or_default();
+        let _patch_guard = (!patch_targets.is_empty()).then(|| self.text_patch_lock.lock());
         if let Some(entry) = self.module_memory_metadata.iter_entry(token) {
             for mod_mem_range in entry.iter_mem_ranges() {
                 self.gate.unprotect_frames(mod_mem_range.phys_frame_range)?;
             }
         }
 
-        if let Some(patch_targets) = self.module_memory_metadata.get_patch_targets(token) {
+        if !patch_targets.is_empty() {
             self.precomputed_patches.remove_patch_data(&patch_targets);
         }
 
@@ -606,11 +615,16 @@ impl<P: Vtl0Gate> Heki<P> {
         let heki_patch = copy_heki_patch_from_vtl0(&self.gate, patch_pa_0, patch_pa_1)?;
         log::debug!("HEKI: {heki_patch:?}");
 
+        let _patch_guard = self.text_patch_lock.lock();
         let precomputed_patch = self
             .find_precomputed_patch(&heki_patch)
             .ok_or(VsmError::PrecomputedPatchNotFound)?;
+        // Protected text changes only through writers serialized by this lock.
+        let current = read_text_patch(&self.gate, &precomputed_patch)?;
 
-        if let Some(validated) = ValidatedTextPatch::prepare(&heki_patch, &precomputed_patch)? {
+        if let Some(validated) =
+            ValidatedTextPatch::prepare(&heki_patch, &precomputed_patch, &current)?
+        {
             validated.apply(writer)?;
         }
         Ok(0)
@@ -755,6 +769,32 @@ fn parse_certs(mut buf: &[u8]) -> Result<Vec<Certificate>, VsmError> {
     Ok(certs)
 }
 
+fn read_text_patch<P: Vtl0Gate>(
+    gate: &P,
+    patch: &HekiPatch,
+) -> Result<[u8; POKE_MAX_OPCODE_SIZE], VsmError> {
+    let pa_0 = PhysAddr::new(patch.pa[0]);
+    let page_0 = pa_0.align_down(Size4KiB::SIZE);
+    let offset = (pa_0 - page_0).trunc();
+    let page_0 =
+        PhysPageAddr::<PAGE_SIZE>::new(page_0.as_u64().trunc()).ok_or(VsmError::Vtl0CopyFailed)?;
+    let mut pages = [page_0, page_0];
+    let page_count = if offset + usize::from(patch.size) > PAGE_SIZE {
+        pages[1] =
+            PhysPageAddr::<PAGE_SIZE>::new(patch.pa[1].trunc()).ok_or(VsmError::Vtl0CopyFailed)?;
+        2
+    } else {
+        1
+    };
+    let mut current = [0; POKE_MAX_OPCODE_SIZE];
+    gate.read_vtl0_pages(
+        &pages[..page_count],
+        offset,
+        &mut current[..usize::from(patch.size)],
+    )?;
+    Ok(current)
+}
+
 /// A text patch that matched VTL1's precomputed patch data, bundled with the
 /// VTL0 write parameters it authorizes.
 ///
@@ -773,8 +813,12 @@ impl<'a> ValidatedTextPatch<'a> {
     /// Validate `patch` against `precomputed`; on success, compute the target
     /// page(s), in-page offset, and bytes. Returns `Err(TextPatchSuspicious)` if
     /// validation fails, or `Ok(None)` if the patch is empty (nothing to write).
-    fn prepare(patch: &'a HekiPatch, precomputed: &HekiPatch) -> Result<Option<Self>, VsmError> {
-        if !validate_text_patch(patch, precomputed) {
+    fn prepare(
+        patch: &'a HekiPatch,
+        precomputed: &HekiPatch,
+        current: &[u8],
+    ) -> Result<Option<Self>, VsmError> {
+        if !validate_text_patch(patch, precomputed, current) {
             return Err(VsmError::TextPatchSuspicious);
         }
         let bytes = &patch.code[..usize::from(patch.size)];

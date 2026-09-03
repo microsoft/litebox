@@ -711,10 +711,48 @@ pub(crate) fn validate_text_poke_bp_batch(
     false
 }
 
-/// This function checks whether the patch data is valid for a given target
-pub(crate) fn validate_text_patch(patch_data: &HekiPatch, precomputed_patch: &HekiPatch) -> bool {
-    validate_text_poke_bp_batch(patch_data, precomputed_patch)
-    // TODO: support other patching methods
+/// This function checks whether the patch data is a valid transition from the current target.
+pub(crate) fn validate_text_patch(
+    patch_data: &HekiPatch,
+    precomputed_patch: &HekiPatch,
+    current: &[u8],
+) -> bool {
+    if !validate_text_poke_bp_batch(patch_data, precomputed_patch) {
+        return false;
+    }
+
+    let size = usize::from(precomputed_patch.size);
+    if current.len() < size {
+        return false;
+    }
+    let current = &current[..size];
+    let nop =
+        if precomputed_patch.size == JMP8_INSN_SIZE || precomputed_patch.size == JMP32_INSN_SIZE {
+            Some(&X86_NOPS[size - 1][..size])
+        } else {
+            None
+        };
+
+    if patch_data.size == 1
+        && patch_data.code[0] == INT3_INSN_OPCODE
+        && patch_data.pa[0] == precomputed_patch.pa[0]
+    {
+        return current == &precomputed_patch.code[..size] || nop.is_some_and(|nop| current == nop);
+    }
+
+    if patch_data.size == precomputed_patch.size - 1 && patch_data.pa[0] != precomputed_patch.pa[0]
+    {
+        return current[0] == INT3_INSN_OPCODE
+            && (current[1..] == precomputed_patch.code[1..size]
+                || nop.is_some_and(|nop| current[1..] == nop[1..]));
+    }
+
+    let mut result = [0; POKE_MAX_OPCODE_SIZE];
+    result[..size].copy_from_slice(current);
+    result[0] = patch_data.code[0];
+    current[0] == INT3_INSN_OPCODE
+        && (result[..size] == precomputed_patch.code[..size]
+            || nop.is_some_and(|nop| result[..size] == *nop))
 }
 
 /// Errors for kernel ELF validation and relocation.
@@ -756,5 +794,45 @@ mod tests {
         let patch_data = patch([precomputed.pa[0] + 1, 0x3000], &[0x01, 0x02]);
 
         assert!(!validate_text_poke_bp_batch(&patch_data, &precomputed));
+    }
+
+    #[test]
+    fn validate_text_patch_requires_consistent_transition() {
+        let precomputed = patch([0x1000, 0], &[0xe9, 0x01, 0x02, 0x03, 0x04]);
+        let int3 = patch([0x1000, 0], &[INT3_INSN_OPCODE]);
+        let real_tail = patch([0x1001, 0], &[0x01, 0x02, 0x03, 0x04]);
+        let real_head = patch([0x1000, 0], &[0xe9]);
+        let nop_head = patch([0x1000, 0], &[0x0f]);
+
+        assert!(validate_text_patch(
+            &int3,
+            &precomputed,
+            &[0xe9, 0x01, 0x02, 0x03, 0x04]
+        ));
+        assert!(validate_text_patch(
+            &real_tail,
+            &precomputed,
+            &[0xcc, 0x1f, 0x44, 0x00, 0x00]
+        ));
+        assert!(validate_text_patch(
+            &real_head,
+            &precomputed,
+            &[0xcc, 0x01, 0x02, 0x03, 0x04]
+        ));
+        assert!(!validate_text_patch(
+            &real_head,
+            &precomputed,
+            &[0xcc, 0x1f, 0x44, 0x00, 0x00]
+        ));
+        assert!(validate_text_patch(
+            &nop_head,
+            &precomputed,
+            &[0xcc, 0x1f, 0x44, 0x00, 0x00]
+        ));
+        assert!(!validate_text_patch(
+            &int3,
+            &precomputed,
+            &[0xe9, 0x1f, 0x44, 0x00, 0x00]
+        ));
     }
 }

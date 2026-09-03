@@ -51,6 +51,7 @@ pub struct Heki<P: Vtl0Gate> {
     pub(crate) kexec_metadata: KexecMemoryMetadataWrapper,
     pub(crate) crash_kexec_metadata: KexecMemoryMetadataWrapper,
     pub(crate) precomputed_patches: PatchDataMap,
+    pub(crate) text_patch_lock: spin::mutex::SpinMutex<()>,
     pub(crate) symbols: SymbolTable,
     pub(crate) gpl_symbols: SymbolTable,
     // TODO: revocation cert, blocklist, etc.
@@ -69,6 +70,7 @@ impl<P: Vtl0Gate> Heki<P> {
             kexec_metadata: KexecMemoryMetadataWrapper::new(),
             crash_kexec_metadata: KexecMemoryMetadataWrapper::new(),
             precomputed_patches: PatchDataMap::new(),
+            text_patch_lock: spin::mutex::SpinMutex::new(()),
             symbols: SymbolTable::new(),
             gpl_symbols: SymbolTable::new(),
         }
@@ -282,6 +284,19 @@ impl ModuleMemoryMetadataMap {
             }
         });
         freed_patch_targets
+    }
+
+    pub(crate) fn has_init_patch_targets(&self, key: i64) -> bool {
+        let guard = self.inner.lock();
+        guard.get(&key).is_some_and(|metadata| {
+            metadata.patch_targets.iter().any(|&pa| {
+                metadata.ranges.iter().any(|range| {
+                    range.mod_mem_type == ModMemType::InitText
+                        && range.phys_frame_range.start.start_address() <= pa
+                        && range.phys_frame_range.end.start_address() > pa
+                })
+            })
+        })
     }
 
     /// Return the addresses of patch targets belonging to a module identified by `key`
