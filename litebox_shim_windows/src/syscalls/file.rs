@@ -2045,7 +2045,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                 output_buffer_length,
             ),
             IoctlTarget::KsecDevice => ksecdd::handle_ioctl::<Platform>(
-                self.global.platform,
+                &self.global.litebox,
                 io_control_code,
                 input_buffer,
                 input_buffer_length,
@@ -2888,7 +2888,7 @@ mod tests {
     fn ksecdd_delivers_entropy_and_rejects_unknown_controls() {
         run_with_test_platform_pointers(|| {
             const UNKNOWN_KSEC_IOCTL: u32 = 0x0039_0000;
-            let task = crate::tests::test_task();
+            let task = crate::tests::test_task_with_random_broker();
             let handle = open_ksecdd(&task, FILE_GENERIC_READ | FILE_GENERIC_WRITE);
 
             let mut first = [0u8; 32];
@@ -2982,6 +2982,35 @@ mod tests {
             );
             assert_eq!(io_status.status, NtStatus::INVALID_DEVICE_REQUEST.as_raw());
             assert_eq!(io_status.information, 0);
+        });
+    }
+
+    #[test]
+    fn ksecdd_random_fill_requires_broker() {
+        run_with_test_platform_pointers(|| {
+            let task = crate::tests::test_task();
+            let handle = open_ksecdd(&task, FILE_GENERIC_READ | FILE_GENERIC_WRITE);
+            let mut output = [0xa5; 32];
+            let mut io_status = IoStatusBlock::default();
+
+            assert_eq!(
+                task.sys_nt_device_io_control_file(
+                    handle,
+                    Handle::default(),
+                    None,
+                    None,
+                    mut_ptr(&mut io_status),
+                    ksecdd::KsecIoControlCode::RandomFillBuffer as u32,
+                    None,
+                    0,
+                    Some(mut_byte_ptr(&mut output)),
+                    output.len().try_into().unwrap(),
+                ),
+                NtStatus::UNSUCCESSFUL
+            );
+            assert_eq!(io_status.status, NtStatus::UNSUCCESSFUL.as_raw());
+            assert_eq!(io_status.information, 0);
+            assert_eq!(output, [0xa5; 32]);
         });
     }
 

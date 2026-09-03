@@ -4,11 +4,21 @@
 extern crate std;
 
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::size_of;
 use litebox::fs::{Mode, OFlags};
 use litebox::platform::RawConstPointer as _;
 use litebox::utils::TruncateExt as _;
+use litebox_broker_local::BrokerLocal;
+use litebox_broker_protocol::BROKER_PROTOCOL_VERSION;
+use litebox_broker_protocol::message::{
+    BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerOperation, BrokerRequest,
+    BrokerResponse, BrokerResult,
+};
+use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE};
+use litebox_broker_transport::channel::{LocalCallChannel, LocalSetupChannel};
+use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemory, SharedMemoryError};
 
 use crate::nt_types::{ObjectAttributes, UnicodeString};
 use crate::syscalls::Handle;
@@ -109,7 +119,30 @@ pub(crate) fn test_task() -> Task<TestPlatform> {
     test_task_with_nls_files(&[])
 }
 
+pub(crate) fn test_task_with_random_broker() -> Task<TestPlatform> {
+    let platform = test_platform();
+    let setup = RandomBrokerSetup::new();
+    let (broker_local, ()) = BrokerLocal::negotiate(setup, |setup| {
+        let memory: Arc<dyn SharedMemory> = setup.memory.clone();
+        Ok((setup.activate(), memory, ()))
+    })
+    .unwrap();
+    let litebox = litebox::LiteBox::new_with_broker_local(platform, broker_local);
+    test_task_with_builder(
+        crate::WindowsShimBuilder::new_with_litebox(platform, litebox),
+        &[],
+    )
+}
+
 pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<TestPlatform> {
+    let platform = test_platform();
+    test_task_with_builder(crate::WindowsShimBuilder::new(platform), nls_files)
+}
+
+fn test_task_with_builder(
+    shim_builder: crate::WindowsShimBuilder<TestPlatform>,
+    nls_files: &[(&str, &[u8])],
+) -> Task<TestPlatform> {
     let platform = test_platform();
     let in_mem = litebox::fs::in_mem::InMem::new_initialized([(
         "/",
@@ -118,7 +151,6 @@ pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<Test
             owner: litebox::fs::UserInfo::ROOT,
         },
     )]);
-    let shim_builder = crate::WindowsShimBuilder::<TestPlatform>::new(platform);
     let fs = Arc::new(shim_builder.default_fs(in_mem, litebox::fs::tar_ro::EMPTY_TAR_FILE.into()));
     {
         let fs = &*fs;
@@ -186,6 +218,113 @@ pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<Test
         stack_top: 0,
         context: 0,
         thread_object,
+    }
+}
+
+struct RandomBrokerSetup {
+    memory: Arc<TestSharedMemory>,
+}
+
+impl RandomBrokerSetup {
+    fn new() -> Self {
+        Self {
+            memory: Arc::new(TestSharedMemory::new()),
+        }
+    }
+
+    fn activate(self) -> RandomBrokerChannel {
+        RandomBrokerChannel {
+            shared_buffers: SharedBufferPool::new(self.memory, SHARED_BUFFER_LAYOUT).unwrap(),
+            next_byte: core::sync::atomic::AtomicU8::new(1),
+        }
+    }
+}
+
+impl LocalSetupChannel for RandomBrokerSetup {
+    type Error = core::convert::Infallible;
+
+    fn send_handshake_request(
+        &mut self,
+        request: &BrokerHandshakeRequest,
+    ) -> core::result::Result<(), Self::Error> {
+        assert_eq!(request.protocol_version, BROKER_PROTOCOL_VERSION);
+        Ok(())
+    }
+
+    fn recv_handshake_response(
+        &mut self,
+    ) -> core::result::Result<Option<BrokerHandshakeResponse>, Self::Error> {
+        Ok(Some(BrokerHandshakeResponse::Negotiated {
+            broker_protocol_version: BROKER_PROTOCOL_VERSION,
+        }))
+    }
+}
+
+struct RandomBrokerChannel {
+    shared_buffers: SharedBufferPool<Arc<TestSharedMemory>>,
+    next_byte: core::sync::atomic::AtomicU8,
+}
+
+impl LocalCallChannel for RandomBrokerChannel {
+    type Error = core::convert::Infallible;
+
+    fn call(&self, request: BrokerRequest) -> core::result::Result<BrokerResponse, Self::Error> {
+        let BrokerOperation::FillRandom(buffer) = request.operation else {
+            panic!("unexpected random test broker operation");
+        };
+        let byte = self
+            .next_byte
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let random = vec![byte; buffer.length as usize];
+        self.shared_buffers
+            .write(buffer.slot_index, &random)
+            .expect("random broker write must use a valid shared buffer");
+        Ok(BrokerResponse {
+            request_id: request.request_id,
+            result: BrokerResult::RandomFilled,
+        })
+    }
+}
+
+struct TestSharedMemory(std::sync::Mutex<Vec<u8>>);
+
+impl TestSharedMemory {
+    fn new() -> Self {
+        Self(std::sync::Mutex::new(vec![0; SHARED_BUFFER_POOL_SIZE]))
+    }
+}
+
+impl SharedMemory for TestSharedMemory {
+    fn len(&self) -> usize {
+        SHARED_BUFFER_POOL_SIZE
+    }
+
+    fn read(
+        &self,
+        offset: usize,
+        destination: &mut [u8],
+    ) -> core::result::Result<(), SharedMemoryError> {
+        let memory = self.0.lock().unwrap();
+        let end = offset
+            .checked_add(destination.len())
+            .ok_or(SharedMemoryError::InvalidRange)?;
+        let source = memory
+            .get(offset..end)
+            .ok_or(SharedMemoryError::InvalidRange)?;
+        destination.copy_from_slice(source);
+        Ok(())
+    }
+
+    fn write(&self, offset: usize, source: &[u8]) -> core::result::Result<(), SharedMemoryError> {
+        let mut memory = self.0.lock().unwrap();
+        let end = offset
+            .checked_add(source.len())
+            .ok_or(SharedMemoryError::InvalidRange)?;
+        let destination = memory
+            .get_mut(offset..end)
+            .ok_or(SharedMemoryError::InvalidRange)?;
+        destination.copy_from_slice(source);
+        Ok(())
     }
 }
 
