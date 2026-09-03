@@ -11,6 +11,7 @@
 #include <time.h>
 #include <errno.h>
 #include <poll.h>
+#include <sys/socket.h>
 
 #define TEST_ASSERT(cond, msg) do { \
     if (!(cond)) { \
@@ -156,10 +157,11 @@ int test_alarm_fires_in_userspace(void) {
     return 0;
 }
 
-// Test: SIGALRM should interrupt poll() blocked on a pipe with no data.
+// Test: SIGALRM should interrupt poll() blocked on a socket with no data.
 int test_alarm_interrupts_poll(void) {
-    int pipefd[2];
-    TEST_ASSERT(pipe(pipefd) == 0, "pipe failed");
+    int sockets[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0,
+                "socketpair failed");
 
     struct sigaction sa;
     sa.sa_handler = alarm_handler;
@@ -173,7 +175,7 @@ int test_alarm_interrupts_poll(void) {
     alarm_count = 0;
 
     struct pollfd fds[1];
-    fds[0].fd = pipefd[0];
+    fds[0].fd = sockets[0];
     fds[0].events = POLLIN;
     fds[0].revents = 0;
 
@@ -195,8 +197,8 @@ int test_alarm_interrupts_poll(void) {
     TEST_ASSERT(elapsed_ms < 5000,
                 "poll() should have been interrupted within ~1s, not blocked for 60s");
 
-    close(pipefd[0]);
-    close(pipefd[1]);
+    close(sockets[0]);
+    close(sockets[1]);
     printf("alarm_interrupts_poll: PASS (elapsed=%ldms)\n", elapsed_ms);
     return 0;
 }

@@ -656,7 +656,7 @@ mod test {
         crate::Task<TestPlatform, crate::DefaultFS<TestPlatform>>,
         EpollFile<TestPlatform, crate::DefaultFS<TestPlatform>>,
     ) {
-        let task = crate::syscalls::tests::init_platform();
+        let task = crate::syscalls::tests::init_platform_with_pipe_broker();
 
         let epoll = EpollFile::new();
         (task, epoll)
@@ -706,7 +706,7 @@ mod test {
 
     #[test]
     fn test_poll() {
-        let task = crate::syscalls::tests::init_platform();
+        let task = crate::syscalls::tests::init_platform_with_pipe_broker();
 
         let mut set = super::PollSet::with_capacity(0);
         let (rfd_u, wfd_u) = task
@@ -761,7 +761,7 @@ mod test {
 
     #[test]
     fn test_pselect() {
-        let task = crate::syscalls::tests::init_platform();
+        let task = crate::syscalls::tests::init_platform_with_pipe_broker();
 
         let (rfd_u, wfd_u) = task
             .sys_pipe2(litebox::fs::OFlags::empty())
@@ -800,7 +800,7 @@ mod test {
 
     #[test]
     fn test_pselect_read_hup() {
-        let task = crate::syscalls::tests::init_platform();
+        let task = crate::syscalls::tests::init_platform_with_pipe_broker();
 
         let (rfd_u, wfd_u) = task
             .sys_pipe2(litebox::fs::OFlags::empty())

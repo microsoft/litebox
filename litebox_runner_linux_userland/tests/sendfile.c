@@ -188,16 +188,16 @@ static void test_bad_out_fd(void) {
 }
 
 static void test_bad_out_fd_checked_before_bad_in_fd_type(void) {
-    int pfd[2];
-    if (pipe(pfd) != 0) die("pipe");
-    if (write(pfd[1], "data", 4) != 4) die("write pipe");
+    int sockets[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) die("socketpair");
+    if (write(sockets[1], "data", 4) != 4) die("write socket");
 
     errno = 0;
-    ssize_t r = sys_sendfile(9999, pfd[0], NULL, 4);
+    ssize_t r = sys_sendfile(9999, sockets[0], NULL, 4);
     TEST_ASSERT(r == -1 && errno == EBADF, "bad_out_fd_before_bad_in_fd_type: EBADF");
 
-    close(pfd[0]);
-    close(pfd[1]);
+    close(sockets[0]);
+    close(sockets[1]);
 }
 
 static void test_negative_offset(void) {
@@ -369,11 +369,13 @@ int main(void) {
     test_bad_out_fd();
     test_bad_out_fd_checked_before_bad_in_fd_type();
     test_negative_offset();
-    test_file_to_pipe_null_offset();
-    test_full_nonblocking_pipe_keeps_null_offset_position();
-    test_partial_nonblocking_pipe_error_is_deferred();
-    test_file_to_pipe_with_offset();
-    test_pipe_in_fd();
+    if (getenv("LITEBOX_PIPE_BROKER") != NULL) {
+        test_file_to_pipe_null_offset();
+        test_full_nonblocking_pipe_keeps_null_offset_position();
+        test_partial_nonblocking_pipe_error_is_deferred();
+        test_file_to_pipe_with_offset();
+        test_pipe_in_fd();
+    }
     test_unix_stream_in_fd();
     test_unix_dgram_in_fd();
 
