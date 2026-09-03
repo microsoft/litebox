@@ -772,10 +772,17 @@ fn test_runner_broker_tcp_client_with_rewriter() {
         drop(partial_reset_stream);
 
         let (mut fault_stream, _) = listener.accept().unwrap();
-        fault_stream
-            .write_all(&vec![0x6d; 512 * 1024 + 4096])
-            .unwrap();
-        fault_stream.shutdown(std::net::Shutdown::Write).unwrap();
+        match fault_stream.write_all(&vec![0x6d; 512 * 1024 + 4096]) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::NotConnected
+                ) => {}
+            Err(error) => panic!("failed to write fault response: {error}"),
+        }
     });
 
     let refused_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
