@@ -6,20 +6,19 @@ extern crate std;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::mem::size_of;
-use litebox::fs::{FileSystem as _, Mode, OFlags};
+use litebox::fs::{Mode, OFlags};
 use litebox::platform::RawConstPointer as _;
 use litebox::utils::TruncateExt as _;
 
 use crate::nt_types::{ObjectAttributes, UnicodeString};
 use crate::syscalls::Handle;
 use crate::syscalls::thread::{ThreadAccess, ThreadSubsystem};
-use crate::{ConstPtr, DefaultFS, MutPtr, Process, ShimFS, ShimPlatform, Task, WindowsShim};
+use crate::{ConstPtr, MutPtr, Process, ShimPlatform, Task, WindowsShim};
 
 #[cfg(target_os = "linux")]
 pub(crate) type TestPlatform = litebox_platform_linux_userland::LinuxUserland;
 #[cfg(target_os = "windows")]
 pub(crate) type TestPlatform = litebox_platform_windows_userland::WindowsUserland;
-pub(crate) type TestFS = DefaultFS<TestPlatform>;
 
 pub(crate) fn const_ptr<T: zerocopy::FromBytes>(value: &T) -> ConstPtr<TestPlatform, T> {
     ConstPtr::<TestPlatform, T>::from_usize(core::ptr::from_ref(value).cast::<u8>() as usize)
@@ -106,11 +105,11 @@ fn map_csr_server_shared_memory(
     .ok()
 }
 
-pub(crate) fn test_task() -> Task<TestPlatform, TestFS> {
+pub(crate) fn test_task() -> Task<TestPlatform> {
     test_task_with_nls_files(&[])
 }
 
-pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<TestPlatform, TestFS> {
+pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<TestPlatform> {
     let platform = test_platform();
     let in_mem = litebox::fs::in_mem::InMem::new_initialized([(
         "/",
@@ -195,7 +194,7 @@ const SYNCHRONIZE: u32 = 0x0010_0000;
 const DUPLICATE_CLOSE_SOURCE: u32 = 0x0000_0001;
 const DUPLICATE_SAME_ACCESS: u32 = 0x0000_0002;
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     /// Returns a clone of this task representing another thread of the same
     /// process, or `None` if the process is already exiting.
     ///
@@ -232,7 +231,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     }
 }
 
-fn create_event(task: &Task<TestPlatform, TestFS>, desired_access: u32) -> Handle {
+fn create_event(task: &Task<TestPlatform>, desired_access: u32) -> Handle {
     let mut handle = Handle::default();
     assert_eq!(
         task.sys_nt_create_event(mut_ptr(&mut handle), desired_access, None, 0, 0,),

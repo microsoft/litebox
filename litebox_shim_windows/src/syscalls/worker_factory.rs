@@ -17,7 +17,7 @@ use crate::syscalls::iocp::{
     IoCompletionAccess, IoCompletionHandleObject, IoCompletionObject, IoCompletionSubsystem,
 };
 use crate::syscalls::{Handle, ProcessHandle};
-use crate::{ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value};
+use crate::{ConstPtr, MutPtr, Task, probe_guest_output_preserving_value};
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -152,7 +152,7 @@ fn commit_worker_factory_shutdown<Platform: crate::ShimPlatform>(
     NtStatus::SUCCESS
 }
 
-impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: crate::ShimPlatform> Task<Platform> {
     fn io_completion_port(
         &self,
         handle: Handle,
@@ -363,7 +363,7 @@ mod tests {
     use super::*;
     use crate::nt_types::ObjectAttributes;
     use crate::tests::{
-        TestFS, TestPlatform, mut_ptr, null_mut_ptr, run_with_test_platform_pointers, test_task,
+        TestPlatform, mut_ptr, null_mut_ptr, run_with_test_platform_pointers, test_task,
     };
 
     const EVENT_ALL_ACCESS: u32 = 0x001f_0003;
@@ -374,14 +374,11 @@ mod tests {
     const WORKER_FACTORY_SHUTDOWN: u32 = 0x0020;
     const START_ROUTINE: usize = 0x1234_5678;
 
-    fn create_io_completion_handle(task: &Task<TestPlatform, TestFS>) -> Handle {
+    fn create_io_completion_handle(task: &Task<TestPlatform>) -> Handle {
         create_io_completion_handle_with_access(task, IO_COMPLETION_ALL_ACCESS)
     }
 
-    fn create_io_completion_handle_with_access(
-        task: &Task<TestPlatform, TestFS>,
-        access: u32,
-    ) -> Handle {
+    fn create_io_completion_handle_with_access(task: &Task<TestPlatform>, access: u32) -> Handle {
         let mut handle = Handle::default();
         assert_eq!(
             task.sys_nt_create_io_completion(mut_ptr(&mut handle), access, None, 0),
@@ -391,7 +388,7 @@ mod tests {
     }
 
     fn create_worker_factory(
-        task: &Task<TestPlatform, TestFS>,
+        task: &Task<TestPlatform>,
         worker_factory_handle: &mut Handle,
         object_attributes: Option<ConstPtr<TestPlatform, ObjectAttributes>>,
         completion_port_handle: Handle,
@@ -408,7 +405,7 @@ mod tests {
     }
 
     fn create_worker_factory_with_access(
-        task: &Task<TestPlatform, TestFS>,
+        task: &Task<TestPlatform>,
         worker_factory_handle: &mut Handle,
         desired_access: u32,
         object_attributes: Option<ConstPtr<TestPlatform, ObjectAttributes>>,

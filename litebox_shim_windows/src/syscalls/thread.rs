@@ -22,7 +22,7 @@ use crate::syscalls::ProcessHandle;
 use crate::syscalls::mutant::MutantObject;
 use crate::syscalls::{Handle, ThreadHandle};
 use crate::{
-    ConstPtr, MutPtr, ShimFS, ShimPlatform, Task, WindowsShimEntrypoints,
+    ConstPtr, MutPtr, ShimPlatform, Task, WindowsShimEntrypoints,
     probe_guest_output_preserving_value,
 };
 
@@ -337,11 +337,11 @@ impl<Platform: ShimPlatform> IOPollable for ThreadObject<Platform> {
     }
 }
 
-struct NewThreadArgs<Platform: ShimPlatform, FS: ShimFS> {
-    task: Task<Platform, FS>,
+struct NewThreadArgs<Platform: ShimPlatform> {
+    task: Task<Platform>,
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> litebox::shim::InitThread for NewThreadArgs<Platform, FS> {
+impl<Platform: ShimPlatform> litebox::shim::InitThread for NewThreadArgs<Platform> {
     type ExecutionContext = litebox_common_linux::PtRegs;
 
     fn init(
@@ -389,7 +389,7 @@ struct ThreadSchedulerSharedDataSlotInformation {
     slot: usize,
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     #[expect(
         clippy::too_many_arguments,
         reason = "NtCreateThreadEx has eleven ABI parameters whose ordering must remain explicit"
@@ -843,7 +843,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     type TestPlatform = crate::tests::TestPlatform;
-    type TestTask = Task<TestPlatform, crate::tests::TestFS>;
+    type TestTask = Task<TestPlatform>;
 
     fn const_byte_ptr<T>(value: &T) -> ConstPtr<TestPlatform, u8> {
         ConstPtr::<TestPlatform, u8>::from_usize(core::ptr::from_ref(value).cast::<u8>() as usize)

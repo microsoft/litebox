@@ -1,20 +1,20 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Possible errors from [`FileSystem`]
+//! Possible errors from [`Resolver`]
 
 #[expect(
     unused_imports,
     reason = "used for doc string links to work out, but not for code"
 )]
-use super::FileSystem;
+use super::resolver::Resolver;
 
 use thiserror::Error;
 
 // XXX(jayb): We probably need to introduce a notion of `Stale` to many/most of these errors, in
 // order to more correctly support network-attached file systems.
 
-/// Possible errors from [`FileSystem::open`]
+/// Possible errors from [`Resolver::open`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum OpenError {
@@ -34,12 +34,12 @@ pub enum OpenError {
     PathError(#[from] PathError),
 }
 
-/// Possible errors from [`FileSystem::close`]
+/// Possible errors from [`Resolver::close`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum CloseError {}
 
-/// Possible errors from [`FileSystem::read`]
+/// Possible errors from [`Resolver::read`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum ReadError {
@@ -53,7 +53,7 @@ pub enum ReadError {
     Io,
 }
 
-/// Possible errors from [`FileSystem::write`]
+/// Possible errors from [`Resolver::write`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum WriteError {
@@ -67,7 +67,7 @@ pub enum WriteError {
     Io,
 }
 
-/// Possible errors from [`FileSystem::seek`]
+/// Possible errors from [`Resolver::seek`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum SeekError {
@@ -83,7 +83,7 @@ pub enum SeekError {
     Io,
 }
 
-/// Possible errors from [`FileSystem::truncate`]
+/// Possible errors from [`Resolver::truncate`]
 #[derive(Error, Debug)]
 pub enum TruncateError {
     #[error("fd has been closed already")]
@@ -98,7 +98,7 @@ pub enum TruncateError {
     Io,
 }
 
-/// Possible errors from [`FileSystem::chmod`]
+/// Possible errors from [`Resolver::chmod`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum ChmodError {
@@ -115,7 +115,7 @@ pub enum ChmodError {
     PathError(#[from] PathError),
 }
 
-/// Possible errors from [`FileSystem::chown`]
+/// Possible errors from [`Resolver::chown`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum ChownError {
@@ -132,7 +132,7 @@ pub enum ChownError {
     PathError(#[from] PathError),
 }
 
-/// Possible errors from [`FileSystem::unlink`]
+/// Possible errors from [`Resolver::unlink`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum UnlinkError {
@@ -148,7 +148,7 @@ pub enum UnlinkError {
     PathError(#[from] PathError),
 }
 
-/// Possible errors from [`FileSystem::mkdir`]
+/// Possible errors from [`Resolver::mkdir`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum MkdirError {
@@ -164,7 +164,7 @@ pub enum MkdirError {
     PathError(#[from] PathError),
 }
 
-/// Possible errors from [`FileSystem::rmdir`]
+/// Possible errors from [`Resolver::rmdir`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum RmdirError {
@@ -186,7 +186,7 @@ pub enum RmdirError {
     PathError(#[from] PathError),
 }
 
-/// Possible errors from [`FileSystem::read_dir`]
+/// Possible errors from [`Resolver::read_dir`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum ReadDirError {
@@ -198,7 +198,7 @@ pub enum ReadDirError {
     Io,
 }
 
-/// Possible errors from [`FileSystem::file_status`]
+/// Possible errors from [`Resolver::file_status`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum FileStatusError {

@@ -2,11 +2,12 @@
 // Licensed under the MIT license.
 
 //! File-system related functionality
+//!
+//! A file-system consists of a [`Resolver`](resolver::Resolver) that works alongside one or more
+//! [`Backend`](backend::Backend)s. Such backends can be composed together: mounted at distinct
+//! paths via the [`Composer`](composer::Composer), or stacked as a writable upper over immutable
+//! lowers via the [`Overlay`](overlay::Overlay).
 
-use crate::fd::{FdEnabledSubsystem, TypedFd};
-use crate::path;
-
-use alloc::vec::Vec;
 use bitflags::bitflags;
 
 use core::ffi::c_uint;
@@ -25,134 +26,6 @@ pub mod tar_ro;
 
 #[cfg(test)]
 mod tests;
-
-use errors::{
-    ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, ReadDirError,
-    ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
-};
-
-/// A private module, to help support writing sealed traits. This module should _itself_ never be
-/// made public.
-mod private {
-    /// A trait to help seal the main `FileSystem` trait.
-    ///
-    /// This trait is explicitly public, but unnameable, thereby preventing code outside this crate
-    /// from implementing this trait.
-    pub trait Sealed {}
-}
-
-/// A `FileSystem` provides access to all file-system related functionality provided by LiteBox.
-///
-/// The design of the file-system is chosen by the specific underlying implementation of this trait
-/// (e.g., [`resolver::Resolver`] over a [`backend::Backend`]), each of which are parametric in the
-/// platform they run on.
-/// However, users of any of these file systems might find benefit in having most of their code
-/// depend on this trait, rather than on any individual file system.
-pub trait FileSystem: private::Sealed + FdEnabledSubsystem {
-    /// Opens a file
-    ///
-    /// The `mode` is only significant when creating a file
-    fn open(
-        &self,
-        path: impl path::Arg,
-        flags: OFlags,
-        mode: Mode,
-    ) -> Result<TypedFd<Self>, OpenError>;
-
-    /// Close the file at `fd`.
-    ///
-    /// Future operations on the `fd` will start to return `ClosedFd` errors.
-    fn close(&self, fd: &TypedFd<Self>) -> Result<(), CloseError>;
-
-    /// Read from a file descriptor at `offset` into a buffer
-    ///
-    /// If `offset` is None, the read will start at the current file offset and update the file offset
-    /// to the end of the read.
-    /// If `offset` is Some, the file offset is not changed.
-    fn read(
-        &self,
-        fd: &TypedFd<Self>,
-        buf: &mut [u8],
-        offset: Option<usize>,
-    ) -> Result<usize, ReadError>;
-
-    /// Write from a buffer to a file descriptor at `offset`
-    ///
-    /// If `offset` is None, the write will start at the current file offset and update the file offset
-    /// to the end of the write.
-    /// If `offset` is Some, the file offset is not changed.
-    fn write(
-        &self,
-        fd: &TypedFd<Self>,
-        buf: &[u8],
-        offset: Option<usize>,
-    ) -> Result<usize, WriteError>;
-
-    /// Reposition read/write file offset, by changing it to `offset` relative to `whence`.
-    ///
-    /// Returns the resulting offset (in bytes from start of file) on success.
-    fn seek(
-        &self,
-        fd: &TypedFd<Self>,
-        offset: isize,
-        whence: SeekWhence,
-    ) -> Result<usize, SeekError>;
-
-    /// Truncate the file to the specified length.
-    ///
-    /// If shorter than existing size, extra data is lost. If longer than existing size, resize by
-    /// adding `\0`s.
-    ///
-    /// If `reset_offset` is true, the offset is reset to zero; otherwise, it remains unchanged.
-    fn truncate(
-        &self,
-        fd: &TypedFd<Self>,
-        length: usize,
-        reset_offset: bool,
-    ) -> Result<(), TruncateError>;
-
-    /// Change the permissions of a file
-    fn chmod(&self, path: impl path::Arg, mode: Mode) -> Result<(), ChmodError>;
-
-    /// Change the owner of a file
-    fn chown(
-        &self,
-        path: impl path::Arg,
-        user: Option<u16>,
-        group: Option<u16>,
-    ) -> Result<(), ChownError>;
-
-    /// Unlink a file
-    fn unlink(&self, path: impl path::Arg) -> Result<(), UnlinkError>;
-
-    /// Create a new directory
-    fn mkdir(&self, path: impl path::Arg, mode: Mode) -> Result<(), MkdirError>;
-
-    /// Remove a directory
-    fn rmdir(&self, path: impl path::Arg) -> Result<(), RmdirError>;
-
-    /// Read directory entries from a directory file descriptor.
-    ///
-    /// Returns a list of file/directory names (explicitly _not_ including `.` or `..`).
-    fn read_dir(&self, fd: &TypedFd<Self>) -> Result<Vec<DirEntry>, ReadDirError>;
-
-    /// Obtain the status of a file/directory/... on the file-system.
-    fn file_status(&self, path: impl path::Arg) -> Result<FileStatus, FileStatusError>;
-
-    /// Equivalent to [`Self::file_status`], but open an open `fd` instead.
-    fn fd_file_status(&self, fd: &TypedFd<Self>) -> Result<FileStatus, FileStatusError>;
-
-    /// Get static backing data for a file, if available and supported.
-    ///
-    /// This method returns the (entire) underlying static byte slice if the file's contents are
-    /// backed by borrowed static data (e.g., set up via [`in_mem::InitialNode::File`]).
-    ///
-    /// Returns `None` if indicating no static backing data is available/supported.
-    #[expect(unused_variables, reason = "default body, non-underscored param names")]
-    fn get_static_backing_data(&self, fd: &TypedFd<Self>) -> Option<&'static [u8]> {
-        None
-    }
-}
 
 bitflags! {
     /// `S_I*` constants for open, ...
@@ -196,7 +69,7 @@ bitflags! {
 
 /// Types of files on a file-system.
 ///
-/// See [`FileSystem::file_status`].
+/// See [`resolver::Resolver::file_status`].
 #[derive(Debug, PartialEq, Eq, Clone)]
 #[non_exhaustive]
 pub enum FileType {
@@ -291,7 +164,7 @@ bitflags! {
     }
 }
 
-/// The `whence` directive to [`FileSystem::seek`]
+/// The `whence` directive to [`resolver::Resolver::seek`]
 #[derive(Copy, Clone)]
 pub enum SeekWhence {
     /// The file offset is set to `offset` bytes.
@@ -344,7 +217,7 @@ pub struct NodeInfo {
     pub rdev: Option<NonZeroUsize>,
 }
 
-/// Directory entries returned by [`FileSystem::read_dir`]
+/// Directory entries returned by [`resolver::Resolver::read_dir`]
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct DirEntry {

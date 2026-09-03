@@ -68,15 +68,14 @@ fn test_broker() -> &'static BrokerCore {
 }
 
 #[must_use]
-pub(crate) fn init_platform() -> crate::Task<TestPlatform, crate::DefaultFS<TestPlatform>> {
+pub(crate) fn init_platform() -> crate::Task<TestPlatform> {
     let platform = test_platform();
 
     init_platform_with_builder(crate::LinuxShimBuilder::new(platform))
 }
 
 #[must_use]
-pub(crate) fn init_platform_with_pipe_broker()
--> crate::Task<TestPlatform, crate::DefaultFS<TestPlatform>> {
+pub(crate) fn init_platform_with_pipe_broker() -> crate::Task<TestPlatform> {
     let platform = test_platform();
     let setup = PipeBrokerSetup::new();
     let (broker_local, ()) = BrokerLocal::negotiate(setup, |setup| {
@@ -90,7 +89,7 @@ pub(crate) fn init_platform_with_pipe_broker()
 
 fn init_platform_with_builder(
     shim_builder: crate::LinuxShimBuilder<TestPlatform>,
-) -> crate::Task<TestPlatform, crate::DefaultFS<TestPlatform>> {
+) -> crate::Task<TestPlatform> {
     let in_mem = litebox::fs::in_mem::InMem::new_initialized([(
         "/",
         litebox::fs::in_mem::InitialNode::Directory {

@@ -16,7 +16,7 @@ use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::nt_types::ProcessEnvironmentBlock;
-use crate::{MutPtr, ShimFS, ShimPlatform, Task, probe_guest_output_preserving_value, write_value};
+use crate::{MutPtr, ShimPlatform, Task, probe_guest_output_preserving_value, write_value};
 
 pub(crate) const DEFAULT_LOCALE_ID: u32 = 0x0409;
 
@@ -455,12 +455,12 @@ struct MappedNlsSection {
     len: usize,
 }
 
-struct NlsSectionFile<FS: ShimFS> {
-    fd: TypedFd<FS>,
+struct NlsSectionFile<Platform: ShimPlatform> {
+    fd: TypedFd<crate::WindowsFS<Platform>>,
     len: usize,
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     pub(crate) fn sys_nt_get_mui_registry_info(
         &self,
         flags: u32,
@@ -770,7 +770,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     fn open_nls_section_file(
         &self,
         request: NlsSectionRequest<Platform>,
-    ) -> Result<NlsSectionFile<FS>, NtStatus> {
+    ) -> Result<NlsSectionFile<Platform>, NtStatus> {
         let path = nls_section_file_path(request.section_type, request.section_data)?;
         let fd = self
             .fs
@@ -801,7 +801,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
 
     fn copy_nls_section_file(
         &self,
-        fd: &TypedFd<FS>,
+        fd: &TypedFd<crate::WindowsFS<Platform>>,
         section_len: usize,
         output: MutPtr<Platform, u8>,
     ) -> Result<usize, NtStatus> {

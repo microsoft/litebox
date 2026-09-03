@@ -16,7 +16,7 @@ use crate::syscalls::Handle;
 use crate::syscalls::event::{EventHandleObject, EventSubsystem};
 use crate::syscalls::iocp::{IoCompletionAccess, IoCompletionSubsystem};
 use crate::syscalls::timer::TimerSubsystem;
-use crate::{ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value};
+use crate::{ConstPtr, MutPtr, Task, probe_guest_output_preserving_value};
 
 const STANDARD_RIGHTS_REQUIRED: u32 = AccessMask::DELETE.bits()
     | AccessMask::READ_CONTROL.bits()
@@ -110,7 +110,7 @@ fn validate_wait_completion_packet_object_attributes<Platform: RawPointerProvide
     Ok(())
 }
 
-impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: crate::ShimPlatform> Task<Platform> {
     fn wait_completion_packet_entry(
         &self,
         handle: Handle,
@@ -396,7 +396,7 @@ mod tests {
     }
 
     fn create_wait_completion_packet(
-        task: &Task<TestPlatform, crate::tests::TestFS>,
+        task: &Task<TestPlatform>,
         handle: &mut Handle,
         object_attributes: Option<ConstPtr<TestPlatform, ObjectAttributes>>,
     ) -> NtStatus {
@@ -408,7 +408,7 @@ mod tests {
     }
 
     fn create_wait_completion_packet_with_access(
-        task: &Task<TestPlatform, crate::tests::TestFS>,
+        task: &Task<TestPlatform>,
         handle: &mut Handle,
         desired_access: u32,
     ) -> NtStatus {
@@ -416,7 +416,7 @@ mod tests {
     }
 
     fn create_io_completion(
-        task: &Task<TestPlatform, crate::tests::TestFS>,
+        task: &Task<TestPlatform>,
         handle: &mut Handle,
         desired_access: u32,
     ) -> NtStatus {
@@ -424,7 +424,7 @@ mod tests {
     }
 
     fn create_event(
-        task: &Task<TestPlatform, crate::tests::TestFS>,
+        task: &Task<TestPlatform>,
         handle: &mut Handle,
         desired_access: u32,
         initial_state: bool,
@@ -439,7 +439,7 @@ mod tests {
     }
 
     fn create_timer(
-        task: &Task<TestPlatform, crate::tests::TestFS>,
+        task: &Task<TestPlatform>,
         handle: &mut Handle,
         desired_access: u32,
     ) -> NtStatus {
@@ -453,7 +453,7 @@ mod tests {
     }
 
     fn associate_wait_completion_packet(
-        task: &Task<TestPlatform, crate::tests::TestFS>,
+        task: &Task<TestPlatform>,
         packet: Handle,
         io_completion: Handle,
         target: Handle,
@@ -472,7 +472,7 @@ mod tests {
     }
 
     fn cancel_wait_completion_packet(
-        task: &Task<TestPlatform, crate::tests::TestFS>,
+        task: &Task<TestPlatform>,
         packet: Handle,
         remove_signaled_packet: bool,
     ) -> NtStatus {

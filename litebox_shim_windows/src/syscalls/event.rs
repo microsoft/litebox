@@ -17,7 +17,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::nt_types::{AccessMask, ObjectAttributes, ObjectAttributesFlags};
 use crate::syscalls::Handle;
-use crate::{ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_preserving_value};
+use crate::{ConstPtr, MutPtr, Task, probe_guest_output_preserving_value};
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, IntEnum, PartialEq)]
@@ -188,7 +188,7 @@ const EVENT_BASIC_INFORMATION_SIZE_U32: u32 = 8;
 const _: () =
     assert!(size_of::<EventBasicInformation>() == EVENT_BASIC_INFORMATION_SIZE_U32 as usize);
 
-impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: crate::ShimPlatform> Task<Platform> {
     fn insert_event_handle(
         &self,
         event: Arc<EventObject<Platform>>,
@@ -880,7 +880,7 @@ mod tests {
         }
 
         fn shim_query_event(
-            task: &Task<crate::tests::TestPlatform, crate::tests::TestFS>,
+            task: &Task<crate::tests::TestPlatform>,
             handle: Handle,
         ) -> (NtStatus, EventBasicInformation, u32) {
             let mut info = EventBasicInformation {
@@ -899,7 +899,7 @@ mod tests {
         }
 
         fn assert_queries_match(
-            task: &Task<crate::tests::TestPlatform, crate::tests::TestFS>,
+            task: &Task<crate::tests::TestPlatform>,
             host_handle: *mut c_void,
             shim_handle: Handle,
         ) {

@@ -6,7 +6,7 @@ mod common;
 
 use std::ffi::CString;
 
-use litebox::fs::{FileSystem as _, Mode, OFlags};
+use litebox::fs::{Mode, OFlags};
 use litebox_platform_linux_userland::LinuxUserland as Platform;
 
 struct TestLauncher {

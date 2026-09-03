@@ -19,8 +19,8 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 use crate::nt_types::{AccessMask, Luid, UnicodeString};
 use crate::syscalls::{Handle, ProcessHandle};
 use crate::{
-    ConstPtr, HandleAttributes, MutPtr, ShimFS, Task, WindowsHandleSubsystem,
-    probe_guest_output_buffer, probe_guest_output_preserving_value,
+    ConstPtr, HandleAttributes, MutPtr, Task, WindowsHandleSubsystem, probe_guest_output_buffer,
+    probe_guest_output_preserving_value,
 };
 
 bitflags::bitflags! {
@@ -341,7 +341,7 @@ pub(crate) struct AccessCheckParameters<Platform: crate::ShimPlatform> {
     pub(crate) access_status: MutPtr<Platform, u32>,
 }
 
-impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: crate::ShimPlatform> Task<Platform> {
     const CURRENT_PROCESS_TOKEN: Handle = Handle::from_raw(usize::MAX - 3);
     const CURRENT_THREAD_TOKEN: Handle = Handle::from_raw(usize::MAX - 4);
     const CURRENT_THREAD_EFFECTIVE_TOKEN: Handle = Handle::from_raw(usize::MAX - 5);
@@ -1018,7 +1018,7 @@ mod tests {
         let mut return_length = 0;
         assert_eq!(
             task.sys_nt_query_security_attributes_token(
-                Task::<crate::tests::TestPlatform, crate::tests::TestFS>::CURRENT_PROCESS_TOKEN,
+                Task::<crate::tests::TestPlatform>::CURRENT_PROCESS_TOKEN,
                 const_ptr(&requested_name),
                 1,
                 mut_byte_ptr(&mut output),
@@ -1070,7 +1070,7 @@ mod tests {
 
         assert_eq!(
             task.sys_nt_query_security_attributes_token(
-                Task::<crate::tests::TestPlatform, crate::tests::TestFS>::CURRENT_PROCESS_TOKEN,
+                Task::<crate::tests::TestPlatform>::CURRENT_PROCESS_TOKEN,
                 const_ptr(&requested_name),
                 1,
                 null_mut_ptr(),
@@ -1128,7 +1128,7 @@ mod tests {
 
         assert_eq!(
             task.sys_nt_query_security_attributes_token(
-                Task::<crate::tests::TestPlatform, crate::tests::TestFS>::CURRENT_THREAD_TOKEN,
+                Task::<crate::tests::TestPlatform>::CURRENT_THREAD_TOKEN,
                 null_const_ptr(),
                 0,
                 mut_byte_ptr(&mut output),
@@ -1139,7 +1139,7 @@ mod tests {
         );
         assert_eq!(
             task.sys_nt_query_security_attributes_token(
-                Task::<crate::tests::TestPlatform, crate::tests::TestFS>::CURRENT_THREAD_EFFECTIVE_TOKEN,
+                Task::<crate::tests::TestPlatform>::CURRENT_THREAD_EFFECTIVE_TOKEN,
                 null_const_ptr(),
                 0,
                 mut_byte_ptr(&mut output),

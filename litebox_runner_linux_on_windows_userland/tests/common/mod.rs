@@ -5,7 +5,7 @@
 
 use std::ffi::CString;
 
-use litebox::fs::{FileSystem as _, Mode, OFlags};
+use litebox::fs::{Mode, OFlags};
 use litebox_platform_windows_userland::WindowsUserland as Platform;
 
 pub struct TestLauncher {

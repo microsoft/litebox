@@ -13,7 +13,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::nt_types::GroupAffinity;
 use crate::syscalls::mm::ALLOCATION_GRANULARITY;
-use crate::{ConstPtr, MutPtr, PAGE_SIZE, ShimFS, ShimPlatform, Task};
+use crate::{ConstPtr, MutPtr, PAGE_SIZE, ShimPlatform, Task};
 
 pub(crate) const QPC_FREQUENCY_HZ: i64 = 1_000_000_000;
 // These fixed values are deterministic sandbox answers: a default 15.625 ms
@@ -271,7 +271,7 @@ struct GroupRelationshipInformation {
     group: GroupRelationship,
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     #[expect(
         clippy::unused_self,
         reason = "syscall handlers consistently operate on the current task"
@@ -957,7 +957,7 @@ mod tests {
     const QPC_SLEEP_TOLERANCE: Duration = Duration::from_millis(15);
 
     type TestPlatform = crate::tests::TestPlatform;
-    type TestTask = Task<TestPlatform, crate::tests::TestFS>;
+    type TestTask = Task<TestPlatform>;
 
     const LOGICAL_PROCESSOR_ALL_INFORMATION_SIZE: usize =
         size_of::<ProcessorRelationshipInformation>() * 2

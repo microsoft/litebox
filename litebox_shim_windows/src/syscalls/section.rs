@@ -19,7 +19,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 use crate::nt_types::{AccessMask, ObjectAttributes};
 use crate::syscalls::mm::{MemoryType, PageProtection, create_pages, parse_page_protection};
 use crate::syscalls::{Handle, ProcessHandle};
-use crate::{ConstPtr, MutPtr, PAGE_SIZE, ShimFS, ShimPlatform, Task, WindowsSectionView};
+use crate::{ConstPtr, MutPtr, PAGE_SIZE, ShimPlatform, Task, WindowsSectionView};
 
 const VIEW_SHARE: u32 = 1;
 const VIEW_UNMAP: u32 = 2;
@@ -214,7 +214,7 @@ struct SectionImageInformation {
 
 const _: () = assert!(size_of::<SectionImageInformation>() == 64);
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     fn insert_section_handle(
         &self,
         section: Arc<SectionObject<Platform>>,
@@ -514,7 +514,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
                 section_information_length,
                 return_length,
             ),
-            SectionInformationClass::Image => write_section_image_information::<Platform, FS>(
+            SectionInformationClass::Image => write_section_image_information::<Platform>(
                 &section,
                 Arc::clone(&self.fs),
                 section_information,
@@ -1179,9 +1179,9 @@ fn write_section_basic_information<Platform: ShimPlatform>(
     NtStatus::SUCCESS
 }
 
-fn write_section_image_information<Platform: ShimPlatform, FS: ShimFS>(
+fn write_section_image_information<Platform: ShimPlatform>(
     section: &SectionObject<Platform>,
-    fs: Arc<FS>,
+    fs: Arc<crate::WindowsFS<Platform>>,
     section_information: MutPtr<Platform, u8>,
     section_information_length: usize,
     return_length: Option<MutPtr<Platform, usize>>,
@@ -1269,7 +1269,7 @@ mod tests {
     use super::*;
     use crate::nt_types::{ObjectAttributes, UnicodeString};
     use crate::syscalls::event::EventType;
-    use crate::tests::{TestFS, TestPlatform, const_ptr, mut_byte_ptr, mut_ptr, test_task};
+    use crate::tests::{TestPlatform, const_ptr, mut_byte_ptr, mut_ptr, test_task};
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
@@ -1301,7 +1301,7 @@ mod tests {
     }
 
     fn create_pagefile_section(
-        task: &Task<TestPlatform, TestFS>,
+        task: &Task<TestPlatform>,
         access: u32,
         size: i64,
         protection: PageProtection,
@@ -1322,7 +1322,7 @@ mod tests {
         handle
     }
 
-    fn map_pagefile_section(task: &Task<TestPlatform, TestFS>, handle: Handle) -> (usize, usize) {
+    fn map_pagefile_section(task: &Task<TestPlatform>, handle: Handle) -> (usize, usize) {
         let mut base = 0usize;
         let mut view_size = 0usize;
         assert_eq!(
@@ -1407,7 +1407,7 @@ mod tests {
     }
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    fn open_image_file(task: &Task<TestPlatform, TestFS>, path: &str) -> Handle {
+    fn open_image_file(task: &Task<TestPlatform>, path: &str) -> Handle {
         let name = wide(path);
         let unicode = unicode(&name);
         let attrs = object_attributes(&unicode);

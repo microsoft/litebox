@@ -11,7 +11,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::nt_types::{ListEntry, ThreadEnvironmentBlock};
 use crate::syscalls::ProcessHandle;
-use crate::{ConstPtr, MutPtr, ShimFS, ShimPlatform, Task};
+use crate::{ConstPtr, MutPtr, ShimPlatform, Task};
 
 const ACTIVE_PROCESS_EXIT_STATUS: i32 = 0x0000_0103;
 const NORMAL_PROCESS_BASE_PRIORITY: i32 = 8;
@@ -302,7 +302,7 @@ impl ProcessTlsLayout {
     }
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     pub(crate) fn sys_nt_query_information_process(
         &self,
         process_handle: ProcessHandle,

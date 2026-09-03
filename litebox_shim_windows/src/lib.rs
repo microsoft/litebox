@@ -222,10 +222,6 @@ pub type DefaultFS<Platform> = WindowsFS<Platform>;
 pub type WindowsFS<Platform> =
     litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>;
 
-/// A trait required for file systems to be used by the Windows shim.
-pub trait ShimFS: litebox::fs::FileSystem + Send + Sync + 'static {}
-impl<T: litebox::fs::FileSystem + Send + Sync + 'static> ShimFS for T {}
-
 fn write_value<Platform, T>(address: usize, value: T) -> Option<()>
 where
     Platform: RawPointerProvider,
@@ -438,7 +434,7 @@ impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
     }
 
     #[must_use]
-    pub fn build<FS: ShimFS>(self) -> WindowsShim<Platform, FS> {
+    pub fn build(self) -> WindowsShim<Platform> {
         let global = Arc::new(GlobalState {
             platform: self.platform,
             page_manager: PageManager::new(&self.litebox),
@@ -449,7 +445,6 @@ impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
             mui_generation: AtomicU32::new(1),
             qpc_boot_instant: TimeProvider::now(self.platform),
             litebox: self.litebox,
-            _fs: PhantomData,
         });
         WindowsShim(global)
     }
@@ -510,17 +505,17 @@ fn windows_user_shared_data() -> nt_types::KUserSharedData {
     shared_data
 }
 
-pub struct WindowsShim<Platform: ShimPlatform, FS: ShimFS>(Arc<GlobalState<Platform, FS>>);
+pub struct WindowsShim<Platform: ShimPlatform>(Arc<GlobalState<Platform>>);
 
-impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
+impl<Platform: ShimPlatform> WindowsShim<Platform> {
     /// Loads the program at `path` as the shim's initial task.
     pub fn load_program(
         &self,
-        fs: Arc<FS>,
+        fs: Arc<WindowsFS<Platform>>,
         path: &str,
         argv: Vec<alloc::ffi::CString>,
         envp: Vec<alloc::ffi::CString>,
-    ) -> Result<LoadedProgram<Platform, FS>, loader::WindowsLoadError> {
+    ) -> Result<LoadedProgram<Platform>, loader::WindowsLoadError> {
         // TODO: refactor the shared mapping
         #[cfg(not(target_os = "windows"))]
         let _ = map_windows_user_shared_data::<Platform>(&self.0.page_manager)
@@ -563,7 +558,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShim<Platform, FS> {
 }
 
 /// Global shim state shared by all Windows tasks loaded by this shim.
-struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
+struct GlobalState<Platform: ShimPlatform> {
     platform: &'static Platform,
     page_manager: WindowsPageManager<Platform>,
     registry: syscalls::registry::RegistryStore<Platform>,
@@ -571,7 +566,6 @@ struct GlobalState<Platform: ShimPlatform, FS: ShimFS> {
     mui_generation: AtomicU32,
     qpc_boot_instant: <Platform as TimeProvider>::Instant,
     litebox: LiteBox<Platform>,
-    _fs: PhantomData<FS>,
 }
 
 /// Per-process Windows state shared by every thread in the process.
@@ -734,10 +728,10 @@ impl<Platform: ShimPlatform> Process<Platform> {
     }
 }
 
-struct Task<Platform: ShimPlatform, FS: ShimFS> {
-    global: Arc<GlobalState<Platform, FS>>,
+struct Task<Platform: ShimPlatform> {
+    global: Arc<GlobalState<Platform>>,
     process: Arc<Process<Platform>>,
-    fs: Arc<FS>,
+    fs: Arc<WindowsFS<Platform>>,
     wait_state: wait::WaitState<Platform>,
     io_completion_worker: Mutex<Platform, syscalls::iocp::IoCompletionWorkerState<Platform>>,
     entry_point: usize,
@@ -747,7 +741,7 @@ struct Task<Platform: ShimPlatform, FS: ShimFS> {
     thread_object: Arc<syscalls::thread::ThreadObject<Platform>>,
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     fn complete_current_thread(&self) {
         let thread_id = self.thread_object.thread_id();
         self.thread_object.complete(|| {
@@ -2523,7 +2517,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             };
         }
 
-        try_metadata!(FileObjectSubsystem<FS>);
+        try_metadata!(FileObjectSubsystem<Platform>);
         try_metadata!(RegistryKeySubsystem<Platform>);
         try_metadata!(EventSubsystem<Platform>);
         try_metadata!(MutantSubsystem<Platform>);
@@ -2573,7 +2567,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             };
         }
 
-        try_set_attributes!(FileObjectSubsystem<FS>);
+        try_set_attributes!(FileObjectSubsystem<Platform>);
         try_set_attributes!(RegistryKeySubsystem<Platform>);
         try_set_attributes!(EventSubsystem<Platform>);
         try_set_attributes!(MutantSubsystem<Platform>);
@@ -2745,7 +2739,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             };
         }
 
-        try_duplicate!(FileObjectSubsystem<FS>);
+        try_duplicate!(FileObjectSubsystem<Platform>);
         try_duplicate!(RegistryKeySubsystem<Platform>);
         try_duplicate!(EventSubsystem<Platform>);
         try_duplicate!(MutantSubsystem<Platform>);
@@ -2833,7 +2827,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     fn close_handle(
         &self,
         handle: syscalls::Handle,
-        visitor: impl RawHandleVisitor<Platform, FS>,
+        visitor: impl RawHandleVisitor<Platform>,
     ) -> NtStatus {
         self.remove_handle(handle, visitor, true)
     }
@@ -2841,7 +2835,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     fn remove_handle(
         &self,
         handle: syscalls::Handle,
-        visitor: impl RawHandleVisitor<Platform, FS>,
+        visitor: impl RawHandleVisitor<Platform>,
         enforce_protect_from_close: bool,
     ) -> NtStatus {
         macro_rules! try_close {
@@ -2856,7 +2850,7 @@ impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
             };
         }
 
-        try_close!(FileObjectSubsystem<FS>, file);
+        try_close!(FileObjectSubsystem<Platform>, file);
         try_close!(RegistryKeySubsystem<Platform>, registry_key);
         try_close!(EventSubsystem<Platform>, event);
         try_close!(MutantSubsystem<Platform>, mutant);
@@ -3021,8 +3015,8 @@ fn is_api_set_contract(dll_name: &str) -> bool {
     })
 }
 
-trait RawHandleVisitor<Platform: ShimPlatform, FS: ShimFS> {
-    fn file(&self, file: FileObject<FS>);
+trait RawHandleVisitor<Platform: ShimPlatform> {
+    fn file(&self, file: FileObject<Platform>);
 
     fn registry_key(&self, key: RegistryKeyObject<Platform>);
 
@@ -3056,14 +3050,12 @@ trait RawHandleVisitor<Platform: ShimPlatform, FS: ShimFS> {
     fn thread(&self, thread: ThreadHandleObject<Platform>);
 }
 
-struct CloseRawHandleVisitor<'task, Platform: ShimPlatform, FS: ShimFS> {
-    task: &'task Task<Platform, FS>,
+struct CloseRawHandleVisitor<'task, Platform: ShimPlatform> {
+    task: &'task Task<Platform>,
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> RawHandleVisitor<Platform, FS>
-    for CloseRawHandleVisitor<'_, Platform, FS>
-{
-    fn file(&self, file: FileObject<FS>) {
+impl<Platform: ShimPlatform> RawHandleVisitor<Platform> for CloseRawHandleVisitor<'_, Platform> {
+    fn file(&self, file: FileObject<Platform>) {
         self.task.close_file(file);
     }
 
@@ -3072,27 +3064,27 @@ impl<Platform: ShimPlatform, FS: ShimFS> RawHandleVisitor<Platform, FS>
     }
 
     fn event(&self, event: EventHandleObject<Platform>) {
-        Task::<Platform, FS>::close_event(event);
+        Task::<Platform>::close_event(event);
     }
 
     fn mutant(&self, mutant: MutantHandleObject<Platform>) {
-        Task::<Platform, FS>::close_mutant(mutant);
+        Task::<Platform>::close_mutant(mutant);
     }
 
     fn semaphore(&self, semaphore: SemaphoreHandleObject<Platform>) {
-        Task::<Platform, FS>::close_semaphore(semaphore);
+        Task::<Platform>::close_semaphore(semaphore);
     }
 
     fn directory(&self, directory: DirectoryHandleObject<Platform>) {
-        Task::<Platform, FS>::close_directory(directory);
+        Task::<Platform>::close_directory(directory);
     }
 
     fn symbolic_link(&self, link: SymbolicLinkHandleObject<Platform>) {
-        Task::<Platform, FS>::close_symbolic_link(link);
+        Task::<Platform>::close_symbolic_link(link);
     }
 
     fn io_completion(&self, io_completion: IoCompletionHandleObject<Platform>) {
-        Task::<Platform, FS>::close_io_completion(io_completion);
+        Task::<Platform>::close_io_completion(io_completion);
     }
 
     fn lpc_port(&self, lpc_port: LpcPortHandleObject) {
@@ -3100,40 +3092,40 @@ impl<Platform: ShimPlatform, FS: ShimFS> RawHandleVisitor<Platform, FS>
     }
 
     fn timer(&self, timer: TimerHandleObject<Platform>) {
-        Task::<Platform, FS>::close_timer(timer);
+        Task::<Platform>::close_timer(timer);
     }
 
     fn wait_completion_packet(
         &self,
         wait_completion_packet: WaitCompletionPacketHandleObject<Platform>,
     ) {
-        Task::<Platform, FS>::close_wait_completion_packet(wait_completion_packet);
+        Task::<Platform>::close_wait_completion_packet(wait_completion_packet);
     }
 
     fn worker_factory(&self, worker_factory: WorkerFactoryHandleObject<Platform>) {
-        Task::<Platform, FS>::close_worker_factory(worker_factory);
+        Task::<Platform>::close_worker_factory(worker_factory);
     }
 
     fn section(&self, section: SectionHandleObject<Platform>) {
-        Task::<Platform, FS>::close_section(section);
+        Task::<Platform>::close_section(section);
     }
 
     fn token(&self, token: TokenHandleObject) {
-        Task::<Platform, FS>::close_token(token);
+        Task::<Platform>::close_token(token);
     }
 
     fn thread(&self, thread: ThreadHandleObject<Platform>) {
-        Task::<Platform, FS>::close_thread(thread);
+        Task::<Platform>::close_thread(thread);
     }
 }
 
 /// The shim entrypoint object passed to the platform.
-pub struct WindowsShimEntrypoints<Platform: ShimPlatform, FS: ShimFS> {
-    task: Task<Platform, FS>,
+pub struct WindowsShimEntrypoints<Platform: ShimPlatform> {
+    task: Task<Platform>,
     _not_send: PhantomData<*const ()>,
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> EnterShim for WindowsShimEntrypoints<Platform, FS> {
+impl<Platform: ShimPlatform> EnterShim for WindowsShimEntrypoints<Platform> {
     type ExecutionContext = litebox_common_linux::PtRegs;
 
     fn init(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
@@ -3165,14 +3157,14 @@ impl<Platform: ShimPlatform, FS: ShimFS> EnterShim for WindowsShimEntrypoints<Pl
     }
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> WindowsShimEntrypoints<Platform, FS> {
+impl<Platform: ShimPlatform> WindowsShimEntrypoints<Platform> {
     /// Runs a shim handler with the wait-state bookkeeping needed to keep the
     /// thread interruptible while it runs guest code.
     fn enter_shim(
         &self,
         is_init: bool,
         ctx: &mut litebox_common_linux::PtRegs,
-        f: impl FnOnce(&Task<Platform, FS>, &mut litebox_common_linux::PtRegs),
+        f: impl FnOnce(&Task<Platform>, &mut litebox_common_linux::PtRegs),
     ) -> ContinueOperation {
         if !is_init {
             self.task.enter_from_guest();
@@ -3188,9 +3180,9 @@ impl<Platform: ShimPlatform, FS: ShimFS> WindowsShimEntrypoints<Platform, FS> {
 }
 
 /// A loaded Windows program and the process handle used to wait for it.
-pub struct LoadedProgram<Platform: ShimPlatform, FS: ShimFS> {
+pub struct LoadedProgram<Platform: ShimPlatform> {
     /// The initial-thread entrypoint state passed to the platform's `run_thread`.
-    pub entrypoints: WindowsShimEntrypoints<Platform, FS>,
+    pub entrypoints: WindowsShimEntrypoints<Platform>,
     /// Handle used to wait for the loaded program to exit.
     pub process: Arc<Process<Platform>>,
 }

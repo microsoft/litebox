@@ -20,7 +20,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 use crate::nt_types::{AccessMask, ObjectAttributes, ObjectAttributesFlags};
 use crate::syscalls::Handle;
 use crate::{
-    ConstPtr, MutPtr, ShimFS, Task, probe_guest_output_buffer, probe_guest_output_preserving_value,
+    ConstPtr, MutPtr, Task, probe_guest_output_buffer, probe_guest_output_preserving_value,
 };
 
 bitflags::bitflags! {
@@ -194,7 +194,7 @@ impl<Platform: crate::ShimPlatform> IoCompletionHandleObject<Platform> {
     }
 }
 
-impl<Platform: crate::ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: crate::ShimPlatform> Task<Platform> {
     pub(crate) fn suspend_io_completion_worker(&self) {
         let mut worker = self.io_completion_worker.lock();
         debug_assert!(!worker.suspended);
@@ -525,8 +525,8 @@ mod tests {
         }
     }
 
-    fn remove_one<FS: ShimFS>(
-        task: &Task<crate::tests::TestPlatform, FS>,
+    fn remove_one(
+        task: &Task<crate::tests::TestPlatform>,
         port: &Arc<IoCompletionObject<crate::tests::TestPlatform>>,
     ) -> Result<Option<IoCompletionPacket>, NtStatus> {
         let already_associated = task.prepare_io_completion_wait(port);

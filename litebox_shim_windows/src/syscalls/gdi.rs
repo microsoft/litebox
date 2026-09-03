@@ -10,7 +10,7 @@ use rangemap::RangeMap;
 
 use crate::nt_types::ProcessEnvironmentBlock;
 use crate::syscalls::mm::{MemoryType, PageProtection};
-use crate::{MutPtr, ShimFS, ShimPlatform, Task, WindowsVirtualAllocation};
+use crate::{MutPtr, ShimPlatform, Task, WindowsVirtualAllocation};
 
 const GDI_SHARED_TABLE_SIZE: usize = 0x182000;
 const GDI_STOCK_OBJECT_TABLE_OFFSET: usize = 0x1800b0;
@@ -24,7 +24,7 @@ pub(crate) struct GdiProcessState {
     cookie: usize,
 }
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     pub(crate) fn sys_nt_gdi_init2(&self) -> usize {
         let mut state = self.process.gdi_state.lock();
         if let Some(state) = *state {

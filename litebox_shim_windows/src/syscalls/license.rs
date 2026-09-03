@@ -5,9 +5,9 @@ use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox_common_windows::nt_status::NtStatus;
 
 use crate::nt_types::UnicodeString;
-use crate::{ConstPtr, MutPtr, ShimFS, ShimPlatform, Task};
+use crate::{ConstPtr, MutPtr, ShimPlatform, Task};
 
-impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+impl<Platform: ShimPlatform> Task<Platform> {
     pub(crate) fn sys_nt_query_license_value(
         value_name: ConstPtr<Platform, UnicodeString>,
         _value_type: MutPtr<Platform, u32>,
