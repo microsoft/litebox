@@ -109,29 +109,31 @@ indirect_x18_done:
 
     mov x27, #12
     sub sp, sp, #16
-    mov x0, sp
-    mov x1, xzr
-    mov x8, #59                  // pipe2
+    mov x0, #1                   // AF_UNIX
+    mov x1, #1                   // SOCK_STREAM
+    mov x2, xzr
+    mov x3, sp
+    mov x8, #199                 // socketpair
     svc #0
     cbnz x0, fail_stack
     ldr w21, [sp]
     ldr w22, [sp, #4]
 
     mov w0, w22
-    adr x1, pipe_byte
+    adr x1, socket_byte
     mov x2, #1
     mov x8, #64                  // write
     svc #0
     cmp x0, #1
     b.ne fail_stack
     mov w0, w21
-    adr x1, pipe_result
+    adr x1, socket_result
     mov x2, #1
     mov x8, #63                  // read
     svc #0
     cmp x0, #1
     b.ne fail_stack
-    adr x0, pipe_result
+    adr x0, socket_result
     ldrb w0, [x0]
     cmp w0, #'X'
     b.ne fail_stack
@@ -210,9 +212,9 @@ values:
     .quad 0x42, 0x43
 adr_value:
     .quad 0x44
-pipe_byte:
+socket_byte:
     .byte 'X'
-pipe_result:
+socket_result:
     .byte 0
     .balign 8
 sigaction:
