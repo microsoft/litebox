@@ -639,6 +639,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::EINVAL);
         }
 
+        if (stack == 0 && stack_size != 0) || (stack != 0 && clone3 && stack_size == 0) {
+            return Err(Errno::EINVAL);
+        }
+
         let tls = if flags.contains(CloneFlags::SETTLS) {
             let addr = tls.trunc();
             #[cfg(target_arch = "x86_64")]
@@ -687,9 +691,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let _ = parent_tid_ptr.write_at_offset::<Platform>(0, child_tid);
         }
 
-        if (stack == 0 && stack_size != 0) || (stack != 0 && clone3 && stack_size == 0) {
-            return Err(Errno::EINVAL);
-        }
         let sp = if stack != 0 {
             let stack: usize = stack.trunc();
             Some(stack.wrapping_add(stack_size.trunc()))
