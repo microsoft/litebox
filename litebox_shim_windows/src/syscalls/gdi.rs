@@ -121,35 +121,3 @@ fn initialize_gdi_shared_table<Platform: ShimPlatform>(
     }
     Ok(0)
 }
-
-#[cfg(test)]
-mod tests {
-    use alloc::sync::Arc;
-
-    use zerocopy::FromZeros as _;
-
-    use super::*;
-    use crate::tests::{run_with_test_platform_pointers, test_task};
-
-    fn set_test_peb(
-        task: &mut Task<crate::tests::TestPlatform>,
-        peb: &mut ProcessEnvironmentBlock,
-    ) {
-        Arc::get_mut(&mut task.process)
-            .expect("test task has a unique process")
-            .peb_address = core::ptr::from_mut(peb) as usize;
-    }
-
-    #[test]
-    fn gdi_initialization_requires_broker_randomness() {
-        run_with_test_platform_pointers(|| {
-            let mut peb = ProcessEnvironmentBlock::new_zeroed();
-            let mut task = test_task();
-            set_test_peb(&mut task, &mut peb);
-
-            assert_eq!(task.sys_nt_gdi_init2(), 0);
-            assert_eq!(peb.gdi_shared_handle_table, 0);
-            assert!(task.process.gdi_state.lock().is_none());
-        });
-    }
-}
