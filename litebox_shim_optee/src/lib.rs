@@ -810,8 +810,10 @@ impl Task {
             crate::loader::ta_stack::allocate_stack(self, self.get_ta_stack_base_addr()).ok_or(
                 ElfLoaderError::MappingError(litebox::mm::linux::MappingError::OutOfMemory),
             )?;
+        let mut stack_canary = [0; 16];
+        self.global.litebox.fill_random(&mut stack_canary)?;
         ta_stack
-            .init(self.global.platform, params)
+            .init(params, stack_canary)
             .ok_or(ElfLoaderError::InvalidStackAddr)?;
 
         Ok(ThreadInitState::Ta {
