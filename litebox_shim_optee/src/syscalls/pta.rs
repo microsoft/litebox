@@ -4,8 +4,7 @@
 //! Implementation of pseudo TAs (PTAs) which export system services as
 //! the functions of built-in TAs.
 
-use crate::syscalls::Cleanup;
-use crate::{Task, UserConstPtr, UserMutPtr};
+use crate::{Task, UserConstPtr, UserMutPtr, idk::IdksPta, syscalls::Cleanup};
 use alloc::vec;
 use alloc::vec::Vec;
 use hmac::{Hmac, Mac};
@@ -23,19 +22,20 @@ use sha2::Sha256;
 use zeroize::{Zeroize, Zeroizing};
 
 struct SystemPta;
-
 /// A common interface to interact with various PTAs including the system PTA.
 ///
 /// Add new PTAs here as needed.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum PseudoTa {
     System,
+    Idks,
 }
 
 impl PseudoTa {
     pub(crate) fn from_uuid(uuid: &TeeUuid) -> Option<Self> {
         match *uuid {
             SystemPta::UUID => Some(Self::System),
+            IdksPta::UUID => Some(Self::Idks),
             _ => None,
         }
     }
@@ -44,6 +44,7 @@ impl PseudoTa {
     fn open_session(self, params: &UteeParams) -> Result<u32, TeeResult> {
         match self {
             Self::System => SystemPta::open_session(params),
+            Self::Idks => IdksPta::open_session(params),
         }
     }
 
@@ -56,27 +57,43 @@ impl PseudoTa {
         let _busy = task.try_set_busy(self)?;
         match self {
             Self::System => SystemPta::invoke_command(task, cmd_id, params),
+            Self::Idks => IdksPta::invoke_command(task, cmd_id, params),
         }
     }
 
     fn close_session(self, task: &Task, session_id: u32) {
         match self {
             Self::System => SystemPta::close_session(task, session_id),
+            Self::Idks => IdksPta::close_session(task, session_id),
         }
     }
 
     fn flags(self) -> TaFlags {
         match self {
             Self::System => SystemPta::FLAGS,
+            Self::Idks => IdksPta::FLAGS,
         }
     }
 }
 
-const PTA_DEFAULT_FLAGS: TaFlags = TaFlags::SINGLE_INSTANCE
+pub(crate) const PTA_DEFAULT_FLAGS: TaFlags = TaFlags::SINGLE_INSTANCE
     .union(TaFlags::MULTI_SESSION)
     .union(TaFlags::INSTANCE_KEEP_ALIVE);
 
 const MAX_PTA_SESSIONS_PER_TASK: usize = 100;
+
+pub(crate) fn open_default_pta_session(params: &UteeParams) -> Result<u32, TeeResult> {
+    if !params.has_types([
+        TeeParamType::None,
+        TeeParamType::None,
+        TeeParamType::None,
+        TeeParamType::None,
+    ]) {
+        return Err(TeeResult::BadParameters);
+    }
+
+    crate::SessionIdPool::allocate().ok_or(TeeResult::Busy)
+}
 
 struct PtaBusyGuard<'a> {
     task: &'a Task,
@@ -221,16 +238,7 @@ impl SystemPta {
     };
 
     fn open_session(params: &UteeParams) -> Result<u32, TeeResult> {
-        if !params.has_types([
-            TeeParamType::None,
-            TeeParamType::None,
-            TeeParamType::None,
-            TeeParamType::None,
-        ]) {
-            return Err(TeeResult::BadParameters);
-        }
-
-        crate::SessionIdPool::allocate().ok_or(TeeResult::Busy)
+        open_default_pta_session(params)
     }
 
     fn close_session(_task: &Task, _session_id: u32) {
