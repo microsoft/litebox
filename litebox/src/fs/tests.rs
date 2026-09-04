@@ -2123,6 +2123,7 @@ mod overlay {
 mod stdio {
     use crate::LiteBox;
     use crate::fs::devices::Devices;
+    use crate::fs::errors::{ReadError, WriteError};
     use crate::fs::resolver::Resolver;
     use crate::fs::{Mode, OFlags};
     use crate::platform::mock::MockPlatform;
@@ -2130,7 +2131,7 @@ mod stdio {
     extern crate std;
 
     #[test]
-    fn stdio_open_read_write() {
+    fn stdio_requires_broker() {
         let ctx = crate::fs::resolver::Context::new();
         let platform = MockPlatform::new();
         let litebox = LiteBox::new(platform);
@@ -2142,29 +2143,26 @@ mod stdio {
                 .unwrap(),
         );
 
-        // Test opening and writing to /dev/stdout
         let fd_stdout = fs
             .open(&ctx, "/dev/stdout", OFlags::WRONLY, Mode::empty())
             .expect("Failed to open /dev/stdout");
-        let data = b"Hello, stdout!";
-        fs.write(&fd_stdout, data, None)
-            .expect("Failed to write to /dev/stdout");
+        assert!(matches!(fs.write(&fd_stdout, b"", None), Ok(0)));
+        assert!(matches!(
+            fs.write(&fd_stdout, b"Hello, stdout!", None),
+            Err(WriteError::Io)
+        ));
         fs.close(&fd_stdout).expect("Failed to close /dev/stdout");
-        assert_eq!(platform.stdout_queue.read().unwrap().len(), 1);
-        assert_eq!(platform.stdout_queue.read().unwrap()[0], data);
 
-        // Test opening and writing to /dev/stderr
         let fd_stderr = fs
             .open(&ctx, "/dev/stderr", OFlags::WRONLY, Mode::empty())
             .expect("Failed to open /dev/stderr");
-        let data = b"Hello, stderr!";
-        fs.write(&fd_stderr, data, None)
-            .expect("Failed to write to /dev/stderr");
+        assert!(matches!(fs.write(&fd_stderr, b"", None), Ok(0)));
+        assert!(matches!(
+            fs.write(&fd_stderr, b"Hello, stderr!", None),
+            Err(WriteError::Io)
+        ));
         fs.close(&fd_stderr).expect("Failed to close /dev/stderr");
-        assert_eq!(platform.stderr_queue.read().unwrap().len(), 1);
-        assert_eq!(platform.stderr_queue.read().unwrap()[0], data);
 
-        // Test opening and reading from /dev/stdin
         platform
             .stdin_queue
             .write()
@@ -2173,12 +2171,16 @@ mod stdio {
         let fd_stdin = fs
             .open(&ctx, "/dev/stdin", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open /dev/stdin");
+        assert!(matches!(fs.read(&fd_stdin, &mut [], None), Ok(0)));
         let mut buffer = vec![0; 13];
-        let bytes_read = fs
-            .read(&fd_stdin, &mut buffer, None)
-            .expect("Failed to read from /dev/stdin");
-        assert_eq!(bytes_read, 13);
-        assert_eq!(&buffer, b"Hello, stdin!");
+        assert!(matches!(
+            fs.read(&fd_stdin, &mut buffer, None),
+            Err(ReadError::Io)
+        ));
+        assert_eq!(
+            platform.stdin_queue.read().unwrap().front().unwrap(),
+            b"Hello, stdin!"
+        );
         fs.close(&fd_stdin).expect("Failed to close /dev/stdin");
     }
 
@@ -2209,6 +2211,7 @@ mod composed_stdio {
     use crate::LiteBox;
     use crate::fs::composer::Composer;
     use crate::fs::devices::Devices;
+    use crate::fs::errors::{ReadError, WriteError};
     use crate::fs::in_mem::{InMem, InitialNode};
     use crate::fs::resolver::Resolver;
     use crate::fs::{Mode, OFlags, UserInfo};
@@ -2238,35 +2241,32 @@ mod composed_stdio {
     }
 
     #[test]
-    fn stdio_open_read_write() {
+    fn stdio_requires_broker() {
         let ctx = crate::fs::resolver::Context::new();
         let platform = MockPlatform::new();
         let litebox = LiteBox::new(platform);
         let fs = composed_fs(&litebox);
 
-        // Test opening and writing to /dev/stdout
         let fd_stdout = fs
             .open(&ctx, "/dev/stdout", OFlags::WRONLY, Mode::empty())
             .expect("Failed to open /dev/stdout");
-        let data = b"Hello, composed stdout!";
-        fs.write(&fd_stdout, data, None)
-            .expect("Failed to write to /dev/stdout");
+        assert!(matches!(fs.write(&fd_stdout, b"", None), Ok(0)));
+        assert!(matches!(
+            fs.write(&fd_stdout, b"Hello, composed stdout!", None),
+            Err(WriteError::Io)
+        ));
         fs.close(&fd_stdout).expect("Failed to close /dev/stdout");
-        assert_eq!(platform.stdout_queue.read().unwrap().len(), 1);
-        assert_eq!(platform.stdout_queue.read().unwrap()[0], data);
 
-        // Test opening and writing to /dev/stderr
         let fd_stderr = fs
             .open(&ctx, "/dev/stderr", OFlags::WRONLY, Mode::empty())
             .expect("Failed to open /dev/stderr");
-        let data = b"Hello, composed stderr!";
-        fs.write(&fd_stderr, data, None)
-            .expect("Failed to write to /dev/stderr");
+        assert!(matches!(fs.write(&fd_stderr, b"", None), Ok(0)));
+        assert!(matches!(
+            fs.write(&fd_stderr, b"Hello, composed stderr!", None),
+            Err(WriteError::Io)
+        ));
         fs.close(&fd_stderr).expect("Failed to close /dev/stderr");
-        assert_eq!(platform.stderr_queue.read().unwrap().len(), 1);
-        assert_eq!(platform.stderr_queue.read().unwrap()[0], data);
 
-        // Test opening and reading from /dev/stdin
         platform
             .stdin_queue
             .write()
@@ -2275,11 +2275,16 @@ mod composed_stdio {
         let fd_stdin = fs
             .open(&ctx, "/dev/stdin", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open /dev/stdin");
+        assert!(matches!(fs.read(&fd_stdin, &mut [], None), Ok(0)));
         let mut buffer = vec![0; 1024];
-        let bytes_read = fs
-            .read(&fd_stdin, &mut buffer, None)
-            .expect("Failed to read from /dev/stdin");
-        assert_eq!(&buffer[..bytes_read], b"Hello, composed stdin!");
+        assert!(matches!(
+            fs.read(&fd_stdin, &mut buffer, None),
+            Err(ReadError::Io)
+        ));
+        assert_eq!(
+            platform.stdin_queue.read().unwrap().front().unwrap(),
+            b"Hello, composed stdin!"
+        );
         fs.close(&fd_stdin).expect("Failed to close /dev/stdin");
     }
 
