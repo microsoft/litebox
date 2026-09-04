@@ -11,10 +11,10 @@ use super::{
     primitive::{Decoder, Encoder},
 };
 
-const REQUEST_TAG_WRITE: u8 = 0;
-const REQUEST_TAG_READ: u8 = 1;
-const RESPONSE_TAG_WRITE: u8 = 0;
-const RESPONSE_TAG_READ: u8 = 1;
+const REQUEST_TAG_READ: u8 = 0;
+const REQUEST_TAG_WRITE: u8 = 1;
+const RESPONSE_TAG_READ: u8 = 0;
+const RESPONSE_TAG_WRITE: u8 = 1;
 
 const OUTPUT_STREAM_TAG_STDOUT: u8 = 0;
 const OUTPUT_STREAM_TAG_STDERR: u8 = 1;
