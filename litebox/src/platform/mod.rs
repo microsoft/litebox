@@ -29,11 +29,7 @@ pub use vector::GuestVectorStateProvider;
 /// provided by it. _However_, most of the provided APIs within the provider act upon an `&self` to
 /// allow storage of any useful "globals" within it necessary.
 pub trait Provider:
-    RawMutexProvider
-    + TimeProvider
-    + ArchSpecificProvider
-    + GuestVectorStateProvider
-    + RawPointerProvider
+    RawMutexProvider + TimeProvider + ArchSpecificProvider + RawPointerProvider
 {
 }
 

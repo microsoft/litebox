@@ -391,17 +391,6 @@ pub struct LinuxKernel<Host: HostInterface> {
     vtl0_kernel_info: Vtl0KernelInfo,
 }
 
-#[cfg(target_arch = "aarch64")]
-impl<Host: HostInterface> litebox::platform::GuestVectorStateProvider for LinuxKernel<Host> {
-    type GuestVectorState = litebox_common_linux::signal::aarch64::GuestVectorState;
-
-    fn get_guest_vector_state(&self) -> Self::GuestVectorState {
-        Self::GuestVectorState::default()
-    }
-
-    fn set_guest_vector_state(&self, _state: &Self::GuestVectorState) {}
-}
-
 /// [`litebox::platform::common_providers::userspace_pointers::ValidateAccess`]
 /// implementation for LVBS that provides SMAP support.
 pub struct LvbsValidateAccess;

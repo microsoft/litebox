@@ -245,15 +245,6 @@ impl ArchSpecificProvider for MockPlatform {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
-impl super::GuestVectorStateProvider for MockPlatform {
-    type GuestVectorState = ();
-
-    fn get_guest_vector_state(&self) {}
-
-    fn set_guest_vector_state(&self, _state: &Self::GuestVectorState) {}
-}
-
 impl RawPointerProvider for MockPlatform {
     type RawConstPointer<T: zerocopy::FromBytes> = super::trivial_providers::TransparentConstPtr<T>;
     type RawMutPointer<T: zerocopy::FromBytes + zerocopy::IntoBytes> =
