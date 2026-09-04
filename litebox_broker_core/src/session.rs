@@ -93,6 +93,8 @@ pub struct BrokerSession {
     pub(crate) caller_credential: CallerCredential,
     /// Handles of the live object references owned by this session.
     references: Mutex<SessionReferences>,
+    /// Pipe capacity charged to this session by live pipe objects.
+    pub(crate) reserved_pipe_capacity: Arc<AtomicUsize>,
     /// Socket quota held by pending, live, and closing in-flight resources.
     pub(crate) reserved_sockets: Arc<AtomicUsize>,
     /// Cancellation state for potentially blocking operations in this session.
@@ -114,6 +116,7 @@ impl BrokerSession {
                 handles: Vec::new(),
                 pending_handles: 0,
             }),
+            reserved_pipe_capacity: Arc::new(AtomicUsize::new(0)),
             reserved_sockets: Arc::new(AtomicUsize::new(0)),
             cancellation: AssociationCancellation::default(),
         }
@@ -132,13 +135,7 @@ impl BrokerSession {
             .principal_object_rights(self.caller_credential)?;
         let object = Arc::new(RwLock::new(object));
         let mut session_references = self.references.lock();
-        let additional = session_references
-            .pending_handles
-            .checked_add(1)
-            .ok_or(BrokerError::ResourceExhausted)?;
-        if session_references.handles.try_reserve(additional).is_err() {
-            return Err(BrokerError::OutOfMemory);
-        }
+        self.prepare_session_references(&mut session_references, 1)?;
         let mut references = self.core.references.write();
         let preparation = (|| {
             let pending = self.core.pending_references.load(Ordering::Relaxed);
@@ -193,13 +190,7 @@ impl BrokerSession {
         let first = Arc::new(RwLock::new(first));
         let second = Arc::new(RwLock::new(second));
         let mut session_references = self.references.lock();
-        let additional = session_references
-            .pending_handles
-            .checked_add(2)
-            .ok_or(BrokerError::ResourceExhausted)?;
-        if session_references.handles.try_reserve(additional).is_err() {
-            return Err(BrokerError::OutOfMemory);
-        }
+        self.prepare_session_references(&mut session_references, 2)?;
         let mut references = self.core.references.write();
         let preparation = (|| {
             let pending = self.core.pending_references.load(Ordering::Relaxed);
@@ -253,14 +244,7 @@ impl BrokerSession {
     ) -> Result<PendingObjectReference<'_>> {
         let object = Arc::new(RwLock::new(ObjectEntry::Reserved));
         let mut session_references = self.references.lock();
-        let next_session_pending = session_references
-            .pending_handles
-            .checked_add(1)
-            .ok_or(BrokerError::ResourceExhausted)?;
-        session_references
-            .handles
-            .try_reserve(next_session_pending)
-            .map_err(|_| BrokerError::OutOfMemory)?;
+        let next_session_pending = self.prepare_session_references(&mut session_references, 1)?;
         let mut references = self.core.references.write();
         let pending_references = self.core.pending_references.load(Ordering::Relaxed);
         if references
@@ -295,6 +279,30 @@ impl BrokerSession {
             object,
             active: true,
         })
+    }
+
+    fn prepare_session_references(
+        &self,
+        session_references: &mut SessionReferences,
+        additional: usize,
+    ) -> Result<usize> {
+        let pending_and_additional = session_references
+            .pending_handles
+            .checked_add(additional)
+            .ok_or(BrokerError::ResourceExhausted)?;
+        if session_references
+            .handles
+            .len()
+            .checked_add(pending_and_additional)
+            .is_none_or(|count| count > self.core.limits.max_references_per_session)
+        {
+            return Err(BrokerError::ResourceExhausted);
+        }
+        session_references
+            .handles
+            .try_reserve(pending_and_additional)
+            .map_err(|_| BrokerError::OutOfMemory)?;
+        Ok(pending_and_additional)
     }
 
     fn insert_object_reference(
@@ -541,6 +549,11 @@ mod tests {
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use std::{sync::Arc, vec::Vec};
 
+    const TEST_MAX_REFERENCES: usize = 4;
+    const TEST_MAX_PIPE_CAPACITY: usize = 8;
+    const TEST_MAX_REFERENCES_PER_SESSION: usize = 2;
+    const TEST_MAX_PIPE_CAPACITY_PER_SESSION: usize = 4;
+
     #[test]
     fn pending_reference_release_checks_both_counters() {
         let core_pending_references = AtomicUsize::new(1);
@@ -569,7 +582,16 @@ mod tests {
         let broker = BrokerCore::new_with_limits(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_socket_policy(SocketPolicy::guest_network()),
-            BrokerCoreLimits::new_with_all_limits(2, 4, 2, 1),
+            BrokerCoreLimits::new_with_all_limits(
+                TEST_MAX_REFERENCES,
+                TEST_MAX_PIPE_CAPACITY,
+                2,
+                1,
+            )
+            .with_session_quotas(
+                TEST_MAX_REFERENCES_PER_SESSION,
+                TEST_MAX_PIPE_CAPACITY_PER_SESSION,
+            ),
             socket_provider.clone(),
             Arc::new(crate::random::TestRandomProvider),
             Arc::new(crate::stdio::UnsupportedStdioProvider),
@@ -582,10 +604,16 @@ mod tests {
         check_pipe_reader_closure(&broker);
         check_corrupt_index_fails_without_mutation(&broker);
         check_corrupt_index_does_not_break_teardown(&broker);
+        check_reference_quota_is_per_session(&broker);
+        check_pending_references_count_toward_session_quota(&broker);
+        check_pipe_capacity_quota_is_per_session(&broker);
+        check_pipe_capacity_is_released_when_reference_creation_fails(&broker);
+        check_pipe_capacity_outlives_session_for_in_flight_object(&broker);
         crate::socket::tests::check_socket_lifecycle(&broker, &socket_provider);
         check_pair_handle_exhaustion(&broker);
 
         assert!(broker.references.read().is_empty());
+        assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
     }
 
     fn check_event_reference_lifecycle(broker: &BrokerCore) {
@@ -768,6 +796,168 @@ mod tests {
         drop(session);
 
         assert!(broker.references.read().is_empty());
+    }
+
+    fn check_reference_quota_is_per_session(broker: &BrokerCore) {
+        let greedy = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let neighbor = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+
+        let greedy_first = crate::event::create(&greedy, 0).unwrap();
+        let greedy_second = crate::event::create(&greedy, 0).unwrap();
+        assert_eq!(
+            crate::event::create(&greedy, 0),
+            Err(BrokerError::ResourceExhausted)
+        );
+
+        let neighbor_first = crate::event::create(&neighbor, 0).unwrap();
+        let neighbor_second = crate::event::create(&neighbor, 0).unwrap();
+        assert_eq!(broker.references.read().len(), TEST_MAX_REFERENCES);
+
+        let latecomer = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        assert_eq!(
+            crate::event::create(&latecomer, 0),
+            Err(BrokerError::ResourceExhausted)
+        );
+
+        assert_eq!(greedy.close_object_reference(greedy_first), Ok(()));
+        let latecomer_handle = crate::event::create(&latecomer, 0).unwrap();
+
+        assert_eq!(greedy.close_object_reference(greedy_second), Ok(()));
+        assert_eq!(neighbor.close_object_reference(neighbor_first), Ok(()));
+        assert_eq!(neighbor.close_object_reference(neighbor_second), Ok(()));
+        assert_eq!(latecomer.close_object_reference(latecomer_handle), Ok(()));
+        assert!(broker.references.read().is_empty());
+    }
+
+    fn check_pending_references_count_toward_session_quota(broker: &BrokerCore) {
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let neighbor = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+
+        let first = session
+            .reserve_object_reference(ObjectRights::WAIT)
+            .unwrap();
+        let second = session
+            .reserve_object_reference(ObjectRights::WAIT)
+            .unwrap();
+        assert!(matches!(
+            session.reserve_object_reference(ObjectRights::WAIT),
+            Err(BrokerError::ResourceExhausted)
+        ));
+
+        let neighbor_handle = crate::event::create(&neighbor, 0).unwrap();
+        drop(first);
+        let session_handle = crate::event::create(&session, 0).unwrap();
+        assert_eq!(
+            crate::event::create(&session, 0),
+            Err(BrokerError::ResourceExhausted)
+        );
+
+        drop(second);
+        assert_eq!(session.close_object_reference(session_handle), Ok(()));
+        assert_eq!(neighbor.close_object_reference(neighbor_handle), Ok(()));
+        assert!(broker.references.read().is_empty());
+        assert_eq!(broker.pending_references.load(Ordering::Relaxed), 0);
+    }
+
+    fn check_pipe_capacity_quota_is_per_session(broker: &BrokerCore) {
+        let greedy = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let neighbor = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+
+        let (greedy_reader, greedy_writer) =
+            crate::pipe::create(&greedy, TEST_MAX_PIPE_CAPACITY_PER_SESSION as u64, 2).unwrap();
+        assert_eq!(
+            crate::pipe::create(&greedy, 1, 1),
+            Err(BrokerError::ResourceExhausted)
+        );
+        assert_eq!(
+            greedy.reserved_pipe_capacity.load(Ordering::Relaxed),
+            TEST_MAX_PIPE_CAPACITY_PER_SESSION
+        );
+
+        let (neighbor_reader, neighbor_writer) =
+            crate::pipe::create(&neighbor, TEST_MAX_PIPE_CAPACITY_PER_SESSION as u64, 2).unwrap();
+        assert_eq!(
+            broker.reserved_pipe_capacity.load(Ordering::Relaxed),
+            TEST_MAX_PIPE_CAPACITY
+        );
+
+        let latecomer = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        assert_eq!(
+            crate::pipe::create(&latecomer, 1, 1),
+            Err(BrokerError::ResourceExhausted)
+        );
+        assert_eq!(latecomer.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
+
+        assert_eq!(greedy.close_object_reference(greedy_reader), Ok(()));
+        assert_eq!(greedy.close_object_reference(greedy_writer), Ok(()));
+        let (latecomer_reader, latecomer_writer) = crate::pipe::create(&latecomer, 1, 1).unwrap();
+
+        assert_eq!(neighbor.close_object_reference(neighbor_reader), Ok(()));
+        assert_eq!(neighbor.close_object_reference(neighbor_writer), Ok(()));
+        assert_eq!(latecomer.close_object_reference(latecomer_reader), Ok(()));
+        assert_eq!(latecomer.close_object_reference(latecomer_writer), Ok(()));
+        assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
+    }
+
+    fn check_pipe_capacity_is_released_when_reference_creation_fails(broker: &BrokerCore) {
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let handle = crate::event::create(&session, 0).unwrap();
+
+        assert_eq!(
+            crate::pipe::create(&session, TEST_MAX_PIPE_CAPACITY_PER_SESSION as u64, 2),
+            Err(BrokerError::ResourceExhausted)
+        );
+        assert_eq!(session.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
+        assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
+
+        assert_eq!(session.close_object_reference(handle), Ok(()));
+    }
+
+    fn check_pipe_capacity_outlives_session_for_in_flight_object(broker: &BrokerCore) {
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let (reader, _writer) =
+            crate::pipe::create(&session, TEST_MAX_PIPE_CAPACITY_PER_SESSION as u64, 2).unwrap();
+        let object = session
+            .authorized_object(reader, ObjectRights::WAIT)
+            .unwrap();
+        let session_capacity = Arc::clone(&session.reserved_pipe_capacity);
+
+        drop(session);
+
+        assert!(broker.references.read().is_empty());
+        assert_eq!(
+            session_capacity.load(Ordering::Relaxed),
+            TEST_MAX_PIPE_CAPACITY_PER_SESSION
+        );
+        assert_eq!(
+            broker.reserved_pipe_capacity.load(Ordering::Relaxed),
+            TEST_MAX_PIPE_CAPACITY_PER_SESSION
+        );
+
+        drop(object);
+
+        assert_eq!(session_capacity.load(Ordering::Relaxed), 0);
+        assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
     }
 
     fn check_pair_handle_exhaustion(broker: &BrokerCore) {

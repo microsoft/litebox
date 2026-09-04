@@ -190,19 +190,18 @@ enum PipeEndpoint {
     Write,
 }
 
-struct PipeCapacityReservation {
+struct CapacityCharge {
     reserved_capacity: Arc<AtomicUsize>,
     capacity: usize,
 }
 
-impl PipeCapacityReservation {
-    fn new(session: &BrokerSession, capacity: usize) -> Result<Self> {
-        let reserved_capacity = Arc::clone(&session.core.reserved_pipe_capacity);
+impl CapacityCharge {
+    fn new(reserved_capacity: Arc<AtomicUsize>, capacity: usize, limit: usize) -> Result<Self> {
         reserved_capacity
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
                 reserved
                     .checked_add(capacity)
-                    .filter(|total| *total <= session.core.limits.max_total_pipe_capacity)
+                    .filter(|total| *total <= limit)
             })
             .map_err(|_| BrokerError::ResourceExhausted)?;
         Ok(Self {
@@ -212,13 +211,37 @@ impl PipeCapacityReservation {
     }
 }
 
-impl Drop for PipeCapacityReservation {
+impl Drop for CapacityCharge {
     fn drop(&mut self) {
         self.reserved_capacity
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
                 reserved.checked_sub(self.capacity)
             })
             .expect("reserved pipe capacity must include every live pipe");
+    }
+}
+
+struct PipeCapacityReservation {
+    _session: CapacityCharge,
+    _broker: CapacityCharge,
+}
+
+impl PipeCapacityReservation {
+    fn new(session: &BrokerSession, capacity: usize) -> Result<Self> {
+        let broker_charge = CapacityCharge::new(
+            Arc::clone(&session.core.reserved_pipe_capacity),
+            capacity,
+            session.core.limits.max_total_pipe_capacity,
+        )?;
+        let session_charge = CapacityCharge::new(
+            Arc::clone(&session.reserved_pipe_capacity),
+            capacity,
+            session.core.limits.max_pipe_capacity_per_session,
+        )?;
+        Ok(Self {
+            _session: session_charge,
+            _broker: broker_charge,
+        })
     }
 }
 
