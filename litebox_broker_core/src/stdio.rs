@@ -33,11 +33,7 @@ pub trait StdioProvider: Send + Sync {
         &self,
         cancellation: &AssociationCancellation,
         output: &mut [u8],
-    ) -> core::result::Result<usize, StdioProviderError> {
-        let _ = cancellation;
-        let _ = output;
-        Err(StdioProviderError::Unsupported)
-    }
+    ) -> core::result::Result<usize, StdioProviderError>;
 
     /// Writes bytes to the selected standard output stream.
     ///

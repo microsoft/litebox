@@ -1200,6 +1200,14 @@ mod tests {
     }
 
     impl StdioProvider for BlockingWriteStdioProvider {
+        fn read(
+            &self,
+            _cancellation: &AssociationCancellation,
+            _output: &mut [u8],
+        ) -> Result<usize, StdioProviderError> {
+            Err(StdioProviderError::Unsupported)
+        }
+
         fn write(
             &self,
             cancellation: &AssociationCancellation,

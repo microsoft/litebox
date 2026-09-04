@@ -33,6 +33,14 @@ struct CapturingStdioProvider {
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 impl litebox_broker_core::stdio::StdioProvider for CapturingStdioProvider {
+    fn read(
+        &self,
+        _cancellation: &litebox_broker_core::AssociationCancellation,
+        _output: &mut [u8],
+    ) -> Result<usize, litebox_broker_core::stdio::StdioProviderError> {
+        Err(litebox_broker_core::stdio::StdioProviderError::Unsupported)
+    }
+
     fn write(
         &self,
         _cancellation: &litebox_broker_core::AssociationCancellation,
