@@ -151,5 +151,18 @@ mod tests {
             task.sys_ioctl(0, IoctlArg::TCGETS(UserPtrMut::from_ptr(&raw mut termios)),),
             Err(Errno::ENOTTY)
         );
+
+        for (path, flags, expected) in [
+            ("/dev/stdin", OFlags::RDONLY, Err(Errno::ENOTTY)),
+            ("/dev/stdout", OFlags::WRONLY, Ok(0)),
+            ("/dev/stderr", OFlags::WRONLY, Err(Errno::ENOTTY)),
+            ("/dev/./stdout", OFlags::WRONLY, Ok(0)),
+        ] {
+            let fd = i32::try_from(task.sys_open(path, flags, Mode::empty()).unwrap()).unwrap();
+            assert_eq!(
+                task.sys_ioctl(fd, IoctlArg::TCGETS(UserPtrMut::from_ptr(&raw mut termios)),),
+                expected
+            );
+        }
     }
 }
