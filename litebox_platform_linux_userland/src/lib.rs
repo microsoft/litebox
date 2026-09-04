@@ -33,8 +33,9 @@ use aarch64::{
     Aarch64GateSignalResult, GateInterruption, assert_tls_block_placement,
     canonicalize_runtime_aarch64_gate_signal_context, copy_signal_context,
     fatal_aarch64_runtime_state, guest_thread_pointer_tp_offset, is_guest_thread,
-    load_tls_block_base, run_thread_arch, set_is_guest_thread, set_signal_return,
-    signal_handler_exit_guest, switch_to_guest, sync_instruction_stream, tls_offset,
+    load_tls_block_base, run_thread_arch, set_guest_vector_state, set_is_guest_thread,
+    set_signal_return, signal_handler_exit_guest, switch_to_guest, sync_instruction_stream,
+    tls_offset,
 };
 
 extern crate alloc;
@@ -963,10 +964,7 @@ fn thread_start(
     #[cfg(target_arch = "aarch64")] vector_state: litebox_common_linux::GuestVectorState,
 ) {
     #[cfg(target_arch = "aarch64")]
-    litebox::platform::GuestVectorStateProvider::set_guest_vector_state(
-        LinuxUserland::new(),
-        &vector_state,
-    );
+    set_guest_vector_state(&vector_state);
     // Allow caller to run some code before we return to the new thread.
     let shim = init_thread.init();
 
@@ -2781,9 +2779,7 @@ mod tests {
             fn init(
                 self: Box<Self>,
             ) -> Box<dyn EnterShim<ExecutionContext = Self::ExecutionContext>> {
-                self.0
-                    .send(LinuxUserland::new().get_guest_vector_state())
-                    .unwrap();
+                self.0.send(super::get_guest_vector_state()).unwrap();
                 Box::new(TerminateShim)
             }
         }

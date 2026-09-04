@@ -1279,28 +1279,35 @@ impl litebox::platform::GuestVectorStateProvider for LinuxUserland {
     type GuestVectorState = GuestVectorState;
 
     fn get_guest_vector_state(&self) -> GuestVectorState {
-        let block: usize;
-        unsafe {
-            core::arch::asm!(
-                load_tls_block_base!("{block}"),
-                block = out(reg) block,
-                options(nomem, nostack, preserves_flags)
-            );
-            ((block + tls_offset::GUEST_VECTOR_STATE) as *const GuestVectorState).read()
-        }
+        get_guest_vector_state()
     }
 
     fn set_guest_vector_state(&self, state: &GuestVectorState) {
-        let block: usize;
-        unsafe {
-            core::arch::asm!(
-                load_tls_block_base!("{block}"),
-                block = out(reg) block,
-                options(nomem, nostack, preserves_flags)
-            );
-            ((block + tls_offset::GUEST_VECTOR_STATE) as *mut GuestVectorState)
-                .write(state.clone());
-        }
+        set_guest_vector_state(state);
+    }
+}
+
+pub(super) fn get_guest_vector_state() -> GuestVectorState {
+    let block: usize;
+    unsafe {
+        core::arch::asm!(
+            load_tls_block_base!("{block}"),
+            block = out(reg) block,
+            options(nomem, nostack, preserves_flags)
+        );
+        ((block + tls_offset::GUEST_VECTOR_STATE) as *const GuestVectorState).read()
+    }
+}
+
+pub(super) fn set_guest_vector_state(state: &GuestVectorState) {
+    let block: usize;
+    unsafe {
+        core::arch::asm!(
+            load_tls_block_base!("{block}"),
+            block = out(reg) block,
+            options(nomem, nostack, preserves_flags)
+        );
+        ((block + tls_offset::GUEST_VECTOR_STATE) as *mut GuestVectorState).write(state.clone());
     }
 }
 
