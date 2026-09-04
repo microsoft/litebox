@@ -1496,6 +1496,7 @@ dependencies = [
  "litebox_broker_transport_linux_userland",
  "litebox_broker_transport_windows_userland",
  "tempfile",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

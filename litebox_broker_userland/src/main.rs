@@ -3,7 +3,7 @@
 
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
-use std::io::{Error as IoError, ErrorKind, Result as IoResult, Write as _};
+use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::process::{Child, Command};
@@ -163,6 +163,15 @@ fn run_runner_process(
         command.arg("--broker-proxy-url").arg(proxy_url);
     }
     let mut runner = command.args(&args.runner_arguments).spawn()?;
+    #[cfg(windows)]
+    let _runner_job = match windows::RunnerJob::assign(&runner) {
+        Ok(job) => job,
+        Err(error) => {
+            let _ = runner.kill();
+            let _ = runner.wait();
+            return Err(error.into());
+        }
+    };
     let runner_process_id = runner.id();
     let association_result = serve(&mut runner, runner_process_id);
     if association_result.is_err() {

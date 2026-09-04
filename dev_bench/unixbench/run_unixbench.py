@@ -352,9 +352,7 @@ def _run_litebox_cmd(
     # since if SIGALRM isn't delivered the process will hang forever.
     timeout = duration * 3 + 30 if bench.uses_alarm else duration * 10 + 60
     popen_options = {}
-    if sys.platform == "win32":
-        popen_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-    else:
+    if sys.platform != "win32":
         popen_options["start_new_session"] = True
     process = subprocess.Popen(
         cmd,
@@ -393,29 +391,14 @@ def _run_litebox_cmd(
 def _terminate_process_tree(process: subprocess.Popen) -> None:
     """Terminate a timed-out broker and the runner process it launched."""
     if sys.platform == "win32":
-        result = subprocess.run(
-            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-            capture_output=True,
-        )
-        if result.returncode != 0:
-            if process.poll() is None:
-                process.kill()
-                process.wait()
-            error = result.stderr.decode("utf-8", errors="replace").strip()
-            raise RuntimeError(
-                f"failed to terminate LiteBox benchmark process tree: {error}"
-            )
+        process.kill()
     else:
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
 
-    process.wait()
-    if process.stdout is not None:
-        process.stdout.close()
-    if process.stderr is not None:
-        process.stderr.close()
+    process.communicate()
 
 
 def run_litebox(
