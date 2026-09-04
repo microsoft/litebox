@@ -191,58 +191,54 @@ enum PipeEndpoint {
 }
 
 struct PipeCapacityReservation {
-    broker_reserved_capacity: Arc<AtomicUsize>,
-    session_reserved_capacity: Arc<AtomicUsize>,
-    capacity: usize,
+    global_counter: Arc<AtomicUsize>,
+    session_counter: Arc<AtomicUsize>,
+    amount: usize,
 }
 
 impl PipeCapacityReservation {
-    fn new(session: &BrokerSession, capacity: usize) -> Result<Self> {
-        let broker_reserved_capacity = Arc::clone(&session.core.reserved_pipe_capacity);
+    fn new(session: &BrokerSession, amount: usize) -> Result<Self> {
         reserve_pipe_capacity(
-            &broker_reserved_capacity,
-            capacity,
+            &session.core.reserved_pipe_capacity,
+            amount,
             session.core.limits.max_total_pipe_capacity,
         )?;
-        let session_reserved_capacity = Arc::clone(&session.reserved_pipe_capacity);
         if let Err(error) = reserve_pipe_capacity(
-            &session_reserved_capacity,
-            capacity,
+            &session.reserved_pipe_capacity,
+            amount,
             session.core.limits.max_pipe_capacity_per_session,
         ) {
-            release_pipe_capacity(&broker_reserved_capacity, capacity);
+            release_pipe_capacity(&session.core.reserved_pipe_capacity, amount);
             return Err(error);
         }
         Ok(Self {
-            broker_reserved_capacity,
-            session_reserved_capacity,
-            capacity,
+            global_counter: Arc::clone(&session.core.reserved_pipe_capacity),
+            session_counter: Arc::clone(&session.reserved_pipe_capacity),
+            amount,
         })
     }
 }
 
 impl Drop for PipeCapacityReservation {
     fn drop(&mut self) {
-        release_pipe_capacity(&self.session_reserved_capacity, self.capacity);
-        release_pipe_capacity(&self.broker_reserved_capacity, self.capacity);
+        release_pipe_capacity(&self.session_counter, self.amount);
+        release_pipe_capacity(&self.global_counter, self.amount);
     }
 }
 
-fn reserve_pipe_capacity(counter: &AtomicUsize, capacity: usize, limit: usize) -> Result<()> {
+fn reserve_pipe_capacity(counter: &AtomicUsize, amount: usize, limit: usize) -> Result<()> {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
-            reserved
-                .checked_add(capacity)
-                .filter(|total| *total <= limit)
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(amount).filter(|next| *next <= limit)
         })
         .map(|_| ())
         .map_err(|_| BrokerError::ResourceExhausted)
 }
 
-fn release_pipe_capacity(counter: &AtomicUsize, capacity: usize) {
+fn release_pipe_capacity(counter: &AtomicUsize, amount: usize) {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
-            reserved.checked_sub(capacity)
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_sub(amount)
         })
         .expect("reserved pipe capacity must include every live pipe");
 }
