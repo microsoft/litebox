@@ -24,60 +24,11 @@ use litebox_broker_transport_windows_userland::named_pipe::{
     WindowsNamedPipeHostSetupChannel, WindowsNamedPipeListener, validate_client_process,
 };
 use litebox_broker_transport_windows_userland::shared_memory::WindowsSharedMemory;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-    SetInformationJobObject,
-};
 
 use super::{
     HostAssociationShutdown, HostRequestSource, HostResponseSink, SETUP_TIMEOUT,
     configured_socket_policy,
 };
-
-pub(super) struct RunnerJob(HANDLE);
-
-impl RunnerJob {
-    pub(super) fn assign(runner: &Child) -> IoResult<Self> {
-        // SAFETY: Null attributes and name request a new unnamed job object.
-        let handle = unsafe { CreateJobObjectW(core::ptr::null(), core::ptr::null()) };
-        if handle.is_null() {
-            return Err(std::io::Error::last_os_error());
-        }
-        let job = Self(handle);
-
-        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        // SAFETY: `job` owns a valid handle, and `limits` is initialized for
-        // the information class and remains alive for the duration of the call.
-        if unsafe {
-            SetInformationJobObject(
-                job.0,
-                JobObjectExtendedLimitInformation,
-                (&raw const limits).cast(),
-                core::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            )
-        } == 0
-        {
-            return Err(std::io::Error::last_os_error());
-        }
-
-        // SAFETY: Both handles are valid for this call. The job retains the
-        // process association independently of the borrowed `Child`.
-        if unsafe { AssignProcessToJobObject(job.0, runner.as_raw_handle()) } == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(job)
-    }
-}
-
-impl Drop for RunnerJob {
-    fn drop(&mut self) {
-        // SAFETY: `self.0` is the owned handle returned by `CreateJobObjectW`.
-        let _ = unsafe { CloseHandle(self.0) };
-    }
-}
 
 impl HostRequestSource for WindowsControlRingHostRequestSource {
     fn recv_request(&mut self) -> IoResult<HostReceive<BrokerRequest>> {

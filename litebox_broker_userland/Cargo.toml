@@ -18,12 +18,6 @@ tempfile = { version = "3", default-features = false }
 
 [target.'cfg(all(windows, target_arch = "x86_64"))'.dependencies]
 litebox_broker_transport_windows_userland = { path = "../litebox_broker_transport_windows_userland", version = "0.1.0" }
-windows-sys = { version = "0.60.2", default-features = false, features = [
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_System_JobObjects",
-    "Win32_System_Threading",
-] }
 
 [[bin]]
 name = "litebox-broker-userland"
