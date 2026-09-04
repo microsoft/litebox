@@ -130,7 +130,7 @@ pub(super) fn restore_sigcontext<Platform: ShimPlatform>(
     _platform: &Platform,
     ctx: &mut PtRegs,
     sigctx: &litebox_common_linux::signal::x86_64::Sigcontext,
-) -> Option<usize> {
+) -> usize {
     let litebox_common_linux::signal::x86_64::Sigcontext {
         r8,
         r9,
@@ -183,5 +183,5 @@ pub(super) fn restore_sigcontext<Platform: ShimPlatform>(
 
     // TODO: restore fpstate
 
-    Some(ctx.rax)
+    ctx.rax
 }

@@ -492,11 +492,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::EFAULT);
         };
 
-        let Some(result) = arch::restore_sigcontext(self.global.platform, ctx, &uctx.mcontext)
-        else {
-            self.force_signal(Signal::SIGSEGV, false);
-            return Err(Errno::EFAULT);
+        #[cfg(target_arch = "aarch64")]
+        let result = {
+            let Some(result) = arch::restore_sigcontext(self.global.platform, ctx, &uctx.mcontext)
+            else {
+                self.force_signal(Signal::SIGSEGV, false);
+                return Err(Errno::EFAULT);
+            };
+            result
         };
+        #[cfg(target_arch = "x86_64")]
+        let result = arch::restore_sigcontext(self.global.platform, ctx, &uctx.mcontext);
         // Restore the alternate signal stack, ignoring errors.
         self.signals.set_sigaltstack(uctx.stack).ok();
         self.signals.set_signal_mask(uctx.sigmask);

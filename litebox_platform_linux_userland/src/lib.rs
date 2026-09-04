@@ -960,8 +960,9 @@ fn thread_start(
         dyn litebox::shim::InitThread<ExecutionContext = litebox_common_linux::PtRegs>,
     >,
     mut ctx: litebox_common_linux::PtRegs,
-    vector_state: litebox_common_linux::GuestVectorState,
+    #[cfg(target_arch = "aarch64")] vector_state: litebox_common_linux::GuestVectorState,
 ) {
+    #[cfg(target_arch = "aarch64")]
     litebox::platform::GuestVectorStateProvider::set_guest_vector_state(
         LinuxUserland::new(),
         &vector_state,
@@ -1036,11 +1037,18 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
         >,
     ) -> Result<(), Self::ThreadSpawnError> {
         let ctx = ctx.clone();
+        #[cfg(target_arch = "aarch64")]
         let vector_state =
             litebox::platform::GuestVectorStateProvider::get_guest_vector_state(self);
         // TODO: do we need to wait for the handle in the main thread?
-        let _handle = std::thread::Builder::new()
-            .spawn(move || thread_start(init_thread, ctx, vector_state))?;
+        let _handle = std::thread::Builder::new().spawn(move || {
+            thread_start(
+                init_thread,
+                ctx,
+                #[cfg(target_arch = "aarch64")]
+                vector_state,
+            );
+        })?;
 
         Ok(())
     }
