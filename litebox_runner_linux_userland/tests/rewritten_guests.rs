@@ -15,7 +15,7 @@ fn run_rewritten_fixture(source: &str, unique_name: &str) -> std::process::Outpu
     let binary_path = std::env::var("NEXTEST_BIN_EXE_litebox_runner_linux_userland")
         .unwrap_or_else(|_| env!("CARGO_BIN_EXE_litebox_runner_linux_userland").to_string());
 
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     let mut command = {
         let broker_path =
             std::path::Path::new(&binary_path).with_file_name("litebox-broker-userland");
@@ -28,7 +28,7 @@ fn run_rewritten_fixture(source: &str, unique_name: &str) -> std::process::Outpu
         command.arg("--runner").arg(&binary_path);
         command
     };
-    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    #[cfg(not(target_os = "linux"))]
     let mut command = std::process::Command::new(binary_path);
 
     command
