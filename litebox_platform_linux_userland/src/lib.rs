@@ -2718,12 +2718,6 @@ unsafe fn interrupt_signal_handler(
     set_signal_return(context, interrupt_callback, 0, 0, 0, 0);
 }
 
-impl litebox::platform::CrngProvider for LinuxUserland {
-    fn fill_bytes_crng(&self, buf: &mut [u8]) {
-        getrandom::fill(buf).expect("getrandom failed");
-    }
-}
-
 impl litebox::platform::DerivedKeyProvider for LinuxUserland {
     fn derive_key<E>(
         &self,

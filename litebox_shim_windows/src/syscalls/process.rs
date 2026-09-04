@@ -826,7 +826,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 }
 
 pub(crate) const fn default_process_cookie() -> u32 {
-    // TODO: use CrngProvider to generate a random cookie
+    // TODO: use broker randomness to generate a random cookie.
     PROCESS_COOKIE
 }
 

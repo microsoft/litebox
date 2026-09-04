@@ -1602,7 +1602,6 @@ version = "0.1.0"
 dependencies = [
  "arrayvec",
  "cfg-if",
- "getrandom 0.3.4",
  "libc",
  "litebox",
  "litebox_common_linux",
@@ -1636,8 +1635,6 @@ dependencies = [
  "num_enum",
  "object",
  "once_cell",
- "rand_chacha",
- "rand_core",
  "rangemap",
  "raw-cpuid",
  "rsa",
@@ -1667,7 +1664,6 @@ dependencies = [
 name = "litebox_platform_windows_userland"
 version = "0.1.0"
 dependencies = [
- "getrandom 0.3.4",
  "litebox",
  "litebox_common_linux",
  "windows-sys 0.60.2",

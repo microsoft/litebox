@@ -22,9 +22,8 @@ use litebox_common_windows::nt_status::NtStatus;
 use litebox::LiteBox;
 use litebox::mm::PageManager;
 use litebox::platform::{
-    ArchSpecificProvider, ArchSpecificRegister, CrngProvider, PageManagementProvider,
-    RawConstPointer as _, RawMutPointer as _, RawPointerProvider, StdioProvider,
-    SystemInfoProvider, TimeProvider,
+    ArchSpecificProvider, ArchSpecificRegister, PageManagementProvider, RawConstPointer as _,
+    RawMutPointer as _, RawPointerProvider, StdioProvider, SystemInfoProvider, TimeProvider,
 };
 use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
 use litebox::sync::{Mutex, RawSyncPrimitivesProvider};
@@ -78,7 +77,6 @@ pub trait ShimPlatform:
     + ArchSpecificProvider
     + SystemInfoProvider
     + TimeProvider
-    + CrngProvider
     + litebox::platform::ThreadProvider<ExecutionContext = litebox_common_linux::PtRegs>
     + 'static
 {
@@ -91,7 +89,6 @@ impl<T> ShimPlatform for T where
         + ArchSpecificProvider
         + SystemInfoProvider
         + TimeProvider
-        + CrngProvider
         + litebox::platform::ThreadProvider<ExecutionContext = litebox_common_linux::PtRegs>
         + 'static
 {
@@ -428,7 +425,7 @@ impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
         tar_data: Cow<'static, [u8]>,
     ) -> DefaultFS<Platform>
     where
-        Platform: CrngProvider + StdioProvider,
+        Platform: StdioProvider,
     {
         default_fs(&self.litebox, in_mem, tar_data)
     }
@@ -3193,7 +3190,7 @@ fn default_fs<Platform>(
     tar_data: Cow<'static, [u8]>,
 ) -> WindowsFS<Platform>
 where
-    Platform: ShimPlatform + CrngProvider + StdioProvider,
+    Platform: ShimPlatform + StdioProvider,
 {
     litebox::fs::resolver::Resolver::new(
         litebox,
