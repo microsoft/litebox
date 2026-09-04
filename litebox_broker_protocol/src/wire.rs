@@ -401,7 +401,10 @@ mod tests {
         ShutdownSocketRequest, SocketConnectionStatus, SocketError, SocketStatusRequest,
         SocketStatusResponse, SocketType, TcpOptionName, TcpOptionValue,
     };
-    use crate::stdio::{StdioOutputStream, WriteStdioRequest, WriteStdioResponse};
+    use crate::stdio::{
+        ReadStdioRequest, ReadStdioResponse, StdioOutputStream, WriteStdioRequest,
+        WriteStdioResponse,
+    };
     use crate::{ObjectHandle, ProtocolVersion, RequestId};
     use core::net::{Ipv4Addr, SocketAddrV4};
 
@@ -506,6 +509,12 @@ mod tests {
                 slot_index: SharedBufferSlotIndex(7),
                 length: 256,
             }),
+            BrokerOperation::Stdio(StdioRequest::Read(ReadStdioRequest {
+                buffer: SharedBufferDescriptor {
+                    slot_index: SharedBufferSlotIndex(4),
+                    length: 31,
+                },
+            })),
             BrokerOperation::Stdio(StdioRequest::Write(WriteStdioRequest {
                 stream: StdioOutputStream::Stdout,
                 buffer: SharedBufferDescriptor {
@@ -854,6 +863,7 @@ mod tests {
             ))),
             BrokerResult::Socket(SocketResponse::Failed(SocketError::ConnectionReset)),
             BrokerResult::RandomFilled,
+            BrokerResult::Stdio(StdioResponse::Read(ReadStdioResponse { read: 11 })),
             BrokerResult::Stdio(StdioResponse::Write(WriteStdioResponse { written: 17 })),
             BrokerResult::Error(ErrorCode::PolicyDenied),
             BrokerResult::Error(ErrorCode::WouldBlock),
@@ -1014,6 +1024,20 @@ mod tests {
             decode_request(&frame[..frame.len() - 1]),
             Err(WireError::TruncatedFrame)
         );
+
+        let read = encode_request(BrokerRequest {
+            request_id: TEST_REQUEST_ID,
+            operation: BrokerOperation::Stdio(StdioRequest::Read(ReadStdioRequest {
+                buffer: SharedBufferDescriptor {
+                    slot_index: SharedBufferSlotIndex(1),
+                    length: 9,
+                },
+            })),
+        });
+        assert_eq!(
+            decode_request(&read[..read.len() - 1]),
+            Err(WireError::TruncatedFrame)
+        );
     }
 
     #[test]
@@ -1033,6 +1057,15 @@ mod tests {
         let frame = encode_response(response);
         assert_eq!(
             decode_response(&frame[..frame.len() - 1]),
+            Err(WireError::TruncatedFrame)
+        );
+
+        let read = encode_response(BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result: BrokerResult::Stdio(StdioResponse::Read(ReadStdioResponse { read: 9 })),
+        });
+        assert_eq!(
+            decode_response(&read[..read.len() - 1]),
             Err(WireError::TruncatedFrame)
         );
     }

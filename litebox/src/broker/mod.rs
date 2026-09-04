@@ -45,6 +45,8 @@ use shared_buffer::{SlotAllocator, SlotLease};
 pub(crate) trait BrokerControl: Send + Sync {
     fn fill_random(&self, output: &mut [u8]) -> core::result::Result<(), BrokerControlError>;
 
+    fn read_stdio(&self, data: &mut [u8]) -> core::result::Result<usize, BrokerControlError>;
+
     fn write_stdio(
         &self,
         stream: StdioOutputStream,
@@ -251,6 +253,7 @@ pub(crate) struct BrokerLocalControl<
     local: Mutex<Platform, Option<Arc<BrokerLocal<Channel>>>>,
     pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
     slot_allocator: SlotAllocator<Platform>,
+    stdio_read_lock: Mutex<Platform, ()>,
 }
 
 impl<Platform, Channel> BrokerLocalControl<Platform, Channel>
@@ -266,6 +269,7 @@ where
             local: Mutex::new(Some(Arc::new(local))),
             pollable_registry,
             slot_allocator: SlotAllocator::new(),
+            stdio_read_lock: Mutex::new(()),
         }
     }
 
@@ -318,6 +322,19 @@ where
             u32::try_from(output.len()).expect("validated random transfer length must fit in u32");
         let lease = self.acquire_shared_buffer(length)?;
         self.request(|local| local.fill_random(lease.descriptor(), output))
+    }
+
+    fn read_stdio(&self, data: &mut [u8]) -> core::result::Result<usize, BrokerControlError> {
+        if data.len() > MAX_STDIO_TRANSFER_SIZE as usize {
+            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
+        }
+        // Keep blocking stdin reads from consuming the broker's shared worker
+        // pool when multiple guest threads read concurrently.
+        let _read_guard = self.stdio_read_lock.lock();
+        let length = u32::try_from(data.len())
+            .expect("validated shared stdio transfer length must fit in u32");
+        let lease = self.acquire_shared_buffer(length)?;
+        self.request(|local| local.read_stdio(lease.descriptor(), data))
     }
 
     fn write_stdio(

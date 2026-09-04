@@ -7,6 +7,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::event::EventObject;
 use crate::pipe::PipeObject;
 use crate::socket::SocketObject;
+use crate::stdio::StdioReadCancellation;
 use crate::{BrokerCore, BrokerError, Result};
 use hashbrown::HashMap;
 use litebox_broker_protocol::ObjectHandle;
@@ -77,6 +78,8 @@ pub struct BrokerSession {
     references: Mutex<SessionReferences>,
     /// Socket quota held by pending, live, and closing in-flight resources.
     pub(crate) reserved_sockets: Arc<AtomicUsize>,
+    /// Cancellation state for standard-input reads in this session.
+    pub(crate) stdio_read_cancellation: StdioReadCancellation,
 }
 
 impl BrokerSession {
@@ -95,6 +98,7 @@ impl BrokerSession {
                 pending_handles: 0,
             }),
             reserved_sockets: Arc::new(AtomicUsize::new(0)),
+            stdio_read_cancellation: StdioReadCancellation::default(),
         }
     }
 

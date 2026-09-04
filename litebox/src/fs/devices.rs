@@ -266,14 +266,7 @@ where
     fn read(&self, h: &FileHandle, buf: &mut [u8], _offset: usize) -> Result<usize, ReadError> {
         let h = h.get_typed::<Self>();
         match h.device {
-            Device::Stdin => self
-                .litebox
-                .x
-                .platform
-                .read_from_stdin(buf)
-                .map_err(|e| match e {
-                    crate::platform::StdioReadError::Closed => ReadError::Io,
-                }),
+            Device::Stdin => self.litebox.read_stdio(buf).map_err(|_| ReadError::Io),
             Device::Stdout | Device::Stderr => Err(ReadError::NotForReading),
             Device::Null => {
                 // /dev/null read returns EOF

@@ -21,7 +21,7 @@ use crate::socket::{
     SendToSocketResponse, SetTcpOptionRequest, ShutdownSocketRequest, SocketError,
     SocketStatusRequest, SocketStatusResponse,
 };
-use crate::stdio::{WriteStdioRequest, WriteStdioResponse};
+use crate::stdio::{ReadStdioRequest, ReadStdioResponse, WriteStdioRequest, WriteStdioResponse};
 use crate::{ObjectHandle, ProtocolVersion, RequestId};
 
 /// Broker handshake request sent before the control channel is active.
@@ -231,6 +231,8 @@ pub enum SocketResponse {
 /// Standard-I/O request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StdioRequest {
+    /// Read bytes from standard input.
+    Read(ReadStdioRequest),
     /// Write bytes to a standard output stream.
     Write(WriteStdioRequest),
 }
@@ -238,6 +240,8 @@ pub enum StdioRequest {
 /// Standard-I/O response.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StdioResponse {
+    /// Standard input read response.
+    Read(ReadStdioResponse),
     /// Standard output write response.
     Write(WriteStdioResponse),
 }

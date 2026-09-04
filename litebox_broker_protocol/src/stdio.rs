@@ -3,7 +3,7 @@
 
 use crate::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferDescriptor};
 
-/// Maximum standard-output bytes transferred by one broker request.
+/// Maximum standard-I/O bytes transferred by one broker request.
 pub const MAX_STDIO_TRANSFER_SIZE: u32 = 32 * 1024;
 
 const _: () = assert!(MAX_STDIO_TRANSFER_SIZE <= SHARED_BUFFER_SLOT_SIZE);
@@ -15,6 +15,20 @@ pub enum StdioOutputStream {
     Stdout,
     /// Process standard error.
     Stderr,
+}
+
+/// Request to read standard input into a leased shared-buffer region.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadStdioRequest {
+    /// Leased shared-buffer region that receives the input bytes.
+    pub buffer: SharedBufferDescriptor,
+}
+
+/// Response describing a completed standard-input read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadStdioResponse {
+    /// Number of bytes read, or zero if standard input reached end-of-file.
+    pub read: u32,
 }
 
 /// Request to write bytes staged in shared memory to a standard output stream.
