@@ -2133,7 +2133,8 @@ mod stdio {
     #[test]
     fn stdio_requires_broker() {
         let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
+        let platform = MockPlatform::new();
+        let litebox = LiteBox::new(platform);
         let fs = Resolver::new(
             &litebox,
             crate::fs::composer::Composer::builder()
@@ -2233,7 +2234,8 @@ mod composed_stdio {
     #[test]
     fn stdio_requires_broker() {
         let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
+        let platform = MockPlatform::new();
+        let litebox = LiteBox::new(platform);
         let fs = composed_fs(&litebox);
 
         let fd_stdout = fs
