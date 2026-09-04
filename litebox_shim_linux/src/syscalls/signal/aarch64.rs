@@ -41,6 +41,9 @@ struct Aarch64Ctx {
     size: u32,
 }
 
+#[repr(align(16))]
+struct AlignedContextRecords([u8; 4096]);
+
 fn write_vector_state(records: &mut [u8; 4096], state: &GuestVectorState) {
     let (fpsimd, rest) = FpsimdContext::mut_from_prefix(records).unwrap();
     fpsimd.magic = FPSIMD_MAGIC;
@@ -185,8 +188,8 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
             *dst = *src as u64;
         }
 
-        let mut reserved = [0; 4096];
-        write_vector_state(&mut reserved, &platform.get_guest_vector_state());
+        let mut reserved = AlignedContextRecords([0; 4096]);
+        write_vector_state(&mut reserved.0, &platform.get_guest_vector_state());
         let frame = SignalFrame {
             siginfo: siginfo.clone(),
             ucontext: Ucontext {
@@ -203,7 +206,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
                     pc: ctx.pc as u64,
                     pstate: ctx.pstate,
                     __reserved_pad: [0; _],
-                    __reserved: reserved,
+                    __reserved: reserved.0,
                 },
             },
             next_frame_fp: ctx.regs[29],

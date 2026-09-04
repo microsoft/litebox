@@ -1590,6 +1590,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         match self.thread.init_state.take() {
             ThreadInitState::None => {}
             ThreadInitState::NewProcess(load_info) => {
+                #[cfg(target_arch = "aarch64")]
+                self.global
+                    .platform
+                    .set_guest_vector_state(&litebox_common_linux::GuestVectorState::default());
                 #[cfg(target_arch = "x86_64")]
                 {
                     *ctx = litebox_common_linux::PtRegs {
