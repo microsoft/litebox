@@ -3,5 +3,5 @@
 > [!WARNING]
 > This crate is work in progress. Broker-backed services are unavailable on
 > LVBS until a kernel broker platform is implemented. This includes standard
-> output and cryptographic randomness, so workloads that require either service
+> I/O and cryptographic randomness, so workloads that require either service
 > cannot run on LVBS.

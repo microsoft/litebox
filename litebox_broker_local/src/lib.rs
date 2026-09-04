@@ -243,7 +243,8 @@ mod tests {
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_protocol::shared_buffer::{SharedBufferDescriptor, SharedBufferSlotIndex};
     use litebox_broker_protocol::stdio::{
-        StdioOutputStream, WriteStdioRequest, WriteStdioResponse,
+        ReadStdioRequest, ReadStdioResponse, StdioOutputStream, WriteStdioRequest,
+        WriteStdioResponse,
     };
     use litebox_broker_transport::channel::LocalNotificationChannel;
     use std::sync::Mutex;
@@ -327,6 +328,38 @@ mod tests {
                 request_id: RequestId(0),
                 operation: BrokerOperation::Stdio(StdioRequest::Write(WriteStdioRequest {
                     stream: StdioOutputStream::Stderr,
+                    buffer: descriptor,
+                })),
+            })
+        );
+    }
+
+    #[test]
+    fn read_stdio_requests_and_reads_the_shared_buffer() {
+        let descriptor = SharedBufferDescriptor {
+            slot_index: SharedBufferSlotIndex(2),
+            length: 3,
+        };
+        let channel = FakeControlChannel::new(
+            None,
+            Some(BrokerResult::Stdio(StdioResponse::Read(
+                ReadStdioResponse { read: 2 },
+            ))),
+        );
+        let local = BrokerLocal {
+            channel,
+            shared_buffers: noop_shared_buffers(),
+            next_request_id: AtomicU64::new(0),
+        };
+        let mut output = [0xff; 3];
+
+        assert_eq!(local.read_stdio(descriptor, &mut output).unwrap(), 2);
+        assert_eq!(output, [0, 0, 0xff]);
+        assert_eq!(
+            local.channel.sent_request.borrow().clone(),
+            Some(BrokerRequest {
+                request_id: RequestId(0),
+                operation: BrokerOperation::Stdio(StdioRequest::Read(ReadStdioRequest {
                     buffer: descriptor,
                 })),
             })

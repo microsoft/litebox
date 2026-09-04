@@ -8,7 +8,7 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::str::FromStr;
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -16,8 +16,6 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use litebox_broker_core::random::{RandomProvider, RandomProviderError};
-use litebox_broker_core::stdio::{StdioProvider, StdioProviderError};
 use litebox_broker_core::{
     BrokerCore, CallerCredential, DestinationPortRange, DestinationRule, Ipv4Cidr, SocketPolicy,
     SocketPolicyError,
@@ -26,7 +24,6 @@ use litebox_broker_host::{BrokerHostAssociation, ConnectionTermination, setup_co
 use litebox_broker_protocol::message::{BrokerRequest, BrokerResponse};
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_LAYOUT;
 use litebox_broker_protocol::socket::{Ipv4Address, Port};
-use litebox_broker_protocol::stdio::StdioOutputStream;
 use litebox_broker_transport::channel::{HostNotificationChannel, HostReceive, HostSetupChannel};
 use litebox_broker_transport::control_ring::ControlRing;
 use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedBufferPool, SharedMemory};
@@ -35,49 +32,17 @@ use litebox_broker_userland::readiness::ReadinessPublisherRuntime;
 
 #[cfg(target_os = "linux")]
 mod linux;
+mod random;
+mod stdio;
 #[cfg(all(windows, target_arch = "x86_64"))]
 mod windows;
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(10);
 const REQUEST_QUEUE_CAPACITY: usize = 64;
+const REQUEST_QUEUE_RETRY_DELAY: Duration = Duration::from_millis(1);
+const REQUEST_QUEUE_STALL_TIMEOUT: Duration = Duration::from_secs(5);
 const WORKER_COUNT: usize = 8;
-
-struct UserlandRandomProvider;
-
-impl RandomProvider for UserlandRandomProvider {
-    fn fill(&self, output: &mut [u8]) -> Result<(), RandomProviderError> {
-        getrandom::fill(output).map_err(|_| RandomProviderError)
-    }
-}
-
-/// Routes output from the broker's single child runner to inherited streams.
-///
-/// A broker serving multiple runners will need association-specific output
-/// destinations instead of sharing process-wide standard streams.
-struct UserlandStdioProvider;
-
-impl StdioProvider for UserlandStdioProvider {
-    fn write(&self, stream: StdioOutputStream, input: &[u8]) -> Result<usize, StdioProviderError> {
-        let result = match stream {
-            StdioOutputStream::Stdout => write_and_flush(std::io::stdout().lock(), input),
-            StdioOutputStream::Stderr => write_and_flush(std::io::stderr().lock(), input),
-        };
-        result.map_err(|error| {
-            if error.kind() == ErrorKind::BrokenPipe {
-                StdioProviderError::Closed
-            } else {
-                StdioProviderError::Failed
-            }
-        })
-    }
-}
-
-fn write_and_flush(mut output: impl std::io::Write, input: &[u8]) -> IoResult<usize> {
-    let written = output.write(input)?;
-    output.flush()?;
-    Ok(written)
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AllowedDestination {
@@ -378,6 +343,17 @@ impl<Shutdown: HostAssociationShutdown> Drop for ReadinessPublicationGuard<'_, S
     }
 }
 
+/// Requests cancellation before an association scope joins its workers.
+struct AssociationCancellationGuard<'association, 'memory, Memory: SharedMemory> {
+    association: &'association BrokerHostAssociation<'memory, Memory>,
+}
+
+impl<Memory: SharedMemory> Drop for AssociationCancellationGuard<'_, '_, Memory> {
+    fn drop(&mut self) {
+        self.association.request_cancellation();
+    }
+}
+
 /// Serves one association until it ends, then reports its first failure.
 ///
 /// `readiness` is created by the caller rather than here so readiness sources
@@ -437,6 +413,9 @@ where
             readiness: &readiness,
             failure_coordinator: &failure_coordinator,
         };
+        let cancellation = AssociationCancellationGuard {
+            association: &association,
+        };
 
         let mut workers = Vec::with_capacity(WORKER_COUNT);
         for worker_id in 0..WORKER_COUNT {
@@ -463,6 +442,7 @@ where
         }
 
         read_requests(&mut request_source, request_sender, &failure_coordinator);
+        drop(cancellation);
         for worker in workers {
             if worker.join().is_err() {
                 failure_coordinator.report(IoError::other("broker request worker panicked"));
@@ -504,11 +484,12 @@ fn read_requests<RequestSource, Shutdown>(
         }
         match request_source.recv_request() {
             Ok(HostReceive::Message(request)) => {
-                if request_sender.send(request).is_err() {
-                    failure_coordinator.report(IoError::new(
-                        ErrorKind::BrokenPipe,
-                        "broker request workers stopped",
-                    ));
+                if !enqueue_request(
+                    &request_sender,
+                    request,
+                    failure_coordinator,
+                    REQUEST_QUEUE_STALL_TIMEOUT,
+                ) {
                     break;
                 }
             }
@@ -523,6 +504,44 @@ fn read_requests<RequestSource, Shutdown>(
             Err(error) => {
                 failure_coordinator.report(error);
                 break;
+            }
+        }
+    }
+}
+
+fn enqueue_request<Shutdown>(
+    request_sender: &SyncSender<BrokerRequest>,
+    mut request: BrokerRequest,
+    failure_coordinator: &HostAssociationFailureCoordinator<Shutdown>,
+    stall_timeout: Duration,
+) -> bool
+where
+    Shutdown: HostAssociationShutdown,
+{
+    let started = Instant::now();
+    loop {
+        match request_sender.try_send(request) {
+            Ok(()) => return true,
+            Err(TrySendError::Disconnected(_)) => {
+                failure_coordinator.report(IoError::new(
+                    ErrorKind::BrokenPipe,
+                    "broker request workers stopped",
+                ));
+                return false;
+            }
+            Err(TrySendError::Full(pending)) => {
+                request = pending;
+                if failure_coordinator.failed() {
+                    return false;
+                }
+                if started.elapsed() >= stall_timeout {
+                    failure_coordinator.report(IoError::new(
+                        ErrorKind::TimedOut,
+                        "broker request queue remained full",
+                    ));
+                    return false;
+                }
+                std::thread::sleep(REQUEST_QUEUE_RETRY_DELAY);
             }
         }
     }
@@ -682,15 +701,23 @@ mod tests {
     use std::os::fd::AsFd;
     use std::os::unix::net::UnixStream;
     use std::sync::Arc;
-    use std::sync::mpsc::{Receiver, sync_channel};
+    use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
     use std::time::{Duration, Instant};
 
     use litebox_broker_core::socket::UnsupportedSocketProvider;
-    use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
+    use litebox_broker_core::stdio::{StdioProvider, StdioProviderError, UnsupportedStdioProvider};
+    use litebox_broker_core::{AssociationCancellation, BrokerCore, ObjectRights, PolicyEngine};
     use litebox_broker_host::setup_connection;
     use litebox_broker_protocol::BROKER_PROTOCOL_VERSION;
-    use litebox_broker_protocol::message::{BrokerHandshakeResponse, BrokerNotification};
-    use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE};
+    use litebox_broker_protocol::RequestId;
+    use litebox_broker_protocol::message::{
+        BrokerHandshakeResponse, BrokerNotification, BrokerOperation,
+    };
+    use litebox_broker_protocol::shared_buffer::{
+        SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SharedBufferDescriptor,
+        SharedBufferSlotIndex,
+    };
+    use litebox_broker_protocol::stdio::StdioOutputStream;
     use litebox_broker_transport::channel::{
         HostNotificationChannel, HostReceive, HostSetupChannel, LocalSetupChannel,
     };
@@ -705,6 +732,8 @@ mod tests {
     };
 
     use super::*;
+
+    const TEST_CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
     /// One live host association: the endpoints teardown acts on, and the rest
     /// held open so the association stays up for the duration of a test.
@@ -767,8 +796,9 @@ mod tests {
     ) -> (
         litebox_broker_local::BrokerLocal<UnixControlRingLocalCallChannel>,
         UnixControlRingLocalNotificationChannel,
+        UnixControlRingLocalShutdown,
     ) {
-        litebox_broker_local::BrokerLocal::negotiate(
+        let (local, (notifications, shutdown)) = litebox_broker_local::BrokerLocal::negotiate(
             UnixStreamLocalSetupChannel::from_connected(stream),
             |mut setup| {
                 let shared_memory = setup.receive_memfd(SHARED_BUFFER_POOL_SIZE, None)?;
@@ -779,12 +809,17 @@ mod tests {
                         format!("invalid test control ring: {error:?}"),
                     )
                 })?;
-                let (call_channel, notifications, _shutdown) =
+                let (call_channel, notifications, shutdown) =
                     setup.into_active(control_ring, || {})?;
-                Ok((call_channel, Arc::new(shared_memory), notifications))
+                Ok((
+                    call_channel,
+                    Arc::new(shared_memory),
+                    (notifications, shutdown),
+                ))
             },
         )
-        .unwrap()
+        .unwrap();
+        (local, notifications, shutdown)
     }
 
     /// One association served by `dispatch_requests` exactly as production serves it.
@@ -795,9 +830,11 @@ mod tests {
     /// publisher that fails immediately cannot race activation.
     fn spawn_dispatch(
         readiness: Arc<ReadinessPublisherRuntime>,
+        stdio_provider: Arc<dyn StdioProvider>,
     ) -> (
         litebox_broker_local::BrokerLocal<UnixControlRingLocalCallChannel>,
         UnixControlRingLocalNotificationChannel,
+        UnixControlRingLocalShutdown,
         Receiver<IoResult<()>>,
         std::thread::JoinHandle<()>,
     ) {
@@ -808,8 +845,8 @@ mod tests {
             let broker = BrokerCore::new(
                 PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()),
                 Arc::new(UnsupportedSocketProvider),
-                Arc::new(UserlandRandomProvider),
-                Arc::new(UserlandStdioProvider),
+                Arc::new(random::UserlandRandomProvider),
+                stdio_provider,
             )
             .unwrap();
             let shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();
@@ -847,9 +884,54 @@ mod tests {
                 ))
                 .unwrap();
         });
-        let (local, notifications) = negotiate_local(local_stream);
+        let (local, notifications, shutdown) = negotiate_local(local_stream);
         start.send(()).unwrap();
-        (local, notifications, outcome, host)
+        (local, notifications, shutdown, outcome, host)
+    }
+
+    struct BlockingStdioProvider {
+        started: SyncSender<()>,
+    }
+
+    impl BlockingStdioProvider {
+        fn block_until_cancelled(
+            &self,
+            cancellation: &AssociationCancellation,
+        ) -> Result<usize, StdioProviderError> {
+            self.started.send(()).unwrap();
+            while !cancellation.is_cancelled() {
+                std::thread::sleep(TEST_CANCELLATION_POLL_INTERVAL);
+            }
+            Err(StdioProviderError::Closed)
+        }
+    }
+
+    impl StdioProvider for BlockingStdioProvider {
+        fn read(
+            &self,
+            cancellation: &AssociationCancellation,
+            _output: &mut [u8],
+        ) -> Result<usize, StdioProviderError> {
+            self.block_until_cancelled(cancellation)
+        }
+
+        fn write(
+            &self,
+            cancellation: &AssociationCancellation,
+            _stream: StdioOutputStream,
+            _input: &[u8],
+        ) -> Result<usize, StdioProviderError> {
+            self.block_until_cancelled(cancellation)
+        }
+    }
+
+    struct RecordingShutdown(Arc<AtomicBool>);
+
+    impl HostAssociationShutdown for RecordingShutdown {
+        fn shutdown(&self) -> IoResult<()> {
+            self.0.store(true, Ordering::Release);
+            Ok(())
+        }
     }
 
     #[test]
@@ -988,6 +1070,35 @@ mod tests {
     }
 
     #[test]
+    fn a_stalled_request_queue_fails_after_its_deadline() {
+        let request = |request_id| BrokerRequest {
+            request_id: RequestId(request_id),
+            operation: BrokerOperation::FillRandom(SharedBufferDescriptor {
+                slot_index: SharedBufferSlotIndex(0),
+                length: 1,
+            }),
+        };
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+        let failure_coordinator =
+            HostAssociationFailureCoordinator::new(RecordingShutdown(Arc::clone(&shutdown_called)));
+        let (request_sender, _request_receiver) = sync_channel(1);
+        request_sender.send(request(1)).unwrap();
+
+        assert!(!enqueue_request(
+            &request_sender,
+            request(2),
+            &failure_coordinator,
+            Duration::ZERO,
+        ));
+
+        assert!(shutdown_called.load(Ordering::Acquire));
+        assert_eq!(
+            failure_coordinator.take_error().unwrap().kind(),
+            ErrorKind::TimedOut
+        );
+    }
+
+    #[test]
     fn dispatching_requests_publishes_readiness_until_the_association_ends() {
         use litebox_broker_protocol::ObjectHandle;
         use litebox_broker_protocol::message::ReadinessNotification;
@@ -997,7 +1108,8 @@ mod tests {
         const HANDLE: ObjectHandle = ObjectHandle(11);
         let expected = ReadinessFlags::READ | ReadinessFlags::WRITE;
         let readiness = Arc::new(ReadinessPublisherRuntime::new());
-        let (local, mut notifications, outcome, host) = spawn_dispatch(Arc::clone(&readiness));
+        let (local, mut notifications, _shutdown, outcome, host) =
+            spawn_dispatch(Arc::clone(&readiness), Arc::new(UnsupportedStdioProvider));
 
         readiness.publish(HANDLE, expected).unwrap();
 
@@ -1042,13 +1154,79 @@ mod tests {
 
         // The local half stays connected and idle, so nothing but the panic can
         // release the request reader that owns association termination.
-        let (local, _notifications, outcome, host) = spawn_dispatch(Arc::clone(&readiness));
+        let (local, _notifications, _shutdown, outcome, host) =
+            spawn_dispatch(Arc::clone(&readiness), Arc::new(UnsupportedStdioProvider));
         let error = outcome
             .recv_timeout(SETUP_TIMEOUT)
             .expect("a panicking publisher must end dispatch")
             .expect_err("a panicking publisher must fail the association");
         assert_eq!(error.to_string(), "broker readiness publisher panicked");
         drop(local);
+        host.join().unwrap();
+    }
+
+    #[test]
+    fn association_teardown_cancels_a_blocked_stdin_read() {
+        let readiness = Arc::new(ReadinessPublisherRuntime::new());
+        let (started_sender, started_receiver) = sync_channel(1);
+        let provider = Arc::new(BlockingStdioProvider {
+            started: started_sender,
+        });
+        let (local, notifications, shutdown, outcome, host) = spawn_dispatch(readiness, provider);
+        let reader = std::thread::spawn(move || {
+            local.read_stdio(
+                SharedBufferDescriptor {
+                    slot_index: SharedBufferSlotIndex(0),
+                    length: 1,
+                },
+                &mut [0],
+            )
+        });
+        started_receiver
+            .recv_timeout(SETUP_TIMEOUT)
+            .expect("broker stdin provider did not start reading");
+
+        shutdown.shutdown().unwrap();
+        drop(notifications);
+
+        let dispatch_result = outcome
+            .recv_timeout(SETUP_TIMEOUT)
+            .expect("association teardown did not cancel the stdin read");
+        assert!(dispatch_result.is_err());
+        assert!(reader.join().unwrap().is_err());
+        host.join().unwrap();
+    }
+
+    #[test]
+    fn association_teardown_cancels_a_blocked_stdout_write() {
+        let readiness = Arc::new(ReadinessPublisherRuntime::new());
+        let (started_sender, started_receiver) = sync_channel(1);
+        let provider = Arc::new(BlockingStdioProvider {
+            started: started_sender,
+        });
+        let (local, notifications, shutdown, outcome, host) = spawn_dispatch(readiness, provider);
+        let writer = std::thread::spawn(move || {
+            local.write_stdio(
+                StdioOutputStream::Stdout,
+                SharedBufferDescriptor {
+                    slot_index: SharedBufferSlotIndex(0),
+                    length: 1,
+                },
+                b"x",
+            )
+        });
+        started_receiver
+            .recv_timeout(SETUP_TIMEOUT)
+            .expect("broker stdout provider did not start writing");
+
+        shutdown.shutdown().unwrap();
+        drop(notifications);
+
+        let dispatch_result = outcome
+            .recv_timeout(SETUP_TIMEOUT)
+            .expect("association teardown did not cancel the stdout write");
+        assert!(dispatch_result.is_err());
+        assert!(writer.join().unwrap().is_err());
         host.join().unwrap();
     }
 }

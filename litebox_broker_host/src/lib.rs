@@ -46,7 +46,8 @@ use litebox_broker_protocol::socket::{
     SendSocketResponse, SendToSocketResponse, SocketOutcome,
 };
 use litebox_broker_protocol::stdio::{
-    MAX_STDIO_TRANSFER_SIZE, WriteStdioRequest, WriteStdioResponse,
+    MAX_STDIO_TRANSFER_SIZE, ReadStdioRequest, ReadStdioResponse, WriteStdioRequest,
+    WriteStdioResponse,
 };
 use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, RequestId};
 use litebox_broker_transport::channel::{HostReceive, HostSetupChannel, PeerCredential};
@@ -80,6 +81,11 @@ struct AssociationState {
 }
 
 impl<Memory: SharedMemory> BrokerHostAssociation<'_, Memory> {
+    /// Requests cancellation of provider operations after the peer disconnects.
+    pub fn request_cancellation(&self) {
+        self.session.request_cancellation();
+    }
+
     /// Executes one active request and emits its response.
     ///
     /// Any fatal broker or response-channel error permanently fails this
@@ -95,14 +101,17 @@ impl<Memory: SharedMemory> BrokerHostAssociation<'_, Memory> {
             operation,
         } = request;
         let buffer_descriptor = match &operation {
-            BrokerOperation::FillRandom(buffer) => Some(*buffer),
             BrokerOperation::Pipe(PipeRequest::Read(request)) => Some(request.buffer),
             BrokerOperation::Pipe(PipeRequest::Write(request)) => Some(request.buffer),
             BrokerOperation::Socket(SocketRequest::Send(request)) => Some(request.buffer),
             BrokerOperation::Socket(SocketRequest::SendTo(request)) => Some(request.buffer),
             BrokerOperation::Socket(SocketRequest::Receive(request)) => Some(request.buffer),
             BrokerOperation::Socket(SocketRequest::ReceiveFrom(request)) => Some(request.buffer),
-            BrokerOperation::Stdio(StdioRequest::Write(request)) => Some(request.buffer),
+            BrokerOperation::FillRandom(buffer)
+            | BrokerOperation::Stdio(
+                StdioRequest::Read(ReadStdioRequest { buffer })
+                | StdioRequest::Write(WriteStdioRequest { buffer, .. }),
+            ) => Some(*buffer),
             BrokerOperation::CloseObject(_)
             | BrokerOperation::CheckReadiness(_)
             | BrokerOperation::Event(_)
@@ -386,6 +395,23 @@ fn handle_stdio_request<Memory: SharedMemory>(
     shared_buffers: &SharedBufferPool<Memory>,
 ) -> RequestResult<StdioResponse> {
     match request {
+        StdioRequest::Read(ReadStdioRequest { buffer }) => {
+            if buffer.length > MAX_STDIO_TRANSFER_SIZE {
+                return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
+            }
+            let mut data = Vec::new();
+            data.try_reserve_exact(buffer.length as usize)
+                .map_err(|_| RequestFailure::Respond(ErrorCode::OutOfMemory))?;
+            data.resize(buffer.length as usize, 0);
+            let read = litebox_broker_core::stdio::read(session, &mut data)
+                .map_err(RequestFailure::from)?;
+            shared_buffers
+                .write(buffer.slot_index, &data[..read])
+                .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
+            Ok(StdioResponse::Read(ReadStdioResponse {
+                read: u32::try_from(read).expect("validated stdio read length must fit in u32"),
+            }))
+        }
         StdioRequest::Write(WriteStdioRequest { stream, buffer }) => {
             if buffer.length > MAX_STDIO_TRANSFER_SIZE {
                 return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
@@ -752,7 +778,9 @@ mod tests {
         PlatformSocketStatus, PlatformStreamReceive, SocketProvider,
     };
     use litebox_broker_core::stdio::{StdioProvider, StdioProviderError};
-    use litebox_broker_core::{ObjectRights, PolicyEngine, SessionId, SocketPolicy};
+    use litebox_broker_core::{
+        AssociationCancellation, ObjectRights, PolicyEngine, SessionId, SocketPolicy,
+    };
     use litebox_broker_protocol::event::{
         AddEventRequest, ConsumeEventRequest, CreateEventRequest, EventConsumeMode,
     };
@@ -774,6 +802,7 @@ mod tests {
     use litebox_broker_protocol::stdio::StdioOutputStream;
     use litebox_broker_protocol::{ObjectHandle, ProtocolVersion, RequestId};
     use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemoryError};
+    use std::collections::VecDeque;
     use std::sync::{Arc, Condvar, Mutex, mpsc};
     use std::time::Duration;
 
@@ -843,12 +872,27 @@ mod tests {
 
     #[derive(Default)]
     struct TestStdioProvider {
+        input: Mutex<VecDeque<u8>>,
         writes: Mutex<Vec<(StdioOutputStream, Vec<u8>)>>,
     }
 
     impl StdioProvider for TestStdioProvider {
+        fn read(
+            &self,
+            _cancellation: &AssociationCancellation,
+            output: &mut [u8],
+        ) -> core::result::Result<usize, StdioProviderError> {
+            let mut input = self.input.lock().unwrap();
+            let read = input.len().min(output.len());
+            for (destination, source) in output.iter_mut().zip(input.drain(..read)) {
+                *destination = source;
+            }
+            Ok(read)
+        }
+
         fn write(
             &self,
+            _cancellation: &AssociationCancellation,
             stream: StdioOutputStream,
             input: &[u8],
         ) -> core::result::Result<usize, StdioProviderError> {
@@ -1101,6 +1145,61 @@ mod tests {
         shared_buffers
             .write(SharedBufferSlotIndex(7), b"error")
             .unwrap();
+        provider.input.lock().unwrap().extend(b"input");
+
+        assert_eq!(
+            handle_test_request_with_buffers(
+                &session,
+                BrokerOperation::Stdio(StdioRequest::Read(ReadStdioRequest {
+                    buffer: descriptor(6, 3),
+                })),
+                &shared_buffers,
+            ),
+            BrokerResult::Stdio(StdioResponse::Read(ReadStdioResponse { read: 3 }))
+        );
+        let mut input = [0u8; 3];
+        shared_buffers
+            .read(SharedBufferSlotIndex(6), &mut input)
+            .unwrap();
+        assert_eq!(&input, b"inp");
+
+        shared_buffers
+            .write(SharedBufferSlotIndex(6), &[0xa5; 4])
+            .unwrap();
+        assert_eq!(
+            handle_test_request_with_buffers(
+                &session,
+                BrokerOperation::Stdio(StdioRequest::Read(ReadStdioRequest {
+                    buffer: descriptor(6, 4),
+                })),
+                &shared_buffers,
+            ),
+            BrokerResult::Stdio(StdioResponse::Read(ReadStdioResponse { read: 2 }))
+        );
+        let mut partial_input = [0u8; 4];
+        shared_buffers
+            .read(SharedBufferSlotIndex(6), &mut partial_input)
+            .unwrap();
+        assert_eq!(&partial_input, b"ut\xa5\xa5");
+
+        shared_buffers
+            .write(SharedBufferSlotIndex(6), &[0xa5; 4])
+            .unwrap();
+        assert_eq!(
+            handle_test_request_with_buffers(
+                &session,
+                BrokerOperation::Stdio(StdioRequest::Read(ReadStdioRequest {
+                    buffer: descriptor(6, 4),
+                })),
+                &shared_buffers,
+            ),
+            BrokerResult::Stdio(StdioResponse::Read(ReadStdioResponse { read: 0 }))
+        );
+        let mut eof_input = [0u8; 4];
+        shared_buffers
+            .read(SharedBufferSlotIndex(6), &mut eof_input)
+            .unwrap();
+        assert_eq!(eof_input, [0xa5; 4]);
 
         assert_eq!(
             handle_test_request_with_buffers(
@@ -1122,6 +1221,17 @@ mod tests {
                 &session,
                 BrokerOperation::Stdio(StdioRequest::Write(WriteStdioRequest {
                     stream: StdioOutputStream::Stdout,
+                    buffer: descriptor(7, MAX_STDIO_TRANSFER_SIZE + 1),
+                })),
+                &shared_buffers,
+                &test_readiness_sink(),
+            ),
+            Err(RequestFailure::Abort(ErrorCode::MalformedRequest))
+        );
+        assert_eq!(
+            handle_request(
+                &session,
+                BrokerOperation::Stdio(StdioRequest::Read(ReadStdioRequest {
                     buffer: descriptor(7, MAX_STDIO_TRANSFER_SIZE + 1),
                 })),
                 &shared_buffers,

@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 use alloc::{sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::event::EventObject;
 use crate::pipe::PipeObject;
@@ -31,6 +31,24 @@ pub enum CallerCredential {
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SessionId(pub u64);
+
+/// Cancellation state shared by potentially blocking operations in one broker
+/// association.
+#[derive(Debug, Default)]
+pub struct AssociationCancellation {
+    cancelled: AtomicBool,
+}
+
+impl AssociationCancellation {
+    /// Returns whether the broker association is ending.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
 
 bitflags::bitflags! {
     /// Broker rights attached to an object reference.
@@ -77,6 +95,8 @@ pub struct BrokerSession {
     references: Mutex<SessionReferences>,
     /// Socket quota held by pending, live, and closing in-flight resources.
     pub(crate) reserved_sockets: Arc<AtomicUsize>,
+    /// Cancellation state for potentially blocking operations in this session.
+    pub(crate) cancellation: AssociationCancellation,
 }
 
 impl BrokerSession {
@@ -95,7 +115,14 @@ impl BrokerSession {
                 pending_handles: 0,
             }),
             reserved_sockets: Arc::new(AtomicUsize::new(0)),
+            cancellation: AssociationCancellation::default(),
         }
+    }
+
+    /// Requests cooperative cancellation of potentially blocking operations
+    /// because this association is ending.
+    pub fn request_cancellation(&self) {
+        self.cancellation.cancel();
     }
 
     pub(crate) fn create_object_reference(&self, object: ObjectEntry) -> Result<ObjectHandle> {

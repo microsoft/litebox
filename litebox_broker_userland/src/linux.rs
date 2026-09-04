@@ -26,6 +26,7 @@ use super::{
     HostAssociationShutdown, HostRequestSource, HostResponseSink, SETUP_TIMEOUT,
     configured_socket_policy,
 };
+use super::{random::UserlandRandomProvider, stdio::UserlandStdioProvider};
 
 const PROXY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -79,8 +80,8 @@ pub(super) fn run(mut args: super::CliArgs) -> Result<(), Box<dyn Error>> {
             limits.max_sockets,
             limits.max_sockets_per_session,
         )?),
-        Arc::new(super::UserlandRandomProvider),
-        Arc::new(super::UserlandStdioProvider),
+        Arc::new(UserlandRandomProvider),
+        Arc::new(UserlandStdioProvider::new()?),
     )?;
 
     crate::run_runner_process(

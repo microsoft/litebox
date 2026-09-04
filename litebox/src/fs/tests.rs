@@ -1946,7 +1946,7 @@ mod overlay {
 mod stdio {
     use crate::LiteBox;
     use crate::fs::devices::Devices;
-    use crate::fs::errors::WriteError;
+    use crate::fs::errors::{ReadError, WriteError};
     use crate::fs::resolver::Resolver;
     use crate::fs::{Mode, OFlags};
     use crate::platform::mock::MockPlatform;
@@ -1954,7 +1954,7 @@ mod stdio {
     extern crate std;
 
     #[test]
-    fn stdio_open_read_without_brokered_output() {
+    fn stdio_requires_broker() {
         let platform = MockPlatform::new();
         let litebox = LiteBox::new(platform);
         let fs = Resolver::new(
@@ -1998,12 +1998,16 @@ mod stdio {
         let fd_stdin = fs
             .open("/dev/stdin", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open /dev/stdin");
+        assert!(matches!(fs.read(&fd_stdin, &mut [], None), Ok(0)));
         let mut buffer = vec![0; 13];
-        let bytes_read = fs
-            .read(&fd_stdin, &mut buffer, None)
-            .expect("Failed to read from /dev/stdin");
-        assert_eq!(bytes_read, 13);
-        assert_eq!(&buffer, b"Hello, stdin!");
+        assert!(matches!(
+            fs.read(&fd_stdin, &mut buffer, None),
+            Err(ReadError::Io)
+        ));
+        assert_eq!(
+            platform.stdin_queue.read().unwrap().front().unwrap(),
+            b"Hello, stdin!"
+        );
         fs.close(&fd_stdin).expect("Failed to close /dev/stdin");
     }
 
@@ -2033,7 +2037,7 @@ mod composed_stdio {
     use crate::LiteBox;
     use crate::fs::composer::Composer;
     use crate::fs::devices::Devices;
-    use crate::fs::errors::WriteError;
+    use crate::fs::errors::{ReadError, WriteError};
     use crate::fs::in_mem::{InMem, InitialNode};
     use crate::fs::resolver::Resolver;
     use crate::fs::{Mode, OFlags, UserInfo};
@@ -2063,7 +2067,7 @@ mod composed_stdio {
     }
 
     #[test]
-    fn stdio_open_read_without_brokered_output() {
+    fn stdio_requires_broker() {
         let platform = MockPlatform::new();
         let litebox = LiteBox::new(platform);
         let fs = composed_fs(&litebox);
@@ -2101,11 +2105,16 @@ mod composed_stdio {
         let fd_stdin = fs
             .open("/dev/stdin", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open /dev/stdin");
+        assert!(matches!(fs.read(&fd_stdin, &mut [], None), Ok(0)));
         let mut buffer = vec![0; 1024];
-        let bytes_read = fs
-            .read(&fd_stdin, &mut buffer, None)
-            .expect("Failed to read from /dev/stdin");
-        assert_eq!(&buffer[..bytes_read], b"Hello, composed stdin!");
+        assert!(matches!(
+            fs.read(&fd_stdin, &mut buffer, None),
+            Err(ReadError::Io)
+        ));
+        assert_eq!(
+            platform.stdin_queue.read().unwrap().front().unwrap(),
+            b"Hello, composed stdin!"
+        );
         fs.close(&fd_stdin).expect("Failed to close /dev/stdin");
     }
 
