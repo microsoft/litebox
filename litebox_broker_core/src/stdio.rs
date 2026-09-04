@@ -22,6 +22,16 @@ pub enum StdioProviderError {
     Unsupported,
 }
 
+impl From<StdioProviderError> for BrokerError {
+    fn from(error: StdioProviderError) -> Self {
+        match error {
+            StdioProviderError::Closed => Self::PeerClosed,
+            StdioProviderError::Failed => Self::Internal,
+            StdioProviderError::Unsupported => Self::UnsupportedOperation,
+        }
+    }
+}
+
 /// Trusted provider of standard-I/O operations.
 pub trait StdioProvider: Send + Sync {
     /// Blocks until bytes can be read from standard input, returning zero at
@@ -80,8 +90,7 @@ pub fn read(session: &BrokerSession, output: &mut [u8]) -> Result<usize> {
     let read = session
         .core
         .stdio_provider
-        .read(&session.cancellation, output)
-        .map_err(map_provider_error)?;
+        .read(&session.cancellation, output)?;
     if read > output.len() {
         return Err(BrokerError::Internal);
     }
@@ -99,18 +108,9 @@ pub fn write(session: &BrokerSession, stream: StdioOutputStream, input: &[u8]) -
     let written = session
         .core
         .stdio_provider
-        .write(&session.cancellation, stream, input)
-        .map_err(map_provider_error)?;
+        .write(&session.cancellation, stream, input)?;
     if written > input.len() {
         return Err(BrokerError::Internal);
     }
     Ok(written)
-}
-
-fn map_provider_error(error: StdioProviderError) -> BrokerError {
-    match error {
-        StdioProviderError::Closed => BrokerError::PeerClosed,
-        StdioProviderError::Failed => BrokerError::Internal,
-        StdioProviderError::Unsupported => BrokerError::UnsupportedOperation,
-    }
 }
