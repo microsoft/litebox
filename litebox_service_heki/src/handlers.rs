@@ -403,7 +403,7 @@ impl<P: Vtl0Gate> Heki<P> {
         let _patch_guard = self
             .module_memory_metadata
             .has_init_patch_targets(token)
-            .then(|| self.text_patch_lock.lock());
+            .then(|| self.text_patch_lock.read());
         let mut result: Result<(), VsmError> = Ok(());
         if let Some(entry) = self.module_memory_metadata.iter_entry(token) {
             for mod_mem_range in entry.iter_mem_ranges() {
@@ -451,7 +451,7 @@ impl<P: Vtl0Gate> Heki<P> {
             .module_memory_metadata
             .get_patch_targets(token)
             .unwrap_or_default();
-        let _patch_guard = (!patch_targets.is_empty()).then(|| self.text_patch_lock.lock());
+        let _patch_guard = (!patch_targets.is_empty()).then(|| self.text_patch_lock.read());
         if let Some(entry) = self.module_memory_metadata.iter_entry(token) {
             for mod_mem_range in entry.iter_mem_ranges() {
                 self.gate.unprotect_frames(mod_mem_range.phys_frame_range)?;
@@ -617,7 +617,7 @@ impl<P: Vtl0Gate> Heki<P> {
 
         // Linux normally serializes `text_poke_bp_batch()` with its global `text_mutex`.
         // Untrusted VTL0 can violate this for corruption, so enforce serialization here.
-        let _patch_guard = self.text_patch_lock.lock();
+        let _patch_guard = self.text_patch_lock.write();
         let precomputed_patch = self
             .find_precomputed_patch(&heki_patch)
             .ok_or(VsmError::PrecomputedPatchNotFound)?;

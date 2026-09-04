@@ -51,7 +51,7 @@ pub struct Heki<P: Vtl0Gate> {
     pub(crate) kexec_metadata: KexecMemoryMetadataWrapper,
     pub(crate) crash_kexec_metadata: KexecMemoryMetadataWrapper,
     pub(crate) precomputed_patches: PatchDataMap,
-    pub(crate) text_patch_lock: spin::mutex::SpinMutex<()>,
+    pub(crate) text_patch_lock: spin::rwlock::RwLock<()>,
     pub(crate) symbols: SymbolTable,
     pub(crate) gpl_symbols: SymbolTable,
     // TODO: revocation cert, blocklist, etc.
@@ -70,7 +70,7 @@ impl<P: Vtl0Gate> Heki<P> {
             kexec_metadata: KexecMemoryMetadataWrapper::new(),
             crash_kexec_metadata: KexecMemoryMetadataWrapper::new(),
             precomputed_patches: PatchDataMap::new(),
-            text_patch_lock: spin::mutex::SpinMutex::new(()),
+            text_patch_lock: spin::rwlock::RwLock::new(()),
             symbols: SymbolTable::new(),
             gpl_symbols: SymbolTable::new(),
         }
