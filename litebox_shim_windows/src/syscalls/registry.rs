@@ -84,6 +84,7 @@ pub(crate) struct RegistryKeyObject<Platform: crate::ShimPlatform> {
 
 pub(crate) struct RegistryStore<Platform: crate::ShimPlatform> {
     fs: RegistryFileSystem<Platform>,
+    fs_context: litebox::fs::resolver::Context,
     notification_state: Mutex<Platform, RegistryNotificationState>,
     notification_pollee: Pollee<Platform>,
 }
@@ -627,6 +628,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
                 .build()
                 .unwrap(),
         );
+        let fs_context = litebox::fs::resolver::Context::new();
         {
             let fs = &fs;
             for key in [
@@ -642,7 +644,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
                 DEFAULT_WINSOCK_NAMESPACE_CATALOG_KEY,
                 DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY,
             ] {
-                if let Err(status) = create_key_in_fs(fs, key) {
+                if let Err(status) = create_key_in_fs(fs, &fs_context, key) {
                     litebox_util_log::error!(key:% = key, status:? = status; "failed to initialize registry key");
                     break;
                 }
@@ -654,6 +656,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
             ] {
                 if let Err(status) = write_value_in_fs(
                     fs,
+                    &fs_context,
                     DEFAULT_CODE_PAGE_KEY,
                     name,
                     RegistryValueType::Sz,
@@ -781,7 +784,9 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
                 ));
             }
             for (key, name, value_type, value) in winsock_values {
-                if let Err(status) = write_value_in_fs(fs, key, name, value_type, &value) {
+                if let Err(status) =
+                    write_value_in_fs(fs, &fs_context, key, name, value_type, &value)
+                {
                     litebox_util_log::error!(name:% = name, status:? = status; "failed to initialize Winsock registry value");
                     break;
                 }
@@ -789,6 +794,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         }
         Self {
             fs,
+            fs_context,
             notification_state: Mutex::new(RegistryNotificationState::default()),
             notification_pollee: Pollee::new(),
         }
@@ -800,7 +806,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         desired_access: RegistryKeyAccess,
     ) -> Result<TypedFd<RegistryFileSystem<Platform>>, NtStatus> {
         self.fs
-            .open(path, desired_access.into(), Mode::empty())
+            .open(&self.fs_context, path, desired_access.into(), Mode::empty())
             .map_err(map_open_error)
     }
 
@@ -812,7 +818,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         let value_path = value_path(key_path, value_name)?;
         let status = self
             .fs
-            .file_status(&*value_path)
+            .file_status(&self.fs_context, &*value_path)
             .map_err(map_file_status_error)?;
         if status.file_type != FileType::RegularFile {
             return Err(NtStatus::OBJECT_TYPE_MISMATCH);
@@ -823,7 +829,12 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
 
         let fd = self
             .fs
-            .open(&*value_path, OFlags::RDONLY, Mode::empty())
+            .open(
+                &self.fs_context,
+                &*value_path,
+                OFlags::RDONLY,
+                Mode::empty(),
+            )
             .map_err(map_open_error)?;
         let mut data = vec![0; status.size];
         let read = self
@@ -852,7 +863,14 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         value_type: u32,
         value: &[u8],
     ) -> Result<(), NtStatus> {
-        write_value_at_path(&self.fs, key_path, value_name, value_type, value)?;
+        write_value_at_path(
+            &self.fs,
+            &self.fs_context,
+            key_path,
+            value_name,
+            value_type,
+            value,
+        )?;
         self.record_change(key_path, RegistryNotifyFilter::LAST_SET);
         Ok(())
     }
@@ -934,6 +952,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         let values_fd = self
             .fs
             .open(
+                &self.fs_context,
                 &*values_path,
                 OFlags::RDONLY | OFlags::DIRECTORY,
                 Mode::empty(),
@@ -952,7 +971,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
             let path = format!("{values_path}/{}", entry.name);
             let size = self
                 .fs
-                .file_status(&*path)
+                .file_status(&self.fs_context, &*path)
                 .map_err(map_file_status_error)?
                 .size;
             if size < REGISTRY_VALUE_TYPE_SIZE {
@@ -1000,6 +1019,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         let child_fd = self
             .fs
             .open(
+                &self.fs_context,
                 &*child_path,
                 OFlags::RDONLY | OFlags::DIRECTORY,
                 Mode::empty(),
@@ -1029,6 +1049,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         let values_fd = self
             .fs
             .open(
+                &self.fs_context,
                 &*values_path,
                 OFlags::RDONLY | OFlags::DIRECTORY,
                 Mode::empty(),
@@ -1216,7 +1237,12 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         object_attributes: ObjectAttributes,
     ) -> Result<(Handle, RegistryKeyDisposition), NtStatus> {
         let path = self.registry_key_path(object_attributes)?;
-        let disposition = match self.global.registry.fs.file_status(&path) {
+        let disposition = match self
+            .global
+            .registry
+            .fs
+            .file_status(&self.global.registry.fs_context, &path)
+        {
             Ok(status) if status.file_type == FileType::Directory => {
                 RegistryKeyDisposition::OpenedExistingKey
             }
@@ -1224,7 +1250,11 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             Err(FileStatusError::PathError(
                 PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
             )) => {
-                for created_path in create_key_path_in_fs(&self.global.registry.fs, &path)? {
+                for created_path in create_key_path_in_fs(
+                    &self.global.registry.fs,
+                    &self.global.registry.fs_context,
+                    &path,
+                )? {
                     self.global.registry.record_key_created(&created_path);
                 }
                 RegistryKeyDisposition::CreatedNewKey
@@ -2206,17 +2236,19 @@ fn is_valid_key_component(component: &str) -> bool {
 
 fn write_value_in_fs<Platform: crate::ShimPlatform>(
     fs: &RegistryFileSystem<Platform>,
+    context: &litebox::fs::resolver::Context,
     key_nt_path: &str,
     value_name: &str,
     value_type: RegistryValueType,
     value: &[u8],
 ) -> Result<(), NtStatus> {
-    let key_path = create_key_in_fs(fs, key_nt_path)?;
-    write_value_at_path(fs, &key_path, value_name, value_type.into(), value)
+    let key_path = create_key_in_fs(fs, context, key_nt_path)?;
+    write_value_at_path(fs, context, &key_path, value_name, value_type.into(), value)
 }
 
 fn write_value_at_path<Platform: crate::ShimPlatform>(
     fs: &RegistryFileSystem<Platform>,
+    context: &litebox::fs::resolver::Context,
     key_path: &str,
     value_name: &str,
     value_type: u32,
@@ -2225,6 +2257,7 @@ fn write_value_at_path<Platform: crate::ShimPlatform>(
     let value_path = value_path(key_path, value_name)?;
     let fd = fs
         .open(
+            context,
             &*value_path,
             OFlags::CREAT | OFlags::WRONLY | OFlags::TRUNC,
             Mode::RUSR | Mode::WUSR | Mode::ROTH | Mode::WOTH,
@@ -2248,15 +2281,17 @@ fn write_value_at_path<Platform: crate::ShimPlatform>(
 
 fn create_key_in_fs<Platform: crate::ShimPlatform>(
     fs: &RegistryFileSystem<Platform>,
+    context: &litebox::fs::resolver::Context,
     nt_path: &str,
 ) -> Result<String, NtStatus> {
     let path = absolute_nt_key_name_to_fs_path(nt_path)?;
-    create_key_path_in_fs(fs, &path)?;
+    create_key_path_in_fs(fs, context, &path)?;
     Ok(path)
 }
 
 fn create_key_path_in_fs<Platform: crate::ShimPlatform>(
     fs: &RegistryFileSystem<Platform>,
+    context: &litebox::fs::resolver::Context,
     path: &str,
 ) -> Result<Vec<String>, NtStatus> {
     let mut current = String::new();
@@ -2267,28 +2302,30 @@ fn create_key_path_in_fs<Platform: crate::ShimPlatform>(
         }
         current.push('/');
         current.push_str(component);
-        if ensure_directory_in_fs(fs, &current)? {
+        if ensure_directory_in_fs(fs, context, &current)? {
             created_keys.push(current.clone());
         }
 
         let mut values_dir = current.clone();
         values_dir.push('/');
         values_dir.push_str(VALUES_DIR_NAME);
-        ensure_directory_in_fs(fs, &values_dir)?;
+        ensure_directory_in_fs(fs, context, &values_dir)?;
     }
     Ok(created_keys)
 }
 
 fn ensure_directory_in_fs<Platform: crate::ShimPlatform>(
     fs: &RegistryFileSystem<Platform>,
+    context: &litebox::fs::resolver::Context,
     path: &str,
 ) -> Result<bool, NtStatus> {
-    match fs.file_status(path) {
+    match fs.file_status(context, path) {
         Ok(status) if status.file_type == FileType::Directory => Ok(false),
         Ok(_) => Err(NtStatus::OBJECT_TYPE_MISMATCH),
         Err(FileStatusError::PathError(
             PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
         )) => match fs.mkdir(
+            context,
             path,
             Mode::RUSR | Mode::WUSR | Mode::XUSR | Mode::ROTH | Mode::WOTH | Mode::XOTH,
         ) {
@@ -2634,11 +2671,19 @@ mod tests {
         let value_path = value_path(&key_path, "ACP").unwrap();
 
         assert_eq!(
-            registry.fs.file_status(&*value_path).unwrap().file_type,
+            registry
+                .fs
+                .file_status(&registry.fs_context, &*value_path)
+                .unwrap()
+                .file_type,
             FileType::RegularFile
         );
         assert_eq!(
-            registry.fs.file_status(&*value_path).unwrap().size,
+            registry
+                .fs
+                .file_status(&registry.fs_context, &*value_path)
+                .unwrap()
+                .size,
             REGISTRY_VALUE_TYPE_SIZE + DEFAULT_ACP_VALUE.len()
         );
         let value = registry.read_value_at_path(&key_path, "ACP").unwrap();
@@ -3141,11 +3186,20 @@ mod tests {
     fn nt_open_key_checks_backing_fs_permissions() {
         let task = crate::tests::test_task();
         let private_key = "\\Registry\\Machine\\Software\\Private";
-        let private_path = create_key_in_fs(&task.global.registry.fs, private_key).unwrap();
+        let private_path = create_key_in_fs(
+            &task.global.registry.fs,
+            &task.global.registry.fs_context,
+            private_key,
+        )
+        .unwrap();
         task.global
             .registry
             .fs
-            .chmod(&*private_path, Mode::WUSR | Mode::XUSR)
+            .chmod(
+                &task.global.registry.fs_context,
+                &*private_path,
+                Mode::WUSR | Mode::XUSR,
+            )
             .unwrap();
 
         let private_name = utf16(private_key);

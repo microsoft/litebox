@@ -283,7 +283,14 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
         let files = syscalls::file::FilesState::new(fs);
         files.set_max_fd(syscalls::process::RLIMIT_NOFILE_CUR);
         let files = Arc::new(files);
-        files.initialize_stdio_in_shared_descriptors_table(&self.0);
+        let credentials = Arc::new(syscalls::process::Credentials {
+            uid,
+            euid,
+            gid,
+            egid,
+        });
+        let fs_state = Arc::new(syscalls::file::FsState::new(&credentials));
+        files.initialize_stdio_in_shared_descriptors_table(&self.0, &fs_state.context.read());
 
         let entrypoints = crate::LinuxShimEntrypoints {
             _not_send: core::marker::PhantomData,
@@ -294,15 +301,9 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
                 pid,
                 ppid,
                 tid: pid,
-                credentials: syscalls::process::Credentials {
-                    uid,
-                    euid,
-                    gid,
-                    egid,
-                }
-                .into(),
+                credentials,
                 comm: [0; litebox_common_linux::TASK_COMM_LEN].into(), // set at load time
-                fs: Arc::new(syscalls::file::FsState::new()).into(),
+                fs: fs_state.into(),
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
             },
@@ -402,19 +403,23 @@ fn default_fs<Platform: ShimPlatform>(
 pub(crate) struct StdioStatusFlags(litebox::fs::OFlags);
 
 impl<Platform: ShimPlatform> syscalls::file::FilesState<Platform> {
-    fn initialize_stdio_in_shared_descriptors_table(&self, global: &GlobalState<Platform>) {
+    fn initialize_stdio_in_shared_descriptors_table(
+        &self,
+        global: &GlobalState<Platform>,
+        context: &litebox::fs::resolver::Context,
+    ) {
         use litebox::fs::{Mode, OFlags};
         let stdin = self
             .fs
-            .open("/dev/stdin", OFlags::RDONLY, Mode::empty())
+            .open(context, "/dev/stdin", OFlags::RDONLY, Mode::empty())
             .unwrap();
         let stdout = self
             .fs
-            .open("/dev/stdout", OFlags::WRONLY, Mode::empty())
+            .open(context, "/dev/stdout", OFlags::WRONLY, Mode::empty())
             .unwrap();
         let stderr = self
             .fs
-            .open("/dev/stderr", OFlags::WRONLY, Mode::empty())
+            .open(context, "/dev/stderr", OFlags::WRONLY, Mode::empty())
             .unwrap();
         let mut dt = global.litebox.descriptor_table_mut();
         let mut rds = self.raw_descriptor_store.write();
@@ -1236,21 +1241,23 @@ mod test_utils {
                 .next_thread_id
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             let files = Arc::new(syscalls::file::FilesState::new(fs));
-            files.initialize_stdio_in_shared_descriptors_table(&self);
+            let credentials = Arc::new(syscalls::process::Credentials {
+                uid: 0,
+                euid: 0,
+                gid: 0,
+                egid: 0,
+            });
+            let fs_state = Arc::new(syscalls::file::FsState::new(&credentials));
+            files.initialize_stdio_in_shared_descriptors_table(&self, &fs_state.context.read());
             Task {
                 wait_state: wait::WaitState::new(self.platform),
                 thread: syscalls::process::ThreadState::new_process(pid),
                 pid,
                 ppid: 0,
                 tid: pid,
-                credentials: Arc::new(syscalls::process::Credentials {
-                    uid: 0,
-                    euid: 0,
-                    gid: 0,
-                    egid: 0,
-                }),
+                credentials,
                 comm: Cell::new(*b"test\0\0\0\0\0\0\0\0\0\0\0\0"),
-                fs: Arc::new(syscalls::file::FsState::new()).into(),
+                fs: fs_state.into(),
                 files: files.into(),
                 signals: syscalls::signal::SignalState::new_process(),
                 global: self,
