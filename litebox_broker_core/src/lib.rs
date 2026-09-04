@@ -42,7 +42,9 @@ pub use policy::{
 };
 use random::RandomProvider;
 use session::ObjectReference;
-pub use session::{BrokerSession, CallerCredential, ObjectRights, SessionId};
+pub use session::{
+    AssociationCancellation, BrokerSession, CallerCredential, ObjectRights, SessionId,
+};
 use socket::{BrokerSocketPorts, SocketProvider};
 use stdio::StdioProvider;
 

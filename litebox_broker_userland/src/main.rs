@@ -18,10 +18,10 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use litebox_broker_core::random::{RandomProvider, RandomProviderError};
-use litebox_broker_core::stdio::{StdioProvider, StdioProviderError, StdioReadCancellation};
+use litebox_broker_core::stdio::{StdioProvider, StdioProviderError};
 use litebox_broker_core::{
-    BrokerCore, CallerCredential, DestinationPortRange, DestinationRule, Ipv4Cidr, SocketPolicy,
-    SocketPolicyError,
+    AssociationCancellation, BrokerCore, CallerCredential, DestinationPortRange, DestinationRule,
+    Ipv4Cidr, SocketPolicy, SocketPolicyError,
 };
 use litebox_broker_host::{BrokerHostAssociation, ConnectionTermination, setup_connection};
 use litebox_broker_protocol::message::{BrokerRequest, BrokerResponse};
@@ -41,7 +41,8 @@ mod windows;
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(10);
-const STDIN_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const STDIO_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const STDIO_WRITE_RETRY_DELAY: Duration = Duration::from_millis(1);
 const REQUEST_QUEUE_CAPACITY: usize = 64;
 const REQUEST_QUEUE_RETRY_DELAY: Duration = Duration::from_millis(1);
 const REQUEST_QUEUE_STALL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -62,6 +63,8 @@ impl RandomProvider for UserlandRandomProvider {
 /// endpoints instead of sharing process-wide standard streams.
 struct UserlandStdioProvider {
     stdin: Mutex<UserlandStdin>,
+    stdout: SyncSender<StdioWriteRequest>,
+    stderr: SyncSender<StdioWriteRequest>,
 }
 
 struct UserlandStdin {
@@ -76,18 +79,33 @@ enum StdinReadResult {
     Error(StdioProviderError),
 }
 
+struct StdioWriteRequest {
+    input: Vec<u8>,
+    completion: SyncSender<Result<usize, StdioProviderError>>,
+}
+
 impl UserlandStdioProvider {
     fn new() -> IoResult<Self> {
-        let (sender, receiver) = sync_channel(1);
+        let (stdin_sender, stdin_receiver) = sync_channel(1);
         std::thread::Builder::new()
             .name("litebox-broker-stdin".to_owned())
-            .spawn(move || pump_stdin(sender))?;
+            .spawn(move || pump_stdin(stdin_sender))?;
+        let (stdout, stdout_receiver) = sync_channel(WORKER_COUNT);
+        std::thread::Builder::new()
+            .name("litebox-broker-stdout".to_owned())
+            .spawn(move || pump_stdout(stdout_receiver))?;
+        let (stderr, stderr_receiver) = sync_channel(WORKER_COUNT);
+        std::thread::Builder::new()
+            .name("litebox-broker-stderr".to_owned())
+            .spawn(move || pump_stderr(stderr_receiver))?;
         Ok(Self {
             stdin: Mutex::new(UserlandStdin {
-                receiver,
+                receiver: stdin_receiver,
                 buffered: VecDeque::new(),
                 eof: false,
             }),
+            stdout,
+            stderr,
         })
     }
 }
@@ -95,7 +113,7 @@ impl UserlandStdioProvider {
 impl StdioProvider for UserlandStdioProvider {
     fn read(
         &self,
-        cancellation: &StdioReadCancellation,
+        cancellation: &AssociationCancellation,
         output: &mut [u8],
     ) -> Result<usize, StdioProviderError> {
         if output.is_empty() {
@@ -119,7 +137,7 @@ impl StdioProvider for UserlandStdioProvider {
             if stdin.eof {
                 return Ok(0);
             }
-            match stdin.receiver.recv_timeout(STDIN_CANCEL_POLL_INTERVAL) {
+            match stdin.receiver.recv_timeout(STDIO_CANCEL_POLL_INTERVAL) {
                 Ok(StdinReadResult::Data(data)) => stdin.buffered.extend(data),
                 Ok(StdinReadResult::Eof) => stdin.eof = true,
                 Ok(StdinReadResult::Error(error)) => return Err(error),
@@ -129,12 +147,46 @@ impl StdioProvider for UserlandStdioProvider {
         }
     }
 
-    fn write(&self, stream: StdioOutputStream, input: &[u8]) -> Result<usize, StdioProviderError> {
-        let result = match stream {
-            StdioOutputStream::Stdout => write_and_flush(std::io::stdout().lock(), input),
-            StdioOutputStream::Stderr => write_and_flush(std::io::stderr().lock(), input),
+    fn write(
+        &self,
+        cancellation: &AssociationCancellation,
+        stream: StdioOutputStream,
+        input: &[u8],
+    ) -> Result<usize, StdioProviderError> {
+        let sender = match stream {
+            StdioOutputStream::Stdout => &self.stdout,
+            StdioOutputStream::Stderr => &self.stderr,
         };
-        result.map_err(map_stdio_error)
+        let (completion, completed) = sync_channel(1);
+        let mut request = StdioWriteRequest {
+            input: input.to_vec(),
+            completion,
+        };
+        loop {
+            if cancellation.is_cancelled() {
+                return Err(StdioProviderError::Closed);
+            }
+            match sender.try_send(request) {
+                Ok(()) => break,
+                Err(TrySendError::Full(pending)) => request = pending,
+                Err(TrySendError::Disconnected(_)) => {
+                    return Err(StdioProviderError::Failed);
+                }
+            }
+            std::thread::sleep(STDIO_WRITE_RETRY_DELAY);
+        }
+        loop {
+            match completed.recv_timeout(STDIO_CANCEL_POLL_INTERVAL) {
+                Ok(result) => return result,
+                Err(RecvTimeoutError::Timeout) if cancellation.is_cancelled() => {
+                    return Err(StdioProviderError::Closed);
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(StdioProviderError::Failed);
+                }
+            }
+        }
     }
 }
 
@@ -152,6 +204,21 @@ fn pump_stdin(sender: SyncSender<StdinReadResult>) {
         if sender.send(result).is_err() || finished {
             return;
         }
+    }
+}
+
+fn pump_stdout(receiver: Receiver<StdioWriteRequest>) {
+    pump_output(std::io::stdout(), receiver);
+}
+
+fn pump_stderr(receiver: Receiver<StdioWriteRequest>) {
+    pump_output(std::io::stderr(), receiver);
+}
+
+fn pump_output(mut output: impl std::io::Write, receiver: Receiver<StdioWriteRequest>) {
+    while let Ok(request) = receiver.recv() {
+        let result = write_and_flush(&mut output, &request.input).map_err(map_stdio_error);
+        let _ = request.completion.send(result);
     }
 }
 
@@ -751,13 +818,36 @@ fn main() {}
 mod cli_tests {
     use super::*;
 
+    #[derive(Default)]
+    struct RecordingOutput {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        flushes: Arc<Mutex<usize>>,
+    }
+
+    impl std::io::Write for RecordingOutput {
+        fn write(&mut self, input: &[u8]) -> IoResult<usize> {
+            let written = input.len().min(3);
+            self.bytes.lock().unwrap().extend(&input[..written]);
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> IoResult<()> {
+            *self.flushes.lock().unwrap() += 1;
+            Ok(())
+        }
+    }
+
     fn test_stdio_provider(receiver: Receiver<StdinReadResult>) -> UserlandStdioProvider {
+        let (stdout, _stdout_receiver) = sync_channel(1);
+        let (stderr, _stderr_receiver) = sync_channel(1);
         UserlandStdioProvider {
             stdin: Mutex::new(UserlandStdin {
                 receiver,
                 buffered: VecDeque::new(),
                 eof: false,
             }),
+            stdout,
+            stderr,
         }
     }
 
@@ -837,7 +927,7 @@ mod cli_tests {
             .unwrap();
         sender.send(StdinReadResult::Eof).unwrap();
         let provider = test_stdio_provider(receiver);
-        let cancellation = StdioReadCancellation::default();
+        let cancellation = AssociationCancellation::default();
 
         let mut first = [0xa5; 3];
         assert_eq!(provider.read(&cancellation, &mut first), Ok(3));
@@ -847,6 +937,43 @@ mod cli_tests {
         assert_eq!(provider.read(&cancellation, &mut second), Ok(2));
         assert_eq!(&second, b"ut\xa5\xa5");
         assert_eq!(provider.read(&cancellation, &mut second), Ok(0));
+    }
+
+    #[test]
+    fn stdio_provider_waits_for_output_write_and_flush() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let flushes = Arc::new(Mutex::new(0));
+        let (stdout, stdout_receiver) = sync_channel(1);
+        let output = RecordingOutput {
+            bytes: Arc::clone(&bytes),
+            flushes: Arc::clone(&flushes),
+        };
+        let writer = std::thread::spawn(move || pump_output(output, stdout_receiver));
+        let (_stdin_sender, stdin_receiver) = sync_channel(1);
+        let (stderr, _stderr_receiver) = sync_channel(1);
+        let provider = UserlandStdioProvider {
+            stdin: Mutex::new(UserlandStdin {
+                receiver: stdin_receiver,
+                buffered: VecDeque::new(),
+                eof: false,
+            }),
+            stdout,
+            stderr,
+        };
+
+        assert_eq!(
+            provider.write(
+                &AssociationCancellation::default(),
+                StdioOutputStream::Stdout,
+                b"prompt",
+            ),
+            Ok(3)
+        );
+
+        drop(provider);
+        writer.join().unwrap();
+        assert_eq!(*bytes.lock().unwrap(), b"pro");
+        assert_eq!(*flushes.lock().unwrap(), 1);
     }
 }
 
@@ -1048,22 +1175,42 @@ mod tests {
     impl StdioProvider for BlockingStdioProvider {
         fn read(
             &self,
-            cancellation: &StdioReadCancellation,
+            cancellation: &AssociationCancellation,
             _output: &mut [u8],
         ) -> Result<usize, StdioProviderError> {
             self.started.send(()).unwrap();
             while !cancellation.is_cancelled() {
-                std::thread::sleep(STDIN_CANCEL_POLL_INTERVAL);
+                std::thread::sleep(STDIO_CANCEL_POLL_INTERVAL);
             }
             Err(StdioProviderError::Closed)
         }
 
         fn write(
             &self,
+            _cancellation: &AssociationCancellation,
             _stream: StdioOutputStream,
             _input: &[u8],
         ) -> Result<usize, StdioProviderError> {
             Err(StdioProviderError::Unsupported)
+        }
+    }
+
+    struct BlockingWriteStdioProvider {
+        started: SyncSender<()>,
+    }
+
+    impl StdioProvider for BlockingWriteStdioProvider {
+        fn write(
+            &self,
+            cancellation: &AssociationCancellation,
+            _stream: StdioOutputStream,
+            _input: &[u8],
+        ) -> Result<usize, StdioProviderError> {
+            self.started.send(()).unwrap();
+            while !cancellation.is_cancelled() {
+                std::thread::sleep(STDIO_CANCEL_POLL_INTERVAL);
+            }
+            Err(StdioProviderError::Closed)
         }
     }
 
@@ -1336,6 +1483,39 @@ mod tests {
             .expect("association teardown did not cancel the stdin read");
         assert!(dispatch_result.is_err());
         assert!(reader.join().unwrap().is_err());
+        host.join().unwrap();
+    }
+
+    #[test]
+    fn association_teardown_cancels_a_blocked_stdout_write() {
+        let readiness = Arc::new(ReadinessPublisherRuntime::new());
+        let (started_sender, started_receiver) = sync_channel(1);
+        let provider = Arc::new(BlockingWriteStdioProvider {
+            started: started_sender,
+        });
+        let (local, notifications, shutdown, outcome, host) = spawn_dispatch(readiness, provider);
+        let writer = std::thread::spawn(move || {
+            local.write_stdio(
+                StdioOutputStream::Stdout,
+                SharedBufferDescriptor {
+                    slot_index: SharedBufferSlotIndex(0),
+                    length: 1,
+                },
+                b"x",
+            )
+        });
+        started_receiver
+            .recv_timeout(SETUP_TIMEOUT)
+            .expect("broker stdout provider did not start writing");
+
+        shutdown.shutdown().unwrap();
+        drop(notifications);
+
+        let dispatch_result = outcome
+            .recv_timeout(SETUP_TIMEOUT)
+            .expect("association teardown did not cancel the stdout write");
+        assert!(dispatch_result.is_err());
+        assert!(writer.join().unwrap().is_err());
         host.join().unwrap();
     }
 }

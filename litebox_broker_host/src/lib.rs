@@ -83,7 +83,7 @@ struct AssociationState {
 impl<Memory: SharedMemory> BrokerHostAssociation<'_, Memory> {
     /// Cancels provider operations that may block after the peer disconnects.
     pub fn cancel_pending_requests(&self) {
-        litebox_broker_core::stdio::cancel_pending_reads(&self.session);
+        self.session.cancel_pending_operations();
     }
 
     /// Executes one active request and emits its response.
@@ -777,8 +777,10 @@ mod tests {
         AcceptedPlatformSocket, PlatformConnectError, PlatformDatagramReceive, PlatformSocket,
         PlatformSocketStatus, PlatformStreamReceive, SocketProvider,
     };
-    use litebox_broker_core::stdio::{StdioProvider, StdioProviderError, StdioReadCancellation};
-    use litebox_broker_core::{ObjectRights, PolicyEngine, SessionId, SocketPolicy};
+    use litebox_broker_core::stdio::{StdioProvider, StdioProviderError};
+    use litebox_broker_core::{
+        AssociationCancellation, ObjectRights, PolicyEngine, SessionId, SocketPolicy,
+    };
     use litebox_broker_protocol::event::{
         AddEventRequest, ConsumeEventRequest, CreateEventRequest, EventConsumeMode,
     };
@@ -877,7 +879,7 @@ mod tests {
     impl StdioProvider for TestStdioProvider {
         fn read(
             &self,
-            _cancellation: &StdioReadCancellation,
+            _cancellation: &AssociationCancellation,
             output: &mut [u8],
         ) -> core::result::Result<usize, StdioProviderError> {
             let mut input = self.input.lock().unwrap();
@@ -890,6 +892,7 @@ mod tests {
 
         fn write(
             &self,
+            _cancellation: &AssociationCancellation,
             stream: StdioOutputStream,
             input: &[u8],
         ) -> core::result::Result<usize, StdioProviderError> {
