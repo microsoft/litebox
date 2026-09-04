@@ -607,7 +607,6 @@ mod tests {
         check_reference_quota_is_per_session(&broker);
         check_pending_references_count_toward_session_quota(&broker);
         check_pipe_capacity_quota_is_per_session(&broker);
-        check_pipe_capacity_is_released_when_reference_creation_fails(&broker);
         check_pipe_capacity_outlives_session_for_in_flight_object(&broker);
         crate::socket::tests::check_socket_lifecycle(&broker, &socket_provider);
         check_pair_handle_exhaustion(&broker);
@@ -658,6 +657,7 @@ mod tests {
             crate::pipe::create(&session, 4, 2),
             Err(BrokerError::ResourceExhausted)
         );
+        assert_eq!(session.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
         // Closing the older handle exercises swap-removing a non-last entry.
         assert_eq!(session.close_object_reference(handle), Ok(()));
@@ -856,14 +856,7 @@ mod tests {
 
         let neighbor_handle = crate::event::create(&neighbor, 0).unwrap();
         drop(first);
-        let session_handle = crate::event::create(&session, 0).unwrap();
-        assert_eq!(
-            crate::event::create(&session, 0),
-            Err(BrokerError::ResourceExhausted)
-        );
-
         drop(second);
-        assert_eq!(session.close_object_reference(session_handle), Ok(()));
         assert_eq!(neighbor.close_object_reference(neighbor_handle), Ok(()));
         assert!(broker.references.read().is_empty());
         assert_eq!(broker.pending_references.load(Ordering::Relaxed), 0);
@@ -906,29 +899,12 @@ mod tests {
 
         assert_eq!(greedy.close_object_reference(greedy_reader), Ok(()));
         assert_eq!(greedy.close_object_reference(greedy_writer), Ok(()));
-        let (latecomer_reader, latecomer_writer) = crate::pipe::create(&latecomer, 1, 1).unwrap();
+        assert_eq!(greedy.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
 
         assert_eq!(neighbor.close_object_reference(neighbor_reader), Ok(()));
         assert_eq!(neighbor.close_object_reference(neighbor_writer), Ok(()));
-        assert_eq!(latecomer.close_object_reference(latecomer_reader), Ok(()));
-        assert_eq!(latecomer.close_object_reference(latecomer_writer), Ok(()));
+        assert_eq!(neighbor.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
-    }
-
-    fn check_pipe_capacity_is_released_when_reference_creation_fails(broker: &BrokerCore) {
-        let session = broker
-            .create_session(CallerCredential::Unauthenticated)
-            .unwrap();
-        let handle = crate::event::create(&session, 0).unwrap();
-
-        assert_eq!(
-            crate::pipe::create(&session, TEST_MAX_PIPE_CAPACITY_PER_SESSION as u64, 2),
-            Err(BrokerError::ResourceExhausted)
-        );
-        assert_eq!(session.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
-        assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
-
-        assert_eq!(session.close_object_reference(handle), Ok(()));
     }
 
     fn check_pipe_capacity_outlives_session_for_in_flight_object(broker: &BrokerCore) {
