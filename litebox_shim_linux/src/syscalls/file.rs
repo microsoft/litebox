@@ -753,7 +753,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         self.global
                             .litebox
                             .descriptor_table_mut()
-                            .set_fd_metadata(fd, Diroff(new_pos));
+                            .set_entry_metadata(fd, Diroff(new_pos));
                         Ok(new_pos)
                     }
                     Err(e) => Err(Errno::from(e)),
@@ -2776,7 +2776,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .global
                     .litebox
                     .descriptor_table_mut()
-                    .set_fd_metadata(file, Diroff(dir_off));
+                    .set_entry_metadata(file, Diroff(dir_off));
                 Ok(nbytes)
             },
             |_fd| Err(Errno::ENOTDIR),
