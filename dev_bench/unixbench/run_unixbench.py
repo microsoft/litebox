@@ -572,10 +572,9 @@ def find_litebox_binaries(
     """Find pre-built litebox binaries without building."""
     build_type = "release" if release else "debug"
     runner = workspace_root / "target" / build_type / "litebox_runner_linux_userland"
-    broker = workspace_root / "target" / build_type / "litebox-broker-userland"
     packager = workspace_root / "target" / build_type / "litebox_packager"
     return (
-        runner if runner.exists() and broker.exists() else None,
+        runner if runner.exists() else None,
         packager if packager.exists() else None,
     )
 
@@ -611,7 +610,8 @@ def main():
     )
     parser.add_argument(
         "--runner-path", type=str, default=None,
-        help="Path to litebox_runner_linux_userland binary (auto-detected if not given)",
+        help="Path to the LiteBox runner binary; litebox-broker-userland must be beside it "
+             "(auto-detected if not given)",
     )
     parser.add_argument(
         "--packager-path", type=str, default=None,
@@ -732,6 +732,22 @@ def main():
             runner_path, packager_path = build_litebox_binaries(
                 workspace_root, args.release,
             )
+
+        if not runner_path.exists():
+            print(f"Error: LiteBox runner not found at {runner_path}")
+            sys.exit(1)
+        broker_name = (
+            "litebox-broker-userland.exe"
+            if is_windows_mode
+            else "litebox-broker-userland"
+        )
+        broker_path = runner_path.with_name(broker_name)
+        if not broker_path.exists():
+            print(f"Error: LiteBox broker not found at {broker_path}")
+            print("Build it beside the runner:")
+            print("  cargo build -p litebox_broker_userland"
+                  + (" --release" if args.release else ""))
+            sys.exit(1)
 
     # Working directory
     if args.work_dir:

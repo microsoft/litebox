@@ -29,7 +29,11 @@ fn run_rewritten_fixture(source: &str, unique_name: &str) -> std::process::Outpu
         command
     };
     #[cfg(not(target_os = "linux"))]
-    let mut command = std::process::Command::new(binary_path);
+    let mut command = {
+        let mut command = std::process::Command::new(binary_path);
+        command.arg("--unstable");
+        command
+    };
 
     command
         .args(["--rewrite-syscalls"])

@@ -60,8 +60,8 @@ struct UserlandStdioProvider;
 impl StdioProvider for UserlandStdioProvider {
     fn write(&self, stream: StdioOutputStream, input: &[u8]) -> Result<usize, StdioProviderError> {
         let result = match stream {
-            StdioOutputStream::Stdout => std::io::stdout().write(input),
-            StdioOutputStream::Stderr => std::io::stderr().write(input),
+            StdioOutputStream::Stdout => write_and_flush(std::io::stdout().lock(), input),
+            StdioOutputStream::Stderr => write_and_flush(std::io::stderr().lock(), input),
         };
         result.map_err(|error| {
             if error.kind() == ErrorKind::BrokenPipe {
@@ -71,6 +71,12 @@ impl StdioProvider for UserlandStdioProvider {
             }
         })
     }
+}
+
+fn write_and_flush(mut output: impl std::io::Write, input: &[u8]) -> IoResult<usize> {
+    let written = output.write(input)?;
+    output.flush()?;
+    Ok(written)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

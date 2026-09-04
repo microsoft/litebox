@@ -130,8 +130,8 @@ This creates `dev_bench/unixbench/prepared/` containing:
 Build the Windows runner, then run benchmarks using the prepared artifacts:
 
 ```powershell
-# Build the Windows runner
-cargo build -p litebox_runner_linux_on_windows_userland --release
+# Build the Windows runner and broker
+cargo build -p litebox_runner_linux_on_windows_userland -p litebox_broker_userland --release
 
 # Run benchmarks
 python run_unixbench.py --mode litebox --windows --prepared-dir ./prepared --release
