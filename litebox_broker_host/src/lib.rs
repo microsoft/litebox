@@ -81,9 +81,9 @@ struct AssociationState {
 }
 
 impl<Memory: SharedMemory> BrokerHostAssociation<'_, Memory> {
-    /// Cancels provider operations that may block after the peer disconnects.
-    pub fn cancel_pending_requests(&self) {
-        self.session.cancel_pending_operations();
+    /// Requests cancellation of provider operations after the peer disconnects.
+    pub fn request_cancellation(&self) {
+        self.session.request_cancellation();
     }
 
     /// Executes one active request and emits its response.

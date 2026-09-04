@@ -119,9 +119,9 @@ impl BrokerSession {
         }
     }
 
-    /// Cancels potentially blocking operations because this association is
-    /// ending.
-    pub fn cancel_pending_operations(&self) {
+    /// Requests cooperative cancellation of potentially blocking operations
+    /// because this association is ending.
+    pub fn request_cancellation(&self) {
         self.cancellation.cancel();
     }
 

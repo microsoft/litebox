@@ -535,14 +535,14 @@ impl<Shutdown: HostAssociationShutdown> Drop for ReadinessPublicationGuard<'_, S
     }
 }
 
-/// Cancels blocking provider work before an association scope joins its workers.
-struct PendingRequestCancellationGuard<'association, 'memory, Memory: SharedMemory> {
+/// Requests cancellation before an association scope joins its workers.
+struct AssociationCancellationGuard<'association, 'memory, Memory: SharedMemory> {
     association: &'association BrokerHostAssociation<'memory, Memory>,
 }
 
-impl<Memory: SharedMemory> Drop for PendingRequestCancellationGuard<'_, '_, Memory> {
+impl<Memory: SharedMemory> Drop for AssociationCancellationGuard<'_, '_, Memory> {
     fn drop(&mut self) {
-        self.association.cancel_pending_requests();
+        self.association.request_cancellation();
     }
 }
 
@@ -605,7 +605,7 @@ where
             readiness: &readiness,
             failure_coordinator: &failure_coordinator,
         };
-        let pending_requests = PendingRequestCancellationGuard {
+        let cancellation = AssociationCancellationGuard {
             association: &association,
         };
 
@@ -634,7 +634,7 @@ where
         }
 
         read_requests(&mut request_source, request_sender, &failure_coordinator);
-        drop(pending_requests);
+        drop(cancellation);
         for worker in workers {
             if worker.join().is_err() {
                 failure_coordinator.report(IoError::other("broker request worker panicked"));
