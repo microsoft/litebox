@@ -8,14 +8,16 @@
 
 extern crate alloc;
 
+use alloc::vec::Vec;
 use core::mem;
 use litebox::utils::TruncateExt;
 use litebox_common_linux::errno::Errno;
+use litebox_common_linux::vmap::PhysPageAddr;
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 use thiserror::Error;
 use x86_64::{
     PhysAddr, VirtAddr,
-    structures::paging::{PageSize, Size4KiB},
+    structures::paging::{PageSize, Size4KiB, frame::PhysFrameRange},
 };
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
@@ -49,6 +51,9 @@ pub const VSM_VTL_CALL_FUNC_ID_ALLOCATE_RINGBUFFER_MEMORY: u32 = 0x1_ffec;
 // This VSM function ID for setting the platform root key is subject to change
 pub const VSM_VTL_CALL_FUNC_ID_SET_PLATFORM_ROOT_KEY: u32 = 0x1_ffed;
 
+// This VSM function ID for generating the identity signing key is subject to change
+pub const VSM_VTL_CALL_FUNC_ID_GENERATE_IDENTITY_SIGNING_KEY: u32 = 0x1_ffee;
+
 // This VSM function ID for OP-TEE messages is subject to change
 pub const VSM_VTL_CALL_FUNC_ID_OPTEE_MESSAGE: u32 = 0x1_fff0;
 
@@ -72,6 +77,7 @@ pub enum VsmFunction {
     OpteeMessage = VSM_VTL_CALL_FUNC_ID_OPTEE_MESSAGE,
     AllocateRingbufferMemory = VSM_VTL_CALL_FUNC_ID_ALLOCATE_RINGBUFFER_MEMORY,
     SetPlatformRootKey = VSM_VTL_CALL_FUNC_ID_SET_PLATFORM_ROOT_KEY,
+    GenerateIdentitySigningKey = VSM_VTL_CALL_FUNC_ID_GENERATE_IDENTITY_SIGNING_KEY,
 }
 
 // `HV_STATUS_*` constants used as discriminants for `HypervCallError`.
@@ -152,18 +158,14 @@ impl From<VerificationError> for Errno {
 }
 
 /// Errors for Virtual Secure Mode (VSM) operations.
+///
+/// TODO: split per layer, so the gates cannot name HEKI policy errors.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum VsmError {
     // Boot/AP Initialization Errors
-    #[error("failed to copy boot signal page from VTL0")]
-    BootSignalPageCopyFailed,
-
     #[error("failed to initialize AP: {0:?}")]
     ApInitFailed(HypervCallError),
-
-    #[error("failed to copy boot signal page to VTL0")]
-    BootSignalWriteFailed,
 
     #[error("failed to copy cpu_online_mask from VTL0")]
     CpuOnlineMaskCopyFailed,
@@ -275,9 +277,6 @@ pub enum VsmError {
     #[error("invalid virtual address")]
     InvalidVirtualAddress,
 
-    #[error("discontiguous memory range")]
-    DiscontiguousMemoryRange,
-
     // Symbol Table Errors
     #[error("symbol table data empty")]
     SymbolTableEmpty,
@@ -287,9 +286,6 @@ pub enum VsmError {
 
     #[error("symbol table length not aligned to symbol size")]
     SymbolTableLengthInvalid,
-
-    #[error("failed to parse symbol at offset {0:#x}")]
-    SymbolParseFailed(usize),
 
     #[error("symbol name offset out of bounds")]
     SymbolNameOffsetInvalid,
@@ -317,9 +313,6 @@ impl From<VsmError> for Errno {
             VsmError::InvalidInputAddress
             | VsmError::InvalidPhysicalAddress
             | VsmError::InvalidVirtualAddress
-            | VsmError::DiscontiguousMemoryRange
-            | VsmError::BootSignalPageCopyFailed
-            | VsmError::BootSignalWriteFailed
             | VsmError::CpuOnlineMaskCopyFailed
             | VsmError::HekiPagesCopyFailed
             | VsmError::Vtl0CopyFailed => Errno::EFAULT,
@@ -364,7 +357,6 @@ impl From<VsmError> for Errno {
             | VsmError::KexecImageSegmentsInvalid
             | VsmError::SymbolTableEmpty
             | VsmError::SymbolTableLengthInvalid
-            | VsmError::SymbolParseFailed(_)
             | VsmError::SymbolNameOffsetInvalid
             | VsmError::SymbolNameInvalidUtf8
             | VsmError::SymbolNameNoTerminator
@@ -839,4 +831,172 @@ impl HekiKernelInfo {
             })
         }
     }
+}
+
+/// The gate through which VTL1 acts on the untrusted VTL0. This is the
+/// capability the HEKI service runs on. Every operation here targets
+/// VTL0. VTL1's own setup operations live in [`Vtl1Gate`].
+///
+/// The platform owns the protected-frame registry (to deal with TOCTOU and
+/// confused deputy) and rejects use of this interface against VTL1 frames and
+/// protected VTL0 frames.
+pub trait Vtl0Gate {
+    /// Copy `out.len()` bytes out of VTL0 physical memory, starting at `offset`
+    /// within the first page of `pages`, into `out`. The pages need not be
+    /// physically contiguous; use [`Self::read_vtl0_contiguous`] when the source
+    /// is a single contiguous span.
+    fn read_vtl0_pages(
+        &self,
+        pages: &[PhysPageAddr<PAGE_SIZE>],
+        offset: usize,
+        out: &mut [u8],
+    ) -> Result<(), VsmError>;
+
+    /// Directly set VTL0 protection on a frame range — no reservation, no
+    /// rollback. Use when the caller already trusts the frames, or is
+    /// re-protecting frames the registry already owns.
+    fn protect_frames(
+        &self,
+        range: PhysFrameRange<Size4KiB>,
+        attr: MemAttr,
+    ) -> Result<(), VsmError>;
+
+    /// Release a frame range the registry currently protects, restoring VTL0
+    /// read/write access — the standalone inverse of [`Self::protect_frames`].
+    fn unprotect_frames(&self, range: PhysFrameRange<Size4KiB>) -> Result<(), VsmError>;
+
+    /// Run a reserve-then-commit transaction: reserve `initial` (claiming the
+    /// frames so VTL0 cannot alter them while the caller inspects their contents),
+    /// run `f` — which reads/checks the frames and protects them via the
+    /// [`FrameTxn`] handle — then commit on `Ok` or roll back (release every
+    /// reserved range) on `Err`. Use when protection must be atomic with a check
+    /// of the frame contents (TOCTOU-safe).
+    fn protect_frames_transactionally(
+        &self,
+        initial: &[PhysFrameRange<Size4KiB>],
+        f: &mut dyn FnMut(&mut dyn FrameTxn) -> Result<(), VsmError>,
+    ) -> Result<(), VsmError>;
+
+    /// Install a VTL0 physical buffer as the platform's log ring buffer.
+    fn install_ringbuffer(&self, pa: u64, size: u64);
+
+    /// Whether VTL0 has signalled end of boot, i.e., whether VTL1's window of
+    /// trusting VTL0 has closed. Operations that are only legitimate while VTL0
+    /// is still trusted must refuse once this returns `true`.
+    fn end_of_boot_reached(&self) -> bool;
+
+    /// Lock VTL0's control registers by arming the hypervisor CR/MSR intercepts
+    /// and snapshotting their current values into VTL1 per-CPU state.
+    fn lock_control_registers(&self) -> Result<(), VsmError>;
+
+    /// Read `out.len()` bytes from a contiguous VTL0 physical-memory span
+    /// starting at `phys_addr`, into `out`. The span may cross page boundaries;
+    /// the covered pages are required to be physically contiguous. Use
+    /// [`Self::read_vtl0_pages`] when they are not.
+    fn read_vtl0_contiguous(&self, phys_addr: u64, out: &mut [u8]) -> Result<(), VsmError> {
+        if out.is_empty() {
+            return Ok(());
+        }
+        let page_size = PAGE_SIZE as u64;
+        let start_page = phys_addr & !(page_size - 1);
+        let offset: usize = (phys_addr - start_page).trunc();
+        let end = phys_addr
+            .checked_add(out.len() as u64)
+            .ok_or(VsmError::IntegerOverflow)?;
+        let last_page = (end - 1) & !(page_size - 1);
+
+        let page_count = ((last_page - start_page) / page_size + 1).trunc();
+        let mut pages = Vec::with_capacity(page_count);
+        let mut p = start_page;
+        loop {
+            pages.push(
+                PhysPageAddr::<PAGE_SIZE>::new(p.trunc())
+                    .ok_or(VsmError::InvalidPhysicalAddress)?,
+            );
+            if p == last_page {
+                break;
+            }
+            p += page_size;
+        }
+        self.read_vtl0_pages(&pages, offset, out)
+    }
+
+    /// Read a `FromBytes` value out of a contiguous VTL0 physical span starting
+    /// at `phys_addr`.
+    fn read_vtl0_val<T: FromBytes>(&self, phys_addr: u64) -> Result<T, VsmError> {
+        let mut buf = alloc::vec![0u8; core::mem::size_of::<T>()];
+        self.read_vtl0_contiguous(phys_addr, &mut buf)?;
+        T::read_from_bytes(&buf).map_err(|_| VsmError::Vtl0CopyFailed)
+    }
+}
+
+/// Authority to write VTL0 memory with the VTL0 protection masks **bypassed**.
+///
+/// Deliberately not part of [`Vtl0Gate`]: it is strictly more dangerous than
+/// everything there, so it is granted per-operation rather than held ambiently.
+/// A holder of [`Vtl0Gate`] alone cannot bypass a protection mask.
+///
+/// The primitive trusts its holder and knows nothing about what is being
+/// written — whether the destination is legitimate is the grantee's business.
+pub trait Vtl0PrivilegedWrite {
+    /// Copy `bytes` into VTL0 physical memory, starting at `offset` within the
+    /// first page of `pages`, bypassing VTL0 protection masks. The pages need
+    /// not be physically contiguous.
+    fn write_vtl0_pages(
+        &self,
+        pages: &[PhysPageAddr<PAGE_SIZE>],
+        offset: usize,
+        bytes: &[u8],
+    ) -> Result<(), VsmError>;
+}
+
+/// VTL1 setup steps that VTL0 requests over a VTL call. All mutate VTL1/platform
+/// state rather than VTL0, so they are consumed by the runner and never by
+/// the HEKI service, which is handed only [`Vtl0Gate`].
+///
+/// [`Self::signal_end_of_boot`] is self-protection: it closes VTL1's window of
+/// trusting VTL0. The other half of VTL1 self-protection — locking VTL1's own
+/// memory away from VTL0 — happens during platform bring-up, before any gate
+/// exists, and so is not on this trait.
+pub trait Vtl1Gate {
+    /// Enable VTL1 on the APs named in the VTL0 `cpu_present_mask` page at
+    /// `cpu_present_mask_pfn`, ahead of [`Self::boot_aps`].
+    fn enable_aps_vtl(&self, cpu_present_mask_pfn: u64) -> Result<(), VsmError>;
+
+    /// Bring VTL1 up on every online AP named in the VTL0 `cpu_online_mask`
+    /// page at `cpu_online_mask_pfn`.
+    fn boot_aps(&self, cpu_online_mask_pfn: u64) -> Result<(), VsmError>;
+
+    /// Read the platform root key from VTL0 `key_pa` and store it in VTL1 state.
+    fn set_platform_root_key(&self, key_pa: u64) -> Result<(), VsmError>;
+
+    /// Close VTL1's window of trusting VTL0, making
+    /// [`Vtl0Gate::end_of_boot_reached`] report `true` from here on. One-way:
+    /// the window never reopens.
+    fn signal_end_of_boot(&self);
+}
+
+/// Outcome of reserving a physical frame range within a transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReservationStatus {
+    /// The range was newly reserved by this transaction.
+    New,
+    /// The range was already owned by the protected-frame registry.
+    AlreadyOwned,
+}
+
+/// Restricted handle for [`Vtl0Gate::protect_frames_transactionally`].
+///
+/// The only way to reserve/protect frames within a transaction; the concrete
+/// reservation guard stays private in the platform.
+pub trait FrameTxn {
+    /// Reserve the given physical frame ranges within this transaction,
+    /// returning the reservation status of each range.
+    fn reserve(
+        &mut self,
+        ranges: &[PhysFrameRange<Size4KiB>],
+    ) -> Result<Vec<ReservationStatus>, VsmError>;
+
+    /// Apply the given memory attributes to a reserved physical frame range.
+    fn protect(&mut self, range: PhysFrameRange<Size4KiB>, attr: MemAttr) -> Result<(), VsmError>;
 }

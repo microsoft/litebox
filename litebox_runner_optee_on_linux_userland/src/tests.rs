@@ -27,6 +27,9 @@ pub fn run_ta_with_test_commands(
         let json_str = std::fs::read_to_string(json_path).unwrap();
         serde_json::from_str(&json_str).unwrap()
     };
+    let ta_head =
+        litebox_common_optee::parse_ta_head(ta_bin).expect("Failed to parse TA header from ta_bin");
+    assert!(shim.store_ta_bin(&ta_head.uuid, ta_bin));
     let mut ta_info: Option<LoadedProgram> = None;
     // The active session id for the TA. Set at OpenSession and reused for the
     // subsequent InvokeCommand entries on the same persistent session.
@@ -52,8 +55,6 @@ pub fn run_ta_with_test_commands(
             continue;
         }
         if func_id == UteeEntryFunc::OpenSession {
-            let ta_head = litebox_common_optee::parse_ta_head(ta_bin)
-                .expect("Failed to parse TA header from ta_bin");
             let mut session_token = session_manager().try_acquire_open_session_token().unwrap();
             let open_session_id = session_token.session_id().unwrap();
             session_id = Some(open_session_id);
@@ -67,7 +68,7 @@ pub fn run_ta_with_test_commands(
             );
             session_manager().set_session_client_identity(open_session_id, Some(client_identity));
             let loaded = shim
-                .load_ldelf(ldelf_bin, ta_head.uuid, Some(ta_bin))
+                .load_ldelf(ldelf_bin, ta_head.uuid)
                 .map_err(|_| {
                     panic!("Failed to load TA");
                 })
@@ -310,7 +311,7 @@ impl TaCommandParamsBase64 {
                 value_b: *value_b,
             },
             TaCommandParamsBase64::MemrefInput { data_base64 } => UteeParamOwned::MemrefInput {
-                data: Self::decode_base64(data_base64).into_boxed_slice(),
+                data: Some(Self::decode_base64(data_base64).into_boxed_slice()),
             },
             TaCommandParamsBase64::MemrefOutput { buffer_size } => UteeParamOwned::MemrefOutput {
                 buffer_size: usize::try_from(*buffer_size).unwrap(),
@@ -326,7 +327,7 @@ impl TaCommandParamsBase64 {
                     "Buffer size is smaller than input data size"
                 );
                 UteeParamOwned::MemrefInout {
-                    data: decoded_data.into_boxed_slice(),
+                    data: Some(decoded_data.into_boxed_slice()),
                     buffer_size,
                 }
             }

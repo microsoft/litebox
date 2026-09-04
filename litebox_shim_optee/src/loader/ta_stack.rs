@@ -10,7 +10,7 @@ use litebox::{
 use litebox_common_optee::{LdelfArg, TeeParamType, UteeParamOwned, UteeParams};
 use zerocopy::IntoBytes;
 
-use crate::UserMutPtr;
+use crate::{Platform, TaMemrefAddresses, UserMutPtr, msg_handler::ShmInfo};
 
 #[inline]
 fn align_down(addr: usize, align: usize) -> usize {
@@ -185,34 +185,41 @@ impl TaStack {
         param_type: TeeParamType,
         bytes: Option<&[u8]>,
         len: usize,
-    ) -> Option<()> {
+    ) -> Option<usize> {
         if self.num_params >= UteeParams::TEE_NUM_PARAMS {
             return None;
         }
         match param_type {
             TeeParamType::MemrefInput | TeeParamType::MemrefInout => {
-                let bytes = bytes?;
+                let bytes = bytes.unwrap_or(&[]);
                 if len > bytes.len() {
                     self.pos = self.pos.checked_sub(len - bytes.len())?;
                 }
                 self.push_bytes(bytes)?;
-                self.params
-                    .set_values(self.num_params, self.get_cur_stack_top() as u64, len as u64)
-                    .ok()?;
             }
-            TeeParamType::MemrefOutput => {
-                self.pos = self.pos.checked_sub(len)?;
-                self.params
-                    .set_values(self.num_params, self.get_cur_stack_top() as u64, len as u64)
-                    .ok()?;
-            }
-            _ => {
-                return None;
-            }
+            TeeParamType::MemrefOutput => self.pos = self.pos.checked_sub(len)?,
+            _ => return None,
         }
+        let address = self.get_cur_stack_top();
+        self.params
+            .set_values(self.num_params, address as u64, len as u64)
+            .ok()?;
         self.params.set_type(self.num_params, param_type).ok()?;
         self.num_params += 1;
-        Some(())
+        Some(address)
+    }
+
+    fn push_param_memref_from_shm<const ALIGN: usize>(
+        &mut self,
+        param_type: TeeParamType,
+        shm_info: &ShmInfo<ALIGN>,
+        len: usize,
+    ) -> Option<usize> {
+        let address = self.push_param_memref(param_type, None, len)?;
+        shm_info
+            .copy_to_user(UserMutPtr::from_usize(address), len)
+            .ok()?;
+        Some(address)
     }
 
     /// Set `UteeParams` on the stack.
@@ -223,14 +230,20 @@ impl TaStack {
         Some(())
     }
 
-    pub(crate) fn init(&mut self, params: &[UteeParamOwned], stack_canary: [u8; 16]) -> Option<()> {
+    pub(crate) fn init<const ALIGN: usize>(
+        &mut self,
+        params: &[UteeParamOwned],
+        shm_info: &[Option<ShmInfo<ALIGN>>],
+        stack_canary: [u8; 16],
+    ) -> Option<TaMemrefAddresses> {
         if params.len() > UteeParams::TEE_NUM_PARAMS {
             return None;
         }
 
         self.scrub()?;
 
-        for param in params {
+        let mut memref_addresses = [None; UteeParams::TEE_NUM_PARAMS];
+        for (index, param) in params.iter().enumerate() {
             match param {
                 UteeParamOwned::ValueInput { value_a, value_b } => {
                     self.push_param_values(TeeParamType::ValueInput, Some((*value_a, *value_b)))?;
@@ -242,13 +255,37 @@ impl TaStack {
                     self.push_param_values(TeeParamType::ValueInout, Some((*value_a, *value_b)))?;
                 }
                 UteeParamOwned::MemrefInput { data } => {
-                    self.push_param_memref(TeeParamType::MemrefInput, Some(data), data.len())?;
+                    if let Some(shm_info) = shm_info.get(index).and_then(Option::as_ref) {
+                        let len = shm_info.len();
+                        self.push_param_memref_from_shm(TeeParamType::MemrefInput, shm_info, len)?;
+                    } else {
+                        let data = data.as_deref()?;
+                        self.push_param_memref(TeeParamType::MemrefInput, Some(data), data.len())?;
+                    }
                 }
                 UteeParamOwned::MemrefInout { data, buffer_size } => {
-                    self.push_param_memref(TeeParamType::MemrefInout, Some(data), *buffer_size)?;
+                    let address =
+                        if let Some(shm_info) = shm_info.get(index).and_then(Option::as_ref) {
+                            self.push_param_memref_from_shm(
+                                TeeParamType::MemrefInout,
+                                shm_info,
+                                *buffer_size,
+                            )?
+                        } else {
+                            self.push_param_memref(
+                                TeeParamType::MemrefInout,
+                                Some(data.as_deref()?),
+                                *buffer_size,
+                            )?
+                        };
+                    memref_addresses[index] = Some(address);
                 }
                 UteeParamOwned::MemrefOutput { buffer_size } => {
-                    self.push_param_memref(TeeParamType::MemrefOutput, None, *buffer_size)?;
+                    memref_addresses[index] = Some(self.push_param_memref(
+                        TeeParamType::MemrefOutput,
+                        None,
+                        *buffer_size,
+                    )?);
                 }
                 UteeParamOwned::None => self.push_param_none()?,
             }
@@ -266,7 +303,7 @@ impl TaStack {
             self.pos % Self::STACK_ALIGNMENT,
             core::mem::size_of::<usize>()
         );
-        Some(())
+        Some(memref_addresses)
     }
 
     pub(crate) fn init_with_ldelf_arg(&mut self, ldelf_arg: &LdelfArg) -> Option<()> {

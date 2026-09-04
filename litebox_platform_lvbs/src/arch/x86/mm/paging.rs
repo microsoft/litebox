@@ -609,7 +609,14 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                 flags
             };
             // Parent entries use a stable permissive constant, not leaf-derived flags.
-            let table_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+            //
+            // ACCESSED and DIRTY are pre-set here (mirroring the Linux kernel's
+            // `_KERNPG_TABLE`) so the CPU's page-table walker doesn't need an
+            // atomic read-modify-write on this entry the first time it's traversed.
+            let table_flags = PageTableFlags::PRESENT
+                | PageTableFlags::WRITABLE
+                | PageTableFlags::ACCESSED
+                | PageTableFlags::DIRTY;
 
             match unsafe {
                 inner.map_to_with_table_flags(
@@ -668,7 +675,13 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
             .map_err(|_| MapToError::FrameAllocationFailed)?;
         let end_page = start_page + frames.len() as u64;
 
-        let table_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+        // ACCESSED and DIRTY are pre-set here (mirroring the Linux kernel's
+        // `_KERNPG_TABLE`) so the CPU's page-table walker doesn't need an
+        // atomic read-modify-write on this entry the first time it's traversed.
+        let table_flags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::ACCESSED
+            | PageTableFlags::DIRTY;
         for (page, &target_frame) in Page::range(start_page, end_page).zip(frames.iter()) {
             // Note: Since we lock the entire page table for the duration of this function (`self.inner.lock()`),
             // there should be no concurrent modifications to the page table. If we allow concurrent mappings
@@ -890,9 +903,14 @@ impl<M: MemoryProvider, const ALIGN: usize> PageTableImpl<ALIGN> for X64PageTabl
                 let mut allocator = PageTableAllocator::<M>::new();
                 // TODO: if it is file-backed, we need to read the page from file
                 let frame = PageTableAllocator::<M>::allocate_frame(true).unwrap();
+                // ACCESSED and DIRTY are pre-set here (mirroring the Linux kernel's
+                // `_KERNPG_TABLE`) so the CPU's page-table walker doesn't need an
+                // atomic read-modify-write on this entry the first time it's traversed.
                 let table_flags = PageTableFlags::PRESENT
                     | PageTableFlags::WRITABLE
-                    | PageTableFlags::USER_ACCESSIBLE;
+                    | PageTableFlags::USER_ACCESSIBLE
+                    | PageTableFlags::ACCESSED
+                    | PageTableFlags::DIRTY;
                 match unsafe {
                     inner.map_to_with_table_flags(
                         page,

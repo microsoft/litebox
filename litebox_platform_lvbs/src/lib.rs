@@ -6,7 +6,8 @@
 #![cfg(target_arch = "x86_64")]
 #![no_std]
 
-use crate::{host::per_cpu_variables::PerCpuVariablesAsm, mshv::vsm::Vtl0KernelInfo};
+use crate::host::per_cpu_variables::{PerCpuVariablesAsm, with_per_cpu_variables};
+use alloc::sync::Arc;
 use core::sync::atomic::AtomicU32;
 use hashbrown::HashMap;
 use litebox::platform::{
@@ -147,6 +148,38 @@ const USER_ADDR_MAX: usize = 0x0000_7FFF_FFFF_F000;
 /// <https://cateee.net/lkddb/web-lkddb/LSM_MMAP_MIN_ADDR.html>
 const USER_ADDR_MIN: usize = 0x0000_0000_0001_0000;
 
+/// Provide access to a page table
+pub struct PageTableHandle<'a>(PageTableHandleInner<'a>);
+
+enum PageTableHandleInner<'a> {
+    Base(&'a mm::PageTable<PAGE_SIZE>),
+    Task(Arc<mm::PageTable<PAGE_SIZE>>),
+}
+
+impl<'a> PageTableHandle<'a> {
+    #[inline]
+    fn base(page_table: &'a mm::PageTable<PAGE_SIZE>) -> Self {
+        Self(PageTableHandleInner::Base(page_table))
+    }
+
+    #[inline]
+    fn task(page_table: Arc<mm::PageTable<PAGE_SIZE>>) -> Self {
+        Self(PageTableHandleInner::Task(page_table))
+    }
+}
+
+impl core::ops::Deref for PageTableHandle<'_> {
+    type Target = mm::PageTable<PAGE_SIZE>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        match &self.0 {
+            PageTableHandleInner::Base(page_table) => page_table,
+            PageTableHandleInner::Task(page_table) => page_table,
+        }
+    }
+}
+
 /// Manages base and task page tables.
 ///
 /// This struct maintains:
@@ -170,7 +203,7 @@ pub struct PageTableManager {
     /// Cached physical frame of the base page table (for fast CR3 comparison).
     base_page_table_frame: PhysFrame<Size4KiB>,
     /// Task page tables keyed by their P4 frame start address (the page table ID).
-    task_page_tables: spin::Mutex<HashMap<usize, alloc::boxed::Box<mm::PageTable<PAGE_SIZE>>>>,
+    task_page_tables: spin::RwLock<HashMap<usize, Arc<mm::PageTable<PAGE_SIZE>>>>,
 }
 
 impl PageTableManager {
@@ -185,46 +218,33 @@ impl PageTableManager {
         Self {
             base_page_table: base_pt,
             base_page_table_frame: base_frame,
-            task_page_tables: spin::Mutex::new(HashMap::new()),
+            task_page_tables: spin::RwLock::new(HashMap::new()),
         }
     }
 
-    /// Returns a reference to the current page table based on the CR3 register.
+    /// Returns a handle to the current page table.
     ///
-    /// This reads the current CR3 value and finds the matching page table.
-    /// If CR3 matches the base page table, returns that. Otherwise, it
-    /// looks up the task page table by physical frame.
+    /// This returns the base page table or the task page table retained by the
+    /// current core.
     ///
     /// # Panics
     ///
-    /// Panics if CR3 contains an unknown page table address (should never happen
-    /// in normal operation).
+    /// Panics if CR3 does not match the current core's retained page table.
     #[inline]
-    pub fn current_page_table(&self) -> &mm::PageTable<PAGE_SIZE> {
+    pub fn current_page_table(&self) -> PageTableHandle<'_> {
         let (cr3_frame, _) = x86_64::registers::control::Cr3::read();
 
-        // Fast path: check base page table first (most common case)
         if self.base_page_table_frame == cr3_frame {
-            return &self.base_page_table;
+            return PageTableHandle::base(&self.base_page_table);
         }
 
         let cr3_id: usize = cr3_frame.start_address().as_u64().trunc();
-        let task_pts = self.task_page_tables.lock();
-        if let Some(pt) = task_pts.get(&cr3_id) {
-            // SAFETY: Three invariants guarantee this reference remains valid:
-            // 1. The PageTable is Box-allocated, so HashMap rehashing does not
-            //    move the PageTable itself (only the Box pointer moves).
-            // 2. This page table is the current CR3, so `delete_task_page_table`
-            //    will refuse to remove it (returns EBUSY).
-            // 3. The PageTableManager is 'static, so neither it nor the HashMap
-            //    will be deallocated.
-            let pt_ref: &mm::PageTable<PAGE_SIZE> = pt;
-            return unsafe { &*core::ptr::from_ref(pt_ref) };
+        if let Some(pt) = with_per_cpu_variables(|pcv| pcv.active_page_table(cr3_id)) {
+            return PageTableHandle::task(pt);
         }
 
-        // CR3 doesn't match any known page table - this shouldn't happen
         unreachable!(
-            "CR3 contains unknown page table: {:?}",
+            "CR3 does not match the per-CPU page table: {:?}",
             cr3_frame.start_address()
         );
     }
@@ -267,7 +287,15 @@ impl PageTableManager {
     ///   after the switch (including the code being executed and stack)
     /// - No references to user-space memory are held across the switch
     pub unsafe fn load_base(&self) {
-        self.base_page_table.load();
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            // Ensure decreasing/dropping `Arc` for the previous page table (`set_active_page_table()`)
+            // only after switching CR3 (`mm::PageTable::load()`).
+            self.base_page_table.load();
+            with_per_cpu_variables(|pcv| {
+                // Safety: CR3 now references the base page table and interrupts are disabled.
+                unsafe { pcv.set_active_page_table(None) }
+            });
+        });
     }
 
     /// Loads the specified task page table by updating CR3.
@@ -290,13 +318,21 @@ impl PageTableManager {
             return Err(Errno::EINVAL);
         }
 
-        let task_pts = self.task_page_tables.lock();
-        if let Some(pt) = task_pts.get(&task_pt_id) {
+        let pt = {
+            let task_pts = self.task_page_tables.read();
+            Arc::clone(task_pts.get(&task_pt_id).ok_or(Errno::ENOENT)?)
+        };
+
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            // Ensure decreasing/dropping `Arc` for the previous page table (`set_active_page_table()`)
+            // only after switching CR3 (`mm::PageTable::load()`).
             pt.load();
-            Ok(())
-        } else {
-            Err(Errno::ENOENT)
-        }
+            with_per_cpu_variables(|pcv| {
+                // Safety: CR3 now references `pt` and interrupts are disabled.
+                unsafe { pcv.set_active_page_table(Some((task_pt_id, pt))) }
+            });
+        });
+        Ok(())
     }
 
     /// Creates a new task page table and returns its ID.
@@ -318,10 +354,10 @@ impl PageTableManager {
         // fixed after boot; lower slots are not shared (see `copy_pml4_entries_from`).
         pt.copy_pml4_entries_from(&self.base_page_table);
 
-        let pt = alloc::boxed::Box::new(pt);
+        let pt = Arc::new(pt);
         let task_pt_id: usize = pt.get_physical_frame().start_address().as_u64().trunc();
 
-        let mut task_pts = self.task_page_tables.lock();
+        let mut task_pts = self.task_page_tables.write();
         task_pts.insert(task_pt_id, pt);
 
         Ok(task_pt_id)
@@ -348,15 +384,15 @@ impl PageTableManager {
     /// - `Ok(())` if the page table was successfully deleted
     /// - `Err(Errno::EINVAL)` if the page table ID is the base page table
     /// - `Err(Errno::ENOENT)` if the page table ID does not exist
-    /// - `Err(Errno::EBUSY)` if the page table is currently active (switch away first)
+    /// - `Err(Errno::EBUSY)` if the page table is active or has outstanding handles
     pub unsafe fn delete_task_page_table(&self, task_pt_id: usize) -> Result<(), Errno> {
         if task_pt_id == BASE_PAGE_TABLE_ID {
             return Err(Errno::EINVAL);
         }
 
-        let mut task_pts = self.task_page_tables.lock();
+        let mut task_pts = self.task_page_tables.write();
 
-        // Check CR3 under the same lock to avoid TOCTOU with the removal below.
+        // Fast path for the page table active on this core.
         let (cr3_frame, _) = x86_64::registers::control::Cr3::read();
         let cr3_id: usize = cr3_frame.start_address().as_u64().trunc();
         if cr3_id == task_pt_id {
@@ -364,13 +400,18 @@ impl PageTableManager {
         }
 
         if let Some(pt) = task_pts.remove(&task_pt_id) {
+            // An active CR3 retains a per-CPU Arc.
+            let pt = match Arc::try_unwrap(pt) {
+                Ok(pt) => pt,
+                Err(pt) => {
+                    task_pts.insert(task_pt_id, pt);
+                    return Err(Errno::EBUSY);
+                }
+            };
             drop(task_pts);
 
-            // Safety: We're about to delete this page table, so it's safe to
-            // free the task-owned intermediate page table frames (user,
-            // direct-map, and vmap slots). The kernel slots are shared with the
-            // base page table and are deliberately left untouched, so its
-            // P3/P2/P1 frames are not freed.
+            // Safety: successful unwrap proves the table is neither active nor
+            // borrowed. Kernel slots are base-owned and must not be freed.
             unsafe {
                 pt.cleanup_page_table_frames();
             }
@@ -388,7 +429,7 @@ pub struct LinuxKernel<Host: HostInterface> {
     host_and_task: core::marker::PhantomData<Host>,
     page_table_manager: PageTableManager,
     vtl1_phys_frame_range: PhysFrameRange<Size4KiB>,
-    vtl0_kernel_info: Vtl0KernelInfo,
+    end_of_boot: core::sync::atomic::AtomicBool,
 }
 
 /// [`litebox::platform::common_providers::userspace_pointers::ValidateAccess`]
@@ -621,8 +662,19 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             host_and_task: core::marker::PhantomData,
             page_table_manager: PageTableManager::new(base_pt),
             vtl1_phys_frame_range: vtl1_range,
-            vtl0_kernel_info: Vtl0KernelInfo::new(),
+            end_of_boot: core::sync::atomic::AtomicBool::new(false),
         }))
+    }
+
+    /// Whether VTL1's window of trusting VTL0 has closed.
+    pub(crate) fn end_of_boot_reached(&self) -> bool {
+        self.end_of_boot.load(core::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Close VTL1's window of trusting VTL0. One-way.
+    pub(crate) fn signal_end_of_boot(&self) {
+        self.end_of_boot
+            .store(true, core::sync::atomic::Ordering::SeqCst);
     }
 
     /// Returns the physical frame range belonging to VTL1.
@@ -700,7 +752,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     /// - `Ok(())` if successful
     /// - `Err(Errno::EINVAL)` if the page table is the base page table
     /// - `Err(Errno::ENOENT)` if the page table doesn't exist
-    /// - `Err(Errno::EBUSY)` if the page table is currently active
+    /// - `Err(Errno::EBUSY)` if the page table is active or has outstanding handles
     pub unsafe fn delete_task_page_table(&self, task_pt_id: usize) -> Result<(), Errno> {
         // Safety: caller guarantees no dangling references
         unsafe { self.page_table_manager.delete_task_page_table(task_pt_id) }
@@ -1230,16 +1282,16 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
             range_set.insert(start..end);
         }
 
-        let mem_attr = if perms.contains(PhysPageMapPermissions::WRITE) {
+        let page_prot = if perms.contains(PhysPageMapPermissions::WRITE) {
             // VTL1 needs writable access, so deny VTL0 all access.
-            litebox_common_lvbs::MemAttr::empty()
+            crate::mshv::HvPageProtFlags::HV_PAGE_ACCESS_NONE
         } else if perms.contains(PhysPageMapPermissions::READ) {
             // VTL1 wants to read data from the pages, preventing VTL0 from writing to the pages.
-            litebox_common_lvbs::MemAttr::MEM_ATTR_READ
-                | litebox_common_lvbs::MemAttr::MEM_ATTR_EXEC
+            crate::mshv::HvPageProtFlags::HV_PAGE_READABLE
+                | crate::mshv::HvPageProtFlags::HV_PAGE_EXECUTABLE
         } else {
             // VTL1 no longer protects the pages.
-            litebox_common_lvbs::MemAttr::all()
+            crate::mshv::HvPageProtFlags::HV_PAGE_FULL_ACCESS
         };
 
         for range in range_set.iter() {
@@ -1247,7 +1299,7 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
                 PhysFrame::<Size4KiB>::containing_address(x86_64::PhysAddr::new(range.start)),
                 PhysFrame::<Size4KiB>::containing_address(x86_64::PhysAddr::new(range.end)),
             );
-            crate::mshv::vsm::protect_physical_memory_range(frame_range, mem_attr)
+            crate::mshv::vsm::protect_physical_memory_range(frame_range, page_prot)
                 .map_err(|_| PhysPointerError::UnsupportedPermissions(perms.bits()))?;
         }
 

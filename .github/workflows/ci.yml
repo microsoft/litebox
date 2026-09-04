@@ -30,14 +30,14 @@ jobs:
       RUSTDOCFLAGS: -Dwarnings
     steps:
       - name: Check out repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Use Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
       - name: Set up Rust
         run: |
           rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --component rustfmt,clippy --target x86_64-unknown-linux-gnu
       - name: Set up Nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2.86.5
         with:
           tool: nextest@${{ env.NEXTEST_VERSION }}
       - name: Install iperf3
@@ -49,9 +49,9 @@ jobs:
       - name: Install AArch64 binutils
         run: |
           sudo apt install -y binutils-aarch64-linux-gnu
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Cache custom out directories
-        uses: actions/cache@v5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             target/*/build/litebox_runner_linux_userland-*/out
@@ -100,12 +100,12 @@ jobs:
         -p litebox_runner_linux_userland
     steps:
       - name: Check out repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Rust
         run: |
           rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --component rustfmt,clippy
       - name: Set up Nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2.86.5
         with:
           tool: nextest@${{ env.NEXTEST_VERSION }}
       - name: Install iperf3
@@ -114,7 +114,7 @@ jobs:
       - name: Install diod
         run: |
           sudo apt install -y diod
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Cache custom out directories
         uses: actions/cache@v5
         with:
@@ -145,7 +145,7 @@ jobs:
       RUSTFLAGS: -Dwarnings
     steps:
       - name: Check out repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # LVBS requires a nightly toolchain because:
       # 1. It uses a custom target (x86_64_vtl1.json) for bare-metal VTL1 kernel development
       # 2. The custom target requires `-Z build-std` to build core/alloc from source
@@ -165,12 +165,12 @@ jobs:
           rustup override set ${RUST_CHANNEL}
           rustup show
       - name: Set up Nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2.86.5
         with:
           tool: nextest@${{ env.NEXTEST_VERSION }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Cache custom out directories
-        uses: actions/cache@v5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             target/*/build/litebox_runner_linux_userland-*/out
@@ -218,15 +218,15 @@ jobs:
         -p litebox_runner_windows_userland
     steps:
       - name: Check out repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Rust
         run: |
           rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --component rustfmt,clippy --target x86_64-pc-windows-msvc
       - name: Set up Nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2.86.5
         with:
           tool: nextest@${{ env.NEXTEST_VERSION }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo clippy --locked --verbose --all-targets --all-features ($env:WINDOWS_CRATES -split ' ')
       - run: cargo build --locked --verbose ($env:WINDOWS_CRATES -split ' ')
       - run: cargo nextest run --locked --profile ci ($env:WINDOWS_CRATES -split ' ')
@@ -238,16 +238,39 @@ jobs:
       - name: Build documentation (fail on warnings)
         run: cargo doc --locked --verbose --no-deps --all-features --document-private-items ($env:WINDOWS_CRATES -split ' ')
 
+  build_and_test_snp:
+    name: Build and Test SNP
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -Dwarnings
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Rust
+        run: |
+          RUST_CHANNEL=$(awk -F'"' '/channel/{print $2}' litebox_runner_snp/rust-toolchain.toml)
+          rustup toolchain install ${RUST_CHANNEL} --profile minimal --no-self-update --component rustfmt,clippy --target x86_64-unknown-none
+          rustup component add rust-src --toolchain ${RUST_CHANNEL}-x86_64-unknown-linux-gnu
+          rustup default ${RUST_CHANNEL}
+          rustup override set ${RUST_CHANNEL}
+          rustup show
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: ./.github/tools/github_actions_run_cargo clippy --all-features --target litebox_runner_snp/target.json --manifest-path=litebox_runner_snp/Cargo.toml -Zbuild-std=core,compiler_builtins,alloc
+      - run: |
+          ./.github/tools/github_actions_run_cargo build -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem --manifest-path=litebox_runner_snp/Cargo.toml --target litebox_runner_snp/target.json
+      - name: Build documentation (fail on warnings)
+        run: ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items
+
   confirm_no_std:
     name: Confirm no_std
     runs-on: ubuntu-latest
     steps:
       - name: Check out repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Rust
         run: |
           rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --target x86_64-unknown-none
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Confirm that we haven't accidentally pulled in std into LiteBox
         run: |
           # Essentially, we run a build on a target that simply does NOT have
@@ -333,10 +356,11 @@ jobs:
           #   access since it needs to actually access the file-system, pull in
           #   relevant files, and then actually trigger LiteBox itself.
           #
-          # - `litebox_shim_optee` is expected to work with
-          #   `litebox_platform_lvbs` (`no_std`) and
-          #   `litebox_platform_linux_userland` (for debugging) which
-          #   depends on `litebox_platform_multiplex`.
+          # - `litebox_shim_optee` is `no_std`, but the builtin
+          #   `x86_64-unknown-none` target is soft-float, which its crypto
+          #   dependencies cannot lower. The shipped target,
+          #   `litebox_runner_lvbs/x86_64_vtl1.json`, satisfies that
+          #   requirement.
           #
           # - `litebox_shim_windows` itself is `no_std` but depends on
           #   `litebox_platform_multiplex`.
@@ -350,6 +374,9 @@ jobs:
           # - `litebox_runner_snp` is `no_std` but requires custom target to build
           # - `litebox_runner_snp` is temporarily disabled until SNP networking
           #   can use a kernel-mode broker
+          #
+          # - `litebox_service_heki` is excluded for the same reason as
+          #   `litebox_shim_optee` above; it also pulls in crypto dependencies.
           #
           # - `dev_tests` is meant to only be used for tests, and thus can
           #   safely use std.
@@ -379,6 +406,7 @@ jobs:
             -not -path './litebox_syscall_rewriter/Cargo.toml' \
             -not -path './litebox_packager/Cargo.toml' \
             -not -path './litebox_runner_snp/Cargo.toml' \
+            -not -path './litebox_service_heki/Cargo.toml' \
             -not -path './dev_tests/Cargo.toml' \
             -not -path './dev_bench/Cargo.toml' \
             -print0 | \
