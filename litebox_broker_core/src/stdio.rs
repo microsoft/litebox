@@ -3,7 +3,7 @@
 
 //! Broker-authoritative standard I/O.
 
-use litebox_broker_protocol::stdio::{MAX_STDIO_TRANSFER_SIZE, StdioOutputStream};
+use litebox_broker_protocol::stdio::{MAX_STDIO_TRANSFER_SIZE, StdioOutputStream, StdioStream};
 use thiserror::Error;
 
 use crate::{AssociationCancellation, BrokerError, BrokerSession, Result};
@@ -55,6 +55,10 @@ pub trait StdioProvider: Send + Sync {
         stream: StdioOutputStream,
         input: &[u8],
     ) -> core::result::Result<usize, StdioProviderError>;
+
+    /// Determines whether the selected standard stream is connected to a
+    /// terminal.
+    fn is_terminal(&self, stream: StdioStream) -> core::result::Result<bool, StdioProviderError>;
 }
 
 /// Standard-I/O provider for deployments that do not expose standard streams.
@@ -75,6 +79,10 @@ impl StdioProvider for UnsupportedStdioProvider {
         _stream: StdioOutputStream,
         _input: &[u8],
     ) -> core::result::Result<usize, StdioProviderError> {
+        Err(StdioProviderError::Unsupported)
+    }
+
+    fn is_terminal(&self, _stream: StdioStream) -> core::result::Result<bool, StdioProviderError> {
         Err(StdioProviderError::Unsupported)
     }
 }
@@ -113,4 +121,13 @@ pub fn write(session: &BrokerSession, stream: StdioOutputStream, input: &[u8]) -
         return Err(BrokerError::Internal);
     }
     Ok(written)
+}
+
+/// Determines whether a standard stream is connected to a terminal.
+pub fn is_terminal(session: &BrokerSession, stream: StdioStream) -> Result<bool> {
+    session
+        .core
+        .stdio_provider
+        .is_terminal(stream)
+        .map_err(Into::into)
 }

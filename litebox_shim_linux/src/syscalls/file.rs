@@ -14,7 +14,7 @@ use litebox::{
     fs::{Mode, OFlags, SeekWhence},
     mm::linux::PAGE_SIZE,
     path,
-    platform::StdioStream,
+    stdio::StdioStream,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_common_linux::{
@@ -2201,7 +2201,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
                                 );
                                 Errno::ENOTTY
                             })?;
-                        if self.global.platform.is_a_tty(stream) {
+                        if self
+                            .global
+                            .litebox
+                            .is_stdio_terminal(stream)
+                            .map_err(|_| Errno::EIO)?
+                        {
                             self.stdio_ioctl(&arg)
                         } else {
                             Err(Errno::ENOTTY)

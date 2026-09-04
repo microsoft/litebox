@@ -137,12 +137,11 @@ impl<Platform: ShimPlatform> EpollDescriptor<Platform> {
                 let events = match global
                     .litebox
                     .descriptor_table()
-                    .with_metadata(file, |stream: &litebox::platform::StdioStream| *stream)
+                    .with_metadata(file, |stream: &litebox::stdio::StdioStream| *stream)
                 {
-                    Ok(litebox::platform::StdioStream::Stdin) => Events::IN,
+                    Ok(litebox::stdio::StdioStream::Stdin) => Events::IN,
                     Ok(
-                        litebox::platform::StdioStream::Stdout
-                        | litebox::platform::StdioStream::Stderr,
+                        litebox::stdio::StdioStream::Stdout | litebox::stdio::StdioStream::Stderr,
                     )
                     | Err(_) => Events::OUT,
                 };

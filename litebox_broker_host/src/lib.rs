@@ -46,8 +46,8 @@ use litebox_broker_protocol::socket::{
     SendSocketResponse, SendToSocketResponse, SocketOutcome,
 };
 use litebox_broker_protocol::stdio::{
-    MAX_STDIO_TRANSFER_SIZE, ReadStdioRequest, ReadStdioResponse, WriteStdioRequest,
-    WriteStdioResponse,
+    IsTerminalStdioRequest, IsTerminalStdioResponse, MAX_STDIO_TRANSFER_SIZE, ReadStdioRequest,
+    ReadStdioResponse, WriteStdioRequest, WriteStdioResponse,
 };
 use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, RequestId};
 use litebox_broker_transport::channel::{HostReceive, HostSetupChannel, PeerCredential};
@@ -116,6 +116,7 @@ impl<Memory: SharedMemory> BrokerHostAssociation<'_, Memory> {
             | BrokerOperation::CheckReadiness(_)
             | BrokerOperation::Event(_)
             | BrokerOperation::Pipe(PipeRequest::Create(_))
+            | BrokerOperation::Stdio(StdioRequest::IsTerminal(_))
             | BrokerOperation::Socket(
                 SocketRequest::Create(_)
                 | SocketRequest::Connect(_)
@@ -428,6 +429,13 @@ fn handle_stdio_request<Memory: SharedMemory>(
             Ok(StdioResponse::Write(WriteStdioResponse {
                 written: u32::try_from(written)
                     .expect("validated stdio write length must fit in u32"),
+            }))
+        }
+        StdioRequest::IsTerminal(IsTerminalStdioRequest { stream }) => {
+            let is_terminal = litebox_broker_core::stdio::is_terminal(session, stream)
+                .map_err(RequestFailure::from)?;
+            Ok(StdioResponse::IsTerminal(IsTerminalStdioResponse {
+                is_terminal,
             }))
         }
     }
@@ -799,7 +807,7 @@ mod tests {
         SocketError, SocketStatusRequest, SocketStatusResponse, SocketType, TcpOptionName,
         TcpOptionValue,
     };
-    use litebox_broker_protocol::stdio::StdioOutputStream;
+    use litebox_broker_protocol::stdio::{StdioOutputStream, StdioStream};
     use litebox_broker_protocol::{ObjectHandle, ProtocolVersion, RequestId};
     use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemoryError};
     use std::collections::VecDeque;
@@ -874,6 +882,7 @@ mod tests {
     struct TestStdioProvider {
         input: Mutex<VecDeque<u8>>,
         writes: Mutex<Vec<(StdioOutputStream, Vec<u8>)>>,
+        terminal_queries: Mutex<Vec<StdioStream>>,
     }
 
     impl StdioProvider for TestStdioProvider {
@@ -898,6 +907,14 @@ mod tests {
         ) -> core::result::Result<usize, StdioProviderError> {
             self.writes.lock().unwrap().push((stream, input.to_vec()));
             Ok(input.len())
+        }
+
+        fn is_terminal(
+            &self,
+            stream: StdioStream,
+        ) -> core::result::Result<bool, StdioProviderError> {
+            self.terminal_queries.lock().unwrap().push(stream);
+            Ok(stream == StdioStream::Stderr)
         }
     }
 
@@ -1215,6 +1232,22 @@ mod tests {
         assert_eq!(
             provider.writes.lock().unwrap().as_slice(),
             [(StdioOutputStream::Stderr, b"error".to_vec())]
+        );
+        assert_eq!(
+            handle_test_request_with_buffers(
+                &session,
+                BrokerOperation::Stdio(StdioRequest::IsTerminal(IsTerminalStdioRequest {
+                    stream: StdioStream::Stderr,
+                })),
+                &shared_buffers,
+            ),
+            BrokerResult::Stdio(StdioResponse::IsTerminal(IsTerminalStdioResponse {
+                is_terminal: true,
+            }))
+        );
+        assert_eq!(
+            provider.terminal_queries.lock().unwrap().as_slice(),
+            [StdioStream::Stderr]
         );
         assert_eq!(
             handle_request(

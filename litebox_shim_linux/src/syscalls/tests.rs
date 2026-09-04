@@ -3,23 +3,24 @@
 
 use litebox::fs::{Mode, OFlags};
 use litebox_broker_core::{
-    BrokerCore, BrokerError, BrokerSession, CallerCredential, ObjectRights, PolicyEngine,
-    SessionId,
+    AssociationCancellation, BrokerCore, BrokerError, BrokerSession, CallerCredential,
+    ObjectRights, PolicyEngine, SessionId,
     random::{RandomProvider, RandomProviderError},
     readiness::ReadinessRegistration,
     socket::{PlatformSocket, SocketProvider},
-    stdio::UnsupportedStdioProvider,
+    stdio::{StdioProvider, StdioProviderError},
 };
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::{
     BROKER_PROTOCOL_VERSION,
     message::{
         BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerOperation, BrokerRequest,
-        BrokerResponse, BrokerResult, PipeRequest, PipeResponse,
+        BrokerResponse, BrokerResult, PipeRequest, PipeResponse, StdioRequest, StdioResponse,
     },
     pipe::{CreatePipeResponse, ReadPipeResponse, WritePipeResponse},
     shared_buffer::{SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE},
     socket::CreateSocketRequest,
+    stdio::{IsTerminalStdioResponse, StdioOutputStream, StdioStream},
 };
 use litebox_broker_transport::{
     channel::{LocalCallChannel, LocalSetupChannel},
@@ -63,10 +64,35 @@ fn test_broker() -> &'static BrokerCore {
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all()),
             alloc::sync::Arc::new(PipeOnlySocketProvider),
             alloc::sync::Arc::new(UnusedRandomProvider),
-            alloc::sync::Arc::new(UnsupportedStdioProvider),
+            alloc::sync::Arc::new(TestStdioProvider),
         )
         .unwrap()
     })
+}
+
+struct TestStdioProvider;
+
+impl StdioProvider for TestStdioProvider {
+    fn read(
+        &self,
+        _cancellation: &AssociationCancellation,
+        _output: &mut [u8],
+    ) -> core::result::Result<usize, StdioProviderError> {
+        Err(StdioProviderError::Unsupported)
+    }
+
+    fn write(
+        &self,
+        _cancellation: &AssociationCancellation,
+        _stream: StdioOutputStream,
+        _input: &[u8],
+    ) -> core::result::Result<usize, StdioProviderError> {
+        Err(StdioProviderError::Unsupported)
+    }
+
+    fn is_terminal(&self, stream: StdioStream) -> core::result::Result<bool, StdioProviderError> {
+        Ok(stream == StdioStream::Stdout)
+    }
 }
 
 #[must_use]
@@ -198,6 +224,15 @@ impl PipeBrokerChannel {
                     |written| {
                         BrokerResult::Pipe(PipeResponse::Write(WritePipeResponse {
                             written: u32::try_from(written).unwrap(),
+                        }))
+                    },
+                )
+            }
+            BrokerOperation::Stdio(StdioRequest::IsTerminal(request)) => {
+                litebox_broker_core::stdio::is_terminal(&self.session, request.stream).map(
+                    |is_terminal| {
+                        BrokerResult::Stdio(StdioResponse::IsTerminal(IsTerminalStdioResponse {
+                            is_terminal,
                         }))
                     },
                 )

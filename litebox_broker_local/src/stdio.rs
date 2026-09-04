@@ -6,13 +6,30 @@ use litebox_broker_protocol::message::{
 };
 use litebox_broker_protocol::shared_buffer::SharedBufferDescriptor;
 use litebox_broker_protocol::stdio::{
-    MAX_STDIO_TRANSFER_SIZE, ReadStdioRequest, StdioOutputStream, WriteStdioRequest,
+    IsTerminalStdioRequest, MAX_STDIO_TRANSFER_SIZE, ReadStdioRequest, StdioOutputStream,
+    StdioStream, WriteStdioRequest,
 };
 use litebox_broker_transport::channel::LocalCallChannel;
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
 
 impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
+    /// Determines whether a standard stream is connected to a terminal.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker reports an unrecoverable error or returns a
+    /// response for a different operation.
+    pub fn is_stdio_terminal(&self, stream: StdioStream) -> Result<bool, Channel::Error> {
+        match self.request(BrokerOperation::Stdio(StdioRequest::IsTerminal(
+            IsTerminalStdioRequest { stream },
+        )))? {
+            BrokerResult::Stdio(StdioResponse::IsTerminal(response)) => Ok(response.is_terminal),
+            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
+            response => panic!("broker returned unexpected stdio response: {response:?}"),
+        }
+    }
+
     /// Reads standard input into an operation-scoped shared-buffer lease.
     ///
     /// The caller must retain exclusive ownership of the descriptor's slot

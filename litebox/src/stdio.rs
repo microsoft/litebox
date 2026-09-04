@@ -4,7 +4,7 @@
 //! Broker-provided standard I/O.
 
 use litebox_broker_protocol::stdio::MAX_STDIO_TRANSFER_SIZE;
-pub use litebox_broker_protocol::stdio::StdioOutputStream;
+pub use litebox_broker_protocol::stdio::{StdioOutputStream, StdioStream};
 use thiserror::Error;
 
 use crate::{LiteBox, sync::RawSyncPrimitivesProvider};
@@ -19,7 +19,23 @@ pub struct ReadStdioError;
 #[error("brokered standard output is unavailable")]
 pub struct WriteStdioError;
 
+/// A broker could not determine whether a standard stream is connected to a
+/// terminal.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+#[error("brokered standard-stream terminal query is unavailable")]
+pub struct StdioTerminalError;
+
 impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
+    /// Determines whether a standard stream is connected to a terminal.
+    ///
+    /// This query requires a negotiated broker.
+    pub fn is_stdio_terminal(&self, stream: StdioStream) -> Result<bool, StdioTerminalError> {
+        self.broker_control()
+            .ok_or(StdioTerminalError)?
+            .is_stdio_terminal(stream)
+            .map_err(|_| StdioTerminalError)
+    }
+
     /// Reads bytes from standard input.
     ///
     /// Empty reads succeed without a broker. Non-empty reads require a

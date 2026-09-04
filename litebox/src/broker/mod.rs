@@ -21,7 +21,7 @@ use litebox_broker_protocol::socket::{
     ReceiveFromSocketResponse, ReceiveSocketResponse, SendFlags as BrokerSendFlags, ShutdownMode,
     SocketConnectionStatus, SocketOutcome, SocketStatusResponse, TcpOptionName, TcpOptionValue,
 };
-use litebox_broker_protocol::stdio::{MAX_STDIO_TRANSFER_SIZE, StdioOutputStream};
+use litebox_broker_protocol::stdio::{MAX_STDIO_TRANSFER_SIZE, StdioOutputStream, StdioStream};
 use litebox_broker_transport::channel::LocalCallChannel;
 
 use crate::event::{Events, polling::Pollee};
@@ -44,6 +44,11 @@ use shared_buffer::{SlotAllocator, SlotLease};
 /// once the local-core wait and notification model supports that shape.
 pub(crate) trait BrokerControl: Send + Sync {
     fn fill_random(&self, output: &mut [u8]) -> core::result::Result<(), BrokerControlError>;
+
+    fn is_stdio_terminal(
+        &self,
+        stream: StdioStream,
+    ) -> core::result::Result<bool, BrokerControlError>;
 
     fn read_stdio(&self, data: &mut [u8]) -> core::result::Result<usize, BrokerControlError>;
 
@@ -322,6 +327,13 @@ where
             u32::try_from(output.len()).expect("validated random transfer length must fit in u32");
         let lease = self.acquire_shared_buffer(length)?;
         self.request(|local| local.fill_random(lease.descriptor(), output))
+    }
+
+    fn is_stdio_terminal(
+        &self,
+        stream: StdioStream,
+    ) -> core::result::Result<bool, BrokerControlError> {
+        self.request(|local| local.is_stdio_terminal(stream))
     }
 
     fn read_stdio(&self, data: &mut [u8]) -> core::result::Result<usize, BrokerControlError> {

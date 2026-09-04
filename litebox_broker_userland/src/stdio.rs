@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use litebox_broker_core::AssociationCancellation;
 use litebox_broker_core::stdio::{StdioProvider, StdioProviderError};
-use litebox_broker_protocol::stdio::{MAX_STDIO_TRANSFER_SIZE, StdioOutputStream};
+use litebox_broker_protocol::stdio::{MAX_STDIO_TRANSFER_SIZE, StdioOutputStream, StdioStream};
 
 const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const WRITE_RETRY_DELAY: Duration = Duration::from_millis(1);
@@ -65,6 +65,16 @@ impl UserlandStdioProvider {
 }
 
 impl StdioProvider for UserlandStdioProvider {
+    fn is_terminal(&self, stream: StdioStream) -> Result<bool, StdioProviderError> {
+        use std::io::IsTerminal as _;
+
+        Ok(match stream {
+            StdioStream::Stdin => std::io::stdin().is_terminal(),
+            StdioStream::Stdout => std::io::stdout().is_terminal(),
+            StdioStream::Stderr => std::io::stderr().is_terminal(),
+        })
+    }
+
     fn read(
         &self,
         cancellation: &AssociationCancellation,

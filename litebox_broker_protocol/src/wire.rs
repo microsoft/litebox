@@ -402,8 +402,8 @@ mod tests {
         SocketStatusResponse, SocketType, TcpOptionName, TcpOptionValue,
     };
     use crate::stdio::{
-        ReadStdioRequest, ReadStdioResponse, StdioOutputStream, WriteStdioRequest,
-        WriteStdioResponse,
+        IsTerminalStdioRequest, IsTerminalStdioResponse, ReadStdioRequest, ReadStdioResponse,
+        StdioOutputStream, StdioStream, WriteStdioRequest, WriteStdioResponse,
     };
     use crate::{ObjectHandle, ProtocolVersion, RequestId};
     use core::net::{Ipv4Addr, SocketAddrV4};
@@ -528,6 +528,15 @@ mod tests {
                     slot_index: SharedBufferSlotIndex(5),
                     length: 23,
                 },
+            })),
+            BrokerOperation::Stdio(StdioRequest::IsTerminal(IsTerminalStdioRequest {
+                stream: StdioStream::Stdin,
+            })),
+            BrokerOperation::Stdio(StdioRequest::IsTerminal(IsTerminalStdioRequest {
+                stream: StdioStream::Stdout,
+            })),
+            BrokerOperation::Stdio(StdioRequest::IsTerminal(IsTerminalStdioRequest {
+                stream: StdioStream::Stderr,
             })),
             BrokerOperation::Socket(SocketRequest::Create(CreateSocketRequest {
                 address_family: AddressFamily::Ipv4,
@@ -865,6 +874,12 @@ mod tests {
             BrokerResult::RandomFilled,
             BrokerResult::Stdio(StdioResponse::Read(ReadStdioResponse { read: 11 })),
             BrokerResult::Stdio(StdioResponse::Write(WriteStdioResponse { written: 17 })),
+            BrokerResult::Stdio(StdioResponse::IsTerminal(IsTerminalStdioResponse {
+                is_terminal: false,
+            })),
+            BrokerResult::Stdio(StdioResponse::IsTerminal(IsTerminalStdioResponse {
+                is_terminal: true,
+            })),
             BrokerResult::Error(ErrorCode::PolicyDenied),
             BrokerResult::Error(ErrorCode::WouldBlock),
             BrokerResult::Error(ErrorCode::PeerClosed),
@@ -1038,6 +1053,23 @@ mod tests {
             decode_request(&read[..read.len() - 1]),
             Err(WireError::TruncatedFrame)
         );
+
+        let terminal = encode_request(BrokerRequest {
+            request_id: TEST_REQUEST_ID,
+            operation: BrokerOperation::Stdio(StdioRequest::IsTerminal(IsTerminalStdioRequest {
+                stream: StdioStream::Stdin,
+            })),
+        });
+        let mut unknown_terminal_stream = terminal.clone();
+        *unknown_terminal_stream.last_mut().unwrap() = 0xff;
+        assert_eq!(
+            decode_request(&unknown_terminal_stream),
+            Err(WireError::InvalidTag)
+        );
+        assert_eq!(
+            decode_request(&terminal[..terminal.len() - 1]),
+            Err(WireError::TruncatedFrame)
+        );
     }
 
     #[test]
@@ -1066,6 +1098,23 @@ mod tests {
         });
         assert_eq!(
             decode_response(&read[..read.len() - 1]),
+            Err(WireError::TruncatedFrame)
+        );
+
+        let terminal = encode_response(BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result: BrokerResult::Stdio(StdioResponse::IsTerminal(IsTerminalStdioResponse {
+                is_terminal: true,
+            })),
+        });
+        let mut unknown_terminal_value = terminal.clone();
+        *unknown_terminal_value.last_mut().unwrap() = 0xff;
+        assert_eq!(
+            decode_response(&unknown_terminal_value),
+            Err(WireError::InvalidTag)
+        );
+        assert_eq!(
+            decode_response(&terminal[..terminal.len() - 1]),
             Err(WireError::TruncatedFrame)
         );
     }
