@@ -352,24 +352,30 @@ def _run_litebox_cmd(
     # since if SIGALRM isn't delivered the process will hang forever.
     timeout = duration * 3 + 30 if bench.uses_alarm else duration * 10 + 60
     popen_options = {}
-    if sys.platform != "win32":
+    if sys.platform == "win32":
+        popen_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
         popen_options["start_new_session"] = True
-    process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        **popen_options,
-    )
-    try:
-        stdout, stderr = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        _terminate_process_tree(process)
-        hint = " (this benchmark uses alarm/SIGALRM)" if bench.uses_alarm else ""
-        print(f"  [TIMEOUT] {bench.name}{hint}")
-        return None
-    except KeyboardInterrupt:
-        _terminate_process_tree(process)
-        raise
+    with tempfile.TemporaryFile() as stderr_file:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr_file,
+            **popen_options,
+        )
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _terminate_process_tree(process)
+            hint = " (this benchmark uses alarm/SIGALRM)" if bench.uses_alarm else ""
+            print(f"  [TIMEOUT] {bench.name}{hint}")
+            return None
+        except KeyboardInterrupt:
+            _terminate_process_tree(process)
+            raise
+
+        stderr_file.seek(0)
+        stderr = stderr_file.read()
     elapsed = time.monotonic() - t0
 
     if process.returncode != 0:
@@ -409,7 +415,7 @@ def _terminate_process_tree(process: subprocess.Popen) -> None:
         except ProcessLookupError:
             pass
 
-    process.communicate()
+    process.wait()
 
 
 def run_litebox(
