@@ -6,11 +6,12 @@ Run [byte-unixbench](https://github.com/kdlucas/byte-unixbench) benchmarks nativ
 
 - The UnixBench source tree at `byte-unixbench-6.0.0/UnixBench/` (extracted from `v6.0.0.zip`).
 - `gcc`, `make`, `ldd`, `tar` on the host.
-- Pre-built LiteBox binaries (`litebox_runner_linux_userland` and `litebox_syscall_rewriter`).
+- Pre-built LiteBox binaries (`litebox-broker-userland`,
+  `litebox_runner_linux_userland`, and `litebox_syscall_rewriter`).
 
 Build LiteBox (from workspace root):
 ```bash
-cargo build --release -p litebox_runner_linux_userland -p litebox_syscall_rewriter
+cargo build --release -p litebox_broker_userland -p litebox_runner_linux_userland -p litebox_syscall_rewriter
 ```
 
 ## Quick Start

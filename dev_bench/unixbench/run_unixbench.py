@@ -395,10 +395,11 @@ def run_litebox(
         return None
 
     tar_path, rewritten = prepared
+    broker_path = runner_path.with_name("litebox-broker-userland")
 
     cmd = [
-        str(runner_path),
-        "--unstable",
+        str(broker_path),
+        "--runner", str(runner_path),
         "--env", "LD_LIBRARY_PATH=/lib64:/lib32:/lib",
         "--env", "HOME=/",
     ]
@@ -448,8 +449,10 @@ def run_litebox_windows(
         print(f"  [SKIP] {bench.name}: tar not found at {tar_path}")
         return None
 
+    broker_path = runner_path.with_name("litebox-broker-userland.exe")
     cmd = [
-        str(runner_path),
+        str(broker_path),
+        "--runner", str(runner_path),
         "--env", "LD_LIBRARY_PATH=/lib64:/lib32:/lib",
         "--env", "HOME=/",
     ]
@@ -533,7 +536,7 @@ def build_litebox_binaries(
     workspace_root: Path, release: bool,
 ) -> tuple[Path, Path]:
     """
-    Build litebox_runner_linux_userland and litebox_packager via cargo.
+    Build the LiteBox runner, broker, and packager via cargo.
 
     Returns (runner_path, packager_path).
     """
@@ -541,6 +544,7 @@ def build_litebox_binaries(
     cmd = [
         "cargo", "build",
         "-p", "litebox_runner_linux_userland",
+        "-p", "litebox_broker_userland",
         "-p", "litebox_packager",
     ]
     if release:
@@ -554,8 +558,10 @@ def build_litebox_binaries(
     print("Build complete.")
 
     runner = workspace_root / "target" / build_type / "litebox_runner_linux_userland"
+    broker = workspace_root / "target" / build_type / "litebox-broker-userland"
     packager = workspace_root / "target" / build_type / "litebox_packager"
     assert runner.exists(), f"Runner not found at {runner}"
+    assert broker.exists(), f"Broker not found at {broker}"
     assert packager.exists(), f"Packager not found at {packager}"
     return runner, packager
 
@@ -566,9 +572,10 @@ def find_litebox_binaries(
     """Find pre-built litebox binaries without building."""
     build_type = "release" if release else "debug"
     runner = workspace_root / "target" / build_type / "litebox_runner_linux_userland"
+    broker = workspace_root / "target" / build_type / "litebox-broker-userland"
     packager = workspace_root / "target" / build_type / "litebox_packager"
     return (
-        runner if runner.exists() else None,
+        runner if runner.exists() and broker.exists() else None,
         packager if packager.exists() else None,
     )
 
@@ -692,6 +699,7 @@ def main():
                 build_cmd = [
                     "cargo", "build",
                     "-p", "litebox_runner_linux_on_windows_userland",
+                    "-p", "litebox_broker_userland",
                 ]
                 if args.release:
                     build_cmd.append("--release")

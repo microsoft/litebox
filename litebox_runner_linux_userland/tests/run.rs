@@ -25,6 +25,28 @@ impl litebox_broker_core::random::RandomProvider for TestRandomProvider {
         Ok(())
     }
 }
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+struct TestStdioProvider {
+    stdout_tx: std::sync::mpsc::Sender<Vec<u8>>,
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+impl litebox_broker_core::stdio::StdioProvider for TestStdioProvider {
+    fn write(
+        &self,
+        stream: litebox_broker_protocol::stdio::StdioOutputStream,
+        input: &[u8],
+    ) -> Result<usize, litebox_broker_core::stdio::StdioProviderError> {
+        if stream == litebox_broker_protocol::stdio::StdioOutputStream::Stdout {
+            self.stdout_tx
+                .send(input.to_vec())
+                .map_err(|_| litebox_broker_core::stdio::StdioProviderError::Failed)?;
+        }
+        Ok(input.len())
+    }
+}
+
 // Dedicated fixtures build static binaries concurrently; exclude them to avoid
 // colliding with this sweep's dynamic `<stem>_rewriter` outputs.
 const DEDICATED_C_TESTS: &[&str] = &[
@@ -148,7 +170,7 @@ impl Runner {
             #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
             managed_proxy_hosts: Vec::new(),
             #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-            use_userland_broker: false,
+            use_userland_broker: true,
             has_run: false,
             unique_name: unique_name.to_owned(),
         }
@@ -189,6 +211,7 @@ impl Runner {
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     fn broker_socket(&mut self, control_socket_path: &Path) -> &mut Self {
+        self.use_userland_broker = false;
         self.command
             .arg("--broker-control-channel")
             .arg(control_socket_path);
@@ -398,6 +421,8 @@ struct TestBroker {
     thread: Option<std::thread::JoinHandle<()>>,
     done_rx: std::sync::mpsc::Receiver<()>,
     close_object_count_rx: std::sync::mpsc::Receiver<usize>,
+    stdout_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    pending_stdout: std::cell::RefCell<Vec<u8>>,
     control_socket_path: PathBuf,
 }
 
@@ -409,7 +434,39 @@ impl TestBroker {
             .expect("broker test host did not report close-object count")
     }
 
-    fn join(mut self) {
+    fn next_stdout_line(&self) -> String {
+        let deadline = std::time::Instant::now() + BROKER_HELPER_TIMEOUT;
+        loop {
+            let newline = self
+                .pending_stdout
+                .borrow()
+                .iter()
+                .position(|byte| *byte == b'\n');
+            if let Some(newline) = newline {
+                let mut line = self
+                    .pending_stdout
+                    .borrow_mut()
+                    .drain(..=newline)
+                    .collect::<Vec<_>>();
+                line.pop();
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                return String::from_utf8(line).expect("guest stdout was not UTF-8");
+            }
+
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .unwrap_or_default();
+            let chunk = self
+                .stdout_rx
+                .recv_timeout(remaining)
+                .expect("timed out waiting for brokered guest stdout");
+            self.pending_stdout.borrow_mut().extend_from_slice(&chunk);
+        }
+    }
+
+    fn finish(&mut self) {
         self.done_rx
             .recv_timeout(BROKER_HELPER_TIMEOUT)
             .expect("broker test host did not finish");
@@ -418,7 +475,19 @@ impl TestBroker {
             .expect("broker test host thread missing")
             .join()
             .expect("broker test host panicked");
-        let _ = std::fs::remove_file(&self.control_socket_path);
+    }
+
+    fn join(mut self) {
+        self.finish();
+    }
+
+    fn join_with_stdout(mut self) -> Vec<u8> {
+        self.finish();
+        let mut output = core::mem::take(self.pending_stdout.get_mut());
+        for chunk in self.stdout_rx.try_iter() {
+            output.extend_from_slice(&chunk);
+        }
+        output
     }
 }
 
@@ -459,6 +528,7 @@ fn spawn_test_broker_with_mode(
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let (close_object_count_tx, close_object_count_rx) = std::sync::mpsc::channel();
+    let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
     let server_control_socket_path = control_socket_path.to_path_buf();
     let cleanup_control_socket_path = control_socket_path.to_path_buf();
     let broker_thread = std::thread::spawn(move || {
@@ -478,6 +548,7 @@ fn spawn_test_broker_with_mode(
                     .expect("failed to create broker test socket provider"),
                 ),
                 std::sync::Arc::new(TestRandomProvider),
+                std::sync::Arc::new(TestStdioProvider { stdout_tx }),
             )
             .expect("failed to create broker core");
             ready_tx.send(()).expect("failed to report broker ready");
@@ -520,6 +591,8 @@ fn spawn_test_broker_with_mode(
         thread: Some(broker_thread),
         done_rx,
         close_object_count_rx,
+        stdout_rx,
+        pending_stdout: std::cell::RefCell::new(Vec::new()),
         control_socket_path: cleanup_control_socket_path,
     }
 }
@@ -899,7 +972,6 @@ fn test_runner_broker_udp_with_rewriter() {
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
 fn test_runner_broker_udp_namespace_delivers_after_sender_close() {
-    use std::io::{BufRead as _, BufReader};
     use std::process::Stdio;
 
     let target = common::compile(
@@ -920,19 +992,8 @@ fn test_runner_broker_udp_namespace_delivers_after_sender_close() {
     let mut server = Runner::new(&target, "broker_udp_namespace_server_rewriter")
         .arg("server")
         .broker_socket(&control_socket_path)
-        .spawn_with_stdio(Stdio::null(), Stdio::piped(), Stdio::inherit());
-    let stdout = server.stdout.take().unwrap();
-    let (line_sender, line_receiver) = std::sync::mpsc::channel();
-    let reader = std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines() {
-            if line_sender.send(line.unwrap()).is_err() {
-                return;
-            }
-        }
-    });
-    let listen = line_receiver
-        .recv_timeout(BROKER_HELPER_TIMEOUT)
-        .expect("timed out waiting for broker UDP server");
+        .spawn_with_stdio(Stdio::null(), Stdio::null(), Stdio::inherit());
+    let listen = broker.next_stdout_line();
     let port = listen
         .strip_prefix("LISTEN ")
         .expect("unexpected broker UDP server output")
@@ -958,7 +1019,6 @@ fn test_runner_broker_udp_namespace_delivers_after_sender_close() {
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
-    reader.join().unwrap();
     assert!(status.success(), "broker UDP server guest failed: {status}");
     assert_eq!(broker.next_close_object_count(), 1);
     assert_eq!(broker.next_close_object_count(), 1);
@@ -968,7 +1028,6 @@ fn test_runner_broker_udp_namespace_delivers_after_sender_close() {
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
 fn test_runner_broker_tcp_server_with_rewriter() {
-    use std::io::{BufRead as _, BufReader};
     use std::process::Stdio;
 
     let target = common::compile(
@@ -988,34 +1047,16 @@ fn test_runner_broker_tcp_server_with_rewriter() {
     );
     let mut child = Runner::new(&target, "broker_tcp_server_rewriter")
         .broker_socket(&control_socket_path)
-        .spawn_with_stdio(Stdio::null(), Stdio::piped(), Stdio::inherit());
-    let stdout = child.stdout.take().unwrap();
-    let (line_sender, line_receiver) = std::sync::mpsc::channel();
-    let reader = std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines() {
-            if line_sender.send(line.unwrap()).is_err() {
-                return;
-            }
-        }
-    });
+        .spawn_with_stdio(Stdio::null(), Stdio::null(), Stdio::inherit());
     let mut output = String::new();
-    let mut next_marker =
-        |prefix: &str| {
-            let deadline = std::time::Instant::now() + BROKER_HELPER_TIMEOUT;
-            loop {
-                let remaining = deadline
-                    .checked_duration_since(std::time::Instant::now())
-                    .unwrap_or_default();
-                let line = line_receiver.recv_timeout(remaining).unwrap_or_else(|error| {
-                panic!("timed out waiting for guest marker {prefix:?}: {error}; output:\n{output}")
-            });
-                output.push_str(&line);
-                output.push('\n');
-                if line.starts_with(prefix) {
-                    return line;
-                }
-            }
-        };
+    let mut next_marker = |prefix: &str| loop {
+        let line = broker.next_stdout_line();
+        output.push_str(&line);
+        output.push('\n');
+        if line.starts_with(prefix) {
+            return line;
+        }
+    };
 
     let listen = next_marker("LISTEN ");
     assert_ne!(
@@ -1066,7 +1107,6 @@ fn test_runner_broker_tcp_server_with_rewriter() {
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
-    reader.join().unwrap();
     assert!(
         status.success(),
         "broker TCP server guest failed with {status}; output:\n{output}"
@@ -1412,14 +1452,14 @@ fn test_broker_with_curl() {
         1,
     );
     let url = format!("http://10.0.2.1:{port}/something");
-    let output = Runner::new(&curl_path, "curl_rewriter")
+    Runner::new(&curl_path, "curl_rewriter")
         .args(["-sS", &url])
         .broker_socket(&control_socket_path)
-        .output();
+        .run();
 
     server_thread.join().expect("Server thread panicked");
     assert!(broker.next_close_object_count() > 0);
-    broker.join();
+    let output = broker.join_with_stdout();
 
     let output_str = String::from_utf8_lossy(&output);
     assert!(output_str.contains(RESPONSE_BODY), "Unexpected curl output");

@@ -11,6 +11,7 @@ use alloc::vec::Vec;
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 
 use crate::LiteBox;
+use crate::stdio::StdioOutputStream;
 use crate::sync::RawSyncPrimitivesProvider;
 
 use super::backend::{
@@ -291,8 +292,8 @@ where
         let h = h.get_typed::<Self>();
         let stream = match h.device {
             Device::Stdin => return Err(WriteError::NotForWriting),
-            Device::Stdout => crate::platform::StdioOutStream::Stdout,
-            Device::Stderr => crate::platform::StdioOutStream::Stderr,
+            Device::Stdout => StdioOutputStream::Stdout,
+            Device::Stderr => StdioOutputStream::Stderr,
             Device::Null | Device::URandom => {
                 // /dev/null discards data: report as if written fully
                 //
@@ -306,12 +307,8 @@ where
             }
         };
         self.litebox
-            .x
-            .platform
-            .write_to(stream, buf)
-            .map_err(|e| match e {
-                crate::platform::StdioWriteError::Closed => WriteError::Io,
-            })
+            .write_stdio(stream, buf)
+            .map_err(|_| WriteError::Io)
     }
 
     fn truncate(&self, _h: &FileHandle, _len: usize) -> Result<(), TruncateError> {

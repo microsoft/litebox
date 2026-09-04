@@ -850,7 +850,8 @@ mod tests {
                 request @ (BrokerOperation::Pipe(_)
                 | BrokerOperation::Event(_)
                 | BrokerOperation::Socket(_)
-                | BrokerOperation::FillRandom(_)) => {
+                | BrokerOperation::FillRandom(_)
+                | BrokerOperation::Stdio(_)) => {
                     panic!("unexpected broker request: {request:?}")
                 }
             };

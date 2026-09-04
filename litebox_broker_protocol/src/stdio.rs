@@ -1,0 +1,34 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+use crate::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferDescriptor};
+
+/// Maximum standard-output bytes transferred by one broker request.
+pub const MAX_STDIO_TRANSFER_SIZE: u32 = 32 * 1024;
+
+const _: () = assert!(MAX_STDIO_TRANSFER_SIZE <= SHARED_BUFFER_SLOT_SIZE);
+
+/// Standard output stream selected by a write request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StdioOutputStream {
+    /// Process standard output.
+    Stdout,
+    /// Process standard error.
+    Stderr,
+}
+
+/// Request to write bytes staged in shared memory to a standard output stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteStdioRequest {
+    /// Destination standard output stream.
+    pub stream: StdioOutputStream,
+    /// Leased shared-buffer region containing the staged bytes.
+    pub buffer: SharedBufferDescriptor,
+}
+
+/// Response describing a completed standard output write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteStdioResponse {
+    /// Number of bytes written to the selected stream.
+    pub written: u32,
+}

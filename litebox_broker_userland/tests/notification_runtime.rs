@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use litebox_broker_core::random::{RandomProvider, RandomProviderError};
 use litebox_broker_core::socket::UnsupportedSocketProvider;
+use litebox_broker_core::stdio::UnsupportedStdioProvider;
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
 use litebox_broker_host::{ConnectionTermination, setup_connection};
 use litebox_broker_local::{BrokerLocal, BrokerNotifications};
@@ -59,6 +60,7 @@ fn spawn_host(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all()),
             Arc::new(UnsupportedSocketProvider),
             Arc::new(FailingRandomProvider),
+            Arc::new(UnsupportedStdioProvider),
         )
         .unwrap();
         let shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();
@@ -142,6 +144,7 @@ fn host_serves_control_requests_and_notifications_over_shared_rings() {
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all()),
         Arc::new(UnsupportedSocketProvider),
         Arc::new(FailingRandomProvider),
+        Arc::new(UnsupportedStdioProvider),
     )
     .unwrap();
     let (local_control, host_control) = UnixStream::pair().unwrap();
