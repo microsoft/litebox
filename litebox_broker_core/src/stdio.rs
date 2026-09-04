@@ -45,20 +45,6 @@ impl StdioProvider for UnsupportedStdioProvider {
     }
 }
 
-#[cfg(test)]
-pub(crate) struct TestStdioProvider;
-
-#[cfg(test)]
-impl StdioProvider for TestStdioProvider {
-    fn write(
-        &self,
-        _stream: StdioOutputStream,
-        input: &[u8],
-    ) -> core::result::Result<usize, StdioProviderError> {
-        Ok(input.len())
-    }
-}
-
 /// Writes `input` through the standard-I/O provider configured for this broker.
 pub fn write(session: &BrokerSession, stream: StdioOutputStream, input: &[u8]) -> Result<usize> {
     if input.len() > MAX_STDIO_TRANSFER_SIZE as usize {
