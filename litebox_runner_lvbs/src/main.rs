@@ -8,7 +8,7 @@
 use core::arch::{asm, naked_asm};
 use core::sync::atomic::{AtomicBool, Ordering};
 use litebox_platform_lvbs::{
-    arch::{enable_extended_states, enable_fsgsbase, enable_smep_smap, instrs::hlt_loop},
+    arch::{enable_extended_states, enable_fsgsbase, enable_smep_smap},
     host::{
         bootparam::save_boot_info,
         per_cpu_variables::{
@@ -47,13 +47,6 @@ static HOST_LOGGER: HostLogger = HostLogger;
 /// Each AP spin-acquires this lock before touching the boot stack, and
 /// releases it after switching to its own heap-allocated per-CPU kernel stack.
 static AP_BOOT_STACK_LOCK: AtomicBool = AtomicBool::new(false);
-
-/// Release the AP boot stack spinlock.
-///
-/// Called after the current core has switched RSP to its per-CPU kernel stack.
-extern "C" fn release_boot_stack_lock() {
-    AP_BOOT_STACK_LOCK.store(false, Ordering::Release);
-}
 
 /// ELF64 relocation entry
 #[repr(C)]
@@ -336,23 +329,19 @@ unsafe fn remap_to_high_canonical() -> ! {
 }
 
 /// Trampoline executed at the high-canonical address after Phase 1 remap.
-///
-/// Adjusts RSP from low-canonical (PA-based) to high-canonical, re-applies
-/// ELF relocations for the final link address, and tail-jumps to
-/// `common_start` with `is_bsp = true`.
 #[unsafe(naked)]
 unsafe extern "C" fn high_canonical_trampoline() -> ! {
     // 1. Adjust RSP from low-canonical (PA-based) to high-canonical.
     // 2. Phase 1b: Re-apply ELF relocations so every GOT slot now points to
     //    high-canonical VAs (addend + memory_base + KERNEL_OFFSET).
-    // 3. Set edi = 1 (is_bsp = true) and tail-jump to common_start.
+    // 3. Set edi = 1 (is_bsp = true) and call common_start.
     naked_asm!(
         "mov rax, {offset}",
         "add rsp, rax",
         "and rsp, -16",
         "call {apply_reloc}",
         "mov edi, 1",
-        "jmp {common_start}",
+        "call {common_start}",
         offset = const KERNEL_OFFSET,
         apply_reloc = sym apply_relocations,
         common_start = sym common_start,
@@ -384,10 +373,16 @@ pub unsafe extern "C" fn _ap_start() -> ! {
         "3:",
         // This AP has acquired the lock and exclusively owns the boot stack.
         "xor edi, edi", // is_bsp = false
-        "jmp {common_start}",
+        "call {common_start}",
         lock = sym AP_BOOT_STACK_LOCK,
         common_start = sym common_start,
     );
+}
+
+#[inline(never)]
+unsafe extern "C" fn finalize_stack_switch_and_start_kernel(is_bsp: bool) -> ! {
+    AP_BOOT_STACK_LOCK.store(false, Ordering::Release);
+    unsafe { kernel_main(is_bsp) }
 }
 
 /// Shared boot path for BSP and AP cores.
@@ -407,27 +402,19 @@ unsafe extern "C" fn common_start(is_bsp: bool) -> ! {
 
     init_per_cpu_variables();
 
-    // Switch to the kernel stack and tail-call kernel_main with is_bsp
+    // Switch to the per-CPU kernel stack and continue startup with is_bsp.
     let is_bsp_u32 = u32::from(is_bsp);
     unsafe {
         asm!(
             // Now use this core's heap-allocated kernel stack.
             "mov rsp, gs:[{kernel_sp_off}]",
-            // The boot stack is no longer in use. Release the AP boot stack
-            // spinlock so the next AP can proceed. For the BSP this is a
-            // harmless no-op (the lock was never held).
-            "push rdi",
-            "call {release_lock}",
-            "pop rdi",
-            "call {kernel_main}",
+            "call {switch_stack_and_start_kernel}",
             kernel_sp_off = const { PerCpuVariablesAsm::kernel_stack_ptr_offset() },
             in("edi") is_bsp_u32,
-            release_lock = sym release_boot_stack_lock,
-            kernel_main = sym kernel_main,
+            switch_stack_and_start_kernel = sym finalize_stack_switch_and_start_kernel,
+            options(noreturn),
         );
     }
-
-    hlt_loop()
 }
 
 /// BSP-only entry point.
