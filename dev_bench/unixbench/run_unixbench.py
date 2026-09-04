@@ -367,6 +367,9 @@ def _run_litebox_cmd(
         hint = " (this benchmark uses alarm/SIGALRM)" if bench.uses_alarm else ""
         print(f"  [TIMEOUT] {bench.name}{hint}")
         return None
+    except KeyboardInterrupt:
+        _terminate_process_tree(process)
+        raise
     elapsed = time.monotonic() - t0
 
     if process.returncode != 0:

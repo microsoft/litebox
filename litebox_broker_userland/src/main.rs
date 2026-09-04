@@ -163,7 +163,7 @@ fn run_runner_process(
         command.arg("--broker-proxy-url").arg(proxy_url);
     }
     let mut runner = command.args(&args.runner_arguments).spawn()?;
-    #[cfg(windows)]
+    #[cfg(all(windows, target_arch = "x86_64"))]
     let _runner_job = match windows::RunnerJob::assign(&runner) {
         Ok(job) => job,
         Err(error) => {
