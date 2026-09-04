@@ -11,8 +11,8 @@ use core::sync::atomic::AtomicU32;
 use hashbrown::HashMap;
 use litebox::platform::{
     ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister, ImmediatelyWokenUp,
-    PageManagementProvider, RawMutex as _, RawMutexProvider, RawPointerProvider, StdioProvider,
-    TimeProvider, UnblockedOrTimedOut, page_mgmt::DeallocationError,
+    PageManagementProvider, RawMutex as _, RawMutexProvider, RawPointerProvider, TimeProvider,
+    UnblockedOrTimedOut, page_mgmt::DeallocationError,
 };
 use litebox::{
     mm::linux::{PAGE_SIZE, PageRange},
@@ -1040,24 +1040,6 @@ impl<Host: HostInterface> litebox::mm::linux::VmemPageFaultHandler for LinuxKern
 
     fn access_error(error_code: u64, flags: litebox::mm::linux::VmFlags) -> bool {
         mm::PageTable::<PAGE_SIZE>::access_error(error_code, flags)
-    }
-}
-
-impl<Host: HostInterface> StdioProvider for LinuxKernel<Host> {
-    fn read_from_stdin(&self, _buf: &mut [u8]) -> Result<usize, litebox::platform::StdioReadError> {
-        unimplemented!()
-    }
-
-    fn write_to(
-        &self,
-        _stream: litebox::platform::StdioOutStream,
-        _buf: &[u8],
-    ) -> Result<usize, litebox::platform::StdioWriteError> {
-        unimplemented!()
-    }
-
-    fn is_a_tty(&self, _stream: litebox::platform::StdioStream) -> bool {
-        unimplemented!()
     }
 }
 

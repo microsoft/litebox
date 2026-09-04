@@ -2163,11 +2163,6 @@ mod stdio {
         ));
         fs.close(&fd_stderr).expect("Failed to close /dev/stderr");
 
-        platform
-            .stdin_queue
-            .write()
-            .unwrap()
-            .push_back(b"Hello, stdin!".to_vec());
         let fd_stdin = fs
             .open(&ctx, "/dev/stdin", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open /dev/stdin");
@@ -2177,10 +2172,6 @@ mod stdio {
             fs.read(&fd_stdin, &mut buffer, None),
             Err(ReadError::Io)
         ));
-        assert_eq!(
-            platform.stdin_queue.read().unwrap().front().unwrap(),
-            b"Hello, stdin!"
-        );
         fs.close(&fd_stdin).expect("Failed to close /dev/stdin");
     }
 
@@ -2267,11 +2258,6 @@ mod composed_stdio {
         ));
         fs.close(&fd_stderr).expect("Failed to close /dev/stderr");
 
-        platform
-            .stdin_queue
-            .write()
-            .unwrap()
-            .push_back(b"Hello, composed stdin!".to_vec());
         let fd_stdin = fs
             .open(&ctx, "/dev/stdin", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open /dev/stdin");
@@ -2281,10 +2267,6 @@ mod composed_stdio {
             fs.read(&fd_stdin, &mut buffer, None),
             Err(ReadError::Io)
         ));
-        assert_eq!(
-            platform.stdin_queue.read().unwrap().front().unwrap(),
-            b"Hello, composed stdin!"
-        );
         fs.close(&fd_stdin).expect("Failed to close /dev/stdin");
     }
 

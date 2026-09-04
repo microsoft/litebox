@@ -9,7 +9,6 @@
 ))]
 
 use std::cell::Cell;
-use std::io::IsTerminal as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::time::Duration;
@@ -129,7 +128,6 @@ pub struct LinuxUserland {
     /// is persistent across multiple process executions, however, it is ephemeral across true
     /// reboots.
     boot_id: std::sync::OnceLock<Vec<u8>>,
-    stdio_is_tty: [bool; 3],
 }
 
 impl core::fmt::Debug for LinuxUserland {
@@ -160,11 +158,6 @@ impl LinuxUserland {
             reserved_pages,
             cow_regions: std::sync::RwLock::new(std::collections::BTreeMap::new()),
             boot_id: std::sync::OnceLock::new(),
-            stdio_is_tty: [
-                std::io::stdin().is_terminal(),
-                std::io::stdout().is_terminal(),
-                std::io::stderr().is_terminal(),
-            ],
         };
         Box::leak(Box::new(platform))
     }
@@ -1715,54 +1708,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             Ok(ptr) => Ok(UserMutPtr::from_usize(ptr)),
             Err(_) => Err(CowAllocationError::InternalFailure),
         }
-    }
-}
-
-impl litebox::platform::StdioProvider for LinuxUserland {
-    fn read_from_stdin(&self, buf: &mut [u8]) -> Result<usize, litebox::platform::StdioReadError> {
-        unsafe {
-            syscalls::syscall3(
-                syscalls::Sysno::read,
-                usize::try_from(litebox_common_linux::STDIN_FILENO).unwrap(),
-                buf.as_ptr() as usize,
-                buf.len(),
-            )
-        }
-        .map_err(|err| match err {
-            syscalls::Errno::EPIPE => litebox::platform::StdioReadError::Closed,
-            _ => panic!("unhandled error {err}"),
-        })
-    }
-
-    fn write_to(
-        &self,
-        stream: litebox::platform::StdioOutStream,
-        buf: &[u8],
-    ) -> Result<usize, litebox::platform::StdioWriteError> {
-        unsafe {
-            syscalls::syscall3(
-                syscalls::Sysno::write,
-                usize::try_from(match stream {
-                    litebox::platform::StdioOutStream::Stdout => {
-                        litebox_common_linux::STDOUT_FILENO
-                    }
-                    litebox::platform::StdioOutStream::Stderr => {
-                        litebox_common_linux::STDERR_FILENO
-                    }
-                })
-                .unwrap(),
-                buf.as_ptr() as usize,
-                buf.len(),
-            )
-        }
-        .map_err(|err| match err {
-            syscalls::Errno::EPIPE => litebox::platform::StdioWriteError::Closed,
-            _ => panic!("unhandled error {err}"),
-        })
-    }
-
-    fn is_a_tty(&self, stream: litebox::platform::StdioStream) -> bool {
-        self.stdio_is_tty[stream as usize]
     }
 }
 

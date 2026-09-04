@@ -12,10 +12,7 @@
 extern crate std;
 
 use core::sync::atomic::AtomicU32;
-use std::collections::VecDeque;
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::vec::Vec;
 
 use super::*;
 
@@ -27,14 +24,9 @@ use super::*;
 /// - Full determinism
 ///   + time moves at one millisecond per "now" call
 /// - Debuging output goes to stderr
-/// - Can pre-fill stdin and check stdout easily between invocations (see [`Self::stdin_queue`],
-///   [`Self::stdout_queue`], and [`Self::stderr_queue`])
 /// - It will not mock you for using it during tests
 pub(crate) struct MockPlatform {
     current_time: AtomicU64,
-    pub(crate) stdin_queue: RwLock<VecDeque<Vec<u8>>>,
-    pub(crate) stdout_queue: RwLock<VecDeque<Vec<u8>>>,
-    pub(crate) stderr_queue: RwLock<VecDeque<Vec<u8>>>,
 }
 
 impl MockPlatform {
@@ -43,9 +35,6 @@ impl MockPlatform {
         //  order to give ourselves a statically lived platform easily.
         alloc::boxed::Box::leak(alloc::boxed::Box::new(MockPlatform {
             current_time: AtomicU64::new(0),
-            stdin_queue: RwLock::new(VecDeque::new()),
-            stdout_queue: RwLock::new(VecDeque::new()),
-            stderr_queue: RwLock::new(VecDeque::new()),
         }))
     }
 }
@@ -260,38 +249,6 @@ impl RawPointerProvider for MockPlatform {
     type RawConstPointer<T: zerocopy::FromBytes> = super::trivial_providers::TransparentConstPtr<T>;
     type RawMutPointer<T: zerocopy::FromBytes + zerocopy::IntoBytes> =
         super::trivial_providers::TransparentMutPtr<T>;
-}
-
-impl StdioProvider for MockPlatform {
-    fn read_from_stdin(&self, buf: &mut [u8]) -> Result<usize, StdioReadError> {
-        let Some(front) = self.stdin_queue.write().unwrap().pop_front() else {
-            return Err(StdioReadError::Closed);
-        };
-        let len = front.len().min(buf.len());
-        buf[..len].copy_from_slice(&front[..len]);
-        if front.len() > len {
-            self.stdin_queue
-                .write()
-                .unwrap()
-                .push_front(front.into_iter().skip(len).collect());
-        }
-        Ok(len)
-    }
-
-    fn write_to(&self, stream: StdioOutStream, buf: &[u8]) -> Result<usize, StdioWriteError> {
-        match stream {
-            StdioOutStream::Stdout => &self.stdout_queue,
-            StdioOutStream::Stderr => &self.stderr_queue,
-        }
-        .write()
-        .unwrap()
-        .push_back(buf.to_vec());
-        Ok(buf.len())
-    }
-
-    fn is_a_tty(&self, _stream: StdioStream) -> bool {
-        false
-    }
 }
 
 std::thread_local! {

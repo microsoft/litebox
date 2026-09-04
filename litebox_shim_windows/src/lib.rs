@@ -23,7 +23,7 @@ use litebox::LiteBox;
 use litebox::mm::PageManager;
 use litebox::platform::{
     ArchSpecificProvider, ArchSpecificRegister, PageManagementProvider, RawConstPointer as _,
-    RawMutPointer as _, RawPointerProvider, StdioProvider, SystemInfoProvider, TimeProvider,
+    RawMutPointer as _, RawPointerProvider, SystemInfoProvider, TimeProvider,
 };
 use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
 use litebox::sync::{Mutex, RawSyncPrimitivesProvider};
@@ -423,10 +423,7 @@ impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
         &self,
         in_mem: litebox::fs::in_mem::InMem<Platform>,
         tar_data: Cow<'static, [u8]>,
-    ) -> DefaultFS<Platform>
-    where
-        Platform: StdioProvider,
-    {
+    ) -> DefaultFS<Platform> {
         default_fs(&self.litebox, in_mem, tar_data)
     }
 
@@ -3192,7 +3189,7 @@ fn default_fs<Platform>(
     tar_data: Cow<'static, [u8]>,
 ) -> WindowsFS<Platform>
 where
-    Platform: ShimPlatform + StdioProvider,
+    Platform: ShimPlatform,
 {
     litebox::fs::resolver::Resolver::new(
         litebox,

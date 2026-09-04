@@ -115,7 +115,7 @@ impl Device {
 /// A [`super::backend::Backend`] that supports Unix-y devices.
 pub struct Devices<Platform>
 where
-    Platform: RawSyncPrimitivesProvider + crate::platform::StdioProvider + 'static,
+    Platform: RawSyncPrimitivesProvider + 'static,
 {
     litebox: LiteBox<Platform>,
     /// Stable inode info for this backend's root directory.
@@ -125,7 +125,7 @@ where
 
 impl<Platform> Devices<Platform>
 where
-    Platform: RawSyncPrimitivesProvider + crate::platform::StdioProvider + 'static,
+    Platform: RawSyncPrimitivesProvider + 'static,
 {
     /// Construct a new `Devices` backend.
     #[must_use]
@@ -152,13 +152,13 @@ pub struct DeviceFileHandle {
 pub struct DeviceDirHandle;
 
 impl<Platform> super::backend::private::Sealed for Devices<Platform> where
-    Platform: RawSyncPrimitivesProvider + crate::platform::StdioProvider + 'static
+    Platform: RawSyncPrimitivesProvider + 'static
 {
 }
 
 impl<Platform> BackendHandles for Devices<Platform>
 where
-    Platform: RawSyncPrimitivesProvider + crate::platform::StdioProvider + 'static,
+    Platform: RawSyncPrimitivesProvider + 'static,
 {
     type WalkingDirHandle<'a> = DeviceDirHandle;
     type FileHandle = DeviceFileHandle;
@@ -167,7 +167,7 @@ where
 
 impl<Platform> Backend for Devices<Platform>
 where
-    Platform: RawSyncPrimitivesProvider + crate::platform::StdioProvider + 'static,
+    Platform: RawSyncPrimitivesProvider + 'static,
 {
     fn root(&self) -> WalkingDirHandle<'_> {
         WalkingDirHandle::from_typed::<Self>(DeviceDirHandle)
