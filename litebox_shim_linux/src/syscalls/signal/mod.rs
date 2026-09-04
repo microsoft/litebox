@@ -348,6 +348,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
 
     fn deliver_signal(
         &self,
+        platform: &Platform,
         signal: Signal,
         siginfo: &Siginfo,
         action: &SigAction,
@@ -381,7 +382,14 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
             return Err(DeliverFault);
         }
 
-        self.write_signal_frame(frame_addr, siginfo, action, ctx, sigreturn_trampoline)?;
+        self.write_signal_frame(
+            platform,
+            frame_addr,
+            siginfo,
+            action,
+            ctx,
+            sigreturn_trampoline,
+        )?;
 
         let mut mask = self.blocked.get() | action.mask;
         if !action.flags.contains(SaFlags::NODEFER) {
@@ -484,12 +492,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::EFAULT);
         };
 
+        let Some(result) = arch::restore_sigcontext(self.global.platform, ctx, &uctx.mcontext)
+        else {
+            self.force_signal(Signal::SIGSEGV, false);
+            return Err(Errno::EFAULT);
+        };
         // Restore the alternate signal stack, ignoring errors.
         self.signals.set_sigaltstack(uctx.stack).ok();
-
         self.signals.set_signal_mask(uctx.sigmask);
-
-        Ok(arch::restore_sigcontext(ctx, &uctx.mcontext))
+        Ok(result)
     }
 
     pub(crate) fn sys_rt_sigaction(
@@ -634,8 +645,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 _ => {
                     let delivered =
                         arch::sigreturn_trampoline(self, &action).and_then(|trampoline| {
-                            self.signals
-                                .deliver_signal(signal, &siginfo, &action, ctx, trampoline)
+                            self.signals.deliver_signal(
+                                self.global.platform,
+                                signal,
+                                &siginfo,
+                                &action,
+                                ctx,
+                                trampoline,
+                            )
                         });
                     if let Err(DeliverFault) = delivered {
                         // Failed to deliver signal. Inject a SIGSEGV

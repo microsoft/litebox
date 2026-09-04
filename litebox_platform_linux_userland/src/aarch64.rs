@@ -64,6 +64,10 @@ macro_rules! tprel_offset {
     }};
 }
 
+/// Guest FP/SIMD state in the kernel's `fpsimd_context` field order.
+/// The 16-byte alignment permits paired Q-register loads and stores.
+use litebox_common_linux::signal::aarch64::GuestVectorState;
+
 /// Layout of the AArch64 TLS control block.
 ///
 /// A layout witness only: the storage is the `.tbss` block reserved below, and
@@ -90,6 +94,7 @@ struct TlsBlock {
     outbound_stub: usize,
     outbound_pc: usize,
     resume_frame_initialized: u8,
+    guest_vector_state: GuestVectorState,
     resume_frame: resume_frame::ResumeFrame,
 }
 
@@ -111,6 +116,7 @@ pub(super) mod tls_offset {
     pub(crate) const OUTBOUND_PC: usize = offset_of!(TlsBlock, outbound_pc);
     pub(crate) const RESUME_FRAME_INITIALIZED: usize =
         offset_of!(TlsBlock, resume_frame_initialized);
+    pub(super) const GUEST_VECTOR_STATE: usize = offset_of!(TlsBlock, guest_vector_state);
     pub(crate) const RESUME_FRAME: usize = offset_of!(TlsBlock, resume_frame);
 }
 
@@ -178,6 +184,7 @@ const _: () = assert!(
     tls_offset::GUEST_X18 - tls_offset::GUEST_THREAD_POINTER
         == litebox_syscall_rewriter::aarch64::GUEST_X18_OFFSET_FROM_GUEST_TP
 );
+const _: () = assert!(tls_offset::GUEST_VECTOR_STATE < (1 << 12));
 
 #[cfg(feature = "aarch64_virtualize_x18")]
 fn set_guest_x18(value: usize) {
@@ -432,6 +439,28 @@ syscall_callback_in_guest_cleared:
     mov  x0,  #-{ENOSYS}
     str  x0,  [x16]
 
+    add  x0, x17, #{GUEST_VECTOR_STATE}
+    stp  q0,  q1,  [x0, #0]
+    stp  q2,  q3,  [x0, #32]
+    stp  q4,  q5,  [x0, #64]
+    stp  q6,  q7,  [x0, #96]
+    stp  q8,  q9,  [x0, #128]
+    stp  q10, q11, [x0, #160]
+    stp  q12, q13, [x0, #192]
+    stp  q14, q15, [x0, #224]
+    stp  q16, q17, [x0, #256]
+    stp  q18, q19, [x0, #288]
+    stp  q20, q21, [x0, #320]
+    stp  q22, q23, [x0, #352]
+    stp  q24, q25, [x0, #384]
+    stp  q26, q27, [x0, #416]
+    stp  q28, q29, [x0, #448]
+    stp  q30, q31, [x0, #480]
+    mrs  x1, fpsr
+    mrs  x2, fpcr
+    add  x0, x0, #512
+    stp  w1, w2, [x0]
+
     // `x29` still holds the guest's frame pointer at this point (it was
     // spilled to `regs[29]` above). Re-establish the host value before the
     // `bl`, or the `.cfi_def_cfa x29, 160` rule would resolve against guest
@@ -507,6 +536,7 @@ interrupt_callback:
     GUEST_CONTEXT_SIZE = const core::mem::size_of::<litebox_common_linux::PtRegs>(),
     HOST_SP = const tls_offset::HOST_SP,
     GUEST_CONTEXT_TOP = const tls_offset::GUEST_CONTEXT_TOP,
+    GUEST_VECTOR_STATE = const tls_offset::GUEST_VECTOR_STATE,
     IN_GUEST = const tls_offset::IN_GUEST,
     OUTBOUND_STUB = const tls_offset::OUTBOUND_STUB,
     OUTBOUND_PC = const tls_offset::OUTBOUND_PC,
@@ -539,15 +569,15 @@ const _: () = assert!(
 ///
 /// One instance per guest thread, in this crate's TLS rather than on the guest
 /// stack, which would have to be writable at resume time and lies at a
-/// guest-controlled address. Costs ~4.7KB of `.tbss` per thread.
+/// guest-controlled address. Together with [`GuestVectorState`], costs
+/// about 5.2KiB of `.tbss` per thread.
 ///
-/// The `fpsimd_context` record's `vregs` stay zero -- LiteBox saves no guest
-/// FP/SIMD -- but the record cannot be omitted: `parse_user_sigframe` rejects
-/// a frame without one.
+/// The required `fpsimd_context` record is populated from the platform-owned
+/// guest vector state before each resume.
 pub(super) mod resume_frame {
     use litebox_common_linux::PtRegs;
     use litebox_common_linux::signal::{Siginfo, Ucontext};
-    use zerocopy::{FromBytes, IntoBytes, KnownLayout};
+    use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
     /// `FPSIMD_MAGIC` from `arch/arm64/include/uapi/asm/sigcontext.h`.
     const FPSIMD_MAGIC: u32 = 0x4650_8001;
@@ -561,7 +591,7 @@ pub(super) mod resume_frame {
     /// `fpsr`/`fpcr` sit *between* the header and `vregs`; putting them after
     /// `vregs` instead pads the record out past the size the kernel expects.
     #[repr(C)]
-    #[derive(FromBytes, IntoBytes, KnownLayout)]
+    #[derive(FromBytes, Immutable, IntoBytes, KnownLayout)]
     struct FpsimdContext {
         magic: u32,
         size: u32,
@@ -573,7 +603,7 @@ pub(super) mod resume_frame {
     /// The kernel's `struct _aarch64_ctx`, used on its own as the `END_MAGIC`
     /// terminator that closes the `__reserved` record list.
     #[repr(C)]
-    #[derive(FromBytes, IntoBytes, KnownLayout)]
+    #[derive(FromBytes, Immutable, IntoBytes, KnownLayout)]
     struct Aarch64Ctx {
         magic: u32,
         size: u32,
@@ -595,7 +625,7 @@ pub(super) mod resume_frame {
 
     /// Uses pre-aligned TLS storage to avoid lazy initialization on a path that
     /// must not panic.
-    fn state() -> (*mut ResumeFrame, *mut u8) {
+    fn state() -> (*mut ResumeFrame, *mut u8, usize) {
         let block: usize;
         // SAFETY: materializes the base of this thread's own TLS control
         // block from `TPIDR_EL0`, which always holds the host anchor. Reads no
@@ -610,6 +640,7 @@ pub(super) mod resume_frame {
         (
             (block + super::tls_offset::RESUME_FRAME) as *mut ResumeFrame,
             (block + super::tls_offset::RESUME_FRAME_INITIALIZED) as *mut u8,
+            block,
         )
     }
 
@@ -635,10 +666,89 @@ pub(super) mod resume_frame {
         // the same as writing `SS_DISABLE`, which *would* tear it down.
     }
 
+    /// Finds the kernel FP/SIMD record in a bounded AArch64 context chain.
+    fn find_fpsimd_context(records: &[u8]) -> Option<&FpsimdContext> {
+        let mut records = records;
+        loop {
+            let (header, _) = Aarch64Ctx::ref_from_prefix(records).ok()?;
+            if header.magic == 0 && header.size == 0 {
+                return None;
+            }
+            let size = usize::try_from(header.size).ok()?;
+            if size < size_of::<Aarch64Ctx>() || size > records.len() || !size.is_multiple_of(16) {
+                return None;
+            }
+            if header.magic == FPSIMD_MAGIC {
+                if size != size_of::<FpsimdContext>() {
+                    return None;
+                }
+                return FpsimdContext::ref_from_prefix(&records[..size])
+                    .ok()
+                    .map(|(context, _)| context);
+            }
+            records = &records[size..];
+        }
+    }
+
+    /// Returns this thread's platform-owned guest vector state.
+    fn guest_vector_state(block: usize) -> &'static super::GuestVectorState {
+        // SAFETY: `block` is this thread's TLS base. Mutations happen only in
+        // transition assembly or a signal handler while guest execution is stopped.
+        unsafe { &*((block + super::tls_offset::GUEST_VECTOR_STATE) as *const _) }
+    }
+
+    /// Copies kernel-saved guest FP/SIMD state from a host signal context.
+    /// Returns false if the bounded extension-record chain has no valid record.
+    pub(super) fn capture_signal_vector_state(context: &libc::ucontext_t, block: usize) -> bool {
+        const _: () = assert!(
+            size_of::<libc::mcontext_t>()
+                == size_of::<litebox_common_linux::signal::aarch64::Sigcontext>()
+                && align_of::<libc::mcontext_t>()
+                    == align_of::<litebox_common_linux::signal::aarch64::Sigcontext>()
+                && core::mem::offset_of!(libc::mcontext_t, fault_address)
+                    == core::mem::offset_of!(
+                        litebox_common_linux::signal::aarch64::Sigcontext,
+                        fault_address
+                    )
+                && core::mem::offset_of!(libc::mcontext_t, regs)
+                    == core::mem::offset_of!(
+                        litebox_common_linux::signal::aarch64::Sigcontext,
+                        regs
+                    )
+                && core::mem::offset_of!(libc::mcontext_t, sp)
+                    == core::mem::offset_of!(litebox_common_linux::signal::aarch64::Sigcontext, sp)
+                && core::mem::offset_of!(libc::mcontext_t, pc)
+                    == core::mem::offset_of!(litebox_common_linux::signal::aarch64::Sigcontext, pc)
+                && core::mem::offset_of!(libc::mcontext_t, pstate)
+                    == core::mem::offset_of!(
+                        litebox_common_linux::signal::aarch64::Sigcontext,
+                        pstate
+                    )
+        );
+        // SAFETY: the assertions above pin libc's public prefix and complete
+        // size/alignment to LiteBox's kernel-compatible sigcontext definition.
+        let signal_context = unsafe {
+            &*core::ptr::from_ref(&context.uc_mcontext)
+                .cast::<litebox_common_linux::signal::aarch64::Sigcontext>()
+        };
+        let Some(fpsimd) = find_fpsimd_context(&signal_context.__reserved) else {
+            return false;
+        };
+        // SAFETY: guest execution is stopped and this signal handler has sole
+        // write access to the current thread's TLS vector state.
+        let state = unsafe {
+            &mut *((block + super::tls_offset::GUEST_VECTOR_STATE) as *mut super::GuestVectorState)
+        };
+        state.registers = fpsimd.vregs;
+        state.fpsr = fpsimd.fpsr;
+        state.fpcr = fpsimd.fpcr;
+        true
+    }
+
     /// Fills this thread's frame in from `ctx` and returns it, ready for
     /// `rt_sigreturn`.
     pub(super) fn prepare(ctx: &PtRegs) -> *mut ResumeFrame {
-        let (frame, initialized) = state();
+        let (frame, initialized, block) = state();
         // SAFETY: own-thread [`super::tls_offset`] slot accesses. The `&mut` is
         // exclusive: this is the only function that takes one, it cannot be
         // reentered on this thread (it runs with `in_guest` clear, outside any
@@ -673,38 +783,12 @@ pub(super) mod resume_frame {
         let blocked = unsafe { core::ptr::read_unaligned((&raw const set).cast::<u64>()) };
         frame.ucontext.sigmask = litebox_common_linux::signal::SigSet::from_u64(blocked);
 
-        // `restore_fpsimd_context` installs these, so a zeroed record would
-        // reset the guest's rounding mode and flush-to-zero on every
-        // asynchronous resume. Copying the live values instead makes the resume
-        // a no-op, matching what the outbound-stub path does by not touching
-        // them at all.
-        //
-        // `FPCR` really is the guest's: it is a mode register and nothing
-        // between the guest's exit and here writes one. `FPSR` is not --- its
-        // cumulative exception bits are set by ordinary arithmetic, so the host
-        // code that ran in between has polluted them. Carrying them forward is
-        // still the better of the two options, since zeroing would discard the
-        // guest's own flags on top.
-        //
-        // TODO: preserve vector state across transitions. Asynchronous resume
-        // currently restores zeroed `vregs`, corrupting SIMD-using guests.
-        let status: u32;
-        let control: u32;
-        // SAFETY: reads two floating-point control registers; touches no
-        // memory.
-        unsafe {
-            core::arch::asm!(
-                "mrs {status:x}, fpsr",
-                "mrs {control:x}, fpcr",
-                status = out(reg) status,
-                control = out(reg) control,
-                options(nomem, nostack, preserves_flags)
-            );
-        }
         let (fpsimd, _) = FpsimdContext::mut_from_prefix(&mut frame.ucontext.mcontext.__reserved)
             .expect("__reserved is 4KiB");
-        fpsimd.fpsr = status;
-        fpsimd.fpcr = control;
+        let vector_state = guest_vector_state(block);
+        fpsimd.vregs = vector_state.registers;
+        fpsimd.fpsr = vector_state.fpsr;
+        fpsimd.fpcr = vector_state.fpcr;
 
         let mcontext = &mut frame.ucontext.mcontext;
         for (dst, src) in mcontext.regs.iter_mut().zip(ctx.regs.iter()) {
@@ -733,6 +817,10 @@ pub(super) mod resume_frame {
         use litebox::utils::TruncateExt;
         use litebox_common_linux::PtRegs;
         use litebox_common_linux::signal::{Siginfo, Ucontext, aarch64::Sigcontext};
+        use zerocopy::FromBytes as _;
+
+        #[repr(align(16))]
+        struct AlignedRecords([u8; 4096]);
 
         /// The layout `rt_sigreturn` expects, pinned against the kernel's
         /// `struct rt_sigframe`. This is the whole contract with the kernel:
@@ -775,6 +863,35 @@ pub(super) mod resume_frame {
             assert_eq!(align_of::<FpsimdContext>(), 16);
             assert_eq!(size_of::<Aarch64Ctx>(), 8);
             assert!(size_of::<FpsimdContext>() + size_of::<Aarch64Ctx>() <= 4096);
+        }
+
+        #[test]
+        fn signal_vector_state_parser_accepts_reordered_records_and_rejects_malformed_ones() {
+            const UNKNOWN_MAGIC: u32 = 0x1234_5678;
+            let expected = [0x1122_3344_5566_7788u128; 32];
+            let mut records = AlignedRecords([0; 4096]);
+            let (unknown, rest) = Aarch64Ctx::mut_from_prefix(&mut records.0).unwrap();
+            unknown.magic = UNKNOWN_MAGIC;
+            unknown.size = 16;
+            let (fpsimd, rest) = FpsimdContext::mut_from_prefix(&mut rest[8..]).unwrap();
+            fpsimd.magic = super::FPSIMD_MAGIC;
+            fpsimd.size = u32::try_from(size_of::<FpsimdContext>()).unwrap();
+            fpsimd.vregs = expected;
+            let (end, _) = Aarch64Ctx::mut_from_prefix(rest).unwrap();
+            end.magic = 0;
+            end.size = 0;
+
+            let parsed = super::find_fpsimd_context(&records.0).unwrap();
+            assert_eq!(parsed.vregs, expected);
+
+            records.0[4..8].copy_from_slice(&15u32.to_ne_bytes());
+            assert!(super::find_fpsimd_context(&records.0).is_none());
+
+            records.0.fill(0);
+            assert!(super::find_fpsimd_context(&records.0).is_none());
+            records.0[..4].copy_from_slice(&UNKNOWN_MAGIC.to_ne_bytes());
+            records.0[4..8].copy_from_slice(&4112u32.to_ne_bytes());
+            assert!(super::find_fpsimd_context(&records.0).is_none());
         }
 
         #[test]
@@ -968,6 +1085,30 @@ switch_to_guest_via_outbound_stub_start:
     b    interrupt_callback
 3:
 
+    add  x17, x17, #{GUEST_VECTOR_STATE}
+    add  x17, x17, #512
+    ldp  w16, w4, [x17]
+    sub  x17, x17, #512
+    msr  fpsr, x16
+    msr  fpcr, x4
+    ldp  q0,  q1,  [x17, #0]
+    ldp  q2,  q3,  [x17, #32]
+    ldp  q4,  q5,  [x17, #64]
+    ldp  q6,  q7,  [x17, #96]
+    ldp  q8,  q9,  [x17, #128]
+    ldp  q10, q11, [x17, #160]
+    ldp  q12, q13, [x17, #192]
+    ldp  q14, q15, [x17, #224]
+    ldp  q16, q17, [x17, #256]
+    ldp  q18, q19, [x17, #288]
+    ldp  q20, q21, [x17, #320]
+    ldp  q22, q23, [x17, #352]
+    ldp  q24, q25, [x17, #384]
+    ldp  q26, q27, [x17, #416]
+    ldp  q28, q29, [x17, #448]
+    ldp  q30, q31, [x17, #480]
+    sub  x17, x17, #{GUEST_VECTOR_STATE}
+
     // x16 carries the stub across restoration; guest x16 is staged for the
     // stub to reload.
     ldr  x16, [x17, #{OUTBOUND_STUB}]
@@ -1047,6 +1188,7 @@ switch_to_guest_via_outbound_stub_end:
     ,
     IN_GUEST = const tls_offset::IN_GUEST,
     INTERRUPT = const tls_offset::INTERRUPT,
+    GUEST_VECTOR_STATE = const tls_offset::GUEST_VECTOR_STATE,
     OUTBOUND_STUB = const tls_offset::OUTBOUND_STUB,
     SVC_FRAME_BYTES = const litebox_syscall_rewriter::aarch64::SVC_FRAME_BYTES,
     SVC_FRAME_OFF_X16 = const litebox_syscall_rewriter::aarch64::SVC_FRAME_OFF_X16,
@@ -1129,6 +1271,35 @@ impl litebox::platform::ArchSpecificProvider for LinuxUserland {
         match reg {
             litebox::platform::ArchSpecificRegister::TpidrEl0 => Ok(get_guest_thread_pointer()),
             _ => Err(litebox::platform::ArchSpecificError::RegisterUnsupported),
+        }
+    }
+}
+
+impl litebox::platform::GuestVectorStateProvider for LinuxUserland {
+    type GuestVectorState = GuestVectorState;
+
+    fn get_guest_vector_state(&self) -> GuestVectorState {
+        let block: usize;
+        unsafe {
+            core::arch::asm!(
+                load_tls_block_base!("{block}"),
+                block = out(reg) block,
+                options(nomem, nostack, preserves_flags)
+            );
+            ((block + tls_offset::GUEST_VECTOR_STATE) as *const GuestVectorState).read()
+        }
+    }
+
+    fn set_guest_vector_state(&self, state: &GuestVectorState) {
+        let block: usize;
+        unsafe {
+            core::arch::asm!(
+                load_tls_block_base!("{block}"),
+                block = out(reg) block,
+                options(nomem, nostack, preserves_flags)
+            );
+            ((block + tls_offset::GUEST_VECTOR_STATE) as *mut GuestVectorState)
+                .write(state.clone());
         }
     }
 }
@@ -1767,9 +1938,9 @@ pub(super) fn canonicalize_runtime_aarch64_gate_signal_context(
     )
 }
 
-/// Terminates after gate canonicalization reports an invalid runtime state,
-/// such as ambiguous valid candidates or unreadable runtime-owned TLS.
-pub(super) fn fatal_aarch64_gate_runtime_state() -> ! {
+/// Terminates after AArch64 transition recovery finds invalid runtime state,
+/// such as ambiguous gates, unreadable runtime TLS, or malformed vector state.
+pub(super) fn fatal_aarch64_runtime_state() -> ! {
     // SAFETY: `getpid`, `gettid`, `tgkill` and `exit_group` are
     // async-signal-safe, are admitted by this platform's seccomp filter, and
     // involve no formatting, allocation, locks or destructors.
@@ -1795,13 +1966,14 @@ pub(super) fn fatal_aarch64_gate_runtime_state() -> ! {
     }
 }
 
-/// Clears `in_guest` and optionally sets `interrupt`. Returns the published
-/// guest context only if `in_guest` was set; its registers may still require
-/// copying or gate canonicalization.
+/// Clears `in_guest`, optionally sets `interrupt`, and optionally captures the
+/// kernel-saved vector state. Returns the published guest context only if
+/// `in_guest` was set; its registers may still require copying or gate
+/// canonicalization. Invalid required vector state terminates the process.
 pub(super) fn signal_handler_exit_guest(
-    // Kept for signature parity, so both call sites stay architecture-free.
-    _context: &libc::ucontext_t,
+    context: &libc::ucontext_t,
     set_interrupt: bool,
+    capture_vector_state: bool,
 ) -> Option<*mut litebox_common_linux::PtRegs> {
     let block: usize;
     // SAFETY: materializes the base of this thread's TLS control block from
@@ -1825,6 +1997,9 @@ pub(super) fn signal_handler_exit_guest(
         }
         if was_in_guest == 0 {
             return None;
+        }
+        if capture_vector_state && !resume_frame::capture_signal_vector_state(context, block) {
+            fatal_aarch64_runtime_state();
         }
         let top = ((block + tls_offset::GUEST_CONTEXT_TOP) as *const usize).read_volatile();
         Some((top as *mut litebox_common_linux::PtRegs).sub(1))
@@ -1966,6 +2141,19 @@ mod tests {
         assert_eq!(offset_of!(PtRegs, pstate), 264);
         assert_eq!(offset_of!(PtRegs, orig_x0), 272);
         assert_eq!(offset_of!(PtRegs, syscallno), 280);
+    }
+
+    #[test]
+    fn guest_vector_state_has_kernel_fpsimd_layout_and_zero_default() {
+        let state = GuestVectorState::default();
+        assert_eq!(core::mem::align_of::<GuestVectorState>(), 16);
+        assert_eq!(core::mem::size_of::<GuestVectorState>(), 528);
+        assert_eq!(core::mem::offset_of!(GuestVectorState, registers), 0);
+        assert_eq!(core::mem::offset_of!(GuestVectorState, fpsr), 512);
+        assert_eq!(core::mem::offset_of!(GuestVectorState, fpcr), 516);
+        assert!(state.registers.iter().all(|register| *register == 0));
+        assert_eq!(state.fpsr, 0);
+        assert_eq!(state.fpcr, 0);
     }
 
     fn gate_fixture(

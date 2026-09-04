@@ -43,6 +43,17 @@ pub struct LinuxKernel<Host: HostInterface> {
     boot_instant: Instant,
 }
 
+#[cfg(target_arch = "aarch64")]
+impl<Host: HostInterface> litebox::platform::GuestVectorStateProvider for LinuxKernel<Host> {
+    type GuestVectorState = litebox_common_linux::signal::aarch64::GuestVectorState;
+
+    fn get_guest_vector_state(&self) -> Self::GuestVectorState {
+        Self::GuestVectorState::default()
+    }
+
+    fn set_guest_vector_state(&self, _state: &Self::GuestVectorState) {}
+}
+
 impl<Host: HostInterface> core::fmt::Debug for LinuxKernel<Host> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct(&alloc::format!(

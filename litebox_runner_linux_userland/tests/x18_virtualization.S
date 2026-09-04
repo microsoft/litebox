@@ -36,6 +36,35 @@ _start:
     cmp x17, x0
     b.ne fail
 
+    mov x27, #15
+    mov x0, #0x5050
+    mov x1, #0x5151
+    ins v0.d[0], x0
+    ins v0.d[1], x1
+    mov x0, #0x5858
+    mov x1, #0x5959
+    ins v8.d[0], x0
+    ins v8.d[1], x1
+    mov x8, #172                  // getpid
+    svc #0
+    umov x0, v0.d[0]
+    mov x1, #0x5050
+    cmp x0, x1
+    b.ne fail
+    umov x0, v0.d[1]
+    mov x1, #0x5151
+    cmp x0, x1
+    b.ne fail
+    umov x0, v8.d[0]
+    mov x1, #0x5858
+    cmp x0, x1
+    b.ne fail
+    umov x0, v8.d[1]
+    mov x1, #0x5959
+    cmp x0, x1
+    b.ne fail
+    mov x27, #11
+
     mov x18, #5
     mov x0, #7
     cmp x0, x0                    // C = 1
@@ -55,6 +84,14 @@ _start:
     b.ne fail
 
     mov x27, #14
+    mov x0, #0x6060
+    mov x1, #0x6161
+    ins v0.d[0], x0
+    ins v0.d[1], x1
+    mov x0, #0x6868
+    mov x1, #0x6969
+    ins v8.d[0], x0
+    ins v8.d[1], x1
     adr x18, br_x18_target
     br x18
     b fail
@@ -87,6 +124,22 @@ blr_x18_target:
     mov x18, x30
     ret x18
 indirect_x18_done:
+    umov x0, v0.d[0]
+    mov x1, #0x6060
+    cmp x0, x1
+    b.ne fail
+    umov x0, v0.d[1]
+    mov x1, #0x6161
+    cmp x0, x1
+    b.ne fail
+    umov x0, v8.d[0]
+    mov x1, #0x6868
+    cmp x0, x1
+    b.ne fail
+    umov x0, v8.d[1]
+    mov x1, #0x6969
+    cmp x0, x1
+    b.ne fail
     mov x27, #11
     adr x18, adr_value
     ldr x0, [x18]

@@ -11,6 +11,7 @@ mod arch;
 pub mod common_providers;
 pub mod page_mgmt;
 pub mod trivial_providers;
+mod vector;
 
 #[cfg(test)]
 pub(crate) mod mock;
@@ -20,6 +21,7 @@ use zerocopy::{FromBytes, IntoBytes};
 
 pub use arch::{ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister};
 pub use page_mgmt::PageManagementProvider;
+pub use vector::GuestVectorStateProvider;
 
 /// A provider of a platform upon which LiteBox can execute.
 ///
@@ -27,7 +29,11 @@ pub use page_mgmt::PageManagementProvider;
 /// provided by it. _However_, most of the provided APIs within the provider act upon an `&self` to
 /// allow storage of any useful "globals" within it necessary.
 pub trait Provider:
-    RawMutexProvider + TimeProvider + ArchSpecificProvider + RawPointerProvider
+    RawMutexProvider
+    + TimeProvider
+    + ArchSpecificProvider
+    + GuestVectorStateProvider
+    + RawPointerProvider
 {
 }
 

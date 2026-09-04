@@ -12,12 +12,73 @@ use litebox::mm::linux::PAGE_SIZE;
 use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
 use litebox_common_linux::{
     AARCH64_GENERAL_REGISTER_COUNT, MapFlags, ProtFlags, PtRegs,
-    signal::{SaFlags, SigAction, Siginfo, Ucontext, aarch64::Sigcontext},
+    signal::{
+        SaFlags, SigAction, Siginfo, Ucontext,
+        aarch64::{GuestVectorState, Sigcontext},
+    },
 };
 use litebox_syscall_rewriter::aarch64::{
     RT_SIGRETURN_TRAMPOLINE_BYTES, emit_rt_sigreturn_trampoline,
 };
-use zerocopy::{FromBytes, IntoBytes};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+
+const FPSIMD_MAGIC: u32 = 0x4650_8001;
+
+#[repr(C)]
+#[derive(Clone, FromBytes, Immutable, IntoBytes, KnownLayout)]
+struct FpsimdContext {
+    magic: u32,
+    size: u32,
+    fpsr: u32,
+    fpcr: u32,
+    vregs: [u128; 32],
+}
+
+#[repr(C)]
+#[derive(Clone, FromBytes, Immutable, IntoBytes, KnownLayout)]
+struct Aarch64Ctx {
+    magic: u32,
+    size: u32,
+}
+
+fn write_vector_state(records: &mut [u8; 4096], state: &GuestVectorState) {
+    let (fpsimd, rest) = FpsimdContext::mut_from_prefix(records).unwrap();
+    fpsimd.magic = FPSIMD_MAGIC;
+    fpsimd.size = u32::try_from(size_of::<FpsimdContext>()).unwrap();
+    fpsimd.fpsr = state.fpsr;
+    fpsimd.fpcr = state.fpcr;
+    fpsimd.vregs = state.registers;
+    let (end, _) = Aarch64Ctx::mut_from_prefix(rest).unwrap();
+    end.magic = 0;
+    end.size = 0;
+}
+
+fn read_vector_state(records: &[u8; 4096]) -> Option<GuestVectorState> {
+    let mut records = records.as_slice();
+    let mut state = None;
+    loop {
+        let (header, _) = Aarch64Ctx::ref_from_prefix(records).ok()?;
+        if header.magic == 0 && header.size == 0 {
+            return state;
+        }
+        let size = usize::try_from(header.size).ok()?;
+        if size < size_of::<Aarch64Ctx>() || size > records.len() || !size.is_multiple_of(16) {
+            return None;
+        }
+        if header.magic == FPSIMD_MAGIC {
+            if state.is_some() || size != size_of::<FpsimdContext>() {
+                return None;
+            }
+            let (fpsimd, _) = FpsimdContext::ref_from_prefix(&records[..size]).ok()?;
+            state = Some(GuestVectorState {
+                registers: fpsimd.vregs,
+                fpsr: fpsimd.fpsr,
+                fpcr: fpsimd.fpcr,
+            });
+        }
+        records = &records[size..];
+    }
+}
 
 /// Linux `rt_sigframe` followed by an unwind-link frame record. Dynamic extra
 /// context is omitted.
@@ -110,6 +171,7 @@ pub(super) fn sigreturn_trampoline<Platform: ShimPlatform>(
 impl<Platform: ShimPlatform> SignalState<Platform> {
     pub(super) fn write_signal_frame(
         &self,
+        platform: &Platform,
         frame_addr: usize,
         siginfo: &Siginfo,
         action: &SigAction,
@@ -123,6 +185,8 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
             *dst = *src as u64;
         }
 
+        let mut reserved = [0; 4096];
+        write_vector_state(&mut reserved, &platform.get_guest_vector_state());
         let frame = SignalFrame {
             siginfo: siginfo.clone(),
             ucontext: Ucontext {
@@ -139,13 +203,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
                     pc: ctx.pc as u64,
                     pstate: ctx.pstate,
                     __reserved_pad: [0; _],
-                    // LiteBox writes only the terminating `_aarch64_ctx` and
-                    // omits Linux's required FP/SIMD context.
-                    // TODO: save and restore the guest FP/SIMD context. The
-                    // transition path does not save V registers, so their values
-                    // are unavailable when the frame is built. See
-                    // `run_thread_arch` in `litebox_platform_linux_userland`.
-                    __reserved: [0; _],
+                    __reserved: reserved,
                 },
             },
             next_frame_fp: ctx.regs[29],
@@ -176,7 +234,13 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
     }
 }
 
-pub(super) fn restore_sigcontext(ctx: &mut PtRegs, sigctx: &Sigcontext) -> usize {
+pub(super) fn restore_sigcontext<Platform: ShimPlatform>(
+    platform: &Platform,
+    ctx: &mut PtRegs,
+    sigctx: &Sigcontext,
+) -> Option<usize> {
+    let vector_state = read_vector_state(&sigctx.__reserved)?;
+    platform.set_guest_vector_state(&vector_state);
     let Sigcontext {
         fault_address: _,
         regs,
@@ -184,9 +248,6 @@ pub(super) fn restore_sigcontext(ctx: &mut PtRegs, sigctx: &Sigcontext) -> usize
         pc,
         pstate,
         __reserved_pad: _,
-        // TODO: restore guest FP/SIMD state from extra context records. This
-        // first requires the transition path to save V registers; see
-        // `litebox_platform_linux_userland`.
         __reserved: _,
     } = sigctx;
 
@@ -199,7 +260,7 @@ pub(super) fn restore_sigcontext(ctx: &mut PtRegs, sigctx: &Sigcontext) -> usize
     ctx.pstate = *pstate & litebox_common_linux::arch::SAFE_USER_PSTATE;
     ctx.syscallno = litebox_common_linux::arch::NO_SYSCALL;
 
-    ctx.regs[0]
+    Some(ctx.regs[0])
 }
 
 #[cfg(test)]
@@ -239,5 +300,25 @@ mod tests {
                 0x8000 + offset_of!(SignalFrame, ucontext),
             ))
         );
+    }
+
+    #[test]
+    fn vector_state_round_trips_through_signal_records() {
+        let expected = GuestVectorState {
+            registers: core::array::from_fn(|index| index as u128 * 0x101),
+            fpsr: 0x1234,
+            fpcr: 0x5678,
+        };
+        let mut records = [0; 4096];
+        write_vector_state(&mut records, &expected);
+        assert_eq!(read_vector_state(&records), Some(expected.clone()));
+
+        records[4..8].copy_from_slice(&15u32.to_ne_bytes());
+        assert_eq!(read_vector_state(&records), None);
+
+        write_vector_state(&mut records, &expected);
+        let terminator = size_of::<FpsimdContext>();
+        records[terminator..terminator + 8].fill(0xff);
+        assert_eq!(read_vector_state(&records), None);
     }
 }

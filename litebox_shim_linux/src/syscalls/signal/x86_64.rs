@@ -61,6 +61,7 @@ pub(super) fn sigreturn_trampoline<Platform: ShimPlatform>(
 impl<Platform: ShimPlatform> SignalState<Platform> {
     pub(super) fn write_signal_frame(
         &self,
+        _platform: &Platform,
         frame_addr: usize,
         siginfo: &Siginfo,
         action: &SigAction,
@@ -125,10 +126,11 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
     }
 }
 
-pub(super) fn restore_sigcontext(
+pub(super) fn restore_sigcontext<Platform: ShimPlatform>(
+    _platform: &Platform,
     ctx: &mut PtRegs,
     sigctx: &litebox_common_linux::signal::x86_64::Sigcontext,
-) -> usize {
+) -> Option<usize> {
     let litebox_common_linux::signal::x86_64::Sigcontext {
         r8,
         r9,
@@ -181,5 +183,5 @@ pub(super) fn restore_sigcontext(
 
     // TODO: restore fpstate
 
-    ctx.rax
+    Some(ctx.rax)
 }
