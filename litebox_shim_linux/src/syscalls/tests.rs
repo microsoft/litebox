@@ -103,9 +103,9 @@ pub(crate) fn init_platform() -> crate::Task<TestPlatform> {
 }
 
 #[must_use]
-pub(crate) fn init_platform_with_pipe_broker() -> crate::Task<TestPlatform> {
+pub(crate) fn init_platform_with_broker() -> crate::Task<TestPlatform> {
     let platform = test_platform();
-    let setup = PipeBrokerSetup::new();
+    let setup = TestBrokerSetup::new();
     let (broker_local, ()) = BrokerLocal::negotiate(setup, |setup| {
         let memory: alloc::sync::Arc<dyn SharedMemory> = setup.memory.clone();
         Ok((setup.activate(), memory, ()))
@@ -129,12 +129,12 @@ fn init_platform_with_builder(
     shim_builder.build().0.new_test_task(fs)
 }
 
-struct PipeBrokerSetup {
+struct TestBrokerSetup {
     memory: alloc::sync::Arc<TestSharedMemory>,
     session: BrokerSession,
 }
 
-impl PipeBrokerSetup {
+impl TestBrokerSetup {
     fn new() -> Self {
         Self {
             memory: alloc::sync::Arc::new(TestSharedMemory::new()),
@@ -144,16 +144,16 @@ impl PipeBrokerSetup {
         }
     }
 
-    fn activate(self) -> PipeBrokerChannel {
+    fn activate(self) -> TestBrokerChannel {
         let shared_buffers = SharedBufferPool::new(self.memory, SHARED_BUFFER_LAYOUT).unwrap();
-        PipeBrokerChannel {
+        TestBrokerChannel {
             session: self.session,
             shared_buffers,
         }
     }
 }
 
-impl LocalSetupChannel for PipeBrokerSetup {
+impl LocalSetupChannel for TestBrokerSetup {
     type Error = core::convert::Infallible;
 
     fn send_handshake_request(
@@ -173,12 +173,12 @@ impl LocalSetupChannel for PipeBrokerSetup {
     }
 }
 
-struct PipeBrokerChannel {
+struct TestBrokerChannel {
     session: BrokerSession,
     shared_buffers: SharedBufferPool<alloc::sync::Arc<TestSharedMemory>>,
 }
 
-impl PipeBrokerChannel {
+impl TestBrokerChannel {
     fn execute(&self, operation: BrokerOperation) -> litebox_broker_core::Result<BrokerResult> {
         match operation {
             BrokerOperation::CloseObject(handle) => self
@@ -242,7 +242,7 @@ impl PipeBrokerChannel {
     }
 }
 
-impl LocalCallChannel for PipeBrokerChannel {
+impl LocalCallChannel for TestBrokerChannel {
     type Error = core::convert::Infallible;
 
     fn call(&self, request: BrokerRequest) -> core::result::Result<BrokerResponse, Self::Error> {
@@ -415,7 +415,7 @@ fn exceptions_queue_their_corresponding_signals() {
 
 #[test]
 fn test_fcntl() {
-    let task = init_platform_with_pipe_broker();
+    let task = init_platform_with_broker();
 
     let check = |fd: i32, flags1: OFlags, flags2: OFlags| {
         assert_eq!(
@@ -483,7 +483,7 @@ fn test_pipe2_requires_broker() {
 
 #[test]
 fn test_pipe2_race_with_concurrent_close() {
-    let task = init_platform_with_pipe_broker();
+    let task = init_platform_with_broker();
     task.files.borrow().set_max_fd(4);
 
     let stop = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));

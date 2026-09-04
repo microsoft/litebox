@@ -12,7 +12,7 @@ mod tests {
 
     use crate::{
         UserPtrMut,
-        syscalls::tests::{init_platform, init_platform_with_pipe_broker},
+        syscalls::tests::{init_platform, init_platform_with_broker},
     };
 
     fn termios() -> Termios {
@@ -140,7 +140,7 @@ mod tests {
 
     #[test]
     fn test_stdio_terminal_query_uses_broker() {
-        let task = init_platform_with_pipe_broker();
+        let task = init_platform_with_broker();
         let mut termios = termios();
 
         assert_eq!(
