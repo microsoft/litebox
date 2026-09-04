@@ -449,6 +449,8 @@ pub struct SessionManager {
     /// pass the limit before either registers.
     pending_count: SpinMutex<usize>,
     /// Cached TA flags by UUID, populated on first successful session registration.
+    /// New entries are published under `ta_load_lock` and are never updated
+    /// or removed; the post-acquire recheck relies on this.
     ///
     /// TODO: a TA's flags (in particular single- vs multi-instance) can
     /// change across a version update of the same UUID. Key this map by
@@ -607,11 +609,8 @@ impl SessionManager {
     ///
     /// - **Known single-instance**: per-UUID lock flag.
     /// - **Known multi-instance**: no lock (each session is independent).
-    /// - **Unknown**: the global `ta_load_lock`. This serializes first-loads
-    ///   of all not-yet-known UUIDs together, but avoids minting a per-UUID
-    ///   lock entry until the TA has been confirmed single-instance. A failed
-    ///   or multi-instance load therefore leaves no stale entry in
-    ///   `single_instance_locks`.
+    /// - **Unknown**: get the global `ta_load_lock`, recheck flags, and transition
+    ///   to the per-UUID lock or no lock if the flags is published.
     ///
     /// Returns `Err(EThreadLimit)` on contention.
     fn try_acquire_for_open(&self, uuid: TeeUuid) -> Result<SessionToken<'_>, OpteeSmcReturnCode> {
@@ -621,10 +620,26 @@ impl SessionManager {
                     .ok_or(OpteeSmcReturnCode::EThreadLimit)?,
             ),
             Some(_) => None,
-            None => Some(
-                self.try_acquire_ta_load_lock()
-                    .ok_or(OpteeSmcReturnCode::EThreadLimit)?,
-            ),
+            None => {
+                let load_lock = self
+                    .try_acquire_ta_load_lock()
+                    .ok_or(OpteeSmcReturnCode::EThreadLimit)?;
+
+                // Another concurrent opener might have loaded this TA and published flags.
+                // Recheck to change the lock domain.
+                if let Some(flags) = self.get_known_flags(&uuid) {
+                    if flags.is_single_instance() {
+                        let uuid_lock = self.try_acquire_uuid_lock(uuid);
+                        self.release_uuid_lock(load_lock);
+                        Some(uuid_lock.ok_or(OpteeSmcReturnCode::EThreadLimit)?)
+                    } else {
+                        self.release_uuid_lock(load_lock);
+                        None
+                    }
+                } else {
+                    Some(load_lock)
+                }
+            }
         };
         Ok(SessionToken {
             manager: self,
