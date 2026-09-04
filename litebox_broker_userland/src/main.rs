@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use litebox_broker_core::random::{RandomProvider, RandomProviderError};
+use litebox_broker_core::stdio::{StdioProvider, StdioProviderError};
 use litebox_broker_core::{
     BrokerCore, CallerCredential, DestinationPortRange, DestinationRule, Ipv4Cidr, SocketPolicy,
     SocketPolicyError,
@@ -25,6 +26,7 @@ use litebox_broker_host::{BrokerHostAssociation, ConnectionTermination, setup_co
 use litebox_broker_protocol::message::{BrokerRequest, BrokerResponse};
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_LAYOUT;
 use litebox_broker_protocol::socket::{Ipv4Address, Port};
+use litebox_broker_protocol::stdio::StdioOutputStream;
 use litebox_broker_transport::channel::{HostNotificationChannel, HostReceive, HostSetupChannel};
 use litebox_broker_transport::control_ring::ControlRing;
 use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedBufferPool, SharedMemory};
@@ -47,6 +49,34 @@ impl RandomProvider for UserlandRandomProvider {
     fn fill(&self, output: &mut [u8]) -> Result<(), RandomProviderError> {
         getrandom::fill(output).map_err(|_| RandomProviderError)
     }
+}
+
+/// Routes output from the broker's single child runner to inherited streams.
+///
+/// A broker serving multiple runners will need association-specific output
+/// destinations instead of sharing process-wide standard streams.
+struct UserlandStdioProvider;
+
+impl StdioProvider for UserlandStdioProvider {
+    fn write(&self, stream: StdioOutputStream, input: &[u8]) -> Result<usize, StdioProviderError> {
+        let result = match stream {
+            StdioOutputStream::Stdout => write_and_flush(std::io::stdout().lock(), input),
+            StdioOutputStream::Stderr => write_and_flush(std::io::stderr().lock(), input),
+        };
+        result.map_err(|error| {
+            if error.kind() == ErrorKind::BrokenPipe {
+                StdioProviderError::Closed
+            } else {
+                StdioProviderError::Failed
+            }
+        })
+    }
+}
+
+fn write_and_flush(mut output: impl std::io::Write, input: &[u8]) -> IoResult<usize> {
+    let written = output.write(input)?;
+    output.flush()?;
+    Ok(written)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -779,6 +809,7 @@ mod tests {
                 PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()),
                 Arc::new(UnsupportedSocketProvider),
                 Arc::new(UserlandRandomProvider),
+                Arc::new(UserlandStdioProvider),
             )
             .unwrap();
             let shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();

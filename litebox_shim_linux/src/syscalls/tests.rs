@@ -8,6 +8,7 @@ use litebox_broker_core::{
     random::{RandomProvider, RandomProviderError},
     readiness::ReadinessRegistration,
     socket::{PlatformSocket, SocketProvider},
+    stdio::UnsupportedStdioProvider,
 };
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::{
@@ -62,6 +63,7 @@ fn test_broker() -> &'static BrokerCore {
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all()),
             alloc::sync::Arc::new(PipeOnlySocketProvider),
             alloc::sync::Arc::new(UnusedRandomProvider),
+            alloc::sync::Arc::new(UnsupportedStdioProvider),
         )
         .unwrap()
     })

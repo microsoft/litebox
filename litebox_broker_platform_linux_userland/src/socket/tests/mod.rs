@@ -11,6 +11,7 @@ use super::*;
 use litebox_broker_core::random::{RandomProvider, RandomProviderError};
 use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_core::socket::{GUEST_IPV4_ADDRESS, HOST_GATEWAY_IPV4_ADDRESS};
+use litebox_broker_core::stdio::UnsupportedStdioProvider;
 use litebox_broker_core::{
     BrokerCore, BrokerCoreLimits, BrokerSession, CallerCredential, DestinationPortRange,
     DestinationRule, Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy,
@@ -48,6 +49,7 @@ fn test_broker_core(
         limits,
         socket_provider,
         Arc::new(TestRandomProvider),
+        Arc::new(UnsupportedStdioProvider),
     )
 }
 

@@ -3,8 +3,7 @@
 
 //! Tests for guests whose syscall sites the rewriter redirected.
 //!
-//! Guests run under `--rewrite-syscalls` with no tar rootfs; broker-backed
-//! guests live in `run.rs`.
+//! Guests run under `--rewrite-syscalls` with no tar rootfs.
 
 #[allow(dead_code, reason = "shared with the other test binaries")]
 mod cache;
@@ -16,8 +15,28 @@ fn run_rewritten_fixture(source: &str, unique_name: &str) -> std::process::Outpu
     let binary_path = std::env::var("NEXTEST_BIN_EXE_litebox_runner_linux_userland")
         .unwrap_or_else(|_| env!("CARGO_BIN_EXE_litebox_runner_linux_userland").to_string());
 
-    std::process::Command::new(binary_path)
-        .args(["--unstable", "--rewrite-syscalls"])
+    #[cfg(target_os = "linux")]
+    let mut command = {
+        let broker_path =
+            std::path::Path::new(&binary_path).with_file_name("litebox-broker-userland");
+        assert!(
+            broker_path.is_file(),
+            "brokered runner tests require a workspace build producing {}",
+            broker_path.display()
+        );
+        let mut command = std::process::Command::new(broker_path);
+        command.arg("--runner").arg(&binary_path);
+        command
+    };
+    #[cfg(not(target_os = "linux"))]
+    let mut command = {
+        let mut command = std::process::Command::new(binary_path);
+        command.arg("--unstable");
+        command
+    };
+
+    command
+        .args(["--rewrite-syscalls"])
         .arg(target)
         .output()
         .expect("Failed to run litebox_runner_linux_userland")

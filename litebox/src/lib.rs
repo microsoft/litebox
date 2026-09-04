@@ -26,6 +26,7 @@ pub mod pipes;
 pub mod platform;
 pub mod random;
 pub mod shim;
+pub mod stdio;
 pub mod sync;
 pub mod tls;
 

@@ -25,6 +25,7 @@ mod event;
 mod pipe;
 mod random;
 mod socket;
+mod stdio;
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -238,8 +239,12 @@ mod tests {
     use core::convert::Infallible;
     use litebox_broker_protocol::ObjectHandle;
     use litebox_broker_protocol::ProtocolVersion;
-    use litebox_broker_protocol::message::ReadinessNotification;
+    use litebox_broker_protocol::message::{ReadinessNotification, StdioRequest, StdioResponse};
     use litebox_broker_protocol::readiness::ReadinessFlags;
+    use litebox_broker_protocol::shared_buffer::{SharedBufferDescriptor, SharedBufferSlotIndex};
+    use litebox_broker_protocol::stdio::{
+        StdioOutputStream, WriteStdioRequest, WriteStdioResponse,
+    };
     use litebox_broker_transport::channel::LocalNotificationChannel;
     use std::sync::Mutex;
 
@@ -288,6 +293,42 @@ mod tests {
             Some(BrokerRequest {
                 request_id: RequestId(0),
                 operation: request,
+            })
+        );
+    }
+
+    #[test]
+    fn write_stdio_stages_the_requested_stream_and_buffer() {
+        let descriptor = SharedBufferDescriptor {
+            slot_index: SharedBufferSlotIndex(2),
+            length: 3,
+        };
+        let channel = FakeControlChannel::new(
+            None,
+            Some(BrokerResult::Stdio(StdioResponse::Write(
+                WriteStdioResponse { written: 2 },
+            ))),
+        );
+        let local = BrokerLocal {
+            channel,
+            shared_buffers: noop_shared_buffers(),
+            next_request_id: AtomicU64::new(0),
+        };
+
+        assert_eq!(
+            local
+                .write_stdio(StdioOutputStream::Stderr, descriptor, b"err")
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            local.channel.sent_request.borrow().clone(),
+            Some(BrokerRequest {
+                request_id: RequestId(0),
+                operation: BrokerOperation::Stdio(StdioRequest::Write(WriteStdioRequest {
+                    stream: StdioOutputStream::Stderr,
+                    buffer: descriptor,
+                })),
             })
         );
     }

@@ -39,6 +39,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -350,33 +351,71 @@ def _run_litebox_cmd(
     # Use a shorter timeout for alarm-based benchmarks under LiteBox,
     # since if SIGALRM isn't delivered the process will hang forever.
     timeout = duration * 3 + 30 if bench.uses_alarm else duration * 10 + 60
-    try:
-        result = subprocess.run(
-            cmd, capture_output=True, timeout=timeout,
+    popen_options = {}
+    if sys.platform == "win32":
+        popen_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_options["start_new_session"] = True
+    with tempfile.TemporaryFile() as stderr_file:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr_file,
+            **popen_options,
         )
-    except subprocess.TimeoutExpired:
-        hint = " (this benchmark uses alarm/SIGALRM)" if bench.uses_alarm else ""
-        print(f"  [TIMEOUT] {bench.name}{hint}")
-        return None
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _terminate_process_tree(process)
+            hint = " (this benchmark uses alarm/SIGALRM)" if bench.uses_alarm else ""
+            print(f"  [TIMEOUT] {bench.name}{hint}")
+            return None
+        except KeyboardInterrupt:
+            _terminate_process_tree(process)
+            raise
+
+        stderr_file.seek(0)
+        stderr = stderr_file.read()
     elapsed = time.monotonic() - t0
 
-    if result.returncode != 0:
-        stderr = result.stderr.decode("utf-8", errors="replace")
-        print(f"  [FAIL] {bench.name} exited with {result.returncode}")
-        print(f"  stderr (last 300 chars): ...{stderr[-300:]}")
+    if process.returncode != 0:
+        decoded_stderr = stderr.decode("utf-8", errors="replace")
+        print(f"  [FAIL] {bench.name} exited with {process.returncode}")
+        print(f"  stderr (last 300 chars): ...{decoded_stderr[-300:]}")
         return None
 
-    stderr = result.stderr.decode("utf-8", errors="replace")
-    parsed = parse_count_line(stderr)
+    decoded_stderr = stderr.decode("utf-8", errors="replace")
+    parsed = parse_count_line(decoded_stderr)
     if parsed is None:
-        print(f"  [FAIL] {bench.name}: no COUNT line in stderr:\n{stderr[:500]}")
+        print(f"  [FAIL] {bench.name}: no COUNT line in stderr:\n{decoded_stderr[:500]}")
         return None
 
     count, base, unit = parsed
     return BenchmarkResult(
         name=bench.name, count=count, base=base, unit=unit,
-        elapsed=elapsed, raw_stderr=stderr,
+        elapsed=elapsed, raw_stderr=decoded_stderr,
     )
+
+
+def _terminate_process_tree(process: subprocess.Popen) -> None:
+    """Terminate a timed-out broker and the runner process it launched."""
+    if sys.platform == "win32":
+        result = subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            capture_output=True,
+        )
+        if process.poll() is None:
+            if result.returncode != 0:
+                error = result.stderr.decode("utf-8", errors="replace").strip()
+                print(f"  Warning: process-tree termination failed: {error}")
+            process.kill()
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    process.wait()
 
 
 def run_litebox(
@@ -395,10 +434,11 @@ def run_litebox(
         return None
 
     tar_path, rewritten = prepared
+    broker_path = runner_path.with_name("litebox-broker-userland")
 
     cmd = [
-        str(runner_path),
-        "--unstable",
+        str(broker_path),
+        "--runner", str(runner_path),
         "--env", "LD_LIBRARY_PATH=/lib64:/lib32:/lib",
         "--env", "HOME=/",
     ]
@@ -448,8 +488,10 @@ def run_litebox_windows(
         print(f"  [SKIP] {bench.name}: tar not found at {tar_path}")
         return None
 
+    broker_path = runner_path.with_name("litebox-broker-userland.exe")
     cmd = [
-        str(runner_path),
+        str(broker_path),
+        "--runner", str(runner_path),
         "--env", "LD_LIBRARY_PATH=/lib64:/lib32:/lib",
         "--env", "HOME=/",
     ]
@@ -533,7 +575,7 @@ def build_litebox_binaries(
     workspace_root: Path, release: bool,
 ) -> tuple[Path, Path]:
     """
-    Build litebox_runner_linux_userland and litebox_packager via cargo.
+    Build the LiteBox runner, broker, and packager via cargo.
 
     Returns (runner_path, packager_path).
     """
@@ -541,6 +583,7 @@ def build_litebox_binaries(
     cmd = [
         "cargo", "build",
         "-p", "litebox_runner_linux_userland",
+        "-p", "litebox_broker_userland",
         "-p", "litebox_packager",
     ]
     if release:
@@ -554,8 +597,10 @@ def build_litebox_binaries(
     print("Build complete.")
 
     runner = workspace_root / "target" / build_type / "litebox_runner_linux_userland"
+    broker = workspace_root / "target" / build_type / "litebox-broker-userland"
     packager = workspace_root / "target" / build_type / "litebox_packager"
     assert runner.exists(), f"Runner not found at {runner}"
+    assert broker.exists(), f"Broker not found at {broker}"
     assert packager.exists(), f"Packager not found at {packager}"
     return runner, packager
 
@@ -604,7 +649,8 @@ def main():
     )
     parser.add_argument(
         "--runner-path", type=str, default=None,
-        help="Path to litebox_runner_linux_userland binary (auto-detected if not given)",
+        help="Path to the LiteBox runner binary; litebox-broker-userland must be beside it "
+             "(auto-detected if not given)",
     )
     parser.add_argument(
         "--packager-path", type=str, default=None,
@@ -692,6 +738,7 @@ def main():
                 build_cmd = [
                     "cargo", "build",
                     "-p", "litebox_runner_linux_on_windows_userland",
+                    "-p", "litebox_broker_userland",
                 ]
                 if args.release:
                     build_cmd.append("--release")
@@ -724,6 +771,22 @@ def main():
             runner_path, packager_path = build_litebox_binaries(
                 workspace_root, args.release,
             )
+
+        if not runner_path.exists():
+            print(f"Error: LiteBox runner not found at {runner_path}")
+            sys.exit(1)
+        broker_name = (
+            "litebox-broker-userland.exe"
+            if is_windows_mode
+            else "litebox-broker-userland"
+        )
+        broker_path = runner_path.with_name(broker_name)
+        if not broker_path.exists():
+            print(f"Error: LiteBox broker not found at {broker_path}")
+            print("Build it beside the runner:")
+            print("  cargo build -p litebox_broker_userland"
+                  + (" --release" if args.release else ""))
+            sys.exit(1)
 
     # Working directory
     if args.work_dir:

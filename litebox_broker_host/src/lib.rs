@@ -30,6 +30,7 @@ use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse};
 use litebox_broker_protocol::message::{
     BrokerHandshakeResponse, BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
     EventRequest, EventResponse, PipeRequest, PipeResponse, SocketRequest, SocketResponse,
+    StdioRequest, StdioResponse,
 };
 use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
@@ -43,6 +44,9 @@ use litebox_broker_protocol::socket::{
     ListenSocketResponse, MAX_SOCKET_PEEK_SIZE, MAX_SOCKET_TRANSFER_SIZE, MAX_TCP_LISTEN_BACKLOG,
     MAX_UDP_DATAGRAM_SIZE, ReceiveFlags, ReceiveFromSocketResponse, ReceiveSocketResponse,
     SendSocketResponse, SendToSocketResponse, SocketOutcome,
+};
+use litebox_broker_protocol::stdio::{
+    MAX_STDIO_TRANSFER_SIZE, WriteStdioRequest, WriteStdioResponse,
 };
 use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, RequestId};
 use litebox_broker_transport::channel::{HostReceive, HostSetupChannel, PeerCredential};
@@ -98,6 +102,7 @@ impl<Memory: SharedMemory> BrokerHostAssociation<'_, Memory> {
             BrokerOperation::Socket(SocketRequest::SendTo(request)) => Some(request.buffer),
             BrokerOperation::Socket(SocketRequest::Receive(request)) => Some(request.buffer),
             BrokerOperation::Socket(SocketRequest::ReceiveFrom(request)) => Some(request.buffer),
+            BrokerOperation::Stdio(StdioRequest::Write(request)) => Some(request.buffer),
             BrokerOperation::CloseObject(_)
             | BrokerOperation::CheckReadiness(_)
             | BrokerOperation::Event(_)
@@ -368,6 +373,36 @@ fn handle_request<Memory: SharedMemory>(
                 .write(buffer.slot_index, data)
                 .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
             Ok(BrokerResult::RandomFilled)
+        }
+        BrokerOperation::Stdio(request) => {
+            handle_stdio_request(session, request, shared_buffers).map(BrokerResult::Stdio)
+        }
+    }
+}
+
+fn handle_stdio_request<Memory: SharedMemory>(
+    session: &BrokerSession,
+    request: StdioRequest,
+    shared_buffers: &SharedBufferPool<Memory>,
+) -> RequestResult<StdioResponse> {
+    match request {
+        StdioRequest::Write(WriteStdioRequest { stream, buffer }) => {
+            if buffer.length > MAX_STDIO_TRANSFER_SIZE {
+                return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
+            }
+            let mut data = Vec::new();
+            data.try_reserve_exact(buffer.length as usize)
+                .map_err(|_| RequestFailure::Respond(ErrorCode::OutOfMemory))?;
+            data.resize(buffer.length as usize, 0);
+            shared_buffers
+                .read(buffer.slot_index, &mut data)
+                .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
+            let written = litebox_broker_core::stdio::write(session, stream, &data)
+                .map_err(RequestFailure::from)?;
+            Ok(StdioResponse::Write(WriteStdioResponse {
+                written: u32::try_from(written)
+                    .expect("validated stdio write length must fit in u32"),
+            }))
         }
     }
 }
@@ -716,6 +751,7 @@ mod tests {
         AcceptedPlatformSocket, PlatformConnectError, PlatformDatagramReceive, PlatformSocket,
         PlatformSocketStatus, PlatformStreamReceive, SocketProvider,
     };
+    use litebox_broker_core::stdio::{StdioProvider, StdioProviderError};
     use litebox_broker_core::{ObjectRights, PolicyEngine, SessionId, SocketPolicy};
     use litebox_broker_protocol::event::{
         AddEventRequest, ConsumeEventRequest, CreateEventRequest, EventConsumeMode,
@@ -735,6 +771,7 @@ mod tests {
         SocketError, SocketStatusRequest, SocketStatusResponse, SocketType, TcpOptionName,
         TcpOptionValue,
     };
+    use litebox_broker_protocol::stdio::StdioOutputStream;
     use litebox_broker_protocol::{ObjectHandle, ProtocolVersion, RequestId};
     use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemoryError};
     use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -801,6 +838,22 @@ mod tests {
             }
             output.fill(0x5a);
             Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct TestStdioProvider {
+        writes: Mutex<Vec<(StdioOutputStream, Vec<u8>)>>,
+    }
+
+    impl StdioProvider for TestStdioProvider {
+        fn write(
+            &self,
+            stream: StdioOutputStream,
+            input: &[u8],
+        ) -> core::result::Result<usize, StdioProviderError> {
+            self.writes.lock().unwrap().push((stream, input.to_vec()));
+            Ok(input.len())
         }
     }
 
@@ -953,11 +1006,13 @@ mod tests {
 
     #[test]
     fn host_request_handling_uses_one_broker_core() {
+        let stdio_provider = Arc::new(TestStdioProvider::default());
         let broker = BrokerCore::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_socket_policy(SocketPolicy::guest_network()),
             Arc::new(TestSocketProvider),
             Arc::new(TestRandomProvider),
+            Arc::clone(&stdio_provider) as Arc<dyn StdioProvider>,
         )
         .unwrap();
 
@@ -976,6 +1031,7 @@ mod tests {
         association_shared_buffer_descriptors_stage_pipe_data(&broker);
         association_shared_buffer_descriptors_stage_socket_data(&broker);
         association_shared_buffer_descriptor_stages_random_data(&broker);
+        association_shared_buffer_descriptor_stages_stdio_data(&broker, &stdio_provider);
         shared_buffer_usage_rejects_invalid_descriptors();
         association_executes_distinct_slots_concurrently(&broker);
         association_allows_slot_reuse_during_response_emission(&broker);
@@ -1032,6 +1088,47 @@ mod tests {
             .read(SharedBufferSlotIndex(3), &mut output)
             .unwrap();
         assert_eq!(output, [0xa5; 2]);
+    }
+
+    fn association_shared_buffer_descriptor_stages_stdio_data(
+        broker: &BrokerCore,
+        provider: &TestStdioProvider,
+    ) {
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let shared_buffers = test_shared_buffers();
+        shared_buffers
+            .write(SharedBufferSlotIndex(7), b"error")
+            .unwrap();
+
+        assert_eq!(
+            handle_test_request_with_buffers(
+                &session,
+                BrokerOperation::Stdio(StdioRequest::Write(WriteStdioRequest {
+                    stream: StdioOutputStream::Stderr,
+                    buffer: descriptor(7, 5),
+                })),
+                &shared_buffers,
+            ),
+            BrokerResult::Stdio(StdioResponse::Write(WriteStdioResponse { written: 5 }))
+        );
+        assert_eq!(
+            provider.writes.lock().unwrap().as_slice(),
+            [(StdioOutputStream::Stderr, b"error".to_vec())]
+        );
+        assert_eq!(
+            handle_request(
+                &session,
+                BrokerOperation::Stdio(StdioRequest::Write(WriteStdioRequest {
+                    stream: StdioOutputStream::Stdout,
+                    buffer: descriptor(7, MAX_STDIO_TRANSFER_SIZE + 1),
+                })),
+                &shared_buffers,
+                &test_readiness_sink(),
+            ),
+            Err(RequestFailure::Abort(ErrorCode::MalformedRequest))
+        );
     }
 
     fn test_channel_negotiates_routes_one_request_and_returns_peer_closed(broker: &BrokerCore) {

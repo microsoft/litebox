@@ -21,6 +21,7 @@ use crate::socket::{
     SendToSocketResponse, SetTcpOptionRequest, ShutdownSocketRequest, SocketError,
     SocketStatusRequest, SocketStatusResponse,
 };
+use crate::stdio::{WriteStdioRequest, WriteStdioResponse};
 use crate::{ObjectHandle, ProtocolVersion, RequestId};
 
 /// Broker handshake request sent before the control channel is active.
@@ -45,6 +46,8 @@ pub enum BrokerOperation {
     Socket(SocketRequest),
     /// Fill a shared buffer with cryptographically secure random bytes.
     FillRandom(SharedBufferDescriptor),
+    /// Standard-I/O request family.
+    Stdio(StdioRequest),
 }
 
 /// Request sent over an active broker control channel.
@@ -148,6 +151,8 @@ pub enum BrokerResult {
     Socket(SocketResponse),
     /// The requested shared buffer was filled with random bytes.
     RandomFilled,
+    /// Standard-I/O response family.
+    Stdio(StdioResponse),
     /// Operation failed with an ABI-neutral broker error.
     Error(ErrorCode),
 }
@@ -221,6 +226,20 @@ pub enum SocketResponse {
     ///
     /// [`SocketConnectionStatus`]: crate::socket::SocketConnectionStatus
     Failed(SocketError),
+}
+
+/// Standard-I/O request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StdioRequest {
+    /// Write bytes to a standard output stream.
+    Write(WriteStdioRequest),
+}
+
+/// Standard-I/O response.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StdioResponse {
+    /// Standard output write response.
+    Write(WriteStdioResponse),
 }
 
 /// Broker-initiated asynchronous notification.

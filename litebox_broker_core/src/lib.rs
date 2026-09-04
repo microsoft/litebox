@@ -26,6 +26,7 @@ pub mod random;
 pub mod readiness;
 mod session;
 pub mod socket;
+pub mod stdio;
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -43,6 +44,7 @@ use random::RandomProvider;
 use session::ObjectReference;
 pub use session::{BrokerSession, CallerCredential, ObjectRights, SessionId};
 use socket::{BrokerSocketPorts, SocketProvider};
+use stdio::StdioProvider;
 
 /// BrokerCore result type.
 pub type Result<T> = core::result::Result<T, BrokerError>;
@@ -119,6 +121,7 @@ pub struct BrokerCore {
     pub(crate) reserved_pipe_capacity: Arc<AtomicUsize>,
     pub(crate) reserved_sockets: Arc<AtomicUsize>,
     pub(crate) random_provider: Arc<dyn RandomProvider>,
+    pub(crate) stdio_provider: Arc<dyn StdioProvider>,
     pub(crate) socket_provider: Arc<dyn SocketProvider>,
     pub(crate) socket_ports: BrokerSocketPorts,
 }
@@ -126,26 +129,29 @@ pub struct BrokerCore {
 static BROKER_CORE_CREATED: AtomicBool = AtomicBool::new(false);
 
 impl BrokerCore {
-    /// Creates the broker core with a broker-wide platform socket provider.
+    /// Creates the broker core with broker-wide platform service providers.
     pub fn new(
         policy: PolicyEngine,
         socket_provider: Arc<dyn SocketProvider>,
         random_provider: Arc<dyn RandomProvider>,
+        stdio_provider: Arc<dyn StdioProvider>,
     ) -> Result<Self> {
         Self::new_with_limits(
             policy,
             BrokerCoreLimits::DEFAULT,
             socket_provider,
             random_provider,
+            stdio_provider,
         )
     }
 
-    /// Creates the broker core with explicit limits and a socket provider.
+    /// Creates the broker core with explicit limits and platform service providers.
     pub fn new_with_limits(
         policy: PolicyEngine,
         limits: BrokerCoreLimits,
         socket_provider: Arc<dyn SocketProvider>,
         random_provider: Arc<dyn RandomProvider>,
+        stdio_provider: Arc<dyn StdioProvider>,
     ) -> Result<Self> {
         BROKER_CORE_CREATED
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -161,6 +167,7 @@ impl BrokerCore {
             reserved_pipe_capacity: Arc::new(AtomicUsize::new(0)),
             reserved_sockets: Arc::new(AtomicUsize::new(0)),
             random_provider,
+            stdio_provider,
             socket_provider,
             socket_ports: BrokerSocketPorts::default(),
         })

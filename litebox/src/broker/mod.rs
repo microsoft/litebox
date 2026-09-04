@@ -21,6 +21,7 @@ use litebox_broker_protocol::socket::{
     ReceiveFromSocketResponse, ReceiveSocketResponse, SendFlags as BrokerSendFlags, ShutdownMode,
     SocketConnectionStatus, SocketOutcome, SocketStatusResponse, TcpOptionName, TcpOptionValue,
 };
+use litebox_broker_protocol::stdio::{MAX_STDIO_TRANSFER_SIZE, StdioOutputStream};
 use litebox_broker_transport::channel::LocalCallChannel;
 
 use crate::event::{Events, polling::Pollee};
@@ -43,6 +44,12 @@ use shared_buffer::{SlotAllocator, SlotLease};
 /// once the local-core wait and notification model supports that shape.
 pub(crate) trait BrokerControl: Send + Sync {
     fn fill_random(&self, output: &mut [u8]) -> core::result::Result<(), BrokerControlError>;
+
+    fn write_stdio(
+        &self,
+        stream: StdioOutputStream,
+        data: &[u8],
+    ) -> core::result::Result<usize, BrokerControlError>;
 
     fn create_tcp_socket(&self) -> core::result::Result<ObjectHandle, BrokerControlError>;
 
@@ -311,6 +318,20 @@ where
             u32::try_from(output.len()).expect("validated random transfer length must fit in u32");
         let lease = self.acquire_shared_buffer(length)?;
         self.request(|local| local.fill_random(lease.descriptor(), output))
+    }
+
+    fn write_stdio(
+        &self,
+        stream: StdioOutputStream,
+        data: &[u8],
+    ) -> core::result::Result<usize, BrokerControlError> {
+        if data.len() > MAX_STDIO_TRANSFER_SIZE as usize {
+            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
+        }
+        let length = u32::try_from(data.len())
+            .expect("validated shared stdio transfer length must fit in u32");
+        let lease = self.acquire_shared_buffer(length)?;
+        self.request(|local| local.write_stdio(stream, lease.descriptor(), data))
     }
 
     fn create_tcp_socket(&self) -> core::result::Result<ObjectHandle, BrokerControlError> {

@@ -31,6 +31,7 @@ mod event;
 mod pipe;
 mod primitive;
 mod socket;
+mod stdio;
 
 const REQUEST_TAG_NEGOTIATE: u8 = 0;
 const REQUEST_TAG_EVENT: u8 = 1;
@@ -39,6 +40,7 @@ const REQUEST_TAG_PIPE: u8 = 3;
 const REQUEST_TAG_CHECK_READINESS: u8 = 4;
 const REQUEST_TAG_SOCKET: u8 = 5;
 const REQUEST_TAG_FILL_RANDOM: u8 = 6;
+const REQUEST_TAG_STDIO: u8 = 7;
 
 // Paired request and successful-response tags intentionally share values.
 const RESPONSE_TAG_NEGOTIATED: u8 = 0;
@@ -48,6 +50,7 @@ const RESPONSE_TAG_PIPE: u8 = 3;
 const RESPONSE_TAG_READINESS: u8 = 4;
 const RESPONSE_TAG_SOCKET: u8 = 5;
 const RESPONSE_TAG_RANDOM_FILLED: u8 = 6;
+const RESPONSE_TAG_STDIO: u8 = 7;
 
 // Reserve the top of the tag space for responses without paired requests.
 const RESPONSE_TAG_ERROR: u8 = 253;
@@ -102,7 +105,8 @@ pub fn decode_handshake_request(frame: &[u8]) -> Result<BrokerHandshakeRequest, 
         | REQUEST_TAG_PIPE
         | REQUEST_TAG_CHECK_READINESS
         | REQUEST_TAG_SOCKET
-        | REQUEST_TAG_FILL_RANDOM => {
+        | REQUEST_TAG_FILL_RANDOM
+        | REQUEST_TAG_STDIO => {
             return Err(WireError::WrongMessagePhase);
         }
         _ => return Err(WireError::InvalidTag),
@@ -152,6 +156,11 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
             encoder.request_id(request_id);
             encoder.shared_buffer_descriptor(buffer);
         }
+        BrokerOperation::Stdio(request) => {
+            encoder.u8(REQUEST_TAG_STDIO);
+            encoder.request_id(request_id);
+            stdio::encode_stdio_request(&mut encoder, request);
+        }
     }
     encoder.finish()
 }
@@ -167,7 +176,8 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         | REQUEST_TAG_EVENT
         | REQUEST_TAG_PIPE
         | REQUEST_TAG_SOCKET
-        | REQUEST_TAG_FILL_RANDOM => {}
+        | REQUEST_TAG_FILL_RANDOM
+        | REQUEST_TAG_STDIO => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -178,6 +188,7 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         REQUEST_TAG_PIPE => BrokerOperation::Pipe(pipe::decode_pipe_request(&mut decoder)?),
         REQUEST_TAG_SOCKET => BrokerOperation::Socket(socket::decode_socket_request(&mut decoder)?),
         REQUEST_TAG_FILL_RANDOM => BrokerOperation::FillRandom(decoder.shared_buffer_descriptor()?),
+        REQUEST_TAG_STDIO => BrokerOperation::Stdio(stdio::decode_stdio_request(&mut decoder)?),
         _ => unreachable!("active request tag was validated"),
     };
     decoder.finish()?;
@@ -228,7 +239,8 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
         | RESPONSE_TAG_READINESS
         | RESPONSE_TAG_ERROR
         | RESPONSE_TAG_SOCKET
-        | RESPONSE_TAG_RANDOM_FILLED => {
+        | RESPONSE_TAG_RANDOM_FILLED
+        | RESPONSE_TAG_STDIO => {
             return Err(WireError::WrongMessagePhase);
         }
         RESPONSE_TAG_VERSION_MISMATCH => BrokerHandshakeResponse::VersionMismatch {
@@ -280,6 +292,11 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
             encoder.u8(RESPONSE_TAG_RANDOM_FILLED);
             encoder.request_id(request_id);
         }
+        BrokerResult::Stdio(response) => {
+            encoder.u8(RESPONSE_TAG_STDIO);
+            encoder.request_id(request_id);
+            stdio::encode_stdio_response(&mut encoder, response);
+        }
         BrokerResult::Error(error) => {
             encoder.u8(RESPONSE_TAG_ERROR);
             encoder.request_id(request_id);
@@ -303,7 +320,8 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         | RESPONSE_TAG_READINESS
         | RESPONSE_TAG_ERROR
         | RESPONSE_TAG_SOCKET
-        | RESPONSE_TAG_RANDOM_FILLED => {}
+        | RESPONSE_TAG_RANDOM_FILLED
+        | RESPONSE_TAG_STDIO => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -318,6 +336,7 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         RESPONSE_TAG_OBJECT_CLOSED => BrokerResult::ObjectClosed,
         RESPONSE_TAG_READINESS => BrokerResult::Readiness(ReadinessFlags(decoder.u32()?)),
         RESPONSE_TAG_RANDOM_FILLED => BrokerResult::RandomFilled,
+        RESPONSE_TAG_STDIO => BrokerResult::Stdio(stdio::decode_stdio_response(&mut decoder)?),
         _ => unreachable!("active response tag was validated"),
     };
     decoder.finish()?;
@@ -364,6 +383,7 @@ mod tests {
     };
     use crate::message::{
         EventRequest, EventResponse, PipeRequest, PipeResponse, SocketRequest, SocketResponse,
+        StdioRequest, StdioResponse,
     };
     use crate::pipe::{
         CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
@@ -381,6 +401,7 @@ mod tests {
         ShutdownSocketRequest, SocketConnectionStatus, SocketError, SocketStatusRequest,
         SocketStatusResponse, SocketType, TcpOptionName, TcpOptionValue,
     };
+    use crate::stdio::{StdioOutputStream, WriteStdioRequest, WriteStdioResponse};
     use crate::{ObjectHandle, ProtocolVersion, RequestId};
     use core::net::{Ipv4Addr, SocketAddrV4};
 
@@ -405,6 +426,7 @@ mod tests {
                 RESPONSE_TAG_READINESS,
                 RESPONSE_TAG_SOCKET,
                 RESPONSE_TAG_RANDOM_FILLED,
+                RESPONSE_TAG_STDIO,
             ],
             [
                 REQUEST_TAG_NEGOTIATE,
@@ -414,6 +436,7 @@ mod tests {
                 REQUEST_TAG_CHECK_READINESS,
                 REQUEST_TAG_SOCKET,
                 REQUEST_TAG_FILL_RANDOM,
+                REQUEST_TAG_STDIO,
             ]
         );
         assert_eq!(
@@ -483,6 +506,20 @@ mod tests {
                 slot_index: SharedBufferSlotIndex(7),
                 length: 256,
             }),
+            BrokerOperation::Stdio(StdioRequest::Write(WriteStdioRequest {
+                stream: StdioOutputStream::Stdout,
+                buffer: SharedBufferDescriptor {
+                    slot_index: SharedBufferSlotIndex(6),
+                    length: 17,
+                },
+            })),
+            BrokerOperation::Stdio(StdioRequest::Write(WriteStdioRequest {
+                stream: StdioOutputStream::Stderr,
+                buffer: SharedBufferDescriptor {
+                    slot_index: SharedBufferSlotIndex(5),
+                    length: 23,
+                },
+            })),
             BrokerOperation::Socket(SocketRequest::Create(CreateSocketRequest {
                 address_family: AddressFamily::Ipv4,
                 socket_type: SocketType::Stream,
@@ -817,6 +854,7 @@ mod tests {
             ))),
             BrokerResult::Socket(SocketResponse::Failed(SocketError::ConnectionReset)),
             BrokerResult::RandomFilled,
+            BrokerResult::Stdio(StdioResponse::Write(WriteStdioResponse { written: 17 })),
             BrokerResult::Error(ErrorCode::PolicyDenied),
             BrokerResult::Error(ErrorCode::WouldBlock),
             BrokerResult::Error(ErrorCode::PeerClosed),
@@ -945,6 +983,58 @@ mod tests {
         });
         frame.push(0xff);
         assert_eq!(decode_request(&frame), Err(WireError::TrailingBytes));
+    }
+
+    #[test]
+    fn decode_rejects_malformed_stdio_request_frames() {
+        let request = BrokerRequest {
+            request_id: TEST_REQUEST_ID,
+            operation: BrokerOperation::Stdio(StdioRequest::Write(WriteStdioRequest {
+                stream: StdioOutputStream::Stdout,
+                buffer: SharedBufferDescriptor {
+                    slot_index: SharedBufferSlotIndex(1),
+                    length: 9,
+                },
+            })),
+        };
+
+        let mut unknown_operation = encode_request(request.clone());
+        unknown_operation[9] = 0xff;
+        assert_eq!(
+            decode_request(&unknown_operation),
+            Err(WireError::InvalidTag)
+        );
+
+        let mut unknown_stream = encode_request(request.clone());
+        unknown_stream[10] = 0xff;
+        assert_eq!(decode_request(&unknown_stream), Err(WireError::InvalidTag));
+
+        let frame = encode_request(request);
+        assert_eq!(
+            decode_request(&frame[..frame.len() - 1]),
+            Err(WireError::TruncatedFrame)
+        );
+    }
+
+    #[test]
+    fn decode_rejects_malformed_stdio_response_frames() {
+        let response = BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result: BrokerResult::Stdio(StdioResponse::Write(WriteStdioResponse { written: 9 })),
+        };
+
+        let mut unknown_operation = encode_response(response.clone());
+        unknown_operation[9] = 0xff;
+        assert_eq!(
+            decode_response(&unknown_operation),
+            Err(WireError::InvalidTag)
+        );
+
+        let frame = encode_response(response);
+        assert_eq!(
+            decode_response(&frame[..frame.len() - 1]),
+            Err(WireError::TruncatedFrame)
+        );
     }
 
     #[test]

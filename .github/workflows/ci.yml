@@ -90,6 +90,7 @@ jobs:
       # is the PR this job starts covering it.
       AARCH64_CRATES: >-
         -p litebox
+        -p litebox_broker_userland
         -p litebox_common_linux
         -p litebox_egress_proxy
         -p litebox_syscall_rewriter

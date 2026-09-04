@@ -3,7 +3,7 @@
 
 #![cfg(all(target_os = "windows", target_arch = "x86_64"))]
 
-/// Runs a hello-world guest PE end to end.
+/// Runs a hello-world guest PE end to end through the userland broker.
 #[test]
 fn run_hello_world_pe() {
     let test_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kernel32_import");
@@ -20,8 +20,7 @@ fn run_hello_world_pe() {
         std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kernel32_import.tar");
     create_tar_with_dir(&test_dir, &tar_path);
 
-    let mut command =
-        std::process::Command::new(env!("CARGO_BIN_EXE_litebox_runner_windows_userland"));
+    let mut command = brokered_windows_runner_command();
     // Verbose log for failure triage; not load-bearing for any assertion.
     command.env("LITEBOX_LOG", "debug");
     command.args([
@@ -49,56 +48,7 @@ fn run_hello_world_pe() {
     );
 }
 
-/// Runs a hello-world guest PE through the Windows userland broker.
-#[test]
-fn run_hello_world_pe_with_broker() {
-    let test_dir =
-        std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kernel32_import_broker");
-    let _ = std::fs::remove_dir_all(&test_dir);
-    std::fs::create_dir_all(&test_dir).unwrap();
-    let pe_path =
-        build_kernel32_import_pe(&test_dir, "kernel32_import", KERNEL32_IMPORT_PE_SOURCE, &[]);
-    println!(
-        "Built rewritten kernel32-import PE fixture at `{}`",
-        pe_path.display()
-    );
-    stage_system_fixtures(&test_dir);
-    let tar_path =
-        std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kernel32_import_broker.tar");
-    create_tar_with_dir(&test_dir, &tar_path);
-
-    let (broker, runner) = build_windows_broker();
-    let mut command = std::process::Command::new(broker);
-    command
-        .env("LITEBOX_LOG", "debug")
-        .arg("--runner")
-        .arg(runner)
-        .args([
-            "--initial-files",
-            tar_path.to_str().unwrap(),
-            "/kernel32_import.exe",
-        ]);
-    println!("Running `{command:?}`");
-    let output = command
-        .output()
-        .expect("failed to run litebox_runner_windows_userland through the broker");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(
-        output.status.success(),
-        "broker failed to run kernel32-import PE; status {:?}\nstdout:\n{}\nstderr:\n{}",
-        output.status.code(),
-        stdout,
-        stderr
-    );
-    assert!(
-        stdout.contains("hello world\n"),
-        "guest output was not captured\nstdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-}
-
-/// Runs a guest PE that creates and joins a child thread.
+/// Runs a guest PE through the broker that creates and joins a child thread.
 #[test]
 fn run_multithreaded_pe() {
     let test_dir =
@@ -120,8 +70,7 @@ fn run_multithreaded_pe() {
         std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kernel32_multithread.tar");
     create_tar_with_dir(&test_dir, &tar_path);
 
-    let mut command =
-        std::process::Command::new(env!("CARGO_BIN_EXE_litebox_runner_windows_userland"));
+    let mut command = brokered_windows_runner_command();
     command.env("LITEBOX_LOG", "debug");
     command.args([
         "--initial-files",
@@ -155,8 +104,8 @@ fn run_multithreaded_pe() {
     );
 }
 
-/// Runs a guest PE that imports the C runtime (ucrtbase via the CRT api-set
-/// contracts), forcing ucrtbase to load and initialize.
+/// Runs a guest PE through the broker that imports the C runtime (ucrtbase via
+/// the CRT api-set contracts), forcing ucrtbase to load and initialize.
 #[test]
 fn run_crt_locale_pe() {
     let test_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("crt_locale");
@@ -172,8 +121,7 @@ fn run_crt_locale_pe() {
     let tar_path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("crt_locale.tar");
     create_tar_with_dir(&test_dir, &tar_path);
 
-    let mut command =
-        std::process::Command::new(env!("CARGO_BIN_EXE_litebox_runner_windows_userland"));
+    let mut command = brokered_windows_runner_command();
     command.env("LITEBOX_LOG", "debug");
     command.args([
         "--initial-files",
@@ -225,6 +173,13 @@ fn build_windows_broker() -> (std::path::PathBuf, std::path::PathBuf) {
         broker.display()
     );
     (broker, runner)
+}
+
+fn brokered_windows_runner_command() -> std::process::Command {
+    let (broker, runner) = build_windows_broker();
+    let mut command = std::process::Command::new(broker);
+    command.arg("--runner").arg(runner);
+    command
 }
 
 /// Stages the guest system DLLs and locale tables the PE fixture needs.

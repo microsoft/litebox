@@ -6,11 +6,12 @@ Run [byte-unixbench](https://github.com/kdlucas/byte-unixbench) benchmarks nativ
 
 - The UnixBench source tree at `byte-unixbench-6.0.0/UnixBench/` (extracted from `v6.0.0.zip`).
 - `gcc`, `make`, `ldd`, `tar` on the host.
-- Pre-built LiteBox binaries (`litebox_runner_linux_userland` and `litebox_syscall_rewriter`).
+- Pre-built LiteBox binaries (`litebox-broker-userland`,
+  `litebox_runner_linux_userland`, and `litebox_syscall_rewriter`).
 
 Build LiteBox (from workspace root):
 ```bash
-cargo build --release -p litebox_runner_linux_userland -p litebox_syscall_rewriter
+cargo build --release -p litebox_broker_userland -p litebox_runner_linux_userland -p litebox_syscall_rewriter
 ```
 
 ## Quick Start
@@ -129,8 +130,8 @@ This creates `dev_bench/unixbench/prepared/` containing:
 Build the Windows runner, then run benchmarks using the prepared artifacts:
 
 ```powershell
-# Build the Windows runner
-cargo build -p litebox_runner_linux_on_windows_userland --release
+# Build the Windows runner and broker
+cargo build -p litebox_runner_linux_on_windows_userland -p litebox_broker_userland --release
 
 # Run benchmarks
 python run_unixbench.py --mode litebox --windows --prepared-dir ./prepared --release

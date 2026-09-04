@@ -24,6 +24,7 @@ pub mod random;
 pub mod readiness;
 pub mod shared_buffer;
 pub mod socket;
+pub mod stdio;
 pub mod wire;
 
 /// Opaque broker object reference handle.
