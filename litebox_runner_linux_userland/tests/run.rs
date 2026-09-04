@@ -27,12 +27,12 @@ impl litebox_broker_core::random::RandomProvider for TestRandomProvider {
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-struct TestStdioProvider {
+struct CapturingStdioProvider {
     stdout_tx: std::sync::mpsc::Sender<Vec<u8>>,
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-impl litebox_broker_core::stdio::StdioProvider for TestStdioProvider {
+impl litebox_broker_core::stdio::StdioProvider for CapturingStdioProvider {
     fn write(
         &self,
         stream: litebox_broker_protocol::stdio::StdioOutputStream,
@@ -548,7 +548,7 @@ fn spawn_test_broker_with_mode(
                     .expect("failed to create broker test socket provider"),
                 ),
                 std::sync::Arc::new(TestRandomProvider),
-                std::sync::Arc::new(TestStdioProvider { stdout_tx }),
+                std::sync::Arc::new(CapturingStdioProvider { stdout_tx }),
             )
             .expect("failed to create broker core");
             ready_tx.send(()).expect("failed to report broker ready");
