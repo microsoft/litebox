@@ -1837,57 +1837,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
     }
 }
 
-impl litebox::platform::StdioProvider for WindowsUserland {
-    fn read_from_stdin(&self, buf: &mut [u8]) -> Result<usize, litebox::platform::StdioReadError> {
-        use std::io::Read as _;
-        std::io::stdin().read(buf).map_err(|err| {
-            if err.kind() == std::io::ErrorKind::BrokenPipe {
-                litebox::platform::StdioReadError::Closed
-            } else {
-                panic!("unhandled error {err}")
-            }
-        })
-    }
-
-    fn write_to(
-        &self,
-        stream: litebox::platform::StdioOutStream,
-        buf: &[u8],
-    ) -> Result<usize, litebox::platform::StdioWriteError> {
-        use std::io::Write as _;
-        match stream {
-            litebox::platform::StdioOutStream::Stdout => {
-                std::io::stdout().write(buf).map_err(|err| {
-                    if err.kind() == std::io::ErrorKind::BrokenPipe {
-                        litebox::platform::StdioWriteError::Closed
-                    } else {
-                        panic!("unhandled error {err}")
-                    }
-                })
-            }
-            litebox::platform::StdioOutStream::Stderr => {
-                std::io::stderr().write(buf).map_err(|err| {
-                    if err.kind() == std::io::ErrorKind::BrokenPipe {
-                        litebox::platform::StdioWriteError::Closed
-                    } else {
-                        panic!("unhandled error {err}")
-                    }
-                })
-            }
-        }
-    }
-
-    fn is_a_tty(&self, stream: litebox::platform::StdioStream) -> bool {
-        use litebox::platform::StdioStream;
-        use std::io::IsTerminal as _;
-        match stream {
-            StdioStream::Stdin => std::io::stdin().is_terminal(),
-            StdioStream::Stdout => std::io::stdout().is_terminal(),
-            StdioStream::Stderr => std::io::stderr().is_terminal(),
-        }
-    }
-}
-
 #[global_allocator]
 static SLAB_ALLOC: litebox::mm::allocator::SafeZoneAllocator<'static, 28, WindowsUserland> =
     litebox::mm::allocator::SafeZoneAllocator::new();

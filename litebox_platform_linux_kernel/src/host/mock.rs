@@ -81,17 +81,6 @@ impl HostInterface for MockHostInterface {
         todo!()
     }
 
-    fn read_from_stdin(_buf: &mut [u8]) -> Result<usize, litebox_common_linux::errno::Errno> {
-        todo!()
-    }
-
-    fn write_to(
-        _stream: litebox::platform::StdioOutStream,
-        _buf: &[u8],
-    ) -> Result<usize, litebox_common_linux::errno::Errno> {
-        todo!()
-    }
-
     fn current_system_time() -> core::time::Duration {
         let mut t = litebox_common_linux::Timespec::default();
         let ret = unsafe {

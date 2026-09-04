@@ -81,7 +81,6 @@ pub trait ShimPlatform:
     + litebox::platform::RawMutexProvider
     + litebox::sync::RawSyncPrimitivesProvider
     + litebox::platform::SystemInfoProvider
-    + litebox::platform::StdioProvider
     + litebox::platform::ArchSpecificProvider
     + litebox::platform::ThreadProvider<ExecutionContext = litebox_common_linux::PtRegs>
     + litebox::platform::TimerProvider<Signal = litebox_common_linux::signal::Signal>
@@ -98,7 +97,6 @@ impl<T> ShimPlatform for T where
         + litebox::platform::RawMutexProvider
         + litebox::sync::RawSyncPrimitivesProvider
         + litebox::platform::SystemInfoProvider
-        + litebox::platform::StdioProvider
         + litebox::platform::ArchSpecificProvider
         + litebox::platform::ThreadProvider<ExecutionContext = litebox_common_linux::PtRegs>
         + litebox::platform::TimerProvider<Signal = litebox_common_linux::signal::Signal>

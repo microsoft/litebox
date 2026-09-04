@@ -284,30 +284,6 @@ impl litebox::platform::SystemTime for SystemTime {
     }
 }
 
-impl<Host: HostInterface> litebox::platform::StdioProvider for LinuxKernel<Host> {
-    fn read_from_stdin(&self, buf: &mut [u8]) -> Result<usize, litebox::platform::StdioReadError> {
-        Host::read_from_stdin(buf).map_err(|err| match err {
-            Errno::EPIPE => litebox::platform::StdioReadError::Closed,
-            _ => panic!("unhandled error {err}"),
-        })
-    }
-
-    fn write_to(
-        &self,
-        stream: litebox::platform::StdioOutStream,
-        buf: &[u8],
-    ) -> Result<usize, litebox::platform::StdioWriteError> {
-        Host::write_to(stream, buf).map_err(|err| match err {
-            Errno::EPIPE => litebox::platform::StdioWriteError::Closed,
-            _ => panic!("unhandled error {err}"),
-        })
-    }
-
-    fn is_a_tty(&self, _stream: litebox::platform::StdioStream) -> bool {
-        false
-    }
-}
-
 /// Platform-Host Interface
 pub trait HostInterface: 'static {
     /// Page allocation from host.
@@ -342,11 +318,6 @@ pub trait HostInterface: 'static {
 
     /// Terminate the current process.
     fn terminate_process(code: i32) -> !;
-
-    // For Stdio
-    fn read_from_stdin(buf: &mut [u8]) -> Result<usize, Errno>;
-
-    fn write_to(stream: litebox::platform::StdioOutStream, buf: &[u8]) -> Result<usize, Errno>;
 
     /// Returns the current system time as a [`Duration`](core::time::Duration) since the
     /// UNIX epoch.

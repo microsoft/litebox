@@ -325,8 +325,6 @@ const PAGE_SIZE: u64 = litebox::mm::linux::PAGE_SIZE as u64;
 const PHYS_ADDR_MAX: u64 = 0x10_0000_0000u64; // 64GB
 
 const NR_SYSCALL_FUTEX: u32 = 202;
-const NR_SYSCALL_READ: u32 = 0;
-const NR_SYSCALL_WRITE: u32 = 1;
 const NR_SYSCALL_EXIT: u32 = 60;
 const NR_SYSCALL_EXIT_GROUP: u32 = 231;
 const NR_SYSCALL_CLONE3: u32 = 435;
@@ -512,36 +510,6 @@ impl HostInterface for HostSnpInterface {
             ],
         })
         .map(|_| ())
-    }
-
-    fn read_from_stdin(buf: &mut [u8]) -> Result<usize, Errno> {
-        Self::syscalls(SyscallN::<3, NR_SYSCALL_READ> {
-            args: [
-                litebox_common_linux::STDIN_FILENO as u64,
-                buf.as_mut_ptr() as u64,
-                buf.len() as u64,
-            ],
-        })
-    }
-
-    fn write_to(stream: litebox::platform::StdioOutStream, buf: &[u8]) -> Result<usize, Errno> {
-        Self::syscalls(SyscallN::<3, NR_SYSCALL_WRITE> {
-            args: [
-                u64::from(
-                    match stream {
-                        litebox::platform::StdioOutStream::Stdout => {
-                            litebox_common_linux::STDOUT_FILENO
-                        }
-                        litebox::platform::StdioOutStream::Stderr => {
-                            litebox_common_linux::STDERR_FILENO
-                        }
-                    }
-                    .reinterpret_as_unsigned(),
-                ),
-                buf.as_ptr() as u64,
-                buf.len() as u64,
-            ],
-        })
     }
 
     fn current_system_time() -> core::time::Duration {
