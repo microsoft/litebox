@@ -893,40 +893,26 @@ mod tests {
         started: SyncSender<()>,
     }
 
+    impl BlockingStdioProvider {
+        fn block_until_cancelled(
+            &self,
+            cancellation: &AssociationCancellation,
+        ) -> Result<usize, StdioProviderError> {
+            self.started.send(()).unwrap();
+            while !cancellation.is_cancelled() {
+                std::thread::sleep(TEST_CANCELLATION_POLL_INTERVAL);
+            }
+            Err(StdioProviderError::Closed)
+        }
+    }
+
     impl StdioProvider for BlockingStdioProvider {
         fn read(
             &self,
             cancellation: &AssociationCancellation,
             _output: &mut [u8],
         ) -> Result<usize, StdioProviderError> {
-            self.started.send(()).unwrap();
-            while !cancellation.is_cancelled() {
-                std::thread::sleep(TEST_CANCELLATION_POLL_INTERVAL);
-            }
-            Err(StdioProviderError::Closed)
-        }
-
-        fn write(
-            &self,
-            _cancellation: &AssociationCancellation,
-            _stream: StdioOutputStream,
-            _input: &[u8],
-        ) -> Result<usize, StdioProviderError> {
-            Err(StdioProviderError::Unsupported)
-        }
-    }
-
-    struct BlockingWriteStdioProvider {
-        started: SyncSender<()>,
-    }
-
-    impl StdioProvider for BlockingWriteStdioProvider {
-        fn read(
-            &self,
-            _cancellation: &AssociationCancellation,
-            _output: &mut [u8],
-        ) -> Result<usize, StdioProviderError> {
-            Err(StdioProviderError::Unsupported)
+            self.block_until_cancelled(cancellation)
         }
 
         fn write(
@@ -935,11 +921,7 @@ mod tests {
             _stream: StdioOutputStream,
             _input: &[u8],
         ) -> Result<usize, StdioProviderError> {
-            self.started.send(()).unwrap();
-            while !cancellation.is_cancelled() {
-                std::thread::sleep(TEST_CANCELLATION_POLL_INTERVAL);
-            }
-            Err(StdioProviderError::Closed)
+            self.block_until_cancelled(cancellation)
         }
     }
 
@@ -1219,7 +1201,7 @@ mod tests {
     fn association_teardown_cancels_a_blocked_stdout_write() {
         let readiness = Arc::new(ReadinessPublisherRuntime::new());
         let (started_sender, started_receiver) = sync_channel(1);
-        let provider = Arc::new(BlockingWriteStdioProvider {
+        let provider = Arc::new(BlockingStdioProvider {
             started: started_sender,
         });
         let (local, notifications, shutdown, outcome, host) = spawn_dispatch(readiness, provider);
