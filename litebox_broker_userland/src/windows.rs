@@ -29,6 +29,7 @@ use super::{
     HostAssociationShutdown, HostRequestSource, HostResponseSink, SETUP_TIMEOUT,
     configured_socket_policy,
 };
+use super::{random::UserlandRandomProvider, stdio::UserlandStdioProvider};
 
 impl HostRequestSource for WindowsControlRingHostRequestSource {
     fn recv_request(&mut self) -> IoResult<HostReceive<BrokerRequest>> {
@@ -56,8 +57,8 @@ pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
             configured_socket_policy(&args.allow_tcp_destination, &args.allow_udp_destination)?,
         ),
         Arc::new(UnsupportedSocketProvider),
-        Arc::new(super::UserlandRandomProvider),
-        Arc::new(super::UserlandStdioProvider::new()?),
+        Arc::new(UserlandRandomProvider),
+        Arc::new(UserlandStdioProvider::new(super::WORKER_COUNT)?),
     )?;
 
     crate::run_runner_process(&args, &control_pipe, None, |runner, runner_process_id| {
