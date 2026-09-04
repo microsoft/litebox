@@ -394,7 +394,15 @@ def _run_litebox_cmd(
 def _terminate_process_tree(process: subprocess.Popen) -> None:
     """Terminate a timed-out broker and the runner process it launched."""
     if sys.platform == "win32":
-        process.kill()
+        result = subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            capture_output=True,
+        )
+        if process.poll() is None:
+            if result.returncode != 0:
+                error = result.stderr.decode("utf-8", errors="replace").strip()
+                print(f"  Warning: process-tree termination failed: {error}")
+            process.kill()
     else:
         try:
             os.killpg(process.pid, signal.SIGKILL)
