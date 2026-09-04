@@ -81,7 +81,7 @@ pub(super) fn run(mut args: super::CliArgs) -> Result<(), Box<dyn Error>> {
             limits.max_sockets_per_session,
         )?),
         Arc::new(UserlandRandomProvider),
-        Arc::new(UserlandStdioProvider::new(super::WORKER_COUNT)?),
+        Arc::new(UserlandStdioProvider::new()?),
     )?;
 
     crate::run_runner_process(

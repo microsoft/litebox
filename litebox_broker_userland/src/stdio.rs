@@ -20,12 +20,12 @@ const WRITE_RETRY_DELAY: Duration = Duration::from_millis(1);
 /// A broker serving multiple runners will need association-specific stream
 /// endpoints instead of sharing process-wide standard streams.
 pub(super) struct UserlandStdioProvider {
-    stdin: Mutex<UserlandStdin>,
-    stdout: SyncSender<StdioWriteRequest>,
-    stderr: SyncSender<StdioWriteRequest>,
+    stdin: Mutex<StdinState>,
+    stdout: SyncSender<StdioWriteOperation>,
+    stderr: SyncSender<StdioWriteOperation>,
 }
 
-struct UserlandStdin {
+struct StdinState {
     receiver: Receiver<StdinReadResult>,
     buffered: VecDeque<u8>,
     eof: bool,
@@ -37,27 +37,27 @@ enum StdinReadResult {
     Error(StdioProviderError),
 }
 
-struct StdioWriteRequest {
+struct StdioWriteOperation {
     input: Vec<u8>,
     completion: SyncSender<Result<usize, StdioProviderError>>,
 }
 
 impl UserlandStdioProvider {
-    pub(super) fn new(max_concurrent_writes: usize) -> IoResult<Self> {
+    pub(super) fn new() -> IoResult<Self> {
         let (stdin_sender, stdin_receiver) = sync_channel(1);
         std::thread::Builder::new()
             .name("litebox-broker-stdin".to_owned())
             .spawn(move || pump_stdin(stdin_sender))?;
-        let (stdout, stdout_receiver) = sync_channel(max_concurrent_writes);
+        let (stdout, stdout_receiver) = sync_channel(super::WORKER_COUNT);
         std::thread::Builder::new()
             .name("litebox-broker-stdout".to_owned())
             .spawn(move || pump_stdout(stdout_receiver))?;
-        let (stderr, stderr_receiver) = sync_channel(max_concurrent_writes);
+        let (stderr, stderr_receiver) = sync_channel(super::WORKER_COUNT);
         std::thread::Builder::new()
             .name("litebox-broker-stderr".to_owned())
             .spawn(move || pump_stderr(stderr_receiver))?;
         Ok(Self {
-            stdin: Mutex::new(UserlandStdin {
+            stdin: Mutex::new(StdinState {
                 receiver: stdin_receiver,
                 buffered: VecDeque::new(),
                 eof: false,
@@ -116,7 +116,7 @@ impl StdioProvider for UserlandStdioProvider {
             StdioOutputStream::Stderr => &self.stderr,
         };
         let (completion, completed) = sync_channel(1);
-        let mut request = StdioWriteRequest {
+        let mut request = StdioWriteOperation {
             input: input.to_vec(),
             completion,
         };
@@ -165,15 +165,15 @@ fn pump_stdin(sender: SyncSender<StdinReadResult>) {
     }
 }
 
-fn pump_stdout(receiver: Receiver<StdioWriteRequest>) {
+fn pump_stdout(receiver: Receiver<StdioWriteOperation>) {
     pump_output(std::io::stdout(), receiver);
 }
 
-fn pump_stderr(receiver: Receiver<StdioWriteRequest>) {
+fn pump_stderr(receiver: Receiver<StdioWriteOperation>) {
     pump_output(std::io::stderr(), receiver);
 }
 
-fn pump_output(mut output: impl std::io::Write, receiver: Receiver<StdioWriteRequest>) {
+fn pump_output(mut output: impl std::io::Write, receiver: Receiver<StdioWriteOperation>) {
     while let Ok(request) = receiver.recv() {
         let result = write_and_flush(&mut output, &request.input).map_err(map_stdio_error);
         let _ = request.completion.send(result);
@@ -223,7 +223,7 @@ mod tests {
         let (stdout, _stdout_receiver) = sync_channel(1);
         let (stderr, _stderr_receiver) = sync_channel(1);
         UserlandStdioProvider {
-            stdin: Mutex::new(UserlandStdin {
+            stdin: Mutex::new(StdinState {
                 receiver,
                 buffered: VecDeque::new(),
                 eof: false,
@@ -266,7 +266,7 @@ mod tests {
         let (_stdin_sender, stdin_receiver) = sync_channel(1);
         let (stderr, _stderr_receiver) = sync_channel(1);
         let provider = UserlandStdioProvider {
-            stdin: Mutex::new(UserlandStdin {
+            stdin: Mutex::new(StdinState {
                 receiver: stdin_receiver,
                 buffered: VecDeque::new(),
                 eof: false,

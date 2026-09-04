@@ -58,7 +58,7 @@ pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
         ),
         Arc::new(UnsupportedSocketProvider),
         Arc::new(UserlandRandomProvider),
-        Arc::new(UserlandStdioProvider::new(super::WORKER_COUNT)?),
+        Arc::new(UserlandStdioProvider::new()?),
     )?;
 
     crate::run_runner_process(&args, &control_pipe, None, |runner, runner_process_id| {
