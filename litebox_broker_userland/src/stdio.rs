@@ -26,7 +26,7 @@ pub(super) struct UserlandStdioProvider {
 }
 
 struct StdinState {
-    receiver: Receiver<StdinReadResult>,
+    receiver: Option<Receiver<StdinReadResult>>,
     buffered: VecDeque<u8>,
     eof: bool,
 }
@@ -44,10 +44,6 @@ struct StdioWriteOperation {
 
 impl UserlandStdioProvider {
     pub(super) fn new() -> IoResult<Self> {
-        let (stdin_sender, stdin_receiver) = sync_channel(1);
-        std::thread::Builder::new()
-            .name("litebox-broker-stdin".to_owned())
-            .spawn(move || pump_stdin(stdin_sender))?;
         let (stdout, stdout_receiver) = sync_channel(super::WORKER_COUNT);
         std::thread::Builder::new()
             .name("litebox-broker-stdout".to_owned())
@@ -58,7 +54,7 @@ impl UserlandStdioProvider {
             .spawn(move || pump_stderr(stderr_receiver))?;
         Ok(Self {
             stdin: Mutex::new(StdinState {
-                receiver: stdin_receiver,
+                receiver: None,
                 buffered: VecDeque::new(),
                 eof: false,
             }),
@@ -95,7 +91,20 @@ impl StdioProvider for UserlandStdioProvider {
             if stdin.eof {
                 return Ok(0);
             }
-            match stdin.receiver.recv_timeout(CANCELLATION_POLL_INTERVAL) {
+            if stdin.receiver.is_none() {
+                let (sender, receiver) = sync_channel(1);
+                std::thread::Builder::new()
+                    .name("litebox-broker-stdin".to_owned())
+                    .spawn(move || pump_stdin(sender))
+                    .map_err(|_| StdioProviderError::Failed)?;
+                stdin.receiver = Some(receiver);
+            }
+            match stdin
+                .receiver
+                .as_ref()
+                .expect("stdin pump was started")
+                .recv_timeout(CANCELLATION_POLL_INTERVAL)
+            {
                 Ok(StdinReadResult::Data(data)) => stdin.buffered.extend(data),
                 Ok(StdinReadResult::Eof) => stdin.eof = true,
                 Ok(StdinReadResult::Error(error)) => return Err(error),
@@ -224,13 +233,20 @@ mod tests {
         let (stderr, _stderr_receiver) = sync_channel(1);
         UserlandStdioProvider {
             stdin: Mutex::new(StdinState {
-                receiver,
+                receiver: Some(receiver),
                 buffered: VecDeque::new(),
                 eof: false,
             }),
             stdout,
             stderr,
         }
+    }
+
+    #[test]
+    fn provider_defers_stdin_pump_until_read() {
+        let provider = UserlandStdioProvider::new().unwrap();
+
+        assert!(provider.stdin.lock().unwrap().receiver.is_none());
     }
 
     #[test]
@@ -267,7 +283,7 @@ mod tests {
         let (stderr, _stderr_receiver) = sync_channel(1);
         let provider = UserlandStdioProvider {
             stdin: Mutex::new(StdinState {
-                receiver: stdin_receiver,
+                receiver: Some(stdin_receiver),
                 buffered: VecDeque::new(),
                 eof: false,
             }),
