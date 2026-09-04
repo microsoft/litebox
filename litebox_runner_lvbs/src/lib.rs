@@ -13,7 +13,9 @@ use litebox::{
     utils::{ReinterpretSignedExt, TruncateExt},
 };
 use litebox_common_linux::errno::Errno;
-use litebox_common_lvbs::{NUM_VTLCALL_PARAMS, VsmError, VsmFunction};
+use litebox_common_lvbs::{
+    ExchangeSecretsRequest, NUM_VTLCALL_PARAMS, PRK_LEN, VsmError, VsmFunction,
+};
 use litebox_common_optee::{
     OpteeMessageCommand, OpteeMsgArgs, OpteeRpcArgs, OpteeSmcArgs, OpteeSmcResult,
     OpteeSmcReturnCode, TeeOrigin, TeeResult, UteeEntryFunc, UteeParams, optee_msg_args_total_size,
@@ -261,10 +263,62 @@ fn vtlcall_dispatch(params: &[u64; NUM_VTLCALL_PARAMS]) -> i64 {
             let smc_args_pfn = params[1];
             optee_smc_handler_entry(smc_args_pfn)
         }
-        VsmFunction::GenerateIdentitySigningKey => {
-            let public_key_pa = params[1];
-            let key_alg = params[2];
-            litebox_shim_optee::idk::generate_identity_signing_key(public_key_pa, key_alg)
+        VsmFunction::ExchangeSecrets => {
+            let request_pa = params[1];
+            let Ok(request_ptr) =
+                NormalWorldConstPtr::<ExchangeSecretsRequest, PAGE_SIZE>::with_usize(
+                    request_pa.trunc(),
+                )
+            else {
+                return Errno::EFAULT.as_neg().into();
+            };
+            let Ok(request) = request_ptr.read_at_offset(0) else {
+                return Errno::EFAULT.as_neg().into();
+            };
+
+            let return_code = vsm_dispatch(VsmFunction::ExchangeSecrets, &params[1..2]);
+            if return_code < 0 {
+                return return_code;
+            }
+
+            let public_key_pa = request_pa
+                .checked_add(core::mem::offset_of!(ExchangeSecretsRequest, idks_pub) as u64)
+                .ok_or(Errno::EINVAL);
+            let public_key_pa = match public_key_pa {
+                Ok(pa) => pa,
+                Err(error) => return error.as_neg().into(),
+            };
+
+            let return_code = litebox_shim_optee::idk::generate_identity_signing_key(
+                public_key_pa,
+                u64::from(request.key_alg_variant),
+            );
+            if return_code < 0 {
+                return return_code;
+            }
+
+            let public_key_len_pa = request_pa
+                .checked_add(core::mem::offset_of!(ExchangeSecretsRequest, idks_pub_len) as u64)
+                .ok_or(Errno::EINVAL);
+            let public_key_len_pa = match public_key_len_pa {
+                Ok(pa) => pa,
+                Err(error) => return error.as_neg().into(),
+            };
+            let Ok(public_key_len_ptr) =
+                NormalWorldMutPtr::<u32, PAGE_SIZE>::with_usize(public_key_len_pa.trunc())
+            else {
+                return Errno::EFAULT.as_neg().into();
+            };
+            let Ok(public_key_len) = u32::try_from(request.idks_pub.len()) else {
+                return Errno::EINVAL.as_neg().into();
+            };
+            if public_key_len_ptr
+                .write_at_offset(0, public_key_len)
+                .is_err()
+            {
+                return Errno::EFAULT.as_neg().into();
+            }
+            0
         }
         _ => vsm_dispatch(func_id, &params[1..]),
     }
@@ -315,10 +369,15 @@ fn vsm_dispatch(func_id: VsmFunction, params: &[u64]) -> i64 {
         VsmFunction::AllocateRingbufferMemory => {
             heki.allocate_ringbuffer_memory(params[0], params[1])
         }
-        VsmFunction::SetPlatformRootKey => vtl1.set_platform_root_key(params[0]).map(|()| 0),
-        VsmFunction::GenerateIdentitySigningKey => {
-            Err(VsmError::OperationNotSupported("Identity key generation"))
-        }
+        VsmFunction::ExchangeSecrets => vtl1
+            .set_platform_root_key(params[0])
+            .and_then(|()| {
+                params[0]
+                    .checked_add(PRK_LEN as u64)
+                    .ok_or(VsmError::IntegerOverflow)
+            })
+            .and_then(|crng_seed_pa| vtl1.set_crng_seed(crng_seed_pa))
+            .map(|()| 0),
         VsmFunction::OpteeMessage => Err(VsmError::OperationNotSupported("OP-TEE communication")),
     };
     match result {
