@@ -51,6 +51,10 @@ impl RandomProvider for UserlandRandomProvider {
     }
 }
 
+/// Routes output from the broker's single child runner to inherited streams.
+///
+/// A broker serving multiple runners will need association-specific output
+/// destinations instead of sharing process-wide standard streams.
 struct UserlandStdioProvider;
 
 impl StdioProvider for UserlandStdioProvider {
