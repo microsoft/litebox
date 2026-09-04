@@ -615,6 +615,8 @@ impl<P: Vtl0Gate> Heki<P> {
         let heki_patch = copy_heki_patch_from_vtl0(&self.gate, patch_pa_0, patch_pa_1)?;
         log::debug!("HEKI: {heki_patch:?}");
 
+        // Linux normally serializes `text_poke_bp_batch()` with its global `text_mutex`.
+        // Untrusted VTL0 can violate this for corruption, so enforce serialization here.
         let _patch_guard = self.text_patch_lock.lock();
         let precomputed_patch = self
             .find_precomputed_patch(&heki_patch)
