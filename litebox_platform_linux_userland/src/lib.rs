@@ -28,6 +28,8 @@ use zerocopy::{FromBytes, IntoBytes};
 
 #[cfg(target_arch = "aarch64")]
 mod aarch64;
+#[cfg(all(test, target_arch = "aarch64"))]
+use aarch64::get_guest_vector_state;
 #[cfg(target_arch = "aarch64")]
 use aarch64::{
     Aarch64GateSignalResult, GateInterruption, assert_tls_block_placement,
