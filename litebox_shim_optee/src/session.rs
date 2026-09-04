@@ -129,9 +129,7 @@ pub struct TaInstance {
     /// The shim must be kept alive to keep the loaded program's memory mappings valid.
     shim: OpteeShim,
     /// The loaded TA program state including entrypoints.
-    /// Boxed to keep it at a fixed heap address - the Task inside must not be moved
-    /// after initialization because it contains internal state that may not survive moves.
-    loaded_program: alloc::boxed::Box<LoadedProgram>,
+    loaded_program: LoadedProgram,
     /// The task page table ID associated with this TA instance.
     ///
     /// Also serves as the instance's identity for sibling-tracking
@@ -483,9 +481,8 @@ pub struct SessionManager {
 
 /// Get the global session manager.
 pub fn session_manager() -> &'static SessionManager {
-    static SESSION_MANAGER: once_cell::race::OnceBox<SessionManager> =
-        once_cell::race::OnceBox::new();
-    SESSION_MANAGER.get_or_init(|| alloc::boxed::Box::new(SessionManager::new()))
+    static SESSION_MANAGER: spin::Once<SessionManager> = spin::Once::new();
+    SESSION_MANAGER.call_once(SessionManager::new)
 }
 
 impl SessionManager {
@@ -767,7 +764,7 @@ impl SessionManager {
         &self,
         session_id: u32,
         shim: OpteeShim,
-        loaded_program: alloc::boxed::Box<LoadedProgram>,
+        loaded_program: LoadedProgram,
         task_page_table_id: usize,
         ta_uuid: TeeUuid,
     ) {
@@ -993,12 +990,12 @@ mod tests {
         crate::OpteeShimBuilder::new().build()
     }
 
-    fn make_loaded_program(ta_flags: TaFlags) -> alloc::boxed::Box<LoadedProgram> {
-        alloc::boxed::Box::new(LoadedProgram {
+    fn make_loaded_program(ta_flags: TaFlags) -> LoadedProgram {
+        LoadedProgram {
             entrypoints: None,
             params_address: None,
             ta_flags,
-        })
+        }
     }
 
     fn make_uuid(seed: u8) -> TeeUuid {

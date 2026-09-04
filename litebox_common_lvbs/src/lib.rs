@@ -261,6 +261,9 @@ pub enum VsmError {
     #[error("failed to copy data from/to VTL0")]
     Vtl0CopyFailed,
 
+    #[error("failed to allocate VTL1 memory")]
+    AllocationFailed,
+
     // Hypercall Errors
     #[error("hypercall failed: {0:?}")]
     HypercallFailed(HypervCallError),
@@ -327,6 +330,8 @@ impl From<VsmError> for Errno {
 
             // Unsupported operation
             VsmError::OperationNotSupported(_) => Errno::ENOTSUP,
+
+            VsmError::AllocationFailed => Errno::ENOMEM,
 
             // Security/verification failures - access denied
             VsmError::TextPatchSuspicious
@@ -906,7 +911,10 @@ pub trait Vtl0Gate {
         let last_page = (end - 1) & !(page_size - 1);
 
         let page_count = ((last_page - start_page) / page_size + 1).trunc();
-        let mut pages = Vec::with_capacity(page_count);
+        let mut pages = Vec::new();
+        pages
+            .try_reserve_exact(page_count)
+            .map_err(|_| VsmError::AllocationFailed)?;
         let mut p = start_page;
         loop {
             pages.push(
@@ -924,7 +932,8 @@ pub trait Vtl0Gate {
     /// Read a `FromBytes` value out of a contiguous VTL0 physical span starting
     /// at `phys_addr`.
     fn read_vtl0_val<T: FromBytes>(&self, phys_addr: u64) -> Result<T, VsmError> {
-        let mut buf = alloc::vec![0u8; core::mem::size_of::<T>()];
+        let mut buf = u8::new_vec_zeroed(core::mem::size_of::<T>())
+            .map_err(|_| VsmError::AllocationFailed)?;
         self.read_vtl0_contiguous(phys_addr, &mut buf)?;
         T::read_from_bytes(&buf).map_err(|_| VsmError::Vtl0CopyFailed)
     }

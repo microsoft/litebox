@@ -1222,15 +1222,18 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
         //
         // `validate_unowned` rejects VTL1-owned PA before callers reach `vmap`, so these pages are
         // foreign and the vmap VA range never aliases VTL1-owned Rust memory.
-        let frames: alloc::vec::Vec<PhysFrame<Size4KiB>> = pages
-            .iter()
-            .map(|p| {
-                let address = p.as_usize();
+        let mut frames = alloc::vec::Vec::new();
+        frames
+            .try_reserve_exact(pages.len())
+            .map_err(|_| PhysPointerError::AllocError)?;
+        for page in pages {
+            let address = page.as_usize();
+            frames.push(
                 x86_64::PhysAddr::try_new(address as u64)
                     .map(PhysFrame::containing_address)
-                    .map_err(|_| PhysPointerError::InvalidPhysicalAddress(address))
-            })
-            .collect::<Result<_, _>>()?;
+                    .map_err(|_| PhysPointerError::InvalidPhysicalAddress(address))?,
+            );
+        }
 
         let base_va = vmap_allocator()
             .allocate_va(frames.len())

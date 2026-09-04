@@ -11,7 +11,7 @@ extern crate alloc;
 use crate::loader::elf::ElfLoaderError;
 use crate::syscalls::pta::PseudoTa;
 use aes::{Aes128, Aes192, Aes256};
-use alloc::{sync::Arc, vec};
+use alloc::sync::Arc;
 use core::cell::Cell;
 use ctr::Ctr128BE;
 use hashbrown::{HashMap, HashSet};
@@ -29,6 +29,7 @@ use litebox_common_optee::{
     TeeObjectInfo, TeeObjectType, TeeOperationMode, TeeResult, TeeUuid, UteeAttribute,
 };
 use litebox_platform_multiplex::Platform;
+use zerocopy::FromZeros as _;
 
 pub mod loader;
 pub mod session;
@@ -422,27 +423,30 @@ impl Task {
                 if let Some(buf_length) = blen.read_at_offset(0)
                     && (buf_length as usize) <= MAX_KERNEL_BUF_SIZE
                 {
-                    let mut prop_buf = vec![0u8; buf_length as usize];
                     if name.as_usize() != 0 || name_len.as_usize() != 0 {
                         #[cfg(debug_assertions)]
                         todo!("return the name of a given property index");
                         #[cfg(not(debug_assertions))]
                         Err(TeeResult::NotSupported)
                     } else {
-                        self.sys_get_property(
-                            prop_set,
-                            index,
-                            None,
-                            None,
-                            &mut prop_buf,
-                            blen,
-                            prop_type,
-                        )
-                        .and_then(|()| {
-                            buf.copy_from_slice(0, &prop_buf)
-                                .ok_or(TeeResult::ShortBuffer)?;
-                            Ok(())
-                        })
+                        u8::new_vec_zeroed(buf_length as usize)
+                            .map_err(|_| TeeResult::OutOfMemory)
+                            .and_then(|mut prop_buf| {
+                                self.sys_get_property(
+                                    prop_set,
+                                    index,
+                                    None,
+                                    None,
+                                    &mut prop_buf,
+                                    blen,
+                                    prop_type,
+                                )
+                                .and_then(|()| {
+                                    buf.copy_from_slice(0, &prop_buf)
+                                        .ok_or(TeeResult::ShortBuffer)?;
+                                    Ok(())
+                                })
+                            })
                     }
                 } else {
                     Err(TeeResult::BadParameters)
@@ -589,11 +593,14 @@ impl Task {
                 if blen > 4096 {
                     Err(TeeResult::OutOfMemory)
                 } else {
-                    let mut kernel_buf = vec![0u8; blen];
-                    self.sys_cryp_random_number_generate(&mut kernel_buf)
-                        .and_then(|()| {
-                            buf.copy_from_slice(0, &kernel_buf)
-                                .ok_or(TeeResult::AccessDenied)
+                    u8::new_vec_zeroed(blen)
+                        .map_err(|_| TeeResult::OutOfMemory)
+                        .and_then(|mut kernel_buf| {
+                            self.sys_cryp_random_number_generate(&mut kernel_buf)
+                                .and_then(|()| {
+                                    buf.copy_from_slice(0, &kernel_buf)
+                                        .ok_or(TeeResult::AccessDenied)
+                                })
                         })
                 }
             }
@@ -758,11 +765,14 @@ impl Task {
                 if num_bytes > 4096 {
                     Err(TeeResult::OutOfMemory)
                 } else {
-                    let mut kernel_buf = vec![0u8; num_bytes];
-                    self.sys_cryp_random_number_generate(&mut kernel_buf)
-                        .and_then(|()| {
-                            buf.copy_from_slice(0, &kernel_buf)
-                                .ok_or(TeeResult::AccessDenied)
+                    u8::new_vec_zeroed(num_bytes)
+                        .map_err(|_| TeeResult::OutOfMemory)
+                        .and_then(|mut kernel_buf| {
+                            self.sys_cryp_random_number_generate(&mut kernel_buf)
+                                .and_then(|()| {
+                                    buf.copy_from_slice(0, &kernel_buf)
+                                        .ok_or(TeeResult::AccessDenied)
+                                })
                         })
                 }
             }
@@ -978,7 +988,7 @@ where
         && length <= MAX_KERNEL_BUF_SIZE as u64
     {
         let mut length: usize = length.trunc();
-        let mut kernel_buf = vec![0u8; length];
+        let mut kernel_buf = u8::new_vec_zeroed(length).map_err(|_| TeeResult::OutOfMemory)?;
         let result = syscall_fn(task, state, &src_slice, &mut kernel_buf, &mut length);
         match result {
             Ok(()) => {
@@ -1040,8 +1050,8 @@ impl TeeObj {
         self.key = None;
     }
 
-    pub fn set_key(&mut self, key: &[u8]) {
-        self.key = Some(alloc::boxed::Box::from(key));
+    pub fn set_key(&mut self, key: alloc::boxed::Box<[u8]>) {
+        self.key = Some(key);
         self.info
             .handle_flags
             .set(TeeHandleFlag::TEE_HANDLE_FLAG_KEY_SET, true);
@@ -1108,7 +1118,7 @@ impl TeeObjMap {
                 let Some(key_box) = key_ptr.to_owned_slice(key_len) else {
                     return Err(TeeResult::BadParameters);
                 };
-                tee_obj.set_key(&key_box);
+                tee_obj.set_key(key_box);
             } else {
                 #[cfg(debug_assertions)]
                 todo!(
@@ -1375,8 +1385,8 @@ impl TaUuidMap {
 
 /// Get the global TA UUID map.
 fn ta_uuid_map() -> &'static TaUuidMap {
-    static TA_UUID_MAP: once_cell::race::OnceBox<TaUuidMap> = once_cell::race::OnceBox::new();
-    TA_UUID_MAP.get_or_init(|| alloc::boxed::Box::new(TaUuidMap::new()))
+    static TA_UUID_MAP: spin::Once<TaUuidMap> = spin::Once::new();
+    TA_UUID_MAP.call_once(TaUuidMap::new)
 }
 
 /// Per-instance TA state which can be shared between sessions if it is

@@ -16,7 +16,7 @@ extern crate alloc;
 mod handlers;
 mod mem_integrity;
 
-use alloc::{boxed::Box, ffi::CString, string::String, vec::Vec};
+use alloc::{ffi::CString, string::String, vec::Vec};
 use core::ffi::{CStr, c_char};
 use core::{
     mem,
@@ -47,7 +47,7 @@ pub struct Heki<P: Vtl0Gate> {
     /// gate out of every handler signature.
     pub(crate) gate: P,
     pub(crate) module_memory_metadata: ModuleMemoryMetadataMap,
-    system_certs: once_cell::race::OnceBox<Box<[Certificate]>>,
+    system_certs: spin::Once<Vec<Certificate>>,
     pub(crate) kexec_metadata: KexecMemoryMetadataWrapper,
     pub(crate) crash_kexec_metadata: KexecMemoryMetadataWrapper,
     pub(crate) precomputed_patches: PatchDataMap,
@@ -65,7 +65,7 @@ impl<P: Vtl0Gate> Heki<P> {
         Self {
             gate,
             module_memory_metadata: ModuleMemoryMetadataMap::new(),
-            system_certs: once_cell::race::OnceBox::new(),
+            system_certs: spin::Once::new(),
             kexec_metadata: KexecMemoryMetadataWrapper::new(),
             crash_kexec_metadata: KexecMemoryMetadataWrapper::new(),
             precomputed_patches: PatchDataMap::new(),
@@ -75,12 +75,11 @@ impl<P: Vtl0Gate> Heki<P> {
     }
 
     pub(crate) fn set_system_certificates(&self, certs: Vec<Certificate>) {
-        let boxed_slice = certs.into_boxed_slice();
-        let _ = self.system_certs.set(boxed_slice.into());
+        self.system_certs.call_once(|| certs);
     }
 
     pub(crate) fn get_system_certificates(&self) -> Option<&[Certificate]> {
-        self.system_certs.get().map(|b| &**b)
+        self.system_certs.get().map(Vec::as_slice)
     }
 
     /// This function finds the precomputed patch data corresponding to the input patch data.
@@ -134,9 +133,21 @@ impl ModuleMemoryMetadata {
         ));
     }
 
+    pub(crate) fn try_reserve_ranges(&mut self, additional: usize) -> Result<(), VsmError> {
+        self.ranges
+            .try_reserve_exact(additional)
+            .map_err(|_| VsmError::AllocationFailed)
+    }
+
     #[inline]
     pub(crate) fn insert_memory_range(&mut self, mem_range: ModuleMemoryRange) {
         self.ranges.push(mem_range);
+    }
+
+    pub(crate) fn try_reserve_patch_targets(&mut self, additional: usize) -> Result<(), VsmError> {
+        self.patch_targets
+            .try_reserve_exact(additional)
+            .map_err(|_| VsmError::AllocationFailed)
     }
 
     #[inline]
@@ -251,7 +262,7 @@ impl ModuleMemoryMetadataMap {
     /// It also returns patch targets that fell within this freed init frames. These patch targets
     /// are no longer valid (i.e., potential patch-after-free) and thus their corresponding
     /// precomputed patches should be removed (we can't remove them here due to locks).
-    pub(crate) fn remove_init_ranges(&self, key: i64) -> Vec<PhysAddr> {
+    pub(crate) fn remove_init_ranges(&self, key: i64) -> Result<Vec<PhysAddr>, VsmError> {
         let is_init = |t| {
             matches!(
                 t,
@@ -260,16 +271,24 @@ impl ModuleMemoryMetadataMap {
         };
         let mut map = self.inner.lock();
         let Some(metadata) = map.get_mut(&key) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
-        let init_ranges: Vec<PhysFrameRange<Size4KiB>> = metadata
-            .ranges
-            .iter()
-            .filter(|r| is_init(r.mod_mem_type))
-            .map(|r| r.phys_frame_range)
-            .collect();
-        metadata.ranges.retain(|r| !is_init(r.mod_mem_type));
+        let mut init_ranges = Vec::new();
+        init_ranges
+            .try_reserve_exact(metadata.ranges.len())
+            .map_err(|_| VsmError::AllocationFailed)?;
+        init_ranges.extend(
+            metadata
+                .ranges
+                .iter()
+                .filter(|r| is_init(r.mod_mem_type))
+                .map(|r| r.phys_frame_range),
+        );
         let mut freed_patch_targets = Vec::new();
+        freed_patch_targets
+            .try_reserve_exact(metadata.patch_targets.len())
+            .map_err(|_| VsmError::AllocationFailed)?;
+        metadata.ranges.retain(|r| !is_init(r.mod_mem_type));
         metadata.patch_targets.retain(|&pa| {
             let freed = init_ranges
                 .iter()
@@ -281,15 +300,21 @@ impl ModuleMemoryMetadataMap {
                 true
             }
         });
-        freed_patch_targets
+        Ok(freed_patch_targets)
     }
 
     /// Return the addresses of patch targets belonging to a module identified by `key`
-    pub(crate) fn get_patch_targets(&self, key: i64) -> Option<Vec<PhysAddr>> {
+    pub(crate) fn get_patch_targets(&self, key: i64) -> Result<Option<Vec<PhysAddr>>, VsmError> {
         let guard = self.inner.lock();
-        guard
-            .get(&key)
-            .map(|metadata| metadata.get_patch_targets().clone())
+        let Some(metadata) = guard.get(&key) else {
+            return Ok(None);
+        };
+        let targets = metadata.get_patch_targets();
+        let mut copy = Vec::new();
+        copy.try_reserve_exact(targets.len())
+            .map_err(|_| VsmError::AllocationFailed)?;
+        copy.extend_from_slice(targets);
+        Ok(Some(copy))
     }
 
     pub(crate) fn iter_entry(&self, key: i64) -> Option<ModuleMemoryMetadataIters<'_>> {
@@ -350,6 +375,12 @@ impl ModuleMemory {
             init_text: MemoryContainer::new(),
             init_rodata: MemoryContainer::new(),
         }
+    }
+
+    pub(crate) fn try_reserve_ranges(&mut self, additional: usize) -> Result<(), VsmError> {
+        self.text.try_reserve_ranges(additional)?;
+        self.init_text.try_reserve_ranges(additional)?;
+        self.init_rodata.try_reserve_ranges(additional)
     }
 
     /// Return a memory container for a section of the module memory by its name
@@ -421,6 +452,12 @@ impl MemoryContainer {
         }
     }
 
+    pub(crate) fn try_reserve_ranges(&mut self, additional: usize) -> Result<(), VsmError> {
+        self.range
+            .try_reserve_exact(additional)
+            .map_err(|_| VsmError::AllocationFailed)
+    }
+
     /// Return the byte length of the memory container
     pub(crate) fn len(&self) -> usize {
         self.buf.len()
@@ -484,11 +521,13 @@ impl MemoryContainer {
                     .checked_add(range_len)
                     .ok_or(MemoryContainerError::Overflow)?;
             }
-            self.buf.reserve_exact(len);
+            self.buf
+                .try_reserve_exact(len)
+                .map_err(|_| MemoryContainerError::AllocationFailed)?;
         }
 
-        let range = self.range.clone();
-        for range in range {
+        for index in 0..self.range.len() {
+            let range = self.range[index];
             let phys_end = range
                 .phys_addr
                 .as_u64()
@@ -513,7 +552,13 @@ impl MemoryContainer {
         }
 
         let old_len = self.buf.len();
-        self.buf.resize(old_len + bytes_to_copy, 0);
+        let new_len = old_len
+            .checked_add(bytes_to_copy)
+            .ok_or(MemoryContainerError::Overflow)?;
+        self.buf
+            .try_reserve_exact(bytes_to_copy)
+            .map_err(|_| MemoryContainerError::AllocationFailed)?;
+        self.buf.resize(new_len, 0);
         if gate
             .read_vtl0_contiguous(phys_start.as_u64(), &mut self.buf[old_len..])
             .is_err()
@@ -541,6 +586,19 @@ pub(crate) enum MemoryContainerError {
     CopyFromVtl0Failed,
     #[error("integer overflow while processing VTL0 memory")]
     Overflow,
+    #[error("failed to allocate memory buffer")]
+    AllocationFailed,
+}
+
+impl From<MemoryContainerError> for VsmError {
+    fn from(error: MemoryContainerError) -> Self {
+        match error {
+            MemoryContainerError::AllocationFailed => VsmError::AllocationFailed,
+            MemoryContainerError::CopyFromVtl0Failed | MemoryContainerError::Overflow => {
+                VsmError::Vtl0CopyFailed
+            }
+        }
+    }
 }
 
 pub(crate) struct KexecMemoryMetadataWrapper {
@@ -598,6 +656,12 @@ impl KexecMemoryMetadata {
         let epa = heki_range.epa;
         self.insert_memory_range(KexecMemoryRange::new_checked(pa, epa));
         Ok(())
+    }
+
+    pub(crate) fn try_reserve_ranges(&mut self, additional: usize) -> Result<(), VsmError> {
+        self.ranges
+            .try_reserve_exact(additional)
+            .map_err(|_| VsmError::AllocationFailed)
     }
 
     #[inline]
@@ -732,6 +796,14 @@ impl PatchDataMap {
         }
 
         let mut parsed: Vec<(PhysAddr, HekiPatch)> = Vec::new();
+        let max_patch_targets = patch_info_buf
+            .len()
+            .checked_div(core::mem::size_of::<HekiPatch>())
+            .and_then(|count| count.checked_mul(2))
+            .ok_or(PatchDataMapError::InvalidHekiPatchInfo)?;
+        parsed
+            .try_reserve_exact(max_patch_targets)
+            .map_err(|_| PatchDataMapError::AllocationFailed)?;
 
         // the buffer looks like below:
         // [`HekiPatchInfo`, [`HekiPatch`, ...], `HekiPatchInfo`, [`HekiPatch`, ...], ...]
@@ -803,6 +875,11 @@ impl PatchDataMap {
         }
 
         // Commit every parsed patch and record its targets for later unload cleanup.
+        if let Some(ref mut mod_mem_meta) = module_memory_metadata {
+            mod_mem_meta
+                .try_reserve_patch_targets(parsed.len())
+                .map_err(|_| PatchDataMapError::AllocationFailed)?;
+        }
         let mut inner = self.inner.write();
         for (target, patch) in parsed {
             inner.insert(target, patch);
@@ -823,6 +900,8 @@ pub(crate) enum PatchDataMapError {
     InvalidHekiPatchInfo,
     #[error("invalid HEKI patch")]
     InvalidHekiPatch,
+    #[error("failed to allocate patch buffer")]
+    AllocationFailed,
 }
 
 // TODO: Use this to resolve symbols in modules

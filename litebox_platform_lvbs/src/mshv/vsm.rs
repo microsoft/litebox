@@ -319,8 +319,17 @@ impl FrameReservation {
     /// claims added by this call are rolled back.
     pub(crate) fn reserve(
         &mut self,
-        frames: impl IntoIterator<Item = PhysFrameRange<Size4KiB>>,
+        frames: &[PhysFrameRange<Size4KiB>],
     ) -> Result<Vec<ReservationStatus>, VsmError> {
+        let reserve_count = frames.len();
+        let mut statuses = Vec::new();
+        statuses
+            .try_reserve_exact(reserve_count)
+            .map_err(|_| VsmError::AllocationFailed)?;
+        self.owned_ranges
+            .try_reserve_exact(reserve_count)
+            .map_err(|_| VsmError::AllocationFailed)?;
+
         let vtl1 = crate::platform_low().vtl1_phys_frame_range();
         let vtl1_start = vtl1.start.start_address().as_u64();
         let vtl1_end = vtl1.end.start_address().as_u64();
@@ -329,10 +338,9 @@ impl FrameReservation {
             // Idempotence applies only to ranges owned before this call.
             let owned_before = self.owned_frames.clone();
             let mut seen = RangeSet::new();
-            let mut statuses = Vec::new();
             // Frames this call adds, so a later overlap rolls back only them.
             let rollback_from = self.owned_ranges.len();
-            for phys_frame_range in frames {
+            for &phys_frame_range in frames {
                 let start = phys_frame_range.start.start_address().as_u64();
                 let end = phys_frame_range.end.start_address().as_u64();
                 if start >= end {
@@ -659,7 +667,7 @@ impl FrameTxn for PlatformFrameTxn<'_> {
         &mut self,
         ranges: &[PhysFrameRange<Size4KiB>],
     ) -> Result<Vec<ReservationStatus>, VsmError> {
-        self.guard.reserve(ranges.iter().copied())
+        self.guard.reserve(ranges)
     }
 
     fn protect(&mut self, range: PhysFrameRange<Size4KiB>, attr: MemAttr) -> Result<(), VsmError> {
@@ -698,7 +706,7 @@ impl Vtl0Gate for LvbsVtl0Gate {
         f: &mut dyn FnMut(&mut dyn FrameTxn) -> Result<(), VsmError>,
     ) -> Result<(), VsmError> {
         let mut guard = FrameReservation::new();
-        guard.reserve(initial.iter().copied())?;
+        guard.reserve(initial)?;
         let mut txn = PlatformFrameTxn { guard: &mut guard };
         let result = f(&mut txn);
         if result.is_ok() {

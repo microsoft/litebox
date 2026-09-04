@@ -1721,6 +1721,7 @@ dependencies = [
  "log",
  "spin 0.10.0",
  "x86_64",
+ "zerocopy",
 ]
 
 [[package]]
@@ -1773,7 +1774,6 @@ dependencies = [
  "litebox_common_lvbs",
  "log",
  "object",
- "once_cell",
  "rangemap",
  "rsa",
  "sha2",
@@ -1824,7 +1824,6 @@ dependencies = [
  "litebox_platform_multiplex",
  "litebox_util_log",
  "num_enum",
- "once_cell",
  "p384",
  "rangemap",
  "sha2",

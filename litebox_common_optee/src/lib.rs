@@ -15,7 +15,7 @@ use litebox::utils::TruncateExt;
 use litebox_common_linux::{PtRegs, errno::Errno};
 use num_enum::TryFromPrimitive;
 use syscall_nr::{LdelfSyscallNr, TeeSyscallNr};
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
 pub mod syscall_nr;
 
@@ -1071,7 +1071,6 @@ impl TeeObjectType {
     const UNKNOWN: Self = TeeObjectType(0xffff_ffff);
 }
 
-const TEE_SUCCESS: u32 = 0x0000_0000;
 const TEE_ERROR_CORRUPT_OBJECT: u32 = 0xf010_0001;
 const TEE_ERROR_CORRUPT_OBJECT_2: u32 = 0xf010_0002;
 const TEE_ERROR_STORAGE_NOT_AVAILABLE: u32 = 0xf010_0003;
@@ -1104,10 +1103,10 @@ const TEE_ERROR_TIME_NOT_SET: u32 = 0xffff_5000;
 const TEE_ERROR_TIME_NEEDS_RESET: u32 = 0xffff_5001;
 
 /// `TEE_Result` (API error codes) from `optee_os/lib/libutee/include/tee_api_defines.h`
-#[derive(Clone, Copy, TryFromPrimitive, PartialEq, Debug)]
+#[derive(Clone, Copy, TryFromPrimitive, PartialEq, Debug, FromZeros)]
 #[repr(u32)]
 pub enum TeeResult {
-    Success = TEE_SUCCESS,
+    Success = 0, // TEE_SUCCESS
     CorruptObject = TEE_ERROR_CORRUPT_OBJECT,
     CorruptObject2 = TEE_ERROR_CORRUPT_OBJECT_2,
     StorageNotAvailable = TEE_ERROR_STORAGE_NOT_AVAILABLE,
@@ -1365,7 +1364,6 @@ impl LdelfArg {
     }
 }
 
-const OPTEE_MSG_CMD_OPEN_SESSION: u32 = 0;
 const OPTEE_MSG_CMD_INVOKE_COMMAND: u32 = 1;
 const OPTEE_MSG_CMD_CLOSE_SESSION: u32 = 2;
 const OPTEE_MSG_CMD_CANCEL: u32 = 3;
@@ -1376,10 +1374,10 @@ const OPTEE_MSG_CMD_STOP_ASYNC_NOTIF: u32 = 7;
 
 /// `OPTEE_MSG_CMD_*` from `optee_os/core/include/optee_msg.h`
 #[non_exhaustive]
-#[derive(Clone, Copy, Debug, PartialEq, TryFromPrimitive)]
+#[derive(Clone, Copy, Debug, PartialEq, TryFromPrimitive, FromZeros)]
 #[repr(u32)]
 pub enum OpteeMessageCommand {
-    OpenSession = OPTEE_MSG_CMD_OPEN_SESSION,
+    OpenSession = 0, // OPTEE_MSG_CMD_OPEN_SESSION
     InvokeCommand = OPTEE_MSG_CMD_INVOKE_COMMAND,
     CloseSession = OPTEE_MSG_CMD_CLOSE_SESSION,
     Cancel = OPTEE_MSG_CMD_CANCEL,
@@ -1401,7 +1399,6 @@ impl TryFrom<OpteeMessageCommand> for UteeEntryFunc {
     }
 }
 
-const OPTEE_MSG_RPC_CMD_LOAD_TA: u32 = 0;
 const OPTEE_MSG_RPC_CMD_RPMB: u32 = 1;
 const OPTEE_MSG_RPC_CMD_FS: u32 = 2;
 const OPTEE_MSG_RPC_CMD_GET_TIME: u32 = 3;
@@ -1424,11 +1421,11 @@ const OPTEE_MSG_RPC_CMD_RPMB_PROBE_FRAMES: u32 = 24;
 /// They live in a separate namespace from [`OpteeMessageCommand`] (which is for main
 /// messaging between the normal-world driver and OP-TEE OS).
 #[non_exhaustive]
-#[derive(Clone, Copy, Debug, PartialEq, TryFromPrimitive)]
+#[derive(Clone, Copy, Debug, PartialEq, TryFromPrimitive, FromZeros)]
 #[repr(u32)]
 pub enum OpteeRpcCommand {
     /// Load a TA into memory, defined in tee-supplicant.
-    LoadTa = OPTEE_MSG_RPC_CMD_LOAD_TA,
+    LoadTa = 0, // OPTEE_MSG_RPC_CMD_LOAD_TA
     /// Reserved
     Rpmb = OPTEE_MSG_RPC_CMD_RPMB,
     /// REE file-system access, defined in tee-supplicant.
@@ -1759,7 +1756,7 @@ impl From<OpteeRpcArgs> for OpteeMsgArgsHeader {
 /// `optee_msg_arg` from `optee_os/core/include/optee_msg.h`
 /// OP-TEE message argument structure that the normal world (or VTL0) OP-TEE driver and OP-TEE OS use to
 /// exchange messages.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, FromZeros)]
 #[repr(C)]
 pub struct OpteeMsgArgs {
     /// OP-TEE message command. This is a superset of `UteeEntryFunc`.
@@ -1983,7 +1980,7 @@ impl OpteeMsgArgs {
 ///
 /// The remaining header fields (`func`, `session`, `cancel_id`) are **unused** for RPC
 /// and always zero on the wire. They are not exposed in this struct.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, FromZeros)]
 #[repr(C)]
 pub struct OpteeRpcArgs {
     /// RPC command ID. Unlike main args, this uses [`OpteeRpcCommand`] (e.g. `LoadTa`,

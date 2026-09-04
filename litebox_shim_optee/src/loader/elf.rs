@@ -30,6 +30,7 @@ use litebox_common_linux::{
 };
 use litebox_common_optee::{LdelfArg, TeeUuid};
 use thiserror::Error;
+use zerocopy::FromZeros as _;
 
 /// An ELF file loaded in memory
 struct ElfFileInMemory<'a> {
@@ -53,11 +54,11 @@ fn read_at(elf: &ElfFileInMemory, offset: u64, buf: &mut [u8]) -> Result<(), Err
 }
 
 impl<'a> ElfFileInMemory<'a> {
-    fn new(task: &'a Task, elf_buf: &[u8]) -> Self {
-        Self {
-            task,
-            buffer: elf_buf.into(),
-        }
+    fn new(task: &'a Task, elf_buf: &[u8]) -> Result<Self, ElfLoaderError> {
+        let mut buffer = <[u8]>::new_box_zeroed_with_elems(elf_buf.len())
+            .map_err(|_| ElfLoaderError::AllocationFailed)?;
+        buffer.copy_from_slice(elf_buf);
+        Ok(Self { task, buffer })
     }
 }
 
@@ -205,7 +206,7 @@ struct FileAndParsed<'a> {
 
 impl<'a> FileAndParsed<'a> {
     fn new(task: &'a Task, elf_buf: &[u8]) -> Result<Self, ElfLoaderError> {
-        let file = ElfFileInMemory::new(task, elf_buf);
+        let file = ElfFileInMemory::new(task, elf_buf)?;
         let mut parsed = litebox_common_linux::loader::ElfParsedFile::parse(&mut &file)
             .map_err(ElfLoaderError::ParseError)?;
         match parsed.parse_trampoline(&mut &file, task.global.platform.get_syscall_entry_point()) {
@@ -307,6 +308,8 @@ pub enum ElfLoaderError {
     MappingError(#[from] MappingError),
     #[error("TA binary UUID does not match expected UUID")]
     InvalidUuid,
+    #[error("failed to allocate ELF file buffer")]
+    AllocationFailed,
 }
 
 impl From<ElfLoaderError> for litebox_common_linux::errno::Errno {
@@ -314,9 +317,9 @@ impl From<ElfLoaderError> for litebox_common_linux::errno::Errno {
         match value {
             ElfLoaderError::OpenError(e) | ElfLoaderError::ProtectError(e) => e,
             ElfLoaderError::ParseError(e) => e.into(),
-            ElfLoaderError::InvalidStackAddr | ElfLoaderError::MappingError(_) => {
-                litebox_common_linux::errno::Errno::ENOMEM
-            }
+            ElfLoaderError::InvalidStackAddr
+            | ElfLoaderError::MappingError(_)
+            | ElfLoaderError::AllocationFailed => litebox_common_linux::errno::Errno::ENOMEM,
             ElfLoaderError::LoadError(e) => e.into(),
             ElfLoaderError::InvalidUuid => litebox_common_linux::errno::Errno::EINVAL,
         }

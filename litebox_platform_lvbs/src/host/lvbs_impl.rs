@@ -271,8 +271,8 @@ impl HostInterface for HostLvbsInterface {
         serial_print_string(msg);
     }
 
-    fn alloc(layout: &core::alloc::Layout) -> Option<(usize, usize)> {
-        panic!("dynamic memory allocation is not supported (layout = {layout:?})");
+    fn alloc(_layout: &core::alloc::Layout) -> Option<(usize, usize)> {
+        None
     }
 
     unsafe fn free(_addr: usize) {
