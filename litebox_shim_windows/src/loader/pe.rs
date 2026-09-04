@@ -1114,7 +1114,12 @@ struct PeImageFile<Platform: crate::ShimPlatform> {
 
 impl<Platform: crate::ShimPlatform> PeImageFile<Platform> {
     fn open(fs: Arc<crate::WindowsFS<Platform>>, path: &str) -> Result<Self, PeImageAccessError> {
-        let fd = fs.open(path, OFlags::RDONLY, Mode::empty())?;
+        let fd = fs.open(
+            &litebox::fs::resolver::Context::new(),
+            path,
+            OFlags::RDONLY,
+            Mode::empty(),
+        )?;
         Ok(Self { fs, fd })
     }
 

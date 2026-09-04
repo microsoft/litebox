@@ -899,9 +899,9 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                     .contains(FileCreateOptions::DELETE_ON_CLOSE)
                 {
                     if is_directory {
-                        let _ = self.fs.rmdir(&file.path);
+                        let _ = self.fs.rmdir(&self.fs_context, &file.path);
                     } else {
-                        let _ = self.fs.unlink(&file.path);
+                        let _ = self.fs.unlink(&self.fs_context, &file.path);
                     }
                 }
             }
@@ -981,11 +981,11 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             }
             Err(status) => return status,
         };
-        let status = match self.fs.file_status(&path) {
+        let status = match self.fs.file_status(&self.fs_context, &path) {
             Ok(status) => status,
             Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory)) => {
                 let parent = parent_directory_path(&path);
-                return if self.fs.file_status(parent).is_ok() {
+                return if self.fs.file_status(&self.fs_context, parent).is_ok() {
                     NtStatus::OBJECT_NAME_NOT_FOUND
                 } else {
                     NtStatus::OBJECT_PATH_NOT_FOUND
@@ -1083,11 +1083,11 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             }
             Err(status) => return status,
         };
-        let status = match self.fs.file_status(&path) {
+        let status = match self.fs.file_status(&self.fs_context, &path) {
             Ok(status) => status,
             Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory)) => {
                 let parent = parent_directory_path(&path);
-                return if self.fs.file_status(parent).is_ok() {
+                return if self.fs.file_status(&self.fs_context, parent).is_ok() {
                     NtStatus::OBJECT_NAME_NOT_FOUND
                 } else {
                     NtStatus::OBJECT_PATH_NOT_FOUND
@@ -1667,7 +1667,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                         && operation == FileIoOperation::Write =>
             {
                 let status = file
-                    .with_entry(|file| self.fs.file_status(&file.path))
+                    .with_entry(|file| self.fs.file_status(&self.fs_context, &file.path))
                     .map_err(map_file_status_error)?;
                 Some(status.size)
             }
@@ -1974,7 +1974,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         let parent_path = parent_directory_path(&file.path);
         let parent_status = self
             .fs
-            .file_status(parent_path)
+            .file_status(&self.fs_context, parent_path)
             .map_err(map_file_status_error)?;
         let mut entries = alloc::vec![
             DirectoryEntry::from_status(String::from("."), &current_status),
@@ -1985,7 +1985,10 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                 continue;
             }
             let path = child_path(&file.path, &entry.name);
-            let status = self.fs.file_status(path).map_err(map_file_status_error)?;
+            let status = self
+                .fs
+                .file_status(&self.fs_context, path)
+                .map_err(map_file_status_error)?;
             entries.push(DirectoryEntry::from_status(entry.name, &status));
         }
         Ok(entries)
@@ -2345,7 +2348,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         ),
         NtStatus,
     > {
-        let existed_before_open = self.fs.file_status(path).is_ok();
+        let existed_before_open = self.fs.file_status(&self.fs_context, path).is_ok();
         if create_disposition == CreateDisposition::Supersede
             && existed_before_open
             && !desired_access.contains(FileAccess::DELETE)
@@ -2355,7 +2358,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         let flags = desired_access.open_flags(create_disposition, create_options);
         let fd = self
             .fs
-            .open(path, flags, mode)
+            .open(&self.fs_context, path, flags, mode)
             .map_err(|error| map_open_error(error, create_disposition))?;
         let file_status = match self.fs.fd_file_status(&fd) {
             Ok(file_status) => file_status,
@@ -2396,7 +2399,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             return Err(NtStatus::INVALID_PARAMETER);
         }
 
-        let existed_before_open = match self.fs.file_status(path) {
+        let existed_before_open = match self.fs.file_status(&self.fs_context, path) {
             Ok(status) => {
                 if status.file_type != FileType::Directory {
                     return Err(NtStatus::NOT_A_DIRECTORY);
@@ -2410,7 +2413,11 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                 ) =>
             {
                 self.fs
-                    .mkdir(path, create_directory_mode(file_attributes))
+                    .mkdir(
+                        &self.fs_context,
+                        path,
+                        create_directory_mode(file_attributes),
+                    )
                     .map_err(map_mkdir_error)?;
                 false
             }
@@ -2425,7 +2432,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         let flags = desired_access.open_flags(open_disposition, create_options);
         let fd = self
             .fs
-            .open(path, flags, Mode::empty())
+            .open(&self.fs_context, path, flags, Mode::empty())
             .map_err(|error| map_open_error(error, create_disposition))?;
         let information = create_disposition.success_information(existed_before_open);
         Ok((
@@ -2816,7 +2823,12 @@ mod tests {
     fn create_existing_file(task: &Task<TestPlatform>, path: &str, data: &[u8]) {
         let fd = task
             .fs
-            .open(path, OFlags::CREAT | OFlags::RDWR, Mode::RUSR | Mode::WUSR)
+            .open(
+                &task.fs_context,
+                path,
+                OFlags::CREAT | OFlags::RDWR,
+                Mode::RUSR | Mode::WUSR,
+            )
             .unwrap();
         assert_eq!(task.fs.write(&fd, data, Some(0)).unwrap(), data.len());
         task.fs.close(&fd).unwrap();
@@ -3173,6 +3185,7 @@ mod tests {
         create_existing_file(&task, "/tmp/query-attributes.txt", b"data");
         task.fs
             .mkdir(
+                &task.fs_context,
                 "/tmp/query-attributes-dir",
                 Mode::RUSR | Mode::WUSR | Mode::XUSR,
             )
@@ -3293,7 +3306,10 @@ mod tests {
             assert_eq!(io_status.information, 1);
             assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
 
-            let fd = task.fs.open(path, OFlags::RDONLY, Mode::empty()).unwrap();
+            let fd = task
+                .fs
+                .open(&task.fs_context, path, OFlags::RDONLY, Mode::empty())
+                .unwrap();
             let mut contents = [0; 5];
             assert_eq!(task.fs.read(&fd, &mut contents, Some(0)).unwrap(), 5);
             assert_eq!(&contents, b"data!");
@@ -3326,7 +3342,7 @@ mod tests {
             let (status, handle, _) = create_file(&task, path, FILE_GENERIC_READ, FILE_OPEN);
             assert_eq!(status, NtStatus::SUCCESS);
 
-            task.fs.unlink(path).unwrap();
+            task.fs.unlink(&task.fs_context, path).unwrap();
             create_existing_file(&task, path, b"replacement is longer");
 
             let mut information = FileStandardInformation::default();
@@ -3776,7 +3792,9 @@ mod tests {
     fn nt_query_directory_file_ex_tracks_restart_single_and_no_cursor_flags() {
         run_with_test_platform_pointers(|| {
             let task = crate::tests::test_task();
-            task.fs.mkdir("/tmp/query-cursor", Mode::RWXU).unwrap();
+            task.fs
+                .mkdir(&task.fs_context, "/tmp/query-cursor", Mode::RWXU)
+                .unwrap();
             create_existing_file(&task, "/tmp/query-cursor/alpha", b"a");
             create_existing_file(&task, "/tmp/query-cursor/beta", b"b");
             let all_handle =
@@ -3960,7 +3978,11 @@ mod tests {
         let task = crate::tests::test_task();
         create_existing_file(&task, "/tmp/dir-file-root.txt", b"root");
         task.fs
-            .mkdir("/tmp/dir", Mode::RUSR | Mode::WUSR | Mode::XUSR)
+            .mkdir(
+                &task.fs_context,
+                "/tmp/dir",
+                Mode::RUSR | Mode::WUSR | Mode::XUSR,
+            )
             .unwrap();
         create_existing_file(&task, "/tmp/dir/child.txt", b"child");
 
@@ -4192,7 +4214,11 @@ mod tests {
     fn nt_create_file_actual_directory_handles_can_root_relative_opens() {
         let task = crate::tests::test_task();
         task.fs
-            .mkdir("/tmp/implicit-dir", Mode::RUSR | Mode::WUSR | Mode::XUSR)
+            .mkdir(
+                &task.fs_context,
+                "/tmp/implicit-dir",
+                Mode::RUSR | Mode::WUSR | Mode::XUSR,
+            )
             .unwrap();
         create_existing_file(&task, "/tmp/implicit-dir/child.txt", b"child");
         let (_path, _name, attributes) = open_object_attributes("/tmp/implicit-dir");
@@ -4439,10 +4465,15 @@ mod tests {
             .unwrap()
             .0;
 
-        assert!(task.fs.file_status("/tmp/delete-on-close.txt").is_ok());
+        assert!(
+            task.fs
+                .file_status(&task.fs_context, "/tmp/delete-on-close.txt")
+                .is_ok()
+        );
         assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
         assert!(matches!(
-            task.fs.file_status("/tmp/delete-on-close.txt"),
+            task.fs
+                .file_status(&task.fs_context, "/tmp/delete-on-close.txt"),
             Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory))
         ));
     }
@@ -4470,10 +4501,15 @@ mod tests {
             .unwrap()
             .0;
 
-        assert!(task.fs.file_status("/tmp/delete-on-close-dir").is_ok());
+        assert!(
+            task.fs
+                .file_status(&task.fs_context, "/tmp/delete-on-close-dir")
+                .is_ok()
+        );
         assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
         assert!(matches!(
-            task.fs.file_status("/tmp/delete-on-close-dir"),
+            task.fs
+                .file_status(&task.fs_context, "/tmp/delete-on-close-dir"),
             Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory))
         ));
     }

@@ -774,7 +774,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let path = nls_section_file_path(request.section_type, request.section_data)?;
         let fd = self
             .fs
-            .open(path.as_str(), OFlags::RDONLY, Mode::empty())
+            .open(
+                &self.fs_context,
+                path.as_str(),
+                OFlags::RDONLY,
+                Mode::empty(),
+            )
             .map_err(map_nls_open_error)?;
 
         let status = match self.fs.fd_file_status(&fd) {

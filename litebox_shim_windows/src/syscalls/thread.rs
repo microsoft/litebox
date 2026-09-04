@@ -512,6 +512,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             global: self.global.clone(),
             process: self.process.clone(),
             fs: self.fs.clone(),
+            fs_context: self.fs_context.clone(),
             wait_state: crate::wait::WaitState::new(self.global.platform),
             io_completion_worker: Mutex::new(super::iocp::IoCompletionWorkerState::new()),
             entry_point: ntdll.ldr_initialize_thunk,
