@@ -8,9 +8,23 @@ mod tests {
     use core::ffi::CStr;
 
     use litebox::fs::{Mode, OFlags};
-    use litebox_common_linux::{FcntlArg, FileDescriptorFlags};
+    use litebox_common_linux::{FcntlArg, FileDescriptorFlags, IoctlArg, Termios, errno::Errno};
 
-    use crate::syscalls::tests::init_platform;
+    use crate::{
+        UserPtrMut,
+        syscalls::tests::{init_platform, init_platform_with_broker},
+    };
+
+    fn termios() -> Termios {
+        Termios {
+            c_iflag: 0,
+            c_oflag: 0,
+            c_cflag: 0,
+            c_lflag: 0,
+            c_line: 0,
+            c_cc: [0; 19],
+        }
+    }
 
     #[test]
     fn test_stdio() {
@@ -111,5 +125,44 @@ mod tests {
             FileDescriptorFlags::empty().bits(),
             task.sys_fcntl(stdin3, FcntlArg::GETFD).unwrap()
         );
+    }
+
+    #[test]
+    fn test_stdio_terminal_query_requires_broker() {
+        let task = init_platform();
+        let mut termios = termios();
+
+        assert_eq!(
+            task.sys_ioctl(1, IoctlArg::TCGETS(UserPtrMut::from_ptr(&raw mut termios)),),
+            Err(Errno::EIO)
+        );
+    }
+
+    #[test]
+    fn test_stdio_terminal_query_uses_broker() {
+        let task = init_platform_with_broker();
+        let mut termios = termios();
+
+        assert_eq!(
+            task.sys_ioctl(1, IoctlArg::TCGETS(UserPtrMut::from_ptr(&raw mut termios)),),
+            Ok(0)
+        );
+        assert_eq!(
+            task.sys_ioctl(0, IoctlArg::TCGETS(UserPtrMut::from_ptr(&raw mut termios)),),
+            Err(Errno::ENOTTY)
+        );
+
+        for (path, flags, expected) in [
+            ("/dev/stdin", OFlags::RDONLY, Err(Errno::ENOTTY)),
+            ("/dev/stdout", OFlags::WRONLY, Ok(0)),
+            ("/dev/stderr", OFlags::WRONLY, Err(Errno::ENOTTY)),
+            ("/dev/./stdout", OFlags::WRONLY, Ok(0)),
+        ] {
+            let fd = i32::try_from(task.sys_open(path, flags, Mode::empty()).unwrap()).unwrap();
+            assert_eq!(
+                task.sys_ioctl(fd, IoctlArg::TCGETS(UserPtrMut::from_ptr(&raw mut termios)),),
+                expected
+            );
+        }
     }
 }

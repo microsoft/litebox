@@ -21,7 +21,10 @@ use crate::socket::{
     SendToSocketResponse, SetTcpOptionRequest, ShutdownSocketRequest, SocketError,
     SocketStatusRequest, SocketStatusResponse,
 };
-use crate::stdio::{ReadStdioRequest, ReadStdioResponse, WriteStdioRequest, WriteStdioResponse};
+use crate::stdio::{
+    IsTerminalStdioRequest, IsTerminalStdioResponse, ReadStdioRequest, ReadStdioResponse,
+    WriteStdioRequest, WriteStdioResponse,
+};
 use crate::{ObjectHandle, ProtocolVersion, RequestId};
 
 /// Broker handshake request sent before the control channel is active.
@@ -235,6 +238,8 @@ pub enum StdioRequest {
     Read(ReadStdioRequest),
     /// Write bytes to a standard output stream.
     Write(WriteStdioRequest),
+    /// Determine whether a standard stream is connected to a terminal.
+    IsTerminal(IsTerminalStdioRequest),
 }
 
 /// Standard-I/O response.
@@ -244,6 +249,8 @@ pub enum StdioResponse {
     Read(ReadStdioResponse),
     /// Standard output write response.
     Write(WriteStdioResponse),
+    /// Standard-stream terminal capability response.
+    IsTerminal(IsTerminalStdioResponse),
 }
 
 /// Broker-initiated asynchronous notification.

@@ -907,6 +907,13 @@ mod tests {
     }
 
     impl StdioProvider for BlockingStdioProvider {
+        fn is_terminal(
+            &self,
+            _stream: litebox_broker_protocol::stdio::StdioStream,
+        ) -> Result<bool, StdioProviderError> {
+            Err(StdioProviderError::Unsupported)
+        }
+
         fn read(
             &self,
             cancellation: &AssociationCancellation,

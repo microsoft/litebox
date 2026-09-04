@@ -14,7 +14,7 @@ use litebox::{
     fs::{Mode, OFlags, SeekWhence},
     mm::linux::PAGE_SIZE,
     path,
-    platform::StdioStream,
+    stdio::StdioStream,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_common_linux::{
@@ -282,13 +282,42 @@ impl<Platform: ShimPlatform> Task<Platform> {
         mode: Mode,
     ) -> Result<FileFd<Platform>, Errno> {
         let mode = mode & !self.get_umask();
-        let files = self.files.borrow();
-        let fs = self.fs.borrow();
-        let context = fs.context.read();
-        files
-            .fs
-            .open(&context, path, flags - OFlags::CLOEXEC, mode)
-            .map_err(Errno::from)
+        // TODO: Have the device backend attach stream identity once backends can set descriptor
+        // metadata for newly opened files.
+        let stream = path
+            .normalized_components()
+            .ok()
+            .and_then(|mut components| {
+                match (
+                    components.next(),
+                    components.next(),
+                    components.next(),
+                    components.next(),
+                ) {
+                    (Some(""), Some("dev"), Some("stdin"), None) => Some(StdioStream::Stdin),
+                    (Some(""), Some("dev"), Some("stdout"), None) => Some(StdioStream::Stdout),
+                    (Some(""), Some("dev"), Some("stderr"), None) => Some(StdioStream::Stderr),
+                    _ => None,
+                }
+            });
+        let file = {
+            let files = self.files.borrow();
+            let fs = self.fs.borrow();
+            let context = fs.context.read();
+            files
+                .fs
+                .open(&context, &path, flags - OFlags::CLOEXEC, mode)
+                .map_err(Errno::from)
+        }?;
+        if let Some(stream) = stream {
+            let old = self
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .set_entry_metadata(&file, stream);
+            assert!(old.is_none());
+        }
+        Ok(file)
     }
 
     fn do_openat(
@@ -2192,16 +2221,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
                             .descriptor_table()
                             .with_metadata(fd, |stream: &StdioStream| *stream)
                             .map_err(|_| {
-                                // TODO: Handle missing `StdioStream` metadata (could happen if
-                                // `/dev/stdin`, `/dev/stdout`, or `/dev/stderr` was reopened).
-                                // XXX(jayb): likely we might want to have some backend-specific
-                                // metadata layer in our file system?
                                 litebox_util_log::error!(
                                     "standard stream is missing StdioStream metadata"
                                 );
-                                Errno::ENOTTY
+                                Errno::EIO
                             })?;
-                        if self.global.platform.is_a_tty(stream) {
+                        if self
+                            .global
+                            .litebox
+                            .is_stdio_terminal(stream)
+                            .map_err(|_| Errno::EIO)?
+                        {
                             self.stdio_ioctl(&arg)
                         } else {
                             Err(Errno::ENOTTY)

@@ -137,12 +137,11 @@ impl<Platform: ShimPlatform> EpollDescriptor<Platform> {
                 let events = match global
                     .litebox
                     .descriptor_table()
-                    .with_metadata(file, |stream: &litebox::platform::StdioStream| *stream)
+                    .with_metadata(file, |stream: &litebox::stdio::StdioStream| *stream)
                 {
-                    Ok(litebox::platform::StdioStream::Stdin) => Events::IN,
+                    Ok(litebox::stdio::StdioStream::Stdin) => Events::IN,
                     Ok(
-                        litebox::platform::StdioStream::Stdout
-                        | litebox::platform::StdioStream::Stderr,
+                        litebox::stdio::StdioStream::Stdout | litebox::stdio::StdioStream::Stderr,
                     )
                     | Err(_) => Events::OUT,
                 };
@@ -644,7 +643,7 @@ mod test {
     }
 
     fn setup_epoll() -> (crate::Task<TestPlatform>, EpollFile<TestPlatform>) {
-        let task = crate::syscalls::tests::init_platform_with_pipe_broker();
+        let task = crate::syscalls::tests::init_platform_with_broker();
 
         let epoll = EpollFile::new();
         (task, epoll)
@@ -695,7 +694,7 @@ mod test {
 
     #[test]
     fn test_poll() {
-        let task = crate::syscalls::tests::init_platform_with_pipe_broker();
+        let task = crate::syscalls::tests::init_platform_with_broker();
 
         let mut set = super::PollSet::with_capacity(0);
         let (rfd_u, wfd_u) = task
@@ -751,7 +750,7 @@ mod test {
 
     #[test]
     fn test_pselect() {
-        let task = crate::syscalls::tests::init_platform_with_pipe_broker();
+        let task = crate::syscalls::tests::init_platform_with_broker();
 
         let (rfd_u, wfd_u) = task
             .sys_pipe2(litebox::fs::OFlags::empty())
@@ -791,7 +790,7 @@ mod test {
 
     #[test]
     fn test_pselect_read_hup() {
-        let task = crate::syscalls::tests::init_platform_with_pipe_broker();
+        let task = crate::syscalls::tests::init_platform_with_broker();
 
         let (rfd_u, wfd_u) = task
             .sys_pipe2(litebox::fs::OFlags::empty())

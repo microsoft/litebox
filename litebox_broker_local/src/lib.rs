@@ -243,8 +243,8 @@ mod tests {
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_protocol::shared_buffer::{SharedBufferDescriptor, SharedBufferSlotIndex};
     use litebox_broker_protocol::stdio::{
-        ReadStdioRequest, ReadStdioResponse, StdioOutputStream, WriteStdioRequest,
-        WriteStdioResponse,
+        IsTerminalStdioRequest, IsTerminalStdioResponse, ReadStdioRequest, ReadStdioResponse,
+        StdioOutputStream, StdioStream, WriteStdioRequest, WriteStdioResponse,
     };
     use litebox_broker_transport::channel::LocalNotificationChannel;
     use std::sync::Mutex;
@@ -362,6 +362,34 @@ mod tests {
                 operation: BrokerOperation::Stdio(StdioRequest::Read(ReadStdioRequest {
                     buffer: descriptor,
                 })),
+            })
+        );
+    }
+
+    #[test]
+    fn stdio_terminal_query_requests_the_selected_stream() {
+        let channel = FakeControlChannel::new(
+            None,
+            Some(BrokerResult::Stdio(StdioResponse::IsTerminal(
+                IsTerminalStdioResponse { is_terminal: true },
+            ))),
+        );
+        let local = BrokerLocal {
+            channel,
+            shared_buffers: noop_shared_buffers(),
+            next_request_id: AtomicU64::new(0),
+        };
+
+        assert!(local.is_stdio_terminal(StdioStream::Stderr).unwrap());
+        assert_eq!(
+            local.channel.sent_request.borrow().clone(),
+            Some(BrokerRequest {
+                request_id: RequestId(0),
+                operation: BrokerOperation::Stdio(StdioRequest::IsTerminal(
+                    IsTerminalStdioRequest {
+                        stream: StdioStream::Stderr,
+                    },
+                )),
             })
         );
     }
