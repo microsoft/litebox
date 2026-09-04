@@ -39,6 +39,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -350,33 +351,71 @@ def _run_litebox_cmd(
     # Use a shorter timeout for alarm-based benchmarks under LiteBox,
     # since if SIGALRM isn't delivered the process will hang forever.
     timeout = duration * 3 + 30 if bench.uses_alarm else duration * 10 + 60
+    popen_options = {}
+    if sys.platform == "win32":
+        popen_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_options["start_new_session"] = True
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        **popen_options,
+    )
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, timeout=timeout,
-        )
+        stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
+        _terminate_process_tree(process)
         hint = " (this benchmark uses alarm/SIGALRM)" if bench.uses_alarm else ""
         print(f"  [TIMEOUT] {bench.name}{hint}")
         return None
     elapsed = time.monotonic() - t0
 
-    if result.returncode != 0:
-        stderr = result.stderr.decode("utf-8", errors="replace")
-        print(f"  [FAIL] {bench.name} exited with {result.returncode}")
-        print(f"  stderr (last 300 chars): ...{stderr[-300:]}")
+    if process.returncode != 0:
+        decoded_stderr = stderr.decode("utf-8", errors="replace")
+        print(f"  [FAIL] {bench.name} exited with {process.returncode}")
+        print(f"  stderr (last 300 chars): ...{decoded_stderr[-300:]}")
         return None
 
-    stderr = result.stderr.decode("utf-8", errors="replace")
-    parsed = parse_count_line(stderr)
+    decoded_stderr = stderr.decode("utf-8", errors="replace")
+    parsed = parse_count_line(decoded_stderr)
     if parsed is None:
-        print(f"  [FAIL] {bench.name}: no COUNT line in stderr:\n{stderr[:500]}")
+        print(f"  [FAIL] {bench.name}: no COUNT line in stderr:\n{decoded_stderr[:500]}")
         return None
 
     count, base, unit = parsed
     return BenchmarkResult(
         name=bench.name, count=count, base=base, unit=unit,
-        elapsed=elapsed, raw_stderr=stderr,
+        elapsed=elapsed, raw_stderr=decoded_stderr,
     )
+
+
+def _terminate_process_tree(process: subprocess.Popen) -> None:
+    """Terminate a timed-out broker and the runner process it launched."""
+    if sys.platform == "win32":
+        result = subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            error = result.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(
+                f"failed to terminate LiteBox benchmark process tree: {error}"
+            )
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    process.wait()
+    if process.stdout is not None:
+        process.stdout.close()
+    if process.stderr is not None:
+        process.stderr.close()
 
 
 def run_litebox(
