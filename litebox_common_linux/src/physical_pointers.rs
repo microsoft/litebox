@@ -141,8 +141,8 @@ where
 
     /// Create a new `PhysMutPtr` from the given contiguous physical address and length.
     ///
-    /// This is a shortcut for
-    /// `PhysMutPtr::new([align_down(pa), align_down(pa) + ALIGN, ..., align_up(pa + bytes) - ALIGN], pa % ALIGN)`.
+    /// Maps the complete pages covering `[pa, pa + bytes)`, while limiting access to
+    /// complete `T` objects within that byte range.
     pub fn with_contiguous_pages(pa: usize, bytes: usize) -> Result<Self, PhysPointerError> {
         if bytes < core::mem::size_of::<T>() {
             return Err(PhysPointerError::InsufficientPhysicalPages(
@@ -169,8 +169,10 @@ where
                 .checked_add(ALIGN)
                 .ok_or(PhysPointerError::Overflow)?;
         }
-        // reuse the allocation
-        Self::from_boxed(pages.into_boxed_slice(), pa - start_page)
+        // Map whole pages, but bound access to the requested bytes.
+        let mut ptr = Self::from_boxed(pages.into_boxed_slice(), pa - start_page)?;
+        ptr.count = bytes / core::mem::size_of::<T>();
+        Ok(ptr)
     }
 
     /// Create a new `PhysMutPtr` from the given physical address for a single object.
@@ -520,8 +522,8 @@ where
 
     /// Create a new `PhysConstPtr` from the given contiguous physical address and length.
     ///
-    /// This is a shortcut for
-    /// `PhysConstPtr::new([align_down(pa), align_down(pa) + ALIGN, ..., align_up(pa + bytes) - ALIGN], pa % ALIGN)`.
+    /// Maps the complete pages covering `[pa, pa + bytes)`, while limiting access to
+    /// complete `T` objects within that byte range.
     pub fn with_contiguous_pages(pa: usize, bytes: usize) -> Result<Self, PhysPointerError> {
         Ok(Self {
             inner: PhysMutPtr::with_contiguous_pages(pa, bytes)?,
