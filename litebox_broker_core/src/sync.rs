@@ -6,9 +6,8 @@
 mod mutex;
 mod rwlock;
 
-pub use litebox_platform::sync::{
-    ImmediatelyWokenUp, RawMutex, RawMutexProvider, UnblockedOrTimedOut,
-};
+use litebox_platform::sync::RawMutexProvider;
+
 pub use mutex::{Mutex, MutexGuard};
 pub use rwlock::{
     MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,

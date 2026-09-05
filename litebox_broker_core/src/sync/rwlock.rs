@@ -7,7 +7,9 @@ use core::cell::UnsafeCell;
 use core::ptr::NonNull;
 use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
-use super::{RawMutex as _, RawSyncPrimitivesProvider};
+use litebox_platform::sync::RawMutex as _;
+
+use super::RawSyncPrimitivesProvider;
 
 const READ_LOCKED: u32 = 1;
 const MASK: u32 = (1 << 30) - 1;

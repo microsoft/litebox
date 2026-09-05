@@ -6,7 +6,7 @@
 use core::sync::atomic::AtomicU32;
 use core::time::Duration;
 
-use litebox_broker_core::sync::{
+use litebox_platform::sync::{
     ImmediatelyWokenUp, RawMutex as RawMutexTrait, RawMutexProvider, UnblockedOrTimedOut,
 };
 use rustix::thread::futex;
@@ -91,9 +91,8 @@ mod tests {
     use core::sync::atomic::Ordering;
     use core::time::Duration;
 
-    use litebox_broker_core::sync::{
-        ImmediatelyWokenUp, Mutex, RawMutex as _, RwLock, UnblockedOrTimedOut,
-    };
+    use litebox_broker_core::sync::{Mutex, RwLock};
+    use litebox_platform::sync::{ImmediatelyWokenUp, RawMutex as _, UnblockedOrTimedOut};
 
     use super::{LinuxRawMutex, LinuxSyncPrimitivesProvider};
 

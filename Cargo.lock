@@ -1517,6 +1517,7 @@ version = "0.1.0"
 dependencies = [
  "litebox_broker_core",
  "litebox_broker_protocol",
+ "litebox_platform",
  "rustix",
 ]
 

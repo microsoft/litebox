@@ -6,7 +6,9 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
-use super::{RawMutex as _, RawSyncPrimitivesProvider};
+use litebox_platform::sync::RawMutex as _;
+
+use super::RawSyncPrimitivesProvider;
 
 struct SpinEnabledRawMutex<Platform: RawSyncPrimitivesProvider> {
     /// 0: unlocked
