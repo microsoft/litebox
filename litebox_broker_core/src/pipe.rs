@@ -193,54 +193,57 @@ enum PipeEndpoint {
 struct PipeCapacityReservation {
     global_counter: Arc<AtomicUsize>,
     session_counter: Arc<AtomicUsize>,
-    amount: usize,
+    capacity: usize,
 }
 
 impl PipeCapacityReservation {
-    fn new(session: &BrokerSession, amount: usize) -> Result<Self> {
-        reserve_pipe_capacity(
-            &session.core.reserved_pipe_capacity,
-            amount,
-            session.core.limits.max_total_pipe_capacity,
-        )?;
-        if let Err(error) = reserve_pipe_capacity(
-            &session.reserved_pipe_capacity,
-            amount,
-            session.core.limits.max_pipe_capacity_per_session,
-        ) {
-            release_pipe_capacity(&session.core.reserved_pipe_capacity, amount);
-            return Err(error);
+    fn new(session: &BrokerSession, capacity: usize) -> Result<Self> {
+        let global_counter = Arc::clone(&session.core.reserved_pipe_capacity);
+        global_counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
+                reserved
+                    .checked_add(capacity)
+                    .filter(|total| *total <= session.core.limits.max_total_pipe_capacity)
+            })
+            .map_err(|_| BrokerError::ResourceExhausted)?;
+
+        let session_counter = Arc::clone(&session.reserved_pipe_capacity);
+        if session_counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
+                reserved
+                    .checked_add(capacity)
+                    .filter(|total| *total <= session.core.limits.max_pipe_capacity_per_session)
+            })
+            .is_err()
+        {
+            global_counter
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
+                    reserved.checked_sub(capacity)
+                })
+                .expect("reserved broker pipe capacity must include the pending pipe");
+            return Err(BrokerError::ResourceExhausted);
         }
         Ok(Self {
-            global_counter: Arc::clone(&session.core.reserved_pipe_capacity),
-            session_counter: Arc::clone(&session.reserved_pipe_capacity),
-            amount,
+            global_counter,
+            session_counter,
+            capacity,
         })
     }
 }
 
 impl Drop for PipeCapacityReservation {
     fn drop(&mut self) {
-        release_pipe_capacity(&self.session_counter, self.amount);
-        release_pipe_capacity(&self.global_counter, self.amount);
+        self.session_counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
+                reserved.checked_sub(self.capacity)
+            })
+            .expect("reserved session pipe capacity must include every live pipe");
+        self.global_counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
+                reserved.checked_sub(self.capacity)
+            })
+            .expect("reserved broker pipe capacity must include every live pipe");
     }
-}
-
-fn reserve_pipe_capacity(counter: &AtomicUsize, amount: usize, limit: usize) -> Result<()> {
-    counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            current.checked_add(amount).filter(|next| *next <= limit)
-        })
-        .map(|_| ())
-        .map_err(|_| BrokerError::ResourceExhausted)
-}
-
-fn release_pipe_capacity(counter: &AtomicUsize, amount: usize) {
-    counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            current.checked_sub(amount)
-        })
-        .expect("reserved pipe capacity must include every live pipe");
 }
 
 struct PipeState {
