@@ -15,3 +15,14 @@ pub trait GuestVectorStateProvider {
     /// Atomically replaces the complete vector state of the current guest thread.
     fn set_guest_vector_state(&self, state: &Self::GuestVectorState);
 }
+
+// TODO: replace this blanket with architecture-specific providers before
+// implementing guest vector-state preservation outside AArch64.
+#[cfg(not(target_arch = "aarch64"))]
+impl<T> GuestVectorStateProvider for T {
+    type GuestVectorState = ();
+
+    fn get_guest_vector_state(&self) {}
+
+    fn set_guest_vector_state(&self, _state: &()) {}
+}
