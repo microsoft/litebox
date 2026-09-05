@@ -485,8 +485,6 @@ fn wake_robust_list<Platform: ShimPlatform>(
 impl<Platform: ShimPlatform> Task<Platform> {
     /// Called when the task is exiting.
     pub(crate) fn prepare_for_exit(&mut self) {
-        self.thread.detach_from_process();
-
         if let Some(clear_child_tid) = self.thread.clear_child_tid.take() {
             // Clear the child TID if requested
             // TODO: if we are the last thread, we don't need to clear it
@@ -502,6 +500,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if let Some(robust_list) = self.thread.robust_list.take() {
             let _ = wake_robust_list::<Platform>(robust_list);
         }
+
+        // This must run last, after all of this task's remaining accesses to
+        // guest memory have completed. Otherwise, because this decrements the
+        // `nr_threads` counter, other tasks may assume that the memory of this
+        // task isn't referenced any more, and therefore can be de-allocated and
+        // re-used (e.g., for an `exec`d process). See
+        // https://github.com/microsoft/litebox/pull/1155.
+        self.thread.detach_from_process();
     }
 
     pub(crate) fn sys_exit(&self, status: i32) {
