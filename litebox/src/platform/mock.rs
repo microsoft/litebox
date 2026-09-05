@@ -346,3 +346,29 @@ unsafe impl ThreadLocalStorageProvider for MockPlatform {
         MOCK_TLS.replace(value)
     }
 }
+
+/// Enough of a [`ThreadProvider`] for tests to build a
+/// [`ThreadHandle`](crate::event::wait::ThreadHandle) and exercise its `interrupt`.
+/// Spawning and guest interruption are not modelled.
+impl ThreadProvider for MockPlatform {
+    type ExecutionContext = ();
+    type ThreadSpawnError = core::convert::Infallible;
+    type ThreadHandle = ();
+
+    unsafe fn spawn_thread(
+        &self,
+        _ctx: &Self::ExecutionContext,
+        _init_thread: alloc::boxed::Box<
+            dyn crate::shim::InitThread<ExecutionContext = Self::ExecutionContext>,
+        >,
+    ) -> Result<(), Self::ThreadSpawnError> {
+        unimplemented!("the mock platform does not spawn threads")
+    }
+
+    fn current_thread(&self) -> Self::ThreadHandle {}
+
+    fn interrupt_thread(&self, _thread: &Self::ThreadHandle) {
+        // Only reached for `RUNNING_IN_GUEST`, which the mock platform never enters.
+        unimplemented!("the mock platform does not run guest code")
+    }
+}
