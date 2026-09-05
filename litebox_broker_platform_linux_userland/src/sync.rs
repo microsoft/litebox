@@ -121,21 +121,14 @@ mod tests {
     }
 
     #[test]
-    fn rwlock_supports_shared_reads_and_exclusive_writes() {
-        let value = LinuxRwLock::new(1);
+    fn rwlock_supports_shared_reads_and_serializes_writers() {
+        let value = Arc::new(LinuxRwLock::new(0));
         let first = value.read();
         let second = value.read();
-        assert_eq!(*first, 1);
-        assert_eq!(*second, 1);
+        assert_eq!(*first, 0);
+        assert_eq!(*second, 0);
         drop((first, second));
 
-        *value.write() = 2;
-        assert_eq!(*value.read(), 2);
-    }
-
-    #[test]
-    fn rwlock_serializes_concurrent_writers() {
-        let value = Arc::new(LinuxRwLock::new(0));
         let threads = (0..4)
             .map(|_| {
                 let value = Arc::clone(&value);
