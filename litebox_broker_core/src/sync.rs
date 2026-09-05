@@ -3,90 +3,60 @@
 
 //! Broker synchronization primitives supplied by the deployment platform.
 
-use core::ops::{Deref, DerefMut};
+use core::sync::atomic::AtomicU32;
 
-/// Platform-provided blocking synchronization primitives.
-///
-/// Broker subsystems use the portable [`Mutex`] and [`RwLock`] wrappers while
-/// the deployment supplies the underlying lock and guard types. Implementations
-/// must block the current execution context under contention rather than spin.
-pub trait RawSyncPrimitivesProvider: Send + Sync + 'static {
-    /// Platform mutex storing `T`.
-    type RawMutex<T: Send>: Send + Sync;
+mod mutex;
+mod rwlock;
 
-    /// Guard returned while a platform mutex is locked.
-    type MutexGuard<'a, T: Send + 'a>: Deref<Target = T> + DerefMut
-    where
-        Self: 'a;
+pub use mutex::{Mutex, MutexGuard};
+pub use rwlock::{
+    MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
+};
 
-    /// Platform reader-writer lock storing `T`.
-    type RawRwLock<T: Send + Sync>: Send + Sync;
+/// A raw blocking mutex primitive supplied by a broker platform.
+pub trait RawMutex: Send + Sync + 'static {
+    /// Initial unlocked mutex value.
+    const INIT: Self;
 
-    /// Guard returned while a platform reader-writer lock is read-locked.
-    type RwLockReadGuard<'a, T: Send + Sync + 'a>: Deref<Target = T>
-    where
-        Self: 'a;
+    /// Returns the atomic word used by the portable lock algorithms.
+    fn underlying_atomic(&self) -> &AtomicU32;
 
-    /// Guard returned while a platform reader-writer lock is write-locked.
-    type RwLockWriteGuard<'a, T: Send + Sync + 'a>: Deref<Target = T> + DerefMut
-    where
-        Self: 'a;
+    /// Wakes up to `count` execution contexts blocked on this mutex.
+    ///
+    /// Implementations that cannot observe the number woken may return zero.
+    fn wake_many(&self, count: usize) -> usize;
 
-    /// Creates a platform mutex containing `value`.
-    fn new_mutex<T: Send>(value: T) -> Self::RawMutex<T>;
-
-    /// Locks a platform mutex, blocking until it is available.
-    fn lock_mutex<T: Send>(mutex: &Self::RawMutex<T>) -> Self::MutexGuard<'_, T>;
-
-    /// Creates a platform reader-writer lock containing `value`.
-    fn new_rwlock<T: Send + Sync>(value: T) -> Self::RawRwLock<T>;
-
-    /// Read-locks a platform reader-writer lock, blocking until it is available.
-    fn read_rwlock<T: Send + Sync>(rwlock: &Self::RawRwLock<T>) -> Self::RwLockReadGuard<'_, T>;
-
-    /// Write-locks a platform reader-writer lock, blocking until it is available.
-    fn write_rwlock<T: Send + Sync>(rwlock: &Self::RawRwLock<T>) -> Self::RwLockWriteGuard<'_, T>;
-}
-
-/// A platform-backed mutual-exclusion lock.
-pub struct Mutex<Provider: RawSyncPrimitivesProvider, T: Send> {
-    raw: Provider::RawMutex<T>,
-}
-
-impl<Provider: RawSyncPrimitivesProvider, T: Send> Mutex<Provider, T> {
-    /// Creates a mutex containing `value`.
-    pub fn new(value: T) -> Self {
-        Self {
-            raw: Provider::new_mutex(value),
-        }
+    /// Wakes one execution context blocked on this mutex.
+    fn wake_one(&self) -> bool {
+        self.wake_many(1) > 0
     }
 
-    /// Locks the mutex, blocking until it is available.
-    pub fn lock(&self) -> Provider::MutexGuard<'_, T> {
-        Provider::lock_mutex(&self.raw)
+    /// Wakes every execution context blocked on this mutex.
+    fn wake_all(&self) -> usize {
+        self.wake_many(i32::MAX as usize)
     }
+
+    /// Blocks while the underlying atomic word equals `expected`.
+    ///
+    /// A wakeup does not imply that the atomic word changed. If the value
+    /// changed before the caller blocked, this returns [`ImmediatelyWokenUp`].
+    fn block(&self, expected: u32) -> Result<(), ImmediatelyWokenUp>;
 }
 
-/// A platform-backed reader-writer lock.
-pub struct RwLock<Provider: RawSyncPrimitivesProvider, T: Send + Sync> {
-    raw: Provider::RawRwLock<T>,
+/// Broker platform capability that selects its raw mutex implementation.
+pub trait RawMutexProvider {
+    /// Raw mutex used by the portable synchronization primitives.
+    type RawMutex: RawMutex;
 }
 
-impl<Provider: RawSyncPrimitivesProvider, T: Send + Sync> RwLock<Provider, T> {
-    /// Creates a reader-writer lock containing `value`.
-    pub fn new(value: T) -> Self {
-        Self {
-            raw: Provider::new_rwlock(value),
-        }
-    }
+/// Convenience bound for broker platforms that provide synchronization.
+pub trait RawSyncPrimitivesProvider: RawMutexProvider + Sync + 'static {}
 
-    /// Read-locks the value, blocking until it is available.
-    pub fn read(&self) -> Provider::RwLockReadGuard<'_, T> {
-        Provider::read_rwlock(&self.raw)
-    }
-
-    /// Write-locks the value, blocking until it is available.
-    pub fn write(&self) -> Provider::RwLockWriteGuard<'_, T> {
-        Provider::write_rwlock(&self.raw)
-    }
+impl<Provider> RawSyncPrimitivesProvider for Provider where
+    Provider: RawMutexProvider + Sync + 'static
+{
 }
+
+/// Indicates that a raw mutex value changed before the caller could block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImmediatelyWokenUp;

@@ -3,43 +3,52 @@
 
 //! Linux-userland broker synchronization primitives.
 
-use litebox_broker_core::sync::RawSyncPrimitivesProvider;
+use core::sync::atomic::AtomicU32;
+
+use litebox_broker_core::sync::{ImmediatelyWokenUp, RawMutex as RawMutexTrait, RawMutexProvider};
+use rustix::thread::futex;
 
 /// Blocking synchronization primitives for a Linux-userland broker.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LinuxSyncPrimitivesProvider;
 
-impl RawSyncPrimitivesProvider for LinuxSyncPrimitivesProvider {
-    type RawMutex<T: Send> = std::sync::Mutex<T>;
-    type MutexGuard<'a, T: Send + 'a> = std::sync::MutexGuard<'a, T>;
-    type RawRwLock<T: Send + Sync> = std::sync::RwLock<T>;
-    type RwLockReadGuard<'a, T: Send + Sync + 'a> = std::sync::RwLockReadGuard<'a, T>;
-    type RwLockWriteGuard<'a, T: Send + Sync + 'a> = std::sync::RwLockWriteGuard<'a, T>;
+impl RawMutexProvider for LinuxSyncPrimitivesProvider {
+    type RawMutex = LinuxRawMutex;
+}
 
-    fn new_mutex<T: Send>(value: T) -> Self::RawMutex<T> {
-        std::sync::Mutex::new(value)
+/// Raw blocking mutex used by the Linux-userland broker.
+pub struct LinuxRawMutex {
+    state: AtomicU32,
+}
+
+impl LinuxRawMutex {
+    const fn new() -> Self {
+        Self {
+            state: AtomicU32::new(0),
+        }
+    }
+}
+
+impl RawMutexTrait for LinuxRawMutex {
+    const INIT: Self = Self::new();
+
+    fn underlying_atomic(&self) -> &AtomicU32 {
+        &self.state
     }
 
-    fn lock_mutex<T: Send>(mutex: &Self::RawMutex<T>) -> Self::MutexGuard<'_, T> {
-        mutex
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    fn wake_many(&self, count: usize) -> usize {
+        assert!(count > 0, "wake count must be nonzero");
+        let count = u32::try_from(count.min(i32::MAX as usize)).unwrap();
+        futex::wake(&self.state, futex::Flags::PRIVATE, count)
+            .expect("failed to wake broker mutex waiters")
     }
 
-    fn new_rwlock<T: Send + Sync>(value: T) -> Self::RawRwLock<T> {
-        std::sync::RwLock::new(value)
-    }
-
-    fn read_rwlock<T: Send + Sync>(rwlock: &Self::RawRwLock<T>) -> Self::RwLockReadGuard<'_, T> {
-        rwlock
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    fn write_rwlock<T: Send + Sync>(rwlock: &Self::RawRwLock<T>) -> Self::RwLockWriteGuard<'_, T> {
-        rwlock
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    fn block(&self, expected: u32) -> Result<(), ImmediatelyWokenUp> {
+        match futex::wait(&self.state, futex::Flags::PRIVATE, expected, None) {
+            Ok(()) | Err(rustix::io::Errno::INTR) => Ok(()),
+            Err(rustix::io::Errno::AGAIN) => Err(ImmediatelyWokenUp),
+            Err(error) => panic!("failed to block on broker mutex: {error}"),
+        }
     }
 }
 
@@ -77,8 +86,33 @@ mod tests {
     #[test]
     fn rwlock_supports_shared_reads_and_exclusive_writes() {
         let value = LinuxRwLock::new(1);
-        assert_eq!(*value.read(), 1);
+        let first = value.read();
+        let second = value.read();
+        assert_eq!(*first, 1);
+        assert_eq!(*second, 1);
+        drop((first, second));
+
         *value.write() = 2;
         assert_eq!(*value.read(), 2);
+    }
+
+    #[test]
+    fn rwlock_serializes_concurrent_writers() {
+        let value = Arc::new(LinuxRwLock::new(0));
+        let threads = (0..4)
+            .map(|_| {
+                let value = Arc::clone(&value);
+                std::thread::spawn(move || {
+                    for _ in 0..1_000 {
+                        *value.write() += 1;
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(*value.read(), 4_000);
     }
 }
