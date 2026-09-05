@@ -191,22 +191,41 @@ enum PipeEndpoint {
 }
 
 struct PipeCapacityReservation {
-    reserved_capacity: Arc<AtomicUsize>,
+    global_counter: Arc<AtomicUsize>,
+    session_counter: Arc<AtomicUsize>,
     capacity: usize,
 }
 
 impl PipeCapacityReservation {
     fn new(session: &BrokerSession, capacity: usize) -> Result<Self> {
-        let reserved_capacity = Arc::clone(&session.core.reserved_pipe_capacity);
-        reserved_capacity
+        let global_counter = Arc::clone(&session.core.reserved_pipe_capacity);
+        global_counter
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
                 reserved
                     .checked_add(capacity)
                     .filter(|total| *total <= session.core.limits.max_total_pipe_capacity)
             })
             .map_err(|_| BrokerError::ResourceExhausted)?;
+
+        let session_counter = Arc::clone(&session.reserved_pipe_capacity);
+        if session_counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
+                reserved
+                    .checked_add(capacity)
+                    .filter(|total| *total <= session.core.limits.max_pipe_capacity_per_session)
+            })
+            .is_err()
+        {
+            global_counter
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
+                    reserved.checked_sub(capacity)
+                })
+                .expect("reserved broker pipe capacity must include the pending pipe");
+            return Err(BrokerError::ResourceExhausted);
+        }
         Ok(Self {
-            reserved_capacity,
+            global_counter,
+            session_counter,
             capacity,
         })
     }
@@ -214,11 +233,16 @@ impl PipeCapacityReservation {
 
 impl Drop for PipeCapacityReservation {
     fn drop(&mut self) {
-        self.reserved_capacity
+        self.session_counter
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
                 reserved.checked_sub(self.capacity)
             })
-            .expect("reserved pipe capacity must include every live pipe");
+            .expect("reserved session pipe capacity must include every live pipe");
+        self.global_counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
+                reserved.checked_sub(self.capacity)
+            })
+            .expect("reserved broker pipe capacity must include every live pipe");
     }
 }
 

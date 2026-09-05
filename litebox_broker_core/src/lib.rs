@@ -51,15 +51,19 @@ use stdio::StdioProvider;
 /// BrokerCore result type.
 pub type Result<T> = core::result::Result<T, BrokerError>;
 
-/// Resource limits for broker-owned authority state.
+/// Broker-wide ceilings and per-session quotas for broker-owned authority state.
 ///
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct BrokerCoreLimits {
-    /// Maximum live object references.
+    /// Maximum live object references across all sessions.
     pub max_references: usize,
-    /// Maximum total capacity in bytes reserved by live pipes.
+    /// Maximum live object references owned by one session.
+    pub max_references_per_session: usize,
+    /// Maximum total capacity in bytes reserved by live pipes across all sessions.
     pub max_total_pipe_capacity: usize,
+    /// Maximum capacity in bytes reserved by live pipes created by one session.
+    pub max_pipe_capacity_per_session: usize,
     /// Maximum live platform socket resources across all sessions.
     pub max_sockets: usize,
     /// Maximum live platform socket resources owned by one session.
@@ -67,25 +71,36 @@ pub struct BrokerCoreLimits {
 }
 
 impl BrokerCoreLimits {
-    /// Conservative default limits for initial broker deployments.
+    /// Conservative default limits that allow four sessions to reach each
+    /// broker-wide ceiling only when all four spend their full quotas.
     pub const DEFAULT: Self = Self {
         max_references: 4096,
+        max_references_per_session: 1024,
         max_total_pipe_capacity: 64 * 1024 * 1024,
+        max_pipe_capacity_per_session: 16 * 1024 * 1024,
         max_sockets: 1024,
         max_sockets_per_session: 256,
     };
 
     /// Creates a broker core limit set.
+    ///
+    /// The reference and pipe-capacity session quotas initially match their
+    /// broker-wide limits. Use [`Self::with_session_quotas`] to override them.
     pub const fn new(max_references: usize, max_total_pipe_capacity: usize) -> Self {
         Self {
             max_references,
+            max_references_per_session: max_references,
             max_total_pipe_capacity,
+            max_pipe_capacity_per_session: max_total_pipe_capacity,
             max_sockets: Self::DEFAULT.max_sockets,
             max_sockets_per_session: Self::DEFAULT.max_sockets_per_session,
         }
     }
 
-    /// Creates a broker core limit set with every limit specified explicitly.
+    /// Creates a broker core limit set with explicit socket limits.
+    ///
+    /// The reference and pipe-capacity session quotas initially match their
+    /// broker-wide limits. Use [`Self::with_session_quotas`] to override them.
     pub const fn new_with_all_limits(
         max_references: usize,
         max_total_pipe_capacity: usize,
@@ -94,9 +109,28 @@ impl BrokerCoreLimits {
     ) -> Self {
         Self {
             max_references,
+            max_references_per_session: max_references,
             max_total_pipe_capacity,
+            max_pipe_capacity_per_session: max_total_pipe_capacity,
             max_sockets,
             max_sockets_per_session,
+        }
+    }
+
+    /// Returns these limits with explicit per-session reference and pipe-capacity quotas.
+    ///
+    /// A quota above its broker-wide limit is accepted; the broker-wide limit
+    /// still applies, so the effective limit is the smaller value.
+    #[must_use]
+    pub const fn with_session_quotas(
+        self,
+        max_references_per_session: usize,
+        max_pipe_capacity_per_session: usize,
+    ) -> Self {
+        Self {
+            max_references_per_session,
+            max_pipe_capacity_per_session,
+            ..self
         }
     }
 }

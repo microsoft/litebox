@@ -195,10 +195,7 @@ where
     // Sockets are currently the only externally backed objects. Add future
     // resource limits here so every live registration fits in the
     // association's shared readiness sink.
-    let max_live_readiness_registrations = limits
-        .max_references
-        .min(limits.max_sockets)
-        .min(limits.max_sockets_per_session);
+    let max_live_readiness_registrations = limits.max_sockets.min(limits.max_sockets_per_session);
     if max_live_readiness_registrations > readiness_sink.max_tracked_objects() {
         return Err(BrokerHostError::Broker(ErrorCode::ResourceExhausted));
     }
