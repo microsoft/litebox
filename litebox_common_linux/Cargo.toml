@@ -11,7 +11,7 @@ litebox = { path = "../litebox/", version = "0.1.0" }
 thiserror = { version = "2.0.6", default-features = false }
 int-enum = "1.2.0"
 syscalls = { version = "0.6", default-features = false }
-zerocopy = { version = "0.8", features = ["derive"] }
+zerocopy = { version = "0.8", features = ["derive", "alloc"] }
 
 [lints]
 workspace = true

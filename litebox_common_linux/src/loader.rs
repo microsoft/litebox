@@ -226,6 +226,20 @@ impl ElfParsedFile {
         self.trampoline.is_some()
     }
 
+    /// The pages the trampoline occupies when this ELF is loaded at `base_addr`;
+    /// a zero `base_addr` yields the load-address-relative range.
+    ///
+    /// `None` if the binary has no trampoline or, like [`Self::has_trampoline`],
+    /// if [`Self::parse_trampoline`] has not run yet.
+    pub fn trampoline_page_range(&self, base_addr: usize) -> Option<core::ops::Range<usize>> {
+        let trampoline = self.trampoline.as_ref()?;
+        let start = base_addr.checked_add(trampoline.vaddr)?;
+        let end = start
+            .checked_add(trampoline.size)?
+            .checked_next_multiple_of(PAGE_SIZE)?;
+        Some(start..end)
+    }
+
     /// Parse the LiteBox trampoline data, if any.
     ///
     /// The trampoline header is located at the end of the file (last 32/20 bytes).
@@ -320,6 +334,16 @@ impl ElfParsedFile {
 
         // The trampoline code should immediately precede the header.
         if file_offset + trampoline_size as u64 != header_offset {
+            return Err(ElfParseError::BadTrampoline);
+        }
+
+        // Reject a vaddr whose range cannot be represented, so that later
+        // address arithmetic cannot wrap.
+        if vaddr
+            .checked_add(trampoline_size)
+            .and_then(|end| end.checked_next_multiple_of(PAGE_SIZE))
+            .is_none()
+        {
             return Err(ElfParseError::BadTrampoline);
         }
 

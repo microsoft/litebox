@@ -70,3 +70,27 @@ fn test_sys_get_time_system_is_monotonic() {
     let second_ms = u64::from(second.seconds) * 1000 + u64::from(second.millis);
     assert!(second_ms >= first_ms, "system time went backwards");
 }
+
+#[test]
+fn test_sys_map_zi_uses_bottom_up_placement() {
+    use litebox::mm::linux::PAGE_SIZE;
+    use litebox_common_optee::LdelfMapFlags;
+
+    let task = init_platform();
+    let (header, header_cleanup) = task
+        .sys_map_zi(0, PAGE_SIZE, 0, 0, LdelfMapFlags::empty())
+        .expect("header mapping should succeed");
+    let (image, image_cleanup) = task
+        .sys_map_zi(
+            0,
+            PAGE_SIZE,
+            PAGE_SIZE,
+            2 * PAGE_SIZE,
+            LdelfMapFlags::empty(),
+        )
+        .expect("padded image mapping should succeed");
+
+    assert!(header < image, "OP-TEE-chosen mappings must grow upward");
+    image_cleanup.run(&task);
+    header_cleanup.run(&task);
+}

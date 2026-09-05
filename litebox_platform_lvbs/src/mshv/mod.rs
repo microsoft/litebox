@@ -3,11 +3,9 @@
 
 //! Hyper-V-specific code
 
-pub(crate) mod heki;
 pub mod hvcall;
 pub(crate) mod hvcall_mm;
 mod hvcall_vp;
-mod mem_integrity;
 pub(crate) mod ringbuffer;
 pub mod vsm;
 pub mod vsm_intercept;
@@ -38,7 +36,7 @@ unsafe impl<const ALIGN: usize> VmapManager<ALIGN> for PrivilegedVmap {
         perms: PhysPageMapPermissions,
     ) -> Result<Self::MapInfo, PhysPointerError> {
         // SAFETY: callers uphold the raw mapping contract. This provider is used only for
-        // independently authorized HEKI patch and ring-buffer writes.
+        // writes whose destination the caller has independently authorized.
         unsafe { crate::platform_low().vmap_privileged(pages, perms) }
     }
 
@@ -73,8 +71,8 @@ unsafe impl<const ALIGN: usize> VmapManager<ALIGN> for PrivilegedVmap {
 type Vtl0PhysConstPtr<T, const ALIGN: usize> =
     litebox_common_linux::physical_pointers::PhysConstPtr<T, ALIGN, crate::Vmap>;
 
-/// Mutable VTL0 pointer reserved for validated HEKI text patching and the fixed-address log ring
-/// buffer. It bypasses ordinary protected-frame access checks and synchronization. Do not use it for other
+/// Mutable VTL0 pointer reserved for callers that have independently validated the destination.
+/// It bypasses ordinary protected-frame access checks and synchronization. Do not use it for other
 /// VTL0 destinations that could enable confused-deputy writes.
 type PrivilegedVtl0PhysMutPtr<T, const ALIGN: usize> =
     litebox_common_linux::physical_pointers::PhysMutPtr<T, ALIGN, PrivilegedVmap>;
@@ -192,7 +190,7 @@ pub const MSR_IA32_SYSENTER_EIP: u32 = 0x0000_0176;
 pub const DEFAULT_REG_PIN_MASK: u64 = u64::MAX;
 
 bitflags::bitflags! {
-    #[derive(Debug, PartialEq)]
+    #[derive(Debug, PartialEq, Clone, Copy)]
     pub struct HvPageProtFlags: u8 {
         const HV_PAGE_ACCESS_NONE = 0x0;
         const HV_PAGE_READABLE = 0x1;

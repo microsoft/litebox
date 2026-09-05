@@ -250,4 +250,6 @@ pub enum PhysPointerError {
     VaSpaceExhausted,
     #[error("Page-table frame allocation failed (out of memory)")]
     FrameAllocationFailed,
+    #[error("Rust object allocation failed (out of memory)")]
+    AllocError,
 }

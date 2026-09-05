@@ -3,7 +3,7 @@
 
 //! Functions for checking the memory integrity of VTL0 kernel image and modules
 
-use crate::mshv::vsm::ModuleMemory;
+use crate::ModuleMemory;
 use alloc::{vec, vec::Vec};
 use authenticode::{AttributeCertificateIterator, AuthenticodeSignature, authenticode_digest};
 use cms::{content_info::ContentInfo, signed_data::SignedData};
@@ -19,7 +19,8 @@ use elf::{
     string_table::StringTable,
     symbol::Symbol,
 };
-use litebox_common_lvbs::{HekiPatch, ModuleSignature, POKE_MAX_OPCODE_SIZE, VerificationError};
+pub(crate) use litebox_common_lvbs::VerificationError;
+use litebox_common_lvbs::{HekiPatch, ModuleSignature, POKE_MAX_OPCODE_SIZE};
 use object::read::pe::PeFile64;
 use rangemap::set::RangeSet;
 use rsa::{RsaPublicKey, pkcs1::DecodeRsaPublicKey, pkcs1v15::Signature, signature::Verifier};
@@ -32,9 +33,6 @@ use x509_cert::{
 };
 use zerocopy::FromBytes;
 
-#[cfg(debug_assertions)]
-use crate::debug_serial_println;
-
 /// This function validates the memory content of a loaded kernel module against the original ELF file.
 /// In particular, it checks whether the non-relocatable/patchable bytes of certain sections
 /// (e.g., `.text`, `.init.text`) of the module are tampered with.
@@ -43,7 +41,7 @@ use crate::debug_serial_println;
 /// Note that this is mainly for defense-in-depth. Even without this code and data tampering, the compromised
 /// module loader could still leverage other attack mechanisms like return-oriented programming (ROP).
 /// In the future, we can add more checks to harden the validation.
-pub fn validate_kernel_module_against_elf(
+pub(crate) fn validate_kernel_module_against_elf(
     module_memory: &ModuleMemory,
     original_elf_data: &[u8],
 ) -> Result<bool, KernelElfError> {
@@ -130,10 +128,7 @@ pub fn validate_kernel_module_against_elf(
                 section_from_elf[reloc.clone()].copy_from_slice(&section_in_memory[reloc.clone()]);
             }
             if section_from_elf != section_in_memory {
-                crate::serial_println!(
-                    "Found {} mismatches in {target_section_name}",
-                    target_section_name
-                );
+                log::warn!("Found mismatches in {target_section_name}");
                 result = false;
             }
         }
@@ -148,7 +143,7 @@ pub fn validate_kernel_module_against_elf(
                 }
             }
             if !diffs.is_empty() {
-                debug_serial_println!(
+                log::debug!(
                     "Found {} mismatches in {target_section_name} at {:?}",
                     diffs.len(),
                     diffs
@@ -210,7 +205,7 @@ fn identify_direct_relocations(
                         todo!("Unsupported relocation type {:?}", rela.r_type);
                         #[cfg(not(debug_assertions))]
                         {
-                            crate::serial_println!("Unsupported relocation type {:?}", rela.r_type);
+                            log::warn!("Unsupported relocation type {:?}", rela.r_type);
                             return Err(KernelElfError::UnsupportedRelocation);
                         }
                     }
@@ -304,7 +299,7 @@ fn identify_indirect_relocations(
                         todo!("Unsupported relocation type {:?}", rela.r_type);
                         #[cfg(not(debug_assertions))]
                         {
-                            crate::serial_println!("Unsupported relocation type {:?}", rela.r_type);
+                            log::warn!("Unsupported relocation type {:?}", rela.r_type);
                             return Err(KernelElfError::UnsupportedRelocation);
                         }
                     }
@@ -342,7 +337,7 @@ fn identify_indirect_relocations(
 
 /// This function parses the `.modinfo` section of a kernel module ELF
 #[cfg(debug_assertions)]
-pub fn parse_modinfo(original_elf_data: &[u8]) -> Result<(), KernelElfError> {
+pub(crate) fn parse_modinfo(original_elf_data: &[u8]) -> Result<(), KernelElfError> {
     let elf = ElfBytes::<AnyEndian>::minimal_parse(original_elf_data)
         .map_err(|_| KernelElfError::ElfParseFailed)?;
 
@@ -370,7 +365,7 @@ pub fn parse_modinfo(original_elf_data: &[u8]) -> Result<(), KernelElfError> {
                 && let Some((k, v)) = s.split_once('=')
                 && k == "name"
             {
-                debug_serial_println!("Modinfo: {} = {}", k, v);
+                log::debug!("Modinfo: {k} = {v}");
             }
         }
     }
@@ -384,7 +379,7 @@ pub fn parse_modinfo(original_elf_data: &[u8]) -> Result<(), KernelElfError> {
 ///
 /// Currently, this function is slow because it uses the `sha2` crate with the `force-soft` feature.
 /// We should consider using HW-accelerated SHA-512 in the future (need to save/restore vector registers).
-pub fn verify_kernel_module_signature(
+pub(crate) fn verify_kernel_module_signature(
     signed_module: &[u8],
     certs: &[Certificate],
 ) -> Result<(), VerificationError> {
@@ -402,7 +397,7 @@ pub fn verify_kernel_module_signature(
         );
         #[cfg(not(debug_assertions))]
         {
-            crate::serial_println!(
+            log::warn!(
                 "Unsupported digest or signature algorithm: {:?}, {:?}",
                 digest_alg,
                 signature_alg
@@ -532,7 +527,7 @@ fn decode_signature(
 /// [EFI boot stub](https://docs.kernel.org/admin-guide/efi-stub.html). This PE header embeds
 /// [Authenticode signature](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format) for UEFI
 /// Secure Boot. The Authenticode signature is computed over the PE image digest and other attributes.
-pub fn verify_kernel_pe_signature(
+pub(crate) fn verify_kernel_pe_signature(
     kernel_blob: &[u8],
     certs: &[Certificate],
 ) -> Result<(), VerificationError> {
@@ -553,7 +548,7 @@ pub fn verify_kernel_pe_signature(
         todo!("Unsupported digest algorithm: {:?}", digest_algorithm_oid);
         #[cfg(not(debug_assertions))]
         {
-            crate::serial_println!("Unsupported digest algorithm: {:?}", digest_algorithm_oid);
+            log::warn!("Unsupported digest algorithm: {:?}", digest_algorithm_oid);
             return Err(VerificationError::Unsupported);
         }
     }
@@ -658,7 +653,10 @@ const JMP32_INSN_SIZE: u8 = 5;
 /// Each invocation of `text_poke_bp_batch` does one of the steps with a portion of the code (1 or n-1 bytes),
 /// so there are up to three invocations for each target target address.
 /// Refer [Linux](https://elixir.bootlin.com/linux/v6.6.85/source/arch/x86/kernel/alternative.c#L2164)
-pub fn validate_text_poke_bp_batch(patch_data: &HekiPatch, precomputed_patch: &HekiPatch) -> bool {
+pub(crate) fn validate_text_poke_bp_batch(
+    patch_data: &HekiPatch,
+    precomputed_patch: &HekiPatch,
+) -> bool {
     // step 1
     if patch_data.size == 1
         && patch_data.code[0] == INT3_INSN_OPCODE
@@ -683,7 +681,7 @@ pub fn validate_text_poke_bp_batch(patch_data: &HekiPatch, precomputed_patch: &H
             return false;
         }
 
-        // step 2. `apply_vtl0_text_patch` uses `patch_data.pa[1]` only when
+        // step 2. `ValidatedTextPatch` uses `patch_data.pa[1]` only when
         // `patch_data.pa[0]` leaves the remainder of the patch on the next page.
         // For a legitimate step 2, that next page is the precomputed patch's pa[1].
         if !precomputed_patch_second_byte_pa_aligned && patch_data.pa[1] != precomputed_patch.pa[1]
@@ -714,9 +712,22 @@ pub fn validate_text_poke_bp_batch(patch_data: &HekiPatch, precomputed_patch: &H
 }
 
 /// This function checks whether the patch data is valid for a given target
-pub fn validate_text_patch(patch_data: &HekiPatch, precomputed_patch: &HekiPatch) -> bool {
+pub(crate) fn validate_text_patch(patch_data: &HekiPatch, precomputed_patch: &HekiPatch) -> bool {
     validate_text_poke_bp_batch(patch_data, precomputed_patch)
     // TODO: support other patching methods
+}
+
+/// Errors for kernel ELF validation and relocation.
+#[derive(Debug, Error, PartialEq)]
+#[non_exhaustive]
+pub(crate) enum KernelElfError {
+    #[error("failed to parse ELF file")]
+    ElfParseFailed,
+    #[error("required section not found")]
+    SectionNotFound,
+    #[cfg_attr(debug_assertions, allow(dead_code))]
+    #[error("unsupported relocation type")]
+    UnsupportedRelocation,
 }
 
 #[cfg(test)]
@@ -746,17 +757,4 @@ mod tests {
 
         assert!(!validate_text_poke_bp_batch(&patch_data, &precomputed));
     }
-}
-
-/// Errors for kernel ELF validation and relocation.
-#[derive(Debug, Error, PartialEq)]
-#[non_exhaustive]
-pub enum KernelElfError {
-    #[error("failed to parse ELF file")]
-    ElfParseFailed,
-    #[error("required section not found")]
-    SectionNotFound,
-    #[cfg_attr(debug_assertions, allow(dead_code))]
-    #[error("unsupported relocation type")]
-    UnsupportedRelocation,
 }

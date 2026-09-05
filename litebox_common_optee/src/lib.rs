@@ -582,12 +582,25 @@ impl UteeParams {
 #[derive(Clone)]
 pub enum UteeParamOwned {
     None,
-    ValueInput { value_a: u64, value_b: u64 },
+    ValueInput {
+        value_a: u64,
+        value_b: u64,
+    },
     ValueOutput,
-    ValueInout { value_a: u64, value_b: u64 },
-    MemrefInput { data: Box<[u8]> },
-    MemrefOutput { buffer_size: usize },
-    MemrefInout { data: Box<[u8]>, buffer_size: usize },
+    ValueInout {
+        value_a: u64,
+        value_b: u64,
+    },
+    MemrefInput {
+        data: Option<Box<[u8]>>,
+    },
+    MemrefOutput {
+        buffer_size: usize,
+    },
+    MemrefInout {
+        data: Option<Box<[u8]>>,
+        buffer_size: usize,
+    },
 }
 
 impl UteeParamOwned {
@@ -1153,6 +1166,7 @@ impl From<Errno> for TeeResult {
             Errno::EINVAL | Errno::EFAULT => Self::BadParameters,
             Errno::EPERM | Errno::EACCES => Self::AccessDenied,
             Errno::ENOMEM => Self::OutOfMemory,
+            Errno::EEXIST => Self::AccessConflict,
             Errno::EOVERFLOW => Self::Overflow,
             Errno::EBUSY => Self::Busy,
             _ => Self::GenericError,

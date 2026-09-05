@@ -36,6 +36,9 @@ pub(crate) mod syscalls;
 
 pub mod msg_handler;
 
+#[cfg(feature = "platform_lvbs")]
+pub mod idk;
+
 // Re-export session management types for convenience
 pub use session::{OpenSessionTarget, SessionManager, SessionToken, TaInstance};
 
@@ -149,7 +152,7 @@ impl OpteeShimBuilder {
             boot_instant: TimeProvider::now(self.platform),
             pm: PageManager::new(&self.litebox),
             litebox: self.litebox,
-            ta_uuid_map: TaUuidMap::new(),
+            ta_uuid_map: ta_uuid_map(),
             pta_busy: spin::mutex::SpinMutex::new(HashSet::new()),
         });
         OpteeShim(global)
@@ -169,7 +172,7 @@ struct GlobalState {
     /// The LiteBox instance used throughout the shim.
     litebox: litebox::LiteBox<Platform>,
     /// The TA UUID to binary map for TA loading.
-    ta_uuid_map: TaUuidMap,
+    ta_uuid_map: &'static TaUuidMap,
     /// Tracks which non-concurrent PTAs (i.e., PTAs w/o `TaFlags::CONCURRENT`)
     /// are currently busy. A busy PTA is *rejected* with `TeeResult::Busy`
     /// rather than queued.
@@ -190,7 +193,7 @@ impl GlobalState {
     }
 
     /// Get the TA binary associated with the given TA UUID.
-    pub(crate) fn get_ta_bin(&self, ta_uuid: &TeeUuid) -> Option<alloc::boxed::Box<[u8]>> {
+    pub(crate) fn get_ta_bin(&self, ta_uuid: &TeeUuid) -> Option<Arc<[u8]>> {
         if let Some(ta_bin) = self.ta_uuid_map.get(ta_uuid) {
             Some(ta_bin)
         } else {
@@ -222,21 +225,20 @@ impl GlobalState {
     /// to avoid repeated RPCs and memory transfers. We remove it lazily if there is
     /// a memory pressure.
     ///
-    /// TODO: Use something like `Arc` to to ensure no active ldelf/TA holds a handle to
-    /// this TA binary
     #[expect(dead_code)]
     pub(crate) fn remove_ta_bin(&self, ta_uuid: &TeeUuid) {
         let _ = self.ta_uuid_map.remove(ta_uuid);
     }
 
     /// RPC to get the TA binary associated with the given TA UUID. Placeholder for now.
-    fn rpc_get_ta_bin(_ta_uuid: &TeeUuid) -> Option<alloc::boxed::Box<[u8]>> {
+    fn rpc_get_ta_bin(_ta_uuid: &TeeUuid) -> Option<Arc<[u8]>> {
         None
     }
 }
 
 type UserMutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
 pub type UserConstPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<T>;
+pub type TaMemrefAddresses = [Option<usize>; litebox_common_optee::UteeParams::TEE_NUM_PARAMS];
 
 type MutPtr<T> = <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
 
@@ -256,7 +258,6 @@ impl OpteeShim {
         &self,
         ldelf_bin: &[u8],
         ta_uuid: TeeUuid,
-        ta_bin: Option<&[u8]>,
     ) -> Result<LoadedProgram, loader::elf::ElfLoaderError> {
         let entrypoints = crate::OpteeShimEntrypoints {
             _not_send: core::marker::PhantomData,
@@ -271,15 +272,11 @@ impl OpteeShim {
                 ta_entry_point: Cell::new(0),
                 ta_stack_base_addr: Cell::new(0),
                 ta_prepared: Cell::new(false),
+                ta_trampoline_page_range: Cell::new(None),
                 #[cfg(target_arch = "x86_64")]
                 tls_base_addr: Cell::new(0),
             },
         };
-        if let Some(ta_bin) = ta_bin
-            && !entrypoints.task.global.store_ta_bin(&ta_uuid, ta_bin)
-        {
-            return Err(loader::elf::ElfLoaderError::InvalidUuid);
-        }
         let elf_loader = loader::elf::ElfLoader::new(&entrypoints.task, ldelf_bin, true)?;
         entrypoints.task.load_ldelf(elf_loader, ta_uuid)?;
         let params_address = if entrypoints.task.get_ta_stack_base_addr().is_some() {
@@ -308,6 +305,19 @@ impl OpteeShim {
         &self.0.pm
     }
 
+    /// Store a TA binary associated with the given TA UUID.
+    ///
+    /// Returns `true` if the binary was successfully stored, `false` if the binary's
+    /// UUID (from `.ta_head` section) doesn't match the provided UUID or parsing failed.
+    pub fn store_ta_bin(&self, ta_uuid: &TeeUuid, ta_bin: &[u8]) -> bool {
+        self.0.store_ta_bin(ta_uuid, ta_bin)
+    }
+
+    /// Get the TA binary associated with the given TA UUID.
+    pub fn get_ta_bin(&self, ta_uuid: &TeeUuid) -> Option<Arc<[u8]>> {
+        self.0.get_ta_bin(ta_uuid)
+    }
+
     /// Release all user-space memory mappings owned by this shim instance.
     ///
     /// This must be called before switching to the base page table and deleting
@@ -334,11 +344,30 @@ impl OpteeShimEntrypoints {
         func_id: u32,
         cmd_id: Option<u32>,
     ) -> Result<(), loader::elf::ElfLoaderError> {
+        self.load_ta_context_with_shm(params, &[], session_id, func_id, cmd_id)
+            .map(|_| ())
+    }
+
+    /// Load the TA context with shared-memory sources for its input buffers.
+    pub fn load_ta_context_with_shm(
+        &self,
+        params: &[litebox_common_optee::UteeParamOwned],
+        shm_info: &[Option<msg_handler::ShmInfo<PAGE_SIZE>>],
+        session_id: u32,
+        func_id: u32,
+        cmd_id: Option<u32>,
+    ) -> Result<TaMemrefAddresses, loader::elf::ElfLoaderError> {
         let init_state = self
             .task
-            .load_ta_context(params, session_id, func_id, cmd_id)?;
+            .load_ta_context(params, shm_info, session_id, func_id, cmd_id)?;
+        let ThreadInitState::Ta {
+            memref_addresses, ..
+        } = init_state
+        else {
+            return Err(loader::elf::ElfLoaderError::InvalidStackAddr);
+        };
         self.task.thread.init_state.set(init_state);
-        Ok(())
+        Ok(memref_addresses)
     }
 }
 
@@ -651,6 +680,7 @@ impl Task {
                 func_id,
                 entry_point,
                 stack_top,
+                ..
             } => {
                 #[cfg(target_arch = "x86_64")]
                 {
@@ -785,6 +815,7 @@ impl Task {
     fn load_ta_context(
         &self,
         params: &[litebox_common_optee::UteeParamOwned],
+        shm_info: &[Option<msg_handler::ShmInfo<PAGE_SIZE>>],
         session_id: u32,
         func_id: u32,
         cmd_id: Option<u32>,
@@ -812,8 +843,8 @@ impl Task {
             )?;
         let mut stack_canary = [0; 16];
         self.global.litebox.fill_random(&mut stack_canary)?;
-        ta_stack
-            .init(params, stack_canary)
+        let memref_addresses = ta_stack
+            .init(params, shm_info, stack_canary)
             .ok_or(ElfLoaderError::InvalidStackAddr)?;
 
         Ok(ThreadInitState::Ta {
@@ -823,6 +854,7 @@ impl Task {
             func_id: func_id as usize,
             entry_point: self.get_ta_entry_point(),
             stack_top: ta_stack.get_cur_stack_top(),
+            memref_addresses,
         })
     }
 
@@ -1315,24 +1347,24 @@ impl TaHandleMap {
 /// Entry in the TA UUID map containing binary data and parsed flags.
 struct TaInfo {
     /// The raw TA binary
-    binary: alloc::boxed::Box<[u8]>,
+    binary: Arc<[u8]>,
     /// Parsed TA flags from .ta_head section
     flags: TaFlags,
 }
 
 /// Data structure to maintain a mapping from TA UUIDs to their binary data and flags.
 pub(crate) struct TaUuidMap {
-    inner: spin::mutex::SpinMutex<HashMap<TeeUuid, TaInfo>>,
+    inner: spin::rwlock::RwLock<HashMap<TeeUuid, TaInfo>>,
 }
 
 impl TaUuidMap {
     pub(crate) fn new() -> Self {
         Self {
-            inner: spin::mutex::SpinMutex::new(HashMap::new()),
+            inner: spin::rwlock::RwLock::new(HashMap::new()),
         }
     }
 
-    pub(crate) fn insert(&self, uuid: TeeUuid, ta_bin: alloc::boxed::Box<[u8]>) -> bool {
+    pub(crate) fn insert(&self, uuid: TeeUuid, ta_bin: Arc<[u8]>) -> bool {
         // Parse TA head from the binary's .ta_head section
         let Some(ta_head) = litebox_common_optee::parse_ta_head(&ta_bin) else {
             return false;
@@ -1343,8 +1375,7 @@ impl TaUuidMap {
             return false;
         }
 
-        let mut inner = self.inner.lock();
-        inner.insert(
+        let _replaced = self.inner.write().insert(
             uuid,
             TaInfo {
                 binary: ta_bin,
@@ -1354,19 +1385,25 @@ impl TaUuidMap {
         true
     }
 
-    pub(crate) fn get(&self, uuid: &TeeUuid) -> Option<alloc::boxed::Box<[u8]>> {
-        self.inner.lock().get(uuid).map(|info| info.binary.clone())
+    pub(crate) fn get(&self, uuid: &TeeUuid) -> Option<Arc<[u8]>> {
+        self.inner.read().get(uuid).map(|info| info.binary.clone())
     }
 
     /// Get the TA flags for a given UUID.
     pub(crate) fn get_flags(&self, uuid: &TeeUuid) -> Option<TaFlags> {
-        self.inner.lock().get(uuid).map(|info| info.flags)
+        self.inner.read().get(uuid).map(|info| info.flags)
     }
 
     // Lazy removal of TA binaries when they are no longer needed.
-    pub(crate) fn remove(&self, uuid: &TeeUuid) -> Option<alloc::boxed::Box<[u8]>> {
-        self.inner.lock().remove(uuid).map(|info| info.binary)
+    pub(crate) fn remove(&self, uuid: &TeeUuid) -> Option<Arc<[u8]>> {
+        self.inner.write().remove(uuid).map(|info| info.binary)
     }
+}
+
+/// Get the global TA UUID map.
+fn ta_uuid_map() -> &'static TaUuidMap {
+    static TA_UUID_MAP: once_cell::race::OnceBox<TaUuidMap> = once_cell::race::OnceBox::new();
+    TA_UUID_MAP.get_or_init(|| alloc::boxed::Box::new(TaUuidMap::new()))
 }
 
 /// Per-instance TA state which can be shared between sessions if it is
@@ -1391,6 +1428,8 @@ struct Task {
     ta_stack_base_addr: Cell<usize>,
     /// Whether the TA has been prepared
     ta_prepared: Cell<bool>,
+    /// Pages left mapped for the TA's syscall trampoline, if any
+    ta_trampoline_page_range: Cell<Option<(usize, usize)>>,
     /// TLS base address for x86_64 (stored to restore FS before each TA entry)
     #[cfg(target_arch = "x86_64")]
     tls_base_addr: Cell<usize>,
@@ -1435,6 +1474,7 @@ pub(crate) enum ThreadInitState {
         func_id: usize,
         entry_point: usize,
         stack_top: usize,
+        memref_addresses: TaMemrefAddresses,
     },
 }
 
@@ -1558,6 +1598,7 @@ mod test_utils {
                 ta_entry_point: Cell::new(0),
                 ta_stack_base_addr: Cell::new(0),
                 ta_prepared: Cell::new(false),
+                ta_trampoline_page_range: Cell::new(None),
                 #[cfg(target_arch = "x86_64")]
                 tls_base_addr: Cell::new(0),
             }
