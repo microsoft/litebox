@@ -64,8 +64,8 @@ pub trait RawMutexProvider {
 /// Convenience bound for broker platforms that provide synchronization.
 pub trait RawSyncPrimitivesProvider: RawMutexProvider + Sync + 'static {}
 
-impl<Provider> RawSyncPrimitivesProvider for Provider where
-    Provider: RawMutexProvider + Sync + 'static
+impl<Platform> RawSyncPrimitivesProvider for Platform where
+    Platform: RawMutexProvider + Sync + 'static
 {
 }
 

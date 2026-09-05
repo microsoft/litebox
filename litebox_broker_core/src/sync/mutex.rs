@@ -8,17 +8,17 @@ use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
 use super::{RawMutex as _, RawSyncPrimitivesProvider};
 
-struct SpinEnabledRawMutex<Provider: RawSyncPrimitivesProvider> {
+struct SpinEnabledRawMutex<Platform: RawSyncPrimitivesProvider> {
     /// 0: unlocked
     /// 1: locked, no other execution context waiting
     /// 2: locked, with another execution context waiting
-    raw: Provider::RawMutex,
+    raw: Platform::RawMutex,
 }
 
-impl<Provider: RawSyncPrimitivesProvider> SpinEnabledRawMutex<Provider> {
+impl<Platform: RawSyncPrimitivesProvider> SpinEnabledRawMutex<Platform> {
     const fn new() -> Self {
         Self {
-            raw: Provider::RawMutex::INIT,
+            raw: Platform::RawMutex::INIT,
         }
     }
 
@@ -81,12 +81,12 @@ impl<Provider: RawSyncPrimitivesProvider> SpinEnabledRawMutex<Provider> {
 }
 
 /// A platform-backed mutual-exclusion lock.
-pub struct Mutex<Provider: RawSyncPrimitivesProvider, T: ?Sized> {
-    raw: SpinEnabledRawMutex<Provider>,
+pub struct Mutex<Platform: RawSyncPrimitivesProvider, T: ?Sized> {
+    raw: SpinEnabledRawMutex<Platform>,
     data: UnsafeCell<T>,
 }
 
-impl<Provider: RawSyncPrimitivesProvider, T> Mutex<Provider, T> {
+impl<Platform: RawSyncPrimitivesProvider, T> Mutex<Platform, T> {
     /// Creates a mutex containing `value`.
     pub const fn new(value: T) -> Self {
         Self {
@@ -106,14 +106,14 @@ impl<Provider: RawSyncPrimitivesProvider, T> Mutex<Provider, T> {
     }
 }
 
-impl<Provider: RawSyncPrimitivesProvider, T: ?Sized> Mutex<Provider, T> {
+impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> Mutex<Platform, T> {
     /// Attempts to acquire the mutex without blocking.
-    pub fn try_lock(&self) -> Option<MutexGuard<'_, Provider, T>> {
+    pub fn try_lock(&self) -> Option<MutexGuard<'_, Platform, T>> {
         self.raw.try_lock().then_some(MutexGuard { mutex: self })
     }
 
     /// Acquires the mutex, blocking until it is available.
-    pub fn lock(&self) -> MutexGuard<'_, Provider, T> {
+    pub fn lock(&self) -> MutexGuard<'_, Platform, T> {
         self.raw.lock();
         MutexGuard { mutex: self }
     }
@@ -121,19 +121,19 @@ impl<Provider: RawSyncPrimitivesProvider, T: ?Sized> Mutex<Provider, T> {
 
 // SAFETY: The mutex transfers ownership of its protected value only when `T`
 // itself can be sent between execution contexts.
-unsafe impl<Provider: RawSyncPrimitivesProvider, T: Send + ?Sized> Send for Mutex<Provider, T> {}
+unsafe impl<Platform: RawSyncPrimitivesProvider, T: Send + ?Sized> Send for Mutex<Platform, T> {}
 
 // SAFETY: The mutex provides exclusive access to `T`, so sharing the mutex is
 // sound whenever `T` can be sent between execution contexts.
-unsafe impl<Provider: RawSyncPrimitivesProvider, T: Send + ?Sized> Sync for Mutex<Provider, T> {}
+unsafe impl<Platform: RawSyncPrimitivesProvider, T: Send + ?Sized> Sync for Mutex<Platform, T> {}
 
 /// Exclusive access guard returned by [`Mutex::lock`].
-pub struct MutexGuard<'a, Provider: RawSyncPrimitivesProvider, T: ?Sized> {
-    mutex: &'a Mutex<Provider, T>,
+pub struct MutexGuard<'a, Platform: RawSyncPrimitivesProvider, T: ?Sized> {
+    mutex: &'a Mutex<Platform, T>,
 }
 
-impl<Provider: RawSyncPrimitivesProvider, T: ?Sized> core::ops::Deref
-    for MutexGuard<'_, Provider, T>
+impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> core::ops::Deref
+    for MutexGuard<'_, Platform, T>
 {
     type Target = T;
 
@@ -143,8 +143,8 @@ impl<Provider: RawSyncPrimitivesProvider, T: ?Sized> core::ops::Deref
     }
 }
 
-impl<Provider: RawSyncPrimitivesProvider, T: ?Sized> core::ops::DerefMut
-    for MutexGuard<'_, Provider, T>
+impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> core::ops::DerefMut
+    for MutexGuard<'_, Platform, T>
 {
     fn deref_mut(&mut self) -> &mut T {
         // SAFETY: Holding the exclusive guard guarantees unique access.
@@ -152,7 +152,7 @@ impl<Provider: RawSyncPrimitivesProvider, T: ?Sized> core::ops::DerefMut
     }
 }
 
-impl<Provider: RawSyncPrimitivesProvider, T: ?Sized> Drop for MutexGuard<'_, Provider, T> {
+impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> Drop for MutexGuard<'_, Platform, T> {
     fn drop(&mut self) {
         // SAFETY: A MutexGuard exists only while its mutex is locked.
         unsafe {

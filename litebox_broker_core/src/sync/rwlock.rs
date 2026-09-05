@@ -36,16 +36,16 @@ fn is_read_lockable(state: u32) -> bool {
     state & MASK < MAX_READERS && !has_readers_waiting(state) && !has_writers_waiting(state)
 }
 
-struct RawRwLock<Provider: RawSyncPrimitivesProvider> {
-    state: Provider::RawMutex,
-    writer_notify: Provider::RawMutex,
+struct RawRwLock<Platform: RawSyncPrimitivesProvider> {
+    state: Platform::RawMutex,
+    writer_notify: Platform::RawMutex,
 }
 
-impl<Provider: RawSyncPrimitivesProvider> RawRwLock<Provider> {
+impl<Platform: RawSyncPrimitivesProvider> RawRwLock<Platform> {
     const fn new() -> Self {
         Self {
-            state: Provider::RawMutex::INIT,
-            writer_notify: Provider::RawMutex::INIT,
+            state: Platform::RawMutex::INIT,
+            writer_notify: Platform::RawMutex::INIT,
         }
     }
 
@@ -257,12 +257,12 @@ impl<Provider: RawSyncPrimitivesProvider> RawRwLock<Provider> {
 }
 
 /// A platform-backed reader-writer lock.
-pub struct RwLock<Provider: RawSyncPrimitivesProvider, T: ?Sized> {
-    raw: RawRwLock<Provider>,
+pub struct RwLock<Platform: RawSyncPrimitivesProvider, T: ?Sized> {
+    raw: RawRwLock<Platform>,
     data: UnsafeCell<T>,
 }
 
-impl<Provider: RawSyncPrimitivesProvider, T> RwLock<Provider, T> {
+impl<Platform: RawSyncPrimitivesProvider, T> RwLock<Platform, T> {
     /// Creates a reader-writer lock containing `value`.
     pub const fn new(value: T) -> Self {
         Self {
@@ -282,15 +282,15 @@ impl<Provider: RawSyncPrimitivesProvider, T> RwLock<Provider, T> {
     }
 }
 
-impl<Provider: RawSyncPrimitivesProvider, T: ?Sized> RwLock<Provider, T> {
+impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> RwLock<Platform, T> {
     /// Acquires shared read access, blocking until it is available.
-    pub fn read(&self) -> RwLockReadGuard<'_, Provider, T> {
+    pub fn read(&self) -> RwLockReadGuard<'_, Platform, T> {
         self.raw.read();
         RwLockReadGuard { rwlock: self }
     }
 
     /// Acquires exclusive write access, blocking until it is available.
-    pub fn write(&self) -> RwLockWriteGuard<'_, Provider, T> {
+    pub fn write(&self) -> RwLockWriteGuard<'_, Platform, T> {
         self.raw.write();
         RwLockWriteGuard { rwlock: self }
     }
@@ -298,39 +298,39 @@ impl<Provider: RawSyncPrimitivesProvider, T: ?Sized> RwLock<Provider, T> {
 
 // SAFETY: The lock transfers ownership of its protected value only when `T`
 // itself can be sent between execution contexts.
-unsafe impl<Provider: RawSyncPrimitivesProvider, T: Send + ?Sized> Send for RwLock<Provider, T> {}
+unsafe impl<Platform: RawSyncPrimitivesProvider, T: Send + ?Sized> Send for RwLock<Platform, T> {}
 
 // SAFETY: Readers may share references to `T`, while writers have exclusive
 // access, so sharing the lock requires `T` to be both Send and Sync.
-unsafe impl<Provider: RawSyncPrimitivesProvider, T: Send + Sync + ?Sized> Sync
-    for RwLock<Provider, T>
+unsafe impl<Platform: RawSyncPrimitivesProvider, T: Send + Sync + ?Sized> Sync
+    for RwLock<Platform, T>
 {
 }
 
 /// Shared access guard returned by [`RwLock::read`].
-pub struct RwLockReadGuard<'a, Provider: RawSyncPrimitivesProvider, T: ?Sized> {
-    rwlock: &'a RwLock<Provider, T>,
+pub struct RwLockReadGuard<'a, Platform: RawSyncPrimitivesProvider, T: ?Sized> {
+    rwlock: &'a RwLock<Platform, T>,
 }
 
 /// Exclusive access guard returned by [`RwLock::write`].
-pub struct RwLockWriteGuard<'a, Provider: RawSyncPrimitivesProvider, T: ?Sized> {
-    rwlock: &'a RwLock<Provider, T>,
+pub struct RwLockWriteGuard<'a, Platform: RawSyncPrimitivesProvider, T: ?Sized> {
+    rwlock: &'a RwLock<Platform, T>,
 }
 
 /// Shared access guard mapped to a component of the locked value.
-pub struct MappedRwLockReadGuard<'a, Provider: RawSyncPrimitivesProvider, T: ?Sized> {
+pub struct MappedRwLockReadGuard<'a, Platform: RawSyncPrimitivesProvider, T: ?Sized> {
     data: NonNull<T>,
-    raw: &'a RawRwLock<Provider>,
+    raw: &'a RawRwLock<Platform>,
 }
 
 /// Exclusive access guard mapped to a component of the locked value.
-pub struct MappedRwLockWriteGuard<'a, Provider: RawSyncPrimitivesProvider, T: ?Sized> {
+pub struct MappedRwLockWriteGuard<'a, Platform: RawSyncPrimitivesProvider, T: ?Sized> {
     data: NonNull<T>,
-    raw: &'a RawRwLock<Provider>,
+    raw: &'a RawRwLock<Platform>,
 }
 
-impl<Provider: RawSyncPrimitivesProvider, T: ?Sized> core::ops::Deref
-    for RwLockReadGuard<'_, Provider, T>
+impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> core::ops::Deref
+    for RwLockReadGuard<'_, Platform, T>
 {
     type Target = T;
 
@@ -340,7 +340,7 @@ impl<Provider: RawSyncPrimitivesProvider, T: ?Sized> core::ops::Deref
     }
 }
 
-impl<Provider: RawSyncPrimitivesProvider, T: ?Sized> Drop for RwLockReadGuard<'_, Provider, T> {
+impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> Drop for RwLockReadGuard<'_, Platform, T> {
     fn drop(&mut self) {
         // SAFETY: A read guard exists only while one read lock is held.
         unsafe {
@@ -349,8 +349,8 @@ impl<Provider: RawSyncPrimitivesProvider, T: ?Sized> Drop for RwLockReadGuard<'_
     }
 }
 
-impl<Provider: RawSyncPrimitivesProvider, T: ?Sized> core::ops::Deref
-    for RwLockWriteGuard<'_, Provider, T>
+impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> core::ops::Deref
+    for RwLockWriteGuard<'_, Platform, T>
 {
     type Target = T;
 
@@ -360,8 +360,8 @@ impl<Provider: RawSyncPrimitivesProvider, T: ?Sized> core::ops::Deref
     }
 }
 
-impl<Provider: RawSyncPrimitivesProvider, T: ?Sized> core::ops::DerefMut
-    for RwLockWriteGuard<'_, Provider, T>
+impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> core::ops::DerefMut
+    for RwLockWriteGuard<'_, Platform, T>
 {
     fn deref_mut(&mut self) -> &mut T {
         // SAFETY: Holding the write guard guarantees unique access.
@@ -369,7 +369,7 @@ impl<Provider: RawSyncPrimitivesProvider, T: ?Sized> core::ops::DerefMut
     }
 }
 
-impl<Provider: RawSyncPrimitivesProvider, T: ?Sized> Drop for RwLockWriteGuard<'_, Provider, T> {
+impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> Drop for RwLockWriteGuard<'_, Platform, T> {
     fn drop(&mut self) {
         // SAFETY: A write guard exists only while the write lock is held.
         unsafe {
@@ -378,8 +378,8 @@ impl<Provider: RawSyncPrimitivesProvider, T: ?Sized> Drop for RwLockWriteGuard<'
     }
 }
 
-impl<Provider: RawSyncPrimitivesProvider, T: ?Sized> core::ops::Deref
-    for MappedRwLockReadGuard<'_, Provider, T>
+impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> core::ops::Deref
+    for MappedRwLockReadGuard<'_, Platform, T>
 {
     type Target = T;
 
@@ -389,8 +389,8 @@ impl<Provider: RawSyncPrimitivesProvider, T: ?Sized> core::ops::Deref
     }
 }
 
-impl<Provider: RawSyncPrimitivesProvider, T: ?Sized> Drop
-    for MappedRwLockReadGuard<'_, Provider, T>
+impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> Drop
+    for MappedRwLockReadGuard<'_, Platform, T>
 {
     fn drop(&mut self) {
         // SAFETY: This mapped guard owns the original read lock.
@@ -400,8 +400,8 @@ impl<Provider: RawSyncPrimitivesProvider, T: ?Sized> Drop
     }
 }
 
-impl<Provider: RawSyncPrimitivesProvider, T: ?Sized> core::ops::Deref
-    for MappedRwLockWriteGuard<'_, Provider, T>
+impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> core::ops::Deref
+    for MappedRwLockWriteGuard<'_, Platform, T>
 {
     type Target = T;
 
@@ -411,8 +411,8 @@ impl<Provider: RawSyncPrimitivesProvider, T: ?Sized> core::ops::Deref
     }
 }
 
-impl<Provider: RawSyncPrimitivesProvider, T: ?Sized> core::ops::DerefMut
-    for MappedRwLockWriteGuard<'_, Provider, T>
+impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> core::ops::DerefMut
+    for MappedRwLockWriteGuard<'_, Platform, T>
 {
     fn deref_mut(&mut self) -> &mut T {
         // SAFETY: The retained write lock guarantees unique access.
@@ -420,8 +420,8 @@ impl<Provider: RawSyncPrimitivesProvider, T: ?Sized> core::ops::DerefMut
     }
 }
 
-impl<Provider: RawSyncPrimitivesProvider, T: ?Sized> Drop
-    for MappedRwLockWriteGuard<'_, Provider, T>
+impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> Drop
+    for MappedRwLockWriteGuard<'_, Platform, T>
 {
     fn drop(&mut self) {
         // SAFETY: This mapped guard owns the original write lock.
@@ -431,12 +431,12 @@ impl<Provider: RawSyncPrimitivesProvider, T: ?Sized> Drop
     }
 }
 
-impl<'a, Provider: RawSyncPrimitivesProvider, T: ?Sized> RwLockReadGuard<'a, Provider, T> {
+impl<'a, Platform: RawSyncPrimitivesProvider, T: ?Sized> RwLockReadGuard<'a, Platform, T> {
     /// Maps this guard to a component of the protected value.
     pub fn map<U: ?Sized>(
         original: Self,
         map: impl FnOnce(&T) -> &U,
-    ) -> MappedRwLockReadGuard<'a, Provider, U> {
+    ) -> MappedRwLockReadGuard<'a, Platform, U> {
         let data = NonNull::from(map(&original));
         let original = core::mem::ManuallyDrop::new(original);
         MappedRwLockReadGuard {
@@ -446,12 +446,12 @@ impl<'a, Provider: RawSyncPrimitivesProvider, T: ?Sized> RwLockReadGuard<'a, Pro
     }
 }
 
-impl<'a, Provider: RawSyncPrimitivesProvider, T: ?Sized> RwLockWriteGuard<'a, Provider, T> {
+impl<'a, Platform: RawSyncPrimitivesProvider, T: ?Sized> RwLockWriteGuard<'a, Platform, T> {
     /// Maps this guard to a component of the protected value.
     pub fn map<U: ?Sized>(
         mut original: Self,
         map: impl FnOnce(&mut T) -> &mut U,
-    ) -> MappedRwLockWriteGuard<'a, Provider, U> {
+    ) -> MappedRwLockWriteGuard<'a, Platform, U> {
         let data = NonNull::from(map(&mut original));
         let original = core::mem::ManuallyDrop::new(original);
         MappedRwLockWriteGuard {
