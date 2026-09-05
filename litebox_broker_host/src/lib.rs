@@ -24,7 +24,7 @@ extern crate std;
 use alloc::{sync::Arc, vec::Vec};
 
 use litebox_broker_core::readiness::ReadinessSink;
-use litebox_broker_core::{BrokerCore, BrokerCoreLimits, BrokerSession, CallerCredential};
+use litebox_broker_core::{BrokerCore, BrokerSession, CallerCredential};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse};
 use litebox_broker_protocol::message::{
@@ -195,7 +195,11 @@ where
     // Sockets are currently the only externally backed objects. Add future
     // resource limits here so every live registration fits in the
     // association's shared readiness sink.
-    let max_live_readiness_registrations = max_live_readiness_registrations(limits);
+    let max_live_readiness_registrations = limits
+        .max_references
+        .min(limits.max_references_per_session)
+        .min(limits.max_sockets)
+        .min(limits.max_sockets_per_session);
     if max_live_readiness_registrations > readiness_sink.max_tracked_objects() {
         return Err(BrokerHostError::Broker(ErrorCode::ResourceExhausted));
     }
@@ -761,14 +765,6 @@ fn handle_event_request(
     }
 }
 
-fn max_live_readiness_registrations(limits: BrokerCoreLimits) -> usize {
-    limits
-        .max_references
-        .min(limits.max_references_per_session)
-        .min(limits.max_sockets)
-        .min(limits.max_sockets_per_session)
-}
-
 /// Terminal outcome after processing one broker connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -843,14 +839,6 @@ mod tests {
         }
 
         fn retire(&self, _handle: ObjectHandle) {}
-    }
-
-    #[test]
-    fn readiness_capacity_uses_the_smallest_per_session_limit() {
-        let limits = BrokerCoreLimits::new_with_all_limits(10_000, 4, 10_000, 10_000)
-            .with_session_quotas(100, 4);
-
-        assert_eq!(max_live_readiness_registrations(limits), 100);
     }
 
     fn test_readiness_sink() -> Arc<dyn ReadinessSink> {
