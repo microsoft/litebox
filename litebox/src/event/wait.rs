@@ -198,6 +198,16 @@ impl<Platform: RawSyncPrimitivesProvider> WaitStateInner<Platform> {
     }
 }
 
+impl<Platform: RawSyncPrimitivesProvider> alloc::task::Wake for WaitStateInner<Platform> {
+    fn wake(self: Arc<Self>) {
+        WaitStateInner::wake(&self);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        WaitStateInner::wake(self);
+    }
+}
+
 pub struct ThreadHandle<Platform: RawSyncPrimitivesProvider + ThreadProvider> {
     waker: Waker<Platform>,
     thread: Platform::ThreadHandle,
@@ -374,7 +384,10 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
     /// evaluating the wait and interrupt conditions so that wakeups are not
     /// missed.
     fn start_wait(&self) {
-        self.waker.0.platform.update_waker(Some(self.waker.clone()));
+        self.waker
+            .0
+            .platform
+            .update_waker(Some(core::task::Waker::from(Arc::clone(&self.waker.0))));
         self.waker
             .0
             .set_state(ThreadState::WAITING, Ordering::SeqCst);

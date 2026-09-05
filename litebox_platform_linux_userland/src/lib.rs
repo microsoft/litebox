@@ -19,7 +19,7 @@ use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::{
     CowAllocationError, FixedAddressBehavior, MemoryRegionPermissions,
 };
-use litebox::platform::{ImmediatelyWokenUp, RawConstPointer as _};
+use litebox::platform::{ImmediatelyWokenUp, RawConstPointer as _, WaitWakerProvider};
 use litebox::shim::ContinueOperation;
 use litebox::utils::{ReinterpretSignedExt, ReinterpretUnsignedExt as _, TruncateExt};
 use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, vmap::VmapManager};
@@ -1156,11 +1156,10 @@ impl litebox::platform::TimerHandle for TimerHandle {
 
 impl litebox::platform::RawMutexProvider for LinuxUserland {
     type RawMutex = RawMutex;
+}
 
-    fn update_waker(&self, waker: Option<litebox::event::wait::Waker<Self>>)
-    where
-        Self: litebox::sync::RawSyncPrimitivesProvider,
-    {
+impl WaitWakerProvider for LinuxUserland {
+    fn update_waker(&self, waker: Option<core::task::Waker>) {
         let mut waker_ptr = waker.map_or(std::ptr::null_mut(), |w| Box::into_raw(Box::new(w)));
         #[cfg(target_arch = "x86_64")]
         unsafe {
@@ -2554,9 +2553,9 @@ unsafe fn record_pending_signal(signal: litebox_common_linux::signal::Signal) {
     }
     // SAFETY: if `waker_addr` is not zero, that means the current thread is suspended
     // to handle this signal and it points to a valid Waker whose lifetime spans the
-    // entire interruptible wait, set by [`RawMutexProvider::update_waker`].
-    let waker = unsafe { &*(waker_addr as *const litebox::event::wait::Waker<LinuxUserland>) };
-    waker.wake();
+    // entire interruptible wait, set by [`WaitWakerProvider::update_waker`].
+    let waker = unsafe { &*(waker_addr as *const core::task::Waker) };
+    waker.wake_by_ref();
 }
 
 /// Signal handler for interrupt signals.

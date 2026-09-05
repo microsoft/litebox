@@ -171,6 +171,8 @@ impl RawMutexProvider for MockPlatform {
     type RawMutex = MockRawMutex;
 }
 
+impl WaitWakerProvider for MockPlatform {}
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct MockInstant {
     time: u64,

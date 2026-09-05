@@ -15,6 +15,7 @@ use litebox::platform::page_mgmt::FixedAddressBehavior;
 use litebox::platform::{
     ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister, ImmediatelyWokenUp,
     PageManagementProvider, Provider, RawMutexProvider, TimeProvider, UnblockedOrTimedOut,
+    WaitWakerProvider,
 };
 use litebox_common_linux::errno::Errno;
 
@@ -135,6 +136,8 @@ impl<Host: HostInterface> LinuxKernel<Host> {
 impl<Host: HostInterface> RawMutexProvider for LinuxKernel<Host> {
     type RawMutex = RawMutex<Host>;
 }
+
+impl<Host: HostInterface> WaitWakerProvider for LinuxKernel<Host> {}
 
 /// An implementation of [`litebox::platform::RawMutex`]
 pub struct RawMutex<Host: HostInterface> {

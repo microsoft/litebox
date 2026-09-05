@@ -13,7 +13,7 @@ use hashbrown::HashMap;
 use litebox::platform::{
     ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister, ImmediatelyWokenUp,
     PageManagementProvider, RawMutex as _, RawMutexProvider, RawPointerProvider, TimeProvider,
-    UnblockedOrTimedOut, page_mgmt::DeallocationError,
+    UnblockedOrTimedOut, WaitWakerProvider, page_mgmt::DeallocationError,
 };
 use litebox::{
     mm::linux::{PAGE_SIZE, PageRange},
@@ -803,6 +803,8 @@ impl<Host: HostInterface> LinuxKernel<Host> {
 impl<Host: HostInterface> RawMutexProvider for LinuxKernel<Host> {
     type RawMutex = RawMutex<Host>;
 }
+
+impl<Host: HostInterface> WaitWakerProvider for LinuxKernel<Host> {}
 
 /// An implementation of [`litebox::platform::RawMutex`]
 pub struct RawMutex<Host: HostInterface> {

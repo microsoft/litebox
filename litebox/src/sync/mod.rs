@@ -31,21 +31,28 @@ pub use rwlock::{
 
 #[cfg(not(feature = "lock_tracing"))]
 /// A convenience name for specific requirements from the platform
-pub trait RawSyncPrimitivesProvider: platform::RawMutexProvider + Sync + 'static {}
+pub trait RawSyncPrimitivesProvider:
+    platform::RawMutexProvider + platform::WaitWakerProvider + Sync + 'static
+{
+}
 #[cfg(not(feature = "lock_tracing"))]
 impl<Platform> RawSyncPrimitivesProvider for Platform where
-    Platform: platform::RawMutexProvider + Sync + 'static
+    Platform: platform::RawMutexProvider + platform::WaitWakerProvider + Sync + 'static
 {
 }
 
 #[cfg(feature = "lock_tracing")]
 /// A convenience name for specific requirements from the platform
 pub trait RawSyncPrimitivesProvider:
-    platform::RawMutexProvider + platform::TimeProvider + Sync + 'static
+    platform::RawMutexProvider + platform::WaitWakerProvider + platform::TimeProvider + Sync + 'static
 {
 }
 #[cfg(feature = "lock_tracing")]
 impl<Platform> RawSyncPrimitivesProvider for Platform where
-    Platform: platform::RawMutexProvider + platform::TimeProvider + Sync + 'static
+    Platform: platform::RawMutexProvider
+        + platform::WaitWakerProvider
+        + platform::TimeProvider
+        + Sync
+        + 'static
 {
 }

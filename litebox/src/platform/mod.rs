@@ -20,6 +20,9 @@ use thiserror::Error;
 use zerocopy::{FromBytes, IntoBytes};
 
 pub use arch::{ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister};
+pub use litebox_platform::sync::{
+    ImmediatelyWokenUp, RawMutex, RawMutexProvider, UnblockedOrTimedOut, WaitWakerProvider,
+};
 pub use page_mgmt::PageManagementProvider;
 pub use vector::GuestVectorStateProvider;
 
@@ -29,7 +32,7 @@ pub use vector::GuestVectorStateProvider;
 /// provided by it. _However_, most of the provided APIs within the provider act upon an `&self` to
 /// allow storage of any useful "globals" within it necessary.
 pub trait Provider:
-    RawMutexProvider + TimeProvider + ArchSpecificProvider + RawPointerProvider
+    RawMutexProvider + WaitWakerProvider + TimeProvider + ArchSpecificProvider + RawPointerProvider
 {
 }
 
@@ -145,93 +148,6 @@ pub trait SignalProvider {
     /// Platforms that support asynchronous signals should override this method.
     #[expect(unused_variables, reason = "no-op by default")]
     fn take_pending_signals(&self, f: impl FnMut(Self::Signal)) {}
-}
-
-/// A provider of raw mutexes
-pub trait RawMutexProvider {
-    type RawMutex: RawMutex;
-
-    /// Updates the waker for the current thread's interruptible wait.
-    ///
-    /// Called by `WaitContext::start_wait` with `Some(waker)` when the current thread
-    /// enters an interruptible wait, and by `WaitContext::end_wait` with
-    /// `None` when it leaves. The thread in an interruptible wait can be unblocked
-    /// by [`Waker::wake`].
-    ///
-    /// This is a no-op by default.
-    ///
-    /// [`Waker::wake`]: crate::event::wait::Waker::wake
-    #[expect(unused_variables)]
-    fn update_waker(&self, waker: Option<crate::event::wait::Waker<Self>>)
-    where
-        Self: crate::sync::RawSyncPrimitivesProvider + Sized,
-    {
-    }
-}
-
-/// A raw mutex/lock API; expected to roughly match (or even be implemented using) a Linux futex.
-pub trait RawMutex: Send + Sync + 'static {
-    /// The initial value for a raw mutex, with an underlying atomic with a
-    /// value of zero.
-    const INIT: Self;
-
-    /// Returns a reference to the underlying atomic value
-    fn underlying_atomic(&self) -> &core::sync::atomic::AtomicU32;
-
-    /// Wake up `n` threads blocked on on this raw mutex.
-    ///
-    /// Returns the number of waiters that were woken up.
-    /// Some platforms cannot observe this number and may return zero
-    /// even when one or more waiters were woken up, so callers must
-    /// not rely on zero meaning that no waiters were woken up.
-    fn wake_many(&self, n: usize) -> usize;
-
-    /// Wake up one thread blocked on this raw mutex.
-    ///
-    /// Returns true if this actually woke up such a thread. Returns false
-    /// if no thread was waiting on this raw mutex, or if the platform
-    /// cannot observe whether a thread was woken up.
-    fn wake_one(&self) -> bool {
-        self.wake_many(1) > 0
-    }
-
-    /// Wake up all threads that are blocked on this raw mutex.
-    ///
-    /// Returns the number of waiters that were woken up. This may be
-    /// zero on platforms that cannot observe this number.
-    fn wake_all(&self) -> usize {
-        self.wake_many(i32::MAX as usize)
-    }
-
-    /// If the underlying value is `val`, block until a wake operation wakes us up.
-    ///
-    /// Importantly, a wake operation does NOT guarantee that the underlying value has changed; it
-    /// only means that a wake operation has occurred. However, an [`ImmediatelyWokenUp`] means that
-    /// the value had changed _before_ it went to sleep.
-    fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp>;
-
-    /// If the underlying value is `val`, block until a wake operation wakes us up, or some `time`
-    /// has passed without a wake operation having occurred.
-    ///
-    /// See comment on [`Self::block`] for more details on underlying value.
-    fn block_or_timeout(
-        &self,
-        val: u32,
-        time: core::time::Duration,
-    ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp>;
-}
-
-/// A zero-sized struct indicating that the block was immediately unblocked (due to non-matching
-/// value).
-pub struct ImmediatelyWokenUp;
-
-/// Named-boolean to indicate whether [`RawMutex::block_or_timeout`] was woken up or timed out.
-#[must_use]
-pub enum UnblockedOrTimedOut {
-    /// Unblocked by a wake call
-    Unblocked,
-    /// Sufficient time elapsed without a wake call
-    TimedOut,
 }
 
 /// An interface to understanding time.

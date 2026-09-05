@@ -1453,6 +1453,7 @@ dependencies = [
  "litebox_broker_local",
  "litebox_broker_protocol",
  "litebox_broker_transport",
+ "litebox_platform",
  "litebox_util_log",
  "rangemap",
  "slabmalloc",
@@ -1472,6 +1473,7 @@ dependencies = [
  "bitflags",
  "hashbrown",
  "litebox_broker_protocol",
+ "litebox_platform",
  "spin 0.9.8",
  "thiserror",
 ]
@@ -1647,6 +1649,10 @@ dependencies = [
  "tokio",
  "walkdir",
 ]
+
+[[package]]
+name = "litebox_platform"
+version = "0.1.0"
 
 [[package]]
 name = "litebox_platform_linux_kernel"

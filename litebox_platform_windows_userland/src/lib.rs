@@ -16,11 +16,10 @@ use std::os::raw::c_void;
 use std::os::windows::io::AsRawHandle as _;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use litebox::platform::ImmediatelyWokenUp;
-use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::{
     AllocationError, FixedAddressBehavior, MemoryRegionPermissions,
 };
+use litebox::platform::{ImmediatelyWokenUp, UnblockedOrTimedOut, WaitWakerProvider};
 use litebox::shim::{ContinueOperation, Exception};
 use litebox::utils::TruncateExt as _;
 
@@ -425,7 +424,7 @@ struct TlsState {
     pending_host_signals: AtomicU32,
     /// Pointer to the `Waker` currently being waited on, or null if not
     /// waiting.
-    waiting_waker: std::sync::atomic::AtomicPtr<litebox::event::wait::Waker<WindowsUserland>>,
+    waiting_waker: std::sync::atomic::AtomicPtr<core::task::Waker>,
 }
 
 impl TlsState {
@@ -1050,7 +1049,7 @@ impl ThreadHandle {
                     // mutex before freeing the old pointer, and we hold that
                     // mutex now.
                     let waker = unsafe { &*waker };
-                    waker.wake();
+                    waker.wake_by_ref();
                 }
             }
         }
@@ -1255,11 +1254,10 @@ fn is_in_ntdll_or_this(ip: usize) -> bool {
 
 impl litebox::platform::RawMutexProvider for WindowsUserland {
     type RawMutex = RawMutex;
+}
 
-    fn update_waker(&self, waker: Option<litebox::event::wait::Waker<Self>>)
-    where
-        Self: litebox::sync::RawSyncPrimitivesProvider,
-    {
+impl WaitWakerProvider for WindowsUserland {
+    fn update_waker(&self, waker: Option<core::task::Waker>) {
         if let Some(tls) = get_tls_ptr().map(|p| unsafe { &*p }) {
             let waker_ptr = waker.map_or(std::ptr::null_mut(), |w| Box::into_raw(Box::new(w)));
             let old = tls.waiting_waker.swap(waker_ptr, Ordering::AcqRel);
