@@ -637,25 +637,15 @@ mod tests {
         assert_eq!(session_references.pending_handles, 0);
     }
 
-    #[test]
-    fn supported_references_duplicate_between_sessions() {
-        let broker = BrokerCore::new_with_limits(
-            PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()),
-            BrokerCoreLimits::new(5, TEST_MAX_PIPE_CAPACITY)
-                .with_session_quotas(3, TEST_MAX_PIPE_CAPACITY_PER_SESSION),
-            Arc::new(crate::socket::UnsupportedSocketProvider),
-            Arc::new(crate::random::TestRandomProvider),
-            Arc::new(crate::stdio::UnsupportedStdioProvider),
-        )
-        .unwrap();
+    fn check_supported_references_duplicate_between_sessions(broker: &BrokerCore) {
         let source = broker
-            .create_session(CallerCredential::HostGuaranteed)
+            .create_session(CallerCredential::Unauthenticated)
             .unwrap();
         let target = broker
-            .create_session(CallerCredential::HostGuaranteed)
+            .create_session(CallerCredential::Unauthenticated)
             .unwrap();
         let denied_target = broker
-            .create_session(CallerCredential::Unauthenticated)
+            .create_session(CallerCredential::HostGuaranteed)
             .unwrap();
 
         let event = crate::event::create(&source, 1).unwrap();
@@ -696,16 +686,14 @@ mod tests {
             Ok(std::vec::Vec::from([1]))
         );
 
-        let first = crate::event::create(&target, 0).unwrap();
-        let second = crate::event::create(&target, 0).unwrap();
+        let event = crate::event::create(&target, 0).unwrap();
         assert_eq!(
             source.duplicate_object_reference_to(reader, &target, ObjectRights::WAIT),
             Err(BrokerError::ResourceExhausted)
         );
-        assert_eq!(broker.references.read().len(), 4);
+        assert_eq!(broker.references.read().len(), 3);
 
-        assert_eq!(target.close_object_reference(first), Ok(()));
-        assert_eq!(target.close_object_reference(second), Ok(()));
+        assert_eq!(target.close_object_reference(event), Ok(()));
         assert_eq!(target.close_object_reference(duplicated_writer), Ok(()));
         assert_eq!(source.close_object_reference(reader), Ok(()));
         assert!(broker.references.read().is_empty());
@@ -744,6 +732,7 @@ mod tests {
         check_pending_references_count_toward_session_quota(&broker);
         check_pipe_capacity_quota_is_per_session(&broker);
         check_pipe_capacity_outlives_session_for_in_flight_object(&broker);
+        check_supported_references_duplicate_between_sessions(&broker);
         crate::socket::tests::check_socket_lifecycle(&broker, &socket_provider);
         check_pair_handle_exhaustion(&broker);
 
