@@ -14,8 +14,9 @@ use litebox_syscall_rewriter::aarch64::{
 };
 #[cfg(feature = "aarch64_virtualize_x18")]
 use litebox_syscall_rewriter::aarch64::{
-    X18_FRAME_BYTES, X18AdrOffset, X18CompareBranchOffset, X18FrameState, X18GateOffset, X18Resume,
-    X18ValueSource, x18_branch_recovery_plan,
+    X18_FRAME_BYTES, X18AdrOffset, X18CompareBranchOffset, X18FaultAttribution, X18FrameState,
+    X18GateOffset, X18Resume, X18StackWritebackFrameState, X18StackWritebackOffset,
+    X18StackWritebackSpSource, X18ValueSource, x18_branch_recovery_plan,
 };
 
 /// Overwrites the destination with the TLS control-block address derived from
@@ -1764,6 +1765,88 @@ fn canonicalize_aarch64_gate_signal_context_with_kind(
             );
         }
         #[cfg(feature = "aarch64_virtualize_x18")]
+        GateMetadata::X18StackWriteback { scratch } => {
+            let Some(plan) = X18StackWritebackOffset::from_offset(offset)
+                .and_then(X18StackWritebackOffset::recovery_plan)
+            else {
+                return Aarch64GateSignalResult::InvalidRuntimeState;
+            };
+            let Some((delta, frame_bytes)) = gate.stack_writeback() else {
+                return Aarch64GateSignalResult::InvalidRuntimeState;
+            };
+            if interruption == GateInterruption::Synchronous
+                && plan.fault_attribution != X18FaultAttribution::GuestInstruction
+            {
+                return Aarch64GateSignalResult::InvalidRuntimeState;
+            }
+
+            let anchor = gate.anchor_scratch().unwrap();
+            let frame_bytes = usize::from(frame_bytes);
+            let frame = match plan.frame {
+                X18StackWritebackFrameState::Absent => None,
+                X18StackWritebackFrameState::AtSpRegistersLive
+                | X18StackWritebackFrameState::AtSpRestoreRegisters
+                | X18StackWritebackFrameState::AtSpRegistersRestored => Some(canonical.sp),
+                X18StackWritebackFrameState::AtAnchorRestoreRegisters => {
+                    Some(context.uc_mcontext.regs[usize::from(anchor)].trunc())
+                }
+            };
+            let restored = match plan.frame {
+                X18StackWritebackFrameState::AtSpRestoreRegisters
+                | X18StackWritebackFrameState::AtAnchorRestoreRegisters => {
+                    const SCRATCH_REGISTER_COUNT: usize = 2;
+                    let mut words = [[0u8; size_of::<usize>()]; SCRATCH_REGISTER_COUNT];
+                    if !read(frame.unwrap(), words.as_flattened_mut()) {
+                        return Aarch64GateSignalResult::InvalidRuntimeState;
+                    }
+                    Some(words.map(usize::from_ne_bytes))
+                }
+                X18StackWritebackFrameState::Absent
+                | X18StackWritebackFrameState::AtSpRegistersLive
+                | X18StackWritebackFrameState::AtSpRegistersRestored => None,
+            };
+            let guest_sp = match plan.sp {
+                X18StackWritebackSpSource::Signal => canonical.sp,
+                X18StackWritebackSpSource::FramePlusOriginal => {
+                    frame.unwrap().wrapping_add(frame_bytes)
+                }
+                X18StackWritebackSpSource::FramePlusResult => frame
+                    .unwrap()
+                    .wrapping_add(frame_bytes)
+                    .wrapping_add_signed(isize::from(delta)),
+            };
+            let guest_x18 = match plan.value {
+                X18ValueSource::Scratch => {
+                    // At the transformed instruction this is the exact value
+                    // reported by hardware; no completion inference is made.
+                    context.uc_mcontext.regs[usize::from(scratch)].trunc()
+                }
+                X18ValueSource::Slot => {
+                    let Some(value) = read_usize(
+                        &mut read,
+                        runtime.guest_thread_pointer_addr
+                            + litebox_syscall_rewriter::aarch64::GUEST_X18_OFFSET_FROM_GUEST_TP,
+                    ) else {
+                        return Aarch64GateSignalResult::InvalidRuntimeState;
+                    };
+                    value
+                }
+            };
+            let Some(resume_pc) = resolve_x18_recovery_pc(plan.resume, site, guest_x18, None)
+            else {
+                return Aarch64GateSignalResult::InvalidRuntimeState;
+            };
+            apply_x18_recovery(
+                &mut canonical,
+                scratch,
+                anchor,
+                restored,
+                guest_sp,
+                guest_x18,
+                resume_pc,
+            );
+        }
+        #[cfg(feature = "aarch64_virtualize_x18")]
         GateMetadata::X18CompareBranch { scratch } => {
             let Some(stage) = X18CompareBranchOffset::from_offset(offset) else {
                 return Aarch64GateSignalResult::InvalidRuntimeState;
@@ -1883,6 +1966,7 @@ fn canonicalize_aarch64_gate_signal_context_with_kind(
         }
         #[cfg(not(feature = "aarch64_virtualize_x18"))]
         GateMetadata::X18 { .. }
+        | GateMetadata::X18StackWriteback { .. }
         | GateMetadata::X18CompareBranch { .. }
         | GateMetadata::X18Adr { .. }
         | GateMetadata::X18Branch { .. } => return Aarch64GateSignalResult::NotGate,
@@ -2659,6 +2743,143 @@ mod tests {
             fixture_reader(&code, &trampoline, &[], &[0; 16]),
         );
         assert!(matches!(result, Aarch64GateSignalResult::NotGate));
+    }
+
+    #[test]
+    #[cfg(feature = "aarch64_virtualize_x18")]
+    fn x18_stack_writeback_gate_canonicalization_boundary_table() {
+        const SITE: usize = 0x1000;
+        const SLOT: usize = 0x400010;
+        const FRAME: usize = 0x8000;
+        const ORIGINAL_SP: usize = FRAME + 32;
+        const RESULT_SP: usize = ORIGINAL_SP - 16;
+        const LOGICAL_X18: usize = 0x1818_1818_1818_1818;
+        const SAVED_SCRATCH: usize = 0x1717_1717_1717_1717;
+        const SAVED_ANCHOR: usize = 0x1616_1616_1616_1616;
+
+        let options = litebox_syscall_rewriter::RewriteOptions::new(
+            litebox_syscall_rewriter::TargetHost::Linux,
+            true,
+        );
+        // stp x18, x19, [sp, #-16]!
+        let mut code = 0xa9bf_4ff2u32.to_le_bytes().to_vec();
+        let (trampoline, trapped) = litebox_syscall_rewriter::patch_code_segment_with_options(
+            &mut code,
+            SITE as u64,
+            0x400000,
+            0,
+            options,
+        )
+        .unwrap();
+        assert!(trapped.is_empty());
+
+        let gate =
+            litebox_syscall_rewriter::aarch64::classify_gate_pc(&trampoline, 0x400000, SLOT as u64)
+                .unwrap();
+        let litebox_syscall_rewriter::aarch64::GateMetadata::X18StackWriteback { scratch } =
+            gate.metadata()
+        else {
+            panic!("expected an x18 stack-writeback gate");
+        };
+        let anchor = gate.anchor_scratch().unwrap();
+        assert_eq!(gate.stack_writeback(), Some((-16, 32)));
+
+        let mut saved = PtRegs::default();
+        saved.regs[usize::from(scratch)] = SAVED_SCRATCH;
+        saved.regs[usize::from(anchor)] = SAVED_ANCHOR;
+        let mut frame = [0u8; 32];
+        frame[..8].copy_from_slice(&SAVED_SCRATCH.to_ne_bytes());
+        frame[8..16].copy_from_slice(&SAVED_ANCHOR.to_ne_bytes());
+        let mut slots = [0u8; 16];
+        slots[8..].copy_from_slice(&LOGICAL_X18.to_ne_bytes());
+
+        for offset in (0usize..=48).step_by(4) {
+            let completed = offset >= 28;
+            let mut context: libc::ucontext_t = unsafe { core::mem::zeroed() };
+            context.uc_mcontext.pc = (SLOT + offset) as u64;
+            context.uc_mcontext.sp = match offset {
+                0 | 24 => ORIGINAL_SP as u64,
+                28 | 48 => RESULT_SP as u64,
+                _ => FRAME as u64,
+            };
+            context.uc_mcontext.regs[usize::from(scratch)] = if matches!(offset, 16..=40) {
+                LOGICAL_X18 as u64
+            } else {
+                SAVED_SCRATCH as u64
+            };
+            context.uc_mcontext.regs[usize::from(anchor)] = if matches!(offset, 20 | 24 | 28 | 32) {
+                FRAME as u64
+            } else {
+                SAVED_ANCHOR as u64
+            };
+
+            let result = canonicalize_aarch64_gate_signal_context(
+                &context,
+                &saved,
+                0x500000,
+                0,
+                0,
+                fixture_reader(&code, &trampoline, &frame, &slots),
+            );
+            let Aarch64GateSignalResult::Canonicalized(regs) = result else {
+                panic!("x18 stack writeback +{offset} did not canonicalize");
+            };
+            assert_eq!(
+                regs.pc,
+                if completed { SITE + 4 } else { SITE },
+                "+{offset}: PC"
+            );
+            assert_eq!(
+                regs.sp,
+                if completed { RESULT_SP } else { ORIGINAL_SP },
+                "+{offset}: SP"
+            );
+            assert_eq!(
+                regs.regs[usize::from(scratch)],
+                SAVED_SCRATCH,
+                "+{offset}: scratch"
+            );
+            assert_eq!(
+                regs.regs[usize::from(anchor)],
+                SAVED_ANCHOR,
+                "+{offset}: anchor"
+            );
+            assert_eq!(regs.regs[18], LOGICAL_X18, "+{offset}: logical x18");
+        }
+
+        // A synchronous fault can be attributed to the guest only while its
+        // transformed pair instruction is current.
+        for (offset, accepted) in [(24usize, true), (12, false), (40, false)] {
+            let mut context: libc::ucontext_t = unsafe { core::mem::zeroed() };
+            context.uc_mcontext.pc = (SLOT + offset) as u64;
+            context.uc_mcontext.sp = if offset == 24 {
+                ORIGINAL_SP as u64
+            } else {
+                FRAME as u64
+            };
+            context.uc_mcontext.regs[usize::from(scratch)] = LOGICAL_X18 as u64;
+            context.uc_mcontext.regs[usize::from(anchor)] = if offset == 24 {
+                FRAME as u64
+            } else {
+                SAVED_ANCHOR as u64
+            };
+            let result = canonicalize_aarch64_gate_signal_context_with_kind(
+                &context,
+                &saved,
+                GateRuntimeState {
+                    guest_thread_pointer_addr: 0x500000,
+                    expected_outbound_stub: 0,
+                    expected_outbound_pc: 0,
+                },
+                GateInterruption::Synchronous,
+                fixture_reader(&code, &trampoline, &frame, &slots),
+            );
+            assert_eq!(
+                matches!(result, Aarch64GateSignalResult::Canonicalized(_)),
+                accepted,
+                "+{offset}: synchronous attribution"
+            );
+        }
     }
 
     #[test]
