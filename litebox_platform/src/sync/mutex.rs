@@ -210,25 +210,20 @@ impl<Platform: RawSyncPrimitivesProvider, T> Mutex<Platform, T> {
     }
 
     /// Consumes this mutex and returns the protected value.
+    #[cfg(not(feature = "lock_tracing"))]
     pub fn into_inner(self) -> T {
-        #[cfg(feature = "lock_tracing")]
-        let mut lock = self;
-        #[cfg(not(feature = "lock_tracing"))]
-        let lock = self;
+        self.data.into_inner()
+    }
 
-        #[cfg(feature = "lock_tracing")]
-        lock.creation
-            .record_destruction_if_registered(LockType::Mutex, lock.raw.raw.underlying_atomic());
-        let lock = core::mem::ManuallyDrop::new(lock);
-        // SAFETY: `self` is consumed and its destructor is suppressed. Moving
-        // every field out prevents double-drops while allowing the raw mutex
-        // and tracing state to be destroyed normally.
-        unsafe {
-            let _raw = core::ptr::read(&raw const lock.raw);
-            #[cfg(feature = "lock_tracing")]
-            let _creation = core::ptr::read(&raw const lock.creation);
-            core::ptr::read(&raw const lock.data).into_inner()
-        }
+    /// Consumes this mutex and returns the protected value.
+    #[cfg(feature = "lock_tracing")]
+    pub fn into_inner(mut self) -> T {
+        self.creation
+            .record_destruction_if_registered(LockType::Mutex, self.raw.raw.underlying_atomic());
+        let this = core::mem::ManuallyDrop::new(self);
+        // SAFETY: `self` is consumed and its destructor is suppressed, so the
+        // protected value can be moved out exactly once.
+        unsafe { core::ptr::read(&raw const this.data).into_inner() }
     }
 }
 

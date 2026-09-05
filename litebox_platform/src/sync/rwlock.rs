@@ -408,7 +408,6 @@ pub struct RwLockReadGuard<'a, Platform: RawSyncPrimitivesProvider, T: ?Sized> {
 pub struct MappedRwLockReadGuard<'a, Platform: RawSyncPrimitivesProvider, T: ?Sized> {
     data: core::ptr::NonNull<T>,
     raw_lock: &'a RawRwLock<Platform>,
-    _variance: core::marker::PhantomData<&'a T>,
     #[cfg(feature = "lock_tracing")]
     locked_witness: Option<LockedWitness>,
 }
@@ -562,7 +561,6 @@ impl<'a, Platform: RawSyncPrimitivesProvider, T: ?Sized> RwLockReadGuard<'a, Pla
         MappedRwLockReadGuard {
             data,
             raw_lock: &orig.rwlock.raw,
-            _variance: core::marker::PhantomData,
             #[cfg(feature = "lock_tracing")]
             locked_witness: unsafe {
                 orig.locked_witness
@@ -676,25 +674,21 @@ impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> RwLock<Platform, T> {
 impl<Platform: RawSyncPrimitivesProvider, T> RwLock<Platform, T> {
     /// Consumes this `RwLock`, returning the underlying data.
     #[inline]
+    #[cfg(not(feature = "lock_tracing"))]
     pub fn into_inner(self) -> T {
-        #[cfg(feature = "lock_tracing")]
-        let mut lock = self;
-        #[cfg(not(feature = "lock_tracing"))]
-        let lock = self;
+        self.data.into_inner()
+    }
 
-        #[cfg(feature = "lock_tracing")]
-        lock.creation
-            .record_destruction_if_registered(LockType::RwLock, &raw const lock.raw.state);
-        let lock = core::mem::ManuallyDrop::new(lock);
-        // SAFETY: `self` is consumed and its destructor is suppressed. Moving
-        // every field out prevents double-drops while allowing the raw locks
-        // and tracing state to be destroyed normally.
-        unsafe {
-            let _raw = core::ptr::read(&raw const lock.raw);
-            #[cfg(feature = "lock_tracing")]
-            let _creation = core::ptr::read(&raw const lock.creation);
-            core::ptr::read(&raw const lock.data).into_inner()
-        }
+    /// Consumes this `RwLock`, returning the underlying data.
+    #[inline]
+    #[cfg(feature = "lock_tracing")]
+    pub fn into_inner(mut self) -> T {
+        self.creation
+            .record_destruction_if_registered(LockType::RwLock, &raw const self.raw.state);
+        let this = core::mem::ManuallyDrop::new(self);
+        // SAFETY: `self` is consumed and its destructor is suppressed, so the
+        // protected value can be moved out exactly once.
+        unsafe { core::ptr::read(&raw const this.data).into_inner() }
     }
 }
 
