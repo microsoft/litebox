@@ -5,6 +5,7 @@
 //! host anchor; the guest thread pointer is virtualized in memory.
 
 use super::*;
+use litebox_common_linux::signal::aarch64::GuestVectorState;
 use litebox_syscall_rewriter::aarch64::{
     GATE_ALIGNMENT, GATE_PC_CANDIDATE_COUNT, GATE_SLOT_SIZES, GateMetadata, MSR_FRAME_BYTES,
     MSR_FRAME_OFF_VALUE, MrsTpidrGateOffset, MrsTpidrValueSource, MsrTpidrFrameState,
@@ -63,8 +64,6 @@ macro_rules! tprel_offset {
         offset
     }};
 }
-
-use litebox_common_linux::signal::aarch64::GuestVectorState;
 
 /// Layout of the AArch64 TLS control block.
 ///
