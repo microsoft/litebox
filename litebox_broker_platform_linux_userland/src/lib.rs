@@ -11,6 +11,8 @@
 
 mod socket;
 mod sync;
+mod time;
 
 pub use socket::LinuxSocketProvider;
-pub use sync::{LinuxSyncInstant, LinuxSyncPrimitivesProvider, LinuxSyncSystemTime};
+pub use sync::LinuxSyncPrimitivesProvider;
+pub use time::{LinuxInstant, LinuxSystemTime, LinuxTimeProvider};
