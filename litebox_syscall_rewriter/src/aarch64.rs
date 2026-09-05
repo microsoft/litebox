@@ -59,9 +59,10 @@
 //! store. TODO: use function metadata and control flow to cover noncontiguous
 //! exclusive sequences.
 //!
-//! The x18 gates spill below the guest SP. A guest memory operand that aliases
-//! that live spill area through an arbitrary register cannot be detected
-//! statically and is outside the supported gate semantics.
+//! X18 gates require writable stack below SP. SP-writeback pairs may spill as
+//! deep as `align_up(16 + max(0, -writeback), 16)` and can fault near guard
+//! pages. Arbitrary-register aliasing is unsupported; SP-pair accesses are
+//! checked not to overlap the spill.
 //!
 //! ## `X16` is preserved across an `SVC`
 //!
@@ -416,6 +417,8 @@ const X18_SLOT_BYTES: usize = 48;
 const X18_COMPARE_BRANCH_SLOT_BYTES: usize = 48;
 /// Byte size of a self-contained `ADR X18` gate slot.
 const X18_ADR_SLOT_BYTES: usize = 32;
+/// Byte size of an immediate SP-writeback pair x18 gate slot.
+const X18_STACK_WRITEBACK_SLOT_BYTES: usize = 64;
 /// Byte size of a terminal `BR X18` trap gate slot.
 const X18_BRANCH_SLOT_BYTES: usize = 16;
 /// Distinct compact-slot sizes probed by classifiers and finalizers. Metadata
@@ -427,8 +430,8 @@ pub const GATE_SLOT_SIZES: [usize; 4] = [
     SVC_SLOT_BYTES,
 ];
 /// Candidate starts required to cover the largest executable gate body:
-/// `max(ceil(executable_end / GATE_ALIGNMENT))`, currently `ceil(48 / 16)`.
-pub const GATE_PC_CANDIDATE_COUNT: usize = 3;
+/// `max(ceil(executable_end / GATE_ALIGNMENT))`, currently `ceil(52 / 16)`.
+pub const GATE_PC_CANDIDATE_COUNT: usize = 4;
 const NOP: u32 = 0xD503_201F;
 
 const GATE_METADATA_MAGIC: u32 = 0xB807;
@@ -455,6 +458,7 @@ enum GateKind {
     X18CompareBranch = 4,
     X18Adr = 5,
     X18Branch = 6,
+    X18StackWriteback = 7,
 }
 
 impl GateKind {
@@ -471,6 +475,7 @@ impl GateKind {
             Self::X18CompareBranch,
             Self::X18Adr,
             Self::X18Branch,
+            Self::X18StackWriteback,
         ]
         .into_iter()
         .find(|kind| kind.bits() == bits)
@@ -517,6 +522,8 @@ pub enum GateMetadata {
     },
     /// An indirect branch through logical x18 emulated by the exception handler.
     X18Branch { kind: X18IndirectBranchKind },
+    /// An immediate, SP-based `STP`/`LDP` with pre/post-index writeback.
+    X18StackWriteback { scratch: u8 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -550,6 +557,7 @@ impl EncodedGateMetadata {
             GateMetadata::X18CompareBranch { scratch } => (GateKind::X18CompareBranch, scratch),
             GateMetadata::X18Adr { scratch } => (GateKind::X18Adr, scratch),
             GateMetadata::X18Branch { kind } => (GateKind::X18Branch, kind as u8),
+            GateMetadata::X18StackWriteback { scratch } => (GateKind::X18StackWriteback, scratch),
         };
         if register > MAX_REGISTER {
             return None;
@@ -596,6 +604,9 @@ impl EncodedGateMetadata {
                     _ => return None,
                 },
             }),
+            GateKind::X18StackWriteback if register != XZR => {
+                Some(GateMetadata::X18StackWriteback { scratch: register })
+            }
             _ => None,
         }
     }
@@ -648,6 +659,15 @@ struct X18Substitution {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct X18StackWriteback {
+    word: u32,
+    scratch: u8,
+    anchor_scratch: u8,
+    delta: i16,
+    frame_bytes: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum X18PcRelative {
     Adr(u64),
     Adrp(u64),
@@ -685,6 +705,44 @@ enum X18Unsupported {
     ExclusiveAtomic,
     EncodingLayout,
     DecodeFailure,
+}
+
+/// Decodes the deliberately narrow pair family supported by the
+/// displacement-aware x18 gate. This is also used to validate persisted gates.
+fn decode_x18_stack_writeback(word: u32) -> Option<(u8, u8, i16, u16)> {
+    // Integer STP/LDP (32- or 64-bit), immediate pre/post-index, SP base.
+    if word & 0x7e00_0000 != 0x2800_0000 || (word >> RN_SHIFT) & REG_MASK != u32::from(SP) {
+        return None;
+    }
+    let mode = (word >> 23) & 3;
+    if !matches!(mode, 1 | 3) {
+        return None;
+    }
+    let element_bytes = if word >> 31 == 0 { 4 } else { 8 };
+    let imm7 = (((word >> IMM7_SHIFT) & u32::from(IMM7_MASK)) as i16) << 9 >> 9;
+    let delta = imm7.checked_mul(element_bytes)?;
+    let rt = (word & REG_MASK) as u8;
+    let rt2 = ((word >> RT2_SHIFT) & REG_MASK) as u8;
+    Some((rt, rt2, delta, element_bytes.cast_unsigned()))
+}
+
+fn classify_x18_stack_writeback(word: u32) -> Option<X18StackWriteback> {
+    let (rt, rt2, delta, _element_bytes) = decode_x18_stack_writeback(word)?;
+    if rt != X18 as u8 && rt2 != X18 as u8 {
+        return None;
+    }
+    let instruction = decode_instruction(word)?;
+    let (scratch, anchor_scratch) = select_x18_scratches(&instruction)?;
+    let transformed = substitute_x18(word, scratch)?;
+    let depth = 16u16.checked_add(if delta < 0 { delta.unsigned_abs() } else { 0 })?;
+    let frame_bytes = depth.checked_add(15)? & !15;
+    Some(X18StackWriteback {
+        word: transformed,
+        scratch,
+        anchor_scratch,
+        delta,
+        frame_bytes,
+    })
 }
 
 fn decode_instruction(word: u32) -> Option<DecodedInstruction> {
@@ -1353,6 +1411,224 @@ pub enum X18GateOffset {
     Return = 40,
     /// First byte after the executable gate body.
     ExecutableEnd = 44,
+}
+
+/// Instruction boundaries in the displacement-aware SP-writeback pair gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum X18StackWritebackOffset {
+    Entry = 0,
+    Spill = 4,
+    FirstAnchor = 8,
+    SlotLoad = 12,
+    FrameAddress = 16,
+    RestoreOriginalSp = 20,
+    Transform = 24,
+    RestoreFrameSp = 28,
+    SecondAnchor = 32,
+    SlotStore = 36,
+    RestoreRegisters = 40,
+    FinalSp = 44,
+    Return = 48,
+    ExecutableEnd = 52,
+}
+
+/// Location and validity of the scratch payload at an SP-writeback boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum X18StackWritebackFrameState {
+    Absent,
+    AtSpRegistersLive,
+    AtSpRestoreRegisters,
+    AtAnchorRestoreRegisters,
+    AtSpRegistersRestored,
+}
+
+/// How recovery reconstructs the guest-visible SP.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum X18StackWritebackSpSource {
+    Signal,
+    FramePlusOriginal,
+    FramePlusResult,
+}
+
+/// Whether a synchronous exception belongs to the guest pair or gate runtime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum X18FaultAttribution {
+    GuestInstruction,
+    Runtime,
+}
+
+/// Host-neutral recovery semantics for one SP-writeback gate boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct X18StackWritebackRecoveryPlan {
+    pub frame: X18StackWritebackFrameState,
+    pub sp: X18StackWritebackSpSource,
+    pub value: X18ValueSource,
+    pub resume: X18Resume,
+    pub runtime_access: RuntimeAccess,
+    pub fault_attribution: X18FaultAttribution,
+}
+
+impl X18StackWritebackRecoveryPlan {
+    const fn new(
+        frame: X18StackWritebackFrameState,
+        sp: X18StackWritebackSpSource,
+        value: X18ValueSource,
+        resume: X18Resume,
+        runtime_access: RuntimeAccess,
+        fault_attribution: X18FaultAttribution,
+    ) -> Self {
+        Self {
+            frame,
+            sp,
+            value,
+            resume,
+            runtime_access,
+            fault_attribution,
+        }
+    }
+}
+
+impl X18StackWritebackOffset {
+    const fn as_usize(self) -> usize {
+        self as u8 as usize
+    }
+
+    pub fn from_offset(offset: usize) -> Option<Self> {
+        Some(match offset {
+            0 => Self::Entry,
+            4 => Self::Spill,
+            8 => Self::FirstAnchor,
+            12 => Self::SlotLoad,
+            16 => Self::FrameAddress,
+            20 => Self::RestoreOriginalSp,
+            24 => Self::Transform,
+            28 => Self::RestoreFrameSp,
+            32 => Self::SecondAnchor,
+            36 => Self::SlotStore,
+            40 => Self::RestoreRegisters,
+            44 => Self::FinalSp,
+            48 => Self::Return,
+            _ => return None,
+        })
+    }
+
+    /// Returns the recovery semantics for this instruction boundary.
+    pub const fn recovery_plan(self) -> Option<X18StackWritebackRecoveryPlan> {
+        use RuntimeAccess::{Memory, NoAccess};
+        use X18FaultAttribution::{GuestInstruction, Runtime};
+        use X18Resume::{Next, Original};
+        use X18StackWritebackFrameState::{
+            Absent, AtAnchorRestoreRegisters, AtSpRegistersLive, AtSpRegistersRestored,
+            AtSpRestoreRegisters,
+        };
+        use X18StackWritebackSpSource::{FramePlusOriginal, FramePlusResult, Signal};
+        use X18ValueSource::{Scratch, Slot};
+
+        Some(match self {
+            Self::Entry => Self::plan(Absent, Signal, Slot, Original, NoAccess, Runtime),
+            Self::Spill => Self::plan(
+                AtSpRegistersLive,
+                FramePlusOriginal,
+                Slot,
+                Original,
+                Memory,
+                Runtime,
+            ),
+            Self::FirstAnchor => Self::plan(
+                AtSpRestoreRegisters,
+                FramePlusOriginal,
+                Slot,
+                Original,
+                NoAccess,
+                Runtime,
+            ),
+            Self::SlotLoad => Self::plan(
+                AtSpRestoreRegisters,
+                FramePlusOriginal,
+                Slot,
+                Original,
+                Memory,
+                Runtime,
+            ),
+            Self::FrameAddress | Self::RestoreOriginalSp => Self::plan(
+                AtSpRestoreRegisters,
+                FramePlusOriginal,
+                Slot,
+                Original,
+                NoAccess,
+                Runtime,
+            ),
+            Self::Transform => Self::plan(
+                AtAnchorRestoreRegisters,
+                Signal,
+                Scratch,
+                Original,
+                NoAccess,
+                GuestInstruction,
+            ),
+            Self::RestoreFrameSp => Self::plan(
+                AtAnchorRestoreRegisters,
+                Signal,
+                Scratch,
+                Next,
+                NoAccess,
+                Runtime,
+            ),
+            Self::SecondAnchor => Self::plan(
+                AtSpRestoreRegisters,
+                FramePlusResult,
+                Scratch,
+                Next,
+                NoAccess,
+                Runtime,
+            ),
+            Self::SlotStore => Self::plan(
+                AtSpRestoreRegisters,
+                FramePlusResult,
+                Scratch,
+                Next,
+                Memory,
+                Runtime,
+            ),
+            Self::RestoreRegisters => Self::plan(
+                AtSpRestoreRegisters,
+                FramePlusResult,
+                Scratch,
+                Next,
+                Memory,
+                Runtime,
+            ),
+            Self::FinalSp => Self::plan(
+                AtSpRegistersRestored,
+                FramePlusResult,
+                Slot,
+                Next,
+                NoAccess,
+                Runtime,
+            ),
+            Self::Return => Self::plan(Absent, Signal, Slot, Next, NoAccess, Runtime),
+            Self::ExecutableEnd => return None,
+        })
+    }
+
+    const fn plan(
+        frame: X18StackWritebackFrameState,
+        sp: X18StackWritebackSpSource,
+        value: X18ValueSource,
+        resume: X18Resume,
+        runtime_access: RuntimeAccess,
+        fault_attribution: X18FaultAttribution,
+    ) -> X18StackWritebackRecoveryPlan {
+        X18StackWritebackRecoveryPlan::new(
+            frame,
+            sp,
+            value,
+            resume,
+            runtime_access,
+            fault_attribution,
+        )
+    }
 }
 
 impl X18GateOffset {
@@ -2461,6 +2737,8 @@ enum PatchKind {
     MrsTpidr(u8),
     /// An x18 use detected under explicit virtualization.
     X18(X18TransformResult),
+    /// Immediate SP-based pair operation whose native instruction writes SP.
+    X18StackWriteback(X18StackWriteback),
     /// A compare/test branch (`CBZ`/`CBNZ`/`TBZ`/`TBNZ`) on logical x18.
     X18CompareBranch(X18CompareBranch),
     /// An `ADR X18` with its original absolute target.
@@ -2592,7 +2870,9 @@ fn find_patch_sites_with_code_ranges(
                     PatchKind::MrsTpidr(rd)
                 }
             } else if config.virtualize_x18 && known_code {
-                if let Some(branch) = classify_x18_conditional_branch(insn, vaddr) {
+                if let Some(pair) = classify_x18_stack_writeback(insn) {
+                    PatchKind::X18StackWriteback(pair)
+                } else if let Some(branch) = classify_x18_conditional_branch(insn, vaddr) {
                     PatchKind::X18CompareBranch(branch)
                 } else if let Some(adr) = classify_adr_x18(insn, vaddr) {
                     PatchKind::X18Adr(adr)
@@ -2612,6 +2892,7 @@ fn find_patch_sites_with_code_ranges(
                 && matches!(
                     kind,
                     PatchKind::X18(_)
+                        | PatchKind::X18StackWriteback(_)
                         | PatchKind::X18CompareBranch(_)
                         | PatchKind::X18Adr(_)
                         | PatchKind::X18Branch(_)
@@ -2758,6 +3039,14 @@ pub(crate) fn hook_syscalls_aarch64_with_code_ranges(
                     config.host,
                 )?,
                 PatchKind::X18(X18TransformResult::Unsupported(_)) => GateBuild::Unreachable,
+                PatchKind::X18StackWriteback(pair) => emit_x18_stack_writeback_gate(
+                    &mut trampoline_data,
+                    gate_offset,
+                    trampoline_base_addr,
+                    site,
+                    pair,
+                    config.host,
+                )?,
                 PatchKind::X18CompareBranch(branch) => emit_x18_compare_branch_gate(
                     &mut trampoline_data,
                     gate_offset,
@@ -3197,6 +3486,77 @@ fn emit_x18_gate(
         gate_vaddr,
         GateMetadata::X18 { scratch },
         X18_SLOT_BYTES,
+    )?;
+    Ok(GateBuild::Emitted)
+}
+
+fn emit_x18_stack_writeback_gate(
+    trampoline_data: &mut Vec<u8>,
+    gate_offset: usize,
+    trampoline_base_addr: u64,
+    site: &PatchSite,
+    pair: X18StackWriteback,
+    host: Host,
+) -> Result<GateBuild> {
+    let gate_vaddr = checked_add_u64(
+        trampoline_base_addr,
+        gate_offset as u64,
+        "x18 SP-writeback gate",
+    )?;
+    let mut asm = Asm::new(gate_vaddr);
+    asm.emit(Insn::SubSp(pair.frame_bytes));
+    asm.emit(Insn::Stp {
+        rt: pair.scratch,
+        rt2: pair.anchor_scratch,
+        rn: SP,
+        imm_bytes: 0,
+    });
+    asm.emit(host.anchor_read(pair.anchor_scratch));
+    asm.emit(Insn::LdrUimm {
+        rt: pair.scratch,
+        rn: pair.anchor_scratch,
+        imm_bytes: GUEST_X18_OFFSET_PLACEHOLDER,
+    });
+    asm.emit(Insn::AddImm {
+        rd: pair.anchor_scratch,
+        rn: SP,
+        imm12: 0,
+    });
+    asm.emit(Insn::AddSp(pair.frame_bytes));
+    asm.push_word(pair.word);
+    asm.emit(Insn::AddImm {
+        rd: SP,
+        rn: pair.anchor_scratch,
+        imm12: 0,
+    });
+    asm.emit(host.anchor_read(pair.anchor_scratch));
+    asm.emit(Insn::StrUimm {
+        rt: pair.scratch,
+        rn: pair.anchor_scratch,
+        imm_bytes: GUEST_X18_OFFSET_PLACEHOLDER,
+    });
+    asm.emit(Insn::Ldp {
+        rt: pair.scratch,
+        rt2: pair.anchor_scratch,
+        rn: SP,
+        imm_bytes: 0,
+    });
+    let final_adjustment = u16::try_from(i32::from(pair.frame_bytes) + i32::from(pair.delta))
+        .map_err(|_| Error::AddressOverflow("x18 SP-writeback adjustment".into()))?;
+    asm.emit(Insn::AddSp(final_adjustment));
+    let return_addr = checked_add_u64(site.vaddr, INSN_BYTES_U64, "x18 SP-writeback return")?;
+    if !asm.branch_to(return_addr)? {
+        return Ok(GateBuild::Unreachable);
+    }
+    append_gate_slot(
+        trampoline_data,
+        asm.finish(),
+        trampoline_base_addr,
+        gate_vaddr,
+        GateMetadata::X18StackWriteback {
+            scratch: pair.scratch,
+        },
+        X18_STACK_WRITEBACK_SLOT_BYTES,
     )?;
     Ok(GateBuild::Emitted)
 }
@@ -3699,6 +4059,100 @@ fn validate_gate_slot_inner_for_host(
                 && word(X18GateOffset::Return.as_usize()) & OPCODE_TOP6_MASK == Opcode::B.bits()
                 && padding_is_nops(X18GateOffset::ExecutableEnd.as_usize())
         }
+        GateMetadata::X18StackWriteback { scratch } => {
+            let anchor_scratch = ((word(4) >> RT2_SHIFT) & REG_MASK) as u8;
+            let transformed = word(X18StackWritebackOffset::Transform.as_usize());
+            let Some((rt, rt2, delta, element_bytes)) = decode_x18_stack_writeback(transformed)
+            else {
+                return false;
+            };
+            let depth = 16u16
+                .checked_add(if delta < 0 { delta.unsigned_abs() } else { 0 })
+                .and_then(|depth| depth.checked_add(15))
+                .map(|depth| depth & !15);
+            let Some(frame_bytes) = depth else {
+                return false;
+            };
+            // Revalidate the original operand layout and scratch choices.
+            let mut original = transformed;
+            if rt == scratch {
+                original = (original & !REG_MASK) | u32::from(X18);
+            }
+            if rt2 == scratch {
+                original = (original & !(REG_MASK << RT2_SHIFT)) | (u32::from(X18) << RT2_SHIFT);
+            }
+            let Some(derived) = classify_x18_stack_writeback(original) else {
+                return false;
+            };
+            let mode = (transformed >> 23) & 3;
+            let access_start = if mode == 3 { i32::from(delta) } else { 0 };
+            let access_end = access_start + i32::from(element_bytes) * 2;
+            let frame_start = -i32::from(frame_bytes);
+            let frame_end = frame_start + i32::from(X18_FRAME_BYTES);
+            let disjoint = access_end <= frame_start || access_start >= frame_end;
+            if !(7..=17).contains(&scratch)
+                || !(7..=17).contains(&anchor_scratch)
+                || anchor_scratch == scratch
+                || (rt != scratch && rt2 != scratch)
+                || rt == anchor_scratch
+                || rt2 == anchor_scratch
+                || derived.word != transformed
+                || derived.scratch != scratch
+                || derived.anchor_scratch != anchor_scratch
+                || derived.delta != delta
+                || derived.frame_bytes != frame_bytes
+                || !disjoint
+            {
+                return false;
+            }
+            exact(0, Insn::SubSp(frame_bytes))
+                && exact(
+                    4,
+                    Insn::Stp {
+                        rt: scratch,
+                        rt2: anchor_scratch,
+                        rn: SP,
+                        imm_bytes: 0,
+                    },
+                )
+                && is_host_anchor_read(word(8), anchor_scratch, host)
+                && is_x18_access(word(12), Opcode::LdrUimm, scratch, anchor_scratch)
+                && exact(
+                    16,
+                    Insn::AddImm {
+                        rd: anchor_scratch,
+                        rn: SP,
+                        imm12: 0,
+                    },
+                )
+                && exact(20, Insn::AddSp(frame_bytes))
+                && exact(
+                    28,
+                    Insn::AddImm {
+                        rd: SP,
+                        rn: anchor_scratch,
+                        imm12: 0,
+                    },
+                )
+                && is_host_anchor_read(word(32), anchor_scratch, host)
+                && word(8) == word(32)
+                && is_x18_access(word(36), Opcode::StrUimm, scratch, anchor_scratch)
+                && exact(
+                    40,
+                    Insn::Ldp {
+                        rt: scratch,
+                        rt2: anchor_scratch,
+                        rn: SP,
+                        imm_bytes: 0,
+                    },
+                )
+                && exact(
+                    44,
+                    Insn::AddSp(u16::try_from(i32::from(frame_bytes) + i32::from(delta)).unwrap()),
+                )
+                && word(48) & OPCODE_TOP6_MASK == Opcode::B.bits()
+                && padding_is_nops(52)
+        }
         GateMetadata::X18CompareBranch { scratch } => {
             let anchor_scratch = ((word(4) >> RT2_SHIFT) & REG_MASK) as u8;
             if !(7..=17).contains(&anchor_scratch) || anchor_scratch == scratch {
@@ -3819,6 +4273,7 @@ impl GateMetadata {
             GateMetadata::MrsTpidr { .. } => MRS_SLOT_BYTES,
             GateMetadata::MsrTpidr { .. } => MSR_SLOT_BYTES,
             GateMetadata::X18 { .. } => X18_SLOT_BYTES,
+            GateMetadata::X18StackWriteback { .. } => X18_STACK_WRITEBACK_SLOT_BYTES,
             GateMetadata::X18CompareBranch { .. } => X18_COMPARE_BRANCH_SLOT_BYTES,
             GateMetadata::X18Adr { .. } => X18_ADR_SLOT_BYTES,
             GateMetadata::X18Branch { .. } => X18_BRANCH_SLOT_BYTES,
@@ -3836,6 +4291,9 @@ impl GateMetadata {
             GateMetadata::MrsTpidr { .. } => MrsTpidrGateOffset::ExecutableEnd.as_usize(),
             GateMetadata::MsrTpidr { .. } => MsrTpidrGateOffset::ExecutableEnd.as_usize(),
             GateMetadata::X18 { .. } => X18GateOffset::ExecutableEnd.as_usize(),
+            GateMetadata::X18StackWriteback { .. } => {
+                X18StackWritebackOffset::ExecutableEnd.as_usize()
+            }
             GateMetadata::X18CompareBranch { .. } => {
                 X18CompareBranchOffset::ExecutableEnd.as_usize()
             }
@@ -3852,6 +4310,7 @@ impl GateMetadata {
             GateMetadata::MrsTpidr { .. } => MrsTpidrGateOffset::Return.as_usize(),
             GateMetadata::MsrTpidr { .. } => MsrTpidrGateOffset::Return.as_usize(),
             GateMetadata::X18 { .. } => X18GateOffset::Return.as_usize(),
+            GateMetadata::X18StackWriteback { .. } => X18StackWritebackOffset::Return.as_usize(),
             GateMetadata::X18CompareBranch { .. } => {
                 X18CompareBranchOffset::FallthroughBranch.as_usize()
             }
@@ -3874,6 +4333,8 @@ pub struct ClassifiedGate {
     slot_offset: usize,
     slot_size: u8,
     anchor_scratch: u8,
+    stack_delta: i16,
+    stack_frame_bytes: u16,
     original_site: u64,
     conditional_target: u64,
     metadata: GateMetadata,
@@ -3894,10 +4355,17 @@ impl ClassifiedGate {
         matches!(
             self.metadata,
             GateMetadata::X18 { .. }
+                | GateMetadata::X18StackWriteback { .. }
                 | GateMetadata::X18CompareBranch { .. }
                 | GateMetadata::X18Adr { .. }
         )
         .then_some(self.anchor_scratch)
+    }
+
+    /// `(writeback displacement, scratch-frame depth)` for an SP-writeback pair.
+    pub fn stack_writeback(self) -> Option<(i16, u16)> {
+        matches!(self.metadata, GateMetadata::X18StackWriteback { .. })
+            .then_some((self.stack_delta, self.stack_frame_bytes))
     }
 
     /// Original guest instruction address recovered from the return branch.
@@ -3965,6 +4433,7 @@ pub fn classify_copied_gate_slot(slot: &[u8], slot_vaddr: u64, pc: u64) -> Optio
         GateMetadata::MrsTpidr { .. }
         | GateMetadata::MsrTpidr { .. }
         | GateMetadata::X18 { .. }
+        | GateMetadata::X18StackWriteback { .. }
         | GateMetadata::X18CompareBranch { .. }
         | GateMetadata::X18Adr { .. }
         | GateMetadata::X18Branch { .. } => 0,
@@ -4006,15 +4475,34 @@ pub fn classify_copied_gate_slot(slot: &[u8], slot_vaddr: u64, pc: u64) -> Optio
     } else {
         0
     };
+    let (stack_delta, stack_frame_bytes) =
+        if matches!(metadata, GateMetadata::X18StackWriteback { .. }) {
+            let (_, _, delta, _) = decode_x18_stack_writeback(u32::from_le_bytes(
+                slot[X18StackWritebackOffset::Transform.as_usize()
+                    ..X18StackWritebackOffset::Transform.as_usize() + 4]
+                    .try_into()
+                    .ok()?,
+            ))?;
+            let frame = (16u16
+                .checked_add(if delta < 0 { delta.unsigned_abs() } else { 0 })?
+                .checked_add(15)?)
+                & !15;
+            (delta, frame)
+        } else {
+            (0, 0)
+        };
     Some(ClassifiedGate {
         slot_offset: 0,
         slot_size: u8::try_from(slot.len()).ok()?,
         anchor_scratch: match metadata {
             GateMetadata::X18 { .. }
+            | GateMetadata::X18StackWriteback { .. }
             | GateMetadata::X18CompareBranch { .. }
             | GateMetadata::X18Adr { .. } => x18_anchor_scratch(slot, metadata)?,
             _ => 0,
         },
+        stack_delta,
+        stack_frame_bytes,
         original_site: return_target.checked_sub(4)?,
         conditional_target,
         metadata,
@@ -4086,15 +4574,34 @@ fn classify_gate_pc_with_candidates<const N: usize>(
             } else {
                 0
             };
+            let (stack_delta, stack_frame_bytes) =
+                if matches!(metadata, GateMetadata::X18StackWriteback { .. }) {
+                    let transform_offset = X18StackWritebackOffset::Transform.as_usize();
+                    let (_, _, delta, _) = decode_x18_stack_writeback(u32::from_le_bytes(
+                        slot[transform_offset..transform_offset + INSN_BYTES]
+                            .try_into()
+                            .ok()?,
+                    ))?;
+                    let frame = (16u16
+                        .checked_add(if delta < 0 { delta.unsigned_abs() } else { 0 })?
+                        .checked_add(15)?)
+                        & !15;
+                    (delta, frame)
+                } else {
+                    (0, 0)
+                };
             match_found = Some(ClassifiedGate {
                 slot_offset: start,
                 slot_size: u8::try_from(slot_size).ok()?,
                 anchor_scratch: match metadata {
                     GateMetadata::X18 { .. }
+                    | GateMetadata::X18StackWriteback { .. }
                     | GateMetadata::X18CompareBranch { .. }
                     | GateMetadata::X18Adr { .. } => x18_anchor_scratch(slot, metadata)?,
                     _ => 0,
                 },
+                stack_delta,
+                stack_frame_bytes,
                 original_site: return_target.checked_sub(4)?,
                 conditional_target,
                 metadata,
@@ -4134,7 +4641,7 @@ fn is_host_anchor_read(word: u32, register: u8, host: Option<Host>) -> bool {
 fn x18_anchor_scratch(slot: &[u8], metadata: GateMetadata) -> Option<u8> {
     let offset = match metadata {
         GateMetadata::X18 { .. } | GateMetadata::X18Adr { .. } => 0,
-        GateMetadata::X18CompareBranch { .. } => 4,
+        GateMetadata::X18StackWriteback { .. } | GateMetadata::X18CompareBranch { .. } => 4,
         _ => return None,
     };
     Some(
@@ -4443,6 +4950,7 @@ fn validate_trampoline_and_collect_offsets(
         has_x18_gate |= matches!(
             metadata,
             GateMetadata::X18 { .. }
+                | GateMetadata::X18StackWriteback { .. }
                 | GateMetadata::X18CompareBranch { .. }
                 | GateMetadata::X18Adr { .. }
                 | GateMetadata::X18Branch { .. }
@@ -4453,6 +4961,10 @@ fn validate_trampoline_and_collect_offsets(
             (GateMetadata::X18 { .. }, true) => &[
                 cursor + X18GateOffset::SlotLoad.as_usize(),
                 cursor + X18GateOffset::SlotStore.as_usize(),
+            ],
+            (GateMetadata::X18StackWriteback { .. }, true) => &[
+                cursor + X18StackWritebackOffset::SlotLoad.as_usize(),
+                cursor + X18StackWritebackOffset::SlotStore.as_usize(),
             ],
             (GateMetadata::X18CompareBranch { .. }, true) => &[cursor + 12],
             (GateMetadata::X18Adr { .. }, true) => &[cursor + 16],
@@ -5116,6 +5628,77 @@ mod tests {
     }
 
     #[test]
+    fn sp_writeback_pair_uses_displacement_aware_x18_gate() {
+        // stp x18, x19, [sp, #-16]!
+        let original = 0xa9bf_4ff2;
+        let pair = classify_x18_stack_writeback(original).unwrap();
+        assert_eq!(pair.delta, -16);
+        assert_eq!(pair.frame_bytes, 32);
+        let (patched, outcome) = hook_words_opt_with_config(
+            &[original],
+            0x1000,
+            0x400000,
+            RewriteConfig {
+                host: Host::Linux,
+                virtualize_x18: true,
+            },
+        );
+        let mut outcome = outcome.unwrap();
+        assert!(outcome.trapped_sites.is_empty());
+        assert_ne!(u32::from_le_bytes(patched.try_into().unwrap()), original);
+        let gate = &outcome.trampoline[GATES_START_OFFSET..];
+        assert_eq!(gate.len(), X18_STACK_WRITEBACK_SLOT_BYTES);
+        let metadata = EncodedGateMetadata(u32::from_le_bytes(
+            gate[gate.len() - 4..].try_into().unwrap(),
+        ))
+        .decode()
+        .unwrap();
+        assert_eq!(
+            metadata,
+            GateMetadata::X18StackWriteback {
+                scratch: pair.scratch
+            }
+        );
+        assert!(validate_gate_slot(
+            gate,
+            0x400000,
+            0x400000 + GATES_START_OFFSET as u64,
+            metadata,
+        ));
+        assert_eq!(word_at(gate, 0), Insn::SubSp(32).encode().unwrap());
+        assert_eq!(word_at(gate, 44), Insn::AddSp(16).encode().unwrap());
+        finalize_trampoline_gates_with_x18(&mut outcome.trampoline, 96, 104).unwrap();
+    }
+
+    #[test]
+    fn sp_writeback_recovery_plan_attributes_only_the_pair_to_guest() {
+        for offset in (0..X18StackWritebackOffset::ExecutableEnd.as_usize()).step_by(INSN_BYTES) {
+            let stage = X18StackWritebackOffset::from_offset(offset).unwrap();
+            let plan = stage.recovery_plan().unwrap();
+            assert_eq!(
+                plan.fault_attribution,
+                if stage == X18StackWritebackOffset::Transform {
+                    X18FaultAttribution::GuestInstruction
+                } else {
+                    X18FaultAttribution::Runtime
+                }
+            );
+        }
+        let transform = X18StackWritebackOffset::Transform.recovery_plan().unwrap();
+        assert_eq!(transform.sp, X18StackWritebackSpSource::Signal);
+        assert_eq!(transform.value, X18ValueSource::Scratch);
+        assert_eq!(transform.resume, X18Resume::Original);
+        assert_eq!(
+            transform.frame,
+            X18StackWritebackFrameState::AtAnchorRestoreRegisters
+        );
+        let completed = X18StackWritebackOffset::FinalSp.recovery_plan().unwrap();
+        assert_eq!(completed.sp, X18StackWritebackSpSource::FramePlusResult);
+        assert_eq!(completed.value, X18ValueSource::Slot);
+        assert_eq!(completed.resume, X18Resume::Next);
+    }
+
+    #[test]
     fn x18_gate_uses_each_hosts_exact_anchor_read() {
         for (host, anchor_word) in [
             (Host::Linux, 0xd53b_d050),
@@ -5168,6 +5751,7 @@ mod tests {
             GateMetadata::MrsTpidr { destination: 9 },
             GateMetadata::MsrTpidr { source: 9 },
             GateMetadata::X18 { scratch: 17 },
+            GateMetadata::X18StackWriteback { scratch: 17 },
             GateMetadata::X18CompareBranch { scratch: 17 },
             GateMetadata::X18Adr { scratch: 17 },
             GateMetadata::X18Branch {
@@ -6112,6 +6696,10 @@ mod tests {
             }),
             0x0261b807
         );
+        assert_eq!(
+            word(GateMetadata::X18StackWriteback { scratch: 17 }),
+            0x1171b807
+        );
     }
 
     #[test]
@@ -6141,7 +6729,7 @@ mod tests {
                 );
             }
         }
-        for kind in 7..16 {
+        for kind in 8..16 {
             let invalid = (valid & !GATE_METADATA_KIND_MASK) | (kind << GATE_METADATA_KIND_SHIFT);
             assert_eq!(EncodedGateMetadata(invalid).decode(), None, "kind {kind}");
         }
@@ -6275,7 +6863,7 @@ mod tests {
                 );
             }
         }
-        for kind in 7..16 {
+        for kind in 8..16 {
             let word = (valid & !GATE_METADATA_KIND_MASK) | (kind << GATE_METADATA_KIND_SHIFT);
             assert_eq!(EncodedGateMetadata(word).decode(), None, "kind {kind}");
         }
@@ -6323,12 +6911,15 @@ mod tests {
                         slot_offset: start,
                         slot_size: u8::try_from(size).unwrap(),
                         anchor_scratch: 0,
+                        stack_delta: 0,
+                        stack_frame_bytes: 0,
                         original_site: 0x1000
                             + match metadata {
                                 GateMetadata::MrsTpidr { .. } => 0,
                                 GateMetadata::MsrTpidr { .. } => 4,
                                 GateMetadata::Svc => 8,
                                 GateMetadata::X18 { .. }
+                                | GateMetadata::X18StackWriteback { .. }
                                 | GateMetadata::X18CompareBranch { .. }
                                 | GateMetadata::X18Adr { .. }
                                 | GateMetadata::X18Branch { .. } => unreachable!(),

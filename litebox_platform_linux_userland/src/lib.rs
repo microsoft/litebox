@@ -2015,6 +2015,7 @@ fn register_exception_handlers() {
         for &sig in exception_signals {
             unsafe {
                 let mut sa: libc::sigaction = core::mem::zeroed();
+                // Keep signal frames off gate scratch storage below guest SP.
                 sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
                 // `SA_NODEFER`: the gate classifier probes memory around a guest
                 // PC that may be unmapped, and reaching the exception-table

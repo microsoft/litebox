@@ -14,8 +14,9 @@ use litebox_syscall_rewriter::aarch64::{
 };
 #[cfg(feature = "aarch64_virtualize_x18")]
 use litebox_syscall_rewriter::aarch64::{
-    X18_FRAME_BYTES, X18AdrOffset, X18CompareBranchOffset, X18FrameState, X18GateOffset, X18Resume,
-    X18ValueSource, x18_branch_recovery_plan,
+    X18_FRAME_BYTES, X18AdrOffset, X18CompareBranchOffset, X18FaultAttribution, X18FrameState,
+    X18GateOffset, X18Resume, X18StackWritebackFrameState, X18StackWritebackOffset,
+    X18StackWritebackSpSource, X18ValueSource, x18_branch_recovery_plan,
 };
 
 /// Overwrites the destination with the TLS control-block address derived from
@@ -1764,6 +1765,87 @@ fn canonicalize_aarch64_gate_signal_context_with_kind(
             );
         }
         #[cfg(feature = "aarch64_virtualize_x18")]
+        GateMetadata::X18StackWriteback { scratch } => {
+            let Some(plan) = X18StackWritebackOffset::from_offset(offset)
+                .and_then(X18StackWritebackOffset::recovery_plan)
+            else {
+                return Aarch64GateSignalResult::InvalidRuntimeState;
+            };
+            let Some((delta, frame_bytes)) = gate.stack_writeback() else {
+                return Aarch64GateSignalResult::InvalidRuntimeState;
+            };
+            if interruption == GateInterruption::Synchronous
+                && plan.fault_attribution != X18FaultAttribution::GuestInstruction
+            {
+                return Aarch64GateSignalResult::InvalidRuntimeState;
+            }
+
+            let anchor = gate.anchor_scratch().unwrap();
+            let frame_bytes = usize::from(frame_bytes);
+            let frame = match plan.frame {
+                X18StackWritebackFrameState::Absent => None,
+                X18StackWritebackFrameState::AtSpRegistersLive
+                | X18StackWritebackFrameState::AtSpRestoreRegisters
+                | X18StackWritebackFrameState::AtSpRegistersRestored => Some(canonical.sp),
+                X18StackWritebackFrameState::AtAnchorRestoreRegisters => {
+                    Some(context.uc_mcontext.regs[usize::from(anchor)].trunc())
+                }
+            };
+            let restored = match plan.frame {
+                X18StackWritebackFrameState::AtSpRestoreRegisters
+                | X18StackWritebackFrameState::AtAnchorRestoreRegisters => {
+                    let mut words = [[0u8; size_of::<usize>()]; 2];
+                    if !read(frame.unwrap(), words.as_flattened_mut()) {
+                        return Aarch64GateSignalResult::InvalidRuntimeState;
+                    }
+                    Some(words.map(usize::from_ne_bytes))
+                }
+                X18StackWritebackFrameState::Absent
+                | X18StackWritebackFrameState::AtSpRegistersLive
+                | X18StackWritebackFrameState::AtSpRegistersRestored => None,
+            };
+            let guest_sp = match plan.sp {
+                X18StackWritebackSpSource::Signal => canonical.sp,
+                X18StackWritebackSpSource::FramePlusOriginal => {
+                    frame.unwrap().wrapping_add(frame_bytes)
+                }
+                X18StackWritebackSpSource::FramePlusResult => frame
+                    .unwrap()
+                    .wrapping_add(frame_bytes)
+                    .wrapping_add_signed(isize::from(delta)),
+            };
+            let guest_x18 = match plan.value {
+                X18ValueSource::Scratch => {
+                    // At the transformed instruction this is the exact value
+                    // reported by hardware; no completion inference is made.
+                    context.uc_mcontext.regs[usize::from(scratch)].trunc()
+                }
+                X18ValueSource::Slot => {
+                    let Some(value) = read_usize(
+                        &mut read,
+                        runtime.guest_thread_pointer_addr
+                            + litebox_syscall_rewriter::aarch64::GUEST_X18_OFFSET_FROM_GUEST_TP,
+                    ) else {
+                        return Aarch64GateSignalResult::InvalidRuntimeState;
+                    };
+                    value
+                }
+            };
+            let Some(resume_pc) = resolve_x18_recovery_pc(plan.resume, site, guest_x18, None)
+            else {
+                return Aarch64GateSignalResult::InvalidRuntimeState;
+            };
+            apply_x18_recovery(
+                &mut canonical,
+                scratch,
+                anchor,
+                restored,
+                guest_sp,
+                guest_x18,
+                resume_pc,
+            );
+        }
+        #[cfg(feature = "aarch64_virtualize_x18")]
         GateMetadata::X18CompareBranch { scratch } => {
             let Some(stage) = X18CompareBranchOffset::from_offset(offset) else {
                 return Aarch64GateSignalResult::InvalidRuntimeState;
@@ -1883,6 +1965,7 @@ fn canonicalize_aarch64_gate_signal_context_with_kind(
         }
         #[cfg(not(feature = "aarch64_virtualize_x18"))]
         GateMetadata::X18 { .. }
+        | GateMetadata::X18StackWriteback { .. }
         | GateMetadata::X18CompareBranch { .. }
         | GateMetadata::X18Adr { .. }
         | GateMetadata::X18Branch { .. } => return Aarch64GateSignalResult::NotGate,
