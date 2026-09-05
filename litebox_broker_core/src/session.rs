@@ -134,6 +134,14 @@ impl BrokerSession {
             .policy
             .principal_object_rights(self.caller_credential)?;
         let object = Arc::new(RwLock::new(object));
+        self.create_object_reference_with_rights(object, rights)
+    }
+
+    fn create_object_reference_with_rights(
+        &self,
+        object: Arc<RwLock<ObjectEntry>>,
+        rights: ObjectRights,
+    ) -> Result<ObjectHandle> {
         let mut session_references = self.references.lock();
         self.prepare_session_references(&mut session_references, 1)?;
         let mut references = self.core.references.write();
@@ -176,6 +184,59 @@ impl BrokerSession {
         );
 
         Ok(handle)
+    }
+
+    /// Duplicates a supported object reference into another session.
+    ///
+    /// The returned handle is owned by `target` and refers to the same
+    /// underlying event or pipe endpoint. `rights` must be nonempty, allowed by
+    /// the target's policy, and no broader than the source reference's rights.
+    /// The source reference is unchanged. Socket references are not supported
+    /// because their readiness registration is currently bound to one session
+    /// and handle.
+    ///
+    /// Pipe capacity remains charged to the session that created the pipe.
+    /// Child creation must call this operation explicitly according to the
+    /// guest operating system's inheritance semantics.
+    pub fn duplicate_object_reference_to(
+        &self,
+        handle: ObjectHandle,
+        target: &BrokerSession,
+        rights: ObjectRights,
+    ) -> Result<ObjectHandle> {
+        if rights.is_empty() {
+            return Err(BrokerError::InvalidRights);
+        }
+
+        let object = {
+            let references = self.core.references.read();
+            let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
+            if reference.session_id != self.session_id {
+                return Err(BrokerError::UnknownObject);
+            }
+            if !reference.rights.contains(rights) {
+                return Err(BrokerError::InvalidRights);
+            }
+            Arc::clone(&reference.object)
+        };
+
+        {
+            let object = object.read();
+            match &*object {
+                ObjectEntry::Event(_) | ObjectEntry::Pipe(_) => {}
+                ObjectEntry::Socket(_) => return Err(BrokerError::UnsupportedOperation),
+                ObjectEntry::Reserved => return Err(BrokerError::Internal),
+            }
+        }
+
+        let target_rights = target
+            .core
+            .policy
+            .principal_object_rights(target.caller_credential)?;
+        if !target_rights.contains(rights) {
+            return Err(BrokerError::PolicyDenied);
+        }
+        target.create_object_reference_with_rights(object, rights)
     }
 
     pub(crate) fn create_object_reference_pair(
@@ -576,6 +637,69 @@ mod tests {
         assert_eq!(session_references.pending_handles, 0);
     }
 
+    fn check_supported_references_duplicate_between_sessions(broker: &BrokerCore) {
+        let source = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let target = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let denied_target = broker
+            .create_session(CallerCredential::HostGuaranteed)
+            .unwrap();
+
+        let event = crate::event::create(&source, 1).unwrap();
+        let duplicated_event = source
+            .duplicate_object_reference_to(event, &target, ObjectRights::WAIT)
+            .unwrap();
+        assert_ne!(duplicated_event, event);
+        assert_eq!(
+            source.duplicate_object_reference_to(event, &denied_target, ObjectRights::WAIT),
+            Err(BrokerError::PolicyDenied)
+        );
+        assert_eq!(source.close_object_reference(event), Ok(()));
+        assert_eq!(
+            crate::event::add(&target, duplicated_event, 1),
+            Err(BrokerError::InvalidRights)
+        );
+        assert_eq!(
+            crate::event::consume(&target, duplicated_event, EventConsumeMode::One),
+            Ok(EventConsumption {
+                value: 1,
+                readiness: ReadinessFlags::WRITE,
+            })
+        );
+        assert_eq!(
+            target.duplicate_object_reference_to(duplicated_event, &source, ObjectRights::WRITE),
+            Err(BrokerError::InvalidRights)
+        );
+        assert_eq!(target.close_object_reference(duplicated_event), Ok(()));
+
+        let (reader, writer) = crate::pipe::create(&source, 4, 2).unwrap();
+        let duplicated_writer = source
+            .duplicate_object_reference_to(writer, &target, ObjectRights::WRITE)
+            .unwrap();
+        assert_eq!(source.close_object_reference(writer), Ok(()));
+        assert_eq!(crate::pipe::write(&target, duplicated_writer, &[1]), Ok(1));
+        assert_eq!(
+            crate::pipe::read(&source, reader, 1),
+            Ok(std::vec::Vec::from([1]))
+        );
+
+        let event = crate::event::create(&target, 0).unwrap();
+        assert_eq!(
+            source.duplicate_object_reference_to(reader, &target, ObjectRights::WAIT),
+            Err(BrokerError::ResourceExhausted)
+        );
+        assert_eq!(broker.references.read().len(), 3);
+
+        assert_eq!(target.close_object_reference(event), Ok(()));
+        assert_eq!(target.close_object_reference(duplicated_writer), Ok(()));
+        assert_eq!(source.close_object_reference(reader), Ok(()));
+        assert!(broker.references.read().is_empty());
+        assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
+    }
+
     #[test]
     fn object_reference_lifecycle_uses_public_core_constructor_once() {
         let socket_provider = Arc::new(crate::socket::tests::TestSocketProvider::default());
@@ -608,6 +732,7 @@ mod tests {
         check_pending_references_count_toward_session_quota(&broker);
         check_pipe_capacity_quota_is_per_session(&broker);
         check_pipe_capacity_outlives_session_for_in_flight_object(&broker);
+        check_supported_references_duplicate_between_sessions(&broker);
         crate::socket::tests::check_socket_lifecycle(&broker, &socket_provider);
         check_pair_handle_exhaustion(&broker);
 
