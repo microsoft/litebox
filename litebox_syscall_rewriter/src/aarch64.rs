@@ -663,7 +663,15 @@ struct X18StackWriteback {
     word: u32,
     scratch: u8,
     anchor_scratch: u8,
+    layout: X18StackWritebackLayout,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct X18StackWritebackLayout {
+    rt: u8,
+    rt2: u8,
     delta: i16,
+    element_bytes: u16,
     frame_bytes: u16,
 }
 
@@ -709,7 +717,7 @@ enum X18Unsupported {
 
 /// Decodes the deliberately narrow pair family supported by the
 /// displacement-aware x18 gate. This is also used to validate persisted gates.
-fn decode_x18_stack_writeback(word: u32) -> Option<(u8, u8, i16, u16)> {
+fn decode_x18_stack_writeback(word: u32) -> Option<X18StackWritebackLayout> {
     // Integer STP/LDP (32- or 64-bit), immediate pre/post-index, SP base.
     if word & 0x7e00_0000 != 0x2800_0000 || (word >> RN_SHIFT) & REG_MASK != u32::from(SP) {
         return None;
@@ -721,27 +729,28 @@ fn decode_x18_stack_writeback(word: u32) -> Option<(u8, u8, i16, u16)> {
     let element_bytes = if word >> 31 == 0 { 4 } else { 8 };
     let imm7 = (((word >> IMM7_SHIFT) & u32::from(IMM7_MASK)) as i16) << 9 >> 9;
     let delta = imm7.checked_mul(element_bytes)?;
-    let rt = (word & REG_MASK) as u8;
-    let rt2 = ((word >> RT2_SHIFT) & REG_MASK) as u8;
-    Some((rt, rt2, delta, element_bytes.cast_unsigned()))
+    let depth = 16u16.checked_add(if delta < 0 { delta.unsigned_abs() } else { 0 })?;
+    Some(X18StackWritebackLayout {
+        rt: (word & REG_MASK) as u8,
+        rt2: ((word >> RT2_SHIFT) & REG_MASK) as u8,
+        delta,
+        element_bytes: element_bytes.cast_unsigned(),
+        frame_bytes: depth.checked_add(15)? & !15,
+    })
 }
 
 fn classify_x18_stack_writeback(word: u32) -> Option<X18StackWriteback> {
-    let (rt, rt2, delta, _element_bytes) = decode_x18_stack_writeback(word)?;
-    if rt != X18 as u8 && rt2 != X18 as u8 {
+    let layout = decode_x18_stack_writeback(word)?;
+    if layout.rt != X18 as u8 && layout.rt2 != X18 as u8 {
         return None;
     }
     let instruction = decode_instruction(word)?;
     let (scratch, anchor_scratch) = select_x18_scratches(&instruction)?;
-    let transformed = substitute_x18(word, scratch)?;
-    let depth = 16u16.checked_add(if delta < 0 { delta.unsigned_abs() } else { 0 })?;
-    let frame_bytes = depth.checked_add(15)? & !15;
     Some(X18StackWriteback {
-        word: transformed,
+        word: substitute_x18(word, scratch)?,
         scratch,
         anchor_scratch,
-        delta,
-        frame_bytes,
+        layout,
     })
 }
 
@@ -1465,7 +1474,6 @@ pub struct X18StackWritebackRecoveryPlan {
     pub sp: X18StackWritebackSpSource,
     pub value: X18ValueSource,
     pub resume: X18Resume,
-    pub runtime_access: RuntimeAccess,
     pub fault_attribution: X18FaultAttribution,
 }
 
@@ -1475,7 +1483,6 @@ impl X18StackWritebackRecoveryPlan {
         sp: X18StackWritebackSpSource,
         value: X18ValueSource,
         resume: X18Resume,
-        runtime_access: RuntimeAccess,
         fault_attribution: X18FaultAttribution,
     ) -> Self {
         Self {
@@ -1483,7 +1490,6 @@ impl X18StackWritebackRecoveryPlan {
             sp,
             value,
             resume,
-            runtime_access,
             fault_attribution,
         }
     }
@@ -1515,7 +1521,6 @@ impl X18StackWritebackOffset {
 
     /// Returns the recovery semantics for this instruction boundary.
     pub const fn recovery_plan(self) -> Option<X18StackWritebackRecoveryPlan> {
-        use RuntimeAccess::{Memory, NoAccess};
         use X18FaultAttribution::{GuestInstruction, Runtime};
         use X18Resume::{Next, Original};
         use X18StackWritebackFrameState::{
@@ -1526,88 +1531,44 @@ impl X18StackWritebackOffset {
         use X18ValueSource::{Scratch, Slot};
 
         Some(match self {
-            Self::Entry => Self::plan(Absent, Signal, Slot, Original, NoAccess, Runtime),
+            Self::Entry => Self::plan(Absent, Signal, Slot, Original, Runtime),
             Self::Spill => Self::plan(
                 AtSpRegistersLive,
                 FramePlusOriginal,
                 Slot,
                 Original,
-                Memory,
                 Runtime,
             ),
-            Self::FirstAnchor => Self::plan(
-                AtSpRestoreRegisters,
-                FramePlusOriginal,
-                Slot,
-                Original,
-                NoAccess,
-                Runtime,
-            ),
-            Self::SlotLoad => Self::plan(
-                AtSpRestoreRegisters,
-                FramePlusOriginal,
-                Slot,
-                Original,
-                Memory,
-                Runtime,
-            ),
-            Self::FrameAddress | Self::RestoreOriginalSp => Self::plan(
-                AtSpRestoreRegisters,
-                FramePlusOriginal,
-                Slot,
-                Original,
-                NoAccess,
-                Runtime,
-            ),
+            Self::FirstAnchor | Self::SlotLoad | Self::FrameAddress | Self::RestoreOriginalSp => {
+                Self::plan(
+                    AtSpRestoreRegisters,
+                    FramePlusOriginal,
+                    Slot,
+                    Original,
+                    Runtime,
+                )
+            }
             Self::Transform => Self::plan(
                 AtAnchorRestoreRegisters,
                 Signal,
                 Scratch,
                 Original,
-                NoAccess,
                 GuestInstruction,
             ),
-            Self::RestoreFrameSp => Self::plan(
-                AtAnchorRestoreRegisters,
-                Signal,
-                Scratch,
-                Next,
-                NoAccess,
-                Runtime,
-            ),
-            Self::SecondAnchor => Self::plan(
+            Self::RestoreFrameSp => {
+                Self::plan(AtAnchorRestoreRegisters, Signal, Scratch, Next, Runtime)
+            }
+            Self::SecondAnchor | Self::SlotStore | Self::RestoreRegisters => Self::plan(
                 AtSpRestoreRegisters,
                 FramePlusResult,
                 Scratch,
                 Next,
-                NoAccess,
                 Runtime,
             ),
-            Self::SlotStore => Self::plan(
-                AtSpRestoreRegisters,
-                FramePlusResult,
-                Scratch,
-                Next,
-                Memory,
-                Runtime,
-            ),
-            Self::RestoreRegisters => Self::plan(
-                AtSpRestoreRegisters,
-                FramePlusResult,
-                Scratch,
-                Next,
-                Memory,
-                Runtime,
-            ),
-            Self::FinalSp => Self::plan(
-                AtSpRegistersRestored,
-                FramePlusResult,
-                Slot,
-                Next,
-                NoAccess,
-                Runtime,
-            ),
-            Self::Return => Self::plan(Absent, Signal, Slot, Next, NoAccess, Runtime),
+            Self::FinalSp => {
+                Self::plan(AtSpRegistersRestored, FramePlusResult, Slot, Next, Runtime)
+            }
+            Self::Return => Self::plan(Absent, Signal, Slot, Next, Runtime),
             Self::ExecutableEnd => return None,
         })
     }
@@ -1617,17 +1578,9 @@ impl X18StackWritebackOffset {
         sp: X18StackWritebackSpSource,
         value: X18ValueSource,
         resume: X18Resume,
-        runtime_access: RuntimeAccess,
         fault_attribution: X18FaultAttribution,
     ) -> X18StackWritebackRecoveryPlan {
-        X18StackWritebackRecoveryPlan::new(
-            frame,
-            sp,
-            value,
-            resume,
-            runtime_access,
-            fault_attribution,
-        )
+        X18StackWritebackRecoveryPlan::new(frame, sp, value, resume, fault_attribution)
     }
 }
 
@@ -3504,7 +3457,7 @@ fn emit_x18_stack_writeback_gate(
         "x18 SP-writeback gate",
     )?;
     let mut asm = Asm::new(gate_vaddr);
-    asm.emit(Insn::SubSp(pair.frame_bytes));
+    asm.emit(Insn::SubSp(pair.layout.frame_bytes));
     asm.emit(Insn::Stp {
         rt: pair.scratch,
         rt2: pair.anchor_scratch,
@@ -3522,7 +3475,7 @@ fn emit_x18_stack_writeback_gate(
         rn: SP,
         imm12: 0,
     });
-    asm.emit(Insn::AddSp(pair.frame_bytes));
+    asm.emit(Insn::AddSp(pair.layout.frame_bytes));
     asm.push_word(pair.word);
     asm.emit(Insn::AddImm {
         rd: SP,
@@ -3541,8 +3494,9 @@ fn emit_x18_stack_writeback_gate(
         rn: SP,
         imm_bytes: 0,
     });
-    let final_adjustment = u16::try_from(i32::from(pair.frame_bytes) + i32::from(pair.delta))
-        .map_err(|_| Error::AddressOverflow("x18 SP-writeback adjustment".into()))?;
+    let final_adjustment =
+        u16::try_from(i32::from(pair.layout.frame_bytes) + i32::from(pair.layout.delta))
+            .map_err(|_| Error::AddressOverflow("x18 SP-writeback adjustment".into()))?;
     asm.emit(Insn::AddSp(final_adjustment));
     let return_addr = checked_add_u64(site.vaddr, INSN_BYTES_U64, "x18 SP-writeback return")?;
     if !asm.branch_to(return_addr)? {
@@ -4062,50 +4016,47 @@ fn validate_gate_slot_inner_for_host(
         GateMetadata::X18StackWriteback { scratch } => {
             let anchor_scratch = ((word(4) >> RT2_SHIFT) & REG_MASK) as u8;
             let transformed = word(X18StackWritebackOffset::Transform.as_usize());
-            let Some((rt, rt2, delta, element_bytes)) = decode_x18_stack_writeback(transformed)
-            else {
-                return false;
-            };
-            let depth = 16u16
-                .checked_add(if delta < 0 { delta.unsigned_abs() } else { 0 })
-                .and_then(|depth| depth.checked_add(15))
-                .map(|depth| depth & !15);
-            let Some(frame_bytes) = depth else {
+            let Some(layout) = decode_x18_stack_writeback(transformed) else {
                 return false;
             };
             // Revalidate the original operand layout and scratch choices.
             let mut original = transformed;
-            if rt == scratch {
+            if layout.rt == scratch {
                 original = (original & !REG_MASK) | u32::from(X18);
             }
-            if rt2 == scratch {
+            if layout.rt2 == scratch {
                 original = (original & !(REG_MASK << RT2_SHIFT)) | (u32::from(X18) << RT2_SHIFT);
             }
             let Some(derived) = classify_x18_stack_writeback(original) else {
                 return false;
             };
             let mode = (transformed >> 23) & 3;
-            let access_start = if mode == 3 { i32::from(delta) } else { 0 };
-            let access_end = access_start + i32::from(element_bytes) * 2;
-            let frame_start = -i32::from(frame_bytes);
+            let access_start = if mode == 3 {
+                i32::from(layout.delta)
+            } else {
+                0
+            };
+            let access_end = access_start + i32::from(layout.element_bytes) * 2;
+            let frame_start = -i32::from(layout.frame_bytes);
             let frame_end = frame_start + i32::from(X18_FRAME_BYTES);
             let disjoint = access_end <= frame_start || access_start >= frame_end;
             if !(7..=17).contains(&scratch)
                 || !(7..=17).contains(&anchor_scratch)
                 || anchor_scratch == scratch
-                || (rt != scratch && rt2 != scratch)
-                || rt == anchor_scratch
-                || rt2 == anchor_scratch
+                || (layout.rt != scratch && layout.rt2 != scratch)
+                || layout.rt == anchor_scratch
+                || layout.rt2 == anchor_scratch
                 || derived.word != transformed
                 || derived.scratch != scratch
                 || derived.anchor_scratch != anchor_scratch
-                || derived.delta != delta
-                || derived.frame_bytes != frame_bytes
+                || derived.layout.delta != layout.delta
+                || derived.layout.element_bytes != layout.element_bytes
+                || derived.layout.frame_bytes != layout.frame_bytes
                 || !disjoint
             {
                 return false;
             }
-            exact(0, Insn::SubSp(frame_bytes))
+            exact(0, Insn::SubSp(layout.frame_bytes))
                 && exact(
                     4,
                     Insn::Stp {
@@ -4125,7 +4076,7 @@ fn validate_gate_slot_inner_for_host(
                         imm12: 0,
                     },
                 )
-                && exact(20, Insn::AddSp(frame_bytes))
+                && exact(20, Insn::AddSp(layout.frame_bytes))
                 && exact(
                     28,
                     Insn::AddImm {
@@ -4148,7 +4099,10 @@ fn validate_gate_slot_inner_for_host(
                 )
                 && exact(
                     44,
-                    Insn::AddSp(u16::try_from(i32::from(frame_bytes) + i32::from(delta)).unwrap()),
+                    Insn::AddSp(
+                        u16::try_from(i32::from(layout.frame_bytes) + i32::from(layout.delta))
+                            .unwrap(),
+                    ),
                 )
                 && word(48) & OPCODE_TOP6_MASK == Opcode::B.bits()
                 && padding_is_nops(52)
@@ -4475,22 +4429,7 @@ pub fn classify_copied_gate_slot(slot: &[u8], slot_vaddr: u64, pc: u64) -> Optio
     } else {
         0
     };
-    let (stack_delta, stack_frame_bytes) =
-        if matches!(metadata, GateMetadata::X18StackWriteback { .. }) {
-            let (_, _, delta, _) = decode_x18_stack_writeback(u32::from_le_bytes(
-                slot[X18StackWritebackOffset::Transform.as_usize()
-                    ..X18StackWritebackOffset::Transform.as_usize() + 4]
-                    .try_into()
-                    .ok()?,
-            ))?;
-            let frame = (16u16
-                .checked_add(if delta < 0 { delta.unsigned_abs() } else { 0 })?
-                .checked_add(15)?)
-                & !15;
-            (delta, frame)
-        } else {
-            (0, 0)
-        };
+    let (stack_delta, stack_frame_bytes) = stack_writeback_state(slot, metadata)?;
     Some(ClassifiedGate {
         slot_offset: 0,
         slot_size: u8::try_from(slot.len()).ok()?,
@@ -4574,22 +4513,7 @@ fn classify_gate_pc_with_candidates<const N: usize>(
             } else {
                 0
             };
-            let (stack_delta, stack_frame_bytes) =
-                if matches!(metadata, GateMetadata::X18StackWriteback { .. }) {
-                    let transform_offset = X18StackWritebackOffset::Transform.as_usize();
-                    let (_, _, delta, _) = decode_x18_stack_writeback(u32::from_le_bytes(
-                        slot[transform_offset..transform_offset + INSN_BYTES]
-                            .try_into()
-                            .ok()?,
-                    ))?;
-                    let frame = (16u16
-                        .checked_add(if delta < 0 { delta.unsigned_abs() } else { 0 })?
-                        .checked_add(15)?)
-                        & !15;
-                    (delta, frame)
-                } else {
-                    (0, 0)
-                };
+            let (stack_delta, stack_frame_bytes) = stack_writeback_state(slot, metadata)?;
             match_found = Some(ClassifiedGate {
                 slot_offset: start,
                 slot_size: u8::try_from(slot_size).ok()?,
@@ -4636,6 +4560,17 @@ fn is_host_anchor_read(word: u32, register: u8, host: Option<Host>) -> bool {
         },
         |host| host.anchor_read(register).encode() == Some(word),
     )
+}
+
+fn stack_writeback_state(slot: &[u8], metadata: GateMetadata) -> Option<(i16, u16)> {
+    if !matches!(metadata, GateMetadata::X18StackWriteback { .. }) {
+        return Some((0, 0));
+    }
+    let offset = X18StackWritebackOffset::Transform.as_usize();
+    let layout = decode_x18_stack_writeback(u32::from_le_bytes(
+        slot.get(offset..offset + INSN_BYTES)?.try_into().ok()?,
+    ))?;
+    Some((layout.delta, layout.frame_bytes))
 }
 
 fn x18_anchor_scratch(slot: &[u8], metadata: GateMetadata) -> Option<u8> {
@@ -5632,8 +5567,8 @@ mod tests {
         // stp x18, x19, [sp, #-16]!
         let original = 0xa9bf_4ff2;
         let pair = classify_x18_stack_writeback(original).unwrap();
-        assert_eq!(pair.delta, -16);
-        assert_eq!(pair.frame_bytes, 32);
+        assert_eq!(pair.layout.delta, -16);
+        assert_eq!(pair.layout.frame_bytes, 32);
         let (patched, outcome) = hook_words_opt_with_config(
             &[original],
             0x1000,
