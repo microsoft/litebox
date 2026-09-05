@@ -10,5 +10,7 @@
 #![cfg(target_os = "linux")]
 
 mod socket;
+mod sync;
 
 pub use socket::LinuxSocketProvider;
+pub use sync::LinuxSyncPrimitivesProvider;
