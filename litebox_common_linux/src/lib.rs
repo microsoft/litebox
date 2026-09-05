@@ -23,6 +23,10 @@ pub mod loader;
 pub mod mm;
 pub mod physical_pointers;
 pub mod signal;
+#[cfg(target_arch = "aarch64")]
+pub use signal::aarch64::GuestVectorState;
+#[cfg(not(target_arch = "aarch64"))]
+pub type GuestVectorState = ();
 pub mod user_pointers;
 pub mod vmap;
 

@@ -114,7 +114,6 @@ fn test_guest_x16_survives_asynchronous_resume() {
 
 #[test]
 #[cfg(target_arch = "aarch64")]
-#[ignore = "AArch64 FP/SIMD state is not preserved across guest transitions"]
 fn test_guest_simd_survives_signal_delivery() {
     let output = run_rewritten_fixture("./tests/sigreturn_simd.c", "sigreturn_simd_rewriter");
 

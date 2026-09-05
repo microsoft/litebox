@@ -28,13 +28,16 @@ use zerocopy::{FromBytes, IntoBytes};
 
 #[cfg(target_arch = "aarch64")]
 mod aarch64;
+#[cfg(all(test, target_arch = "aarch64"))]
+use aarch64::get_guest_vector_state;
 #[cfg(target_arch = "aarch64")]
 use aarch64::{
     Aarch64GateSignalResult, GateInterruption, assert_tls_block_placement,
     canonicalize_runtime_aarch64_gate_signal_context, copy_signal_context,
-    fatal_aarch64_gate_runtime_state, guest_thread_pointer_tp_offset, is_guest_thread,
-    load_tls_block_base, run_thread_arch, set_is_guest_thread, set_signal_return,
-    signal_handler_exit_guest, switch_to_guest, sync_instruction_stream, tls_offset,
+    fatal_aarch64_runtime_state, guest_thread_pointer_tp_offset, is_guest_thread,
+    load_tls_block_base, run_thread_arch, set_guest_vector_state, set_is_guest_thread,
+    set_signal_return, signal_handler_exit_guest, switch_to_guest, sync_instruction_stream,
+    tls_offset,
 };
 
 extern crate alloc;
@@ -960,7 +963,10 @@ fn thread_start(
         dyn litebox::shim::InitThread<ExecutionContext = litebox_common_linux::PtRegs>,
     >,
     mut ctx: litebox_common_linux::PtRegs,
+    #[cfg(target_arch = "aarch64")] vector_state: litebox_common_linux::GuestVectorState,
 ) {
+    #[cfg(target_arch = "aarch64")]
+    set_guest_vector_state(&vector_state);
     // Allow caller to run some code before we return to the new thread.
     let shim = init_thread.init();
 
@@ -1031,8 +1037,18 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
         >,
     ) -> Result<(), Self::ThreadSpawnError> {
         let ctx = ctx.clone();
+        #[cfg(target_arch = "aarch64")]
+        let vector_state =
+            litebox::platform::GuestVectorStateProvider::get_guest_vector_state(self);
         // TODO: do we need to wait for the handle in the main thread?
-        let _handle = std::thread::Builder::new().spawn(move || thread_start(init_thread, ctx))?;
+        let _handle = std::thread::Builder::new().spawn(move || {
+            thread_start(
+                init_thread,
+                ctx,
+                #[cfg(target_arch = "aarch64")]
+                vector_state,
+            );
+        })?;
 
         Ok(())
     }
@@ -2122,6 +2138,7 @@ fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
 fn signal_handler_exit_guest(
     _context: &libc::ucontext_t,
     set_interrupt: bool,
+    _capture_vector_state: bool,
 ) -> Option<*mut litebox_common_linux::PtRegs> {
     unsafe {
         let gsbase: u64;
@@ -2332,7 +2349,7 @@ unsafe extern "C" fn exception_signal_handler(
         return unsafe { next_signal_handler(signum, info, context) };
     }
 
-    let Some(regs) = signal_handler_exit_guest(context, false) else {
+    let Some(regs) = signal_handler_exit_guest(context, false, true) else {
         return unsafe { next_signal_handler(signum, info, context) };
     };
     #[cfg(target_arch = "x86_64")]
@@ -2359,7 +2376,7 @@ unsafe extern "C" fn exception_signal_handler(
                 unsafe { (*regs).syscallno = litebox_common_linux::arch::NO_SYSCALL };
             }
             Aarch64GateSignalResult::InvalidRuntimeState => {
-                fatal_aarch64_gate_runtime_state();
+                fatal_aarch64_runtime_state();
             }
         }
 
@@ -2632,11 +2649,11 @@ unsafe fn interrupt_signal_handler(
         return;
     }
 
-    let Some(regs) = signal_handler_exit_guest(context, true) else {
+    let in_switch_to_guest = in_switch_to_guest(ip);
+    let Some(regs) = signal_handler_exit_guest(context, true, !in_switch_to_guest) else {
         return;
     };
 
-    let in_switch_to_guest = in_switch_to_guest(ip);
     if in_switch_to_guest {
         // The saved guest context remains authoritative during restoration.
     } else {
@@ -2656,7 +2673,7 @@ unsafe fn interrupt_signal_handler(
                 unsafe { (*regs).syscallno = litebox_common_linux::arch::NO_SYSCALL };
             }
             Aarch64GateSignalResult::InvalidRuntimeState => {
-                fatal_aarch64_gate_runtime_state();
+                fatal_aarch64_runtime_state();
             }
         }
     }
@@ -2748,6 +2765,74 @@ mod tests {
     use litebox::platform::PageManagementProvider;
 
     extern crate std;
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn spawned_thread_installs_inherited_vector_state() {
+        use litebox::platform::{GuestVectorStateProvider as _, ThreadProvider as _};
+        use litebox::shim::{ContinueOperation, EnterShim, InitThread};
+
+        struct ObserveInit(std::sync::mpsc::Sender<litebox_common_linux::GuestVectorState>);
+        struct TerminateShim;
+
+        impl InitThread for ObserveInit {
+            type ExecutionContext = litebox_common_linux::PtRegs;
+
+            fn init(
+                self: Box<Self>,
+            ) -> Box<dyn EnterShim<ExecutionContext = Self::ExecutionContext>> {
+                self.0.send(super::get_guest_vector_state()).unwrap();
+                Box::new(TerminateShim)
+            }
+        }
+
+        impl EnterShim for TerminateShim {
+            type ExecutionContext = litebox_common_linux::PtRegs;
+
+            fn init(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+                ContinueOperation::Terminate
+            }
+
+            fn syscall(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+                unreachable!()
+            }
+
+            fn exception(
+                &self,
+                _ctx: &mut Self::ExecutionContext,
+                _info: &litebox::shim::ExceptionInfo,
+            ) -> ContinueOperation {
+                unreachable!()
+            }
+
+            fn interrupt(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+                unreachable!()
+            }
+        }
+
+        let platform = LinuxUserland::new();
+        let original = platform.get_guest_vector_state();
+        let expected = litebox_common_linux::GuestVectorState {
+            registers: core::array::from_fn(|index| index as u128 * 0x101),
+            fpsr: 0x1234,
+            fpcr: 0x5678,
+        };
+        platform.set_guest_vector_state(&expected);
+        let (send, receive) = std::sync::mpsc::channel();
+        unsafe {
+            platform
+                .spawn_thread(
+                    &litebox_common_linux::PtRegs::default(),
+                    Box::new(ObserveInit(send)),
+                )
+                .unwrap();
+        }
+        let observed = receive
+            .recv_timeout(core::time::Duration::from_secs(5))
+            .unwrap();
+        platform.set_guest_vector_state(&original);
+        assert_eq!(observed, expected);
+    }
 
     #[cfg(target_arch = "aarch64")]
     #[test]

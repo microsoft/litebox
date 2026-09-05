@@ -6,6 +6,17 @@
 use crate::AARCH64_GENERAL_REGISTER_COUNT;
 use zerocopy::{FromBytes, IntoBytes};
 
+/// Architectural AArch64 FP/SIMD state.
+///
+/// Aligned for paired Q-register loads and stores.
+#[repr(C, align(16))]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GuestVectorState {
+    pub registers: [u128; 32],
+    pub fpsr: u32,
+    pub fpcr: u32,
+}
+
 /// sigcontext for aarch64.
 /// See: <https://elixir.bootlin.com/linux/v5.19.17/source/arch/arm64/include/uapi/asm/sigcontext.h>
 ///
