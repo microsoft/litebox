@@ -1,7 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! LiteBox wait support.
+//! Synchronization primitives used by LiteBox.
+//!
+//! Portable locks are implemented by [`litebox_platform::sync`] and re-exported
+//! here. This module also provides LiteBox-specific futex support and the
+//! platform capability bound used by interruptible waits.
 
 pub mod futex;
 
