@@ -56,6 +56,39 @@ _start:
     cmp x21, x0
     b.ne fail
 
+    // Exercise the remaining non-exclusive integer pair operations with x18
+    // in Rt2, whose encoding is independent of Rt.
+    sub sp, sp, #16
+    mov x21, #0x2121
+    mov x18, #0x1818
+    stnp x21, x18, [sp]
+    mov x21, xzr
+    mov x18, xzr
+    ldnp x21, x18, [sp]
+    mov x0, #0x2121
+    cmp x21, x0
+    b.ne fail_pair_stack
+    mov x0, #0x1818
+    cmp x18, x0
+    b.ne fail_pair_stack
+
+    // LDPSW sign-extends both 32-bit words into its X-register destinations.
+    mov w21, #0x2121
+    mov w0, #-2
+    str w21, [sp]
+    str w0, [sp, #4]
+    mov x21, xzr
+    mov x18, xzr
+    ldpsw x21, x18, [sp]
+    mov x0, #0x2121
+    cmp x21, x0
+    b.ne fail_pair_stack
+    cmn x18, #2
+    b.ne fail_pair_stack
+    add sp, sp, #16
+    cmp sp, x19
+    b.ne fail
+
     mov x27, #15
     mov x0, #0x5050
     mov x1, #0x5151
@@ -261,6 +294,9 @@ success:
     mov x8, #93
     svc #0
 
+fail_pair_stack:
+    add sp, sp, #16
+    b fail
 fail_stack:
     add sp, sp, #16
 fail:

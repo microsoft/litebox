@@ -1234,7 +1234,11 @@ fn substitute_x18(word: u32, replacement: u8) -> Option<u32> {
                     (_, 1)
                         if matches!(
                             instruction.opcode,
-                            DecodedOpcode::STP | DecodedOpcode::LDP
+                            DecodedOpcode::STP
+                                | DecodedOpcode::LDP
+                                | DecodedOpcode::STNP
+                                | DecodedOpcode::LDNP
+                                | DecodedOpcode::LDPSW
                         ) =>
                     {
                         RT2_SHIFT
@@ -5231,7 +5235,10 @@ mod tests {
             (0x0b12_0063, 0x0b11_0063), // ADD Rm
             (0xf940_0642, 0xf940_0622), // memory base
             (0xf832_7824, 0xf831_7824), // memory index
-            (0xa906_4bee, 0xa906_47ee), // Rt2
+            (0xa906_4bee, 0xa906_47ee), // STP Rt2
+            (0xa801_480e, 0xa801_440e), // STNP Rt2
+            (0xa841_480e, 0xa841_440e), // LDNP Rt2
+            (0x6942_480e, 0x6942_440e), // LDPSW Rt2
             (0x9b08_486b, 0x9b08_446b), // MADD Ra
             (0x9b12_8c41, 0x9b11_8c41), // MSUB Rm
             (0x9b25_48a4, 0x9b25_44a4), // SMADDL Ra
