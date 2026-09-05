@@ -492,6 +492,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::EFAULT);
         };
 
+        // Linux installs the signal mask before validating and restoring the
+        // machine context. A malformed context therefore still changes it.
+        self.signals.set_signal_mask(uctx.sigmask);
+
         #[cfg(target_arch = "aarch64")]
         let result = {
             let Some(result) = arch::restore_sigcontext(self.global.platform, ctx, &uctx.mcontext)
@@ -505,7 +509,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let result = arch::restore_sigcontext(self.global.platform, ctx, &uctx.mcontext);
         // Restore the alternate signal stack, ignoring errors.
         self.signals.set_sigaltstack(uctx.stack).ok();
-        self.signals.set_signal_mask(uctx.sigmask);
         Ok(result)
     }
 

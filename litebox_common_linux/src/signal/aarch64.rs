@@ -6,7 +6,9 @@
 use crate::AARCH64_GENERAL_REGISTER_COUNT;
 use zerocopy::{FromBytes, IntoBytes};
 
-/// Architectural AArch64 FP/SIMD state carried by Linux signal contexts.
+/// Architectural AArch64 FP/SIMD state.
+///
+/// Aligned for paired Q-register loads and stores.
 #[repr(C, align(16))]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct GuestVectorState {

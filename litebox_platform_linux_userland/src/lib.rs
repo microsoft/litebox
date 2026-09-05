@@ -133,6 +133,15 @@ pub struct LinuxUserland {
     boot_id: std::sync::OnceLock<Vec<u8>>,
 }
 
+#[cfg(target_arch = "x86_64")]
+impl litebox::platform::GuestVectorStateProvider for LinuxUserland {
+    type GuestVectorState = ();
+
+    fn get_guest_vector_state(&self) {}
+
+    fn set_guest_vector_state(&self, _state: &()) {}
+}
+
 impl core::fmt::Debug for LinuxUserland {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("LinuxUserland").finish_non_exhaustive()

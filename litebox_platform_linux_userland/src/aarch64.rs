@@ -64,8 +64,6 @@ macro_rules! tprel_offset {
     }};
 }
 
-/// Guest FP/SIMD state in the kernel's `fpsimd_context` field order.
-/// The 16-byte alignment permits paired Q-register loads and stores.
 use litebox_common_linux::signal::aarch64::GuestVectorState;
 
 /// Layout of the AArch64 TLS control block.
@@ -1287,27 +1285,35 @@ impl litebox::platform::GuestVectorStateProvider for LinuxUserland {
     }
 }
 
+/// Returns a snapshot of the current thread's platform-owned guest vector state.
 pub(super) fn get_guest_vector_state() -> GuestVectorState {
     let block: usize;
+    // SAFETY: callers run on an initialized guest thread, whose TLS block owns
+    // this aligned slot. Volatile matches transition-assembly accesses.
     unsafe {
         core::arch::asm!(
             load_tls_block_base!("{block}"),
             block = out(reg) block,
             options(nomem, nostack, preserves_flags)
         );
-        ((block + tls_offset::GUEST_VECTOR_STATE) as *const GuestVectorState).read()
+        ((block + tls_offset::GUEST_VECTOR_STATE) as *const GuestVectorState).read_volatile()
     }
 }
 
+/// Replaces the current thread's platform-owned guest vector state.
 pub(super) fn set_guest_vector_state(state: &GuestVectorState) {
     let block: usize;
+    // SAFETY: callers run on an initialized guest thread with guest execution
+    // stopped, giving exclusive access to this aligned TLS slot. Volatile
+    // matches transition-assembly accesses.
     unsafe {
         core::arch::asm!(
             load_tls_block_base!("{block}"),
             block = out(reg) block,
             options(nomem, nostack, preserves_flags)
         );
-        ((block + tls_offset::GUEST_VECTOR_STATE) as *mut GuestVectorState).write(state.clone());
+        ((block + tls_offset::GUEST_VECTOR_STATE) as *mut GuestVectorState)
+            .write_volatile(state.clone());
     }
 }
 
