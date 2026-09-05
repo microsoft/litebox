@@ -38,7 +38,7 @@ fn ratchet_globals() -> Result<()> {
             ("litebox_broker_transport_linux_userland/", 1),
             ("litebox_broker_userland/", 1),
             ("litebox/", 7),
-            ("litebox_platform/", 3),
+            ("litebox_platform/", 2),
             ("litebox_platform_linux_kernel/", 5),
             ("litebox_platform_linux_userland/", 5),
             ("litebox_platform_lvbs/", 22),
