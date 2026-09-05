@@ -2798,8 +2798,7 @@ mod tests {
             context.uc_mcontext.pc = (SLOT + offset) as u64;
             context.uc_mcontext.sp = match offset {
                 0 | 24 => ORIGINAL_SP as u64,
-                28 => RESULT_SP as u64,
-                48 => RESULT_SP as u64,
+                28 | 48 => RESULT_SP as u64,
                 _ => FRAME as u64,
             };
             context.uc_mcontext.regs[usize::from(scratch)] = if matches!(offset, 16..=40) {

@@ -629,6 +629,7 @@ const SP: u8 = 31;
 const XZR: u8 = 31;
 
 const X18: u16 = 18;
+const X18_ENCODED: u8 = 18;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum X18Classification {
@@ -727,7 +728,8 @@ fn decode_x18_stack_writeback(word: u32) -> Option<X18StackWritebackLayout> {
         return None;
     }
     let element_bytes = if word >> 31 == 0 { 4 } else { 8 };
-    let imm7 = (((word >> IMM7_SHIFT) & u32::from(IMM7_MASK)) as i16) << 9 >> 9;
+    let encoded_imm7 = ((word >> IMM7_SHIFT) & u32::from(IMM7_MASK)).to_le_bytes()[0];
+    let imm7 = i16::from(encoded_imm7) << 9 >> 9;
     let delta = imm7.checked_mul(element_bytes)?;
     let depth = 16u16.checked_add(if delta < 0 { delta.unsigned_abs() } else { 0 })?;
     Some(X18StackWritebackLayout {
@@ -741,7 +743,7 @@ fn decode_x18_stack_writeback(word: u32) -> Option<X18StackWritebackLayout> {
 
 fn classify_x18_stack_writeback(word: u32) -> Option<X18StackWriteback> {
     let layout = decode_x18_stack_writeback(word)?;
-    if layout.rt != X18 as u8 && layout.rt2 != X18 as u8 {
+    if layout.rt != X18_ENCODED && layout.rt2 != X18_ENCODED {
         return None;
     }
     let instruction = decode_instruction(word)?;
