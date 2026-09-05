@@ -1794,7 +1794,8 @@ fn canonicalize_aarch64_gate_signal_context_with_kind(
             let restored = match plan.frame {
                 X18StackWritebackFrameState::AtSpRestoreRegisters
                 | X18StackWritebackFrameState::AtAnchorRestoreRegisters => {
-                    let mut words = [[0u8; size_of::<usize>()]; 2];
+                    const SCRATCH_REGISTER_COUNT: usize = 2;
+                    let mut words = [[0u8; size_of::<usize>()]; SCRATCH_REGISTER_COUNT];
                     if !read(frame.unwrap(), words.as_flattened_mut()) {
                         return Aarch64GateSignalResult::InvalidRuntimeState;
                     }

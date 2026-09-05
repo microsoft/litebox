@@ -731,7 +731,7 @@ fn decode_x18_stack_writeback(word: u32) -> Option<X18StackWritebackLayout> {
     let encoded_imm7 = ((word >> IMM7_SHIFT) & u32::from(IMM7_MASK)).to_le_bytes()[0];
     let imm7 = i16::from(encoded_imm7) << 9 >> 9;
     let delta = imm7.checked_mul(element_bytes)?;
-    let depth = 16u16.checked_add(if delta < 0 { delta.unsigned_abs() } else { 0 })?;
+    let depth = X18_FRAME_BYTES.checked_add(if delta < 0 { delta.unsigned_abs() } else { 0 })?;
     Some(X18StackWritebackLayout {
         rt: (word & REG_MASK) as u8,
         rt2: ((word >> RT2_SHIFT) & REG_MASK) as u8,
