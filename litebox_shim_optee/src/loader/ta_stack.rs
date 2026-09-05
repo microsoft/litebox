@@ -10,7 +10,7 @@ use litebox::{
 use litebox_common_optee::{LdelfArg, TeeParamType, UteeParamOwned, UteeParams};
 use zerocopy::IntoBytes;
 
-use crate::{Platform, TaMemrefAddresses, UserMutPtr, msg_handler::ShmInfo};
+use crate::{TaMemrefAddresses, UserMutPtr, msg_handler::ShmInfo};
 
 #[inline]
 fn align_down(addr: usize, align: usize) -> usize {

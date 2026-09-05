@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 use crate::NormalWorldMutPtr;
-use litebox::{mm::linux::PAGE_SIZE, platform::CrngProvider, utils::TruncateExt};
+use litebox::{LiteBox, mm::linux::PAGE_SIZE, utils::TruncateExt};
 use litebox_common_linux::errno::Errno;
 use num_enum::TryFromPrimitive;
 use p384::{NonZeroScalar, elliptic_curve::sec1::ToEncodedPoint};
@@ -116,7 +116,9 @@ fn generate_identity_signing_private_key()
     let mut private_key_bytes = Zeroizing::new([0u8; IDENTITY_SIGNING_PRIVATE_KEY_LEN]);
 
     for _ in 0..MAX_KEYGEN_ATTEMPT {
-        litebox_platform_multiplex::platform().fill_bytes_crng(&mut *private_key_bytes);
+        LiteBox::new(litebox_platform_multiplex::platform())
+            .fill_random(&mut private_key_bytes[..])
+            .map_err(|_| Errno::EIO)?;
         if is_valid_identity_signing_private_key(&private_key_bytes) {
             return Ok(private_key_bytes);
         }
