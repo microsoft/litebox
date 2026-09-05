@@ -2,7 +2,7 @@ NOTICES
 
 This repository incorporates material as listed below or described in the code.
 
-Component: RwLock and Mutex from Rust `std` (see `litebox/src/sync/{mutex,rwlock}.rs`)
+Component: RwLock and Mutex from Rust `std` (see `litebox_platform/src/sync/{mutex,rwlock}.rs`)
 
 Open Source License/Copyright Notice:
 

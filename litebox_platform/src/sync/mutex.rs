@@ -136,8 +136,16 @@ impl<Platform: RawSyncPrimitivesProvider> SpinEnabledRawMutex<Platform> {
 /// This structure is created by [`Mutex::lock`].
 pub struct MutexGuard<'a, Platform: RawSyncPrimitivesProvider, T: ?Sized + 'a> {
     mutex: &'a Mutex<Platform, T>,
+    _not_send: core::marker::PhantomData<*mut ()>,
     #[cfg(feature = "lock_tracing")]
     locked_witness: Option<LockedWitness>,
+}
+
+// SAFETY: Sharing a guard only exposes shared references to `T`, so it is safe
+// when `T` itself is `Sync`. The marker keeps the guard from being `Send`.
+unsafe impl<Platform: RawSyncPrimitivesProvider, T: Sync + ?Sized> Sync
+    for MutexGuard<'_, Platform, T>
+{
 }
 
 impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> core::ops::Deref
@@ -202,20 +210,25 @@ impl<Platform: RawSyncPrimitivesProvider, T> Mutex<Platform, T> {
     }
 
     /// Consumes this mutex and returns the protected value.
-    #[cfg(not(feature = "lock_tracing"))]
     pub fn into_inner(self) -> T {
-        self.data.into_inner()
-    }
+        #[cfg(feature = "lock_tracing")]
+        let mut lock = self;
+        #[cfg(not(feature = "lock_tracing"))]
+        let lock = self;
 
-    /// Consumes this mutex and returns the protected value.
-    #[cfg(feature = "lock_tracing")]
-    pub fn into_inner(mut self) -> T {
-        self.creation
-            .record_destruction_if_registered(LockType::Mutex, self.raw.raw.underlying_atomic());
-        let this = core::mem::ManuallyDrop::new(self);
-        // SAFETY: `self` is consumed and its destructor is suppressed, so the
-        // protected value can be moved out exactly once.
-        unsafe { core::ptr::read(&raw const this.data).into_inner() }
+        #[cfg(feature = "lock_tracing")]
+        lock.creation
+            .record_destruction_if_registered(LockType::Mutex, lock.raw.raw.underlying_atomic());
+        let lock = core::mem::ManuallyDrop::new(lock);
+        // SAFETY: `self` is consumed and its destructor is suppressed. Moving
+        // every field out prevents double-drops while allowing the raw mutex
+        // and tracing state to be destroyed normally.
+        unsafe {
+            let _raw = core::ptr::read(&raw const lock.raw);
+            #[cfg(feature = "lock_tracing")]
+            let _creation = core::ptr::read(&raw const lock.creation);
+            core::ptr::read(&raw const lock.data).into_inner()
+        }
     }
 }
 
@@ -247,6 +260,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> Mutex<Platform, T> {
 
         Some(MutexGuard {
             mutex: self,
+            _not_send: core::marker::PhantomData,
             #[cfg(feature = "lock_tracing")]
             locked_witness: attempt.map(super::lock_tracing::LockTracker::mark_lock),
         })
@@ -269,6 +283,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> Mutex<Platform, T> {
 
         MutexGuard {
             mutex: self,
+            _not_send: core::marker::PhantomData,
             #[cfg(feature = "lock_tracing")]
             locked_witness: attempt.map(super::lock_tracing::LockTracker::mark_lock),
         }

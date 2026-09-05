@@ -641,8 +641,9 @@ impl LockTrackerX {
         };
         let tracker = (CONFIG_PRINT_LOCK_ATTEMPTS
             || CONFIG_PRINT_CONTENDED_LOCKS
-            || CONFIG_PRINT_LOCKS_SLOWER_THAN.is_some())
-        .then(|| l_tracker.x.lock());
+            || CONFIG_PRINT_LOCKS_SLOWER_THAN.is_some()
+            || CONFIG_ENABLE_RECORDING)
+            .then(|| l_tracker.x.lock());
         let contended = if CONFIG_PRINT_CONTENDED_LOCKS || CONFIG_PRINT_LOCKS_SLOWER_THAN.is_some()
         {
             tracker
@@ -698,7 +699,9 @@ impl LockTrackerX {
         }
         LockAttemptWitness {
             locked,
-            start_time: tracker.as_ref().unwrap().platform.now(),
+            start_time: tracker
+                .as_ref()
+                .map_or(Duration::ZERO, |tracker| tracker.platform.now()),
             contended_with: contended.cloned(),
             tracker: l_tracker,
         }

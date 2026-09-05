@@ -2,6 +2,11 @@
 // Licensed under the MIT license.
 
 //! Platform synchronization contracts and portable lock implementations.
+//!
+//! The [`Mutex`] and [`RwLock`] implementations are derived from related
+//! source files in Rust's `std`. See `./cgmanifest.json` for the specific
+//! upstream commits. They are modified to operate through [`RawMutex`] rather
+//! than system interfaces and to support the optional lock-tracing feature.
 
 use core::sync::atomic::AtomicU32;
 use core::task::Waker;
@@ -99,4 +104,72 @@ pub enum UnblockedOrTimedOut {
     Unblocked,
     /// Sufficient time elapsed without a wake call.
     TimedOut,
+}
+
+#[cfg(test)]
+mod tests {
+    use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+    use core::time::Duration;
+
+    use super::{
+        ImmediatelyWokenUp, Mutex, RawMutex, RawMutexProvider, RwLock, UnblockedOrTimedOut,
+    };
+
+    static RAW_MUTEX_DROPS: AtomicUsize = AtomicUsize::new(0);
+
+    struct DroppingRawMutex {
+        state: AtomicU32,
+    }
+
+    impl Drop for DroppingRawMutex {
+        fn drop(&mut self) {
+            RAW_MUTEX_DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    impl RawMutex for DroppingRawMutex {
+        const INIT: Self = Self {
+            state: AtomicU32::new(0),
+        };
+
+        fn underlying_atomic(&self) -> &AtomicU32 {
+            &self.state
+        }
+
+        fn wake_many(&self, _count: usize) -> usize {
+            0
+        }
+
+        fn block(&self, _expected: u32) -> Result<(), ImmediatelyWokenUp> {
+            unreachable!("the test never contends on a lock")
+        }
+
+        fn block_or_timeout(
+            &self,
+            _expected: u32,
+            _timeout: Duration,
+        ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
+            unreachable!("the test never contends on a lock")
+        }
+    }
+
+    struct DroppingRawMutexProvider;
+
+    impl RawMutexProvider for DroppingRawMutexProvider {
+        type RawMutex = DroppingRawMutex;
+    }
+
+    #[test]
+    fn into_inner_drops_raw_mutexes() {
+        RAW_MUTEX_DROPS.store(0, Ordering::Relaxed);
+
+        assert_eq!(Mutex::<DroppingRawMutexProvider, _>::new(1).into_inner(), 1);
+        assert_eq!(RAW_MUTEX_DROPS.load(Ordering::Relaxed), 1);
+
+        assert_eq!(
+            RwLock::<DroppingRawMutexProvider, _>::new(2).into_inner(),
+            2
+        );
+        assert_eq!(RAW_MUTEX_DROPS.load(Ordering::Relaxed), 3);
+    }
 }
