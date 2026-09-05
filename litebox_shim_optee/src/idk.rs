@@ -162,7 +162,10 @@ mod tests {
         let message = b"IDK_S signing test message";
 
         let _task = init_platform();
-        let private_key = generate_identity_signing_private_key().unwrap();
+        // XXX: Use a fixed valid scalar so this unit test only exercises signing and
+        // verification; key generation requires the broker-backed platform RNG.
+        let mut private_key = [0u8; IDENTITY_SIGNING_PRIVATE_KEY_LEN];
+        private_key[IDENTITY_SIGNING_PRIVATE_KEY_LEN - 1] = 1;
         assert!(is_valid_identity_signing_private_key(&private_key));
         let signing_key = SigningKey::from_slice(&private_key[..]).unwrap();
         let public_key = identity_signing_public_key_from_private_key(&private_key).unwrap();
