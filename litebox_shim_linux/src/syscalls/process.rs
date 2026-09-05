@@ -15,8 +15,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 use litebox::event::wait::WaitError;
 use litebox::mm::linux::VmFlags;
+use litebox::platform::ArchSpecificRegister;
 use litebox::platform::TimerHandle;
-use litebox::platform::{ArchSpecificRegister, RawMutex as _};
 use litebox::platform::{Instant as _, SystemTime as _, TimeProvider};
 use litebox::sync::{Mutex, RwLock};
 use litebox::utils::TruncateExt as _;
@@ -24,6 +24,7 @@ use litebox_common_linux::{
     ArchPrctlArg, CloneFlags, FutexArgs, IntervalTimer, ItimerVal, PrctlArg, TimeParam,
     errno::Errno,
 };
+use litebox_platform::sync::{RawMutex as _, RawMutexProvider};
 
 /// Process-management-related state on [`Task`].
 pub(crate) struct ThreadState<Platform: ShimPlatform> {
@@ -116,7 +117,7 @@ impl<Platform: ShimPlatform> ThreadRemote<Platform> {
 pub(crate) struct Process<Platform: ShimPlatform> {
     /// Number of threads in this process. Always updated under the `inner`
     /// mutex lock.
-    nr_threads: <Platform as litebox::platform::RawMutexProvider>::RawMutex,
+    nr_threads: <Platform as RawMutexProvider>::RawMutex,
     inner: Mutex<Platform, ProcessInner<Platform>>,
     /// Resource limits for this process.
     pub(crate) limits: ResourceLimits<Platform>,
@@ -169,7 +170,7 @@ pub(crate) enum ExitStatus {
 impl<Platform: ShimPlatform> Process<Platform> {
     /// Creates a new process with the given initial thread.
     fn new(pid: i32, remote: Arc<ThreadRemote<Platform>>) -> Self {
-        let nr_threads = <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT;
+        let nr_threads = <Platform as RawMutexProvider>::RawMutex::INIT;
         nr_threads.underlying_atomic().store(1, Ordering::Relaxed);
         Self {
             nr_threads,

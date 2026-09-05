@@ -41,7 +41,8 @@ use core::pin::Pin;
 use core::ptr;
 use core::sync::atomic::Ordering;
 
-use crate::platform::RawMutex;
+use litebox_platform::sync::RawMutex;
+
 use crate::sync::Mutex;
 use crate::sync::RawSyncPrimitivesProvider;
 

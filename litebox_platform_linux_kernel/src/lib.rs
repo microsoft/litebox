@@ -13,11 +13,14 @@ use litebox::mm::linux::PageRange;
 use litebox::platform::RawPointerProvider;
 use litebox::platform::page_mgmt::FixedAddressBehavior;
 use litebox::platform::{
-    ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister, ImmediatelyWokenUp,
-    PageManagementProvider, Provider, RawMutexProvider, TimeProvider, UnblockedOrTimedOut,
-    WaitWakerProvider,
+    ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister, PageManagementProvider,
+    Provider, TimeProvider,
 };
 use litebox_common_linux::errno::Errno;
+use litebox_platform::sync::{
+    ImmediatelyWokenUp, RawMutex as RawMutexTrait, RawMutexProvider, UnblockedOrTimedOut,
+    WaitWakerProvider,
+};
 
 extern crate alloc;
 
@@ -139,7 +142,7 @@ impl<Host: HostInterface> RawMutexProvider for LinuxKernel<Host> {
 
 impl<Host: HostInterface> WaitWakerProvider for LinuxKernel<Host> {}
 
-/// An implementation of [`litebox::platform::RawMutex`]
+/// An implementation of [`litebox_platform::sync::RawMutex`].
 pub struct RawMutex<Host: HostInterface> {
     inner: AtomicU32,
     host: core::marker::PhantomData<fn(Host) -> Host>,
@@ -148,7 +151,7 @@ pub struct RawMutex<Host: HostInterface> {
 unsafe impl<Host: HostInterface> Send for RawMutex<Host> {}
 unsafe impl<Host: HostInterface> Sync for RawMutex<Host> {}
 
-impl<Host: HostInterface> litebox::platform::RawMutex for RawMutex<Host> {
+impl<Host: HostInterface> RawMutexTrait for RawMutex<Host> {
     const INIT: Self = Self::new();
 
     fn underlying_atomic(&self) -> &core::sync::atomic::AtomicU32 {
@@ -171,7 +174,7 @@ impl<Host: HostInterface> litebox::platform::RawMutex for RawMutex<Host> {
         &self,
         val: u32,
         time: core::time::Duration,
-    ) -> Result<litebox::platform::UnblockedOrTimedOut, ImmediatelyWokenUp> {
+    ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
         self.block_or_maybe_timeout(val, Some(time))
     }
 }

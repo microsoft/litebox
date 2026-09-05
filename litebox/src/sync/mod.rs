@@ -6,11 +6,15 @@
 //! The implementation for some of the components in this module (specifically, [`Mutex`] and
 //! [`RwLock`]) is derived from related source files in Rust's `std`. See `./cgmanifest.json` for a
 //! declaration of the specific commit hashes. The files have been modified significantly to support
-//! invoking through the [`platform`], rather than through regular system interfaces. Additionally,
+//! invoking through the [`crate::platform`], rather than through regular system interfaces.
+//! Additionally,
 //! support is added tracing locks through the `lock_tracing` conditional-compilation feature that
 //! can aid in debugging.
 
-use crate::platform;
+use litebox_platform::sync::{RawMutexProvider, WaitWakerProvider};
+
+#[cfg(feature = "lock_tracing")]
+use crate::platform::TimeProvider;
 
 mod condvar;
 pub mod futex;
@@ -31,28 +35,21 @@ pub use rwlock::{
 
 #[cfg(not(feature = "lock_tracing"))]
 /// A convenience name for specific requirements from the platform
-pub trait RawSyncPrimitivesProvider:
-    platform::RawMutexProvider + platform::WaitWakerProvider + Sync + 'static
-{
-}
+pub trait RawSyncPrimitivesProvider: RawMutexProvider + WaitWakerProvider + Sync + 'static {}
 #[cfg(not(feature = "lock_tracing"))]
 impl<Platform> RawSyncPrimitivesProvider for Platform where
-    Platform: platform::RawMutexProvider + platform::WaitWakerProvider + Sync + 'static
+    Platform: RawMutexProvider + WaitWakerProvider + Sync + 'static
 {
 }
 
 #[cfg(feature = "lock_tracing")]
 /// A convenience name for specific requirements from the platform
 pub trait RawSyncPrimitivesProvider:
-    platform::RawMutexProvider + platform::WaitWakerProvider + platform::TimeProvider + Sync + 'static
+    RawMutexProvider + WaitWakerProvider + TimeProvider + Sync + 'static
 {
 }
 #[cfg(feature = "lock_tracing")]
 impl<Platform> RawSyncPrimitivesProvider for Platform where
-    Platform: platform::RawMutexProvider
-        + platform::WaitWakerProvider
-        + platform::TimeProvider
-        + Sync
-        + 'static
+    Platform: RawMutexProvider + WaitWakerProvider + TimeProvider + Sync + 'static
 {
 }

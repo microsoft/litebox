@@ -11,7 +11,7 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
-use crate::platform::RawMutex;
+use litebox_platform::sync::RawMutex;
 
 #[cfg(feature = "lock_tracing")]
 use crate::sync::lock_tracing::{LockType, LockedWitness};

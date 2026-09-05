@@ -24,12 +24,10 @@
 
 use alloc::sync::Arc;
 use core::{marker::PhantomData, sync::atomic::Ordering};
+use litebox_platform::sync::{ImmediatelyWokenUp, RawMutex, UnblockedOrTimedOut};
 
 use crate::{
-    platform::{
-        ImmediatelyWokenUp, Instant as _, RawMutex, ThreadProvider, TimeProvider,
-        UnblockedOrTimedOut,
-    },
+    platform::{Instant as _, ThreadProvider, TimeProvider},
     sync::RawSyncPrimitivesProvider,
 };
 use thiserror::Error;

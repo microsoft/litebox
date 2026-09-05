@@ -15,14 +15,17 @@ use std::time::Duration;
 use std::unimplemented;
 
 use litebox::fs::OFlags;
-use litebox::platform::UnblockedOrTimedOut;
+use litebox::platform::RawConstPointer as _;
 use litebox::platform::page_mgmt::{
     CowAllocationError, FixedAddressBehavior, MemoryRegionPermissions,
 };
-use litebox::platform::{ImmediatelyWokenUp, RawConstPointer as _, WaitWakerProvider};
 use litebox::shim::ContinueOperation;
 use litebox::utils::{ReinterpretSignedExt, ReinterpretUnsignedExt as _, TruncateExt};
 use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, vmap::VmapManager};
+use litebox_platform::sync::{
+    ImmediatelyWokenUp, RawMutex as RawMutexTrait, RawMutexProvider, UnblockedOrTimedOut,
+    WaitWakerProvider,
+};
 
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -1154,7 +1157,7 @@ impl litebox::platform::TimerHandle for TimerHandle {
     }
 }
 
-impl litebox::platform::RawMutexProvider for LinuxUserland {
+impl RawMutexProvider for LinuxUserland {
     type RawMutex = RawMutex;
 }
 
@@ -1234,7 +1237,7 @@ impl RawMutex {
     }
 }
 
-impl litebox::platform::RawMutex for RawMutex {
+impl RawMutexTrait for RawMutex {
     const INIT: Self = Self::new();
 
     fn underlying_atomic(&self) -> &AtomicU32 {
@@ -2759,7 +2762,7 @@ mod tests {
     use std::thread::sleep;
 
     use litebox::fs::OFlags;
-    use litebox::platform::RawMutex;
+    use litebox_platform::sync::RawMutex;
 
     use crate::LinuxUserland;
     use litebox::platform::PageManagementProvider;

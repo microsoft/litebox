@@ -8,8 +8,8 @@ use core::sync::atomic::Ordering::{Acquire, Release};
 use litebox_broker_protocol::shared_buffer::{
     SHARED_BUFFER_SLOT_COUNT, SharedBufferDescriptor, SharedBufferSlotIndex,
 };
+use litebox_platform::sync::RawMutex as _;
 
-use crate::platform::RawMutex as _;
 use crate::sync::{Mutex, RawSyncPrimitivesProvider};
 
 const ALLOCATED_SLOT_MASK: u64 = (1 << SHARED_BUFFER_SLOT_COUNT) - 1;

@@ -19,9 +19,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 use litebox::platform::page_mgmt::{
     AllocationError, FixedAddressBehavior, MemoryRegionPermissions,
 };
-use litebox::platform::{ImmediatelyWokenUp, UnblockedOrTimedOut, WaitWakerProvider};
 use litebox::shim::{ContinueOperation, Exception};
 use litebox::utils::TruncateExt as _;
+use litebox_platform::sync::{
+    ImmediatelyWokenUp, RawMutex as RawMutexTrait, RawMutexProvider, UnblockedOrTimedOut,
+    WaitWakerProvider,
+};
 
 use windows_sys::Win32::Foundation::{self as Win32_Foundation, FILETIME};
 use windows_sys::Win32::{
@@ -1252,7 +1255,7 @@ fn is_in_ntdll_or_this(ip: usize) -> bool {
     bounds.iter().any(|b| b.contains(&ip))
 }
 
-impl litebox::platform::RawMutexProvider for WindowsUserland {
+impl RawMutexProvider for WindowsUserland {
     type RawMutex = RawMutex;
 }
 
@@ -1329,7 +1332,7 @@ impl RawMutex {
     }
 }
 
-impl litebox::platform::RawMutex for RawMutex {
+impl RawMutexTrait for RawMutex {
     const INIT: Self = Self::new();
 
     fn underlying_atomic(&self) -> &AtomicU32 {
@@ -2015,9 +2018,9 @@ mod tests {
     use crate::process_memory_range_by_regions;
     use litebox::platform::PageManagementProvider;
     use litebox::platform::RawConstPointer;
-    use litebox::platform::RawMutex;
     use litebox::platform::page_mgmt::FixedAddressBehavior;
     use litebox::platform::page_mgmt::MemoryRegionPermissions;
+    use litebox_platform::sync::RawMutex;
 
     #[test]
     fn test_raw_mutex() {

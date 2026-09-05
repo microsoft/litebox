@@ -78,7 +78,7 @@ pub trait ShimPlatform:
     + litebox::platform::TimeProvider
     + litebox::platform::PageManagementProvider<{ PAGE_SIZE }>
     + litebox::mm::linux::VmemPageFaultHandler
-    + litebox::platform::RawMutexProvider
+    + litebox_platform::sync::RawMutexProvider
     + litebox::sync::RawSyncPrimitivesProvider
     + litebox::platform::SystemInfoProvider
     + litebox::platform::ArchSpecificProvider
@@ -96,7 +96,7 @@ impl<T> ShimPlatform for T where
         + litebox::platform::TimeProvider
         + litebox::platform::PageManagementProvider<{ PAGE_SIZE }>
         + litebox::mm::linux::VmemPageFaultHandler
-        + litebox::platform::RawMutexProvider
+        + litebox_platform::sync::RawMutexProvider
         + litebox::sync::RawSyncPrimitivesProvider
         + litebox::platform::SystemInfoProvider
         + litebox::platform::ArchSpecificProvider

@@ -19,10 +19,9 @@ pub(crate) mod mock;
 use thiserror::Error;
 use zerocopy::{FromBytes, IntoBytes};
 
+use litebox_platform::sync::{RawMutexProvider, WaitWakerProvider};
+
 pub use arch::{ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister};
-pub use litebox_platform::sync::{
-    ImmediatelyWokenUp, RawMutex, RawMutexProvider, UnblockedOrTimedOut, WaitWakerProvider,
-};
 pub use page_mgmt::PageManagementProvider;
 pub use vector::GuestVectorStateProvider;
 

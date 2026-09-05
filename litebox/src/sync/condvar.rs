@@ -5,7 +5,7 @@
 
 #![expect(unused, reason = "currently unimplemented")]
 
-use crate::platform::RawMutexProvider;
+use litebox_platform::sync::{RawMutex, RawMutexProvider};
 
 /// Condition variables, roughly analogous to Rust's
 /// [`std::sync::Condvar`](https://doc.rust-lang.org/std/sync/struct.Condvar.html)
@@ -17,7 +17,7 @@ impl<Platform: RawMutexProvider> Condvar<Platform> {
     #[inline]
     pub(super) const fn new() -> Self {
         Self {
-            futex: <Platform::RawMutex as crate::platform::RawMutex>::INIT,
+            futex: <Platform::RawMutex as RawMutex>::INIT,
         }
     }
 }

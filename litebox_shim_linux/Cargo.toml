@@ -9,6 +9,7 @@ bitvec = { version = "1.0.1", default-features = false, features = ["alloc"] }
 bitflags = "2.13.1"
 litebox = { path = "../litebox/", version = "0.1.0" }
 litebox_common_linux = { path = "../litebox_common_linux/", version = "0.1.0" }
+litebox_platform = { path = "../litebox_platform", version = "0.1.0" }
 litebox_util_log = { version = "0.1.0", path = "../litebox_util_log" }
 once_cell = { version = "1.20.2", default-features = false, features = ["alloc", "race"] }
 thiserror = { version = "2.0.6", default-features = false }

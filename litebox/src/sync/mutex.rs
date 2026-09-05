@@ -7,15 +7,15 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
-use crate::platform::RawMutex as _;
+use litebox_platform::sync::{RawMutex as _, RawMutexProvider};
 
 #[cfg(feature = "lock_tracing")]
 use crate::sync::lock_tracing::{LockType, LockedWitness};
 
 use super::RawSyncPrimitivesProvider;
 
-/// A spin-enabled wrapper around [`platform::RawMutex`](crate::platform::RawMutex) to reduce the
-/// number of unnecessary calls out to platform.
+/// A spin-enabled wrapper around [`RawMutex`](litebox_platform::sync::RawMutex) to reduce the
+/// number of unnecessary calls out to the platform.
 struct SpinEnabledRawMutex<Platform: RawSyncPrimitivesProvider> {
     /// 0: unlocked
     /// 1: locked, no other threads waiting
@@ -24,7 +24,7 @@ struct SpinEnabledRawMutex<Platform: RawSyncPrimitivesProvider> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider> SpinEnabledRawMutex<Platform> {
-    /// Create a new [`SpinEnabledRawMutex`] from a [`RawMutex`](crate::platform::RawMutex).
+    /// Create a new [`SpinEnabledRawMutex`] from a [`RawMutex`](litebox_platform::sync::RawMutex).
     #[inline]
     const fn new(raw: Platform::RawMutex) -> Self {
         Self { raw }
@@ -196,9 +196,7 @@ impl<Platform: RawSyncPrimitivesProvider, T> Mutex<Platform, T> {
     #[cfg_attr(feature = "lock_tracing", track_caller)]
     pub const fn new(val: T) -> Self {
         Self {
-            raw: SpinEnabledRawMutex::new(
-                <Platform as crate::platform::RawMutexProvider>::RawMutex::INIT,
-            ),
+            raw: SpinEnabledRawMutex::new(<Platform as RawMutexProvider>::RawMutex::INIT),
             #[cfg(feature = "lock_tracing")]
             creation: super::lock_tracing::Creation::new(),
             data: UnsafeCell::new(val),
