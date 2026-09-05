@@ -4,6 +4,7 @@
 //! Broker synchronization primitives supplied by the deployment platform.
 
 use core::sync::atomic::AtomicU32;
+use core::time::Duration;
 
 mod mutex;
 mod rwlock;
@@ -41,6 +42,17 @@ pub trait RawMutex: Send + Sync + 'static {
     /// A wakeup does not imply that the atomic word changed. If the value
     /// changed before the caller blocked, this returns [`ImmediatelyWokenUp`].
     fn block(&self, expected: u32) -> Result<(), ImmediatelyWokenUp>;
+
+    /// Blocks while the underlying atomic word equals `expected`, or until
+    /// `timeout` elapses.
+    ///
+    /// If the value changed before the caller blocked, this returns
+    /// [`ImmediatelyWokenUp`].
+    fn block_or_timeout(
+        &self,
+        expected: u32,
+        timeout: Duration,
+    ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp>;
 }
 
 /// Broker platform capability that selects its raw mutex implementation.
@@ -60,3 +72,12 @@ impl<Provider> RawSyncPrimitivesProvider for Provider where
 /// Indicates that a raw mutex value changed before the caller could block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ImmediatelyWokenUp;
+
+/// Outcome of a raw mutex wait with a timeout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnblockedOrTimedOut {
+    /// The execution context was woken before the timeout elapsed.
+    Unblocked,
+    /// The timeout elapsed before a wake operation.
+    TimedOut,
+}
