@@ -769,7 +769,7 @@ fn x18_fixed_gate_can_execute(instruction: &DecodedInstruction) -> bool {
 }
 
 fn has_possible_x18_field(word: u32) -> bool {
-    // SVE ADD (vectors, unpredicated) uses these fields for Z registers only.
+    // Exclude vector-only SVE ADD, but retain scalar SVE x18 detection.
     if word & 0xFF20_FC00 == 0x0420_0000 {
         return false;
     }
@@ -4818,16 +4818,47 @@ mod tests {
             (0x0420_e3e7, X18Classification::None), // SVE cntb
             (0x2522_1ce1, X18Classification::None), // SVE whilelo
             (0x04e1_0012, X18Classification::None), // SVE add z18.d, z0.d, z1.d
+            (0x0432_0252, X18Classification::None), // SVE add z18.b, z18.b, z18.b
+            (0x0472_0252, X18Classification::None), // SVE add z18.h, z18.h, z18.h
+            (0x04b2_0252, X18Classification::None), // SVE add z18.s, z18.s, z18.s
+            (0x04f2_0252, X18Classification::None), // SVE add z18.d, z18.d, z18.d
             (0xa400_a020, X18Classification::None), // SVE ld1b
             (0xe400_e060, X18Classification::None), // SVE st1b
-            (
-                0xa5e0_a240, // SVE ld1d { z0.d }, p0/z, [x18]
+        ] {
+            assert_eq!(classify_x18(word), expected, "word {word:#010x}");
+        }
+    }
+
+    #[test]
+    fn sve_scalar_x18_operands_are_trapped() {
+        for word in [
+            0x0420_e3f2, // cntb x18
+            0x04f2_e3f2, // incd x18, all, mul #3
+            0x25e1_1e40, // whilelo p0.d, x18, x1
+            0x25f2_1c00, // whilelo p0.d, x0, x18
+            0xa5e0_a240, // ld1d { z0.d }, p0/z, [x18]
+            0xe5e0_e240, // st1d { z0.d }, p0, [x18]
+            0xa5f2_4000, // ld1d { z0.d }, p0/z, [x0, x18, lsl #3]
+        ] {
+            assert_eq!(
+                classify_x18(word),
                 X18Classification::X18(X18TransformResult::Unsupported(
                     X18Unsupported::DecodeFailure,
                 )),
-            ),
-        ] {
-            assert_eq!(classify_x18(word), expected, "word {word:#010x}");
+                "word {word:#010x}"
+            );
+            let (patched, outcome) =
+                hook_words_opt_with_config(&[word], 0x1000, 0x2000, x18_config(Host::Linux));
+            assert_eq!(
+                word_at(&patched, 0),
+                Insn::Brk(TRAP_BRK_IMM).encode().unwrap(),
+                "word {word:#010x}"
+            );
+            assert_eq!(outcome.unwrap().trapped_sites, vec![0x1000]);
+
+            let (native, outcome) = hook_words_opt(&[word], 0x1000, 0x2000);
+            assert_eq!(word_at(&native, 0), word);
+            assert!(outcome.is_none());
         }
     }
 
