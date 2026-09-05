@@ -1,51 +1,50 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Higher-level synchronization primitives
+//! Synchronization primitives used by LiteBox.
 //!
-//! The implementation for some of the components in this module (specifically, [`Mutex`] and
-//! [`RwLock`]) is derived from related source files in Rust's `std`. See `./cgmanifest.json` for a
-//! declaration of the specific commit hashes. The files have been modified significantly to support
-//! invoking through the [`platform`], rather than through regular system interfaces. Additionally,
-//! support is added tracing locks through the `lock_tracing` conditional-compilation feature that
-//! can aid in debugging.
+//! Portable locks are implemented by [`litebox_platform::sync`] and re-exported
+//! here. This module also provides LiteBox-specific futex support and the
+//! platform capability bound used by interruptible waits.
 
-use crate::platform;
-
-mod condvar;
 pub mod futex;
-mod mutex;
-mod rwlock;
 
+pub use litebox_platform::sync::{
+    MappedRwLockReadGuard, MappedRwLockWriteGuard, Mutex, MutexGuard, RwLock, RwLockReadGuard,
+    RwLockWriteGuard,
+};
 #[cfg(feature = "lock_tracing")]
-pub(crate) mod lock_tracing;
-
-#[cfg(feature = "lock_tracing")]
-pub use lock_tracing::{RecordingSummary, flush_to_jsonl, start_recording, stop_recording};
-
-pub use condvar::Condvar;
-pub use mutex::{Mutex, MutexGuard};
-pub use rwlock::{
-    MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
+pub use litebox_platform::sync::{
+    RecordingSummary, flush_to_jsonl, start_recording, stop_recording,
 };
 
 #[cfg(not(feature = "lock_tracing"))]
 /// A convenience name for specific requirements from the platform
-pub trait RawSyncPrimitivesProvider: platform::RawMutexProvider + Sync + 'static {}
+pub trait RawSyncPrimitivesProvider:
+    litebox_platform::sync::RawSyncPrimitivesProvider + litebox_platform::sync::WaitWakerProvider
+{
+}
+
 #[cfg(not(feature = "lock_tracing"))]
 impl<Platform> RawSyncPrimitivesProvider for Platform where
-    Platform: platform::RawMutexProvider + Sync + 'static
+    Platform: litebox_platform::sync::RawSyncPrimitivesProvider
+        + litebox_platform::sync::WaitWakerProvider
 {
 }
 
 #[cfg(feature = "lock_tracing")]
 /// A convenience name for specific requirements from the platform
 pub trait RawSyncPrimitivesProvider:
-    platform::RawMutexProvider + platform::TimeProvider + Sync + 'static
+    litebox_platform::sync::RawSyncPrimitivesProvider
+    + litebox_platform::sync::WaitWakerProvider
+    + litebox_platform::time::TimeProvider
 {
 }
+
 #[cfg(feature = "lock_tracing")]
 impl<Platform> RawSyncPrimitivesProvider for Platform where
-    Platform: platform::RawMutexProvider + platform::TimeProvider + Sync + 'static
+    Platform: litebox_platform::sync::RawSyncPrimitivesProvider
+        + litebox_platform::sync::WaitWakerProvider
+        + litebox_platform::time::TimeProvider
 {
 }

@@ -10,11 +10,11 @@ use core::{
 };
 
 use bitflags::bitflags;
+use litebox_platform::time::TimeProvider;
 
 use crate::{
     LiteBox,
     net::socket_channel::NetworkProxy,
-    platform::{self, TimeProvider},
     sync::{self, RawSyncPrimitivesProvider},
 };
 
@@ -71,7 +71,7 @@ pub enum ShutdownDirection {
 /// nonblocking I/O and readiness notification.
 pub struct Network<Platform>
 where
-    Platform: platform::TimeProvider + sync::RawSyncPrimitivesProvider,
+    Platform: TimeProvider + sync::RawSyncPrimitivesProvider,
 {
     litebox: LiteBox<Platform>,
     /// FDs that are queued for eventual closure while another operation pins their entry.
@@ -80,7 +80,7 @@ where
 
 impl<Platform> Network<Platform>
 where
-    Platform: platform::TimeProvider + sync::RawSyncPrimitivesProvider,
+    Platform: TimeProvider + sync::RawSyncPrimitivesProvider,
 {
     /// Construct a new `Network` instance.
     pub fn new(litebox: &LiteBox<Platform>) -> Self {
@@ -125,7 +125,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> SocketHandle<Platform> 
 
 impl<Platform> Network<Platform>
 where
-    Platform: platform::TimeProvider + sync::RawSyncPrimitivesProvider,
+    Platform: TimeProvider + sync::RawSyncPrimitivesProvider,
 {
     /// Creates a broker-owned TCP or UDP socket.
     ///
@@ -674,9 +674,9 @@ pub enum CloseBehavior {
 }
 
 crate::fd::enable_fds_for_subsystem! {
-    @Platform: { platform::TimeProvider + sync::RawSyncPrimitivesProvider };
+    @Platform: { TimeProvider + sync::RawSyncPrimitivesProvider };
     Network<Platform>;
-    @Platform: { platform::TimeProvider + sync::RawSyncPrimitivesProvider };
+    @Platform: { TimeProvider + sync::RawSyncPrimitivesProvider };
     SocketHandle<Platform>;
     -> SocketFd<Platform>;
 }

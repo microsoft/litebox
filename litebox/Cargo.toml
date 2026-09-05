@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-arrayvec = { version = "0.7.6", default-features = false, optional = true }
 bitflags = "2.13.1"
 hashbrown = "0.15.2"
 smallvec = "1.13.2"
@@ -20,6 +19,7 @@ litebox_util_log = { version = "0.1.0", path = "../litebox_util_log" }
 litebox_broker_local = { version = "0.1.0", path = "../litebox_broker_local" }
 litebox_broker_protocol = { version = "0.1.0", path = "../litebox_broker_protocol" }
 litebox_broker_transport = { version = "0.1.0", path = "../litebox_broker_transport" }
+litebox_platform = { version = "0.1.0", path = "../litebox_platform" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60.2", features = [
@@ -31,7 +31,7 @@ windows-sys = { version = "0.60.2", features = [
 ]}
 
 [features]
-lock_tracing = ["dep:arrayvec", "spin/mutex"]
+lock_tracing = ["litebox_platform/lock_tracing"]
 panic_on_unclosed_fd_drop = []
 enforce_singleton_litebox_instance = []
 

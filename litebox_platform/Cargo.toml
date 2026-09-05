@@ -1,0 +1,15 @@
+[package]
+name = "litebox_platform"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+arrayvec = { version = "0.7.6", default-features = false, optional = true }
+litebox_util_log = { version = "0.1.0", path = "../litebox_util_log", optional = true }
+spin = { version = "0.9.8", default-features = false, features = ["mutex", "once", "spin_mutex"], optional = true }
+
+[features]
+lock_tracing = ["dep:arrayvec", "dep:litebox_util_log", "dep:spin"]
+
+[lints]
+workspace = true

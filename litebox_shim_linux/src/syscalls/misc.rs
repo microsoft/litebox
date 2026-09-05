@@ -6,9 +6,10 @@
 //! Examples of syscalls handled here include `getrandom`, `uname`, and similar operations.
 
 use crate::{ShimPlatform, Task};
-use litebox::{platform::Instant as _, utils::TruncateExt as _};
+use litebox::utils::TruncateExt as _;
 use litebox_common_linux::errno::Errno;
 use litebox_common_linux::user_pointers::UserPtrMut;
+use litebox_platform::time::Instant as _;
 
 impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `getrandom`.

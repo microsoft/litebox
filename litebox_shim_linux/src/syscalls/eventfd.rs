@@ -14,10 +14,10 @@ use litebox::{
     },
     fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry},
     fs::OFlags,
-    platform::TimeProvider,
     sync::RawSyncPrimitivesProvider,
 };
 use litebox_common_linux::{EfdFlags, errno::Errno};
+use litebox_platform::time::TimeProvider;
 
 use crate::{GlobalState, ShimPlatform};
 

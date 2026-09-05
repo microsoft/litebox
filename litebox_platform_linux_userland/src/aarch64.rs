@@ -2146,7 +2146,7 @@ pub(super) fn set_signal_return(
 mod tests {
     use super::*;
     use core::mem::offset_of;
-    use litebox::platform::{RawMutexProvider, SystemInfoProvider as _};
+    use litebox::platform::SystemInfoProvider as _;
     use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
     use litebox_common_linux::PtRegs;
     use litebox_common_linux::signal::{SigSet, Signal};
@@ -3735,15 +3735,14 @@ mod tests {
     #[test]
     fn test_update_waker_exchange() {
         let platform = LinuxUserland::new();
-        let wait_state = litebox::event::wait::WaitState::new(platform);
 
         assert_eq!(read_tls_slot!(usize, tls_offset::WAIT_WAKER_ADDR), 0);
 
-        platform.update_waker(Some(wait_state.context().waker().clone()));
+        platform.update_waker(Some(core::task::Waker::noop().clone()));
         let first = read_tls_slot!(usize, tls_offset::WAIT_WAKER_ADDR);
         assert_ne!(first, 0, "update_waker must publish the boxed waker");
 
-        platform.update_waker(Some(wait_state.context().waker().clone()));
+        platform.update_waker(Some(core::task::Waker::noop().clone()));
         let second = read_tls_slot!(usize, tls_offset::WAIT_WAKER_ADDR);
         assert_ne!(second, 0);
 

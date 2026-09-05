@@ -7,15 +7,13 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
-use crate::platform::RawMutex as _;
+use super::{RawMutex as _, RawMutexProvider, RawSyncPrimitivesProvider};
 
 #[cfg(feature = "lock_tracing")]
-use crate::sync::lock_tracing::{LockType, LockedWitness};
+use super::lock_tracing::{LockType, LockedWitness};
 
-use super::RawSyncPrimitivesProvider;
-
-/// A spin-enabled wrapper around [`platform::RawMutex`](crate::platform::RawMutex) to reduce the
-/// number of unnecessary calls out to platform.
+/// A spin-enabled wrapper around [`RawMutex`](super::RawMutex) to reduce the number of unnecessary
+/// calls out to the platform.
 struct SpinEnabledRawMutex<Platform: RawSyncPrimitivesProvider> {
     /// 0: unlocked
     /// 1: locked, no other threads waiting
@@ -24,7 +22,7 @@ struct SpinEnabledRawMutex<Platform: RawSyncPrimitivesProvider> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider> SpinEnabledRawMutex<Platform> {
-    /// Create a new [`SpinEnabledRawMutex`] from a [`RawMutex`](crate::platform::RawMutex).
+    /// Create a new [`SpinEnabledRawMutex`] from a [`RawMutex`](super::RawMutex).
     #[inline]
     const fn new(raw: Platform::RawMutex) -> Self {
         Self { raw }
@@ -138,8 +136,16 @@ impl<Platform: RawSyncPrimitivesProvider> SpinEnabledRawMutex<Platform> {
 /// This structure is created by [`Mutex::lock`].
 pub struct MutexGuard<'a, Platform: RawSyncPrimitivesProvider, T: ?Sized + 'a> {
     mutex: &'a Mutex<Platform, T>,
+    _not_send: core::marker::PhantomData<*mut ()>,
     #[cfg(feature = "lock_tracing")]
     locked_witness: Option<LockedWitness>,
+}
+
+// SAFETY: Sharing a guard only exposes shared references to `T`, so it is safe
+// when `T` itself is `Sync`. The marker keeps the guard from being `Send`.
+unsafe impl<Platform: RawSyncPrimitivesProvider, T: Sync + ?Sized> Sync
+    for MutexGuard<'_, Platform, T>
+{
 }
 
 impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> core::ops::Deref
@@ -196,24 +202,39 @@ impl<Platform: RawSyncPrimitivesProvider, T> Mutex<Platform, T> {
     #[cfg_attr(feature = "lock_tracing", track_caller)]
     pub const fn new(val: T) -> Self {
         Self {
-            raw: SpinEnabledRawMutex::new(
-                <Platform as crate::platform::RawMutexProvider>::RawMutex::INIT,
-            ),
+            raw: SpinEnabledRawMutex::new(<Platform as RawMutexProvider>::RawMutex::INIT),
             #[cfg(feature = "lock_tracing")]
             creation: super::lock_tracing::Creation::new(),
             data: UnsafeCell::new(val),
         }
     }
+
+    /// Consumes this mutex and returns the protected value.
+    #[cfg(not(feature = "lock_tracing"))]
+    pub fn into_inner(self) -> T {
+        self.data.into_inner()
+    }
+
+    /// Consumes this mutex and returns the protected value.
+    #[cfg(feature = "lock_tracing")]
+    pub fn into_inner(mut self) -> T {
+        self.creation
+            .record_destruction_if_registered(LockType::Mutex, self.raw.raw.underlying_atomic());
+        let this = core::mem::ManuallyDrop::new(self);
+        // SAFETY: `self` is consumed and its destructor is suppressed, so the
+        // protected value can be moved out exactly once.
+        unsafe { core::ptr::read(&raw const this.data).into_inner() }
+    }
 }
 
 // SAFETY: `Mutex<T>` inherits `Send` from `T`.
-unsafe impl<Platform: RawSyncPrimitivesProvider, T: Send> Send for Mutex<Platform, T> {}
+unsafe impl<Platform: RawSyncPrimitivesProvider, T: Send + ?Sized> Send for Mutex<Platform, T> {}
 // SAFETY: `Mutex` provides mutually exclusive access to `T`, so it's OK to
 // share a reference to it between threads as long as `T` can be _sent_ between
 // threads.
-unsafe impl<Platform: RawSyncPrimitivesProvider, T: Send> Sync for Mutex<Platform, T> {}
+unsafe impl<Platform: RawSyncPrimitivesProvider, T: Send + ?Sized> Sync for Mutex<Platform, T> {}
 
-impl<Platform: RawSyncPrimitivesProvider, T> Mutex<Platform, T> {
+impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> Mutex<Platform, T> {
     /// Attempts to acquire this mutex without blocking.
     #[inline]
     #[track_caller]
@@ -234,6 +255,7 @@ impl<Platform: RawSyncPrimitivesProvider, T> Mutex<Platform, T> {
 
         Some(MutexGuard {
             mutex: self,
+            _not_send: core::marker::PhantomData,
             #[cfg(feature = "lock_tracing")]
             locked_witness: attempt.map(super::lock_tracing::LockTracker::mark_lock),
         })
@@ -256,6 +278,7 @@ impl<Platform: RawSyncPrimitivesProvider, T> Mutex<Platform, T> {
 
         MutexGuard {
             mutex: self,
+            _not_send: core::marker::PhantomData,
             #[cfg(feature = "lock_tracing")]
             locked_witness: attempt.map(super::lock_tracing::LockTracker::mark_lock),
         }
@@ -266,8 +289,7 @@ impl<Platform: RawSyncPrimitivesProvider, T> Mutex<Platform, T> {
     /// This is safe because we have `&mut self`, so no other threads can access
     /// the data.
     pub fn get_mut(&mut self) -> &mut T {
-        // SAFETY: We have &mut self, so no other threads can have access to the data.
-        unsafe { &mut *self.data.get() }
+        self.data.get_mut()
     }
 }
 

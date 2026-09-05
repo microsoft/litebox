@@ -17,10 +17,11 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::RawSyncPrimitivesProvider;
 use crate::event::wait::{WaitContext, WaitError, Waker};
+use crate::platform::RawConstPointer as _;
 use crate::platform::RawPointerProvider;
-use crate::platform::{RawConstPointer as _, TimeProvider};
 use crate::utilities::loan_list::{LoanList, LoanListEntry};
 use crate::utils::TruncateExt as _;
+use litebox_platform::time::TimeProvider;
 use thiserror::Error;
 
 /// A manager of all available futexes.

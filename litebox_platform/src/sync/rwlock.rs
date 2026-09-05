@@ -11,12 +11,10 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
-use crate::platform::RawMutex;
+use super::{RawMutex, RawSyncPrimitivesProvider};
 
 #[cfg(feature = "lock_tracing")]
-use crate::sync::lock_tracing::{LockType, LockedWitness};
-
-use super::RawSyncPrimitivesProvider;
+use super::lock_tracing::{LockType, LockedWitness};
 
 struct RawRwLock<Platform: RawSyncPrimitivesProvider> {
     // The state consists of a 30-bit reader counter, a 'readers waiting' flag, and a 'writers waiting' flag.
@@ -401,33 +399,36 @@ pub struct RwLock<Platform: RawSyncPrimitivesProvider, T: ?Sized> {
     data: UnsafeCell<T>,
 }
 
-pub struct RwLockReadGuard<'a, Platform: RawSyncPrimitivesProvider, T> {
+pub struct RwLockReadGuard<'a, Platform: RawSyncPrimitivesProvider, T: ?Sized> {
     rwlock: &'a RwLock<Platform, T>,
     #[cfg(feature = "lock_tracing")]
     locked_witness: Option<LockedWitness>,
 }
 
-pub struct MappedRwLockReadGuard<'a, Platform: RawSyncPrimitivesProvider, T> {
+pub struct MappedRwLockReadGuard<'a, Platform: RawSyncPrimitivesProvider, T: ?Sized> {
     data: core::ptr::NonNull<T>,
     raw_lock: &'a RawRwLock<Platform>,
     #[cfg(feature = "lock_tracing")]
     locked_witness: Option<LockedWitness>,
 }
 
-pub struct RwLockWriteGuard<'a, Platform: RawSyncPrimitivesProvider, T> {
+pub struct RwLockWriteGuard<'a, Platform: RawSyncPrimitivesProvider, T: ?Sized> {
     rwlock: &'a RwLock<Platform, T>,
     #[cfg(feature = "lock_tracing")]
     locked_witness: Option<LockedWitness>,
 }
 
-pub struct MappedRwLockWriteGuard<'a, Platform: RawSyncPrimitivesProvider, T> {
+pub struct MappedRwLockWriteGuard<'a, Platform: RawSyncPrimitivesProvider, T: ?Sized> {
     data: core::ptr::NonNull<T>,
     raw_lock: &'a RawRwLock<Platform>,
+    _variance: core::marker::PhantomData<&'a mut T>,
     #[cfg(feature = "lock_tracing")]
     locked_witness: Option<LockedWitness>,
 }
 
-impl<Platform: RawSyncPrimitivesProvider, T> core::ops::Deref for RwLockReadGuard<'_, Platform, T> {
+impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> core::ops::Deref
+    for RwLockReadGuard<'_, Platform, T>
+{
     type Target = T;
 
     fn deref(&self) -> &T {
@@ -435,7 +436,7 @@ impl<Platform: RawSyncPrimitivesProvider, T> core::ops::Deref for RwLockReadGuar
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider, T> Drop for RwLockReadGuard<'_, Platform, T> {
+impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> Drop for RwLockReadGuard<'_, Platform, T> {
     fn drop(&mut self) {
         #[cfg(feature = "lock_tracing")]
         if let Some(witness) = &mut self.locked_witness {
@@ -448,7 +449,7 @@ impl<Platform: RawSyncPrimitivesProvider, T> Drop for RwLockReadGuard<'_, Platfo
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider, T> core::ops::Deref
+impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> core::ops::Deref
     for RwLockWriteGuard<'_, Platform, T>
 {
     type Target = T;
@@ -458,7 +459,7 @@ impl<Platform: RawSyncPrimitivesProvider, T> core::ops::Deref
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider, T> core::ops::DerefMut
+impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> core::ops::DerefMut
     for RwLockWriteGuard<'_, Platform, T>
 {
     fn deref_mut(&mut self) -> &mut T {
@@ -466,7 +467,7 @@ impl<Platform: RawSyncPrimitivesProvider, T> core::ops::DerefMut
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider, T> Drop for RwLockWriteGuard<'_, Platform, T> {
+impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> Drop for RwLockWriteGuard<'_, Platform, T> {
     fn drop(&mut self) {
         #[cfg(feature = "lock_tracing")]
         if let Some(witness) = &mut self.locked_witness {
@@ -479,7 +480,7 @@ impl<Platform: RawSyncPrimitivesProvider, T> Drop for RwLockWriteGuard<'_, Platf
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider, T> core::ops::Deref
+impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> core::ops::Deref
     for MappedRwLockReadGuard<'_, Platform, T>
 {
     type Target = T;
@@ -489,7 +490,9 @@ impl<Platform: RawSyncPrimitivesProvider, T> core::ops::Deref
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider, T> Drop for MappedRwLockReadGuard<'_, Platform, T> {
+impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> Drop
+    for MappedRwLockReadGuard<'_, Platform, T>
+{
     fn drop(&mut self) {
         #[cfg(feature = "lock_tracing")]
         if let Some(witness) = &mut self.locked_witness {
@@ -501,7 +504,7 @@ impl<Platform: RawSyncPrimitivesProvider, T> Drop for MappedRwLockReadGuard<'_, 
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider, T> core::ops::Deref
+impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> core::ops::Deref
     for MappedRwLockWriteGuard<'_, Platform, T>
 {
     type Target = T;
@@ -511,7 +514,7 @@ impl<Platform: RawSyncPrimitivesProvider, T> core::ops::Deref
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider, T> core::ops::DerefMut
+impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> core::ops::DerefMut
     for MappedRwLockWriteGuard<'_, Platform, T>
 {
     fn deref_mut(&mut self) -> &mut T {
@@ -519,7 +522,9 @@ impl<Platform: RawSyncPrimitivesProvider, T> core::ops::DerefMut
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider, T> Drop for MappedRwLockWriteGuard<'_, Platform, T> {
+impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> Drop
+    for MappedRwLockWriteGuard<'_, Platform, T>
+{
     fn drop(&mut self) {
         #[cfg(feature = "lock_tracing")]
         if let Some(witness) = &mut self.locked_witness {
@@ -532,7 +537,7 @@ impl<Platform: RawSyncPrimitivesProvider, T> Drop for MappedRwLockWriteGuard<'_,
     }
 }
 
-impl<'a, Platform: RawSyncPrimitivesProvider, T> RwLockReadGuard<'a, Platform, T> {
+impl<'a, Platform: RawSyncPrimitivesProvider, T: ?Sized> RwLockReadGuard<'a, Platform, T> {
     /// Makes a `MappedRwLockReadGuard` for a component of the borrowed data, e.g. an enum variant.
     ///
     /// The `RwLock` is already locked for reading, so this cannot fail.
@@ -540,7 +545,10 @@ impl<'a, Platform: RawSyncPrimitivesProvider, T> RwLockReadGuard<'a, Platform, T
     /// This is an associated function that needs to be used as `RwLockReadGuard::map(...)`. A
     /// method would interfere with methods of the same name on the contents of the `RwLockReadGuard`
     /// used through `Deref`.
-    pub fn map<U, F: FnOnce(&T) -> &U>(orig: Self, f: F) -> MappedRwLockReadGuard<'a, Platform, U> {
+    pub fn map<U: ?Sized, F: FnOnce(&T) -> &U>(
+        orig: Self,
+        f: F,
+    ) -> MappedRwLockReadGuard<'a, Platform, U> {
         let data_t: *mut T = orig.rwlock.data.get();
         let data_t: *const T = data_t;
         // SAFETY: We are holding a read-lock to the underlying T, thus it is safe to dereference
@@ -563,7 +571,7 @@ impl<'a, Platform: RawSyncPrimitivesProvider, T> RwLockReadGuard<'a, Platform, T
     }
 }
 
-impl<'a, Platform: RawSyncPrimitivesProvider, T> RwLockWriteGuard<'a, Platform, T> {
+impl<'a, Platform: RawSyncPrimitivesProvider, T: ?Sized> RwLockWriteGuard<'a, Platform, T> {
     /// Makes a `MappedRwLockWriteGuard` for a component of the borrowed data, e.g. an enum variant.
     ///
     /// The `RwLock` is already locked for writing, so this cannot fail.
@@ -571,7 +579,7 @@ impl<'a, Platform: RawSyncPrimitivesProvider, T> RwLockWriteGuard<'a, Platform, 
     /// This is an associated function that needs to be used as `RwLockWriteGuard::map(...)`. A
     /// method would interfere with methods of the same name on the contents of the `RwLockWriteGuard`
     /// used through `Deref`/`DerefMut`.
-    pub fn map<U, F: FnOnce(&mut T) -> &mut U>(
+    pub fn map<U: ?Sized, F: FnOnce(&mut T) -> &mut U>(
         orig: Self,
         f: F,
     ) -> MappedRwLockWriteGuard<'a, Platform, U> {
@@ -586,6 +594,7 @@ impl<'a, Platform: RawSyncPrimitivesProvider, T> RwLockWriteGuard<'a, Platform, 
         MappedRwLockWriteGuard {
             data,
             raw_lock: &orig.rwlock.raw,
+            _variance: core::marker::PhantomData,
             #[cfg(feature = "lock_tracing")]
             locked_witness: unsafe {
                 orig.locked_witness
@@ -610,7 +619,7 @@ impl<Platform: RawSyncPrimitivesProvider, T> RwLock<Platform, T> {
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider, T> RwLock<Platform, T> {
+impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> RwLock<Platform, T> {
     #[inline]
     #[track_caller]
     pub fn read(&self) -> RwLockReadGuard<'_, Platform, T> {
@@ -651,38 +660,6 @@ impl<Platform: RawSyncPrimitivesProvider, T> RwLock<Platform, T> {
         }
     }
 
-    /// Consumes this `RwLock`, returning the underlying data.
-    ///
-    /// Since this function consumes `self`, it is guaranteed that no other thread has borrowed it
-    /// or has unreleased locks.
-    #[inline]
-    #[cfg(not(feature = "lock_tracing"))]
-    pub fn into_inner(self) -> T {
-        self.data.into_inner()
-    }
-
-    /// Consumes this `RwLock`, returning the underlying data.
-    ///
-    /// Since this function consumes `self`, it is guaranteed that no other thread has borrowed it
-    /// or has unreleased locks.
-    #[inline]
-    #[cfg(feature = "lock_tracing")]
-    pub fn into_inner(mut self) -> T {
-        // Record destruction event before consuming self, since Drop won't run
-        // after we use ManuallyDrop.
-        self.creation
-            .record_destruction_if_registered(LockType::RwLock, &raw const self.raw.state);
-
-        // Prevent Drop from running since we've manually recorded destruction.
-        // ManuallyDrop is required because RwLock has a Drop impl when lock_tracing
-        // is enabled, and Rust won't let us move `self.data` out of a type with Drop.
-        let this = core::mem::ManuallyDrop::new(self);
-
-        // SAFETY: We're consuming self and have prevented Drop from running,
-        // so it's safe to read and move out of the data field.
-        unsafe { core::ptr::read(&raw const this.data).into_inner() }
-    }
-
     /// Returns a mutable reference to the underlying data.
     ///
     /// Since this function borrows `self` mutably, it is guaranteed that no other thread has
@@ -691,6 +668,27 @@ impl<Platform: RawSyncPrimitivesProvider, T> RwLock<Platform, T> {
     #[inline]
     pub fn get_mut(&mut self) -> &mut T {
         self.data.get_mut()
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider, T> RwLock<Platform, T> {
+    /// Consumes this `RwLock`, returning the underlying data.
+    #[inline]
+    #[cfg(not(feature = "lock_tracing"))]
+    pub fn into_inner(self) -> T {
+        self.data.into_inner()
+    }
+
+    /// Consumes this `RwLock`, returning the underlying data.
+    #[inline]
+    #[cfg(feature = "lock_tracing")]
+    pub fn into_inner(mut self) -> T {
+        self.creation
+            .record_destruction_if_registered(LockType::RwLock, &raw const self.raw.state);
+        let this = core::mem::ManuallyDrop::new(self);
+        // SAFETY: `self` is consumed and its destructor is suppressed, so the
+        // protected value can be moved out exactly once.
+        unsafe { core::ptr::read(&raw const this.data).into_inner() }
     }
 }
 
@@ -703,9 +701,12 @@ impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> Drop for RwLock<Platform, T
 }
 
 // SAFETY: `RwLock<T>` inherits `Send` from `T`.
-unsafe impl<Platform: RawSyncPrimitivesProvider, T: Send> Send for RwLock<Platform, T> {}
+unsafe impl<Platform: RawSyncPrimitivesProvider, T: Send + ?Sized> Send for RwLock<Platform, T> {}
 // SAFETY: `RwLock<T>` is `Sync` when `T` is `Send+Sync`. Note that this is a
 // different bound from `Mutex<T>`--the `Send` bound is still necessary since a
 // writer can transfer `T` between threads, but the `Sync` bound is necessary,
 // too, since readers on multiple threads can share `T` simultaneously.
-unsafe impl<Platform: RawSyncPrimitivesProvider, T: Send + Sync> Sync for RwLock<Platform, T> {}
+unsafe impl<Platform: RawSyncPrimitivesProvider, T: Send + Sync + ?Sized> Sync
+    for RwLock<Platform, T>
+{
+}

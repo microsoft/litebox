@@ -10,5 +10,9 @@
 #![cfg(target_os = "linux")]
 
 mod socket;
+mod sync;
+mod time;
 
 pub use socket::LinuxSocketProvider;
+pub use sync::LinuxSyncPrimitivesProvider;
+pub use time::{LinuxInstant, LinuxSystemTime, LinuxTimeProvider};

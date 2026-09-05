@@ -12,6 +12,10 @@
 extern crate std;
 
 use core::sync::atomic::AtomicU32;
+use litebox_platform::sync::{
+    ImmediatelyWokenUp, RawMutex, RawMutexProvider, UnblockedOrTimedOut, WaitWakerProvider,
+};
+use litebox_platform::time::{Instant, SystemTime, TimeProvider};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::*;
@@ -170,6 +174,8 @@ impl RawMutex for MockRawMutex {
 impl RawMutexProvider for MockPlatform {
     type RawMutex = MockRawMutex;
 }
+
+impl WaitWakerProvider for MockPlatform {}
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct MockInstant {

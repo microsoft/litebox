@@ -15,14 +15,20 @@ use std::time::Duration;
 use std::unimplemented;
 
 use litebox::fs::OFlags;
-use litebox::platform::UnblockedOrTimedOut;
+use litebox::platform::RawConstPointer as _;
 use litebox::platform::page_mgmt::{
     CowAllocationError, FixedAddressBehavior, MemoryRegionPermissions,
 };
-use litebox::platform::{ImmediatelyWokenUp, RawConstPointer as _};
 use litebox::shim::ContinueOperation;
 use litebox::utils::{ReinterpretSignedExt, ReinterpretUnsignedExt as _, TruncateExt};
 use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, vmap::VmapManager};
+use litebox_platform::sync::{
+    ImmediatelyWokenUp, RawMutex as RawMutexTrait, RawMutexProvider, UnblockedOrTimedOut,
+    WaitWakerProvider,
+};
+use litebox_platform::time::{
+    Instant as InstantTrait, SystemTime as SystemTimeTrait, TimeProvider,
+};
 
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -1154,13 +1160,12 @@ impl litebox::platform::TimerHandle for TimerHandle {
     }
 }
 
-impl litebox::platform::RawMutexProvider for LinuxUserland {
+impl RawMutexProvider for LinuxUserland {
     type RawMutex = RawMutex;
+}
 
-    fn update_waker(&self, waker: Option<litebox::event::wait::Waker<Self>>)
-    where
-        Self: litebox::sync::RawSyncPrimitivesProvider,
-    {
+impl WaitWakerProvider for LinuxUserland {
+    fn update_waker(&self, waker: Option<core::task::Waker>) {
         let mut waker_ptr = waker.map_or(std::ptr::null_mut(), |w| Box::into_raw(Box::new(w)));
         #[cfg(target_arch = "x86_64")]
         unsafe {
@@ -1235,7 +1240,7 @@ impl RawMutex {
     }
 }
 
-impl litebox::platform::RawMutex for RawMutex {
+impl RawMutexTrait for RawMutex {
     const INIT: Self = Self::new();
 
     fn underlying_atomic(&self) -> &AtomicU32 {
@@ -1273,7 +1278,7 @@ impl litebox::platform::RawMutex for RawMutex {
     }
 }
 
-impl litebox::platform::TimeProvider for LinuxUserland {
+impl TimeProvider for LinuxUserland {
     type Instant = Instant;
     type SystemTime = SystemTime;
 
@@ -1309,7 +1314,7 @@ pub struct Instant {
     inner: Duration,
 }
 
-impl litebox::platform::Instant for Instant {
+impl InstantTrait for Instant {
     fn checked_duration_since(&self, earlier: &Self) -> Option<Duration> {
         self.inner.checked_sub(earlier.inner)
     }
@@ -1324,7 +1329,7 @@ pub struct SystemTime {
     inner: Duration,
 }
 
-impl litebox::platform::SystemTime for SystemTime {
+impl SystemTimeTrait for SystemTime {
     const UNIX_EPOCH: Self = SystemTime {
         inner: Duration::ZERO,
     };
@@ -2554,9 +2559,9 @@ unsafe fn record_pending_signal(signal: litebox_common_linux::signal::Signal) {
     }
     // SAFETY: if `waker_addr` is not zero, that means the current thread is suspended
     // to handle this signal and it points to a valid Waker whose lifetime spans the
-    // entire interruptible wait, set by [`RawMutexProvider::update_waker`].
-    let waker = unsafe { &*(waker_addr as *const litebox::event::wait::Waker<LinuxUserland>) };
-    waker.wake();
+    // entire interruptible wait, set by [`WaitWakerProvider::update_waker`].
+    let waker = unsafe { &*(waker_addr as *const core::task::Waker) };
+    waker.wake_by_ref();
 }
 
 /// Signal handler for interrupt signals.
@@ -2760,7 +2765,7 @@ mod tests {
     use std::thread::sleep;
 
     use litebox::fs::OFlags;
-    use litebox::platform::RawMutex;
+    use litebox_platform::sync::RawMutex;
 
     use crate::LinuxUserland;
     use litebox::platform::PageManagementProvider;

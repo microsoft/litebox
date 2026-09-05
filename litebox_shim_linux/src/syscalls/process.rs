@@ -15,15 +15,16 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 use litebox::event::wait::WaitError;
 use litebox::mm::linux::VmFlags;
+use litebox::platform::ArchSpecificRegister;
 use litebox::platform::TimerHandle;
-use litebox::platform::{ArchSpecificRegister, RawMutex as _};
-use litebox::platform::{Instant as _, SystemTime as _, TimeProvider};
 use litebox::sync::{Mutex, RwLock};
 use litebox::utils::TruncateExt as _;
 use litebox_common_linux::{
     ArchPrctlArg, CloneFlags, FutexArgs, IntervalTimer, ItimerVal, PrctlArg, TimeParam,
     errno::Errno,
 };
+use litebox_platform::sync::{RawMutex as _, RawMutexProvider};
+use litebox_platform::time::{Instant as _, SystemTime as _, TimeProvider};
 
 /// Process-management-related state on [`Task`].
 pub(crate) struct ThreadState<Platform: ShimPlatform> {
@@ -116,7 +117,7 @@ impl<Platform: ShimPlatform> ThreadRemote<Platform> {
 pub(crate) struct Process<Platform: ShimPlatform> {
     /// Number of threads in this process. Always updated under the `inner`
     /// mutex lock.
-    nr_threads: <Platform as litebox::platform::RawMutexProvider>::RawMutex,
+    nr_threads: <Platform as RawMutexProvider>::RawMutex,
     inner: Mutex<Platform, ProcessInner<Platform>>,
     /// Resource limits for this process.
     pub(crate) limits: ResourceLimits<Platform>,
@@ -130,16 +131,13 @@ pub(crate) struct Alarm<Platform: ShimPlatform> {
     /// Handle for the alarm timer.
     pub(crate) handle: Option<<Platform as litebox::platform::TimerProvider>::TimerHandle>,
     /// The deadline for the alarm.
-    pub(crate) deadline: Option<<Platform as litebox::platform::TimeProvider>::Instant>,
+    pub(crate) deadline: Option<<Platform as TimeProvider>::Instant>,
 }
 
 impl<Platform: ShimPlatform> Alarm<Platform> {
     /// Returns the time remaining until [`Self::deadline`], or zero if the
     /// alarm is not armed or its deadline has already passed.
-    pub(crate) fn remaining(
-        &self,
-        now: <Platform as litebox::platform::TimeProvider>::Instant,
-    ) -> Duration {
+    pub(crate) fn remaining(&self, now: <Platform as TimeProvider>::Instant) -> Duration {
         self.deadline
             .as_ref()
             .and_then(|d| d.checked_duration_since(&now))
@@ -169,7 +167,7 @@ pub(crate) enum ExitStatus {
 impl<Platform: ShimPlatform> Process<Platform> {
     /// Creates a new process with the given initial thread.
     fn new(pid: i32, remote: Arc<ThreadRemote<Platform>>) -> Self {
-        let nr_threads = <Platform as litebox::platform::RawMutexProvider>::RawMutex::INIT;
+        let nr_threads = <Platform as RawMutexProvider>::RawMutex::INIT;
         nr_threads.underlying_atomic().store(1, Ordering::Relaxed);
         Self {
             nr_threads,
@@ -1912,8 +1910,8 @@ mod tests {
     /// interrupted and SIGALRM should be pending.
     #[test]
     fn test_alarm_fires_after_deadline() {
-        use litebox::platform::{Instant as _, TimeProvider};
         use litebox_common_linux::{ClockId, TimerFlags, Timespec};
+        use litebox_platform::time::{Instant as _, TimeProvider};
 
         let task = crate::syscalls::tests::init_platform();
         <crate::syscalls::tests::TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {

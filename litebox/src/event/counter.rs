@@ -7,6 +7,7 @@ use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::event::ConsumeEventResponse;
 pub use litebox_broker_protocol::event::EventConsumeMode as EventCounterReadMode;
 use litebox_broker_protocol::readiness::ReadinessFlags;
+use litebox_platform::time::TimeProvider;
 use thiserror::Error;
 
 use crate::{
@@ -20,7 +21,6 @@ use crate::{
         Events, IOPollable, observer::Observer, polling::Pollee, polling::TryOpError,
         wait::WaitContext,
     },
-    platform::TimeProvider,
     sync::RawSyncPrimitivesProvider,
 };
 

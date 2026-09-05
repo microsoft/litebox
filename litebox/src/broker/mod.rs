@@ -23,9 +23,9 @@ use litebox_broker_protocol::socket::{
 };
 use litebox_broker_protocol::stdio::{MAX_STDIO_TRANSFER_SIZE, StdioOutputStream, StdioStream};
 use litebox_broker_transport::channel::LocalCallChannel;
+use litebox_platform::time::TimeProvider;
 
 use crate::event::{Events, polling::Pollee};
-use crate::platform::TimeProvider;
 use crate::sync::{Mutex, RawSyncPrimitivesProvider};
 
 pub(crate) mod error;

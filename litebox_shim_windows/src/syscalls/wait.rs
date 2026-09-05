@@ -9,8 +9,9 @@ use litebox::event::observer::Observer;
 use litebox::event::polling::TryOpError;
 use litebox::event::wait::WaitError;
 use litebox::event::{Events, IOPollable as _};
-use litebox::platform::{RawConstPointer as _, SystemTime as _};
+use litebox::platform::RawConstPointer as _;
 use litebox_common_windows::nt_status::NtStatus;
+use litebox_platform::time::SystemTime as _;
 
 use crate::nt_types::AccessMask;
 use crate::syscalls::event::{EventObject, EventSubsystem};

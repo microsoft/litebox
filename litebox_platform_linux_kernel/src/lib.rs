@@ -13,10 +13,16 @@ use litebox::mm::linux::PageRange;
 use litebox::platform::RawPointerProvider;
 use litebox::platform::page_mgmt::FixedAddressBehavior;
 use litebox::platform::{
-    ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister, ImmediatelyWokenUp,
-    PageManagementProvider, Provider, RawMutexProvider, TimeProvider, UnblockedOrTimedOut,
+    ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister, PageManagementProvider, Provider,
 };
 use litebox_common_linux::errno::Errno;
+use litebox_platform::sync::{
+    ImmediatelyWokenUp, RawMutex as RawMutexTrait, RawMutexProvider, UnblockedOrTimedOut,
+    WaitWakerProvider,
+};
+use litebox_platform::time::{
+    Instant as InstantTrait, SystemTime as SystemTimeTrait, TimeProvider,
+};
 
 extern crate alloc;
 
@@ -136,7 +142,9 @@ impl<Host: HostInterface> RawMutexProvider for LinuxKernel<Host> {
     type RawMutex = RawMutex<Host>;
 }
 
-/// An implementation of [`litebox::platform::RawMutex`]
+impl<Host: HostInterface> WaitWakerProvider for LinuxKernel<Host> {}
+
+/// An implementation of [`litebox_platform::sync::RawMutex`].
 pub struct RawMutex<Host: HostInterface> {
     inner: AtomicU32,
     host: core::marker::PhantomData<fn(Host) -> Host>,
@@ -145,7 +153,7 @@ pub struct RawMutex<Host: HostInterface> {
 unsafe impl<Host: HostInterface> Send for RawMutex<Host> {}
 unsafe impl<Host: HostInterface> Sync for RawMutex<Host> {}
 
-impl<Host: HostInterface> litebox::platform::RawMutex for RawMutex<Host> {
+impl<Host: HostInterface> RawMutexTrait for RawMutex<Host> {
     const INIT: Self = Self::new();
 
     fn underlying_atomic(&self) -> &core::sync::atomic::AtomicU32 {
@@ -168,7 +176,7 @@ impl<Host: HostInterface> litebox::platform::RawMutex for RawMutex<Host> {
         &self,
         val: u32,
         time: core::time::Duration,
-    ) -> Result<litebox::platform::UnblockedOrTimedOut, ImmediatelyWokenUp> {
+    ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
         self.block_or_maybe_timeout(val, Some(time))
     }
 }
@@ -201,11 +209,11 @@ impl<Host: HostInterface> RawMutex<Host> {
     }
 }
 
-/// An implementation of [`litebox::platform::Instant`]
+/// An implementation of [`litebox_platform::time::Instant`].
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Instant(u64);
 
-/// An implementation of [`litebox::platform::SystemTime`]
+/// An implementation of [`litebox_platform::time::SystemTime`].
 pub struct SystemTime {
     inner: core::time::Duration,
 }
@@ -219,7 +227,7 @@ impl<Host: HostInterface> TimeProvider for LinuxKernel<Host> {
     }
 
     fn current_time(&self) -> Self::SystemTime {
-        use litebox::platform::Instant as _;
+        use litebox_platform::time::Instant as _;
         // Derive the current system time from the monotonic clock elapsed
         // since boot, avoiding repeated host calls.
         //
@@ -236,7 +244,7 @@ impl<Host: HostInterface> TimeProvider for LinuxKernel<Host> {
     }
 }
 
-impl litebox::platform::Instant for Instant {
+impl InstantTrait for Instant {
     fn checked_duration_since(&self, earlier: &Self) -> Option<core::time::Duration> {
         self.0.checked_sub(earlier.0).map(|v| {
             core::time::Duration::from_micros(
@@ -272,7 +280,7 @@ impl Instant {
     }
 }
 
-impl litebox::platform::SystemTime for SystemTime {
+impl SystemTimeTrait for SystemTime {
     const UNIX_EPOCH: Self = SystemTime {
         inner: core::time::Duration::ZERO,
     };

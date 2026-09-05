@@ -18,7 +18,7 @@ use hashbrown::{HashMap, HashSet};
 use litebox::{
     LiteBox,
     mm::{PageManager, linux::PAGE_SIZE},
-    platform::{Instant as _, RawConstPointer as _, RawMutPointer as _, TimeProvider},
+    platform::{RawConstPointer as _, RawMutPointer as _},
     shim::ContinueOperation,
     utils::TruncateExt,
 };
@@ -28,6 +28,7 @@ use litebox_common_optee::{
     TeeAttributeType, TeeCrypStateHandle, TeeHandleFlag, TeeIdentity, TeeLogin, TeeObjHandle,
     TeeObjectInfo, TeeObjectType, TeeOperationMode, TeeResult, TeeUuid, UteeAttribute,
 };
+use litebox_platform::time::{Instant as _, TimeProvider};
 use litebox_platform_multiplex::Platform;
 
 pub mod loader;
@@ -166,7 +167,7 @@ struct GlobalState {
     /// Monotonic baseline captured when this instance was created; the
     /// arbitrary origin for GP "system time" (`TEE_GetSystemTime`).
     /// See [`GlobalState::system_time`].
-    boot_instant: <Platform as litebox::platform::TimeProvider>::Instant,
+    boot_instant: <Platform as TimeProvider>::Instant,
     /// The page manager for managing virtual memory.
     pm: litebox::mm::PageManager<Platform, { PAGE_SIZE }>,
     /// The LiteBox instance used throughout the shim.

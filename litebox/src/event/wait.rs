@@ -24,14 +24,10 @@
 
 use alloc::sync::Arc;
 use core::{marker::PhantomData, sync::atomic::Ordering};
+use litebox_platform::sync::{ImmediatelyWokenUp, RawMutex, UnblockedOrTimedOut};
+use litebox_platform::time::{Instant as _, TimeProvider};
 
-use crate::{
-    platform::{
-        ImmediatelyWokenUp, Instant as _, RawMutex, ThreadProvider, TimeProvider,
-        UnblockedOrTimedOut,
-    },
-    sync::RawSyncPrimitivesProvider,
-};
+use crate::{platform::ThreadProvider, sync::RawSyncPrimitivesProvider};
 use thiserror::Error;
 
 /// The wait state for a thread.
@@ -195,6 +191,16 @@ impl<Platform: RawSyncPrimitivesProvider> WaitStateInner<Platform> {
         self.condvar
             .underlying_atomic()
             .store(new_state.0, ordering);
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider> alloc::task::Wake for WaitStateInner<Platform> {
+    fn wake(self: Arc<Self>) {
+        WaitStateInner::wake(&self);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        WaitStateInner::wake(self);
     }
 }
 
@@ -374,7 +380,10 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
     /// evaluating the wait and interrupt conditions so that wakeups are not
     /// missed.
     fn start_wait(&self) {
-        self.waker.0.platform.update_waker(Some(self.waker.clone()));
+        self.waker
+            .0
+            .platform
+            .update_waker(Some(core::task::Waker::from(Arc::clone(&self.waker.0))));
         self.waker
             .0
             .set_state(ThreadState::WAITING, Ordering::SeqCst);

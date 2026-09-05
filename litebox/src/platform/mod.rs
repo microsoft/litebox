@@ -19,6 +19,9 @@ pub(crate) mod mock;
 use thiserror::Error;
 use zerocopy::{FromBytes, IntoBytes};
 
+use litebox_platform::sync::{RawMutexProvider, WaitWakerProvider};
+use litebox_platform::time::TimeProvider;
+
 pub use arch::{ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister};
 pub use page_mgmt::PageManagementProvider;
 pub use vector::GuestVectorStateProvider;
@@ -29,7 +32,7 @@ pub use vector::GuestVectorStateProvider;
 /// provided by it. _However_, most of the provided APIs within the provider act upon an `&self` to
 /// allow storage of any useful "globals" within it necessary.
 pub trait Provider:
-    RawMutexProvider + TimeProvider + ArchSpecificProvider + RawPointerProvider
+    RawMutexProvider + WaitWakerProvider + TimeProvider + ArchSpecificProvider + RawPointerProvider
 {
 }
 
@@ -145,137 +148,6 @@ pub trait SignalProvider {
     /// Platforms that support asynchronous signals should override this method.
     #[expect(unused_variables, reason = "no-op by default")]
     fn take_pending_signals(&self, f: impl FnMut(Self::Signal)) {}
-}
-
-/// A provider of raw mutexes
-pub trait RawMutexProvider {
-    type RawMutex: RawMutex;
-
-    /// Updates the waker for the current thread's interruptible wait.
-    ///
-    /// Called by `WaitContext::start_wait` with `Some(waker)` when the current thread
-    /// enters an interruptible wait, and by `WaitContext::end_wait` with
-    /// `None` when it leaves. The thread in an interruptible wait can be unblocked
-    /// by [`Waker::wake`].
-    ///
-    /// This is a no-op by default.
-    ///
-    /// [`Waker::wake`]: crate::event::wait::Waker::wake
-    #[expect(unused_variables)]
-    fn update_waker(&self, waker: Option<crate::event::wait::Waker<Self>>)
-    where
-        Self: crate::sync::RawSyncPrimitivesProvider + Sized,
-    {
-    }
-}
-
-/// A raw mutex/lock API; expected to roughly match (or even be implemented using) a Linux futex.
-pub trait RawMutex: Send + Sync + 'static {
-    /// The initial value for a raw mutex, with an underlying atomic with a
-    /// value of zero.
-    const INIT: Self;
-
-    /// Returns a reference to the underlying atomic value
-    fn underlying_atomic(&self) -> &core::sync::atomic::AtomicU32;
-
-    /// Wake up `n` threads blocked on on this raw mutex.
-    ///
-    /// Returns the number of waiters that were woken up.
-    /// Some platforms cannot observe this number and may return zero
-    /// even when one or more waiters were woken up, so callers must
-    /// not rely on zero meaning that no waiters were woken up.
-    fn wake_many(&self, n: usize) -> usize;
-
-    /// Wake up one thread blocked on this raw mutex.
-    ///
-    /// Returns true if this actually woke up such a thread. Returns false
-    /// if no thread was waiting on this raw mutex, or if the platform
-    /// cannot observe whether a thread was woken up.
-    fn wake_one(&self) -> bool {
-        self.wake_many(1) > 0
-    }
-
-    /// Wake up all threads that are blocked on this raw mutex.
-    ///
-    /// Returns the number of waiters that were woken up. This may be
-    /// zero on platforms that cannot observe this number.
-    fn wake_all(&self) -> usize {
-        self.wake_many(i32::MAX as usize)
-    }
-
-    /// If the underlying value is `val`, block until a wake operation wakes us up.
-    ///
-    /// Importantly, a wake operation does NOT guarantee that the underlying value has changed; it
-    /// only means that a wake operation has occurred. However, an [`ImmediatelyWokenUp`] means that
-    /// the value had changed _before_ it went to sleep.
-    fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp>;
-
-    /// If the underlying value is `val`, block until a wake operation wakes us up, or some `time`
-    /// has passed without a wake operation having occurred.
-    ///
-    /// See comment on [`Self::block`] for more details on underlying value.
-    fn block_or_timeout(
-        &self,
-        val: u32,
-        time: core::time::Duration,
-    ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp>;
-}
-
-/// A zero-sized struct indicating that the block was immediately unblocked (due to non-matching
-/// value).
-pub struct ImmediatelyWokenUp;
-
-/// Named-boolean to indicate whether [`RawMutex::block_or_timeout`] was woken up or timed out.
-#[must_use]
-pub enum UnblockedOrTimedOut {
-    /// Unblocked by a wake call
-    Unblocked,
-    /// Sufficient time elapsed without a wake call
-    TimedOut,
-}
-
-/// An interface to understanding time.
-pub trait TimeProvider {
-    type Instant: Instant;
-    type SystemTime: SystemTime;
-    /// Returns an instant corresponding to "now".
-    fn now(&self) -> Self::Instant;
-    /// Returns the current system time.
-    fn current_time(&self) -> Self::SystemTime;
-}
-
-/// An opaque measurement of a monotonically nondecreasing clock.
-///
-/// Notable, the `Instant` is distinct from [`SystemTime`], in that the `Instant` is monotonic, and
-/// need not have any relation with "real" time. It does not matter if the world takes a step
-/// backwards in time, the `Instant` continues marching forward.
-pub trait Instant: Copy + Clone + PartialEq + Eq + PartialOrd + Ord + Send + Sync {
-    /// Returns the amount of time elapsed from another instant to this one, or `None` if that
-    /// instant is later than this one.
-    fn checked_duration_since(&self, earlier: &Self) -> Option<core::time::Duration>;
-    /// Returns the amount of time elapsed from another instant to this one, or zero duration if
-    /// that instant is later than this one.
-    fn duration_since(&self, earlier: &Self) -> core::time::Duration {
-        self.checked_duration_since(earlier)
-            .unwrap_or(core::time::Duration::from_secs(0))
-    }
-    /// Returns a new `Instant` that is the sum of this instant and the provided
-    /// duration, or `None` if the resulting instant would overflow.
-    fn checked_add(&self, duration: core::time::Duration) -> Option<Self>;
-}
-
-/// A measurement of the system clock.
-///
-/// Notably, the `SystemTime` is distinct from [`Instant`], in that the `SystemTime` need not be
-/// monotonic, but instead is the best guess of "real" or "wall clock" time.
-pub trait SystemTime: Send + Sync {
-    /// An anchor in time corresponding to "1970-01-01 00:00:00 UTC".
-    const UNIX_EPOCH: Self;
-    /// Returns the amount of time elapsed from an `earlier` point in time to this one. This is
-    /// fallible since the clock might have been adjusted backwards in time to before the earlier
-    /// point in time was measured; in such a case, it returns an `Err(_)` with the absolute
-    /// duration.
-    fn duration_since(&self, earlier: &Self) -> Result<core::time::Duration, core::time::Duration>;
 }
 
 /// A common interface for raw pointers, aimed at usage in shims _above_ LiteBox.

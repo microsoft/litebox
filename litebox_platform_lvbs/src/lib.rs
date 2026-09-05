@@ -11,9 +11,8 @@ use alloc::sync::Arc;
 use core::sync::atomic::AtomicU32;
 use hashbrown::HashMap;
 use litebox::platform::{
-    ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister, ImmediatelyWokenUp,
-    PageManagementProvider, RawMutex as _, RawMutexProvider, RawPointerProvider, TimeProvider,
-    UnblockedOrTimedOut, page_mgmt::DeallocationError,
+    ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister, PageManagementProvider,
+    RawPointerProvider, page_mgmt::DeallocationError,
 };
 use litebox::{
     mm::linux::{PAGE_SIZE, PageRange},
@@ -25,6 +24,13 @@ use litebox_common_linux::errno::Errno;
 use litebox_common_linux::vmap::{
     GlobalVmapManager, PhysPageAddrArray, PhysPageMapInfo, PhysPageMapPermissions,
     PhysPointerError, VmapManager,
+};
+use litebox_platform::sync::{
+    ImmediatelyWokenUp, RawMutex as RawMutexTrait, RawMutexProvider, UnblockedOrTimedOut,
+    WaitWakerProvider,
+};
+use litebox_platform::time::{
+    Instant as InstantTrait, SystemTime as SystemTimeTrait, TimeProvider,
 };
 use x86_64::{
     VirtAddr,
@@ -804,7 +810,9 @@ impl<Host: HostInterface> RawMutexProvider for LinuxKernel<Host> {
     type RawMutex = RawMutex<Host>;
 }
 
-/// An implementation of [`litebox::platform::RawMutex`]
+impl<Host: HostInterface> WaitWakerProvider for LinuxKernel<Host> {}
+
+/// An implementation of [`litebox_platform::sync::RawMutex`].
 pub struct RawMutex<Host: HostInterface> {
     inner: AtomicU32,
     host: core::marker::PhantomData<fn(Host) -> Host>,
@@ -814,7 +822,7 @@ unsafe impl<Host: HostInterface> Send for RawMutex<Host> {}
 unsafe impl<Host: HostInterface> Sync for RawMutex<Host> {}
 
 /// TODO: common mutex implementation could be moved to a shared crate
-impl<Host: HostInterface> litebox::platform::RawMutex for RawMutex<Host> {
+impl<Host: HostInterface> RawMutexTrait for RawMutex<Host> {
     const INIT: Self = Self::new();
 
     fn underlying_atomic(&self) -> &core::sync::atomic::AtomicU32 {
@@ -837,7 +845,7 @@ impl<Host: HostInterface> litebox::platform::RawMutex for RawMutex<Host> {
         &self,
         val: u32,
         time: core::time::Duration,
-    ) -> Result<litebox::platform::UnblockedOrTimedOut, ImmediatelyWokenUp> {
+    ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
         self.block_or_maybe_timeout(val, Some(time))
     }
 }
@@ -877,14 +885,14 @@ impl<Host: HostInterface> RawMutex<Host> {
     }
 }
 
-/// An implementation of [`litebox::platform::Instant`].
+/// An implementation of [`litebox_platform::time::Instant`].
 ///
 /// Backed by the Hyper-V partition reference counter, which is monotonic
 /// and normalized by the hypervisor across TSC scaling and live migration.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Instant(u64);
 
-/// An implementation of [`litebox::platform::SystemTime`]
+/// An implementation of [`litebox_platform::time::SystemTime`].
 pub struct SystemTime();
 
 impl<Host: HostInterface> TimeProvider for LinuxKernel<Host> {
@@ -900,7 +908,7 @@ impl<Host: HostInterface> TimeProvider for LinuxKernel<Host> {
     }
 }
 
-impl litebox::platform::Instant for Instant {
+impl InstantTrait for Instant {
     fn checked_duration_since(&self, earlier: &Self) -> Option<core::time::Duration> {
         let ticks = self.0.checked_sub(earlier.0)?;
         // Each reference-counter tick is `REF_COUNTER_TICK_NANOS` (100) ns.
@@ -921,7 +929,7 @@ impl Instant {
     }
 }
 
-impl litebox::platform::SystemTime for SystemTime {
+impl SystemTimeTrait for SystemTime {
     const UNIX_EPOCH: Self = SystemTime();
 
     fn duration_since(

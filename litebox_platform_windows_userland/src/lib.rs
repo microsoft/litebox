@@ -16,13 +16,18 @@ use std::os::raw::c_void;
 use std::os::windows::io::AsRawHandle as _;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use litebox::platform::ImmediatelyWokenUp;
-use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::{
     AllocationError, FixedAddressBehavior, MemoryRegionPermissions,
 };
 use litebox::shim::{ContinueOperation, Exception};
 use litebox::utils::TruncateExt as _;
+use litebox_platform::sync::{
+    ImmediatelyWokenUp, RawMutex as RawMutexTrait, RawMutexProvider, UnblockedOrTimedOut,
+    WaitWakerProvider,
+};
+use litebox_platform::time::{
+    Instant as InstantTrait, SystemTime as SystemTimeTrait, TimeProvider,
+};
 
 use windows_sys::Win32::Foundation::{self as Win32_Foundation, FILETIME};
 use windows_sys::Win32::{
@@ -425,7 +430,7 @@ struct TlsState {
     pending_host_signals: AtomicU32,
     /// Pointer to the `Waker` currently being waited on, or null if not
     /// waiting.
-    waiting_waker: std::sync::atomic::AtomicPtr<litebox::event::wait::Waker<WindowsUserland>>,
+    waiting_waker: std::sync::atomic::AtomicPtr<core::task::Waker>,
 }
 
 impl TlsState {
@@ -1050,7 +1055,7 @@ impl ThreadHandle {
                     // mutex before freeing the old pointer, and we hold that
                     // mutex now.
                     let waker = unsafe { &*waker };
-                    waker.wake();
+                    waker.wake_by_ref();
                 }
             }
         }
@@ -1253,13 +1258,12 @@ fn is_in_ntdll_or_this(ip: usize) -> bool {
     bounds.iter().any(|b| b.contains(&ip))
 }
 
-impl litebox::platform::RawMutexProvider for WindowsUserland {
+impl RawMutexProvider for WindowsUserland {
     type RawMutex = RawMutex;
+}
 
-    fn update_waker(&self, waker: Option<litebox::event::wait::Waker<Self>>)
-    where
-        Self: litebox::sync::RawSyncPrimitivesProvider,
-    {
+impl WaitWakerProvider for WindowsUserland {
+    fn update_waker(&self, waker: Option<core::task::Waker>) {
         if let Some(tls) = get_tls_ptr().map(|p| unsafe { &*p }) {
             let waker_ptr = waker.map_or(std::ptr::null_mut(), |w| Box::into_raw(Box::new(w)));
             let old = tls.waiting_waker.swap(waker_ptr, Ordering::AcqRel);
@@ -1331,7 +1335,7 @@ impl RawMutex {
     }
 }
 
-impl litebox::platform::RawMutex for RawMutex {
+impl RawMutexTrait for RawMutex {
     const INIT: Self = Self::new();
 
     fn underlying_atomic(&self) -> &AtomicU32 {
@@ -1378,7 +1382,7 @@ impl litebox::platform::RawMutex for RawMutex {
     }
 }
 
-impl litebox::platform::TimeProvider for WindowsUserland {
+impl TimeProvider for WindowsUserland {
     type Instant = Instant;
     type SystemTime = SystemTime;
 
@@ -1409,7 +1413,7 @@ impl litebox::platform::TimeProvider for WindowsUserland {
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Instant(u64);
 
-impl litebox::platform::Instant for Instant {
+impl InstantTrait for Instant {
     fn checked_duration_since(&self, earlier: &Self) -> Option<core::time::Duration> {
         let diff = self.0.checked_sub(earlier.0)?;
         // Convert from 100ns intervals to nanoseconds. This won't overflow in
@@ -1429,7 +1433,7 @@ pub struct SystemTime {
     filetime: u64,
 }
 
-impl litebox::platform::SystemTime for SystemTime {
+impl SystemTimeTrait for SystemTime {
     // Windows epoch: Jan 1, 1601
     // Unix epoch: Jan 1, 1970
     // Difference: 11644473600 seconds
@@ -2017,9 +2021,9 @@ mod tests {
     use crate::process_memory_range_by_regions;
     use litebox::platform::PageManagementProvider;
     use litebox::platform::RawConstPointer;
-    use litebox::platform::RawMutex;
     use litebox::platform::page_mgmt::FixedAddressBehavior;
     use litebox::platform::page_mgmt::MemoryRegionPermissions;
+    use litebox_platform::sync::RawMutex;
 
     #[test]
     fn test_raw_mutex() {

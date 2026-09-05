@@ -6,6 +6,7 @@
 use core::sync::atomic::AtomicBool;
 
 use alloc::sync::{Arc, Weak};
+use litebox_platform::time::TimeProvider;
 use thiserror::Error;
 
 use super::{
@@ -14,7 +15,6 @@ use super::{
 };
 use crate::{
     event::wait::{WaitContext, WaitError},
-    platform::TimeProvider,
     sync::RawSyncPrimitivesProvider,
 };
 

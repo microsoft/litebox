@@ -1446,13 +1446,13 @@ checksum = "df1d3c3b53da64cf5760482273a98e575c651a67eec7f77df96b5b642de8f039"
 name = "litebox"
 version = "0.1.0"
 dependencies = [
- "arrayvec",
  "bitflags",
  "buddy_system_allocator",
  "hashbrown",
  "litebox_broker_local",
  "litebox_broker_protocol",
  "litebox_broker_transport",
+ "litebox_platform",
  "litebox_util_log",
  "rangemap",
  "slabmalloc",
@@ -1515,6 +1515,7 @@ version = "0.1.0"
 dependencies = [
  "litebox_broker_core",
  "litebox_broker_protocol",
+ "litebox_platform",
  "rustix",
 ]
 
@@ -1566,6 +1567,7 @@ dependencies = [
  "litebox_broker_transport",
  "litebox_broker_transport_linux_userland",
  "litebox_broker_transport_windows_userland",
+ "litebox_platform",
  "tempfile",
 ]
 
@@ -1649,6 +1651,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_platform"
+version = "0.1.0"
+dependencies = [
+ "arrayvec",
+ "litebox_util_log",
+ "spin 0.9.8",
+]
+
+[[package]]
 name = "litebox_platform_linux_kernel"
 version = "0.1.0"
 dependencies = [
@@ -1657,6 +1668,7 @@ dependencies = [
  "bitflags",
  "litebox",
  "litebox_common_linux",
+ "litebox_platform",
  "litebox_util_log",
  "paste",
  "rangemap",
@@ -1677,6 +1689,7 @@ dependencies = [
  "litebox",
  "litebox_common_linux",
  "litebox_common_optee",
+ "litebox_platform",
  "litebox_syscall_rewriter",
  "seccompiler",
  "spin 0.9.8",
@@ -1697,6 +1710,7 @@ dependencies = [
  "litebox",
  "litebox_common_linux",
  "litebox_common_lvbs",
+ "litebox_platform",
  "litebox_util_log",
  "modular-bitfield",
  "num_enum",
@@ -1730,6 +1744,7 @@ version = "0.1.0"
 dependencies = [
  "litebox",
  "litebox_common_linux",
+ "litebox_platform",
  "windows-sys 0.60.2",
  "zerocopy",
 ]
@@ -1908,6 +1923,7 @@ dependencies = [
  "litebox_broker_protocol",
  "litebox_broker_transport",
  "litebox_common_linux",
+ "litebox_platform",
  "litebox_platform_linux_userland",
  "litebox_platform_windows_userland",
  "litebox_syscall_rewriter",
@@ -1935,6 +1951,7 @@ dependencies = [
  "litebox",
  "litebox_common_linux",
  "litebox_common_optee",
+ "litebox_platform",
  "litebox_platform_multiplex",
  "litebox_util_log",
  "num_enum",
@@ -1957,6 +1974,7 @@ dependencies = [
  "litebox",
  "litebox_common_linux",
  "litebox_common_windows",
+ "litebox_platform",
  "litebox_platform_linux_userland",
  "litebox_platform_windows_userland",
  "litebox_util_log",
