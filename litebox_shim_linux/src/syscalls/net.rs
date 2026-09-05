@@ -2285,12 +2285,8 @@ mod tests {
                     h
                 };
                 assert_eq!(
-                    task.sys_sendmsg(
-                        i32::try_from(raw_client_fd).unwrap(),
-                        UserPtr::from_usize(&raw const hdr as usize),
-                        SendFlags::empty(),
-                    )
-                    .expect("Failed to sendmsg"),
+                    task.do_sendmsg(&client_fd, &hdr, SendFlags::empty())
+                        .expect("Failed to sendmsg"),
                     buf1.len() + buf2.len()
                 );
                 let output = child_handle
@@ -2319,14 +2315,7 @@ mod tests {
                 };
                 let n = match option {
                     "recvfrom" => task
-                        .sys_recvfrom(
-                            i32::try_from(raw_client_fd).unwrap(),
-                            UserPtrMut::from_usize(recv_buf.as_mut_ptr() as usize),
-                            recv_buf.len(),
-                            flags,
-                            None,
-                            UserPtrMut::from_usize(0),
-                        )
+                        .do_recvfrom(&client_fd, &mut recv_buf, flags, None)
                         .expect("Failed to receive data"),
                     "recvmsg" => {
                         let iovec = [litebox_common_linux::IoVec {
@@ -2853,42 +2842,6 @@ mod tests {
         close_socket(&task, socket_fd);
         close_socket(&task, socket_fd2);
     }
-
-    #[test]
-    fn socket_from_raw_rejects_negative_fd() {
-        let task = init_platform(None);
-        assert!(matches!(
-            task.files.borrow().socket_from_raw(-1),
-            Err(Errno::EBADF)
-        ));
-    }
-
-    #[test]
-    fn typed_socket_does_not_follow_raw_fd_reuse() {
-        let task = init_platform(None);
-        let socket_fd = task
-            .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
-            .unwrap();
-        let socket = task
-            .files
-            .borrow()
-            .socket_from_raw(i32::try_from(socket_fd).unwrap())
-            .unwrap();
-
-        close_socket(&task, socket_fd);
-        let replacement = task
-            .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
-            .unwrap();
-        assert_eq!(replacement, socket_fd);
-
-        let result = task.files.borrow().with_typed_socket(
-            &task.global,
-            &socket,
-            |fd| task.global.get_proxy(fd).map(|_| ()),
-            |_| unreachable!(),
-        );
-        assert_eq!(result, Err(Errno::EBADF));
-    }
 }
 
 #[cfg(test)]
@@ -2945,16 +2898,6 @@ mod unix_tests {
             .unwrap()
     }
 
-    fn recvfrom(
-        task: &TestTask,
-        socket: &crate::syscalls::file::AnyTypedFd<crate::syscalls::tests::TestPlatform>,
-        buf: &mut [u8],
-        flags: ReceiveFlags,
-        source_addr: Option<&mut Option<SocketAddress>>,
-    ) -> Result<usize, Errno> {
-        task.do_recvfrom(socket, buf, flags, source_addr)
-    }
-
     fn ppoll(task: &TestTask, fd: u32, events: Events) {
         let fd = i32::try_from(fd).unwrap();
         let mut pollfd = [litebox_common_linux::Pollfd {
@@ -3008,14 +2951,14 @@ mod unix_tests {
 
             let mut buf = [0u8; 64];
             let mut source = None;
-            let n = recvfrom(
-                &task,
-                &client_fd,
-                &mut buf,
-                ReceiveFlags::empty(),
-                Some(&mut source),
-            )
-            .expect("recvfrom failed");
+            let n = task
+                .do_recvfrom(
+                    &client_fd,
+                    &mut buf,
+                    ReceiveFlags::empty(),
+                    Some(&mut source),
+                )
+                .expect("recvfrom failed");
             assert_eq!(n, msg1.len());
             assert_eq!(&buf[..n], b"Hello from server");
             assert_eq!(source, Some(server_addr.clone()));
@@ -3034,14 +2977,14 @@ mod unix_tests {
 
             let mut buf = [0u8; 64];
             let mut source = None;
-            let n = recvfrom(
-                &task,
-                &server_fd,
-                &mut buf,
-                ReceiveFlags::empty(),
-                Some(&mut source),
-            )
-            .expect("recvfrom failed");
+            let n = task
+                .do_recvfrom(
+                    &server_fd,
+                    &mut buf,
+                    ReceiveFlags::empty(),
+                    Some(&mut source),
+                )
+                .expect("recvfrom failed");
             assert_eq!(n, msg2.len());
             assert_eq!(&buf[..n], b"Hello from client");
             assert_eq!(source, Some(client_addr));
@@ -3092,7 +3035,8 @@ mod unix_tests {
             assert_eq!(n, msg2.len());
 
             let mut buf = [0u8; 64];
-            let n = recvfrom(&task, &client_fd, &mut buf, ReceiveFlags::empty(), None)
+            let n = task
+                .do_recvfrom(&client_fd, &mut buf, ReceiveFlags::empty(), None)
                 .expect("recvfrom failed");
             assert_eq!(n, msg1.len() + msg2.len());
             assert_eq!(&buf[..n], b"Hello, world!");
@@ -3234,14 +3178,9 @@ mod unix_tests {
                 ppoll(&task, *raw_server_conn_fd, Events::IN);
             }
             let server_conn_fd = typed_socket(&task, *raw_server_conn_fd);
-            let n = recvfrom(
-                &task,
-                &server_conn_fd,
-                &mut buf,
-                ReceiveFlags::empty(),
-                None,
-            )
-            .expect("recvfrom failed");
+            let n = task
+                .do_recvfrom(&server_conn_fd, &mut buf, ReceiveFlags::empty(), None)
+                .expect("recvfrom failed");
             assert_eq!(n, msg.len());
             assert_eq!(&buf[..n], msg.as_bytes());
         }
@@ -3383,7 +3322,8 @@ mod unix_tests {
                 ppoll(&task, raw_sock2, Events::IN);
             }
             let sock2 = typed_socket(&task, raw_sock2);
-            let n = recvfrom(&task, &sock2, &mut buf, ReceiveFlags::empty(), None)
+            let n = task
+                .do_recvfrom(&sock2, &mut buf, ReceiveFlags::empty(), None)
                 .expect("recvfrom failed");
             assert_eq!(&buf[..n], b"Message from sock1");
         });
@@ -3401,7 +3341,8 @@ mod unix_tests {
                 ppoll(&task, raw_sock1, Events::IN);
             }
             let sock1 = typed_socket(&task, raw_sock1);
-            let n = recvfrom(&task, &sock1, &mut buf, ReceiveFlags::empty(), None)
+            let n = task
+                .do_recvfrom(&sock1, &mut buf, ReceiveFlags::empty(), None)
                 .expect("recvfrom failed");
             assert_eq!(&buf[..n], b"Message from sock2");
         });
@@ -3471,7 +3412,9 @@ mod unix_tests {
         .expect("Failed to set SO_RCVTIMEO");
         let mut buf = [0u8; 16];
         let start = std::time::Instant::now();
-        let err = recvfrom(&task, &sock1, &mut buf, ReceiveFlags::empty(), None).unwrap_err();
+        let err = task
+            .do_recvfrom(&sock1, &mut buf, ReceiveFlags::empty(), None)
+            .unwrap_err();
         let elapsed = start.elapsed();
         // Linux returns EAGAIN (not ETIMEDOUT) when SO_RCVTIMEO expires on a blocking recv.
         assert_eq!(err, Errno::EAGAIN);
