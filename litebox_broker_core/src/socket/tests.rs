@@ -1358,6 +1358,31 @@ pub(crate) fn check_socket_lifecycle(broker: &BrokerCore, provider: &TestSocketP
     check_duplicate_port_binding_retires_socket(broker, provider);
 }
 
+#[test]
+fn socket_reference_duplication_is_unsupported() {
+    let provider = Arc::new(TestSocketProvider::default());
+    let broker = test_broker(Arc::clone(&provider) as Arc<dyn SocketProvider>);
+    let source = broker
+        .create_session(CallerCredential::Unauthenticated)
+        .unwrap();
+    let target = broker
+        .create_session(CallerCredential::Unauthenticated)
+        .unwrap();
+    let handle = create(
+        &source,
+        create_request(),
+        Arc::new(TestReadinessSink::default()),
+    )
+    .unwrap();
+
+    assert_eq!(
+        source.duplicate_object_reference_to(handle, &target, ObjectRights::WAIT),
+        Err(BrokerError::UnsupportedOperation)
+    );
+    assert_eq!(source.close_object_reference(handle), Ok(()));
+    assert!(broker.references.read().is_empty());
+}
+
 fn check_platform_socket_retires_before_last_arc_drop(
     broker: &BrokerCore,
     provider: &TestSocketProvider,
