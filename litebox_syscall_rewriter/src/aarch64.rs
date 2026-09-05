@@ -60,9 +60,10 @@
 //! exclusive sequences.
 //!
 //! X18 gates require writable stack below SP. SP-writeback pairs may spill as
-//! deep as `align_up(16 + max(0, -writeback), 16)` and can fault near guard
-//! pages. Arbitrary-register aliasing is unsupported; SP-pair accesses are
-//! checked not to overlap the spill.
+//! deep as `align_up(16 + max(0, -writeback), 16)`. This extra spill can fault
+//! even when the native guest instruction would succeed; such a runtime spill
+//! fault is not attributed to the guest instruction. Arbitrary-register
+//! aliasing is unsupported; SP-pair accesses are checked not to overlap it.
 //!
 //! ## `X16` is preserved across an `SVC`
 //!
@@ -5608,6 +5609,32 @@ mod tests {
     }
 
     #[test]
+    fn sp_writeback_pair_variants_preserve_scaled_displacements() {
+        // Cover pre/post indexing, positive/negative displacements, and both
+        // integer element widths. The expected values come from the ISA, not
+        // from the gate's frame-size calculation.
+        for (word, expected_delta, expected_frame, expected_final_add) in [
+            (0xa9bf_4ff2, -16, 32, 16), // stp x18, x19, [sp, #-16]!
+            (0xa8c1_4ff2, 16, 16, 32),  // ldp x18, x19, [sp], #16
+            (0x29bf_4ff2, -8, 32, 24),  // stp w18, w19, [sp, #-8]!
+            (0x28c1_4ff2, 8, 16, 24),   // ldp w18, w19, [sp], #8
+        ] {
+            let pair = classify_x18_stack_writeback(word).unwrap();
+            assert_eq!(pair.layout.delta, expected_delta);
+            assert_eq!(pair.layout.frame_bytes, expected_frame);
+
+            let (_patched, outcome) =
+                hook_words_opt_with_config(&[word], 0x1000, 0x400000, x18_config(Host::Linux));
+            let outcome = outcome.unwrap();
+            let gate = &outcome.trampoline[GATES_START_OFFSET..];
+            assert_eq!(
+                word_at(gate, X18StackWritebackOffset::FinalSp.as_usize()),
+                Insn::AddSp(expected_final_add).encode().unwrap()
+            );
+        }
+    }
+
+    #[test]
     fn sp_writeback_recovery_plan_attributes_only_the_pair_to_guest() {
         for offset in (0..X18StackWritebackOffset::ExecutableEnd.as_usize()).step_by(INSN_BYTES) {
             let stage = X18StackWritebackOffset::from_offset(offset).unwrap();
@@ -6878,6 +6905,7 @@ mod tests {
     fn classifier_finds_every_x18_gate_kind() {
         let words = [
             0xaa00_03f2, // mov x18, x0
+            0xa9bf_4ff2, // stp x18, x19, [sp, #-16]!
             0x3500_0332, // cbnz w18, +0x64
             0x1000_0072, // adr x18, +0xc
             0xd61f_0240, // br x18
@@ -6889,13 +6917,22 @@ mod tests {
 
         for (index, (start, size)) in [
             (16usize, X18_SLOT_BYTES),
-            (16 + X18_SLOT_BYTES, X18_COMPARE_BRANCH_SLOT_BYTES),
+            (16 + X18_SLOT_BYTES, X18_STACK_WRITEBACK_SLOT_BYTES),
             (
-                16 + X18_SLOT_BYTES + X18_COMPARE_BRANCH_SLOT_BYTES,
+                16 + X18_SLOT_BYTES + X18_STACK_WRITEBACK_SLOT_BYTES,
+                X18_COMPARE_BRANCH_SLOT_BYTES,
+            ),
+            (
+                16 + X18_SLOT_BYTES
+                    + X18_STACK_WRITEBACK_SLOT_BYTES
+                    + X18_COMPARE_BRANCH_SLOT_BYTES,
                 X18_ADR_SLOT_BYTES,
             ),
             (
-                16 + X18_SLOT_BYTES + X18_COMPARE_BRANCH_SLOT_BYTES + X18_ADR_SLOT_BYTES,
+                16 + X18_SLOT_BYTES
+                    + X18_STACK_WRITEBACK_SLOT_BYTES
+                    + X18_COMPARE_BRANCH_SLOT_BYTES
+                    + X18_ADR_SLOT_BYTES,
                 X18_BRANCH_SLOT_BYTES,
             ),
         ]
@@ -6911,9 +6948,10 @@ mod tests {
             .unwrap();
             assert!(match index {
                 0 => matches!(metadata, GateMetadata::X18 { .. }),
-                1 => matches!(metadata, GateMetadata::X18CompareBranch { .. }),
-                2 => matches!(metadata, GateMetadata::X18Adr { .. }),
-                3 => matches!(metadata, GateMetadata::X18Branch { .. }),
+                1 => matches!(metadata, GateMetadata::X18StackWriteback { .. }),
+                2 => matches!(metadata, GateMetadata::X18CompareBranch { .. }),
+                3 => matches!(metadata, GateMetadata::X18Adr { .. }),
+                4 => matches!(metadata, GateMetadata::X18Branch { .. }),
                 _ => unreachable!(),
             });
             for offset in (0..metadata.executable_end()).step_by(INSN_BYTES) {
@@ -6958,6 +6996,32 @@ mod tests {
                 assert_eq!(classified.slot_size(), u8::try_from(size).unwrap());
                 assert_eq!(classified.metadata(), metadata);
             }
+        }
+
+        let (_patched, outcome) = hook_words_opt_with_config(
+            &[0xa9bf_4ff2], // stp x18, x19, [sp, #-16]!
+            0x1000,
+            base,
+            x18_config(Host::Linux),
+        );
+        let trampoline = outcome.unwrap().trampoline;
+        let slot = &trampoline[GATES_START_OFFSET..];
+        for offset in (0..X18StackWritebackOffset::ExecutableEnd.as_usize()).step_by(INSN_BYTES) {
+            let classified = classify_copied_gate_slot(
+                slot,
+                base + GATES_START_OFFSET as u64,
+                base + (GATES_START_OFFSET + offset) as u64,
+            )
+            .expect("emitted x18 stack-writeback slot must classify");
+            assert_eq!(classified.slot_offset(), 0);
+            assert_eq!(
+                classified.slot_size(),
+                u8::try_from(X18_STACK_WRITEBACK_SLOT_BYTES).unwrap()
+            );
+            assert!(matches!(
+                classified.metadata(),
+                GateMetadata::X18StackWriteback { .. }
+            ));
         }
     }
 

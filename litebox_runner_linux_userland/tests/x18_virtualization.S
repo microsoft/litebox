@@ -36,6 +36,26 @@ _start:
     cmp x17, x0
     b.ne fail
 
+    // Exercise x18 virtualization together with native SP writeback. The
+    // store/load round trip independently checks the memory values and SP.
+    mov x18, #0x1818
+    mov x21, #0x2121
+    stp x18, x21, [sp, #-16]!
+    sub x0, x19, #16
+    cmp sp, x0
+    b.ne fail
+    mov x18, xzr
+    mov x21, xzr
+    ldp x18, x21, [sp], #16
+    cmp sp, x19
+    b.ne fail
+    mov x0, #0x1818
+    cmp x18, x0
+    b.ne fail
+    mov x0, #0x2121
+    cmp x21, x0
+    b.ne fail
+
     mov x27, #15
     mov x0, #0x5050
     mov x1, #0x5151
