@@ -9,8 +9,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
-use crate::sync::{Mutex, RawSyncPrimitivesProvider};
 use crate::utils::id_pool::IdPool;
+use litebox_platform::sync::{Mutex, RawSyncPrimitivesProvider};
 
 use super::Error;
 use super::fcall::{self, Fcall, FcallStr, GetattrMask, TaggedFcall};

@@ -615,15 +615,25 @@ fn run_rewritten_node(ctx: BenchCtx<'_>) -> Result<()> {
         };
         cmd!(
             sh,
-            "cargo build -p litebox_runner_linux_userland {release...} {features...}"
+            "cargo build -p litebox_broker_userland -p litebox_runner_linux_userland {release...} {features...}"
         )
         .run()?;
     } else {
         let mode = if release_mode { "release" } else { "debug" };
+        let runner = project_root
+            .join("target")
+            .join(mode)
+            .join("litebox_runner_linux_userland");
+        let broker = project_root
+            .join("target")
+            .join(mode)
+            .join("litebox-broker-userland");
+        let program = sh.current_dir().join("node_rewritten");
         cmd!(
             sh,
-            "{project_root}/target/{mode}/litebox_runner_linux_userland --unstable --env HOME=/ --initial-files {tar_file} node_rewritten hello_world.js"
-        ).run()?;
+            "{broker} --filesystem-program {program} --filesystem-initial-files {tar_file} --runner {runner} -- --env HOME=/ {program} hello_world.js"
+        )
+        .run()?;
     }
     Ok(())
 }

@@ -27,10 +27,17 @@ use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_core::{BrokerCore, BrokerSession, CallerCredential};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse};
+use litebox_broker_protocol::filesystem::{
+    ChmodFileRequest, ChownFileRequest, HandleFileStatusRequest, MAX_FILESYSTEM_TRANSFER_SIZE,
+    MkdirFileRequest, OpenFileRequest, OpenFileResponse, PathFileStatusRequest,
+    ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest, ReadFileResponse,
+    RmdirFileRequest, SeekFileRequest, SeekFileResponse, TruncateFileRequest, UnlinkFileRequest,
+    WriteFileRequest, WriteFileResponse, encode_directory_entries,
+};
 use litebox_broker_protocol::message::{
     BrokerHandshakeResponse, BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
-    EventRequest, EventResponse, PipeRequest, PipeResponse, SocketRequest, SocketResponse,
-    StdioRequest, StdioResponse,
+    EventRequest, EventResponse, FilesystemRequest, FilesystemResponse, PipeRequest, PipeResponse,
+    SocketRequest, SocketResponse, StdioRequest, StdioResponse,
 };
 use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
@@ -111,12 +118,29 @@ impl<Memory: SharedMemory> BrokerHostAssociation<'_, Memory> {
             | BrokerOperation::Stdio(
                 StdioRequest::Read(ReadStdioRequest { buffer })
                 | StdioRequest::Write(WriteStdioRequest { buffer, .. }),
+            )
+            | BrokerOperation::Filesystem(
+                FilesystemRequest::Open(OpenFileRequest { path: buffer, .. })
+                | FilesystemRequest::Read(ReadFileRequest { buffer, .. })
+                | FilesystemRequest::Write(WriteFileRequest { buffer, .. })
+                | FilesystemRequest::ReadDirectory(ReadDirectoryRequest { buffer, .. })
+                | FilesystemRequest::PathStatus(PathFileStatusRequest { path: buffer, .. })
+                | FilesystemRequest::Chmod(ChmodFileRequest { path: buffer, .. })
+                | FilesystemRequest::Chown(ChownFileRequest { path: buffer, .. })
+                | FilesystemRequest::Unlink(UnlinkFileRequest { path: buffer, .. })
+                | FilesystemRequest::Mkdir(MkdirFileRequest { path: buffer, .. })
+                | FilesystemRequest::Rmdir(RmdirFileRequest { path: buffer, .. }),
             ) => Some(*buffer),
             BrokerOperation::CloseObject(_)
             | BrokerOperation::CheckReadiness(_)
             | BrokerOperation::Event(_)
             | BrokerOperation::Pipe(PipeRequest::Create(_))
             | BrokerOperation::Stdio(StdioRequest::IsTerminal(_))
+            | BrokerOperation::Filesystem(
+                FilesystemRequest::Seek(_)
+                | FilesystemRequest::Truncate(_)
+                | FilesystemRequest::HandleStatus(_),
+            )
             | BrokerOperation::Socket(
                 SocketRequest::Create(_)
                 | SocketRequest::Connect(_)
@@ -384,7 +408,278 @@ fn handle_request<Memory: SharedMemory>(
         BrokerOperation::Stdio(request) => {
             handle_stdio_request(session, request, shared_buffers).map(BrokerResult::Stdio)
         }
+        BrokerOperation::Filesystem(request) => {
+            handle_filesystem_request(session, request, shared_buffers)
+                .map(BrokerResult::Filesystem)
+        }
     }
+}
+
+fn handle_filesystem_request<Memory: SharedMemory>(
+    session: &BrokerSession,
+    request: FilesystemRequest,
+    shared_buffers: &SharedBufferPool<Memory>,
+) -> RequestResult<FilesystemResponse> {
+    match request {
+        FilesystemRequest::Open(OpenFileRequest {
+            namespace,
+            path,
+            user,
+            flags,
+            mode,
+        }) => {
+            let path = read_filesystem_path(shared_buffers, path)?;
+            match litebox_broker_core::filesystem::open(
+                session, namespace, &path, user, flags, mode,
+            )
+            .map_err(RequestFailure::from)?
+            {
+                Ok(handle) => Ok(FilesystemResponse::Open(OpenFileResponse { handle })),
+                Err(error) => Ok(FilesystemResponse::Failed(error)),
+            }
+        }
+        FilesystemRequest::Read(ReadFileRequest {
+            handle,
+            buffer,
+            offset,
+        }) => {
+            validate_filesystem_buffer(buffer)?;
+            let mut data = allocate_zeroed(buffer.length)?;
+            match litebox_broker_core::filesystem::read(session, handle, &mut data, offset)
+                .map_err(RequestFailure::from)?
+            {
+                Ok(read) => {
+                    shared_buffers
+                        .write(buffer.slot_index, &data[..read])
+                        .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
+                    Ok(FilesystemResponse::Read(ReadFileResponse {
+                        read: u32::try_from(read)
+                            .expect("validated filesystem read length must fit in u32"),
+                    }))
+                }
+                Err(error) => Ok(FilesystemResponse::Failed(error)),
+            }
+        }
+        FilesystemRequest::Write(WriteFileRequest {
+            handle,
+            buffer,
+            offset,
+        }) => {
+            validate_filesystem_buffer(buffer)?;
+            let data = read_shared_buffer(shared_buffers, buffer)?;
+            match litebox_broker_core::filesystem::write(session, handle, &data, offset)
+                .map_err(RequestFailure::from)?
+            {
+                Ok(written) => Ok(FilesystemResponse::Write(WriteFileResponse {
+                    written: u32::try_from(written)
+                        .expect("validated filesystem write length must fit in u32"),
+                })),
+                Err(error) => Ok(FilesystemResponse::Failed(error)),
+            }
+        }
+        FilesystemRequest::Seek(SeekFileRequest {
+            handle,
+            offset,
+            whence,
+        }) => match litebox_broker_core::filesystem::seek(session, handle, offset, whence)
+            .map_err(RequestFailure::from)?
+        {
+            Ok(offset) => Ok(FilesystemResponse::Seek(SeekFileResponse { offset })),
+            Err(error) => Ok(FilesystemResponse::Failed(error)),
+        },
+        FilesystemRequest::Truncate(TruncateFileRequest {
+            handle,
+            length,
+            reset_offset,
+        }) => {
+            match litebox_broker_core::filesystem::truncate(session, handle, length, reset_offset)
+                .map_err(RequestFailure::from)?
+            {
+                Ok(()) => Ok(FilesystemResponse::Truncate),
+                Err(error) => Ok(FilesystemResponse::Failed(error)),
+            }
+        }
+        FilesystemRequest::ReadDirectory(ReadDirectoryRequest {
+            handle,
+            buffer,
+            start_index,
+        }) => {
+            validate_filesystem_buffer(buffer)?;
+            let (entries, next_index) = match litebox_broker_core::filesystem::read_directory(
+                session,
+                handle,
+                start_index,
+                buffer.length as usize,
+            )
+            .map_err(RequestFailure::from)?
+            {
+                Ok(entries) => entries,
+                Err(error) => return Ok(FilesystemResponse::Failed(error)),
+            };
+            let payload = encode_directory_entries(&entries)
+                .map_err(|_| RequestFailure::Respond(ErrorCode::ResourceExhausted))?;
+            if payload.len() > buffer.length as usize {
+                return Err(RequestFailure::Abort(ErrorCode::Internal));
+            }
+            shared_buffers
+                .write(buffer.slot_index, &payload)
+                .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
+            Ok(FilesystemResponse::ReadDirectory(ReadDirectoryResponse {
+                length: u32::try_from(payload.len())
+                    .expect("directory payload must fit its shared-buffer descriptor"),
+                next_index,
+            }))
+        }
+        FilesystemRequest::PathStatus(PathFileStatusRequest {
+            namespace,
+            path,
+            user,
+        }) => {
+            let path = read_filesystem_path(shared_buffers, path)?;
+            Ok(
+                match litebox_broker_core::filesystem::path_status(session, namespace, &path, user)
+                    .map_err(RequestFailure::from)?
+                {
+                    Ok(status) => FilesystemResponse::Status(status),
+                    Err(error) => FilesystemResponse::Failed(error),
+                },
+            )
+        }
+        FilesystemRequest::HandleStatus(HandleFileStatusRequest { handle }) => {
+            match litebox_broker_core::filesystem::handle_status(session, handle)
+                .map_err(RequestFailure::from)?
+            {
+                Ok(status) => Ok(FilesystemResponse::Status(status)),
+                Err(error) => Ok(FilesystemResponse::Failed(error)),
+            }
+        }
+        FilesystemRequest::Chmod(ChmodFileRequest {
+            namespace,
+            path,
+            user,
+            mode,
+        }) => {
+            let path = read_filesystem_path(shared_buffers, path)?;
+            Ok(
+                match litebox_broker_core::filesystem::chmod(session, namespace, &path, user, mode)
+                    .map_err(RequestFailure::from)?
+                {
+                    Ok(()) => FilesystemResponse::Chmod,
+                    Err(error) => FilesystemResponse::Failed(error),
+                },
+            )
+        }
+        FilesystemRequest::Chown(ChownFileRequest {
+            namespace,
+            path,
+            acting_user,
+            user,
+            group,
+        }) => {
+            let path = read_filesystem_path(shared_buffers, path)?;
+            Ok(
+                match litebox_broker_core::filesystem::chown(
+                    session,
+                    namespace,
+                    &path,
+                    acting_user,
+                    user,
+                    group,
+                )
+                .map_err(RequestFailure::from)?
+                {
+                    Ok(()) => FilesystemResponse::Chown,
+                    Err(error) => FilesystemResponse::Failed(error),
+                },
+            )
+        }
+        FilesystemRequest::Unlink(UnlinkFileRequest {
+            namespace,
+            path,
+            user,
+        }) => {
+            let path = read_filesystem_path(shared_buffers, path)?;
+            Ok(
+                match litebox_broker_core::filesystem::unlink(session, namespace, &path, user)
+                    .map_err(RequestFailure::from)?
+                {
+                    Ok(()) => FilesystemResponse::Unlink,
+                    Err(error) => FilesystemResponse::Failed(error),
+                },
+            )
+        }
+        FilesystemRequest::Mkdir(MkdirFileRequest {
+            namespace,
+            path,
+            user,
+            mode,
+        }) => {
+            let path = read_filesystem_path(shared_buffers, path)?;
+            Ok(
+                match litebox_broker_core::filesystem::mkdir(session, namespace, &path, user, mode)
+                    .map_err(RequestFailure::from)?
+                {
+                    Ok(()) => FilesystemResponse::Mkdir,
+                    Err(error) => FilesystemResponse::Failed(error),
+                },
+            )
+        }
+        FilesystemRequest::Rmdir(RmdirFileRequest {
+            namespace,
+            path,
+            user,
+        }) => {
+            let path = read_filesystem_path(shared_buffers, path)?;
+            Ok(
+                match litebox_broker_core::filesystem::rmdir(session, namespace, &path, user)
+                    .map_err(RequestFailure::from)?
+                {
+                    Ok(()) => FilesystemResponse::Rmdir,
+                    Err(error) => FilesystemResponse::Failed(error),
+                },
+            )
+        }
+    }
+}
+
+fn validate_filesystem_buffer(buffer: SharedBufferDescriptor) -> RequestResult<()> {
+    if buffer.length > MAX_FILESYSTEM_TRANSFER_SIZE {
+        return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
+    }
+    Ok(())
+}
+
+fn allocate_zeroed(length: u32) -> RequestResult<Vec<u8>> {
+    let mut data = Vec::new();
+    data.try_reserve_exact(length as usize)
+        .map_err(|_| RequestFailure::Respond(ErrorCode::OutOfMemory))?;
+    data.resize(length as usize, 0);
+    Ok(data)
+}
+
+fn read_shared_buffer<Memory: SharedMemory>(
+    shared_buffers: &SharedBufferPool<Memory>,
+    buffer: SharedBufferDescriptor,
+) -> RequestResult<Vec<u8>> {
+    validate_filesystem_buffer(buffer)?;
+    let mut data = allocate_zeroed(buffer.length)?;
+    shared_buffers
+        .read(buffer.slot_index, &mut data)
+        .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
+    Ok(data)
+}
+
+fn read_filesystem_path<Memory: SharedMemory>(
+    shared_buffers: &SharedBufferPool<Memory>,
+    buffer: SharedBufferDescriptor,
+) -> RequestResult<alloc::string::String> {
+    let data = read_shared_buffer(shared_buffers, buffer)?;
+    let path = alloc::string::String::from_utf8(data)
+        .map_err(|_| RequestFailure::Abort(ErrorCode::MalformedRequest))?;
+    if !path.starts_with('/') {
+        return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
+    }
+    Ok(path)
 }
 
 fn handle_stdio_request<Memory: SharedMemory>(
@@ -1071,6 +1366,7 @@ mod tests {
             Arc::new(TestSocketProvider),
             Arc::new(TestRandomProvider),
             Arc::clone(&stdio_provider) as Arc<dyn StdioProvider>,
+            Arc::new(litebox_broker_core::filesystem::UnsupportedFilesystemProvider),
         )
         .unwrap();
 

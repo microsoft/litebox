@@ -1466,18 +1466,18 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                 return NtStatus::ACCESS_VIOLATION;
             };
             let chunk_offset = offset.map(|offset| offset + total_written);
-            let write = file.with_entry(|file| match &file.backing {
+            let (write, continue_after_short_write) = file.with_entry(|file| match &file.backing {
                 FileObjectBacking::Filesystem { fd, is_directory } => {
                     if *is_directory {
-                        return Err(WriteError::NotAFile);
+                        return (Err(WriteError::NotAFile), false);
                     }
-                    self.fs.write(fd, &bytes, chunk_offset)
+                    (self.fs.write(fd, &bytes, chunk_offset), true)
                 }
                 FileObjectBacking::CondrvStream { fd, .. } => {
-                    self.fs.write(fd, &bytes, chunk_offset)
+                    (self.fs.write(fd, &bytes, chunk_offset), false)
                 }
                 FileObjectBacking::CondrvControl(_) | FileObjectBacking::KsecDevice => {
-                    Err(WriteError::NotAFile)
+                    (Err(WriteError::NotAFile), false)
                 }
             });
             let written = match write {
@@ -1487,7 +1487,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                 Err(error) => break Err(error),
             };
             total_written += written;
-            if written < chunk_length {
+            if written < chunk_length && !continue_after_short_write {
                 break Ok(total_written);
             }
         };
@@ -1568,7 +1568,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                 }
                 let chunk_length = (output_length - total_read).min(bytes.len());
                 let chunk_offset = offset.map(|offset| offset + total_read);
-                let (read, continue_after_full_chunk) = match &file.backing {
+                let (read, continue_after_short_read) = match &file.backing {
                     FileObjectBacking::Filesystem { fd, is_directory } => {
                         if *is_directory {
                             return Err(ReadError::NotAFile);
@@ -1599,7 +1599,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                     return Err(ReadError::Io);
                 }
                 total_read += read;
-                if read < chunk_length || !continue_after_full_chunk {
+                if !continue_after_short_read {
                     break;
                 }
             }

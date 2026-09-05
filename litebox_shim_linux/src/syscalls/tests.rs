@@ -65,6 +65,7 @@ fn test_broker() -> &'static BrokerCore {
             alloc::sync::Arc::new(PipeOnlySocketProvider),
             alloc::sync::Arc::new(UnusedRandomProvider),
             alloc::sync::Arc::new(TestStdioProvider),
+            alloc::sync::Arc::new(litebox_broker_core::filesystem::UnsupportedFilesystemProvider),
         )
         .unwrap()
     })

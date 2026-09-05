@@ -26,7 +26,7 @@ use crate::fs::errors::{
     ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use crate::fs::nine_p::fcall::Rlerror;
-use crate::sync;
+use litebox_platform::sync;
 
 mod client;
 mod fcall;

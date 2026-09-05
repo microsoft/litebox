@@ -4,17 +4,26 @@
 use std::error::Error;
 use std::io::{BufRead, BufReader, Error as IoError, ErrorKind, Result as IoResult};
 use std::net::{Ipv4Addr, SocketAddrV4};
+use std::os::linux::fs::MetadataExt as _;
 use std::os::unix::net::UnixListener;
+use std::path::Path;
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::Arc;
 use std::sync::mpsc::{RecvTimeoutError, sync_channel};
 use std::time::{Duration, Instant};
 
+use litebox::fs::Mode;
+use litebox::fs::composer::Composer;
+use litebox::fs::in_mem::{InMem, InitialNode};
+use litebox::fs::overlay::Overlay;
+use litebox::fs::resolver::Filesystem;
+use litebox::fs::tar_ro::{EMPTY_TAR_FILE, TarRo};
+use litebox_broker_core::filesystem::FilesystemProvider;
 use litebox_broker_core::socket::HOST_GATEWAY_IPV4_ADDRESS;
 use litebox_broker_core::{BrokerCore, BrokerCoreLimits, ObjectRights, PolicyEngine};
-use litebox_broker_platform_linux_userland::LinuxSocketProvider;
 #[cfg(feature = "lock_tracing")]
 use litebox_broker_platform_linux_userland::LinuxTimeProvider;
+use litebox_broker_platform_linux_userland::{LinuxSocketProvider, LinuxSyncPrimitivesProvider};
 use litebox_broker_protocol::message::{BrokerRequest, BrokerResponse};
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport::channel::HostReceive;
@@ -79,6 +88,13 @@ pub(super) fn run(mut args: super::CliArgs) -> Result<(), Box<dyn Error>> {
     let control_listener = UnixListener::bind(&control_socket_path)?;
     control_listener.set_nonblocking(true)?;
     let limits = BrokerCoreLimits::DEFAULT;
+    let random_provider = Arc::new(UserlandRandomProvider);
+    let stdio_provider = Arc::new(UserlandStdioProvider::new()?);
+    let filesystem_provider = create_filesystem_provider(
+        &args,
+        Arc::clone(&random_provider) as Arc<dyn litebox_broker_core::random::RandomProvider>,
+        Arc::clone(&stdio_provider) as Arc<dyn litebox_broker_core::stdio::StdioProvider>,
+    )?;
     let broker = BrokerCore::new_with_limits(
         PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()).with_socket_policy(
             configured_socket_policy(&args.allow_tcp_destination, &args.allow_udp_destination)?,
@@ -88,8 +104,9 @@ pub(super) fn run(mut args: super::CliArgs) -> Result<(), Box<dyn Error>> {
             limits.max_sockets,
             limits.max_sockets_per_session,
         )?),
-        Arc::new(UserlandRandomProvider),
-        Arc::new(UserlandStdioProvider::new()?),
+        random_provider,
+        stdio_provider,
+        filesystem_provider,
     )?;
 
     crate::run_runner_process(
@@ -100,6 +117,127 @@ pub(super) fn run(mut args: super::CliArgs) -> Result<(), Box<dyn Error>> {
             serve_runner(&broker, &control_listener, runner, runner_process_id)
         },
     )
+}
+
+fn create_filesystem_provider(
+    args: &super::CliArgs,
+    random: Arc<dyn litebox_broker_core::random::RandomProvider>,
+    stdio: Arc<dyn litebox_broker_core::stdio::StdioProvider>,
+) -> Result<Arc<dyn FilesystemProvider>, Box<dyn Error>> {
+    const DEFAULT_GUEST_UID: u16 = 1000;
+    const DEFAULT_GUEST_GID: u16 = 1000;
+
+    let mut entries = Vec::new();
+    if let Some(program) = args.filesystem_program.as_deref() {
+        let program = std::path::absolute(program)?;
+        let ancestors: Vec<_> = program.ancestors().skip(1).collect();
+        let mut previous_user = 0;
+        for path in ancestors.into_iter().rev().skip(1) {
+            let metadata = path.metadata()?;
+            let owner = if previous_user == 0 && metadata.st_uid() == 0 {
+                litebox::fs::UserInfo::ROOT
+            } else {
+                litebox::fs::UserInfo {
+                    user: DEFAULT_GUEST_UID,
+                    group: DEFAULT_GUEST_GID,
+                }
+            };
+            entries.push((
+                path_to_string(path)?,
+                InitialNode::Directory {
+                    mode: Mode::from_bits_retain(metadata.st_mode()),
+                    owner,
+                },
+            ));
+            previous_user = metadata.st_uid();
+        }
+        let mut program_data = std::fs::read(&program)?;
+        if args.filesystem_rewrite_syscalls {
+            program_data = litebox_syscall_rewriter::hook_syscalls_in_elf_with_options(
+                &program_data,
+                None,
+                litebox_syscall_rewriter::RewriteOptions::new(
+                    litebox_syscall_rewriter::TargetHost::Linux,
+                    args.filesystem_virtualize_x18,
+                ),
+            )?;
+        }
+        let metadata = program.metadata()?;
+        entries.push((
+            path_to_string(&program)?,
+            InitialNode::File {
+                mode: Mode::from_bits_retain(metadata.st_mode()),
+                owner: if previous_user == 0 && metadata.st_uid() == 0 {
+                    litebox::fs::UserInfo::ROOT
+                } else {
+                    litebox::fs::UserInfo {
+                        user: DEFAULT_GUEST_UID,
+                        group: DEFAULT_GUEST_GID,
+                    }
+                },
+                data: program_data.into(),
+            },
+        ));
+    }
+
+    let tmp_mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
+    if let Some((_, InitialNode::Directory { mode, .. })) =
+        entries.iter_mut().find(|(path, _)| path == "/tmp")
+    {
+        *mode = tmp_mode;
+    } else {
+        entries.push((
+            "/tmp".to_owned(),
+            InitialNode::Directory {
+                mode: tmp_mode,
+                owner: litebox::fs::UserInfo::ROOT,
+            },
+        ));
+    }
+
+    let tar_data = match args.filesystem_initial_files.as_deref() {
+        Some(path) => {
+            if path.extension().and_then(|extension| extension.to_str()) != Some("tar") {
+                return Err(IoError::new(
+                    ErrorKind::InvalidInput,
+                    format!("expected a .tar file, found {}", path.display()),
+                )
+                .into());
+            }
+            std::borrow::Cow::Owned(std::fs::read(path)?)
+        }
+        None => std::borrow::Cow::Borrowed(EMPTY_TAR_FILE),
+    };
+    let in_mem = InMem::<LinuxSyncPrimitivesProvider>::new_initialized(entries);
+    let backend = Composer::builder()
+        .mount_nestable("/", |allocators| {
+            Overlay::<LinuxSyncPrimitivesProvider>::new(
+                in_mem,
+                TarRo::new(tar_data, allocators.next()),
+                allocators.next(),
+            )
+        })
+        .mount("/dev", litebox::fs::devices::Devices::new)
+        .build()
+        .map_err(|_| IoError::other("failed to construct broker filesystem"))?;
+    let guest = Arc::new(super::filesystem::FilesystemProviderAdapter::new(
+        Filesystem::<LinuxSyncPrimitivesProvider, _>::new(backend),
+        Arc::clone(&random),
+        Arc::clone(&stdio),
+    )) as Arc<dyn FilesystemProvider>;
+    let windows_registry = super::filesystem::create_windows_registry_provider::<
+        LinuxSyncPrimitivesProvider,
+    >(random, stdio)
+    .map_err(IoError::other)?;
+    Ok(Arc::new(
+        super::filesystem::NamespacedFilesystemProvider::new(guest, windows_registry),
+    ))
+}
+
+fn path_to_string(path: &Path) -> Result<String, IoError> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "filesystem path is not UTF-8"))
 }
 
 struct ManagedEgressProxy {

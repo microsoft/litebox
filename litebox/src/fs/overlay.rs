@@ -20,7 +20,7 @@ use alloc::vec::Vec;
 
 use hashbrown::{HashMap, HashSet};
 
-use crate::sync::{Mutex, MutexGuard, RawSyncPrimitivesProvider};
+use litebox_platform::sync::{Mutex, MutexGuard, RawSyncPrimitivesProvider};
 
 use super::backend::{
     Backend, BackendHandles, CreationMetadata, DeviceIo, DirHandle, FileHandle, Handle, HandleRef,

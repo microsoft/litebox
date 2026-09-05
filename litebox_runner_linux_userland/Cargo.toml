@@ -24,6 +24,7 @@ litebox_util_log = { version = "0.1.0", path = "../litebox_util_log", features =
 sha2 = "0.10"
 walkdir = "2.0"
 glob = "0.3"
+litebox_shim_linux = { version = "0.1.0", path = "../litebox_shim_linux", features = ["local_filesystem"] }
 litebox_broker_core = { version = "0.1.0", path = "../litebox_broker_core" }
 litebox_broker_host = { version = "0.1.0", path = "../litebox_broker_host" }
 litebox_broker_platform_linux_userland = { version = "0.1.0", path = "../litebox_broker_platform_linux_userland" }

@@ -3,7 +3,7 @@
 
 //! The path-management/permissions/... layer, that sits above [`super::backend`].
 
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -11,6 +11,13 @@ use alloc::vec::Vec;
 use crate::fs::UserInfo;
 use crate::path::Arg;
 use crate::{LiteBox, fd::TypedFd, sync};
+use litebox_broker_protocol::ObjectHandle;
+use litebox_broker_protocol::error::ErrorCode;
+use litebox_broker_protocol::filesystem::{
+    FilesystemDirectoryEntry, FilesystemError, FilesystemFileStatus, FilesystemFileType,
+    FilesystemNamespace, FilesystemNodeInfo, FilesystemSeekWhence, FilesystemUser,
+};
+use litebox_platform::sync::RawSyncPrimitivesProvider as RawPlatformSyncPrimitivesProvider;
 
 use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
@@ -31,15 +38,39 @@ pub struct Resolver<
     Backend: super::backend::Backend + 'static,
 > {
     litebox: LiteBox<Platform>,
-    core: ResolverCore<Backend>,
+    authority: ResolverAuthority<Backend>,
+}
+
+enum ResolverAuthority<Backend: super::backend::Backend + 'static> {
+    #[cfg(any(test, feature = "local_filesystem"))]
+    Local(ResolverCore<Backend>),
+    Broker(
+        Arc<dyn crate::broker::BrokerControl>,
+        FilesystemNamespace,
+        core::marker::PhantomData<fn() -> Backend>,
+    ),
 }
 
 struct ResolverCore<Backend: super::backend::Backend + 'static> {
     backend: Backend,
 }
 
-struct OpenFileDescription<Platform: sync::RawSyncPrimitivesProvider> {
+struct OpenFileDescription<Platform: RawPlatformSyncPrimitivesProvider> {
     state: sync::Mutex<Platform, OpenFileDescriptionState>,
+}
+
+/// Filesystem namespace and open-file-description engine for broker deployments.
+pub struct Filesystem<
+    Platform: RawPlatformSyncPrimitivesProvider,
+    Backend: super::backend::Backend + 'static,
+> {
+    core: ResolverCore<Backend>,
+    _platform: core::marker::PhantomData<Platform>,
+}
+
+/// One open-file description owned by a [`Filesystem`].
+pub struct FilesystemOpenFile<Platform: RawPlatformSyncPrimitivesProvider> {
+    description: Arc<OpenFileDescription<Platform>>,
 }
 
 #[expect(
@@ -60,11 +91,185 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     Resolver<Platform, Backend>
 {
     /// Construct a new resolver over a `backend`.
+    #[cfg(any(test, feature = "local_filesystem"))]
     #[must_use]
     pub fn new(litebox: &LiteBox<Platform>, backend: Backend) -> Self {
         Self {
             litebox: litebox.clone(),
+            authority: ResolverAuthority::Local(ResolverCore { backend }),
+        }
+    }
+}
+
+impl<Platform: RawPlatformSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
+    Filesystem<Platform, Backend>
+{
+    /// Constructs a filesystem engine over `backend`.
+    #[must_use]
+    pub fn new(backend: Backend) -> Self {
+        Self {
             core: ResolverCore { backend },
+            _platform: core::marker::PhantomData,
+        }
+    }
+
+    /// Opens an absolute path.
+    pub fn open(
+        &self,
+        user: UserInfo,
+        path: &str,
+        flags: OFlags,
+        mode: Mode,
+    ) -> Result<FilesystemOpenFile<Platform>, OpenError> {
+        let context = root_context(user);
+        self.core
+            .open::<Platform>(&context, path, flags, mode)
+            .map(|description| FilesystemOpenFile { description })
+    }
+
+    /// Reads from an open file.
+    pub fn read(
+        &self,
+        device_io: &dyn DeviceIo,
+        file: &FilesystemOpenFile<Platform>,
+        output: &mut [u8],
+        offset: Option<usize>,
+    ) -> Result<usize, ReadError> {
+        self.core.read(device_io, &file.description, output, offset)
+    }
+
+    /// Writes to an open file.
+    pub fn write(
+        &self,
+        device_io: &dyn DeviceIo,
+        file: &FilesystemOpenFile<Platform>,
+        input: &[u8],
+        offset: Option<usize>,
+    ) -> Result<usize, WriteError> {
+        self.core.write(device_io, &file.description, input, offset)
+    }
+
+    /// Repositions an open file.
+    pub fn seek(
+        &self,
+        file: &FilesystemOpenFile<Platform>,
+        offset: isize,
+        whence: super::SeekWhence,
+    ) -> Result<usize, SeekError> {
+        self.core.seek(&file.description, offset, whence)
+    }
+
+    /// Truncates an open file.
+    pub fn truncate(
+        &self,
+        file: &FilesystemOpenFile<Platform>,
+        length: usize,
+        reset_offset: bool,
+    ) -> Result<(), TruncateError> {
+        self.core.truncate(&file.description, length, reset_offset)
+    }
+
+    /// Reads all entries from an open directory.
+    pub fn read_dir(
+        &self,
+        file: &FilesystemOpenFile<Platform>,
+    ) -> Result<Vec<super::DirEntry>, ReadDirError> {
+        self.core.read_dir(&file.description)
+    }
+
+    /// Returns status for an absolute path.
+    pub fn file_status(
+        &self,
+        user: UserInfo,
+        path: &str,
+    ) -> Result<super::FileStatus, FileStatusError> {
+        self.core.file_status::<Platform>(&root_context(user), path)
+    }
+
+    /// Returns status for an open file.
+    pub fn handle_status(
+        &self,
+        file: &FilesystemOpenFile<Platform>,
+    ) -> Result<super::FileStatus, FileStatusError> {
+        self.core.fd_file_status(&file.description)
+    }
+
+    /// Changes mode bits for an absolute path.
+    pub fn chmod(&self, user: UserInfo, path: &str, mode: Mode) -> Result<(), ChmodError> {
+        self.core.chmod(&root_context(user), path, mode)
+    }
+
+    /// Changes ownership for an absolute path.
+    pub fn chown(
+        &self,
+        acting_user: UserInfo,
+        path: &str,
+        user: Option<u16>,
+        group: Option<u16>,
+    ) -> Result<(), ChownError> {
+        self.core
+            .chown(&root_context(acting_user), path, user, group)
+    }
+
+    /// Removes a file at an absolute path.
+    pub fn unlink(&self, user: UserInfo, path: &str) -> Result<(), UnlinkError> {
+        self.core.unlink(&root_context(user), path)
+    }
+
+    /// Creates a directory at an absolute path.
+    pub fn mkdir(&self, user: UserInfo, path: &str, mode: Mode) -> Result<(), MkdirError> {
+        self.core.mkdir(&root_context(user), path, mode)
+    }
+
+    /// Removes a directory at an absolute path.
+    pub fn rmdir(&self, user: UserInfo, path: &str) -> Result<(), RmdirError> {
+        self.core.rmdir(&root_context(user), path)
+    }
+}
+
+fn root_context(user: UserInfo) -> Context {
+    let mut context = Context::new();
+    context.set_acting_user(user);
+    context
+}
+
+impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
+    Resolver<Platform, Backend>
+{
+    /// Constructs a resolver whose filesystem authority is owned by the broker.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `litebox` has no negotiated broker connection.
+    #[must_use]
+    pub fn new_brokered(litebox: &LiteBox<Platform>) -> Self {
+        Self::new_brokered_in_namespace(litebox, FilesystemNamespace::Guest)
+    }
+
+    /// Constructs a resolver for the broker-owned Windows registry namespace.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `litebox` has no negotiated broker connection.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn new_brokered_windows_registry(litebox: &LiteBox<Platform>) -> Self {
+        Self::new_brokered_in_namespace(litebox, FilesystemNamespace::WindowsRegistry)
+    }
+
+    fn new_brokered_in_namespace(
+        litebox: &LiteBox<Platform>,
+        namespace: FilesystemNamespace,
+    ) -> Self {
+        Self {
+            litebox: litebox.clone(),
+            authority: ResolverAuthority::Broker(
+                litebox
+                    .broker_control()
+                    .expect("brokered filesystem requires a broker connection"),
+                namespace,
+                core::marker::PhantomData,
+            ),
         }
     }
 }
@@ -502,7 +707,7 @@ impl<Backend: super::backend::Backend + 'static> ResolverCore<Backend> {
     /// Opens a file
     ///
     /// The `mode` is only significant when creating a file
-    fn open<Platform: sync::RawSyncPrimitivesProvider>(
+    fn open<Platform: RawPlatformSyncPrimitivesProvider>(
         &self,
         context: &Context,
         path: impl Arg,
@@ -524,7 +729,7 @@ impl<Backend: super::backend::Backend + 'static> ResolverCore<Backend> {
             .union(OFlags::PATH);
 
         if flags.intersects(CURRENTLY_SUPPORTED_OFLAGS.complement()) {
-            unimplemented!("{flags:?}")
+            return Err(OpenError::Io);
         }
         let path_only = flags.contains(OFlags::PATH);
         if path_only {
@@ -666,7 +871,7 @@ impl<Backend: super::backend::Backend + 'static> ResolverCore<Backend> {
     /// # Panics
     ///
     /// Panics if the updated file offset would overflow `usize`.
-    fn read<Platform: sync::RawSyncPrimitivesProvider>(
+    fn read<Platform: RawPlatformSyncPrimitivesProvider>(
         &self,
         device_io: &dyn DeviceIo,
         description: &OpenFileDescription<Platform>,
@@ -683,8 +888,7 @@ impl<Backend: super::backend::Backend + 'static> ResolverCore<Backend> {
             return Err(ReadError::NotForReading);
         }
         if state.path_only {
-            // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
-            unimplemented!("read from O_PATH fd")
+            return Err(ReadError::NotForReading);
         }
 
         let read_offset = match seek_behavior {
@@ -707,7 +911,7 @@ impl<Backend: super::backend::Backend + 'static> ResolverCore<Backend> {
     /// # Panics
     ///
     /// Panics if the updated file offset would overflow `usize`.
-    fn write<Platform: sync::RawSyncPrimitivesProvider>(
+    fn write<Platform: RawPlatformSyncPrimitivesProvider>(
         &self,
         device_io: &dyn DeviceIo,
         description: &OpenFileDescription<Platform>,
@@ -724,8 +928,7 @@ impl<Backend: super::backend::Backend + 'static> ResolverCore<Backend> {
             return Err(WriteError::NotForWriting);
         }
         if state.path_only {
-            // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
-            unimplemented!("write to O_PATH fd")
+            return Err(WriteError::NotForWriting);
         }
 
         let write_offset = match seek_behavior {
@@ -748,7 +951,7 @@ impl<Backend: super::backend::Backend + 'static> ResolverCore<Backend> {
     /// Reposition read/write file offset, by changing it to `offset` relative to `whence`.
     ///
     /// Returns the resulting offset (in bytes from start of file) on success.
-    fn seek<Platform: sync::RawSyncPrimitivesProvider>(
+    fn seek<Platform: RawPlatformSyncPrimitivesProvider>(
         &self,
         description: &OpenFileDescription<Platform>,
         offset: isize,
@@ -760,8 +963,7 @@ impl<Backend: super::backend::Backend + 'static> ResolverCore<Backend> {
             Handle::Dir(_) => return Err(SeekError::NotAFile),
         };
         if state.path_only {
-            // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
-            unimplemented!("seek on O_PATH fd")
+            return Err(SeekError::NonSeekable);
         }
 
         match state.seek_behavior {
@@ -798,7 +1000,7 @@ impl<Backend: super::backend::Backend + 'static> ResolverCore<Backend> {
     /// adding `\0`s.
     ///
     /// If `reset_offset` is true, the offset is reset to zero; otherwise, it remains unchanged.
-    fn truncate<Platform: sync::RawSyncPrimitivesProvider>(
+    fn truncate<Platform: RawPlatformSyncPrimitivesProvider>(
         &self,
         description: &OpenFileDescription<Platform>,
         length: usize,
@@ -813,8 +1015,7 @@ impl<Backend: super::backend::Backend + 'static> ResolverCore<Backend> {
             return Err(TruncateError::NotForWriting);
         }
         if state.path_only {
-            // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
-            unimplemented!("truncate O_PATH fd")
+            return Err(TruncateError::NotForWriting);
         }
 
         self.backend.truncate(file, length)?;
@@ -952,14 +1153,13 @@ impl<Backend: super::backend::Backend + 'static> ResolverCore<Backend> {
     /// Read directory entries from a directory file descriptor.
     ///
     /// Returns a list of file/directory names (explicitly _not_ including `.` or `..`).
-    fn read_dir<Platform: sync::RawSyncPrimitivesProvider>(
+    fn read_dir<Platform: RawPlatformSyncPrimitivesProvider>(
         &self,
         description: &OpenFileDescription<Platform>,
     ) -> Result<Vec<super::DirEntry>, ReadDirError> {
         let state = description.state.lock();
         if state.path_only {
-            // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
-            unimplemented!("read_dir on O_PATH fd")
+            return Err(ReadDirError::NotADirectory);
         }
         let dir = match &state.handle {
             Handle::File(_) => return Err(ReadDirError::NotADirectory),
@@ -983,7 +1183,7 @@ impl<Backend: super::backend::Backend + 'static> ResolverCore<Backend> {
     }
 
     /// Obtain the status of a file/directory/... on the file-system.
-    fn file_status<Platform: sync::RawSyncPrimitivesProvider>(
+    fn file_status<Platform: RawPlatformSyncPrimitivesProvider>(
         &self,
         context: &Context,
         path: impl Arg,
@@ -1003,7 +1203,7 @@ impl<Backend: super::backend::Backend + 'static> ResolverCore<Backend> {
     }
 
     /// Equivalent to [`Self::file_status`], but on an open `fd` instead.
-    fn fd_file_status<Platform: sync::RawSyncPrimitivesProvider>(
+    fn fd_file_status<Platform: RawPlatformSyncPrimitivesProvider>(
         &self,
         description: &OpenFileDescription<Platform>,
     ) -> Result<super::FileStatus, FileStatusError> {
@@ -1017,7 +1217,8 @@ impl<Backend: super::backend::Backend + 'static> ResolverCore<Backend> {
     /// backed by borrowed static data (e.g., set up via [`super::in_mem::InitialNode::File`]).
     ///
     /// Returns `None` if no static backing data is available/supported.
-    fn get_static_backing_data<Platform: sync::RawSyncPrimitivesProvider>(
+    #[cfg(any(test, feature = "local_filesystem"))]
+    fn get_static_backing_data<Platform: RawPlatformSyncPrimitivesProvider>(
         &self,
         description: &OpenFileDescription<Platform>,
     ) -> Option<&'static [u8]> {
@@ -1032,13 +1233,10 @@ impl<Backend: super::backend::Backend + 'static> ResolverCore<Backend> {
 impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
     Resolver<Platform, Backend>
 {
-    fn open_file_description(
-        &self,
-        fd: &TypedFd<Self>,
-    ) -> Option<Arc<OpenFileDescription<Platform>>> {
+    fn open_file_description(&self, fd: &TypedFd<Self>) -> Option<ResolverDescription<Platform>> {
         let entry = self.litebox.descriptor_table().entry_handle(fd)?;
         let entry = entry.get_entry();
-        Some(Arc::clone(&entry.entry.description))
+        Some(entry.entry.description.clone())
     }
 
     /// Opens a file.
@@ -1051,7 +1249,32 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         flags: OFlags,
         mode: Mode,
     ) -> Result<TypedFd<Self>, OpenError> {
-        let description = self.core.open::<Platform>(context, path, flags, mode)?;
+        let description = match &self.authority {
+            #[cfg(any(test, feature = "local_filesystem"))]
+            ResolverAuthority::Local(core) => {
+                ResolverDescription::Local(core.open::<Platform>(context, path, flags, mode)?)
+            }
+            ResolverAuthority::Broker(broker, namespace, _) => {
+                let path = context.resolve(path)?.to_string();
+                let handle = broker
+                    .open_file(
+                        *namespace,
+                        &path,
+                        filesystem_user(context.acting_user()),
+                        flags.bits(),
+                        mode.bits(),
+                    )
+                    .map_err(|_| OpenError::Io)?
+                    .map_err(open_error)?;
+                ResolverDescription::Broker(
+                    BrokerOpenFileDescription(Arc::new(BrokerOpenFileDescriptionInner {
+                        broker: Arc::clone(broker),
+                        handle,
+                    })),
+                    core::marker::PhantomData,
+                )
+            }
+        };
         Ok(self.litebox.descriptor_table_mut().insert(ResolverEntry {
             description,
             _backend: core::marker::PhantomData,
@@ -1078,7 +1301,28 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         offset: Option<usize>,
     ) -> Result<usize, ReadError> {
         let description = self.open_file_description(fd).ok_or(ReadError::ClosedFd)?;
-        self.core.read(&self.litebox, &description, buf, offset)
+        match (&self.authority, description) {
+            #[cfg(any(test, feature = "local_filesystem"))]
+            (ResolverAuthority::Local(core), ResolverDescription::Local(description)) => {
+                core.read(&self.litebox, &description, buf, offset)
+            }
+            (ResolverAuthority::Broker(_, _, _), ResolverDescription::Broker(description, _)) => {
+                description
+                    .broker
+                    .read_file(
+                        description.handle,
+                        buf,
+                        offset
+                            .map(u64::try_from)
+                            .transpose()
+                            .map_err(|_| ReadError::Io)?,
+                    )
+                    .map_err(|error| broker_fd_error(error, ReadError::ClosedFd, ReadError::Io))?
+                    .map_err(read_error)
+            }
+            #[cfg(any(test, feature = "local_filesystem"))]
+            _ => unreachable!("resolver entry authority must match its resolver"),
+        }
     }
 
     /// Writes to `fd`, optionally at an explicit offset.
@@ -1089,7 +1333,28 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         offset: Option<usize>,
     ) -> Result<usize, WriteError> {
         let description = self.open_file_description(fd).ok_or(WriteError::ClosedFd)?;
-        self.core.write(&self.litebox, &description, buf, offset)
+        match (&self.authority, description) {
+            #[cfg(any(test, feature = "local_filesystem"))]
+            (ResolverAuthority::Local(core), ResolverDescription::Local(description)) => {
+                core.write(&self.litebox, &description, buf, offset)
+            }
+            (ResolverAuthority::Broker(_, _, _), ResolverDescription::Broker(description, _)) => {
+                description
+                    .broker
+                    .write_file(
+                        description.handle,
+                        buf,
+                        offset
+                            .map(u64::try_from)
+                            .transpose()
+                            .map_err(|_| WriteError::Io)?,
+                    )
+                    .map_err(|error| broker_fd_error(error, WriteError::ClosedFd, WriteError::Io))?
+                    .map_err(write_error)
+            }
+            #[cfg(any(test, feature = "local_filesystem"))]
+            _ => unreachable!("resolver entry authority must match its resolver"),
+        }
     }
 
     /// Repositions the shared offset of `fd`.
@@ -1100,7 +1365,23 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         whence: super::SeekWhence,
     ) -> Result<usize, SeekError> {
         let description = self.open_file_description(fd).ok_or(SeekError::ClosedFd)?;
-        self.core.seek(&description, offset, whence)
+        match (&self.authority, description) {
+            #[cfg(any(test, feature = "local_filesystem"))]
+            (ResolverAuthority::Local(core), ResolverDescription::Local(description)) => {
+                core.seek(&description, offset, whence)
+            }
+            (ResolverAuthority::Broker(_, _, _), ResolverDescription::Broker(description, _)) => {
+                let offset = i64::try_from(offset).map_err(|_| SeekError::InvalidOffset)?;
+                let offset = description
+                    .broker
+                    .seek_file(description.handle, offset, filesystem_seek_whence(whence))
+                    .map_err(|error| broker_fd_error(error, SeekError::ClosedFd, SeekError::Io))?
+                    .map_err(seek_error)?;
+                usize::try_from(offset).map_err(|_| SeekError::InvalidOffset)
+            }
+            #[cfg(any(test, feature = "local_filesystem"))]
+            _ => unreachable!("resolver entry authority must match its resolver"),
+        }
     }
 
     /// Truncates the file referenced by `fd`.
@@ -1113,12 +1394,47 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         let description = self
             .open_file_description(fd)
             .ok_or(TruncateError::ClosedFd)?;
-        self.core.truncate(&description, length, reset_offset)
+        match (&self.authority, description) {
+            #[cfg(any(test, feature = "local_filesystem"))]
+            (ResolverAuthority::Local(core), ResolverDescription::Local(description)) => {
+                core.truncate(&description, length, reset_offset)
+            }
+            (ResolverAuthority::Broker(_, _, _), ResolverDescription::Broker(description, _)) => {
+                description
+                    .broker
+                    .truncate_file(
+                        description.handle,
+                        u64::try_from(length).map_err(|_| TruncateError::Io)?,
+                        reset_offset,
+                    )
+                    .map_err(|error| {
+                        broker_fd_error(error, TruncateError::ClosedFd, TruncateError::Io)
+                    })?
+                    .map_err(truncate_error)
+            }
+            #[cfg(any(test, feature = "local_filesystem"))]
+            _ => unreachable!("resolver entry authority must match its resolver"),
+        }
     }
 
     /// Changes the permissions of a file.
     pub fn chmod(&self, context: &Context, path: impl Arg, mode: Mode) -> Result<(), ChmodError> {
-        self.core.chmod(context, path, mode)
+        match &self.authority {
+            #[cfg(any(test, feature = "local_filesystem"))]
+            ResolverAuthority::Local(core) => core.chmod(context, path, mode),
+            ResolverAuthority::Broker(broker, namespace, _) => {
+                let path = context.resolve(path)?.to_string();
+                broker
+                    .chmod_file(
+                        *namespace,
+                        &path,
+                        filesystem_user(context.acting_user()),
+                        mode.bits(),
+                    )
+                    .map_err(|_| ChmodError::Io)?
+                    .map_err(chmod_error)
+            }
+        }
     }
 
     /// Changes the owner of a file.
@@ -1129,22 +1445,73 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError> {
-        self.core.chown(context, path, user, group)
+        match &self.authority {
+            #[cfg(any(test, feature = "local_filesystem"))]
+            ResolverAuthority::Local(core) => core.chown(context, path, user, group),
+            ResolverAuthority::Broker(broker, namespace, _) => {
+                let path = context.resolve(path)?.to_string();
+                broker
+                    .chown_file(
+                        *namespace,
+                        &path,
+                        filesystem_user(context.acting_user()),
+                        user,
+                        group,
+                    )
+                    .map_err(|_| ChownError::Io)?
+                    .map_err(chown_error)
+            }
+        }
     }
 
     /// Unlinks a file.
     pub fn unlink(&self, context: &Context, path: impl Arg) -> Result<(), UnlinkError> {
-        self.core.unlink(context, path)
+        match &self.authority {
+            #[cfg(any(test, feature = "local_filesystem"))]
+            ResolverAuthority::Local(core) => core.unlink(context, path),
+            ResolverAuthority::Broker(broker, namespace, _) => {
+                let path = context.resolve(path)?.to_string();
+                broker
+                    .unlink_file(*namespace, &path, filesystem_user(context.acting_user()))
+                    .map_err(|_| UnlinkError::Io)?
+                    .map_err(unlink_error)
+            }
+        }
     }
 
     /// Creates a directory.
     pub fn mkdir(&self, context: &Context, path: impl Arg, mode: Mode) -> Result<(), MkdirError> {
-        self.core.mkdir(context, path, mode)
+        match &self.authority {
+            #[cfg(any(test, feature = "local_filesystem"))]
+            ResolverAuthority::Local(core) => core.mkdir(context, path, mode),
+            ResolverAuthority::Broker(broker, namespace, _) => {
+                let path = context.resolve(path)?.to_string();
+                broker
+                    .mkdir_file(
+                        *namespace,
+                        &path,
+                        filesystem_user(context.acting_user()),
+                        mode.bits(),
+                    )
+                    .map_err(|_| MkdirError::Io)?
+                    .map_err(mkdir_error)
+            }
+        }
     }
 
     /// Removes a directory.
     pub fn rmdir(&self, context: &Context, path: impl Arg) -> Result<(), RmdirError> {
-        self.core.rmdir(context, path)
+        match &self.authority {
+            #[cfg(any(test, feature = "local_filesystem"))]
+            ResolverAuthority::Local(core) => core.rmdir(context, path),
+            ResolverAuthority::Broker(broker, namespace, _) => {
+                let path = context.resolve(path)?.to_string();
+                broker
+                    .rmdir_file(*namespace, &path, filesystem_user(context.acting_user()))
+                    .map_err(|_| RmdirError::Io)?
+                    .map_err(rmdir_error)
+            }
+        }
     }
 
     /// Reads directory entries from an open directory descriptor.
@@ -1152,7 +1519,24 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         let description = self
             .open_file_description(fd)
             .ok_or(ReadDirError::ClosedFd)?;
-        self.core.read_dir(&description)
+        match (&self.authority, description) {
+            #[cfg(any(test, feature = "local_filesystem"))]
+            (ResolverAuthority::Local(core), ResolverDescription::Local(description)) => {
+                core.read_dir(&description)
+            }
+            (ResolverAuthority::Broker(_, _, _), ResolverDescription::Broker(description, _)) => {
+                let entries = description
+                    .broker
+                    .read_directory(description.handle)
+                    .map_err(|error| {
+                        broker_fd_error(error, ReadDirError::ClosedFd, ReadDirError::Io)
+                    })?
+                    .map_err(read_dir_error)?;
+                directory_entries(entries)
+            }
+            #[cfg(any(test, feature = "local_filesystem"))]
+            _ => unreachable!("resolver entry authority must match its resolver"),
+        }
     }
 
     /// Obtains the status of the object named by `path`.
@@ -1161,7 +1545,18 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         context: &Context,
         path: impl Arg,
     ) -> Result<super::FileStatus, FileStatusError> {
-        self.core.file_status::<Platform>(context, path)
+        match &self.authority {
+            #[cfg(any(test, feature = "local_filesystem"))]
+            ResolverAuthority::Local(core) => core.file_status::<Platform>(context, path),
+            ResolverAuthority::Broker(broker, namespace, _) => {
+                let path = context.resolve(path)?.to_string();
+                let status = broker
+                    .path_file_status(*namespace, &path, filesystem_user(context.acting_user()))
+                    .map_err(|_| FileStatusError::Io)?
+                    .map_err(file_status_error)?;
+                file_status(status)
+            }
+        }
     }
 
     /// Obtains the status of the object referenced by `fd`.
@@ -1169,19 +1564,322 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         let description = self
             .open_file_description(fd)
             .ok_or(FileStatusError::ClosedFd)?;
-        self.core.fd_file_status(&description)
+        match (&self.authority, description) {
+            #[cfg(any(test, feature = "local_filesystem"))]
+            (ResolverAuthority::Local(core), ResolverDescription::Local(description)) => {
+                core.fd_file_status(&description)
+            }
+            (ResolverAuthority::Broker(_, _, _), ResolverDescription::Broker(description, _)) => {
+                let status = description
+                    .broker
+                    .handle_file_status(description.handle)
+                    .map_err(|error| {
+                        broker_fd_error(error, FileStatusError::ClosedFd, FileStatusError::Io)
+                    })?
+                    .map_err(file_status_error)?;
+                file_status(status)
+            }
+            #[cfg(any(test, feature = "local_filesystem"))]
+            _ => unreachable!("resolver entry authority must match its resolver"),
+        }
     }
 
     /// Gets static backing data for a file, if available.
     pub fn get_static_backing_data(&self, fd: &TypedFd<Self>) -> Option<&'static [u8]> {
         let description = self.open_file_description(fd)?;
-        self.core.get_static_backing_data(&description)
+        match (&self.authority, description) {
+            #[cfg(any(test, feature = "local_filesystem"))]
+            (ResolverAuthority::Local(core), ResolverDescription::Local(description)) => {
+                core.get_static_backing_data(&description)
+            }
+            (ResolverAuthority::Broker(_, _, _), ResolverDescription::Broker(_, _)) => {
+                // TODO: Restore zero-copy backing after broker shared-memory objects are available.
+                None
+            }
+            #[cfg(any(test, feature = "local_filesystem"))]
+            _ => unreachable!("resolver entry authority must match its resolver"),
+        }
     }
 }
 
 struct ResolverEntry<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend> {
-    description: Arc<OpenFileDescription<Platform>>,
+    description: ResolverDescription<Platform>,
     _backend: core::marker::PhantomData<Backend>,
+}
+
+enum ResolverDescription<Platform: sync::RawSyncPrimitivesProvider> {
+    #[cfg(any(test, feature = "local_filesystem"))]
+    Local(Arc<OpenFileDescription<Platform>>),
+    Broker(
+        BrokerOpenFileDescription,
+        core::marker::PhantomData<fn() -> Platform>,
+    ),
+}
+
+impl<Platform: sync::RawSyncPrimitivesProvider> Clone for ResolverDescription<Platform> {
+    fn clone(&self) -> Self {
+        match self {
+            #[cfg(any(test, feature = "local_filesystem"))]
+            Self::Local(description) => Self::Local(Arc::clone(description)),
+            Self::Broker(description, _) => {
+                Self::Broker(description.clone(), core::marker::PhantomData)
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct BrokerOpenFileDescription(Arc<BrokerOpenFileDescriptionInner>);
+
+struct BrokerOpenFileDescriptionInner {
+    broker: Arc<dyn crate::broker::BrokerControl>,
+    handle: ObjectHandle,
+}
+
+impl core::ops::Deref for BrokerOpenFileDescription {
+    type Target = BrokerOpenFileDescriptionInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for BrokerOpenFileDescriptionInner {
+    fn drop(&mut self) {
+        let _ = self.broker.close_object(self.handle);
+    }
+}
+
+const fn filesystem_user(user: UserInfo) -> FilesystemUser {
+    FilesystemUser {
+        user: user.user,
+        group: user.group,
+    }
+}
+
+const fn filesystem_seek_whence(whence: super::SeekWhence) -> FilesystemSeekWhence {
+    match whence {
+        super::SeekWhence::RelativeToBeginning => FilesystemSeekWhence::Beginning,
+        super::SeekWhence::RelativeToCurrentOffset => FilesystemSeekWhence::Current,
+        super::SeekWhence::RelativeToEnd => FilesystemSeekWhence::End,
+    }
+}
+
+fn broker_fd_error<T>(error: crate::broker::error::BrokerControlError, closed: T, io: T) -> T {
+    match error {
+        crate::broker::error::BrokerControlError::Broker(
+            ErrorCode::UnknownObject | ErrorCode::InvalidRights,
+        ) => closed,
+        crate::broker::error::BrokerControlError::AssociationFailed
+        | crate::broker::error::BrokerControlError::Broker(_) => io,
+    }
+}
+
+fn path_error(error: FilesystemError) -> Option<PathError> {
+    match error {
+        FilesystemError::NoSuchFileOrDirectory => Some(PathError::NoSuchFileOrDirectory),
+        FilesystemError::NoSearchPermissions => Some(PathError::NoSearchPerms {
+            #[cfg(debug_assertions)]
+            dir: String::new(),
+            #[cfg(debug_assertions)]
+            perms: Mode::empty(),
+        }),
+        FilesystemError::InvalidPathname => Some(PathError::InvalidPathname),
+        FilesystemError::MissingComponent => Some(PathError::MissingComponent),
+        FilesystemError::ComponentNotDirectory => Some(PathError::ComponentNotADirectory),
+        _ => None,
+    }
+}
+
+fn open_error(error: FilesystemError) -> OpenError {
+    if let Some(error) = path_error(error) {
+        return error.into();
+    }
+    match error {
+        FilesystemError::AccessNotAllowed => OpenError::AccessNotAllowed,
+        FilesystemError::NoWritePermissions => OpenError::NoWritePerms,
+        FilesystemError::ReadOnlyFilesystem => OpenError::ReadOnlyFileSystem,
+        FilesystemError::AlreadyExists => OpenError::AlreadyExists,
+        FilesystemError::IsDirectory => OpenError::TruncateError(TruncateError::IsDirectory),
+        FilesystemError::NotForWriting => OpenError::TruncateError(TruncateError::NotForWriting),
+        FilesystemError::IsTerminalDevice => {
+            OpenError::TruncateError(TruncateError::IsTerminalDevice)
+        }
+        _ => OpenError::Io,
+    }
+}
+
+fn read_error(error: FilesystemError) -> ReadError {
+    match error {
+        FilesystemError::NotFile => ReadError::NotAFile,
+        FilesystemError::NotForReading => ReadError::NotForReading,
+        _ => ReadError::Io,
+    }
+}
+
+fn write_error(error: FilesystemError) -> WriteError {
+    match error {
+        FilesystemError::NotFile => WriteError::NotAFile,
+        FilesystemError::NotForWriting => WriteError::NotForWriting,
+        _ => WriteError::Io,
+    }
+}
+
+fn seek_error(error: FilesystemError) -> SeekError {
+    match error {
+        FilesystemError::NotFile => SeekError::NotAFile,
+        FilesystemError::InvalidOffset => SeekError::InvalidOffset,
+        FilesystemError::NonSeekable => SeekError::NonSeekable,
+        _ => SeekError::Io,
+    }
+}
+
+fn truncate_error(error: FilesystemError) -> TruncateError {
+    match error {
+        FilesystemError::IsDirectory => TruncateError::IsDirectory,
+        FilesystemError::NotForWriting => TruncateError::NotForWriting,
+        FilesystemError::IsTerminalDevice => TruncateError::IsTerminalDevice,
+        _ => TruncateError::Io,
+    }
+}
+
+fn chmod_error(error: FilesystemError) -> ChmodError {
+    if let Some(error) = path_error(error) {
+        return error.into();
+    }
+    match error {
+        FilesystemError::NotOwner => ChmodError::NotTheOwner,
+        FilesystemError::ReadOnlyFilesystem => ChmodError::ReadOnlyFileSystem,
+        _ => ChmodError::Io,
+    }
+}
+
+fn chown_error(error: FilesystemError) -> ChownError {
+    if let Some(error) = path_error(error) {
+        return error.into();
+    }
+    match error {
+        FilesystemError::NotOwner => ChownError::NotTheOwner,
+        FilesystemError::ReadOnlyFilesystem => ChownError::ReadOnlyFileSystem,
+        _ => ChownError::Io,
+    }
+}
+
+fn unlink_error(error: FilesystemError) -> UnlinkError {
+    if let Some(error) = path_error(error) {
+        return error.into();
+    }
+    match error {
+        FilesystemError::NoWritePermissions => UnlinkError::NoWritePerms,
+        FilesystemError::IsDirectory => UnlinkError::IsADirectory,
+        FilesystemError::ReadOnlyFilesystem => UnlinkError::ReadOnlyFileSystem,
+        _ => UnlinkError::Io,
+    }
+}
+
+fn mkdir_error(error: FilesystemError) -> MkdirError {
+    if let Some(error) = path_error(error) {
+        return error.into();
+    }
+    match error {
+        FilesystemError::NoWritePermissions => MkdirError::NoWritePerms,
+        FilesystemError::AlreadyExists => MkdirError::AlreadyExists,
+        FilesystemError::ReadOnlyFilesystem => MkdirError::ReadOnlyFileSystem,
+        _ => MkdirError::Io,
+    }
+}
+
+fn rmdir_error(error: FilesystemError) -> RmdirError {
+    if let Some(error) = path_error(error) {
+        return error.into();
+    }
+    match error {
+        FilesystemError::NoWritePermissions => RmdirError::NoWritePerms,
+        FilesystemError::Busy => RmdirError::Busy,
+        FilesystemError::NotEmpty => RmdirError::NotEmpty,
+        FilesystemError::NotDirectory => RmdirError::NotADirectory,
+        FilesystemError::ReadOnlyFilesystem => RmdirError::ReadOnlyFileSystem,
+        _ => RmdirError::Io,
+    }
+}
+
+fn read_dir_error(error: FilesystemError) -> ReadDirError {
+    match error {
+        FilesystemError::NotDirectory => ReadDirError::NotADirectory,
+        _ => ReadDirError::Io,
+    }
+}
+
+fn file_status_error(error: FilesystemError) -> FileStatusError {
+    path_error(error).map_or(FileStatusError::Io, Into::into)
+}
+
+fn file_status(status: FilesystemFileStatus) -> Result<super::FileStatus, FileStatusError> {
+    Ok(super::FileStatus {
+        file_type: file_type(status.file_type),
+        mode: Mode::from_bits_retain(status.mode),
+        size: usize::try_from(status.size).map_err(|_| FileStatusError::Io)?,
+        owner: UserInfo {
+            user: status.owner.user,
+            group: status.owner.group,
+        },
+        node_info: super::NodeInfo {
+            dev: usize::try_from(status.node_info.dev).map_err(|_| FileStatusError::Io)?,
+            ino: usize::try_from(status.node_info.ino).map_err(|_| FileStatusError::Io)?,
+            rdev: status
+                .node_info
+                .rdev
+                .map(|rdev| {
+                    usize::try_from(rdev)
+                        .ok()
+                        .and_then(core::num::NonZeroUsize::new)
+                        .ok_or(FileStatusError::Io)
+                })
+                .transpose()?,
+        },
+        blksize: usize::try_from(status.block_size).map_err(|_| FileStatusError::Io)?,
+    })
+}
+
+fn directory_entries(
+    entries: Vec<FilesystemDirectoryEntry>,
+) -> Result<Vec<super::DirEntry>, ReadDirError> {
+    let mut converted = Vec::new();
+    converted
+        .try_reserve_exact(entries.len())
+        .map_err(|_| ReadDirError::Io)?;
+    for entry in entries {
+        converted.push(super::DirEntry {
+            name: entry.name,
+            file_type: file_type(entry.file_type),
+            ino_info: entry.node_info.map(node_info).transpose()?,
+        });
+    }
+    Ok(converted)
+}
+
+const fn file_type(file_type: FilesystemFileType) -> FileType {
+    match file_type {
+        FilesystemFileType::RegularFile => FileType::RegularFile,
+        FilesystemFileType::Directory => FileType::Directory,
+        FilesystemFileType::CharacterDevice => FileType::CharacterDevice,
+    }
+}
+
+fn node_info(node_info: FilesystemNodeInfo) -> Result<super::NodeInfo, ReadDirError> {
+    Ok(super::NodeInfo {
+        dev: usize::try_from(node_info.dev).map_err(|_| ReadDirError::Io)?,
+        ino: usize::try_from(node_info.ino).map_err(|_| ReadDirError::Io)?,
+        rdev: node_info
+            .rdev
+            .map(|rdev| {
+                usize::try_from(rdev)
+                    .ok()
+                    .and_then(core::num::NonZeroUsize::new)
+                    .ok_or(ReadDirError::Io)
+            })
+            .transpose()?,
+    })
 }
 
 crate::fd::enable_fds_for_subsystem! {

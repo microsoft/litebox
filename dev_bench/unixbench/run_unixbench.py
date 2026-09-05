@@ -290,16 +290,16 @@ def prepare_litebox_rootfs(
     bench: BenchmarkDef,
     work_dir: Path,
     packager_path: Optional[Path],
-) -> Optional[tuple[Path, Path]]:
+) -> Optional[tuple[Path, str]]:
     """
     Prepare the rootfs tar for a LiteBox benchmark run using litebox_packager.
 
     The packager discovers shared-library dependencies via ldd, rewrites all
     ELF files with the syscall rewriter, and produces a tar suitable for
-    ``--initial-files``.  The rewritten main binary is then extracted from
-    the tar so it can be passed to the runner as the program to execute.
+    ``--filesystem-initial-files``.  The rewritten main binary is also
+    extracted for the ``execl`` benchmark's self-exec setup.
 
-    Returns (tar_path, rewritten_binary_path) or None on failure.
+    Returns (tar_path, guest_program_path) or None on failure.
     """
     binary = pgms_dir / bench.binary
     if not binary.exists():
@@ -335,7 +335,7 @@ def prepare_litebox_rootfs(
     if bench.name == "execl":
         add_execl_to_tar(tar_path, rewritten)
 
-    return tar_path, rewritten
+    return tar_path, "/" + str(binary.resolve()).lstrip("/")
 
 
 def _run_litebox_cmd(
@@ -433,12 +433,14 @@ def run_litebox(
     if prepared is None:
         return None
 
-    tar_path, rewritten = prepared
+    tar_path, guest_program = prepared
     broker_path = runner_path.with_name("litebox-broker-userland")
 
     cmd = [
         str(broker_path),
+        "--filesystem-initial-files", str(tar_path),
         "--runner", str(runner_path),
+        "--",
         "--env", "LD_LIBRARY_PATH=/lib64:/lib32:/lib",
         "--env", "HOME=/",
     ]
@@ -447,8 +449,7 @@ def run_litebox(
     if bench.name == "execl":
         cmd += ["--env", "UB_BINDIR=/pgms"]
 
-    cmd += ["--initial-files", str(tar_path)]
-    cmd += [str(rewritten)]
+    cmd += ["--program-from-tar", guest_program]
 
     return _run_litebox_cmd(bench, duration, cmd)
 
@@ -491,7 +492,9 @@ def run_litebox_windows(
     broker_path = runner_path.with_name("litebox-broker-userland.exe")
     cmd = [
         str(broker_path),
+        "--filesystem-initial-files", str(tar_path),
         "--runner", str(runner_path),
+        "--",
         "--env", "LD_LIBRARY_PATH=/lib64:/lib32:/lib",
         "--env", "HOME=/",
     ]
@@ -500,7 +503,6 @@ def run_litebox_windows(
     if bench.name == "execl":
         cmd += ["--env", "UB_BINDIR=/pgms"]
 
-    cmd += ["--initial-files", str(tar_path)]
     cmd += [tar_program_path]
 
     return _run_litebox_cmd(bench, duration, cmd)

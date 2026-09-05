@@ -50,6 +50,7 @@ fn test_broker_core(
         socket_provider,
         Arc::new(TestRandomProvider),
         Arc::new(UnsupportedStdioProvider),
+        Arc::new(litebox_broker_core::filesystem::UnsupportedFilesystemProvider),
     )
 }
 

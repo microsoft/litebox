@@ -11,6 +11,7 @@
 
 extern crate alloc;
 
+#[cfg(any(test, feature = "local_filesystem"))]
 use alloc::borrow::Cow;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -419,6 +420,7 @@ impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
     }
 
     /// Build the default file system with the given in-memory layer and tar data.
+    #[cfg(any(test, feature = "local_filesystem"))]
     #[must_use]
     pub fn default_fs(
         &self,
@@ -426,6 +428,12 @@ impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
         tar_data: Cow<'static, [u8]>,
     ) -> DefaultFS<Platform> {
         default_fs(&self.litebox, in_mem, tar_data)
+    }
+
+    /// Creates a filesystem facade backed by the negotiated broker.
+    #[must_use]
+    pub fn brokered_fs(&self) -> DefaultFS<Platform> {
+        litebox::fs::resolver::Resolver::new_brokered(&self.litebox)
     }
 
     #[must_use]
@@ -3184,6 +3192,7 @@ pub struct LoadedProgram<Platform: ShimPlatform> {
     pub process: Arc<Process<Platform>>,
 }
 
+#[cfg(any(test, feature = "local_filesystem"))]
 fn default_fs<Platform>(
     litebox: &LiteBox<Platform>,
     in_mem: litebox::fs::in_mem::InMem<Platform>,
