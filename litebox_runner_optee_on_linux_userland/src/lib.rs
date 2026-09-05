@@ -4,7 +4,7 @@
 use anyhow::{Context as _, Result};
 use clap::Parser;
 use litebox_broker_local_userland as broker;
-use litebox_common_optee::{TeeUuid, UteeEntryFunc, UteeParamOwned};
+use litebox_common_optee::{UteeEntryFunc, UteeParamOwned};
 use litebox_platform_multiplex::Platform;
 use litebox_shim_optee::session::session_manager;
 use std::path::PathBuf;
