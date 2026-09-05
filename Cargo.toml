@@ -27,6 +27,7 @@ members = [
     "litebox_runner_windows_on_linux_userland",
     "litebox_runner_windows_userland",
     "litebox_runner_lvbs",
+    "litebox_runner_snp",
     "litebox_runner_optee_on_linux_userland",
     "litebox_shim_linux",
     "litebox_shim_windows",

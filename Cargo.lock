@@ -1821,6 +1821,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_runner_snp"
+version = "0.1.0"
+dependencies = [
+ "arrayvec",
+ "litebox",
+ "litebox_common_linux",
+ "litebox_platform_linux_kernel",
+ "litebox_shim_linux",
+ "litebox_util_log",
+ "log",
+ "once_cell",
+]
+
+[[package]]
 name = "litebox_runner_windows_on_linux_userland"
 version = "0.1.0"
 dependencies = [
