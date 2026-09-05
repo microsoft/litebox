@@ -11,7 +11,15 @@ mod cache;
 mod common;
 
 fn run_rewritten_fixture(source: &str, unique_name: &str) -> std::process::Output {
-    let target = common::compile(source, unique_name, true, false);
+    run_rewritten_fixture_with_options(source, unique_name, false)
+}
+
+fn run_rewritten_fixture_with_options(
+    source: &str,
+    unique_name: &str,
+    nolibc: bool,
+) -> std::process::Output {
+    let target = common::compile(source, unique_name, true, nolibc);
     let binary_path = std::env::var("NEXTEST_BIN_EXE_litebox_runner_linux_userland")
         .unwrap_or_else(|_| env!("CARGO_BIN_EXE_litebox_runner_linux_userland").to_string());
 
@@ -154,7 +162,11 @@ fn test_signals_while_exercising_each_aarch64_gate_kind() {
 #[test]
 #[cfg(all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"))]
 fn test_x18_virtualization() {
-    let output = run_rewritten_fixture("./tests/x18_virtualization.S", "x18_virtualization_nolibc");
+    let output = run_rewritten_fixture_with_options(
+        "./tests/x18_virtualization.S",
+        "x18_virtualization_nolibc",
+        true,
+    );
     assert!(
         output.status.success(),
         "x18 fixture failed ({}): {}",

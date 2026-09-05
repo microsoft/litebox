@@ -168,6 +168,23 @@ fn align_down(addr: usize, align: usize) -> usize {
 }
 
 impl<Platform: ShimPlatform> Task<Platform> {
+    fn read_file_exact_at(&self, fd: i32, mut buffer: &mut [u8], mut offset: usize) -> bool {
+        while !buffer.is_empty() {
+            let Ok(read) = self.sys_read(fd, buffer, Some(offset)) else {
+                return false;
+            };
+            if read == 0 {
+                return false;
+            }
+            let Some(next_offset) = offset.checked_add(read) else {
+                return false;
+            };
+            offset = next_offset;
+            buffer = &mut buffer[read..];
+        }
+        true
+    }
+
     #[inline]
     fn do_mmap(
         &self,
@@ -731,9 +748,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         // Read the ELF header (64 bytes for Elf64).
         let mut ehdr_buf = [0u8; core::mem::size_of::<FileHeader64<LittleEndian>>()];
-        match self.sys_read(fd, &mut ehdr_buf, Some(0)) {
-            Ok(n) if n == ehdr_buf.len() => {}
-            _ => return, // Not readable or short read, skip
+        if !self.read_file_exact_at(fd, &mut ehdr_buf, 0) {
+            return;
         }
 
         // Parse as typed ELF64 header.
@@ -765,9 +781,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return; // Sanity check
         }
         let mut phdrs_buf = alloc::vec![0u8; phdrs_size];
-        match self.sys_read(fd, &mut phdrs_buf, Some(e_phoff)) {
-            Ok(n) if n == phdrs_buf.len() => {}
-            _ => return,
+        if !self.read_file_exact_at(fd, &mut phdrs_buf, e_phoff) {
+            return;
         }
 
         // Find highest PT_LOAD end (p_vaddr + p_memsz) and compute base_addr
@@ -824,14 +839,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 let word_len = file_size.div_ceil(8);
                 let mut words = u64::new_vec_zeroed(word_len).ok()?;
                 let bytes = zerocopy::IntoBytes::as_mut_bytes(words.as_mut_slice());
-                match self.sys_read(fd, &mut bytes[..file_size], Some(0)) {
-                    Ok(n) if n == file_size => {
-                        litebox_syscall_rewriter::aarch64::ElfCodeMetadata::parse_aligned_in_place(
-                            &mut words, file_size,
-                        )
-                        .ok()
-                    }
-                    _ => None,
+                if self.read_file_exact_at(fd, &mut bytes[..file_size], 0) {
+                    litebox_syscall_rewriter::aarch64::ElfCodeMetadata::parse_aligned_in_place(
+                        &mut words, file_size,
+                    )
+                    .ok()
+                } else {
+                    None
                 }
             })
         };
@@ -982,9 +996,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return (false, 0, 0, 0);
         }
         let mut tail = [0u8; HEADER_SIZE];
-        match self.sys_read(fd, &mut tail, Some(file_size - HEADER_SIZE)) {
-            Ok(n) if n == HEADER_SIZE => {}
-            _ => return (false, 0, 0, 0),
+        if !self.read_file_exact_at(fd, &mut tail, file_size - HEADER_SIZE) {
+            return (false, 0, 0, 0);
         }
         if &tail[0..8] != litebox_syscall_rewriter::TRAMPOLINE_MAGIC {
             return (false, 0, 0, 0);
@@ -1175,12 +1188,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 let mut tramp_data = alloc::vec![0u8; state.trampoline_file_size];
                 let file_off = state.trampoline_file_offset.trunc();
                 let tramp_ptr = UserPtrMut::<u8>::from_usize(tramp_addr);
-                match self.sys_read(fd, &mut tramp_data, Some(file_off)) {
-                    Ok(n) if n == tramp_data.len() => {}
-                    _ => {
-                        let _ = self.sys_munmap_raw(tramp_ptr, tramp_len);
-                        return false;
-                    }
+                if !self.read_file_exact_at(fd, &mut tramp_data, file_off) {
+                    let _ = self.sys_munmap_raw(tramp_ptr, tramp_len);
+                    return false;
                 }
 
                 // Write syscall entry point to the first 8 bytes.
