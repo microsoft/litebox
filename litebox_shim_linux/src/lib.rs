@@ -22,7 +22,6 @@ use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
 use litebox::{
     LiteBox,
-    fd::TypedFd,
     mm::{PageManager, linux::PAGE_SIZE},
     net::Network,
     pipes::Pipes,
@@ -51,8 +50,6 @@ pub(crate) mod stdio;
 pub mod syscalls;
 pub mod transport;
 mod wait;
-
-use crate::syscalls::file::get_file_descriptor_flags;
 
 pub type DefaultFS<Platform> = LinuxFS<Platform>;
 
@@ -436,8 +433,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let files = self.files.borrow();
         let alive_fds: Vec<usize> = files.raw_descriptor_store.read().iter_alive().collect();
         for raw_fd in alive_fds {
-            if let Ok(flags) = get_file_descriptor_flags(raw_fd, &self.global, &files)
-                && flags.contains(litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC)
+            if let Ok(fd) = files.typed_fd_from_raw(raw_fd)
+                && syscalls::file::get_file_descriptor_flags(&fd, &self.global)
+                    .contains(litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC)
             {
                 let _ = self.do_close(raw_fd);
             }
@@ -446,42 +444,31 @@ impl<Platform: ShimPlatform> Task<Platform> {
 }
 
 impl<Platform: ShimPlatform> syscalls::file::FilesState<Platform> {
-    #[expect(clippy::too_many_arguments)]
-    pub(crate) fn run_on_raw_fd<R>(
+    /// Resolve a userland fd number, rejecting negative values with `EBADF`.
+    pub(crate) fn typed_fd(&self, fd: i32) -> Result<syscalls::file::AnyTypedFd<Platform>, Errno> {
+        self.typed_fd_from_raw(usize::try_from(fd).map_err(|_| Errno::EBADF)?)
+    }
+
+    pub(crate) fn typed_fd_from_raw(
         &self,
         fd: usize,
-        fs: impl FnOnce(&FileFd<Platform>) -> R,
-        net: impl FnOnce(&TypedFd<Network<Platform>>) -> R,
-        pipes: impl FnOnce(&TypedFd<Pipes<Platform>>) -> R,
-        eventfd: impl FnOnce(&TypedFd<syscalls::eventfd::EventfdSubsystem<Platform>>) -> R,
-        epoll: impl FnOnce(&TypedFd<syscalls::epoll::EpollSubsystem<Platform>>) -> R,
-        unix: impl FnOnce(&TypedFd<syscalls::unix::UnixSocketSubsystem<Platform>>) -> R,
-    ) -> Result<R, Errno> {
+    ) -> Result<syscalls::file::AnyTypedFd<Platform>, Errno> {
         let rds = self.raw_descriptor_store.read();
-        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
-            drop(rds);
-            return Ok(fs(&fd));
+
+        macro_rules! resolve_fd {
+            ($subsystem:ty, $variant:ident) => {
+                if let Ok(fd) = rds.fd_from_raw_integer::<$subsystem>(fd) {
+                    return Ok(syscalls::file::AnyTypedFd::$variant(fd));
+                }
+            };
         }
-        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
-            drop(rds);
-            return Ok(net(&fd));
-        }
-        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
-            drop(rds);
-            return Ok(pipes(&fd));
-        }
-        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
-            drop(rds);
-            return Ok(eventfd(&fd));
-        }
-        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
-            drop(rds);
-            return Ok(epoll(&fd));
-        }
-        if let Ok(fd) = rds.fd_from_raw_integer(fd) {
-            drop(rds);
-            return Ok(unix(&fd));
-        }
+
+        resolve_fd!(LinuxFS<Platform>, Fs);
+        resolve_fd!(Network<Platform>, Network);
+        resolve_fd!(Pipes<Platform>, Pipes);
+        resolve_fd!(syscalls::eventfd::EventfdSubsystem<Platform>, Eventfd);
+        resolve_fd!(syscalls::epoll::EpollSubsystem<Platform>, Epoll);
+        resolve_fd!(syscalls::unix::UnixSocketSubsystem<Platform>, Unix);
         Err(Errno::EBADF)
     }
 }
@@ -513,10 +500,20 @@ impl ToSyscallResult for Result<u32, Errno> {
 }
 
 impl<Platform: ShimPlatform> Task<Platform> {
-    /// A wrapper function around `sys_pread64` that copies data in chunks to avoid OOMing.
+    /// A wrapper function around `do_pread_with_user_buf` that copies data in chunks to avoid OOMing.
     fn pread_with_user_buf(
         &self,
         fd: i32,
+        buf: UserPtrMut<u8>,
+        count: usize,
+        offset: i64,
+    ) -> Result<usize, Errno> {
+        self.with_typed_fd(fd, |fd| self.do_pread_with_user_buf(fd, buf, count, offset))
+    }
+
+    fn do_pread_with_user_buf(
+        &self,
+        fd: &syscalls::file::AnyTypedFd<Platform>,
         buf: UserPtrMut<u8>,
         count: usize,
         offset: i64,
@@ -525,11 +522,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let mut read_total = 0;
         while read_total < count {
             let to_read = (count - read_total).min(kernel_buf.len());
-            match self.sys_pread64(
-                fd,
-                &mut kernel_buf[..to_read],
-                offset + (read_total.reinterpret_as_signed() as i64),
-            ) {
+            let read_offset = offset
+                .checked_add(read_total.reinterpret_as_signed() as i64)
+                .and_then(|offset| usize::try_from(offset).ok())
+                .ok_or(Errno::EINVAL)?;
+            match self.do_read(fd, &mut kernel_buf[..to_read], Some(read_offset)) {
                 Ok(0) => break, // EOF
                 Ok(size) => {
                     buf.copy_from_slice::<Platform>(read_total, &kernel_buf[..size])
@@ -598,26 +595,36 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 } else {
                     // If the read size is too large, we need to do some extra work to avoid OOMing.
                     // We read data in chunks and update the file offset ourselves only if the read succeeds.
-                    self.sys_lseek(fd, 0, litebox::fs::SeekWhence::RelativeToCurrentOffset)
-                    .inspect_err(|e| {
-                        match *e {
-                            Errno::EBADF => (), // safe errors to return
-                            Errno::ESPIPE => {
-                                unimplemented!("read on non-seekable fds with large buffers");
+                    self.with_typed_fd(fd, |fd| {
+                        self.do_seek(
+                            fd,
+                            0,
+                            litebox::fs::SeekWhence::RelativeToCurrentOffset,
+                        )
+                        .inspect_err(|e| {
+                            match *e {
+                                Errno::EBADF => (), // safe errors to return
+                                Errno::ESPIPE => {
+                                    unimplemented!("read on non-seekable fds with large buffers");
+                                }
+                                Errno::EINVAL => {
+                                    unreachable!("seekable file should not return EINVAL when getting current offset");
+                                }
+                                _ => {
+                                    unimplemented!("unexpected error from lseek: {}", e);
+                                }
                             }
-                            Errno::EINVAL => {
-                                unreachable!("seekable file should not return EINVAL when getting current offset");
-                            }
-                            _ => {
-                                unimplemented!("unexpected error from lseek: {}", e);
-                            }
-                        }
-                    })
-                    .and_then(|cur_loc| {
-                        self.pread_with_user_buf(fd, buf, count, i64::try_from(cur_loc).unwrap())
+                        })
+                        .and_then(|cur_loc| {
+                            self.do_pread_with_user_buf(
+                                fd,
+                                buf,
+                                count,
+                                i64::try_from(cur_loc).unwrap(),
+                            )
                             .inspect(|read_total| {
                                 // Update the file offset to reflect the read we just did.
-                                self.sys_lseek(
+                                self.do_seek(
                                     fd,
                                     (cur_loc + read_total).reinterpret_as_signed(),
                                     litebox::fs::SeekWhence::RelativeToBeginning,
@@ -625,6 +632,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                                 // Given that previous lseek and pread succeeded, this lseek should also succeed.
                                 .expect("lseek failed");
                             })
+                        })
                     })
                 }
             }
