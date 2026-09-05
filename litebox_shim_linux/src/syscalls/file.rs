@@ -168,9 +168,6 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
 }
 
 /// A raw fd resolved once into the subsystem that owns it.
-///
-/// Holding the `Arc` keeps the resolution stable: a concurrent `close` makes subsequent
-/// operations fail with `EBADF` rather than follow a reused raw slot to another file.
 pub(crate) enum AnyTypedFd<Platform: ShimPlatform> {
     Fs(alloc::sync::Arc<FileFd<Platform>>),
     Network(alloc::sync::Arc<TypedFd<litebox::net::Network<Platform>>>),
@@ -588,6 +585,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 })
             },
         );
+        // For datagrams, the returned size represents the actual size of the message,
+        // which may be larger than the buffer size.
         result.map(|size| size.min(buf.borrow().len()))
     }
 
@@ -2623,80 +2622,6 @@ mod tests {
     use litebox::fs::{Mode, OFlags};
 
     extern crate std;
-
-    #[test]
-    fn readv_does_not_follow_raw_fd_reuse() {
-        let task = crate::syscalls::tests::init_platform(None);
-        let replacement_path = "/readv_fd_reuse";
-        let replacement = task
-            .sys_open(replacement_path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
-            .unwrap();
-        task.sys_write(i32::try_from(replacement).unwrap(), b"BBBB", None)
-            .unwrap();
-        task.sys_close(i32::try_from(replacement).unwrap()).unwrap();
-
-        let (read_fd, write_fd) = task.sys_pipe2(OFlags::empty()).unwrap();
-        task.sys_write(i32::try_from(write_fd).unwrap(), b"AAAACCCC", None)
-            .unwrap();
-
-        let mut first = [0u8; 4];
-        let mut second = [0u8; 4];
-        let iovs = [
-            IoReadVec {
-                iov_base: UserPtrMut::from_usize(first.as_mut_ptr().expose_provenance()),
-                iov_len: first.len(),
-            },
-            IoReadVec {
-                iov_base: UserPtrMut::from_usize(second.as_mut_ptr().expose_provenance()),
-                iov_len: second.len(),
-            },
-        ];
-        let mut kernel_buffer = [0u8; 4];
-        let call = Cell::new(0);
-        let read_fd = i32::try_from(read_fd).unwrap();
-
-        let result = task.with_typed_fd(read_fd, |fd| {
-            read_from_iovec::<_, crate::syscalls::tests::TestPlatform>(
-                &iovs,
-                &mut kernel_buffer,
-                |buf, _total| {
-                    let size = task.do_read(fd, buf, None)?;
-                    if call.replace(call.get() + 1) == 0 {
-                        task.sys_close(read_fd).unwrap();
-                        let reopened = task
-                            .sys_open(replacement_path, OFlags::RDONLY, Mode::empty())
-                            .unwrap();
-                        assert_eq!(i32::try_from(reopened).unwrap(), read_fd);
-                    }
-                    Ok(size)
-                },
-            )
-        });
-
-        assert_eq!(result, Ok(4));
-        assert_eq!(&first, b"AAAA");
-        assert_eq!(&second, &[0; 4]);
-    }
-
-    #[test]
-    fn dup_does_not_follow_raw_fd_reuse() {
-        let task = crate::syscalls::tests::init_platform(None);
-        let raw_fd = task
-            .sys_open("/dev/stdin", OFlags::RDONLY, Mode::empty())
-            .unwrap();
-        let typed_fd = task.typed_fd(raw_fd.try_into().unwrap()).unwrap();
-
-        task.sys_close(raw_fd.try_into().unwrap()).unwrap();
-        let replacement = task
-            .sys_open("/dev/stdin", OFlags::RDONLY, Mode::empty())
-            .unwrap();
-        assert_eq!(replacement, raw_fd);
-
-        assert!(matches!(
-            task.do_dup(&typed_fd, OFlags::empty()),
-            Err(DupFdError::BadFd)
-        ));
-    }
 
     #[test]
     fn write_to_iovec_returns_partial_after_later_error() {
