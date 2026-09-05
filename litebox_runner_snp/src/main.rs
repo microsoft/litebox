@@ -224,8 +224,7 @@ pub extern "C" fn sandbox_process_init(
                     globals::SM_TERM_GENERAL,
                 );
             };
-            litebox::fs::overlay::Overlay::new(
-                litebox,
+            litebox::fs::overlay::Overlay::<Platform>::new(
                 litebox::fs::in_mem::InMem::<Platform>::new_initialized([(
                     "/tmp",
                     litebox::fs::in_mem::InitialNode::Directory {
@@ -239,9 +238,7 @@ pub extern "C" fn sandbox_process_init(
                 allocators.next(),
             )
         })
-        .mount("/dev", |allocator| {
-            litebox::fs::devices::Devices::new(litebox, allocator)
-        })
+        .mount("/dev", litebox::fs::devices::Devices::new)
         .build()
         .unwrap_or_else(
             |(litebox::fs::composer::BuildError::NoMounts

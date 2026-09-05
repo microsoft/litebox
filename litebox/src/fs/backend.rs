@@ -15,6 +15,35 @@ use super::errors::{
     RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::{DirEntry, FileStatus, Mode, OFlags, UserInfo};
+use crate::stdio::StdioOutputStream;
+
+/// I/O services used by special device backends.
+pub trait DeviceIo {
+    /// Read from standard input.
+    fn read_stdin(&self, output: &mut [u8]) -> Result<usize, ReadError>;
+
+    /// Write to standard output or standard error.
+    fn write_stdio(&self, stream: StdioOutputStream, input: &[u8]) -> Result<usize, WriteError>;
+
+    /// Fill `output` with random bytes.
+    fn fill_random(&self, output: &mut [u8]) -> Result<(), ReadError>;
+}
+
+pub(super) struct NoDeviceIo;
+
+impl DeviceIo for NoDeviceIo {
+    fn read_stdin(&self, _output: &mut [u8]) -> Result<usize, ReadError> {
+        Err(ReadError::Io)
+    }
+
+    fn write_stdio(&self, _stream: StdioOutputStream, _input: &[u8]) -> Result<usize, WriteError> {
+        Err(WriteError::Io)
+    }
+
+    fn fill_random(&self, _output: &mut [u8]) -> Result<(), ReadError> {
+        Err(ReadError::Io)
+    }
+}
 
 /// How a backend file handle participates in seek.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,7 +123,13 @@ pub trait Backend: private::Sealed + Send + Sync + Any {
     /// Backends do not have an internal notion of offsets; instead the resolver maintains offsets
     /// as needed. For files with non-position-based [`SeekBehavior`], such as `stdin`, the resolver
     /// passes zero and the backend should ignore the offset.
-    fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError>;
+    fn read(
+        &self,
+        device_io: &dyn DeviceIo,
+        h: &FileHandle,
+        buf: &mut [u8],
+        offset: usize,
+    ) -> Result<usize, ReadError>;
 
     /// Optional performance hook: get static backing data for a file, if available and supported.
     ///
@@ -115,7 +150,13 @@ pub trait Backend: private::Sealed + Send + Sync + Any {
     // it ugly on the interface side here. It would be very ugly for us to pass in extra flags, or
     // indeed even need to maintain/handle seeking on every backend; mostly we need some sort of
     // nicer locking discipline, but I don't want to block the MVP for this just yet.
-    fn write(&self, h: &FileHandle, buf: &[u8], offset: usize) -> Result<usize, WriteError>;
+    fn write(
+        &self,
+        device_io: &dyn DeviceIo,
+        h: &FileHandle,
+        buf: &[u8],
+        offset: usize,
+    ) -> Result<usize, WriteError>;
 
     /// Truncate the file to the specified length.
     ///

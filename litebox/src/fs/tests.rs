@@ -66,8 +66,7 @@ fn overlay_fs(
 ) -> OverlayFs {
     crate::fs::resolver::Resolver::new(
         litebox,
-        crate::fs::overlay::Overlay::new(
-            litebox,
+        crate::fs::overlay::Overlay::<crate::platform::mock::MockPlatform>::new(
             upper,
             crate::fs::tar_ro::TarRo::new(
                 tar_data,
@@ -137,6 +136,37 @@ mod in_mem {
             assert_eq!(bytes_read, data.len());
             assert_eq!(&buffer, data);
             fs.close(&fd).expect("Failed to close file");
+        });
+    }
+
+    #[test]
+    fn duplicated_descriptors_share_open_file_description() {
+        let ctx = crate::fs::resolver::Context::new();
+        let litebox = LiteBox::new(MockPlatform::new());
+
+        with_root_privileges(&mut super::in_mem_fs(&litebox), &ctx, |fs, ctx| {
+            let fd = fs
+                .open(ctx, "/testfile", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
+                .expect("Failed to create file");
+            fs.write(&fd, b"shared", None)
+                .expect("Failed to write file");
+            let duplicate = litebox
+                .descriptor_table_mut()
+                .duplicate(&fd)
+                .expect("Failed to duplicate descriptor");
+            fs.close(&fd).expect("Failed to close original descriptor");
+
+            fs.seek(&duplicate, 0, crate::fs::SeekWhence::RelativeToBeginning)
+                .expect("Failed to seek duplicate");
+            let mut buffer = [0; 6];
+            let bytes_read = fs
+                .read(&duplicate, &mut buffer, None)
+                .expect("Failed to read duplicate");
+            assert_eq!(bytes_read, buffer.len());
+            assert_eq!(&buffer, b"shared");
+
+            fs.close(&duplicate)
+                .expect("Failed to close duplicate descriptor");
         });
     }
 
@@ -2138,7 +2168,7 @@ mod stdio {
         let fs = Resolver::new(
             &litebox,
             crate::fs::composer::Composer::builder()
-                .mount("/dev", |allocator| Devices::new(&litebox, allocator))
+                .mount("/dev", Devices::new)
                 .build()
                 .unwrap(),
         );
@@ -2182,7 +2212,7 @@ mod stdio {
         let fs = Resolver::new(
             &litebox,
             crate::fs::composer::Composer::builder()
-                .mount("/dev", |allocator| Devices::new(&litebox, allocator))
+                .mount("/dev", Devices::new)
                 .build()
                 .unwrap(),
         );
@@ -2225,7 +2255,7 @@ mod composed_stdio {
                         },
                     )])
                 })
-                .mount("/dev", |allocator| Devices::new(litebox, allocator))
+                .mount("/dev", Devices::new)
                 .build()
                 .unwrap(),
         )

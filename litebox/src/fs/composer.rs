@@ -10,8 +10,9 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::backend::{
-    Backend, BackendHandles, CreationMetadata, DirHandle, FileHandle, HandleRef, PermissionCheck,
-    Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkedComponent, WalkingDirHandle,
+    Backend, BackendHandles, CreationMetadata, DeviceIo, DirHandle, FileHandle, HandleRef,
+    PermissionCheck, Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkedComponent,
+    WalkingDirHandle,
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
@@ -643,11 +644,17 @@ impl Backend for Composer {
         }
     }
 
-    fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError> {
+    fn read(
+        &self,
+        device_io: &dyn DeviceIo,
+        h: &FileHandle,
+        buf: &mut [u8],
+        offset: usize,
+    ) -> Result<usize, ReadError> {
         let h = h.get_typed::<Self>();
         self.mounts[h.mount_index]
             .backend
-            .read(&h.handle, buf, offset)
+            .read(device_io, &h.handle, buf, offset)
     }
 
     fn get_static_backing_data(&self, h: &FileHandle) -> Option<&'static [u8]> {
@@ -657,11 +664,17 @@ impl Backend for Composer {
             .get_static_backing_data(&h.handle)
     }
 
-    fn write(&self, h: &FileHandle, buf: &[u8], offset: usize) -> Result<usize, WriteError> {
+    fn write(
+        &self,
+        device_io: &dyn DeviceIo,
+        h: &FileHandle,
+        buf: &[u8],
+        offset: usize,
+    ) -> Result<usize, WriteError> {
         let h = h.get_typed::<Self>();
         self.mounts[h.mount_index]
             .backend
-            .write(&h.handle, buf, offset)
+            .write(device_io, &h.handle, buf, offset)
     }
 
     fn truncate(&self, h: &FileHandle, length: usize) -> Result<(), TruncateError> {

@@ -20,13 +20,12 @@ use alloc::vec::Vec;
 
 use hashbrown::{HashMap, HashSet};
 
-use crate::LiteBox;
 use crate::sync::{Mutex, MutexGuard, RawSyncPrimitivesProvider};
 
 use super::backend::{
-    Backend, BackendHandles, CreationMetadata, DirHandle, FileHandle, Handle, HandleRef,
-    PermissionCheck, PermissionInfo, Permissioned, SeekBehavior, WalkOutcome, WalkStopReason,
-    WalkedComponent, WalkingDirHandle,
+    Backend, BackendHandles, CreationMetadata, DeviceIo, DirHandle, FileHandle, Handle, HandleRef,
+    NoDeviceIo, PermissionCheck, PermissionInfo, Permissioned, SeekBehavior, WalkOutcome,
+    WalkStopReason, WalkedComponent, WalkingDirHandle,
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
@@ -128,13 +127,8 @@ struct ResolvedEntry {
 
 impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
     /// Construct an overlay over a single `lower`, using `allocator` for overlay-visible inodes.
-    pub fn new(
-        litebox: &LiteBox<Platform>,
-        upper: impl Backend,
-        lower: impl Backend,
-        allocator: InodeAllocator,
-    ) -> Self {
-        Self::with_boxed_lowers(litebox, upper, vec![Box::new(lower)], allocator)
+    pub fn new(upper: impl Backend, lower: impl Backend, allocator: InodeAllocator) -> Self {
+        Self::with_boxed_lowers(upper, vec![Box::new(lower)], allocator)
     }
 
     /// Construct an overlay with lower backends ordered from highest to lowest precedence.
@@ -143,7 +137,6 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
     ///
     /// Panics if `lowers` is empty.
     pub fn with_boxed_lowers(
-        _litebox: &LiteBox<Platform>,
         upper: impl Backend,
         lowers: Vec<Box<dyn Backend>>,
         allocator: InodeAllocator,
@@ -308,9 +301,10 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
     ) -> Result<(), OpenError> {
         let mut offset = 0;
         let mut buf = [0u8; 4096];
+        // Copy-up is restricted to regular files, whose current backends do not use device I/O.
         loop {
             let count = self.lowers[layer]
-                .read(lower, &mut buf, offset)
+                .read(&NoDeviceIo, lower, &mut buf, offset)
                 .map_err(|_| OpenError::Io)?;
             if count == 0 {
                 return Ok(());
@@ -319,7 +313,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
             while written < count {
                 let progress = self
                     .upper
-                    .write(upper, &buf[written..count], offset + written)
+                    .write(&NoDeviceIo, upper, &buf[written..count], offset + written)
                     .map_err(|_| OpenError::Io)?;
                 if progress == 0 {
                     return Err(OpenError::Io);
@@ -907,9 +901,15 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         Ok(entries)
     }
 
-    fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError> {
+    fn read(
+        &self,
+        device_io: &dyn DeviceIo,
+        h: &FileHandle,
+        buf: &mut [u8],
+        offset: usize,
+    ) -> Result<usize, ReadError> {
         self.with_file(h.get_typed::<Self>(), |_, backend, handle| {
-            backend.read(handle, buf, offset)
+            backend.read(device_io, handle, buf, offset)
         })
     }
 
@@ -919,13 +919,19 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         })
     }
 
-    fn write(&self, h: &FileHandle, buf: &[u8], offset: usize) -> Result<usize, WriteError> {
+    fn write(
+        &self,
+        device_io: &dyn DeviceIo,
+        h: &FileHandle,
+        buf: &[u8],
+        offset: usize,
+    ) -> Result<usize, WriteError> {
         let file = h.get_typed::<Self>();
         if let Some(upper) = self.migrated(file) {
-            return self.upper.write(&upper, buf, offset);
+            return self.upper.write(device_io, &upper, buf, offset);
         }
         match &file.layer {
-            OverlayFileLayer::Upper(handle) => self.upper.write(handle, buf, offset),
+            OverlayFileLayer::Upper(handle) => self.upper.write(device_io, handle, buf, offset),
             // A writable open copies up first, so a lower-backed handle is read-only.
             OverlayFileLayer::Lower { .. } => Err(WriteError::NotForWriting),
         }
