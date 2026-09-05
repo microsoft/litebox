@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 use litebox_broker_core::socket::HOST_GATEWAY_IPV4_ADDRESS;
 use litebox_broker_core::{BrokerCore, BrokerCoreLimits, ObjectRights, PolicyEngine};
 use litebox_broker_platform_linux_userland::LinuxSocketProvider;
+#[cfg(feature = "lock_tracing")]
+use litebox_broker_platform_linux_userland::LinuxSyncPrimitivesProvider;
 use litebox_broker_protocol::message::{BrokerRequest, BrokerResponse};
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport::channel::HostReceive;
@@ -29,6 +31,9 @@ use super::{
 use super::{random::UserlandRandomProvider, stdio::UserlandStdioProvider};
 
 const PROXY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(feature = "lock_tracing")]
+static LOCK_TRACING_PLATFORM: LinuxSyncPrimitivesProvider = LinuxSyncPrimitivesProvider;
 
 impl HostRequestSource for UnixControlRingHostRequestSource {
     fn recv_request(&mut self) -> IoResult<HostReceive<BrokerRequest>> {
@@ -49,6 +54,9 @@ impl HostAssociationShutdown for UnixControlRingHostShutdown {
 }
 
 pub(super) fn run(mut args: super::CliArgs) -> Result<(), Box<dyn Error>> {
+    #[cfg(feature = "lock_tracing")]
+    litebox_platform::sync::init_lock_tracing(&LOCK_TRACING_PLATFORM);
+
     let proxy = if args.allow_host.is_empty() {
         None
     } else {

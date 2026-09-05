@@ -17,7 +17,6 @@ use litebox::event::wait::WaitError;
 use litebox::mm::linux::VmFlags;
 use litebox::platform::ArchSpecificRegister;
 use litebox::platform::TimerHandle;
-use litebox::platform::{Instant as _, SystemTime as _, TimeProvider};
 use litebox::sync::{Mutex, RwLock};
 use litebox::utils::TruncateExt as _;
 use litebox_common_linux::{
@@ -25,6 +24,7 @@ use litebox_common_linux::{
     errno::Errno,
 };
 use litebox_platform::sync::{RawMutex as _, RawMutexProvider};
+use litebox_platform::time::{Instant as _, SystemTime as _, TimeProvider};
 
 /// Process-management-related state on [`Task`].
 pub(crate) struct ThreadState<Platform: ShimPlatform> {
@@ -131,16 +131,13 @@ pub(crate) struct Alarm<Platform: ShimPlatform> {
     /// Handle for the alarm timer.
     pub(crate) handle: Option<<Platform as litebox::platform::TimerProvider>::TimerHandle>,
     /// The deadline for the alarm.
-    pub(crate) deadline: Option<<Platform as litebox::platform::TimeProvider>::Instant>,
+    pub(crate) deadline: Option<<Platform as TimeProvider>::Instant>,
 }
 
 impl<Platform: ShimPlatform> Alarm<Platform> {
     /// Returns the time remaining until [`Self::deadline`], or zero if the
     /// alarm is not armed or its deadline has already passed.
-    pub(crate) fn remaining(
-        &self,
-        now: <Platform as litebox::platform::TimeProvider>::Instant,
-    ) -> Duration {
+    pub(crate) fn remaining(&self, now: <Platform as TimeProvider>::Instant) -> Duration {
         self.deadline
             .as_ref()
             .and_then(|d| d.checked_duration_since(&now))
@@ -1913,8 +1910,8 @@ mod tests {
     /// interrupted and SIGALRM should be pending.
     #[test]
     fn test_alarm_fires_after_deadline() {
-        use litebox::platform::{Instant as _, TimeProvider};
         use litebox_common_linux::{ClockId, TimerFlags, Timespec};
+        use litebox_platform::time::{Instant as _, TimeProvider};
 
         let task = crate::syscalls::tests::init_platform();
         <crate::syscalls::tests::TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {

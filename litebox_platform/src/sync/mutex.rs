@@ -7,15 +7,13 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
-use litebox_platform::sync::{RawMutex as _, RawMutexProvider};
+use super::{RawMutex as _, RawMutexProvider, RawSyncPrimitivesProvider};
 
 #[cfg(feature = "lock_tracing")]
-use crate::sync::lock_tracing::{LockType, LockedWitness};
+use super::lock_tracing::{LockType, LockedWitness};
 
-use super::RawSyncPrimitivesProvider;
-
-/// A spin-enabled wrapper around [`RawMutex`](litebox_platform::sync::RawMutex) to reduce the
-/// number of unnecessary calls out to the platform.
+/// A spin-enabled wrapper around [`RawMutex`](super::RawMutex) to reduce the number of unnecessary
+/// calls out to the platform.
 struct SpinEnabledRawMutex<Platform: RawSyncPrimitivesProvider> {
     /// 0: unlocked
     /// 1: locked, no other threads waiting
@@ -24,7 +22,7 @@ struct SpinEnabledRawMutex<Platform: RawSyncPrimitivesProvider> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider> SpinEnabledRawMutex<Platform> {
-    /// Create a new [`SpinEnabledRawMutex`] from a [`RawMutex`](litebox_platform::sync::RawMutex).
+    /// Create a new [`SpinEnabledRawMutex`] from a [`RawMutex`](super::RawMutex).
     #[inline]
     const fn new(raw: Platform::RawMutex) -> Self {
         Self { raw }
@@ -202,16 +200,33 @@ impl<Platform: RawSyncPrimitivesProvider, T> Mutex<Platform, T> {
             data: UnsafeCell::new(val),
         }
     }
+
+    /// Consumes this mutex and returns the protected value.
+    #[cfg(not(feature = "lock_tracing"))]
+    pub fn into_inner(self) -> T {
+        self.data.into_inner()
+    }
+
+    /// Consumes this mutex and returns the protected value.
+    #[cfg(feature = "lock_tracing")]
+    pub fn into_inner(mut self) -> T {
+        self.creation
+            .record_destruction_if_registered(LockType::Mutex, self.raw.raw.underlying_atomic());
+        let this = core::mem::ManuallyDrop::new(self);
+        // SAFETY: `self` is consumed and its destructor is suppressed, so the
+        // protected value can be moved out exactly once.
+        unsafe { core::ptr::read(&raw const this.data).into_inner() }
+    }
 }
 
 // SAFETY: `Mutex<T>` inherits `Send` from `T`.
-unsafe impl<Platform: RawSyncPrimitivesProvider, T: Send> Send for Mutex<Platform, T> {}
+unsafe impl<Platform: RawSyncPrimitivesProvider, T: Send + ?Sized> Send for Mutex<Platform, T> {}
 // SAFETY: `Mutex` provides mutually exclusive access to `T`, so it's OK to
 // share a reference to it between threads as long as `T` can be _sent_ between
 // threads.
-unsafe impl<Platform: RawSyncPrimitivesProvider, T: Send> Sync for Mutex<Platform, T> {}
+unsafe impl<Platform: RawSyncPrimitivesProvider, T: Send + ?Sized> Sync for Mutex<Platform, T> {}
 
-impl<Platform: RawSyncPrimitivesProvider, T> Mutex<Platform, T> {
+impl<Platform: RawSyncPrimitivesProvider, T: ?Sized> Mutex<Platform, T> {
     /// Attempts to acquire this mutex without blocking.
     #[inline]
     #[track_caller]
@@ -264,8 +279,7 @@ impl<Platform: RawSyncPrimitivesProvider, T> Mutex<Platform, T> {
     /// This is safe because we have `&mut self`, so no other threads can access
     /// the data.
     pub fn get_mut(&mut self) -> &mut T {
-        // SAFETY: We have &mut self, so no other threads can have access to the data.
-        unsafe { &mut *self.data.get() }
+        self.data.get_mut()
     }
 }
 

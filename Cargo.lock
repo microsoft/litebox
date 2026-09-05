@@ -1446,7 +1446,6 @@ checksum = "df1d3c3b53da64cf5760482273a98e575c651a67eec7f77df96b5b642de8f039"
 name = "litebox"
 version = "0.1.0"
 dependencies = [
- "arrayvec",
  "bitflags",
  "buddy_system_allocator",
  "hashbrown",
@@ -1473,7 +1472,6 @@ dependencies = [
  "bitflags",
  "hashbrown",
  "litebox_broker_protocol",
- "litebox_platform",
  "spin 0.9.8",
  "thiserror",
 ]
@@ -1569,6 +1567,7 @@ dependencies = [
  "litebox_broker_transport",
  "litebox_broker_transport_linux_userland",
  "litebox_broker_transport_windows_userland",
+ "litebox_platform",
  "tempfile",
 ]
 
@@ -1654,6 +1653,11 @@ dependencies = [
 [[package]]
 name = "litebox_platform"
 version = "0.1.0"
+dependencies = [
+ "arrayvec",
+ "litebox_util_log",
+ "spin 0.9.8",
+]
 
 [[package]]
 name = "litebox_platform_linux_kernel"
@@ -1947,6 +1951,7 @@ dependencies = [
  "litebox",
  "litebox_common_linux",
  "litebox_common_optee",
+ "litebox_platform",
  "litebox_platform_multiplex",
  "litebox_util_log",
  "num_enum",
@@ -1969,6 +1974,7 @@ dependencies = [
  "litebox",
  "litebox_common_linux",
  "litebox_common_windows",
+ "litebox_platform",
  "litebox_platform_linux_userland",
  "litebox_platform_windows_userland",
  "litebox_util_log",

@@ -6,10 +6,10 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use alloc::sync::{Arc, Weak};
 use litebox::{
     event::{Events, observer::Observer, polling::Pollee},
-    platform::TimeProvider,
     sync::{Mutex, RawSyncPrimitivesProvider},
 };
 use litebox_common_linux::errno::Errno;
+use litebox_platform::time::TimeProvider;
 use ringbuf::traits::{Consumer as _, Observer as _, Producer as _};
 
 use crate::ShimPlatform;

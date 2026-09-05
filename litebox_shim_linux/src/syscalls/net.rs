@@ -25,7 +25,7 @@ use litebox::{
         errors::AcceptError,
         socket_channel::{ChannelReadError, ChannelWriteError, NetworkProxy, SocketState},
     },
-    platform::{Instant as _, page_mgmt::MemoryRegionPermissions},
+    platform::page_mgmt::MemoryRegionPermissions,
     sync::{Mutex, MutexGuard},
     utils::TruncateExt as _,
 };
@@ -34,6 +34,7 @@ use litebox_common_linux::{
     SockFlags, SockType, SocketOption, SocketOptionName, TcpOption, UnixProtocol, UserMmsgHdr,
     UserMsgHdr, errno::Errno, signal::Signal,
 };
+use litebox_platform::time::Instant as _;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::syscalls::unix::{CSockUnixAddr, UnixSocket, UnixSocketAddr, UnixSocketSubsystem};

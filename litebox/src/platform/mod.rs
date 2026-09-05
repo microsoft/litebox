@@ -20,6 +20,7 @@ use thiserror::Error;
 use zerocopy::{FromBytes, IntoBytes};
 
 use litebox_platform::sync::{RawMutexProvider, WaitWakerProvider};
+use litebox_platform::time::TimeProvider;
 
 pub use arch::{ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister};
 pub use page_mgmt::PageManagementProvider;
@@ -147,50 +148,6 @@ pub trait SignalProvider {
     /// Platforms that support asynchronous signals should override this method.
     #[expect(unused_variables, reason = "no-op by default")]
     fn take_pending_signals(&self, f: impl FnMut(Self::Signal)) {}
-}
-
-/// An interface to understanding time.
-pub trait TimeProvider {
-    type Instant: Instant;
-    type SystemTime: SystemTime;
-    /// Returns an instant corresponding to "now".
-    fn now(&self) -> Self::Instant;
-    /// Returns the current system time.
-    fn current_time(&self) -> Self::SystemTime;
-}
-
-/// An opaque measurement of a monotonically nondecreasing clock.
-///
-/// Notable, the `Instant` is distinct from [`SystemTime`], in that the `Instant` is monotonic, and
-/// need not have any relation with "real" time. It does not matter if the world takes a step
-/// backwards in time, the `Instant` continues marching forward.
-pub trait Instant: Copy + Clone + PartialEq + Eq + PartialOrd + Ord + Send + Sync {
-    /// Returns the amount of time elapsed from another instant to this one, or `None` if that
-    /// instant is later than this one.
-    fn checked_duration_since(&self, earlier: &Self) -> Option<core::time::Duration>;
-    /// Returns the amount of time elapsed from another instant to this one, or zero duration if
-    /// that instant is later than this one.
-    fn duration_since(&self, earlier: &Self) -> core::time::Duration {
-        self.checked_duration_since(earlier)
-            .unwrap_or(core::time::Duration::from_secs(0))
-    }
-    /// Returns a new `Instant` that is the sum of this instant and the provided
-    /// duration, or `None` if the resulting instant would overflow.
-    fn checked_add(&self, duration: core::time::Duration) -> Option<Self>;
-}
-
-/// A measurement of the system clock.
-///
-/// Notably, the `SystemTime` is distinct from [`Instant`], in that the `SystemTime` need not be
-/// monotonic, but instead is the best guess of "real" or "wall clock" time.
-pub trait SystemTime: Send + Sync {
-    /// An anchor in time corresponding to "1970-01-01 00:00:00 UTC".
-    const UNIX_EPOCH: Self;
-    /// Returns the amount of time elapsed from an `earlier` point in time to this one. This is
-    /// fallible since the clock might have been adjusted backwards in time to before the earlier
-    /// point in time was measured; in such a case, it returns an `Err(_)` with the absolute
-    /// duration.
-    fn duration_since(&self, earlier: &Self) -> Result<core::time::Duration, core::time::Duration>;
 }
 
 /// A common interface for raw pointers, aimed at usage in shims _above_ LiteBox.

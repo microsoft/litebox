@@ -9,5 +9,8 @@ litebox_broker_protocol = { path = "../litebox_broker_protocol", version = "0.1.
 litebox_platform = { path = "../litebox_platform", version = "0.1.0" }
 rustix = { version = "1.1.2", default-features = false, features = ["event", "net", "std", "thread"] }
 
+[features]
+lock_tracing = ["litebox_platform/lock_tracing"]
+
 [lints]
 workspace = true

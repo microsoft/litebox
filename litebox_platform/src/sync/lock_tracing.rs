@@ -13,18 +13,14 @@
 //! # Feature flag
 //!
 //! Lock tracing is only compiled in when the `lock_tracing` cargo feature is
-//! enabled. Without this feature, lock tracing functionality is not available,
-//! and the LiteBox synchronization objects do not include any lock-tracing
-//! state or runtime overhead.
+//! enabled. Without this feature, synchronization objects do not include any
+//! lock-tracing state or runtime overhead.
 //!
 //! # Initialization
 //!
-//! The lock tracker is initialized when [`LiteBox`](crate::LiteBox) is
-//! instantiated, via [`LockTracker::init`]. Until initialization occurs, lock
-//! tracing is silently disabled: locks can be acquired and released normally,
-//! but no tracking or debugging output will occur. This allows early
-//! initialization code to use locks before the full LiteBox environment is set
-//! up.
+//! The lock tracker is initialized by [`init_lock_tracing`]. Until
+//! initialization occurs, locks can be acquired and released normally, but no
+//! tracking or debugging output occurs.
 //!
 //! Once initialized, the tracker will begin monitoring all subsequent lock
 //! operations and reporting issues according to the configuration constants
@@ -34,9 +30,7 @@ use core::time::Duration;
 
 use arrayvec::ArrayVec;
 
-use crate::platform::Instant as _;
-
-use super::RawSyncPrimitivesProvider;
+use crate::time::Instant as _;
 
 /// Number of locks that can be held together at once before panicking.
 ///
@@ -453,13 +447,12 @@ pub(crate) fn record_lock_destroyed<T>(
 }
 
 /// The lock tracker, which manages both tracking and (if necessary) panicking
-/// upon invariant failure. The public methods are backed by a singleton, which
-/// is initialized by [`LockTracker::init`].
-pub(crate) struct LockTracker {
+/// upon invariant failure.
+pub(super) struct LockTracker {
     x: alloc::boxed::Box<spin::Mutex<LockTrackerX>>,
 }
 
-struct LockTrackerPlatform<Platform: RawSyncPrimitivesProvider> {
+struct LockTrackerPlatform<Platform: crate::time::TimeProvider + Sync + 'static> {
     platform: &'static Platform,
     start_time: Platform::Instant,
 }
@@ -482,14 +475,20 @@ trait DynLockTrackerProvider: Send + Sync {
     fn now(&self) -> Duration;
 }
 
-impl<Platform: RawSyncPrimitivesProvider> DynLockTrackerProvider for LockTrackerPlatform<Platform> {
+impl<Platform> DynLockTrackerProvider for LockTrackerPlatform<Platform>
+where
+    Platform: crate::time::TimeProvider + Sync + 'static,
+{
     fn now(&self) -> Duration {
         self.platform.now().duration_since(&self.start_time)
     }
 }
 
 impl LockTracker {
-    fn new<Platform: RawSyncPrimitivesProvider>(platform: &'static Platform) -> Self {
+    fn new<Platform>(platform: &'static Platform) -> Self
+    where
+        Platform: crate::time::TimeProvider + Sync + 'static,
+    {
         Self {
             x: alloc::boxed::Box::new(spin::Mutex::new(LockTrackerX {
                 held: ArrayVec::new_const(),
@@ -506,12 +505,25 @@ impl LockTracker {
     }
 
     /// Initializes the global lock tracker with the given platform.
-    pub(crate) fn init<Platform: RawSyncPrimitivesProvider>(platform: &'static Platform) {
+    fn init<Platform>(platform: &'static Platform)
+    where
+        Platform: crate::time::TimeProvider + Sync + 'static,
+    {
         LOCK_TRACKER.call_once(|| Self::new(platform));
     }
 }
 
 static LOCK_TRACKER: spin::Once<LockTracker> = spin::Once::new();
+
+/// Initializes process-wide lock tracing with the supplied platform clock.
+///
+/// Repeated calls retain the platform supplied by the first call.
+pub fn init_lock_tracing<Platform>(platform: &'static Platform)
+where
+    Platform: crate::time::TimeProvider + Sync + 'static,
+{
+    LockTracker::init(platform);
+}
 
 impl core::fmt::Display for LockTrackerX {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {

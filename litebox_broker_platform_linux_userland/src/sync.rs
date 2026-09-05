@@ -9,6 +9,9 @@ use core::time::Duration;
 use litebox_platform::sync::{
     ImmediatelyWokenUp, RawMutex as RawMutexTrait, RawMutexProvider, UnblockedOrTimedOut,
 };
+use litebox_platform::time::{
+    Instant as InstantTrait, SystemTime as SystemTimeTrait, TimeProvider,
+};
 use rustix::thread::futex;
 
 /// Blocking synchronization primitives for a Linux-userland broker.
@@ -17,6 +20,47 @@ pub struct LinuxSyncPrimitivesProvider;
 
 impl RawMutexProvider for LinuxSyncPrimitivesProvider {
     type RawMutex = LinuxRawMutex;
+}
+
+impl TimeProvider for LinuxSyncPrimitivesProvider {
+    type Instant = LinuxSyncInstant;
+    type SystemTime = LinuxSyncSystemTime;
+
+    fn now(&self) -> Self::Instant {
+        LinuxSyncInstant(std::time::Instant::now())
+    }
+
+    fn current_time(&self) -> Self::SystemTime {
+        LinuxSyncSystemTime(std::time::SystemTime::now())
+    }
+}
+
+/// Monotonic clock value used by Linux-userland broker synchronization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LinuxSyncInstant(std::time::Instant);
+
+impl InstantTrait for LinuxSyncInstant {
+    fn checked_duration_since(&self, earlier: &Self) -> Option<Duration> {
+        self.0.checked_duration_since(earlier.0)
+    }
+
+    fn checked_add(&self, duration: Duration) -> Option<Self> {
+        self.0.checked_add(duration).map(Self)
+    }
+}
+
+/// Wall-clock value used by Linux-userland broker synchronization.
+#[derive(Clone, Copy, Debug)]
+pub struct LinuxSyncSystemTime(std::time::SystemTime);
+
+impl SystemTimeTrait for LinuxSyncSystemTime {
+    const UNIX_EPOCH: Self = Self(std::time::SystemTime::UNIX_EPOCH);
+
+    fn duration_since(&self, earlier: &Self) -> Result<Duration, Duration> {
+        self.0
+            .duration_since(earlier.0)
+            .map_err(|error| error.duration())
+    }
 }
 
 /// Raw blocking mutex used by the Linux-userland broker.
@@ -91,8 +135,9 @@ mod tests {
     use core::sync::atomic::Ordering;
     use core::time::Duration;
 
-    use litebox_broker_core::sync::{Mutex, RwLock};
-    use litebox_platform::sync::{ImmediatelyWokenUp, RawMutex as _, UnblockedOrTimedOut};
+    use litebox_platform::sync::{
+        ImmediatelyWokenUp, Mutex, RawMutex as _, RwLock, UnblockedOrTimedOut,
+    };
 
     use super::{LinuxRawMutex, LinuxSyncPrimitivesProvider};
 

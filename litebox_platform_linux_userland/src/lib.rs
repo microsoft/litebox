@@ -26,6 +26,9 @@ use litebox_platform::sync::{
     ImmediatelyWokenUp, RawMutex as RawMutexTrait, RawMutexProvider, UnblockedOrTimedOut,
     WaitWakerProvider,
 };
+use litebox_platform::time::{
+    Instant as InstantTrait, SystemTime as SystemTimeTrait, TimeProvider,
+};
 
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -1275,7 +1278,7 @@ impl RawMutexTrait for RawMutex {
     }
 }
 
-impl litebox::platform::TimeProvider for LinuxUserland {
+impl TimeProvider for LinuxUserland {
     type Instant = Instant;
     type SystemTime = SystemTime;
 
@@ -1311,7 +1314,7 @@ pub struct Instant {
     inner: Duration,
 }
 
-impl litebox::platform::Instant for Instant {
+impl InstantTrait for Instant {
     fn checked_duration_since(&self, earlier: &Self) -> Option<Duration> {
         self.inner.checked_sub(earlier.inner)
     }
@@ -1326,7 +1329,7 @@ pub struct SystemTime {
     inner: Duration,
 }
 
-impl litebox::platform::SystemTime for SystemTime {
+impl SystemTimeTrait for SystemTime {
     const UNIX_EPOCH: Self = SystemTime {
         inner: Duration::ZERO,
     };

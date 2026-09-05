@@ -8,11 +8,11 @@ use alloc::sync::Arc;
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::message::BrokerNotification;
 use litebox_broker_transport::channel::LocalCallChannel;
+use litebox_platform::time::TimeProvider;
 
 use crate::{
     broker,
     fd::Descriptors,
-    platform::TimeProvider,
     sync::{RawSyncPrimitivesProvider, RwLock},
 };
 
@@ -97,7 +97,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         // Enable lock tracing, using this platform for time keeping and debug
         // prints, if the feature is enabled.
         #[cfg(feature = "lock_tracing")]
-        crate::sync::lock_tracing::LockTracker::init(platform);
+        litebox_platform::sync::init_lock_tracing(platform);
         let descriptors: RwLock<Platform, Descriptors<Platform>> =
             RwLock::new(Descriptors::new_from_litebox_creation());
 

@@ -12,7 +12,7 @@ use core::sync::atomic::AtomicU32;
 use hashbrown::HashMap;
 use litebox::platform::{
     ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister, PageManagementProvider,
-    RawPointerProvider, TimeProvider, page_mgmt::DeallocationError,
+    RawPointerProvider, page_mgmt::DeallocationError,
 };
 use litebox::{
     mm::linux::{PAGE_SIZE, PageRange},
@@ -28,6 +28,9 @@ use litebox_common_linux::vmap::{
 use litebox_platform::sync::{
     ImmediatelyWokenUp, RawMutex as RawMutexTrait, RawMutexProvider, UnblockedOrTimedOut,
     WaitWakerProvider,
+};
+use litebox_platform::time::{
+    Instant as InstantTrait, SystemTime as SystemTimeTrait, TimeProvider,
 };
 use x86_64::{
     VirtAddr,
@@ -882,14 +885,14 @@ impl<Host: HostInterface> RawMutex<Host> {
     }
 }
 
-/// An implementation of [`litebox::platform::Instant`].
+/// An implementation of [`litebox_platform::time::Instant`].
 ///
 /// Backed by the Hyper-V partition reference counter, which is monotonic
 /// and normalized by the hypervisor across TSC scaling and live migration.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Instant(u64);
 
-/// An implementation of [`litebox::platform::SystemTime`]
+/// An implementation of [`litebox_platform::time::SystemTime`].
 pub struct SystemTime();
 
 impl<Host: HostInterface> TimeProvider for LinuxKernel<Host> {
@@ -905,7 +908,7 @@ impl<Host: HostInterface> TimeProvider for LinuxKernel<Host> {
     }
 }
 
-impl litebox::platform::Instant for Instant {
+impl InstantTrait for Instant {
     fn checked_duration_since(&self, earlier: &Self) -> Option<core::time::Duration> {
         let ticks = self.0.checked_sub(earlier.0)?;
         // Each reference-counter tick is `REF_COUNTER_TICK_NANOS` (100) ns.
@@ -926,7 +929,7 @@ impl Instant {
     }
 }
 
-impl litebox::platform::SystemTime for SystemTime {
+impl SystemTimeTrait for SystemTime {
     const UNIX_EPOCH: Self = SystemTime();
 
     fn duration_since(

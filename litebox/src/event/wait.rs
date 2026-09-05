@@ -25,11 +25,9 @@
 use alloc::sync::Arc;
 use core::{marker::PhantomData, sync::atomic::Ordering};
 use litebox_platform::sync::{ImmediatelyWokenUp, RawMutex, UnblockedOrTimedOut};
+use litebox_platform::time::{Instant as _, TimeProvider};
 
-use crate::{
-    platform::{Instant as _, ThreadProvider, TimeProvider},
-    sync::RawSyncPrimitivesProvider,
-};
+use crate::{platform::ThreadProvider, sync::RawSyncPrimitivesProvider};
 use thiserror::Error;
 
 /// The wait state for a thread.

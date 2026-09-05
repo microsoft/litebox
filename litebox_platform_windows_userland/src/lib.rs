@@ -25,6 +25,9 @@ use litebox_platform::sync::{
     ImmediatelyWokenUp, RawMutex as RawMutexTrait, RawMutexProvider, UnblockedOrTimedOut,
     WaitWakerProvider,
 };
+use litebox_platform::time::{
+    Instant as InstantTrait, SystemTime as SystemTimeTrait, TimeProvider,
+};
 
 use windows_sys::Win32::Foundation::{self as Win32_Foundation, FILETIME};
 use windows_sys::Win32::{
@@ -1379,7 +1382,7 @@ impl RawMutexTrait for RawMutex {
     }
 }
 
-impl litebox::platform::TimeProvider for WindowsUserland {
+impl TimeProvider for WindowsUserland {
     type Instant = Instant;
     type SystemTime = SystemTime;
 
@@ -1410,7 +1413,7 @@ impl litebox::platform::TimeProvider for WindowsUserland {
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Instant(u64);
 
-impl litebox::platform::Instant for Instant {
+impl InstantTrait for Instant {
     fn checked_duration_since(&self, earlier: &Self) -> Option<core::time::Duration> {
         let diff = self.0.checked_sub(earlier.0)?;
         // Convert from 100ns intervals to nanoseconds. This won't overflow in
@@ -1430,7 +1433,7 @@ pub struct SystemTime {
     filetime: u64,
 }
 
-impl litebox::platform::SystemTime for SystemTime {
+impl SystemTimeTrait for SystemTime {
     // Windows epoch: Jan 1, 1601
     // Unix epoch: Jan 1, 1970
     // Difference: 11644473600 seconds

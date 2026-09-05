@@ -26,7 +26,6 @@ use litebox::{
     mm::{PageManager, linux::PAGE_SIZE},
     net::Network,
     pipes::Pipes,
-    platform::TimeProvider,
     shim::ContinueOperation,
     sync::futex::FutexManager,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _},
@@ -36,6 +35,7 @@ use litebox_common_linux::{
     errno::Errno,
     user_pointers::{UserPtr, UserPtrMut},
 };
+use litebox_platform::time::TimeProvider;
 
 #[cfg(target_arch = "aarch64")]
 const fn aarch64_rewrite_options() -> litebox_syscall_rewriter::RewriteOptions {
@@ -75,7 +75,7 @@ pub(crate) type FileFd<Platform> = litebox::fd::TypedFd<LinuxFS<Platform>>;
 /// as `impl<Platform: ShimPlatform, ..>` rather than repeating a large `where` clause.
 pub trait ShimPlatform:
     litebox::platform::RawPointerProvider
-    + litebox::platform::TimeProvider
+    + TimeProvider
     + litebox::platform::PageManagementProvider<{ PAGE_SIZE }>
     + litebox::mm::linux::VmemPageFaultHandler
     + litebox_platform::sync::RawMutexProvider
@@ -93,7 +93,7 @@ pub trait ShimPlatform:
 
 impl<T> ShimPlatform for T where
     T: litebox::platform::RawPointerProvider
-        + litebox::platform::TimeProvider
+        + TimeProvider
         + litebox::platform::PageManagementProvider<{ PAGE_SIZE }>
         + litebox::mm::linux::VmemPageFaultHandler
         + litebox_platform::sync::RawMutexProvider

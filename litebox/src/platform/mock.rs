@@ -15,6 +15,7 @@ use core::sync::atomic::AtomicU32;
 use litebox_platform::sync::{
     ImmediatelyWokenUp, RawMutex, RawMutexProvider, UnblockedOrTimedOut, WaitWakerProvider,
 };
+use litebox_platform::time::{Instant, SystemTime, TimeProvider};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::*;

@@ -4,10 +4,10 @@
 //! Socket I/O and readiness proxies.
 
 use core::net::SocketAddr;
+use litebox_platform::time::TimeProvider;
 
 use crate::{
     event::{Events, IOPollable, observer::Observer},
-    platform::TimeProvider,
     sync::RawSyncPrimitivesProvider,
 };
 

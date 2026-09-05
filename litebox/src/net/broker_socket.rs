@@ -15,6 +15,7 @@ use litebox_broker_protocol::socket::{
     SocketConnectionStatus, SocketError as BrokerSocketError, SocketOutcome, SocketStatusResponse,
     TcpOptionName as BrokerTcpOptionName, TcpOptionValue as BrokerTcpOptionValue,
 };
+use litebox_platform::time::TimeProvider;
 
 use super::{
     ReceiveFlags, TcpOptionData, TcpOptionName,
@@ -27,7 +28,6 @@ use super::{
 use crate::{
     broker::{BrokerControl, BrokerPollableRegistry, error::BrokerObjectError, readiness_events},
     event::{Events, IOPollable, observer::Observer, polling::Pollee},
-    platform::TimeProvider,
     sync::{Mutex, RawSyncPrimitivesProvider},
 };
 

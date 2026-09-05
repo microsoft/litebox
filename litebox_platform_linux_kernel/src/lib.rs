@@ -13,13 +13,15 @@ use litebox::mm::linux::PageRange;
 use litebox::platform::RawPointerProvider;
 use litebox::platform::page_mgmt::FixedAddressBehavior;
 use litebox::platform::{
-    ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister, PageManagementProvider,
-    Provider, TimeProvider,
+    ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister, PageManagementProvider, Provider,
 };
 use litebox_common_linux::errno::Errno;
 use litebox_platform::sync::{
     ImmediatelyWokenUp, RawMutex as RawMutexTrait, RawMutexProvider, UnblockedOrTimedOut,
     WaitWakerProvider,
+};
+use litebox_platform::time::{
+    Instant as InstantTrait, SystemTime as SystemTimeTrait, TimeProvider,
 };
 
 extern crate alloc;
@@ -207,11 +209,11 @@ impl<Host: HostInterface> RawMutex<Host> {
     }
 }
 
-/// An implementation of [`litebox::platform::Instant`]
+/// An implementation of [`litebox_platform::time::Instant`].
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Instant(u64);
 
-/// An implementation of [`litebox::platform::SystemTime`]
+/// An implementation of [`litebox_platform::time::SystemTime`].
 pub struct SystemTime {
     inner: core::time::Duration,
 }
@@ -225,7 +227,7 @@ impl<Host: HostInterface> TimeProvider for LinuxKernel<Host> {
     }
 
     fn current_time(&self) -> Self::SystemTime {
-        use litebox::platform::Instant as _;
+        use litebox_platform::time::Instant as _;
         // Derive the current system time from the monotonic clock elapsed
         // since boot, avoiding repeated host calls.
         //
@@ -242,7 +244,7 @@ impl<Host: HostInterface> TimeProvider for LinuxKernel<Host> {
     }
 }
 
-impl litebox::platform::Instant for Instant {
+impl InstantTrait for Instant {
     fn checked_duration_since(&self, earlier: &Self) -> Option<core::time::Duration> {
         self.0.checked_sub(earlier.0).map(|v| {
             core::time::Duration::from_micros(
@@ -278,7 +280,7 @@ impl Instant {
     }
 }
 
-impl litebox::platform::SystemTime for SystemTime {
+impl SystemTimeTrait for SystemTime {
     const UNIX_EPOCH: Self = SystemTime {
         inner: core::time::Duration::ZERO,
     };

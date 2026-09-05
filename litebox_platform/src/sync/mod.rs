@@ -1,11 +1,26 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Platform synchronization capability contracts.
+//! Platform synchronization contracts and portable lock implementations.
 
 use core::sync::atomic::AtomicU32;
 use core::task::Waker;
 use core::time::Duration;
+
+mod mutex;
+mod rwlock;
+
+#[cfg(feature = "lock_tracing")]
+mod lock_tracing;
+
+#[cfg(feature = "lock_tracing")]
+pub use lock_tracing::{
+    RecordingSummary, flush_to_jsonl, init_lock_tracing, start_recording, stop_recording,
+};
+pub use mutex::{Mutex, MutexGuard};
+pub use rwlock::{
+    MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
+};
 
 /// A raw mutex/lock API expected to roughly match a Linux futex.
 pub trait RawMutex: Send + Sync + 'static {
@@ -52,6 +67,14 @@ pub trait RawMutex: Send + Sync + 'static {
 pub trait RawMutexProvider {
     /// Raw mutex used by portable synchronization primitives.
     type RawMutex: RawMutex;
+}
+
+/// Platform capabilities required by the portable synchronization primitives.
+pub trait RawSyncPrimitivesProvider: RawMutexProvider + Sync + 'static {}
+
+impl<Platform> RawSyncPrimitivesProvider for Platform where
+    Platform: RawMutexProvider + Sync + 'static
+{
 }
 
 /// Platform capability for publishing the current interruptible-wait waker.

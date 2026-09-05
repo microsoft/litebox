@@ -23,13 +23,14 @@ use litebox::LiteBox;
 use litebox::mm::PageManager;
 use litebox::platform::{
     ArchSpecificProvider, ArchSpecificRegister, PageManagementProvider, RawConstPointer as _,
-    RawMutPointer as _, RawPointerProvider, SystemInfoProvider, TimeProvider,
+    RawMutPointer as _, RawPointerProvider, SystemInfoProvider,
 };
 use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
 use litebox::sync::{Mutex, RawSyncPrimitivesProvider};
 use litebox::utils::TruncateExt as _;
 use litebox_common_windows::loader::PAGE_SIZE;
 use litebox_common_windows::{NtSysno, Win32Sysno};
+use litebox_platform::time::TimeProvider;
 
 use crate::syscalls::event::{EventHandleObject, EventSubsystem};
 use crate::syscalls::file::{FileObject, FileObjectSubsystem};

@@ -4,11 +4,10 @@
 use core::mem::size_of;
 
 use int_enum::IntEnum;
-use litebox::platform::{
-    Instant as _, PageManagementProvider, RawConstPointer as _, RawMutPointer as _,
-};
+use litebox::platform::{PageManagementProvider, RawConstPointer as _, RawMutPointer as _};
 use litebox::utils::TruncateExt as _;
 use litebox_common_windows::nt_status::NtStatus;
+use litebox_platform::time::Instant as _;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::nt_types::GroupAffinity;

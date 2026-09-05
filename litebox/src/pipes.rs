@@ -12,6 +12,7 @@ use alloc::sync::{Arc, Weak};
 use litebox_broker_protocol::{
     ObjectHandle, pipe::MAX_PIPE_TRANSFER_SIZE, readiness::ReadinessFlags,
 };
+use litebox_platform::time::TimeProvider;
 use thiserror::Error;
 
 use crate::{
@@ -28,7 +29,6 @@ use crate::{
         wait::{WaitContext, WaitError},
     },
     fs::OFlags,
-    platform::TimeProvider,
     sync::RawSyncPrimitivesProvider,
 };
 

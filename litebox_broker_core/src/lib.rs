@@ -27,7 +27,6 @@ pub mod readiness;
 mod session;
 pub mod socket;
 pub mod stdio;
-pub mod sync;
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
