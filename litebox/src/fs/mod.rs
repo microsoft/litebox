@@ -14,54 +14,8 @@ use core::num::NonZeroUsize;
 pub mod errors;
 pub mod resolver;
 
-#[doc(hidden)]
-#[cfg(any(test, feature = "local_filesystem"))]
-pub mod backend {
-    pub use litebox_broker_core::fs::backend::*;
-}
-
-#[doc(hidden)]
-#[cfg(any(test, feature = "local_filesystem"))]
-pub mod composer {
-    pub use litebox_broker_core::fs::composer::*;
-}
-
-#[doc(hidden)]
-#[cfg(any(test, feature = "local_filesystem"))]
-pub mod devices {
-    pub use litebox_broker_core::fs::devices::*;
-}
-
-#[doc(hidden)]
-#[cfg(any(test, feature = "local_filesystem"))]
-pub mod in_mem {
-    pub use litebox_broker_core::fs::in_mem::*;
-    pub use litebox_broker_core::fs::{Mode, UserInfo};
-}
-
-#[doc(hidden)]
 #[cfg(test)]
-pub(crate) mod inode_allocator {
-    pub(crate) use litebox_broker_core::fs::inode_allocator::*;
-}
-
-#[doc(hidden)]
-#[cfg(any(test, feature = "local_filesystem"))]
-pub mod nine_p {
-    pub use litebox_broker_core::fs::nine_p::*;
-}
-
-#[doc(hidden)]
-#[cfg(any(test, feature = "local_filesystem"))]
-pub mod overlay {
-    pub use litebox_broker_core::fs::overlay::*;
-}
-
-#[doc(hidden)]
-#[cfg(any(test, feature = "local_filesystem"))]
-pub mod tar_ro {
-    pub use litebox_broker_core::fs::tar_ro::*;
-}
+mod broker_fixture;
 
 #[cfg(test)]
 mod tests;

@@ -15,7 +15,9 @@ litebox_util_log = { version = "0.1.0", path = "../litebox_util_log", features =
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 
 [dev-dependencies]
-litebox_shim_linux = { version = "0.1.0", path = "../litebox_shim_linux", default-features = false, features = ["local_filesystem"] }
+litebox_broker_core = { version = "0.1.0", path = "../litebox_broker_core" }
+litebox_broker_test_support = { version = "0.1.0", path = "../litebox_broker_test_support" }
+litebox_shim_linux = { version = "0.1.0", path = "../litebox_shim_linux", default-features = false }
 litebox_syscall_rewriter = { version = "0.1.0", path = "../litebox_syscall_rewriter", default-features = false, features = ["std"] }
 tar = "0.4"
 

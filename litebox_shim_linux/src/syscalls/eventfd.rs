@@ -106,10 +106,12 @@ mod tests {
 
     #[test]
     fn test_eventfd_requires_broker_control() {
-        let task = crate::syscalls::tests::init_platform();
+        let global = crate::LinuxShimBuilder::new(crate::syscalls::tests::test_platform())
+            .build()
+            .0;
 
         assert!(matches!(
-            task.global.create_linux_eventfd(0, EfdFlags::NONBLOCK),
+            global.create_linux_eventfd(0, EfdFlags::NONBLOCK),
             Err(Errno::EIO)
         ));
     }

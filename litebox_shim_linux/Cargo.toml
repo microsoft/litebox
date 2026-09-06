@@ -23,13 +23,11 @@ object = { version = "0.36.7", default-features = false, features = ["elf", "rea
 [features]
 alarm_fallback = []
 aarch64_virtualize_x18 = []
-local_filesystem = ["litebox/local_filesystem"]
 
 [dev-dependencies]
-litebox = { path = "../litebox/", version = "0.1.0", features = ["local_filesystem"] }
-litebox_broker_local = { path = "../litebox_broker_local", version = "0.1.0" }
+litebox = { path = "../litebox/", version = "0.1.0" }
 litebox_broker_protocol = { path = "../litebox_broker_protocol", version = "0.1.0" }
-litebox_broker_transport = { path = "../litebox_broker_transport", version = "0.1.0" }
+litebox_broker_test_support = { path = "../litebox_broker_test_support", version = "0.1.0" }
 spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }
 libc = "0.2.177"
 tempfile = "3"

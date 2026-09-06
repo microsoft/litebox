@@ -1,0 +1,16 @@
+[package]
+name = "litebox_broker_test_support"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+litebox_broker_core = { path = "../litebox_broker_core", version = "0.1.0" }
+litebox_broker_host = { path = "../litebox_broker_host", version = "0.1.0" }
+litebox_broker_local = { path = "../litebox_broker_local", version = "0.1.0" }
+litebox_broker_protocol = { path = "../litebox_broker_protocol", version = "0.1.0" }
+litebox_broker_transport = { path = "../litebox_broker_transport", version = "0.1.0" }
+litebox_platform = { path = "../litebox_platform", version = "0.1.0" }
+
+[lints]
+workspace = true

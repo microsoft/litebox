@@ -1452,6 +1452,7 @@ dependencies = [
  "litebox_broker_core",
  "litebox_broker_local",
  "litebox_broker_protocol",
+ "litebox_broker_test_support",
  "litebox_broker_transport",
  "litebox_platform",
  "litebox_util_log",
@@ -1527,6 +1528,18 @@ name = "litebox_broker_protocol"
 version = "0.1.0"
 dependencies = [
  "thiserror",
+]
+
+[[package]]
+name = "litebox_broker_test_support"
+version = "0.1.0"
+dependencies = [
+ "litebox_broker_core",
+ "litebox_broker_host",
+ "litebox_broker_local",
+ "litebox_broker_protocol",
+ "litebox_broker_transport",
+ "litebox_platform",
 ]
 
 [[package]]
@@ -1761,7 +1774,9 @@ dependencies = [
  "anyhow",
  "clap",
  "litebox",
+ "litebox_broker_core",
  "litebox_broker_local_userland",
+ "litebox_broker_test_support",
  "litebox_common_linux",
  "litebox_platform_windows_userland",
  "litebox_shim_linux",
@@ -1785,6 +1800,7 @@ dependencies = [
  "litebox_broker_local_userland",
  "litebox_broker_platform_linux_userland",
  "litebox_broker_protocol",
+ "litebox_broker_test_support",
  "litebox_broker_transport",
  "litebox_broker_transport_linux_userland",
  "litebox_broker_userland",
@@ -1924,9 +1940,8 @@ dependencies = [
  "libc",
  "litebox",
  "litebox_broker_core",
- "litebox_broker_local",
  "litebox_broker_protocol",
- "litebox_broker_transport",
+ "litebox_broker_test_support",
  "litebox_common_linux",
  "litebox_platform",
  "litebox_platform_linux_userland",
@@ -1977,6 +1992,8 @@ dependencies = [
  "bitflags",
  "int-enum",
  "litebox",
+ "litebox_broker_core",
+ "litebox_broker_test_support",
  "litebox_common_linux",
  "litebox_common_windows",
  "litebox_platform",

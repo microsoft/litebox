@@ -321,6 +321,9 @@ jobs:
           # - `litebox_broker_userland` is allowed to have `std` access,
           #   since it is the hosted userland broker executable.
           #
+          # - `litebox_broker_test_support` is allowed to have `std` access,
+          #   since it provides an in-process broker transport for hosted tests.
+          #
           # - `litebox_egress_proxy` is allowed to have `std` access, since it
           #   is the hosted userland CONNECT proxy executable.
           #
@@ -389,6 +392,7 @@ jobs:
             -not -path './litebox_broker_platform_linux_userland/Cargo.toml' \
             -not -path './litebox_broker_transport_linux_userland/Cargo.toml' \
             -not -path './litebox_broker_transport_windows_userland/Cargo.toml' \
+            -not -path './litebox_broker_test_support/Cargo.toml' \
             -not -path './litebox_broker_userland/Cargo.toml' \
             -not -path './litebox_egress_proxy/Cargo.toml' \
             -not -path './litebox_platform_linux_userland/Cargo.toml' \

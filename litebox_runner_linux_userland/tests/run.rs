@@ -658,16 +658,16 @@ fn test_fs_provider(
 ) -> std::sync::Arc<dyn litebox_broker_core::fs::FilesystemProvider> {
     use std::os::unix::fs::PermissionsExt as _;
 
-    let owner = litebox::fs::in_mem::UserInfo {
+    let owner = litebox_broker_core::fs::UserInfo {
         user: 1000,
         group: 1000,
     };
     let mut entries = vec![(
         "/tmp".to_owned(),
-        litebox::fs::in_mem::InitialNode::Directory {
-            mode: litebox::fs::in_mem::Mode::RWXU
-                | litebox::fs::in_mem::Mode::RWXG
-                | litebox::fs::in_mem::Mode::RWXO,
+        litebox_broker_core::fs::in_mem::InitialNode::Directory {
+            mode: litebox_broker_core::fs::Mode::RWXU
+                | litebox_broker_core::fs::Mode::RWXG
+                | litebox_broker_core::fs::Mode::RWXO,
             owner,
         },
     )];
@@ -690,11 +690,12 @@ fn test_fs_provider(
             let metadata = entry
                 .metadata()
                 .expect("failed to read broker test filesystem metadata");
-            let mode = litebox::fs::in_mem::Mode::from_bits_retain(metadata.permissions().mode());
+            let mode =
+                litebox_broker_core::fs::Mode::from_bits_retain(metadata.permissions().mode());
             let node = if metadata.is_dir() {
-                litebox::fs::in_mem::InitialNode::Directory { mode, owner }
+                litebox_broker_core::fs::in_mem::InitialNode::Directory { mode, owner }
             } else {
-                litebox::fs::in_mem::InitialNode::File {
+                litebox_broker_core::fs::in_mem::InitialNode::File {
                     mode,
                     owner,
                     data: std::borrow::Cow::Owned(
@@ -706,12 +707,12 @@ fn test_fs_provider(
             entries.push((path, node));
         }
     }
-    let in_mem = litebox::fs::in_mem::InMem::<
+    let in_mem = litebox_broker_core::fs::in_mem::InMem::<
         litebox_broker_platform_linux_userland::LinuxSyncPrimitivesProvider,
     >::new_initialized(entries);
-    let backend = litebox::fs::composer::Composer::builder()
+    let backend = litebox_broker_core::fs::composer::Composer::builder()
         .mount_nestable("/", |_| in_mem)
-        .mount("/dev", litebox::fs::devices::Devices::new)
+        .mount("/dev", litebox_broker_core::fs::devices::Devices::new)
         .build()
         .expect("failed to construct broker test filesystem");
     std::sync::Arc::new(litebox_broker_core::fs::FilesystemProviderAdapter::new(

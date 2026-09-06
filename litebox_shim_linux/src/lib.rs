@@ -14,8 +14,6 @@
 
 extern crate alloc;
 
-#[cfg(any(test, feature = "local_filesystem"))]
-use alloc::borrow::Cow;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -227,16 +225,6 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         &self.litebox
     }
 
-    /// Create the default file system with the given in-memory layer and tar data.
-    #[cfg(any(test, feature = "local_filesystem"))]
-    pub fn default_fs(
-        &self,
-        in_mem: litebox::fs::in_mem::InMem<Platform>,
-        tar_data: Cow<'static, [u8]>,
-    ) -> DefaultFS<Platform> {
-        default_fs(&self.litebox, in_mem, tar_data)
-    }
-
     /// Creates a filesystem facade backed by the negotiated broker.
     #[must_use]
     pub fn brokered_fs(&self) -> DefaultFS<Platform> {
@@ -380,29 +368,6 @@ impl<Platform: ShimPlatform> LinuxShimProcess<Platform> {
             syscalls::process::ExitStatus::Signal(signal) => signal.as_i32() + 256,
         }
     }
-}
-
-/// Create the default file system with the given in-memory layer and tar data.
-#[cfg(any(test, feature = "local_filesystem"))]
-fn default_fs<Platform: ShimPlatform>(
-    litebox: &LiteBox<Platform>,
-    in_mem: litebox::fs::in_mem::InMem<Platform>,
-    tar_data: Cow<'static, [u8]>,
-) -> LinuxFS<Platform> {
-    litebox::fs::resolver::Resolver::new(
-        litebox,
-        litebox::fs::composer::Composer::builder()
-            .mount_nestable("/", |allocators| {
-                litebox::fs::overlay::Overlay::<Platform>::new(
-                    in_mem,
-                    litebox::fs::tar_ro::TarRo::new(tar_data, allocators.next()),
-                    allocators.next(),
-                )
-            })
-            .mount("/dev", litebox::fs::devices::Devices::new)
-            .build()
-            .unwrap(),
-    )
 }
 
 // Special override so that `GETFL` can return stdio-specific flags

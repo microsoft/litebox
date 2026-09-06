@@ -436,6 +436,9 @@ struct BrokerDeviceIo<'a> {
 
 impl DeviceIo for BrokerDeviceIo<'_> {
     fn read_stdin(&self, output: &mut [u8]) -> Result<usize, ReadError> {
+        if output.is_empty() {
+            return Ok(0);
+        }
         self.stdio
             .read(self.cancellation, output)
             .map_err(|_| ReadError::Io)
@@ -446,12 +449,18 @@ impl DeviceIo for BrokerDeviceIo<'_> {
         stream: litebox_broker_protocol::stdio::StdioOutputStream,
         input: &[u8],
     ) -> Result<usize, WriteError> {
+        if input.is_empty() {
+            return Ok(0);
+        }
         self.stdio
             .write(self.cancellation, stream, input)
             .map_err(|_| WriteError::Io)
     }
 
     fn fill_random(&self, output: &mut [u8]) -> Result<(), ReadError> {
+        if output.is_empty() {
+            return Ok(());
+        }
         self.random.fill(output).map_err(|_| ReadError::Io)
     }
 }

@@ -7,6 +7,10 @@ mod common;
 use std::ffi::CString;
 
 use litebox::fs::{Mode, OFlags};
+use litebox_broker_core::fs::{
+    Mode as BackendMode, UserInfo as BackendUserInfo, composer::Composer, devices::Devices,
+    in_mem::InMem, in_mem::InitialNode, overlay::Overlay, tar_ro::TarRo,
+};
 use litebox_platform_linux_userland::LinuxUserland as Platform;
 
 struct TestLauncher {
@@ -19,23 +23,35 @@ struct TestLauncher {
 impl TestLauncher {
     fn init_platform(tar_data: &'static [u8], initial_files: &[&str]) -> Self {
         let platform = Platform::new();
-        let shim_builder = litebox_shim_linux::LinuxShimBuilder::new(platform);
-
-        let in_mem = litebox::fs::in_mem::InMem::new_initialized([(
+        let in_mem = InMem::<Platform>::new_initialized([(
             "/",
-            litebox::fs::in_mem::InitialNode::Directory {
-                mode: litebox::fs::in_mem::Mode::RWXU
-                    | litebox::fs::in_mem::Mode::RWXG
-                    | litebox::fs::in_mem::Mode::RWXO,
-                owner: litebox::fs::in_mem::UserInfo::ROOT,
+            InitialNode::Directory {
+                mode: BackendMode::RWXU | BackendMode::RWXG | BackendMode::RWXO,
+                owner: BackendUserInfo::ROOT,
             },
         )]);
         let tar_data = if tar_data.is_empty() {
-            litebox::fs::tar_ro::EMPTY_TAR_FILE.into()
+            litebox_broker_core::fs::tar_ro::EMPTY_TAR_FILE.into()
         } else {
             tar_data.into()
         };
-        let fs = shim_builder.default_fs(in_mem, tar_data);
+        let backend = Composer::builder()
+            .mount_nestable("/", |allocators| {
+                Overlay::<Platform>::new(
+                    in_mem,
+                    TarRo::new(tar_data, allocators.next()),
+                    allocators.next(),
+                )
+            })
+            .mount("/dev", Devices::new)
+            .build()
+            .unwrap();
+        let broker_local =
+            litebox_broker_test_support::connect_with_filesystem::<Platform, _>(backend);
+        let litebox = litebox::LiteBox::new_with_broker_local(platform, broker_local);
+        let shim_builder =
+            litebox_shim_linux::LinuxShimBuilder::new_with_litebox(platform, litebox);
+        let fs = shim_builder.brokered_fs();
         let mut this = Self {
             platform,
             shim_builder,
@@ -84,7 +100,12 @@ impl TestLauncher {
                 Mode::RWXG | Mode::RWXO | Mode::RWXU,
             )
             .unwrap();
-        self.fs.write(&fd, &contents, None).unwrap();
+        let mut written = 0;
+        while written < contents.len() {
+            let count = self.fs.write(&fd, &contents[written..], None).unwrap();
+            assert!(count > 0, "filesystem write made no progress");
+            written += count;
+        }
         self.fs.close(&fd).unwrap();
     }
 

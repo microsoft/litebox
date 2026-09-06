@@ -68,22 +68,67 @@ pub(crate) fn object_attributes(name: &UnicodeString, attributes: u32) -> Object
     }
 }
 
-pub(crate) fn test_platform() -> &'static TestPlatform {
-    static PLATFORM: std::sync::OnceLock<&'static TestPlatform> = std::sync::OnceLock::new();
-    PLATFORM.get_or_init(|| {
+struct TestEnvironment {
+    platform: &'static TestPlatform,
+    broker: litebox_broker_core::BrokerCore,
+}
+
+fn test_environment() -> &'static TestEnvironment {
+    static ENVIRONMENT: std::sync::OnceLock<TestEnvironment> = std::sync::OnceLock::new();
+    ENVIRONMENT.get_or_init(|| {
         #[cfg(target_os = "linux")]
         let platform = TestPlatform::new();
 
         #[cfg(target_os = "windows")]
         let platform = TestPlatform::new();
 
-        platform
+        let in_mem = litebox_broker_core::fs::in_mem::InMem::<TestPlatform>::new_initialized([(
+            "/",
+            litebox_broker_core::fs::in_mem::InitialNode::Directory {
+                mode: litebox_broker_core::fs::Mode::RWXU
+                    | litebox_broker_core::fs::Mode::RWXG
+                    | litebox_broker_core::fs::Mode::RWXO,
+                owner: litebox_broker_core::fs::UserInfo::ROOT,
+            },
+        )]);
+        let backend = litebox_broker_core::fs::composer::Composer::builder()
+            .mount_nestable("/", |allocators| {
+                litebox_broker_core::fs::overlay::Overlay::<TestPlatform>::new(
+                    in_mem,
+                    litebox_broker_core::fs::tar_ro::TarRo::new(
+                        litebox_broker_core::fs::tar_ro::EMPTY_TAR_FILE.into(),
+                        allocators.next(),
+                    ),
+                    allocators.next(),
+                )
+            })
+            .mount("/dev", litebox_broker_core::fs::devices::Devices::new)
+            .build()
+            .expect("valid test filesystem backend");
+        let broker = litebox_broker_test_support::core_with_filesystem::<TestPlatform, _>(backend);
+
+        TestEnvironment { platform, broker }
     })
+}
+
+pub(crate) fn test_platform() -> &'static TestPlatform {
+    test_environment().platform
 }
 
 pub(crate) fn run_with_test_platform_pointers<R>(f: impl FnOnce() -> R) -> R {
     let _ = test_platform();
     <TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(f)
+}
+
+/// Returns the process-wide broker core backing the shim's unit tests.
+///
+/// A `BrokerCore` can only be constructed once per process, so this is
+/// initialized lazily and shared by every test. Each test task connects its
+/// own broker-local association (see [`test_task_with_nls_files`]) to this
+/// shared core, so the underlying guest filesystem is shared across tasks
+/// created within the same test binary.
+fn test_broker() -> &'static litebox_broker_core::BrokerCore {
+    &test_environment().broker
 }
 
 fn map_csr_server_shared_memory(
@@ -109,68 +154,85 @@ pub(crate) fn test_task() -> Task<TestPlatform> {
     test_task_with_nls_files(&[])
 }
 
+/// Creates a `mkdir` that tolerates the directory already existing.
+///
+/// Test tasks share the same broker-backed guest filesystem across the
+/// process (see [`test_broker`]), so a directory created by an earlier task
+/// fixture is expected to already be present for later ones.
+fn mkdir_idempotent(
+    fs: &crate::WindowsFS<TestPlatform>,
+    context: &litebox::fs::resolver::Context,
+    path: &str,
+    mode: Mode,
+) {
+    match fs.mkdir(context, path, mode) {
+        Ok(()) | Err(litebox::fs::errors::MkdirError::AlreadyExists) => {}
+        Err(error) => panic!("failed to create {path}: {error:?}"),
+    }
+}
+
 pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<TestPlatform> {
     let platform = test_platform();
-    let in_mem = litebox::fs::in_mem::InMem::new_initialized([(
-        "/",
-        litebox::fs::in_mem::InitialNode::Directory {
-            mode: litebox::fs::in_mem::Mode::RWXU
-                | litebox::fs::in_mem::Mode::RWXG
-                | litebox::fs::in_mem::Mode::RWXO,
-            owner: litebox::fs::in_mem::UserInfo::ROOT,
-        },
-    )]);
-    let shim_builder = crate::WindowsShimBuilder::<TestPlatform>::new(platform);
-    let fs = Arc::new(shim_builder.default_fs(in_mem, litebox::fs::tar_ro::EMPTY_TAR_FILE.into()));
+    let broker_local = litebox_broker_test_support::connect(test_broker().clone());
+    let litebox = litebox::LiteBox::new_with_broker_local(platform, broker_local);
+    let shim_builder =
+        crate::WindowsShimBuilder::<TestPlatform>::new_with_litebox(platform, litebox);
+    let fs = Arc::new(shim_builder.brokered_fs());
     let fs_context = litebox::fs::resolver::Context::new();
     {
         let fs = &*fs;
-        fs.mkdir(
+        mkdir_idempotent(
+            fs,
             &fs_context,
             "/tmp",
             litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
-        )
-        .expect("/tmp creation cannot fail on a fresh in-memory file system");
+        );
         fs.chown(&fs_context, "/tmp", Some(1000), Some(1000))
-            .expect("/tmp chown cannot fail on a fresh in-memory file system");
+            .expect("/tmp chown should succeed");
 
         if !nls_files.is_empty() {
-            fs.mkdir(
+            mkdir_idempotent(
+                fs,
                 &fs_context,
                 "/Windows",
                 Mode::RWXU | Mode::RWXG | Mode::RWXO,
-            )
-            .expect("/Windows creation cannot fail on a fresh in-memory file system");
-            fs.mkdir(
+            );
+            mkdir_idempotent(
+                fs,
                 &fs_context,
                 "/Windows/System32",
                 Mode::RWXU | Mode::RWXG | Mode::RWXO,
-            )
-            .expect("/Windows/System32 creation cannot fail on a fresh in-memory file system");
-            fs.mkdir(
+            );
+            mkdir_idempotent(
+                fs,
                 &fs_context,
                 "/Windows/Globalization",
                 Mode::RWXU | Mode::RWXG | Mode::RWXO,
-            )
-            .expect("/Windows/Globalization creation cannot fail on a fresh in-memory file system");
-            fs.mkdir(
+            );
+            mkdir_idempotent(
+                fs,
                 &fs_context,
                 "/Windows/Globalization/Sorting",
                 Mode::RWXU | Mode::RWXG | Mode::RWXO,
-            )
-            .expect("/Windows/Globalization/Sorting creation cannot fail on a fresh in-memory file system");
+            );
         }
         for (path, bytes) in nls_files {
             let fd = fs
                 .open(
                     &fs_context,
                     *path,
-                    OFlags::WRONLY | OFlags::CREAT,
+                    OFlags::WRONLY | OFlags::CREAT | OFlags::TRUNC,
                     Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::ROTH,
                 )
                 .expect("NLS fixture creation should succeed");
-            fs.write(&fd, bytes, Some(0))
-                .expect("NLS fixture write should succeed");
+            let mut written = 0;
+            while written < bytes.len() {
+                let count = fs
+                    .write(&fd, &bytes[written..], Some(written))
+                    .expect("NLS fixture write should succeed");
+                assert!(count > 0, "NLS fixture write made no progress");
+                written += count;
+            }
             fs.close(&fd).expect("NLS fixture close should succeed");
         }
     }

@@ -602,36 +602,7 @@ struct RegistryValue {
 
 impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
     pub(crate) fn new(litebox: &LiteBox<Platform>) -> Self {
-        #[cfg(not(any(test, feature = "local_filesystem")))]
         let fs = litebox::fs::resolver::Resolver::new_brokered_windows_registry(litebox);
-        #[cfg(any(test, feature = "local_filesystem"))]
-        let in_mem = litebox::fs::in_mem::InMem::<Platform>::new_initialized([(
-            "/",
-            litebox::fs::in_mem::InitialNode::Directory {
-                mode: litebox::fs::in_mem::Mode::RWXU
-                    | litebox::fs::in_mem::Mode::RWXG
-                    | litebox::fs::in_mem::Mode::RWXO,
-                owner: litebox::fs::in_mem::UserInfo::ROOT,
-            },
-        )]);
-        #[cfg(any(test, feature = "local_filesystem"))]
-        let fs = litebox::fs::resolver::Resolver::new(
-            litebox,
-            litebox::fs::composer::Composer::builder()
-                .mount_nestable("/", |allocators| {
-                    litebox::fs::overlay::Overlay::<Platform>::new(
-                        in_mem,
-                        litebox::fs::tar_ro::TarRo::new(
-                            // TODO: Replace with tar file provided by the user
-                            litebox::fs::tar_ro::EMPTY_TAR_FILE.into(),
-                            allocators.next(),
-                        ),
-                        allocators.next(),
-                    )
-                })
-                .build()
-                .unwrap(),
-        );
         let fs_context = litebox::fs::resolver::Context::new();
         {
             let fs = &fs;
@@ -2450,13 +2421,12 @@ fn map_read_dir_error(error: ReadDirError) -> NtStatus {
 #[cfg(test)]
 mod tests {
     use crate::tests::{
-        TestPlatform, const_ptr, mut_byte_ptr, mut_ptr, object_attributes, test_platform,
-        unicode_string, utf16_units as utf16,
+        TestPlatform, const_ptr, mut_byte_ptr, mut_ptr, object_attributes, unicode_string,
+        utf16_units as utf16,
     };
 
     use super::*;
     use core::mem::size_of;
-    use litebox::LiteBox;
 
     extern crate std;
 
@@ -2516,12 +2486,6 @@ mod tests {
         ) -> i32;
         fn RegCloseKey(hKey: *mut core::ffi::c_void) -> i32;
         fn RegDeleteTreeW(hKey: *mut core::ffi::c_void, lpSubKey: *const u16) -> i32;
-    }
-
-    fn test_registry() -> (LiteBox<TestPlatform>, RegistryStore<TestPlatform>) {
-        let litebox = LiteBox::new(test_platform());
-        let registry = RegistryStore::new(&litebox);
-        (litebox, registry)
     }
 
     fn open_key(
@@ -2691,7 +2655,8 @@ mod tests {
 
     #[test]
     fn registry_store_separates_values_from_subkeys() {
-        let (_litebox, registry) = test_registry();
+        let task = crate::tests::test_task();
+        let registry = &task.global.registry;
         let key_path = absolute_nt_key_name_to_fs_path(DEFAULT_CODE_PAGE_KEY).unwrap();
         let value_path = value_path(&key_path, "ACP").unwrap();
 
