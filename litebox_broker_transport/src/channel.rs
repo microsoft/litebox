@@ -132,7 +132,7 @@ pub trait HostNotificationChannel {
 /// peer.
 ///
 /// This is the request-reading half of an active association's control
-/// transport. It is transport-neutral so a generic hosted association runtime,
+/// transport. It is transport-neutral so a generic association runtime,
 /// such as the one in `litebox_broker_userland`, can dispatch requests without
 /// depending on a concrete transport crate.
 pub trait HostRequestSource {

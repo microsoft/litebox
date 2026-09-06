@@ -1,10 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Generic hosted broker association runtime.
+//! Generic broker association runtime.
 //!
 //! This module owns association setup, request dispatch, readiness
-//! publication, cancellation, and teardown for one hosted broker association.
+//! publication, cancellation, and teardown for one broker association.
 //! It is transport-neutral: it depends only on the [`HostSetupChannel`],
 //! [`HostRequestSource`], [`HostResponseSink`], [`HostNotificationChannel`],
 //! and [`HostAssociationShutdown`] contracts from
@@ -44,7 +44,7 @@ const REQUEST_QUEUE_CAPACITY: usize = 64;
 const REQUEST_QUEUE_RETRY_DELAY: Duration = Duration::from_millis(1);
 const REQUEST_QUEUE_STALL_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Serves one hosted broker association from setup through teardown.
+/// Serves one broker association from setup through teardown.
 ///
 /// `control_channel` must already be configured with whatever deadline and
 /// peer authentication its transport requires; this function only negotiates

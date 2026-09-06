@@ -1,9 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Structured configuration for constructing a hosted broker core.
+//! Structured configuration for constructing a userland broker core.
 //!
-//! [`HostedBrokerBuilder`] selects the platform socket provider, the
+//! [`BrokerCoreBuilder`] selects the platform socket provider, the
 //! cross-platform getrandom-backed random provider, and the inherited-stdio
 //! provider, and applies whatever platform setup a deployment needs before its
 //! first association is served (for example, Linux lock-tracing
@@ -20,7 +20,7 @@ use litebox_broker_core::{BrokerCore, BrokerCoreLimits, BrokerError, PolicyEngin
 use crate::random::UserlandRandomProvider;
 use crate::stdio::UserlandStdioProvider;
 
-/// Failure constructing a hosted [`BrokerCore`].
+/// Failure constructing a userland [`BrokerCore`].
 ///
 /// Platform setup, such as creating a socket provider or spawning stdio pump
 /// threads, fails with [`std::io::Error`]. A rejected core configuration, such
@@ -29,23 +29,23 @@ use crate::stdio::UserlandStdioProvider;
 /// failure is retryable platform trouble or a fixed configuration mistake.
 #[derive(Debug)]
 #[non_exhaustive]
-pub enum HostedBrokerError {
+pub enum BrokerBuildError {
     /// Platform-level setup failed.
     Io(std::io::Error),
     /// The broker core rejected the requested configuration.
     Broker(BrokerError),
 }
 
-impl fmt::Display for HostedBrokerError {
+impl fmt::Display for BrokerBuildError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Io(error) => write!(formatter, "hosted broker platform setup failed: {error}"),
-            Self::Broker(error) => write!(formatter, "hosted broker core rejected: {error}"),
+            Self::Io(error) => write!(formatter, "broker platform setup failed: {error}"),
+            Self::Broker(error) => write!(formatter, "broker core rejected: {error}"),
         }
     }
 }
 
-impl std::error::Error for HostedBrokerError {
+impl std::error::Error for BrokerBuildError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
@@ -54,31 +54,31 @@ impl std::error::Error for HostedBrokerError {
     }
 }
 
-impl From<std::io::Error> for HostedBrokerError {
+impl From<std::io::Error> for BrokerBuildError {
     fn from(error: std::io::Error) -> Self {
         Self::Io(error)
     }
 }
 
-impl From<BrokerError> for HostedBrokerError {
+impl From<BrokerError> for BrokerBuildError {
     fn from(error: BrokerError) -> Self {
         Self::Broker(error)
     }
 }
 
-/// Structured configuration for building a hosted [`BrokerCore`].
+/// Structured configuration for building a userland [`BrokerCore`].
 ///
 /// This is the in-process equivalent of the userland broker binary's platform
 /// setup: it selects the same platform providers and applies the same
 /// process-wide platform initialization, so a caller that hosts a broker core
 /// directly gets the same behavior a deployment launched through the binary
 /// would.
-pub struct HostedBrokerBuilder {
+pub struct BrokerCoreBuilder {
     policy: PolicyEngine,
     limits: BrokerCoreLimits,
 }
 
-impl HostedBrokerBuilder {
+impl BrokerCoreBuilder {
     /// Creates a builder with the given policy and default authority-state
     /// limits.
     #[must_use]
@@ -96,11 +96,11 @@ impl HostedBrokerBuilder {
         self
     }
 
-    /// Applies platform setup and constructs the hosted [`BrokerCore`].
+    /// Applies platform setup and constructs the [`BrokerCore`].
     ///
     /// A broker process may construct only one broker core for its process
     /// lifetime; see [`BrokerCore::new_with_limits`].
-    pub fn build(self) -> Result<BrokerCore, HostedBrokerError> {
+    pub fn build(self) -> Result<BrokerCore, BrokerBuildError> {
         init_platform();
         let socket_provider = platform_socket_provider(&self.limits)?;
         let broker = BrokerCore::new_with_limits(
@@ -114,7 +114,7 @@ impl HostedBrokerBuilder {
     }
 }
 
-/// Applies process-wide platform setup shared by every hosted broker core.
+/// Applies process-wide platform setup shared by every userland broker core.
 ///
 /// This runs lock tracing initialization on Linux when the `lock_tracing`
 /// feature is enabled, so an in-process caller gets the same platform setup
@@ -131,7 +131,7 @@ fn init_platform() {
 #[cfg(target_os = "linux")]
 fn platform_socket_provider(
     limits: &BrokerCoreLimits,
-) -> Result<Arc<dyn SocketProvider>, HostedBrokerError> {
+) -> Result<Arc<dyn SocketProvider>, BrokerBuildError> {
     Ok(Arc::new(
         litebox_broker_platform_linux_userland::LinuxSocketProvider::new(
             limits.max_sockets,
@@ -147,7 +147,7 @@ fn platform_socket_provider(
 #[allow(clippy::unnecessary_wraps)]
 fn platform_socket_provider(
     _limits: &BrokerCoreLimits,
-) -> Result<Arc<dyn SocketProvider>, HostedBrokerError> {
+) -> Result<Arc<dyn SocketProvider>, BrokerBuildError> {
     Ok(Arc::new(
         litebox_broker_core::socket::UnsupportedSocketProvider,
     ))

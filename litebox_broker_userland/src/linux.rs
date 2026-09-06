@@ -16,7 +16,7 @@ use litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory;
 use litebox_broker_transport_linux_userland::unix_socket::{
     UnixStreamHostSetupChannel, validate_peer_process,
 };
-use litebox_broker_userland::builder::HostedBrokerBuilder;
+use litebox_broker_userland::builder::BrokerCoreBuilder;
 
 use super::{SETUP_TIMEOUT, configured_socket_policy};
 
@@ -44,7 +44,7 @@ pub(super) fn run(mut args: super::CliArgs) -> Result<(), Box<dyn Error>> {
     let control_socket_path = socket_dir.path().join("broker.sock");
     let control_listener = UnixListener::bind(&control_socket_path)?;
     control_listener.set_nonblocking(true)?;
-    let broker = HostedBrokerBuilder::new(
+    let broker = BrokerCoreBuilder::new(
         PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()).with_socket_policy(
             configured_socket_policy(&args.allow_tcp_destination, &args.allow_udp_destination)?,
         ),

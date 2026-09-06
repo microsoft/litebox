@@ -5,8 +5,8 @@
 //!
 //! This crate owns the shared parts of userland broker deployments: a
 //! structured builder that selects operating-system providers and constructs a
-//! [`litebox_broker_core::BrokerCore`] ([`builder`]), the generic hosted
-//! association runtime that serves one association from setup through
+//! [`litebox_broker_core::BrokerCore`] ([`builder`]), the generic association
+//! runtime that serves one association from setup through
 //! teardown ([`runtime`]), and threaded readiness publication
 //! ([`readiness`]). The `litebox-broker-userland` binary composes these with
 //! CLI parsing, launching and supervising the separate LiteBox runner process,

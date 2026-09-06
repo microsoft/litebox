@@ -15,14 +15,14 @@ use litebox_broker_transport_windows_userland::named_pipe::{
     WindowsNamedPipeHostSetupChannel, WindowsNamedPipeListener, validate_client_process,
 };
 use litebox_broker_transport_windows_userland::shared_memory::WindowsSharedMemory;
-use litebox_broker_userland::builder::HostedBrokerBuilder;
+use litebox_broker_userland::builder::BrokerCoreBuilder;
 
 use super::{SETUP_TIMEOUT, configured_socket_policy};
 
 pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
     let control_pipe = unique_control_pipe_name();
     let control_listener = WindowsNamedPipeListener::bind(&control_pipe)?;
-    let broker = HostedBrokerBuilder::new(
+    let broker = BrokerCoreBuilder::new(
         PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()).with_socket_policy(
             configured_socket_policy(&args.allow_tcp_destination, &args.allow_udp_destination)?,
         ),
