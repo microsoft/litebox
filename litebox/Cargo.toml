@@ -8,7 +8,6 @@ bitflags = "2.13.1"
 hashbrown = "0.15.2"
 smallvec = "1.13.2"
 spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }
-tar-no-std = { version = "0.3.3", default-features = false, features = ["alloc"] }
 thiserror = { version = "2.0.6", default-features = false }
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 rangemap = { version = "1.5.1", features = ["const_fn"] }
@@ -39,4 +38,6 @@ enforce_singleton_litebox_instance = []
 workspace = true
 
 [dev-dependencies]
+litebox_broker_core = { version = "0.1.0", path = "../litebox_broker_core" }
+litebox_broker_test_support = { version = "0.1.0", path = "../litebox_broker_test_support" }
 tempfile = "3"

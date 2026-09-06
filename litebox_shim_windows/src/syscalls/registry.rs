@@ -58,8 +58,7 @@ use crate::nt_types::{
     read_unicode_string_at,
 };
 
-type RegistryFileSystem<Platform> =
-    litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>;
+type RegistryFileSystem<Platform> = litebox::fs::resolver::Resolver<Platform>;
 
 pub(crate) struct RegistryKeySubsystem<Platform>(PhantomData<fn(Platform)>);
 
@@ -603,31 +602,7 @@ struct RegistryValue {
 
 impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
     pub(crate) fn new(litebox: &LiteBox<Platform>) -> Self {
-        let in_mem = litebox::fs::in_mem::InMem::<Platform>::new_initialized([(
-            "/",
-            litebox::fs::in_mem::InitialNode::Directory {
-                mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
-                owner: litebox::fs::UserInfo::ROOT,
-            },
-        )]);
-        let fs = litebox::fs::resolver::Resolver::new(
-            litebox,
-            litebox::fs::composer::Composer::builder()
-                .mount_nestable("/", |allocators| {
-                    litebox::fs::overlay::Overlay::new(
-                        litebox,
-                        in_mem,
-                        litebox::fs::tar_ro::TarRo::new(
-                            // TODO: Replace with tar file provided by the user
-                            litebox::fs::tar_ro::EMPTY_TAR_FILE.into(),
-                            allocators.next(),
-                        ),
-                        allocators.next(),
-                    )
-                })
-                .build()
-                .unwrap(),
-        );
+        let fs = litebox::fs::resolver::Resolver::new_brokered_windows_registry(litebox);
         let fs_context = litebox::fs::resolver::Context::new();
         {
             let fs = &fs;
@@ -837,14 +812,9 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
             )
             .map_err(map_open_error)?;
         let mut data = vec![0; status.size];
-        let read = self
-            .fs
-            .read(&fd, &mut data, Some(0))
-            .map_err(map_read_error)?;
+        let result = read_exact_at(&self.fs, &fd, &mut data);
         let _ = self.fs.close(&fd);
-        if read != data.len() {
-            return Err(NtStatus::UNSUCCESSFUL);
-        }
+        result?;
 
         let value_type = u32::from_le_bytes(
             data[..REGISTRY_VALUE_TYPE_SIZE]
@@ -2263,19 +2233,45 @@ fn write_value_at_path<Platform: crate::ShimPlatform>(
             Mode::RUSR | Mode::WUSR | Mode::ROTH | Mode::WOTH,
         )
         .map_err(map_open_error)?;
-    let written = fs
-        .write(&fd, &value_type.to_le_bytes(), Some(0))
-        .map_err(map_write_error)?;
-    if written != REGISTRY_VALUE_TYPE_SIZE {
-        return Err(NtStatus::DISK_FULL);
-    }
-    let written = fs
-        .write(&fd, value, Some(REGISTRY_VALUE_TYPE_SIZE))
-        .map_err(map_write_error)?;
-    if written != value.len() {
-        return Err(NtStatus::DISK_FULL);
-    }
+    let result = (|| {
+        write_all_at(fs, &fd, &value_type.to_le_bytes(), 0)?;
+        write_all_at(fs, &fd, value, REGISTRY_VALUE_TYPE_SIZE)
+    })();
     let _ = fs.close(&fd);
+    result
+}
+
+fn read_exact_at<Platform: crate::ShimPlatform>(
+    fs: &RegistryFileSystem<Platform>,
+    fd: &TypedFd<RegistryFileSystem<Platform>>,
+    mut data: &mut [u8],
+) -> Result<(), NtStatus> {
+    let mut offset = 0;
+    while !data.is_empty() {
+        let read = fs.read(fd, data, Some(offset)).map_err(map_read_error)?;
+        if read == 0 {
+            return Err(NtStatus::UNSUCCESSFUL);
+        }
+        offset = offset.checked_add(read).ok_or(NtStatus::UNSUCCESSFUL)?;
+        data = &mut data[read..];
+    }
+    Ok(())
+}
+
+fn write_all_at<Platform: crate::ShimPlatform>(
+    fs: &RegistryFileSystem<Platform>,
+    fd: &TypedFd<RegistryFileSystem<Platform>>,
+    mut data: &[u8],
+    mut offset: usize,
+) -> Result<(), NtStatus> {
+    while !data.is_empty() {
+        let written = fs.write(fd, data, Some(offset)).map_err(map_write_error)?;
+        if written == 0 {
+            return Err(NtStatus::DISK_FULL);
+        }
+        offset = offset.checked_add(written).ok_or(NtStatus::DISK_FULL)?;
+        data = &data[written..];
+    }
     Ok(())
 }
 
@@ -2425,13 +2421,12 @@ fn map_read_dir_error(error: ReadDirError) -> NtStatus {
 #[cfg(test)]
 mod tests {
     use crate::tests::{
-        TestPlatform, const_ptr, mut_byte_ptr, mut_ptr, object_attributes, test_platform,
-        unicode_string, utf16_units as utf16,
+        TestPlatform, const_ptr, mut_byte_ptr, mut_ptr, object_attributes, unicode_string,
+        utf16_units as utf16,
     };
 
     use super::*;
     use core::mem::size_of;
-    use litebox::LiteBox;
 
     extern crate std;
 
@@ -2491,12 +2486,6 @@ mod tests {
         ) -> i32;
         fn RegCloseKey(hKey: *mut core::ffi::c_void) -> i32;
         fn RegDeleteTreeW(hKey: *mut core::ffi::c_void, lpSubKey: *const u16) -> i32;
-    }
-
-    fn test_registry() -> (LiteBox<TestPlatform>, RegistryStore<TestPlatform>) {
-        let litebox = LiteBox::new(test_platform());
-        let registry = RegistryStore::new(&litebox);
-        (litebox, registry)
     }
 
     fn open_key(
@@ -2666,7 +2655,8 @@ mod tests {
 
     #[test]
     fn registry_store_separates_values_from_subkeys() {
-        let (_litebox, registry) = test_registry();
+        let task = crate::tests::test_task();
+        let registry = &task.global.registry;
         let key_path = absolute_nt_key_name_to_fs_path(DEFAULT_CODE_PAGE_KEY).unwrap();
         let value_path = value_path(&key_path, "ACP").unwrap();
 

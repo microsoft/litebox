@@ -5,6 +5,7 @@ use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::event::EventObject;
+use crate::fs::OpenFileDescription;
 use crate::pipe::PipeObject;
 use crate::socket::SocketObject;
 use crate::{BrokerCore, BrokerError, Result};
@@ -73,6 +74,7 @@ pub(crate) enum ObjectEntry {
     Event(EventObject),
     Pipe(PipeObject),
     Socket(SocketObject),
+    Filesystem(Arc<dyn OpenFileDescription>),
 }
 
 struct SessionReferences {
@@ -223,7 +225,7 @@ impl BrokerSession {
         {
             let object = object.read();
             match &*object {
-                ObjectEntry::Event(_) | ObjectEntry::Pipe(_) => {}
+                ObjectEntry::Event(_) | ObjectEntry::Pipe(_) | ObjectEntry::Filesystem(_) => {}
                 ObjectEntry::Socket(_) => return Err(BrokerError::UnsupportedOperation),
                 ObjectEntry::Reserved => return Err(BrokerError::Internal),
             }
@@ -418,6 +420,7 @@ impl BrokerSession {
                 ObjectEntry::Event(event) => return Ok(event.readiness()),
                 ObjectEntry::Pipe(pipe) => return Ok(pipe.readiness()),
                 ObjectEntry::Socket(socket) => socket.resource(),
+                ObjectEntry::Filesystem(_) => return Err(BrokerError::InvalidRights),
                 ObjectEntry::Reserved => return Err(BrokerError::Internal),
             }
         };
@@ -719,6 +722,7 @@ mod tests {
             socket_provider.clone(),
             Arc::new(crate::random::TestRandomProvider),
             Arc::new(crate::stdio::UnsupportedStdioProvider),
+            Arc::new(crate::fs::UnsupportedFilesystemProvider),
         )
         .unwrap();
 

@@ -11,7 +11,6 @@
 
 extern crate alloc;
 
-use alloc::borrow::Cow;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -217,8 +216,7 @@ impl<Platform: ShimPlatform> Clone for WindowsSectionView<Platform> {
 
 pub type DefaultFS<Platform> = WindowsFS<Platform>;
 
-pub type WindowsFS<Platform> =
-    litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>;
+pub type WindowsFS<Platform> = litebox::fs::resolver::Resolver<Platform>;
 
 fn write_value<Platform, T>(address: usize, value: T) -> Option<()>
 where
@@ -418,14 +416,10 @@ impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
         &self.litebox
     }
 
-    /// Build the default file system with the given in-memory layer and tar data.
+    /// Creates a filesystem facade backed by the negotiated broker.
     #[must_use]
-    pub fn default_fs(
-        &self,
-        in_mem: litebox::fs::in_mem::InMem<Platform>,
-        tar_data: Cow<'static, [u8]>,
-    ) -> DefaultFS<Platform> {
-        default_fs(&self.litebox, in_mem, tar_data)
+    pub fn brokered_fs(&self) -> DefaultFS<Platform> {
+        litebox::fs::resolver::Resolver::new_brokered(&self.litebox)
     }
 
     #[must_use]
@@ -3182,31 +3176,4 @@ pub struct LoadedProgram<Platform: ShimPlatform> {
     pub entrypoints: WindowsShimEntrypoints<Platform>,
     /// Handle used to wait for the loaded program to exit.
     pub process: Arc<Process<Platform>>,
-}
-
-fn default_fs<Platform>(
-    litebox: &LiteBox<Platform>,
-    in_mem: litebox::fs::in_mem::InMem<Platform>,
-    tar_data: Cow<'static, [u8]>,
-) -> WindowsFS<Platform>
-where
-    Platform: ShimPlatform,
-{
-    litebox::fs::resolver::Resolver::new(
-        litebox,
-        litebox::fs::composer::Composer::builder()
-            .mount_nestable("/", |allocators| {
-                litebox::fs::overlay::Overlay::new(
-                    litebox,
-                    in_mem,
-                    litebox::fs::tar_ro::TarRo::new(tar_data, allocators.next()),
-                    allocators.next(),
-                )
-            })
-            .mount("/dev", |allocator| {
-                litebox::fs::devices::Devices::new(litebox, allocator)
-            })
-            .build()
-            .unwrap(),
-    )
 }

@@ -1466,18 +1466,18 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                 return NtStatus::ACCESS_VIOLATION;
             };
             let chunk_offset = offset.map(|offset| offset + total_written);
-            let write = file.with_entry(|file| match &file.backing {
+            let (write, continue_after_short_write) = file.with_entry(|file| match &file.backing {
                 FileObjectBacking::Filesystem { fd, is_directory } => {
                     if *is_directory {
-                        return Err(WriteError::NotAFile);
+                        return (Err(WriteError::NotAFile), false);
                     }
-                    self.fs.write(fd, &bytes, chunk_offset)
+                    (self.fs.write(fd, &bytes, chunk_offset), true)
                 }
                 FileObjectBacking::CondrvStream { fd, .. } => {
-                    self.fs.write(fd, &bytes, chunk_offset)
+                    (self.fs.write(fd, &bytes, chunk_offset), false)
                 }
                 FileObjectBacking::CondrvControl(_) | FileObjectBacking::KsecDevice => {
-                    Err(WriteError::NotAFile)
+                    (Err(WriteError::NotAFile), false)
                 }
             });
             let written = match write {
@@ -1487,7 +1487,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                 Err(error) => break Err(error),
             };
             total_written += written;
-            if written < chunk_length {
+            if written < chunk_length && !continue_after_short_write {
                 break Ok(total_written);
             }
         };
@@ -1568,7 +1568,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                 }
                 let chunk_length = (output_length - total_read).min(bytes.len());
                 let chunk_offset = offset.map(|offset| offset + total_read);
-                let (read, continue_after_full_chunk) = match &file.backing {
+                let (read, continue_after_short_read) = match &file.backing {
                     FileObjectBacking::Filesystem { fd, is_directory } => {
                         if *is_directory {
                             return Err(ReadError::NotAFile);
@@ -1599,7 +1599,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                     return Err(ReadError::Io);
                 }
                 total_read += read;
-                if read < chunk_length || !continue_after_full_chunk {
+                if !continue_after_short_read {
                     break;
                 }
             }
@@ -2897,13 +2897,13 @@ mod tests {
     }
 
     #[test]
-    fn ksecdd_requires_broker_and_rejects_unknown_controls() {
+    fn ksecdd_uses_broker_and_rejects_unknown_controls() {
         run_with_test_platform_pointers(|| {
             const UNKNOWN_KSEC_IOCTL: u32 = 0x0039_0000;
             let task = crate::tests::test_task();
             let handle = open_ksecdd(&task, FILE_GENERIC_READ | FILE_GENERIC_WRITE);
 
-            let mut random = [0xa5; 32];
+            let mut random = [0xa5u8; 32];
             let mut io_status = IoStatusBlock::default();
             assert_eq!(
                 task.sys_nt_device_io_control_file(
@@ -2918,13 +2918,13 @@ mod tests {
                     Some(mut_byte_ptr(&mut random)),
                     random.len().try_into().unwrap(),
                 ),
-                NtStatus::UNSUCCESSFUL
+                NtStatus::SUCCESS
             );
-            assert_eq!(io_status.status, NtStatus::UNSUCCESSFUL.as_raw());
-            assert_eq!(io_status.information, 0);
-            assert_eq!(random, [0xa5; 32]);
+            assert_eq!(io_status.status, NtStatus::SUCCESS.as_raw());
+            assert_eq!(io_status.information, random.len());
+            assert_eq!(random, [0x5a; 32]);
 
-            let mut scratch = [0xa5; 8];
+            let mut scratch = [0xa5u8; 8];
             assert_eq!(
                 task.sys_nt_device_io_control_file(
                     handle,

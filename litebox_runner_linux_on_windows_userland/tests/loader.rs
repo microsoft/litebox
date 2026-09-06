@@ -236,16 +236,14 @@ fn run_prog_with_windows_broker(
     tar.finish().unwrap();
     drop(tar);
 
-    let mut arguments = Vec::new();
+    let mut arguments = Vec::<std::ffi::OsString>::new();
     if !libs.is_empty() {
         arguments.extend(["--env".into(), "LD_LIBRARY_PATH=/lib64:/lib32:/lib".into()]);
     }
-    arguments.extend([
-        "--initial-files".into(),
-        tar_path.into_os_string(),
-        format!("/{exec_path}").into(),
-    ]);
+    arguments.push(format!("/{exec_path}").into());
     let status = std::process::Command::new(broker)
+        .arg("--fs-initial-files")
+        .arg(&tar_path)
         .arg("--runner")
         .arg(runner)
         .args(arguments)
@@ -344,10 +342,7 @@ fn run_dynamic_linked_prog_with_rewriter(
     tar.finish().unwrap();
     println!("Tar file created at: {}", tar_target_file.to_str().unwrap());
 
-    let binary_path = std::env::var("NEXTEST_BIN_EXE_litebox_runner_linux_on_windows_userland")
-        .unwrap_or_else(|_| {
-            env!("CARGO_BIN_EXE_litebox_runner_linux_on_windows_userland").to_string()
-        });
+    let (broker, runner) = build_windows_broker();
 
     // The program path refers to the tar-internal path.
     let prog_tar_path = format!("/bin/{prog_name_hooked}");
@@ -359,18 +354,21 @@ fn run_dynamic_linked_prog_with_rewriter(
         // Alternatively, we could add a `/etc/ld.so.cache` file to the rootfs.
         "--env",
         "LD_LIBRARY_PATH=/lib64:/lib32:/lib",
-        "--initial-files",
-        tar_target_file.to_str().unwrap(),
     ];
     args.push(&prog_tar_path);
     args.extend_from_slice(cmd_args);
 
-    let mut command = std::process::Command::new(&binary_path);
-    command.args(&args);
+    let mut command = std::process::Command::new(broker);
+    command
+        .arg("--fs-initial-files")
+        .arg(&tar_target_file)
+        .arg("--runner")
+        .arg(runner)
+        .args(&args);
     println!("Running `{command:?}`");
     let status = command
         .status()
-        .expect("Failed to run litebox_runner_linux_on_windows_userland");
+        .expect("Failed to run litebox-broker-userland");
     assert!(
         status.success(),
         "failed to run litebox_runner_linux_on_windows_userland: {status}",

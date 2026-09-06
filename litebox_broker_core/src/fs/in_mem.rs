@@ -8,7 +8,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use hashbrown::HashMap;
 
-use crate::sync;
+use litebox_platform::sync;
 
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
@@ -402,6 +402,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
 
     fn read(
         &self,
+        _device_io: &dyn super::backend::DeviceIo,
         h: &super::backend::FileHandle,
         buf: &mut [u8],
         offset: usize,
@@ -417,6 +418,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
 
     fn write(
         &self,
+        _device_io: &dyn super::backend::DeviceIo,
         h: &super::backend::FileHandle,
         buf: &[u8],
         offset: usize,

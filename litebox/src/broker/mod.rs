@@ -12,6 +12,10 @@ use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{ConsumeEventResponse, EventConsumeMode};
+use litebox_broker_protocol::fs::{
+    FilesystemDirectoryEntry, FilesystemError, FilesystemFileStatus, FilesystemNamespace,
+    FilesystemSeekWhence, FilesystemUser, MAX_FILESYSTEM_TRANSFER_SIZE,
+};
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -179,6 +183,108 @@ pub(crate) trait BrokerControl: Send + Sync {
         handle: ObjectHandle,
         data: &[u8],
     ) -> core::result::Result<usize, BrokerControlError>;
+
+    fn open_file(
+        &self,
+        namespace: FilesystemNamespace,
+        path: &str,
+        user: FilesystemUser,
+        flags: u32,
+        mode: u32,
+    ) -> core::result::Result<core::result::Result<ObjectHandle, FilesystemError>, BrokerControlError>;
+
+    fn read_file(
+        &self,
+        handle: ObjectHandle,
+        data: &mut [u8],
+        offset: Option<u64>,
+    ) -> core::result::Result<core::result::Result<usize, FilesystemError>, BrokerControlError>;
+
+    fn write_file(
+        &self,
+        handle: ObjectHandle,
+        data: &[u8],
+        offset: Option<u64>,
+    ) -> core::result::Result<core::result::Result<usize, FilesystemError>, BrokerControlError>;
+
+    fn seek_file(
+        &self,
+        handle: ObjectHandle,
+        offset: i64,
+        whence: FilesystemSeekWhence,
+    ) -> core::result::Result<core::result::Result<u64, FilesystemError>, BrokerControlError>;
+
+    fn truncate_file(
+        &self,
+        handle: ObjectHandle,
+        length: u64,
+        reset_offset: bool,
+    ) -> core::result::Result<core::result::Result<(), FilesystemError>, BrokerControlError>;
+
+    fn read_directory(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<
+        core::result::Result<Vec<FilesystemDirectoryEntry>, FilesystemError>,
+        BrokerControlError,
+    >;
+
+    fn path_file_status(
+        &self,
+        namespace: FilesystemNamespace,
+        path: &str,
+        user: FilesystemUser,
+    ) -> core::result::Result<
+        core::result::Result<FilesystemFileStatus, FilesystemError>,
+        BrokerControlError,
+    >;
+
+    fn handle_file_status(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<
+        core::result::Result<FilesystemFileStatus, FilesystemError>,
+        BrokerControlError,
+    >;
+
+    fn chmod_file(
+        &self,
+        namespace: FilesystemNamespace,
+        path: &str,
+        user: FilesystemUser,
+        mode: u32,
+    ) -> core::result::Result<core::result::Result<(), FilesystemError>, BrokerControlError>;
+
+    fn chown_file(
+        &self,
+        namespace: FilesystemNamespace,
+        path: &str,
+        acting_user: FilesystemUser,
+        user: Option<u16>,
+        group: Option<u16>,
+    ) -> core::result::Result<core::result::Result<(), FilesystemError>, BrokerControlError>;
+
+    fn unlink_file(
+        &self,
+        namespace: FilesystemNamespace,
+        path: &str,
+        user: FilesystemUser,
+    ) -> core::result::Result<core::result::Result<(), FilesystemError>, BrokerControlError>;
+
+    fn mkdir_file(
+        &self,
+        namespace: FilesystemNamespace,
+        path: &str,
+        user: FilesystemUser,
+        mode: u32,
+    ) -> core::result::Result<core::result::Result<(), FilesystemError>, BrokerControlError>;
+
+    fn rmdir_file(
+        &self,
+        namespace: FilesystemNamespace,
+        path: &str,
+        user: FilesystemUser,
+    ) -> core::result::Result<core::result::Result<(), FilesystemError>, BrokerControlError>;
 
     fn close_object(&self, handle: ObjectHandle) -> core::result::Result<(), BrokerControlError>;
 
@@ -617,6 +723,191 @@ where
         self.request(|local| local.write_pipe(handle, lease.descriptor(), data))
     }
 
+    fn open_file(
+        &self,
+        namespace: FilesystemNamespace,
+        path: &str,
+        user: FilesystemUser,
+        flags: u32,
+        mode: u32,
+    ) -> core::result::Result<core::result::Result<ObjectHandle, FilesystemError>, BrokerControlError>
+    {
+        let path = path.as_bytes();
+        let length = fs_transfer_length(path.len())?;
+        let lease = self.acquire_shared_buffer(length)?;
+        self.request(|local| {
+            local.open_file(namespace, lease.descriptor(), path, user, flags, mode)
+        })
+    }
+
+    fn read_file(
+        &self,
+        handle: ObjectHandle,
+        data: &mut [u8],
+        offset: Option<u64>,
+    ) -> core::result::Result<core::result::Result<usize, FilesystemError>, BrokerControlError>
+    {
+        let length = fs_transfer_length(data.len().min(MAX_FILESYSTEM_TRANSFER_SIZE as usize))?;
+        let data = &mut data[..length as usize];
+        let lease = self.acquire_shared_buffer(length)?;
+        self.request(|local| local.read_file(handle, lease.descriptor(), data, offset))
+    }
+
+    fn write_file(
+        &self,
+        handle: ObjectHandle,
+        data: &[u8],
+        offset: Option<u64>,
+    ) -> core::result::Result<core::result::Result<usize, FilesystemError>, BrokerControlError>
+    {
+        let length = fs_transfer_length(data.len().min(MAX_FILESYSTEM_TRANSFER_SIZE as usize))?;
+        let data = &data[..length as usize];
+        let lease = self.acquire_shared_buffer(length)?;
+        self.request(|local| local.write_file(handle, lease.descriptor(), data, offset))
+    }
+
+    fn seek_file(
+        &self,
+        handle: ObjectHandle,
+        offset: i64,
+        whence: FilesystemSeekWhence,
+    ) -> core::result::Result<core::result::Result<u64, FilesystemError>, BrokerControlError> {
+        self.request(|local| local.seek_file(handle, offset, whence))
+    }
+
+    fn truncate_file(
+        &self,
+        handle: ObjectHandle,
+        length: u64,
+        reset_offset: bool,
+    ) -> core::result::Result<core::result::Result<(), FilesystemError>, BrokerControlError> {
+        self.request(|local| local.truncate_file(handle, length, reset_offset))
+    }
+
+    fn read_directory(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<
+        core::result::Result<Vec<FilesystemDirectoryEntry>, FilesystemError>,
+        BrokerControlError,
+    > {
+        let mut entries = Vec::new();
+        let mut start_index = 0;
+        loop {
+            let lease = self.acquire_shared_buffer(MAX_FILESYSTEM_TRANSFER_SIZE)?;
+            let response = self
+                .request(|local| local.read_directory(handle, lease.descriptor(), start_index))?;
+            let (mut chunk, next_index) = match response {
+                Ok(response) => response,
+                Err(error) => return Ok(Err(error)),
+            };
+            entries
+                .try_reserve(chunk.len())
+                .map_err(|_| BrokerControlError::Broker(ErrorCode::OutOfMemory))?;
+            entries.append(&mut chunk);
+            let Some(next_index) = next_index else {
+                return Ok(Ok(entries));
+            };
+            assert!(
+                next_index > start_index,
+                "broker returned a non-advancing directory continuation"
+            );
+            start_index = next_index;
+        }
+    }
+
+    fn path_file_status(
+        &self,
+        namespace: FilesystemNamespace,
+        path: &str,
+        user: FilesystemUser,
+    ) -> core::result::Result<
+        core::result::Result<FilesystemFileStatus, FilesystemError>,
+        BrokerControlError,
+    > {
+        let path = path.as_bytes();
+        let lease = self.acquire_shared_buffer(fs_transfer_length(path.len())?)?;
+        self.request(|local| local.path_file_status(namespace, lease.descriptor(), path, user))
+    }
+
+    fn handle_file_status(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<
+        core::result::Result<FilesystemFileStatus, FilesystemError>,
+        BrokerControlError,
+    > {
+        self.request(|local| local.handle_file_status(handle))
+    }
+
+    fn chmod_file(
+        &self,
+        namespace: FilesystemNamespace,
+        path: &str,
+        user: FilesystemUser,
+        mode: u32,
+    ) -> core::result::Result<core::result::Result<(), FilesystemError>, BrokerControlError> {
+        let path = path.as_bytes();
+        let lease = self.acquire_shared_buffer(fs_transfer_length(path.len())?)?;
+        self.request(|local| local.chmod_file(namespace, lease.descriptor(), path, user, mode))
+    }
+
+    fn chown_file(
+        &self,
+        namespace: FilesystemNamespace,
+        path: &str,
+        acting_user: FilesystemUser,
+        user: Option<u16>,
+        group: Option<u16>,
+    ) -> core::result::Result<core::result::Result<(), FilesystemError>, BrokerControlError> {
+        let path = path.as_bytes();
+        let lease = self.acquire_shared_buffer(fs_transfer_length(path.len())?)?;
+        self.request(|local| {
+            local.chown_file(
+                namespace,
+                lease.descriptor(),
+                path,
+                acting_user,
+                user,
+                group,
+            )
+        })
+    }
+
+    fn unlink_file(
+        &self,
+        namespace: FilesystemNamespace,
+        path: &str,
+        user: FilesystemUser,
+    ) -> core::result::Result<core::result::Result<(), FilesystemError>, BrokerControlError> {
+        let path = path.as_bytes();
+        let lease = self.acquire_shared_buffer(fs_transfer_length(path.len())?)?;
+        self.request(|local| local.unlink_file(namespace, lease.descriptor(), path, user))
+    }
+
+    fn mkdir_file(
+        &self,
+        namespace: FilesystemNamespace,
+        path: &str,
+        user: FilesystemUser,
+        mode: u32,
+    ) -> core::result::Result<core::result::Result<(), FilesystemError>, BrokerControlError> {
+        let path = path.as_bytes();
+        let lease = self.acquire_shared_buffer(fs_transfer_length(path.len())?)?;
+        self.request(|local| local.mkdir_file(namespace, lease.descriptor(), path, user, mode))
+    }
+
+    fn rmdir_file(
+        &self,
+        namespace: FilesystemNamespace,
+        path: &str,
+        user: FilesystemUser,
+    ) -> core::result::Result<core::result::Result<(), FilesystemError>, BrokerControlError> {
+        let path = path.as_bytes();
+        let lease = self.acquire_shared_buffer(fs_transfer_length(path.len())?)?;
+        self.request(|local| local.rmdir_file(namespace, lease.descriptor(), path, user))
+    }
+
     fn close_object(&self, handle: ObjectHandle) -> core::result::Result<(), BrokerControlError> {
         self.request(|local| local.close_object(handle))
     }
@@ -624,6 +915,13 @@ where
     fn fail_connection(&self) {
         self.fail_association();
     }
+}
+
+fn fs_transfer_length(length: usize) -> core::result::Result<u32, BrokerControlError> {
+    if length > MAX_FILESYSTEM_TRANSFER_SIZE as usize {
+        return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
+    }
+    Ok(u32::try_from(length).expect("validated filesystem transfer length must fit in u32"))
 }
 
 pub(crate) fn readiness_events(readiness: ReadinessFlags) -> Events {

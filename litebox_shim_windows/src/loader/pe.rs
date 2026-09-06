@@ -2544,18 +2544,14 @@ mod tests {
 
     fn created_process_environment_snapshot() -> CreatedProcessEnvironmentSnapshot {
         let platform = crate::tests::test_platform();
-        let litebox = litebox::LiteBox::new(platform);
-        let page_manager = crate::WindowsPageManager::<crate::tests::TestPlatform>::new(&litebox);
-        let fs = Arc::new(litebox::fs::resolver::Resolver::new(
-            &litebox,
-            litebox::fs::composer::Composer::builder()
-                .mount("/", |allocator| {
-                    litebox::fs::in_mem::InMem::<crate::tests::TestPlatform>::new(allocator)
-                })
-                .build()
-                .expect("valid test filesystem"),
-        ));
-        let loader = PeLoader::new(platform, fs, &page_manager);
+        // Reuse a full test task's broker-backed filesystem and page manager
+        // rather than constructing a local-only filesystem. The task is kept
+        // alive for the duration of this function so the loader's borrowed
+        // page manager and cloned filesystem handle remain valid.
+        let task = crate::tests::test_task();
+        let fs = task.fs.clone();
+        let page_manager = &task.global.page_manager;
+        let loader = PeLoader::new(platform, fs, page_manager);
         let image = loaded_module_image(application_module_base());
 
         let image_base_address = image.mapping.base_addr;

@@ -3,30 +3,19 @@
 
 use litebox::fs::{Mode, OFlags};
 use litebox_broker_core::{
-    AssociationCancellation, BrokerCore, BrokerError, BrokerSession, CallerCredential,
-    ObjectRights, PolicyEngine, SessionId,
+    AssociationCancellation, BrokerCore, ObjectRights, PolicyEngine,
+    fs::{
+        FilesystemProviderAdapter, Mode as BackendMode, NamespacedFilesystemProvider,
+        UserInfo as BackendUserInfo, composer::Composer, create_windows_registry_provider,
+        devices::Devices, in_mem::InMem, in_mem::InitialNode, overlay::Overlay,
+        resolver::Filesystem, tar_ro::TarRo,
+    },
     random::{RandomProvider, RandomProviderError},
-    readiness::ReadinessRegistration,
-    socket::{PlatformSocket, SocketProvider},
+    socket::UnsupportedSocketProvider,
     stdio::{StdioProvider, StdioProviderError},
 };
-use litebox_broker_local::BrokerLocal;
-use litebox_broker_protocol::{
-    BROKER_PROTOCOL_VERSION,
-    message::{
-        BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerOperation, BrokerRequest,
-        BrokerResponse, BrokerResult, PipeRequest, PipeResponse, StdioRequest, StdioResponse,
-    },
-    pipe::{CreatePipeResponse, ReadPipeResponse, WritePipeResponse},
-    shared_buffer::{SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE},
-    socket::CreateSocketRequest,
-    stdio::{IsTerminalStdioResponse, StdioOutputStream, StdioStream},
-};
-use litebox_broker_transport::{
-    channel::{LocalCallChannel, LocalSetupChannel},
-    shared_memory::{SharedBufferPool, SharedMemory, SharedMemoryError},
-};
-use litebox_common_linux::{AtFlags, EfdFlags, FcntlArg, FileDescriptorFlags, errno::Errno};
+use litebox_broker_protocol::stdio::{StdioOutputStream, StdioStream};
+use litebox_common_linux::{AtFlags, FcntlArg, FileDescriptorFlags, errno::Errno};
 use zerocopy::FromBytes as _;
 
 use crate::UserPtrMut;
@@ -60,11 +49,45 @@ pub(crate) fn test_platform() -> &'static TestPlatform {
 fn test_broker() -> &'static BrokerCore {
     static BROKER: std::sync::OnceLock<BrokerCore> = std::sync::OnceLock::new();
     BROKER.get_or_init(|| {
+        let random: alloc::sync::Arc<dyn RandomProvider> =
+            alloc::sync::Arc::new(UnusedRandomProvider);
+        let stdio: alloc::sync::Arc<dyn StdioProvider> = alloc::sync::Arc::new(TestStdioProvider);
+        let in_mem = InMem::<TestPlatform>::new_initialized([(
+            "/",
+            InitialNode::Directory {
+                mode: BackendMode::RWXU | BackendMode::RWXG | BackendMode::RWXO,
+                owner: BackendUserInfo::ROOT,
+            },
+        )]);
+        let backend = Composer::builder()
+            .mount_nestable("/", |allocators| {
+                Overlay::<TestPlatform>::new(
+                    in_mem,
+                    TarRo::new(TEST_TAR_FILE.into(), allocators.next()),
+                    allocators.next(),
+                )
+            })
+            .mount("/dev", Devices::new)
+            .build()
+            .unwrap();
+        let guest = alloc::sync::Arc::new(FilesystemProviderAdapter::new(
+            Filesystem::<TestPlatform, _>::new(backend),
+            alloc::sync::Arc::clone(&random),
+            alloc::sync::Arc::clone(&stdio),
+        ));
+        let windows_registry = create_windows_registry_provider::<TestPlatform>(
+            alloc::sync::Arc::clone(&random),
+            alloc::sync::Arc::clone(&stdio),
+        )
+        .unwrap();
+        let fs_provider =
+            alloc::sync::Arc::new(NamespacedFilesystemProvider::new(guest, windows_registry));
         BrokerCore::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all()),
-            alloc::sync::Arc::new(PipeOnlySocketProvider),
-            alloc::sync::Arc::new(UnusedRandomProvider),
-            alloc::sync::Arc::new(TestStdioProvider),
+            alloc::sync::Arc::new(UnsupportedSocketProvider),
+            random,
+            stdio,
+            fs_provider,
         )
         .unwrap()
     })
@@ -97,20 +120,13 @@ impl StdioProvider for TestStdioProvider {
 
 #[must_use]
 pub(crate) fn init_platform() -> crate::Task<TestPlatform> {
-    let platform = test_platform();
-
-    init_platform_with_builder(crate::LinuxShimBuilder::new(platform))
+    init_platform_with_broker()
 }
 
 #[must_use]
 pub(crate) fn init_platform_with_broker() -> crate::Task<TestPlatform> {
     let platform = test_platform();
-    let setup = TestBrokerSetup::new();
-    let (broker_local, ()) = BrokerLocal::negotiate(setup, |setup| {
-        let memory: alloc::sync::Arc<dyn SharedMemory> = setup.memory.clone();
-        Ok((setup.activate(), memory, ()))
-    })
-    .unwrap();
+    let broker_local = litebox_broker_test_support::connect(test_broker().clone());
     let litebox = litebox::LiteBox::new_with_broker_local(platform, broker_local);
     init_platform_with_builder(crate::LinuxShimBuilder::new_with_litebox(platform, litebox))
 }
@@ -118,202 +134,8 @@ pub(crate) fn init_platform_with_broker() -> crate::Task<TestPlatform> {
 fn init_platform_with_builder(
     shim_builder: crate::LinuxShimBuilder<TestPlatform>,
 ) -> crate::Task<TestPlatform> {
-    let in_mem = litebox::fs::in_mem::InMem::new_initialized([(
-        "/",
-        litebox::fs::in_mem::InitialNode::Directory {
-            mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
-            owner: litebox::fs::UserInfo::ROOT,
-        },
-    )]);
-    let fs = alloc::sync::Arc::new(shim_builder.default_fs(in_mem, TEST_TAR_FILE.into()));
+    let fs = alloc::sync::Arc::new(shim_builder.brokered_fs());
     shim_builder.build().0.new_test_task(fs)
-}
-
-struct TestBrokerSetup {
-    memory: alloc::sync::Arc<TestSharedMemory>,
-    session: BrokerSession,
-}
-
-impl TestBrokerSetup {
-    fn new() -> Self {
-        Self {
-            memory: alloc::sync::Arc::new(TestSharedMemory::new()),
-            session: test_broker()
-                .create_session(CallerCredential::Unauthenticated)
-                .unwrap(),
-        }
-    }
-
-    fn activate(self) -> TestBrokerChannel {
-        let shared_buffers = SharedBufferPool::new(self.memory, SHARED_BUFFER_LAYOUT).unwrap();
-        TestBrokerChannel {
-            session: self.session,
-            shared_buffers,
-        }
-    }
-}
-
-impl LocalSetupChannel for TestBrokerSetup {
-    type Error = core::convert::Infallible;
-
-    fn send_handshake_request(
-        &mut self,
-        request: &BrokerHandshakeRequest,
-    ) -> core::result::Result<(), Self::Error> {
-        assert_eq!(request.protocol_version, BROKER_PROTOCOL_VERSION);
-        Ok(())
-    }
-
-    fn recv_handshake_response(
-        &mut self,
-    ) -> core::result::Result<Option<BrokerHandshakeResponse>, Self::Error> {
-        Ok(Some(BrokerHandshakeResponse::Negotiated {
-            broker_protocol_version: BROKER_PROTOCOL_VERSION,
-        }))
-    }
-}
-
-struct TestBrokerChannel {
-    session: BrokerSession,
-    shared_buffers: SharedBufferPool<alloc::sync::Arc<TestSharedMemory>>,
-}
-
-impl TestBrokerChannel {
-    fn execute(&self, operation: BrokerOperation) -> litebox_broker_core::Result<BrokerResult> {
-        match operation {
-            BrokerOperation::CloseObject(handle) => self
-                .session
-                .close_object_reference(handle)
-                .map(|()| BrokerResult::ObjectClosed),
-            BrokerOperation::CheckReadiness(handle) => self
-                .session
-                .check_readiness(handle)
-                .map(BrokerResult::Readiness),
-            BrokerOperation::Pipe(PipeRequest::Create(request)) => {
-                litebox_broker_core::pipe::create(
-                    &self.session,
-                    request.capacity,
-                    request.atomic_write_size,
-                )
-                .map(|(read_handle, write_handle)| {
-                    BrokerResult::Pipe(PipeResponse::Create(CreatePipeResponse {
-                        read_handle,
-                        write_handle,
-                    }))
-                })
-            }
-            BrokerOperation::Pipe(PipeRequest::Read(request)) => {
-                let data = litebox_broker_core::pipe::read(
-                    &self.session,
-                    request.handle,
-                    request.buffer.length,
-                )?;
-                self.shared_buffers
-                    .write(request.buffer.slot_index, &data)
-                    .expect("pipe broker read must use a valid shared buffer");
-                Ok(BrokerResult::Pipe(PipeResponse::Read(ReadPipeResponse {
-                    read: u32::try_from(data.len()).unwrap(),
-                })))
-            }
-            BrokerOperation::Pipe(PipeRequest::Write(request)) => {
-                let mut data = std::vec![0; request.buffer.length as usize];
-                self.shared_buffers
-                    .read(request.buffer.slot_index, &mut data)
-                    .expect("pipe broker write must use a valid shared buffer");
-                litebox_broker_core::pipe::write(&self.session, request.handle, &data).map(
-                    |written| {
-                        BrokerResult::Pipe(PipeResponse::Write(WritePipeResponse {
-                            written: u32::try_from(written).unwrap(),
-                        }))
-                    },
-                )
-            }
-            BrokerOperation::Stdio(StdioRequest::IsTerminal(request)) => {
-                litebox_broker_core::stdio::is_terminal(&self.session, request.stream).map(
-                    |is_terminal| {
-                        BrokerResult::Stdio(StdioResponse::IsTerminal(IsTerminalStdioResponse {
-                            is_terminal,
-                        }))
-                    },
-                )
-            }
-            operation => panic!("unexpected pipe test broker operation: {operation:?}"),
-        }
-    }
-}
-
-impl LocalCallChannel for TestBrokerChannel {
-    type Error = core::convert::Infallible;
-
-    fn call(&self, request: BrokerRequest) -> core::result::Result<BrokerResponse, Self::Error> {
-        let result = self
-            .execute(request.operation)
-            .unwrap_or_else(|error| BrokerResult::Error(error.into()));
-        Ok(BrokerResponse {
-            request_id: request.request_id,
-            result,
-        })
-    }
-}
-
-struct TestSharedMemory(std::sync::Mutex<std::vec::Vec<u8>>);
-
-impl TestSharedMemory {
-    fn new() -> Self {
-        Self(std::sync::Mutex::new(std::vec![
-            0;
-            SHARED_BUFFER_POOL_SIZE
-        ]))
-    }
-}
-
-impl SharedMemory for TestSharedMemory {
-    fn len(&self) -> usize {
-        SHARED_BUFFER_POOL_SIZE
-    }
-
-    fn read(
-        &self,
-        offset: usize,
-        destination: &mut [u8],
-    ) -> core::result::Result<(), SharedMemoryError> {
-        let memory = self.0.lock().unwrap();
-        let end = offset
-            .checked_add(destination.len())
-            .ok_or(SharedMemoryError::InvalidRange)?;
-        let source = memory
-            .get(offset..end)
-            .ok_or(SharedMemoryError::InvalidRange)?;
-        destination.copy_from_slice(source);
-        Ok(())
-    }
-
-    fn write(&self, offset: usize, source: &[u8]) -> core::result::Result<(), SharedMemoryError> {
-        let mut memory = self.0.lock().unwrap();
-        let end = offset
-            .checked_add(source.len())
-            .ok_or(SharedMemoryError::InvalidRange)?;
-        let destination = memory
-            .get_mut(offset..end)
-            .ok_or(SharedMemoryError::InvalidRange)?;
-        destination.copy_from_slice(source);
-        Ok(())
-    }
-}
-
-struct PipeOnlySocketProvider;
-
-impl SocketProvider for PipeOnlySocketProvider {
-    fn create(
-        &self,
-        _session_id: SessionId,
-        _request: CreateSocketRequest,
-        _readiness: ReadinessRegistration,
-    ) -> litebox_broker_core::Result<alloc::sync::Arc<dyn PlatformSocket>> {
-        Err(BrokerError::UnsupportedOperation)
-    }
-
-    fn close_session(&self, _session_id: SessionId) {}
 }
 
 struct UnusedRandomProvider;
@@ -443,16 +265,6 @@ fn test_fcntl() {
     let write_fd = i32::try_from(write_fd).unwrap();
     check(write_fd, OFlags::WRONLY | OFlags::NONBLOCK, OFlags::WRONLY);
 
-    // Eventfd requires broker control in this shim configuration.
-    let brokerless_task = init_platform();
-    assert_eq!(
-        brokerless_task.sys_eventfd2(
-            0,
-            EfdFlags::CLOEXEC | EfdFlags::SEMAPHORE | EfdFlags::NONBLOCK,
-        ),
-        Err(Errno::EIO)
-    );
-
     // Test fcntl with DUPFD
     let fd = task
         .sys_open("/dev/stdin", OFlags::RDONLY, Mode::empty())
@@ -476,9 +288,13 @@ fn test_fcntl() {
 
 #[test]
 fn test_pipe2_requires_broker() {
-    let task = init_platform();
+    let litebox = litebox::LiteBox::new(test_platform());
+    let pipes = litebox::pipes::Pipes::new(&litebox);
 
-    assert_eq!(task.sys_pipe2(OFlags::empty()), Err(Errno::EIO));
+    assert!(matches!(
+        pipes.create_pipe(2, litebox::pipes::Flags::empty(), None),
+        Err(litebox::pipes::errors::CreateError::Io)
+    ));
 }
 
 #[test]

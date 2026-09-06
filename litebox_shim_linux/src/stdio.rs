@@ -129,12 +129,11 @@ mod tests {
 
     #[test]
     fn test_stdio_terminal_query_requires_broker() {
-        let task = init_platform();
-        let mut termios = termios();
-
-        assert_eq!(
-            task.sys_ioctl(1, IoctlArg::TCGETS(UserPtrMut::from_ptr(&raw mut termios)),),
-            Err(Errno::EIO)
+        let litebox = litebox::LiteBox::new(crate::syscalls::tests::test_platform());
+        assert!(
+            litebox
+                .is_stdio_terminal(litebox::stdio::StdioStream::Stdout)
+                .is_err()
         );
     }
 

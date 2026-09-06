@@ -8,15 +8,12 @@
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 
-use crate::LiteBox;
-use crate::stdio::StdioOutputStream;
-use crate::sync::RawSyncPrimitivesProvider;
+use litebox_broker_protocol::stdio::StdioOutputStream;
 
 use super::backend::{
-    Backend, BackendHandles, CreationMetadata, DirHandle, FileHandle, HandleRef, PermissionCheck,
-    Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkingDirHandle,
+    Backend, BackendHandles, CreationMetadata, DeviceIo, DirHandle, FileHandle, HandleRef,
+    PermissionCheck, Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkingDirHandle,
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
@@ -113,26 +110,18 @@ impl Device {
 }
 
 /// A [`super::backend::Backend`] that supports Unix-y devices.
-pub struct Devices<Platform>
-where
-    Platform: RawSyncPrimitivesProvider + 'static,
-{
-    litebox: LiteBox<Platform>,
+pub struct Devices {
     /// Stable inode info for this backend's root directory.
     root_inode: NodeInfo,
     _alloc: InodeAllocator,
 }
 
-impl<Platform> Devices<Platform>
-where
-    Platform: RawSyncPrimitivesProvider + 'static,
-{
+impl Devices {
     /// Construct a new `Devices` backend.
     #[must_use]
-    pub fn new(litebox: &LiteBox<Platform>, allocator: InodeAllocator) -> Self {
+    pub fn new(allocator: InodeAllocator) -> Self {
         let root_inode = allocator.next();
         Self {
-            litebox: litebox.clone(),
             root_inode,
             _alloc: allocator,
         }
@@ -151,24 +140,15 @@ pub struct DeviceFileHandle {
 #[derive(Debug, Clone, Copy)]
 pub struct DeviceDirHandle;
 
-impl<Platform> super::backend::private::Sealed for Devices<Platform> where
-    Platform: RawSyncPrimitivesProvider + 'static
-{
-}
+impl super::backend::private::Sealed for Devices {}
 
-impl<Platform> BackendHandles for Devices<Platform>
-where
-    Platform: RawSyncPrimitivesProvider + 'static,
-{
+impl BackendHandles for Devices {
     type WalkingDirHandle<'a> = DeviceDirHandle;
     type FileHandle = DeviceFileHandle;
     type DirHandle = DeviceDirHandle;
 }
 
-impl<Platform> Backend for Devices<Platform>
-where
-    Platform: RawSyncPrimitivesProvider + 'static,
-{
+impl Backend for Devices {
     fn root(&self) -> WalkingDirHandle<'_> {
         WalkingDirHandle::from_typed::<Self>(DeviceDirHandle)
     }
@@ -263,25 +243,32 @@ where
             .collect())
     }
 
-    fn read(&self, h: &FileHandle, buf: &mut [u8], _offset: usize) -> Result<usize, ReadError> {
+    fn read(
+        &self,
+        device_io: &dyn DeviceIo,
+        h: &FileHandle,
+        buf: &mut [u8],
+        _offset: usize,
+    ) -> Result<usize, ReadError> {
         let h = h.get_typed::<Self>();
         match h.device {
-            Device::Stdin => self.litebox.read_stdio(buf).map_err(|_| ReadError::Io),
+            Device::Stdin => device_io.read_stdin(buf),
             Device::Stdout | Device::Stderr => Err(ReadError::NotForReading),
             Device::Null => {
                 // /dev/null read returns EOF
                 Ok(0)
             }
-            Device::URandom => {
-                for chunk in buf.chunks_mut(MAX_RANDOM_TRANSFER_SIZE as usize) {
-                    self.litebox.fill_random(chunk).map_err(|_| ReadError::Io)?;
-                }
-                Ok(buf.len())
-            }
+            Device::URandom => device_io.fill_random(buf).map(|()| buf.len()),
         }
     }
 
-    fn write(&self, h: &FileHandle, buf: &[u8], _offset: usize) -> Result<usize, WriteError> {
+    fn write(
+        &self,
+        device_io: &dyn DeviceIo,
+        h: &FileHandle,
+        buf: &[u8],
+        _offset: usize,
+    ) -> Result<usize, WriteError> {
         let h = h.get_typed::<Self>();
         let stream = match h.device {
             Device::Stdin => return Err(WriteError::NotForWriting),
@@ -299,9 +286,7 @@ where
                 return Ok(buf.len());
             }
         };
-        self.litebox
-            .write_stdio(stream, buf)
-            .map_err(|_| WriteError::Io)
+        device_io.write_stdio(stream, buf)
     }
 
     fn truncate(&self, _h: &FileHandle, _len: usize) -> Result<(), TruncateError> {
@@ -376,20 +361,42 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::mock::MockPlatform;
+
+    struct NoDeviceIo;
+
+    impl DeviceIo for NoDeviceIo {
+        fn read_stdin(&self, _output: &mut [u8]) -> Result<usize, ReadError> {
+            Err(ReadError::Io)
+        }
+
+        fn write_stdio(
+            &self,
+            _stream: StdioOutputStream,
+            _input: &[u8],
+        ) -> Result<usize, WriteError> {
+            Err(WriteError::Io)
+        }
+
+        fn fill_random(&self, output: &mut [u8]) -> Result<(), ReadError> {
+            if output.is_empty() {
+                Ok(())
+            } else {
+                Err(ReadError::Io)
+            }
+        }
+    }
 
     #[test]
-    fn urandom_requires_broker_only_for_nonempty_reads() {
-        let litebox = LiteBox::new(MockPlatform::new());
-        let devices = Devices::new(&litebox, InodeAllocator::standalone());
+    fn urandom_requires_device_io_only_for_nonempty_reads() {
+        let devices = Devices::new(InodeAllocator::standalone());
         let urandom = devices
             .open_file_at(devices.root(), "urandom", OFlags::RDONLY)
             .unwrap()
             .item;
 
-        assert_eq!(devices.read(&urandom, &mut [], 0).unwrap(), 0);
+        assert_eq!(devices.read(&NoDeviceIo, &urandom, &mut [], 0).unwrap(), 0);
         assert!(matches!(
-            devices.read(&urandom, &mut [0], 0),
+            devices.read(&NoDeviceIo, &urandom, &mut [0], 0),
             Err(ReadError::Io)
         ));
     }

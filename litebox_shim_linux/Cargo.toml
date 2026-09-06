@@ -8,6 +8,7 @@ arrayvec = { version = "0.7.6", default-features = false }
 bitvec = { version = "1.0.1", default-features = false, features = ["alloc"] }
 bitflags = "2.13.1"
 litebox = { path = "../litebox/", version = "0.1.0" }
+litebox_broker_core = { path = "../litebox_broker_core", version = "0.1.0" }
 litebox_common_linux = { path = "../litebox_common_linux/", version = "0.1.0" }
 litebox_platform = { path = "../litebox_platform", version = "0.1.0" }
 litebox_util_log = { version = "0.1.0", path = "../litebox_util_log" }
@@ -24,10 +25,9 @@ alarm_fallback = []
 aarch64_virtualize_x18 = []
 
 [dev-dependencies]
-litebox_broker_core = { path = "../litebox_broker_core", version = "0.1.0" }
-litebox_broker_local = { path = "../litebox_broker_local", version = "0.1.0" }
+litebox = { path = "../litebox/", version = "0.1.0" }
 litebox_broker_protocol = { path = "../litebox_broker_protocol", version = "0.1.0" }
-litebox_broker_transport = { path = "../litebox_broker_transport", version = "0.1.0" }
+litebox_broker_test_support = { path = "../litebox_broker_test_support", version = "0.1.0" }
 spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }
 libc = "0.2.177"
 tempfile = "3"

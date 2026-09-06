@@ -35,6 +35,8 @@ mod linux;
 mod random;
 mod stdio;
 #[cfg(all(windows, target_arch = "x86_64"))]
+mod sync;
+#[cfg(all(windows, target_arch = "x86_64"))]
 mod windows;
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -108,6 +110,21 @@ struct CliArgs {
     /// Local runner executable to launch.
     #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::ExecutablePath)]
     runner: PathBuf,
+    /// Host program to populate into the broker-owned filesystem.
+    #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::ExecutablePath)]
+    fs_program: Option<PathBuf>,
+    /// Tar archive to mount as the broker-owned initial filesystem.
+    #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
+    fs_initial_files: Option<PathBuf>,
+    /// Rewrite the host program before adding it to the broker-owned filesystem.
+    #[arg(long, requires = "fs_program")]
+    fs_rewrite_syscalls: bool,
+    /// Declare that AArch64 filesystem binaries use x18 virtualization.
+    ///
+    /// When rewriting a host program, this also enables x18 virtualization in
+    /// the syscall rewriter.
+    #[arg(long)]
+    fs_virtualize_x18: bool,
     /// Arguments to pass to the local runner.
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true, value_hint = clap::ValueHint::CommandWithArguments)]
     runner_arguments: Vec<OsString>,
@@ -124,6 +141,9 @@ fn run_runner_process(
         .arg("--unstable")
         .arg("--broker-control-channel")
         .arg(control_channel);
+    if args.fs_virtualize_x18 {
+        command.arg("--broker-fs-virtualize-x18");
+    }
     if let Some(proxy_url) = proxy_url {
         command.arg("--broker-proxy-url").arg(proxy_url);
     }
@@ -645,6 +665,28 @@ mod cli_tests {
     }
 
     #[test]
+    fn cli_forwards_runner_options_after_delimiter() {
+        let args = CliArgs::try_parse_from([
+            "litebox-broker-userland",
+            "--fs-initial-files",
+            "rootfs.tar",
+            "--runner",
+            "runner",
+            "--",
+            "--env",
+            "HOME=/",
+            "--program-from-tar",
+            "/guest",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.runner_arguments,
+            ["--env", "HOME=/", "--program-from-tar", "/guest"]
+        );
+    }
+
+    #[test]
     fn destination_argument_parses_canonical_cidr_and_ports() {
         let allowed = "203.0.113.0/24:443-444"
             .parse::<AllowedDestination>()
@@ -847,6 +889,7 @@ mod tests {
                 Arc::new(UnsupportedSocketProvider),
                 Arc::new(random::UserlandRandomProvider),
                 stdio_provider,
+                Arc::new(litebox_broker_core::fs::UnsupportedFilesystemProvider),
             )
             .unwrap();
             let shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();

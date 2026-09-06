@@ -6,6 +6,13 @@ use crate::event::{
     AddEventRequest, AddEventResponse, ConsumeEventRequest, ConsumeEventResponse,
     CreateEventRequest, CreateEventResponse,
 };
+use crate::fs::{
+    ChmodFileRequest, ChownFileRequest, FilesystemError, FilesystemFileStatus,
+    HandleFileStatusRequest, MkdirFileRequest, OpenFileRequest, OpenFileResponse,
+    PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
+    ReadFileResponse, RmdirFileRequest, SeekFileRequest, SeekFileResponse, TruncateFileRequest,
+    UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
+};
 use crate::pipe::{
     CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
     WritePipeResponse,
@@ -51,6 +58,8 @@ pub enum BrokerOperation {
     FillRandom(SharedBufferDescriptor),
     /// Standard-I/O request family.
     Stdio(StdioRequest),
+    /// Filesystem request family.
+    Filesystem(FilesystemRequest),
 }
 
 /// Request sent over an active broker control channel.
@@ -156,6 +165,8 @@ pub enum BrokerResult {
     RandomFilled,
     /// Standard-I/O response family.
     Stdio(StdioResponse),
+    /// Filesystem response family.
+    Filesystem(FilesystemResponse),
     /// Operation failed with an ABI-neutral broker error.
     Error(ErrorCode),
 }
@@ -251,6 +262,68 @@ pub enum StdioResponse {
     Write(WriteStdioResponse),
     /// Standard-stream terminal capability response.
     IsTerminal(IsTerminalStdioResponse),
+}
+
+/// Broker-owned filesystem request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FilesystemRequest {
+    /// Open or create an object.
+    Open(OpenFileRequest),
+    /// Read from an open file.
+    Read(ReadFileRequest),
+    /// Write to an open file.
+    Write(WriteFileRequest),
+    /// Reposition an open file.
+    Seek(SeekFileRequest),
+    /// Truncate an open file.
+    Truncate(TruncateFileRequest),
+    /// Read directory entries.
+    ReadDirectory(ReadDirectoryRequest),
+    /// Read status by path.
+    PathStatus(PathFileStatusRequest),
+    /// Read status by open handle.
+    HandleStatus(HandleFileStatusRequest),
+    /// Change mode bits by path.
+    Chmod(ChmodFileRequest),
+    /// Change ownership by path.
+    Chown(ChownFileRequest),
+    /// Remove a file by path.
+    Unlink(UnlinkFileRequest),
+    /// Create a directory by path.
+    Mkdir(MkdirFileRequest),
+    /// Remove a directory by path.
+    Rmdir(RmdirFileRequest),
+}
+
+/// Broker-owned filesystem response.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FilesystemResponse {
+    /// Open response.
+    Open(OpenFileResponse),
+    /// Read response.
+    Read(ReadFileResponse),
+    /// Write response.
+    Write(WriteFileResponse),
+    /// Seek response.
+    Seek(SeekFileResponse),
+    /// Truncate completed.
+    Truncate,
+    /// Directory-read response.
+    ReadDirectory(ReadDirectoryResponse),
+    /// Status response.
+    Status(FilesystemFileStatus),
+    /// Mode change completed.
+    Chmod,
+    /// Ownership change completed.
+    Chown,
+    /// File removal completed.
+    Unlink,
+    /// Directory creation completed.
+    Mkdir,
+    /// Directory removal completed.
+    Rmdir,
+    /// Filesystem operation failed with a guest-visible error.
+    Failed(FilesystemError),
 }
 
 /// Broker-initiated asynchronous notification.

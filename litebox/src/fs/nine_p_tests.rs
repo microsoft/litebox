@@ -12,14 +12,12 @@ use crate::fs::errors::{
     FileStatusError, MkdirError, OpenError, ReadDirError, ReadError, RmdirError, SeekError,
     TruncateError, UnlinkError, WriteError,
 };
-use crate::fs::inode_allocator::InodeAllocator;
-use crate::fs::resolver::Resolver;
 use crate::fs::{Mode, OFlags};
 use crate::platform::mock::MockPlatform;
+use litebox_broker_core::fs::inode_allocator::InodeAllocator;
 
-use super::{NineP, transport};
-
-type NinePFs<T> = Resolver<MockPlatform, NineP<MockPlatform, T>>;
+use super::broker_fixture::BrokeredFs;
+use litebox_broker_core::fs::nine_p::{NineP, transport};
 
 /// Attach to `server` over `transport`, building the backend the tests resolve paths through.
 fn attach<T: transport::Read + transport::Write>(
@@ -194,12 +192,9 @@ impl Drop for DiodServer {
 // Helper: create a connected 9P filesystem
 // ---------------------------------------------------------------------------
 
-fn connect_9p(
-    litebox: &crate::LiteBox<MockPlatform>,
-    server: &DiodServer,
-) -> NinePFs<TcpTransport> {
+fn connect_9p(server: &DiodServer) -> BrokeredFs {
     let transport = TcpTransport::connect(&server.addr());
-    Resolver::new(litebox, attach(transport, server))
+    BrokeredFs::new(attach(transport, server))
 }
 
 // ---------------------------------------------------------------------------
@@ -209,9 +204,8 @@ fn connect_9p(
 #[test]
 fn test_nine_p_create_and_read_file() {
     let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
-    let fs = connect_9p(&litebox, &server);
+    let fs = connect_9p(&server);
 
     // Create a file and write to it
     let fd = fs
@@ -250,9 +244,8 @@ fn test_nine_p_create_and_read_file() {
 #[test]
 fn test_nine_p_mkdir_and_readdir() {
     let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
-    let fs = connect_9p(&litebox, &server);
+    let fs = connect_9p(&server);
 
     // Create directories
     fs.mkdir(&ctx, "/subdir", Mode::RWXU)
@@ -311,9 +304,8 @@ fn test_nine_p_mkdir_and_readdir() {
 #[test]
 fn test_nine_p_unlink_and_rmdir() {
     let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
-    let fs = connect_9p(&litebox, &server);
+    let fs = connect_9p(&server);
 
     // Create a file, then delete it
     let fd = fs
@@ -352,9 +344,8 @@ fn test_nine_p_unlink_and_rmdir() {
 #[test]
 fn test_nine_p_file_status() {
     let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
-    let fs = connect_9p(&litebox, &server);
+    let fs = connect_9p(&server);
 
     // Create a file with known content
     let fd = fs
@@ -395,9 +386,8 @@ fn test_nine_p_file_status() {
 #[test]
 fn test_nine_p_seek_and_partial_read() {
     let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
-    let fs = connect_9p(&litebox, &server);
+    let fs = connect_9p(&server);
 
     // Write a file with known content
     let fd = fs
@@ -433,9 +423,8 @@ fn test_nine_p_seek_and_partial_read() {
 #[test]
 fn test_nine_p_truncate() {
     let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
-    let fs = connect_9p(&litebox, &server);
+    let fs = connect_9p(&server);
 
     // Write a file
     let fd = fs
@@ -461,7 +450,6 @@ fn test_nine_p_truncate() {
 #[test]
 fn test_nine_p_host_files_visible() {
     let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
 
     // Pre-populate some files on the host side
@@ -473,7 +461,7 @@ fn test_nine_p_host_files_visible() {
     )
     .unwrap();
 
-    let fs = connect_9p(&litebox, &server);
+    let fs = connect_9p(&server);
 
     // Read file created on the host through 9P
     let fd = fs
@@ -560,16 +548,9 @@ impl transport::Write for BrokenTransport {
 /// `allowed_writes` must be >= 2 for the filesystem to be constructed
 /// successfully. Any FS operation after construction will consume one
 /// additional write.
-fn connect_9p_broken(
-    litebox: &crate::LiteBox<MockPlatform>,
-    server: &DiodServer,
-    allowed_writes: usize,
-) -> NinePFs<BrokenTransport> {
+fn connect_9p_broken(server: &DiodServer, allowed_writes: usize) -> BrokeredFs {
     let tcp = TcpTransport::connect(&server.addr());
-    Resolver::new(
-        litebox,
-        attach(BrokenTransport::new(tcp, allowed_writes), server),
-    )
+    BrokeredFs::new(attach(BrokenTransport::new(tcp, allowed_writes), server))
 }
 
 // ---------------------------------------------------------------------------
@@ -581,10 +562,9 @@ fn connect_9p_broken(
 #[test]
 fn test_nine_p_broken_open() {
     let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
     // 2 writes: version + attach. The next write (open's walk) will fail.
-    let fs = connect_9p_broken(&litebox, &server, 2);
+    let fs = connect_9p_broken(&server, 2);
 
     let result = fs.open(&ctx, "/anything.txt", OFlags::RDONLY, Mode::empty());
     assert!(matches!(result, Err(OpenError::Io)));
@@ -594,9 +574,8 @@ fn test_nine_p_broken_open() {
 #[test]
 fn test_nine_p_broken_create() {
     let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
-    let fs = connect_9p_broken(&litebox, &server, 2);
+    let fs = connect_9p_broken(&server, 2);
 
     let result = fs.open(&ctx, "/new.txt", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU);
     assert!(matches!(result, Err(OpenError::Io)));
@@ -606,26 +585,14 @@ fn test_nine_p_broken_create() {
 #[test]
 fn test_nine_p_broken_read() {
     let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
 
-    // Pre-create a file via normal connection
-    {
-        let fs = connect_9p(&litebox, &server);
-        let fd = fs
-            .open(
-                &ctx,
-                "/read_me.txt",
-                OFlags::CREAT | OFlags::WRONLY,
-                Mode::RWXU,
-            )
-            .unwrap();
-        fs.write(&fd, b"data", None).unwrap();
-        fs.close(&fd).unwrap();
-    }
+    // Pre-create a file directly on the host, so this test only constructs the one (broken)
+    // `BrokerCore` rather than a working one followed by a broken one.
+    std::fs::write(server.export_path().join("read_me.txt"), b"data").unwrap();
 
     // 4 writes: version + attach + walk + lopen. Then read will fail.
-    let fs = connect_9p_broken(&litebox, &server, 4);
+    let fs = connect_9p_broken(&server, 4);
     let fd = fs
         .open(&ctx, "/read_me.txt", OFlags::RDONLY, Mode::empty())
         .expect("open should succeed before break");
@@ -639,12 +606,11 @@ fn test_nine_p_broken_read() {
 #[test]
 fn test_nine_p_broken_write() {
     let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
 
     // 5 writes: version + attach + walk (which reports the file as missing) + the clone of the
     // parent directory's fid + create. Then write will fail.
-    let fs = connect_9p_broken(&litebox, &server, 5);
+    let fs = connect_9p_broken(&server, 5);
     let fd = fs
         .open(
             &ctx,
@@ -662,9 +628,8 @@ fn test_nine_p_broken_write() {
 #[test]
 fn test_nine_p_broken_mkdir() {
     let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
-    let fs = connect_9p_broken(&litebox, &server, 2);
+    let fs = connect_9p_broken(&server, 2);
 
     let result = fs.mkdir(&ctx, "/broken_dir", Mode::RWXU);
     assert!(matches!(result, Err(MkdirError::Io)));
@@ -674,11 +639,10 @@ fn test_nine_p_broken_mkdir() {
 #[test]
 fn test_nine_p_broken_readdir() {
     let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
 
     // 4 writes: version + attach + walk + lopen for the directory.
-    let fs = connect_9p_broken(&litebox, &server, 4);
+    let fs = connect_9p_broken(&server, 4);
     let fd = fs
         .open(&ctx, "/", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
         .expect("open dir should succeed before break");
@@ -691,24 +655,13 @@ fn test_nine_p_broken_readdir() {
 #[test]
 fn test_nine_p_broken_unlink() {
     let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
 
-    // Pre-create a file
-    {
-        let fs = connect_9p(&litebox, &server);
-        let fd = fs
-            .open(
-                &ctx,
-                "/to_unlink.txt",
-                OFlags::CREAT | OFlags::WRONLY,
-                Mode::RWXU,
-            )
-            .unwrap();
-        fs.close(&fd).unwrap();
-    }
+    // Pre-create a file directly on the host, so this test only constructs the one (broken)
+    // `BrokerCore` rather than a working one followed by a broken one.
+    std::fs::write(server.export_path().join("to_unlink.txt"), b"").unwrap();
 
-    let fs = connect_9p_broken(&litebox, &server, 2);
+    let fs = connect_9p_broken(&server, 2);
     let result = fs.unlink(&ctx, "/to_unlink.txt");
     assert!(matches!(result, Err(UnlinkError::Io)));
 }
@@ -717,16 +670,13 @@ fn test_nine_p_broken_unlink() {
 #[test]
 fn test_nine_p_broken_rmdir() {
     let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
 
-    // Pre-create a directory
-    {
-        let fs = connect_9p(&litebox, &server);
-        fs.mkdir(&ctx, "/to_rmdir", Mode::RWXU).unwrap();
-    }
+    // Pre-create a directory directly on the host, so this test only constructs the one
+    // (broken) `BrokerCore` rather than a working one followed by a broken one.
+    std::fs::create_dir(server.export_path().join("to_rmdir")).unwrap();
 
-    let fs = connect_9p_broken(&litebox, &server, 2);
+    let fs = connect_9p_broken(&server, 2);
     let result = fs.rmdir(&ctx, "/to_rmdir");
     assert!(matches!(result, Err(RmdirError::Io)));
 }
@@ -735,9 +685,8 @@ fn test_nine_p_broken_rmdir() {
 #[test]
 fn test_nine_p_broken_file_status() {
     let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
-    let fs = connect_9p_broken(&litebox, &server, 2);
+    let fs = connect_9p_broken(&server, 2);
 
     let result = fs.file_status(&ctx, "/");
     assert!(matches!(result, Err(FileStatusError::Io)));
@@ -747,26 +696,14 @@ fn test_nine_p_broken_file_status() {
 #[test]
 fn test_nine_p_broken_truncate() {
     let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
 
-    // Pre-create a file
-    {
-        let fs = connect_9p(&litebox, &server);
-        let fd = fs
-            .open(
-                &ctx,
-                "/to_trunc.txt",
-                OFlags::CREAT | OFlags::WRONLY,
-                Mode::RWXU,
-            )
-            .unwrap();
-        fs.write(&fd, b"some data", None).unwrap();
-        fs.close(&fd).unwrap();
-    }
+    // Pre-create a file directly on the host, so this test only constructs the one (broken)
+    // `BrokerCore` rather than a working one followed by a broken one.
+    std::fs::write(server.export_path().join("to_trunc.txt"), b"some data").unwrap();
 
     // 4 writes: version + attach + walk + lopen. Then truncate will fail.
-    let fs = connect_9p_broken(&litebox, &server, 4);
+    let fs = connect_9p_broken(&server, 4);
     let fd = fs
         .open(&ctx, "/to_trunc.txt", OFlags::RDWR, Mode::empty())
         .expect("open should succeed before break");
@@ -779,26 +716,14 @@ fn test_nine_p_broken_truncate() {
 #[test]
 fn test_nine_p_broken_seek() {
     let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
 
-    // Pre-create a file
-    {
-        let fs = connect_9p(&litebox, &server);
-        let fd = fs
-            .open(
-                &ctx,
-                "/to_seek.txt",
-                OFlags::CREAT | OFlags::WRONLY,
-                Mode::RWXU,
-            )
-            .unwrap();
-        fs.write(&fd, b"data", None).unwrap();
-        fs.close(&fd).unwrap();
-    }
+    // Pre-create a file directly on the host, so this test only constructs the one (broken)
+    // `BrokerCore` rather than a working one followed by a broken one.
+    std::fs::write(server.export_path().join("to_seek.txt"), b"data").unwrap();
 
     // 4 writes: version + attach + walk + lopen. Then the getattr for seek will fail.
-    let fs = connect_9p_broken(&litebox, &server, 4);
+    let fs = connect_9p_broken(&server, 4);
     let fd = fs
         .open(&ctx, "/to_seek.txt", OFlags::RDONLY, Mode::empty())
         .expect("open should succeed before break");
@@ -813,9 +738,8 @@ fn test_nine_p_deep_path_walk() {
 
     let ctx = crate::fs::resolver::Context::new();
 
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
-    let fs = connect_9p(&litebox, &server);
+    let fs = connect_9p(&server);
 
     // Create a path deeper than MAXWELEM (13) to exercise walk_chunked
     let mut path = std::string::String::new();
@@ -859,9 +783,8 @@ fn test_nine_p_deep_path_walk() {
 #[test]
 fn test_nine_p_chmod() {
     let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
-    let fs = connect_9p(&litebox, &server);
+    let fs = connect_9p(&server);
 
     // Create a file
     let fd = fs
@@ -902,9 +825,8 @@ fn test_nine_p_chmod() {
 #[test]
 fn test_nine_p_chown() {
     let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
-    let fs = connect_9p(&litebox, &server);
+    let fs = connect_9p(&server);
 
     // Create a file
     let fd = fs
@@ -942,9 +864,8 @@ fn test_nine_p_chown() {
 #[test]
 fn test_nine_p_fd_file_status() {
     let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
-    let fs = connect_9p(&litebox, &server);
+    let fs = connect_9p(&server);
 
     // Create a file with known content
     let fd = fs
@@ -983,9 +904,8 @@ fn test_nine_p_fd_file_status() {
 #[test]
 fn test_nine_p_large_read_write() {
     let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
-    let fs = connect_9p(&litebox, &server);
+    let fs = connect_9p(&server);
 
     // The msize is 65536 and IOHDRSZ is 24, so the max per-message payload
     // is 65512 bytes. Write data larger than that to verify the client
@@ -1040,9 +960,8 @@ fn test_nine_p_large_read_write() {
 #[test]
 fn test_nine_p_explicit_offset_read_write() {
     let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
-    let fs = connect_9p(&litebox, &server);
+    let fs = connect_9p(&server);
 
     let fd = fs
         .open(

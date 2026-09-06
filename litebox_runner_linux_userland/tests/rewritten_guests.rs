@@ -3,7 +3,7 @@
 
 //! Tests for guests whose syscall sites the rewriter redirected.
 //!
-//! Guests run under `--rewrite-syscalls` with no tar rootfs.
+//! Guests run from a host program rewritten by the broker.
 
 #[allow(dead_code, reason = "shared with the other test binaries")]
 mod cache;
@@ -11,7 +11,15 @@ mod cache;
 mod common;
 
 fn run_rewritten_fixture(source: &str, unique_name: &str) -> std::process::Output {
-    let target = common::compile(source, unique_name, true, false);
+    run_rewritten_fixture_with_options(source, unique_name, false)
+}
+
+fn run_rewritten_fixture_with_options(
+    source: &str,
+    unique_name: &str,
+    nolibc: bool,
+) -> std::process::Output {
+    let target = common::compile(source, unique_name, true, nolibc);
     let binary_path = std::env::var("NEXTEST_BIN_EXE_litebox_runner_linux_userland")
         .unwrap_or_else(|_| env!("CARGO_BIN_EXE_litebox_runner_linux_userland").to_string());
 
@@ -25,6 +33,13 @@ fn run_rewritten_fixture(source: &str, unique_name: &str) -> std::process::Outpu
             broker_path.display()
         );
         let mut command = std::process::Command::new(broker_path);
+        command
+            .arg("--fs-program")
+            .arg(&target)
+            .arg("--fs-rewrite-syscalls");
+        if cfg!(feature = "aarch64_virtualize_x18") {
+            command.arg("--fs-virtualize-x18");
+        }
         command.arg("--runner").arg(&binary_path);
         command
     };
@@ -36,7 +51,6 @@ fn run_rewritten_fixture(source: &str, unique_name: &str) -> std::process::Outpu
     };
 
     command
-        .args(["--rewrite-syscalls"])
         .arg(target)
         .output()
         .expect("Failed to run litebox_runner_linux_userland")
@@ -148,19 +162,11 @@ fn test_signals_while_exercising_each_aarch64_gate_kind() {
 #[test]
 #[cfg(all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"))]
 fn test_x18_virtualization() {
-    let target = common::compile(
+    let output = run_rewritten_fixture_with_options(
         "./tests/x18_virtualization.S",
         "x18_virtualization_nolibc",
         true,
-        true,
     );
-    let binary_path = std::env::var("NEXTEST_BIN_EXE_litebox_runner_linux_userland")
-        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_litebox_runner_linux_userland").to_string());
-    let output = std::process::Command::new(binary_path)
-        .args(["--unstable", "--rewrite-syscalls"])
-        .arg(target)
-        .output()
-        .expect("Failed to run litebox_runner_linux_userland");
     assert!(
         output.status.success(),
         "x18 fixture failed ({}): {}",

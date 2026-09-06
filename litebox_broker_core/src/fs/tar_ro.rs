@@ -29,10 +29,8 @@ use alloc::vec::Vec;
 use core::ops::Range;
 use hashbrown::HashMap;
 
-use crate::fs::{DirEntry, FileType};
-
 use super::{
-    Mode, NodeInfo, OFlags, UserInfo,
+    DirEntry, FileType, Mode, NodeInfo, OFlags, UserInfo,
     backend::{CreationMetadata, DirHandle, FileHandle, HandleRef, WalkingDirHandle},
     errors::{
         ChmodError, ChownError, MkdirError, OpenError, PathError, ReadDirError, ReadError,
@@ -203,7 +201,13 @@ impl super::backend::Backend for TarRo {
             .collect())
     }
 
-    fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError> {
+    fn read(
+        &self,
+        _device_io: &dyn super::backend::DeviceIo,
+        h: &FileHandle,
+        buf: &mut [u8],
+        offset: usize,
+    ) -> Result<usize, ReadError> {
         let file = self.tar_index.file_data(h.get_typed::<Self>().idx);
         let start = offset.min(file.len());
         let end = offset.checked_add(buf.len()).unwrap().min(file.len());
@@ -213,7 +217,13 @@ impl super::backend::Backend for TarRo {
         Ok(len)
     }
 
-    fn write(&self, _h: &FileHandle, _buf: &[u8], _offset: usize) -> Result<usize, WriteError> {
+    fn write(
+        &self,
+        _device_io: &dyn super::backend::DeviceIo,
+        _h: &FileHandle,
+        _buf: &[u8],
+        _offset: usize,
+    ) -> Result<usize, WriteError> {
         Err(WriteError::NotForWriting)
     }
 

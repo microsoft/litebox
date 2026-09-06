@@ -13,7 +13,7 @@ pub struct InodeAllocators {
 
 impl InodeAllocators {
     /// Start handing out allocators, beginning at `first_device_id`.
-    pub(super) fn starting_at(first_device_id: u64) -> Self {
+    pub fn starting_at(first_device_id: u64) -> Self {
         Self {
             next_device_id: AtomicU64::new(first_device_id),
         }
@@ -36,7 +36,7 @@ pub struct InodeAllocator {
 impl InodeAllocator {
     /// Construct an allocator for a specific `device_id`.
     #[must_use]
-    pub(super) fn for_device(device_id: u64) -> Self {
+    pub fn for_device(device_id: u64) -> Self {
         Self {
             device_id,
             counter: AtomicU64::new(1),
@@ -47,7 +47,7 @@ impl InodeAllocator {
     ///
     /// This should (eventually) disappear once we have better device ID allocation setup.
     #[must_use]
-    pub(crate) fn standalone() -> Self {
+    pub fn standalone() -> Self {
         // `b"Stnd".hex()`
         const STANDALONE_DEVICE_ID: u64 = 0x53746e64;
         Self::for_device(STANDALONE_DEVICE_ID)

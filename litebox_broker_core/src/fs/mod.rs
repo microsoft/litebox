@@ -1,27 +1,36 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Guest-facing filesystem facade.
+//! File-system related functionality
 //!
-//! Filesystem resolution and backend implementations are broker-owned. This
-//! module retains the guest descriptor facade and its public value types.
+//! A file-system consists of a [`Filesystem`](resolver::Filesystem) that works alongside one or more
+//! [`Backend`](backend::Backend)s. Such backends can be composed together: mounted at distinct
+//! paths via the [`Composer`](composer::Composer), or stacked as a writable upper over immutable
+//! lowers via the [`Overlay`](overlay::Overlay).
 
 use bitflags::bitflags;
 
 use core::ffi::c_uint;
 use core::num::NonZeroUsize;
 
+pub mod backend;
+pub mod composer;
+mod control;
+pub mod devices;
 pub mod errors;
+pub mod in_mem;
+#[doc(hidden)]
+pub mod inode_allocator;
+pub mod nine_p;
+pub mod overlay;
+mod provider;
 pub mod resolver;
+pub mod tar_ro;
 
-#[cfg(test)]
-mod broker_fixture;
-
-#[cfg(test)]
-mod tests;
-
-#[cfg(all(test, target_os = "linux"))]
-mod nine_p_tests;
+pub use control::*;
+pub use provider::{
+    FilesystemProviderAdapter, NamespacedFilesystemProvider, create_windows_registry_provider,
+};
 
 bitflags! {
     /// `S_I*` constants for open, ...
@@ -65,7 +74,7 @@ bitflags! {
 
 /// Types of files on a file-system.
 ///
-/// See [`resolver::Resolver::file_status`].
+/// See [`resolver::Filesystem::file_status`].
 #[derive(Debug, PartialEq, Eq, Clone)]
 #[non_exhaustive]
 pub enum FileType {
@@ -160,7 +169,7 @@ bitflags! {
     }
 }
 
-/// The `whence` directive to [`resolver::Resolver::seek`]
+/// The `whence` directive to [`resolver::Filesystem::seek`]
 #[derive(Copy, Clone)]
 pub enum SeekWhence {
     /// The file offset is set to `offset` bytes.
@@ -213,7 +222,7 @@ pub struct NodeInfo {
     pub rdev: Option<NonZeroUsize>,
 }
 
-/// Directory entries returned by [`resolver::Resolver::read_dir`]
+/// Directory entries returned by [`resolver::Filesystem::read_dir`]
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct DirEntry {
@@ -226,3 +235,6 @@ impl UserInfo {
     /// The root user
     pub const ROOT: Self = Self { user: 0, group: 0 };
 }
+
+/// The size reported as the size of a directory.
+const DEFAULT_DIRECTORY_SIZE: usize = 4096;

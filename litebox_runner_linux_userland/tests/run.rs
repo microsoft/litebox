@@ -196,6 +196,11 @@ impl Runner {
         &self.tar_dir
     }
 
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    fn fs_root(&self) -> PathBuf {
+        self.tar_dir.clone()
+    }
+
     fn env(&mut self, env: impl AsRef<std::ffi::OsStr>) -> &mut Self {
         self.command.arg("--env").arg(env);
         self
@@ -260,11 +265,7 @@ impl Runner {
         assert!(tar_success, "failed to create tar file");
         println!("Tar file ready at: {}", tar_file.to_str().unwrap());
 
-        self.command
-            .arg("--initial-files")
-            .arg(tar_file)
-            .arg(&self.cmd_path)
-            .args(&self.cmd_args);
+        self.command.arg(&self.cmd_path).args(&self.cmd_args);
 
         #[cfg(target_os = "linux")]
         if self.use_userland_broker || !self.managed_proxy_hosts.is_empty() {
@@ -290,10 +291,21 @@ impl Runner {
                 );
             }
             let mut command = std::process::Command::new(broker);
+            if cfg!(all(
+                target_arch = "aarch64",
+                feature = "aarch64_virtualize_x18"
+            )) {
+                command.arg("--fs-virtualize-x18");
+            }
             for host in &self.managed_proxy_hosts {
                 command.arg("--allow-host").arg(host);
             }
-            command.arg("--runner").arg(runner).args(runner_arguments);
+            command
+                .arg("--fs-initial-files")
+                .arg(&tar_file)
+                .arg("--runner")
+                .arg(runner)
+                .args(runner_arguments);
             self.command = command;
         }
     }
@@ -519,8 +531,15 @@ fn spawn_test_broker(
     control_socket_path: &Path,
     policy: litebox_broker_core::PolicyEngine,
     connection_count: usize,
+    fs_roots: Vec<PathBuf>,
 ) -> TestBroker {
-    spawn_test_broker_with_mode(control_socket_path, policy, connection_count, false)
+    spawn_test_broker_with_mode(
+        control_socket_path,
+        policy,
+        connection_count,
+        fs_roots,
+        false,
+    )
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -528,8 +547,15 @@ fn spawn_concurrent_test_broker(
     control_socket_path: &Path,
     policy: litebox_broker_core::PolicyEngine,
     connection_count: usize,
+    fs_roots: Vec<PathBuf>,
 ) -> TestBroker {
-    spawn_test_broker_with_mode(control_socket_path, policy, connection_count, true)
+    spawn_test_broker_with_mode(
+        control_socket_path,
+        policy,
+        connection_count,
+        fs_roots,
+        true,
+    )
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -537,6 +563,7 @@ fn spawn_test_broker_with_mode(
     control_socket_path: &Path,
     policy: litebox_broker_core::PolicyEngine,
     connection_count: usize,
+    fs_roots: Vec<PathBuf>,
     concurrent: bool,
 ) -> TestBroker {
     let _ = std::fs::remove_file(control_socket_path);
@@ -553,6 +580,15 @@ fn spawn_test_broker_with_mode(
                 std::os::unix::net::UnixListener::bind(&server_control_socket_path)
                     .expect("failed to bind broker test control socket");
             let limits = litebox_broker_core::BrokerCoreLimits::DEFAULT;
+            let random_provider = std::sync::Arc::new(TestRandomProvider);
+            let stdio_provider = std::sync::Arc::new(CapturingStdioProvider { stdout_tx });
+            let fs_provider = test_fs_provider(
+                fs_roots,
+                std::sync::Arc::clone(&random_provider)
+                    as std::sync::Arc<dyn litebox_broker_core::random::RandomProvider>,
+                std::sync::Arc::clone(&stdio_provider)
+                    as std::sync::Arc<dyn litebox_broker_core::stdio::StdioProvider>,
+            );
             let broker = litebox_broker_core::BrokerCore::new_with_limits(
                 policy,
                 limits,
@@ -563,8 +599,9 @@ fn spawn_test_broker_with_mode(
                     )
                     .expect("failed to create broker test socket provider"),
                 ),
-                std::sync::Arc::new(TestRandomProvider),
-                std::sync::Arc::new(CapturingStdioProvider { stdout_tx }),
+                random_provider,
+                stdio_provider,
+                fs_provider,
             )
             .expect("failed to create broker core");
             ready_tx.send(()).expect("failed to report broker ready");
@@ -614,6 +651,81 @@ fn spawn_test_broker_with_mode(
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn test_fs_provider(
+    roots: Vec<PathBuf>,
+    random: std::sync::Arc<dyn litebox_broker_core::random::RandomProvider>,
+    stdio: std::sync::Arc<dyn litebox_broker_core::stdio::StdioProvider>,
+) -> std::sync::Arc<dyn litebox_broker_core::fs::FilesystemProvider> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let owner = litebox_broker_core::fs::UserInfo {
+        user: 1000,
+        group: 1000,
+    };
+    let mut entries = vec![(
+        "/tmp".to_owned(),
+        litebox_broker_core::fs::in_mem::InitialNode::Directory {
+            mode: litebox_broker_core::fs::Mode::RWXU
+                | litebox_broker_core::fs::Mode::RWXG
+                | litebox_broker_core::fs::Mode::RWXO,
+            owner,
+        },
+    )];
+    for root in roots {
+        for entry in walkdir::WalkDir::new(&root)
+            .min_depth(1)
+            .sort_by_file_name()
+        {
+            let entry = entry.expect("failed to walk broker test filesystem");
+            let relative = entry
+                .path()
+                .strip_prefix(&root)
+                .expect("walked path escaped broker test filesystem");
+            let path = format!(
+                "/{}",
+                relative
+                    .to_str()
+                    .expect("broker test filesystem path was not UTF-8")
+            );
+            let metadata = entry
+                .metadata()
+                .expect("failed to read broker test filesystem metadata");
+            let mode =
+                litebox_broker_core::fs::Mode::from_bits_retain(metadata.permissions().mode());
+            let node = if metadata.is_dir() {
+                litebox_broker_core::fs::in_mem::InitialNode::Directory { mode, owner }
+            } else {
+                litebox_broker_core::fs::in_mem::InitialNode::File {
+                    mode,
+                    owner,
+                    data: std::borrow::Cow::Owned(
+                        std::fs::read(entry.path())
+                            .expect("failed to read broker test filesystem file"),
+                    ),
+                }
+            };
+            entries.push((path, node));
+        }
+    }
+    let in_mem = litebox_broker_core::fs::in_mem::InMem::<
+        litebox_broker_platform_linux_userland::LinuxSyncPrimitivesProvider,
+    >::new_initialized(entries);
+    let backend = litebox_broker_core::fs::composer::Composer::builder()
+        .mount_nestable("/", |_| in_mem)
+        .mount("/dev", litebox_broker_core::fs::devices::Devices::new)
+        .build()
+        .expect("failed to construct broker test filesystem");
+    std::sync::Arc::new(litebox_broker_core::fs::FilesystemProviderAdapter::new(
+        litebox_broker_core::fs::resolver::Filesystem::<
+            litebox_broker_platform_linux_userland::LinuxSyncPrimitivesProvider,
+            _,
+        >::new(backend),
+        random,
+        stdio,
+    ))
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn run_test_broker_connection(
     broker: &litebox_broker_core::BrokerCore,
     control_stream: std::os::unix::net::UnixStream,
@@ -659,21 +771,39 @@ fn run_test_broker_connection(
     let publisher_readiness = readiness.clone();
     let publisher = std::thread::spawn(move || publisher_readiness.run(&mut notifications));
     let mut close_object_count = 0;
+    let mut fs_handles = std::collections::HashSet::new();
     let termination = loop {
         match request_source
             .recv_request()
             .expect("failed to receive broker test request")
         {
             litebox_broker_transport::channel::HostReceive::Message(request) => {
-                if matches!(
-                    &request.operation,
-                    litebox_broker_protocol::message::BrokerOperation::CloseObject(_)
-                ) {
+                let closed_handle = match &request.operation {
+                    litebox_broker_protocol::message::BrokerOperation::CloseObject(handle) => {
+                        Some(*handle)
+                    }
+                    _ => None,
+                };
+                let mut opened_fs_handle = None;
+                association
+                    .execute_request(request, |response| {
+                        if let litebox_broker_protocol::message::BrokerResult::Filesystem(
+                            litebox_broker_protocol::message::FilesystemResponse::Open(opened),
+                        ) = &response.result
+                        {
+                            opened_fs_handle = Some(opened.handle);
+                        }
+                        response_sink.send_response(response)
+                    })
+                    .expect("failed to execute broker test request");
+                if let Some(handle) = opened_fs_handle {
+                    fs_handles.insert(handle);
+                }
+                if let Some(handle) = closed_handle
+                    && !fs_handles.remove(&handle)
+                {
                     close_object_count += 1;
                 }
-                association
-                    .execute_request(request, |response| response_sink.send_response(response))
-                    .expect("failed to execute broker test request");
             }
             litebox_broker_transport::channel::HostReceive::PeerClosed => {
                 break litebox_broker_host::ConnectionTermination::PeerClosed;
@@ -723,6 +853,16 @@ console.log(content);
         false,
         false,
     );
+    let mut true_runner = Runner::new(&true_path, "broker_true_rewriter");
+    let mut eventfd_runner = Runner::new(&target, "broker_eventfd_rewriter");
+    let mut pipe_runner = Runner::new(&pipe_target, "broker_pipe_rewriter");
+    let mut urandom_runner = Runner::new(&urandom_target, "broker_urandom_rewriter");
+    let mut node_runner = Runner::new(&node_path, "hello_node_broker_rewriter");
+    node_runner
+        .arg("/out/hello_world.js")
+        .with_fs_path(|out_dir| {
+            std::fs::write(out_dir.join("out/hello_world.js"), HELLO_WORLD_JS).unwrap();
+        });
     let control_socket_path = unique_test_socket_path("runner-broker-control");
     let broker_thread = spawn_test_broker(
         &control_socket_path,
@@ -730,37 +870,32 @@ console.log(content);
             litebox_broker_core::ObjectRights::all(),
         ),
         5,
+        [
+            &true_runner,
+            &eventfd_runner,
+            &pipe_runner,
+            &urandom_runner,
+            &node_runner,
+        ]
+        .map(Runner::fs_root)
+        .to_vec(),
     );
 
-    Runner::new(&true_path, "broker_true_rewriter")
-        .broker_socket(&control_socket_path)
-        .run();
+    true_runner.broker_socket(&control_socket_path).run();
     assert_eq!(broker_thread.next_close_object_count(), 0);
 
-    Runner::new(&target, "broker_eventfd_rewriter")
-        .broker_socket(&control_socket_path)
-        .run();
+    eventfd_runner.broker_socket(&control_socket_path).run();
     // eventfd.c creates thirteen eventfd objects; each should release one broker object.
     assert_eq!(broker_thread.next_close_object_count(), 13);
 
-    Runner::new(&pipe_target, "broker_pipe_rewriter")
-        .broker_socket(&control_socket_path)
-        .run();
+    pipe_runner.broker_socket(&control_socket_path).run();
     // pipe_broker.c creates five pipes; each endpoint owns one broker object.
     assert_eq!(broker_thread.next_close_object_count(), 10);
 
-    Runner::new(&urandom_target, "broker_urandom_rewriter")
-        .broker_socket(&control_socket_path)
-        .run();
+    urandom_runner.broker_socket(&control_socket_path).run();
     assert_eq!(broker_thread.next_close_object_count(), 0);
 
-    Runner::new(&node_path, "hello_node_broker_rewriter")
-        .broker_socket(&control_socket_path)
-        .arg("/out/hello_world.js")
-        .with_fs_path(|out_dir| {
-            std::fs::write(out_dir.join("out/hello_world.js"), HELLO_WORLD_JS).unwrap();
-        })
-        .run();
+    node_runner.broker_socket(&control_socket_path).run();
     assert!(broker_thread.next_close_object_count() > 0);
 
     broker_thread.join();
@@ -877,6 +1012,7 @@ fn test_runner_broker_tcp_client_with_rewriter() {
     let refused_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let refused_port = refused_listener.local_addr().unwrap().port();
     drop(refused_listener);
+    let mut runner = Runner::new(&target, "broker_tcp_client_rewriter");
     let control_socket_path = unique_test_socket_path("runner-broker-tcp-control");
     let broker = spawn_test_broker(
         &control_socket_path,
@@ -885,8 +1021,9 @@ fn test_runner_broker_tcp_client_with_rewriter() {
         )
         .with_socket_policy(gateway_tcp_policy()),
         1,
+        vec![runner.fs_root()],
     );
-    Runner::new(&target, "broker_tcp_client_rewriter")
+    runner
         .arg(port.to_string())
         .arg(refused_port.to_string())
         .broker_socket(&control_socket_path)
@@ -974,6 +1111,7 @@ fn test_runner_broker_udp_with_rewriter() {
         )
         .with_socket_policy(gateway_udp_policy()),
         1,
+        vec![runner.fs_root()],
     );
     runner
         .arg(port.to_string())
@@ -996,6 +1134,8 @@ fn test_runner_broker_udp_namespace_delivers_after_sender_close() {
         false,
         false,
     );
+    let mut server_runner = Runner::new(&target, "broker_udp_namespace_server_rewriter");
+    let mut client_runner = Runner::new(&target, "broker_udp_namespace_client_rewriter");
     let control_socket_path = unique_test_socket_path("runner-broker-udp-namespace-control");
     let broker = spawn_concurrent_test_broker(
         &control_socket_path,
@@ -1004,8 +1144,9 @@ fn test_runner_broker_udp_namespace_delivers_after_sender_close() {
         )
         .with_socket_policy(litebox_broker_core::SocketPolicy::guest_network()),
         2,
+        vec![server_runner.fs_root(), client_runner.fs_root()],
     );
-    let mut server = Runner::new(&target, "broker_udp_namespace_server_rewriter")
+    let mut server = server_runner
         .arg("server")
         .broker_socket(&control_socket_path)
         .spawn_with_stdio(Stdio::null(), Stdio::null(), Stdio::inherit());
@@ -1017,7 +1158,7 @@ fn test_runner_broker_udp_namespace_delivers_after_sender_close() {
         .unwrap();
     assert_ne!(port, 0);
 
-    Runner::new(&target, "broker_udp_namespace_client_rewriter")
+    client_runner
         .arg("client")
         .arg(port.to_string())
         .broker_socket(&control_socket_path)
@@ -1052,6 +1193,7 @@ fn test_runner_broker_tcp_server_with_rewriter() {
         false,
         false,
     );
+    let mut runner = Runner::new(&target, "broker_tcp_server_rewriter");
     let control_socket_path = unique_test_socket_path("runner-broker-tcp-server-control");
     let broker = spawn_test_broker(
         &control_socket_path,
@@ -1060,10 +1202,13 @@ fn test_runner_broker_tcp_server_with_rewriter() {
         )
         .with_socket_policy(litebox_broker_core::SocketPolicy::guest_network()),
         1,
+        vec![runner.fs_root()],
     );
-    let mut child = Runner::new(&target, "broker_tcp_server_rewriter")
-        .broker_socket(&control_socket_path)
-        .spawn_with_stdio(Stdio::null(), Stdio::null(), Stdio::inherit());
+    let mut child = runner.broker_socket(&control_socket_path).spawn_with_stdio(
+        Stdio::null(),
+        Stdio::null(),
+        Stdio::inherit(),
+    );
     let mut output = String::new();
     let mut next_marker = |prefix: &str| loop {
         let line = broker.next_stdout_line();
@@ -1458,6 +1603,7 @@ fn test_broker_with_curl() {
     });
 
     let curl_path = run_which("curl");
+    let mut runner = Runner::new(&curl_path, "curl_rewriter");
     let control_socket_path = unique_test_socket_path("runner-broker-curl-control");
     let broker = spawn_test_broker(
         &control_socket_path,
@@ -1466,9 +1612,10 @@ fn test_broker_with_curl() {
         )
         .with_socket_policy(gateway_tcp_policy()),
         1,
+        vec![runner.fs_root()],
     );
     let url = format!("http://10.0.2.1:{port}/something");
-    Runner::new(&curl_path, "curl_rewriter")
+    runner
         .args(["-sS", &url])
         .broker_socket(&control_socket_path)
         .run();
@@ -1552,6 +1699,7 @@ fn test_broker_with_iperf3() {
     const IPERF_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
     let iperf3_path = run_which("iperf3");
+    let mut runner = Runner::new(&iperf3_path, "broker_iperf3_client_rewriter");
     let control_socket_path = unique_test_socket_path("runner-broker-iperf3-control");
     let broker = spawn_test_broker(
         &control_socket_path,
@@ -1560,6 +1708,7 @@ fn test_broker_with_iperf3() {
         )
         .with_socket_policy(gateway_tcp_policy()),
         1,
+        vec![runner.fs_root()],
     );
 
     let mut last_server_output = String::new();
@@ -1618,7 +1767,6 @@ fn test_broker_with_iperf3() {
     let (port, mut server, server_output) = started_server
         .unwrap_or_else(|| panic!("iperf3 server did not start; output:\n{last_server_output}"));
 
-    let mut runner = Runner::new(&iperf3_path, "broker_iperf3_client_rewriter");
     runner
         .args([
             "-c",

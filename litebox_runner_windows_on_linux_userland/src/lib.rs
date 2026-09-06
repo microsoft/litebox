@@ -9,18 +9,18 @@ extern crate alloc;
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
+use litebox_broker_local_userland as broker;
 use litebox_platform_linux_userland::LinuxUserland;
 use std::path::PathBuf;
 
 /// Run Windows PE programs with LiteBox on unmodified Linux.
 ///
-/// The program binary and any initial filesystem contents must be provided inside a tar archive via
-/// `--initial-files`. The program path refers to a path inside the tar archive.
+/// The program path refers to a path inside the filesystem configured by the broker.
 #[derive(Parser, Debug)]
 pub struct CliArgs {
     /// The program and arguments passed to it (e.g., `/app/program.exe --help`).
     ///
-    /// The program path refers to a path inside the tar archive provided via `--initial-files`.
+    /// The program path refers to a path inside the filesystem configured by the broker.
     #[arg(required = true, trailing_var_arg = true, value_hint = clap::ValueHint::CommandWithArguments)]
     pub program_and_arguments: Vec<String>,
     /// Environment variables passed to the program (`K=V` pairs; can be invoked multiple times).
@@ -32,17 +32,18 @@ pub struct CliArgs {
     /// Allow using unstable options.
     #[arg(short = 'Z', long = "unstable")]
     pub unstable: bool,
-    /// Tar archive containing the program and its runtime files.
-    #[arg(long = "initial-files", value_name = "PATH_TO_TAR", value_hint = clap::ValueHint::FilePath)]
-    pub initial_files: PathBuf,
+    /// Broker-supplied Unix-domain socket path for the local control channel.
+    #[arg(
+        long = "broker-control-channel",
+        value_name = "SOCKET_PATH",
+        hide = true,
+        requires = "unstable",
+        help_heading = "Unstable Options"
+    )]
+    pub broker_control_channel: PathBuf,
 }
 
 /// Run Windows PE programs with LiteBox on unmodified Linux.
-///
-/// # Panics
-///
-/// Panics if the initial in-memory file system fails to create `/tmp` - those
-/// operations cannot fail against a freshly-constructed file system.
 pub fn run(cli_args: CliArgs) -> Result<()> {
     tracing_subscriber::fmt()
         .with_timer(tracing_subscriber::fmt::time::uptime())
@@ -60,37 +61,30 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         );
     }
 
-    let tar_file = &cli_args.initial_files;
-    if tar_file.extension().and_then(|x| x.to_str()) != Some("tar") {
-        anyhow::bail!("Expected a .tar file, found {}", tar_file.display());
-    }
-    let tar_data = std::fs::read(tar_file)
-        .with_context(|| format!("Could not read tar file at {}", tar_file.display()))?;
-
     let platform = LinuxUserland::new();
-    let shim_builder = litebox_shim_windows::WindowsShimBuilder::new(platform);
+    let broker::BrokerConnection {
+        local,
+        notifications,
+        coordinator,
+        positional_io_fds: _broker_positional_io_fds,
+        shutdown_fd: _broker_shutdown_fd,
+    } = broker::connect(&cli_args.broker_control_channel)?;
+    let litebox = litebox::LiteBox::new_with_broker_local(platform, local);
+    coordinator.install_dispatch(litebox.broker_failure_dispatcher());
+    broker::start_notification_receiver(
+        notifications,
+        coordinator,
+        litebox.broker_notification_dispatcher(),
+    )?;
+    let shim_builder =
+        litebox_shim_windows::WindowsShimBuilder::new_with_litebox(platform, litebox);
 
     let (program_path, program_args) = cli_args
         .program_and_arguments
         .split_first()
         .context("program path missing - clap should have required at least one argument")?;
 
-    let initial_file_system = {
-        let in_mem = litebox::fs::in_mem::InMem::new_initialized([(
-            "/tmp",
-            litebox::fs::in_mem::InitialNode::Directory {
-                mode: litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
-                owner: litebox::fs::UserInfo {
-                    user: 1000,
-                    group: 1000,
-                },
-            },
-        )]);
-
-        shim_builder.default_fs(in_mem, tar_data.into())
-    };
-    let initial_file_system = std::sync::Arc::new(initial_file_system);
-
+    let initial_file_system = std::sync::Arc::new(shim_builder.brokered_fs());
     let shim = shim_builder.build();
     let argv = std::iter::once(program_path.as_str())
         .chain(program_args.iter().map(String::as_str))

@@ -7,6 +7,9 @@
 //! `litebox_broker_host` with the Linux host endpoints from
 //! `litebox_broker_transport_linux_userland`. It owns runner process lifecycle,
 //! socket setup, and worker threads. This library exposes components shared by
-//! the executable and its integration tests, currently readiness publication.
+//! the executable and its integration tests.
 
 pub mod readiness;
+
+#[cfg(all(test, target_os = "linux"))]
+mod fs_tests;
