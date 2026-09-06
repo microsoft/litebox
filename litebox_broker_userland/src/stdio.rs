@@ -44,11 +44,11 @@ struct StdioWriteOperation {
 
 impl UserlandStdioProvider {
     pub(super) fn new() -> IoResult<Self> {
-        let (stdout, stdout_receiver) = sync_channel(super::WORKER_COUNT);
+        let (stdout, stdout_receiver) = sync_channel(crate::WORKER_COUNT);
         std::thread::Builder::new()
             .name("litebox-broker-stdout".to_owned())
             .spawn(move || pump_stdout(stdout_receiver))?;
-        let (stderr, stderr_receiver) = sync_channel(super::WORKER_COUNT);
+        let (stderr, stderr_receiver) = sync_channel(crate::WORKER_COUNT);
         std::thread::Builder::new()
             .name("litebox-broker-stderr".to_owned())
             .spawn(move || pump_stderr(stderr_receiver))?;
