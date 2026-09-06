@@ -62,6 +62,7 @@ struct LocalRingAssociation {
     request_producer: Mutex<ControlRingProducer<WindowsSharedMemory>>,
     pending_calls: Arc<PendingCalls>,
     liveness: PipeLiveness,
+    on_failure: Arc<dyn Fn() + Send + Sync>,
     request_wake: ControlRingWakeHandle<WindowsSharedMemory>,
     response_wake: ControlRingWakeHandle<WindowsSharedMemory>,
     notification_wake: ControlRingWakeHandle<WindowsSharedMemory>,
@@ -139,7 +140,26 @@ impl WindowsNamedPipeLocalSetupChannel {
         WindowsControlRingLocalCallChannel,
         WindowsControlRingLocalNotificationChannel,
     )> {
-        activate_local(self.stream, self.negotiated, self.setup_deadline, ring)
+        self.into_active_with_failure_handler(ring, || {})
+    }
+
+    /// Activates calls and notifications and invokes `on_failure` once after
+    /// the active association first fails and its waits have been interrupted.
+    pub fn into_active_with_failure_handler(
+        self,
+        ring: ControlRing<WindowsSharedMemory>,
+        on_failure: impl Fn() + Send + Sync + 'static,
+    ) -> IoResult<(
+        WindowsControlRingLocalCallChannel,
+        WindowsControlRingLocalNotificationChannel,
+    )> {
+        activate_local(
+            self.stream,
+            self.negotiated,
+            self.setup_deadline,
+            ring,
+            Arc::new(on_failure),
+        )
     }
 }
 
@@ -168,6 +188,7 @@ fn activate_local(
     negotiated: bool,
     setup_deadline: Option<Instant>,
     ring: ControlRing<WindowsSharedMemory>,
+    on_failure: Arc<dyn Fn() + Send + Sync>,
 ) -> IoResult<(
     WindowsControlRingLocalCallChannel,
     WindowsControlRingLocalNotificationChannel,
@@ -199,6 +220,7 @@ fn activate_local(
     let stream = Arc::new(stream);
     let association = Arc::new(LocalRingAssociation {
         liveness: PipeLiveness::new(Arc::clone(&stream), false)?,
+        on_failure,
         request_wake: request_producer.wake_handle(),
         request_producer: Mutex::new(request_producer),
         response_wake: response_consumer.wake_handle(),
@@ -338,12 +360,17 @@ impl LocalRingAssociation {
     }
 
     fn fail(&self, error: Error) -> IoResult<()> {
-        self.pending_calls.record_failure(Arc::new(error));
-        self.request_wake
+        let first_failure = self.pending_calls.record_failure(Arc::new(error));
+        let result = self
+            .request_wake
             .interrupt_wait()
             .and(self.response_wake.interrupt_wait())
             .and(self.notification_wake.interrupt_wait())
-            .and(self.liveness.shutdown())
+            .and(self.liveness.shutdown());
+        if first_failure {
+            (self.on_failure)();
+        }
+        result
     }
 }
 

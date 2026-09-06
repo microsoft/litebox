@@ -94,6 +94,16 @@ impl UnixStreamLocalSetupChannel {
         }
     }
 
+    /// Creates a local setup channel from an already-connected Unix stream and
+    /// bounds all setup I/O by `deadline`.
+    pub const fn from_connected_with_setup_deadline(stream: UnixStream, deadline: Instant) -> Self {
+        Self {
+            stream,
+            setup_deadline: Some(deadline),
+            negotiated: false,
+        }
+    }
+
     /// Connects to a userland broker Unix socket.
     pub fn connect(path: impl AsRef<Path>) -> IoResult<Self> {
         UnixStream::connect(path).map(Self::from_connected)

@@ -3,6 +3,7 @@
 
 use std::{
     os::fd::{AsFd, AsRawFd, RawFd},
+    os::unix::net::UnixStream,
     path::Path,
     sync::{
         Arc, Mutex,
@@ -12,14 +13,21 @@ use std::{
 };
 
 use anyhow::{Context as _, Result};
+use litebox_broker_core::BrokerCore;
 use litebox_broker_local::{BrokerLocal, BrokerNotifications};
 use litebox_broker_protocol::message::BrokerNotification;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport::control_ring::ControlRing;
+use litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory;
 use litebox_broker_transport_linux_userland::unix_socket::{
     UnixControlRingLocalCallChannel, UnixControlRingLocalNotificationChannel,
     UnixControlRingLocalShutdown, UnixStreamLocalSetupChannel,
 };
+use litebox_broker_transport_linux_userland::unix_socket::{
+    UnixStreamHostSetupChannel, validate_peer_process,
+};
+
+use crate::in_process::InProcessHostThread;
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const RETRY_DELAY: Duration = Duration::from_millis(20);
@@ -53,6 +61,69 @@ pub fn connect(control_socket_path: &Path) -> Result<BrokerConnection> {
             control_socket_path.display()
         )
     })?;
+    negotiate(setup_channel, setup_deadline, None)
+}
+
+/// Connects to a broker core hosted in this process over the production Linux
+/// Unix-socket, memfd, and control-ring transport.
+///
+/// This mode is intended for tests and explicitly non-secure development
+/// deployments. The broker host thread is not covered by the runner thread's
+/// seccomp filter; secure Linux deployments must keep the broker and runner in
+/// separate processes. Active-association failure shuts down the transport and
+/// joins the broker host thread before failure handling returns.
+pub fn connect_in_process(broker: &BrokerCore) -> Result<BrokerConnection> {
+    let setup_deadline = Instant::now() + SETUP_TIMEOUT;
+    let (local_stream, host_stream) =
+        UnixStream::pair().context("failed to create in-process broker control socket")?;
+    validate_peer_process(&host_stream, std::process::id())
+        .context("failed to authenticate in-process broker peer")?;
+
+    let broker = broker.clone();
+    let host_thread = Arc::new(InProcessHostThread::new(
+        std::thread::Builder::new()
+            .name("litebox-broker-host".to_owned())
+            .spawn(move || {
+                let control_channel =
+                    UnixStreamHostSetupChannel::from_host_guaranteed(host_stream, setup_deadline);
+                litebox_broker_userland::runtime::serve_association(
+                    &broker,
+                    control_channel,
+                    || MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE),
+                    MemfdSharedMemory::create_control_ring,
+                    |channel, shared_memory, control_memory| {
+                        channel.send_memfd(shared_memory, Some(setup_deadline))?;
+                        channel.send_memfd(control_memory, Some(setup_deadline))
+                    },
+                    UnixStreamHostSetupChannel::into_active,
+                )
+            })
+            .context("failed to start in-process broker host")?,
+    ));
+    let setup_channel = UnixStreamLocalSetupChannel::from_connected_with_setup_deadline(
+        local_stream,
+        setup_deadline,
+    );
+    match negotiate(
+        setup_channel,
+        setup_deadline,
+        Some(Arc::clone(&host_thread)),
+    ) {
+        Ok(connection) => Ok(connection),
+        Err(error) => match host_thread.join() {
+            Ok(()) => Err(error),
+            Err(host_error) => {
+                Err(error.context(format!("in-process broker host failed: {host_error}")))
+            }
+        },
+    }
+}
+
+fn negotiate(
+    setup_channel: UnixStreamLocalSetupChannel,
+    setup_deadline: Instant,
+    host_thread: Option<Arc<InProcessHostThread>>,
+) -> Result<BrokerConnection> {
     let association_coordinator = Arc::new(BrokerAssociationFailureCoordinator::new());
     let (local, (notification_channel, positional_io_fds, shutdown_fd)) =
         BrokerLocal::negotiate(setup_channel, |mut setup| {
@@ -70,10 +141,14 @@ pub fn connect(control_socket_path: &Path) -> Result<BrokerConnection> {
                 )
             })?;
             let weak_association_coordinator = Arc::downgrade(&association_coordinator);
+            let host_thread = host_thread.clone();
             let (call_channel, notification_channel, association_shutdown) =
                 setup.into_active(control_ring, move || {
                     if let Some(association_coordinator) = weak_association_coordinator.upgrade() {
                         association_coordinator.report_failure();
+                    }
+                    if let Some(host_thread) = &host_thread {
+                        host_thread.join_and_report();
                     }
                 })?;
             let shutdown_fd = association_shutdown.as_fd().as_raw_fd();
