@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use crate::filesystem::{
+use crate::fs::{
     ChmodFileRequest, ChownFileRequest, FilesystemError, FilesystemFileStatus, FilesystemNamespace,
     FilesystemNodeInfo, FilesystemSeekWhence, FilesystemUser, HandleFileStatusRequest,
     MkdirFileRequest, OpenFileRequest, OpenFileResponse, PathFileStatusRequest,
@@ -44,7 +44,7 @@ const RESPONSE_TAG_MKDIR: u8 = 10;
 const RESPONSE_TAG_RMDIR: u8 = 11;
 const RESPONSE_TAG_FAILED: u8 = 12;
 
-pub(super) fn encode_filesystem_request(encoder: &mut Encoder, request: FilesystemRequest) {
+pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FilesystemRequest) {
     match request {
         FilesystemRequest::Open(request) => {
             encoder.u8(REQUEST_TAG_OPEN);
@@ -131,9 +131,7 @@ pub(super) fn encode_filesystem_request(encoder: &mut Encoder, request: Filesyst
     }
 }
 
-pub(super) fn decode_filesystem_request(
-    decoder: &mut Decoder<'_>,
-) -> Result<FilesystemRequest, WireError> {
+pub(super) fn decode_fs_request(decoder: &mut Decoder<'_>) -> Result<FilesystemRequest, WireError> {
     match decoder.u8()? {
         REQUEST_TAG_OPEN => Ok(FilesystemRequest::Open(OpenFileRequest {
             namespace: decode_namespace(decoder)?,
@@ -208,7 +206,7 @@ pub(super) fn decode_filesystem_request(
     }
 }
 
-pub(super) fn encode_filesystem_response(encoder: &mut Encoder, response: FilesystemResponse) {
+pub(super) fn encode_fs_response(encoder: &mut Encoder, response: FilesystemResponse) {
     match response {
         FilesystemResponse::Open(OpenFileResponse { handle }) => {
             encoder.u8(RESPONSE_TAG_OPEN);
@@ -248,7 +246,7 @@ pub(super) fn encode_filesystem_response(encoder: &mut Encoder, response: Filesy
     }
 }
 
-pub(super) fn decode_filesystem_response(
+pub(super) fn decode_fs_response(
     decoder: &mut Decoder<'_>,
 ) -> Result<FilesystemResponse, WireError> {
     match decoder.u8()? {

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{RecvTimeoutError, sync_channel};
 use std::time::{Duration, Instant};
 
-use litebox_broker_core::filesystem::FilesystemProvider;
+use litebox_broker_core::fs::FilesystemProvider;
 use litebox_broker_core::fs::composer::Composer;
 use litebox_broker_core::fs::in_mem::{InMem, InitialNode};
 use litebox_broker_core::fs::overlay::Overlay;
@@ -93,7 +93,7 @@ pub(super) fn run(mut args: super::CliArgs) -> Result<(), Box<dyn Error>> {
     let limits = BrokerCoreLimits::DEFAULT;
     let random_provider = Arc::new(UserlandRandomProvider);
     let stdio_provider = Arc::new(UserlandStdioProvider::new()?);
-    let filesystem_provider = create_filesystem_provider(
+    let fs_provider = create_fs_provider(
         &args,
         Arc::clone(&random_provider) as Arc<dyn litebox_broker_core::random::RandomProvider>,
         Arc::clone(&stdio_provider) as Arc<dyn litebox_broker_core::stdio::StdioProvider>,
@@ -109,7 +109,7 @@ pub(super) fn run(mut args: super::CliArgs) -> Result<(), Box<dyn Error>> {
         )?),
         random_provider,
         stdio_provider,
-        filesystem_provider,
+        fs_provider,
     )?;
 
     crate::run_runner_process(
@@ -122,7 +122,7 @@ pub(super) fn run(mut args: super::CliArgs) -> Result<(), Box<dyn Error>> {
     )
 }
 
-fn create_filesystem_provider(
+fn create_fs_provider(
     args: &super::CliArgs,
     random: Arc<dyn litebox_broker_core::random::RandomProvider>,
     stdio: Arc<dyn litebox_broker_core::stdio::StdioProvider>,
@@ -131,7 +131,7 @@ fn create_filesystem_provider(
     const DEFAULT_GUEST_GID: u16 = 1000;
 
     let mut entries = Vec::new();
-    if let Some(program) = args.filesystem_program.as_deref() {
+    if let Some(program) = args.fs_program.as_deref() {
         let program = std::path::absolute(program)?;
         let ancestors: Vec<_> = program.ancestors().skip(1).collect();
         let mut previous_user = 0;
@@ -155,13 +155,13 @@ fn create_filesystem_provider(
             previous_user = metadata.st_uid();
         }
         let mut program_data = std::fs::read(&program)?;
-        if args.filesystem_rewrite_syscalls {
+        if args.fs_rewrite_syscalls {
             program_data = litebox_syscall_rewriter::hook_syscalls_in_elf_with_options(
                 &program_data,
                 None,
                 litebox_syscall_rewriter::RewriteOptions::new(
                     litebox_syscall_rewriter::TargetHost::Linux,
-                    args.filesystem_virtualize_x18,
+                    args.fs_virtualize_x18,
                 ),
             )?;
         }
@@ -198,7 +198,7 @@ fn create_filesystem_provider(
         ));
     }
 
-    let tar_data = match args.filesystem_initial_files.as_deref() {
+    let tar_data = match args.fs_initial_files.as_deref() {
         Some(path) => {
             if path.extension().and_then(|extension| extension.to_str()) != Some("tar") {
                 return Err(IoError::new(

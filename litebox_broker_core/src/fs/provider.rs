@@ -14,11 +14,11 @@ use super::errors::{
 };
 use super::resolver::{Filesystem, FilesystemOpenFile};
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence, UserInfo};
+use super::{FilesystemProvider, OpenFileDescription as BrokerOpenFileDescription};
 use crate::AssociationCancellation;
-use crate::filesystem::{FilesystemProvider, OpenFileDescription as BrokerOpenFileDescription};
 use crate::random::RandomProvider;
 use crate::stdio::StdioProvider;
-use litebox_broker_protocol::filesystem::{
+use litebox_broker_protocol::fs::{
     FilesystemDirectoryEntry, FilesystemError, FilesystemFileStatus, FilesystemFileType,
     FilesystemNamespace, FilesystemNodeInfo, FilesystemSeekWhence, FilesystemUser,
     paginate_directory_entries,
@@ -137,29 +137,29 @@ impl FilesystemProvider for NamespacedFilesystemProvider {
 }
 
 /// Exposes a LiteBox filesystem engine as a broker filesystem provider.
-pub struct FilesystemProviderAdapter<Platform, FilesystemBackend>
+pub struct FilesystemProviderAdapter<Platform, FsBackend>
 where
     Platform: RawSyncPrimitivesProvider,
-    FilesystemBackend: Backend + 'static,
+    FsBackend: Backend + 'static,
 {
-    filesystem: Arc<Filesystem<Platform, FilesystemBackend>>,
+    fs: Arc<Filesystem<Platform, FsBackend>>,
     random: Arc<dyn RandomProvider>,
     stdio: Arc<dyn StdioProvider>,
 }
 
-impl<Platform, FilesystemBackend> FilesystemProviderAdapter<Platform, FilesystemBackend>
+impl<Platform, FsBackend> FilesystemProviderAdapter<Platform, FsBackend>
 where
     Platform: RawSyncPrimitivesProvider,
-    FilesystemBackend: Backend + 'static,
+    FsBackend: Backend + 'static,
 {
     /// Creates a provider using the given filesystem and device-I/O providers.
     pub fn new(
-        filesystem: Filesystem<Platform, FilesystemBackend>,
+        fs: Filesystem<Platform, FsBackend>,
         random: Arc<dyn RandomProvider>,
         stdio: Arc<dyn StdioProvider>,
     ) -> Self {
         Self {
-            filesystem: Arc::new(filesystem),
+            fs: Arc::new(fs),
             random,
             stdio,
         }
@@ -198,11 +198,10 @@ where
     )))
 }
 
-impl<Platform, FilesystemBackend> FilesystemProvider
-    for FilesystemProviderAdapter<Platform, FilesystemBackend>
+impl<Platform, FsBackend> FilesystemProvider for FilesystemProviderAdapter<Platform, FsBackend>
 where
     Platform: RawSyncPrimitivesProvider + Send + Sync + 'static,
-    FilesystemBackend: Backend + 'static,
+    FsBackend: Backend + 'static,
 {
     fn open(
         &self,
@@ -214,16 +213,16 @@ where
         mode: u32,
     ) -> Result<Arc<dyn BrokerOpenFileDescription>, FilesystemError> {
         let file = self
-            .filesystem
+            .fs
             .open(
                 user_info(user),
                 path,
                 OFlags::from_bits_retain(flags),
                 Mode::from_bits_retain(mode),
             )
-            .map_err(filesystem_open_error)?;
+            .map_err(fs_open_error)?;
         Ok(Arc::new(OpenFileDescriptionAdapter {
-            filesystem: Arc::clone(&self.filesystem),
+            fs: Arc::clone(&self.fs),
             file,
             random: Arc::clone(&self.random),
             stdio: Arc::clone(&self.stdio),
@@ -238,9 +237,9 @@ where
         path: &str,
         user: FilesystemUser,
     ) -> Result<FilesystemFileStatus, FilesystemError> {
-        self.filesystem
+        self.fs
             .file_status(user_info(user), path)
-            .map_err(filesystem_file_status_error)
+            .map_err(fs_file_status_error)
             .map(file_status)
     }
 
@@ -252,9 +251,9 @@ where
         user: FilesystemUser,
         mode: u32,
     ) -> Result<(), FilesystemError> {
-        self.filesystem
+        self.fs
             .chmod(user_info(user), path, Mode::from_bits_retain(mode))
-            .map_err(filesystem_chmod_error)
+            .map_err(fs_chmod_error)
     }
 
     fn chown(
@@ -266,9 +265,9 @@ where
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), FilesystemError> {
-        self.filesystem
+        self.fs
             .chown(user_info(acting_user), path, user, group)
-            .map_err(filesystem_chown_error)
+            .map_err(fs_chown_error)
     }
 
     fn unlink(
@@ -278,9 +277,9 @@ where
         path: &str,
         user: FilesystemUser,
     ) -> Result<(), FilesystemError> {
-        self.filesystem
+        self.fs
             .unlink(user_info(user), path)
-            .map_err(filesystem_unlink_error)
+            .map_err(fs_unlink_error)
     }
 
     fn mkdir(
@@ -291,9 +290,9 @@ where
         user: FilesystemUser,
         mode: u32,
     ) -> Result<(), FilesystemError> {
-        self.filesystem
+        self.fs
             .mkdir(user_info(user), path, Mode::from_bits_retain(mode))
-            .map_err(filesystem_mkdir_error)
+            .map_err(fs_mkdir_error)
     }
 
     fn rmdir(
@@ -303,29 +302,27 @@ where
         path: &str,
         user: FilesystemUser,
     ) -> Result<(), FilesystemError> {
-        self.filesystem
-            .rmdir(user_info(user), path)
-            .map_err(filesystem_rmdir_error)
+        self.fs.rmdir(user_info(user), path).map_err(fs_rmdir_error)
     }
 }
 
-struct OpenFileDescriptionAdapter<Platform, FilesystemBackend>
+struct OpenFileDescriptionAdapter<Platform, FsBackend>
 where
     Platform: RawSyncPrimitivesProvider,
-    FilesystemBackend: Backend + 'static,
+    FsBackend: Backend + 'static,
 {
-    filesystem: Arc<Filesystem<Platform, FilesystemBackend>>,
+    fs: Arc<Filesystem<Platform, FsBackend>>,
     file: FilesystemOpenFile<Platform>,
     random: Arc<dyn RandomProvider>,
     stdio: Arc<dyn StdioProvider>,
     directory_snapshot: Mutex<Platform, Option<Vec<FilesystemDirectoryEntry>>>,
 }
 
-impl<Platform, FilesystemBackend> BrokerOpenFileDescription
-    for OpenFileDescriptionAdapter<Platform, FilesystemBackend>
+impl<Platform, FsBackend> BrokerOpenFileDescription
+    for OpenFileDescriptionAdapter<Platform, FsBackend>
 where
     Platform: RawSyncPrimitivesProvider + Send + Sync + 'static,
-    FilesystemBackend: Backend + 'static,
+    FsBackend: Backend + 'static,
 {
     fn read(
         &self,
@@ -333,7 +330,7 @@ where
         output: &mut [u8],
         offset: Option<u64>,
     ) -> Result<usize, FilesystemError> {
-        self.filesystem
+        self.fs
             .read(
                 &BrokerDeviceIo {
                     cancellation,
@@ -347,7 +344,7 @@ where
                     .transpose()
                     .map_err(|_| FilesystemError::InvalidOffset)?,
             )
-            .map_err(filesystem_read_error)
+            .map_err(fs_read_error)
     }
 
     fn write(
@@ -356,7 +353,7 @@ where
         input: &[u8],
         offset: Option<u64>,
     ) -> Result<usize, FilesystemError> {
-        self.filesystem
+        self.fs
             .write(
                 &BrokerDeviceIo {
                     cancellation,
@@ -370,7 +367,7 @@ where
                     .transpose()
                     .map_err(|_| FilesystemError::InvalidOffset)?,
             )
-            .map_err(filesystem_write_error)
+            .map_err(fs_write_error)
     }
 
     fn seek(
@@ -381,9 +378,9 @@ where
     ) -> Result<u64, FilesystemError> {
         let offset = isize::try_from(offset).map_err(|_| FilesystemError::InvalidOffset)?;
         let offset = self
-            .filesystem
+            .fs
             .seek(&self.file, offset, seek_whence(whence))
-            .map_err(filesystem_seek_error)?;
+            .map_err(fs_seek_error)?;
         u64::try_from(offset).map_err(|_| FilesystemError::InvalidOffset)
     }
 
@@ -393,13 +390,13 @@ where
         length: u64,
         reset_offset: bool,
     ) -> Result<(), FilesystemError> {
-        self.filesystem
+        self.fs
             .truncate(
                 &self.file,
                 usize::try_from(length).map_err(|_| FilesystemError::InvalidOffset)?,
                 reset_offset,
             )
-            .map_err(filesystem_truncate_error)
+            .map_err(fs_truncate_error)
     }
 
     fn read_directory(
@@ -411,9 +408,9 @@ where
         let mut snapshot = self.directory_snapshot.lock();
         if start_index == 0 {
             let entries = self
-                .filesystem
+                .fs
                 .read_dir(&self.file)
-                .map_err(filesystem_read_dir_error)?
+                .map_err(fs_read_dir_error)?
                 .into_iter()
                 .map(directory_entry)
                 .collect();
@@ -432,9 +429,9 @@ where
         &self,
         _cancellation: &AssociationCancellation,
     ) -> Result<FilesystemFileStatus, FilesystemError> {
-        self.filesystem
+        self.fs
             .handle_status(&self.file)
-            .map_err(filesystem_file_status_error)
+            .map_err(fs_file_status_error)
             .map(file_status)
     }
 }
@@ -520,7 +517,7 @@ fn node_info(node_info: NodeInfo) -> FilesystemNodeInfo {
     }
 }
 
-fn filesystem_path_error(error: PathError) -> FilesystemError {
+fn fs_path_error(error: PathError) -> FilesystemError {
     match error {
         PathError::NoSuchFileOrDirectory => FilesystemError::NoSuchFileOrDirectory,
         PathError::NoSearchPerms { .. } => FilesystemError::NoSearchPermissions,
@@ -530,19 +527,19 @@ fn filesystem_path_error(error: PathError) -> FilesystemError {
     }
 }
 
-fn filesystem_open_error(error: OpenError) -> FilesystemError {
+fn fs_open_error(error: OpenError) -> FilesystemError {
     match error {
         OpenError::AccessNotAllowed => FilesystemError::AccessNotAllowed,
         OpenError::NoWritePerms => FilesystemError::NoWritePermissions,
         OpenError::ReadOnlyFileSystem => FilesystemError::ReadOnlyFilesystem,
         OpenError::AlreadyExists => FilesystemError::AlreadyExists,
-        OpenError::TruncateError(error) => filesystem_truncate_error(error),
-        OpenError::PathError(error) => filesystem_path_error(error),
+        OpenError::TruncateError(error) => fs_truncate_error(error),
+        OpenError::PathError(error) => fs_path_error(error),
         _ => FilesystemError::Io,
     }
 }
 
-fn filesystem_read_error(error: ReadError) -> FilesystemError {
+fn fs_read_error(error: ReadError) -> FilesystemError {
     match error {
         ReadError::NotAFile => FilesystemError::NotFile,
         ReadError::NotForReading => FilesystemError::NotForReading,
@@ -550,7 +547,7 @@ fn filesystem_read_error(error: ReadError) -> FilesystemError {
     }
 }
 
-fn filesystem_write_error(error: WriteError) -> FilesystemError {
+fn fs_write_error(error: WriteError) -> FilesystemError {
     match error {
         WriteError::NotAFile => FilesystemError::NotFile,
         WriteError::NotForWriting => FilesystemError::NotForWriting,
@@ -558,7 +555,7 @@ fn filesystem_write_error(error: WriteError) -> FilesystemError {
     }
 }
 
-fn filesystem_seek_error(error: SeekError) -> FilesystemError {
+fn fs_seek_error(error: SeekError) -> FilesystemError {
     match error {
         SeekError::NotAFile => FilesystemError::NotFile,
         SeekError::InvalidOffset => FilesystemError::InvalidOffset,
@@ -567,7 +564,7 @@ fn filesystem_seek_error(error: SeekError) -> FilesystemError {
     }
 }
 
-fn filesystem_truncate_error(error: TruncateError) -> FilesystemError {
+fn fs_truncate_error(error: TruncateError) -> FilesystemError {
     match error {
         TruncateError::IsDirectory => FilesystemError::IsDirectory,
         TruncateError::NotForWriting => FilesystemError::NotForWriting,
@@ -576,66 +573,66 @@ fn filesystem_truncate_error(error: TruncateError) -> FilesystemError {
     }
 }
 
-fn filesystem_chmod_error(error: ChmodError) -> FilesystemError {
+fn fs_chmod_error(error: ChmodError) -> FilesystemError {
     match error {
         ChmodError::NotTheOwner => FilesystemError::NotOwner,
         ChmodError::ReadOnlyFileSystem => FilesystemError::ReadOnlyFilesystem,
-        ChmodError::PathError(error) => filesystem_path_error(error),
+        ChmodError::PathError(error) => fs_path_error(error),
         _ => FilesystemError::Io,
     }
 }
 
-fn filesystem_chown_error(error: ChownError) -> FilesystemError {
+fn fs_chown_error(error: ChownError) -> FilesystemError {
     match error {
         ChownError::NotTheOwner => FilesystemError::NotOwner,
         ChownError::ReadOnlyFileSystem => FilesystemError::ReadOnlyFilesystem,
-        ChownError::PathError(error) => filesystem_path_error(error),
+        ChownError::PathError(error) => fs_path_error(error),
         _ => FilesystemError::Io,
     }
 }
 
-fn filesystem_unlink_error(error: UnlinkError) -> FilesystemError {
+fn fs_unlink_error(error: UnlinkError) -> FilesystemError {
     match error {
         UnlinkError::NoWritePerms => FilesystemError::NoWritePermissions,
         UnlinkError::IsADirectory => FilesystemError::IsDirectory,
         UnlinkError::ReadOnlyFileSystem => FilesystemError::ReadOnlyFilesystem,
-        UnlinkError::PathError(error) => filesystem_path_error(error),
+        UnlinkError::PathError(error) => fs_path_error(error),
         _ => FilesystemError::Io,
     }
 }
 
-fn filesystem_mkdir_error(error: MkdirError) -> FilesystemError {
+fn fs_mkdir_error(error: MkdirError) -> FilesystemError {
     match error {
         MkdirError::NoWritePerms => FilesystemError::NoWritePermissions,
         MkdirError::AlreadyExists => FilesystemError::AlreadyExists,
         MkdirError::ReadOnlyFileSystem => FilesystemError::ReadOnlyFilesystem,
-        MkdirError::PathError(error) => filesystem_path_error(error),
+        MkdirError::PathError(error) => fs_path_error(error),
         _ => FilesystemError::Io,
     }
 }
 
-fn filesystem_rmdir_error(error: RmdirError) -> FilesystemError {
+fn fs_rmdir_error(error: RmdirError) -> FilesystemError {
     match error {
         RmdirError::NoWritePerms => FilesystemError::NoWritePermissions,
         RmdirError::Busy => FilesystemError::Busy,
         RmdirError::NotEmpty => FilesystemError::NotEmpty,
         RmdirError::NotADirectory => FilesystemError::NotDirectory,
         RmdirError::ReadOnlyFileSystem => FilesystemError::ReadOnlyFilesystem,
-        RmdirError::PathError(error) => filesystem_path_error(error),
+        RmdirError::PathError(error) => fs_path_error(error),
         _ => FilesystemError::Io,
     }
 }
 
-fn filesystem_read_dir_error(error: ReadDirError) -> FilesystemError {
+fn fs_read_dir_error(error: ReadDirError) -> FilesystemError {
     match error {
         ReadDirError::NotADirectory => FilesystemError::NotDirectory,
         _ => FilesystemError::Io,
     }
 }
 
-fn filesystem_file_status_error(error: FileStatusError) -> FilesystemError {
+fn fs_file_status_error(error: FileStatusError) -> FilesystemError {
     match error {
-        FileStatusError::PathError(error) => filesystem_path_error(error),
+        FileStatusError::PathError(error) => fs_path_error(error),
         _ => FilesystemError::Io,
     }
 }

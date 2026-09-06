@@ -1330,7 +1330,7 @@ fn test_broker_with_policy(
         random_provider: Arc::new(crate::random::TestRandomProvider),
         stdio_provider: Arc::new(crate::stdio::UnsupportedStdioProvider),
         socket_provider,
-        filesystem_provider: Arc::new(crate::filesystem::UnsupportedFilesystemProvider),
+        fs_provider: Arc::new(crate::fs::UnsupportedFilesystemProvider),
         socket_ports: BrokerSocketPorts::default(),
     }
 }

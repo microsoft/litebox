@@ -34,11 +34,11 @@ fn run_rewritten_fixture_with_options(
         );
         let mut command = std::process::Command::new(broker_path);
         command
-            .arg("--filesystem-program")
+            .arg("--fs-program")
             .arg(&target)
-            .arg("--filesystem-rewrite-syscalls");
+            .arg("--fs-rewrite-syscalls");
         if cfg!(feature = "aarch64_virtualize_x18") {
-            command.arg("--filesystem-virtualize-x18");
+            command.arg("--fs-virtualize-x18");
         }
         command.arg("--runner").arg(&binary_path);
         command

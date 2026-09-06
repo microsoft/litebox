@@ -630,7 +630,7 @@ mod tests {
     use alloc::vec;
 
     #[test]
-    fn filesystem_errors_have_unique_stable_wire_values() {
+    fn fs_errors_have_unique_stable_wire_values() {
         let errors = [
             FilesystemError::AccessNotAllowed,
             FilesystemError::NoWritePermissions,

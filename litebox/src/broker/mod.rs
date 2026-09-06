@@ -12,7 +12,7 @@ use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{ConsumeEventResponse, EventConsumeMode};
-use litebox_broker_protocol::filesystem::{
+use litebox_broker_protocol::fs::{
     FilesystemDirectoryEntry, FilesystemError, FilesystemFileStatus, FilesystemNamespace,
     FilesystemSeekWhence, FilesystemUser, MAX_FILESYSTEM_TRANSFER_SIZE,
 };
@@ -365,7 +365,7 @@ pub(crate) struct BrokerLocalControl<
     pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
     slot_allocator: SlotAllocator<Platform>,
     stdio_read_lock: Mutex<Platform, ()>,
-    filesystem_directory_lock: Mutex<Platform, ()>,
+    fs_directory_lock: Mutex<Platform, ()>,
 }
 
 impl<Platform, Channel> BrokerLocalControl<Platform, Channel>
@@ -382,7 +382,7 @@ where
             pollable_registry,
             slot_allocator: SlotAllocator::new(),
             stdio_read_lock: Mutex::new(()),
-            filesystem_directory_lock: Mutex::new(()),
+            fs_directory_lock: Mutex::new(()),
         }
     }
 
@@ -735,7 +735,7 @@ where
     ) -> core::result::Result<core::result::Result<ObjectHandle, FilesystemError>, BrokerControlError>
     {
         let path = path.as_bytes();
-        let length = filesystem_transfer_length(path.len())?;
+        let length = fs_transfer_length(path.len())?;
         let lease = self.acquire_shared_buffer(length)?;
         self.request(|local| {
             local.open_file(namespace, lease.descriptor(), path, user, flags, mode)
@@ -749,8 +749,7 @@ where
         offset: Option<u64>,
     ) -> core::result::Result<core::result::Result<usize, FilesystemError>, BrokerControlError>
     {
-        let length =
-            filesystem_transfer_length(data.len().min(MAX_FILESYSTEM_TRANSFER_SIZE as usize))?;
+        let length = fs_transfer_length(data.len().min(MAX_FILESYSTEM_TRANSFER_SIZE as usize))?;
         let data = &mut data[..length as usize];
         let lease = self.acquire_shared_buffer(length)?;
         self.request(|local| local.read_file(handle, lease.descriptor(), data, offset))
@@ -763,8 +762,7 @@ where
         offset: Option<u64>,
     ) -> core::result::Result<core::result::Result<usize, FilesystemError>, BrokerControlError>
     {
-        let length =
-            filesystem_transfer_length(data.len().min(MAX_FILESYSTEM_TRANSFER_SIZE as usize))?;
+        let length = fs_transfer_length(data.len().min(MAX_FILESYSTEM_TRANSFER_SIZE as usize))?;
         let data = &data[..length as usize];
         let lease = self.acquire_shared_buffer(length)?;
         self.request(|local| local.write_file(handle, lease.descriptor(), data, offset))
@@ -795,7 +793,7 @@ where
         core::result::Result<Vec<FilesystemDirectoryEntry>, FilesystemError>,
         BrokerControlError,
     > {
-        let _directory_guard = self.filesystem_directory_lock.lock();
+        let _directory_guard = self.fs_directory_lock.lock();
         let mut entries = Vec::new();
         let mut start_index = 0;
         loop {
@@ -831,7 +829,7 @@ where
         BrokerControlError,
     > {
         let path = path.as_bytes();
-        let lease = self.acquire_shared_buffer(filesystem_transfer_length(path.len())?)?;
+        let lease = self.acquire_shared_buffer(fs_transfer_length(path.len())?)?;
         self.request(|local| local.path_file_status(namespace, lease.descriptor(), path, user))
     }
 
@@ -853,7 +851,7 @@ where
         mode: u32,
     ) -> core::result::Result<core::result::Result<(), FilesystemError>, BrokerControlError> {
         let path = path.as_bytes();
-        let lease = self.acquire_shared_buffer(filesystem_transfer_length(path.len())?)?;
+        let lease = self.acquire_shared_buffer(fs_transfer_length(path.len())?)?;
         self.request(|local| local.chmod_file(namespace, lease.descriptor(), path, user, mode))
     }
 
@@ -866,7 +864,7 @@ where
         group: Option<u16>,
     ) -> core::result::Result<core::result::Result<(), FilesystemError>, BrokerControlError> {
         let path = path.as_bytes();
-        let lease = self.acquire_shared_buffer(filesystem_transfer_length(path.len())?)?;
+        let lease = self.acquire_shared_buffer(fs_transfer_length(path.len())?)?;
         self.request(|local| {
             local.chown_file(
                 namespace,
@@ -886,7 +884,7 @@ where
         user: FilesystemUser,
     ) -> core::result::Result<core::result::Result<(), FilesystemError>, BrokerControlError> {
         let path = path.as_bytes();
-        let lease = self.acquire_shared_buffer(filesystem_transfer_length(path.len())?)?;
+        let lease = self.acquire_shared_buffer(fs_transfer_length(path.len())?)?;
         self.request(|local| local.unlink_file(namespace, lease.descriptor(), path, user))
     }
 
@@ -898,7 +896,7 @@ where
         mode: u32,
     ) -> core::result::Result<core::result::Result<(), FilesystemError>, BrokerControlError> {
         let path = path.as_bytes();
-        let lease = self.acquire_shared_buffer(filesystem_transfer_length(path.len())?)?;
+        let lease = self.acquire_shared_buffer(fs_transfer_length(path.len())?)?;
         self.request(|local| local.mkdir_file(namespace, lease.descriptor(), path, user, mode))
     }
 
@@ -909,7 +907,7 @@ where
         user: FilesystemUser,
     ) -> core::result::Result<core::result::Result<(), FilesystemError>, BrokerControlError> {
         let path = path.as_bytes();
-        let lease = self.acquire_shared_buffer(filesystem_transfer_length(path.len())?)?;
+        let lease = self.acquire_shared_buffer(fs_transfer_length(path.len())?)?;
         self.request(|local| local.rmdir_file(namespace, lease.descriptor(), path, user))
     }
 
@@ -922,7 +920,7 @@ where
     }
 }
 
-fn filesystem_transfer_length(length: usize) -> core::result::Result<u32, BrokerControlError> {
+fn fs_transfer_length(length: usize) -> core::result::Result<u32, BrokerControlError> {
     if length > MAX_FILESYSTEM_TRANSFER_SIZE as usize {
         return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
     }

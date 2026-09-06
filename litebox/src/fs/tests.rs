@@ -71,7 +71,7 @@ fn overlay_fs(
 }
 
 #[test]
-fn local_descriptor_uses_the_filesystem_that_opened_it() {
+fn local_descriptor_uses_the_opening_fs() {
     let context = crate::fs::resolver::Context::new();
     let litebox = crate::LiteBox::new(crate::platform::mock::MockPlatform::new());
     let owner = in_mem_fs(&litebox);

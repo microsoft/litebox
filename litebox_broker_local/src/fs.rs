@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::error::ErrorCode;
-use litebox_broker_protocol::filesystem::{
+use litebox_broker_protocol::fs::{
     ChmodFileRequest, ChownFileRequest, FilesystemDirectoryEntry, FilesystemError,
     FilesystemFileStatus, FilesystemNamespace, FilesystemSeekWhence, FilesystemUser,
     HandleFileStatusRequest, MAX_FILESYSTEM_TRANSFER_SIZE, MkdirFileRequest, OpenFileRequest,
@@ -21,8 +21,8 @@ use litebox_broker_transport::channel::LocalCallChannel;
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
 
-type FilesystemResult<T> = core::result::Result<T, FilesystemError>;
-type DirectoryReadResult = FilesystemResult<(Vec<FilesystemDirectoryEntry>, Option<u64>)>;
+type FsResult<T> = core::result::Result<T, FilesystemError>;
+type DirectoryReadResult = FsResult<(Vec<FilesystemDirectoryEntry>, Option<u64>)>;
 
 impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     /// Opens an absolute filesystem path.
@@ -39,9 +39,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         user: FilesystemUser,
         flags: u32,
         mode: u32,
-    ) -> Result<FilesystemResult<ObjectHandle>, Channel::Error> {
-        self.write_filesystem_buffer(path_buffer, path)?;
-        match self.request_filesystem(FilesystemRequest::Open(OpenFileRequest {
+    ) -> Result<FsResult<ObjectHandle>, Channel::Error> {
+        self.write_fs_buffer(path_buffer, path)?;
+        match self.request_fs(FilesystemRequest::Open(OpenFileRequest {
             namespace,
             path: path_buffer,
             user,
@@ -66,9 +66,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         buffer: SharedBufferDescriptor,
         destination: &mut [u8],
         offset: Option<u64>,
-    ) -> Result<FilesystemResult<usize>, Channel::Error> {
-        self.validate_filesystem_buffer(buffer, destination.len())?;
-        match self.request_filesystem(FilesystemRequest::Read(ReadFileRequest {
+    ) -> Result<FsResult<usize>, Channel::Error> {
+        self.validate_fs_buffer(buffer, destination.len())?;
+        match self.request_fs(FilesystemRequest::Read(ReadFileRequest {
             handle,
             buffer,
             offset,
@@ -101,9 +101,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         buffer: SharedBufferDescriptor,
         data: &[u8],
         offset: Option<u64>,
-    ) -> Result<FilesystemResult<usize>, Channel::Error> {
-        self.write_filesystem_buffer(buffer, data)?;
-        match self.request_filesystem(FilesystemRequest::Write(WriteFileRequest {
+    ) -> Result<FsResult<usize>, Channel::Error> {
+        self.write_fs_buffer(buffer, data)?;
+        match self.request_fs(FilesystemRequest::Write(WriteFileRequest {
             handle,
             buffer,
             offset,
@@ -133,8 +133,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         handle: ObjectHandle,
         offset: i64,
         whence: FilesystemSeekWhence,
-    ) -> Result<FilesystemResult<u64>, Channel::Error> {
-        match self.request_filesystem(FilesystemRequest::Seek(SeekFileRequest {
+    ) -> Result<FsResult<u64>, Channel::Error> {
+        match self.request_fs(FilesystemRequest::Seek(SeekFileRequest {
             handle,
             offset,
             whence,
@@ -156,8 +156,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         handle: ObjectHandle,
         length: u64,
         reset_offset: bool,
-    ) -> Result<FilesystemResult<()>, Channel::Error> {
-        match self.request_filesystem(FilesystemRequest::Truncate(TruncateFileRequest {
+    ) -> Result<FsResult<()>, Channel::Error> {
+        match self.request_fs(FilesystemRequest::Truncate(TruncateFileRequest {
             handle,
             length,
             reset_offset,
@@ -182,8 +182,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         buffer: SharedBufferDescriptor,
         start_index: u64,
     ) -> Result<DirectoryReadResult, Channel::Error> {
-        self.validate_filesystem_buffer(buffer, buffer.length as usize)?;
-        match self.request_filesystem(FilesystemRequest::ReadDirectory(ReadDirectoryRequest {
+        self.validate_fs_buffer(buffer, buffer.length as usize)?;
+        match self.request_fs(FilesystemRequest::ReadDirectory(ReadDirectoryRequest {
             handle,
             buffer,
             start_index,
@@ -233,9 +233,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         path_buffer: SharedBufferDescriptor,
         path: &[u8],
         user: FilesystemUser,
-    ) -> Result<FilesystemResult<FilesystemFileStatus>, Channel::Error> {
-        self.write_filesystem_buffer(path_buffer, path)?;
-        match self.request_filesystem(FilesystemRequest::PathStatus(PathFileStatusRequest {
+    ) -> Result<FsResult<FilesystemFileStatus>, Channel::Error> {
+        self.write_fs_buffer(path_buffer, path)?;
+        match self.request_fs(FilesystemRequest::PathStatus(PathFileStatusRequest {
             namespace,
             path: path_buffer,
             user,
@@ -257,8 +257,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn handle_file_status(
         &self,
         handle: ObjectHandle,
-    ) -> Result<FilesystemResult<FilesystemFileStatus>, Channel::Error> {
-        match self.request_filesystem(FilesystemRequest::HandleStatus(HandleFileStatusRequest {
+    ) -> Result<FsResult<FilesystemFileStatus>, Channel::Error> {
+        match self.request_fs(FilesystemRequest::HandleStatus(HandleFileStatusRequest {
             handle,
         }))? {
             FilesystemResponse::Status(status) => Ok(Ok(status)),
@@ -282,9 +282,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         path: &[u8],
         user: FilesystemUser,
         mode: u32,
-    ) -> Result<FilesystemResult<()>, Channel::Error> {
-        self.write_filesystem_buffer(path_buffer, path)?;
-        match self.request_filesystem(FilesystemRequest::Chmod(ChmodFileRequest {
+    ) -> Result<FsResult<()>, Channel::Error> {
+        self.write_fs_buffer(path_buffer, path)?;
+        match self.request_fs(FilesystemRequest::Chmod(ChmodFileRequest {
             namespace,
             path: path_buffer,
             user,
@@ -312,9 +312,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         acting_user: FilesystemUser,
         user: Option<u16>,
         group: Option<u16>,
-    ) -> Result<FilesystemResult<()>, Channel::Error> {
-        self.write_filesystem_buffer(path_buffer, path)?;
-        match self.request_filesystem(FilesystemRequest::Chown(ChownFileRequest {
+    ) -> Result<FsResult<()>, Channel::Error> {
+        self.write_fs_buffer(path_buffer, path)?;
+        match self.request_fs(FilesystemRequest::Chown(ChownFileRequest {
             namespace,
             path: path_buffer,
             acting_user,
@@ -341,9 +341,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         path_buffer: SharedBufferDescriptor,
         path: &[u8],
         user: FilesystemUser,
-    ) -> Result<FilesystemResult<()>, Channel::Error> {
-        self.write_filesystem_buffer(path_buffer, path)?;
-        match self.request_filesystem(FilesystemRequest::Unlink(UnlinkFileRequest {
+    ) -> Result<FsResult<()>, Channel::Error> {
+        self.write_fs_buffer(path_buffer, path)?;
+        match self.request_fs(FilesystemRequest::Unlink(UnlinkFileRequest {
             namespace,
             path: path_buffer,
             user,
@@ -369,9 +369,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         path: &[u8],
         user: FilesystemUser,
         mode: u32,
-    ) -> Result<FilesystemResult<()>, Channel::Error> {
-        self.write_filesystem_buffer(path_buffer, path)?;
-        match self.request_filesystem(FilesystemRequest::Mkdir(MkdirFileRequest {
+    ) -> Result<FsResult<()>, Channel::Error> {
+        self.write_fs_buffer(path_buffer, path)?;
+        match self.request_fs(FilesystemRequest::Mkdir(MkdirFileRequest {
             namespace,
             path: path_buffer,
             user,
@@ -397,9 +397,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         path_buffer: SharedBufferDescriptor,
         path: &[u8],
         user: FilesystemUser,
-    ) -> Result<FilesystemResult<()>, Channel::Error> {
-        self.write_filesystem_buffer(path_buffer, path)?;
-        match self.request_filesystem(FilesystemRequest::Rmdir(RmdirFileRequest {
+    ) -> Result<FsResult<()>, Channel::Error> {
+        self.write_fs_buffer(path_buffer, path)?;
+        match self.request_fs(FilesystemRequest::Rmdir(RmdirFileRequest {
             namespace,
             path: path_buffer,
             user,
@@ -412,7 +412,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    fn validate_filesystem_buffer(
+    fn validate_fs_buffer(
         &self,
         buffer: SharedBufferDescriptor,
         expected_length: usize,
@@ -431,22 +431,19 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         Ok(())
     }
 
-    fn write_filesystem_buffer(
+    fn write_fs_buffer(
         &self,
         buffer: SharedBufferDescriptor,
         data: &[u8],
     ) -> Result<(), Channel::Error> {
-        self.validate_filesystem_buffer(buffer, data.len())?;
+        self.validate_fs_buffer(buffer, data.len())?;
         self.shared_buffers
             .write(buffer.slot_index, data)
             .expect("validated shared filesystem write range must be accessible");
         Ok(())
     }
 
-    fn request_filesystem(
-        &self,
-        request: FilesystemRequest,
-    ) -> Result<FilesystemResponse, Channel::Error> {
+    fn request_fs(&self, request: FilesystemRequest) -> Result<FilesystemResponse, Channel::Error> {
         match self.request(BrokerOperation::Filesystem(request))? {
             BrokerResult::Filesystem(response) => Ok(response),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),

@@ -4,14 +4,14 @@
 use std::sync::Arc;
 
 use litebox_broker_core::AssociationCancellation;
-use litebox_broker_core::filesystem::FilesystemProvider;
+use litebox_broker_core::fs::FilesystemProvider;
 use litebox_broker_core::fs::{
     Mode, NamespacedFilesystemProvider, OFlags, create_windows_registry_provider,
 };
 use litebox_broker_core::random::{RandomProvider, RandomProviderError};
 use litebox_broker_core::stdio::UnsupportedStdioProvider;
 use litebox_broker_platform_linux_userland::LinuxSyncPrimitivesProvider;
-use litebox_broker_protocol::filesystem::{FilesystemError, FilesystemNamespace, FilesystemUser};
+use litebox_broker_protocol::fs::{FilesystemError, FilesystemNamespace, FilesystemUser};
 
 struct TestRandomProvider;
 
@@ -31,7 +31,7 @@ fn empty_provider() -> Arc<dyn FilesystemProvider> {
 }
 
 #[test]
-fn filesystem_namespaces_are_isolated() {
+fn fs_namespaces_are_isolated() {
     let provider = NamespacedFilesystemProvider::new(empty_provider(), empty_provider());
     let cancellation = AssociationCancellation::default();
     let user = FilesystemUser { user: 0, group: 0 };

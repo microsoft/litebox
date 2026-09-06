@@ -296,7 +296,7 @@ def prepare_litebox_rootfs(
 
     The packager discovers shared-library dependencies via ldd, rewrites all
     ELF files with the syscall rewriter, and produces a tar suitable for
-    ``--filesystem-initial-files``.  The rewritten main binary is also
+    ``--fs-initial-files``.  The rewritten main binary is also
     extracted for the ``execl`` benchmark's self-exec setup.
 
     Returns (tar_path, guest_program_path) or None on failure.
@@ -438,7 +438,7 @@ def run_litebox(
 
     cmd = [
         str(broker_path),
-        "--filesystem-initial-files", str(tar_path),
+        "--fs-initial-files", str(tar_path),
         "--runner", str(runner_path),
         "--",
         "--env", "LD_LIBRARY_PATH=/lib64:/lib32:/lib",
@@ -492,7 +492,7 @@ def run_litebox_windows(
     broker_path = runner_path.with_name("litebox-broker-userland.exe")
     cmd = [
         str(broker_path),
-        "--filesystem-initial-files", str(tar_path),
+        "--fs-initial-files", str(tar_path),
         "--runner", str(runner_path),
         "--",
         "--env", "LD_LIBRARY_PATH=/lib64:/lib32:/lib",

@@ -11,7 +11,7 @@ use std::process::Child;
 use std::sync::Arc;
 use std::time::Instant;
 
-use litebox_broker_core::filesystem::FilesystemProvider;
+use litebox_broker_core::fs::FilesystemProvider;
 use litebox_broker_core::fs::composer::Composer;
 use litebox_broker_core::fs::in_mem::{InMem, InitialNode};
 use litebox_broker_core::fs::overlay::Overlay;
@@ -64,7 +64,7 @@ pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
     let control_listener = WindowsNamedPipeListener::bind(&control_pipe)?;
     let random_provider = Arc::new(UserlandRandomProvider);
     let stdio_provider = Arc::new(UserlandStdioProvider::new()?);
-    let filesystem_provider = create_filesystem_provider(
+    let fs_provider = create_fs_provider(
         &args,
         Arc::clone(&random_provider) as Arc<dyn litebox_broker_core::random::RandomProvider>,
         Arc::clone(&stdio_provider) as Arc<dyn litebox_broker_core::stdio::StdioProvider>,
@@ -76,7 +76,7 @@ pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
         Arc::new(UnsupportedSocketProvider),
         random_provider,
         stdio_provider,
-        filesystem_provider,
+        fs_provider,
     )?;
 
     crate::run_runner_process(&args, &control_pipe, None, |runner, runner_process_id| {
@@ -84,22 +84,19 @@ pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
     })
 }
 
-fn create_filesystem_provider(
+fn create_fs_provider(
     args: &super::CliArgs,
     random: Arc<dyn litebox_broker_core::random::RandomProvider>,
     stdio: Arc<dyn litebox_broker_core::stdio::StdioProvider>,
 ) -> Result<Arc<dyn FilesystemProvider>, Box<dyn Error>> {
-    if args.filesystem_program.is_some()
-        || args.filesystem_rewrite_syscalls
-        || args.filesystem_virtualize_x18
-    {
+    if args.fs_program.is_some() || args.fs_rewrite_syscalls || args.fs_virtualize_x18 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "Windows broker filesystems require the program to be supplied in the initial tar",
         )
         .into());
     }
-    let tar_data = match args.filesystem_initial_files.as_deref() {
+    let tar_data = match args.fs_initial_files.as_deref() {
         Some(path) => {
             if path.extension().and_then(|extension| extension.to_str()) != Some("tar") {
                 return Err(std::io::Error::new(

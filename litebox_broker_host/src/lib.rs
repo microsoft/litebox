@@ -27,7 +27,7 @@ use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_core::{BrokerCore, BrokerSession, CallerCredential};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse};
-use litebox_broker_protocol::filesystem::{
+use litebox_broker_protocol::fs::{
     ChmodFileRequest, ChownFileRequest, HandleFileStatusRequest, MAX_FILESYSTEM_TRANSFER_SIZE,
     MkdirFileRequest, OpenFileRequest, OpenFileResponse, PathFileStatusRequest,
     ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest, ReadFileResponse,
@@ -409,13 +409,12 @@ fn handle_request<Memory: SharedMemory>(
             handle_stdio_request(session, request, shared_buffers).map(BrokerResult::Stdio)
         }
         BrokerOperation::Filesystem(request) => {
-            handle_filesystem_request(session, request, shared_buffers)
-                .map(BrokerResult::Filesystem)
+            handle_fs_request(session, request, shared_buffers).map(BrokerResult::Filesystem)
         }
     }
 }
 
-fn handle_filesystem_request<Memory: SharedMemory>(
+fn handle_fs_request<Memory: SharedMemory>(
     session: &BrokerSession,
     request: FilesystemRequest,
     shared_buffers: &SharedBufferPool<Memory>,
@@ -428,11 +427,9 @@ fn handle_filesystem_request<Memory: SharedMemory>(
             flags,
             mode,
         }) => {
-            let path = read_filesystem_path(shared_buffers, path)?;
-            match litebox_broker_core::filesystem::open(
-                session, namespace, &path, user, flags, mode,
-            )
-            .map_err(RequestFailure::from)?
+            let path = read_fs_path(shared_buffers, path)?;
+            match litebox_broker_core::fs::open(session, namespace, &path, user, flags, mode)
+                .map_err(RequestFailure::from)?
             {
                 Ok(handle) => Ok(FilesystemResponse::Open(OpenFileResponse { handle })),
                 Err(error) => Ok(FilesystemResponse::Failed(error)),
@@ -443,9 +440,9 @@ fn handle_filesystem_request<Memory: SharedMemory>(
             buffer,
             offset,
         }) => {
-            validate_filesystem_buffer(buffer)?;
+            validate_fs_buffer(buffer)?;
             let mut data = allocate_zeroed(buffer.length)?;
-            match litebox_broker_core::filesystem::read(session, handle, &mut data, offset)
+            match litebox_broker_core::fs::read(session, handle, &mut data, offset)
                 .map_err(RequestFailure::from)?
             {
                 Ok(read) => {
@@ -465,9 +462,9 @@ fn handle_filesystem_request<Memory: SharedMemory>(
             buffer,
             offset,
         }) => {
-            validate_filesystem_buffer(buffer)?;
+            validate_fs_buffer(buffer)?;
             let data = read_shared_buffer(shared_buffers, buffer)?;
-            match litebox_broker_core::filesystem::write(session, handle, &data, offset)
+            match litebox_broker_core::fs::write(session, handle, &data, offset)
                 .map_err(RequestFailure::from)?
             {
                 Ok(written) => Ok(FilesystemResponse::Write(WriteFileResponse {
@@ -481,7 +478,7 @@ fn handle_filesystem_request<Memory: SharedMemory>(
             handle,
             offset,
             whence,
-        }) => match litebox_broker_core::filesystem::seek(session, handle, offset, whence)
+        }) => match litebox_broker_core::fs::seek(session, handle, offset, whence)
             .map_err(RequestFailure::from)?
         {
             Ok(offset) => Ok(FilesystemResponse::Seek(SeekFileResponse { offset })),
@@ -492,7 +489,7 @@ fn handle_filesystem_request<Memory: SharedMemory>(
             length,
             reset_offset,
         }) => {
-            match litebox_broker_core::filesystem::truncate(session, handle, length, reset_offset)
+            match litebox_broker_core::fs::truncate(session, handle, length, reset_offset)
                 .map_err(RequestFailure::from)?
             {
                 Ok(()) => Ok(FilesystemResponse::Truncate),
@@ -504,8 +501,8 @@ fn handle_filesystem_request<Memory: SharedMemory>(
             buffer,
             start_index,
         }) => {
-            validate_filesystem_buffer(buffer)?;
-            let (entries, next_index) = match litebox_broker_core::filesystem::read_directory(
+            validate_fs_buffer(buffer)?;
+            let (entries, next_index) = match litebox_broker_core::fs::read_directory(
                 session,
                 handle,
                 start_index,
@@ -535,9 +532,9 @@ fn handle_filesystem_request<Memory: SharedMemory>(
             path,
             user,
         }) => {
-            let path = read_filesystem_path(shared_buffers, path)?;
+            let path = read_fs_path(shared_buffers, path)?;
             Ok(
-                match litebox_broker_core::filesystem::path_status(session, namespace, &path, user)
+                match litebox_broker_core::fs::path_status(session, namespace, &path, user)
                     .map_err(RequestFailure::from)?
                 {
                     Ok(status) => FilesystemResponse::Status(status),
@@ -546,7 +543,7 @@ fn handle_filesystem_request<Memory: SharedMemory>(
             )
         }
         FilesystemRequest::HandleStatus(HandleFileStatusRequest { handle }) => {
-            match litebox_broker_core::filesystem::handle_status(session, handle)
+            match litebox_broker_core::fs::handle_status(session, handle)
                 .map_err(RequestFailure::from)?
             {
                 Ok(status) => Ok(FilesystemResponse::Status(status)),
@@ -559,9 +556,9 @@ fn handle_filesystem_request<Memory: SharedMemory>(
             user,
             mode,
         }) => {
-            let path = read_filesystem_path(shared_buffers, path)?;
+            let path = read_fs_path(shared_buffers, path)?;
             Ok(
-                match litebox_broker_core::filesystem::chmod(session, namespace, &path, user, mode)
+                match litebox_broker_core::fs::chmod(session, namespace, &path, user, mode)
                     .map_err(RequestFailure::from)?
                 {
                     Ok(()) => FilesystemResponse::Chmod,
@@ -576,9 +573,9 @@ fn handle_filesystem_request<Memory: SharedMemory>(
             user,
             group,
         }) => {
-            let path = read_filesystem_path(shared_buffers, path)?;
+            let path = read_fs_path(shared_buffers, path)?;
             Ok(
-                match litebox_broker_core::filesystem::chown(
+                match litebox_broker_core::fs::chown(
                     session,
                     namespace,
                     &path,
@@ -598,9 +595,9 @@ fn handle_filesystem_request<Memory: SharedMemory>(
             path,
             user,
         }) => {
-            let path = read_filesystem_path(shared_buffers, path)?;
+            let path = read_fs_path(shared_buffers, path)?;
             Ok(
-                match litebox_broker_core::filesystem::unlink(session, namespace, &path, user)
+                match litebox_broker_core::fs::unlink(session, namespace, &path, user)
                     .map_err(RequestFailure::from)?
                 {
                     Ok(()) => FilesystemResponse::Unlink,
@@ -614,9 +611,9 @@ fn handle_filesystem_request<Memory: SharedMemory>(
             user,
             mode,
         }) => {
-            let path = read_filesystem_path(shared_buffers, path)?;
+            let path = read_fs_path(shared_buffers, path)?;
             Ok(
-                match litebox_broker_core::filesystem::mkdir(session, namespace, &path, user, mode)
+                match litebox_broker_core::fs::mkdir(session, namespace, &path, user, mode)
                     .map_err(RequestFailure::from)?
                 {
                     Ok(()) => FilesystemResponse::Mkdir,
@@ -629,9 +626,9 @@ fn handle_filesystem_request<Memory: SharedMemory>(
             path,
             user,
         }) => {
-            let path = read_filesystem_path(shared_buffers, path)?;
+            let path = read_fs_path(shared_buffers, path)?;
             Ok(
-                match litebox_broker_core::filesystem::rmdir(session, namespace, &path, user)
+                match litebox_broker_core::fs::rmdir(session, namespace, &path, user)
                     .map_err(RequestFailure::from)?
                 {
                     Ok(()) => FilesystemResponse::Rmdir,
@@ -642,7 +639,7 @@ fn handle_filesystem_request<Memory: SharedMemory>(
     }
 }
 
-fn validate_filesystem_buffer(buffer: SharedBufferDescriptor) -> RequestResult<()> {
+fn validate_fs_buffer(buffer: SharedBufferDescriptor) -> RequestResult<()> {
     if buffer.length > MAX_FILESYSTEM_TRANSFER_SIZE {
         return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
     }
@@ -661,7 +658,7 @@ fn read_shared_buffer<Memory: SharedMemory>(
     shared_buffers: &SharedBufferPool<Memory>,
     buffer: SharedBufferDescriptor,
 ) -> RequestResult<Vec<u8>> {
-    validate_filesystem_buffer(buffer)?;
+    validate_fs_buffer(buffer)?;
     let mut data = allocate_zeroed(buffer.length)?;
     shared_buffers
         .read(buffer.slot_index, &mut data)
@@ -669,7 +666,7 @@ fn read_shared_buffer<Memory: SharedMemory>(
     Ok(data)
 }
 
-fn read_filesystem_path<Memory: SharedMemory>(
+fn read_fs_path<Memory: SharedMemory>(
     shared_buffers: &SharedBufferPool<Memory>,
     buffer: SharedBufferDescriptor,
 ) -> RequestResult<alloc::string::String> {
@@ -1366,7 +1363,7 @@ mod tests {
             Arc::new(TestSocketProvider),
             Arc::new(TestRandomProvider),
             Arc::clone(&stdio_provider) as Arc<dyn StdioProvider>,
-            Arc::new(litebox_broker_core::filesystem::UnsupportedFilesystemProvider),
+            Arc::new(litebox_broker_core::fs::UnsupportedFilesystemProvider),
         )
         .unwrap();
 

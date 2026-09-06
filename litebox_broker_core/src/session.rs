@@ -5,7 +5,7 @@ use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::event::EventObject;
-use crate::filesystem::OpenFileDescription;
+use crate::fs::OpenFileDescription;
 use crate::pipe::PipeObject;
 use crate::socket::SocketObject;
 use crate::{BrokerCore, BrokerError, Result};
@@ -722,7 +722,7 @@ mod tests {
             socket_provider.clone(),
             Arc::new(crate::random::TestRandomProvider),
             Arc::new(crate::stdio::UnsupportedStdioProvider),
-            Arc::new(crate::filesystem::UnsupportedFilesystemProvider),
+            Arc::new(crate::fs::UnsupportedFilesystemProvider),
         )
         .unwrap();
 

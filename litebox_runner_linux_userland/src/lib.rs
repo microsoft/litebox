@@ -78,11 +78,11 @@ pub struct CliArgs {
     pub broker_proxy_url: Option<String>,
     /// Broker declaration that filesystem binaries use AArch64 x18 virtualization.
     #[arg(
-        long = "broker-filesystem-virtualize-x18",
+        long = "broker-fs-virtualize-x18",
         hide = true,
         requires = "broker_control_channel"
     )]
-    pub broker_filesystem_virtualize_x18: bool,
+    pub broker_fs_virtualize_x18: bool,
 }
 
 /// Run Linux programs with LiteBox on unmodified Linux
@@ -99,7 +99,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         ));
     }
     #[cfg(target_arch = "aarch64")]
-    if cli_args.broker_filesystem_virtualize_x18 != cfg!(feature = "aarch64_virtualize_x18") {
+    if cli_args.broker_fs_virtualize_x18 != cfg!(feature = "aarch64_virtualize_x18") {
         return Err(anyhow!(
             "broker filesystem x18 virtualization must match the runner build"
         ));
@@ -267,12 +267,12 @@ mod tests {
             "--unstable",
             "--broker-control-channel",
             "broker.sock",
-            "--broker-filesystem-virtualize-x18",
+            "--broker-fs-virtualize-x18",
             "/bin/true",
         ])
         .unwrap();
 
-        assert!(args.broker_filesystem_virtualize_x18);
+        assert!(args.broker_fs_virtualize_x18);
     }
 
     #[test]

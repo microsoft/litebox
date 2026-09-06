@@ -112,19 +112,19 @@ struct CliArgs {
     runner: PathBuf,
     /// Host program to populate into the broker-owned filesystem.
     #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::ExecutablePath)]
-    filesystem_program: Option<PathBuf>,
+    fs_program: Option<PathBuf>,
     /// Tar archive to mount as the broker-owned initial filesystem.
     #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
-    filesystem_initial_files: Option<PathBuf>,
+    fs_initial_files: Option<PathBuf>,
     /// Rewrite the host program before adding it to the broker-owned filesystem.
-    #[arg(long, requires = "filesystem_program")]
-    filesystem_rewrite_syscalls: bool,
+    #[arg(long, requires = "fs_program")]
+    fs_rewrite_syscalls: bool,
     /// Declare that AArch64 filesystem binaries use x18 virtualization.
     ///
     /// When rewriting a host program, this also enables x18 virtualization in
     /// the syscall rewriter.
     #[arg(long)]
-    filesystem_virtualize_x18: bool,
+    fs_virtualize_x18: bool,
     /// Arguments to pass to the local runner.
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true, value_hint = clap::ValueHint::CommandWithArguments)]
     runner_arguments: Vec<OsString>,
@@ -141,8 +141,8 @@ fn run_runner_process(
         .arg("--unstable")
         .arg("--broker-control-channel")
         .arg(control_channel);
-    if args.filesystem_virtualize_x18 {
-        command.arg("--broker-filesystem-virtualize-x18");
+    if args.fs_virtualize_x18 {
+        command.arg("--broker-fs-virtualize-x18");
     }
     if let Some(proxy_url) = proxy_url {
         command.arg("--broker-proxy-url").arg(proxy_url);
@@ -668,7 +668,7 @@ mod cli_tests {
     fn cli_forwards_runner_options_after_delimiter() {
         let args = CliArgs::try_parse_from([
             "litebox-broker-userland",
-            "--filesystem-initial-files",
+            "--fs-initial-files",
             "rootfs.tar",
             "--runner",
             "runner",
@@ -889,7 +889,7 @@ mod tests {
                 Arc::new(UnsupportedSocketProvider),
                 Arc::new(random::UserlandRandomProvider),
                 stdio_provider,
-                Arc::new(litebox_broker_core::filesystem::UnsupportedFilesystemProvider),
+                Arc::new(litebox_broker_core::fs::UnsupportedFilesystemProvider),
             )
             .unwrap();
             let shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();

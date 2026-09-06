@@ -631,7 +631,7 @@ fn run_rewritten_node(ctx: BenchCtx<'_>) -> Result<()> {
         let program = sh.current_dir().join("node_rewritten");
         cmd!(
             sh,
-            "{broker} --filesystem-program {program} --filesystem-initial-files {tar_file} --runner {runner} -- --env HOME=/ {program} hello_world.js"
+            "{broker} --fs-program {program} --fs-initial-files {tar_file} --runner {runner} -- --env HOME=/ {program} hello_world.js"
         )
         .run()?;
     }

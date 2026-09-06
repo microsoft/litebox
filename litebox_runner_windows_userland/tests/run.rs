@@ -167,7 +167,7 @@ fn brokered_windows_runner_command(initial_files: &std::path::Path) -> std::proc
     let (broker, runner) = build_windows_broker();
     let mut command = std::process::Command::new(broker);
     command
-        .arg("--filesystem-initial-files")
+        .arg("--fs-initial-files")
         .arg(initial_files)
         .arg("--runner")
         .arg(runner);

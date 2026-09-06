@@ -61,7 +61,7 @@ fn spawn_host(
             Arc::new(UnsupportedSocketProvider),
             Arc::new(FailingRandomProvider),
             Arc::new(UnsupportedStdioProvider),
-            Arc::new(litebox_broker_core::filesystem::UnsupportedFilesystemProvider),
+            Arc::new(litebox_broker_core::fs::UnsupportedFilesystemProvider),
         )
         .unwrap();
         let shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();
@@ -146,7 +146,7 @@ fn host_serves_control_requests_and_notifications_over_shared_rings() {
         Arc::new(UnsupportedSocketProvider),
         Arc::new(FailingRandomProvider),
         Arc::new(UnsupportedStdioProvider),
-        Arc::new(litebox_broker_core::filesystem::UnsupportedFilesystemProvider),
+        Arc::new(litebox_broker_core::fs::UnsupportedFilesystemProvider),
     )
     .unwrap();
     let (local_control, host_control) = UnixStream::pair().unwrap();

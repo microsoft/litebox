@@ -28,7 +28,7 @@ use crate::readiness::ReadinessFlags;
 use primitive::{Decoder, Encoder};
 
 mod event;
-mod filesystem;
+mod fs;
 mod pipe;
 mod primitive;
 mod socket;
@@ -168,7 +168,7 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
         BrokerOperation::Filesystem(request) => {
             encoder.u8(REQUEST_TAG_FILESYSTEM);
             encoder.request_id(request_id);
-            filesystem::encode_filesystem_request(&mut encoder, request);
+            fs::encode_fs_request(&mut encoder, request);
         }
     }
     encoder.finish()
@@ -199,9 +199,7 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         REQUEST_TAG_SOCKET => BrokerOperation::Socket(socket::decode_socket_request(&mut decoder)?),
         REQUEST_TAG_FILL_RANDOM => BrokerOperation::FillRandom(decoder.shared_buffer_descriptor()?),
         REQUEST_TAG_STDIO => BrokerOperation::Stdio(stdio::decode_stdio_request(&mut decoder)?),
-        REQUEST_TAG_FILESYSTEM => {
-            BrokerOperation::Filesystem(filesystem::decode_filesystem_request(&mut decoder)?)
-        }
+        REQUEST_TAG_FILESYSTEM => BrokerOperation::Filesystem(fs::decode_fs_request(&mut decoder)?),
         _ => unreachable!("active request tag was validated"),
     };
     decoder.finish()?;
@@ -314,7 +312,7 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
         BrokerResult::Filesystem(response) => {
             encoder.u8(RESPONSE_TAG_FILESYSTEM);
             encoder.request_id(request_id);
-            filesystem::encode_filesystem_response(&mut encoder, response);
+            fs::encode_fs_response(&mut encoder, response);
         }
         BrokerResult::Error(error) => {
             encoder.u8(RESPONSE_TAG_ERROR);
@@ -357,9 +355,7 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         RESPONSE_TAG_READINESS => BrokerResult::Readiness(ReadinessFlags(decoder.u32()?)),
         RESPONSE_TAG_RANDOM_FILLED => BrokerResult::RandomFilled,
         RESPONSE_TAG_STDIO => BrokerResult::Stdio(stdio::decode_stdio_response(&mut decoder)?),
-        RESPONSE_TAG_FILESYSTEM => {
-            BrokerResult::Filesystem(filesystem::decode_filesystem_response(&mut decoder)?)
-        }
+        RESPONSE_TAG_FILESYSTEM => BrokerResult::Filesystem(fs::decode_fs_response(&mut decoder)?),
         _ => unreachable!("active response tag was validated"),
     };
     decoder.finish()?;
@@ -404,7 +400,7 @@ mod tests {
         AddEventRequest, AddEventResponse, ConsumeEventRequest, CreateEventRequest,
         CreateEventResponse, EventConsumeMode, EventConsumption,
     };
-    use crate::filesystem::{
+    use crate::fs::{
         ChmodFileRequest, ChownFileRequest, FilesystemError, FilesystemFileStatus,
         FilesystemFileType, FilesystemNamespace, FilesystemNodeInfo, FilesystemSeekWhence,
         FilesystemUser, HandleFileStatusRequest, MkdirFileRequest, OpenFileRequest,

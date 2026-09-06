@@ -15,6 +15,7 @@ use core::num::NonZeroUsize;
 
 pub mod backend;
 pub mod composer;
+mod control;
 pub mod devices;
 pub mod errors;
 pub mod in_mem;
@@ -26,6 +27,7 @@ mod provider;
 pub mod resolver;
 pub mod tar_ro;
 
+pub use control::*;
 pub use provider::{
     FilesystemProviderAdapter, NamespacedFilesystemProvider, create_windows_registry_provider,
 };

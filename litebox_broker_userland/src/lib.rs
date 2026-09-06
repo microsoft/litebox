@@ -12,4 +12,4 @@
 pub mod readiness;
 
 #[cfg(all(test, target_os = "linux"))]
-mod filesystem_tests;
+mod fs_tests;

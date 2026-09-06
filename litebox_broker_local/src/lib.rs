@@ -22,7 +22,7 @@ extern crate std;
 
 mod error;
 mod event;
-mod filesystem;
+mod fs;
 mod pipe;
 mod random;
 mod socket;

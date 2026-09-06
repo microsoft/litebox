@@ -6,7 +6,7 @@
 use alloc::{sync::Arc, vec::Vec};
 
 use litebox_broker_protocol::ObjectHandle;
-use litebox_broker_protocol::filesystem::{
+use litebox_broker_protocol::fs::{
     FilesystemDirectoryEntry, FilesystemError, FilesystemFileStatus, FilesystemNamespace,
     FilesystemSeekWhence, FilesystemUser, MAX_FILESYSTEM_TRANSFER_SIZE,
 };
@@ -14,7 +14,7 @@ use litebox_broker_protocol::filesystem::{
 use crate::session::{ObjectEntry, ObjectRights};
 use crate::{AssociationCancellation, BrokerError, BrokerSession, Result};
 
-type FilesystemResult<T> = core::result::Result<T, FilesystemError>;
+type FsResult<T> = core::result::Result<T, FilesystemError>;
 type DirectoryPage = (Vec<FilesystemDirectoryEntry>, Option<u64>);
 
 /// Broker-wide filesystem namespace provider.
@@ -236,7 +236,7 @@ pub fn open(
         return Err(BrokerError::PolicyDenied);
     }
     let reference = session.reserve_object_reference(rights)?;
-    let description = match session.core.filesystem_provider.open(
+    let description = match session.core.fs_provider.open(
         &session.cancellation,
         namespace,
         path,
@@ -322,7 +322,7 @@ pub fn read_directory(
     handle: ObjectHandle,
     start_index: u64,
     maximum_encoded_length: usize,
-) -> Result<FilesystemResult<DirectoryPage>> {
+) -> Result<FsResult<DirectoryPage>> {
     let description = open_file_description(session, handle, ObjectRights::WAIT)?;
     let page =
         description.read_directory(&session.cancellation, start_index, maximum_encoded_length);
@@ -353,10 +353,10 @@ pub fn path_status(
     path: &str,
     user: FilesystemUser,
 ) -> Result<core::result::Result<FilesystemFileStatus, FilesystemError>> {
-    authorize_filesystem_operation(session, ObjectRights::WAIT)?;
+    authorize_fs_operation(session, ObjectRights::WAIT)?;
     Ok(session
         .core
-        .filesystem_provider
+        .fs_provider
         .path_status(&session.cancellation, namespace, path, user))
 }
 
@@ -368,10 +368,10 @@ pub fn chmod(
     user: FilesystemUser,
     mode: u32,
 ) -> Result<core::result::Result<(), FilesystemError>> {
-    authorize_filesystem_operation(session, ObjectRights::WRITE)?;
+    authorize_fs_operation(session, ObjectRights::WRITE)?;
     Ok(session
         .core
-        .filesystem_provider
+        .fs_provider
         .chmod(&session.cancellation, namespace, path, user, mode))
 }
 
@@ -384,8 +384,8 @@ pub fn chown(
     user: Option<u16>,
     group: Option<u16>,
 ) -> Result<core::result::Result<(), FilesystemError>> {
-    authorize_filesystem_operation(session, ObjectRights::WRITE)?;
-    Ok(session.core.filesystem_provider.chown(
+    authorize_fs_operation(session, ObjectRights::WRITE)?;
+    Ok(session.core.fs_provider.chown(
         &session.cancellation,
         namespace,
         path,
@@ -402,10 +402,10 @@ pub fn unlink(
     path: &str,
     user: FilesystemUser,
 ) -> Result<core::result::Result<(), FilesystemError>> {
-    authorize_filesystem_operation(session, ObjectRights::WRITE)?;
+    authorize_fs_operation(session, ObjectRights::WRITE)?;
     Ok(session
         .core
-        .filesystem_provider
+        .fs_provider
         .unlink(&session.cancellation, namespace, path, user))
 }
 
@@ -417,10 +417,10 @@ pub fn mkdir(
     user: FilesystemUser,
     mode: u32,
 ) -> Result<core::result::Result<(), FilesystemError>> {
-    authorize_filesystem_operation(session, ObjectRights::WRITE)?;
+    authorize_fs_operation(session, ObjectRights::WRITE)?;
     Ok(session
         .core
-        .filesystem_provider
+        .fs_provider
         .mkdir(&session.cancellation, namespace, path, user, mode))
 }
 
@@ -431,10 +431,10 @@ pub fn rmdir(
     path: &str,
     user: FilesystemUser,
 ) -> Result<core::result::Result<(), FilesystemError>> {
-    authorize_filesystem_operation(session, ObjectRights::WRITE)?;
+    authorize_fs_operation(session, ObjectRights::WRITE)?;
     Ok(session
         .core
-        .filesystem_provider
+        .fs_provider
         .rmdir(&session.cancellation, namespace, path, user))
 }
 
@@ -454,10 +454,7 @@ fn open_file_description(
     }
 }
 
-fn authorize_filesystem_operation(
-    session: &BrokerSession,
-    required_rights: ObjectRights,
-) -> Result<()> {
+fn authorize_fs_operation(session: &BrokerSession, required_rights: ObjectRights) -> Result<()> {
     let rights = session
         .core
         .policy
@@ -642,7 +639,7 @@ mod tests {
     fn test_broker(
         rights: ObjectRights,
         max_references: usize,
-        filesystem_provider: Arc<TestFilesystemProvider>,
+        fs_provider: Arc<TestFilesystemProvider>,
     ) -> BrokerCore {
         BrokerCore {
             policy: Arc::new(PolicyEngine::with_unauthenticated_rights(rights)),
@@ -656,13 +653,13 @@ mod tests {
             random_provider: Arc::new(crate::random::TestRandomProvider),
             stdio_provider: Arc::new(crate::stdio::UnsupportedStdioProvider),
             socket_provider: Arc::new(crate::socket::UnsupportedSocketProvider),
-            filesystem_provider,
+            fs_provider,
             socket_ports: BrokerSocketPorts::default(),
         }
     }
 
     #[test]
-    fn filesystem_policy_is_checked_before_calling_the_provider() {
+    fn fs_policy_is_checked_before_calling_the_provider() {
         let wait_provider = Arc::new(TestFilesystemProvider::default());
         let wait_broker = test_broker(ObjectRights::WAIT, 2, Arc::clone(&wait_provider));
         let wait_session = wait_broker
@@ -705,7 +702,7 @@ mod tests {
     }
 
     #[test]
-    fn filesystem_open_reserves_reference_before_provider_side_effects() {
+    fn fs_open_reserves_reference_before_provider_side_effects() {
         let provider = Arc::new(TestFilesystemProvider::default());
         let broker = test_broker(ObjectRights::all(), 1, Arc::clone(&provider));
         let session = broker
@@ -722,7 +719,7 @@ mod tests {
     }
 
     #[test]
-    fn filesystem_operations_enforce_attenuated_reference_rights() {
+    fn fs_operations_enforce_attenuated_reference_rights() {
         let provider = Arc::new(TestFilesystemProvider::default());
         let broker = test_broker(ObjectRights::all(), 2, provider);
         let source = broker
@@ -746,7 +743,7 @@ mod tests {
     }
 
     #[test]
-    fn filesystem_operations_reject_wrong_types_and_provider_overreporting() {
+    fn fs_operations_reject_wrong_types_and_provider_overreporting() {
         let provider = Arc::new(TestFilesystemProvider::default());
         provider.overreport_reads.store(true, Ordering::Relaxed);
         let broker = test_broker(ObjectRights::all(), 2, provider);

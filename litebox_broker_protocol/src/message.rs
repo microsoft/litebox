@@ -6,7 +6,7 @@ use crate::event::{
     AddEventRequest, AddEventResponse, ConsumeEventRequest, ConsumeEventResponse,
     CreateEventRequest, CreateEventResponse,
 };
-use crate::filesystem::{
+use crate::fs::{
     ChmodFileRequest, ChownFileRequest, FilesystemError, FilesystemFileStatus,
     HandleFileStatusRequest, MkdirFileRequest, OpenFileRequest, OpenFileResponse,
     PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,

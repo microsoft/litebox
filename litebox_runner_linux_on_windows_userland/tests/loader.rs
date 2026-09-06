@@ -242,7 +242,7 @@ fn run_prog_with_windows_broker(
     }
     arguments.push(format!("/{exec_path}").into());
     let status = std::process::Command::new(broker)
-        .arg("--filesystem-initial-files")
+        .arg("--fs-initial-files")
         .arg(&tar_path)
         .arg("--runner")
         .arg(runner)
@@ -360,7 +360,7 @@ fn run_dynamic_linked_prog_with_rewriter(
 
     let mut command = std::process::Command::new(broker);
     command
-        .arg("--filesystem-initial-files")
+        .arg("--fs-initial-files")
         .arg(&tar_target_file)
         .arg("--runner")
         .arg(runner)

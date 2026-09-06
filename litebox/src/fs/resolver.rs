@@ -18,7 +18,7 @@ use litebox_broker_core::fs::{
 };
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::error::ErrorCode;
-use litebox_broker_protocol::filesystem::{
+use litebox_broker_protocol::fs::{
     FilesystemDirectoryEntry, FilesystemError, FilesystemFileStatus, FilesystemFileType,
     FilesystemNamespace, FilesystemNodeInfo, FilesystemSeekWhence, FilesystemUser,
 };
@@ -37,7 +37,7 @@ pub struct Resolver<Platform: sync::RawSyncPrimitivesProvider> {
 
 enum ResolverAuthority<Platform: sync::RawSyncPrimitivesProvider> {
     #[cfg(any(test, feature = "local_filesystem"))]
-    Local(Arc<dyn LocalFilesystem<Platform>>),
+    Local(Arc<dyn LocalFs<Platform>>),
     Broker(
         Arc<dyn crate::broker::BrokerControl>,
         FilesystemNamespace,
@@ -46,7 +46,7 @@ enum ResolverAuthority<Platform: sync::RawSyncPrimitivesProvider> {
 }
 
 #[cfg(any(test, feature = "local_filesystem"))]
-trait LocalFilesystem<Platform: sync::RawSyncPrimitivesProvider>: Send + Sync {
+trait LocalFs<Platform: sync::RawSyncPrimitivesProvider>: Send + Sync {
     fn open(
         &self,
         user: UserInfo,
@@ -106,8 +106,8 @@ trait LocalFilesystem<Platform: sync::RawSyncPrimitivesProvider>: Send + Sync {
 }
 
 #[cfg(any(test, feature = "local_filesystem"))]
-impl<Platform: sync::RawSyncPrimitivesProvider, FilesystemBackend: Backend + 'static>
-    LocalFilesystem<Platform> for Filesystem<Platform, FilesystemBackend>
+impl<Platform: sync::RawSyncPrimitivesProvider, FsBackend: Backend + 'static> LocalFs<Platform>
+    for Filesystem<Platform, FsBackend>
 {
     fn open(
         &self,
@@ -238,9 +238,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Resolver<Platform> {
     /// Constructs a local resolver for tests and explicit compatibility configurations.
     #[cfg(any(test, feature = "local_filesystem"))]
     #[must_use]
-    pub fn new<FilesystemBackend: Backend + 'static>(
+    pub fn new<FsBackend: Backend + 'static>(
         litebox: &LiteBox<Platform>,
-        backend: FilesystemBackend,
+        backend: FsBackend,
     ) -> Self {
         Self {
             litebox: litebox.clone(),
@@ -432,7 +432,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Resolver<Platform> {
             ResolverAuthority::Local(core) => {
                 let path = context.resolve(path)?.to_string();
                 ResolverDescription::Local(LocalOpenFileDescription {
-                    filesystem: Arc::clone(core),
+                    fs: Arc::clone(core),
                     file: core.open(context.acting_user(), &path, flags, mode)?,
                 })
             }
@@ -442,7 +442,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Resolver<Platform> {
                     .open_file(
                         *namespace,
                         &path,
-                        filesystem_user(context.acting_user()),
+                        fs_user(context.acting_user()),
                         flags.bits(),
                         mode.bits(),
                     )
@@ -487,7 +487,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Resolver<Platform> {
             #[cfg(any(test, feature = "local_filesystem"))]
             ResolverDescription::Local(description) => {
                 description
-                    .filesystem
+                    .fs
                     .read(&self.litebox, &description.file, buf, offset)
             }
             ResolverDescription::Broker(description, _) => description
@@ -517,7 +517,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Resolver<Platform> {
             #[cfg(any(test, feature = "local_filesystem"))]
             ResolverDescription::Local(description) => {
                 description
-                    .filesystem
+                    .fs
                     .write(&self.litebox, &description.file, buf, offset)
             }
             ResolverDescription::Broker(description, _) => description
@@ -546,15 +546,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Resolver<Platform> {
         match description {
             #[cfg(any(test, feature = "local_filesystem"))]
             ResolverDescription::Local(description) => {
-                description
-                    .filesystem
-                    .seek(&description.file, offset, whence)
+                description.fs.seek(&description.file, offset, whence)
             }
             ResolverDescription::Broker(description, _) => {
                 let offset = i64::try_from(offset).map_err(|_| SeekError::InvalidOffset)?;
                 let offset = description
                     .broker
-                    .seek_file(description.handle, offset, filesystem_seek_whence(whence))
+                    .seek_file(description.handle, offset, fs_seek_whence(whence))
                     .map_err(|error| broker_fd_error(error, SeekError::ClosedFd, SeekError::Io))?
                     .map_err(seek_error)?;
                 usize::try_from(offset).map_err(|_| SeekError::InvalidOffset)
@@ -576,7 +574,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Resolver<Platform> {
             #[cfg(any(test, feature = "local_filesystem"))]
             ResolverDescription::Local(description) => {
                 description
-                    .filesystem
+                    .fs
                     .truncate(&description.file, length, reset_offset)
             }
             ResolverDescription::Broker(description, _) => description
@@ -607,7 +605,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Resolver<Platform> {
                     .chmod_file(
                         *namespace,
                         &path,
-                        filesystem_user(context.acting_user()),
+                        fs_user(context.acting_user()),
                         mode.bits(),
                     )
                     .map_err(|_| ChmodError::Io)?
@@ -636,7 +634,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Resolver<Platform> {
                     .chown_file(
                         *namespace,
                         &path,
-                        filesystem_user(context.acting_user()),
+                        fs_user(context.acting_user()),
                         user,
                         group,
                     )
@@ -657,7 +655,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Resolver<Platform> {
             ResolverAuthority::Broker(broker, namespace, _) => {
                 let path = context.resolve(path)?.to_string();
                 broker
-                    .unlink_file(*namespace, &path, filesystem_user(context.acting_user()))
+                    .unlink_file(*namespace, &path, fs_user(context.acting_user()))
                     .map_err(|_| UnlinkError::Io)?
                     .map_err(unlink_error)
             }
@@ -678,7 +676,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Resolver<Platform> {
                     .mkdir_file(
                         *namespace,
                         &path,
-                        filesystem_user(context.acting_user()),
+                        fs_user(context.acting_user()),
                         mode.bits(),
                     )
                     .map_err(|_| MkdirError::Io)?
@@ -698,7 +696,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Resolver<Platform> {
             ResolverAuthority::Broker(broker, namespace, _) => {
                 let path = context.resolve(path)?.to_string();
                 broker
-                    .rmdir_file(*namespace, &path, filesystem_user(context.acting_user()))
+                    .rmdir_file(*namespace, &path, fs_user(context.acting_user()))
                     .map_err(|_| RmdirError::Io)?
                     .map_err(rmdir_error)
             }
@@ -712,9 +710,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Resolver<Platform> {
             .ok_or(ReadDirError::ClosedFd)?;
         match description {
             #[cfg(any(test, feature = "local_filesystem"))]
-            ResolverDescription::Local(description) => {
-                description.filesystem.read_dir(&description.file)
-            }
+            ResolverDescription::Local(description) => description.fs.read_dir(&description.file),
             ResolverDescription::Broker(description, _) => {
                 let entries = description
                     .broker
@@ -743,7 +739,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Resolver<Platform> {
             ResolverAuthority::Broker(broker, namespace, _) => {
                 let path = context.resolve(path)?.to_string();
                 let status = broker
-                    .path_file_status(*namespace, &path, filesystem_user(context.acting_user()))
+                    .path_file_status(*namespace, &path, fs_user(context.acting_user()))
                     .map_err(|_| FileStatusError::Io)?
                     .map_err(file_status_error)?;
                 file_status(status)
@@ -759,7 +755,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Resolver<Platform> {
         match description {
             #[cfg(any(test, feature = "local_filesystem"))]
             ResolverDescription::Local(description) => {
-                description.filesystem.handle_status(&description.file)
+                description.fs.handle_status(&description.file)
             }
             ResolverDescription::Broker(description, _) => {
                 let status = description
@@ -779,9 +775,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Resolver<Platform> {
         let description = self.open_file_description(fd)?;
         match description {
             #[cfg(any(test, feature = "local_filesystem"))]
-            ResolverDescription::Local(description) => description
-                .filesystem
-                .get_static_backing_data(&description.file),
+            ResolverDescription::Local(description) => {
+                description.fs.get_static_backing_data(&description.file)
+            }
             ResolverDescription::Broker(_, _) => {
                 // TODO: Restore zero-copy backing after broker shared-memory objects are available.
                 None
@@ -817,7 +813,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Clone for ResolverDescription<Pl
 
 #[cfg(any(test, feature = "local_filesystem"))]
 struct LocalOpenFileDescription<Platform: sync::RawSyncPrimitivesProvider> {
-    filesystem: Arc<dyn LocalFilesystem<Platform>>,
+    fs: Arc<dyn LocalFs<Platform>>,
     file: FilesystemOpenFile<Platform>,
 }
 
@@ -825,7 +821,7 @@ struct LocalOpenFileDescription<Platform: sync::RawSyncPrimitivesProvider> {
 impl<Platform: sync::RawSyncPrimitivesProvider> Clone for LocalOpenFileDescription<Platform> {
     fn clone(&self) -> Self {
         Self {
-            filesystem: Arc::clone(&self.filesystem),
+            fs: Arc::clone(&self.fs),
             file: self.file.clone(),
         }
     }
@@ -1097,14 +1093,14 @@ fn local_node_info(node_info: local_fs::NodeInfo) -> super::NodeInfo {
     }
 }
 
-const fn filesystem_user(user: UserInfo) -> FilesystemUser {
+const fn fs_user(user: UserInfo) -> FilesystemUser {
     FilesystemUser {
         user: user.user,
         group: user.group,
     }
 }
 
-const fn filesystem_seek_whence(whence: super::SeekWhence) -> FilesystemSeekWhence {
+const fn fs_seek_whence(whence: super::SeekWhence) -> FilesystemSeekWhence {
     match whence {
         super::SeekWhence::RelativeToBeginning => FilesystemSeekWhence::Beginning,
         super::SeekWhence::RelativeToCurrentOffset => FilesystemSeekWhence::Current,

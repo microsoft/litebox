@@ -197,7 +197,7 @@ impl Runner {
     }
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    fn filesystem_root(&self) -> PathBuf {
+    fn fs_root(&self) -> PathBuf {
         self.tar_dir.clone()
     }
 
@@ -295,13 +295,13 @@ impl Runner {
                 target_arch = "aarch64",
                 feature = "aarch64_virtualize_x18"
             )) {
-                command.arg("--filesystem-virtualize-x18");
+                command.arg("--fs-virtualize-x18");
             }
             for host in &self.managed_proxy_hosts {
                 command.arg("--allow-host").arg(host);
             }
             command
-                .arg("--filesystem-initial-files")
+                .arg("--fs-initial-files")
                 .arg(&tar_file)
                 .arg("--runner")
                 .arg(runner)
@@ -531,13 +531,13 @@ fn spawn_test_broker(
     control_socket_path: &Path,
     policy: litebox_broker_core::PolicyEngine,
     connection_count: usize,
-    filesystem_roots: Vec<PathBuf>,
+    fs_roots: Vec<PathBuf>,
 ) -> TestBroker {
     spawn_test_broker_with_mode(
         control_socket_path,
         policy,
         connection_count,
-        filesystem_roots,
+        fs_roots,
         false,
     )
 }
@@ -547,13 +547,13 @@ fn spawn_concurrent_test_broker(
     control_socket_path: &Path,
     policy: litebox_broker_core::PolicyEngine,
     connection_count: usize,
-    filesystem_roots: Vec<PathBuf>,
+    fs_roots: Vec<PathBuf>,
 ) -> TestBroker {
     spawn_test_broker_with_mode(
         control_socket_path,
         policy,
         connection_count,
-        filesystem_roots,
+        fs_roots,
         true,
     )
 }
@@ -563,7 +563,7 @@ fn spawn_test_broker_with_mode(
     control_socket_path: &Path,
     policy: litebox_broker_core::PolicyEngine,
     connection_count: usize,
-    filesystem_roots: Vec<PathBuf>,
+    fs_roots: Vec<PathBuf>,
     concurrent: bool,
 ) -> TestBroker {
     let _ = std::fs::remove_file(control_socket_path);
@@ -582,8 +582,8 @@ fn spawn_test_broker_with_mode(
             let limits = litebox_broker_core::BrokerCoreLimits::DEFAULT;
             let random_provider = std::sync::Arc::new(TestRandomProvider);
             let stdio_provider = std::sync::Arc::new(CapturingStdioProvider { stdout_tx });
-            let filesystem_provider = test_filesystem_provider(
-                filesystem_roots,
+            let fs_provider = test_fs_provider(
+                fs_roots,
                 std::sync::Arc::clone(&random_provider)
                     as std::sync::Arc<dyn litebox_broker_core::random::RandomProvider>,
                 std::sync::Arc::clone(&stdio_provider)
@@ -601,7 +601,7 @@ fn spawn_test_broker_with_mode(
                 ),
                 random_provider,
                 stdio_provider,
-                filesystem_provider,
+                fs_provider,
             )
             .expect("failed to create broker core");
             ready_tx.send(()).expect("failed to report broker ready");
@@ -651,11 +651,11 @@ fn spawn_test_broker_with_mode(
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-fn test_filesystem_provider(
+fn test_fs_provider(
     roots: Vec<PathBuf>,
     random: std::sync::Arc<dyn litebox_broker_core::random::RandomProvider>,
     stdio: std::sync::Arc<dyn litebox_broker_core::stdio::StdioProvider>,
-) -> std::sync::Arc<dyn litebox_broker_core::filesystem::FilesystemProvider> {
+) -> std::sync::Arc<dyn litebox_broker_core::fs::FilesystemProvider> {
     use std::os::unix::fs::PermissionsExt as _;
 
     let owner = litebox::fs::in_mem::UserInfo {
@@ -770,7 +770,7 @@ fn run_test_broker_connection(
     let publisher_readiness = readiness.clone();
     let publisher = std::thread::spawn(move || publisher_readiness.run(&mut notifications));
     let mut close_object_count = 0;
-    let mut filesystem_handles = std::collections::HashSet::new();
+    let mut fs_handles = std::collections::HashSet::new();
     let termination = loop {
         match request_source
             .recv_request()
@@ -783,23 +783,23 @@ fn run_test_broker_connection(
                     }
                     _ => None,
                 };
-                let mut opened_filesystem_handle = None;
+                let mut opened_fs_handle = None;
                 association
                     .execute_request(request, |response| {
                         if let litebox_broker_protocol::message::BrokerResult::Filesystem(
                             litebox_broker_protocol::message::FilesystemResponse::Open(opened),
                         ) = &response.result
                         {
-                            opened_filesystem_handle = Some(opened.handle);
+                            opened_fs_handle = Some(opened.handle);
                         }
                         response_sink.send_response(response)
                     })
                     .expect("failed to execute broker test request");
-                if let Some(handle) = opened_filesystem_handle {
-                    filesystem_handles.insert(handle);
+                if let Some(handle) = opened_fs_handle {
+                    fs_handles.insert(handle);
                 }
                 if let Some(handle) = closed_handle
-                    && !filesystem_handles.remove(&handle)
+                    && !fs_handles.remove(&handle)
                 {
                     close_object_count += 1;
                 }
@@ -876,7 +876,7 @@ console.log(content);
             &urandom_runner,
             &node_runner,
         ]
-        .map(Runner::filesystem_root)
+        .map(Runner::fs_root)
         .to_vec(),
     );
 
@@ -1020,7 +1020,7 @@ fn test_runner_broker_tcp_client_with_rewriter() {
         )
         .with_socket_policy(gateway_tcp_policy()),
         1,
-        vec![runner.filesystem_root()],
+        vec![runner.fs_root()],
     );
     runner
         .arg(port.to_string())
@@ -1110,7 +1110,7 @@ fn test_runner_broker_udp_with_rewriter() {
         )
         .with_socket_policy(gateway_udp_policy()),
         1,
-        vec![runner.filesystem_root()],
+        vec![runner.fs_root()],
     );
     runner
         .arg(port.to_string())
@@ -1143,10 +1143,7 @@ fn test_runner_broker_udp_namespace_delivers_after_sender_close() {
         )
         .with_socket_policy(litebox_broker_core::SocketPolicy::guest_network()),
         2,
-        vec![
-            server_runner.filesystem_root(),
-            client_runner.filesystem_root(),
-        ],
+        vec![server_runner.fs_root(), client_runner.fs_root()],
     );
     let mut server = server_runner
         .arg("server")
@@ -1204,7 +1201,7 @@ fn test_runner_broker_tcp_server_with_rewriter() {
         )
         .with_socket_policy(litebox_broker_core::SocketPolicy::guest_network()),
         1,
-        vec![runner.filesystem_root()],
+        vec![runner.fs_root()],
     );
     let mut child = runner.broker_socket(&control_socket_path).spawn_with_stdio(
         Stdio::null(),
@@ -1614,7 +1611,7 @@ fn test_broker_with_curl() {
         )
         .with_socket_policy(gateway_tcp_policy()),
         1,
-        vec![runner.filesystem_root()],
+        vec![runner.fs_root()],
     );
     let url = format!("http://10.0.2.1:{port}/something");
     runner
@@ -1710,7 +1707,7 @@ fn test_broker_with_iperf3() {
         )
         .with_socket_policy(gateway_tcp_policy()),
         1,
-        vec![runner.filesystem_root()],
+        vec![runner.fs_root()],
     );
 
     let mut last_server_output = String::new();
