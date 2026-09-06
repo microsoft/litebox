@@ -1753,6 +1753,8 @@ unsafe extern "C" {
     #[cfg(all(test, target_arch = "aarch64"))]
     fn switch_to_guest_stage_x16();
     #[cfg(all(test, target_arch = "aarch64"))]
+    fn switch_to_guest_stage_x16_end();
+    #[cfg(all(test, target_arch = "aarch64"))]
     fn switch_to_guest_stage_x16_fixup();
 }
 
