@@ -24,8 +24,7 @@ use litebox::{
 };
 use litebox_common_linux::errno::Errno;
 use litebox_common_linux::vmap::{
-    GlobalVmapManager, PhysPageAddrArray, PhysPageMapInfo, PhysPageMapPermissions,
-    PhysPointerError, VmapManager,
+    PhysPageAddrArray, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError, VmapManager,
 };
 use x86_64::{
     VirtAddr,
@@ -491,16 +490,6 @@ type UserConstPtr<T> =
     litebox::platform::common_providers::userspace_pointers::UserConstPtr<LvbsValidateAccess, T>;
 type UserMutPtr<T> =
     litebox::platform::common_providers::userspace_pointers::UserMutPtr<LvbsValidateAccess, T>;
-
-/// Type-level marker for the VTL0 physical-pointer provider.
-pub enum Vmap {}
-
-impl<const ALIGN: usize> GlobalVmapManager<ALIGN> for Vmap {
-    type Manager = crate::host::LvbsLinuxKernel;
-    fn manager() -> &'static Self::Manager {
-        crate::platform_low()
-    }
-}
 
 impl<Host: HostInterface> RawPointerProvider for LinuxKernel<Host> {
     type RawConstPointer<T: FromBytes> = UserConstPtr<T>;
@@ -1159,7 +1148,7 @@ impl<Host: HostInterface> litebox::platform::SystemInfoProvider for LinuxKernel<
     }
 }
 
-unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for LinuxKernel<Host> {
+unsafe impl<const ALIGN: usize> VmapManager<ALIGN> for crate::host::LvbsLinuxKernel {
     type MapInfo = LvbsPhysPageMapInfo;
 
     unsafe fn vmap(
@@ -1351,7 +1340,7 @@ unsafe impl<Host: HostInterface, const ALIGN: usize> VmapManager<ALIGN> for Linu
                 PhysFrame::<Size4KiB>::containing_address(x86_64::PhysAddr::new(range.start)),
                 PhysFrame::<Size4KiB>::containing_address(x86_64::PhysAddr::new(range.end)),
             );
-            crate::mshv::vsm::protect_physical_memory_range(frame_range, page_prot)
+            crate::mshv::vsm::protect_physical_memory_range(self, frame_range, page_prot)
                 .map_err(|_| PhysPointerError::UnsupportedPermissions(perms.bits()))?;
         }
 
@@ -2037,30 +2026,4 @@ unsafe extern "C" fn switch_to_user(_ctx: &litebox_common_linux::PtRegs) -> ! {
         vtl1_xsave_mask_hi_off = const { PerCpuVariablesAsm::vtl1_xsave_mask_hi_offset() },
         vtl1_user_xsaved_off = const { PerCpuVariablesAsm::vtl1_user_xsaved_offset() },
     );
-}
-
-// NOTE: The below code is a naive workaround to let LVBS code to access the platform.
-// Rather than doing this, we should implement LVBS interface/provider for the platform.
-
-pub type Platform = crate::host::LvbsLinuxKernel;
-
-static PLATFORM_LOW: once_cell::race::OnceRef<'static, Platform> = once_cell::race::OnceRef::new();
-
-/// # Panics
-///
-/// Panics if invoked more than once
-pub fn set_platform_low(platform: &'static Platform) {
-    match PLATFORM_LOW.set(platform) {
-        Ok(()) => {}
-        Err(()) => panic!("set_platform should only be called once per crate"),
-    }
-}
-
-/// # Panics
-///
-/// Panics if [`set_platform_low`] has not been invoked before this
-pub fn platform_low() -> &'static Platform {
-    PLATFORM_LOW
-        .get()
-        .expect("set_platform_low should have already been called before this point")
 }

@@ -19,7 +19,11 @@ use crate::{NormalWorldConstPtr, NormalWorldMutPtr};
 use alloc::{boxed::Box, vec::Vec};
 use core::mem::size_of;
 use hashbrown::{HashMap, HashSet};
-use litebox::{mm::linux::PAGE_SIZE, platform::RawConstPointer, utils::TruncateExt};
+use litebox::{
+    mm::linux::PAGE_SIZE,
+    platform::{RawConstPointer, RawMutPointer},
+    utils::TruncateExt,
+};
 use litebox_common_linux::vmap::PhysPageAddr;
 use litebox_common_optee::{
     OpteeMessageCommand, OpteeMsgArgs, OpteeMsgArgsHeader, OpteeMsgAttrType, OpteeMsgParamRmem,
@@ -178,7 +182,8 @@ fn parse_optee_msg_args(
 /// ```
 ///
 /// Returns `(main_args, Option<rpc_args>)`.
-pub fn read_optee_msg_args_from_phys(
+pub fn read_optee_msg_args_from_phys<Platform: crate::OpteeShimPlatform>(
+    platform: &Platform,
     phys_addr: usize,
     has_rpc_arg: bool,
 ) -> Result<(Box<OpteeMsgArgs>, Option<Box<OpteeRpcArgs>>), OpteeSmcReturnCode> {
@@ -192,9 +197,10 @@ pub fn read_optee_msg_args_from_phys(
 
     let mut blob = alloc::vec![0u8; copy_size];
 
-    let blob_ptr =
-        NormalWorldConstPtr::<u8, PAGE_SIZE>::with_contiguous_pages(phys_addr, copy_size)
-            .map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
+    let blob_ptr = NormalWorldConstPtr::<Platform, u8, PAGE_SIZE>::with_contiguous_pages(
+        platform, phys_addr, copy_size,
+    )
+    .map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
     blob_ptr
         .read_slice_at_offset(0, &mut blob)
         .map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
@@ -206,9 +212,10 @@ pub fn read_optee_msg_args_from_phys(
 /// It returns an `OpteeSmcResult` representing the result of the SMC call or `OpteeMsgArgs` it contains
 /// if the SMC call involves with an OP-TEE message which should be handled by
 /// `handle_optee_msg_args` or `handle_ta_request`.
-pub fn handle_optee_smc_args(
-    smc: &mut OpteeSmcArgs,
-) -> Result<OpteeSmcResult<'_>, OpteeSmcReturnCode> {
+pub fn handle_optee_smc_args<'a, Platform: crate::OpteeShimPlatform>(
+    platform: &Platform,
+    smc: &'a mut OpteeSmcArgs,
+) -> Result<OpteeSmcResult<'a>, OpteeSmcReturnCode> {
     let func_id = smc.func_id()?;
     #[cfg(debug_assertions)]
     litebox_util_log::debug!(
@@ -219,7 +226,7 @@ pub fn handle_optee_smc_args(
         OpteeSmcFunction::CallWithArg => {
             let msg_args_addr = smc.optee_msg_args_phys_addr()?;
             let msg_args_addr: usize = msg_args_addr.trunc();
-            let (msg_args, _) = read_optee_msg_args_from_phys(msg_args_addr, false)?;
+            let (msg_args, _) = read_optee_msg_args_from_phys(platform, msg_args_addr, false)?;
             Ok(OpteeSmcResult::CallWithArg {
                 msg_args,
                 rpc_args: None,
@@ -229,7 +236,8 @@ pub fn handle_optee_smc_args(
         OpteeSmcFunction::CallWithRpcArg => {
             let msg_args_addr = smc.optee_msg_args_phys_addr()?;
             let msg_args_addr: usize = msg_args_addr.trunc();
-            let (msg_args, rpc_args) = read_optee_msg_args_from_phys(msg_args_addr, true)?;
+            let (msg_args, rpc_args) =
+                read_optee_msg_args_from_phys(platform, msg_args_addr, true)?;
             Ok(OpteeSmcResult::CallWithArg {
                 msg_args,
                 rpc_args,
@@ -249,7 +257,7 @@ pub fn handle_optee_smc_args(
                 main_max + optee_msg_args_total_size(OpteeRpcArgs::MAX_RPC_ARG_PARAM_COUNT.trunc());
 
             let mut blob = alloc::vec![0u8; copy_size];
-            shm_info.read_at(offset, &mut blob)?;
+            shm_info.read_at(platform, offset, &mut blob)?;
             let (msg_args, rpc_args) = parse_optee_msg_args(&blob, true)?;
 
             // Compute the physical address of `OpteeMsgArgs`
@@ -327,7 +335,10 @@ pub fn handle_optee_smc_args(
 /// If an OP-TEE message involves with a TA request, it simply returns
 /// `Err(OpteeSmcReturnCode::Ok)` while expecting that the caller will handle
 /// the message with `handle_ta_request`.
-pub fn handle_optee_msg_args(msg_args: &OpteeMsgArgs) -> Result<(), OpteeSmcReturnCode> {
+pub fn handle_optee_msg_args<Platform: crate::OpteeShimPlatform>(
+    platform: &Platform,
+    msg_args: &OpteeMsgArgs,
+) -> Result<(), OpteeSmcReturnCode> {
     msg_args.validate()?;
     match msg_args.cmd {
         OpteeMessageCommand::RegisterShm => {
@@ -348,6 +359,7 @@ pub fn handle_optee_msg_args(msg_args: &OpteeMsgArgs) -> Result<(), OpteeSmcRetu
                 .ok_or(OpteeSmcReturnCode::ENomem)?;
             let aligned_size = page_align_up(size).ok_or(OpteeSmcReturnCode::ENomem)?;
             shm_ref_map().register_shm(
+                platform,
                 shm_ref_pages_data_phys_addr,
                 page_offset,
                 tmem.size,
@@ -398,7 +410,8 @@ pub struct TaRequestInfo<const ALIGN: usize> {
 /// This function decodes a TA request contained in `OpteeMsgArgs`.
 ///
 /// Memref payload copies are deferred until their TA buffers are allocated.
-pub fn decode_ta_request(
+pub fn decode_ta_request<Platform: crate::OpteeShimPlatform>(
+    _platform: &Platform,
     msg_args: &OpteeMsgArgs,
 ) -> Result<TaRequestInfo<PAGE_SIZE>, OpteeSmcReturnCode> {
     let ta_entry_func: UteeEntryFunc = msg_args.cmd.try_into()?;
@@ -578,7 +591,9 @@ pub fn decode_ta_request(
 /// `ta_params` is a reference to `UteeParams` structure that stores TA's output within its memory.
 /// `ta_req_info` refers to the decoded TA request information including the normal world
 /// shared memory addresses to write back output data.
-pub fn update_optee_msg_args(
+#[allow(clippy::too_many_arguments)]
+pub fn update_optee_msg_args<Platform: crate::OpteeShimPlatform>(
+    platform: &Platform,
     return_code: TeeResult,
     return_origin: TeeOrigin,
     session_id: Option<u32>,
@@ -647,8 +662,8 @@ pub fn update_optee_msg_args(
                     let address = memref_addresses
                         .and_then(|addresses| addresses[index])
                         .ok_or(OpteeSmcReturnCode::EBadAddr)?;
-                    let ptr = crate::UserConstPtr::<u8>::from_usize(address);
-                    shm_info.copy_from_user(ptr, len)?;
+                    let ptr = crate::UserConstPtr::<Platform, u8>::from_usize(address);
+                    shm_info.copy_from_user(platform, ptr, len)?;
                 }
             }
             _ => {}
@@ -719,7 +734,12 @@ impl<const ALIGN: usize> ShmInfo<ALIGN> {
     /// Read into `buffer` from the normal-world shared memory pages referenced by `self`,
     /// starting at byte `offset` within the view.
     /// Returns `EBadAddr` if the requested range is not entirely within the view.
-    fn read_at(&self, offset: usize, buffer: &mut [u8]) -> Result<(), OpteeSmcReturnCode> {
+    fn read_at<Platform: litebox_common_linux::vmap::VmapManager<ALIGN>>(
+        &self,
+        platform: &Platform,
+        offset: usize,
+        buffer: &mut [u8],
+    ) -> Result<(), OpteeSmcReturnCode> {
         if offset
             .checked_add(buffer.len())
             .is_none_or(|end| end > self.len)
@@ -729,42 +749,77 @@ impl<const ALIGN: usize> ShmInfo<ALIGN> {
         if buffer.is_empty() {
             return Ok(());
         }
-        let ptr = NormalWorldConstPtr::<u8, ALIGN>::new(&self.page_addrs, self.page_offset)?;
+        let ptr = NormalWorldConstPtr::<Platform, u8, ALIGN>::new(
+            platform,
+            &self.page_addrs,
+            self.page_offset,
+        )?;
         ptr.read_slice_at_offset(offset, buffer)?;
         Ok(())
     }
 
     /// Copy from this normal-world shared memory into TA userspace.
-    pub(crate) fn copy_to_user(
+    pub(crate) fn copy_to_user<Platform>(
         &self,
-        dst: crate::UserMutPtr<u8>,
+        platform: &Platform,
+        dst: crate::UserMutPtr<Platform, u8>,
         len: usize,
-    ) -> Result<(), OpteeSmcReturnCode> {
+    ) -> Result<(), OpteeSmcReturnCode>
+    where
+        Platform: crate::OpteeShimPlatform + litebox_common_linux::vmap::VmapManager<ALIGN>,
+    {
         if len > self.len {
             return Err(OpteeSmcReturnCode::EBadAddr);
         }
         if len == 0 {
             return Ok(());
         }
-        let ptr = NormalWorldConstPtr::<u8, ALIGN>::new(&self.page_addrs, self.page_offset)?;
-        ptr.copy_to_user(dst, len)?;
+        let mut offset = 0;
+        let mut buffer = [0u8; PAGE_SIZE];
+        while offset < len {
+            let chunk_len = (len - offset).min(buffer.len());
+            self.read_at(platform, offset, &mut buffer[..chunk_len])?;
+            dst.copy_from_slice(offset, &buffer[..chunk_len])
+                .ok_or(OpteeSmcReturnCode::EBadAddr)?;
+            offset += chunk_len;
+        }
         Ok(())
     }
 
     /// Copy from TA userspace into this normal-world shared memory.
-    fn copy_from_user(
+    fn copy_from_user<Platform>(
         &self,
-        src: crate::UserConstPtr<u8>,
+        platform: &Platform,
+        src: crate::UserConstPtr<Platform, u8>,
         len: usize,
-    ) -> Result<(), OpteeSmcReturnCode> {
+    ) -> Result<(), OpteeSmcReturnCode>
+    where
+        Platform: crate::OpteeShimPlatform + litebox_common_linux::vmap::VmapManager<ALIGN>,
+    {
         if len > self.len {
             return Err(OpteeSmcReturnCode::EBadAddr);
         }
         if len == 0 {
             return Ok(());
         }
-        let ptr = NormalWorldMutPtr::<u8, ALIGN>::new(&self.page_addrs, self.page_offset)?;
-        ptr.copy_from_user(src, len)?;
+        let ptr = NormalWorldMutPtr::<Platform, u8, ALIGN>::new(
+            platform,
+            &self.page_addrs,
+            self.page_offset,
+        )?;
+        let mut offset = 0;
+        while offset < len {
+            let chunk_len = (len - offset).min(PAGE_SIZE);
+            let address = src
+                .as_usize()
+                .checked_add(offset)
+                .ok_or(OpteeSmcReturnCode::EBadAddr)?;
+            let chunk = crate::UserConstPtr::<Platform, u8>::from_usize(address)
+                .to_owned_slice(chunk_len)
+                .ok_or(OpteeSmcReturnCode::EBadAddr)?;
+            ptr.write_slice_at_offset(offset, &chunk)?;
+            offset += chunk_len;
+        }
         Ok(())
     }
 }
@@ -816,8 +871,9 @@ impl<const ALIGN: usize> ShmRefMap<ALIGN> {
     /// `aligned_size` indicates the page-aligned size of the shared memory region to register
     /// (i.e., `page_align_up(page_offset + size)`) and determines how many physical pages are
     /// walked from the [`ShmRefPagesData`] list.
-    pub fn register_shm(
+    pub fn register_shm<Platform: litebox_common_linux::vmap::VmapManager<ALIGN>>(
         &self,
+        platform: &Platform,
         shm_ref_pages_data_phys_addr: u64,
         page_offset: u64,
         size: u64,
@@ -841,8 +897,10 @@ impl<const ALIGN: usize> ShmRefMap<ALIGN> {
                 return Err(OpteeSmcReturnCode::EBadAddr);
             }
             visited_pages_data.insert(cur_addr);
-            let cur_ptr = NormalWorldConstPtr::<ShmRefPagesData, ALIGN>::with_usize(cur_addr)
-                .map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
+            let cur_ptr = NormalWorldConstPtr::<Platform, ShmRefPagesData, ALIGN>::with_usize(
+                platform, cur_addr,
+            )
+            .map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
             let pages_data = cur_ptr
                 .read_at_offset(0)
                 .map_err(|_| OpteeSmcReturnCode::EBadAddr)?;

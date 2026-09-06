@@ -4,8 +4,8 @@
 use anyhow::{Context as _, Result};
 use clap::Parser;
 use litebox_common_optee::{UteeEntryFunc, UteeParamOwned};
-use litebox_platform_multiplex::Platform;
-use litebox_shim_optee::session::session_manager;
+use litebox_platform_linux_userland::LinuxUserland as Platform;
+use litebox_shim_optee::session::SessionManager;
 use std::path::PathBuf;
 
 mod tests;
@@ -80,8 +80,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     // TODO(jb): Clean up platform initialization once we have https://github.com/MSRSSP/litebox/issues/24
     let platform = Platform::new(None);
-    litebox_platform_multiplex::set_platform(platform);
-    let shim_builder = litebox_shim_optee::OpteeShimBuilder::new();
+    // Leaked because the shim requires a `'static` session manager.
+    let session_manager: &'static SessionManager<Platform> =
+        Box::leak(Box::new(SessionManager::new()));
+    let shim_builder = litebox_shim_optee::OpteeShimBuilder::new(platform, session_manager);
     let _litebox = shim_builder.litebox();
     let shim = shim_builder.build();
 
@@ -105,7 +107,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 /// it can be loaded and run. Note that an OP-TEE TA does nothing without
 /// a client invoking commands on it.
 fn run_ta_with_default_commands(
-    shim: &litebox_shim_optee::OpteeShim,
+    shim: &litebox_shim_optee::OpteeShim<Platform>,
     ldelf_bin: &[u8],
     ta_bin: &[u8],
 ) {
@@ -117,7 +119,10 @@ fn run_ta_with_default_commands(
         let params = [const { UteeParamOwned::None }; UteeParamOwned::TEE_NUM_PARAMS];
 
         if func_id == UteeEntryFunc::OpenSession {
-            let session_token = session_manager().try_acquire_open_session_token().unwrap();
+            let session_token = shim
+                .session_manager()
+                .try_acquire_open_session_token()
+                .unwrap();
             let session_id = session_token.session_id().unwrap();
             let loaded_program = shim
                 .load_ldelf(ldelf_bin, ta_uuid)

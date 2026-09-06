@@ -12,23 +12,31 @@ pub mod vsm_intercept;
 pub mod vtl1_mem_layout;
 pub mod vtl_switch;
 
+use crate::mshv::vtl1_mem_layout::PAGE_SIZE;
 use litebox_common_linux::vmap::{
-    GlobalVmapManager, PhysPageAddrArray, PhysPageMapPermissions, PhysPointerError, VmapManager,
+    PhysPageAddrArray, PhysPageMapPermissions, PhysPointerError, VmapManager,
 };
+use litebox_common_lvbs::MAX_CORES;
+use modular_bitfield::prelude::*;
+use modular_bitfield::specifiers::{B3, B4, B7, B8, B16, B31, B32, B45, B51, B62};
+use num_enum::{IntoPrimitive, TryFromPrimitive};
 
-/// Provider for MSHV operations authorized to modify protected VTL0 frames.
-struct PrivilegedVmap;
+/// Adapter for mapping and modifying protected VTL0 frames.
+struct PrivilegedVmap<'a, P> {
+    platform: &'a P,
+}
 
-impl<const ALIGN: usize> GlobalVmapManager<ALIGN> for PrivilegedVmap {
-    type Manager = PrivilegedVmap;
-
-    fn manager() -> &'static Self::Manager {
-        &PrivilegedVmap
+impl<'a, P> PrivilegedVmap<'a, P> {
+    /// Mint the protection-bypassing mapper.
+    fn mint(platform: &'a P) -> Self {
+        Self { platform }
     }
 }
 
-unsafe impl<const ALIGN: usize> VmapManager<ALIGN> for PrivilegedVmap {
-    type MapInfo = crate::LvbsPhysPageMapInfo;
+unsafe impl<const ALIGN: usize, P: VmapManager<ALIGN>> VmapManager<ALIGN>
+    for PrivilegedVmap<'_, P>
+{
+    type MapInfo = P::MapInfo;
 
     unsafe fn vmap(
         &self,
@@ -37,7 +45,7 @@ unsafe impl<const ALIGN: usize> VmapManager<ALIGN> for PrivilegedVmap {
     ) -> Result<Self::MapInfo, PhysPointerError> {
         // SAFETY: callers uphold the raw mapping contract. This provider is used only for
         // writes whose destination the caller has independently authorized.
-        unsafe { crate::platform_low().vmap_privileged(pages, perms) }
+        unsafe { self.platform.vmap_privileged(pages, perms) }
     }
 
     unsafe fn vunmap(
@@ -46,16 +54,11 @@ unsafe impl<const ALIGN: usize> VmapManager<ALIGN> for PrivilegedVmap {
     ) -> Result<(), (PhysPointerError, Self::MapInfo)> {
         // SAFETY: `map_info` came from the same LVBS mapper and has no outstanding uses beyond the
         // physical-pointer guard that is dropping it.
-        unsafe {
-            <crate::host::LvbsLinuxKernel as VmapManager<ALIGN>>::vunmap(
-                crate::platform_low(),
-                map_info,
-            )
-        }
+        unsafe { self.platform.vunmap(map_info) }
     }
 
     fn validate_unowned(&self, pages: &PhysPageAddrArray<ALIGN>) -> Result<(), PhysPointerError> {
-        crate::platform_low().validate_unowned(pages)
+        self.platform.validate_unowned(pages)
     }
 
     unsafe fn protect(
@@ -64,24 +67,28 @@ unsafe impl<const ALIGN: usize> VmapManager<ALIGN> for PrivilegedVmap {
         perms: PhysPageMapPermissions,
     ) -> Result<(), PhysPointerError> {
         // SAFETY: callers uphold `VmapManager::protect`; this forwards unchanged to LVBS.
-        unsafe { crate::platform_low().protect(pages, perms) }
+        unsafe { self.platform.protect(pages, perms) }
     }
 }
 
-type Vtl0PhysConstPtr<T, const ALIGN: usize> =
-    litebox_common_linux::physical_pointers::PhysConstPtr<T, ALIGN, crate::Vmap>;
+type Vtl0PhysConstPtr<'a, T, const ALIGN: usize> =
+    litebox_common_linux::physical_pointers::PhysConstPtr<
+        'a,
+        crate::host::LvbsLinuxKernel,
+        T,
+        ALIGN,
+    >;
 
 /// Mutable VTL0 pointer reserved for callers that have independently validated the destination.
 /// It bypasses ordinary protected-frame access checks and synchronization. Do not use it for other
 /// VTL0 destinations that could enable confused-deputy writes.
-type PrivilegedVtl0PhysMutPtr<T, const ALIGN: usize> =
-    litebox_common_linux::physical_pointers::PhysMutPtr<T, ALIGN, PrivilegedVmap>;
-
-use crate::mshv::vtl1_mem_layout::PAGE_SIZE;
-use litebox_common_lvbs::MAX_CORES;
-use modular_bitfield::prelude::*;
-use modular_bitfield::specifiers::{B3, B4, B7, B8, B16, B31, B32, B45, B51, B62};
-use num_enum::{IntoPrimitive, TryFromPrimitive};
+type PrivilegedVtl0PhysMutPtr<'a, T, const ALIGN: usize> =
+    litebox_common_linux::physical_pointers::PhysMutPtr<
+        'a,
+        PrivilegedVmap<'a, crate::host::LvbsLinuxKernel>,
+        T,
+        ALIGN,
+    >;
 
 pub const HV_HYPERCALL_REP_COMP_MASK: u64 = 0xfff_0000_0000;
 pub const HV_HYPERCALL_REP_COMP_OFFSET: u32 = 32;

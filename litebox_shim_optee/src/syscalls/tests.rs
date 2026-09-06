@@ -1,28 +1,23 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use litebox_platform_multiplex::{Platform, set_platform};
-
-// Ensure we only init the platform once
-static INIT_FUNC: spin::Once = spin::Once::new();
+use litebox_platform_linux_userland::LinuxUserland as Platform;
 
 #[must_use]
-#[cfg_attr(
-    not(target_os = "linux"),
-    expect(unused_variables, reason = "ignored parameter on non-linux platforms")
-)]
-pub(crate) fn init_platform() -> crate::Task {
-    INIT_FUNC.call_once(|| {
-        #[cfg(target_os = "linux")]
-        let platform = Platform::new(None);
+pub(crate) fn shim_builder() -> crate::OpteeShimBuilder<Platform> {
+    static PLATFORM: spin::Once<&'static Platform> = spin::Once::new();
+    static SESSION_MANAGER: once_cell::race::OnceBox<crate::session::SessionManager<Platform>> =
+        once_cell::race::OnceBox::new();
 
-        #[cfg(not(target_os = "linux"))]
-        let platform = Platform::new();
+    let platform = *PLATFORM.call_once(|| Platform::new(None));
+    let session_manager = SESSION_MANAGER
+        .get_or_init(|| alloc::boxed::Box::new(crate::session::SessionManager::new()));
 
-        set_platform(platform);
-    });
+    crate::OpteeShimBuilder::new(platform, session_manager)
+}
 
-    let shim_builder = crate::OpteeShimBuilder::new();
+pub(crate) fn init_platform() -> crate::Task<Platform> {
+    let shim_builder = shim_builder();
     let _litebox = shim_builder.litebox();
     shim_builder.build().0.new_test_task()
 }
@@ -50,12 +45,12 @@ fn test_sys_get_time_system_is_monotonic() {
     let task = init_platform();
 
     let mut first = TeeTime::default();
-    let first_ptr = crate::UserMutPtr::<TeeTime>::from_usize(&raw mut first as usize);
+    let first_ptr = crate::UserMutPtr::<Platform, TeeTime>::from_usize(&raw mut first as usize);
     task.sys_get_time(TeeTimeCategory::System, first_ptr)
         .expect("system time should be supported");
 
     let mut second = TeeTime::default();
-    let second_ptr = crate::UserMutPtr::<TeeTime>::from_usize(&raw mut second as usize);
+    let second_ptr = crate::UserMutPtr::<Platform, TeeTime>::from_usize(&raw mut second as usize);
     task.sys_get_time(TeeTimeCategory::System, second_ptr)
         .expect("system time should be supported");
 
