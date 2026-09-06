@@ -125,5 +125,55 @@ pub trait HostNotificationChannel {
     type Error;
 
     /// Sends one broker notification.
+    ///
+    /// An error is terminal when this channel is part of an active
+    /// association. Before returning it, the transport must terminate that
+    /// association and unblock its request, response, notification, and
+    /// shutdown endpoints. This lets the association runtime preserve a clean
+    /// peer close while relying on the request endpoint to report transport
+    /// failures.
     fn send_notification(&mut self, notification: &BrokerNotification) -> Result<(), Self::Error>;
+}
+
+/// Host-side endpoint that reads active broker requests from an association's
+/// peer.
+///
+/// This is the request-reading half of an active association's control
+/// transport. It is transport-neutral so a generic association runtime,
+/// such as the one in `litebox_broker_userland`, can dispatch requests without
+/// depending on a concrete transport crate.
+pub trait HostRequestSource {
+    /// Channel-specific error type.
+    type Error;
+
+    /// Receives one active broker request.
+    fn recv_request(&mut self) -> Result<HostReceive<BrokerRequest>, Self::Error>;
+}
+
+/// Host-side endpoint that publishes active broker responses to an
+/// association's peer.
+///
+/// This is the response-writing half of an active association's control
+/// transport. Implementations are typically cheaply [`Clone`]able so
+/// concurrent request workers can each hold one.
+pub trait HostResponseSink {
+    /// Channel-specific error type.
+    type Error;
+
+    /// Serializes and sends one complete active broker response.
+    fn send_response(&self, response: &BrokerResponse) -> Result<(), Self::Error>;
+}
+
+/// RAII-independent shutdown handle for an active broker association.
+///
+/// Calling [`shutdown`](Self::shutdown) ends the association's transport so
+/// every endpoint blocked on it, such as a parked request read or a
+/// capacity-blocked notification send, observes termination instead of
+/// hanging.
+pub trait HostAssociationShutdown {
+    /// Channel-specific error type.
+    type Error;
+
+    /// Ends the active association transport without waiting for it to drain.
+    fn shutdown(&self) -> Result<(), Self::Error>;
 }

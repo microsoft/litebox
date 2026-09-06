@@ -24,7 +24,8 @@ use litebox_broker_protocol::wire::{
     encode_notification, encode_response,
 };
 use litebox_broker_transport::channel::{
-    HostNotificationChannel, HostReceive, HostSetupChannel, PeerCredential,
+    HostAssociationShutdown, HostNotificationChannel, HostReceive, HostRequestSource,
+    HostResponseSink, HostSetupChannel, PeerCredential,
 };
 use litebox_broker_transport::control_ring::{
     CONTROL_RING_READY, ControlRing, ControlRingConsumer, ControlRingProducer,
@@ -244,6 +245,14 @@ impl UnixControlRingHostShutdown {
     }
 }
 
+impl HostAssociationShutdown for UnixControlRingHostShutdown {
+    type Error = Error;
+
+    fn shutdown(&self) -> IoResult<()> {
+        Self::shutdown(self)
+    }
+}
+
 impl Drop for UnixControlRingHostShutdown {
     fn drop(&mut self) {
         let _ = self.association.fail(Error::new(
@@ -324,6 +333,14 @@ impl UnixControlRingHostRequestSource {
     }
 }
 
+impl HostRequestSource for UnixControlRingHostRequestSource {
+    type Error = Error;
+
+    fn recv_request(&mut self) -> IoResult<HostReceive<BrokerRequest>> {
+        Self::recv_request(self)
+    }
+}
+
 impl UnixControlRingHostResponseSink {
     /// Serializes and sends one complete active broker response.
     pub fn send_response(&self, response: &BrokerResponse) -> IoResult<()> {
@@ -344,6 +361,14 @@ impl UnixControlRingHostResponseSink {
                 }
             }
         }
+    }
+}
+
+impl HostResponseSink for UnixControlRingHostResponseSink {
+    type Error = Error;
+
+    fn send_response(&self, response: &BrokerResponse) -> IoResult<()> {
+        Self::send_response(self, response)
     }
 }
 

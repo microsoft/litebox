@@ -6,57 +6,23 @@ use std::io::{BufRead, BufReader, Error as IoError, ErrorKind, Result as IoResul
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::os::unix::net::UnixListener;
 use std::process::{Child, ChildStdout, Command, Stdio};
-use std::sync::Arc;
 use std::sync::mpsc::{RecvTimeoutError, sync_channel};
 use std::time::{Duration, Instant};
 
 use litebox_broker_core::socket::HOST_GATEWAY_IPV4_ADDRESS;
-use litebox_broker_core::{BrokerCore, BrokerCoreLimits, ObjectRights, PolicyEngine};
-use litebox_broker_platform_linux_userland::LinuxSocketProvider;
-#[cfg(feature = "lock_tracing")]
-use litebox_broker_platform_linux_userland::LinuxTimeProvider;
-use litebox_broker_protocol::message::{BrokerRequest, BrokerResponse};
+use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
-use litebox_broker_transport::channel::HostReceive;
 use litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory;
 use litebox_broker_transport_linux_userland::unix_socket::{
-    UnixControlRingHostRequestSource, UnixControlRingHostResponseSink, UnixControlRingHostShutdown,
     UnixStreamHostSetupChannel, validate_peer_process,
 };
+use litebox_broker_userland::builder::BrokerCoreBuilder;
 
-use super::{
-    HostAssociationShutdown, HostRequestSource, HostResponseSink, SETUP_TIMEOUT,
-    configured_socket_policy,
-};
-use super::{random::UserlandRandomProvider, stdio::UserlandStdioProvider};
+use super::{SETUP_TIMEOUT, configured_socket_policy};
 
 const PROXY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[cfg(feature = "lock_tracing")]
-static LOCK_TRACING_PLATFORM: LinuxTimeProvider = LinuxTimeProvider;
-
-impl HostRequestSource for UnixControlRingHostRequestSource {
-    fn recv_request(&mut self) -> IoResult<HostReceive<BrokerRequest>> {
-        Self::recv_request(self)
-    }
-}
-
-impl HostResponseSink for UnixControlRingHostResponseSink {
-    fn send_response(&self, response: &BrokerResponse) -> IoResult<()> {
-        Self::send_response(self, response)
-    }
-}
-
-impl HostAssociationShutdown for UnixControlRingHostShutdown {
-    fn shutdown(&self) -> IoResult<()> {
-        Self::shutdown(self)
-    }
-}
-
 pub(super) fn run(mut args: super::CliArgs) -> Result<(), Box<dyn Error>> {
-    #[cfg(feature = "lock_tracing")]
-    litebox_platform::sync::init_lock_tracing(&LOCK_TRACING_PLATFORM);
-
     let proxy = if args.allow_host.is_empty() {
         None
     } else {
@@ -78,19 +44,12 @@ pub(super) fn run(mut args: super::CliArgs) -> Result<(), Box<dyn Error>> {
     let control_socket_path = socket_dir.path().join("broker.sock");
     let control_listener = UnixListener::bind(&control_socket_path)?;
     control_listener.set_nonblocking(true)?;
-    let limits = BrokerCoreLimits::DEFAULT;
-    let broker = BrokerCore::new_with_limits(
+    let broker = BrokerCoreBuilder::new(
         PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()).with_socket_policy(
             configured_socket_policy(&args.allow_tcp_destination, &args.allow_udp_destination)?,
         ),
-        limits,
-        Arc::new(LinuxSocketProvider::new(
-            limits.max_sockets,
-            limits.max_sockets_per_session,
-        )?),
-        Arc::new(UserlandRandomProvider),
-        Arc::new(UserlandStdioProvider::new()?),
-    )?;
+    )
+    .build()?;
 
     crate::run_runner_process(
         &args,
@@ -214,7 +173,7 @@ fn serve_runner(
     validate_peer_process(&control_stream, runner_process_id)?;
     let control_channel =
         UnixStreamHostSetupChannel::from_host_guaranteed(control_stream, setup_deadline);
-    crate::serve_runner(
+    litebox_broker_userland::runtime::serve_association(
         broker,
         control_channel,
         || MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE),
@@ -225,5 +184,6 @@ fn serve_runner(
             Ok(())
         },
         UnixStreamHostSetupChannel::into_active,
-    )
+    )?;
+    Ok(())
 }
