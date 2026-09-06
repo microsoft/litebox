@@ -658,14 +658,16 @@ fn test_filesystem_provider(
 ) -> std::sync::Arc<dyn litebox_broker_core::filesystem::FilesystemProvider> {
     use std::os::unix::fs::PermissionsExt as _;
 
-    let owner = litebox::fs::UserInfo {
+    let owner = litebox::fs::in_mem::UserInfo {
         user: 1000,
         group: 1000,
     };
     let mut entries = vec![(
         "/tmp".to_owned(),
         litebox::fs::in_mem::InitialNode::Directory {
-            mode: litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
+            mode: litebox::fs::in_mem::Mode::RWXU
+                | litebox::fs::in_mem::Mode::RWXG
+                | litebox::fs::in_mem::Mode::RWXO,
             owner,
         },
     )];
@@ -688,7 +690,7 @@ fn test_filesystem_provider(
             let metadata = entry
                 .metadata()
                 .expect("failed to read broker test filesystem metadata");
-            let mode = litebox::fs::Mode::from_bits_retain(metadata.permissions().mode());
+            let mode = litebox::fs::in_mem::Mode::from_bits_retain(metadata.permissions().mode());
             let node = if metadata.is_dir() {
                 litebox::fs::in_mem::InitialNode::Directory { mode, owner }
             } else {

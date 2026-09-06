@@ -608,8 +608,10 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         let in_mem = litebox::fs::in_mem::InMem::<Platform>::new_initialized([(
             "/",
             litebox::fs::in_mem::InitialNode::Directory {
-                mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
-                owner: litebox::fs::UserInfo::ROOT,
+                mode: litebox::fs::in_mem::Mode::RWXU
+                    | litebox::fs::in_mem::Mode::RWXG
+                    | litebox::fs::in_mem::Mode::RWXO,
+                owner: litebox::fs::in_mem::UserInfo::ROOT,
             },
         )]);
         #[cfg(any(test, feature = "local_filesystem"))]

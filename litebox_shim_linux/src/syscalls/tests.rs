@@ -122,8 +122,10 @@ fn init_platform_with_builder(
     let in_mem = litebox::fs::in_mem::InMem::new_initialized([(
         "/",
         litebox::fs::in_mem::InitialNode::Directory {
-            mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
-            owner: litebox::fs::UserInfo::ROOT,
+            mode: litebox::fs::in_mem::Mode::RWXU
+                | litebox::fs::in_mem::Mode::RWXG
+                | litebox::fs::in_mem::Mode::RWXO,
+            owner: litebox::fs::in_mem::UserInfo::ROOT,
         },
     )]);
     let fs = alloc::sync::Arc::new(shim_builder.default_fs(in_mem, TEST_TAR_FILE.into()));

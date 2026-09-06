@@ -114,8 +114,10 @@ pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<Test
     let in_mem = litebox::fs::in_mem::InMem::new_initialized([(
         "/",
         litebox::fs::in_mem::InitialNode::Directory {
-            mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
-            owner: litebox::fs::UserInfo::ROOT,
+            mode: litebox::fs::in_mem::Mode::RWXU
+                | litebox::fs::in_mem::Mode::RWXG
+                | litebox::fs::in_mem::Mode::RWXO,
+            owner: litebox::fs::in_mem::UserInfo::ROOT,
         },
     )]);
     let shim_builder = crate::WindowsShimBuilder::<TestPlatform>::new(platform);

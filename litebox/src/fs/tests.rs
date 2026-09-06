@@ -1365,7 +1365,8 @@ mod tar_ro {
 mod overlay {
     use crate::LiteBox;
     use crate::fs::in_mem::{InMem, InitialNode};
-    use crate::fs::{FileType, Mode, OFlags, UserInfo};
+    use crate::fs::in_mem::{Mode as BackendMode, UserInfo as BackendUserInfo};
+    use crate::fs::{FileType, Mode, OFlags};
     use crate::platform::mock::MockPlatform;
     use alloc::vec;
     use alloc::vec::Vec;
@@ -1374,11 +1375,13 @@ mod overlay {
     const TEST_TAR_FILE: &[u8] = include_bytes!("./test.tar");
 
     /// The user these tests act as, and so the owner of anything they are set up as having created.
-    const ACTING_USER: UserInfo = UserInfo {
+    const ACTING_USER: BackendUserInfo = BackendUserInfo {
         user: 1000,
         group: 1000,
     };
-    const ALL_PERMS: Mode = Mode::RWXU.union(Mode::RWXG).union(Mode::RWXO);
+    const ALL_PERMS: BackendMode = BackendMode::RWXU
+        .union(BackendMode::RWXG)
+        .union(BackendMode::RWXO);
 
     /// An upper backend whose root is writable by the acting user, holding `entries`.
     ///
@@ -1392,7 +1395,7 @@ mod overlay {
                 "/",
                 InitialNode::Directory {
                     mode: ALL_PERMS,
-                    owner: UserInfo::ROOT,
+                    owner: BackendUserInfo::ROOT,
                 },
             )]
             .into_iter()
@@ -1578,7 +1581,7 @@ mod overlay {
                 (
                     "/upperfile",
                     InitialNode::File {
-                        mode: Mode::RWXU,
+                        mode: BackendMode::RWXU,
                         owner: ACTING_USER,
                         data: alloc::borrow::Cow::Borrowed(b""),
                     },
@@ -1720,7 +1723,7 @@ mod overlay {
                 (
                     "/upperfile",
                     InitialNode::File {
-                        mode: Mode::RWXU,
+                        mode: BackendMode::RWXU,
                         owner: ACTING_USER,
                         data: alloc::borrow::Cow::Borrowed(b""),
                     },
@@ -2257,8 +2260,9 @@ mod composed_stdio {
     use crate::fs::devices::Devices;
     use crate::fs::errors::{ReadError, WriteError};
     use crate::fs::in_mem::{InMem, InitialNode};
+    use crate::fs::in_mem::{Mode as BackendMode, UserInfo as BackendUserInfo};
     use crate::fs::resolver::Resolver;
-    use crate::fs::{Mode, OFlags, UserInfo};
+    use crate::fs::{Mode, OFlags};
     use crate::platform::mock::MockPlatform;
     use alloc::vec;
     extern crate std;
@@ -2273,8 +2277,8 @@ mod composed_stdio {
                     InMem::<MockPlatform>::new_initialized([(
                         "/",
                         InitialNode::Directory {
-                            mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
-                            owner: UserInfo::ROOT,
+                            mode: BackendMode::RWXU | BackendMode::RWXG | BackendMode::RWXO,
+                            owner: BackendUserInfo::ROOT,
                         },
                     )])
                 })

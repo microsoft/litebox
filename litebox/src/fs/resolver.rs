@@ -11,10 +11,11 @@ use alloc::vec::Vec;
 use crate::path::Arg;
 use crate::{LiteBox, fd::TypedFd, sync};
 #[cfg(any(test, feature = "local_filesystem"))]
-use litebox_broker_core::fs::backend::Backend;
-use litebox_broker_core::fs::backend::DeviceIo;
-#[cfg(any(test, feature = "local_filesystem"))]
-use litebox_broker_core::fs::resolver::{Filesystem, FilesystemOpenFile};
+use litebox_broker_core::fs::{
+    self as local_fs,
+    backend::{Backend, DeviceIo},
+    resolver::{Filesystem, FilesystemOpenFile},
+};
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::filesystem::{
@@ -27,12 +28,6 @@ use super::errors::{
     ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
 };
 use super::{FileType, Mode, OFlags, UserInfo};
-
-impl From<crate::path::ConversionError> for PathError {
-    fn from(_value: crate::path::ConversionError) -> Self {
-        Self::InvalidPathname
-    }
-}
 
 /// The guest-facing filesystem entry point.
 pub struct Resolver<Platform: sync::RawSyncPrimitivesProvider> {
@@ -121,7 +116,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider, FilesystemBackend: Backend + 'st
         flags: OFlags,
         mode: Mode,
     ) -> Result<FilesystemOpenFile<Platform>, OpenError> {
-        self.open(user, path, flags, mode)
+        self.open(
+            local_user_info(user),
+            path,
+            local_open_flags(flags),
+            local_mode(mode),
+        )
+        .map_err(local_open_error)
     }
 
     fn read(
@@ -132,6 +133,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, FilesystemBackend: Backend + 'st
         offset: Option<usize>,
     ) -> Result<usize, ReadError> {
         self.read(device_io, file, output, offset)
+            .map_err(local_read_error)
     }
 
     fn write(
@@ -142,6 +144,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, FilesystemBackend: Backend + 'st
         offset: Option<usize>,
     ) -> Result<usize, WriteError> {
         self.write(device_io, file, input, offset)
+            .map_err(local_write_error)
     }
 
     fn seek(
@@ -150,7 +153,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, FilesystemBackend: Backend + 'st
         offset: isize,
         whence: super::SeekWhence,
     ) -> Result<usize, SeekError> {
-        self.seek(file, offset, whence)
+        self.seek(file, offset, local_seek_whence(whence))
+            .map_err(local_seek_error)
     }
 
     fn truncate(
@@ -160,10 +164,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, FilesystemBackend: Backend + 'st
         reset_offset: bool,
     ) -> Result<(), TruncateError> {
         self.truncate(file, length, reset_offset)
+            .map_err(local_truncate_error)
     }
 
     fn chmod(&self, user: UserInfo, path: &str, mode: Mode) -> Result<(), ChmodError> {
-        self.chmod(user, path, mode)
+        self.chmod(local_user_info(user), path, local_mode(mode))
+            .map_err(local_chmod_error)
     }
 
     fn chown(
@@ -173,19 +179,23 @@ impl<Platform: sync::RawSyncPrimitivesProvider, FilesystemBackend: Backend + 'st
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError> {
-        self.chown(acting_user, path, user, group)
+        self.chown(local_user_info(acting_user), path, user, group)
+            .map_err(local_chown_error)
     }
 
     fn unlink(&self, user: UserInfo, path: &str) -> Result<(), UnlinkError> {
-        self.unlink(user, path)
+        self.unlink(local_user_info(user), path)
+            .map_err(local_unlink_error)
     }
 
     fn mkdir(&self, user: UserInfo, path: &str, mode: Mode) -> Result<(), MkdirError> {
-        self.mkdir(user, path, mode)
+        self.mkdir(local_user_info(user), path, local_mode(mode))
+            .map_err(local_mkdir_error)
     }
 
     fn rmdir(&self, user: UserInfo, path: &str) -> Result<(), RmdirError> {
-        self.rmdir(user, path)
+        self.rmdir(local_user_info(user), path)
+            .map_err(local_rmdir_error)
     }
 
     fn read_dir(
@@ -193,6 +203,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, FilesystemBackend: Backend + 'st
         file: &FilesystemOpenFile<Platform>,
     ) -> Result<Vec<super::DirEntry>, ReadDirError> {
         self.read_dir(file)
+            .map_err(local_read_dir_error)
+            .and_then(local_directory_entries)
     }
 
     fn file_status(
@@ -200,7 +212,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, FilesystemBackend: Backend + 'st
         user: UserInfo,
         path: &str,
     ) -> Result<super::FileStatus, FileStatusError> {
-        self.file_status(user, path)
+        self.file_status(local_user_info(user), path)
+            .map_err(local_file_status_error)
+            .and_then(local_file_status)
     }
 
     fn handle_status(
@@ -208,6 +222,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, FilesystemBackend: Backend + 'st
         file: &FilesystemOpenFile<Platform>,
     ) -> Result<super::FileStatus, FileStatusError> {
         self.handle_status(file)
+            .map_err(local_file_status_error)
+            .and_then(local_file_status)
     }
 
     fn get_static_backing_data(
@@ -272,21 +288,22 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Resolver<Platform> {
     }
 }
 
+#[cfg(any(test, feature = "local_filesystem"))]
 impl<Platform: sync::RawSyncPrimitivesProvider> DeviceIo for LiteBox<Platform> {
-    fn read_stdin(&self, output: &mut [u8]) -> Result<usize, ReadError> {
-        LiteBox::read_stdio(self, output).map_err(|_| ReadError::Io)
+    fn read_stdin(&self, output: &mut [u8]) -> Result<usize, local_fs::errors::ReadError> {
+        LiteBox::read_stdio(self, output).map_err(|_| local_fs::errors::ReadError::Io)
     }
 
     fn write_stdio(
         &self,
         stream: crate::stdio::StdioOutputStream,
         input: &[u8],
-    ) -> Result<usize, WriteError> {
-        LiteBox::write_stdio(self, stream, input).map_err(|_| WriteError::Io)
+    ) -> Result<usize, local_fs::errors::WriteError> {
+        LiteBox::write_stdio(self, stream, input).map_err(|_| local_fs::errors::WriteError::Io)
     }
 
-    fn fill_random(&self, output: &mut [u8]) -> Result<(), ReadError> {
-        LiteBox::fill_random(self, output).map_err(|_| ReadError::Io)
+    fn fill_random(&self, output: &mut [u8]) -> Result<(), local_fs::errors::ReadError> {
+        LiteBox::fill_random(self, output).map_err(|_| local_fs::errors::ReadError::Io)
     }
 }
 
@@ -836,6 +853,250 @@ impl Drop for BrokerOpenFileDescriptionInner {
     }
 }
 
+#[cfg(any(test, feature = "local_filesystem"))]
+const fn local_user_info(user: UserInfo) -> local_fs::UserInfo {
+    local_fs::UserInfo {
+        user: user.user,
+        group: user.group,
+    }
+}
+
+#[cfg(any(test, feature = "local_filesystem"))]
+fn local_mode(mode: Mode) -> local_fs::Mode {
+    local_fs::Mode::from_bits_retain(mode.bits())
+}
+
+#[cfg(any(test, feature = "local_filesystem"))]
+fn local_open_flags(flags: OFlags) -> local_fs::OFlags {
+    local_fs::OFlags::from_bits_retain(flags.bits())
+}
+
+#[cfg(any(test, feature = "local_filesystem"))]
+const fn local_seek_whence(whence: super::SeekWhence) -> local_fs::SeekWhence {
+    match whence {
+        super::SeekWhence::RelativeToBeginning => local_fs::SeekWhence::RelativeToBeginning,
+        super::SeekWhence::RelativeToCurrentOffset => local_fs::SeekWhence::RelativeToCurrentOffset,
+        super::SeekWhence::RelativeToEnd => local_fs::SeekWhence::RelativeToEnd,
+    }
+}
+
+#[cfg(any(test, feature = "local_filesystem"))]
+fn local_path_error(error: local_fs::errors::PathError) -> PathError {
+    match error {
+        local_fs::errors::PathError::NoSuchFileOrDirectory => PathError::NoSuchFileOrDirectory,
+        local_fs::errors::PathError::NoSearchPerms {
+            #[cfg(debug_assertions)]
+            dir,
+            #[cfg(debug_assertions)]
+            perms,
+        } => PathError::NoSearchPerms {
+            #[cfg(debug_assertions)]
+            dir,
+            #[cfg(debug_assertions)]
+            perms: Mode::from_bits_retain(perms.bits()),
+        },
+        local_fs::errors::PathError::InvalidPathname => PathError::InvalidPathname,
+        local_fs::errors::PathError::MissingComponent => PathError::MissingComponent,
+        local_fs::errors::PathError::ComponentNotADirectory => PathError::ComponentNotADirectory,
+    }
+}
+
+#[cfg(any(test, feature = "local_filesystem"))]
+fn local_open_error(error: local_fs::errors::OpenError) -> OpenError {
+    match error {
+        local_fs::errors::OpenError::AccessNotAllowed => OpenError::AccessNotAllowed,
+        local_fs::errors::OpenError::NoWritePerms => OpenError::NoWritePerms,
+        local_fs::errors::OpenError::ReadOnlyFileSystem => OpenError::ReadOnlyFileSystem,
+        local_fs::errors::OpenError::AlreadyExists => OpenError::AlreadyExists,
+        local_fs::errors::OpenError::TruncateError(error) => {
+            OpenError::TruncateError(local_truncate_error(error))
+        }
+        local_fs::errors::OpenError::PathError(error) => {
+            OpenError::PathError(local_path_error(error))
+        }
+        _ => OpenError::Io,
+    }
+}
+
+#[cfg(any(test, feature = "local_filesystem"))]
+fn local_read_error(error: local_fs::errors::ReadError) -> ReadError {
+    match error {
+        local_fs::errors::ReadError::ClosedFd => ReadError::ClosedFd,
+        local_fs::errors::ReadError::NotAFile => ReadError::NotAFile,
+        local_fs::errors::ReadError::NotForReading => ReadError::NotForReading,
+        _ => ReadError::Io,
+    }
+}
+
+#[cfg(any(test, feature = "local_filesystem"))]
+fn local_write_error(error: local_fs::errors::WriteError) -> WriteError {
+    match error {
+        local_fs::errors::WriteError::ClosedFd => WriteError::ClosedFd,
+        local_fs::errors::WriteError::NotAFile => WriteError::NotAFile,
+        local_fs::errors::WriteError::NotForWriting => WriteError::NotForWriting,
+        _ => WriteError::Io,
+    }
+}
+
+#[cfg(any(test, feature = "local_filesystem"))]
+fn local_seek_error(error: local_fs::errors::SeekError) -> SeekError {
+    match error {
+        local_fs::errors::SeekError::ClosedFd => SeekError::ClosedFd,
+        local_fs::errors::SeekError::NotAFile => SeekError::NotAFile,
+        local_fs::errors::SeekError::InvalidOffset => SeekError::InvalidOffset,
+        local_fs::errors::SeekError::NonSeekable => SeekError::NonSeekable,
+        _ => SeekError::Io,
+    }
+}
+
+#[cfg(any(test, feature = "local_filesystem"))]
+fn local_truncate_error(error: local_fs::errors::TruncateError) -> TruncateError {
+    match error {
+        local_fs::errors::TruncateError::ClosedFd => TruncateError::ClosedFd,
+        local_fs::errors::TruncateError::IsDirectory => TruncateError::IsDirectory,
+        local_fs::errors::TruncateError::NotForWriting => TruncateError::NotForWriting,
+        local_fs::errors::TruncateError::IsTerminalDevice => TruncateError::IsTerminalDevice,
+        local_fs::errors::TruncateError::Io => TruncateError::Io,
+    }
+}
+
+#[cfg(any(test, feature = "local_filesystem"))]
+fn local_chmod_error(error: local_fs::errors::ChmodError) -> ChmodError {
+    match error {
+        local_fs::errors::ChmodError::NotTheOwner => ChmodError::NotTheOwner,
+        local_fs::errors::ChmodError::ReadOnlyFileSystem => ChmodError::ReadOnlyFileSystem,
+        local_fs::errors::ChmodError::PathError(error) => {
+            ChmodError::PathError(local_path_error(error))
+        }
+        _ => ChmodError::Io,
+    }
+}
+
+#[cfg(any(test, feature = "local_filesystem"))]
+fn local_chown_error(error: local_fs::errors::ChownError) -> ChownError {
+    match error {
+        local_fs::errors::ChownError::NotTheOwner => ChownError::NotTheOwner,
+        local_fs::errors::ChownError::ReadOnlyFileSystem => ChownError::ReadOnlyFileSystem,
+        local_fs::errors::ChownError::PathError(error) => {
+            ChownError::PathError(local_path_error(error))
+        }
+        _ => ChownError::Io,
+    }
+}
+
+#[cfg(any(test, feature = "local_filesystem"))]
+fn local_unlink_error(error: local_fs::errors::UnlinkError) -> UnlinkError {
+    match error {
+        local_fs::errors::UnlinkError::NoWritePerms => UnlinkError::NoWritePerms,
+        local_fs::errors::UnlinkError::IsADirectory => UnlinkError::IsADirectory,
+        local_fs::errors::UnlinkError::ReadOnlyFileSystem => UnlinkError::ReadOnlyFileSystem,
+        local_fs::errors::UnlinkError::PathError(error) => {
+            UnlinkError::PathError(local_path_error(error))
+        }
+        _ => UnlinkError::Io,
+    }
+}
+
+#[cfg(any(test, feature = "local_filesystem"))]
+fn local_mkdir_error(error: local_fs::errors::MkdirError) -> MkdirError {
+    match error {
+        local_fs::errors::MkdirError::NoWritePerms => MkdirError::NoWritePerms,
+        local_fs::errors::MkdirError::AlreadyExists => MkdirError::AlreadyExists,
+        local_fs::errors::MkdirError::ReadOnlyFileSystem => MkdirError::ReadOnlyFileSystem,
+        local_fs::errors::MkdirError::PathError(error) => {
+            MkdirError::PathError(local_path_error(error))
+        }
+        _ => MkdirError::Io,
+    }
+}
+
+#[cfg(any(test, feature = "local_filesystem"))]
+fn local_rmdir_error(error: local_fs::errors::RmdirError) -> RmdirError {
+    match error {
+        local_fs::errors::RmdirError::NoWritePerms => RmdirError::NoWritePerms,
+        local_fs::errors::RmdirError::Busy => RmdirError::Busy,
+        local_fs::errors::RmdirError::NotEmpty => RmdirError::NotEmpty,
+        local_fs::errors::RmdirError::NotADirectory => RmdirError::NotADirectory,
+        local_fs::errors::RmdirError::ReadOnlyFileSystem => RmdirError::ReadOnlyFileSystem,
+        local_fs::errors::RmdirError::PathError(error) => {
+            RmdirError::PathError(local_path_error(error))
+        }
+        _ => RmdirError::Io,
+    }
+}
+
+#[cfg(any(test, feature = "local_filesystem"))]
+fn local_read_dir_error(error: local_fs::errors::ReadDirError) -> ReadDirError {
+    match error {
+        local_fs::errors::ReadDirError::ClosedFd => ReadDirError::ClosedFd,
+        local_fs::errors::ReadDirError::NotADirectory => ReadDirError::NotADirectory,
+        _ => ReadDirError::Io,
+    }
+}
+
+#[cfg(any(test, feature = "local_filesystem"))]
+fn local_file_status_error(error: local_fs::errors::FileStatusError) -> FileStatusError {
+    match error {
+        local_fs::errors::FileStatusError::ClosedFd => FileStatusError::ClosedFd,
+        local_fs::errors::FileStatusError::PathError(error) => {
+            FileStatusError::PathError(local_path_error(error))
+        }
+        _ => FileStatusError::Io,
+    }
+}
+
+#[cfg(any(test, feature = "local_filesystem"))]
+fn local_file_status(status: local_fs::FileStatus) -> Result<super::FileStatus, FileStatusError> {
+    Ok(super::FileStatus {
+        file_type: local_file_type(status.file_type).ok_or(FileStatusError::Io)?,
+        mode: Mode::from_bits_retain(status.mode.bits()),
+        size: status.size,
+        owner: UserInfo {
+            user: status.owner.user,
+            group: status.owner.group,
+        },
+        node_info: local_node_info(status.node_info),
+        blksize: status.blksize,
+    })
+}
+
+#[cfg(any(test, feature = "local_filesystem"))]
+fn local_directory_entries(
+    entries: Vec<local_fs::DirEntry>,
+) -> Result<Vec<super::DirEntry>, ReadDirError> {
+    let mut converted = Vec::new();
+    converted
+        .try_reserve_exact(entries.len())
+        .map_err(|_| ReadDirError::Io)?;
+    for entry in entries {
+        converted.push(super::DirEntry {
+            name: entry.name,
+            file_type: local_file_type(entry.file_type).ok_or(ReadDirError::Io)?,
+            ino_info: entry.ino_info.map(local_node_info),
+        });
+    }
+    Ok(converted)
+}
+
+#[cfg(any(test, feature = "local_filesystem"))]
+const fn local_file_type(file_type: local_fs::FileType) -> Option<FileType> {
+    match file_type {
+        local_fs::FileType::RegularFile => Some(FileType::RegularFile),
+        local_fs::FileType::Directory => Some(FileType::Directory),
+        local_fs::FileType::CharacterDevice => Some(FileType::CharacterDevice),
+        _ => None,
+    }
+}
+
+#[cfg(any(test, feature = "local_filesystem"))]
+fn local_node_info(node_info: local_fs::NodeInfo) -> super::NodeInfo {
+    super::NodeInfo {
+        dev: node_info.dev,
+        ino: node_info.ino,
+        rdev: node_info.rdev,
+    }
+}
+
 const fn filesystem_user(user: UserInfo) -> FilesystemUser {
     FilesystemUser {
         user: user.user,
@@ -1001,15 +1262,15 @@ fn file_status_error(error: FilesystemError) -> FileStatusError {
 }
 
 fn file_status(status: FilesystemFileStatus) -> Result<super::FileStatus, FileStatusError> {
-    Ok(super::FileStatus::new(
-        file_type(status.file_type),
-        Mode::from_bits_retain(status.mode),
-        usize::try_from(status.size).map_err(|_| FileStatusError::Io)?,
-        UserInfo {
+    Ok(super::FileStatus {
+        file_type: file_type(status.file_type),
+        mode: Mode::from_bits_retain(status.mode),
+        size: usize::try_from(status.size).map_err(|_| FileStatusError::Io)?,
+        owner: UserInfo {
             user: status.owner.user,
             group: status.owner.group,
         },
-        super::NodeInfo {
+        node_info: super::NodeInfo {
             dev: usize::try_from(status.node_info.dev).map_err(|_| FileStatusError::Io)?,
             ino: usize::try_from(status.node_info.ino).map_err(|_| FileStatusError::Io)?,
             rdev: status
@@ -1023,8 +1284,8 @@ fn file_status(status: FilesystemFileStatus) -> Result<super::FileStatus, FileSt
                 })
                 .transpose()?,
         },
-        usize::try_from(status.block_size).map_err(|_| FileStatusError::Io)?,
-    ))
+        blksize: usize::try_from(status.block_size).map_err(|_| FileStatusError::Io)?,
+    })
 }
 
 fn directory_entries(
@@ -1035,11 +1296,11 @@ fn directory_entries(
         .try_reserve_exact(entries.len())
         .map_err(|_| ReadDirError::Io)?;
     for entry in entries {
-        converted.push(super::DirEntry::new(
-            entry.name,
-            file_type(entry.file_type),
-            entry.node_info.map(node_info).transpose()?,
-        ));
+        converted.push(super::DirEntry {
+            name: entry.name,
+            file_type: file_type(entry.file_type),
+            ino_info: entry.node_info.map(node_info).transpose()?,
+        });
     }
     Ok(converted)
 }

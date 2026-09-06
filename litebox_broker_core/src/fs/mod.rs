@@ -200,29 +200,6 @@ pub struct FileStatus {
     pub blksize: usize,
 }
 
-impl FileStatus {
-    /// Constructs filesystem status information.
-    #[doc(hidden)]
-    #[must_use]
-    pub const fn new(
-        file_type: FileType,
-        mode: Mode,
-        size: usize,
-        owner: UserInfo,
-        node_info: NodeInfo,
-        blksize: usize,
-    ) -> Self {
-        Self {
-            file_type,
-            mode,
-            size,
-            owner,
-            node_info,
-            blksize,
-        }
-    }
-}
-
 /// User information
 #[derive(Clone, Copy, Debug)]
 pub struct UserInfo {
@@ -250,23 +227,6 @@ pub struct DirEntry {
     pub name: alloc::string::String,
     pub file_type: FileType,
     pub ino_info: Option<NodeInfo>,
-}
-
-impl DirEntry {
-    /// Constructs a directory entry.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn new(
-        name: alloc::string::String,
-        file_type: FileType,
-        ino_info: Option<NodeInfo>,
-    ) -> Self {
-        Self {
-            name,
-            file_type,
-            ino_info,
-        }
-    }
 }
 
 impl UserInfo {
