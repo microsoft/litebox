@@ -3,8 +3,6 @@
 
 use litebox_platform_linux_userland::LinuxUserland as Platform;
 
-/// A shim builder bound to the test platform and a single session registry shared by
-/// every shim built here, per [`crate::OpteeShimBuilder::new`]'s invariant.
 #[must_use]
 pub(crate) fn shim_builder() -> crate::OpteeShimBuilder<Platform> {
     static PLATFORM: spin::Once<&'static Platform> = spin::Once::new();

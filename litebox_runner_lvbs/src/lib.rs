@@ -45,11 +45,7 @@ use litebox_shim_optee::msg_handler::{
 use litebox_shim_optee::session::{OpenSessionTarget, SessionManager, TaInstance};
 use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr, TaMemrefAddresses, UserConstPtr};
 
-/// The session registry for this runner.
-///
-/// The shim is generic over its platform, so it cannot own this: a `static` cannot
-/// name a generic parameter. The composition root names the concrete platform, so
-/// the singleton lives here.
+/// The session registry shared by all shims in this runner.
 fn session_manager() -> &'static SessionManager<Platform> {
     static SESSION_MANAGER: once_cell::race::OnceBox<SessionManager<Platform>> =
         once_cell::race::OnceBox::new();
@@ -98,19 +94,15 @@ pub fn seed_initial_heap() {
 /// All cores then initialize hypercalls, GDT, IDT, interrupts, and syscall
 /// support.
 ///
-/// The BSP constructs the platform; every AP recovers that same instance here. This
-/// is the AP's arrival point, and from here the reference is passed by argument.
+/// The BSP constructs the platform, and every AP recovers the same instance here.
 ///
 /// # Panics
 ///
 /// Panics if VTL1 memory info is unavailable (BSP) or if hypercall
 /// initialization fails.
 pub fn init(is_bsp: bool) -> &'static Platform {
-    // Bootstrap-only handle, existing solely to satisfy the AP entry ABI: APs are
-    // entered by Hyper-V at `_ap_start`, a naked trampoline that can pass nothing but
-    // `is_bsp`, so the BSP publishes here and each AP recovers on arrival. Scoped to
-    // this function so no other code can reach for it: everything below `init` takes
-    // `&'static Platform` as an argument instead.
+    // The AP entry ABI cannot pass the platform, so the BSP publishes it here.
+    // Everything else takes `&'static Platform` as an argument.
     static BOOT_PLATFORM: once_cell::race::OnceRef<'static, Platform> =
         once_cell::race::OnceRef::new();
 
@@ -457,8 +449,6 @@ unsafe fn delete_task_page_table(
 /// table can run before this guard's `Drop` — the redundant write at
 /// drop time is benign.
 struct TaskPageTableGuard {
-    /// Needed by `Drop`, which cannot take arguments and so has nowhere to receive
-    /// the platform from.
     platform: &'static Platform,
 }
 

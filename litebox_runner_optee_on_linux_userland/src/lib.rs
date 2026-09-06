@@ -80,9 +80,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     // TODO(jb): Clean up platform initialization once we have https://github.com/MSRSSP/litebox/issues/24
     let platform = Platform::new(None);
-    // One registry per `run`, minted beside the platform it is paired with, so
-    // `OpteeShimBuilder::new`'s "one registry per image" invariant holds by
-    // construction. Leaked because the shim stores it as `&'static`.
+    // Leaked because the shim requires a `'static` session manager.
     let session_manager: &'static SessionManager<Platform> =
         Box::leak(Box::new(SessionManager::new()));
     let shim_builder = litebox_shim_optee::OpteeShimBuilder::new(platform, session_manager);

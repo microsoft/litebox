@@ -573,21 +573,17 @@ pub(crate) fn unprotect_physical_memory_range(
 
 // --- The gates: platform implementation of the capability traits -----------
 
-/// Capability implementing [`Vtl0Gate`]: mediated access to the untrusted VTL0.
-/// Held by the HEKI service.
+/// Capability implementing [`Vtl0Gate`] for mediated access to untrusted VTL0.
 pub struct LvbsVtl0Gate {
     /// Private, so the capability is built only via [`LvbsVtl0Gate::mint`],
     /// never a bare literal.
-    /// `'static` because it is long lived.
     platform: &'static crate::host::LvbsLinuxKernel,
 }
 
-/// Capability implementing [`Vtl1Gate`]: the VTL1 setup steps VTL0 may request.
-/// Held by the runner.
+/// Capability implementing [`Vtl1Gate`] for VTL1 setup requests.
 pub struct LvbsVtl1Gate {
     /// Private, so the capability is built only via [`LvbsVtl1Gate::mint`],
     /// never a bare literal.
-    /// `'static` because it is long lived.
     platform: &'static crate::host::LvbsLinuxKernel,
 }
 
