@@ -159,16 +159,9 @@ impl<Platform: crate::OpteeShimPlatform> TaInstance<Platform> {
     }
 }
 
-// SAFETY: `TaInstance` is not auto-`Send`/`Sync` only because of the `_not_send` marker in
-// `OpteeShimEntrypoints` and the `Cell`s in `Task`. Sharing those is sound because every
-// access goes through a `SessionToken` serializing on the per-UUID lock or the
-// per-`session_id` marker, so at most one core is ever inside an instance. See the
-// module-level "Concurrency Model". These impls vouch for that discipline and nothing else.
-//
-// Nothing reached through `Platform` needs vouching for: `OpteeShimPlatform` already
-// implies `Platform: Sync` and everything `GlobalState` holds (`LiteBox`, `PageManager`,
-// the handle maps) is auto-`Send + Sync`. Also, nothing under `TaInstance` stores
-// associated pointer types: `Task` keeps addresses as `Cell<usize>`.
+// SAFETY: `SessionManager` serializes access to each instance's non-`Sync`
+// entrypoints and `Cell` state. The remaining fields are `Send + Sync` under the
+// `OpteeShimPlatform` bound. See the module-level concurrency model.
 unsafe impl<Platform: crate::OpteeShimPlatform> Send for TaInstance<Platform> {}
 unsafe impl<Platform: crate::OpteeShimPlatform> Sync for TaInstance<Platform> {}
 
@@ -198,7 +191,7 @@ enum SessionEntry<Platform: crate::OpteeShimPlatform> {
     Dead { ta_uuid: TeeUuid, ta_flags: TaFlags },
 }
 
-// Hand-written: `#[derive(Clone)]` would add a spurious `Platform: Clone` bound.
+// Avoid the unnecessary `Platform: Clone` bound added by `derive`.
 impl<Platform: crate::OpteeShimPlatform> Clone for SessionEntry<Platform> {
     fn clone(&self) -> Self {
         match self {
@@ -499,12 +492,6 @@ pub struct SessionManager<Platform: crate::OpteeShimPlatform> {
     /// the session is unregistered.
     session_client_identities: SpinMutex<HashMap<u32, TeeIdentity>>,
 }
-
-// NOTE: the session manager singleton lives in the composition root (each
-// runner), not here. A `static` cannot name a generic parameter, and a shim
-// instance is built per session, so the shim has nowhere to put it. The runner
-// knows its concrete platform, so it can hold the `static` and hand out
-// `&'static SessionManager<ConcretePlatform>`.
 
 impl<Platform: crate::OpteeShimPlatform> SessionManager<Platform> {
     pub fn new() -> Self {

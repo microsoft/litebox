@@ -22,17 +22,14 @@ use modular_bitfield::specifiers::{B3, B4, B7, B8, B16, B31, B32, B45, B51, B62}
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 
 /// Adapter for mapping and modifying protected VTL0 frames.
-///
-/// Wrap a borrowed manager to bound lifetime: it cannot outlive the platform borrow
-/// it was built from, and it can only be obtained by having a platform in hand.
-/// Note that this is just for auditing: any code in this module can still construct it.
-struct PrivilegedVmap<'a, P>(&'a P);
+struct PrivilegedVmap<'a, P> {
+    platform: &'a P,
+}
 
 impl<'a, P> PrivilegedVmap<'a, P> {
-    /// Mint the protection-bypassing mapper. Every privileged VTL0 mapping starts here,
-    /// so `PrivilegedVmap::mint` is the grep target for auditing them like `LvbsVtl0Gate`.
+    /// Mint the protection-bypassing mapper.
     fn mint(platform: &'a P) -> Self {
-        Self(platform)
+        Self { platform }
     }
 }
 
@@ -48,7 +45,7 @@ unsafe impl<const ALIGN: usize, P: VmapManager<ALIGN>> VmapManager<ALIGN>
     ) -> Result<Self::MapInfo, PhysPointerError> {
         // SAFETY: callers uphold the raw mapping contract. This provider is used only for
         // writes whose destination the caller has independently authorized.
-        unsafe { self.0.vmap_privileged(pages, perms) }
+        unsafe { self.platform.vmap_privileged(pages, perms) }
     }
 
     unsafe fn vunmap(
@@ -57,11 +54,11 @@ unsafe impl<const ALIGN: usize, P: VmapManager<ALIGN>> VmapManager<ALIGN>
     ) -> Result<(), (PhysPointerError, Self::MapInfo)> {
         // SAFETY: `map_info` came from the same LVBS mapper and has no outstanding uses beyond the
         // physical-pointer guard that is dropping it.
-        unsafe { self.0.vunmap(map_info) }
+        unsafe { self.platform.vunmap(map_info) }
     }
 
     fn validate_unowned(&self, pages: &PhysPageAddrArray<ALIGN>) -> Result<(), PhysPointerError> {
-        self.0.validate_unowned(pages)
+        self.platform.validate_unowned(pages)
     }
 
     unsafe fn protect(
@@ -70,7 +67,7 @@ unsafe impl<const ALIGN: usize, P: VmapManager<ALIGN>> VmapManager<ALIGN>
         perms: PhysPageMapPermissions,
     ) -> Result<(), PhysPointerError> {
         // SAFETY: callers uphold `VmapManager::protect`; this forwards unchanged to LVBS.
-        unsafe { self.0.protect(pages, perms) }
+        unsafe { self.platform.protect(pages, perms) }
     }
 }
 

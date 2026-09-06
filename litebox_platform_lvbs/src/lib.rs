@@ -1104,7 +1104,6 @@ impl<Host: HostInterface> litebox::platform::SystemInfoProvider for LinuxKernel<
     }
 }
 
-// Concrete: the VTL0 protection hypercalls exist only for the LVBS host.
 unsafe impl<const ALIGN: usize> VmapManager<ALIGN> for crate::host::LvbsLinuxKernel {
     type MapInfo = LvbsPhysPageMapInfo;
 

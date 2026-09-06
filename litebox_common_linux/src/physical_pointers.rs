@@ -405,8 +405,7 @@ impl<V: VmapManager<ALIGN>, const ALIGN: usize> PhysMutPtr<'_, V, u8, ALIGN> {
 
 /// RAII guard that unmaps physical pages when dropped.
 ///
-/// Created by `map_and_get_ptr_guard`. Its lifetime is tied to the guard to a borrow of
-/// the parent `PhysMutPtr`.
+/// Created by `map_and_get_ptr_guard`; its lifetime is tied to the parent `PhysMutPtr`.
 ///
 /// # Invariant
 ///
