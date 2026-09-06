@@ -8,11 +8,6 @@ use thiserror::Error;
 ///
 /// `ALIGN`: The page frame size.
 ///
-/// This provider exists to service [`crate::physical_pointers::PhysMutPtr`] and
-/// [`crate::physical_pointers::PhysConstPtr`], which borrow an implementor. It
-/// can benefit other modules which need Linux kernel's `vmap()` and `vunmap()`
-/// functionalities (e.g., HVCI/HEKI, drivers).
-///
 /// # Safety
 ///
 /// Implementors must uphold each unsafe method's contract and keep [`Self::MapInfo`] tied to the

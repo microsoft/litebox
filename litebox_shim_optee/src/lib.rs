@@ -42,13 +42,7 @@ pub use session::{OpenSessionTarget, SessionManager, SessionToken, TaInstance};
 
 const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
 
-/// Aggregate bound capturing everything the OP-TEE shim requires of a platform.
-///
-/// This exists so that the (many) `impl` blocks throughout the shim can be written
-/// as `impl<Platform: OpteeShimPlatform, ..>` rather than repeating a large `where` clause.
-///
-/// `VmapManager` is part of the contract because the shim reads and writes normal-world
-/// physical memory through [`NormalWorldConstPtr`]/[`NormalWorldMutPtr`].
+/// Platform capabilities required by the OP-TEE shim.
 pub trait OpteeShimPlatform:
     litebox::platform::RawPointerProvider
     + litebox::platform::TimeProvider
@@ -161,15 +155,9 @@ pub struct OpteeShimBuilder<Platform: OpteeShimPlatform> {
 }
 
 impl<Platform: OpteeShimPlatform> OpteeShimBuilder<Platform> {
-    /// Returns a new shim builder for `platform`.
+    /// Returns a new shim builder.
     ///
-    /// # Invariant
-    ///
-    /// `session_manager` must be the one session registry of the LiteBox image this
-    /// shim runs in — per process for a userland runner, per VTL1 kernel image for
-    /// LVBS, where all VPs share it. Shims are built per session, so passing a second
-    /// registry splits session state across two views. Reach the registry via
-    /// [`OpteeShim::session_manager`] where a shim is already in hand.
+    /// Every shim for this platform instance shares the same `session_manager`.
     pub fn new(
         platform: &'static Platform,
         session_manager: &'static session::SessionManager<Platform>,
@@ -358,8 +346,6 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
     }
 
     /// The session registry this shim was built against.
-    ///
-    /// See the invariant on [`OpteeShimBuilder::new`].
     #[must_use]
     pub fn session_manager(&self) -> &'static session::SessionManager<Platform> {
         self.0.session_manager
