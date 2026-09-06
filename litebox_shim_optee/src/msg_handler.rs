@@ -591,6 +591,7 @@ pub fn decode_ta_request<Platform: crate::OpteeShimPlatform>(
 /// `ta_params` is a reference to `UteeParams` structure that stores TA's output within its memory.
 /// `ta_req_info` refers to the decoded TA request information including the normal world
 /// shared memory addresses to write back output data.
+#[allow(clippy::too_many_arguments)]
 pub fn update_optee_msg_args<Platform: crate::OpteeShimPlatform>(
     platform: &Platform,
     return_code: TeeResult,

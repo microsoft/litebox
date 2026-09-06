@@ -1313,6 +1313,7 @@ fn handle_close_session(
 ///
 /// Panics if called while the base page table is active (i.e., not in a TA context).
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn write_msg_args_to_normal_world(
     platform: &'static Platform,
     msg_args: &mut OpteeMsgArgs,
