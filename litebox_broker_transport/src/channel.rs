@@ -7,15 +7,6 @@
 //! local endpoint and the broker host. They are transport-neutral: an
 //! implementation may use Unix sockets, shared rings, kernel traps, or another
 //! IPC mechanism.
-//!
-//! [`HostRequestSource`], [`HostResponseSink`], and [`HostAssociationShutdown`]
-//! additionally let a generic hosted association runtime, such as the one in
-//! `litebox_broker_userland`, dispatch requests and tear down an association
-//! without depending on a concrete transport crate. Concrete transports, such
-//! as `litebox_broker_transport_linux_userland` and
-//! `litebox_broker_transport_windows_userland`, implement these traits for
-//! their active host endpoint types in addition to those types' inherent
-//! methods.
 
 use litebox_broker_protocol::message::{
     BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequest,
