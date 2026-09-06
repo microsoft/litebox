@@ -30,7 +30,6 @@ use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedBufferPoo
 
 use litebox_broker_userland::readiness::ReadinessPublisherRuntime;
 
-mod filesystem;
 #[cfg(target_os = "linux")]
 mod linux;
 mod random;

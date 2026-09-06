@@ -21,6 +21,7 @@ extern crate std;
 mod error;
 pub mod event;
 pub mod filesystem;
+pub mod fs;
 pub mod pipe;
 mod policy;
 pub mod random;

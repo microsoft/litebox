@@ -20,7 +20,6 @@ use super::errors::{
 };
 use super::inode_allocator::{InodeAllocator, InodeAllocators};
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
-use crate::path::Arg;
 use thiserror::Error;
 
 // XXX(jayb): consider removing this via a runtime reserved device ID?
@@ -79,11 +78,7 @@ impl Composer {
 impl ComposerBuilder {
     /// Add a backend mounted at `path`.
     #[must_use]
-    pub fn mount<B: Backend>(
-        self,
-        path: impl Arg,
-        backend: impl FnOnce(InodeAllocator) -> B,
-    ) -> Self {
+    pub fn mount<B: Backend>(self, path: &str, backend: impl FnOnce(InodeAllocator) -> B) -> Self {
         self.mount_nestable(path, |allocators| backend(allocators.next()))
     }
 
@@ -91,13 +86,12 @@ impl ComposerBuilder {
     #[must_use]
     pub fn mount_nestable<B: Backend>(
         mut self,
-        path: impl Arg,
+        path: &str,
         backend: impl FnOnce(&InodeAllocators) -> B,
     ) -> Self {
         // TODO(jayb): Decide whether we need a fallible version of closure-based mount.
         let backend = backend(&self.allocators);
-        self.mounts
-            .push((path.as_rust_str().map(Into::into).ok(), Box::new(backend)));
+        self.mounts.push((Some(path.into()), Box::new(backend)));
         self
     }
 

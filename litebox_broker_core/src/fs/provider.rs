@@ -3,28 +3,27 @@
 
 //! Adapter from the LiteBox filesystem engine to broker filesystem contracts.
 
-use std::sync::{Arc, Mutex};
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 
-use litebox::fs::backend::{Backend, DeviceIo};
-use litebox::fs::composer::Composer;
-use litebox::fs::errors::{
+use super::backend::{Backend, DeviceIo};
+use super::composer::Composer;
+use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
     ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
 };
-use litebox::fs::resolver::{Filesystem, FilesystemOpenFile};
-use litebox::fs::{DirEntry, FileStatus, FileType, Mode, OFlags, SeekWhence, UserInfo};
-use litebox_broker_core::AssociationCancellation;
-use litebox_broker_core::filesystem::{
-    FilesystemProvider, OpenFileDescription as BrokerOpenFileDescription,
-};
-use litebox_broker_core::random::RandomProvider;
-use litebox_broker_core::stdio::StdioProvider;
+use super::resolver::{Filesystem, FilesystemOpenFile};
+use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence, UserInfo};
+use crate::AssociationCancellation;
+use crate::filesystem::{FilesystemProvider, OpenFileDescription as BrokerOpenFileDescription};
+use crate::random::RandomProvider;
+use crate::stdio::StdioProvider;
 use litebox_broker_protocol::filesystem::{
     FilesystemDirectoryEntry, FilesystemError, FilesystemFileStatus, FilesystemFileType,
     FilesystemNamespace, FilesystemNodeInfo, FilesystemSeekWhence, FilesystemUser,
     paginate_directory_entries,
 };
-use litebox_platform::sync::RawSyncPrimitivesProvider;
+use litebox_platform::sync::{Mutex, RawSyncPrimitivesProvider};
 
 /// Routes each filesystem namespace to its isolated provider.
 pub struct NamespacedFilesystemProvider {
@@ -175,21 +174,18 @@ pub fn create_windows_registry_provider<Platform>(
 where
     Platform: RawSyncPrimitivesProvider + Send + Sync + 'static,
 {
-    let in_mem = litebox::fs::in_mem::InMem::<Platform>::new_initialized([(
+    let in_mem = super::in_mem::InMem::<Platform>::new_initialized([(
         "/",
-        litebox::fs::in_mem::InitialNode::Directory {
+        super::in_mem::InitialNode::Directory {
             mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
             owner: UserInfo::ROOT,
         },
     )]);
     let backend = Composer::builder()
         .mount_nestable("/", |allocators| {
-            litebox::fs::overlay::Overlay::<Platform>::new(
+            super::overlay::Overlay::<Platform>::new(
                 in_mem,
-                litebox::fs::tar_ro::TarRo::new(
-                    litebox::fs::tar_ro::EMPTY_TAR_FILE.into(),
-                    allocators.next(),
-                ),
+                super::tar_ro::TarRo::new(super::tar_ro::EMPTY_TAR_FILE.into(), allocators.next()),
                 allocators.next(),
             )
         })
@@ -245,7 +241,7 @@ where
         self.filesystem
             .file_status(user_info(user), path)
             .map_err(filesystem_file_status_error)
-            .and_then(file_status)
+            .map(file_status)
     }
 
     fn chmod(
@@ -322,7 +318,7 @@ where
     file: FilesystemOpenFile<Platform>,
     random: Arc<dyn RandomProvider>,
     stdio: Arc<dyn StdioProvider>,
-    directory_snapshot: Mutex<Option<Vec<FilesystemDirectoryEntry>>>,
+    directory_snapshot: Mutex<Platform, Option<Vec<FilesystemDirectoryEntry>>>,
 }
 
 impl<Platform, FilesystemBackend> BrokerOpenFileDescription
@@ -412,10 +408,7 @@ where
         start_index: u64,
         maximum_encoded_length: usize,
     ) -> Result<(Vec<FilesystemDirectoryEntry>, Option<u64>), FilesystemError> {
-        let mut snapshot = self
-            .directory_snapshot
-            .lock()
-            .map_err(|_| FilesystemError::Io)?;
+        let mut snapshot = self.directory_snapshot.lock();
         if start_index == 0 {
             let entries = self
                 .filesystem
@@ -423,7 +416,7 @@ where
                 .map_err(filesystem_read_dir_error)?
                 .into_iter()
                 .map(directory_entry)
-                .collect::<Result<Vec<_>, _>>()?;
+                .collect();
             *snapshot = Some(entries);
         }
         let entries = snapshot.as_ref().ok_or(FilesystemError::Io)?;
@@ -442,7 +435,7 @@ where
         self.filesystem
             .handle_status(&self.file)
             .map_err(filesystem_file_status_error)
-            .and_then(file_status)
+            .map(file_status)
     }
 }
 
@@ -461,22 +454,11 @@ impl DeviceIo for BrokerDeviceIo<'_> {
 
     fn write_stdio(
         &self,
-        stream: litebox::stdio::StdioOutputStream,
+        stream: litebox_broker_protocol::stdio::StdioOutputStream,
         input: &[u8],
     ) -> Result<usize, WriteError> {
         self.stdio
-            .write(
-                self.cancellation,
-                match stream {
-                    litebox::stdio::StdioOutputStream::Stdout => {
-                        litebox_broker_protocol::stdio::StdioOutputStream::Stdout
-                    }
-                    litebox::stdio::StdioOutputStream::Stderr => {
-                        litebox_broker_protocol::stdio::StdioOutputStream::Stderr
-                    }
-                },
-                input,
-            )
+            .write(self.cancellation, stream, input)
             .map_err(|_| WriteError::Io)
     }
 
@@ -500,9 +482,9 @@ const fn seek_whence(whence: FilesystemSeekWhence) -> SeekWhence {
     }
 }
 
-fn file_status(status: FileStatus) -> Result<FilesystemFileStatus, FilesystemError> {
-    Ok(FilesystemFileStatus {
-        file_type: file_type(status.file_type)?,
+fn file_status(status: FileStatus) -> FilesystemFileStatus {
+    FilesystemFileStatus {
+        file_type: file_type(status.file_type),
         mode: status.mode.bits(),
         size: status.size as u64,
         owner: FilesystemUser {
@@ -511,27 +493,26 @@ fn file_status(status: FileStatus) -> Result<FilesystemFileStatus, FilesystemErr
         },
         node_info: node_info(status.node_info),
         block_size: status.blksize as u64,
-    })
-}
-
-fn directory_entry(entry: DirEntry) -> Result<FilesystemDirectoryEntry, FilesystemError> {
-    Ok(FilesystemDirectoryEntry {
-        name: entry.name,
-        file_type: file_type(entry.file_type)?,
-        node_info: entry.ino_info.map(node_info),
-    })
-}
-
-fn file_type(file_type: FileType) -> Result<FilesystemFileType, FilesystemError> {
-    match file_type {
-        FileType::RegularFile => Ok(FilesystemFileType::RegularFile),
-        FileType::Directory => Ok(FilesystemFileType::Directory),
-        FileType::CharacterDevice => Ok(FilesystemFileType::CharacterDevice),
-        _ => Err(FilesystemError::Io),
     }
 }
 
-fn node_info(node_info: litebox::fs::NodeInfo) -> FilesystemNodeInfo {
+fn directory_entry(entry: DirEntry) -> FilesystemDirectoryEntry {
+    FilesystemDirectoryEntry {
+        name: entry.name,
+        file_type: file_type(entry.file_type),
+        node_info: entry.ino_info.map(node_info),
+    }
+}
+
+const fn file_type(file_type: FileType) -> FilesystemFileType {
+    match file_type {
+        FileType::RegularFile => FilesystemFileType::RegularFile,
+        FileType::Directory => FilesystemFileType::Directory,
+        FileType::CharacterDevice => FilesystemFileType::CharacterDevice,
+    }
+}
+
+fn node_info(node_info: NodeInfo) -> FilesystemNodeInfo {
     FilesystemNodeInfo {
         dev: node_info.dev as u64,
         ino: node_info.ino as u64,
@@ -656,69 +637,5 @@ fn filesystem_file_status_error(error: FileStatusError) -> FilesystemError {
     match error {
         FileStatusError::PathError(error) => filesystem_path_error(error),
         _ => FilesystemError::Io,
-    }
-}
-
-#[cfg(all(test, target_os = "linux"))]
-mod tests {
-    use super::*;
-    use litebox_broker_core::random::{RandomProvider, RandomProviderError};
-    use litebox_broker_core::stdio::UnsupportedStdioProvider;
-    use litebox_broker_platform_linux_userland::LinuxSyncPrimitivesProvider;
-
-    struct TestRandomProvider;
-
-    impl RandomProvider for TestRandomProvider {
-        fn fill(&self, output: &mut [u8]) -> Result<(), RandomProviderError> {
-            output.fill(0);
-            Ok(())
-        }
-    }
-
-    fn empty_provider() -> Arc<dyn FilesystemProvider> {
-        create_windows_registry_provider::<LinuxSyncPrimitivesProvider>(
-            Arc::new(TestRandomProvider),
-            Arc::new(UnsupportedStdioProvider),
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn filesystem_namespaces_are_isolated() {
-        let provider = NamespacedFilesystemProvider::new(empty_provider(), empty_provider());
-        let cancellation = AssociationCancellation::default();
-        let user = FilesystemUser { user: 0, group: 0 };
-
-        drop(
-            provider
-                .open(
-                    &cancellation,
-                    FilesystemNamespace::Guest,
-                    "/guest-only",
-                    user,
-                    (OFlags::CREAT | OFlags::WRONLY).bits(),
-                    Mode::RUSR.bits(),
-                )
-                .unwrap(),
-        );
-        assert!(
-            provider
-                .path_status(
-                    &cancellation,
-                    FilesystemNamespace::Guest,
-                    "/guest-only",
-                    user,
-                )
-                .is_ok()
-        );
-        assert_eq!(
-            provider.path_status(
-                &cancellation,
-                FilesystemNamespace::WindowsRegistry,
-                "/guest-only",
-                user,
-            ),
-            Err(FilesystemError::NoSuchFileOrDirectory)
-        );
     }
 }

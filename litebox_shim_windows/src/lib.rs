@@ -218,8 +218,7 @@ impl<Platform: ShimPlatform> Clone for WindowsSectionView<Platform> {
 
 pub type DefaultFS<Platform> = WindowsFS<Platform>;
 
-pub type WindowsFS<Platform> =
-    litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>;
+pub type WindowsFS<Platform> = litebox::fs::resolver::Resolver<Platform>;
 
 fn write_value<Platform, T>(address: usize, value: T) -> Option<()>
 where

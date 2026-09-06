@@ -8,14 +8,29 @@ use alloc::vec::Vec;
 use core::any::{Any, TypeId};
 use core::marker::PhantomData;
 
-use crate::utilities::anymap::AnyCloneSendSync;
+use litebox_broker_protocol::stdio::StdioOutputStream;
 
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, ReadDirError, ReadError,
     RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::{DirEntry, FileStatus, Mode, OFlags, UserInfo};
-use crate::stdio::StdioOutputStream;
+
+trait AnyCloneSendSync: Any + Send + Sync {
+    fn clone_to_any(&self) -> Box<dyn AnyCloneSendSync>;
+}
+
+impl<T: Any + Clone + Send + Sync> AnyCloneSendSync for T {
+    fn clone_to_any(&self) -> Box<dyn AnyCloneSendSync> {
+        Box::new(self.clone())
+    }
+}
+
+impl Clone for Box<dyn AnyCloneSendSync> {
+    fn clone(&self) -> Self {
+        (**self).clone_to_any()
+    }
+}
 
 /// I/O services used by special device backends.
 pub trait DeviceIo {

@@ -65,8 +65,7 @@ use crate::syscalls::file::get_file_descriptor_flags;
 
 pub type DefaultFS<Platform> = LinuxFS<Platform>;
 
-pub(crate) type LinuxFS<Platform> =
-    litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>;
+pub(crate) type LinuxFS<Platform> = litebox::fs::resolver::Resolver<Platform>;
 
 pub(crate) type FileFd<Platform> = litebox::fd::TypedFd<LinuxFS<Platform>>;
 

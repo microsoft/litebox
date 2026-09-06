@@ -17,9 +17,9 @@ use crate::fs::resolver::Resolver;
 use crate::fs::{Mode, OFlags};
 use crate::platform::mock::MockPlatform;
 
-use super::{NineP, transport};
+use super::nine_p::{NineP, transport};
 
-type NinePFs<T> = Resolver<MockPlatform, NineP<MockPlatform, T>>;
+type NinePFs = Resolver<MockPlatform>;
 
 /// Attach to `server` over `transport`, building the backend the tests resolve paths through.
 fn attach<T: transport::Read + transport::Write>(
@@ -194,10 +194,7 @@ impl Drop for DiodServer {
 // Helper: create a connected 9P filesystem
 // ---------------------------------------------------------------------------
 
-fn connect_9p(
-    litebox: &crate::LiteBox<MockPlatform>,
-    server: &DiodServer,
-) -> NinePFs<TcpTransport> {
+fn connect_9p(litebox: &crate::LiteBox<MockPlatform>, server: &DiodServer) -> NinePFs {
     let transport = TcpTransport::connect(&server.addr());
     Resolver::new(litebox, attach(transport, server))
 }
@@ -564,7 +561,7 @@ fn connect_9p_broken(
     litebox: &crate::LiteBox<MockPlatform>,
     server: &DiodServer,
     allowed_writes: usize,
-) -> NinePFs<BrokenTransport> {
+) -> NinePFs {
     let tcp = TcpTransport::connect(&server.addr());
     Resolver::new(
         litebox,

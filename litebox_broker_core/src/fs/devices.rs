@@ -9,7 +9,7 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::stdio::StdioOutputStream;
+use litebox_broker_protocol::stdio::StdioOutputStream;
 
 use super::backend::{
     Backend, BackendHandles, CreationMetadata, DeviceIo, DirHandle, FileHandle, HandleRef,
@@ -361,21 +361,42 @@ impl Backend for Devices {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::LiteBox;
-    use crate::platform::mock::MockPlatform;
+
+    struct NoDeviceIo;
+
+    impl DeviceIo for NoDeviceIo {
+        fn read_stdin(&self, _output: &mut [u8]) -> Result<usize, ReadError> {
+            Err(ReadError::Io)
+        }
+
+        fn write_stdio(
+            &self,
+            _stream: StdioOutputStream,
+            _input: &[u8],
+        ) -> Result<usize, WriteError> {
+            Err(WriteError::Io)
+        }
+
+        fn fill_random(&self, output: &mut [u8]) -> Result<(), ReadError> {
+            if output.is_empty() {
+                Ok(())
+            } else {
+                Err(ReadError::Io)
+            }
+        }
+    }
 
     #[test]
-    fn urandom_requires_broker_only_for_nonempty_reads() {
-        let litebox = LiteBox::new(MockPlatform::new());
+    fn urandom_requires_device_io_only_for_nonempty_reads() {
         let devices = Devices::new(InodeAllocator::standalone());
         let urandom = devices
             .open_file_at(devices.root(), "urandom", OFlags::RDONLY)
             .unwrap()
             .item;
 
-        assert_eq!(devices.read(&litebox, &urandom, &mut [], 0).unwrap(), 0);
+        assert_eq!(devices.read(&NoDeviceIo, &urandom, &mut [], 0).unwrap(), 0);
         assert!(matches!(
-            devices.read(&litebox, &urandom, &mut [0], 0),
+            devices.read(&NoDeviceIo, &urandom, &mut [0], 0),
             Err(ReadError::Io)
         ));
     }

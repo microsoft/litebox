@@ -6,9 +6,9 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 
-use litebox::fs::nine_p::transport;
 use litebox::net::socket_channel::{ChannelReadError, ChannelWriteError, NetworkProxy};
 use litebox::net::{ReceiveFlags, SendFlags};
+use litebox_broker_core::fs::nine_p::transport;
 use litebox_common_linux::{SockFlags, SockType, errno::Errno};
 
 use crate::syscalls::net::SocketFd;
@@ -263,7 +263,7 @@ mod tests {
     fn connect_9p(
         task: &crate::Task<crate::syscalls::tests::TestPlatform>,
         server: &DiodServer,
-    ) -> Resolver<crate::syscalls::tests::TestPlatform, litebox::fs::composer::Composer> {
+    ) -> Resolver<crate::syscalls::tests::TestPlatform> {
         let addr = socket_addr([127, 0, 0, 1], server.port);
         let transport = ShimTransport::connect(task.global.clone(), addr)
             .expect("failed to connect to 9P server via shim network");

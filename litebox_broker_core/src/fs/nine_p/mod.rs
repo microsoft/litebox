@@ -16,25 +16,23 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use thiserror::Error;
 
-use crate::fs::OFlags;
-use crate::fs::backend::{
+use self::fcall::Rlerror;
+use super::OFlags;
+use super::backend::{
     DirHandle, FileHandle, HandleRef, PermissionCheck, Permissioned, SeekBehavior, WalkOutcome,
     WalkStopReason, WalkedComponent, WalkingDirHandle,
 };
-use crate::fs::errors::{
+use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
     ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WalkError, WriteError,
 };
-use crate::fs::nine_p::fcall::Rlerror;
 use litebox_platform::sync;
 
 mod client;
 mod fcall;
+mod id_pool;
 
 pub mod transport;
-
-#[cfg(test)]
-mod tests;
 
 /// A [`Backend`](super::backend::Backend) backed by a 9P2000.L server.
 ///

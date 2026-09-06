@@ -1,20 +1,14 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Possible errors from [`Resolver`]
-
-#[expect(
-    unused_imports,
-    reason = "used for doc string links to work out, but not for code"
-)]
-use super::resolver::Resolver;
+//! Possible errors from the broker filesystem engine.
 
 use thiserror::Error;
 
 // XXX(jayb): We probably need to introduce a notion of `Stale` to many/most of these errors, in
 // order to more correctly support network-attached file systems.
 
-/// Possible errors from [`Resolver::open`]
+/// Possible errors from [`super::resolver::Filesystem::open`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum OpenError {
@@ -34,12 +28,12 @@ pub enum OpenError {
     PathError(#[from] PathError),
 }
 
-/// Possible errors from [`Resolver::close`]
+/// Possible errors when closing a guest filesystem descriptor.
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum CloseError {}
 
-/// Possible errors from [`Resolver::read`]
+/// Possible errors from [`super::resolver::Filesystem::read`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum ReadError {
@@ -53,7 +47,7 @@ pub enum ReadError {
     Io,
 }
 
-/// Possible errors from [`Resolver::write`]
+/// Possible errors from [`super::resolver::Filesystem::write`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum WriteError {
@@ -67,7 +61,7 @@ pub enum WriteError {
     Io,
 }
 
-/// Possible errors from [`Resolver::seek`]
+/// Possible errors from [`super::resolver::Filesystem::seek`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum SeekError {
@@ -83,7 +77,7 @@ pub enum SeekError {
     Io,
 }
 
-/// Possible errors from [`Resolver::truncate`]
+/// Possible errors from [`super::resolver::Filesystem::truncate`]
 #[derive(Error, Debug)]
 pub enum TruncateError {
     #[error("fd has been closed already")]
@@ -98,7 +92,7 @@ pub enum TruncateError {
     Io,
 }
 
-/// Possible errors from [`Resolver::chmod`]
+/// Possible errors from [`super::resolver::Filesystem::chmod`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum ChmodError {
@@ -115,7 +109,7 @@ pub enum ChmodError {
     PathError(#[from] PathError),
 }
 
-/// Possible errors from [`Resolver::chown`]
+/// Possible errors from [`super::resolver::Filesystem::chown`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum ChownError {
@@ -132,7 +126,7 @@ pub enum ChownError {
     PathError(#[from] PathError),
 }
 
-/// Possible errors from [`Resolver::unlink`]
+/// Possible errors from [`super::resolver::Filesystem::unlink`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum UnlinkError {
@@ -148,7 +142,7 @@ pub enum UnlinkError {
     PathError(#[from] PathError),
 }
 
-/// Possible errors from [`Resolver::mkdir`]
+/// Possible errors from [`super::resolver::Filesystem::mkdir`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum MkdirError {
@@ -164,7 +158,7 @@ pub enum MkdirError {
     PathError(#[from] PathError),
 }
 
-/// Possible errors from [`Resolver::rmdir`]
+/// Possible errors from [`super::resolver::Filesystem::rmdir`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum RmdirError {
@@ -186,7 +180,7 @@ pub enum RmdirError {
     PathError(#[from] PathError),
 }
 
-/// Possible errors from [`Resolver::read_dir`]
+/// Possible errors from [`super::resolver::Filesystem::read_dir`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum ReadDirError {
@@ -198,7 +192,7 @@ pub enum ReadDirError {
     Io,
 }
 
-/// Possible errors from [`Resolver::file_status`]
+/// Possible errors from [`super::resolver::Filesystem::file_status`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum FileStatusError {
@@ -230,7 +224,7 @@ pub enum PathError {
         #[cfg(debug_assertions)]
         dir: alloc::string::String,
         #[cfg(debug_assertions)]
-        perms: crate::fs::Mode,
+        perms: super::Mode,
     },
     #[error("invalid characters, not permitted by underlying file system")]
     InvalidPathname,
@@ -238,10 +232,4 @@ pub enum PathError {
     MissingComponent,
     #[error("a component used as a directory in pathname is not, in fact, a directory")]
     ComponentNotADirectory,
-}
-
-impl From<crate::path::ConversionError> for PathError {
-    fn from(_value: crate::path::ConversionError) -> Self {
-        Self::InvalidPathname
-    }
 }

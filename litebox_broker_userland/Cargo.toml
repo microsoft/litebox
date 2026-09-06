@@ -6,7 +6,6 @@ edition = "2024"
 [dependencies]
 clap = { version = "4.5.33", features = ["derive"] }
 getrandom = { version = "0.3.4", default-features = false }
-litebox = { path = "../litebox", version = "0.1.0" }
 litebox_broker_core = { path = "../litebox_broker_core", version = "0.1.0" }
 litebox_broker_host = { path = "../litebox_broker_host", version = "0.1.0" }
 litebox_broker_protocol = { path = "../litebox_broker_protocol", version = "0.1.0" }

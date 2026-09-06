@@ -11,13 +11,16 @@ use std::process::Child;
 use std::sync::Arc;
 use std::time::Instant;
 
-use litebox::fs::Mode;
-use litebox::fs::composer::Composer;
-use litebox::fs::in_mem::{InMem, InitialNode};
-use litebox::fs::overlay::Overlay;
-use litebox::fs::resolver::Filesystem;
-use litebox::fs::tar_ro::{EMPTY_TAR_FILE, TarRo};
 use litebox_broker_core::filesystem::FilesystemProvider;
+use litebox_broker_core::fs::composer::Composer;
+use litebox_broker_core::fs::in_mem::{InMem, InitialNode};
+use litebox_broker_core::fs::overlay::Overlay;
+use litebox_broker_core::fs::resolver::Filesystem;
+use litebox_broker_core::fs::tar_ro::{EMPTY_TAR_FILE, TarRo};
+use litebox_broker_core::fs::{
+    FilesystemProviderAdapter, Mode, NamespacedFilesystemProvider, UserInfo,
+    create_windows_registry_provider,
+};
 use litebox_broker_core::socket::UnsupportedSocketProvider;
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
 use litebox_broker_protocol::message::{BrokerRequest, BrokerResponse};
@@ -113,7 +116,7 @@ fn create_filesystem_provider(
         "/tmp",
         InitialNode::Directory {
             mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
-            owner: litebox::fs::UserInfo {
+            owner: UserInfo {
                 user: 1000,
                 group: 1000,
             },
@@ -127,21 +130,22 @@ fn create_filesystem_provider(
                 allocators.next(),
             )
         })
-        .mount("/dev", litebox::fs::devices::Devices::new)
+        .mount("/dev", litebox_broker_core::fs::devices::Devices::new)
         .build()
         .map_err(|_| std::io::Error::other("failed to construct broker filesystem"))?;
-    let guest = Arc::new(super::filesystem::FilesystemProviderAdapter::new(
+    let guest = Arc::new(FilesystemProviderAdapter::new(
         Filesystem::<super::sync::WindowsSyncPrimitivesProvider, _>::new(backend),
         Arc::clone(&random),
         Arc::clone(&stdio),
     )) as Arc<dyn FilesystemProvider>;
-    let windows_registry = super::filesystem::create_windows_registry_provider::<
+    let windows_registry = create_windows_registry_provider::<
         super::sync::WindowsSyncPrimitivesProvider,
     >(random, stdio)
     .map_err(std::io::Error::other)?;
-    Ok(Arc::new(
-        super::filesystem::NamespacedFilesystemProvider::new(guest, windows_registry),
-    ))
+    Ok(Arc::new(NamespacedFilesystemProvider::new(
+        guest,
+        windows_registry,
+    )))
 }
 
 fn serve_runner(

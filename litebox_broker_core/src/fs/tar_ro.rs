@@ -29,10 +29,8 @@ use alloc::vec::Vec;
 use core::ops::Range;
 use hashbrown::HashMap;
 
-use crate::fs::{DirEntry, FileType};
-
 use super::{
-    Mode, NodeInfo, OFlags, UserInfo,
+    DirEntry, FileType, Mode, NodeInfo, OFlags, UserInfo,
     backend::{CreationMetadata, DirHandle, FileHandle, HandleRef, WalkingDirHandle},
     errors::{
         ChmodError, ChownError, MkdirError, OpenError, PathError, ReadDirError, ReadError,

@@ -712,16 +712,14 @@ fn test_filesystem_provider(
         .mount("/dev", litebox::fs::devices::Devices::new)
         .build()
         .expect("failed to construct broker test filesystem");
-    std::sync::Arc::new(
-        litebox_broker_userland::filesystem::FilesystemProviderAdapter::new(
-            litebox::fs::resolver::Filesystem::<
-                litebox_broker_platform_linux_userland::LinuxSyncPrimitivesProvider,
-                _,
-            >::new(backend),
-            random,
-            stdio,
-        ),
-    )
+    std::sync::Arc::new(litebox_broker_core::fs::FilesystemProviderAdapter::new(
+        litebox_broker_core::fs::resolver::Filesystem::<
+            litebox_broker_platform_linux_userland::LinuxSyncPrimitivesProvider,
+            _,
+        >::new(backend),
+        random,
+        stdio,
+    ))
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]

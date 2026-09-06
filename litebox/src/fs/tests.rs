@@ -4,7 +4,7 @@
 fn tar_ro_fs(
     litebox: &crate::LiteBox<crate::platform::mock::MockPlatform>,
     tar_data: alloc::borrow::Cow<'static, [u8]>,
-) -> crate::fs::resolver::Resolver<crate::platform::mock::MockPlatform, crate::fs::tar_ro::TarRo> {
+) -> crate::fs::resolver::Resolver<crate::platform::mock::MockPlatform> {
     crate::fs::resolver::Resolver::new(
         litebox,
         crate::fs::tar_ro::TarRo::new(
@@ -14,26 +14,22 @@ fn tar_ro_fs(
     )
 }
 
-type InMemFs = crate::fs::resolver::Resolver<
-    crate::platform::mock::MockPlatform,
-    crate::fs::in_mem::InMem<crate::platform::mock::MockPlatform>,
->;
+type InMemFs = crate::fs::resolver::Resolver<crate::platform::mock::MockPlatform>;
 
 fn in_mem_fs(litebox: &crate::LiteBox<crate::platform::mock::MockPlatform>) -> InMemFs {
     crate::fs::resolver::Resolver::new(
         litebox,
-        crate::fs::in_mem::InMem::new(crate::fs::inode_allocator::InodeAllocator::standalone()),
+        crate::fs::in_mem::InMem::<crate::platform::mock::MockPlatform>::new(
+            crate::fs::inode_allocator::InodeAllocator::standalone(),
+        ),
     )
 }
 
 /// Run `f` with the acting user set to root.
-fn with_root_privileges<
-    Platform: crate::sync::RawSyncPrimitivesProvider,
-    B: crate::fs::backend::Backend,
->(
-    fs: &mut crate::fs::resolver::Resolver<Platform, B>,
+fn with_root_privileges<Platform: crate::sync::RawSyncPrimitivesProvider>(
+    fs: &mut crate::fs::resolver::Resolver<Platform>,
     context: &crate::fs::resolver::Context,
-    f: impl FnOnce(&mut crate::fs::resolver::Resolver<Platform, B>, &crate::fs::resolver::Context),
+    f: impl FnOnce(&mut crate::fs::resolver::Resolver<Platform>, &crate::fs::resolver::Context),
 ) {
     let root = crate::fs::UserInfo::ROOT;
     with_user(fs, context, root.user, root.group, f);
@@ -41,22 +37,19 @@ fn with_root_privileges<
 
 /// Run `f` with the acting user set to `user`/`group`, so that tests can exercise operations
 /// whose outcome depends on the acting user.
-fn with_user<Platform: crate::sync::RawSyncPrimitivesProvider, B: crate::fs::backend::Backend>(
-    fs: &mut crate::fs::resolver::Resolver<Platform, B>,
+fn with_user<Platform: crate::sync::RawSyncPrimitivesProvider>(
+    fs: &mut crate::fs::resolver::Resolver<Platform>,
     context: &crate::fs::resolver::Context,
     user: u16,
     group: u16,
-    f: impl FnOnce(&mut crate::fs::resolver::Resolver<Platform, B>, &crate::fs::resolver::Context),
+    f: impl FnOnce(&mut crate::fs::resolver::Resolver<Platform>, &crate::fs::resolver::Context),
 ) {
     let mut context = context.clone();
     context.set_acting_user(crate::fs::UserInfo { user, group });
     f(fs, &context);
 }
 
-type OverlayFs = crate::fs::resolver::Resolver<
-    crate::platform::mock::MockPlatform,
-    crate::fs::overlay::Overlay<crate::platform::mock::MockPlatform>,
->;
+type OverlayFs = crate::fs::resolver::Resolver<crate::platform::mock::MockPlatform>;
 
 /// An overlay of `upper` over a tar-backed lower layer.
 fn overlay_fs(
@@ -75,6 +68,36 @@ fn overlay_fs(
             crate::fs::inode_allocator::InodeAllocator::standalone(),
         ),
     )
+}
+
+#[test]
+fn local_descriptor_uses_the_filesystem_that_opened_it() {
+    let context = crate::fs::resolver::Context::new();
+    let litebox = crate::LiteBox::new(crate::platform::mock::MockPlatform::new());
+    let owner = in_mem_fs(&litebox);
+    let other = tar_ro_fs(&litebox, include_bytes!("./test.tar").as_slice().into());
+
+    let fd = owner
+        .open(
+            &context,
+            "/owned",
+            crate::fs::OFlags::CREAT | crate::fs::OFlags::RDWR,
+            crate::fs::Mode::RWXU,
+        )
+        .expect("failed to create file");
+    owner
+        .write(&fd, b"owner", None)
+        .expect("failed to write file");
+    owner
+        .seek(&fd, 0, crate::fs::SeekWhence::RelativeToBeginning)
+        .expect("failed to seek file");
+
+    let mut output = [0; 5];
+    other
+        .read(&fd, &mut output, None)
+        .expect("descriptor should dispatch through its owning filesystem");
+    assert_eq!(&output, b"owner");
+    other.close(&fd).expect("failed to close file");
 }
 
 mod in_mem {
@@ -2240,7 +2263,7 @@ mod composed_stdio {
     use alloc::vec;
     extern crate std;
 
-    type ComposedFs = Resolver<MockPlatform, Composer>;
+    type ComposedFs = Resolver<MockPlatform>;
 
     fn composed_fs(litebox: &LiteBox<MockPlatform>) -> ComposedFs {
         Resolver::new(

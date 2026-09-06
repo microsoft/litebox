@@ -12,13 +12,16 @@ use std::sync::Arc;
 use std::sync::mpsc::{RecvTimeoutError, sync_channel};
 use std::time::{Duration, Instant};
 
-use litebox::fs::Mode;
-use litebox::fs::composer::Composer;
-use litebox::fs::in_mem::{InMem, InitialNode};
-use litebox::fs::overlay::Overlay;
-use litebox::fs::resolver::Filesystem;
-use litebox::fs::tar_ro::{EMPTY_TAR_FILE, TarRo};
 use litebox_broker_core::filesystem::FilesystemProvider;
+use litebox_broker_core::fs::composer::Composer;
+use litebox_broker_core::fs::in_mem::{InMem, InitialNode};
+use litebox_broker_core::fs::overlay::Overlay;
+use litebox_broker_core::fs::resolver::Filesystem;
+use litebox_broker_core::fs::tar_ro::{EMPTY_TAR_FILE, TarRo};
+use litebox_broker_core::fs::{
+    FilesystemProviderAdapter, Mode, NamespacedFilesystemProvider, UserInfo,
+    create_windows_registry_provider,
+};
 use litebox_broker_core::socket::HOST_GATEWAY_IPV4_ADDRESS;
 use litebox_broker_core::{BrokerCore, BrokerCoreLimits, ObjectRights, PolicyEngine};
 #[cfg(feature = "lock_tracing")]
@@ -135,9 +138,9 @@ fn create_filesystem_provider(
         for path in ancestors.into_iter().rev().skip(1) {
             let metadata = path.metadata()?;
             let owner = if previous_user == 0 && metadata.st_uid() == 0 {
-                litebox::fs::UserInfo::ROOT
+                UserInfo::ROOT
             } else {
-                litebox::fs::UserInfo {
+                UserInfo {
                     user: DEFAULT_GUEST_UID,
                     group: DEFAULT_GUEST_GID,
                 }
@@ -168,9 +171,9 @@ fn create_filesystem_provider(
             InitialNode::File {
                 mode: Mode::from_bits_retain(metadata.st_mode()),
                 owner: if previous_user == 0 && metadata.st_uid() == 0 {
-                    litebox::fs::UserInfo::ROOT
+                    UserInfo::ROOT
                 } else {
-                    litebox::fs::UserInfo {
+                    UserInfo {
                         user: DEFAULT_GUEST_UID,
                         group: DEFAULT_GUEST_GID,
                     }
@@ -190,7 +193,7 @@ fn create_filesystem_provider(
             "/tmp".to_owned(),
             InitialNode::Directory {
                 mode: tmp_mode,
-                owner: litebox::fs::UserInfo::ROOT,
+                owner: UserInfo::ROOT,
             },
         ));
     }
@@ -217,21 +220,21 @@ fn create_filesystem_provider(
                 allocators.next(),
             )
         })
-        .mount("/dev", litebox::fs::devices::Devices::new)
+        .mount("/dev", litebox_broker_core::fs::devices::Devices::new)
         .build()
         .map_err(|_| IoError::other("failed to construct broker filesystem"))?;
-    let guest = Arc::new(super::filesystem::FilesystemProviderAdapter::new(
+    let guest = Arc::new(FilesystemProviderAdapter::new(
         Filesystem::<LinuxSyncPrimitivesProvider, _>::new(backend),
         Arc::clone(&random),
         Arc::clone(&stdio),
     )) as Arc<dyn FilesystemProvider>;
-    let windows_registry = super::filesystem::create_windows_registry_provider::<
-        LinuxSyncPrimitivesProvider,
-    >(random, stdio)
-    .map_err(IoError::other)?;
-    Ok(Arc::new(
-        super::filesystem::NamespacedFilesystemProvider::new(guest, windows_registry),
-    ))
+    let windows_registry =
+        create_windows_registry_provider::<LinuxSyncPrimitivesProvider>(random, stdio)
+            .map_err(IoError::other)?;
+    Ok(Arc::new(NamespacedFilesystemProvider::new(
+        guest,
+        windows_registry,
+    )))
 }
 
 fn path_to_string(path: &Path) -> Result<String, IoError> {

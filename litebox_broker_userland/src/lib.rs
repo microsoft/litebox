@@ -9,5 +9,7 @@
 //! socket setup, and worker threads. This library exposes components shared by
 //! the executable and its integration tests.
 
-pub mod filesystem;
 pub mod readiness;
+
+#[cfg(all(test, target_os = "linux"))]
+mod filesystem_tests;
