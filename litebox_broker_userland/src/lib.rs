@@ -9,8 +9,9 @@
 //! association runtime that serves one association from setup through
 //! teardown ([`runtime`]), and threaded readiness publication
 //! ([`readiness`]). The `litebox-broker-userland` binary composes these with
-//! CLI parsing, runner process lifecycle, and the platform-specific transport
-//! endpoints from `litebox_broker_transport_linux_userland` and
+//! CLI parsing, launching and supervising the separate LiteBox runner process,
+//! and the platform-specific transport endpoints from
+//! `litebox_broker_transport_linux_userland` and
 //! `litebox_broker_transport_windows_userland`; an in-process caller can use
 //! the same builder and runtime directly instead.
 
