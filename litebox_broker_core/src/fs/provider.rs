@@ -23,7 +23,7 @@ use litebox_broker_protocol::fs::{
     FilesystemNamespace, FilesystemNodeInfo, FilesystemSeekWhence, FilesystemUser,
     paginate_directory_entries,
 };
-use litebox_platform::sync::{Mutex, RawSyncPrimitivesProvider};
+use litebox_platform::sync::RawSyncPrimitivesProvider;
 
 /// Routes each filesystem namespace to its isolated provider.
 pub struct NamespacedFilesystemProvider {
@@ -226,7 +226,6 @@ where
             file,
             random: Arc::clone(&self.random),
             stdio: Arc::clone(&self.stdio),
-            directory_snapshot: Mutex::new(None),
         }))
     }
 
@@ -315,7 +314,6 @@ where
     file: FilesystemOpenFile<Platform>,
     random: Arc<dyn RandomProvider>,
     stdio: Arc<dyn StdioProvider>,
-    directory_snapshot: Mutex<Platform, Option<Vec<FilesystemDirectoryEntry>>>,
 }
 
 impl<Platform, FsBackend> BrokerOpenFileDescription
@@ -405,24 +403,18 @@ where
         start_index: u64,
         maximum_encoded_length: usize,
     ) -> Result<(Vec<FilesystemDirectoryEntry>, Option<u64>), FilesystemError> {
-        let mut snapshot = self.directory_snapshot.lock();
-        if start_index == 0 {
-            let entries = self
-                .fs
-                .read_dir(&self.file)
-                .map_err(fs_read_dir_error)?
-                .into_iter()
-                .map(directory_entry)
-                .collect();
-            *snapshot = Some(entries);
-        }
-        let entries = snapshot.as_ref().ok_or(FilesystemError::Io)?;
-        paginate_directory_entries(
-            entries,
-            usize::try_from(start_index).map_err(|_| FilesystemError::InvalidOffset)?,
-            maximum_encoded_length,
-        )
-        .map_err(|_| FilesystemError::Io)
+        let entries = self
+            .fs
+            .read_dir(&self.file)
+            .map_err(fs_read_dir_error)?
+            .into_iter()
+            .map(directory_entry)
+            .collect::<Vec<_>>();
+        let start_index = usize::try_from(start_index)
+            .map_err(|_| FilesystemError::InvalidOffset)?
+            .min(entries.len());
+        paginate_directory_entries(&entries, start_index, maximum_encoded_length)
+            .map_err(|_| FilesystemError::Io)
     }
 
     fn status(

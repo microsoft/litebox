@@ -204,7 +204,7 @@ pub trait OpenFileDescription: Send + Sync {
         reset_offset: bool,
     ) -> core::result::Result<(), FilesystemError>;
 
-    /// Returns one bounded page of directory entries.
+    /// Returns one bounded page from a fresh directory enumeration.
     fn read_directory(
         &self,
         cancellation: &AssociationCancellation,

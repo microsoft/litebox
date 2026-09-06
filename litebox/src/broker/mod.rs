@@ -365,7 +365,6 @@ pub(crate) struct BrokerLocalControl<
     pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
     slot_allocator: SlotAllocator<Platform>,
     stdio_read_lock: Mutex<Platform, ()>,
-    fs_directory_lock: Mutex<Platform, ()>,
 }
 
 impl<Platform, Channel> BrokerLocalControl<Platform, Channel>
@@ -382,7 +381,6 @@ where
             pollable_registry,
             slot_allocator: SlotAllocator::new(),
             stdio_read_lock: Mutex::new(()),
-            fs_directory_lock: Mutex::new(()),
         }
     }
 
@@ -793,7 +791,6 @@ where
         core::result::Result<Vec<FilesystemDirectoryEntry>, FilesystemError>,
         BrokerControlError,
     > {
-        let _directory_guard = self.fs_directory_lock.lock();
         let mut entries = Vec::new();
         let mut start_index = 0;
         loop {

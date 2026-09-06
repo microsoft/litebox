@@ -285,7 +285,7 @@ pub struct TruncateFileRequest {
     pub reset_offset: bool,
 }
 
-/// Reads all directory entries into a shared-buffer region.
+/// Reads one bounded page of directory entries into a shared-buffer region.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReadDirectoryRequest {
     /// Open-directory-description handle.
