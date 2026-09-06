@@ -1,10 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Library support for the userland broker process.
+//! Reusable support for hosting a broker in userland.
 //!
-//! This crate owns the platform-independent parts of hosting a broker: a
-//! structured builder that selects platform providers and constructs a
+//! This crate owns the shared parts of userland broker deployments: a
+//! structured builder that selects operating-system providers and constructs a
 //! [`litebox_broker_core::BrokerCore`] ([`builder`]), the generic hosted
 //! association runtime that serves one association from setup through
 //! teardown ([`runtime`]), and threaded readiness publication
