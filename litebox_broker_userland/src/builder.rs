@@ -101,7 +101,14 @@ impl BrokerCoreBuilder {
     /// A broker process may construct only one broker core for its process
     /// lifetime; see [`BrokerCore::new_with_limits`].
     pub fn build(self) -> Result<BrokerCore, BrokerBuildError> {
-        init_platform();
+        #[cfg(all(target_os = "linux", feature = "lock_tracing"))]
+        {
+            static LOCK_TRACING_PLATFORM:
+                litebox_broker_platform_linux_userland::LinuxTimeProvider =
+                litebox_broker_platform_linux_userland::LinuxTimeProvider;
+            litebox_platform::sync::init_lock_tracing(&LOCK_TRACING_PLATFORM);
+        }
+
         let socket_provider = platform_socket_provider(&self.limits)?;
         let broker = BrokerCore::new_with_limits(
             self.policy,
@@ -111,20 +118,6 @@ impl BrokerCoreBuilder {
             Arc::new(UserlandStdioProvider::new()?),
         )?;
         Ok(broker)
-    }
-}
-
-/// Applies process-wide platform setup shared by every userland broker core.
-///
-/// This runs lock tracing initialization on Linux when the `lock_tracing`
-/// feature is enabled, so an in-process caller gets the same platform setup
-/// the userland broker binary performs before serving associations.
-fn init_platform() {
-    #[cfg(all(target_os = "linux", feature = "lock_tracing"))]
-    {
-        static LOCK_TRACING_PLATFORM: litebox_broker_platform_linux_userland::LinuxTimeProvider =
-            litebox_broker_platform_linux_userland::LinuxTimeProvider;
-        litebox_platform::sync::init_lock_tracing(&LOCK_TRACING_PLATFORM);
     }
 }
 
