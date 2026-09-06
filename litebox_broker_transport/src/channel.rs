@@ -125,6 +125,13 @@ pub trait HostNotificationChannel {
     type Error;
 
     /// Sends one broker notification.
+    ///
+    /// An error is terminal when this channel is part of an active
+    /// association. Before returning it, the transport must terminate that
+    /// association and unblock its request, response, notification, and
+    /// shutdown endpoints. This lets the association runtime preserve a clean
+    /// peer close while relying on the request endpoint to report transport
+    /// failures.
     fn send_notification(&mut self, notification: &BrokerNotification) -> Result<(), Self::Error>;
 }
 

@@ -29,6 +29,7 @@ use litebox_broker_core::BrokerCore;
 use litebox_broker_host::{
     BrokerHostAssociation, BrokerHostError, ConnectionTermination, setup_connection,
 };
+use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::message::BrokerRequest;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_LAYOUT;
 use litebox_broker_transport::channel::{
@@ -134,15 +135,31 @@ where
 /// Maps a host setup or request failure to a precise [`std::io::Error`].
 ///
 /// A channel failure is already an [`std::io::Error`] and is returned as-is.
-/// Every other outcome, such as a shared-buffer layout mismatch or a rejected
-/// broker operation, is a deployment or protocol problem rather than a channel
-/// fault, so it is reported as [`ErrorKind::InvalidData`] with the broker host
-/// error's message preserved.
+/// Broker errors retain the closest matching I/O category, while a
+/// shared-buffer layout mismatch is invalid transport data.
 fn map_host_error(error: BrokerHostError<IoError>) -> IoError {
     let description = error.to_string();
     match error {
         BrokerHostError::Channel(error) => error,
-        _ => IoError::new(ErrorKind::InvalidData, description),
+        BrokerHostError::Broker(error) => {
+            let kind = match error {
+                ErrorCode::UnsupportedVersion
+                | ErrorCode::MalformedRequest
+                | ErrorCode::ProtocolState => ErrorKind::InvalidData,
+                ErrorCode::UnsupportedOperation => ErrorKind::Unsupported,
+                ErrorCode::PolicyDenied | ErrorCode::InvalidRights => ErrorKind::PermissionDenied,
+                ErrorCode::UnknownObject => ErrorKind::NotFound,
+                ErrorCode::WouldBlock => ErrorKind::WouldBlock,
+                ErrorCode::PeerClosed => ErrorKind::BrokenPipe,
+                ErrorCode::OutOfMemory => ErrorKind::OutOfMemory,
+                _ => ErrorKind::Other,
+            };
+            IoError::new(kind, description)
+        }
+        BrokerHostError::SharedBufferLayoutMismatch => {
+            IoError::new(ErrorKind::InvalidData, description)
+        }
+        _ => IoError::other(description),
     }
 }
 
@@ -291,12 +308,11 @@ where
                     failure_coordinator: &publisher_failure_coordinator,
                 };
                 // The request reader owns association termination. A failing
-                // notification transport fails the association, so a reader
-                // still running observes and reports the same error, and a peer
-                // that closed cleanly is not a failure at all. Reporting here
-                // would turn a clean shutdown into a reported error. A failure
-                // that first appears once the reader has returned is dropped
-                // deliberately, because the association is already over.
+                // notification transport must fail the association before
+                // returning an error, so a reader still running observes and
+                // reports the same failure. Reporting here would instead turn
+                // a clean peer close into an error when its transport teardown
+                // releases a blocked notification send.
                 let _ = publisher_readiness.run(&mut notification_channel);
             });
         let publisher = match publisher {
@@ -525,6 +541,40 @@ mod tests {
     /// the userland binary chooses for real runner processes.
     const TEST_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
     const TEST_CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+    #[test]
+    fn host_errors_preserve_io_categories() {
+        for (error, expected) in [
+            (ErrorCode::UnsupportedVersion, ErrorKind::InvalidData),
+            (ErrorCode::MalformedRequest, ErrorKind::InvalidData),
+            (ErrorCode::ProtocolState, ErrorKind::InvalidData),
+            (ErrorCode::UnsupportedOperation, ErrorKind::Unsupported),
+            (ErrorCode::Internal, ErrorKind::Other),
+            (ErrorCode::PolicyDenied, ErrorKind::PermissionDenied),
+            (ErrorCode::InvalidRights, ErrorKind::PermissionDenied),
+            (ErrorCode::UnknownObject, ErrorKind::NotFound),
+            (ErrorCode::ResourceExhausted, ErrorKind::Other),
+            (ErrorCode::WouldBlock, ErrorKind::WouldBlock),
+            (ErrorCode::PeerClosed, ErrorKind::BrokenPipe),
+            (ErrorCode::OutOfMemory, ErrorKind::OutOfMemory),
+        ] {
+            assert_eq!(
+                map_host_error(BrokerHostError::<IoError>::Broker(error)).kind(),
+                expected
+            );
+        }
+
+        let channel_error = map_host_error(BrokerHostError::Channel(IoError::new(
+            ErrorKind::TimedOut,
+            "channel timed out",
+        )));
+        assert_eq!(channel_error.kind(), ErrorKind::TimedOut);
+        assert_eq!(channel_error.to_string(), "channel timed out");
+        assert_eq!(
+            map_host_error(BrokerHostError::<IoError>::SharedBufferLayoutMismatch).kind(),
+            ErrorKind::InvalidData
+        );
+    }
 
     /// One live host association: the endpoints teardown acts on, and the rest
     /// held open so the association stays up for the duration of a test.
