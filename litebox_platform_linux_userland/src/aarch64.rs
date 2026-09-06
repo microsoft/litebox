@@ -2070,43 +2070,61 @@ pub(super) fn fatal_aarch64_runtime_state() -> ! {
     }
 }
 
-/// Clears `in_guest`, optionally sets `interrupt`, and optionally captures the
-/// kernel-saved vector state. Returns the published guest context only if
-/// `in_guest` was set; its registers may still require copying or gate
-/// canonicalization. Invalid required vector state terminates the process.
-pub(super) fn signal_handler_exit_guest(
-    context: &libc::ucontext_t,
-    set_interrupt: bool,
-    capture_vector_state: bool,
-) -> Option<*mut litebox_common_linux::PtRegs> {
+/// Clears `in_guest` and returns the published guest context only if `in_guest`
+/// was set. Its registers may still require copying or gate canonicalization.
+pub(super) fn signal_handler_take_guest() -> Option<*mut litebox_common_linux::PtRegs> {
     let block: usize;
-    // SAFETY: materializes the base of this thread's TLS control block from
-    // `TPIDR_EL0`, the host anchor even when this signal interrupted guest
-    // code. Reads no memory.
+    // SAFETY: `TPIDR_EL0` anchors host TLS even in guest code. Reads no memory.
     unsafe {
         core::arch::asm!(
-            load_tls_block_base!("{0}"),
-            out(reg) block,
+            load_tls_block_base!("{block}"),
+            block = out(reg) block,
             options(nostack, nomem, preserves_flags)
         );
     }
-    // SAFETY: own-thread [`tls_offset`] slot accesses off `block`. Volatile
-    // because the transition assembly also writes them, unseen by the compiler.
+    // SAFETY: own-thread TLS slots. Volatile because transition assembly
+    // writes them unseen by the compiler.
     unsafe {
         let in_guest = (block + tls_offset::IN_GUEST) as *mut u8;
         let was_in_guest = in_guest.read_volatile();
         in_guest.write_volatile(0);
-        if set_interrupt {
-            ((block + tls_offset::INTERRUPT) as *mut u8).write_volatile(1);
-        }
         if was_in_guest == 0 {
             return None;
         }
-        if capture_vector_state && !resume_frame::capture_signal_vector_state(context, block) {
-            fatal_aarch64_runtime_state();
-        }
         let top = ((block + tls_offset::GUEST_CONTEXT_TOP) as *const usize).read_volatile();
         Some((top as *mut litebox_common_linux::PtRegs).sub(1))
+    }
+}
+
+/// Captures kernel-saved guest vector state from the signal frame.
+/// Invalid required vector state terminates the process.
+pub(super) fn signal_handler_capture_guest_vector_state(context: &libc::ucontext_t) {
+    let block: usize;
+    // SAFETY: `TPIDR_EL0` anchors host TLS even in guest code. Reads no memory.
+    unsafe {
+        core::arch::asm!(
+            load_tls_block_base!("{block}"),
+            block = out(reg) block,
+            options(nostack, nomem, preserves_flags)
+        );
+    }
+    if !resume_frame::capture_signal_vector_state(context, block) {
+        fatal_aarch64_runtime_state();
+    }
+}
+
+/// Records an interrupt in this thread's TLS.
+pub(super) fn signal_handler_set_interrupt() {
+    let block: usize;
+    // SAFETY: `TPIDR_EL0` anchors this thread's host TLS even in guest code.
+    // Volatile because transition assembly accesses the slot unseen by the compiler.
+    unsafe {
+        core::arch::asm!(
+            load_tls_block_base!("{block}"),
+            block = out(reg) block,
+            options(nostack, nomem, preserves_flags)
+        );
+        ((block + tls_offset::INTERRUPT) as *mut u8).write_volatile(1);
     }
 }
 
@@ -3741,6 +3759,19 @@ mod tests {
     }
 
     #[test]
+    fn signal_handler_records_interrupt_outside_guest() {
+        let interrupt = (tls_block_base() + tls_offset::INTERRUPT) as *mut u8;
+        // SAFETY: this is this thread's byte-sized TLS slot.
+        unsafe { interrupt.write_volatile(0) };
+
+        super::signal_handler_set_interrupt();
+        assert_eq!(read_tls_slot!(u8, tls_offset::INTERRUPT), 1);
+
+        // SAFETY: as above.
+        unsafe { interrupt.write_volatile(0) };
+    }
+
+    #[test]
     fn test_update_waker_exchange() {
         let platform = LinuxUserland::new();
 
@@ -3835,9 +3866,8 @@ mod tests {
         );
     }
 
-    /// The staging store must carry an exception-table fixup, or a fault on it
-    /// escapes into `exception_signal_handler` with `in_guest == 1` and is
-    /// mistaken for a guest fault; see [`switch_to_guest_via_outbound_stub`].
+    /// The staging-store fixup enables fallback to generic context restore.
+    /// Without it, `in_switch_to_guest` routes the fault to `next_signal_handler`.
     #[test]
     fn test_switch_to_guest_stage_x16_has_exception_fixup() {
         let stage = super::switch_to_guest_stage_x16 as *const () as usize;
@@ -3869,13 +3899,8 @@ mod tests {
         );
     }
 
-    /// A SIGSEGV on that store must not be attributed to the guest.
-    ///
-    /// `in_guest` is already 1 at the fault, so without the fixup and the
-    /// `switch_to_guest` guard the handler would overwrite the guest `PtRegs`
-    /// with the host register file. Asserts that the guest context is
-    /// untouched, `in_guest` is left alone, and the context is redirected to
-    /// the fixup.
+    /// Staging faults with `in_guest == 1` must not leak host registers into guest `PtRegs`.
+    /// The assembly fixup clears the flag on resumption; this test stops before that.
     #[test]
     fn test_exception_on_guest_stack_store_does_not_leak_host_state() {
         const SEGV_MAPERR: libc::c_int = 1;
@@ -3935,8 +3960,7 @@ mod tests {
         );
         assert_eq!(
             was_in_guest, 1,
-            "the fault is a host fault recovered in place, so the thread is still on its way \
-             into the guest and `in_guest` must stay set"
+            "the handler must leave `in_guest` for the assembly fixup to clear"
         );
         let fixed_pc: usize = context.uc_mcontext.pc.trunc();
         assert_eq!(

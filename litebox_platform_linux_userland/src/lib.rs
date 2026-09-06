@@ -42,8 +42,8 @@ use aarch64::{
     canonicalize_runtime_aarch64_gate_signal_context, copy_signal_context,
     fatal_aarch64_runtime_state, guest_thread_pointer_tp_offset, is_guest_thread,
     load_tls_block_base, run_thread_arch, set_guest_vector_state, set_is_guest_thread,
-    set_signal_return, signal_handler_exit_guest, switch_to_guest, sync_instruction_stream,
-    tls_offset,
+    set_signal_return, signal_handler_capture_guest_vector_state, signal_handler_set_interrupt,
+    signal_handler_take_guest, switch_to_guest, sync_instruction_stream, tls_offset,
 };
 
 extern crate alloc;
@@ -2327,6 +2327,29 @@ fn gate_interruption(signum: libc::c_int, code: libc::c_int) -> GateInterruption
     }
 }
 
+/// Updates guest registers; returns true when the gate consumes the signal.
+#[cfg(target_arch = "aarch64")]
+fn update_aarch64_guest_signal_context(
+    context: &libc::ucontext_t,
+    regs: &mut litebox_common_linux::PtRegs,
+    interruption: GateInterruption,
+) -> bool {
+    match canonicalize_runtime_aarch64_gate_signal_context(context, regs, interruption) {
+        Aarch64GateSignalResult::NotGate => copy_signal_context(regs, context),
+        Aarch64GateSignalResult::Canonicalized(canonical) => *regs = canonical,
+        Aarch64GateSignalResult::ResumeGuest(canonical) => {
+            *regs = canonical;
+            return true;
+        }
+        Aarch64GateSignalResult::PreserveSavedContext => {
+            // Saved registers are authoritative, but the outbound stub leaves a stale syscall number.
+            regs.syscallno = litebox_common_linux::arch::NO_SYSCALL;
+        }
+        Aarch64GateSignalResult::InvalidRuntimeState => fatal_aarch64_runtime_state(),
+    }
+    false
+}
+
 #[cfg(target_arch = "aarch64")]
 fn signal_exception_fixup(signum: libc::c_int, code: libc::c_int, pc: usize) -> Option<usize> {
     is_synchronous_memory_fault(signum, code)
@@ -2340,6 +2363,28 @@ unsafe extern "C" fn exception_signal_handler(
     info: &mut libc::siginfo_t,
     context: &mut libc::ucontext_t,
 ) {
+    // Misclassifying transition faults as guest faults leaks host registers via `PtRegs`.
+    #[cfg(target_arch = "aarch64")]
+    let faulting_pc: usize = context.uc_mcontext.pc.trunc();
+
+    // Staging can raise SIGSEGV/SIGBUS with `in_guest` set; fix up before checking it.
+    #[cfg(target_arch = "aarch64")]
+    if let Some(fixup_addr) = signal_exception_fixup(signum, info.si_code, faulting_pc) {
+        // The staging-store assembly fixup clears `in_guest` on resumption.
+        context.uc_mcontext.pc = fixup_addr as u64;
+        return;
+    }
+
+    // Transition faults are host faults: `in_guest` and SP may be inconsistent.
+    #[cfg(target_arch = "aarch64")]
+    if in_switch_to_guest(faulting_pc) {
+        return unsafe { next_signal_handler(signum, info, context) };
+    }
+
+    // Nested faults in the handler must be classified as host faults.
+    #[cfg(target_arch = "aarch64")]
+    let interrupted_guest = signal_handler_take_guest();
+
     #[cfg(debug_assertions)]
     if signum == libc::SIGSYS {
         use core::fmt::Write as _;
@@ -2379,61 +2424,42 @@ unsafe extern "C" fn exception_signal_handler(
                 buf.len(),
             )
         };
+        #[cfg(target_arch = "x86_64")]
         return;
+        #[cfg(target_arch = "aarch64")]
+        {
+            // Resume through host code without re-arming `in_guest` here.
+            if let Some(regs) = interrupted_guest {
+                signal_handler_capture_guest_vector_state(context);
+                update_aarch64_guest_signal_context(
+                    context,
+                    unsafe { &mut *regs },
+                    gate_interruption(signum, info.si_code),
+                );
+                set_signal_return(context, interrupt_callback, 0, 0, 0, 0);
+            }
+            return;
+        }
     }
 
-    // Classify runtime transition faults before guest faults; misclassification
-    // would disclose the live host register file through guest `PtRegs`.
-    #[cfg(target_arch = "aarch64")]
-    let faulting_pc: usize = context.uc_mcontext.pc.trunc();
-
-    // The staging store is inside the `in_guest` bracket and may raise SIGSEGV
-    // or SIGBUS, so its fixup must run before consulting `in_guest`.
-    #[cfg(target_arch = "aarch64")]
-    if let Some(fixup_addr) = signal_exception_fixup(signum, info.si_code, faulting_pc) {
-        context.uc_mcontext.pc = fixup_addr as u64;
-        return;
-    }
-
-    // Remaining faults inside the transition bracket are runtime faults and
-    // cannot safely resume because `in_guest` and SP may be inconsistent.
-    #[cfg(target_arch = "aarch64")]
-    if in_switch_to_guest(faulting_pc) {
-        return unsafe { next_signal_handler(signum, info, context) };
-    }
-
+    #[cfg(target_arch = "x86_64")]
     let Some(regs) = signal_handler_exit_guest(context, false, true) else {
+        return unsafe { next_signal_handler(signum, info, context) };
+    };
+    #[cfg(target_arch = "aarch64")]
+    let Some(regs) = interrupted_guest else {
         return unsafe { next_signal_handler(signum, info, context) };
     };
     #[cfg(target_arch = "x86_64")]
     copy_signal_context(unsafe { &mut *regs }, context);
     #[cfg(target_arch = "aarch64")]
     {
-        let interruption = gate_interruption(signum, info.si_code);
-        let mut resume_guest = false;
-        match canonicalize_runtime_aarch64_gate_signal_context(
+        signal_handler_capture_guest_vector_state(context);
+        if update_aarch64_guest_signal_context(
             context,
-            unsafe { &*regs },
-            interruption,
+            unsafe { &mut *regs },
+            gate_interruption(signum, info.si_code),
         ) {
-            Aarch64GateSignalResult::NotGate => copy_signal_context(unsafe { &mut *regs }, context),
-            Aarch64GateSignalResult::Canonicalized(canonical) => unsafe { regs.write(canonical) },
-            Aarch64GateSignalResult::ResumeGuest(canonical) => {
-                unsafe { regs.write(canonical) };
-                resume_guest = true;
-            }
-            Aarch64GateSignalResult::PreserveSavedContext => {
-                // The saved registers are already authoritative, but the
-                // outbound stub retains the completed syscall number. Clear it
-                // before exposing this context to exception handling.
-                unsafe { (*regs).syscallno = litebox_common_linux::arch::NO_SYSCALL };
-            }
-            Aarch64GateSignalResult::InvalidRuntimeState => {
-                fatal_aarch64_runtime_state();
-            }
-        }
-
-        if resume_guest {
             set_signal_return(context, interrupt_callback, 0, 0, 0, 0);
             return;
         }
@@ -2617,6 +2643,9 @@ unsafe fn interrupt_signal_handler(
     info: &mut libc::siginfo_t,
     context: &mut libc::ucontext_t,
 ) {
+    #[cfg(target_arch = "aarch64")]
+    let interrupted_guest = signal_handler_take_guest();
+
     #[cfg(debug_assertions)]
     let raise_signal = |signum: libc::c_int, info: &libc::siginfo_t| {
         // Block the signal on this non-guest thread so the kernel won't
@@ -2649,39 +2678,43 @@ unsafe fn interrupt_signal_handler(
             signum
         };
 
-        // Only record signals that can be forwarded to the guest as
-        // litebox_common_linux::signal::Signal. Unknown signals are silently dropped.
-        let Ok(signal) = litebox_common_linux::signal::Signal::try_from(guest_signum) else {
-            return;
-        };
+        if let Ok(signal) = litebox_common_linux::signal::Signal::try_from(guest_signum) {
+            // Check whether this is a guest thread. If not, re-raise the signal
+            // process-wide.
+            //
+            // This is a thread-lifetime property, not `in_guest`: `in_guest` is 0
+            // whenever a guest thread sits in the host, including parked in an
+            // interruptible wait -- the case `record_pending_signal` and
+            // `wait_waker_addr` serve.
+            let is_guest_thread;
+            #[cfg(target_arch = "x86_64")]
+            {
+                let gsbase: u64;
+                unsafe { core::arch::asm!("rdgsbase {}", out(reg) gsbase) };
+                is_guest_thread = gsbase != 0;
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                is_guest_thread = self::is_guest_thread();
+            }
 
-        // Check whether this is a guest thread. If not, re-raise the signal
-        // process-wide.
-        //
-        // This is a thread-lifetime property, not `in_guest`: `in_guest` is 0
-        // whenever a guest thread sits in the host, including parked in an
-        // interruptible wait -- the case `record_pending_signal` and
-        // `wait_waker_addr` serve.
-        let is_guest_thread;
-        #[cfg(target_arch = "x86_64")]
-        {
-            let gsbase: u64;
-            unsafe { core::arch::asm!("rdgsbase {}", out(reg) gsbase) };
-            is_guest_thread = gsbase != 0;
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            is_guest_thread = self::is_guest_thread();
-        }
-
-        if is_guest_thread {
-            // SAFETY: we verified above that this is a guest thread, which is
-            // what `record_pending_signal` requires.
-            unsafe { record_pending_signal(signal) };
+            if is_guest_thread {
+                // SAFETY: we verified above that this is a guest thread.
+                unsafe { record_pending_signal(signal) };
+            } else {
+                #[cfg(debug_assertions)]
+                raise_signal(signum, info);
+                return;
+            }
         } else {
-            #[cfg(debug_assertions)]
-            raise_signal(signum, info);
+            // Unknown signals are dropped, but aarch64 has already cleared `in_guest`:
+            // an interrupted guest must exit through `interrupt_callback`.
+            #[cfg(target_arch = "x86_64")]
             return;
+            #[cfg(target_arch = "aarch64")]
+            if interrupted_guest.is_none() {
+                return;
+            }
         }
     }
 
@@ -2703,9 +2736,20 @@ unsafe fn interrupt_signal_handler(
     }
 
     let in_switch_to_guest = in_switch_to_guest(ip);
+    #[cfg(target_arch = "x86_64")]
     let Some(regs) = signal_handler_exit_guest(context, true, !in_switch_to_guest) else {
         return;
     };
+    #[cfg(target_arch = "aarch64")]
+    signal_handler_set_interrupt();
+    #[cfg(target_arch = "aarch64")]
+    let Some(regs) = interrupted_guest else {
+        return;
+    };
+    #[cfg(target_arch = "aarch64")]
+    if !in_switch_to_guest {
+        signal_handler_capture_guest_vector_state(context);
+    }
 
     if in_switch_to_guest {
         // The saved guest context remains authoritative during restoration.
@@ -2713,22 +2757,11 @@ unsafe fn interrupt_signal_handler(
         #[cfg(target_arch = "x86_64")]
         copy_signal_context(unsafe { &mut *regs }, context);
         #[cfg(target_arch = "aarch64")]
-        match canonicalize_runtime_aarch64_gate_signal_context(
+        update_aarch64_guest_signal_context(
             context,
-            unsafe { &*regs },
+            unsafe { &mut *regs },
             GateInterruption::Asynchronous,
-        ) {
-            Aarch64GateSignalResult::NotGate => copy_signal_context(unsafe { &mut *regs }, context),
-            Aarch64GateSignalResult::Canonicalized(canonical)
-            | Aarch64GateSignalResult::ResumeGuest(canonical) => unsafe { regs.write(canonical) },
-            Aarch64GateSignalResult::PreserveSavedContext => {
-                // The outbound path preserves registers but leaves stale syscall state.
-                unsafe { (*regs).syscallno = litebox_common_linux::arch::NO_SYSCALL };
-            }
-            Aarch64GateSignalResult::InvalidRuntimeState => {
-                fatal_aarch64_runtime_state();
-            }
-        }
+        );
     }
     set_signal_return(context, interrupt_callback, 0, 0, 0, 0);
 }
