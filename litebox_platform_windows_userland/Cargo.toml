@@ -3,7 +3,7 @@ name = "litebox_platform_windows_userland"
 version = "0.1.0"
 edition = "2024"
 
-[target.'cfg(windows)'.dependencies]
+[target.'cfg(target_os = "windows")'.dependencies]
 litebox = { path = "../litebox/", version = "0.1.0" }
 litebox_common_linux = { path = "../litebox_common_linux", version = "0.1.0" }
 litebox_platform = { path = "../litebox_platform", version = "0.1.0" }
