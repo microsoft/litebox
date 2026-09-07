@@ -80,7 +80,7 @@ fn overlay_fs(
 
 mod in_mem {
     use crate::LiteBox;
-    use crate::fs::{Mode, OFlags};
+    use crate::fs::{Mode, OFlags, SeekWhence};
     use crate::platform::mock::MockPlatform;
     use alloc::vec;
     use alloc::vec::Vec;
@@ -137,6 +137,71 @@ mod in_mem {
             assert_eq!(bytes_read, data.len());
             assert_eq!(&buffer, data);
             fs.close(&fd).expect("Failed to close file");
+        });
+    }
+
+    #[test]
+    fn duplicated_descriptors_share_offset_and_lifetime() {
+        let ctx = crate::fs::resolver::Context::new();
+        let litebox = LiteBox::new(MockPlatform::new());
+
+        with_root_privileges(&mut super::in_mem_fs(&litebox), &ctx, |fs, ctx| {
+            let fd = fs
+                .open(ctx, "/testfile", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
+                .expect("Failed to create file");
+            fs.write(&fd, b"abcdef", None)
+                .expect("Failed to write file");
+            fs.seek(&fd, 0, SeekWhence::RelativeToBeginning)
+                .expect("Failed to seek file");
+
+            let duplicate = litebox
+                .descriptor_table_mut()
+                .duplicate(&fd)
+                .expect("Failed to duplicate descriptor");
+            let mut buffer = [0; 2];
+            fs.read(&fd, &mut buffer, None)
+                .expect("Failed to read original descriptor");
+            assert_eq!(&buffer, b"ab");
+
+            fs.close(&fd).expect("Failed to close original descriptor");
+            fs.read(&duplicate, &mut buffer, None)
+                .expect("Failed to read duplicate descriptor");
+            assert_eq!(&buffer, b"cd");
+            fs.close(&duplicate)
+                .expect("Failed to close duplicate descriptor");
+        });
+    }
+
+    #[test]
+    fn independently_opened_descriptors_have_independent_offsets() {
+        let ctx = crate::fs::resolver::Context::new();
+        let litebox = LiteBox::new(MockPlatform::new());
+
+        with_root_privileges(&mut super::in_mem_fs(&litebox), &ctx, |fs, ctx| {
+            let fd = fs
+                .open(ctx, "/testfile", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+                .expect("Failed to create file");
+            fs.write(&fd, b"abcdef", None)
+                .expect("Failed to write file");
+            fs.close(&fd).expect("Failed to close file");
+
+            let first = fs
+                .open(ctx, "/testfile", OFlags::RDONLY, Mode::empty())
+                .expect("Failed to open first descriptor");
+            let second = fs
+                .open(ctx, "/testfile", OFlags::RDONLY, Mode::empty())
+                .expect("Failed to open second descriptor");
+            let mut first_buffer = [0; 2];
+            let mut second_buffer = [0; 2];
+            fs.read(&first, &mut first_buffer, None)
+                .expect("Failed to read first descriptor");
+            fs.read(&second, &mut second_buffer, None)
+                .expect("Failed to read second descriptor");
+            assert_eq!(&first_buffer, b"ab");
+            assert_eq!(&second_buffer, b"ab");
+            fs.close(&first).expect("Failed to close first descriptor");
+            fs.close(&second)
+                .expect("Failed to close second descriptor");
         });
     }
 

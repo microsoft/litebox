@@ -34,6 +34,24 @@ pub struct Resolver<
     backend: Backend,
 }
 
+struct OpenFileDescription<Platform: sync::RawSyncPrimitivesProvider> {
+    state: sync::Mutex<Platform, OpenFileDescriptionState>,
+}
+
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "open file descriptions carry independent status and access flags"
+)]
+struct OpenFileDescriptionState {
+    handle: Handle,
+    read_allowed: bool,
+    write_allowed: bool,
+    position: usize,
+    append_mode: bool,
+    path_only: bool,
+    seek_behavior: SeekBehavior,
+}
+
 impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
     Resolver<Platform, Backend>
 {
@@ -463,6 +481,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
 impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
     Resolver<Platform, Backend>
 {
+    fn open_file_description(
+        &self,
+        fd: &TypedFd<Self>,
+    ) -> Option<Arc<OpenFileDescription<Platform>>> {
+        let entry = self.litebox.descriptor_table().entry_handle(fd)?;
+        let entry = entry.get_entry();
+        Some(Arc::clone(&entry.entry.description))
+    }
+
     /// Opens a file
     ///
     /// The `mode` is only significant when creating a file
@@ -504,14 +531,18 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         let append_mode = flags.contains(OFlags::APPEND);
         let insert = |handle, seek_behavior| {
             self.litebox.descriptor_table_mut().insert(ResolverEntry {
-                handle,
+                description: Arc::new(OpenFileDescription {
+                    state: sync::Mutex::new(OpenFileDescriptionState {
+                        handle,
+                        read_allowed,
+                        write_allowed,
+                        position: 0,
+                        append_mode,
+                        path_only,
+                        seek_behavior,
+                    }),
+                }),
                 _backend: core::marker::PhantomData,
-                read_allowed,
-                write_allowed,
-                position: 0,
-                append_mode,
-                path_only,
-                seek_behavior,
             })
         };
 
@@ -648,35 +679,28 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         buf: &mut [u8],
         offset: Option<usize>,
     ) -> Result<usize, ReadError> {
-        let entry = self
-            .litebox
-            .descriptor_table()
-            .entry_handle(fd)
-            .ok_or(ReadError::ClosedFd)?;
-        let mut entry = entry.get_entry_mut();
-        // XXX(jayb): This over-holds the descriptor-entry lock across backend I/O. We need a
-        // smaller per-open-file-description primitive for position/append serialization, so the
-        // descriptor entry can be unlocked before potentially blocking backend calls.
-        let file = match &entry.entry.handle {
+        let description = self.open_file_description(fd).ok_or(ReadError::ClosedFd)?;
+        let mut state = description.state.lock();
+        let file = match &state.handle {
             Handle::File(file) => file,
             Handle::Dir(_) => return Err(ReadError::NotAFile),
         };
-        let seek_behavior = entry.entry.seek_behavior;
-        if !entry.entry.read_allowed {
+        let seek_behavior = state.seek_behavior;
+        if !state.read_allowed {
             return Err(ReadError::NotForReading);
         }
-        if entry.entry.path_only {
+        if state.path_only {
             // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
             unimplemented!("read from O_PATH fd")
         }
 
         let read_offset = match seek_behavior {
             SeekBehavior::NonSeekable | SeekBehavior::ZeroPosition => 0,
-            SeekBehavior::PositionBased => offset.unwrap_or(entry.entry.position),
+            SeekBehavior::PositionBased => offset.unwrap_or(state.position),
         };
         let read = self.backend.read(file, buf, read_offset)?;
         if matches!(seek_behavior, SeekBehavior::PositionBased) && offset.is_none() {
-            entry.entry.position = read_offset.checked_add(read).unwrap();
+            state.position = read_offset.checked_add(read).unwrap();
         }
         Ok(read)
     }
@@ -696,41 +720,34 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         buf: &[u8],
         offset: Option<usize>,
     ) -> Result<usize, WriteError> {
-        let entry = self
-            .litebox
-            .descriptor_table()
-            .entry_handle(fd)
-            .ok_or(WriteError::ClosedFd)?;
-        let mut entry = entry.get_entry_mut();
-        // XXX(jayb): This over-holds the descriptor-entry lock across backend I/O. We need a
-        // smaller per-open-file-description primitive for position/append serialization, so the
-        // descriptor entry can be unlocked before potentially blocking backend calls.
-        let file = match &entry.entry.handle {
+        let description = self.open_file_description(fd).ok_or(WriteError::ClosedFd)?;
+        let mut state = description.state.lock();
+        let file = match &state.handle {
             Handle::File(file) => file,
             Handle::Dir(_) => return Err(WriteError::NotAFile),
         };
-        let seek_behavior = entry.entry.seek_behavior;
-        if !entry.entry.write_allowed {
+        let seek_behavior = state.seek_behavior;
+        if !state.write_allowed {
             return Err(WriteError::NotForWriting);
         }
-        if entry.entry.path_only {
+        if state.path_only {
             // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
             unimplemented!("write to O_PATH fd")
         }
 
         let write_offset = match seek_behavior {
             SeekBehavior::NonSeekable | SeekBehavior::ZeroPosition => 0,
-            SeekBehavior::PositionBased if entry.entry.append_mode && offset.is_none() => {
+            SeekBehavior::PositionBased if state.append_mode && offset.is_none() => {
                 self.backend
                     .status(HandleRef::File(file))
                     .map_err(|_| WriteError::Io)?
                     .size
             }
-            SeekBehavior::PositionBased => offset.unwrap_or(entry.entry.position),
+            SeekBehavior::PositionBased => offset.unwrap_or(state.position),
         };
         let written = self.backend.write(file, buf, write_offset)?;
         if matches!(seek_behavior, SeekBehavior::PositionBased) && offset.is_none() {
-            entry.entry.position = write_offset.checked_add(written).unwrap();
+            state.position = write_offset.checked_add(written).unwrap();
         }
         Ok(written)
     }
@@ -744,22 +761,18 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         offset: isize,
         whence: super::SeekWhence,
     ) -> Result<usize, SeekError> {
-        let entry = self
-            .litebox
-            .descriptor_table()
-            .entry_handle(fd)
-            .ok_or(SeekError::ClosedFd)?;
-        let mut entry = entry.get_entry_mut();
-        let file = match &entry.entry.handle {
+        let description = self.open_file_description(fd).ok_or(SeekError::ClosedFd)?;
+        let mut state = description.state.lock();
+        let file = match &state.handle {
             Handle::File(file) => file,
             Handle::Dir(_) => return Err(SeekError::NotAFile),
         };
-        if entry.entry.path_only {
+        if state.path_only {
             // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
             unimplemented!("seek on O_PATH fd")
         }
 
-        match entry.entry.seek_behavior {
+        match state.seek_behavior {
             SeekBehavior::NonSeekable => Err(SeekError::NonSeekable),
             SeekBehavior::ZeroPosition => Ok(0),
             SeekBehavior::PositionBased => {
@@ -770,7 +783,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                     .size;
                 let base = match whence {
                     super::SeekWhence::RelativeToBeginning => 0,
-                    super::SeekWhence::RelativeToCurrentOffset => entry.entry.position,
+                    super::SeekWhence::RelativeToCurrentOffset => state.position,
                     super::SeekWhence::RelativeToEnd => file_len,
                 };
                 let new_position = base
@@ -781,7 +794,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 if new_position > file_len {
                     return Err(SeekError::InvalidOffset);
                 }
-                entry.entry.position = new_position;
+                state.position = new_position;
                 Ok(new_position)
             }
         }
@@ -799,27 +812,25 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         length: usize,
         reset_offset: bool,
     ) -> Result<(), TruncateError> {
-        let entry = self
-            .litebox
-            .descriptor_table()
-            .entry_handle(fd)
+        let description = self
+            .open_file_description(fd)
             .ok_or(TruncateError::ClosedFd)?;
-        let mut entry = entry.get_entry_mut();
-        let file = match &entry.entry.handle {
+        let mut state = description.state.lock();
+        let file = match &state.handle {
             Handle::File(file) => file,
             Handle::Dir(_) => return Err(TruncateError::IsDirectory),
         };
-        if !entry.entry.write_allowed {
+        if !state.write_allowed {
             return Err(TruncateError::NotForWriting);
         }
-        if entry.entry.path_only {
+        if state.path_only {
             // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
             unimplemented!("truncate O_PATH fd")
         }
 
         self.backend.truncate(file, length)?;
         if reset_offset {
-            entry.entry.position = 0;
+            state.position = 0;
         }
         Ok(())
     }
@@ -953,17 +964,15 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     ///
     /// Returns a list of file/directory names (explicitly _not_ including `.` or `..`).
     pub fn read_dir(&self, fd: &TypedFd<Self>) -> Result<Vec<super::DirEntry>, ReadDirError> {
-        let entry = self
-            .litebox
-            .descriptor_table()
-            .entry_handle(fd)
+        let description = self
+            .open_file_description(fd)
             .ok_or(ReadDirError::ClosedFd)?;
-        let entry = entry.get_entry();
-        if entry.entry.path_only {
+        let state = description.state.lock();
+        if state.path_only {
             // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
             unimplemented!("read_dir on O_PATH fd")
         }
-        let dir = match &entry.entry.handle {
+        let dir = match &state.handle {
             Handle::File(_) => return Err(ReadDirError::NotADirectory),
             Handle::Dir(dir) => dir,
         };
@@ -1012,13 +1021,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
 
     /// Equivalent to [`Self::file_status`], but on an open `fd` instead.
     pub fn fd_file_status(&self, fd: &TypedFd<Self>) -> Result<super::FileStatus, FileStatusError> {
-        let entry = self
-            .litebox
-            .descriptor_table()
-            .entry_handle(fd)
+        let description = self
+            .open_file_description(fd)
             .ok_or(FileStatusError::ClosedFd)?;
-        let entry = entry.get_entry();
-        self.backend.status(entry.entry.handle.as_ref())
+        let state = description.state.lock();
+        self.backend.status(state.handle.as_ref())
     }
 
     /// Get static backing data for a file, if available and supported.
@@ -1028,34 +1035,24 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     ///
     /// Returns `None` if no static backing data is available/supported.
     pub fn get_static_backing_data(&self, fd: &TypedFd<Self>) -> Option<&'static [u8]> {
-        let entry = self.litebox.descriptor_table().entry_handle(fd)?;
-        let entry = entry.get_entry();
-        match &entry.entry.handle {
+        let description = self.open_file_description(fd)?;
+        let state = description.state.lock();
+        match &state.handle {
             Handle::File(file) => self.backend.get_static_backing_data(file),
             Handle::Dir(_) => None,
         }
     }
 }
 
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "resolver fd entries carry independent descriptor flags"
-)]
-struct ResolverEntry<Backend: super::backend::Backend> {
-    handle: Handle,
+struct ResolverEntry<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend> {
+    description: Arc<OpenFileDescription<Platform>>,
     _backend: core::marker::PhantomData<Backend>,
-    read_allowed: bool,
-    write_allowed: bool,
-    position: usize,
-    append_mode: bool,
-    path_only: bool,
-    seek_behavior: SeekBehavior,
 }
 
 crate::fd::enable_fds_for_subsystem! {
     @ Platform: { sync::RawSyncPrimitivesProvider }, Backend: { super::backend::Backend + 'static };
     Resolver<Platform, Backend>;
-    @ Backend: { super::backend::Backend + 'static };
-    ResolverEntry<Backend>;
+    @ Platform: { sync::RawSyncPrimitivesProvider }, Backend: { super::backend::Backend + 'static };
+    ResolverEntry<Platform, Backend>;
     -> ResolverFd<Platform, Backend>;
 }
