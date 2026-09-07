@@ -31,7 +31,7 @@ fn mmapped_file(path: impl AsRef<Path>) -> Result<&'static [u8]> {
     Ok(data)
 }
 
-/// Run Windows PE programs with LiteBox on unmodified Windows.
+/// Runs a Windows PE program with LiteBox on unmodified Windows and returns its exit code.
 ///
 /// The program binary and any initial filesystem contents must be provided inside a tar archive via
 /// `--initial-files`. The program path refers to a path inside the tar archive.
@@ -71,7 +71,7 @@ pub struct CliArgs {
 ///
 /// Panics if the initial in-memory file system fails to create `/tmp` — those
 /// operations cannot fail against a freshly-constructed file system.
-pub fn run(cli_args: CliArgs) -> Result<()> {
+pub fn run(cli_args: CliArgs) -> Result<i32> {
     tracing_subscriber::fmt()
         .with_timer(tracing_subscriber::fmt::time::uptime())
         .with_level(true)
@@ -164,7 +164,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             &mut litebox_common_linux::PtRegs::default(),
         );
     }
-    std::process::exit(program.process.wait())
+    Ok(program.process.wait())
 }
 
 fn to_cstring(s: &str) -> Result<std::ffi::CString> {

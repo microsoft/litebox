@@ -2,13 +2,16 @@
 // Licensed under the MIT license.
 
 use std::error::Error;
+use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Error as IoError, ErrorKind, Result as IoResult};
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{RecvTimeoutError, sync_channel};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use clap::Parser as _;
 use litebox_broker_core::socket::HOST_GATEWAY_IPV4_ADDRESS;
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
@@ -44,21 +47,36 @@ pub(super) fn run(mut args: super::CliArgs) -> Result<(), Box<dyn Error>> {
     let control_socket_path = socket_dir.path().join("broker.sock");
     let control_listener = UnixListener::bind(&control_socket_path)?;
     control_listener.set_nonblocking(true)?;
-    let broker = BrokerCoreBuilder::new(
-        PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()).with_socket_policy(
-            configured_socket_policy(&args.allow_tcp_destination, &args.allow_udp_destination)?,
-        ),
-    )
-    .build()?;
+    let policy = PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()).with_socket_policy(
+        configured_socket_policy(&args.allow_tcp_destination, &args.allow_udp_destination)?,
+    );
+    let build_broker = || BrokerCoreBuilder::new(policy).build();
+    let broker = if args.in_process_runner {
+        litebox_platform_linux_userland::with_guest_signals_blocked(build_broker)?
+    } else {
+        build_broker()?
+    };
 
-    crate::run_runner_process(
-        &args,
-        control_socket_path.as_os_str(),
-        proxy_url.as_deref(),
-        |runner, runner_process_id| {
-            serve_runner(&broker, &control_listener, runner, runner_process_id)
-        },
-    )
+    if args.in_process_runner {
+        debug_assert!(args.unstable);
+        run_runner_in_process(
+            &args,
+            control_socket_path.as_os_str(),
+            proxy_url.as_deref(),
+            &broker,
+            &control_listener,
+        )
+    } else {
+        crate::run_runner_process(
+            &args,
+            control_socket_path.as_os_str(),
+            proxy_url.as_deref(),
+            |runner, runner_process_id| {
+                serve_runner_process(&broker, &control_listener, runner, runner_process_id)?;
+                Ok(())
+            },
+        )
+    }
 }
 
 struct ManagedEgressProxy {
@@ -160,17 +178,73 @@ fn read_proxy_ready(stdout: ChildStdout) -> IoResult<SocketAddrV4> {
         .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "invalid egress proxy readiness"))
 }
 
-fn serve_runner(
+fn run_runner_in_process(
+    args: &super::CliArgs,
+    control_socket_path: &std::ffi::OsStr,
+    proxy_url: Option<&str>,
+    broker: &BrokerCore,
+    control_listener: &UnixListener,
+) -> Result<(), Box<dyn Error>> {
+    let runner_args = litebox_runner_linux_userland::CliArgs::try_parse_from(
+        std::iter::once(OsString::from("litebox-runner-linux-userland")).chain(
+            crate::runner_command_arguments(args, control_socket_path, proxy_url),
+        ),
+    )?;
+    litebox_platform_linux_userland::with_guest_signals_blocked(|| {
+        let runner = std::thread::Builder::new()
+            .name("litebox-runner".to_owned())
+            .spawn(move || {
+                litebox_platform_linux_userland::unblock_guest_signals();
+                litebox_runner_linux_userland::run(runner_args)
+                    .map_err(|error| format!("{error:#}"))
+            })?;
+        let association_result = serve_runner_in_process(broker, control_listener, &runner);
+        crate::finish_in_process_runner(runner, association_result)
+    })
+}
+
+fn serve_runner_process(
     broker: &BrokerCore,
     control_listener: &UnixListener,
     runner: &mut Child,
     runner_process_id: u32,
-) -> Result<(), Box<dyn Error>> {
+) -> IoResult<()> {
     let setup_deadline = Instant::now() + SETUP_TIMEOUT;
-    let control_stream = crate::accept_runner_channel(runner, setup_deadline, "control", || {
-        control_listener.accept().map(|(stream, _)| stream)
-    })?;
+    let control_stream = crate::accept_runner_channel(
+        setup_deadline,
+        "control",
+        || {
+            runner
+                .try_wait()
+                .map(|status| status.map(|status| format!("exited with {status}")))
+        },
+        || control_listener.accept().map(|(stream, _)| stream),
+    )?;
     validate_peer_process(&control_stream, runner_process_id)?;
+    serve_control_stream(broker, control_stream, setup_deadline)
+}
+
+fn serve_runner_in_process(
+    broker: &BrokerCore,
+    control_listener: &UnixListener,
+    runner: &JoinHandle<super::InProcessRunnerResult>,
+) -> IoResult<()> {
+    let setup_deadline = Instant::now() + SETUP_TIMEOUT;
+    let control_stream = crate::accept_runner_channel(
+        setup_deadline,
+        "control",
+        || Ok(runner.is_finished().then(|| "thread stopped".to_owned())),
+        || control_listener.accept().map(|(stream, _)| stream),
+    )?;
+    validate_peer_process(&control_stream, std::process::id())?;
+    serve_control_stream(broker, control_stream, setup_deadline)
+}
+
+fn serve_control_stream(
+    broker: &BrokerCore,
+    control_stream: UnixStream,
+    setup_deadline: Instant,
+) -> IoResult<()> {
     let control_channel =
         UnixStreamHostSetupChannel::from_host_guaranteed(control_stream, setup_deadline);
     litebox_broker_userland::runtime::serve_association(
@@ -184,6 +258,5 @@ fn serve_runner(
             Ok(())
         },
         UnixStreamHostSetupChannel::into_active,
-    )?;
-    Ok(())
+    )
 }

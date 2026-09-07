@@ -127,6 +127,8 @@ struct Runner {
     managed_proxy_hosts: Vec<OsString>,
     #[cfg(target_os = "linux")]
     use_userland_broker: bool,
+    #[cfg(target_os = "linux")]
+    in_process_mode: bool,
     has_run: bool,
 }
 
@@ -187,6 +189,8 @@ impl Runner {
             managed_proxy_hosts: Vec::new(),
             #[cfg(target_os = "linux")]
             use_userland_broker: true,
+            #[cfg(target_os = "linux")]
+            in_process_mode: false,
             has_run: false,
             unique_name: unique_name.to_owned(),
         }
@@ -231,6 +235,13 @@ impl Runner {
         self.command
             .arg("--broker-control-channel")
             .arg(control_socket_path);
+        self
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    fn use_in_process_runner(&mut self) -> &mut Self {
+        self.use_userland_broker = true;
+        self.in_process_mode = true;
         self
     }
 
@@ -293,7 +304,12 @@ impl Runner {
             for host in &self.managed_proxy_hosts {
                 command.arg("--allow-host").arg(host);
             }
-            command.arg("--runner").arg(runner).args(runner_arguments);
+            if self.in_process_mode {
+                command.args(["--unstable", "--in-process-runner"]);
+            } else {
+                command.arg("--runner").arg(runner);
+            }
+            command.args(runner_arguments);
             self.command = command;
         }
     }
@@ -776,7 +792,7 @@ fn brokered_getrandom() {
         false,
     );
     let mut runner = Runner::new(&target, "brokered_getrandom");
-    runner.use_userland_broker = true;
+    runner.use_in_process_runner();
     runner.run();
 }
 

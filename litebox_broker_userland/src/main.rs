@@ -8,6 +8,7 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::str::FromStr;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
@@ -86,12 +87,45 @@ struct CliArgs {
     /// `0.0.0.0/0:1-65535` permits every nonzero IPv4 UDP destination.
     #[arg(long, value_name = "CIDR:PORT[-PORT]")]
     allow_udp_destination: Vec<AllowedDestination>,
+    /// Allow using unstable options.
+    #[arg(short = 'Z', long = "unstable")]
+    unstable: bool,
+    /// Run the runner library for this platform as a thread in this broker process.
+    ///
+    /// This mode does not provide a security boundary between the runner and
+    /// broker and is intended only for testing and development.
+    #[arg(long, hide = true, requires = "unstable", conflicts_with = "runner")]
+    in_process_runner: bool,
     /// Local runner executable to launch.
-    #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::ExecutablePath)]
-    runner: PathBuf,
+    #[arg(
+        long,
+        value_name = "PATH",
+        value_hint = clap::ValueHint::ExecutablePath,
+        required_unless_present = "in_process_runner",
+        conflicts_with = "in_process_runner"
+    )]
+    runner: Option<PathBuf>,
     /// Arguments to pass to the local runner.
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true, value_hint = clap::ValueHint::CommandWithArguments)]
     runner_arguments: Vec<OsString>,
+}
+
+fn runner_command_arguments(
+    args: &CliArgs,
+    control_channel: &OsStr,
+    proxy_url: Option<&str>,
+) -> Vec<OsString> {
+    let mut runner_arguments = vec![
+        OsString::from("--unstable"),
+        OsString::from("--broker-control-channel"),
+        control_channel.to_os_string(),
+    ];
+    if let Some(proxy_url) = proxy_url {
+        runner_arguments.push(OsString::from("--broker-proxy-url"));
+        runner_arguments.push(OsString::from(proxy_url));
+    }
+    runner_arguments.extend(args.runner_arguments.iter().cloned());
+    runner_arguments
 }
 
 fn run_runner_process(
@@ -100,15 +134,15 @@ fn run_runner_process(
     proxy_url: Option<&str>,
     serve: impl FnOnce(&mut Child, u32) -> Result<(), Box<dyn Error>>,
 ) -> Result<(), Box<dyn Error>> {
-    let mut command = Command::new(&args.runner);
-    command
-        .arg("--unstable")
-        .arg("--broker-control-channel")
-        .arg(control_channel);
-    if let Some(proxy_url) = proxy_url {
-        command.arg("--broker-proxy-url").arg(proxy_url);
-    }
-    let mut runner = command.args(&args.runner_arguments).spawn()?;
+    let runner_path = args.runner.as_ref().ok_or_else(|| {
+        IoError::new(
+            ErrorKind::InvalidInput,
+            "--runner is required outside in-process mode",
+        )
+    })?;
+    let mut runner = Command::new(runner_path)
+        .args(runner_command_arguments(args, control_channel, proxy_url))
+        .spawn()?;
     let runner_process_id = runner.id();
     let association_result = serve(&mut runner, runner_process_id);
     if association_result.is_err() {
@@ -120,6 +154,46 @@ fn run_runner_process(
         return Err(IoError::other(format!("runner exited with {runner_status}")).into());
     }
     Ok(())
+}
+
+type InProcessRunnerResult = Result<i32, String>;
+
+fn finish_in_process_runner(
+    runner: JoinHandle<InProcessRunnerResult>,
+    association_result: IoResult<()>,
+) -> Result<(), Box<dyn Error>> {
+    if let Err(error) = &association_result
+        && !runner.is_finished()
+    {
+        return Err(
+            IoError::new(error.kind(), format!("broker association failed: {error}")).into(),
+        );
+    }
+
+    let runner_result = runner
+        .join()
+        .map_err(|_| IoError::other("in-process runner thread panicked"))?;
+    match (runner_result, association_result) {
+        (Ok(0), Ok(())) => Ok(()),
+        (Ok(exit_code), Ok(())) => Err(IoError::other(format!(
+            "in-process runner exited with status code {exit_code}"
+        ))
+        .into()),
+        (Err(runner_error), Ok(())) => {
+            Err(IoError::other(format!("in-process runner failed: {runner_error}")).into())
+        }
+        (Ok(0), Err(association_error)) => Err(association_error.into()),
+        (Ok(exit_code), Err(association_error)) => Err(IoError::other(format!(
+            "in-process runner exited with status code {exit_code}; \
+             broker association failed: {association_error}"
+        ))
+        .into()),
+        (Err(runner_error), Err(association_error)) => Err(IoError::other(format!(
+            "in-process runner failed: {runner_error}; \
+             broker association failed: {association_error}"
+        ))
+        .into()),
+    }
 }
 
 fn configured_socket_policy(
@@ -152,9 +226,9 @@ fn destination_rules(allowed_destinations: &[AllowedDestination]) -> Vec<Destina
 }
 
 fn accept_runner_channel<Channel>(
-    runner: &mut Child,
     deadline: Instant,
     channel_name: &'static str,
+    mut runner_status: impl FnMut() -> IoResult<Option<String>>,
     mut try_accept: impl FnMut() -> IoResult<Channel>,
 ) -> IoResult<Channel> {
     loop {
@@ -165,10 +239,10 @@ fn accept_runner_channel<Channel>(
                 format!("timed out waiting for runner {channel_name} channel"),
             ));
         }
-        if let Some(status) = runner.try_wait()? {
+        if let Some(status) = runner_status()? {
             return Err(IoError::new(
                 ErrorKind::BrokenPipe,
-                format!("runner exited with {status} before connecting its {channel_name} channel"),
+                format!("runner {status} before connecting its {channel_name} channel"),
             ));
         }
         match try_accept() {

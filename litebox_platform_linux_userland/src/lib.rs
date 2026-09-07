@@ -924,18 +924,66 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
     );
 }
 
-/// Non-guest threads (e.g., network workers, background tasks) should call this
-/// function at the start of their execution so the kernel only delivers
-/// `SIGALRM` / `SIGINT` to guest threads, which have the proper signal-handler
-/// context to re-enter the shim.
-fn block_guest_signals() {
+fn guest_signal_set() -> libc::sigset_t {
     unsafe {
         let mut set: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&raw mut set);
         libc::sigaddset(&raw mut set, libc::SIGALRM);
         libc::sigaddset(&raw mut set, libc::SIGINT);
-        libc::pthread_sigmask(libc::SIG_BLOCK, &raw const set, std::ptr::null_mut());
+        set
     }
+}
+
+struct GuestSignalMaskGuard {
+    previous: libc::sigset_t,
+}
+
+impl Drop for GuestSignalMaskGuard {
+    fn drop(&mut self) {
+        // SAFETY: `previous` was populated by `pthread_sigmask` for this
+        // thread and remains valid for the lifetime of the guard.
+        let result = unsafe {
+            libc::pthread_sigmask(
+                libc::SIG_SETMASK,
+                &raw const self.previous,
+                std::ptr::null_mut(),
+            )
+        };
+        debug_assert_eq!(result, 0, "failed to restore the thread signal mask");
+    }
+}
+
+/// Runs `f` while blocking signals reserved for delivery to guest threads.
+///
+/// Threads spawned by `f` inherit the blocked mask. The calling thread's
+/// previous mask is restored when `f` returns or unwinds.
+///
+/// # Panics
+///
+/// Panics if the calling thread's signal mask cannot be changed.
+pub fn with_guest_signals_blocked<T>(f: impl FnOnce() -> T) -> T {
+    let set = guest_signal_set();
+    let mut previous = unsafe { std::mem::zeroed() };
+    // SAFETY: `set` and `previous` are valid signal sets owned by this thread.
+    let result =
+        unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &raw const set, &raw mut previous) };
+    assert_eq!(result, 0, "failed to block guest signals");
+    let _guard = GuestSignalMaskGuard { previous };
+    f()
+}
+
+/// Unblocks signals reserved for delivery to guest threads on the calling thread.
+///
+/// # Panics
+///
+/// Panics if the calling thread's signal mask cannot be changed.
+pub fn unblock_guest_signals() {
+    let set = guest_signal_set();
+    // SAFETY: `set` is a valid signal set and the null third argument means
+    // the previous mask is not requested.
+    let result =
+        unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &raw const set, std::ptr::null_mut()) };
+    assert_eq!(result, 0, "failed to unblock guest signals");
 }
 
 /// Spawn a non-guest ("host") thread that automatically blocks guest interrupt
@@ -958,10 +1006,7 @@ where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    std::thread::spawn(move || {
-        block_guest_signals();
-        f()
-    })
+    with_guest_signals_blocked(|| std::thread::spawn(f))
 }
 
 fn thread_start(
