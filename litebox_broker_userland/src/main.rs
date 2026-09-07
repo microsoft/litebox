@@ -19,7 +19,7 @@ use litebox_broker_protocol::socket::{Ipv4Address, Port};
 
 #[cfg(target_os = "linux")]
 mod linux;
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 mod windows;
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -185,12 +185,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     linux::run(CliArgs::parse())
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     windows::run(CliArgs::parse())
 }
 
-#[cfg(not(any(target_os = "linux", all(windows, target_arch = "x86_64"))))]
+#[cfg(not(any(
+    target_os = "linux",
+    all(target_os = "windows", target_arch = "x86_64")
+)))]
 fn main() {}
 
 #[cfg(test)]

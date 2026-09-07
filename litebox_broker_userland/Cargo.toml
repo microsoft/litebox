@@ -17,7 +17,7 @@ litebox_broker_platform_linux_userland = { path = "../litebox_broker_platform_li
 litebox_broker_transport_linux_userland = { path = "../litebox_broker_transport_linux_userland", version = "0.1.0" }
 tempfile = { version = "3", default-features = false }
 
-[target.'cfg(all(windows, target_arch = "x86_64"))'.dependencies]
+[target.'cfg(all(target_os = "windows", target_arch = "x86_64"))'.dependencies]
 litebox_broker_transport_windows_userland = { path = "../litebox_broker_transport_windows_userland", version = "0.1.0" }
 
 [features]

@@ -7,7 +7,7 @@ edition = "2024"
 litebox_broker_protocol = { path = "../litebox_broker_protocol", version = "0.1.0" }
 litebox_broker_transport = { path = "../litebox_broker_transport", version = "0.1.0" }
 
-[target.'cfg(windows)'.dependencies]
+[target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.60.2", features = [
     "Win32_Foundation",
     "Win32_Security",
