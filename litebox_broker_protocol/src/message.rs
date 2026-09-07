@@ -7,11 +7,11 @@ use crate::event::{
     CreateEventRequest, CreateEventResponse,
 };
 use crate::fs::{
-    ChmodFileRequest, ChownFileRequest, FilesystemError, FilesystemFileStatus,
-    HandleFileStatusRequest, MkdirFileRequest, OpenFileRequest, OpenFileResponse,
-    PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
-    ReadFileResponse, RmdirFileRequest, SeekFileRequest, SeekFileResponse, TruncateFileRequest,
-    UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
+    ChmodFileRequest, ChownFileRequest, FileError, FileStatus, HandleFileStatusRequest,
+    MkdirFileRequest, OpenFileRequest, OpenFileResponse, PathFileStatusRequest,
+    ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest, ReadFileResponse,
+    RmdirFileRequest, SeekFileRequest, SeekFileResponse, TruncateFileRequest, UnlinkFileRequest,
+    WriteFileRequest, WriteFileResponse,
 };
 use crate::pipe::{
     CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
@@ -58,8 +58,8 @@ pub enum BrokerOperation {
     FillRandom(SharedBufferDescriptor),
     /// Standard-I/O request family.
     Stdio(StdioRequest),
-    /// Filesystem request family.
-    Filesystem(FilesystemRequest),
+    /// File request family.
+    File(FileRequest),
 }
 
 /// Request sent over an active broker control channel.
@@ -165,8 +165,8 @@ pub enum BrokerResult {
     RandomFilled,
     /// Standard-I/O response family.
     Stdio(StdioResponse),
-    /// Filesystem response family.
-    Filesystem(FilesystemResponse),
+    /// File response family.
+    File(FileResponse),
     /// Operation failed with an ABI-neutral broker error.
     Error(ErrorCode),
 }
@@ -264,9 +264,9 @@ pub enum StdioResponse {
     IsTerminal(IsTerminalStdioResponse),
 }
 
-/// Broker-owned filesystem request.
+/// Broker-owned fs request.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum FilesystemRequest {
+pub enum FileRequest {
     /// Open or create an object.
     Open(OpenFileRequest),
     /// Read from an open file.
@@ -295,9 +295,9 @@ pub enum FilesystemRequest {
     Rmdir(RmdirFileRequest),
 }
 
-/// Broker-owned filesystem response.
+/// Broker-owned fs response.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum FilesystemResponse {
+pub enum FileResponse {
     /// Open response.
     Open(OpenFileResponse),
     /// Read response.
@@ -310,8 +310,10 @@ pub enum FilesystemResponse {
     Truncate,
     /// Directory-read response.
     ReadDirectory(ReadDirectoryResponse),
-    /// Status response.
-    Status(FilesystemFileStatus),
+    /// Path-status response.
+    PathStatus(FileStatus),
+    /// Handle-status response.
+    HandleStatus(FileStatus),
     /// Mode change completed.
     Chmod,
     /// Ownership change completed.
@@ -322,8 +324,8 @@ pub enum FilesystemResponse {
     Mkdir,
     /// Directory removal completed.
     Rmdir,
-    /// Filesystem operation failed with a guest-visible error.
-    Failed(FilesystemError),
+    /// File operation failed with a guest-visible error.
+    Failed(FileError),
 }
 
 /// Broker-initiated asynchronous notification.

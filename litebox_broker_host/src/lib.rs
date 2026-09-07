@@ -115,7 +115,7 @@ impl<Memory: SharedMemory> BrokerHostAssociation<'_, Memory> {
             BrokerOperation::CloseObject(_)
             | BrokerOperation::CheckReadiness(_)
             | BrokerOperation::Event(_)
-            | BrokerOperation::Filesystem(_)
+            | BrokerOperation::File(_)
             | BrokerOperation::Pipe(PipeRequest::Create(_))
             | BrokerOperation::Stdio(StdioRequest::IsTerminal(_))
             | BrokerOperation::Socket(
@@ -385,9 +385,7 @@ fn handle_request<Memory: SharedMemory>(
         BrokerOperation::Stdio(request) => {
             handle_stdio_request(session, request, shared_buffers).map(BrokerResult::Stdio)
         }
-        BrokerOperation::Filesystem(_) => {
-            Err(RequestFailure::Respond(ErrorCode::UnsupportedOperation))
-        }
+        BrokerOperation::File(_) => Err(RequestFailure::Respond(ErrorCode::UnsupportedOperation)),
     }
 }
 

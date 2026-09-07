@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Broker filesystem requests, responses, and ABI-neutral values.
+//! Broker fs requests, responses, and ABI-neutral values.
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -11,37 +11,27 @@ use thiserror::Error;
 use crate::ObjectHandle;
 use crate::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferDescriptor};
 
-/// Maximum bytes transferred through one filesystem shared-buffer request.
+/// Maximum bytes transferred through one fs shared-buffer request.
 ///
 /// This remains independent of slot capacity so increasing the shared-buffer
-/// layout does not silently change filesystem protocol behavior.
-pub const MAX_FILESYSTEM_TRANSFER_SIZE: u32 = 64 * 1024;
+/// layout does not silently change fs protocol behavior.
+pub const MAX_FILE_TRANSFER_SIZE: u32 = 64 * 1024;
 
-const _: () = assert!(MAX_FILESYSTEM_TRANSFER_SIZE <= SHARED_BUFFER_SLOT_SIZE);
+const _: () = assert!(MAX_FILE_TRANSFER_SIZE <= SHARED_BUFFER_SLOT_SIZE);
 
-/// Broker-owned filesystem namespace.
+/// File user identity used for permission checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum FilesystemNamespace {
-    /// Guest-visible filesystem namespace.
-    Guest,
-    /// Private backing store for Windows registry state.
-    WindowsRegistry,
-}
-
-/// Filesystem user identity used for permission checks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FilesystemUser {
+pub struct FileUser {
     /// Effective user ID.
     pub user: u16,
     /// Effective group ID.
     pub group: u16,
 }
 
-/// Filesystem object kind.
+/// File object kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum FilesystemFileType {
+pub enum FileType {
     /// Regular file.
     RegularFile,
     /// Directory.
@@ -52,7 +42,7 @@ pub enum FilesystemFileType {
 
 /// Device and inode identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FilesystemNodeInfo {
+pub struct FileNodeInfo {
     /// Device number.
     pub dev: u64,
     /// Inode number.
@@ -61,44 +51,44 @@ pub struct FilesystemNodeInfo {
     pub rdev: Option<u64>,
 }
 
-/// Status returned for a filesystem object.
+/// Status returned for a fs object.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FilesystemFileStatus {
+pub struct FileStatus {
     /// Object kind.
-    pub file_type: FilesystemFileType,
+    pub file_type: FileType,
     /// Permission and special mode bits, excluding object-type bits.
-    pub mode: FilesystemMode,
+    pub mode: FileMode,
     /// Object size in bytes.
     pub size: u64,
     /// Owner identity.
-    pub owner: FilesystemUser,
+    pub owner: FileUser,
     /// Device and inode identity.
-    pub node_info: FilesystemNodeInfo,
-    /// Preferred filesystem I/O block size.
+    pub node_info: FileNodeInfo,
+    /// Preferred fs I/O block size.
     pub block_size: u64,
 }
 
 /// One directory entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FilesystemDirectoryEntry {
+pub struct FileDirectoryEntry {
     /// Entry name.
     pub name: String,
     /// Entry kind.
-    pub file_type: FilesystemFileType,
+    pub file_type: FileType,
     /// Optional device and inode identity.
-    pub node_info: Option<FilesystemNodeInfo>,
+    pub node_info: Option<FileNodeInfo>,
 }
 
-/// Filesystem operation failure that is meaningful to the guest ABI.
+/// File operation failure that is meaningful to the guest ABI.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum FilesystemError {
+pub enum FileError {
     #[error("requested access is not allowed")]
     AccessNotAllowed,
     #[error("parent directory does not allow writes")]
     NoWritePermissions,
-    #[error("filesystem is read-only")]
-    ReadOnlyFilesystem,
+    #[error("fs is read-only")]
+    ReadOnlyFs,
     #[error("object already exists")]
     AlreadyExists,
     #[error("I/O error")]
@@ -137,67 +127,10 @@ pub enum FilesystemError {
     NotEmpty,
 }
 
-impl FilesystemError {
-    /// Converts one raw wire value to a filesystem error.
-    pub const fn from_raw(raw: u8) -> Option<Self> {
-        match raw {
-            1 => Some(Self::AccessNotAllowed),
-            2 => Some(Self::NoWritePermissions),
-            3 => Some(Self::ReadOnlyFilesystem),
-            4 => Some(Self::AlreadyExists),
-            5 => Some(Self::Io),
-            6 => Some(Self::NoSuchFileOrDirectory),
-            7 => Some(Self::NoSearchPermissions),
-            8 => Some(Self::InvalidPathname),
-            9 => Some(Self::MissingComponent),
-            10 => Some(Self::ComponentNotDirectory),
-            11 => Some(Self::NotFile),
-            12 => Some(Self::NotForReading),
-            13 => Some(Self::NotForWriting),
-            14 => Some(Self::InvalidOffset),
-            15 => Some(Self::NonSeekable),
-            16 => Some(Self::IsDirectory),
-            17 => Some(Self::IsTerminalDevice),
-            18 => Some(Self::NotOwner),
-            19 => Some(Self::NotDirectory),
-            20 => Some(Self::Busy),
-            21 => Some(Self::NotEmpty),
-            _ => None,
-        }
-    }
-
-    /// Returns the raw wire value for this filesystem error.
-    pub const fn as_raw(self) -> u8 {
-        match self {
-            Self::AccessNotAllowed => 1,
-            Self::NoWritePermissions => 2,
-            Self::ReadOnlyFilesystem => 3,
-            Self::AlreadyExists => 4,
-            Self::Io => 5,
-            Self::NoSuchFileOrDirectory => 6,
-            Self::NoSearchPermissions => 7,
-            Self::InvalidPathname => 8,
-            Self::MissingComponent => 9,
-            Self::ComponentNotDirectory => 10,
-            Self::NotFile => 11,
-            Self::NotForReading => 12,
-            Self::NotForWriting => 13,
-            Self::InvalidOffset => 14,
-            Self::NonSeekable => 15,
-            Self::IsDirectory => 16,
-            Self::IsTerminalDevice => 17,
-            Self::NotOwner => 18,
-            Self::NotDirectory => 19,
-            Self::Busy => 20,
-            Self::NotEmpty => 21,
-        }
-    }
-}
-
 /// Seek origin.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum FilesystemSeekWhence {
+pub enum FileSeekWhence {
     /// Offset from the beginning of the file.
     Beginning,
     /// Offset from the file's current position.
@@ -206,10 +139,10 @@ pub enum FilesystemSeekWhence {
     End,
 }
 
-/// Access mode requested when opening a filesystem object.
+/// Access mode requested when opening a fs object.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum FilesystemAccessMode {
+pub enum FileAccessMode {
     /// Open for reading.
     ReadOnly,
     /// Open for writing.
@@ -218,12 +151,12 @@ pub enum FilesystemAccessMode {
     ReadWrite,
 }
 
-/// ABI-neutral filesystem permission and special mode bits.
+/// ABI-neutral fs permission and special mode bits.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct FilesystemMode(u16);
+pub struct FileMode(u16);
 
-impl FilesystemMode {
+impl FileMode {
     /// Every permission and special mode bit this protocol version defines.
     pub const SUPPORTED: Self = Self(0o7777);
 
@@ -244,15 +177,15 @@ impl FilesystemMode {
     }
 }
 
-/// ABI-neutral filesystem open flags.
+/// ABI-neutral fs open flags.
 ///
 /// These values are intentionally independent of target-specific `O_*` bit
 /// assignments.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct FilesystemOpenFlags(u16);
+pub struct FileOpenFlags(u16);
 
-impl FilesystemOpenFlags {
+impl FileOpenFlags {
     /// No open flags.
     pub const NONE: Self = Self(0);
     /// Create the object when it does not exist.
@@ -319,7 +252,7 @@ impl FilesystemOpenFlags {
     }
 }
 
-impl core::ops::BitOr for FilesystemOpenFlags {
+impl core::ops::BitOr for FileOpenFlags {
     type Output = Self;
 
     fn bitor(self, rhs: Self) -> Self::Output {
@@ -327,21 +260,19 @@ impl core::ops::BitOr for FilesystemOpenFlags {
     }
 }
 
-/// Opens or creates a filesystem object.
+/// Opens or creates a fs object.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpenFileRequest {
-    /// Filesystem namespace containing the path.
-    pub namespace: FilesystemNamespace,
     /// Shared-buffer region containing one absolute UTF-8 path.
     pub path: SharedBufferDescriptor,
     /// Caller identity for permission checks.
-    pub user: FilesystemUser,
+    pub user: FileUser,
     /// Requested access mode.
-    pub access: FilesystemAccessMode,
+    pub access: FileAccessMode,
     /// Open flags.
-    pub flags: FilesystemOpenFlags,
+    pub flags: FileOpenFlags,
     /// Creation mode.
-    pub mode: FilesystemMode,
+    pub mode: FileMode,
 }
 
 /// Successful open response.
@@ -395,7 +326,7 @@ pub struct SeekFileRequest {
     /// Signed offset relative to `whence`.
     pub offset: i64,
     /// Seek origin.
-    pub whence: FilesystemSeekWhence,
+    pub whence: FileSeekWhence,
 }
 
 /// Successful seek response.
@@ -439,12 +370,10 @@ pub struct ReadDirectoryResponse {
 /// Reads status by path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PathFileStatusRequest {
-    /// Filesystem namespace containing the path.
-    pub namespace: FilesystemNamespace,
     /// Shared-buffer region containing one absolute UTF-8 path.
     pub path: SharedBufferDescriptor,
     /// Caller identity for permission checks.
-    pub user: FilesystemUser,
+    pub user: FileUser,
 }
 
 /// Reads status by open handle.
@@ -457,25 +386,21 @@ pub struct HandleFileStatusRequest {
 /// Changes mode bits by path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChmodFileRequest {
-    /// Filesystem namespace containing the path.
-    pub namespace: FilesystemNamespace,
     /// Shared-buffer region containing one absolute UTF-8 path.
     pub path: SharedBufferDescriptor,
     /// Caller identity for permission checks.
-    pub user: FilesystemUser,
+    pub user: FileUser,
     /// New mode bits.
-    pub mode: FilesystemMode,
+    pub mode: FileMode,
 }
 
 /// Changes ownership by path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChownFileRequest {
-    /// Filesystem namespace containing the path.
-    pub namespace: FilesystemNamespace,
     /// Shared-buffer region containing one absolute UTF-8 path.
     pub path: SharedBufferDescriptor,
     /// Caller identity for permission checks.
-    pub acting_user: FilesystemUser,
+    pub acting_user: FileUser,
     /// New user ID, if changed.
     pub user: Option<u16>,
     /// New group ID, if changed.
@@ -485,36 +410,30 @@ pub struct ChownFileRequest {
 /// Removes a file by path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UnlinkFileRequest {
-    /// Filesystem namespace containing the path.
-    pub namespace: FilesystemNamespace,
     /// Shared-buffer region containing one absolute UTF-8 path.
     pub path: SharedBufferDescriptor,
     /// Caller identity for permission checks.
-    pub user: FilesystemUser,
+    pub user: FileUser,
 }
 
 /// Creates a directory by path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MkdirFileRequest {
-    /// Filesystem namespace containing the path.
-    pub namespace: FilesystemNamespace,
     /// Shared-buffer region containing one absolute UTF-8 path.
     pub path: SharedBufferDescriptor,
     /// Caller identity for permission checks.
-    pub user: FilesystemUser,
+    pub user: FileUser,
     /// New directory mode.
-    pub mode: FilesystemMode,
+    pub mode: FileMode,
 }
 
 /// Removes a directory by path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RmdirFileRequest {
-    /// Filesystem namespace containing the path.
-    pub namespace: FilesystemNamespace,
     /// Shared-buffer region containing one absolute UTF-8 path.
     pub path: SharedBufferDescriptor,
     /// Caller identity for permission checks.
-    pub user: FilesystemUser,
+    pub user: FileUser,
 }
 
 /// Error while encoding or decoding a shared directory payload.
@@ -522,13 +441,13 @@ pub struct RmdirFileRequest {
 pub enum DirectoryPayloadError {
     #[error("directory payload is malformed")]
     Malformed,
-    #[error("directory payload exceeds one filesystem transfer")]
+    #[error("directory payload exceeds one fs transfer")]
     TooLarge,
 }
 
-/// Encodes directory entries for one filesystem shared-buffer transfer.
+/// Encodes directory entries for one fs shared-buffer transfer.
 pub fn encode_directory_entries(
-    entries: &[FilesystemDirectoryEntry],
+    entries: &[FileDirectoryEntry],
 ) -> Result<Vec<u8>, DirectoryPayloadError> {
     let mut output = Vec::new();
     output.extend_from_slice(&0u32.to_le_bytes());
@@ -537,7 +456,7 @@ pub fn encode_directory_entries(
             .len()
             .checked_add(encoded_directory_entry_length(entry)?)
             .ok_or(DirectoryPayloadError::TooLarge)?;
-        if encoded_length > MAX_FILESYSTEM_TRANSFER_SIZE as usize {
+        if encoded_length > MAX_FILE_TRANSFER_SIZE as usize {
             return Err(DirectoryPayloadError::TooLarge);
         }
         encode_directory_entry(&mut output, entry)?;
@@ -547,13 +466,13 @@ pub fn encode_directory_entries(
     Ok(output)
 }
 
-/// Decodes directory entries from one filesystem shared-buffer transfer.
+/// Decodes directory entries from one fs shared-buffer transfer.
 pub fn decode_directory_entries(
     payload: &[u8],
-) -> Result<Vec<FilesystemDirectoryEntry>, DirectoryPayloadError> {
+) -> Result<Vec<FileDirectoryEntry>, DirectoryPayloadError> {
     const MINIMUM_ENTRY_LENGTH: usize = size_of::<u32>() + 2;
 
-    if payload.len() > MAX_FILESYSTEM_TRANSFER_SIZE as usize {
+    if payload.len() > MAX_FILE_TRANSFER_SIZE as usize {
         return Err(DirectoryPayloadError::TooLarge);
     }
     let mut decoder = DirectoryPayloadDecoder { payload, offset: 0 };
@@ -582,11 +501,11 @@ pub fn decode_directory_entries(
                     1 => Some(decoder.u64()?),
                     _ => return Err(DirectoryPayloadError::Malformed),
                 };
-                Some(FilesystemNodeInfo { dev, ino, rdev })
+                Some(FileNodeInfo { dev, ino, rdev })
             }
             _ => return Err(DirectoryPayloadError::Malformed),
         };
-        entries.push(FilesystemDirectoryEntry {
+        entries.push(FileDirectoryEntry {
             name,
             file_type,
             node_info,
@@ -598,25 +517,25 @@ pub fn decode_directory_entries(
     Ok(entries)
 }
 
-pub(crate) const fn file_type_raw(file_type: FilesystemFileType) -> u8 {
+pub(crate) const fn file_type_raw(file_type: FileType) -> u8 {
     match file_type {
-        FilesystemFileType::RegularFile => 0,
-        FilesystemFileType::Directory => 1,
-        FilesystemFileType::CharacterDevice => 2,
+        FileType::RegularFile => 0,
+        FileType::Directory => 1,
+        FileType::CharacterDevice => 2,
     }
 }
 
-pub(crate) const fn file_type_from_raw(raw: u8) -> Option<FilesystemFileType> {
+pub(crate) const fn file_type_from_raw(raw: u8) -> Option<FileType> {
     match raw {
-        0 => Some(FilesystemFileType::RegularFile),
-        1 => Some(FilesystemFileType::Directory),
-        2 => Some(FilesystemFileType::CharacterDevice),
+        0 => Some(FileType::RegularFile),
+        1 => Some(FileType::Directory),
+        2 => Some(FileType::CharacterDevice),
         _ => None,
     }
 }
 
 fn encoded_directory_entry_length(
-    entry: &FilesystemDirectoryEntry,
+    entry: &FileDirectoryEntry,
 ) -> Result<usize, DirectoryPayloadError> {
     let _ = u32::try_from(entry.name.len()).map_err(|_| DirectoryPayloadError::TooLarge)?;
     size_of::<u32>()
@@ -638,7 +557,7 @@ fn encoded_directory_entry_length(
 
 fn encode_directory_entry(
     output: &mut Vec<u8>,
-    entry: &FilesystemDirectoryEntry,
+    entry: &FileDirectoryEntry,
 ) -> Result<(), DirectoryPayloadError> {
     let name = entry.name.as_bytes();
     let name_len = u32::try_from(name.len()).map_err(|_| DirectoryPayloadError::TooLarge)?;
@@ -703,61 +622,26 @@ mod tests {
     use alloc::vec;
 
     #[test]
-    fn fs_errors_have_unique_stable_wire_values() {
-        let errors = [
-            FilesystemError::AccessNotAllowed,
-            FilesystemError::NoWritePermissions,
-            FilesystemError::ReadOnlyFilesystem,
-            FilesystemError::AlreadyExists,
-            FilesystemError::Io,
-            FilesystemError::NoSuchFileOrDirectory,
-            FilesystemError::NoSearchPermissions,
-            FilesystemError::InvalidPathname,
-            FilesystemError::MissingComponent,
-            FilesystemError::ComponentNotDirectory,
-            FilesystemError::NotFile,
-            FilesystemError::NotForReading,
-            FilesystemError::NotForWriting,
-            FilesystemError::InvalidOffset,
-            FilesystemError::NonSeekable,
-            FilesystemError::IsDirectory,
-            FilesystemError::IsTerminalDevice,
-            FilesystemError::NotOwner,
-            FilesystemError::NotDirectory,
-            FilesystemError::Busy,
-            FilesystemError::NotEmpty,
-        ];
-
-        for (index, error) in errors.into_iter().enumerate() {
-            let raw = u8::try_from(index + 1).unwrap();
-            assert_eq!(error.as_raw(), raw);
-            assert_eq!(FilesystemError::from_raw(raw), Some(error));
-        }
-        assert_eq!(FilesystemError::from_raw(0), None);
-        assert_eq!(FilesystemError::from_raw(22), None);
-    }
-
-    #[test]
     fn directory_payload_round_trips_all_entry_shapes() {
         let entries = vec![
-            FilesystemDirectoryEntry {
+            FileDirectoryEntry {
                 name: ".".into(),
-                file_type: FilesystemFileType::Directory,
+                file_type: FileType::Directory,
                 node_info: None,
             },
-            FilesystemDirectoryEntry {
+            FileDirectoryEntry {
                 name: "regular".into(),
-                file_type: FilesystemFileType::RegularFile,
-                node_info: Some(FilesystemNodeInfo {
+                file_type: FileType::RegularFile,
+                node_info: Some(FileNodeInfo {
                     dev: 2,
                     ino: 3,
                     rdev: None,
                 }),
             },
-            FilesystemDirectoryEntry {
+            FileDirectoryEntry {
                 name: "device".into(),
-                file_type: FilesystemFileType::CharacterDevice,
-                node_info: Some(FilesystemNodeInfo {
+                file_type: FileType::CharacterDevice,
+                node_info: Some(FileNodeInfo {
                     dev: 5,
                     ino: 7,
                     rdev: Some(11),
@@ -771,10 +655,10 @@ mod tests {
 
     #[test]
     fn directory_payload_wire_shape_is_pinned() {
-        let payload = encode_directory_entries(&[FilesystemDirectoryEntry {
+        let payload = encode_directory_entries(&[FileDirectoryEntry {
             name: "x".into(),
-            file_type: FilesystemFileType::CharacterDevice,
-            node_info: Some(FilesystemNodeInfo {
+            file_type: FileType::CharacterDevice,
+            node_info: Some(FileNodeInfo {
                 dev: 2,
                 ino: 3,
                 rdev: Some(5),
@@ -797,9 +681,9 @@ mod tests {
             Err(DirectoryPayloadError::Malformed)
         );
 
-        let valid = encode_directory_entries(&[FilesystemDirectoryEntry {
+        let valid = encode_directory_entries(&[FileDirectoryEntry {
             name: "entry".into(),
-            file_type: FilesystemFileType::RegularFile,
+            file_type: FileType::RegularFile,
             node_info: None,
         }])
         .unwrap();
@@ -827,39 +711,22 @@ mod tests {
     }
 
     #[test]
-    fn open_flags_are_bounded() {
-        let flags = FilesystemOpenFlags::CREATE
-            | FilesystemOpenFlags::DIRECTORY
-            | FilesystemOpenFlags::NO_FOLLOW;
-        assert!(flags.contains(FilesystemOpenFlags::DIRECTORY));
-        assert_eq!(FilesystemOpenFlags::from_bits(flags.bits()), Some(flags));
-        assert_eq!(FilesystemOpenFlags::from_bits(1 << 15), None);
-    }
-
-    #[test]
-    fn modes_are_bounded() {
-        let mode = FilesystemMode::from_bits(0o6751).unwrap();
-        assert_eq!(mode.bits(), 0o6751);
-        assert_eq!(FilesystemMode::from_bits(0o10000), None);
-    }
-
-    #[test]
     fn directory_payload_is_bounded_by_one_transfer() {
         const ENTRY_OVERHEAD: usize = size_of::<u32>() + 2;
         let maximum_name_length =
-            MAX_FILESYSTEM_TRANSFER_SIZE as usize - size_of::<u32>() - ENTRY_OVERHEAD;
-        let maximum_entry = FilesystemDirectoryEntry {
+            MAX_FILE_TRANSFER_SIZE as usize - size_of::<u32>() - ENTRY_OVERHEAD;
+        let maximum_entry = FileDirectoryEntry {
             name: "x".repeat(maximum_name_length),
-            file_type: FilesystemFileType::RegularFile,
+            file_type: FileType::RegularFile,
             node_info: None,
         };
         let payload = encode_directory_entries(core::slice::from_ref(&maximum_entry)).unwrap();
-        assert_eq!(payload.len(), MAX_FILESYSTEM_TRANSFER_SIZE as usize);
+        assert_eq!(payload.len(), MAX_FILE_TRANSFER_SIZE as usize);
         assert_eq!(decode_directory_entries(&payload).unwrap(), [maximum_entry]);
 
-        let oversized_entry = FilesystemDirectoryEntry {
+        let oversized_entry = FileDirectoryEntry {
             name: "x".repeat(maximum_name_length + 1),
-            file_type: FilesystemFileType::RegularFile,
+            file_type: FileType::RegularFile,
             node_info: None,
         };
         assert_eq!(

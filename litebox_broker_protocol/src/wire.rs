@@ -42,7 +42,7 @@ const REQUEST_TAG_CHECK_READINESS: u8 = 4;
 const REQUEST_TAG_SOCKET: u8 = 5;
 const REQUEST_TAG_FILL_RANDOM: u8 = 6;
 const REQUEST_TAG_STDIO: u8 = 7;
-const REQUEST_TAG_FILESYSTEM: u8 = 8;
+const REQUEST_TAG_FILE: u8 = 8;
 
 // Paired request and successful-response tags intentionally share values.
 const RESPONSE_TAG_NEGOTIATED: u8 = 0;
@@ -53,7 +53,7 @@ const RESPONSE_TAG_READINESS: u8 = 4;
 const RESPONSE_TAG_SOCKET: u8 = 5;
 const RESPONSE_TAG_RANDOM_FILLED: u8 = 6;
 const RESPONSE_TAG_STDIO: u8 = 7;
-const RESPONSE_TAG_FILESYSTEM: u8 = 8;
+const RESPONSE_TAG_FILE: u8 = 8;
 
 // Reserve the top of the tag space for responses without paired requests.
 const RESPONSE_TAG_ERROR: u8 = 253;
@@ -110,7 +110,7 @@ pub fn decode_handshake_request(frame: &[u8]) -> Result<BrokerHandshakeRequest, 
         | REQUEST_TAG_SOCKET
         | REQUEST_TAG_FILL_RANDOM
         | REQUEST_TAG_STDIO
-        | REQUEST_TAG_FILESYSTEM => {
+        | REQUEST_TAG_FILE => {
             return Err(WireError::WrongMessagePhase);
         }
         _ => return Err(WireError::InvalidTag),
@@ -165,8 +165,8 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
             encoder.request_id(request_id);
             stdio::encode_stdio_request(&mut encoder, request);
         }
-        BrokerOperation::Filesystem(request) => {
-            encoder.u8(REQUEST_TAG_FILESYSTEM);
+        BrokerOperation::File(request) => {
+            encoder.u8(REQUEST_TAG_FILE);
             encoder.request_id(request_id);
             fs::encode_fs_request(&mut encoder, request);
         }
@@ -187,7 +187,7 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         | REQUEST_TAG_SOCKET
         | REQUEST_TAG_FILL_RANDOM
         | REQUEST_TAG_STDIO
-        | REQUEST_TAG_FILESYSTEM => {}
+        | REQUEST_TAG_FILE => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -199,7 +199,7 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         REQUEST_TAG_SOCKET => BrokerOperation::Socket(socket::decode_socket_request(&mut decoder)?),
         REQUEST_TAG_FILL_RANDOM => BrokerOperation::FillRandom(decoder.shared_buffer_descriptor()?),
         REQUEST_TAG_STDIO => BrokerOperation::Stdio(stdio::decode_stdio_request(&mut decoder)?),
-        REQUEST_TAG_FILESYSTEM => BrokerOperation::Filesystem(fs::decode_fs_request(&mut decoder)?),
+        REQUEST_TAG_FILE => BrokerOperation::File(fs::decode_fs_request(&mut decoder)?),
         _ => unreachable!("active request tag was validated"),
     };
     decoder.finish()?;
@@ -230,7 +230,7 @@ pub fn encode_handshake_response(response: BrokerHandshakeResponse) -> Vec<u8> {
         }
         BrokerHandshakeResponse::Error(error) => {
             encoder.u8(RESPONSE_TAG_HANDSHAKE_ERROR);
-            encoder.u16(error.as_raw());
+            encode_error_code(&mut encoder, error);
         }
     }
     encoder.finish()
@@ -252,15 +252,14 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
         | RESPONSE_TAG_SOCKET
         | RESPONSE_TAG_RANDOM_FILLED
         | RESPONSE_TAG_STDIO
-        | RESPONSE_TAG_FILESYSTEM => {
+        | RESPONSE_TAG_FILE => {
             return Err(WireError::WrongMessagePhase);
         }
         RESPONSE_TAG_VERSION_MISMATCH => BrokerHandshakeResponse::VersionMismatch {
             broker_protocol_version: decoder.protocol_version()?,
         },
         RESPONSE_TAG_HANDSHAKE_ERROR => {
-            let error = ErrorCode::from_raw(decoder.u16()?).ok_or(WireError::InvalidTag)?;
-            BrokerHandshakeResponse::Error(error)
+            BrokerHandshakeResponse::Error(decode_error_code(&mut decoder)?)
         }
         _ => return Err(WireError::InvalidTag),
     };
@@ -309,15 +308,15 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
             encoder.request_id(request_id);
             stdio::encode_stdio_response(&mut encoder, response);
         }
-        BrokerResult::Filesystem(response) => {
-            encoder.u8(RESPONSE_TAG_FILESYSTEM);
+        BrokerResult::File(response) => {
+            encoder.u8(RESPONSE_TAG_FILE);
             encoder.request_id(request_id);
             fs::encode_fs_response(&mut encoder, response);
         }
         BrokerResult::Error(error) => {
             encoder.u8(RESPONSE_TAG_ERROR);
             encoder.request_id(request_id);
-            encoder.u16(error.as_raw());
+            encode_error_code(&mut encoder, error);
         }
     }
     encoder.finish()
@@ -339,7 +338,7 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         | RESPONSE_TAG_SOCKET
         | RESPONSE_TAG_RANDOM_FILLED
         | RESPONSE_TAG_STDIO
-        | RESPONSE_TAG_FILESYSTEM => {}
+        | RESPONSE_TAG_FILE => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -347,19 +346,51 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         RESPONSE_TAG_EVENT => BrokerResult::Event(event::decode_event_response(&mut decoder)?),
         RESPONSE_TAG_PIPE => BrokerResult::Pipe(pipe::decode_pipe_response(&mut decoder)?),
         RESPONSE_TAG_SOCKET => BrokerResult::Socket(socket::decode_socket_response(&mut decoder)?),
-        RESPONSE_TAG_ERROR => {
-            let error = ErrorCode::from_raw(decoder.u16()?).ok_or(WireError::InvalidTag)?;
-            BrokerResult::Error(error)
-        }
+        RESPONSE_TAG_ERROR => BrokerResult::Error(decode_error_code(&mut decoder)?),
         RESPONSE_TAG_OBJECT_CLOSED => BrokerResult::ObjectClosed,
         RESPONSE_TAG_READINESS => BrokerResult::Readiness(ReadinessFlags(decoder.u32()?)),
         RESPONSE_TAG_RANDOM_FILLED => BrokerResult::RandomFilled,
         RESPONSE_TAG_STDIO => BrokerResult::Stdio(stdio::decode_stdio_response(&mut decoder)?),
-        RESPONSE_TAG_FILESYSTEM => BrokerResult::Filesystem(fs::decode_fs_response(&mut decoder)?),
+        RESPONSE_TAG_FILE => BrokerResult::File(fs::decode_fs_response(&mut decoder)?),
         _ => unreachable!("active response tag was validated"),
     };
     decoder.finish()?;
     Ok(BrokerResponse { request_id, result })
+}
+
+fn encode_error_code(encoder: &mut Encoder, error: ErrorCode) {
+    encoder.u16(match error {
+        ErrorCode::UnsupportedVersion => 1,
+        ErrorCode::MalformedRequest => 2,
+        ErrorCode::ProtocolState => 3,
+        ErrorCode::UnsupportedOperation => 4,
+        ErrorCode::Internal => 5,
+        ErrorCode::PolicyDenied => 6,
+        ErrorCode::UnknownObject => 7,
+        ErrorCode::InvalidRights => 8,
+        ErrorCode::ResourceExhausted => 9,
+        ErrorCode::WouldBlock => 10,
+        ErrorCode::PeerClosed => 11,
+        ErrorCode::OutOfMemory => 12,
+    });
+}
+
+fn decode_error_code(decoder: &mut Decoder<'_>) -> Result<ErrorCode, WireError> {
+    match decoder.u16()? {
+        1 => Ok(ErrorCode::UnsupportedVersion),
+        2 => Ok(ErrorCode::MalformedRequest),
+        3 => Ok(ErrorCode::ProtocolState),
+        4 => Ok(ErrorCode::UnsupportedOperation),
+        5 => Ok(ErrorCode::Internal),
+        6 => Ok(ErrorCode::PolicyDenied),
+        7 => Ok(ErrorCode::UnknownObject),
+        8 => Ok(ErrorCode::InvalidRights),
+        9 => Ok(ErrorCode::ResourceExhausted),
+        10 => Ok(ErrorCode::WouldBlock),
+        11 => Ok(ErrorCode::PeerClosed),
+        12 => Ok(ErrorCode::OutOfMemory),
+        _ => Err(WireError::InvalidTag),
+    }
 }
 
 /// Encodes a broker notification body.
@@ -401,17 +432,16 @@ mod tests {
         CreateEventResponse, EventConsumeMode, EventConsumption,
     };
     use crate::fs::{
-        ChmodFileRequest, ChownFileRequest, FilesystemAccessMode, FilesystemError,
-        FilesystemFileStatus, FilesystemFileType, FilesystemMode, FilesystemNamespace,
-        FilesystemNodeInfo, FilesystemOpenFlags, FilesystemSeekWhence, FilesystemUser,
-        HandleFileStatusRequest, MkdirFileRequest, OpenFileRequest, OpenFileResponse,
-        PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
-        ReadFileResponse, RmdirFileRequest, SeekFileRequest, SeekFileResponse, TruncateFileRequest,
+        ChmodFileRequest, ChownFileRequest, FileAccessMode, FileError, FileMode, FileNodeInfo,
+        FileOpenFlags, FileSeekWhence, FileStatus, FileType, FileUser, HandleFileStatusRequest,
+        MkdirFileRequest, OpenFileRequest, OpenFileResponse, PathFileStatusRequest,
+        ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest, ReadFileResponse,
+        RmdirFileRequest, SeekFileRequest, SeekFileResponse, TruncateFileRequest,
         UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
     };
     use crate::message::{
-        EventRequest, EventResponse, FilesystemRequest, FilesystemResponse, PipeRequest,
-        PipeResponse, SocketRequest, SocketResponse, StdioRequest, StdioResponse,
+        EventRequest, EventResponse, FileRequest, FileResponse, PipeRequest, PipeResponse,
+        SocketRequest, SocketResponse, StdioRequest, StdioResponse,
     };
     use crate::pipe::{
         CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
@@ -458,7 +488,7 @@ mod tests {
                 RESPONSE_TAG_SOCKET,
                 RESPONSE_TAG_RANDOM_FILLED,
                 RESPONSE_TAG_STDIO,
-                RESPONSE_TAG_FILESYSTEM,
+                RESPONSE_TAG_FILE,
             ],
             [
                 REQUEST_TAG_NEGOTIATE,
@@ -469,7 +499,7 @@ mod tests {
                 REQUEST_TAG_SOCKET,
                 REQUEST_TAG_FILL_RANDOM,
                 REQUEST_TAG_STDIO,
-                REQUEST_TAG_FILESYSTEM,
+                REQUEST_TAG_FILE,
             ]
         );
         assert_eq!(
@@ -568,20 +598,17 @@ mod tests {
             BrokerOperation::Stdio(StdioRequest::IsTerminal(IsTerminalStdioRequest {
                 stream: StdioStream::Stderr,
             })),
-            BrokerOperation::Filesystem(FilesystemRequest::Open(OpenFileRequest {
-                namespace: FilesystemNamespace::Guest,
+            BrokerOperation::File(FileRequest::Open(OpenFileRequest {
                 path: SharedBufferDescriptor {
                     slot_index: SharedBufferSlotIndex(1),
                     length: 7,
                 },
-                user: FilesystemUser { user: 2, group: 3 },
-                access: FilesystemAccessMode::ReadWrite,
-                flags: FilesystemOpenFlags::CREATE
-                    | FilesystemOpenFlags::EXCLUSIVE
-                    | FilesystemOpenFlags::NO_FOLLOW,
-                mode: FilesystemMode::from_bits(0o640).unwrap(),
+                user: FileUser { user: 2, group: 3 },
+                access: FileAccessMode::ReadWrite,
+                flags: FileOpenFlags::CREATE | FileOpenFlags::EXCLUSIVE | FileOpenFlags::NO_FOLLOW,
+                mode: FileMode::from_bits(0o640).unwrap(),
             })),
-            BrokerOperation::Filesystem(FilesystemRequest::Read(ReadFileRequest {
+            BrokerOperation::File(FileRequest::Read(ReadFileRequest {
                 handle,
                 buffer: SharedBufferDescriptor {
                     slot_index: SharedBufferSlotIndex(2),
@@ -589,7 +616,7 @@ mod tests {
                 },
                 offset: None,
             })),
-            BrokerOperation::Filesystem(FilesystemRequest::Read(ReadFileRequest {
+            BrokerOperation::File(FileRequest::Read(ReadFileRequest {
                 handle,
                 buffer: SharedBufferDescriptor {
                     slot_index: SharedBufferSlotIndex(2),
@@ -597,7 +624,7 @@ mod tests {
                 },
                 offset: Some(u64::MAX),
             })),
-            BrokerOperation::Filesystem(FilesystemRequest::Write(WriteFileRequest {
+            BrokerOperation::File(FileRequest::Write(WriteFileRequest {
                 handle,
                 buffer: SharedBufferDescriptor {
                     slot_index: SharedBufferSlotIndex(3),
@@ -605,17 +632,17 @@ mod tests {
                 },
                 offset: Some(11),
             })),
-            BrokerOperation::Filesystem(FilesystemRequest::Seek(SeekFileRequest {
+            BrokerOperation::File(FileRequest::Seek(SeekFileRequest {
                 handle,
                 offset: -19,
-                whence: FilesystemSeekWhence::Current,
+                whence: FileSeekWhence::Current,
             })),
-            BrokerOperation::Filesystem(FilesystemRequest::Truncate(TruncateFileRequest {
+            BrokerOperation::File(FileRequest::Truncate(TruncateFileRequest {
                 handle,
                 length: 4096,
                 reset_offset: true,
             })),
-            BrokerOperation::Filesystem(FilesystemRequest::ReadDirectory(ReadDirectoryRequest {
+            BrokerOperation::File(FileRequest::ReadDirectory(ReadDirectoryRequest {
                 handle,
                 buffer: SharedBufferDescriptor {
                     slot_index: SharedBufferSlotIndex(4),
@@ -623,60 +650,54 @@ mod tests {
                 },
                 start_index: 19,
             })),
-            BrokerOperation::Filesystem(FilesystemRequest::PathStatus(PathFileStatusRequest {
-                namespace: FilesystemNamespace::WindowsRegistry,
+            BrokerOperation::File(FileRequest::PathStatus(PathFileStatusRequest {
                 path: SharedBufferDescriptor {
                     slot_index: SharedBufferSlotIndex(5),
                     length: 9,
                 },
-                user: FilesystemUser { user: 2, group: 3 },
+                user: FileUser { user: 2, group: 3 },
             })),
-            BrokerOperation::Filesystem(FilesystemRequest::HandleStatus(HandleFileStatusRequest {
+            BrokerOperation::File(FileRequest::HandleStatus(HandleFileStatusRequest {
                 handle,
             })),
-            BrokerOperation::Filesystem(FilesystemRequest::Chmod(ChmodFileRequest {
-                namespace: FilesystemNamespace::Guest,
+            BrokerOperation::File(FileRequest::Chmod(ChmodFileRequest {
                 path: SharedBufferDescriptor {
                     slot_index: SharedBufferSlotIndex(6),
                     length: 9,
                 },
-                user: FilesystemUser { user: 2, group: 3 },
-                mode: FilesystemMode::from_bits(0o755).unwrap(),
+                user: FileUser { user: 2, group: 3 },
+                mode: FileMode::from_bits(0o755).unwrap(),
             })),
-            BrokerOperation::Filesystem(FilesystemRequest::Chown(ChownFileRequest {
-                namespace: FilesystemNamespace::Guest,
+            BrokerOperation::File(FileRequest::Chown(ChownFileRequest {
                 path: SharedBufferDescriptor {
                     slot_index: SharedBufferSlotIndex(7),
                     length: 9,
                 },
-                acting_user: FilesystemUser { user: 0, group: 0 },
+                acting_user: FileUser { user: 0, group: 0 },
                 user: Some(2),
                 group: None,
             })),
-            BrokerOperation::Filesystem(FilesystemRequest::Unlink(UnlinkFileRequest {
-                namespace: FilesystemNamespace::Guest,
+            BrokerOperation::File(FileRequest::Unlink(UnlinkFileRequest {
                 path: SharedBufferDescriptor {
                     slot_index: SharedBufferSlotIndex(8),
                     length: 9,
                 },
-                user: FilesystemUser { user: 2, group: 3 },
+                user: FileUser { user: 2, group: 3 },
             })),
-            BrokerOperation::Filesystem(FilesystemRequest::Mkdir(MkdirFileRequest {
-                namespace: FilesystemNamespace::Guest,
+            BrokerOperation::File(FileRequest::Mkdir(MkdirFileRequest {
                 path: SharedBufferDescriptor {
                     slot_index: SharedBufferSlotIndex(9),
                     length: 9,
                 },
-                user: FilesystemUser { user: 2, group: 3 },
-                mode: FilesystemMode::from_bits(0o750).unwrap(),
+                user: FileUser { user: 2, group: 3 },
+                mode: FileMode::from_bits(0o750).unwrap(),
             })),
-            BrokerOperation::Filesystem(FilesystemRequest::Rmdir(RmdirFileRequest {
-                namespace: FilesystemNamespace::Guest,
+            BrokerOperation::File(FileRequest::Rmdir(RmdirFileRequest {
                 path: SharedBufferDescriptor {
                     slot_index: SharedBufferSlotIndex(10),
                     length: 9,
                 },
-                user: FilesystemUser { user: 2, group: 3 },
+                user: FileUser { user: 2, group: 3 },
             })),
             BrokerOperation::Socket(SocketRequest::Create(CreateSocketRequest {
                 address_family: AddressFamily::Ipv4,
@@ -894,6 +915,41 @@ mod tests {
     }
 
     #[test]
+    fn file_error_wire_values_are_stable_and_round_trip() {
+        for (error, raw) in [
+            (FileError::AccessNotAllowed, 1),
+            (FileError::NoWritePermissions, 2),
+            (FileError::ReadOnlyFs, 3),
+            (FileError::AlreadyExists, 4),
+            (FileError::Io, 5),
+            (FileError::NoSuchFileOrDirectory, 6),
+            (FileError::NoSearchPermissions, 7),
+            (FileError::InvalidPathname, 8),
+            (FileError::MissingComponent, 9),
+            (FileError::ComponentNotDirectory, 10),
+            (FileError::NotFile, 11),
+            (FileError::NotForReading, 12),
+            (FileError::NotForWriting, 13),
+            (FileError::InvalidOffset, 14),
+            (FileError::NonSeekable, 15),
+            (FileError::IsDirectory, 16),
+            (FileError::IsTerminalDevice, 17),
+            (FileError::NotOwner, 18),
+            (FileError::NotDirectory, 19),
+            (FileError::Busy, 20),
+            (FileError::NotEmpty, 21),
+        ] {
+            let response = BrokerResponse {
+                request_id: TEST_REQUEST_ID,
+                result: BrokerResult::File(FileResponse::Failed(error)),
+            };
+            let encoded = encode_response(response.clone());
+            assert_eq!(encoded.last(), Some(&raw));
+            assert_eq!(decode_response(&encoded).unwrap(), response);
+        }
+    }
+
+    #[test]
     fn request_codec_round_trips_identifier_bounds() {
         for request_id in [RequestId(0), RequestId(u64::MAX)] {
             let request = BrokerRequest {
@@ -1020,36 +1076,51 @@ mod tests {
             BrokerResult::Stdio(StdioResponse::IsTerminal(IsTerminalStdioResponse {
                 is_terminal: true,
             })),
-            BrokerResult::Filesystem(FilesystemResponse::Open(OpenFileResponse { handle })),
-            BrokerResult::Filesystem(FilesystemResponse::Read(ReadFileResponse { read: 11 })),
-            BrokerResult::Filesystem(FilesystemResponse::Write(WriteFileResponse { written: 17 })),
-            BrokerResult::Filesystem(FilesystemResponse::Seek(SeekFileResponse { offset: 19 })),
-            BrokerResult::Filesystem(FilesystemResponse::Truncate),
-            BrokerResult::Filesystem(FilesystemResponse::ReadDirectory(ReadDirectoryResponse {
+            BrokerResult::File(FileResponse::Open(OpenFileResponse { handle })),
+            BrokerResult::File(FileResponse::Read(ReadFileResponse { read: 11 })),
+            BrokerResult::File(FileResponse::Write(WriteFileResponse { written: 17 })),
+            BrokerResult::File(FileResponse::Seek(SeekFileResponse { offset: 19 })),
+            BrokerResult::File(FileResponse::Truncate),
+            BrokerResult::File(FileResponse::ReadDirectory(ReadDirectoryResponse {
                 length: 23,
                 next_index: Some(29),
             })),
-            BrokerResult::Filesystem(FilesystemResponse::Status(FilesystemFileStatus {
-                file_type: FilesystemFileType::CharacterDevice,
-                mode: FilesystemMode::from_bits(0o620).unwrap(),
+            BrokerResult::File(FileResponse::PathStatus(FileStatus {
+                file_type: FileType::CharacterDevice,
+                mode: FileMode::from_bits(0o620).unwrap(),
                 size: u64::MAX,
-                owner: FilesystemUser {
+                owner: FileUser {
                     user: u16::MAX,
                     group: u16::MAX,
                 },
-                node_info: FilesystemNodeInfo {
+                node_info: FileNodeInfo {
                     dev: u64::MAX,
                     ino: u64::MAX,
                     rdev: Some(u64::MAX),
                 },
                 block_size: u64::MAX,
             })),
-            BrokerResult::Filesystem(FilesystemResponse::Chmod),
-            BrokerResult::Filesystem(FilesystemResponse::Chown),
-            BrokerResult::Filesystem(FilesystemResponse::Unlink),
-            BrokerResult::Filesystem(FilesystemResponse::Mkdir),
-            BrokerResult::Filesystem(FilesystemResponse::Rmdir),
-            BrokerResult::Filesystem(FilesystemResponse::Failed(FilesystemError::Io)),
+            BrokerResult::File(FileResponse::HandleStatus(FileStatus {
+                file_type: FileType::CharacterDevice,
+                mode: FileMode::from_bits(0o620).unwrap(),
+                size: u64::MAX,
+                owner: FileUser {
+                    user: u16::MAX,
+                    group: u16::MAX,
+                },
+                node_info: FileNodeInfo {
+                    dev: u64::MAX,
+                    ino: u64::MAX,
+                    rdev: Some(u64::MAX),
+                },
+                block_size: u64::MAX,
+            })),
+            BrokerResult::File(FileResponse::Chmod),
+            BrokerResult::File(FileResponse::Chown),
+            BrokerResult::File(FileResponse::Unlink),
+            BrokerResult::File(FileResponse::Mkdir),
+            BrokerResult::File(FileResponse::Rmdir),
+            BrokerResult::File(FileResponse::Failed(FileError::Io)),
             BrokerResult::Error(ErrorCode::PolicyDenied),
             BrokerResult::Error(ErrorCode::WouldBlock),
             BrokerResult::Error(ErrorCode::PeerClosed),
@@ -1179,132 +1250,22 @@ mod tests {
     }
 
     #[test]
-    fn decode_rejects_malformed_stdio_request_frames() {
-        let request = BrokerRequest {
-            request_id: TEST_REQUEST_ID,
-            operation: BrokerOperation::Stdio(StdioRequest::Write(WriteStdioRequest {
-                stream: StdioOutputStream::Stdout,
-                buffer: SharedBufferDescriptor {
-                    slot_index: SharedBufferSlotIndex(1),
-                    length: 9,
-                },
-            })),
-        };
-
-        let mut unknown_operation = encode_request(request.clone());
-        unknown_operation[9] = 0xff;
-        assert_eq!(
-            decode_request(&unknown_operation),
-            Err(WireError::InvalidTag)
-        );
-
-        let mut unknown_stream = encode_request(request.clone());
-        unknown_stream[10] = 0xff;
-        assert_eq!(decode_request(&unknown_stream), Err(WireError::InvalidTag));
-
-        let frame = encode_request(request);
-        assert_eq!(
-            decode_request(&frame[..frame.len() - 1]),
-            Err(WireError::TruncatedFrame)
-        );
-
-        let read = encode_request(BrokerRequest {
-            request_id: TEST_REQUEST_ID,
-            operation: BrokerOperation::Stdio(StdioRequest::Read(ReadStdioRequest {
-                buffer: SharedBufferDescriptor {
-                    slot_index: SharedBufferSlotIndex(1),
-                    length: 9,
-                },
-            })),
-        });
-        assert_eq!(
-            decode_request(&read[..read.len() - 1]),
-            Err(WireError::TruncatedFrame)
-        );
-
-        let terminal = encode_request(BrokerRequest {
-            request_id: TEST_REQUEST_ID,
-            operation: BrokerOperation::Stdio(StdioRequest::IsTerminal(IsTerminalStdioRequest {
-                stream: StdioStream::Stdin,
-            })),
-        });
-        let mut unknown_terminal_stream = terminal.clone();
-        *unknown_terminal_stream.last_mut().unwrap() = 0xff;
-        assert_eq!(
-            decode_request(&unknown_terminal_stream),
-            Err(WireError::InvalidTag)
-        );
-        assert_eq!(
-            decode_request(&terminal[..terminal.len() - 1]),
-            Err(WireError::TruncatedFrame)
-        );
-    }
-
-    #[test]
-    fn decode_rejects_malformed_stdio_response_frames() {
-        let response = BrokerResponse {
-            request_id: TEST_REQUEST_ID,
-            result: BrokerResult::Stdio(StdioResponse::Write(WriteStdioResponse { written: 9 })),
-        };
-
-        let mut unknown_operation = encode_response(response.clone());
-        unknown_operation[9] = 0xff;
-        assert_eq!(
-            decode_response(&unknown_operation),
-            Err(WireError::InvalidTag)
-        );
-
-        let frame = encode_response(response);
-        assert_eq!(
-            decode_response(&frame[..frame.len() - 1]),
-            Err(WireError::TruncatedFrame)
-        );
-
-        let read = encode_response(BrokerResponse {
-            request_id: TEST_REQUEST_ID,
-            result: BrokerResult::Stdio(StdioResponse::Read(ReadStdioResponse { read: 9 })),
-        });
-        assert_eq!(
-            decode_response(&read[..read.len() - 1]),
-            Err(WireError::TruncatedFrame)
-        );
-
-        let terminal = encode_response(BrokerResponse {
-            request_id: TEST_REQUEST_ID,
-            result: BrokerResult::Stdio(StdioResponse::IsTerminal(IsTerminalStdioResponse {
-                is_terminal: true,
-            })),
-        });
-        let mut unknown_terminal_value = terminal.clone();
-        *unknown_terminal_value.last_mut().unwrap() = 0xff;
-        assert_eq!(
-            decode_response(&unknown_terminal_value),
-            Err(WireError::InvalidTag)
-        );
-        assert_eq!(
-            decode_response(&terminal[..terminal.len() - 1]),
-            Err(WireError::TruncatedFrame)
-        );
-    }
-
-    #[test]
-    fn decode_rejects_malformed_filesystem_request_frames() {
+    fn decode_rejects_malformed_fs_request_frames() {
         let open = BrokerRequest {
             request_id: TEST_REQUEST_ID,
-            operation: BrokerOperation::Filesystem(FilesystemRequest::Open(OpenFileRequest {
-                namespace: FilesystemNamespace::Guest,
+            operation: BrokerOperation::File(FileRequest::Open(OpenFileRequest {
                 path: SharedBufferDescriptor {
                     slot_index: SharedBufferSlotIndex(1),
                     length: 9,
                 },
-                user: FilesystemUser { user: 2, group: 3 },
-                access: FilesystemAccessMode::ReadOnly,
-                flags: FilesystemOpenFlags::CREATE,
-                mode: FilesystemMode::from_bits(0o640).unwrap(),
+                user: FileUser { user: 2, group: 3 },
+                access: FileAccessMode::ReadOnly,
+                flags: FileOpenFlags::CREATE,
+                mode: FileMode::from_bits(0o640).unwrap(),
             })),
         };
 
-        let mut unknown_operation = Vec::from([REQUEST_TAG_FILESYSTEM]);
+        let mut unknown_operation = Vec::from([REQUEST_TAG_FILE]);
         unknown_operation.extend_from_slice(&TEST_REQUEST_ID.0.to_le_bytes());
         unknown_operation.push(0xff);
         assert_eq!(
@@ -1313,41 +1274,28 @@ mod tests {
         );
 
         let open = encode_request(open);
-        let mut unknown_namespace = open.clone();
-        unknown_namespace[10] = 0xff;
-        assert_eq!(
-            decode_request(&unknown_namespace),
-            Err(WireError::InvalidTag)
-        );
         let mut unknown_access = open.clone();
-        unknown_access[23] = 0xff;
+        unknown_access[22] = 0xff;
         assert_eq!(decode_request(&unknown_access), Err(WireError::InvalidTag));
         let mut unsupported_flags = open.clone();
-        unsupported_flags[24..26].copy_from_slice(&(1u16 << 15).to_le_bytes());
+        unsupported_flags[23..25].copy_from_slice(&(1u16 << 15).to_le_bytes());
         assert_eq!(
             decode_request(&unsupported_flags),
             Err(WireError::InvalidTag)
         );
         let mut unsupported_mode = open.clone();
-        unsupported_mode[26..28].copy_from_slice(&0o10000u16.to_le_bytes());
+        unsupported_mode[25..27].copy_from_slice(&0o10000u16.to_le_bytes());
         assert_eq!(
             decode_request(&unsupported_mode),
             Err(WireError::InvalidTag)
         );
-        assert_eq!(
-            decode_request(&open[..open.len() - 1]),
-            Err(WireError::TruncatedFrame)
-        );
-
         let mut invalid_reset_offset = encode_request(BrokerRequest {
             request_id: TEST_REQUEST_ID,
-            operation: BrokerOperation::Filesystem(FilesystemRequest::Truncate(
-                TruncateFileRequest {
-                    handle: ObjectHandle(13),
-                    length: 17,
-                    reset_offset: false,
-                },
-            )),
+            operation: BrokerOperation::File(FileRequest::Truncate(TruncateFileRequest {
+                handle: ObjectHandle(13),
+                length: 17,
+                reset_offset: false,
+            })),
         });
         *invalid_reset_offset.last_mut().unwrap() = 2;
         assert_eq!(
@@ -1357,10 +1305,10 @@ mod tests {
 
         let mut invalid_whence = encode_request(BrokerRequest {
             request_id: TEST_REQUEST_ID,
-            operation: BrokerOperation::Filesystem(FilesystemRequest::Seek(SeekFileRequest {
+            operation: BrokerOperation::File(FileRequest::Seek(SeekFileRequest {
                 handle: ObjectHandle(13),
                 offset: 0,
-                whence: FilesystemSeekWhence::Beginning,
+                whence: FileSeekWhence::Beginning,
             })),
         });
         *invalid_whence.last_mut().unwrap() = 0xff;
@@ -1368,37 +1316,32 @@ mod tests {
 
         let chown = BrokerRequest {
             request_id: TEST_REQUEST_ID,
-            operation: BrokerOperation::Filesystem(FilesystemRequest::Chown(ChownFileRequest {
-                namespace: FilesystemNamespace::Guest,
+            operation: BrokerOperation::File(FileRequest::Chown(ChownFileRequest {
                 path: SharedBufferDescriptor {
                     slot_index: SharedBufferSlotIndex(1),
                     length: 9,
                 },
-                acting_user: FilesystemUser { user: 0, group: 0 },
+                acting_user: FileUser { user: 0, group: 0 },
                 user: Some(2),
                 group: None,
             })),
         };
-        let chown = encode_request(chown);
-        let mut invalid_user = chown.clone();
+        let mut invalid_user = encode_request(chown);
         let user_tag = invalid_user.len() - 4;
         invalid_user[user_tag] = 2;
         assert_eq!(decode_request(&invalid_user), Err(WireError::InvalidTag));
-        let mut invalid_group = chown;
-        *invalid_group.last_mut().unwrap() = 2;
-        assert_eq!(decode_request(&invalid_group), Err(WireError::InvalidTag));
     }
 
     #[test]
-    fn decode_rejects_malformed_filesystem_response_frames() {
+    fn decode_rejects_malformed_fs_response_frames() {
         let status = BrokerResponse {
             request_id: TEST_REQUEST_ID,
-            result: BrokerResult::Filesystem(FilesystemResponse::Status(FilesystemFileStatus {
-                file_type: FilesystemFileType::RegularFile,
-                mode: FilesystemMode::from_bits(0o640).unwrap(),
+            result: BrokerResult::File(FileResponse::PathStatus(FileStatus {
+                file_type: FileType::RegularFile,
+                mode: FileMode::from_bits(0o640).unwrap(),
                 size: 17,
-                owner: FilesystemUser { user: 2, group: 3 },
-                node_info: FilesystemNodeInfo {
+                owner: FileUser { user: 2, group: 3 },
+                node_info: FileNodeInfo {
                     dev: 5,
                     ino: 7,
                     rdev: None,
@@ -1419,19 +1362,12 @@ mod tests {
             decode_response(&unsupported_mode),
             Err(WireError::InvalidTag)
         );
-        assert_eq!(
-            decode_response(&status[..status.len() - 1]),
-            Err(WireError::TruncatedFrame)
-        );
-
         let mut invalid_next_index = encode_response(BrokerResponse {
             request_id: TEST_REQUEST_ID,
-            result: BrokerResult::Filesystem(FilesystemResponse::ReadDirectory(
-                ReadDirectoryResponse {
-                    length: 17,
-                    next_index: None,
-                },
-            )),
+            result: BrokerResult::File(FileResponse::ReadDirectory(ReadDirectoryResponse {
+                length: 17,
+                next_index: None,
+            })),
         });
         *invalid_next_index.last_mut().unwrap() = 2;
         assert_eq!(
@@ -1441,7 +1377,7 @@ mod tests {
 
         let mut invalid_error = encode_response(BrokerResponse {
             request_id: TEST_REQUEST_ID,
-            result: BrokerResult::Filesystem(FilesystemResponse::Failed(FilesystemError::Io)),
+            result: BrokerResult::File(FileResponse::Failed(FileError::Io)),
         });
         *invalid_error.last_mut().unwrap() = 0xff;
         assert_eq!(decode_response(&invalid_error), Err(WireError::InvalidTag));
@@ -1786,27 +1722,26 @@ mod tests {
     }
 
     #[test]
-    fn filesystem_open_request_wire_shape_is_pinned() {
+    fn fs_open_request_wire_shape_is_pinned() {
         assert_eq!(
             encode_request(BrokerRequest {
                 request_id: RequestId(13),
-                operation: BrokerOperation::Filesystem(FilesystemRequest::Open(OpenFileRequest {
-                    namespace: FilesystemNamespace::Guest,
+                operation: BrokerOperation::File(FileRequest::Open(OpenFileRequest {
                     path: SharedBufferDescriptor {
                         slot_index: SharedBufferSlotIndex(2),
                         length: 3,
                     },
-                    user: FilesystemUser { user: 5, group: 7 },
-                    access: FilesystemAccessMode::ReadWrite,
-                    flags: FilesystemOpenFlags::CREATE
-                        | FilesystemOpenFlags::EXCLUSIVE
-                        | FilesystemOpenFlags::NO_FOLLOW,
-                    mode: FilesystemMode::from_bits(0o640).unwrap(),
+                    user: FileUser { user: 5, group: 7 },
+                    access: FileAccessMode::ReadWrite,
+                    flags: FileOpenFlags::CREATE
+                        | FileOpenFlags::EXCLUSIVE
+                        | FileOpenFlags::NO_FOLLOW,
+                    mode: FileMode::from_bits(0o640).unwrap(),
                 })),
             }),
             [
-                8, 13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 5, 0, 7, 0, 2, 137, 0,
-                160, 1,
+                8, 13, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 5, 0, 7, 0, 2, 137, 0, 160,
+                1,
             ]
         );
     }
