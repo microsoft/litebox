@@ -614,8 +614,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
             litebox,
             litebox::fs::composer::Composer::builder()
                 .mount_nestable("/", |allocators| {
-                    litebox::fs::overlay::Overlay::new(
-                        litebox,
+                    litebox::fs::overlay::Overlay::<Platform>::new(
                         in_mem,
                         litebox::fs::tar_ro::TarRo::new(
                             // TODO: Replace with tar file provided by the user

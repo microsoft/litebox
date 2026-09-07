@@ -3196,16 +3196,13 @@ where
         litebox,
         litebox::fs::composer::Composer::builder()
             .mount_nestable("/", |allocators| {
-                litebox::fs::overlay::Overlay::new(
-                    litebox,
+                litebox::fs::overlay::Overlay::<Platform>::new(
                     in_mem,
                     litebox::fs::tar_ro::TarRo::new(tar_data, allocators.next()),
                     allocators.next(),
                 )
             })
-            .mount("/dev", |allocator| {
-                litebox::fs::devices::Devices::new(litebox, allocator)
-            })
+            .mount("/dev", litebox::fs::devices::Devices::new)
             .build()
             .unwrap(),
     )

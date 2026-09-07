@@ -67,7 +67,6 @@ fn overlay_fs(
     crate::fs::resolver::Resolver::new(
         litebox,
         crate::fs::overlay::Overlay::new(
-            litebox,
             upper,
             crate::fs::tar_ro::TarRo::new(
                 tar_data,
@@ -2138,7 +2137,7 @@ mod stdio {
         let fs = Resolver::new(
             &litebox,
             crate::fs::composer::Composer::builder()
-                .mount("/dev", |allocator| Devices::new(&litebox, allocator))
+                .mount("/dev", Devices::new)
                 .build()
                 .unwrap(),
         );
@@ -2182,7 +2181,7 @@ mod stdio {
         let fs = Resolver::new(
             &litebox,
             crate::fs::composer::Composer::builder()
-                .mount("/dev", |allocator| Devices::new(&litebox, allocator))
+                .mount("/dev", Devices::new)
                 .build()
                 .unwrap(),
         );
@@ -2225,7 +2224,7 @@ mod composed_stdio {
                         },
                     )])
                 })
-                .mount("/dev", |allocator| Devices::new(litebox, allocator))
+                .mount("/dev", Devices::new)
                 .build()
                 .unwrap(),
         )
