@@ -8,6 +8,8 @@
 
 use super::transport;
 
+// This duplicates `litebox::utilities::macros::repr_enum` because broker core cannot depend on
+// LiteBox. Keep it local unless enough shared macros justify introducing a common home.
 macro_rules! repr_enum {
     (
         $(#[$meta:meta])*

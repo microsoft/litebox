@@ -9,8 +9,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use litebox_broker_core::fs as broker_fs;
-use litebox_broker_core::fs::backend::{Backend, DeviceIo};
-use litebox_broker_core::fs::resolver::{Filesystem, ResolverEntry};
+use litebox_broker_core::fs::backend::DeviceIo;
+use litebox_broker_core::fs::resolver::{Engine, ResolverEntry};
 
 use crate::path::Arg;
 use crate::{LiteBox, fd::TypedFd, sync};
@@ -22,21 +22,23 @@ use super::errors::{
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence, UserInfo};
 
 /// The guest-facing filesystem entry point.
-pub struct Resolver<Platform: sync::RawSyncPrimitivesProvider, FilesystemBackend: Backend + 'static>
-{
+pub struct Resolver<
+    Platform: sync::RawSyncPrimitivesProvider,
+    Backend: broker_fs::backend::Backend + 'static,
+> {
     litebox: LiteBox<Platform>,
-    filesystem: Filesystem<FilesystemBackend>,
+    engine: Engine<Backend>,
 }
 
-impl<Platform: sync::RawSyncPrimitivesProvider, FilesystemBackend: Backend + 'static>
-    Resolver<Platform, FilesystemBackend>
+impl<Platform: sync::RawSyncPrimitivesProvider, Backend: broker_fs::backend::Backend + 'static>
+    Resolver<Platform, Backend>
 {
     /// Construct a new resolver over `backend`.
     #[must_use]
-    pub fn new(litebox: &LiteBox<Platform>, backend: FilesystemBackend) -> Self {
+    pub fn new(litebox: &LiteBox<Platform>, backend: Backend) -> Self {
         Self {
             litebox: litebox.clone(),
-            filesystem: Filesystem::new(backend),
+            engine: Engine::new(backend),
         }
     }
 }
@@ -62,6 +64,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> DeviceIo for LiteBox<Platform> {
 /// Per-call resolution context. The user may hold and mutate this as they wish.
 ///
 /// This struct is deliberately cheap to clone.
+// NOTE(jayb): I generally dislike getters/setters for fields of a data-like struct (e.g., see
+// acting_user and set_acting_user here), but I'm putting these here since I am not yet convinced
+// that we won't need more things in the context, nor am I convinced that we might not need the
+// ability to lock down how contexts are made/used. In some sense, I am forcing some chokepoints
+// here. In the future, we might flatten these out and just allow access to the fields directly.
 #[derive(Clone, Debug)]
 pub struct Context {
     /// Current working directory.
@@ -105,6 +112,10 @@ impl Context {
     }
 
     /// Resolve `path` against the current context.
+    // XXX(jayb): if/when we support chroot, we might need to tweak this to not allow "escaping"
+    // outside the chrooted part.
+    // XXX(jayb): since we are migrating all resolution into the resolver, we probably don't need
+    // `Arg` anymore, so could get rid of it in the future.
     pub fn resolve(&self, path: impl Arg) -> Result<ResolvedPath, PathError> {
         let mut components = if path.as_rust_str()?.starts_with('/') {
             vec![]
@@ -132,7 +143,10 @@ impl Default for Context {
     }
 }
 
-/// Absolute normalized path, created by [`Context::resolve`].
+/// Absolute normalized path, must only be created from [`Context::resolve`].
+///
+/// Note that a resolved path does not imply that it exists within the file system, merely that it
+/// is an absolute normalized path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedPath {
     // Note: an empty path is equivalent to `/`.
@@ -151,8 +165,8 @@ impl core::fmt::Display for ResolvedPath {
     }
 }
 
-impl<Platform: sync::RawSyncPrimitivesProvider, FilesystemBackend: Backend + 'static>
-    Resolver<Platform, FilesystemBackend>
+impl<Platform: sync::RawSyncPrimitivesProvider, Backend: broker_fs::backend::Backend + 'static>
+    Resolver<Platform, Backend>
 {
     /// Opens a file.
     ///
@@ -166,7 +180,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, FilesystemBackend: Backend + 'st
     ) -> Result<TypedFd<Self>, OpenError> {
         let path = context.resolve(path)?.to_string();
         let entry = self
-            .filesystem
+            .engine
             .open(
                 broker_user_info(context.acting_user()),
                 &path,
@@ -191,6 +205,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider, FilesystemBackend: Backend + 'st
     }
 
     /// Read from a file descriptor at `offset` into a buffer.
+    ///
+    /// If `offset` is None, the read will start at the current file offset and update the file
+    /// offset to the end of the read.
+    /// If `offset` is Some, the file offset is not changed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the updated file offset would overflow `usize`.
     pub fn read(
         &self,
         fd: &TypedFd<Self>,
@@ -205,12 +227,20 @@ impl<Platform: sync::RawSyncPrimitivesProvider, FilesystemBackend: Backend + 'st
         let mut entry = entry.get_entry_mut();
         // XXX(jayb): This deliberately preserves the current descriptor-entry lock across backend
         // I/O. A later PR can introduce a smaller position/append serialization primitive.
-        self.filesystem
+        self.engine
             .read(&self.litebox, &mut entry.entry, buf, offset)
             .map_err(guest_read_error)
     }
 
     /// Write from a buffer to a file descriptor at `offset`.
+    ///
+    /// If `offset` is None, the write will start at the current file offset and update the file
+    /// offset to the end of the write.
+    /// If `offset` is Some, the file offset is not changed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the updated file offset would overflow `usize`.
     pub fn write(
         &self,
         fd: &TypedFd<Self>,
@@ -225,12 +255,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider, FilesystemBackend: Backend + 'st
         let mut entry = entry.get_entry_mut();
         // XXX(jayb): This deliberately preserves the current descriptor-entry lock across backend
         // I/O. A later PR can introduce a smaller position/append serialization primitive.
-        self.filesystem
+        self.engine
             .write(&self.litebox, &mut entry.entry, buf, offset)
             .map_err(guest_write_error)
     }
 
-    /// Reposition the read/write file offset.
+    /// Reposition the read/write file offset, by changing it to `offset` relative to `whence`.
+    ///
+    /// Returns the resulting offset (in bytes from start of file) on success.
     pub fn seek(
         &self,
         fd: &TypedFd<Self>,
@@ -243,12 +275,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider, FilesystemBackend: Backend + 'st
             .entry_handle(fd)
             .ok_or(SeekError::ClosedFd)?;
         let mut entry = entry.get_entry_mut();
-        self.filesystem
+        self.engine
             .seek(&mut entry.entry, offset, broker_seek_whence(whence))
             .map_err(guest_seek_error)
     }
 
-    /// Truncate the file to `length`.
+    /// Truncate the file to the specified length.
+    ///
+    /// If shorter than existing size, extra data is lost. If longer than existing size, resize by
+    /// adding `\0`s.
+    ///
+    /// If `reset_offset` is true, the offset is reset to zero; otherwise, it remains unchanged.
     pub fn truncate(
         &self,
         fd: &TypedFd<Self>,
@@ -261,7 +298,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, FilesystemBackend: Backend + 'st
             .entry_handle(fd)
             .ok_or(TruncateError::ClosedFd)?;
         let mut entry = entry.get_entry_mut();
-        self.filesystem
+        self.engine
             .truncate(&mut entry.entry, length, reset_offset)
             .map_err(guest_truncate_error)
     }
@@ -269,7 +306,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, FilesystemBackend: Backend + 'st
     /// Change the permissions of a file.
     pub fn chmod(&self, context: &Context, path: impl Arg, mode: Mode) -> Result<(), ChmodError> {
         let path = context.resolve(path)?.to_string();
-        self.filesystem
+        self.engine
             .chmod(
                 broker_user_info(context.acting_user()),
                 &path,
@@ -287,7 +324,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, FilesystemBackend: Backend + 'st
         group: Option<u16>,
     ) -> Result<(), ChownError> {
         let path = context.resolve(path)?.to_string();
-        self.filesystem
+        self.engine
             .chown(broker_user_info(context.acting_user()), &path, user, group)
             .map_err(guest_chown_error)
     }
@@ -295,7 +332,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, FilesystemBackend: Backend + 'st
     /// Unlink a file.
     pub fn unlink(&self, context: &Context, path: impl Arg) -> Result<(), UnlinkError> {
         let path = context.resolve(path)?.to_string();
-        self.filesystem
+        self.engine
             .unlink(broker_user_info(context.acting_user()), &path)
             .map_err(guest_unlink_error)
     }
@@ -303,7 +340,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, FilesystemBackend: Backend + 'st
     /// Create a new directory.
     pub fn mkdir(&self, context: &Context, path: impl Arg, mode: Mode) -> Result<(), MkdirError> {
         let path = context.resolve(path)?.to_string();
-        self.filesystem
+        self.engine
             .mkdir(
                 broker_user_info(context.acting_user()),
                 &path,
@@ -315,12 +352,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider, FilesystemBackend: Backend + 'st
     /// Remove a directory.
     pub fn rmdir(&self, context: &Context, path: impl Arg) -> Result<(), RmdirError> {
         let path = context.resolve(path)?.to_string();
-        self.filesystem
+        self.engine
             .rmdir(broker_user_info(context.acting_user()), &path)
             .map_err(guest_rmdir_error)
     }
 
     /// Read directory entries from a directory file descriptor.
+    ///
+    /// Returns a list of file/directory names including synthesized `.` and `..` entries.
     pub fn read_dir(&self, fd: &TypedFd<Self>) -> Result<Vec<DirEntry>, ReadDirError> {
         let entry = self
             .litebox
@@ -328,7 +367,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, FilesystemBackend: Backend + 'st
             .entry_handle(fd)
             .ok_or(ReadDirError::ClosedFd)?;
         let entry = entry.get_entry();
-        self.filesystem
+        self.engine
             .read_dir(&entry.entry)
             .map_err(guest_read_dir_error)
             .map(guest_directory_entries)
@@ -341,7 +380,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, FilesystemBackend: Backend + 'st
         path: impl Arg,
     ) -> Result<FileStatus, FileStatusError> {
         let path = context.resolve(path)?.to_string();
-        self.filesystem
+        self.engine
             .file_status(broker_user_info(context.acting_user()), &path)
             .map_err(guest_file_status_error)
             .map(guest_file_status)
@@ -355,20 +394,28 @@ impl<Platform: sync::RawSyncPrimitivesProvider, FilesystemBackend: Backend + 'st
             .entry_handle(fd)
             .ok_or(FileStatusError::ClosedFd)?;
         let entry = entry.get_entry();
-        self.filesystem
+        self.engine
             .handle_status(&entry.entry)
             .map_err(guest_file_status_error)
             .map(guest_file_status)
     }
 
     /// Get static backing data for a file, if available and supported.
+    ///
+    /// This method returns the (entire) underlying static byte slice if the file's contents are
+    /// backed by borrowed static data (e.g., set up via [`super::in_mem::InitialNode::File`]).
+    ///
+    /// Returns `None` if no static backing data is available/supported.
     pub fn get_static_backing_data(&self, fd: &TypedFd<Self>) -> Option<&'static [u8]> {
         let entry = self.litebox.descriptor_table().entry_handle(fd)?;
         let entry = entry.get_entry();
-        self.filesystem.get_static_backing_data(&entry.entry)
+        self.engine.get_static_backing_data(&entry.entry)
     }
 }
 
+// TODO: Remove most of the guest/core conversion helpers below once LiteBox uses the broker file
+// APIs exclusively. They temporarily preserve LiteBox's guest-facing types while this facade calls
+// the broker-core engine directly.
 fn broker_mode(mode: Mode) -> broker_fs::Mode {
     broker_fs::Mode::from_bits_retain(mode.bits())
 }
@@ -594,9 +641,9 @@ fn guest_file_status_error(error: broker_fs::errors::FileStatusError) -> FileSta
 }
 
 crate::fd::enable_fds_for_subsystem! {
-    @ Platform: { sync::RawSyncPrimitivesProvider }, FilesystemBackend: { Backend + 'static };
-    Resolver<Platform, FilesystemBackend>;
-    @ FilesystemBackend: { Backend + 'static };
-    ResolverEntry<FilesystemBackend>;
-    -> ResolverFd<Platform, FilesystemBackend>;
+    @ Platform: { sync::RawSyncPrimitivesProvider }, Backend: { broker_fs::backend::Backend + 'static };
+    Resolver<Platform, Backend>;
+    @ Backend: { broker_fs::backend::Backend + 'static };
+    ResolverEntry<Backend>;
+    -> ResolverFd<Platform, Backend>;
 }

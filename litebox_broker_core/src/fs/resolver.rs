@@ -21,11 +21,11 @@ use super::{
 use super::{SeekWhence, UserInfo};
 
 /// The broker-core filesystem engine, generic over a [`Backend`](super::backend::Backend).
-pub struct Filesystem<Backend: super::backend::Backend + 'static> {
+pub struct Engine<Backend: super::backend::Backend + 'static> {
     backend: Backend,
 }
 
-impl<Backend: super::backend::Backend + 'static> Filesystem<Backend> {
+impl<Backend: super::backend::Backend + 'static> Engine<Backend> {
     /// Construct a filesystem engine over `backend`.
     #[must_use]
     pub fn new(backend: Backend) -> Self {
@@ -124,7 +124,7 @@ enum SearchScope {
     AndReadableTarget,
 }
 
-impl<Backend: super::backend::Backend + 'static> Filesystem<Backend> {
+impl<Backend: super::backend::Backend + 'static> Engine<Backend> {
     fn parent_dir_and_name<'a>(
         &self,
         context: &Context,
@@ -374,7 +374,7 @@ impl<Backend: super::backend::Backend + 'static> Filesystem<Backend> {
     }
 }
 
-impl<Backend: super::backend::Backend + 'static> Filesystem<Backend> {
+impl<Backend: super::backend::Backend + 'static> Engine<Backend> {
     /// Opens a file
     ///
     /// The `mode` is only significant when creating a file
@@ -826,7 +826,7 @@ impl<Backend: super::backend::Backend + 'static> Filesystem<Backend> {
 
     /// Read directory entries from a directory file descriptor.
     ///
-    /// Returns a list of file/directory names (explicitly _not_ including `.` or `..`).
+    /// Returns a list of file/directory names including synthesized `.` and `..` entries.
     pub fn read_dir(
         &self,
         entry: &ResolverEntry<Backend>,

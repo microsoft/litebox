@@ -3,10 +3,10 @@
 
 //! File-system related functionality
 //!
-//! A file-system consists of a [`Filesystem`](resolver::Filesystem) that works alongside one or more
-//! [`Backend`](backend::Backend)s. Such backends can be composed together: mounted at distinct
-//! paths via the [`Composer`](composer::Composer), or stacked as a writable upper over immutable
-//! lowers via the [`Overlay`](overlay::Overlay).
+//! A file-system consists of an [`Engine`](resolver::Engine) that works alongside one or more
+//! [`Backend`](backend::Backend)s. Such backends can be composed together: mounted at distinct paths
+//! via the [`Composer`](composer::Composer), or stacked as a writable upper over immutable lowers
+//! via the [`Overlay`](overlay::Overlay).
 
 use bitflags::bitflags;
 
@@ -67,7 +67,7 @@ bitflags! {
 
 /// Types of files on a file-system.
 ///
-/// See [`resolver::Filesystem::file_status`].
+/// See [`resolver::Engine::file_status`].
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum FileType {
     RegularFile,
@@ -161,7 +161,7 @@ bitflags! {
     }
 }
 
-/// The `whence` directive to [`resolver::Filesystem::seek`]
+/// The `whence` directive to [`resolver::Engine::seek`]
 #[derive(Copy, Clone)]
 pub enum SeekWhence {
     /// The file offset is set to `offset` bytes.
@@ -214,7 +214,7 @@ pub struct NodeInfo {
     pub rdev: Option<NonZeroUsize>,
 }
 
-/// Directory entries returned by [`resolver::Filesystem::read_dir`]
+/// Directory entries returned by [`resolver::Engine::read_dir`]
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct DirEntry {

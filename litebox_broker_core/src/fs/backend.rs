@@ -16,6 +16,8 @@ use super::errors::{
 };
 use super::{DirEntry, FileStatus, Mode, OFlags, UserInfo};
 
+// This duplicates the cloneable type-erasure support from `litebox::utilities::anymap` because
+// broker core cannot depend on LiteBox. Keep it local unless broader reuse justifies a common home.
 trait AnyCloneSendSync: Any + Send + Sync {
     fn clone_to_any(&self) -> Box<dyn AnyCloneSendSync>;
 }
@@ -33,6 +35,11 @@ impl Clone for Box<dyn AnyCloneSendSync> {
 }
 
 /// I/O services used by special device backends.
+///
+/// TODO: This is a temporary cross-crate bridge while LiteBox calls the broker-core filesystem
+/// engine directly. The filesystem backend is global, while standard I/O and cancellation are
+/// session-specific; once file operations are broker-owned, replace this with a broker-private
+/// per-operation context backed by the current [`BrokerSession`](crate::BrokerSession).
 pub trait DeviceIo {
     /// Read from standard input.
     fn read_stdin(&self, output: &mut [u8]) -> Result<usize, ReadError>;
@@ -438,18 +445,11 @@ pub(super) struct PermissionInfo {
 
 #[cfg(test)]
 mod tests {
-    use super::{Backend, DeviceIo};
+    use super::Backend;
 
     #[test]
     fn backend_is_dyn_safe() {
         fn assert_dyn_safe(_: Option<&dyn Backend>) {}
-
-        assert_dyn_safe(None);
-    }
-
-    #[test]
-    fn device_io_is_dyn_safe() {
-        fn assert_dyn_safe(_: Option<&dyn DeviceIo>) {}
 
         assert_dyn_safe(None);
     }

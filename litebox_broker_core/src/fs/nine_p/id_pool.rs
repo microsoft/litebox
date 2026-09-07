@@ -6,6 +6,9 @@
 //! [`IdPool`] provides recyclable `u32` ID allocation with O(n/64) amortized
 //! allocation via word-level wrap-around scanning, and O(1) deallocation.
 
+// TODO: This duplicates `litebox::utils::id_pool` because both broker 9P and LiteBox consumers need
+// the allocator. Consider moving it into a common `no_std` crate shared by LiteBox and broker core.
+
 use alloc::vec;
 use alloc::vec::Vec;
 

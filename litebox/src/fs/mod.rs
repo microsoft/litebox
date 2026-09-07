@@ -14,6 +14,9 @@ use core::num::NonZeroUsize;
 pub mod errors;
 pub mod resolver;
 
+// TODO: Remove these implementation-facing compatibility modules once LiteBox uses the broker
+// file APIs exclusively. They temporarily preserve local filesystem construction while resolver
+// and backend ownership moves into broker core.
 #[doc(hidden)]
 pub mod backend {
     pub use litebox_broker_core::fs::backend::*;
