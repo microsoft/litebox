@@ -20,7 +20,6 @@ use litebox_broker_transport_windows_userland::named_pipe::{
     WindowsNamedPipeStream, validate_client_process,
 };
 use litebox_broker_transport_windows_userland::shared_memory::WindowsSharedMemory;
-use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 use crate::in_process::InProcessHostThread;
 
@@ -70,17 +69,14 @@ pub fn connect_in_process(broker: &BrokerCore) -> Result<BrokerConnection> {
                     control_stream,
                     deadline,
                 );
-                // SAFETY: GetCurrentProcess returns the documented pseudo-handle
-                // for the current process and does not transfer ownership.
-                let current_process = unsafe { GetCurrentProcess() };
                 litebox_broker_userland::runtime::serve_association(
                     &broker,
                     control_channel,
                     || WindowsSharedMemory::create(SHARED_BUFFER_POOL_SIZE),
                     WindowsSharedMemory::create_control_ring,
                     |channel, shared_memory, control_memory| {
-                        channel.send_shared_memory(shared_memory, current_process)?;
-                        channel.send_shared_memory(control_memory, current_process)
+                        channel.send_shared_memory_to_current_process(shared_memory)?;
+                        channel.send_shared_memory_to_current_process(control_memory)
                     },
                     WindowsNamedPipeHostSetupChannel::into_active,
                 )

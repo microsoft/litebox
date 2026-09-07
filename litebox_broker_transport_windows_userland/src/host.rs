@@ -26,6 +26,7 @@ use litebox_broker_transport::control_ring::{
 };
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
+use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 use crate::control_ring::PipeLiveness;
 use crate::named_pipe::{TRANSFER_FRAME_TAG, WindowsNamedPipeStream};
@@ -107,6 +108,17 @@ impl WindowsNamedPipeHostSetupChannel {
             &encode_transfer(&transfer)?,
             self.setup_deadline,
         )
+    }
+
+    /// Duplicates one shared-memory object into this process and sends its
+    /// handle values to a same-process local endpoint.
+    pub fn send_shared_memory_to_current_process(
+        &mut self,
+        memory: &WindowsSharedMemory,
+    ) -> IoResult<()> {
+        // SAFETY: GetCurrentProcess returns the documented pseudo-handle for
+        // the current process and does not transfer ownership.
+        self.send_shared_memory(memory, unsafe { GetCurrentProcess() })
     }
 
     /// Activates host request, response, and notification control-ring endpoints.

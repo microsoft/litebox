@@ -16,7 +16,6 @@ litebox_broker_transport_linux_userland = { path = "../litebox_broker_transport_
 
 [target.'cfg(all(windows, target_arch = "x86_64"))'.dependencies]
 litebox_broker_transport_windows_userland = { path = "../litebox_broker_transport_windows_userland", version = "0.1.0" }
-windows-sys = { version = "0.60.2", default-features = false, features = ["Win32_System_Threading"] }
 
 [lints]
 workspace = true
