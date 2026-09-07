@@ -210,7 +210,7 @@ impl Backend for Devices {
                 Device::Stdin | Device::Stdout | Device::Stderr | Device::URandom
             )
         {
-            unimplemented!("Non-blocking I/O is not yet supported for {:?}", device);
+            return Err(OpenError::Io);
         }
 
         if flags.contains(OFlags::TRUNC) {

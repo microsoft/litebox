@@ -37,6 +37,7 @@ use litebox_broker_protocol::ObjectHandle;
 use spin::rwlock::RwLock;
 
 pub use error::BrokerError;
+use fs::FileService;
 pub use policy::{
     DestinationPortRange, DestinationRule, Ipv4Cidr, MAX_DESTINATION_RULES, PolicyEngine,
     PolicyProfile, SocketPolicy, SocketPolicyError,
@@ -160,18 +161,20 @@ pub struct BrokerCore {
     pub(crate) random_provider: Arc<dyn RandomProvider>,
     pub(crate) stdio_provider: Arc<dyn StdioProvider>,
     pub(crate) socket_provider: Arc<dyn SocketProvider>,
+    pub(crate) fs: Arc<dyn FileService>,
     pub(crate) socket_ports: BrokerSocketPorts,
 }
 
 static BROKER_CORE_CREATED: AtomicBool = AtomicBool::new(false);
 
 impl BrokerCore {
-    /// Creates the broker core with broker-wide platform service providers.
+    /// Creates the broker core with broker-wide service providers.
     pub fn new(
         policy: PolicyEngine,
         socket_provider: Arc<dyn SocketProvider>,
         random_provider: Arc<dyn RandomProvider>,
         stdio_provider: Arc<dyn StdioProvider>,
+        fs: Arc<dyn FileService>,
     ) -> Result<Self> {
         Self::new_with_limits(
             policy,
@@ -179,16 +182,18 @@ impl BrokerCore {
             socket_provider,
             random_provider,
             stdio_provider,
+            fs,
         )
     }
 
-    /// Creates the broker core with explicit limits and platform service providers.
+    /// Creates the broker core with explicit limits and service providers.
     pub fn new_with_limits(
         policy: PolicyEngine,
         limits: BrokerCoreLimits,
         socket_provider: Arc<dyn SocketProvider>,
         random_provider: Arc<dyn RandomProvider>,
         stdio_provider: Arc<dyn StdioProvider>,
+        fs: Arc<dyn FileService>,
     ) -> Result<Self> {
         BROKER_CORE_CREATED
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -206,6 +211,7 @@ impl BrokerCore {
             random_provider,
             stdio_provider,
             socket_provider,
+            fs,
             socket_ports: BrokerSocketPorts::default(),
         })
     }

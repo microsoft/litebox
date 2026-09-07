@@ -355,16 +355,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         }
         let perms = file.read().perms.clone();
         let handle = super::backend::FileHandle::from_typed::<Self>(InMemFileHandle { file });
-        if flags.contains(super::OFlags::TRUNC) && !flags.contains(super::OFlags::PATH) {
-            // Linux truncates whenever the open succeeds, regardless of the access mode (an
-            // `O_RDONLY|O_TRUNC` open of a writable file does truncate it); `O_PATH` opens ignore
-            // `O_TRUNC` entirely.
-            //
-            // TODO(jayb): Linux's `may_open` also adds `MAY_WRITE` for `O_TRUNC`, and checks
-            // permissions _before_ truncating; the resolver does neither, so a denied
-            // `O_RDONLY|O_TRUNC` open still empties the file here.
-            self.truncate(&handle, 0)?;
-        }
         Ok(super::backend::Permissioned {
             item: handle,
             permissions: super::backend::PermissionCheck::ByResolver(
@@ -409,7 +399,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
     ) -> Result<usize, ReadError> {
         let file = h.get_typed::<Self>().file.read();
         let start = offset.min(file.data.len());
-        let end = offset.checked_add(buf.len()).unwrap().min(file.data.len());
+        let end = offset
+            .checked_add(buf.len())
+            .ok_or(ReadError::Io)?
+            .min(file.data.len());
         debug_assert!(start <= end);
         let len = end - start;
         buf[..len].copy_from_slice(&file.data[start..end]);
@@ -423,22 +416,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         buf: &[u8],
         offset: usize,
     ) -> Result<usize, WriteError> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let end = offset.checked_add(buf.len()).ok_or(WriteError::Io)?;
         let mut file = h.get_typed::<Self>().file.write();
-        let overwritten_len = match offset.cmp(&file.data.len()) {
-            core::cmp::Ordering::Less => {
-                let end = offset.checked_add(buf.len()).unwrap().min(file.data.len());
-                let overwritten_len = end - offset;
-                file.data.to_mut()[offset..end].copy_from_slice(&buf[..overwritten_len]);
-                overwritten_len
-            }
-            core::cmp::Ordering::Equal => 0,
-            core::cmp::Ordering::Greater => {
-                // Need to pad with 0s because the offset was past the end of the file
-                file.data.to_mut().resize(offset, 0);
-                0
-            }
-        };
-        file.data.to_mut().extend(&buf[overwritten_len..]);
+        let data = owned_data_with_capacity(&mut file.data, end).map_err(|_| WriteError::Io)?;
+        if data.len() < end {
+            data.resize(end, 0);
+        }
+        data[offset..end].copy_from_slice(buf);
         Ok(buf.len())
     }
 
@@ -450,7 +437,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                 alloc::borrow::Cow::Owned(d) => d.truncate(length),
             },
             core::cmp::Ordering::Equal => (),
-            core::cmp::Ordering::Greater => file.data.to_mut().resize(length, 0),
+            core::cmp::Ordering::Greater => {
+                let data = owned_data_with_capacity(&mut file.data, length)
+                    .map_err(|_| TruncateError::Io)?;
+                data.resize(length, 0);
+            }
         }
         Ok(())
     }
@@ -624,6 +615,23 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             alloc::borrow::Cow::Owned(_) => None,
         }
     }
+}
+
+fn owned_data_with_capacity<'data>(
+    data: &'data mut alloc::borrow::Cow<'static, [u8]>,
+    required_length: usize,
+) -> Result<&'data mut Vec<u8>, alloc::collections::TryReserveError> {
+    if let alloc::borrow::Cow::Borrowed(borrowed) = data {
+        let mut owned = Vec::new();
+        owned.try_reserve_exact(required_length.max(borrowed.len()))?;
+        owned.extend_from_slice(borrowed);
+        *data = alloc::borrow::Cow::Owned(owned);
+    }
+    let alloc::borrow::Cow::Owned(owned) = data else {
+        unreachable!()
+    };
+    owned.try_reserve(required_length.saturating_sub(owned.len()))?;
+    Ok(owned)
 }
 
 /// Flags this backend knows how to honor when opening files/directories.

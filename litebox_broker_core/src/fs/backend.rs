@@ -130,6 +130,9 @@ pub trait Backend: private::Sealed + Send + Sync + Any {
     /// Open an (existing) file at `dir`.
     ///
     /// To create a file, you need [`Self::create_file_at`].
+    ///
+    /// A backend asking the engine to check permissions must defer any `O_TRUNC` side effect; the
+    /// engine performs it after checking the returned permissions.
     fn open_file_at(
         &self,
         dir: WalkingDirHandle<'_>,

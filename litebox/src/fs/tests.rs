@@ -1508,6 +1508,33 @@ mod overlay {
     }
 
     #[test]
+    fn writing_an_unlinked_lower_file_does_not_restore_its_path() {
+        let ctx = crate::fs::resolver::Context::new();
+        let litebox = LiteBox::new(MockPlatform::new());
+        let fs = overlay_fs(&litebox, upper([]));
+        let fd = fs
+            .open(&ctx, "foo", OFlags::RDWR, Mode::RWXU)
+            .expect("failed to open lower file");
+
+        fs.unlink(&ctx, "foo").expect("failed to unlink lower file");
+        fs.write(&fd, b"gone", Some(0))
+            .expect("failed to write unlinked file");
+
+        let mut buffer = vec![0; 8];
+        let bytes_read = fs
+            .read(&fd, &mut buffer, Some(0))
+            .expect("failed to read unlinked file");
+        assert_eq!(&buffer[..bytes_read], b"gonefoo\n");
+        assert!(matches!(
+            fs.open(&ctx, "foo", OFlags::RDONLY, Mode::empty()),
+            Err(crate::fs::errors::OpenError::PathError(
+                crate::fs::errors::PathError::NoSuchFileOrDirectory
+            )),
+        ));
+        fs.close(&fd).expect("failed to close unlinked file");
+    }
+
+    #[test]
     fn o_directory_flag_tests() {
         let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());

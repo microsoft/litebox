@@ -23,7 +23,15 @@ pub mod inode_allocator;
 pub mod nine_p;
 pub mod overlay;
 pub mod resolver;
+mod service;
 pub mod tar_ro;
+
+pub(crate) use service::File;
+pub use service::{
+    EngineFileService, FileResult, FileService, UnsupportedFileService, chmod, chown,
+    handle_status, mkdir, open, path_status, read, read_directory, rmdir, seek, truncate, unlink,
+    write,
+};
 
 bitflags! {
     /// `S_I*` constants for open, ...

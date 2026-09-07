@@ -116,6 +116,7 @@ impl BrokerCoreBuilder {
             socket_provider,
             Arc::new(UserlandRandomProvider),
             Arc::new(UserlandStdioProvider::new()?),
+            Arc::new(litebox_broker_core::fs::UnsupportedFileService),
         )?;
         Ok(broker)
     }

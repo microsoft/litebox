@@ -14,13 +14,16 @@
 //! changes do not compromise memory safety or the structural integrity of its internal state.
 
 use alloc::boxed::Box;
+use alloc::format;
 use alloc::string::String;
+use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
 
 use hashbrown::{HashMap, HashSet};
 
 use litebox_platform::sync::{Mutex, MutexGuard, RawSyncPrimitivesProvider};
+use spin::RwLock;
 
 use super::backend::{
     Backend, BackendHandles, CreationMetadata, DeviceIo, DirHandle, FileHandle, Handle, HandleRef,
@@ -60,10 +63,11 @@ struct Namespace;
 struct State {
     /// Overlay-visible identity assigned to each per-layer node.
     ids: HashMap<LayerNode, NodeInfo>,
-    /// Files that have been copied up, by overlay identity, and their handle in the upper backend.
-    /// A handle opened against a lower backend stays valid, but every operation looks here first.
-    copied_up: HashMap<NodeInfo, FileHandle>,
+    /// Shared migration cells for currently open lower-backed files, by overlay identity.
+    migrations: HashMap<NodeInfo, Weak<RwLock<Option<FileHandle>>>>,
 }
+
+type FileMigration = Arc<RwLock<Option<FileHandle>>>;
 
 /// A node as identified by the layer that owns it; `Lower` carries the lower backend's index.
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -85,7 +89,7 @@ pub struct OverlayDir {
 #[derive(Clone)]
 pub struct OverlayFile {
     /// The layer this file was _opened_ against; a later copy-up can move it, which is what
-    /// [`State::copied_up`] records.
+    /// the lower layer's shared [`FileMigration`] records.
     layer: OverlayFileLayer,
     // TODO(jayb): the parent path plus name is how object-addressed operations (`chmod`/`chown`)
     // find the file again in order to copy it up. This must be revisited when rename lands, since a
@@ -101,8 +105,8 @@ enum OverlayFileLayer {
     Lower {
         layer: usize,
         handle: FileHandle,
-        /// The overlay identity of the file, under which a later copy-up records its upper handle.
-        node: NodeInfo,
+        /// Shared by every lower-backed handle opened for this node.
+        migration: FileMigration,
     },
 }
 
@@ -152,7 +156,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
             namespace: Mutex::new(Namespace),
             state: Mutex::new(State {
                 ids: HashMap::new(),
-                copied_up: HashMap::new(),
+                migrations: HashMap::new(),
             }),
         }
     }
@@ -253,13 +257,13 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
     // atomic link/rename, would need to update `Backend` for that.
     fn copy_up_file(
         &self,
-        _guard: &NamespaceGuard<'_, Platform>,
         upper_dir: &DirHandle,
         name: &str,
         lower: (usize, &FileHandle),
         status: &FileStatus,
-        truncate: bool,
-    ) -> Result<FileHandle, OpenError> {
+        truncate: Option<usize>,
+        detached: bool,
+    ) -> Result<(FileHandle, NodeInfo), OpenError> {
         let (layer, lower) = lower;
         let upper = self.upper.create_file_at(
             upper_dir.clone(),
@@ -269,28 +273,28 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
                 owner: status.owner,
             },
         )?;
-        let copied = if truncate {
-            Ok(())
-        } else {
-            self.copy_bytes(layer, lower, &upper)
-        };
-
-        if let Err(error) = copied {
+        let copy_length = truncate.map(|length| length.min(status.size));
+        if copy_length != Some(0)
+            && let Err(error) = self.copy_bytes(layer, lower, &upper, copy_length)
+        {
             // Ancestor directories materialised for this copy-up deliberately stay behind.
             let _rollback_result = self.upper.unlink_at(upper_dir.clone(), name);
             return Err(error);
         }
-        // The copied-up file keeps the identity it had in the lower backend, so existing
-        // lower-backed handles keep reporting the same inode.
-        if let Ok(upper_status) = self.upper.status(HandleRef::File(&upper)) {
-            self.bind_copy_up(
-                layer,
-                status.node_info.clone(),
-                upper_status.node_info,
-                Some(&upper),
-            );
+        if let Some(length) = truncate
+            && let Err(error) = self.upper.truncate(&upper, length)
+        {
+            let _rollback_result = self.upper.unlink_at(upper_dir.clone(), name);
+            return Err(error.into());
         }
-        Ok(upper)
+        let Ok(upper_status) = self.upper.status(HandleRef::File(&upper)) else {
+            let _rollback_result = self.upper.unlink_at(upper_dir.clone(), name);
+            return Err(OpenError::Io);
+        };
+        if detached && let Err(error) = self.upper.unlink_at(upper_dir.clone(), name) {
+            return Err(unlink_to_open_error(error));
+        }
+        Ok((upper, upper_status.node_info))
     }
 
     fn copy_bytes(
@@ -298,28 +302,39 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
         layer: usize,
         lower: &FileHandle,
         upper: &FileHandle,
+        length: Option<usize>,
     ) -> Result<(), OpenError> {
         let mut offset = 0;
         let mut buf = [0u8; 4096];
         loop {
+            let read_len = length.map_or(buf.len(), |length| {
+                length.saturating_sub(offset).min(buf.len())
+            });
+            if read_len == 0 {
+                return Ok(());
+            }
             let count = self.lowers[layer]
-                .read(&NoDeviceIo, lower, &mut buf, offset)
+                .read(&NoDeviceIo, lower, &mut buf[..read_len], offset)
                 .map_err(|_| OpenError::Io)?;
             if count == 0 {
                 return Ok(());
             }
+            if count > read_len {
+                return Err(OpenError::Io);
+            }
             let mut written = 0;
             while written < count {
+                let write_offset = offset.checked_add(written).ok_or(OpenError::Io)?;
                 let progress = self
                     .upper
-                    .write(&NoDeviceIo, upper, &buf[written..count], offset + written)
+                    .write(&NoDeviceIo, upper, &buf[written..count], write_offset)
                     .map_err(|_| OpenError::Io)?;
                 if progress == 0 {
                     return Err(OpenError::Io);
                 }
                 written += progress;
             }
-            offset += count;
+            offset = offset.checked_add(count).ok_or(OpenError::Io)?;
         }
     }
 
@@ -329,18 +344,36 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
         locked: NamespaceGuard<'_, Platform>,
         h: HandleRef<'_>,
     ) -> Result<Handle, OpenError> {
+        self.ensure_upper_with_copy(locked, h, None)
+    }
+
+    fn ensure_upper_with_copy(
+        &self,
+        locked: NamespaceGuard<'_, Platform>,
+        h: HandleRef<'_>,
+        truncate: Option<usize>,
+    ) -> Result<Handle, OpenError> {
         let file = match h {
             HandleRef::Dir(dir) => {
+                debug_assert!(truncate.is_none());
                 let path = &dir.get_typed::<Self>().path;
                 return Ok(Handle::Dir(self.ensure_upper_dir(&locked, path)?));
             }
             HandleRef::File(file) => file.get_typed::<Self>(),
         };
-        let (layer, lower) = match &file.layer {
+        let (layer, lower, migration) = match &file.layer {
             OverlayFileLayer::Upper(handle) => return Ok(Handle::File(handle.clone())),
-            OverlayFileLayer::Lower { layer, handle, .. } => (*layer, handle),
+            OverlayFileLayer::Lower {
+                layer,
+                handle,
+                migration,
+                ..
+            } => (*layer, handle, migration),
         };
-        if let Some(upper) = self.migrated(file) {
+        if let Some(upper) = Self::migrated(file) {
+            if let Some(length) = truncate {
+                self.upper.truncate(&upper, length)?;
+            }
             return Ok(Handle::File(upper));
         }
 
@@ -351,15 +384,46 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
             // Only regular files can be copied up.
             return Err(OpenError::ReadOnlyFileSystem);
         }
-        let upper_dir = self.ensure_upper_dir(&locked, &file.parent)?;
-        let upper = self.copy_up_file(
-            &locked,
+        let linked = match self.resolve_dir(&file.parent) {
+            Ok(dir) => dir
+                .entries
+                .get(&file.name)
+                .is_some_and(|entry| !entry.upper && entry.lower == Some(layer)),
+            // A missing or replaced parent proves that this open file is detached. Permission and
+            // other failures leave the namespace indeterminate and must not turn a linked copy-up
+            // into an anonymous one.
+            Err(OpenError::PathError(
+                PathError::NoSuchFileOrDirectory
+                | PathError::MissingComponent
+                | PathError::ComponentNotADirectory,
+            )) => false,
+            Err(error) => return Err(error),
+        };
+        let (upper_dir, name, detached) = if linked {
+            (
+                self.ensure_upper_dir(&locked, &file.parent)?,
+                file.name.clone(),
+                false,
+            )
+        } else {
+            let staging = self.alloc.next();
+            (
+                self.upper.owned_dir_at(self.upper.root(), OFlags::PATH)?,
+                format!("{MARKER_PREFIX}detached-{}-{}", staging.dev, staging.ino),
+                true,
+            )
+        };
+        let (upper, upper_node) = self.copy_up_file(
             &upper_dir,
-            &file.name,
+            &name,
             (layer, lower),
             &status,
-            false,
+            truncate,
+            detached,
         )?;
+        // Publish only after the upper object is complete and, when detached, unlinked.
+        self.bind_copy_up(layer, status.node_info, upper_node);
+        *migration.write() = Some(upper.clone());
         Ok(Handle::File(upper))
     }
 
@@ -483,7 +547,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
             })?;
         // A materialised directory stands in for the lower one, so it keeps its identity.
         if let (Some(layer), Ok(upper)) = (layer, self.upper.status(HandleRef::Dir(&child))) {
-            self.bind_copy_up(layer, status.node_info, upper.node_info, None);
+            self.bind_copy_up(layer, status.node_info, upper.node_info);
         }
         Ok(child)
     }
@@ -513,7 +577,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
         file: &OverlayFile,
         f: impl FnOnce(Option<usize>, &dyn Backend, &FileHandle) -> R,
     ) -> R {
-        if let Some(upper) = self.migrated(file) {
+        if let Some(upper) = Self::migrated(file) {
             return f(None, self.upper.as_ref(), &upper);
         }
         match &file.layer {
@@ -548,30 +612,31 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
 
     /// Give the freshly created `upper` node the overlay identity of the `lower` node it copies,
     /// which is what makes copy-up invisible: the object keeps its inode.
-    ///
-    /// `upper_file` is the new upper handle, which lets lower-backed handles follow the contents;
-    /// directories are addressed by path, so they have nothing to follow.
-    fn bind_copy_up(
-        &self,
-        layer: usize,
-        lower: NodeInfo,
-        upper: NodeInfo,
-        upper_file: Option<&FileHandle>,
-    ) {
+    fn bind_copy_up(&self, layer: usize, lower: NodeInfo, upper: NodeInfo) {
         let mut state = self.state.lock();
         let id = self.map_node(&mut state.ids, Some(layer), lower);
-        state.ids.insert(layer_node(None, upper), id.clone());
-        if let Some(file) = upper_file {
-            state.copied_up.insert(id, file.clone());
+        state.ids.insert(layer_node(None, upper), id);
+    }
+
+    /// Return the migration cell shared by every currently open lower-backed handle for `node`.
+    fn file_migration(&self, node: &NodeInfo) -> FileMigration {
+        let mut state = self.state.lock();
+        if let Some(migration) = state.migrations.get(node).and_then(Weak::upgrade) {
+            return migration;
         }
+        let migration = Arc::new(RwLock::new(None));
+        state
+            .migrations
+            .insert(node.clone(), Arc::downgrade(&migration));
+        migration
     }
 
     /// The upper handle for `file`, if it has been copied up since it was opened.
-    fn migrated(&self, file: &OverlayFile) -> Option<FileHandle> {
-        let OverlayFileLayer::Lower { node, .. } = &file.layer else {
+    fn migrated(file: &OverlayFile) -> Option<FileHandle> {
+        let OverlayFileLayer::Lower { migration, .. } = &file.layer else {
             return None;
         };
-        self.state.lock().copied_up.get(node).cloned()
+        migration.read().clone()
     }
 
     /// Merge the per-layer directories of one logical directory into its overlay-visible entries.
@@ -803,7 +868,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
             return Err(PathError::ComponentNotADirectory.into());
         }
         let path = dir.into_typed::<Self>().path;
-        let guard = self.namespace.lock();
+        let _guard = self.namespace.lock();
         let resolved = self.resolve_dir(&path)?;
         let entry = resolved
             .entries
@@ -826,12 +891,8 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
             let walking = self.lowers[layer]
                 .walking_dir_at(lower_dir)
                 .ok_or(OpenError::Io)?;
-            // An open that may modify the file has to copy it up first; the lower backends are
-            // immutable, so such an open is read-only down there.
-            //
-            // XXX(jayb): the resolver authorizes an open only after this returns, so a
-            // writable open can copy up before a later permission denial. A preflight
-            // authorization hook in `Backend` would make copy-up properly two-phase.
+            // Lower backends are immutable, so even a writable open is read-only there. The first
+            // authorized mutation copies the file up.
             let writing =
                 flags.intersects(OFlags::WRONLY | OFlags::RDWR | OFlags::APPEND | OFlags::TRUNC);
             let lower_flags = if writing {
@@ -849,29 +910,30 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
                     // Only regular files can be copied up, and the lowers do not accept writes.
                     return Err(OpenError::ReadOnlyFileSystem);
                 }
-                let upper_dir = self.ensure_upper_dir(&guard, &path)?;
-                let upper = self.copy_up_file(
-                    &guard,
-                    &upper_dir,
-                    name,
-                    (layer, &file.item),
-                    &status,
-                    flags.contains(OFlags::TRUNC),
-                )?;
                 // The lower open was substituted with a read-only one, so its `PermissionCheck`
                 // says nothing about the caller's write access; check the file's own mode instead.
                 let permissions = PermissionCheck::ByResolver(PermissionInfo {
                     mode: status.mode,
                     owner: status.owner,
                 });
-                (OverlayFileLayer::Upper(upper), permissions)
-            } else {
                 let node = self.map_node(&mut self.state.lock().ids, Some(layer), status.node_info);
+                let migration = self.file_migration(&node);
                 (
                     OverlayFileLayer::Lower {
                         layer,
                         handle: file.item,
-                        node,
+                        migration,
+                    },
+                    permissions,
+                )
+            } else {
+                let node = self.map_node(&mut self.state.lock().ids, Some(layer), status.node_info);
+                let migration = self.file_migration(&node);
+                (
+                    OverlayFileLayer::Lower {
+                        layer,
+                        handle: file.item,
+                        migration,
                     },
                     file.permissions,
                 )
@@ -926,25 +988,44 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         offset: usize,
     ) -> Result<usize, WriteError> {
         let file = h.get_typed::<Self>();
-        if let Some(upper) = self.migrated(file) {
+        if let Some(upper) = Self::migrated(file) {
             return self.upper.write(device_io, &upper, buf, offset);
         }
-        match &file.layer {
-            OverlayFileLayer::Upper(handle) => self.upper.write(device_io, handle, buf, offset),
-            // A writable open copies up first, so a lower-backed handle is read-only.
-            OverlayFileLayer::Lower { .. } => Err(WriteError::NotForWriting),
-        }
+        let upper = match &file.layer {
+            OverlayFileLayer::Upper(handle) => handle.clone(),
+            OverlayFileLayer::Lower { .. } => {
+                let locked = self.namespace.lock();
+                let Handle::File(upper) = self
+                    .ensure_upper(locked, HandleRef::File(h))
+                    .map_err(|_| WriteError::Io)?
+                else {
+                    return Err(WriteError::Io);
+                };
+                upper
+            }
+        };
+        self.upper.write(device_io, &upper, buf, offset)
     }
 
     fn truncate(&self, h: &FileHandle, length: usize) -> Result<(), TruncateError> {
         let file = h.get_typed::<Self>();
-        if let Some(upper) = self.migrated(file) {
+        if let Some(upper) = Self::migrated(file) {
             return self.upper.truncate(&upper, length);
         }
-        match &file.layer {
-            OverlayFileLayer::Upper(handle) => self.upper.truncate(handle, length),
-            OverlayFileLayer::Lower { .. } => Err(TruncateError::NotForWriting),
-        }
+        let upper = match &file.layer {
+            OverlayFileLayer::Upper(handle) => handle.clone(),
+            OverlayFileLayer::Lower { .. } => {
+                let locked = self.namespace.lock();
+                let Handle::File(_) = self
+                    .ensure_upper_with_copy(locked, HandleRef::File(h), Some(length))
+                    .map_err(|_| TruncateError::Io)?
+                else {
+                    return Err(TruncateError::Io);
+                };
+                return Ok(());
+            }
+        };
+        self.upper.truncate(&upper, length)
     }
 
     fn seek_behavior(&self, h: &FileHandle) -> SeekBehavior {

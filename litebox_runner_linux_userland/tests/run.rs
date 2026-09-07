@@ -581,6 +581,7 @@ fn spawn_test_broker_with_mode(
                 ),
                 std::sync::Arc::new(TestRandomProvider),
                 std::sync::Arc::new(CapturingStdioProvider { stdout_tx }),
+                std::sync::Arc::new(litebox_broker_core::fs::UnsupportedFileService),
             )
             .expect("failed to create broker core");
             ready_tx.send(()).expect("failed to report broker ready");
