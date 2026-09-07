@@ -462,7 +462,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                 Ok(())
             },
             || {
-                if alertable && self.thread_object.take_pending_thread_alert() {
+                if alertable && self.thread_object.take_pending_classic_alert() {
                     return Err(TryOpError::WaitError(WaitError::Interrupted));
                 }
                 match port.remove_with_capacity(

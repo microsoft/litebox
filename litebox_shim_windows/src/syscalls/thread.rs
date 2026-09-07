@@ -105,9 +105,30 @@ pub(crate) struct ThreadHandleObject<Platform: ShimPlatform> {
 }
 
 #[derive(Default)]
-struct KeyedAlertState {
-    wait_address: Option<usize>,
+struct AlertState {
+    waiting: bool,
     pending: bool,
+}
+
+impl AlertState {
+    fn begin_wait(&mut self) {
+        debug_assert!(!self.waiting);
+        self.waiting = true;
+    }
+
+    fn take_pending(&mut self) -> bool {
+        core::mem::take(&mut self.pending)
+    }
+
+    fn end_wait(&mut self) {
+        debug_assert!(self.waiting);
+        self.waiting = false;
+    }
+
+    fn set_pending(&mut self) -> bool {
+        self.pending = true;
+        self.waiting
+    }
 }
 
 pub(crate) struct ThreadObject<Platform: ShimPlatform> {
@@ -123,8 +144,8 @@ pub(crate) struct ThreadObject<Platform: ShimPlatform> {
     /// Handle used to interrupt the thread, published once by the thread itself
     /// when it starts running. Empty until then.
     wait_handle: once_cell::race::OnceBox<litebox::event::wait::ThreadHandle<Platform>>,
-    thread_alert_pending: AtomicBool,
-    keyed_alert_state: Mutex<Platform, KeyedAlertState>,
+    alert_state: Mutex<Platform, AlertState>,
+    thread_id_alert_state: Mutex<Platform, AlertState>,
     owned_mutants: Mutex<Platform, Vec<Weak<MutantObject<Platform>>>>,
 }
 
@@ -147,8 +168,8 @@ impl<Platform: ShimPlatform> ThreadObject<Platform> {
             is_exiting: AtomicBool::new(false),
             suspend_count: AtomicU32::new(suspend_count),
             wait_handle: once_cell::race::OnceBox::new(),
-            thread_alert_pending: AtomicBool::new(false),
-            keyed_alert_state: Mutex::new(KeyedAlertState::default()),
+            alert_state: Mutex::new(AlertState::default()),
+            thread_id_alert_state: Mutex::new(AlertState::default()),
             owned_mutants: Mutex::new(Vec::new()),
         }
     }
@@ -222,44 +243,44 @@ impl<Platform: ShimPlatform> ThreadObject<Platform> {
         }
     }
 
-    fn begin_keyed_alert_wait(&self, address: usize) {
-        let mut state = self.keyed_alert_state.lock();
-        debug_assert!(state.wait_address.is_none());
-        state.wait_address = Some(address);
+    fn begin_thread_id_alert_wait(&self) {
+        self.thread_id_alert_state.lock().begin_wait();
     }
 
-    fn take_keyed_alert(&self, address: usize) -> bool {
-        let mut state = self.keyed_alert_state.lock();
-        debug_assert_eq!(state.wait_address, Some(address));
-        core::mem::take(&mut state.pending)
+    fn take_thread_id_alert(&self) -> bool {
+        let mut state = self.thread_id_alert_state.lock();
+        debug_assert!(state.waiting);
+        state.take_pending()
     }
 
-    fn end_keyed_alert_wait(&self, address: usize) -> bool {
-        let mut state = self.keyed_alert_state.lock();
-        debug_assert_eq!(state.wait_address, Some(address));
-        state.wait_address = None;
-        core::mem::take(&mut state.pending)
+    fn end_thread_id_alert_wait(&self) -> bool {
+        let mut state = self.thread_id_alert_state.lock();
+        state.end_wait();
+        state.take_pending()
     }
 
-    fn alert_keyed_wait(&self, address: Option<usize>) {
-        let mut state = self.keyed_alert_state.lock();
-        if address.is_some() && state.wait_address != address {
-            return;
-        }
-        state.pending = true;
-        drop(state);
-        if let Some(handle) = self.wait_handle.get() {
+    fn set_thread_id_alert(&self) {
+        let waiting = self.thread_id_alert_state.lock().set_pending();
+        if waiting && let Some(handle) = self.wait_handle.get() {
             handle.interrupt();
         }
     }
 
-    pub(crate) fn take_pending_thread_alert(&self) -> bool {
-        self.thread_alert_pending.swap(false, Ordering::AcqRel)
+    pub(crate) fn begin_classic_alert_wait(&self) {
+        self.alert_state.lock().begin_wait();
     }
 
-    fn set_thread_alert(&self) {
-        self.thread_alert_pending.store(true, Ordering::Release);
-        if let Some(handle) = self.wait_handle.get() {
+    pub(crate) fn end_classic_alert_wait(&self) {
+        self.alert_state.lock().end_wait();
+    }
+
+    pub(crate) fn take_pending_classic_alert(&self) -> bool {
+        self.alert_state.lock().take_pending()
+    }
+
+    fn set_classic_alert(&self) {
+        let waiting = self.alert_state.lock().set_pending();
+        if waiting && let Some(handle) = self.wait_handle.get() {
             handle.interrupt();
         }
     }
@@ -574,7 +595,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     pub(crate) fn sys_nt_alert_thread(&self, thread_handle: ThreadHandle) -> NtStatus {
         if thread_handle.is_current() {
-            self.thread_object.set_thread_alert();
+            self.thread_object.set_classic_alert();
         } else {
             let entry = match self.typed_handle_entry_with_access::<ThreadSubsystem<Platform>>(
                 thread_handle.as_handle(),
@@ -583,14 +604,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 Ok(entry) => entry,
                 Err(status) => return status,
             };
-            entry.with_entry(|entry| entry.thread.set_thread_alert());
+            entry.with_entry(|entry| entry.thread.set_classic_alert());
         }
         NtStatus::SUCCESS
     }
 
     pub(crate) fn sys_nt_wait_for_alert_by_thread_id(
         &self,
-        address: usize,
+        _address: usize,
         timeout: Option<ConstPtr<Platform, i64>>,
     ) -> NtStatus {
         let timeout = match timeout {
@@ -600,9 +621,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
             },
             None => None,
         };
-        self.thread_object.begin_keyed_alert_wait(address);
-        let result = self.wait_until(timeout, || self.thread_object.take_keyed_alert(address));
-        let alert_raced_with_completion = self.thread_object.end_keyed_alert_wait(address);
+        self.thread_object.begin_thread_id_alert_wait();
+        let result = self.wait_until(timeout, || self.thread_object.take_thread_id_alert());
+        let alert_raced_with_completion = self.thread_object.end_thread_id_alert_wait();
         match result {
             Ok(()) | Err(litebox::event::wait::WaitError::Interrupted) => NtStatus::ALERTED,
             Err(litebox::event::wait::WaitError::TimedOut) if alert_raced_with_completion => {
@@ -615,12 +636,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
     pub(crate) fn sys_nt_alert_thread_by_thread_id_ex(
         &self,
         thread_id: usize,
-        address: usize,
+        _lock: usize,
     ) -> NtStatus {
+        // TODO(thread-alert-autoboost): Model the optional SRW lock's AutoBoost bookkeeping.
         let Some(thread) = self.process.thread_by_id(thread_id) else {
             return NtStatus::INVALID_CID;
         };
-        thread.alert_keyed_wait(Some(address));
+        thread.set_thread_id_alert();
         NtStatus::SUCCESS
     }
 
@@ -628,7 +650,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let Some(thread) = self.process.thread_by_id(thread_id) else {
             return NtStatus::INVALID_CID;
         };
-        thread.alert_keyed_wait(None);
+        thread.set_thread_id_alert();
         NtStatus::SUCCESS
     }
 
@@ -909,7 +931,7 @@ mod tests {
     }
 
     #[test]
-    fn wait_for_alert_by_thread_id_blocks_until_matching_alert() {
+    fn wait_for_alert_by_thread_id_blocks_until_alert() {
         run_with_test_platform_pointers(|| {
             let alerter = crate::tests::test_task();
             let waiter = alerter
@@ -933,13 +955,13 @@ mod tests {
             });
 
             let deadline = Instant::now() + Duration::from_secs(2);
-            while waiter_thread.keyed_alert_state.lock().wait_address != Some(wait_address) {
+            while !waiter_thread.thread_id_alert_state.lock().waiting {
                 assert!(Instant::now() < deadline, "waiter did not enter alert wait");
                 std::thread::yield_now();
             }
             assert_eq!(result_rx.try_recv(), Err(TryRecvError::Empty));
             assert_eq!(
-                alerter.sys_nt_alert_thread_by_thread_id_ex(thread_id, wait_address),
+                alerter.sys_nt_alert_thread_by_thread_id_ex(thread_id, 0),
                 NtStatus::SUCCESS
             );
             assert_eq!(
@@ -954,6 +976,81 @@ mod tests {
                     .sys_nt_wait_for_alert_by_thread_id(wait_address, Some(const_ptr(&timeout)),),
                 NtStatus::TIMEOUT
             );
+        });
+    }
+
+    #[test]
+    fn alerts_before_wait_coalesce() {
+        run_with_test_platform_pointers(|| {
+            let alerter = crate::tests::test_task();
+            let waiter = alerter
+                .clone_for_test()
+                .expect("a live process should accept another thread");
+            let thread_id = waiter.thread_object.thread_id();
+            let alert_lock = 0;
+
+            assert_eq!(
+                alerter.sys_nt_alert_thread_by_thread_id_ex(thread_id, alert_lock),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(
+                alerter.sys_nt_alert_thread_by_thread_id_ex(thread_id, alert_lock),
+                NtStatus::SUCCESS
+            );
+            let timeout = 0i64;
+            assert_eq!(
+                waiter.sys_nt_wait_for_alert_by_thread_id(0x1234, Some(const_ptr(&timeout))),
+                NtStatus::ALERTED
+            );
+            assert_eq!(
+                waiter.sys_nt_wait_for_alert_by_thread_id(0x5678, Some(const_ptr(&timeout))),
+                NtStatus::TIMEOUT
+            );
+        });
+    }
+
+    #[test]
+    fn classic_alert_does_not_satisfy_thread_id_alert_wait() {
+        run_with_test_platform_pointers(|| {
+            let alerter = crate::tests::test_task();
+            let waiter = alerter
+                .clone_for_test()
+                .expect("a live process should accept another thread");
+            let waiter_thread = Arc::clone(&waiter.thread_object);
+            let thread_id = waiter_thread.thread_id();
+            let (result_tx, result_rx) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                run_with_test_platform_pointers(|| {
+                    waiter.publish_thread_handle();
+                    let timeout = -10_000_000i64;
+                    result_tx
+                        .send(
+                            waiter.sys_nt_wait_for_alert_by_thread_id(0, Some(const_ptr(&timeout))),
+                        )
+                        .unwrap();
+                });
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !waiter_thread.thread_id_alert_state.lock().waiting {
+                assert!(Instant::now() < deadline, "waiter did not enter alert wait");
+                std::thread::yield_now();
+            }
+            waiter_thread.set_classic_alert();
+            assert_eq!(
+                result_rx.recv_timeout(Duration::from_millis(50)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            );
+            assert_eq!(
+                alerter.sys_nt_alert_thread_by_thread_id(thread_id),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(
+                result_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                NtStatus::ALERTED
+            );
+            thread.join().unwrap();
+            assert!(waiter_thread.take_pending_classic_alert());
         });
     }
 
@@ -986,13 +1083,13 @@ mod tests {
             });
 
             registered_rx.recv().unwrap();
-            waiter_thread.set_thread_alert();
+            waiter_thread.set_classic_alert();
             assert!(matches!(
                 result_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
                 Err(TryOpError::WaitError(WaitError::Interrupted))
             ));
             thread.join().unwrap();
-            assert!(!waiter_thread.take_pending_thread_alert());
+            assert!(!waiter_thread.take_pending_classic_alert());
         });
     }
 
@@ -1033,7 +1130,7 @@ mod tests {
             });
 
             let observer = registered_rx.recv().unwrap();
-            waiter_thread.set_thread_alert();
+            waiter_thread.set_classic_alert();
             assert!(matches!(result_rx.try_recv(), Err(TryRecvError::Empty)));
             ready.store(true, Ordering::Release);
             observer.upgrade().unwrap().on_events(&Events::IN);
@@ -1044,8 +1141,8 @@ mod tests {
                     .is_ok()
             );
             thread.join().unwrap();
-            assert!(waiter_thread.take_pending_thread_alert());
-            assert!(!waiter_thread.take_pending_thread_alert());
+            assert!(waiter_thread.take_pending_classic_alert());
+            assert!(!waiter_thread.take_pending_classic_alert());
         });
     }
 

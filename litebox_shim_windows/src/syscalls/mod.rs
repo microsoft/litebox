@@ -794,7 +794,7 @@ pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
     },
     NtAlertThreadByThreadIdEx {
         thread_id: usize,
-        address: usize,
+        lock: usize,
     },
     NtAlertThreadByThreadId {
         thread_id: usize,
@@ -1646,7 +1646,7 @@ impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
                 timeout:*,
             })),
             NtSysno::NtAlertThreadByThreadIdEx => {
-                Some(sys_req!(NtAlertThreadByThreadIdEx { thread_id, address }))
+                Some(sys_req!(NtAlertThreadByThreadIdEx { thread_id, lock }))
             }
             NtSysno::NtAlertThreadByThreadId => {
                 Some(sys_req!(NtAlertThreadByThreadId { thread_id }))
