@@ -19,7 +19,6 @@ use super::errors::{
 };
 use super::inode_allocator::{InodeAllocator, InodeAllocators};
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
-use crate::path::Arg;
 use thiserror::Error;
 
 // XXX(jayb): consider removing this via a runtime reserved device ID?
@@ -36,7 +35,7 @@ pub struct Composer {
 
 /// A [`Composer`] builder.
 pub struct ComposerBuilder {
-    mounts: Vec<(Option<String>, Box<dyn Backend>)>,
+    mounts: Vec<(String, Box<dyn Backend>)>,
     allocators: InodeAllocators,
 }
 
@@ -78,11 +77,7 @@ impl Composer {
 impl ComposerBuilder {
     /// Add a backend mounted at `path`.
     #[must_use]
-    pub fn mount<B: Backend>(
-        self,
-        path: impl Arg,
-        backend: impl FnOnce(InodeAllocator) -> B,
-    ) -> Self {
+    pub fn mount<B: Backend>(self, path: &str, backend: impl FnOnce(InodeAllocator) -> B) -> Self {
         self.mount_nestable(path, |allocators| backend(allocators.next()))
     }
 
@@ -90,13 +85,12 @@ impl ComposerBuilder {
     #[must_use]
     pub fn mount_nestable<B: Backend>(
         mut self,
-        path: impl Arg,
+        path: &str,
         backend: impl FnOnce(&InodeAllocators) -> B,
     ) -> Self {
         // TODO(jayb): Decide whether we need a fallible version of closure-based mount.
         let backend = backend(&self.allocators);
-        self.mounts
-            .push((path.as_rust_str().map(Into::into).ok(), Box::new(backend)));
+        self.mounts.push((path.into(), Box::new(backend)));
         self
     }
 
@@ -109,7 +103,6 @@ impl ComposerBuilder {
         let mut mounts = vec![];
         let mut paths = vec![];
         for (raw, backend) in self.mounts {
-            let raw = raw.ok_or(BuildError::InvalidMountPath)?;
             if !raw.starts_with('/') {
                 return Err(BuildError::InvalidMountPath);
             }
@@ -643,11 +636,17 @@ impl Backend for Composer {
         }
     }
 
-    fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError> {
+    fn read(
+        &self,
+        device_io: &dyn super::backend::DeviceIo,
+        h: &FileHandle,
+        buf: &mut [u8],
+        offset: usize,
+    ) -> Result<usize, ReadError> {
         let h = h.get_typed::<Self>();
         self.mounts[h.mount_index]
             .backend
-            .read(&h.handle, buf, offset)
+            .read(device_io, &h.handle, buf, offset)
     }
 
     fn get_static_backing_data(&self, h: &FileHandle) -> Option<&'static [u8]> {
@@ -657,11 +656,17 @@ impl Backend for Composer {
             .get_static_backing_data(&h.handle)
     }
 
-    fn write(&self, h: &FileHandle, buf: &[u8], offset: usize) -> Result<usize, WriteError> {
+    fn write(
+        &self,
+        device_io: &dyn super::backend::DeviceIo,
+        h: &FileHandle,
+        buf: &[u8],
+        offset: usize,
+    ) -> Result<usize, WriteError> {
         let h = h.get_typed::<Self>();
         self.mounts[h.mount_index]
             .backend
-            .write(&h.handle, buf, offset)
+            .write(device_io, &h.handle, buf, offset)
     }
 
     fn truncate(&self, h: &FileHandle, length: usize) -> Result<(), TruncateError> {

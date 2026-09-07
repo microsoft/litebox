@@ -8,7 +8,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use hashbrown::HashMap;
 
-use crate::sync;
+use litebox_platform::sync;
 
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
@@ -62,11 +62,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
     /// type of an existing path, or if the root is given as a file.
     #[must_use]
     pub fn new_initialized<Path: AsRef<str>>(
-        entries: impl IntoIterator<Item = (Path, InitialNode)>,
+        entries: impl IntoIterator<Item = (Path, impl Into<InitialNode>)>,
     ) -> Self {
         let this = Self::new(InodeAllocator::standalone());
         for (path, node) in entries {
-            this.insert_initial(path.as_ref(), node);
+            this.insert_initial(path.as_ref(), node.into());
         }
         this
     }
@@ -402,6 +402,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
 
     fn read(
         &self,
+        _device_io: &dyn super::backend::DeviceIo,
         h: &super::backend::FileHandle,
         buf: &mut [u8],
         offset: usize,
@@ -417,6 +418,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
 
     fn write(
         &self,
+        _device_io: &dyn super::backend::DeviceIo,
         h: &super::backend::FileHandle,
         buf: &[u8],
         offset: usize,

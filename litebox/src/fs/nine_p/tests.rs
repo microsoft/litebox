@@ -17,7 +17,7 @@ use crate::fs::resolver::Resolver;
 use crate::fs::{Mode, OFlags};
 use crate::platform::mock::MockPlatform;
 
-use super::{NineP, transport};
+use super::nine_p::{NineP, transport};
 
 type NinePFs<T> = Resolver<MockPlatform, NineP<MockPlatform, T>>;
 

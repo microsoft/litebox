@@ -1,114 +1,29 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Guest-facing filesystem facade.
+//! File-system related functionality
 //!
-//! Filesystem resolution and backend implementations live in `litebox_broker_core`. This module
-//! retains LiteBox's guest values, descriptor integration, and compatibility module paths.
+//! A file-system consists of an [`Engine`](resolver::Engine) that works alongside one or more
+//! [`Backend`](backend::Backend)s. Such backends can be composed together: mounted at distinct paths
+//! via the [`Composer`](composer::Composer), or stacked as a writable upper over immutable lowers
+//! via the [`Overlay`](overlay::Overlay).
 
 use bitflags::bitflags;
 
 use core::ffi::c_uint;
 use core::num::NonZeroUsize;
 
+pub mod backend;
+pub mod composer;
+pub mod devices;
 pub mod errors;
+pub mod in_mem;
+#[doc(hidden)]
+pub mod inode_allocator;
+pub mod nine_p;
+pub mod overlay;
 pub mod resolver;
-
-// TODO: Remove these implementation-facing compatibility modules once LiteBox uses the broker
-// file APIs exclusively. They temporarily preserve local filesystem construction while resolver
-// and backend ownership moves into broker core.
-#[doc(hidden)]
-pub mod backend {
-    pub use litebox_broker_core::fs::backend::*;
-}
-
-#[doc(hidden)]
-pub mod composer {
-    pub use litebox_broker_core::fs::composer::*;
-}
-
-#[doc(hidden)]
-pub mod devices {
-    pub use litebox_broker_core::fs::devices::*;
-}
-
-#[doc(hidden)]
-pub mod in_mem {
-    pub use litebox_broker_core::fs::in_mem::{InMem, InMemDirHandle, InMemFileHandle};
-
-    /// A node used to pre-populate an [`InMem`] backend, via [`InMem::new_initialized`].
-    pub enum InitialNode {
-        /// A directory.
-        Directory {
-            /// Permission bits for the directory.
-            mode: super::Mode,
-            /// Owning user and group.
-            owner: super::UserInfo,
-        },
-        /// A regular file, along with its contents.
-        File {
-            /// Permission bits for the file.
-            mode: super::Mode,
-            /// Owning user and group.
-            owner: super::UserInfo,
-            /// The file's contents.
-            ///
-            /// Borrowed data is kept borrowed until the first write to the file, which makes this
-            /// the cheap way to set up large read-heavy files (such as executables).
-            data: alloc::borrow::Cow<'static, [u8]>,
-        },
-    }
-
-    impl From<InitialNode> for litebox_broker_core::fs::in_mem::InitialNode {
-        fn from(node: InitialNode) -> Self {
-            match node {
-                InitialNode::Directory { mode, owner } => Self::Directory {
-                    mode: litebox_broker_core::fs::Mode::from_bits_retain(mode.bits()),
-                    owner: litebox_broker_core::fs::UserInfo {
-                        user: owner.user,
-                        group: owner.group,
-                    },
-                },
-                InitialNode::File { mode, owner, data } => Self::File {
-                    mode: litebox_broker_core::fs::Mode::from_bits_retain(mode.bits()),
-                    owner: litebox_broker_core::fs::UserInfo {
-                        user: owner.user,
-                        group: owner.group,
-                    },
-                    data,
-                },
-            }
-        }
-    }
-}
-
-#[doc(hidden)]
-#[cfg(test)]
-pub(crate) mod inode_allocator {
-    pub(crate) use litebox_broker_core::fs::inode_allocator::*;
-}
-
-#[doc(hidden)]
-pub mod nine_p {
-    pub use litebox_broker_core::fs::nine_p::*;
-}
-
-#[doc(hidden)]
-pub mod overlay {
-    pub use litebox_broker_core::fs::overlay::*;
-}
-
-#[doc(hidden)]
-pub mod tar_ro {
-    pub use litebox_broker_core::fs::tar_ro::*;
-}
-
-#[cfg(test)]
-mod tests;
-
-#[cfg(all(test, target_os = "linux"))]
-#[path = "nine_p/tests.rs"]
-mod nine_p_tests;
+pub mod tar_ro;
 
 bitflags! {
     /// `S_I*` constants for open, ...
@@ -152,9 +67,8 @@ bitflags! {
 
 /// Types of files on a file-system.
 ///
-/// See [`resolver::Resolver::file_status`].
+/// See [`resolver::Engine::file_status`].
 #[derive(Debug, PartialEq, Eq, Clone)]
-#[non_exhaustive]
 pub enum FileType {
     RegularFile,
     Directory,
@@ -247,7 +161,7 @@ bitflags! {
     }
 }
 
-/// The `whence` directive to [`resolver::Resolver::seek`]
+/// The `whence` directive to [`resolver::Engine::seek`]
 #[derive(Copy, Clone)]
 pub enum SeekWhence {
     /// The file offset is set to `offset` bytes.
@@ -300,7 +214,7 @@ pub struct NodeInfo {
     pub rdev: Option<NonZeroUsize>,
 }
 
-/// Directory entries returned by [`resolver::Resolver::read_dir`]
+/// Directory entries returned by [`resolver::Engine::read_dir`]
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct DirEntry {
@@ -313,3 +227,6 @@ impl UserInfo {
     /// The root user
     pub const ROOT: Self = Self { user: 0, group: 0 };
 }
+
+/// The size reported as the size of a directory.
+const DEFAULT_DIRECTORY_SIZE: usize = 4096;

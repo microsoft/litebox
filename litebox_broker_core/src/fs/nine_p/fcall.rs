@@ -7,6 +7,41 @@
 //! See <https://9p.io/sys/man/5/intro> and <https://github.com/chaos/diod/blob/master/protocol.md>
 
 use super::transport;
+
+// This duplicates `litebox::utilities::macros::repr_enum` because broker core cannot depend on
+// LiteBox. Keep it local unless enough shared macros justify introducing a common home.
+macro_rules! repr_enum {
+    (
+        $(#[$meta:meta])*
+        $vis:vis enum $name:ident : $int_ty:ty, $from_fn:ident {
+            $(
+                $(#[$vmeta:meta])*
+                $variant:ident = $value:expr
+            ),* $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        #[repr($int_ty)]
+        $vis enum $name {
+            $(
+                $(#[$vmeta])*
+                $variant = $value,
+            )*
+        }
+
+        impl $name {
+            fn $from_fn(value: $int_ty) -> Option<Self> {
+                match value {
+                    $(
+                        $value => Some(Self::$variant),
+                    )*
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
 use alloc::{borrow::Cow, vec::Vec};
 use bitflags::bitflags;
 
@@ -345,7 +380,7 @@ impl<'a> DirEntryData<'a> {
     }
 }
 
-crate::utilities::macros::repr_enum! {
+repr_enum! {
     /// 9P message types
     #[derive(Copy, Clone, Debug)]
     enum FcallType: u8, from_u8 {
