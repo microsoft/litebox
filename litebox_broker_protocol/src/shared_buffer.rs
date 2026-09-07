@@ -139,6 +139,7 @@ mod tests {
     #[test]
     fn larger_slots_do_not_change_existing_transfer_limits() {
         assert_eq!(crate::pipe::MAX_PIPE_TRANSFER_SIZE, 32 * 1024);
+        assert_eq!(crate::fs::MAX_FILESYSTEM_TRANSFER_SIZE, 64 * 1024);
         assert_eq!(crate::socket::MAX_SOCKET_TRANSFER_SIZE, 32 * 1024);
         assert_eq!(crate::socket::MAX_UDP_DATAGRAM_SIZE, 65_507);
         assert_eq!(crate::stdio::MAX_STDIO_TRANSFER_SIZE, 32 * 1024);

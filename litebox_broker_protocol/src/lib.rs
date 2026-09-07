@@ -18,6 +18,7 @@ extern crate std;
 
 pub mod error;
 pub mod event;
+pub mod fs;
 pub mod message;
 pub mod pipe;
 pub mod random;
@@ -43,4 +44,4 @@ pub struct RequestId(pub u64);
 pub struct ProtocolVersion(pub u16);
 
 /// Current broker protocol version.
-pub const BROKER_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(1);
+pub const BROKER_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(2);
