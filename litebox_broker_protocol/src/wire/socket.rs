@@ -421,11 +421,38 @@ fn decode_connection_status(
 }
 
 fn encode_socket_error(encoder: &mut Encoder, error: SocketError) {
-    encoder.u8(error.as_raw());
+    encoder.u8(match error {
+        SocketError::ConnectionRefused => 1,
+        SocketError::ConnectionReset => 2,
+        SocketError::ConnectionAborted => 3,
+        SocketError::NetworkUnreachable => 4,
+        SocketError::HostUnreachable => 5,
+        SocketError::TimedOut => 6,
+        SocketError::AddressInUse => 7,
+        SocketError::AddressNotAvailable => 8,
+        SocketError::PolicyDenied => 9,
+        SocketError::Other => 10,
+        SocketError::NotConnected => 11,
+        SocketError::InvalidArgument => 12,
+    });
 }
 
 fn decode_socket_error(decoder: &mut Decoder<'_>) -> Result<SocketError, WireError> {
-    SocketError::from_raw(decoder.u8()?).ok_or(WireError::InvalidTag)
+    match decoder.u8()? {
+        1 => Ok(SocketError::ConnectionRefused),
+        2 => Ok(SocketError::ConnectionReset),
+        3 => Ok(SocketError::ConnectionAborted),
+        4 => Ok(SocketError::NetworkUnreachable),
+        5 => Ok(SocketError::HostUnreachable),
+        6 => Ok(SocketError::TimedOut),
+        7 => Ok(SocketError::AddressInUse),
+        8 => Ok(SocketError::AddressNotAvailable),
+        9 => Ok(SocketError::PolicyDenied),
+        10 => Ok(SocketError::Other),
+        11 => Ok(SocketError::NotConnected),
+        12 => Ok(SocketError::InvalidArgument),
+        _ => Err(WireError::InvalidTag),
+    }
 }
 
 fn encode_address(encoder: &mut Encoder, address: SocketAddrV4) {

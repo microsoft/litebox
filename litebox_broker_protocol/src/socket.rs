@@ -257,48 +257,6 @@ pub enum SocketError {
     Other,
 }
 
-impl SocketError {
-    /// Raw socket error values are part of the broker wire ABI.
-    ///
-    /// Value `0` is unassigned so a zero-filled value never represents a
-    /// concrete network failure.
-    pub const fn from_raw(raw: u8) -> Option<Self> {
-        match raw {
-            1 => Some(Self::ConnectionRefused),
-            2 => Some(Self::ConnectionReset),
-            3 => Some(Self::ConnectionAborted),
-            4 => Some(Self::NetworkUnreachable),
-            5 => Some(Self::HostUnreachable),
-            6 => Some(Self::TimedOut),
-            7 => Some(Self::AddressInUse),
-            8 => Some(Self::AddressNotAvailable),
-            9 => Some(Self::PolicyDenied),
-            10 => Some(Self::Other),
-            11 => Some(Self::NotConnected),
-            12 => Some(Self::InvalidArgument),
-            _ => None,
-        }
-    }
-
-    /// Returns the raw broker wire ABI value.
-    pub const fn as_raw(self) -> u8 {
-        match self {
-            Self::ConnectionRefused => 1,
-            Self::ConnectionReset => 2,
-            Self::ConnectionAborted => 3,
-            Self::NetworkUnreachable => 4,
-            Self::HostUnreachable => 5,
-            Self::TimedOut => 6,
-            Self::AddressInUse => 7,
-            Self::AddressNotAvailable => 8,
-            Self::PolicyDenied => 9,
-            Self::Other => 10,
-            Self::NotConnected => 11,
-            Self::InvalidArgument => 12,
-        }
-    }
-}
-
 /// Result of a socket operation that can fail with an ordinary network outcome.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[must_use]
