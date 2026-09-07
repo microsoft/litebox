@@ -165,7 +165,11 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
     }
 
     let broker_connection = match cli_args.broker_control_channel.as_deref() {
-        Some(control_socket_path) => Some(broker::connect(control_socket_path)?),
+        Some(control_socket_path) => {
+            Some(litebox_platform_linux_userland::with_guest_signals_blocked(
+                || broker::connect(control_socket_path),
+            )?)
+        }
         None => None,
     };
 
@@ -257,11 +261,13 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         broker_shutdown_fds.push(shutdown_fd);
         let litebox = litebox::LiteBox::new_with_broker_local(platform, broker_local);
         broker_association_coordinator.install_dispatch(litebox.broker_failure_dispatcher());
-        broker::start_notification_receiver(
-            broker_notifications,
-            broker_association_coordinator,
-            litebox.broker_notification_dispatcher(),
-        )?;
+        litebox_platform_linux_userland::with_guest_signals_blocked(|| {
+            broker::start_notification_receiver(
+                broker_notifications,
+                broker_association_coordinator,
+                litebox.broker_notification_dispatcher(),
+            )
+        })?;
         litebox_shim_linux::LinuxShimBuilder::new_with_litebox(platform, litebox)
     } else {
         litebox_shim_linux::LinuxShimBuilder::new(platform)

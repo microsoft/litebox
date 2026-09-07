@@ -90,7 +90,7 @@ struct CliArgs {
     /// Allow using unstable options.
     #[arg(short = 'Z', long = "unstable")]
     unstable: bool,
-    /// Run the host-native runner as a thread in this broker process.
+    /// Run the runner library for this platform as a thread in this broker process.
     ///
     /// This mode does not provide a security boundary between the runner and
     /// broker and is intended only for testing and development.
@@ -287,46 +287,6 @@ mod cli_tests {
 
         assert_eq!(args.allow_tcp_destination.len(), 1);
         assert_eq!(args.allow_udp_destination.len(), 1);
-    }
-
-    #[test]
-    fn cli_accepts_unstable_in_process_runner() {
-        let args = CliArgs::try_parse_from([
-            "litebox-broker-userland",
-            "--unstable",
-            "--in-process-runner",
-            "guest",
-        ])
-        .unwrap();
-
-        assert!(args.unstable);
-        assert!(args.in_process_runner);
-        assert!(args.runner.is_none());
-    }
-
-    #[test]
-    fn cli_rejects_invalid_runner_modes() {
-        assert!(
-            CliArgs::try_parse_from(["litebox-broker-userland", "guest"]).is_err(),
-            "a separate-process runner path should be required"
-        );
-        assert!(
-            CliArgs::try_parse_from(["litebox-broker-userland", "--in-process-runner", "guest"])
-                .is_err(),
-            "in-process mode should require --unstable"
-        );
-        assert!(
-            CliArgs::try_parse_from([
-                "litebox-broker-userland",
-                "--unstable",
-                "--in-process-runner",
-                "--runner",
-                "runner",
-                "guest"
-            ])
-            .is_err(),
-            "in-process mode should conflict with --runner"
-        );
     }
 
     #[test]

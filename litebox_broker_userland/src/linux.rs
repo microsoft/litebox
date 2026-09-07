@@ -47,12 +47,15 @@ pub(super) fn run(mut args: super::CliArgs) -> Result<(), Box<dyn Error>> {
     let control_socket_path = socket_dir.path().join("broker.sock");
     let control_listener = UnixListener::bind(&control_socket_path)?;
     control_listener.set_nonblocking(true)?;
-    let broker = BrokerCoreBuilder::new(
-        PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()).with_socket_policy(
-            configured_socket_policy(&args.allow_tcp_destination, &args.allow_udp_destination)?,
-        ),
-    )
-    .build()?;
+    let policy = PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()).with_socket_policy(
+        configured_socket_policy(&args.allow_tcp_destination, &args.allow_udp_destination)?,
+    );
+    let build_broker = || BrokerCoreBuilder::new(policy).build();
+    let broker = if args.in_process_runner {
+        litebox_platform_linux_userland::with_guest_signals_blocked(build_broker)?
+    } else {
+        build_broker()?
+    };
 
     if args.in_process_runner {
         debug_assert!(args.unstable);
@@ -187,13 +190,17 @@ fn run_runner_in_process(
             crate::runner_command_arguments(args, control_socket_path, proxy_url),
         ),
     )?;
-    let runner = std::thread::Builder::new()
-        .name("litebox-runner".to_owned())
-        .spawn(move || {
-            litebox_runner_linux_userland::run(runner_args).map_err(|error| format!("{error:#}"))
-        })?;
-    let association_result = serve_runner_in_process(broker, control_listener, &runner);
-    crate::finish_in_process_runner(runner, association_result)
+    litebox_platform_linux_userland::with_guest_signals_blocked(|| {
+        let runner = std::thread::Builder::new()
+            .name("litebox-runner".to_owned())
+            .spawn(move || {
+                litebox_platform_linux_userland::unblock_guest_signals();
+                litebox_runner_linux_userland::run(runner_args)
+                    .map_err(|error| format!("{error:#}"))
+            })?;
+        let association_result = serve_runner_in_process(broker, control_listener, &runner);
+        crate::finish_in_process_runner(runner, association_result)
+    })
 }
 
 fn serve_runner_process(

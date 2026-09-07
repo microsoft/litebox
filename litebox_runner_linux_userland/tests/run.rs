@@ -128,7 +128,7 @@ struct Runner {
     #[cfg(target_os = "linux")]
     use_userland_broker: bool,
     #[cfg(target_os = "linux")]
-    in_process_broker: bool,
+    in_process_mode: bool,
     has_run: bool,
 }
 
@@ -190,7 +190,7 @@ impl Runner {
             #[cfg(target_os = "linux")]
             use_userland_broker: true,
             #[cfg(target_os = "linux")]
-            in_process_broker: false,
+            in_process_mode: false,
             has_run: false,
             unique_name: unique_name.to_owned(),
         }
@@ -238,10 +238,10 @@ impl Runner {
         self
     }
 
-    #[cfg(target_os = "linux")]
-    fn in_process_broker(&mut self) -> &mut Self {
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    fn use_in_process_runner(&mut self) -> &mut Self {
         self.use_userland_broker = true;
-        self.in_process_broker = true;
+        self.in_process_mode = true;
         self
     }
 
@@ -304,7 +304,7 @@ impl Runner {
             for host in &self.managed_proxy_hosts {
                 command.arg("--allow-host").arg(host);
             }
-            if self.in_process_broker {
+            if self.in_process_mode {
                 command.args(["--unstable", "--in-process-runner"]);
             } else {
                 command.arg("--runner").arg(runner);
@@ -792,7 +792,7 @@ fn brokered_getrandom() {
         false,
     );
     let mut runner = Runner::new(&target, "brokered_getrandom");
-    runner.in_process_broker();
+    runner.use_in_process_runner();
     runner.run();
 }
 
