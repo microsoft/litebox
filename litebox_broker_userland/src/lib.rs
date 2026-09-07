@@ -9,11 +9,10 @@
 //! runtime that serves one association from setup through
 //! teardown ([`runtime`]), and threaded readiness publication
 //! ([`readiness`]). The `litebox-broker-userland` binary composes these with
-//! CLI parsing, launching and supervising the separate LiteBox runner process,
-//! and the platform-specific transport endpoints from
+//! CLI parsing, launching and supervising a separate or explicitly non-secure
+//! in-process LiteBox runner, and the platform-specific transport endpoints from
 //! `litebox_broker_transport_linux_userland` and
-//! `litebox_broker_transport_windows_userland`; an in-process caller can use
-//! the same builder and runtime directly instead.
+//! `litebox_broker_transport_windows_userland`.
 
 pub mod builder;
 pub mod readiness;

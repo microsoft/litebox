@@ -155,7 +155,7 @@ mod tests {
     };
     use litebox_broker_transport::control_ring::ControlRing;
     use litebox_broker_transport::shared_memory::SharedMemory as _;
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId};
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 
     const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(10);
 
@@ -298,8 +298,7 @@ mod tests {
             .unwrap();
             let memory = WindowsSharedMemory::create(4096).unwrap();
             memory.write(0, b"shared").unwrap();
-            host.send_shared_memory(&memory, unsafe { GetCurrentProcess() })
-                .unwrap();
+            host.send_shared_memory_to_current_process(&memory).unwrap();
         });
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut local =

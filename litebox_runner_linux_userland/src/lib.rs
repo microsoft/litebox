@@ -25,7 +25,7 @@ const MANAGED_PROXY_ENV_KEYS: [&str; 5] = [
     "NO_PROXY",
 ];
 
-/// Run Linux programs with LiteBox on unmodified Linux
+/// Runs a Linux program with LiteBox on unmodified Linux and returns its exit code.
 ///
 /// Detailed logging can be controlled via the `LITEBOX_LOG` environment variable. For example:
 /// - `LITEBOX_LOG=debug` to show debug and higher level logs
@@ -131,7 +131,7 @@ fn mmapped_file(path: impl AsRef<Path>) -> Result<MmappedFile> {
 /// Can panic if any particulars of the environment are not set up as expected. Ideally, would not
 /// panic. If it does actually panic, then ping the authors of LiteBox, and likely a better error
 /// message could be thrown instead.
-pub fn run(cli_args: CliArgs) -> Result<()> {
+pub fn run(cli_args: CliArgs) -> Result<i32> {
     if cli_args.broker_proxy_url.is_some() && cli_args.broker_control_channel.is_none() {
         return Err(anyhow!(
             "--broker-proxy-url requires --broker-control-channel"
@@ -423,7 +423,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         }
     }
 
-    std::process::exit(program.process.wait())
+    Ok(program.process.wait())
 }
 
 fn apply_broker_proxy_environment(environment: &mut Vec<String>, proxy_url: Option<&str>) {

@@ -5,7 +5,8 @@
 fn main() -> anyhow::Result<()> {
     use clap::Parser as _;
     use litebox_runner_windows_userland::CliArgs;
-    litebox_runner_windows_userland::run(CliArgs::parse())
+    let exit_code = litebox_runner_windows_userland::run(CliArgs::parse())?;
+    std::process::exit(exit_code)
 }
 
 #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]

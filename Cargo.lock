@@ -1568,6 +1568,8 @@ dependencies = [
  "litebox_broker_transport_linux_userland",
  "litebox_broker_transport_windows_userland",
  "litebox_platform",
+ "litebox_runner_linux_userland",
+ "litebox_runner_windows_userland",
  "tempfile",
 ]
 

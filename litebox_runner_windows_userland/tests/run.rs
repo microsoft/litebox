@@ -20,32 +20,42 @@ fn run_hello_world_pe() {
         std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kernel32_import.tar");
     create_tar_with_dir(&test_dir, &tar_path);
 
-    let mut command = brokered_windows_runner_command();
-    // Verbose log for failure triage; not load-bearing for any assertion.
-    command.env("LITEBOX_LOG", "debug");
-    command.args([
-        "--initial-files",
-        tar_path.to_str().unwrap(),
-        "/kernel32_import.exe",
-    ]);
-    println!("Running `{command:?}`");
-    let output = command
-        .output()
-        .expect("failed to run litebox_runner_windows_userland");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let (broker, runner) = build_windows_broker();
+    let mut separate_process = std::process::Command::new(&broker);
+    separate_process.arg("--runner").arg(runner);
+    let mut in_process = std::process::Command::new(broker);
+    in_process.args(["--unstable", "--in-process-runner"]);
 
-    assert!(
-        output.status.success(),
-        "runner failed to run kernel32-import PE; status {:?}\nstdout:\n{}\nstderr:\n{}",
-        output.status.code(),
-        stdout,
-        stderr
-    );
-    assert!(
-        stdout.contains("hello world\n"),
-        "guest output was not captured\nstdout:\n{stdout}\nstderr:\n{stderr}"
-    );
+    for (mode, mut command) in [
+        ("separate-process", separate_process),
+        ("in-process", in_process),
+    ] {
+        // Verbose log for failure triage; not load-bearing for any assertion.
+        command.env("LITEBOX_LOG", "debug");
+        command.args([
+            "--initial-files",
+            tar_path.to_str().unwrap(),
+            "/kernel32_import.exe",
+        ]);
+        println!("Running {mode} `{command:?}`");
+        let output = command
+            .output()
+            .expect("failed to run litebox_runner_windows_userland");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            output.status.success(),
+            "{mode} runner failed to run kernel32-import PE; status {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            stdout,
+            stderr
+        );
+        assert!(
+            stdout.contains("hello world\n"),
+            "{mode} guest output was not captured\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
 }
 
 /// Runs a guest PE through the broker that creates and joins a child thread.
