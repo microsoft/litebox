@@ -132,6 +132,7 @@ enum ReceiveSocket<'a, Platform: ShimPlatform> {
 }
 
 impl<Platform: ShimPlatform> super::file::FilesState<Platform> {
+    #[cfg(target_os = "linux")]
     #[cfg(test)]
     pub(crate) fn try_pin_inet_socket<'a>(
         &self,
