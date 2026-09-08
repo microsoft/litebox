@@ -38,10 +38,11 @@ use litebox_platform::time::TimeProvider;
 
 #[cfg(target_arch = "aarch64")]
 const fn aarch64_rewrite_options() -> litebox_syscall_rewriter::RewriteOptions {
-    litebox_syscall_rewriter::RewriteOptions::new(
-        litebox_syscall_rewriter::TargetHost::Linux,
-        cfg!(feature = "aarch64_virtualize_x18"),
-    )
+    #[cfg(target_os = "macos")]
+    let host = litebox_syscall_rewriter::TargetHost::MacOs;
+    #[cfg(not(target_os = "macos"))]
+    let host = litebox_syscall_rewriter::TargetHost::Linux;
+    litebox_syscall_rewriter::RewriteOptions::new(host, cfg!(feature = "aarch64_virtualize_x18"))
 }
 
 /// On debug builds, logs that the user attempted to use an unsupported feature.

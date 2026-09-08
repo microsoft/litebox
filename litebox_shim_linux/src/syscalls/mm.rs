@@ -29,7 +29,7 @@ use litebox::utils::ReinterpretUnsignedExt as _;
 use litebox::utils::TruncateExt as _;
 use object::elf::{ET_DYN, FileHeader64, PT_LOAD, ProgramHeader64};
 use object::endian::LittleEndian;
-#[cfg(all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"))]
+#[cfg(target_arch = "aarch64")]
 use zerocopy::FromZeros as _;
 
 #[cfg(not(target_pointer_width = "64"))]
@@ -57,15 +57,19 @@ fn finalize_trampoline_gates(
     // Gates encode a scaled `u16`; the platform API remains pointer-width.
     let offset = u16::try_from(offset)
         .map_err(|_| format!("guest thread-pointer offset {offset} is too large for a gate"))?;
-    if cfg!(feature = "aarch64_virtualize_x18") {
+    let options = crate::aarch64_rewrite_options();
+    if options.virtualizes_x18() {
         let x18 = offset
             .checked_add(
                 u16::try_from(litebox_syscall_rewriter::aarch64::GUEST_X18_OFFSET_FROM_GUEST_TP)
                     .expect("guest x18 slot delta fits in a gate offset"),
             )
             .ok_or_else(|| alloc::string::String::from("guest x18 offset overflow"))?;
-        litebox_syscall_rewriter::aarch64::finalize_trampoline_gates_with_x18(
-            trampoline, offset, x18,
+        litebox_syscall_rewriter::aarch64::finalize_trampoline_gates_for_host(
+            trampoline,
+            offset,
+            x18,
+            options.target_host(),
         )
         .map_err(|e| format!("failed to patch guest offsets {offset}/{x18}: {e}"))
     } else {
@@ -95,6 +99,8 @@ pub(crate) struct ElfPatchState {
     trampoline_addr: usize,
     #[cfg(target_arch = "aarch64")]
     load_span: Option<Range<usize>>,
+    #[cfg(target_arch = "aarch64")]
+    trampoline_hole: Option<Range<usize>>,
     /// Current write position within the trampoline (byte offset from `trampoline_addr`).
     trampoline_cursor: usize,
     /// Whether the trampoline region has been allocated.
@@ -106,7 +112,7 @@ pub(crate) struct ElfPatchState {
     runtime_patches_committed: bool,
     #[cfg(target_arch = "aarch64")]
     trampoline_invalidated: bool,
-    #[cfg(all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"))]
+    #[cfg(target_arch = "aarch64")]
     code_metadata: Option<litebox_syscall_rewriter::aarch64::ElfCodeMetadata>,
     /// Tracks file-backed mappings for this fd as (vaddr, len) pairs.
     /// Used to find mappings that need patching when mprotect adds PROT_EXEC.
@@ -541,8 +547,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         result
     }
 
-    /// Applies `prot`, excluding AOT trampolines placed inside their load spans.
-    /// Runtime trampolines are outside the span and are not excluded.
+    /// Applies `prot`, excluding trampolines placed inside their load spans.
     #[cfg(target_arch = "aarch64")]
     fn mprotect_around_trampolines(
         &self,
@@ -764,6 +769,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let mut min_load_start: u64 = u64::MAX;
         let mut max_load_align: u64 = 0;
         let mut base_addr: Option<usize> = None;
+        #[cfg(target_arch = "aarch64")]
+        let mut load_segments = Vec::new();
         for i in 0..e_phnum {
             let ph_bytes = &phdrs_buf[i * e_phentsize..][..e_phentsize];
             let Ok((ph, _)) = object::from_bytes::<ProgramHeader64<LittleEndian>>(ph_bytes) else {
@@ -787,11 +794,25 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
             min_load_start = min_load_start.min(align_down(p_vaddr.trunc(), PAGE_SIZE) as u64);
             max_load_align = max_load_align.max(ph.p_align.get(ENDIAN));
+            #[cfg(target_arch = "aarch64")]
+            load_segments.push(litebox_syscall_rewriter::LoadSegment {
+                vaddr: p_vaddr,
+                filesz: ph.p_filesz.get(ENDIAN),
+                memsz: p_memsz,
+                align: ph.p_align.get(ENDIAN),
+            });
             // Match segment by page-aligned file offset to derive base address.
             if base_addr.is_none()
                 && align_down(p_offset, PAGE_SIZE) == align_down(file_offset, PAGE_SIZE)
             {
-                base_addr = Some(mapped_addr.wrapping_sub(p_vaddr.trunc()));
+                #[cfg(target_arch = "aarch64")]
+                {
+                    base_addr = mapped_addr.checked_sub(align_down(p_vaddr.trunc(), PAGE_SIZE));
+                }
+                #[cfg(not(target_arch = "aarch64"))]
+                {
+                    base_addr = Some(mapped_addr.wrapping_sub(p_vaddr.trunc()));
+                }
             }
         }
 
@@ -803,8 +824,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let (pre_patched, tramp_file_offset, tramp_vaddr, tramp_file_size) =
             self.check_trampoline_magic(fd);
 
-        #[cfg(all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"))]
-        let code_metadata = if pre_patched {
+        #[cfg(target_arch = "aarch64")]
+        let code_metadata = if pre_patched || !crate::aarch64_rewrite_options().virtualizes_x18() {
             None
         } else {
             self.sys_fstat(fd).ok().and_then(|stat| {
@@ -823,8 +844,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 }
             })
         };
-        #[cfg(all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"))]
-        if !pre_patched {
+        #[cfg(target_arch = "aarch64")]
+        if !pre_patched && crate::aarch64_rewrite_options().virtualizes_x18() {
             if let Some(metadata) = &code_metadata {
                 let (executable_bytes, identified_bytes) = metadata.coverage_bytes();
                 litebox_util_log::debug!(
@@ -844,10 +865,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // Compute the trampoline virtual address.
         // - Pre-patched: use the exact address from the trampoline header (the
         //   code already contains JMPs there, so we MUST map at this address).
-        // - Unpatched: use the architecture-specific fallback past the loader's
-        //   alignment slack. This is only a hint; the runtime path re-checks
-        //   the chosen address against the branch-reach limit below, and falls
-        //   back to traps.
+        // - Unpatched: compute an outside-span fallback. Reserved in-span
+        //   placement, when used, is selected below.
         // For ET_DYN, virtual addresses are relative to the load base.
         let trampoline_vaddr = if pre_patched {
             if e_type == ET_DYN {
@@ -867,11 +886,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             } else {
                 0
             };
-            // On x86-64, the fallback is the page-aligned end of the highest
-            // PT_LOAD segment.
-            // No trustworthy program-header view of a partially mapped file
-            // here, so take the `trampoline_addr_for` fallback rather than the
-            // hole `trampoline_placement_for` would pick.
             let Ok(offset) = litebox_syscall_rewriter::trampoline_addr_for(
                 max_load_end,
                 max_load_align,
@@ -880,7 +894,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 return;
             };
             let offset: usize = offset.trunc();
-            base + offset
+            base + align_up(offset, PAGE_SIZE)
         };
 
         // Never synthesize an ET_DYN span from an unknown base: it could cover
@@ -895,6 +909,27 @@ impl<Platform: ShimPlatform> Task<Platform> {
             Some(min_load_start.trunc()..align_up(max_load_end.trunc(), PAGE_SIZE))
         };
 
+        #[cfg(target_arch = "aarch64")]
+        let trampoline_hole = if pre_patched {
+            None
+        } else {
+            let base = if e_type == ET_DYN { base_addr } else { Some(0) };
+            base.and_then(|base| {
+                let (start, end) = litebox_syscall_rewriter::largest_inter_segment_hole(
+                    &load_segments,
+                    PAGE_SIZE as u64,
+                )?;
+                Some(
+                    base.checked_add(usize::try_from(start).ok()?)?
+                        ..base.checked_add(usize::try_from(end).ok()?)?,
+                )
+            })
+        };
+        #[cfg(target_arch = "aarch64")]
+        let trampoline_vaddr = trampoline_hole
+            .as_ref()
+            .map_or(trampoline_vaddr, |hole| hole.start);
+
         // Insert under lock (re-check for races).
         let mut cache = self.global.elf_patch_cache.lock();
         cache.entry(fd).or_insert(ElfPatchState {
@@ -904,13 +939,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
             trampoline_addr: trampoline_vaddr,
             #[cfg(target_arch = "aarch64")]
             load_span,
+            #[cfg(target_arch = "aarch64")]
+            trampoline_hole,
             trampoline_cursor: 0,
             trampoline_mapped: false,
             trampoline_mapped_len: 0,
             runtime_patches_committed: false,
             #[cfg(target_arch = "aarch64")]
             trampoline_invalidated: false,
-            #[cfg(all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"))]
+            #[cfg(target_arch = "aarch64")]
             code_metadata,
             file_mappings: BTreeSet::new(),
             patched_ranges: BTreeSet::new(),
@@ -997,6 +1034,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         len: usize,
         already_rw: bool,
         ranges: Option<&litebox_syscall_rewriter::aarch64::CodeScanRanges>,
+        excluded: Option<&core::ops::Range<usize>>,
     ) {
         if !already_rw {
             self.sys_mprotect_raw(
@@ -1037,9 +1075,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             );
         }
         assert!(
-            mapped_addr
-                .copy_from_slice::<Platform>(0, &code_buf)
-                .is_some(),
+            Self::write_patched_code(mapped_addr, &code_buf, excluded),
             "fatal: failed to write trap bytes back to code segment"
         );
 
@@ -1091,6 +1127,32 @@ impl<Platform: ShimPlatform> Task<Platform> {
             ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
         )
         .expect("fatal: failed to restore code segment to RX after trap fallback");
+    }
+
+    fn write_patched_code(
+        mapped_addr: UserPtrMut<u8>,
+        code: &[u8],
+        excluded: Option<&core::ops::Range<usize>>,
+    ) -> bool {
+        if let Some(excluded) = excluded {
+            let start = excluded
+                .start
+                .saturating_sub(mapped_addr.as_usize())
+                .min(code.len());
+            let end = excluded
+                .end
+                .saturating_sub(mapped_addr.as_usize())
+                .min(code.len());
+            if start < end {
+                return mapped_addr
+                    .copy_from_slice::<Platform>(0, &code[..start])
+                    .is_some()
+                    && mapped_addr
+                        .copy_from_slice::<Platform>(end, &code[end..])
+                        .is_some();
+            }
+        }
+        mapped_addr.copy_from_slice::<Platform>(0, code).is_some()
     }
 
     /// Patch an executable segment in-place after it has been mapped.
@@ -1214,18 +1276,27 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         // ── Runtime patching path (unpatched binaries) ───────────────
 
-        #[cfg(all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"))]
+        #[cfg(target_arch = "aarch64")]
+        let excluded = state.trampoline_hole.clone();
+        #[cfg(not(target_arch = "aarch64"))]
+        let excluded: Option<core::ops::Range<usize>> = None;
+
+        #[cfg(target_arch = "aarch64")]
         let scan_ranges = file_offset.and_then(|file_offset| {
             state
                 .code_metadata
                 .as_ref()
                 .and_then(|metadata| metadata.ranges_for_mapping(file_offset as u64, len).ok())
         });
-        #[cfg(all(target_arch = "aarch64", not(feature = "aarch64_virtualize_x18")))]
-        let scan_ranges: Option<litebox_syscall_rewriter::aarch64::CodeScanRanges> = None;
         #[cfg(target_arch = "aarch64")]
         let apply_trap_fallback = |mapped_addr, len, already_rw| {
-            self.apply_aarch64_trap_fallback(mapped_addr, len, already_rw, scan_ranges.as_ref());
+            self.apply_aarch64_trap_fallback(
+                mapped_addr,
+                len,
+                already_rw,
+                scan_ranges.as_ref(),
+                excluded.as_ref(),
+            );
         };
         #[cfg(target_arch = "x86_64")]
         let apply_trap_fallback = |mapped_addr, len, already_rw| {
@@ -1236,19 +1307,35 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let addr_usize = mapped_addr.as_usize();
         if !state.trampoline_mapped {
             let tramp_addr = state.trampoline_addr;
+            let initial_len = excluded.as_ref().map_or(PAGE_SIZE, ExactSizeIterator::len);
+            let fixed = if excluded.is_some() {
+                MapFlags::MAP_FIXED
+            } else {
+                MapFlags::MAP_FIXED_NOREPLACE
+            };
+            #[cfg(target_arch = "aarch64")]
+            if excluded.is_some()
+                && !self.trampoline_range_is_safe_to_map(state, tramp_addr, initial_len)
+            {
+                apply_trap_fallback(mapped_addr, len, false);
+                return true;
+            }
 
-            // Try MAP_FIXED_NOREPLACE first — works when the preferred
-            // trampoline address is available. If that fails, let the VM
-            // manager choose a free address and validate that it is still
-            // within JMP rel32 range below.
+            // Reserve the entire owned hole before generating code; host allocations
+            // made during rewriting must not consume space needed by later gates.
+            // Holes replace the object's existing reservation. Outside the
+            // object, use NOREPLACE and check any relocated mapping for reach.
             let actual_addr = self
                 .do_mmap_anonymous(
                     Some(tramp_addr),
-                    PAGE_SIZE,
+                    initial_len,
                     ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-                    MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
+                    MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | fixed,
                 )
-                .or_else(|_| {
+                .or_else(|error| {
+                    if excluded.is_some() {
+                        return Err(error);
+                    }
                     self.do_mmap_anonymous(
                         None,
                         PAGE_SIZE,
@@ -1272,7 +1359,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     distance:? = distance;
                     "trampoline too far from code segment, skipping patching"
                 );
-                let _ = self.sys_munmap_raw(UserPtrMut::<u8>::from_usize(actual_addr), PAGE_SIZE);
+                let _ = self.sys_munmap_raw(UserPtrMut::<u8>::from_usize(actual_addr), initial_len);
                 apply_trap_fallback(mapped_addr, len, false);
                 return true;
             }
@@ -1287,7 +1374,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 {
                     litebox_util_log::warn!("failed to write syscall entry point to trampoline");
                     let _ =
-                        self.sys_munmap_raw(UserPtrMut::<u8>::from_usize(actual_addr), PAGE_SIZE);
+                        self.sys_munmap_raw(UserPtrMut::<u8>::from_usize(actual_addr), initial_len);
                     apply_trap_fallback(mapped_addr, len, false);
                     return true;
                 }
@@ -1296,7 +1383,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 state.trampoline_cursor = 0;
             }
             state.trampoline_mapped = true;
-            state.trampoline_mapped_len = PAGE_SIZE;
+            state.trampoline_mapped_len = initial_len;
         }
 
         // Performance guard: skip if this exact range was already patched.
@@ -1425,6 +1512,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     return true;
                 };
                 let tramp_pages_needed = align_up(new_cursor, PAGE_SIZE);
+                if excluded
+                    .as_ref()
+                    .is_some_and(|hole| tramp_pages_needed > hole.len())
+                {
+                    litebox_util_log::warn!("runtime trampoline exceeds its ELF hole");
+                    apply_trap_fallback(mapped_addr, len, true);
+                    restore_trampoline_rx(self, state);
+                    return true;
+                }
                 if tramp_pages_needed > state.trampoline_mapped_len {
                     let extra_start = state.trampoline_addr + state.trampoline_mapped_len;
                     let extra_len = tramp_pages_needed - state.trampoline_mapped_len;
@@ -1465,11 +1561,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 }
 
                 // Write patched code back to the mapped region.
-                if mapped_addr
-                    .copy_from_slice::<Platform>(0, &code_buf)
-                    .is_none()
-                {
-                    let _ = mapped_addr.copy_from_slice::<Platform>(0, &original_code);
+                if !Self::write_patched_code(mapped_addr, &code_buf, excluded.as_ref()) {
+                    let _ =
+                        Self::write_patched_code(mapped_addr, &original_code, excluded.as_ref());
                     let _ = self.sys_mprotect_raw(
                         mapped_addr,
                         len,
@@ -1486,11 +1580,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 // have replaced unpatchable syscalls with trap instructions.
                 // Write back the modified code if it changed.
                 if code_buf != original_code
-                    && mapped_addr
-                        .copy_from_slice::<Platform>(0, &code_buf)
-                        .is_none()
+                    && !Self::write_patched_code(mapped_addr, &code_buf, excluded.as_ref())
                 {
-                    let _ = mapped_addr.copy_from_slice::<Platform>(0, &original_code);
+                    let _ =
+                        Self::write_patched_code(mapped_addr, &original_code, excluded.as_ref());
                     panic!("fatal: failed to write trap bytes back to code segment");
                 }
                 // Fall through to restore RX protections below.
@@ -1540,19 +1633,24 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
 #[cfg(test)]
 mod tests {
-    use litebox::{
-        fs::{Mode, OFlags},
-        platform::PageManagementProvider,
-    };
-    use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
+    use litebox::fs::{Mode, OFlags};
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    use litebox::platform::PageManagementProvider;
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    use litebox_common_linux::MRemapFlags;
+    use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno};
 
     use crate::syscalls::tests::TestPlatform as Platform;
     use crate::{UserPtrMut, syscalls::tests::init_platform};
 
-    /// Fail closed: an unpatched placeholder executes silently.
     #[cfg(target_arch = "aarch64")]
     mod aarch64_trampoline_gates {
         use litebox::platform::SystemInfoProvider;
+        use litebox_syscall_rewriter::{
+            RewriteOptions,
+            aarch64::{GateMetadata, MAX_GUEST_TPIDR_OFFSET, classify_copied_gate_slot_for_host},
+            patch_code_segment_with_options,
+        };
 
         struct StubPlatform(Option<usize>);
 
@@ -1568,141 +1666,152 @@ mod tests {
             }
         }
 
+        fn tpidr_load_offset(trampoline: &[u8]) -> u16 {
+            // The MRS fixture's LDR is at byte 20; its imm12 is scaled by eight.
+            let load = u32::from_le_bytes(trampoline[20..24].try_into().unwrap());
+            u16::try_from(((load >> 10) & 0xfff) * 8).unwrap()
+        }
+
         fn unpatched_trampoline() -> alloc::vec::Vec<u8> {
+            let options = crate::aarch64_rewrite_options();
             let mut code = 0xD53B_D049u32.to_le_bytes(); // MRS X9, TPIDR_EL0
             let (tramp, trapped) =
-                litebox_syscall_rewriter::patch_code_segment(&mut code, 0x1000, 0x400000, 0)
-                    .unwrap();
+                patch_code_segment_with_options(&mut code, 0x1000, 0x400000, 0, options).unwrap();
             assert!(trapped.is_empty());
-            assert_eq!(
-                litebox_syscall_rewriter::aarch64::find_guest_tpidr_placeholder(&tramp),
-                Some(16 + 4),
-                "the fixture must start out unpatched, or these tests prove nothing"
-            );
-            let classified =
-                litebox_syscall_rewriter::aarch64::classify_gate_pc(&tramp, 0x400000, 0x400010)
-                    .expect("emitted MRS slot must validate");
-            assert_eq!(classified.slot_offset(), 16);
+            assert_eq!(tpidr_load_offset(&tramp), MAX_GUEST_TPIDR_OFFSET);
+            let classified = classify_copied_gate_slot_for_host(
+                &tramp[16..],
+                0x400010,
+                0x400010,
+                options.target_host(),
+            )
+            .expect("emitted MRS slot must validate");
             assert!(matches!(
                 classified.metadata(),
-                litebox_syscall_rewriter::aarch64::GateMetadata::MrsTpidr { destination: 9, .. }
+                GateMetadata::MrsTpidr { destination: 9 }
             ));
             tramp
         }
 
-        #[cfg(feature = "aarch64_virtualize_x18")]
         #[test]
-        fn x18_gate_is_finalized_with_the_platform_offset() {
-            let mut code = 0xaa00_03f2u32.to_le_bytes(); // mov x18, x0
-            let options = litebox_syscall_rewriter::RewriteOptions::new(
-                litebox_syscall_rewriter::TargetHost::Linux,
-                true,
-            );
-            let (mut trampoline, trapped) =
-                litebox_syscall_rewriter::patch_code_segment_with_options(
-                    &mut code, 0x1000, 0x400000, 0, options,
-                )
-                .unwrap();
-            assert!(trapped.is_empty());
-
-            super::super::finalize_trampoline_gates(&StubPlatform(Some(96)), &mut trampoline)
-                .unwrap();
-
-            assert!(matches!(
-                litebox_syscall_rewriter::aarch64::classify_gate_pc(
-                    &trampoline,
-                    0x400000,
-                    0x400010,
-                )
-                .unwrap()
-                .metadata(),
-                litebox_syscall_rewriter::aarch64::GateMetadata::X18 { .. }
+        fn code_writeback_preserves_trampoline_hole() {
+            let mut buffer = [0xa5; 64];
+            let ptr = crate::UserPtrMut::from_ptr(buffer.as_mut_ptr());
+            let hole = ptr.as_usize() + 16..ptr.as_usize() + 48;
+            assert!(crate::Task::<super::Platform>::write_patched_code(
+                ptr,
+                &[0xcc; 64],
+                Some(&hole)
             ));
+            assert_eq!(&buffer[..16], &[0xcc; 16]);
+            assert_eq!(&buffer[16..48], &[0xa5; 32]);
+            assert_eq!(&buffer[48..], &[0xcc; 16]);
         }
 
-        /// Runtime gates receive the callback address, not a callback-slot address.
+        #[test]
+        fn x18_gate_matches_configured_policy() {
+            let options = crate::aarch64_rewrite_options();
+            let mut code = 0xaa00_03f2u32.to_le_bytes(); // mov x18, x0
+            let (mut trampoline, trapped) = patch_code_segment_with_options(
+                &mut code,
+                0x1000,
+                0x400000,
+                0,
+                RewriteOptions::new(options.target_host(), true),
+            )
+            .unwrap();
+            assert!(trapped.is_empty());
+            let before = trampoline.clone();
+            let result =
+                super::super::finalize_trampoline_gates(&StubPlatform(Some(96)), &mut trampoline);
+            if options.virtualizes_x18() {
+                result.unwrap();
+                assert!(matches!(
+                    classify_copied_gate_slot_for_host(
+                        &trampoline[16..],
+                        0x400010,
+                        0x400010,
+                        options.target_host(),
+                    )
+                    .unwrap()
+                    .metadata(),
+                    GateMetadata::X18 { .. }
+                ));
+            } else {
+                assert!(result.is_err());
+                assert_eq!(trampoline, before);
+            }
+        }
+
         #[test]
         fn the_runtime_paths_argument_shape_produces_installable_gates() {
             const TRAMPOLINE_BASE: u64 = 0x40_0000;
             const SYSCALL_ENTRY: u64 = 0xDEAD_0000;
-            const GUEST_THREAD_POINTER_OFFSET: usize = 96;
-
+            let options = crate::aarch64_rewrite_options();
             let mut code = 0xD400_0001u32.to_le_bytes(); // SVC #0
-            let (mut stubs, trapped) = litebox_syscall_rewriter::patch_code_segment(
+            let (mut stubs, trapped) = patch_code_segment_with_options(
                 &mut code,
                 0x1000,
                 TRAMPOLINE_BASE,
                 SYSCALL_ENTRY,
+                options,
             )
-            .expect("a gate-aligned base and a real callback must be accepted");
+            .unwrap();
             assert!(trapped.is_empty());
-
             assert_eq!(
                 u64::from_le_bytes(stubs[..8].try_into().unwrap()),
                 SYSCALL_ENTRY
             );
-
-            super::super::finalize_trampoline_gates(
-                &StubPlatform(Some(GUEST_THREAD_POINTER_OFFSET)),
-                &mut stubs,
-            )
-            .expect("runtime gates must be patchable exactly like ahead-of-time ones");
-            assert_eq!(
-                litebox_syscall_rewriter::aarch64::find_guest_tpidr_placeholder(&stubs),
-                None
-            );
-            litebox_syscall_rewriter::aarch64::classify_gate_pc(
-                &stubs,
-                TRAMPOLINE_BASE,
-                TRAMPOLINE_BASE + 16,
-            )
-            .expect("the installed gate must classify at runtime");
-
+            super::super::finalize_trampoline_gates(&StubPlatform(Some(96)), &mut stubs).unwrap();
+            assert!(matches!(
+                classify_copied_gate_slot_for_host(
+                    &stubs[16..],
+                    TRAMPOLINE_BASE + 16,
+                    TRAMPOLINE_BASE + 16,
+                    options.target_host(),
+                )
+                .unwrap()
+                .metadata(),
+                GateMetadata::Svc
+            ));
             let mut code = 0xD400_0001u32.to_le_bytes();
             assert!(
-                litebox_syscall_rewriter::patch_code_segment(
+                patch_code_segment_with_options(
                     &mut code,
                     0x1000,
                     TRAMPOLINE_BASE + 8,
                     TRAMPOLINE_BASE,
+                    options,
                 )
-                .is_err(),
-                "a base-relative callback has to be rejected, or this test proves nothing"
+                .is_err()
             );
         }
 
         #[test]
         fn a_supplied_offset_is_baked_into_every_gate() {
             let mut tramp = unpatched_trampoline();
-            super::super::finalize_trampoline_gates(&StubPlatform(Some(96)), &mut tramp)
-                .expect("a well-formed trampoline and a valid offset must be accepted");
-            assert_eq!(
-                litebox_syscall_rewriter::aarch64::find_guest_tpidr_placeholder(&tramp),
-                None
-            );
+            super::super::finalize_trampoline_gates(&StubPlatform(Some(96)), &mut tramp).unwrap();
+            assert_eq!(tpidr_load_offset(&tramp), 96);
         }
 
         #[test]
         fn a_platform_with_no_offset_is_refused() {
             let mut tramp = unpatched_trampoline();
+            let before = tramp.clone();
             let err = super::super::finalize_trampoline_gates(&StubPlatform(None), &mut tramp)
-                .expect_err(
-                    "an AArch64 platform that supplies no offset must be fatal for the \
-                         binary, not a silent skip",
-                );
+                .unwrap_err();
             assert!(err.contains("no guest thread-pointer offset"), "{err}");
-            assert_eq!(
-                litebox_syscall_rewriter::aarch64::find_guest_tpidr_placeholder(&tramp),
-                Some(16 + 4)
-            );
+            assert_eq!(tramp, before);
         }
 
         #[test]
         fn an_offset_no_gate_can_encode_is_refused() {
             let mut tramp = unpatched_trampoline();
+            let before = tramp.clone();
             let err = super::super::finalize_trampoline_gates(&StubPlatform(Some(4)), &mut tramp)
-                .expect_err("an offset the gates' scaled immediate cannot hold is fatal");
+                .unwrap_err();
             assert!(err.contains("failed to patch"), "{err}");
+            assert_eq!(tramp, before);
         }
     }
 

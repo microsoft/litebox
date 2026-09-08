@@ -58,7 +58,7 @@ jobs:
           key: custom-out-${{ runner.os }}-${{ github.job }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('**/litebox_syscall_rewriter/**/*.rs') }}
       - run: ./.github/tools/github_actions_run_cargo fmt
       - run: |
-          ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_snp --exclude litebox_runner_optee_on_linux_userland
+          ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_snp --exclude litebox_runner_optee_on_linux_userland --exclude litebox_runner_linux_on_macos_userland
           ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features -p litebox_runner_optee_on_linux_userland
           # We exclude `litebox_runner_lvbs` because it requires a custom target and nightly
           # features. `build_and_test_lvbs` covers it.
@@ -76,7 +76,7 @@ jobs:
           # aren't included in nextest at the moment. See relevant discussion at
           # https://github.com/nextest-rs/nextest/issues/16
       - name: Build documentation (fail on warnings)
-        run: ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_snp
+        run: ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_snp --exclude litebox_runner_linux_on_macos_userland
 
   build_and_test_arm64:
     name: Build and Test (AArch64)
@@ -124,19 +124,43 @@ jobs:
       - run: ./.github/tools/github_actions_run_cargo fmt
       - run: |
           ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features $AARCH64_CRATES
-      - run: ./.github/tools/github_actions_run_cargo build $AARCH64_CRATES
-      - run: ./.github/tools/github_actions_run_cargo nextest $AARCH64_CRATES
+      - run: ./.github/tools/github_actions_run_cargo build $AARCH64_CRATES --features litebox_common_linux/aarch64_gate_recovery
+      - run: ./.github/tools/github_actions_run_cargo nextest $AARCH64_CRATES --features litebox_common_linux/aarch64_gate_recovery
       - name: Test AArch64 x18 virtualization
         run: |
           ./.github/tools/github_actions_run_cargo nextest -p litebox_syscall_rewriter -p litebox_platform_linux_userland -p litebox_shim_linux --features litebox_platform_linux_userland/aarch64_virtualize_x18,litebox_shim_linux/aarch64_virtualize_x18
           ./.github/tools/github_actions_run_cargo nextest -p litebox_runner_linux_userland --features litebox_runner_linux_userland/aarch64_virtualize_x18 -E 'binary(run) or binary(rewritten_guests)'
       # Nextest does not run doctests.
       - run: |
-          ./.github/tools/github_actions_run_cargo test --doc $AARCH64_CRATES
+          ./.github/tools/github_actions_run_cargo test --doc $AARCH64_CRATES --features litebox_common_linux/aarch64_gate_recovery
       - name: Build documentation (fail on warnings)
         env:
           RUSTDOCFLAGS: -Dwarnings
         run: ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items $AARCH64_CRATES
+
+  build_and_test_macos_arm64:
+    name: Build and Test (Apple Silicon)
+    runs-on: macos-15
+    env:
+      RUSTFLAGS: -Dwarnings
+      RUSTDOCFLAGS: -Dwarnings
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Verify Apple Silicon and set up Rust
+        run: |
+          test "$(uname -m)" = arm64
+          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --component rustfmt,clippy
+      - name: Set up Nextest
+        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2.86.5
+        with:
+          tool: nextest@${{ env.NEXTEST_VERSION }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo clippy -p litebox_platform_macos_userland -p litebox_runner_linux_on_macos_userland --all-targets -- -D warnings
+      - run: ./.github/tools/github_actions_run_cargo nextest -p litebox -p litebox_common_linux --lib --features litebox_common_linux/aarch64_gate_recovery
+      - run: ./.github/tools/github_actions_run_cargo nextest -p litebox_platform_macos_userland -p litebox_runner_linux_on_macos_userland
+      # Nextest does not run doctests.
+      - run: ./.github/tools/github_actions_run_cargo test --doc -p litebox_platform_macos_userland -p litebox_runner_linux_on_macos_userland
 
   build_and_test_lvbs:
     name: Build and Test LVBS
@@ -298,6 +322,9 @@ jobs:
           # - `litebox_platform_linux_userland` is allowed to have `std` access,
           #   since it is a purely-userland implementation.
           #
+          # - `litebox_platform_macos_userland` is allowed to have `std` access,
+          #   since it is a purely-userland implementation.
+          #
           # - `litebox_platform_windows_userland` is allowed to have `std` access,
           #   since it is a purely-userland implementation.
           #
@@ -332,6 +359,9 @@ jobs:
           #   has access, and this is just a multiplexer. Ideally, we'd do a
           #   more precise check, but as long as we are tracking the underlying
           #   platforms, we are unlikely to hit any significant issues here.
+          #
+          # - `litebox_runner_linux_on_macos_userland` is allowed to have `std`
+          #   access since it loads files and runs LiteBox on a hosted platform.
           #
           # - `litebox_runner_linux_on_windows_userland` is allowed to have `std`
           #   access since it needs to actually access the file-system, pull in
@@ -392,7 +422,9 @@ jobs:
             -not -path './litebox_broker_userland/Cargo.toml' \
             -not -path './litebox_egress_proxy/Cargo.toml' \
             -not -path './litebox_platform_linux_userland/Cargo.toml' \
+            -not -path './litebox_platform_macos_userland/Cargo.toml' \
             -not -path './litebox_platform_windows_userland/Cargo.toml' \
+            -not -path './litebox_runner_linux_on_macos_userland/Cargo.toml' \
             -not -path './litebox_runner_linux_on_windows_userland/Cargo.toml' \
             -not -path './litebox_runner_windows_on_linux_userland/Cargo.toml' \
             -not -path './litebox_platform_lvbs/Cargo.toml' \

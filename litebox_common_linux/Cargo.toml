@@ -13,5 +13,11 @@ int-enum = "1.2.0"
 syscalls = { version = "0.6", default-features = false }
 zerocopy = { version = "0.8", features = ["derive", "alloc"] }
 
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+litebox_syscall_rewriter = { path = "../litebox_syscall_rewriter", version = "0.1.0", default-features = false, optional = true }
+
+[features]
+aarch64_gate_recovery = ["dep:litebox_syscall_rewriter"]
+
 [lints]
 workspace = true

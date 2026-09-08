@@ -238,6 +238,7 @@ impl From<litebox::platform::page_mgmt::AllocationError> for Errno {
             litebox::platform::page_mgmt::AllocationError::Unaligned
             | litebox::platform::page_mgmt::AllocationError::AboveMaxAddress => Errno::EINVAL,
             litebox::platform::page_mgmt::AllocationError::BelowMinAddress => Errno::EPERM,
+            litebox::platform::page_mgmt::AllocationError::PermissionDenied => Errno::EACCES,
             litebox::platform::page_mgmt::AllocationError::OutOfMemory
             | litebox::platform::page_mgmt::AllocationError::AddressPartiallyInUse
             | litebox::platform::page_mgmt::AllocationError::AddressInUseByPlatform => {
@@ -300,6 +301,7 @@ impl From<litebox::platform::page_mgmt::RemapError> for Errno {
             litebox::platform::page_mgmt::RemapError::AlreadyAllocated
             | litebox::platform::page_mgmt::RemapError::AlreadyUnallocated => Errno::EFAULT,
             litebox::platform::page_mgmt::RemapError::OutOfMemory => Errno::ENOMEM,
+            litebox::platform::page_mgmt::RemapError::PermissionDenied => Errno::EACCES,
             _ => unimplemented!(),
         }
     }
@@ -309,7 +311,10 @@ impl From<litebox::platform::page_mgmt::PermissionUpdateError> for Errno {
     fn from(value: litebox::platform::page_mgmt::PermissionUpdateError) -> Self {
         match value {
             litebox::platform::page_mgmt::PermissionUpdateError::Unaligned => Errno::EINVAL,
-            litebox::platform::page_mgmt::PermissionUpdateError::Unallocated => Errno::ENOMEM,
+            litebox::platform::page_mgmt::PermissionUpdateError::Unallocated
+            | litebox::platform::page_mgmt::PermissionUpdateError::OutOfMemory => Errno::ENOMEM,
+            litebox::platform::page_mgmt::PermissionUpdateError::PermissionDenied => Errno::EACCES,
+            litebox::platform::page_mgmt::PermissionUpdateError::PlatformFailure => Errno::EIO,
             _ => unimplemented!(),
         }
     }

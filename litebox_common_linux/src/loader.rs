@@ -195,6 +195,12 @@ impl ElfParsedFile {
             return Err(ElfParseError::UnsupportedType);
         }
 
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if header.e_type != elf::abi::ET_DYN {
+            // Preserve __PAGEZERO.
+            return Err(ElfParseError::UnsupportedType);
+        }
+
         // Read the program headers.
         let phent_size = if cfg!(target_pointer_width = "64") {
             size_of::<elf::segment::Elf64_Phdr>()
@@ -213,6 +219,35 @@ impl ElfParsedFile {
         let mut phdrs = alloc::vec![0u8; usize::from(phdr_size)];
         file.read_at(header.e_phoff, &mut phdrs)
             .map_err(ElfParseError::Io)?;
+
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            // Reject LOADs that overlap after native-page alignment.
+            let mut ranges = alloc::vec::Vec::new();
+            let table = elf::segment::SegmentTable::new(header.endianness, CLASS, &phdrs);
+            for ph in table
+                .iter()
+                .filter(|ph| ph.p_type == elf::abi::PT_LOAD && ph.p_memsz != 0)
+            {
+                let page = PAGE_SIZE as u64;
+                let end = ph
+                    .p_vaddr
+                    .checked_add(ph.p_memsz)
+                    .and_then(|end| end.checked_next_multiple_of(page))
+                    .ok_or(ElfParseError::BadFormat)?;
+                let start = ph.p_vaddr & !(page - 1);
+                if ph.p_offset % page != ph.p_vaddr % page
+                    || ph.p_flags & (elf::abi::PF_W | elf::abi::PF_X)
+                        == (elf::abi::PF_W | elf::abi::PF_X)
+                    || ranges
+                        .iter()
+                        .any(|r: &core::ops::Range<u64>| r.start < end && start < r.end)
+                {
+                    return Err(ElfParseError::BadFormat);
+                }
+                ranges.push(start..end);
+            }
+        }
 
         Ok(ElfParsedFile {
             header,
@@ -322,8 +357,8 @@ impl ElfParsedFile {
             return Ok(());
         }
 
-        // Verify the file offset is page-aligned (as required by the rewriter)
-        if !file_offset.is_multiple_of(PAGE_SIZE as u64) {
+        // Trampoline file offsets use 4 KiB alignment, independent of host pages.
+        if !file_offset.is_multiple_of(4096) {
             return Err(ElfParseError::BadTrampoline);
         }
 

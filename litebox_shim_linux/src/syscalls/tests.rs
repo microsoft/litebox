@@ -44,17 +44,28 @@ const TEST_TAR_FILE: &[u8] = include_bytes!("../../../litebox/src/fs/test.tar");
 /// The concrete platform used by the shim's unit tests.
 ///
 /// This is selected by the build target so the tests can run against whichever
-/// userland platform matches the host (Linux or Windows) rather than being
+/// userland platform matches the host rather than being
 /// hard-wired to one.
 #[cfg(target_os = "linux")]
 pub(crate) use litebox_platform_linux_userland::LinuxUserland as TestPlatform;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use litebox_platform_macos_userland::MacosUserland as TestPlatform;
 #[cfg(target_os = "windows")]
 pub(crate) use litebox_platform_windows_userland::WindowsUserland as TestPlatform;
 
 /// Returns the process-wide test platform, initializing it once.
 pub(crate) fn test_platform() -> &'static TestPlatform {
     static PLATFORM: std::sync::OnceLock<&'static TestPlatform> = std::sync::OnceLock::new();
-    PLATFORM.get_or_init(TestPlatform::new)
+    PLATFORM.get_or_init(|| {
+        #[cfg(target_os = "macos")]
+        {
+            TestPlatform::new().unwrap()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            TestPlatform::new()
+        }
+    })
 }
 
 fn test_broker() -> &'static BrokerCore {

@@ -15,10 +15,10 @@
 //! This crate currently supports x86-64 ELFs for syscall hooking and x86-64 PEs for syscall
 //! hooking plus rewriting Windows TEB accesses from GS segment overrides to FS segment overrides.
 //!
-//! It also supports AArch64 ELFs. Linux has complete syscall, guest
-//! thread-pointer, and optional x18 virtualization. macOS and Windows target
-//! selection currently provides x18-only host-anchor emission scaffolding;
-//! there is no in-tree loader/runtime for those artifacts.
+//! It also supports AArch64 ELFs with syscall and guest thread-pointer gates
+//! on Linux and macOS. Guest x18 virtualization is optional on Linux and always
+//! enabled on macOS. Windows target selection still provides only x18 host-anchor
+//! emission scaffolding, without an in-tree AArch64 runtime.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
@@ -135,8 +135,7 @@ pub enum TargetHost {
     /// Linux, using `TPIDR_EL0` as the host per-thread anchor.
     #[default]
     Linux,
-    /// Experimental macOS emission using `TPIDRRO_EL0` as the host anchor.
-    /// No in-tree macOS runtime consumes these artifacts.
+    /// macOS, using `TPIDRRO_EL0` as the host anchor. Guest x18 is virtualized.
     MacOs,
     /// Experimental Windows emission using physical `x18` as the host anchor.
     /// No in-tree AArch64 Windows runtime consumes these artifacts.
@@ -161,12 +160,12 @@ impl RewriteOptions {
     }
 
     /// Returns the selected AArch64 host ABI.
-    const fn target_host(self) -> TargetHost {
+    pub const fn target_host(self) -> TargetHost {
         self.target_host
     }
 
     /// Returns whether AArch64 guest `x18` accesses must be virtualized.
-    const fn effective_virtualize_x18(self) -> bool {
+    pub const fn virtualizes_x18(self) -> bool {
         self.virtualize_x18
     }
 }
@@ -359,7 +358,7 @@ pub fn hook_syscalls_in_elf_with_options(
             return Ok(input_binary.to_vec());
         }
 
-        let placement = find_addr_for_trampoline_code(&file)?;
+        let placement = find_addr_for_trampoline_code(&file, options.target_host())?;
 
         (arch, text_sections, aarch64_code_sections, placement)
     };
@@ -1031,7 +1030,7 @@ fn hook_aarch64_elf_at(
         sections.code,
         trampoline_base_addr,
         callback,
-        aarch64::RewriteConfig::new(options.target_host(), options.effective_virtualize_x18()),
+        aarch64::RewriteConfig::new(options.target_host(), options.virtualizes_x18()),
     )?
     else {
         // No patch sites: emit the original binary with a size-0 sentinel
@@ -1771,7 +1770,7 @@ pub fn patch_aarch64_code_segment_with_options_and_ranges(
         &identified,
         trampoline_write_vaddr,
         syscall_entry_addr,
-        aarch64::RewriteConfig::new(options.target_host(), options.effective_virtualize_x18()),
+        aarch64::RewriteConfig::new(options.target_host(), options.virtualizes_x18()),
     )?
     else {
         return Ok((Vec::new(), Vec::new()));
@@ -1877,12 +1876,13 @@ pub fn trap_all_aarch64_patch_sites_with_options_and_ranges(
         code,
         &executable,
         &identified,
-        aarch64::RewriteConfig::new(options.target_host(), options.effective_virtualize_x18()),
+        aarch64::RewriteConfig::new(options.target_host(), options.virtualizes_x18()),
     )
 }
 
 /// The guest page size assumed when laying out the appended trampoline.
 pub(crate) const TRAMPOLINE_PAGE_SIZE: u64 = 0x1000;
+const MACOS_TRAMPOLINE_ALIGNMENT: u64 = 16 * 1024;
 
 /// The address past the object's last `PT_LOAD` where an appended trampoline
 /// goes. `max_load_end` is the highest `p_vaddr + p_memsz`, `max_align` the
@@ -1914,7 +1914,7 @@ pub fn trampoline_addr_for(max_load_end: u64, max_align: u64, e_machine: u16) ->
 
 /// A `PT_LOAD` segment, reduced to the fields trampoline placement needs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct LoadSegment {
+pub struct LoadSegment {
     /// `p_vaddr`.
     pub vaddr: u64,
     /// `p_filesz`.
@@ -1982,11 +1982,9 @@ impl TrampolinePlacement {
 /// [`TrampolinePlacement::InsideLoadSpan`]. No program header covers the
 /// trampoline, so it must land in space the dynamic loader already reserved for
 /// *this* object: glibc reserves the whole first-`mapstart` to last-`allocend`
-/// span, so the gaps AArch64 objects leave (linked for 64 KiB pages, run with a
-/// 4 KiB `AT_PAGESZ`) belong to the object for its lifetime. Addresses past the
-/// last segment are unreserved and routinely owned by a neighboring object. The
-/// gap is exact because LiteBox pins the guest's `AT_PAGESZ` to
-/// [`TRAMPOLINE_PAGE_SIZE`].
+/// span. Gap boundaries use the guest's page size, so they never include a
+/// page occupied by a LOAD segment. Addresses past the last segment are
+/// unreserved and may belong to a neighboring object.
 ///
 /// An object with no usable gap falls back to [`trampoline_addr_for`], reported
 /// as [`TrampolinePlacement::PastLastSegment`] so the caller knows the address
@@ -1994,14 +1992,20 @@ impl TrampolinePlacement {
 pub(crate) fn trampoline_placement_for(
     segments: &[LoadSegment],
     e_machine: u16,
+    page_size: u64,
 ) -> Result<TrampolinePlacement> {
+    if !page_size.is_power_of_two() {
+        return Err(Error::ParseError("invalid trampoline page size".into()));
+    }
     let max_load_end = segments
         .iter()
         .filter_map(|s| s.vaddr.checked_add(s.memsz))
         .max()
         .ok_or_else(|| Error::ParseError("no PT_LOAD segments found".into()))?;
     let max_align = segments.iter().map(|s| s.align).max().unwrap_or(0);
-    let fallback_addr = trampoline_addr_for(max_load_end, max_align, e_machine)?;
+    let fallback_addr = trampoline_addr_for(max_load_end, max_align, e_machine)?
+        .checked_next_multiple_of(page_size)
+        .ok_or_else(|| Error::AddressOverflow("trampoline address".into()))?;
     let fallback = TrampolinePlacement::PastLastSegment {
         addr: fallback_addr,
     };
@@ -2012,7 +2016,7 @@ pub(crate) fn trampoline_placement_for(
     }
 
     Ok(
-        largest_inter_segment_hole(segments).map_or(fallback, |(start, end)| {
+        largest_inter_segment_hole(segments, page_size).map_or(fallback, |(start, end)| {
             TrampolinePlacement::InsideLoadSpan {
                 addr: start,
                 limit: end - start,
@@ -2030,8 +2034,10 @@ pub(crate) fn trampoline_placement_for(
 /// `_dl_map_segments` maps anonymous pages over the difference for any segment
 /// whose `p_memsz` exceeds its `p_filesz`, not only the last one, so counting
 /// only `p_filesz` would open a gap that is actually backed.
-fn largest_inter_segment_hole(segments: &[LoadSegment]) -> Option<(u64, u64)> {
-    let page = TRAMPOLINE_PAGE_SIZE;
+pub fn largest_inter_segment_hole(segments: &[LoadSegment], page: u64) -> Option<(u64, u64)> {
+    if !page.is_power_of_two() {
+        return None;
+    }
     let mut sorted: Vec<&LoadSegment> = segments.iter().collect();
     sorted.sort_unstable_by_key(|s| s.vaddr);
 
@@ -2058,14 +2064,20 @@ fn largest_inter_segment_hole(segments: &[LoadSegment]) -> Option<(u64, u64)> {
     best
 }
 
-fn find_addr_for_trampoline_code(file: &object::File<'_>) -> Result<TrampolinePlacement> {
+fn find_addr_for_trampoline_code(
+    file: &object::File<'_>,
+    host: TargetHost,
+) -> Result<TrampolinePlacement> {
     let object::File::Elf64(elf) = file else {
         unreachable!()
     };
-    trampoline_placement_for(
-        &elf_load_segments(file),
-        elf.elf_header().e_machine.get(elf.endian()),
-    )
+    let machine = elf.elf_header().e_machine.get(elf.endian());
+    let page = if machine == object::elf::EM_AARCH64 && host == TargetHost::MacOs {
+        MACOS_TRAMPOLINE_ALIGNMENT
+    } else {
+        TRAMPOLINE_PAGE_SIZE
+    };
+    trampoline_placement_for(&elf_load_segments(file), machine, page)
 }
 
 /// Collects the `PT_LOAD` segments of `file` in program-header order.
@@ -2408,6 +2420,82 @@ fn hook_syscall_and_after(
 mod tests {
     use super::*;
 
+    #[test]
+    fn macos_trampolines_use_owned_native_page_holes() {
+        let segments = [
+            seg(0, 0x18213c, 0x18213c, 0x10000),
+            seg(0x19d2b0, 0x64398, 0x70d20, 0x10000),
+        ];
+        let placement = trampoline_placement_for(
+            &segments,
+            object::elf::EM_AARCH64,
+            MACOS_TRAMPOLINE_ALIGNMENT,
+        )
+        .unwrap();
+        assert_eq!(
+            placement,
+            TrampolinePlacement::InsideLoadSpan {
+                addr: 0x184000,
+                limit: 0x18000,
+                fallback_addr: 0x220000
+            },
+        );
+        let input = 0xd4000001u32.to_le_bytes();
+        let mut code = input;
+        let sections = [TextSectionInfo {
+            vaddr: 0x1000,
+            file_offset: 0,
+            size: 4,
+        }];
+        let output = hook_aarch64_elf(
+            &input,
+            &mut code,
+            aarch64::ScanSections {
+                executable: &sections,
+                code: &sections,
+            },
+            placement,
+            0,
+            RewriteOptions::new(TargetHost::MacOs, true),
+        )
+        .unwrap();
+        let footer = TrampolineHeader64::read_from_bytes(&output[output.len() - 32..]).unwrap();
+        let vaddr = footer.vaddr;
+        assert_eq!(vaddr, 0x184000);
+
+        // A larger 4 KiB gap need not contain any complete 16 KiB page.
+        let segments = [
+            seg(0, 0x1000, 0x1000, 0x1000),
+            seg(0x6000, 0x1000, 0x1000, 0x1000),
+            seg(0xc000, 0x1000, 0x1000, 0x1000),
+        ];
+        assert_eq!(
+            largest_inter_segment_hole(&segments, MACOS_TRAMPOLINE_ALIGNMENT),
+            Some((0x8000, 0xc000))
+        );
+        assert_eq!(
+            largest_inter_segment_hole(&segments[..2], MACOS_TRAMPOLINE_ALIGNMENT),
+            None
+        );
+        assert_eq!(largest_inter_segment_hole(&segments, 0), None);
+    }
+
+    #[test]
+    fn x18_policy_is_normalized_by_rewrite_options() {
+        for (host, requested, expected) in [
+            (TargetHost::Linux, false, false),
+            (TargetHost::Linux, true, true),
+            (TargetHost::MacOs, false, true),
+            (TargetHost::MacOs, true, true),
+            (TargetHost::Windows, false, true),
+            (TargetHost::Windows, true, true),
+        ] {
+            let options = RewriteOptions::new(host, requested);
+            assert_eq!(options.target_host(), host);
+            assert_eq!(options.virtualizes_x18(), expected);
+        }
+    }
+
     fn seg(vaddr: u64, filesz: u64, memsz: u64, align: u64) -> LoadSegment {
         LoadSegment {
             vaddr,
@@ -2502,7 +2590,8 @@ mod tests {
         let mut collisions = Vec::new();
         for obj in &objects {
             let placement =
-                trampoline_placement_for(&obj.segs, object::elf::EM_AARCH64).expect("placement");
+                trampoline_placement_for(&obj.segs, object::elf::EM_AARCH64, TRAMPOLINE_PAGE_SIZE)
+                    .expect("placement");
             let tramp = (
                 obj.base + placement.addr(),
                 obj.base
@@ -2544,7 +2633,8 @@ mod tests {
     fn placement_is_inside_the_objects_own_reservation() {
         for obj in &python_objects() {
             let placement =
-                trampoline_placement_for(&obj.segs, object::elf::EM_AARCH64).expect("placement");
+                trampoline_placement_for(&obj.segs, object::elf::EM_AARCH64, TRAMPOLINE_PAGE_SIZE)
+                    .expect("placement");
             let span_end = obj
                 .segs
                 .iter()
@@ -2591,7 +2681,8 @@ mod tests {
                 .find(|o| o.name == name)
                 .unwrap();
             let placement =
-                trampoline_placement_for(&obj.segs, object::elf::EM_AARCH64).expect("placement");
+                trampoline_placement_for(&obj.segs, object::elf::EM_AARCH64, TRAMPOLINE_PAGE_SIZE)
+                    .expect("placement");
             let TrampolinePlacement::InsideLoadSpan { addr, limit, .. } = placement else {
                 panic!("{name}: expected a hole inside the load span");
             };
@@ -2612,7 +2703,8 @@ mod tests {
             seg(0x0, 0x1000, 0x1000, 0x10000),
             seg(0x1000, 0x100, 0x100, 0x10000),
         ];
-        let placement = trampoline_placement_for(&segs, object::elf::EM_AARCH64).unwrap();
+        let placement =
+            trampoline_placement_for(&segs, object::elf::EM_AARCH64, TRAMPOLINE_PAGE_SIZE).unwrap();
         assert!(matches!(
             placement,
             TrampolinePlacement::PastLastSegment { .. }
@@ -2772,7 +2864,8 @@ mod tests {
     fn placement_leaves_x86_64_alone() {
         for obj in &python_objects() {
             let placement =
-                trampoline_placement_for(&obj.segs, object::elf::EM_X86_64).expect("placement");
+                trampoline_placement_for(&obj.segs, object::elf::EM_X86_64, TRAMPOLINE_PAGE_SIZE)
+                    .expect("placement");
             assert!(matches!(
                 placement,
                 TrampolinePlacement::PastLastSegment { .. }

@@ -32,10 +32,14 @@ impl crate::platform::RawPointerProvider for DummyVmemBackend {
 impl crate::platform::PageManagementProvider<PAGE_SIZE> for DummyVmemBackend {
     #[cfg(target_os = "linux")]
     const TASK_ADDR_MIN: usize = 0x1_0000; // default linux config
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    const TASK_ADDR_MIN: usize = 0x1_0000; // Test backend only; no Darwin mappings are made.
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000; // (1 << 47) - PAGE_SIZE;
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     const TASK_ADDR_MAX: usize = 0xFFFF_FFFF_F000; // 48-bit VA space
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    const TASK_ADDR_MAX: usize = 0xFFFF_FFFF_C000; // 48-bit, 16 KiB-aligned
 
     fn allocate_pages(
         &self,

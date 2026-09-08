@@ -1587,6 +1587,7 @@ dependencies = [
  "elf",
  "int-enum",
  "litebox",
+ "litebox_syscall_rewriter",
  "syscalls",
  "thiserror",
  "zerocopy",
@@ -1733,6 +1734,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_platform_macos_userland"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "litebox",
+ "litebox_common_linux",
+ "litebox_platform",
+ "litebox_syscall_rewriter",
+ "zerocopy",
+]
+
+[[package]]
 name = "litebox_platform_multiplex"
 version = "0.1.0"
 dependencies = [
@@ -1754,6 +1767,22 @@ dependencies = [
  "litebox_platform",
  "windows-sys 0.60.2",
  "zerocopy",
+]
+
+[[package]]
+name = "litebox_runner_linux_on_macos_userland"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "litebox",
+ "litebox_common_linux",
+ "litebox_platform_macos_userland",
+ "litebox_shim_linux",
+ "litebox_syscall_rewriter",
+ "litebox_util_log",
+ "tempfile",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1932,6 +1961,7 @@ dependencies = [
  "litebox_common_linux",
  "litebox_platform",
  "litebox_platform_linux_userland",
+ "litebox_platform_macos_userland",
  "litebox_platform_windows_userland",
  "litebox_syscall_rewriter",
  "litebox_util_log",

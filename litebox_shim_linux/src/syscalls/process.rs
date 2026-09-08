@@ -2105,6 +2105,7 @@ mod tests {
         });
     }
 
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     #[test]
     fn test_timer_delivers_correct_signal() {
         use litebox::platform::{TimerHandle as _, TimerProvider as _};
