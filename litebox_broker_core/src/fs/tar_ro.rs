@@ -212,10 +212,7 @@ impl super::backend::Backend for TarRo {
     ) -> Result<usize, ReadError> {
         let file = self.tar_index.file_data(h.get_typed::<Self>().idx);
         let start = offset.min(file.len());
-        let end = offset
-            .checked_add(buf.len())
-            .ok_or(ReadError::Io)?
-            .min(file.len());
+        let end = offset.checked_add(buf.len()).unwrap().min(file.len());
         debug_assert!(start <= end);
         let len = end - start;
         buf[..len].copy_from_slice(&file[start..end]);

@@ -466,25 +466,18 @@ impl<Backend: super::backend::Backend + 'static> Engine<Backend> {
                 if outcome.stop_reason == WalkStopReason::StoppedAtNonDirectory =>
             {
                 let name = components[walked];
+                // TODO(jayb): Reject O_CREAT | O_EXCL before invoking the backend, so open-time
+                // side effects like truncation cannot happen before AlreadyExists is returned.
+                let file = self.backend.open_file_at(outcome.last, name, flags)?;
                 if flags.contains(OFlags::CREAT) && flags.contains(OFlags::EXCL) {
                     return Err(OpenError::AlreadyExists);
                 }
-                let file = self.backend.open_file_at(outcome.last, name, flags)?;
-                let truncate_by_resolver =
-                    if let PermissionCheck::ByResolver(permissions) = &file.permissions {
-                        if !path_only
-                            && ((read_allowed && !context.can_read(permissions))
-                                || ((write_allowed || flags.contains(OFlags::TRUNC))
-                                    && !context.can_write(permissions)))
-                        {
-                            return Err(OpenError::AccessNotAllowed);
-                        }
-                        !path_only && flags.contains(OFlags::TRUNC)
-                    } else {
-                        false
-                    };
-                if truncate_by_resolver {
-                    self.backend.truncate(&file.item, 0)?;
+                if !path_only
+                    && let PermissionCheck::ByResolver(permissions) = &file.permissions
+                    && ((read_allowed && !context.can_read(permissions))
+                        || (write_allowed && !context.can_write(permissions)))
+                {
+                    return Err(OpenError::AccessNotAllowed);
                 }
                 let seek_behavior = self.backend.seek_behavior(&file.item);
                 Ok(entry(Handle::File(file.item), seek_behavior))
@@ -562,11 +555,7 @@ impl<Backend: super::backend::Backend + 'static> Engine<Backend> {
             SeekBehavior::NonSeekable | SeekBehavior::ZeroPosition => 0,
             SeekBehavior::PositionBased => offset.unwrap_or(entry.position),
         };
-        read_offset.checked_add(buf.len()).ok_or(ReadError::Io)?;
         let read = self.backend.read(device_io, file, buf, read_offset)?;
-        if read > buf.len() {
-            return Err(ReadError::Io);
-        }
         Ok((read, read_offset))
     }
 
@@ -576,6 +565,9 @@ impl<Backend: super::backend::Backend + 'static> Engine<Backend> {
     /// offset to the end of the read.
     /// If `offset` is Some, the file offset is not changed.
     ///
+    /// # Panics
+    ///
+    /// Panics if the updated file offset would overflow `usize`.
     pub fn read(
         &self,
         device_io: &dyn DeviceIo,
@@ -585,7 +577,7 @@ impl<Backend: super::backend::Backend + 'static> Engine<Backend> {
     ) -> Result<usize, ReadError> {
         let (read, read_offset) = self.read_without_update(device_io, entry, buf, offset)?;
         if entry.uses_position() && offset.is_none() {
-            entry.position = read_offset.checked_add(read).ok_or(ReadError::Io)?;
+            entry.position = read_offset.checked_add(read).unwrap();
         }
         Ok(read)
     }
@@ -632,11 +624,7 @@ impl<Backend: super::backend::Backend + 'static> Engine<Backend> {
             }
             SeekBehavior::PositionBased => offset.unwrap_or(entry.position),
         };
-        write_offset.checked_add(buf.len()).ok_or(WriteError::Io)?;
         let written = self.backend.write(device_io, file, buf, write_offset)?;
-        if written > buf.len() {
-            return Err(WriteError::Io);
-        }
         Ok((written, write_offset))
     }
 
@@ -646,6 +634,9 @@ impl<Backend: super::backend::Backend + 'static> Engine<Backend> {
     /// offset to the end of the write.
     /// If `offset` is Some, the file offset is not changed.
     ///
+    /// # Panics
+    ///
+    /// Panics if the updated file offset would overflow `usize`.
     pub fn write(
         &self,
         device_io: &dyn DeviceIo,
@@ -655,7 +646,7 @@ impl<Backend: super::backend::Backend + 'static> Engine<Backend> {
     ) -> Result<usize, WriteError> {
         let (written, write_offset) = self.write_without_update(device_io, entry, buf, offset)?;
         if entry.uses_position() && offset.is_none() {
-            entry.position = write_offset.checked_add(written).ok_or(WriteError::Io)?;
+            entry.position = write_offset.checked_add(written).unwrap();
         }
         Ok(written)
     }
