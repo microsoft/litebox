@@ -1,79 +1,309 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Guest filesystem facade backed directly by the broker-core filesystem engine.
+//! Guest filesystem facade backed by broker-owned file objects.
 
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use litebox_broker_core::fs as broker_fs;
-use litebox_broker_core::fs::backend::DeviceIo;
-use litebox_broker_core::fs::resolver::{Resolver as BrokerResolver, ResolverEntry};
+use litebox_broker_protocol::ObjectHandle;
+use litebox_broker_protocol::error::ErrorCode;
+use litebox_broker_protocol::fs::{
+    FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileNodeInfo, FileOpenFlags,
+    FileSeekWhence, FileStatus as BrokerFileStatus, FileType as BrokerFileType, FileUser,
+};
 
 use crate::path::Arg;
-use crate::{LiteBox, fd::TypedFd, sync};
+use crate::{
+    LiteBox,
+    fd::{EntryHandle, TypedFd},
+    sync,
+};
 
 use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
     ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
 };
-use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence, UserInfo};
+use super::{DirEntry, FileStatus, FileType, Mode, OFlags, SeekWhence, UserInfo};
 
 /// The guest-facing filesystem entry point.
-pub struct Resolver<
-    Platform: sync::RawSyncPrimitivesProvider,
-    Backend: broker_fs::backend::Backend + 'static,
-> {
+pub struct Resolver<Platform: sync::RawSyncPrimitivesProvider> {
     litebox: LiteBox<Platform>,
-    engine: BrokerResolver<Platform, Backend>,
+    authority: ResolverAuthority,
 }
 
-impl<Platform: sync::RawSyncPrimitivesProvider, Backend: broker_fs::backend::Backend + 'static>
-    Resolver<Platform, Backend>
-{
-    /// Construct a new resolver over `backend`.
+struct ResolverAuthority {
+    broker: Arc<dyn crate::broker::BrokerControl>,
+}
+
+struct PinnedBrokerFile<Platform: sync::RawSyncPrimitivesProvider> {
+    _entry: EntryHandle<Platform, Resolver<Platform>>,
+    broker: Arc<dyn crate::broker::BrokerControl>,
+    handle: ObjectHandle,
+}
+
+impl<Platform: sync::RawSyncPrimitivesProvider> Resolver<Platform> {
+    /// Constructs a resolver whose filesystem authority is owned by the negotiated broker.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `litebox` has no negotiated broker connection.
     #[must_use]
-    pub fn new(litebox: &LiteBox<Platform>, backend: Backend) -> Self {
+    pub fn new_brokered(litebox: &LiteBox<Platform>) -> Self {
         Self {
             litebox: litebox.clone(),
-            engine: BrokerResolver::new(backend),
+            authority: ResolverAuthority {
+                broker: litebox
+                    .broker_control()
+                    .expect("brokered file operations require a broker connection"),
+            },
         }
     }
-}
 
-impl<Platform: sync::RawSyncPrimitivesProvider> DeviceIo for LiteBox<Platform> {
-    fn read_stdin(&self, output: &mut [u8]) -> Result<usize, broker_fs::errors::ReadError> {
-        LiteBox::read_stdio(self, output).map_err(|_| broker_fs::errors::ReadError::Io)
+    fn broker_file(&self, fd: &TypedFd<Self>) -> Option<PinnedBrokerFile<Platform>> {
+        let entry_handle = self.litebox.descriptor_table().entry_handle(fd)?;
+        let (broker, handle) = {
+            let entry = entry_handle.get_entry();
+            (Arc::clone(&entry.entry.broker), entry.entry.handle)
+        };
+        Some(PinnedBrokerFile {
+            _entry: entry_handle,
+            broker,
+            handle,
+        })
     }
 
-    fn write_stdio(
+    fn broker_path(context: &Context, path: impl Arg) -> Result<String, PathError> {
+        Ok(context.resolve(path)?.to_string())
+    }
+
+    /// Opens a file.
+    ///
+    /// The `mode` is only significant when creating a file.
+    pub fn open(
         &self,
-        stream: litebox_broker_protocol::stdio::StdioOutputStream,
-        input: &[u8],
-    ) -> Result<usize, broker_fs::errors::WriteError> {
-        LiteBox::write_stdio(self, stream, input).map_err(|_| broker_fs::errors::WriteError::Io)
+        context: &Context,
+        path: impl Arg,
+        flags: OFlags,
+        mode: Mode,
+    ) -> Result<TypedFd<Self>, OpenError> {
+        let path = Self::broker_path(context, path)?;
+        let (access, flags) = file_open_options(flags)?;
+        let handle = self
+            .authority
+            .broker
+            .open_file(
+                &path,
+                file_user(context.acting_user()),
+                access,
+                flags,
+                file_mode(mode),
+            )
+            .map_err(|_| OpenError::Io)?
+            .map_err(open_error)?;
+        Ok(self.litebox.descriptor_table_mut().insert(BrokerFile {
+            broker: Arc::clone(&self.authority.broker),
+            handle,
+        }))
     }
 
-    fn fill_random(&self, output: &mut [u8]) -> Result<(), broker_fs::errors::ReadError> {
-        LiteBox::fill_random(self, output).map_err(|_| broker_fs::errors::ReadError::Io)
+    /// Close the file at `fd`.
+    ///
+    /// Future operations on the `fd` will start to return `ClosedFd` errors.
+    pub fn close(&self, fd: &TypedFd<Self>) -> Result<(), CloseError> {
+        let mut descriptors = self.litebox.descriptor_table_mut();
+        let removed = descriptors.remove(fd);
+        drop(descriptors);
+        drop(removed);
+        Ok(())
+    }
+
+    /// Read from a file descriptor at `offset` into a buffer.
+    pub fn read(
+        &self,
+        fd: &TypedFd<Self>,
+        buf: &mut [u8],
+        offset: Option<usize>,
+    ) -> Result<usize, ReadError> {
+        let file = self.broker_file(fd).ok_or(ReadError::ClosedFd)?;
+        file.broker
+            .read_file(
+                file.handle,
+                buf,
+                offset
+                    .map(u64::try_from)
+                    .transpose()
+                    .map_err(|_| ReadError::Io)?,
+            )
+            .map_err(|error| broker_fd_error(error, ReadError::ClosedFd, ReadError::Io))?
+            .map_err(read_error)
+    }
+
+    /// Write from a buffer to a file descriptor at `offset`.
+    pub fn write(
+        &self,
+        fd: &TypedFd<Self>,
+        buf: &[u8],
+        offset: Option<usize>,
+    ) -> Result<usize, WriteError> {
+        let file = self.broker_file(fd).ok_or(WriteError::ClosedFd)?;
+        file.broker
+            .write_file(
+                file.handle,
+                buf,
+                offset
+                    .map(u64::try_from)
+                    .transpose()
+                    .map_err(|_| WriteError::Io)?,
+            )
+            .map_err(|error| broker_fd_error(error, WriteError::ClosedFd, WriteError::Io))?
+            .map_err(write_error)
+    }
+
+    /// Reposition the read/write file offset.
+    pub fn seek(
+        &self,
+        fd: &TypedFd<Self>,
+        offset: isize,
+        whence: SeekWhence,
+    ) -> Result<usize, SeekError> {
+        let file = self.broker_file(fd).ok_or(SeekError::ClosedFd)?;
+        let offset = i64::try_from(offset).map_err(|_| SeekError::InvalidOffset)?;
+        let offset = file
+            .broker
+            .seek_file(file.handle, offset, file_seek_whence(whence))
+            .map_err(|error| broker_fd_error(error, SeekError::ClosedFd, SeekError::Io))?
+            .map_err(seek_error)?;
+        usize::try_from(offset).map_err(|_| SeekError::InvalidOffset)
+    }
+
+    /// Truncate the file to the specified length.
+    pub fn truncate(
+        &self,
+        fd: &TypedFd<Self>,
+        length: usize,
+        reset_offset: bool,
+    ) -> Result<(), TruncateError> {
+        let file = self.broker_file(fd).ok_or(TruncateError::ClosedFd)?;
+        file.broker
+            .truncate_file(
+                file.handle,
+                u64::try_from(length).map_err(|_| TruncateError::Io)?,
+                reset_offset,
+            )
+            .map_err(|error| broker_fd_error(error, TruncateError::ClosedFd, TruncateError::Io))?
+            .map_err(truncate_error)
+    }
+
+    /// Change the permissions of a file.
+    pub fn chmod(&self, context: &Context, path: impl Arg, mode: Mode) -> Result<(), ChmodError> {
+        let path = Self::broker_path(context, path)?;
+        self.authority
+            .broker
+            .chmod_file(&path, file_user(context.acting_user()), file_mode(mode))
+            .map_err(|_| ChmodError::Io)?
+            .map_err(chmod_error)
+    }
+
+    /// Change the owner of a file.
+    pub fn chown(
+        &self,
+        context: &Context,
+        path: impl Arg,
+        user: Option<u16>,
+        group: Option<u16>,
+    ) -> Result<(), ChownError> {
+        let path = Self::broker_path(context, path)?;
+        self.authority
+            .broker
+            .chown_file(&path, file_user(context.acting_user()), user, group)
+            .map_err(|_| ChownError::Io)?
+            .map_err(chown_error)
+    }
+
+    /// Unlink a file.
+    pub fn unlink(&self, context: &Context, path: impl Arg) -> Result<(), UnlinkError> {
+        let path = Self::broker_path(context, path)?;
+        self.authority
+            .broker
+            .unlink_file(&path, file_user(context.acting_user()))
+            .map_err(|_| UnlinkError::Io)?
+            .map_err(unlink_error)
+    }
+
+    /// Create a new directory.
+    pub fn mkdir(&self, context: &Context, path: impl Arg, mode: Mode) -> Result<(), MkdirError> {
+        let path = Self::broker_path(context, path)?;
+        self.authority
+            .broker
+            .mkdir_file(&path, file_user(context.acting_user()), file_mode(mode))
+            .map_err(|_| MkdirError::Io)?
+            .map_err(mkdir_error)
+    }
+
+    /// Remove a directory.
+    pub fn rmdir(&self, context: &Context, path: impl Arg) -> Result<(), RmdirError> {
+        let path = Self::broker_path(context, path)?;
+        self.authority
+            .broker
+            .rmdir_file(&path, file_user(context.acting_user()))
+            .map_err(|_| RmdirError::Io)?
+            .map_err(rmdir_error)
+    }
+
+    /// Read directory entries from a directory file descriptor.
+    pub fn read_dir(&self, fd: &TypedFd<Self>) -> Result<Vec<DirEntry>, ReadDirError> {
+        let file = self.broker_file(fd).ok_or(ReadDirError::ClosedFd)?;
+        let entries = file
+            .broker
+            .read_directory(file.handle)
+            .map_err(|error| broker_fd_error(error, ReadDirError::ClosedFd, ReadDirError::Io))?
+            .map_err(read_dir_error)?;
+        directory_entries(entries)
+    }
+
+    /// Obtain the status of a path.
+    pub fn file_status(
+        &self,
+        context: &Context,
+        path: impl Arg,
+    ) -> Result<FileStatus, FileStatusError> {
+        let path = Self::broker_path(context, path)?;
+        let status = self
+            .authority
+            .broker
+            .path_file_status(&path, file_user(context.acting_user()))
+            .map_err(|_| FileStatusError::Io)?
+            .map_err(file_status_error)?;
+        file_status(status)
+    }
+
+    /// Equivalent to [`Self::file_status`], but on an open `fd`.
+    pub fn fd_file_status(&self, fd: &TypedFd<Self>) -> Result<FileStatus, FileStatusError> {
+        let file = self.broker_file(fd).ok_or(FileStatusError::ClosedFd)?;
+        let status = file
+            .broker
+            .handle_file_status(file.handle)
+            .map_err(|error| {
+                broker_fd_error(error, FileStatusError::ClosedFd, FileStatusError::Io)
+            })?
+            .map_err(file_status_error)?;
+        file_status(status)
+    }
+
+    /// Get static backing data for a file, if available and supported.
+    pub fn get_static_backing_data(&self, fd: &TypedFd<Self>) -> Option<&'static [u8]> {
+        let _ = self.broker_file(fd)?;
+        None
     }
 }
 
 /// Per-call resolution context. The user may hold and mutate this as they wish.
-///
-/// This struct is deliberately cheap to clone.
-// NOTE(jayb): I generally dislike getters/setters for fields of a data-like struct (e.g., see
-// acting_user and set_acting_user here), but I'm putting these here since I am not yet convinced
-// that we won't need more things in the context, nor am I convinced that we might not need the
-// ability to lock down how contexts are made/used. In some sense, I am forcing some chokepoints
-// here. In the future, we might flatten these out and just allow access to the fields directly.
 #[derive(Clone, Debug)]
 pub struct Context {
-    /// Current working directory.
     cwd: Arc<ResolvedPath>,
-    /// Effective user for permission checks.
     user_info: UserInfo,
 }
 
@@ -101,7 +331,8 @@ impl Context {
     }
 
     /// A new default context, anchored at `/` for a non-root user.
-    pub fn new() -> Context {
+    #[must_use]
+    pub fn new() -> Self {
         Self {
             cwd: Arc::new(ResolvedPath { components: vec![] }),
             user_info: UserInfo {
@@ -112,10 +343,6 @@ impl Context {
     }
 
     /// Resolve `path` against the current context.
-    // XXX(jayb): if/when we support chroot, we might need to tweak this to not allow "escaping"
-    // outside the chrooted part.
-    // XXX(jayb): since we are migrating all resolution into the resolver, we probably don't need
-    // `Arg` anymore, so could get rid of it in the future.
     pub fn resolve(&self, path: impl Arg) -> Result<ResolvedPath, PathError> {
         let mut components = if path.as_rust_str()?.starts_with('/') {
             vec![]
@@ -128,9 +355,7 @@ impl Context {
                 ".." => {
                     let _ = components.pop();
                 }
-                _ => {
-                    components.push(component.into());
-                }
+                _ => components.push(component.into()),
             }
         }
         Ok(ResolvedPath { components })
@@ -143,507 +368,315 @@ impl Default for Context {
     }
 }
 
-/// Absolute normalized path, must only be created from [`Context::resolve`].
-///
-/// Note that a resolved path does not imply that it exists within the file system, merely that it
-/// is an absolute normalized path.
+/// Absolute normalized path, created from [`Context::resolve`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedPath {
-    // Note: an empty path is equivalent to `/`.
     components: Vec<String>,
 }
 
 impl core::fmt::Display for ResolvedPath {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         for component in &self.components {
-            write!(f, "/{component}")?;
+            write!(formatter, "/{component}")?;
         }
         if self.components.is_empty() {
-            f.write_str("/")?;
+            formatter.write_str("/")?;
         }
         Ok(())
     }
 }
 
-impl<Platform: sync::RawSyncPrimitivesProvider, Backend: broker_fs::backend::Backend + 'static>
-    Resolver<Platform, Backend>
-{
-    /// Opens a file.
-    ///
-    /// The `mode` is only significant when creating a file.
-    pub fn open(
-        &self,
-        context: &Context,
-        path: impl Arg,
-        flags: OFlags,
-        mode: Mode,
-    ) -> Result<TypedFd<Self>, OpenError> {
-        let path = context.resolve(path)?.to_string();
-        let entry = self
-            .engine
-            .open(
-                broker_user_info(context.acting_user()),
-                &path,
-                broker_open_flags(flags),
-                broker_mode(mode),
-            )
-            .map_err(guest_open_error)?;
-        Ok(self.litebox.descriptor_table_mut().insert(entry))
-    }
+struct BrokerFile {
+    broker: Arc<dyn crate::broker::BrokerControl>,
+    handle: ObjectHandle,
+}
 
-    /// Close the file at `fd`.
-    ///
-    /// Future operations on the `fd` will start to return `ClosedFd` errors.
-    pub fn close(&self, fd: &TypedFd<Self>) -> Result<(), CloseError> {
-        let mut descriptors = self.litebox.descriptor_table_mut();
-        let removed = descriptors.remove(fd);
-        drop(descriptors);
-        // Some backends might block while closing an fd, so release the descriptor-table lock
-        // before dropping the backend handle.
-        drop(removed);
-        Ok(())
-    }
-
-    /// Read from a file descriptor at `offset` into a buffer.
-    ///
-    /// If `offset` is None, the read will start at the current file offset and update the file
-    /// offset to the end of the read.
-    /// If `offset` is Some, the file offset is not changed.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the updated file offset would overflow `usize`.
-    pub fn read(
-        &self,
-        fd: &TypedFd<Self>,
-        buf: &mut [u8],
-        offset: Option<usize>,
-    ) -> Result<usize, ReadError> {
-        let entry = self
-            .litebox
-            .descriptor_table()
-            .entry_handle(fd)
-            .ok_or(ReadError::ClosedFd)?;
-        let mut entry = entry.get_entry_mut();
-        // XXX(jayb): This deliberately preserves the current descriptor-entry lock across backend
-        // I/O. A later PR can introduce a smaller position/append serialization primitive.
-        self.engine
-            .read(&self.litebox, &mut entry.entry, buf, offset)
-            .map_err(guest_read_error)
-    }
-
-    /// Write from a buffer to a file descriptor at `offset`.
-    ///
-    /// If `offset` is None, the write will start at the current file offset and update the file
-    /// offset to the end of the write.
-    /// If `offset` is Some, the file offset is not changed.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the updated file offset would overflow `usize`.
-    pub fn write(
-        &self,
-        fd: &TypedFd<Self>,
-        buf: &[u8],
-        offset: Option<usize>,
-    ) -> Result<usize, WriteError> {
-        let entry = self
-            .litebox
-            .descriptor_table()
-            .entry_handle(fd)
-            .ok_or(WriteError::ClosedFd)?;
-        let mut entry = entry.get_entry_mut();
-        // XXX(jayb): This deliberately preserves the current descriptor-entry lock across backend
-        // I/O. A later PR can introduce a smaller position/append serialization primitive.
-        self.engine
-            .write(&self.litebox, &mut entry.entry, buf, offset)
-            .map_err(guest_write_error)
-    }
-
-    /// Reposition the read/write file offset, by changing it to `offset` relative to `whence`.
-    ///
-    /// Returns the resulting offset (in bytes from start of file) on success.
-    pub fn seek(
-        &self,
-        fd: &TypedFd<Self>,
-        offset: isize,
-        whence: SeekWhence,
-    ) -> Result<usize, SeekError> {
-        let entry = self
-            .litebox
-            .descriptor_table()
-            .entry_handle(fd)
-            .ok_or(SeekError::ClosedFd)?;
-        let mut entry = entry.get_entry_mut();
-        self.engine
-            .seek(&mut entry.entry, offset, broker_seek_whence(whence))
-            .map_err(guest_seek_error)
-    }
-
-    /// Truncate the file to the specified length.
-    ///
-    /// If shorter than existing size, extra data is lost. If longer than existing size, resize by
-    /// adding `\0`s.
-    ///
-    /// If `reset_offset` is true, the offset is reset to zero; otherwise, it remains unchanged.
-    pub fn truncate(
-        &self,
-        fd: &TypedFd<Self>,
-        length: usize,
-        reset_offset: bool,
-    ) -> Result<(), TruncateError> {
-        let entry = self
-            .litebox
-            .descriptor_table()
-            .entry_handle(fd)
-            .ok_or(TruncateError::ClosedFd)?;
-        let mut entry = entry.get_entry_mut();
-        self.engine
-            .truncate(&mut entry.entry, length, reset_offset)
-            .map_err(guest_truncate_error)
-    }
-
-    /// Change the permissions of a file.
-    pub fn chmod(&self, context: &Context, path: impl Arg, mode: Mode) -> Result<(), ChmodError> {
-        let path = context.resolve(path)?.to_string();
-        self.engine
-            .chmod(
-                broker_user_info(context.acting_user()),
-                &path,
-                broker_mode(mode),
-            )
-            .map_err(guest_chmod_error)
-    }
-
-    /// Change the owner of a file.
-    pub fn chown(
-        &self,
-        context: &Context,
-        path: impl Arg,
-        user: Option<u16>,
-        group: Option<u16>,
-    ) -> Result<(), ChownError> {
-        let path = context.resolve(path)?.to_string();
-        self.engine
-            .chown(broker_user_info(context.acting_user()), &path, user, group)
-            .map_err(guest_chown_error)
-    }
-
-    /// Unlink a file.
-    pub fn unlink(&self, context: &Context, path: impl Arg) -> Result<(), UnlinkError> {
-        let path = context.resolve(path)?.to_string();
-        self.engine
-            .unlink(broker_user_info(context.acting_user()), &path)
-            .map_err(guest_unlink_error)
-    }
-
-    /// Create a new directory.
-    pub fn mkdir(&self, context: &Context, path: impl Arg, mode: Mode) -> Result<(), MkdirError> {
-        let path = context.resolve(path)?.to_string();
-        self.engine
-            .mkdir(
-                broker_user_info(context.acting_user()),
-                &path,
-                broker_mode(mode),
-            )
-            .map_err(guest_mkdir_error)
-    }
-
-    /// Remove a directory.
-    pub fn rmdir(&self, context: &Context, path: impl Arg) -> Result<(), RmdirError> {
-        let path = context.resolve(path)?.to_string();
-        self.engine
-            .rmdir(broker_user_info(context.acting_user()), &path)
-            .map_err(guest_rmdir_error)
-    }
-
-    /// Read directory entries from a directory file descriptor.
-    ///
-    /// Returns a list of file/directory names including synthesized `.` and `..` entries.
-    pub fn read_dir(&self, fd: &TypedFd<Self>) -> Result<Vec<DirEntry>, ReadDirError> {
-        let entry = self
-            .litebox
-            .descriptor_table()
-            .entry_handle(fd)
-            .ok_or(ReadDirError::ClosedFd)?;
-        let entry = entry.get_entry();
-        self.engine
-            .read_dir(&entry.entry)
-            .map_err(guest_read_dir_error)
-            .map(guest_directory_entries)
-    }
-
-    /// Obtain the status of a path.
-    pub fn file_status(
-        &self,
-        context: &Context,
-        path: impl Arg,
-    ) -> Result<FileStatus, FileStatusError> {
-        let path = context.resolve(path)?.to_string();
-        self.engine
-            .file_status(broker_user_info(context.acting_user()), &path)
-            .map_err(guest_file_status_error)
-            .map(guest_file_status)
-    }
-
-    /// Equivalent to [`Self::file_status`], but on an open `fd`.
-    pub fn fd_file_status(&self, fd: &TypedFd<Self>) -> Result<FileStatus, FileStatusError> {
-        let entry = self
-            .litebox
-            .descriptor_table()
-            .entry_handle(fd)
-            .ok_or(FileStatusError::ClosedFd)?;
-        let entry = entry.get_entry();
-        self.engine
-            .handle_status(&entry.entry)
-            .map_err(guest_file_status_error)
-            .map(guest_file_status)
-    }
-
-    /// Get static backing data for a file, if available and supported.
-    ///
-    /// This method returns the (entire) underlying static byte slice if the file's contents are
-    /// backed by borrowed static data (e.g., set up via [`super::in_mem::InitialNode::File`]).
-    ///
-    /// Returns `None` if no static backing data is available/supported.
-    pub fn get_static_backing_data(&self, fd: &TypedFd<Self>) -> Option<&'static [u8]> {
-        let entry = self.litebox.descriptor_table().entry_handle(fd)?;
-        let entry = entry.get_entry();
-        self.engine.get_static_backing_data(&entry.entry)
+impl Drop for BrokerFile {
+    fn drop(&mut self) {
+        let _ = self.broker.close_object(self.handle);
     }
 }
 
-// TODO: Remove most of the guest/core conversion helpers below once LiteBox uses the broker file
-// APIs exclusively. They temporarily preserve LiteBox's guest-facing types while this facade calls
-// the broker-core engine directly.
-fn broker_mode(mode: Mode) -> broker_fs::Mode {
-    broker_fs::Mode::from_bits_retain(mode.bits())
+fn file_open_options(flags: OFlags) -> Result<(FileAccessMode, FileOpenFlags), OpenError> {
+    const SUPPORTED_FLAGS: OFlags = OFlags::CREAT
+        .union(OFlags::RDONLY)
+        .union(OFlags::WRONLY)
+        .union(OFlags::RDWR)
+        .union(OFlags::TRUNC)
+        .union(OFlags::NOCTTY)
+        .union(OFlags::EXCL)
+        .union(OFlags::DIRECTORY)
+        .union(OFlags::NONBLOCK)
+        .union(OFlags::LARGEFILE)
+        .union(OFlags::NOFOLLOW)
+        .union(OFlags::APPEND)
+        .union(OFlags::PATH);
+
+    if flags.intersects(SUPPORTED_FLAGS.complement()) {
+        unimplemented!("{flags:?}")
+    }
+    let access = match flags.bits() & 3 {
+        0 => FileAccessMode::ReadOnly,
+        1 => FileAccessMode::WriteOnly,
+        2 => FileAccessMode::ReadWrite,
+        _ => return Err(OpenError::AccessNotAllowed),
+    };
+    let mut output = FileOpenFlags::NONE;
+    for (guest, broker) in [
+        (OFlags::CREAT, FileOpenFlags::CREATE),
+        (OFlags::TRUNC, FileOpenFlags::TRUNCATE),
+        (OFlags::NOCTTY, FileOpenFlags::NO_CONTROLLING_TERMINAL),
+        (OFlags::EXCL, FileOpenFlags::EXCLUSIVE),
+        (OFlags::DIRECTORY, FileOpenFlags::DIRECTORY),
+        (OFlags::NONBLOCK, FileOpenFlags::NONBLOCKING),
+        (OFlags::LARGEFILE, FileOpenFlags::LARGE_FILE),
+        (OFlags::NOFOLLOW, FileOpenFlags::NO_FOLLOW),
+        (OFlags::APPEND, FileOpenFlags::APPEND),
+        (OFlags::PATH, FileOpenFlags::PATH),
+    ] {
+        if flags.contains(guest) {
+            output = output.union(broker);
+        }
+    }
+    Ok((access, output))
 }
 
-fn guest_mode(mode: broker_fs::Mode) -> Mode {
-    Mode::from_bits_retain(mode.bits())
+fn file_mode(mode: Mode) -> FileMode {
+    let bits = u16::try_from(mode.bits() & u32::from(FileMode::SUPPORTED.bits()))
+        .expect("supported file mode bits fit in u16");
+    FileMode::from_bits(bits).expect("masked file mode bits are supported")
 }
 
-fn broker_open_flags(flags: OFlags) -> broker_fs::OFlags {
-    broker_fs::OFlags::from_bits_retain(flags.bits())
-}
-
-fn broker_user_info(user: UserInfo) -> broker_fs::UserInfo {
-    broker_fs::UserInfo {
+const fn file_user(user: UserInfo) -> FileUser {
+    FileUser {
         user: user.user,
         group: user.group,
     }
 }
 
-fn guest_user_info(user: broker_fs::UserInfo) -> UserInfo {
-    UserInfo {
-        user: user.user,
-        group: user.group,
-    }
-}
-
-fn broker_seek_whence(whence: SeekWhence) -> broker_fs::SeekWhence {
+const fn file_seek_whence(whence: SeekWhence) -> FileSeekWhence {
     match whence {
-        SeekWhence::RelativeToBeginning => broker_fs::SeekWhence::RelativeToBeginning,
-        SeekWhence::RelativeToCurrentOffset => broker_fs::SeekWhence::RelativeToCurrentOffset,
-        SeekWhence::RelativeToEnd => broker_fs::SeekWhence::RelativeToEnd,
+        SeekWhence::RelativeToBeginning => FileSeekWhence::Beginning,
+        SeekWhence::RelativeToCurrentOffset => FileSeekWhence::Current,
+        SeekWhence::RelativeToEnd => FileSeekWhence::End,
     }
 }
 
-fn guest_file_type(file_type: broker_fs::FileType) -> FileType {
-    match file_type {
-        broker_fs::FileType::RegularFile => FileType::RegularFile,
-        broker_fs::FileType::Directory => FileType::Directory,
-        broker_fs::FileType::CharacterDevice => FileType::CharacterDevice,
-    }
-}
-
-fn guest_node_info(node: broker_fs::NodeInfo) -> NodeInfo {
-    NodeInfo {
-        dev: node.dev,
-        ino: node.ino,
-        rdev: node.rdev,
-    }
-}
-
-fn guest_file_status(status: broker_fs::FileStatus) -> FileStatus {
-    FileStatus {
-        file_type: guest_file_type(status.file_type),
-        mode: guest_mode(status.mode),
-        size: status.size,
-        owner: guest_user_info(status.owner),
-        node_info: guest_node_info(status.node_info),
-        blksize: status.blksize,
-    }
-}
-
-fn guest_directory_entries(entries: Vec<broker_fs::DirEntry>) -> Vec<DirEntry> {
-    entries
-        .into_iter()
-        .map(|entry| DirEntry {
-            name: entry.name,
-            file_type: guest_file_type(entry.file_type),
-            ino_info: entry.ino_info.map(guest_node_info),
-        })
-        .collect()
-}
-
-fn guest_path_error(error: broker_fs::errors::PathError) -> PathError {
+fn broker_fd_error<T>(error: crate::broker::error::BrokerControlError, closed: T, io: T) -> T {
     match error {
-        broker_fs::errors::PathError::NoSuchFileOrDirectory => PathError::NoSuchFileOrDirectory,
-        broker_fs::errors::PathError::NoSearchPerms {
+        crate::broker::error::BrokerControlError::Broker(
+            ErrorCode::UnknownObject | ErrorCode::InvalidRights,
+        ) => closed,
+        crate::broker::error::BrokerControlError::AssociationFailed
+        | crate::broker::error::BrokerControlError::Broker(_) => io,
+    }
+}
+
+fn path_error(error: FileError) -> Option<PathError> {
+    match error {
+        FileError::NoSuchFileOrDirectory => Some(PathError::NoSuchFileOrDirectory),
+        FileError::NoSearchPermissions => Some(PathError::NoSearchPerms {
             #[cfg(debug_assertions)]
-            dir,
+            dir: String::new(),
             #[cfg(debug_assertions)]
-            perms,
-        } => PathError::NoSearchPerms {
-            #[cfg(debug_assertions)]
-            dir,
-            #[cfg(debug_assertions)]
-            perms: guest_mode(perms),
+            perms: Mode::empty(),
+        }),
+        FileError::InvalidPathname => Some(PathError::InvalidPathname),
+        FileError::MissingComponent => Some(PathError::MissingComponent),
+        FileError::ComponentNotDirectory => Some(PathError::ComponentNotADirectory),
+        _ => None,
+    }
+}
+
+fn open_error(error: FileError) -> OpenError {
+    if let Some(error) = path_error(error) {
+        return error.into();
+    }
+    match error {
+        FileError::AccessNotAllowed => OpenError::AccessNotAllowed,
+        FileError::NoWritePermissions => OpenError::NoWritePerms,
+        FileError::ReadOnlyFs => OpenError::ReadOnlyFileSystem,
+        FileError::AlreadyExists => OpenError::AlreadyExists,
+        FileError::IsDirectory => OpenError::TruncateError(TruncateError::IsDirectory),
+        FileError::NotForWriting => OpenError::TruncateError(TruncateError::NotForWriting),
+        FileError::IsTerminalDevice => OpenError::TruncateError(TruncateError::IsTerminalDevice),
+        _ => OpenError::Io,
+    }
+}
+
+fn read_error(error: FileError) -> ReadError {
+    match error {
+        FileError::NotFile => ReadError::NotAFile,
+        FileError::NotForReading => ReadError::NotForReading,
+        _ => ReadError::Io,
+    }
+}
+
+fn write_error(error: FileError) -> WriteError {
+    match error {
+        FileError::NotFile => WriteError::NotAFile,
+        FileError::NotForWriting => WriteError::NotForWriting,
+        _ => WriteError::Io,
+    }
+}
+
+fn seek_error(error: FileError) -> SeekError {
+    match error {
+        FileError::NotFile => SeekError::NotAFile,
+        FileError::InvalidOffset => SeekError::InvalidOffset,
+        FileError::NonSeekable => SeekError::NonSeekable,
+        _ => SeekError::Io,
+    }
+}
+
+fn truncate_error(error: FileError) -> TruncateError {
+    match error {
+        FileError::IsDirectory => TruncateError::IsDirectory,
+        FileError::NotForWriting => TruncateError::NotForWriting,
+        FileError::IsTerminalDevice => TruncateError::IsTerminalDevice,
+        _ => TruncateError::Io,
+    }
+}
+
+fn chmod_error(error: FileError) -> ChmodError {
+    if let Some(error) = path_error(error) {
+        return error.into();
+    }
+    match error {
+        FileError::NotOwner => ChmodError::NotTheOwner,
+        FileError::ReadOnlyFs => ChmodError::ReadOnlyFileSystem,
+        _ => ChmodError::Io,
+    }
+}
+
+fn chown_error(error: FileError) -> ChownError {
+    if let Some(error) = path_error(error) {
+        return error.into();
+    }
+    match error {
+        FileError::NotOwner => ChownError::NotTheOwner,
+        FileError::ReadOnlyFs => ChownError::ReadOnlyFileSystem,
+        _ => ChownError::Io,
+    }
+}
+
+fn unlink_error(error: FileError) -> UnlinkError {
+    if let Some(error) = path_error(error) {
+        return error.into();
+    }
+    match error {
+        FileError::NoWritePermissions => UnlinkError::NoWritePerms,
+        FileError::IsDirectory => UnlinkError::IsADirectory,
+        FileError::ReadOnlyFs => UnlinkError::ReadOnlyFileSystem,
+        _ => UnlinkError::Io,
+    }
+}
+
+fn mkdir_error(error: FileError) -> MkdirError {
+    if let Some(error) = path_error(error) {
+        return error.into();
+    }
+    match error {
+        FileError::NoWritePermissions => MkdirError::NoWritePerms,
+        FileError::AlreadyExists => MkdirError::AlreadyExists,
+        FileError::ReadOnlyFs => MkdirError::ReadOnlyFileSystem,
+        _ => MkdirError::Io,
+    }
+}
+
+fn rmdir_error(error: FileError) -> RmdirError {
+    if let Some(error) = path_error(error) {
+        return error.into();
+    }
+    match error {
+        FileError::NoWritePermissions => RmdirError::NoWritePerms,
+        FileError::Busy => RmdirError::Busy,
+        FileError::NotEmpty => RmdirError::NotEmpty,
+        FileError::NotDirectory => RmdirError::NotADirectory,
+        FileError::ReadOnlyFs => RmdirError::ReadOnlyFileSystem,
+        _ => RmdirError::Io,
+    }
+}
+
+fn read_dir_error(error: FileError) -> ReadDirError {
+    match error {
+        FileError::NotDirectory => ReadDirError::NotADirectory,
+        _ => ReadDirError::Io,
+    }
+}
+
+fn file_status_error(error: FileError) -> FileStatusError {
+    path_error(error).map_or(FileStatusError::Io, Into::into)
+}
+
+fn file_status(status: BrokerFileStatus) -> Result<FileStatus, FileStatusError> {
+    Ok(FileStatus {
+        file_type: file_type(status.file_type).map_err(|()| FileStatusError::Io)?,
+        mode: Mode::from_bits_retain(u32::from(status.mode.bits())),
+        size: usize::try_from(status.size).map_err(|_| FileStatusError::Io)?,
+        owner: UserInfo {
+            user: status.owner.user,
+            group: status.owner.group,
         },
-        broker_fs::errors::PathError::InvalidPathname => PathError::InvalidPathname,
-        broker_fs::errors::PathError::MissingComponent => PathError::MissingComponent,
-        broker_fs::errors::PathError::ComponentNotADirectory => PathError::ComponentNotADirectory,
+        node_info: status_node_info(status.node_info)?,
+        blksize: usize::try_from(status.block_size).map_err(|_| FileStatusError::Io)?,
+    })
+}
+
+fn directory_entries(entries: Vec<FileDirectoryEntry>) -> Result<Vec<DirEntry>, ReadDirError> {
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(entries.len())
+        .map_err(|_| ReadDirError::Io)?;
+    for entry in entries {
+        output.push(DirEntry {
+            name: entry.name,
+            file_type: file_type(entry.file_type).map_err(|()| ReadDirError::Io)?,
+            ino_info: entry.node_info.map(directory_node_info).transpose()?,
+        });
+    }
+    Ok(output)
+}
+
+fn file_type(file_type: BrokerFileType) -> Result<FileType, ()> {
+    match file_type {
+        BrokerFileType::RegularFile => Ok(FileType::RegularFile),
+        BrokerFileType::Directory => Ok(FileType::Directory),
+        BrokerFileType::CharacterDevice => Ok(FileType::CharacterDevice),
+        _ => Err(()),
     }
 }
 
-fn guest_open_error(error: broker_fs::errors::OpenError) -> OpenError {
-    match error {
-        broker_fs::errors::OpenError::AccessNotAllowed => OpenError::AccessNotAllowed,
-        broker_fs::errors::OpenError::NoWritePerms => OpenError::NoWritePerms,
-        broker_fs::errors::OpenError::ReadOnlyFileSystem => OpenError::ReadOnlyFileSystem,
-        broker_fs::errors::OpenError::AlreadyExists => OpenError::AlreadyExists,
-        broker_fs::errors::OpenError::TruncateError(error) => {
-            OpenError::TruncateError(guest_truncate_error(error))
-        }
-        broker_fs::errors::OpenError::Io => OpenError::Io,
-        broker_fs::errors::OpenError::PathError(error) => {
-            OpenError::PathError(guest_path_error(error))
-        }
-    }
+fn status_node_info(node: FileNodeInfo) -> Result<super::NodeInfo, FileStatusError> {
+    Ok(super::NodeInfo {
+        dev: usize::try_from(node.dev).map_err(|_| FileStatusError::Io)?,
+        ino: usize::try_from(node.ino).map_err(|_| FileStatusError::Io)?,
+        rdev: optional_device(node.rdev).map_err(|()| FileStatusError::Io)?,
+    })
 }
 
-fn guest_read_error(error: broker_fs::errors::ReadError) -> ReadError {
-    match error {
-        broker_fs::errors::ReadError::ClosedFd => ReadError::ClosedFd,
-        broker_fs::errors::ReadError::NotAFile => ReadError::NotAFile,
-        broker_fs::errors::ReadError::NotForReading => ReadError::NotForReading,
-        broker_fs::errors::ReadError::Io => ReadError::Io,
-    }
+fn directory_node_info(node: FileNodeInfo) -> Result<super::NodeInfo, ReadDirError> {
+    Ok(super::NodeInfo {
+        dev: usize::try_from(node.dev).map_err(|_| ReadDirError::Io)?,
+        ino: usize::try_from(node.ino).map_err(|_| ReadDirError::Io)?,
+        rdev: optional_device(node.rdev).map_err(|()| ReadDirError::Io)?,
+    })
 }
 
-fn guest_write_error(error: broker_fs::errors::WriteError) -> WriteError {
-    match error {
-        broker_fs::errors::WriteError::ClosedFd => WriteError::ClosedFd,
-        broker_fs::errors::WriteError::NotAFile => WriteError::NotAFile,
-        broker_fs::errors::WriteError::NotForWriting => WriteError::NotForWriting,
-        broker_fs::errors::WriteError::Io => WriteError::Io,
-    }
-}
-
-fn guest_seek_error(error: broker_fs::errors::SeekError) -> SeekError {
-    match error {
-        broker_fs::errors::SeekError::ClosedFd => SeekError::ClosedFd,
-        broker_fs::errors::SeekError::NotAFile => SeekError::NotAFile,
-        broker_fs::errors::SeekError::InvalidOffset => SeekError::InvalidOffset,
-        broker_fs::errors::SeekError::NonSeekable => SeekError::NonSeekable,
-        broker_fs::errors::SeekError::Io => SeekError::Io,
-    }
-}
-
-fn guest_truncate_error(error: broker_fs::errors::TruncateError) -> TruncateError {
-    match error {
-        broker_fs::errors::TruncateError::ClosedFd => TruncateError::ClosedFd,
-        broker_fs::errors::TruncateError::IsDirectory => TruncateError::IsDirectory,
-        broker_fs::errors::TruncateError::NotForWriting => TruncateError::NotForWriting,
-        broker_fs::errors::TruncateError::IsTerminalDevice => TruncateError::IsTerminalDevice,
-        broker_fs::errors::TruncateError::Io => TruncateError::Io,
-    }
-}
-
-fn guest_chmod_error(error: broker_fs::errors::ChmodError) -> ChmodError {
-    match error {
-        broker_fs::errors::ChmodError::NotTheOwner => ChmodError::NotTheOwner,
-        broker_fs::errors::ChmodError::ReadOnlyFileSystem => ChmodError::ReadOnlyFileSystem,
-        broker_fs::errors::ChmodError::Io => ChmodError::Io,
-        broker_fs::errors::ChmodError::PathError(error) => {
-            ChmodError::PathError(guest_path_error(error))
-        }
-    }
-}
-
-fn guest_chown_error(error: broker_fs::errors::ChownError) -> ChownError {
-    match error {
-        broker_fs::errors::ChownError::NotTheOwner => ChownError::NotTheOwner,
-        broker_fs::errors::ChownError::ReadOnlyFileSystem => ChownError::ReadOnlyFileSystem,
-        broker_fs::errors::ChownError::Io => ChownError::Io,
-        broker_fs::errors::ChownError::PathError(error) => {
-            ChownError::PathError(guest_path_error(error))
-        }
-    }
-}
-
-fn guest_unlink_error(error: broker_fs::errors::UnlinkError) -> UnlinkError {
-    match error {
-        broker_fs::errors::UnlinkError::NoWritePerms => UnlinkError::NoWritePerms,
-        broker_fs::errors::UnlinkError::IsADirectory => UnlinkError::IsADirectory,
-        broker_fs::errors::UnlinkError::ReadOnlyFileSystem => UnlinkError::ReadOnlyFileSystem,
-        broker_fs::errors::UnlinkError::Io => UnlinkError::Io,
-        broker_fs::errors::UnlinkError::PathError(error) => {
-            UnlinkError::PathError(guest_path_error(error))
-        }
-    }
-}
-
-fn guest_mkdir_error(error: broker_fs::errors::MkdirError) -> MkdirError {
-    match error {
-        broker_fs::errors::MkdirError::NoWritePerms => MkdirError::NoWritePerms,
-        broker_fs::errors::MkdirError::AlreadyExists => MkdirError::AlreadyExists,
-        broker_fs::errors::MkdirError::ReadOnlyFileSystem => MkdirError::ReadOnlyFileSystem,
-        broker_fs::errors::MkdirError::Io => MkdirError::Io,
-        broker_fs::errors::MkdirError::PathError(error) => {
-            MkdirError::PathError(guest_path_error(error))
-        }
-    }
-}
-
-fn guest_rmdir_error(error: broker_fs::errors::RmdirError) -> RmdirError {
-    match error {
-        broker_fs::errors::RmdirError::NoWritePerms => RmdirError::NoWritePerms,
-        broker_fs::errors::RmdirError::Busy => RmdirError::Busy,
-        broker_fs::errors::RmdirError::NotEmpty => RmdirError::NotEmpty,
-        broker_fs::errors::RmdirError::NotADirectory => RmdirError::NotADirectory,
-        broker_fs::errors::RmdirError::ReadOnlyFileSystem => RmdirError::ReadOnlyFileSystem,
-        broker_fs::errors::RmdirError::Io => RmdirError::Io,
-        broker_fs::errors::RmdirError::PathError(error) => {
-            RmdirError::PathError(guest_path_error(error))
-        }
-    }
-}
-
-fn guest_read_dir_error(error: broker_fs::errors::ReadDirError) -> ReadDirError {
-    match error {
-        broker_fs::errors::ReadDirError::ClosedFd => ReadDirError::ClosedFd,
-        broker_fs::errors::ReadDirError::NotADirectory => ReadDirError::NotADirectory,
-        broker_fs::errors::ReadDirError::Io => ReadDirError::Io,
-    }
-}
-
-fn guest_file_status_error(error: broker_fs::errors::FileStatusError) -> FileStatusError {
-    match error {
-        broker_fs::errors::FileStatusError::ClosedFd => FileStatusError::ClosedFd,
-        broker_fs::errors::FileStatusError::Io => FileStatusError::Io,
-        broker_fs::errors::FileStatusError::PathError(error) => {
-            FileStatusError::PathError(guest_path_error(error))
-        }
-    }
+fn optional_device(device: Option<u64>) -> Result<Option<core::num::NonZeroUsize>, ()> {
+    device
+        .map(|device| {
+            usize::try_from(device)
+                .ok()
+                .and_then(core::num::NonZeroUsize::new)
+                .ok_or(())
+        })
+        .transpose()
 }
 
 crate::fd::enable_fds_for_subsystem! {
-    @ Platform: { sync::RawSyncPrimitivesProvider }, Backend: { broker_fs::backend::Backend + 'static };
-    Resolver<Platform, Backend>;
-    @ Backend: { broker_fs::backend::Backend + 'static };
-    ResolverEntry<Backend>;
-    -> ResolverFd<Platform, Backend>;
+    @ Platform: { sync::RawSyncPrimitivesProvider };
+    Resolver<Platform>;
+    BrokerFile;
+    -> ResolverFd<Platform>;
 }

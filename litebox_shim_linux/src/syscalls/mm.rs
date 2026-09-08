@@ -812,15 +812,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 let word_len = file_size.div_ceil(8);
                 let mut words = u64::new_vec_zeroed(word_len).ok()?;
                 let bytes = zerocopy::IntoBytes::as_mut_bytes(words.as_mut_slice());
-                match self.sys_read(fd, &mut bytes[..file_size], Some(0)) {
-                    Ok(n) if n == file_size => {
-                        litebox_syscall_rewriter::aarch64::ElfCodeMetadata::parse_aligned_in_place(
-                            &mut words, file_size,
-                        )
-                        .ok()
-                    }
-                    _ => None,
-                }
+                self.read_file_exact_at(fd, &mut bytes[..file_size], 0)
+                    .ok()?;
+                litebox_syscall_rewriter::aarch64::ElfCodeMetadata::parse_aligned_in_place(
+                    &mut words, file_size,
+                )
+                .ok()
             })
         };
         #[cfg(all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"))]
@@ -952,6 +949,23 @@ impl<Platform: ShimPlatform> Task<Platform> {
         true
     }
 
+    fn read_file_exact_at(
+        &self,
+        fd: i32,
+        mut data: &mut [u8],
+        mut offset: usize,
+    ) -> Result<(), Errno> {
+        while !data.is_empty() {
+            let read = self.sys_read(fd, data, Some(offset))?;
+            if read == 0 {
+                return Err(Errno::EIO);
+            }
+            offset = offset.checked_add(read).ok_or(Errno::EOVERFLOW)?;
+            data = &mut data[read..];
+        }
+        Ok(())
+    }
+
     /// Check if a file has the LITEBOX trampoline magic at its tail.
     /// Returns (is_pre_patched, file_offset, vaddr, trampoline_size).
     fn check_trampoline_magic(&self, fd: i32) -> (bool, u64, u64, u64) {
@@ -969,6 +983,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if file_size < HEADER_SIZE {
             return (false, 0, 0, 0);
         }
+
         let mut tail = [0u8; HEADER_SIZE];
         match self.sys_read(fd, &mut tail, Some(file_size - HEADER_SIZE)) {
             Ok(n) if n == HEADER_SIZE => {}
@@ -1163,12 +1178,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 let mut tramp_data = alloc::vec![0u8; state.trampoline_file_size];
                 let file_off = state.trampoline_file_offset.trunc();
                 let tramp_ptr = UserPtrMut::<u8>::from_usize(tramp_addr);
-                match self.sys_read(fd, &mut tramp_data, Some(file_off)) {
-                    Ok(n) if n == tramp_data.len() => {}
-                    _ => {
-                        let _ = self.sys_munmap_raw(tramp_ptr, tramp_len);
-                        return false;
-                    }
+                if self
+                    .read_file_exact_at(fd, &mut tramp_data, file_off)
+                    .is_err()
+                {
+                    let _ = self.sys_munmap_raw(tramp_ptr, tramp_len);
+                    return false;
                 }
 
                 // Write syscall entry point to the first 8 bytes.

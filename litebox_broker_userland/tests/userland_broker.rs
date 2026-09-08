@@ -42,10 +42,13 @@ fn run_parent_test() {
     // the fake runner finishes its broker requests, it terminates the broker
     // parent process; this lets the test exercise the long-running broker
     // without a test-only shutdown path.
+    let test_executable = std::env::current_exe().unwrap();
     let mut event_command = Command::new(env!("CARGO_BIN_EXE_litebox-broker-userland"));
     event_command
+        .arg("--fs-program")
+        .arg(&test_executable)
         .arg("--runner")
-        .arg(std::env::current_exe().unwrap())
+        .arg(&test_executable)
         .arg(RUNNER_ARGUMENT);
     wait_for_broker(event_command);
 
@@ -68,12 +71,14 @@ fn run_parent_test() {
     });
     let mut network_command = Command::new(env!("CARGO_BIN_EXE_litebox-broker-userland"));
     network_command
+        .arg("--fs-program")
+        .arg(&test_executable)
         .arg("--allow-tcp-destination")
         .arg(format!("{gateway}/32:{tcp_port}"))
         .arg("--allow-udp-destination")
         .arg(format!("{gateway}/32:{udp_port}"))
         .arg("--runner")
-        .arg(std::env::current_exe().unwrap())
+        .arg(test_executable)
         .arg(NETWORK_RUNNER_ARGUMENT)
         .arg(tcp_port.to_string())
         .arg(udp_port.to_string());

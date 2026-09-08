@@ -48,8 +48,8 @@ const FILE_SHARE_READ: u32 = 0x0000_0001;
 const FILE_SHARE_WRITE: u32 = 0x0000_0002;
 const FILE_SHARE_DELETE: u32 = 0x0000_0004;
 
-// Bound guest-controlled file I/O allocations while keeping backend call overhead reasonable.
-const FILE_IO_CHUNK_SIZE: usize = 0x80_000;
+// Match the broker file payload limit so a successful chunk is not mistaken for a short transfer.
+const FILE_IO_CHUNK_SIZE: usize = 0x10_000;
 
 /// Append at the current end of file
 const FILE_WRITE_TO_END_OF_FILE: i64 = -1;

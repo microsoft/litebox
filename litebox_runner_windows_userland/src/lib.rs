@@ -11,25 +11,7 @@ use anyhow::{Context as _, Result};
 use clap::Parser;
 use litebox_broker_local_userland as broker;
 use litebox_platform_windows_userland::WindowsUserland;
-use memmap2::Mmap;
-use std::path::{Path, PathBuf};
-
-fn mmapped_file(path: impl AsRef<Path>) -> Result<&'static [u8]> {
-    let path = path.as_ref();
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("Could not open tar file at {}", path.display()))?;
-    let data = {
-        // SAFETY: The runner maps the input read-only and does not modify it. The caller must ensure
-        // the tar file is not modified externally while the guest is running.
-        //
-        // Leak the mapping so the borrowed tar data remains valid for the process-lifetime file
-        // system.
-        Box::leak(Box::new(unsafe { Mmap::map(&file) }.with_context(
-            || format!("Could not map tar file at {}", path.display()),
-        )?))
-    };
-    Ok(data)
-}
+use std::path::PathBuf;
 
 /// Runs a Windows PE program with LiteBox on unmodified Windows and returns its exit code.
 ///
@@ -61,8 +43,10 @@ pub struct CliArgs {
     )]
     pub broker_control_channel: Option<std::ffi::OsString>,
     /// Tar archive containing the program and its runtime files.
+    ///
+    /// This may be omitted when the broker was configured with `--fs-initial-files`.
     #[arg(long = "initial-files", value_name = "PATH_TO_TAR", value_hint = clap::ValueHint::FilePath)]
-    pub initial_files: PathBuf,
+    pub initial_files: Option<PathBuf>,
 }
 
 /// Run Windows PE programs with LiteBox on unmodified Windows.
@@ -82,53 +66,30 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         )
         .init();
 
-    let tar_file = &cli_args.initial_files;
-    if tar_file.extension().and_then(|x| x.to_str()) != Some("tar") {
-        anyhow::bail!("Expected a .tar file, found {}", tar_file.display());
-    }
-    let tar_data = mmapped_file(tar_file)?;
-
     let platform = WindowsUserland::new();
-    let broker_connection = cli_args
+    let control_pipe = cli_args
         .broker_control_channel
         .as_deref()
-        .map(broker::connect)
-        .transpose()?;
-    let shim_builder = if let Some(broker_connection) = broker_connection {
-        let broker::BrokerConnection {
-            local,
-            notifications,
-        } = broker_connection;
-        let litebox = litebox::LiteBox::new_with_broker_local(platform, local);
-        broker::start_notification_receiver(
-            notifications,
-            litebox.broker_notification_dispatcher(),
-            litebox.broker_failure_dispatcher(),
-        )?;
-        litebox_shim_windows::WindowsShimBuilder::new_with_litebox(platform, litebox)
-    } else {
-        litebox_shim_windows::WindowsShimBuilder::new(platform)
-    };
+        .context("file operations require --broker-control-channel")?;
+    let broker::BrokerConnection {
+        local,
+        notifications,
+    } = broker::connect(control_pipe)?;
+    let litebox = litebox::LiteBox::new_with_broker_local(platform, local);
+    broker::start_notification_receiver(
+        notifications,
+        litebox.broker_notification_dispatcher(),
+        litebox.broker_failure_dispatcher(),
+    )?;
+    let shim_builder =
+        litebox_shim_windows::WindowsShimBuilder::new_with_litebox(platform, litebox);
 
     let (program_path, program_args) = cli_args
         .program_and_arguments
         .split_first()
         .context("program path missing — clap should have required at least one argument")?;
 
-    let initial_file_system = {
-        let in_mem = litebox::fs::in_mem::InMem::new_initialized([(
-            "/tmp",
-            litebox::fs::in_mem::InitialNode::Directory {
-                mode: litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
-                owner: litebox::fs::UserInfo {
-                    user: 1000,
-                    group: 1000,
-                },
-            },
-        )]);
-
-        shim_builder.default_fs(in_mem, tar_data.into())
-    };
+    let initial_file_system = shim_builder.brokered_fs();
     let initial_file_system = std::sync::Arc::new(initial_file_system);
 
     let shim = shim_builder.build();

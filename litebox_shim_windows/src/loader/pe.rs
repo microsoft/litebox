@@ -2544,17 +2544,20 @@ mod tests {
 
     fn created_process_environment_snapshot() -> CreatedProcessEnvironmentSnapshot {
         let platform = crate::tests::test_platform();
-        let litebox = litebox::LiteBox::new(platform);
+        let litebox = crate::test_broker::litebox(
+            platform,
+            alloc::vec![(
+                "/".into(),
+                litebox_broker_core::fs::in_mem::InitialNode::Directory {
+                    mode: litebox_broker_core::fs::Mode::RWXU
+                        | litebox_broker_core::fs::Mode::RWXG
+                        | litebox_broker_core::fs::Mode::RWXO,
+                    owner: litebox_broker_core::fs::UserInfo::ROOT,
+                },
+            )],
+        );
         let page_manager = crate::WindowsPageManager::<crate::tests::TestPlatform>::new(&litebox);
-        let fs = Arc::new(litebox::fs::resolver::Resolver::new(
-            &litebox,
-            litebox::fs::composer::Composer::builder()
-                .mount("/", |allocator| {
-                    litebox::fs::in_mem::InMem::<crate::tests::TestPlatform>::new(allocator)
-                })
-                .build()
-                .expect("valid test filesystem"),
-        ));
+        let fs = Arc::new(litebox::fs::resolver::Resolver::new_brokered(&litebox));
         let loader = PeLoader::new(platform, fs, &page_manager);
         let image = loaded_module_image(application_module_base());
 
