@@ -685,6 +685,16 @@ mod in_mem {
             Err(crate::fs::errors::OpenError::AlreadyExists)
         ));
 
+        assert!(matches!(
+            fs.open(
+                &ctx,
+                "/newfile",
+                OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY | OFlags::TRUNC,
+                Mode::RWXU,
+            ),
+            Err(crate::fs::errors::OpenError::AlreadyExists)
+        ));
+
         // Test O_EXCL without O_CREAT (should be ignored and succeed)
         let fd = fs
             .open(
