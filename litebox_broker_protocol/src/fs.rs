@@ -443,30 +443,37 @@ pub enum DirectoryPayloadError {
     Malformed,
     #[error("directory payload exceeds one fs transfer")]
     TooLarge,
+}
+
+/// Error while processing a directory payload for an fs transfer.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DirectoryTransferError {
+    #[error(transparent)]
+    Payload(#[from] DirectoryPayloadError),
     #[error("directory payload allocation failed")]
     OutOfMemory,
 }
 
-/// Error while encoding one bounded directory payload chunk.
-#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
-pub enum DirectoryChunkError {
-    #[error("directory payload chunk exceeds its transfer limit")]
-    TooLarge,
-    #[error("directory payload chunk allocation failed")]
-    OutOfMemory,
+impl DirectoryTransferError {
+    fn into_payload_error(self) -> DirectoryPayloadError {
+        match self {
+            Self::Payload(error) => error,
+            Self::OutOfMemory => DirectoryPayloadError::TooLarge,
+        }
+    }
 }
 
 /// Encodes directory entries for one fs shared-buffer transfer.
+///
+/// Allocation failures are reported as [`DirectoryPayloadError::TooLarge`] for
+/// compatibility with the original codec API.
 pub fn encode_directory_entries(
     entries: &[FileDirectoryEntry],
 ) -> Result<Vec<u8>, DirectoryPayloadError> {
     let (payload, next_index) =
-        encode_directory_entries_chunk(entries, 0, MAX_FILE_TRANSFER_SIZE as usize).map_err(
-            |error| match error {
-                DirectoryChunkError::TooLarge => DirectoryPayloadError::TooLarge,
-                DirectoryChunkError::OutOfMemory => DirectoryPayloadError::OutOfMemory,
-            },
-        )?;
+        encode_directory_entries_chunk(entries, 0, MAX_FILE_TRANSFER_SIZE as usize)
+            .map_err(DirectoryTransferError::into_payload_error)?;
     if next_index.is_some() {
         return Err(DirectoryPayloadError::TooLarge);
     }
@@ -480,53 +487,63 @@ pub fn encode_directory_entries_chunk(
     entries: &[FileDirectoryEntry],
     start_index: usize,
     maximum_length: usize,
-) -> Result<(Vec<u8>, Option<u64>), DirectoryChunkError> {
+) -> Result<(Vec<u8>, Option<u64>), DirectoryTransferError> {
     let (end_index, encoded_length) =
         directory_entries_chunk_end(entries, start_index, maximum_length)?;
     let mut output = Vec::new();
     output
         .try_reserve_exact(encoded_length)
-        .map_err(|_| DirectoryChunkError::OutOfMemory)?;
+        .map_err(|_| DirectoryTransferError::OutOfMemory)?;
     output.extend_from_slice(&0u32.to_le_bytes());
     for entry in &entries[start_index..end_index] {
-        encode_directory_entry(&mut output, entry).map_err(|_| DirectoryChunkError::TooLarge)?;
+        encode_directory_entry(&mut output, entry)?;
     }
     let count =
-        u32::try_from(end_index - start_index).map_err(|_| DirectoryChunkError::TooLarge)?;
+        u32::try_from(end_index - start_index).map_err(|_| DirectoryPayloadError::TooLarge)?;
     output[..size_of::<u32>()].copy_from_slice(&count.to_le_bytes());
     let next_index = if end_index == entries.len() {
         None
     } else {
-        Some(u64::try_from(end_index).map_err(|_| DirectoryChunkError::TooLarge)?)
+        Some(u64::try_from(end_index).map_err(|_| DirectoryPayloadError::TooLarge)?)
     };
     Ok((output, next_index))
 }
 
 /// Decodes directory entries from one fs shared-buffer transfer.
+///
+/// Allocation failures are reported as [`DirectoryPayloadError::TooLarge`] for
+/// compatibility with the original codec API.
 pub fn decode_directory_entries(
     payload: &[u8],
 ) -> Result<Vec<FileDirectoryEntry>, DirectoryPayloadError> {
+    try_decode_directory_entries(payload).map_err(DirectoryTransferError::into_payload_error)
+}
+
+/// Decodes directory entries while distinguishing allocation failure.
+pub fn try_decode_directory_entries(
+    payload: &[u8],
+) -> Result<Vec<FileDirectoryEntry>, DirectoryTransferError> {
     const MINIMUM_ENTRY_LENGTH: usize = size_of::<u32>() + 2;
 
     if payload.len() > MAX_FILE_TRANSFER_SIZE as usize {
-        return Err(DirectoryPayloadError::TooLarge);
+        return Err(DirectoryPayloadError::TooLarge.into());
     }
     let mut decoder = DirectoryPayloadDecoder { payload, offset: 0 };
     let count = decoder.u32()? as usize;
     if count > (decoder.payload.len() - decoder.offset) / MINIMUM_ENTRY_LENGTH {
-        return Err(DirectoryPayloadError::Malformed);
+        return Err(DirectoryPayloadError::Malformed.into());
     }
     let mut entries = Vec::new();
     entries
         .try_reserve_exact(count)
-        .map_err(|_| DirectoryPayloadError::OutOfMemory)?;
+        .map_err(|_| DirectoryTransferError::OutOfMemory)?;
     for _ in 0..count {
         let name_len = decoder.u32()? as usize;
         let encoded_name = core::str::from_utf8(decoder.take(name_len)?)
             .map_err(|_| DirectoryPayloadError::Malformed)?;
         let mut name = String::new();
         name.try_reserve_exact(encoded_name.len())
-            .map_err(|_| DirectoryPayloadError::OutOfMemory)?;
+            .map_err(|_| DirectoryTransferError::OutOfMemory)?;
         name.push_str(encoded_name);
         let file_type =
             file_type_from_raw(decoder.u8()?).ok_or(DirectoryPayloadError::Malformed)?;
@@ -538,11 +555,11 @@ pub fn decode_directory_entries(
                 let rdev = match decoder.u8()? {
                     0 => None,
                     1 => Some(decoder.u64()?),
-                    _ => return Err(DirectoryPayloadError::Malformed),
+                    _ => return Err(DirectoryPayloadError::Malformed.into()),
                 };
                 Some(FileNodeInfo { dev, ino, rdev })
             }
-            _ => return Err(DirectoryPayloadError::Malformed),
+            _ => return Err(DirectoryPayloadError::Malformed.into()),
         };
         entries.push(FileDirectoryEntry {
             name,
@@ -551,7 +568,7 @@ pub fn decode_directory_entries(
         });
     }
     if decoder.offset != payload.len() {
-        return Err(DirectoryPayloadError::Malformed);
+        return Err(DirectoryPayloadError::Malformed.into());
     }
     Ok(entries)
 }
@@ -598,26 +615,23 @@ fn directory_entries_chunk_end(
     entries: &[FileDirectoryEntry],
     start_index: usize,
     maximum_length: usize,
-) -> Result<(usize, usize), DirectoryChunkError> {
+) -> Result<(usize, usize), DirectoryPayloadError> {
     if start_index > entries.len()
         || !(size_of::<u32>()..=MAX_FILE_TRANSFER_SIZE as usize).contains(&maximum_length)
     {
-        return Err(DirectoryChunkError::TooLarge);
+        return Err(DirectoryPayloadError::TooLarge);
     }
     let mut encoded_length = size_of::<u32>();
     let mut end_index = start_index;
     while let Some(entry) = entries.get(end_index) {
         encoded_length = encoded_length
-            .checked_add(
-                encoded_directory_entry_length(entry).map_err(|_| DirectoryChunkError::TooLarge)?,
-            )
-            .ok_or(DirectoryChunkError::TooLarge)?;
+            .checked_add(encoded_directory_entry_length(entry)?)
+            .ok_or(DirectoryPayloadError::TooLarge)?;
         if encoded_length > maximum_length {
             if end_index == start_index {
-                return Err(DirectoryChunkError::TooLarge);
+                return Err(DirectoryPayloadError::TooLarge);
             }
-            encoded_length -=
-                encoded_directory_entry_length(entry).map_err(|_| DirectoryChunkError::TooLarge)?;
+            encoded_length -= encoded_directory_entry_length(entry)?;
             break;
         }
         end_index += 1;

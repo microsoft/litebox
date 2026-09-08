@@ -28,11 +28,12 @@ use litebox_broker_core::{BrokerCore, BrokerSession, CallerCredential};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse};
 use litebox_broker_protocol::fs::{
-    ChmodFileRequest, ChownFileRequest, DirectoryChunkError, FileError, HandleFileStatusRequest,
-    MAX_FILE_TRANSFER_SIZE, MkdirFileRequest, OpenFileRequest, OpenFileResponse,
-    PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
-    ReadFileResponse, RmdirFileRequest, SeekFileRequest, SeekFileResponse, TruncateFileRequest,
-    UnlinkFileRequest, WriteFileRequest, WriteFileResponse, encode_directory_entries_chunk,
+    ChmodFileRequest, ChownFileRequest, DirectoryPayloadError, DirectoryTransferError, FileError,
+    HandleFileStatusRequest, MAX_FILE_TRANSFER_SIZE, MkdirFileRequest, OpenFileRequest,
+    OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse,
+    ReadFileRequest, ReadFileResponse, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
+    TruncateFileRequest, UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
+    encode_directory_entries_chunk,
 };
 use litebox_broker_protocol::message::{
     BrokerHandshakeResponse, BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
@@ -515,11 +516,15 @@ fn handle_file_request<Memory: SharedMemory>(
                 match encode_directory_entries_chunk(&entries, start_index, buffer.length as usize)
                 {
                     Ok(page) => page,
-                    Err(DirectoryChunkError::TooLarge) => {
-                        return Ok(FileResponse::Failed(FileError::Io));
-                    }
-                    Err(DirectoryChunkError::OutOfMemory) => {
+                    Err(DirectoryTransferError::Payload(
+                        DirectoryPayloadError::Malformed | DirectoryPayloadError::TooLarge,
+                    )) => return Ok(FileResponse::Failed(FileError::Io)),
+                    Err(DirectoryTransferError::OutOfMemory) => {
                         return Err(RequestFailure::Respond(ErrorCode::OutOfMemory));
+                    }
+                    Err(error) => {
+                        let _ = error;
+                        return Err(RequestFailure::Abort(ErrorCode::Internal));
                     }
                 };
             shared_buffers

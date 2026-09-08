@@ -6,12 +6,12 @@ use alloc::vec::Vec;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{
-    ChmodFileRequest, ChownFileRequest, DirectoryPayloadError, FileAccessMode, FileDirectoryEntry,
-    FileError, FileMode, FileOpenFlags, FileSeekWhence, FileStatus, FileUser,
-    HandleFileStatusRequest, MAX_FILE_TRANSFER_SIZE, MkdirFileRequest, OpenFileRequest,
-    PathFileStatusRequest, ReadDirectoryRequest, ReadFileRequest, RmdirFileRequest,
-    SeekFileRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
-    decode_directory_entries,
+    ChmodFileRequest, ChownFileRequest, DirectoryPayloadError, DirectoryTransferError,
+    FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileOpenFlags, FileSeekWhence,
+    FileStatus, FileUser, HandleFileStatusRequest, MAX_FILE_TRANSFER_SIZE, MkdirFileRequest,
+    OpenFileRequest, PathFileStatusRequest, ReadDirectoryRequest, ReadFileRequest,
+    RmdirFileRequest, SeekFileRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
+    try_decode_directory_entries,
 };
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, FileRequest, FileResponse};
 use litebox_broker_protocol::shared_buffer::SharedBufferDescriptor;
@@ -51,13 +51,387 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             response => panic!("broker returned unexpected file open response: {response:?}"),
         }
     }
+
+    /// Reads from an open file.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the buffer descriptor is inconsistent or the broker returns
+    /// an invalid response.
+    pub fn read_file(
+        &self,
+        handle: ObjectHandle,
+        buffer: SharedBufferDescriptor,
+        destination: &mut [u8],
+        offset: Option<u64>,
+    ) -> Result<FileOperationResult<usize>, Channel::Error> {
+        self.validate_file_buffer(buffer, destination.len())?;
+        match self.request_file(FileRequest::Read(ReadFileRequest {
+            handle,
+            buffer,
+            offset,
+        }))? {
+            FileResponse::Read(response) => {
+                assert!(
+                    response.read <= buffer.length,
+                    "broker returned oversized file read"
+                );
+                let read = response.read as usize;
+                self.shared_buffers
+                    .read(buffer.slot_index, &mut destination[..read])
+                    .expect("validated shared file read range must be accessible");
+                Ok(Ok(read))
+            }
+            FileResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected file read response: {response:?}"),
+        }
+    }
+
+    /// Writes to an open file.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the buffer descriptor is inconsistent or the broker returns
+    /// an invalid response.
+    pub fn write_file(
+        &self,
+        handle: ObjectHandle,
+        buffer: SharedBufferDescriptor,
+        data: &[u8],
+        offset: Option<u64>,
+    ) -> Result<FileOperationResult<usize>, Channel::Error> {
+        self.write_file_buffer(buffer, data)?;
+        match self.request_file(FileRequest::Write(WriteFileRequest {
+            handle,
+            buffer,
+            offset,
+        }))? {
+            FileResponse::Write(response) => {
+                assert!(
+                    response.written <= buffer.length,
+                    "broker returned oversized file write"
+                );
+                Ok(Ok(response.written as usize))
+            }
+            FileResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected file write response: {response:?}"),
+        }
+    }
+
+    /// Repositions an open file.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for another file operation.
+    pub fn seek_file(
+        &self,
+        handle: ObjectHandle,
+        offset: i64,
+        whence: FileSeekWhence,
+    ) -> Result<FileOperationResult<u64>, Channel::Error> {
+        match self.request_file(FileRequest::Seek(SeekFileRequest {
+            handle,
+            offset,
+            whence,
+        }))? {
+            FileResponse::Seek(response) => Ok(Ok(response.offset)),
+            FileResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected file seek response: {response:?}"),
+        }
+    }
+
+    /// Truncates an open file.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for another file operation.
+    pub fn truncate_file(
+        &self,
+        handle: ObjectHandle,
+        length: u64,
+        reset_offset: bool,
+    ) -> Result<FileOperationResult<()>, Channel::Error> {
+        match self.request_file(FileRequest::Truncate(TruncateFileRequest {
+            handle,
+            length,
+            reset_offset,
+        }))? {
+            FileResponse::Truncate => Ok(Ok(())),
+            FileResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected file truncate response: {response:?}"),
+        }
+    }
+
+    /// Reads one encoded page of directory entries.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the buffer descriptor is inconsistent or the broker returns
+    /// an invalid response or directory payload.
+    pub fn read_directory(
+        &self,
+        handle: ObjectHandle,
+        buffer: SharedBufferDescriptor,
+        start_index: u64,
+    ) -> Result<DirectoryReadResult, Channel::Error> {
+        self.validate_file_buffer(buffer, buffer.length as usize)?;
+        match self.request_file(FileRequest::ReadDirectory(ReadDirectoryRequest {
+            handle,
+            buffer,
+            start_index,
+        }))? {
+            FileResponse::ReadDirectory(response) => {
+                assert!(
+                    response.length <= buffer.length,
+                    "broker returned oversized file directory payload"
+                );
+                let mut payload = Vec::new();
+                payload
+                    .try_reserve_exact(response.length as usize)
+                    .map_err(|_| BrokerLocalError::Broker(ErrorCode::OutOfMemory))?;
+                payload.resize(response.length as usize, 0);
+                self.shared_buffers
+                    .read(buffer.slot_index, &mut payload)
+                    .expect("validated shared file directory range must be accessible");
+                let entries = match try_decode_directory_entries(&payload) {
+                    Ok(entries) => entries,
+                    Err(DirectoryTransferError::OutOfMemory) => {
+                        return Err(BrokerLocalError::Broker(ErrorCode::OutOfMemory));
+                    }
+                    Err(DirectoryTransferError::Payload(
+                        DirectoryPayloadError::Malformed | DirectoryPayloadError::TooLarge,
+                    )) => panic!("broker returned malformed file directory payload"),
+                    Err(error) => {
+                        panic!("broker returned unsupported file directory payload error: {error}")
+                    }
+                };
+                if let Some(next_index) = response.next_index {
+                    let expected_next_index = start_index
+                        .checked_add(u64::try_from(entries.len()).unwrap())
+                        .expect("file directory index overflow");
+                    assert!(
+                        !entries.is_empty() && next_index == expected_next_index,
+                        "broker returned inconsistent file directory continuation"
+                    );
+                }
+                Ok(Ok((entries, response.next_index)))
+            }
+            FileResponse::Failed(error) => Ok(Err(error)),
+            response => {
+                panic!("broker returned unexpected file directory response: {response:?}")
+            }
+        }
+    }
+
+    /// Returns status for an absolute path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the buffer descriptor is inconsistent or the broker returns
+    /// a response for another file operation.
+    pub fn path_file_status(
+        &self,
+        path_buffer: SharedBufferDescriptor,
+        path: &str,
+        user: FileUser,
+    ) -> Result<FileOperationResult<FileStatus>, Channel::Error> {
+        self.write_file_buffer(path_buffer, path.as_bytes())?;
+        match self.request_file(FileRequest::PathStatus(PathFileStatusRequest {
+            path: path_buffer,
+            user,
+        }))? {
+            FileResponse::PathStatus(status) => Ok(Ok(status)),
+            FileResponse::Failed(error) => Ok(Err(error)),
+            response => {
+                panic!("broker returned unexpected file path-status response: {response:?}")
+            }
+        }
+    }
+
+    /// Returns status for an open file.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for another file operation.
+    pub fn handle_file_status(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<FileOperationResult<FileStatus>, Channel::Error> {
+        match self.request_file(FileRequest::HandleStatus(HandleFileStatusRequest {
+            handle,
+        }))? {
+            FileResponse::HandleStatus(status) => Ok(Ok(status)),
+            FileResponse::Failed(error) => Ok(Err(error)),
+            response => {
+                panic!("broker returned unexpected file handle-status response: {response:?}")
+            }
+        }
+    }
+
+    /// Changes mode bits for an absolute path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the buffer descriptor is inconsistent or the broker returns
+    /// a response for another file operation.
+    pub fn chmod_file(
+        &self,
+        path_buffer: SharedBufferDescriptor,
+        path: &str,
+        user: FileUser,
+        mode: FileMode,
+    ) -> Result<FileOperationResult<()>, Channel::Error> {
+        self.write_file_buffer(path_buffer, path.as_bytes())?;
+        match self.request_file(FileRequest::Chmod(ChmodFileRequest {
+            path: path_buffer,
+            user,
+            mode,
+        }))? {
+            FileResponse::Chmod => Ok(Ok(())),
+            FileResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected file chmod response: {response:?}"),
+        }
+    }
+
+    /// Changes ownership for an absolute path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the buffer descriptor is inconsistent or the broker returns
+    /// a response for another file operation.
+    pub fn chown_file(
+        &self,
+        path_buffer: SharedBufferDescriptor,
+        path: &str,
+        acting_user: FileUser,
+        user: Option<u16>,
+        group: Option<u16>,
+    ) -> Result<FileOperationResult<()>, Channel::Error> {
+        self.write_file_buffer(path_buffer, path.as_bytes())?;
+        match self.request_file(FileRequest::Chown(ChownFileRequest {
+            path: path_buffer,
+            acting_user,
+            user,
+            group,
+        }))? {
+            FileResponse::Chown => Ok(Ok(())),
+            FileResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected file chown response: {response:?}"),
+        }
+    }
+
+    /// Removes a file at an absolute path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the buffer descriptor is inconsistent or the broker returns
+    /// a response for another file operation.
+    pub fn unlink_file(
+        &self,
+        path_buffer: SharedBufferDescriptor,
+        path: &str,
+        user: FileUser,
+    ) -> Result<FileOperationResult<()>, Channel::Error> {
+        self.write_file_buffer(path_buffer, path.as_bytes())?;
+        match self.request_file(FileRequest::Unlink(UnlinkFileRequest {
+            path: path_buffer,
+            user,
+        }))? {
+            FileResponse::Unlink => Ok(Ok(())),
+            FileResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected file unlink response: {response:?}"),
+        }
+    }
+
+    /// Creates a directory at an absolute path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the buffer descriptor is inconsistent or the broker returns
+    /// a response for another file operation.
+    pub fn mkdir_file(
+        &self,
+        path_buffer: SharedBufferDescriptor,
+        path: &str,
+        user: FileUser,
+        mode: FileMode,
+    ) -> Result<FileOperationResult<()>, Channel::Error> {
+        self.write_file_buffer(path_buffer, path.as_bytes())?;
+        match self.request_file(FileRequest::Mkdir(MkdirFileRequest {
+            path: path_buffer,
+            user,
+            mode,
+        }))? {
+            FileResponse::Mkdir => Ok(Ok(())),
+            FileResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected file mkdir response: {response:?}"),
+        }
+    }
+
+    /// Removes a directory at an absolute path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the buffer descriptor is inconsistent or the broker returns
+    /// a response for another file operation.
+    pub fn rmdir_file(
+        &self,
+        path_buffer: SharedBufferDescriptor,
+        path: &str,
+        user: FileUser,
+    ) -> Result<FileOperationResult<()>, Channel::Error> {
+        self.write_file_buffer(path_buffer, path.as_bytes())?;
+        match self.request_file(FileRequest::Rmdir(RmdirFileRequest {
+            path: path_buffer,
+            user,
+        }))? {
+            FileResponse::Rmdir => Ok(Ok(())),
+            FileResponse::Failed(error) => Ok(Err(error)),
+            response => panic!("broker returned unexpected file rmdir response: {response:?}"),
+        }
+    }
+
+    fn validate_file_buffer(
+        &self,
+        buffer: SharedBufferDescriptor,
+        expected_length: usize,
+    ) -> Result<(), Channel::Error> {
+        if buffer.length > MAX_FILE_TRANSFER_SIZE {
+            return Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted));
+        }
+        assert_eq!(
+            expected_length, buffer.length as usize,
+            "shared file data must match its descriptor"
+        );
+        self.shared_buffers
+            .layout()
+            .range(buffer.slot_index, expected_length)
+            .expect("shared file descriptor must identify a valid slot range");
+        Ok(())
+    }
+
+    fn write_file_buffer(
+        &self,
+        buffer: SharedBufferDescriptor,
+        data: &[u8],
+    ) -> Result<(), Channel::Error> {
+        self.validate_file_buffer(buffer, data.len())?;
+        self.shared_buffers
+            .write(buffer.slot_index, data)
+            .expect("validated shared file write range must be accessible");
+        Ok(())
+    }
+
+    fn request_file(&self, request: FileRequest) -> Result<FileResponse, Channel::Error> {
+        match self.request(BrokerOperation::File(request))? {
+            BrokerResult::File(response) => Ok(response),
+            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
+            response => panic!("broker returned unexpected file response: {response:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::items_after_test_module,
-    reason = "the test module must access private adapter state while the production methods stay grouped"
-)]
 mod tests {
     use super::*;
     use alloc::sync::Arc;
@@ -317,383 +691,6 @@ mod tests {
                 request_id: request.request_id,
                 result: self.results.borrow_mut().pop_front().unwrap(),
             })
-        }
-    }
-}
-
-impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
-    /// Reads from an open file.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the buffer descriptor is inconsistent or the broker returns
-    /// an invalid response.
-    pub fn read_file(
-        &self,
-        handle: ObjectHandle,
-        buffer: SharedBufferDescriptor,
-        destination: &mut [u8],
-        offset: Option<u64>,
-    ) -> Result<FileOperationResult<usize>, Channel::Error> {
-        self.validate_file_buffer(buffer, destination.len())?;
-        match self.request_file(FileRequest::Read(ReadFileRequest {
-            handle,
-            buffer,
-            offset,
-        }))? {
-            FileResponse::Read(response) => {
-                assert!(
-                    response.read <= buffer.length,
-                    "broker returned oversized file read"
-                );
-                let read = response.read as usize;
-                self.shared_buffers
-                    .read(buffer.slot_index, &mut destination[..read])
-                    .expect("validated shared file read range must be accessible");
-                Ok(Ok(read))
-            }
-            FileResponse::Failed(error) => Ok(Err(error)),
-            response => panic!("broker returned unexpected file read response: {response:?}"),
-        }
-    }
-
-    /// Writes to an open file.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the buffer descriptor is inconsistent or the broker returns
-    /// an invalid response.
-    pub fn write_file(
-        &self,
-        handle: ObjectHandle,
-        buffer: SharedBufferDescriptor,
-        data: &[u8],
-        offset: Option<u64>,
-    ) -> Result<FileOperationResult<usize>, Channel::Error> {
-        self.write_file_buffer(buffer, data)?;
-        match self.request_file(FileRequest::Write(WriteFileRequest {
-            handle,
-            buffer,
-            offset,
-        }))? {
-            FileResponse::Write(response) => {
-                assert!(
-                    response.written <= buffer.length,
-                    "broker returned oversized file write"
-                );
-                Ok(Ok(response.written as usize))
-            }
-            FileResponse::Failed(error) => Ok(Err(error)),
-            response => panic!("broker returned unexpected file write response: {response:?}"),
-        }
-    }
-
-    /// Repositions an open file.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the broker returns a response for another file operation.
-    pub fn seek_file(
-        &self,
-        handle: ObjectHandle,
-        offset: i64,
-        whence: FileSeekWhence,
-    ) -> Result<FileOperationResult<u64>, Channel::Error> {
-        match self.request_file(FileRequest::Seek(SeekFileRequest {
-            handle,
-            offset,
-            whence,
-        }))? {
-            FileResponse::Seek(response) => Ok(Ok(response.offset)),
-            FileResponse::Failed(error) => Ok(Err(error)),
-            response => panic!("broker returned unexpected file seek response: {response:?}"),
-        }
-    }
-
-    /// Truncates an open file.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the broker returns a response for another file operation.
-    pub fn truncate_file(
-        &self,
-        handle: ObjectHandle,
-        length: u64,
-        reset_offset: bool,
-    ) -> Result<FileOperationResult<()>, Channel::Error> {
-        match self.request_file(FileRequest::Truncate(TruncateFileRequest {
-            handle,
-            length,
-            reset_offset,
-        }))? {
-            FileResponse::Truncate => Ok(Ok(())),
-            FileResponse::Failed(error) => Ok(Err(error)),
-            response => panic!("broker returned unexpected file truncate response: {response:?}"),
-        }
-    }
-
-    /// Reads one encoded page of directory entries.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the buffer descriptor is inconsistent or the broker returns
-    /// an invalid response or directory payload.
-    pub fn read_directory(
-        &self,
-        handle: ObjectHandle,
-        buffer: SharedBufferDescriptor,
-        start_index: u64,
-    ) -> Result<DirectoryReadResult, Channel::Error> {
-        self.validate_file_buffer(buffer, buffer.length as usize)?;
-        match self.request_file(FileRequest::ReadDirectory(ReadDirectoryRequest {
-            handle,
-            buffer,
-            start_index,
-        }))? {
-            FileResponse::ReadDirectory(response) => {
-                assert!(
-                    response.length <= buffer.length,
-                    "broker returned oversized file directory payload"
-                );
-                let mut payload = Vec::new();
-                payload
-                    .try_reserve_exact(response.length as usize)
-                    .map_err(|_| BrokerLocalError::Broker(ErrorCode::OutOfMemory))?;
-                payload.resize(response.length as usize, 0);
-                self.shared_buffers
-                    .read(buffer.slot_index, &mut payload)
-                    .expect("validated shared file directory range must be accessible");
-                let entries = match decode_directory_entries(&payload) {
-                    Ok(entries) => entries,
-                    Err(DirectoryPayloadError::OutOfMemory) => {
-                        return Err(BrokerLocalError::Broker(ErrorCode::OutOfMemory));
-                    }
-                    Err(DirectoryPayloadError::Malformed | DirectoryPayloadError::TooLarge) => {
-                        panic!("broker returned malformed file directory payload");
-                    }
-                };
-                if let Some(next_index) = response.next_index {
-                    let expected_next_index = start_index
-                        .checked_add(u64::try_from(entries.len()).unwrap())
-                        .expect("file directory index overflow");
-                    assert!(
-                        !entries.is_empty() && next_index == expected_next_index,
-                        "broker returned inconsistent file directory continuation"
-                    );
-                }
-                Ok(Ok((entries, response.next_index)))
-            }
-            FileResponse::Failed(error) => Ok(Err(error)),
-            response => {
-                panic!("broker returned unexpected file directory response: {response:?}")
-            }
-        }
-    }
-
-    /// Returns status for an absolute path.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the buffer descriptor is inconsistent or the broker returns
-    /// a response for another file operation.
-    pub fn path_file_status(
-        &self,
-        path_buffer: SharedBufferDescriptor,
-        path: &str,
-        user: FileUser,
-    ) -> Result<FileOperationResult<FileStatus>, Channel::Error> {
-        self.write_file_buffer(path_buffer, path.as_bytes())?;
-        match self.request_file(FileRequest::PathStatus(PathFileStatusRequest {
-            path: path_buffer,
-            user,
-        }))? {
-            FileResponse::PathStatus(status) => Ok(Ok(status)),
-            FileResponse::Failed(error) => Ok(Err(error)),
-            response => {
-                panic!("broker returned unexpected file path-status response: {response:?}")
-            }
-        }
-    }
-
-    /// Returns status for an open file.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the broker returns a response for another file operation.
-    pub fn handle_file_status(
-        &self,
-        handle: ObjectHandle,
-    ) -> Result<FileOperationResult<FileStatus>, Channel::Error> {
-        match self.request_file(FileRequest::HandleStatus(HandleFileStatusRequest {
-            handle,
-        }))? {
-            FileResponse::HandleStatus(status) => Ok(Ok(status)),
-            FileResponse::Failed(error) => Ok(Err(error)),
-            response => {
-                panic!("broker returned unexpected file handle-status response: {response:?}")
-            }
-        }
-    }
-
-    /// Changes mode bits for an absolute path.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the buffer descriptor is inconsistent or the broker returns
-    /// a response for another file operation.
-    pub fn chmod_file(
-        &self,
-        path_buffer: SharedBufferDescriptor,
-        path: &str,
-        user: FileUser,
-        mode: FileMode,
-    ) -> Result<FileOperationResult<()>, Channel::Error> {
-        self.write_file_buffer(path_buffer, path.as_bytes())?;
-        match self.request_file(FileRequest::Chmod(ChmodFileRequest {
-            path: path_buffer,
-            user,
-            mode,
-        }))? {
-            FileResponse::Chmod => Ok(Ok(())),
-            FileResponse::Failed(error) => Ok(Err(error)),
-            response => panic!("broker returned unexpected file chmod response: {response:?}"),
-        }
-    }
-
-    /// Changes ownership for an absolute path.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the buffer descriptor is inconsistent or the broker returns
-    /// a response for another file operation.
-    pub fn chown_file(
-        &self,
-        path_buffer: SharedBufferDescriptor,
-        path: &str,
-        acting_user: FileUser,
-        user: Option<u16>,
-        group: Option<u16>,
-    ) -> Result<FileOperationResult<()>, Channel::Error> {
-        self.write_file_buffer(path_buffer, path.as_bytes())?;
-        match self.request_file(FileRequest::Chown(ChownFileRequest {
-            path: path_buffer,
-            acting_user,
-            user,
-            group,
-        }))? {
-            FileResponse::Chown => Ok(Ok(())),
-            FileResponse::Failed(error) => Ok(Err(error)),
-            response => panic!("broker returned unexpected file chown response: {response:?}"),
-        }
-    }
-
-    /// Removes a file at an absolute path.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the buffer descriptor is inconsistent or the broker returns
-    /// a response for another file operation.
-    pub fn unlink_file(
-        &self,
-        path_buffer: SharedBufferDescriptor,
-        path: &str,
-        user: FileUser,
-    ) -> Result<FileOperationResult<()>, Channel::Error> {
-        self.write_file_buffer(path_buffer, path.as_bytes())?;
-        match self.request_file(FileRequest::Unlink(UnlinkFileRequest {
-            path: path_buffer,
-            user,
-        }))? {
-            FileResponse::Unlink => Ok(Ok(())),
-            FileResponse::Failed(error) => Ok(Err(error)),
-            response => panic!("broker returned unexpected file unlink response: {response:?}"),
-        }
-    }
-
-    /// Creates a directory at an absolute path.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the buffer descriptor is inconsistent or the broker returns
-    /// a response for another file operation.
-    pub fn mkdir_file(
-        &self,
-        path_buffer: SharedBufferDescriptor,
-        path: &str,
-        user: FileUser,
-        mode: FileMode,
-    ) -> Result<FileOperationResult<()>, Channel::Error> {
-        self.write_file_buffer(path_buffer, path.as_bytes())?;
-        match self.request_file(FileRequest::Mkdir(MkdirFileRequest {
-            path: path_buffer,
-            user,
-            mode,
-        }))? {
-            FileResponse::Mkdir => Ok(Ok(())),
-            FileResponse::Failed(error) => Ok(Err(error)),
-            response => panic!("broker returned unexpected file mkdir response: {response:?}"),
-        }
-    }
-
-    /// Removes a directory at an absolute path.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the buffer descriptor is inconsistent or the broker returns
-    /// a response for another file operation.
-    pub fn rmdir_file(
-        &self,
-        path_buffer: SharedBufferDescriptor,
-        path: &str,
-        user: FileUser,
-    ) -> Result<FileOperationResult<()>, Channel::Error> {
-        self.write_file_buffer(path_buffer, path.as_bytes())?;
-        match self.request_file(FileRequest::Rmdir(RmdirFileRequest {
-            path: path_buffer,
-            user,
-        }))? {
-            FileResponse::Rmdir => Ok(Ok(())),
-            FileResponse::Failed(error) => Ok(Err(error)),
-            response => panic!("broker returned unexpected file rmdir response: {response:?}"),
-        }
-    }
-
-    fn validate_file_buffer(
-        &self,
-        buffer: SharedBufferDescriptor,
-        expected_length: usize,
-    ) -> Result<(), Channel::Error> {
-        if buffer.length > MAX_FILE_TRANSFER_SIZE {
-            return Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted));
-        }
-        assert_eq!(
-            expected_length, buffer.length as usize,
-            "shared file data must match its descriptor"
-        );
-        self.shared_buffers
-            .layout()
-            .range(buffer.slot_index, expected_length)
-            .expect("shared file descriptor must identify a valid slot range");
-        Ok(())
-    }
-
-    fn write_file_buffer(
-        &self,
-        buffer: SharedBufferDescriptor,
-        data: &[u8],
-    ) -> Result<(), Channel::Error> {
-        self.validate_file_buffer(buffer, data.len())?;
-        self.shared_buffers
-            .write(buffer.slot_index, data)
-            .expect("validated shared file write range must be accessible");
-        Ok(())
-    }
-
-    fn request_file(&self, request: FileRequest) -> Result<FileResponse, Channel::Error> {
-        match self.request(BrokerOperation::File(request))? {
-            BrokerResult::File(response) => Ok(response),
-            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
-            response => panic!("broker returned unexpected file response: {response:?}"),
         }
     }
 }
