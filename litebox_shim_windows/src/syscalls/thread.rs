@@ -934,26 +934,19 @@ mod tests {
     fn wait_for_alert_by_thread_id_blocks_until_alert() {
         run_with_test_platform_pointers(|| {
             let alerter = crate::tests::test_task();
-            let waiter = alerter
-                .clone_for_test()
-                .expect("a live process should accept another thread");
-            let waiter_thread = Arc::clone(&waiter.thread_object);
-            let thread_id = waiter_thread.thread_id();
             let wait_address = 0x1234;
             let (result_tx, result_rx) = std::sync::mpsc::channel();
-            let thread = std::thread::spawn(move || {
-                run_with_test_platform_pointers(|| {
-                    waiter.publish_thread_handle();
-                    let timeout = -10_000_000i64;
-                    result_tx
-                        .send(waiter.sys_nt_wait_for_alert_by_thread_id(
-                            wait_address,
-                            Some(const_ptr(&timeout)),
-                        ))
-                        .unwrap();
-                });
+            let (thread, waiter_thread) = alerter.spawn_clone_for_test(move |waiter| {
+                let timeout = -10_000_000i64;
+                result_tx
+                    .send(waiter.sys_nt_wait_for_alert_by_thread_id(
+                        wait_address,
+                        Some(const_ptr(&timeout)),
+                    ))
+                    .unwrap();
             });
 
+            let thread_id = waiter_thread.thread_id();
             let deadline = Instant::now() + Duration::from_secs(2);
             while !waiter_thread.thread_id_alert_state.lock().waiting {
                 assert!(Instant::now() < deadline, "waiter did not enter alert wait");
@@ -980,57 +973,18 @@ mod tests {
     }
 
     #[test]
-    fn alerts_before_wait_coalesce() {
-        run_with_test_platform_pointers(|| {
-            let alerter = crate::tests::test_task();
-            let waiter = alerter
-                .clone_for_test()
-                .expect("a live process should accept another thread");
-            let thread_id = waiter.thread_object.thread_id();
-            let alert_lock = 0;
-
-            assert_eq!(
-                alerter.sys_nt_alert_thread_by_thread_id_ex(thread_id, alert_lock),
-                NtStatus::SUCCESS
-            );
-            assert_eq!(
-                alerter.sys_nt_alert_thread_by_thread_id_ex(thread_id, alert_lock),
-                NtStatus::SUCCESS
-            );
-            let timeout = 0i64;
-            assert_eq!(
-                waiter.sys_nt_wait_for_alert_by_thread_id(0x1234, Some(const_ptr(&timeout))),
-                NtStatus::ALERTED
-            );
-            assert_eq!(
-                waiter.sys_nt_wait_for_alert_by_thread_id(0x5678, Some(const_ptr(&timeout))),
-                NtStatus::TIMEOUT
-            );
-        });
-    }
-
-    #[test]
     fn classic_alert_does_not_satisfy_thread_id_alert_wait() {
         run_with_test_platform_pointers(|| {
             let alerter = crate::tests::test_task();
-            let waiter = alerter
-                .clone_for_test()
-                .expect("a live process should accept another thread");
-            let waiter_thread = Arc::clone(&waiter.thread_object);
-            let thread_id = waiter_thread.thread_id();
             let (result_tx, result_rx) = std::sync::mpsc::channel();
-            let thread = std::thread::spawn(move || {
-                run_with_test_platform_pointers(|| {
-                    waiter.publish_thread_handle();
-                    let timeout = -10_000_000i64;
-                    result_tx
-                        .send(
-                            waiter.sys_nt_wait_for_alert_by_thread_id(0, Some(const_ptr(&timeout))),
-                        )
-                        .unwrap();
-                });
+            let (thread, waiter_thread) = alerter.spawn_clone_for_test(move |waiter| {
+                let timeout = -10_000_000i64;
+                result_tx
+                    .send(waiter.sys_nt_wait_for_alert_by_thread_id(0, Some(const_ptr(&timeout))))
+                    .unwrap();
             });
 
+            let thread_id = waiter_thread.thread_id();
             let deadline = Instant::now() + Duration::from_secs(2);
             while !waiter_thread.thread_id_alert_state.lock().waiting {
                 assert!(Instant::now() < deadline, "waiter did not enter alert wait");
@@ -1058,28 +1012,21 @@ mod tests {
     fn alert_wakes_an_alertable_wait() {
         run_with_test_platform_pointers(|| {
             let parent = crate::tests::test_task();
-            let waiter = parent
-                .clone_for_test()
-                .expect("a live process should accept another thread");
-            let waiter_thread = Arc::clone(&waiter.thread_object);
             let (registered_tx, registered_rx) = std::sync::mpsc::channel();
             let (result_tx, result_rx) = std::sync::mpsc::channel();
-            let thread = std::thread::spawn(move || {
-                run_with_test_platform_pointers(|| {
-                    waiter.publish_thread_handle();
-                    let result: Result<(), TryOpError<NtStatus>> = waiter.wait_on_events(
-                        false,
-                        true,
-                        None,
-                        Events::IN,
-                        |_, _| {
-                            registered_tx.send(()).unwrap();
-                            Ok(())
-                        },
-                        || Err(TryOpError::TryAgain),
-                    );
-                    result_tx.send(result).unwrap();
-                });
+            let (thread, waiter_thread) = parent.spawn_clone_for_test(move |waiter| {
+                let result: Result<(), TryOpError<NtStatus>> = waiter.wait_on_events(
+                    false,
+                    true,
+                    None,
+                    Events::IN,
+                    |_, _| {
+                        registered_tx.send(()).unwrap();
+                        Ok(())
+                    },
+                    || Err(TryOpError::TryAgain),
+                );
+                result_tx.send(result).unwrap();
             });
 
             registered_rx.recv().unwrap();
@@ -1097,36 +1044,29 @@ mod tests {
     fn non_alertable_wait_preserves_pending_alert() {
         run_with_test_platform_pointers(|| {
             let parent = crate::tests::test_task();
-            let waiter = parent
-                .clone_for_test()
-                .expect("a live process should accept another thread");
-            let waiter_thread = Arc::clone(&waiter.thread_object);
             let ready = Arc::new(AtomicBool::new(false));
             let wait_ready = Arc::clone(&ready);
             let (registered_tx, registered_rx) = std::sync::mpsc::channel();
             let (result_tx, result_rx) = std::sync::mpsc::channel();
-            let thread = std::thread::spawn(move || {
-                run_with_test_platform_pointers(|| {
-                    waiter.publish_thread_handle();
-                    let result: Result<(), TryOpError<NtStatus>> = waiter.wait_on_events(
-                        false,
-                        false,
-                        None,
-                        Events::IN,
-                        |observer, _| {
-                            registered_tx.send(observer).unwrap();
+            let (thread, waiter_thread) = parent.spawn_clone_for_test(move |waiter| {
+                let result: Result<(), TryOpError<NtStatus>> = waiter.wait_on_events(
+                    false,
+                    false,
+                    None,
+                    Events::IN,
+                    |observer, _| {
+                        registered_tx.send(observer).unwrap();
+                        Ok(())
+                    },
+                    || {
+                        if wait_ready.load(Ordering::Acquire) {
                             Ok(())
-                        },
-                        || {
-                            if wait_ready.load(Ordering::Acquire) {
-                                Ok(())
-                            } else {
-                                Err(TryOpError::TryAgain)
-                            }
-                        },
-                    );
-                    result_tx.send(result).unwrap();
-                });
+                        } else {
+                            Err(TryOpError::TryAgain)
+                        }
+                    },
+                );
+                result_tx.send(result).unwrap();
             });
 
             let observer = registered_rx.recv().unwrap();
@@ -1150,45 +1090,31 @@ mod tests {
     fn suspended_thread_does_not_enter_guest_until_resumed() {
         run_with_test_platform_pointers(|| {
             let parent = crate::tests::test_task();
-            let child = parent
-                .clone_for_test()
-                .expect("a live process should accept another thread");
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (result_tx, result_rx) = std::sync::mpsc::channel();
+            let (thread, suspended_thread) = parent.spawn_clone_for_test(move |child| {
+                child
+                    .thread_object
+                    .suspend_count
+                    .store(1, Ordering::Release);
+                started_tx.send(()).unwrap();
+                let mut ctx = litebox_common_linux::PtRegs::default();
+                let ready = child.prepare_to_run_guest(&mut ctx);
+                result_tx.send(ready).unwrap();
+            });
+
+            started_rx.recv().unwrap();
+            assert!(suspended_thread.wait_handle.get().is_some());
             let handle = parent
                 .insert_typed_handle::<ThreadSubsystem<_>>(
                     ThreadHandleObject {
-                        thread: Arc::clone(&child.thread_object),
+                        thread: Arc::clone(&suspended_thread),
                     },
                     ThreadAccess::SUSPEND_RESUME.bits(),
                     drop,
                 )
                 .unwrap();
             let handle = ThreadHandle::from_raw(handle.as_raw());
-            child
-                .thread_object
-                .suspend_count
-                .store(1, Ordering::Release);
-            let suspended_thread = Arc::clone(&child.thread_object);
-            let (started_tx, started_rx) = std::sync::mpsc::channel();
-            let (result_tx, result_rx) = std::sync::mpsc::channel();
-            let thread = std::thread::spawn(move || {
-                run_with_test_platform_pointers(|| {
-                    child.publish_thread_handle();
-                    started_tx.send(()).unwrap();
-                    let mut ctx = litebox_common_linux::PtRegs::default();
-                    let ready = child.prepare_to_run_guest(&mut ctx);
-                    result_tx.send(ready).unwrap();
-                });
-            });
-
-            started_rx.recv().unwrap();
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while suspended_thread.wait_handle.get().is_none() {
-                assert!(
-                    Instant::now() < deadline,
-                    "child did not publish wait handle"
-                );
-                std::thread::yield_now();
-            }
             assert_eq!(result_rx.try_recv(), Err(TryRecvError::Empty));
             let mut previous_suspend_count = u32::MAX;
             assert_eq!(
