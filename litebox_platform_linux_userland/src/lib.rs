@@ -2363,7 +2363,6 @@ unsafe extern "C" fn exception_signal_handler(
     info: &mut libc::siginfo_t,
     context: &mut libc::ucontext_t,
 ) {
-    // Misclassifying transition faults as guest faults leaks host registers via `PtRegs`.
     #[cfg(target_arch = "aarch64")]
     let faulting_pc: usize = context.uc_mcontext.pc.trunc();
 
@@ -2681,11 +2680,6 @@ unsafe fn interrupt_signal_handler(
         if let Ok(signal) = litebox_common_linux::signal::Signal::try_from(guest_signum) {
             // Check whether this is a guest thread. If not, re-raise the signal
             // process-wide.
-            //
-            // This is a thread-lifetime property, not `in_guest`: `in_guest` is 0
-            // whenever a guest thread sits in the host, including parked in an
-            // interruptible wait -- the case `record_pending_signal` and
-            // `wait_waker_addr` serve.
             let is_guest_thread;
             #[cfg(target_arch = "x86_64")]
             {
