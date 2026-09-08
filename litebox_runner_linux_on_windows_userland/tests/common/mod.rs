@@ -92,7 +92,12 @@ impl TestLauncher {
                 Mode::RWXG | Mode::RWXO | Mode::RWXU,
             )
             .unwrap();
-        self.fs.write(&fd, &contents, None).unwrap();
+        let mut written = 0;
+        while written < contents.len() {
+            let count = self.fs.write(&fd, &contents[written..], None).unwrap();
+            assert_ne!(count, 0, "broker made no progress installing {out}");
+            written += count;
+        }
         self.fs.close(&fd).unwrap();
     }
 
