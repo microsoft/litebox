@@ -804,7 +804,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
         ctx: &PtRegs,
     ) {
         #[cfg(target_arch = "aarch64")]
-        let _ = ctx;
+        if info.exception == Exception::BRK64 {
+            let pc = arch::pc(ctx);
+            let instruction =
+                crate::UserPtrMut::<u32>::from_usize(pc).read_at_offset::<Platform>(0);
+            litebox_util_log::warn!(
+                pc:% = format_args!("{pc:#x}"),
+                instruction:% = format_args!("{instruction:x?}");
+                "guest AArch64 breakpoint (d4362160 is the runtime rewriter's trap fallback)"
+            );
+        }
         #[cfg(target_arch = "x86_64")]
         let (signal, fault_address) = match info.exception {
             Exception::DIVIDE_ERROR => (Signal::SIGFPE, arch::pc(ctx)),

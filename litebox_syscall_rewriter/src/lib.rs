@@ -1780,6 +1780,38 @@ pub fn patch_aarch64_code_segment_with_options_and_ranges(
     Ok((outcome.trampoline, outcome.trapped_sites))
 }
 
+/// Upper bound on the trampoline bytes needed to rewrite an AArch64 code mapping.
+///
+/// Uses the same site scan as runtime rewriting, reserving the largest gate slot
+/// for each site. Allocate this whole range before publishing any branches into
+/// it; allocating one page and subsequently growing it can collide with mappings.
+/// `None` scans the entire mapping, including for x18 uses when enabled.
+pub fn aarch64_runtime_trampoline_capacity(
+    code: &[u8],
+    code_vaddr: u64,
+    ranges: Option<&aarch64::CodeScanRanges>,
+    options: RewriteOptions,
+) -> Result<usize> {
+    let whole;
+    let ranges = if let Some(ranges) = ranges {
+        ranges
+    } else {
+        whole = aarch64::CodeScanRanges {
+            executable: core::iter::once(0..code.len()).collect(),
+            identified: core::iter::once(0..code.len()).collect(),
+        };
+        &whole
+    };
+    let executable = scan_sections(code_vaddr, &ranges.executable, code.len())?;
+    let identified = scan_sections(code_vaddr, &ranges.identified, code.len())?;
+    aarch64::trampoline_capacity_with_code_ranges(
+        code,
+        &executable,
+        &identified,
+        aarch64::RewriteConfig::new(options.target_host(), options.effective_virtualize_x18()),
+    )
+}
+
 fn scan_sections(
     code_vaddr: u64,
     ranges: &[Range<usize>],
@@ -2926,6 +2958,55 @@ mod tests {
             code_vaddr.wrapping_add(disp.cast_unsigned()),
             trampoline_vaddr + 16,
             "the B targets the first aligned gate slot"
+        );
+    }
+
+    #[test]
+    fn aarch64_runtime_trampoline_capacity_covers_emitted_gates() {
+        let words: [u32; 5] = [
+            0xD400_0001, // SVC #0
+            0xD53B_D049, // MRS X9, TPIDR_EL0
+            0xD51B_D049, // MSR TPIDR_EL0, X9
+            0xaa00_03f2, // MOV X18, X0
+            0xD503_201F, // NOP
+        ];
+        let code: Vec<_> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let code = code.repeat(128);
+        let partial = aarch64::CodeScanRanges {
+            executable: core::iter::once(0..20).collect(),
+            identified: core::iter::once(0..20).collect(),
+        };
+        for virtualize_x18 in [false, true] {
+            let options = RewriteOptions::new(TargetHost::Linux, virtualize_x18);
+            for ranges in [None, Some(&partial)] {
+                let capacity =
+                    aarch64_runtime_trampoline_capacity(&code, 0x1000, ranges, options).unwrap();
+                let mut patched = code.clone();
+                let (trampoline, trapped) = patch_aarch64_code_segment_with_options_and_ranges(
+                    &mut patched,
+                    0x1000,
+                    ranges.unwrap_or(&whole_code_scan_ranges(code.len())),
+                    0x400000,
+                    0x800000,
+                    options,
+                )
+                .unwrap();
+                assert!(trapped.is_empty());
+                assert!(capacity >= trampoline.len());
+                if ranges.is_none() {
+                    assert!(trampoline.len() > 4096);
+                }
+            }
+        }
+        assert_eq!(
+            aarch64_runtime_trampoline_capacity(
+                &0xD503_201Fu32.to_le_bytes(),
+                0x1000,
+                None,
+                RewriteOptions::default(),
+            )
+            .unwrap(),
+            0,
         );
     }
 

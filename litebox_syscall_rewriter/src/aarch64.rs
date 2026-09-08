@@ -3051,6 +3051,24 @@ pub(crate) fn hook_syscalls_aarch64_with_code_ranges(
     }))
 }
 
+pub(crate) fn trampoline_capacity_with_code_ranges(
+    buf: &[u8],
+    executable_sections: &[TextSectionInfo],
+    code_sections: &[TextSectionInfo],
+    config: RewriteConfig,
+) -> Result<usize> {
+    let sites = find_patch_sites_with_code_ranges(executable_sections, code_sections, buf, config)?;
+    if sites.is_empty() {
+        return Ok(0);
+    }
+    let largest_slot = GATE_SLOT_SIZES.into_iter().max().unwrap();
+    sites
+        .len()
+        .checked_mul(largest_slot)
+        .and_then(|size| size.checked_add(GATES_START_OFFSET))
+        .ok_or_else(|| Error::AddressOverflow("runtime trampoline capacity".into()))
+}
+
 /// Replace the four bytes at `file_offset` with `BRK #TRAP_BRK_IMM`.
 ///
 /// A patch site left native escapes the virtualization: an `SVC` reaches the

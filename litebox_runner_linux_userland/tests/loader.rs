@@ -18,6 +18,21 @@ struct TestLauncher {
 
 impl TestLauncher {
     fn init_platform(tar_data: &'static [u8], initial_files: &[&str]) -> Self {
+        static LOGGING: std::sync::Once = std::sync::Once::new();
+        LOGGING.call_once(|| {
+            tracing_subscriber::fmt()
+                .with_test_writer()
+                .with_ansi(false)
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::builder()
+                        .with_default_directive(
+                            tracing_subscriber::filter::LevelFilter::WARN.into(),
+                        )
+                        .with_env_var("LITEBOX_LOG")
+                        .from_env_lossy(),
+                )
+                .init();
+        });
         let platform = Platform::new();
         let shim_builder = litebox_shim_linux::LinuxShimBuilder::new(platform);
 
@@ -106,11 +121,9 @@ impl TestLauncher {
                 &mut litebox_common_linux::PtRegs::default(),
             );
         }
-        assert_eq!(
-            program.process.wait(),
-            0,
-            "process exited with non-zero code"
-        );
+        let status = program.process.wait();
+        assert!(status < 256, "guest terminated by signal {}", status - 256);
+        assert_eq!(status, 0, "process exited with non-zero code");
     }
 }
 

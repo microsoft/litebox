@@ -1105,6 +1105,83 @@ impl<Platform: ShimPlatform> Task<Platform> {
         .expect("fatal: failed to restore code segment to RX after trap fallback");
     }
 
+    /// Claims a complete trampoline without replacing guest or host mappings.
+    #[cfg(target_arch = "aarch64")]
+    fn map_aarch64_runtime_trampoline(
+        &self,
+        preferred: usize,
+        len: usize,
+        code: Range<usize>,
+    ) -> Result<UserPtrMut<u8>, MappingError> {
+        use litebox::platform::page_mgmt::AllocationError;
+
+        let reach = litebox_syscall_rewriter::MAX_TRAMPOLINE_DISPLACEMENT;
+        let low = align_up(
+            code.end.saturating_sub(reach).max(Platform::TASK_ADDR_MIN),
+            PAGE_SIZE,
+        );
+        let high = align_down(
+            code.start
+                .saturating_add(reach)
+                .min(Platform::TASK_ADDR_MAX)
+                .checked_sub(len)
+                .ok_or(MappingError::OutOfMemory)?,
+            PAGE_SIZE,
+        );
+        if low > high {
+            return Err(MappingError::OutOfMemory);
+        }
+        let preferred = align_down(preferred.clamp(low, high), PAGE_SIZE);
+        let map = |addr| {
+            self.do_mmap_anonymous(
+                Some(addr),
+                len,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
+            )
+        };
+        match map(preferred) {
+            Ok(ptr) => return Ok(ptr),
+            Err(MappingError::MapError(
+                AllocationError::AddressInUse | AllocationError::AddressInUseByPlatform,
+            )) => {}
+            Err(e) => return Err(e),
+        }
+
+        // The shim's map omits host allocations. Skip known occupied ranges,
+        // but use NOREPLACE for every probe so a host collision is harmless.
+        let occupied: Vec<_> = self
+            .global
+            .pm
+            .mappings()
+            .into_iter()
+            .map(|(range, _)| range)
+            .collect();
+        let mut gaps = subtract_ranges(low..high + len, &occupied);
+        gaps.retain(|gap| gap.len() >= len);
+        gaps.sort_unstable_by_key(|gap| {
+            preferred.abs_diff(preferred.clamp(gap.start, gap.end - len))
+        });
+        for gap in gaps {
+            let nearest = preferred.clamp(gap.start, gap.end - len);
+            let candidates = core::iter::once(nearest).chain(
+                (gap.start..=gap.end - len)
+                    .step_by(PAGE_SIZE)
+                    .filter(|&addr| addr != nearest),
+            );
+            for addr in candidates {
+                match map(addr) {
+                    Ok(ptr) => return Ok(ptr),
+                    Err(MappingError::MapError(
+                        AllocationError::AddressInUse | AllocationError::AddressInUseByPlatform,
+                    )) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Err(MappingError::OutOfMemory)
+    }
+
     /// Patch an executable segment in-place after it has been mapped.
     ///
     /// For pre-patched binaries: maps the trampoline from the file and writes
@@ -1244,73 +1321,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             self.apply_trap_fallback(mapped_addr, len, already_rw);
         };
 
-        // Allocate the trampoline region if not yet done.
-        let addr_usize = mapped_addr.as_usize();
-        if !state.trampoline_mapped {
-            let tramp_addr = state.trampoline_addr;
-
-            // Try MAP_FIXED_NOREPLACE first — works when the preferred
-            // trampoline address is available. If that fails, let the VM
-            // manager choose a free address and validate that it is still
-            // within JMP rel32 range below.
-            let actual_addr = self
-                .do_mmap_anonymous(
-                    Some(tramp_addr),
-                    PAGE_SIZE,
-                    ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-                    MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
-                )
-                .or_else(|_| {
-                    self.do_mmap_anonymous(
-                        None,
-                        PAGE_SIZE,
-                        ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-                        MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE,
-                    )
-                });
-            let Ok(actual_addr_ptr) = actual_addr else {
-                litebox_util_log::warn!("failed to allocate trampoline region");
-                apply_trap_fallback(mapped_addr, len, false);
-                return true;
-            };
-            let actual_addr = actual_addr_ptr.as_usize();
-
-            let far_end = addr_usize.saturating_add(len);
-            let distance = actual_addr
-                .abs_diff(addr_usize)
-                .max(actual_addr.abs_diff(far_end));
-            if distance > litebox_syscall_rewriter::MAX_TRAMPOLINE_DISPLACEMENT {
-                litebox_util_log::warn!(
-                    distance:? = distance;
-                    "trampoline too far from code segment, skipping patching"
-                );
-                let _ = self.sys_munmap_raw(UserPtrMut::<u8>::from_usize(actual_addr), PAGE_SIZE);
-                apply_trap_fallback(mapped_addr, len, false);
-                return true;
-            }
-
-            state.trampoline_addr = actual_addr;
-
-            if litebox_syscall_rewriter::TRAMPOLINE_ENTRY_POINT_BYTES != 0 {
-                let entry_ptr = UserPtrMut::<u8>::from_usize(actual_addr);
-                if entry_ptr
-                    .copy_from_slice::<Platform>(0, &syscall_entry.to_le_bytes())
-                    .is_none()
-                {
-                    litebox_util_log::warn!("failed to write syscall entry point to trampoline");
-                    let _ =
-                        self.sys_munmap_raw(UserPtrMut::<u8>::from_usize(actual_addr), PAGE_SIZE);
-                    apply_trap_fallback(mapped_addr, len, false);
-                    return true;
-                }
-                state.trampoline_cursor = litebox_syscall_rewriter::TRAMPOLINE_ENTRY_POINT_BYTES;
-            } else {
-                state.trampoline_cursor = 0;
-            }
-            state.trampoline_mapped = true;
-            state.trampoline_mapped_len = PAGE_SIZE;
-        }
-
         // Performance guard: skip if this exact range was already patched.
         let mapping_key = (mapped_addr.as_usize(), len);
         if state.patched_ranges.contains(&mapping_key) {
@@ -1328,6 +1338,126 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
         };
 
+        self.sys_mprotect_raw(
+            mapped_addr,
+            len,
+            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+        )
+        .expect("fatal: failed to mprotect code segment to RW for patching");
+        // Read the mapped code into a buffer, patch it, write back.
+        let Some(code_owned) = mapped_addr.to_owned_slice::<Platform>(len) else {
+            let _ = self.sys_mprotect_raw(
+                mapped_addr,
+                len,
+                ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
+            );
+            panic!("fatal: failed to read code segment for patching");
+        };
+        let mut code_buf = code_owned.into_vec();
+        let original_code = code_buf.clone();
+
+        // Allocate the trampoline region if not yet done.
+        let addr_usize = mapped_addr.as_usize();
+        if !state.trampoline_mapped {
+            let tramp_addr = state.trampoline_addr;
+
+            #[cfg(target_arch = "aarch64")]
+            let allocation_len =
+                match litebox_syscall_rewriter::aarch64_runtime_trampoline_capacity(
+                    &code_buf,
+                    addr_usize as u64,
+                    scan_ranges.as_ref(),
+                    crate::aarch64_rewrite_options(),
+                )
+                .and_then(|size| {
+                    size.max(PAGE_SIZE)
+                        .checked_next_multiple_of(PAGE_SIZE)
+                        .ok_or_else(|| {
+                            litebox_syscall_rewriter::Error::AddressOverflow(
+                                "trampoline page alignment".into(),
+                            )
+                        })
+                }) {
+                    Ok(size) => size,
+                    Err(e) => {
+                        litebox_util_log::warn!(err:? = e; "failed to size runtime trampoline");
+                        apply_trap_fallback(mapped_addr, len, true);
+                        return true;
+                    }
+                };
+            #[cfg(target_arch = "x86_64")]
+            let allocation_len = PAGE_SIZE;
+
+            #[cfg(target_arch = "aarch64")]
+            let actual_addr = self.map_aarch64_runtime_trampoline(
+                tramp_addr,
+                allocation_len,
+                addr_usize..addr_usize + len,
+            );
+            // Try MAP_FIXED_NOREPLACE first — works when the preferred
+            // trampoline address is available. If that fails, let the VM
+            // manager choose a free address and validate that it is still
+            // within JMP rel32 range below.
+            #[cfg(target_arch = "x86_64")]
+            let actual_addr = self
+                .do_mmap_anonymous(
+                    Some(tramp_addr),
+                    PAGE_SIZE,
+                    ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                    MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
+                )
+                .or_else(|_| {
+                    self.do_mmap_anonymous(
+                        None,
+                        PAGE_SIZE,
+                        ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                        MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE,
+                    )
+                });
+            let Ok(actual_addr_ptr) = actual_addr else {
+                litebox_util_log::warn!("failed to allocate trampoline region");
+                apply_trap_fallback(mapped_addr, len, true);
+                return true;
+            };
+            let actual_addr = actual_addr_ptr.as_usize();
+
+            let far_end = addr_usize.saturating_add(len);
+            let distance = actual_addr
+                .abs_diff(addr_usize)
+                .max(actual_addr.abs_diff(far_end));
+            if distance > litebox_syscall_rewriter::MAX_TRAMPOLINE_DISPLACEMENT {
+                litebox_util_log::warn!(
+                    distance:? = distance;
+                    "trampoline too far from code segment, skipping patching"
+                );
+                let _ =
+                    self.sys_munmap_raw(UserPtrMut::<u8>::from_usize(actual_addr), allocation_len);
+                apply_trap_fallback(mapped_addr, len, true);
+                return true;
+            }
+
+            state.trampoline_addr = actual_addr;
+
+            if litebox_syscall_rewriter::TRAMPOLINE_ENTRY_POINT_BYTES != 0 {
+                let entry_ptr = UserPtrMut::<u8>::from_usize(actual_addr);
+                if entry_ptr
+                    .copy_from_slice::<Platform>(0, &syscall_entry.to_le_bytes())
+                    .is_none()
+                {
+                    litebox_util_log::warn!("failed to write syscall entry point to trampoline");
+                    let _ = self
+                        .sys_munmap_raw(UserPtrMut::<u8>::from_usize(actual_addr), allocation_len);
+                    apply_trap_fallback(mapped_addr, len, true);
+                    return true;
+                }
+                state.trampoline_cursor = litebox_syscall_rewriter::TRAMPOLINE_ENTRY_POINT_BYTES;
+            } else {
+                state.trampoline_cursor = 0;
+            }
+            state.trampoline_mapped = true;
+            state.trampoline_mapped_len = allocation_len;
+        }
+
         // Make the trampoline RW for writing stubs.
         if state.trampoline_mapped_len > 0
             && self
@@ -1340,30 +1470,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         {
             panic!("fatal: failed to mprotect trampoline to RW");
         }
-        if self
-            .sys_mprotect_raw(
-                mapped_addr,
-                len,
-                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-            )
-            .is_err()
-        {
-            restore_trampoline_rx(self, state);
-            panic!("fatal: failed to mprotect code segment to RW for patching");
-        }
-
-        // Read the mapped code into a buffer, patch it, write back.
-        let Some(code_owned) = mapped_addr.to_owned_slice::<Platform>(len) else {
-            let _ = self.sys_mprotect_raw(
-                mapped_addr,
-                len,
-                ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
-            );
-            restore_trampoline_rx(self, state);
-            panic!("fatal: failed to read code segment for patching");
-        };
-        let mut code_buf = code_owned.into_vec();
-        let original_code = code_buf.clone();
 
         let code_vaddr = addr_usize as u64;
         state.trampoline_cursor = align_up(
@@ -1560,6 +1666,178 @@ mod tests {
 
     use crate::syscalls::tests::TestPlatform as Platform;
     use crate::{UserPtrMut, syscalls::tests::init_platform};
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn runtime_trampoline_claims_all_pages_before_patching() {
+        use alloc::collections::BTreeSet;
+        use litebox::mm::linux::PAGE_SIZE;
+        use litebox::platform::SystemInfoProvider;
+
+        let task = init_platform();
+        let arena_len = 64 * PAGE_SIZE;
+        let arena = task
+            .sys_mmap(
+                0,
+                arena_len,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE,
+                -1,
+                0,
+            )
+            .unwrap();
+        let base = arena.as_usize();
+        let preferred = base + PAGE_SIZE;
+        let available = base + 4 * PAGE_SIZE;
+        let blocker = UserPtrMut::<u8>::from_usize(base + 2 * PAGE_SIZE);
+        blocker
+            .copy_from_slice::<Platform>(0, &[0xa5; PAGE_SIZE])
+            .unwrap();
+        let code = 0xD400_0001u32.to_le_bytes().repeat(PAGE_SIZE / 4); // SVC #0
+        arena.copy_from_slice::<Platform>(0, &code).unwrap();
+
+        // A one-page allocation at the hint succeeds, but its expansion cannot.
+        // Another nearby hole can hold all the gates without touching the blocker.
+        task.sys_munmap(UserPtrMut::from_usize(preferred), PAGE_SIZE)
+            .unwrap();
+        task.sys_munmap(UserPtrMut::from_usize(available), 32 * PAGE_SIZE)
+            .unwrap();
+        task.global.elf_patch_cache.lock().insert(
+            -1,
+            super::ElfPatchState {
+                pre_patched: false,
+                trampoline_file_offset: 0,
+                trampoline_file_size: 0,
+                trampoline_addr: preferred,
+                load_span: Some(base..base + PAGE_SIZE),
+                trampoline_cursor: 0,
+                trampoline_mapped: false,
+                trampoline_mapped_len: 0,
+                runtime_patches_committed: false,
+                trampoline_invalidated: false,
+                #[cfg(feature = "aarch64_virtualize_x18")]
+                code_metadata: None,
+                file_mappings: BTreeSet::new(),
+                patched_ranges: BTreeSet::new(),
+            },
+        );
+        assert!(task.maybe_patch_exec_segment(
+            arena,
+            PAGE_SIZE,
+            -1,
+            task.global.platform.get_syscall_entry_point(),
+            Some(0),
+        ));
+        let trampoline_len = {
+            let cache = task.global.elf_patch_cache.lock();
+            let state = &cache[&-1];
+            assert!(state.runtime_patches_committed, "must not fall back to BRK");
+            assert_eq!(state.trampoline_addr, available);
+            assert!(state.trampoline_mapped_len > PAGE_SIZE);
+            state.trampoline_mapped_len
+        };
+        let patched = arena.to_owned_slice::<Platform>(PAGE_SIZE).unwrap();
+        for (i, instruction) in patched.as_chunks::<4>().0.iter().enumerate() {
+            let instruction = u32::from_le_bytes(*instruction);
+            let target = litebox_syscall_rewriter::aarch64::decode_branch_target(
+                instruction,
+                (base + i * 4) as u64,
+            )
+            .expect("every syscall must branch into the trampoline, not trap");
+            assert!((available as u64..(available + trampoline_len) as u64).contains(&target));
+        }
+        assert_eq!(
+            &*blocker.to_owned_slice::<Platform>(PAGE_SIZE).unwrap(),
+            &[0xa5; PAGE_SIZE]
+        );
+        task.sys_munmap(arena, arena_len).unwrap();
+        task.finalize_elf_patch(-1);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn runtime_trampoline_replaces_an_out_of_reach_hint_with_a_nearby_mapping() {
+        use litebox::mm::linux::PAGE_SIZE;
+
+        let task = init_platform();
+        let code = task
+            .sys_mmap(
+                0,
+                PAGE_SIZE,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE,
+                -1,
+                0,
+            )
+            .unwrap();
+        let trampoline = task
+            .map_aarch64_runtime_trampoline(
+                PAGE_SIZE,
+                2 * PAGE_SIZE,
+                code.as_usize()..code.as_usize() + PAGE_SIZE,
+            )
+            .unwrap();
+        let reach = litebox_syscall_rewriter::MAX_TRAMPOLINE_DISPLACEMENT;
+        assert!(trampoline.as_usize().abs_diff(code.as_usize() + PAGE_SIZE) <= reach);
+        assert!((trampoline.as_usize() + 2 * PAGE_SIZE).abs_diff(code.as_usize()) <= reach);
+        task.sys_munmap(trampoline, 2 * PAGE_SIZE).unwrap();
+        task.sys_munmap(code, PAGE_SIZE).unwrap();
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn runtime_trampoline_preserves_host_only_mappings() {
+        use litebox::mm::linux::PAGE_SIZE;
+        use litebox::platform::page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions};
+
+        let task = init_platform();
+        let arena = task
+            .sys_mmap(
+                0,
+                8 * PAGE_SIZE,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE,
+                -1,
+                0,
+            )
+            .unwrap();
+        let preferred = arena.as_usize() + PAGE_SIZE;
+        task.sys_munmap(UserPtrMut::from_usize(preferred), 4 * PAGE_SIZE)
+            .unwrap();
+        let host_range = preferred..preferred + 2 * PAGE_SIZE;
+        PageManagementProvider::<PAGE_SIZE>::allocate_pages(
+            task.global.platform,
+            host_range.clone(),
+            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+            false,
+            true,
+            FixedAddressBehavior::NoReplace,
+        )
+        .unwrap();
+        let host_ptr = UserPtrMut::<u8>::from_usize(preferred);
+        host_ptr
+            .copy_from_slice::<Platform>(0, &[0xa5; 2 * PAGE_SIZE])
+            .unwrap();
+
+        let trampoline = task
+            .map_aarch64_runtime_trampoline(
+                preferred,
+                2 * PAGE_SIZE,
+                arena.as_usize()..arena.as_usize() + PAGE_SIZE,
+            )
+            .unwrap();
+        assert_eq!(trampoline.as_usize(), host_range.end);
+        assert_eq!(
+            &*host_ptr.to_owned_slice::<Platform>(2 * PAGE_SIZE).unwrap(),
+            &[0xa5; 2 * PAGE_SIZE],
+        );
+        // SAFETY: this test owns the host-only mapping and no longer uses it.
+        unsafe {
+            PageManagementProvider::<PAGE_SIZE>::deallocate_pages(task.global.platform, host_range)
+                .unwrap();
+        }
+        task.sys_munmap(arena, 8 * PAGE_SIZE).unwrap();
+    }
 
     /// Fail closed: an unpatched placeholder executes silently.
     #[cfg(target_arch = "aarch64")]
