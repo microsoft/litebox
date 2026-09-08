@@ -2070,43 +2070,61 @@ pub(super) fn fatal_aarch64_runtime_state() -> ! {
     }
 }
 
-/// Clears `in_guest`, optionally sets `interrupt`, and optionally captures the
-/// kernel-saved vector state. Returns the published guest context only if
-/// `in_guest` was set; its registers may still require copying or gate
-/// canonicalization. Invalid required vector state terminates the process.
-pub(super) fn signal_handler_exit_guest(
-    context: &libc::ucontext_t,
-    set_interrupt: bool,
-    capture_vector_state: bool,
-) -> Option<*mut litebox_common_linux::PtRegs> {
+/// Clears `in_guest` and returns the published guest context only if `in_guest`
+/// was set. Its registers may still require copying or gate canonicalization.
+pub(super) fn signal_handler_take_guest() -> Option<*mut litebox_common_linux::PtRegs> {
     let block: usize;
-    // SAFETY: materializes the base of this thread's TLS control block from
-    // `TPIDR_EL0`, the host anchor even when this signal interrupted guest
-    // code. Reads no memory.
+    // SAFETY: `TPIDR_EL0` anchors host TLS even in guest code. Reads no memory.
     unsafe {
         core::arch::asm!(
-            load_tls_block_base!("{0}"),
-            out(reg) block,
+            load_tls_block_base!("{block}"),
+            block = out(reg) block,
             options(nostack, nomem, preserves_flags)
         );
     }
-    // SAFETY: own-thread [`tls_offset`] slot accesses off `block`. Volatile
-    // because the transition assembly also writes them, unseen by the compiler.
+    // SAFETY: own-thread TLS slots. Volatile because transition assembly
+    // writes them unseen by the compiler.
     unsafe {
         let in_guest = (block + tls_offset::IN_GUEST) as *mut u8;
         let was_in_guest = in_guest.read_volatile();
         in_guest.write_volatile(0);
-        if set_interrupt {
-            ((block + tls_offset::INTERRUPT) as *mut u8).write_volatile(1);
-        }
         if was_in_guest == 0 {
             return None;
         }
-        if capture_vector_state && !resume_frame::capture_signal_vector_state(context, block) {
-            fatal_aarch64_runtime_state();
-        }
         let top = ((block + tls_offset::GUEST_CONTEXT_TOP) as *const usize).read_volatile();
         Some((top as *mut litebox_common_linux::PtRegs).sub(1))
+    }
+}
+
+/// Captures kernel-saved guest vector state from the signal frame.
+/// Invalid required vector state terminates the process.
+pub(super) fn signal_handler_capture_guest_vector_state(context: &libc::ucontext_t) {
+    let block: usize;
+    // SAFETY: `TPIDR_EL0` anchors host TLS even in guest code. Reads no memory.
+    unsafe {
+        core::arch::asm!(
+            load_tls_block_base!("{block}"),
+            block = out(reg) block,
+            options(nostack, nomem, preserves_flags)
+        );
+    }
+    if !resume_frame::capture_signal_vector_state(context, block) {
+        fatal_aarch64_runtime_state();
+    }
+}
+
+/// Records an interrupt in this thread's TLS.
+pub(super) fn signal_handler_set_interrupt() {
+    let block: usize;
+    // SAFETY: `TPIDR_EL0` anchors this thread's host TLS even in guest code.
+    // Volatile because transition assembly accesses the slot unseen by the compiler.
+    unsafe {
+        core::arch::asm!(
+            load_tls_block_base!("{block}"),
+            block = out(reg) block,
+            options(nostack, nomem, preserves_flags)
+        );
+        ((block + tls_offset::INTERRUPT) as *mut u8).write_volatile(1);
     }
 }
 
@@ -3741,6 +3759,19 @@ mod tests {
     }
 
     #[test]
+    fn signal_handler_records_interrupt_outside_guest() {
+        let interrupt = (tls_block_base() + tls_offset::INTERRUPT) as *mut u8;
+        // SAFETY: this is this thread's byte-sized TLS slot.
+        unsafe { interrupt.write_volatile(0) };
+
+        super::signal_handler_set_interrupt();
+        assert_eq!(read_tls_slot!(u8, tls_offset::INTERRUPT), 1);
+
+        // SAFETY: as above.
+        unsafe { interrupt.write_volatile(0) };
+    }
+
+    #[test]
     fn test_update_waker_exchange() {
         let platform = LinuxUserland::new();
 
@@ -3835,9 +3866,8 @@ mod tests {
         );
     }
 
-    /// The staging store must carry an exception-table fixup, or a fault on it
-    /// escapes into `exception_signal_handler` with `in_guest == 1` and is
-    /// mistaken for a guest fault; see [`switch_to_guest_via_outbound_stub`].
+    /// The staging-store fixup enables fallback to generic context restore.
+    /// Without it, `in_switch_to_guest` routes the fault to `next_signal_handler`.
     #[test]
     fn test_switch_to_guest_stage_x16_has_exception_fixup() {
         let stage = super::switch_to_guest_stage_x16 as *const () as usize;
@@ -3869,13 +3899,157 @@ mod tests {
         );
     }
 
-    /// A SIGSEGV on that store must not be attributed to the guest.
-    ///
-    /// `in_guest` is already 1 at the fault, so without the fixup and the
-    /// `switch_to_guest` guard the handler would overwrite the guest `PtRegs`
-    /// with the host register file. Asserts that the guest context is
-    /// untouched, `in_guest` is left alone, and the context is redirected to
-    /// the fixup.
+    /// A nested host exception during SIGSYS diagnostics must not overwrite guest state.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn nested_exception_during_sigsys_preserves_guest_context() {
+        const CHILD_ENV: &str = "LITEBOX_TEST_NESTED_EXCEPTION_CHILD";
+
+        extern "C" fn chained_handler(
+            _: libc::c_int,
+            info: &mut libc::siginfo_t,
+            _: &mut libc::ucontext_t,
+        ) {
+            // SIGTRAP leaves si_errno unused; use it as a per-invocation chain marker.
+            info.si_errno = 1;
+        }
+
+        extern "C" fn trap_during_write(_: libc::c_int) {
+            // SAFETY: deliberately traps into the installed SIGTRAP handler,
+            // which checks the nested exception and exits without resuming.
+            unsafe { core::arch::asm!("brk #0", options(nostack)) };
+        }
+
+        unsafe extern "C" fn observe_nested_exception(
+            signum: libc::c_int,
+            info: &mut libc::siginfo_t,
+            context: &mut libc::ucontext_t,
+        ) {
+            let block = tls_block_base();
+            // SAFETY: this thread published a live boxed PtRegs before entering SIGSYS.
+            unsafe {
+                let top = ((block + tls_offset::GUEST_CONTEXT_TOP) as *const usize).read_volatile();
+                let regs = (top as *const PtRegs).sub(1);
+                let before = regs.read();
+                let in_guest = (block + tls_offset::IN_GUEST) as *const u8;
+                let was_in_guest = in_guest.read_volatile();
+                let pc = context.uc_mcontext.pc;
+                info.si_errno = 0;
+
+                super::exception_signal_handler(signum, info, context);
+
+                let after = regs.read();
+                let unchanged = before.regs == after.regs
+                    && before.sp == after.sp
+                    && before.pc == after.pc
+                    && before.pstate == after.pstate
+                    && before.orig_x0 == after.orig_x0
+                    && before.syscallno == after.syscallno;
+                let passed = was_in_guest == 0
+                    && in_guest.read_volatile() == 0
+                    && unchanged
+                    && context.uc_mcontext.pc == pc
+                    && info.si_errno == 1;
+                // Avoid assertions, allocation, and returning to the faulting BRK.
+                libc::_exit(if !unchanged {
+                    1
+                } else if passed {
+                    42
+                } else {
+                    2
+                });
+            }
+        }
+
+        if std::env::var_os(CHILD_ENV).is_none() {
+            // Isolate process-wide signal handlers and stderr redirection from other tests.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "aarch64::tests::nested_exception_during_sigsys_preserves_guest_context",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            // Only the nested observer can report success, not an empty test filter.
+            assert_eq!(
+                output.status.code(),
+                Some(42),
+                "child failed (1: guest clobbered, 2: wrong host routing, 3: no nested exit): {output:?}"
+            );
+            return;
+        }
+
+        // SAFETY: all signal state is private to this subprocess; handlers stay
+        // installed until _exit. The alarm bounds failures such as recursive traps.
+        unsafe {
+            libc::alarm(5);
+            let mut action: libc::sigaction = core::mem::zeroed();
+            libc::sigemptyset(&raw mut action.sa_mask);
+            action.sa_sigaction = trap_during_write as *const () as usize;
+            assert_eq!(
+                libc::sigaction(libc::SIGPIPE, &raw const action, core::ptr::null_mut()),
+                0
+            );
+            action.sa_flags = libc::SA_SIGINFO | libc::SA_NODEFER;
+            action.sa_sigaction = observe_nested_exception as *const () as usize;
+            assert_eq!(
+                libc::sigaction(libc::SIGTRAP, &raw const action, core::ptr::null_mut()),
+                0
+            );
+            super::NEXT_SA[libc::SIGTRAP as usize].sa_sigaction =
+                chained_handler as *const () as usize;
+            super::NEXT_SA[libc::SIGTRAP as usize].sa_flags = libc::SA_SIGINFO;
+
+            let mut unblocked: libc::sigset_t = core::mem::zeroed();
+            libc::sigemptyset(&raw mut unblocked);
+            libc::sigaddset(&raw mut unblocked, libc::SIGPIPE);
+            libc::sigaddset(&raw mut unblocked, libc::SIGTRAP);
+            assert_eq!(
+                libc::pthread_sigmask(
+                    libc::SIG_UNBLOCK,
+                    &raw const unblocked,
+                    core::ptr::null_mut()
+                ),
+                0
+            );
+
+            // A diagnostic write raises SIGPIPE, whose handler triggers a real
+            // hardware exception while the outer SIGSYS handler is still active.
+            let mut pipe = [-1; 2];
+            assert_eq!(libc::pipe(pipe.as_mut_ptr()), 0);
+            assert_eq!(libc::close(pipe[0]), 0);
+            assert_eq!(
+                libc::dup2(pipe[1], libc::STDERR_FILENO),
+                libc::STDERR_FILENO
+            );
+            assert_eq!(libc::close(pipe[1]), 0);
+        }
+
+        let mut guest = std::boxed::Box::new(PtRegs::default());
+        for (index, reg) in guest.regs.iter_mut().enumerate() {
+            *reg = 0x6d05_7000_0000_0000 | index;
+        }
+        let mut context: libc::ucontext_t = unsafe { core::mem::zeroed() };
+        let mut info: libc::siginfo_t = unsafe { core::mem::zeroed() };
+        context.uc_mcontext.regs[8] = libc::SYS_getpid as u64;
+        context.uc_mcontext.pc =
+            nested_exception_during_sigsys_preserves_guest_context as *const () as u64;
+
+        // SAFETY: publish this thread's boxed context until the nested handler exits.
+        unsafe {
+            let block = tls_block_base();
+            ((block + tls_offset::GUEST_CONTEXT_TOP) as *mut usize)
+                .write_volatile((&raw mut *guest).add(1) as usize);
+            ((block + tls_offset::IN_GUEST) as *mut u8).write_volatile(1);
+            super::exception_signal_handler(libc::SIGSYS, &mut info, &mut context);
+            libc::_exit(3); // The nested exception must have run and exited first.
+        }
+    }
+
+    /// Staging faults with `in_guest == 1` must not leak host registers into guest `PtRegs`.
+    /// The assembly fixup clears the flag on resumption; this test stops before that.
     #[test]
     fn test_exception_on_guest_stack_store_does_not_leak_host_state() {
         const SEGV_MAPERR: libc::c_int = 1;
@@ -3935,8 +4109,7 @@ mod tests {
         );
         assert_eq!(
             was_in_guest, 1,
-            "the fault is a host fault recovered in place, so the thread is still on its way \
-             into the guest and `in_guest` must stay set"
+            "the handler must leave `in_guest` for the assembly fixup to clear"
         );
         let fixed_pc: usize = context.uc_mcontext.pc.trunc();
         assert_eq!(
