@@ -193,16 +193,6 @@ pub struct UnsupportedFileService;
 
 impl private::Service for UnsupportedFileService {}
 
-impl<Platform, Backend> Resolver<Platform, Backend>
-where
-    Backend: super::backend::Backend + 'static,
-    Platform: RawSyncPrimitivesProvider,
-{
-    fn state(file: &File) -> Result<&RwLock<Platform, ResolverEntry<Backend>>> {
-        file.state()
-    }
-}
-
 impl<Platform, Backend> private::Service for Resolver<Platform, Backend>
 where
     Backend: super::backend::Backend + 'static,
@@ -235,7 +225,7 @@ where
         let Ok(offset) = checked_offset(offset, output.len()) else {
             return Ok(Err(FileError::InvalidOffset));
         };
-        let state = Self::state(file)?;
+        let state = file.state::<RwLock<Platform, ResolverEntry<Backend>>>()?;
         let entry = state.read();
         let read = if offset.is_some() || !entry.uses_position() {
             if entry.is_path_only() {
@@ -270,7 +260,7 @@ where
         let Ok(offset) = checked_offset(offset, input.len()) else {
             return Ok(Err(FileError::InvalidOffset));
         };
-        let state = Self::state(file)?;
+        let state = file.state::<RwLock<Platform, ResolverEntry<Backend>>>()?;
         let entry = state.read();
         let written = if offset.is_some() || !entry.uses_position() {
             if entry.is_path_only() {
@@ -306,7 +296,7 @@ where
             return Ok(Err(FileError::InvalidOffset));
         };
         let whence = seek_whence(whence)?;
-        let state = Self::state(file)?;
+        let state = file.state::<RwLock<Platform, ResolverEntry<Backend>>>()?;
         let entry = state.read();
         let seek = if entry.uses_position() {
             drop(entry);
@@ -338,7 +328,7 @@ where
         let Ok(length) = usize::try_from(length) else {
             return Ok(Err(FileError::InvalidOffset));
         };
-        let state = Self::state(file)?;
+        let state = file.state::<RwLock<Platform, ResolverEntry<Backend>>>()?;
         let entry = state.read();
         let truncate = if reset_offset && entry.uses_position() {
             drop(entry);
@@ -361,7 +351,9 @@ where
         _session: &BrokerSession,
         file: &File,
     ) -> ServiceResult<Vec<FileDirectoryEntry>> {
-        let entry = Self::state(file)?.read();
+        let entry = file
+            .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
+            .read();
         if entry.is_path_only() {
             return Ok(Err(FileError::AccessNotAllowed));
         }
@@ -384,7 +376,9 @@ where
         _session: &BrokerSession,
         file: &File,
     ) -> ServiceResult<ProtocolFileStatus> {
-        let entry = Self::state(file)?.read();
+        let entry = file
+            .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
+            .read();
         let status = match Resolver::handle_status(self, &entry) {
             Ok(status) => status,
             Err(error) => return Ok(Err(file_status_error(error))),
