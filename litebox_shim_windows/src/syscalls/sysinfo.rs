@@ -1819,7 +1819,9 @@ mod tests {
                 Some(mut_ptr(&mut guest_frequency)),
             );
 
+            let host_start = std::time::Instant::now();
             std::thread::sleep(QPC_SLEEP_DURATION);
+            let host_duration = host_start.elapsed();
 
             let guest_end_status = task.sys_nt_query_performance_counter(
                 mut_ptr(&mut guest_end),
@@ -1831,20 +1833,18 @@ mod tests {
             assert_eq!(guest_frequency, QPC_FREQUENCY_HZ);
 
             let guest_duration_nanos = qpc_delta_nanos(guest_start, guest_end);
-            let minimum_duration_nanos = QPC_SLEEP_DURATION
-                .saturating_sub(QPC_SLEEP_TOLERANCE)
-                .as_nanos();
-            let maximum_duration_nanos = QPC_SLEEP_DURATION
-                .saturating_add(QPC_SLEEP_TOLERANCE)
-                .as_nanos();
+            let minimum_duration_nanos =
+                host_duration.saturating_sub(QPC_SLEEP_TOLERANCE).as_nanos();
+            let maximum_duration_nanos =
+                host_duration.saturating_add(QPC_SLEEP_TOLERANCE).as_nanos();
 
             assert!(
                 guest_duration_nanos >= minimum_duration_nanos,
-                "guest duration {guest_duration_nanos}ns was shorter than requested sleep minus tolerance {minimum_duration_nanos}ns",
+                "guest duration {guest_duration_nanos}ns was shorter than host duration minus tolerance {minimum_duration_nanos}ns",
             );
             assert!(
                 guest_duration_nanos <= maximum_duration_nanos,
-                "guest duration {guest_duration_nanos}ns was longer than requested sleep plus tolerance {maximum_duration_nanos}ns",
+                "guest duration {guest_duration_nanos}ns was longer than host duration plus tolerance {maximum_duration_nanos}ns",
             );
         });
     }
