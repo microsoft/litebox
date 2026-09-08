@@ -246,50 +246,74 @@ impl LinuxUserland {
         // We should either fix `mmap` to handle this error, or let global allocator call this function
         // whenever it get more pages from the host.
         let path = c"/proc/self/maps";
-        #[cfg(target_arch = "x86_64")]
-        let fd = unsafe {
-            syscalls::syscall3(
-                syscalls::Sysno::open,
-                path.as_ptr() as usize,
-                OFlags::RDONLY.bits() as usize,
-                0,
-            )
-        };
-        #[cfg(target_arch = "aarch64")]
-        let fd = unsafe {
-            syscalls::syscall4(
-                syscalls::Sysno::openat,
-                AT_FDCWD,
-                path.as_ptr() as usize,
-                OFlags::RDONLY.bits() as usize,
-                0,
-            )
-        };
-        let Ok(fd) = fd else {
-            return alloc::vec::Vec::new();
-        };
-        let mut buf = [0u8; 8192];
-        let mut total_read = 0;
-        while total_read < buf.len() {
-            let n = unsafe {
+        let mut maps = Vec::new();
+        let mut buffer_length = 8192;
+        loop {
+            maps.clear();
+            maps.try_reserve_exact(buffer_length)
+                .expect("failed to allocate maps buffer");
+            maps.resize(buffer_length, 0);
+
+            #[cfg(target_arch = "x86_64")]
+            // SAFETY: `path` is a valid C string and `open` receives the
+            // argument count required when no creation flag is present.
+            let fd = unsafe {
                 syscalls::syscall3(
-                    syscalls::Sysno::read,
-                    fd,
-                    buf.as_mut_ptr() as usize + total_read,
-                    buf.len() - total_read,
+                    syscalls::Sysno::open,
+                    path.as_ptr() as usize,
+                    OFlags::RDONLY.bits() as usize,
+                    0,
                 )
+            };
+            #[cfg(target_arch = "aarch64")]
+            // SAFETY: `path` is a valid C string and the arguments satisfy the
+            // `openat` contract when no creation flag is present.
+            let fd = unsafe {
+                syscalls::syscall4(
+                    syscalls::Sysno::openat,
+                    AT_FDCWD,
+                    path.as_ptr() as usize,
+                    OFlags::RDONLY.bits() as usize,
+                    0,
+                )
+            };
+            let Ok(fd) = fd else {
+                return alloc::vec::Vec::new();
+            };
+
+            let mut total_read = 0;
+            while total_read < maps.len() {
+                // SAFETY: `fd` is open for reading and the remaining `maps`
+                // region is valid for writes of up to its full length.
+                let length = unsafe {
+                    syscalls::syscall3(
+                        syscalls::Sysno::read,
+                        fd,
+                        maps.as_mut_ptr() as usize + total_read,
+                        maps.len() - total_read,
+                    )
+                }
+                .expect("read failed");
+                if length == 0 {
+                    break;
+                }
+                total_read += length;
             }
-            .expect("read failed");
-            if n == 0 {
+            // SAFETY: `fd` was returned by the successful open above and is
+            // consumed exactly once in this iteration.
+            unsafe { syscalls::syscall1(syscalls::Sysno::close, fd) }.expect("close failed");
+
+            if total_read < maps.len() {
+                maps.truncate(total_read);
                 break;
             }
-            total_read += n;
+            buffer_length = buffer_length
+                .checked_mul(2)
+                .expect("maps buffer size overflow");
         }
-        assert!(total_read < buf.len(), "buffer too small");
-        unsafe { syscalls::syscall1(syscalls::Sysno::close, fd) }.expect("close failed");
 
         let mut reserved_pages = alloc::vec::Vec::new();
-        let s = core::str::from_utf8(&buf[..total_read]).expect("invalid UTF-8");
+        let s = core::str::from_utf8(&maps).expect("invalid UTF-8");
         for line in s.lines() {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() < 5 {
