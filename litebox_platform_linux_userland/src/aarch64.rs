@@ -160,7 +160,7 @@ pub(super) fn assert_tls_block_placement() {
     assert!(
         frame.is_multiple_of(core::mem::align_of::<resume_frame::ResumeFrame>()),
         "the resume frame is at thread-pointer offset {frame}, which `sys_rt_sigreturn` would \
-         reject, failing every asynchronous guest resume",
+         reject, failing every guest resume through the generic path",
     );
 
     let _ = guest_thread_pointer_tp_offset();
@@ -558,12 +558,14 @@ const _: () = assert!(
         && litebox_syscall_rewriter::aarch64::SVC_FRAME_OFF_RETADDR == 8
 );
 
-/// The kernel's `struct rt_sigframe`, synthesized by the runtime so that an
-/// *asynchronous* guest resume can restore all 31 GPRs, `SP`, `PC` and
-/// `PSTATE` at once.
+/// The kernel's `struct rt_sigframe`, synthesized by the runtime for the
+/// generic guest-resume path. It restores all 31 GPRs, `SP`, `PC`, and
+/// `PSTATE` at once without depending on guest-stack contents.
 ///
-/// Returning through `rt_sigreturn` spends no register as a branch target, so
-/// guest `x16` survives.
+/// This path handles arbitrary resume PCs, including asynchronous resumes. It
+/// is also the fallback when the syscall-specific outbound stub cannot use its
+/// guest-stack frame. Returning through `rt_sigreturn` spends no register as a
+/// branch target, so guest `x16` survives.
 ///
 /// One instance per guest thread, in this crate's TLS rather than on the guest
 /// stack, which would have to be writable at resume time and lies at a
@@ -764,7 +766,7 @@ pub(super) mod resume_frame {
         }
 
         // `restore_sigframe` ends by installing this mask, so it decides the
-        // host mask after every asynchronous resume and has to say "no change".
+        // host mask after every resume through this frame and has to say "no change".
         // Sampled per resume: this frame outlives a single guest lifetime, and
         // nothing stops a host thread from running another one.
         // SAFETY: `sigset_t` is a plain bit array, so all-zero is a valid value.
@@ -983,13 +985,11 @@ pub(super) mod resume_frame {
 /// the interior of `run_thread_arch`. Do not call this where the stack needs
 /// unwinding to run destructors.
 ///
-/// AArch64 cannot restore all 31 GPRs *and* branch, so this dispatches to
-/// [`switch_to_guest_via_outbound_stub`] or [`switch_to_guest_via_sigreturn`].
-/// The stub is usable exactly when [`tls_offset::OUTBOUND_STUB`] is recorded and
-/// `PtRegs::pc` still equals [`tls_offset::OUTBOUND_PC`]; the pair is never
-/// invalidated, so a stale record can only be selected when using it is correct.
-/// The choice happens here, before `in_guest` is set, so the frame stores cannot
-/// be attributed to the guest.
+/// The generic resume mechanism restores the complete context through
+/// `rt_sigreturn`. As an optimization, a resume at the most recent rewritten
+/// syscall site uses its recorded outbound stub while that stub's guest-stack
+/// frame remains usable. A fault while staging that frame returns to the
+/// generic mechanism.
 pub(super) unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
     #[cfg(feature = "aarch64_virtualize_x18")]
     set_guest_x18(ctx.regs[18]);
@@ -998,11 +998,8 @@ pub(super) unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRe
         // recorded and `ctx.pc` is the PC it branches to, checked above.
         unsafe { switch_to_guest_via_outbound_stub(ctx) }
     } else {
-        let frame = resume_frame::prepare(ctx);
-        // SAFETY: the caller's contract, plus a fully prepared frame, which
-        // `resume_frame::prepare` just returned and which lives for the rest
-        // of this thread's life.
-        unsafe { switch_to_guest_via_sigreturn(frame) }
+        // SAFETY: inherited from this function's contract.
+        unsafe { switch_to_guest_via_sigreturn(ctx) }
     }
 }
 
@@ -1036,11 +1033,11 @@ pub(super) fn outbound_stub_is_current(ctx: &litebox_common_linux::PtRegs) -> bo
 /// [`tls_offset::OUTBOUND_STUB`] and `ctx.pc` must be the PC it branches to.
 /// [`outbound_stub_is_current`] is the check.
 ///
-/// `SP` is staged at `PtRegs::sp - SVC_FRAME_BYTES` because the stub pops the
-/// frame, and `[SP, #0]` is re-written from `PtRegs::regs[16]` so a shim that
-/// modified it is honored. That store is the only write to guest memory in any
-/// transition assembly, so it carries an exception-table fixup that skips it
-/// and takes the stub anyway.
+/// Stages `PtRegs::regs[16]` in the stub frame before restoring guest state.
+/// If that guest-stack access faults (for example, because the stack was
+/// remapped), control returns to the generic [`switch_to_guest_via_sigreturn`]
+/// path. This is a failure of the syscall-specific optimization, not recovery
+/// of the syscall itself.
 ///
 /// The `switch_to_guest_via_outbound_stub_start`/`_end` bracket is one of the
 /// two ranges [`in_switch_to_guest`] tests: from before the `in_guest` store to
@@ -1083,6 +1080,31 @@ switch_to_guest_via_outbound_stub_start:
     b    interrupt_callback
 3:
 
+    // Stage x16 while host SP and FP/SIMD state are intact.
+    ldr  x4, [x0, #248]
+    sub  x4, x4, #{SVC_FRAME_BYTES}
+    ldr  x5, [x0, #128]
+.globl switch_to_guest_stage_x16
+switch_to_guest_stage_x16:
+    str  x5, [x4, #{SVC_FRAME_OFF_X16}]
+.globl switch_to_guest_stage_x16_end
+switch_to_guest_stage_x16_end:
+    b    4f
+.globl switch_to_guest_stage_x16_fixup
+switch_to_guest_stage_x16_fixup:
+    // Leave the syscall-specific fast path and use generic context restore;
+    // selecting the stub again would retry this store.
+    strb wzr, [x17, #{IN_GUEST}]
+    b    {resume_via_sigreturn}
+4:
+    // [start, end) and fixup as self-relative 32-bit offsets.
+    .pushsection ex_table,\"aR\"
+    .balign 4
+    .long switch_to_guest_stage_x16 - .
+    .long switch_to_guest_stage_x16_end - .
+    .long switch_to_guest_stage_x16_fixup - .
+    .popsection
+
     add  x17, x17, #{GUEST_VECTOR_STATE}
     add  x17, x17, #512
     ldp  w16, w4, [x17]
@@ -1107,43 +1129,12 @@ switch_to_guest_via_outbound_stub_start:
     ldp  q30, q31, [x17, #480]
     sub  x17, x17, #{GUEST_VECTOR_STATE}
 
-    // x16 carries the stub across restoration; guest x16 is staged for the
-    // stub to reload.
+    // x16 carries the stub. Recompute the frame after x4 was used as scratch;
+    // SP starts below the frame because the stub pops it before returning.
     ldr  x16, [x17, #{OUTBOUND_STUB}]
     ldr  x4,  [x0,  #248]
     sub  x4,  x4,  #{SVC_FRAME_BYTES}
     mov  sp,  x4
-    ldr  x5,  [x0,  #128]
-    // The one and only write to *guest* memory in the transition assembly,
-    // hence the only instruction here that a guest can make fault. It is
-    // registered in the exception table below so that a fault is recovered in
-    // place instead of being mistaken for a guest exception; see this
-    // function's doc comment.
-.globl switch_to_guest_stage_x16
-switch_to_guest_stage_x16:
-    str  x5,  [sp,  #{SVC_FRAME_OFF_X16}]
-.globl switch_to_guest_stage_x16_fixup
-switch_to_guest_stage_x16_fixup:
-    // TODO: skipping the store is not a clean recovery either way. If the
-    // guest stack is unmapped, the stub's own reload of `x16` faults next; if
-    // it is merely read-only, that reload succeeds and returns the guest's
-    // original `x16`, silently dropping any change the shim made to
-    // `regs[16]`. Diverting here to the `rt_sigreturn` path would handle both,
-    // since it reads its frame from runtime TLS and never touches guest
-    // memory -- but it must first restore `sp` from `host_sp` and clear
-    // `in_guest`, since it re-enters Rust.
-    // Exception-table entry for the store above, in the format
-    // `litebox::mm::exception_table` defines and searches: three self-relative
-    // 32-bit deltas, [start, stop) and the fixup. Written out longhand rather
-    // than through that module's `ex_table_entry!` because the macro is
-    // private to it and this body is one string literal; keep the section
-    // flags (`aR`: allocate, retain) identical to the ones there.
-    .pushsection ex_table,\"aR\"
-    .balign 4
-    .long switch_to_guest_stage_x16 - .
-    .long switch_to_guest_stage_x16_fixup - .
-    .long switch_to_guest_stage_x16_fixup - .
-    .popsection
 
     // `msr nzcv` writes only PSTATE 31:28. SSBS and DIT are carried in
     // `PtRegs::pstate` (see `copy_signal_context`) but are knowingly NOT
@@ -1151,8 +1142,8 @@ switch_to_guest_stage_x16_fixup:
     // ARMv8.0 optional / ARMv8.4 respectively, so unconditionally emitting
     // them would raise this crate's hardware floor. A guest that sets SSBS or
     // DIT therefore loses them across a syscall: both are hardening hints with
-    // no architectural effect on results. (The asynchronous path does restore
-    // them, for free, because `rt_sigreturn` writes the whole SPSR; see
+    // no architectural effect on results. (The generic `rt_sigreturn` path
+    // does restore them for free by writing the whole SPSR; see
     // `resume_frame::prepare`.)
     //
     // TODO: restore SSBS/DIT for guests that set them, gated on a runtime
@@ -1191,24 +1182,41 @@ switch_to_guest_via_outbound_stub_end:
     SVC_FRAME_BYTES = const litebox_syscall_rewriter::aarch64::SVC_FRAME_BYTES,
     SVC_FRAME_OFF_X16 = const litebox_syscall_rewriter::aarch64::SVC_FRAME_OFF_X16,
     VIRTUALIZE_X18 = const cfg!(feature = "aarch64_virtualize_x18") as usize,
+    resume_via_sigreturn = sym switch_to_guest_via_sigreturn,
     );
 }
 
-/// Re-enters the guest by `rt_sigreturn`-ing into a prepared
-/// [`resume_frame::ResumeFrame`], for a resume at an arbitrary PC.
+/// Generic guest resume for an arbitrary context, independent of guest-stack
+/// contents.
+///
+/// This is the normal path whenever the syscall-specific outbound-stub
+/// optimization is inapplicable, and its fallback if the guest-stack frame
+/// cannot be used.
+///
+/// # Safety
+/// Inherits [`switch_to_guest`]'s contract; the caller must be in host state.
+unsafe extern "C" fn switch_to_guest_via_sigreturn(ctx: &litebox_common_linux::PtRegs) -> ! {
+    let frame = resume_frame::prepare(ctx);
+    // SAFETY: `prepare` returned a complete thread-local frame.
+    unsafe { restore_guest_from_sigreturn_frame(frame) }
+}
+
+/// Restores the guest through a prepared [`resume_frame::ResumeFrame`].
+///
+/// This performs a *host* `rt_sigreturn` on the host's own thread, unrelated to
+/// a guest `rt_sigreturn` emulated by the shim.
 ///
 /// # Safety
 /// As [`switch_to_guest`], and additionally: `frame` must point at a frame
 /// [`resume_frame::prepare`] has filled in from the context being resumed, and
 /// must stay valid until the guest is entered.
 ///
-/// A *host* `rt_sigreturn` on the host's own thread, unrelated to the guest
-/// `rt_sigreturn` the shim emulates.
-///
 /// The second range [`in_switch_to_guest`] tests; see
 /// [`switch_to_guest_via_outbound_stub`]. During the `svc` itself is fine.
 #[unsafe(naked)]
-unsafe extern "C" fn switch_to_guest_via_sigreturn(frame: *mut resume_frame::ResumeFrame) -> ! {
+unsafe extern "C" fn restore_guest_from_sigreturn_frame(
+    frame: *mut resume_frame::ResumeFrame,
+) -> ! {
     core::arch::naked_asm!(
     "
 // No FDE, for the reason given on `switch_to_guest_via_outbound_stub`.
@@ -3833,11 +3841,22 @@ mod tests {
     #[test]
     fn test_switch_to_guest_stage_x16_has_exception_fixup() {
         let stage = super::switch_to_guest_stage_x16 as *const () as usize;
+        let end = super::switch_to_guest_stage_x16_end as *const () as usize;
         let fixup = super::switch_to_guest_stage_x16_fixup as *const () as usize;
+        assert_eq!(end, stage + 4, "only the staging store may be fixed up");
+        assert_ne!(
+            end, fixup,
+            "successful staging must not fall through into fault recovery"
+        );
         assert_eq!(
             litebox::mm::exception_table::search_exception_tables(stage),
             Some(fixup),
-            "the guest-stack staging store must be recoverable in place"
+            "the guest-stack staging store must fall back to generic context restore"
+        );
+        assert_eq!(
+            litebox::mm::exception_table::search_exception_tables(end),
+            None,
+            "the instruction after the staging store must not be covered"
         );
     }
 
