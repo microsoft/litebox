@@ -246,42 +246,71 @@ impl LinuxUserland {
         // We should either fix `mmap` to handle this error, or let global allocator call this function
         // whenever it get more pages from the host.
         let path = c"/proc/self/maps";
-        #[cfg(target_arch = "x86_64")]
-        let fd = unsafe {
-            syscalls::syscall3(
-                syscalls::Sysno::open,
-                path.as_ptr() as usize,
-                OFlags::RDONLY.bits() as usize,
-                0,
-            )
-        };
-        #[cfg(target_arch = "aarch64")]
-        let fd = unsafe {
-            syscalls::syscall4(
-                syscalls::Sysno::openat,
-                AT_FDCWD,
-                path.as_ptr() as usize,
-                OFlags::RDONLY.bits() as usize,
-                0,
-            )
-        };
-        let Ok(fd) = fd else {
-            return alloc::vec::Vec::new();
-        };
-        let maps = Self::read_to_end(|buffer| {
-            // SAFETY: `fd` is open for reading and `buffer` is valid for writes
-            // of up to its full length.
-            unsafe {
+        let mut maps = Vec::new();
+        let mut buffer_length = 8192;
+        loop {
+            maps.clear();
+            maps.try_reserve_exact(buffer_length)
+                .expect("failed to allocate maps buffer");
+            maps.resize(buffer_length, 0);
+
+            #[cfg(target_arch = "x86_64")]
+            // SAFETY: `path` is a valid C string and `open` receives the
+            // argument count required when no creation flag is present.
+            let fd = unsafe {
                 syscalls::syscall3(
-                    syscalls::Sysno::read,
-                    fd,
-                    buffer.as_mut_ptr() as usize,
-                    buffer.len(),
+                    syscalls::Sysno::open,
+                    path.as_ptr() as usize,
+                    OFlags::RDONLY.bits() as usize,
+                    0,
                 )
+            };
+            #[cfg(target_arch = "aarch64")]
+            // SAFETY: `path` is a valid C string and the arguments satisfy the
+            // `openat` contract when no creation flag is present.
+            let fd = unsafe {
+                syscalls::syscall4(
+                    syscalls::Sysno::openat,
+                    AT_FDCWD,
+                    path.as_ptr() as usize,
+                    OFlags::RDONLY.bits() as usize,
+                    0,
+                )
+            };
+            let Ok(fd) = fd else {
+                return alloc::vec::Vec::new();
+            };
+
+            let mut total_read = 0;
+            while total_read < maps.len() {
+                // SAFETY: `fd` is open for reading and the remaining `maps`
+                // region is valid for writes of up to its full length.
+                let length = unsafe {
+                    syscalls::syscall3(
+                        syscalls::Sysno::read,
+                        fd,
+                        maps.as_mut_ptr() as usize + total_read,
+                        maps.len() - total_read,
+                    )
+                }
+                .expect("read failed");
+                if length == 0 {
+                    break;
+                }
+                total_read += length;
             }
-            .expect("read failed")
-        });
-        unsafe { syscalls::syscall1(syscalls::Sysno::close, fd) }.expect("close failed");
+            // SAFETY: `fd` was returned by the successful open above and is
+            // consumed exactly once in this iteration.
+            unsafe { syscalls::syscall1(syscalls::Sysno::close, fd) }.expect("close failed");
+
+            if total_read < maps.len() {
+                maps.truncate(total_read);
+                break;
+            }
+            buffer_length = buffer_length
+                .checked_mul(2)
+                .expect("maps buffer size overflow");
+        }
 
         let mut reserved_pages = alloc::vec::Vec::new();
         let s = core::str::from_utf8(&maps).expect("invalid UTF-8");
@@ -296,23 +325,6 @@ impl LinuxUserland {
             reserved_pages.push(start..end);
         }
         reserved_pages
-    }
-
-    fn read_to_end(mut read: impl FnMut(&mut [u8]) -> usize) -> Vec<u8> {
-        let mut output = Vec::new();
-        let mut buffer = [0; 8192];
-        loop {
-            let length = read(&mut buffer);
-            if length == 0 {
-                break;
-            }
-            assert!(length <= buffer.len(), "reader returned an invalid length");
-            output
-                .try_reserve(length)
-                .expect("failed to allocate maps buffer");
-            output.extend_from_slice(&buffer[..length]);
-        }
-        output
     }
 
     #[expect(
@@ -2970,19 +2982,6 @@ mod tests {
             assert!(page.end > page.start);
             prev = page.end;
         }
-    }
-
-    #[test]
-    fn read_to_end_grows_beyond_one_buffer() {
-        let input = vec![0x5a; 8192 * 2 + 137];
-        let mut offset = 0;
-        let output = LinuxUserland::read_to_end(|buffer| {
-            let length = (input.len() - offset).min(997).min(buffer.len());
-            buffer[..length].copy_from_slice(&input[offset..offset + length]);
-            offset += length;
-            length
-        });
-        assert_eq!(output, input);
     }
 
     #[test]
