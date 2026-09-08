@@ -353,7 +353,7 @@ where
         if flags.intersects(OFlags::WRONLY | OFlags::RDWR) {
             // TODO(jayb): POSIX requires `EISDIR` when write access is requested on a directory,
             // but `OpenError` has no such variant yet.
-            return Err(OpenError::AccessNotAllowed);
+            unimplemented!()
         }
         let (fid, is_backend_root) = dir.into_typed::<Self>().into_dir();
         if flags.contains(OFlags::PATH) {
@@ -406,7 +406,7 @@ where
                 name: walked,
                 child: Some(child),
             } if walked == name => child,
-            NinePWalkingDirHandleInner::StoppedAtNonDir { .. } => return Err(OpenError::Io),
+            NinePWalkingDirHandleInner::StoppedAtNonDir { .. } => unimplemented!("{name}"),
             NinePWalkingDirHandleInner::Dir { fid, .. } => {
                 self.own(self.client.walk(&fid.fid, &[name])?.into_complete_fid()?)
             }

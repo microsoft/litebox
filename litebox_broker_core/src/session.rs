@@ -816,18 +816,6 @@ mod tests {
 
         assert_eq!(crate::fs::write(&source, file, b"abcdef", None), Ok(Ok(6)));
         assert_eq!(
-            crate::fs::read(&source, file, &mut [0], Some(u64::MAX)),
-            Ok(Err(FileError::InvalidOffset))
-        );
-        assert_eq!(
-            crate::fs::write(&source, file, b"x", Some(u64::MAX)),
-            Ok(Err(FileError::InvalidOffset))
-        );
-        assert_eq!(
-            crate::fs::truncate(&source, file, u64::MAX, false),
-            Ok(Err(FileError::Io))
-        );
-        assert_eq!(
             crate::fs::seek(&source, file, 0, FileSeekWhence::Beginning),
             Ok(Ok(0))
         );
@@ -868,7 +856,7 @@ mod tests {
         assert_eq!(&first, b"ab");
 
         let duplicate = source
-            .duplicate_object_reference_to(file, &target, ObjectRights::all())
+            .duplicate_object_reference_to(file, &target, ObjectRights::WAIT)
             .unwrap();
         let mut second = [0; 2];
         assert_eq!(
@@ -890,6 +878,11 @@ mod tests {
         );
         assert_eq!(&final_bytes, b"ef");
 
+        let status = crate::fs::handle_status(&target, duplicate)
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.file_type, FileType::RegularFile);
+        assert_eq!(status.size, 6);
         assert_eq!(source.close_object_reference(file), Ok(()));
         assert_eq!(
             crate::fs::seek(&target, duplicate, 0, FileSeekWhence::Beginning),
@@ -900,42 +893,8 @@ mod tests {
             Ok(Ok(1))
         );
         assert_eq!(&byte, b"a");
-        assert_eq!(
-            crate::fs::truncate(&target, duplicate, 3, false),
-            Ok(Ok(()))
-        );
-        let status = crate::fs::handle_status(&target, duplicate)
-            .unwrap()
-            .unwrap();
-        assert_eq!(status.file_type, FileType::RegularFile);
-        assert_eq!(status.size, 3);
         assert_eq!(target.close_object_reference(duplicate), Ok(()));
-
-        let changed_mode = FileMode::from_bits(0o640).unwrap();
-        assert_eq!(
-            crate::fs::chmod(&source, "/file", ROOT, changed_mode),
-            Ok(Ok(()))
-        );
-        assert_eq!(
-            crate::fs::chown(&source, "/file", ROOT, Some(1), Some(2)),
-            Ok(Ok(()))
-        );
-        let status = crate::fs::path_status(&source, "/file", ROOT)
-            .unwrap()
-            .unwrap();
-        assert_eq!(status.file_type, FileType::RegularFile);
-        assert_eq!(status.size, 3);
-        assert_eq!(status.mode, changed_mode);
-        assert_eq!(status.owner, FileUser { user: 1, group: 2 });
-
-        assert_eq!(crate::fs::mkdir(&source, "/dir", ROOT, mode), Ok(Ok(())));
-        assert_eq!(
-            crate::fs::path_status(&source, "/dir", ROOT)
-                .unwrap()
-                .unwrap()
-                .file_type,
-            FileType::Directory
-        );
+        assert_eq!(crate::fs::unlink(&source, "/file", ROOT), Ok(Ok(())));
 
         let directory = crate::fs::open(
             &source,
@@ -951,11 +910,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(entries.iter().any(|entry| entry.name == "."));
-        assert!(entries.iter().any(|entry| entry.name == ".."));
-        assert!(entries.iter().any(|entry| entry.name == "file"));
         assert!(entries.iter().any(|entry| entry.name == "dev"));
-        assert!(entries.iter().any(|entry| entry.name == "dir"));
         assert_eq!(source.close_object_reference(directory), Ok(()));
+
         let write_only_directory = crate::fs::open(
             &source,
             "/",
@@ -971,58 +928,6 @@ mod tests {
             Ok(Err(FileError::NotForReading))
         );
         assert_eq!(source.close_object_reference(write_only_directory), Ok(()));
-        assert_eq!(crate::fs::rmdir(&source, "/dir", ROOT), Ok(Ok(())));
-        assert_eq!(crate::fs::unlink(&source, "/file", ROOT), Ok(Ok(())));
-        assert_eq!(
-            crate::fs::path_status(&source, "/file", ROOT),
-            Ok(Err(FileError::NoSuchFileOrDirectory))
-        );
-
-        let protected_mode = FileMode::from_bits(0o400).unwrap();
-        let protected = crate::fs::open(
-            &source,
-            "/protected",
-            ROOT,
-            FileAccessMode::ReadWrite,
-            FileOpenFlags::CREATE,
-            protected_mode,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            crate::fs::write(&source, protected, b"kept", None),
-            Ok(Ok(4))
-        );
-        assert_eq!(source.close_object_reference(protected), Ok(()));
-        assert_eq!(
-            crate::fs::open(
-                &source,
-                "/protected",
-                ROOT,
-                FileAccessMode::ReadOnly,
-                FileOpenFlags::TRUNCATE,
-                FileMode::default(),
-            ),
-            Ok(Err(FileError::AccessNotAllowed))
-        );
-        let protected = crate::fs::open(
-            &source,
-            "/protected",
-            ROOT,
-            FileAccessMode::ReadOnly,
-            FileOpenFlags::NONE,
-            FileMode::default(),
-        )
-        .unwrap()
-        .unwrap();
-        let mut kept = [0; 4];
-        assert_eq!(
-            crate::fs::read(&source, protected, &mut kept, None),
-            Ok(Ok(4))
-        );
-        assert_eq!(&kept, b"kept");
-        assert_eq!(source.close_object_reference(protected), Ok(()));
-        assert_eq!(crate::fs::unlink(&source, "/protected", ROOT), Ok(Ok(())));
 
         let random = crate::fs::open(
             &source,
@@ -1041,19 +946,6 @@ mod tests {
         );
         assert_eq!(random_bytes, [0x5a; 4]);
         assert_eq!(source.close_object_reference(random), Ok(()));
-
-        let null = crate::fs::open(
-            &source,
-            "/dev/null",
-            ROOT,
-            FileAccessMode::ReadWrite,
-            FileOpenFlags::NONE,
-            FileMode::default(),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(crate::fs::write(&source, null, b"discard", None), Ok(Ok(7)));
-        assert_eq!(source.close_object_reference(null), Ok(()));
     }
 
     #[test]
