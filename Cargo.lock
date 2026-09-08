@@ -1487,6 +1487,7 @@ dependencies = [
  "litebox_broker_core",
  "litebox_broker_protocol",
  "litebox_broker_transport",
+ "litebox_platform",
  "spin 0.9.8",
  "thiserror",
 ]
