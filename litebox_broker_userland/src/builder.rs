@@ -14,6 +14,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use litebox_broker_core::fs::{FileService, UnsupportedFileService};
 use litebox_broker_core::socket::SocketProvider;
 use litebox_broker_core::{BrokerCore, BrokerCoreLimits, BrokerError, PolicyEngine};
 
@@ -76,6 +77,7 @@ impl From<BrokerError> for BrokerBuildError {
 pub struct BrokerCoreBuilder {
     policy: PolicyEngine,
     limits: BrokerCoreLimits,
+    fs: Arc<dyn FileService>,
 }
 
 impl BrokerCoreBuilder {
@@ -86,6 +88,7 @@ impl BrokerCoreBuilder {
         Self {
             policy,
             limits: BrokerCoreLimits::DEFAULT,
+            fs: Arc::new(UnsupportedFileService),
         }
     }
 
@@ -93,6 +96,13 @@ impl BrokerCoreBuilder {
     #[must_use]
     pub const fn with_limits(mut self, limits: BrokerCoreLimits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// Installs the broker-authoritative file service.
+    #[must_use]
+    pub fn with_file_service(mut self, fs: Arc<dyn FileService>) -> Self {
+        self.fs = fs;
         self
     }
 
@@ -116,7 +126,7 @@ impl BrokerCoreBuilder {
             socket_provider,
             Arc::new(UserlandRandomProvider),
             Arc::new(UserlandStdioProvider::new()?),
-            Arc::new(litebox_broker_core::fs::UnsupportedFileService),
+            self.fs,
         )?;
         Ok(broker)
     }

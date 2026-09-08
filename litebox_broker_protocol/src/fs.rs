@@ -208,7 +208,6 @@ impl FileOpenFlags {
     pub const APPEND: Self = Self(1 << 8);
     /// Open only for path-based operations.
     pub const PATH: Self = Self(1 << 9);
-
     /// Every open flag this protocol version defines.
     pub const SUPPORTED: Self = Self(
         Self::CREATE.0

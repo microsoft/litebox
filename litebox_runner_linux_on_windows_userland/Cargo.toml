@@ -15,6 +15,11 @@ litebox_util_log = { version = "0.1.0", path = "../litebox_util_log", features =
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 
 [dev-dependencies]
+litebox_broker_core = { version = "0.1.0", path = "../litebox_broker_core" }
+litebox_broker_host = { version = "0.1.0", path = "../litebox_broker_host" }
+litebox_broker_local = { version = "0.1.0", path = "../litebox_broker_local" }
+litebox_broker_protocol = { version = "0.1.0", path = "../litebox_broker_protocol" }
+litebox_broker_transport = { version = "0.1.0", path = "../litebox_broker_transport" }
 litebox_syscall_rewriter = { version = "0.1.0", path = "../litebox_syscall_rewriter", default-features = false, features = ["std"] }
 tar = "0.4"
 

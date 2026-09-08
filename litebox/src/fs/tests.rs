@@ -4,8 +4,8 @@
 fn tar_ro_fs(
     litebox: &crate::LiteBox<crate::platform::mock::MockPlatform>,
     tar_data: alloc::borrow::Cow<'static, [u8]>,
-) -> crate::fs::resolver::Resolver<crate::platform::mock::MockPlatform, crate::fs::tar_ro::TarRo> {
-    crate::fs::resolver::Resolver::new(
+) -> crate::fs::resolver::Resolver<crate::platform::mock::MockPlatform> {
+    crate::test_broker::brokered_fs(
         litebox,
         crate::fs::tar_ro::TarRo::new(
             tar_data,
@@ -14,26 +14,22 @@ fn tar_ro_fs(
     )
 }
 
-type InMemFs = crate::fs::resolver::Resolver<
-    crate::platform::mock::MockPlatform,
-    crate::fs::in_mem::InMem<crate::platform::mock::MockPlatform>,
->;
+type InMemFs = crate::fs::resolver::Resolver<crate::platform::mock::MockPlatform>;
 
 fn in_mem_fs(litebox: &crate::LiteBox<crate::platform::mock::MockPlatform>) -> InMemFs {
-    crate::fs::resolver::Resolver::new(
+    crate::test_broker::brokered_fs(
         litebox,
-        crate::fs::in_mem::InMem::new(crate::fs::inode_allocator::InodeAllocator::standalone()),
+        crate::fs::in_mem::InMem::<crate::platform::mock::MockPlatform>::new(
+            crate::fs::inode_allocator::InodeAllocator::standalone(),
+        ),
     )
 }
 
 /// Run `f` with the acting user set to root.
-fn with_root_privileges<
-    Platform: crate::sync::RawSyncPrimitivesProvider,
-    B: crate::fs::backend::Backend,
->(
-    fs: &mut crate::fs::resolver::Resolver<Platform, B>,
+fn with_root_privileges<Platform: crate::sync::RawSyncPrimitivesProvider>(
+    fs: &mut crate::fs::resolver::Resolver<Platform>,
     context: &crate::fs::resolver::Context,
-    f: impl FnOnce(&mut crate::fs::resolver::Resolver<Platform, B>, &crate::fs::resolver::Context),
+    f: impl FnOnce(&mut crate::fs::resolver::Resolver<Platform>, &crate::fs::resolver::Context),
 ) {
     let root = crate::fs::UserInfo::ROOT;
     with_user(fs, context, root.user, root.group, f);
@@ -41,22 +37,19 @@ fn with_root_privileges<
 
 /// Run `f` with the acting user set to `user`/`group`, so that tests can exercise operations
 /// whose outcome depends on the acting user.
-fn with_user<Platform: crate::sync::RawSyncPrimitivesProvider, B: crate::fs::backend::Backend>(
-    fs: &mut crate::fs::resolver::Resolver<Platform, B>,
+fn with_user<Platform: crate::sync::RawSyncPrimitivesProvider>(
+    fs: &mut crate::fs::resolver::Resolver<Platform>,
     context: &crate::fs::resolver::Context,
     user: u16,
     group: u16,
-    f: impl FnOnce(&mut crate::fs::resolver::Resolver<Platform, B>, &crate::fs::resolver::Context),
+    f: impl FnOnce(&mut crate::fs::resolver::Resolver<Platform>, &crate::fs::resolver::Context),
 ) {
     let mut context = context.clone();
     context.set_acting_user(crate::fs::UserInfo { user, group });
     f(fs, &context);
 }
 
-type OverlayFs = crate::fs::resolver::Resolver<
-    crate::platform::mock::MockPlatform,
-    crate::fs::overlay::Overlay<crate::platform::mock::MockPlatform>,
->;
+type OverlayFs = crate::fs::resolver::Resolver<crate::platform::mock::MockPlatform>;
 
 /// An overlay of `upper` over a tar-backed lower layer.
 fn overlay_fs(
@@ -64,9 +57,9 @@ fn overlay_fs(
     upper: crate::fs::in_mem::InMem<crate::platform::mock::MockPlatform>,
     tar_data: alloc::borrow::Cow<'static, [u8]>,
 ) -> OverlayFs {
-    crate::fs::resolver::Resolver::new(
+    crate::test_broker::brokered_fs(
         litebox,
-        crate::fs::overlay::Overlay::new(
+        crate::fs::overlay::Overlay::<crate::platform::mock::MockPlatform>::new(
             upper,
             crate::fs::tar_ro::TarRo::new(
                 tar_data,
@@ -2123,7 +2116,6 @@ mod stdio {
     use crate::LiteBox;
     use crate::fs::devices::Devices;
     use crate::fs::errors::{ReadError, WriteError};
-    use crate::fs::resolver::Resolver;
     use crate::fs::{Mode, OFlags};
     use crate::platform::mock::MockPlatform;
     use alloc::vec;
@@ -2134,7 +2126,7 @@ mod stdio {
         let ctx = crate::fs::resolver::Context::new();
         let platform = MockPlatform::new();
         let litebox = LiteBox::new(platform);
-        let fs = Resolver::new(
+        let fs = crate::test_broker::brokered_fs(
             &litebox,
             crate::fs::composer::Composer::builder()
                 .mount("/dev", Devices::new)
@@ -2178,7 +2170,7 @@ mod stdio {
     fn non_dev_path_fails() {
         let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
-        let fs = Resolver::new(
+        let fs = crate::test_broker::brokered_fs(
             &litebox,
             crate::fs::composer::Composer::builder()
                 .mount("/dev", Devices::new)
@@ -2203,16 +2195,15 @@ mod composed_stdio {
     use crate::fs::devices::Devices;
     use crate::fs::errors::{ReadError, WriteError};
     use crate::fs::in_mem::{InMem, InitialNode};
-    use crate::fs::resolver::Resolver;
     use crate::fs::{Mode, OFlags, UserInfo};
     use crate::platform::mock::MockPlatform;
     use alloc::vec;
     extern crate std;
 
-    type ComposedFs = Resolver<MockPlatform, Composer>;
+    type ComposedFs = crate::fs::resolver::Resolver<MockPlatform>;
 
     fn composed_fs(litebox: &LiteBox<MockPlatform>) -> ComposedFs {
-        Resolver::new(
+        crate::test_broker::brokered_fs(
             litebox,
             Composer::builder()
                 .mount("/", |_| {

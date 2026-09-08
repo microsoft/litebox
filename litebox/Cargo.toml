@@ -39,4 +39,5 @@ enforce_singleton_litebox_instance = []
 workspace = true
 
 [dev-dependencies]
+litebox_broker_host = { version = "0.1.0", path = "../litebox_broker_host" }
 tempfile = "3"

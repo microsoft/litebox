@@ -58,8 +58,7 @@ use crate::nt_types::{
     read_unicode_string_at,
 };
 
-type RegistryFileSystem<Platform> =
-    litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>;
+type RegistryFileSystem<Platform> = litebox::fs::resolver::Resolver<Platform>;
 
 pub(crate) struct RegistryKeySubsystem<Platform>(PhantomData<fn(Platform)>);
 
@@ -603,30 +602,7 @@ struct RegistryValue {
 
 impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
     pub(crate) fn new(litebox: &LiteBox<Platform>) -> Self {
-        let in_mem = litebox::fs::in_mem::InMem::<Platform>::new_initialized([(
-            "/",
-            litebox::fs::in_mem::InitialNode::Directory {
-                mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
-                owner: litebox::fs::UserInfo::ROOT,
-            },
-        )]);
-        let fs = litebox::fs::resolver::Resolver::new(
-            litebox,
-            litebox::fs::composer::Composer::builder()
-                .mount_nestable("/", |allocators| {
-                    litebox::fs::overlay::Overlay::<Platform>::new(
-                        in_mem,
-                        litebox::fs::tar_ro::TarRo::new(
-                            // TODO: Replace with tar file provided by the user
-                            litebox::fs::tar_ro::EMPTY_TAR_FILE.into(),
-                            allocators.next(),
-                        ),
-                        allocators.next(),
-                    )
-                })
-                .build()
-                .unwrap(),
-        );
+        let fs = litebox::fs::resolver::Resolver::new_brokered(litebox);
         let fs_context = litebox::fs::resolver::Context::new();
         {
             let fs = &fs;
@@ -836,14 +812,9 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
             )
             .map_err(map_open_error)?;
         let mut data = vec![0; status.size];
-        let read = self
-            .fs
-            .read(&fd, &mut data, Some(0))
-            .map_err(map_read_error)?;
+        let result = read_exact_at(&self.fs, &fd, &mut data);
         let _ = self.fs.close(&fd);
-        if read != data.len() {
-            return Err(NtStatus::UNSUCCESSFUL);
-        }
+        result?;
 
         let value_type = u32::from_le_bytes(
             data[..REGISTRY_VALUE_TYPE_SIZE]
@@ -2262,19 +2233,45 @@ fn write_value_at_path<Platform: crate::ShimPlatform>(
             Mode::RUSR | Mode::WUSR | Mode::ROTH | Mode::WOTH,
         )
         .map_err(map_open_error)?;
-    let written = fs
-        .write(&fd, &value_type.to_le_bytes(), Some(0))
-        .map_err(map_write_error)?;
-    if written != REGISTRY_VALUE_TYPE_SIZE {
-        return Err(NtStatus::DISK_FULL);
-    }
-    let written = fs
-        .write(&fd, value, Some(REGISTRY_VALUE_TYPE_SIZE))
-        .map_err(map_write_error)?;
-    if written != value.len() {
-        return Err(NtStatus::DISK_FULL);
-    }
+    let result = (|| {
+        write_all_at(fs, &fd, &value_type.to_le_bytes(), 0)?;
+        write_all_at(fs, &fd, value, REGISTRY_VALUE_TYPE_SIZE)
+    })();
     let _ = fs.close(&fd);
+    result
+}
+
+fn read_exact_at<Platform: crate::ShimPlatform>(
+    fs: &RegistryFileSystem<Platform>,
+    fd: &TypedFd<RegistryFileSystem<Platform>>,
+    mut data: &mut [u8],
+) -> Result<(), NtStatus> {
+    let mut offset = 0;
+    while !data.is_empty() {
+        let read = fs.read(fd, data, Some(offset)).map_err(map_read_error)?;
+        if read == 0 {
+            return Err(NtStatus::UNSUCCESSFUL);
+        }
+        offset = offset.checked_add(read).ok_or(NtStatus::UNSUCCESSFUL)?;
+        data = &mut data[read..];
+    }
+    Ok(())
+}
+
+fn write_all_at<Platform: crate::ShimPlatform>(
+    fs: &RegistryFileSystem<Platform>,
+    fd: &TypedFd<RegistryFileSystem<Platform>>,
+    mut data: &[u8],
+    mut offset: usize,
+) -> Result<(), NtStatus> {
+    while !data.is_empty() {
+        let written = fs.write(fd, data, Some(offset)).map_err(map_write_error)?;
+        if written == 0 {
+            return Err(NtStatus::DISK_FULL);
+        }
+        offset = offset.checked_add(written).ok_or(NtStatus::DISK_FULL)?;
+        data = &data[written..];
+    }
     Ok(())
 }
 
@@ -2493,7 +2490,28 @@ mod tests {
     }
 
     fn test_registry() -> (LiteBox<TestPlatform>, RegistryStore<TestPlatform>) {
-        let litebox = LiteBox::new(test_platform());
+        let mode = litebox_broker_core::fs::Mode::RWXU
+            | litebox_broker_core::fs::Mode::RWXG
+            | litebox_broker_core::fs::Mode::RWXO;
+        let litebox = crate::test_broker::litebox(
+            test_platform(),
+            alloc::vec![
+                (
+                    "/".into(),
+                    litebox_broker_core::fs::in_mem::InitialNode::Directory {
+                        mode,
+                        owner: litebox_broker_core::fs::UserInfo::ROOT,
+                    },
+                ),
+                (
+                    "/registry".into(),
+                    litebox_broker_core::fs::in_mem::InitialNode::Directory {
+                        mode,
+                        owner: litebox_broker_core::fs::UserInfo::ROOT,
+                    },
+                ),
+            ],
+        );
         let registry = RegistryStore::new(&litebox);
         (litebox, registry)
     }
@@ -2665,7 +2683,7 @@ mod tests {
 
     #[test]
     fn registry_store_separates_values_from_subkeys() {
-        let (_litebox, registry) = test_registry();
+        let (litebox, registry) = test_registry();
         let key_path = absolute_nt_key_name_to_fs_path(DEFAULT_CODE_PAGE_KEY).unwrap();
         let value_path = value_path(&key_path, "ACP").unwrap();
 
@@ -2688,6 +2706,15 @@ mod tests {
         let value = registry.read_value_at_path(&key_path, "ACP").unwrap();
         assert_eq!(value.value_type, u32::from(RegistryValueType::Sz));
         assert_eq!(value.data, DEFAULT_ACP_VALUE);
+
+        let broker_fs = litebox::fs::resolver::Resolver::new_brokered(&litebox);
+        assert_eq!(
+            broker_fs
+                .file_status(&litebox::fs::resolver::Context::new(), value_path.as_str(),)
+                .unwrap()
+                .file_type,
+            FileType::RegularFile
+        );
 
         let values_dir = absolute_nt_key_name_to_fs_path(
             "\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Nls\\CodePage\\.values",

@@ -10,8 +10,8 @@ mod globals;
 
 extern crate alloc;
 
-use alloc::{borrow::ToOwned, boxed::Box};
-use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
+use alloc::boxed::Box;
+use litebox::utils::TruncateExt as _;
 use litebox_platform_linux_kernel::{HostInterface, host::snp::ghcb::ghcb_prints};
 
 /// `log` backend that forwards to the GHCB serial console.
@@ -157,114 +157,12 @@ pub extern "C" fn sandbox_process_init(
     let initialized = SHIM.set(Box::new(shim)).is_ok();
     assert!(initialized, "shim initialized more than once");
 
-    let parse_args =
-        |params: &litebox_platform_linux_kernel::host::snp::snp_impl::vmpl2_boot_params| -> Option<(
-            alloc::string::String,
-            alloc::vec::Vec<alloc::ffi::CString>,
-            alloc::vec::Vec<alloc::ffi::CString>,
-        )> {
-            let mut argv = alloc::vec::Vec::new();
-            let mut envp = alloc::vec::Vec::new();
-
-            let argv_len = params.argv_len.reinterpret_as_unsigned() as usize;
-            let env_len = params.env_len.reinterpret_as_unsigned() as usize;
-            let total = argv_len + env_len;
-
-            let mut idx = 0;
-            while idx < total {
-                let arg = core::ffi::CStr::from_bytes_until_nul(&params.argv_and_env[idx..])
-                    .ok()?
-                    .to_owned();
-                let this_len = arg.count_bytes() + 1;
-
-                if idx < argv_len {
-                    argv.push(arg);
-                } else {
-                    envp.push(arg);
-                }
-                idx += this_len;
-            }
-            let program = argv.first().cloned()?;
-            Some((program.to_str().ok()?.to_owned(), argv, envp))
-        };
-    let Some((program, argv, envp)) = parse_args(boot_params) else {
-        litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::terminate(
-            globals::SM_SEV_TERM_SET,
-            globals::SM_TERM_INVALID_PARAM,
-        );
-    };
-
-    #[allow(clippy::missing_panics_doc)]
-    let shim = SHIM.get().expect("initialized");
-    let litebox = shim.litebox();
-
-    let socket_addr = core::net::SocketAddr::V4(core::net::SocketAddrV4::new(
-        core::net::Ipv4Addr::new(10, 0, 0, 1),
-        8888,
-    ));
-    let Ok(transport) = shim.tcp_connection(socket_addr) else {
-        ghcb_prints("failed to connect to 9p server");
-        litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::terminate(
-            globals::SM_SEV_TERM_SET,
-            globals::SM_TERM_GENERAL,
-        );
-    };
-    let composer = litebox::fs::composer::Composer::builder()
-        .mount_nestable("/", |allocators| {
-            let Ok(nine_p) = litebox::fs::nine_p::NineP::<Platform, _>::new(
-                transport,
-                65536,
-                "root",
-                "/tmp",
-                allocators.next(),
-            ) else {
-                ghcb_prints("failed to create 9P filesystem");
-                litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::terminate(
-                    globals::SM_SEV_TERM_SET,
-                    globals::SM_TERM_GENERAL,
-                );
-            };
-            litebox::fs::overlay::Overlay::<Platform>::new(
-                litebox::fs::in_mem::InMem::<Platform>::new_initialized([(
-                    "/tmp",
-                    litebox::fs::in_mem::InitialNode::Directory {
-                        mode: litebox::fs::Mode::RWXU
-                            | litebox::fs::Mode::RWXG
-                            | litebox::fs::Mode::RWXO,
-                        owner: litebox::fs::UserInfo::ROOT,
-                    },
-                )]),
-                nine_p,
-                allocators.next(),
-            )
-        })
-        .mount("/dev", litebox::fs::devices::Devices::new)
-        .build()
-        .unwrap_or_else(
-            |(litebox::fs::composer::BuildError::NoMounts
-             | litebox::fs::composer::BuildError::InvalidMountPath
-             | litebox::fs::composer::BuildError::DuplicateMountPath)| unreachable!(),
-        );
-    let fs = alloc::sync::Arc::new(litebox::fs::resolver::Resolver::new(litebox, composer));
-
-    // Loading a program may trigger page faults, so we need to set SHIM before this.
-    let program = match shim.load_program(fs, platform.init_task(boot_params), &program, argv, envp)
-    {
-        Ok(program) => program,
-        Err(err) => {
-            litebox_util_log::error!(err:% = err; "failed to load program");
-            litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::terminate(
-                globals::SM_SEV_TERM_SET,
-                globals::SM_TERM_GENERAL,
-            );
-        }
-    };
-    unsafe {
-        litebox_platform_linux_kernel::host::snp::snp_impl::run_thread(
-            alloc::boxed::Box::new(program.entrypoints),
-            pt_regs,
-        )
-    };
+    let _ = (boot_params, pt_regs);
+    ghcb_prints("filesystem startup requires a kernel broker platform");
+    litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::terminate(
+        globals::SM_SEV_TERM_SET,
+        globals::SM_TERM_GENERAL,
+    );
 }
 
 #[unsafe(no_mangle)]

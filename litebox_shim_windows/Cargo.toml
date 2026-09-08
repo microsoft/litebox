@@ -20,9 +20,19 @@ thiserror = { version = "2.0.6", default-features = false }
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
+litebox_broker_core = { path = "../litebox_broker_core/", version = "0.1.0" }
+litebox_broker_host = { path = "../litebox_broker_host/", version = "0.1.0" }
+litebox_broker_local = { path = "../litebox_broker_local/", version = "0.1.0" }
+litebox_broker_protocol = { path = "../litebox_broker_protocol/", version = "0.1.0" }
+litebox_broker_transport = { path = "../litebox_broker_transport/", version = "0.1.0" }
 litebox_platform_linux_userland = { path = "../litebox_platform_linux_userland/", version = "0.1.0" }
 
 [target.'cfg(target_os = "windows")'.dev-dependencies]
+litebox_broker_core = { path = "../litebox_broker_core/", version = "0.1.0" }
+litebox_broker_host = { path = "../litebox_broker_host/", version = "0.1.0" }
+litebox_broker_local = { path = "../litebox_broker_local/", version = "0.1.0" }
+litebox_broker_protocol = { path = "../litebox_broker_protocol/", version = "0.1.0" }
+litebox_broker_transport = { path = "../litebox_broker_transport/", version = "0.1.0" }
 litebox_platform_windows_userland = { path = "../litebox_platform_windows_userland/", version = "0.1.0" }
 
 [lints]

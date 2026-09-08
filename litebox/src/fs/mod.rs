@@ -14,25 +14,26 @@ use core::num::NonZeroUsize;
 pub mod errors;
 pub mod resolver;
 
-// TODO: Remove these implementation-facing compatibility modules once LiteBox uses the broker
-// file APIs exclusively. They temporarily preserve local filesystem construction while resolver
-// and backend ownership moves into broker core.
 #[doc(hidden)]
+#[cfg(test)]
 pub mod backend {
     pub use litebox_broker_core::fs::backend::*;
 }
 
 #[doc(hidden)]
+#[cfg(test)]
 pub mod composer {
     pub use litebox_broker_core::fs::composer::*;
 }
 
 #[doc(hidden)]
+#[cfg(test)]
 pub mod devices {
     pub use litebox_broker_core::fs::devices::*;
 }
 
 #[doc(hidden)]
+#[cfg(test)]
 pub mod in_mem {
     pub use litebox_broker_core::fs::in_mem::{InMem, InMemDirHandle, InMemFileHandle};
 
@@ -94,11 +95,13 @@ pub mod nine_p {
 }
 
 #[doc(hidden)]
+#[cfg(test)]
 pub mod overlay {
     pub use litebox_broker_core::fs::overlay::*;
 }
 
 #[doc(hidden)]
+#[cfg(test)]
 pub mod tar_ro {
     pub use litebox_broker_core::fs::tar_ro::*;
 }

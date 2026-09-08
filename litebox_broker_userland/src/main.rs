@@ -21,6 +21,8 @@ use litebox_broker_protocol::socket::{Ipv4Address, Port};
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(all(windows, target_arch = "x86_64"))]
+mod sync;
+#[cfg(all(windows, target_arch = "x86_64"))]
 mod windows;
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -70,6 +72,7 @@ impl FromStr for AllowedDestination {
 }
 
 #[derive(Parser, Debug)]
+#[allow(clippy::struct_excessive_bools)]
 struct CliArgs {
     /// Permit HTTP and HTTPS proxy requests to a hostname and destination ports.
     #[cfg(target_os = "linux")]
@@ -105,6 +108,20 @@ struct CliArgs {
         conflicts_with = "in_process_runner"
     )]
     runner: Option<PathBuf>,
+    /// Host program to populate into the broker-owned file system.
+    #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::ExecutablePath)]
+    fs_program: Option<PathBuf>,
+    /// Tar archive to mount as the broker-owned initial file system.
+    ///
+    /// When `--fs-program` is omitted, the guest program is expected to be in this archive.
+    #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
+    fs_initial_files: Option<PathBuf>,
+    /// Rewrite the host program before populating the broker-owned file system.
+    #[arg(long, requires = "fs_program")]
+    fs_rewrite_syscalls: bool,
+    /// Declare that rewritten AArch64 binaries use x18 virtualization.
+    #[arg(long)]
+    fs_virtualize_x18: bool,
     /// Arguments to pass to the local runner.
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true, value_hint = clap::ValueHint::CommandWithArguments)]
     runner_arguments: Vec<OsString>,

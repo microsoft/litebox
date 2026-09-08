@@ -13,13 +13,12 @@ use crate::fs::errors::{
     TruncateError, UnlinkError, WriteError,
 };
 use crate::fs::inode_allocator::InodeAllocator;
-use crate::fs::resolver::Resolver;
 use crate::fs::{Mode, OFlags};
 use crate::platform::mock::MockPlatform;
 
 use super::nine_p::{NineP, transport};
 
-type NinePFs<T> = Resolver<MockPlatform, NineP<MockPlatform, T>>;
+type NinePFs = crate::fs::resolver::Resolver<MockPlatform>;
 
 /// Attach to `server` over `transport`, building the backend the tests resolve paths through.
 fn attach<T: transport::Read + transport::Write>(
@@ -194,12 +193,9 @@ impl Drop for DiodServer {
 // Helper: create a connected 9P filesystem
 // ---------------------------------------------------------------------------
 
-fn connect_9p(
-    litebox: &crate::LiteBox<MockPlatform>,
-    server: &DiodServer,
-) -> NinePFs<TcpTransport> {
+fn connect_9p(litebox: &crate::LiteBox<MockPlatform>, server: &DiodServer) -> NinePFs {
     let transport = TcpTransport::connect(&server.addr());
-    Resolver::new(litebox, attach(transport, server))
+    crate::test_broker::brokered_fs(litebox, attach(transport, server))
 }
 
 // ---------------------------------------------------------------------------
@@ -564,9 +560,9 @@ fn connect_9p_broken(
     litebox: &crate::LiteBox<MockPlatform>,
     server: &DiodServer,
     allowed_writes: usize,
-) -> NinePFs<BrokenTransport> {
+) -> NinePFs {
     let tcp = TcpTransport::connect(&server.addr());
-    Resolver::new(
+    crate::test_broker::brokered_fs(
         litebox,
         attach(BrokenTransport::new(tcp, allowed_writes), server),
     )
@@ -609,20 +605,7 @@ fn test_nine_p_broken_read() {
     let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
 
-    // Pre-create a file via normal connection
-    {
-        let fs = connect_9p(&litebox, &server);
-        let fd = fs
-            .open(
-                &ctx,
-                "/read_me.txt",
-                OFlags::CREAT | OFlags::WRONLY,
-                Mode::RWXU,
-            )
-            .unwrap();
-        fs.write(&fd, b"data", None).unwrap();
-        fs.close(&fd).unwrap();
-    }
+    std::fs::write(server.export_path().join("read_me.txt"), b"data").unwrap();
 
     // 4 writes: version + attach + walk + lopen. Then read will fail.
     let fs = connect_9p_broken(&litebox, &server, 4);
@@ -694,19 +677,7 @@ fn test_nine_p_broken_unlink() {
     let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
 
-    // Pre-create a file
-    {
-        let fs = connect_9p(&litebox, &server);
-        let fd = fs
-            .open(
-                &ctx,
-                "/to_unlink.txt",
-                OFlags::CREAT | OFlags::WRONLY,
-                Mode::RWXU,
-            )
-            .unwrap();
-        fs.close(&fd).unwrap();
-    }
+    std::fs::write(server.export_path().join("to_unlink.txt"), b"").unwrap();
 
     let fs = connect_9p_broken(&litebox, &server, 2);
     let result = fs.unlink(&ctx, "/to_unlink.txt");
@@ -720,11 +691,7 @@ fn test_nine_p_broken_rmdir() {
     let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
 
-    // Pre-create a directory
-    {
-        let fs = connect_9p(&litebox, &server);
-        fs.mkdir(&ctx, "/to_rmdir", Mode::RWXU).unwrap();
-    }
+    std::fs::create_dir(server.export_path().join("to_rmdir")).unwrap();
 
     let fs = connect_9p_broken(&litebox, &server, 2);
     let result = fs.rmdir(&ctx, "/to_rmdir");
@@ -750,20 +717,7 @@ fn test_nine_p_broken_truncate() {
     let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
 
-    // Pre-create a file
-    {
-        let fs = connect_9p(&litebox, &server);
-        let fd = fs
-            .open(
-                &ctx,
-                "/to_trunc.txt",
-                OFlags::CREAT | OFlags::WRONLY,
-                Mode::RWXU,
-            )
-            .unwrap();
-        fs.write(&fd, b"some data", None).unwrap();
-        fs.close(&fd).unwrap();
-    }
+    std::fs::write(server.export_path().join("to_trunc.txt"), b"some data").unwrap();
 
     // 4 writes: version + attach + walk + lopen. Then truncate will fail.
     let fs = connect_9p_broken(&litebox, &server, 4);
@@ -782,20 +736,7 @@ fn test_nine_p_broken_seek() {
     let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
 
-    // Pre-create a file
-    {
-        let fs = connect_9p(&litebox, &server);
-        let fd = fs
-            .open(
-                &ctx,
-                "/to_seek.txt",
-                OFlags::CREAT | OFlags::WRONLY,
-                Mode::RWXU,
-            )
-            .unwrap();
-        fs.write(&fd, b"data", None).unwrap();
-        fs.close(&fd).unwrap();
-    }
+    std::fs::write(server.export_path().join("to_seek.txt"), b"data").unwrap();
 
     // 4 writes: version + attach + walk + lopen. Then the getattr for seek will fail.
     let fs = connect_9p_broken(&litebox, &server, 4);

@@ -8,10 +8,18 @@ use std::ffi::OsString;
 use std::io::Result as IoResult;
 use std::os::windows::io::AsRawHandle;
 use std::process::Child;
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Instant;
 
 use clap::Parser as _;
+use litebox_broker_core::fs::FileService;
+use litebox_broker_core::fs::composer::Composer;
+use litebox_broker_core::fs::in_mem::{InMem, InitialNode};
+use litebox_broker_core::fs::overlay::Overlay;
+use litebox_broker_core::fs::resolver::Resolver;
+use litebox_broker_core::fs::tar_ro::TarRo;
+use litebox_broker_core::fs::{Mode, UserInfo};
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport_windows_userland::named_pipe::{
@@ -31,6 +39,7 @@ pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
             configured_socket_policy(&args.allow_tcp_destination, &args.allow_udp_destination)?,
         ),
     )
+    .with_file_service(create_file_service(&args)?)
     .build()?;
 
     if args.in_process_runner {
@@ -42,6 +51,76 @@ pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
             Ok(())
         })
     }
+}
+
+fn create_file_service(args: &super::CliArgs) -> Result<Arc<dyn FileService>, Box<dyn Error>> {
+    if args.fs_program.is_some() || args.fs_rewrite_syscalls || args.fs_virtualize_x18 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows broker file systems require the program in the initial tar archive",
+        )
+        .into());
+    }
+    let runner_args = litebox_runner_windows_userland::CliArgs::try_parse_from(
+        std::iter::once(OsString::from("litebox-runner-windows-userland"))
+            .chain(std::iter::once(OsString::from("--unstable")))
+            .chain(args.runner_arguments.iter().cloned()),
+    )
+    .ok();
+    let initial_files = args
+        .fs_initial_files
+        .clone()
+        .or_else(|| runner_args.and_then(|args| args.initial_files))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Windows broker requires --fs-initial-files or runner --initial-files",
+            )
+        })?;
+    if initial_files
+        .extension()
+        .and_then(|extension| extension.to_str())
+        != Some("tar")
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("expected a .tar file, found {}", initial_files.display()),
+        )
+        .into());
+    }
+    let tar_data = std::borrow::Cow::Owned(std::fs::read(initial_files)?);
+    let mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
+    let in_mem = InMem::<super::sync::WindowsSyncPrimitivesProvider>::new_initialized([
+        (
+            "/tmp",
+            InitialNode::Directory {
+                mode,
+                owner: UserInfo::ROOT,
+            },
+        ),
+        (
+            "/registry",
+            InitialNode::Directory {
+                mode,
+                owner: UserInfo::ROOT,
+            },
+        ),
+    ]);
+    let backend = Composer::builder()
+        .mount_nestable("/", |allocators| {
+            Overlay::<super::sync::WindowsSyncPrimitivesProvider>::new(
+                in_mem,
+                TarRo::new(tar_data, allocators.next()),
+                allocators.next(),
+            )
+        })
+        .mount("/dev", litebox_broker_core::fs::devices::Devices::new)
+        .build()
+        .map_err(|_| std::io::Error::other("failed to construct broker file service"))?;
+    Ok(Arc::new(Resolver::<
+        super::sync::WindowsSyncPrimitivesProvider,
+        _,
+    >::new(backend)))
 }
 
 fn run_runner_in_process(
