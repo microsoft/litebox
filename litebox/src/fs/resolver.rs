@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 
 use litebox_broker_core::fs as broker_fs;
 use litebox_broker_core::fs::backend::DeviceIo;
-use litebox_broker_core::fs::resolver::{Engine, ResolverEntry};
+use litebox_broker_core::fs::resolver::{Resolver as BrokerResolver, ResolverEntry};
 
 use crate::path::Arg;
 use crate::{LiteBox, fd::TypedFd, sync};
@@ -27,7 +27,7 @@ pub struct Resolver<
     Backend: broker_fs::backend::Backend + 'static,
 > {
     litebox: LiteBox<Platform>,
-    engine: Engine<Backend>,
+    engine: BrokerResolver<Platform, Backend>,
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider, Backend: broker_fs::backend::Backend + 'static>
@@ -38,7 +38,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: broker_fs::backend::Bac
     pub fn new(litebox: &LiteBox<Platform>, backend: Backend) -> Self {
         Self {
             litebox: litebox.clone(),
-            engine: Engine::new(backend),
+            engine: BrokerResolver::new(backend),
         }
     }
 }

@@ -1073,6 +1073,7 @@ mod tests {
             Arc::new(TestSocketProvider),
             Arc::new(TestRandomProvider),
             Arc::clone(&stdio_provider) as Arc<dyn StdioProvider>,
+            Arc::new(litebox_broker_core::fs::UnsupportedFileService),
         )
         .unwrap();
 

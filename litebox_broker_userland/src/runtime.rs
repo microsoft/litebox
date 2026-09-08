@@ -688,6 +688,7 @@ mod tests {
                 Arc::new(UnsupportedSocketProvider),
                 Arc::new(random::UserlandRandomProvider),
                 stdio_provider,
+                Arc::new(litebox_broker_core::fs::UnsupportedFileService),
             )
             .unwrap();
             let shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();

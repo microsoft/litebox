@@ -6,6 +6,7 @@
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::marker::PhantomData;
 
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
@@ -20,16 +21,21 @@ use super::{
 };
 use super::{SeekWhence, UserInfo};
 
-/// The broker-core filesystem engine, generic over a [`Backend`](super::backend::Backend).
-pub struct Engine<Backend: super::backend::Backend + 'static> {
+/// The broker-core filesystem resolver, generic over its synchronization platform and
+/// [`Backend`](super::backend::Backend).
+pub struct Resolver<Platform, Backend: super::backend::Backend + 'static> {
     backend: Backend,
+    _sync: PhantomData<fn() -> Platform>,
 }
 
-impl<Backend: super::backend::Backend + 'static> Engine<Backend> {
-    /// Construct a filesystem engine over `backend`.
+impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Backend> {
+    /// Construct a filesystem resolver over `backend`.
     #[must_use]
     pub fn new(backend: Backend) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            _sync: PhantomData,
+        }
     }
 }
 
@@ -124,7 +130,7 @@ enum SearchScope {
     AndReadableTarget,
 }
 
-impl<Backend: super::backend::Backend + 'static> Engine<Backend> {
+impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Backend> {
     fn parent_dir_and_name<'a>(
         &self,
         context: &Context,
@@ -374,7 +380,7 @@ impl<Backend: super::backend::Backend + 'static> Engine<Backend> {
     }
 }
 
-impl<Backend: super::backend::Backend + 'static> Engine<Backend> {
+impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Backend> {
     /// Opens a file
     ///
     /// The `mode` is only significant when creating a file
@@ -531,22 +537,13 @@ impl<Backend: super::backend::Backend + 'static> Engine<Backend> {
         }
     }
 
-    /// Read from a file descriptor at `offset` into a buffer
-    ///
-    /// If `offset` is None, the read will start at the current file offset and update the file
-    /// offset to the end of the read.
-    /// If `offset` is Some, the file offset is not changed.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the updated file offset would overflow `usize`.
-    pub fn read(
+    fn read_inner(
         &self,
         device_io: &dyn DeviceIo,
-        entry: &mut ResolverEntry<Backend>,
+        entry: &ResolverEntry<Backend>,
         buf: &mut [u8],
         offset: Option<usize>,
-    ) -> Result<usize, ReadError> {
+    ) -> Result<(usize, usize), ReadError> {
         let file = match &entry.handle {
             Handle::File(file) => file,
             Handle::Dir(_) => return Err(ReadError::NotAFile),
@@ -565,28 +562,51 @@ impl<Backend: super::backend::Backend + 'static> Engine<Backend> {
             SeekBehavior::PositionBased => offset.unwrap_or(entry.position),
         };
         let read = self.backend.read(device_io, file, buf, read_offset)?;
-        if matches!(seek_behavior, SeekBehavior::PositionBased) && offset.is_none() {
-            entry.position = read_offset.checked_add(read).unwrap();
-        }
-        Ok(read)
+        Ok((read, read_offset))
     }
 
-    /// Write from a buffer to a file descriptor at `offset`
+    /// Read from a file descriptor at `offset` into a buffer
     ///
-    /// If `offset` is None, the write will start at the current file offset and update the file
-    /// offset to the end of the write.
+    /// If `offset` is None, the read will start at the current file offset and update the file
+    /// offset to the end of the read.
     /// If `offset` is Some, the file offset is not changed.
     ///
     /// # Panics
     ///
     /// Panics if the updated file offset would overflow `usize`.
-    pub fn write(
+    pub fn read(
         &self,
         device_io: &dyn DeviceIo,
         entry: &mut ResolverEntry<Backend>,
+        buf: &mut [u8],
+        offset: Option<usize>,
+    ) -> Result<usize, ReadError> {
+        let (read, read_offset) = self.read_inner(device_io, entry, buf, offset)?;
+        if entry.uses_position() && offset.is_none() {
+            entry.position = read_offset.checked_add(read).unwrap();
+        }
+        Ok(read)
+    }
+
+    pub(crate) fn read_without_position_update(
+        &self,
+        device_io: &dyn DeviceIo,
+        entry: &ResolverEntry<Backend>,
+        buf: &mut [u8],
+        offset: Option<usize>,
+    ) -> Result<usize, ReadError> {
+        debug_assert!(offset.is_some() || !entry.uses_position());
+        self.read_inner(device_io, entry, buf, offset)
+            .map(|(read, _)| read)
+    }
+
+    fn write_inner(
+        &self,
+        device_io: &dyn DeviceIo,
+        entry: &ResolverEntry<Backend>,
         buf: &[u8],
         offset: Option<usize>,
-    ) -> Result<usize, WriteError> {
+    ) -> Result<(usize, usize), WriteError> {
         let file = match &entry.handle {
             Handle::File(file) => file,
             Handle::Dir(_) => return Err(WriteError::NotAFile),
@@ -611,10 +631,42 @@ impl<Backend: super::backend::Backend + 'static> Engine<Backend> {
             SeekBehavior::PositionBased => offset.unwrap_or(entry.position),
         };
         let written = self.backend.write(device_io, file, buf, write_offset)?;
-        if matches!(seek_behavior, SeekBehavior::PositionBased) && offset.is_none() {
+        Ok((written, write_offset))
+    }
+
+    /// Write from a buffer to a file descriptor at `offset`
+    ///
+    /// If `offset` is None, the write will start at the current file offset and update the file
+    /// offset to the end of the write.
+    /// If `offset` is Some, the file offset is not changed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the updated file offset would overflow `usize`.
+    pub fn write(
+        &self,
+        device_io: &dyn DeviceIo,
+        entry: &mut ResolverEntry<Backend>,
+        buf: &[u8],
+        offset: Option<usize>,
+    ) -> Result<usize, WriteError> {
+        let (written, write_offset) = self.write_inner(device_io, entry, buf, offset)?;
+        if entry.uses_position() && offset.is_none() {
             entry.position = write_offset.checked_add(written).unwrap();
         }
         Ok(written)
+    }
+
+    pub(crate) fn write_without_position_update(
+        &self,
+        device_io: &dyn DeviceIo,
+        entry: &ResolverEntry<Backend>,
+        buf: &[u8],
+        offset: Option<usize>,
+    ) -> Result<usize, WriteError> {
+        debug_assert!(offset.is_some() || !entry.uses_position());
+        self.write_inner(device_io, entry, buf, offset)
+            .map(|(written, _)| written)
     }
 
     /// Reposition read/write file offset, by changing it to `offset` relative to `whence`.
@@ -663,6 +715,27 @@ impl<Backend: super::backend::Backend + 'static> Engine<Backend> {
         }
     }
 
+    pub(crate) fn seek_without_position_update(
+        entry: &ResolverEntry<Backend>,
+    ) -> Result<usize, SeekError> {
+        match &entry.handle {
+            Handle::File(_) => {}
+            Handle::Dir(_) => return Err(SeekError::NotAFile),
+        }
+        if entry.path_only {
+            // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
+            unimplemented!("seek on O_PATH fd")
+        }
+
+        match entry.seek_behavior {
+            SeekBehavior::NonSeekable => Err(SeekError::NonSeekable),
+            SeekBehavior::ZeroPosition => Ok(0),
+            SeekBehavior::PositionBased => {
+                unreachable!("position-based seeks require exclusive resolver-entry access")
+            }
+        }
+    }
+
     /// Truncate the file to the specified length.
     ///
     /// If shorter than existing size, extra data is lost. If longer than existing size, resize by
@@ -674,6 +747,18 @@ impl<Backend: super::backend::Backend + 'static> Engine<Backend> {
         entry: &mut ResolverEntry<Backend>,
         length: usize,
         reset_offset: bool,
+    ) -> Result<(), TruncateError> {
+        self.truncate_without_position_update(entry, length)?;
+        if reset_offset {
+            entry.position = 0;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn truncate_without_position_update(
+        &self,
+        entry: &ResolverEntry<Backend>,
+        length: usize,
     ) -> Result<(), TruncateError> {
         let file = match &entry.handle {
             Handle::File(file) => file,
@@ -688,9 +773,6 @@ impl<Backend: super::backend::Backend + 'static> Engine<Backend> {
         }
 
         self.backend.truncate(file, length)?;
-        if reset_offset {
-            entry.position = 0;
-        }
         Ok(())
     }
 
@@ -912,4 +994,18 @@ pub struct ResolverEntry<Backend: super::backend::Backend> {
     append_mode: bool,
     path_only: bool,
     seek_behavior: SeekBehavior,
+}
+
+impl<Backend: super::backend::Backend> ResolverEntry<Backend> {
+    pub(crate) const fn is_path_only(&self) -> bool {
+        self.path_only
+    }
+
+    pub(crate) const fn allows_read(&self) -> bool {
+        self.read_allowed
+    }
+
+    pub(crate) const fn uses_position(&self) -> bool {
+        matches!(self.seek_behavior, SeekBehavior::PositionBased)
+    }
 }

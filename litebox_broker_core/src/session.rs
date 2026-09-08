@@ -5,6 +5,7 @@ use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::event::EventObject;
+use crate::fs::File;
 use crate::pipe::PipeObject;
 use crate::socket::SocketObject;
 use crate::{BrokerCore, BrokerError, Result};
@@ -54,9 +55,9 @@ bitflags::bitflags! {
     /// Broker rights attached to an object reference.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
     pub struct ObjectRights: u32 {
-        /// Right to wait for readiness.
+        /// Right to observe or consume object state, including readiness and file reads.
         const WAIT = 1 << 0;
-        /// Right to mutate object state, such as adding event readiness credits.
+        /// Right to mutate object state, such as file contents or event readiness credits.
         const WRITE = 1 << 1;
     }
 }
@@ -71,6 +72,7 @@ pub(crate) struct ObjectReference {
 pub(crate) enum ObjectEntry {
     Reserved,
     Event(EventObject),
+    File(File),
     Pipe(PipeObject),
     Socket(SocketObject),
 }
@@ -189,7 +191,7 @@ impl BrokerSession {
     /// Duplicates a supported object reference into another session.
     ///
     /// The returned handle is owned by `target` and refers to the same
-    /// underlying event or pipe endpoint. `rights` must be nonempty, allowed by
+    /// underlying event, file, or pipe endpoint. `rights` must be nonempty, allowed by
     /// the target's policy, and no broader than the source reference's rights.
     /// The source reference is unchanged. Socket references are not supported
     /// because their readiness registration is currently bound to one session
@@ -223,7 +225,7 @@ impl BrokerSession {
         {
             let object = object.read();
             match &*object {
-                ObjectEntry::Event(_) | ObjectEntry::Pipe(_) => {}
+                ObjectEntry::Event(_) | ObjectEntry::File(_) | ObjectEntry::Pipe(_) => {}
                 ObjectEntry::Socket(_) => return Err(BrokerError::UnsupportedOperation),
                 ObjectEntry::Reserved => return Err(BrokerError::Internal),
             }
@@ -409,6 +411,23 @@ impl BrokerSession {
         Ok(Arc::clone(&reference.object))
     }
 
+    pub(crate) fn authorized_object_with_any_rights(
+        &self,
+        handle: ObjectHandle,
+        allowed_rights: ObjectRights,
+    ) -> Result<Arc<RwLock<ObjectEntry>>> {
+        debug_assert!(!allowed_rights.is_empty());
+        let references = self.core.references.read();
+        let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
+        if reference.session_id != self.session_id {
+            return Err(BrokerError::UnknownObject);
+        }
+        if !reference.rights.intersects(allowed_rights) {
+            return Err(BrokerError::InvalidRights);
+        }
+        Ok(Arc::clone(&reference.object))
+    }
+
     /// Returns the current readiness of a broker-owned object.
     pub fn check_readiness(&self, handle: ObjectHandle) -> Result<ReadinessFlags> {
         let object = self.authorized_object(handle, ObjectRights::WAIT)?;
@@ -416,6 +435,7 @@ impl BrokerSession {
             let object = object.read();
             match &*object {
                 ObjectEntry::Event(event) => return Ok(event.readiness()),
+                ObjectEntry::File(_) => return Err(BrokerError::InvalidRights),
                 ObjectEntry::Pipe(pipe) => return Ok(pipe.readiness()),
                 ObjectEntry::Socket(socket) => socket.resource(),
                 ObjectEntry::Reserved => return Err(BrokerError::Internal),
@@ -598,7 +618,8 @@ impl Drop for BrokerSession {
 
 #[cfg(test)]
 mod tests {
-    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+    use core::time::Duration;
 
     use super::{SessionReferences, release_pending_reference};
     use crate::{
@@ -607,13 +628,87 @@ mod tests {
     };
     use litebox_broker_protocol::ObjectHandle;
     use litebox_broker_protocol::event::{EventConsumeMode, EventConsumption};
+    use litebox_broker_protocol::fs::{
+        FileAccessMode, FileError, FileMode, FileOpenFlags, FileSeekWhence, FileType, FileUser,
+    };
     use litebox_broker_protocol::readiness::ReadinessFlags;
-    use std::{sync::Arc, vec::Vec};
+    use litebox_platform::sync::{
+        ImmediatelyWokenUp, RawMutex, RawMutexProvider, UnblockedOrTimedOut,
+    };
+    use std::{
+        sync::{Arc, Condvar, Mutex},
+        vec::Vec,
+    };
 
     const TEST_MAX_REFERENCES: usize = 4;
     const TEST_MAX_PIPE_CAPACITY: usize = 8;
     const TEST_MAX_REFERENCES_PER_SESSION: usize = 2;
     const TEST_MAX_PIPE_CAPACITY_PER_SESSION: usize = 4;
+    const ROOT: FileUser = FileUser { user: 0, group: 0 };
+
+    struct TestRawMutex {
+        state: AtomicU32,
+        waiters: Mutex<()>,
+        wake: Condvar,
+    }
+
+    impl RawMutex for TestRawMutex {
+        const INIT: Self = Self {
+            state: AtomicU32::new(0),
+            waiters: Mutex::new(()),
+            wake: Condvar::new(),
+        };
+
+        fn underlying_atomic(&self) -> &AtomicU32 {
+            &self.state
+        }
+
+        fn wake_many(&self, count: usize) -> usize {
+            let _waiters = self.waiters.lock().unwrap();
+            self.wake.notify_all();
+            count
+        }
+
+        fn block(&self, expected: u32) -> Result<(), ImmediatelyWokenUp> {
+            let waiters = self.waiters.lock().unwrap();
+            if self.state.load(Ordering::Acquire) != expected {
+                return Err(ImmediatelyWokenUp);
+            }
+            let _waiters = self
+                .wake
+                .wait_while(waiters, |()| self.state.load(Ordering::Acquire) == expected)
+                .unwrap();
+            Ok(())
+        }
+
+        fn block_or_timeout(
+            &self,
+            expected: u32,
+            timeout: Duration,
+        ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
+            let waiters = self.waiters.lock().unwrap();
+            if self.state.load(Ordering::Acquire) != expected {
+                return Err(ImmediatelyWokenUp);
+            }
+            let (_waiters, result) = self
+                .wake
+                .wait_timeout_while(waiters, timeout, |()| {
+                    self.state.load(Ordering::Acquire) == expected
+                })
+                .unwrap();
+            Ok(if result.timed_out() {
+                UnblockedOrTimedOut::TimedOut
+            } else {
+                UnblockedOrTimedOut::Unblocked
+            })
+        }
+    }
+
+    struct TestSync;
+
+    impl RawMutexProvider for TestSync {
+        type RawMutex = TestRawMutex;
+    }
 
     #[test]
     fn pending_reference_release_checks_both_counters() {
@@ -700,9 +795,167 @@ mod tests {
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
     }
 
+    fn check_file_reference_lifecycle(broker: &BrokerCore) {
+        let source = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let target = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let mode = FileMode::from_bits(0o600).unwrap();
+        let file = crate::fs::open(
+            &source,
+            "/file",
+            ROOT,
+            FileAccessMode::ReadWrite,
+            FileOpenFlags::CREATE,
+            mode,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(crate::fs::write(&source, file, b"abcdef", None), Ok(Ok(6)));
+        assert_eq!(
+            crate::fs::seek(&source, file, 0, FileSeekWhence::Beginning),
+            Ok(Ok(0))
+        );
+
+        let event = crate::event::create(&source, 0).unwrap();
+        let mut byte = [0];
+        assert_eq!(
+            crate::fs::read(&source, event, &mut byte, None),
+            Err(BrokerError::InvalidRights)
+        );
+        assert_eq!(
+            crate::event::consume(&source, file, EventConsumeMode::One),
+            Err(BrokerError::InvalidRights)
+        );
+        assert_eq!(
+            source.check_readiness(file),
+            Err(BrokerError::InvalidRights)
+        );
+        assert_eq!(
+            crate::fs::open(
+                &source,
+                "/uncommitted",
+                ROOT,
+                FileAccessMode::ReadWrite,
+                FileOpenFlags::CREATE,
+                mode,
+            ),
+            Err(BrokerError::ResourceExhausted)
+        );
+        assert_eq!(source.close_object_reference(event), Ok(()));
+        assert_eq!(
+            crate::fs::path_status(&source, "/uncommitted", ROOT),
+            Ok(Err(FileError::NoSuchFileOrDirectory))
+        );
+
+        let mut first = [0; 2];
+        assert_eq!(crate::fs::read(&source, file, &mut first, None), Ok(Ok(2)));
+        assert_eq!(&first, b"ab");
+
+        let duplicate = source
+            .duplicate_object_reference_to(file, &target, ObjectRights::WAIT)
+            .unwrap();
+        let mut second = [0; 2];
+        assert_eq!(
+            crate::fs::read(&target, duplicate, &mut second, None),
+            Ok(Ok(2))
+        );
+        assert_eq!(&second, b"cd");
+
+        let mut explicit = [0; 2];
+        assert_eq!(
+            crate::fs::read(&source, file, &mut explicit, Some(0)),
+            Ok(Ok(2))
+        );
+        assert_eq!(&explicit, b"ab");
+        let mut final_bytes = [0; 2];
+        assert_eq!(
+            crate::fs::read(&source, file, &mut final_bytes, None),
+            Ok(Ok(2))
+        );
+        assert_eq!(&final_bytes, b"ef");
+
+        let status = crate::fs::handle_status(&target, duplicate)
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.file_type, FileType::RegularFile);
+        assert_eq!(status.size, 6);
+        assert_eq!(source.close_object_reference(file), Ok(()));
+        assert_eq!(
+            crate::fs::seek(&target, duplicate, 0, FileSeekWhence::Beginning),
+            Ok(Ok(0))
+        );
+        assert_eq!(
+            crate::fs::read(&target, duplicate, &mut byte, None),
+            Ok(Ok(1))
+        );
+        assert_eq!(&byte, b"a");
+        assert_eq!(target.close_object_reference(duplicate), Ok(()));
+        assert_eq!(crate::fs::unlink(&source, "/file", ROOT), Ok(Ok(())));
+
+        let directory = crate::fs::open(
+            &source,
+            "/",
+            ROOT,
+            FileAccessMode::ReadOnly,
+            FileOpenFlags::DIRECTORY,
+            FileMode::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let entries = crate::fs::read_directory(&source, directory)
+            .unwrap()
+            .unwrap();
+        assert!(entries.iter().any(|entry| entry.name == "."));
+        assert!(entries.iter().any(|entry| entry.name == "dev"));
+        assert_eq!(source.close_object_reference(directory), Ok(()));
+
+        let write_only_directory = crate::fs::open(
+            &source,
+            "/",
+            ROOT,
+            FileAccessMode::WriteOnly,
+            FileOpenFlags::DIRECTORY,
+            FileMode::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            crate::fs::read_directory(&source, write_only_directory),
+            Ok(Err(FileError::NotForReading))
+        );
+        assert_eq!(source.close_object_reference(write_only_directory), Ok(()));
+
+        let random = crate::fs::open(
+            &source,
+            "/dev/urandom",
+            ROOT,
+            FileAccessMode::ReadOnly,
+            FileOpenFlags::NONE,
+            FileMode::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let mut random_bytes = [0; 4];
+        assert_eq!(
+            crate::fs::read(&source, random, &mut random_bytes, None),
+            Ok(Ok(4))
+        );
+        assert_eq!(random_bytes, [0x5a; 4]);
+        assert_eq!(source.close_object_reference(random), Ok(()));
+    }
+
     #[test]
     fn object_reference_lifecycle_uses_public_core_constructor_once() {
         let socket_provider = Arc::new(crate::socket::tests::TestSocketProvider::default());
+        let fs = crate::fs::composer::Composer::builder()
+            .mount("/", crate::fs::in_mem::InMem::<TestSync>::new)
+            .mount("/dev", crate::fs::devices::Devices::new)
+            .build()
+            .unwrap();
         let broker = BrokerCore::new_with_limits(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_socket_policy(SocketPolicy::guest_network()),
@@ -719,6 +972,7 @@ mod tests {
             socket_provider.clone(),
             Arc::new(crate::random::TestRandomProvider),
             Arc::new(crate::stdio::UnsupportedStdioProvider),
+            Arc::new(crate::fs::resolver::Resolver::<TestSync, _>::new(fs)),
         )
         .unwrap();
 
@@ -733,6 +987,7 @@ mod tests {
         check_pipe_capacity_quota_is_per_session(&broker);
         check_pipe_capacity_outlives_session_for_in_flight_object(&broker);
         check_supported_references_duplicate_between_sessions(&broker);
+        check_file_reference_lifecycle(&broker);
         crate::socket::tests::check_socket_lifecycle(&broker, &socket_provider);
         check_pair_handle_exhaustion(&broker);
 
