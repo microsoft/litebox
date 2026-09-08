@@ -12,10 +12,10 @@ mod common;
 
 fn run_rewritten_fixture(source: &str, unique_name: &str) -> std::process::Output {
     let target = common::compile(source, unique_name, true, false);
-    run_rewritten_target(&target)
+    run_rewritten_target(&target, false)
 }
 
-fn run_rewritten_target(target: &std::path::Path) -> std::process::Output {
+fn run_rewritten_target(target: &std::path::Path, virtualize_x18: bool) -> std::process::Output {
     let binary_path = std::env::var("NEXTEST_BIN_EXE_litebox_runner_linux_userland")
         .unwrap_or_else(|_| env!("CARGO_BIN_EXE_litebox_runner_linux_userland").to_string());
 
@@ -29,6 +29,9 @@ fn run_rewritten_target(target: &std::path::Path) -> std::process::Output {
             broker_path.display()
         );
         let mut command = std::process::Command::new(broker_path);
+        if virtualize_x18 {
+            command.arg("--fs-virtualize-x18");
+        }
         command.arg("--runner").arg(&binary_path);
         command
     };
@@ -158,7 +161,7 @@ fn test_x18_virtualization() {
         true,
         true,
     );
-    let output = run_rewritten_target(&target);
+    let output = run_rewritten_target(&target, true);
     assert!(
         output.status.success(),
         "x18 fixture failed ({}): {}",
