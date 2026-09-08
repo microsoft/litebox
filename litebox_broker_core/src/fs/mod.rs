@@ -3,7 +3,7 @@
 
 //! File-system related functionality
 //!
-//! A file-system consists of an [`Engine`](resolver::Engine) that works alongside one or more
+//! A file-system consists of a [`Resolver`](resolver::Resolver) that works alongside one or more
 //! [`Backend`](backend::Backend)s. Such backends can be composed together: mounted at distinct paths
 //! via the [`Composer`](composer::Composer), or stacked as a writable upper over immutable lowers
 //! via the [`Overlay`](overlay::Overlay).
@@ -28,9 +28,8 @@ pub mod tar_ro;
 
 pub(crate) use service::File;
 pub use service::{
-    EngineFileService, FileResult, FileService, UnsupportedFileService, chmod, chown,
-    handle_status, mkdir, open, path_status, read, read_directory, rmdir, seek, truncate, unlink,
-    write,
+    FileResult, FileService, UnsupportedFileService, chmod, chown, handle_status, mkdir, open,
+    path_status, read, read_directory, rmdir, seek, truncate, unlink, write,
 };
 
 bitflags! {
@@ -75,7 +74,7 @@ bitflags! {
 
 /// Types of files on a file-system.
 ///
-/// See [`resolver::Engine::file_status`].
+/// See [`resolver::Resolver::file_status`].
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum FileType {
     RegularFile,
@@ -169,7 +168,7 @@ bitflags! {
     }
 }
 
-/// The `whence` directive to [`resolver::Engine::seek`]
+/// The `whence` directive to [`resolver::Resolver::seek`]
 #[derive(Copy, Clone)]
 pub enum SeekWhence {
     /// The file offset is set to `offset` bytes.
@@ -222,7 +221,7 @@ pub struct NodeInfo {
     pub rdev: Option<NonZeroUsize>,
 }
 
-/// Directory entries returned by [`resolver::Engine::read_dir`]
+/// Directory entries returned by [`resolver::Resolver::read_dir`]
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct DirEntry {

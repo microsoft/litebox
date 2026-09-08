@@ -972,9 +972,7 @@ mod tests {
             socket_provider.clone(),
             Arc::new(crate::random::TestRandomProvider),
             Arc::new(crate::stdio::UnsupportedStdioProvider),
-            Arc::new(crate::fs::EngineFileService::<_, TestSync>::new(
-                crate::fs::resolver::Engine::new(fs),
-            )),
+            Arc::new(crate::fs::resolver::Resolver::<TestSync, _>::new(fs)),
         )
         .unwrap();
 

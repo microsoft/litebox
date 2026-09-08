@@ -4,7 +4,7 @@
 //! Broker-authoritative file operations.
 
 use alloc::{sync::Arc, vec::Vec};
-use core::{any::Any, marker::PhantomData};
+use core::any::Any;
 
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::{
@@ -20,7 +20,7 @@ use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
     ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
 };
-use super::resolver::{Engine, ResolverEntry};
+use super::resolver::{Resolver, ResolverEntry};
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence, UserInfo};
 use crate::session::{ObjectEntry, ObjectRights};
 use crate::{BrokerError, BrokerSession, Result};
@@ -182,37 +182,18 @@ mod private {
 /// Object-safe broker-wide file service.
 ///
 /// Implementations are sealed so every broker-owned open state is created and interpreted by
-/// broker core. Construct an [`EngineFileService`] for a real fs engine, or use
+/// broker core. Construct a [`Resolver`](super::resolver::Resolver) for a real fs, or use
 /// [`UnsupportedFileService`] when file operations are intentionally unavailable.
 pub trait FileService: private::Service {}
 
 impl<Service: private::Service> FileService for Service {}
-
-/// File service backed by one broker-core [`Engine`].
-pub struct EngineFileService<Backend: super::backend::Backend, Platform> {
-    engine: Engine<Backend>,
-    _sync: PhantomData<fn() -> Platform>,
-}
-
-impl<Backend: super::backend::Backend, Platform> EngineFileService<Backend, Platform> {
-    /// Creates a file service over the global fs engine.
-    ///
-    /// `Platform` selects the blocking synchronization primitives used for shared per-open state.
-    #[must_use]
-    pub fn new(engine: Engine<Backend>) -> Self {
-        Self {
-            engine,
-            _sync: PhantomData,
-        }
-    }
-}
 
 /// File service for broker configurations that intentionally expose no file operations.
 pub struct UnsupportedFileService;
 
 impl private::Service for UnsupportedFileService {}
 
-impl<Backend, Platform> EngineFileService<Backend, Platform>
+impl<Platform, Backend> Resolver<Platform, Backend>
 where
     Backend: super::backend::Backend + 'static,
     Platform: RawSyncPrimitivesProvider,
@@ -222,7 +203,7 @@ where
     }
 }
 
-impl<Backend, Platform> private::Service for EngineFileService<Backend, Platform>
+impl<Platform, Backend> private::Service for Resolver<Platform, Backend>
 where
     Backend: super::backend::Backend + 'static,
     Platform: RawSyncPrimitivesProvider,
@@ -237,10 +218,7 @@ where
         mode: FileMode,
     ) -> ServiceResult<File> {
         let flags = open_flags(access, flags)?;
-        let entry = match self
-            .engine
-            .open(user_info(user), path, flags, file_mode(mode))
-        {
+        let entry = match Resolver::open(self, user_info(user), path, flags, file_mode(mode)) {
             Ok(entry) => entry,
             Err(error) => return Ok(Err(file_open_error(error))),
         };
@@ -263,20 +241,14 @@ where
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            self.engine.read_without_position_update(
-                &SessionDeviceIo(session),
-                &entry,
-                output,
-                offset,
-            )
+            self.read_without_position_update(&SessionDeviceIo(session), &entry, output, offset)
         } else {
             drop(entry);
             let mut entry = state.write();
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            self.engine
-                .read(&SessionDeviceIo(session), &mut entry, output, offset)
+            Resolver::read(self, &SessionDeviceIo(session), &mut entry, output, offset)
         };
         let read = match read {
             Ok(read) => read,
@@ -304,20 +276,14 @@ where
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            self.engine.write_without_position_update(
-                &SessionDeviceIo(session),
-                &entry,
-                input,
-                offset,
-            )
+            self.write_without_position_update(&SessionDeviceIo(session), &entry, input, offset)
         } else {
             drop(entry);
             let mut entry = state.write();
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            self.engine
-                .write(&SessionDeviceIo(session), &mut entry, input, offset)
+            Resolver::write(self, &SessionDeviceIo(session), &mut entry, input, offset)
         };
         let written = match written {
             Ok(written) => written,
@@ -348,12 +314,12 @@ where
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            self.engine.seek(&mut entry, offset, whence)
+            Resolver::seek(self, &mut entry, offset, whence)
         } else {
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            Engine::<Backend>::seek_without_position_update(&entry)
+            Resolver::<Platform, Backend>::seek_without_position_update(&entry)
         };
         let offset = match seek {
             Ok(offset) => offset,
@@ -380,12 +346,12 @@ where
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            self.engine.truncate(&mut entry, length, true)
+            Resolver::truncate(self, &mut entry, length, true)
         } else {
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            self.engine.truncate_without_position_update(&entry, length)
+            self.truncate_without_position_update(&entry, length)
         };
         Ok(truncate.map_err(file_truncate_error))
     }
@@ -402,7 +368,7 @@ where
         if !entry.allows_read() {
             return Ok(Err(FileError::NotForReading));
         }
-        let entries = match self.engine.read_dir(&entry) {
+        let entries = match Resolver::read_dir(self, &entry) {
             Ok(entries) => entries,
             Err(error) => return Ok(Err(file_read_directory_error(error))),
         };
@@ -419,7 +385,7 @@ where
         file: &File,
     ) -> ServiceResult<ProtocolFileStatus> {
         let entry = Self::state(file)?.read();
-        let status = match self.engine.handle_status(&entry) {
+        let status = match Resolver::handle_status(self, &entry) {
             Ok(status) => status,
             Err(error) => return Ok(Err(file_status_error(error))),
         };
@@ -432,7 +398,7 @@ where
         path: &str,
         user: FileUser,
     ) -> ServiceResult<ProtocolFileStatus> {
-        let status = match self.engine.file_status(user_info(user), path) {
+        let status = match Resolver::file_status(self, user_info(user), path) {
             Ok(status) => status,
             Err(error) => return Ok(Err(file_status_error(error))),
         };
@@ -446,10 +412,7 @@ where
         user: FileUser,
         mode: FileMode,
     ) -> ServiceResult<()> {
-        Ok(self
-            .engine
-            .chmod(user_info(user), path, file_mode(mode))
-            .map_err(file_chmod_error))
+        Ok(Resolver::chmod(self, user_info(user), path, file_mode(mode)).map_err(file_chmod_error))
     }
 
     fn chown(
@@ -460,17 +423,14 @@ where
         user: Option<u16>,
         group: Option<u16>,
     ) -> ServiceResult<()> {
-        Ok(self
-            .engine
-            .chown(user_info(acting_user), path, user, group)
-            .map_err(file_chown_error))
+        Ok(
+            Resolver::chown(self, user_info(acting_user), path, user, group)
+                .map_err(file_chown_error),
+        )
     }
 
     fn unlink(&self, _session: &BrokerSession, path: &str, user: FileUser) -> ServiceResult<()> {
-        Ok(self
-            .engine
-            .unlink(user_info(user), path)
-            .map_err(file_unlink_error))
+        Ok(Resolver::unlink(self, user_info(user), path).map_err(file_unlink_error))
     }
 
     fn mkdir(
@@ -480,17 +440,11 @@ where
         user: FileUser,
         mode: FileMode,
     ) -> ServiceResult<()> {
-        Ok(self
-            .engine
-            .mkdir(user_info(user), path, file_mode(mode))
-            .map_err(file_mkdir_error))
+        Ok(Resolver::mkdir(self, user_info(user), path, file_mode(mode)).map_err(file_mkdir_error))
     }
 
     fn rmdir(&self, _session: &BrokerSession, path: &str, user: FileUser) -> ServiceResult<()> {
-        Ok(self
-            .engine
-            .rmdir(user_info(user), path)
-            .map_err(file_rmdir_error))
+        Ok(Resolver::rmdir(self, user_info(user), path).map_err(file_rmdir_error))
     }
 }
 

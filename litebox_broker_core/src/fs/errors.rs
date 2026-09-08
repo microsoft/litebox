@@ -8,7 +8,7 @@ use thiserror::Error;
 // XXX(jayb): We probably need to introduce a notion of `Stale` to many/most of these errors, in
 // order to more correctly support network-attached file systems.
 
-/// Possible errors from [`super::resolver::Engine::open`]
+/// Possible errors from [`super::resolver::Resolver::open`]
 #[derive(Error, Debug)]
 pub enum OpenError {
     #[error("requested access to the file is not allowed")]
@@ -27,7 +27,7 @@ pub enum OpenError {
     PathError(#[from] PathError),
 }
 
-/// Possible errors from [`super::resolver::Engine::read`]
+/// Possible errors from [`super::resolver::Resolver::read`]
 #[derive(Error, Debug)]
 pub enum ReadError {
     #[error("fd has been closed already")]
@@ -40,7 +40,7 @@ pub enum ReadError {
     Io,
 }
 
-/// Possible errors from [`super::resolver::Engine::write`]
+/// Possible errors from [`super::resolver::Resolver::write`]
 #[derive(Error, Debug)]
 pub enum WriteError {
     #[error("fd has been closed already")]
@@ -53,7 +53,7 @@ pub enum WriteError {
     Io,
 }
 
-/// Possible errors from [`super::resolver::Engine::seek`]
+/// Possible errors from [`super::resolver::Resolver::seek`]
 #[derive(Error, Debug)]
 pub enum SeekError {
     #[error("fd has been closed already")]
@@ -68,7 +68,7 @@ pub enum SeekError {
     Io,
 }
 
-/// Possible errors from [`super::resolver::Engine::truncate`]
+/// Possible errors from [`super::resolver::Resolver::truncate`]
 #[derive(Error, Debug)]
 pub enum TruncateError {
     #[error("fd has been closed already")]
@@ -83,7 +83,7 @@ pub enum TruncateError {
     Io,
 }
 
-/// Possible errors from [`super::resolver::Engine::chmod`]
+/// Possible errors from [`super::resolver::Resolver::chmod`]
 #[derive(Error, Debug)]
 pub enum ChmodError {
     #[error(
@@ -99,7 +99,7 @@ pub enum ChmodError {
     PathError(#[from] PathError),
 }
 
-/// Possible errors from [`super::resolver::Engine::chown`]
+/// Possible errors from [`super::resolver::Resolver::chown`]
 #[derive(Error, Debug)]
 pub enum ChownError {
     #[error(
@@ -115,7 +115,7 @@ pub enum ChownError {
     PathError(#[from] PathError),
 }
 
-/// Possible errors from [`super::resolver::Engine::unlink`]
+/// Possible errors from [`super::resolver::Resolver::unlink`]
 #[derive(Error, Debug)]
 pub enum UnlinkError {
     #[error("the parent directory does not allow write permission")]
@@ -130,7 +130,7 @@ pub enum UnlinkError {
     PathError(#[from] PathError),
 }
 
-/// Possible errors from [`super::resolver::Engine::mkdir`]
+/// Possible errors from [`super::resolver::Resolver::mkdir`]
 #[derive(Error, Debug)]
 pub enum MkdirError {
     #[error("the parent directory does not allow write permission")]
@@ -145,7 +145,7 @@ pub enum MkdirError {
     PathError(#[from] PathError),
 }
 
-/// Possible errors from [`super::resolver::Engine::rmdir`]
+/// Possible errors from [`super::resolver::Resolver::rmdir`]
 #[derive(Error, Debug)]
 pub enum RmdirError {
     #[error("the parent directory does not allow write permission")]
@@ -166,7 +166,7 @@ pub enum RmdirError {
     PathError(#[from] PathError),
 }
 
-/// Possible errors from [`super::resolver::Engine::read_dir`]
+/// Possible errors from [`super::resolver::Resolver::read_dir`]
 #[derive(Error, Debug)]
 pub enum ReadDirError {
     #[error("fd has been closed already")]
@@ -177,7 +177,7 @@ pub enum ReadDirError {
     Io,
 }
 
-/// Possible errors from [`super::resolver::Engine::file_status`]
+/// Possible errors from [`super::resolver::Resolver::file_status`]
 #[derive(Error, Debug)]
 pub enum FileStatusError {
     #[error("fd has been closed already")]

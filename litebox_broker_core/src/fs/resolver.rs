@@ -6,6 +6,7 @@
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::marker::PhantomData;
 
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
@@ -20,16 +21,21 @@ use super::{
 };
 use super::{SeekWhence, UserInfo};
 
-/// The broker-core filesystem engine, generic over a [`Backend`](super::backend::Backend).
-pub struct Engine<Backend: super::backend::Backend + 'static> {
+/// The broker-core filesystem resolver, generic over its synchronization platform and
+/// [`Backend`](super::backend::Backend).
+pub struct Resolver<Platform, Backend: super::backend::Backend + 'static> {
     backend: Backend,
+    _sync: PhantomData<fn() -> Platform>,
 }
 
-impl<Backend: super::backend::Backend + 'static> Engine<Backend> {
-    /// Construct a filesystem engine over `backend`.
+impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Backend> {
+    /// Construct a filesystem resolver over `backend`.
     #[must_use]
     pub fn new(backend: Backend) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            _sync: PhantomData,
+        }
     }
 }
 
@@ -124,7 +130,7 @@ enum SearchScope {
     AndReadableTarget,
 }
 
-impl<Backend: super::backend::Backend + 'static> Engine<Backend> {
+impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Backend> {
     fn parent_dir_and_name<'a>(
         &self,
         context: &Context,
@@ -374,7 +380,7 @@ impl<Backend: super::backend::Backend + 'static> Engine<Backend> {
     }
 }
 
-impl<Backend: super::backend::Backend + 'static> Engine<Backend> {
+impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Backend> {
     /// Opens a file
     ///
     /// The `mode` is only significant when creating a file
@@ -531,7 +537,7 @@ impl<Backend: super::backend::Backend + 'static> Engine<Backend> {
         }
     }
 
-    fn read_without_update(
+    fn read_inner(
         &self,
         device_io: &dyn DeviceIo,
         entry: &ResolverEntry<Backend>,
@@ -575,7 +581,7 @@ impl<Backend: super::backend::Backend + 'static> Engine<Backend> {
         buf: &mut [u8],
         offset: Option<usize>,
     ) -> Result<usize, ReadError> {
-        let (read, read_offset) = self.read_without_update(device_io, entry, buf, offset)?;
+        let (read, read_offset) = self.read_inner(device_io, entry, buf, offset)?;
         if entry.uses_position() && offset.is_none() {
             entry.position = read_offset.checked_add(read).unwrap();
         }
@@ -590,11 +596,11 @@ impl<Backend: super::backend::Backend + 'static> Engine<Backend> {
         offset: Option<usize>,
     ) -> Result<usize, ReadError> {
         debug_assert!(offset.is_some() || !entry.uses_position());
-        self.read_without_update(device_io, entry, buf, offset)
+        self.read_inner(device_io, entry, buf, offset)
             .map(|(read, _)| read)
     }
 
-    fn write_without_update(
+    fn write_inner(
         &self,
         device_io: &dyn DeviceIo,
         entry: &ResolverEntry<Backend>,
@@ -644,7 +650,7 @@ impl<Backend: super::backend::Backend + 'static> Engine<Backend> {
         buf: &[u8],
         offset: Option<usize>,
     ) -> Result<usize, WriteError> {
-        let (written, write_offset) = self.write_without_update(device_io, entry, buf, offset)?;
+        let (written, write_offset) = self.write_inner(device_io, entry, buf, offset)?;
         if entry.uses_position() && offset.is_none() {
             entry.position = write_offset.checked_add(written).unwrap();
         }
@@ -659,7 +665,7 @@ impl<Backend: super::backend::Backend + 'static> Engine<Backend> {
         offset: Option<usize>,
     ) -> Result<usize, WriteError> {
         debug_assert!(offset.is_some() || !entry.uses_position());
-        self.write_without_update(device_io, entry, buf, offset)
+        self.write_inner(device_io, entry, buf, offset)
             .map(|(written, _)| written)
     }
 
