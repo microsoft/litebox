@@ -344,11 +344,6 @@ fn run_dynamic_linked_prog_with_rewriter(
     tar.finish().unwrap();
     println!("Tar file created at: {}", tar_target_file.to_str().unwrap());
 
-    let binary_path = std::env::var("NEXTEST_BIN_EXE_litebox_runner_linux_on_windows_userland")
-        .unwrap_or_else(|_| {
-            env!("CARGO_BIN_EXE_litebox_runner_linux_on_windows_userland").to_string()
-        });
-
     // The program path refers to the tar-internal path.
     let prog_tar_path = format!("/bin/{prog_name_hooked}");
 
@@ -364,9 +359,9 @@ fn run_dynamic_linked_prog_with_rewriter(
     ];
     args.push(&prog_tar_path);
     args.extend_from_slice(cmd_args);
-
-    let mut command = std::process::Command::new(&binary_path);
-    command.args(&args);
+    let (broker, runner) = build_windows_broker();
+    let mut command = std::process::Command::new(broker);
+    command.arg("--runner").arg(runner).args(&args);
     println!("Running `{command:?}`");
     let status = command
         .status()
