@@ -1,0 +1,76 @@
+name: LVBS Smoke Test
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  lvbs_smoke_test:
+    name: Run LVBS smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.ADO_SP_ClientID }}
+          tenant-id: ${{ secrets.ADO_SP_TenantID }}
+          allow-no-subscriptions: true
+
+      - name: Trigger ADO pipeline and wait for completion
+        uses: azure/cli@v2
+        env:
+          ADO_ORGANIZATION: https://dev.azure.com/msazure
+          ADO_PIPELINE_ID: "471678"
+          ADO_PROJECT: LSG-linux
+          LITEBOX_COMMIT: ${{ github.event.pull_request.head.sha }}
+        with:
+          inlineScript: |
+            set -eu
+
+            echo "Triggering ADO pipeline for Litebox commit ${LITEBOX_COMMIT}..."
+            BUILD_RESULT="$(az pipelines run \
+              --id "${ADO_PIPELINE_ID}" \
+              --organization "${ADO_ORGANIZATION}" \
+              --project "${ADO_PROJECT}" \
+              --parameters "liteboxCommit=${LITEBOX_COMMIT}" \
+              --output json)"
+
+            BUILD_ID="$(printf '%s\n' "${BUILD_RESULT}" | jq -r '.id // empty')"
+            if [ -z "${BUILD_ID}" ]; then
+              echo "Failed to get the build ID from the pipeline trigger."
+              exit 1
+            fi
+
+            BUILD_URL="https://msazure.visualstudio.com/${ADO_PROJECT}/_build/results?buildId=${BUILD_ID}"
+            echo "Triggered ADO build ${BUILD_ID}: ${BUILD_URL}"
+
+            while true; do
+              BUILD_JSON="$(az pipelines build show \
+                --id "${BUILD_ID}" \
+                --organization "${ADO_ORGANIZATION}" \
+                --project "${ADO_PROJECT}" \
+                --output json)"
+
+              BUILD_STATUS="$(printf '%s\n' "${BUILD_JSON}" | jq -r '.status')"
+              BUILD_RESULT_STATUS="$(printf '%s\n' "${BUILD_JSON}" | jq -r '.result // "none"')"
+              echo "ADO build status: ${BUILD_STATUS}; result: ${BUILD_RESULT_STATUS}"
+
+              if [ "${BUILD_STATUS}" = "completed" ]; then
+                if [ "${BUILD_RESULT_STATUS}" = "succeeded" ]; then
+                  exit 0
+                fi
+
+                echo "ADO build ${BUILD_ID} did not succeed: ${BUILD_URL}"
+                exit 1
+              fi
+
+              sleep 60
+            done
