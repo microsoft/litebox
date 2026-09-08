@@ -182,7 +182,7 @@ mod private {
 /// Object-safe broker-wide file service.
 ///
 /// Implementations are sealed so every broker-owned open state is created and interpreted by
-/// broker core. Construct a [`Resolver`](super::resolver::Resolver) for a real fs, or use
+/// broker core. Construct a [`Resolver`] for a real fs, or use
 /// [`UnsupportedFileService`] when file operations are intentionally unavailable.
 pub trait FileService: private::Service {}
 
