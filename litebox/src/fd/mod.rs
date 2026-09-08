@@ -541,11 +541,20 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     }
 }
 
+/// An opaque, stable identity for a descriptor's entry (its open file
+/// description).
+///
+/// Equal keys denote the same entry. A key is stable across `dup` and for the
+/// entry's lifetime, so it can identify an entry (for example as a map key)
+/// without dereferencing anything.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EntryStableKey(usize);
+
 /// A handle to a descriptor entry (via [`Descriptors::entry_handle`]) that can be used without
 /// maintaining access to the descriptor table itself.
 pub struct EntryHandle<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>(
     Arc<SharedEntry<Platform>>,
-    PhantomData<Subsystem>,
+    PhantomData<fn(Subsystem) -> Subsystem>,
 );
 impl<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>
     EntryHandle<Platform, Subsystem>
@@ -580,48 +589,31 @@ impl<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>
         f(self.0.entry.write().as_subsystem_mut::<Subsystem>())
     }
 
-    /// Runs `f` with the aliased (open-file-description-level) metadata of type
-    /// `T`, if present.
+    /// Apply `f` on metadata at the entry, if it exists.
     ///
-    /// This reads the metadata stored via [`Descriptors::set_entry_metadata`],
-    /// which is shared by every descriptor referring to the same open file
-    /// description. Returns `None` if no such metadata exists.
-    pub fn with_shared_metadata<T, R>(&self, f: impl FnOnce(&T) -> R) -> Option<R>
+    /// In contrast to [`Descriptors::with_metadata`], this obtains entry-level metadata.
+    /// For FD-specific metadata, one necessarily needs the specific FD.
+    pub fn with_entry_metadata<T, R>(&self, f: impl FnOnce(&T) -> R) -> Option<R>
     where
         T: core::any::Any + Clone + Send + Sync,
     {
         self.0.entry.read().metadata.get::<T>().map(f)
     }
 
-    /// The address of the shared open file description this handle refers to.
-    ///
-    /// Duplicates of a descriptor share one open file description, so this
-    /// address is stable across `dup` and uniquely identifies the description
-    /// for as long as any duplicate keeps it alive.
+    /// An opaque, stable identity for this entry (see [`EntryStableKey`]).
     #[must_use]
-    pub fn as_ptr(&self) -> *const () {
-        Arc::as_ptr(&self.0).cast()
+    pub fn stable_key(&self) -> EntryStableKey {
+        EntryStableKey(Arc::as_ptr(&self.0).addr())
     }
 
-    /// Downgrades to a [`WeakEntryHandle`] that survives `dup`.
-    ///
-    /// The resulting handle upgrades for as long as *any* descriptor referring
-    /// to the same open file description remains open, even after the specific
-    /// descriptor this handle was obtained from has been closed.
+    /// Obtains a non-owning [`WeakEntryHandle`] to this entry.
     #[must_use]
     pub fn downgrade(&self) -> WeakEntryHandle<Platform, Subsystem> {
         WeakEntryHandle(Arc::downgrade(&self.0), PhantomData)
     }
 }
 
-/// A durable, `dup`-surviving weak reference to a descriptor's open file
-/// description.
-///
-/// Unlike a [`TypedFd`], which is tied to one descriptor slot, this upgrades as
-/// long as *any* descriptor referring to the same open file description is
-/// open. It is the correct anchor for interest that must outlive the closure of
-/// the specific descriptor it was registered against (for example, epoll
-/// interest, per Linux `epoll(7)` semantics).
+/// A weak reference to a descriptor entry.
 pub struct WeakEntryHandle<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>(
     Weak<SharedEntry<Platform>>,
     PhantomData<fn(Subsystem) -> Subsystem>,
@@ -630,8 +622,7 @@ pub struct WeakEntryHandle<Platform: RawSyncPrimitivesProvider, Subsystem: FdEna
 impl<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>
     WeakEntryHandle<Platform, Subsystem>
 {
-    /// Upgrades to a strong [`EntryHandle`] if the open file description is
-    /// still alive (i.e. at least one duplicate remains open).
+    /// Upgrades to a strong [`EntryHandle`] if the entry is still alive.
     #[must_use]
     pub fn upgrade(&self) -> Option<EntryHandle<Platform, Subsystem>> {
         self.0
@@ -639,16 +630,14 @@ impl<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>
             .map(|entry| EntryHandle(entry, PhantomData))
     }
 
-    /// The address of the shared open file description, stable across `dup`.
+    /// An opaque, stable identity for this entry (see [`EntryStableKey`]).
     ///
-    /// This is safe to use as a durable identity key. A [`WeakEntryHandle`]
-    /// keeps the underlying allocation reserved even after the open file
-    /// description is closed (every strong reference dropped), so this address
-    /// is never recycled for a different open file description while this handle
-    /// exists. The pointer is only ever compared, never dereferenced.
+    /// A [`WeakEntryHandle`] keeps the underlying allocation reserved even after
+    /// the entry is closed, so this key is never reused for a different entry
+    /// while this handle exists.
     #[must_use]
-    pub fn as_ptr(&self) -> *const () {
-        self.0.as_ptr().cast()
+    pub fn stable_key(&self) -> EntryStableKey {
+        EntryStableKey(self.0.as_ptr().addr())
     }
 }
 
