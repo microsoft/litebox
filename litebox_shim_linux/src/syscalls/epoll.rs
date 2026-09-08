@@ -15,7 +15,7 @@ use litebox::{
         polling::{Pollee, TryOpError},
         wait::{WaitContext, WaitError, Waker},
     },
-    fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd, WeakEntryHandle},
+    fd::{EntryStableKey, FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd, WeakEntryHandle},
     utils::ReinterpretUnsignedExt,
 };
 use litebox_common_linux::{EpollEvent, EpollOp, errno::Errno};
@@ -110,15 +110,15 @@ impl<Platform: ShimPlatform> DescriptorRef<Platform> {
         })
     }
 
-    /// The address of the shared open file description, stable across `dup`.
-    fn as_ptr(&self) -> usize {
+    /// An opaque, stable identity for the entry, used to key interests.
+    fn stable_key(&self) -> EntryStableKey {
         match self {
-            DescriptorRef::Eventfd(handle) => handle.as_ptr().addr(),
-            DescriptorRef::Epoll(handle) => handle.as_ptr().addr(),
-            DescriptorRef::File(handle) => handle.as_ptr().addr(),
-            DescriptorRef::Socket(handle) => handle.as_ptr().addr(),
-            DescriptorRef::Pipe(handle) => handle.as_ptr().addr(),
-            DescriptorRef::Unix(handle) => handle.as_ptr().addr(),
+            DescriptorRef::Eventfd(handle) => handle.stable_key(),
+            DescriptorRef::Epoll(handle) => handle.stable_key(),
+            DescriptorRef::File(handle) => handle.stable_key(),
+            DescriptorRef::Socket(handle) => handle.stable_key(),
+            DescriptorRef::Pipe(handle) => handle.stable_key(),
+            DescriptorRef::Unix(handle) => handle.stable_key(),
         }
     }
 
@@ -155,7 +155,7 @@ impl<Platform: ShimPlatform> DescriptorRef<Platform> {
             DescriptorRef::Socket(handle) => {
                 let proxy = handle
                     .upgrade()?
-                    .with_shared_metadata::<crate::syscalls::net::SocketProxy<Platform>, _>(
+                    .with_entry_metadata::<crate::syscalls::net::SocketProxy<Platform>, _>(
                         |crate::syscalls::net::SocketProxy(proxy)| proxy.clone(),
                     )?;
                 Some(check(&proxy))
@@ -165,7 +165,7 @@ impl<Platform: ShimPlatform> DescriptorRef<Platform> {
                 // for REPLs (mirrors `EpollDescriptor::poll`).
                 let handle = handle.upgrade()?;
                 let events = match handle
-                    .with_shared_metadata::<litebox::platform::StdioStream, _>(|stream| *stream)
+                    .with_entry_metadata::<litebox::platform::StdioStream, _>(|stream| *stream)
                 {
                     Some(litebox::platform::StdioStream::Stdin) => Events::IN,
                     Some(
@@ -306,7 +306,7 @@ impl<Platform: ShimPlatform> EpollFile<Platform> {
         event: EpollEvent,
     ) -> Result<(), Errno> {
         let desc = DescriptorRef::new(global, file).ok_or(Errno::EBADF)?;
-        let key = EpollEntryKey(fd, desc.as_ptr());
+        let key = EpollEntryKey(fd, desc.stable_key());
         let mut interests = self.interests.lock();
         if let Some(entry) = interests.get(&key)
             && entry.desc.is_alive()
@@ -395,19 +395,20 @@ impl<Platform: ShimPlatform> EpollFile<Platform> {
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
-struct EpollEntryKey(u32, usize);
+struct EpollEntryKey(u32, EntryStableKey);
 impl EpollEntryKey {
-    /// Builds the key `(fd, open-file-description address)`.
+    /// Builds the key `(fd, entry identity)`.
     ///
-    /// The address is stable across `dup`, so an interest registered against one
-    /// descriptor is found again while any duplicate of its open file
-    /// description remains open. Returns `None` if the descriptor is closed.
+    /// The entry identity is stable across `dup`, so an interest registered
+    /// against one descriptor is found again while any duplicate of its open
+    /// file description remains open. Returns `None` if the descriptor is
+    /// closed.
     fn new<Platform: ShimPlatform>(
         global: &GlobalState<Platform>,
         fd: u32,
         desc: &EpollDescriptor<Platform>,
     ) -> Option<Self> {
-        Some(Self(fd, DescriptorRef::new(global, desc)?.as_ptr()))
+        Some(Self(fd, DescriptorRef::new(global, desc)?.stable_key()))
     }
 }
 
