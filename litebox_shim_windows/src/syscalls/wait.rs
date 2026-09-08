@@ -127,7 +127,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 Ok(())
             },
             || {
-                if alertable && self.thread_object.take_pending_thread_alert() {
+                if alertable && self.thread_object.take_pending_classic_alert() {
                     return Err(TryOpError::WaitError(WaitError::Interrupted));
                 }
                 object
@@ -155,7 +155,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return NtStatus::ACCESS_VIOLATION;
         };
         // TODO(windows-apc): deliver user APCs during alertable delays.
-        if alertable && self.thread_object.take_pending_thread_alert() {
+        if alertable && self.thread_object.take_pending_classic_alert() {
             return NtStatus::ALERTED;
         }
 

@@ -24,7 +24,7 @@ impl<Platform: ShimPlatform> litebox::event::wait::CheckForInterrupt
 {
     fn check_for_interrupt(&self) -> bool {
         self.task.thread_object.is_exiting()
-            || (self.alertable && self.task.thread_object.take_pending_thread_alert())
+            || (self.alertable && self.task.thread_object.take_pending_classic_alert())
     }
 }
 
@@ -71,6 +71,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // The core helper probes again before blocking, so readiness racing with this point can
         // briefly release the IOCP slot without a host block. Exact accounting requires a hook
         // around WaitContext's platform block; keep this approximation local to the Windows shim.
+        if alertable {
+            self.thread_object.begin_classic_alert_wait();
+        }
+        let _end_alert_wait = litebox::utils::defer(|| {
+            if alertable {
+                self.thread_object.end_classic_alert_wait();
+            }
+        });
         self.with_io_completion_worker_suspended(|| {
             let interrupt = WaitInterrupt {
                 task: self,
@@ -105,6 +113,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
         alertable: bool,
         timeout: core::time::Duration,
     ) -> litebox::event::wait::WaitError {
+        if alertable {
+            self.thread_object.begin_classic_alert_wait();
+        }
+        let _end_alert_wait = litebox::utils::defer(|| {
+            if alertable {
+                self.thread_object.end_classic_alert_wait();
+            }
+        });
         self.with_io_completion_worker_suspended(|| {
             let interrupt = WaitInterrupt {
                 task: self,

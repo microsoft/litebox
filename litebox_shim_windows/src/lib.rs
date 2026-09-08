@@ -2120,8 +2120,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             SyscallRequest::NtWaitForAlertByThreadId { address, timeout } => {
                 self.sys_nt_wait_for_alert_by_thread_id(address, timeout)
             }
-            SyscallRequest::NtAlertThreadByThreadIdEx { thread_id, address } => {
-                self.sys_nt_alert_thread_by_thread_id_ex(thread_id, address)
+            SyscallRequest::NtAlertThreadByThreadIdEx { thread_id, lock } => {
+                self.sys_nt_alert_thread_by_thread_id_ex(thread_id, lock)
             }
             SyscallRequest::NtAlertThreadByThreadId { thread_id } => {
                 self.sys_nt_alert_thread_by_thread_id(thread_id)
@@ -2492,7 +2492,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     fn test_alert(&self) -> NtStatus {
         // TODO(windows-apc): Deliver queued user-mode APCs here.
-        if self.thread_object.take_pending_thread_alert() {
+        if self.thread_object.take_pending_classic_alert() {
             NtStatus::ALERTED
         } else {
             NtStatus::SUCCESS

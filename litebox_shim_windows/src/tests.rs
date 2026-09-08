@@ -12,7 +12,7 @@ use litebox::utils::TruncateExt as _;
 
 use crate::nt_types::{ObjectAttributes, UnicodeString};
 use crate::syscalls::Handle;
-use crate::syscalls::thread::{ThreadAccess, ThreadSubsystem};
+use crate::syscalls::thread::{ThreadAccess, ThreadObject, ThreadSubsystem};
 use crate::{ConstPtr, MutPtr, Process, ShimPlatform, Task, WindowsShim};
 
 #[cfg(target_os = "linux")]
@@ -218,6 +218,34 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// zeroed because such a task never runs guest code.
     pub(crate) fn clone_for_test(&self) -> Option<Self> {
         self.clone_for_test_with_teb(0)
+    }
+
+    /// Spawns a sibling task with platform test-thread state and its interrupt handle initialized.
+    ///
+    /// Returns its join handle and shared thread object. Initialization happens on the spawned
+    /// thread before `run`, so returning does not guarantee the thread has started or is waiting.
+    ///
+    /// # Panics
+    /// Panics if the test process is already terminating.
+    #[must_use]
+    pub(crate) fn spawn_clone_for_test<R>(
+        &self,
+        run: impl 'static + Send + FnOnce(Task<Platform>) -> R,
+    ) -> (std::thread::JoinHandle<R>, Arc<ThreadObject<Platform>>)
+    where
+        R: 'static + Send,
+    {
+        let task = self
+            .clone_for_test()
+            .expect("a live process should accept another thread");
+        let thread_object = Arc::clone(&task.thread_object);
+        let thread = std::thread::spawn(move || {
+            <Platform as litebox::platform::ThreadProvider>::run_test_thread(|| {
+                task.publish_thread_handle();
+                run(task)
+            })
+        });
+        (thread, thread_object)
     }
 
     pub(crate) fn clone_for_test_with_teb(&self, teb_address: usize) -> Option<Self> {
