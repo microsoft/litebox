@@ -268,28 +268,23 @@ impl LinuxUserland {
         let Ok(fd) = fd else {
             return alloc::vec::Vec::new();
         };
-        let mut buf = [0u8; 8192];
-        let mut total_read = 0;
-        while total_read < buf.len() {
-            let n = unsafe {
+        let maps = Self::read_to_end(|buffer| {
+            // SAFETY: `fd` is open for reading and `buffer` is valid for writes
+            // of up to its full length.
+            unsafe {
                 syscalls::syscall3(
                     syscalls::Sysno::read,
                     fd,
-                    buf.as_mut_ptr() as usize + total_read,
-                    buf.len() - total_read,
+                    buffer.as_mut_ptr() as usize,
+                    buffer.len(),
                 )
             }
-            .expect("read failed");
-            if n == 0 {
-                break;
-            }
-            total_read += n;
-        }
-        assert!(total_read < buf.len(), "buffer too small");
+            .expect("read failed")
+        });
         unsafe { syscalls::syscall1(syscalls::Sysno::close, fd) }.expect("close failed");
 
         let mut reserved_pages = alloc::vec::Vec::new();
-        let s = core::str::from_utf8(&buf[..total_read]).expect("invalid UTF-8");
+        let s = core::str::from_utf8(&maps).expect("invalid UTF-8");
         for line in s.lines() {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() < 5 {
@@ -301,6 +296,23 @@ impl LinuxUserland {
             reserved_pages.push(start..end);
         }
         reserved_pages
+    }
+
+    fn read_to_end(mut read: impl FnMut(&mut [u8]) -> usize) -> Vec<u8> {
+        let mut output = Vec::new();
+        let mut buffer = [0; 8192];
+        loop {
+            let length = read(&mut buffer);
+            if length == 0 {
+                break;
+            }
+            assert!(length <= buffer.len(), "reader returned an invalid length");
+            output
+                .try_reserve(length)
+                .expect("failed to allocate maps buffer");
+            output.extend_from_slice(&buffer[..length]);
+        }
+        output
     }
 
     #[expect(
@@ -2958,6 +2970,19 @@ mod tests {
             assert!(page.end > page.start);
             prev = page.end;
         }
+    }
+
+    #[test]
+    fn read_to_end_grows_beyond_one_buffer() {
+        let input = vec![0x5a; 8192 * 2 + 137];
+        let mut offset = 0;
+        let output = LinuxUserland::read_to_end(|buffer| {
+            let length = (input.len() - offset).min(997).min(buffer.len());
+            buffer[..length].copy_from_slice(&input[offset..offset + length]);
+            offset += length;
+            length
+        });
+        assert_eq!(output, input);
     }
 
     #[test]
