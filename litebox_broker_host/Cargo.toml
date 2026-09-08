@@ -11,5 +11,8 @@ litebox_broker_transport = { path = "../litebox_broker_transport", version = "0.
 spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }
 thiserror = { version = "2.0.6", default-features = false }
 
+[dev-dependencies]
+litebox_platform = { path = "../litebox_platform", version = "0.1.0" }
+
 [lints]
 workspace = true
