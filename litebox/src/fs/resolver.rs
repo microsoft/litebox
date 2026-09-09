@@ -20,8 +20,8 @@ use super::errors::{
 use super::{
     FileType, Mode, OFlags,
     backend::{
-        CreationMetadata, DirHandle, Handle, HandleRef, PermissionCheck, PermissionInfo,
-        Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkingDirHandle,
+        CreationMetadata, Handle, HandleRef, PermissionCheck, PermissionInfo, Resolution,
+        ResolvedDir, ResolvedTarget, SeekBehavior,
     },
 };
 
@@ -188,26 +188,6 @@ impl ResolvedPath {
     }
 }
 
-/// A directory reached by a walk, plus the permission metadata to check against it.
-struct WalkedDir<'a> {
-    handle: WalkingDirHandle<'a>,
-    /// `None` when the walk ended at the backend root, which reports no permission metadata.
-    permissions: Option<PermissionCheck>,
-}
-
-/// Which directories along a walk must grant search (execute) permission.
-#[derive(Clone, Copy)]
-enum SearchScope {
-    /// Every walked directory, including a final directory component, must be searchable.
-    AllComponents,
-    /// The directories leading to the object the path names must be searchable; target is not
-    /// checked.
-    ParentsOnly,
-    /// Like [`SearchScope::ParentsOnly`], but the final directory component is checked to be
-    /// readable.
-    AndReadableTarget,
-}
-
 impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
     Resolver<Platform, Backend>
 {
@@ -215,248 +195,103 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         &self,
         context: &Context,
         path: &'a ResolvedPath,
-    ) -> Result<Option<(WalkedDir<'_>, &'a str)>, WalkError> {
-        // Return the walking handle rather than an owned directory handle so backends can keep any
-        // locks acquired during path resolution held across the final operation. This lets e.g.
-        // "walk parent + mutate child" stay atomic.
+    ) -> Result<Option<(ResolvedDir<'_>, &'a str)>, WalkError> {
+        // Keep scoped resolution state alive across the mutation so backend locks stay held.
         let Some((parent_components, name)) = path.parent_and_name() else {
             return Ok(None);
         };
-        let parent = self.walk_to_directory(
-            context,
-            self.backend.root(),
-            &parent_components,
-            #[cfg(debug_assertions)]
-            &parent_components,
-        )?;
+        let parent = match self.resolve_path(context, &parent_components)? {
+            Resolution::Found(ResolvedTarget::Dir(parent)) => parent,
+            Resolution::Found(ResolvedTarget::File(_)) => {
+                return Err(PathError::ComponentNotADirectory.into());
+            }
+            Resolution::MissingFinal { .. } => return Err(PathError::MissingComponent.into()),
+        };
+        if let PermissionCheck::ByResolver(permissions) = &parent.permissions {
+            Self::check_search_permission(
+                context,
+                permissions,
+                #[cfg(debug_assertions)]
+                Some(&parent_components),
+            )?;
+        }
         Ok(Some((parent, name)))
     }
 
     /// Whether `context` may add or remove entries in `dir`.
-    ///
-    /// A `dir` without permission metadata is the backend root, which the backend does not report
-    /// permissions for; such directories are currently left unchecked.
-    // TODO(jayb): Check write permission on the root directory too. That needs the backend to
-    // report permissions for [`super::backend::Backend::root`].
     // TODO(jayb): Prioritize `EROFS` before this permission check runs; currently not an issue due
     // to 0777 from read-only backends, but needs an update then.
-    fn can_change_entries_in_dir(context: &Context, dir: &WalkedDir<'_>) -> bool {
+    fn can_change_entries_in_dir(context: &Context, dir: &ResolvedDir<'_>) -> bool {
         match &dir.permissions {
-            None | Some(PermissionCheck::ByBackend) => true,
-            Some(PermissionCheck::ByResolver(permissions)) => context.can_write(permissions),
+            PermissionCheck::ByBackend => true,
+            PermissionCheck::ByResolver(permissions) => context.can_write(permissions),
         }
     }
 
-    fn owned_parent_dir(&self, dir: WalkingDirHandle<'_>) -> Result<DirHandle, WalkError> {
-        self.backend
-            .owned_dir_at(dir, OFlags::PATH)
-            .map_err(|error| match error {
-                OpenError::PathError(PathError::NoSuchFileOrDirectory) => {
-                    PathError::MissingComponent.into()
-                }
-                OpenError::PathError(error) => error.into(),
-                _ => WalkError::Io,
-            })
-    }
-
-    /// Resolve `path` to an owned handle on the file or directory it names, plus how permissions
-    /// on it are to be checked.
-    ///
-    /// The handle is taken with [`OFlags::PATH`], as it addresses the object for operations that
-    /// do not read or write its contents, and thus needs no access permissions on it.
-    fn path_handle(
+    fn resolve_target(
         &self,
         context: &Context,
         path: &ResolvedPath,
-    ) -> Result<Permissioned<Handle>, WalkError> {
-        let map_open_error = |error| match error {
-            OpenError::PathError(error) => WalkError::PathError(error),
-            _ => WalkError::Io,
-        };
+    ) -> Result<ResolvedTarget<'_>, WalkError> {
         let components: Vec<_> = path.components.iter().map(String::as_str).collect();
-        if components.is_empty() {
-            let root = self
-                .backend
-                .owned_dir_at(self.backend.root(), OFlags::PATH)
-                .map_err(map_open_error)?;
-            // A backend root reports no permission metadata, so the backend is left to enforce
-            // whatever it wants on it.
-            return Ok(Permissioned {
-                item: Handle::Dir(root),
-                permissions: PermissionCheck::ByBackend,
-            });
-        }
-        let (outcome, walked) = self.walk_path(
-            context,
-            self.backend.root(),
-            &components,
-            #[cfg(debug_assertions)]
-            &components,
-            SearchScope::ParentsOnly,
-        )?;
-        match outcome.stop_reason {
-            WalkStopReason::CompleteDirectory => {
-                let permissions = outcome
-                    .components
-                    .last()
-                    .map_or(PermissionCheck::ByBackend, |component| {
-                        component.permissions.clone()
-                    });
-                let dir = self
-                    .backend
-                    .owned_dir_at(outcome.last, OFlags::PATH)
-                    .map_err(map_open_error)?;
-                Ok(Permissioned {
-                    item: Handle::Dir(dir),
-                    permissions,
-                })
-            }
-            WalkStopReason::StoppedAtNonDirectory => {
-                let file = self
-                    .backend
-                    .open_file_at(outcome.last, components[walked], OFlags::PATH)
-                    .map_err(map_open_error)?;
-                Ok(Permissioned {
-                    item: Handle::File(file.item),
-                    permissions: file.permissions,
-                })
-            }
-            WalkStopReason::Continue => {
-                // `walk_path` validates stop reasons before returning.
-                unreachable!()
-            }
+        match self.resolve_path(context, &components)? {
+            Resolution::Found(target) => Ok(target),
+            Resolution::MissingFinal { .. } => Err(PathError::NoSuchFileOrDirectory.into()),
         }
     }
 
-    fn walk_to_directory<'a>(
-        &'a self,
+    fn check_search_permission(
         context: &Context,
-        from: WalkingDirHandle<'a>,
-        components: &[&str],
-        #[cfg(debug_assertions)] absolute_components: &[&str],
-    ) -> Result<WalkedDir<'a>, WalkError> {
-        if components.is_empty() {
-            // TODO(jayb): Decide whether empty walks from a non-root handle need permission checks.
-            return Ok(WalkedDir {
-                handle: from,
-                permissions: None,
-            });
+        permissions: &PermissionInfo,
+        #[cfg(debug_assertions)] absolute_components: Option<&[&str]>,
+    ) -> Result<(), WalkError> {
+        if !context.can_execute(permissions) {
+            return Err(PathError::NoSearchPerms {
+                #[cfg(debug_assertions)]
+                dir: absolute_components
+                    .map(|components| alloc::format!("/{}", components.join("/")))
+                    .unwrap_or_default(),
+                #[cfg(debug_assertions)]
+                perms: permissions.mode,
+            }
+            .into());
         }
+        Ok(())
+    }
 
-        let outcome =
-            self.backend
-                .walk_directories(from, components)
-                .map_err(|error| match error {
+    fn resolve_path(
+        &self,
+        context: &Context,
+        components: &[&str],
+    ) -> Result<Resolution<'_>, WalkError> {
+        self.backend
+            .resolve(self.backend.root()?, components, &|permissions| {
+                Self::check_search_permission(
+                    context,
+                    permissions,
+                    #[cfg(debug_assertions)]
+                    None,
+                )
+            })
+            .map_err(|error| {
+                #[cfg(debug_assertions)]
+                let error = {
+                    let mut error = error;
+                    if let Some(index) = error.component
+                        && let WalkError::PathError(PathError::NoSearchPerms { dir, .. }) =
+                            &mut error.error
+                    {
+                        *dir = alloc::format!("/{}", components[..index].join("/"));
+                    }
+                    error
+                };
+                match error.error {
                     WalkError::PathError(PathError::NoSuchFileOrDirectory) => {
                         PathError::MissingComponent.into()
                     }
                     error => error,
-                })?;
-        Self::check_walk_permissions(
-            context,
-            #[cfg(debug_assertions)]
-            absolute_components,
-            &outcome,
-            SearchScope::AllComponents,
-        )?;
-
-        match outcome.stop_reason {
-            WalkStopReason::CompleteDirectory => {
-                assert_eq!(outcome.components.len(), components.len());
-                let permissions = outcome
-                    .components
-                    .last()
-                    .map(|component| component.permissions.clone());
-                Ok(WalkedDir {
-                    handle: outcome.last,
-                    permissions,
-                })
-            }
-            WalkStopReason::StoppedAtNonDirectory => {
-                Err(WalkError::PathError(PathError::ComponentNotADirectory))
-            }
-            WalkStopReason::Continue => {
-                // TODO(jayb): Continue walking from `outcome.last` once partial backend walks are
-                // supported by the resolver.
-                unimplemented!("partial backend walks are not supported yet")
-            }
-        }
-    }
-
-    fn walk_path<'a>(
-        &'a self,
-        context: &Context,
-        from: WalkingDirHandle<'a>,
-        components: &[&str],
-        #[cfg(debug_assertions)] absolute_components: &[&str],
-        scope: SearchScope,
-    ) -> Result<(WalkOutcome<WalkingDirHandle<'a>>, usize), WalkError> {
-        assert!(!components.is_empty());
-        let outcome = self.backend.walk_directories(from, components)?;
-        Self::check_walk_permissions(
-            context,
-            #[cfg(debug_assertions)]
-            absolute_components,
-            &outcome,
-            scope,
-        )?;
-
-        let walked = outcome.components.len();
-        match outcome.stop_reason {
-            WalkStopReason::CompleteDirectory => {
-                assert_eq!(walked, components.len());
-                Ok((outcome, walked))
-            }
-            WalkStopReason::StoppedAtNonDirectory if walked + 1 == components.len() => {
-                Ok((outcome, walked))
-            }
-            WalkStopReason::StoppedAtNonDirectory => {
-                Err(WalkError::PathError(PathError::ComponentNotADirectory))
-            }
-            WalkStopReason::Continue => {
-                // TODO(jayb): Continue walking from `outcome.last` once partial backend walks are
-                // supported by the resolver.
-                unimplemented!("partial backend walks are not supported yet")
-            }
-        }
-    }
-
-    fn check_walk_permissions(
-        context: &Context,
-        #[cfg(debug_assertions)] absolute_components: &[&str],
-        outcome: &WalkOutcome<WalkingDirHandle<'_>>,
-        scope: SearchScope,
-    ) -> Result<(), PathError> {
-        for (idx, walked) in outcome.components.iter().enumerate() {
-            let PermissionCheck::ByResolver(permissions) = &walked.permissions else {
-                continue;
-            };
-            let is_target_dir = idx + 1 == outcome.components.len()
-                && matches!(outcome.stop_reason, WalkStopReason::CompleteDirectory);
-            let allowed = match (is_target_dir, scope) {
-                (true, SearchScope::ParentsOnly) => continue,
-                (true, SearchScope::AndReadableTarget) => context.can_read(permissions),
-                _ => context.can_execute(permissions),
-            };
-            if !allowed {
-                // TODO(jayb): a [`SearchScope::AndReadableTarget`] target denying *read* permission
-                // reports `NoSearchPerms` too. Clean up during filesystem errors overhaul.
-                return Err(PathError::NoSearchPerms {
-                    #[cfg(debug_assertions)]
-                    dir: {
-                        let mut path = String::new();
-                        for component in &absolute_components[..=idx] {
-                            path.push('/');
-                            path.push_str(component);
-                        }
-                        path
-                    },
-                    #[cfg(debug_assertions)]
-                    perms: permissions.mode,
-                });
-            }
-        }
-        Ok(())
+                }
+            })
     }
 }
 
@@ -515,47 +350,32 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             })
         };
 
-        if path.components.is_empty() {
-            if flags.contains(OFlags::CREAT) && flags.contains(OFlags::EXCL) {
-                return Err(OpenError::AlreadyExists);
-            }
-            return Ok(insert(
-                Handle::Dir(self.backend.owned_dir_at(self.backend.root(), flags)?),
-                SeekBehavior::NonSeekable,
-            ));
-        }
-
         let components: Vec<_> = path.components.iter().map(String::as_str).collect();
-        let walk = self.walk_path(
-            context,
-            self.backend.root(),
-            &components,
-            #[cfg(debug_assertions)]
-            &components,
-            if path_only {
-                SearchScope::ParentsOnly
-            } else {
-                SearchScope::AndReadableTarget
-            },
-        );
-        match walk {
-            Ok((outcome, _)) if outcome.stop_reason == WalkStopReason::CompleteDirectory => {
-                if flags.contains(OFlags::CREAT) && flags.contains(OFlags::EXCL) {
-                    return Err(OpenError::AlreadyExists);
+        let resolution = self
+            .resolve_path(context, &components)
+            .map_err(|error| match error {
+                WalkError::Io => OpenError::Io,
+                WalkError::PathError(error) => error.into(),
+            })?;
+        match resolution {
+            Resolution::Found(_) if flags.contains(OFlags::CREAT | OFlags::EXCL) => {
+                Err(OpenError::AlreadyExists)
+            }
+            Resolution::Found(ResolvedTarget::Dir(dir)) => {
+                if !path_only
+                    && let PermissionCheck::ByResolver(permissions) = &dir.permissions
+                    && !context.can_read(permissions)
+                {
+                    return Err(OpenError::AccessNotAllowed);
                 }
                 Ok(insert(
-                    Handle::Dir(self.backend.owned_dir_at(outcome.last, flags)?),
+                    Handle::Dir(self.backend.open_dir(dir, flags)?),
                     SeekBehavior::NonSeekable,
                 ))
             }
-            Ok((outcome, walked))
-                if outcome.stop_reason == WalkStopReason::StoppedAtNonDirectory =>
-            {
-                let name = components[walked];
-                if flags.contains(OFlags::CREAT) && flags.contains(OFlags::EXCL) {
-                    return Err(OpenError::AlreadyExists);
-                }
-                let file = self.backend.open_file_at(outcome.last, name, flags)?;
+            Resolution::Found(ResolvedTarget::File(file)) => {
+                // TODO(DO NOT COMMIT): Require write permission for O_TRUNC independently of the
+                // access mode; should be fixed up soon
                 if !path_only
                     && let PermissionCheck::ByResolver(permissions) = &file.permissions
                     && ((read_allowed && !context.can_read(permissions))
@@ -563,40 +383,18 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 {
                     return Err(OpenError::AccessNotAllowed);
                 }
-                let seek_behavior = self.backend.seek_behavior(&file.item);
-                Ok(insert(Handle::File(file.item), seek_behavior))
+                let file = self.backend.open_file(file, flags)?;
+                let seek_behavior = self.backend.seek_behavior(&file);
+                Ok(insert(Handle::File(file), seek_behavior))
             }
-            Ok(_) => {
-                // `walk_path` validates stop reasons before returning.
-                unreachable!()
-            }
-            Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
-                if flags.contains(OFlags::CREAT) =>
-            {
-                let Some((parent_components, name)) = path.parent_and_name() else {
-                    unreachable!("root path was handled above")
+            Resolution::MissingFinal { parent } if flags.contains(OFlags::CREAT) => {
+                let Some(name) = components.last() else {
+                    // components is empty => `/` => cannot be missing final
+                    unreachable!()
                 };
-                let parent = self
-                    .walk_to_directory(
-                        context,
-                        self.backend.root(),
-                        &parent_components,
-                        #[cfg(debug_assertions)]
-                        &parent_components,
-                    )
-                    .map_err(|error| match error {
-                        WalkError::Io => OpenError::Io,
-                        WalkError::PathError(error) => error.into(),
-                    })?;
                 if !Self::can_change_entries_in_dir(context, &parent) {
                     return Err(OpenError::NoWritePerms);
                 }
-                let parent = self
-                    .owned_parent_dir(parent.handle)
-                    .map_err(|error| match error {
-                        WalkError::Io => OpenError::Io,
-                        WalkError::PathError(error) => error.into(),
-                    })?;
                 let file = self.backend.create_file_at(
                     parent,
                     name,
@@ -608,10 +406,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 let seek_behavior = self.backend.seek_behavior(&file);
                 Ok(insert(Handle::File(file), seek_behavior))
             }
-            Err(error) => match error {
-                WalkError::Io => Err(OpenError::Io),
-                WalkError::PathError(error) => Err(error.into()),
-            },
+            Resolution::MissingFinal { .. } => Err(PathError::NoSuchFileOrDirectory.into()),
         }
     }
 
@@ -819,7 +614,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         Ok(())
     }
 
-    fn may_change_metadata(context: &Context, permissions: &PermissionCheck) -> bool {
+    fn may_change_metadata(context: &Context, target: &ResolvedTarget<'_>) -> bool {
+        let permissions = match target {
+            ResolvedTarget::Dir(dir) => &dir.permissions,
+            ResolvedTarget::File(file) => &file.permissions,
+        };
         let PermissionCheck::ByResolver(permissions) = permissions else {
             return true;
         };
@@ -830,16 +629,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     /// Change the permissions of a file
     pub fn chmod(&self, context: &Context, path: impl Arg, mode: Mode) -> Result<(), ChmodError> {
         let path = context.resolve(path)?;
-        let handle = self
-            .path_handle(context, &path)
+        let target = self
+            .resolve_target(context, &path)
             .map_err(|error| match error {
                 WalkError::Io => ChmodError::Io,
                 WalkError::PathError(error) => error.into(),
             })?;
-        if !Self::may_change_metadata(context, &handle.permissions) {
+        if !Self::may_change_metadata(context, &target) {
             return Err(ChmodError::NotTheOwner);
         }
-        self.backend.chmod(handle.item.as_ref(), mode)
+        self.backend.chmod(target, mode)
     }
 
     /// Change the owner of a file
@@ -851,16 +650,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         group: Option<u16>,
     ) -> Result<(), ChownError> {
         let path = context.resolve(path)?;
-        let handle = self
-            .path_handle(context, &path)
+        let target = self
+            .resolve_target(context, &path)
             .map_err(|error| match error {
                 WalkError::Io => ChownError::Io,
                 WalkError::PathError(error) => error.into(),
             })?;
-        if !Self::may_change_metadata(context, &handle.permissions) {
+        if !Self::may_change_metadata(context, &target) {
             return Err(ChownError::NotTheOwner);
         }
-        self.backend.chown(handle.item.as_ref(), user, group)
+        self.backend.chown(target, user, group)
     }
 
     /// Unlink a file
@@ -878,12 +677,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         if !Self::can_change_entries_in_dir(context, &parent) {
             return Err(UnlinkError::NoWritePerms);
         }
-        let parent = self
-            .owned_parent_dir(parent.handle)
-            .map_err(|error| match error {
-                WalkError::Io => UnlinkError::Io,
-                WalkError::PathError(error) => error.into(),
-            })?;
         self.backend.unlink_at(parent, name)
     }
 
@@ -902,12 +695,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         if !Self::can_change_entries_in_dir(context, &parent) {
             return Err(MkdirError::NoWritePerms);
         }
-        let parent = self
-            .owned_parent_dir(parent.handle)
-            .map_err(|error| match error {
-                WalkError::Io => MkdirError::Io,
-                WalkError::PathError(error) => error.into(),
-            })?;
         self.backend
             .mkdir_at(
                 parent,
@@ -935,12 +722,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         if !Self::can_change_entries_in_dir(context, &parent) {
             return Err(RmdirError::NoWritePerms);
         }
-        let parent = self
-            .owned_parent_dir(parent.handle)
-            .map_err(|error| match error {
-                WalkError::Io => RmdirError::Io,
-                WalkError::PathError(error) => error.into(),
-            })?;
         self.backend.rmdir_at(parent, name)
     }
 
