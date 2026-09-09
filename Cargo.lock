@@ -1666,6 +1666,7 @@ dependencies = [
  "getrandom 0.3.4",
  "litebox",
  "litebox_common_linux",
+ "rangemap",
  "windows-sys 0.60.2",
  "zerocopy",
 ]
@@ -2441,9 +2442,9 @@ dependencies = [
 
 [[package]]
 name = "rangemap"
-version = "1.6.0"
+version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f93e7e49bb0bf967717f7bd674458b3d6b0c5f48ec7e3038166026a69fc22223"
+checksum = "f60fcc7d6849342eff22c4350c8b9a989ee8ceabc4b481253e8946b9fe83d684"
 
 [[package]]
 name = "raw-cpuid"
