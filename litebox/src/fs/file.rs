@@ -19,7 +19,7 @@ use litebox_broker_protocol::fs::{
 };
 
 use crate::path::Arg;
-use crate::{LiteBox, fd::EntryHandle, sync};
+use crate::{LiteBox, sync};
 
 use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
@@ -233,24 +233,10 @@ impl UserInfo {
 /// Type marker for file descriptors backed by broker-owned files.
 pub struct File<Platform: sync::RawSyncPrimitivesProvider>(core::marker::PhantomData<fn(Platform)>);
 
-struct PinnedBrokerFile<Platform: sync::RawSyncPrimitivesProvider> {
-    _entry: EntryHandle<Platform, File<Platform>>,
-    broker: Arc<dyn crate::broker::BrokerControl>,
-    handle: ObjectHandle,
-}
-
 impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
-    fn broker_file(&self, fd: &FileFd<Platform>) -> Option<PinnedBrokerFile<Platform>> {
-        let entry_handle = self.descriptor_table().entry_handle(fd)?;
-        let (broker, handle) = {
-            let entry = entry_handle.get_entry();
-            (Arc::clone(&entry.entry.broker), entry.entry.handle)
-        };
-        Some(PinnedBrokerFile {
-            _entry: entry_handle,
-            broker,
-            handle,
-        })
+    fn broker_file(&self, fd: &FileFd<Platform>) -> Option<Arc<BrokerFile>> {
+        self.descriptor_table()
+            .with_entry(fd, |entry| Arc::clone(&entry.entry))
     }
 
     fn broker_path(context: &Context, path: impl Arg) -> Result<String, PathError> {
@@ -282,7 +268,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
             .map_err(open_error)?;
         Ok(self
             .descriptor_table_mut()
-            .insert(BrokerFile { broker, handle }))
+            .insert(Arc::new(BrokerFile { broker, handle })))
     }
 
     /// Close the file at `fd`.
@@ -866,6 +852,6 @@ fn optional_device(device: Option<u64>) -> Result<Option<core::num::NonZeroUsize
 crate::fd::enable_fds_for_subsystem! {
     @ Platform: { sync::RawSyncPrimitivesProvider };
     File<Platform>;
-    BrokerFile;
+    Arc<BrokerFile>;
     -> FileFd<Platform>;
 }
