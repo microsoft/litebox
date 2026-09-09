@@ -10,7 +10,7 @@ mod tests {
     use litebox::fs::{Mode, OFlags};
     use litebox_common_linux::{FcntlArg, FileDescriptorFlags, IoctlArg, Termios, errno::Errno};
 
-    use crate::{UserPtrMut, syscalls::tests::init_platform_with_broker};
+    use crate::{UserPtrMut, syscalls::tests::init_platform};
 
     fn termios() -> Termios {
         Termios {
@@ -25,7 +25,7 @@ mod tests {
 
     #[test]
     fn test_stdio() {
-        let task = init_platform_with_broker();
+        let task = init_platform();
 
         // Check that the stdio streams are in the file table
         let stdin_stat = task.sys_fstat(0).unwrap();
@@ -71,7 +71,7 @@ mod tests {
 
     #[test]
     fn test_stdio_flags_with_dup() {
-        let task = init_platform_with_broker();
+        let task = init_platform();
 
         let stdin = 0;
         let flags = task.sys_fcntl(stdin, FcntlArg::GETFL).unwrap();
@@ -126,7 +126,7 @@ mod tests {
 
     #[test]
     fn test_stdio_terminal_query_uses_broker() {
-        let task = init_platform_with_broker();
+        let task = init_platform();
         let mut termios = termios();
 
         assert_eq!(

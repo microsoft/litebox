@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
 pub mod pty;
+pub(crate) mod runner;
 
 #[cfg(target_arch = "x86_64")]
 const MULTIARCH: &str = "x86_64-linux-gnu";

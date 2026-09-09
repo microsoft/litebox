@@ -15,6 +15,8 @@ pub(crate) mod unix;
 
 pub(crate) mod signal;
 #[cfg(test)]
+pub(crate) mod test_broker;
+#[cfg(test)]
 pub(crate) mod tests;
 
 macro_rules! common_functions_for_file_status {

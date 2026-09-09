@@ -1269,7 +1269,9 @@ mod tests {
     use super::*;
     use crate::nt_types::{ObjectAttributes, UnicodeString};
     use crate::syscalls::event::EventType;
-    use crate::tests::{TestPlatform, const_ptr, mut_byte_ptr, mut_ptr, test_task};
+    use crate::tests::{
+        TestPlatform, const_ptr, mut_byte_ptr, mut_ptr, test_task, test_task_with_broker_files,
+    };
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
@@ -1484,8 +1486,10 @@ mod tests {
     #[test]
     fn nt_query_section_image_information_uses_pe_headers() {
         let image = host_kernel32_image();
-        let task =
-            crate::tests::test_task_with_nls_files(&[("/Windows/System32/kernel32.dll", &image)]);
+        let task = crate::tests::test_task_with_broker_files(&[(
+            "/Windows/System32/kernel32.dll",
+            &image,
+        )]);
         let name = wide(r"\KnownDlls\kernel32.dll");
         let unicode = unicode(&name);
         let attrs = object_attributes(&unicode);
@@ -1540,7 +1544,7 @@ mod tests {
     #[test]
     fn nt_create_section_maps_file_backed_image() {
         let image = host_kernel32_image();
-        let task = crate::tests::test_task_with_nls_files(&[("/tmp/kernel32.dll", &image)]);
+        let task = crate::tests::test_task_with_broker_files(&[("/tmp/kernel32.dll", &image)]);
         let file_handle = open_image_file(&task, r"\Device\HarddiskVolume1\tmp\kernel32.dll");
         let mut section_handle = Handle::default();
 
@@ -1605,8 +1609,10 @@ mod tests {
     #[test]
     fn image_section_rejects_writable_view_protection() {
         let image = host_kernel32_image();
-        let task =
-            crate::tests::test_task_with_nls_files(&[("/Windows/System32/kernel32.dll", &image)]);
+        let task = crate::tests::test_task_with_broker_files(&[(
+            "/Windows/System32/kernel32.dll",
+            &image,
+        )]);
         let name = wide(r"\KnownDlls\kernel32.dll");
         let unicode = unicode(&name);
         let attrs = object_attributes(&unicode);
@@ -1664,7 +1670,7 @@ mod tests {
 
     #[test]
     fn section_output_handles_follow_host_probe_contracts() {
-        let task = test_task();
+        let task = test_task_with_broker_files(&[]);
         let name = wide(r"\KnownDlls\DefinitelyMissingLiteBoxProbe.dll");
         let unicode = unicode(&name);
         let attrs = object_attributes(&unicode);

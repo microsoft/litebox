@@ -1,6 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+//! Shared fixtures and cross-cutting unit tests for the Windows shim.
+//!
+//! [`test_task`] builds a task over a broker association that serves no objects, so the shim's
+//! unit tests exercise guest and shim code rather than broker authority. Only tests that are
+//! genuinely about file-backed behavior use [`test_task_with_broker_files`]; see
+//! [`crate::test_broker`].
+
 extern crate std;
 
 use alloc::sync::Arc;
@@ -106,11 +113,16 @@ fn map_csr_server_shared_memory(
 }
 
 pub(crate) fn test_task() -> Task<TestPlatform> {
-    test_task_with_nls_files(&[])
+    test_task_from_litebox(crate::test_broker::litebox(test_platform()))
 }
 
-pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<TestPlatform> {
-    let platform = test_platform();
+/// Returns a task whose broker serves `files` from an in-memory filesystem.
+///
+/// Reserved for tests that genuinely exercise file-backed behavior. Every other test must use
+/// [`test_task`], whose broker serves no files at all. The broker core is a process singleton, so
+/// exactly one such task may be built per test process; `cargo nextest` runs each test in its own
+/// process.
+pub(crate) fn test_task_with_broker_files(files: &[(&str, &[u8])]) -> Task<TestPlatform> {
     let directory = |owner| InitialNode::Directory {
         mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
         owner,
@@ -126,7 +138,7 @@ pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<Test
         ),
         ("/registry".into(), directory(UserInfo::ROOT)),
     ];
-    if !nls_files.is_empty() {
+    if !files.is_empty() {
         entries.extend([
             ("/Windows".into(), directory(UserInfo::ROOT)),
             ("/Windows/System32".into(), directory(UserInfo::ROOT)),
@@ -137,7 +149,7 @@ pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<Test
             ),
         ]);
     }
-    entries.extend(nls_files.iter().map(|(path, bytes)| {
+    entries.extend(files.iter().map(|(path, bytes)| {
         (
             (*path).into(),
             InitialNode::File {
@@ -148,7 +160,14 @@ pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<Test
         )
     }));
 
-    let litebox = crate::test_broker::litebox(platform, entries);
+    test_task_from_litebox(crate::test_broker::litebox_with_broker_files(
+        test_platform(),
+        entries,
+    ))
+}
+
+fn test_task_from_litebox(litebox: litebox::LiteBox<TestPlatform>) -> Task<TestPlatform> {
+    let platform = test_platform();
     let shim_builder =
         crate::WindowsShimBuilder::<TestPlatform>::new_with_litebox(platform, litebox);
     let fs = Arc::new(shim_builder.brokered_fs());
@@ -182,6 +201,15 @@ pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<Test
         context: 0,
         thread_object,
     }
+}
+
+/// Building a shim and its initial task must not depend on the broker.
+///
+/// The association behind [`test_task`] panics on every request, so this fails loudly if shim
+/// construction starts asking the broker for anything.
+#[test]
+fn building_a_task_issues_no_broker_requests() {
+    let _task = test_task();
 }
 
 const EVENT_MODIFY_STATE: u32 = 0x0002;
