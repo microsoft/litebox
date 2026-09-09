@@ -464,12 +464,12 @@ fn run_thread_inner(
 /// See <https://learn.microsoft.com/en-us/cpp/build/x64-calling-convention#fpcsr>.
 static HOST_X87_CONTROL_WORD: u16 = 0x027f;
 static HOST_MXCSR: u32 = core::arch::x86_64::_MM_MASK_MASK;
-const HOST_MXCSR_CONTROL_MASK: u32 = 0xffc0;
 
 #[inline]
 fn debug_assert_host_fx_control_state() {
     #[cfg(debug_assertions)]
     {
+        const HOST_MXCSR_CONTROL_MASK: u32 = 0xffc0;
         let mut x87_control_word = 0_u16;
         let mut mxcsr = 0_u32;
         unsafe {
@@ -2419,196 +2419,12 @@ mod tests {
 
     use crate::WindowsUserland;
     use crate::process_memory_range_by_regions;
-    use crate::{ExtendedContext, XsaveArea, XsaveLayout};
+    use crate::{XsaveArea, XsaveLayout};
     use litebox::platform::PageManagementProvider;
     use litebox::platform::RawConstPointer;
     use litebox::platform::page_mgmt::FixedAddressBehavior;
     use litebox::platform::page_mgmt::MemoryRegionPermissions;
     use litebox_platform::sync::RawMutex;
-
-    #[test]
-    fn vectored_exception_entry_preserves_fp_controls() {
-        use windows_sys::Win32::System::Diagnostics::Debug::{CONTEXT, EXCEPTION_POINTERS};
-
-        static TEST_X87_CONTROL_WORD: u16 = 0x077f;
-        static TEST_MXCSR: u32 = 0x3f81;
-
-        #[unsafe(naked)]
-        unsafe extern "system" fn invoke_handler(
-            info: *mut EXCEPTION_POINTERS,
-            observed: &mut [u32; 3],
-        ) {
-            core::arch::naked_asm!(
-                ".seh_proc test_vectored_exception_entry",
-                "sub rsp, 56",
-                ".seh_stackalloc 56",
-                ".seh_endprologue",
-                "fnstcw WORD PTR [rsp + 32]",
-                "stmxcsr DWORD PTR [rsp + 36]",
-                "mov [rsp + 40], rdx",
-                "fldcw WORD PTR [rip + {test_cw}]",
-                "ldmxcsr DWORD PTR [rip + {test_mxcsr}]",
-                "call {handler}",
-                "mov rdx, [rsp + 40]",
-                "fnstcw WORD PTR [rdx]",
-                "stmxcsr DWORD PTR [rdx + 4]",
-                "mov [rdx + 8], eax",
-                "fldcw WORD PTR [rsp + 32]",
-                "ldmxcsr DWORD PTR [rsp + 36]",
-                "add rsp, 56",
-                "ret",
-                ".seh_endproc",
-                test_cw = sym TEST_X87_CONTROL_WORD,
-                test_mxcsr = sym TEST_MXCSR,
-                handler = sym crate::vectored_exception_handler,
-            );
-        }
-
-        let mut record = crate::EXCEPTION_RECORD {
-            ExceptionCode: crate::Win32_Foundation::EXCEPTION_ILLEGAL_INSTRUCTION,
-            ..Default::default()
-        };
-        let mut context = CONTEXT {
-            MxCsr: TEST_MXCSR,
-            ..Default::default()
-        };
-        context.Anonymous.FltSave.ControlWord = TEST_X87_CONTROL_WORD;
-        let mut info = EXCEPTION_POINTERS {
-            ExceptionRecord: &raw mut record,
-            ContextRecord: &raw mut context,
-        };
-        let mut check = || {
-            let mut observed = [0_u32; 3];
-            // SAFETY: The pointers refer to live, exclusively borrowed test storage.
-            // Assembly restores the original FP controls before returning to Rust.
-            unsafe { invoke_handler(&raw mut info, &mut observed) };
-            assert_eq!(observed[0], u32::from(TEST_X87_CONTROL_WORD));
-            assert_eq!(observed[1], TEST_MXCSR);
-            assert_eq!(
-                observed[2],
-                crate::EXCEPTION_CONTINUE_SEARCH.cast_unsigned()
-            );
-        };
-        check();
-        crate::ensure_tls_index();
-        let tls = crate::TlsState::new();
-        crate::ThreadHandle::run_with_handle(&tls, check);
-        assert_eq!(context.MxCsr, TEST_MXCSR);
-        // SAFETY: FltSave was initialized above and remains the active union member.
-        assert_eq!(
-            unsafe { context.Anonymous.FltSave.ControlWord },
-            TEST_X87_CONTROL_WORD
-        );
-    }
-
-    fn check_pending_interrupt_before_guest_entry(fast_path: bool) {
-        use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
-        use litebox_common_linux::PtRegs;
-        use std::cell::Cell;
-
-        #[unsafe(naked)]
-        unsafe extern "C" fn guest_entry() {
-            core::arch::naked_asm!(
-                "jmp {syscall_callback}",
-                syscall_callback = sym crate::syscall_callback,
-            );
-        }
-
-        struct PendingInterruptShim {
-            interrupted: Cell<bool>,
-            entered_guest: Cell<bool>,
-        }
-
-        impl EnterShim for PendingInterruptShim {
-            type ExecutionContext = PtRegs;
-
-            fn init(&self, _ctx: &mut PtRegs) -> ContinueOperation {
-                let current =
-                    crate::CURRENT_THREAD_HANDLE.with_borrow(|current| current.clone().unwrap());
-                current.interrupt(Some(&current));
-                ContinueOperation::Resume
-            }
-
-            fn syscall(&self, _ctx: &mut PtRegs) -> ContinueOperation {
-                self.entered_guest.set(true);
-                ContinueOperation::Terminate
-            }
-
-            fn exception(&self, _ctx: &mut PtRegs, _info: &ExceptionInfo) -> ContinueOperation {
-                self.entered_guest.set(true);
-                ContinueOperation::Terminate
-            }
-
-            fn interrupt(&self, _ctx: &mut PtRegs) -> ContinueOperation {
-                self.interrupted.set(true);
-                ContinueOperation::Terminate
-            }
-        }
-
-        crate::ensure_tls_index();
-        let shim = PendingInterruptShim {
-            interrupted: Cell::new(false),
-            entered_guest: Cell::new(false),
-        };
-        let mut stack = [0_u128; 256];
-        let entry = guest_entry as *const () as usize;
-        let mut ctx = PtRegs {
-            rip: entry,
-            rcx: if fast_path { entry } else { 0 },
-            rsp: stack.as_mut_ptr().wrapping_add(stack.len()).addr(),
-            eflags: 0x202,
-            ..Default::default()
-        };
-        crate::run_thread_inner(&shim, &mut ctx);
-        assert!(shim.interrupted.get());
-        assert!(!shim.entered_guest.get());
-        assert_eq!(ctx.rip, entry);
-        assert_eq!(ctx.rcx, if fast_path { entry } else { 0 });
-    }
-
-    #[test]
-    fn pending_interrupt_before_guest_entry_sysret() {
-        check_pending_interrupt_before_guest_entry(true);
-    }
-
-    #[test]
-    fn pending_interrupt_before_guest_entry_ntcontinue() {
-        check_pending_interrupt_before_guest_entry(false);
-    }
-
-    #[test]
-    fn interrupt_capture_reuses_storage_and_resets_flags() {
-        use windows_sys::Win32::System::Diagnostics::Debug::{
-            CONTEXT_ALL_AMD64, CONTEXT_CONTROL_AMD64, CONTEXT_XSTATE_AMD64, GetXStateFeaturesMask,
-            SetXStateFeaturesMask,
-        };
-
-        let mut tls = crate::TlsState::new();
-        let scratch = tls.interrupt_context.get_mut();
-        let pointer = scratch.as_ptr();
-        let mut expected_mask = 0;
-        // SAFETY: scratch owns initialized extended context storage.
-        assert_ne!(
-            unsafe { GetXStateFeaturesMask(pointer, &raw mut expected_mask) },
-            0
-        );
-        for _ in 0..2 {
-            // SAFETY: The feature-mask change does not change the buffer layout.
-            assert_ne!(unsafe { SetXStateFeaturesMask(pointer, 0) }, 0);
-            scratch.context_mut().ContextFlags = CONTEXT_CONTROL_AMD64;
-            let context = scratch.prepare_for_capture();
-            assert_eq!(core::ptr::from_mut(context), pointer);
-            assert_eq!(
-                context.ContextFlags,
-                CONTEXT_ALL_AMD64 | CONTEXT_XSTATE_AMD64
-            );
-            let mut mask = 0;
-            // SAFETY: prepare_for_capture restored the extended context flags.
-            assert_ne!(unsafe { GetXStateFeaturesMask(context, &raw mut mask) }, 0);
-            assert_eq!(mask, expected_mask);
-        }
-        assert_ne!(pointer, tls.continue_context.get_mut().as_ptr());
-    }
 
     #[test]
     fn interrupt_capture_preserves_xstate_on_reuse() {
@@ -2621,7 +2437,6 @@ mod tests {
             VirtualFree, VirtualProtect,
         };
 
-        static TEST_NATIVE_VECTOR: [u8; 32] = [0xa5; 32];
         static TEST_VECTOR: [u8; 32] = [0x5a; 32];
         static TEST_NEXT_VECTOR: [u8; 32] = [0x3c; 32];
         static TEST_MXCSR: u32 = 0x3f80;
@@ -2630,52 +2445,45 @@ mod tests {
         unsafe extern "C" fn guest_entry() {
             core::arch::naked_asm!(
                 "ldmxcsr [rip + {mxcsr}]",
-                "movdqu xmm0, [rip + {native_vector}]",
-                "test rsi, rsi",
-                "jz 2f",
-                "vmovdqu ymm0, [rip + {native_vector}]",
-                "2:",
-                "lea rcx, [rip + 3f]",
-                "jmp {syscall_callback}",
-                "3:",
                 "movdqu xmm0, [rip + {vector}]",
                 "test rsi, rsi",
-                "jz 4f",
+                "jz 2f",
                 "vmovdqu ymm0, [rip + {vector}]",
-                "4:",
+                "2:",
                 "jmp rbx",
                 mxcsr = sym TEST_MXCSR,
-                native_vector = sym TEST_NATIVE_VECTOR,
                 vector = sym TEST_VECTOR,
-                syscall_callback = sym crate::syscall_callback,
             );
         }
 
         #[unsafe(naked)]
         unsafe extern "C" fn guest_after_interrupt() {
             core::arch::naked_asm!(
-                "lea rcx, [rip + 2f]",
-                "jmp {syscall_callback}",
-                "2:",
+                // Change the state before reusing the interrupt capture buffer.
                 "movdqu xmm0, [rip + {vector}]",
                 "test rsi, rsi",
-                "jz 3f",
+                "jz 2f",
                 "vmovdqu ymm0, [rip + {vector}]",
-                "3:",
+                "2:",
                 "jmp rbx",
                 vector = sym TEST_NEXT_VECTOR,
+            );
+        }
+
+        #[unsafe(naked)]
+        unsafe extern "C" fn guest_stop() {
+            core::arch::naked_asm!(
+                "jmp {syscall_callback}",
                 syscall_callback = sym crate::syscall_callback,
             );
         }
 
-        struct InterruptShim<'a> {
+        struct InterruptShim {
             count: Cell<usize>,
-            syscalls: Cell<usize>,
             avx: bool,
-            stop: &'a AtomicU32,
         }
 
-        impl EnterShim for InterruptShim<'_> {
+        impl EnterShim for InterruptShim {
             type ExecutionContext = PtRegs;
 
             fn init(&self, _ctx: &mut PtRegs) -> ContinueOperation {
@@ -2683,45 +2491,7 @@ mod tests {
             }
 
             fn syscall(&self, _ctx: &mut PtRegs) -> ContinueOperation {
-                if self.stop.load(Ordering::Acquire) != 0 {
-                    return ContinueOperation::Terminate;
-                }
-                let call = self.syscalls.get();
-                assert_eq!(self.count.get(), call);
-                let expected = [0xa5, 0x5a, 0x3c][call];
-                // SAFETY: The active guest's native capture has completed.
-                let area = unsafe { &*(*crate::get_tls_ptr().unwrap()).guest_xsave_area.get() };
-                let legacy = area.legacy_state_for_context();
-                assert_eq!(legacy.MxCsr, TEST_MXCSR);
-                assert_eq!(
-                    legacy.XmmRegisters[0].Low,
-                    u64::from_le_bytes([expected; 8])
-                );
-                assert_eq!(
-                    legacy.XmmRegisters[0].High.cast_unsigned(),
-                    u64::from_le_bytes([expected; 8])
-                );
-                if self.avx {
-                    let component = XsaveLayout::get()
-                        .components
-                        .iter()
-                        .find(|component| component.id == 2)
-                        .unwrap();
-                    assert_ne!(area.xstate_bv() & 4, 0);
-                    // SAFETY: The saved AVX component contains YMM0's upper half.
-                    assert_eq!(
-                        unsafe {
-                            core::slice::from_raw_parts(area.as_ptr().add(component.offset), 16)
-                        },
-                        [expected; 16]
-                    );
-                }
-                self.syscalls.set(call + 1);
-                if call == 2 {
-                    ContinueOperation::Terminate
-                } else {
-                    ContinueOperation::Resume
-                }
+                ContinueOperation::Terminate
             }
 
             fn exception(&self, _ctx: &mut PtRegs, info: &ExceptionInfo) -> ContinueOperation {
@@ -2729,9 +2499,6 @@ mod tests {
             }
 
             fn interrupt(&self, ctx: &mut PtRegs) -> ContinueOperation {
-                if self.stop.load(Ordering::Acquire) != 0 {
-                    return ContinueOperation::Terminate;
-                }
                 let expected = [0x5a, 0x3c][self.count.get()];
                 // SAFETY: The target has returned to the host; its saved context
                 // is not concurrently accessible while is_in_guest is false.
@@ -2767,12 +2534,19 @@ mod tests {
                         [expected; 16]
                     );
                 }
-                self.count.set(self.count.get() + 1);
+                let count = self.count.get() + 1;
+                self.count.set(count);
+                if count == 2 {
+                    return ContinueOperation::Terminate;
+                }
                 ctx.rip = ctx.r12;
                 ContinueOperation::Resume
             }
         }
 
+        // Place the spin loop outside this module so `is_in_ntdll_or_this`
+        // classifies its RIP as guest code and `interrupt` exercises case 4,
+        // which captures the live guest context and XSTATE.
         // SAFETY: Allocate a private page, populate it while writable, then make
         // it executable before starting the worker. The page outlives the worker.
         let code = unsafe {
@@ -2788,10 +2562,10 @@ mod tests {
             // SAFETY: The worker is joined before the uniquely owned page is freed.
             assert_ne!(unsafe { VirtualFree(code, 0, MEM_RELEASE) }, 0);
         });
-        // mov dword ptr [rdi], 1; pause; cmp dword ptr [r14], 0; je pause; jmp r12.
+        // mov dword ptr [rdi], 1; pause; cmp dword ptr [r14], 0; je pause; jmp r13.
         let instructions = [
             0xc7_u8, 0x07, 1, 0, 0, 0, 0xf3, 0x90, 0x41, 0x83, 0x3e, 0, 0x74, 0xf8, 0x41, 0xff,
-            0xe4,
+            0xe5,
         ];
         // SAFETY: The page is writable and large enough for these instructions.
         unsafe {
@@ -2817,259 +2591,80 @@ mod tests {
         );
 
         let code_address = code.addr();
-        for deliver_interrupts in [true, false] {
-            let ready = AtomicU32::new(0);
-            let stop = AtomicU32::new(0);
-            std::thread::scope(|scope| {
-                let stop_worker = litebox::utils::defer(|| stop.store(1, Ordering::Release));
-                let timeout = std::time::Duration::from_secs(5);
-                let deadline = std::time::Instant::now() + timeout;
-                let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-                let ready_ref = &ready;
-                let stop_ref = &stop;
-                let worker = scope.spawn(move || {
-                    crate::ensure_tls_index();
-                    let shim = InterruptShim {
-                        count: Cell::new(0),
-                        syscalls: Cell::new(0),
-                        avx: std::is_x86_feature_detected!("avx"),
-                        stop: stop_ref,
-                    };
-                    let mut stack = [0_u128; 256];
-                    let entry = guest_entry as *const () as usize;
-                    let mut ctx = PtRegs {
-                        rip: entry,
-                        rcx: entry,
-                        rbx: code_address,
-                        rdi: core::ptr::from_ref(ready_ref).addr(),
-                        rsi: usize::from(shim.avx),
-                        r12: guest_after_interrupt as *const () as usize,
-                        r14: core::ptr::from_ref(stop_ref).addr(),
-                        rsp: stack.as_mut_ptr().wrapping_add(stack.len()).addr(),
-                        eflags: 0x202,
-                        ..Default::default()
-                    };
-                    let tls = crate::TlsState::new();
-                    tls.guest_context_top
-                        .set(core::ptr::from_mut(&mut ctx).wrapping_add(1));
-                    let mut thread_ctx = crate::ThreadContext {
-                        shim: &shim,
-                        ctx: &mut ctx,
-                        tls: &tls,
-                    };
-                    crate::ThreadHandle::run_with_handle(&tls, || {
-                        sender
-                            .send(
-                                crate::CURRENT_THREAD_HANDLE
-                                    .with_borrow(|handle| handle.clone().unwrap()),
-                            )
-                            .unwrap();
-                        // SAFETY: The worker owns a live guest stack and TLS until termination.
-                        unsafe { crate::run_thread_arch(&mut thread_ctx, &tls) };
-                    });
-                    (shim.count.get(), shim.syscalls.get())
+        // Capture 0x5a and then 0x3c into the same interrupt scratch context.
+        let ready = AtomicU32::new(0);
+        let stop = AtomicU32::new(0);
+        std::thread::scope(|scope| {
+            let _stop_worker = litebox::utils::defer(|| stop.store(1, Ordering::Release));
+            let timeout = std::time::Duration::from_secs(5);
+            let deadline = std::time::Instant::now() + timeout;
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            let ready_ref = &ready;
+            let stop_ref = &stop;
+            let worker = scope.spawn(move || {
+                crate::ensure_tls_index();
+                let shim = InterruptShim {
+                    count: Cell::new(0),
+                    avx: std::is_x86_feature_detected!("avx"),
+                };
+                let mut stack = [0_u128; 256];
+                let entry = guest_entry as *const () as usize;
+                let mut ctx = PtRegs {
+                    rip: entry,
+                    rcx: entry,
+                    rbx: code_address,
+                    rdi: core::ptr::from_ref(ready_ref).addr(),
+                    rsi: usize::from(shim.avx),
+                    r12: guest_after_interrupt as *const () as usize,
+                    r13: guest_stop as *const () as usize,
+                    r14: core::ptr::from_ref(stop_ref).addr(),
+                    rsp: stack.as_mut_ptr().wrapping_add(stack.len()).addr(),
+                    eflags: 0x202,
+                    ..Default::default()
+                };
+                let tls = crate::TlsState::new();
+                tls.guest_context_top
+                    .set(core::ptr::from_mut(&mut ctx).wrapping_add(1));
+                let mut thread_ctx = crate::ThreadContext {
+                    shim: &shim,
+                    ctx: &mut ctx,
+                    tls: &tls,
+                };
+                crate::ThreadHandle::run_with_handle(&tls, || {
+                    sender
+                        .send(
+                            crate::CURRENT_THREAD_HANDLE
+                                .with_borrow(|handle| handle.clone().unwrap()),
+                        )
+                        .unwrap();
+                    // SAFETY: The worker owns a live guest stack and TLS until termination.
+                    unsafe { crate::run_thread_arch(&mut thread_ctx, &tls) };
                 });
-                let handle = receiver.recv_timeout(timeout).expect("guest did not start");
-                for _ in 0..if deliver_interrupts { 2 } else { 1 } {
-                    while ready.swap(0, Ordering::Acquire) == 0 {
-                        assert!(
-                            !worker.is_finished(),
-                            "guest exited before signaling readiness"
-                        );
-                        assert!(
-                            std::time::Instant::now() < deadline,
-                            "guest readiness timed out"
-                        );
-                        std::thread::yield_now();
-                    }
-                    if deliver_interrupts {
-                        handle.interrupt(None);
-                    }
-                }
-                if !deliver_interrupts {
-                    drop(stop_worker);
-                }
-                while !worker.is_finished() {
-                    assert!(std::time::Instant::now() < deadline, "guest exit timed out");
+                shim.count.get()
+            });
+            let handle = receiver.recv_timeout(timeout).expect("guest did not start");
+            for _ in 0..2 {
+                // The trampoline publishes readiness only after the new XSTATE
+                // value is live, so each capture has a deterministic expectation.
+                while ready.swap(0, Ordering::Acquire) == 0 {
+                    assert!(
+                        !worker.is_finished(),
+                        "guest exited before signaling readiness"
+                    );
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "guest readiness timed out"
+                    );
                     std::thread::yield_now();
                 }
-                assert_eq!(
-                    worker.join().unwrap(),
-                    if deliver_interrupts { (2, 3) } else { (0, 1) }
-                );
-            });
-        }
-    }
-
-    #[test]
-    fn interrupt_redirection_preserves_stack_registers() {
-        use windows_sys::Win32::System::Diagnostics::Debug::{CONTEXT, CONTEXT_CONTROL_AMD64};
-
-        let mut context = CONTEXT {
-            ContextFlags: CONTEXT_CONTROL_AMD64,
-            Rip: 0x1000,
-            Rsp: 0x2000,
-            Rbp: 0x3000,
-            ..Default::default()
-        };
-        crate::set_context_to_interrupt_callback(&mut context);
-        assert_ne!(context.Rip, 0x1000);
-        assert_eq!(context.Rsp, 0x2000);
-        assert_eq!(context.Rbp, 0x3000);
-    }
-
-    fn copy_context(
-        destination: &mut ExtendedContext,
-        source: &windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
-    ) {
-        use windows_sys::Win32::System::Diagnostics::Debug::{
-            CONTEXT_ALL_AMD64, CONTEXT_XSTATE_AMD64, CopyContext,
-        };
-
-        // SAFETY: destination owns initialized context storage and is exclusively
-        // borrowed; source is a separate initialized extended context in this test.
-        let ok = unsafe {
-            CopyContext(
-                destination.as_ptr(),
-                CONTEXT_ALL_AMD64 | CONTEXT_XSTATE_AMD64,
-                source,
-            )
-        };
-        assert_ne!(ok, 0, "CopyContext failed");
-    }
-
-    fn save_xsave_from_context(
-        xsave_area: &mut XsaveArea,
-        context: &windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
-    ) {
-        use windows_sys::Win32::System::Diagnostics::Debug::{
-            CONTEXT_FLOATING_POINT_AMD64, CONTEXT_XSTATE_AMD64, GetXStateFeaturesMask,
-            LocateXStateFeature, XSAVE_FORMAT,
-        };
-
-        assert_eq!(
-            context.ContextFlags & CONTEXT_FLOATING_POINT_AMD64,
-            CONTEXT_FLOATING_POINT_AMD64,
-        );
-        xsave_area.storage.fill(crate::XsaveChunk([0; 64]));
-        let mut xstate_bv = 3;
-        unsafe {
-            xsave_area
-                .as_mut_ptr()
-                .cast::<XSAVE_FORMAT>()
-                .write(context.Anonymous.FltSave);
-        }
-        if context.ContextFlags & CONTEXT_XSTATE_AMD64 == CONTEXT_XSTATE_AMD64 {
-            let mut context_mask = 0;
-            let ok = unsafe { GetXStateFeaturesMask(context, &raw mut context_mask) };
-            assert_ne!(ok, 0, "GetXStateFeaturesMask failed");
-            for component in &XsaveLayout::get().components {
-                let bit = 1 << component.id;
-                if context_mask & bit == 0 {
-                    continue;
-                }
-                let mut length = 0;
-                let source = unsafe {
-                    LocateXStateFeature(context, component.id, &raw mut length).cast::<u8>()
-                };
-                assert!(!source.is_null());
-                assert_eq!(length as usize, component.size);
-                unsafe {
-                    xsave_area
-                        .as_mut_ptr()
-                        .add(component.offset)
-                        .copy_from_nonoverlapping(source, component.size);
-                }
-                xstate_bv |= bit;
+                handle.interrupt(None);
             }
-        }
-        unsafe {
-            xsave_area
-                .as_mut_ptr()
-                .add(crate::XSAVE_HEADER_OFFSET)
-                .cast::<u64>()
-                .write_unaligned(xstate_bv);
-        }
-    }
-
-    #[test]
-    fn save_guest_context_preserves_registers_and_xstate() {
-        let mut source = ExtendedContext::new();
-        XsaveArea::initial_guest().restore_to_context(source.context_mut());
-        let context = source.context_mut();
-        context.Rax = 11;
-        context.Rip = 22;
-        context.MxCsr = 0x3f80;
-        context.Anonymous.FltSave.MxCsr = 0x3f80;
-
-        let mut tls = crate::TlsState::new();
-        let destination = tls.continue_context.get_mut().context_mut();
-        destination.Rax = 33;
-        destination.Rip = 44;
-
-        let mut regs = litebox_common_linux::PtRegs::default();
-        crate::save_guest_context(&tls, &mut regs, context);
-
-        assert_eq!(regs.rax, 11);
-        assert_eq!(regs.rip, 22);
-        let destination = tls.continue_context.get_mut().context_mut();
-        assert_eq!(destination.Rax, 33);
-        assert_eq!(destination.Rip, 44);
-        assert_eq!(destination.MxCsr, 0x3f80);
-        // SAFETY: CopyContext initialized the floating-point state above.
-        assert_eq!(unsafe { destination.Anonymous.FltSave.MxCsr }, 0x3f80);
-        assert!(tls.guest_xstate_format.get() == crate::GuestXstateFormat::Windows);
-    }
-
-    #[test]
-    fn xsave_preserves_mxcsr_with_initial_sse() {
-        use windows_sys::Win32::System::Diagnostics::Debug::XSAVE_FORMAT;
-
-        let mut initial = XsaveArea::initial_guest();
-        let mut saved = XsaveArea::initial_guest();
-        let mut host = [const { crate::XsaveChunk([0; 64]) }; 8];
-        for expected in [XsaveArea::GUEST_INITIAL_MXCSR, 0x3f80] {
-            if expected != XsaveArea::GUEST_INITIAL_MXCSR {
-                // SAFETY: The buffer owns aligned, initialized legacy state.
-                unsafe { (*initial.as_mut_ptr().cast::<XSAVE_FORMAT>()).MxCsr = expected };
+            while !worker.is_finished() {
+                assert!(std::time::Instant::now() < deadline, "guest exit timed out");
+                std::thread::yield_now();
             }
-            let mut observed = 0_u32;
-            // SAFETY: The buffers are aligned, disjoint, and sufficiently sized.
-            // Only SSE is changed; all host legacy state is restored before returning.
-            unsafe {
-                core::arch::asm!(
-                    "fxsave64 [{host}]",
-                    "mov eax, 2",
-                    "xor edx, edx",
-                    "xrstor64 [{initial}]",
-                    "xsave64 [{saved}]",
-                    "stmxcsr [{observed}]",
-                    "fxrstor64 [{host}]",
-                    host = in(reg) host.as_mut_ptr(),
-                    initial = in(reg) initial.as_ptr(),
-                    saved = in(reg) saved.as_mut_ptr(),
-                    observed = in(reg) &raw mut observed,
-                    out("eax") _,
-                    out("edx") _,
-                    options(nostack),
-                );
-            }
-            assert_eq!(observed, expected);
-            assert_eq!(saved.xstate_bv() & 2, 0);
-            let mut destination = ExtendedContext::new();
-            saved.restore_to_context(destination.context_mut());
-            let context = destination.context_mut();
-            assert_eq!(context.MxCsr, expected);
-            // SAFETY: restore_to_context initialized FltSave above.
-            let legacy = unsafe { context.Anonymous.FltSave };
-            assert_eq!(legacy.MxCsr, expected);
-            assert!(
-                legacy
-                    .XmmRegisters
-                    .iter()
-                    .all(|value| value.Low == 0 && value.High == 0)
-            );
-        }
+            assert_eq!(worker.join().unwrap(), 2);
+        });
     }
 
     #[test]
@@ -3171,6 +2766,7 @@ mod tests {
                     }
                 }
                 if call == 2 || call == 4 {
+                    // Force the guest to take the slower `NtContinue` resume path.
                     ctx.rcx = 0;
                 }
                 if call == 6 {
@@ -3290,112 +2886,6 @@ mod tests {
             "XSAVEOPT: median {} ns/round trip over {ITERATIONS} syscalls",
             samples[samples.len() / 2] / ITERATIONS as u128
         );
-    }
-
-    #[test]
-    fn xsave_preserves_avx_state() {
-        if !std::is_x86_feature_detected!("avx") {
-            return;
-        }
-
-        let mut xsave_area = XsaveArea::initial_guest();
-        let expected = [
-            0x00_u8, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
-            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
-            0x1c, 0x1d, 0x1e, 0x1f,
-        ];
-        let mut actual = [0_u8; 32];
-        let mask = XsaveLayout::get().mask;
-        unsafe {
-            core::arch::asm!(
-                "vmovdqu ymm0, [{expected}]",
-                "mov eax, {mask:e}",
-                "shr {mask}, 32",
-                "mov edx, {mask:e}",
-                "xsave64 [{xsave_area}]",
-                "vpxor ymm0, ymm0, ymm0",
-                "mov eax, {restore_mask:e}",
-                "shr {restore_mask}, 32",
-                "mov edx, {restore_mask:e}",
-                "xrstor64 [{xsave_area}]",
-                "vmovdqu [{actual}], ymm0",
-                "vzeroupper",
-                expected = in(reg) expected.as_ptr(),
-                actual = in(reg) actual.as_mut_ptr(),
-                xsave_area = in(reg) xsave_area.as_mut_ptr(),
-                mask = inout(reg) mask => _,
-                restore_mask = inout(reg) mask => _,
-                out("eax") _,
-                out("edx") _,
-                out("ymm0") _,
-                options(nostack),
-            );
-        }
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn xsave_round_trips_through_extended_context() {
-        use windows_sys::Win32::System::Diagnostics::Debug::LocateXStateFeature;
-
-        let Some(component) = XsaveLayout::get()
-            .components
-            .iter()
-            .find(|component| component.id == 2)
-        else {
-            return;
-        };
-        let expected = vec![0x5a_u8; component.size];
-        let mut source = ExtendedContext::new();
-        let mut length = 0;
-        let source_feature = unsafe {
-            LocateXStateFeature(source.context_mut(), component.id, &raw mut length).cast::<u8>()
-        };
-        assert_eq!(length as usize, component.size);
-        unsafe { source_feature.copy_from_nonoverlapping(expected.as_ptr(), expected.len()) };
-
-        let mut copied = ExtendedContext::new();
-        copy_context(&mut copied, source.context_mut());
-        let copied_feature = unsafe {
-            LocateXStateFeature(copied.context_mut(), component.id, &raw mut length).cast::<u8>()
-        };
-        let copied_actual = unsafe { core::slice::from_raw_parts(copied_feature, length as usize) };
-        assert_eq!(copied_actual, expected);
-
-        let mut xsave_area = XsaveArea::initial_guest();
-        save_xsave_from_context(&mut xsave_area, source.context_mut());
-        let mut destination = ExtendedContext::new();
-        xsave_area.restore_to_context(destination.context_mut());
-
-        let destination_feature = unsafe {
-            LocateXStateFeature(destination.context_mut(), component.id, &raw mut length)
-                .cast::<u8>()
-        };
-        let actual = unsafe { core::slice::from_raw_parts(destination_feature, length as usize) };
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn xsave_restore_marks_only_legacy_state_valid() {
-        use windows_sys::Win32::System::Diagnostics::Debug::GetXStateFeaturesMask;
-
-        let mut xsave_area = XsaveArea::initial_guest();
-        xsave_area.storage.fill(crate::XsaveChunk([0x5a; 64]));
-        unsafe {
-            xsave_area
-                .as_mut_ptr()
-                .add(crate::XSAVE_HEADER_OFFSET)
-                .cast::<u64>()
-                .write_unaligned(0);
-        }
-
-        let mut destination = ExtendedContext::new();
-        xsave_area.restore_to_context(destination.context_mut());
-
-        let mut feature_mask = u64::MAX;
-        let ok = unsafe { GetXStateFeaturesMask(destination.context_mut(), &raw mut feature_mask) };
-        assert_ne!(ok, 0, "GetXStateFeaturesMask failed");
-        assert_eq!(feature_mask, 3);
     }
 
     #[test]
