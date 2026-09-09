@@ -67,3 +67,30 @@ fn runtime_x18_gates_preserve_registers_and_branch_targets() {
 fn aot_x18_gates_preserve_registers_and_branch_targets() {
     run_x18_fixture(true);
 }
+
+#[test]
+fn clone_uses_distinct_guest_tls_and_x18_slots() {
+    let fixture = Fixture::new();
+    // Clone with SETTLS|CHILD_CLEARTID; child changes TP and x18. Parent waits
+    // on clear_child_tid with FUTEX_WAIT, then checks its own values are unchanged.
+    let code = [
+        0xd2800000, 0xd2a00021, 0xd2800062, 0xd2800443, 0x92800004, 0xd2800005, 0xd2801bc8,
+        0xd4000001, 0xf100001f, 0x540006cb, 0xaa0003f3, 0x52800029, 0xb9000a69, 0xd2824692,
+        0xd2822229, 0xd51bd049, 0xd281e000, 0xf2a005a0, 0x91404261, 0xd2800002, 0xd2844443,
+        0x91002264, 0xd2801b88, 0xd4000001, 0xb40002a0, 0xf100001f, 0x540004ab, 0x91002260,
+        0xd2800001, 0xb9400002, 0x340000a2, 0xd2800003, 0xd2800c48, 0xd4000001, 0x17fffff9,
+        0xd53bd049, 0xd282222a, 0xeb0a013f, 0x54000321, 0xd282468a, 0xeb0a025f, 0x540002c1,
+        0xd2800540, 0xd2800bc8, 0xd4000001, 0xd53bd049, 0xd284444a, 0xeb0a013f, 0x540001e1,
+        0xd282468a, 0xeb0a025f, 0x54000181, 0xd28acf12, 0xd2866669, 0xd51bd049, 0xd2801588,
+        0xd4000001, 0xd28acf0a, 0xeb0a025f, 0x54000081, 0xd2800000, 0xd2800ba8, 0xd4000001,
+        0xd2800020, 0xd2800bc8, 0xd4000001,
+    ];
+    std::fs::write(fixture.0.join("program"), elf(&code)).unwrap();
+    let output = fixture.run(&[]);
+    assert_eq!(
+        output.status.code(),
+        Some(42),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

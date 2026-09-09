@@ -891,6 +891,20 @@ struct ThreadContext<'a> {
     exit: GuestExit,
 }
 
+unsafe fn thread_start(
+    init_thread: Box<dyn litebox::shim::InitThread<ExecutionContext = PtRegs>>,
+    mut ctx: PtRegs,
+    vector_state: GuestVectorState,
+) {
+    initialize_thread_tls().expect("unsupported macOS TLS layout");
+    set_guest_vector_state(&vector_state);
+    // Thread registration and signal-stack setup happen in run_thread_inner;
+    // InitThread::init must not call current_thread or access guest memory.
+    let shim = init_thread.init();
+    // SAFETY: the spawning caller supplied live guest mappings; shim and ctx remain live.
+    unsafe { run_thread_inner(shim.as_ref(), &mut ctx) };
+}
+
 struct ThreadState {
     // Cleared before thread exit to prevent pthread ID-reuse races.
     identity: Mutex<Option<usize>>,
@@ -929,13 +943,17 @@ impl ThreadProvider for MacosUserland {
     type ThreadHandle = ThreadHandle;
     unsafe fn spawn_thread(
         &self,
-        _ctx: &Self::ExecutionContext,
-        _init_thread: Box<dyn litebox::shim::InitThread<ExecutionContext = Self::ExecutionContext>>,
+        ctx: &Self::ExecutionContext,
+        init_thread: Box<dyn litebox::shim::InitThread<ExecutionContext = Self::ExecutionContext>>,
     ) -> Result<(), Self::ThreadSpawnError> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "guest thread creation is not supported",
-        ))
+        let ctx = ctx.clone();
+        let vector_state = get_guest_vector_state();
+        // TODO: wait for child initialization so startup failures can be reported.
+        let _handle = std::thread::Builder::new().spawn(move || {
+            // SAFETY: the caller supplies the child context and its live guest mappings.
+            unsafe { thread_start(init_thread, ctx, vector_state) };
+        })?;
+        Ok(())
     }
     fn current_thread(&self) -> Self::ThreadHandle {
         ThreadHandle::current()
@@ -1916,6 +1934,148 @@ mod tests {
     use litebox::platform::RawMutPointer as _;
     const RW: MemoryRegionPermissions =
         MemoryRegionPermissions::READ.union(MemoryRegionPermissions::WRITE);
+
+    #[test]
+    fn child_inherits_vector_state_and_dispatches_on_host_stack() {
+        use litebox::shim::InitThread;
+        use litebox_syscall_rewriter::{
+            RewriteOptions, TargetHost, patch_code_segment_with_options,
+        };
+
+        #[derive(Debug, PartialEq)]
+        enum Event {
+            Inherited(bool),
+            Init(bool),
+            Syscall(bool),
+            Done,
+        }
+        struct Probe {
+            entry: usize,
+            stack: usize,
+            vector: GuestVectorState,
+            send: std::sync::mpsc::Sender<Event>,
+        }
+        fn on_host_stack() -> bool {
+            // SAFETY: stack_t is zero-valid writable output for this thread's query.
+            let mut stack = unsafe { core::mem::zeroed::<libc::stack_t>() };
+            // SAFETY: null requests a query; stack remains writable for the call.
+            let result = unsafe { libc::sigaltstack(core::ptr::null(), &raw mut stack) };
+            result == 0 && stack.ss_flags & libc::SS_ONSTACK == 0
+        }
+        impl InitThread for Probe {
+            type ExecutionContext = PtRegs;
+            fn init(self: Box<Self>) -> Box<dyn EnterShim<ExecutionContext = PtRegs>> {
+                self.send
+                    .send(Event::Inherited(get_guest_vector_state() == self.vector))
+                    .unwrap();
+                self
+            }
+        }
+        impl EnterShim for Probe {
+            type ExecutionContext = PtRegs;
+            fn init(&self, ctx: &mut PtRegs) -> ContinueOperation {
+                self.send.send(Event::Init(on_host_stack())).unwrap();
+                ctx.pc = self.entry;
+                ctx.sp = self.stack;
+                ctx.regs[8] = 172;
+                ContinueOperation::Resume
+            }
+            fn syscall(&self, _: &mut PtRegs) -> ContinueOperation {
+                self.send
+                    .send(Event::Syscall(
+                        on_host_stack() && get_guest_vector_state() == self.vector,
+                    ))
+                    .unwrap();
+                ContinueOperation::Terminate
+            }
+            fn exception(&self, _: &mut PtRegs, _: &ExceptionInfo) -> ContinueOperation {
+                ContinueOperation::Terminate
+            }
+            fn interrupt(&self, _: &mut PtRegs) -> ContinueOperation {
+                ContinueOperation::Resume
+            }
+        }
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                let _ = self.send.send(Event::Done);
+            }
+        }
+
+        let platform = MacosUserland::new().unwrap();
+        let memory = platform
+            .allocate_pages(
+                TASK_ADDR_MIN..TASK_ADDR_MIN + 3 * PAGE_SIZE,
+                RW,
+                false,
+                true,
+                FixedAddressBehavior::Hint,
+            )
+            .unwrap();
+        let base = memory.as_usize();
+        let mut code = 0xd4000001u32.to_le_bytes();
+        let (gates, trapped) = patch_code_segment_with_options(
+            &mut code,
+            base as u64,
+            (base + PAGE_SIZE / 2) as u64,
+            platform.get_syscall_entry_point() as u64,
+            RewriteOptions::new(TargetHost::MacOs, true),
+        )
+        .unwrap();
+        assert!(trapped.is_empty());
+        assert_eq!(memory.write_slice_at_offset(0, &code), Some(()));
+        assert_eq!(
+            memory.write_slice_at_offset((PAGE_SIZE / 2).cast_signed(), &gates),
+            Some(())
+        );
+        // SAFETY: code is initialized and has no active readers before publication.
+        unsafe {
+            platform
+                .update_permissions(
+                    base..base + PAGE_SIZE,
+                    MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
+                )
+                .unwrap();
+        }
+        let original = get_guest_vector_state();
+        let _restore = litebox::utils::defer(|| set_guest_vector_state(&original));
+        let mut vector = GuestVectorState::default();
+        vector.registers[0] = 0x1234;
+        vector.registers[31] = 0x5678;
+        set_guest_vector_state(&vector);
+        let (send, receive) = std::sync::mpsc::channel();
+        // SAFETY: the test retains the child's rewritten code and stack until Probe is dropped.
+        unsafe {
+            platform
+                .spawn_thread(
+                    &PtRegs::default(),
+                    Box::new(Probe {
+                        entry: base,
+                        stack: base + 3 * PAGE_SIZE,
+                        vector,
+                        send,
+                    }),
+                )
+                .unwrap();
+        }
+        let observed: Vec<_> = (0..4)
+            .map(|_| receive.recv_timeout(Duration::from_secs(5)).unwrap())
+            .collect();
+        assert_eq!(
+            observed,
+            [
+                Event::Inherited(true),
+                Event::Init(true),
+                Event::Syscall(true),
+                Event::Done
+            ]
+        );
+        // SAFETY: Probe was dropped after run_thread_inner returned, so the guest mappings are idle.
+        unsafe {
+            platform
+                .deallocate_pages(base..base + 3 * PAGE_SIZE)
+                .unwrap();
+        }
+    }
 
     #[test]
     fn pstate_capture_and_restore_preserve_only_user_bits() {
