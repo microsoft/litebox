@@ -6,7 +6,6 @@
 //! Provides `{stdin,stdout,null,urandom,...}` entries, intended to be mounted at `/dev`.
 
 use alloc::string::String;
-use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::LiteBox;
@@ -14,11 +13,11 @@ use crate::sync::RawSyncPrimitivesProvider;
 
 use super::backend::{
     Backend, BackendHandles, CreationMetadata, DirHandle, FileHandle, HandleRef, PermissionCheck,
-    Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkingDirHandle,
+    PermissionInfo, Resolution, ResolvedDir, ResolvedFile, ResolvedTarget, SeekBehavior,
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
+    ReadError, ResolutionError, RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::inode_allocator::InodeAllocator;
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
@@ -170,7 +169,8 @@ where
         + crate::platform::CrngProvider
         + 'static,
 {
-    type WalkingDirHandle<'a> = DeviceDirHandle;
+    type ResolvedDir<'a> = DeviceDirHandle;
+    type ResolvedFile<'a> = DeviceFileHandle;
     type FileHandle = DeviceFileHandle;
     type DirHandle = DeviceDirHandle;
 }
@@ -182,57 +182,54 @@ where
         + crate::platform::CrngProvider
         + 'static,
 {
-    fn root(&self) -> WalkingDirHandle<'_> {
-        WalkingDirHandle::from_typed::<Self>(DeviceDirHandle)
-    }
-
-    fn walk_directories<'a>(
-        &'a self,
-        from: WalkingDirHandle<'a>,
-        components: &[&str],
-    ) -> Result<WalkOutcome<WalkingDirHandle<'a>>, WalkError> {
-        let from = from.into_typed::<Self>();
-        // Device files are final path targets, so directory walking must stop before them.
-        if let Some(&component) = components.first() {
-            if Device::from_name(component).is_some() {
-                return Ok(WalkOutcome {
-                    components: vec![],
-                    last: WalkingDirHandle::from_typed::<Self>(from),
-                    stop_reason: WalkStopReason::StoppedAtNonDirectory,
-                });
-            }
-            return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
-        }
-        Ok(WalkOutcome {
-            components: vec![],
-            last: WalkingDirHandle::from_typed::<Self>(from),
-            stop_reason: WalkStopReason::CompleteDirectory,
-        })
-    }
-
-    fn owned_dir_at(
-        &self,
-        dir: WalkingDirHandle<'_>,
-        _flags: OFlags,
-    ) -> Result<DirHandle, OpenError> {
-        Ok(DirHandle::from_typed::<Self>(dir.into_typed::<Self>()))
-    }
-
-    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<WalkingDirHandle<'a>> {
-        Some(WalkingDirHandle::from_typed::<Self>(
-            *dir.get_typed::<Self>(),
+    fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
+        Ok(ResolvedDir::from_typed::<Self>(
+            DeviceDirHandle,
+            PermissionCheck::ByBackend,
         ))
     }
 
-    fn open_file_at(
-        &self,
-        dir: WalkingDirHandle<'_>,
-        name: &str,
-        flags: OFlags,
-    ) -> Result<Permissioned<FileHandle>, OpenError> {
-        let _dir = dir.into_typed::<Self>();
-        let device = Device::from_name(name)
-            .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
+    fn resolve<'a>(
+        &'a self,
+        from: ResolvedDir<'a>,
+        components: &[&str],
+        _authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
+    ) -> Result<Resolution<'a>, ResolutionError> {
+        let Some(component) = components.first() else {
+            return Ok(Resolution::Found(ResolvedTarget::Dir(from)));
+        };
+        match Device::from_name(component) {
+            Some(device) if components.len() == 1 => Ok(Resolution::Found(ResolvedTarget::File(
+                ResolvedFile::from_typed::<Self>(
+                    DeviceFileHandle { device },
+                    PermissionCheck::ByBackend,
+                ),
+            ))),
+            Some(_) => Err(ResolutionError {
+                component: Some(1),
+                error: PathError::ComponentNotADirectory.into(),
+            }),
+            None if components.len() == 1 => Ok(Resolution::MissingFinal { parent: from }),
+            None => Err(ResolutionError {
+                component: Some(0),
+                error: PathError::NoSuchFileOrDirectory.into(),
+            }),
+        }
+    }
+
+    fn open_dir(&self, dir: ResolvedDir<'_>, _flags: OFlags) -> Result<DirHandle, OpenError> {
+        Ok(DirHandle::from_typed::<Self>(dir.into_typed::<Self>()))
+    }
+
+    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<ResolvedDir<'a>> {
+        Some(ResolvedDir::from_typed::<Self>(
+            *dir.get_typed::<Self>(),
+            PermissionCheck::ByBackend,
+        ))
+    }
+
+    fn open_file(&self, file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError> {
+        let DeviceFileHandle { device } = file.into_typed::<Self>();
 
         if flags.contains(OFlags::DIRECTORY) {
             return Err(OpenError::PathError(PathError::ComponentNotADirectory));
@@ -258,10 +255,7 @@ where
             ));
         }
 
-        Ok(Permissioned {
-            item: FileHandle::from_typed::<Self>(DeviceFileHandle { device }),
-            permissions: PermissionCheck::ByBackend,
-        })
+        Ok(FileHandle::from_typed::<Self>(DeviceFileHandle { device }))
     }
 
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
@@ -355,9 +349,18 @@ where
         }
     }
 
+    fn resolved_status(&self, target: &ResolvedTarget<'_>) -> Result<FileStatus, FileStatusError> {
+        match target {
+            ResolvedTarget::File(h) => Ok(h.get_typed::<Self>().device.file_status()),
+            ResolvedTarget::Dir(h) => self.status(HandleRef::Dir(&DirHandle::from_typed::<Self>(
+                *h.get_typed::<Self>(),
+            ))),
+        }
+    }
+
     fn create_file_at(
         &self,
-        _dir: DirHandle,
+        _dir: ResolvedDir<'_>,
         _name: &str,
         _metadata: CreationMetadata,
     ) -> Result<FileHandle, OpenError> {
@@ -366,28 +369,28 @@ where
 
     fn mkdir_at(
         &self,
-        _dir: DirHandle,
+        _dir: ResolvedDir<'_>,
         _name: &str,
         _metadata: CreationMetadata,
     ) -> Result<DirHandle, MkdirError> {
         Err(MkdirError::ReadOnlyFileSystem)
     }
 
-    fn unlink_at(&self, _dir: DirHandle, _name: &str) -> Result<(), UnlinkError> {
+    fn unlink_at(&self, _dir: ResolvedDir<'_>, _name: &str) -> Result<(), UnlinkError> {
         Err(UnlinkError::ReadOnlyFileSystem)
     }
 
-    fn rmdir_at(&self, _dir: DirHandle, _name: &str) -> Result<(), RmdirError> {
+    fn rmdir_at(&self, _dir: ResolvedDir<'_>, _name: &str) -> Result<(), RmdirError> {
         Err(RmdirError::ReadOnlyFileSystem)
     }
 
-    fn chmod(&self, _h: HandleRef<'_>, _mode: Mode) -> Result<(), ChmodError> {
+    fn chmod(&self, _h: ResolvedTarget<'_>, _mode: Mode) -> Result<(), ChmodError> {
         Err(ChmodError::ReadOnlyFileSystem)
     }
 
     fn chown(
         &self,
-        _h: HandleRef<'_>,
+        _h: ResolvedTarget<'_>,
         _user: Option<u16>,
         _group: Option<u16>,
     ) -> Result<(), ChownError> {

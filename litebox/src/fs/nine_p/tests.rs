@@ -207,6 +207,84 @@ fn connect_9p(
 // ---------------------------------------------------------------------------
 
 #[test]
+fn overlay_authorizes_logical_targets_even_with_a_self_enforcing_lower() {
+    use crate::fs::UserInfo;
+    use crate::fs::errors::{ChmodError, ChownError, PathError};
+    use crate::fs::in_mem::{InMem, InitialNode};
+    use crate::fs::overlay::Overlay;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let litebox = crate::LiteBox::new(MockPlatform::new());
+    let server = DiodServer::start();
+    let file = server.export_path().join("private-file");
+    std::fs::write(&file, b"server-owned data").unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let dir = server.export_path().join("private-dir");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(dir.join("hidden"), b"hidden").unwrap();
+    let metadata = std::fs::metadata(&file).unwrap();
+    let mut context = crate::fs::resolver::Context::new();
+    context.set_acting_user(UserInfo {
+        user: u16::try_from(metadata.uid()).unwrap().wrapping_add(1),
+        group: u16::try_from(metadata.gid()).unwrap().wrapping_add(1),
+    });
+    let direct = connect_9p(&litebox, &server);
+    let fd = direct
+        .open(&context, "/private-file", OFlags::RDONLY, Mode::empty())
+        .unwrap();
+    direct.close(&fd).unwrap();
+
+    let upper = InMem::<MockPlatform>::new_initialized([(
+        "/",
+        InitialNode::Directory {
+            mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+            owner: UserInfo::ROOT,
+        },
+    )]);
+    let backend = Overlay::new(
+        &litebox,
+        upper,
+        attach(TcpTransport::connect(&server.addr()), &server),
+        InodeAllocator::standalone(),
+    );
+    let fs = Resolver::new(&litebox, backend);
+    for flags in [OFlags::RDONLY, OFlags::WRONLY | OFlags::TRUNC] {
+        assert!(matches!(
+            fs.open(&context, "/private-file", flags, Mode::empty()),
+            Err(OpenError::AccessNotAllowed)
+        ));
+    }
+    assert!(matches!(
+        fs.open(&context, "/private-dir", OFlags::RDONLY, Mode::empty()),
+        Err(OpenError::AccessNotAllowed)
+    ));
+    assert!(matches!(
+        fs.open(&context, "/private-dir/hidden", OFlags::PATH, Mode::empty()),
+        Err(OpenError::PathError(PathError::NoSearchPerms { .. }))
+    ));
+    assert!(matches!(
+        fs.chmod(&context, "/private-file", Mode::RWXU),
+        Err(ChmodError::NotTheOwner)
+    ));
+    assert!(matches!(
+        fs.chown(
+            &context,
+            "/private-file",
+            Some(context.acting_user().user),
+            None
+        ),
+        Err(ChownError::NotTheOwner)
+    ));
+    let fd = fs
+        .open(&context, "/private-file", OFlags::PATH, Mode::empty())
+        .unwrap();
+    assert_eq!(fs.fd_file_status(&fd).unwrap().size, 17);
+    fs.close(&fd).unwrap();
+    assert_eq!(std::fs::read(&file).unwrap(), b"server-owned data");
+}
+
+#[test]
 fn test_nine_p_create_and_read_file() {
     let ctx = crate::fs::resolver::Context::new();
     let litebox = crate::LiteBox::new(MockPlatform::new());

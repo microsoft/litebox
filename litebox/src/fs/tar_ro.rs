@@ -33,10 +33,13 @@ use crate::fs::{DirEntry, FileType};
 
 use super::{
     Mode, NodeInfo, OFlags, UserInfo,
-    backend::{CreationMetadata, DirHandle, FileHandle, HandleRef, WalkingDirHandle},
+    backend::{
+        CreationMetadata, DirHandle, FileHandle, HandleRef, PermissionCheck, PermissionInfo,
+        Resolution, ResolvedDir, ResolvedFile, ResolvedTarget,
+    },
     errors::{
         ChmodError, ChownError, MkdirError, OpenError, PathError, ReadDirError, ReadError,
-        RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
+        ResolutionError, RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
     },
     inode_allocator::InodeAllocator,
 };
@@ -51,6 +54,16 @@ pub struct TarRo {
 }
 
 impl TarRo {
+    fn resolved_dir<'a>(&self, dir: TarRoDirHandle) -> ResolvedDir<'a> {
+        let permissions = PermissionCheck::ByResolver(PermissionInfo {
+            mode: DEFAULT_DIR_MODE,
+            owner: self.tar_index.dirs[dir.idx]
+                .owner
+                .unwrap_or(DEFAULT_DIRECTORY_OWNER),
+        });
+        ResolvedDir::from_typed::<Self>(dir, permissions)
+    }
+
     /// Construct a tar backend using a caller-provided inode allocator.
     #[must_use]
     pub fn new(
@@ -76,85 +89,79 @@ pub struct TarRoFileHandle {
     idx: usize,
 }
 impl super::backend::BackendHandles for TarRo {
-    type WalkingDirHandle<'a> = TarRoDirHandle;
+    type ResolvedDir<'a> = TarRoDirHandle;
+    type ResolvedFile<'a> = TarRoFileHandle;
     type FileHandle = TarRoFileHandle;
     type DirHandle = TarRoDirHandle;
 }
 
 impl super::backend::Backend for TarRo {
-    fn root(&self) -> WalkingDirHandle<'_> {
-        WalkingDirHandle::from_typed::<Self>(TarRoDirHandle { idx: 0 })
+    fn root(&self) -> Result<ResolvedDir<'_>, WalkError> {
+        Ok(self.resolved_dir(TarRoDirHandle { idx: 0 }))
     }
 
-    fn walk_directories<'a>(
+    fn resolve<'a>(
         &'a self,
-        from: WalkingDirHandle<'a>,
+        from: ResolvedDir<'a>,
         components: &[&str],
-    ) -> Result<super::backend::WalkOutcome<WalkingDirHandle<'a>>, WalkError> {
-        let mut current = from.into_typed::<Self>();
-        let mut walked_components = Vec::with_capacity(components.len());
-        for component in components {
-            let child = self.tar_index.dirs[current.idx]
-                .children
-                .get(*component)
-                .ok_or(WalkError::PathError(PathError::NoSuchFileOrDirectory))?;
-            let IndexedChild::Dir(child_idx) = *child else {
-                return Ok(super::backend::WalkOutcome {
-                    components: walked_components,
-                    last: WalkingDirHandle::from_typed::<Self>(current),
-                    stop_reason: super::backend::WalkStopReason::StoppedAtNonDirectory,
-                });
+        authorize_dir_lookup: &dyn Fn(&PermissionInfo) -> Result<(), WalkError>,
+    ) -> Result<Resolution<'a>, ResolutionError> {
+        let mut current = from;
+        for (index, component) in components.iter().enumerate() {
+            let fail = |error| ResolutionError {
+                component: Some(index),
+                error,
             };
-
-            let child = &self.tar_index.dirs[child_idx];
-            walked_components.push(super::backend::WalkedComponent {
-                permissions: super::backend::PermissionCheck::ByResolver(
-                    super::backend::PermissionInfo {
-                        mode: DEFAULT_DIR_MODE,
-                        owner: child.owner.unwrap_or(DEFAULT_DIRECTORY_OWNER),
-                    },
-                ),
-            });
-            current = TarRoDirHandle { idx: child_idx };
+            let PermissionCheck::ByResolver(permissions) = &current.permissions else {
+                unreachable!()
+            };
+            authorize_dir_lookup(permissions).map_err(fail)?;
+            let dir = current.into_typed::<Self>();
+            match self.tar_index.dirs[dir.idx].children.get(*component) {
+                Some(IndexedChild::Dir(idx)) => {
+                    current = self.resolved_dir(TarRoDirHandle { idx: *idx });
+                }
+                Some(IndexedChild::File(idx)) => {
+                    if index + 1 != components.len() {
+                        return Err(ResolutionError {
+                            component: Some(index + 1),
+                            error: PathError::ComponentNotADirectory.into(),
+                        });
+                    }
+                    let file = &self.tar_index.files[*idx];
+                    return Ok(Resolution::Found(ResolvedTarget::File(
+                        ResolvedFile::from_typed::<Self>(
+                            TarRoFileHandle { idx: *idx },
+                            PermissionCheck::ByResolver(PermissionInfo {
+                                mode: file.mode,
+                                owner: file.owner,
+                            }),
+                        ),
+                    )));
+                }
+                None if index + 1 == components.len() => {
+                    return Ok(Resolution::MissingFinal {
+                        parent: self.resolved_dir(dir),
+                    });
+                }
+                None => return Err(fail(PathError::NoSuchFileOrDirectory.into())),
+            }
         }
-        Ok(super::backend::WalkOutcome {
-            components: walked_components,
-            last: WalkingDirHandle::from_typed::<Self>(current),
-            stop_reason: super::backend::WalkStopReason::CompleteDirectory,
-        })
+        Ok(Resolution::Found(ResolvedTarget::Dir(current)))
     }
 
-    fn owned_dir_at(
-        &self,
-        dir: WalkingDirHandle<'_>,
-        flags: OFlags,
-    ) -> Result<DirHandle, OpenError> {
+    fn open_dir(&self, dir: ResolvedDir<'_>, flags: OFlags) -> Result<DirHandle, OpenError> {
         if flags.intersects(OFlags::CREAT | OFlags::TRUNC | OFlags::WRONLY | OFlags::RDWR) {
             return Err(OpenError::ReadOnlyFileSystem);
         }
         Ok(DirHandle::from_typed::<Self>(dir.into_typed::<Self>()))
     }
 
-    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<WalkingDirHandle<'a>> {
-        Some(WalkingDirHandle::from_typed::<Self>(
-            dir.get_typed::<Self>().clone(),
-        ))
+    fn walking_dir_at<'a>(&'a self, dir: &DirHandle) -> Option<ResolvedDir<'a>> {
+        Some(self.resolved_dir(dir.get_typed::<Self>().clone()))
     }
 
-    fn open_file_at(
-        &self,
-        dir: WalkingDirHandle<'_>,
-        name: &str,
-        flags: OFlags,
-    ) -> Result<super::backend::Permissioned<FileHandle>, OpenError> {
-        let dir = dir.into_typed::<Self>();
-        let child = self.tar_index.dirs[dir.idx]
-            .children
-            .get(name)
-            .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
-        let IndexedChild::File(file_idx) = *child else {
-            return Err(OpenError::PathError(PathError::ComponentNotADirectory));
-        };
+    fn open_file(&self, file: ResolvedFile<'_>, flags: OFlags) -> Result<FileHandle, OpenError> {
         if flags.contains(OFlags::DIRECTORY) {
             return Err(OpenError::PathError(PathError::ComponentNotADirectory));
         }
@@ -166,16 +173,7 @@ impl super::backend::Backend for TarRo {
         {
             return Err(OpenError::ReadOnlyFileSystem);
         }
-        let file = &self.tar_index.files[file_idx];
-        Ok(super::backend::Permissioned {
-            item: FileHandle::from_typed::<Self>(TarRoFileHandle { idx: file_idx }),
-            permissions: super::backend::PermissionCheck::ByResolver(
-                super::backend::PermissionInfo {
-                    mode: file.mode,
-                    owner: file.owner,
-                },
-            ),
-        })
+        Ok(FileHandle::from_typed::<Self>(file.into_typed::<Self>()))
     }
 
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
@@ -255,9 +253,23 @@ impl super::backend::Backend for TarRo {
         }
     }
 
+    fn resolved_status(
+        &self,
+        target: &ResolvedTarget<'_>,
+    ) -> Result<super::FileStatus, super::errors::FileStatusError> {
+        match target {
+            ResolvedTarget::File(h) => self.status(HandleRef::File(
+                &FileHandle::from_typed::<Self>(h.get_typed::<Self>().clone()),
+            )),
+            ResolvedTarget::Dir(h) => self.status(HandleRef::Dir(&DirHandle::from_typed::<Self>(
+                h.get_typed::<Self>().clone(),
+            ))),
+        }
+    }
+
     fn create_file_at(
         &self,
-        _dir: DirHandle,
+        _dir: ResolvedDir<'_>,
         _name: &str,
         _metadata: CreationMetadata,
     ) -> Result<FileHandle, OpenError> {
@@ -266,14 +278,14 @@ impl super::backend::Backend for TarRo {
 
     fn mkdir_at(
         &self,
-        _dir: DirHandle,
+        _dir: ResolvedDir<'_>,
         _name: &str,
         _metadata: CreationMetadata,
     ) -> Result<DirHandle, MkdirError> {
         Err(MkdirError::ReadOnlyFileSystem)
     }
 
-    fn unlink_at(&self, dir: DirHandle, name: &str) -> Result<(), UnlinkError> {
+    fn unlink_at(&self, dir: ResolvedDir<'_>, name: &str) -> Result<(), UnlinkError> {
         let dir = dir.into_typed::<Self>();
         match self.tar_index.dirs[dir.idx].children.get(name) {
             Some(IndexedChild::Dir(_)) => Err(UnlinkError::IsADirectory),
@@ -282,7 +294,7 @@ impl super::backend::Backend for TarRo {
         }
     }
 
-    fn rmdir_at(&self, dir: DirHandle, name: &str) -> Result<(), RmdirError> {
+    fn rmdir_at(&self, dir: ResolvedDir<'_>, name: &str) -> Result<(), RmdirError> {
         let dir = dir.into_typed::<Self>();
         match self.tar_index.dirs[dir.idx].children.get(name) {
             Some(IndexedChild::Dir(_)) => Err(RmdirError::ReadOnlyFileSystem),
@@ -291,13 +303,13 @@ impl super::backend::Backend for TarRo {
         }
     }
 
-    fn chmod(&self, _h: HandleRef<'_>, _mode: Mode) -> Result<(), ChmodError> {
+    fn chmod(&self, _h: ResolvedTarget<'_>, _mode: Mode) -> Result<(), ChmodError> {
         Err(ChmodError::ReadOnlyFileSystem)
     }
 
     fn chown(
         &self,
-        _h: HandleRef<'_>,
+        _h: ResolvedTarget<'_>,
         _user: Option<u16>,
         _group: Option<u16>,
     ) -> Result<(), ChownError> {

@@ -2102,6 +2102,67 @@ mod overlay {
     }
 
     #[test]
+    fn nested_overlay_resolution_and_mutation_do_not_deadlock() {
+        use crate::fs::inode_allocator::InodeAllocator;
+        use crate::fs::overlay::Overlay;
+        use crate::fs::resolver::Resolver;
+        use crate::fs::tar_ro::{EMPTY_TAR_FILE, TarRo};
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let litebox = LiteBox::new(MockPlatform::new());
+            let lower = Overlay::new(
+                &litebox,
+                upper([]),
+                TarRo::new(TEST_TAR_FILE.into(), InodeAllocator::standalone()),
+                InodeAllocator::standalone(),
+            );
+            let nested_upper = Overlay::new(
+                &litebox,
+                upper([]),
+                TarRo::new(EMPTY_TAR_FILE.into(), InodeAllocator::standalone()),
+                InodeAllocator::standalone(),
+            );
+            let fs = Resolver::new(
+                &litebox,
+                Overlay::new(&litebox, nested_upper, lower, InodeAllocator::standalone()),
+            );
+            let context = crate::fs::resolver::Context::new();
+            assert_eq!(fs.file_status(&context, "/bar/baz").unwrap().size, 13);
+            fs.chmod(&context, "/bar/baz", Mode::RUSR | Mode::WUSR)
+                .unwrap();
+            fs.chown(&context, "/bar", Some(1000), Some(1000)).unwrap();
+            let fd = fs
+                .open(
+                    &context,
+                    "/bar/baz",
+                    OFlags::WRONLY | OFlags::TRUNC,
+                    Mode::empty(),
+                )
+                .unwrap();
+            fs.close(&fd).unwrap();
+            let fd = fs
+                .open(
+                    &context,
+                    "/bar/new",
+                    OFlags::CREAT | OFlags::WRONLY,
+                    Mode::RUSR | Mode::WUSR,
+                )
+                .unwrap();
+            fs.close(&fd).unwrap();
+            fs.unlink(&context, "/bar/new").unwrap();
+            fs.mkdir(&context, "/bar/sub", ALL_PERMS).unwrap();
+            fs.rmdir(&context, "/bar/sub").unwrap();
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("nested overlay operation failed or deadlocked");
+    }
+
+    #[test]
     fn copy_up_does_not_deadlock() {
         use std::sync::mpsc;
         use std::thread;
