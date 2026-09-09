@@ -9,8 +9,6 @@
 
 #![cfg(all(target_os = "windows", target_arch = "x86_64"))]
 
-mod common;
-
 #[expect(
     unused,
     reason = "This code snippet is just used to illustrate the source code of the `hello_exec_nolibc` test."
@@ -156,25 +154,21 @@ fn test_static_linked_prog_with_rewriter() {
     test_dir.push("tests/test-bins");
 
     let prog_name = "hello_world_static";
-    let prog_name_hooked = format!("{prog_name}.hooked");
     let path = test_dir.join(prog_name);
     let executable_data =
         litebox_syscall_rewriter::rewrite_binary(&std::fs::read(path).unwrap(), None).unwrap();
 
-    let executable_path = format!("/{prog_name_hooked}");
-
-    let mut launcher = common::TestLauncher::init_platform(&[], &[], &[]);
-    launcher.install_file(executable_data, &executable_path);
-    launcher.test_load_exec_common(&executable_path);
+    let (broker, runner) = build_windows_broker();
+    run_prog_with_windows_broker(&broker, &runner, prog_name, &[], Some(&executable_data));
 }
 
 #[test]
 fn test_programs_with_windows_broker() {
     let (broker, runner) = build_windows_broker();
-    run_prog_with_windows_broker(&broker, &runner, "hello_world_static", &[]);
-    run_prog_with_windows_broker(&broker, &runner, "pipe_broker", &[]);
-    run_prog_with_windows_broker(&broker, &runner, "hello_world_dyn", &DYNAMIC_LIBS);
-    run_prog_with_windows_broker(&broker, &runner, "hello_thread", &DYNAMIC_LIBS);
+    run_prog_with_windows_broker(&broker, &runner, "hello_world_static", &[], None);
+    run_prog_with_windows_broker(&broker, &runner, "pipe_broker", &[], None);
+    run_prog_with_windows_broker(&broker, &runner, "hello_world_dyn", &DYNAMIC_LIBS, None);
+    run_prog_with_windows_broker(&broker, &runner, "hello_thread", &DYNAMIC_LIBS, None);
 }
 
 const DYNAMIC_LIBS: [(&str, &str); 2] = [
@@ -219,13 +213,23 @@ fn run_prog_with_windows_broker(
     runner: &std::path::Path,
     exec_name: &str,
     libs: &[(&str, &str)],
+    pre_rewritten_exec: Option<&[u8]>,
 ) {
     let test_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/test-bins");
-    let tar_path =
-        std::path::Path::new(env!("OUT_DIR")).join(format!("broker_{exec_name}_rootfs.tar"));
+    let variant = if pre_rewritten_exec.is_some() {
+        "_pre_rewritten"
+    } else {
+        ""
+    };
+    let tar_path = std::path::Path::new(env!("OUT_DIR"))
+        .join(format!("broker_{exec_name}{variant}_rootfs.tar"));
     let mut tar = tar::Builder::new(std::fs::File::create(&tar_path).unwrap());
     let exec_path = format!("bin/{exec_name}.hooked");
-    append_rewritten_file(&mut tar, &test_dir.join(exec_name), &exec_path);
+    if let Some(executable) = pre_rewritten_exec {
+        append_file(&mut tar, executable, &exec_path);
+    } else {
+        append_rewritten_file(&mut tar, &test_dir.join(exec_name), &exec_path);
+    }
     for (file, prefix) in libs {
         append_rewritten_file(
             &mut tar,
@@ -261,15 +265,19 @@ fn append_rewritten_file(
 ) {
     let rewritten =
         litebox_syscall_rewriter::rewrite_binary(&std::fs::read(source).unwrap(), None).unwrap();
+    append_file(tar, &rewritten, archive_path);
+}
+
+fn append_file(tar: &mut tar::Builder<std::fs::File>, contents: &[u8], archive_path: &str) {
     let mut header = tar::Header::new_ustar();
-    header.set_size(rewritten.len() as u64);
+    header.set_size(contents.len() as u64);
     header.set_mode(0o755);
     header.set_uid(0);
     header.set_gid(0);
     header.set_mtime(0);
     header.set_entry_type(tar::EntryType::Regular);
     header.set_cksum();
-    tar.append_data(&mut header, archive_path, rewritten.as_slice())
+    tar.append_data(&mut header, archive_path, contents)
         .unwrap();
 }
 
@@ -344,11 +352,6 @@ fn run_dynamic_linked_prog_with_rewriter(
     tar.finish().unwrap();
     println!("Tar file created at: {}", tar_target_file.to_str().unwrap());
 
-    let binary_path = std::env::var("NEXTEST_BIN_EXE_litebox_runner_linux_on_windows_userland")
-        .unwrap_or_else(|_| {
-            env!("CARGO_BIN_EXE_litebox_runner_linux_on_windows_userland").to_string()
-        });
-
     // The program path refers to the tar-internal path.
     let prog_tar_path = format!("/bin/{prog_name_hooked}");
 
@@ -364,9 +367,9 @@ fn run_dynamic_linked_prog_with_rewriter(
     ];
     args.push(&prog_tar_path);
     args.extend_from_slice(cmd_args);
-
-    let mut command = std::process::Command::new(&binary_path);
-    command.args(&args);
+    let (broker, runner) = build_windows_broker();
+    let mut command = std::process::Command::new(broker);
+    command.arg("--runner").arg(runner).args(&args);
     println!("Running `{command:?}`");
     let status = command
         .status()

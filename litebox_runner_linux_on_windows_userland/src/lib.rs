@@ -7,7 +7,7 @@
 
 extern crate alloc;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context as _, Result};
 use clap::Parser;
 use litebox_broker_local_userland as broker;
 use litebox_platform_windows_userland::WindowsUserland as Platform;
@@ -49,8 +49,9 @@ pub struct CliArgs {
     ///
     /// All ELF binaries should be pre-rewritten with the syscall rewriter
     /// (e.g., via `litebox-packager`).
+    /// This may be omitted when the broker was configured with `--fs-initial-files`.
     #[arg(long = "initial-files", value_name = "PATH_TO_TAR", value_hint = clap::ValueHint::FilePath)]
-    pub initial_files: PathBuf,
+    pub initial_files: Option<PathBuf>,
 }
 
 /// Run Linux programs with LiteBox on unmodified Windows
@@ -71,53 +72,25 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         )
         .init();
 
-    let tar_file = &cli_args.initial_files;
-    if tar_file.extension().and_then(|x| x.to_str()) != Some("tar") {
-        anyhow::bail!("Expected a .tar file, found {}", tar_file.display());
-    }
-    let tar_data = std::fs::read(tar_file)
-        .map_err(|e| anyhow!("Could not read tar file at {}: {}", tar_file.display(), e))?;
-
     let platform = Platform::new();
-    let broker_connection = cli_args
+    let control_pipe = cli_args
         .broker_control_channel
         .as_deref()
-        .map(broker::connect)
-        .transpose()?;
-    let shim_builder = if let Some(broker_connection) = broker_connection {
-        let broker::BrokerConnection {
-            local,
-            notifications,
-        } = broker_connection;
-        let litebox = litebox::LiteBox::new_with_broker_local(platform, local);
-        broker::start_notification_receiver(
-            notifications,
-            litebox.broker_notification_dispatcher(),
-            litebox.broker_failure_dispatcher(),
-        )?;
-        litebox_shim_linux::LinuxShimBuilder::new_with_litebox(platform, litebox)
-    } else {
-        litebox_shim_linux::LinuxShimBuilder::new(platform)
-    };
+        .context("file operations require --broker-control-channel")?;
+    let broker::BrokerConnection {
+        local,
+        notifications,
+    } = broker::connect(control_pipe)?;
+    let litebox = litebox::LiteBox::new_with_broker_local(platform, local);
+    broker::start_notification_receiver(
+        notifications,
+        litebox.broker_notification_dispatcher(),
+        litebox.broker_failure_dispatcher(),
+    )?;
+    let shim_builder = litebox_shim_linux::LinuxShimBuilder::new_with_litebox(platform, litebox);
 
     // The program path is a Unix-style path inside the tar archive.
     let prog_path = &cli_args.program_and_arguments[0];
-
-    let initial_file_system = {
-        let in_mem = litebox::fs::in_mem::InMem::new_initialized([(
-            "/tmp",
-            litebox::fs::in_mem::InitialNode::Directory {
-                mode: litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
-                owner: litebox::fs::UserInfo {
-                    user: 1000,
-                    group: 1000,
-                },
-            },
-        )]);
-
-        shim_builder.default_fs(in_mem, tar_data.into())
-    };
-    let initial_file_system = std::sync::Arc::new(initial_file_system);
 
     let shim = shim_builder.build();
     let argv = cli_args
@@ -142,13 +115,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     };
 
     let program = shim
-        .load_program(
-            initial_file_system,
-            platform.init_task(),
-            prog_path,
-            argv,
-            envp,
-        )
+        .load_program(platform.init_task(), prog_path, argv, envp)
         .unwrap();
     unsafe {
         litebox_platform_windows_userland::run_thread(

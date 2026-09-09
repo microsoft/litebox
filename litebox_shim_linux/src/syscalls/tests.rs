@@ -1,35 +1,32 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+//! Shared fixtures and cross-cutting unit tests for the Linux shim.
+//!
+//! Tasks here run against the in-process broker fixtures in [`crate::syscalls::test_broker`], so
+//! the shim's unit tests exercise guest and shim code rather than broker authority. Filesystem
+//! resolution and backend semantics belong to `litebox_broker_core` and are tested there; what the
+//! shim owns, and what these tests cover, is the translation between the Linux ABI and the broker
+//! protocol.
+
+use alloc::sync::Arc;
+use alloc::vec;
+use alloc::vec::Vec;
 use litebox::fs::{Mode, OFlags};
-use litebox_broker_core::{
-    AssociationCancellation, BrokerCore, BrokerError, BrokerSession, CallerCredential,
-    ObjectRights, PolicyEngine, SessionId,
-    random::{RandomProvider, RandomProviderError},
-    readiness::ReadinessRegistration,
-    socket::{PlatformSocket, SocketProvider},
-    stdio::{StdioProvider, StdioProviderError},
+use litebox_broker_protocol::ObjectHandle;
+use litebox_broker_protocol::fs::WriteFileResponse;
+use litebox_broker_protocol::fs::{
+    FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileNodeInfo, FileOpenFlags, FileType,
+    FileUser, MAX_FILE_TRANSFER_SIZE, encode_directory_entries_chunk,
 };
-use litebox_broker_local::BrokerLocal;
-use litebox_broker_protocol::{
-    BROKER_PROTOCOL_VERSION,
-    message::{
-        BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerOperation, BrokerRequest,
-        BrokerResponse, BrokerResult, PipeRequest, PipeResponse, StdioRequest, StdioResponse,
-    },
-    pipe::{CreatePipeResponse, ReadPipeResponse, WritePipeResponse},
-    shared_buffer::{SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE},
-    socket::CreateSocketRequest,
-    stdio::{IsTerminalStdioResponse, StdioOutputStream, StdioStream},
-};
-use litebox_broker_transport::{
-    channel::{LocalCallChannel, LocalSetupChannel},
-    shared_memory::{SharedBufferPool, SharedMemory, SharedMemoryError},
-};
-use litebox_common_linux::{AtFlags, EfdFlags, FcntlArg, FileDescriptorFlags, errno::Errno};
+use litebox_broker_protocol::message::FileResponse;
+use litebox_common_linux::{AtFlags, DirentType, FcntlArg, FileDescriptorFlags, errno::Errno};
 use zerocopy::FromBytes as _;
 
 use crate::UserPtrMut;
+use crate::syscalls::test_broker::{
+    FileCall, Scripted, ScriptedFiles, closed, failed, opened, path_status,
+};
 
 use litebox::shim::{Exception, ExceptionInfo};
 use litebox_common_linux::PtRegs;
@@ -39,7 +36,11 @@ use litebox_common_linux::signal::{ILL_ILLOPN, SI_KERNEL, SiginfoData, Signal};
 
 extern crate std;
 
-const TEST_TAR_FILE: &[u8] = include_bytes!("../../../litebox/src/fs/test.tar");
+/// The handle the scripted fixture hands out for a file a test opens.
+pub(crate) const FILE_HANDLE: ObjectHandle = ObjectHandle(0x1000);
+
+/// The user every test task acts as.
+pub(crate) const ROOT: FileUser = FileUser { user: 0, group: 0 };
 
 /// The concrete platform used by the shim's unit tests.
 ///
@@ -57,272 +58,50 @@ pub(crate) fn test_platform() -> &'static TestPlatform {
     PLATFORM.get_or_init(TestPlatform::new)
 }
 
-fn test_broker() -> &'static BrokerCore {
-    static BROKER: std::sync::OnceLock<BrokerCore> = std::sync::OnceLock::new();
-    BROKER.get_or_init(|| {
-        BrokerCore::new(
-            PolicyEngine::with_unauthenticated_rights(ObjectRights::all()),
-            alloc::sync::Arc::new(PipeOnlySocketProvider),
-            alloc::sync::Arc::new(UnusedRandomProvider),
-            alloc::sync::Arc::new(TestStdioProvider),
-            alloc::sync::Arc::new(litebox_broker_core::fs::UnsupportedFileService),
-        )
-        .unwrap()
-    })
-}
-
-struct TestStdioProvider;
-
-impl StdioProvider for TestStdioProvider {
-    fn read(
-        &self,
-        _cancellation: &AssociationCancellation,
-        _output: &mut [u8],
-    ) -> core::result::Result<usize, StdioProviderError> {
-        Err(StdioProviderError::Unsupported)
-    }
-
-    fn write(
-        &self,
-        _cancellation: &AssociationCancellation,
-        _stream: StdioOutputStream,
-        _input: &[u8],
-    ) -> core::result::Result<usize, StdioProviderError> {
-        Err(StdioProviderError::Unsupported)
-    }
-
-    fn is_terminal(&self, stream: StdioStream) -> core::result::Result<bool, StdioProviderError> {
-        Ok(stream == StdioStream::Stdout)
-    }
-}
-
+/// Returns a task whose broker only serves the standard streams used during construction.
 #[must_use]
 pub(crate) fn init_platform() -> crate::Task<TestPlatform> {
-    let platform = test_platform();
-
-    init_platform_with_builder(crate::LinuxShimBuilder::new(platform))
+    init_platform_with_files(ScriptedFiles::new([]))
 }
 
+/// Returns a task whose broker answers file requests with `files`.
 #[must_use]
-pub(crate) fn init_platform_with_broker() -> crate::Task<TestPlatform> {
+fn init_platform_with_files(files: Arc<ScriptedFiles>) -> crate::Task<TestPlatform> {
     let platform = test_platform();
-    let setup = TestBrokerSetup::new();
-    let (broker_local, ()) = BrokerLocal::negotiate(setup, |setup| {
-        let memory: alloc::sync::Arc<dyn SharedMemory> = setup.memory.clone();
-        Ok((setup.activate(), memory, ()))
-    })
-    .unwrap();
-    let litebox = litebox::LiteBox::new_with_broker_local(platform, broker_local);
-    init_platform_with_builder(crate::LinuxShimBuilder::new_with_litebox(platform, litebox))
+    let litebox = litebox::LiteBox::new_with_broker_local(
+        platform,
+        crate::syscalls::test_broker::negotiate(files),
+    );
+    let shim_builder = crate::LinuxShimBuilder::new_with_litebox(platform, litebox);
+    shim_builder.build().0.new_test_task()
 }
 
-fn init_platform_with_builder(
-    shim_builder: crate::LinuxShimBuilder<TestPlatform>,
-) -> crate::Task<TestPlatform> {
-    let in_mem = litebox::fs::in_mem::InMem::new_initialized([(
-        "/",
-        litebox::fs::in_mem::InitialNode::Directory {
-            mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
-            owner: litebox::fs::UserInfo::ROOT,
-        },
-    )]);
-    let fs = alloc::sync::Arc::new(shim_builder.default_fs(in_mem, TEST_TAR_FILE.into()));
-    shim_builder.build().0.new_test_task(fs)
+/// Returns a task and the scripted file fixture that answers its file requests.
+#[must_use]
+pub(crate) fn scripted_task(
+    script: impl IntoIterator<Item = Scripted>,
+) -> (Arc<ScriptedFiles>, crate::Task<TestPlatform>) {
+    let files = ScriptedFiles::new(script);
+    let task = init_platform_with_files(Arc::clone(&files));
+    (files, task)
 }
 
-struct TestBrokerSetup {
-    memory: alloc::sync::Arc<TestSharedMemory>,
-    session: BrokerSession,
-}
-
-impl TestBrokerSetup {
-    fn new() -> Self {
-        Self {
-            memory: alloc::sync::Arc::new(TestSharedMemory::new()),
-            session: test_broker()
-                .create_session(CallerCredential::Unauthenticated)
-                .unwrap(),
-        }
-    }
-
-    fn activate(self) -> TestBrokerChannel {
-        let shared_buffers = SharedBufferPool::new(self.memory, SHARED_BUFFER_LAYOUT).unwrap();
-        TestBrokerChannel {
-            session: self.session,
-            shared_buffers,
-        }
+/// Builds one scripted directory entry.
+pub(crate) fn directory_entry(name: &str, file_type: FileType, ino: u64) -> FileDirectoryEntry {
+    FileDirectoryEntry {
+        name: alloc::string::String::from(name),
+        file_type,
+        node_info: Some(FileNodeInfo {
+            dev: 1,
+            ino,
+            rdev: None,
+        }),
     }
 }
 
-impl LocalSetupChannel for TestBrokerSetup {
-    type Error = core::convert::Infallible;
-
-    fn send_handshake_request(
-        &mut self,
-        request: &BrokerHandshakeRequest,
-    ) -> core::result::Result<(), Self::Error> {
-        assert_eq!(request.protocol_version, BROKER_PROTOCOL_VERSION);
-        Ok(())
-    }
-
-    fn recv_handshake_response(
-        &mut self,
-    ) -> core::result::Result<Option<BrokerHandshakeResponse>, Self::Error> {
-        Ok(Some(BrokerHandshakeResponse::Negotiated {
-            broker_protocol_version: BROKER_PROTOCOL_VERSION,
-        }))
-    }
-}
-
-struct TestBrokerChannel {
-    session: BrokerSession,
-    shared_buffers: SharedBufferPool<alloc::sync::Arc<TestSharedMemory>>,
-}
-
-impl TestBrokerChannel {
-    fn execute(&self, operation: BrokerOperation) -> litebox_broker_core::Result<BrokerResult> {
-        match operation {
-            BrokerOperation::CloseObject(handle) => self
-                .session
-                .close_object_reference(handle)
-                .map(|()| BrokerResult::ObjectClosed),
-            BrokerOperation::CheckReadiness(handle) => self
-                .session
-                .check_readiness(handle)
-                .map(BrokerResult::Readiness),
-            BrokerOperation::Pipe(PipeRequest::Create(request)) => {
-                litebox_broker_core::pipe::create(
-                    &self.session,
-                    request.capacity,
-                    request.atomic_write_size,
-                )
-                .map(|(read_handle, write_handle)| {
-                    BrokerResult::Pipe(PipeResponse::Create(CreatePipeResponse {
-                        read_handle,
-                        write_handle,
-                    }))
-                })
-            }
-            BrokerOperation::Pipe(PipeRequest::Read(request)) => {
-                let data = litebox_broker_core::pipe::read(
-                    &self.session,
-                    request.handle,
-                    request.buffer.length,
-                )?;
-                self.shared_buffers
-                    .write(request.buffer.slot_index, &data)
-                    .expect("pipe broker read must use a valid shared buffer");
-                Ok(BrokerResult::Pipe(PipeResponse::Read(ReadPipeResponse {
-                    read: u32::try_from(data.len()).unwrap(),
-                })))
-            }
-            BrokerOperation::Pipe(PipeRequest::Write(request)) => {
-                let mut data = std::vec![0; request.buffer.length as usize];
-                self.shared_buffers
-                    .read(request.buffer.slot_index, &mut data)
-                    .expect("pipe broker write must use a valid shared buffer");
-                litebox_broker_core::pipe::write(&self.session, request.handle, &data).map(
-                    |written| {
-                        BrokerResult::Pipe(PipeResponse::Write(WritePipeResponse {
-                            written: u32::try_from(written).unwrap(),
-                        }))
-                    },
-                )
-            }
-            BrokerOperation::Stdio(StdioRequest::IsTerminal(request)) => {
-                litebox_broker_core::stdio::is_terminal(&self.session, request.stream).map(
-                    |is_terminal| {
-                        BrokerResult::Stdio(StdioResponse::IsTerminal(IsTerminalStdioResponse {
-                            is_terminal,
-                        }))
-                    },
-                )
-            }
-            operation => panic!("unexpected pipe test broker operation: {operation:?}"),
-        }
-    }
-}
-
-impl LocalCallChannel for TestBrokerChannel {
-    type Error = core::convert::Infallible;
-
-    fn call(&self, request: BrokerRequest) -> core::result::Result<BrokerResponse, Self::Error> {
-        let result = self
-            .execute(request.operation)
-            .unwrap_or_else(|error| BrokerResult::Error(error.into()));
-        Ok(BrokerResponse {
-            request_id: request.request_id,
-            result,
-        })
-    }
-}
-
-struct TestSharedMemory(std::sync::Mutex<std::vec::Vec<u8>>);
-
-impl TestSharedMemory {
-    fn new() -> Self {
-        Self(std::sync::Mutex::new(std::vec![
-            0;
-            SHARED_BUFFER_POOL_SIZE
-        ]))
-    }
-}
-
-impl SharedMemory for TestSharedMemory {
-    fn len(&self) -> usize {
-        SHARED_BUFFER_POOL_SIZE
-    }
-
-    fn read(
-        &self,
-        offset: usize,
-        destination: &mut [u8],
-    ) -> core::result::Result<(), SharedMemoryError> {
-        let memory = self.0.lock().unwrap();
-        let end = offset
-            .checked_add(destination.len())
-            .ok_or(SharedMemoryError::InvalidRange)?;
-        let source = memory
-            .get(offset..end)
-            .ok_or(SharedMemoryError::InvalidRange)?;
-        destination.copy_from_slice(source);
-        Ok(())
-    }
-
-    fn write(&self, offset: usize, source: &[u8]) -> core::result::Result<(), SharedMemoryError> {
-        let mut memory = self.0.lock().unwrap();
-        let end = offset
-            .checked_add(source.len())
-            .ok_or(SharedMemoryError::InvalidRange)?;
-        let destination = memory
-            .get_mut(offset..end)
-            .ok_or(SharedMemoryError::InvalidRange)?;
-        destination.copy_from_slice(source);
-        Ok(())
-    }
-}
-
-struct PipeOnlySocketProvider;
-
-impl SocketProvider for PipeOnlySocketProvider {
-    fn create(
-        &self,
-        _session_id: SessionId,
-        _request: CreateSocketRequest,
-        _readiness: ReadinessRegistration,
-    ) -> litebox_broker_core::Result<alloc::sync::Arc<dyn PlatformSocket>> {
-        Err(BrokerError::UnsupportedOperation)
-    }
-
-    fn close_session(&self, _session_id: SessionId) {}
-}
-
-struct UnusedRandomProvider;
-
-impl RandomProvider for UnusedRandomProvider {
-    fn fill(&self, _output: &mut [u8]) -> core::result::Result<(), RandomProviderError> {
-        Err(RandomProviderError)
-    }
+/// Builds the protocol mode a request is expected to carry.
+pub(crate) fn mode(bits: u16) -> FileMode {
+    FileMode::from_bits(bits).expect("test modes must be supported")
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -416,7 +195,7 @@ fn exceptions_queue_their_corresponding_signals() {
 
 #[test]
 fn test_fcntl() {
-    let task = init_platform_with_broker();
+    let task = init_platform();
 
     let check = |fd: i32, flags1: OFlags, flags2: OFlags| {
         assert_eq!(
@@ -444,16 +223,6 @@ fn test_fcntl() {
     let write_fd = i32::try_from(write_fd).unwrap();
     check(write_fd, OFlags::WRONLY | OFlags::NONBLOCK, OFlags::WRONLY);
 
-    // Eventfd requires broker control in this shim configuration.
-    let brokerless_task = init_platform();
-    assert_eq!(
-        brokerless_task.sys_eventfd2(
-            0,
-            EfdFlags::CLOEXEC | EfdFlags::SEMAPHORE | EfdFlags::NONBLOCK,
-        ),
-        Err(Errno::EIO)
-    );
-
     // Test fcntl with DUPFD
     let fd = task
         .sys_open("/dev/stdin", OFlags::RDONLY, Mode::empty())
@@ -476,15 +245,8 @@ fn test_fcntl() {
 }
 
 #[test]
-fn test_pipe2_requires_broker() {
-    let task = init_platform();
-
-    assert_eq!(task.sys_pipe2(OFlags::empty()), Err(Errno::EIO));
-}
-
-#[test]
 fn test_pipe2_race_with_concurrent_close() {
-    let task = init_platform_with_broker();
+    let task = init_platform();
     task.files.borrow().set_max_fd(4);
 
     let stop = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
@@ -537,342 +299,431 @@ fn test_dup() {
     assert_eq!(fd2 + 10, fd4);
 }
 
-// Note the test was generated by copilot with minor fixes.
+/// Parses the `linux_dirent64` entries the shim wrote, as `(name, type, inode, offset)`.
+fn parse_dirents(buffer: &[u8]) -> Vec<(alloc::string::String, u8, u64, u64)> {
+    let mut entries = Vec::new();
+    let mut offset = 0;
+    while offset < buffer.len() {
+        let (dirent, _) =
+            litebox_common_linux::LinuxDirent64::read_from_prefix(&buffer[offset..]).unwrap();
+        assert!(dirent.len > 0, "directory entry length must be positive");
+        assert!(
+            offset + dirent.len as usize <= buffer.len(),
+            "an entry must not exceed the reported bytes"
+        );
+        let name_bytes = {
+            let start = offset + core::mem::offset_of!(litebox_common_linux::LinuxDirent64, __name);
+            &buffer[start..offset + dirent.len as usize]
+        };
+        let name_len = name_bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(name_bytes.len());
+        let name = core::str::from_utf8(&name_bytes[..name_len]).expect("names must be UTF-8");
+        entries.push((
+            alloc::string::String::from(name),
+            dirent.typ,
+            dirent.ino,
+            dirent.off,
+        ));
+        offset += dirent.len as usize;
+    }
+    entries
+}
+
+/// Opens a directory over the scripted fixture and returns its descriptor.
+fn scripted_dir_fd(files: &ScriptedFiles, task: &crate::Task<TestPlatform>, path: &str) -> i32 {
+    files.script([opened(FILE_HANDLE)]);
+    let fd = task
+        .sys_open(path, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+        .expect("the scripted open must succeed");
+    let _ = files.take_calls();
+    i32::try_from(fd).unwrap()
+}
+
+fn close_scripted_file(
+    files: &ScriptedFiles,
+    task: &crate::Task<TestPlatform>,
+    fd: i32,
+    handle: ObjectHandle,
+) {
+    files.script([closed()]);
+    task.sys_close(fd).expect("the scripted close must succeed");
+    assert!(
+        matches!(files.take_calls().last(), Some(FileCall::Close(actual)) if *actual == handle),
+        "closing the guest fd must close its broker handle"
+    );
+}
+
+fn directory_pages(entries: &[FileDirectoryEntry], maximum_length: usize) -> Vec<Scripted> {
+    let mut pages = Vec::new();
+    let mut start_index = 0;
+    loop {
+        let (payload, next_index) = encode_directory_entries_chunk(
+            entries,
+            start_index,
+            maximum_length.min(MAX_FILE_TRANSFER_SIZE as usize),
+        )
+        .expect("scripted directory entries must encode");
+        pages.push(Scripted::Directory {
+            payload,
+            next_index,
+        });
+        let Some(next_index) = next_index else {
+            return pages;
+        };
+        start_index = usize::try_from(next_index).unwrap();
+    }
+}
+
 #[test]
-fn test_getdent64() {
-    let task = init_platform();
+fn getdirent64_encodes_the_entries_the_broker_returns() {
+    let entries = vec![
+        directory_entry(".", FileType::Directory, 1),
+        directory_entry("..", FileType::Directory, 1),
+        directory_entry("file.txt", FileType::RegularFile, 7),
+        directory_entry("sub", FileType::Directory, 9),
+    ];
+    let (files, task) = scripted_task([]);
+    let dir_fd = scripted_dir_fd(&files, &task, "/dir");
 
-    // Create test files in root directory for testing
-    let file1_fd = task
-        .sys_open(
-            "/test_file1.txt",
-            OFlags::CREAT | OFlags::WRONLY,
-            Mode::RUSR | Mode::WUSR,
-        )
-        .expect("Failed to create test_file1.txt");
-    task.sys_close(file1_fd.try_into().unwrap())
-        .expect("Failed to close test_file1.txt");
-
-    let file2_fd = task
-        .sys_open(
-            "/test_file2.txt",
-            OFlags::CREAT | OFlags::WRONLY,
-            Mode::RUSR | Mode::WUSR,
-        )
-        .expect("Failed to create test_file2.txt");
-    task.sys_close(file2_fd.try_into().unwrap())
-        .expect("Failed to close test_file2.txt");
-
-    // Open the root directory for testing
-    let dir_fd = task
-        .sys_open("/", OFlags::RDONLY, Mode::empty())
-        .expect("Failed to open root directory");
-    let dir_fd = dir_fd.try_into().unwrap();
-
-    // Test 1: Basic functionality - read directory entries
-    let mut buffer = alloc::vec![0u8; 4096];
-    let bytes_read = task
+    files.script(directory_pages(&entries, usize::MAX));
+    let mut buffer = vec![0u8; 4096];
+    let read = task
         .sys_getdirent64(
             dir_fd,
             UserPtrMut::from_usize(buffer.as_mut_ptr() as usize),
             buffer.len(),
         )
-        .expect("Failed to read directory entries");
+        .expect("the directory read must succeed");
 
-    assert!(bytes_read > 0, "Should have read some directory entries");
-    assert!(
-        bytes_read <= buffer.len(),
-        "Should not read more than buffer size"
-    );
-
-    // Parse the returned entries to verify they are correct
-    let mut offset = 0;
-    let mut found_entries = alloc::vec::Vec::new();
-
-    while offset < bytes_read {
-        let (dirent, _) =
-            litebox_common_linux::LinuxDirent64::read_from_prefix(&buffer[offset..]).unwrap();
-
-        // Validate the entry length
-        assert!(dirent.len > 0, "Directory entry length must be positive");
-        assert!(
-            offset + dirent.len as usize <= bytes_read,
-            "Entry should not exceed buffer"
-        );
-
-        let name_bytes = {
-            let start = offset + core::mem::offset_of!(litebox_common_linux::LinuxDirent64, __name);
-            let end = offset + dirent.len as usize;
-            &buffer[start..end]
-        };
-
-        // Find the null terminator
-        let null_pos = name_bytes
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(name_bytes.len());
-        let name =
-            core::str::from_utf8(&name_bytes[..null_pos]).expect("Invalid UTF-8 in filename");
-
-        found_entries.push((alloc::string::String::from(name), dirent.typ, dirent.ino));
-        offset += dirent.len as usize;
-    }
-
-    assert!(
-        !found_entries.is_empty(),
-        "Should find at least some directory entries"
-    );
-
-    // Check that our test files appear in the directory listing
-    let mut entry_names: alloc::vec::Vec<alloc::string::String> = found_entries
-        .iter()
-        .map(|(name, _, _)| name.clone())
-        .collect();
-    entry_names.sort();
     assert_eq!(
-        entry_names,
-        alloc::vec![
-            ".",
-            "..",
-            "bar",
-            "dev",
-            "foo",
-            "test_file1.txt",
-            "test_file2.txt"
-        ]
+        files.take_calls(),
+        vec![FileCall::ReadDirectory {
+            handle: FILE_HANDLE,
+            start_index: 0,
+        }]
+    );
+    assert_eq!(
+        parse_dirents(&buffer[..read]),
+        vec![
+            (".".into(), DirentType::Directory as u8, 1, 0),
+            ("..".into(), DirentType::Directory as u8, 1, 1),
+            ("file.txt".into(), DirentType::Regular as u8, 7, 2),
+            ("sub".into(), DirentType::Directory as u8, 9, 3),
+        ],
+        "entries are reported sorted by name, with their broker type and inode"
     );
 
-    // Verify that our test files have the correct type (regular file)
-    for (name, typ, _) in &found_entries {
-        if name == "test_file1.txt" || name == "test_file2.txt" {
-            assert_eq!(
-                *typ,
-                litebox_common_linux::DirentType::Regular as u8,
-                "Test files should have Regular type"
-            );
-        }
-    }
-
+    // A second read resumes after the entries already reported.
+    files.script(directory_pages(&entries, usize::MAX));
     assert_eq!(
         task.sys_getdirent64(
             dir_fd,
             UserPtrMut::from_usize(buffer.as_mut_ptr() as usize),
-            buffer.len()
-        )
-        .expect("Failed to read directory entries"),
-        0,
-        "should have read all entries in the previous call"
+            buffer.len(),
+        ),
+        Ok(0),
+        "the previous call already reported every entry"
     );
-    task.sys_close(dir_fd).expect("Failed to close directory");
-
-    // Test 2: Small buffer (should handle partial reads gracefully)
-    let dir_fd = task
-        .sys_open("/", OFlags::RDONLY, Mode::empty())
-        .expect("Failed to open root directory");
-    let dir_fd = dir_fd.try_into().unwrap();
-    let mut small_buffer = [0u8; 64];
-    let bytes = task
-        .sys_getdirent64(
-            dir_fd,
-            UserPtrMut::from_usize(small_buffer.as_mut_ptr() as usize),
-            small_buffer.len(),
-        )
-        .expect("Failed to read directory entries");
-
-    // Should either succeed with partial data or return 0 if no entry fits
-    assert!(bytes <= small_buffer.len(), "Should not exceed buffer size");
-    // If bytes > 0, verify the structure is valid
-    if bytes > 0 {
-        let (dirent, _) =
-            litebox_common_linux::LinuxDirent64::read_from_prefix(&small_buffer[..bytes]).unwrap();
-        assert!(
-            dirent.len as usize <= bytes,
-            "First entry length should fit in returned bytes"
-        );
-        assert!(dirent.len > 0, "Entry length should be positive");
-    }
-
-    // Test 3: Invalid file descriptor
-    let result = task.sys_getdirent64(
-        -1,
-        UserPtrMut::from_usize(buffer.as_mut_ptr() as usize),
-        buffer.len(),
-    );
-    assert_eq!(
-        result,
-        Err(Errno::EBADF),
-        "Should return EBADF for invalid fd"
-    );
-
-    // Test 4: File descriptor pointing to a regular file (not a directory)
-    let file1_fd = task
-        .sys_open("/test_file1.txt", OFlags::RDONLY, Mode::empty())
-        .expect("Failed to open test_file1.txt");
-    let file1_fd = file1_fd.try_into().unwrap();
-
-    let result = task.sys_getdirent64(
-        file1_fd,
-        UserPtrMut::from_usize(buffer.as_mut_ptr() as usize),
-        buffer.len(),
-    );
-    assert_eq!(
-        result,
-        Err(Errno::ENOTDIR),
-        "Should return ENOTDIR for non-directory fd"
-    );
-    task.sys_close(file1_fd).expect("Failed to close file");
-
-    // Test 5: Zero-length buffer
-    let result = task.sys_getdirent64(
-        dir_fd,
-        UserPtrMut::from_usize(buffer.as_mut_ptr() as usize),
-        0,
-    );
-    assert_eq!(
-        result,
-        Err(Errno::EINVAL),
-        "Should return EINVAL for zero-length buffer"
-    );
-
-    task.sys_close(dir_fd).expect("Failed to close directory");
-
-    // Test 6: Multiple reads (test directory offset tracking)
-    // Reopen directory to reset position
-    let dir_fd2 = task
-        .sys_open("/", OFlags::RDONLY, Mode::empty())
-        .expect("Failed to reopen root directory");
-    let dir_fd2 = dir_fd2.try_into().unwrap();
-
-    // Read entries in smaller chunks to test offset tracking
-    let mut all_entries = alloc::vec::Vec::new();
-
-    loop {
-        let mut chunk_buffer = [0u8; 64];
-        let bytes_read = task
-            .sys_getdirent64(
-                dir_fd2,
-                UserPtrMut::from_usize(chunk_buffer.as_mut_ptr() as usize),
-                chunk_buffer.len(),
-            )
-            .expect("Failed to read directory chunk");
-
-        if bytes_read == 0 {
-            break; // End of directory
-        }
-
-        // Parse entries from this chunk
-        let mut offset = 0;
-        while offset < bytes_read {
-            let (dirent, _) = litebox_common_linux::LinuxDirent64::read_from_prefix(
-                &chunk_buffer[offset..bytes_read],
-            )
-            .unwrap();
-
-            assert!(dirent.len > 0, "Entry length must be positive");
-            assert!(
-                offset + dirent.len as usize <= bytes_read,
-                "Entry should fit in chunk"
-            );
-
-            let name_bytes = {
-                let start =
-                    offset + core::mem::offset_of!(litebox_common_linux::LinuxDirent64, __name);
-                let end = offset + dirent.len as usize;
-                &chunk_buffer[start..end]
-            };
-
-            let null_pos = name_bytes
-                .iter()
-                .position(|&b| b == 0)
-                .unwrap_or(name_bytes.len());
-            let name =
-                core::str::from_utf8(&name_bytes[..null_pos]).expect("Invalid UTF-8 in filename");
-
-            all_entries.push(alloc::string::String::from(name));
-            offset += dirent.len as usize;
-        }
-    }
-
-    // Verify we still got our expected entries through chunked reading
-    all_entries.sort();
-    assert_eq!(
-        all_entries,
-        alloc::vec![
-            ".",
-            "..",
-            "bar",
-            "dev",
-            "foo",
-            "test_file1.txt",
-            "test_file2.txt"
-        ]
-    );
+    close_scripted_file(&files, &task, dir_fd, FILE_HANDLE);
 }
 
 #[test]
-fn test_umask_behavior() {
-    let task = init_platform();
+fn getdirent64_resumes_across_buffers_and_rejects_undersized_ones() {
+    let entries = vec![
+        directory_entry("aaaaaaaaaaaaaaaa", FileType::RegularFile, 1),
+        directory_entry("bbbbbbbbbbbbbbbb", FileType::RegularFile, 2),
+        directory_entry("cccccccccccccccc", FileType::RegularFile, 3),
+    ];
+    let (files, task) = scripted_task([]);
+    let dir_fd = scripted_dir_fd(&files, &task, "/dir");
 
-    // 1. Capture original mask without changing final state.
-    let orig = task.sys_umask(0).bits(); // sets mask to 0, returns previous
-    let _ = task.sys_umask(orig); // restore original
+    let mut names = Vec::new();
+    let mut pages = Vec::new();
+    let mut chunk = [0u8; 48];
+    loop {
+        files.script(directory_pages(&entries, 64));
+        let read = task
+            .sys_getdirent64(
+                dir_fd,
+                UserPtrMut::from_usize(chunk.as_mut_ptr() as usize),
+                chunk.len(),
+            )
+            .expect("chunked directory reads must succeed");
+        pages.extend(files.take_calls());
+        if read == 0 {
+            break;
+        }
+        assert!(read <= chunk.len(), "the shim must respect the buffer size");
+        names.extend(
+            parse_dirents(&chunk[..read])
+                .into_iter()
+                .map(|entry| entry.0),
+        );
+    }
+    assert_eq!(
+        names,
+        vec!["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb", "cccccccccccccccc"]
+    );
+    assert!(
+        pages.iter().any(|call| matches!(
+            call,
+            FileCall::ReadDirectory { start_index, .. } if *start_index > 0
+        )),
+        "the guest must resume from the continuation index the broker reported"
+    );
+    close_scripted_file(&files, &task, dir_fd, FILE_HANDLE);
 
-    // We expect the default (from implementation) to be 0o022.
-    assert_eq!(orig, 0o022, "Default umask should be 022 (got {orig:03o})");
+    // A buffer too small for even one entry is rejected rather than truncating a name.
+    let fresh_fd = scripted_dir_fd(&files, &task, "/dir");
+    files.script(directory_pages(&entries, usize::MAX));
+    let mut tiny = [0u8; 8];
+    assert_eq!(
+        task.sys_getdirent64(
+            fresh_fd,
+            UserPtrMut::from_usize(tiny.as_mut_ptr() as usize),
+            tiny.len(),
+        ),
+        Err(Errno::EINVAL)
+    );
+    close_scripted_file(&files, &task, fresh_fd, FILE_HANDLE);
+}
 
-    // 2. Set a new umask (e.g., 0o077) and verify file creation honors it.
-    let prev = task.sys_umask(0o077).bits();
-    assert_eq!(prev, orig, "Setting umask should return previous value");
+#[test]
+fn getdirent64_translates_descriptor_and_broker_errors() {
+    let (files, task) = scripted_task([]);
+    let mut buffer = [0u8; 256];
 
-    // Create a file with mode 0o666; with umask 0o077 it should become 0o600.
-    let file_mode = Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH; // 0o666
-    let test_file = "/umask_rs_test_file_perm.txt";
+    // An unknown descriptor never reaches the broker.
+    assert_eq!(
+        task.sys_getdirent64(
+            -1,
+            UserPtrMut::from_usize(buffer.as_mut_ptr() as usize),
+            buffer.len(),
+        ),
+        Err(Errno::EBADF)
+    );
+    assert!(files.take_calls().is_empty());
+
+    let dir_fd = scripted_dir_fd(&files, &task, "/dir");
+    files.script([failed(FileError::NotDirectory)]);
+    assert_eq!(
+        task.sys_getdirent64(
+            dir_fd,
+            UserPtrMut::from_usize(buffer.as_mut_ptr() as usize),
+            buffer.len(),
+        ),
+        Err(Errno::ENOTDIR),
+        "a broker not-a-directory failure surfaces as ENOTDIR"
+    );
+
+    // A zero-length buffer cannot hold an entry.
+    let entries = vec![directory_entry("file", FileType::RegularFile, 1)];
+    files.script(directory_pages(&entries, usize::MAX));
+    assert_eq!(
+        task.sys_getdirent64(
+            dir_fd,
+            UserPtrMut::from_usize(buffer.as_mut_ptr() as usize),
+            0
+        ),
+        Err(Errno::EINVAL)
+    );
+    close_scripted_file(&files, &task, dir_fd, FILE_HANDLE);
+}
+
+#[test]
+fn umask_masks_the_creation_mode_sent_to_the_broker() {
+    let (files, task) = scripted_task([]);
+
+    // The default mask is 022, and `umask` returns the previous mask.
+    assert_eq!(task.sys_umask(0o077).bits(), 0o022);
+
+    files.script([opened(FILE_HANDLE)]);
     let fd = task
-        .sys_open(test_file, OFlags::CREAT | OFlags::WRONLY, file_mode)
-        .expect("Failed to create test file with O_CREAT");
-    // Close it (ignore errors)
-    let _ = task.sys_close(i32::try_from(fd).unwrap());
-
-    let stat_file = task.sys_stat(test_file).expect("stat failed on test file");
-    let actual_file_perm = stat_file.st_mode & 0o777;
+        .sys_open(
+            "/masked_file",
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::from_bits_retain(0o666),
+        )
+        .expect("the scripted create must succeed");
     assert_eq!(
-        actual_file_perm, 0o600,
-        "File permission should respect umask (expected 600 got {actual_file_perm:03o})",
+        files.take_calls(),
+        vec![FileCall::Open {
+            path: "/masked_file".into(),
+            user: ROOT,
+            access: FileAccessMode::WriteOnly,
+            flags: FileOpenFlags::CREATE,
+            mode: mode(0o600),
+        }],
+        "the broker is asked to create the file with 0o666 & !0o077"
+    );
+    close_scripted_file(&files, &task, i32::try_from(fd).unwrap(), FILE_HANDLE);
+
+    files.script([Scripted::Reply(FileResponse::Mkdir)]);
+    task.sys_mkdirat(litebox_common_linux::AT_FDCWD, "/masked_dir", 0o777)
+        .expect("the scripted mkdir must succeed");
+    assert_eq!(
+        files.take_calls(),
+        vec![FileCall::Mkdir {
+            path: "/masked_dir".into(),
+            user: ROOT,
+            mode: mode(0o700),
+        }],
+        "the broker is asked to create the directory with 0o777 & !0o077"
     );
 
-    // 3. Create a directory with mode 0o777; with umask 0o077 should become 0o700.
-    let dir_mode = (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits();
-    let test_dir = "/umask_rs_test_dir";
-    task.sys_mkdirat(litebox_common_linux::AT_FDCWD, test_dir, dir_mode)
-        .expect("Failed to create test directory");
+    // Only the low nine bits of a new mask are retained.
+    assert_eq!(task.sys_umask(0o1777).bits(), 0o077);
+    assert_eq!(task.sys_umask(0o022).bits(), 0o777);
+}
 
-    let stat_dir = task
-        .sys_stat(test_dir)
-        .expect("stat failed on test directory");
-    let actual_dir_perm = stat_dir.st_mode & 0o777;
+#[test]
+fn unlinkat_routes_by_flag_and_translates_broker_failures() {
+    let (files, task) = scripted_task([]);
+
+    // AT_REMOVEDIR combined with any other flag is rejected before the broker is asked.
     assert_eq!(
-        actual_dir_perm, 0o700,
-        "Directory permission should respect umask (expected 700 got {actual_dir_perm:03o})",
+        task.sys_unlinkat(
+            litebox_common_linux::AT_FDCWD,
+            "/dir",
+            AtFlags::AT_REMOVEDIR | AtFlags::AT_SYMLINK_NOFOLLOW,
+        ),
+        Err(Errno::EINVAL)
+    );
+    assert!(files.take_calls().is_empty());
+
+    files.script([Scripted::Reply(FileResponse::Unlink)]);
+    task.sys_unlinkat(litebox_common_linux::AT_FDCWD, "/file", AtFlags::empty())
+        .expect("the scripted unlink must succeed");
+    assert_eq!(
+        files.take_calls(),
+        vec![FileCall::Unlink {
+            path: "/file".into(),
+            user: ROOT,
+        }]
     );
 
-    // 4. High bits are ignored: set mask with bits beyond 0o777.
-    // Current mask is 0o077; now set 0o1777 -> stored low 9 bits = 0o777.
-    let prev2 = task.sys_umask(0o1777).bits();
-    assert_eq!(prev2, 0o077, "Returned previous mask should be 077");
-    let prev3 = task.sys_umask(0).bits(); // fetch current (0o777) and set to 0
+    files.script([Scripted::Reply(FileResponse::Rmdir)]);
+    task.sys_unlinkat(
+        litebox_common_linux::AT_FDCWD,
+        "/dir",
+        AtFlags::AT_REMOVEDIR,
+    )
+    .expect("the scripted rmdir must succeed");
     assert_eq!(
-        prev3, 0o777,
-        "Only low 9 bits should be retained (expected 777)"
+        files.take_calls(),
+        vec![FileCall::Rmdir {
+            path: "/dir".into(),
+            user: ROOT,
+        }],
+        "AT_REMOVEDIR is routed to the directory-removal request"
     );
-    // Restore to original
-    let _ = task.sys_umask(orig);
+
+    for (flags, error, errno) in [
+        (AtFlags::empty(), FileError::IsDirectory, Errno::EISDIR),
+        (
+            AtFlags::empty(),
+            FileError::NoSuchFileOrDirectory,
+            Errno::ENOENT,
+        ),
+        (AtFlags::AT_REMOVEDIR, FileError::NotEmpty, Errno::ENOTEMPTY),
+        (
+            AtFlags::AT_REMOVEDIR,
+            FileError::NotDirectory,
+            Errno::ENOTDIR,
+        ),
+    ] {
+        files.script([failed(error)]);
+        assert_eq!(
+            task.sys_unlinkat(litebox_common_linux::AT_FDCWD, "/target", flags),
+            Err(errno),
+            "{error:?} must surface as {errno:?}"
+        );
+        let _ = files.take_calls();
+    }
+}
+
+#[test]
+fn read_and_write_carry_lengths_and_offsets_to_the_broker() {
+    let (files, task) = scripted_task([opened(FILE_HANDLE)]);
+    let fd = i32::try_from(
+        task.sys_open("/data", OFlags::RDWR, Mode::empty())
+            .expect("the scripted open must succeed"),
+    )
+    .unwrap();
+    let _ = files.take_calls();
+
+    // A read without an offset uses the broker-owned file position.
+    files.script([Scripted::Read(b"hello".to_vec())]);
+    let mut buffer = [0u8; 8];
+    assert_eq!(task.sys_read(fd, &mut buffer, None), Ok(5));
+    assert_eq!(
+        &buffer[..5],
+        b"hello",
+        "a short read fills only what arrived"
+    );
+    assert_eq!(
+        files.take_calls(),
+        vec![FileCall::Read {
+            handle: FILE_HANDLE,
+            length: 8,
+            offset: None,
+        }]
+    );
+
+    // `pread` passes its explicit offset through.
+    files.script([Scripted::Read(b"lo".to_vec())]);
+    assert_eq!(task.sys_read(fd, &mut buffer[..2], Some(3)), Ok(2));
+    assert_eq!(
+        files.take_calls(),
+        vec![FileCall::Read {
+            handle: FILE_HANDLE,
+            length: 2,
+            offset: Some(3),
+        }]
+    );
+
+    // `pwrite` stages its bytes and offset for the broker.
+    files.script([Scripted::Reply(FileResponse::Write(WriteFileResponse {
+        written: 3,
+    }))]);
+    assert_eq!(task.sys_write(fd, b"abc", Some(7)), Ok(3));
+    assert_eq!(
+        files.take_calls(),
+        vec![FileCall::Write {
+            handle: FILE_HANDLE,
+            data: b"abc".to_vec(),
+            offset: Some(7),
+        }]
+    );
+    close_scripted_file(&files, &task, fd, FILE_HANDLE);
+}
+
+#[test]
+fn stat_translates_broker_status_and_failures() {
+    let (files, task) = scripted_task([path_status(FileType::RegularFile, 0o640)]);
+
+    let stat = task.sys_stat("/status_file").expect("stat must succeed");
+    assert_eq!(stat.st_mode & 0o777, 0o640);
+    assert_eq!(
+        files.take_calls(),
+        vec![FileCall::PathStatus {
+            path: "/status_file".into(),
+            user: ROOT,
+        }]
+    );
+
+    files.script([failed(FileError::NoSuchFileOrDirectory)]);
+    assert_eq!(task.sys_stat("/missing"), Err(Errno::ENOENT));
+    let _ = files.take_calls();
 }
 
 #[test]
 fn test_rlimit_nofile() {
     use litebox_common_linux::{Rlimit, RlimitResource, errno::Errno};
 
-    let task = crate::syscalls::tests::init_platform();
+    let (files, task) = scripted_task([opened(FILE_HANDLE), closed()]);
 
     // 1. Get the current NOFILE limit.
     let cur_lim = task
@@ -918,91 +769,19 @@ fn test_rlimit_nofile() {
             .expect_err("open should fail due to new cur limit"),
         Errno::EMFILE,
     );
-}
-
-#[test]
-fn test_unlinkat() {
-    let task = init_platform();
-
-    // 1. Create a regular file and unlink it.
-    let file_path = "/unlink_test_file.txt";
-    let fd = task
-        .sys_open(
-            file_path,
-            OFlags::CREAT | OFlags::WRONLY,
-            Mode::RUSR | Mode::WUSR,
-        )
-        .expect("Failed to create test file for unlink");
-    task.sys_close(i32::try_from(fd).unwrap())
-        .expect("Failed to close test file");
-    task.sys_unlinkat(0, file_path, AtFlags::empty())
-        .expect("unlinkat should succeed on regular file");
     assert_eq!(
-        task.sys_stat(file_path),
-        Err(Errno::ENOENT),
-        "File should no longer exist after unlink"
-    );
-
-    // 2. Create a directory and attempt to unlink without AT_REMOVEDIR -> EISDIR.
-    let dir_path = "/unlink_dir";
-    let dir_mode = (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits();
-    task.sys_mkdirat(litebox_common_linux::AT_FDCWD, dir_path, dir_mode)
-        .expect("Failed to create directory");
-    assert_eq!(
-        task.sys_unlinkat(0, dir_path, AtFlags::empty()),
-        Err(Errno::EISDIR),
-        "Unlinking a directory without AT_REMOVEDIR should return EISDIR"
-    );
-
-    // 3. Create a non-empty directory and remove with AT_REMOVEDIR -> ENOTEMPTY.
-    let nonempty_dir = "/unlink_dir_nonempty";
-    task.sys_mkdirat(litebox_common_linux::AT_FDCWD, nonempty_dir, dir_mode)
-        .expect("Failed to create non-empty directory");
-    let inner_file_fd = task
-        .sys_open(
-            "/unlink_dir_nonempty/inner.txt",
-            OFlags::CREAT | OFlags::WRONLY,
-            Mode::RUSR | Mode::WUSR,
-        )
-        .expect("Failed to create inner file");
-    task.sys_close(i32::try_from(inner_file_fd).unwrap())
-        .expect("Failed to close inner file");
-    assert_eq!(
-        task.sys_unlinkat(0, nonempty_dir, AtFlags::AT_REMOVEDIR),
-        Err(Errno::ENOTEMPTY),
-        "Removing a non-empty directory with AT_REMOVEDIR should return ENOTEMPTY"
-    );
-
-    // 4. Invalid flag combination: AT_REMOVEDIR | (any other flag) -> EINVAL.
-    assert_eq!(
-        task.sys_unlinkat(
-            0,
-            dir_path,
-            AtFlags::AT_REMOVEDIR | AtFlags::AT_SYMLINK_NOFOLLOW
-        ),
-        Err(Errno::EINVAL),
-        "Invalid extra flags with AT_REMOVEDIR should return EINVAL"
-    );
-
-    // 5. Successfully remove previously created empty directory with AT_REMOVEDIR.
-    task.sys_unlinkat(0, dir_path, AtFlags::AT_REMOVEDIR)
-        .expect("Should remove empty directory with AT_REMOVEDIR");
-    assert_eq!(
-        task.sys_stat(dir_path),
-        Err(Errno::ENOENT),
-        "Directory should no longer exist after removal"
-    );
-
-    // 6. Create and remove another empty directory to ensure repeatability.
-    let empty_dir2 = "/unlink_empty_dir";
-    task.sys_mkdirat(litebox_common_linux::AT_FDCWD, empty_dir2, dir_mode)
-        .expect("Failed to create second empty directory");
-    task.sys_unlinkat(0, empty_dir2, AtFlags::AT_REMOVEDIR)
-        .expect("Should remove second empty directory");
-    assert_eq!(
-        task.sys_stat(empty_dir2),
-        Err(Errno::ENOENT),
-        "Second directory should no longer exist after removal"
+        files.take_calls(),
+        vec![
+            FileCall::Open {
+                path: "/prlimit_file".into(),
+                user: ROOT,
+                access: FileAccessMode::ReadOnly,
+                flags: FileOpenFlags::CREATE,
+                mode: mode(0o700),
+            },
+            FileCall::Close(FILE_HANDLE),
+        ],
+        "an open that cannot acquire a guest fd must close the broker handle"
     );
 }
 

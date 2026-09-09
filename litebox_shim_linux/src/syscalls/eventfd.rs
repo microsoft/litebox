@@ -102,15 +102,15 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
 
 #[cfg(test)]
 mod tests {
-    use litebox_common_linux::{EfdFlags, errno::Errno};
+    use litebox_common_linux::EfdFlags;
 
     #[test]
-    fn test_eventfd_requires_broker_control() {
+    fn test_eventfd_uses_broker_control() {
         let task = crate::syscalls::tests::init_platform();
-
-        assert!(matches!(
-            task.global.create_linux_eventfd(0, EfdFlags::NONBLOCK),
-            Err(Errno::EIO)
-        ));
+        let event = task
+            .global
+            .create_linux_eventfd(0, EfdFlags::NONBLOCK)
+            .unwrap();
+        drop(event);
     }
 }

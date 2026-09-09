@@ -14,7 +14,6 @@
 
 extern crate alloc;
 
-use alloc::borrow::Cow;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -59,12 +58,7 @@ pub mod syscalls;
 pub mod transport;
 mod wait;
 
-pub type DefaultFS<Platform> = LinuxFS<Platform>;
-
-pub(crate) type LinuxFS<Platform> =
-    litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>;
-
-pub(crate) type FileFd<Platform> = litebox::fd::TypedFd<LinuxFS<Platform>>;
+pub(crate) type FileFd<Platform> = litebox::fs::FileFd<Platform>;
 
 /// Aggregate bound capturing everything the shim requires of a platform.
 ///
@@ -224,15 +218,6 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         &self.litebox
     }
 
-    /// Create the default file system with the given in-memory layer and tar data.
-    pub fn default_fs(
-        &self,
-        in_mem: litebox::fs::in_mem::InMem<Platform>,
-        tar_data: Cow<'static, [u8]>,
-    ) -> DefaultFS<Platform> {
-        default_fs(&self.litebox, in_mem, tar_data)
-    }
-
     /// Build the shim.
     pub fn build(self) -> LinuxShim<Platform> {
         let net = Network::new(&self.litebox);
@@ -264,7 +249,6 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
     /// initial register state.
     pub fn load_program(
         &self,
-        fs: alloc::sync::Arc<LinuxFS<Platform>>,
         task: litebox_common_linux::TaskParams,
         path: &str,
         argv: Vec<alloc::ffi::CString>,
@@ -279,7 +263,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             egid,
         } = task;
 
-        let files = syscalls::file::FilesState::new(fs);
+        let files = syscalls::file::FilesState::new(&self.0.litebox);
         files.set_max_fd(syscalls::process::RLIMIT_NOFILE_CUR);
         let files = Arc::new(files);
         let credentials = Arc::new(syscalls::process::Credentials {
@@ -372,28 +356,6 @@ impl<Platform: ShimPlatform> LinuxShimProcess<Platform> {
     }
 }
 
-/// Create the default file system with the given in-memory layer and tar data.
-fn default_fs<Platform: ShimPlatform>(
-    litebox: &LiteBox<Platform>,
-    in_mem: litebox::fs::in_mem::InMem<Platform>,
-    tar_data: Cow<'static, [u8]>,
-) -> LinuxFS<Platform> {
-    litebox::fs::resolver::Resolver::new(
-        litebox,
-        litebox::fs::composer::Composer::builder()
-            .mount_nestable("/", |allocators| {
-                litebox::fs::overlay::Overlay::<Platform>::new(
-                    in_mem,
-                    litebox::fs::tar_ro::TarRo::new(tar_data, allocators.next()),
-                    allocators.next(),
-                )
-            })
-            .mount("/dev", litebox::fs::devices::Devices::new)
-            .build()
-            .unwrap(),
-    )
-}
-
 // Special override so that `GETFL` can return stdio-specific flags
 #[derive(Clone)]
 pub(crate) struct StdioStatusFlags(litebox::fs::OFlags);
@@ -402,20 +364,20 @@ impl<Platform: ShimPlatform> syscalls::file::FilesState<Platform> {
     fn initialize_stdio_in_shared_descriptors_table(
         &self,
         global: &GlobalState<Platform>,
-        context: &litebox::fs::resolver::Context,
+        context: &litebox::fs::Context,
     ) {
         use litebox::fs::{Mode, OFlags};
         let stdin = self
             .fs
-            .open(context, "/dev/stdin", OFlags::RDONLY, Mode::empty())
+            .open_file(context, "/dev/stdin", OFlags::RDONLY, Mode::empty())
             .unwrap();
         let stdout = self
             .fs
-            .open(context, "/dev/stdout", OFlags::WRONLY, Mode::empty())
+            .open_file(context, "/dev/stdout", OFlags::WRONLY, Mode::empty())
             .unwrap();
         let stderr = self
             .fs
-            .open(context, "/dev/stderr", OFlags::WRONLY, Mode::empty())
+            .open_file(context, "/dev/stderr", OFlags::WRONLY, Mode::empty())
             .unwrap();
         let mut dt = global.litebox.descriptor_table_mut();
         let mut rds = self.raw_descriptor_store.write();
@@ -471,7 +433,7 @@ impl<Platform: ShimPlatform> syscalls::file::FilesState<Platform> {
             };
         }
 
-        resolve_fd!(LinuxFS<Platform>, Fs);
+        resolve_fd!(litebox::fs::File<Platform>, Fs);
         resolve_fd!(Network<Platform>, Network);
         resolve_fd!(Pipes<Platform>, Pipes);
         resolve_fd!(syscalls::eventfd::EventfdSubsystem<Platform>, Eventfd);
@@ -1240,14 +1202,11 @@ mod test_utils {
 
     impl<Platform: ShimPlatform> GlobalState<Platform> {
         /// Make a new task with default values for testing.
-        pub(crate) fn new_test_task(
-            self: Arc<Self>,
-            fs: alloc::sync::Arc<LinuxFS<Platform>>,
-        ) -> Task<Platform> {
+        pub(crate) fn new_test_task(self: Arc<Self>) -> Task<Platform> {
             let pid = self
                 .next_thread_id
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            let files = Arc::new(syscalls::file::FilesState::new(fs));
+            let files = Arc::new(syscalls::file::FilesState::new(&self.litebox));
             let credentials = Arc::new(syscalls::process::Credentials {
                 uid: 0,
                 euid: 0,

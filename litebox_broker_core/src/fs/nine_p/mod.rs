@@ -31,6 +31,8 @@ use litebox_platform::sync;
 mod client;
 mod fcall;
 mod id_pool;
+#[cfg(all(test, target_os = "linux"))]
+mod tests;
 
 pub mod transport;
 

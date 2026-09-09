@@ -102,14 +102,14 @@ pub(crate) struct WindowsThreadEnvironment {
 
 pub(crate) struct PeLoader<'a, Platform: crate::ShimPlatform> {
     platform: &'static Platform,
-    fs: Arc<crate::WindowsFS<Platform>>,
+    fs: Arc<litebox::LiteBox<Platform>>,
     page_manager: &'a crate::WindowsPageManager<Platform>,
 }
 
 impl<'a, Platform: crate::ShimPlatform> PeLoader<'a, Platform> {
     pub(crate) fn new(
         platform: &'static Platform,
-        fs: Arc<crate::WindowsFS<Platform>>,
+        fs: Arc<litebox::LiteBox<Platform>>,
         page_manager: &'a crate::WindowsPageManager<Platform>,
     ) -> Self {
         Self {
@@ -139,13 +139,16 @@ impl<'a, Platform: crate::ShimPlatform> PeLoader<'a, Platform> {
             application_entry_point
         };
 
-        let environment = self.create_process_environment(ProcessEnvironmentInput {
-            image: &image.parsed,
-            image_base_address: image.mapping.base_addr,
-            image_path: path,
-            argv,
-            envp,
-        })?;
+        let environment = create_process_environment(
+            self.page_manager,
+            ProcessEnvironmentInput {
+                image: &image.parsed,
+                image_base_address: image.mapping.base_addr,
+                image_path: path,
+                argv,
+                envp,
+            },
+        )?;
         if let Some(ntdll) = &ntdll {
             let context = X64Context::initial_thread_context(
                 ntdll.exports.rtl_user_thread_start,
@@ -213,184 +216,180 @@ impl<'a, Platform: crate::ShimPlatform> PeLoader<'a, Platform> {
 
         Ok(())
     }
+}
 
-    fn create_process_environment(
-        &self,
-        input: ProcessEnvironmentInput<'_>,
-    ) -> Result<WindowsProcessEnvironment, WindowsLoadError> {
-        let create_pages = |size: usize| -> Result<usize, PeImageAccessError> {
-            let aligned_length = size.next_multiple_of(PAGE_SIZE);
-            let length =
-                NonZeroPageSize::new(aligned_length).ok_or(PeImageAccessError::AddressOverflow)?;
-            // SAFETY: `suggested_address` is `None` and `CreatePagesFlags::empty()` leaves address
-            // selection to the page manager, so this cannot replace an existing mapping.
-            let ptr = unsafe {
-                self.page_manager.create_writable_pages(
-                    None,
-                    length,
-                    CreatePagesFlags::empty(),
-                    |_| Ok(0),
-                )
-            }?;
-            Ok(ptr.as_usize())
-        };
-        let peb_ptr = create_pages(size_of::<ProcessEnvironmentBlock>())?;
-        let api_set_map = API_SET_NAMESPACE;
-        let api_set_map_ptr = create_pages(api_set_map.len())?;
-        write_guest_slice::<Platform, _>(api_set_map_ptr, api_set_map)?;
-        let win32_image_path = win32_image_path(input.image_path);
-        let dos_image_path = dos_image_path(input.image_path);
-        let current_directory_path = Utf16StringBuffer::new(r"C:\")?;
-        let dll_path = Utf16StringBuffer::new(r"C:\Windows\System32;C:\")?;
-        let image_path_name = Utf16StringBuffer::new(&dos_image_path)?;
-        let command_line =
-            Utf16StringBuffer::new(&windows_command_line(&win32_image_path, input.argv))?;
-        let window_title = Utf16StringBuffer::new(&dos_image_path)?;
-        let desktop_info = Utf16StringBuffer::new("")?;
-        let shell_info = Utf16StringBuffer::new("")?;
-        let runtime_data = Utf16StringBuffer::new("")?;
-        let redirection_dll_name = Utf16StringBuffer::new("")?;
-        let environment_block = windows_environment_block(input.envp);
-        let environment_size = checked_mul(environment_block.len(), size_of::<u16>())?;
-        let environment_ptr = create_pages(environment_size)?;
-        write_guest_slice::<Platform, _>(environment_ptr, &environment_block)?;
-        let process_parameter_strings = [
-            &current_directory_path,
-            &dll_path,
-            &image_path_name,
-            &command_line,
-            &window_title,
-            &desktop_info,
-            &shell_info,
-            &runtime_data,
-            &redirection_dll_name,
-        ];
-        let process_parameters_length = process_parameter_strings.iter().try_fold(
-            size_of::<RtlUserProcessParameters>(),
-            |length, string| {
-                length
-                    .checked_add(usize::from(string.maximum_length))
-                    .ok_or(PeImageAccessError::AddressOverflow)
-            },
-        )?;
-        let process_parameters_allocation_length =
-            process_parameters_length.next_multiple_of(PAGE_SIZE);
-        let process_parameters_ptr = create_pages(process_parameters_length)?;
+/// Builds the synthetic Windows process environment (PEB, TEB, process parameters, and
+/// initial thread state) for an image that has already been mapped.
+///
+/// This only writes guest memory through `page_manager`, so it is independent of how the
+/// image was obtained and needs no file system.
+fn create_process_environment<Platform: crate::ShimPlatform>(
+    page_manager: &crate::WindowsPageManager<Platform>,
+    input: ProcessEnvironmentInput<'_>,
+) -> Result<WindowsProcessEnvironment, WindowsLoadError> {
+    let create_pages = |size: usize| -> Result<usize, PeImageAccessError> {
+        let aligned_length = size.next_multiple_of(PAGE_SIZE);
+        let length =
+            NonZeroPageSize::new(aligned_length).ok_or(PeImageAccessError::AddressOverflow)?;
+        // SAFETY: `suggested_address` is `None` and `CreatePagesFlags::empty()` leaves address
+        // selection to the page manager, so this cannot replace an existing mapping.
+        let ptr = unsafe {
+            page_manager.create_writable_pages(None, length, CreatePagesFlags::empty(), |_| Ok(0))
+        }?;
+        Ok(ptr.as_usize())
+    };
+    let peb_ptr = create_pages(size_of::<ProcessEnvironmentBlock>())?;
+    let api_set_map = API_SET_NAMESPACE;
+    let api_set_map_ptr = create_pages(api_set_map.len())?;
+    write_guest_slice::<Platform, _>(api_set_map_ptr, api_set_map)?;
+    let win32_image_path = win32_image_path(input.image_path);
+    let dos_image_path = dos_image_path(input.image_path);
+    let current_directory_path = Utf16StringBuffer::new(r"C:\")?;
+    let dll_path = Utf16StringBuffer::new(r"C:\Windows\System32;C:\")?;
+    let image_path_name = Utf16StringBuffer::new(&dos_image_path)?;
+    let command_line =
+        Utf16StringBuffer::new(&windows_command_line(&win32_image_path, input.argv))?;
+    let window_title = Utf16StringBuffer::new(&dos_image_path)?;
+    let desktop_info = Utf16StringBuffer::new("")?;
+    let shell_info = Utf16StringBuffer::new("")?;
+    let runtime_data = Utf16StringBuffer::new("")?;
+    let redirection_dll_name = Utf16StringBuffer::new("")?;
+    let environment_block = windows_environment_block(input.envp);
+    let environment_size = checked_mul(environment_block.len(), size_of::<u16>())?;
+    let environment_ptr = create_pages(environment_size)?;
+    write_guest_slice::<Platform, _>(environment_ptr, &environment_block)?;
+    let process_parameter_strings = [
+        &current_directory_path,
+        &dll_path,
+        &image_path_name,
+        &command_line,
+        &window_title,
+        &desktop_info,
+        &shell_info,
+        &runtime_data,
+        &redirection_dll_name,
+    ];
+    let process_parameters_length = process_parameter_strings.iter().try_fold(
+        size_of::<RtlUserProcessParameters>(),
+        |length, string| {
+            length
+                .checked_add(usize::from(string.maximum_length))
+                .ok_or(PeImageAccessError::AddressOverflow)
+        },
+    )?;
+    let process_parameters_allocation_length =
+        process_parameters_length.next_multiple_of(PAGE_SIZE);
+    let process_parameters_ptr = create_pages(process_parameters_length)?;
 
-        let mut process_parameters = RtlUserProcessParameters::new_zeroed();
-        process_parameters.maximum_length = to_u32(process_parameters_allocation_length)?;
-        process_parameters.length = to_u32(process_parameters_length)?;
-        process_parameters.flags = RtlUserProcFlags::NORMALIZED.bits();
-        process_parameters.environment = environment_ptr;
-        process_parameters.environment_size =
-            u64::try_from(environment_size).map_err(|_| PeImageAccessError::AddressOverflow)?;
-        let mut process_parameters_allocation =
-            GuestMemoryAllocator::new(process_parameters_ptr, process_parameters_length)?;
-        let guest_process_parameters =
-            process_parameters_allocation.allocate::<Platform, RtlUserProcessParameters>()?;
-        process_parameters.current_directory.dos_path = allocate_guest_unicode_string::<Platform>(
-            &mut process_parameters_allocation,
-            &current_directory_path,
-        )?;
-        process_parameters.dll_path = allocate_guest_unicode_string::<Platform>(
-            &mut process_parameters_allocation,
-            &dll_path,
-        )?;
-        process_parameters.image_path_name = allocate_guest_unicode_string::<Platform>(
-            &mut process_parameters_allocation,
-            &image_path_name,
-        )?;
-        process_parameters.command_line = allocate_guest_unicode_string::<Platform>(
-            &mut process_parameters_allocation,
-            &command_line,
-        )?;
-        process_parameters.window_title = allocate_guest_unicode_string::<Platform>(
-            &mut process_parameters_allocation,
-            &window_title,
-        )?;
-        process_parameters.desktop_info = allocate_guest_unicode_string::<Platform>(
-            &mut process_parameters_allocation,
-            &desktop_info,
-        )?;
-        process_parameters.shell_info = allocate_guest_unicode_string::<Platform>(
-            &mut process_parameters_allocation,
-            &shell_info,
-        )?;
-        process_parameters.runtime_data = allocate_guest_unicode_string::<Platform>(
-            &mut process_parameters_allocation,
-            &runtime_data,
-        )?;
-        process_parameters.redirection_dll_name = allocate_guest_unicode_string::<Platform>(
-            &mut process_parameters_allocation,
-            &redirection_dll_name,
-        )?;
-        guest_process_parameters
-            .write_at_offset(0, process_parameters)
-            .ok_or(PeImageAccessError::MemoryAccess)?;
+    let mut process_parameters = RtlUserProcessParameters::new_zeroed();
+    process_parameters.maximum_length = to_u32(process_parameters_allocation_length)?;
+    process_parameters.length = to_u32(process_parameters_length)?;
+    process_parameters.flags = RtlUserProcFlags::NORMALIZED.bits();
+    process_parameters.environment = environment_ptr;
+    process_parameters.environment_size =
+        u64::try_from(environment_size).map_err(|_| PeImageAccessError::AddressOverflow)?;
+    let mut process_parameters_allocation =
+        GuestMemoryAllocator::new(process_parameters_ptr, process_parameters_length)?;
+    let guest_process_parameters =
+        process_parameters_allocation.allocate::<Platform, RtlUserProcessParameters>()?;
+    process_parameters.current_directory.dos_path = allocate_guest_unicode_string::<Platform>(
+        &mut process_parameters_allocation,
+        &current_directory_path,
+    )?;
+    process_parameters.dll_path =
+        allocate_guest_unicode_string::<Platform>(&mut process_parameters_allocation, &dll_path)?;
+    process_parameters.image_path_name = allocate_guest_unicode_string::<Platform>(
+        &mut process_parameters_allocation,
+        &image_path_name,
+    )?;
+    process_parameters.command_line = allocate_guest_unicode_string::<Platform>(
+        &mut process_parameters_allocation,
+        &command_line,
+    )?;
+    process_parameters.window_title = allocate_guest_unicode_string::<Platform>(
+        &mut process_parameters_allocation,
+        &window_title,
+    )?;
+    process_parameters.desktop_info = allocate_guest_unicode_string::<Platform>(
+        &mut process_parameters_allocation,
+        &desktop_info,
+    )?;
+    process_parameters.shell_info =
+        allocate_guest_unicode_string::<Platform>(&mut process_parameters_allocation, &shell_info)?;
+    process_parameters.runtime_data = allocate_guest_unicode_string::<Platform>(
+        &mut process_parameters_allocation,
+        &runtime_data,
+    )?;
+    process_parameters.redirection_dll_name = allocate_guest_unicode_string::<Platform>(
+        &mut process_parameters_allocation,
+        &redirection_dll_name,
+    )?;
+    guest_process_parameters
+        .write_at_offset(0, process_parameters)
+        .ok_or(PeImageAccessError::MemoryAccess)?;
 
-        let read_only_shared_memory_base = create_pages(WINDOWS_SHARED_SECTION_SIZE)?;
-        let mut shared_heap =
-            GuestMemoryAllocator::new(read_only_shared_memory_base, WINDOWS_SHARED_SECTION_SIZE)?;
-        let read_only_static_server_data =
-            initialize_windows_static_server_data::<Platform>(&mut shared_heap)?;
-        let mut peb = ProcessEnvironmentBlock::new_zeroed();
-        peb.image_base_address = input.image_base_address;
-        if input.image_base_address != input.image.image_base() || input.image.has_dynamic_base() {
-            peb.bit_field = PebBitField::IS_IMAGE_DYNAMICALLY_RELOCATED.bits();
-        }
-        let process_heaps = initial_process_heaps_array(peb_ptr)?;
-        let fast_peb_lock = create_pages(size_of::<RtlCriticalSection>())?;
-        write_guest_value::<Platform, _>(fast_peb_lock, RtlCriticalSection::initialized(0))?;
-        let loader_lock = create_pages(size_of::<RtlCriticalSection>())?;
-        write_guest_value::<Platform, _>(loader_lock, RtlCriticalSection::initialized(0))?;
-
-        peb.api_set_map = api_set_map_ptr;
-        peb.process_parameters = process_parameters_ptr;
-        peb.fast_peb_lock = fast_peb_lock;
-        peb.shared_data = read_only_shared_memory_base;
-        peb.number_of_processors = 1;
-        peb.critical_section_timeout = WINDOWS_CRITICAL_SECTION_TIMEOUT_100NS;
-        peb.heap_segment_reserve = WINDOWS_HEAP_SEGMENT_RESERVE;
-        peb.heap_segment_commit = WINDOWS_HEAP_SEGMENT_COMMIT;
-        peb.heap_de_commit_total_free_threshold = WINDOWS_HEAP_DECOMMIT_TOTAL_FREE_THRESHOLD;
-        peb.heap_de_commit_free_block_threshold = WINDOWS_HEAP_DECOMMIT_FREE_BLOCK_THRESHOLD;
-        peb.maximum_number_of_heaps = process_heaps.maximum_number_of_heaps;
-        peb.process_heaps = process_heaps.address;
-        peb.loader_lock = loader_lock;
-        peb.active_process_affinity_mask = 1;
-        peb.os_major_version = u32::from(crate::syscalls::sysinfo::WINDOWS_OS_MAJOR_VERSION);
-        peb.os_minor_version = u32::from(crate::syscalls::sysinfo::WINDOWS_OS_MINOR_VERSION);
-        peb.os_build_number = crate::syscalls::sysinfo::WINDOWS_OS_BUILD_NUMBER;
-        peb.os_platform_id = crate::syscalls::sysinfo::WINDOWS_OS_PLATFORM_WIN32_NT;
-        peb.image_subsystem = u32::from(input.image.subsystem());
-        peb.image_subsystem_major_version = u32::from(input.image.major_subsystem_version());
-        peb.image_subsystem_minor_version = u32::from(input.image.minor_subsystem_version());
-        peb.read_only_shared_memory_base = read_only_shared_memory_base;
-        peb.read_only_static_server_data = read_only_static_server_data;
-        // TODO(csr-shared-section): model shared backing with distinct client and CSRSS
-        // virtual addresses instead of aliasing both PEB bases to this single mapping.
-        peb.csr_server_read_only_shared_memory_base = read_only_shared_memory_base as u64;
-
-        write_guest_value::<Platform, _>(peb_ptr, peb)?;
-
-        let thread = create_thread_environment(
-            self.page_manager,
-            INITIAL_STACK_SIZE,
-            peb_ptr,
-            ClientId {
-                unique_process: INITIAL_PROCESS_ID,
-                unique_thread: INITIAL_THREAD_ID,
-            },
-            true,
-        )?;
-        Ok(WindowsProcessEnvironment {
-            peb: peb_ptr,
-            teb: thread.teb,
-            context: thread.context,
-            stack_top: thread.stack_top,
-            windows_shared_section: read_only_shared_memory_base,
-        })
+    let read_only_shared_memory_base = create_pages(WINDOWS_SHARED_SECTION_SIZE)?;
+    let mut shared_heap =
+        GuestMemoryAllocator::new(read_only_shared_memory_base, WINDOWS_SHARED_SECTION_SIZE)?;
+    let read_only_static_server_data =
+        initialize_windows_static_server_data::<Platform>(&mut shared_heap)?;
+    let mut peb = ProcessEnvironmentBlock::new_zeroed();
+    peb.image_base_address = input.image_base_address;
+    if input.image_base_address != input.image.image_base() || input.image.has_dynamic_base() {
+        peb.bit_field = PebBitField::IS_IMAGE_DYNAMICALLY_RELOCATED.bits();
     }
+    let process_heaps = initial_process_heaps_array(peb_ptr)?;
+    let fast_peb_lock = create_pages(size_of::<RtlCriticalSection>())?;
+    write_guest_value::<Platform, _>(fast_peb_lock, RtlCriticalSection::initialized(0))?;
+    let loader_lock = create_pages(size_of::<RtlCriticalSection>())?;
+    write_guest_value::<Platform, _>(loader_lock, RtlCriticalSection::initialized(0))?;
+
+    peb.api_set_map = api_set_map_ptr;
+    peb.process_parameters = process_parameters_ptr;
+    peb.fast_peb_lock = fast_peb_lock;
+    peb.shared_data = read_only_shared_memory_base;
+    peb.number_of_processors = 1;
+    peb.critical_section_timeout = WINDOWS_CRITICAL_SECTION_TIMEOUT_100NS;
+    peb.heap_segment_reserve = WINDOWS_HEAP_SEGMENT_RESERVE;
+    peb.heap_segment_commit = WINDOWS_HEAP_SEGMENT_COMMIT;
+    peb.heap_de_commit_total_free_threshold = WINDOWS_HEAP_DECOMMIT_TOTAL_FREE_THRESHOLD;
+    peb.heap_de_commit_free_block_threshold = WINDOWS_HEAP_DECOMMIT_FREE_BLOCK_THRESHOLD;
+    peb.maximum_number_of_heaps = process_heaps.maximum_number_of_heaps;
+    peb.process_heaps = process_heaps.address;
+    peb.loader_lock = loader_lock;
+    peb.active_process_affinity_mask = 1;
+    peb.os_major_version = u32::from(crate::syscalls::sysinfo::WINDOWS_OS_MAJOR_VERSION);
+    peb.os_minor_version = u32::from(crate::syscalls::sysinfo::WINDOWS_OS_MINOR_VERSION);
+    peb.os_build_number = crate::syscalls::sysinfo::WINDOWS_OS_BUILD_NUMBER;
+    peb.os_platform_id = crate::syscalls::sysinfo::WINDOWS_OS_PLATFORM_WIN32_NT;
+    peb.image_subsystem = u32::from(input.image.subsystem());
+    peb.image_subsystem_major_version = u32::from(input.image.major_subsystem_version());
+    peb.image_subsystem_minor_version = u32::from(input.image.minor_subsystem_version());
+    peb.read_only_shared_memory_base = read_only_shared_memory_base;
+    peb.read_only_static_server_data = read_only_static_server_data;
+    // TODO(csr-shared-section): model shared backing with distinct client and CSRSS
+    // virtual addresses instead of aliasing both PEB bases to this single mapping.
+    peb.csr_server_read_only_shared_memory_base = read_only_shared_memory_base as u64;
+
+    write_guest_value::<Platform, _>(peb_ptr, peb)?;
+
+    let thread = create_thread_environment(
+        page_manager,
+        INITIAL_STACK_SIZE,
+        peb_ptr,
+        ClientId {
+            unique_process: INITIAL_PROCESS_ID,
+            unique_thread: INITIAL_THREAD_ID,
+        },
+        true,
+    )?;
+    Ok(WindowsProcessEnvironment {
+        peb: peb_ptr,
+        teb: thread.teb,
+        context: thread.context,
+        stack_top: thread.stack_top,
+        windows_shared_section: read_only_shared_memory_base,
+    })
 }
 
 pub(crate) fn create_thread_environment<Platform: crate::ShimPlatform>(
@@ -912,7 +911,7 @@ struct NtDllExports {
 
 fn load_ntdll<Platform: crate::ShimPlatform>(
     platform: &'static Platform,
-    fs: Arc<crate::WindowsFS<Platform>>,
+    fs: Arc<litebox::LiteBox<Platform>>,
     page_manager: &crate::WindowsPageManager<Platform>,
 ) -> Result<Option<LoadedNtDll>, WindowsLoadError> {
     match load_image_with_writable_sections(
@@ -937,7 +936,7 @@ fn load_ntdll<Platform: crate::ShimPlatform>(
 
 fn load_image<Platform: crate::ShimPlatform>(
     platform: &'static Platform,
-    fs: Arc<crate::WindowsFS<Platform>>,
+    fs: Arc<litebox::LiteBox<Platform>>,
     path: &str,
     page_manager: &crate::WindowsPageManager<Platform>,
 ) -> Result<LoadedImage, WindowsLoadError> {
@@ -946,7 +945,7 @@ fn load_image<Platform: crate::ShimPlatform>(
 
 pub(crate) fn load_image_section<Platform: crate::ShimPlatform>(
     platform: &'static Platform,
-    fs: Arc<crate::WindowsFS<Platform>>,
+    fs: Arc<litebox::LiteBox<Platform>>,
     path: &str,
     page_manager: &crate::WindowsPageManager<Platform>,
     virtual_allocations: &crate::WindowsVirtualAllocations<Platform>,
@@ -969,14 +968,14 @@ pub(crate) struct ImageSectionMetadata {
 }
 
 pub(crate) fn image_section_metadata<Platform: crate::ShimPlatform>(
-    fs: Arc<crate::WindowsFS<Platform>>,
+    fs: Arc<litebox::LiteBox<Platform>>,
     path: &str,
 ) -> Result<ImageSectionMetadata, WindowsLoadError> {
     let file = PeImageFile::open(fs, path)?;
     let parsed = PeParsedFile::parse(&mut &file).map_err(WindowsLoadError::Parse)?;
     let file_size = file
         .fs
-        .fd_file_status(&file.fd)
+        .file_status(&file.fd)
         .map_err(PeImageAccessError::FileStatus)?
         .size
         .try_into()
@@ -997,7 +996,7 @@ pub(crate) fn image_section_metadata<Platform: crate::ShimPlatform>(
 }
 
 fn load_image_with_writable_sections<Platform: crate::ShimPlatform>(
-    fs: Arc<crate::WindowsFS<Platform>>,
+    fs: Arc<litebox::LiteBox<Platform>>,
     path: &str,
     platform: &'static Platform,
     page_manager: &crate::WindowsPageManager<Platform>,
@@ -1108,14 +1107,14 @@ fn is_missing_file_error(error: &WindowsLoadError) -> bool {
 }
 
 struct PeImageFile<Platform: crate::ShimPlatform> {
-    fs: Arc<crate::WindowsFS<Platform>>,
-    fd: litebox::fd::TypedFd<crate::WindowsFS<Platform>>,
+    fs: Arc<litebox::LiteBox<Platform>>,
+    fd: litebox::fs::FileFd<Platform>,
 }
 
 impl<Platform: crate::ShimPlatform> PeImageFile<Platform> {
-    fn open(fs: Arc<crate::WindowsFS<Platform>>, path: &str) -> Result<Self, PeImageAccessError> {
-        let fd = fs.open(
-            &litebox::fs::resolver::Context::new(),
+    fn open(fs: Arc<litebox::LiteBox<Platform>>, path: &str) -> Result<Self, PeImageAccessError> {
+        let fd = fs.open_file(
+            &litebox::fs::Context::new(),
             path,
             OFlags::RDONLY,
             Mode::empty(),
@@ -1129,7 +1128,7 @@ impl<Platform: crate::ShimPlatform> PeImageFile<Platform> {
         mut buf: &mut [u8],
     ) -> Result<(), PeImageAccessError> {
         while !buf.is_empty() {
-            let bytes_read = self.fs.read(&self.fd, buf, Some(offset))?;
+            let bytes_read = self.fs.read_file(&self.fd, buf, Some(offset))?;
             if bytes_read == 0 {
                 return Err(PeImageAccessError::ShortRead);
             }
@@ -1144,7 +1143,7 @@ impl<Platform: crate::ShimPlatform> PeImageFile<Platform> {
 
 impl<Platform: crate::ShimPlatform> Drop for PeImageFile<Platform> {
     fn drop(&mut self) {
-        if let Err(e) = self.fs.close(&self.fd) {
+        if let Err(e) = self.fs.close_file(&self.fd) {
             litebox_util_log::warn!(error:? = e; "failed to close PE image file");
         }
     }
@@ -1164,7 +1163,7 @@ impl<Platform: crate::ShimPlatform> ReadAt for &'_ PeImageFile<Platform> {
 
     fn size(&mut self) -> Result<u64, Self::Error> {
         self.fs
-            .fd_file_status(&self.fd)?
+            .file_status(&self.fd)?
             .size
             .try_into()
             .map_err(|_| PeImageAccessError::AddressOverflow)
@@ -2543,19 +2542,10 @@ mod tests {
     }
 
     fn created_process_environment_snapshot() -> CreatedProcessEnvironmentSnapshot {
-        let platform = crate::tests::test_platform();
-        let litebox = litebox::LiteBox::new(platform);
+        // Process environment construction only writes guest memory, so this needs no files and
+        // uses the objectless broker association.
+        let litebox = crate::test_broker::litebox(crate::tests::test_platform());
         let page_manager = crate::WindowsPageManager::<crate::tests::TestPlatform>::new(&litebox);
-        let fs = Arc::new(litebox::fs::resolver::Resolver::new(
-            &litebox,
-            litebox::fs::composer::Composer::builder()
-                .mount("/", |allocator| {
-                    litebox::fs::in_mem::InMem::<crate::tests::TestPlatform>::new(allocator)
-                })
-                .build()
-                .expect("valid test filesystem"),
-        ));
-        let loader = PeLoader::new(platform, fs, &page_manager);
         let image = loaded_module_image(application_module_base());
 
         let image_base_address = image.mapping.base_addr;
@@ -2569,15 +2559,17 @@ mod tests {
             CString::new("B=two").expect("valid envp[1]"),
             CString::new("a=one").expect("valid envp[2]"),
         ];
-        let environment = loader
-            .create_process_environment(ProcessEnvironmentInput {
+        let environment = create_process_environment(
+            &page_manager,
+            ProcessEnvironmentInput {
                 image: &image.parsed,
                 image_base_address,
                 image_path: "test.exe",
                 argv: &argv,
                 envp: &envp,
-            })
-            .expect("failed to create synthetic Windows process environment");
+            },
+        )
+        .expect("failed to create synthetic Windows process environment");
         let peb = read_guest_value::<ProcessEnvironmentBlock>(environment.peb);
 
         CreatedProcessEnvironmentSnapshot {

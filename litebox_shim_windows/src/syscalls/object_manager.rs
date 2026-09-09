@@ -1615,7 +1615,8 @@ mod tests {
     };
     use crate::tests::{
         TestPlatform, const_ptr, mut_byte_ptr, mut_ptr, null_mut_ptr, object_attributes,
-        run_with_test_platform_pointers, test_task, unicode_string, utf16_units,
+        run_with_test_platform_pointers, test_task, test_task_with_broker_files, unicode_string,
+        utf16_units,
     };
 
     const DIRECTORY_QUERY: u32 = 0x0000_0001;
@@ -1984,7 +1985,7 @@ mod tests {
     #[test]
     fn open_section_rejects_empty_known_dlls_with_zeroed_output() {
         run_with_test_platform_pointers(|| {
-            let task = test_task();
+            let task = test_task_with_broker_files(&[]);
             let known_dlls_units = utf16_units(r"\KnownDlls");
             let known_dlls_name = unicode_string(&known_dlls_units);
             let known_dlls_attrs = object_attributes(

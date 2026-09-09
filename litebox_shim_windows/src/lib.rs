@@ -11,7 +11,6 @@
 
 extern crate alloc;
 
-use alloc::borrow::Cow;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -65,6 +64,8 @@ mod nt_types;
 mod syscalls;
 mod wait;
 
+#[cfg(test)]
+mod test_broker;
 #[cfg(test)]
 mod tests;
 
@@ -214,11 +215,6 @@ impl<Platform: ShimPlatform> Clone for WindowsSectionView<Platform> {
         }
     }
 }
-
-pub type DefaultFS<Platform> = WindowsFS<Platform>;
-
-pub type WindowsFS<Platform> =
-    litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>;
 
 fn write_value<Platform, T>(address: usize, value: T) -> Option<()>
 where
@@ -402,11 +398,6 @@ pub struct WindowsShimBuilder<Platform: ShimPlatform> {
 }
 
 impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
-    #[must_use]
-    pub fn new(platform: &'static Platform) -> Self {
-        Self::new_with_litebox(platform, LiteBox::new(platform))
-    }
-
     /// Creates a builder backed by an existing LiteBox instance.
     #[must_use]
     pub fn new_with_litebox(platform: &'static Platform, litebox: LiteBox<Platform>) -> Self {
@@ -416,16 +407,6 @@ impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
     #[must_use]
     pub fn litebox(&self) -> &LiteBox<Platform> {
         &self.litebox
-    }
-
-    /// Build the default file system with the given in-memory layer and tar data.
-    #[must_use]
-    pub fn default_fs(
-        &self,
-        in_mem: litebox::fs::in_mem::InMem<Platform>,
-        tar_data: Cow<'static, [u8]>,
-    ) -> DefaultFS<Platform> {
-        default_fs(&self.litebox, in_mem, tar_data)
     }
 
     #[must_use]
@@ -506,7 +487,6 @@ impl<Platform: ShimPlatform> WindowsShim<Platform> {
     /// Loads the program at `path` as the shim's initial task.
     pub fn load_program(
         &self,
-        fs: Arc<WindowsFS<Platform>>,
         path: &str,
         argv: Vec<alloc::ffi::CString>,
         envp: Vec<alloc::ffi::CString>,
@@ -515,6 +495,7 @@ impl<Platform: ShimPlatform> WindowsShim<Platform> {
         #[cfg(not(target_os = "windows"))]
         let _ = map_windows_user_shared_data::<Platform>(&self.0.page_manager)
             .ok_or(loader::WindowsLoadError::MapSharedMemory)?;
+        let fs = Arc::new(self.0.litebox.clone());
         let load_info = loader::PeLoader::new(self.0.platform, fs.clone(), &self.0.page_manager)
             .load(path, &argv, &envp)?;
         // TODO: shared section should be only created once and shared across all processes, not created per-process.
@@ -538,7 +519,7 @@ impl<Platform: ShimPlatform> WindowsShim<Platform> {
                     global: self.0.clone(),
                     process: process.clone(),
                     fs,
-                    fs_context: litebox::fs::resolver::Context::new(),
+                    fs_context: litebox::fs::Context::new(),
                     wait_state: wait::WaitState::new(self.0.platform),
                     io_completion_worker: Mutex::new(syscalls::iocp::IoCompletionWorkerState::new()),
                     entry_point: load_info.entry_point,
@@ -727,8 +708,8 @@ impl<Platform: ShimPlatform> Process<Platform> {
 struct Task<Platform: ShimPlatform> {
     global: Arc<GlobalState<Platform>>,
     process: Arc<Process<Platform>>,
-    fs: Arc<WindowsFS<Platform>>,
-    fs_context: litebox::fs::resolver::Context,
+    fs: Arc<LiteBox<Platform>>,
+    fs_context: litebox::fs::Context,
     wait_state: wait::WaitState<Platform>,
     io_completion_worker: Mutex<Platform, syscalls::iocp::IoCompletionWorkerState<Platform>>,
     entry_point: usize,
@@ -3182,28 +3163,4 @@ pub struct LoadedProgram<Platform: ShimPlatform> {
     pub entrypoints: WindowsShimEntrypoints<Platform>,
     /// Handle used to wait for the loaded program to exit.
     pub process: Arc<Process<Platform>>,
-}
-
-fn default_fs<Platform>(
-    litebox: &LiteBox<Platform>,
-    in_mem: litebox::fs::in_mem::InMem<Platform>,
-    tar_data: Cow<'static, [u8]>,
-) -> WindowsFS<Platform>
-where
-    Platform: ShimPlatform,
-{
-    litebox::fs::resolver::Resolver::new(
-        litebox,
-        litebox::fs::composer::Composer::builder()
-            .mount_nestable("/", |allocators| {
-                litebox::fs::overlay::Overlay::<Platform>::new(
-                    in_mem,
-                    litebox::fs::tar_ro::TarRo::new(tar_data, allocators.next()),
-                    allocators.next(),
-                )
-            })
-            .mount("/dev", litebox::fs::devices::Devices::new)
-            .build()
-            .unwrap(),
-    )
 }

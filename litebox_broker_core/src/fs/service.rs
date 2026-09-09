@@ -9,8 +9,7 @@ use core::any::Any;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileNodeInfo, FileOpenFlags,
-    FileSeekWhence, FileStatus as ProtocolFileStatus, FileType as ProtocolFileType, FileUser,
-    MAX_FILE_TRANSFER_SIZE,
+    FileSeekWhence, FileStatus as ProtocolFileStatus, FileUser, MAX_FILE_TRANSFER_SIZE,
 };
 use litebox_broker_protocol::stdio::{MAX_STDIO_TRANSFER_SIZE, StdioOutputStream};
 use litebox_platform::sync::{RawSyncPrimitivesProvider, RwLock};
@@ -21,7 +20,7 @@ use super::errors::{
     ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
 };
 use super::resolver::{Resolver, ResolverEntry};
-use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence, UserInfo};
+use super::{DirEntry, FileStatus, Mode, NodeInfo, OFlags, SeekWhence, UserInfo};
 use crate::session::{ObjectEntry, ObjectRights};
 use crate::{BrokerError, BrokerSession, Result};
 
@@ -765,7 +764,7 @@ fn file_status(status: FileStatus) -> Result<ProtocolFileStatus> {
         .map_err(|_| BrokerError::Internal)?;
     let mode = FileMode::from_bits(mode_bits).ok_or(BrokerError::Internal)?;
     Ok(ProtocolFileStatus {
-        file_type: file_type(status.file_type),
+        file_type: status.file_type,
         mode,
         size: u64::try_from(status.size).map_err(|_| BrokerError::Internal)?,
         owner: FileUser {
@@ -780,17 +779,9 @@ fn file_status(status: FileStatus) -> Result<ProtocolFileStatus> {
 fn directory_entry(entry: DirEntry) -> Result<FileDirectoryEntry> {
     Ok(FileDirectoryEntry {
         name: entry.name,
-        file_type: file_type(entry.file_type),
+        file_type: entry.file_type,
         node_info: entry.ino_info.map(node_info).transpose()?,
     })
-}
-
-const fn file_type(file_type: FileType) -> ProtocolFileType {
-    match file_type {
-        FileType::RegularFile => ProtocolFileType::RegularFile,
-        FileType::Directory => ProtocolFileType::Directory,
-        FileType::CharacterDevice => ProtocolFileType::CharacterDevice,
-    }
 }
 
 fn node_info(node_info: NodeInfo) -> Result<FileNodeInfo> {
@@ -927,6 +918,7 @@ fn file_status_error(error: FileStatusError) -> FileError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fs::FileType;
 
     #[test]
     fn file_status_excludes_object_type_mode_bits() {

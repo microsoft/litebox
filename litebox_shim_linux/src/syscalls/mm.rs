@@ -274,7 +274,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
 
         let files = self.files.borrow();
-        let static_data = files.fs.get_static_backing_data(fd.as_fs()?)?;
+        let static_data = files.fs.get_static_file_backing_data(fd.as_fs()?)?;
 
         if offset > static_data.len() {
             return None;
@@ -812,15 +812,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 let word_len = file_size.div_ceil(8);
                 let mut words = u64::new_vec_zeroed(word_len).ok()?;
                 let bytes = zerocopy::IntoBytes::as_mut_bytes(words.as_mut_slice());
-                match self.sys_read(fd, &mut bytes[..file_size], Some(0)) {
-                    Ok(n) if n == file_size => {
-                        litebox_syscall_rewriter::aarch64::ElfCodeMetadata::parse_aligned_in_place(
-                            &mut words, file_size,
-                        )
-                        .ok()
-                    }
-                    _ => None,
-                }
+                self.read_file_exact_at(fd, &mut bytes[..file_size], 0)
+                    .ok()?;
+                litebox_syscall_rewriter::aarch64::ElfCodeMetadata::parse_aligned_in_place(
+                    &mut words, file_size,
+                )
+                .ok()
             })
         };
         #[cfg(all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"))]
@@ -952,6 +949,23 @@ impl<Platform: ShimPlatform> Task<Platform> {
         true
     }
 
+    fn read_file_exact_at(
+        &self,
+        fd: i32,
+        mut data: &mut [u8],
+        mut offset: usize,
+    ) -> Result<(), Errno> {
+        while !data.is_empty() {
+            let read = self.sys_read(fd, data, Some(offset))?;
+            if read == 0 {
+                return Err(Errno::EIO);
+            }
+            offset = offset.checked_add(read).ok_or(Errno::EOVERFLOW)?;
+            data = &mut data[read..];
+        }
+        Ok(())
+    }
+
     /// Check if a file has the LITEBOX trampoline magic at its tail.
     /// Returns (is_pre_patched, file_offset, vaddr, trampoline_size).
     fn check_trampoline_magic(&self, fd: i32) -> (bool, u64, u64, u64) {
@@ -969,6 +983,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if file_size < HEADER_SIZE {
             return (false, 0, 0, 0);
         }
+
         let mut tail = [0u8; HEADER_SIZE];
         match self.sys_read(fd, &mut tail, Some(file_size - HEADER_SIZE)) {
             Ok(n) if n == HEADER_SIZE => {}
@@ -1163,12 +1178,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 let mut tramp_data = alloc::vec![0u8; state.trampoline_file_size];
                 let file_off = state.trampoline_file_offset.trunc();
                 let tramp_ptr = UserPtrMut::<u8>::from_usize(tramp_addr);
-                match self.sys_read(fd, &mut tramp_data, Some(file_off)) {
-                    Ok(n) if n == tramp_data.len() => {}
-                    _ => {
-                        let _ = self.sys_munmap_raw(tramp_ptr, tramp_len);
-                        return false;
-                    }
+                if self
+                    .read_file_exact_at(fd, &mut tramp_data, file_off)
+                    .is_err()
+                {
+                    let _ = self.sys_munmap_raw(tramp_ptr, tramp_len);
+                    return false;
                 }
 
                 // Write syscall entry point to the first 8 bytes.
@@ -1542,12 +1557,79 @@ impl<Platform: ShimPlatform> Task<Platform> {
 mod tests {
     use litebox::{
         fs::{Mode, OFlags},
+        mm::linux::PAGE_SIZE,
         platform::PageManagementProvider,
     };
+    use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags};
     use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
+    use object::{elf::FileHeader64, endian::LittleEndian};
 
-    use crate::syscalls::tests::TestPlatform as Platform;
-    use crate::{UserPtrMut, syscalls::tests::init_platform};
+    use crate::syscalls::test_broker::{FileCall, Scripted, ScriptedFiles, closed, opened};
+    use crate::syscalls::tests::{
+        FILE_HANDLE, ROOT, TestPlatform as Platform, init_platform, mode, scripted_task,
+    };
+    use crate::{Task, UserPtrMut};
+
+    fn open_scripted_mmap_file(files: &ScriptedFiles, task: &Task<Platform>, path: &str) -> i32 {
+        files.script([opened(FILE_HANDLE)]);
+        let fd = i32::try_from(
+            task.sys_open(path, OFlags::RDONLY, Mode::empty())
+                .expect("the scripted open must succeed"),
+        )
+        .unwrap();
+        assert_eq!(
+            files.take_calls(),
+            alloc::vec![FileCall::Open {
+                path: path.into(),
+                user: ROOT,
+                access: FileAccessMode::ReadOnly,
+                flags: FileOpenFlags::from_bits(0).unwrap(),
+                mode: mode(0),
+            }]
+        );
+        fd
+    }
+
+    fn script_mmap_bytes(files: &ScriptedFiles, data: &[u8]) {
+        files.script([
+            Scripted::Read(data.to_vec()),
+            Scripted::Read(alloc::vec![]),
+            Scripted::Read(alloc::vec![]),
+        ]);
+    }
+
+    fn assert_mmap_reads(files: &ScriptedFiles, data_len: usize) {
+        assert_eq!(
+            files.take_calls(),
+            alloc::vec![
+                FileCall::Read {
+                    handle: FILE_HANDLE,
+                    length: u32::try_from(PAGE_SIZE).unwrap(),
+                    offset: Some(0),
+                },
+                FileCall::Read {
+                    handle: FILE_HANDLE,
+                    length: u32::try_from(PAGE_SIZE).unwrap(),
+                    offset: Some(u64::try_from(data_len).unwrap()),
+                },
+                FileCall::Read {
+                    handle: FILE_HANDLE,
+                    length: u32::try_from(core::mem::size_of::<FileHeader64<LittleEndian>>())
+                        .unwrap(),
+                    offset: Some(0),
+                },
+            ]
+        );
+    }
+
+    fn close_scripted_mmap_file(files: &ScriptedFiles, task: &Task<Platform>, fd: i32) {
+        files.script([closed()]);
+        task.sys_close(fd).expect("the scripted close must succeed");
+        assert_eq!(
+            files.take_calls(),
+            alloc::vec![FileCall::Close(FILE_HANDLE)]
+        );
+    }
 
     /// Fail closed: an unpatched placeholder executes silently.
     #[cfg(target_arch = "aarch64")]
@@ -1728,14 +1810,10 @@ mod tests {
 
     #[test]
     fn test_file_backed_mmap() {
-        let task = init_platform();
-
         let content = b"Hello, world!";
-        let fd = task
-            .sys_open("test.txt", OFlags::RDWR | OFlags::CREAT, Mode::RWXU)
-            .unwrap();
-        let fd = i32::try_from(fd).unwrap();
-        assert_eq!(task.sys_write(fd, content, None).unwrap(), content.len());
+        let (files, task) = scripted_task([]);
+        let fd = open_scripted_mmap_file(&files, &task, "/test.txt");
+        script_mmap_bytes(&files, content);
         let addr = task
             .sys_mmap(
                 0,
@@ -1752,8 +1830,9 @@ mod tests {
                 .as_ref(),
             content.as_slice(),
         );
+        assert_mmap_reads(&files, content.len());
         task.sys_munmap(addr, 0x1000).unwrap();
-        task.sys_close(fd).unwrap();
+        close_scripted_mmap_file(&files, &task, fd);
     }
 
     #[test]
@@ -2058,14 +2137,10 @@ mod tests {
 
     #[test]
     fn test_map_shared_readonly_file() {
-        let task = init_platform();
-
         let content = b"Hello, shared!";
-        let fd = task
-            .sys_open("shared.txt", OFlags::RDWR | OFlags::CREAT, Mode::RWXU)
-            .unwrap();
-        let fd = i32::try_from(fd).unwrap();
-        assert_eq!(task.sys_write(fd, content, None).unwrap(), content.len());
+        let (files, task) = scripted_task([]);
+        let fd = open_scripted_mmap_file(&files, &task, "/shared.txt");
+        script_mmap_bytes(&files, content);
 
         // MAP_SHARED with PROT_READ on a file should succeed
         let addr = task
@@ -2079,6 +2154,7 @@ mod tests {
                 .as_ref(),
             content.as_slice(),
         );
+        assert_mmap_reads(&files, content.len());
 
         // mprotect to add write permission should fail
         let err = task
@@ -2087,7 +2163,7 @@ mod tests {
         assert_eq!(err, Errno::EACCES);
 
         task.sys_munmap(addr, 0x1000).unwrap();
-        task.sys_close(fd).unwrap();
+        close_scripted_mmap_file(&files, &task, fd);
     }
 
     #[test]

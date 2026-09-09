@@ -3,10 +3,7 @@
 
 use anyhow::{Context as _, Result, anyhow};
 use clap::Parser;
-use litebox::fs::Mode;
 use litebox_platform_linux_userland::LinuxUserland as Platform;
-use memmap2::Mmap;
-use std::os::linux::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
 use litebox_broker_local_userland as broker;
@@ -74,7 +71,7 @@ pub struct CliArgs {
     /// This is used by `litebox-packager` to create fully self-contained tar bundles.
     #[arg(
         long = "program-from-tar",
-        requires_all = ["unstable", "initial_files"],
+        requires = "unstable",
         conflicts_with = "rewrite_syscalls",
         help_heading = "Unstable Options"
     )]
@@ -98,30 +95,6 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub broker_proxy_url: Option<String>,
-}
-
-struct MmappedFile {
-    data: &'static [u8],
-    abs_path: PathBuf,
-}
-
-fn mmapped_file(path: impl AsRef<Path>) -> Result<MmappedFile> {
-    let path = path.as_ref();
-    let abs_path = std::path::absolute(path)
-        .map_err(|e| anyhow!("Could not get absolute path for {}: {}", path.display(), e))?;
-    let file = std::fs::File::open(&abs_path)?;
-    let data = {
-        // SAFETY: We assume that the file given to us is not going to change _externally_ while in
-        // the middle of execution. Since we are mapping it as read-only and mapping it only once,
-        // we are not planning to change it either. With both these in mind, this call is safe.
-        //
-        // We need to leak the `Mmap` object, so that it stays alive until the end of the program,
-        // rather than being unmapped at function finish (i.e., to get the `'static` lifetime).
-        Box::leak(Box::new(unsafe { Mmap::map(&file) }.map_err(|e| {
-            anyhow!("Could not read tar file at {}: {}", path.display(), e)
-        })?))
-    };
-    Ok(MmappedFile { data, abs_path })
 }
 
 /// Run Linux programs with LiteBox on unmodified Linux
@@ -164,114 +137,36 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         );
     }
 
-    let broker_connection = match cli_args.broker_control_channel.as_deref() {
-        Some(control_socket_path) => {
-            Some(litebox_platform_linux_userland::with_guest_signals_blocked(
-                || broker::connect(control_socket_path),
-            )?)
-        }
-        None => None,
-    };
-
-    let mut cow_eligible_regions: Vec<MmappedFile> = Vec::new();
-
-    // When --program-from-tar is set, the program binary is already in the tar file,
-    // so we skip reading it from the host filesystem and skip extracting ancestor modes.
-    #[allow(clippy::type_complexity)]
-    let (ancestor_modes_and_users, prog_data): (
-        Vec<(litebox::fs::Mode, u32)>,
-        Option<alloc::borrow::Cow<'static, [u8]>>,
-    ) = if cli_args.program_from_tar {
-        (Vec::new(), None)
-    } else {
-        let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap();
-        if !prog.exists() {
-            let mut msg = format!("program not found on host filesystem: {}", prog.display());
-            if cli_args.initial_files.is_some() {
-                msg.push_str(
-                    "\nhint: if the program is inside the tar archive, \
-                     add --program-from-tar",
-                );
-            }
-            anyhow::bail!(msg);
-        }
-        let ancestors: Vec<_> = prog.ancestors().collect();
-        let modes: Vec<_> = ancestors
-            .into_iter()
-            .rev()
-            .skip(1)
-            .map(|path| {
-                let metadata = path.metadata().unwrap();
-                (
-                    litebox::fs::Mode::from_bits(metadata.st_mode()).unwrap(),
-                    metadata.st_uid(),
-                )
-            })
-            .collect();
-        let file = mmapped_file(&prog)?;
-        let data = if cli_args.rewrite_syscalls {
-            #[cfg(target_arch = "aarch64")]
-            let rewritten = litebox_syscall_rewriter::hook_syscalls_in_elf_with_options(
-                file.data,
-                None,
-                litebox_syscall_rewriter::RewriteOptions::new(
-                    litebox_syscall_rewriter::TargetHost::Linux,
-                    cfg!(feature = "aarch64_virtualize_x18"),
-                ),
-            )
-            .with_context(|| format!("failed to rewrite {}", prog.display()))?;
-            #[cfg(not(target_arch = "aarch64"))]
-            let rewritten = litebox_syscall_rewriter::hook_syscalls_in_elf(file.data, None)
-                .with_context(|| format!("failed to rewrite {}", prog.display()))?;
-            rewritten.into()
-        } else {
-            let data = file.data.into();
-            cow_eligible_regions.push(file);
-            data
-        };
-        (modes, Some(data))
-    };
-    let tar_data: &'static [u8] = if let Some(tar_file) = cli_args.initial_files.as_ref() {
-        if tar_file.extension().and_then(|x| x.to_str()) != Some("tar") {
-            anyhow::bail!("Expected a .tar file, found {}", tar_file.display());
-        }
-        mmapped_file(tar_file)?.data
-    } else {
-        litebox::fs::tar_ro::EMPTY_TAR_FILE
-    };
-
     // TODO(jb): Clean up platform initialization once we have https://github.com/MSRSSP/litebox/issues/24
     let platform = Platform::new();
 
-    for file in cow_eligible_regions {
-        platform.register_cow_region(file.data, file.abs_path);
-    }
-
     let mut broker_positional_io_fds = Vec::new();
     let mut broker_shutdown_fds = Vec::new();
-    let shim_builder = if let Some(broker_connection) = broker_connection {
-        let broker::BrokerConnection {
-            local: broker_local,
-            notifications: broker_notifications,
-            coordinator: broker_association_coordinator,
-            positional_io_fds,
-            shutdown_fd,
-        } = broker_connection;
-        broker_positional_io_fds.extend(positional_io_fds);
-        broker_shutdown_fds.push(shutdown_fd);
-        let litebox = litebox::LiteBox::new_with_broker_local(platform, broker_local);
-        broker_association_coordinator.install_dispatch(litebox.broker_failure_dispatcher());
-        litebox_platform_linux_userland::with_guest_signals_blocked(|| {
-            broker::start_notification_receiver(
-                broker_notifications,
-                broker_association_coordinator,
-                litebox.broker_notification_dispatcher(),
-            )
-        })?;
-        litebox_shim_linux::LinuxShimBuilder::new_with_litebox(platform, litebox)
-    } else {
-        litebox_shim_linux::LinuxShimBuilder::new(platform)
-    };
+    let control_socket_path = cli_args
+        .broker_control_channel
+        .as_deref()
+        .context("file operations require --broker-control-channel")?;
+    let broker::BrokerConnection {
+        local: broker_local,
+        notifications: broker_notifications,
+        coordinator: broker_association_coordinator,
+        positional_io_fds,
+        shutdown_fd,
+    } = litebox_platform_linux_userland::with_guest_signals_blocked(|| {
+        broker::connect(control_socket_path)
+    })?;
+    broker_positional_io_fds.extend(positional_io_fds);
+    broker_shutdown_fds.push(shutdown_fd);
+    let litebox = litebox::LiteBox::new_with_broker_local(platform, broker_local);
+    broker_association_coordinator.install_dispatch(litebox.broker_failure_dispatcher());
+    litebox_platform_linux_userland::with_guest_signals_blocked(|| {
+        broker::start_notification_receiver(
+            broker_notifications,
+            broker_association_coordinator,
+            litebox.broker_notification_dispatcher(),
+        )
+    })?;
+    let shim_builder = litebox_shim_linux::LinuxShimBuilder::new_with_litebox(platform, litebox);
     // SAFETY: `gettid` takes no pointer arguments and has no Rust-side aliasing requirements.
     let tid = unsafe { libc::syscall(libc::SYS_gettid) }
         .try_into()
@@ -286,83 +181,6 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         gid: u32::from(DEFAULT_GUEST_GID),
         egid: u32::from(DEFAULT_GUEST_GID),
     };
-    let initial_file_system = {
-        // The in-memory layer is pre-populated at construction, which lets us set up root-owned
-        // directories and files without ever acting as root at runtime.
-        //
-        // A host uid of 0 anywhere along the path means the entry stays root-owned; as soon as a
-        // path component belongs to a non-root host user, that component and everything below it
-        // is owned by the guest user.
-        let owner_of = |parent_host_user: u32, host_user: u32| {
-            if parent_host_user == 0 && host_user == 0 {
-                litebox::fs::UserInfo::ROOT
-            } else {
-                litebox::fs::UserInfo {
-                    user: DEFAULT_GUEST_UID,
-                    group: DEFAULT_GUEST_GID,
-                }
-            }
-        };
-        let mut entries: Vec<(String, litebox::fs::in_mem::InitialNode)> = Vec::new();
-
-        // When loading the program from the tar, we don't need to create ancestor
-        // directories or write the program binary into the in-memory FS -- the program
-        // is already in the tar layer.
-        if let Some(prog_data) = prog_data {
-            let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap();
-            let ancestors: Vec<_> = prog.ancestors().collect();
-            let mut prev_user = 0;
-            for (path, &mode_and_user) in ancestors
-                .into_iter()
-                .skip(1)
-                .rev()
-                .skip(1)
-                .zip(&ancestor_modes_and_users)
-            {
-                entries.push((
-                    path.to_str().unwrap().to_owned(),
-                    litebox::fs::in_mem::InitialNode::Directory {
-                        mode: mode_and_user.0,
-                        owner: owner_of(prev_user, mode_and_user.1),
-                    },
-                ));
-                prev_user = mode_and_user.1;
-            }
-            let last = ancestor_modes_and_users.last().ok_or_else(|| {
-                anyhow!("program path has no ancestor directories (is it the root path?)")
-            })?;
-            entries.push((
-                prog.to_str().unwrap().to_owned(),
-                litebox::fs::in_mem::InitialNode::File {
-                    mode: last.0,
-                    owner: owner_of(prev_user, last.1),
-                    data: prog_data,
-                },
-            ));
-        }
-
-        let tmp_mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
-        if let Some((_, node)) = entries.iter_mut().find(|(path, _)| path == "/tmp") {
-            // `/tmp` is an ancestor of the program, so it keeps the owner derived above and only
-            // has its mode widened.
-            let litebox::fs::in_mem::InitialNode::Directory { mode, .. } = node else {
-                unreachable!("ancestors are always directories")
-            };
-            *mode = tmp_mode;
-        } else {
-            entries.push((
-                "/tmp".to_owned(),
-                litebox::fs::in_mem::InitialNode::Directory {
-                    mode: tmp_mode,
-                    owner: litebox::fs::UserInfo::ROOT,
-                },
-            ));
-        }
-
-        let in_mem = litebox::fs::in_mem::InMem::new_initialized(entries);
-        shim_builder.default_fs(in_mem, tar_data.into())
-    };
-
     // We need to get the file path before enabling seccomp.
     // For --program-from-tar the path is already validated as absolute above,
     // so use it directly instead of resolving against the host CWD.
@@ -377,8 +195,6 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
             cli_args.program_and_arguments[0]
         )
     })?;
-
-    let initial_file_system = std::sync::Arc::new(initial_file_system);
 
     let shim = shim_builder.build();
 
@@ -403,7 +219,7 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         &broker_shutdown_fds,
     );
 
-    let program = shim.load_program(initial_file_system, task_params, prog_path, argv, envp)?;
+    let program = shim.load_program(task_params, prog_path, argv, envp)?;
 
     #[cfg(feature = "lock_tracing")]
     litebox::sync::start_recording();

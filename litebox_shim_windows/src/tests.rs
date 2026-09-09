@@ -1,14 +1,21 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+//! Shared fixtures and cross-cutting unit tests for the Windows shim.
+//!
+//! [`test_task`] builds a task over a broker association that serves no objects, so the shim's
+//! unit tests exercise guest and shim code rather than broker authority. Only tests that are
+//! genuinely about file-backed behavior use [`test_task_with_broker_files`]; see
+//! [`crate::test_broker`].
+
 extern crate std;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::mem::size_of;
-use litebox::fs::{Mode, OFlags};
 use litebox::platform::RawConstPointer as _;
 use litebox::utils::TruncateExt as _;
+use litebox_broker_core::fs::{Mode, UserInfo, in_mem::InitialNode};
 
 use crate::nt_types::{ObjectAttributes, UnicodeString};
 use crate::syscalls::Handle;
@@ -106,72 +113,65 @@ fn map_csr_server_shared_memory(
 }
 
 pub(crate) fn test_task() -> Task<TestPlatform> {
-    test_task_with_nls_files(&[])
+    test_task_from_litebox(crate::test_broker::litebox(test_platform()))
 }
 
-pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<TestPlatform> {
-    let platform = test_platform();
-    let in_mem = litebox::fs::in_mem::InMem::new_initialized([(
-        "/",
-        litebox::fs::in_mem::InitialNode::Directory {
-            mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
-            owner: litebox::fs::UserInfo::ROOT,
-        },
-    )]);
-    let shim_builder = crate::WindowsShimBuilder::<TestPlatform>::new(platform);
-    let fs = Arc::new(shim_builder.default_fs(in_mem, litebox::fs::tar_ro::EMPTY_TAR_FILE.into()));
-    let fs_context = litebox::fs::resolver::Context::new();
-    {
-        let fs = &*fs;
-        fs.mkdir(
-            &fs_context,
-            "/tmp",
-            litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
-        )
-        .expect("/tmp creation cannot fail on a fresh in-memory file system");
-        fs.chown(&fs_context, "/tmp", Some(1000), Some(1000))
-            .expect("/tmp chown cannot fail on a fresh in-memory file system");
-
-        if !nls_files.is_empty() {
-            fs.mkdir(
-                &fs_context,
-                "/Windows",
-                Mode::RWXU | Mode::RWXG | Mode::RWXO,
-            )
-            .expect("/Windows creation cannot fail on a fresh in-memory file system");
-            fs.mkdir(
-                &fs_context,
-                "/Windows/System32",
-                Mode::RWXU | Mode::RWXG | Mode::RWXO,
-            )
-            .expect("/Windows/System32 creation cannot fail on a fresh in-memory file system");
-            fs.mkdir(
-                &fs_context,
-                "/Windows/Globalization",
-                Mode::RWXU | Mode::RWXG | Mode::RWXO,
-            )
-            .expect("/Windows/Globalization creation cannot fail on a fresh in-memory file system");
-            fs.mkdir(
-                &fs_context,
-                "/Windows/Globalization/Sorting",
-                Mode::RWXU | Mode::RWXG | Mode::RWXO,
-            )
-            .expect("/Windows/Globalization/Sorting creation cannot fail on a fresh in-memory file system");
-        }
-        for (path, bytes) in nls_files {
-            let fd = fs
-                .open(
-                    &fs_context,
-                    *path,
-                    OFlags::WRONLY | OFlags::CREAT,
-                    Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::ROTH,
-                )
-                .expect("NLS fixture creation should succeed");
-            fs.write(&fd, bytes, Some(0))
-                .expect("NLS fixture write should succeed");
-            fs.close(&fd).expect("NLS fixture close should succeed");
-        }
+/// Returns a task whose broker serves `files` from an in-memory filesystem.
+///
+/// Reserved for tests that genuinely exercise file-backed behavior. Every other test must use
+/// [`test_task`], whose broker serves no files at all. The broker core is a process singleton, so
+/// exactly one such task may be built per test process; `cargo nextest` runs each test in its own
+/// process.
+pub(crate) fn test_task_with_broker_files(files: &[(&str, &[u8])]) -> Task<TestPlatform> {
+    let directory = |owner| InitialNode::Directory {
+        mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+        owner,
+    };
+    let mut entries = alloc::vec![
+        ("/".into(), directory(UserInfo::ROOT)),
+        (
+            "/tmp".into(),
+            directory(UserInfo {
+                user: 1000,
+                group: 1000,
+            }),
+        ),
+        ("/registry".into(), directory(UserInfo::ROOT)),
+    ];
+    if !files.is_empty() {
+        entries.extend([
+            ("/Windows".into(), directory(UserInfo::ROOT)),
+            ("/Windows/System32".into(), directory(UserInfo::ROOT)),
+            ("/Windows/Globalization".into(), directory(UserInfo::ROOT)),
+            (
+                "/Windows/Globalization/Sorting".into(),
+                directory(UserInfo::ROOT),
+            ),
+        ]);
     }
+    entries.extend(files.iter().map(|(path, bytes)| {
+        (
+            (*path).into(),
+            InitialNode::File {
+                mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::ROTH,
+                owner: UserInfo::ROOT,
+                data: (*bytes).to_vec().into(),
+            },
+        )
+    }));
+
+    test_task_from_litebox(crate::test_broker::litebox_with_broker_files(
+        test_platform(),
+        entries,
+    ))
+}
+
+fn test_task_from_litebox(litebox: litebox::LiteBox<TestPlatform>) -> Task<TestPlatform> {
+    let platform = test_platform();
+    let shim_builder =
+        crate::WindowsShimBuilder::<TestPlatform>::new_with_litebox(platform, litebox);
+    let fs = Arc::new(shim_builder.litebox().clone());
+    let fs_context = litebox::fs::Context::new();
     let shim = shim_builder.build();
     let WindowsShim(global) = shim;
 
@@ -201,6 +201,15 @@ pub(crate) fn test_task_with_nls_files(nls_files: &[(&str, &[u8])]) -> Task<Test
         context: 0,
         thread_object,
     }
+}
+
+/// Building a shim and its initial task must not depend on the broker.
+///
+/// The association behind [`test_task`] panics on every request, so this fails loudly if shim
+/// construction starts asking the broker for anything.
+#[test]
+fn building_a_task_issues_no_broker_requests() {
+    let _task = test_task();
 }
 
 const EVENT_MODIFY_STATE: u32 = 0x0002;

@@ -10,10 +10,7 @@ mod tests {
     use litebox::fs::{Mode, OFlags};
     use litebox_common_linux::{FcntlArg, FileDescriptorFlags, IoctlArg, Termios, errno::Errno};
 
-    use crate::{
-        UserPtrMut,
-        syscalls::tests::{init_platform, init_platform_with_broker},
-    };
+    use crate::{UserPtrMut, syscalls::tests::init_platform};
 
     fn termios() -> Termios {
         Termios {
@@ -128,19 +125,8 @@ mod tests {
     }
 
     #[test]
-    fn test_stdio_terminal_query_requires_broker() {
-        let task = init_platform();
-        let mut termios = termios();
-
-        assert_eq!(
-            task.sys_ioctl(1, IoctlArg::TCGETS(UserPtrMut::from_ptr(&raw mut termios)),),
-            Err(Errno::EIO)
-        );
-    }
-
-    #[test]
     fn test_stdio_terminal_query_uses_broker() {
-        let task = init_platform_with_broker();
+        let task = init_platform();
         let mut termios = termios();
 
         assert_eq!(
