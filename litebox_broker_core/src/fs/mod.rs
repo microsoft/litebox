@@ -25,6 +25,10 @@ pub mod overlay;
 pub mod resolver;
 mod service;
 pub mod tar_ro;
+#[cfg(test)]
+mod test_support;
+#[cfg(test)]
+mod tests;
 
 pub(crate) use service::File;
 pub use service::{

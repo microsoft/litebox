@@ -618,10 +618,10 @@ impl Drop for BrokerSession {
 
 #[cfg(test)]
 mod tests {
-    use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-    use core::time::Duration;
+    use core::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{SessionReferences, release_pending_reference};
+    use crate::test_platform::TestPlatform;
     use crate::{
         BrokerCore, BrokerCoreLimits, BrokerError, CallerCredential, ObjectRights, PolicyEngine,
         SocketPolicy,
@@ -632,83 +632,13 @@ mod tests {
         FileAccessMode, FileError, FileMode, FileOpenFlags, FileSeekWhence, FileType, FileUser,
     };
     use litebox_broker_protocol::readiness::ReadinessFlags;
-    use litebox_platform::sync::{
-        ImmediatelyWokenUp, RawMutex, RawMutexProvider, UnblockedOrTimedOut,
-    };
-    use std::{
-        sync::{Arc, Condvar, Mutex},
-        vec::Vec,
-    };
+    use std::{sync::Arc, vec::Vec};
 
     const TEST_MAX_REFERENCES: usize = 4;
     const TEST_MAX_PIPE_CAPACITY: usize = 8;
     const TEST_MAX_REFERENCES_PER_SESSION: usize = 2;
     const TEST_MAX_PIPE_CAPACITY_PER_SESSION: usize = 4;
     const ROOT: FileUser = FileUser { user: 0, group: 0 };
-
-    struct TestRawMutex {
-        state: AtomicU32,
-        waiters: Mutex<()>,
-        wake: Condvar,
-    }
-
-    impl RawMutex for TestRawMutex {
-        const INIT: Self = Self {
-            state: AtomicU32::new(0),
-            waiters: Mutex::new(()),
-            wake: Condvar::new(),
-        };
-
-        fn underlying_atomic(&self) -> &AtomicU32 {
-            &self.state
-        }
-
-        fn wake_many(&self, count: usize) -> usize {
-            let _waiters = self.waiters.lock().unwrap();
-            self.wake.notify_all();
-            count
-        }
-
-        fn block(&self, expected: u32) -> Result<(), ImmediatelyWokenUp> {
-            let waiters = self.waiters.lock().unwrap();
-            if self.state.load(Ordering::Acquire) != expected {
-                return Err(ImmediatelyWokenUp);
-            }
-            let _waiters = self
-                .wake
-                .wait_while(waiters, |()| self.state.load(Ordering::Acquire) == expected)
-                .unwrap();
-            Ok(())
-        }
-
-        fn block_or_timeout(
-            &self,
-            expected: u32,
-            timeout: Duration,
-        ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
-            let waiters = self.waiters.lock().unwrap();
-            if self.state.load(Ordering::Acquire) != expected {
-                return Err(ImmediatelyWokenUp);
-            }
-            let (_waiters, result) = self
-                .wake
-                .wait_timeout_while(waiters, timeout, |()| {
-                    self.state.load(Ordering::Acquire) == expected
-                })
-                .unwrap();
-            Ok(if result.timed_out() {
-                UnblockedOrTimedOut::TimedOut
-            } else {
-                UnblockedOrTimedOut::Unblocked
-            })
-        }
-    }
-
-    struct TestSync;
-
-    impl RawMutexProvider for TestSync {
-        type RawMutex = TestRawMutex;
-    }
 
     #[test]
     fn pending_reference_release_checks_both_counters() {
@@ -952,7 +882,7 @@ mod tests {
     fn object_reference_lifecycle_uses_public_core_constructor_once() {
         let socket_provider = Arc::new(crate::socket::tests::TestSocketProvider::default());
         let fs = crate::fs::composer::Composer::builder()
-            .mount("/", crate::fs::in_mem::InMem::<TestSync>::new)
+            .mount("/", crate::fs::in_mem::InMem::<TestPlatform>::new)
             .mount("/dev", crate::fs::devices::Devices::new)
             .build()
             .unwrap();
@@ -972,7 +902,7 @@ mod tests {
             socket_provider.clone(),
             Arc::new(crate::random::TestRandomProvider),
             Arc::new(crate::stdio::UnsupportedStdioProvider),
-            Arc::new(crate::fs::resolver::Resolver::<TestSync, _>::new(fs)),
+            Arc::new(crate::fs::resolver::Resolver::<TestPlatform, _>::new(fs)),
         )
         .unwrap();
 

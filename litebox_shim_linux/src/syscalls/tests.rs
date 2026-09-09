@@ -37,7 +37,7 @@ use litebox_common_linux::signal::{ILL_ILLOPN, SI_KERNEL, SiginfoData, Signal};
 
 extern crate std;
 
-const TEST_TAR_FILE: &[u8] = include_bytes!("../../../litebox/src/fs/test.tar");
+const TEST_TAR_FILE: &[u8] = include_bytes!("../../../litebox_broker_core/src/fs/test.tar");
 
 /// The concrete platform used by the shim's unit tests.
 ///

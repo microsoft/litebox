@@ -4,7 +4,8 @@
 //! Guest-facing filesystem facade.
 //!
 //! Filesystem resolution and backend implementations live in `litebox_broker_core`. This module
-//! retains LiteBox's guest values, descriptor integration, and compatibility module paths.
+//! retains LiteBox's guest values and descriptor integration, plus the 9P transport traits that
+//! deployments implement.
 
 use bitflags::bitflags;
 
@@ -15,103 +16,12 @@ pub mod errors;
 pub mod resolver;
 
 #[doc(hidden)]
-#[cfg(test)]
-pub mod backend {
-    pub use litebox_broker_core::fs::backend::*;
-}
-
-#[doc(hidden)]
-#[cfg(test)]
-pub mod composer {
-    pub use litebox_broker_core::fs::composer::*;
-}
-
-#[doc(hidden)]
-#[cfg(test)]
-pub mod devices {
-    pub use litebox_broker_core::fs::devices::*;
-}
-
-#[doc(hidden)]
-#[cfg(test)]
-pub mod in_mem {
-    pub use litebox_broker_core::fs::in_mem::{InMem, InMemDirHandle, InMemFileHandle};
-
-    /// A node used to pre-populate an [`InMem`] backend, via [`InMem::new_initialized`].
-    pub enum InitialNode {
-        /// A directory.
-        Directory {
-            /// Permission bits for the directory.
-            mode: super::Mode,
-            /// Owning user and group.
-            owner: super::UserInfo,
-        },
-        /// A regular file, along with its contents.
-        File {
-            /// Permission bits for the file.
-            mode: super::Mode,
-            /// Owning user and group.
-            owner: super::UserInfo,
-            /// The file's contents.
-            ///
-            /// Borrowed data is kept borrowed until the first write to the file, which makes this
-            /// the cheap way to set up large read-heavy files (such as executables).
-            data: alloc::borrow::Cow<'static, [u8]>,
-        },
-    }
-
-    impl From<InitialNode> for litebox_broker_core::fs::in_mem::InitialNode {
-        fn from(node: InitialNode) -> Self {
-            match node {
-                InitialNode::Directory { mode, owner } => Self::Directory {
-                    mode: litebox_broker_core::fs::Mode::from_bits_retain(mode.bits()),
-                    owner: litebox_broker_core::fs::UserInfo {
-                        user: owner.user,
-                        group: owner.group,
-                    },
-                },
-                InitialNode::File { mode, owner, data } => Self::File {
-                    mode: litebox_broker_core::fs::Mode::from_bits_retain(mode.bits()),
-                    owner: litebox_broker_core::fs::UserInfo {
-                        user: owner.user,
-                        group: owner.group,
-                    },
-                    data,
-                },
-            }
-        }
-    }
-}
-
-#[doc(hidden)]
-#[cfg(test)]
-pub(crate) mod inode_allocator {
-    pub(crate) use litebox_broker_core::fs::inode_allocator::*;
-}
-
-#[doc(hidden)]
 pub mod nine_p {
     pub use litebox_broker_core::fs::nine_p::*;
 }
 
-#[doc(hidden)]
-#[cfg(test)]
-pub mod overlay {
-    pub use litebox_broker_core::fs::overlay::*;
-}
-
-#[doc(hidden)]
-#[cfg(test)]
-pub mod tar_ro {
-    pub use litebox_broker_core::fs::tar_ro::*;
-}
-
 #[cfg(test)]
 mod tests;
-
-#[cfg(all(test, target_os = "linux"))]
-#[path = "nine_p/tests.rs"]
-mod nine_p_tests;
 
 bitflags! {
     /// `S_I*` constants for open, ...

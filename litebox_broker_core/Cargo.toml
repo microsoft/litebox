@@ -15,3 +15,7 @@ thiserror = { version = "2.0.6", default-features = false }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# Temporary directories exported by the `diod` server the 9P tests run against.
+tempfile = "3"
