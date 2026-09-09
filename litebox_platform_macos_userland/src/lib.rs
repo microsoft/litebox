@@ -1102,6 +1102,18 @@ struct ThreadContext<'a> {
     exit: GuestExit,
 }
 
+fn thread_start(
+    init_thread: Box<dyn litebox::shim::InitThread<ExecutionContext = PtRegs>>,
+    mut ctx: PtRegs,
+    vector_state: GuestVectorState,
+) {
+    initialize_thread_tls().expect("failed to initialize macOS thread TLS");
+    set_guest_vector_state(&vector_state);
+    // Allow caller to run some code before we return to the new thread.
+    let shim = init_thread.init();
+    run_thread_inner(shim.as_ref(), &mut ctx);
+}
+
 struct ThreadState {
     // Cleared before thread exit to prevent pthread ID-reuse races.
     identity: Mutex<Option<usize>>,
@@ -1140,13 +1152,20 @@ impl litebox::platform::ThreadProvider for MacosUserland {
     type ThreadHandle = ThreadHandle;
     unsafe fn spawn_thread(
         &self,
-        _ctx: &Self::ExecutionContext,
-        _init_thread: Box<dyn litebox::shim::InitThread<ExecutionContext = Self::ExecutionContext>>,
+        ctx: &Self::ExecutionContext,
+        init_thread: Box<dyn litebox::shim::InitThread<ExecutionContext = Self::ExecutionContext>>,
     ) -> Result<(), Self::ThreadSpawnError> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "guest thread creation is not supported",
-        ))
+        let ctx = ctx.clone();
+        let vector_state =
+            litebox::platform::GuestVectorStateProvider::get_guest_vector_state(self);
+        // TODO: report child startup failures synchronously. Unlike the Linux
+        // and Windows paths, initialize_thread_tls can fail after spawn_thread
+        // has already returned success. Unwinding still drops init_thread and
+        // its Task, so clear_child_tid is cleared and woken, but the guest sees
+        // only a child that exited before running its initialization callback.
+        let _handle = std::thread::Builder::new()
+            .spawn(move || thread_start(init_thread, ctx, vector_state))?;
+        Ok(())
     }
     fn current_thread(&self) -> Self::ThreadHandle {
         ThreadHandle::current()
@@ -2285,7 +2304,10 @@ unsafe extern "C" fn finish_thread_arch() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use litebox::platform::{PageManagementProvider as _, RawMutPointer as _};
+    use litebox::platform::{
+        PageManagementProvider as _, RawMutPointer as _, SystemInfoProvider as _,
+        ThreadProvider as _,
+    };
     const RW: MemoryRegionPermissions =
         MemoryRegionPermissions::READ.union(MemoryRegionPermissions::WRITE);
 
@@ -2345,6 +2367,156 @@ mod tests {
             unsafe { run_thread(PanickingShim, &mut ctx) };
         });
         assert!(result.is_err(), "the panic must propagate to the caller");
+    }
+
+    #[test]
+    fn child_inherits_vector_state_and_dispatches_on_host_stack() {
+        use litebox::shim::InitThread;
+        use litebox_syscall_rewriter::{
+            RewriteOptions, TargetHost, patch_code_segment_with_options,
+        };
+
+        #[derive(Debug, PartialEq)]
+        enum Event {
+            VectorStateInherited(bool),
+            EnteredOnHostStack(bool),
+            SyscallOnHostStackWithVectorState(bool),
+            Done,
+        }
+        struct VectorStateProbe {
+            entry: usize,
+            stack: usize,
+            vector_state: GuestVectorState,
+            send: std::sync::mpsc::Sender<Event>,
+        }
+        fn altstack_is_installed_and_inactive() -> bool {
+            // SAFETY: stack_t is zero-valid writable output for this thread's query.
+            let mut stack = unsafe { core::mem::zeroed::<libc::stack_t>() };
+            // SAFETY: null requests a query; stack remains writable for the call.
+            let result = unsafe { libc::sigaltstack(core::ptr::null(), &raw mut stack) };
+            result == 0 && stack.ss_flags & (libc::SS_ONSTACK | libc::SS_DISABLE) == 0
+        }
+        impl InitThread for VectorStateProbe {
+            type ExecutionContext = PtRegs;
+            fn init(self: Box<Self>) -> Box<dyn EnterShim<ExecutionContext = PtRegs>> {
+                self.send
+                    .send(Event::VectorStateInherited(
+                        get_guest_vector_state() == self.vector_state,
+                    ))
+                    .unwrap();
+                self
+            }
+        }
+        impl EnterShim for VectorStateProbe {
+            type ExecutionContext = PtRegs;
+            fn init(&self, ctx: &mut PtRegs) -> ContinueOperation {
+                self.send
+                    .send(Event::EnteredOnHostStack(
+                        altstack_is_installed_and_inactive(),
+                    ))
+                    .unwrap();
+                ctx.pc = self.entry;
+                ctx.sp = self.stack;
+                ctx.regs[8] = 172; // getpid
+                ContinueOperation::Resume
+            }
+            fn syscall(&self, _: &mut PtRegs) -> ContinueOperation {
+                self.send
+                    .send(Event::SyscallOnHostStackWithVectorState(
+                        altstack_is_installed_and_inactive()
+                            && get_guest_vector_state() == self.vector_state,
+                    ))
+                    .unwrap();
+                ContinueOperation::Terminate
+            }
+            fn exception(&self, _: &mut PtRegs, _: &ExceptionInfo) -> ContinueOperation {
+                ContinueOperation::Terminate
+            }
+            fn interrupt(&self, _: &mut PtRegs) -> ContinueOperation {
+                ContinueOperation::Resume
+            }
+        }
+        impl Drop for VectorStateProbe {
+            fn drop(&mut self) {
+                let _ = self.send.send(Event::Done);
+            }
+        }
+
+        let platform = MacosUserland::new();
+        let memory = platform
+            .allocate_pages(
+                TASK_ADDR_MIN..TASK_ADDR_MIN + 3 * PAGE_SIZE,
+                RW,
+                false,
+                true,
+                FixedAddressBehavior::Hint,
+            )
+            .unwrap();
+        let base = memory.as_usize();
+        let mut code = 0xd4000001u32.to_le_bytes();
+        let (trampoline, trapped) = patch_code_segment_with_options(
+            &mut code,
+            base as u64,
+            (base + PAGE_SIZE / 2) as u64,
+            platform.get_syscall_entry_point() as u64,
+            RewriteOptions::new(TargetHost::MacOs, true),
+        )
+        .unwrap();
+        assert!(trapped.is_empty());
+        assert_eq!(memory.write_slice_at_offset(0, &code), Some(()));
+        assert_eq!(
+            memory.write_slice_at_offset((PAGE_SIZE / 2).cast_signed(), &trampoline),
+            Some(())
+        );
+        // SAFETY: code is initialized and has no active readers before publication.
+        unsafe {
+            platform
+                .update_permissions(
+                    base..base + PAGE_SIZE,
+                    MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
+                )
+                .unwrap();
+        }
+        let original_vector_state = get_guest_vector_state();
+        let _restore = litebox::utils::defer(|| set_guest_vector_state(&original_vector_state));
+        let mut vector_state = GuestVectorState::default();
+        vector_state.registers[0] = 0x1234;
+        vector_state.registers[31] = 0x5678;
+        set_guest_vector_state(&vector_state);
+        let (send, receive) = std::sync::mpsc::channel();
+        // SAFETY: the test retains the child's rewritten code and stack until
+        // VectorStateProbe is dropped.
+        unsafe {
+            platform
+                .spawn_thread(
+                    &PtRegs::default(),
+                    Box::new(VectorStateProbe {
+                        entry: base,
+                        stack: base + 3 * PAGE_SIZE,
+                        vector_state,
+                        send,
+                    }),
+                )
+                .unwrap();
+        }
+        let observed: Vec<_> = (0..4)
+            .map(|_| receive.recv_timeout(Duration::from_secs(5)).unwrap())
+            .collect();
+        assert_eq!(
+            observed,
+            [
+                Event::VectorStateInherited(true),
+                Event::EnteredOnHostStack(true),
+                Event::SyscallOnHostStackWithVectorState(true),
+                Event::Done
+            ]
+        );
+        // SAFETY: VectorStateProbe has stopped, so the guest mappings are idle.
+        unsafe {
+            platform
+                .deallocate_pages(base..base + 3 * PAGE_SIZE)
+                .unwrap();
+        }
     }
 
     #[test]

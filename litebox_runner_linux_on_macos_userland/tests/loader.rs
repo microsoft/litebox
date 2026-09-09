@@ -79,6 +79,16 @@ fn test_load_exec_dynamic() {
 }
 
 #[test]
+fn test_load_exec_dynamic_pthreads() {
+    run_program("hello_thread", false);
+}
+
+#[test]
 fn test_syscall_rewriter() {
     run_program("hello_world_dyn", true);
+}
+
+#[test]
+fn test_syscall_rewriter_pthreads() {
+    run_program("hello_thread", true);
 }
