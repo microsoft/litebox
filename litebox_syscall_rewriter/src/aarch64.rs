@@ -6194,27 +6194,6 @@ mod tests {
     }
 
     #[test]
-    fn no_patch_sites_have_zero_trampoline_size_upper_bound() {
-        let bytes = NOP.to_le_bytes();
-        let section = TextSectionInfo {
-            vaddr: 0x1000,
-            file_offset: 0,
-            size: bytes.len() as u64,
-        };
-        let metadata = ElfCodeMetadata {
-            executable: vec![section],
-            identified: vec![section],
-        };
-
-        assert_eq!(
-            metadata
-                .trampoline_size_upper_bound(&bytes, crate::RewriteOptions::default())
-                .unwrap(),
-            0
-        );
-    }
-
-    #[test]
     fn no_patch_sites_emit_no_trampoline() {
         // No patch sites: a NOP-only section yields no trampoline at all, so the
         // caller emits a size-0 sentinel (matching the x86-64 path).
