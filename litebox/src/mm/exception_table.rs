@@ -347,7 +347,7 @@ fn exception_table() -> &'static [ExceptionTableEntry] {
 ///
 /// However, Rust/LLVM inline asm (but not global asm) seems to drop the '$', so
 /// this doesn't work. So, we use a different technique.
-#[cfg(windows)]
+#[cfg(target_os = "windows")]
 #[expect(clippy::cast_ptr_alignment)]
 fn exception_table() -> &'static [ExceptionTableEntry] {
     use crate::utils::ReinterpretUnsignedExt as _;

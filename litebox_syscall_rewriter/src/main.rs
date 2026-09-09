@@ -59,7 +59,7 @@ fn copy_file_permissions(
             input_file.metadata()?.mode(),
         ))?;
     }
-    #[cfg(windows)]
+    #[cfg(target_os = "windows")]
     {
         let input_metadata = input_file.metadata()?;
         let perms = input_metadata.permissions();
