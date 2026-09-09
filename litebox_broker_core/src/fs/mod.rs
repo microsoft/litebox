@@ -30,6 +30,7 @@ mod test_support;
 #[cfg(test)]
 mod tests;
 
+pub use litebox_broker_protocol::fs::FileType;
 pub(crate) use service::File;
 pub use service::{
     FileResult, FileService, UnsupportedFileService, chmod, chown, handle_status, mkdir, open,
@@ -74,16 +75,6 @@ bitflags! {
         /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
         const _ = !0;
     }
-}
-
-/// Types of files on a file-system.
-///
-/// See [`resolver::Resolver::file_status`].
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub enum FileType {
-    RegularFile,
-    Directory,
-    CharacterDevice,
 }
 
 bitflags! {

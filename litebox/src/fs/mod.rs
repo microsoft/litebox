@@ -10,9 +10,11 @@
 pub mod errors;
 mod file;
 
+pub use litebox_broker_protocol::fs::FileType;
+
 pub use file::{
-    Context, DirEntry, File, FileFd, FileStatus, FileType, Mode, NodeInfo, OFlags, ResolvedPath,
-    SeekWhence, UserInfo,
+    Context, DirEntry, File, FileFd, FileStatus, Mode, NodeInfo, OFlags, ResolvedPath, SeekWhence,
+    UserInfo,
 };
 
 #[doc(hidden)]
