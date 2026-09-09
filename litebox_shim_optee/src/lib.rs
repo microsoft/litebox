@@ -29,6 +29,7 @@ use litebox_common_optee::{
     TeeObjectInfo, TeeObjectType, TeeOperationMode, TeeResult, TeeUuid, UteeAttribute,
 };
 use litebox_platform_multiplex::Platform;
+use sha2::{Digest, Sha256};
 
 pub mod loader;
 pub mod session;
@@ -36,13 +37,14 @@ pub(crate) mod syscalls;
 
 pub mod msg_handler;
 
-#[cfg(feature = "platform_lvbs")]
 pub mod idk;
 
 // Re-export session management types for convenience
 pub use session::{OpenSessionTarget, SessionManager, SessionToken, TaInstance};
 
 const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
+pub(crate) const TA_DIGEST_LEN: usize = 32;
+pub(crate) type TaDigest = [u8; TA_DIGEST_LEN];
 
 pub struct OpteeShimEntrypoints {
     task: Task,
@@ -203,11 +205,6 @@ impl GlobalState {
         }
     }
 
-    /// Get the TA flags associated with the given TA UUID.
-    pub(crate) fn get_ta_flags(&self, ta_uuid: &TeeUuid) -> TaFlags {
-        self.ta_uuid_map.get_flags(ta_uuid).unwrap_or_default()
-    }
-
     /// Monotonic time elapsed since this instance was created, used as GP
     /// "system time" (`TEE_GetSystemTime`).
     ///
@@ -245,7 +242,7 @@ pub struct OpteeShim(Arc<GlobalState>);
 
 impl OpteeShim {
     /// Load the given `ldelf` binary into memory while making it ready to load the TA binary specified
-    /// by `ta_uuid` (and optionally `ta_bin`).
+    /// by `ta_uuid`.
     ///
     /// The loaded program is an *instance*: a single instance can serve many
     /// sessions. The active session id is supplied per entry via
@@ -257,12 +254,20 @@ impl OpteeShim {
         ldelf_bin: &[u8],
         ta_uuid: TeeUuid,
     ) -> Result<LoadedProgram, loader::elf::ElfLoaderError> {
+        let (ta_flags, ta_digest) = self
+            .0
+            .ta_uuid_map
+            .get_metadata(&ta_uuid)
+            .ok_or(loader::elf::ElfLoaderError::OpenError(Errno::ENOENT))?;
         let entrypoints = crate::OpteeShimEntrypoints {
             _not_send: core::marker::PhantomData,
             task: Task {
                 global: self.0.clone(),
                 thread: ThreadState::new(),
                 ta_app_id: ta_uuid,
+                // TODO: Populate this from trusted TA version metadata when available.
+                ta_svn: 0,
+                ta_digest,
                 tee_cryp_state_map: TeeCrypStateMap::new(),
                 tee_obj_map: TeeObjMap::new(),
                 ta_handle_map: TaHandleMap::new(),
@@ -289,8 +294,6 @@ impl OpteeShim {
         } else {
             None
         };
-        // Get TA flags from the stored binary
-        let ta_flags = entrypoints.task.global.get_ta_flags(&ta_uuid);
         Ok(LoadedProgram {
             entrypoints: Some(entrypoints),
             params_address,
@@ -1346,6 +1349,8 @@ struct TaInfo {
     binary: Arc<[u8]>,
     /// Parsed TA flags from .ta_head section
     flags: TaFlags,
+    /// SHA-256 digest of the raw TA binary
+    digest: TaDigest,
 }
 
 /// Data structure to maintain a mapping from TA UUIDs to their binary data and flags.
@@ -1371,11 +1376,13 @@ impl TaUuidMap {
             return false;
         }
 
+        let digest = Sha256::digest(&ta_bin).into();
         let _replaced = self.inner.write().insert(
             uuid,
             TaInfo {
                 binary: ta_bin,
                 flags: ta_head.flags,
+                digest,
             },
         );
         true
@@ -1385,9 +1392,11 @@ impl TaUuidMap {
         self.inner.read().get(uuid).map(|info| info.binary.clone())
     }
 
-    /// Get the TA flags for a given UUID.
-    pub(crate) fn get_flags(&self, uuid: &TeeUuid) -> Option<TaFlags> {
-        self.inner.read().get(uuid).map(|info| info.flags)
+    fn get_metadata(&self, uuid: &TeeUuid) -> Option<(TaFlags, TaDigest)> {
+        self.inner
+            .read()
+            .get(uuid)
+            .map(|info| (info.flags, info.digest))
     }
 
     // Lazy removal of TA binaries when they are no longer needed.
@@ -1410,6 +1419,10 @@ struct Task {
     thread: ThreadState,
     /// TA UUID
     ta_app_id: TeeUuid,
+    /// TA security version number
+    ta_svn: u32,
+    /// SHA-256 digest of the raw TA binary.
+    ta_digest: TaDigest,
     /// TEE cryptography state map
     tee_cryp_state_map: TeeCrypStateMap,
     /// TEE object map
@@ -1587,6 +1600,8 @@ mod test_utils {
                 global: self.clone(),
                 thread: ThreadState::new(),
                 ta_app_id: TeeUuid::default(),
+                ta_svn: 0,
+                ta_digest: [0; TA_DIGEST_LEN],
                 tee_cryp_state_map: TeeCrypStateMap::new(),
                 tee_obj_map: TeeObjMap::new(),
                 ta_handle_map: TaHandleMap::new(),
