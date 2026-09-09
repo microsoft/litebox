@@ -3740,6 +3740,9 @@ mod unix_tests {
 
     use alloc::{string::ToString, vec::Vec};
     use litebox::event::Events;
+    use litebox_broker_protocol::ObjectHandle;
+    use litebox_broker_protocol::fs::{FileAccessMode, FileError, FileOpenFlags};
+    use litebox_broker_protocol::message::FileResponse;
     use litebox_common_linux::{
         AddressFamily, AtFlags, ReceiveFlags, SendFlags, SockFlags, SockType, SocketOption,
         SocketOptionName, TimeParam, errno::Errno,
@@ -3747,7 +3750,12 @@ mod unix_tests {
 
     use crate::{
         UserPtr, UserPtrMut,
-        syscalls::{net::SocketAddress, tests::init_platform, unix::UnixSocketAddr},
+        syscalls::{
+            net::SocketAddress,
+            test_broker::{FileCall, Scripted, ScriptedFiles, closed, failed, opened},
+            tests::{ROOT, init_platform, mode, scripted_task},
+            unix::UnixSocketAddr,
+        },
     };
 
     extern crate std;
@@ -3758,15 +3766,12 @@ mod unix_tests {
 
     fn create_unix_server_socket(
         task: &TestTask,
-        addr: &str,
+        addr: UnixSocketAddr,
         flags: SockFlags,
     ) -> Result<u32, Errno> {
         let raw_server_fd = create_unix_socket(task, SockType::Stream, flags);
         let server_fd = typed_socket(task, raw_server_fd);
-        task.do_bind(
-            &server_fd,
-            SocketAddress::Unix(UnixSocketAddr::Path(addr.to_string())),
-        )?;
+        task.do_bind(&server_fd, SocketAddress::Unix(addr))?;
         task.do_listen(&server_fd, 1)?;
         Ok(raw_server_fd)
     }
@@ -3774,6 +3779,30 @@ mod unix_tests {
     fn close_socket(task: &TestTask, fd: u32) {
         task.sys_close(i32::try_from(fd).unwrap())
             .expect("close socket failed");
+    }
+
+    fn file_handle(value: u64) -> ObjectHandle {
+        ObjectHandle(0x2000 + value)
+    }
+
+    fn script_path_bind(files: &ScriptedFiles, handle: ObjectHandle) {
+        files.script([opened(handle)]);
+    }
+
+    fn script_path_lookup(files: &ScriptedFiles, handle: ObjectHandle) {
+        files.script([opened(handle), closed()]);
+    }
+
+    fn script_path_bind_failure(files: &ScriptedFiles, error: FileError) {
+        files.script([failed(error)]);
+    }
+
+    fn script_path_close(files: &ScriptedFiles) {
+        files.script([closed()]);
+    }
+
+    fn script_path_unlink(files: &ScriptedFiles) {
+        files.script([Scripted::Reply(FileResponse::Unlink)]);
     }
 
     fn typed_socket(
@@ -3812,14 +3841,14 @@ mod unix_tests {
         let task = init_platform();
 
         for _ in 0..10 {
-            let server_path = "/unix_stream_socket_server.sock";
-            let client_path = "/unix_stream_socket_client.sock";
             let raw_server_fd = create_unix_socket(&task, SockType::Datagram, SockFlags::empty());
             let raw_client_fd = create_unix_socket(&task, SockType::Datagram, SockFlags::empty());
             let server_fd = typed_socket(&task, raw_server_fd);
             let client_fd = typed_socket(&task, raw_client_fd);
-            let server_addr = SocketAddress::Unix(UnixSocketAddr::Path(server_path.to_string()));
-            let client_addr = SocketAddress::Unix(UnixSocketAddr::Path(client_path.to_string()));
+            let server_addr =
+                SocketAddress::Unix(UnixSocketAddr::Abstract(b"datagram-server".to_vec()));
+            let client_addr =
+                SocketAddress::Unix(UnixSocketAddr::Abstract(b"datagram-client".to_vec()));
             task.do_bind(&server_fd, server_addr.clone())
                 .expect("server bind failed");
             task.do_bind(&client_fd, client_addr.clone())
@@ -3879,10 +3908,6 @@ mod unix_tests {
 
             close_socket(&task, raw_server_fd);
             close_socket(&task, raw_client_fd);
-            task.sys_unlinkat(-1, server_path, AtFlags::empty())
-                .unwrap();
-            task.sys_unlinkat(-1, client_path, AtFlags::empty())
-                .unwrap();
         }
     }
 
@@ -3891,16 +3916,14 @@ mod unix_tests {
         let task = init_platform();
 
         for _ in 0..10 {
-            let addr = "/unix_stream_socket.sock";
-            let raw_server_fd = create_unix_server_socket(&task, addr, SockFlags::empty()).unwrap();
+            let addr = UnixSocketAddr::Abstract(b"stream-socket".to_vec());
+            let raw_server_fd =
+                create_unix_server_socket(&task, addr.clone(), SockFlags::empty()).unwrap();
             let raw_client_fd = create_unix_socket(&task, SockType::Stream, SockFlags::empty());
             let server_fd = typed_socket(&task, raw_server_fd);
             let client_fd = typed_socket(&task, raw_client_fd);
-            task.do_connect(
-                &client_fd,
-                SocketAddress::Unix(UnixSocketAddr::Path(addr.to_string())),
-            )
-            .unwrap();
+            task.do_connect(&client_fd, SocketAddress::Unix(addr))
+                .unwrap();
 
             let mut peer_addr = SocketAddress::default();
             let raw_server_conn = task
@@ -3941,13 +3964,17 @@ mod unix_tests {
 
             close_socket(&task, raw_server_fd);
             close_socket(&task, raw_client_fd);
-            task.sys_unlinkat(-1, addr, AtFlags::empty()).unwrap();
+            close_socket(&task, raw_server_conn);
         }
     }
 
     #[test]
     fn test_unix_stream_socket_refused() {
-        let task = init_platform();
+        const FIRST_BOUND: ObjectHandle = ObjectHandle(0x2300);
+        const FIRST_LOOKUP: ObjectHandle = ObjectHandle(0x2301);
+        const SECOND_BOUND: ObjectHandle = ObjectHandle(0x2302);
+
+        let (files, task) = scripted_task([]);
         let raw_client_fd = create_unix_socket(&task, SockType::Stream, SockFlags::empty());
         let client_fd = typed_socket(&task, raw_client_fd);
         let addr = "/unix_stream_socket_refused.sock";
@@ -3958,9 +3985,16 @@ mod unix_tests {
         assert_eq!(result.unwrap_err(), Errno::ECONNREFUSED);
         close_socket(&task, raw_client_fd);
 
-        let raw_server_fd = create_unix_server_socket(&task, addr, SockFlags::empty()).unwrap();
+        script_path_bind(&files, FIRST_BOUND);
+        let raw_server_fd = create_unix_server_socket(
+            &task,
+            UnixSocketAddr::Path(addr.to_string()),
+            SockFlags::empty(),
+        )
+        .unwrap();
         let raw_client_fd = create_unix_socket(&task, SockType::Stream, SockFlags::empty());
         let client_fd = typed_socket(&task, raw_client_fd);
+        script_path_lookup(&files, FIRST_LOOKUP);
         let result = task.do_connect(
             &client_fd,
             SocketAddress::Unix(UnixSocketAddr::Path(addr.to_string())),
@@ -3979,31 +4013,82 @@ mod unix_tests {
         assert_eq!(result.unwrap_err(), Errno::ECONNREFUSED);
 
         close_socket(&task, raw_another_client);
+        script_path_close(&files);
         close_socket(&task, raw_client_fd);
 
         let addr = "/unix_stream_socket_refused2.sock";
-        let raw_server_fd = create_unix_server_socket(&task, addr, SockFlags::empty()).unwrap();
+        script_path_bind(&files, SECOND_BOUND);
+        let raw_server_fd = create_unix_server_socket(
+            &task,
+            UnixSocketAddr::Path(addr.to_string()),
+            SockFlags::empty(),
+        )
+        .unwrap();
         let raw_client_fd = create_unix_socket(&task, SockType::Stream, SockFlags::empty());
         let client_fd = typed_socket(&task, raw_client_fd);
 
         // remove the sock file
+        script_path_unlink(&files);
         task.sys_unlinkat(-1, addr, AtFlags::empty()).unwrap();
+        script_path_bind_failure(&files, FileError::NoSuchFileOrDirectory);
         let result = task.do_connect(
             &client_fd,
             SocketAddress::Unix(UnixSocketAddr::Path(addr.to_string())),
         );
         assert_eq!(result.unwrap_err(), Errno::ENOENT);
 
+        script_path_close(&files);
         close_socket(&task, raw_server_fd);
         close_socket(&task, raw_client_fd);
+
+        assert_eq!(
+            files.take_calls(),
+            alloc::vec![
+                FileCall::Open {
+                    path: "/unix_stream_socket_refused.sock".into(),
+                    user: ROOT,
+                    access: FileAccessMode::ReadWrite,
+                    flags: FileOpenFlags::CREATE.union(FileOpenFlags::EXCLUSIVE),
+                    mode: mode(0o755),
+                },
+                FileCall::Open {
+                    path: "/unix_stream_socket_refused.sock".into(),
+                    user: ROOT,
+                    access: FileAccessMode::ReadWrite,
+                    flags: FileOpenFlags::from_bits(0).unwrap(),
+                    mode: mode(0o755),
+                },
+                FileCall::Close(FIRST_LOOKUP),
+                FileCall::Close(FIRST_BOUND),
+                FileCall::Open {
+                    path: "/unix_stream_socket_refused2.sock".into(),
+                    user: ROOT,
+                    access: FileAccessMode::ReadWrite,
+                    flags: FileOpenFlags::CREATE.union(FileOpenFlags::EXCLUSIVE),
+                    mode: mode(0o755),
+                },
+                FileCall::Unlink {
+                    path: "/unix_stream_socket_refused2.sock".into(),
+                    user: ROOT,
+                },
+                FileCall::Open {
+                    path: "/unix_stream_socket_refused2.sock".into(),
+                    user: ROOT,
+                    access: FileAccessMode::ReadWrite,
+                    flags: FileOpenFlags::from_bits(0).unwrap(),
+                    mode: mode(0o755),
+                },
+                FileCall::Close(SECOND_BOUND),
+            ]
+        );
     }
 
     fn test_multiple_unix_stream_connections(is_nonblocking: bool) {
         let task = init_platform();
-        let addr = "/unix_multi_stream_socket.sock";
+        let addr = UnixSocketAddr::Abstract(b"multi-stream-socket".to_vec());
         let raw_server_fd = create_unix_server_socket(
             &task,
-            addr,
+            addr.clone(),
             if is_nonblocking {
                 SockFlags::NONBLOCK
             } else {
@@ -4013,6 +4098,7 @@ mod unix_tests {
         .unwrap();
         let server_fd = typed_socket(&task, raw_server_fd);
 
+        let client_addr = addr.clone();
         let client = task.spawn_clone_for_test(move |task| {
             let mut client_fds = Vec::new();
             for _ in 0..10 {
@@ -4029,11 +4115,8 @@ mod unix_tests {
                 if is_nonblocking {
                     ppoll(&task, raw_server_fd, Events::OUT);
                 }
-                task.do_connect(
-                    &client_fd,
-                    SocketAddress::Unix(UnixSocketAddr::Path(addr.to_string())),
-                )
-                .unwrap();
+                task.do_connect(&client_fd, SocketAddress::Unix(client_addr.clone()))
+                    .unwrap();
                 client_fds.push((raw_client_fd, client_fd));
             }
 
@@ -4102,23 +4185,46 @@ mod unix_tests {
 
     #[test]
     fn test_unix_stream_socket_on_same_addr() {
-        let task = init_platform();
-        for _ in 0..10 {
+        let (files, task) = scripted_task([]);
+        for iteration in 0..10 {
             let addr = "/unix_stream_socket_server.sock";
-            let raw_server1_fd =
-                create_unix_server_socket(&task, addr, SockFlags::NONBLOCK).unwrap();
+            let first_bound = file_handle(iteration * 4);
+            let second_bound = file_handle(iteration * 4 + 1);
+            let first_lookup = file_handle(iteration * 4 + 2);
+            let second_lookup = file_handle(iteration * 4 + 3);
+
+            script_path_bind(&files, first_bound);
+            let raw_server1_fd = create_unix_server_socket(
+                &task,
+                UnixSocketAddr::Path(addr.to_string()),
+                SockFlags::NONBLOCK,
+            )
+            .unwrap();
             let server1_fd = typed_socket(&task, raw_server1_fd);
-            let err = create_unix_server_socket(&task, addr, SockFlags::empty()).unwrap_err();
+            script_path_bind_failure(&files, FileError::AlreadyExists);
+            let err = create_unix_server_socket(
+                &task,
+                UnixSocketAddr::Path(addr.to_string()),
+                SockFlags::empty(),
+            )
+            .unwrap_err();
             assert_eq!(err, Errno::EADDRINUSE);
 
             // remove the socket file to allow another server to bind to the same address
+            script_path_unlink(&files);
             task.sys_unlinkat(-1, addr, AtFlags::empty()).unwrap();
-            let raw_server2_fd =
-                create_unix_server_socket(&task, addr, SockFlags::NONBLOCK).unwrap();
+            script_path_bind(&files, second_bound);
+            let raw_server2_fd = create_unix_server_socket(
+                &task,
+                UnixSocketAddr::Path(addr.to_string()),
+                SockFlags::NONBLOCK,
+            )
+            .unwrap();
             let server2_fd = typed_socket(&task, raw_server2_fd);
 
             let raw_client1_fd = create_unix_socket(&task, SockType::Stream, SockFlags::empty());
             let client1_fd = typed_socket(&task, raw_client1_fd);
+            script_path_lookup(&files, first_lookup);
             task.do_connect(
                 &client1_fd,
                 SocketAddress::Unix(UnixSocketAddr::Path(addr.to_string())),
@@ -4138,32 +4244,55 @@ mod unix_tests {
             close_socket(&task, raw_client1_fd);
 
             // close server one and connect again
+            script_path_close(&files);
             close_socket(&task, raw_server1_fd);
             let raw_client2_fd = create_unix_socket(&task, SockType::Stream, SockFlags::empty());
             let client2_fd = typed_socket(&task, raw_client2_fd);
+            script_path_lookup(&files, second_lookup);
             task.do_connect(
                 &client2_fd,
                 SocketAddress::Unix(UnixSocketAddr::Path(addr.to_string())),
             )
             .unwrap();
             close_socket(&task, raw_client2_fd);
+            script_path_close(&files);
             close_socket(&task, raw_server2_fd);
 
             // still fail after we close the server
-            let err = create_unix_server_socket(&task, addr, SockFlags::empty()).unwrap_err();
+            script_path_bind_failure(&files, FileError::AlreadyExists);
+            let err = create_unix_server_socket(
+                &task,
+                UnixSocketAddr::Path(addr.to_string()),
+                SockFlags::empty(),
+            )
+            .unwrap_err();
             assert_eq!(err, Errno::EADDRINUSE);
 
+            script_path_unlink(&files);
             task.sys_unlinkat(-1, addr, AtFlags::empty()).unwrap();
         }
+
+        assert!(
+            files
+                .take_calls()
+                .iter()
+                .filter(|call| matches!(call, FileCall::Unlink { .. }))
+                .count()
+                == 20,
+            "each iteration must explicitly unlink both path bindings"
+        );
     }
 
     #[test]
     fn test_unix_datagram_socket_on_same_addr() {
-        let task = init_platform();
-        for _ in 0..10 {
+        let (files, task) = scripted_task([]);
+        for iteration in 0..10 {
             let addr = "/unix_datagram_socket_server.sock";
+            let first_bound = file_handle(iteration * 2);
+            let second_bound = file_handle(iteration * 2 + 1);
             let raw_server_fd = create_unix_socket(&task, SockType::Datagram, SockFlags::empty());
             let server_fd = typed_socket(&task, raw_server_fd);
+            script_path_bind(&files, first_bound);
             task.do_bind(
                 &server_fd,
                 SocketAddress::Unix(UnixSocketAddr::Path(addr.to_string())),
@@ -4172,6 +4301,7 @@ mod unix_tests {
 
             let raw_server_fd2 = create_unix_socket(&task, SockType::Datagram, SockFlags::empty());
             let server_fd2 = typed_socket(&task, raw_server_fd2);
+            script_path_bind_failure(&files, FileError::AlreadyExists);
             let err = task
                 .do_bind(
                     &server_fd2,
@@ -4180,19 +4310,34 @@ mod unix_tests {
                 .unwrap_err();
             assert_eq!(err, Errno::EADDRINUSE);
 
+            script_path_unlink(&files);
             task.sys_unlinkat(-1, addr, AtFlags::empty()).unwrap();
             let raw_server_fd2 = create_unix_socket(&task, SockType::Datagram, SockFlags::empty());
             let server_fd2 = typed_socket(&task, raw_server_fd2);
+            script_path_bind(&files, second_bound);
             task.do_bind(
                 &server_fd2,
                 SocketAddress::Unix(UnixSocketAddr::Path(addr.to_string())),
             )
             .unwrap();
 
+            script_path_close(&files);
             close_socket(&task, raw_server_fd);
+            script_path_close(&files);
             close_socket(&task, raw_server_fd2);
+            script_path_unlink(&files);
             task.sys_unlinkat(-1, addr, AtFlags::empty()).unwrap();
         }
+
+        assert!(
+            files
+                .take_calls()
+                .iter()
+                .filter(|call| matches!(call, FileCall::Unlink { .. }))
+                .count()
+                == 20,
+            "each iteration must explicitly unlink both path bindings"
+        );
     }
 
     fn unix_socketpair_bidirectional(ty: SockType, is_nonblocking: bool) {
@@ -4385,10 +4530,18 @@ mod unix_tests {
 
     #[test]
     fn test_unix_stream_addr() {
-        let task = init_platform();
+        const BOUND: ObjectHandle = ObjectHandle(0x2100);
+        const LOOKUP: ObjectHandle = ObjectHandle(0x2101);
+
+        let (files, task) = scripted_task([]);
         let server_path = "/unix_stream_sockname.sock";
-        let raw_server_fd =
-            create_unix_server_socket(&task, server_path, SockFlags::empty()).unwrap();
+        script_path_bind(&files, BOUND);
+        let raw_server_fd = create_unix_server_socket(
+            &task,
+            UnixSocketAddr::Path(server_path.to_string()),
+            SockFlags::empty(),
+        )
+        .unwrap();
         let server_fd = typed_socket(&task, raw_server_fd);
 
         // Server socket should have its bound address
@@ -4410,6 +4563,7 @@ mod unix_tests {
         ));
 
         // Connect client to server
+        script_path_lookup(&files, LOOKUP);
         task.do_connect(
             &client_fd,
             SocketAddress::Unix(UnixSocketAddr::Path(server_path.to_string())),
@@ -4452,14 +4606,46 @@ mod unix_tests {
 
         close_socket(&task, raw_client_fd);
         close_socket(&task, raw_server_conn);
+        script_path_close(&files);
         close_socket(&task, raw_server_fd);
+        script_path_unlink(&files);
         task.sys_unlinkat(-1, server_path, AtFlags::empty())
             .unwrap();
+        assert_eq!(
+            files.take_calls(),
+            alloc::vec![
+                FileCall::Open {
+                    path: server_path.into(),
+                    user: ROOT,
+                    access: FileAccessMode::ReadWrite,
+                    flags: FileOpenFlags::CREATE.union(FileOpenFlags::EXCLUSIVE),
+                    mode: mode(0o755),
+                },
+                FileCall::Open {
+                    path: server_path.into(),
+                    user: ROOT,
+                    access: FileAccessMode::ReadWrite,
+                    flags: FileOpenFlags::from_bits(0).unwrap(),
+                    mode: mode(0o755),
+                },
+                FileCall::Close(LOOKUP),
+                FileCall::Close(BOUND),
+                FileCall::Unlink {
+                    path: server_path.into(),
+                    user: ROOT,
+                },
+            ],
+            "path-based Unix sockets must issue explicit open, lookup, close, and unlink requests"
+        );
     }
 
     #[test]
     fn test_unix_datagram_addr() {
-        let task = init_platform();
+        const SERVER: ObjectHandle = ObjectHandle(0x2200);
+        const CLIENT: ObjectHandle = ObjectHandle(0x2201);
+        const LOOKUP: ObjectHandle = ObjectHandle(0x2202);
+
+        let (files, task) = scripted_task([]);
         let server_path = "/unix_datagram_sockname_server.sock";
         let client_path = "/unix_datagram_sockname_client.sock";
 
@@ -4482,6 +4668,7 @@ mod unix_tests {
         ));
 
         // Bind server
+        script_path_bind(&files, SERVER);
         task.do_bind(
             &server_fd,
             SocketAddress::Unix(UnixSocketAddr::Path(server_path.to_string())),
@@ -4496,6 +4683,7 @@ mod unix_tests {
         );
 
         // Bind client
+        script_path_bind(&files, CLIENT);
         task.do_bind(
             &client_fd,
             SocketAddress::Unix(UnixSocketAddr::Path(client_path.to_string())),
@@ -4510,6 +4698,7 @@ mod unix_tests {
         );
 
         // Connect client to server
+        script_path_lookup(&files, LOOKUP);
         task.do_connect(
             &client_fd,
             SocketAddress::Unix(UnixSocketAddr::Path(server_path.to_string())),
@@ -4534,11 +4723,52 @@ mod unix_tests {
         let server_peer_result = task.do_getpeername(&server_fd);
         assert_eq!(server_peer_result.unwrap_err(), Errno::ENOTCONN);
 
+        script_path_close(&files);
         close_socket(&task, raw_server_fd);
+        script_path_close(&files);
         close_socket(&task, raw_client_fd);
+        script_path_unlink(&files);
         task.sys_unlinkat(-1, server_path, AtFlags::empty())
             .unwrap();
+        script_path_unlink(&files);
         task.sys_unlinkat(-1, client_path, AtFlags::empty())
             .unwrap();
+        assert_eq!(
+            files.take_calls(),
+            alloc::vec![
+                FileCall::Open {
+                    path: server_path.into(),
+                    user: ROOT,
+                    access: FileAccessMode::ReadWrite,
+                    flags: FileOpenFlags::CREATE.union(FileOpenFlags::EXCLUSIVE),
+                    mode: mode(0o755),
+                },
+                FileCall::Open {
+                    path: client_path.into(),
+                    user: ROOT,
+                    access: FileAccessMode::ReadWrite,
+                    flags: FileOpenFlags::CREATE.union(FileOpenFlags::EXCLUSIVE),
+                    mode: mode(0o755),
+                },
+                FileCall::Open {
+                    path: server_path.into(),
+                    user: ROOT,
+                    access: FileAccessMode::ReadWrite,
+                    flags: FileOpenFlags::from_bits(0).unwrap(),
+                    mode: mode(0o755),
+                },
+                FileCall::Close(LOOKUP),
+                FileCall::Close(SERVER),
+                FileCall::Close(CLIENT),
+                FileCall::Unlink {
+                    path: server_path.into(),
+                    user: ROOT,
+                },
+                FileCall::Unlink {
+                    path: client_path.into(),
+                    user: ROOT,
+                },
+            ]
+        );
     }
 }

@@ -1156,7 +1156,7 @@ mod tests {
     #[test]
     fn nt_get_nls_section_ptr_maps_file_backed_section() {
         let section_bytes = vec![1, 2, 3, 4, 5];
-        let task = crate::tests::test_task_with_nls_files(&[(
+        let task = crate::tests::test_task_with_broker_files(&[(
             "/Windows/System32/c_1252.nls",
             section_bytes.as_slice(),
         )]);
@@ -1202,7 +1202,7 @@ mod tests {
     #[test]
     fn nt_get_nls_section_ptr_matches_host_section_content() {
         let host_file_bytes = host_system32_file_bytes("c_1252.nls");
-        let task = crate::tests::test_task_with_nls_files(&[(
+        let task = crate::tests::test_task_with_broker_files(&[(
             "/Windows/System32/c_1252.nls",
             host_file_bytes.as_slice(),
         )]);
@@ -1254,7 +1254,7 @@ mod tests {
     #[test]
     fn nt_get_nls_section_ptr_rejects_invalid_arguments() {
         let bytes = [0xaa];
-        let task = crate::tests::test_task_with_nls_files(&[(
+        let task = crate::tests::test_task_with_broker_files(&[(
             "/Windows/System32/c_437.nls",
             bytes.as_slice(),
         )]);
@@ -1311,7 +1311,7 @@ mod tests {
     #[test]
     fn nt_initialize_nls_files_maps_locale_file() {
         let locale_bytes = vec![0x44; PAGE_SIZE + 1];
-        let task = crate::tests::test_task_with_nls_files(&[(
+        let task = crate::tests::test_task_with_broker_files(&[(
             "/Windows/System32/locale.nls",
             locale_bytes.as_slice(),
         )]);
@@ -1343,7 +1343,7 @@ mod tests {
     #[test]
     fn nt_initialize_nls_files_matches_host_outputs() {
         let host_file_bytes = host_system32_file_bytes("locale.nls");
-        let task = crate::tests::test_task_with_nls_files(&[(
+        let task = crate::tests::test_task_with_broker_files(&[(
             "/Windows/System32/locale.nls",
             host_file_bytes.as_slice(),
         )]);

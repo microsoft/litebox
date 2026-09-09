@@ -2900,7 +2900,7 @@ mod tests {
     fn ksecdd_requires_broker_and_rejects_unknown_controls() {
         run_with_test_platform_pointers(|| {
             const UNKNOWN_KSEC_IOCTL: u32 = 0x0039_0000;
-            let task = crate::tests::test_task();
+            let task = crate::tests::test_task_with_broker_files(&[]);
             let handle = open_ksecdd(&task, FILE_GENERIC_READ | FILE_GENERIC_WRITE);
 
             let mut random = [0xa5; 32];
@@ -3181,7 +3181,7 @@ mod tests {
 
     #[test]
     fn nt_query_attributes_file_reports_file_type_attributes() {
-        let task = crate::tests::test_task();
+        let task = crate::tests::test_task_with_broker_files(&[]);
         create_existing_file(&task, "/tmp/query-attributes.txt", b"data");
         task.fs
             .mkdir(
@@ -3222,7 +3222,7 @@ mod tests {
 
     #[test]
     fn nt_duplicate_object_rejects_file_access_escalation() {
-        let task = crate::tests::test_task();
+        let task = crate::tests::test_task_with_broker_files(&[]);
         create_existing_file(&task, "/tmp/duplicate-read-only.txt", b"data");
         let (status, source, _) = create_file(
             &task,
@@ -3275,7 +3275,7 @@ mod tests {
     #[test]
     fn nt_write_file_forces_append_only_handles_to_end_of_file() {
         run_with_test_platform_pointers(|| {
-            let task = crate::tests::test_task();
+            let task = crate::tests::test_task_with_broker_files(&[]);
             let path = "/tmp/append-only.txt";
             create_existing_file(&task, path, b"data");
             let (status, handle, _) = create_file(
@@ -3336,7 +3336,7 @@ mod tests {
     #[test]
     fn nt_query_standard_information_uses_open_file_metadata() {
         run_with_test_platform_pointers(|| {
-            let task = crate::tests::test_task();
+            let task = crate::tests::test_task_with_broker_files(&[]);
             let path = "/tmp/query-standard-open-file.txt";
             create_existing_file(&task, path, b"original");
             let (status, handle, _) = create_file(&task, path, FILE_GENERIC_READ, FILE_OPEN);
@@ -3366,7 +3366,7 @@ mod tests {
     #[test]
     fn nt_set_position_information_updates_synchronous_position() {
         run_with_test_platform_pointers(|| {
-            let task = crate::tests::test_task();
+            let task = crate::tests::test_task_with_broker_files(&[]);
             let path = "/tmp/set-position-sync.txt";
             create_existing_file(&task, path, b"0123456789");
             let (status, handle, _) = create_file(
@@ -3420,7 +3420,7 @@ mod tests {
     #[test]
     fn nt_set_position_information_rejects_duplicate_without_data_access() {
         run_with_test_platform_pointers(|| {
-            let task = crate::tests::test_task();
+            let task = crate::tests::test_task_with_broker_files(&[]);
             let path = "/tmp/set-position-no-access.txt";
             create_existing_file(&task, path, b"0123456789");
             let (status, handle, _) = create_file(
@@ -3441,7 +3441,7 @@ mod tests {
     #[test]
     fn nt_file_io_transfers_across_multiple_chunks() {
         run_with_test_platform_pointers(|| {
-            let task = crate::tests::test_task();
+            let task = crate::tests::test_task_with_broker_files(&[]);
             let (status, handle, _) = create_file(
                 &task,
                 "/tmp/chunked-file-io.txt",
@@ -3497,7 +3497,7 @@ mod tests {
 
     #[test]
     fn nt_create_file_follows_condrv_connection_through_standard_streams() {
-        let task = crate::tests::test_task();
+        let task = crate::tests::test_task_with_broker_files(&[]);
         let server_handle = open_condrv_server(&task);
         let reference_handle = open_condrv_reference(&task, server_handle);
         let (_connect_path, _connect_name, mut connect_attributes) =
@@ -3754,7 +3754,7 @@ mod tests {
     #[test]
     fn nt_query_volume_information_file_returns_fs_device_information() {
         run_with_test_platform_pointers(|| {
-            let task = crate::tests::test_task();
+            let task = crate::tests::test_task_with_broker_files(&[]);
             let handle = open_fs_root(&task);
             let mut io_status = IoStatusBlock::default();
             let mut output = FileFsDeviceInformation {
@@ -3791,7 +3791,7 @@ mod tests {
     #[test]
     fn nt_query_directory_file_ex_tracks_restart_single_and_no_cursor_flags() {
         run_with_test_platform_pointers(|| {
-            let task = crate::tests::test_task();
+            let task = crate::tests::test_task_with_broker_files(&[]);
             task.fs
                 .mkdir(&task.fs_context, "/tmp/query-cursor", Mode::RWXU)
                 .unwrap();
@@ -3882,7 +3882,7 @@ mod tests {
     #[test]
     fn nt_query_volume_information_file_leaves_iosb_untouched_on_failures() {
         run_with_test_platform_pointers(|| {
-            let task = crate::tests::test_task();
+            let task = crate::tests::test_task_with_broker_files(&[]);
             let handle = open_fs_root(&task);
             let sentinel = IoStatusBlock::new(NtStatus::from_raw(0x1111_1111), 0x2222_2222);
             let mut io_status = sentinel;
@@ -3975,7 +3975,7 @@ mod tests {
 
     #[test]
     fn nt_open_file_opens_existing_absolute_and_relative_files() {
-        let task = crate::tests::test_task();
+        let task = crate::tests::test_task_with_broker_files(&[]);
         create_existing_file(&task, "/tmp/dir-file-root.txt", b"root");
         task.fs
             .mkdir(
@@ -4045,7 +4045,7 @@ mod tests {
 
     #[test]
     fn nt_create_file_reports_disposition_information() {
-        let task = crate::tests::test_task();
+        let task = crate::tests::test_task_with_broker_files(&[]);
         create_existing_file(&task, "/tmp/existing.txt", b"old");
 
         let (status, handle, io_status) =
@@ -4121,7 +4121,7 @@ mod tests {
 
     #[test]
     fn nt_create_file_reports_missing_and_collision_information() {
-        let task = crate::tests::test_task();
+        let task = crate::tests::test_task_with_broker_files(&[]);
         create_existing_file(&task, "/tmp/existing-collision.txt", b"old");
 
         let (status, _handle, io_status) =
@@ -4149,7 +4149,7 @@ mod tests {
 
     #[test]
     fn nt_create_file_rejects_invalid_share_access() {
-        let task = crate::tests::test_task();
+        let task = crate::tests::test_task_with_broker_files(&[]);
         create_existing_file(&task, "/tmp/invalid-share.txt", b"old");
         let (_path, _name, attributes) = open_object_attributes("/tmp/invalid-share.txt");
         let mut io_status = IoStatusBlock::default();
@@ -4173,7 +4173,7 @@ mod tests {
 
     #[test]
     fn nt_create_file_directory_handles_can_root_relative_opens() {
-        let task = crate::tests::test_task();
+        let task = crate::tests::test_task_with_broker_files(&[]);
         let (_path, _name, attributes) = open_object_attributes("/tmp/created-dir");
         let mut io_status = IoStatusBlock::default();
         let directory_handle = task
@@ -4212,7 +4212,7 @@ mod tests {
 
     #[test]
     fn nt_create_file_actual_directory_handles_can_root_relative_opens() {
-        let task = crate::tests::test_task();
+        let task = crate::tests::test_task_with_broker_files(&[]);
         task.fs
             .mkdir(
                 &task.fs_context,
@@ -4346,7 +4346,7 @@ mod tests {
 
     #[test]
     fn nt_create_file_enforces_share_access() {
-        let task = crate::tests::test_task();
+        let task = crate::tests::test_task_with_broker_files(&[]);
         create_existing_file(&task, "/tmp/shared.txt", b"old");
         let (_path, _name, attributes) = open_object_attributes("/tmp/shared.txt");
         let mut io_status = IoStatusBlock::default();
@@ -4386,7 +4386,7 @@ mod tests {
 
     #[test]
     fn nt_close_releases_file_handle_and_share_lock() {
-        let task = crate::tests::test_task();
+        let task = crate::tests::test_task_with_broker_files(&[]);
         create_existing_file(&task, "/tmp/close-shared.txt", b"old");
         let (_path, _name, attributes) = open_object_attributes("/tmp/close-shared.txt");
         let mut io_status = IoStatusBlock::default();
@@ -4445,7 +4445,7 @@ mod tests {
 
     #[test]
     fn nt_close_deletes_delete_on_close_file() {
-        let task = crate::tests::test_task();
+        let task = crate::tests::test_task_with_broker_files(&[]);
         create_existing_file(&task, "/tmp/delete-on-close.txt", b"old");
         let (_path, _name, attributes) = open_object_attributes("/tmp/delete-on-close.txt");
         let mut io_status = IoStatusBlock::default();
@@ -4480,7 +4480,7 @@ mod tests {
 
     #[test]
     fn nt_close_deletes_delete_on_close_directory() {
-        let task = crate::tests::test_task();
+        let task = crate::tests::test_task_with_broker_files(&[]);
         let (_path, _name, attributes) = open_object_attributes("/tmp/delete-on-close-dir");
         let mut io_status = IoStatusBlock::default();
         let handle = task
@@ -4516,7 +4516,7 @@ mod tests {
 
     #[test]
     fn write_file_result_clears_handle_output_when_iosb_write_fails() {
-        let task = crate::tests::test_task();
+        let task = crate::tests::test_task_with_broker_files(&[]);
         let (_path, _name, attributes) = open_object_attributes("/tmp/iosb-fault.txt");
         let mut io_status = IoStatusBlock::default();
         let created_handle = task
@@ -4815,7 +4815,7 @@ mod tests {
                     .contains(FileDeviceCharacteristics::IS_MOUNTED)
             );
 
-            let task = crate::tests::test_task();
+            let task = crate::tests::test_task_with_broker_files(&[]);
             let handle = open_fs_root(&task);
             let mut output = FileFsDeviceInformation {
                 device_type: 0,
@@ -5000,7 +5000,7 @@ mod tests {
             };
             close_host_handle(host_handle);
 
-            let task = crate::tests::test_task();
+            let task = crate::tests::test_task_with_broker_files(&[]);
             create_existing_file(&task, "/tmp/existing.txt", b"litebox");
             let (_path, _name, attributes) = open_object_attributes("/tmp/existing.txt");
             let mut litebox_handle = Handle::default();
@@ -5116,7 +5116,7 @@ mod tests {
             };
             close_host_handle(host_handle);
 
-            let task = crate::tests::test_task();
+            let task = crate::tests::test_task_with_broker_files(&[]);
             let (_path, _name, attributes) = open_object_attributes("/tmp/supersede-created.txt");
             let mut litebox_handle = Handle::default();
             let mut litebox_io_status = IoStatusBlock::default();
