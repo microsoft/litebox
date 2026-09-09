@@ -140,7 +140,7 @@ unsafe extern "system" fn vectored_exception_handler(
         && unsafe { litebox_common_linux::rdfsbase() } == 0
         && WindowsUserland::get_thread_fs_base() != 0
     {
-        set_context_to_interrupt_callback(tls, context);
+        set_context_to_interrupt_callback(context);
     } else {
         // Push the exception record onto the host stack.
         let exception_record_ptr = tls.host_sp.get().cast::<EXCEPTION_RECORD>().wrapping_sub(1);
@@ -610,6 +610,10 @@ exception_callback:
     jmp .Ldone
 
 interrupt_callback:
+    mov     r11d, DWORD PTR [rip + {TLS_INDEX}]
+    mov     r11, QWORD PTR gs:[r11 * 8 + TEB_TLS_SLOTS_OFFSET]
+    mov     rsp, [r11 + {HOST_SP}]
+    mov     rbp, [r11 + {HOST_BP}]
     mov  rcx, QWORD PTR [rsp] // thread_ctx
     call {interrupt_handler}
     jmp .Ldone
@@ -664,10 +668,15 @@ interrupt_callback:
 ///
 unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
     #[unsafe(naked)]
-    extern "C" fn switch_to_guest_sysret(ctx: &litebox_common_linux::PtRegs) -> ! {
+    extern "C" fn switch_to_guest_sysret(ctx: &litebox_common_linux::PtRegs, tls: &TlsState) -> ! {
         core::arch::naked_asm!(
-            // Load all registers from the guest context structure.
             "switch_to_guest_start:",
+            "mov BYTE PTR [rdx + {IS_IN_GUEST}], 1",
+            "cmp BYTE PTR [rdx + {INTERRUPT}], 0",
+            "je 2f",
+            "jmp {interrupt_callback}",
+            "2:",
+            // Load all registers from the guest context structure.
             "mov rsp, rcx",
             "pop r15",
             "pop r14",
@@ -691,6 +700,9 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
             "pop rsp",
             "jmp rcx", // jump to the entry point of the thread
             "switch_to_guest_end:",
+            IS_IN_GUEST = const core::mem::offset_of!(TlsState, is_in_guest),
+            INTERRUPT = const core::mem::offset_of!(TlsState, interrupt),
+            interrupt_callback = sym interrupt_callback,
         );
     }
 
@@ -735,7 +747,21 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
         // Ensure the context is written before we set `is_in_guest` so that
         // `ThreadHandle::interrupt` can see a consistent state.
         std::sync::atomic::compiler_fence(Ordering::Release);
-        tls.is_in_guest.set(true);
+        // SAFETY: TLS and the saved host stack belong to this thread's active
+        // run_thread_arch frame. The callback does not return to this frame.
+        unsafe {
+            core::arch::asm!(
+                "mov BYTE PTR [{tls} + {IS_IN_GUEST}], 1",
+                "cmp BYTE PTR [{tls} + {INTERRUPT}], 0",
+                "je 2f",
+                "jmp {interrupt_callback}",
+                "2:",
+                tls = in(reg) tls,
+                IS_IN_GUEST = const core::mem::offset_of!(TlsState, is_in_guest),
+                INTERRUPT = const core::mem::offset_of!(TlsState, interrupt),
+                interrupt_callback = sym interrupt_callback,
+            );
+        }
         unsafe {
             let status = NtContinue(win_ctx, 0);
             panic!(
@@ -762,8 +788,7 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
     // This is much slower, but it is only used for things like signal handlers,
     // so it should not be on the critical path.
     if ctx.rcx == ctx.rip {
-        tls.is_in_guest.set(true);
-        switch_to_guest_sysret(ctx)
+        switch_to_guest_sysret(ctx, tls)
     } else {
         switch_to_guest_ntcontinue(tls, ctx)
     }
@@ -1169,18 +1194,18 @@ impl ThreadHandle {
             // context, since it's already saved.
             true
         } else if is_in_ntdll_or_this(context.Rip.trunc()) {
-            // Case 2/3: we can't distinguish between them. For case 2 we don't
-            // need to do anything, but for case 3 we need to update the
+            // Case 2/3: we can't distinguish between them. For case 3 we don't
+            // need to do anything, but for case 2 we need to update the
             // NtContinue context to point to the interrupt callback (the guest
             // context is already up to date).
             //
-            // In case 2, the NtContinue context is not being used, so it is
+            // In case 3, the NtContinue context is not being used, so it is
             // safe to update it anyway.
 
             // SAFETY: `continue_context` is not accessed by user-mode code
             // while `is_in_guest` is true.
             let continue_context = unsafe { &mut *target_tls.continue_context.get() };
-            set_context_to_interrupt_callback(target_tls, continue_context);
+            set_context_to_interrupt_callback(continue_context);
             false
         } else {
             // Case 4: save the guest context and jump to interrupt callback.
@@ -1188,7 +1213,7 @@ impl ThreadHandle {
             true
         };
         if run_interrupt_callback {
-            set_context_to_interrupt_callback(target_tls, &mut context);
+            set_context_to_interrupt_callback(&mut context);
             unsafe {
                 windows_sys::Win32::System::Diagnostics::Debug::SetThreadContext(
                     inner.handle.as_raw_handle(),
@@ -1199,18 +1224,13 @@ impl ThreadHandle {
     }
 }
 
-/// Updates `context` to jump to the interrupt callback with the given
-/// `guest_context` pointer.
+/// Updates `context` to jump to the interrupt callback, which restores the host stack.
 fn set_context_to_interrupt_callback(
-    tls: &TlsState,
     context: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
 ) {
-    let required_flags = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64
-        | windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_INTEGER_AMD64;
+    let required_flags = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64;
     assert_eq!(context.ContextFlags & required_flags, required_flags);
     context.Rip = interrupt_callback as *const () as usize as u64;
-    context.Rsp = tls.host_sp.get().addr() as u64;
-    context.Rbp = tls.host_bp.get().addr() as u64;
 }
 
 /// Returns true if the given instruction pointer is in ntdll.dll or this module.
@@ -2096,6 +2116,98 @@ mod tests {
     use litebox::platform::RawMutex;
     use litebox::platform::page_mgmt::FixedAddressBehavior;
     use litebox::platform::page_mgmt::MemoryRegionPermissions;
+
+    fn check_pending_interrupt_before_guest_entry(fast_path: bool) {
+        use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
+        use litebox_common_linux::PtRegs;
+        use std::cell::Cell;
+
+        #[unsafe(naked)]
+        unsafe extern "C" fn guest_entry() {
+            core::arch::naked_asm!(
+                "jmp {syscall_callback}",
+                syscall_callback = sym crate::syscall_callback,
+            );
+        }
+
+        struct PendingInterruptShim {
+            interrupted: Cell<bool>,
+            entered_guest: Cell<bool>,
+        }
+
+        impl EnterShim for PendingInterruptShim {
+            type ExecutionContext = PtRegs;
+
+            fn init(&self, _ctx: &mut PtRegs) -> ContinueOperation {
+                let current =
+                    crate::CURRENT_THREAD_HANDLE.with_borrow(|current| current.clone().unwrap());
+                current.interrupt(Some(&current));
+                ContinueOperation::Resume
+            }
+
+            fn syscall(&self, _ctx: &mut PtRegs) -> ContinueOperation {
+                self.entered_guest.set(true);
+                ContinueOperation::Terminate
+            }
+
+            fn exception(&self, _ctx: &mut PtRegs, _info: &ExceptionInfo) -> ContinueOperation {
+                self.entered_guest.set(true);
+                ContinueOperation::Terminate
+            }
+
+            fn interrupt(&self, _ctx: &mut PtRegs) -> ContinueOperation {
+                self.interrupted.set(true);
+                ContinueOperation::Terminate
+            }
+        }
+
+        crate::ensure_tls_index();
+        let shim = PendingInterruptShim {
+            interrupted: Cell::new(false),
+            entered_guest: Cell::new(false),
+        };
+        let mut stack = [0_u128; 256];
+        let entry = guest_entry as *const () as usize;
+        let mut ctx = PtRegs {
+            rip: entry,
+            rcx: if fast_path { entry } else { 0 },
+            rsp: stack.as_mut_ptr().wrapping_add(stack.len()).addr(),
+            eflags: 0x202,
+            ..Default::default()
+        };
+        crate::run_thread_inner(&shim, &mut ctx);
+        assert!(shim.interrupted.get());
+        assert!(!shim.entered_guest.get());
+        assert_eq!(ctx.rip, entry);
+        assert_eq!(ctx.rcx, if fast_path { entry } else { 0 });
+    }
+
+    #[test]
+    fn pending_interrupt_before_guest_entry_sysret() {
+        check_pending_interrupt_before_guest_entry(true);
+    }
+
+    #[test]
+    fn pending_interrupt_before_guest_entry_ntcontinue() {
+        check_pending_interrupt_before_guest_entry(false);
+    }
+
+    #[test]
+    fn interrupt_redirection_preserves_stack_registers() {
+        use windows_sys::Win32::System::Diagnostics::Debug::{CONTEXT, CONTEXT_CONTROL_AMD64};
+
+        let mut context = CONTEXT {
+            ContextFlags: CONTEXT_CONTROL_AMD64,
+            Rip: 0x1000,
+            Rsp: 0x2000,
+            Rbp: 0x3000,
+            ..Default::default()
+        };
+        crate::set_context_to_interrupt_callback(&mut context);
+        assert_ne!(context.Rip, 0x1000);
+        assert_eq!(context.Rsp, 0x2000);
+        assert_eq!(context.Rbp, 0x3000);
+    }
 
     #[test]
     fn test_raw_mutex() {
