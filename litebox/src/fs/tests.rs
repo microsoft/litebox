@@ -17,7 +17,7 @@ use alloc::string::{String, ToString as _};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use std::sync::Mutex;
+use std::sync::{Barrier, Mutex};
 
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::fs::{
@@ -96,6 +96,12 @@ enum Scripted {
     Reply(FileResponse),
     /// Stage `data` in the request's shared buffer and report it as read.
     Read(Vec<u8>),
+    /// Wait for the test to close the fd before completing this read.
+    BlockingRead {
+        data: Vec<u8>,
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+    },
     /// Answer directory reads from `entries`, at most `page_bytes` of them per response.
     Directory {
         entries: Vec<FileDirectoryEntry>,
@@ -175,6 +181,21 @@ impl ScriptedBroker {
                 match self.next_scripted() {
                     Scripted::Reply(response) => response,
                     Scripted::Read(data) => {
+                        assert!(data.len() <= request.buffer.length as usize);
+                        self.buffers
+                            .write(request.buffer.slot_index, &data)
+                            .unwrap();
+                        FileResponse::Read(ReadFileResponse {
+                            read: u32::try_from(data.len()).unwrap(),
+                        })
+                    }
+                    Scripted::BlockingRead {
+                        data,
+                        entered,
+                        release,
+                    } => {
+                        entered.wait();
+                        release.wait();
                         assert!(data.len() <= request.buffer.length as usize);
                         self.buffers
                             .write(request.buffer.slot_index, &data)
@@ -267,7 +288,7 @@ impl ScriptedBroker {
     fn reply(&self) -> FileResponse {
         match self.next_scripted() {
             Scripted::Reply(response) => response,
-            Scripted::Read(_) | Scripted::Directory { .. } => {
+            Scripted::Read(_) | Scripted::BlockingRead { .. } | Scripted::Directory { .. } => {
                 panic!("scripted payload answer for a request that carries none")
             }
         }
@@ -508,6 +529,48 @@ fn closing_releases_the_broker_object_and_the_descriptor() {
         Err(WriteError::ClosedFd)
     ));
     assert_eq!(broker.calls().len(), 2);
+}
+
+#[test]
+fn in_flight_read_keeps_the_broker_file_alive_after_close() {
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let (broker, fs) = scripted_fs([
+        opened(),
+        Scripted::BlockingRead {
+            data: b"broker".to_vec(),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        },
+    ]);
+    let fd = Arc::new(
+        fs.open_file(&Context::new(), "/file", OFlags::RDONLY, Mode::empty())
+            .expect("open should succeed"),
+    );
+
+    let worker = fs.clone();
+    let opened_file = Arc::clone(&fd);
+    let reader = std::thread::spawn(move || {
+        let mut buffer = [0; 8];
+        let read = worker
+            .read_file(&opened_file, &mut buffer, None)
+            .expect("the in-flight read should succeed");
+        buffer[..read].to_vec()
+    });
+
+    entered.wait();
+    fs.close_file(&fd).expect("close should succeed");
+    assert!(
+        !broker
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::Close(FILE_HANDLE))),
+        "the broker object must remain open while the read holds a reference"
+    );
+
+    release.wait();
+    assert_eq!(reader.join().unwrap(), b"broker");
+    assert_eq!(broker.calls().last(), Some(&Call::Close(FILE_HANDLE)));
 }
 
 #[test]
