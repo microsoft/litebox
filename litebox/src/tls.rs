@@ -117,21 +117,21 @@ impl<T: 'static, Platform: ThreadLocalStorageProvider> TlsKey<T, Platform> {
     /// Panics if this TLS is not initialized on this thread, or if it is still
     /// in use via calls to `with`.
     pub fn deinit(&'static self) -> T {
-        // Validate the TLS is set and of the right type before taking it out.
-        let _ = self.get_ptr();
-        let tls = unsafe {
+        // Validate the TLS is set, of the right type, and has zero users before
+        // taking it out and re-tagging as a unique (Box'd) pointer:
+        {
+            let tls = unsafe { &*self.get_ptr() };
+            assert_eq!(tls.users.get(), 0, "tls is still in use on this thread");
+        }
+
+        // Because it's a thread-local value, we know that no one else can have
+        // acquired a TLS reference between the above check and the below
+        // de-initialization:
+        unsafe {
             let ptr =
                 Platform::replace_thread_local_storage(ptr::null_mut()).cast::<Tls<T, Platform>>();
-            Box::from_raw(ptr)
-        };
-        let users = tls.users.get();
-        if users != 0 {
-            // Put it back in case panic unwinds and something is
-            // referencing it.
-            unsafe { Platform::replace_thread_local_storage(Box::into_raw(tls).cast()) };
-            panic!("tls is still in use on this thread");
+            Box::from_raw(ptr).data
         }
-        tls.data
     }
 
     fn get_ptr(&'static self) -> *const Tls<T, Platform> {
