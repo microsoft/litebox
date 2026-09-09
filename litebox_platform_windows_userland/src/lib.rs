@@ -547,9 +547,6 @@ impl XsaveLayout {
 }
 
 /// Represents the standard-layout XSAVE area for a guest context.
-///
-/// Keep its storage stable and retain its contents between XRSTOR and XSAVEOPT:
-/// an optimized save may leave unmodified components in place.
 struct XsaveArea {
     storage: Box<[XsaveChunk]>,
 }
@@ -941,7 +938,7 @@ syscall_callback:
     mov     eax, DWORD PTR [r11 + {XSAVE_MASK}]
     mov     edx, DWORD PTR [r11 + {XSAVE_MASK} + 4]
     mov     r10, QWORD PTR [r11 + {GUEST_XSAVE_PTR}]
-    xsaveopt64 [r10]
+    xsave64 [r10]
     mov     BYTE PTR [r11 + {GUEST_XSTATE_FORMAT}], 0
     // Restore the Windows ABI's standard host x87 control word and mxcsr.
     fldcw WORD PTR [rip + {HOST_X87_CONTROL_WORD}]
@@ -2816,7 +2813,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "measures XSAVEOPT guest syscall round trips; run with --release"]
+    #[ignore = "measures XSAVE guest syscall round trips; run with --release"]
     fn benchmark_xsave_syscall_round_trip() {
         use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
         use litebox_common_linux::PtRegs;
@@ -2883,7 +2880,7 @@ mod tests {
         }
         samples.sort_unstable();
         println!(
-            "XSAVEOPT: median {} ns/round trip over {ITERATIONS} syscalls",
+            "XSAVE: median {} ns/round trip over {ITERATIONS} syscalls",
             samples[samples.len() / 2] / ITERATIONS as u128
         );
     }
