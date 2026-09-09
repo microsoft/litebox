@@ -19,6 +19,8 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 use crate::signal::SigSet;
 
 pub mod errno;
+#[cfg(all(target_arch = "aarch64", feature = "aarch64_gate_recovery"))]
+pub mod gate_recovery;
 pub mod loader;
 pub mod mm;
 pub mod physical_pointers;

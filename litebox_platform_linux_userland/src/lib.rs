@@ -39,10 +39,10 @@ use aarch64::get_guest_vector_state;
 #[cfg(target_arch = "aarch64")]
 use aarch64::{
     Aarch64GateSignalResult, GateInterruption, assert_tls_block_placement,
-    canonicalize_runtime_aarch64_gate_signal_context, copy_signal_context,
-    fatal_aarch64_runtime_state, guest_thread_pointer_tp_offset, is_guest_thread,
-    load_tls_block_base, run_thread_arch, set_guest_vector_state, set_is_guest_thread,
-    set_signal_return, signal_handler_capture_guest_vector_state, signal_handler_set_interrupt,
+    canonicalize_runtime_aarch64_gate_signal_context, fatal_aarch64_runtime_state,
+    guest_thread_pointer_tp_offset, is_guest_thread, load_tls_block_base, run_thread_arch,
+    set_guest_vector_state, set_is_guest_thread, set_signal_return,
+    signal_handler_capture_guest_vector_state, signal_handler_set_interrupt,
     signal_handler_take_guest, switch_to_guest, sync_instruction_stream, tls_offset,
 };
 
@@ -2358,8 +2358,10 @@ fn update_aarch64_guest_signal_context(
     regs: &mut litebox_common_linux::PtRegs,
     interruption: GateInterruption,
 ) -> bool {
-    match canonicalize_runtime_aarch64_gate_signal_context(context, regs, interruption) {
-        Aarch64GateSignalResult::NotGate => copy_signal_context(regs, context),
+    let (result, interrupted) =
+        canonicalize_runtime_aarch64_gate_signal_context(context, regs, interruption);
+    match result {
+        Aarch64GateSignalResult::NotGate => *regs = interrupted,
         Aarch64GateSignalResult::Canonicalized(canonical) => *regs = canonical,
         Aarch64GateSignalResult::ResumeGuest(canonical) => {
             *regs = canonical;

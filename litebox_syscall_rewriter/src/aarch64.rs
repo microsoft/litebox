@@ -3959,7 +3959,10 @@ fn validate_gate_slot_inner_for_host(
         }
         GateMetadata::X18 { scratch } => {
             let anchor_scratch = ((word(0) >> RT2_SHIFT) & REG_MASK) as u8;
-            if !(7..=17).contains(&anchor_scratch) || anchor_scratch == scratch {
+            if !(7..=17).contains(&scratch)
+                || !(7..=17).contains(&anchor_scratch)
+                || anchor_scratch == scratch
+            {
                 return false;
             }
             exact(
@@ -4116,7 +4119,10 @@ fn validate_gate_slot_inner_for_host(
         }
         GateMetadata::X18CompareBranch { scratch } => {
             let anchor_scratch = ((word(4) >> RT2_SHIFT) & REG_MASK) as u8;
-            if !(7..=17).contains(&anchor_scratch) || anchor_scratch == scratch {
+            if !(7..=17).contains(&scratch)
+                || !(7..=17).contains(&anchor_scratch)
+                || anchor_scratch == scratch
+            {
                 return false;
             }
             exact(0, Insn::SubSp(X18_FRAME_BYTES))
@@ -4191,7 +4197,10 @@ fn validate_gate_slot_inner_for_host(
             let anchor_scratch = ((word(0) >> RT2_SHIFT) & REG_MASK) as u8;
             let adrp = word(8);
             let add = word(12);
-            if !(7..=17).contains(&anchor_scratch) || anchor_scratch == scratch {
+            if !(7..=17).contains(&scratch)
+                || !(7..=17).contains(&anchor_scratch)
+                || anchor_scratch == scratch
+            {
                 return false;
             }
             exact(
@@ -4363,12 +4372,19 @@ pub fn classify_gate_pc(
     classify_gate_pc_with_candidates(trampoline, trampoline_base, pc, candidates)
 }
 
-/// Classifies one Linux-host, fault-safely copied compact slot containing `pc`.
+/// Classifies one fault-safely copied compact slot containing `pc` for `host`.
+/// Host-specific anchor reads currently apply only to x18 gates; TPIDR gates
+/// retain their Linux templates until host-aware emission is enabled.
 ///
 /// The caller is responsible for selecting candidate slot starts and for
 /// requiring exactly one match. Keeping that policy outside this pure helper
 /// lets a signal handler copy each candidate before inspecting it.
-pub fn classify_copied_gate_slot(slot: &[u8], slot_vaddr: u64, pc: u64) -> Option<ClassifiedGate> {
+pub fn classify_copied_gate_slot_for_host(
+    slot: &[u8],
+    slot_vaddr: u64,
+    pc: u64,
+    host: crate::TargetHost,
+) -> Option<ClassifiedGate> {
     let offset = usize::try_from(pc.checked_sub(slot_vaddr)?).ok()?;
     if !pc.is_multiple_of(INSN_BYTES_U64) || !slot_vaddr.is_multiple_of(GATE_ALIGNMENT as u64) {
         return None;
@@ -4410,7 +4426,11 @@ pub fn classify_copied_gate_slot(slot: &[u8], slot_vaddr: u64, pc: u64) -> Optio
             slot_vaddr,
         },
         metadata,
-        Some(Host::Linux),
+        Some(match host {
+            crate::TargetHost::Linux => Host::Linux,
+            crate::TargetHost::MacOs => Host::MacOs,
+            crate::TargetHost::Windows => Host::Windows,
+        }),
     ) {
         return None;
     }
@@ -4453,6 +4473,11 @@ pub fn classify_copied_gate_slot(slot: &[u8], slot_vaddr: u64, pc: u64) -> Optio
         conditional_target,
         metadata,
     })
+}
+
+/// Classifies one Linux-host, fault-safely copied compact slot containing `pc`.
+pub fn classify_copied_gate_slot(slot: &[u8], slot_vaddr: u64, pc: u64) -> Option<ClassifiedGate> {
+    classify_copied_gate_slot_for_host(slot, slot_vaddr, pc, crate::TargetHost::Linux)
 }
 
 fn classify_gate_pc_with_candidates<const N: usize>(
