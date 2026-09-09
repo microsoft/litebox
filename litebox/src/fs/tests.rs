@@ -22,9 +22,9 @@ use std::sync::{Barrier, Mutex};
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileNodeInfo, FileOpenFlags,
-    FileSeekWhence, FileStatus as BrokerFileStatus, FileType as BrokerFileType, FileUser,
-    MAX_FILE_TRANSFER_SIZE, OpenFileResponse, ReadDirectoryResponse, ReadFileResponse,
-    SeekFileResponse, WriteFileResponse, encode_directory_entries_chunk,
+    FileSeekWhence, FileStatus as BrokerFileStatus, FileUser, MAX_FILE_TRANSFER_SIZE,
+    OpenFileResponse, ReadDirectoryResponse, ReadFileResponse, SeekFileResponse, WriteFileResponse,
+    encode_directory_entries_chunk,
 };
 use litebox_broker_protocol::message::{
     BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerOperation, BrokerRequest,
@@ -578,7 +578,7 @@ fn path_status_converts_broker_values() {
     let context = Context::new();
     let (broker, fs) = scripted_fs([Scripted::Reply(FileResponse::PathStatus(
         BrokerFileStatus {
-            file_type: BrokerFileType::CharacterDevice,
+            file_type: FileType::CharacterDevice,
             mode: FileMode::from_bits(0o644).unwrap(),
             size: 12,
             owner: FileUser { user: 1, group: 2 },
@@ -622,7 +622,7 @@ fn read_dir_reassembles_paged_broker_entries() {
     let entries = vec![
         FileDirectoryEntry {
             name: String::from("one"),
-            file_type: BrokerFileType::RegularFile,
+            file_type: FileType::RegularFile,
             node_info: Some(FileNodeInfo {
                 dev: 1,
                 ino: 2,
@@ -631,7 +631,7 @@ fn read_dir_reassembles_paged_broker_entries() {
         },
         FileDirectoryEntry {
             name: String::from("two"),
-            file_type: BrokerFileType::Directory,
+            file_type: FileType::Directory,
             node_info: None,
         },
     ];

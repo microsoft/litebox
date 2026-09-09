@@ -15,7 +15,7 @@ use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileNodeInfo, FileOpenFlags,
-    FileSeekWhence, FileStatus as BrokerFileStatus, FileType as BrokerFileType, FileUser,
+    FileSeekWhence, FileStatus as BrokerFileStatus, FileType, FileUser,
 };
 
 use crate::path::Arg;
@@ -64,17 +64,6 @@ bitflags! {
         /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
         const _ = !0;
     }
-}
-
-/// Types of files on a file-system.
-///
-/// See [`LiteBox::path_file_status`].
-#[derive(Debug, PartialEq, Eq, Clone)]
-#[non_exhaustive]
-pub enum FileType {
-    RegularFile,
-    Directory,
-    CharacterDevice,
 }
 
 bitflags! {
@@ -786,7 +775,7 @@ fn file_status_error(error: FileError) -> FileStatusError {
 
 fn file_status(status: BrokerFileStatus) -> Result<FileStatus, FileStatusError> {
     Ok(FileStatus {
-        file_type: file_type(status.file_type).map_err(|()| FileStatusError::Io)?,
+        file_type: status.file_type,
         mode: Mode::from_bits_retain(u32::from(status.mode.bits())),
         size: usize::try_from(status.size).map_err(|_| FileStatusError::Io)?,
         owner: UserInfo {
@@ -806,20 +795,11 @@ fn directory_entries(entries: Vec<FileDirectoryEntry>) -> Result<Vec<DirEntry>, 
     for entry in entries {
         output.push(DirEntry {
             name: entry.name,
-            file_type: file_type(entry.file_type).map_err(|()| ReadDirError::Io)?,
+            file_type: entry.file_type,
             ino_info: entry.node_info.map(directory_node_info).transpose()?,
         });
     }
     Ok(output)
-}
-
-fn file_type(file_type: BrokerFileType) -> Result<FileType, ()> {
-    match file_type {
-        BrokerFileType::RegularFile => Ok(FileType::RegularFile),
-        BrokerFileType::Directory => Ok(FileType::Directory),
-        BrokerFileType::CharacterDevice => Ok(FileType::CharacterDevice),
-        _ => Err(()),
-    }
 }
 
 fn status_node_info(node: FileNodeInfo) -> Result<NodeInfo, FileStatusError> {
