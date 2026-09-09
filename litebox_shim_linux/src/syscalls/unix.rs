@@ -31,7 +31,7 @@ use litebox_common_linux::{
 };
 
 use crate::{
-    FileFd, GlobalState, LinuxFS, ShimPlatform, Task, UserPtr, UserPtrMut,
+    FileFd, GlobalState, ShimPlatform, Task, UserPtr, UserPtrMut,
     channel::{Channel, ReadEnd, WriteEnd},
     syscalls::net::{SocketOptionValue, SocketOptions},
 };
@@ -70,7 +70,7 @@ pub(crate) enum UnixSocketAddr {
 /// the socket file remains accessible. The file is automatically closed
 /// when this structure is dropped.
 enum UnixBoundSocketAddr<Platform: ShimPlatform> {
-    Path((String, FileFd<Platform>, Arc<LinuxFS<Platform>>)),
+    Path((String, FileFd<Platform>, litebox::LiteBox<Platform>)),
     Abstract(Vec<u8>),
 }
 
@@ -123,7 +123,7 @@ impl UnixSocketAddr {
                     let context = fs.context.read();
                     files
                         .fs
-                        .open(
+                        .open_file(
                             &context,
                             path.as_str(),
                             flags,
@@ -174,7 +174,7 @@ impl<Platform: ShimPlatform> Drop for UnixBoundSocketAddr<Platform> {
     fn drop(&mut self) {
         match self {
             Self::Path((_, file, fs)) => {
-                let _ = fs.close(file);
+                let _ = fs.close_file(file);
             }
             Self::Abstract(_) => {}
         }

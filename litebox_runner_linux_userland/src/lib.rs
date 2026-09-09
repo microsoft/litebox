@@ -181,8 +181,6 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         gid: u32::from(DEFAULT_GUEST_GID),
         egid: u32::from(DEFAULT_GUEST_GID),
     };
-    let initial_file_system = shim_builder.brokered_fs();
-
     // We need to get the file path before enabling seccomp.
     // For --program-from-tar the path is already validated as absolute above,
     // so use it directly instead of resolving against the host CWD.
@@ -197,8 +195,6 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
             cli_args.program_and_arguments[0]
         )
     })?;
-
-    let initial_file_system = std::sync::Arc::new(initial_file_system);
 
     let shim = shim_builder.build();
 
@@ -223,7 +219,7 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         &broker_shutdown_fds,
     );
 
-    let program = shim.load_program(initial_file_system, task_params, prog_path, argv, envp)?;
+    let program = shim.load_program(task_params, prog_path, argv, envp)?;
 
     #[cfg(feature = "lock_tracing")]
     litebox::sync::start_recording();

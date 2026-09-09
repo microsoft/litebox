@@ -24,9 +24,7 @@ use litebox_common_linux::{
 };
 use thiserror::Error;
 
-use crate::{
-    FileFd, GlobalState, LinuxFS, ShimPlatform, Task, UserPtr, UserPtrMut, syscalls::signal,
-};
+use crate::{FileFd, GlobalState, ShimPlatform, Task, UserPtr, UserPtrMut, syscalls::signal};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Clone, Copy)]
@@ -49,7 +47,7 @@ pub(crate) struct FsState<Platform: ShimPlatform> {
     umask: core::sync::atomic::AtomicU32,
     // XXX: the context also stores credentials, might need to reconsider design when implementing
     // `setuid` and similar.
-    pub(crate) context: litebox::sync::RwLock<Platform, litebox::fs::resolver::Context>,
+    pub(crate) context: litebox::sync::RwLock<Platform, litebox::fs::Context>,
 }
 
 impl<Platform: ShimPlatform> Clone for FsState<Platform> {
@@ -72,7 +70,7 @@ impl<Platform: ShimPlatform> FsState<Platform> {
             group: u16::try_from(credentials.egid)
                 .unwrap_or_else(|_| unimplemented!("{}", credentials.egid)),
         };
-        let mut context = litebox::fs::resolver::Context::new();
+        let mut context = litebox::fs::Context::new();
         context.set_acting_user(user_info);
         Self {
             umask: (Mode::WGRP | Mode::WOTH).bits().into(),
@@ -88,7 +86,7 @@ impl<Platform: ShimPlatform> FsState<Platform> {
 /// Task state shared by `CLONE_FILES`.
 pub(crate) struct FilesState<Platform: ShimPlatform> {
     /// The filesystem implementation, shared across tasks that share file system.
-    pub(crate) fs: alloc::sync::Arc<LinuxFS<Platform>>,
+    pub(crate) fs: litebox::LiteBox<Platform>,
     pub(crate) raw_descriptor_store:
         litebox::sync::RwLock<Platform, litebox::fd::RawDescriptorStorage>,
     /// Exclusive upper bound for raw file descriptor values.
@@ -96,9 +94,9 @@ pub(crate) struct FilesState<Platform: ShimPlatform> {
 }
 
 impl<Platform: ShimPlatform> FilesState<Platform> {
-    pub(crate) fn new(fs: alloc::sync::Arc<LinuxFS<Platform>>) -> Self {
+    pub(crate) fn new(fs: &litebox::LiteBox<Platform>) -> Self {
         Self {
-            fs,
+            fs: fs.clone(),
             raw_descriptor_store: litebox::sync::RwLock::new(
                 litebox::fd::RawDescriptorStorage::new(),
             ),
@@ -386,7 +384,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let context = fs.context.read();
             files
                 .fs
-                .open(&context, &path, flags - OFlags::CLOEXEC, mode)
+                .open_file(&context, &path, flags - OFlags::CLOEXEC, mode)
                 .map_err(Errno::from)
         }?;
         if let Some(stream) = stream {
@@ -424,7 +422,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         let files = self.files.borrow();
         let raw_fd = files.insert_raw_fd(file).map_err(|file| {
-            files.fs.close(&file).unwrap();
+            files.fs.close_file(&file).unwrap();
             Errno::EMFILE
         })?;
         Ok(u32::try_from(raw_fd).unwrap())
@@ -465,7 +463,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let files = self.files.borrow();
         let fd = files.typed_fd(fd)?;
         fd.dispatch(
-            |fd| files.fs.truncate(fd, length, false).map_err(Errno::from),
+            |fd| {
+                files
+                    .fs
+                    .truncate_file(fd, length, false)
+                    .map_err(Errno::from)
+            },
             |_fd| todo!("net"),
             |_fd| todo!("pipes"),
             |_fd| Err(Errno::EINVAL),
@@ -501,7 +504,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     mode,
                 )?;
                 let files = self.files.borrow();
-                let _ = files.fs.close(&file);
+                let _ = files.fs.close_file(&file);
             }
             // TODO: Named pipe, socket, block and char files are not supported
             InodeType::NamedPipe
@@ -530,9 +533,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let fs = self.fs.borrow();
         let context = fs.context.read();
         if flags.contains(AtFlags::AT_REMOVEDIR) {
-            files.fs.rmdir(&context, path).map_err(Errno::from)
+            files.fs.rmdir_file(&context, path).map_err(Errno::from)
         } else {
-            files.fs.unlink(&context, path).map_err(Errno::from)
+            files.fs.unlink_file(&context, path).map_err(Errno::from)
         }
     }
 
@@ -559,7 +562,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             |fd| {
                 files
                     .fs
-                    .read(fd, &mut buf.borrow_mut(), offset)
+                    .read_file(fd, &mut buf.borrow_mut(), offset)
                     .map_err(Errno::from)
             },
             |fd| {
@@ -639,7 +642,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let files = self.files.borrow();
         let is_inet_datagram = core::cell::Cell::new(false);
         let result = fd.dispatch(
-            |fd| files.fs.write(fd, buf, offset).map_err(Errno::from),
+            |fd| files.fs.write_file(fd, buf, offset).map_err(Errno::from),
             |fd| {
                 espipe_for_non_seekable_offset(offset)?;
                 is_inet_datagram.set(matches!(
@@ -720,7 +723,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let files = self.files.borrow();
         files
             .fs
-            .seek(fd, -rewind, SeekWhence::RelativeToCurrentOffset)
+            .seek_file(fd, -rewind, SeekWhence::RelativeToCurrentOffset)
             .map(|_| ())
             .map_err(Errno::from)
     }
@@ -764,7 +767,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let read_result = match typed_in_fd.as_fs() {
                 Some(fd) => files
                     .fs
-                    .read(fd, &mut kernel_buf[..to_read], cur_off)
+                    .read_file(fd, &mut kernel_buf[..to_read], cur_off)
                     .map_err(Errno::from),
                 None => Err(non_fs_err),
             };
@@ -846,7 +849,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ) -> Result<usize, Errno> {
         let fd = fd.fs_only(Errno::ESPIPE)?;
         let files = self.files.borrow();
-        match files.fs.seek(fd, offset, whence) {
+        match files.fs.seek_file(fd, offset, whence) {
             Ok(pos) => Ok(pos),
             Err(litebox::fs::errors::SeekError::NotAFile) => {
                 let base = match whence {
@@ -877,7 +880,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let context = fs.context.read();
         files
             .fs
-            .mkdir(&context, pathname, mode)
+            .mkdir_file(&context, pathname, mode)
             .map_err(Errno::from)
     }
 
@@ -893,7 +896,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     pub(crate) fn do_close(&self, raw_fd: usize) -> Result<(), Errno> {
-        self.do_close_and_replace::<LinuxFS<Platform>>(raw_fd, None)
+        self.do_close_and_replace::<litebox::fs::File<Platform>>(raw_fd, None)
     }
 
     pub(super) fn remove_and_drop_descriptor<S: FdEnabledSubsystem>(&self, fd: &TypedFd<S>) {
@@ -916,7 +919,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let files = self.files.borrow();
         let mut rds = files.raw_descriptor_store.write();
         let consumed: AnyTypedFd<Platform> = match rds
-            .fd_consume_raw_integer::<LinuxFS<Platform>>(raw_fd)
+            .fd_consume_raw_integer::<litebox::fs::File<Platform>>(raw_fd)
         {
             Ok(fd) => AnyTypedFd::Fs(fd),
             Err(litebox::fd::ErrRawIntFd::NotFound) => {
@@ -968,7 +971,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 if let Ok(raw_fd) = i32::try_from(raw_fd) {
                     self.finalize_elf_patch(raw_fd);
                 }
-                files.fs.close(&fd).map_err(Errno::from)
+                files.fs.close_file(&fd).map_err(Errno::from)
             }
             AnyTypedFd::Network(fd) => self.global.close_socket(&self.wait_cx(), fd),
             AnyTypedFd::Pipes(fd) => self.global.close_linux_pipe(&fd),
@@ -1404,7 +1407,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let files = self.files.borrow();
             let fs = self.fs.borrow();
             let context = fs.context.read();
-            files.fs.file_status(&context, pathname)?
+            files.fs.path_file_status(&context, pathname)?
         };
         let owner = status.owner.into();
         Self::do_access_mode(status.mode, owner, caller, &mode)
@@ -1556,13 +1559,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let rw_user_mode = (Mode::RUSR | Mode::WUSR).bits();
         let files = self.files.borrow();
         fd.dispatch(
-            |fd| {
-                files
-                    .fs
-                    .fd_file_status(fd)
-                    .map(T::from)
-                    .map_err(Errno::from)
-            },
+            |fd| files.fs.file_status(fd).map(T::from).map_err(Errno::from),
             |_fd| Ok(T::from(synthetic(socket_mode, 4096))),
             |fd| {
                 Ok(T::from(synthetic(
@@ -1595,7 +1592,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let files = self.files.borrow();
             let fs = self.fs.borrow();
             let context = fs.context.read();
-            files.fs.file_status(&context, path)?
+            files.fs.path_file_status(&context, path)?
         };
         Ok(T::from(status))
     }
@@ -1643,7 +1640,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 let files = self.files.borrow();
                 let fs = self.fs.borrow();
                 let context = fs.context.read();
-                Ok(T::from(files.fs.file_status(&context, cwd)?))
+                Ok(T::from(files.fs.path_file_status(&context, cwd)?))
             }
             FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
                 self.with_typed_fd(fd, |fd| self.do_stat(fd))
@@ -1936,7 +1933,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         {
             let files = self.files.borrow();
             let context = fs.context.read();
-            match files.fs.file_status(&context, target.to_string()) {
+            match files.fs.path_file_status(&context, target.to_string()) {
                 Ok(status) => {
                     if status.file_type != FileType::Directory {
                         return Err(Errno::ENOTDIR);
@@ -2048,8 +2045,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
     }
 
-    fn is_stdio(&self, fs: &LinuxFS<Platform>, fd: &FileFd<Platform>) -> Result<bool, Errno> {
-        match fs.fd_file_status(fd) {
+    fn is_stdio(
+        &self,
+        fs: &litebox::LiteBox<Platform>,
+        fd: &FileFd<Platform>,
+    ) -> Result<bool, Errno> {
+        match fs.file_status(fd) {
             Ok(status) => {
                 // See https://www.kernel.org/doc/Documentation/admin-guide/devices.txt
                 let major = status.node_info.rdev.map_or(0, |v| v.get() >> 8);
@@ -2608,7 +2609,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         file.dispatch(
             |fd| {
                 dup(self, &files, fd, close_on_exec, target, |fd| {
-                    let _ = files.fs.close(&fd);
+                    let _ = files.fs.close_file(&fd);
                 })
             },
             |fd| {
@@ -2733,7 +2734,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let mut dir_off = dir_off.0;
         let mut nbytes = 0;
 
-        let mut entries = files.fs.read_dir(file)?;
+        let mut entries = files.fs.read_file_directory(file)?;
         entries.sort_by(|a, b| a.name.cmp(&b.name));
 
         for entry in entries.iter().skip(dir_off) {

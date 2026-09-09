@@ -89,9 +89,6 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         .split_first()
         .context("program path missing — clap should have required at least one argument")?;
 
-    let initial_file_system = shim_builder.brokered_fs();
-    let initial_file_system = std::sync::Arc::new(initial_file_system);
-
     let shim = shim_builder.build();
     let argv = std::iter::once(program_path.as_str())
         .chain(program_args.iter().map(String::as_str))
@@ -114,7 +111,7 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
     }
 
     let program = shim
-        .load_program(initial_file_system, program_path, argv, envp)
+        .load_program(program_path, argv, envp)
         .context("failed to load Windows PE program")?;
     // SAFETY: `WindowsShimEntrypoints::init` populates `rip`/`rsp`/`eflags` inside
     // `run_thread` before the initial guest thread executes, so the `PtRegs::default()`
