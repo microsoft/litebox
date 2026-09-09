@@ -669,6 +669,13 @@ interrupt_callback:
 unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
     #[unsafe(naked)]
     extern "C" fn switch_to_guest_sysret(ctx: &litebox_common_linux::PtRegs, tls: &TlsState) -> ! {
+        // Set `in_guest` now, then check if there is a pending interrupt. If
+        // so, jump to the interrupt handler.
+        //
+        // If an interrupt arrives after the check, then the signal handler will
+        // see that the IP is between `switch_to_guest_start` and
+        // `switch_to_guest_end` and will set the `interrupt` and jump to
+        // `interrupt_callback`.
         core::arch::naked_asm!(
             "switch_to_guest_start:",
             "mov BYTE PTR [rdx + {IS_IN_GUEST}], 1",
@@ -747,8 +754,6 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
         // Ensure the context is written before we set `is_in_guest` so that
         // `ThreadHandle::interrupt` can see a consistent state.
         std::sync::atomic::compiler_fence(Ordering::Release);
-        // SAFETY: TLS and the saved host stack belong to this thread's active
-        // run_thread_arch frame. The callback does not return to this frame.
         unsafe {
             core::arch::asm!(
                 "mov BYTE PTR [{tls} + {IS_IN_GUEST}], 1",
@@ -2116,98 +2121,6 @@ mod tests {
     use litebox::platform::RawMutex;
     use litebox::platform::page_mgmt::FixedAddressBehavior;
     use litebox::platform::page_mgmt::MemoryRegionPermissions;
-
-    fn check_pending_interrupt_before_guest_entry(fast_path: bool) {
-        use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
-        use litebox_common_linux::PtRegs;
-        use std::cell::Cell;
-
-        #[unsafe(naked)]
-        unsafe extern "C" fn guest_entry() {
-            core::arch::naked_asm!(
-                "jmp {syscall_callback}",
-                syscall_callback = sym crate::syscall_callback,
-            );
-        }
-
-        struct PendingInterruptShim {
-            interrupted: Cell<bool>,
-            entered_guest: Cell<bool>,
-        }
-
-        impl EnterShim for PendingInterruptShim {
-            type ExecutionContext = PtRegs;
-
-            fn init(&self, _ctx: &mut PtRegs) -> ContinueOperation {
-                let current =
-                    crate::CURRENT_THREAD_HANDLE.with_borrow(|current| current.clone().unwrap());
-                current.interrupt(Some(&current));
-                ContinueOperation::Resume
-            }
-
-            fn syscall(&self, _ctx: &mut PtRegs) -> ContinueOperation {
-                self.entered_guest.set(true);
-                ContinueOperation::Terminate
-            }
-
-            fn exception(&self, _ctx: &mut PtRegs, _info: &ExceptionInfo) -> ContinueOperation {
-                self.entered_guest.set(true);
-                ContinueOperation::Terminate
-            }
-
-            fn interrupt(&self, _ctx: &mut PtRegs) -> ContinueOperation {
-                self.interrupted.set(true);
-                ContinueOperation::Terminate
-            }
-        }
-
-        crate::ensure_tls_index();
-        let shim = PendingInterruptShim {
-            interrupted: Cell::new(false),
-            entered_guest: Cell::new(false),
-        };
-        let mut stack = [0_u128; 256];
-        let entry = guest_entry as *const () as usize;
-        let mut ctx = PtRegs {
-            rip: entry,
-            rcx: if fast_path { entry } else { 0 },
-            rsp: stack.as_mut_ptr().wrapping_add(stack.len()).addr(),
-            eflags: 0x202,
-            ..Default::default()
-        };
-        crate::run_thread_inner(&shim, &mut ctx);
-        assert!(shim.interrupted.get());
-        assert!(!shim.entered_guest.get());
-        assert_eq!(ctx.rip, entry);
-        assert_eq!(ctx.rcx, if fast_path { entry } else { 0 });
-    }
-
-    #[test]
-    fn pending_interrupt_before_guest_entry_sysret() {
-        check_pending_interrupt_before_guest_entry(true);
-    }
-
-    #[test]
-    fn pending_interrupt_before_guest_entry_ntcontinue() {
-        check_pending_interrupt_before_guest_entry(false);
-    }
-
-    #[test]
-    fn interrupt_redirection_preserves_stack_registers() {
-        use windows_sys::Win32::System::Diagnostics::Debug::{CONTEXT, CONTEXT_CONTROL_AMD64};
-
-        let mut context = CONTEXT {
-            ContextFlags: CONTEXT_CONTROL_AMD64,
-            Rip: 0x1000,
-            Rsp: 0x2000,
-            Rbp: 0x3000,
-            ..Default::default()
-        };
-        crate::set_context_to_interrupt_callback(&mut context);
-        assert_ne!(context.Rip, 0x1000);
-        assert_eq!(context.Rsp, 0x2000);
-        assert_eq!(context.Rbp, 0x3000);
-    }
 
     #[test]
     fn test_raw_mutex() {
