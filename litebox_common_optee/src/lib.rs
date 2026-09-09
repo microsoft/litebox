@@ -1556,6 +1556,8 @@ const OPTEE_MSG_ATTR_TYPE_TMEM_INOUT: u8 = 0xb;
 /// Meta-parameter marker of the attribute word. Set on the `OpenSession`
 /// TA-UUID and client-identity params.
 const OPTEE_MSG_ATTR_META: u64 = 1 << 8;
+/// Noncontiguous-memory marker of the attribute word.
+const OPTEE_MSG_ATTR_NONCONTIG: u64 = 1 << 9;
 
 #[non_exhaustive]
 #[derive(Debug, PartialEq, TryFromPrimitive)]
@@ -1579,7 +1581,9 @@ pub enum OpteeMsgAttrType {
 /// - bits \[7:0\]  – type (`OPTEE_MSG_ATTR_TYPE_*`)
 /// - bit  8       – meta
 /// - bit  9       – noncontig
-/// - bits \[63:10\] – reserved (zero)
+/// - bits \[15:10\] – reserved (zero)
+/// - bits \[18:16\] – cache attributes
+/// - bits \[63:19\] – reserved (zero)
 #[derive(Clone, Copy, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(transparent)]
 pub struct OpteeMsgAttr(u64);
@@ -1590,6 +1594,10 @@ impl OpteeMsgAttr {
     /// zero). See [`OpteeMsgArgs::get_meta_param_value`].
     pub const META_VALUE_INPUT: Self =
         Self(OPTEE_MSG_ATTR_META | OPTEE_MSG_ATTR_TYPE_VALUE_INPUT as u64);
+
+    /// The exact attribute word required for `OPTEE_MSG_CMD_REGISTER_SHM`'s page list.
+    pub const NONCONTIG_TMEM_OUTPUT: Self =
+        Self(OPTEE_MSG_ATTR_NONCONTIG | OPTEE_MSG_ATTR_TYPE_TMEM_OUTPUT as u64);
 
     /// Returns the attribute type (bits 0–7).
     #[allow(clippy::cast_possible_truncation)]
@@ -1604,7 +1612,7 @@ impl OpteeMsgAttr {
 
     /// Returns `true` when the noncontig bit (bit 9) is set.
     pub fn noncontig(&self) -> bool {
-        self.0 & (1 << 9) != 0
+        self.0 & OPTEE_MSG_ATTR_NONCONTIG != 0
     }
 }
 
@@ -1616,12 +1624,22 @@ pub struct OpteeMsgParam {
 }
 
 impl OpteeMsgParam {
-    pub fn attr_type(&self) -> OpteeMsgAttrType {
-        OpteeMsgAttrType::try_from(self.attr.attr_type()).unwrap_or(OpteeMsgAttrType::None)
+    /// Returns the attribute type, or `None` if its type field is unknown.
+    pub fn try_attr_type(&self) -> Option<OpteeMsgAttrType> {
+        OpteeMsgAttrType::try_from(self.attr.attr_type()).ok()
+    }
+    /// Returns `true` if this is exactly the attribute required for the
+    /// `REGISTER_SHM` page-list parameter, with no meta, cache, or reserved bits set.
+    pub fn is_noncontiguous_tmem_output(&self) -> bool {
+        self.attr == OpteeMsgAttr::NONCONTIG_TMEM_OUTPUT
     }
     /// Returns `true` when the meta bit (bit 8) is set.
     pub fn is_meta(&self) -> bool {
         self.attr.meta()
+    }
+    /// Returns `true` when the noncontiguous-memory bit (bit 9) is set.
+    pub fn is_noncontiguous(&self) -> bool {
+        self.attr.noncontig()
     }
     pub fn get_param_tmem(&self) -> Option<OpteeMsgParamTmem> {
         if matches!(

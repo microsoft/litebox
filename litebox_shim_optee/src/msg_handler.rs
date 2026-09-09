@@ -331,6 +331,10 @@ pub fn handle_optee_msg_args(msg_args: &OpteeMsgArgs) -> Result<(), OpteeSmcRetu
     msg_args.validate()?;
     match msg_args.cmd {
         OpteeMessageCommand::RegisterShm => {
+            // REGISTER_SHM has exactly one TMEM_OUTPUT | NONCONTIG parameter.
+            if msg_args.num_params != 1 || !msg_args.params[0].is_noncontiguous_tmem_output() {
+                return Err(OpteeSmcReturnCode::EBadCmd);
+            }
             let tmem = msg_args.get_param_tmem(0)?;
             if tmem.buf_ptr == 0 || tmem.size == 0 || tmem.shm_ref == 0 {
                 return Err(OpteeSmcReturnCode::EBadAddr);
@@ -356,6 +360,9 @@ pub fn handle_optee_msg_args(msg_args: &OpteeMsgArgs) -> Result<(), OpteeSmcRetu
             )?;
         }
         OpteeMessageCommand::UnregisterShm => {
+            if msg_args.num_params != 1 {
+                return Err(OpteeSmcReturnCode::EBadCmd);
+            }
             let rmem = msg_args.get_param_rmem(0)?;
             if rmem.shm_ref == 0 {
                 return Err(OpteeSmcReturnCode::EBadAddr);
@@ -487,7 +494,9 @@ pub fn decode_ta_request(
         if param.is_meta() {
             return Err(OpteeSmcReturnCode::EBadCmd);
         }
-        ta_req_info.params[i] = match param.attr_type() {
+        // Dynamic shared memory is registered separately and referenced as RMEM.
+        // Page-list-backed noncontiguous TMEMs are deliberately not decoded here.
+        ta_req_info.params[i] = match param.try_attr_type().ok_or(OpteeSmcReturnCode::EBadCmd)? {
             OpteeMsgAttrType::None => UteeParamOwned::None,
             OpteeMsgAttrType::ValueInput => {
                 let value = param.get_param_value().ok_or(OpteeSmcReturnCode::EBadCmd)?;
@@ -506,6 +515,9 @@ pub fn decode_ta_request(
             }
             OpteeMsgAttrType::TmemInput => {
                 let tmem = param.get_param_tmem().ok_or(OpteeSmcReturnCode::EBadCmd)?;
+                if param.is_noncontiguous() && tmem.buf_ptr != 0 {
+                    return Err(OpteeSmcReturnCode::EBadCmd);
+                }
                 let data_size = checked_memref_size(tmem.size)?;
                 let shm_info = get_shm_info_from_optee_msg_param_tmem(tmem)?;
                 if data_size != shm_info.len() {
@@ -526,6 +538,9 @@ pub fn decode_ta_request(
             }
             OpteeMsgAttrType::TmemOutput => {
                 let tmem = param.get_param_tmem().ok_or(OpteeSmcReturnCode::EBadCmd)?;
+                if param.is_noncontiguous() && tmem.buf_ptr != 0 {
+                    return Err(OpteeSmcReturnCode::EBadCmd);
+                }
                 let buffer_size = checked_memref_size(tmem.size)?;
                 let shm_info = get_shm_info_from_optee_msg_param_tmem(tmem)?;
 
@@ -542,6 +557,9 @@ pub fn decode_ta_request(
             }
             OpteeMsgAttrType::TmemInout => {
                 let tmem = param.get_param_tmem().ok_or(OpteeSmcReturnCode::EBadCmd)?;
+                if param.is_noncontiguous() && tmem.buf_ptr != 0 {
+                    return Err(OpteeSmcReturnCode::EBadCmd);
+                }
                 let buffer_size = checked_memref_size(tmem.size)?;
                 let shm_info = get_shm_info_from_optee_msg_param_tmem(tmem)?;
 
