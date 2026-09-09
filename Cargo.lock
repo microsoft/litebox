@@ -1450,7 +1450,6 @@ dependencies = [
  "buddy_system_allocator",
  "hashbrown",
  "litebox_broker_core",
- "litebox_broker_host",
  "litebox_broker_local",
  "litebox_broker_protocol",
  "litebox_broker_transport",
@@ -1460,7 +1459,6 @@ dependencies = [
  "slabmalloc",
  "smallvec",
  "spin 0.9.8",
- "tempfile",
  "thiserror",
  "windows-sys 0.60.2",
  "zerocopy",
@@ -1477,6 +1475,7 @@ dependencies = [
  "litebox_util_log",
  "spin 0.9.8",
  "tar-no-std",
+ "tempfile",
  "thiserror",
 ]
 

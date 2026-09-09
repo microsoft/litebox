@@ -1,2284 +1,667 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-fn tar_ro_fs(
-    litebox: &crate::LiteBox<crate::platform::mock::MockPlatform>,
-    tar_data: alloc::borrow::Cow<'static, [u8]>,
-) -> crate::fs::resolver::Resolver<crate::platform::mock::MockPlatform> {
-    crate::test_broker::brokered_fs(
-        litebox,
-        crate::fs::tar_ro::TarRo::new(
-            tar_data,
-            crate::fs::inode_allocator::InodeAllocator::standalone(),
-        ),
-    )
+//! Guest-facing filesystem facade tests.
+//!
+//! Filesystem resolution, backend, and 9P semantics belong to `litebox_broker_core` and are tested
+//! there. What LiteBox owns is the guest side of the boundary: resolving paths against a
+//! [`Context`], converting between guest and protocol values, mapping broker errors onto guest
+//! error types, and tying broker-owned files to guest descriptors. These tests script broker
+//! responses over a local channel, so no broker core, policy engine, or host transport is
+//! involved.
+
+extern crate std;
+
+use alloc::collections::VecDeque;
+use alloc::string::{String, ToString as _};
+use alloc::sync::Arc;
+use alloc::vec;
+use alloc::vec::Vec;
+use std::sync::Mutex;
+
+use litebox_broker_local::BrokerLocal;
+use litebox_broker_protocol::fs::{
+    FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileNodeInfo, FileOpenFlags,
+    FileSeekWhence, FileStatus as BrokerFileStatus, FileType as BrokerFileType, FileUser,
+    MAX_FILE_TRANSFER_SIZE, OpenFileResponse, ReadDirectoryResponse, ReadFileResponse,
+    SeekFileResponse, WriteFileResponse, encode_directory_entries_chunk,
+};
+use litebox_broker_protocol::message::{
+    BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerOperation, BrokerRequest,
+    BrokerResponse, BrokerResult, FileRequest, FileResponse,
+};
+use litebox_broker_protocol::shared_buffer::{
+    SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SharedBufferDescriptor,
+};
+use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, ObjectHandle};
+use litebox_broker_transport::channel::{LocalCallChannel, LocalSetupChannel};
+use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemory, SharedMemoryError};
+
+use crate::fs::errors::{
+    OpenError, PathError, ReadDirError, ReadError, RmdirError, UnlinkError, WriteError,
+};
+use crate::fs::resolver::{Context, Resolver};
+use crate::fs::{FileType, Mode, OFlags, SeekWhence, UserInfo};
+use crate::platform::mock::MockPlatform;
+
+/// The handle the scripted broker hands out for every successful open.
+const FILE_HANDLE: ObjectHandle = ObjectHandle(7);
+
+/// One broker request the facade issued, with any shared-buffer payload copied out.
+#[derive(Debug, PartialEq, Eq)]
+enum Call {
+    Open {
+        path: String,
+        user: FileUser,
+        access: FileAccessMode,
+        flags: FileOpenFlags,
+        mode: FileMode,
+    },
+    Read {
+        handle: ObjectHandle,
+        length: u32,
+        offset: Option<u64>,
+    },
+    Write {
+        handle: ObjectHandle,
+        data: Vec<u8>,
+        offset: Option<u64>,
+    },
+    Seek {
+        handle: ObjectHandle,
+        offset: i64,
+        whence: FileSeekWhence,
+    },
+    ReadDirectory {
+        handle: ObjectHandle,
+        start_index: u64,
+    },
+    PathStatus {
+        path: String,
+        user: FileUser,
+    },
+    Unlink {
+        path: String,
+        user: FileUser,
+    },
+    Rmdir {
+        path: String,
+        user: FileUser,
+    },
+    Close(ObjectHandle),
 }
 
-type InMemFs = crate::fs::resolver::Resolver<crate::platform::mock::MockPlatform>;
-
-fn in_mem_fs(litebox: &crate::LiteBox<crate::platform::mock::MockPlatform>) -> InMemFs {
-    crate::test_broker::brokered_fs(
-        litebox,
-        crate::fs::in_mem::InMem::<crate::platform::mock::MockPlatform>::new(
-            crate::fs::inode_allocator::InodeAllocator::standalone(),
-        ),
-    )
+/// One scripted broker answer.
+enum Scripted {
+    /// Reply with this file response verbatim.
+    Reply(FileResponse),
+    /// Stage `data` in the request's shared buffer and report it as read.
+    Read(Vec<u8>),
+    /// Answer directory reads from `entries`, at most `page_bytes` of them per response.
+    Directory {
+        entries: Vec<FileDirectoryEntry>,
+        page_bytes: usize,
+    },
 }
 
-/// Run `f` with the acting user set to root.
-fn with_root_privileges<Platform: crate::sync::RawSyncPrimitivesProvider>(
-    fs: &mut crate::fs::resolver::Resolver<Platform>,
-    context: &crate::fs::resolver::Context,
-    f: impl FnOnce(&mut crate::fs::resolver::Resolver<Platform>, &crate::fs::resolver::Context),
-) {
-    let root = crate::fs::UserInfo::ROOT;
-    with_user(fs, context, root.user, root.group, f);
+/// A broker that records requests and answers them from a script.
+struct ScriptedBroker {
+    buffers: SharedBufferPool<Arc<TestSharedMemory>>,
+    calls: Mutex<Vec<Call>>,
+    script: Mutex<VecDeque<Scripted>>,
 }
 
-/// Run `f` with the acting user set to `user`/`group`, so that tests can exercise operations
-/// whose outcome depends on the acting user.
-fn with_user<Platform: crate::sync::RawSyncPrimitivesProvider>(
-    fs: &mut crate::fs::resolver::Resolver<Platform>,
-    context: &crate::fs::resolver::Context,
-    user: u16,
-    group: u16,
-    f: impl FnOnce(&mut crate::fs::resolver::Resolver<Platform>, &crate::fs::resolver::Context),
-) {
-    let mut context = context.clone();
-    context.set_acting_user(crate::fs::UserInfo { user, group });
-    f(fs, &context);
-}
-
-type OverlayFs = crate::fs::resolver::Resolver<crate::platform::mock::MockPlatform>;
-
-/// An overlay of `upper` over a tar-backed lower layer.
-fn overlay_fs(
-    litebox: &crate::LiteBox<crate::platform::mock::MockPlatform>,
-    upper: crate::fs::in_mem::InMem<crate::platform::mock::MockPlatform>,
-    tar_data: alloc::borrow::Cow<'static, [u8]>,
-) -> OverlayFs {
-    crate::test_broker::brokered_fs(
-        litebox,
-        crate::fs::overlay::Overlay::<crate::platform::mock::MockPlatform>::new(
-            upper,
-            crate::fs::tar_ro::TarRo::new(
-                tar_data,
-                crate::fs::inode_allocator::InodeAllocator::standalone(),
-            ),
-            crate::fs::inode_allocator::InodeAllocator::standalone(),
-        ),
-    )
-}
-
-mod in_mem {
-    use crate::LiteBox;
-    use crate::fs::{Mode, OFlags};
-    use crate::platform::mock::MockPlatform;
-    use alloc::vec;
-    use alloc::vec::Vec;
-    extern crate std;
-
-    use super::{with_root_privileges, with_user};
-
-    #[test]
-    fn root_file_creation_and_deletion() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-
-        with_root_privileges(&mut super::in_mem_fs(&litebox), &ctx, |fs, ctx| {
-            // Test file creation
-            let path = "/testfile";
-            let fd = fs
-                .open(ctx, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
-                .expect("Failed to create file");
-
-            fs.close(&fd).expect("Failed to close file");
-
-            // Test file deletion
-            fs.unlink(ctx, path).expect("Failed to unlink file");
-            assert!(
-                fs.open(ctx, path, OFlags::RDONLY, Mode::RWXU).is_err(),
-                "File should not exist"
-            );
-        });
+impl ScriptedBroker {
+    fn new(script: impl IntoIterator<Item = Scripted>) -> Arc<Self> {
+        let memory = Arc::new(TestSharedMemory::new());
+        Arc::new(Self {
+            buffers: SharedBufferPool::new(memory, SHARED_BUFFER_LAYOUT).unwrap(),
+            calls: Mutex::new(Vec::new()),
+            script: Mutex::new(script.into_iter().collect()),
+        })
     }
 
-    #[test]
-    fn root_file_read_write() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-
-        with_root_privileges(&mut super::in_mem_fs(&litebox), &ctx, |fs, ctx| {
-            // Create and write to a file
-            let path = "/testfile";
-            let fd = fs
-                .open(ctx, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
-                .expect("Failed to create file");
-            let data = b"Hello, world!";
-            fs.write(&fd, data, None).expect("Failed to write to file");
-            fs.close(&fd).expect("Failed to close file");
-
-            // Read from the file
-            let fd = fs
-                .open(ctx, path, OFlags::RDONLY, Mode::RWXU)
-                .expect("Failed to open file");
-            let mut buffer = vec![0; data.len()];
-            let bytes_read = fs
-                .read(&fd, &mut buffer, None)
-                .expect("Failed to read from file");
-            assert_eq!(bytes_read, data.len());
-            assert_eq!(&buffer, data);
-            fs.close(&fd).expect("Failed to close file");
-        });
+    /// Every request observed so far, oldest first.
+    fn calls(&self) -> std::sync::MutexGuard<'_, Vec<Call>> {
+        self.calls.lock().unwrap()
     }
 
-    #[test]
-    fn write_only_open_does_not_require_read_permission() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-        let mut fs = super::in_mem_fs(&litebox);
-        with_root_privileges(&mut fs, &ctx, |fs, ctx| {
-            fs.mkdir(ctx, "/tmp", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                .expect("Failed to create /tmp");
-        });
-
-        let path = "/tmp/write_only";
-        let fd = fs
-            .open(&ctx, path, OFlags::CREAT | OFlags::WRONLY, Mode::WUSR)
-            .expect("Failed to create write-only file");
-        fs.write(&fd, b"x", None).expect("Failed to write file");
-
-        let mut buffer = [0];
-        assert!(matches!(
-            fs.read(&fd, &mut buffer, None),
-            Err(crate::fs::errors::ReadError::NotForReading)
-        ));
-        fs.close(&fd).expect("Failed to close file");
-
-        assert!(matches!(
-            fs.open(&ctx, path, OFlags::RDONLY, Mode::empty()),
-            Err(crate::fs::errors::OpenError::AccessNotAllowed)
-        ));
+    fn record(&self, call: Call) {
+        self.calls.lock().unwrap().push(call);
     }
 
-    #[test]
-    fn newly_created_file_does_not_require_its_own_permissions() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-        let mut fs = super::in_mem_fs(&litebox);
-        with_root_privileges(&mut fs, &ctx, |fs, ctx| {
-            fs.mkdir(ctx, "/tmp", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                .expect("Failed to create /tmp");
-        });
-
-        let path = "/tmp/zero_mode";
-        let fd = fs
-            .open(&ctx, path, OFlags::CREAT | OFlags::WRONLY, Mode::empty())
-            .expect("Failed to create zero-mode file");
-        fs.write(&fd, b"x", None).expect("Failed to write file");
-        fs.close(&fd).expect("Failed to close file");
-
-        let status = fs.file_status(&ctx, path).expect("Failed to stat file");
-        assert_eq!(status.mode, Mode::empty());
-        assert!(matches!(
-            fs.open(&ctx, path, OFlags::WRONLY, Mode::empty()),
-            Err(crate::fs::errors::OpenError::AccessNotAllowed)
-        ));
-    }
-
-    #[test]
-    fn root_directory_creation_and_removal() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-
-        with_root_privileges(&mut super::in_mem_fs(&litebox), &ctx, |fs, ctx| {
-            // Test directory creation
-            let path = "/testdir";
-            fs.mkdir(ctx, path, Mode::RWXU)
-                .expect("Failed to create directory");
-
-            // Test directory removal
-            fs.rmdir(ctx, path).expect("Failed to remove directory");
-            assert!(
-                fs.open(ctx, path, OFlags::RDONLY, Mode::RWXU).is_err(),
-                "Directory should not exist"
-            );
-        });
-    }
-
-    #[test]
-    fn file_creation_and_deletion() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-        let mut fs = super::in_mem_fs(&litebox);
-        with_root_privileges(&mut fs, &ctx, |fs, ctx| {
-            // Make `/tmp` and set up with reasonable privs so normal users can do things in there.
-            fs.mkdir(ctx, "/tmp", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                .expect("Failed to create /tmp");
-        });
-
-        // Test file creation
-        let path = "/tmp/testfile";
-        let fd = fs
-            .open(&ctx, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
-            .expect("Failed to create file");
-
-        fs.close(&fd).expect("Failed to close file");
-
-        // Test file deletion
-        fs.unlink(&ctx, path).expect("Failed to unlink file");
-        assert!(
-            fs.open(&ctx, path, OFlags::RDONLY, Mode::RWXU).is_err(),
-            "File should not exist"
-        );
-    }
-
-    #[test]
-    fn file_read_write() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-        let mut fs = super::in_mem_fs(&litebox);
-        with_root_privileges(&mut fs, &ctx, |fs, ctx| {
-            // Make `/tmp` and set up with reasonable privs so normal users can do things in there.
-            fs.mkdir(ctx, "/tmp", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                .expect("Failed to create /tmp");
-        });
-
-        // Create and write to a file
-        let path = "/tmp/testfile";
-        let fd = fs
-            .open(&ctx, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
-            .expect("Failed to create file");
-        let data = b"Hello, world!";
-        fs.write(&fd, data, None).expect("Failed to write to file");
-        fs.write(&fd, &data[2..], Some(2))
-            .expect("Failed to write to file with offset");
-        fs.close(&fd).expect("Failed to close file");
-
-        // Read from the file
-        let fd = fs
-            .open(&ctx, path, OFlags::RDONLY, Mode::RWXU)
-            .expect("Failed to open file");
-        let mut buffer = vec![0; data.len()];
-        let bytes_read = fs
-            .read(&fd, &mut buffer, None)
-            .expect("Failed to read from file");
-        let bytes_read2 = fs
-            .read(&fd, &mut buffer[2..], Some(2))
-            .expect("Failed to read from file with offset");
-        assert_eq!(bytes_read, data.len());
-        assert_eq!(bytes_read2, data.len() - 2);
-        assert_eq!(&buffer, data);
-        fs.close(&fd).expect("Failed to close file");
-    }
-
-    #[test]
-    fn directory_creation_and_removal() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-        let mut fs = super::in_mem_fs(&litebox);
-        with_root_privileges(&mut fs, &ctx, |fs, ctx| {
-            // Make `/tmp` and set up with reasonable privs so normal users can do things in there.
-            fs.mkdir(ctx, "/tmp", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                .expect("Failed to create /tmp");
-        });
-
-        // Test directory creation
-        let path = "/tmp/testdir";
-        fs.mkdir(&ctx, path, Mode::RWXU)
-            .expect("Failed to create directory");
-
-        // Test directory removal
-        fs.rmdir(&ctx, path).expect("Failed to remove directory");
-        assert!(
-            fs.open(&ctx, path, OFlags::RDONLY, Mode::RWXU).is_err(),
-            "Directory should not exist"
-        );
-    }
-
-    #[test]
-    fn read_dir_empty() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-
-        with_root_privileges(&mut super::in_mem_fs(&litebox), &ctx, |fs, ctx| {
-            let fd = fs
-                .open(ctx, "/", OFlags::RDONLY, Mode::empty())
-                .expect("Failed to open root directory");
-            let entries = fs
-                .read_dir(&fd)
-                .expect("Failed to read directory")
-                .iter()
-                .map(|e| e.name.clone())
-                .collect::<Vec<_>>();
-            assert_eq!(
-                entries,
-                vec![".", ".."],
-                "Root directory should contain . and .."
-            );
-            fs.close(&fd).expect("Failed to close directory");
-        });
-    }
-
-    #[test]
-    fn read_dir_with_files_and_dirs() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-
-        with_root_privileges(&mut super::in_mem_fs(&litebox), &ctx, |fs, ctx| {
-            // Create a directory structure
-            fs.mkdir(ctx, "/testdir", Mode::RWXU)
-                .expect("Failed to create directory");
-            let fd1 = fs
-                .open(
-                    ctx,
-                    "/testfile1",
-                    OFlags::CREAT | OFlags::WRONLY,
-                    Mode::RWXU,
-                )
-                .expect("Failed to create file1");
-            fs.close(&fd1).expect("Failed to close file1");
-            let fd2 = fs
-                .open(
-                    ctx,
-                    "/testfile2",
-                    OFlags::CREAT | OFlags::WRONLY,
-                    Mode::RWXU,
-                )
-                .expect("Failed to create file2");
-            fs.close(&fd2).expect("Failed to close file2");
-
-            // Read root directory
-            let fd = fs
-                .open(ctx, "/", OFlags::RDONLY, Mode::empty())
-                .expect("Failed to open root directory");
-            let entries = fs.read_dir(&fd).expect("Failed to read directory");
-            fs.close(&fd).expect("Failed to close directory");
-
-            // Should have 5 entries: ., .., testdir, testfile1, testfile2
-            assert_eq!(entries.len(), 5);
-
-            let mut names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
-            names.sort_unstable();
-            assert_eq!(names, vec![".", "..", "testdir", "testfile1", "testfile2"]);
-
-            // Check file types
-            for entry in &entries {
-                match entry.name.as_str() {
-                    "testdir" | "." | ".." => {
-                        assert_eq!(entry.file_type, crate::fs::FileType::Directory);
-                    }
-                    "testfile1" | "testfile2" => {
-                        assert_eq!(entry.file_type, crate::fs::FileType::RegularFile);
-                    }
-                    _ => panic!("Unexpected entry: {}", entry.name),
-                }
-                if entry.name != "." && entry.name != ".." {
-                    assert!(entry.ino_info.is_some(), "Inode info should be present");
-                } else {
-                    // TODO(jayb): Re-enable this assertion once the resolver fills in
-                    // inode information for the synthesized `.` and `..` entries.
-                }
-            }
-
-            // Read the subdirectory (should be empty)
-            let fd = fs
-                .open(ctx, "/testdir", OFlags::RDONLY, Mode::empty())
-                .expect("Failed to open subdirectory");
-            let entries = fs
-                .read_dir(&fd)
-                .expect("Failed to read subdirectory")
-                .iter()
-                .map(|e| e.name.clone())
-                .collect::<Vec<_>>();
-            assert!(entries.len() == 2, "Subdirectory should contain . and ..");
-            fs.close(&fd).expect("Failed to close subdirectory");
-        });
-    }
-
-    #[test]
-    fn read_dir_file_not_directory() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-
-        with_root_privileges(&mut super::in_mem_fs(&litebox), &ctx, |fs, ctx| {
-            // Create a file
-            let fd = fs
-                .open(ctx, "/testfile", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
-                .expect("Failed to create file");
-            fs.close(&fd).expect("Failed to close file");
-
-            // Try to read_dir on the file (should fail)
-            let fd = fs
-                .open(ctx, "/testfile", OFlags::RDONLY, Mode::empty())
-                .expect("Failed to open file");
-            let result = fs.read_dir(&fd);
-            fs.close(&fd).expect("Failed to close file");
-
-            assert!(matches!(
-                result,
-                Err(crate::fs::errors::ReadDirError::NotADirectory)
-            ));
-        });
-    }
-
-    #[test]
-    fn parent_dir_write_permissions_are_enforced() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-        let mut fs = super::in_mem_fs(&litebox);
-
-        with_root_privileges(&mut fs, &ctx, |fs, ctx| {
-            // A root-owned 0755 directory, holding a file and a directory to try to remove.
-            fs.mkdir(
-                ctx,
-                "/rootdir",
-                Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
-            )
-            .expect("Failed to create directory");
-            let fd = fs
-                .open(
-                    ctx,
-                    "/rootdir/file",
-                    OFlags::CREAT | OFlags::WRONLY,
-                    Mode::RWXU,
-                )
-                .expect("Failed to create file");
-            fs.close(&fd).expect("Failed to close file");
-            fs.mkdir(ctx, "/rootdir/sub", Mode::RWXU)
-                .expect("Failed to create subdirectory");
-
-            // A world-writable directory, for the positive case.
-            fs.mkdir(ctx, "/opendir", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                .expect("Failed to create directory");
-        });
-
-        with_user(&mut fs, &ctx, 1000, 1000, |fs, ctx| {
-            assert!(matches!(
-                fs.open(
-                    ctx,
-                    "/rootdir/new",
-                    OFlags::CREAT | OFlags::WRONLY,
-                    Mode::RWXU
-                ),
-                Err(crate::fs::errors::OpenError::NoWritePerms)
-            ));
-            assert!(matches!(
-                fs.mkdir(ctx, "/rootdir/newdir", Mode::RWXU),
-                Err(crate::fs::errors::MkdirError::NoWritePerms)
-            ));
-            assert!(matches!(
-                fs.unlink(ctx, "/rootdir/file"),
-                Err(crate::fs::errors::UnlinkError::NoWritePerms)
-            ));
-            assert!(matches!(
-                fs.rmdir(ctx, "/rootdir/sub"),
-                Err(crate::fs::errors::RmdirError::NoWritePerms)
-            ));
-
-            // The same operations succeed in a directory the user may write.
-            let fd = fs
-                .open(
-                    ctx,
-                    "/opendir/new",
-                    OFlags::CREAT | OFlags::WRONLY,
-                    Mode::RWXU,
-                )
-                .expect("Failed to create file");
-            fs.close(&fd).expect("Failed to close file");
-            fs.mkdir(ctx, "/opendir/newdir", Mode::RWXU)
-                .expect("Failed to create directory");
-            fs.unlink(ctx, "/opendir/new")
-                .expect("Failed to unlink file");
-            fs.rmdir(ctx, "/opendir/newdir")
-                .expect("Failed to remove directory");
-        });
-    }
-
-    #[test]
-    fn chown_test() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-        let mut fs = super::in_mem_fs(&litebox);
-
-        // Create a test file as root
-        with_root_privileges(&mut fs, &ctx, |fs, ctx| {
-            let path = "/testfile";
-            let fd = fs
-                .open(ctx, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
-                .expect("Failed to create file");
-            fs.close(&fd).expect("Failed to close file");
-
-            // First chown to 1000:1000 as root (should succeed)
-            fs.chown(ctx, path, Some(1000), Some(1000))
-                .expect("Failed to chown as root");
-        });
-
-        // Switch to user 1000 and test that owner can chown (should succeed)
-        let path = "/testfile";
-        with_user(&mut fs, &ctx, 1000, 1000, |fs, ctx| {
-            fs.chown(ctx, path, Some(123), Some(456))
-                .expect("Failed to chown as owner");
-        });
-
-        // Switch to a different user and test that non-owner cannot chown (should fail)
-        with_user(&mut fs, &ctx, 500, 500, |fs, ctx| {
-            match fs.chown(ctx, path, Some(789), Some(101)) {
-                Err(crate::fs::errors::ChownError::NotTheOwner) => {
-                    // Expected behavior
-                }
-                Ok(()) => panic!("Non-owner should not be able to chown"),
-                Err(e) => panic!("Unexpected error: {e:?}"),
-            }
-        });
-
-        // Test chown on non-existent file (should fail)
-        match fs.chown(&ctx, "/nonexistent", Some(123), Some(456)) {
-            Err(crate::fs::errors::ChownError::PathError(
-                crate::fs::errors::PathError::NoSuchFileOrDirectory,
-            )) => {
-                // Expected behavior
-            }
-            Ok(()) => panic!("Should not be able to chown non-existent file"),
-            Err(e) => panic!("Unexpected error: {e:?}"),
-        }
-
-        // Test partial chown (change only user, leave group unchanged)
-        with_root_privileges(&mut fs, &ctx, |fs, ctx| {
-            fs.chown(ctx, path, Some(999), None)
-                .expect("Failed to chown user only");
-        });
-
-        // Test partial chown (change only group, leave user unchanged)
-        with_root_privileges(&mut fs, &ctx, |fs, ctx| {
-            fs.chown(ctx, path, None, Some(888))
-                .expect("Failed to chown group only");
-        });
-    }
-
-    #[test]
-    fn o_directory_flag_tests() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-        let mut fs = super::in_mem_fs(&litebox);
-
-        with_root_privileges(&mut fs, &ctx, |fs, ctx| {
-            fs.chmod(ctx, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                .expect("Failed to chmod /");
-        });
-        // Create test directory and file
-        fs.mkdir(&ctx, "/testdir", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-            .expect("Failed to create directory");
-
-        let fd = fs
-            .open(
-                &ctx,
-                "/testfile",
-                OFlags::CREAT | OFlags::WRONLY,
-                Mode::RWXU,
-            )
-            .expect("Failed to create file");
-        fs.close(&fd).expect("Failed to close file");
-
-        // Test O_DIRECTORY on a directory (should succeed)
-        let fd = fs
-            .open(
-                &ctx,
-                "/testdir",
-                OFlags::RDONLY | OFlags::DIRECTORY,
-                Mode::empty(),
-            )
-            .expect("Failed to open directory with O_DIRECTORY");
-        fs.close(&fd).expect("Failed to close directory");
-
-        // Test O_DIRECTORY on a regular file (should fail)
-        assert!(matches!(
-            fs.open(
-                &ctx,
-                "/testfile",
-                OFlags::RDONLY | OFlags::DIRECTORY,
-                Mode::empty()
-            ),
-            Err(crate::fs::errors::OpenError::PathError(
-                crate::fs::errors::PathError::ComponentNotADirectory
-            ))
-        ));
-
-        // Test O_DIRECTORY on non-existent path (should fail)
-        assert!(matches!(
-            fs.open(
-                &ctx,
-                "/nonexistent",
-                OFlags::RDONLY | OFlags::DIRECTORY,
-                Mode::empty()
-            ),
-            Err(crate::fs::errors::OpenError::PathError(
-                crate::fs::errors::PathError::NoSuchFileOrDirectory
-            ))
-        ));
-
-        // Test O_DIRECTORY with O_CREAT on non-existent path
-        // According to the implementation, O_DIRECTORY should be ignored when O_CREAT is specified
-        let fd = fs
-            .open(
-                &ctx,
-                "/newfile",
-                OFlags::CREAT | OFlags::WRONLY | OFlags::DIRECTORY,
-                Mode::RWXU,
-            )
-            .expect("Failed to create file with O_CREAT | O_DIRECTORY");
-        fs.close(&fd).expect("Failed to close file");
-
-        // Verify it created a regular file, not a directory
-        let stat = fs
-            .file_status(&ctx, "/newfile")
-            .expect("Failed to get file status");
-        assert_eq!(stat.file_type, crate::fs::FileType::RegularFile);
-
-        // TODO(jayb): Restore coverage of `O_RDWR | O_DIRECTORY` once `OpenError` can report
-        // `EISDIR`; see the matching TODO in `InMem::owned_dir_at`. The legacy in-memory file
-        // system used to accept such an open, which Linux rejects.
-    }
-
-    #[test]
-    fn o_excl_flag_tests() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-        let mut fs = super::in_mem_fs(&litebox);
-
-        with_root_privileges(&mut fs, &ctx, |fs, ctx| {
-            fs.chmod(ctx, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                .expect("Failed to chmod /");
-        });
-
-        // Test O_CREAT | O_EXCL on non-existent file (should succeed)
-        let fd = fs
-            .open(
-                &ctx,
-                "/newfile",
-                OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
-                Mode::RWXU,
-            )
-            .expect("Failed to create new file with O_CREAT | O_EXCL");
-
-        // Write some data to verify file was created
-        fs.write(&fd, b"test data", None)
-            .expect("Failed to write to new file");
-        fs.close(&fd).expect("Failed to close new file");
-
-        // Test O_CREAT | O_EXCL on existing file (should fail)
-        assert!(matches!(
-            fs.open(
-                &ctx,
-                "/newfile",
-                OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
-                Mode::RWXU,
-            ),
-            Err(crate::fs::errors::OpenError::AlreadyExists)
-        ));
-
-        // Test O_EXCL without O_CREAT (should be ignored and succeed)
-        let fd = fs
-            .open(
-                &ctx,
-                "/newfile",
-                OFlags::EXCL | OFlags::RDONLY,
-                Mode::empty(),
-            )
-            .expect("Failed to open existing file with O_EXCL (without O_CREAT)");
-
-        // Verify we can read the data
-        let mut buffer = vec![0; 9];
-        let bytes_read = fs
-            .read(&fd, &mut buffer, None)
-            .expect("Failed to read from file");
-        assert_eq!(&buffer[..bytes_read], b"test data");
-        fs.close(&fd).expect("Failed to close file");
-
-        // Test O_CREAT without O_EXCL on existing file (should succeed)
-        let fd = fs
-            .open(&ctx, "/newfile", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
-            .expect("Failed to open existing file with O_CREAT (without O_EXCL)");
-        fs.close(&fd).expect("Failed to close file");
-
-        // Test O_CREAT | O_EXCL on directory (should fail)
-        fs.mkdir(&ctx, "/testdir", Mode::RWXU)
-            .expect("Failed to create directory");
-        assert!(matches!(
-            fs.open(
-                &ctx,
-                "/testdir",
-                OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
-                Mode::RWXU,
-            ),
-            Err(crate::fs::errors::OpenError::AlreadyExists)
-        ));
-    }
-
-    #[test]
-    fn open_with_trunc() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-        let mut fs = super::in_mem_fs(&litebox);
-
-        with_root_privileges(&mut fs, &ctx, |fs, ctx| {
-            fs.chmod(ctx, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                .expect("Failed to chmod /");
-        });
-
-        // Create a file and write some initial content
-        let path = "/testfile";
-        let fd = fs
-            .open(&ctx, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
-            .expect("Failed to create file");
-        let initial_data = b"Hello, world! This is initial content.";
-        fs.write(&fd, initial_data, None)
-            .expect("Failed to write initial content");
-        fs.close(&fd).expect("Failed to close file");
-
-        // Verify initial content was written
-        let fd = fs
-            .open(&ctx, path, OFlags::RDONLY, Mode::empty())
-            .expect("Failed to open file for reading");
-        let mut buffer = vec![0; initial_data.len()];
-        let bytes_read = fs
-            .read(&fd, &mut buffer, None)
-            .expect("Failed to read initial content");
-        assert_eq!(bytes_read, initial_data.len());
-        assert_eq!(&buffer, initial_data);
-        fs.close(&fd).expect("Failed to close file");
-
-        // Test O_TRUNC with O_WRONLY - should truncate file
-        let fd = fs
-            .open(&ctx, path, OFlags::WRONLY | OFlags::TRUNC, Mode::empty())
-            .expect("Failed to open file with O_TRUNC | O_WRONLY");
-
-        // Write new content to the truncated file
-        let new_data = b"New content";
-        fs.write(&fd, new_data, None)
-            .expect("Failed to write new content");
-        fs.close(&fd).expect("Failed to close file");
-
-        // Verify the file was truncated and contains only new content
-        let fd = fs
-            .open(&ctx, path, OFlags::RDONLY, Mode::empty())
-            .expect("Failed to open file for verification");
-        let mut buffer = vec![0; initial_data.len()];
-        let bytes_read = fs
-            .read(&fd, &mut buffer, None)
-            .expect("Failed to read after truncation");
-        assert_eq!(bytes_read, new_data.len());
-        assert_eq!(&buffer[..bytes_read], new_data);
-        fs.close(&fd).expect("Failed to close file");
-
-        // Test O_TRUNC with O_RDWR - should also truncate
-        fs.write(
-            &fs.open(&ctx, path, OFlags::WRONLY, Mode::empty()).unwrap(),
-            b"More content to truncate",
-            None,
-        )
-        .unwrap();
-        fs.close(&fs.open(&ctx, path, OFlags::WRONLY, Mode::empty()).unwrap())
+    /// The UTF-8 path staged in `descriptor` by the guest.
+    fn staged_path(&self, descriptor: SharedBufferDescriptor) -> String {
+        let mut bytes = vec![0; descriptor.length as usize];
+        self.buffers
+            .read(descriptor.slot_index, &mut bytes)
             .unwrap();
-
-        let fd = fs
-            .open(&ctx, path, OFlags::RDWR | OFlags::TRUNC, Mode::empty())
-            .expect("Failed to open file with O_TRUNC | O_RDWR");
-
-        // File should be empty after truncation
-        let mut buffer = vec![0; 100];
-        let bytes_read = fs
-            .read(&fd, &mut buffer, None)
-            .expect("Failed to read from truncated file");
-        assert_eq!(bytes_read, 0);
-
-        // Write and read back to verify it works
-        let test_data = b"After RDWR truncation";
-        fs.write(&fd, test_data, None)
-            .expect("Failed to write after RDWR truncation");
-
-        fs.seek(&fd, 0, crate::fs::SeekWhence::RelativeToBeginning)
-            .expect("Failed to seek to beginning");
-        let bytes_read = fs
-            .read(&fd, &mut buffer, None)
-            .expect("Failed to read after write");
-        assert_eq!(bytes_read, test_data.len());
-        assert_eq!(&buffer[..bytes_read], test_data);
-        fs.close(&fd).expect("Failed to close file");
+        String::from_utf8(bytes).expect("guest must stage a UTF-8 path")
     }
 
-    #[test]
-    fn write_position_after_seek() {
-        use crate::fs::SeekWhence;
-
-        let ctx = crate::fs::resolver::Context::new();
-
-        let litebox = LiteBox::new(MockPlatform::new());
-        let mut fs = super::in_mem_fs(&litebox);
-        with_root_privileges(&mut fs, &ctx, |fs, ctx| {
-            // Allow regular user to create in root for this focused test
-            fs.chmod(ctx, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                .expect("chmod / failed");
-        });
-
-        let fd = fs
-            .open(
-                &ctx,
-                "/posfile",
-                OFlags::CREAT | OFlags::RDWR,
-                Mode::RWXU | Mode::RWXG | Mode::RWXO,
-            )
-            .expect("open failed");
-
-        // 1. First positional write; position should advance by 6.
-        fs.write(&fd, b"abcdef", None).expect("first write failed");
-
-        // 2. Rewind to beginning.
-        fs.seek(&fd, 0, SeekWhence::RelativeToBeginning)
-            .expect("seek failed");
-
-        // 3. Another positional write should write from start
-        fs.write(&fd, b"X", None).expect("overwrite failed");
-
-        // The file offset should now be at 2.
-        assert_eq!(
-            fs.seek(&fd, 0, SeekWhence::RelativeToCurrentOffset)
-                .expect("seek failed"),
-            1
-        );
-
-        // Read back whole file to verify content and length.
-        fs.seek(&fd, 0, SeekWhence::RelativeToBeginning)
-            .expect("seek failed");
-        let mut buf = [0u8; 16];
-        let n = fs.read(&fd, &mut buf, None).expect("read failed");
-        assert_eq!(n, 6, "file length should be 6 after writes");
-        assert_eq!(&buf[..n], b"Xbcdef", "file content mismatch");
-
-        // Extra: another append to verify continued correct advancement.
-        fs.write(&fd, b"12", None).expect("second append failed");
-        fs.seek(&fd, 0, SeekWhence::RelativeToBeginning)
-            .expect("seek 2 failed");
-        let mut buf2 = [0u8; 16];
-        let n2 = fs.read(&fd, &mut buf2, None).expect("read 2 failed");
-        assert_eq!(n2, 8);
-        assert_eq!(&buf2[..n2], b"Xbcdef12");
-
-        fs.close(&fd).expect("close failed");
+    fn staged_data(&self, descriptor: SharedBufferDescriptor) -> Vec<u8> {
+        let mut bytes = vec![0; descriptor.length as usize];
+        self.buffers
+            .read(descriptor.slot_index, &mut bytes)
+            .unwrap();
+        bytes
     }
 
-    #[test]
-    fn o_append_flag_basic() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-        let mut fs = super::in_mem_fs(&litebox);
-
-        with_root_privileges(&mut fs, &ctx, |fs, ctx| {
-            fs.chmod(ctx, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                .expect("Failed to chmod /");
-        });
-
-        // Create a file and write some initial content
-        let path = "/testfile";
-        let fd = fs
-            .open(&ctx, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
-            .expect("Failed to create file");
-        let initial_data = b"Hello";
-        fs.write(&fd, initial_data, None)
-            .expect("Failed to write initial content");
-        fs.close(&fd).expect("Failed to close file");
-
-        // Re-open with O_APPEND and write more data
-        let fd = fs
-            .open(&ctx, path, OFlags::WRONLY | OFlags::APPEND, Mode::empty())
-            .expect("Failed to open file with O_APPEND");
-        let append_data = b" World";
-        fs.write(&fd, append_data, None)
-            .expect("Failed to append data");
-        fs.close(&fd).expect("Failed to close file");
-
-        // Verify the file contains both pieces of data concatenated
-        let fd = fs
-            .open(&ctx, path, OFlags::RDONLY, Mode::empty())
-            .expect("Failed to open file for reading");
-        let mut buffer = vec![0; 11];
-        let bytes_read = fs
-            .read(&fd, &mut buffer, None)
-            .expect("Failed to read from file");
-        assert_eq!(bytes_read, 11);
-        assert_eq!(&buffer[..bytes_read], b"Hello World");
-        fs.close(&fd).expect("Failed to close file");
+    fn next_scripted(&self) -> Scripted {
+        self.script
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("test script must answer every file request")
     }
 
-    #[test]
-    fn o_append_flag_seek_ignored_for_write() {
-        use crate::fs::SeekWhence;
-
-        let ctx = crate::fs::resolver::Context::new();
-
-        let litebox = LiteBox::new(MockPlatform::new());
-        let mut fs = super::in_mem_fs(&litebox);
-
-        with_root_privileges(&mut fs, &ctx, |fs, ctx| {
-            fs.chmod(ctx, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                .expect("Failed to chmod /");
-        });
-
-        // Create a file and write some initial content
-        let path = "/testfile";
-        let fd = fs
-            .open(&ctx, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
-            .expect("Failed to create file");
-        fs.write(&fd, b"ABCDEF", None)
-            .expect("Failed to write initial content");
-        fs.close(&fd).expect("Failed to close file");
-
-        // Re-open with O_APPEND
-        let fd = fs
-            .open(&ctx, path, OFlags::WRONLY | OFlags::APPEND, Mode::empty())
-            .expect("Failed to open file with O_APPEND");
-
-        // Seek to beginning - this should succeed but writes should still append
-        fs.seek(&fd, 0, SeekWhence::RelativeToBeginning)
-            .expect("Failed to seek to beginning");
-
-        // Write some data - it should go to the end despite the seek
-        fs.write(&fd, b"123", None)
-            .expect("Failed to write after seek");
-        fs.close(&fd).expect("Failed to close file");
-
-        // Verify the file content: original data followed by appended data
-        let fd = fs
-            .open(&ctx, path, OFlags::RDONLY, Mode::empty())
-            .expect("Failed to open file for reading");
-        let mut buffer = vec![0; 20];
-        let bytes_read = fs
-            .read(&fd, &mut buffer, None)
-            .expect("Failed to read from file");
-        assert_eq!(bytes_read, 9);
-        assert_eq!(&buffer[..bytes_read], b"ABCDEF123");
-        fs.close(&fd).expect("Failed to close file");
-    }
-
-    #[test]
-    fn o_append_flag_with_rdwr() {
-        use crate::fs::SeekWhence;
-
-        let ctx = crate::fs::resolver::Context::new();
-
-        let litebox = LiteBox::new(MockPlatform::new());
-        let mut fs = super::in_mem_fs(&litebox);
-
-        with_root_privileges(&mut fs, &ctx, |fs, ctx| {
-            fs.chmod(ctx, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                .expect("Failed to chmod /");
-        });
-
-        // Create a file with initial content
-        let path = "/testfile";
-        let fd = fs
-            .open(&ctx, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
-            .expect("Failed to create file");
-        fs.write(&fd, b"Hello", None)
-            .expect("Failed to write initial content");
-        fs.close(&fd).expect("Failed to close file");
-
-        // Re-open with O_RDWR | O_APPEND
-        let fd = fs
-            .open(&ctx, path, OFlags::RDWR | OFlags::APPEND, Mode::empty())
-            .expect("Failed to open file with O_RDWR | O_APPEND");
-
-        // Read should work normally from the beginning
-        let mut buffer = vec![0; 10];
-        let bytes_read = fs
-            .read(&fd, &mut buffer, None)
-            .expect("Failed to read from file");
-        assert_eq!(bytes_read, 5);
-        assert_eq!(&buffer[..bytes_read], b"Hello");
-
-        // Seek to beginning - write should still append despite position being at 0
-        fs.seek(&fd, 0, SeekWhence::RelativeToBeginning)
-            .expect("Seek failed");
-
-        // Write should append to end, ignoring the current position
-        fs.write(&fd, b" World", None)
-            .expect("Failed to write with append");
-
-        // Seek to beginning and read the whole file
-        fs.seek(&fd, 0, SeekWhence::RelativeToBeginning)
-            .expect("Seek failed");
-        let mut buffer = vec![0; 20];
-        let bytes_read = fs
-            .read(&fd, &mut buffer, None)
-            .expect("Failed to read from file");
-        assert_eq!(bytes_read, 11);
-        assert_eq!(&buffer[..bytes_read], b"Hello World");
-        fs.close(&fd).expect("Failed to close file");
-    }
-
-    #[test]
-    fn o_append_pwrite_ignores_append_mode() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-        let mut fs = super::in_mem_fs(&litebox);
-
-        with_root_privileges(&mut fs, &ctx, |fs, ctx| {
-            fs.chmod(ctx, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                .expect("Failed to chmod /");
-        });
-
-        // Create a file with initial content
-        let path = "/testfile";
-        let fd = fs
-            .open(&ctx, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
-            .expect("Failed to create file");
-        fs.write(&fd, b"ABCDEF", None)
-            .expect("Failed to write initial content");
-        fs.close(&fd).expect("Failed to close file");
-
-        // Re-open with O_APPEND
-        let fd = fs
-            .open(&ctx, path, OFlags::WRONLY | OFlags::APPEND, Mode::empty())
-            .expect("Failed to open file with O_APPEND");
-
-        // pwrite (write with explicit offset) should ignore O_APPEND per POSIX
-        fs.write(&fd, b"XX", Some(2)).expect("Failed to pwrite");
-        fs.close(&fd).expect("Failed to close file");
-
-        // Verify the file content: XX should be at position 2, not appended
-        let fd = fs
-            .open(&ctx, path, OFlags::RDONLY, Mode::empty())
-            .expect("Failed to open file for reading");
-        let mut buffer = vec![0; 10];
-        let bytes_read = fs
-            .read(&fd, &mut buffer, None)
-            .expect("Failed to read from file");
-        assert_eq!(bytes_read, 6);
-        assert_eq!(&buffer[..bytes_read], b"ABXXEF");
-        fs.close(&fd).expect("Failed to close file");
-    }
-
-    #[test]
-    fn o_append_with_trunc() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-        let mut fs = super::in_mem_fs(&litebox);
-
-        with_root_privileges(&mut fs, &ctx, |fs, ctx| {
-            fs.chmod(ctx, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                .expect("Failed to chmod /");
-        });
-
-        // Create a file with initial content
-        let path = "/testfile";
-        let fd = fs
-            .open(&ctx, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
-            .expect("Failed to create file");
-        fs.write(&fd, b"Original content", None)
-            .expect("Failed to write initial content");
-        fs.close(&fd).expect("Failed to close file");
-
-        // Re-open with O_TRUNC | O_APPEND
-        let fd = fs
-            .open(
-                &ctx,
-                path,
-                OFlags::WRONLY | OFlags::TRUNC | OFlags::APPEND,
-                Mode::empty(),
-            )
-            .expect("Failed to open file with O_TRUNC | O_APPEND");
-
-        // File should be truncated, then write should append (to empty file)
-        fs.write(&fd, b"New", None)
-            .expect("Failed to write after truncation");
-        fs.write(&fd, b"Content", None)
-            .expect("Failed to write second chunk");
-        fs.close(&fd).expect("Failed to close file");
-
-        // Verify the file content
-        let fd = fs
-            .open(&ctx, path, OFlags::RDONLY, Mode::empty())
-            .expect("Failed to open file for reading");
-        let mut buffer = vec![0; 20];
-        let bytes_read = fs
-            .read(&fd, &mut buffer, None)
-            .expect("Failed to read from file");
-        assert_eq!(bytes_read, 10);
-        assert_eq!(&buffer[..bytes_read], b"NewContent");
-        fs.close(&fd).expect("Failed to close file");
-    }
-}
-
-mod tar_ro {
-    use crate::LiteBox;
-    use crate::fs::{Mode, OFlags};
-    use crate::platform::mock::MockPlatform;
-    use alloc::vec;
-    use alloc::vec::Vec;
-    extern crate std;
-
-    const TEST_TAR_FILE: &[u8] = include_bytes!("./test.tar");
-
-    #[test]
-    fn file_read() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-        let fs = super::tar_ro_fs(&litebox, TEST_TAR_FILE.into());
-        let fd = fs
-            .open(&ctx, "foo", OFlags::RDONLY, Mode::RWXU)
-            .expect("Failed to open file");
-        let mut buffer = vec![0; 1024];
-        let bytes_read = fs
-            .read(&fd, &mut buffer, None)
-            .expect("Failed to read from file");
-        assert_eq!(&buffer[..bytes_read], b"testfoo\n");
-        fs.close(&fd).expect("Failed to close file");
-        let fd = fs
-            .open(&ctx, "bar/baz", OFlags::RDONLY, Mode::empty())
-            .expect("Failed to open file");
-        let mut buffer = vec![0; 1024];
-        let bytes_read = fs
-            .read(&fd, &mut buffer, None)
-            .expect("Failed to read from file");
-        assert_eq!(&buffer[..bytes_read], b"test bar baz\n");
-        fs.close(&fd).expect("Failed to close file");
-    }
-
-    #[test]
-    fn dir_and_nonexist_checks() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-        let fs = super::tar_ro_fs(&litebox, TEST_TAR_FILE.into());
-        assert!(matches!(
-            fs.open(&ctx, "bar/ba", OFlags::RDONLY, Mode::empty()),
-            Err(crate::fs::errors::OpenError::PathError(
-                crate::fs::errors::PathError::NoSuchFileOrDirectory
-            )),
-        ));
-        let fd = fs
-            .open(&ctx, "bar", OFlags::RDONLY, Mode::empty())
-            .expect("Failed to open dir");
-        fs.close(&fd).expect("Failed to close dir");
-    }
-
-    #[test]
-    fn o_directory_flag_tests() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-        let fs = super::tar_ro_fs(&litebox, TEST_TAR_FILE.into());
-
-        // Test O_DIRECTORY on a directory (should succeed)
-        let fd = fs
-            .open(
-                &ctx,
-                "bar",
-                OFlags::RDONLY | OFlags::DIRECTORY,
-                Mode::empty(),
-            )
-            .expect("Failed to open directory with O_DIRECTORY");
-        fs.close(&fd).expect("Failed to close directory");
-
-        // Test O_DIRECTORY on a regular file (should fail)
-        assert!(matches!(
-            fs.open(
-                &ctx,
-                "foo",
-                OFlags::RDONLY | OFlags::DIRECTORY,
-                Mode::empty()
-            ),
-            Err(crate::fs::errors::OpenError::PathError(
-                crate::fs::errors::PathError::ComponentNotADirectory
-            ))
-        ));
-
-        // Test O_DIRECTORY on non-existent path (should fail)
-        assert!(matches!(
-            fs.open(
-                &ctx,
-                "nonexistent",
-                OFlags::RDONLY | OFlags::DIRECTORY,
-                Mode::empty()
-            ),
-            Err(crate::fs::errors::OpenError::PathError(
-                crate::fs::errors::PathError::NoSuchFileOrDirectory
-            ))
-        ));
-
-        // Test O_DIRECTORY on nested file (should fail)
-        assert!(matches!(
-            fs.open(
-                &ctx,
-                "bar/baz",
-                OFlags::RDONLY | OFlags::DIRECTORY,
-                Mode::empty()
-            ),
-            Err(crate::fs::errors::OpenError::PathError(
-                crate::fs::errors::PathError::ComponentNotADirectory
-            ))
-        ));
-    }
-
-    #[test]
-    fn write_or_truncate_open_of_directory_fails() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-        let fs = super::tar_ro_fs(&litebox, TEST_TAR_FILE.into());
-
-        for flags in [OFlags::WRONLY, OFlags::RDWR, OFlags::TRUNC] {
-            assert!(matches!(
-                fs.open(&ctx, "bar", flags, Mode::empty()),
-                Err(crate::fs::errors::OpenError::ReadOnlyFileSystem)
-            ));
-        }
-    }
-
-    #[test]
-    fn read_dir_subdirectory() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-        let fs = super::tar_ro_fs(&litebox, TEST_TAR_FILE.into());
-
-        // Read root directory
-        let fd = fs
-            .open(&ctx, "/", OFlags::RDONLY, Mode::empty())
-            .expect("Failed to open root directory");
-        let entries = fs.read_dir(&fd).expect("Failed to read root directory");
-        fs.close(&fd).expect("Failed to close root directory");
-
-        // Should have 4 entries: ., .., bar, foo
-        assert_eq!(entries.len(), 4);
-
-        let mut names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
-        names.sort_unstable();
-        assert_eq!(names, vec![".", "..", "bar", "foo"]);
-
-        // Check file types
-        for entry in &entries {
-            match entry.name.as_str() {
-                "foo" => {
-                    assert_eq!(entry.file_type, crate::fs::FileType::RegularFile);
+    fn file_response(&self, request: FileRequest) -> FileResponse {
+        match request {
+            FileRequest::Open(request) => {
+                self.record(Call::Open {
+                    path: self.staged_path(request.path),
+                    user: request.user,
+                    access: request.access,
+                    flags: request.flags,
+                    mode: request.mode,
+                });
+                self.reply()
+            }
+            FileRequest::Read(request) => {
+                self.record(Call::Read {
+                    handle: request.handle,
+                    length: request.buffer.length,
+                    offset: request.offset,
+                });
+                match self.next_scripted() {
+                    Scripted::Reply(response) => response,
+                    Scripted::Read(data) => {
+                        assert!(data.len() <= request.buffer.length as usize);
+                        self.buffers
+                            .write(request.buffer.slot_index, &data)
+                            .unwrap();
+                        FileResponse::Read(ReadFileResponse {
+                            read: u32::try_from(data.len()).unwrap(),
+                        })
+                    }
+                    Scripted::Directory { .. } => panic!("scripted directory answer for a read"),
                 }
-                "bar" | "." | ".." => assert_eq!(entry.file_type, crate::fs::FileType::Directory),
-                _ => panic!("Unexpected entry: {}", entry.name),
             }
-            if entry.name != "." && entry.name != ".." {
-                assert!(entry.ino_info.is_some(), "Inode info should be present");
-            } else {
-                // TODO(jayb): Re-enable this assertion once Composer handles `.` and `..` inode
-                // information better.
+            FileRequest::Write(request) => {
+                self.record(Call::Write {
+                    handle: request.handle,
+                    data: self.staged_data(request.buffer),
+                    offset: request.offset,
+                });
+                self.reply()
             }
-        }
-
-        // Read `bar` directory
-        let fd = fs
-            .open(&ctx, "bar", OFlags::RDONLY, Mode::empty())
-            .expect("Failed to open bar directory");
-        let entries = fs.read_dir(&fd).expect("Failed to read bar directory");
-        fs.close(&fd).expect("Failed to close bar directory");
-
-        // Should have 3 entry: ., .., baz (file)
-        assert_eq!(entries.len(), 3);
-        assert_eq!(entries[2].name, "baz");
-        assert_eq!(entries[2].file_type, crate::fs::FileType::RegularFile);
-    }
-
-    #[test]
-    fn read_dir_file_not_directory() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-        let fs = super::tar_ro_fs(&litebox, TEST_TAR_FILE.into());
-
-        let fd = fs
-            .open(&ctx, "foo", OFlags::RDONLY, Mode::empty())
-            .expect("Failed to open foo file");
-        let result = fs.read_dir(&fd);
-        fs.close(&fd).expect("Failed to close foo file");
-
-        assert!(matches!(
-            result,
-            Err(crate::fs::errors::ReadDirError::NotADirectory)
-        ));
-    }
-}
-
-mod overlay {
-    use crate::LiteBox;
-    use crate::fs::in_mem::{InMem, InitialNode};
-    use crate::fs::{FileType, Mode, OFlags, UserInfo};
-    use crate::platform::mock::MockPlatform;
-    use alloc::vec;
-    use alloc::vec::Vec;
-    extern crate std;
-
-    const TEST_TAR_FILE: &[u8] = include_bytes!("./test.tar");
-
-    /// The user these tests act as, and so the owner of anything they are set up as having created.
-    const ACTING_USER: UserInfo = UserInfo {
-        user: 1000,
-        group: 1000,
-    };
-    const ALL_PERMS: Mode = Mode::RWXU.union(Mode::RWXG).union(Mode::RWXO);
-
-    /// An upper backend whose root is writable by the acting user, holding `entries`.
-    ///
-    /// The overlay directs every mutation to the upper backend, so its root has to allow writes for
-    /// anything to be created.
-    fn upper(
-        entries: impl IntoIterator<Item = (&'static str, InitialNode)>,
-    ) -> InMem<MockPlatform> {
-        InMem::new_initialized(
-            [(
-                "/",
-                InitialNode::Directory {
-                    mode: ALL_PERMS,
-                    owner: UserInfo::ROOT,
-                },
-            )]
-            .into_iter()
-            .chain(entries),
-        )
-    }
-
-    fn overlay_fs(litebox: &LiteBox<MockPlatform>, upper: InMem<MockPlatform>) -> super::OverlayFs {
-        super::overlay_fs(litebox, upper, TEST_TAR_FILE.into())
-    }
-
-    #[test]
-    fn file_read_from_lower() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-        let fs = overlay_fs(&litebox, upper([]));
-        let fd = fs
-            .open(&ctx, "foo", OFlags::RDONLY, Mode::RWXU)
-            .expect("Failed to open file");
-        let mut buffer = vec![0; 1024];
-        let bytes_read = fs
-            .read(&fd, &mut buffer, None)
-            .expect("Failed to read from file");
-        assert_eq!(&buffer[..bytes_read], b"testfoo\n");
-        let stat = fs.fd_file_status(&fd).expect("Failed to fd file stat");
-        assert_eq!(stat.file_type, FileType::RegularFile);
-        assert_eq!(stat.mode, Mode::from_bits(0o644).unwrap());
-        fs.close(&fd).expect("Failed to close file");
-
-        let stat = fs.file_status(&ctx, "bar").expect("Failed to file stat");
-        assert_eq!(stat.file_type, FileType::Directory);
-        assert_eq!(stat.mode, Mode::from_bits(0o777).unwrap());
-
-        let fd = fs
-            .open(&ctx, "bar/baz", OFlags::RDONLY, Mode::empty())
-            .expect("Failed to open file");
-        let mut buffer = vec![0; 1024];
-        let bytes_read = fs
-            .read(&fd, &mut buffer, None)
-            .expect("Failed to read from file");
-        assert_eq!(&buffer[..bytes_read], b"test bar baz\n");
-        let stat = fs.fd_file_status(&fd).expect("Failed to fd file stat");
-        assert_eq!(stat.file_type, FileType::RegularFile);
-        assert_eq!(stat.mode, Mode::from_bits(0o644).unwrap());
-        fs.close(&fd).expect("Failed to close file");
-    }
-
-    #[test]
-    fn dir_and_nonexist_checks() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-        let fs = overlay_fs(&litebox, upper([]));
-        assert!(matches!(
-            fs.open(&ctx, "bar/ba", OFlags::RDONLY, Mode::empty()),
-            Err(crate::fs::errors::OpenError::PathError(
-                crate::fs::errors::PathError::NoSuchFileOrDirectory
-            )),
-        ));
-        let fd = fs
-            .open(&ctx, "bar", OFlags::RDONLY, Mode::empty())
-            .expect("Failed to open dir");
-        fs.close(&fd).expect("Failed to close dir");
-    }
-
-    /// Check that for the same file, even though it started as a lower file, writing to it copies
-    /// it up and redirects handles already open on it, so every descriptor sees the update.
-    #[test]
-    fn file_read_write_copy_up() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-        let fs = overlay_fs(&litebox, upper([]));
-        let fd1 = fs
-            .open(&ctx, "foo", OFlags::RDONLY, Mode::RWXU)
-            .expect("Failed to open file");
-        let fd2 = fs
-            .open(&ctx, "foo", OFlags::WRONLY, Mode::RWXU)
-            .expect("Failed to open file");
-
-        let mut buffer = vec![0; 1024];
-
-        let bytes_read = fs
-            .read(&fd1, &mut buffer, None)
-            .expect("Failed to read from file");
-        assert_eq!(&buffer[..bytes_read], b"testfoo\n");
-
-        fs.write(&fd2, b"share", None)
-            .expect("Failed to write to file");
-
-        fs.seek(&fd1, 0, crate::fs::SeekWhence::RelativeToBeginning)
-            .expect("Failed to seek to start");
-        let bytes_read = fs
-            .read(&fd1, &mut buffer, None)
-            .expect("Failed to read from file");
-        assert_eq!(&buffer[..bytes_read], b"shareoo\n");
-
-        fs.close(&fd1).expect("Failed to close file");
-        fs.close(&fd2).expect("Failed to close file");
-    }
-
-    /// Similar to [`file_read_write_copy_up`] but also confirm that file positions have been
-    /// maintained.
-    #[test]
-    fn file_read_write_copy_up_keeps_position() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-        let fs = overlay_fs(&litebox, upper([]));
-        let fd1 = fs
-            .open(&ctx, "foo", OFlags::RDONLY, Mode::RWXU)
-            .expect("Failed to open file");
-        let fd2 = fs
-            .open(&ctx, "foo", OFlags::WRONLY, Mode::RWXU)
-            .expect("Failed to open file");
-
-        let mut buffer = vec![0; 4];
-
-        let bytes_read = fs
-            .read(&fd1, &mut buffer, None)
-            .expect("Failed to read from file");
-        assert_eq!(&buffer[..bytes_read], b"test");
-
-        fs.write(&fd2, b"share", None)
-            .expect("Failed to write to file");
-
-        let bytes_read = fs
-            .read(&fd1, &mut buffer, None)
-            .expect("Failed to read from file");
-        assert_eq!(&buffer[..bytes_read], b"eoo\n");
-
-        fs.close(&fd1).expect("Failed to close file");
-        fs.close(&fd2).expect("Failed to close file");
-    }
-
-    #[test]
-    fn file_deletion() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-        let fs = overlay_fs(&litebox, upper([]));
-        let fd = fs
-            .open(&ctx, "foo", OFlags::RDONLY, Mode::RWXU)
-            .expect("Failed to open file");
-
-        let mut buffer = vec![0; 4];
-
-        // The file exists, and is readable
-        let bytes_read = fs
-            .read(&fd, &mut buffer, None)
-            .expect("Failed to read from file");
-        assert_eq!(&buffer[..bytes_read], b"test");
-
-        // Then we delete it
-        fs.unlink(&ctx, "foo").unwrap();
-
-        // This should not really impact the readability; file is fine.
-        let bytes_read = fs
-            .read(&fd, &mut buffer, None)
-            .expect("Failed to read from file");
-        assert_eq!(&buffer[..bytes_read], b"foo\n");
-
-        // But if we close and attempt to re-open, it should not exist
-        fs.close(&fd).expect("Failed to close file");
-        assert!(matches!(
-            fs.open(&ctx, "foo", OFlags::RDONLY, Mode::empty()),
-            Err(crate::fs::errors::OpenError::PathError(
-                crate::fs::errors::PathError::NoSuchFileOrDirectory
-            )),
-        ));
-    }
-
-    #[test]
-    fn o_directory_flag_tests() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-        let fs = overlay_fs(
-            &litebox,
-            upper([
-                (
-                    "/upperdir",
-                    InitialNode::Directory {
-                        mode: ALL_PERMS,
-                        owner: ACTING_USER,
-                    },
-                ),
-                (
-                    "/upperfile",
-                    InitialNode::File {
-                        mode: Mode::RWXU,
-                        owner: ACTING_USER,
-                        data: alloc::borrow::Cow::Borrowed(b""),
-                    },
-                ),
-            ]),
-        );
-
-        // Test O_DIRECTORY on directory from lower layer (tar)
-        let fd = fs
-            .open(
-                &ctx,
-                "bar",
-                OFlags::RDONLY | OFlags::DIRECTORY,
-                Mode::empty(),
-            )
-            .expect("Failed to open lower layer directory with O_DIRECTORY");
-        fs.close(&fd).expect("Failed to close directory");
-
-        // Test O_DIRECTORY on directory from upper layer (in_mem)
-        let fd = fs
-            .open(
-                &ctx,
-                "/upperdir",
-                OFlags::RDONLY | OFlags::DIRECTORY,
-                Mode::empty(),
-            )
-            .expect("Failed to open upper layer directory with O_DIRECTORY");
-        fs.close(&fd).expect("Failed to close directory");
-
-        // Test O_DIRECTORY on file from lower layer (should fail)
-        assert!(matches!(
-            fs.open(
-                &ctx,
-                "foo",
-                OFlags::RDONLY | OFlags::DIRECTORY,
-                Mode::empty()
-            ),
-            Err(crate::fs::errors::OpenError::PathError(
-                crate::fs::errors::PathError::ComponentNotADirectory
-            ))
-        ));
-
-        // Test O_DIRECTORY on file from upper layer (should fail)
-        assert!(matches!(
-            fs.open(
-                &ctx,
-                "/upperfile",
-                OFlags::RDONLY | OFlags::DIRECTORY,
-                Mode::empty()
-            ),
-            Err(crate::fs::errors::OpenError::PathError(
-                crate::fs::errors::PathError::ComponentNotADirectory
-            ))
-        ));
-
-        // Test O_DIRECTORY on nested file from lower layer (should fail)
-        assert!(matches!(
-            fs.open(
-                &ctx,
-                "bar/baz",
-                OFlags::RDONLY | OFlags::DIRECTORY,
-                Mode::empty()
-            ),
-            Err(crate::fs::errors::OpenError::PathError(
-                crate::fs::errors::PathError::ComponentNotADirectory
-            ))
-        ));
-
-        // Test O_DIRECTORY on non-existent path (should fail)
-        assert!(matches!(
-            fs.open(
-                &ctx,
-                "nonexistent",
-                OFlags::RDONLY | OFlags::DIRECTORY,
-                Mode::empty()
-            ),
-            Err(crate::fs::errors::OpenError::PathError(
-                crate::fs::errors::PathError::NoSuchFileOrDirectory
-            ))
-        ));
-    }
-
-    #[test]
-    // Regression test for #250: a file that already exists in the lower layer should not be
-    // shadowed by an attempt to create a file.
-    fn file_create_exist_in_lower() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-        let fs = overlay_fs(&litebox, upper([]));
-        let fd = fs
-            .open(&ctx, "foo", OFlags::RDWR | OFlags::CREAT, Mode::RWXU)
-            .expect("Failed to open file");
-        let mut buffer = vec![0; 4];
-
-        // The file exists, and is readable
-        let bytes_read = fs
-            .read(&fd, &mut buffer, None)
-            .expect("Failed to read from file");
-        assert_eq!(&buffer[..bytes_read], b"test");
-    }
-
-    #[test]
-    fn read_dir_from_lower_layer() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-        let fs = overlay_fs(&litebox, upper([]));
-
-        // Read bar subdirectory
-        let fd = fs
-            .open(&ctx, "bar", OFlags::RDONLY, Mode::empty())
-            .expect("Failed to open bar directory");
-        let entries = fs.read_dir(&fd).expect("Failed to read bar directory");
-        fs.close(&fd).expect("Failed to close bar directory");
-
-        // Should have 3 entries: ., .., baz (file)
-        assert_eq!(entries.len(), 3);
-        assert_eq!(entries[2].name, "baz");
-        assert_eq!(entries[2].file_type, crate::fs::FileType::RegularFile);
-        assert!(
-            entries[2].ino_info.is_some(),
-            "Inode info should be present"
-        );
-    }
-
-    #[test]
-    fn read_dir_from_upper_layer() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-        let fs = overlay_fs(
-            &litebox,
-            upper([
-                (
-                    "/upperdir",
-                    InitialNode::Directory {
-                        mode: ALL_PERMS,
-                        owner: ACTING_USER,
-                    },
-                ),
-                (
-                    "/upperfile",
-                    InitialNode::File {
-                        mode: Mode::RWXU,
-                        owner: ACTING_USER,
-                        data: alloc::borrow::Cow::Borrowed(b""),
-                    },
-                ),
-            ]),
-        );
-
-        // Read root directory (should contain entries from both layers)
-        let fd = fs
-            .open(&ctx, "/", OFlags::RDONLY, Mode::empty())
-            .expect("Failed to open root directory");
-        let entries = fs.read_dir(&fd).expect("Failed to read root directory");
-        fs.close(&fd).expect("Failed to close root directory");
-
-        // Should have 6 entries: ., .., bar, foo (from lower), upperdir, upperfile (from upper)
-        assert_eq!(entries.len(), 6);
-
-        let mut names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
-        names.sort_unstable();
-        assert_eq!(
-            names,
-            vec![".", "..", "bar", "foo", "upperdir", "upperfile"]
-        );
-
-        // Check file types
-        for entry in &entries {
-            match entry.name.as_str() {
-                "foo" | "upperfile" => {
-                    assert_eq!(entry.file_type, crate::fs::FileType::RegularFile);
+            FileRequest::Seek(request) => {
+                self.record(Call::Seek {
+                    handle: request.handle,
+                    offset: request.offset,
+                    whence: request.whence,
+                });
+                self.reply()
+            }
+            FileRequest::ReadDirectory(request) => {
+                self.record(Call::ReadDirectory {
+                    handle: request.handle,
+                    start_index: request.start_index,
+                });
+                let scripted = self.next_scripted();
+                let Scripted::Directory {
+                    entries,
+                    page_bytes,
+                } = scripted
+                else {
+                    let Scripted::Reply(response) = scripted else {
+                        panic!("scripted read answer for a directory read")
+                    };
+                    return response;
+                };
+                let (payload, next_index) = encode_directory_entries_chunk(
+                    &entries,
+                    usize::try_from(request.start_index).unwrap(),
+                    page_bytes.min(request.buffer.length as usize),
+                )
+                .expect("directory entries must encode");
+                self.buffers
+                    .write(request.buffer.slot_index, &payload)
+                    .unwrap();
+                if next_index.is_some() {
+                    // The guest asks again from the continuation index, so keep answering.
+                    self.script.lock().unwrap().push_front(Scripted::Directory {
+                        entries,
+                        page_bytes,
+                    });
                 }
-                "bar" | "upperdir" | "." | ".." => {
-                    assert_eq!(entry.file_type, crate::fs::FileType::Directory);
-                }
-                _ => panic!("Unexpected entry: {}", entry.name),
-            }
-            if entry.name != "." && entry.name != ".." {
-                assert!(entry.ino_info.is_some(), "Inode info should be present");
-            } else {
-                // TODO(jayb): Re-enable this assertion once the resolver fills in
-                // inode information for the synthesized `.` and `..` entries.
-            }
-        }
-
-        // Read upperdir directory (should be from upper layer)
-        let fd = fs
-            .open(&ctx, "/upperdir", OFlags::RDONLY, Mode::empty())
-            .expect("Failed to open upperdir");
-        let entries = fs.read_dir(&fd).expect("Failed to read upperdir");
-        fs.close(&fd).expect("Failed to close upperdir");
-
-        // only . and ..
-        assert_eq!(entries.len(), 2);
-    }
-
-    #[test]
-    fn o_excl_tests() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-        let fs = overlay_fs(&litebox, upper([]));
-
-        // Test O_CREAT | O_EXCL on file that exists in lower layer (should fail)
-        // "foo" exists in the tar file
-        assert!(matches!(
-            fs.open(
-                &ctx,
-                "foo",
-                OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
-                Mode::RWXU,
-            ),
-            Err(crate::fs::errors::OpenError::AlreadyExists)
-        ));
-
-        // Test O_CREAT | O_EXCL on file that doesn't exist anywhere (should succeed)
-        let fd = fs
-            .open(
-                &ctx,
-                "/newfile",
-                OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
-                Mode::RWXU,
-            )
-            .expect("Failed to create new file with O_CREAT | O_EXCL");
-
-        fs.write(&fd, b"overlay test", None)
-            .expect("Failed to write to new file");
-        fs.close(&fd).expect("Failed to close new file");
-
-        // Test O_CREAT | O_EXCL on file that now exists in upper layer (should fail)
-        assert!(matches!(
-            fs.open(
-                &ctx,
-                "/newfile",
-                OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
-                Mode::RWXU,
-            ),
-            Err(crate::fs::errors::OpenError::AlreadyExists)
-        ));
-
-        // Test O_CREAT | O_EXCL on directory that exists in lower layer (should fail)
-        // "bar" is a directory in the tar file
-        assert!(matches!(
-            fs.open(
-                &ctx,
-                "bar",
-                OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
-                Mode::RWXU,
-            ),
-            Err(crate::fs::errors::OpenError::AlreadyExists)
-        ));
-
-        // Test O_CREAT | O_EXCL on file that was deleted (tombstoned) should succeed
-        // First delete a file from lower layer
-        fs.unlink(&ctx, "foo")
-            .expect("Failed to unlink lower layer file");
-
-        // Now try to create it with O_EXCL (should succeed since it's tombstoned)
-        let fd = fs
-            .open(
-                &ctx,
-                "foo",
-                OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
-                Mode::RWXU,
-            )
-            .expect("Failed to create file over tombstone with O_CREAT | O_EXCL");
-
-        fs.write(&fd, b"new foo content", None)
-            .expect("Failed to write to recreated file");
-        fs.close(&fd).expect("Failed to close recreated file");
-
-        // Verify the new content
-        let fd = fs
-            .open(&ctx, "foo", OFlags::RDONLY, Mode::empty())
-            .expect("Failed to open recreated file");
-        let mut buffer = vec![0; 15];
-        let bytes_read = fs
-            .read(&fd, &mut buffer, None)
-            .expect("Failed to read from recreated file");
-        assert_eq!(&buffer[..bytes_read], b"new foo content");
-        fs.close(&fd).expect("Failed to close recreated file");
-
-        // Test O_CREAT | O_EXCL behavior with existing upper layer file
-        // Create a file in upper layer first
-        let fd = fs
-            .open(
-                &ctx,
-                "/upper_only_file",
-                OFlags::CREAT | OFlags::WRONLY,
-                Mode::RWXU,
-            )
-            .expect("Failed to create upper layer file");
-        fs.write(&fd, b"upper content", None)
-            .expect("Failed to write to upper layer file");
-        fs.close(&fd).expect("Failed to close upper layer file");
-
-        // Now try O_CREAT | O_EXCL on the same file (should fail)
-        assert!(matches!(
-            fs.open(
-                &ctx,
-                "/upper_only_file",
-                OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
-                Mode::RWXU,
-            ),
-            Err(crate::fs::errors::OpenError::AlreadyExists)
-        ));
-    }
-
-    #[test]
-    fn dir_creation_inside_lower_existing_dir() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-        let fs = overlay_fs(&litebox, upper([]));
-
-        // Create the directory /bar/test (where /bar already exists inside the tar file)
-        fs.mkdir(&ctx, "/bar/test", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-            .expect("Failed to create /bar/test directory");
-
-        // Verify the directory was created
-        let stat = fs
-            .file_status(&ctx, "/bar/test")
-            .expect("Failed to get status of /bar/test");
-        assert_eq!(stat.file_type, FileType::Directory);
-
-        // Verify we can open the directory
-        let fd = fs
-            .open(&ctx, "/bar/test", OFlags::RDONLY, Mode::empty())
-            .expect("Failed to open /bar/test directory");
-        let entries = fs
-            .read_dir(&fd)
-            .expect("Failed to read /bar/test directory");
-        fs.close(&fd).expect("Failed to close directory");
-
-        // Should contain only . and .. entries
-        assert_eq!(entries.len(), 2);
-        let mut names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
-        names.sort_unstable();
-        assert_eq!(names, vec![".", ".."]);
-    }
-
-    #[test]
-    fn file_creation_materializes_ancestor_dirs() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-        let fs = overlay_fs(&litebox, upper([]));
-
-        // Open bar/test for writing (where bar exists in lower layer but test doesn't exist)
-        // This should create ancestor directories and allow file creation
-        let fd = fs
-            .open(&ctx, "bar/test", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
-            .expect("Failed to open bar/test for writing");
-
-        // Write data to the file
-        let data = b"Hello from nested file!";
-        fs.write(&fd, data, None)
-            .expect("Failed to write to bar/test");
-        fs.close(&fd).expect("Failed to close file");
-
-        // Read the file back
-        let fd = fs
-            .open(&ctx, "bar/test", OFlags::RDONLY, Mode::empty())
-            .expect("Failed to open bar/test for reading");
-        let mut buffer = vec![0; 1024];
-        let bytes_read = fs
-            .read(&fd, &mut buffer, None)
-            .expect("Failed to read from bar/test");
-        assert_eq!(&buffer[..bytes_read], data);
-        fs.close(&fd).expect("Failed to close file");
-
-        // Verify the file exists and has correct type
-        let stat = fs
-            .file_status(&ctx, "bar/test")
-            .expect("Failed to get status of bar/test");
-        assert_eq!(stat.file_type, FileType::RegularFile);
-    }
-
-    #[test]
-    fn file_modification_materializes_ancestor_dirs() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-        let fs = overlay_fs(&litebox, upper([]));
-
-        // Open bar/baz for writing (both bar and baz exist in lower layer)
-        // This copies up the ancestor directories and allows the file to be modified
-        let fd = fs
-            .open(&ctx, "bar/baz", OFlags::WRONLY, Mode::RWXU)
-            .expect("Failed to open bar/baz for writing");
-
-        // Write new data to the file (overwriting existing content)
-        let data = b"Modified content!";
-        fs.write(&fd, data, None)
-            .expect("Failed to write to bar/baz");
-        fs.close(&fd).expect("Failed to close file");
-
-        // Read the file back to verify it was modified
-        let fd = fs
-            .open(&ctx, "bar/baz", OFlags::RDONLY, Mode::empty())
-            .expect("Failed to open bar/baz for reading");
-        let mut buffer = vec![0; 1024];
-        let bytes_read = fs
-            .read(&fd, &mut buffer, None)
-            .expect("Failed to read from bar/baz");
-
-        assert_eq!(&buffer[..bytes_read], data);
-        fs.close(&fd).expect("Failed to close file");
-
-        // Verify the file still exists and has correct type
-        let stat = fs
-            .file_status(&ctx, "bar/baz")
-            .expect("Failed to get status of bar/baz");
-        assert_eq!(stat.file_type, FileType::RegularFile);
-    }
-
-    #[test]
-    fn open_with_trunc() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-        let fs = overlay_fs(&litebox, upper([]));
-
-        // Open with O_TRUNC should copy the file up into the upper backend, empty
-        let fd = fs
-            .open(&ctx, "foo", OFlags::RDWR | OFlags::TRUNC, Mode::empty())
-            .expect("Failed to open file with O_TRUNC");
-
-        // File should be truncated (empty)
-        let mut buffer = vec![0; 1024];
-        let bytes_read = fs
-            .read(&fd, &mut buffer, None)
-            .expect("Failed to read file");
-        assert_eq!(bytes_read, 0);
-
-        // Write new content
-        fs.write(&fd, b"new content", None)
-            .expect("Failed to write to file");
-        fs.close(&fd).expect("Failed to close file");
-
-        // Verify the content persists
-        let fd = fs
-            .open(&ctx, "foo", OFlags::RDONLY, Mode::empty())
-            .expect("Failed to reopen file");
-        let mut buffer = vec![0; 1024];
-        let bytes_read = fs
-            .read(&fd, &mut buffer, None)
-            .expect("Failed to read file");
-        assert_eq!(&buffer[..bytes_read], b"new content");
-        fs.close(&fd).expect("Failed to close file");
-    }
-
-    #[test]
-    fn rmdir_upper_only_directory() {
-        use crate::fs::errors::{PathError, RmdirError};
-
-        let ctx = crate::fs::resolver::Context::new();
-
-        let litebox = LiteBox::new(MockPlatform::new());
-        let fs = overlay_fs(&litebox, upper([]));
-
-        // Create an empty directory only in upper layer
-        fs.mkdir(&ctx, "/upper_empty", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-            .expect("mkdir upper_empty failed");
-
-        // Remove it
-        fs.rmdir(&ctx, "/upper_empty")
-            .expect("rmdir upper_empty should succeed");
-
-        // Verify it no longer exists
-        assert!(matches!(
-            fs.file_status(&ctx, "/upper_empty"),
-            Err(crate::fs::errors::FileStatusError::PathError(
-                PathError::NoSuchFileOrDirectory
-            ))
-        ));
-
-        // Second removal should yield NoSuchFileOrDirectory (path error)
-        assert!(matches!(
-            fs.rmdir(&ctx, "/upper_empty"),
-            Err(RmdirError::PathError(PathError::NoSuchFileOrDirectory))
-        ));
-    }
-
-    #[test]
-    fn rmdir_upper_directory_not_empty_then_empty() {
-        use crate::fs::errors::{PathError, RmdirError};
-
-        let ctx = crate::fs::resolver::Context::new();
-
-        let litebox = LiteBox::new(MockPlatform::new());
-        let fs = overlay_fs(&litebox, upper([]));
-
-        fs.mkdir(&ctx, "/upper_dir", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-            .expect("mkdir upper_dir failed");
-
-        // Create a file inside making directory non-empty
-        let fd = fs
-            .open(
-                &ctx,
-                "/upper_dir/file",
-                OFlags::CREAT | OFlags::WRONLY,
-                Mode::RWXU | Mode::RWXG,
-            )
-            .expect("create file in upper_dir failed");
-        fs.close(&fd).unwrap();
-
-        // Attempt to remove while non-empty
-        assert!(matches!(
-            fs.rmdir(&ctx, "/upper_dir"),
-            Err(RmdirError::NotEmpty)
-        ));
-
-        // Remove inner file
-        fs.unlink(&ctx, "/upper_dir/file")
-            .expect("unlink inner failed");
-
-        // Now should succeed
-        fs.rmdir(&ctx, "/upper_dir")
-            .expect("rmdir upper_dir should succeed");
-
-        // Confirm gone
-        assert!(matches!(
-            fs.file_status(&ctx, "/upper_dir"),
-            Err(crate::fs::errors::FileStatusError::PathError(
-                PathError::NoSuchFileOrDirectory
-            ))
-        ));
-    }
-
-    #[test]
-    fn rmdir_lower_directory_non_empty() {
-        use crate::fs::errors::RmdirError;
-
-        let ctx = crate::fs::resolver::Context::new();
-
-        let litebox = LiteBox::new(MockPlatform::new());
-        let fs = overlay_fs(&litebox, upper([]));
-
-        // "bar" exists in lower layer and contains "baz" (non-empty)
-        assert!(matches!(fs.rmdir(&ctx, "bar"), Err(RmdirError::NotEmpty)));
-    }
-
-    #[test]
-    fn rmdir_not_a_directory() {
-        use crate::fs::errors::RmdirError;
-
-        let ctx = crate::fs::resolver::Context::new();
-
-        let litebox = LiteBox::new(MockPlatform::new());
-        let fs = overlay_fs(&litebox, upper([]));
-
-        // Create a regular file (upper only)
-        let fd = fs
-            .open(
-                &ctx,
-                "/regular_file",
-                OFlags::CREAT | OFlags::WRONLY,
-                Mode::RWXU | Mode::RWXG,
-            )
-            .expect("create file failed");
-        fs.close(&fd).unwrap();
-
-        // rmdir should fail with NotADirectory
-        assert!(matches!(
-            fs.rmdir(&ctx, "/regular_file"),
-            Err(RmdirError::NotADirectory)
-        ));
-    }
-
-    #[test]
-    fn copy_up_does_not_deadlock() {
-        use std::sync::mpsc;
-        use std::thread;
-        use std::time::Duration;
-
-        let ctx = crate::fs::resolver::Context::new();
-
-        let litebox = LiteBox::new(MockPlatform::new());
-        let fs = overlay_fs(&litebox, upper([]));
-
-        fs.file_status(&ctx, "foo").expect("Failed to stat foo");
-
-        // Writing to the lower-layer file triggers copy-up. Run it on a worker thread.
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let fd = fs
-                .open(&ctx, "foo", OFlags::WRONLY, Mode::RWXU)
-                .expect("Failed to open file for writing");
-            fs.write(&fd, b"x", None).expect("Failed to write to file");
-            fs.close(&fd).expect("Failed to close file");
-            let _ = tx.send(());
-        });
-
-        rx.recv_timeout(Duration::from_secs(2))
-            .expect("copy-up deadlocked");
-    }
-}
-
-mod stdio {
-    use crate::LiteBox;
-    use crate::fs::devices::Devices;
-    use crate::fs::errors::{ReadError, WriteError};
-    use crate::fs::{Mode, OFlags};
-    use crate::platform::mock::MockPlatform;
-    use alloc::vec;
-    extern crate std;
-
-    #[test]
-    fn stdio_requires_broker() {
-        let ctx = crate::fs::resolver::Context::new();
-        let platform = MockPlatform::new();
-        let litebox = LiteBox::new(platform);
-        let fs = crate::test_broker::brokered_fs(
-            &litebox,
-            crate::fs::composer::Composer::builder()
-                .mount("/dev", Devices::new)
-                .build()
-                .unwrap(),
-        );
-
-        let fd_stdout = fs
-            .open(&ctx, "/dev/stdout", OFlags::WRONLY, Mode::empty())
-            .expect("Failed to open /dev/stdout");
-        assert!(matches!(fs.write(&fd_stdout, b"", None), Ok(0)));
-        assert!(matches!(
-            fs.write(&fd_stdout, b"Hello, stdout!", None),
-            Err(WriteError::Io)
-        ));
-        fs.close(&fd_stdout).expect("Failed to close /dev/stdout");
-
-        let fd_stderr = fs
-            .open(&ctx, "/dev/stderr", OFlags::WRONLY, Mode::empty())
-            .expect("Failed to open /dev/stderr");
-        assert!(matches!(fs.write(&fd_stderr, b"", None), Ok(0)));
-        assert!(matches!(
-            fs.write(&fd_stderr, b"Hello, stderr!", None),
-            Err(WriteError::Io)
-        ));
-        fs.close(&fd_stderr).expect("Failed to close /dev/stderr");
-
-        let fd_stdin = fs
-            .open(&ctx, "/dev/stdin", OFlags::RDONLY, Mode::empty())
-            .expect("Failed to open /dev/stdin");
-        assert!(matches!(fs.read(&fd_stdin, &mut [], None), Ok(0)));
-        let mut buffer = vec![0; 13];
-        assert!(matches!(
-            fs.read(&fd_stdin, &mut buffer, None),
-            Err(ReadError::Io)
-        ));
-        fs.close(&fd_stdin).expect("Failed to close /dev/stdin");
-    }
-
-    #[test]
-    fn non_dev_path_fails() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-        let fs = crate::test_broker::brokered_fs(
-            &litebox,
-            crate::fs::composer::Composer::builder()
-                .mount("/dev", Devices::new)
-                .build()
-                .unwrap(),
-        );
-
-        // Attempt to open a non-/dev/* path
-        let result = fs.open(&ctx, "foo", OFlags::RDONLY, Mode::empty());
-        assert!(matches!(
-            result,
-            Err(crate::fs::errors::OpenError::PathError(
-                crate::fs::errors::PathError::NoSuchFileOrDirectory
-            ))
-        ));
-    }
-}
-
-mod composed_stdio {
-    use crate::LiteBox;
-    use crate::fs::composer::Composer;
-    use crate::fs::devices::Devices;
-    use crate::fs::errors::{ReadError, WriteError};
-    use crate::fs::in_mem::{InMem, InitialNode};
-    use crate::fs::{Mode, OFlags, UserInfo};
-    use crate::platform::mock::MockPlatform;
-    use alloc::vec;
-    extern crate std;
-
-    type ComposedFs = crate::fs::resolver::Resolver<MockPlatform>;
-
-    fn composed_fs(litebox: &LiteBox<MockPlatform>) -> ComposedFs {
-        crate::test_broker::brokered_fs(
-            litebox,
-            Composer::builder()
-                .mount("/", |_| {
-                    InMem::<MockPlatform>::new_initialized([(
-                        "/",
-                        InitialNode::Directory {
-                            mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
-                            owner: UserInfo::ROOT,
-                        },
-                    )])
+                FileResponse::ReadDirectory(ReadDirectoryResponse {
+                    length: u32::try_from(payload.len()).unwrap(),
+                    next_index,
                 })
-                .mount("/dev", Devices::new)
-                .build()
-                .unwrap(),
-        )
+            }
+            FileRequest::PathStatus(request) => {
+                self.record(Call::PathStatus {
+                    path: self.staged_path(request.path),
+                    user: request.user,
+                });
+                self.reply()
+            }
+            FileRequest::Unlink(request) => {
+                self.record(Call::Unlink {
+                    path: self.staged_path(request.path),
+                    user: request.user,
+                });
+                self.reply()
+            }
+            FileRequest::Rmdir(request) => {
+                self.record(Call::Rmdir {
+                    path: self.staged_path(request.path),
+                    user: request.user,
+                });
+                self.reply()
+            }
+            request => panic!("unscripted file request: {request:?}"),
+        }
     }
 
-    #[test]
-    fn stdio_requires_broker() {
-        let ctx = crate::fs::resolver::Context::new();
-        let platform = MockPlatform::new();
-        let litebox = LiteBox::new(platform);
-        let fs = composed_fs(&litebox);
+    fn reply(&self) -> FileResponse {
+        match self.next_scripted() {
+            Scripted::Reply(response) => response,
+            Scripted::Read(_) | Scripted::Directory { .. } => {
+                panic!("scripted payload answer for a request that carries none")
+            }
+        }
+    }
+}
 
-        let fd_stdout = fs
-            .open(&ctx, "/dev/stdout", OFlags::WRONLY, Mode::empty())
-            .expect("Failed to open /dev/stdout");
-        assert!(matches!(fs.write(&fd_stdout, b"", None), Ok(0)));
-        assert!(matches!(
-            fs.write(&fd_stdout, b"Hello, composed stdout!", None),
-            Err(WriteError::Io)
-        ));
-        fs.close(&fd_stdout).expect("Failed to close /dev/stdout");
+/// The local end of the scripted broker connection.
+struct ScriptedChannel(Arc<ScriptedBroker>);
 
-        let fd_stderr = fs
-            .open(&ctx, "/dev/stderr", OFlags::WRONLY, Mode::empty())
-            .expect("Failed to open /dev/stderr");
-        assert!(matches!(fs.write(&fd_stderr, b"", None), Ok(0)));
-        assert!(matches!(
-            fs.write(&fd_stderr, b"Hello, composed stderr!", None),
-            Err(WriteError::Io)
-        ));
-        fs.close(&fd_stderr).expect("Failed to close /dev/stderr");
+impl LocalSetupChannel for ScriptedChannel {
+    type Error = core::convert::Infallible;
 
-        let fd_stdin = fs
-            .open(&ctx, "/dev/stdin", OFlags::RDONLY, Mode::empty())
-            .expect("Failed to open /dev/stdin");
-        assert!(matches!(fs.read(&fd_stdin, &mut [], None), Ok(0)));
-        let mut buffer = vec![0; 1024];
-        assert!(matches!(
-            fs.read(&fd_stdin, &mut buffer, None),
-            Err(ReadError::Io)
-        ));
-        fs.close(&fd_stdin).expect("Failed to close /dev/stdin");
+    fn send_handshake_request(
+        &mut self,
+        request: &BrokerHandshakeRequest,
+    ) -> Result<(), Self::Error> {
+        assert_eq!(request.protocol_version, BROKER_PROTOCOL_VERSION);
+        Ok(())
     }
 
-    #[test]
-    fn write_to_non_dev() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-        let fs = composed_fs(&litebox);
+    fn recv_handshake_response(&mut self) -> Result<Option<BrokerHandshakeResponse>, Self::Error> {
+        Ok(Some(BrokerHandshakeResponse::Negotiated {
+            broker_protocol_version: BROKER_PROTOCOL_VERSION,
+        }))
+    }
+}
 
-        // Test file creation
-        let path = "/testfile";
-        let fd = fs
-            .open(&ctx, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
-            .expect("Failed to create file");
+impl LocalCallChannel for ScriptedChannel {
+    type Error = core::convert::Infallible;
 
-        fs.close(&fd).expect("Failed to close file");
+    fn call(&self, request: BrokerRequest) -> Result<BrokerResponse, Self::Error> {
+        let result = match request.operation {
+            BrokerOperation::File(file) => BrokerResult::File(self.0.file_response(file)),
+            BrokerOperation::CloseObject(handle) => {
+                self.0.record(Call::Close(handle));
+                BrokerResult::ObjectClosed
+            }
+            operation => panic!("unscripted broker operation: {operation:?}"),
+        };
+        Ok(BrokerResponse {
+            request_id: request.request_id,
+            result,
+        })
+    }
+}
 
-        // Test file deletion
-        fs.unlink(&ctx, path).expect("Failed to unlink file");
-        assert!(
-            fs.open(&ctx, path, OFlags::RDONLY, Mode::RWXU).is_err(),
-            "File should not exist"
+/// Shared memory backed by an ordinary allocation, since no peer process observes it.
+struct TestSharedMemory(Mutex<Vec<u8>>);
+
+impl TestSharedMemory {
+    fn new() -> Self {
+        Self(Mutex::new(vec![0; SHARED_BUFFER_POOL_SIZE]))
+    }
+}
+
+impl SharedMemory for TestSharedMemory {
+    fn len(&self) -> usize {
+        SHARED_BUFFER_POOL_SIZE
+    }
+
+    fn read(&self, offset: usize, destination: &mut [u8]) -> Result<(), SharedMemoryError> {
+        let memory = self.0.lock().unwrap();
+        let end = offset
+            .checked_add(destination.len())
+            .ok_or(SharedMemoryError::InvalidRange)?;
+        destination.copy_from_slice(
+            memory
+                .get(offset..end)
+                .ok_or(SharedMemoryError::InvalidRange)?,
         );
+        Ok(())
     }
+
+    fn write(&self, offset: usize, source: &[u8]) -> Result<(), SharedMemoryError> {
+        let mut memory = self.0.lock().unwrap();
+        let end = offset
+            .checked_add(source.len())
+            .ok_or(SharedMemoryError::InvalidRange)?;
+        memory
+            .get_mut(offset..end)
+            .ok_or(SharedMemoryError::InvalidRange)?
+            .copy_from_slice(source);
+        Ok(())
+    }
+}
+
+/// Build a guest filesystem facade whose broker answers from `script`.
+fn scripted_fs(
+    script: impl IntoIterator<Item = Scripted>,
+) -> (Arc<ScriptedBroker>, Resolver<MockPlatform>) {
+    let broker = ScriptedBroker::new(script);
+    let memory = Arc::clone(broker.buffers.memory());
+    let (local, ()) = BrokerLocal::negotiate(ScriptedChannel(Arc::clone(&broker)), |channel| {
+        Ok((channel, memory as Arc<dyn SharedMemory>, ()))
+    })
+    .unwrap();
+    let litebox = crate::LiteBox::new_with_broker_local(MockPlatform::new(), local);
+    let fs = Resolver::new_brokered(&litebox);
+    (broker, fs)
+}
+
+fn opened() -> Scripted {
+    Scripted::Reply(FileResponse::Open(OpenFileResponse {
+        handle: FILE_HANDLE,
+    }))
+}
+
+fn user(context: &Context) -> FileUser {
+    FileUser {
+        user: context.acting_user().user,
+        group: context.acting_user().group,
+    }
+}
+
+#[test]
+fn context_resolves_paths_against_the_cwd() {
+    let mut context = Context::new();
+    assert_eq!(context.cwd().to_string(), "/");
+    assert_eq!(context.resolve("a/b/../c").unwrap().to_string(), "/a/c");
+
+    context.set_cwd(context.resolve("/work/dir").unwrap());
+    assert_eq!(context.cwd().to_string(), "/work/dir");
+    assert_eq!(
+        context.resolve("./file").unwrap().to_string(),
+        "/work/dir/file"
+    );
+    assert_eq!(
+        context.resolve("../file").unwrap().to_string(),
+        "/work/file"
+    );
+    assert_eq!(
+        context.resolve("/etc//passwd").unwrap().to_string(),
+        "/etc/passwd"
+    );
+}
+
+#[test]
+fn open_sends_the_resolved_path_and_translated_flags() {
+    let mut context = Context::new();
+    context.set_cwd(context.resolve("/work").unwrap());
+    context.set_acting_user(UserInfo { user: 7, group: 9 });
+    let (broker, fs) = scripted_fs([opened()]);
+
+    let fd = fs
+        .open(
+            &context,
+            "sub/../file.txt",
+            OFlags::CREAT | OFlags::WRONLY | OFlags::APPEND,
+            Mode::RWXU,
+        )
+        .expect("open should succeed");
+
+    assert_eq!(
+        *broker.calls(),
+        vec![Call::Open {
+            path: String::from("/work/file.txt"),
+            user: FileUser { user: 7, group: 9 },
+            access: FileAccessMode::WriteOnly,
+            flags: FileOpenFlags::CREATE | FileOpenFlags::APPEND,
+            mode: FileMode::from_bits(0o700).unwrap(),
+        }]
+    );
+    fs.close(&fd).expect("close should succeed");
+}
+
+#[test]
+fn read_and_write_transfer_payloads_through_the_broker() {
+    let context = Context::new();
+    let (broker, fs) = scripted_fs([
+        opened(),
+        Scripted::Reply(FileResponse::Write(WriteFileResponse { written: 5 })),
+        Scripted::Read(b"broker".to_vec()),
+        Scripted::Reply(FileResponse::Seek(SeekFileResponse { offset: 3 })),
+    ]);
+
+    let fd = fs
+        .open(&context, "/file", OFlags::RDWR, Mode::empty())
+        .expect("open should succeed");
+
+    assert_eq!(fs.write(&fd, b"hello", None).unwrap(), 5);
+
+    let mut buffer = vec![0; 16];
+    let read = fs.read(&fd, &mut buffer, Some(2)).unwrap();
+    assert_eq!(&buffer[..read], b"broker");
+
+    assert_eq!(fs.seek(&fd, -3, SeekWhence::RelativeToEnd).unwrap(), 3);
+    fs.close(&fd).expect("close should succeed");
+
+    let calls = broker.calls();
+    assert_eq!(
+        calls[1],
+        Call::Write {
+            handle: FILE_HANDLE,
+            data: b"hello".to_vec(),
+            offset: None,
+        }
+    );
+    assert_eq!(
+        calls[2],
+        Call::Read {
+            handle: FILE_HANDLE,
+            length: 16,
+            offset: Some(2),
+        }
+    );
+    assert_eq!(
+        calls[3],
+        Call::Seek {
+            handle: FILE_HANDLE,
+            offset: -3,
+            whence: FileSeekWhence::End,
+        }
+    );
+    assert_eq!(calls[4], Call::Close(FILE_HANDLE));
+}
+
+#[test]
+fn closing_releases_the_broker_object_and_the_descriptor() {
+    let context = Context::new();
+    let (broker, fs) = scripted_fs([opened()]);
+
+    let fd = fs
+        .open(&context, "/file", OFlags::RDONLY, Mode::empty())
+        .expect("open should succeed");
+    fs.close(&fd).expect("close should succeed");
+    assert_eq!(broker.calls()[1], Call::Close(FILE_HANDLE));
+
+    // The descriptor no longer names a broker file, so operations on it report a closed fd
+    // instead of reaching the broker.
+    let mut buffer = [0; 4];
+    assert!(matches!(
+        fs.read(&fd, &mut buffer, None),
+        Err(ReadError::ClosedFd)
+    ));
+    assert!(matches!(
+        fs.write(&fd, b"x", None),
+        Err(WriteError::ClosedFd)
+    ));
+    assert_eq!(broker.calls().len(), 2);
+}
+
+#[test]
+fn path_status_converts_broker_values() {
+    let context = Context::new();
+    let (broker, fs) = scripted_fs([Scripted::Reply(FileResponse::PathStatus(
+        BrokerFileStatus {
+            file_type: BrokerFileType::CharacterDevice,
+            mode: FileMode::from_bits(0o644).unwrap(),
+            size: 12,
+            owner: FileUser { user: 1, group: 2 },
+            node_info: FileNodeInfo {
+                dev: 3,
+                ino: 4,
+                rdev: Some(5),
+            },
+            block_size: 4096,
+        },
+    ))]);
+
+    let status = fs
+        .file_status(&context, "/dev/null")
+        .expect("status should succeed");
+
+    assert_eq!(status.file_type, FileType::CharacterDevice);
+    assert_eq!(status.mode, Mode::from_bits(0o644).unwrap());
+    assert_eq!(status.size, 12);
+    assert_eq!(status.owner.user, 1);
+    assert_eq!(status.owner.group, 2);
+    assert_eq!(status.node_info.dev, 3);
+    assert_eq!(status.node_info.ino, 4);
+    assert_eq!(
+        status.node_info.rdev.map(core::num::NonZeroUsize::get),
+        Some(5)
+    );
+    assert_eq!(status.blksize, 4096);
+    assert_eq!(
+        *broker.calls(),
+        vec![Call::PathStatus {
+            path: String::from("/dev/null"),
+            user: user(&context),
+        }]
+    );
+}
+
+#[test]
+fn read_dir_reassembles_paged_broker_entries() {
+    let context = Context::new();
+    let entries = vec![
+        FileDirectoryEntry {
+            name: String::from("one"),
+            file_type: BrokerFileType::RegularFile,
+            node_info: Some(FileNodeInfo {
+                dev: 1,
+                ino: 2,
+                rdev: None,
+            }),
+        },
+        FileDirectoryEntry {
+            name: String::from("two"),
+            file_type: BrokerFileType::Directory,
+            node_info: None,
+        },
+    ];
+    // A page that holds one entry, so the guest has to follow the continuation index.
+    let page_bytes =
+        encode_directory_entries_chunk(&entries[..1], 0, MAX_FILE_TRANSFER_SIZE as usize)
+            .unwrap()
+            .0
+            .len();
+    let (broker, fs) = scripted_fs([
+        opened(),
+        Scripted::Directory {
+            entries,
+            page_bytes,
+        },
+    ]);
+
+    let fd = fs
+        .open(
+            &context,
+            "/dir",
+            OFlags::RDONLY | OFlags::DIRECTORY,
+            Mode::empty(),
+        )
+        .expect("open should succeed");
+    let entries = fs.read_dir(&fd).expect("read_dir should succeed");
+    fs.close(&fd).expect("close should succeed");
+
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].name, "one");
+    assert_eq!(entries[0].file_type, FileType::RegularFile);
+    assert_eq!(entries[0].ino_info.as_ref().map(|node| node.ino), Some(2));
+    assert_eq!(entries[1].name, "two");
+    assert_eq!(entries[1].file_type, FileType::Directory);
+    assert!(entries[1].ino_info.is_none());
+
+    let calls = broker.calls();
+    assert_eq!(
+        calls[1],
+        Call::ReadDirectory {
+            handle: FILE_HANDLE,
+            start_index: 0,
+        }
+    );
+    assert_eq!(
+        calls[2],
+        Call::ReadDirectory {
+            handle: FILE_HANDLE,
+            start_index: 1,
+        }
+    );
+}
+
+#[test]
+fn broker_file_errors_map_to_guest_errors() {
+    let context = Context::new();
+    let (broker, fs) = scripted_fs([
+        Scripted::Reply(FileResponse::Failed(FileError::NoSuchFileOrDirectory)),
+        Scripted::Reply(FileResponse::Failed(FileError::AccessNotAllowed)),
+        Scripted::Reply(FileResponse::Failed(FileError::NoWritePermissions)),
+        Scripted::Reply(FileResponse::Failed(FileError::NotEmpty)),
+        opened(),
+        Scripted::Reply(FileResponse::Failed(FileError::NotForReading)),
+        Scripted::Reply(FileResponse::Failed(FileError::NotDirectory)),
+    ]);
+
+    assert!(matches!(
+        fs.open(&context, "/missing", OFlags::RDONLY, Mode::empty()),
+        Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
+    ));
+    assert!(matches!(
+        fs.open(&context, "/secret", OFlags::RDONLY, Mode::empty()),
+        Err(OpenError::AccessNotAllowed)
+    ));
+    assert!(matches!(
+        fs.unlink(&context, "/locked/file"),
+        Err(UnlinkError::NoWritePerms)
+    ));
+    assert!(matches!(
+        fs.rmdir(&context, "/full"),
+        Err(RmdirError::NotEmpty)
+    ));
+
+    let fd = fs
+        .open(&context, "/file", OFlags::WRONLY, Mode::empty())
+        .expect("open should succeed");
+    let mut buffer = [0; 4];
+    assert!(matches!(
+        fs.read(&fd, &mut buffer, None),
+        Err(ReadError::NotForReading)
+    ));
+    assert!(matches!(fs.read_dir(&fd), Err(ReadDirError::NotADirectory)));
+    fs.close(&fd).expect("close should succeed");
+
+    assert_eq!(broker.calls().len(), 8);
 }

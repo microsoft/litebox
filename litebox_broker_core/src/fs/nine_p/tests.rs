@@ -1,7 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-extern crate std;
+//! 9P filesystem semantics, exercised against a real `diod` server.
+//!
+//! These tests drive the broker-core resolver over the [`NineP`] backend, so they cover the
+//! client's protocol handling and the resolver semantics layered on it. They need `diod`
+//! installed (`apt install diod`).
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::io::{Read as _, Write as _};
@@ -13,18 +17,20 @@ use crate::fs::errors::{
     TruncateError, UnlinkError, WriteError,
 };
 use crate::fs::inode_allocator::InodeAllocator;
-use crate::fs::{Mode, OFlags};
-use crate::platform::mock::MockPlatform;
+use crate::fs::test_support::{Fs, USER};
+use crate::fs::{FileType, Mode, OFlags, SeekWhence};
+use crate::test_platform::TestPlatform;
 
-use super::nine_p::{NineP, transport};
+use super::{NineP, transport};
 
-type NinePFs = crate::fs::resolver::Resolver<MockPlatform>;
+/// A resolver over a 9P backend reached through `T`.
+type NinePFs<T> = Fs<NineP<TestPlatform, T>>;
 
 /// Attach to `server` over `transport`, building the backend the tests resolve paths through.
 fn attach<T: transport::Read + transport::Write>(
     transport: T,
     server: &DiodServer,
-) -> NineP<MockPlatform, T> {
+) -> NineP<TestPlatform, T> {
     let aname = server.export_path().to_str().unwrap();
     let username = std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
@@ -39,7 +45,7 @@ fn attach<T: transport::Read + transport::Write>(
     .expect("failed to create 9P filesystem")
 }
 
-/// A wrapper around `TcpStream` that implements the litebox 9P transport traits.
+/// A wrapper around `TcpStream` that implements the 9P transport traits.
 struct TcpTransport {
     stream: TcpStream,
 }
@@ -193,9 +199,9 @@ impl Drop for DiodServer {
 // Helper: create a connected 9P filesystem
 // ---------------------------------------------------------------------------
 
-fn connect_9p(litebox: &crate::LiteBox<MockPlatform>, server: &DiodServer) -> NinePFs {
+fn connect_9p(server: &DiodServer) -> NinePFs<TcpTransport> {
     let transport = TcpTransport::connect(&server.addr());
-    crate::test_broker::brokered_fs(litebox, attach(transport, server))
+    Fs::new(attach(transport, server))
 }
 
 // ---------------------------------------------------------------------------
@@ -204,15 +210,13 @@ fn connect_9p(litebox: &crate::LiteBox<MockPlatform>, server: &DiodServer) -> Ni
 
 #[test]
 fn test_nine_p_create_and_read_file() {
-    let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
-    let fs = connect_9p(&litebox, &server);
+    let fs = connect_9p(&server);
 
     // Create a file and write to it
-    let fd = fs
+    let mut fd = fs
         .open(
-            &ctx,
+            USER,
             "/hello.txt",
             OFlags::CREAT | OFlags::WRONLY,
             Mode::RWXU,
@@ -220,10 +224,12 @@ fn test_nine_p_create_and_read_file() {
         .expect("failed to create file via 9P");
 
     let data = b"Hello from litebox 9P!";
-    let written = fs.write(&fd, data, None).expect("failed to write via 9P");
+    let written = fs
+        .write(&mut fd, data, None)
+        .expect("failed to write via 9P");
     assert_eq!(written, data.len());
 
-    fs.close(&fd).expect("failed to close file");
+    drop(fd);
 
     // Verify the file exists on the host
     let host_path = server.export_path().join("hello.txt");
@@ -232,48 +238,48 @@ fn test_nine_p_create_and_read_file() {
     assert_eq!(host_content, "Hello from litebox 9P!");
 
     // Read the file back through 9P
-    let fd = fs
-        .open(&ctx, "/hello.txt", OFlags::RDONLY, Mode::empty())
+    let mut fd = fs
+        .open(USER, "/hello.txt", OFlags::RDONLY, Mode::empty())
         .expect("failed to open file for reading via 9P");
 
     let mut buf = alloc::vec![0u8; 256];
-    let bytes_read = fs.read(&fd, &mut buf, None).expect("failed to read via 9P");
+    let bytes_read = fs
+        .read(&mut fd, &mut buf, None)
+        .expect("failed to read via 9P");
     assert_eq!(&buf[..bytes_read], data);
 
-    fs.close(&fd).expect("failed to close file");
+    drop(fd);
 }
 
 #[test]
 fn test_nine_p_mkdir_and_readdir() {
-    let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
-    let fs = connect_9p(&litebox, &server);
+    let fs = connect_9p(&server);
 
     // Create directories
-    fs.mkdir(&ctx, "/subdir", Mode::RWXU)
+    fs.mkdir(USER, "/subdir", Mode::RWXU)
         .expect("failed to mkdir via 9P");
-    fs.mkdir(&ctx, "/subdir/nested", Mode::RWXU)
+    fs.mkdir(USER, "/subdir/nested", Mode::RWXU)
         .expect("failed to mkdir nested via 9P");
 
     // Create a file inside the subdirectory
-    let fd = fs
+    let mut fd = fs
         .open(
-            &ctx,
+            USER,
             "/subdir/file.txt",
             OFlags::CREAT | OFlags::WRONLY,
             Mode::RWXU,
         )
         .expect("failed to create file in subdir");
-    fs.write(&fd, b"nested content", None).unwrap();
-    fs.close(&fd).unwrap();
+    fs.write(&mut fd, b"nested content", None).unwrap();
+    drop(fd);
 
     // Read the root directory
     let fd = fs
-        .open(&ctx, "/", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+        .open(USER, "/", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
         .expect("failed to open root dir");
     let entries = fs.read_dir(&fd).expect("failed to readdir root");
-    fs.close(&fd).unwrap();
+    drop(fd);
 
     let names: alloc::vec::Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
     assert!(
@@ -284,14 +290,14 @@ fn test_nine_p_mkdir_and_readdir() {
     // Read the subdirectory
     let fd = fs
         .open(
-            &ctx,
+            USER,
             "/subdir",
             OFlags::RDONLY | OFlags::DIRECTORY,
             Mode::empty(),
         )
         .expect("failed to open subdir");
     let entries = fs.read_dir(&fd).expect("failed to readdir subdir");
-    fs.close(&fd).unwrap();
+    drop(fd);
 
     let names: alloc::vec::Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
     assert!(
@@ -306,36 +312,34 @@ fn test_nine_p_mkdir_and_readdir() {
 
 #[test]
 fn test_nine_p_unlink_and_rmdir() {
-    let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
-    let fs = connect_9p(&litebox, &server);
+    let fs = connect_9p(&server);
 
     // Create a file, then delete it
     let fd = fs
         .open(
-            &ctx,
+            USER,
             "/to_delete.txt",
             OFlags::CREAT | OFlags::WRONLY,
             Mode::RWXU,
         )
         .expect("failed to create file");
-    fs.close(&fd).unwrap();
+    drop(fd);
 
-    fs.unlink(&ctx, "/to_delete.txt")
+    fs.unlink(USER, "/to_delete.txt")
         .expect("failed to unlink file via 9P");
 
     // Verify the file is gone
     assert!(
-        fs.open(&ctx, "/to_delete.txt", OFlags::RDONLY, Mode::empty())
+        fs.open(USER, "/to_delete.txt", OFlags::RDONLY, Mode::empty())
             .is_err(),
         "file should no longer exist"
     );
 
     // Create a directory, then remove it
-    fs.mkdir(&ctx, "/to_remove", Mode::RWXU)
+    fs.mkdir(USER, "/to_remove", Mode::RWXU)
         .expect("failed to mkdir");
-    fs.rmdir(&ctx, "/to_remove")
+    fs.rmdir(USER, "/to_remove")
         .expect("failed to rmdir via 9P");
 
     // Verify the directory is gone on the host
@@ -347,107 +351,101 @@ fn test_nine_p_unlink_and_rmdir() {
 
 #[test]
 fn test_nine_p_file_status() {
-    let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
-    let fs = connect_9p(&litebox, &server);
+    let fs = connect_9p(&server);
 
     // Create a file with known content
-    let fd = fs
+    let mut fd = fs
         .open(
-            &ctx,
+            USER,
             "/status_test.txt",
             OFlags::CREAT | OFlags::WRONLY,
             Mode::RWXU,
         )
         .expect("failed to create file");
     let data = b"1234567890";
-    fs.write(&fd, data, None).unwrap();
-    fs.close(&fd).unwrap();
+    fs.write(&mut fd, data, None).unwrap();
+    drop(fd);
 
     // Check file_status via path
     let status = fs
-        .file_status(&ctx, "/status_test.txt")
+        .file_status(USER, "/status_test.txt")
         .expect("failed to stat file");
     assert_eq!(
         status.file_type,
-        crate::fs::FileType::RegularFile,
+        FileType::RegularFile,
         "should be a regular file"
     );
     assert_eq!(status.size, 10, "file size should be 10 bytes");
 
     // Check directory status
-    fs.mkdir(&ctx, "/stat_dir", Mode::RWXU).unwrap();
+    fs.mkdir(USER, "/stat_dir", Mode::RWXU).unwrap();
     let status = fs
-        .file_status(&ctx, "/stat_dir")
+        .file_status(USER, "/stat_dir")
         .expect("failed to stat dir");
     assert_eq!(
         status.file_type,
-        crate::fs::FileType::Directory,
+        FileType::Directory,
         "should be a directory"
     );
 }
 
 #[test]
 fn test_nine_p_seek_and_partial_read() {
-    let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
-    let fs = connect_9p(&litebox, &server);
+    let fs = connect_9p(&server);
 
     // Write a file with known content
-    let fd = fs
+    let mut fd = fs
         .open(
-            &ctx,
+            USER,
             "/seek_test.txt",
             OFlags::CREAT | OFlags::WRONLY,
             Mode::RWXU,
         )
         .expect("failed to create file");
-    fs.write(&fd, b"ABCDEFGHIJ", None).unwrap();
-    fs.close(&fd).unwrap();
+    fs.write(&mut fd, b"ABCDEFGHIJ", None).unwrap();
+    drop(fd);
 
     // Open for reading and seek
-    let fd = fs
-        .open(&ctx, "/seek_test.txt", OFlags::RDONLY, Mode::empty())
+    let mut fd = fs
+        .open(USER, "/seek_test.txt", OFlags::RDONLY, Mode::empty())
         .expect("failed to open file for reading");
 
     // Seek to offset 5
     let pos = fs
-        .seek(&fd, 5, crate::fs::SeekWhence::RelativeToBeginning)
+        .seek(&mut fd, 5, SeekWhence::RelativeToBeginning)
         .expect("failed to seek");
     assert_eq!(pos, 5);
 
     // Read from offset 5 → should get "FGHIJ"
     let mut buf = alloc::vec![0u8; 10];
-    let n = fs.read(&fd, &mut buf, None).expect("failed to read");
+    let n = fs.read(&mut fd, &mut buf, None).expect("failed to read");
     assert_eq!(&buf[..n], b"FGHIJ");
 
-    fs.close(&fd).unwrap();
+    drop(fd);
 }
 
 #[test]
 fn test_nine_p_truncate() {
-    let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
-    let fs = connect_9p(&litebox, &server);
+    let fs = connect_9p(&server);
 
     // Write a file
-    let fd = fs
+    let mut fd = fs
         .open(
-            &ctx,
+            USER,
             "/trunc_test.txt",
             OFlags::CREAT | OFlags::RDWR,
             Mode::RWXU,
         )
         .expect("failed to create file");
-    fs.write(&fd, b"Hello, World!", None).unwrap();
+    fs.write(&mut fd, b"Hello, World!", None).unwrap();
 
     // Truncate to 5 bytes
-    fs.truncate(&fd, 5, true)
+    fs.truncate(&mut fd, 5, true)
         .expect("failed to truncate via 9P");
-    fs.close(&fd).unwrap();
+    drop(fd);
 
     // Verify on host
     let content = std::fs::read_to_string(server.export_path().join("trunc_test.txt")).unwrap();
@@ -456,8 +454,6 @@ fn test_nine_p_truncate() {
 
 #[test]
 fn test_nine_p_host_files_visible() {
-    let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
 
     // Pre-populate some files on the host side
@@ -469,28 +465,28 @@ fn test_nine_p_host_files_visible() {
     )
     .unwrap();
 
-    let fs = connect_9p(&litebox, &server);
+    let fs = connect_9p(&server);
 
     // Read file created on the host through 9P
-    let fd = fs
-        .open(&ctx, "/host_file.txt", OFlags::RDONLY, Mode::empty())
+    let mut fd = fs
+        .open(USER, "/host_file.txt", OFlags::RDONLY, Mode::empty())
         .expect("failed to open host file via 9P");
     let mut buf = alloc::vec![0u8; 256];
-    let n = fs.read(&fd, &mut buf, None).unwrap();
+    let n = fs.read(&mut fd, &mut buf, None).unwrap();
     assert_eq!(&buf[..n], b"from host");
-    fs.close(&fd).unwrap();
+    drop(fd);
 
     // List host directory through 9P
     let fd = fs
         .open(
-            &ctx,
+            USER,
             "/host_dir",
             OFlags::RDONLY | OFlags::DIRECTORY,
             Mode::empty(),
         )
         .expect("failed to open host dir via 9P");
     let entries = fs.read_dir(&fd).unwrap();
-    fs.close(&fd).unwrap();
+    drop(fd);
 
     let names: alloc::vec::Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
     assert!(
@@ -556,16 +552,9 @@ impl transport::Write for BrokenTransport {
 /// `allowed_writes` must be >= 2 for the filesystem to be constructed
 /// successfully. Any FS operation after construction will consume one
 /// additional write.
-fn connect_9p_broken(
-    litebox: &crate::LiteBox<MockPlatform>,
-    server: &DiodServer,
-    allowed_writes: usize,
-) -> NinePFs {
+fn connect_9p_broken(server: &DiodServer, allowed_writes: usize) -> NinePFs<BrokenTransport> {
     let tcp = TcpTransport::connect(&server.addr());
-    crate::test_broker::brokered_fs(
-        litebox,
-        attach(BrokenTransport::new(tcp, allowed_writes), server),
-    )
+    Fs::new(attach(BrokenTransport::new(tcp, allowed_writes), server))
 }
 
 // ---------------------------------------------------------------------------
@@ -576,94 +565,82 @@ fn connect_9p_broken(
 /// breaks after the filesystem has been attached.
 #[test]
 fn test_nine_p_broken_open() {
-    let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
     // 2 writes: version + attach. The next write (open's walk) will fail.
-    let fs = connect_9p_broken(&litebox, &server, 2);
+    let fs = connect_9p_broken(&server, 2);
 
-    let result = fs.open(&ctx, "/anything.txt", OFlags::RDONLY, Mode::empty());
+    let result = fs.open(USER, "/anything.txt", OFlags::RDONLY, Mode::empty());
     assert!(matches!(result, Err(OpenError::Io)));
 }
 
 /// Creating a file should fail when the connection is broken.
 #[test]
 fn test_nine_p_broken_create() {
-    let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
-    let fs = connect_9p_broken(&litebox, &server, 2);
+    let fs = connect_9p_broken(&server, 2);
 
-    let result = fs.open(&ctx, "/new.txt", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU);
+    let result = fs.open(USER, "/new.txt", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU);
     assert!(matches!(result, Err(OpenError::Io)));
 }
 
 /// Reading from an fd obtained before the break should fail.
 #[test]
 fn test_nine_p_broken_read() {
-    let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
 
     std::fs::write(server.export_path().join("read_me.txt"), b"data").unwrap();
 
     // 4 writes: version + attach + walk + lopen. Then read will fail.
-    let fs = connect_9p_broken(&litebox, &server, 4);
-    let fd = fs
-        .open(&ctx, "/read_me.txt", OFlags::RDONLY, Mode::empty())
+    let fs = connect_9p_broken(&server, 4);
+    let mut fd = fs
+        .open(USER, "/read_me.txt", OFlags::RDONLY, Mode::empty())
         .expect("open should succeed before break");
 
     let mut buf = alloc::vec![0u8; 64];
-    let result = fs.read(&fd, &mut buf, None);
+    let result = fs.read(&mut fd, &mut buf, None);
     assert!(matches!(result, Err(ReadError::Io)));
 }
 
 /// Writing to an fd obtained before the break should fail.
 #[test]
 fn test_nine_p_broken_write() {
-    let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
 
     // 5 writes: version + attach + walk (which reports the file as missing) + the clone of the
     // parent directory's fid + create. Then write will fail.
-    let fs = connect_9p_broken(&litebox, &server, 5);
-    let fd = fs
+    let fs = connect_9p_broken(&server, 5);
+    let mut fd = fs
         .open(
-            &ctx,
+            USER,
             "/write_me.txt",
             OFlags::CREAT | OFlags::WRONLY,
             Mode::RWXU,
         )
         .expect("create should succeed before break");
 
-    let result = fs.write(&fd, b"data", None);
+    let result = fs.write(&mut fd, b"data", None);
     assert!(matches!(result, Err(WriteError::Io)));
 }
 
 /// mkdir should fail when the connection is broken.
 #[test]
 fn test_nine_p_broken_mkdir() {
-    let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
-    let fs = connect_9p_broken(&litebox, &server, 2);
+    let fs = connect_9p_broken(&server, 2);
 
-    let result = fs.mkdir(&ctx, "/broken_dir", Mode::RWXU);
+    let result = fs.mkdir(USER, "/broken_dir", Mode::RWXU);
     assert!(matches!(result, Err(MkdirError::Io)));
 }
 
 /// readdir should fail when the connection breaks during the directory read.
 #[test]
 fn test_nine_p_broken_readdir() {
-    let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
 
     // 4 writes: version + attach + walk + lopen for the directory.
-    let fs = connect_9p_broken(&litebox, &server, 4);
+    let fs = connect_9p_broken(&server, 4);
     let fd = fs
-        .open(&ctx, "/", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+        .open(USER, "/", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
         .expect("open dir should succeed before break");
 
     let result = fs.read_dir(&fd);
@@ -673,78 +650,68 @@ fn test_nine_p_broken_readdir() {
 /// unlink should fail when the connection is broken.
 #[test]
 fn test_nine_p_broken_unlink() {
-    let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
 
     std::fs::write(server.export_path().join("to_unlink.txt"), b"").unwrap();
 
-    let fs = connect_9p_broken(&litebox, &server, 2);
-    let result = fs.unlink(&ctx, "/to_unlink.txt");
+    let fs = connect_9p_broken(&server, 2);
+    let result = fs.unlink(USER, "/to_unlink.txt");
     assert!(matches!(result, Err(UnlinkError::Io)));
 }
 
 /// rmdir should fail when the connection is broken.
 #[test]
 fn test_nine_p_broken_rmdir() {
-    let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
 
     std::fs::create_dir(server.export_path().join("to_rmdir")).unwrap();
 
-    let fs = connect_9p_broken(&litebox, &server, 2);
-    let result = fs.rmdir(&ctx, "/to_rmdir");
+    let fs = connect_9p_broken(&server, 2);
+    let result = fs.rmdir(USER, "/to_rmdir");
     assert!(matches!(result, Err(RmdirError::Io)));
 }
 
 /// file_status should fail when the connection is broken.
 #[test]
 fn test_nine_p_broken_file_status() {
-    let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
-    let fs = connect_9p_broken(&litebox, &server, 2);
+    let fs = connect_9p_broken(&server, 2);
 
-    let result = fs.file_status(&ctx, "/");
+    let result = fs.file_status(USER, "/");
     assert!(matches!(result, Err(FileStatusError::Io)));
 }
 
 /// truncate should fail when the connection breaks after open.
 #[test]
 fn test_nine_p_broken_truncate() {
-    let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
 
     std::fs::write(server.export_path().join("to_trunc.txt"), b"some data").unwrap();
 
     // 4 writes: version + attach + walk + lopen. Then truncate will fail.
-    let fs = connect_9p_broken(&litebox, &server, 4);
-    let fd = fs
-        .open(&ctx, "/to_trunc.txt", OFlags::RDWR, Mode::empty())
+    let fs = connect_9p_broken(&server, 4);
+    let mut fd = fs
+        .open(USER, "/to_trunc.txt", OFlags::RDWR, Mode::empty())
         .expect("open should succeed before break");
 
-    let result = fs.truncate(&fd, 0, true);
+    let result = fs.truncate(&mut fd, 0, true);
     assert!(matches!(result, Err(TruncateError::Io)));
 }
 
 /// seek (RelativeToEnd, which requires a getattr) should fail when broken.
 #[test]
 fn test_nine_p_broken_seek() {
-    let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
 
     std::fs::write(server.export_path().join("to_seek.txt"), b"data").unwrap();
 
     // 4 writes: version + attach + walk + lopen. Then the getattr for seek will fail.
-    let fs = connect_9p_broken(&litebox, &server, 4);
-    let fd = fs
-        .open(&ctx, "/to_seek.txt", OFlags::RDONLY, Mode::empty())
+    let fs = connect_9p_broken(&server, 4);
+    let mut fd = fs
+        .open(USER, "/to_seek.txt", OFlags::RDONLY, Mode::empty())
         .expect("open should succeed before break");
 
-    let result = fs.seek(&fd, -1, crate::fs::SeekWhence::RelativeToEnd);
+    let result = fs.seek(&mut fd, -1, SeekWhence::RelativeToEnd);
     assert!(matches!(result, Err(SeekError::Io)));
 }
 
@@ -752,71 +719,61 @@ fn test_nine_p_broken_seek() {
 fn test_nine_p_deep_path_walk() {
     use core::fmt::Write as _;
 
-    let ctx = crate::fs::resolver::Context::new();
-
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
-    let fs = connect_9p(&litebox, &server);
+    let fs = connect_9p(&server);
 
     // Create a path deeper than MAXWELEM (13) to exercise walk_chunked
     let mut path = std::string::String::new();
     for i in 0..20 {
         path.push('/');
         write!(path, "d{i}").unwrap();
-        fs.mkdir(&ctx, &*path, Mode::RWXU)
+        fs.mkdir(USER, &path, Mode::RWXU)
             .expect("failed to mkdir deep path component");
     }
 
     // Create a file at the bottom
     let file_path = path.clone() + "/deep_file.txt";
-    let fd = fs
-        .open(
-            &ctx,
-            &*file_path,
-            OFlags::CREAT | OFlags::WRONLY,
-            Mode::RWXU,
-        )
+    let mut fd = fs
+        .open(USER, &file_path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
         .expect("failed to create file in deep path");
-    fs.write(&fd, b"deep content", None).unwrap();
-    fs.close(&fd).unwrap();
+    fs.write(&mut fd, b"deep content", None).unwrap();
+    drop(fd);
 
     // Read it back
-    let fd = fs
-        .open(&ctx, &*file_path, OFlags::RDONLY, Mode::empty())
+    let mut fd = fs
+        .open(USER, &file_path, OFlags::RDONLY, Mode::empty())
         .expect("failed to open file in deep path");
     let mut buf = alloc::vec![0u8; 64];
-    let n = fs.read(&fd, &mut buf, None).unwrap();
+    let n = fs.read(&mut fd, &mut buf, None).unwrap();
     assert_eq!(&buf[..n], b"deep content");
-    fs.close(&fd).unwrap();
+    drop(fd);
 
     // Verify file_status works through the deep path
     let status = fs
-        .file_status(&ctx, &*file_path)
+        .file_status(USER, &file_path)
         .expect("failed to stat deep file");
-    assert_eq!(status.file_type, crate::fs::FileType::RegularFile);
+    assert_eq!(status.file_type, FileType::RegularFile);
     assert_eq!(status.size, 12);
 }
 
 #[test]
 fn test_nine_p_chmod() {
-    let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
-    let fs = connect_9p(&litebox, &server);
+    let fs = connect_9p(&server);
 
     // Create a file
     let fd = fs
         .open(
-            &ctx,
+            USER,
             "/chmod_test.txt",
             OFlags::CREAT | OFlags::WRONLY,
             Mode::RWXU,
         )
         .expect("failed to create file");
-    fs.close(&fd).unwrap();
+    drop(fd);
 
     // Change permissions to read-only for user
-    fs.chmod(&ctx, "/chmod_test.txt", Mode::RUSR)
+    fs.chmod(USER, "/chmod_test.txt", Mode::RUSR)
         .expect("chmod failed");
 
     // Verify via host filesystem
@@ -831,7 +788,7 @@ fn test_nine_p_chmod() {
 
     // Also verify via 9P file_status
     let status = fs
-        .file_status(&ctx, "/chmod_test.txt")
+        .file_status(USER, "/chmod_test.txt")
         .expect("file_status failed");
     assert!(status.mode.contains(Mode::RUSR), "mode should contain RUSR");
     assert!(
@@ -842,30 +799,28 @@ fn test_nine_p_chmod() {
 
 #[test]
 fn test_nine_p_chown() {
-    let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
-    let fs = connect_9p(&litebox, &server);
+    let fs = connect_9p(&server);
 
     // Create a file
     let fd = fs
         .open(
-            &ctx,
+            USER,
             "/chown_test.txt",
             OFlags::CREAT | OFlags::WRONLY,
             Mode::RWXU,
         )
         .expect("failed to create file");
-    fs.close(&fd).unwrap();
+    drop(fd);
 
     // Get current ownership
     let status_before = fs
-        .file_status(&ctx, "/chown_test.txt")
+        .file_status(USER, "/chown_test.txt")
         .expect("file_status failed");
 
     // Change group to the same value (chown to a different uid/gid requires root)
     fs.chown(
-        &ctx,
+        USER,
         "/chown_test.txt",
         Some(status_before.owner.user),
         Some(status_before.owner.group),
@@ -874,59 +829,53 @@ fn test_nine_p_chown() {
 
     // Verify ownership hasn't changed
     let status_after = fs
-        .file_status(&ctx, "/chown_test.txt")
+        .file_status(USER, "/chown_test.txt")
         .expect("file_status failed after chown");
     assert_eq!(status_after.owner.user, status_before.owner.user);
     assert_eq!(status_after.owner.group, status_before.owner.group);
 }
 
 #[test]
-fn test_nine_p_fd_file_status() {
-    let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
+fn test_nine_p_handle_status() {
     let server = DiodServer::start();
-    let fs = connect_9p(&litebox, &server);
+    let fs = connect_9p(&server);
 
     // Create a file with known content
-    let fd = fs
+    let mut fd = fs
         .open(
-            &ctx,
+            USER,
             "/fd_stat_test.txt",
             OFlags::CREAT | OFlags::WRONLY,
             Mode::RWXU,
         )
         .expect("failed to create file");
-    fs.write(&fd, b"hello fd_stat", None).unwrap();
-    fs.close(&fd).unwrap();
+    fs.write(&mut fd, b"hello fd_stat", None).unwrap();
+    drop(fd);
 
-    // Open the file and check fd_file_status
+    // Open the file and check the open-handle status
     let fd = fs
-        .open(&ctx, "/fd_stat_test.txt", OFlags::RDONLY, Mode::empty())
+        .open(USER, "/fd_stat_test.txt", OFlags::RDONLY, Mode::empty())
         .expect("failed to open file");
 
-    let status = fs.fd_file_status(&fd).expect("fd_file_status failed");
-    assert_eq!(status.file_type, crate::fs::FileType::RegularFile);
+    let status = fs.handle_status(&fd).expect("handle status failed");
+    assert_eq!(status.file_type, FileType::RegularFile);
     assert_eq!(status.size, 13, "file size should be 13 bytes");
 
-    // Also check fd_file_status on a directory
-    fs.close(&fd).unwrap();
+    // Also check the handle status on a directory
+    drop(fd);
 
     let fd = fs
-        .open(&ctx, "/", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+        .open(USER, "/", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
         .expect("failed to open root dir");
-    let status = fs
-        .fd_file_status(&fd)
-        .expect("fd_file_status on dir failed");
-    assert_eq!(status.file_type, crate::fs::FileType::Directory);
-    fs.close(&fd).unwrap();
+    let status = fs.handle_status(&fd).expect("handle status on dir failed");
+    assert_eq!(status.file_type, FileType::Directory);
+    drop(fd);
 }
 
 #[test]
 fn test_nine_p_large_read_write() {
-    let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
-    let fs = connect_9p(&litebox, &server);
+    let fs = connect_9p(&server);
 
     // The msize is 65536 and IOHDRSZ is 24, so the max per-message payload
     // is 65512 bytes. Write data larger than that to verify the client
@@ -936,9 +885,9 @@ fn test_nine_p_large_read_write() {
         .map(|i: usize| u8::try_from(i % 251).unwrap())
         .collect();
 
-    let fd = fs
+    let mut fd = fs
         .open(
-            &ctx,
+            USER,
             "/large_test.bin",
             OFlags::CREAT | OFlags::RDWR,
             Mode::RWXU,
@@ -948,24 +897,26 @@ fn test_nine_p_large_read_write() {
     // Write in a loop (the client caps each write to msize - IOHDRSZ)
     let mut written = 0;
     while written < data.len() {
-        let n = fs.write(&fd, &data[written..], None).expect("write failed");
+        let n = fs
+            .write(&mut fd, &data[written..], None)
+            .expect("write failed");
         assert!(n > 0, "write should make progress");
         written += n;
     }
     assert_eq!(written, data.len());
 
-    fs.close(&fd).unwrap();
+    drop(fd);
 
     // Read it all back
-    let fd = fs
-        .open(&ctx, "/large_test.bin", OFlags::RDONLY, Mode::empty())
+    let mut fd = fs
+        .open(USER, "/large_test.bin", OFlags::RDONLY, Mode::empty())
         .expect("failed to open file for reading");
 
     let mut read_buf = alloc::vec![0u8; data_size];
     let mut total_read = 0;
     while total_read < data.len() {
         let n = fs
-            .read(&fd, &mut read_buf[total_read..], None)
+            .read(&mut fd, &mut read_buf[total_read..], None)
             .expect("read failed");
         if n == 0 {
             break;
@@ -975,19 +926,17 @@ fn test_nine_p_large_read_write() {
     assert_eq!(total_read, data.len());
     assert_eq!(read_buf, data);
 
-    fs.close(&fd).unwrap();
+    drop(fd);
 }
 
 #[test]
 fn test_nine_p_explicit_offset_read_write() {
-    let ctx = crate::fs::resolver::Context::new();
-    let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
-    let fs = connect_9p(&litebox, &server);
+    let fs = connect_9p(&server);
 
-    let fd = fs
+    let mut fd = fs
         .open(
-            &ctx,
+            USER,
             "/offset_test.txt",
             OFlags::CREAT | OFlags::RDWR,
             Mode::RWXU,
@@ -995,19 +944,19 @@ fn test_nine_p_explicit_offset_read_write() {
         .expect("failed to create file");
 
     // Write "AAAAAAAAAA" at offset 0 using implicit offset
-    fs.write(&fd, b"AAAAAAAAAA", None).unwrap();
+    fs.write(&mut fd, b"AAAAAAAAAA", None).unwrap();
 
     // Write "BBBBB" at explicit offset 5 — should NOT change the fd offset
     let n = fs
-        .write(&fd, b"BBBBB", Some(5))
+        .write(&mut fd, b"BBBBB", Some(5))
         .expect("explicit offset write failed");
     assert_eq!(n, 5);
 
     // The fd offset should still be 10 (from the first write), not 10
     // Write "C" using implicit offset — should go at offset 10
-    fs.write(&fd, b"C", None).unwrap();
+    fs.write(&mut fd, b"C", None).unwrap();
 
-    fs.close(&fd).unwrap();
+    drop(fd);
 
     // Verify the final file content on host: "AAAAABBBBBC"
     let host_content =
@@ -1015,14 +964,14 @@ fn test_nine_p_explicit_offset_read_write() {
     assert_eq!(host_content, "AAAAABBBBBC");
 
     // Now test explicit offset reads
-    let fd = fs
-        .open(&ctx, "/offset_test.txt", OFlags::RDONLY, Mode::empty())
+    let mut fd = fs
+        .open(USER, "/offset_test.txt", OFlags::RDONLY, Mode::empty())
         .expect("failed to open for reading");
 
     // Read 5 bytes at explicit offset 5 → "BBBBB"
     let mut buf = alloc::vec![0u8; 5];
     let n = fs
-        .read(&fd, &mut buf, Some(5))
+        .read(&mut fd, &mut buf, Some(5))
         .expect("explicit offset read failed");
     assert_eq!(n, 5);
     assert_eq!(&buf[..n], b"BBBBB");
@@ -1030,8 +979,10 @@ fn test_nine_p_explicit_offset_read_write() {
     // fd offset should still be 0 (explicit offset doesn't change it)
     // Read using implicit offset → should start at 0
     let mut buf = alloc::vec![0u8; 11];
-    let n = fs.read(&fd, &mut buf, None).expect("implicit read failed");
+    let n = fs
+        .read(&mut fd, &mut buf, None)
+        .expect("implicit read failed");
     assert_eq!(&buf[..n], b"AAAAABBBBBC");
 
-    fs.close(&fd).unwrap();
+    drop(fd);
 }
