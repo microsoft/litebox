@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Guest-facing filesystem facade.
+//! Guest-facing file values and operations.
 //!
 //! Filesystem resolution and backend implementations live in `litebox_broker_core`. This module
 //! retains LiteBox's guest values and descriptor integration, plus the 9P transport traits that
@@ -13,7 +13,9 @@ use core::ffi::c_uint;
 use core::num::NonZeroUsize;
 
 pub mod errors;
-pub mod resolver;
+mod file;
+
+pub use file::{Context, File, FileFd, ResolvedPath};
 
 #[doc(hidden)]
 pub mod nine_p {
@@ -65,7 +67,7 @@ bitflags! {
 
 /// Types of files on a file-system.
 ///
-/// See [`resolver::Resolver::file_status`].
+/// See [`crate::LiteBox::path_file_status`].
 #[derive(Debug, PartialEq, Eq, Clone)]
 #[non_exhaustive]
 pub enum FileType {
@@ -160,7 +162,7 @@ bitflags! {
     }
 }
 
-/// The `whence` directive to [`resolver::Resolver::seek`]
+/// The `whence` directive to [`crate::LiteBox::seek_file`].
 #[derive(Copy, Clone)]
 pub enum SeekWhence {
     /// The file offset is set to `offset` bytes.
@@ -213,7 +215,7 @@ pub struct NodeInfo {
     pub rdev: Option<NonZeroUsize>,
 }
 
-/// Directory entries returned by [`resolver::Resolver::read_dir`]
+/// Directory entries returned by [`crate::LiteBox::read_file_directory`].
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct DirEntry {

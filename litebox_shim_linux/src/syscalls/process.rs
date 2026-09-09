@@ -1407,14 +1407,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
             )?;
             let mut header = [0u8; SHEBANG_MAX_LINE];
             let files = self.files.borrow();
-            let n = match files.fs.read(&file, &mut header, Some(0)) {
+            let n = match files.fs.read_file(&file, &mut header, Some(0)) {
                 Ok(n) => n,
                 Err(e) => {
-                    let _ = files.fs.close(&file);
+                    let _ = files.fs.close_file(&file);
                     return Err(Errno::from(e));
                 }
             };
-            let _ = files.fs.close(&file);
+            let _ = files.fs.close_file(&file);
 
             match parse_shebang(&header[..n]) {
                 Some((interp, opt_arg)) => {

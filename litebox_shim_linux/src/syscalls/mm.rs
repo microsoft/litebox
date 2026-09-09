@@ -274,7 +274,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
 
         let files = self.files.borrow();
-        let static_data = files.fs.get_static_backing_data(fd.as_fs()?)?;
+        let static_data = files.fs.get_static_file_backing_data(fd.as_fs()?)?;
 
         if offset > static_data.len() {
             return None;

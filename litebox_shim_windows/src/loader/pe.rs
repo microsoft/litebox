@@ -102,14 +102,14 @@ pub(crate) struct WindowsThreadEnvironment {
 
 pub(crate) struct PeLoader<'a, Platform: crate::ShimPlatform> {
     platform: &'static Platform,
-    fs: Arc<crate::WindowsFS<Platform>>,
+    fs: Arc<litebox::LiteBox<Platform>>,
     page_manager: &'a crate::WindowsPageManager<Platform>,
 }
 
 impl<'a, Platform: crate::ShimPlatform> PeLoader<'a, Platform> {
     pub(crate) fn new(
         platform: &'static Platform,
-        fs: Arc<crate::WindowsFS<Platform>>,
+        fs: Arc<litebox::LiteBox<Platform>>,
         page_manager: &'a crate::WindowsPageManager<Platform>,
     ) -> Self {
         Self {
@@ -911,7 +911,7 @@ struct NtDllExports {
 
 fn load_ntdll<Platform: crate::ShimPlatform>(
     platform: &'static Platform,
-    fs: Arc<crate::WindowsFS<Platform>>,
+    fs: Arc<litebox::LiteBox<Platform>>,
     page_manager: &crate::WindowsPageManager<Platform>,
 ) -> Result<Option<LoadedNtDll>, WindowsLoadError> {
     match load_image_with_writable_sections(
@@ -936,7 +936,7 @@ fn load_ntdll<Platform: crate::ShimPlatform>(
 
 fn load_image<Platform: crate::ShimPlatform>(
     platform: &'static Platform,
-    fs: Arc<crate::WindowsFS<Platform>>,
+    fs: Arc<litebox::LiteBox<Platform>>,
     path: &str,
     page_manager: &crate::WindowsPageManager<Platform>,
 ) -> Result<LoadedImage, WindowsLoadError> {
@@ -945,7 +945,7 @@ fn load_image<Platform: crate::ShimPlatform>(
 
 pub(crate) fn load_image_section<Platform: crate::ShimPlatform>(
     platform: &'static Platform,
-    fs: Arc<crate::WindowsFS<Platform>>,
+    fs: Arc<litebox::LiteBox<Platform>>,
     path: &str,
     page_manager: &crate::WindowsPageManager<Platform>,
     virtual_allocations: &crate::WindowsVirtualAllocations<Platform>,
@@ -968,14 +968,14 @@ pub(crate) struct ImageSectionMetadata {
 }
 
 pub(crate) fn image_section_metadata<Platform: crate::ShimPlatform>(
-    fs: Arc<crate::WindowsFS<Platform>>,
+    fs: Arc<litebox::LiteBox<Platform>>,
     path: &str,
 ) -> Result<ImageSectionMetadata, WindowsLoadError> {
     let file = PeImageFile::open(fs, path)?;
     let parsed = PeParsedFile::parse(&mut &file).map_err(WindowsLoadError::Parse)?;
     let file_size = file
         .fs
-        .fd_file_status(&file.fd)
+        .file_status(&file.fd)
         .map_err(PeImageAccessError::FileStatus)?
         .size
         .try_into()
@@ -996,7 +996,7 @@ pub(crate) fn image_section_metadata<Platform: crate::ShimPlatform>(
 }
 
 fn load_image_with_writable_sections<Platform: crate::ShimPlatform>(
-    fs: Arc<crate::WindowsFS<Platform>>,
+    fs: Arc<litebox::LiteBox<Platform>>,
     path: &str,
     platform: &'static Platform,
     page_manager: &crate::WindowsPageManager<Platform>,
@@ -1107,14 +1107,14 @@ fn is_missing_file_error(error: &WindowsLoadError) -> bool {
 }
 
 struct PeImageFile<Platform: crate::ShimPlatform> {
-    fs: Arc<crate::WindowsFS<Platform>>,
-    fd: litebox::fd::TypedFd<crate::WindowsFS<Platform>>,
+    fs: Arc<litebox::LiteBox<Platform>>,
+    fd: litebox::fs::FileFd<Platform>,
 }
 
 impl<Platform: crate::ShimPlatform> PeImageFile<Platform> {
-    fn open(fs: Arc<crate::WindowsFS<Platform>>, path: &str) -> Result<Self, PeImageAccessError> {
-        let fd = fs.open(
-            &litebox::fs::resolver::Context::new(),
+    fn open(fs: Arc<litebox::LiteBox<Platform>>, path: &str) -> Result<Self, PeImageAccessError> {
+        let fd = fs.open_file(
+            &litebox::fs::Context::new(),
             path,
             OFlags::RDONLY,
             Mode::empty(),
@@ -1128,7 +1128,7 @@ impl<Platform: crate::ShimPlatform> PeImageFile<Platform> {
         mut buf: &mut [u8],
     ) -> Result<(), PeImageAccessError> {
         while !buf.is_empty() {
-            let bytes_read = self.fs.read(&self.fd, buf, Some(offset))?;
+            let bytes_read = self.fs.read_file(&self.fd, buf, Some(offset))?;
             if bytes_read == 0 {
                 return Err(PeImageAccessError::ShortRead);
             }
@@ -1143,7 +1143,7 @@ impl<Platform: crate::ShimPlatform> PeImageFile<Platform> {
 
 impl<Platform: crate::ShimPlatform> Drop for PeImageFile<Platform> {
     fn drop(&mut self) {
-        if let Err(e) = self.fs.close(&self.fd) {
+        if let Err(e) = self.fs.close_file(&self.fd) {
             litebox_util_log::warn!(error:? = e; "failed to close PE image file");
         }
     }
@@ -1163,7 +1163,7 @@ impl<Platform: crate::ShimPlatform> ReadAt for &'_ PeImageFile<Platform> {
 
     fn size(&mut self) -> Result<u64, Self::Error> {
         self.fs
-            .fd_file_status(&self.fd)?
+            .file_status(&self.fd)?
             .size
             .try_into()
             .map_err(|_| PeImageAccessError::AddressOverflow)

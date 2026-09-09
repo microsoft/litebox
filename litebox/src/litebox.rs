@@ -28,6 +28,15 @@ pub struct LiteBox<Platform: RawSyncPrimitivesProvider> {
     pub(crate) x: Arc<LiteBoxX<Platform>>,
 }
 
+impl<Platform: RawSyncPrimitivesProvider> Clone for LiteBox<Platform> {
+    /// Creates another handle to the same LiteBox system.
+    fn clone(&self) -> Self {
+        Self {
+            x: Arc::clone(&self.x),
+        }
+    }
+}
+
 impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     /// Create a new (empty) [`LiteBox`] instance for the given `platform`.
     ///
@@ -110,15 +119,6 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
                 broker: broker_control,
                 broker_pollables,
             }),
-        }
-    }
-
-    /// An explicitly-crate-internal clone method to prevent outside users from cloning the
-    /// [`LiteBox`] object, which could cause confusion as to the intended use. External users must
-    /// only create it via [`Self::new`].
-    pub(crate) fn clone(&self) -> Self {
-        Self {
-            x: Arc::clone(&self.x),
         }
     }
 

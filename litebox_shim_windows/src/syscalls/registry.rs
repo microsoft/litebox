@@ -39,7 +39,7 @@ use litebox::event::{
     Events,
     polling::{Pollee, TryOpError},
 };
-use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd};
+use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry};
 use litebox::fs::errors::{
     FileStatusError, MkdirError, OpenError, PathError, ReadDirError, ReadError, WriteError,
 };
@@ -58,7 +58,7 @@ use crate::nt_types::{
     read_unicode_string_at,
 };
 
-type RegistryFileSystem<Platform> = litebox::fs::resolver::Resolver<Platform>;
+type RegistryFileSystem<Platform> = LiteBox<Platform>;
 
 pub(crate) struct RegistryKeySubsystem<Platform>(PhantomData<fn(Platform)>);
 
@@ -78,12 +78,12 @@ impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem
 
 pub(crate) struct RegistryKeyObject<Platform: crate::ShimPlatform> {
     path: String,
-    fd: TypedFd<RegistryFileSystem<Platform>>,
+    fd: litebox::fs::FileFd<Platform>,
 }
 
 pub(crate) struct RegistryStore<Platform: crate::ShimPlatform> {
     fs: RegistryFileSystem<Platform>,
-    fs_context: litebox::fs::resolver::Context,
+    fs_context: litebox::fs::Context,
     /// Whether the built-in keys and values have been written to [`Self::fs`].
     ///
     /// The defaults are written on first use rather than at construction so that
@@ -612,8 +612,8 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
     /// seeded lazily by [`Self::fs`] when the guest first uses the registry.
     pub(crate) fn new(litebox: &LiteBox<Platform>) -> Self {
         Self {
-            fs: litebox::fs::resolver::Resolver::new_brokered(litebox),
-            fs_context: litebox::fs::resolver::Context::new(),
+            fs: litebox.clone(),
+            fs_context: litebox::fs::Context::new(),
             defaults_seeded: Mutex::new(false),
             notification_state: Mutex::new(RegistryNotificationState::default()),
             notification_pollee: Pollee::new(),
@@ -640,9 +640,9 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         &self,
         path: &str,
         desired_access: RegistryKeyAccess,
-    ) -> Result<TypedFd<RegistryFileSystem<Platform>>, NtStatus> {
+    ) -> Result<litebox::fs::FileFd<Platform>, NtStatus> {
         self.fs()
-            .open(&self.fs_context, path, desired_access.into(), Mode::empty())
+            .open_file(&self.fs_context, path, desired_access.into(), Mode::empty())
             .map_err(map_open_error)
     }
 
@@ -654,7 +654,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         let value_path = value_path(key_path, value_name)?;
         let status = self
             .fs()
-            .file_status(&self.fs_context, &*value_path)
+            .path_file_status(&self.fs_context, &*value_path)
             .map_err(map_file_status_error)?;
         if status.file_type != FileType::RegularFile {
             return Err(NtStatus::OBJECT_TYPE_MISMATCH);
@@ -665,7 +665,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
 
         let fd = self
             .fs()
-            .open(
+            .open_file(
                 &self.fs_context,
                 &*value_path,
                 OFlags::RDONLY,
@@ -674,7 +674,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
             .map_err(map_open_error)?;
         let mut data = vec![0; status.size];
         let result = read_exact_at(self.fs(), &fd, &mut data);
-        let _ = self.fs().close(&fd);
+        let _ = self.fs().close_file(&fd);
         result?;
 
         let value_type = u32::from_le_bytes(
@@ -766,7 +766,11 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
 
     fn key_summary(&self, key: &RegistryKeyObject<Platform>) -> Result<KeySummary, NtStatus> {
         let mut summary = KeySummary::default();
-        for entry in self.fs().read_dir(&key.fd).map_err(map_read_dir_error)? {
+        for entry in self
+            .fs()
+            .read_file_directory(&key.fd)
+            .map_err(map_read_dir_error)?
+        {
             if entry.file_type == FileType::Directory
                 && entry.name != "."
                 && entry.name != ".."
@@ -782,15 +786,18 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         let values_path = format!("{}/{}", key.path.trim_end_matches('/'), VALUES_DIR_NAME);
         let values_fd = self
             .fs()
-            .open(
+            .open_file(
                 &self.fs_context,
                 &*values_path,
                 OFlags::RDONLY | OFlags::DIRECTORY,
                 Mode::empty(),
             )
             .map_err(map_open_error)?;
-        let values = self.fs().read_dir(&values_fd).map_err(map_read_dir_error);
-        let _ = self.fs().close(&values_fd);
+        let values = self
+            .fs()
+            .read_file_directory(&values_fd)
+            .map_err(map_read_dir_error);
+        let _ = self.fs().close_file(&values_fd);
         for entry in values? {
             if entry.file_type != FileType::RegularFile {
                 continue;
@@ -802,7 +809,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
             let path = format!("{values_path}/{}", entry.name);
             let size = self
                 .fs()
-                .file_status(&self.fs_context, &*path)
+                .path_file_status(&self.fs_context, &*path)
                 .map_err(map_file_status_error)?
                 .size;
             if size < REGISTRY_VALUE_TYPE_SIZE {
@@ -827,7 +834,11 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         index: u32,
     ) -> Result<Option<String>, NtStatus> {
         let mut names = Vec::new();
-        for entry in self.fs().read_dir(&key.fd).map_err(map_read_dir_error)? {
+        for entry in self
+            .fs()
+            .read_file_directory(&key.fd)
+            .map_err(map_read_dir_error)?
+        {
             if entry.file_type == FileType::Directory
                 && entry.name != "."
                 && entry.name != ".."
@@ -849,7 +860,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         let child_path = format!("{}/{}", key.path.trim_end_matches('/'), name);
         let child_fd = self
             .fs()
-            .open(
+            .open_file(
                 &self.fs_context,
                 &*child_path,
                 OFlags::RDONLY | OFlags::DIRECTORY,
@@ -861,7 +872,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
             fd: child_fd,
         };
         let summary = self.key_summary(&child);
-        let _ = self.fs().close(&child.fd);
+        let _ = self.fs().close_file(&child.fd);
         summary
     }
 
@@ -879,15 +890,18 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         let values_path = format!("{}/{}", key.path.trim_end_matches('/'), VALUES_DIR_NAME);
         let values_fd = self
             .fs()
-            .open(
+            .open_file(
                 &self.fs_context,
                 &*values_path,
                 OFlags::RDONLY | OFlags::DIRECTORY,
                 Mode::empty(),
             )
             .map_err(map_open_error)?;
-        let entries = self.fs().read_dir(&values_fd).map_err(map_read_dir_error);
-        let _ = self.fs().close(&values_fd);
+        let entries = self
+            .fs()
+            .read_file_directory(&values_fd)
+            .map_err(map_read_dir_error);
+        let _ = self.fs().close_file(&values_fd);
         let mut names = Vec::new();
         for entry in entries? {
             if entry.file_type == FileType::RegularFile {
@@ -906,7 +920,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
 /// defaults were written during shim construction.
 fn seed_defaults<Platform: crate::ShimPlatform>(
     fs: &RegistryFileSystem<Platform>,
-    fs_context: &litebox::fs::resolver::Context,
+    fs_context: &litebox::fs::Context,
 ) {
     for key in [
         DEFAULT_SESSION_MANAGER_KEY,
@@ -1102,7 +1116,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
     }
 
     pub(crate) fn close_registry_key(&self, key: RegistryKeyObject<Platform>) {
-        let _ = self.global.registry.fs().close(&key.fd);
+        let _ = self.global.registry.fs().close_file(&key.fd);
     }
 
     pub(crate) fn sys_nt_open_key(
@@ -1241,7 +1255,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             .global
             .registry
             .fs()
-            .file_status(&self.global.registry.fs_context, &path)
+            .path_file_status(&self.global.registry.fs_context, &path)
         {
             Ok(status) if status.file_type == FileType::Directory => {
                 RegistryKeyDisposition::OpenedExistingKey
@@ -2236,7 +2250,7 @@ fn is_valid_key_component(component: &str) -> bool {
 
 fn write_value_in_fs<Platform: crate::ShimPlatform>(
     fs: &RegistryFileSystem<Platform>,
-    context: &litebox::fs::resolver::Context,
+    context: &litebox::fs::Context,
     key_nt_path: &str,
     value_name: &str,
     value_type: RegistryValueType,
@@ -2248,7 +2262,7 @@ fn write_value_in_fs<Platform: crate::ShimPlatform>(
 
 fn write_value_at_path<Platform: crate::ShimPlatform>(
     fs: &RegistryFileSystem<Platform>,
-    context: &litebox::fs::resolver::Context,
+    context: &litebox::fs::Context,
     key_path: &str,
     value_name: &str,
     value_type: u32,
@@ -2256,7 +2270,7 @@ fn write_value_at_path<Platform: crate::ShimPlatform>(
 ) -> Result<(), NtStatus> {
     let value_path = value_path(key_path, value_name)?;
     let fd = fs
-        .open(
+        .open_file(
             context,
             &*value_path,
             OFlags::CREAT | OFlags::WRONLY | OFlags::TRUNC,
@@ -2267,18 +2281,20 @@ fn write_value_at_path<Platform: crate::ShimPlatform>(
         write_all_at(fs, &fd, &value_type.to_le_bytes(), 0)?;
         write_all_at(fs, &fd, value, REGISTRY_VALUE_TYPE_SIZE)
     })();
-    let _ = fs.close(&fd);
+    let _ = fs.close_file(&fd);
     result
 }
 
 fn read_exact_at<Platform: crate::ShimPlatform>(
     fs: &RegistryFileSystem<Platform>,
-    fd: &TypedFd<RegistryFileSystem<Platform>>,
+    fd: &litebox::fs::FileFd<Platform>,
     mut data: &mut [u8],
 ) -> Result<(), NtStatus> {
     let mut offset = 0;
     while !data.is_empty() {
-        let read = fs.read(fd, data, Some(offset)).map_err(map_read_error)?;
+        let read = fs
+            .read_file(fd, data, Some(offset))
+            .map_err(map_read_error)?;
         if read == 0 {
             return Err(NtStatus::UNSUCCESSFUL);
         }
@@ -2290,12 +2306,14 @@ fn read_exact_at<Platform: crate::ShimPlatform>(
 
 fn write_all_at<Platform: crate::ShimPlatform>(
     fs: &RegistryFileSystem<Platform>,
-    fd: &TypedFd<RegistryFileSystem<Platform>>,
+    fd: &litebox::fs::FileFd<Platform>,
     mut data: &[u8],
     mut offset: usize,
 ) -> Result<(), NtStatus> {
     while !data.is_empty() {
-        let written = fs.write(fd, data, Some(offset)).map_err(map_write_error)?;
+        let written = fs
+            .write_file(fd, data, Some(offset))
+            .map_err(map_write_error)?;
         if written == 0 {
             return Err(NtStatus::DISK_FULL);
         }
@@ -2307,7 +2325,7 @@ fn write_all_at<Platform: crate::ShimPlatform>(
 
 fn create_key_in_fs<Platform: crate::ShimPlatform>(
     fs: &RegistryFileSystem<Platform>,
-    context: &litebox::fs::resolver::Context,
+    context: &litebox::fs::Context,
     nt_path: &str,
 ) -> Result<String, NtStatus> {
     let path = absolute_nt_key_name_to_fs_path(nt_path)?;
@@ -2317,7 +2335,7 @@ fn create_key_in_fs<Platform: crate::ShimPlatform>(
 
 fn create_key_path_in_fs<Platform: crate::ShimPlatform>(
     fs: &RegistryFileSystem<Platform>,
-    context: &litebox::fs::resolver::Context,
+    context: &litebox::fs::Context,
     path: &str,
 ) -> Result<Vec<String>, NtStatus> {
     let mut current = String::new();
@@ -2342,15 +2360,15 @@ fn create_key_path_in_fs<Platform: crate::ShimPlatform>(
 
 fn ensure_directory_in_fs<Platform: crate::ShimPlatform>(
     fs: &RegistryFileSystem<Platform>,
-    context: &litebox::fs::resolver::Context,
+    context: &litebox::fs::Context,
     path: &str,
 ) -> Result<bool, NtStatus> {
-    match fs.file_status(context, path) {
+    match fs.path_file_status(context, path) {
         Ok(status) if status.file_type == FileType::Directory => Ok(false),
         Ok(_) => Err(NtStatus::OBJECT_TYPE_MISMATCH),
         Err(FileStatusError::PathError(
             PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
-        )) => match fs.mkdir(
+        )) => match fs.mkdir_file(
             context,
             path,
             Mode::RUSR | Mode::WUSR | Mode::XUSR | Mode::ROTH | Mode::WOTH | Mode::XOTH,
@@ -2734,7 +2752,9 @@ mod tests {
 
         // The raw store is read directly here so that the read itself does not seed it.
         assert!(matches!(
-            registry.fs.file_status(&registry.fs_context, &*value_path),
+            registry
+                .fs
+                .path_file_status(&registry.fs_context, &*value_path),
             Err(FileStatusError::PathError(
                 PathError::NoSuchFileOrDirectory | PathError::MissingComponent
             ))
@@ -2765,7 +2785,7 @@ mod tests {
         assert_eq!(
             registry
                 .fs()
-                .file_status(&registry.fs_context, &*value_path)
+                .path_file_status(&registry.fs_context, &*value_path)
                 .unwrap()
                 .file_type,
             FileType::RegularFile
@@ -2773,7 +2793,7 @@ mod tests {
         assert_eq!(
             registry
                 .fs()
-                .file_status(&registry.fs_context, &*value_path)
+                .path_file_status(&registry.fs_context, &*value_path)
                 .unwrap()
                 .size,
             REGISTRY_VALUE_TYPE_SIZE + DEFAULT_ACP_VALUE.len()
@@ -2782,10 +2802,10 @@ mod tests {
         assert_eq!(value.value_type, u32::from(RegistryValueType::Sz));
         assert_eq!(value.data, DEFAULT_ACP_VALUE);
 
-        let broker_fs = litebox::fs::resolver::Resolver::new_brokered(&litebox);
+        let broker_fs = litebox;
         assert_eq!(
             broker_fs
-                .file_status(&litebox::fs::resolver::Context::new(), value_path.as_str(),)
+                .path_file_status(&litebox::fs::Context::new(), value_path.as_str())
                 .unwrap()
                 .file_type,
             FileType::RegularFile
@@ -3296,7 +3316,7 @@ mod tests {
         task.global
             .registry
             .fs()
-            .chmod(
+            .chmod_file(
                 &task.global.registry.fs_context,
                 &*private_path,
                 Mode::WUSR | Mode::XUSR,

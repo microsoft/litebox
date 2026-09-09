@@ -471,7 +471,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             fs_path:% = fs_path;
             "NtOpenSection: creating section for KnownDlls image"
         );
-        let Ok(file_status) = self.fs.file_status(&self.fs_context, &fs_path) else {
+        let Ok(file_status) = self.fs.path_file_status(&self.fs_context, &fs_path) else {
             return NtStatus::OBJECT_NAME_NOT_FOUND;
         };
         let section = Arc::new(SectionObject {
@@ -1181,7 +1181,7 @@ fn write_section_basic_information<Platform: ShimPlatform>(
 
 fn write_section_image_information<Platform: ShimPlatform>(
     section: &SectionObject<Platform>,
-    fs: Arc<crate::WindowsFS<Platform>>,
+    fs: Arc<litebox::LiteBox<Platform>>,
     section_information: MutPtr<Platform, u8>,
     section_information_length: usize,
     return_length: Option<MutPtr<Platform, usize>>,

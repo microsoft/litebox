@@ -92,9 +92,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // The program path is a Unix-style path inside the tar archive.
     let prog_path = &cli_args.program_and_arguments[0];
 
-    let initial_file_system = shim_builder.brokered_fs();
-    let initial_file_system = std::sync::Arc::new(initial_file_system);
-
     let shim = shim_builder.build();
     let argv = cli_args
         .program_and_arguments
@@ -118,13 +115,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     };
 
     let program = shim
-        .load_program(
-            initial_file_system,
-            platform.init_task(),
-            prog_path,
-            argv,
-            envp,
-        )
+        .load_program(platform.init_task(), prog_path, argv, envp)
         .unwrap();
     unsafe {
         litebox_platform_windows_userland::run_thread(

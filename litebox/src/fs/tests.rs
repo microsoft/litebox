@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Guest-facing filesystem facade tests.
+//! Guest-facing file API tests.
 //!
 //! Filesystem resolution, backend, and 9P semantics belong to `litebox_broker_core` and are tested
 //! there. What LiteBox owns is the guest side of the boundary: resolving paths against a
@@ -40,14 +40,13 @@ use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemory, Sh
 use crate::fs::errors::{
     OpenError, PathError, ReadDirError, ReadError, RmdirError, UnlinkError, WriteError,
 };
-use crate::fs::resolver::{Context, Resolver};
-use crate::fs::{FileType, Mode, OFlags, SeekWhence, UserInfo};
+use crate::fs::{Context, FileType, Mode, OFlags, SeekWhence, UserInfo};
 use crate::platform::mock::MockPlatform;
 
 /// The handle the scripted broker hands out for every successful open.
 const FILE_HANDLE: ObjectHandle = ObjectHandle(7);
 
-/// One broker request the facade issued, with any shared-buffer payload copied out.
+/// One broker request LiteBox issued, with any shared-buffer payload copied out.
 #[derive(Debug, PartialEq, Eq)]
 enum Call {
     Open {
@@ -355,19 +354,20 @@ impl SharedMemory for TestSharedMemory {
     }
 }
 
-/// Build a guest filesystem facade whose broker answers from `script`.
+/// Build a LiteBox whose broker answers from `script`.
 fn scripted_fs(
     script: impl IntoIterator<Item = Scripted>,
-) -> (Arc<ScriptedBroker>, Resolver<MockPlatform>) {
+) -> (Arc<ScriptedBroker>, crate::LiteBox<MockPlatform>) {
     let broker = ScriptedBroker::new(script);
     let memory = Arc::clone(broker.buffers.memory());
     let (local, ()) = BrokerLocal::negotiate(ScriptedChannel(Arc::clone(&broker)), |channel| {
         Ok((channel, memory as Arc<dyn SharedMemory>, ()))
     })
     .unwrap();
-    let litebox = crate::LiteBox::new_with_broker_local(MockPlatform::new(), local);
-    let fs = Resolver::new_brokered(&litebox);
-    (broker, fs)
+    (
+        broker,
+        crate::LiteBox::new_with_broker_local(MockPlatform::new(), local),
+    )
 }
 
 fn opened() -> Scripted {
@@ -413,7 +413,7 @@ fn open_sends_the_resolved_path_and_translated_flags() {
     let (broker, fs) = scripted_fs([opened()]);
 
     let fd = fs
-        .open(
+        .open_file(
             &context,
             "sub/../file.txt",
             OFlags::CREAT | OFlags::WRONLY | OFlags::APPEND,
@@ -431,7 +431,7 @@ fn open_sends_the_resolved_path_and_translated_flags() {
             mode: FileMode::from_bits(0o700).unwrap(),
         }]
     );
-    fs.close(&fd).expect("close should succeed");
+    fs.close_file(&fd).expect("close should succeed");
 }
 
 #[test]
@@ -445,17 +445,17 @@ fn read_and_write_transfer_payloads_through_the_broker() {
     ]);
 
     let fd = fs
-        .open(&context, "/file", OFlags::RDWR, Mode::empty())
+        .open_file(&context, "/file", OFlags::RDWR, Mode::empty())
         .expect("open should succeed");
 
-    assert_eq!(fs.write(&fd, b"hello", None).unwrap(), 5);
+    assert_eq!(fs.write_file(&fd, b"hello", None).unwrap(), 5);
 
     let mut buffer = vec![0; 16];
-    let read = fs.read(&fd, &mut buffer, Some(2)).unwrap();
+    let read = fs.read_file(&fd, &mut buffer, Some(2)).unwrap();
     assert_eq!(&buffer[..read], b"broker");
 
-    assert_eq!(fs.seek(&fd, -3, SeekWhence::RelativeToEnd).unwrap(), 3);
-    fs.close(&fd).expect("close should succeed");
+    assert_eq!(fs.seek_file(&fd, -3, SeekWhence::RelativeToEnd).unwrap(), 3);
+    fs.close_file(&fd).expect("close should succeed");
 
     let calls = broker.calls();
     assert_eq!(
@@ -491,20 +491,20 @@ fn closing_releases_the_broker_object_and_the_descriptor() {
     let (broker, fs) = scripted_fs([opened()]);
 
     let fd = fs
-        .open(&context, "/file", OFlags::RDONLY, Mode::empty())
+        .open_file(&context, "/file", OFlags::RDONLY, Mode::empty())
         .expect("open should succeed");
-    fs.close(&fd).expect("close should succeed");
+    fs.close_file(&fd).expect("close should succeed");
     assert_eq!(broker.calls()[1], Call::Close(FILE_HANDLE));
 
     // The descriptor no longer names a broker file, so operations on it report a closed fd
     // instead of reaching the broker.
     let mut buffer = [0; 4];
     assert!(matches!(
-        fs.read(&fd, &mut buffer, None),
+        fs.read_file(&fd, &mut buffer, None),
         Err(ReadError::ClosedFd)
     ));
     assert!(matches!(
-        fs.write(&fd, b"x", None),
+        fs.write_file(&fd, b"x", None),
         Err(WriteError::ClosedFd)
     ));
     assert_eq!(broker.calls().len(), 2);
@@ -529,7 +529,7 @@ fn path_status_converts_broker_values() {
     ))]);
 
     let status = fs
-        .file_status(&context, "/dev/null")
+        .path_file_status(&context, "/dev/null")
         .expect("status should succeed");
 
     assert_eq!(status.file_type, FileType::CharacterDevice);
@@ -587,15 +587,17 @@ fn read_dir_reassembles_paged_broker_entries() {
     ]);
 
     let fd = fs
-        .open(
+        .open_file(
             &context,
             "/dir",
             OFlags::RDONLY | OFlags::DIRECTORY,
             Mode::empty(),
         )
         .expect("open should succeed");
-    let entries = fs.read_dir(&fd).expect("read_dir should succeed");
-    fs.close(&fd).expect("close should succeed");
+    let entries = fs
+        .read_file_directory(&fd)
+        .expect("read_dir should succeed");
+    fs.close_file(&fd).expect("close should succeed");
 
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].name, "one");
@@ -636,32 +638,35 @@ fn broker_file_errors_map_to_guest_errors() {
     ]);
 
     assert!(matches!(
-        fs.open(&context, "/missing", OFlags::RDONLY, Mode::empty()),
+        fs.open_file(&context, "/missing", OFlags::RDONLY, Mode::empty()),
         Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
     ));
     assert!(matches!(
-        fs.open(&context, "/secret", OFlags::RDONLY, Mode::empty()),
+        fs.open_file(&context, "/secret", OFlags::RDONLY, Mode::empty()),
         Err(OpenError::AccessNotAllowed)
     ));
     assert!(matches!(
-        fs.unlink(&context, "/locked/file"),
+        fs.unlink_file(&context, "/locked/file"),
         Err(UnlinkError::NoWritePerms)
     ));
     assert!(matches!(
-        fs.rmdir(&context, "/full"),
+        fs.rmdir_file(&context, "/full"),
         Err(RmdirError::NotEmpty)
     ));
 
     let fd = fs
-        .open(&context, "/file", OFlags::WRONLY, Mode::empty())
+        .open_file(&context, "/file", OFlags::WRONLY, Mode::empty())
         .expect("open should succeed");
     let mut buffer = [0; 4];
     assert!(matches!(
-        fs.read(&fd, &mut buffer, None),
+        fs.read_file(&fd, &mut buffer, None),
         Err(ReadError::NotForReading)
     ));
-    assert!(matches!(fs.read_dir(&fd), Err(ReadDirError::NotADirectory)));
-    fs.close(&fd).expect("close should succeed");
+    assert!(matches!(
+        fs.read_file_directory(&fd),
+        Err(ReadDirError::NotADirectory)
+    ));
+    fs.close_file(&fd).expect("close should succeed");
 
     assert_eq!(broker.calls().len(), 8);
 }

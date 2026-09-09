@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Guest filesystem facade backed by broker-owned file objects.
+//! Guest file operations backed by broker-owned file objects.
 
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -16,11 +16,7 @@ use litebox_broker_protocol::fs::{
 };
 
 use crate::path::Arg;
-use crate::{
-    LiteBox,
-    fd::{EntryHandle, TypedFd},
-    sync,
-};
+use crate::{LiteBox, fd::EntryHandle, sync};
 
 use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
@@ -28,42 +24,18 @@ use super::errors::{
 };
 use super::{DirEntry, FileStatus, FileType, Mode, OFlags, SeekWhence, UserInfo};
 
-/// The guest-facing filesystem entry point.
-pub struct Resolver<Platform: sync::RawSyncPrimitivesProvider> {
-    litebox: LiteBox<Platform>,
-    authority: ResolverAuthority,
-}
-
-struct ResolverAuthority {
-    broker: Arc<dyn crate::broker::BrokerControl>,
-}
+/// Type marker for file descriptors backed by broker-owned files.
+pub struct File<Platform: sync::RawSyncPrimitivesProvider>(core::marker::PhantomData<fn(Platform)>);
 
 struct PinnedBrokerFile<Platform: sync::RawSyncPrimitivesProvider> {
-    _entry: EntryHandle<Platform, Resolver<Platform>>,
+    _entry: EntryHandle<Platform, File<Platform>>,
     broker: Arc<dyn crate::broker::BrokerControl>,
     handle: ObjectHandle,
 }
 
-impl<Platform: sync::RawSyncPrimitivesProvider> Resolver<Platform> {
-    /// Constructs a resolver whose filesystem authority is owned by the negotiated broker.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `litebox` has no negotiated broker connection.
-    #[must_use]
-    pub fn new_brokered(litebox: &LiteBox<Platform>) -> Self {
-        Self {
-            litebox: litebox.clone(),
-            authority: ResolverAuthority {
-                broker: litebox
-                    .broker_control()
-                    .expect("brokered file operations require a broker connection"),
-            },
-        }
-    }
-
-    fn broker_file(&self, fd: &TypedFd<Self>) -> Option<PinnedBrokerFile<Platform>> {
-        let entry_handle = self.litebox.descriptor_table().entry_handle(fd)?;
+impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
+    fn broker_file(&self, fd: &FileFd<Platform>) -> Option<PinnedBrokerFile<Platform>> {
+        let entry_handle = self.descriptor_table().entry_handle(fd)?;
         let (broker, handle) = {
             let entry = entry_handle.get_entry();
             (Arc::clone(&entry.entry.broker), entry.entry.handle)
@@ -82,18 +54,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Resolver<Platform> {
     /// Opens a file.
     ///
     /// The `mode` is only significant when creating a file.
-    pub fn open(
+    pub fn open_file(
         &self,
         context: &Context,
         path: impl Arg,
         flags: OFlags,
         mode: Mode,
-    ) -> Result<TypedFd<Self>, OpenError> {
+    ) -> Result<FileFd<Platform>, OpenError> {
         let path = Self::broker_path(context, path)?;
         let (access, flags) = file_open_options(flags)?;
-        let handle = self
-            .authority
-            .broker
+        let broker = self.broker_control().ok_or(OpenError::Io)?;
+        let handle = broker
             .open_file(
                 &path,
                 file_user(context.acting_user()),
@@ -103,17 +74,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Resolver<Platform> {
             )
             .map_err(|_| OpenError::Io)?
             .map_err(open_error)?;
-        Ok(self.litebox.descriptor_table_mut().insert(BrokerFile {
-            broker: Arc::clone(&self.authority.broker),
-            handle,
-        }))
+        Ok(self
+            .descriptor_table_mut()
+            .insert(BrokerFile { broker, handle }))
     }
 
     /// Close the file at `fd`.
     ///
     /// Future operations on the `fd` will start to return `ClosedFd` errors.
-    pub fn close(&self, fd: &TypedFd<Self>) -> Result<(), CloseError> {
-        let mut descriptors = self.litebox.descriptor_table_mut();
+    pub fn close_file(&self, fd: &FileFd<Platform>) -> Result<(), CloseError> {
+        let mut descriptors = self.descriptor_table_mut();
         let removed = descriptors.remove(fd);
         drop(descriptors);
         drop(removed);
@@ -121,9 +91,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Resolver<Platform> {
     }
 
     /// Read from a file descriptor at `offset` into a buffer.
-    pub fn read(
+    pub fn read_file(
         &self,
-        fd: &TypedFd<Self>,
+        fd: &FileFd<Platform>,
         buf: &mut [u8],
         offset: Option<usize>,
     ) -> Result<usize, ReadError> {
@@ -142,9 +112,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Resolver<Platform> {
     }
 
     /// Write from a buffer to a file descriptor at `offset`.
-    pub fn write(
+    pub fn write_file(
         &self,
-        fd: &TypedFd<Self>,
+        fd: &FileFd<Platform>,
         buf: &[u8],
         offset: Option<usize>,
     ) -> Result<usize, WriteError> {
@@ -163,9 +133,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Resolver<Platform> {
     }
 
     /// Reposition the read/write file offset.
-    pub fn seek(
+    pub fn seek_file(
         &self,
-        fd: &TypedFd<Self>,
+        fd: &FileFd<Platform>,
         offset: isize,
         whence: SeekWhence,
     ) -> Result<usize, SeekError> {
@@ -180,9 +150,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Resolver<Platform> {
     }
 
     /// Truncate the file to the specified length.
-    pub fn truncate(
+    pub fn truncate_file(
         &self,
-        fd: &TypedFd<Self>,
+        fd: &FileFd<Platform>,
         length: usize,
         reset_offset: bool,
     ) -> Result<(), TruncateError> {
@@ -198,17 +168,22 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Resolver<Platform> {
     }
 
     /// Change the permissions of a file.
-    pub fn chmod(&self, context: &Context, path: impl Arg, mode: Mode) -> Result<(), ChmodError> {
+    pub fn chmod_file(
+        &self,
+        context: &Context,
+        path: impl Arg,
+        mode: Mode,
+    ) -> Result<(), ChmodError> {
         let path = Self::broker_path(context, path)?;
-        self.authority
-            .broker
+        self.broker_control()
+            .ok_or(ChmodError::Io)?
             .chmod_file(&path, file_user(context.acting_user()), file_mode(mode))
             .map_err(|_| ChmodError::Io)?
             .map_err(chmod_error)
     }
 
     /// Change the owner of a file.
-    pub fn chown(
+    pub fn chown_file(
         &self,
         context: &Context,
         path: impl Arg,
@@ -216,45 +191,53 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Resolver<Platform> {
         group: Option<u16>,
     ) -> Result<(), ChownError> {
         let path = Self::broker_path(context, path)?;
-        self.authority
-            .broker
+        self.broker_control()
+            .ok_or(ChownError::Io)?
             .chown_file(&path, file_user(context.acting_user()), user, group)
             .map_err(|_| ChownError::Io)?
             .map_err(chown_error)
     }
 
     /// Unlink a file.
-    pub fn unlink(&self, context: &Context, path: impl Arg) -> Result<(), UnlinkError> {
+    pub fn unlink_file(&self, context: &Context, path: impl Arg) -> Result<(), UnlinkError> {
         let path = Self::broker_path(context, path)?;
-        self.authority
-            .broker
+        self.broker_control()
+            .ok_or(UnlinkError::Io)?
             .unlink_file(&path, file_user(context.acting_user()))
             .map_err(|_| UnlinkError::Io)?
             .map_err(unlink_error)
     }
 
     /// Create a new directory.
-    pub fn mkdir(&self, context: &Context, path: impl Arg, mode: Mode) -> Result<(), MkdirError> {
+    pub fn mkdir_file(
+        &self,
+        context: &Context,
+        path: impl Arg,
+        mode: Mode,
+    ) -> Result<(), MkdirError> {
         let path = Self::broker_path(context, path)?;
-        self.authority
-            .broker
+        self.broker_control()
+            .ok_or(MkdirError::Io)?
             .mkdir_file(&path, file_user(context.acting_user()), file_mode(mode))
             .map_err(|_| MkdirError::Io)?
             .map_err(mkdir_error)
     }
 
     /// Remove a directory.
-    pub fn rmdir(&self, context: &Context, path: impl Arg) -> Result<(), RmdirError> {
+    pub fn rmdir_file(&self, context: &Context, path: impl Arg) -> Result<(), RmdirError> {
         let path = Self::broker_path(context, path)?;
-        self.authority
-            .broker
+        self.broker_control()
+            .ok_or(RmdirError::Io)?
             .rmdir_file(&path, file_user(context.acting_user()))
             .map_err(|_| RmdirError::Io)?
             .map_err(rmdir_error)
     }
 
     /// Read directory entries from a directory file descriptor.
-    pub fn read_dir(&self, fd: &TypedFd<Self>) -> Result<Vec<DirEntry>, ReadDirError> {
+    pub fn read_file_directory(
+        &self,
+        fd: &FileFd<Platform>,
+    ) -> Result<Vec<DirEntry>, ReadDirError> {
         let file = self.broker_file(fd).ok_or(ReadDirError::ClosedFd)?;
         let entries = file
             .broker
@@ -265,23 +248,23 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Resolver<Platform> {
     }
 
     /// Obtain the status of a path.
-    pub fn file_status(
+    pub fn path_file_status(
         &self,
         context: &Context,
         path: impl Arg,
     ) -> Result<FileStatus, FileStatusError> {
         let path = Self::broker_path(context, path)?;
         let status = self
-            .authority
-            .broker
+            .broker_control()
+            .ok_or(FileStatusError::Io)?
             .path_file_status(&path, file_user(context.acting_user()))
             .map_err(|_| FileStatusError::Io)?
             .map_err(file_status_error)?;
         file_status(status)
     }
 
-    /// Equivalent to [`Self::file_status`], but on an open `fd`.
-    pub fn fd_file_status(&self, fd: &TypedFd<Self>) -> Result<FileStatus, FileStatusError> {
+    /// Equivalent to [`Self::path_file_status`], but on an open `fd`.
+    pub fn file_status(&self, fd: &FileFd<Platform>) -> Result<FileStatus, FileStatusError> {
         let file = self.broker_file(fd).ok_or(FileStatusError::ClosedFd)?;
         let status = file
             .broker
@@ -294,7 +277,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Resolver<Platform> {
     }
 
     /// Get static backing data for a file, if available and supported.
-    pub fn get_static_backing_data(&self, fd: &TypedFd<Self>) -> Option<&'static [u8]> {
+    pub fn get_static_file_backing_data(&self, fd: &FileFd<Platform>) -> Option<&'static [u8]> {
         let _ = self.broker_file(fd)?;
         None
     }
@@ -676,7 +659,7 @@ fn optional_device(device: Option<u64>) -> Result<Option<core::num::NonZeroUsize
 
 crate::fd::enable_fds_for_subsystem! {
     @ Platform: { sync::RawSyncPrimitivesProvider };
-    Resolver<Platform>;
+    File<Platform>;
     BrokerFile;
-    -> ResolverFd<Platform>;
+    -> FileFd<Platform>;
 }

@@ -73,8 +73,7 @@ fn init_platform_with_files(files: Arc<ScriptedFiles>) -> crate::Task<TestPlatfo
         crate::syscalls::test_broker::negotiate(files),
     );
     let shim_builder = crate::LinuxShimBuilder::new_with_litebox(platform, litebox);
-    let fs = Arc::new(shim_builder.brokered_fs());
-    shim_builder.build().0.new_test_task(fs)
+    shim_builder.build().0.new_test_task()
 }
 
 /// Returns a task and the scripted file fixture that answers its file requests.

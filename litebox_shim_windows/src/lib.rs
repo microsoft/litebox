@@ -216,10 +216,6 @@ impl<Platform: ShimPlatform> Clone for WindowsSectionView<Platform> {
     }
 }
 
-pub type DefaultFS<Platform> = WindowsFS<Platform>;
-
-pub type WindowsFS<Platform> = litebox::fs::resolver::Resolver<Platform>;
-
 fn write_value<Platform, T>(address: usize, value: T) -> Option<()>
 where
     Platform: RawPointerProvider,
@@ -413,12 +409,6 @@ impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
         &self.litebox
     }
 
-    /// Creates a filesystem facade backed by the negotiated broker.
-    #[must_use]
-    pub fn brokered_fs(&self) -> DefaultFS<Platform> {
-        litebox::fs::resolver::Resolver::new_brokered(&self.litebox)
-    }
-
     #[must_use]
     pub fn build(self) -> WindowsShim<Platform> {
         let global = Arc::new(GlobalState {
@@ -497,7 +487,6 @@ impl<Platform: ShimPlatform> WindowsShim<Platform> {
     /// Loads the program at `path` as the shim's initial task.
     pub fn load_program(
         &self,
-        fs: Arc<WindowsFS<Platform>>,
         path: &str,
         argv: Vec<alloc::ffi::CString>,
         envp: Vec<alloc::ffi::CString>,
@@ -506,6 +495,7 @@ impl<Platform: ShimPlatform> WindowsShim<Platform> {
         #[cfg(not(target_os = "windows"))]
         let _ = map_windows_user_shared_data::<Platform>(&self.0.page_manager)
             .ok_or(loader::WindowsLoadError::MapSharedMemory)?;
+        let fs = Arc::new(self.0.litebox.clone());
         let load_info = loader::PeLoader::new(self.0.platform, fs.clone(), &self.0.page_manager)
             .load(path, &argv, &envp)?;
         // TODO: shared section should be only created once and shared across all processes, not created per-process.
@@ -529,7 +519,7 @@ impl<Platform: ShimPlatform> WindowsShim<Platform> {
                     global: self.0.clone(),
                     process: process.clone(),
                     fs,
-                    fs_context: litebox::fs::resolver::Context::new(),
+                    fs_context: litebox::fs::Context::new(),
                     wait_state: wait::WaitState::new(self.0.platform),
                     io_completion_worker: Mutex::new(syscalls::iocp::IoCompletionWorkerState::new()),
                     entry_point: load_info.entry_point,
@@ -718,8 +708,8 @@ impl<Platform: ShimPlatform> Process<Platform> {
 struct Task<Platform: ShimPlatform> {
     global: Arc<GlobalState<Platform>>,
     process: Arc<Process<Platform>>,
-    fs: Arc<WindowsFS<Platform>>,
-    fs_context: litebox::fs::resolver::Context,
+    fs: Arc<LiteBox<Platform>>,
+    fs_context: litebox::fs::Context,
     wait_state: wait::WaitState<Platform>,
     io_completion_worker: Mutex<Platform, syscalls::iocp::IoCompletionWorkerState<Platform>>,
     entry_point: usize,
