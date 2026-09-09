@@ -38,12 +38,10 @@ pub const TRAMPOLINE_ENTRY_POINT_BYTES: usize = size_of::<u64>();
 #[cfg(target_arch = "aarch64")]
 pub const TRAMPOLINE_ENTRY_POINT_BYTES: usize = 0;
 
-/// Furthest a trampoline may sit from any byte of the code segment reaching it.
+/// Furthest preferred trampoline base from the code segment.
 ///
-/// A rewritten site branches to its stub with a single direct branch, so a
-/// trampoline beyond this displacement cannot be reached and the site has to
-/// fall back to a trap. Each architecture's value is its direct-branch range
-/// less a margin for the last stub in the trampoline.
+/// AArch64 runtime reservations may exceed the nominal tail margin; each gate
+/// performs its own reach check.
 #[cfg(target_arch = "x86_64")]
 pub const MAX_TRAMPOLINE_DISPLACEMENT: usize = 0x7FFF_0000;
 #[cfg(target_arch = "aarch64")]

@@ -115,7 +115,7 @@ use alloc::format;
 use alloc::string::ToString as _;
 use alloc::vec::Vec;
 use core::ops::Range;
-use object::read::{Object as _, ObjectSection as _, ObjectSymbol as _};
+use object::read::{Object as _, ObjectSection as _, ObjectSegment as _, ObjectSymbol as _};
 use yaxpeax_arch::{Decoder, U8Reader};
 use yaxpeax_arm::armv8::a64::{
     InstDecoder, Instruction as DecodedInstruction, Opcode as DecodedOpcode, Operand,
@@ -198,6 +198,39 @@ impl ElfCodeMetadata {
         })
     }
 
+    /// Bounds gates at this ELF's file addresses. Remapping, load bias, or
+    /// runtime rescans may still require growth.
+    pub fn trampoline_size_upper_bound(
+        &self,
+        elf: &[u8],
+        options: crate::RewriteOptions,
+    ) -> Result<usize> {
+        let sites = find_patch_sites_with_code_ranges(
+            &self.executable,
+            &self.identified,
+            elf,
+            RewriteConfig::new(options.target_host(), options.effective_virtualize_x18()),
+        )?;
+        sites.into_iter().try_fold(0usize, |total, site| {
+            let gate_bytes = match site.kind {
+                PatchKind::Svc => SVC_SLOT_BYTES,
+                PatchKind::MsrTpidr(_) => MSR_SLOT_BYTES,
+                PatchKind::MrsTpidr(_) => MRS_SLOT_BYTES,
+                PatchKind::X18(X18TransformResult::Supported(_)) => X18_SLOT_BYTES,
+                PatchKind::X18(X18TransformResult::Unsupported(_)) => 0,
+                PatchKind::X18StackWriteback(_) => X18_STACK_WRITEBACK_SLOT_BYTES,
+                PatchKind::X18CompareBranch(_) => X18_COMPARE_BRANCH_SLOT_BYTES,
+                PatchKind::X18Adr(_) => X18_ADR_SLOT_BYTES,
+                PatchKind::X18Branch(_) => X18_BRANCH_SLOT_BYTES,
+            };
+            // One prologue per site covers separate mapping batches.
+            total
+                .checked_add(GATES_START_OFFSET)
+                .and_then(|total| total.checked_add(gate_bytes))
+                .ok_or_else(|| Error::AddressOverflow("AArch64 trampoline size".into()))
+        })
+    }
+
     /// Total executable and identified-code bytes represented by this metadata.
     pub fn coverage_bytes(&self) -> (u64, u64) {
         let total = |ranges: &[TextSectionInfo]| {
@@ -212,12 +245,43 @@ impl ElfCodeMetadata {
 pub(crate) fn elf_code_metadata(
     file: &object::File<'_>,
 ) -> core::result::Result<ElfCodeMetadata, InternalError> {
-    let executable = text_sections(file)?;
+    // Stripped ELFs may expose code only through executable PT_LOAD segments.
+    let executable = match text_sections(file) {
+        Ok(sections) => sections,
+        Err(InternalError::NoTextSectionFound) => executable_segments(file)?,
+        Err(error) => return Err(error),
+    };
     let identified = code_sections(file, &executable);
     Ok(ElfCodeMetadata {
         executable,
         identified,
     })
+}
+
+fn executable_segments(
+    file: &object::File<'_>,
+) -> core::result::Result<Vec<TextSectionInfo>, InternalError> {
+    let executable = file
+        .segments()
+        .filter_map(|segment| {
+            let object::SegmentFlags::Elf { p_flags } = segment.flags() else {
+                return None;
+            };
+            if p_flags & object::elf::PF_X == 0 {
+                return None;
+            }
+            let (file_offset, size) = segment.file_range();
+            (size != 0).then_some(TextSectionInfo {
+                vaddr: segment.address(),
+                file_offset,
+                size,
+            })
+        })
+        .collect::<Vec<_>>();
+    if executable.is_empty() {
+        return Err(InternalError::NoTextSectionFound);
+    }
+    Ok(executable)
 }
 
 #[expect(
@@ -6083,6 +6147,71 @@ mod tests {
         assert_eq!(ranges[0].vaddr, 0x1000);
         assert_eq!(ranges[0].file_offset, 0x200);
         assert_eq!(ranges[0].size, 0xc);
+    }
+
+    #[test]
+    fn trampoline_size_upper_bound_accounts_for_per_mapping_prologues() {
+        let words = [
+            SVC_0,
+            msr_tpidr_el0(5),
+            Insn::MrsTpidrEl0(9).encode().unwrap(),
+        ];
+        let bytes = words
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<_>>();
+        let metadata = ElfCodeMetadata {
+            executable: vec![TextSectionInfo {
+                vaddr: 0x1000,
+                file_offset: 0,
+                size: bytes.len() as u64,
+            }],
+            identified: vec![TextSectionInfo {
+                vaddr: 0x1000,
+                file_offset: 0,
+                size: bytes.len() as u64,
+            }],
+        };
+
+        let bound = metadata
+            .trampoline_size_upper_bound(&bytes, crate::RewriteOptions::default())
+            .unwrap();
+        let emitted = words
+            .iter()
+            .enumerate()
+            .map(|(index, word)| {
+                hook_words(&[*word], 0x1000 + (index * INSN_BYTES) as u64, 0x400000)
+                    .1
+                    .len()
+            })
+            .sum::<usize>();
+
+        assert_eq!(
+            bound,
+            3 * GATES_START_OFFSET + SVC_SLOT_BYTES + MSR_SLOT_BYTES + MRS_SLOT_BYTES
+        );
+        assert_eq!(emitted, bound);
+    }
+
+    #[test]
+    fn no_patch_sites_have_zero_trampoline_size_upper_bound() {
+        let bytes = NOP.to_le_bytes();
+        let section = TextSectionInfo {
+            vaddr: 0x1000,
+            file_offset: 0,
+            size: bytes.len() as u64,
+        };
+        let metadata = ElfCodeMetadata {
+            executable: vec![section],
+            identified: vec![section],
+        };
+
+        assert_eq!(
+            metadata
+                .trampoline_size_upper_bound(&bytes, crate::RewriteOptions::default())
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

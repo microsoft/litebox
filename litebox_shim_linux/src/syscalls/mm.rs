@@ -29,7 +29,7 @@ use litebox::utils::ReinterpretUnsignedExt as _;
 use litebox::utils::TruncateExt as _;
 use object::elf::{ET_DYN, FileHeader64, PT_LOAD, ProgramHeader64};
 use object::endian::LittleEndian;
-#[cfg(all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"))]
+#[cfg(target_arch = "aarch64")]
 use zerocopy::FromZeros as _;
 
 #[cfg(not(target_pointer_width = "64"))]
@@ -106,8 +106,11 @@ pub(crate) struct ElfPatchState {
     runtime_patches_committed: bool,
     #[cfg(target_arch = "aarch64")]
     trampoline_invalidated: bool,
-    #[cfg(all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"))]
+    #[cfg(target_arch = "aarch64")]
     code_metadata: Option<litebox_syscall_rewriter::aarch64::ElfCodeMetadata>,
+    /// Pre-scanned, page-aligned trampoline capacity.
+    #[cfg(target_arch = "aarch64")]
+    trampoline_capacity: usize,
     /// Tracks file-backed mappings for this fd as (vaddr, len) pairs.
     /// Used to find mappings that need patching when mprotect adds PROT_EXEC.
     /// Cleared on munmap to allow re-patching.
@@ -803,43 +806,57 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let (pre_patched, tramp_file_offset, tramp_vaddr, tramp_file_size) =
             self.check_trampoline_magic(fd);
 
-        #[cfg(all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"))]
-        let code_metadata = if pre_patched {
-            None
+        #[cfg(target_arch = "aarch64")]
+        let (code_metadata, trampoline_capacity) = if pre_patched {
+            (None, 0)
         } else {
-            self.sys_fstat(fd).ok().and_then(|stat| {
+            let scanned = self.sys_fstat(fd).ok().and_then(|stat| {
                 let file_size: usize = stat.st_size.reinterpret_as_unsigned().trunc();
                 let word_len = file_size.div_ceil(8);
                 let mut words = u64::new_vec_zeroed(word_len).ok()?;
                 let bytes = zerocopy::IntoBytes::as_mut_bytes(words.as_mut_slice());
                 match self.sys_read(fd, &mut bytes[..file_size], Some(0)) {
                     Ok(n) if n == file_size => {
-                        litebox_syscall_rewriter::aarch64::ElfCodeMetadata::parse_aligned_in_place(
+                        let metadata = litebox_syscall_rewriter::aarch64::ElfCodeMetadata::parse_aligned_in_place(
                             &mut words, file_size,
-                        )
-                        .ok()
+                        ).ok()?;
+                        let upper_bound = metadata
+                            .trampoline_size_upper_bound(
+                                &zerocopy::IntoBytes::as_bytes(words.as_slice())[..file_size],
+                                crate::aarch64_rewrite_options(),
+                            )
+                            .ok();
+                        Some((metadata, upper_bound))
                     }
                     _ => None,
                 }
-            })
-        };
-        #[cfg(all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"))]
-        if !pre_patched {
-            if let Some(metadata) = &code_metadata {
+            });
+            if let Some((metadata, upper_bound)) = scanned {
                 let (executable_bytes, identified_bytes) = metadata.coverage_bytes();
+                let initial_cursor = litebox_syscall_rewriter::TRAMPOLINE_ENTRY_POINT_BYTES
+                    .checked_next_multiple_of(litebox_syscall_rewriter::TRAMPOLINE_CURSOR_ALIGN);
+                let capacity = upper_bound
+                    .zip(initial_cursor)
+                    .and_then(|(bound, cursor)| bound.checked_add(cursor))
+                    .and_then(|bound| bound.checked_next_multiple_of(PAGE_SIZE))
+                    .unwrap_or(PAGE_SIZE);
                 litebox_util_log::debug!(
                     fd:? = fd,
                     executable_bytes:? = executable_bytes,
-                    identified_bytes:? = identified_bytes;
-                    "collected AArch64 code metadata"
+                    identified_bytes:? = identified_bytes,
+                    trampoline_upper_bound:? = upper_bound,
+                    trampoline_capacity:? = capacity;
+                    "pre-scanned AArch64 ELF for runtime rewriting"
                 );
+                (Some(metadata), capacity)
             } else {
                 litebox_util_log::warn!(
                     fd:? = fd;
-                    "AArch64 code metadata unavailable; falling back to whole-mapping x18 scan"
+                    "AArch64 ELF pre-scan unavailable; using one-page trampoline with incremental fallback"
                 );
+                (None, PAGE_SIZE)
             }
-        }
+        };
 
         // Compute the trampoline virtual address.
         // - Pre-patched: use the exact address from the trampoline header (the
@@ -910,8 +927,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
             runtime_patches_committed: false,
             #[cfg(target_arch = "aarch64")]
             trampoline_invalidated: false,
-            #[cfg(all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"))]
+            #[cfg(target_arch = "aarch64")]
             code_metadata,
+            #[cfg(target_arch = "aarch64")]
+            trampoline_capacity,
             file_mappings: BTreeSet::new(),
             patched_ranges: BTreeSet::new(),
         });
@@ -1214,15 +1233,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         // ── Runtime patching path (unpatched binaries) ───────────────
 
-        #[cfg(all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"))]
+        #[cfg(target_arch = "aarch64")]
         let scan_ranges = file_offset.and_then(|file_offset| {
             state
                 .code_metadata
                 .as_ref()
                 .and_then(|metadata| metadata.ranges_for_mapping(file_offset as u64, len).ok())
         });
-        #[cfg(all(target_arch = "aarch64", not(feature = "aarch64_virtualize_x18")))]
-        let scan_ranges: Option<litebox_syscall_rewriter::aarch64::CodeScanRanges> = None;
         #[cfg(target_arch = "aarch64")]
         let apply_trap_fallback = |mapped_addr, len, already_rw| {
             self.apply_aarch64_trap_fallback(mapped_addr, len, already_rw, scan_ranges.as_ref());
@@ -1236,34 +1253,55 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let addr_usize = mapped_addr.as_usize();
         if !state.trampoline_mapped {
             let tramp_addr = state.trampoline_addr;
+            #[cfg(target_arch = "aarch64")]
+            let initial_trampoline_len = state.trampoline_capacity.max(PAGE_SIZE);
+            #[cfg(target_arch = "x86_64")]
+            let initial_trampoline_len = PAGE_SIZE;
 
-            // Try MAP_FIXED_NOREPLACE first — works when the preferred
-            // trampoline address is available. If that fails, let the VM
-            // manager choose a free address and validate that it is still
-            // within JMP rel32 range below.
-            let actual_addr = self
-                .do_mmap_anonymous(
-                    Some(tramp_addr),
-                    PAGE_SIZE,
-                    ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-                    MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
-                )
-                .or_else(|_| {
-                    self.do_mmap_anonymous(
-                        None,
-                        PAGE_SIZE,
-                        ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-                        MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE,
-                    )
+            let map_preferred = |reservation_len| match self.do_mmap_anonymous(
+                Some(tramp_addr),
+                reservation_len,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
+            ) {
+                Ok(ptr) => {
+                    if ptr.as_usize() == tramp_addr {
+                        Some(ptr)
+                    } else {
+                        let _ = self.sys_munmap_raw(ptr, reservation_len);
+                        None
+                    }
+                }
+                Err(_) => None,
+            };
+            let preferred = map_preferred(initial_trampoline_len)
+                .map(|ptr| (ptr, initial_trampoline_len))
+                .or_else(|| {
+                    if initial_trampoline_len > PAGE_SIZE {
+                        map_preferred(PAGE_SIZE).map(|ptr| (ptr, PAGE_SIZE))
+                    } else {
+                        None
+                    }
                 });
-            let Ok(actual_addr_ptr) = actual_addr else {
-                litebox_util_log::warn!("failed to allocate trampoline region");
-                apply_trap_fallback(mapped_addr, len, false);
-                return true;
+            let (actual_addr_ptr, reservation_len) = if let Some(preferred) = preferred {
+                preferred
+            } else {
+                let Ok(ptr) = self.do_mmap_anonymous(
+                    None,
+                    initial_trampoline_len,
+                    ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                    MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE,
+                ) else {
+                    litebox_util_log::warn!("failed to allocate trampoline region");
+                    apply_trap_fallback(mapped_addr, len, false);
+                    return true;
+                };
+                (ptr, initial_trampoline_len)
             };
             let actual_addr = actual_addr_ptr.as_usize();
 
             let far_end = addr_usize.saturating_add(len);
+            // Individual gates perform their own reach checks.
             let distance = actual_addr
                 .abs_diff(addr_usize)
                 .max(actual_addr.abs_diff(far_end));
@@ -1272,7 +1310,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     distance:? = distance;
                     "trampoline too far from code segment, skipping patching"
                 );
-                let _ = self.sys_munmap_raw(UserPtrMut::<u8>::from_usize(actual_addr), PAGE_SIZE);
+                let _ =
+                    self.sys_munmap_raw(UserPtrMut::<u8>::from_usize(actual_addr), reservation_len);
                 apply_trap_fallback(mapped_addr, len, false);
                 return true;
             }
@@ -1286,8 +1325,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .is_none()
                 {
                     litebox_util_log::warn!("failed to write syscall entry point to trampoline");
-                    let _ =
-                        self.sys_munmap_raw(UserPtrMut::<u8>::from_usize(actual_addr), PAGE_SIZE);
+                    let _ = self
+                        .sys_munmap_raw(UserPtrMut::<u8>::from_usize(actual_addr), reservation_len);
                     apply_trap_fallback(mapped_addr, len, false);
                     return true;
                 }
@@ -1296,7 +1335,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 state.trampoline_cursor = 0;
             }
             state.trampoline_mapped = true;
-            state.trampoline_mapped_len = PAGE_SIZE;
+            state.trampoline_mapped_len = reservation_len;
         }
 
         // Performance guard: skip if this exact range was already patched.
