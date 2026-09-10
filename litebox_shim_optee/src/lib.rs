@@ -249,13 +249,7 @@ impl<Platform: OpteeShimPlatform> GlobalState<Platform> {
         TimeProvider::now(self.platform).duration_since(&self.boot_instant)
     }
 
-    /// Remove the TA binary associated with the given TA UUID.
-    ///
-    /// Since a TA binary can be continuously loaded/used by multiple clients, we cache it
-    /// to avoid repeated RPCs and memory transfers. We remove it lazily if there is
-    /// a memory pressure.
-    ///
-    #[expect(dead_code)]
+    /// Remove a TA binary after it is no longer needed in the trusted cache.
     pub(crate) fn remove_ta_bin(&self, ta_uuid: &TeeUuid) {
         let _ = self.ta_uuid_map.remove(ta_uuid);
     }
@@ -365,6 +359,11 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
     /// Return whether a TA binary is cached for the given UUID.
     pub fn contains_ta_bin(&self, ta_uuid: &TeeUuid) -> bool {
         self.0.contains_ta_bin(ta_uuid)
+    }
+
+    /// Remove a TA binary from the trusted cache.
+    pub fn remove_ta_bin(&self, ta_uuid: &TeeUuid) {
+        self.0.remove_ta_bin(ta_uuid);
     }
 
     /// Release all user-space memory mappings owned by this shim instance.

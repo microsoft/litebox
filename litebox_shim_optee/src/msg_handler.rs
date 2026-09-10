@@ -70,7 +70,7 @@ const MAX_SHM_MEMREF_SIZE: usize = 8 * 1024 * 1024;
 const MAX_SHM_REF_MAP_ENTRIES: usize = 1024;
 
 #[inline]
-pub fn page_align_down(address: u64) -> u64 {
+fn page_align_down(address: u64) -> u64 {
     address & !(PAGE_SIZE as u64 - 1)
 }
 
@@ -84,7 +84,7 @@ pub fn checked_memref_size(size: u64) -> Result<usize, OpteeSmcReturnCode> {
     if size > MAX_SHM_MEMREF_SIZE as u64 {
         return Err(OpteeSmcReturnCode::ENomem);
     }
-    Ok(size.trunc())
+    usize::try_from(size).map_err(|_| OpteeSmcReturnCode::ENomem)
 }
 
 fn parse_optee_msg_args(
@@ -272,6 +272,19 @@ pub fn register_rpc_shm<Platform: litebox_common_linux::vmap::VmapManager<PAGE_S
 /// Remove a shared-memory mapping inserted for an RPC allocation.
 pub fn unregister_rpc_shm(shm_ref: u64) -> bool {
     shm_ref_map().remove(shm_ref).is_some()
+}
+
+/// Copy bytes from a registered RPC allocation into trusted memory.
+pub fn read_rpc_shm<Platform: litebox_common_linux::vmap::VmapManager<PAGE_SIZE>>(
+    platform: &Platform,
+    shm_ref: u64,
+    offset: usize,
+    buffer: &mut [u8],
+) -> Result<(), OpteeSmcReturnCode> {
+    shm_ref_map()
+        .get(shm_ref)
+        .ok_or(OpteeSmcReturnCode::EBadAddr)?
+        .read_at(platform, offset, buffer)
 }
 
 /// This function handles `OpteeSmcArgs` passed from the normal world (VTL0) via an OP-TEE SMC call.

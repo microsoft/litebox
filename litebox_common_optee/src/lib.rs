@@ -2269,6 +2269,27 @@ impl OpteeRpcArgs {
         Ok(size)
     }
 
+    /// Validate a successful second LOAD_TA response and read the TA binary.
+    pub fn load_ta_binary_response(
+        &self,
+        expected_shm_ref: u64,
+        expected_size: u64,
+        read_binary: impl FnOnce(u64, u64) -> Result<Box<[u8]>, OpteeSmcReturnCode>,
+    ) -> Result<Box<[u8]>, OpteeSmcReturnCode> {
+        if self.cmd != OpteeRpcCommand::LoadTa
+            || self.ret != TeeResult::Success
+            || self.num_params != 2
+        {
+            return Err(OpteeSmcReturnCode::EBadCmd);
+        }
+
+        let rmem = self.get_param_rmem_output(1)?;
+        if rmem.shm_ref != expected_shm_ref || rmem.offs != 0 || rmem.size != expected_size {
+            return Err(OpteeSmcReturnCode::EBadCmd);
+        }
+        read_binary(rmem.shm_ref, rmem.size)
+    }
+
     /// Validate a successful SHM_ALLOC response and return its memory reference.
     pub fn shm_alloc_response(
         &self,
@@ -2316,6 +2337,29 @@ impl OpteeRpcArgs {
         )?;
 
         Ok(())
+    }
+
+    /// Prepare a shared-memory free RPC request to be sent to normal world.
+    pub fn prepare_shm_free_rpc(
+        &mut self,
+        shm_type: OpteeRpcShmType,
+        shm_ref: u64,
+    ) -> Result<(), OpteeSmcReturnCode> {
+        self.cmd = OpteeRpcCommand::ShmFree;
+        // Match OP-TEE's get_rpc_arg(): default to failure in case normal world
+        // returns without updating the RPC result.
+        self.ret = TeeResult::GenericError;
+        self.num_params = 1;
+
+        self.set_param_attr_type(0, OpteeMsgAttrType::ValueInput)?;
+        self.set_param_value(
+            0,
+            OpteeMsgParamValue {
+                a: shm_type as u64,
+                b: shm_ref,
+                c: 0,
+            },
+        )
     }
 
     /// Prepare a LOAD_TA RPC request to be sent to normal world.

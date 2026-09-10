@@ -15,9 +15,9 @@ use litebox::{
 use litebox_common_linux::errno::Errno;
 use litebox_common_lvbs::{NUM_VTLCALL_PARAMS, VsmError, VsmFunction};
 use litebox_common_optee::{
-    OpteeMessageCommand, OpteeMsgArgs, OpteeMsgParamRmem, OpteeRpcArgs, OpteeRpcShmType,
-    OpteeSmcArgs, OpteeSmcFunction, OpteeSmcResult, OpteeSmcReturnCode, TeeOrigin, TeeResult,
-    UteeEntryFunc, UteeParams, optee_msg_args_total_size,
+    OpteeMessageCommand, OpteeMsgArgs, OpteeMsgParamRmem, OpteeRpcArgs, OpteeRpcCommand,
+    OpteeRpcShmType, OpteeSmcArgs, OpteeSmcFunction, OpteeSmcResult, OpteeSmcReturnCode, TeeOrigin,
+    TeeResult, UteeEntryFunc, UteeParams, optee_msg_args_total_size,
 };
 use litebox_platform_lvbs::host::LvbsLinuxKernel as Platform;
 use litebox_platform_lvbs::mshv::vsm::{LvbsVtl0Gate, LvbsVtl0PrivilegedWriter, LvbsVtl1Gate};
@@ -46,10 +46,10 @@ use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr, TaMemrefAddress
 use litebox_shim_optee::{
     msg_handler::{
         checked_memref_size, decode_ta_request, handle_optee_msg_args, handle_optee_smc_args,
-        read_optee_msg_args_from_regd_shm, register_rpc_shm, unregister_rpc_shm,
+        read_optee_msg_args_from_regd_shm, read_rpc_shm, register_rpc_shm, unregister_rpc_shm,
         update_optee_msg_args, write_rpc_args_to_regd_shm,
     },
-    rpc_context::{RpcContext, rpc_context_map},
+    rpc_context::{RpcCompletion, RpcContext, rpc_context_map},
 };
 
 /// The session registry shared by all shims in this runner.
@@ -692,9 +692,9 @@ fn optee_smc_handler(platform: &'static Platform, smc_args_addr: usize) -> Optee
         OpteeSmcResult::ReturnFromRpc {
             msg_args,
             rpc_args,
-            msg_args_phys_addr: _,
+            msg_args_phys_addr,
         } => {
-            let msg_args = *msg_args;
+            let mut msg_args = *msg_args;
             let mut rpc_args = *rpc_args;
 
             let context_id = match smc_args.get_rpc_context_id() {
@@ -727,8 +727,24 @@ fn optee_smc_handler(platform: &'static Platform, smc_args_addr: usize) -> Optee
                         &mut rpc_args,
                     );
                 }
-                _ => {
-                    smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+                RpcContext::LoadTaBinary { .. } => {
+                    handle_return_from_load_ta_binary_rpc(
+                        platform,
+                        context_id,
+                        &mut smc_args,
+                        &msg_args,
+                        &mut rpc_args,
+                    );
+                }
+                RpcContext::ShmFree { .. } => {
+                    handle_return_from_shm_free_rpc(
+                        platform,
+                        context_id,
+                        &mut smc_args,
+                        &mut msg_args,
+                        &rpc_args,
+                        msg_args_phys_addr,
+                    );
                 }
             }
             *smc_args
@@ -781,6 +797,133 @@ fn handle_return_from_load_ta_rpc(
     }
 }
 
+fn handle_return_from_load_ta_binary_rpc(
+    platform: &'static Platform,
+    context_id: u32,
+    smc_args: &mut OpteeSmcArgs,
+    msg_args: &OpteeMsgArgs,
+    rpc_args: &mut OpteeRpcArgs,
+) {
+    let Some(
+        context @ RpcContext::LoadTaBinary {
+            requested_size,
+            shm_ref,
+            ..
+        },
+    ) = rpc_context_map().get(context_id)
+    else {
+        discard_rpc_context(context_id);
+        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+        return;
+    };
+    let response = rpc_args.load_ta_binary_response(shm_ref, requested_size, |shm_ref, size| {
+        let ta_size = checked_memref_size(size)?;
+        let mut ta_binary = alloc::vec![0u8; ta_size];
+        read_rpc_shm(platform, shm_ref, 0, &mut ta_binary)?;
+        Ok(ta_binary.into_boxed_slice())
+    });
+
+    let completion = match response {
+        Ok(ta_binary) => {
+            let shim =
+                litebox_shim_optee::OpteeShimBuilder::new(platform, session_manager()).build();
+            if shim.store_ta_bin(&context.ta_uuid(), &ta_binary) {
+                RpcCompletion::OpenSession
+            } else {
+                RpcCompletion::ReturnError(OpteeSmcReturnCode::EBadCmd)
+            }
+        }
+        Err(error) => RpcCompletion::ReturnError(error),
+    };
+    if !start_shm_free_rpc(
+        platform, smc_args, msg_args, rpc_args, context_id, shm_ref, completion,
+    ) && completion == RpcCompletion::OpenSession
+    {
+        litebox_shim_optee::OpteeShimBuilder::new(platform, session_manager())
+            .build()
+            .remove_ta_bin(&context.ta_uuid());
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_shm_free_rpc(
+    platform: &Platform,
+    smc_args: &mut OpteeSmcArgs,
+    msg_args: &OpteeMsgArgs,
+    rpc_args: &mut OpteeRpcArgs,
+    context_id: u32,
+    shm_ref: u64,
+    completion: RpcCompletion,
+) -> bool {
+    let unregister_local_shm = matches!(
+        rpc_context_map().get(context_id),
+        Some(RpcContext::LoadTaBinary { .. })
+    );
+    if rpc_args
+        .prepare_shm_free_rpc(OpteeRpcShmType::Appl, shm_ref)
+        .is_err()
+        || rpc_context_map()
+            .transition_to_shm_free(context_id, shm_ref, completion)
+            .is_err()
+    {
+        discard_rpc_context(context_id);
+        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+        return false;
+    }
+    if unregister_local_shm {
+        let _ = unregister_rpc_shm(shm_ref);
+    }
+    if !write_next_rpc(platform, smc_args, msg_args, rpc_args, context_id) {
+        discard_rpc_context(context_id);
+        return false;
+    }
+    true
+}
+
+fn handle_return_from_shm_free_rpc(
+    platform: &'static Platform,
+    context_id: u32,
+    smc_args: &mut OpteeSmcArgs,
+    msg_args: &mut OpteeMsgArgs,
+    rpc_args: &OpteeRpcArgs,
+    msg_args_phys_addr: u64,
+) {
+    let Some(context) = rpc_context_map().take(context_id) else {
+        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+        return;
+    };
+    let RpcContext::ShmFree { completion, .. } = context else {
+        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+        return;
+    };
+    match completion {
+        RpcCompletion::OpenSession => {
+            let shim =
+                litebox_shim_optee::OpteeShimBuilder::new(platform, session_manager()).build();
+            if rpc_args.cmd != OpteeRpcCommand::ShmFree
+                || rpc_args.ret != TeeResult::Success
+                || rpc_args.num_params != 1
+            {
+                shim.remove_ta_bin(&context.ta_uuid());
+                smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+                return;
+            }
+            let mut no_rpc_args = None;
+            let result =
+                handle_open_session(platform, msg_args, &mut no_rpc_args, msg_args_phys_addr);
+            // Regardless of the result, remove the TA binary from VTL1 cache.
+            // If the TA is SINGLE_INSTANCE and has KEEP_ALIVE flag, the TA
+            // runtime will be cached in memory even after last session is
+            // closed.
+            shim.remove_ta_bin(&context.ta_uuid());
+            smc_args.set_return_code(result.err().unwrap_or(OpteeSmcReturnCode::Ok));
+        }
+        // ReturnError is only recorded before the TA binary is cached or when
+        // caching fails. Removing by UUID here could evict another load's entry.
+        RpcCompletion::ReturnError(error) => smc_args.set_return_code(error),
+    }
+}
+
 fn handle_return_from_shm_alloc_rpc(
     platform: &Platform,
     context_id: u32,
@@ -806,40 +949,91 @@ fn handle_return_from_shm_alloc_rpc(
         }
     };
     if checked_memref_size(tmem.size).is_err() {
-        discard_rpc_context(context_id);
-        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+        start_shm_free_rpc(
+            platform,
+            smc_args,
+            msg_args,
+            rpc_args,
+            context_id,
+            tmem.shm_ref,
+            RpcCompletion::ReturnError(OpteeSmcReturnCode::EBadCmd),
+        );
         return;
     }
     if register_rpc_shm(platform, &tmem).is_err() {
-        discard_rpc_context(context_id);
-        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+        start_shm_free_rpc(
+            platform,
+            smc_args,
+            msg_args,
+            rpc_args,
+            context_id,
+            tmem.shm_ref,
+            RpcCompletion::ReturnError(OpteeSmcReturnCode::EBadCmd),
+        );
         return;
     }
-    let Some(context) = rpc_context_map().get(context_id) else {
+    if rpc_context_map()
+        .transition_to_load_ta_binary(context_id, tmem.shm_ref)
+        .is_err()
+    {
         let _ = unregister_rpc_shm(tmem.shm_ref);
-        discard_rpc_context(context_id);
-        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+        start_shm_free_rpc(
+            platform,
+            smc_args,
+            msg_args,
+            rpc_args,
+            context_id,
+            tmem.shm_ref,
+            RpcCompletion::ReturnError(OpteeSmcReturnCode::EBadCmd),
+        );
         return;
-    };
+    }
     let rmem = OpteeMsgParamRmem {
         offs: 0,
         size: requested_size,
         shm_ref: tmem.shm_ref,
     };
+    let Some(context) = rpc_context_map().get(context_id) else {
+        let _ = unregister_rpc_shm(tmem.shm_ref);
+        start_shm_free_rpc(
+            platform,
+            smc_args,
+            msg_args,
+            rpc_args,
+            context_id,
+            tmem.shm_ref,
+            RpcCompletion::ReturnError(OpteeSmcReturnCode::EBadCmd),
+        );
+        return;
+    };
     if rpc_args
         .prepare_load_ta_rpc(context.ta_uuid(), Some(rmem))
         .is_err()
-        || rpc_context_map()
-            .transition_to_load_ta_binary(context_id, tmem.shm_ref)
-            .is_err()
     {
         let _ = unregister_rpc_shm(tmem.shm_ref);
-        discard_rpc_context(context_id);
-        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+        start_shm_free_rpc(
+            platform,
+            smc_args,
+            msg_args,
+            rpc_args,
+            context_id,
+            tmem.shm_ref,
+            RpcCompletion::ReturnError(OpteeSmcReturnCode::EBadCmd),
+        );
         return;
     }
     if !write_next_rpc(platform, smc_args, msg_args, rpc_args, context_id) {
-        discard_rpc_context(context_id);
+        let _ = unregister_rpc_shm(tmem.shm_ref);
+        start_shm_free_rpc(
+            platform,
+            smc_args,
+            msg_args,
+            rpc_args,
+            context_id,
+            tmem.shm_ref,
+            RpcCompletion::ReturnError(OpteeSmcReturnCode::EBadAddr),
+        );
+        return;
     }
 }
 
@@ -863,7 +1057,6 @@ fn write_next_rpc(
             )
         });
     if let Err(error) = result {
-        discard_rpc_context(context_id);
         smc_args.set_return_code(error);
         false
     } else {
@@ -874,7 +1067,7 @@ fn write_next_rpc(
 
 fn discard_rpc_context(context_id: u32) {
     if let Some(context) = rpc_context_map().take(context_id)
-        && let Some(shm_ref) = context.shm_ref()
+        && let RpcContext::LoadTaBinary { shm_ref, .. } = context
     {
         let _ = unregister_rpc_shm(shm_ref);
     }
