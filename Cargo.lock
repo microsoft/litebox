@@ -1755,6 +1755,7 @@ dependencies = [
  "litebox_common_linux",
  "litebox_platform_macos_userland",
  "litebox_shim_linux",
+ "litebox_syscall_rewriter",
  "litebox_util_log",
  "tempfile",
  "tracing-subscriber",

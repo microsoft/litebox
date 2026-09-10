@@ -2,6 +2,8 @@
 // Licensed under the MIT license.
 
 use super::*;
+use litebox_syscall_rewriter::{RewriteOptions, TargetHost, hook_syscalls_in_elf_with_options};
+
 // Exercises TLS, syscalls, x18 spills, SP writeback, and ADR/BLR through x18.
 const X18: &[u32] = &[
     0xd2824692, 0xd2822229, 0xd51bd049, 0xd2801588, 0xd4000001, 0xd53bd04a, 0xeb0a013f, 0x54000221,
@@ -33,10 +35,20 @@ fn guest_signal_return_restores_x18_and_vector_state() {
     );
 }
 
-#[test]
-fn x18_gates_preserve_registers_and_branch_targets() {
+fn run_x18_fixture(aot: bool) {
     let fixture = Fixture::new();
-    std::fs::write(fixture.0.join("program"), elf(X18)).unwrap();
+    let original = elf(X18);
+    let code = if aot {
+        hook_syscalls_in_elf_with_options(
+            &original,
+            None,
+            RewriteOptions::new(TargetHost::MacOs, false),
+        )
+        .unwrap()
+    } else {
+        original
+    };
+    std::fs::write(fixture.0.join("program"), code).unwrap();
     let output = fixture.run(&[]);
     assert_eq!(
         output.status.code(),
@@ -44,4 +56,14 @@ fn x18_gates_preserve_registers_and_branch_targets() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn runtime_x18_gates_preserve_registers_and_branch_targets() {
+    run_x18_fixture(false);
+}
+
+#[test]
+fn aot_x18_gates_preserve_registers_and_branch_targets() {
+    run_x18_fixture(true);
 }
