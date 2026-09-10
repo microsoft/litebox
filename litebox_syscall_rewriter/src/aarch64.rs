@@ -5,7 +5,7 @@
 //!
 //! Instructions are a fixed 4 bytes and `B imm26` reaches ±128MB, so a site is
 //! replaced in place by a branch into its trampoline gate. A site out of that
-//! reach becomes `BRK #TRAP_BRK_IMM` and is reported as trapped, which makes
+//! reach becomes a breakpoint and is reported as trapped, which makes
 //! the ELF-level caller reject the binary with `Error::UnpatchableSyscalls`.
 //! Executing the `BRK` faults the guest instead of letting an unpatched
 //! instruction reach the host kernel.
@@ -37,13 +37,9 @@
 //! * The one anchoring the *host*'s per-thread block, selected by `Host` —
 //!   also `TPIDR_EL0` on a Linux host.
 //!
-//! `guest_tpidr_offset` is fixed by the host binary's link and one rewritten
-//! guest must run under any host build, so gates carry a placeholder offset.
-//! **A loader must pass staged gates through [`finalize_trampoline_gates`], or
-//! [`finalize_trampoline_gates_with_x18`] when x18 virtualization is enabled,
-//! before mapping the trampoline executable.** The finalizer validates every
-//! slot and patches each metadata-designated placeholder; an unpatched gate
-//! does not fault. See `GUEST_TPIDR_OFFSET_PLACEHOLDER`.
+//! Before execution, finalize placeholders with [`finalize_trampoline_gates`]
+//! (Linux without x18) or [`finalize_trampoline_gates_for_host`] (TLS/x18).
+//! Unpatched gates can corrupt host memory without faulting.
 //!
 //! ## Gate scratch storage
 //!
@@ -209,7 +205,7 @@ impl ElfCodeMetadata {
             &self.executable,
             &self.identified,
             elf,
-            RewriteConfig::new(options.target_host(), options.effective_virtualize_x18()),
+            RewriteConfig::new(options.target_host(), options.virtualizes_x18()),
         )?;
         sites.into_iter().try_fold(0usize, |total, site| {
             let gate_bytes = match site.kind {
@@ -1376,12 +1372,8 @@ pub const MAX_GUEST_TPIDR_OFFSET: u16 = LDR_UIMM12_MAX_BYTE_OFFSET;
 
 /// The smallest guest thread-pointer offset a gate may be patched with.
 ///
-/// A host keeps its own per-thread bookkeeping at the base of the block its
-/// anchor points at, so a runtime places the guest slot past that and no
-/// legitimate offset is ever this low. The bound matters because the
-/// placeholder only catches a loader that forgets to patch at all: one that
-/// patches with a defaulted or zeroed offset leaves nothing behind to detect,
-/// and every rewritten thread-pointer write would then land on host state.
+/// Rejects zero and the first anchor-relative slot; the runtime separately
+/// validates ownership of its selected slot.
 pub(crate) const MIN_GUEST_TPIDR_OFFSET: u16 = 16;
 
 /// Placeholder byte offset baked into every emitted gate's guest thread-pointer
@@ -1396,8 +1388,8 @@ pub(crate) const MIN_GUEST_TPIDR_OFFSET: u16 = 16;
 /// It buys **no** run-time safety. An unpatched gate does not fault: it reads
 /// and writes one self-consistent address 32KB past the host thread pointer,
 /// quietly corrupting eight bytes of whatever is mapped there. A loader must
-/// use [`finalize_trampoline_gates`] or [`finalize_trampoline_gates_with_x18`]
-/// before making a trampoline executable.
+/// use [`finalize_trampoline_gates`] (Linux without x18) or
+/// [`finalize_trampoline_gates_for_host`] before making a trampoline executable.
 pub(crate) const GUEST_TPIDR_OFFSET_PLACEHOLDER: u16 = MAX_GUEST_TPIDR_OFFSET;
 /// Distinct placeholder for the anchor-relative guest x18 slot.
 const GUEST_X18_OFFSET_PLACEHOLDER: u16 = MAX_GUEST_TPIDR_OFFSET - 8;
@@ -2709,15 +2701,20 @@ pub(crate) struct RewriteConfig {
     virtualize_x18: bool,
 }
 
+impl From<crate::TargetHost> for Host {
+    fn from(target: crate::TargetHost) -> Self {
+        match target {
+            crate::TargetHost::Linux => Self::Linux,
+            crate::TargetHost::MacOs => Self::MacOs,
+            crate::TargetHost::Windows => Self::Windows,
+        }
+    }
+}
+
 impl RewriteConfig {
-    pub(crate) const fn new(target: crate::TargetHost, virtualize_x18: bool) -> Self {
-        let host = match target {
-            crate::TargetHost::Linux => Host::Linux,
-            crate::TargetHost::MacOs => Host::MacOs,
-            crate::TargetHost::Windows => Host::Windows,
-        };
+    pub(crate) fn new(target: crate::TargetHost, virtualize_x18: bool) -> Self {
         Self {
-            host,
+            host: target.into(),
             virtualize_x18,
         }
     }
@@ -2772,7 +2769,7 @@ enum PatchKind {
 }
 
 /// Scans executable sections for Linux syscall/thread-pointer gates and, when
-/// configured, x18 gates. Linux-specific sites are rejected for other hosts;
+/// configured, x18 gates. Linux-specific sites are still rejected for Windows;
 /// x18 sites inside lexical exclusive sequences are rejected. AArch64
 /// instructions are fixed-width, so sites are returned in ascending file order.
 ///
@@ -2850,7 +2847,7 @@ fn find_patch_sites_with_code_ranges(
             }
             was_known_code = known_code;
             let kind = if (insn & SVC_OPCODE_MASK) == SVC_OPCODE_BITS {
-                if config.host != Host::Linux {
+                if config.host == Host::Windows {
                     return Err(Error::UnsupportedExecutable(format!(
                         "AArch64 SVC site is unsupported for the selected host at {:#x}",
                         checked_add_u64(section.vaddr, i as u64, "SVC site")?
@@ -2858,7 +2855,7 @@ fn find_patch_sites_with_code_ranges(
                 }
                 PatchKind::Svc
             } else if (insn & MSR_TPIDR_EL0_MASK) == MSR_TPIDR_EL0_BITS {
-                if config.host != Host::Linux {
+                if config.host == Host::Windows {
                     return Err(Error::UnsupportedExecutable(format!(
                         "AArch64 TPIDR_EL0 write is unsupported for the selected host at {:#x}",
                         checked_add_u64(section.vaddr, i as u64, "TPIDR site")?
@@ -2873,7 +2870,7 @@ fn find_patch_sites_with_code_ranges(
                     PatchKind::MsrTpidr(source)
                 }
             } else if (insn & MRS_TPIDR_EL0_MASK) == MRS_TPIDR_EL0_BITS {
-                if config.host != Host::Linux {
+                if config.host == Host::Windows {
                     return Err(Error::UnsupportedExecutable(format!(
                         "AArch64 TPIDR_EL0 read is unsupported for the selected host at {:#x}",
                         checked_add_u64(section.vaddr, i as u64, "TPIDR site")?
@@ -3115,7 +3112,7 @@ pub(crate) fn hook_syscalls_aarch64_with_code_ranges(
     }))
 }
 
-/// Replace the four bytes at `file_offset` with `BRK #TRAP_BRK_IMM`.
+/// Replace the instruction at `file_offset` with a breakpoint.
 ///
 /// A patch site left native escapes the virtualization: an `SVC` reaches the
 /// host kernel directly, and an `MSR TPIDR_EL0` writes the hardware register
@@ -3128,7 +3125,7 @@ fn trap_site(buf: &mut [u8], file_offset: usize) {
     buf[file_offset..file_offset + INSN_BYTES].copy_from_slice(&brk.to_le_bytes());
 }
 
-/// Replace every patch site in `buf` with `BRK #TRAP_BRK_IMM`, returning how
+/// Replace every patch site in `buf` with a breakpoint, returning how
 /// many were trapped.
 ///
 /// The fail-safe behind [`crate::trap_all_syscalls_in_code`], for a segment
@@ -3956,7 +3953,7 @@ fn validate_gate_slot_inner_for_host(
                 && padding_is_nops(48)
         }
         GateMetadata::MrsTpidr { destination } => {
-            exact(0, Insn::MrsTpidrEl0(destination))
+            is_host_anchor_read(word(0), destination, host)
                 && is_tpidr_access(word(4), Opcode::LdrUimm, destination, destination)
                 && match addressing {
                     SlotAddressing::Unplaced { .. } => {
@@ -3986,7 +3983,7 @@ fn validate_gate_slot_inner_for_host(
                         imm_bytes: MSR_FRAME_OFF_VALUE,
                     },
                 )
-                && exact(12, Insn::MrsTpidrEl0(X16))
+                && is_host_anchor_read(word(12), X16, host)
                 && exact(
                     16,
                     Insn::LdrUimm {
@@ -4436,13 +4433,8 @@ pub fn classify_gate_pc(
     classify_gate_pc_with_candidates(trampoline, trampoline_base, pc, candidates)
 }
 
-/// Classifies one fault-safely copied compact slot containing `pc` for `host`.
-/// Host-specific anchor reads currently apply only to x18 gates; TPIDR gates
-/// retain their Linux templates until host-aware emission is enabled.
-///
-/// The caller is responsible for selecting candidate slot starts and for
-/// requiring exactly one match. Keeping that policy outside this pure helper
-/// lets a signal handler copy each candidate before inspecting it.
+/// Classify a copied compact slot, validating the selected host's TLS anchor.
+/// The caller must require exactly one matching candidate.
 pub fn classify_copied_gate_slot_for_host(
     slot: &[u8],
     slot_vaddr: u64,
@@ -4490,11 +4482,7 @@ pub fn classify_copied_gate_slot_for_host(
             slot_vaddr,
         },
         metadata,
-        Some(match host {
-            crate::TargetHost::Linux => Host::Linux,
-            crate::TargetHost::MacOs => Host::MacOs,
-            crate::TargetHost::Windows => Host::Windows,
-        }),
+        Some(host.into()),
     ) {
         return None;
     }
@@ -4537,11 +4525,6 @@ pub fn classify_copied_gate_slot_for_host(
         conditional_target,
         metadata,
     })
-}
-
-/// Classifies one Linux-host, fault-safely copied compact slot containing `pc`.
-pub fn classify_copied_gate_slot(slot: &[u8], slot_vaddr: u64, pc: u64) -> Option<ClassifiedGate> {
-    classify_copied_gate_slot_for_host(slot, slot_vaddr, pc, crate::TargetHost::Linux)
 }
 
 fn classify_gate_pc_with_candidates<const N: usize>(
@@ -4759,23 +4742,19 @@ const LDST_UIMM12_IMM_SHIFT: u32 = 10;
 
 /// Validates and patches every thread-pointer gate in a Linux-host trampoline.
 /// Trampolines containing x18 gates must use
-/// [`finalize_trampoline_gates_with_x18`].
+/// [`finalize_trampoline_gates_for_host`].
 ///
 /// # Errors
 ///
 /// Rejects invalid offsets, malformed slots, unexpected field values, and x18
 /// gates before mutating the trampoline.
 pub fn finalize_trampoline_gates(trampoline: &mut [u8], offset: u16) -> Result<()> {
-    if !is_patchable_guest_tpidr_offset(offset) {
-        return Err(Error::TrampolinePatchFailure(format!(
-            "guest thread-pointer offset {offset} is not a legitimate gate target"
-        )));
-    }
-    let validation = validate_trampoline_and_collect_offsets(trampoline, offset, false)?;
+    validate_guest_offset(offset, false)?;
+    let validation = validate_trampoline_offsets_for_host(trampoline, offset, false, Host::Linux)?;
     if validation.has_x18_gate {
         return Err(Error::TrampolinePatchFailure(
             "AArch64 trampoline contains x18 gates or placeholders; use \
-             finalize_trampoline_gates_with_x18"
+             finalize_trampoline_gates_for_host"
                 .into(),
         ));
     }
@@ -4783,13 +4762,12 @@ pub fn finalize_trampoline_gates(trampoline: &mut [u8], offset: u16) -> Result<(
     Ok(())
 }
 
-/// Finalizes both anchor-relative guest slots in a Linux-host trampoline.
-/// Validation happens against a copy so an invalid offset cannot partially
-/// patch the caller's trampoline.
-pub fn finalize_trampoline_gates_with_x18(
+/// Validate and finalize guest TLS/x18 slots for `host`. Leaves bytes unchanged on error.
+pub fn finalize_trampoline_gates_for_host(
     trampoline: &mut [u8],
     guest_tpidr_offset: u16,
     guest_x18_offset: u16,
+    host: crate::TargetHost,
 ) -> Result<()> {
     let expected_x18_offset = usize::from(guest_tpidr_offset)
         .checked_add(GUEST_X18_OFFSET_FROM_GUEST_TP)
@@ -4800,10 +4778,14 @@ pub fn finalize_trampoline_gates_with_x18(
              offset {guest_tpidr_offset}"
         )));
     }
-    let mut staged = trampoline.to_vec();
-    patch_guest_tpidr_offset_inner(&mut staged, guest_tpidr_offset, true)?;
-    patch_guest_x18_offset(&mut staged, guest_x18_offset)?;
-    trampoline.copy_from_slice(&staged);
+    validate_guest_offset(guest_tpidr_offset, false)?;
+    let host = host.into();
+    let tp = validate_trampoline_offsets_for_host(trampoline, guest_tpidr_offset, false, host)?;
+    validate_guest_offset(guest_x18_offset, true)?;
+    let x18 = validate_trampoline_offsets_for_host(trampoline, guest_x18_offset, true, host)?;
+    // Both sets are validated before mutation, so an error cannot leave a partial patch.
+    patch_offset_words(trampoline, &tp.patch_offsets, guest_tpidr_offset);
+    patch_offset_words(trampoline, &x18.patch_offsets, guest_x18_offset);
     Ok(())
 }
 
@@ -4839,60 +4821,45 @@ pub fn is_patchable_guest_x18_offset(offset: u16) -> bool {
 /// if the blob is not a well-formed trampoline: too short for the shared
 /// prologue, not a whole number of instruction words, or holding a placeholder
 /// in a metadata-designated field with an unexpected value. Trampolines with
-/// x18 gates must instead use [`finalize_trampoline_gates_with_x18`].
+/// x18 gates must instead use [`finalize_trampoline_gates_for_host`].
 ///
 /// # Panics
 ///
 /// Panics if a validated slot is shorter than its own metadata word, which the
 /// slot templates make impossible.
 pub fn patch_guest_tpidr_offset(trampoline: &mut [u8], offset: u16) -> Result<usize> {
-    patch_guest_tpidr_offset_inner(trampoline, offset, false)
-}
-
-fn patch_guest_tpidr_offset_inner(
-    trampoline: &mut [u8],
-    offset: u16,
-    allow_x18: bool,
-) -> Result<usize> {
-    if !is_patchable_guest_tpidr_offset(offset) {
-        return Err(Error::TrampolinePatchFailure(format!(
-            "guest thread-pointer offset {offset} is not a legitimate gate target: it must be a \
-             multiple of {GUEST_TPIDR_OFFSET_ALIGN}, at least {MIN_GUEST_TPIDR_OFFSET} so it \
-             cannot land on the host's own per-thread state, and below \
-             {GUEST_TPIDR_OFFSET_PLACEHOLDER} so a patched gate is never mistaken for an \
-             unpatched one"
-        )));
-    }
-
-    let validation = validate_trampoline_and_collect_offsets(trampoline, offset, false)?;
-    if validation.has_x18_gate && !allow_x18 {
+    validate_guest_offset(offset, false)?;
+    let validation = validate_trampoline_offsets_for_host(trampoline, offset, false, Host::Linux)?;
+    if validation.has_x18_gate {
         return Err(Error::TrampolinePatchFailure(
-            "AArch64 trampoline contains x18 gates; use finalize_trampoline_gates_with_x18".into(),
+            "AArch64 trampoline contains x18 gates; use finalize_trampoline_gates_for_host".into(),
         ));
-    }
-    let patch_offsets = validation.patch_offsets;
-    let new_imm = u32::from(offset / GUEST_TPIDR_OFFSET_ALIGN) << LDST_UIMM12_IMM_SHIFT;
-    for offset in &patch_offsets {
-        let word = &mut trampoline[*offset..*offset + INSN_BYTES];
-        let insn = u32::from_le_bytes(word.try_into().expect("four-byte patch offset"));
-        let patched_insn = (insn & !LDST_UIMM12_IMM_MASK) | new_imm;
-        word.copy_from_slice(&patched_insn.to_le_bytes());
-    }
-    Ok(patch_offsets.len())
-}
-
-fn patch_guest_x18_offset(trampoline: &mut [u8], offset: u16) -> Result<usize> {
-    if !is_patchable_guest_x18_offset(offset) {
-        return Err(Error::TrampolinePatchFailure(format!(
-            "guest x18 offset {offset} is not a legitimate gate target"
-        )));
-    }
-    let validation = validate_trampoline_and_collect_offsets(trampoline, offset, true)?;
-    if !validation.has_x18_gate {
-        return Ok(0);
     }
     patch_offset_words(trampoline, &validation.patch_offsets, offset);
     Ok(validation.patch_offsets.len())
+}
+
+fn validate_guest_offset(offset: u16, x18: bool) -> Result<()> {
+    let (valid, slot, upper_bound) = if x18 {
+        (
+            is_patchable_guest_x18_offset(offset),
+            "x18",
+            GUEST_X18_OFFSET_PLACEHOLDER,
+        )
+    } else {
+        (
+            is_patchable_guest_tpidr_offset(offset),
+            "thread-pointer",
+            GUEST_TPIDR_OFFSET_PLACEHOLDER,
+        )
+    };
+    if !valid {
+        return Err(Error::TrampolinePatchFailure(format!(
+            "invalid guest {slot} offset {offset}: must be a multiple of \
+             {GUEST_TPIDR_OFFSET_ALIGN}, at least {MIN_GUEST_TPIDR_OFFSET}, and below {upper_bound}"
+        )));
+    }
+    Ok(())
 }
 
 fn patch_offset_words(trampoline: &mut [u8], patch_offsets: &[usize], offset: u16) {
@@ -4909,14 +4876,11 @@ struct TrampolineValidation {
     has_x18_gate: bool,
 }
 
-/// Validates every Linux-host slot, reports whether any x18 gate is present,
-/// and returns metadata-designated fields that still hold the selected
-/// placeholder. A field holding neither the placeholder nor `expected_offset`
-/// is rejected rather than left alone.
-fn validate_trampoline_and_collect_offsets(
+fn validate_trampoline_offsets_for_host(
     trampoline: &[u8],
     expected_offset: u16,
     x18: bool,
+    host: Host,
 ) -> Result<TrampolineValidation> {
     if trampoline.len() < GATES_START_OFFSET || !trampoline.len().is_multiple_of(INSN_BYTES) {
         return Err(Error::TrampolinePatchFailure(
@@ -4961,7 +4925,7 @@ fn validate_trampoline_and_collect_offsets(
                         slot_offset: cursor as u64,
                     },
                     metadata,
-                    Some(Host::Linux),
+                    Some(host),
                 )
             {
                 continue;
@@ -5042,14 +5006,14 @@ pub fn find_guest_tpidr_placeholder(trampoline: &[u8]) -> Option<usize> {
 
 /// Returns the first unfinalized guest-x18 access in a valid Linux-host
 /// trampoline. Returns `None` for malformed/non-Linux input as well as absence;
-/// loaders must use [`finalize_trampoline_gates_with_x18`] for acceptance.
+/// loaders must use [`finalize_trampoline_gates_for_host`] for acceptance.
 #[cfg(test)]
 fn find_guest_x18_placeholder(trampoline: &[u8]) -> Option<usize> {
     find_structured_placeholder(trampoline, true)
 }
 
 fn find_structured_placeholder(trampoline: &[u8], x18: bool) -> Option<usize> {
-    let validation = validate_trampoline_and_collect_offsets(
+    let validation = validate_trampoline_offsets_for_host(
         trampoline,
         if x18 {
             GUEST_X18_OFFSET_PLACEHOLDER
@@ -5057,6 +5021,7 @@ fn find_structured_placeholder(trampoline: &[u8], x18: bool) -> Option<usize> {
             GUEST_TPIDR_OFFSET_PLACEHOLDER
         },
         x18,
+        Host::Linux,
     )
     .ok()?;
     validation.patch_offsets.into_iter().next()
@@ -5184,28 +5149,96 @@ mod tests {
     use super::*;
 
     #[test]
-    fn non_linux_rejects_linux_specific_sites_but_accepts_x18_only_scan() {
-        for target in [crate::TargetHost::MacOs, crate::TargetHost::Windows] {
-            let config = RewriteConfig::new(target, true);
-            for word in [SVC_0, MSR_TPIDR_EL0_BITS, MRS_TPIDR_EL0_BITS] {
-                let bytes = word.to_le_bytes();
-                let error = find_patch_sites(
-                    &[TextSectionInfo {
-                        vaddr: 0x1000,
-                        file_offset: 0,
-                        size: 4,
-                    }],
-                    &bytes,
-                    config,
-                )
-                .err()
-                .expect("non-Linux Linux-specific site must fail");
-                assert!(
-                    matches!(error, Error::UnsupportedExecutable(reason) if reason.contains("selected host"))
-                );
-            }
+    fn macos_fallback_traps_use_shared_marker() {
+        let original = 0xd51bd052u32; // MSR TPIDR_EL0, x18: unsupported overlap
+        let config = RewriteConfig::new(crate::TargetHost::MacOs, true);
+        let (patched, outcome) = hook_words_opt_with_config(&[original], 0x1000, 0x400000, config);
+        assert_eq!(outcome.unwrap().trapped_sites, [0x1000]);
+        assert_eq!(
+            word_at(&patched, 0),
+            Insn::Brk(TRAP_BRK_IMM).encode().unwrap()
+        );
 
-            let bytes = 0x0b12_0063u32.to_le_bytes();
+        let mut code = original.to_le_bytes();
+        let sections = [TextSectionInfo {
+            vaddr: 0x1000,
+            file_offset: 0,
+            size: 4,
+        }];
+        assert_eq!(
+            trap_all_patch_sites_with_code_ranges(&mut code, &sections, &sections, config).unwrap(),
+            1
+        );
+        assert_eq!(
+            u32::from_le_bytes(code),
+            Insn::Brk(TRAP_BRK_IMM).encode().unwrap()
+        );
+    }
+
+    #[test]
+    fn macos_emits_tpidrro_tls_gates_and_svc_gate() {
+        let words = [
+            Insn::MrsTpidrEl0(9).encode().unwrap(),
+            msr_tpidr_el0(5),
+            SVC_0,
+        ];
+        let (_, outcome) = hook_words_opt_with_config(
+            &words,
+            0x1000,
+            0x400000,
+            RewriteConfig::new(crate::TargetHost::MacOs, true),
+        );
+        let trampoline = outcome.unwrap().trampoline;
+        assert_eq!(
+            word_at(&trampoline, 16),
+            Insn::MrsTpidrroEl0(9).encode().unwrap()
+        );
+        assert_eq!(
+            word_at(&trampoline, 32 + 12),
+            Insn::MrsTpidrroEl0(X16).encode().unwrap()
+        );
+        assert!(matches!(
+            decode_gate_metadata_word(word_at(&trampoline, 80 + SVC_SLOT_BYTES - 4)),
+            Some(GateMetadata::Svc)
+        ));
+    }
+
+    #[test]
+    fn windows_rejects_linux_specific_sites_but_accepts_x18_only_scan() {
+        let config = RewriteConfig::new(crate::TargetHost::Windows, true);
+        for word in [SVC_0, MSR_TPIDR_EL0_BITS, MRS_TPIDR_EL0_BITS] {
+            let bytes = word.to_le_bytes();
+            let error = find_patch_sites(
+                &[TextSectionInfo {
+                    vaddr: 0x1000,
+                    file_offset: 0,
+                    size: 4,
+                }],
+                &bytes,
+                config,
+            )
+            .err()
+            .expect("non-Linux Linux-specific site must fail");
+            assert!(
+                matches!(error, Error::UnsupportedExecutable(reason) if reason.contains("selected host"))
+            );
+        }
+
+        let bytes = 0x0b12_0063u32.to_le_bytes();
+        let sites = find_patch_sites(
+            &[TextSectionInfo {
+                vaddr: 0x1000,
+                file_offset: 0,
+                size: 4,
+            }],
+            &bytes,
+            config,
+        )
+        .unwrap();
+        assert!(matches!(sites[0].kind, PatchKind::X18(_)));
+
+        for instruction in [Insn::Br(18), Insn::Blr(18), Insn::Ret(18)] {
+            let bytes = instruction.encode().unwrap().to_le_bytes();
             let sites = find_patch_sites(
                 &[TextSectionInfo {
                     vaddr: 0x1000,
@@ -5216,23 +5249,39 @@ mod tests {
                 config,
             )
             .unwrap();
-            assert!(matches!(sites[0].kind, PatchKind::X18(_)));
-
-            for instruction in [Insn::Br(18), Insn::Blr(18), Insn::Ret(18)] {
-                let bytes = instruction.encode().unwrap().to_le_bytes();
-                let sites = find_patch_sites(
-                    &[TextSectionInfo {
-                        vaddr: 0x1000,
-                        file_offset: 0,
-                        size: 4,
-                    }],
-                    &bytes,
-                    config,
-                )
-                .unwrap();
-                assert!(matches!(sites[0].kind, PatchKind::X18Branch(_)));
-            }
+            assert!(matches!(sites[0].kind, PatchKind::X18Branch(_)));
         }
+    }
+
+    #[test]
+    fn macos_finalization_accepts_current_gates_and_rejects_cross_host_state_atomically() {
+        let words = [SVC_0, MSR_TPIDR_EL0_BITS, MRS_TPIDR_EL0_BITS, 0x0b12_0063];
+        let config = RewriteConfig::new(crate::TargetHost::MacOs, true);
+        let (_, outcome) = hook_words_opt_with_config(&words, 0x1000, 0x400000, config);
+        let mut trampoline = outcome.unwrap().trampoline;
+        let original = trampoline.clone();
+        assert!(
+            finalize_trampoline_gates_for_host(&mut trampoline, 96, 104, crate::TargetHost::Linux)
+                .is_err()
+        );
+        assert_eq!(trampoline, original);
+        assert!(
+            finalize_trampoline_gates_for_host(&mut trampoline, 96, 112, crate::TargetHost::MacOs)
+                .is_err()
+        );
+        assert_eq!(trampoline, original);
+        finalize_trampoline_gates_for_host(&mut trampoline, 96, 104, crate::TargetHost::MacOs)
+            .unwrap();
+        // Re-finalization is idempotent; a different slot layout is rejected.
+        let finalized = trampoline.clone();
+        finalize_trampoline_gates_for_host(&mut trampoline, 96, 104, crate::TargetHost::MacOs)
+            .unwrap();
+        assert_eq!(trampoline, finalized);
+        assert!(
+            finalize_trampoline_gates_for_host(&mut trampoline, 112, 120, crate::TargetHost::MacOs)
+                .is_err()
+        );
+        assert_eq!(trampoline, finalized);
     }
 
     #[test]
@@ -5701,7 +5750,13 @@ mod tests {
         ));
         assert_eq!(word_at(gate, 0), Insn::SubSp(32).encode().unwrap());
         assert_eq!(word_at(gate, 44), Insn::AddSp(16).encode().unwrap());
-        finalize_trampoline_gates_with_x18(&mut outcome.trampoline, 96, 104).unwrap();
+        finalize_trampoline_gates_for_host(
+            &mut outcome.trampoline,
+            96,
+            104,
+            crate::TargetHost::Linux,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -5861,7 +5916,8 @@ mod tests {
             hook_words_opt_with_config(&[0x3500_0332], 0x1000, 0x400000, x18_config(Host::Linux));
         let mut trampoline = outcome.unwrap().trampoline;
 
-        finalize_trampoline_gates_with_x18(&mut trampoline, 96, 104).unwrap();
+        finalize_trampoline_gates_for_host(&mut trampoline, 96, 104, crate::TargetHost::Linux)
+            .unwrap();
         assert_eq!(find_guest_x18_placeholder(&trampoline), None);
     }
 
@@ -5951,7 +6007,8 @@ mod tests {
             hook_words_opt_with_config(&[0x1000_0072], 0x1000, 0x400000, x18_config(Host::Linux));
         let mut trampoline = outcome.unwrap().trampoline;
 
-        finalize_trampoline_gates_with_x18(&mut trampoline, 96, 104).unwrap();
+        finalize_trampoline_gates_for_host(&mut trampoline, 96, 104, crate::TargetHost::Linux)
+            .unwrap();
         assert_eq!(find_guest_x18_placeholder(&trampoline), None);
     }
 
@@ -5962,18 +6019,19 @@ mod tests {
         let mut trampoline = outcome.unwrap().trampoline;
         let before = trampoline.clone();
         assert!(matches!(
-            finalize_trampoline_gates_with_x18(&mut trampoline, 96, 12),
+            finalize_trampoline_gates_for_host(&mut trampoline, 96, 12, crate::TargetHost::Linux),
             Err(Error::TrampolinePatchFailure(_))
         ));
         assert_eq!(trampoline, before);
 
         assert!(matches!(
-            finalize_trampoline_gates_with_x18(&mut trampoline, 96, 96),
+            finalize_trampoline_gates_for_host(&mut trampoline, 96, 96, crate::TargetHost::Linux),
             Err(Error::TrampolinePatchFailure(_))
         ));
         assert_eq!(trampoline, before);
 
-        finalize_trampoline_gates_with_x18(&mut trampoline, 96, 104).unwrap();
+        finalize_trampoline_gates_for_host(&mut trampoline, 96, 104, crate::TargetHost::Linux)
+            .unwrap();
         assert_eq!(find_guest_x18_placeholder(&trampoline), None);
     }
 
@@ -5993,7 +6051,10 @@ mod tests {
         let (_, mut trampoline) = hook_words(&[SVC_0], 0x1000, 0x400000);
         let before = trampoline.clone();
 
-        assert!(finalize_trampoline_gates_with_x18(&mut trampoline, 96, 12).is_err());
+        assert!(
+            finalize_trampoline_gates_for_host(&mut trampoline, 96, 12, crate::TargetHost::Linux)
+                .is_err()
+        );
         assert_eq!(trampoline, before);
     }
 
@@ -6004,7 +6065,10 @@ mod tests {
         let mut trampoline = outcome.unwrap().trampoline;
         let before = trampoline.clone();
 
-        assert!(finalize_trampoline_gates_with_x18(&mut trampoline, 96, 112).is_err());
+        assert!(
+            finalize_trampoline_gates_for_host(&mut trampoline, 96, 112, crate::TargetHost::Linux)
+                .is_err()
+        );
         assert_eq!(trampoline, before);
     }
 
@@ -6021,7 +6085,8 @@ mod tests {
         let transformed = GATES_START_OFFSET + X18GateOffset::Transform.as_usize();
         let before = word_at(&trampoline, transformed);
 
-        finalize_trampoline_gates_with_x18(&mut trampoline, 96, 104).unwrap();
+        finalize_trampoline_gates_for_host(&mut trampoline, 96, 104, crate::TargetHost::Linux)
+            .unwrap();
 
         assert_eq!(word_at(&trampoline, transformed), before);
         assert_eq!(find_guest_x18_placeholder(&trampoline), None);
@@ -6042,7 +6107,7 @@ mod tests {
         let error = finalize_trampoline_gates(&mut trampoline, 96).unwrap_err();
 
         assert!(
-            matches!(error, Error::TrampolinePatchFailure(reason) if reason.contains("finalize_trampoline_gates_with_x18"))
+            matches!(error, Error::TrampolinePatchFailure(reason) if reason.contains("finalize_trampoline_gates_for_host"))
         );
         assert_eq!(trampoline, before);
     }
@@ -6738,7 +6803,12 @@ mod tests {
         assert_eq!(EncodedGateMetadata(xzr).decode(), None);
         assert_eq!(classify_gate_pc(&trampoline, base, base + 16), None);
         assert_eq!(
-            classify_copied_gate_slot(&trampoline[16..32], base + 16, base + 16),
+            classify_copied_gate_slot_for_host(
+                &trampoline[16..32],
+                base + 16,
+                base + 16,
+                crate::TargetHost::Linux
+            ),
             None
         );
     }
@@ -7126,10 +7196,11 @@ mod tests {
         ] {
             let slot = &trampoline[start..start + size];
             for offset in (0..executable_end).step_by(INSN_BYTES) {
-                let classified = classify_copied_gate_slot(
+                let classified = classify_copied_gate_slot_for_host(
                     slot,
                     base + start as u64,
                     base + (start + offset) as u64,
+                    crate::TargetHost::Linux,
                 )
                 .expect("emitted slot must classify");
                 assert_eq!(classified.slot_offset(), 0);
@@ -7147,10 +7218,11 @@ mod tests {
         let trampoline = outcome.unwrap().trampoline;
         let slot = &trampoline[GATES_START_OFFSET..];
         for offset in (0..X18StackWritebackOffset::ExecutableEnd.as_usize()).step_by(INSN_BYTES) {
-            let classified = classify_copied_gate_slot(
+            let classified = classify_copied_gate_slot_for_host(
                 slot,
                 base + GATES_START_OFFSET as u64,
                 base + (GATES_START_OFFSET + offset) as u64,
+                crate::TargetHost::Linux,
             )
             .expect("emitted x18 stack-writeback slot must classify");
             assert_eq!(classified.slot_offset(), 0);
