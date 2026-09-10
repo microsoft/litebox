@@ -10,7 +10,7 @@
 pub mod errors;
 mod file;
 
-pub use file::{BrokerFile, Context, FileFd, OFlags, ResolvedPath};
+pub use file::{BrokerFile, Context, FileFd};
 
 #[doc(hidden)]
 pub mod nine_p {

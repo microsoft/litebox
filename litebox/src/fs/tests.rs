@@ -41,7 +41,7 @@ use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemory, Sh
 use crate::fs::errors::{
     OpenError, PathError, ReadDirError, ReadError, RmdirError, UnlinkError, WriteError,
 };
-use crate::fs::{BrokerFile, Context, FileFd, OFlags};
+use crate::fs::{BrokerFile, Context, FileFd};
 use crate::platform::mock::MockPlatform;
 
 /// The handle the scripted broker hands out for every successful open.
@@ -433,7 +433,7 @@ fn context_resolves_paths_against_the_cwd() {
 }
 
 #[test]
-fn open_sends_the_resolved_path_and_translated_flags() {
+fn open_sends_the_resolved_path_and_protocol_options() {
     let mut context = Context::new();
     context.set_cwd(context.resolve("/work").unwrap());
     context.set_acting_user(FileUser { user: 7, group: 9 });
@@ -443,7 +443,8 @@ fn open_sends_the_resolved_path_and_translated_flags() {
         .open_file(
             &context,
             "sub/../file.txt",
-            OFlags::CREAT | OFlags::WRONLY | OFlags::APPEND,
+            FileAccessMode::WriteOnly,
+            FileOpenFlags::CREATE | FileOpenFlags::APPEND,
             FileMode::RWXU,
         )
         .expect("open should succeed");
@@ -462,6 +463,22 @@ fn open_sends_the_resolved_path_and_translated_flags() {
 }
 
 #[test]
+fn open_rejects_unknown_protocol_flags_before_the_broker() {
+    let (broker, fs) = scripted_fs([]);
+    assert!(matches!(
+        fs.open_file(
+            &Context::new(),
+            "/file",
+            FileAccessMode::ReadOnly,
+            FileOpenFlags::from_bits_retain(1 << 15),
+            FileMode::empty(),
+        ),
+        Err(OpenError::AccessNotAllowed)
+    ));
+    assert!(broker.calls().is_empty());
+}
+
+#[test]
 fn read_and_write_transfer_payloads_through_the_broker() {
     let context = Context::new();
     let (broker, fs) = scripted_fs([
@@ -472,7 +489,13 @@ fn read_and_write_transfer_payloads_through_the_broker() {
     ]);
 
     let fd = fs
-        .open_file(&context, "/file", OFlags::RDWR, FileMode::empty())
+        .open_file(
+            &context,
+            "/file",
+            FileAccessMode::ReadWrite,
+            FileOpenFlags::NONE,
+            FileMode::empty(),
+        )
         .expect("open should succeed");
 
     assert_eq!(fs.write_file(&fd, b"hello", None).unwrap(), 5);
@@ -522,7 +545,13 @@ fn closing_releases_the_broker_object_and_the_descriptor() {
     let (broker, fs) = scripted_fs([opened()]);
 
     let fd = fs
-        .open_file(&context, "/file", OFlags::RDONLY, FileMode::empty())
+        .open_file(
+            &context,
+            "/file",
+            FileAccessMode::ReadOnly,
+            FileOpenFlags::NONE,
+            FileMode::empty(),
+        )
         .expect("open should succeed");
     fs.close_file(&fd).expect("close should succeed");
     assert_eq!(broker.calls()[1], Call::Close(FILE_HANDLE));
@@ -545,7 +574,13 @@ fn closing_releases_the_broker_object_and_the_descriptor() {
 fn broker_file_descriptors_preserve_subsystem_and_duplicate_lifetimes() {
     let (broker, fs) = scripted_fs([opened(), Scripted::Read(b"broker".to_vec())]);
     let fd: FileFd = fs
-        .open_file(&Context::new(), "/file", OFlags::RDONLY, FileMode::empty())
+        .open_file(
+            &Context::new(),
+            "/file",
+            FileAccessMode::ReadOnly,
+            FileOpenFlags::NONE,
+            FileMode::empty(),
+        )
         .unwrap();
     let duplicate = fs.descriptor_table_mut().duplicate(&fd).unwrap();
     let mut raw_fds = crate::fd::RawDescriptorStorage::new();
@@ -583,8 +618,14 @@ fn in_flight_read_keeps_the_broker_file_alive_after_close() {
         },
     ]);
     let fd = Arc::new(
-        fs.open_file(&Context::new(), "/file", OFlags::RDONLY, FileMode::empty())
-            .expect("open should succeed"),
+        fs.open_file(
+            &Context::new(),
+            "/file",
+            FileAccessMode::ReadOnly,
+            FileOpenFlags::NONE,
+            FileMode::empty(),
+        )
+        .expect("open should succeed"),
     );
 
     let worker = fs.clone();
@@ -639,7 +680,13 @@ fn path_and_handle_status_preserve_protocol_metadata() {
 
     assert_eq!(status, expected);
     let fd = fs
-        .open_file(&context, "/dev/null", OFlags::RDONLY, FileMode::empty())
+        .open_file(
+            &context,
+            "/dev/null",
+            FileAccessMode::ReadOnly,
+            FileOpenFlags::NONE,
+            FileMode::empty(),
+        )
         .unwrap();
     assert_eq!(fs.file_status(&fd).unwrap(), expected);
     fs.close_file(&fd).unwrap();
@@ -709,7 +756,8 @@ fn read_dir_reassembles_paged_broker_entries() {
         .open_file(
             &context,
             "/dir",
-            OFlags::RDONLY | OFlags::DIRECTORY,
+            FileAccessMode::ReadOnly,
+            FileOpenFlags::DIRECTORY,
             FileMode::empty(),
         )
         .expect("open should succeed");
@@ -751,11 +799,23 @@ fn broker_file_errors_map_to_guest_errors() {
     ]);
 
     assert!(matches!(
-        fs.open_file(&context, "/missing", OFlags::RDONLY, FileMode::empty()),
+        fs.open_file(
+            &context,
+            "/missing",
+            FileAccessMode::ReadOnly,
+            FileOpenFlags::NONE,
+            FileMode::empty(),
+        ),
         Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
     ));
     assert!(matches!(
-        fs.open_file(&context, "/secret", OFlags::RDONLY, FileMode::empty()),
+        fs.open_file(
+            &context,
+            "/secret",
+            FileAccessMode::ReadOnly,
+            FileOpenFlags::NONE,
+            FileMode::empty(),
+        ),
         Err(OpenError::AccessNotAllowed)
     ));
     assert!(matches!(
@@ -768,7 +828,13 @@ fn broker_file_errors_map_to_guest_errors() {
     ));
 
     let fd = fs
-        .open_file(&context, "/file", OFlags::WRONLY, FileMode::empty())
+        .open_file(
+            &context,
+            "/file",
+            FileAccessMode::WriteOnly,
+            FileOpenFlags::NONE,
+            FileMode::empty(),
+        )
         .expect("open should succeed");
     let mut buffer = [0; 4];
     assert!(matches!(

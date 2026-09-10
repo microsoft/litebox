@@ -1402,7 +1402,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let full_path = self.resolve_path(&path)?;
             let file = self.do_open(
                 full_path,
-                litebox::fs::OFlags::RDONLY,
+                litebox_common_linux::OFlags::RDONLY,
                 litebox_broker_protocol::fs::FileMode::empty(),
             )?;
             let mut header = [0u8; SHEBANG_MAX_LINE];

@@ -28,9 +28,11 @@ use litebox::{
     sync::futex::FutexManager,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _},
 };
-use litebox_broker_protocol::fs::{FileMode as Mode, FileSeekWhence as SeekWhence};
+use litebox_broker_protocol::fs::{
+    FileAccessMode, FileMode as Mode, FileOpenFlags, FileSeekWhence as SeekWhence,
+};
 use litebox_common_linux::{
-    SyscallRequest,
+    OFlags, SyscallRequest,
     errno::Errno,
     user_pointers::{UserPtr, UserPtrMut},
 };
@@ -359,7 +361,7 @@ impl<Platform: ShimPlatform> LinuxShimProcess<Platform> {
 
 // Special override so that `GETFL` can return stdio-specific flags
 #[derive(Clone)]
-pub(crate) struct StdioStatusFlags(litebox::fs::OFlags);
+pub(crate) struct StdioStatusFlags(OFlags);
 
 impl<Platform: ShimPlatform> syscalls::file::FilesState<Platform> {
     fn initialize_stdio_in_shared_descriptors_table(
@@ -367,18 +369,35 @@ impl<Platform: ShimPlatform> syscalls::file::FilesState<Platform> {
         global: &GlobalState<Platform>,
         context: &litebox::fs::Context,
     ) {
-        use litebox::fs::OFlags;
         let stdin = self
             .fs
-            .open_file(context, "/dev/stdin", OFlags::RDONLY, Mode::empty())
+            .open_file(
+                context,
+                "/dev/stdin",
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::NONE,
+                Mode::empty(),
+            )
             .unwrap();
         let stdout = self
             .fs
-            .open_file(context, "/dev/stdout", OFlags::WRONLY, Mode::empty())
+            .open_file(
+                context,
+                "/dev/stdout",
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::NONE,
+                Mode::empty(),
+            )
             .unwrap();
         let stderr = self
             .fs
-            .open_file(context, "/dev/stderr", OFlags::WRONLY, Mode::empty())
+            .open_file(
+                context,
+                "/dev/stderr",
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::NONE,
+                Mode::empty(),
+            )
             .unwrap();
         let mut dt = global.litebox.descriptor_table_mut();
         let mut rds = self.raw_descriptor_store.write();

@@ -12,11 +12,10 @@ use core::num::NonZero;
 use litebox::{
     event::{IOPollable, wait::WaitContext},
     fd::MetadataError,
-    fs::OFlags,
     pipes::{Flags, HalfPipeType, PipeFd},
 };
 use litebox_broker_protocol::fs::FileMode as Mode;
-use litebox_common_linux::{FileDescriptorFlags, InodeType, errno::Errno};
+use litebox_common_linux::{FileDescriptorFlags, InodeType, OFlags, errno::Errno};
 
 use crate::{GlobalState, ShimPlatform};
 

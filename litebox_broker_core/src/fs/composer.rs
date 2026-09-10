@@ -10,10 +10,10 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use litebox_broker_protocol::fs::{
-    FileDirectoryEntry, FileMode as Mode, FileNodeInfo, FileStatus, FileType, FileUser as UserInfo,
+    FileAccessMode, FileDirectoryEntry, FileMode as Mode, FileNodeInfo, FileOpenFlags, FileStatus,
+    FileType, FileUser as UserInfo,
 };
 
-use super::OFlags;
 use super::backend::{
     Backend, BackendHandles, CreationMetadata, DirHandle, FileHandle, HandleRef, PermissionCheck,
     Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkedComponent, WalkingDirHandle,
@@ -546,7 +546,8 @@ impl Backend for Composer {
     fn owned_dir_at(
         &self,
         dir: WalkingDirHandle<'_>,
-        flags: OFlags,
+        access: FileAccessMode,
+        flags: FileOpenFlags,
     ) -> Result<DirHandle, OpenError> {
         let dir = dir.into_typed::<Self>();
         let inner = match dir.inner {
@@ -562,7 +563,7 @@ impl Backend for Composer {
                 mount_index,
                 handle: self.mounts[mount_index]
                     .backend
-                    .owned_dir_at(handle, flags)?,
+                    .owned_dir_at(handle, access, flags)?,
             },
         };
         Ok(DirHandle::from_typed::<Self>(ComposerDirHandle { inner }))
@@ -598,7 +599,8 @@ impl Backend for Composer {
         &self,
         dir: WalkingDirHandle<'_>,
         name: &str,
-        flags: OFlags,
+        access: FileAccessMode,
+        flags: FileOpenFlags,
     ) -> Result<Permissioned<FileHandle>, OpenError> {
         let dir = dir.into_typed::<Self>();
         match dir.inner {
@@ -617,7 +619,7 @@ impl Backend for Composer {
                 )?;
                 self.mounts[mount_index]
                     .backend
-                    .open_file_at(handle, name, flags)
+                    .open_file_at(handle, name, access, flags)
                     .map(|file| Permissioned {
                         item: FileHandle::from_typed::<Self>(ComposerFileHandle {
                             mount_index,

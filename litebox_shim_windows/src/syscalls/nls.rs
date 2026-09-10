@@ -5,12 +5,11 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::mem::size_of;
-use litebox::fs::OFlags;
 use litebox::fs::errors::{FileStatusError, OpenError, PathError, ReadError};
 use litebox::mm::linux::{CreatePagesFlags, MappingError, NonZeroPageSize};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider};
 use litebox::utils::TruncateExt as _;
-use litebox_broker_protocol::fs::{FileMode as Mode, FileType};
+use litebox_broker_protocol::fs::{FileAccessMode, FileMode as Mode, FileOpenFlags, FileType};
 use litebox_common_windows::loader::PAGE_SIZE;
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -777,7 +776,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .open_file(
                 &self.fs_context,
                 path.as_str(),
-                OFlags::RDONLY,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::NONE,
                 Mode::empty(),
             )
             .map_err(map_nls_open_error)?;

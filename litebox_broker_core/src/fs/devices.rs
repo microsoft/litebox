@@ -9,12 +9,12 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use litebox_broker_protocol::fs::{
-    FileDirectoryEntry, FileMode as Mode, FileNodeInfo, FileStatus, FileType, FileUser as UserInfo,
+    FileAccessMode, FileDirectoryEntry, FileMode as Mode, FileNodeInfo, FileOpenFlags, FileStatus,
+    FileType, FileUser as UserInfo,
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::stdio::StdioOutputStream;
 
-use super::OFlags;
 use super::backend::{
     Backend, BackendHandles, CreationMetadata, DeviceIo, DirHandle, FileHandle, HandleRef,
     PermissionCheck, Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkingDirHandle,
@@ -183,7 +183,8 @@ impl Backend for Devices {
     fn owned_dir_at(
         &self,
         dir: WalkingDirHandle<'_>,
-        _flags: OFlags,
+        _access: FileAccessMode,
+        _flags: FileOpenFlags,
     ) -> Result<DirHandle, OpenError> {
         Ok(DirHandle::from_typed::<Self>(dir.into_typed::<Self>()))
     }
@@ -198,16 +199,17 @@ impl Backend for Devices {
         &self,
         dir: WalkingDirHandle<'_>,
         name: &str,
-        flags: OFlags,
+        _access: FileAccessMode,
+        flags: FileOpenFlags,
     ) -> Result<Permissioned<FileHandle>, OpenError> {
         let _dir = dir.into_typed::<Self>();
         let device = Device::from_name(name)
             .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
 
-        if flags.contains(OFlags::DIRECTORY) {
+        if flags.contains(FileOpenFlags::DIRECTORY) {
             return Err(OpenError::PathError(PathError::ComponentNotADirectory));
         }
-        if flags.contains(OFlags::NONBLOCK)
+        if flags.contains(FileOpenFlags::NONBLOCKING)
             && matches!(
                 device,
                 Device::Stdin | Device::Stdout | Device::Stderr | Device::URandom
@@ -216,7 +218,7 @@ impl Backend for Devices {
             unimplemented!("Non-blocking I/O is not yet supported for {:?}", device);
         }
 
-        if flags.contains(OFlags::TRUNC) {
+        if flags.contains(FileOpenFlags::TRUNCATE) {
             // Note: matching Linux behavior, this does not actually perform any truncation, and
             // instead, it is silently ignored if you attempt to truncate upon opening stdio.
             debug_assert!(matches!(
@@ -375,7 +377,12 @@ mod tests {
     fn urandom_requires_broker_only_for_nonempty_reads() {
         let devices = Devices::new(InodeAllocator::standalone());
         let urandom = devices
-            .open_file_at(devices.root(), "urandom", OFlags::RDONLY)
+            .open_file_at(
+                devices.root(),
+                "urandom",
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+            )
             .unwrap()
             .item;
 

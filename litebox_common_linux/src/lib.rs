@@ -6,13 +6,10 @@
 #![no_std]
 #![allow(non_camel_case_types)]
 
-use core::ffi::c_char;
+use core::ffi::{c_char, c_uint};
 use core::time::Duration;
 use int_enum::IntEnum;
-use litebox::{
-    fs::OFlags,
-    utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
-};
+use litebox::utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _};
 use litebox_broker_protocol::fs::{FileMode, FileNodeInfo, FileStatus, FileType, FileUser};
 use syscalls::Sysno;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
@@ -60,6 +57,103 @@ pub const CLOCK_MONOTONIC_COARSE: i32 = 6;
 /// Special value `libc::AT_FDCWD` used to indicate openat should use
 /// the current working directory.
 pub const AT_FDCWD: i32 = -100;
+
+bitflags::bitflags! {
+    /// `O_*` constants for use with open, ...
+    #[repr(transparent)]
+    #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+    pub struct OFlags: c_uint {
+        /// `O_RDONLY`: read-only
+        const RDONLY = 0x0;
+        /// `O_WRONLY`: write-only
+        const WRONLY = 0x1;
+        /// `O_RDWR`: read/write.
+        ///
+        /// This is not equal to `RDONLY | WRONLY`. It's a distinct flag.
+        const RDWR = 0x2;
+        /// `O_APPEND`: append mode
+        const APPEND = 0x400;
+        /// `O_ASYNC`: signal-driven I/O
+        const ASYNC = 0x2000;
+        /// `O_CLOEXEC`: close-on-exec flag
+        const CLOEXEC = 0x80000;
+        /// `O_CREAT`: if path does not exist, create it as a regular file
+        const CREAT = 0x40;
+        /// `O_DIRECT`: try to minimize cache effects of I/O
+        #[cfg(target_arch = "x86_64")]
+        const DIRECT = 0x4000;
+        #[cfg(target_arch = "aarch64")]
+        const DIRECT = 0x10000;
+        /// `O_DIRECTORY`: fail if not a directory
+        #[cfg(target_arch = "x86_64")]
+        const DIRECTORY = 0x10000;
+        #[cfg(target_arch = "aarch64")]
+        const DIRECTORY = 0x4000;
+        /// `O_DSYNC`: write operations on the file will complete according to the requirements of
+        /// synchronized I/O *data* integrity completion.
+        const DSYNC = 0x1000;
+        /// `O_EXCL`: exclusive use
+        const EXCL = 0x80;
+        /// `O_LARGEFILE`: allow large file support
+        #[cfg(target_arch = "x86_64")]
+        const LARGEFILE = 0x8000;
+        #[cfg(target_arch = "aarch64")]
+        const LARGEFILE = 0x20000;
+        /// `O_NOATIME`: do not update access time
+        const NOATIME = 0x40000;
+        /// `O_NOCTTY`: do not assign controlling terminal
+        const NOCTTY = 0x100;
+        /// `O_NOFOLLOW`: fail if the path does not point to a regular file
+        #[cfg(target_arch = "x86_64")]
+        const NOFOLLOW = 0x20000;
+        #[cfg(target_arch = "aarch64")]
+        const NOFOLLOW = 0x8000;
+        /// `O_NDELAY`: non-blocking mode (same as NONBLOCK)
+        const NDELAY = 0x800;
+        /// `O_NONBLOCK`: non-blocking mode (same as NDELAY)
+        const NONBLOCK = 0x800;
+        /// `O_PATH`: open a file descriptor for path resolution only
+        const PATH = 0x200000;
+        /// `O_SYNC`: write operations on the file will complete according to the requirements of
+        /// synchronized I/O file integrity completion (by contrast with the synchronized I/O data
+        /// integrity completion provided by `O_DSYNC`.)
+        const SYNC = 0x101000;
+        /// `O_TMPFILE`: create an unnamed temporary file
+        #[cfg(target_arch = "x86_64")]
+        const TMPFILE = 0x410000;
+        #[cfg(target_arch = "aarch64")]
+        const TMPFILE = 0x404000;
+        /// `O_TRUNC`: truncate the file to zero length
+        const TRUNC = 0x200;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+
+        /// All file status flags + access modes
+        const STATUS_FLAGS_MASK = Self::APPEND.bits()
+            | Self::NONBLOCK.bits()
+            | Self::DSYNC.bits()
+            | Self::ASYNC.bits()
+            | Self::DIRECT.bits()
+            | Self::LARGEFILE.bits()
+            | Self::NOATIME.bits()
+            | Self::SYNC.bits()
+            | Self::PATH.bits()
+            | Self::RDONLY.bits()
+            | Self::WRONLY.bits()
+            | Self::RDWR.bits();
+    }
+}
+
+impl From<litebox::pipes::Flags> for OFlags {
+    fn from(flags: litebox::pipes::Flags) -> Self {
+        let mut oflags = OFlags::empty();
+        oflags.set(
+            OFlags::NONBLOCK,
+            flags.contains(litebox::pipes::Flags::NON_BLOCKING),
+        );
+        oflags
+    }
+}
 
 /// Encoding for ioctl commands.
 pub mod ioctl {
@@ -683,8 +777,8 @@ bitflags::bitflags! {
     #[derive(Debug, Clone, Copy)]
     pub struct EfdFlags: core::ffi::c_uint {
         const SEMAPHORE = 1;
-        const CLOEXEC = litebox::fs::OFlags::CLOEXEC.bits();
-        const NONBLOCK = litebox::fs::OFlags::NONBLOCK.bits();
+        const CLOEXEC = OFlags::CLOEXEC.bits();
+        const NONBLOCK = OFlags::NONBLOCK.bits();
         /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
         const _ = !0;
     }
@@ -1435,7 +1529,7 @@ pub struct RobustListHead {
 bitflags::bitflags! {
     #[derive(Debug)]
     pub struct EpollCreateFlags: core::ffi::c_uint {
-        const EPOLL_CLOEXEC = litebox::fs::OFlags::CLOEXEC.bits();
+        const EPOLL_CLOEXEC = OFlags::CLOEXEC.bits();
         /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
         const _ = !0;
     }
@@ -2118,7 +2212,7 @@ pub enum SyscallRequest {
     Dup {
         oldfd: i32,
         newfd: Option<i32>,
-        flags: Option<litebox::fs::OFlags>,
+        flags: Option<OFlags>,
     },
     Socket {
         domain: u32,
@@ -2279,7 +2373,7 @@ pub enum SyscallRequest {
     Openat {
         dirfd: i32,
         pathname: UserPtr<c_char>,
-        flags: litebox::fs::OFlags,
+        flags: OFlags,
         mode: FileMode,
     },
     Ftruncate {
@@ -2309,7 +2403,7 @@ pub enum SyscallRequest {
     },
     Pipe2 {
         pipefd: UserPtrMut<u32>,
-        flags: litebox::fs::OFlags,
+        flags: OFlags,
     },
     Clone {
         args: CloneArgs,
@@ -2624,7 +2718,7 @@ impl SyscallRequest {
             },
             Sysno::faccessat2 => sys_req!(Faccessat { dirfd, pathname:*, mode, flags }),
             #[cfg(target_arch = "x86_64")]
-            Sysno::pipe => sys_req!(Pipe2 { pipefd:*, flags: { litebox::fs::OFlags::empty() } }),
+            Sysno::pipe => sys_req!(Pipe2 { pipefd:*, flags: { OFlags::empty() } }),
             Sysno::pipe2 => sys_req!(Pipe2 { pipefd:* ,flags }),
             Sysno::madvise => sys_req!(Madvise { addr:*, length, behavior:? }),
             Sysno::dup => SyscallRequest::Dup {
@@ -2869,9 +2963,7 @@ impl SyscallRequest {
                 SyscallRequest::Openat {
                     dirfd: AT_FDCWD,
                     pathname: ctx.sys_req_ptr(0),
-                    flags: litebox::fs::OFlags::CREAT
-                        | litebox::fs::OFlags::WRONLY
-                        | litebox::fs::OFlags::TRUNC,
+                    flags: OFlags::CREAT | OFlags::WRONLY | OFlags::TRUNC,
                     mode: ctx.sys_req_arg(1),
                 }
             }
@@ -3419,7 +3511,7 @@ reinterpret_truncated_from_usize_for! {
         MRemapFlags,
         AccessFlags,
         FileMode,
-        litebox::fs::OFlags,
+        OFlags,
         AtFlags,
         SockFlags,
         SendFlags,
@@ -3475,6 +3567,96 @@ impl<T> ReinterpretUsizeAsPtr<core::marker::PhantomData<(bool, T)>> for Option<U
         } else {
             Some(UserPtrMut::from_usize(v))
         }
+    }
+}
+
+#[cfg(test)]
+mod open_flags_tests {
+    use super::*;
+
+    #[test]
+    fn open_flags_match_linux_abi() {
+        assert_eq!(
+            core::mem::size_of::<OFlags>(),
+            core::mem::size_of::<c_uint>()
+        );
+        for (flag, bits) in [
+            (OFlags::RDONLY, 0),
+            (OFlags::WRONLY, 0x1),
+            (OFlags::RDWR, 0x2),
+            (OFlags::CREAT, 0x40),
+            (OFlags::EXCL, 0x80),
+            (OFlags::NOCTTY, 0x100),
+            (OFlags::TRUNC, 0x200),
+            (OFlags::APPEND, 0x400),
+            (OFlags::NDELAY, 0x800),
+            (OFlags::NONBLOCK, 0x800),
+            (OFlags::DSYNC, 0x1000),
+            (OFlags::ASYNC, 0x2000),
+            (OFlags::NOATIME, 0x40000),
+            (OFlags::CLOEXEC, 0x80000),
+            (OFlags::SYNC, 0x101000),
+            (OFlags::PATH, 0x200000),
+        ] {
+            assert_eq!(flag.bits(), bits, "{flag:?}");
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert_eq!(OFlags::DIRECT.bits(), 0x4000);
+            assert_eq!(OFlags::DIRECTORY.bits(), 0x10000);
+            assert_eq!(OFlags::LARGEFILE.bits(), 0x8000);
+            assert_eq!(OFlags::NOFOLLOW.bits(), 0x20000);
+            assert_eq!(OFlags::TMPFILE.bits(), 0x410000);
+            assert_eq!(OFlags::STATUS_FLAGS_MASK.bits(), 0x34fc03);
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert_eq!(OFlags::DIRECT.bits(), 0x10000);
+            assert_eq!(OFlags::DIRECTORY.bits(), 0x4000);
+            assert_eq!(OFlags::LARGEFILE.bits(), 0x20000);
+            assert_eq!(OFlags::NOFOLLOW.bits(), 0x8000);
+            assert_eq!(OFlags::TMPFILE.bits(), 0x404000);
+            assert_eq!(OFlags::STATUS_FLAGS_MASK.bits(), 0x373c03);
+        }
+        assert_eq!(EfdFlags::CLOEXEC.bits(), OFlags::CLOEXEC.bits());
+        assert_eq!(EfdFlags::NONBLOCK.bits(), OFlags::NONBLOCK.bits());
+        assert_eq!(SockFlags::CLOEXEC.bits(), OFlags::CLOEXEC.bits());
+        assert_eq!(SockFlags::NONBLOCK.bits(), OFlags::NONBLOCK.bits());
+        assert_eq!(
+            EpollCreateFlags::EPOLL_CLOEXEC.bits(),
+            OFlags::CLOEXEC.bits()
+        );
+    }
+
+    #[test]
+    fn open_flags_preserve_unknown_bits_in_linux_argument_decoding() {
+        let bits = 0x8000_0000 | OFlags::NONBLOCK.bits() | 3;
+        assert_eq!(OFlags::from_bits(bits).unwrap().bits(), bits);
+        assert_eq!(OFlags::from_bits_truncate(bits).bits(), bits);
+        assert_eq!(
+            OFlags::reinterpret_truncated_from_usize(bits as usize).bits(),
+            bits
+        );
+        let Some(FcntlArg::SETFL(flags)) = FcntlArg::try_from(F_SETFL, bits as usize) else {
+            panic!("F_SETFL must retain unknown Linux flags");
+        };
+        assert_eq!(flags.bits(), bits);
+    }
+
+    #[test]
+    fn pipe_flags_translate_only_nonblocking_status() {
+        assert_eq!(
+            OFlags::from(litebox::pipes::Flags::empty()),
+            OFlags::empty()
+        );
+        assert_eq!(
+            OFlags::from(litebox::pipes::Flags::NON_BLOCKING),
+            OFlags::NONBLOCK
+        );
+        assert_eq!(
+            OFlags::from(litebox::pipes::Flags::from_bits_retain(u32::MAX)),
+            OFlags::NONBLOCK
+        );
     }
 }
 

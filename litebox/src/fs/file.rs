@@ -5,16 +5,13 @@
 
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
-use alloc::vec;
 use alloc::vec::Vec;
-use bitflags::bitflags;
-use core::ffi::c_uint;
 
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileDirectoryEntry, FileError, FileMode as Mode, FileOpenFlags,
-    FileSeekWhence as SeekWhence, FileStatus, FileUser as UserInfo,
+    FileSeekWhence as SeekWhence, FileStatus, FileUser as UserInfo, ResolvedPath,
 };
 
 use crate::path::Arg;
@@ -24,92 +21,6 @@ use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
     ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
 };
-
-bitflags! {
-    /// `O_*` constants for use with open, ...
-    #[repr(transparent)]
-    #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
-    pub struct OFlags: c_uint {
-        /// `O_RDONLY`: read-only
-        const RDONLY = 0x0;
-        /// `O_WRONLY`: write-only
-        const WRONLY = 0x1;
-        /// `O_RDWR`: read/write.
-        ///
-        /// This is not equal to `RDONLY | WRONLY`. It's a distinct flag.
-        const RDWR = 0x2;
-        /// `O_APPEND`: append mode
-        const APPEND = 0x400;
-        /// `O_ASYNC`: signal-driven I/O
-        const ASYNC = 0x2000;
-        /// `O_CLOEXEC`: close-on-exec flag
-        const CLOEXEC = 0x80000;
-        /// `O_CREAT`: if path does not exist, create it as a regular file
-        const CREAT = 0x40;
-        /// `O_DIRECT`: try to minimize cache effects of I/O
-        #[cfg(target_arch = "x86_64")]
-        const DIRECT = 0x4000;
-        #[cfg(target_arch = "aarch64")]
-        const DIRECT = 0x10000;
-        /// `O_DIRECTORY`: fail if not a directory
-        #[cfg(target_arch = "x86_64")]
-        const DIRECTORY = 0x10000;
-        #[cfg(target_arch = "aarch64")]
-        const DIRECTORY = 0x4000;
-        /// `O_DSYNC`: write operations on the file will complete according to the requirements of
-        /// synchronized I/O *data* integrity completion.
-        const DSYNC = 0x1000;
-        /// `O_EXCL`: exclusive use
-        const EXCL = 0x80;
-        /// `O_LARGEFILE`: allow large file support
-        #[cfg(target_arch = "x86_64")]
-        const LARGEFILE = 0x8000;
-        #[cfg(target_arch = "aarch64")]
-        const LARGEFILE = 0x20000;
-        /// `O_NOATIME`: do not update access time
-        const NOATIME = 0x40000;
-        /// `O_NOCTTY`: do not assign controlling terminal
-        const NOCTTY = 0x100;
-        /// `O_NOFOLLOW`: fail if the path does not point to a regular file
-        #[cfg(target_arch = "x86_64")]
-        const NOFOLLOW = 0x20000;
-        #[cfg(target_arch = "aarch64")]
-        const NOFOLLOW = 0x8000;
-        /// `O_NDELAY`: non-blocking mode (same as NONBLOCK)
-        const NDELAY = 0x800;
-        /// `O_NONBLOCK`: non-blocking mode (same as NDELAY)
-        const NONBLOCK = 0x800;
-        /// `O_PATH`: open a file descriptor for path resolution only
-        const PATH = 0x200000;
-        /// `O_SYNC`: write operations on the file will complete according to the requirements of
-        /// synchronized I/O file integrity completion (by contrast with the synchronized I/O data
-        /// integrity completion provided by `O_DSYNC`.)
-        const SYNC = 0x101000;
-        /// `O_TMPFILE`: create an unnamed temporary file
-        #[cfg(target_arch = "x86_64")]
-        const TMPFILE = 0x410000;
-        #[cfg(target_arch = "aarch64")]
-        const TMPFILE = 0x404000;
-        /// `O_TRUNC`: truncate the file to zero length
-        const TRUNC = 0x200;
-        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
-        const _ = !0;
-
-        /// All file status flags + access modes
-        const STATUS_FLAGS_MASK = Self::APPEND.bits()
-            | Self::NONBLOCK.bits()
-            | Self::DSYNC.bits()
-            | Self::ASYNC.bits()
-            | Self::DIRECT.bits()
-            | Self::LARGEFILE.bits()
-            | Self::NOATIME.bits()
-            | Self::SYNC.bits()
-            | Self::PATH.bits()
-            | Self::RDONLY.bits()
-            | Self::WRONLY.bits()
-            | Self::RDWR.bits();
-    }
-}
 
 impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
     fn broker_file(&self, fd: &FileFd) -> Option<Arc<BrokerFile>> {
@@ -123,16 +34,20 @@ impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
 
     /// Opens a file.
     ///
+    /// `access` and `flags` use the architecture-independent broker contract.
     /// The `mode` is only significant when creating a file.
     pub fn open_file(
         &self,
         context: &Context,
         path: impl Arg,
-        flags: OFlags,
+        access: FileAccessMode,
+        flags: FileOpenFlags,
         mode: Mode,
     ) -> Result<FileFd, OpenError> {
         let path = Self::broker_path(context, path)?;
-        let (access, flags) = file_open_options(flags)?;
+        if FileOpenFlags::from_bits(flags.bits()).is_none() {
+            return Err(OpenError::AccessNotAllowed);
+        }
         let broker = self.broker_control().ok_or(OpenError::Io)?;
         let handle = broker
             .open_file(
@@ -381,7 +296,7 @@ impl Context {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            cwd: Arc::new(ResolvedPath { components: vec![] }),
+            cwd: Arc::new(ResolvedPath::root()),
             user_info: UserInfo {
                 user: 1000,
                 group: 1000,
@@ -391,45 +306,13 @@ impl Context {
 
     /// Resolve `path` against the current context.
     pub fn resolve(&self, path: impl Arg) -> Result<ResolvedPath, PathError> {
-        let mut components = if path.as_rust_str()?.starts_with('/') {
-            vec![]
-        } else {
-            self.cwd.components.clone()
-        };
-        for component in path.components()? {
-            match component {
-                "" | "." => {}
-                ".." => {
-                    let _ = components.pop();
-                }
-                _ => components.push(component.into()),
-            }
-        }
-        Ok(ResolvedPath { components })
+        Ok(self.cwd.resolve(path.as_rust_str()?))
     }
 }
 
 impl Default for Context {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// Absolute normalized path, created from [`Context::resolve`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ResolvedPath {
-    components: Vec<String>,
-}
-
-impl core::fmt::Display for ResolvedPath {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        for component in &self.components {
-            write!(formatter, "/{component}")?;
-        }
-        if self.components.is_empty() {
-            formatter.write_str("/")?;
-        }
-        Ok(())
     }
 }
 
@@ -446,50 +329,6 @@ impl Drop for BrokerFile {
     fn drop(&mut self) {
         let _ = self.broker.close_object(self.handle);
     }
-}
-
-fn file_open_options(flags: OFlags) -> Result<(FileAccessMode, FileOpenFlags), OpenError> {
-    const SUPPORTED_FLAGS: OFlags = OFlags::CREAT
-        .union(OFlags::RDONLY)
-        .union(OFlags::WRONLY)
-        .union(OFlags::RDWR)
-        .union(OFlags::TRUNC)
-        .union(OFlags::NOCTTY)
-        .union(OFlags::EXCL)
-        .union(OFlags::DIRECTORY)
-        .union(OFlags::NONBLOCK)
-        .union(OFlags::LARGEFILE)
-        .union(OFlags::NOFOLLOW)
-        .union(OFlags::APPEND)
-        .union(OFlags::PATH);
-
-    if flags.intersects(SUPPORTED_FLAGS.complement()) {
-        unimplemented!("{flags:?}")
-    }
-    let access = match flags.bits() & 3 {
-        0 => FileAccessMode::ReadOnly,
-        1 => FileAccessMode::WriteOnly,
-        2 => FileAccessMode::ReadWrite,
-        _ => return Err(OpenError::AccessNotAllowed),
-    };
-    let mut output = FileOpenFlags::NONE;
-    for (guest, broker) in [
-        (OFlags::CREAT, FileOpenFlags::CREATE),
-        (OFlags::TRUNC, FileOpenFlags::TRUNCATE),
-        (OFlags::NOCTTY, FileOpenFlags::NO_CONTROLLING_TERMINAL),
-        (OFlags::EXCL, FileOpenFlags::EXCLUSIVE),
-        (OFlags::DIRECTORY, FileOpenFlags::DIRECTORY),
-        (OFlags::NONBLOCK, FileOpenFlags::NONBLOCKING),
-        (OFlags::LARGEFILE, FileOpenFlags::LARGE_FILE),
-        (OFlags::NOFOLLOW, FileOpenFlags::NO_FOLLOW),
-        (OFlags::APPEND, FileOpenFlags::APPEND),
-        (OFlags::PATH, FileOpenFlags::PATH),
-    ] {
-        if flags.contains(guest) {
-            output = output.union(broker);
-        }
-    }
-    Ok((access, output))
 }
 
 fn broker_fd_error<T>(error: crate::broker::error::BrokerControlError, closed: T, io: T) -> T {

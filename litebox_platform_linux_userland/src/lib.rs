@@ -14,14 +14,13 @@ use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::time::Duration;
 use std::unimplemented;
 
-use litebox::fs::OFlags;
 use litebox::platform::RawConstPointer as _;
 use litebox::platform::page_mgmt::{
     CowAllocationError, FixedAddressBehavior, MemoryRegionPermissions,
 };
 use litebox::shim::ContinueOperation;
 use litebox::utils::{ReinterpretSignedExt, ReinterpretUnsignedExt as _, TruncateExt};
-use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, vmap::VmapManager};
+use litebox_common_linux::{MRemapFlags, MapFlags, OFlags, ProtFlags, vmap::VmapManager};
 use litebox_platform::sync::{
     ImmediatelyWokenUp, RawMutex as RawMutexTrait, RawMutexProvider, UnblockedOrTimedOut,
     WaitWakerProvider,
@@ -2862,7 +2861,7 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::thread::sleep;
 
-    use litebox::fs::OFlags;
+    use litebox_common_linux::OFlags;
     use litebox_platform::sync::RawMutex;
 
     use crate::LinuxUserland;

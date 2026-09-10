@@ -10,13 +10,12 @@ use core::{
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox::utils::TruncateExt as _;
 use litebox::{
-    fs::OFlags,
     mm::linux::{
         CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, VmemProtectError,
     },
     platform::RawPointerProvider,
 };
-use litebox_broker_protocol::fs::FileMode as Mode;
+use litebox_broker_protocol::fs::{FileAccessMode, FileMode as Mode, FileOpenFlags};
 use litebox_common_windows::loader::{
     AccessMemory, Fault, KiUserInvertedFunctionTableEntry, KiUserInvertedFunctionTableHeader,
     MAXIMUM_INVERTED_FUNCTION_TABLE_SIZE, MapMemory, MappingInfo, PAGE_SIZE, PeExportError,
@@ -1115,7 +1114,8 @@ impl<Platform: crate::ShimPlatform> PeImageFile<Platform> {
         let fd = fs.open_file(
             &litebox::fs::Context::new(),
             path,
-            OFlags::RDONLY,
+            FileAccessMode::ReadOnly,
+            FileOpenFlags::NONE,
             Mode::empty(),
         )?;
         Ok(Self { fs, fd })

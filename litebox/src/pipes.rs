@@ -28,7 +28,6 @@ use crate::{
         polling::{Pollee, TryOpError},
         wait::{WaitContext, WaitError},
     },
-    fs::OFlags,
     sync::RawSyncPrimitivesProvider,
 };
 
@@ -75,7 +74,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
             broker,
             self.litebox.broker_pollable_registry(),
             capacity,
-            OFlags::from(flags),
+            flags & Flags::all(),
             atomic_slice_guarantee_size,
         )?;
         let mut dt = self.litebox.descriptor_table_mut();
@@ -160,7 +159,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
             .ok_or(errors::ClosedError::ClosedFd)?
             .entry
             .0;
-        Ok(Flags::from_oflags_truncate(p.get_status()))
+        Ok(p.get_status())
     }
 
     /// Update the flags set on the pipe at `fd`.
@@ -178,7 +177,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
             .ok_or(errors::ClosedError::ClosedFd)?
             .entry
             .0;
-        p.set_status(OFlags::from(mask), on);
+        p.set_status(mask & Flags::all(), on);
         Ok(())
     }
 
@@ -215,21 +214,6 @@ bitflags::bitflags! {
         /// `NON_BLOCKING` impacts what happens when a full channel is written, or an empty channel
         /// is read from. If set, the operations returns immediately with a `WouldBlock` error.
         const NON_BLOCKING = 0x1;
-    }
-}
-
-impl Flags {
-    fn from_oflags_truncate(oflags: OFlags) -> Self {
-        let mut flags = Flags::empty();
-        flags.set(Flags::NON_BLOCKING, oflags.contains(OFlags::NONBLOCK));
-        flags
-    }
-}
-impl From<Flags> for OFlags {
-    fn from(flags: Flags) -> Self {
-        let mut oflags = OFlags::empty();
-        oflags.set(OFlags::NONBLOCK, flags.contains(Flags::NON_BLOCKING));
-        oflags
     }
 }
 
@@ -367,7 +351,7 @@ fn new_broker_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider>(
     broker: Arc<dyn BrokerControl>,
     pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
     capacity: usize,
-    flags: OFlags,
+    flags: Flags,
     atomic_slice_guarantee_size: Option<NonZeroUsize>,
 ) -> Result<(Arc<BrokerPipeEnd<Platform>>, Arc<BrokerPipeEnd<Platform>>), errors::CreateError> {
     let atomic_write_size = atomic_slice_guarantee_size
@@ -395,7 +379,7 @@ fn new_broker_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider>(
         pollee: Arc::new(Pollee::new()),
         peer: Weak::new(),
         endpoint_type: HalfPipeType::SenderHalf,
-        status: AtomicU32::new((flags | OFlags::WRONLY).bits()),
+        status: AtomicU32::new(flags.bits()),
     });
     let reader = Arc::new_cyclic(|weak_reader| {
         Arc::get_mut(&mut writer)
@@ -408,7 +392,7 @@ fn new_broker_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider>(
             pollee: Arc::new(Pollee::new()),
             peer: Arc::downgrade(&writer),
             endpoint_type: HalfPipeType::ReceiverHalf,
-            status: AtomicU32::new((flags | OFlags::RDONLY).bits()),
+            status: AtomicU32::new(flags.bits()),
         }
     });
 
@@ -418,11 +402,11 @@ fn new_broker_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider>(
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerPipeEnd<Platform> {
-    fn get_status(&self) -> OFlags {
-        OFlags::from_bits(self.status.load(Relaxed)).unwrap() & OFlags::STATUS_FLAGS_MASK
+    fn get_status(&self) -> Flags {
+        Flags::from_bits(self.status.load(Relaxed)).expect("pipe status contains only pipe flags")
     }
 
-    fn set_status(&self, mask: OFlags, on: bool) {
+    fn set_status(&self, mask: Flags, on: bool) {
         if on {
             self.status.fetch_or(mask.bits(), Relaxed);
         } else {
@@ -442,7 +426,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerPipeEnd<Platform>
         self.pollee
             .wait(
                 cx,
-                self.get_status().contains(OFlags::NONBLOCK),
+                self.get_status().contains(Flags::NON_BLOCKING),
                 Events::IN,
                 || {
                     let data = self
@@ -468,7 +452,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerPipeEnd<Platform>
         if buf.is_empty() {
             return Ok(0);
         }
-        let nonblock = self.get_status().contains(OFlags::NONBLOCK);
+        let nonblock = self.get_status().contains(Flags::NON_BLOCKING);
         if nonblock {
             let data = &buf[..buf.len().min(MAX_PIPE_TRANSFER_SIZE as usize)];
             return self
@@ -603,6 +587,53 @@ mod tests {
     };
 
     extern crate std;
+
+    #[test]
+    fn pipe_flags_are_independent_for_each_endpoint() {
+        let platform = crate::platform::mock::MockPlatform::new();
+        let (local, ()) = BrokerLocal::negotiate(
+            FailingPipeChannel {
+                request_count: Arc::new(AtomicUsize::new(0)),
+                read_failure: ReadFailure::WouldBlock,
+                force_transport: Arc::new(AtomicBool::new(false)),
+            },
+            |channel| Ok((channel, Arc::new(NoopSharedMemory), ())),
+        )
+        .unwrap();
+        let litebox = crate::LiteBox::new_with_broker_local(platform, local);
+        let pipes = super::Pipes::new(&litebox);
+        let unknown = super::Flags::from_bits_retain(1 << 31);
+        let (writer, reader) = pipes
+            .create_pipe(2, super::Flags::NON_BLOCKING | unknown, None)
+            .unwrap();
+        assert_eq!(
+            pipes.get_flags(&writer).unwrap(),
+            super::Flags::NON_BLOCKING
+        );
+        assert_eq!(
+            pipes.get_flags(&reader).unwrap(),
+            super::Flags::NON_BLOCKING
+        );
+        pipes
+            .update_flags(&writer, super::Flags::NON_BLOCKING, false)
+            .unwrap();
+        assert!(pipes.get_flags(&writer).unwrap().is_empty());
+        assert_eq!(
+            pipes.get_flags(&reader).unwrap(),
+            super::Flags::NON_BLOCKING
+        );
+        pipes.update_flags(&writer, unknown, true).unwrap();
+        assert!(pipes.get_flags(&writer).unwrap().is_empty());
+        pipes
+            .update_flags(&writer, super::Flags::NON_BLOCKING, true)
+            .unwrap();
+        assert_eq!(
+            pipes.get_flags(&writer).unwrap(),
+            super::Flags::NON_BLOCKING
+        );
+        pipes.close(&writer).unwrap();
+        pipes.close(&reader).unwrap();
+    }
 
     #[test]
     fn broker_control_failure_notifies_all_pipe_observers() {

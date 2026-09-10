@@ -11,18 +11,19 @@ use alloc::{
 use litebox::{
     event::{Events, wait::WaitError},
     fd::{FdEnabledSubsystem, MetadataError, TypedFd},
-    fs::OFlags,
+    fs::errors::OpenError,
     mm::linux::PAGE_SIZE,
     path,
     stdio::StdioStream,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_broker_protocol::fs::{
-    FileMode as Mode, FileSeekWhence as SeekWhence, FileStatus, FileType, FileUser,
+    FileAccessMode, FileMode as Mode, FileOpenFlags, FileSeekWhence as SeekWhence, FileStatus,
+    FileType, FileUser,
 };
 use litebox_common_linux::{
     AccessFlags, AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat,
-    InodeType, IoReadVec, IoWriteVec, IoctlArg, Statx, StatxMask, TimeParam, errno::Errno,
+    InodeType, IoReadVec, IoWriteVec, IoctlArg, OFlags, Statx, StatxMask, TimeParam, errno::Errno,
     signal::Signal,
 };
 use thiserror::Error;
@@ -90,6 +91,51 @@ fn file_mode_from_linux(mode: u32) -> Mode {
     let bits = u16::try_from(mode & u32::from(Mode::SUPPORTED.bits()))
         .expect("supported file mode bits fit in u16");
     Mode::from_bits_retain(bits)
+}
+
+/// Translate Linux open flags after descriptor-local `O_CLOEXEC` has been removed.
+fn file_open_options(flags: OFlags) -> Result<(FileAccessMode, FileOpenFlags), OpenError> {
+    const SUPPORTED_FLAGS: OFlags = OFlags::CREAT
+        .union(OFlags::RDONLY)
+        .union(OFlags::WRONLY)
+        .union(OFlags::RDWR)
+        .union(OFlags::TRUNC)
+        .union(OFlags::NOCTTY)
+        .union(OFlags::EXCL)
+        .union(OFlags::DIRECTORY)
+        .union(OFlags::NONBLOCK)
+        .union(OFlags::LARGEFILE)
+        .union(OFlags::NOFOLLOW)
+        .union(OFlags::APPEND)
+        .union(OFlags::PATH);
+
+    if flags.intersects(SUPPORTED_FLAGS.complement()) {
+        unimplemented!("{flags:?}")
+    }
+    let access = match flags.bits() & 3 {
+        0 => FileAccessMode::ReadOnly,
+        1 => FileAccessMode::WriteOnly,
+        2 => FileAccessMode::ReadWrite,
+        _ => return Err(OpenError::AccessNotAllowed),
+    };
+    let mut output = FileOpenFlags::NONE;
+    for (guest, broker) in [
+        (OFlags::CREAT, FileOpenFlags::CREATE),
+        (OFlags::TRUNC, FileOpenFlags::TRUNCATE),
+        (OFlags::NOCTTY, FileOpenFlags::NO_CONTROLLING_TERMINAL),
+        (OFlags::EXCL, FileOpenFlags::EXCLUSIVE),
+        (OFlags::DIRECTORY, FileOpenFlags::DIRECTORY),
+        (OFlags::NONBLOCK, FileOpenFlags::NONBLOCKING),
+        (OFlags::LARGEFILE, FileOpenFlags::LARGE_FILE),
+        (OFlags::NOFOLLOW, FileOpenFlags::NO_FOLLOW),
+        (OFlags::APPEND, FileOpenFlags::APPEND),
+        (OFlags::PATH, FileOpenFlags::PATH),
+    ] {
+        if flags.contains(guest) {
+            output = output.union(broker);
+        }
+    }
+    Ok((access, output))
 }
 
 /// Task state shared by `CLONE_FILES`.
@@ -391,9 +437,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let files = self.files.borrow();
             let fs = self.fs.borrow();
             let context = fs.context.read();
+            let path = path
+                .as_rust_str()
+                .map_err(litebox::fs::errors::PathError::from)?;
+            let (access, open_flags) =
+                file_open_options(flags - OFlags::CLOEXEC).map_err(Errno::from)?;
             files
                 .fs
-                .open_file(&context, &path, flags - OFlags::CLOEXEC, mode)
+                .open_file(&context, path, access, open_flags, mode)
                 .map_err(Errno::from)
         }?;
         if let Some(stream) = stream {
@@ -2810,9 +2861,80 @@ mod tests {
     use super::*;
     use alloc::string::String;
     use core::cell::Cell;
-    use litebox::fs::OFlags;
 
     extern crate std;
+
+    #[test]
+    fn open_flags_decode_access_mode_separately() {
+        for (flags, access) in [
+            (OFlags::RDONLY, FileAccessMode::ReadOnly),
+            (OFlags::WRONLY, FileAccessMode::WriteOnly),
+            (OFlags::RDWR, FileAccessMode::ReadWrite),
+        ] {
+            assert_eq!(
+                file_open_options(flags).unwrap(),
+                (access, FileOpenFlags::NONE)
+            );
+        }
+        assert!(matches!(
+            file_open_options(OFlags::from_bits_retain(3)),
+            Err(OpenError::AccessNotAllowed)
+        ));
+    }
+
+    #[test]
+    fn open_flags_translate_each_supported_flag_and_path_combinations() {
+        let mut combined = OFlags::RDWR;
+        for (linux, normalized) in [
+            (OFlags::CREAT, FileOpenFlags::CREATE),
+            (OFlags::TRUNC, FileOpenFlags::TRUNCATE),
+            (OFlags::NOCTTY, FileOpenFlags::NO_CONTROLLING_TERMINAL),
+            (OFlags::EXCL, FileOpenFlags::EXCLUSIVE),
+            (OFlags::DIRECTORY, FileOpenFlags::DIRECTORY),
+            (OFlags::NONBLOCK, FileOpenFlags::NONBLOCKING),
+            (OFlags::LARGEFILE, FileOpenFlags::LARGE_FILE),
+            (OFlags::NOFOLLOW, FileOpenFlags::NO_FOLLOW),
+            (OFlags::APPEND, FileOpenFlags::APPEND),
+            (OFlags::PATH, FileOpenFlags::PATH),
+        ] {
+            assert_eq!(
+                file_open_options(linux | OFlags::WRONLY).unwrap(),
+                (FileAccessMode::WriteOnly, normalized)
+            );
+            combined |= linux;
+        }
+        assert_eq!(
+            file_open_options(combined).unwrap(),
+            (FileAccessMode::ReadWrite, FileOpenFlags::SUPPORTED)
+        );
+        assert!(matches!(
+            file_open_options(OFlags::PATH | OFlags::from_bits_retain(3)),
+            Err(OpenError::AccessNotAllowed)
+        ));
+    }
+
+    #[test]
+    fn open_flags_keep_unsupported_flags_unimplemented() {
+        for flags in [
+            OFlags::ASYNC,
+            OFlags::DIRECT,
+            OFlags::DSYNC,
+            OFlags::SYNC,
+            OFlags::NOATIME,
+            OFlags::TMPFILE,
+            OFlags::CLOEXEC,
+            OFlags::from_bits_retain(0x8000_0000),
+        ] {
+            assert!(
+                std::panic::catch_unwind(|| file_open_options(flags)).is_err(),
+                "{flags:?} must remain unsupported"
+            );
+            assert!(
+                std::panic::catch_unwind(|| file_open_options(flags | OFlags::PATH)).is_err(),
+                "O_PATH must not hide unsupported flags"
+            );
+        }
+    }
 
     #[test]
     fn stat_overflow_does_not_narrow_internal_metadata_or_statx() {
@@ -3273,7 +3395,7 @@ mod tests {
         let fd = task
             .sys_open(
                 "file.txt",
-                litebox::fs::OFlags::CREAT | litebox::fs::OFlags::WRONLY,
+                OFlags::CREAT | OFlags::WRONLY,
                 Mode::RUSR | Mode::WUSR,
             )
             .unwrap();
@@ -3296,7 +3418,7 @@ mod tests {
             .sys_openat(
                 litebox_common_linux::AT_FDCWD,
                 "subdir/inner.txt",
-                litebox::fs::OFlags::CREAT | litebox::fs::OFlags::WRONLY,
+                OFlags::CREAT | OFlags::WRONLY,
                 Mode::RUSR | Mode::WUSR,
             )
             .unwrap();

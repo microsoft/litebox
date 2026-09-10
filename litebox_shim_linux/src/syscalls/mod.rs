@@ -21,13 +21,15 @@ pub(crate) mod tests;
 
 macro_rules! common_functions_for_file_status {
     () => {
-        pub(crate) fn get_status(&self) -> litebox::fs::OFlags {
-            litebox::fs::OFlags::from_bits(self.status.load(core::sync::atomic::Ordering::Relaxed))
-                .unwrap()
-                & litebox::fs::OFlags::STATUS_FLAGS_MASK
+        pub(crate) fn get_status(&self) -> litebox_common_linux::OFlags {
+            litebox_common_linux::OFlags::from_bits(
+                self.status.load(core::sync::atomic::Ordering::Relaxed),
+            )
+            .unwrap()
+                & litebox_common_linux::OFlags::STATUS_FLAGS_MASK
         }
 
-        pub(crate) fn set_status(&self, flag: litebox::fs::OFlags, on: bool) {
+        pub(crate) fn set_status(&self, flag: litebox_common_linux::OFlags, on: bool) {
             if on {
                 self.status
                     .fetch_or(flag.bits(), core::sync::atomic::Ordering::Relaxed);

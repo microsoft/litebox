@@ -21,11 +21,11 @@ use alloc::vec::Vec;
 use hashbrown::{HashMap, HashSet};
 
 use litebox_broker_protocol::fs::{
-    FileDirectoryEntry, FileMode as Mode, FileNodeInfo, FileStatus, FileType, FileUser as UserInfo,
+    FileAccessMode, FileDirectoryEntry, FileMode as Mode, FileNodeInfo, FileOpenFlags, FileStatus,
+    FileType, FileUser as UserInfo,
 };
 use litebox_platform::sync::{Mutex, MutexGuard, RawSyncPrimitivesProvider};
 
-use super::OFlags;
 use super::backend::{
     Backend, BackendHandles, CreationMetadata, DeviceIo, DirHandle, FileHandle, Handle, HandleRef,
     NoDeviceIo, PermissionCheck, PermissionInfo, Permissioned, SeekBehavior, WalkOutcome,
@@ -161,11 +161,19 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
     }
 
     fn resolve_root(&self) -> Result<ResolvedDir, OpenError> {
-        let upper = self.upper.owned_dir_at(self.upper.root(), OFlags::PATH)?;
+        let upper = self.upper.owned_dir_at(
+            self.upper.root(),
+            FileAccessMode::ReadOnly,
+            FileOpenFlags::PATH,
+        )?;
         let lowers = self
             .lowers
             .iter()
-            .map(|lower| lower.owned_dir_at(lower.root(), OFlags::PATH).map(Some))
+            .map(|lower| {
+                lower
+                    .owned_dir_at(lower.root(), FileAccessMode::ReadOnly, FileOpenFlags::PATH)
+                    .map(Some)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         self.merge(Some(upper), lowers)
     }
@@ -196,7 +204,11 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
                 return Err(PathError::ComponentNotADirectory.into());
             }
             let component = component.clone();
-            let owned = backend.owned_dir_at(outcome.last, OFlags::PATH)?;
+            let owned = backend.owned_dir_at(
+                outcome.last,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::PATH,
+            )?;
             Ok((owned, component))
         }
 
@@ -442,7 +454,11 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
         locked: &NamespaceGuard<'_, Platform>,
         path: &[String],
     ) -> Result<DirHandle, OpenError> {
-        let mut upper = self.upper.owned_dir_at(self.upper.root(), OFlags::PATH)?;
+        let mut upper = self.upper.owned_dir_at(
+            self.upper.root(),
+            FileAccessMode::ReadOnly,
+            FileOpenFlags::PATH,
+        )?;
         for index in 0..path.len() {
             // Re-resolve after each materialisation, since it changed the upper namespace.
             let resolved = self.resolve_dir(&path[..=index])?;
@@ -776,13 +792,14 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
     fn owned_dir_at(
         &self,
         dir: WalkingDirHandle<'_>,
-        flags: OFlags,
+        access: FileAccessMode,
+        flags: FileOpenFlags,
     ) -> Result<DirHandle, OpenError> {
         let path = dir.into_typed::<Self>().path;
         let resolved = self.resolve_dir(&path)?;
         let (_, backend, handle) = self.owning_dir(&resolved).ok_or(OpenError::Io)?;
         let walking = backend.walking_dir_at(handle).ok_or(OpenError::Io)?;
-        backend.owned_dir_at(walking, flags)?;
+        backend.owned_dir_at(walking, access, flags)?;
         Ok(DirHandle::from_typed::<Self>(OverlayDir { path }))
     }
 
@@ -796,12 +813,13 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         &self,
         dir: WalkingDirHandle<'_>,
         name: &str,
-        flags: OFlags,
+        access: FileAccessMode,
+        flags: FileOpenFlags,
     ) -> Result<Permissioned<FileHandle>, OpenError> {
         if !valid(name) {
             return Err(PathError::InvalidPathname.into());
         }
-        if flags.contains(OFlags::DIRECTORY) {
+        if flags.contains(FileOpenFlags::DIRECTORY) {
             return Err(PathError::ComponentNotADirectory.into());
         }
         let path = dir.into_typed::<Self>().path;
@@ -813,14 +831,14 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
             .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
         // The resolver only reaches `create_file_at` once a walk reported the name as missing, so
         // an existing entry means an exclusive create must fail here.
-        if flags.contains(OFlags::CREAT | OFlags::EXCL) {
+        if flags.contains(FileOpenFlags::CREATE | FileOpenFlags::EXCLUSIVE) {
             return Err(OpenError::AlreadyExists);
         }
 
         let (layer, permissions) = if entry.upper {
             let upper = resolved.upper.as_ref().ok_or(OpenError::Io)?;
             let walking = self.upper.walking_dir_at(upper).ok_or(OpenError::Io)?;
-            let file = self.upper.open_file_at(walking, name, flags)?;
+            let file = self.upper.open_file_at(walking, name, access, flags)?;
             (OverlayFileLayer::Upper(file.item), file.permissions)
         } else {
             let layer = entry.lower.ok_or(OpenError::Io)?;
@@ -834,14 +852,16 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
             // XXX(jayb): the resolver authorizes an open only after this returns, so a
             // writable open can copy up before a later permission denial. A preflight
             // authorization hook in `Backend` would make copy-up properly two-phase.
-            let writing =
-                flags.intersects(OFlags::WRONLY | OFlags::RDWR | OFlags::APPEND | OFlags::TRUNC);
-            let lower_flags = if writing {
-                OFlags::RDONLY
+            let writing = matches!(
+                access,
+                FileAccessMode::WriteOnly | FileAccessMode::ReadWrite
+            ) || flags.intersects(FileOpenFlags::APPEND | FileOpenFlags::TRUNCATE);
+            let (lower_access, lower_flags) = if writing {
+                (FileAccessMode::ReadOnly, FileOpenFlags::empty())
             } else {
-                flags.difference(OFlags::CREAT)
+                (access, flags.difference(FileOpenFlags::CREATE))
             };
-            let file = self.lowers[layer].open_file_at(walking, name, lower_flags)?;
+            let file = self.lowers[layer].open_file_at(walking, name, lower_access, lower_flags)?;
             // The file's own identity, which is also the key a later copy-up records itself under.
             let status = self.lowers[layer]
                 .status(HandleRef::File(&file.item))
@@ -858,7 +878,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
                     name,
                     (layer, &file.item),
                     &status,
-                    flags.contains(OFlags::TRUNC),
+                    flags.contains(FileOpenFlags::TRUNCATE),
                 )?;
                 // The lower open was substituted with a read-only one, so its `PermissionCheck`
                 // says nothing about the caller's write access; check the file's own mode instead.

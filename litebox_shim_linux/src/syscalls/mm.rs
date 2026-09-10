@@ -1549,9 +1549,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
 #[cfg(test)]
 mod tests {
-    use litebox::{fs::OFlags, mm::linux::PAGE_SIZE, platform::PageManagementProvider};
+    use litebox::{mm::linux::PAGE_SIZE, platform::PageManagementProvider};
     use litebox_broker_protocol::fs::{FileAccessMode, FileMode as Mode, FileOpenFlags};
-    use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
+    use litebox_common_linux::{MRemapFlags, MapFlags, OFlags, ProtFlags, errno::Errno};
     use object::{elf::FileHeader64, endian::LittleEndian};
 
     use crate::syscalls::test_broker::{FileCall, Scripted, ScriptedFiles, closed, opened};

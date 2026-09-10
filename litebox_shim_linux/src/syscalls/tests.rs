@@ -12,7 +12,6 @@
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use litebox::fs::OFlags;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::WriteFileResponse;
 use litebox_broker_protocol::fs::{
@@ -20,7 +19,9 @@ use litebox_broker_protocol::fs::{
     FileType, FileUser, MAX_FILE_TRANSFER_SIZE, encode_directory_entries_chunk,
 };
 use litebox_broker_protocol::message::FileResponse;
-use litebox_common_linux::{AtFlags, DirentType, FcntlArg, FileDescriptorFlags, errno::Errno};
+use litebox_common_linux::{
+    AtFlags, DirentType, FcntlArg, FileDescriptorFlags, OFlags, errno::Errno,
+};
 use zerocopy::FromBytes as _;
 
 use crate::UserPtrMut;
@@ -530,6 +531,83 @@ fn getdirent64_translates_descriptor_and_broker_errors() {
         Err(Errno::EINVAL)
     );
     close_scripted_file(&files, &task, dir_fd, FILE_HANDLE);
+}
+
+#[test]
+fn open_flags_keep_cloexec_local_and_send_normalized_path_options() {
+    let cloexec_handle = ObjectHandle(FILE_HANDLE.0 + 1);
+    let (files, task) = scripted_task([opened(FILE_HANDLE), opened(cloexec_handle)]);
+    let flags =
+        OFlags::RDWR | OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::NONBLOCK;
+    let plain_fd = i32::try_from(task.sys_open("/path", flags, Mode::empty()).unwrap()).unwrap();
+    let cloexec_fd = i32::try_from(
+        task.sys_openat(
+            litebox_common_linux::AT_FDCWD,
+            "/path",
+            flags | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let expected = FileCall::Open {
+        path: "/path".into(),
+        user: ROOT,
+        access: FileAccessMode::ReadWrite,
+        flags: FileOpenFlags::PATH
+            | FileOpenFlags::DIRECTORY
+            | FileOpenFlags::NO_FOLLOW
+            | FileOpenFlags::NONBLOCKING,
+        mode: Mode::empty(),
+    };
+    let calls = files.take_calls();
+    assert_eq!(calls.len(), 2);
+    for call in calls {
+        assert_eq!(call, expected);
+    }
+    assert_eq!(task.sys_fcntl(plain_fd, FcntlArg::GETFD), Ok(0));
+    assert_eq!(
+        task.sys_fcntl(cloexec_fd, FcntlArg::GETFD),
+        Ok(FileDescriptorFlags::FD_CLOEXEC.bits())
+    );
+    assert_eq!(
+        task.sys_fcntl(cloexec_fd, FcntlArg::GETFL).unwrap() & OFlags::CLOEXEC.bits(),
+        0
+    );
+
+    files.script([closed()]);
+    task.close_on_exec();
+    assert_eq!(files.take_calls(), vec![FileCall::Close(cloexec_handle)]);
+    assert_eq!(
+        task.sys_fcntl(cloexec_fd, FcntlArg::GETFD),
+        Err(Errno::EBADF)
+    );
+    assert_eq!(task.sys_fcntl(plain_fd, FcntlArg::GETFD), Ok(0));
+    close_scripted_file(&files, &task, plain_fd, FILE_HANDLE);
+}
+
+#[test]
+fn open_flags_reject_invalid_access_before_contacting_broker() {
+    let (files, task) = scripted_task([]);
+    for flags in [
+        OFlags::from_bits_retain(3),
+        OFlags::from_bits_retain(3) | OFlags::PATH | OFlags::CLOEXEC,
+    ] {
+        assert_eq!(
+            task.sys_open("/invalid_access", flags, Mode::empty()),
+            Err(Errno::EACCES)
+        );
+        assert_eq!(
+            task.sys_openat(
+                litebox_common_linux::AT_FDCWD,
+                "/invalid_access",
+                flags,
+                Mode::empty(),
+            ),
+            Err(Errno::EACCES)
+        );
+    }
+    assert!(files.take_calls().is_empty());
 }
 
 #[test]

@@ -9,7 +9,8 @@ use alloc::vec::Vec;
 use hashbrown::HashMap;
 
 use litebox_broker_protocol::fs::{
-    FileDirectoryEntry, FileMode as Mode, FileNodeInfo, FileStatus, FileType, FileUser as UserInfo,
+    FileAccessMode, FileDirectoryEntry, FileMode as Mode, FileNodeInfo, FileOpenFlags, FileStatus,
+    FileType, FileUser as UserInfo,
 };
 use litebox_platform::sync;
 
@@ -210,8 +211,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::private::Sealed
 pub struct InMemDirHandle<Platform: sync::RawSyncPrimitivesProvider> {
     dir: DirNode<Platform>,
     /// The flags the directory was opened with; walking handles are not opened for access, and
-    /// thus use [`super::OFlags::PATH`].
-    flags: super::OFlags,
+    /// thus use [`FileOpenFlags::PATH`].
+    flags: FileOpenFlags,
 }
 impl<Platform: sync::RawSyncPrimitivesProvider> Clone for InMemDirHandle<Platform> {
     fn clone(&self) -> Self {
@@ -244,7 +245,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
     fn root(&self) -> super::backend::WalkingDirHandle<'_> {
         super::backend::WalkingDirHandle::from_typed::<Self>(InMemDirHandle {
             dir: self.root.clone(),
-            flags: super::OFlags::PATH,
+            flags: FileOpenFlags::PATH,
         })
     }
 
@@ -284,7 +285,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             });
             current = InMemDirHandle {
                 dir: child,
-                flags: super::OFlags::PATH,
+                flags: FileOpenFlags::PATH,
             };
         }
         Ok(super::backend::WalkOutcome {
@@ -297,19 +298,24 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
     fn owned_dir_at(
         &self,
         dir: super::backend::WalkingDirHandle<'_>,
-        flags: super::OFlags,
+        access: FileAccessMode,
+        flags: FileOpenFlags,
     ) -> Result<super::backend::DirHandle, OpenError> {
-        assert_supported_oflags(flags);
-        if flags.intersects(super::OFlags::WRONLY | super::OFlags::RDWR) {
+        assert_supported_flags(flags);
+        if matches!(
+            access,
+            FileAccessMode::WriteOnly | FileAccessMode::ReadWrite
+        ) {
             // XXX(jayb): POSIX requires `EISDIR` when write access is requested on a directory, but
             // `OpenError` has no such variant yet. Allowing write-mode directory handles here is a
-            // workaround for the Windows access-to-`OFlags` mapping introduced by PR #894
+            // workaround for the Windows access mapping introduced by PR #894
             // (afe6cddc): Windows directory modification rights (such as `DELETE`) use write mode
             // to trigger permission checks even though the handle is not used as a writable byte
             // stream. A cleaner design would separate permission-check intent from handle I/O mode,
             // allowing the Windows shim to request modification permission on a non-stream
             // directory handle while POSIX opens with `WRONLY` or `RDWR` return `EISDIR`.
             litebox_util_log::debug!(
+                access:? = access,
                 flags:? = flags;
                 "using writable-directory workaround for permission checks"
             );
@@ -329,7 +335,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         Some(super::backend::WalkingDirHandle::from_typed::<Self>(
             InMemDirHandle {
                 dir: dir.get_typed::<Self>().dir.clone(),
-                flags: super::OFlags::PATH,
+                flags: FileOpenFlags::PATH,
             },
         ))
     }
@@ -338,9 +344,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         &self,
         dir: super::backend::WalkingDirHandle<'_>,
         name: &str,
-        flags: super::OFlags,
+        _access: FileAccessMode,
+        flags: FileOpenFlags,
     ) -> Result<super::backend::Permissioned<super::backend::FileHandle>, OpenError> {
-        assert_supported_oflags(flags);
+        assert_supported_flags(flags);
         let dir = dir.into_typed::<Self>();
         let child = dir
             .dir
@@ -352,12 +359,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         let Node::File(file) = child else {
             return Err(PathError::ComponentNotADirectory.into());
         };
-        if flags.contains(super::OFlags::DIRECTORY) {
+        if flags.contains(FileOpenFlags::DIRECTORY) {
             return Err(PathError::ComponentNotADirectory.into());
         }
         let perms = file.read().perms.clone();
         let handle = super::backend::FileHandle::from_typed::<Self>(InMemFileHandle { file });
-        if flags.contains(super::OFlags::TRUNC) && !flags.contains(super::OFlags::PATH) {
+        if flags.contains(FileOpenFlags::TRUNCATE) && !flags.contains(FileOpenFlags::PATH) {
             // Linux truncates whenever the open succeeds, regardless of the access mode (an
             // `O_RDONLY|O_TRUNC` open of a writable file does truncate it); `O_PATH` opens ignore
             // `O_TRUNC` entirely.
@@ -546,7 +553,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             InMemDirHandle {
                 dir: child,
                 // TODO(jayb): is this the right set of flags here?
-                flags: super::OFlags::PATH,
+                flags: FileOpenFlags::PATH,
             },
         ))
     }
@@ -628,23 +635,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
     }
 }
 
-/// Flags this backend knows how to honor when opening files/directories.
-const SUPPORTED_OFLAGS: super::OFlags = super::OFlags::CREAT
-    .union(super::OFlags::RDONLY)
-    .union(super::OFlags::WRONLY)
-    .union(super::OFlags::RDWR)
-    .union(super::OFlags::TRUNC)
-    .union(super::OFlags::NOCTTY)
-    .union(super::OFlags::EXCL)
-    .union(super::OFlags::DIRECTORY)
-    .union(super::OFlags::NONBLOCK)
-    .union(super::OFlags::LARGEFILE)
-    .union(super::OFlags::NOFOLLOW)
-    .union(super::OFlags::APPEND)
-    .union(super::OFlags::PATH);
-
-fn assert_supported_oflags(flags: super::OFlags) {
-    if flags.intersects(SUPPORTED_OFLAGS.complement()) {
+fn assert_supported_flags(flags: FileOpenFlags) {
+    if !flags.difference(FileOpenFlags::all()).is_empty() {
         unimplemented!("{flags:?}")
     }
 }
