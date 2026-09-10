@@ -457,8 +457,8 @@ fn run_thread_inner(
 /// Windows x64 ABI default: all x87 exceptions masked, 53-bit precision, round to nearest.
 /// Unlike the guest's architectural initial value (0x037f), this selects double precision.
 /// See <https://learn.microsoft.com/en-us/cpp/build/x64-calling-convention#fpcsr>.
-const HOST_X87_CONTROL_WORD: u16 = 0x027f;
-const HOST_MXCSR: u32 = core::arch::x86_64::_MM_MASK_MASK;
+static HOST_X87_CONTROL_WORD: u16 = 0x027f;
+static HOST_MXCSR: u32 = core::arch::x86_64::_MM_MASK_MASK;
 
 #[inline]
 fn debug_assert_host_fx_control_state() {
@@ -2506,22 +2506,30 @@ mod tests {
             VirtualFree, VirtualProtect,
         };
 
-        const TEST_VECTOR: [u8; 32] = [0x5a; 32];
-        const TEST_NEXT_VECTOR: [u8; 32] = [0x3c; 32];
+        const TEST_VECTOR_QWORD: u64 = 0x5a5a_5a5a_5a5a_5a5a;
+        const TEST_NEXT_VECTOR_QWORD: u64 = 0x3c3c_3c3c_3c3c_3c3c;
         const TEST_MXCSR: u32 = 0x3f80;
 
         #[unsafe(naked)]
         unsafe extern "C" fn guest_entry() {
             core::arch::naked_asm!(
-                "ldmxcsr [rip + {mxcsr}]",
-                "movdqu xmm0, [rip + {vector}]",
+                "sub rsp, 40",
+                "mov DWORD PTR [rsp + 32], {mxcsr}",
+                "mov rax, {vector}",
+                "mov QWORD PTR [rsp], rax",
+                "mov QWORD PTR [rsp + 8], rax",
+                "mov QWORD PTR [rsp + 16], rax",
+                "mov QWORD PTR [rsp + 24], rax",
+                "ldmxcsr [rsp + 32]",
+                "movdqu xmm0, [rsp]",
                 "test rsi, rsi",
                 "jz 2f",
-                "vmovdqu ymm0, [rip + {vector}]",
+                "vmovdqu ymm0, [rsp]",
                 "2:",
+                "add rsp, 40",
                 "jmp rbx",
-                mxcsr = sym TEST_MXCSR,
-                vector = sym TEST_VECTOR,
+                mxcsr = const TEST_MXCSR,
+                vector = const TEST_VECTOR_QWORD,
             );
         }
 
@@ -2529,13 +2537,20 @@ mod tests {
         unsafe extern "C" fn guest_after_interrupt() {
             core::arch::naked_asm!(
                 // Change the state before reusing the interrupt capture buffer.
-                "movdqu xmm0, [rip + {vector}]",
+                "sub rsp, 32",
+                "mov rax, {vector}",
+                "mov QWORD PTR [rsp], rax",
+                "mov QWORD PTR [rsp + 8], rax",
+                "mov QWORD PTR [rsp + 16], rax",
+                "mov QWORD PTR [rsp + 24], rax",
+                "movdqu xmm0, [rsp]",
                 "test rsi, rsi",
                 "jz 2f",
-                "vmovdqu ymm0, [rip + {vector}]",
+                "vmovdqu ymm0, [rsp]",
                 "2:",
+                "add rsp, 32",
                 "jmp rbx",
-                vector = sym TEST_NEXT_VECTOR,
+                vector = const TEST_NEXT_VECTOR_QWORD,
             );
         }
 
@@ -2744,20 +2759,29 @@ mod tests {
 
         const TEST_CW: u16 = 0x077f;
         const TEST_MXCSR: u32 = 0x3f80;
-        const TEST_VECTOR: [u8; 32] = [0x5a; 32];
+        const TEST_VECTOR_QWORD: u64 = 0x5a5a_5a5a_5a5a_5a5a;
 
         #[unsafe(naked)]
         unsafe extern "C" fn guest_entry() {
             core::arch::naked_asm!(
                 "stmxcsr [rsi]",
                 "fnstcw [rsi + 4]",
-                "fldcw [rip + {control_word}]",
-                "ldmxcsr [rip + {mxcsr}]",
-                "movdqu xmm0, [rip + {vector}]",
+                "sub rsp, 40",
+                "mov WORD PTR [rsp + 32], {control_word}",
+                "mov DWORD PTR [rsp + 36], {mxcsr}",
+                "mov rax, {vector}",
+                "mov QWORD PTR [rsp], rax",
+                "mov QWORD PTR [rsp + 8], rax",
+                "mov QWORD PTR [rsp + 16], rax",
+                "mov QWORD PTR [rsp + 24], rax",
+                "fldcw [rsp + 32]",
+                "ldmxcsr [rsp + 36]",
+                "movdqu xmm0, [rsp]",
                 "test rdi, rdi",
                 "jz 2f",
-                "vmovdqu ymm0, [rip + {vector}]",
+                "vmovdqu ymm0, [rsp]",
                 "2:",
+                "add rsp, 40",
                 "lea rcx, [rip + 3f]",
                 "jmp {syscall_callback}",
                 "3:",
@@ -2782,9 +2806,9 @@ mod tests {
                 "jmp {syscall_callback}",
                 "9:",
                 "ud2",
-                control_word = sym TEST_CW,
-                mxcsr = sym TEST_MXCSR,
-                vector = sym TEST_VECTOR,
+                control_word = const TEST_CW,
+                mxcsr = const TEST_MXCSR,
+                vector = const TEST_VECTOR_QWORD,
                 syscall_callback = sym crate::syscall_callback,
             );
         }
