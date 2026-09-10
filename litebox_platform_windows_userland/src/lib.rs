@@ -457,7 +457,7 @@ fn run_thread_inner(
 /// Windows x64 ABI default: all x87 exceptions masked, 53-bit precision, round to nearest.
 /// Unlike the guest's architectural initial value (0x037f), this selects double precision.
 /// See <https://learn.microsoft.com/en-us/cpp/build/x64-calling-convention#fpcsr>.
-const  HOST_X87_CONTROL_WORD: u16 = 0x027f;
+const HOST_X87_CONTROL_WORD: u16 = 0x027f;
 const HOST_MXCSR: u32 = core::arch::x86_64::_MM_MASK_MASK;
 
 #[inline]
