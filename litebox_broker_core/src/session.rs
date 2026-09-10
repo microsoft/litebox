@@ -746,7 +746,7 @@ mod tests {
 
         assert_eq!(crate::fs::write(&source, file, b"abcdef", None), Ok(Ok(6)));
         assert_eq!(
-            crate::fs::seek(&source, file, 0, FileSeekWhence::Beginning),
+            crate::fs::seek(&source, file, 0, FileSeekWhence::RelativeToBeginning),
             Ok(Ok(0))
         );
 
@@ -815,7 +815,7 @@ mod tests {
         assert_eq!(status.size, 6);
         assert_eq!(source.close_object_reference(file), Ok(()));
         assert_eq!(
-            crate::fs::seek(&target, duplicate, 0, FileSeekWhence::Beginning),
+            crate::fs::seek(&target, duplicate, 0, FileSeekWhence::RelativeToBeginning),
             Ok(Ok(0))
         );
         assert_eq!(

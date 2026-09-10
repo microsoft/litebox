@@ -1555,12 +1555,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
 #[cfg(test)]
 mod tests {
-    use litebox::{
-        fs::{Mode, OFlags},
-        mm::linux::PAGE_SIZE,
-        platform::PageManagementProvider,
-    };
-    use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags};
+    use litebox::{fs::OFlags, mm::linux::PAGE_SIZE, platform::PageManagementProvider};
+    use litebox_broker_protocol::fs::{FileAccessMode, FileMode as Mode, FileOpenFlags};
     use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
     use object::{elf::FileHeader64, endian::LittleEndian};
 

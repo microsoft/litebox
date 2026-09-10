@@ -635,7 +635,7 @@ mod tests {
             BrokerOperation::File(FileRequest::Seek(SeekFileRequest {
                 handle,
                 offset: -19,
-                whence: FileSeekWhence::Current,
+                whence: FileSeekWhence::RelativeToCurrentOffset,
             })),
             BrokerOperation::File(FileRequest::Truncate(TruncateFileRequest {
                 handle,
@@ -1308,7 +1308,7 @@ mod tests {
             operation: BrokerOperation::File(FileRequest::Seek(SeekFileRequest {
                 handle: ObjectHandle(13),
                 offset: 0,
-                whence: FileSeekWhence::Beginning,
+                whence: FileSeekWhence::RelativeToBeginning,
             })),
         });
         *invalid_whence.last_mut().unwrap() = 0xff;

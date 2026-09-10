@@ -1491,7 +1491,7 @@ mod tests {
                 BrokerOperation::File(FileRequest::Seek(SeekFileRequest {
                     handle: opened.handle,
                     offset: 0,
-                    whence: FileSeekWhence::Beginning,
+                    whence: FileSeekWhence::RelativeToBeginning,
                 })),
                 &shared_buffers,
             ),

@@ -10,12 +10,13 @@ use core::{
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox::utils::TruncateExt as _;
 use litebox::{
-    fs::{Mode, OFlags},
+    fs::OFlags,
     mm::linux::{
         CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, VmemProtectError,
     },
     platform::RawPointerProvider,
 };
+use litebox_broker_protocol::fs::FileMode as Mode;
 use litebox_common_windows::loader::{
     AccessMemory, Fault, KiUserInvertedFunctionTableEntry, KiUserInvertedFunctionTableHeader,
     MAXIMUM_INVERTED_FUNCTION_TABLE_SIZE, MapMemory, MappingInfo, PAGE_SIZE, PeExportError,

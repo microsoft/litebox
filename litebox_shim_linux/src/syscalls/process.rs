@@ -1403,7 +1403,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let file = self.do_open(
                 full_path,
                 litebox::fs::OFlags::RDONLY,
-                litebox::fs::Mode::empty(),
+                litebox_broker_protocol::fs::FileMode::empty(),
             )?;
             let mut header = [0u8; SHEBANG_MAX_LINE];
             let files = self.files.borrow();

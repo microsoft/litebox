@@ -28,6 +28,7 @@ use litebox::{
     sync::futex::FutexManager,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _},
 };
+use litebox_broker_protocol::fs::{FileMode as Mode, FileSeekWhence as SeekWhence};
 use litebox_common_linux::{
     SyscallRequest,
     errno::Errno,
@@ -366,7 +367,7 @@ impl<Platform: ShimPlatform> syscalls::file::FilesState<Platform> {
         global: &GlobalState<Platform>,
         context: &litebox::fs::Context,
     ) {
-        use litebox::fs::{Mode, OFlags};
+        use litebox::fs::OFlags;
         let stdin = self
             .fs
             .open_file(context, "/dev/stdin", OFlags::RDONLY, Mode::empty())
@@ -576,7 +577,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         self.do_seek(
                             fd,
                             0,
-                            litebox::fs::SeekWhence::RelativeToCurrentOffset,
+                            SeekWhence::RelativeToCurrentOffset,
                         )
                         .inspect_err(|e| {
                             match *e {
@@ -604,7 +605,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                                 self.do_seek(
                                     fd,
                                     (cur_loc + read_total).reinterpret_as_signed(),
-                                    litebox::fs::SeekWhence::RelativeToBeginning,
+                                    SeekWhence::RelativeToBeginning,
                                 )
                                 // Given that previous lseek and pread succeeded, this lseek should also succeed.
                                 .expect("lseek failed");

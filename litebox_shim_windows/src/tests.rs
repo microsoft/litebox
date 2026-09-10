@@ -15,7 +15,8 @@ use alloc::vec::Vec;
 use core::mem::size_of;
 use litebox::platform::RawConstPointer as _;
 use litebox::utils::TruncateExt as _;
-use litebox_broker_core::fs::{Mode, UserInfo, in_mem::InitialNode};
+use litebox_broker_core::fs::in_mem::InitialNode;
+use litebox_broker_protocol::fs::{FileMode as Mode, FileUser as UserInfo};
 
 use crate::nt_types::{ObjectAttributes, UnicodeString};
 use crate::syscalls::Handle;

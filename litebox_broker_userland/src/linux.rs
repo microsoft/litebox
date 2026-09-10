@@ -21,9 +21,9 @@ use litebox_broker_core::fs::in_mem::{InMem, InitialNode};
 use litebox_broker_core::fs::overlay::Overlay;
 use litebox_broker_core::fs::resolver::Resolver;
 use litebox_broker_core::fs::tar_ro::{EMPTY_TAR_FILE, TarRo};
-use litebox_broker_core::fs::{Mode, UserInfo};
 use litebox_broker_core::socket::HOST_GATEWAY_IPV4_ADDRESS;
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
+use litebox_broker_protocol::fs::{FileMode as Mode, FileUser as UserInfo};
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory;
 use litebox_broker_transport_linux_userland::unix_socket::{
@@ -158,7 +158,7 @@ fn create_file_service(args: &super::CliArgs) -> Result<Arc<dyn FileService>, Bo
             entries.push((
                 path_to_string(path)?,
                 InitialNode::Directory {
-                    mode: Mode::from_bits_retain(metadata.st_mode()),
+                    mode: file_mode(metadata.st_mode()),
                     owner,
                 },
             ));
@@ -179,7 +179,7 @@ fn create_file_service(args: &super::CliArgs) -> Result<Arc<dyn FileService>, Bo
         entries.push((
             path_to_string(&program)?,
             InitialNode::File {
-                mode: Mode::from_bits_retain(metadata.st_mode()),
+                mode: file_mode(metadata.st_mode()),
                 owner: guest_owner(previous_user, metadata.st_uid()),
                 data: program_data.into(),
             },
@@ -242,6 +242,12 @@ fn guest_owner(previous_user: u32, user: u32) -> UserInfo {
             group: DEFAULT_GUEST_GID,
         }
     }
+}
+
+fn file_mode(mode: u32) -> Mode {
+    let bits = u16::try_from(mode & u32::from(Mode::SUPPORTED.bits()))
+        .expect("supported file mode bits fit in u16");
+    Mode::from_bits_retain(bits)
 }
 
 fn inferred_linux_runner_args(

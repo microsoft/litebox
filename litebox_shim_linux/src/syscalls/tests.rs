@@ -12,12 +12,12 @@
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use litebox::fs::{Mode, OFlags};
+use litebox::fs::OFlags;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::WriteFileResponse;
 use litebox_broker_protocol::fs::{
-    FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileNodeInfo, FileOpenFlags, FileType,
-    FileUser, MAX_FILE_TRANSFER_SIZE, encode_directory_entries_chunk,
+    FileAccessMode, FileDirectoryEntry, FileError, FileMode as Mode, FileNodeInfo, FileOpenFlags,
+    FileType, FileUser, MAX_FILE_TRANSFER_SIZE, encode_directory_entries_chunk,
 };
 use litebox_broker_protocol::message::FileResponse;
 use litebox_common_linux::{AtFlags, DirentType, FcntlArg, FileDescriptorFlags, errno::Errno};
@@ -100,8 +100,8 @@ pub(crate) fn directory_entry(name: &str, file_type: FileType, ino: u64) -> File
 }
 
 /// Builds the protocol mode a request is expected to carry.
-pub(crate) fn mode(bits: u16) -> FileMode {
-    FileMode::from_bits(bits).expect("test modes must be supported")
+pub(crate) fn mode(bits: u16) -> Mode {
+    Mode::from_bits(bits).expect("test modes must be supported")
 }
 
 #[cfg(target_arch = "x86_64")]

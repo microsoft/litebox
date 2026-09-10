@@ -13,6 +13,7 @@ use litebox::{
     fs::OFlags,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
+use litebox_broker_protocol::fs::{FileMode, FileType, FileUser};
 use syscalls::Sysno;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
@@ -250,12 +251,12 @@ pub enum InodeType {
     Socket = 0o140000,
 }
 
-impl From<litebox::fs::FileType> for InodeType {
-    fn from(value: litebox::fs::FileType) -> Self {
+impl From<FileType> for InodeType {
+    fn from(value: FileType) -> Self {
         match value {
-            litebox::fs::FileType::RegularFile => InodeType::File,
-            litebox::fs::FileType::Directory => InodeType::Dir,
-            litebox::fs::FileType::CharacterDevice => InodeType::CharDevice,
+            FileType::RegularFile => InodeType::File,
+            FileType::Directory => InodeType::Dir,
+            FileType::CharacterDevice => InodeType::CharDevice,
             _ => unimplemented!(),
         }
     }
@@ -281,12 +282,12 @@ pub enum DirentType {
     Socket = 12,
 }
 
-impl From<litebox::fs::FileType> for DirentType {
-    fn from(value: litebox::fs::FileType) -> Self {
+impl From<FileType> for DirentType {
+    fn from(value: FileType) -> Self {
         match value {
-            litebox::fs::FileType::RegularFile => DirentType::Regular,
-            litebox::fs::FileType::Directory => DirentType::Directory,
-            litebox::fs::FileType::CharacterDevice => DirentType::CharDevice,
+            FileType::RegularFile => DirentType::Regular,
+            FileType::Directory => DirentType::Directory,
+            FileType::CharacterDevice => DirentType::CharDevice,
             _ => unimplemented!(),
         }
     }
@@ -375,7 +376,7 @@ impl From<litebox::fs::FileStatus> for FileStat {
             file_type,
             mode,
             size,
-            owner: litebox::fs::UserInfo { user, group },
+            owner: FileUser { user, group },
             node_info: litebox::fs::NodeInfo { dev, ino, rdev },
             blksize,
             ..
@@ -384,7 +385,7 @@ impl From<litebox::fs::FileStatus> for FileStat {
             st_dev: <_>::try_from(dev).unwrap(),
             st_ino: <_>::try_from(ino).unwrap(),
             st_nlink: 1,
-            st_mode: (mode.bits() | InodeType::from(file_type) as u32).trunc(),
+            st_mode: (u32::from(mode.bits()) | InodeType::from(file_type) as u32).trunc(),
             st_uid: <_>::from(user),
             st_gid: <_>::from(group),
             st_rdev: rdev
@@ -515,7 +516,7 @@ impl From<litebox::fs::FileStatus> for Statx {
             file_type,
             mode,
             size,
-            owner: litebox::fs::UserInfo { user, group },
+            owner: FileUser { user, group },
             node_info: litebox::fs::NodeInfo { dev, ino, rdev },
             blksize,
             ..
@@ -528,7 +529,7 @@ impl From<litebox::fs::FileStatus> for Statx {
             stx_nlink: 1,
             stx_uid: u32::from(user),
             stx_gid: u32::from(group),
-            stx_mode: (mode.bits() | InodeType::from(file_type) as u32).trunc(),
+            stx_mode: (u32::from(mode.bits()) | InodeType::from(file_type) as u32).trunc(),
             stx_ino: ino as u64,
             stx_size: size as u64,
             stx_blocks: 0,
@@ -2277,7 +2278,7 @@ pub enum SyscallRequest {
         dirfd: i32,
         pathname: UserPtr<c_char>,
         flags: litebox::fs::OFlags,
-        mode: litebox::fs::Mode,
+        mode: FileMode,
     },
     Ftruncate {
         fd: i32,
@@ -3415,7 +3416,7 @@ reinterpret_truncated_from_usize_for! {
         MapFlags,
         MRemapFlags,
         AccessFlags,
-        litebox::fs::Mode,
+        FileMode,
         litebox::fs::OFlags,
         AtFlags,
         SockFlags,

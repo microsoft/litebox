@@ -21,10 +21,11 @@ use litebox::{
         wait::WaitContext,
     },
     fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry},
-    fs::{Mode, OFlags, errors::OpenError},
+    fs::{OFlags, errors::OpenError},
     sync::{Mutex, RwLock},
     utils::TruncateExt as _,
 };
+use litebox_broker_protocol::fs::FileMode as Mode;
 use litebox_common_linux::{
     IpOption, ReceiveFlags, SendFlags, ShutdownHow, SockFlags, SockType, SocketOption,
     SocketOptionName, errno::Errno,

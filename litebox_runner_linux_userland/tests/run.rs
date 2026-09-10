@@ -327,12 +327,12 @@ fn test_file_service(
     use std::os::unix::fs::PermissionsExt;
 
     use litebox_broker_core::fs::{
-        Mode, UserInfo,
         composer::Composer,
         in_mem::{InMem, InitialNode},
         resolver::Resolver,
     };
     use litebox_broker_platform_linux_userland::LinuxSyncPrimitivesProvider;
+    use litebox_broker_protocol::fs::{FileMode as Mode, FileUser as UserInfo};
 
     let directory_mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
     let mut entries = vec![
@@ -371,7 +371,9 @@ fn test_file_service(
             );
             let metadata =
                 std::fs::metadata(entry.path()).expect("failed to inspect runner test file");
-            let mode = Mode::from_bits_retain(metadata.permissions().mode() & 0o7777);
+            let bits = u16::try_from(metadata.permissions().mode() & 0o7777)
+                .expect("supported file mode bits fit in u16");
+            let mode = Mode::from_bits_retain(bits);
             let node = if metadata.is_dir() {
                 InitialNode::Directory {
                     mode,

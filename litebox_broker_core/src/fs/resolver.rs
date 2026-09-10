@@ -7,19 +7,21 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
+use litebox_broker_protocol::fs::{
+    FileMode as Mode, FileSeekWhence as SeekWhence, FileType, FileUser as UserInfo,
+};
 
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
     ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::{
-    FileType, Mode, OFlags,
+    OFlags,
     backend::{
         CreationMetadata, DeviceIo, DirHandle, Handle, HandleRef, PermissionCheck, PermissionInfo,
         Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkingDirHandle,
     },
 };
-use super::{SeekWhence, UserInfo};
 
 /// The broker-core filesystem resolver, generic over its synchronization platform and
 /// [`Backend`](super::backend::Backend).

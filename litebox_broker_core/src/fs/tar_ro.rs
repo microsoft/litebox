@@ -28,11 +28,12 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::ops::Range;
 use hashbrown::HashMap;
+use litebox_broker_protocol::fs::{FileMode as Mode, FileType, FileUser as UserInfo};
 
-use super::{DirEntry, FileType};
+use super::DirEntry;
 
 use super::{
-    Mode, NodeInfo, OFlags, UserInfo,
+    NodeInfo, OFlags,
     backend::{CreationMetadata, DirHandle, FileHandle, HandleRef, WalkingDirHandle},
     errors::{
         ChmodError, ChownError, MkdirError, OpenError, PathError, ReadDirError, ReadError,

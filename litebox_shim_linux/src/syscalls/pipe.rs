@@ -12,9 +12,10 @@ use core::num::NonZero;
 use litebox::{
     event::{IOPollable, wait::WaitContext},
     fd::MetadataError,
-    fs::{Mode, OFlags},
+    fs::OFlags,
     pipes::{Flags, HalfPipeType, PipeFd},
 };
+use litebox_broker_protocol::fs::FileMode as Mode;
 use litebox_common_linux::{FileDescriptorFlags, InodeType, errno::Errno};
 
 use crate::{GlobalState, ShimPlatform};
@@ -145,7 +146,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
             HalfPipeType::SenderHalf => Mode::WUSR,
             HalfPipeType::ReceiverHalf => Mode::RUSR,
         };
-        Ok(read_write_mode.bits() | InodeType::NamedPipe as u32)
+        Ok(u32::from(read_write_mode.bits()) | InodeType::NamedPipe as u32)
     }
 
     pub(crate) fn with_linux_pipe_iopollable<R>(

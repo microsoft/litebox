@@ -40,13 +40,14 @@ use litebox::event::{
     polling::{Pollee, TryOpError},
 };
 use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry};
+use litebox::fs::OFlags;
 use litebox::fs::errors::{
     FileStatusError, MkdirError, OpenError, PathError, ReadDirError, ReadError, WriteError,
 };
-use litebox::fs::{FileType, Mode, OFlags};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox::sync::Mutex;
 use litebox::utils::TruncateExt;
+use litebox_broker_protocol::fs::{FileMode as Mode, FileType};
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
@@ -2476,6 +2477,7 @@ mod tests {
     use super::*;
     use core::mem::size_of;
     use litebox::LiteBox;
+    use litebox_broker_protocol::fs::{FileMode, FileUser};
 
     extern crate std;
 
@@ -2542,9 +2544,7 @@ mod tests {
     /// The store's defaults are written on first use, so callers observe them through any
     /// registry operation, exactly as a guest does.
     fn test_registry() -> (LiteBox<TestPlatform>, RegistryStore<TestPlatform>) {
-        let mode = litebox_broker_core::fs::Mode::RWXU
-            | litebox_broker_core::fs::Mode::RWXG
-            | litebox_broker_core::fs::Mode::RWXO;
+        let mode = FileMode::RWXU | FileMode::RWXG | FileMode::RWXO;
         let litebox = crate::test_broker::litebox_with_broker_files(
             test_platform(),
             alloc::vec![
@@ -2552,14 +2552,14 @@ mod tests {
                     "/".into(),
                     litebox_broker_core::fs::in_mem::InitialNode::Directory {
                         mode,
-                        owner: litebox_broker_core::fs::UserInfo::ROOT,
+                        owner: FileUser::ROOT,
                     },
                 ),
                 (
                     "/registry".into(),
                     litebox_broker_core::fs::in_mem::InitialNode::Directory {
                         mode,
-                        owner: litebox_broker_core::fs::UserInfo::ROOT,
+                        owner: FileUser::ROOT,
                     },
                 ),
             ],

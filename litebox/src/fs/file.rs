@@ -14,8 +14,8 @@ use core::num::NonZeroUsize;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{
-    FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileNodeInfo, FileOpenFlags,
-    FileSeekWhence, FileStatus as BrokerFileStatus, FileType, FileUser,
+    FileAccessMode, FileDirectoryEntry, FileError, FileMode as Mode, FileNodeInfo, FileOpenFlags,
+    FileSeekWhence as SeekWhence, FileStatus as BrokerFileStatus, FileType, FileUser as UserInfo,
 };
 
 use crate::path::Arg;
@@ -25,46 +25,6 @@ use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
     ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
 };
-
-bitflags! {
-    /// `S_I*` constants for open, ...
-    #[repr(transparent)]
-    #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
-    pub struct Mode: c_uint {
-        /// `S_IRWXU`: user (file owner) has read, write, and execute permission
-        const RWXU = 0o00700;
-        /// `S_IRUSR`: user has read permission
-        const RUSR = 0o00400;
-        /// `S_IWUSR`: user has write permission
-        const WUSR = 0o00200;
-        /// `S_IXUSR`: user has execute permission
-        const XUSR = 0o00100;
-        /// `S_IRWXG`: group has read, write, and execute permission
-        const RWXG = 0o00070;
-        /// `S_IRGRP`: group has read permission
-        const RGRP = 0o00040;
-        /// `S_IWGRP`: group has write permission
-        const WGRP = 0o00020;
-        /// `S_IXGRP`: group has execute permission
-        const XGRP = 0o00010;
-        /// `S_IRWXO`: others have read, write, and execute permission
-        const RWXO = 0o00007;
-        /// `S_IROTH`: others have read permission
-        const ROTH = 0o00004;
-        /// `S_IWOTH`: others have write permission
-        const WOTH = 0o00002;
-        /// `S_IXOTH`: others have execute permission
-        const XOTH = 0o00001;
-        /// `S_ISUID`: set-user-ID bit
-        const SUID = 0o0004000;
-        /// `S_ISGID`: set-group-ID bit (see inode(7)).
-        const SGID = 0o0002000;
-        /// `S_ISVTX`: sticky bit (see inode(7)).
-        const SVTX = 0o0001000;
-        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
-        const _ = !0;
-    }
-}
 
 bitflags! {
     /// `O_*` constants for use with open, ...
@@ -152,17 +112,6 @@ bitflags! {
     }
 }
 
-/// The `whence` directive to [`LiteBox::seek_file`].
-#[derive(Copy, Clone)]
-pub enum SeekWhence {
-    /// The file offset is set to `offset` bytes.
-    RelativeToBeginning,
-    /// The file offset is set to its current location plus `offset` bytes.
-    RelativeToCurrentOffset,
-    /// The file offset is set to the size of the file plus `offset` bytes.
-    RelativeToEnd,
-}
-
 /// The status of a file/directory/... on the file-system, inspired by `stat(3type)`.
 ///
 /// This is explicitly a non-exhaustive struct with public members. As LiteBox evolves, more
@@ -185,15 +134,6 @@ pub struct FileStatus {
     pub blksize: usize,
 }
 
-/// User information
-#[derive(Clone, Copy, Debug)]
-pub struct UserInfo {
-    /// User ID for the owner
-    pub user: u16,
-    /// Group ID for the owner
-    pub group: u16,
-}
-
 /// Device/Inode information
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 pub struct NodeInfo {
@@ -212,11 +152,6 @@ pub struct DirEntry {
     pub name: String,
     pub file_type: FileType,
     pub ino_info: Option<NodeInfo>,
-}
-
-impl UserInfo {
-    /// The root user
-    pub const ROOT: Self = Self { user: 0, group: 0 };
 }
 
 /// Type marker for file descriptors backed by broker-owned files.
@@ -248,10 +183,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
         let handle = broker
             .open_file(
                 &path,
-                file_user(context.acting_user()),
+                context.acting_user(),
                 access,
                 flags,
-                file_mode(mode),
+                mode & Mode::SUPPORTED,
             )
             .map_err(|_| OpenError::Io)?
             .map_err(open_error)?;
@@ -324,7 +259,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
         let offset = i64::try_from(offset).map_err(|_| SeekError::InvalidOffset)?;
         let offset = file
             .broker
-            .seek_file(file.handle, offset, file_seek_whence(whence))
+            .seek_file(file.handle, offset, whence)
             .map_err(|error| broker_fd_error(error, SeekError::ClosedFd, SeekError::Io))?
             .map_err(seek_error)?;
         usize::try_from(offset).map_err(|_| SeekError::InvalidOffset)
@@ -358,7 +293,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
         let path = Self::broker_path(context, path)?;
         self.broker_control()
             .ok_or(ChmodError::Io)?
-            .chmod_file(&path, file_user(context.acting_user()), file_mode(mode))
+            .chmod_file(&path, context.acting_user(), mode & Mode::SUPPORTED)
             .map_err(|_| ChmodError::Io)?
             .map_err(chmod_error)
     }
@@ -374,7 +309,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
         let path = Self::broker_path(context, path)?;
         self.broker_control()
             .ok_or(ChownError::Io)?
-            .chown_file(&path, file_user(context.acting_user()), user, group)
+            .chown_file(&path, context.acting_user(), user, group)
             .map_err(|_| ChownError::Io)?
             .map_err(chown_error)
     }
@@ -384,7 +319,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
         let path = Self::broker_path(context, path)?;
         self.broker_control()
             .ok_or(UnlinkError::Io)?
-            .unlink_file(&path, file_user(context.acting_user()))
+            .unlink_file(&path, context.acting_user())
             .map_err(|_| UnlinkError::Io)?
             .map_err(unlink_error)
     }
@@ -399,7 +334,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
         let path = Self::broker_path(context, path)?;
         self.broker_control()
             .ok_or(MkdirError::Io)?
-            .mkdir_file(&path, file_user(context.acting_user()), file_mode(mode))
+            .mkdir_file(&path, context.acting_user(), mode & Mode::SUPPORTED)
             .map_err(|_| MkdirError::Io)?
             .map_err(mkdir_error)
     }
@@ -409,7 +344,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
         let path = Self::broker_path(context, path)?;
         self.broker_control()
             .ok_or(RmdirError::Io)?
-            .rmdir_file(&path, file_user(context.acting_user()))
+            .rmdir_file(&path, context.acting_user())
             .map_err(|_| RmdirError::Io)?
             .map_err(rmdir_error)
     }
@@ -438,7 +373,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
         let status = self
             .broker_control()
             .ok_or(FileStatusError::Io)?
-            .path_file_status(&path, file_user(context.acting_user()))
+            .path_file_status(&path, context.acting_user())
             .map_err(|_| FileStatusError::Io)?
             .map_err(file_status_error)?;
         file_status(status)
@@ -605,27 +540,6 @@ fn file_open_options(flags: OFlags) -> Result<(FileAccessMode, FileOpenFlags), O
     Ok((access, output))
 }
 
-fn file_mode(mode: Mode) -> FileMode {
-    let bits = u16::try_from(mode.bits() & u32::from(FileMode::SUPPORTED.bits()))
-        .expect("supported file mode bits fit in u16");
-    FileMode::from_bits(bits).expect("masked file mode bits are supported")
-}
-
-const fn file_user(user: UserInfo) -> FileUser {
-    FileUser {
-        user: user.user,
-        group: user.group,
-    }
-}
-
-const fn file_seek_whence(whence: SeekWhence) -> FileSeekWhence {
-    match whence {
-        SeekWhence::RelativeToBeginning => FileSeekWhence::Beginning,
-        SeekWhence::RelativeToCurrentOffset => FileSeekWhence::Current,
-        SeekWhence::RelativeToEnd => FileSeekWhence::End,
-    }
-}
-
 fn broker_fd_error<T>(error: crate::broker::error::BrokerControlError, closed: T, io: T) -> T {
     match error {
         crate::broker::error::BrokerControlError::Broker(
@@ -636,6 +550,8 @@ fn broker_fd_error<T>(error: crate::broker::error::BrokerControlError, closed: T
     }
 }
 
+// TODO: Define canonical per-operation protocol errors so these conversions can be removed without
+// broadening every LiteBox file API to the full set of `FileError` variants.
 fn path_error(error: FileError) -> Option<PathError> {
     match error {
         FileError::NoSuchFileOrDirectory => Some(PathError::NoSuchFileOrDirectory),
@@ -776,12 +692,9 @@ fn file_status_error(error: FileError) -> FileStatusError {
 fn file_status(status: BrokerFileStatus) -> Result<FileStatus, FileStatusError> {
     Ok(FileStatus {
         file_type: status.file_type,
-        mode: Mode::from_bits_retain(u32::from(status.mode.bits())),
+        mode: status.mode,
         size: usize::try_from(status.size).map_err(|_| FileStatusError::Io)?,
-        owner: UserInfo {
-            user: status.owner.user,
-            group: status.owner.group,
-        },
+        owner: status.owner,
         node_info: status_node_info(status.node_info)?,
         blksize: usize::try_from(status.block_size).map_err(|_| FileStatusError::Io)?,
     })

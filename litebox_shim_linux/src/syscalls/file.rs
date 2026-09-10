@@ -11,11 +11,14 @@ use alloc::{
 use litebox::{
     event::{Events, wait::WaitError},
     fd::{FdEnabledSubsystem, MetadataError, TypedFd},
-    fs::{Mode, OFlags, SeekWhence},
+    fs::OFlags,
     mm::linux::PAGE_SIZE,
     path,
     stdio::StdioStream,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
+};
+use litebox_broker_protocol::fs::{
+    FileMode as Mode, FileSeekWhence as SeekWhence, FileType, FileUser,
 };
 use litebox_common_linux::{
     AccessFlags, AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat,
@@ -33,8 +36,8 @@ struct AccessUserInfo {
     group: u32,
 }
 
-impl From<litebox::fs::UserInfo> for AccessUserInfo {
-    fn from(value: litebox::fs::UserInfo) -> Self {
+impl From<FileUser> for AccessUserInfo {
+    fn from(value: FileUser) -> Self {
         Self {
             user: u32::from(value.user),
             group: u32::from(value.group),
@@ -62,7 +65,7 @@ impl<Platform: ShimPlatform> Clone for FsState<Platform> {
 impl<Platform: ShimPlatform> FsState<Platform> {
     /// Create the state for a task running as `credentials`.
     pub fn new(credentials: &super::process::Credentials) -> Self {
-        let user_info = litebox::fs::UserInfo {
+        let user_info = FileUser {
             // XXX: Linux ids are 32-bit, but the core litebox file system uses 16-bit ones, so we
             // may need to widen `UserInfo`.
             user: u16::try_from(credentials.euid)
@@ -73,14 +76,20 @@ impl<Platform: ShimPlatform> FsState<Platform> {
         let mut context = litebox::fs::Context::new();
         context.set_acting_user(user_info);
         Self {
-            umask: (Mode::WGRP | Mode::WOTH).bits().into(),
+            umask: u32::from((Mode::WGRP | Mode::WOTH).bits()).into(),
             context: litebox::sync::RwLock::new(context),
         }
     }
 
     fn umask(&self) -> Mode {
-        Mode::from_bits_retain(self.umask.load(Ordering::Relaxed))
+        file_mode_from_linux(self.umask.load(Ordering::Relaxed))
     }
+}
+
+fn file_mode_from_linux(mode: u32) -> Mode {
+    let bits = u16::try_from(mode & u32::from(Mode::SUPPORTED.bits()))
+        .expect("supported file mode bits fit in u16");
+    Mode::from_bits_retain(bits)
 }
 
 /// Task state shared by `CLONE_FILES`.
@@ -430,13 +439,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Handle syscall `umask`
     pub(crate) fn sys_umask(&self, new_mask: u32) -> Mode {
-        let new_mask = Mode::from_bits_truncate(new_mask) & (Mode::RWXU | Mode::RWXG | Mode::RWXO);
+        let new_mask = file_mode_from_linux(new_mask) & (Mode::RWXU | Mode::RWXG | Mode::RWXO);
         let old_mask = self
             .fs
             .borrow()
             .umask
-            .swap(new_mask.bits(), Ordering::Relaxed);
-        Mode::from_bits_retain(old_mask)
+            .swap(new_mask.bits().into(), Ordering::Relaxed);
+        file_mode_from_linux(old_mask)
     }
 
     /// Handle syscall `open`
@@ -496,7 +505,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
         match file_type {
             InodeType::File => {
-                let mode = Mode::from_bits_truncate(mode_and_type & !FILE_TYPE_MASK);
+                let mode = file_mode_from_linux(mode_and_type & !FILE_TYPE_MASK);
                 let file = self.do_openat(
                     dirfd,
                     pathname,
@@ -892,7 +901,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         mode: u32,
     ) -> Result<(), Errno> {
         let pathname = self.resolve_path_at(dirfd, pathname)?;
-        self.do_mkdir(pathname, Mode::from_bits_retain(mode))
+        self.do_mkdir(pathname, file_mode_from_linux(mode))
     }
 
     pub(crate) fn do_close(&self, raw_fd: usize) -> Result<(), Errno> {
@@ -1446,7 +1455,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     group: stat.st_gid,
                 };
                 Self::do_access_mode(
-                    Mode::from_bits_truncate(stat.st_mode & 0o7777),
+                    file_mode_from_linux(stat.st_mode & 0o7777),
                     owner,
                     caller,
                     &mode,
@@ -1555,8 +1564,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             ..Default::default()
         };
         let socket_mode = litebox_common_linux::InodeType::Socket as u32
-            | (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits();
-        let rw_user_mode = (Mode::RUSR | Mode::WUSR).bits();
+            | u32::from((Mode::RWXU | Mode::RWXG | Mode::RWXO).bits());
+        let rw_user_mode = u32::from((Mode::RUSR | Mode::WUSR).bits());
         let files = self.files.borrow();
         fd.dispatch(
             |fd| files.fs.file_status(fd).map(T::from).map_err(Errno::from),
@@ -1910,7 +1919,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Handle syscall `chdir`
     pub fn sys_chdir(&self, pathname: impl path::Arg) -> Result<(), Errno> {
-        use litebox::fs::FileType;
         use litebox::fs::errors::{FileStatusError, PathError};
 
         let fs = self.fs.borrow();
@@ -2054,8 +2062,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             Ok(status) => {
                 // See https://www.kernel.org/doc/Documentation/admin-guide/devices.txt
                 let major = status.node_info.rdev.map_or(0, |v| v.get() >> 8);
-                Ok((136..=143).contains(&major)
-                    && status.file_type == litebox::fs::FileType::CharacterDevice)
+                Ok((136..=143).contains(&major) && status.file_type == FileType::CharacterDevice)
             }
             Err(litebox::fs::errors::FileStatusError::ClosedFd) => Err(Errno::EBADF),
             Err(_) => unimplemented!(),
@@ -2753,7 +2760,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 ino: entry.ino_info.as_ref().map_or(0, |node_info| node_info.ino) as u64,
                 off: dir_off as u64,
                 len: len.trunc(),
-                typ: litebox_common_linux::DirentType::from(entry.file_type.clone()) as u8,
+                typ: litebox_common_linux::DirentType::from(entry.file_type) as u8,
                 __name: [0; 0],
             };
             let hdr_ptr = UserPtrMut::from_usize(dirp.as_usize() + nbytes);
@@ -2790,7 +2797,7 @@ mod tests {
     use super::*;
     use alloc::string::String;
     use core::cell::Cell;
-    use litebox::fs::{Mode, OFlags};
+    use litebox::fs::OFlags;
 
     extern crate std;
 
@@ -3098,7 +3105,7 @@ mod tests {
             task.sys_mknodat(
                 litebox_common_linux::AT_FDCWD,
                 "/mknodat_at_fd_limit",
-                InodeType::File as u32 | (Mode::RUSR | Mode::WUSR).bits(),
+                InodeType::File as u32 | u32::from((Mode::RUSR | Mode::WUSR).bits()),
                 0,
             ),
             Ok(())
@@ -3152,7 +3159,7 @@ mod tests {
             task.sys_mknodat(
                 litebox_common_linux::AT_FDCWD,
                 "",
-                InodeType::File as u32 | Mode::RWXU.bits(),
+                InodeType::File as u32 | u32::from(Mode::RWXU.bits()),
                 0,
             )
             .unwrap_err(),

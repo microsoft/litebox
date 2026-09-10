@@ -1527,6 +1527,7 @@ dependencies = [
 name = "litebox_broker_protocol"
 version = "0.1.0"
 dependencies = [
+ "bitflags",
  "thiserror",
 ]
 
@@ -1589,6 +1590,7 @@ dependencies = [
  "elf",
  "int-enum",
  "litebox",
+ "litebox_broker_protocol",
  "syscalls",
  "thiserror",
  "zerocopy",
