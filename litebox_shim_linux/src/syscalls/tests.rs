@@ -381,7 +381,7 @@ fn getdirent64_encodes_the_entries_the_broker_returns() {
     let entries = vec![
         directory_entry(".", FileType::Directory, 1),
         directory_entry("..", FileType::Directory, 1),
-        directory_entry("file.txt", FileType::RegularFile, 7),
+        directory_entry("file.txt", FileType::RegularFile, u64::MAX),
         directory_entry("sub", FileType::Directory, 9),
     ];
     let (files, task) = scripted_task([]);
@@ -409,7 +409,7 @@ fn getdirent64_encodes_the_entries_the_broker_returns() {
         vec![
             (".".into(), DirentType::Directory as u8, 1, 0),
             ("..".into(), DirentType::Directory as u8, 1, 1),
-            ("file.txt".into(), DirentType::Regular as u8, 7, 2),
+            ("file.txt".into(), DirentType::Regular as u8, u64::MAX, 2),
             ("sub".into(), DirentType::Directory as u8, 9, 3),
         ],
         "entries are reported sorted by name, with their broker type and inode"

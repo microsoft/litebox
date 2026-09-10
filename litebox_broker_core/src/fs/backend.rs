@@ -8,14 +8,16 @@ use alloc::vec::Vec;
 use core::any::{Any, TypeId};
 use core::marker::PhantomData;
 
-use litebox_broker_protocol::fs::{FileMode as Mode, FileUser as UserInfo};
+use litebox_broker_protocol::fs::{
+    FileDirectoryEntry, FileMode as Mode, FileStatus, FileUser as UserInfo,
+};
 use litebox_broker_protocol::stdio::StdioOutputStream;
 
+use super::OFlags;
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, ReadDirError, ReadError,
     RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
 };
-use super::{DirEntry, FileStatus, OFlags};
 
 // This duplicates the cloneable type-erasure support from `litebox::utilities::anymap` because
 // broker core cannot depend on LiteBox. Keep it local unless broader reuse justifies a common home.
@@ -139,7 +141,7 @@ pub trait Backend: private::Sealed + Send + Sync + Any {
     ) -> Result<Permissioned<FileHandle>, OpenError>;
 
     /// Read directory entries at `dir`.
-    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError>;
+    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<FileDirectoryEntry>, ReadDirError>;
 
     /// Read at `offset` into `buf`, returning the number of bytes read.
     ///

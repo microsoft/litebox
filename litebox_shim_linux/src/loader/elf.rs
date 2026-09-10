@@ -7,7 +7,7 @@ use alloc::{ffi::CString, vec::Vec};
 use litebox::{
     fs::OFlags,
     mm::linux::{CreatePagesFlags, MappingError, PAGE_SIZE},
-    utils::{ReinterpretSignedExt, TruncateExt},
+    utils::ReinterpretSignedExt,
 };
 use litebox_broker_protocol::fs::FileMode as Mode;
 use litebox_common_linux::{MapFlags, errno::Errno, loader::ElfParsedFile};
@@ -56,28 +56,23 @@ impl<Platform: ShimPlatform> litebox_common_linux::loader::ReadAt for &'_ ElfFil
                 return Ok(());
             }
             // Try to read the remaining bytes
-            let bytes_read = self.task.sys_read(self.fd, buf, Some(offset.trunc()))?;
+            let file_offset = usize::try_from(offset).map_err(|_| Errno::EOVERFLOW)?;
+            let bytes_read = self.task.sys_read(self.fd, buf, Some(file_offset))?;
             if bytes_read == 0 {
                 // reached the end of the file
                 return Err(Errno::ENODATA);
             } else {
                 // Successfully read some bytes
                 buf = &mut buf[bytes_read..];
-                offset += bytes_read as u64;
+                offset = offset
+                    .checked_add(bytes_read as u64)
+                    .ok_or(Errno::EOVERFLOW)?;
             }
         }
     }
 
     fn size(&mut self) -> Result<u64, Self::Error> {
-        #[cfg(target_arch = "x86_64")]
-        {
-            Ok(self.task.sys_fstat(self.fd)?.st_size as u64)
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            // The asm-generic ABI uses signed `st_size`; reject negative sizes.
-            u64::try_from(self.task.sys_fstat(self.fd)?.st_size).map_err(|_| Errno::EINVAL)
-        }
+        Ok(self.task.file_status(self.fd)?.size)
     }
 }
 
@@ -149,7 +144,7 @@ impl<Platform: ShimPlatform> litebox_common_linux::loader::MapMemory for ElfFile
             prot.flags(),
             MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
             self.fd,
-            offset.trunc(),
+            usize::try_from(offset).map_err(|_| Errno::EOVERFLOW)?,
         )?;
         Ok(())
     }
@@ -389,6 +384,26 @@ mod tests {
     use litebox_common_linux::loader::MapMemory as _;
 
     use super::*;
+
+    #[test]
+    fn elf_file_size_retains_protocol_width() {
+        use crate::syscalls::test_broker::{Scripted, closed, opened, status};
+        use crate::syscalls::tests::{FILE_HANDLE, scripted_task};
+        use litebox_broker_protocol::fs::{FileStatus, FileType};
+        use litebox_broker_protocol::message::FileResponse;
+        use litebox_common_linux::loader::ReadAt as _;
+
+        let (files, task) = scripted_task([opened(FILE_HANDLE)]);
+        let file = ElfFile::new(&task, "/large").unwrap();
+        files.script([
+            Scripted::Reply(FileResponse::HandleStatus(FileStatus {
+                size: u64::MAX,
+                ..status(FileType::RegularFile, 0o644)
+            })),
+            closed(),
+        ]);
+        assert_eq!((&file).size().unwrap(), u64::MAX);
+    }
 
     #[test]
     fn interpreter_reservation_is_top_down_above_low_heap() {

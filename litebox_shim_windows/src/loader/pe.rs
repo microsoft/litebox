@@ -959,7 +959,7 @@ pub(crate) fn load_image_section<Platform: crate::ShimPlatform>(
 
 pub(crate) struct ImageSectionMetadata {
     pub(crate) transfer_address: usize,
-    pub(crate) file_size: u32,
+    pub(crate) file_size: u64,
     pub(crate) subsystem: u32,
     pub(crate) subsystem_major_version: u16,
     pub(crate) subsystem_minor_version: u16,
@@ -978,9 +978,7 @@ pub(crate) fn image_section_metadata<Platform: crate::ShimPlatform>(
         .fs
         .file_status(&file.fd)
         .map_err(PeImageAccessError::FileStatus)?
-        .size
-        .try_into()
-        .map_err(|_| PeImageAccessError::AddressOverflow)?;
+        .size;
     Ok(ImageSectionMetadata {
         transfer_address: parsed
             .image_base()
@@ -1163,11 +1161,7 @@ impl<Platform: crate::ShimPlatform> ReadAt for &'_ PeImageFile<Platform> {
     }
 
     fn size(&mut self) -> Result<u64, Self::Error> {
-        self.fs
-            .file_status(&self.fd)?
-            .size
-            .try_into()
-            .map_err(|_| PeImageAccessError::AddressOverflow)
+        Ok(self.fs.file_status(&self.fd)?.size)
     }
 }
 

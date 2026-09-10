@@ -5,6 +5,7 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::num::NonZeroU64;
 
 use bitflags::bitflags;
 use thiserror::Error;
@@ -47,14 +48,14 @@ pub enum FileType {
 }
 
 /// Device and inode identity.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FileNodeInfo {
     /// Device number.
     pub dev: u64,
     /// Inode number.
     pub ino: u64,
-    /// Referenced device number for special files.
-    pub rdev: Option<u64>,
+    /// Nonzero referenced device number for special files.
+    pub rdev: Option<NonZeroU64>,
 }
 
 /// Status returned for a fs object.
@@ -572,7 +573,9 @@ pub fn try_decode_directory_entries(
                 let ino = decoder.u64()?;
                 let rdev = match decoder.u8()? {
                     0 => None,
-                    1 => Some(decoder.u64()?),
+                    1 => Some(
+                        NonZeroU64::new(decoder.u64()?).ok_or(DirectoryPayloadError::Malformed)?,
+                    ),
                     _ => return Err(DirectoryPayloadError::Malformed.into()),
                 };
                 Some(FileNodeInfo { dev, ino, rdev })
@@ -674,7 +677,7 @@ fn encode_directory_entry(
             match node_info.rdev {
                 Some(rdev) => {
                     output.push(1);
-                    output.extend_from_slice(&rdev.to_le_bytes());
+                    output.extend_from_slice(&rdev.get().to_le_bytes());
                 }
                 None => output.push(0),
             }
@@ -746,7 +749,7 @@ mod tests {
                 node_info: Some(FileNodeInfo {
                     dev: 5,
                     ino: 7,
-                    rdev: Some(11),
+                    rdev: NonZeroU64::new(11),
                 }),
             },
         ];
@@ -763,7 +766,7 @@ mod tests {
             node_info: Some(FileNodeInfo {
                 dev: 2,
                 ino: 3,
-                rdev: Some(5),
+                rdev: NonZeroU64::new(5),
             }),
         }])
         .unwrap();
@@ -806,6 +809,28 @@ mod tests {
             encode_directory_entries_chunk(&entries, 2, first_two_length).unwrap();
         assert_eq!(decode_directory_entries(&last).unwrap(), entries[2..]);
         assert_eq!(next_index, None);
+    }
+
+    #[test]
+    fn directory_payload_preserves_full_width_node_info_and_rejects_zero_rdev() {
+        let entries = [FileDirectoryEntry {
+            name: "device".into(),
+            file_type: FileType::CharacterDevice,
+            node_info: Some(FileNodeInfo {
+                dev: u64::MAX,
+                ino: u64::MAX,
+                rdev: Some(NonZeroU64::MAX),
+            }),
+        }];
+        let mut payload = encode_directory_entries(&entries).unwrap();
+        assert_eq!(decode_directory_entries(&payload).unwrap(), entries);
+
+        let rdev_start = payload.len() - size_of::<u64>();
+        payload[rdev_start..].fill(0);
+        assert_eq!(
+            decode_directory_entries(&payload),
+            Err(DirectoryPayloadError::Malformed)
+        );
     }
 
     #[test]

@@ -73,7 +73,7 @@ pub(crate) struct SectionHandleObject<Platform: ShimPlatform> {
 
 pub(crate) struct SectionObject<Platform: ShimPlatform> {
     fs_path: Option<String>,
-    size: usize,
+    size: u64,
     attributes: SectionAllocationAttributes,
     protection: PageProtection,
     backing: SectionBacking,
@@ -315,7 +315,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
         let section = Arc::new(SectionObject {
             fs_path: None,
-            size,
+            size: size as u64,
             attributes,
             protection,
             backing: SectionBacking::Pagefile,
@@ -361,7 +361,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
         let section = Arc::new(SectionObject {
             fs_path: Some(fs_path),
-            size: metadata.file_size as usize,
+            size: metadata.file_size,
             attributes: SectionAllocationAttributes::SEC_FILE
                 | SectionAllocationAttributes::SEC_IMAGE,
             protection: PageProtection::PAGE_EXECUTE_WRITECOPY,
@@ -723,16 +723,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
         page_protection: PageProtection,
         permissions: MemoryRegionPermissions,
     ) -> Result<MappedPagefileSectionView, NtStatus> {
-        if section_offset > section.size {
-            return Err(NtStatus::INVALID_VIEW_SIZE);
-        }
-        let remaining = section.size - section_offset;
+        let remaining = section
+            .size
+            .checked_sub(section_offset as u64)
+            .ok_or(NtStatus::INVALID_VIEW_SIZE)?;
         let view_size = if requested_view_size == 0 {
-            remaining
+            usize::try_from(remaining).map_err(|_| NtStatus::INVALID_VIEW_SIZE)?
         } else {
             requested_view_size
         };
-        if view_size == 0 || view_size > remaining {
+        if view_size == 0 || view_size as u64 > remaining {
             return Err(NtStatus::INVALID_VIEW_SIZE);
         }
         let mapped_size = view_size
@@ -837,11 +837,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return NtStatus::INVALID_VIEW_SIZE;
         }
         let view_size = if requested_view_size == 0 {
-            section.size
+            let Ok(size) = usize::try_from(section.size) else {
+                return NtStatus::INVALID_VIEW_SIZE;
+            };
+            size
         } else {
             requested_view_size
         };
-        if view_size == 0 || view_size > section.size {
+        if view_size == 0 || view_size as u64 > section.size {
             return NtStatus::INVALID_VIEW_SIZE;
         }
         let Some(mapped_size) = view_size.checked_next_multiple_of(PAGE_SIZE) else {
@@ -1044,7 +1047,7 @@ pub(crate) fn load_time_windows_shared_section<Platform: ShimPlatform>(
     // pointers instead of exposing a zeroed generic pagefile section.
     Arc::new(SectionObject {
         fs_path: None,
-        size: WINDOWS_SHARED_SECTION_SIZE,
+        size: WINDOWS_SHARED_SECTION_SIZE as u64,
         attributes: SectionAllocationAttributes::SEC_COMMIT,
         protection: PageProtection::PAGE_READWRITE,
         backing: SectionBacking::CsrSharedSection { base },
@@ -1201,6 +1204,9 @@ fn write_section_image_information<Platform: ShimPlatform>(
         Err(crate::loader::WindowsLoadError::Access(_)) => return NtStatus::OBJECT_NAME_NOT_FOUND,
         Err(_) => return NtStatus::INVALID_FILE_FOR_SECTION,
     };
+    let Ok(image_file_size) = u32::try_from(metadata.file_size) else {
+        return NtStatus::SECTION_TOO_BIG;
+    };
     // Host ntdll reports ReturnLength=64 for SectionImageInformation on x64; the public
     // winternl.h layout ends at CheckSum and has no trailing extension fields.
     let info = SectionImageInformation {
@@ -1219,7 +1225,7 @@ fn write_section_image_information<Platform: ShimPlatform>(
         image_contains_code: 1,
         image_flags: 0,
         loader_flags: 0,
-        image_file_size: metadata.file_size,
+        image_file_size,
         checksum: 0,
     };
     let output =

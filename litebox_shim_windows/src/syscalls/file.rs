@@ -9,14 +9,16 @@ use core::mem::{align_of, offset_of, size_of};
 
 use int_enum::IntEnum;
 use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry};
+use litebox::fs::OFlags;
 use litebox::fs::errors::{
     FileStatusError, MkdirError, OpenError, PathError, ReadDirError, ReadError, SeekError,
     WriteError,
 };
-use litebox::fs::{FileStatus, OFlags};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider};
 use litebox::utils::TruncateExt as _;
-use litebox_broker_protocol::fs::{FileMode as Mode, FileSeekWhence as SeekWhence, FileType};
+use litebox_broker_protocol::fs::{
+    FileMode as Mode, FileSeekWhence as SeekWhence, FileStatus, FileType,
+};
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::byteorder::native_endian::U32;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
@@ -262,7 +264,7 @@ struct FileStatusMetadata {
     end_of_file: i64,
     allocation_size: i64,
     file_attributes: FileAttributes,
-    file_id: Option<u64>,
+    file_id: u64,
     file_id_128: [u8; 16],
 }
 
@@ -279,14 +281,12 @@ impl FileStatusMetadata {
         let end_of_file = i64::try_from(status.size).unwrap_or(i64::MAX);
         let allocation_size = status
             .size
-            .checked_next_multiple_of(status.blksize.max(1))
+            .checked_next_multiple_of(status.block_size.max(1))
             .and_then(|size| i64::try_from(size).ok())
             .unwrap_or(i64::MAX);
-        let file_id = u64::try_from(status.node_info.ino).ok();
+        let file_id = status.node_info.ino;
         let mut file_id_128 = [0; 16];
-        if let Some(file_id) = file_id {
-            file_id_128[..size_of::<u64>()].copy_from_slice(&file_id.to_ne_bytes());
-        }
+        file_id_128[..size_of::<u64>()].copy_from_slice(&file_id.to_ne_bytes());
         Self {
             end_of_file,
             allocation_size,
@@ -305,9 +305,7 @@ impl DirectoryEntry {
             end_of_file: metadata.end_of_file,
             allocation_size: metadata.allocation_size,
             file_attributes: metadata.file_attributes,
-            file_id: metadata
-                .file_id
-                .map_or(-1, |file_id| i64::from_ne_bytes(file_id.to_ne_bytes())),
+            file_id: i64::from_ne_bytes(metadata.file_id.to_ne_bytes()),
         }
     }
 }
@@ -1099,9 +1097,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         let metadata = FileStatusMetadata::from_status(&status);
         // TODO(fs-timestamps): Populate timestamps when FileStatus exposes them.
         let information = FileStatBasicInformation {
-            file_id: metadata
-                .file_id
-                .map_or(0, |file_id| i64::from_ne_bytes(file_id.to_ne_bytes())),
+            file_id: i64::from_ne_bytes(metadata.file_id.to_ne_bytes()),
             allocation_size: metadata.allocation_size,
             end_of_file: metadata.end_of_file,
             file_attributes: metadata.file_attributes.bits(),
@@ -1676,7 +1672,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                 let status = file
                     .with_entry(|file| self.fs.path_file_status(&self.fs_context, &file.path))
                     .map_err(map_file_status_error)?;
-                Some(status.size)
+                Some(usize::try_from(status.size).map_err(|_| NtStatus::INVALID_PARAMETER)?)
             }
             Some(FILE_USE_FILE_POINTER_POSITION) | None => None,
             Some(offset) if offset >= 0 => {
@@ -1695,7 +1691,11 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                 "Ignoring file I/O byte-range lock key; byte-range locking is not supported yet"
             );
         }
-        if offset.is_some_and(|offset| offset.checked_add(length).is_none()) {
+        if offset.is_some_and(|offset| {
+            offset
+                .checked_add(length)
+                .is_none_or(|end| isize::try_from(end).is_err())
+        }) {
             return Err(NtStatus::INVALID_PARAMETER);
         }
         if !event.is_null() {
@@ -2810,6 +2810,41 @@ mod tests {
     const FILE_OPEN: u32 = 1;
     const FILE_CREATE: u32 = 2;
     const FILE_OVERWRITE: u32 = 4;
+
+    #[test]
+    fn status_metadata_preserves_inode_bits_and_saturates_signed_lengths() {
+        let status = FileStatus {
+            file_type: FileType::RegularFile,
+            mode: Mode::RUSR | Mode::WUSR,
+            size: u64::MAX,
+            owner: litebox_broker_protocol::fs::FileUser::ROOT,
+            node_info: litebox_broker_protocol::fs::FileNodeInfo {
+                dev: u64::MAX,
+                ino: u64::MAX,
+                rdev: None,
+            },
+            block_size: 4096,
+        };
+        let metadata = FileStatusMetadata::from_status(&status);
+        assert_eq!(metadata.end_of_file, i64::MAX);
+        assert_eq!(metadata.allocation_size, i64::MAX);
+        assert_eq!(metadata.file_id, u64::MAX);
+        assert_eq!(&metadata.file_id_128[..8], &u64::MAX.to_ne_bytes());
+        assert_eq!(&metadata.file_id_128[8..], &[0; 8]);
+        assert_eq!(
+            DirectoryEntry::from_status(String::from("large"), &status).file_id,
+            -1
+        );
+
+        let status = FileStatus {
+            size: 1,
+            block_size: u64::from(u32::MAX) + 1,
+            ..status
+        };
+        let metadata = FileStatusMetadata::from_status(&status);
+        assert_eq!(metadata.end_of_file, 1);
+        assert_eq!(metadata.allocation_size, i64::from(u32::MAX) + 1);
+    }
 
     fn open_object_attributes(
         path: &str,

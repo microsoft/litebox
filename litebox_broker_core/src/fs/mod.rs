@@ -11,8 +11,6 @@
 use bitflags::bitflags;
 
 use core::ffi::c_uint;
-use core::num::NonZeroUsize;
-use litebox_broker_protocol::fs::{FileMode as Mode, FileType, FileUser as UserInfo};
 
 pub mod backend;
 pub mod composer;
@@ -123,47 +121,5 @@ bitflags! {
     }
 }
 
-/// The status of a file/directory/... on the file-system, inspired by `stat(3type)`.
-///
-/// This is explicitly a non-exhaustive struct with public members. As LiteBox evolves, more
-/// elements might be added to this struct, allowing file systems to provide richer information
-/// about the status of files. However, users of LiteBox must not depend on the completeness or even
-/// layout of this particular type.
-#[non_exhaustive]
-pub struct FileStatus {
-    /// File type
-    pub file_type: FileType,
-    /// Permissions for the file
-    pub mode: Mode,
-    /// Size of the file, in bytes. This value considered informative if this is a regular file.
-    pub size: usize,
-    /// Owner of the file
-    pub owner: UserInfo,
-    /// Information about this particular node
-    pub node_info: NodeInfo,
-    /// Block size for file system I/O
-    pub blksize: usize,
-}
-
-/// Device/Inode information
-#[derive(PartialEq, Eq, Hash, Clone, Debug)]
-pub struct NodeInfo {
-    /// Device number
-    pub dev: usize,
-    /// Inode number
-    pub ino: usize,
-    /// Device that is being referred to (will be `Some(...)` only if special file)
-    pub rdev: Option<NonZeroUsize>,
-}
-
-/// Directory entries returned by [`resolver::Resolver::read_dir`]
-#[derive(Debug)]
-#[non_exhaustive]
-pub struct DirEntry {
-    pub name: alloc::string::String,
-    pub file_type: FileType,
-    pub ino_info: Option<NodeInfo>,
-}
-
 /// The size reported as the size of a directory.
-const DEFAULT_DIRECTORY_SIZE: usize = 4096;
+const DEFAULT_DIRECTORY_SIZE: u64 = 4096;

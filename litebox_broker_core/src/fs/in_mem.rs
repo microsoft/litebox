@@ -8,7 +8,9 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use hashbrown::HashMap;
 
-use litebox_broker_protocol::fs::{FileMode as Mode, FileType, FileUser as UserInfo};
+use litebox_broker_protocol::fs::{
+    FileDirectoryEntry, FileMode as Mode, FileNodeInfo, FileStatus, FileType, FileUser as UserInfo,
+};
 use litebox_platform::sync;
 
 use super::errors::{
@@ -16,7 +18,6 @@ use super::errors::{
     ReadError, RmdirError, TruncateError, UnlinkError, WriteError,
 };
 use super::inode_allocator::InodeAllocator;
-use super::{DirEntry, FileStatus, NodeInfo};
 
 /// A [`super::backend::Backend`] that stores all files in memory.
 ///
@@ -380,7 +381,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
     fn list_dir_at(
         &self,
         handle: super::backend::DirHandle,
-    ) -> Result<Vec<DirEntry>, ReadDirError> {
+    ) -> Result<Vec<FileDirectoryEntry>, ReadDirError> {
         Ok(handle
             .into_typed::<Self>()
             .dir
@@ -389,13 +390,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             .iter()
             .map(|(name, child)| {
                 let (file_type, node_info) = match child {
-                    Node::File(file) => (FileType::RegularFile, file.read().node_info.clone()),
-                    Node::Dir(dir) => (FileType::Directory, dir.read().node_info.clone()),
+                    Node::File(file) => (FileType::RegularFile, file.read().node_info),
+                    Node::Dir(dir) => (FileType::Directory, dir.read().node_info),
                 };
-                DirEntry {
+                FileDirectoryEntry {
                     name: name.clone(),
                     file_type,
-                    ino_info: Some(node_info),
+                    node_info: Some(node_info),
                 }
             })
             .collect())
@@ -467,10 +468,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                 Ok(FileStatus {
                     file_type: FileType::RegularFile,
                     mode: file.perms.mode,
-                    size: file.data.len(),
+                    size: u64::try_from(file.data.len()).map_err(|_| FileStatusError::Io)?,
                     owner: file.perms.userinfo,
-                    node_info: file.node_info.clone(),
-                    blksize: BLOCK_SIZE,
+                    node_info: file.node_info,
+                    block_size: BLOCK_SIZE,
                 })
             }
             super::backend::HandleRef::Dir(h) => {
@@ -480,8 +481,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                     mode: dir.perms.mode,
                     size: super::DEFAULT_DIRECTORY_SIZE,
                     owner: dir.perms.userinfo,
-                    node_info: dir.node_info.clone(),
-                    blksize: BLOCK_SIZE,
+                    node_info: dir.node_info,
+                    block_size: BLOCK_SIZE,
                 })
             }
         }
@@ -650,7 +651,7 @@ fn assert_supported_oflags(flags: super::OFlags) {
 
 /// Block size for file system I/O operations
 // TODO(jayb): Determine appropriate block size
-const BLOCK_SIZE: usize = 0;
+const BLOCK_SIZE: u64 = 0;
 
 enum Node<Platform: sync::RawSyncPrimitivesProvider> {
     File(FileNode<Platform>),
@@ -669,14 +670,14 @@ type DirNode<Platform> = Arc<sync::RwLock<Platform, DirData<Platform>>>;
 struct DirData<Platform: sync::RawSyncPrimitivesProvider> {
     perms: Permissions,
     children: HashMap<String, Node<Platform>>,
-    node_info: NodeInfo,
+    node_info: FileNodeInfo,
 }
 
 type FileNode<Platform> = Arc<sync::RwLock<Platform, FileData>>;
 struct FileData {
     perms: Permissions,
     data: alloc::borrow::Cow<'static, [u8]>,
-    node_info: NodeInfo,
+    node_info: FileNodeInfo,
 }
 
 #[derive(Clone, Debug)]

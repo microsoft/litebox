@@ -3,7 +3,7 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use super::NodeInfo;
+use litebox_broker_protocol::fs::FileNodeInfo;
 
 /// Hands out [`InodeAllocator`]s, each with its own device id.
 #[derive(Debug)]
@@ -53,20 +53,42 @@ impl InodeAllocator {
         Self::for_device(STANDALONE_DEVICE_ID)
     }
 
-    /// Allocate a fresh `NodeInfo` for a new entry on this backend.
+    /// Allocate a fresh [`FileNodeInfo`] for a new entry on this backend.
     #[must_use]
-    pub fn next(&self) -> NodeInfo {
+    pub fn next(&self) -> FileNodeInfo {
         let ino = self.counter.fetch_add(1, Ordering::Relaxed);
-        NodeInfo {
+        FileNodeInfo {
             dev: self.device_id(),
-            ino: ino.try_into().unwrap(),
+            ino,
             rdev: None,
         }
     }
 
     /// The device id this allocator hands out.
     #[must_use]
-    pub fn device_id(&self) -> usize {
-        self.device_id.try_into().unwrap()
+    pub fn device_id(&self) -> u64 {
+        self.device_id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preserves_full_width_device_and_inode_numbers() {
+        let allocator = InodeAllocator::for_device(u64::MAX);
+        allocator.counter.store(u64::MAX - 1, Ordering::Relaxed);
+
+        assert_eq!(allocator.device_id(), u64::MAX);
+        assert_eq!(
+            allocator.next(),
+            FileNodeInfo {
+                dev: u64::MAX,
+                ino: u64::MAX - 1,
+                rdev: None,
+            }
+        );
+        assert_eq!(allocator.next().ino, u64::MAX);
     }
 }

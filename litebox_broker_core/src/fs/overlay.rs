@@ -20,9 +20,12 @@ use alloc::vec::Vec;
 
 use hashbrown::{HashMap, HashSet};
 
-use litebox_broker_protocol::fs::{FileMode as Mode, FileType, FileUser as UserInfo};
+use litebox_broker_protocol::fs::{
+    FileDirectoryEntry, FileMode as Mode, FileNodeInfo, FileStatus, FileType, FileUser as UserInfo,
+};
 use litebox_platform::sync::{Mutex, MutexGuard, RawSyncPrimitivesProvider};
 
+use super::OFlags;
 use super::backend::{
     Backend, BackendHandles, CreationMetadata, DeviceIo, DirHandle, FileHandle, Handle, HandleRef,
     NoDeviceIo, PermissionCheck, PermissionInfo, Permissioned, SeekBehavior, WalkOutcome,
@@ -33,7 +36,6 @@ use super::errors::{
     ReadError, RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::inode_allocator::InodeAllocator;
-use super::{DirEntry, FileStatus, NodeInfo, OFlags};
 
 /// The reserved namespace prefix; no overlay-visible name may start with it.
 const MARKER_PREFIX: &str = ".litebox-overlay-";
@@ -60,17 +62,17 @@ struct Namespace;
 
 struct State {
     /// Overlay-visible identity assigned to each per-layer node.
-    ids: HashMap<LayerNode, NodeInfo>,
+    ids: HashMap<LayerNode, FileNodeInfo>,
     /// Files that have been copied up, by overlay identity, and their handle in the upper backend.
     /// A handle opened against a lower backend stays valid, but every operation looks here first.
-    copied_up: HashMap<NodeInfo, FileHandle>,
+    copied_up: HashMap<FileNodeInfo, FileHandle>,
 }
 
 /// A node as identified by the layer that owns it; `Lower` carries the lower backend's index.
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum LayerNode {
-    Upper(NodeInfo),
-    Lower(usize, NodeInfo),
+    Upper(FileNodeInfo),
+    Lower(usize, FileNodeInfo),
 }
 
 pub struct OverlayWalkingDir {
@@ -103,7 +105,7 @@ enum OverlayFileLayer {
         layer: usize,
         handle: FileHandle,
         /// The overlay identity of the file, under which a later copy-up records its upper handle.
-        node: NodeInfo,
+        node: FileNodeInfo,
     },
 }
 
@@ -118,7 +120,7 @@ struct ResolvedDir {
 /// An overlay-visible directory entry, plus which layers contribute to it.
 struct ResolvedEntry {
     /// The entry as reported by the layer that owns it.
-    entry: DirEntry,
+    entry: FileDirectoryEntry,
     upper: bool,
     /// The highest-precedence lower backend with an entry of this name, if any.
     lower: Option<usize>,
@@ -286,7 +288,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
         if let Ok(upper_status) = self.upper.status(HandleRef::File(&upper)) {
             self.bind_copy_up(
                 layer,
-                status.node_info.clone(),
+                status.node_info,
                 upper_status.node_info,
                 Some(&upper),
             );
@@ -528,17 +530,16 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
     /// The overlay-visible identity of `node` as owned by `layer`, allocated on first sight.
     fn map_node(
         &self,
-        ids: &mut HashMap<LayerNode, NodeInfo>,
+        ids: &mut HashMap<LayerNode, FileNodeInfo>,
         layer: Option<usize>,
-        node: NodeInfo,
-    ) -> NodeInfo {
+        node: FileNodeInfo,
+    ) -> FileNodeInfo {
         let rdev = node.rdev;
-        ids.entry(layer_node(layer, node))
-            .or_insert_with(|| NodeInfo {
+        *ids.entry(layer_node(layer, node))
+            .or_insert_with(|| FileNodeInfo {
                 rdev,
                 ..self.alloc.next()
             })
-            .clone()
     }
 
     /// `status` as reported by `layer`, with its node identity replaced by the overlay's own.
@@ -555,13 +556,13 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
     fn bind_copy_up(
         &self,
         layer: usize,
-        lower: NodeInfo,
-        upper: NodeInfo,
+        lower: FileNodeInfo,
+        upper: FileNodeInfo,
         upper_file: Option<&FileHandle>,
     ) {
         let mut state = self.state.lock();
         let id = self.map_node(&mut state.ids, Some(layer), lower);
-        state.ids.insert(layer_node(None, upper), id.clone());
+        state.ids.insert(layer_node(None, upper), id);
         if let Some(file) = upper_file {
             state.copied_up.insert(id, file.clone());
         }
@@ -605,8 +606,8 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
             if entry.file_type != FileType::Directory {
                 blocked.insert(entry.name.clone());
             }
-            entry.ino_info = entry
-                .ino_info
+            entry.node_info = entry
+                .node_info
                 .take()
                 .map(|node| self.map_node(&mut self.state.lock().ids, None, node));
             entries.insert(
@@ -634,7 +635,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
                         continue;
                     }
                     let directory = lower_entry.file_type == FileType::Directory;
-                    let lower_node = lower_entry.ino_info.take();
+                    let lower_node = lower_entry.node_info.take();
                     let entry = entries
                         .entry(name.clone())
                         .or_insert_with(|| ResolvedEntry {
@@ -646,7 +647,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
                     entry.lower.get_or_insert(layer);
                     if !entry.upper && entry.lower == Some(layer) {
                         // This layer owns the entry, so its node is the one callers see.
-                        entry.entry.ino_info = lower_node.clone().map(|node| {
+                        entry.entry.node_info = lower_node.map(|node| {
                             self.map_node(&mut self.state.lock().ids, Some(layer), node)
                         });
                     }
@@ -657,7 +658,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
                         entry.lower_directories[layer] = true;
                         // Several layers describe one logical directory; the one already resolved
                         // above owns the identity, and this layer's node adopts it.
-                        if let (Some(node), Some(id)) = (lower_node, entry.entry.ino_info.clone()) {
+                        if let (Some(node), Some(id)) = (lower_node, entry.entry.node_info) {
                             self.state
                                 .lock()
                                 .ids
@@ -681,7 +682,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
 
 /// The node `node` as owned by `layer`, which is `None` for the upper backend and `Some(index)`
 /// for a lower one.
-fn layer_node(layer: Option<usize>, node: NodeInfo) -> LayerNode {
+fn layer_node(layer: Option<usize>, node: FileNodeInfo) -> LayerNode {
     match layer {
         None => LayerNode::Upper(node),
         Some(layer) => LayerNode::Lower(layer, node),
@@ -889,10 +890,10 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         })
     }
 
-    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
+    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<FileDirectoryEntry>, ReadDirError> {
         let path = handle.into_typed::<Self>().path;
         let resolved = self.resolve_dir(&path).map_err(|_| ReadDirError::Io)?;
-        let mut entries: Vec<DirEntry> = resolved
+        let mut entries: Vec<FileDirectoryEntry> = resolved
             .entries
             .into_values()
             .map(|entry| entry.entry)

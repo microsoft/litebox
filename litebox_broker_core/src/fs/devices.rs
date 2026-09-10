@@ -8,10 +8,13 @@
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use litebox_broker_protocol::fs::{FileMode as Mode, FileType, FileUser as UserInfo};
+use litebox_broker_protocol::fs::{
+    FileDirectoryEntry, FileMode as Mode, FileNodeInfo, FileStatus, FileType, FileUser as UserInfo,
+};
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::stdio::StdioOutputStream;
 
+use super::OFlags;
 use super::backend::{
     Backend, BackendHandles, CreationMetadata, DeviceIo, DirHandle, FileHandle, HandleRef,
     PermissionCheck, Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkingDirHandle,
@@ -21,14 +24,13 @@ use super::errors::{
     ReadError, RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::inode_allocator::InodeAllocator;
-use super::{DirEntry, FileStatus, NodeInfo, OFlags};
 
 /// Block size for stdio devices
-const STDIO_BLOCK_SIZE: usize = 1024;
+const STDIO_BLOCK_SIZE: u64 = 1024;
 /// Block size for null device
-const NULL_BLOCK_SIZE: usize = 0x1000;
+const NULL_BLOCK_SIZE: u64 = 0x1000;
 /// Block size for /dev/urandom
-const URANDOM_BLOCK_SIZE: usize = 0x1000;
+const URANDOM_BLOCK_SIZE: u64 = 0x1000;
 
 /// Constant node information for all 3 stdio devices:
 /// ```console
@@ -38,24 +40,24 @@ const URANDOM_BLOCK_SIZE: usize = 0x1000;
 /// name=/dev/stderr dev=64 ino=9 rdev=34822
 /// ```
 // XXX(jayb): Should we be pulling the device names and such from the inode allocator?
-const STDIO_NODE_INFO: NodeInfo = NodeInfo {
+const STDIO_NODE_INFO: FileNodeInfo = FileNodeInfo {
     dev: 64,
     ino: 9,
-    rdev: core::num::NonZeroUsize::new(34822),
+    rdev: core::num::NonZeroU64::new(34822),
 };
 /// Node info for /dev/null
-const NULL_NODE_INFO: NodeInfo = NodeInfo {
+const NULL_NODE_INFO: FileNodeInfo = FileNodeInfo {
     dev: 5,
     ino: 4,
     // major=1, minor=3
-    rdev: core::num::NonZeroUsize::new(0x103),
+    rdev: core::num::NonZeroU64::new(0x103),
 };
 /// Node info for /dev/urandom
-const URANDOM_NODE_INFO: NodeInfo = NodeInfo {
+const URANDOM_NODE_INFO: FileNodeInfo = FileNodeInfo {
     dev: 5,
     ino: 8,
     // major=1, minor=9
-    rdev: core::num::NonZeroUsize::new(0x109),
+    rdev: core::num::NonZeroU64::new(0x109),
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,7 +90,7 @@ impl Device {
                 size: 0,
                 owner: UserInfo::ROOT,
                 node_info: STDIO_NODE_INFO,
-                blksize: STDIO_BLOCK_SIZE,
+                block_size: STDIO_BLOCK_SIZE,
             },
             Device::Null => FileStatus {
                 file_type: FileType::CharacterDevice,
@@ -96,7 +98,7 @@ impl Device {
                 size: 0,
                 owner: UserInfo::ROOT,
                 node_info: NULL_NODE_INFO,
-                blksize: NULL_BLOCK_SIZE,
+                block_size: NULL_BLOCK_SIZE,
             },
             Device::URandom => FileStatus {
                 file_type: FileType::CharacterDevice,
@@ -104,7 +106,7 @@ impl Device {
                 size: 0,
                 owner: UserInfo::ROOT,
                 node_info: URANDOM_NODE_INFO,
-                blksize: URANDOM_BLOCK_SIZE,
+                block_size: URANDOM_BLOCK_SIZE,
             },
         }
     }
@@ -113,7 +115,7 @@ impl Device {
 /// A [`super::backend::Backend`] that supports Unix-y devices.
 pub struct Devices {
     /// Stable inode info for this backend's root directory.
-    root_inode: NodeInfo,
+    root_inode: FileNodeInfo,
     _alloc: InodeAllocator,
 }
 
@@ -232,14 +234,14 @@ impl Backend for Devices {
         })
     }
 
-    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
+    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<FileDirectoryEntry>, ReadDirError> {
         let _handle = handle.into_typed::<Self>();
         Ok(Device::ALL
             .iter()
-            .map(|(n, d)| DirEntry {
+            .map(|(n, d)| FileDirectoryEntry {
                 name: String::from(*n),
                 file_type: FileType::CharacterDevice,
-                ino_info: Some(d.file_status().node_info),
+                node_info: Some(d.file_status().node_info),
             })
             .collect())
     }
@@ -317,8 +319,8 @@ impl Backend for Devices {
                     mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
                     size: super::DEFAULT_DIRECTORY_SIZE,
                     owner: UserInfo::ROOT,
-                    node_info: self.root_inode.clone(),
-                    blksize: super::DEFAULT_DIRECTORY_SIZE,
+                    node_info: self.root_inode,
+                    block_size: super::DEFAULT_DIRECTORY_SIZE,
                 })
             }
         }

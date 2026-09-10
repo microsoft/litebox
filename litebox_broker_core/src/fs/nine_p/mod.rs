@@ -11,10 +11,12 @@
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::num::NonZeroUsize;
+use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use litebox_broker_protocol::fs::{FileMode, FileType, FileUser};
+use litebox_broker_protocol::fs::{
+    FileDirectoryEntry, FileMode, FileNodeInfo, FileStatus, FileType, FileUser,
+};
 use litebox_platform::sync;
 use thiserror::Error;
 
@@ -31,6 +33,8 @@ use super::errors::{
 mod client;
 mod fcall;
 mod id_pool;
+#[cfg(test)]
+mod metadata_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod tests;
 
@@ -53,9 +57,9 @@ pub struct NineP<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read +
     /// Handed out (shared) by [`Backend::root`](super::backend::Backend::root), so it must never
     /// be `Tlopen`ed or `Tlcreate`d; see the `is_backend_root` flag on the walking dir handle.
     root: Arc<OwnedFid<Platform, T>>,
-    /// Device id reported in every [`NodeInfo`](super::NodeInfo) from this backend; inode numbers
+    /// Device id reported in every [`FileNodeInfo`] from this backend; inode numbers
     /// come from the server's qids instead.
-    device_id: usize,
+    device_id: u64,
     /// Whether `unlinkat` is supported by the server
     unlinkat_supported: AtomicBool,
 }
@@ -430,7 +434,7 @@ where
         })
     }
 
-    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<super::DirEntry>, ReadDirError> {
+    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<FileDirectoryEntry>, ReadDirError> {
         let handle = handle.into_typed::<Self>();
         let entries = self.client.readdir_all(&handle.fid.fid)?;
         Ok(entries
@@ -442,18 +446,16 @@ where
                 // have the resolver handle only cases where it is not handled by the backend?
                 !matches!(&*entry.name, b"." | b"..")
             })
-            .map(|entry| {
-                Ok(super::DirEntry {
-                    name: String::from_utf8_lossy(&entry.name).into_owned(),
-                    file_type: qid_type_to_file_type(entry.qid.typ),
-                    ino_info: Some(super::NodeInfo {
-                        dev: self.device_id,
-                        ino: usize::try_from(entry.qid.path).map_err(|_| Error::InvalidResponse)?,
-                        rdev: None,
-                    }),
-                })
+            .map(|entry| FileDirectoryEntry {
+                name: String::from_utf8_lossy(&entry.name).into_owned(),
+                file_type: qid_type_to_file_type(entry.qid.typ),
+                node_info: Some(FileNodeInfo {
+                    dev: self.device_id,
+                    ino: entry.qid.path,
+                    rdev: None,
+                }),
             })
-            .collect::<Result<_, Error>>()?)
+            .collect())
     }
 
     fn read(
@@ -500,7 +502,7 @@ where
         SeekBehavior::PositionBased
     }
 
-    fn status(&self, h: HandleRef<'_>) -> Result<super::FileStatus, FileStatusError> {
+    fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError> {
         let fid = match h {
             HandleRef::File(h) => &h.get_typed::<Self>().fid,
             HandleRef::Dir(h) => &h.get_typed::<Self>().fid,
@@ -721,32 +723,27 @@ fn file_mode(mode: u32) -> FileMode {
 ///
 /// Inode numbers come from the server's qids; `device_id` is the device the caller reports this
 /// filesystem as.
-fn rgetattr_to_file_status(
-    attr: &fcall::Rgetattr,
-    device_id: usize,
-) -> Result<super::FileStatus, Error> {
+fn rgetattr_to_file_status(attr: &fcall::Rgetattr, device_id: u64) -> Result<FileStatus, Error> {
     let file_type = qid_type_to_file_type(attr.qid.typ);
 
     if attr.valid.contains(fcall::GetattrMask::BASIC) {
-        Ok(super::FileStatus {
+        Ok(FileStatus {
             file_type,
             mode: file_mode(attr.stat.mode),
-            size: usize::try_from(attr.stat.size).map_err(|_| Error::InvalidResponse)?,
+            size: attr.stat.size,
             owner: FileUser {
                 user: u16::try_from(attr.stat.uid).map_err(|_| Error::InvalidResponse)?,
                 group: u16::try_from(attr.stat.gid).map_err(|_| Error::InvalidResponse)?,
             },
-            node_info: super::NodeInfo {
+            node_info: FileNodeInfo {
                 dev: device_id,
-                ino: usize::try_from(attr.qid.path).map_err(|_| Error::InvalidResponse)?,
-                rdev: NonZeroUsize::new(
-                    usize::try_from(attr.stat.rdev).map_err(|_| Error::InvalidResponse)?,
-                ),
+                ino: attr.qid.path,
+                rdev: NonZeroU64::new(attr.stat.rdev),
             },
-            blksize: usize::try_from(attr.stat.blksize).map_err(|_| Error::InvalidResponse)?,
+            block_size: attr.stat.blksize,
         })
     } else {
-        Ok(super::FileStatus {
+        Ok(FileStatus {
             file_type,
             mode: if attr.valid.contains(fcall::GetattrMask::MODE) {
                 file_mode(attr.stat.mode)
@@ -754,7 +751,7 @@ fn rgetattr_to_file_status(
                 FileMode::empty()
             },
             size: if attr.valid.contains(fcall::GetattrMask::SIZE) {
-                usize::try_from(attr.stat.size).map_err(|_| Error::InvalidResponse)?
+                attr.stat.size
             } else {
                 0
             },
@@ -770,19 +767,17 @@ fn rgetattr_to_file_status(
                     0
                 },
             },
-            node_info: super::NodeInfo {
+            node_info: FileNodeInfo {
                 dev: device_id,
-                ino: usize::try_from(attr.qid.path).map_err(|_| Error::InvalidResponse)?,
+                ino: attr.qid.path,
                 rdev: if attr.valid.contains(fcall::GetattrMask::RDEV) {
-                    NonZeroUsize::new(
-                        usize::try_from(attr.stat.rdev).map_err(|_| Error::InvalidResponse)?,
-                    )
+                    NonZeroU64::new(attr.stat.rdev)
                 } else {
                     None
                 },
             },
-            blksize: if attr.valid.contains(fcall::GetattrMask::BLOCKS) {
-                usize::try_from(attr.stat.blksize).map_err(|_| Error::InvalidResponse)?
+            block_size: if attr.valid.contains(fcall::GetattrMask::BLOCKS) {
+                attr.stat.blksize
             } else {
                 0
             },
