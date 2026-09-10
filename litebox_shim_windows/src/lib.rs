@@ -2994,9 +2994,9 @@ fn is_api_set_contract(dll_name: &str) -> bool {
 }
 
 trait RawHandleVisitor<Platform: ShimPlatform> {
-    fn file(&self, file: FileObject<Platform>);
+    fn file(&self, file: FileObject);
 
-    fn registry_key(&self, key: RegistryKeyObject<Platform>);
+    fn registry_key(&self, key: RegistryKeyObject);
 
     fn event(&self, event: EventHandleObject<Platform>);
 
@@ -3033,11 +3033,11 @@ struct CloseRawHandleVisitor<'task, Platform: ShimPlatform> {
 }
 
 impl<Platform: ShimPlatform> RawHandleVisitor<Platform> for CloseRawHandleVisitor<'_, Platform> {
-    fn file(&self, file: FileObject<Platform>) {
+    fn file(&self, file: FileObject) {
         self.task.close_file(file);
     }
 
-    fn registry_key(&self, key: RegistryKeyObject<Platform>) {
+    fn registry_key(&self, key: RegistryKeyObject) {
         self.task.close_registry_key(key);
     }
 

@@ -41,7 +41,7 @@ use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemory, Sh
 use crate::fs::errors::{
     OpenError, PathError, ReadDirError, ReadError, RmdirError, UnlinkError, WriteError,
 };
-use crate::fs::{Context, OFlags};
+use crate::fs::{BrokerFile, Context, FileFd, OFlags};
 use crate::platform::mock::MockPlatform;
 
 /// The handle the scripted broker hands out for every successful open.
@@ -539,6 +539,35 @@ fn closing_releases_the_broker_object_and_the_descriptor() {
         Err(WriteError::ClosedFd)
     ));
     assert_eq!(broker.calls().len(), 2);
+}
+
+#[test]
+fn broker_file_descriptors_preserve_subsystem_and_duplicate_lifetimes() {
+    let (broker, fs) = scripted_fs([opened(), Scripted::Read(b"broker".to_vec())]);
+    let fd: FileFd = fs
+        .open_file(&Context::new(), "/file", OFlags::RDONLY, FileMode::empty())
+        .unwrap();
+    let duplicate = fs.descriptor_table_mut().duplicate(&fd).unwrap();
+    let mut raw_fds = crate::fd::RawDescriptorStorage::new();
+    let raw_fd = raw_fds.fd_into_raw_integer(fd);
+
+    assert!(matches!(
+        raw_fds.fd_from_raw_integer::<crate::pipes::Pipes<MockPlatform>>(raw_fd),
+        Err(crate::fd::ErrRawIntFd::InvalidSubsystem)
+    ));
+    let fd = raw_fds
+        .fd_consume_raw_integer::<BrokerFile>(raw_fd)
+        .unwrap();
+    fs.close_file(&fd).unwrap();
+    assert_eq!(broker.calls().len(), 1);
+
+    let mut buffer = [0; 6];
+    assert_eq!(fs.read_file(&duplicate, &mut buffer, None).unwrap(), 6);
+    assert_eq!(&buffer, b"broker");
+    fs.close_file(&duplicate).unwrap();
+    let calls = broker.calls();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls.last(), Some(&Call::Close(FILE_HANDLE)));
 }
 
 #[test]

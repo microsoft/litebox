@@ -455,8 +455,8 @@ struct MappedNlsSection {
     len: usize,
 }
 
-struct NlsSectionFile<Platform: ShimPlatform> {
-    fd: litebox::fs::FileFd<Platform>,
+struct NlsSectionFile {
+    fd: litebox::fs::FileFd,
     len: usize,
 }
 
@@ -770,7 +770,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     fn open_nls_section_file(
         &self,
         request: NlsSectionRequest<Platform>,
-    ) -> Result<NlsSectionFile<Platform>, NtStatus> {
+    ) -> Result<NlsSectionFile, NtStatus> {
         let path = nls_section_file_path(request.section_type, request.section_data)?;
         let fd = self
             .fs
@@ -807,7 +807,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     fn copy_nls_section_file(
         &self,
-        fd: &litebox::fs::FileFd<Platform>,
+        fd: &litebox::fs::FileFd,
         section_len: usize,
         output: MutPtr<Platform, u8>,
     ) -> Result<usize, NtStatus> {

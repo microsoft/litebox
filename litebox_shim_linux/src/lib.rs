@@ -59,7 +59,7 @@ pub mod syscalls;
 pub mod transport;
 mod wait;
 
-pub(crate) type FileFd<Platform> = litebox::fs::FileFd<Platform>;
+pub(crate) use litebox::fs::FileFd;
 
 /// Aggregate bound capturing everything the shim requires of a platform.
 ///
@@ -434,7 +434,7 @@ impl<Platform: ShimPlatform> syscalls::file::FilesState<Platform> {
             };
         }
 
-        resolve_fd!(litebox::fs::File<Platform>, Fs);
+        resolve_fd!(litebox::fs::BrokerFile, Fs);
         resolve_fd!(Network<Platform>, Network);
         resolve_fd!(Pipes<Platform>, Pipes);
         resolve_fd!(syscalls::eventfd::EventfdSubsystem<Platform>, Eventfd);

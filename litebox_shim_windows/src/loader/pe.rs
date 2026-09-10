@@ -1107,7 +1107,7 @@ fn is_missing_file_error(error: &WindowsLoadError) -> bool {
 
 struct PeImageFile<Platform: crate::ShimPlatform> {
     fs: Arc<litebox::LiteBox<Platform>>,
-    fd: litebox::fs::FileFd<Platform>,
+    fd: litebox::fs::FileFd,
 }
 
 impl<Platform: crate::ShimPlatform> PeImageFile<Platform> {

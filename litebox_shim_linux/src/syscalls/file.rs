@@ -176,7 +176,7 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
 
 /// A raw fd resolved once into the subsystem that owns it.
 pub(crate) enum AnyTypedFd<Platform: ShimPlatform> {
-    Fs(alloc::sync::Arc<FileFd<Platform>>),
+    Fs(alloc::sync::Arc<FileFd>),
     Network(alloc::sync::Arc<TypedFd<litebox::net::Network<Platform>>>),
     Pipes(alloc::sync::Arc<TypedFd<litebox::pipes::Pipes<Platform>>>),
     Eventfd(alloc::sync::Arc<TypedFd<super::eventfd::EventfdSubsystem<Platform>>>),
@@ -214,7 +214,7 @@ impl<Platform: ShimPlatform> AnyTypedFd<Platform> {
     }
 
     /// The filesystem fd behind this descriptor, or `None` for every other subsystem.
-    pub(crate) fn as_fs(&self) -> Option<&FileFd<Platform>> {
+    pub(crate) fn as_fs(&self) -> Option<&FileFd> {
         match self {
             Self::Fs(fd) => Some(fd),
             _ => None,
@@ -222,14 +222,14 @@ impl<Platform: ShimPlatform> AnyTypedFd<Platform> {
     }
 
     /// Like [`Self::as_fs`], but fails with `otherwise` for non-filesystem descriptors.
-    pub(crate) fn fs_only(&self, otherwise: Errno) -> Result<&FileFd<Platform>, Errno> {
+    pub(crate) fn fs_only(&self, otherwise: Errno) -> Result<&FileFd, Errno> {
         self.as_fs().ok_or(otherwise)
     }
 
     /// Run the handler matching this fd's subsystem.
     pub(crate) fn dispatch<R>(
         &self,
-        fs: impl FnOnce(&FileFd<Platform>) -> R,
+        fs: impl FnOnce(&FileFd) -> R,
         net: impl FnOnce(&TypedFd<litebox::net::Network<Platform>>) -> R,
         pipes: impl FnOnce(&TypedFd<litebox::pipes::Pipes<Platform>>) -> R,
         eventfd: impl FnOnce(&TypedFd<super::eventfd::EventfdSubsystem<Platform>>) -> R,
@@ -367,7 +367,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         path: impl path::Arg,
         flags: OFlags,
         mode: Mode,
-    ) -> Result<FileFd<Platform>, Errno> {
+    ) -> Result<FileFd, Errno> {
         let mode = mode & !self.get_umask();
         // TODO: Have the device backend attach stream identity once backends can set descriptor
         // metadata for newly opened files.
@@ -413,12 +413,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         pathname: impl path::Arg,
         flags: OFlags,
         mode: Mode,
-    ) -> Result<FileFd<Platform>, Errno> {
+    ) -> Result<FileFd, Errno> {
         let path = self.resolve_path_at(dirfd, pathname)?;
         self.do_open(path, flags, mode)
     }
 
-    fn insert_raw_file_fd(&self, file: FileFd<Platform>, flags: OFlags) -> Result<u32, Errno> {
+    fn insert_raw_file_fd(&self, file: FileFd, flags: OFlags) -> Result<u32, Errno> {
         if flags.contains(OFlags::CLOEXEC) {
             let None = self
                 .global
@@ -905,7 +905,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     pub(crate) fn do_close(&self, raw_fd: usize) -> Result<(), Errno> {
-        self.do_close_and_replace::<litebox::fs::File<Platform>>(raw_fd, None)
+        self.do_close_and_replace::<litebox::fs::BrokerFile>(raw_fd, None)
     }
 
     pub(super) fn remove_and_drop_descriptor<S: FdEnabledSubsystem>(&self, fd: &TypedFd<S>) {
@@ -928,7 +928,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let files = self.files.borrow();
         let mut rds = files.raw_descriptor_store.write();
         let consumed: AnyTypedFd<Platform> = match rds
-            .fd_consume_raw_integer::<litebox::fs::File<Platform>>(raw_fd)
+            .fd_consume_raw_integer::<litebox::fs::BrokerFile>(raw_fd)
         {
             Ok(fd) => AnyTypedFd::Fs(fd),
             Err(litebox::fd::ErrRawIntFd::NotFound) => {
@@ -2067,11 +2067,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
     }
 
-    fn is_stdio(
-        &self,
-        fs: &litebox::LiteBox<Platform>,
-        fd: &FileFd<Platform>,
-    ) -> Result<bool, Errno> {
+    fn is_stdio(&self, fs: &litebox::LiteBox<Platform>, fd: &FileFd) -> Result<bool, Errno> {
         match fs.file_status(fd) {
             Ok(status) => {
                 // See https://www.kernel.org/doc/Documentation/admin-guide/devices.txt
