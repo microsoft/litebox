@@ -9,13 +9,12 @@ use alloc::vec;
 use alloc::vec::Vec;
 use bitflags::bitflags;
 use core::ffi::c_uint;
-use core::num::NonZeroUsize;
 
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{
-    FileAccessMode, FileDirectoryEntry, FileError, FileMode as Mode, FileNodeInfo, FileOpenFlags,
-    FileSeekWhence as SeekWhence, FileStatus as BrokerFileStatus, FileType, FileUser as UserInfo,
+    FileAccessMode, FileDirectoryEntry, FileError, FileMode as Mode, FileOpenFlags,
+    FileSeekWhence as SeekWhence, FileStatus, FileUser as UserInfo,
 };
 
 use crate::path::Arg;
@@ -110,48 +109,6 @@ bitflags! {
             | Self::WRONLY.bits()
             | Self::RDWR.bits();
     }
-}
-
-/// The status of a file/directory/... on the file-system, inspired by `stat(3type)`.
-///
-/// This is explicitly a non-exhaustive struct with public members. As LiteBox evolves, more
-/// elements might be added to this struct, allowing file systems to provide richer information
-/// about the status of files. However, users of LiteBox must not depend on the completeness or even
-/// layout of this particular type.
-#[non_exhaustive]
-pub struct FileStatus {
-    /// File type
-    pub file_type: FileType,
-    /// Permissions for the file
-    pub mode: Mode,
-    /// Size of the file, in bytes. This value considered informative if this is a regular file.
-    pub size: usize,
-    /// Owner of the file
-    pub owner: UserInfo,
-    /// Information about this particular node
-    pub node_info: NodeInfo,
-    /// Block size for file system I/O
-    pub blksize: usize,
-}
-
-/// Device/Inode information
-#[derive(PartialEq, Eq, Hash, Clone, Debug)]
-pub struct NodeInfo {
-    /// Device number
-    pub dev: usize,
-    /// Inode number
-    pub ino: usize,
-    /// Device that is being referred to (will be `Some(...)` only if special file)
-    pub rdev: Option<NonZeroUsize>,
-}
-
-/// Directory entries returned by [`LiteBox::read_file_directory`].
-#[derive(Debug)]
-#[non_exhaustive]
-pub struct DirEntry {
-    pub name: String,
-    pub file_type: FileType,
-    pub ino_info: Option<NodeInfo>,
 }
 
 /// Type marker for file descriptors backed by broker-owned files.
@@ -353,14 +310,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
     pub fn read_file_directory(
         &self,
         fd: &FileFd<Platform>,
-    ) -> Result<Vec<DirEntry>, ReadDirError> {
+    ) -> Result<Vec<FileDirectoryEntry>, ReadDirError> {
         let file = self.broker_file(fd).ok_or(ReadDirError::ClosedFd)?;
-        let entries = file
-            .broker
+        file.broker
             .read_directory(file.handle)
             .map_err(|error| broker_fd_error(error, ReadDirError::ClosedFd, ReadDirError::Io))?
-            .map_err(read_dir_error)?;
-        directory_entries(entries)
+            .map_err(read_dir_error)
     }
 
     /// Obtain the status of a path.
@@ -370,26 +325,22 @@ impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
         path: impl Arg,
     ) -> Result<FileStatus, FileStatusError> {
         let path = Self::broker_path(context, path)?;
-        let status = self
-            .broker_control()
+        self.broker_control()
             .ok_or(FileStatusError::Io)?
             .path_file_status(&path, context.acting_user())
             .map_err(|_| FileStatusError::Io)?
-            .map_err(file_status_error)?;
-        file_status(status)
+            .map_err(file_status_error)
     }
 
     /// Equivalent to [`Self::path_file_status`], but on an open `fd`.
     pub fn file_status(&self, fd: &FileFd<Platform>) -> Result<FileStatus, FileStatusError> {
         let file = self.broker_file(fd).ok_or(FileStatusError::ClosedFd)?;
-        let status = file
-            .broker
+        file.broker
             .handle_file_status(file.handle)
             .map_err(|error| {
                 broker_fd_error(error, FileStatusError::ClosedFd, FileStatusError::Io)
             })?
-            .map_err(file_status_error)?;
-        file_status(status)
+            .map_err(file_status_error)
     }
 
     /// Get static backing data for a file, if available and supported.
@@ -687,59 +638,6 @@ fn read_dir_error(error: FileError) -> ReadDirError {
 
 fn file_status_error(error: FileError) -> FileStatusError {
     path_error(error).map_or(FileStatusError::Io, Into::into)
-}
-
-fn file_status(status: BrokerFileStatus) -> Result<FileStatus, FileStatusError> {
-    Ok(FileStatus {
-        file_type: status.file_type,
-        mode: status.mode,
-        size: usize::try_from(status.size).map_err(|_| FileStatusError::Io)?,
-        owner: status.owner,
-        node_info: status_node_info(status.node_info)?,
-        blksize: usize::try_from(status.block_size).map_err(|_| FileStatusError::Io)?,
-    })
-}
-
-fn directory_entries(entries: Vec<FileDirectoryEntry>) -> Result<Vec<DirEntry>, ReadDirError> {
-    let mut output = Vec::new();
-    output
-        .try_reserve_exact(entries.len())
-        .map_err(|_| ReadDirError::Io)?;
-    for entry in entries {
-        output.push(DirEntry {
-            name: entry.name,
-            file_type: entry.file_type,
-            ino_info: entry.node_info.map(directory_node_info).transpose()?,
-        });
-    }
-    Ok(output)
-}
-
-fn status_node_info(node: FileNodeInfo) -> Result<NodeInfo, FileStatusError> {
-    Ok(NodeInfo {
-        dev: usize::try_from(node.dev).map_err(|_| FileStatusError::Io)?,
-        ino: usize::try_from(node.ino).map_err(|_| FileStatusError::Io)?,
-        rdev: optional_device(node.rdev).map_err(|()| FileStatusError::Io)?,
-    })
-}
-
-fn directory_node_info(node: FileNodeInfo) -> Result<NodeInfo, ReadDirError> {
-    Ok(NodeInfo {
-        dev: usize::try_from(node.dev).map_err(|_| ReadDirError::Io)?,
-        ino: usize::try_from(node.ino).map_err(|_| ReadDirError::Io)?,
-        rdev: optional_device(node.rdev).map_err(|()| ReadDirError::Io)?,
-    })
-}
-
-fn optional_device(device: Option<u64>) -> Result<Option<core::num::NonZeroUsize>, ()> {
-    device
-        .map(|device| {
-            usize::try_from(device)
-                .ok()
-                .and_then(core::num::NonZeroUsize::new)
-                .ok_or(())
-        })
-        .transpose()
 }
 
 crate::fd::enable_fds_for_subsystem! {

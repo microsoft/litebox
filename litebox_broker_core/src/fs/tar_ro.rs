@@ -28,23 +28,23 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::ops::Range;
 use hashbrown::HashMap;
-use litebox_broker_protocol::fs::{FileMode as Mode, FileType, FileUser as UserInfo};
-
-use super::DirEntry;
+use litebox_broker_protocol::fs::{
+    FileDirectoryEntry, FileMode as Mode, FileNodeInfo, FileStatus, FileType, FileUser as UserInfo,
+};
 
 use super::{
-    NodeInfo, OFlags,
+    OFlags,
     backend::{CreationMetadata, DirHandle, FileHandle, HandleRef, WalkingDirHandle},
     errors::{
-        ChmodError, ChownError, MkdirError, OpenError, PathError, ReadDirError, ReadError,
-        RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
+        ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
+        ReadError, RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
     },
     inode_allocator::InodeAllocator,
 };
 
 /// Block size for file system I/O operations
 // TODO(jayb): Determine appropriate block size
-const BLOCK_SIZE: usize = 0;
+const BLOCK_SIZE: u64 = 0;
 
 /// A [`super::backend::Backend`] that stores all files in-memory, via a read-only `.tar` file.
 pub struct TarRo {
@@ -179,26 +179,24 @@ impl super::backend::Backend for TarRo {
         })
     }
 
-    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
+    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<FileDirectoryEntry>, ReadDirError> {
         let handle = handle.into_typed::<Self>();
         Ok(self.tar_index.dirs[handle.idx]
             .children
             .iter()
             .map(|(name, child)| {
                 let (file_type, node_info) = match *child {
-                    IndexedChild::File(idx) => (
-                        FileType::RegularFile,
-                        self.tar_index.files[idx].node_info.clone(),
-                    ),
-                    IndexedChild::Dir(idx) => (
-                        FileType::Directory,
-                        self.tar_index.dirs[idx].node_info.clone(),
-                    ),
+                    IndexedChild::File(idx) => {
+                        (FileType::RegularFile, self.tar_index.files[idx].node_info)
+                    }
+                    IndexedChild::Dir(idx) => {
+                        (FileType::Directory, self.tar_index.dirs[idx].node_info)
+                    }
                 };
-                DirEntry {
+                FileDirectoryEntry {
                     name: name.clone(),
                     file_type,
-                    ino_info: Some(node_info),
+                    node_info: Some(node_info),
                 }
             })
             .collect())
@@ -238,31 +236,28 @@ impl super::backend::Backend for TarRo {
         super::backend::SeekBehavior::PositionBased
     }
 
-    fn status(
-        &self,
-        h: HandleRef<'_>,
-    ) -> Result<super::FileStatus, super::errors::FileStatusError> {
+    fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError> {
         match h {
             HandleRef::File(h) => {
                 let file = &self.tar_index.files[h.get_typed::<Self>().idx];
-                Ok(super::FileStatus {
+                Ok(FileStatus {
                     file_type: FileType::RegularFile,
                     mode: file.mode,
-                    size: file.data_range.len(),
+                    size: u64::try_from(file.data_range.len()).map_err(|_| FileStatusError::Io)?,
                     owner: file.owner,
-                    node_info: file.node_info.clone(),
-                    blksize: BLOCK_SIZE,
+                    node_info: file.node_info,
+                    block_size: BLOCK_SIZE,
                 })
             }
             HandleRef::Dir(h) => {
                 let dir = &self.tar_index.dirs[h.get_typed::<Self>().idx];
-                Ok(super::FileStatus {
+                Ok(FileStatus {
                     file_type: FileType::Directory,
                     mode: DEFAULT_DIR_MODE,
                     size: super::DEFAULT_DIRECTORY_SIZE,
                     owner: dir.owner.unwrap_or(DEFAULT_DIRECTORY_OWNER),
-                    node_info: dir.node_info.clone(),
-                    blksize: BLOCK_SIZE,
+                    node_info: dir.node_info,
+                    block_size: BLOCK_SIZE,
                 })
             }
         }
@@ -325,12 +320,12 @@ struct IndexedFile {
     data_range: Range<usize>,
     mode: Mode,
     owner: UserInfo,
-    node_info: NodeInfo,
+    node_info: FileNodeInfo,
 }
 
 struct IndexedDir {
     owner: Option<UserInfo>,
-    node_info: NodeInfo,
+    node_info: FileNodeInfo,
     children: HashMap<String, IndexedChild>,
 }
 

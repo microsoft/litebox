@@ -8,7 +8,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 use litebox_broker_protocol::fs::{
-    FileMode as Mode, FileSeekWhence as SeekWhence, FileType, FileUser as UserInfo,
+    FileDirectoryEntry, FileMode as Mode, FileSeekWhence as SeekWhence, FileStatus, FileType,
+    FileUser as UserInfo,
 };
 
 use super::errors::{
@@ -625,10 +626,13 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         let write_offset = match seek_behavior {
             SeekBehavior::NonSeekable | SeekBehavior::ZeroPosition => 0,
             SeekBehavior::PositionBased if entry.append_mode && offset.is_none() => {
-                self.backend
-                    .status(HandleRef::File(file))
-                    .map_err(|_| WriteError::Io)?
-                    .size
+                usize::try_from(
+                    self.backend
+                        .status(HandleRef::File(file))
+                        .map_err(|_| WriteError::Io)?
+                        .size,
+                )
+                .map_err(|_| WriteError::Io)?
             }
             SeekBehavior::PositionBased => offset.unwrap_or(entry.position),
         };
@@ -700,17 +704,23 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                     .size;
                 let base = match whence {
                     SeekWhence::RelativeToBeginning => 0,
-                    SeekWhence::RelativeToCurrentOffset => entry.position,
+                    SeekWhence::RelativeToCurrentOffset => {
+                        u64::try_from(entry.position).map_err(|_| SeekError::InvalidOffset)?
+                    }
                     SeekWhence::RelativeToEnd => file_len,
                 };
                 let new_position = base
-                    .checked_add_signed(offset)
+                    .checked_add_signed(
+                        i64::try_from(offset).map_err(|_| SeekError::InvalidOffset)?,
+                    )
                     .ok_or(SeekError::InvalidOffset)?;
                 // TODO(jayb): Linux allows regular files to seek past EOF, while some backends or
                 // file types may not. Model that distinction instead of using one resolver rule.
                 if new_position > file_len {
                     return Err(SeekError::InvalidOffset);
                 }
+                let new_position =
+                    usize::try_from(new_position).map_err(|_| SeekError::InvalidOffset)?;
                 entry.position = new_position;
                 Ok(new_position)
             }
@@ -914,7 +924,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     pub fn read_dir(
         &self,
         entry: &ResolverEntry<Backend>,
-    ) -> Result<Vec<super::DirEntry>, ReadDirError> {
+    ) -> Result<Vec<FileDirectoryEntry>, ReadDirError> {
         if entry.path_only {
             // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
             unimplemented!("read_dir on O_PATH fd")
@@ -926,26 +936,22 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
 
         let mut entries = Vec::new();
         // TODO(jayb): Fill in inode info for synthesized dot entries.
-        entries.push(super::DirEntry {
+        entries.push(FileDirectoryEntry {
             name: String::from("."),
             file_type: FileType::Directory,
-            ino_info: None,
+            node_info: None,
         });
-        entries.push(super::DirEntry {
+        entries.push(FileDirectoryEntry {
             name: String::from(".."),
             file_type: FileType::Directory,
-            ino_info: None,
+            node_info: None,
         });
         entries.extend(self.backend.list_dir_at(dir.clone())?);
         Ok(entries)
     }
 
     /// Obtain the status of a file/directory/... on the file-system.
-    pub fn file_status(
-        &self,
-        user: UserInfo,
-        path: &str,
-    ) -> Result<super::FileStatus, FileStatusError> {
+    pub fn file_status(&self, user: UserInfo, path: &str) -> Result<FileStatus, FileStatusError> {
         let entry =
             self.open(user, path, OFlags::PATH, Mode::empty())
                 .map_err(|error| match error {
@@ -964,7 +970,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     pub fn handle_status(
         &self,
         entry: &ResolverEntry<Backend>,
-    ) -> Result<super::FileStatus, FileStatusError> {
+    ) -> Result<FileStatus, FileStatusError> {
         self.backend.status(entry.handle.as_ref())
     }
 

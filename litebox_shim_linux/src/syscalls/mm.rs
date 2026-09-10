@@ -24,8 +24,6 @@ use alloc::vec::Vec;
 use core::ops::Range;
 #[cfg(target_arch = "aarch64")]
 use litebox::mm::linux::VmFlags;
-#[cfg(target_arch = "aarch64")]
-use litebox::utils::ReinterpretUnsignedExt as _;
 use litebox::utils::TruncateExt as _;
 use object::elf::{ET_DYN, FileHeader64, PT_LOAD, ProgramHeader64};
 use object::endian::LittleEndian;
@@ -807,8 +805,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let code_metadata = if pre_patched {
             None
         } else {
-            self.sys_fstat(fd).ok().and_then(|stat| {
-                let file_size: usize = stat.st_size.reinterpret_as_unsigned().trunc();
+            self.file_status(fd).ok().and_then(|stat| {
+                let file_size = usize::try_from(stat.size).ok()?;
                 let word_len = file_size.div_ceil(8);
                 let mut words = u64::new_vec_zeroed(word_len).ok()?;
                 let bytes = zerocopy::IntoBytes::as_mut_bytes(words.as_mut_slice());
@@ -970,22 +968,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Returns (is_pre_patched, file_offset, vaddr, trampoline_size).
     fn check_trampoline_magic(&self, fd: i32) -> (bool, u64, u64, u64) {
         const HEADER_SIZE: usize = 32; // TrampolineHeader64: magic(8) + file_offset(8) + vaddr(8) + size(8)
-        let Ok(stat) = self.sys_fstat(fd) else {
+        let Ok(stat) = self.file_status(fd) else {
             return (false, 0, 0, 0);
         };
-        #[cfg(target_arch = "x86_64")]
-        let file_size: usize = stat.st_size;
-        #[cfg(target_arch = "aarch64")]
-        let file_size: usize = {
-            // The asm-generic ABI uses signed `st_size`.
-            stat.st_size.reinterpret_as_unsigned().trunc()
-        };
-        if file_size < HEADER_SIZE {
+        let Some(tail_offset) = stat.size.checked_sub(HEADER_SIZE as u64) else {
             return (false, 0, 0, 0);
-        }
+        };
+        let Ok(tail_offset) = usize::try_from(tail_offset) else {
+            return (false, 0, 0, 0);
+        };
 
         let mut tail = [0u8; HEADER_SIZE];
-        match self.sys_read(fd, &mut tail, Some(file_size - HEADER_SIZE)) {
+        match self.sys_read(fd, &mut tail, Some(tail_offset)) {
             Ok(n) if n == HEADER_SIZE => {}
             _ => return (false, 0, 0, 0),
         }

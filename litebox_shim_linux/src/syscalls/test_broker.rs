@@ -20,6 +20,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
@@ -772,7 +773,7 @@ impl ScriptedFiles {
                         "standard streams must be queried as the bootstrap user"
                     );
                     let mut status = status(FileType::CharacterDevice, 0o620);
-                    status.node_info.rdev = Some(PTS_RDEV | minor);
+                    status.node_info.rdev = NonZeroU64::new(PTS_RDEV | minor);
                     return FileResponse::PathStatus(status);
                 }
                 self.record(FileCall::PathStatus {
@@ -784,7 +785,7 @@ impl ScriptedFiles {
             FileRequest::HandleStatus(request) => {
                 if let Some(rdev) = self.stdio.lock().unwrap().get(&request.handle).copied() {
                     let mut status = status(FileType::CharacterDevice, 0o620);
-                    status.node_info.rdev = Some(rdev);
+                    status.node_info.rdev = NonZeroU64::new(rdev);
                     return FileResponse::HandleStatus(status);
                 }
                 self.record(FileCall::HandleStatus(request.handle));

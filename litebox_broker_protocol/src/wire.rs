@@ -465,6 +465,7 @@ mod tests {
     };
     use crate::{ObjectHandle, ProtocolVersion, RequestId};
     use core::net::{Ipv4Addr, SocketAddrV4};
+    use core::num::NonZeroU64;
 
     const TEST_REQUEST_ID: RequestId = RequestId(0x0102_0304_0506_0708);
 
@@ -1096,7 +1097,7 @@ mod tests {
                 node_info: FileNodeInfo {
                     dev: u64::MAX,
                     ino: u64::MAX,
-                    rdev: Some(u64::MAX),
+                    rdev: Some(NonZeroU64::MAX),
                 },
                 block_size: u64::MAX,
             })),
@@ -1111,7 +1112,7 @@ mod tests {
                 node_info: FileNodeInfo {
                     dev: u64::MAX,
                     ino: u64::MAX,
-                    rdev: Some(u64::MAX),
+                    rdev: Some(NonZeroU64::MAX),
                 },
                 block_size: u64::MAX,
             })),
@@ -1330,6 +1331,37 @@ mod tests {
         let user_tag = invalid_user.len() - 4;
         invalid_user[user_tag] = 2;
         assert_eq!(decode_request(&invalid_user), Err(WireError::InvalidTag));
+    }
+
+    #[test]
+    fn decode_rejects_zero_device_numbers_in_fs_status_responses() {
+        let status = FileStatus {
+            file_type: FileType::CharacterDevice,
+            mode: FileMode::from_bits(0o640).unwrap(),
+            size: 17,
+            owner: FileUser::ROOT,
+            node_info: FileNodeInfo {
+                dev: 5,
+                ino: 7,
+                rdev: Some(NonZeroU64::MAX),
+            },
+            block_size: 4096,
+        };
+        for result in [
+            FileResponse::PathStatus(status),
+            FileResponse::HandleStatus(status),
+        ] {
+            let response = BrokerResponse {
+                request_id: TEST_REQUEST_ID,
+                result: BrokerResult::File(result),
+            };
+            let mut bytes = encode_response(response.clone());
+            assert_eq!(decode_response(&bytes), Ok(response));
+            // The optional device number precedes the final block-size field.
+            let rdev_start = bytes.len() - 2 * size_of::<u64>();
+            bytes[rdev_start..rdev_start + size_of::<u64>()].fill(0);
+            assert_eq!(decode_response(&bytes), Err(WireError::InvalidTag));
+        }
     }
 
     #[test]

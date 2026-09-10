@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use core::num::NonZeroU64;
+
 use crate::fs::{
     ChmodFileRequest, ChownFileRequest, FileAccessMode, FileError, FileMode, FileNodeInfo,
     FileOpenFlags, FileSeekWhence, FileStatus, FileUser, HandleFileStatusRequest, MkdirFileRequest,
@@ -440,7 +442,7 @@ fn encode_status(encoder: &mut Encoder, status: FileStatus) {
     encode_user(encoder, status.owner);
     encoder.u64(status.node_info.dev);
     encoder.u64(status.node_info.ino);
-    encode_optional_u64(encoder, status.node_info.rdev);
+    encode_optional_u64(encoder, status.node_info.rdev.map(NonZeroU64::get));
     encoder.u64(status.block_size);
 }
 
@@ -451,7 +453,9 @@ fn decode_status(decoder: &mut Decoder<'_>) -> Result<FileStatus, WireError> {
     let owner = decode_user(decoder)?;
     let dev = decoder.u64()?;
     let ino = decoder.u64()?;
-    let rdev = decode_optional_u64(decoder)?;
+    let rdev = decode_optional_u64(decoder)?
+        .map(|value| NonZeroU64::new(value).ok_or(WireError::InvalidTag))
+        .transpose()?;
     let block_size = decoder.u64()?;
     Ok(FileStatus {
         file_type,

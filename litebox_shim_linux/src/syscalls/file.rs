@@ -18,7 +18,7 @@ use litebox::{
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_broker_protocol::fs::{
-    FileMode as Mode, FileSeekWhence as SeekWhence, FileType, FileUser,
+    FileMode as Mode, FileSeekWhence as SeekWhence, FileStatus, FileType, FileUser,
 };
 use litebox_common_linux::{
     AccessFlags, AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat,
@@ -1449,7 +1449,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 self.do_access(cwd, mode, caller)
             }
             FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
-                let stat: FileStat = self.with_typed_fd(fd, |fd| self.do_stat(fd))?;
+                let files = self.files.borrow();
+                let typed_fd = files.typed_fd(fd)?;
+                if let Some(file) = typed_fd.as_fs() {
+                    let status = files.fs.file_status(file)?;
+                    return Self::do_access_mode(status.mode, status.owner.into(), caller, &mode);
+                }
+                drop(files);
+                let stat: FileStat = self.do_stat(&typed_fd)?;
                 let owner = AccessUserInfo {
                     user: stat.st_uid,
                     group: stat.st_gid,
@@ -1538,9 +1545,16 @@ fn set_file_descriptor_flags<Platform: ShimPlatform>(
 }
 
 impl<Platform: ShimPlatform> Task<Platform> {
+    /// Query filesystem metadata without narrowing it to a guest `stat` layout.
+    pub(crate) fn file_status(&self, fd: i32) -> Result<FileStatus, Errno> {
+        let files = self.files.borrow();
+        let fd = files.typed_fd(fd)?;
+        Ok(files.fs.file_status(fd.fs_only(Errno::EBADF)?)?)
+    }
+
     pub(crate) fn do_stat<T>(&self, fd: &AnyTypedFd<Platform>) -> Result<T, Errno>
     where
-        T: From<litebox::fs::FileStatus> + From<FileStat>,
+        T: TryFrom<FileStatus, Error = Errno> + From<FileStat>,
     {
         // TODO: give correct values for the synthesized branches.
         let synthetic = |mode_bits: u32, blksize: usize| FileStat {
@@ -1568,7 +1582,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let rw_user_mode = u32::from((Mode::RUSR | Mode::WUSR).bits());
         let files = self.files.borrow();
         fd.dispatch(
-            |fd| files.fs.file_status(fd).map(T::from).map_err(Errno::from),
+            |fd| T::try_from(files.fs.file_status(fd)?),
             |_fd| Ok(T::from(synthetic(socket_mode, 4096))),
             |fd| {
                 Ok(T::from(synthetic(
@@ -1585,7 +1599,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Get the file status of `pathname`.
     ///
     /// The `pathname` must be absolute.
-    fn do_path_stat<T: From<litebox::fs::FileStatus>>(
+    fn do_path_stat<T: TryFrom<FileStatus, Error = Errno>>(
         &self,
         pathname: impl path::Arg,
         follow_symlink: bool,
@@ -1603,7 +1617,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let context = fs.context.read();
             files.fs.path_file_status(&context, path)?
         };
-        Ok(T::from(status))
+        T::try_from(status)
     }
 
     /// Handle syscall `stat`
@@ -1634,7 +1648,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         flags: AtFlags,
     ) -> Result<T, Errno>
     where
-        T: From<litebox::fs::FileStatus> + From<FileStat>,
+        T: TryFrom<FileStatus, Error = Errno> + From<FileStat>,
     {
         let get_cwd = || self.cwd_prefix();
         let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
@@ -1649,7 +1663,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 let files = self.files.borrow();
                 let fs = self.fs.borrow();
                 let context = fs.context.read();
-                Ok(T::from(files.fs.path_file_status(&context, cwd)?))
+                T::try_from(files.fs.path_file_status(&context, cwd)?)
             }
             FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
                 self.with_typed_fd(fd, |fd| self.do_stat(fd))
@@ -2757,9 +2771,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 break;
             }
             let dirent64 = litebox_common_linux::LinuxDirent64 {
-                ino: entry.ino_info.as_ref().map_or(0, |node_info| node_info.ino) as u64,
+                ino: entry
+                    .node_info
+                    .as_ref()
+                    .map_or(0, |node_info| node_info.ino),
                 off: dir_off as u64,
-                len: len.trunc(),
+                len: u16::try_from(len).map_err(|_| Errno::EOVERFLOW)?,
                 typ: litebox_common_linux::DirentType::from(entry.file_type) as u8,
                 __name: [0; 0],
             };
@@ -2800,6 +2817,63 @@ mod tests {
     use litebox::fs::OFlags;
 
     extern crate std;
+
+    #[test]
+    fn stat_overflow_does_not_narrow_internal_metadata_or_statx() {
+        use crate::syscalls::test_broker::{Scripted, closed, opened, status};
+        use crate::syscalls::tests::{FILE_HANDLE, scripted_task};
+        use litebox_broker_protocol::message::FileResponse;
+
+        let metadata = FileStatus {
+            size: u64::MAX,
+            ..status(FileType::RegularFile, 0o644)
+        };
+        let (files, task) = scripted_task([opened(FILE_HANDLE)]);
+        let fd = i32::try_from(
+            task.sys_open("/large", OFlags::RDONLY, Mode::empty())
+                .unwrap(),
+        )
+        .unwrap();
+        files.script([
+            Scripted::Reply(FileResponse::HandleStatus(metadata)),
+            Scripted::Reply(FileResponse::HandleStatus(metadata)),
+            Scripted::Reply(FileResponse::HandleStatus(metadata)),
+            Scripted::Reply(FileResponse::HandleStatus(metadata)),
+            Scripted::Reply(FileResponse::PathStatus(metadata)),
+            Scripted::Reply(FileResponse::PathStatus(metadata)),
+            Scripted::Reply(FileResponse::PathStatus(metadata)),
+            closed(),
+        ]);
+        assert_eq!(task.file_status(fd).unwrap(), metadata);
+        assert_eq!(task.sys_fstat(fd), Err(Errno::EOVERFLOW));
+        assert_eq!(
+            task.sys_statx(fd, "", AtFlags::AT_EMPTY_PATH, StatxMask::STATX_SIZE)
+                .unwrap()
+                .stx_size,
+            u64::MAX
+        );
+        assert_eq!(
+            task.sys_faccessat(fd, "", AccessFlags::F_OK, AtFlags::AT_EMPTY_PATH),
+            Ok(())
+        );
+        assert_eq!(task.sys_stat("/large"), Err(Errno::EOVERFLOW));
+        assert_eq!(
+            task.sys_newfstatat(litebox_common_linux::AT_FDCWD, "/large", AtFlags::empty()),
+            Err(Errno::EOVERFLOW)
+        );
+        assert_eq!(
+            task.sys_statx(
+                litebox_common_linux::AT_FDCWD,
+                "/large",
+                AtFlags::empty(),
+                StatxMask::STATX_SIZE,
+            )
+            .unwrap()
+            .stx_size,
+            u64::MAX
+        );
+        task.sys_close(fd).unwrap();
+    }
 
     #[test]
     fn write_to_iovec_returns_partial_after_later_error() {

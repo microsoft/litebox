@@ -5,7 +5,7 @@
 //!
 //! Filesystem resolution, backend, and 9P semantics belong to `litebox_broker_core` and are tested
 //! there. What LiteBox owns is the guest side of the boundary: resolving paths against a
-//! [`Context`], converting between guest and protocol values, mapping broker errors onto guest
+//! [`Context`], passing shared metadata through, mapping broker errors onto guest
 //! error types, and tying broker-owned files to guest descriptors. These tests script broker
 //! responses over a local channel, so no broker core, policy engine, or host transport is
 //! involved.
@@ -17,13 +17,14 @@ use alloc::string::{String, ToString as _};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::num::NonZeroU64;
 use std::sync::{Barrier, Mutex};
 
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileNodeInfo, FileOpenFlags,
-    FileSeekWhence, FileStatus as BrokerFileStatus, FileType, FileUser, MAX_FILE_TRANSFER_SIZE,
-    OpenFileResponse, ReadDirectoryResponse, ReadFileResponse, SeekFileResponse, WriteFileResponse,
+    FileSeekWhence, FileStatus, FileType, FileUser, MAX_FILE_TRANSFER_SIZE, OpenFileResponse,
+    ReadDirectoryResponse, ReadFileResponse, SeekFileResponse, WriteFileResponse,
     encode_directory_entries_chunk,
 };
 use litebox_broker_protocol::message::{
@@ -79,6 +80,7 @@ enum Call {
         path: String,
         user: FileUser,
     },
+    HandleStatus(ObjectHandle),
     Unlink {
         path: String,
         user: FileUser,
@@ -265,6 +267,10 @@ impl ScriptedBroker {
                     path: self.staged_path(request.path),
                     user: request.user,
                 });
+                self.reply()
+            }
+            FileRequest::HandleStatus(request) => {
+                self.record(Call::HandleStatus(request.handle));
                 self.reply()
             }
             FileRequest::Unlink(request) => {
@@ -578,45 +584,53 @@ fn in_flight_read_keeps_the_broker_file_alive_after_close() {
 }
 
 #[test]
-fn path_status_converts_broker_values() {
+fn path_and_handle_status_preserve_protocol_metadata() {
     let context = Context::new();
-    let (broker, fs) = scripted_fs([Scripted::Reply(FileResponse::PathStatus(
-        BrokerFileStatus {
-            file_type: FileType::CharacterDevice,
-            mode: FileMode::from_bits(0o644).unwrap(),
-            size: 12,
-            owner: FileUser { user: 1, group: 2 },
-            node_info: FileNodeInfo {
-                dev: 3,
-                ino: 4,
-                rdev: Some(5),
-            },
-            block_size: 4096,
+    let expected = FileStatus {
+        file_type: FileType::CharacterDevice,
+        mode: FileMode::from_bits(0o644).unwrap(),
+        size: u64::MAX,
+        owner: FileUser { user: 1, group: 2 },
+        node_info: FileNodeInfo {
+            dev: u64::MAX,
+            ino: u64::MAX,
+            rdev: Some(NonZeroU64::MAX),
         },
-    ))]);
+        block_size: u64::MAX,
+    };
+    let (broker, fs) = scripted_fs([
+        Scripted::Reply(FileResponse::PathStatus(expected)),
+        opened(),
+        Scripted::Reply(FileResponse::HandleStatus(expected)),
+    ]);
 
     let status = fs
         .path_file_status(&context, "/dev/null")
         .expect("status should succeed");
 
-    assert_eq!(status.file_type, FileType::CharacterDevice);
-    assert_eq!(status.mode, FileMode::from_bits(0o644).unwrap());
-    assert_eq!(status.size, 12);
-    assert_eq!(status.owner.user, 1);
-    assert_eq!(status.owner.group, 2);
-    assert_eq!(status.node_info.dev, 3);
-    assert_eq!(status.node_info.ino, 4);
-    assert_eq!(
-        status.node_info.rdev.map(core::num::NonZeroUsize::get),
-        Some(5)
-    );
-    assert_eq!(status.blksize, 4096);
+    assert_eq!(status, expected);
+    let fd = fs
+        .open_file(&context, "/dev/null", OFlags::RDONLY, FileMode::empty())
+        .unwrap();
+    assert_eq!(fs.file_status(&fd).unwrap(), expected);
+    fs.close_file(&fd).unwrap();
     assert_eq!(
         *broker.calls(),
-        vec![Call::PathStatus {
-            path: String::from("/dev/null"),
-            user: user(&context),
-        }]
+        vec![
+            Call::PathStatus {
+                path: String::from("/dev/null"),
+                user: user(&context),
+            },
+            Call::Open {
+                path: String::from("/dev/null"),
+                user: user(&context),
+                access: FileAccessMode::ReadOnly,
+                flags: FileOpenFlags::NONE,
+                mode: FileMode::empty(),
+            },
+            Call::HandleStatus(FILE_HANDLE),
+            Call::Close(FILE_HANDLE),
+        ]
     );
 }
 
@@ -628,27 +642,36 @@ fn read_dir_reassembles_paged_broker_entries() {
             name: String::from("one"),
             file_type: FileType::RegularFile,
             node_info: Some(FileNodeInfo {
-                dev: 1,
-                ino: 2,
+                dev: u64::MAX,
+                ino: u64::MAX,
                 rdev: None,
             }),
         },
         FileDirectoryEntry {
-            name: String::from("two"),
+            name: String::from("directory"),
             file_type: FileType::Directory,
             node_info: None,
+        },
+        FileDirectoryEntry {
+            name: String::from("device"),
+            file_type: FileType::CharacterDevice,
+            node_info: Some(FileNodeInfo {
+                dev: u64::MAX,
+                ino: u64::MAX,
+                rdev: Some(NonZeroU64::MAX),
+            }),
         },
     ];
     // A page that holds one entry, so the guest has to follow the continuation index.
     let page_bytes =
-        encode_directory_entries_chunk(&entries[..1], 0, MAX_FILE_TRANSFER_SIZE as usize)
+        encode_directory_entries_chunk(&entries[2..], 0, MAX_FILE_TRANSFER_SIZE as usize)
             .unwrap()
             .0
             .len();
     let (broker, fs) = scripted_fs([
         opened(),
         Scripted::Directory {
-            entries,
+            entries: entries.clone(),
             page_bytes,
         },
     ]);
@@ -661,18 +684,12 @@ fn read_dir_reassembles_paged_broker_entries() {
             FileMode::empty(),
         )
         .expect("open should succeed");
-    let entries = fs
+    let received = fs
         .read_file_directory(&fd)
         .expect("read_dir should succeed");
     fs.close_file(&fd).expect("close should succeed");
 
-    assert_eq!(entries.len(), 2);
-    assert_eq!(entries[0].name, "one");
-    assert_eq!(entries[0].file_type, FileType::RegularFile);
-    assert_eq!(entries[0].ino_info.as_ref().map(|node| node.ino), Some(2));
-    assert_eq!(entries[1].name, "two");
-    assert_eq!(entries[1].file_type, FileType::Directory);
-    assert!(entries[1].ino_info.is_none());
+    assert_eq!(received, entries);
 
     let calls = broker.calls();
     assert_eq!(

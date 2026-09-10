@@ -13,7 +13,7 @@ use litebox::{
     fs::OFlags,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
-use litebox_broker_protocol::fs::{FileMode, FileType, FileUser};
+use litebox_broker_protocol::fs::{FileMode, FileNodeInfo, FileStatus, FileType, FileUser};
 use syscalls::Sysno;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
@@ -369,42 +369,43 @@ pub struct IoReadVec {
 /// `iovec` struct for both read and write
 pub type IoVec = IoReadVec;
 
-impl From<litebox::fs::FileStatus> for FileStat {
-    fn from(value: litebox::fs::FileStatus) -> Self {
+impl TryFrom<FileStatus> for FileStat {
+    type Error = errno::Errno;
+
+    fn try_from(value: FileStatus) -> Result<Self, Self::Error> {
         // TODO: add more fields
-        let litebox::fs::FileStatus {
+        let FileStatus {
             file_type,
             mode,
             size,
             owner: FileUser { user, group },
-            node_info: litebox::fs::NodeInfo { dev, ino, rdev },
-            blksize,
+            node_info: FileNodeInfo { dev, ino, rdev },
+            block_size,
             ..
         } = value;
-        Self {
-            st_dev: <_>::try_from(dev).unwrap(),
-            st_ino: <_>::try_from(ino).unwrap(),
+        // Linux exposes signed sizes even where the Rust ABI struct uses `usize`.
+        let size = i64::try_from(size).map_err(|_| errno::Errno::EOVERFLOW)?;
+        #[cfg(target_arch = "x86_64")]
+        let block_size = i64::try_from(block_size).map_err(|_| errno::Errno::EOVERFLOW)?;
+        Ok(Self {
+            st_dev: dev,
+            st_ino: ino,
             st_nlink: 1,
             st_mode: (u32::from(mode.bits()) | InodeType::from(file_type) as u32).trunc(),
             st_uid: <_>::from(user),
             st_gid: <_>::from(group),
-            st_rdev: rdev
-                .map(|r| <_>::try_from(r.get()).unwrap())
-                .unwrap_or_default(),
+            st_rdev: rdev.map_or(0, core::num::NonZeroU64::get),
             #[cfg(target_arch = "x86_64")]
-            #[allow(clippy::cast_possible_wrap)]
+            st_size: usize::try_from(size).map_err(|_| errno::Errno::EOVERFLOW)?,
+            #[cfg(target_arch = "aarch64")]
             st_size: size,
-            #[cfg(target_arch = "aarch64")]
-            #[allow(clippy::cast_possible_wrap)]
-            st_size: size as i64,
             #[cfg(target_arch = "x86_64")]
-            st_blksize: blksize,
+            st_blksize: usize::try_from(block_size).map_err(|_| errno::Errno::EOVERFLOW)?,
             #[cfg(target_arch = "aarch64")]
-            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            st_blksize: blksize as i32,
+            st_blksize: i32::try_from(block_size).map_err(|_| errno::Errno::EOVERFLOW)?,
             st_blocks: 0,
             ..Default::default()
-        }
+        })
     }
 }
 
@@ -510,35 +511,36 @@ fn dev_minor(dev: u64) -> u32 {
     ((dev & 0xff) | ((dev >> 12) & !0xff)).trunc()
 }
 
-impl From<litebox::fs::FileStatus> for Statx {
-    fn from(value: litebox::fs::FileStatus) -> Self {
-        let litebox::fs::FileStatus {
+impl TryFrom<FileStatus> for Statx {
+    type Error = errno::Errno;
+
+    fn try_from(value: FileStatus) -> Result<Self, Self::Error> {
+        let FileStatus {
             file_type,
             mode,
             size,
             owner: FileUser { user, group },
-            node_info: litebox::fs::NodeInfo { dev, ino, rdev },
-            blksize,
+            node_info: FileNodeInfo { dev, ino, rdev },
+            block_size,
             ..
         } = value;
-        let dev = dev as u64;
-        let rdev = rdev.map_or(0u64, |r| r.get() as u64);
-        Self {
+        let rdev = rdev.map_or(0, core::num::NonZeroU64::get);
+        Ok(Self {
             stx_mask: StatxMask::STATX_BASIC_FILLED.bits(),
-            stx_blksize: blksize.trunc(),
+            stx_blksize: u32::try_from(block_size).map_err(|_| errno::Errno::EOVERFLOW)?,
             stx_nlink: 1,
             stx_uid: u32::from(user),
             stx_gid: u32::from(group),
             stx_mode: (u32::from(mode.bits()) | InodeType::from(file_type) as u32).trunc(),
-            stx_ino: ino as u64,
-            stx_size: size as u64,
+            stx_ino: ino,
+            stx_size: size,
             stx_blocks: 0,
             stx_rdev_major: dev_major(rdev),
             stx_rdev_minor: dev_minor(rdev),
             stx_dev_major: dev_major(dev),
             stx_dev_minor: dev_minor(dev),
             ..Default::default()
-        }
+        })
     }
 }
 
@@ -3473,5 +3475,77 @@ impl<T> ReinterpretUsizeAsPtr<core::marker::PhantomData<(bool, T)>> for Option<U
         } else {
             Some(UserPtrMut::from_usize(v))
         }
+    }
+}
+
+#[cfg(test)]
+mod file_status_tests {
+    use super::*;
+    use core::num::NonZeroU64;
+
+    fn status() -> FileStatus {
+        FileStatus {
+            file_type: FileType::CharacterDevice,
+            mode: FileMode::RUSR | FileMode::WUSR,
+            size: u64::from(u32::MAX) + 1,
+            owner: FileUser {
+                user: 12,
+                group: 34,
+            },
+            node_info: FileNodeInfo {
+                dev: u64::MAX,
+                ino: u64::MAX,
+                rdev: NonZeroU64::new(u64::MAX),
+            },
+            block_size: 4096,
+        }
+    }
+
+    #[test]
+    fn stat_preserves_full_width_identity_and_representable_sizes() {
+        let status = status();
+        let stat = FileStat::try_from(status).unwrap();
+        assert_eq!({ stat.st_dev }, status.node_info.dev);
+        assert_eq!({ stat.st_ino }, status.node_info.ino);
+        assert_eq!({ stat.st_rdev }, u64::MAX);
+        assert_eq!(u64::try_from(stat.st_size).unwrap(), status.size);
+        assert_eq!({ stat.st_blksize }, 4096);
+        assert_eq!({ stat.st_uid }, 12);
+        assert_eq!({ stat.st_gid }, 34);
+    }
+
+    #[test]
+    fn stat_rejects_sizes_outside_the_signed_linux_abi() {
+        let mut status = status();
+        status.size = u64::MAX;
+        assert_eq!(FileStat::try_from(status), Err(errno::Errno::EOVERFLOW));
+        status.size = 0;
+        #[cfg(target_arch = "x86_64")]
+        {
+            status.block_size = u64::MAX;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            status.block_size = u64::from(i32::MAX.cast_unsigned()) + 1;
+        }
+        assert_eq!(FileStat::try_from(status), Err(errno::Errno::EOVERFLOW));
+    }
+
+    #[test]
+    fn statx_preserves_u64_sizes_and_checks_block_size_narrowing() {
+        let mut status = status();
+        status.size = u64::MAX;
+        let stat = Statx::try_from(status).unwrap();
+        assert_eq!(stat.stx_size, u64::MAX);
+        assert_eq!(stat.stx_ino, u64::MAX);
+        assert_eq!(stat.stx_dev_major, dev_major(u64::MAX));
+        assert_eq!(stat.stx_dev_minor, dev_minor(u64::MAX));
+        assert_eq!(stat.stx_rdev_major, dev_major(u64::MAX));
+        assert_eq!(stat.stx_rdev_minor, dev_minor(u64::MAX));
+        status.block_size = u64::from(u32::MAX) + 1;
+        assert_eq!(
+            Statx::try_from(status).unwrap_err(),
+            errno::Errno::EOVERFLOW
+        );
     }
 }

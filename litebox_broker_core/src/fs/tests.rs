@@ -319,7 +319,7 @@ mod in_mem {
                 _ => panic!("Unexpected entry: {}", entry.name),
             }
             if entry.name != "." && entry.name != ".." {
-                assert!(entry.ino_info.is_some(), "Inode info should be present");
+                assert!(entry.node_info.is_some(), "Inode info should be present");
             } else {
                 // TODO(jayb): Re-enable this assertion once the resolver fills in
                 // inode information for the synthesized `.` and `..` entries.
@@ -1075,7 +1075,7 @@ mod tar_ro {
                 _ => panic!("Unexpected entry: {}", entry.name),
             }
             if entry.name != "." && entry.name != ".." {
-                assert!(entry.ino_info.is_some(), "Inode info should be present");
+                assert!(entry.node_info.is_some(), "Inode info should be present");
             } else {
                 // TODO(jayb): Re-enable this assertion once Composer handles `.` and `..` inode
                 // information better.
@@ -1393,7 +1393,7 @@ mod overlay {
         assert_eq!(entries[2].name, "baz");
         assert_eq!(entries[2].file_type, FileType::RegularFile);
         assert!(
-            entries[2].ino_info.is_some(),
+            entries[2].node_info.is_some(),
             "Inode info should be present"
         );
     }
@@ -1447,7 +1447,7 @@ mod overlay {
                 _ => panic!("Unexpected entry: {}", entry.name),
             }
             if entry.name != "." && entry.name != ".." {
-                assert!(entry.ino_info.is_some(), "Inode info should be present");
+                assert!(entry.node_info.is_some(), "Inode info should be present");
             } else {
                 // TODO(jayb): Re-enable this assertion once the resolver fills in
                 // inode information for the synthesized `.` and `..` entries.

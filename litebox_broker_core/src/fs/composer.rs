@@ -9,8 +9,11 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
-use litebox_broker_protocol::fs::{FileMode as Mode, FileType, FileUser as UserInfo};
+use litebox_broker_protocol::fs::{
+    FileDirectoryEntry, FileMode as Mode, FileNodeInfo, FileStatus, FileType, FileUser as UserInfo,
+};
 
+use super::OFlags;
 use super::backend::{
     Backend, BackendHandles, CreationMetadata, DirHandle, FileHandle, HandleRef, PermissionCheck,
     Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkedComponent, WalkingDirHandle,
@@ -20,7 +23,6 @@ use super::errors::{
     ReadError, RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::inode_allocator::{InodeAllocator, InodeAllocators};
-use super::{DirEntry, FileStatus, NodeInfo, OFlags};
 use thiserror::Error;
 
 // XXX(jayb): consider removing this via a runtime reserved device ID?
@@ -51,7 +53,7 @@ struct Mount {
 #[derive(Clone)]
 struct VirtualDir {
     path: Vec<String>,
-    node_info: NodeInfo,
+    node_info: FileNodeInfo,
 }
 
 /// Composer construction errors.
@@ -227,19 +229,23 @@ impl Composer {
         children
     }
 
-    fn list_mount_children(&self, path: &[String]) -> Vec<DirEntry> {
+    fn list_mount_children(&self, path: &[String]) -> Vec<FileDirectoryEntry> {
         self.immediate_mount_children(path)
             .into_iter()
-            .map(|name| DirEntry {
+            .map(|name| FileDirectoryEntry {
                 name,
                 file_type: FileType::Directory,
                 // TODO(jayb): set up proper inode info for these
-                ino_info: None,
+                node_info: None,
             })
             .collect()
     }
 
-    fn merge_mount_children(&self, mut entries: Vec<DirEntry>, path: &[String]) -> Vec<DirEntry> {
+    fn merge_mount_children(
+        &self,
+        mut entries: Vec<FileDirectoryEntry>,
+        path: &[String],
+    ) -> Vec<FileDirectoryEntry> {
         for child in self.list_mount_children(path) {
             entries.retain(|entry| entry.name != child.name);
             entries.push(child);
@@ -273,7 +279,7 @@ impl Composer {
             .virtual_dirs
             .iter()
             .find(|dir| dir.path == path)
-            .map(|dir| dir.node_info.clone())
+            .map(|dir| dir.node_info)
             .expect("virtual directory is precomputed");
         FileStatus {
             file_type: FileType::Directory,
@@ -282,7 +288,7 @@ impl Composer {
             size: super::DEFAULT_DIRECTORY_SIZE,
             owner: UserInfo::ROOT,
             node_info,
-            blksize: super::DEFAULT_DIRECTORY_SIZE,
+            block_size: super::DEFAULT_DIRECTORY_SIZE,
         }
     }
 
@@ -623,7 +629,7 @@ impl Backend for Composer {
         }
     }
 
-    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
+    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<FileDirectoryEntry>, ReadDirError> {
         let handle = handle.into_typed::<Self>();
         match handle.inner {
             ComposerDirHandleInner::Virtual { path } => Ok(self.list_mount_children(&path)),

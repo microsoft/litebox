@@ -544,7 +544,7 @@ struct KeySummary {
     max_name_len: usize,
     values: usize,
     max_value_name_len: usize,
-    max_value_data_len: usize,
+    max_value_data_len: u64,
 }
 
 /// The `KEY_VALUE_BASIC_INFORMATION` structure defines a subset of the full
@@ -660,10 +660,15 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         if status.file_type != FileType::RegularFile {
             return Err(NtStatus::OBJECT_TYPE_MISMATCH);
         }
-        if status.size < REGISTRY_VALUE_TYPE_SIZE {
+        if status.size < REGISTRY_VALUE_TYPE_SIZE as u64 {
             return Err(NtStatus::UNSUCCESSFUL);
         }
 
+        let size = usize::try_from(status.size).map_err(|_| NtStatus::NO_MEMORY)?;
+        let mut data = Vec::new();
+        data.try_reserve_exact(size)
+            .map_err(|_| NtStatus::NO_MEMORY)?;
+        data.resize(size, 0);
         let fd = self
             .fs()
             .open_file(
@@ -673,7 +678,6 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
                 Mode::empty(),
             )
             .map_err(map_open_error)?;
-        let mut data = vec![0; status.size];
         let result = read_exact_at(self.fs(), &fd, &mut data);
         let _ = self.fs().close_file(&fd);
         result?;
@@ -813,12 +817,12 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
                 .path_file_status(&self.fs_context, &*path)
                 .map_err(map_file_status_error)?
                 .size;
-            if size < REGISTRY_VALUE_TYPE_SIZE {
+            if size < REGISTRY_VALUE_TYPE_SIZE as u64 {
                 return Err(NtStatus::UNSUCCESSFUL);
             }
             summary.max_value_data_len = summary
                 .max_value_data_len
-                .max(size - REGISTRY_VALUE_TYPE_SIZE);
+                .max(size - REGISTRY_VALUE_TYPE_SIZE as u64);
         }
         Ok(summary)
     }
@@ -1743,7 +1747,8 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                     max_class_len: 0,
                     values: summary.values.trunc(),
                     max_value_name_len: summary.max_value_name_len.trunc(),
-                    max_value_data_len: summary.max_value_data_len.trunc(),
+                    max_value_data_len: u32::try_from(summary.max_value_data_len)
+                        .map_err(|_| NtStatus::UNSUCCESSFUL)?,
                     class: [],
                 };
                 write_query_information::<Platform>(
@@ -1791,7 +1796,8 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                     max_name_len: summary.max_name_len.trunc(),
                     values: summary.values.trunc(),
                     max_value_name_len: summary.max_value_name_len.trunc(),
-                    max_value_data_len: summary.max_value_data_len.trunc(),
+                    max_value_data_len: u32::try_from(summary.max_value_data_len)
+                        .map_err(|_| NtStatus::UNSUCCESSFUL)?,
                     name_length: leaf_name.len().trunc(),
                     padding: [0; 4],
                 };
@@ -1961,7 +1967,8 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                     max_class_len: 0,
                     values: summary.values.trunc(),
                     max_value_name_len: summary.max_value_name_len.trunc(),
-                    max_value_data_len: summary.max_value_data_len.trunc(),
+                    max_value_data_len: u32::try_from(summary.max_value_data_len)
+                        .map_err(|_| NtStatus::UNSUCCESSFUL)?,
                     class: [],
                 };
                 write_query_information::<Platform>(
@@ -2796,7 +2803,7 @@ mod tests {
                 .path_file_status(&registry.fs_context, &*value_path)
                 .unwrap()
                 .size,
-            REGISTRY_VALUE_TYPE_SIZE + DEFAULT_ACP_VALUE.len()
+            (REGISTRY_VALUE_TYPE_SIZE + DEFAULT_ACP_VALUE.len()) as u64
         );
         let value = registry.read_value_at_path(&key_path, "ACP").unwrap();
         assert_eq!(value.value_type, u32::from(RegistryValueType::Sz));

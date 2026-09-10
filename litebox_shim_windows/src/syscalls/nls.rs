@@ -798,10 +798,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(NtStatus::OBJECT_NAME_NOT_FOUND);
         }
 
-        Ok(NlsSectionFile {
-            fd,
-            len: status.size,
-        })
+        let Ok(len) = usize::try_from(status.size) else {
+            let _ = self.fs.close_file(&fd);
+            return Err(NtStatus::SECTION_TOO_BIG);
+        };
+        Ok(NlsSectionFile { fd, len })
     }
 
     fn copy_nls_section_file(
