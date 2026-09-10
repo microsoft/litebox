@@ -15,9 +15,9 @@ use litebox::{
 use litebox_common_linux::errno::Errno;
 use litebox_common_lvbs::{NUM_VTLCALL_PARAMS, VsmError, VsmFunction};
 use litebox_common_optee::{
-    OpteeMessageCommand, OpteeMsgArgs, OpteeRpcArgs, OpteeSmcArgs, OpteeSmcFunction,
-    OpteeSmcResult, OpteeSmcReturnCode, TeeOrigin, TeeResult, UteeEntryFunc, UteeParams,
-    optee_msg_args_total_size,
+    OpteeMessageCommand, OpteeMsgArgs, OpteeMsgParamRmem, OpteeRpcArgs, OpteeRpcShmType,
+    OpteeSmcArgs, OpteeSmcFunction, OpteeSmcResult, OpteeSmcReturnCode, TeeOrigin, TeeResult,
+    UteeEntryFunc, UteeParams, optee_msg_args_total_size,
 };
 use litebox_platform_lvbs::host::LvbsLinuxKernel as Platform;
 use litebox_platform_lvbs::mshv::vsm::{LvbsVtl0Gate, LvbsVtl0PrivilegedWriter, LvbsVtl1Gate};
@@ -45,10 +45,11 @@ use litebox_shim_optee::session::{OpenSessionTarget, SessionManager, TaInstance}
 use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr, TaMemrefAddresses, UserConstPtr};
 use litebox_shim_optee::{
     msg_handler::{
-        decode_ta_request, handle_optee_msg_args, handle_optee_smc_args, update_optee_msg_args,
-        write_rpc_args_to_regd_shm,
+        checked_memref_size, decode_ta_request, handle_optee_msg_args, handle_optee_smc_args,
+        read_optee_msg_args_from_regd_shm, register_rpc_shm, unregister_rpc_shm,
+        update_optee_msg_args, write_rpc_args_to_regd_shm,
     },
-    rpc_context::rpc_context_map,
+    rpc_context::{RpcContext, rpc_context_map},
 };
 
 /// The session registry shared by all shims in this runner.
@@ -548,115 +549,334 @@ fn optee_smc_handler(platform: &'static Platform, smc_args_addr: usize) -> Optee
     let Ok(mut smc_args) = smc_args_ptr.read_at_offset(0) else {
         return make_error_response(OpteeSmcReturnCode::EBadAddr);
     };
-    let Ok(smc_result) = handle_optee_smc_args(platform, &mut smc_args) else {
+    let smc_result = if smc_args.func_id() == Ok(OpteeSmcFunction::ReturnFromRpc) {
+        let context_id = match smc_args.get_rpc_context_id() {
+            Ok(context_id) => context_id,
+            Err(error) => {
+                smc_args.set_return_code(error);
+                return *smc_args;
+            }
+        };
+        let Some(context) = rpc_context_map().get(context_id) else {
+            smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+            return *smc_args;
+        };
+        let result = read_optee_msg_args_from_regd_shm(
+            platform,
+            context.registered_shm_ref(),
+            context.registered_shm_offset(),
+        )
+        .and_then(|(msg_args, rpc_args, msg_args_phys_addr)| {
+            Ok(OpteeSmcResult::ReturnFromRpc {
+                msg_args,
+                rpc_args: rpc_args.ok_or(OpteeSmcReturnCode::EBadAddr)?,
+                msg_args_phys_addr,
+            })
+        });
+        if result.is_err() {
+            discard_rpc_context(context_id);
+        }
+        result
+    } else {
+        handle_optee_smc_args(platform, &mut smc_args)
+    };
+    let Ok(smc_result) = smc_result else {
         smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
         return *smc_args;
     };
-    if let OpteeSmcResult::CallWithArg {
-        msg_args,
-        mut rpc_args,
-        msg_args_phys_addr,
-    } = smc_result
-    {
-        let mut msg_args = *msg_args;
-        debug_serial_println!("OP-TEE SMC with MsgArgs Command: {:?}", msg_args.cmd);
-        let result = match msg_args.cmd {
-            OpenSession => {
-                handle_open_session(platform, &mut msg_args, &mut rpc_args, msg_args_phys_addr)
-            }
-            InvokeCommand => handle_invoke_command(platform, &mut msg_args, msg_args_phys_addr),
-            CloseSession => handle_close_session(platform, &mut msg_args, msg_args_phys_addr),
-            _ => {
-                let r = handle_optee_msg_args(platform, &msg_args);
-                if r.is_ok() {
-                    msg_args.ret = TeeResult::Success;
-                } else {
-                    msg_args.ret = TeeResult::BadParameters;
+    match smc_result {
+        OpteeSmcResult::CallWithArg {
+            msg_args,
+            mut rpc_args,
+            msg_args_phys_addr,
+        } => {
+            let mut msg_args = *msg_args;
+            debug_serial_println!("OP-TEE SMC with MsgArgs Command: {:?}", msg_args.cmd);
+            let result = match msg_args.cmd {
+                OpenSession => {
+                    handle_open_session(platform, &mut msg_args, &mut rpc_args, msg_args_phys_addr)
                 }
-                msg_args.ret_origin = TeeOrigin::Tee;
-                let _ =
-                    write_non_ta_msg_args_to_normal_world(platform, &msg_args, msg_args_phys_addr);
-                r
-            }
-        };
-
-        // Always switch back to base page table before returning to VTL0
-        // Safety: No user-space memory references are held after this point
-        unsafe { switch_to_base_page_table(platform) };
-
-        if let Err(e) = result {
-            if e == OpteeSmcReturnCode::RpcCmd {
-                debug_serial_println!("OP-TEE SMC returning RPC command to normal world");
-
-                // Dynamic TA RPC continuation requires CallWithRegdArg because the request
-                // buffer must be identified by a registered SHM reference and offset.
-                // CallWithArg and CallWithRpcArg do not provide that registered-SHM identity.
-                if smc_args.func_id() != Ok(OpteeSmcFunction::CallWithRegdArg) {
-                    smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
-                    return *smc_args;
+                InvokeCommand => handle_invoke_command(platform, &mut msg_args, msg_args_phys_addr),
+                CloseSession => handle_close_session(platform, &mut msg_args, msg_args_phys_addr),
+                _ => {
+                    let r = handle_optee_msg_args(platform, &msg_args);
+                    if r.is_ok() {
+                        msg_args.ret = TeeResult::Success;
+                    } else {
+                        msg_args.ret = TeeResult::BadParameters;
+                    }
+                    msg_args.ret_origin = TeeOrigin::Tee;
+                    let _ = write_non_ta_msg_args_to_normal_world(
+                        platform,
+                        &msg_args,
+                        msg_args_phys_addr,
+                    );
+                    r
                 }
-                let Some(rpc_args_ref) = rpc_args.as_ref() else {
-                    smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
-                    return *smc_args;
-                };
+            };
 
-                let (registered_shm_ref, regd_shm_offset) =
-                    match smc_args.optee_regd_shm_ref_and_offset() {
-                        Ok(location) => location,
-                        Err(error) => {
-                            smc_args.set_return_code(error);
-                            return *smc_args;
-                        }
-                    };
-                let ta_uuid = match decode_ta_request(platform, &msg_args)
-                    .ok()
-                    .and_then(|request| request.uuid)
-                {
-                    Some(ta_uuid) => ta_uuid,
-                    None => {
+            // Always switch back to base page table before returning to VTL0
+            // Safety: No user-space memory references are held after this point
+            unsafe { switch_to_base_page_table(platform) };
+
+            if let Err(e) = result {
+                if e == OpteeSmcReturnCode::RpcCmd {
+                    debug_serial_println!("OP-TEE SMC returning RPC command to normal world");
+
+                    // Dynamic TA RPC continuation requires CallWithRegdArg because the request
+                    // buffer must be identified by a registered SHM reference and offset.
+                    // CallWithArg and CallWithRpcArg do not provide that registered-SHM identity.
+                    if smc_args.func_id() != Ok(OpteeSmcFunction::CallWithRegdArg) {
                         smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
                         return *smc_args;
                     }
-                };
-                let context_id = match rpc_context_map().allocate(
-                    ta_uuid,
-                    registered_shm_ref,
-                    regd_shm_offset,
-                ) {
-                    Ok(context_id) => context_id,
-                    Err(error) => {
-                        debug_serial_println!(
-                            "Failed to allocate RPC context for LOAD_TA request: {:?}",
-                            error
-                        );
-                        smc_args.set_return_code(OpteeSmcReturnCode::EThreadLimit);
+                    let Some(rpc_args_ref) = rpc_args.as_ref() else {
+                        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
                         return *smc_args;
+                    };
+                    let (registered_shm_ref, regd_shm_offset) =
+                        match smc_args.optee_regd_shm_ref_and_offset() {
+                            Ok(location) => location,
+                            Err(error) => {
+                                smc_args.set_return_code(error);
+                                return *smc_args;
+                            }
+                        };
+                    let ta_uuid = match decode_ta_request(platform, &msg_args)
+                        .ok()
+                        .and_then(|request| request.uuid)
+                    {
+                        Some(ta_uuid) => ta_uuid,
+                        None => {
+                            smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+                            return *smc_args;
+                        }
+                    };
+                    let context_id = match rpc_context_map().allocate(
+                        ta_uuid,
+                        registered_shm_ref,
+                        regd_shm_offset,
+                    ) {
+                        Ok(context_id) => context_id,
+                        Err(error) => {
+                            debug_serial_println!(
+                                "Failed to allocate RPC context for LOAD_TA request: {:?}",
+                                error
+                            );
+                            smc_args.set_return_code(OpteeSmcReturnCode::EThreadLimit);
+                            return *smc_args;
+                        }
+                    };
+                    smc_args.set_rpc_context_id(context_id);
+                    if let Err(e) = write_rpc_args_to_regd_shm(
+                        platform,
+                        registered_shm_ref,
+                        regd_shm_offset,
+                        msg_args.num_params,
+                        rpc_args_ref,
+                    ) {
+                        let _ = rpc_context_map().take(context_id);
+                        smc_args.set_return_code(e);
+                    } else {
+                        smc_args.set_return_code(OpteeSmcReturnCode::RpcCmd);
                     }
-                };
-                smc_args.set_rpc_context_id(context_id);
-
-                if let Err(e) = write_rpc_args_to_regd_shm(
-                    platform,
-                    registered_shm_ref,
-                    regd_shm_offset,
-                    msg_args.num_params,
-                    rpc_args_ref,
-                ) {
-                    let _ = rpc_context_map().take(context_id);
-                    smc_args.set_return_code(e);
                 } else {
-                    smc_args.set_return_code(OpteeSmcReturnCode::RpcCmd);
+                    debug_serial_println!("OP-TEE SMC returning error code: {:?}", e);
+                    smc_args.set_return_code(e);
                 }
             } else {
-                debug_serial_println!("OP-TEE SMC returning error code: {:?}", e);
-                smc_args.set_return_code(e);
+                smc_args.set_return_code(OpteeSmcReturnCode::Ok);
             }
-        } else {
-            smc_args.set_return_code(OpteeSmcReturnCode::Ok);
+            *smc_args
         }
-        *smc_args
+        OpteeSmcResult::ReturnFromRpc {
+            msg_args,
+            rpc_args,
+            msg_args_phys_addr: _,
+        } => {
+            let msg_args = *msg_args;
+            let mut rpc_args = *rpc_args;
+
+            let context_id = match smc_args.get_rpc_context_id() {
+                Ok(context_id) => context_id,
+                Err(error) => {
+                    smc_args.set_return_code(error);
+                    return *smc_args;
+                }
+            };
+            let Some(context) = rpc_context_map().get(context_id) else {
+                smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+                return *smc_args;
+            };
+            match context {
+                RpcContext::LoadTaSize { .. } => {
+                    handle_return_from_load_ta_rpc(
+                        platform,
+                        context_id,
+                        &mut smc_args,
+                        &msg_args,
+                        &mut rpc_args,
+                    );
+                }
+                RpcContext::ShmAlloc { .. } => {
+                    handle_return_from_shm_alloc_rpc(
+                        platform,
+                        context_id,
+                        &mut smc_args,
+                        &msg_args,
+                        &mut rpc_args,
+                    );
+                }
+                _ => {
+                    smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+                }
+            }
+            *smc_args
+        }
+        _ => smc_result.into(),
+    }
+}
+
+fn handle_return_from_load_ta_rpc(
+    platform: &Platform,
+    context_id: u32,
+    smc_args: &mut OpteeSmcArgs,
+    msg_args: &OpteeMsgArgs,
+    rpc_args: &mut OpteeRpcArgs,
+) {
+    let ta_size = match rpc_args.load_ta_size_response() {
+        Ok(ta_size) => ta_size,
+        Err(error) => {
+            discard_rpc_context(context_id);
+            smc_args.set_return_code(error);
+            return;
+        }
+    };
+    debug_serial_println!("First LOAD_TA request, TA size: {}", ta_size);
+    if checked_memref_size(ta_size).is_err() {
+        debug_serial_println!("Invalid TA size in first LOAD_TA request");
+        discard_rpc_context(context_id);
+        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+        return;
+    }
+
+    if rpc_args
+        .prepare_shm_alloc_rpc(OpteeRpcShmType::Appl, ta_size, 8)
+        .is_err()
+    {
+        discard_rpc_context(context_id);
+        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+        return;
+    }
+    if rpc_context_map()
+        .transition_to_shm_alloc(context_id, ta_size)
+        .is_err()
+    {
+        discard_rpc_context(context_id);
+        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+        return;
+    }
+    if !write_next_rpc(platform, smc_args, msg_args, rpc_args, context_id) {
+        discard_rpc_context(context_id);
+    }
+}
+
+fn handle_return_from_shm_alloc_rpc(
+    platform: &Platform,
+    context_id: u32,
+    smc_args: &mut OpteeSmcArgs,
+    msg_args: &OpteeMsgArgs,
+    rpc_args: &mut OpteeRpcArgs,
+) {
+    let Some(RpcContext::ShmAlloc {
+        common: _,
+        requested_size,
+    }) = rpc_context_map().get(context_id)
+    else {
+        discard_rpc_context(context_id);
+        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+        return;
+    };
+    let tmem = match rpc_args.shm_alloc_response(requested_size) {
+        Ok(tmem) => tmem,
+        Err(error) => {
+            discard_rpc_context(context_id);
+            smc_args.set_return_code(error);
+            return;
+        }
+    };
+    if checked_memref_size(tmem.size).is_err() {
+        discard_rpc_context(context_id);
+        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+        return;
+    }
+    if register_rpc_shm(platform, &tmem).is_err() {
+        discard_rpc_context(context_id);
+        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+        return;
+    }
+    let Some(context) = rpc_context_map().get(context_id) else {
+        let _ = unregister_rpc_shm(tmem.shm_ref);
+        discard_rpc_context(context_id);
+        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+        return;
+    };
+    let rmem = OpteeMsgParamRmem {
+        offs: 0,
+        size: requested_size,
+        shm_ref: tmem.shm_ref,
+    };
+    if rpc_args
+        .prepare_load_ta_rpc(context.ta_uuid(), Some(rmem))
+        .is_err()
+        || rpc_context_map()
+            .transition_to_load_ta_binary(context_id, tmem.shm_ref)
+            .is_err()
+    {
+        let _ = unregister_rpc_shm(tmem.shm_ref);
+        discard_rpc_context(context_id);
+        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+        return;
+    }
+    if !write_next_rpc(platform, smc_args, msg_args, rpc_args, context_id) {
+        discard_rpc_context(context_id);
+    }
+}
+
+fn write_next_rpc(
+    platform: &Platform,
+    smc_args: &mut OpteeSmcArgs,
+    msg_args: &OpteeMsgArgs,
+    rpc_args: &OpteeRpcArgs,
+    context_id: u32,
+) -> bool {
+    let result = rpc_context_map()
+        .get(context_id)
+        .ok_or(OpteeSmcReturnCode::EBadCmd)
+        .and_then(|context| {
+            write_rpc_args_to_regd_shm(
+                platform,
+                context.registered_shm_ref(),
+                context.registered_shm_offset(),
+                msg_args.num_params,
+                rpc_args,
+            )
+        });
+    if let Err(error) = result {
+        discard_rpc_context(context_id);
+        smc_args.set_return_code(error);
+        false
     } else {
-        smc_result.into()
+        smc_args.set_return_code(OpteeSmcReturnCode::RpcCmd);
+        true
+    }
+}
+
+fn discard_rpc_context(context_id: u32) {
+    if let Some(context) = rpc_context_map().take(context_id)
+        && let Some(shm_ref) = context.shm_ref()
+    {
+        let _ = unregister_rpc_shm(shm_ref);
     }
 }
 

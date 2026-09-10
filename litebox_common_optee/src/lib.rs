@@ -1450,6 +1450,22 @@ const OPTEE_MSG_RPC_CMD_RPMB_PROBE_RESET: u32 = 22;
 const OPTEE_MSG_RPC_CMD_RPMB_PROBE_NEXT: u32 = 23;
 const OPTEE_MSG_RPC_CMD_RPMB_PROBE_FRAMES: u32 = 24;
 
+/// Memory that can be shared with a non-secure user space application
+const OPTEE_RPC_SHM_TYPE_APPL: u32 = 0;
+/// Memory only shared with non-secure kernel
+const OPTEE_RPC_SHM_TYPE_KERNEL: u32 = 1;
+/// Memory shared with non-secure kernel and exported to a non-secure user
+/// space application
+const OPTEE_RPC_SHM_TYPE_GLOBAL: u32 = 2;
+
+/// OP-TEE RPC shared memory types
+#[repr(u32)]
+pub enum OpteeRpcShmType {
+    Appl = OPTEE_RPC_SHM_TYPE_APPL,
+    Kernel = OPTEE_RPC_SHM_TYPE_KERNEL,
+    Global = OPTEE_RPC_SHM_TYPE_GLOBAL,
+}
+
 /// RPC command IDs from `optee_os/core/include/optee_msg.h`
 ///
 /// These are the command IDs used in the `cmd` field of the RPC `optee_msg_arg`.
@@ -2157,6 +2173,12 @@ impl OpteeRpcArgs {
         OpteeMsgParamTmem::read_from_bytes(&param.data).map_err(|_| OpteeSmcReturnCode::EBadCmd)
     }
 
+    /// Return whether an exactly validated TMEM output parameter uses a page list.
+    fn is_param_tmem_output_noncontiguous(&self, index: usize) -> Result<bool, OpteeSmcReturnCode> {
+        self.get_param_tmem_output(index)?;
+        Ok(self.params[index].attr.noncontig())
+    }
+
     /// Access an RMEM output parameter with exact direction and flag validation.
     pub fn get_param_rmem_output(
         &self,
@@ -2229,6 +2251,71 @@ impl OpteeRpcArgs {
             self.params[index].data.copy_from_slice(tmem.as_bytes());
             Ok(())
         }
+    }
+
+    /// Validate a successful first LOAD_TA response and return the requested TA size.
+    pub fn load_ta_size_response(&self) -> Result<u64, OpteeSmcReturnCode> {
+        if self.cmd != OpteeRpcCommand::LoadTa
+            || self.ret != TeeResult::Success
+            || self.num_params != 2
+        {
+            return Err(OpteeSmcReturnCode::EBadCmd);
+        }
+
+        let size = self.get_param_tmem_output(1)?.size;
+        if size == 0 {
+            return Err(OpteeSmcReturnCode::EBadCmd);
+        }
+        Ok(size)
+    }
+
+    /// Validate a successful SHM_ALLOC response and return its memory reference.
+    pub fn shm_alloc_response(
+        &self,
+        requested_size: u64,
+    ) -> Result<OpteeMsgParamTmem, OpteeSmcReturnCode> {
+        if self.cmd != OpteeRpcCommand::ShmAlloc
+            || self.ret != TeeResult::Success
+            || self.num_params != 1
+        {
+            return Err(OpteeSmcReturnCode::EBadCmd);
+        }
+
+        let tmem = self.get_param_tmem_output(0)?;
+        if !self.is_param_tmem_output_noncontiguous(0)?
+            || tmem.buf_ptr == 0
+            || tmem.shm_ref == 0
+            || tmem.size < requested_size
+        {
+            return Err(OpteeSmcReturnCode::EBadCmd);
+        }
+        Ok(tmem)
+    }
+
+    /// Prepare a shared-memory allocation RPC request to be sent to normal world.
+    pub fn prepare_shm_alloc_rpc(
+        &mut self,
+        shm_type: OpteeRpcShmType,
+        size: u64,
+        alignment: u64,
+    ) -> Result<(), OpteeSmcReturnCode> {
+        self.cmd = OpteeRpcCommand::ShmAlloc;
+        // Match OP-TEE's get_rpc_arg(): default to failure in case normal world
+        // returns without updating the RPC result.
+        self.ret = TeeResult::GenericError;
+        self.num_params = 1;
+
+        self.set_param_attr_type(0, OpteeMsgAttrType::ValueInput)?;
+        self.set_param_value(
+            0,
+            OpteeMsgParamValue {
+                a: shm_type as u64,
+                b: size,
+                c: alignment,
+            },
+        )?;
+
+        Ok(())
     }
 
     /// Prepare a LOAD_TA RPC request to be sent to normal world.
@@ -2380,6 +2467,7 @@ impl OpteeSmcArgs {
 /// TODO: Add stuffs based on the OP-TEE driver that LVBS is using.
 const OPTEE_SMC_FUNCID_GET_OS_UUID: usize = 0x0;
 const OPTEE_SMC_FUNCID_GET_OS_REVISION: usize = 0x1;
+const OPTEE_SMC_FUNCID_RETURN_FROM_RPC: usize = 0x3;
 const OPTEE_SMC_FUNCID_CALL_WITH_ARG: usize = 0x4;
 const OPTEE_SMC_FUNCID_EXCHANGE_CAPABILITIES: usize = 0x9;
 const OPTEE_SMC_FUNCID_DISABLE_SHM_CACHE: usize = 0xa;
@@ -2394,6 +2482,7 @@ const OPTEE_SMC_FUNCID_CALLS_REVISION: usize = 0xff03;
 pub enum OpteeSmcFunction {
     GetOsUuid = OPTEE_SMC_FUNCID_GET_OS_UUID,
     GetOsRevision = OPTEE_SMC_FUNCID_GET_OS_REVISION,
+    ReturnFromRpc = OPTEE_SMC_FUNCID_RETURN_FROM_RPC,
     CallWithArg = OPTEE_SMC_FUNCID_CALL_WITH_ARG,
     ExchangeCapabilities = OPTEE_SMC_FUNCID_EXCHANGE_CAPABILITIES,
     DisableShmCache = OPTEE_SMC_FUNCID_DISABLE_SHM_CACHE,
@@ -2441,6 +2530,11 @@ pub enum OpteeSmcResult<'a> {
     CallWithArg {
         msg_args: Box<OpteeMsgArgs>,
         rpc_args: Option<Box<OpteeRpcArgs>>,
+        msg_args_phys_addr: u64,
+    },
+    ReturnFromRpc {
+        msg_args: Box<OpteeMsgArgs>,
+        rpc_args: Box<OpteeRpcArgs>,
         msg_args_phys_addr: u64,
     },
 }
@@ -2504,6 +2598,11 @@ impl From<OpteeSmcResult<'_>> for OpteeSmcArgs {
             OpteeSmcResult::CallWithArg { .. } => {
                 panic!(
                     "OpteeSmcResult::CallWithArg cannot be converted to OpteeSmcArgs directly. Handle the incorporated OpteeMsgArgs."
+                );
+            }
+            OpteeSmcResult::ReturnFromRpc { .. } => {
+                panic!(
+                    "OpteeSmcResult::ReturnFromRpc cannot be converted to OpteeSmcArgs directly. Handle the incorporated OpteeMsgArgs and OpteeRpcArgs."
                 );
             }
         }
