@@ -254,15 +254,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
             })?
             .map_err(file_status_error)
     }
-
-    /// Get static backing data for a file, if available and supported.
-    pub fn get_static_file_backing_data(&self, fd: &FileFd) -> Option<&'static [u8]> {
-        let _ = self.broker_file(fd)?;
-        None
-    }
 }
 
-/// Per-call resolution context. The user may hold and mutate this as they wish.
+/// Caller-owned filesystem context containing a working directory and acting user.
 #[derive(Clone, Debug)]
 pub struct Context {
     cwd: Arc<ResolvedPath>,

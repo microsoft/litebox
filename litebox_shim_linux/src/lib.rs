@@ -58,7 +58,6 @@ pub(crate) mod channel;
 pub mod loader;
 pub(crate) mod stdio;
 pub mod syscalls;
-pub mod transport;
 mod wait;
 
 pub(crate) use litebox::fs::FileFd;
@@ -315,17 +314,6 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
     /// Get the global page manager
     pub fn page_manager(&self) -> &PageManager<Platform, PAGE_SIZE> {
         &self.0.pm
-    }
-
-    /// Establish a TCP connection to the given address.
-    ///
-    /// Returns a [`transport::ShimTransport`] that can be used as a
-    /// byte-stream transport (e.g., for a 9P filesystem client).
-    pub fn tcp_connection(
-        &self,
-        addr: core::net::SocketAddr,
-    ) -> Result<transport::ShimTransport<Platform>, Errno> {
-        transport::ShimTransport::connect(self.0.clone(), addr)
     }
 
     pub fn litebox(&self) -> &LiteBox<Platform> {

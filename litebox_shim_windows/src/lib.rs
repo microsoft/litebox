@@ -32,16 +32,14 @@ use litebox_common_windows::{NtSysno, Win32Sysno};
 use litebox_platform::time::TimeProvider;
 
 use crate::syscalls::event::{EventHandleObject, EventSubsystem};
-use crate::syscalls::file::{FileObject, FileObjectSubsystem};
+use crate::syscalls::file::FileObject;
 use crate::syscalls::iocp::{IoCompletionHandleObject, IoCompletionSubsystem};
 use crate::syscalls::lpc::{LpcPortHandleObject, LpcPortSubsystem};
 use crate::syscalls::mutant::{MutantHandleObject, MutantSubsystem};
 use crate::syscalls::object_manager::{
     DirectoryHandleObject, DirectoryObjectSubsystem, ObjectManager,
 };
-use crate::syscalls::registry::{
-    NtNotifyChangeKeyRequest, RegistryKeyObject, RegistryKeySubsystem,
-};
+use crate::syscalls::registry::{NtNotifyChangeKeyRequest, RegistryKeyObject};
 use crate::syscalls::section::{
     MapViewOfSectionParameters, SectionHandleObject, SectionObject, SectionSubsystem,
 };
@@ -2495,8 +2493,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             };
         }
 
-        try_metadata!(FileObjectSubsystem<Platform>);
-        try_metadata!(RegistryKeySubsystem<Platform>);
+        try_metadata!(FileObject);
+        try_metadata!(RegistryKeyObject);
         try_metadata!(EventSubsystem<Platform>);
         try_metadata!(MutantSubsystem<Platform>);
         try_metadata!(SemaphoreSubsystem<Platform>);
@@ -2545,8 +2543,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             };
         }
 
-        try_set_attributes!(FileObjectSubsystem<Platform>);
-        try_set_attributes!(RegistryKeySubsystem<Platform>);
+        try_set_attributes!(FileObject);
+        try_set_attributes!(RegistryKeyObject);
         try_set_attributes!(EventSubsystem<Platform>);
         try_set_attributes!(MutantSubsystem<Platform>);
         try_set_attributes!(SemaphoreSubsystem<Platform>);
@@ -2717,8 +2715,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             };
         }
 
-        try_duplicate!(FileObjectSubsystem<Platform>);
-        try_duplicate!(RegistryKeySubsystem<Platform>);
+        try_duplicate!(FileObject);
+        try_duplicate!(RegistryKeyObject);
         try_duplicate!(EventSubsystem<Platform>);
         try_duplicate!(MutantSubsystem<Platform>);
         try_duplicate!(SemaphoreSubsystem<Platform>);
@@ -2828,8 +2826,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             };
         }
 
-        try_close!(FileObjectSubsystem<Platform>, file);
-        try_close!(RegistryKeySubsystem<Platform>, registry_key);
+        try_close!(FileObject, file);
+        try_close!(RegistryKeyObject, registry_key);
         try_close!(EventSubsystem<Platform>, event);
         try_close!(MutantSubsystem<Platform>, mutant);
         try_close!(SemaphoreSubsystem<Platform>, semaphore);
