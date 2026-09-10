@@ -9,7 +9,6 @@ use core::mem::{align_of, offset_of, size_of};
 
 use int_enum::IntEnum;
 use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry};
-use litebox::fs::OFlags;
 use litebox::fs::errors::{
     FileStatusError, MkdirError, OpenError, PathError, ReadDirError, ReadError, SeekError,
     WriteError,
@@ -17,7 +16,8 @@ use litebox::fs::errors::{
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider};
 use litebox::utils::TruncateExt as _;
 use litebox_broker_protocol::fs::{
-    FileMode as Mode, FileSeekWhence as SeekWhence, FileStatus, FileType,
+    FileAccessMode, FileMode as Mode, FileOpenFlags, FileSeekWhence as SeekWhence, FileStatus,
+    FileType,
 };
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::byteorder::native_endian::U32;
@@ -678,7 +678,7 @@ impl FileAccess {
         self,
         create_disposition: CreateDisposition,
         create_options: FileCreateOptions,
-    ) -> OFlags {
+    ) -> (FileAccessMode, FileOpenFlags) {
         let wants_read = self.intersects(Self::FS_READ_ACCESS);
         let wants_write = self.intersects(Self::FS_WRITE_ACCESS)
             || matches!(
@@ -688,32 +688,36 @@ impl FileAccess {
                     | CreateDisposition::OverwriteIf
             );
 
-        let mut flags = match (wants_read, wants_write) {
-            (true, true) => OFlags::RDWR,
-            (false, true) => OFlags::WRONLY,
-            _ => OFlags::RDONLY,
+        let access = match (wants_read, wants_write) {
+            (true, true) => FileAccessMode::ReadWrite,
+            (false, true) => FileAccessMode::WriteOnly,
+            _ => FileAccessMode::ReadOnly,
         };
+        // Append-only rights are enforced per NT handle by `prepare_file_io`.
+        let mut flags = FileOpenFlags::NONE;
 
         match create_disposition {
             CreateDisposition::Overwrite => {
-                flags.insert(OFlags::TRUNC);
+                flags.insert(FileOpenFlags::TRUNCATE);
             }
             CreateDisposition::Supersede | CreateDisposition::OverwriteIf => {
-                flags.insert(OFlags::CREAT | OFlags::TRUNC);
+                flags.insert(FileOpenFlags::CREATE | FileOpenFlags::TRUNCATE);
             }
-            CreateDisposition::Create => flags.insert(OFlags::CREAT | OFlags::EXCL),
-            CreateDisposition::OpenIf => flags.insert(OFlags::CREAT),
+            CreateDisposition::Create => {
+                flags.insert(FileOpenFlags::CREATE | FileOpenFlags::EXCLUSIVE);
+            }
+            CreateDisposition::OpenIf => flags.insert(FileOpenFlags::CREATE),
             CreateDisposition::Open => {}
         }
 
         if create_options.contains(FileCreateOptions::DIRECTORY_FILE) {
-            flags.insert(OFlags::DIRECTORY);
+            flags.insert(FileOpenFlags::DIRECTORY);
         }
         if create_options.contains(FileCreateOptions::NON_DIRECTORY_FILE) {
-            flags.insert(OFlags::NOFOLLOW);
+            flags.insert(FileOpenFlags::NO_FOLLOW);
         }
 
-        flags
+        (access, flags)
     }
 
     fn conflicts_with_share(self, share_access: FileShareAccess) -> bool {
@@ -2356,10 +2360,10 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         {
             return Err(NtStatus::ACCESS_DENIED);
         }
-        let flags = desired_access.open_flags(create_disposition, create_options);
+        let (access, flags) = desired_access.open_flags(create_disposition, create_options);
         let fd = self
             .fs
-            .open_file(&self.fs_context, path, flags, mode)
+            .open_file(&self.fs_context, path, access, flags, mode)
             .map_err(|error| map_open_error(error, create_disposition))?;
         let file_status = match self.fs.file_status(&fd) {
             Ok(file_status) => file_status,
@@ -2430,10 +2434,10 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         } else {
             CreateDisposition::Open
         };
-        let flags = desired_access.open_flags(open_disposition, create_options);
+        let (access, flags) = desired_access.open_flags(open_disposition, create_options);
         let fd = self
             .fs
-            .open_file(&self.fs_context, path, flags, Mode::empty())
+            .open_file(&self.fs_context, path, access, flags, Mode::empty())
             .map_err(|error| map_open_error(error, create_disposition))?;
         let information = create_disposition.success_information(existed_before_open);
         Ok((
@@ -2809,6 +2813,103 @@ mod tests {
     const FILE_OVERWRITE: u32 = 4;
 
     #[test]
+    fn file_access_and_options_map_to_protocol_open_parameters() {
+        for (desired_access, expected_access) in [
+            (0, FileAccessMode::ReadOnly),
+            (FileAccess::SYNCHRONIZE.bits(), FileAccessMode::ReadOnly),
+            (FileAccess::READ_DATA.bits(), FileAccessMode::ReadOnly),
+            (FileAccess::READ_ATTRIBUTES.bits(), FileAccessMode::ReadOnly),
+            (FileAccess::EXECUTE.bits(), FileAccessMode::ReadOnly),
+            (FileAccess::WRITE_DATA.bits(), FileAccessMode::WriteOnly),
+            (FileAccess::APPEND_DATA.bits(), FileAccessMode::WriteOnly),
+            (FileAccess::DELETE.bits(), FileAccessMode::WriteOnly),
+            (
+                (FileAccess::READ_DATA | FileAccess::APPEND_DATA).bits(),
+                FileAccessMode::ReadWrite,
+            ),
+            (AccessMask::GENERIC_READ.bits(), FileAccessMode::ReadOnly),
+            (AccessMask::GENERIC_WRITE.bits(), FileAccessMode::WriteOnly),
+            (AccessMask::GENERIC_EXECUTE.bits(), FileAccessMode::ReadOnly),
+            (AccessMask::GENERIC_ALL.bits(), FileAccessMode::ReadWrite),
+        ] {
+            for (options, expected_flags) in [
+                (FileCreateOptions::empty(), FileOpenFlags::NONE),
+                (FileCreateOptions::DIRECTORY_FILE, FileOpenFlags::DIRECTORY),
+                (
+                    FileCreateOptions::NON_DIRECTORY_FILE,
+                    FileOpenFlags::NO_FOLLOW,
+                ),
+                (
+                    FileCreateOptions::WRITE_THROUGH
+                        | FileCreateOptions::SYNCHRONOUS_IO_NONALERT
+                        | FileCreateOptions::OPEN_REPARSE_POINT,
+                    FileOpenFlags::NONE,
+                ),
+            ] {
+                assert_eq!(
+                    FileAccess::from_desired_access(desired_access)
+                        .open_flags(CreateDisposition::Open, options),
+                    (expected_access, expected_flags),
+                    "desired_access={desired_access:#x}, options={options:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn create_dispositions_map_to_protocol_flags_and_truncation_access() {
+        for (desired_access, open_access, truncate_access) in [
+            (
+                FileAccess::empty(),
+                FileAccessMode::ReadOnly,
+                FileAccessMode::WriteOnly,
+            ),
+            (
+                FileAccess::READ_DATA,
+                FileAccessMode::ReadOnly,
+                FileAccessMode::ReadWrite,
+            ),
+            (
+                FileAccess::WRITE_DATA,
+                FileAccessMode::WriteOnly,
+                FileAccessMode::WriteOnly,
+            ),
+        ] {
+            for (disposition, expected_flags, truncates) in [
+                (CreateDisposition::Open, FileOpenFlags::NONE, false),
+                (
+                    CreateDisposition::Create,
+                    FileOpenFlags::CREATE | FileOpenFlags::EXCLUSIVE,
+                    false,
+                ),
+                (CreateDisposition::OpenIf, FileOpenFlags::CREATE, false),
+                (CreateDisposition::Overwrite, FileOpenFlags::TRUNCATE, true),
+                (
+                    CreateDisposition::Supersede,
+                    FileOpenFlags::CREATE | FileOpenFlags::TRUNCATE,
+                    true,
+                ),
+                (
+                    CreateDisposition::OverwriteIf,
+                    FileOpenFlags::CREATE | FileOpenFlags::TRUNCATE,
+                    true,
+                ),
+            ] {
+                let expected_access = if truncates {
+                    truncate_access
+                } else {
+                    open_access
+                };
+                assert_eq!(
+                    desired_access.open_flags(disposition, FileCreateOptions::empty()),
+                    (expected_access, expected_flags),
+                    "desired_access={desired_access:?}, disposition={disposition:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
     fn status_metadata_preserves_inode_bits_and_saturates_signed_lengths() {
         let status = FileStatus {
             file_type: FileType::RegularFile,
@@ -2862,7 +2963,8 @@ mod tests {
             .open_file(
                 &task.fs_context,
                 path,
-                OFlags::CREAT | OFlags::RDWR,
+                FileAccessMode::ReadWrite,
+                FileOpenFlags::CREATE,
                 Mode::RUSR | Mode::WUSR,
             )
             .unwrap();
@@ -3344,7 +3446,13 @@ mod tests {
 
             let fd = task
                 .fs
-                .open_file(&task.fs_context, path, OFlags::RDONLY, Mode::empty())
+                .open_file(
+                    &task.fs_context,
+                    path,
+                    FileAccessMode::ReadOnly,
+                    FileOpenFlags::NONE,
+                    Mode::empty(),
+                )
                 .unwrap();
             let mut contents = [0; 5];
             assert_eq!(task.fs.read_file(&fd, &mut contents, Some(0)).unwrap(), 5);
@@ -4370,13 +4478,12 @@ mod tests {
             ),
             Ok(())
         );
-        assert!(
-            generic_read
-                .open_flags(
-                    CreateDisposition::Open,
-                    FileCreateOptions::NON_DIRECTORY_FILE
-                )
-                .contains(OFlags::NOFOLLOW)
+        assert_eq!(
+            generic_read.open_flags(
+                CreateDisposition::Open,
+                FileCreateOptions::NON_DIRECTORY_FILE
+            ),
+            (FileAccessMode::ReadOnly, FileOpenFlags::NO_FOLLOW)
         );
     }
 

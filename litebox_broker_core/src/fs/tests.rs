@@ -12,7 +12,6 @@ use litebox_broker_protocol::fs::{
     FileMode as Mode, FileSeekWhence as SeekWhence, FileType, FileUser as UserInfo,
 };
 
-use super::OFlags;
 use super::in_mem::InMem;
 use super::inode_allocator::InodeAllocator;
 use super::overlay::Overlay;
@@ -43,13 +42,14 @@ fn overlay_fs(
 }
 
 mod in_mem {
+    use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags};
+
     use super::{
-        FileType, Fs, InMem, Mode, OFlags, ROOT, SeekWhence, TestPlatform, USER, UserInfo,
-        in_mem_fs,
+        FileType, Fs, InMem, Mode, ROOT, SeekWhence, TestPlatform, USER, UserInfo, in_mem_fs,
     };
     use crate::fs::errors::{
         ChownError, MkdirError, OpenError, PathError, ReadDirError, ReadError, RmdirError,
-        UnlinkError,
+        TruncateError, UnlinkError, WriteError,
     };
     use crate::fs::test_support::Entry;
     use alloc::vec;
@@ -77,14 +77,27 @@ mod in_mem {
         // Test file creation
         let path = "/testfile";
         let fd = fs
-            .open(ROOT, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .open(
+                ROOT,
+                path,
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::CREATE,
+                Mode::RWXU,
+            )
             .expect("Failed to create file");
         drop(fd);
 
         // Test file deletion
         fs.unlink(ROOT, path).expect("Failed to unlink file");
         assert!(
-            fs.open(ROOT, path, OFlags::RDONLY, Mode::RWXU).is_err(),
+            fs.open(
+                ROOT,
+                path,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::RWXU
+            )
+            .is_err(),
             "File should not exist"
         );
     }
@@ -96,7 +109,13 @@ mod in_mem {
         // Create and write to a file
         let path = "/testfile";
         let mut fd = fs
-            .open(ROOT, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .open(
+                ROOT,
+                path,
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::CREATE,
+                Mode::RWXU,
+            )
             .expect("Failed to create file");
         let data = b"Hello, world!";
         fs.write(&mut fd, data, None)
@@ -105,7 +124,13 @@ mod in_mem {
 
         // Read from the file
         let mut fd = fs
-            .open(ROOT, path, OFlags::RDONLY, Mode::RWXU)
+            .open(
+                ROOT,
+                path,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::RWXU,
+            )
             .expect("Failed to open file");
         let mut buffer = vec![0; data.len()];
         let bytes_read = fs
@@ -122,7 +147,13 @@ mod in_mem {
 
         let path = "/tmp/write_only";
         let mut fd = fs
-            .open(USER, path, OFlags::CREAT | OFlags::WRONLY, Mode::WUSR)
+            .open(
+                USER,
+                path,
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::CREATE,
+                Mode::WUSR,
+            )
             .expect("Failed to create write-only file");
         fs.write(&mut fd, b"x", None).expect("Failed to write file");
 
@@ -134,7 +165,13 @@ mod in_mem {
         drop(fd);
 
         assert!(matches!(
-            fs.open(USER, path, OFlags::RDONLY, Mode::empty()),
+            fs.open(
+                USER,
+                path,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::empty()
+            ),
             Err(OpenError::AccessNotAllowed)
         ));
     }
@@ -146,7 +183,13 @@ mod in_mem {
 
         let path = "/tmp/zero_mode";
         let mut fd = fs
-            .open(USER, path, OFlags::CREAT | OFlags::WRONLY, Mode::empty())
+            .open(
+                USER,
+                path,
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::CREATE,
+                Mode::empty(),
+            )
             .expect("Failed to create zero-mode file");
         fs.write(&mut fd, b"x", None).expect("Failed to write file");
         drop(fd);
@@ -154,7 +197,13 @@ mod in_mem {
         let status = fs.file_status(USER, path).expect("Failed to stat file");
         assert_eq!(status.mode, Mode::empty());
         assert!(matches!(
-            fs.open(USER, path, OFlags::WRONLY, Mode::empty()),
+            fs.open(
+                USER,
+                path,
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::empty(),
+                Mode::empty()
+            ),
             Err(OpenError::AccessNotAllowed)
         ));
     }
@@ -171,7 +220,14 @@ mod in_mem {
         // Test directory removal
         fs.rmdir(ROOT, path).expect("Failed to remove directory");
         assert!(
-            fs.open(ROOT, path, OFlags::RDONLY, Mode::RWXU).is_err(),
+            fs.open(
+                ROOT,
+                path,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::RWXU
+            )
+            .is_err(),
             "Directory should not exist"
         );
     }
@@ -184,14 +240,27 @@ mod in_mem {
         // Test file creation
         let path = "/tmp/testfile";
         let fd = fs
-            .open(USER, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .open(
+                USER,
+                path,
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::CREATE,
+                Mode::RWXU,
+            )
             .expect("Failed to create file");
         drop(fd);
 
         // Test file deletion
         fs.unlink(USER, path).expect("Failed to unlink file");
         assert!(
-            fs.open(USER, path, OFlags::RDONLY, Mode::RWXU).is_err(),
+            fs.open(
+                USER,
+                path,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::RWXU
+            )
+            .is_err(),
             "File should not exist"
         );
     }
@@ -204,7 +273,13 @@ mod in_mem {
         // Create and write to a file
         let path = "/tmp/testfile";
         let mut fd = fs
-            .open(USER, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .open(
+                USER,
+                path,
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::CREATE,
+                Mode::RWXU,
+            )
             .expect("Failed to create file");
         let data = b"Hello, world!";
         fs.write(&mut fd, data, None)
@@ -215,7 +290,13 @@ mod in_mem {
 
         // Read from the file
         let mut fd = fs
-            .open(USER, path, OFlags::RDONLY, Mode::RWXU)
+            .open(
+                USER,
+                path,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::RWXU,
+            )
             .expect("Failed to open file");
         let mut buffer = vec![0; data.len()];
         let bytes_read = fs
@@ -242,7 +323,14 @@ mod in_mem {
         // Test directory removal
         fs.rmdir(USER, path).expect("Failed to remove directory");
         assert!(
-            fs.open(USER, path, OFlags::RDONLY, Mode::RWXU).is_err(),
+            fs.open(
+                USER,
+                path,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::RWXU
+            )
+            .is_err(),
             "Directory should not exist"
         );
     }
@@ -252,7 +340,13 @@ mod in_mem {
         let fs = in_mem_fs();
 
         let fd = fs
-            .open(ROOT, "/", OFlags::RDONLY, Mode::empty())
+            .open(
+                ROOT,
+                "/",
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::empty(),
+            )
             .expect("Failed to open root directory");
         let entries = fs
             .read_dir(&fd)
@@ -278,7 +372,8 @@ mod in_mem {
             .open(
                 ROOT,
                 "/testfile1",
-                OFlags::CREAT | OFlags::WRONLY,
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::CREATE,
                 Mode::RWXU,
             )
             .expect("Failed to create file1");
@@ -287,7 +382,8 @@ mod in_mem {
             .open(
                 ROOT,
                 "/testfile2",
-                OFlags::CREAT | OFlags::WRONLY,
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::CREATE,
                 Mode::RWXU,
             )
             .expect("Failed to create file2");
@@ -295,7 +391,13 @@ mod in_mem {
 
         // Read root directory
         let fd = fs
-            .open(ROOT, "/", OFlags::RDONLY, Mode::empty())
+            .open(
+                ROOT,
+                "/",
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::empty(),
+            )
             .expect("Failed to open root directory");
         let entries = fs.read_dir(&fd).expect("Failed to read directory");
         drop(fd);
@@ -328,7 +430,13 @@ mod in_mem {
 
         // Read the subdirectory (should be empty)
         let fd = fs
-            .open(ROOT, "/testdir", OFlags::RDONLY, Mode::empty())
+            .open(
+                ROOT,
+                "/testdir",
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::empty(),
+            )
             .expect("Failed to open subdirectory");
         let entries = fs
             .read_dir(&fd)
@@ -348,7 +456,8 @@ mod in_mem {
             .open(
                 ROOT,
                 "/testfile",
-                OFlags::CREAT | OFlags::WRONLY,
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::CREATE,
                 Mode::RWXU,
             )
             .expect("Failed to create file");
@@ -356,7 +465,13 @@ mod in_mem {
 
         // Try to read_dir on the file (should fail)
         let fd = fs
-            .open(ROOT, "/testfile", OFlags::RDONLY, Mode::empty())
+            .open(
+                ROOT,
+                "/testfile",
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::empty(),
+            )
             .expect("Failed to open file");
         assert!(matches!(fs.read_dir(&fd), Err(ReadDirError::NotADirectory)));
     }
@@ -376,7 +491,8 @@ mod in_mem {
             .open(
                 ROOT,
                 "/rootdir/file",
-                OFlags::CREAT | OFlags::WRONLY,
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::CREATE,
                 Mode::RWXU,
             )
             .expect("Failed to create file");
@@ -392,7 +508,8 @@ mod in_mem {
             fs.open(
                 USER,
                 "/rootdir/new",
-                OFlags::CREAT | OFlags::WRONLY,
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::CREATE,
                 Mode::RWXU
             ),
             Err(OpenError::NoWritePerms)
@@ -415,7 +532,8 @@ mod in_mem {
             .open(
                 USER,
                 "/opendir/new",
-                OFlags::CREAT | OFlags::WRONLY,
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::CREATE,
                 Mode::RWXU,
             )
             .expect("Failed to create file");
@@ -435,7 +553,13 @@ mod in_mem {
         // Create a test file as root
         let path = "/testfile";
         let fd = fs
-            .open(ROOT, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .open(
+                ROOT,
+                path,
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::CREATE,
+                Mode::RWXU,
+            )
             .expect("Failed to create file");
         drop(fd);
 
@@ -491,7 +615,8 @@ mod in_mem {
             .open(
                 USER,
                 "/testfile",
-                OFlags::CREAT | OFlags::WRONLY,
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::CREATE,
                 Mode::RWXU,
             )
             .expect("Failed to create file");
@@ -502,7 +627,8 @@ mod in_mem {
             .open(
                 USER,
                 "/testdir",
-                OFlags::RDONLY | OFlags::DIRECTORY,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::DIRECTORY,
                 Mode::empty(),
             )
             .expect("Failed to open directory with O_DIRECTORY");
@@ -513,7 +639,8 @@ mod in_mem {
             fs.open(
                 USER,
                 "/testfile",
-                OFlags::RDONLY | OFlags::DIRECTORY,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::DIRECTORY,
                 Mode::empty()
             ),
             Err(OpenError::PathError(PathError::ComponentNotADirectory))
@@ -524,7 +651,8 @@ mod in_mem {
             fs.open(
                 USER,
                 "/nonexistent",
-                OFlags::RDONLY | OFlags::DIRECTORY,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::DIRECTORY,
                 Mode::empty()
             ),
             Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
@@ -536,7 +664,8 @@ mod in_mem {
             .open(
                 USER,
                 "/newfile",
-                OFlags::CREAT | OFlags::WRONLY | OFlags::DIRECTORY,
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::CREATE | FileOpenFlags::DIRECTORY,
                 Mode::RWXU,
             )
             .expect("Failed to create file with O_CREAT | O_DIRECTORY");
@@ -563,7 +692,8 @@ mod in_mem {
             .open(
                 USER,
                 "/newfile",
-                OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::CREATE | FileOpenFlags::EXCLUSIVE,
                 Mode::RWXU,
             )
             .expect("Failed to create new file with O_CREAT | O_EXCL");
@@ -578,7 +708,8 @@ mod in_mem {
             fs.open(
                 USER,
                 "/newfile",
-                OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::CREATE | FileOpenFlags::EXCLUSIVE,
                 Mode::RWXU,
             ),
             Err(OpenError::AlreadyExists)
@@ -589,7 +720,8 @@ mod in_mem {
             .open(
                 USER,
                 "/newfile",
-                OFlags::EXCL | OFlags::RDONLY,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::EXCLUSIVE,
                 Mode::empty(),
             )
             .expect("Failed to open existing file with O_EXCL (without O_CREAT)");
@@ -604,7 +736,13 @@ mod in_mem {
 
         // Test O_CREAT without O_EXCL on existing file (should succeed)
         let fd = fs
-            .open(USER, "/newfile", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .open(
+                USER,
+                "/newfile",
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::CREATE,
+                Mode::RWXU,
+            )
             .expect("Failed to open existing file with O_CREAT (without O_EXCL)");
         drop(fd);
 
@@ -615,7 +753,8 @@ mod in_mem {
             fs.open(
                 USER,
                 "/testdir",
-                OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::CREATE | FileOpenFlags::EXCLUSIVE,
                 Mode::RWXU,
             ),
             Err(OpenError::AlreadyExists)
@@ -630,7 +769,13 @@ mod in_mem {
         // Create a file and write some initial content
         let path = "/testfile";
         let mut fd = fs
-            .open(USER, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .open(
+                USER,
+                path,
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::CREATE,
+                Mode::RWXU,
+            )
             .expect("Failed to create file");
         let initial_data = b"Hello, world! This is initial content.";
         fs.write(&mut fd, initial_data, None)
@@ -639,7 +784,13 @@ mod in_mem {
 
         // Verify initial content was written
         let mut fd = fs
-            .open(USER, path, OFlags::RDONLY, Mode::empty())
+            .open(
+                USER,
+                path,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::empty(),
+            )
             .expect("Failed to open file for reading");
         let mut buffer = vec![0; initial_data.len()];
         let bytes_read = fs
@@ -651,7 +802,13 @@ mod in_mem {
 
         // Test O_TRUNC with O_WRONLY - should truncate file
         let mut fd = fs
-            .open(USER, path, OFlags::WRONLY | OFlags::TRUNC, Mode::empty())
+            .open(
+                USER,
+                path,
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::TRUNCATE,
+                Mode::empty(),
+            )
             .expect("Failed to open file with O_TRUNC | O_WRONLY");
 
         // Write new content to the truncated file
@@ -662,7 +819,13 @@ mod in_mem {
 
         // Verify the file was truncated and contains only new content
         let mut fd = fs
-            .open(USER, path, OFlags::RDONLY, Mode::empty())
+            .open(
+                USER,
+                path,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::empty(),
+            )
             .expect("Failed to open file for verification");
         let mut buffer = vec![0; initial_data.len()];
         let bytes_read = fs
@@ -674,14 +837,26 @@ mod in_mem {
 
         // Test O_TRUNC with O_RDWR - should also truncate
         let mut fd = fs
-            .open(USER, path, OFlags::WRONLY, Mode::empty())
+            .open(
+                USER,
+                path,
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::empty(),
+                Mode::empty(),
+            )
             .expect("Failed to open file for writing");
         fs.write(&mut fd, b"More content to truncate", None)
             .expect("Failed to write more content");
         drop(fd);
 
         let mut fd = fs
-            .open(USER, path, OFlags::RDWR | OFlags::TRUNC, Mode::empty())
+            .open(
+                USER,
+                path,
+                FileAccessMode::ReadWrite,
+                FileOpenFlags::TRUNCATE,
+                Mode::empty(),
+            )
             .expect("Failed to open file with O_TRUNC | O_RDWR");
 
         // File should be empty after truncation
@@ -711,7 +886,13 @@ mod in_mem {
         world_writable_root(&fs);
 
         let mut fd = fs
-            .open(USER, "/truncfile", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
+            .open(
+                USER,
+                "/truncfile",
+                FileAccessMode::ReadWrite,
+                FileOpenFlags::CREATE,
+                Mode::RWXU,
+            )
             .expect("Failed to create file");
         fs.write(&mut fd, b"0123456789", None)
             .expect("Failed to write file");
@@ -743,7 +924,8 @@ mod in_mem {
             .open(
                 USER,
                 "/posfile",
-                OFlags::CREAT | OFlags::RDWR,
+                FileAccessMode::ReadWrite,
+                FileOpenFlags::CREATE,
                 Mode::RWXU | Mode::RWXG | Mode::RWXO,
             )
             .expect("open failed");
@@ -788,7 +970,13 @@ mod in_mem {
     /// Create `path` holding `data`, as the unprivileged user.
     fn create_with_content(fs: &InMemFs, path: &str, data: &[u8]) {
         let mut fd = fs
-            .open(USER, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .open(
+                USER,
+                path,
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::CREATE,
+                Mode::RWXU,
+            )
             .expect("Failed to create file");
         fs.write(&mut fd, data, None)
             .expect("Failed to write initial content");
@@ -815,7 +1003,13 @@ mod in_mem {
 
         // Re-open with O_APPEND and write more data
         let mut fd = fs
-            .open(USER, path, OFlags::WRONLY | OFlags::APPEND, Mode::empty())
+            .open(
+                USER,
+                path,
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::APPEND,
+                Mode::empty(),
+            )
             .expect("Failed to open file with O_APPEND");
         fs.write(&mut fd, b" World", None)
             .expect("Failed to append data");
@@ -823,7 +1017,13 @@ mod in_mem {
 
         // Verify the file contains both pieces of data concatenated
         let mut fd = fs
-            .open(USER, path, OFlags::RDONLY, Mode::empty())
+            .open(
+                USER,
+                path,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::empty(),
+            )
             .expect("Failed to open file for reading");
         assert_eq!(read_all(&fs, &mut fd), b"Hello World");
     }
@@ -839,7 +1039,13 @@ mod in_mem {
 
         // Re-open with O_APPEND
         let mut fd = fs
-            .open(USER, path, OFlags::WRONLY | OFlags::APPEND, Mode::empty())
+            .open(
+                USER,
+                path,
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::APPEND,
+                Mode::empty(),
+            )
             .expect("Failed to open file with O_APPEND");
 
         // Seek to beginning - this should succeed but writes should still append
@@ -853,7 +1059,13 @@ mod in_mem {
 
         // Verify the file content: original data followed by appended data
         let mut fd = fs
-            .open(USER, path, OFlags::RDONLY, Mode::empty())
+            .open(
+                USER,
+                path,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::empty(),
+            )
             .expect("Failed to open file for reading");
         assert_eq!(read_all(&fs, &mut fd), b"ABCDEF123");
     }
@@ -869,7 +1081,13 @@ mod in_mem {
 
         // Re-open with O_RDWR | O_APPEND
         let mut fd = fs
-            .open(USER, path, OFlags::RDWR | OFlags::APPEND, Mode::empty())
+            .open(
+                USER,
+                path,
+                FileAccessMode::ReadWrite,
+                FileOpenFlags::APPEND,
+                Mode::empty(),
+            )
             .expect("Failed to open file with O_RDWR | O_APPEND");
 
         // Read should work normally from the beginning
@@ -900,7 +1118,13 @@ mod in_mem {
 
         // Re-open with O_APPEND
         let mut fd = fs
-            .open(USER, path, OFlags::WRONLY | OFlags::APPEND, Mode::empty())
+            .open(
+                USER,
+                path,
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::APPEND,
+                Mode::empty(),
+            )
             .expect("Failed to open file with O_APPEND");
 
         // pwrite (write with explicit offset) should ignore O_APPEND per POSIX
@@ -909,7 +1133,13 @@ mod in_mem {
 
         // Verify the file content: XX should be at position 2, not appended
         let mut fd = fs
-            .open(USER, path, OFlags::RDONLY, Mode::empty())
+            .open(
+                USER,
+                path,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::empty(),
+            )
             .expect("Failed to open file for reading");
         assert_eq!(read_all(&fs, &mut fd), b"ABXXEF");
     }
@@ -928,7 +1158,8 @@ mod in_mem {
             .open(
                 USER,
                 path,
-                OFlags::WRONLY | OFlags::TRUNC | OFlags::APPEND,
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::TRUNCATE | FileOpenFlags::APPEND,
                 Mode::empty(),
             )
             .expect("Failed to open file with O_TRUNC | O_APPEND");
@@ -942,14 +1173,164 @@ mod in_mem {
 
         // Verify the file content
         let mut fd = fs
-            .open(USER, path, OFlags::RDONLY, Mode::empty())
+            .open(
+                USER,
+                path,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::empty(),
+            )
             .expect("Failed to open file for reading");
         assert_eq!(read_all(&fs, &mut fd), b"NewContent");
+    }
+
+    #[test]
+    fn creation_flags_do_not_change_access_mode() {
+        for (access, can_read, can_write) in [
+            (FileAccessMode::ReadOnly, true, false),
+            (FileAccessMode::WriteOnly, false, true),
+            (FileAccessMode::ReadWrite, true, true),
+        ] {
+            let fs = in_mem_fs();
+            let mut entry = fs
+                .open(
+                    USER,
+                    "/file",
+                    access,
+                    FileOpenFlags::CREATE | FileOpenFlags::EXCLUSIVE | FileOpenFlags::APPEND,
+                    Mode::RWXU,
+                )
+                .unwrap();
+
+            let read = fs.read(&mut entry, &mut [0], None);
+            if can_read {
+                assert_eq!(read.unwrap(), 0);
+            } else {
+                assert!(matches!(read, Err(ReadError::NotForReading)));
+            }
+            let write = fs.write(&mut entry, b"x", None);
+            if can_write {
+                assert_eq!(write.unwrap(), 1);
+            } else {
+                assert!(matches!(write, Err(WriteError::NotForWriting)));
+            }
+        }
+    }
+
+    #[test]
+    fn read_only_open_can_still_truncate() {
+        let fs = in_mem_fs();
+        create_with_content(&fs, "/file", b"contents");
+        let mut entry = fs
+            .open(
+                USER,
+                "/file",
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::TRUNCATE,
+                Mode::empty(),
+            )
+            .unwrap();
+        assert_eq!(fs.handle_status(&entry).unwrap().size, 0);
+        assert!(matches!(
+            fs.write(&mut entry, b"x", None),
+            Err(WriteError::NotForWriting)
+        ));
+    }
+
+    #[test]
+    fn path_only_ignores_access_and_mutating_flags() {
+        let fs = in_mem_fs();
+        create_with_content(&fs, "/file", b"contents");
+        fs.chmod(USER, "/file", Mode::empty()).unwrap();
+        let flags = FileOpenFlags::all() - FileOpenFlags::DIRECTORY;
+
+        for access in [
+            FileAccessMode::ReadOnly,
+            FileAccessMode::WriteOnly,
+            FileAccessMode::ReadWrite,
+        ] {
+            let mut entry = fs.open(USER, "/file", access, flags, Mode::RWXU).unwrap();
+            assert!(entry.is_path_only());
+            assert!(entry.allows_read());
+            assert_eq!(fs.handle_status(&entry).unwrap().size, 8);
+            assert!(matches!(
+                fs.write(&mut entry, b"x", None),
+                Err(WriteError::NotForWriting)
+            ));
+            assert!(matches!(
+                fs.truncate(&mut entry, 0, false),
+                Err(TruncateError::NotForWriting)
+            ));
+            assert!(matches!(
+                fs.open(USER, "/missing", access, flags, Mode::RWXU),
+                Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
+            ));
+            assert!(matches!(
+                fs.open(
+                    USER,
+                    "/file",
+                    access,
+                    flags | FileOpenFlags::DIRECTORY,
+                    Mode::empty(),
+                ),
+                Err(OpenError::PathError(PathError::ComponentNotADirectory))
+            ));
+        }
+    }
+
+    #[test]
+    fn paths_are_normalized_before_lookup_and_mutation() {
+        let fs = in_mem_fs();
+        fs.mkdir(USER, "/dir", Mode::RWXU).unwrap();
+        create_with_content(&fs, "/dir/file", b"contents");
+        let expected = fs.file_status(USER, "/dir/file").unwrap();
+        for path in [
+            "/dir//./missing/../file/",
+            "dir/../../dir/file",
+            "../../dir/file",
+        ] {
+            let entry = fs
+                .open(
+                    USER,
+                    path,
+                    FileAccessMode::ReadOnly,
+                    FileOpenFlags::empty(),
+                    Mode::empty(),
+                )
+                .unwrap();
+            assert_eq!(fs.handle_status(&entry).unwrap(), expected);
+        }
+        let root = fs.file_status(USER, "/").unwrap();
+        for path in ["", ".", "../..", "/dir/../../.."] {
+            assert_eq!(fs.file_status(USER, path).unwrap(), root);
+        }
+
+        fs.mkdir(USER, "/dir/missing/../new", Mode::RWXU).unwrap();
+        let entry = fs
+            .open(
+                USER,
+                "dir/new/./missing/../file",
+                FileAccessMode::ReadWrite,
+                FileOpenFlags::CREATE,
+                Mode::RWXU,
+            )
+            .unwrap();
+        fs.chmod(USER, "dir/new//file", Mode::RUSR).unwrap();
+        fs.chown(USER, "dir/new/unused/../file", None, Some(ROOT.group))
+            .unwrap();
+        let status = fs.handle_status(&entry).unwrap();
+        assert_eq!(status.mode, Mode::RUSR);
+        assert_eq!(status.owner.group, ROOT.group);
+        fs.unlink(USER, "/dir/new/missing/../file").unwrap();
+        fs.rmdir(USER, "//dir/./new/").unwrap();
+        assert!(fs.file_status(USER, "/dir/new").is_err());
     }
 }
 
 mod tar_ro {
-    use super::{FileType, Mode, OFlags, TEST_TAR_FILE, USER, tar_ro_fs};
+    use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags};
+
+    use super::{FileType, Mode, TEST_TAR_FILE, USER, tar_ro_fs};
     use crate::fs::errors::{OpenError, PathError, ReadDirError};
     use alloc::vec;
     use alloc::vec::Vec;
@@ -958,7 +1339,13 @@ mod tar_ro {
     fn file_read() {
         let fs = tar_ro_fs(TEST_TAR_FILE.into());
         let mut fd = fs
-            .open(USER, "foo", OFlags::RDONLY, Mode::RWXU)
+            .open(
+                USER,
+                "foo",
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::RWXU,
+            )
             .expect("Failed to open file");
         let mut buffer = vec![0; 1024];
         let bytes_read = fs
@@ -968,7 +1355,13 @@ mod tar_ro {
         drop(fd);
 
         let mut fd = fs
-            .open(USER, "bar/baz", OFlags::RDONLY, Mode::empty())
+            .open(
+                USER,
+                "bar/baz",
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::empty(),
+            )
             .expect("Failed to open file");
         let mut buffer = vec![0; 1024];
         let bytes_read = fs
@@ -981,11 +1374,23 @@ mod tar_ro {
     fn dir_and_nonexist_checks() {
         let fs = tar_ro_fs(TEST_TAR_FILE.into());
         assert!(matches!(
-            fs.open(USER, "bar/ba", OFlags::RDONLY, Mode::empty()),
+            fs.open(
+                USER,
+                "bar/ba",
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::empty()
+            ),
             Err(OpenError::PathError(PathError::NoSuchFileOrDirectory)),
         ));
-        fs.open(USER, "bar", OFlags::RDONLY, Mode::empty())
-            .expect("Failed to open dir");
+        fs.open(
+            USER,
+            "bar",
+            FileAccessMode::ReadOnly,
+            FileOpenFlags::empty(),
+            Mode::empty(),
+        )
+        .expect("Failed to open dir");
     }
 
     #[test]
@@ -996,7 +1401,8 @@ mod tar_ro {
         fs.open(
             USER,
             "bar",
-            OFlags::RDONLY | OFlags::DIRECTORY,
+            FileAccessMode::ReadOnly,
+            FileOpenFlags::DIRECTORY,
             Mode::empty(),
         )
         .expect("Failed to open directory with O_DIRECTORY");
@@ -1006,7 +1412,8 @@ mod tar_ro {
             fs.open(
                 USER,
                 "foo",
-                OFlags::RDONLY | OFlags::DIRECTORY,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::DIRECTORY,
                 Mode::empty()
             ),
             Err(OpenError::PathError(PathError::ComponentNotADirectory))
@@ -1017,7 +1424,8 @@ mod tar_ro {
             fs.open(
                 USER,
                 "nonexistent",
-                OFlags::RDONLY | OFlags::DIRECTORY,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::DIRECTORY,
                 Mode::empty()
             ),
             Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
@@ -1028,7 +1436,8 @@ mod tar_ro {
             fs.open(
                 USER,
                 "bar/baz",
-                OFlags::RDONLY | OFlags::DIRECTORY,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::DIRECTORY,
                 Mode::empty()
             ),
             Err(OpenError::PathError(PathError::ComponentNotADirectory))
@@ -1039,11 +1448,40 @@ mod tar_ro {
     fn write_or_truncate_open_of_directory_fails() {
         let fs = tar_ro_fs(TEST_TAR_FILE.into());
 
-        for flags in [OFlags::WRONLY, OFlags::RDWR, OFlags::TRUNC] {
+        for (access, flags) in [
+            (FileAccessMode::WriteOnly, FileOpenFlags::empty()),
+            (FileAccessMode::ReadWrite, FileOpenFlags::empty()),
+            (FileAccessMode::ReadOnly, FileOpenFlags::TRUNCATE),
+        ] {
             assert!(matches!(
-                fs.open(USER, "bar", flags, Mode::empty()),
+                fs.open(USER, "bar", access, flags, Mode::empty()),
                 Err(OpenError::ReadOnlyFileSystem)
             ));
+        }
+    }
+
+    #[test]
+    fn path_only_does_not_request_write_access_on_read_only_backend() {
+        let fs = tar_ro_fs(TEST_TAR_FILE.into());
+        for path in ["/", "bar", "foo"] {
+            let expected = fs.file_status(USER, path).unwrap();
+            for access in [FileAccessMode::WriteOnly, FileAccessMode::ReadWrite] {
+                let entry = fs
+                    .open(
+                        USER,
+                        path,
+                        access,
+                        FileOpenFlags::PATH
+                            | FileOpenFlags::CREATE
+                            | FileOpenFlags::EXCLUSIVE
+                            | FileOpenFlags::TRUNCATE
+                            | FileOpenFlags::APPEND,
+                        Mode::empty(),
+                    )
+                    .unwrap();
+                assert!(entry.is_path_only());
+                assert_eq!(fs.handle_status(&entry).unwrap(), expected);
+            }
         }
     }
 
@@ -1053,7 +1491,13 @@ mod tar_ro {
 
         // Read root directory
         let fd = fs
-            .open(USER, "/", OFlags::RDONLY, Mode::empty())
+            .open(
+                USER,
+                "/",
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::empty(),
+            )
             .expect("Failed to open root directory");
         let entries = fs.read_dir(&fd).expect("Failed to read root directory");
         drop(fd);
@@ -1084,7 +1528,13 @@ mod tar_ro {
 
         // Read `bar` directory
         let fd = fs
-            .open(USER, "bar", OFlags::RDONLY, Mode::empty())
+            .open(
+                USER,
+                "bar",
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::empty(),
+            )
             .expect("Failed to open bar directory");
         let entries = fs.read_dir(&fd).expect("Failed to read bar directory");
 
@@ -1099,16 +1549,23 @@ mod tar_ro {
         let fs = tar_ro_fs(TEST_TAR_FILE.into());
 
         let fd = fs
-            .open(USER, "foo", OFlags::RDONLY, Mode::empty())
+            .open(
+                USER,
+                "foo",
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::empty(),
+            )
             .expect("Failed to open foo file");
         assert!(matches!(fs.read_dir(&fd), Err(ReadDirError::NotADirectory)));
     }
 }
 
 mod overlay {
+    use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags};
+
     use super::{
-        FileType, Fs, Mode, OFlags, Overlay, SeekWhence, TEST_TAR_FILE, TestPlatform, USER,
-        UserInfo,
+        FileType, Fs, Mode, Overlay, SeekWhence, TEST_TAR_FILE, TestPlatform, USER, UserInfo,
     };
     use crate::fs::errors::{FileStatusError, OpenError, PathError, RmdirError};
     use crate::fs::in_mem::{InMem, InitialNode};
@@ -1148,7 +1605,13 @@ mod overlay {
     fn file_read_from_lower() {
         let fs = overlay_fs(upper([]));
         let mut fd = fs
-            .open(USER, "foo", OFlags::RDONLY, Mode::RWXU)
+            .open(
+                USER,
+                "foo",
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::RWXU,
+            )
             .expect("Failed to open file");
         let mut buffer = vec![0; 1024];
         let bytes_read = fs
@@ -1165,7 +1628,13 @@ mod overlay {
         assert_eq!(stat.mode, Mode::from_bits(0o777).unwrap());
 
         let mut fd = fs
-            .open(USER, "bar/baz", OFlags::RDONLY, Mode::empty())
+            .open(
+                USER,
+                "bar/baz",
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::empty(),
+            )
             .expect("Failed to open file");
         let mut buffer = vec![0; 1024];
         let bytes_read = fs
@@ -1181,11 +1650,23 @@ mod overlay {
     fn dir_and_nonexist_checks() {
         let fs = overlay_fs(upper([]));
         assert!(matches!(
-            fs.open(USER, "bar/ba", OFlags::RDONLY, Mode::empty()),
+            fs.open(
+                USER,
+                "bar/ba",
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::empty()
+            ),
             Err(OpenError::PathError(PathError::NoSuchFileOrDirectory)),
         ));
-        fs.open(USER, "bar", OFlags::RDONLY, Mode::empty())
-            .expect("Failed to open dir");
+        fs.open(
+            USER,
+            "bar",
+            FileAccessMode::ReadOnly,
+            FileOpenFlags::empty(),
+            Mode::empty(),
+        )
+        .expect("Failed to open dir");
     }
 
     /// Check that for the same file, even though it started as a lower file, writing to it copies
@@ -1194,10 +1675,22 @@ mod overlay {
     fn file_read_write_copy_up() {
         let fs = overlay_fs(upper([]));
         let mut fd1 = fs
-            .open(USER, "foo", OFlags::RDONLY, Mode::RWXU)
+            .open(
+                USER,
+                "foo",
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::RWXU,
+            )
             .expect("Failed to open file");
         let mut fd2 = fs
-            .open(USER, "foo", OFlags::WRONLY, Mode::RWXU)
+            .open(
+                USER,
+                "foo",
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::empty(),
+                Mode::RWXU,
+            )
             .expect("Failed to open file");
 
         let mut buffer = vec![0; 1024];
@@ -1224,10 +1717,22 @@ mod overlay {
     fn file_read_write_copy_up_keeps_position() {
         let fs = overlay_fs(upper([]));
         let mut fd1 = fs
-            .open(USER, "foo", OFlags::RDONLY, Mode::RWXU)
+            .open(
+                USER,
+                "foo",
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::RWXU,
+            )
             .expect("Failed to open file");
         let mut fd2 = fs
-            .open(USER, "foo", OFlags::WRONLY, Mode::RWXU)
+            .open(
+                USER,
+                "foo",
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::empty(),
+                Mode::RWXU,
+            )
             .expect("Failed to open file");
 
         let mut buffer = vec![0; 4];
@@ -1250,7 +1755,13 @@ mod overlay {
     fn file_deletion() {
         let fs = overlay_fs(upper([]));
         let mut fd = fs
-            .open(USER, "foo", OFlags::RDONLY, Mode::RWXU)
+            .open(
+                USER,
+                "foo",
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::RWXU,
+            )
             .expect("Failed to open file");
 
         let mut buffer = vec![0; 4];
@@ -1273,7 +1784,13 @@ mod overlay {
         // But if we close and attempt to re-open, it should not exist
         drop(fd);
         assert!(matches!(
-            fs.open(USER, "foo", OFlags::RDONLY, Mode::empty()),
+            fs.open(
+                USER,
+                "foo",
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::empty()
+            ),
             Err(OpenError::PathError(PathError::NoSuchFileOrDirectory)),
         ));
     }
@@ -1302,7 +1819,8 @@ mod overlay {
         fs.open(
             USER,
             "bar",
-            OFlags::RDONLY | OFlags::DIRECTORY,
+            FileAccessMode::ReadOnly,
+            FileOpenFlags::DIRECTORY,
             Mode::empty(),
         )
         .expect("Failed to open lower layer directory with O_DIRECTORY");
@@ -1311,7 +1829,8 @@ mod overlay {
         fs.open(
             USER,
             "/upperdir",
-            OFlags::RDONLY | OFlags::DIRECTORY,
+            FileAccessMode::ReadOnly,
+            FileOpenFlags::DIRECTORY,
             Mode::empty(),
         )
         .expect("Failed to open upper layer directory with O_DIRECTORY");
@@ -1321,7 +1840,8 @@ mod overlay {
             fs.open(
                 USER,
                 "foo",
-                OFlags::RDONLY | OFlags::DIRECTORY,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::DIRECTORY,
                 Mode::empty()
             ),
             Err(OpenError::PathError(PathError::ComponentNotADirectory))
@@ -1332,7 +1852,8 @@ mod overlay {
             fs.open(
                 USER,
                 "/upperfile",
-                OFlags::RDONLY | OFlags::DIRECTORY,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::DIRECTORY,
                 Mode::empty()
             ),
             Err(OpenError::PathError(PathError::ComponentNotADirectory))
@@ -1343,7 +1864,8 @@ mod overlay {
             fs.open(
                 USER,
                 "bar/baz",
-                OFlags::RDONLY | OFlags::DIRECTORY,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::DIRECTORY,
                 Mode::empty()
             ),
             Err(OpenError::PathError(PathError::ComponentNotADirectory))
@@ -1354,7 +1876,8 @@ mod overlay {
             fs.open(
                 USER,
                 "nonexistent",
-                OFlags::RDONLY | OFlags::DIRECTORY,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::DIRECTORY,
                 Mode::empty()
             ),
             Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
@@ -1367,7 +1890,13 @@ mod overlay {
     fn file_create_exist_in_lower() {
         let fs = overlay_fs(upper([]));
         let mut fd = fs
-            .open(USER, "foo", OFlags::RDWR | OFlags::CREAT, Mode::RWXU)
+            .open(
+                USER,
+                "foo",
+                FileAccessMode::ReadWrite,
+                FileOpenFlags::CREATE,
+                Mode::RWXU,
+            )
             .expect("Failed to open file");
         let mut buffer = vec![0; 4];
 
@@ -1384,7 +1913,13 @@ mod overlay {
 
         // Read bar subdirectory
         let fd = fs
-            .open(USER, "bar", OFlags::RDONLY, Mode::empty())
+            .open(
+                USER,
+                "bar",
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::empty(),
+            )
             .expect("Failed to open bar directory");
         let entries = fs.read_dir(&fd).expect("Failed to read bar directory");
 
@@ -1420,7 +1955,13 @@ mod overlay {
 
         // Read root directory (should contain entries from both layers)
         let fd = fs
-            .open(USER, "/", OFlags::RDONLY, Mode::empty())
+            .open(
+                USER,
+                "/",
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::empty(),
+            )
             .expect("Failed to open root directory");
         let entries = fs.read_dir(&fd).expect("Failed to read root directory");
         drop(fd);
@@ -1456,7 +1997,13 @@ mod overlay {
 
         // Read upperdir directory (should be from upper layer)
         let fd = fs
-            .open(USER, "/upperdir", OFlags::RDONLY, Mode::empty())
+            .open(
+                USER,
+                "/upperdir",
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::empty(),
+            )
             .expect("Failed to open upperdir");
         let entries = fs.read_dir(&fd).expect("Failed to read upperdir");
 
@@ -1474,7 +2021,8 @@ mod overlay {
             fs.open(
                 USER,
                 "foo",
-                OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::CREATE | FileOpenFlags::EXCLUSIVE,
                 Mode::RWXU,
             ),
             Err(OpenError::AlreadyExists)
@@ -1485,7 +2033,8 @@ mod overlay {
             .open(
                 USER,
                 "/newfile",
-                OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::CREATE | FileOpenFlags::EXCLUSIVE,
                 Mode::RWXU,
             )
             .expect("Failed to create new file with O_CREAT | O_EXCL");
@@ -1499,7 +2048,8 @@ mod overlay {
             fs.open(
                 USER,
                 "/newfile",
-                OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::CREATE | FileOpenFlags::EXCLUSIVE,
                 Mode::RWXU,
             ),
             Err(OpenError::AlreadyExists)
@@ -1511,7 +2061,8 @@ mod overlay {
             fs.open(
                 USER,
                 "bar",
-                OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::CREATE | FileOpenFlags::EXCLUSIVE,
                 Mode::RWXU,
             ),
             Err(OpenError::AlreadyExists)
@@ -1527,7 +2078,8 @@ mod overlay {
             .open(
                 USER,
                 "foo",
-                OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::CREATE | FileOpenFlags::EXCLUSIVE,
                 Mode::RWXU,
             )
             .expect("Failed to create file over tombstone with O_CREAT | O_EXCL");
@@ -1538,7 +2090,13 @@ mod overlay {
 
         // Verify the new content
         let mut fd = fs
-            .open(USER, "foo", OFlags::RDONLY, Mode::empty())
+            .open(
+                USER,
+                "foo",
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::empty(),
+            )
             .expect("Failed to open recreated file");
         let mut buffer = vec![0; 15];
         let bytes_read = fs
@@ -1553,7 +2111,8 @@ mod overlay {
             .open(
                 USER,
                 "/upper_only_file",
-                OFlags::CREAT | OFlags::WRONLY,
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::CREATE,
                 Mode::RWXU,
             )
             .expect("Failed to create upper layer file");
@@ -1566,7 +2125,8 @@ mod overlay {
             fs.open(
                 USER,
                 "/upper_only_file",
-                OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::CREATE | FileOpenFlags::EXCLUSIVE,
                 Mode::RWXU,
             ),
             Err(OpenError::AlreadyExists)
@@ -1589,7 +2149,13 @@ mod overlay {
 
         // Verify we can open the directory
         let fd = fs
-            .open(USER, "/bar/test", OFlags::RDONLY, Mode::empty())
+            .open(
+                USER,
+                "/bar/test",
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::empty(),
+            )
             .expect("Failed to open /bar/test directory");
         let entries = fs
             .read_dir(&fd)
@@ -1609,7 +2175,13 @@ mod overlay {
         // Open bar/test for writing (where bar exists in lower layer but test doesn't exist)
         // This should create ancestor directories and allow file creation
         let mut fd = fs
-            .open(USER, "bar/test", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .open(
+                USER,
+                "bar/test",
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::CREATE,
+                Mode::RWXU,
+            )
             .expect("Failed to open bar/test for writing");
 
         // Write data to the file
@@ -1620,7 +2192,13 @@ mod overlay {
 
         // Read the file back
         let mut fd = fs
-            .open(USER, "bar/test", OFlags::RDONLY, Mode::empty())
+            .open(
+                USER,
+                "bar/test",
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::empty(),
+            )
             .expect("Failed to open bar/test for reading");
         let mut buffer = vec![0; 1024];
         let bytes_read = fs
@@ -1643,7 +2221,13 @@ mod overlay {
         // Open bar/baz for writing (both bar and baz exist in lower layer)
         // This copies up the ancestor directories and allows the file to be modified
         let mut fd = fs
-            .open(USER, "bar/baz", OFlags::WRONLY, Mode::RWXU)
+            .open(
+                USER,
+                "bar/baz",
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::empty(),
+                Mode::RWXU,
+            )
             .expect("Failed to open bar/baz for writing");
 
         // Write new data to the file (overwriting existing content)
@@ -1654,7 +2238,13 @@ mod overlay {
 
         // Read the file back to verify it was modified
         let mut fd = fs
-            .open(USER, "bar/baz", OFlags::RDONLY, Mode::empty())
+            .open(
+                USER,
+                "bar/baz",
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::empty(),
+            )
             .expect("Failed to open bar/baz for reading");
         let mut buffer = vec![0; 1024];
         let bytes_read = fs
@@ -1677,7 +2267,13 @@ mod overlay {
 
         // Open with O_TRUNC should copy the file up into the upper backend, empty
         let mut fd = fs
-            .open(USER, "foo", OFlags::RDWR | OFlags::TRUNC, Mode::empty())
+            .open(
+                USER,
+                "foo",
+                FileAccessMode::ReadWrite,
+                FileOpenFlags::TRUNCATE,
+                Mode::empty(),
+            )
             .expect("Failed to open file with O_TRUNC");
 
         // File should be truncated (empty)
@@ -1694,7 +2290,13 @@ mod overlay {
 
         // Verify the content persists
         let mut fd = fs
-            .open(USER, "foo", OFlags::RDONLY, Mode::empty())
+            .open(
+                USER,
+                "foo",
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::empty(),
+            )
             .expect("Failed to reopen file");
         let mut buffer = vec![0; 1024];
         let bytes_read = fs
@@ -1740,7 +2342,8 @@ mod overlay {
             .open(
                 USER,
                 "/upper_dir/file",
-                OFlags::CREAT | OFlags::WRONLY,
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::CREATE,
                 Mode::RWXU | Mode::RWXG,
             )
             .expect("create file in upper_dir failed");
@@ -1784,7 +2387,8 @@ mod overlay {
             .open(
                 USER,
                 "/regular_file",
-                OFlags::CREAT | OFlags::WRONLY,
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::CREATE,
                 Mode::RWXU | Mode::RWXG,
             )
             .expect("create file failed");
@@ -1811,7 +2415,13 @@ mod overlay {
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let mut fd = fs
-                .open(USER, "foo", OFlags::WRONLY, Mode::RWXU)
+                .open(
+                    USER,
+                    "foo",
+                    FileAccessMode::WriteOnly,
+                    FileOpenFlags::empty(),
+                    Mode::RWXU,
+                )
                 .expect("Failed to open file for writing");
             fs.write(&mut fd, b"x", None)
                 .expect("Failed to write to file");
@@ -1825,7 +2435,9 @@ mod overlay {
 }
 
 mod devices {
-    use super::{Fs, Mode, OFlags, RecordingStdio, USER, UnservicedStdio};
+    use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags};
+
+    use super::{Fs, Mode, RecordingStdio, USER, UnservicedStdio};
     use crate::fs::composer::Composer;
     use crate::fs::devices::Devices;
     use crate::fs::errors::{OpenError, PathError, ReadError, WriteError};
@@ -1849,7 +2461,13 @@ mod devices {
         let stdio = UnservicedStdio;
 
         let mut fd_stdout = fs
-            .open(USER, "/dev/stdout", OFlags::WRONLY, Mode::empty())
+            .open(
+                USER,
+                "/dev/stdout",
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::empty(),
+                Mode::empty(),
+            )
             .expect("Failed to open /dev/stdout");
         assert!(matches!(
             fs.write_with(&stdio, &mut fd_stdout, b"", None),
@@ -1862,7 +2480,13 @@ mod devices {
         drop(fd_stdout);
 
         let mut fd_stderr = fs
-            .open(USER, "/dev/stderr", OFlags::WRONLY, Mode::empty())
+            .open(
+                USER,
+                "/dev/stderr",
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::empty(),
+                Mode::empty(),
+            )
             .expect("Failed to open /dev/stderr");
         assert!(matches!(
             fs.write_with(&stdio, &mut fd_stderr, b"", None),
@@ -1875,7 +2499,13 @@ mod devices {
         drop(fd_stderr);
 
         let mut fd_stdin = fs
-            .open(USER, "/dev/stdin", OFlags::RDONLY, Mode::empty())
+            .open(
+                USER,
+                "/dev/stdin",
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::empty(),
+            )
             .expect("Failed to open /dev/stdin");
         assert!(matches!(
             fs.read_with(&stdio, &mut fd_stdin, &mut [], None),
@@ -1895,7 +2525,13 @@ mod devices {
         let stdio = RecordingStdio::new(b"host input");
 
         let mut fd_stdout = fs
-            .open(USER, "/dev/stdout", OFlags::WRONLY, Mode::empty())
+            .open(
+                USER,
+                "/dev/stdout",
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::empty(),
+                Mode::empty(),
+            )
             .expect("Failed to open /dev/stdout");
         assert_eq!(
             fs.write_with(&stdio, &mut fd_stdout, b"out", None)
@@ -1904,7 +2540,13 @@ mod devices {
         );
 
         let mut fd_stderr = fs
-            .open(USER, "/dev/stderr", OFlags::WRONLY, Mode::empty())
+            .open(
+                USER,
+                "/dev/stderr",
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::empty(),
+                Mode::empty(),
+            )
             .expect("Failed to open /dev/stderr");
         assert_eq!(
             fs.write_with(&stdio, &mut fd_stderr, b"err", None)
@@ -1921,7 +2563,13 @@ mod devices {
         );
 
         let mut fd_stdin = fs
-            .open(USER, "/dev/stdin", OFlags::RDONLY, Mode::empty())
+            .open(
+                USER,
+                "/dev/stdin",
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::empty(),
+            )
             .expect("Failed to open /dev/stdin");
         let mut buffer = vec![0; 16];
         let read = fs
@@ -1946,14 +2594,22 @@ mod devices {
 
         // Attempt to open a non-/dev/* path
         assert!(matches!(
-            fs.open(USER, "foo", OFlags::RDONLY, Mode::empty()),
+            fs.open(
+                USER,
+                "foo",
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::empty()
+            ),
             Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
         ));
     }
 }
 
 mod composed {
-    use super::{Fs, InMem, Mode, OFlags, TestPlatform, USER, UnservicedStdio, UserInfo};
+    use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags};
+
+    use super::{Fs, InMem, Mode, TestPlatform, USER, UnservicedStdio, UserInfo};
     use crate::fs::composer::Composer;
     use crate::fs::devices::Devices;
     use crate::fs::errors::{ReadError, WriteError};
@@ -1984,7 +2640,13 @@ mod composed {
         let stdio = UnservicedStdio;
 
         let mut fd_stdout = fs
-            .open(USER, "/dev/stdout", OFlags::WRONLY, Mode::empty())
+            .open(
+                USER,
+                "/dev/stdout",
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::empty(),
+                Mode::empty(),
+            )
             .expect("Failed to open /dev/stdout");
         assert!(matches!(
             fs.write_with(&stdio, &mut fd_stdout, b"", None),
@@ -1997,7 +2659,13 @@ mod composed {
         drop(fd_stdout);
 
         let mut fd_stderr = fs
-            .open(USER, "/dev/stderr", OFlags::WRONLY, Mode::empty())
+            .open(
+                USER,
+                "/dev/stderr",
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::empty(),
+                Mode::empty(),
+            )
             .expect("Failed to open /dev/stderr");
         assert!(matches!(
             fs.write_with(&stdio, &mut fd_stderr, b"", None),
@@ -2010,7 +2678,13 @@ mod composed {
         drop(fd_stderr);
 
         let mut fd_stdin = fs
-            .open(USER, "/dev/stdin", OFlags::RDONLY, Mode::empty())
+            .open(
+                USER,
+                "/dev/stdin",
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::empty(),
+            )
             .expect("Failed to open /dev/stdin");
         assert!(matches!(
             fs.read_with(&stdio, &mut fd_stdin, &mut [], None),
@@ -2030,14 +2704,27 @@ mod composed {
         // Test file creation
         let path = "/testfile";
         let fd = fs
-            .open(USER, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .open(
+                USER,
+                path,
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::CREATE,
+                Mode::RWXU,
+            )
             .expect("Failed to create file");
         drop(fd);
 
         // Test file deletion
         fs.unlink(USER, path).expect("Failed to unlink file");
         assert!(
-            fs.open(USER, path, OFlags::RDONLY, Mode::RWXU).is_err(),
+            fs.open(
+                USER,
+                path,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::empty(),
+                Mode::RWXU
+            )
+            .is_err(),
             "File should not exist"
         );
     }

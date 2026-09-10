@@ -18,7 +18,6 @@ use litebox::{
         wait::{WaitContext, WaitError},
     },
     fd::EntryHandle,
-    fs::OFlags,
     mm::linux::PAGE_SIZE,
     net::{
         CloseBehavior, SOCKET_RECEIVE_OPERATION_SIZE, TcpOptionData,
@@ -30,7 +29,7 @@ use litebox::{
     utils::TruncateExt as _,
 };
 use litebox_common_linux::{
-    AddressFamily, FileDescriptorFlags, IPProtocol, ReceiveFlags, SendFlags, ShutdownHow,
+    AddressFamily, FileDescriptorFlags, IPProtocol, OFlags, ReceiveFlags, SendFlags, ShutdownHow,
     SockFlags, SockType, SocketOption, SocketOptionName, TcpOption, UnixProtocol, UserMmsgHdr,
     UserMsgHdr, errno::Errno, signal::Signal,
 };
@@ -1260,12 +1259,12 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
             })
     }
 
-    fn get_status(&self, fd: &SocketFd<Platform>) -> litebox::fs::OFlags {
+    fn get_status(&self, fd: &SocketFd<Platform>) -> OFlags {
         self.litebox
             .descriptor_table()
             .with_metadata(fd, |SocketOFlags(flags)| *flags)
             .unwrap()
-            & litebox::fs::OFlags::STATUS_FLAGS_MASK
+            & OFlags::STATUS_FLAGS_MASK
     }
 
     pub(crate) fn get_proxy(

@@ -13,10 +13,9 @@ use litebox::{
         wait::WaitContext,
     },
     fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry},
-    fs::OFlags,
     sync::RawSyncPrimitivesProvider,
 };
-use litebox_common_linux::{EfdFlags, errno::Errno};
+use litebox_common_linux::{EfdFlags, OFlags, errno::Errno};
 use litebox_platform::time::TimeProvider;
 
 use crate::{GlobalState, ShimPlatform};

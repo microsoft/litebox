@@ -698,7 +698,7 @@ mod test {
 
         let mut set = super::PollSet::with_capacity(0);
         let (rfd_u, wfd_u) = task
-            .sys_pipe2(litebox::fs::OFlags::empty())
+            .sys_pipe2(litebox_common_linux::OFlags::empty())
             .expect("pipe2 failed");
         let rfd = i32::try_from(rfd_u).unwrap();
         let wfd = i32::try_from(wfd_u).unwrap();
@@ -753,7 +753,7 @@ mod test {
         let task = crate::syscalls::tests::init_platform();
 
         let (rfd_u, wfd_u) = task
-            .sys_pipe2(litebox::fs::OFlags::empty())
+            .sys_pipe2(litebox_common_linux::OFlags::empty())
             .expect("pipe2 failed");
         let rfd = i32::try_from(rfd_u).unwrap();
         let wfd = i32::try_from(wfd_u).unwrap();
@@ -793,7 +793,7 @@ mod test {
         let task = crate::syscalls::tests::init_platform();
 
         let (rfd_u, wfd_u) = task
-            .sys_pipe2(litebox::fs::OFlags::empty())
+            .sys_pipe2(litebox_common_linux::OFlags::empty())
             .expect("pipe2 failed");
         let rfd = i32::try_from(rfd_u).unwrap();
         let wfd = i32::try_from(wfd_u).unwrap();

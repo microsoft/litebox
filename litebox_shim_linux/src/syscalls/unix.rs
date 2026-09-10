@@ -21,13 +21,13 @@ use litebox::{
         wait::WaitContext,
     },
     fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry},
-    fs::{OFlags, errors::OpenError},
+    fs::errors::OpenError,
     sync::{Mutex, RwLock},
     utils::TruncateExt as _,
 };
-use litebox_broker_protocol::fs::FileMode as Mode;
+use litebox_broker_protocol::fs::{FileAccessMode, FileMode as Mode, FileOpenFlags};
 use litebox_common_linux::{
-    IpOption, ReceiveFlags, SendFlags, ShutdownHow, SockFlags, SockType, SocketOption,
+    IpOption, OFlags, ReceiveFlags, SendFlags, ShutdownHow, SockFlags, SockType, SocketOption,
     SocketOptionName, errno::Errno,
 };
 
@@ -113,9 +113,9 @@ impl UnixSocketAddr {
                 let flags = if is_server {
                     // create the socket file if not exists;
                     // use O_EXCL to ensure exclusive creation
-                    OFlags::CREAT | OFlags::EXCL | OFlags::RDWR
+                    FileOpenFlags::CREATE | FileOpenFlags::EXCLUSIVE
                 } else {
-                    OFlags::RDWR
+                    FileOpenFlags::NONE
                 };
                 // TODO: extend fs to support creating sock file (i.e., with type `InodeType::Socket`)
                 let file = {
@@ -127,6 +127,7 @@ impl UnixSocketAddr {
                         .open_file(
                             &context,
                             path.as_str(),
+                            FileAccessMode::ReadWrite,
                             flags,
                             Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
                         )

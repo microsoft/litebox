@@ -9,11 +9,11 @@ use core::any::{Any, TypeId};
 use core::marker::PhantomData;
 
 use litebox_broker_protocol::fs::{
-    FileDirectoryEntry, FileMode as Mode, FileStatus, FileUser as UserInfo,
+    FileAccessMode, FileDirectoryEntry, FileMode as Mode, FileOpenFlags, FileStatus,
+    FileUser as UserInfo,
 };
 use litebox_broker_protocol::stdio::StdioOutputStream;
 
-use super::OFlags;
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, ReadDirError, ReadError,
     RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
@@ -114,11 +114,12 @@ pub trait Backend: private::Sealed + Send + Sync + Any {
         components: &[&str],
     ) -> Result<WalkOutcome<WalkingDirHandle<'a>>, WalkError>;
 
-    /// Take an owned handle to a `dir` found via a walk, validating any open `flags`.
+    /// Take an owned handle to a `dir` found via a walk, validating `access` and open `flags`.
     fn owned_dir_at(
         &self,
         dir: WalkingDirHandle<'_>,
-        flags: OFlags,
+        access: FileAccessMode,
+        flags: FileOpenFlags,
     ) -> Result<DirHandle, OpenError>;
 
     /// Obtain a walking handle to an existing owned dir.
@@ -137,7 +138,8 @@ pub trait Backend: private::Sealed + Send + Sync + Any {
         &self,
         dir: WalkingDirHandle<'_>,
         name: &str,
-        flags: OFlags,
+        access: FileAccessMode,
+        flags: FileOpenFlags,
     ) -> Result<Permissioned<FileHandle>, OpenError>;
 
     /// Read directory entries at `dir`.

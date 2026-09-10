@@ -15,13 +15,13 @@ use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use litebox_broker_protocol::fs::{
-    FileDirectoryEntry, FileMode, FileNodeInfo, FileStatus, FileType, FileUser,
+    FileAccessMode, FileDirectoryEntry, FileMode, FileNodeInfo, FileOpenFlags, FileStatus,
+    FileType, FileUser,
 };
 use litebox_platform::sync;
 use thiserror::Error;
 
 use self::fcall::Rlerror;
-use super::OFlags;
 use super::backend::{
     DirHandle, FileHandle, HandleRef, PermissionCheck, Permissioned, SeekBehavior, WalkOutcome,
     WalkStopReason, WalkedComponent, WalkingDirHandle,
@@ -35,6 +35,8 @@ mod fcall;
 mod id_pool;
 #[cfg(test)]
 mod metadata_tests;
+#[cfg(test)]
+mod open_flags_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod tests;
 
@@ -353,16 +355,20 @@ where
     fn owned_dir_at(
         &self,
         dir: WalkingDirHandle<'_>,
-        flags: OFlags,
+        access: FileAccessMode,
+        flags: FileOpenFlags,
     ) -> Result<DirHandle, OpenError> {
-        assert_supported_oflags(flags);
-        if flags.intersects(OFlags::WRONLY | OFlags::RDWR) {
+        assert_supported_flags(flags);
+        if matches!(
+            access,
+            FileAccessMode::WriteOnly | FileAccessMode::ReadWrite
+        ) {
             // TODO(jayb): POSIX requires `EISDIR` when write access is requested on a directory,
             // but `OpenError` has no such variant yet.
             unimplemented!()
         }
         let (fid, is_backend_root) = dir.into_typed::<Self>().into_dir();
-        if flags.contains(OFlags::PATH) {
+        if flags.contains(FileOpenFlags::PATH) {
             // An `O_PATH` handle is never opened server-side, so the walked fid can be handed over
             // as-is, even when it is the shared root fid.
             return Ok(DirHandle::from_typed::<Self>(NinePDirHandle { fid }));
@@ -397,12 +403,13 @@ where
         &self,
         dir: WalkingDirHandle<'_>,
         name: &str,
-        flags: OFlags,
+        access: FileAccessMode,
+        flags: FileOpenFlags,
     ) -> Result<Permissioned<FileHandle>, OpenError> {
-        assert_supported_oflags(flags);
+        assert_supported_flags(flags);
         // TODO: we do not support non-blocking, so ignore that flag instead of returning an error.
-        let flags = flags - OFlags::NONBLOCK;
-        if flags.contains(OFlags::DIRECTORY) {
+        let flags = flags - FileOpenFlags::NONBLOCKING;
+        if flags.contains(FileOpenFlags::DIRECTORY) {
             return Err(OpenError::PathError(PathError::ComponentNotADirectory));
         }
 
@@ -418,14 +425,17 @@ where
             }
         };
 
-        if !flags.contains(OFlags::PATH) {
+        if !flags.contains(FileOpenFlags::PATH) {
             // An `O_PATH` handle addresses the file without opening it server-side.
             //
             // The file exists (it is what stopped the walk), so the creation flags say nothing
             // about how to open it; the resolver enforces `O_CREAT | O_EXCL` itself.
             self.client.open(
                 &fid.fid,
-                oflags_to_lopen(flags - OFlags::CREAT - OFlags::EXCL),
+                open_flags_to_lopen(
+                    access,
+                    flags - FileOpenFlags::CREATE - FileOpenFlags::EXCLUSIVE,
+                ),
             )?;
         }
         Ok(Permissioned {
@@ -634,71 +644,41 @@ fn backend_checked_components(count: usize) -> Vec<WalkedComponent> {
     ]
 }
 
-/// Flags this backend knows how to honor when opening files/directories.
-const SUPPORTED_OFLAGS: OFlags = OFlags::CREAT
-    .union(OFlags::RDONLY)
-    .union(OFlags::WRONLY)
-    .union(OFlags::RDWR)
-    .union(OFlags::TRUNC)
-    .union(OFlags::NOCTTY)
-    .union(OFlags::EXCL)
-    .union(OFlags::DIRECTORY)
-    .union(OFlags::NONBLOCK)
-    .union(OFlags::LARGEFILE)
-    .union(OFlags::NOFOLLOW)
-    .union(OFlags::APPEND)
-    .union(OFlags::PATH);
-
-fn assert_supported_oflags(flags: OFlags) {
-    if flags.intersects(SUPPORTED_OFLAGS.complement()) {
+fn assert_supported_flags(flags: FileOpenFlags) {
+    if !flags.difference(FileOpenFlags::all()).is_empty() {
         unimplemented!("{flags:?}")
     }
 }
 
-/// Convert [`OFlags`] to 9P `LOpenFlags`
-fn oflags_to_lopen(flags: OFlags) -> fcall::LOpenFlags {
-    let mut lflags = fcall::LOpenFlags::empty();
+/// Convert canonical open intent to the 9P2000.L wire flags.
+fn open_flags_to_lopen(access: FileAccessMode, flags: FileOpenFlags) -> fcall::LOpenFlags {
+    let mut lflags = match access {
+        FileAccessMode::ReadOnly => fcall::LOpenFlags::empty(),
+        FileAccessMode::WriteOnly => fcall::LOpenFlags::O_WRONLY,
+        FileAccessMode::ReadWrite => fcall::LOpenFlags::O_RDWR,
+        _ => unimplemented!("{access:?}"),
+    };
 
-    // Access mode (RDONLY is 0, so we only check for WRONLY and RDWR)
-    if flags.contains(OFlags::RDWR) {
-        lflags |= fcall::LOpenFlags::O_RDWR;
-    } else if flags.contains(OFlags::WRONLY) {
-        lflags |= fcall::LOpenFlags::O_WRONLY;
-    }
-    // RDONLY is implicit if neither WRONLY nor RDWR
-
-    if flags.contains(OFlags::CREAT) {
+    if flags.contains(FileOpenFlags::CREATE) {
         lflags |= fcall::LOpenFlags::O_CREAT;
     }
-    if flags.contains(OFlags::EXCL) {
+    if flags.contains(FileOpenFlags::EXCLUSIVE) {
         lflags |= fcall::LOpenFlags::O_EXCL;
     }
-    if flags.contains(OFlags::TRUNC) {
+    if flags.contains(FileOpenFlags::TRUNCATE) {
         lflags |= fcall::LOpenFlags::O_TRUNC;
     }
-    if flags.contains(OFlags::APPEND) {
+    if flags.contains(FileOpenFlags::APPEND) {
         lflags |= fcall::LOpenFlags::O_APPEND;
     }
-    if flags.contains(OFlags::DIRECTORY) {
+    if flags.contains(FileOpenFlags::DIRECTORY) {
         lflags |= fcall::LOpenFlags::O_DIRECTORY;
     }
-    if flags.contains(OFlags::NOFOLLOW) {
+    if flags.contains(FileOpenFlags::NO_FOLLOW) {
         lflags |= fcall::LOpenFlags::O_NOFOLLOW;
     }
-    if flags.contains(OFlags::NONBLOCK) {
+    if flags.contains(FileOpenFlags::NONBLOCKING) {
         lflags |= fcall::LOpenFlags::O_NONBLOCK;
-    }
-    if flags.contains(OFlags::SYNC) {
-        lflags |= fcall::LOpenFlags::O_SYNC;
-    }
-    if flags.contains(OFlags::DSYNC) {
-        lflags |= fcall::LOpenFlags::O_DSYNC;
-    }
-    if flags.contains(OFlags::DIRECT) {
-        lflags |= fcall::LOpenFlags::O_DIRECT;
-    }
-    if flags.contains(OFlags::NOATIME) {
-        lflags |= fcall::LOpenFlags::O_NOATIME;
     }
 
     lflags

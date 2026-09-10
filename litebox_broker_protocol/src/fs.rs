@@ -13,6 +13,9 @@ use thiserror::Error;
 use crate::ObjectHandle;
 use crate::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferDescriptor};
 
+mod path;
+pub use path::ResolvedPath;
+
 /// Maximum bytes transferred through one fs shared-buffer request.
 ///
 /// This remains independent of slot capacity so increasing the shared-buffer
@@ -197,85 +200,46 @@ bitflags! {
     }
 }
 
-/// ABI-neutral fs open flags.
-///
-/// These values are intentionally independent of target-specific `O_*` bit
-/// assignments.
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct FileOpenFlags(u16);
-
-impl FileOpenFlags {
-    /// No open flags.
-    pub const NONE: Self = Self(0);
-    /// Create the object when it does not exist.
-    pub const CREATE: Self = Self(1 << 0);
-    /// Truncate an existing regular file.
-    pub const TRUNCATE: Self = Self(1 << 1);
-    /// Do not assign a controlling terminal.
-    pub const NO_CONTROLLING_TERMINAL: Self = Self(1 << 2);
-    /// Require creation to fail when the object already exists.
-    pub const EXCLUSIVE: Self = Self(1 << 3);
-    /// Require the opened object to be a directory.
-    pub const DIRECTORY: Self = Self(1 << 4);
-    /// Request nonblocking operation.
-    pub const NONBLOCKING: Self = Self(1 << 5);
-    /// Allow large-file operation.
-    pub const LARGE_FILE: Self = Self(1 << 6);
-    /// Do not follow the final symbolic link.
-    pub const NO_FOLLOW: Self = Self(1 << 7);
-    /// Append writes to the end of the file.
-    pub const APPEND: Self = Self(1 << 8);
-    /// Open only for path-based operations.
-    pub const PATH: Self = Self(1 << 9);
-    /// Every open flag this protocol version defines.
-    pub const SUPPORTED: Self = Self(
-        Self::CREATE.0
-            | Self::TRUNCATE.0
-            | Self::NO_CONTROLLING_TERMINAL.0
-            | Self::EXCLUSIVE.0
-            | Self::DIRECTORY.0
-            | Self::NONBLOCKING.0
-            | Self::LARGE_FILE.0
-            | Self::NO_FOLLOW.0
-            | Self::APPEND.0
-            | Self::PATH.0,
-    );
-
-    /// Creates flags when every bit is defined by this protocol version.
-    #[must_use]
-    pub const fn from_bits(bits: u16) -> Option<Self> {
-        if bits & !Self::SUPPORTED.0 == 0 {
-            Some(Self(bits))
-        } else {
-            None
-        }
-    }
-
-    /// Returns the stable protocol bits.
-    #[must_use]
-    pub const fn bits(self) -> u16 {
-        self.0
-    }
-
-    /// Returns whether all flags in `other` are present.
-    #[must_use]
-    pub const fn contains(self, other: Self) -> bool {
-        self.0 & other.0 == other.0
-    }
-
-    /// Returns the union of two flag sets.
-    #[must_use]
-    pub const fn union(self, other: Self) -> Self {
-        Self(self.0 | other.0)
-    }
-}
-
-impl core::ops::BitOr for FileOpenFlags {
-    type Output = Self;
-
-    fn bitor(self, rhs: Self) -> Self::Output {
-        Self(self.0 | rhs.0)
+bitflags! {
+    /// ABI-neutral fs open flags.
+    ///
+    /// These values are intentionally independent of target-specific `O_*` bit assignments.
+    #[repr(transparent)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct FileOpenFlags: u16 {
+        /// No open flags.
+        const NONE = 0;
+        /// Create the object when it does not exist.
+        const CREATE = 1 << 0;
+        /// Truncate an existing regular file.
+        const TRUNCATE = 1 << 1;
+        /// Do not assign a controlling terminal.
+        const NO_CONTROLLING_TERMINAL = 1 << 2;
+        /// Require creation to fail when the object already exists.
+        const EXCLUSIVE = 1 << 3;
+        /// Require the opened object to be a directory.
+        const DIRECTORY = 1 << 4;
+        /// Request nonblocking operation.
+        const NONBLOCKING = 1 << 5;
+        /// Allow large-file operation.
+        const LARGE_FILE = 1 << 6;
+        /// Do not follow the final symbolic link.
+        const NO_FOLLOW = 1 << 7;
+        /// Append writes to the end of the file.
+        const APPEND = 1 << 8;
+        /// Open only for path-based operations.
+        const PATH = 1 << 9;
+        /// Every open flag this protocol version defines.
+        const SUPPORTED = Self::CREATE.bits()
+            | Self::TRUNCATE.bits()
+            | Self::NO_CONTROLLING_TERMINAL.bits()
+            | Self::EXCLUSIVE.bits()
+            | Self::DIRECTORY.bits()
+            | Self::NONBLOCKING.bits()
+            | Self::LARGE_FILE.bits()
+            | Self::NO_FOLLOW.bits()
+            | Self::APPEND.bits()
+            | Self::PATH.bits();
     }
 }
 
@@ -725,6 +689,30 @@ impl<'a> DirectoryPayloadDecoder<'a> {
 mod tests {
     use super::*;
     use alloc::vec;
+
+    #[test]
+    fn file_open_flags_preserve_wire_bits_and_reject_unknown_bits() {
+        for (flag, bits) in [
+            (FileOpenFlags::NONE, 0),
+            (FileOpenFlags::CREATE, 0x001),
+            (FileOpenFlags::TRUNCATE, 0x002),
+            (FileOpenFlags::NO_CONTROLLING_TERMINAL, 0x004),
+            (FileOpenFlags::EXCLUSIVE, 0x008),
+            (FileOpenFlags::DIRECTORY, 0x010),
+            (FileOpenFlags::NONBLOCKING, 0x020),
+            (FileOpenFlags::LARGE_FILE, 0x040),
+            (FileOpenFlags::NO_FOLLOW, 0x080),
+            (FileOpenFlags::APPEND, 0x100),
+            (FileOpenFlags::PATH, 0x200),
+            (FileOpenFlags::SUPPORTED, 0x3ff),
+        ] {
+            assert_eq!(flag.bits(), bits);
+            assert_eq!(FileOpenFlags::from_bits(bits), Some(flag));
+        }
+        assert_eq!(FileOpenFlags::all(), FileOpenFlags::SUPPORTED);
+        assert_eq!(FileOpenFlags::from_bits(0x400), None);
+        assert_eq!(FileOpenFlags::from_bits(u16::MAX), None);
+    }
 
     #[test]
     fn directory_payload_round_trips_all_entry_shapes() {

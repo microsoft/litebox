@@ -40,14 +40,13 @@ use litebox::event::{
     polling::{Pollee, TryOpError},
 };
 use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry};
-use litebox::fs::OFlags;
 use litebox::fs::errors::{
     FileStatusError, MkdirError, OpenError, PathError, ReadDirError, ReadError, WriteError,
 };
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox::sync::Mutex;
 use litebox::utils::TruncateExt;
-use litebox_broker_protocol::fs::{FileMode as Mode, FileType};
+use litebox_broker_protocol::fs::{FileAccessMode, FileMode as Mode, FileOpenFlags, FileType};
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
@@ -394,19 +393,17 @@ impl RegistryKeyAccess {
             normalized
         })
     }
-}
 
-impl From<RegistryKeyAccess> for OFlags {
-    fn from(desired_access: RegistryKeyAccess) -> Self {
-        let wants_read = desired_access.intersects(RegistryKeyAccess::FS_READ_ACCESS);
-        let wants_write = desired_access.intersects(RegistryKeyAccess::FS_WRITE_ACCESS);
+    fn open_flags(self) -> (FileAccessMode, FileOpenFlags) {
+        let wants_read = self.intersects(Self::FS_READ_ACCESS);
+        let wants_write = self.intersects(Self::FS_WRITE_ACCESS);
 
         let access = match (wants_read, wants_write) {
-            (true, true) => OFlags::RDWR,
-            (false, true) => OFlags::WRONLY,
-            _ => OFlags::RDONLY,
+            (true, true) => FileAccessMode::ReadWrite,
+            (false, true) => FileAccessMode::WriteOnly,
+            _ => FileAccessMode::ReadOnly,
         };
-        access | OFlags::DIRECTORY
+        (access, FileOpenFlags::DIRECTORY)
     }
 }
 
@@ -642,8 +639,9 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         path: &str,
         desired_access: RegistryKeyAccess,
     ) -> Result<litebox::fs::FileFd, NtStatus> {
+        let (access, flags) = desired_access.open_flags();
         self.fs()
-            .open_file(&self.fs_context, path, desired_access.into(), Mode::empty())
+            .open_file(&self.fs_context, path, access, flags, Mode::empty())
             .map_err(map_open_error)
     }
 
@@ -674,7 +672,8 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
             .open_file(
                 &self.fs_context,
                 &*value_path,
-                OFlags::RDONLY,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::NONE,
                 Mode::empty(),
             )
             .map_err(map_open_error)?;
@@ -794,7 +793,8 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
             .open_file(
                 &self.fs_context,
                 &*values_path,
-                OFlags::RDONLY | OFlags::DIRECTORY,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::DIRECTORY,
                 Mode::empty(),
             )
             .map_err(map_open_error)?;
@@ -864,7 +864,8 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
             .open_file(
                 &self.fs_context,
                 &*child_path,
-                OFlags::RDONLY | OFlags::DIRECTORY,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::DIRECTORY,
                 Mode::empty(),
             )
             .map_err(map_open_error)?;
@@ -894,7 +895,8 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
             .open_file(
                 &self.fs_context,
                 &*values_path,
-                OFlags::RDONLY | OFlags::DIRECTORY,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::DIRECTORY,
                 Mode::empty(),
             )
             .map_err(map_open_error)?;
@@ -2277,7 +2279,8 @@ fn write_value_at_path<Platform: crate::ShimPlatform>(
         .open_file(
             context,
             &*value_path,
-            OFlags::CREAT | OFlags::WRONLY | OFlags::TRUNC,
+            FileAccessMode::WriteOnly,
+            FileOpenFlags::CREATE | FileOpenFlags::TRUNCATE,
             Mode::RUSR | Mode::WUSR | Mode::ROTH | Mode::WOTH,
         )
         .map_err(map_open_error)?;
@@ -2499,6 +2502,55 @@ mod tests {
 
     const KEY_VALUE_PARTIAL_INFORMATION_DATA_OFFSET: usize =
         offset_of!(KeyValuePartialInformation, data);
+
+    #[test]
+    fn registry_access_maps_to_protocol_directory_open_parameters() {
+        for (desired_access, expected_access) in [
+            (0, FileAccessMode::ReadOnly),
+            (
+                RegistryKeyAccess::QUERY_VALUE.bits(),
+                FileAccessMode::ReadOnly,
+            ),
+            (
+                RegistryKeyAccess::ENUMERATE_SUB_KEYS.bits(),
+                FileAccessMode::ReadOnly,
+            ),
+            (RegistryKeyAccess::NOTIFY.bits(), FileAccessMode::ReadOnly),
+            (
+                RegistryKeyAccess::SET_VALUE.bits(),
+                FileAccessMode::WriteOnly,
+            ),
+            (
+                RegistryKeyAccess::CREATE_SUB_KEY.bits(),
+                FileAccessMode::WriteOnly,
+            ),
+            (
+                RegistryKeyAccess::CREATE_LINK.bits(),
+                FileAccessMode::WriteOnly,
+            ),
+            (
+                (RegistryKeyAccess::QUERY_VALUE | RegistryKeyAccess::SET_VALUE).bits(),
+                FileAccessMode::ReadWrite,
+            ),
+            (AccessMask::DELETE.bits(), FileAccessMode::WriteOnly),
+            (AccessMask::WRITE_DAC.bits(), FileAccessMode::WriteOnly),
+            (AccessMask::WRITE_OWNER.bits(), FileAccessMode::WriteOnly),
+            (AccessMask::GENERIC_READ.bits(), FileAccessMode::ReadOnly),
+            (AccessMask::GENERIC_WRITE.bits(), FileAccessMode::WriteOnly),
+            (AccessMask::GENERIC_EXECUTE.bits(), FileAccessMode::ReadOnly),
+            (AccessMask::GENERIC_ALL.bits(), FileAccessMode::ReadWrite),
+            (
+                AccessMask::MAXIMUM_ALLOWED.bits(),
+                FileAccessMode::ReadWrite,
+            ),
+        ] {
+            assert_eq!(
+                RegistryKeyAccess::from_desired_access(desired_access).open_flags(),
+                (expected_access, FileOpenFlags::DIRECTORY),
+                "desired_access={desired_access:#x}",
+            );
+        }
+    }
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     #[allow(non_snake_case)]

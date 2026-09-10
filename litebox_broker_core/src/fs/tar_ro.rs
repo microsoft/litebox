@@ -29,11 +29,11 @@ use alloc::vec::Vec;
 use core::ops::Range;
 use hashbrown::HashMap;
 use litebox_broker_protocol::fs::{
-    FileDirectoryEntry, FileMode as Mode, FileNodeInfo, FileStatus, FileType, FileUser as UserInfo,
+    FileAccessMode, FileDirectoryEntry, FileMode as Mode, FileNodeInfo, FileOpenFlags, FileStatus,
+    FileType, FileUser as UserInfo,
 };
 
 use super::{
-    OFlags,
     backend::{CreationMetadata, DirHandle, FileHandle, HandleRef, WalkingDirHandle},
     errors::{
         ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
@@ -128,9 +128,15 @@ impl super::backend::Backend for TarRo {
     fn owned_dir_at(
         &self,
         dir: WalkingDirHandle<'_>,
-        flags: OFlags,
+        access: FileAccessMode,
+        flags: FileOpenFlags,
     ) -> Result<DirHandle, OpenError> {
-        if flags.intersects(OFlags::CREAT | OFlags::TRUNC | OFlags::WRONLY | OFlags::RDWR) {
+        if flags.intersects(FileOpenFlags::CREATE | FileOpenFlags::TRUNCATE)
+            || matches!(
+                access,
+                FileAccessMode::WriteOnly | FileAccessMode::ReadWrite
+            )
+        {
             return Err(OpenError::ReadOnlyFileSystem);
         }
         Ok(DirHandle::from_typed::<Self>(dir.into_typed::<Self>()))
@@ -146,7 +152,8 @@ impl super::backend::Backend for TarRo {
         &self,
         dir: WalkingDirHandle<'_>,
         name: &str,
-        flags: OFlags,
+        access: FileAccessMode,
+        flags: FileOpenFlags,
     ) -> Result<super::backend::Permissioned<FileHandle>, OpenError> {
         let dir = dir.into_typed::<Self>();
         let child = self.tar_index.dirs[dir.idx]
@@ -156,14 +163,15 @@ impl super::backend::Backend for TarRo {
         let IndexedChild::File(file_idx) = *child else {
             return Err(OpenError::PathError(PathError::ComponentNotADirectory));
         };
-        if flags.contains(OFlags::DIRECTORY) {
+        if flags.contains(FileOpenFlags::DIRECTORY) {
             return Err(OpenError::PathError(PathError::ComponentNotADirectory));
         }
-        if !(flags.contains(OFlags::CREAT) && flags.contains(OFlags::EXCL))
-            && (flags.contains(OFlags::CREAT)
-                || flags.contains(OFlags::TRUNC)
-                || flags.contains(OFlags::WRONLY)
-                || flags.contains(OFlags::RDWR))
+        if !flags.contains(FileOpenFlags::CREATE | FileOpenFlags::EXCLUSIVE)
+            && (flags.intersects(FileOpenFlags::CREATE | FileOpenFlags::TRUNCATE)
+                || matches!(
+                    access,
+                    FileAccessMode::WriteOnly | FileAccessMode::ReadWrite
+                ))
         {
             return Err(OpenError::ReadOnlyFileSystem);
         }
