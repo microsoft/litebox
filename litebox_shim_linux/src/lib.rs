@@ -359,6 +359,14 @@ impl<Platform: ShimPlatform> LinuxShimProcess<Platform> {
             syscalls::process::ExitStatus::Signal(signal) => signal.as_i32() + 256,
         }
     }
+
+    /// Wait for the process to exit, returning an exit code suitable for a Unix shell.
+    pub fn wait_for_unix_shell_exit_code(&self) -> i32 {
+        match self.0.wait_for_exit() {
+            syscalls::process::ExitStatus::Exit(v) => i32::from(v) & 0xff,
+            syscalls::process::ExitStatus::Signal(signal) => signal.as_i32() + 128,
+        }
+    }
 }
 
 /// Create the default file system with the given in-memory layer and tar data.

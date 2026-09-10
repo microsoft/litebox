@@ -397,7 +397,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         shutdown.store(true, core::sync::atomic::Ordering::Relaxed);
         net_worker.join().unwrap();
     }
-    std::process::exit(program.process.wait())
+    std::process::exit(program.process.wait_for_unix_shell_exit_code())
 }
 
 /// Pin the current thread to a specific CPU core
