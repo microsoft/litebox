@@ -4,7 +4,6 @@
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::marker::PhantomData;
 use core::mem::{align_of, offset_of, size_of};
 
 use int_enum::IntEnum;
@@ -447,17 +446,13 @@ struct FileStandardInformation {
     padding: [u8; 2],
 }
 
-pub(crate) struct FileObjectSubsystem<Platform>(PhantomData<fn(Platform)>);
-
-impl<Platform: crate::ShimPlatform> FdEnabledSubsystem for FileObjectSubsystem<Platform> {
-    type Entry = FileObject;
+impl FdEnabledSubsystem for FileObject {
+    type Entry = Self;
 }
 
 impl FdEnabledSubsystemEntry for FileObject {}
 
-impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem
-    for FileObjectSubsystem<Platform>
-{
+impl crate::WindowsHandleSubsystem for FileObject {
     fn normalize_desired_access(desired_access: u32) -> u32 {
         FileAccess::from_desired_access(desired_access).bits()
     }
@@ -528,7 +523,7 @@ enum FileIoOperation {
 /// with the resolved absolute byte offset (`None` when the current file-pointer
 /// position should be used).
 type PreparedFileIo<Platform> = (
-    litebox::fd::EntryHandle<Platform, FileObjectSubsystem<Platform>>,
+    litebox::fd::EntryHandle<Platform, FileObject>,
     Option<usize>,
 );
 
@@ -826,8 +821,8 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
     fn file_entry(
         &self,
         handle: Handle,
-    ) -> Result<litebox::fd::EntryHandle<Platform, FileObjectSubsystem<Platform>>, NtStatus> {
-        raw_handle_entry::<Platform, FileObjectSubsystem<Platform>>(
+    ) -> Result<litebox::fd::EntryHandle<Platform, FileObject>, NtStatus> {
+        raw_handle_entry::<Platform, FileObject>(
             &self.global.litebox,
             &self.process.handles,
             handle,
@@ -839,33 +834,26 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         &self,
         handle: Handle,
         operation: FileIoOperation,
-    ) -> Result<
-        (
-            litebox::fd::EntryHandle<Platform, FileObjectSubsystem<Platform>>,
-            bool,
-        ),
-        NtStatus,
-    > {
+    ) -> Result<(litebox::fd::EntryHandle<Platform, FileObject>, bool), NtStatus> {
         let mut append_only = false;
-        let file = self.typed_handle_entry_with_access_check::<FileObjectSubsystem<Platform>>(
-            handle,
-            |granted_access| match operation {
-                FileIoOperation::Read => granted_access & FileAccess::READ_DATA.bits() != 0,
-                FileIoOperation::Write => {
-                    append_only = granted_access & FileAccess::WRITE_DATA.bits() == 0
-                        && granted_access & FileAccess::APPEND_DATA.bits() != 0;
-                    granted_access & (FileAccess::WRITE_DATA | FileAccess::APPEND_DATA).bits() != 0
+        let file =
+            self.typed_handle_entry_with_access_check::<FileObject>(handle, |granted_access| {
+                match operation {
+                    FileIoOperation::Read => granted_access & FileAccess::READ_DATA.bits() != 0,
+                    FileIoOperation::Write => {
+                        append_only = granted_access & FileAccess::WRITE_DATA.bits() == 0
+                            && granted_access & FileAccess::APPEND_DATA.bits() != 0;
+                        granted_access & (FileAccess::WRITE_DATA | FileAccess::APPEND_DATA).bits()
+                            != 0
+                    }
                 }
-            },
-        )?;
+            })?;
         Ok((file, append_only))
     }
 
     pub(crate) fn image_section_file_path(&self, handle: Handle) -> Result<String, NtStatus> {
-        let entry = self.typed_handle_entry_with_access::<FileObjectSubsystem<Platform>>(
-            handle,
-            FileAccess::EXECUTE.bits(),
-        )?;
+        let entry =
+            self.typed_handle_entry_with_access::<FileObject>(handle, FileAccess::EXECUTE.bits())?;
         entry.with_entry(|file| match &file.backing {
             FileObjectBacking::Filesystem {
                 is_directory: false,
@@ -882,13 +870,13 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
 
     fn insert_file_handle(&self, file: FileObject) -> Result<Handle, NtStatus> {
         let granted_access = file.create_time_access.bits();
-        self.insert_typed_handle::<FileObjectSubsystem<Platform>>(file, granted_access, |file| {
+        self.insert_typed_handle::<FileObject>(file, granted_access, |file| {
             self.close_file(file);
         })
     }
 
     pub(crate) fn close_file_handle(&self, handle: Handle) {
-        self.close_typed_handle::<FileObjectSubsystem<Platform>>(handle, |file| {
+        self.close_typed_handle::<FileObject>(handle, |file| {
             self.close_file(file);
         });
     }
@@ -996,23 +984,17 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             }
             Err(error) => return map_file_status_error(error),
         };
-        let readonly = !status.mode.intersects(Mode::WUSR | Mode::WGRP | Mode::WOTH);
-        let mut file_attributes = match status.file_type {
-            FileType::Directory => FileAttributes::DIRECTORY,
-            FileType::RegularFile => FileAttributes::ARCHIVE,
+        if !matches!(
+            status.file_type,
+            FileType::Directory | FileType::RegularFile
+        ) {
             // TODO(chardev-attributes): Probe native attributes for character devices and
             // future filesystem node types; regular files are host-grounded as ARCHIVE.
-            file_type => {
-                litebox_util_log::debug!(
-                    path = path.as_str(),
-                    file_type:? = file_type;
-                    "Using archive attributes for nonstandard filesystem node"
-                );
-                FileAttributes::ARCHIVE
-            }
-        };
-        if readonly {
-            file_attributes |= FileAttributes::READONLY;
+            litebox_util_log::debug!(
+                path = path.as_str(),
+                file_type:? = status.file_type;
+                "Using archive attributes for nonstandard filesystem node"
+            );
         }
         // TODO(fs-timestamps): Populate timestamps when FileStatus exposes them.
         litebox_util_log::debug!(
@@ -1020,7 +1002,9 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             "Using zero timestamps for file attributes"
         );
         let information = FileBasicInformation {
-            file_attributes: file_attributes.bits(),
+            file_attributes: FileStatusMetadata::from_status(&status)
+                .file_attributes
+                .bits(),
             ..FileBasicInformation::default()
         };
         if file_information.write_at_offset(0, information).is_none() {
@@ -1229,7 +1213,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         {
             return NtStatus::ACCESS_VIOLATION;
         }
-        let file = match self.typed_handle_entry_with_access_check::<FileObjectSubsystem<Platform>>(
+        let file = match self.typed_handle_entry_with_access_check::<FileObject>(
             file_handle,
             |granted_access| {
                 granted_access & (FileAccess::READ_DATA | FileAccess::WRITE_DATA).bits() != 0
@@ -1321,7 +1305,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         if position < 0 {
             return NtStatus::INVALID_PARAMETER;
         }
-        let file = match self.typed_handle_entry_with_access_check::<FileObjectSubsystem<Platform>>(
+        let file = match self.typed_handle_entry_with_access_check::<FileObject>(
             file_handle,
             |granted_access| {
                 granted_access & (FileAccess::READ_DATA | FileAccess::WRITE_DATA).bits() != 0
@@ -1819,7 +1803,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             return NtStatus::INFO_LENGTH_MISMATCH;
         }
 
-        let file = match self.typed_handle_entry_with_access::<FileObjectSubsystem<Platform>>(
+        let file = match self.typed_handle_entry_with_access::<FileObject>(
             file_handle,
             FileAccess::LIST_DIRECTORY.bits(),
         ) {
@@ -2493,7 +2477,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             let Some(handle) = Handle::from_raw_fd(raw_handle) else {
                 continue;
             };
-            let Some(entry) = raw_handle_entry::<Platform, FileObjectSubsystem<Platform>>(
+            let Some(entry) = raw_handle_entry::<Platform, FileObject>(
                 &self.global.litebox,
                 &self.process.handles,
                 handle,
@@ -3399,7 +3383,7 @@ mod tests {
             NtStatus::SUCCESS
         );
         assert_eq!(
-            task.typed_handle::<FileObjectSubsystem<TestPlatform>>(maximum_duplicate)
+            task.typed_handle::<FileObject>(maximum_duplicate)
                 .and_then(|typed| {
                     task.typed_handle_metadata(&typed)
                         .map(|metadata| metadata.granted_access)

@@ -205,16 +205,6 @@ pub enum FileStatusError {
     PathError(#[from] PathError),
 }
 
-/// Possible errors from a backend walk
-#[non_exhaustive]
-#[derive(Error, Debug)]
-pub enum WalkError {
-    #[error("I/O error")]
-    Io,
-    #[error(transparent)]
-    PathError(#[from] PathError),
-}
-
 /// Possible errors in any file-system function due to path errors.
 #[derive(Error, Debug)]
 pub enum PathError {

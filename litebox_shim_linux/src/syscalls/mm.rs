@@ -5,13 +5,7 @@
 //! Most of these syscalls which are not backed by files are implemented in [`litebox_common_linux::mm`].
 
 use alloc::collections::{BTreeMap, BTreeSet};
-use litebox::{
-    mm::linux::{MappingError, PAGE_SIZE, PageRange},
-    platform::{
-        PageManagementProvider, RawConstPointer,
-        page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions},
-    },
-};
+use litebox::mm::linux::{MappingError, PAGE_SIZE};
 use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
 
 use crate::ShimPlatform;
@@ -212,14 +206,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let is_exec = prot.contains(ProtFlags::PROT_EXEC);
         let typed_fd = self.typed_fd(fd).map_err(|_| MappingError::BadFD(fd))?;
 
-        // Perform the normal mmap first (CoW or memcpy fallback).
-        let result = if let Some(cow_result) =
-            self.try_cow_mmap_file(suggested_addr, len, &prot, &flags, &typed_fd, offset)
-        {
-            cow_result?
-        } else {
-            self.do_mmap_file_memcpy(suggested_addr, len, prot, flags, &typed_fd, offset)?
-        };
+        let result =
+            self.do_mmap_file_memcpy(suggested_addr, len, prot, flags, &typed_fd, offset)?;
 
         // Runtime syscall rewriting: patch PROT_EXEC segments in-place.
         if is_exec {
@@ -253,98 +241,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         Ok(result)
     }
 
-    /// Attempt to create a CoW mapping for a file with static backing data.
-    ///
-    /// Returns `Some(result)` if CoW was attempted (success or failure),
-    /// `None` if CoW is not applicable (fall back to memcpy).
-    // TODO(jb): does this need to be Option-Result or can it just be Option?
-    fn try_cow_mmap_file(
-        &self,
-        suggested_addr: Option<usize>,
-        len: usize,
-        prot: &ProtFlags,
-        flags: &MapFlags,
-        fd: &AnyTypedFd<Platform>,
-        offset: usize,
-    ) -> Option<Result<UserPtrMut<u8>, MappingError>> {
-        if !len.is_multiple_of(PAGE_SIZE) {
-            return None;
-        }
-
-        let files = self.files.borrow();
-        let static_data = files.fs.get_static_file_backing_data(fd.as_fs()?)?;
-
-        if offset > static_data.len() {
-            return None;
-        }
-
-        let available_len = static_data.len().saturating_sub(offset);
-        if available_len < len {
-            // Cannot fill full page
-            return None;
-        }
-
-        let fixed_behavior = if flags.contains(MapFlags::MAP_FIXED_NOREPLACE) {
-            FixedAddressBehavior::NoReplace
-        } else if flags.contains(MapFlags::MAP_FIXED) {
-            FixedAddressBehavior::Replace
-        } else {
-            FixedAddressBehavior::Hint
-        };
-
-        let permissions = {
-            let mut perms = MemoryRegionPermissions::empty();
-            perms.set(
-                MemoryRegionPermissions::READ,
-                prot.contains(ProtFlags::PROT_READ),
-            );
-            perms.set(
-                MemoryRegionPermissions::WRITE,
-                prot.contains(ProtFlags::PROT_WRITE),
-            );
-            perms.set(
-                MemoryRegionPermissions::EXEC,
-                prot.contains(ProtFlags::PROT_EXEC),
-            );
-            perms
-        };
-
-        // XXX: `try_allocate_cow_pages` and `register_existing_mapping` are not called under a
-        // unified lock, so there is a theoretical race if two threads concurrently attempt a
-        // fixed-address mapping with replacement at the same address. In practice this is benign:
-        // if a program races like this both threads will register the same mapping anyway. Updating
-        // to a begin/attempt/commit scheme could close this race window entirely.
-        match <_ as PageManagementProvider<{ PAGE_SIZE }>>::try_allocate_cow_pages(
-            self.global.platform,
-            suggested_addr.unwrap_or(0),
-            &static_data[offset..offset + len],
-            permissions,
-            fixed_behavior,
-        ) {
-            Ok(ptr) => {
-                let range =
-                    PageRange::new(ptr.as_usize(), ptr.as_usize().checked_add(len).unwrap())
-                        .unwrap();
-                // SAFETY: ptr is the freshly CoW-mapped region of exactly `len` bytes with
-                // `permissions`.
-                unsafe {
-                    self.global.pm.register_existing_mapping(
-                        range,
-                        permissions,
-                        true,
-                        fixed_behavior == FixedAddressBehavior::Replace,
-                        flags.contains(MapFlags::MAP_SHARED),
-                    )
-                }
-                .unwrap();
-                Some(Ok(UserPtrMut::from_platform_ptr::<Platform>(ptr)))
-            }
-            Err(_cow_not_supported) => None,
-        }
-    }
-
-    /// Fallback mmap implementation using page-by-page memcpy, for files where the CoW attempt
-    /// fails (either due to lack of support on platform, or non-static-backed data, etc.)
+    /// Map a file by reading its contents through the filesystem API into allocated pages.
     fn do_mmap_file_memcpy(
         &self,
         suggested_addr: Option<usize>,
