@@ -235,6 +235,56 @@ fn aarch64_metadata_projects_text_into_file_mapping() {
 }
 
 #[test]
+fn aarch64_trampoline_size_bound_covers_emitted_fixture() {
+    let mut aligned = vec![0u64; HELLO_AARCH64.len().div_ceil(8)];
+    zerocopy::IntoBytes::as_mut_bytes(aligned.as_mut_slice())[..HELLO_AARCH64.len()]
+        .copy_from_slice(HELLO_AARCH64);
+    let metadata = litebox_syscall_rewriter::aarch64::ElfCodeMetadata::parse_aligned_in_place(
+        &mut aligned,
+        HELLO_AARCH64.len(),
+    )
+    .unwrap();
+    let bound = metadata
+        .trampoline_size_upper_bound(
+            &zerocopy::IntoBytes::as_bytes(aligned.as_slice())[..HELLO_AARCH64.len()],
+            RewriteOptions::default(),
+        )
+        .unwrap();
+
+    let out = hook_syscalls_in_elf(HELLO_AARCH64, Some(0)).unwrap();
+    let (_, _, emitted) = trampoline_header(&out);
+    assert!(emitted > 0, "fixture must emit a trampoline");
+    assert!(emitted <= bound as u64, "{emitted:#x} > {bound:#x}");
+}
+
+#[test]
+fn aarch64_metadata_falls_back_to_executable_segments_without_sections() {
+    let mut elf = HELLO_AARCH64.to_vec();
+    elf[40..48].fill(0); // e_shoff
+    elf[58..64].fill(0); // e_shentsize, e_shnum, e_shstrndx
+    let mut aligned = vec![0u64; elf.len().div_ceil(8)];
+    zerocopy::IntoBytes::as_mut_bytes(aligned.as_mut_slice())[..elf.len()].copy_from_slice(&elf);
+
+    let metadata = litebox_syscall_rewriter::aarch64::ElfCodeMetadata::parse_aligned_in_place(
+        &mut aligned,
+        elf.len(),
+    )
+    .unwrap();
+    let (executable, identified) = metadata.coverage_bytes();
+    assert!(executable > 0);
+    assert_eq!(identified, executable);
+    assert!(
+        metadata
+            .trampoline_size_upper_bound(
+                &zerocopy::IntoBytes::as_bytes(aligned.as_slice())[..elf.len()],
+                RewriteOptions::default(),
+            )
+            .unwrap()
+            > 0
+    );
+}
+
+#[test]
 fn aarch64_text_section_confirms_x18_code_without_symbols_or_fdes() {
     let mut elf = HELLO_AARCH64.to_vec();
     let sections = exec_sections(&elf);
