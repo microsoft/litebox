@@ -18,6 +18,7 @@ use x86_64::{
                 CleanUp, FlagUpdateError, MapToError, PageTableFrameMapping, TranslateResult,
                 UnmapError as X64UnmapError,
             },
+            page_table::PageTableEntry,
         },
     },
 };
@@ -35,12 +36,12 @@ use crate::mm::{
 #[cfg(not(test))]
 const TLB_SINGLE_PAGE_FLUSH_CEILING: usize = 33;
 
-/// Bit position of the PML4 (level-4) index within a virtual address, for
-/// x86-64 4-level paging: 12 page-offset bits + 9 bits each for P1-P3.
-const PML4_SHIFT: u32 = 39;
-
-/// Mask for a 9-bit page-table index (512 entries per table).
-const PML4_INDEX_MASK: u64 = 0x1FF;
+const PAGE_SHIFT: usize = Size4KiB::SIZE.trailing_zeros() as usize;
+const PAGE_TABLE_LEVEL_BITS: usize = 9;
+const P2_SHIFT: usize = PAGE_SHIFT + PAGE_TABLE_LEVEL_BITS;
+const P3_SHIFT: usize = P2_SHIFT + PAGE_TABLE_LEVEL_BITS;
+const PML4_SHIFT: usize = P3_SHIFT + PAGE_TABLE_LEVEL_BITS;
+const PML4_INDEX_MASK: u64 = (1 << PAGE_TABLE_LEVEL_BITS) - 1;
 
 /// PML4 index of the first VTL1-kernel slot (`PA + KERNEL_OFFSET`).
 ///
@@ -291,30 +292,6 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         Ok(())
     }
 
-    /// Clean up task-owned intermediate page table frames (P1-P3) for a task
-    /// page table that is being destroyed.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that:
-    /// - All user data frames have been released before calling this function (e.g., using `PageManager::release_memory()`)
-    /// - The page table is no longer active (not loaded in CR3)
-    pub(crate) unsafe fn cleanup_page_table_frames(&self) {
-        let mut allocator = PageTableAllocator::<M>::new();
-        // Task-owned slots span the VA below the kernel region, i.e.,
-        // `0 ..= KERNEL_PML4_START * PML4_SLOT_SIZE - 1`. The kernel region at
-        // and above `KERNEL_PML4_START` is base-owned/shared.
-        let start = Page::<Size4KiB>::from_start_address(VirtAddr::new(0)).unwrap();
-        let end = Page::<Size4KiB>::containing_address(VirtAddr::new(crate::KERNEL_OFFSET - 1));
-        // Safety: The page table is being destroyed and will not be reused.
-        // This function crosses the non-canonical hole.
-        unsafe {
-            self.inner
-                .lock()
-                .clean_up_addr_range(Page::range_inclusive(start, end), &mut allocator);
-        }
-    }
-
     pub(crate) unsafe fn remap_pages(
         &self,
         old_range: PageRange<ALIGN>,
@@ -499,8 +476,8 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                     // COW lazy-enable was unimplemented, so granting WRITABLE via a later
                     // fault would land in the unimplemented COW path and kill the task.
                     // Install the writable PTE directly until COW (and shared frames) land.
-                    // FIXME: when COW is implemented, restore the lazy-enable masking that
-                    // was removed here so a R->RW mprotect defers WRITABLE to the fault path.
+                    // FIXME: COW needs lazy write enable and refcounted user frames;
+                    // task-table destruction currently assumes exclusive ownership.
                     if flags != new_flags {
                         match unsafe {
                             inner.update_flags(page, (flags & !Self::MPROTECT_PTE_MASK) | new_flags)
@@ -822,16 +799,100 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
 }
 
 impl<M: MemoryProvider, const ALIGN: usize> Drop for X64PageTable<'_, M, ALIGN> {
-    /// Deallocate the physical frame of the top-level page table
+    /// Reclaims owned user frames and private page tables.
+    ///
+    /// No TLB shootdown is needed because it is released after a non-PCID CR3 reload.
     #[allow(clippy::similar_names)]
     fn drop(&mut self) {
         let mut allocator = PageTableAllocator::<M>::new();
-        let p4_va =
-            core::ptr::from_mut::<PageTable>(self.inner.lock().level_4_table_mut()).cast::<u8>();
-        let p4_pa = M::va_to_pa(VirtAddr::new(p4_va as u64));
-        unsafe {
-            allocator.deallocate_frame(PhysFrame::containing_address(p4_pa));
+        let mut inner = self.inner.lock();
+        let p4 = inner.level_4_table_mut();
+
+        // Skip shared VTL1-kernel PML4 entries.
+        for (p4_index, p4_entry) in p4.iter_mut().enumerate().take(KERNEL_PML4_START) {
+            let Ok(p3_frame) = p4_entry.frame() else {
+                p4_entry.set_unused();
+                continue;
+            };
+            let p3 = unsafe { &mut *frame_to_pointer::<M>(p3_frame) };
+
+            for (p3_index, p3_entry) in p3.iter_mut().enumerate() {
+                if p3_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+                    crate::debug_serial_println!("BUG: LVBS platform does not support huge pages");
+                    debug_assert!(false, "LVBS platform does not support huge pages");
+                    p3_entry.set_unused();
+                    continue;
+                }
+                let Ok(p2_frame) = p3_entry.frame() else {
+                    p3_entry.set_unused();
+                    continue;
+                };
+                let p2 = unsafe { &mut *frame_to_pointer::<M>(p2_frame) };
+
+                for (p2_index, p2_entry) in p2.iter_mut().enumerate() {
+                    if p2_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+                        crate::debug_serial_println!(
+                            "BUG: LVBS platform does not support huge pages"
+                        );
+                        debug_assert!(false, "LVBS platform does not support huge pages");
+                        p2_entry.set_unused();
+                        continue;
+                    }
+                    let Ok(p1_frame) = p2_entry.frame() else {
+                        p2_entry.set_unused();
+                        continue;
+                    };
+                    let p1 = unsafe { &mut *frame_to_pointer::<M>(p1_frame) };
+
+                    for (p1_index, p1_entry) in p1.iter_mut().enumerate() {
+                        // Indices >= 256 cannot fall in the user range.
+                        let page_address = (p4_index << PML4_SHIFT)
+                            | (p3_index << P3_SHIFT)
+                            | (p2_index << P2_SHIFT)
+                            | (p1_index << PAGE_SHIFT);
+                        if (crate::USER_ADDR_MIN..crate::USER_ADDR_MAX).contains(&page_address) {
+                            match p1_entry.frame() {
+                                Ok(frame) => {
+                                    // Safety: task user leaf frames are exclusively owned.
+                                    unsafe { allocator.deallocate_frame(frame) };
+                                }
+                                Err(_) if !p1_entry.is_unused() => {
+                                    crate::debug_serial_println!(
+                                        "BUG: leaking malformed task leaf during destruction"
+                                    );
+                                    debug_assert!(false, "malformed task leaf during destruction");
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                        p1_entry.set_unused();
+                    }
+                }
+            }
         }
+
+        let p4_va = core::ptr::from_mut::<PageTable>(p4).cast::<u8>();
+        let p4_pa = M::va_to_pa(VirtAddr::new(p4_va as u64));
+        let start = Page::<Size4KiB>::containing_address(VirtAddr::new(0));
+        let end = Page::<Size4KiB>::containing_address(VirtAddr::new(crate::KERNEL_OFFSET - 1));
+        debug_assert_eq!(usize::from(end.p4_index()), KERNEL_PML4_START - 1);
+
+        // Safety: all private leaves were cleared above.
+        unsafe {
+            inner.clean_up_addr_range(Page::range_inclusive(start, end), &mut allocator);
+        }
+        debug_assert!(
+            inner
+                .level_4_table()
+                .iter()
+                .take(KERNEL_PML4_START)
+                .all(PageTableEntry::is_unused),
+            "task page table dropped with live private mappings"
+        );
+        drop(inner);
+
+        // Safety: owned P4 frame.
+        unsafe { allocator.deallocate_frame(PhysFrame::containing_address(p4_pa)) };
     }
 }
 
