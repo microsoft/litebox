@@ -2169,7 +2169,6 @@ impl OpteeRpcArgs {
     }
 
     /// Access an RMEM output parameter with exact direction and flag validation.
-    #[expect(dead_code)]
     fn get_param_rmem_output(&self, index: usize) -> Result<OpteeMsgParamRmem, OpteeSmcReturnCode> {
         if index >= self.num_params as usize {
             return Err(OpteeSmcReturnCode::ENotAvail);
@@ -2254,6 +2253,26 @@ impl OpteeRpcArgs {
         Ok(size)
     }
 
+    /// Validate a successful second LOAD_TA response.
+    pub fn load_ta_binary_response(
+        &self,
+        expected_shm_ref: u64,
+        expected_size: u64,
+    ) -> Result<OpteeMsgParamRmem, OpteeSmcReturnCode> {
+        if self.cmd != OpteeRpcCommand::LoadTa
+            || self.ret != TeeResult::Success
+            || self.num_params != 2
+        {
+            return Err(OpteeSmcReturnCode::EBadCmd);
+        }
+
+        let rmem = self.get_param_rmem_output(1)?;
+        if rmem.shm_ref != expected_shm_ref || rmem.offs != 0 || rmem.size != expected_size {
+            return Err(OpteeSmcReturnCode::EBadCmd);
+        }
+        Ok(rmem)
+    }
+
     /// Validate a successful SHM_ALLOC response and return its memory reference.
     pub fn shm_alloc_response(
         &self,
@@ -2300,6 +2319,29 @@ impl OpteeRpcArgs {
         )?;
 
         Ok(())
+    }
+
+    /// Prepare a shared-memory free RPC request to be sent to normal world.
+    pub fn prepare_shm_free_rpc(
+        &mut self,
+        shm_type: OpteeRpcShmType,
+        shm_ref: u64,
+    ) -> Result<(), OpteeSmcReturnCode> {
+        self.cmd = OpteeRpcCommand::ShmFree;
+        // Match OP-TEE's get_rpc_arg(): default to failure in case normal world
+        // returns without updating the RPC result.
+        self.ret = TeeResult::GenericError;
+        self.num_params = 1;
+
+        self.set_param_attr_type(0, OpteeMsgAttrType::ValueInput)?;
+        self.set_param_value(
+            0,
+            OpteeMsgParamValue {
+                a: shm_type as u64,
+                b: shm_ref,
+                c: 0,
+            },
+        )
     }
 
     /// Prepare a LOAD_TA RPC request to be sent to normal world.
