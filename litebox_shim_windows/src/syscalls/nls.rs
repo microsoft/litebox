@@ -171,7 +171,6 @@ struct MuiStringsSection {
     header: MuiStringPool,
     indices: Vec<i16>,
     characters: Vec<u16>,
-    language_count: usize,
 }
 
 struct MuiMachineConfigSection {
@@ -215,10 +214,7 @@ fn align_up(value: usize, alignment: usize) -> Option<usize> {
 }
 
 impl MuiInstalledSection {
-    fn new(languages: &[MuiLanguage<'_>], name_indices: &[i16]) -> Option<Self> {
-        if languages.len() != name_indices.len() {
-            return None;
-        }
+    fn new(languages: &[MuiLanguage<'_>]) -> Option<Self> {
         let capacity = languages.len().max(MUI_MIN_LANGUAGE_CAPACITY);
         let encoded_len = align_up(
             size_of::<MuiLanguages>()
@@ -226,9 +222,9 @@ impl MuiInstalledSection {
             8,
         )?;
         let mut language_info = Vec::with_capacity(capacity);
-        for (language, &name_index) in languages.iter().zip(name_indices) {
+        for (index, language) in languages.iter().enumerate() {
             let mut info = language.info;
-            info.language_name_index = name_index;
+            info.language_name_index = i16::try_from(index.checked_add(1)?).ok()?;
             language_info.push(info);
         }
         language_info.resize(capacity, EMPTY_MUI_LANGUAGE_INFO);
@@ -270,8 +266,8 @@ impl MuiStringsSection {
             indices.push(i16::try_from(characters.len()).ok()?);
             characters.extend(language.name.encode_utf16());
             characters.push(0);
+            characters.push(0);
         }
-        characters.push(0);
         let character_count = characters.len();
         let character_capacity = character_count.max(40);
         indices.resize(string_capacity, 0);
@@ -293,12 +289,7 @@ impl MuiStringsSection {
             },
             indices,
             characters,
-            language_count: languages.len(),
         })
-    }
-
-    fn language_name_indices(&self) -> &[i16] {
-        &self.indices[1..=self.language_count]
     }
 
     fn encoded_len(&self) -> usize {
@@ -349,7 +340,7 @@ impl MuiRegistryBlob {
         language_configs: &[MuiLanguageConfigNode],
     ) -> Option<Self> {
         let strings = MuiStringsSection::new(languages)?;
-        let installed = MuiInstalledSection::new(languages, strings.language_name_indices())?;
+        let installed = MuiInstalledSection::new(languages)?;
         let machine_config = MuiMachineConfigSection::new(language_configs)?;
         let installed_sku = installed_sku();
         let installed_sku_size = installed_sku.len().checked_mul(size_of::<u16>())?;
@@ -364,8 +355,8 @@ impl MuiRegistryBlob {
         )?;
         let total_size = align_up(installed_sku_offset.checked_add(installed_sku_size)?, 8)?;
         let mut install_language_fallback = [0; 4];
-        for (slot, language) in install_language_fallback.iter_mut().zip(languages) {
-            *slot = language.info.language_id;
+        if let Some(language) = languages.first() {
+            install_language_fallback[0] = language.info.language_id;
         }
         let registry_info = MuiRegistryInfo {
             // TODO(mui-registry-info): Identify this host-observed ownership bit.
@@ -1065,92 +1056,365 @@ mod tests {
     type TestPlatform = crate::tests::TestPlatform;
 
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    fn mui_registry_data(
-        generation: u32,
-        languages: &[MuiLanguage<'_>],
-        language_configs: &[MuiLanguageConfigNode],
-    ) -> Option<Vec<u8>> {
-        MuiRegistryBlob::new(generation, languages, language_configs)?.encode()
-    }
+    mod windows_x64 {
+        use super::*;
 
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    unsafe extern "system" {
-        fn NtGetNlsSectionPtr(
-            section_type: u32,
-            section_data: u32,
-            context_data: *mut core::ffi::c_void,
-            section_pointer: *mut *const u8,
-            section_size: *mut u32,
-        ) -> i32;
+        fn mui_registry_data(
+            generation: u32,
+            languages: &[MuiLanguage<'_>],
+            language_configs: &[MuiLanguageConfigNode],
+        ) -> Option<Vec<u8>> {
+            MuiRegistryBlob::new(generation, languages, language_configs)?.encode()
+        }
 
-        fn NtInitializeNlsFiles(
-            base_address: *mut *const u8,
-            default_locale_id: *mut u32,
-            default_casing_table_size: *mut i64,
-        ) -> i32;
+        fn read_mui_values<T: FromBytes>(data: &[u8], offset: usize, count: usize) -> Vec<T> {
+            let value_size = size_of::<T>();
+            let byte_len = count.checked_mul(value_size).unwrap();
+            let end = offset.checked_add(byte_len).unwrap();
+            let mut data = &data[offset..end];
+            let mut values = Vec::with_capacity(count);
+            for _ in 0..count {
+                let (bytes, remaining) = data.split_at(value_size);
+                values.push(T::read_from_bytes(bytes).unwrap());
+                data = remaining;
+            }
+            values
+        }
 
-        fn NtGetMUIRegistryInfo(flags: u32, data_size: *mut u32, data: *mut u8) -> i32;
+        unsafe extern "system" {
+            fn NtGetNlsSectionPtr(
+                section_type: u32,
+                section_data: u32,
+                context_data: *mut core::ffi::c_void,
+                section_pointer: *mut *const u8,
+                section_size: *mut u32,
+            ) -> i32;
 
-        fn NtQueryDefaultLocale(user_profile: u8, default_locale_id: *mut u32) -> i32;
+            fn NtInitializeNlsFiles(
+                base_address: *mut *const u8,
+                default_locale_id: *mut u32,
+                default_casing_table_size: *mut i64,
+            ) -> i32;
 
-        fn NtQueryDefaultUILanguage(default_ui_language: *mut u16) -> i32;
+            fn NtGetMUIRegistryInfo(flags: u32, data_size: *mut u32, data: *mut u8) -> i32;
 
-        fn NtQueryInstallUILanguage(install_ui_language: *mut u16) -> i32;
-    }
+            fn NtQueryDefaultLocale(user_profile: u8, default_locale_id: *mut u32) -> i32;
 
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    fn host_system32_file_bytes(file_name: &str) -> std::vec::Vec<u8> {
-        std::fs::read(
-            std::path::PathBuf::from(
-                std::env::var_os("SystemRoot")
-                    .unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows")),
+            fn NtQueryDefaultUILanguage(default_ui_language: *mut u16) -> i32;
+
+            fn NtQueryInstallUILanguage(install_ui_language: *mut u16) -> i32;
+        }
+
+        fn host_system32_file_bytes(file_name: &str) -> std::vec::Vec<u8> {
+            std::fs::read(
+                std::path::PathBuf::from(
+                    std::env::var_os("SystemRoot")
+                        .unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows")),
+                )
+                .join("System32")
+                .join(file_name),
             )
-            .join("System32")
-            .join(file_name),
-        )
-        .unwrap()
-    }
+            .unwrap()
+        }
 
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    fn host_status(status: i32) -> NtStatus {
-        NtStatus::from_raw(u32::from_ne_bytes(status.to_ne_bytes()))
-    }
+        fn host_status(status: i32) -> NtStatus {
+            NtStatus::from_raw(u32::from_ne_bytes(status.to_ne_bytes()))
+        }
 
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    #[test]
-    fn nt_get_mui_registry_info_matches_host_query_contract_and_layout() {
-        let mut host_size = 0u32;
-        // SAFETY: This is the host's documented size-query shape: a writable size pointer and a
-        // null data buffer.
-        let status = unsafe {
-            NtGetMUIRegistryInfo(0, core::ptr::addr_of_mut!(host_size), core::ptr::null_mut())
-        };
-        assert_eq!(host_status(status), NtStatus::SUCCESS);
-        assert_eq!(
-            host_size as usize,
-            mui_registry_data(0, &[EN_US_MUI_LANGUAGE], &[])
+        #[test]
+        fn nt_get_mui_registry_info_matches_host_query_contract_and_layout() {
+            let mut host_size = 0u32;
+            // SAFETY: This is the host's documented size-query shape: a writable size pointer and a
+            // null data buffer.
+            let status = unsafe {
+                NtGetMUIRegistryInfo(0, core::ptr::addr_of_mut!(host_size), core::ptr::null_mut())
+            };
+            assert_eq!(host_status(status), NtStatus::SUCCESS);
+            assert!(host_size as usize >= size_of::<MuiRegistryInfo>());
+
+            let mut host_data = vec![0; host_size as usize];
+            // SAFETY: `host_data` is a writable buffer of the size returned by the host query.
+            let status = unsafe {
+                NtGetMUIRegistryInfo(
+                    0,
+                    core::ptr::addr_of_mut!(host_size),
+                    host_data.as_mut_ptr(),
+                )
+            };
+            assert_eq!(host_status(status), NtStatus::SUCCESS);
+            let host_registry_info = MuiRegistryInfo::read_from_prefix(&host_data).unwrap().0;
+            assert_eq!(
+                host_registry_info.installed_offset,
+                u64::try_from(size_of::<MuiRegistryInfo>()).unwrap(),
+            );
+            let installed_offset = usize::try_from(host_registry_info.installed_offset).unwrap();
+            let installed = MuiLanguages::read_from_prefix(&host_data[installed_offset..])
                 .unwrap()
-                .len()
-        );
+                .0;
+            assert!(installed.languages > 0);
+            assert!(installed.languages <= installed.max_languages);
+            let installed_end = installed_offset
+                .checked_add(installed.total_size as usize)
+                .unwrap();
+            assert!(installed_end <= host_data.len());
 
-        let mut host_data = vec![0; host_size as usize];
-        // SAFETY: `host_data` is a writable buffer of the size returned by the host query.
-        let status = unsafe {
-            NtGetMUIRegistryInfo(
-                0,
-                core::ptr::addr_of_mut!(host_size),
-                host_data.as_mut_ptr(),
-            )
-        };
-        assert_eq!(host_status(status), NtStatus::SUCCESS);
-        let host_registry_info = MuiRegistryInfo::read_from_prefix(&host_data).unwrap().0;
-        assert_eq!(
-            host_registry_info.installed_offset,
-            u64::try_from(size_of::<MuiRegistryInfo>()).unwrap(),
-        );
-        let expected =
-            mui_registry_data(host_registry_info.generation, &[EN_US_MUI_LANGUAGE], &[]).unwrap();
-        assert_eq!(host_data, expected);
+            let strings_offset = usize::try_from(host_registry_info.strings_offset).unwrap();
+            let strings = MuiStringPool::read_from_prefix(&host_data[strings_offset..])
+                .unwrap()
+                .0;
+            assert!(strings.strings > 0);
+            assert!(strings.strings <= strings.max_strings);
+            assert!(strings.characters <= strings.max_characters);
+            let strings_end = strings_offset
+                .checked_add(strings.total_size as usize)
+                .unwrap();
+            assert!(strings_end <= host_data.len());
+
+            let language_info = read_mui_values::<MuiLanguageInfo>(
+                &host_data,
+                installed_offset + size_of::<MuiLanguages>(),
+                usize::from(installed.languages),
+            );
+            let string_indices = read_mui_values::<i16>(
+                &host_data,
+                strings_offset + size_of::<MuiStringPool>(),
+                usize::from(strings.max_strings),
+            );
+            let string_pool_offset = strings_offset
+                + size_of::<MuiStringPool>()
+                + usize::from(strings.max_strings) * size_of::<i16>();
+            let string_pool = read_mui_values::<u16>(
+                &host_data,
+                string_pool_offset,
+                usize::from(strings.max_characters),
+            );
+            let language_names = language_info
+                .iter()
+                .map(|info| {
+                    let index = usize::try_from(info.language_name_index).unwrap();
+                    let start = usize::try_from(string_indices[index]).unwrap();
+                    let end = start
+                        + string_pool[start..]
+                            .iter()
+                            .position(|&character| character == 0)
+                            .unwrap();
+                    String::from_utf16(&string_pool[start..end]).unwrap()
+                })
+                .collect::<Vec<_>>();
+            let languages = language_info
+                .iter()
+                .zip(&language_names)
+                .map(|(&info, name)| MuiLanguage { info, name })
+                .collect::<Vec<_>>();
+
+            let machine_config_offset =
+                usize::try_from(host_registry_info.machine_config_offset).unwrap();
+            let machine_config =
+                MuiLanguageConfigList::read_from_prefix(&host_data[machine_config_offset..])
+                    .unwrap()
+                    .0;
+            assert!(machine_config.languages <= machine_config.max_languages);
+            let language_configs = read_mui_values::<MuiLanguageConfigNode>(
+                &host_data,
+                machine_config_offset + size_of::<MuiLanguageConfigList>(),
+                usize::from(machine_config.languages),
+            );
+
+            let installed_sku_end = usize::try_from(host_registry_info.installed_sku_offset)
+                .unwrap()
+                .checked_add(host_registry_info.installed_sku_size as usize)
+                .unwrap();
+            assert!(installed_sku_end <= host_data.len());
+
+            let rebuilt =
+                mui_registry_data(host_registry_info.generation, &languages, &language_configs)
+                    .unwrap();
+            assert_eq!(host_data, rebuilt);
+        }
+
+        #[test]
+        fn nt_get_nls_section_ptr_matches_host_section_content() {
+            let host_file_bytes = host_system32_file_bytes("c_1252.nls");
+            let task = crate::tests::test_task_with_nls_files(&[(
+                "/Windows/System32/c_1252.nls",
+                host_file_bytes.as_slice(),
+            )]);
+
+            let mut host_section_pointer = core::ptr::null::<u8>();
+            let mut host_section_size = 0u32;
+            // SAFETY: The pointers reference local output variables, and the section type/data
+            // pair is the same supported codepage section requested by normal Windows startup.
+            let status = unsafe {
+                NtGetNlsSectionPtr(
+                    NLS_SECTION_CODEPAGE,
+                    ANSI_CODE_PAGE,
+                    core::ptr::null_mut(),
+                    core::ptr::addr_of_mut!(host_section_pointer),
+                    core::ptr::addr_of_mut!(host_section_size),
+                )
+            };
+            assert_eq!(host_status(status), NtStatus::SUCCESS);
+            assert!(!host_section_pointer.is_null());
+
+            let mut section_pointer = 0usize;
+            let mut section_size = 0u32;
+            assert_eq!(
+                task.sys_nt_get_nls_section_ptr(
+                    NLS_SECTION_CODEPAGE,
+                    ANSI_CODE_PAGE,
+                    0,
+                    mut_ptr(&mut section_pointer),
+                    Some(mut_ptr(&mut section_size)),
+                ),
+                NtStatus::SUCCESS
+            );
+
+            let host_section_len = usize::try_from(host_section_size).unwrap();
+            assert_eq!(section_size, host_section_size);
+            let mapped = <TestPlatform as RawPointerProvider>::RawConstPointer::<u8>::from_usize(
+                section_pointer,
+            );
+            // SAFETY: The host returned a non-null process-lifetime read-only NLS mapping.
+            let host_section =
+                unsafe { core::slice::from_raw_parts(host_section_pointer, host_section_len) };
+            assert_eq!(
+                mapped.to_owned_slice(host_section_len).unwrap().as_ref(),
+                host_section
+            );
+        }
+
+        #[test]
+        fn nt_initialize_nls_files_matches_host_outputs() {
+            let host_file_bytes = host_system32_file_bytes("locale.nls");
+            let task = crate::tests::test_task_with_nls_files(&[(
+                "/Windows/System32/locale.nls",
+                host_file_bytes.as_slice(),
+            )]);
+
+            let mut host_base_address = core::ptr::null::<u8>();
+            let mut host_locale_id = 0x1234_5678u32;
+            let mut host_casing_table_size = 0x1234_5678i64;
+            // SAFETY: The pointers mirror the normal process-startup call shape; the returned
+            // mapping is process-lifetime read-only NLS data.
+            let status = unsafe {
+                NtInitializeNlsFiles(
+                    core::ptr::addr_of_mut!(host_base_address),
+                    core::ptr::addr_of_mut!(host_locale_id),
+                    core::ptr::addr_of_mut!(host_casing_table_size),
+                )
+            };
+            assert_eq!(host_status(status), NtStatus::SUCCESS);
+            assert!(!host_base_address.is_null());
+
+            task.process
+                .system_lcid
+                .store(host_locale_id, core::sync::atomic::Ordering::Relaxed);
+            let mut base_address = 0usize;
+            let mut locale_id = 0x1234_5678u32;
+            let mut casing_table_size = 0x1234_5678i64;
+            assert_eq!(
+                task.sys_nt_initialize_nls_files(
+                    mut_ptr(&mut base_address),
+                    mut_ptr(&mut locale_id),
+                    mut_ptr(&mut casing_table_size),
+                ),
+                NtStatus::SUCCESS
+            );
+
+            assert_eq!(locale_id, host_locale_id);
+            assert_eq!(casing_table_size, host_casing_table_size);
+            let mapped = <TestPlatform as RawPointerProvider>::RawConstPointer::<u8>::from_usize(
+                base_address,
+            );
+            // SAFETY: The host returned a non-null process-lifetime NLS mapping, and the fixture
+            // file length bounds the comparison.
+            let host_section =
+                unsafe { core::slice::from_raw_parts(host_base_address, host_file_bytes.len()) };
+            assert_eq!(
+                mapped
+                    .to_owned_slice(host_file_bytes.len())
+                    .unwrap()
+                    .as_ref(),
+                host_section
+            );
+        }
+
+        #[test]
+        fn locale_query_syscalls_match_host_outputs() {
+            let task = crate::tests::test_task();
+            let mut host_system_locale = 0u32;
+            let mut host_user_locale = 0u32;
+            let mut host_user_ui_language = 0u16;
+            let mut host_install_ui_language = 0u16;
+
+            // SAFETY: The pointers reference local output variables for read-only host queries.
+            unsafe {
+                assert_eq!(
+                    host_status(NtQueryDefaultLocale(
+                        0,
+                        core::ptr::addr_of_mut!(host_system_locale),
+                    )),
+                    NtStatus::SUCCESS
+                );
+                assert_eq!(
+                    host_status(NtQueryDefaultLocale(
+                        1,
+                        core::ptr::addr_of_mut!(host_user_locale),
+                    )),
+                    NtStatus::SUCCESS
+                );
+                assert_eq!(
+                    host_status(NtQueryDefaultUILanguage(core::ptr::addr_of_mut!(
+                        host_user_ui_language
+                    ))),
+                    NtStatus::SUCCESS
+                );
+                assert_eq!(
+                    host_status(NtQueryInstallUILanguage(core::ptr::addr_of_mut!(
+                        host_install_ui_language
+                    ))),
+                    NtStatus::SUCCESS
+                );
+            }
+
+            task.process
+                .system_lcid
+                .store(host_system_locale, core::sync::atomic::Ordering::Relaxed);
+            task.process
+                .user_lcid
+                .store(host_user_locale, core::sync::atomic::Ordering::Relaxed);
+            task.process.user_ui_language.store(
+                u32::from(host_user_ui_language),
+                core::sync::atomic::Ordering::Relaxed,
+            );
+
+            let mut locale_id = 0u32;
+            let mut language = 0u16;
+            assert_eq!(
+                task.sys_nt_query_default_locale(0, mut_ptr(&mut locale_id)),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(locale_id, host_system_locale);
+            assert_eq!(
+                task.sys_nt_query_default_locale(1, mut_ptr(&mut locale_id)),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(locale_id, host_user_locale);
+            assert_eq!(
+                task.sys_nt_query_default_ui_language(mut_ptr(&mut language)),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(language, host_user_ui_language);
+            task.process.system_lcid.store(
+                u32::from(host_install_ui_language),
+                core::sync::atomic::Ordering::Relaxed,
+            );
+            assert_eq!(
+                task.sys_nt_query_install_ui_language(mut_ptr(&mut language)),
+                NtStatus::SUCCESS
+            );
+            assert_eq!(language, host_install_ui_language);
+        }
     }
 
     #[test]
@@ -1196,59 +1460,6 @@ mod tests {
             NtStatus::SUCCESS
         );
         assert_eq!(second_section_pointer, section_pointer);
-    }
-
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    #[test]
-    fn nt_get_nls_section_ptr_matches_host_section_content() {
-        let host_file_bytes = host_system32_file_bytes("c_1252.nls");
-        let task = crate::tests::test_task_with_nls_files(&[(
-            "/Windows/System32/c_1252.nls",
-            host_file_bytes.as_slice(),
-        )]);
-
-        let mut host_section_pointer = core::ptr::null::<u8>();
-        let mut host_section_size = 0u32;
-        // SAFETY: The pointers reference local output variables, and the section type/data pair is
-        // the same supported codepage section requested by normal Windows process startup.
-        let status = unsafe {
-            NtGetNlsSectionPtr(
-                NLS_SECTION_CODEPAGE,
-                ANSI_CODE_PAGE,
-                core::ptr::null_mut(),
-                core::ptr::addr_of_mut!(host_section_pointer),
-                core::ptr::addr_of_mut!(host_section_size),
-            )
-        };
-        assert_eq!(host_status(status), NtStatus::SUCCESS);
-        assert!(!host_section_pointer.is_null());
-
-        let mut section_pointer = 0usize;
-        let mut section_size = 0u32;
-        assert_eq!(
-            task.sys_nt_get_nls_section_ptr(
-                NLS_SECTION_CODEPAGE,
-                ANSI_CODE_PAGE,
-                0,
-                mut_ptr(&mut section_pointer),
-                Some(mut_ptr(&mut section_size)),
-            ),
-            NtStatus::SUCCESS
-        );
-
-        let host_section_len = usize::try_from(host_section_size).unwrap();
-        assert_eq!(section_size, host_section_size);
-        let mapped = <TestPlatform as RawPointerProvider>::RawConstPointer::<u8>::from_usize(
-            section_pointer,
-        );
-        // SAFETY: A successful host NtGetNlsSectionPtr returned a non-null pointer and size for a
-        // process-lifetime read-only NLS mapping.
-        let host_section =
-            unsafe { core::slice::from_raw_parts(host_section_pointer, host_section_len) };
-        assert_eq!(
-            mapped.to_owned_slice(host_section_len).unwrap().as_ref(),
-            host_section
-        );
     }
 
     #[test]
@@ -1337,140 +1548,6 @@ mod tests {
             mapped.to_owned_slice(locale_bytes.len()).unwrap().as_ref(),
             locale_bytes.as_slice()
         );
-    }
-
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    #[test]
-    fn nt_initialize_nls_files_matches_host_outputs() {
-        let host_file_bytes = host_system32_file_bytes("locale.nls");
-        let task = crate::tests::test_task_with_nls_files(&[(
-            "/Windows/System32/locale.nls",
-            host_file_bytes.as_slice(),
-        )]);
-
-        let mut host_base_address = core::ptr::null::<u8>();
-        let mut host_locale_id = 0x1234_5678u32;
-        let mut host_casing_table_size = 0x1234_5678i64;
-        // SAFETY: The pointers reference local output variables and mirror the normal process
-        // startup call shape; the returned mapping is process-lifetime read-only NLS data.
-        let status = unsafe {
-            NtInitializeNlsFiles(
-                core::ptr::addr_of_mut!(host_base_address),
-                core::ptr::addr_of_mut!(host_locale_id),
-                core::ptr::addr_of_mut!(host_casing_table_size),
-            )
-        };
-        assert_eq!(host_status(status), NtStatus::SUCCESS);
-        assert!(!host_base_address.is_null());
-
-        task.process
-            .system_lcid
-            .store(host_locale_id, core::sync::atomic::Ordering::Relaxed);
-        let mut base_address = 0usize;
-        let mut locale_id = 0x1234_5678u32;
-        let mut casing_table_size = 0x1234_5678i64;
-        assert_eq!(
-            task.sys_nt_initialize_nls_files(
-                mut_ptr(&mut base_address),
-                mut_ptr(&mut locale_id),
-                mut_ptr(&mut casing_table_size),
-            ),
-            NtStatus::SUCCESS
-        );
-
-        assert_eq!(locale_id, host_locale_id);
-        assert_eq!(casing_table_size, host_casing_table_size);
-        let mapped =
-            <TestPlatform as RawPointerProvider>::RawConstPointer::<u8>::from_usize(base_address);
-        // SAFETY: A successful host NtInitializeNlsFiles returned a non-null process-lifetime NLS
-        // mapping, and the fixture file length bounds the comparison.
-        let host_section =
-            unsafe { core::slice::from_raw_parts(host_base_address, host_file_bytes.len()) };
-        assert_eq!(
-            mapped
-                .to_owned_slice(host_file_bytes.len())
-                .unwrap()
-                .as_ref(),
-            host_section
-        );
-    }
-
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    #[test]
-    fn locale_query_syscalls_match_host_outputs() {
-        let task = crate::tests::test_task();
-        let mut host_system_locale = 0u32;
-        let mut host_user_locale = 0u32;
-        let mut host_user_ui_language = 0u16;
-        let mut host_install_ui_language = 0u16;
-
-        // SAFETY: The pointers reference local output variables for read-only host locale queries.
-        unsafe {
-            assert_eq!(
-                host_status(NtQueryDefaultLocale(
-                    0,
-                    core::ptr::addr_of_mut!(host_system_locale),
-                )),
-                NtStatus::SUCCESS
-            );
-            assert_eq!(
-                host_status(NtQueryDefaultLocale(
-                    1,
-                    core::ptr::addr_of_mut!(host_user_locale),
-                )),
-                NtStatus::SUCCESS
-            );
-            assert_eq!(
-                host_status(NtQueryDefaultUILanguage(core::ptr::addr_of_mut!(
-                    host_user_ui_language
-                ))),
-                NtStatus::SUCCESS
-            );
-            assert_eq!(
-                host_status(NtQueryInstallUILanguage(core::ptr::addr_of_mut!(
-                    host_install_ui_language
-                ))),
-                NtStatus::SUCCESS
-            );
-        }
-
-        task.process
-            .system_lcid
-            .store(host_system_locale, core::sync::atomic::Ordering::Relaxed);
-        task.process
-            .user_lcid
-            .store(host_user_locale, core::sync::atomic::Ordering::Relaxed);
-        task.process.user_ui_language.store(
-            u32::from(host_user_ui_language),
-            core::sync::atomic::Ordering::Relaxed,
-        );
-
-        let mut locale_id = 0u32;
-        let mut language = 0u16;
-        assert_eq!(
-            task.sys_nt_query_default_locale(0, mut_ptr(&mut locale_id)),
-            NtStatus::SUCCESS
-        );
-        assert_eq!(locale_id, host_system_locale);
-        assert_eq!(
-            task.sys_nt_query_default_locale(1, mut_ptr(&mut locale_id)),
-            NtStatus::SUCCESS
-        );
-        assert_eq!(locale_id, host_user_locale);
-        assert_eq!(
-            task.sys_nt_query_default_ui_language(mut_ptr(&mut language)),
-            NtStatus::SUCCESS
-        );
-        assert_eq!(language, host_user_ui_language);
-        task.process.system_lcid.store(
-            u32::from(host_install_ui_language),
-            core::sync::atomic::Ordering::Relaxed,
-        );
-        assert_eq!(
-            task.sys_nt_query_install_ui_language(mut_ptr(&mut language)),
-            NtStatus::SUCCESS
-        );
-        assert_eq!(language, host_install_ui_language);
     }
 
     #[test]

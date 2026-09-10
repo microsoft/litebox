@@ -2321,6 +2321,17 @@ mod tests {
     fn process_parameters_include_argv_and_environment() {
         let created = created_process_environment_snapshot();
 
+        assert_eq!(
+            created
+                .process_parameters
+                .current_directory
+                .dos_path
+                .buffer
+                .checked_sub(created.peb.process_parameters),
+            Some(size_of::<RtlUserProcessParameters>())
+        );
+        assert_eq!(created.process_parameters.attribute_list, 0);
+
         // `RTL_USER_PROCESS_PARAMETERS.CommandLine` stores the original command line for
         // `CommandLineToArgvW`, and the environment is a sorted UTF-16 `name=value\0...\0\0`
         // block as documented for `GetEnvironmentStringsW`.
