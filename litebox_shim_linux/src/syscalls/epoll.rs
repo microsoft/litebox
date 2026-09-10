@@ -43,7 +43,7 @@ bitflags::bitflags! {
 pub(crate) enum EpollDescriptor<Platform: ShimPlatform> {
     Eventfd(Arc<TypedFd<super::eventfd::EventfdSubsystem<Platform>>>),
     Epoll(Arc<TypedFd<super::epoll::EpollSubsystem<Platform>>>),
-    File(Arc<crate::FileFd<Platform>>),
+    File(Arc<crate::FileFd>),
     Socket(Arc<super::net::SocketFd<Platform>>),
     Pipe(Arc<litebox::pipes::PipeFd<Platform>>),
     Unix(Arc<TypedFd<crate::syscalls::unix::UnixSocketSubsystem<Platform>>>),
@@ -52,7 +52,7 @@ pub(crate) enum EpollDescriptor<Platform: ShimPlatform> {
 impl<Platform: ShimPlatform> EpollDescriptor<Platform> {
     pub fn try_from(files: &FilesState<Platform>, raw_fd: usize) -> Result<Self, Errno> {
         let rds = files.raw_descriptor_store.read();
-        if let Ok(fd) = rds.fd_from_raw_integer::<litebox::fs::File<Platform>>(raw_fd) {
+        if let Ok(fd) = rds.fd_from_raw_integer::<litebox::fs::BrokerFile>(raw_fd) {
             return Ok(EpollDescriptor::File(fd));
         }
         if let Ok(fd) = rds.fd_from_raw_integer::<crate::Network<Platform>>(raw_fd) {
@@ -81,7 +81,7 @@ impl<Platform: ShimPlatform> EpollDescriptor<Platform> {
 enum DescriptorRef<Platform: ShimPlatform> {
     Eventfd(Weak<TypedFd<super::eventfd::EventfdSubsystem<Platform>>>),
     Epoll(Weak<TypedFd<super::epoll::EpollSubsystem<Platform>>>),
-    File(Weak<crate::FileFd<Platform>>),
+    File(Weak<crate::FileFd>),
     Socket(Weak<super::net::SocketFd<Platform>>),
     Pipe(Weak<litebox::pipes::PipeFd<Platform>>),
     Unix(Weak<TypedFd<crate::syscalls::unix::UnixSocketSubsystem<Platform>>>),

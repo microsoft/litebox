@@ -450,10 +450,10 @@ struct FileStandardInformation {
 pub(crate) struct FileObjectSubsystem<Platform>(PhantomData<fn(Platform)>);
 
 impl<Platform: crate::ShimPlatform> FdEnabledSubsystem for FileObjectSubsystem<Platform> {
-    type Entry = FileObject<Platform>;
+    type Entry = FileObject;
 }
 
-impl<Platform: crate::ShimPlatform> FdEnabledSubsystemEntry for FileObject<Platform> {}
+impl FdEnabledSubsystemEntry for FileObject {}
 
 impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem
     for FileObjectSubsystem<Platform>
@@ -479,9 +479,9 @@ impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem
     }
 }
 
-pub(crate) struct FileObject<Platform: crate::ShimPlatform> {
+pub(crate) struct FileObject {
     path: String,
-    backing: FileObjectBacking<Platform>,
+    backing: FileObjectBacking,
     create_time_access: FileAccess,
     share_access: FileShareAccess,
     create_options: FileCreateOptions,
@@ -496,15 +496,15 @@ struct DirectoryQueryState {
     entries: Vec<DirectoryEntry>,
 }
 
-enum FileObjectBacking<Platform: crate::ShimPlatform> {
+enum FileObjectBacking {
     Filesystem {
-        fd: litebox::fs::FileFd<Platform>,
+        fd: litebox::fs::FileFd,
         is_directory: bool,
     },
     CondrvStream {
         object: CondrvObject,
         stream_object: Arc<CondrvStreamObject>,
-        fd: litebox::fs::FileFd<Platform>,
+        fd: litebox::fs::FileFd,
     },
     CondrvControl(CondrvObject),
     /// A handle to `\Device\KsecDD`.
@@ -541,7 +541,7 @@ enum FileSharingIdentity<'a> {
 }
 
 impl FileSharingIdentity<'_> {
-    fn matches<Platform: crate::ShimPlatform>(self, file: &FileObject<Platform>) -> bool {
+    fn matches(self, file: &FileObject) -> bool {
         match self {
             Self::Path(path) => file.condrv_stream_object_id().is_none() && file.path == path,
             Self::CondrvObject(object_id) => file.condrv_stream_object_id() == Some(object_id),
@@ -549,7 +549,7 @@ impl FileSharingIdentity<'_> {
     }
 }
 
-impl<Platform: crate::ShimPlatform> FileObject<Platform> {
+impl FileObject {
     fn condrv_object(&self) -> Option<CondrvObject> {
         match self.backing {
             FileObjectBacking::CondrvStream { object, .. }
@@ -876,7 +876,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         })
     }
 
-    fn insert_file_handle(&self, file: FileObject<Platform>) -> Result<Handle, NtStatus> {
+    fn insert_file_handle(&self, file: FileObject) -> Result<Handle, NtStatus> {
         let granted_access = file.create_time_access.bits();
         self.insert_typed_handle::<FileObjectSubsystem<Platform>>(file, granted_access, |file| {
             self.close_file(file);
@@ -889,7 +889,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         });
     }
 
-    pub(crate) fn close_file(&self, file: FileObject<Platform>) {
+    pub(crate) fn close_file(&self, file: FileObject) {
         match file.backing {
             FileObjectBacking::Filesystem { fd, is_directory } => {
                 let _ = self.fs.close_file(&fd);
@@ -1877,7 +1877,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
 
     fn query_directory(
         &self,
-        file: &mut FileObject<Platform>,
+        file: &mut FileObject,
         supplied_pattern: Option<String>,
         information_class: FileInformationClass,
         flags: DirectoryQueryFlags,
@@ -1966,10 +1966,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         Ok((NtStatus::SUCCESS, output))
     }
 
-    fn read_directory_entries(
-        &self,
-        file: &FileObject<Platform>,
-    ) -> Result<Vec<DirectoryEntry>, NtStatus> {
+    fn read_directory_entries(&self, file: &FileObject) -> Result<Vec<DirectoryEntry>, NtStatus> {
         let FileObjectBacking::Filesystem { fd, is_directory } = &file.backing else {
             return Err(NtStatus::INVALID_PARAMETER);
         };
@@ -2205,7 +2202,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         create_disposition: CreateDisposition,
         create_options: FileCreateOptions,
         file_attributes: u32,
-    ) -> Result<(FileObject<Platform>, FileCreateInformation), NtStatus> {
+    ) -> Result<(FileObject, FileCreateInformation), NtStatus> {
         self.check_file_sharing(
             FileSharingIdentity::Path(&path),
             desired_access,
@@ -2255,7 +2252,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         create_options: FileCreateOptions,
         ea_buffer: Option<ConstPtr<Platform, u8>>,
         ea_length: u32,
-    ) -> Result<(FileObject<Platform>, FileCreateInformation), NtStatus> {
+    ) -> Result<(FileObject, FileCreateInformation), NtStatus> {
         if object == CondrvObject::Connect {
             condrv::validate_connect_server_ea::<Platform>(ea_buffer, ea_length)?;
         } else if ea_buffer.is_some() || ea_length != 0 {
@@ -2327,7 +2324,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         desired_access: FileAccess,
         share_access: FileShareAccess,
         create_options: FileCreateOptions,
-    ) -> Result<(FileObject<Platform>, FileCreateInformation), NtStatus> {
+    ) -> Result<(FileObject, FileCreateInformation), NtStatus> {
         if create_options.contains(FileCreateOptions::DIRECTORY_FILE) {
             return Err(NtStatus::NOT_A_DIRECTORY);
         }
@@ -2351,7 +2348,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         create_disposition: CreateDisposition,
         create_options: FileCreateOptions,
         mode: Mode,
-    ) -> Result<(litebox::fs::FileFd<Platform>, bool, FileCreateInformation), NtStatus> {
+    ) -> Result<(litebox::fs::FileFd, bool, FileCreateInformation), NtStatus> {
         let existed_before_open = self.fs.path_file_status(&self.fs_context, path).is_ok();
         if create_disposition == CreateDisposition::Supersede
             && existed_before_open
@@ -2393,7 +2390,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         create_disposition: CreateDisposition,
         create_options: FileCreateOptions,
         file_attributes: u32,
-    ) -> Result<(FileObject<Platform>, FileCreateInformation), NtStatus> {
+    ) -> Result<(FileObject, FileCreateInformation), NtStatus> {
         if matches!(
             create_disposition,
             CreateDisposition::Supersede

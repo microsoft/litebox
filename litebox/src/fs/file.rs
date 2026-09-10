@@ -111,11 +111,8 @@ bitflags! {
     }
 }
 
-/// Type marker for file descriptors backed by broker-owned files.
-pub struct File<Platform: sync::RawSyncPrimitivesProvider>(core::marker::PhantomData<fn(Platform)>);
-
 impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
-    fn broker_file(&self, fd: &FileFd<Platform>) -> Option<Arc<BrokerFile>> {
+    fn broker_file(&self, fd: &FileFd) -> Option<Arc<BrokerFile>> {
         self.descriptor_table()
             .with_entry(fd, |entry| Arc::clone(&entry.entry))
     }
@@ -133,7 +130,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
         path: impl Arg,
         flags: OFlags,
         mode: Mode,
-    ) -> Result<FileFd<Platform>, OpenError> {
+    ) -> Result<FileFd, OpenError> {
         let path = Self::broker_path(context, path)?;
         let (access, flags) = file_open_options(flags)?;
         let broker = self.broker_control().ok_or(OpenError::Io)?;
@@ -155,7 +152,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
     /// Close the file at `fd`.
     ///
     /// Future operations on the `fd` will start to return `ClosedFd` errors.
-    pub fn close_file(&self, fd: &FileFd<Platform>) -> Result<(), CloseError> {
+    pub fn close_file(&self, fd: &FileFd) -> Result<(), CloseError> {
         let mut descriptors = self.descriptor_table_mut();
         let removed = descriptors.remove(fd);
         drop(descriptors);
@@ -166,7 +163,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
     /// Read from a file descriptor at `offset` into a buffer.
     pub fn read_file(
         &self,
-        fd: &FileFd<Platform>,
+        fd: &FileFd,
         buf: &mut [u8],
         offset: Option<usize>,
     ) -> Result<usize, ReadError> {
@@ -187,7 +184,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
     /// Write from a buffer to a file descriptor at `offset`.
     pub fn write_file(
         &self,
-        fd: &FileFd<Platform>,
+        fd: &FileFd,
         buf: &[u8],
         offset: Option<usize>,
     ) -> Result<usize, WriteError> {
@@ -208,7 +205,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
     /// Reposition the read/write file offset.
     pub fn seek_file(
         &self,
-        fd: &FileFd<Platform>,
+        fd: &FileFd,
         offset: isize,
         whence: SeekWhence,
     ) -> Result<usize, SeekError> {
@@ -225,7 +222,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
     /// Truncate the file to the specified length.
     pub fn truncate_file(
         &self,
-        fd: &FileFd<Platform>,
+        fd: &FileFd,
         length: usize,
         reset_offset: bool,
     ) -> Result<(), TruncateError> {
@@ -309,7 +306,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
     /// Read directory entries from a directory file descriptor.
     pub fn read_file_directory(
         &self,
-        fd: &FileFd<Platform>,
+        fd: &FileFd,
     ) -> Result<Vec<FileDirectoryEntry>, ReadDirError> {
         let file = self.broker_file(fd).ok_or(ReadDirError::ClosedFd)?;
         file.broker
@@ -333,7 +330,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
     }
 
     /// Equivalent to [`Self::path_file_status`], but on an open `fd`.
-    pub fn file_status(&self, fd: &FileFd<Platform>) -> Result<FileStatus, FileStatusError> {
+    pub fn file_status(&self, fd: &FileFd) -> Result<FileStatus, FileStatusError> {
         let file = self.broker_file(fd).ok_or(FileStatusError::ClosedFd)?;
         file.broker
             .handle_file_status(file.handle)
@@ -344,7 +341,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
     }
 
     /// Get static backing data for a file, if available and supported.
-    pub fn get_static_file_backing_data(&self, fd: &FileFd<Platform>) -> Option<&'static [u8]> {
+    pub fn get_static_file_backing_data(&self, fd: &FileFd) -> Option<&'static [u8]> {
         let _ = self.broker_file(fd)?;
         None
     }
@@ -436,7 +433,11 @@ impl core::fmt::Display for ResolvedPath {
     }
 }
 
-struct BrokerFile {
+/// Guest-side reference to a broker-owned file and the subsystem type for [`FileFd`].
+///
+/// The broker object is closed when its last descriptor or in-flight operation releases its
+/// reference.
+pub struct BrokerFile {
     broker: Arc<dyn crate::broker::BrokerControl>,
     handle: ObjectHandle,
 }
@@ -641,8 +642,7 @@ fn file_status_error(error: FileError) -> FileStatusError {
 }
 
 crate::fd::enable_fds_for_subsystem! {
-    @ Platform: { sync::RawSyncPrimitivesProvider };
-    File<Platform>;
+    BrokerFile;
     Arc<BrokerFile>;
-    -> FileFd<Platform>;
+    -> FileFd;
 }

@@ -71,7 +71,7 @@ pub(crate) enum UnixSocketAddr {
 /// the socket file remains accessible. The file is automatically closed
 /// when this structure is dropped.
 enum UnixBoundSocketAddr<Platform: ShimPlatform> {
-    Path((String, FileFd<Platform>, litebox::LiteBox<Platform>)),
+    Path((String, FileFd, litebox::LiteBox<Platform>)),
     Abstract(Vec<u8>),
 }
 
