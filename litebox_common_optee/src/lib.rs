@@ -692,12 +692,31 @@ impl TeeUuid {
         Self::from_bytes(bytes)
     }
 
+    #[allow(clippy::missing_panics_doc)]
+    pub fn to_u64_array(self) -> [u64; 2] {
+        let bytes = self.to_bytes();
+        [
+            u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+            u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+        ]
+    }
+
     /// Converts the UUID to a 16-byte array with little-endian encoding.
     pub fn to_le_bytes(self) -> [u8; 16] {
         let mut bytes = [0u8; 16];
         bytes[0..4].copy_from_slice(&self.time_low.to_le_bytes());
         bytes[4..6].copy_from_slice(&self.time_mid.to_le_bytes());
         bytes[6..8].copy_from_slice(&self.time_hi_and_version.to_le_bytes());
+        bytes[8..16].copy_from_slice(&self.clock_seq_and_node);
+        bytes
+    }
+
+    /// Converts the UUID to a 16-byte array with big-endian encoding (RFC 4122 format).
+    pub fn to_bytes(self) -> [u8; 16] {
+        let mut bytes = [0u8; 16];
+        bytes[0..4].copy_from_slice(&self.time_low.to_be_bytes());
+        bytes[4..6].copy_from_slice(&self.time_mid.to_be_bytes());
+        bytes[6..8].copy_from_slice(&self.time_hi_and_version.to_be_bytes());
         bytes[8..16].copy_from_slice(&self.clock_seq_and_node);
         bytes
     }
@@ -1556,6 +1575,7 @@ const OPTEE_MSG_ATTR_TYPE_TMEM_INOUT: u8 = 0xb;
 /// Meta-parameter marker of the attribute word. Set on the `OpenSession`
 /// TA-UUID and client-identity params.
 const OPTEE_MSG_ATTR_META: u64 = 1 << 8;
+const OPTEE_MSG_ATTR_NONCONTIG: u64 = 1 << 9;
 
 #[non_exhaustive]
 #[derive(Debug, PartialEq, TryFromPrimitive)]
@@ -1604,7 +1624,7 @@ impl OpteeMsgAttr {
 
     /// Returns `true` when the noncontig bit (bit 9) is set.
     pub fn noncontig(&self) -> bool {
-        self.0 & (1 << 9) != 0
+        self.0 & OPTEE_MSG_ATTR_NONCONTIG != 0
     }
 }
 
@@ -2116,6 +2136,45 @@ impl OpteeRpcArgs {
         }
     }
 
+    /// Access a TMEM output parameter with exact direction and flag validation.
+    ///
+    /// The NONCONTIG flag is permitted because an SHM_ALLOC response may return
+    /// either contiguous memory or an OP-TEE page-list descriptor.
+    pub fn get_param_tmem_output(
+        &self,
+        index: usize,
+    ) -> Result<OpteeMsgParamTmem, OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            return Err(OpteeSmcReturnCode::ENotAvail);
+        }
+
+        let param = &self.params[index];
+        if param.attr.attr_type() != OpteeMsgAttrType::TmemOutput as u8
+            || param.attr.0 & !(u64::from(u8::MAX) | OPTEE_MSG_ATTR_NONCONTIG) != 0
+        {
+            return Err(OpteeSmcReturnCode::EBadCmd);
+        }
+        OpteeMsgParamTmem::read_from_bytes(&param.data).map_err(|_| OpteeSmcReturnCode::EBadCmd)
+    }
+
+    /// Access an RMEM output parameter with exact direction and flag validation.
+    pub fn get_param_rmem_output(
+        &self,
+        index: usize,
+    ) -> Result<OpteeMsgParamRmem, OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            return Err(OpteeSmcReturnCode::ENotAvail);
+        }
+
+        let param = &self.params[index];
+        if param.attr.attr_type() != OpteeMsgAttrType::RmemOutput as u8
+            || param.attr.0 & !u64::from(u8::MAX) != 0
+        {
+            return Err(OpteeSmcReturnCode::EBadCmd);
+        }
+        OpteeMsgParamRmem::read_from_bytes(&param.data).map_err(|_| OpteeSmcReturnCode::EBadCmd)
+    }
+
     /// Set a value parameter by index with bounds checking against `num_params`.
     pub fn set_param_value(
         &mut self,
@@ -2126,6 +2185,34 @@ impl OpteeRpcArgs {
             Err(OpteeSmcReturnCode::ENotAvail)
         } else {
             self.params[index].data.copy_from_slice(value.as_bytes());
+            Ok(())
+        }
+    }
+
+    /// Set a parameter's attribute type by index with bounds checking against `num_params`.
+    pub fn set_param_attr_type(
+        &mut self,
+        index: usize,
+        attr_type: OpteeMsgAttrType,
+    ) -> Result<(), OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            Err(OpteeSmcReturnCode::ENotAvail)
+        } else {
+            self.params[index].attr = OpteeMsgAttr(attr_type as u64);
+            Ok(())
+        }
+    }
+
+    /// Set an rmem parameter by index with bounds checking against `num_params`.
+    pub fn set_param_rmem(
+        &mut self,
+        index: usize,
+        rmem: OpteeMsgParamRmem,
+    ) -> Result<(), OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            Err(OpteeSmcReturnCode::ENotAvail)
+        } else {
+            self.params[index].data.copy_from_slice(rmem.as_bytes());
             Ok(())
         }
     }
@@ -2143,10 +2230,6 @@ impl OpteeRpcArgs {
             Ok(())
         }
     }
-
-    // Note: RPC does not use rmem params. Rmem requires pre-registered shared memory
-    // references from the normal-world driver, which is a main-messaging-path concept.
-    // RPC uses tmem for buffer references since OP-TEE provides physical addresses directly.
 }
 
 /// Serialize the params portion as raw bytes into `buf`.
@@ -2529,6 +2612,29 @@ mod tests {
         assert_eq!(
             uuid.clock_seq_and_node,
             [0xaf, 0x63, 0x00, 0x02, 0xa5, 0xd5, 0xc5, 0x1b]
+        );
+        assert_eq!(
+            uuid.to_u64_array(),
+            [0xe311f8e7_e0b34f38, 0x1bc5d5a5_020063af]
+        );
+        assert_eq!(TeeUuid::from_u64_array(uuid.to_u64_array()), uuid);
+    }
+
+    #[test]
+    fn test_tee_uuid_to_bytes() {
+        let uuid = TeeUuid {
+            time_low: 0x384f_b3e0,
+            time_mid: 0xe7f8,
+            time_hi_and_version: 0x11e3,
+            clock_seq_and_node: [0xaf, 0x63, 0x00, 0x02, 0xa5, 0xd5, 0xc5, 0x1b],
+        };
+
+        assert_eq!(
+            uuid.to_bytes(),
+            [
+                0x38, 0x4f, 0xb3, 0xe0, 0xe7, 0xf8, 0x11, 0xe3, 0xaf, 0x63, 0x00, 0x02, 0xa5, 0xd5,
+                0xc5, 0x1b,
+            ]
         );
     }
 
