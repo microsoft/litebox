@@ -281,21 +281,16 @@ impl<Platform: OpteeShimPlatform> GlobalState<Platform> {
         self.dynamic_ta_uuid_map.insert(*ta_uuid, ta_bin.into())
     }
 
-    /// Get the TA binary associated with the given TA UUID.
+    /// Get the cached TA binary associated with the given TA UUID.
     pub(crate) fn get_ta_bin(&self, ta_uuid: &TeeUuid) -> Option<Arc<[u8]>> {
-        if let Some(ta_bin) = self
-            .dynamic_ta_uuid_map
+        self.dynamic_ta_uuid_map
             .get(ta_uuid)
             .or_else(|| self.embedded_ta_uuid_map.get(ta_uuid))
-        {
-            Some(ta_bin)
-        } else {
-            let ta_bin = Self::rpc_get_ta_bin(ta_uuid)?;
-            if !self.store_ta_bin(ta_uuid, &ta_bin) {
-                return None;
-            }
-            Some(ta_bin)
-        }
+    }
+
+    /// Return whether a TA binary is cached for the given UUID.
+    pub(crate) fn contains_ta_bin(&self, ta_uuid: &TeeUuid) -> bool {
+        self.dynamic_ta_uuid_map.contains(ta_uuid) || self.embedded_ta_uuid_map.contains(ta_uuid)
     }
 
     /// Monotonic time elapsed since this instance was created, used as GP
@@ -316,11 +311,6 @@ impl<Platform: OpteeShimPlatform> GlobalState<Platform> {
     #[expect(dead_code)]
     pub(crate) fn remove_ta_bin(&self, ta_uuid: &TeeUuid) {
         let _ = self.dynamic_ta_uuid_map.remove(ta_uuid);
-    }
-
-    /// RPC to get the TA binary associated with the given TA UUID. Placeholder for now.
-    fn rpc_get_ta_bin(_ta_uuid: &TeeUuid) -> Option<Arc<[u8]>> {
-        None
     }
 }
 
@@ -450,7 +440,7 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
         self.0.embedded_ta_uuid_map.insert(*ta_uuid, ta_bin.into())
     }
 
-    /// Get the TA binary associated with the given TA UUID.
+    /// Get the cached TA binary associated with the given TA UUID.
     pub fn get_ta_bin(&self, ta_uuid: &TeeUuid) -> Option<Arc<[u8]>> {
         self.0.get_ta_bin(ta_uuid)
     }
@@ -469,6 +459,11 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
         unsafe {
             let _ = self.memory_manager().release_memory(release);
         }
+    }
+
+    /// Return whether a TA binary is cached for the given UUID.
+    pub fn contains_ta_bin(&self, ta_uuid: &TeeUuid) -> bool {
+        self.0.contains_ta_bin(ta_uuid)
     }
 }
 
@@ -1530,6 +1525,10 @@ impl TaUuidMap {
 
     pub(crate) fn get(&self, uuid: &TeeUuid) -> Option<Arc<[u8]>> {
         self.inner.read().get(uuid).map(|info| info.binary.clone())
+    }
+
+    pub(crate) fn contains(&self, uuid: &TeeUuid) -> bool {
+        self.inner.read().contains_key(uuid)
     }
 
     fn get_with_flags(&self, uuid: &TeeUuid) -> Option<(Arc<[u8]>, TaFlags)> {
