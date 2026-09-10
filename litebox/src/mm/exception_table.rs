@@ -34,6 +34,14 @@ macro_rules! ex_table_section {
     };
 }
 
+#[cfg(target_os = "macos")]
+macro_rules! ex_table_section {
+    () => {
+        // Regular data; retain entries even when the linker cannot see their users.
+        "__DATA,__ex_table,regular,no_dead_strip"
+    };
+}
+
 macro_rules! ex_table_entry {
     ($start:tt, $stop:tt, $recover:tt) => {
         concat!(
@@ -302,14 +310,17 @@ struct ExceptionTableEntry {
 
 /// Returns the exception table, found by linker-defined symbols marking the
 /// start and end of the section.
-#[cfg(any(target_os = "linux", target_os = "none"))]
+#[cfg(any(target_os = "linux", target_os = "none", target_os = "macos"))]
 fn exception_table() -> &'static [ExceptionTableEntry] {
     // SAFETY: the linker automatically defines these symbols when the section
     // is non-empty.
     unsafe extern "C" {
-        #[link_name = "__start_ex_table"]
+        // \x01 suppresses Mach-O's leading underscore.
+        #[cfg_attr(target_os = "macos", link_name = "\x01section$start$__DATA$__ex_table")]
+        #[cfg_attr(not(target_os = "macos"), link_name = "__start_ex_table")]
         static START_EX_TABLE: [ExceptionTableEntry; 0];
-        #[link_name = "__stop_ex_table"]
+        #[cfg_attr(target_os = "macos", link_name = "\x01section$end$__DATA$__ex_table")]
+        #[cfg_attr(not(target_os = "macos"), link_name = "__stop_ex_table")]
         static STOP_EX_TABLE: [ExceptionTableEntry; 0];
     }
 

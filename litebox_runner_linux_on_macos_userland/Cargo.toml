@@ -1,0 +1,20 @@
+[package]
+name = "litebox_runner_linux_on_macos_userland"
+version = "0.1.0"
+edition = "2024"
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+litebox = { path = "../litebox", version = "0.1.0" }
+litebox_common_linux = { path = "../litebox_common_linux", version = "0.1.0" }
+litebox_platform_macos_userland = { path = "../litebox_platform_macos_userland", version = "0.1.0" }
+litebox_shim_linux = { path = "../litebox_shim_linux", version = "0.1.0", default-features = false }
+litebox_util_log = { path = "../litebox_util_log", version = "0.1.0", features = ["backend_tracing"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

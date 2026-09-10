@@ -1148,7 +1148,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 .create_timer(litebox_common_linux::signal::Signal::SIGALRM)
             {
                 Ok(handle) => alarm.handle = Some(handle),
-                Err(litebox::platform::TimerCreationError::Unsupported) => {}
+                Err(litebox::platform::TimerCreationError::Unsupported) => {
+                    #[cfg(not(feature = "alarm_fallback"))]
+                    return Err(Errno::ENOSYS);
+                }
                 Err(_) => unimplemented!(),
             }
         }
@@ -1912,9 +1915,20 @@ mod tests {
         });
     }
 
+    #[test]
+    #[cfg(all(target_os = "macos", not(feature = "alarm_fallback")))]
+    fn unsupported_alarm_is_reported() {
+        let task = crate::syscalls::tests::init_platform();
+        assert_eq!(
+            task.sys_alarm(1),
+            Err(litebox_common_linux::errno::Errno::ENOSYS)
+        );
+    }
+
     /// After the alarm deadline passes, a blocking operation should be
     /// interrupted and SIGALRM should be pending.
     #[test]
+    #[cfg_attr(target_os = "macos", ignore = "requires interruptible host sleep")]
     fn test_alarm_fires_after_deadline() {
         use litebox_common_linux::{ClockId, TimerFlags, Timespec};
         use litebox_platform::time::{Instant as _, TimeProvider};
@@ -1975,6 +1989,7 @@ mod tests {
     /// Cancelling an alarm before it fires should prevent signal delivery
     /// even if a blocking operation runs past the original deadline.
     #[test]
+    #[cfg_attr(target_os = "macos", ignore = "requires platform timer support")]
     fn test_alarm_cancel_prevents_signal() {
         use litebox_common_linux::{ClockId, TimerFlags, Timespec};
 
@@ -2025,6 +2040,7 @@ mod tests {
             )
             .expect("block SIGUSR1 failed");
 
+            #[cfg(not(target_os = "macos"))]
             assert_eq!(task.sys_alarm(1).unwrap(), 0);
             task.sys_tkill(task.tid, Signal::SIGUSR1.as_i32())
                 .expect("tkill failed");
@@ -2043,6 +2059,7 @@ mod tests {
             .expect("unblock SIGUSR1 failed");
 
             assert_eq!(task.sys_pause(), Err(Errno::EINTR));
+            #[cfg(not(target_os = "macos"))]
             task.sys_alarm(0).unwrap();
 
             let pending = task.pending_signal_set();
@@ -2057,6 +2074,7 @@ mod tests {
     /// Setting alarm with SIG_IGN for SIGALRM: a blocking operation is still
     /// interrupted, but `process_signals` discards the signal.
     #[test]
+    #[cfg_attr(target_os = "macos", ignore = "requires platform timer support")]
     fn test_alarm_with_sigign() {
         use litebox_common_linux::signal::{SIG_IGN, SaFlags, SigAction, SigSet, Signal};
         use litebox_common_linux::{ClockId, TimerFlags, Timespec};
@@ -2112,6 +2130,8 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(target_os = "macos", ignore = "requires interruptible host sleep")]
+    #[cfg_attr(target_os = "macos", allow(unused_variables))]
     fn test_timer_delivers_correct_signal() {
         use litebox::platform::{TimerHandle as _, TimerProvider as _};
         use litebox_common_linux::signal::Signal;

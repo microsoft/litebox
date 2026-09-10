@@ -36,6 +36,10 @@ impl crate::platform::PageManagementProvider<PAGE_SIZE> for DummyVmemBackend {
     const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000; // (1 << 47) - PAGE_SIZE;
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     const TASK_ADDR_MAX: usize = 0xFFFF_FFFF_F000; // 48-bit VA space
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    const TASK_ADDR_MIN: usize = 0x1_0000; // Vmem unit-test bound
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    const TASK_ADDR_MAX: usize = 0x7FFF_FE00_0000; // MACH_VM_MAX_ADDRESS
 
     fn allocate_pages(
         &self,
@@ -79,6 +83,25 @@ impl crate::platform::PageManagementProvider<PAGE_SIZE> for DummyVmemBackend {
 
 fn collect_mappings(vmm: &Vmem<DummyVmemBackend, PAGE_SIZE>) -> Vec<Range<usize>> {
     vmm.iter().map(|v| v.0.start..v.0.end).collect()
+}
+
+#[test]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn nonfixed_hint_below_task_min_relocates() {
+    let mut vmm = Vmem::new(&DummyVmemBackend);
+    let address = unsafe {
+        vmm.create_mapping(
+            Some(NonZeroAddress::new(PAGE_SIZE).unwrap()),
+            NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+            VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD, false),
+            CreatePagesFlags::empty(),
+        )
+    }
+    .unwrap();
+    assert_eq!(
+        address.as_usize(),
+        DummyVmemBackend::TASK_ADDR_MAX - PAGE_SIZE
+    );
 }
 
 #[test]

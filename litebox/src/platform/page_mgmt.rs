@@ -112,6 +112,7 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
             )
             .map_err(|e| match e {
                 AllocationError::OutOfMemory => RemapError::OutOfMemory,
+                AllocationError::PermissionDenied => RemapError::PermissionDenied,
                 AllocationError::AddressInUse | AllocationError::AddressInUseByPlatform => {
                     RemapError::AlreadyAllocated
                 }
@@ -220,6 +221,8 @@ pub enum AllocationError {
     AboveMaxAddress,
     #[error("out of memory")]
     OutOfMemory,
+    #[error("requested page permissions are denied")]
+    PermissionDenied,
     #[error("provided fixed address range is in use")]
     AddressInUse,
     #[error("provided fixed address range is in use by the platform")]
@@ -250,6 +253,8 @@ pub enum RemapError {
     Overlapping,
     #[error("provided new range is already allocated")]
     AlreadyAllocated,
+    #[error("requested page permissions are denied")]
+    PermissionDenied,
     #[error("out of memory")]
     OutOfMemory,
 }
@@ -262,6 +267,12 @@ pub enum PermissionUpdateError {
     Unaligned,
     #[error("provided range contains unallocated pages")]
     Unallocated,
+    #[error("requested page permissions are denied")]
+    PermissionDenied,
+    #[error("out of memory")]
+    OutOfMemory,
+    #[error("platform failed to update page permissions")]
+    PlatformFailure,
 }
 
 /// Possible errors for [`PageManagementProvider::try_allocate_cow_pages`]
