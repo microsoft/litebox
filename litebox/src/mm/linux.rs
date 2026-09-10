@@ -17,7 +17,12 @@ use crate::platform::page_mgmt::AllocationError;
 use crate::platform::page_mgmt::FixedAddressBehavior;
 use crate::platform::page_mgmt::MemoryRegionPermissions;
 
-/// Page size in bytes
+/// Host page size in bytes on Apple Silicon macOS.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub const PAGE_SIZE: usize = 16384;
+
+/// Page size in bytes.
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 pub const PAGE_SIZE: usize = 4096;
 
 bitflags::bitflags! {
@@ -660,6 +665,9 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             } {
                 Ok(_) => {}
                 Err(AllocationError::OutOfMemory) => return Err(VmemResizeError::OutOfMemory),
+                Err(AllocationError::PermissionDenied) => {
+                    return Err(VmemResizeError::PermissionDenied);
+                }
                 Err(
                     AllocationError::AddressInUse
                     | AllocationError::AddressInUseByPlatform
@@ -979,6 +987,8 @@ pub(super) enum VmemResizeError {
     InvalidAddr { range: Range<usize>, addr: usize },
     #[error("range {0:?} is already (partially) occupied")]
     RangeOccupied(Range<usize>),
+    #[error("requested page permissions are denied")]
+    PermissionDenied,
     #[error("out of memory")]
     OutOfMemory,
 }
