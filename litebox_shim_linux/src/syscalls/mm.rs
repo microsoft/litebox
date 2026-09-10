@@ -171,7 +171,7 @@ fn align_down(addr: usize, align: usize) -> usize {
     addr & !(align - 1)
 }
 
-/// Returns the first reservation, preferring capacity over address locality.
+/// Tries preferred-full, anywhere-full, then preferred-one-page.
 fn choose_trampoline_reservation<T>(
     capacity: usize,
     page_size: usize,
@@ -1294,6 +1294,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 Err(_) => None,
             };
             let far_end = addr_usize.saturating_add(len);
+            let trampoline_distance = |actual_addr: usize| {
+                actual_addr
+                    .abs_diff(addr_usize)
+                    .max(actual_addr.abs_diff(far_end))
+            };
+            let mut rejected_distance = None;
             let reservation = choose_trampoline_reservation(
                 initial_trampoline_len,
                 PAGE_SIZE,
@@ -1307,34 +1313,37 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     )
                     .ok()
                     .and_then(|ptr| {
-                        let actual_addr = ptr.as_usize();
-                        let distance = actual_addr
-                            .abs_diff(addr_usize)
-                            .max(actual_addr.abs_diff(far_end));
-                        if distance <= litebox_syscall_rewriter::MAX_TRAMPOLINE_DISPLACEMENT {
-                            Some(ptr)
-                        } else {
-                            litebox_util_log::warn!(
+                        let distance = trampoline_distance(ptr.as_usize());
+                        if distance > litebox_syscall_rewriter::MAX_TRAMPOLINE_DISPLACEMENT {
+                            rejected_distance = Some(distance);
+                            litebox_util_log::debug!(
                                 distance:? = distance;
-                                "trampoline too far from code segment, skipping patching"
+                                "rejecting arbitrary trampoline reservation outside branch range"
                             );
                             let _ = self.sys_munmap_raw(ptr, reservation_len);
                             None
+                        } else {
+                            Some(ptr)
                         }
                     })
                 },
             );
             let Some((actual_addr_ptr, reservation_len)) = reservation else {
-                litebox_util_log::warn!("failed to allocate trampoline region");
+                if let Some(distance) = rejected_distance {
+                    litebox_util_log::warn!(
+                        distance:? = distance;
+                        "trampoline too far from code segment, skipping patching"
+                    );
+                } else {
+                    litebox_util_log::warn!("failed to allocate trampoline region");
+                }
                 apply_trap_fallback(mapped_addr, len, false);
                 return true;
             };
             let actual_addr = actual_addr_ptr.as_usize();
 
             // Defend the preferred paths; individual gates also check reach.
-            let distance = actual_addr
-                .abs_diff(addr_usize)
-                .max(actual_addr.abs_diff(far_end));
+            let distance = trampoline_distance(actual_addr);
             if distance > litebox_syscall_rewriter::MAX_TRAMPOLINE_DISPLACEMENT {
                 litebox_util_log::warn!(
                     distance:? = distance;
