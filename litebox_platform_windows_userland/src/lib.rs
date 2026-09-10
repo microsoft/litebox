@@ -457,8 +457,8 @@ fn run_thread_inner(
 /// Windows x64 ABI default: all x87 exceptions masked, 53-bit precision, round to nearest.
 /// Unlike the guest's architectural initial value (0x037f), this selects double precision.
 /// See <https://learn.microsoft.com/en-us/cpp/build/x64-calling-convention#fpcsr>.
-static HOST_X87_CONTROL_WORD: u16 = 0x027f;
-static HOST_MXCSR: u32 = core::arch::x86_64::_MM_MASK_MASK;
+const  HOST_X87_CONTROL_WORD: u16 = 0x027f;
+const HOST_MXCSR: u32 = core::arch::x86_64::_MM_MASK_MASK;
 
 #[inline]
 fn debug_assert_host_fx_control_state() {
@@ -2506,9 +2506,9 @@ mod tests {
             VirtualFree, VirtualProtect,
         };
 
-        static TEST_VECTOR: [u8; 32] = [0x5a; 32];
-        static TEST_NEXT_VECTOR: [u8; 32] = [0x3c; 32];
-        static TEST_MXCSR: u32 = 0x3f80;
+        const TEST_VECTOR: [u8; 32] = [0x5a; 32];
+        const TEST_NEXT_VECTOR: [u8; 32] = [0x3c; 32];
+        const TEST_MXCSR: u32 = 0x3f80;
 
         #[unsafe(naked)]
         unsafe extern "C" fn guest_entry() {
@@ -2742,9 +2742,9 @@ mod tests {
         use litebox_common_linux::PtRegs;
         use std::cell::Cell;
 
-        static TEST_CW: u16 = 0x077f;
-        static TEST_MXCSR: u32 = 0x3f80;
-        static TEST_VECTOR: [u8; 32] = [0x5a; 32];
+        const TEST_CW: u16 = 0x077f;
+        const TEST_MXCSR: u32 = 0x3f80;
+        const TEST_VECTOR: [u8; 32] = [0x5a; 32];
 
         #[unsafe(naked)]
         unsafe extern "C" fn guest_entry() {
