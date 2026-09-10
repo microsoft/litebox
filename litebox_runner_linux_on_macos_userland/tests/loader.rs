@@ -3,10 +3,11 @@
 
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
+use litebox_syscall_rewriter::{RewriteOptions, TargetHost, hook_syscalls_in_elf_with_options};
 use std::{path::Path, process::Command};
 
 // Prebuilt AArch64 Linux programs with their dynamic loader and glibc.
-fn run_program(name: &str) {
+fn run_program(name: &str, aot: bool) {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/test-bins");
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
@@ -18,6 +19,16 @@ fn run_program(name: &str) {
         let path = root.join(destination);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::copy(fixtures.join(source), &path).unwrap();
+        if aot {
+            let original = std::fs::read(&path).unwrap();
+            let rewritten = hook_syscalls_in_elf_with_options(
+                &original,
+                None,
+                RewriteOptions::new(TargetHost::MacOs, true),
+            )
+            .unwrap_or_else(|error| panic!("rewriting {source}: {error}"));
+            std::fs::write(&path, rewritten).unwrap();
+        }
     }
     let archive = directory.path().join("root.tar");
     let tar = Command::new("tar")
@@ -54,7 +65,7 @@ fn run_program(name: &str) {
         assert_eq!(
             output.status.code(),
             Some(0),
-            "{name} (from_tar={from_tar}): {}\nstdout: {}\nstderr: {}",
+            "{name} (aot={aot}, from_tar={from_tar}): {}\nstdout: {}\nstderr: {}",
             output.status,
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
@@ -64,5 +75,10 @@ fn run_program(name: &str) {
 
 #[test]
 fn test_load_exec_dynamic() {
-    run_program("hello_world_dyn");
+    run_program("hello_world_dyn", false);
+}
+
+#[test]
+fn test_syscall_rewriter() {
+    run_program("hello_world_dyn", true);
 }

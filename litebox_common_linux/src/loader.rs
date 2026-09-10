@@ -72,6 +72,8 @@ struct TrampolineInfo {
 /// The magic number used to identify the LiteBox trampoline.
 /// This must match `TRAMPOLINE_MAGIC` in `litebox_syscall_rewriter`.
 const TRAMPOLINE_MAGIC: u64 = u64::from_le_bytes(*b"LITEBOX0");
+/// This must match `litebox_syscall_rewriter::TRAMPOLINE_FILE_ALIGNMENT`.
+const TRAMPOLINE_FILE_ALIGNMENT: u64 = 4096;
 
 /// Trampoline header for 64-bit: 8 (magic) + 8 (file_offset) + 8 (vaddr) + 8 (size) = 32 bytes
 #[repr(C, packed)]
@@ -357,8 +359,8 @@ impl ElfParsedFile {
             return Ok(());
         }
 
-        // Verify the file offset is page-aligned (as required by the rewriter)
-        if !file_offset.is_multiple_of(PAGE_SIZE as u64) {
+        // Verify the rewriter-defined file alignment.
+        if !file_offset.is_multiple_of(TRAMPOLINE_FILE_ALIGNMENT) {
             return Err(ElfParseError::BadTrampoline);
         }
 
@@ -577,6 +579,10 @@ impl ElfParsedFile {
             info.brk = info.brk.max(trampoline_end);
             return Ok(());
         }
+        debug_assert!(
+            trampoline.file_offset.is_multiple_of(PAGE_SIZE as u64),
+            "non-populating loaders map the trampoline directly from its file offset"
+        );
         mapper
             .map_file(
                 trampoline_start,

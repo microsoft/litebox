@@ -127,6 +127,9 @@ const BUN_FOOTER_MARKER: &[u8] = b"\n---- Bun! ----\n";
 /// This is checked by the loader to verify that the trampoline is valid.
 pub const TRAMPOLINE_MAGIC: &[u8; 8] = b"LITEBOX0";
 
+/// Required file alignment of the appended trampoline payload.
+pub const TRAMPOLINE_FILE_ALIGNMENT: usize = 0x1000;
+
 /// Host operating system for AArch64 guest rewriting.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TargetHost {
@@ -929,12 +932,21 @@ fn append_trampoline_footer(
     header_vaddr: u64,
     align_trampoline_size: bool,
 ) {
-    let remain = out.len() % 0x1000;
-    out.extend_from_slice(&vec![0; if remain == 0 { 0 } else { 0x1000 - remain }]);
+    let remain = out.len() % TRAMPOLINE_FILE_ALIGNMENT;
+    out.extend_from_slice(&vec![
+        0;
+        if remain == 0 {
+            0
+        } else {
+            TRAMPOLINE_FILE_ALIGNMENT - remain
+        }
+    ]);
 
     let trampoline_file_offset = out.len() as u64;
     if align_trampoline_size {
-        let trampoline_size = trampoline_data.len().next_multiple_of(0x1000);
+        let trampoline_size = trampoline_data
+            .len()
+            .next_multiple_of(TRAMPOLINE_FILE_ALIGNMENT);
         trampoline_data.extend_from_slice(&vec![0; trampoline_size - trampoline_data.len()]);
     }
     let trampoline_size = trampoline_data.len();
@@ -1129,7 +1141,10 @@ fn is_already_hooked(input_binary: &[u8], arch: Arch) -> bool {
         return true;
     }
 
-    if file_offset % 0x1000 != 0 {
+    if usize::try_from(file_offset)
+        .ok()
+        .is_none_or(|offset| !offset.is_multiple_of(TRAMPOLINE_FILE_ALIGNMENT))
+    {
         return false;
     }
     if vaddr % 0x1000 != 0 {
