@@ -429,7 +429,7 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         }
     }
 
-    Ok(program.process.wait())
+    Ok(program.process.wait_for_unix_shell_exit_code())
 }
 
 fn apply_broker_proxy_environment(environment: &mut Vec<String>, proxy_url: Option<&str>) {
