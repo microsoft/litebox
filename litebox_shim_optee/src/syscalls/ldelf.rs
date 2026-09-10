@@ -256,7 +256,7 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
             "sys_open_bin"
         );
 
-        if self.global.get_ta_bin(&ta_uuid).is_none() {
+        if !self.global.contains_ta_bin(&ta_uuid) {
             return Err(TeeResult::ItemNotFound);
         }
         let new_handle = self.ta_handle_map.insert(ta_uuid);

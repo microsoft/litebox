@@ -2232,6 +2232,52 @@ impl OpteeRpcArgs {
     }
 }
 
+/// Prepare a LOAD_TA RPC request to be sent to normal world.
+pub fn prepare_load_ta_rpc(
+    rpc_msg_args: &mut OpteeRpcArgs,
+    ta_uuid: TeeUuid,
+    memref: Option<OpteeMsgParamRmem>,
+) -> Result<(), OpteeSmcReturnCode> {
+    rpc_msg_args.cmd = OpteeRpcCommand::LoadTa;
+    // Match OP-TEE's get_rpc_arg(): default to failure in case normal world
+    // returns without updating the RPC result.
+    rpc_msg_args.ret = TeeResult::GenericError;
+    rpc_msg_args.num_params = 2;
+
+    rpc_msg_args.set_param_attr_type(0, OpteeMsgAttrType::ValueInput)?;
+    let uuid_bytes = ta_uuid.to_u64_array();
+    rpc_msg_args.set_param_value(
+        0,
+        OpteeMsgParamValue {
+            a: uuid_bytes[0],
+            b: uuid_bytes[1],
+            c: 0,
+        },
+    )?;
+
+    if memref.is_none() {
+        // First call of LOAD_TA protocol: normal world returns the TA size in `tmem.size`.
+        rpc_msg_args.set_param_attr_type(1, OpteeMsgAttrType::TmemOutput)?;
+        rpc_msg_args.set_param_tmem(
+            1,
+            OpteeMsgParamTmem {
+                buf_ptr: 0,
+                size: 0,
+                shm_ref: 0,
+            },
+        )?;
+    } else {
+        // Second LOAD_TA: LiteBox passes VTL0-owned memory back to VTL0
+        // so normal world can populate it with the TA binary.
+        rpc_msg_args.set_param_attr_type(1, OpteeMsgAttrType::RmemOutput)?;
+        if let Some(rmem) = memref {
+            rpc_msg_args.set_param_rmem(1, rmem)?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Serialize the params portion as raw bytes into `buf`.
 #[inline]
 fn write_optee_msg_params_to_buf(params: &[OpteeMsgParam], buf: &mut [u8]) {
