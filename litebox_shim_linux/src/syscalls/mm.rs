@@ -64,8 +64,11 @@ fn finalize_trampoline_gates(
                     .expect("guest x18 slot delta fits in a gate offset"),
             )
             .ok_or_else(|| alloc::string::String::from("guest x18 offset overflow"))?;
-        litebox_syscall_rewriter::aarch64::finalize_trampoline_gates_with_x18(
-            trampoline, offset, x18,
+        litebox_syscall_rewriter::aarch64::finalize_trampoline_gates_for_host(
+            trampoline,
+            offset,
+            x18,
+            litebox_syscall_rewriter::TargetHost::Linux,
         )
         .map_err(|e| format!("failed to patch guest offsets {offset}/{x18}: {e}"))
     } else {
