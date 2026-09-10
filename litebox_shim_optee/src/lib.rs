@@ -30,6 +30,7 @@ use litebox_common_optee::{
 use sha2::{Digest, Sha256};
 
 pub mod loader;
+pub mod rpc_context;
 pub mod session;
 pub(crate) mod syscalls;
 
