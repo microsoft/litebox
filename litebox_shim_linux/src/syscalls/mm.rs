@@ -171,6 +171,25 @@ fn align_down(addr: usize, align: usize) -> usize {
     addr & !(align - 1)
 }
 
+/// Tries preferred-full, anywhere-full, then preferred-one-page.
+fn choose_trampoline_reservation<T>(
+    capacity: usize,
+    page_size: usize,
+    mut map_preferred: impl FnMut(usize) -> Option<T>,
+    mut map_anywhere: impl FnMut(usize) -> Option<T>,
+) -> Option<(T, usize)> {
+    map_preferred(capacity)
+        .map(|reservation| (reservation, capacity))
+        .or_else(|| map_anywhere(capacity).map(|reservation| (reservation, capacity)))
+        .or_else(|| {
+            if capacity > page_size {
+                map_preferred(page_size).map(|reservation| (reservation, page_size))
+            } else {
+                None
+            }
+        })
+}
+
 impl<Platform: ShimPlatform> Task<Platform> {
     #[inline]
     fn do_mmap(
@@ -1274,37 +1293,57 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 }
                 Err(_) => None,
             };
-            let preferred = map_preferred(initial_trampoline_len)
-                .map(|ptr| (ptr, initial_trampoline_len))
-                .or_else(|| {
-                    if initial_trampoline_len > PAGE_SIZE {
-                        map_preferred(PAGE_SIZE).map(|ptr| (ptr, PAGE_SIZE))
-                    } else {
-                        None
-                    }
-                });
-            let (actual_addr_ptr, reservation_len) = if let Some(preferred) = preferred {
-                preferred
-            } else {
-                let Ok(ptr) = self.do_mmap_anonymous(
-                    None,
-                    initial_trampoline_len,
-                    ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-                    MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE,
-                ) else {
+            let far_end = addr_usize.saturating_add(len);
+            let trampoline_distance = |actual_addr: usize| {
+                actual_addr
+                    .abs_diff(addr_usize)
+                    .max(actual_addr.abs_diff(far_end))
+            };
+            let mut rejected_distance = None;
+            let reservation = choose_trampoline_reservation(
+                initial_trampoline_len,
+                PAGE_SIZE,
+                map_preferred,
+                |reservation_len| {
+                    self.do_mmap_anonymous(
+                        None,
+                        reservation_len,
+                        ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                        MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE,
+                    )
+                    .ok()
+                    .and_then(|ptr| {
+                        let distance = trampoline_distance(ptr.as_usize());
+                        if distance > litebox_syscall_rewriter::MAX_TRAMPOLINE_DISPLACEMENT {
+                            rejected_distance = Some(distance);
+                            litebox_util_log::debug!(
+                                distance:? = distance;
+                                "rejecting arbitrary trampoline reservation outside branch range"
+                            );
+                            let _ = self.sys_munmap_raw(ptr, reservation_len);
+                            None
+                        } else {
+                            Some(ptr)
+                        }
+                    })
+                },
+            );
+            let Some((actual_addr_ptr, reservation_len)) = reservation else {
+                if let Some(distance) = rejected_distance {
+                    litebox_util_log::warn!(
+                        distance:? = distance;
+                        "trampoline too far from code segment, skipping patching"
+                    );
+                } else {
                     litebox_util_log::warn!("failed to allocate trampoline region");
-                    apply_trap_fallback(mapped_addr, len, false);
-                    return true;
-                };
-                (ptr, initial_trampoline_len)
+                }
+                apply_trap_fallback(mapped_addr, len, false);
+                return true;
             };
             let actual_addr = actual_addr_ptr.as_usize();
 
-            let far_end = addr_usize.saturating_add(len);
-            // Individual gates perform their own reach checks.
-            let distance = actual_addr
-                .abs_diff(addr_usize)
-                .max(actual_addr.abs_diff(far_end));
+            // Defend the preferred paths; individual gates also check reach.
+            let distance = trampoline_distance(actual_addr);
             if distance > litebox_syscall_rewriter::MAX_TRAMPOLINE_DISPLACEMENT {
                 litebox_util_log::warn!(
                     distance:? = distance;
@@ -1579,6 +1618,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
 #[cfg(test)]
 mod tests {
+    use super::PAGE_SIZE;
     use litebox::{
         fs::{Mode, OFlags},
         platform::PageManagementProvider,
@@ -1587,6 +1627,29 @@ mod tests {
 
     use crate::syscalls::tests::TestPlatform as Platform;
     use crate::{UserPtrMut, syscalls::tests::init_platform};
+
+    #[test]
+    fn full_capacity_anywhere_precedes_preferred_one_page() {
+        let calls = core::cell::RefCell::new(alloc::vec::Vec::new());
+        let reservation = super::choose_trampoline_reservation(
+            7 * PAGE_SIZE,
+            PAGE_SIZE,
+            |len| {
+                calls.borrow_mut().push(("preferred", len));
+                None
+            },
+            |len| {
+                calls.borrow_mut().push(("anywhere", len));
+                Some("full capacity")
+            },
+        );
+
+        assert_eq!(reservation, Some(("full capacity", 7 * PAGE_SIZE)));
+        assert_eq!(
+            calls.into_inner(),
+            alloc::vec![("preferred", 7 * PAGE_SIZE), ("anywhere", 7 * PAGE_SIZE),]
+        );
+    }
 
     /// Fail closed: an unpatched placeholder executes silently.
     #[cfg(target_arch = "aarch64")]
