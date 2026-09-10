@@ -87,12 +87,12 @@ pub enum RpcCompletion {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RpcCommon {
-    ta_uuid: TeeUuid,
+    pub ta_uuid: TeeUuid,
     // RPC continuation reuses args[3] for the context ID. Use these fields to
     // preserve the original registered SHM reference and offset
     // before overwriting it.
-    registered_shm_ref: u64,
-    regd_shm_offset: usize,
+    pub registered_shm_ref: u64,
+    pub regd_shm_offset: usize,
 }
 
 /// Continuation state for an RPC-backed Dynamic TA request.
