@@ -524,6 +524,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(target_os = "macos", ignore = "macOS runner supports PIE guests only")]
     fn et_exec_interpreter_loads_top_down_above_low_heap() {
         let task = crate::syscalls::tests::init_platform();
         write_file(&task, "/main", &minimal_elf(ET_EXEC, Some(INTERP_PATH)));

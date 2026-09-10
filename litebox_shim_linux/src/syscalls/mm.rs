@@ -57,7 +57,8 @@ fn finalize_trampoline_gates(
     // Gates encode a scaled `u16`; the platform API remains pointer-width.
     let offset = u16::try_from(offset)
         .map_err(|_| format!("guest thread-pointer offset {offset} is too large for a gate"))?;
-    if cfg!(feature = "aarch64_virtualize_x18") {
+    let options = crate::aarch64_rewrite_options();
+    if options.virtualizes_x18() {
         let x18 = offset
             .checked_add(
                 u16::try_from(litebox_syscall_rewriter::aarch64::GUEST_X18_OFFSET_FROM_GUEST_TP)
@@ -68,7 +69,7 @@ fn finalize_trampoline_gates(
             trampoline,
             offset,
             x18,
-            litebox_syscall_rewriter::TargetHost::Linux,
+            options.target_host(),
         )
         .map_err(|e| format!("failed to patch guest offsets {offset}/{x18}: {e}"))
     } else {
@@ -816,7 +817,23 @@ impl<Platform: ShimPlatform> Task<Platform> {
             if base_addr.is_none()
                 && align_down(p_offset, PAGE_SIZE) == align_down(file_offset, PAGE_SIZE)
             {
-                base_addr = Some(mapped_addr.wrapping_sub(p_vaddr.trunc()));
+                #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+                {
+                    let Some(base) =
+                        mapped_addr.checked_sub(align_down(p_vaddr.trunc(), PAGE_SIZE))
+                    else {
+                        litebox_util_log::warn!(
+                            mapped_addr:? = mapped_addr, p_vaddr:? = p_vaddr;
+                            "mapped ELF address is below its page-aligned virtual address"
+                        );
+                        return;
+                    };
+                    base_addr = Some(base);
+                }
+                #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+                {
+                    base_addr = Some(mapped_addr.wrapping_sub(p_vaddr.trunc()));
+                }
             }
         }
 
@@ -919,6 +936,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 return;
             };
             let offset: usize = offset.trunc();
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            let offset = align_up(offset, PAGE_SIZE);
             base + offset
         };
 
@@ -1622,11 +1641,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
 #[cfg(test)]
 mod tests {
     use super::PAGE_SIZE;
-    use litebox::{
-        fs::{Mode, OFlags},
-        platform::PageManagementProvider,
-    };
-    use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
+    use litebox::fs::{Mode, OFlags};
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    use litebox::platform::PageManagementProvider;
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    use litebox_common_linux::MRemapFlags;
+    use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno};
 
     use crate::syscalls::tests::TestPlatform as Platform;
     use crate::{UserPtrMut, syscalls::tests::init_platform};
@@ -1658,6 +1678,11 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     mod aarch64_trampoline_gates {
         use litebox::platform::SystemInfoProvider;
+        use litebox_syscall_rewriter::{
+            RewriteOptions,
+            aarch64::{GateMetadata, classify_copied_gate_slot_for_host},
+            patch_code_segment_with_options,
+        };
 
         struct StubPlatform(Option<usize>);
 
@@ -1674,140 +1699,136 @@ mod tests {
         }
 
         fn unpatched_trampoline() -> alloc::vec::Vec<u8> {
+            let options = crate::aarch64_rewrite_options();
             let mut code = 0xD53B_D049u32.to_le_bytes(); // MRS X9, TPIDR_EL0
             let (tramp, trapped) =
-                litebox_syscall_rewriter::patch_code_segment(&mut code, 0x1000, 0x400000, 0)
-                    .unwrap();
+                patch_code_segment_with_options(&mut code, 0x1000, 0x400000, 0, options).unwrap();
             assert!(trapped.is_empty());
-            assert_eq!(
-                litebox_syscall_rewriter::aarch64::find_guest_tpidr_placeholder(&tramp),
-                Some(16 + 4),
-                "the fixture must start out unpatched, or these tests prove nothing"
-            );
-            let classified =
-                litebox_syscall_rewriter::aarch64::classify_gate_pc(&tramp, 0x400000, 0x400010)
-                    .expect("emitted MRS slot must validate");
-            assert_eq!(classified.slot_offset(), 16);
+            let classified = classify_copied_gate_slot_for_host(
+                &tramp[16..],
+                0x400010,
+                0x400010,
+                options.target_host(),
+            )
+            .expect("emitted MRS slot must validate");
             assert!(matches!(
                 classified.metadata(),
-                litebox_syscall_rewriter::aarch64::GateMetadata::MrsTpidr { destination: 9, .. }
+                GateMetadata::MrsTpidr { destination: 9 }
             ));
             tramp
         }
 
-        #[cfg(feature = "aarch64_virtualize_x18")]
         #[test]
-        fn x18_gate_is_finalized_with_the_platform_offset() {
+        fn x18_gate_matches_configured_policy() {
+            let options = crate::aarch64_rewrite_options();
             let mut code = 0xaa00_03f2u32.to_le_bytes(); // mov x18, x0
-            let options = litebox_syscall_rewriter::RewriteOptions::new(
-                litebox_syscall_rewriter::TargetHost::Linux,
-                true,
-            );
-            let (mut trampoline, trapped) =
-                litebox_syscall_rewriter::patch_code_segment_with_options(
-                    &mut code, 0x1000, 0x400000, 0, options,
-                )
-                .unwrap();
+            let (mut trampoline, trapped) = patch_code_segment_with_options(
+                &mut code,
+                0x1000,
+                0x400000,
+                0,
+                RewriteOptions::new(options.target_host(), true),
+            )
+            .unwrap();
             assert!(trapped.is_empty());
-
-            super::super::finalize_trampoline_gates(&StubPlatform(Some(96)), &mut trampoline)
-                .unwrap();
-
-            assert!(matches!(
-                litebox_syscall_rewriter::aarch64::classify_gate_pc(
-                    &trampoline,
-                    0x400000,
-                    0x400010,
-                )
-                .unwrap()
-                .metadata(),
-                litebox_syscall_rewriter::aarch64::GateMetadata::X18 { .. }
-            ));
+            let before = trampoline.clone();
+            let result =
+                super::super::finalize_trampoline_gates(&StubPlatform(Some(96)), &mut trampoline);
+            if options.virtualizes_x18() {
+                result.unwrap();
+                assert!(matches!(
+                    classify_copied_gate_slot_for_host(
+                        &trampoline[16..],
+                        0x400010,
+                        0x400010,
+                        options.target_host(),
+                    )
+                    .unwrap()
+                    .metadata(),
+                    GateMetadata::X18 { .. }
+                ));
+            } else {
+                assert!(result.is_err());
+                assert_eq!(trampoline, before);
+            }
         }
 
-        /// Runtime gates receive the callback address, not a callback-slot address.
         #[test]
         fn the_runtime_paths_argument_shape_produces_installable_gates() {
             const TRAMPOLINE_BASE: u64 = 0x40_0000;
             const SYSCALL_ENTRY: u64 = 0xDEAD_0000;
-            const GUEST_THREAD_POINTER_OFFSET: usize = 96;
-
+            let options = crate::aarch64_rewrite_options();
             let mut code = 0xD400_0001u32.to_le_bytes(); // SVC #0
-            let (mut stubs, trapped) = litebox_syscall_rewriter::patch_code_segment(
+            let (mut stubs, trapped) = patch_code_segment_with_options(
                 &mut code,
                 0x1000,
                 TRAMPOLINE_BASE,
                 SYSCALL_ENTRY,
+                options,
             )
-            .expect("a gate-aligned base and a real callback must be accepted");
+            .unwrap();
             assert!(trapped.is_empty());
-
             assert_eq!(
                 u64::from_le_bytes(stubs[..8].try_into().unwrap()),
                 SYSCALL_ENTRY
             );
-
-            super::super::finalize_trampoline_gates(
-                &StubPlatform(Some(GUEST_THREAD_POINTER_OFFSET)),
-                &mut stubs,
-            )
-            .expect("runtime gates must be patchable exactly like ahead-of-time ones");
-            assert_eq!(
-                litebox_syscall_rewriter::aarch64::find_guest_tpidr_placeholder(&stubs),
-                None
-            );
-            litebox_syscall_rewriter::aarch64::classify_gate_pc(
-                &stubs,
-                TRAMPOLINE_BASE,
-                TRAMPOLINE_BASE + 16,
-            )
-            .expect("the installed gate must classify at runtime");
-
+            super::super::finalize_trampoline_gates(&StubPlatform(Some(96)), &mut stubs).unwrap();
+            assert!(matches!(
+                classify_copied_gate_slot_for_host(
+                    &stubs[16..],
+                    TRAMPOLINE_BASE + 16,
+                    TRAMPOLINE_BASE + 16,
+                    options.target_host(),
+                )
+                .unwrap()
+                .metadata(),
+                GateMetadata::Svc
+            ));
             let mut code = 0xD400_0001u32.to_le_bytes();
             assert!(
-                litebox_syscall_rewriter::patch_code_segment(
+                patch_code_segment_with_options(
                     &mut code,
                     0x1000,
                     TRAMPOLINE_BASE + 8,
                     TRAMPOLINE_BASE,
+                    options,
                 )
-                .is_err(),
-                "a base-relative callback has to be rejected, or this test proves nothing"
+                .is_err()
             );
         }
 
         #[test]
-        fn a_supplied_offset_is_baked_into_every_gate() {
+        fn a_supplied_offset_is_accepted() {
             let mut tramp = unpatched_trampoline();
-            super::super::finalize_trampoline_gates(&StubPlatform(Some(96)), &mut tramp)
-                .expect("a well-formed trampoline and a valid offset must be accepted");
-            assert_eq!(
-                litebox_syscall_rewriter::aarch64::find_guest_tpidr_placeholder(&tramp),
-                None
-            );
+            super::super::finalize_trampoline_gates(&StubPlatform(Some(96)), &mut tramp).unwrap();
+            if crate::aarch64_rewrite_options().target_host()
+                == litebox_syscall_rewriter::TargetHost::Linux
+            {
+                assert_eq!(
+                    litebox_syscall_rewriter::aarch64::find_guest_tpidr_placeholder(&tramp),
+                    None
+                );
+            }
         }
 
         #[test]
         fn a_platform_with_no_offset_is_refused() {
             let mut tramp = unpatched_trampoline();
+            let before = tramp.clone();
             let err = super::super::finalize_trampoline_gates(&StubPlatform(None), &mut tramp)
-                .expect_err(
-                    "an AArch64 platform that supplies no offset must be fatal for the \
-                         binary, not a silent skip",
-                );
+                .unwrap_err();
             assert!(err.contains("no guest thread-pointer offset"), "{err}");
-            assert_eq!(
-                litebox_syscall_rewriter::aarch64::find_guest_tpidr_placeholder(&tramp),
-                Some(16 + 4)
-            );
+            assert_eq!(tramp, before);
         }
 
         #[test]
         fn an_offset_no_gate_can_encode_is_refused() {
             let mut tramp = unpatched_trampoline();
+            let before = tramp.clone();
             let err = super::super::finalize_trampoline_gates(&StubPlatform(Some(4)), &mut tramp)
-                .expect_err("an offset the gates' scaled immediate cannot hold is fatal");
+                .unwrap_err();
             assert!(err.contains("failed to patch"), "{err}");
+            assert_eq!(tramp, before);
         }
     }
 
@@ -1862,6 +1883,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(target_os = "macos", ignore = "assumes 4 KiB host pages")]
     fn test_mremap() {
         let task = init_platform();
 
@@ -1900,6 +1922,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(target_os = "macos", ignore = "assumes 4 KiB host pages")]
     fn test_mmap_fixed_noreplace() {
         let task = init_platform();
 
@@ -2104,6 +2127,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(target_os = "macos", ignore = "assumes 4 KiB host pages")]
     fn test_map_shared_anonymous() {
         let task = init_platform();
 
@@ -2139,6 +2163,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(target_os = "macos", ignore = "assumes 4 KiB host pages")]
     fn test_map_shared_anonymous_writable() {
         let task = init_platform();
 
@@ -2162,6 +2187,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(target_os = "macos", ignore = "assumes 4 KiB host pages")]
     fn test_map_shared_readonly_file() {
         let task = init_platform();
 

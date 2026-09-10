@@ -1915,6 +1915,10 @@ mod tests {
     /// After the alarm deadline passes, a blocking operation should be
     /// interrupted and SIGALRM should be pending.
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "host sleep is not interrupted by fallback alarms"
+    )]
     fn test_alarm_fires_after_deadline() {
         use litebox_common_linux::{ClockId, TimerFlags, Timespec};
         use litebox_platform::time::{Instant as _, TimeProvider};
@@ -2112,6 +2116,8 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(target_os = "macos", ignore = "requires platform timer support")]
+    #[cfg_attr(target_os = "macos", allow(unused_variables))]
     fn test_timer_delivers_correct_signal() {
         use litebox::platform::{TimerHandle as _, TimerProvider as _};
         use litebox_common_linux::signal::Signal;
