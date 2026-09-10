@@ -8,7 +8,7 @@ use crate::{
     host::per_cpu_variables::with_per_cpu_variables,
 };
 use digest::Digest;
-use litebox_common_lvbs::PRK_LEN;
+use litebox_common_lvbs::{CRNG_SEED_LEN, PRK_LEN};
 use rand_core::{RngCore, SeedableRng};
 use zeroize::Zeroizing;
 
@@ -112,7 +112,7 @@ impl litebox::platform::CrngProvider for LvbsLinuxKernel {
         random
             .get_or_insert_with(|| {
                 LvbsCrng::new(
-                    PRK_ONCE.get().expect("Platform root key not initialized"),
+                    CRNG_SEED_ONCE.get().expect("CRNG seed not set"),
                     rdrand_seed().expect("RDRAND unavailable during CRNG initialization"),
                 )
             })
@@ -134,10 +134,10 @@ struct LvbsCrng {
 }
 
 impl LvbsCrng {
-    fn new(prk: &[u8; PRK_LEN], rdrand_seed: CrngSeed) -> Self {
+    fn new(seed: &[u8; CRNG_SEED_LEN], rdrand_seed: CrngSeed) -> Self {
         Self {
-            random: rand_chacha::ChaCha20Rng::from_seed(crng_seed_from_prk_and_rdrand(
-                prk,
+            random: rand_chacha::ChaCha20Rng::from_seed(crng_seed_from_rot_and_rdrand(
+                seed,
                 rdrand_seed,
             )),
             bytes_until_reseed: CRNG_RESEED_INTERVAL_BYTES,
@@ -176,6 +176,7 @@ impl LvbsCrng {
 }
 
 static PRK_ONCE: spin::Once<[u8; PRK_LEN]> = spin::Once::new();
+static CRNG_SEED_ONCE: spin::Once<[u8; CRNG_SEED_LEN]> = spin::Once::new();
 
 // Do not expose a raw PRK getter (i.e., no `get_platform_root_key`).
 // Consumers should provide key derivation function and context
@@ -190,6 +191,18 @@ pub(crate) fn set_platform_root_key(key: &[u8; PRK_LEN]) {
         let mut prk = Zeroizing::new([0u8; PRK_LEN]);
         prk.copy_from_slice(key);
         *prk
+    });
+}
+
+/// Sets the trusted CRNG seed for this platform.
+///
+/// This should be called once during platform initialization with a seed
+/// derived from a hardware root of trust (e.g., a TPM).
+pub(crate) fn set_crng_seed(seed: &[u8; CRNG_SEED_LEN]) {
+    CRNG_SEED_ONCE.call_once(|| {
+        let mut s = Zeroizing::new([0u8; CRNG_SEED_LEN]);
+        s.copy_from_slice(seed);
+        *s
     });
 }
 
@@ -231,10 +244,10 @@ fn rdrand_seed() -> Option<CrngSeed> {
     Some(seed)
 }
 
-fn crng_seed_from_prk_and_rdrand(prk: &[u8; PRK_LEN], rdrand_seed: CrngSeed) -> CrngSeed {
+fn crng_seed_from_rot_and_rdrand(seed: &[u8; CRNG_SEED_LEN], rdrand_seed: CrngSeed) -> CrngSeed {
     sha2::Sha256::new()
         .chain_update(b"litebox-lvbs-crng-seed-v1")
-        .chain_update(prk)
+        .chain_update(seed)
         .chain_update(rdrand_seed)
         .finalize()
         .into()

@@ -27,8 +27,8 @@ use core::ops::Range;
 use litebox::utils::TruncateExt;
 use litebox_common_linux::vmap::PhysPageAddr;
 use litebox_common_lvbs::{
-    FrameTxn, HypervCallError, MemAttr, PAGE_SHIFT, PAGE_SIZE, PRK_LEN, ReservationStatus,
-    VsmError, Vtl0Gate, Vtl0PrivilegedWrite, Vtl1Gate,
+    CRNG_SEED_LEN, FrameTxn, HypervCallError, MemAttr, PAGE_SHIFT, PAGE_SIZE, PRK_LEN,
+    ReservationStatus, VsmError, Vtl0Gate, Vtl0PrivilegedWrite, Vtl1Gate,
 };
 use rangemap::RangeSet;
 use spin::{Once, rwlock::RwLock as SpinRwLock};
@@ -788,6 +788,20 @@ impl Vtl1Gate for LvbsVtl1Gate {
             .read_vtl0_contiguous(key_pa.as_u64(), &mut *keybuf)
             .map_err(|_| VsmError::Vtl0CopyFailed)?;
         crate::host::set_platform_root_key(&keybuf);
+        Ok(())
+    }
+
+    fn set_crng_seed(&self, seed_pa: u64) -> Result<(), VsmError> {
+        if crate::platform_low().end_of_boot_reached() {
+            return Err(VsmError::OperationAfterEndOfBoot("set crng seed"));
+        }
+
+        let seed_pa = PhysAddr::try_new(seed_pa).map_err(|_| VsmError::InvalidPhysicalAddress)?;
+        let mut seed = Zeroizing::new([0u8; CRNG_SEED_LEN]);
+        LvbsVtl0Gate::mint()
+            .read_vtl0_contiguous(seed_pa.as_u64(), &mut *seed)
+            .map_err(|_| VsmError::Vtl0CopyFailed)?;
+        crate::host::set_crng_seed(&seed);
         Ok(())
     }
 }
