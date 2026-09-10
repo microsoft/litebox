@@ -23,7 +23,7 @@ use crate::{
     mm::linux::{NonZeroAddress, NonZeroPageSize, VmemResetError},
     platform::{
         PageManagementProvider, RawConstPointer,
-        page_mgmt::{MemoryRegionPermissions, RemapError},
+        page_mgmt::{MemoryRegionPermissions, PageState, RemapError},
     },
     sync::{RawSyncPrimitivesProvider, RwLock},
 };
@@ -80,7 +80,14 @@ where
     {
         let addr = {
             let mut vmem = self.vmem.write();
-            unsafe { vmem.create_pages(suggested_address, length, flags, before_perms) }?
+            unsafe {
+                vmem.create_pages(
+                    suggested_address,
+                    length,
+                    flags,
+                    PageState::Committed(before_perms),
+                )
+            }?
         };
         // call the user function with the pages
         // Note `op` may trigger page fault handler which requires write lock to `vmem`.
@@ -253,6 +260,24 @@ where
         }
     }
 
+    /// Reserve an address range without committing pages.
+    ///
+    /// # Safety
+    ///
+    /// When replacing a fixed mapping, the caller must ensure that overlapping mappings are not
+    /// in use. The caller must also ensure that `flags` correctly describe the mapping.
+    ///
+    /// Platforms that do not support reserving pages may emulate it by creating inaccessible pages.
+    pub unsafe fn create_reserved_pages(
+        &self,
+        suggested_address: Option<NonZeroAddress<ALIGN>>,
+        length: NonZeroPageSize<ALIGN>,
+        flags: CreatePagesFlags,
+    ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
+        let mut vmem = self.vmem.write();
+        unsafe { vmem.create_pages(suggested_address, length, flags, PageState::Reserved) }
+    }
+
     /// Create stack pages.
     ///
     /// `suggested_address` is the hint address for where to create the pages if it is not `None`.
@@ -351,7 +376,7 @@ where
                     Some(suggested_address),
                     length,
                     CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
-                    perms,
+                    PageState::Committed(perms),
                 )
             }?;
         }
@@ -485,6 +510,43 @@ where
         let start = ptr.as_usize();
         let range = PageRange::new(start, start + len).ok_or(VmemResetError::UnAligned)?;
         unsafe { vmem.reset_pages(range, anonymous_only) }
+    }
+
+    /// Commit pages in a reserved range set by [`create_reserved_pages`](Self::create_reserved_pages).
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the range belongs to this page manager and that the requested
+    /// permissions do not conflict with concurrent access.
+    pub unsafe fn commit_pages(
+        &self,
+        ptr: Platform::RawMutPointer<u8>,
+        len: usize,
+        permissions: MemoryRegionPermissions,
+    ) -> Result<(), VmemProtectError> {
+        let mut vmem = self.vmem.write();
+        let start = ptr.as_usize();
+        let range = PageRange::new(start, start + len)
+            .ok_or(VmemProtectError::InvalidRange(start..start + len))?;
+        unsafe { vmem.update_mapping_state(range, PageState::Committed(permissions)) }
+    }
+
+    /// Decommit pages while retaining ownership of their address range.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the range belongs to this page manager and that its contents
+    /// are no longer in use.
+    pub unsafe fn decommit_pages(
+        &self,
+        ptr: Platform::RawMutPointer<u8>,
+        len: usize,
+    ) -> Result<(), VmemProtectError> {
+        let mut vmem = self.vmem.write();
+        let start = ptr.as_usize();
+        let range = PageRange::new(start, start + len)
+            .ok_or(VmemProtectError::InvalidRange(start..start + len))?;
+        unsafe { vmem.update_mapping_state(range, PageState::Reserved) }
     }
 
     /// Internal common function used by `make_pages_*` to change page permissions.
@@ -685,6 +747,9 @@ where
                 .ok_or(PageFaultError::AccessError("no mapping"))?;
             (r.start, *vma)
         };
+        if vma.flags().contains(VmFlags::VM_RESERVED) {
+            return Err(PageFaultError::AccessError("reserved page"));
+        }
         if fault_addr < start {
             // address is out of range, test if it is next to a stack
             if !vma.flags().contains(VmFlags::VM_GROWSDOWN) {

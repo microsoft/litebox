@@ -1463,11 +1463,19 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
     fn allocate_pages(
         &self,
         suggested_range: core::ops::Range<usize>,
-        initial_permissions: MemoryRegionPermissions,
+        initial_state: litebox::platform::page_mgmt::PageState,
         can_grow_down: bool,
         populate_pages_immediately: bool,
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
+        let (initial_permissions, populate_pages_immediately) = match initial_state {
+            litebox::platform::page_mgmt::PageState::Reserved => {
+                (MemoryRegionPermissions::empty(), false)
+            }
+            litebox::platform::page_mgmt::PageState::Committed(permissions) => {
+                (permissions, populate_pages_immediately)
+            }
+        };
         let flags = MapFlags::MAP_PRIVATE
             | MapFlags::MAP_ANONYMOUS
             | match fixed_address_behavior {
@@ -1530,7 +1538,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         &self,
         old_range: core::ops::Range<usize>,
         new_range: core::ops::Range<usize>,
-        _permissions: MemoryRegionPermissions,
+        _state: litebox::platform::page_mgmt::PageState,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::RemapError> {
         let res = unsafe {
             syscalls::syscall5(
@@ -1546,11 +1554,49 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         Ok(UserMutPtr::from_usize(res))
     }
 
+    unsafe fn commit_pages(
+        &self,
+        range: core::ops::Range<usize>,
+        permissions: MemoryRegionPermissions,
+    ) -> Result<(), litebox::platform::page_mgmt::PageStateUpdateError> {
+        unsafe {
+            <Self as litebox::platform::PageManagementProvider<ALIGN>>::update_permissions(
+                self,
+                range,
+                permissions,
+            )
+        }
+    }
+
+    unsafe fn decommit_pages(
+        &self,
+        range: core::ops::Range<usize>,
+    ) -> Result<(), litebox::platform::page_mgmt::PageStateUpdateError> {
+        unsafe {
+            <Self as litebox::platform::PageManagementProvider<ALIGN>>::update_permissions(
+                self,
+                range.clone(),
+                MemoryRegionPermissions::empty(),
+            )
+        }?;
+        unsafe {
+            syscalls::syscall3(
+                syscalls::Sysno::madvise,
+                range.start,
+                range.len(),
+                libc::MADV_DONTNEED as usize,
+            )
+        }
+        .expect("madvise(MADV_DONTNEED) failed");
+        Ok(())
+    }
+
     unsafe fn update_permissions(
         &self,
         range: core::ops::Range<usize>,
         new_permissions: MemoryRegionPermissions,
-    ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError> {
+    ) -> Result<(), litebox::platform::page_mgmt::PageStateUpdateError> {
+        #[cfg(target_arch = "x86_64")]
         unsafe {
             syscalls::syscall3(
                 syscalls::Sysno::mprotect,
@@ -2426,7 +2472,8 @@ mod tests {
     use litebox::{fs::OFlags, platform::RawMutex};
 
     use crate::LinuxUserland;
-    use litebox::platform::PageManagementProvider;
+    use litebox::platform::page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions, PageState};
+    use litebox::platform::{PageManagementProvider, RawConstPointer as _, RawMutPointer as _};
 
     extern crate std;
 
@@ -2461,6 +2508,60 @@ mod tests {
             assert!(page.end > page.start);
             prev = page.end;
         }
+    }
+
+    #[test]
+    fn test_reserved_page_lifecycle() {
+        const PAGE_SIZE: usize = 4096;
+
+        let platform = LinuxUserland::new(None);
+        let ptr = <LinuxUserland as PageManagementProvider<PAGE_SIZE>>::allocate_pages(
+            platform,
+            0..PAGE_SIZE,
+            PageState::Reserved,
+            false,
+            false,
+            FixedAddressBehavior::Hint,
+        )
+        .unwrap();
+        let range = ptr.as_usize()..ptr.as_usize() + PAGE_SIZE;
+
+        // SAFETY: `range` is the reserved allocation returned immediately above.
+        unsafe {
+            <LinuxUserland as PageManagementProvider<PAGE_SIZE>>::commit_pages(
+                platform,
+                range.clone(),
+                MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+            )
+        }
+        .unwrap();
+        ptr.write_at_offset(0, 0xa5).unwrap();
+
+        // SAFETY: The test no longer accesses the committed page before recommitting it.
+        unsafe {
+            <LinuxUserland as PageManagementProvider<PAGE_SIZE>>::decommit_pages(
+                platform,
+                range.clone(),
+            )
+        }
+        .unwrap();
+        // SAFETY: `range` remains owned by the provider after decommit.
+        unsafe {
+            <LinuxUserland as PageManagementProvider<PAGE_SIZE>>::commit_pages(
+                platform,
+                range.clone(),
+                MemoryRegionPermissions::READ,
+            )
+        }
+        .unwrap();
+        // SAFETY: The page was recommitted with read permission above.
+        assert_eq!(unsafe { (range.start as *const u8).read() }, 0);
+
+        // SAFETY: `range` is no longer accessed after this deallocation.
+        unsafe {
+            <LinuxUserland as PageManagementProvider<PAGE_SIZE>>::deallocate_pages(platform, range)
+        }
+        .unwrap();
     }
 
     #[test]

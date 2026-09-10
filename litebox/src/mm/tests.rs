@@ -30,17 +30,16 @@ impl crate::platform::RawPointerProvider for DummyVmemBackend {
 
 #[expect(unused_variables, reason = "dummy/mock backend")]
 impl crate::platform::PageManagementProvider<PAGE_SIZE> for DummyVmemBackend {
-    #[cfg(target_os = "linux")]
     const TASK_ADDR_MIN: usize = 0x1_0000; // default linux config
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[cfg(target_arch = "x86_64")]
     const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000; // (1 << 47) - PAGE_SIZE;
-    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    #[cfg(target_arch = "aarch64")]
     const TASK_ADDR_MAX: usize = 0xFFFF_FFFF_F000; // 48-bit VA space
 
     fn allocate_pages(
         &self,
         suggested_range: Range<usize>,
-        initial_permissions: crate::platform::page_mgmt::MemoryRegionPermissions,
+        initial_state: crate::platform::page_mgmt::PageState,
         can_grow_down: bool,
         populate_pages_immediately: bool,
         fixed_address_behavior: crate::platform::page_mgmt::FixedAddressBehavior,
@@ -59,7 +58,7 @@ impl crate::platform::PageManagementProvider<PAGE_SIZE> for DummyVmemBackend {
         &self,
         old_range: Range<usize>,
         new_range: Range<usize>,
-        permissions: crate::platform::page_mgmt::MemoryRegionPermissions,
+        state: crate::platform::page_mgmt::PageState,
     ) -> Result<Self::RawMutPointer<u8>, crate::platform::page_mgmt::RemapError> {
         Ok(TransparentMutPtr::from_usize(new_range.start))
     }
@@ -68,7 +67,7 @@ impl crate::platform::PageManagementProvider<PAGE_SIZE> for DummyVmemBackend {
         &self,
         range: Range<usize>,
         new_permissions: crate::platform::page_mgmt::MemoryRegionPermissions,
-    ) -> Result<(), crate::platform::page_mgmt::PermissionUpdateError> {
+    ) -> Result<(), crate::platform::page_mgmt::PageStateUpdateError> {
         Ok(())
     }
 

@@ -1020,11 +1020,20 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
     fn allocate_pages(
         &self,
         suggested_range: core::ops::Range<usize>,
-        initial_permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
+        initial_state: litebox::platform::page_mgmt::PageState,
         can_grow_down: bool,
         populate_pages_immediately: bool,
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
+        let (initial_permissions, populate_pages_immediately) = match initial_state {
+            litebox::platform::page_mgmt::PageState::Reserved => (
+                litebox::platform::page_mgmt::MemoryRegionPermissions::empty(),
+                false,
+            ),
+            litebox::platform::page_mgmt::PageState::Committed(permissions) => {
+                (permissions, populate_pages_immediately)
+            }
+        };
         let range = PageRange::new(suggested_range.start, suggested_range.end)
             .ok_or(litebox::platform::page_mgmt::AllocationError::Unaligned)?;
         let current_pt = self.page_table_manager.current_page_table();
@@ -1062,7 +1071,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
         &self,
         old_range: core::ops::Range<usize>,
         new_range: core::ops::Range<usize>,
-        _permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
+        _state: litebox::platform::page_mgmt::PageState,
     ) -> Result<UserMutPtr<u8>, litebox::platform::page_mgmt::RemapError> {
         let old_range = PageRange::new(old_range.start, old_range.end)
             .ok_or(litebox::platform::page_mgmt::RemapError::Unaligned)?;
@@ -1082,9 +1091,9 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
         &self,
         range: core::ops::Range<usize>,
         new_permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
-    ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError> {
+    ) -> Result<(), litebox::platform::page_mgmt::PageStateUpdateError> {
         let range = PageRange::new(range.start, range.end)
-            .ok_or(litebox::platform::page_mgmt::PermissionUpdateError::Unaligned)?;
+            .ok_or(litebox::platform::page_mgmt::PageStateUpdateError::Unaligned)?;
         let new_flags =
             litebox::mm::linux::VmFlags::from_bits(new_permissions.bits().into()).unwrap();
         unsafe {

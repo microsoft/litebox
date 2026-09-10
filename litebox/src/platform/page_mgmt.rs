@@ -24,6 +24,15 @@ bitflags::bitflags! {
     }
 }
 
+/// The allocation state of a memory region.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageState {
+    /// The address range is reserved but has no committed pages.
+    Reserved,
+    /// The address range has committed pages with the specified permissions.
+    Committed(MemoryRegionPermissions),
+}
+
 /// A provider for managing memory pages
 ///
 /// NOTE: Due to insufficient support for associated constants in current Stable Rust, we have
@@ -39,12 +48,12 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     /// Note it must be aligned to `ALIGN`.
     const TASK_ADDR_MAX: usize;
 
-    /// Allocates new memory pages at the specified `suggested_range` with the given `initial_permissions`.
+    /// Allocates a new memory region at `suggested_range` with the given `initial_state`.
     ///
     /// # Parameters
     ///
     /// - `suggested_range`: A suggested address range for the allocation.
-    /// - `initial_permissions`: The permissions to apply to the allocated memory region.
+    /// - `initial_state`: Whether the region is reserved or committed with permissions.
     /// - `can_grow_down`: If `true`, the region is allowed to grow downward (towards zero) upon
     ///   a page fault.
     /// - `populate_pages_immediately`: If `true`, the pages are populated immediately; otherwise,
@@ -61,7 +70,7 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     fn allocate_pages(
         &self,
         suggested_range: Range<usize>,
-        initial_permissions: MemoryRegionPermissions,
+        initial_state: PageState,
         can_grow_down: bool,
         populate_pages_immediately: bool,
         fixed_address_behavior: FixedAddressBehavior,
@@ -92,7 +101,7 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         &self,
         old_range: Range<usize>,
         new_range: Range<usize>,
-        permissions: MemoryRegionPermissions,
+        state: PageState,
     ) -> Result<Self::RawMutPointer<u8>, RemapError> {
         debug_assert!(old_range.start.is_multiple_of(ALIGN));
         debug_assert!(new_range.start.is_multiple_of(ALIGN));
@@ -101,11 +110,20 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         debug_assert!(new_range.len() > old_range.len());
         debug_assert!(old_range.start.max(new_range.start) >= old_range.end.min(new_range.end));
         // Default implementation: allocate new pages, copy data, deallocate old pages
-        let temp_permissions = permissions | MemoryRegionPermissions::WRITE;
+        let permissions = match state {
+            PageState::Reserved => MemoryRegionPermissions::empty(),
+            PageState::Committed(permissions) => permissions,
+        };
+        let temp_state = match state {
+            PageState::Reserved => PageState::Reserved,
+            PageState::Committed(_) => {
+                PageState::Committed(permissions | MemoryRegionPermissions::WRITE)
+            }
+        };
         let new_ptr = self
             .allocate_pages(
                 new_range.clone(),
-                temp_permissions,
+                temp_state,
                 false,
                 true,
                 FixedAddressBehavior::NoReplace,
@@ -121,33 +139,37 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
                 | AllocationError::AddressPartiallyInUse => unreachable!(),
             })?;
 
-        // Copy memory from old range to new range
-        if !permissions.contains(MemoryRegionPermissions::READ) {
-            (unsafe {
-                self.update_permissions(
-                    old_range.clone(),
-                    permissions | MemoryRegionPermissions::READ,
-                )
-            })
-            .expect("failed to update permissions on old range for copying");
-        }
-        // Copy in chunks of ALIGN bytes to handle very large memory regions
-        let total_len = old_range.len();
-        let mut offset = 0;
-        while offset < total_len {
-            let chunk_len = (total_len - offset).min(ALIGN);
-            let old_ptr =
-                <Self as RawPointerProvider>::RawConstPointer::from_usize(old_range.start + offset);
-            new_ptr
-                .write_slice_at_offset(
-                    isize::try_from(offset).unwrap(),
-                    &old_ptr.to_owned_slice(chunk_len).unwrap(),
-                )
-                .unwrap();
-            offset += ALIGN;
+        if let PageState::Committed(permissions) = state {
+            // Copy memory from old range to new range
+            if !permissions.contains(MemoryRegionPermissions::READ) {
+                (unsafe {
+                    self.update_permissions(
+                        old_range.clone(),
+                        permissions | MemoryRegionPermissions::READ,
+                    )
+                })
+                .expect("failed to update permissions on old range for copying");
+            }
+
+            // Copy in chunks of ALIGN bytes to handle very large memory regions.
+            let total_len = old_range.len();
+            let mut offset = 0;
+            while offset < total_len {
+                let chunk_len = (total_len - offset).min(ALIGN);
+                let old_ptr = <Self as RawPointerProvider>::RawConstPointer::from_usize(
+                    old_range.start + offset,
+                );
+                new_ptr
+                    .write_slice_at_offset(
+                        isize::try_from(offset).unwrap(),
+                        &old_ptr.to_owned_slice(chunk_len).unwrap(),
+                    )
+                    .unwrap();
+                offset += ALIGN;
+            }
         }
 
-        if temp_permissions != permissions {
+        if temp_state != state {
             (unsafe { self.update_permissions(new_range.clone(), permissions) })
                 .expect("failed to restore permissions on new range");
         }
@@ -157,7 +179,37 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         Ok(new_ptr)
     }
 
-    /// Update the permissions on pages in `range` to `new_permissions`.
+    /// Commit pages in an existing reserved address range.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the permissions do not conflict with any currently active usage
+    /// of these pages.
+    ///
+    /// The default implementation is a no-op. Platforms that require an explicit commit operation must override this method.
+    unsafe fn commit_pages(
+        &self,
+        _range: Range<usize>,
+        _permissions: MemoryRegionPermissions,
+    ) -> Result<(), PageStateUpdateError> {
+        Ok(())
+    }
+
+    /// Decommit pages while retaining ownership of the address range.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the contents of these pages are no longer in use.
+    ///
+    /// The default implementation calls [`deallocate_pages`](Self::deallocate_pages) to release the platform backing.
+    unsafe fn decommit_pages(&self, range: Range<usize>) -> Result<(), PageStateUpdateError> {
+        unsafe { self.deallocate_pages(range) }.map_err(|error| match error {
+            DeallocationError::Unaligned => PageStateUpdateError::Unaligned,
+            DeallocationError::AlreadyUnallocated => PageStateUpdateError::Unallocated,
+        })
+    }
+
+    /// Update the permissions on committed pages in `range`.
     ///
     /// # Safety
     ///
@@ -167,7 +219,7 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         &self,
         range: Range<usize>,
         new_permissions: MemoryRegionPermissions,
-    ) -> Result<(), PermissionUpdateError>;
+    ) -> Result<(), PageStateUpdateError>;
 
     /// Return reserved pages that are not available for allocation.
     ///
@@ -254,10 +306,10 @@ pub enum RemapError {
     OutOfMemory,
 }
 
-/// Possible errors for [`PageManagementProvider::update_permissions`]
+/// Possible errors for page commitment and permission updates.
 #[derive(Error, Debug)]
 #[non_exhaustive]
-pub enum PermissionUpdateError {
+pub enum PageStateUpdateError {
     #[error("provided range is not page-aligned")]
     Unaligned,
     #[error("provided range contains unallocated pages")]

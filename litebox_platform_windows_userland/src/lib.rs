@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use litebox::platform::ImmediatelyWokenUp;
 use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::{
-    AllocationError, FixedAddressBehavior, MemoryRegionPermissions,
+    AllocationError, FixedAddressBehavior, MemoryRegionPermissions, PageState,
 };
 use litebox::shim::{ContinueOperation, Exception};
 use litebox::utils::TruncateExt as _;
@@ -2042,7 +2042,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
     fn allocate_pages(
         &self,
         suggested_range: core::ops::Range<usize>,
-        initial_permissions: MemoryRegionPermissions,
+        initial_state: PageState,
         can_grow_down: bool,
         populate_pages_immediately: bool,
         fixed_address_behavior: FixedAddressBehavior,
@@ -2057,42 +2057,44 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         //
         // To ensure future MEM_COMMIT calls on sub-ranges succeed, we always reserve the entire aligned range
         // (i.e., MEM_RESERVE size is also made aligned to system allocation granularity).
-        let reserve_and_commit = |r: core::ops::Range<usize>,
-                                  flags: Win32_Memory::PAGE_PROTECTION_FLAGS|
-         -> *mut c_void {
-            let aligned_start_addr = self.round_down_to_granu(r.start);
-            let aligned_end_addr = self.round_up_to_granu(r.end);
-            let ptr = unsafe {
-                VirtualAlloc2(
-                    GetCurrentProcess(),
-                    aligned_start_addr as *mut c_void,
-                    aligned_end_addr - aligned_start_addr,
-                    Win32_Memory::MEM_RESERVE,
-                    Win32_Memory::PAGE_NOACCESS,
-                    core::ptr::null_mut(),
-                    0,
-                )
-            };
-            if ptr.is_null() {
-                core::ptr::null_mut()
-            } else {
-                unsafe {
+        let reserve_and_maybe_commit =
+            |r: core::ops::Range<usize>, state: PageState| -> *mut c_void {
+                let aligned_start_addr = self.round_down_to_granu(r.start);
+                let aligned_end_addr = self.round_up_to_granu(r.end);
+                let ptr = unsafe {
                     VirtualAlloc2(
                         GetCurrentProcess(),
-                        if r.start == 0 {
-                            ptr
-                        } else {
-                            r.start as *mut c_void
-                        },
-                        r.len(),
-                        Win32_Memory::MEM_COMMIT,
-                        flags,
+                        aligned_start_addr as *mut c_void,
+                        aligned_end_addr - aligned_start_addr,
+                        Win32_Memory::MEM_RESERVE,
+                        Win32_Memory::PAGE_NOACCESS,
                         core::ptr::null_mut(),
                         0,
                     )
+                };
+                if ptr.is_null() {
+                    core::ptr::null_mut()
+                } else {
+                    match state {
+                        PageState::Reserved => ptr,
+                        PageState::Committed(permissions) => unsafe {
+                            VirtualAlloc2(
+                                GetCurrentProcess(),
+                                if r.start == 0 {
+                                    ptr
+                                } else {
+                                    r.start as *mut c_void
+                                },
+                                r.len(),
+                                Win32_Memory::MEM_COMMIT,
+                                prot_flags(permissions),
+                                core::ptr::null_mut(),
+                                0,
+                            )
+                        },
+                    }
                 }
-            }
-        };
+            };
 
         let mut base_addr = suggested_range.start as *mut c_void;
         let size = suggested_range.len();
@@ -2115,8 +2117,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 })
                 .is_err();
             if has_committed_page && fixed_address_behavior == FixedAddressBehavior::Hint {
-                // If any page in the suggested range is already committed, and the caller
-                // did not request a fixed address, we ask the OS to allocate a new region.
+                // If any page in the suggested range is already mapped, and the caller did not
+                // request a fixed address, we ask the OS to allocate a new region.
                 base_addr = core::ptr::null_mut();
             } else if has_committed_page
                 && fixed_address_behavior == FixedAddressBehavior::NoReplace
@@ -2150,23 +2152,27 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                         unsafe { GetLastError() }
                                     );
                                 }
-                                let ptr = unsafe {
-                                    VirtualAlloc2(
-                                        GetCurrentProcess(),
-                                        r.start as *mut c_void,
-                                        r.len(),
-                                        Win32_Memory::MEM_COMMIT,
-                                        prot_flags(initial_permissions),
-                                        core::ptr::null_mut(),
-                                        0,
-                                    )
-                                };
-                                !ptr.is_null()
+                                match initial_state {
+                                    PageState::Reserved => true,
+                                    PageState::Committed(permissions) => {
+                                        let ptr = unsafe {
+                                            VirtualAlloc2(
+                                                GetCurrentProcess(),
+                                                r.start as *mut c_void,
+                                                r.len(),
+                                                Win32_Memory::MEM_COMMIT,
+                                                prot_flags(permissions),
+                                                core::ptr::null_mut(),
+                                                0,
+                                            )
+                                        };
+                                        !ptr.is_null()
+                                    }
+                                }
                             }
                             // In case the region is free, we need to reserve and commit it.
                             Win32_Memory::MEM_FREE => {
-                                let ptr =
-                                    reserve_and_commit(r.clone(), prot_flags(initial_permissions));
+                                let ptr = reserve_and_maybe_commit(r.clone(), initial_state);
                                 !ptr.is_null()
                             }
                             _ => unimplemented!(
@@ -2174,8 +2180,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                                 state
                             ),
                         };
-                        // Prefetch the memory range if requested
-                        if ok && populate_pages_immediately {
+                        // Prefetch only committed ranges.
+                        if ok
+                            && populate_pages_immediately
+                            && matches!(initial_state, PageState::Committed(_))
+                        {
                             do_prefetch_on_range(r.start, r.len());
                         }
                         Ok(ok)
@@ -2187,7 +2196,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         }
 
         debug_assert!(base_addr.is_null());
-        let ptr = reserve_and_commit(0..size, prot_flags(initial_permissions));
+        let ptr = reserve_and_maybe_commit(0..size, initial_state);
         assert!(
             !ptr.is_null(),
             "VirtualAlloc2(RESERVE|COMMIT size=0x{:x}) failed: {}",
@@ -2195,8 +2204,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             std::io::Error::last_os_error()
         );
 
-        // Prefetch the memory range if requested
-        if populate_pages_immediately {
+        // Prefetch only committed ranges.
+        if populate_pages_immediately && matches!(initial_state, PageState::Committed(_)) {
             do_prefetch_on_range(ptr as usize, size);
         }
         Ok(UserMutPtr::from_ptr(ptr.cast::<u8>()))
@@ -2226,26 +2235,76 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         Ok(())
     }
 
+    unsafe fn commit_pages(
+        &self,
+        range: core::ops::Range<usize>,
+        permissions: MemoryRegionPermissions,
+    ) -> Result<(), litebox::platform::page_mgmt::PageStateUpdateError> {
+        debug_assert_alignment!(range, ALIGN);
+        process_memory_range_by_regions(
+            range,
+            |r, state| -> Result<bool, std::convert::Infallible> {
+                assert_eq!(state, Win32_Memory::MEM_RESERVE);
+                Ok(!unsafe {
+                    VirtualAlloc2(
+                        GetCurrentProcess(),
+                        r.start as *mut c_void,
+                        r.len(),
+                        Win32_Memory::MEM_COMMIT,
+                        prot_flags(permissions),
+                        core::ptr::null_mut(),
+                        0,
+                    )
+                }
+                .is_null())
+            },
+        )
+        .expect("commit_pages failed");
+        Ok(())
+    }
+
+    unsafe fn decommit_pages(
+        &self,
+        range: core::ops::Range<usize>,
+    ) -> Result<(), litebox::platform::page_mgmt::PageStateUpdateError> {
+        debug_assert_alignment!(range, ALIGN);
+        process_memory_range_by_regions(
+            range,
+            |r, state| -> Result<bool, std::convert::Infallible> {
+                match state {
+                    Win32_Memory::MEM_RESERVE => Ok(true),
+                    Win32_Memory::MEM_COMMIT => Ok(unsafe {
+                        VirtualFree(r.start as *mut c_void, r.len(), Win32_Memory::MEM_DECOMMIT)
+                    } != 0),
+                    _ => panic!(
+                        "Trying to decommit an unallocated region: {:p}-{:p}",
+                        r.start as *mut c_void, r.end as *mut c_void
+                    ),
+                }
+            },
+        )
+        .expect("decommit_pages failed");
+        Ok(())
+    }
+
     unsafe fn update_permissions(
         &self,
         range: core::ops::Range<usize>,
         new_permissions: MemoryRegionPermissions,
-    ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError> {
+    ) -> Result<(), litebox::platform::page_mgmt::PageStateUpdateError> {
         debug_assert_alignment!(range, ALIGN);
-        let flags = prot_flags(new_permissions);
         process_memory_range_by_regions(
             range,
             |r, state| -> Result<bool, std::convert::Infallible> {
-                debug_assert_eq!(
-                    state,
-                    Win32_Memory::MEM_COMMIT,
-                    "Trying to change permissions on a non-committed region: {:p}-{:p}",
-                    r.start as *mut c_void,
-                    r.end as *mut c_void
-                );
+                assert_eq!(state, Win32_Memory::MEM_COMMIT);
                 let mut old_protect: u32 = 0;
                 Ok(unsafe {
-                    VirtualProtect(r.start as *mut c_void, r.len(), flags, &raw mut old_protect)
+                    VirtualProtect(
+                        r.start as *mut c_void,
+                        r.len(),
+                        prot_flags(new_permissions),
+                        &raw mut old_protect,
+                    )
                 } != 0)
             },
         )
@@ -2499,6 +2558,8 @@ mod tests {
     use litebox::platform::RawMutex;
     use litebox::platform::page_mgmt::FixedAddressBehavior;
     use litebox::platform::page_mgmt::MemoryRegionPermissions;
+    use litebox::platform::page_mgmt::PageState;
+    use windows_sys::Win32::System::Memory as Win32_Memory;
 
     #[test]
     fn interrupt_capture_preserves_xstate_on_reuse() {
@@ -2990,7 +3051,7 @@ mod tests {
         let addr = <WindowsUserland as PageManagementProvider<4096>>::allocate_pages(
             platform,
             0..0x1000,
-            MemoryRegionPermissions::WRITE,
+            PageState::Committed(MemoryRegionPermissions::WRITE),
             false,
             true,
             FixedAddressBehavior::Hint,
@@ -3016,7 +3077,7 @@ mod tests {
         let addr2 = <WindowsUserland as PageManagementProvider<4096>>::allocate_pages(
             platform,
             (addr + 0x8000)..(addr + 0x1_0000),
-            MemoryRegionPermissions::WRITE,
+            PageState::Committed(MemoryRegionPermissions::WRITE),
             false,
             true,
             FixedAddressBehavior::Hint,
@@ -3048,7 +3109,7 @@ mod tests {
         let addr3 = <WindowsUserland as PageManagementProvider<4096>>::allocate_pages(
             platform,
             (addr + 0x4000)..(addr + 0x1_0000),
-            MemoryRegionPermissions::WRITE,
+            PageState::Committed(MemoryRegionPermissions::WRITE),
             false,
             true,
             FixedAddressBehavior::Hint,
@@ -3056,5 +3117,151 @@ mod tests {
         .unwrap()
         .as_usize();
         assert_ne!(addr3, addr + 0x4000);
+
+        // Find a free allocation-granularity-sized region so this allocation
+        // deterministically exercises the MEM_FREE path.
+        let free_addr = {
+            let mut address =
+                <WindowsUserland as PageManagementProvider<4096>>::TASK_ADDR_MIN as *mut c_void;
+            loop {
+                let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+                do_query_on_region(&mut mbi, address);
+                if mbi.State == Win32_Memory::MEM_FREE
+                    && mbi.RegionSize >= system_allocation_granularity
+                {
+                    break mbi.BaseAddress as usize;
+                }
+                address = (mbi.BaseAddress as usize + mbi.RegionSize) as *mut c_void;
+            }
+        };
+        // Populating an explicit reservation should not commit or prefetch it.
+        let suggested_populated_inaccessible_addr =
+            <WindowsUserland as PageManagementProvider<4096>>::allocate_pages(
+                platform,
+                free_addr..free_addr + 0x1000,
+                PageState::Reserved,
+                false,
+                true,
+                FixedAddressBehavior::Hint,
+            )
+            .unwrap()
+            .as_usize();
+        assert_eq!(suggested_populated_inaccessible_addr, free_addr);
+        assert_eq!(
+            collect_regions(free_addr..free_addr + 0x1000),
+            vec![(
+                free_addr..free_addr + 0x1000,
+                windows_sys::Win32::System::Memory::MEM_RESERVE
+            )]
+        );
+
+        // The same behavior applies when Windows chooses the base address.
+        let populated_inaccessible_addr =
+            <WindowsUserland as PageManagementProvider<4096>>::allocate_pages(
+                platform,
+                0..0x1000,
+                PageState::Reserved,
+                false,
+                true,
+                FixedAddressBehavior::Hint,
+            )
+            .unwrap()
+            .as_usize();
+        assert_eq!(
+            collect_regions(populated_inaccessible_addr..populated_inaccessible_addr + 0x1000),
+            vec![(
+                populated_inaccessible_addr..populated_inaccessible_addr + 0x1000,
+                windows_sys::Win32::System::Memory::MEM_RESERVE
+            )]
+        );
+        // Making the range accessible commits it.
+        unsafe {
+            <WindowsUserland as PageManagementProvider<4096>>::commit_pages(
+                platform,
+                populated_inaccessible_addr..populated_inaccessible_addr + 0x1000,
+                MemoryRegionPermissions::WRITE,
+            )
+        }
+        .unwrap();
+        assert_eq!(
+            collect_regions(populated_inaccessible_addr..populated_inaccessible_addr + 0x1000),
+            vec![(
+                populated_inaccessible_addr..populated_inaccessible_addr + 0x1000,
+                windows_sys::Win32::System::Memory::MEM_COMMIT
+            )]
+        );
+
+        // A reserved mapping remains uncommitted until explicitly committed.
+        let inaccessible_addr = <WindowsUserland as PageManagementProvider<4096>>::allocate_pages(
+            platform,
+            0..0x1000,
+            PageState::Reserved,
+            false,
+            false,
+            FixedAddressBehavior::Hint,
+        )
+        .unwrap()
+        .as_usize();
+        assert_eq!(
+            collect_regions(inaccessible_addr..inaccessible_addr + 0x1000),
+            vec![(
+                inaccessible_addr..inaccessible_addr + 0x1000,
+                windows_sys::Win32::System::Memory::MEM_RESERVE
+            )]
+        );
+
+        // Deallocation leaves the underlying Windows reservation reusable.
+        unsafe {
+            <WindowsUserland as PageManagementProvider<4096>>::deallocate_pages(
+                platform,
+                inaccessible_addr..inaccessible_addr + 0x1000,
+            )
+        }
+        .unwrap();
+        let reused_addr = <WindowsUserland as PageManagementProvider<4096>>::allocate_pages(
+            platform,
+            inaccessible_addr..inaccessible_addr + 0x1000,
+            PageState::Reserved,
+            false,
+            false,
+            FixedAddressBehavior::Hint,
+        )
+        .unwrap()
+        .as_usize();
+        assert_eq!(reused_addr, inaccessible_addr);
+
+        // Committed PAGE_NOACCESS is distinct from an address reservation.
+        let committed_noaccess_addr =
+            <WindowsUserland as PageManagementProvider<4096>>::allocate_pages(
+                platform,
+                0..0x1000,
+                PageState::Committed(MemoryRegionPermissions::empty()),
+                false,
+                true,
+                FixedAddressBehavior::Hint,
+            )
+            .unwrap()
+            .as_usize();
+        assert_eq!(
+            collect_regions(committed_noaccess_addr..committed_noaccess_addr + 0x1000),
+            vec![(
+                committed_noaccess_addr..committed_noaccess_addr + 0x1000,
+                Win32_Memory::MEM_COMMIT
+            )]
+        );
+        unsafe {
+            <WindowsUserland as PageManagementProvider<4096>>::decommit_pages(
+                platform,
+                committed_noaccess_addr..committed_noaccess_addr + 0x1000,
+            )
+        }
+        .unwrap();
+        assert_eq!(
+            collect_regions(committed_noaccess_addr..committed_noaccess_addr + 0x1000),
+            vec![(
+                committed_noaccess_addr..committed_noaccess_addr + 0x1000,
+                Win32_Memory::MEM_RESERVE
+            )]
+        );
     }
 }

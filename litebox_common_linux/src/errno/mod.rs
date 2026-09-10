@@ -305,11 +305,11 @@ impl From<litebox::platform::page_mgmt::RemapError> for Errno {
     }
 }
 
-impl From<litebox::platform::page_mgmt::PermissionUpdateError> for Errno {
-    fn from(value: litebox::platform::page_mgmt::PermissionUpdateError) -> Self {
+impl From<litebox::platform::page_mgmt::PageStateUpdateError> for Errno {
+    fn from(value: litebox::platform::page_mgmt::PageStateUpdateError) -> Self {
         match value {
-            litebox::platform::page_mgmt::PermissionUpdateError::Unaligned => Errno::EINVAL,
-            litebox::platform::page_mgmt::PermissionUpdateError::Unallocated => Errno::ENOMEM,
+            litebox::platform::page_mgmt::PageStateUpdateError::Unaligned => Errno::EINVAL,
+            litebox::platform::page_mgmt::PageStateUpdateError::Unallocated => Errno::ENOMEM,
             _ => unimplemented!(),
         }
     }
@@ -320,6 +320,9 @@ impl From<litebox::mm::linux::VmemProtectError> for Errno {
         match value {
             litebox::mm::linux::VmemProtectError::UnAligned(_) => Errno::EINVAL,
             litebox::mm::linux::VmemProtectError::InvalidRange(_) => Errno::ENOMEM,
+            litebox::mm::linux::VmemProtectError::NotCommitted(_) => {
+                unreachable!("the Linux shim does not reserve pages")
+            }
             litebox::mm::linux::VmemProtectError::NoAccess { .. } => Errno::EACCES,
             litebox::mm::linux::VmemProtectError::ProtectError(e) => e.into(),
         }

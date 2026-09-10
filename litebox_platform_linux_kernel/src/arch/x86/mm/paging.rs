@@ -216,12 +216,12 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         &self,
         range: PageRange<ALIGN>,
         new_flags: VmFlags,
-    ) -> Result<(), page_mgmt::PermissionUpdateError> {
+    ) -> Result<(), page_mgmt::PageStateUpdateError> {
         let start = VirtAddr::new(range.start as _);
         let end = VirtAddr::new(range.end as _);
         let new_flags = vmflags_to_pteflags(new_flags) & Self::MPROTECT_PTE_MASK;
         let start: Page<Size4KiB> =
-            Page::from_start_address(start).or(Err(page_mgmt::PermissionUpdateError::Unaligned))?;
+            Page::from_start_address(start).or(Err(page_mgmt::PageStateUpdateError::Unaligned))?;
         let end: Page<Size4KiB> = Page::containing_address(end - 1);
 
         // TODO: this implementation is slow as each page requires two full page table walks.

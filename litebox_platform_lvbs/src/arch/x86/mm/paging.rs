@@ -476,12 +476,12 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         &self,
         range: PageRange<ALIGN>,
         new_flags: VmFlags,
-    ) -> Result<(), page_mgmt::PermissionUpdateError> {
+    ) -> Result<(), page_mgmt::PageStateUpdateError> {
         let start = VirtAddr::new(range.start as _);
         let end = VirtAddr::new(range.end as _);
         let new_flags = vmflags_to_pteflags(new_flags) & Self::MPROTECT_PTE_MASK;
         let start: Page<Size4KiB> =
-            Page::from_start_address(start).or(Err(page_mgmt::PermissionUpdateError::Unaligned))?;
+            Page::from_start_address(start).or(Err(page_mgmt::PageStateUpdateError::Unaligned))?;
         let end: Page<Size4KiB> = Page::containing_address(end - 1);
 
         // Note: TLB entries are batch-flushed after all permission updates, consistent
@@ -516,7 +516,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                                         crate::serial_println!(
                                             "BUG: attempt to protect a huge page"
                                         );
-                                        return Err(page_mgmt::PermissionUpdateError::Unaligned);
+                                        return Err(page_mgmt::PageStateUpdateError::Unaligned);
                                     }
                                 }
                             },
@@ -530,7 +530,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                     #[cfg(not(debug_assertions))]
                     {
                         crate::serial_println!("Invalid frame address: {:#x}", pa);
-                        return Err(page_mgmt::PermissionUpdateError::Unaligned);
+                        return Err(page_mgmt::PageStateUpdateError::Unaligned);
                     }
                 }
             }
