@@ -15,8 +15,8 @@ use litebox::{
 use litebox_common_linux::errno::Errno;
 use litebox_common_lvbs::{NUM_VTLCALL_PARAMS, VsmError, VsmFunction};
 use litebox_common_optee::{
-    OpteeMessageCommand, OpteeMsgArgs, OpteeRpcArgs, OpteeSmcArgs, OpteeSmcResult,
-    OpteeSmcReturnCode, TeeOrigin, TeeResult, UteeEntryFunc, UteeParams, optee_msg_args_total_size,
+    OpteeMessageCommand, OpteeMsgArgs, OpteeSmcArgs, OpteeSmcResult, OpteeSmcReturnCode, TeeOrigin,
+    TeeResult, UteeEntryFunc, UteeParams, optee_msg_args_total_size,
 };
 use litebox_platform_lvbs::host::LvbsLinuxKernel as Platform;
 use litebox_platform_lvbs::mshv::vsm::{LvbsVtl0Gate, LvbsVtl0PrivilegedWriter, LvbsVtl1Gate};
@@ -1372,38 +1372,6 @@ fn write_non_ta_msg_args_to_normal_world(
         platform,
         msg_args_phys_addr.trunc(),
         msg_args_size,
-    )?;
-    ptr.write_slice_at_offset(0, &blob)?;
-    Ok(())
-}
-
-/// Write `OpteeRpcArgs` to the normal world. Its write address is determined by
-/// `msg_args_phys_addr` and the size of `OpteeMsgArgs`.
-///
-/// Unlike [`write_msg_args_to_normal_world`], this function does not access TA userspace
-/// memory and can be called from the base page table context. It simply serializes the
-/// rpc_args and writes it to the normal world physical address.
-#[expect(dead_code)]
-#[inline]
-fn write_rpc_args_to_normal_world(
-    platform: &'static Platform,
-    msg_args: &OpteeMsgArgs,
-    msg_args_phys_addr: u64,
-    rpc_args: &OpteeRpcArgs,
-) -> Result<(), OpteeSmcReturnCode> {
-    let msg_args_size = optee_msg_args_total_size(msg_args.num_params);
-
-    let rpc_args_size = optee_msg_args_total_size(rpc_args.num_params);
-    let mut blob = vec![0u8; rpc_args_size];
-    rpc_args.serialize(&mut blob)?;
-
-    let rpc_pa: usize = <u64 as litebox::utils::TruncateExt<usize>>::trunc(msg_args_phys_addr)
-        .checked_add(msg_args_size)
-        .ok_or(OpteeSmcReturnCode::EBadAddr)?; // RPC args are placed right after the main msg_args blob
-    let ptr = NormalWorldMutPtr::<Platform, u8, PAGE_SIZE>::with_contiguous_pages(
-        platform,
-        rpc_pa,
-        rpc_args_size,
     )?;
     ptr.write_slice_at_offset(0, &blob)?;
     Ok(())
