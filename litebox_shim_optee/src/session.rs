@@ -1073,6 +1073,29 @@ mod tests {
         assert!(manager.single_instance_cache.get(&uuid).is_some());
     }
 
+    #[test]
+    fn keep_alive_instance_is_reused_after_last_session_closes() {
+        let manager = SessionManager::new();
+        let uuid = make_uuid(0xA5);
+        let flags = single_instance_flags() | TaFlags::INSTANCE_KEEP_ALIVE;
+
+        register_for_test(&manager, 107, flags, 12, uuid);
+        let instance = manager.single_instance_cache.get(&uuid).unwrap();
+
+        assert_eq!(manager.unregister_session(107), Some(flags));
+        assert_eq!(manager.count_sessions_for_instance(&instance), 0);
+
+        manager
+            .with_ta(&uuid, |target| {
+                let OpenSessionTarget::Sibling(reused) = target else {
+                    panic!("keep-alive instance was not reused");
+                };
+                assert_eq!(reused.task_page_table_id(), 12);
+                Ok(())
+            })
+            .unwrap();
+    }
+
     /// `mark_sessions_dead_for_instance` retires the cached single-instance
     /// TA: Live entries become Dead, stop counting for
     /// `count_sessions_for_instance`, `with_session` thereafter sees `None`,

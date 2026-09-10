@@ -2286,6 +2286,27 @@ pub fn prepare_shm_alloc_rpc(
     Ok(())
 }
 
+/// Prepare a shared-memory free RPC request to be sent to normal world.
+/// This will free the memory allocated by SHM_ALLOC request in normal world.
+pub fn prepare_shm_free_rpc(
+    rpc_msg_args: &mut OpteeRpcArgs,
+    shm_type: OpteeRpcShmType,
+    shm_ref: u64,
+) -> Result<(), OpteeSmcReturnCode> {
+    rpc_msg_args.cmd = OpteeRpcCommand::ShmFree;
+    rpc_msg_args.ret = TeeResult::GenericError;
+    rpc_msg_args.num_params = 1;
+    rpc_msg_args.set_param_attr_type(0, OpteeMsgAttrType::ValueInput)?;
+    rpc_msg_args.set_param_value(
+        0,
+        OpteeMsgParamValue {
+            a: shm_type as u64,
+            b: shm_ref,
+            c: 0,
+        },
+    )
+}
+
 /// Prepare a LOAD_TA RPC request to be sent to normal world.
 pub fn prepare_load_ta_rpc(
     rpc_msg_args: &mut OpteeRpcArgs,
@@ -2976,6 +2997,35 @@ mod tests {
             rpc_args.get_param_rmem_output(1),
             Err(OpteeSmcReturnCode::ENotAvail)
         ));
+    }
+    #[test]
+    fn test_prepare_shm_free_rpc() {
+        let header = OpteeMsgArgsHeader {
+            cmd: OpteeRpcCommand::LoadTa as u32,
+            func: 0,
+            session: 0,
+            cancel_id: 0,
+            pad: 0,
+            ret: TeeResult::Success as u32,
+            ret_origin: 0,
+            num_params: 1,
+        };
+        let raw_params = [0u8; size_of::<OpteeMsgParam>()];
+        let mut rpc_args = OpteeRpcArgs::from_header_and_raw_params(&header, &raw_params)
+            .expect("should parse RPC args");
+
+        prepare_shm_free_rpc(&mut rpc_args, OpteeRpcShmType::Appl, 0x1234)
+            .expect("should prepare SHM_FREE");
+
+        assert_eq!(rpc_args.cmd, OpteeRpcCommand::ShmFree);
+        assert_eq!(rpc_args.ret, TeeResult::GenericError);
+        assert_eq!(rpc_args.num_params, 1);
+        let value = rpc_args
+            .get_param_value(0)
+            .expect("SHM_FREE value parameter should be readable");
+        assert_eq!(value.a, OpteeRpcShmType::Appl as u64);
+        assert_eq!(value.b, 0x1234);
+        assert_eq!(value.c, 0);
     }
 
     #[test]
