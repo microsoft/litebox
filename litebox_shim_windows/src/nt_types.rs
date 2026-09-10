@@ -822,12 +822,14 @@ pub(crate) struct RtlUserProcessParameters {
     pub(crate) heap_memory_type_mask: u32,
     /// Reserved tail padding.
     pub(crate) padding_2: [u8; 4],
+    /// Pointer to loader attributes consumed during process initialization.
+    pub(crate) attribute_list: usize,
 }
 
 const _: [(); 0x1878] = [(); core::mem::size_of::<ThreadEnvironmentBlock>()];
 const _: [(); 0x7d0] = [(); core::mem::size_of::<ProcessEnvironmentBlock>()];
 const _: [(); 0x4d0] = [(); core::mem::size_of::<X64Context>()];
-const _: [(); 0x448] = [(); core::mem::size_of::<RtlUserProcessParameters>()];
+const _: [(); 0x450] = [(); core::mem::size_of::<RtlUserProcessParameters>()];
 
 #[repr(C)]
 #[derive(Clone, Copy, FromBytes, Immutable, IntoBytes, KnownLayout)]
