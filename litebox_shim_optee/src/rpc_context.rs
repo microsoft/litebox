@@ -150,29 +150,6 @@ impl RpcContext {
         self.common().regd_shm_offset
     }
 
-    pub fn requested_size(&self) -> Option<u64> {
-        match self {
-            Self::ShmAlloc { requested_size, .. } | Self::LoadTaBinary { requested_size, .. } => {
-                Some(*requested_size)
-            }
-            Self::LoadTaSize { .. } | Self::ShmFree { .. } => None,
-        }
-    }
-
-    pub fn shm_ref(&self) -> Option<u64> {
-        match self {
-            Self::LoadTaBinary { shm_ref, .. } | Self::ShmFree { shm_ref, .. } => Some(*shm_ref),
-            Self::LoadTaSize { .. } | Self::ShmAlloc { .. } => None,
-        }
-    }
-
-    pub fn completion(&self) -> Option<RpcCompletion> {
-        match self {
-            Self::ShmFree { completion, .. } => Some(*completion),
-            Self::LoadTaSize { .. } | Self::ShmAlloc { .. } | Self::LoadTaBinary { .. } => None,
-        }
-    }
-
     fn into_shm_alloc(self, requested_size: u64) -> Result<Self, RpcContextError> {
         match self {
             Self::LoadTaSize { common } => Ok(Self::ShmAlloc {
