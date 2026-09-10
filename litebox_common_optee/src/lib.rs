@@ -2230,6 +2230,52 @@ impl OpteeRpcArgs {
             Ok(())
         }
     }
+
+    /// Prepare a LOAD_TA RPC request to be sent to normal world.
+    pub fn prepare_load_ta_rpc(
+        &mut self,
+        ta_uuid: TeeUuid,
+        memref: Option<OpteeMsgParamRmem>,
+    ) -> Result<(), OpteeSmcReturnCode> {
+        self.cmd = OpteeRpcCommand::LoadTa;
+        // Match OP-TEE's get_rpc_arg(): default to failure in case normal world
+        // returns without updating the RPC result.
+        self.ret = TeeResult::GenericError;
+        self.num_params = 2;
+
+        self.set_param_attr_type(0, OpteeMsgAttrType::ValueInput)?;
+        let uuid_bytes = ta_uuid.to_u64_array();
+        self.set_param_value(
+            0,
+            OpteeMsgParamValue {
+                a: uuid_bytes[0],
+                b: uuid_bytes[1],
+                c: 0,
+            },
+        )?;
+
+        match memref {
+            None => {
+                // First LOAD_TA call: normal world returns the TA size in `tmem.size`.
+                self.set_param_attr_type(1, OpteeMsgAttrType::TmemOutput)?;
+                self.set_param_tmem(
+                    1,
+                    OpteeMsgParamTmem {
+                        buf_ptr: 0,
+                        size: 0,
+                        shm_ref: 0,
+                    },
+                )?;
+            }
+            Some(rmem) => {
+                // Second LOAD_TA call: normal world populates VTL0-owned memory.
+                self.set_param_attr_type(1, OpteeMsgAttrType::RmemOutput)?;
+                self.set_param_rmem(1, rmem)?;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Serialize the params portion as raw bytes into `buf`.
