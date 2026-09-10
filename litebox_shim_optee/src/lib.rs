@@ -31,6 +31,7 @@ use litebox_platform::time::{Instant as _, TimeProvider};
 use sha2::{Digest, Sha256};
 
 pub mod loader;
+pub mod rpc_context;
 pub mod session;
 pub(crate) mod syscalls;
 
