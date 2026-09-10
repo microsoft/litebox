@@ -1068,12 +1068,17 @@ mod tests {
         }
 
         fn read_mui_values<T: FromBytes>(data: &[u8], offset: usize, count: usize) -> Vec<T> {
-            let byte_len = count.checked_mul(size_of::<T>()).unwrap();
+            let value_size = size_of::<T>();
+            let byte_len = count.checked_mul(value_size).unwrap();
             let end = offset.checked_add(byte_len).unwrap();
-            data[offset..end]
-                .chunks_exact(size_of::<T>())
-                .map(|bytes| T::read_from_bytes(bytes).unwrap())
-                .collect()
+            let mut data = &data[offset..end];
+            let mut values = Vec::with_capacity(count);
+            for _ in 0..count {
+                let (bytes, remaining) = data.split_at(value_size);
+                values.push(T::read_from_bytes(bytes).unwrap());
+                data = remaining;
+            }
+            values
         }
 
         unsafe extern "system" {
