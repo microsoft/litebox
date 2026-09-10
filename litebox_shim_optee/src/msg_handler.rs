@@ -934,6 +934,41 @@ impl<const ALIGN: usize> ShmRefMap<ALIGN> {
     }
 }
 
+/// Serialize RPC arguments immediately after the main message in registered shared memory.
+pub fn write_rpc_args_to_regd_shm<Platform: litebox_common_linux::vmap::VmapManager<PAGE_SIZE>>(
+    platform: &Platform,
+    shm_ref: u64,
+    msg_args_offset: usize,
+    msg_args_num_params: u32,
+    rpc_args: &OpteeRpcArgs,
+) -> Result<(), OpteeSmcReturnCode> {
+    let shm_info = shm_ref_map()
+        .get(shm_ref)
+        .ok_or(OpteeSmcReturnCode::EBadAddr)?;
+    let rpc_args_offset = msg_args_offset
+        .checked_add(optee_msg_args_total_size(msg_args_num_params))
+        .ok_or(OpteeSmcReturnCode::EBadAddr)?;
+    let rpc_args_size = optee_msg_args_total_size(rpc_args.num_params);
+    let mut blob = alloc::vec![0u8; rpc_args_size];
+    rpc_args.serialize(&mut blob)?;
+    if rpc_args_offset
+        .checked_add(blob.len())
+        .is_none_or(|end| end > shm_info.len)
+    {
+        return Err(OpteeSmcReturnCode::EBadAddr);
+    }
+    if blob.is_empty() {
+        return Ok(());
+    }
+    let ptr = NormalWorldMutPtr::<Platform, u8, PAGE_SIZE>::new(
+        platform,
+        &shm_info.page_addrs,
+        shm_info.page_offset,
+    )?;
+    ptr.write_slice_at_offset(rpc_args_offset, &blob)?;
+    Ok(())
+}
+
 fn shm_ref_map() -> &'static ShmRefMap<PAGE_SIZE> {
     static SHM_REF_MAP: OnceBox<ShmRefMap<PAGE_SIZE>> = OnceBox::new();
     SHM_REF_MAP.get_or_init(|| Box::new(ShmRefMap::new()))
