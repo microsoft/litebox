@@ -5,10 +5,11 @@
 
 use alloc::{ffi::CString, vec::Vec};
 use litebox::{
-    fs::{Mode, OFlags},
+    fs::OFlags,
     mm::linux::{CreatePagesFlags, MappingError, PAGE_SIZE},
     utils::{ReinterpretSignedExt, TruncateExt},
 };
+use litebox_broker_protocol::fs::FileMode as Mode;
 use litebox_common_linux::{MapFlags, errno::Errno, loader::ElfParsedFile};
 use thiserror::Error;
 

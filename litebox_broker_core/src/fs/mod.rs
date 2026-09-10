@@ -12,6 +12,7 @@ use bitflags::bitflags;
 
 use core::ffi::c_uint;
 use core::num::NonZeroUsize;
+use litebox_broker_protocol::fs::{FileMode as Mode, FileType, FileUser as UserInfo};
 
 pub mod backend;
 pub mod composer;
@@ -30,52 +31,11 @@ mod test_support;
 #[cfg(test)]
 mod tests;
 
-pub use litebox_broker_protocol::fs::FileType;
 pub(crate) use service::File;
 pub use service::{
     FileResult, FileService, UnsupportedFileService, chmod, chown, handle_status, mkdir, open,
     path_status, read, read_directory, rmdir, seek, truncate, unlink, write,
 };
-
-bitflags! {
-    /// `S_I*` constants for open, ...
-    #[repr(transparent)]
-    #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
-    pub struct Mode: c_uint {
-        /// `S_IRWXU`: user (file owner) has read, write, and execute permission
-        const RWXU = 0o00700;
-        /// `S_IRUSR`: user has read permission
-        const RUSR = 0o00400;
-        /// `S_IWUSR`: user has write permission
-        const WUSR = 0o00200;
-        /// `S_IXUSR`: user has execute permission
-        const XUSR = 0o00100;
-        /// `S_IRWXG`: group has read, write, and execute permission
-        const RWXG = 0o00070;
-        /// `S_IRGRP`: group has read permission
-        const RGRP = 0o00040;
-        /// `S_IWGRP`: group has write permission
-        const WGRP = 0o00020;
-        /// `S_IXGRP`: group has execute permission
-        const XGRP = 0o00010;
-        /// `S_IRWXO`: others have read, write, and execute permission
-        const RWXO = 0o00007;
-        /// `S_IROTH`: others have read permission
-        const ROTH = 0o00004;
-        /// `S_IWOTH`: others have write permission
-        const WOTH = 0o00002;
-        /// `S_IXOTH`: others have execute permission
-        const XOTH = 0o00001;
-        /// `S_ISUID`: set-user-ID bit
-        const SUID = 0o0004000;
-        /// `S_ISGID`: set-group-ID bit (see inode(7)).
-        const SGID = 0o0002000;
-        /// `S_ISVTX`: sticky bit (see inode(7)).
-        const SVTX = 0o0001000;
-        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
-        const _ = !0;
-    }
-}
 
 bitflags! {
     /// `O_*` constants for use with open, ...
@@ -163,17 +123,6 @@ bitflags! {
     }
 }
 
-/// The `whence` directive to [`resolver::Resolver::seek`]
-#[derive(Copy, Clone)]
-pub enum SeekWhence {
-    /// The file offset is set to `offset` bytes.
-    RelativeToBeginning,
-    /// The file offset is set to its current location plus `offset` bytes.
-    RelativeToCurrentOffset,
-    /// The file offset is set to the size of the file plus `offset` bytes.
-    RelativeToEnd,
-}
-
 /// The status of a file/directory/... on the file-system, inspired by `stat(3type)`.
 ///
 /// This is explicitly a non-exhaustive struct with public members. As LiteBox evolves, more
@@ -196,15 +145,6 @@ pub struct FileStatus {
     pub blksize: usize,
 }
 
-/// User information
-#[derive(Clone, Copy, Debug)]
-pub struct UserInfo {
-    /// User ID for the owner
-    pub user: u16,
-    /// Group ID for the owner
-    pub group: u16,
-}
-
 /// Device/Inode information
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 pub struct NodeInfo {
@@ -223,11 +163,6 @@ pub struct DirEntry {
     pub name: alloc::string::String,
     pub file_type: FileType,
     pub ino_info: Option<NodeInfo>,
-}
-
-impl UserInfo {
-    /// The root user
-    pub const ROOT: Self = Self { user: 0, group: 0 };
 }
 
 /// The size reported as the size of a directory.

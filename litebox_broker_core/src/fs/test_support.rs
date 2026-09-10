@@ -9,6 +9,9 @@
 
 use alloc::vec::Vec;
 
+use litebox_broker_protocol::fs::{
+    FileMode as Mode, FileSeekWhence as SeekWhence, FileUser as UserInfo,
+};
 use litebox_broker_protocol::stdio::StdioOutputStream;
 
 use super::backend::{Backend, DeviceIo, NoDeviceIo};
@@ -17,7 +20,7 @@ use super::errors::{
     RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
 };
 use super::resolver::{Resolver, ResolverEntry};
-use super::{DirEntry, FileStatus, Mode, OFlags, SeekWhence, UserInfo};
+use super::{DirEntry, FileStatus, OFlags};
 use crate::test_platform::TestPlatform;
 
 /// The unprivileged user these tests act as unless they need root.

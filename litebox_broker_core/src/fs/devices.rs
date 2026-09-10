@@ -8,6 +8,7 @@
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use litebox_broker_protocol::fs::{FileMode as Mode, FileType, FileUser as UserInfo};
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::stdio::StdioOutputStream;
 
@@ -20,7 +21,7 @@ use super::errors::{
     ReadError, RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::inode_allocator::InodeAllocator;
-use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
+use super::{DirEntry, FileStatus, NodeInfo, OFlags};
 
 /// Block size for stdio devices
 const STDIO_BLOCK_SIZE: usize = 1024;

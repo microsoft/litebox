@@ -7,7 +7,8 @@
 mod tests {
     use core::ffi::CStr;
 
-    use litebox::fs::{Mode, OFlags};
+    use litebox::fs::OFlags;
+    use litebox_broker_protocol::fs::FileMode as Mode;
     use litebox_common_linux::{FcntlArg, FileDescriptorFlags, IoctlArg, Termios, errno::Errno};
 
     use crate::{UserPtrMut, syscalls::tests::init_platform};

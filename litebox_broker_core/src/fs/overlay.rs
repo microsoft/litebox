@@ -20,6 +20,7 @@ use alloc::vec::Vec;
 
 use hashbrown::{HashMap, HashSet};
 
+use litebox_broker_protocol::fs::{FileMode as Mode, FileType, FileUser as UserInfo};
 use litebox_platform::sync::{Mutex, MutexGuard, RawSyncPrimitivesProvider};
 
 use super::backend::{
@@ -32,7 +33,7 @@ use super::errors::{
     ReadError, RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::inode_allocator::InodeAllocator;
-use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
+use super::{DirEntry, FileStatus, NodeInfo, OFlags};
 
 /// The reserved namespace prefix; no overlay-visible name may start with it.
 const MARKER_PREFIX: &str = ".litebox-overlay-";

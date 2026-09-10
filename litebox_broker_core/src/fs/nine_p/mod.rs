@@ -14,6 +14,8 @@ use alloc::vec::Vec;
 use core::num::NonZeroUsize;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use litebox_broker_protocol::fs::{FileMode, FileType, FileUser};
+use litebox_platform::sync;
 use thiserror::Error;
 
 use self::fcall::Rlerror;
@@ -26,8 +28,6 @@ use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
     ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WalkError, WriteError,
 };
-use litebox_platform::sync;
-
 mod client;
 mod fcall;
 mod id_pool;
@@ -527,7 +527,7 @@ where
             fid,
             name,
             fcall::LOpenFlags::O_RDWR,
-            metadata.mode.bits(),
+            metadata.mode.bits().into(),
             u32::from(metadata.owner.group),
         )?;
         Ok(FileHandle::from_typed::<Self>(NinePFileHandle {
@@ -546,7 +546,7 @@ where
         self.client.mkdir(
             &dir.fid.fid,
             name,
-            metadata.mode.bits(),
+            metadata.mode.bits().into(),
             u32::from(metadata.owner.group),
         )?;
         // `Tmkdir` only reports the new directory's qid, so a walk is needed to address it.
@@ -572,13 +572,13 @@ where
         Ok(self.remove_at(&dir.into_typed::<Self>(), name, false)?)
     }
 
-    fn chmod(&self, h: HandleRef<'_>, mode: super::Mode) -> Result<(), ChmodError> {
+    fn chmod(&self, h: HandleRef<'_>, mode: FileMode) -> Result<(), ChmodError> {
         let fid = match h {
             HandleRef::File(h) => &h.get_typed::<Self>().fid,
             HandleRef::Dir(h) => &h.get_typed::<Self>().fid,
         };
         let stat = fcall::SetAttr {
-            mode: mode.bits(),
+            mode: mode.bits().into(),
             ..Default::default()
         };
         Ok(self
@@ -703,12 +703,18 @@ fn oflags_to_lopen(flags: OFlags) -> fcall::LOpenFlags {
 }
 
 /// Convert a Qid type to our FileType
-fn qid_type_to_file_type(qid_type: fcall::QidType) -> super::FileType {
+fn qid_type_to_file_type(qid_type: fcall::QidType) -> FileType {
     if qid_type.contains(fcall::QidType::DIR) {
-        super::FileType::Directory
+        FileType::Directory
     } else {
-        super::FileType::RegularFile
+        FileType::RegularFile
     }
+}
+
+fn file_mode(mode: u32) -> FileMode {
+    let bits = u16::try_from(mode & u32::from(FileMode::SUPPORTED.bits()))
+        .expect("supported file mode bits fit in u16");
+    FileMode::from_bits_retain(bits)
 }
 
 /// Convert getattr response to FileStatus
@@ -724,9 +730,9 @@ fn rgetattr_to_file_status(
     if attr.valid.contains(fcall::GetattrMask::BASIC) {
         Ok(super::FileStatus {
             file_type,
-            mode: super::Mode::from_bits_truncate(attr.stat.mode),
+            mode: file_mode(attr.stat.mode),
             size: usize::try_from(attr.stat.size).map_err(|_| Error::InvalidResponse)?,
-            owner: super::UserInfo {
+            owner: FileUser {
                 user: u16::try_from(attr.stat.uid).map_err(|_| Error::InvalidResponse)?,
                 group: u16::try_from(attr.stat.gid).map_err(|_| Error::InvalidResponse)?,
             },
@@ -743,16 +749,16 @@ fn rgetattr_to_file_status(
         Ok(super::FileStatus {
             file_type,
             mode: if attr.valid.contains(fcall::GetattrMask::MODE) {
-                super::Mode::from_bits_truncate(attr.stat.mode)
+                file_mode(attr.stat.mode)
             } else {
-                super::Mode::empty()
+                FileMode::empty()
             },
             size: if attr.valid.contains(fcall::GetattrMask::SIZE) {
                 usize::try_from(attr.stat.size).map_err(|_| Error::InvalidResponse)?
             } else {
                 0
             },
-            owner: super::UserInfo {
+            owner: FileUser {
                 user: if attr.valid.contains(fcall::GetattrMask::UID) {
                     u16::try_from(attr.stat.uid).map_err(|_| Error::InvalidResponse)?
                 } else {
@@ -933,7 +939,7 @@ impl From<Error> for FileStatusError {
                     #[cfg(debug_assertions)]
                     dir: String::new(),
                     #[cfg(debug_assertions)]
-                    perms: super::Mode::empty(),
+                    perms: FileMode::empty(),
                 }),
                 _ => FileStatusError::Io,
             },
@@ -1012,7 +1018,7 @@ impl From<Error> for WalkError {
                     #[cfg(debug_assertions)]
                     dir: String::new(),
                     #[cfg(debug_assertions)]
-                    perms: super::Mode::empty(),
+                    perms: FileMode::empty(),
                 }),
                 _ => WalkError::Io,
             },

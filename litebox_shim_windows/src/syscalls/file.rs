@@ -13,9 +13,10 @@ use litebox::fs::errors::{
     FileStatusError, MkdirError, OpenError, PathError, ReadDirError, ReadError, SeekError,
     WriteError,
 };
-use litebox::fs::{FileStatus, FileType, Mode, OFlags, SeekWhence};
+use litebox::fs::{FileStatus, OFlags};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider};
 use litebox::utils::TruncateExt as _;
+use litebox_broker_protocol::fs::{FileMode as Mode, FileSeekWhence as SeekWhence, FileType};
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::byteorder::native_endian::U32;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};

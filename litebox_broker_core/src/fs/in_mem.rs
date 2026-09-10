@@ -8,6 +8,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use hashbrown::HashMap;
 
+use litebox_broker_protocol::fs::{FileMode as Mode, FileType, FileUser as UserInfo};
 use litebox_platform::sync;
 
 use super::errors::{
@@ -15,7 +16,7 @@ use super::errors::{
     ReadError, RmdirError, TruncateError, UnlinkError, WriteError,
 };
 use super::inode_allocator::InodeAllocator;
-use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, UserInfo};
+use super::{DirEntry, FileStatus, NodeInfo};
 
 /// A [`super::backend::Backend`] that stores all files in memory.
 ///

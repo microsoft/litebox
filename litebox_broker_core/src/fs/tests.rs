@@ -8,13 +8,16 @@
 //! descriptor table involved: the semantics under test are owned by broker core.
 
 use alloc::borrow::Cow;
+use litebox_broker_protocol::fs::{
+    FileMode as Mode, FileSeekWhence as SeekWhence, FileType, FileUser as UserInfo,
+};
 
+use super::OFlags;
 use super::in_mem::InMem;
 use super::inode_allocator::InodeAllocator;
 use super::overlay::Overlay;
 use super::tar_ro::TarRo;
 use super::test_support::{Fs, ROOT, RecordingStdio, USER, UnservicedStdio};
-use super::{Mode, OFlags, UserInfo};
 use crate::test_platform::TestPlatform;
 
 const TEST_TAR_FILE: &[u8] = include_bytes!("./test.tar");
@@ -40,13 +43,15 @@ fn overlay_fs(
 }
 
 mod in_mem {
-    use super::{Fs, InMem, Mode, OFlags, ROOT, TestPlatform, USER, in_mem_fs};
+    use super::{
+        FileType, Fs, InMem, Mode, OFlags, ROOT, SeekWhence, TestPlatform, USER, UserInfo,
+        in_mem_fs,
+    };
     use crate::fs::errors::{
         ChownError, MkdirError, OpenError, PathError, ReadDirError, ReadError, RmdirError,
         UnlinkError,
     };
     use crate::fs::test_support::Entry;
-    use crate::fs::{FileType, SeekWhence};
     use alloc::vec;
     use alloc::vec::Vec;
 
@@ -443,7 +448,7 @@ mod in_mem {
             .expect("Failed to chown as owner");
 
         // A different user may not chown (should fail)
-        let other = super::UserInfo {
+        let other = UserInfo {
             user: 500,
             group: 500,
         };
@@ -944,8 +949,7 @@ mod in_mem {
 }
 
 mod tar_ro {
-    use super::{Mode, OFlags, TEST_TAR_FILE, USER, tar_ro_fs};
-    use crate::fs::FileType;
+    use super::{FileType, Mode, OFlags, TEST_TAR_FILE, USER, tar_ro_fs};
     use crate::fs::errors::{OpenError, PathError, ReadDirError};
     use alloc::vec;
     use alloc::vec::Vec;
@@ -1102,9 +1106,10 @@ mod tar_ro {
 }
 
 mod overlay {
-    use super::{Fs, Mode, OFlags, Overlay, TEST_TAR_FILE, TestPlatform, USER, UserInfo};
-    use crate::fs::FileType;
-    use crate::fs::SeekWhence;
+    use super::{
+        FileType, Fs, Mode, OFlags, Overlay, SeekWhence, TEST_TAR_FILE, TestPlatform, USER,
+        UserInfo,
+    };
     use crate::fs::errors::{FileStatusError, OpenError, PathError, RmdirError};
     use crate::fs::in_mem::{InMem, InitialNode};
     use alloc::vec;

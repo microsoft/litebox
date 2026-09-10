@@ -418,17 +418,17 @@ fn decode_bool(decoder: &mut Decoder<'_>) -> Result<bool, WireError> {
 
 fn encode_whence(encoder: &mut Encoder, whence: FileSeekWhence) {
     encoder.u8(match whence {
-        FileSeekWhence::Beginning => 0,
-        FileSeekWhence::Current => 1,
-        FileSeekWhence::End => 2,
+        FileSeekWhence::RelativeToBeginning => 0,
+        FileSeekWhence::RelativeToCurrentOffset => 1,
+        FileSeekWhence::RelativeToEnd => 2,
     });
 }
 
 fn decode_whence(decoder: &mut Decoder<'_>) -> Result<FileSeekWhence, WireError> {
     match decoder.u8()? {
-        0 => Ok(FileSeekWhence::Beginning),
-        1 => Ok(FileSeekWhence::Current),
-        2 => Ok(FileSeekWhence::End),
+        0 => Ok(FileSeekWhence::RelativeToBeginning),
+        1 => Ok(FileSeekWhence::RelativeToCurrentOffset),
+        2 => Ok(FileSeekWhence::RelativeToEnd),
         _ => Err(WireError::InvalidTag),
     }
 }

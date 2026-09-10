@@ -9,6 +9,8 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
+use litebox_broker_protocol::fs::{FileMode as Mode, FileType, FileUser as UserInfo};
+
 use super::backend::{
     Backend, BackendHandles, CreationMetadata, DirHandle, FileHandle, HandleRef, PermissionCheck,
     Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkedComponent, WalkingDirHandle,
@@ -18,7 +20,7 @@ use super::errors::{
     ReadError, RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::inode_allocator::{InodeAllocator, InodeAllocators};
-use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
+use super::{DirEntry, FileStatus, NodeInfo, OFlags};
 use thiserror::Error;
 
 // XXX(jayb): consider removing this via a runtime reserved device ID?

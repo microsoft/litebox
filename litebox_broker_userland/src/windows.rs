@@ -19,8 +19,8 @@ use litebox_broker_core::fs::in_mem::{InMem, InitialNode};
 use litebox_broker_core::fs::overlay::Overlay;
 use litebox_broker_core::fs::resolver::Resolver;
 use litebox_broker_core::fs::tar_ro::TarRo;
-use litebox_broker_core::fs::{Mode, UserInfo};
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
+use litebox_broker_protocol::fs::{FileMode as Mode, FileUser as UserInfo};
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport_windows_userland::named_pipe::{
     WindowsNamedPipeHostSetupChannel, WindowsNamedPipeListener, WindowsNamedPipeStream,

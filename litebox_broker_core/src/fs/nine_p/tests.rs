@@ -12,13 +12,15 @@ use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 
+use litebox_broker_protocol::fs::{FileMode as Mode, FileSeekWhence as SeekWhence, FileType};
+
+use crate::fs::OFlags;
 use crate::fs::errors::{
     FileStatusError, MkdirError, OpenError, ReadDirError, ReadError, RmdirError, SeekError,
     TruncateError, UnlinkError, WriteError,
 };
 use crate::fs::inode_allocator::InodeAllocator;
 use crate::fs::test_support::{Fs, USER};
-use crate::fs::{FileType, Mode, OFlags, SeekWhence};
 use crate::test_platform::TestPlatform;
 
 use super::{NineP, transport};

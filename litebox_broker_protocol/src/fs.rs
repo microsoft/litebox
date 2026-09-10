@@ -6,6 +6,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use bitflags::bitflags;
 use thiserror::Error;
 
 use crate::ObjectHandle;
@@ -26,6 +27,11 @@ pub struct FileUser {
     pub user: u16,
     /// Effective group ID.
     pub group: u16,
+}
+
+impl FileUser {
+    /// The root user.
+    pub const ROOT: Self = Self { user: 0, group: 0 };
 }
 
 /// File object kind.
@@ -129,14 +135,13 @@ pub enum FileError {
 
 /// Seek origin.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum FileSeekWhence {
     /// Offset from the beginning of the file.
-    Beginning,
+    RelativeToBeginning,
     /// Offset from the file's current position.
-    Current,
+    RelativeToCurrentOffset,
     /// Offset from the end of the file.
-    End,
+    RelativeToEnd,
 }
 
 /// Access mode requested when opening a fs object.
@@ -151,29 +156,43 @@ pub enum FileAccessMode {
     ReadWrite,
 }
 
-/// ABI-neutral fs permission and special mode bits.
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct FileMode(u16);
-
-impl FileMode {
-    /// Every permission and special mode bit this protocol version defines.
-    pub const SUPPORTED: Self = Self(0o7777);
-
-    /// Creates a mode when every bit is defined by this protocol version.
-    #[must_use]
-    pub const fn from_bits(bits: u16) -> Option<Self> {
-        if bits & !Self::SUPPORTED.0 == 0 {
-            Some(Self(bits))
-        } else {
-            None
-        }
-    }
-
-    /// Returns the stable protocol bits.
-    #[must_use]
-    pub const fn bits(self) -> u16 {
-        self.0
+bitflags! {
+    /// ABI-neutral fs permission and special mode bits.
+    #[repr(transparent)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+    pub struct FileMode: u16 {
+        /// User (file owner) has read, write, and execute permission.
+        const RWXU = 0o00700;
+        /// User has read permission.
+        const RUSR = 0o00400;
+        /// User has write permission.
+        const WUSR = 0o00200;
+        /// User has execute permission.
+        const XUSR = 0o00100;
+        /// Group has read, write, and execute permission.
+        const RWXG = 0o00070;
+        /// Group has read permission.
+        const RGRP = 0o00040;
+        /// Group has write permission.
+        const WGRP = 0o00020;
+        /// Group has execute permission.
+        const XGRP = 0o00010;
+        /// Others have read, write, and execute permission.
+        const RWXO = 0o00007;
+        /// Others have read permission.
+        const ROTH = 0o00004;
+        /// Others have write permission.
+        const WOTH = 0o00002;
+        /// Others have execute permission.
+        const XOTH = 0o00001;
+        /// Set-user-ID bit.
+        const SUID = 0o0004000;
+        /// Set-group-ID bit.
+        const SGID = 0o0002000;
+        /// Sticky bit.
+        const SVTX = 0o0001000;
+        /// Every permission and special mode bit this protocol version defines.
+        const SUPPORTED = 0o0007777;
     }
 }
 

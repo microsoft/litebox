@@ -3,6 +3,7 @@
 
 //! Errors from LiteBox file operations.
 
+use litebox_broker_protocol::fs::FileMode;
 use thiserror::Error;
 
 // XXX(jayb): We probably need to introduce a notion of `Stale` to many/most of these errors, in
@@ -224,7 +225,7 @@ pub enum PathError {
         #[cfg(debug_assertions)]
         dir: alloc::string::String,
         #[cfg(debug_assertions)]
-        perms: crate::fs::Mode,
+        perms: FileMode,
     },
     #[error("invalid characters, not permitted by underlying file system")]
     InvalidPathname,

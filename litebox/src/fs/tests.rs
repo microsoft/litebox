@@ -22,7 +22,7 @@ use std::sync::{Barrier, Mutex};
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileNodeInfo, FileOpenFlags,
-    FileSeekWhence, FileStatus as BrokerFileStatus, FileUser, MAX_FILE_TRANSFER_SIZE,
+    FileSeekWhence, FileStatus as BrokerFileStatus, FileType, FileUser, MAX_FILE_TRANSFER_SIZE,
     OpenFileResponse, ReadDirectoryResponse, ReadFileResponse, SeekFileResponse, WriteFileResponse,
     encode_directory_entries_chunk,
 };
@@ -40,7 +40,7 @@ use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemory, Sh
 use crate::fs::errors::{
     OpenError, PathError, ReadDirError, ReadError, RmdirError, UnlinkError, WriteError,
 };
-use crate::fs::{Context, FileType, Mode, OFlags, SeekWhence, UserInfo};
+use crate::fs::{Context, OFlags};
 use crate::platform::mock::MockPlatform;
 
 /// The handle the scripted broker hands out for every successful open.
@@ -430,7 +430,7 @@ fn context_resolves_paths_against_the_cwd() {
 fn open_sends_the_resolved_path_and_translated_flags() {
     let mut context = Context::new();
     context.set_cwd(context.resolve("/work").unwrap());
-    context.set_acting_user(UserInfo { user: 7, group: 9 });
+    context.set_acting_user(FileUser { user: 7, group: 9 });
     let (broker, fs) = scripted_fs([opened()]);
 
     let fd = fs
@@ -438,7 +438,7 @@ fn open_sends_the_resolved_path_and_translated_flags() {
             &context,
             "sub/../file.txt",
             OFlags::CREAT | OFlags::WRONLY | OFlags::APPEND,
-            Mode::RWXU,
+            FileMode::RWXU,
         )
         .expect("open should succeed");
 
@@ -466,7 +466,7 @@ fn read_and_write_transfer_payloads_through_the_broker() {
     ]);
 
     let fd = fs
-        .open_file(&context, "/file", OFlags::RDWR, Mode::empty())
+        .open_file(&context, "/file", OFlags::RDWR, FileMode::empty())
         .expect("open should succeed");
 
     assert_eq!(fs.write_file(&fd, b"hello", None).unwrap(), 5);
@@ -475,7 +475,11 @@ fn read_and_write_transfer_payloads_through_the_broker() {
     let read = fs.read_file(&fd, &mut buffer, Some(2)).unwrap();
     assert_eq!(&buffer[..read], b"broker");
 
-    assert_eq!(fs.seek_file(&fd, -3, SeekWhence::RelativeToEnd).unwrap(), 3);
+    assert_eq!(
+        fs.seek_file(&fd, -3, FileSeekWhence::RelativeToEnd)
+            .unwrap(),
+        3
+    );
     fs.close_file(&fd).expect("close should succeed");
 
     let calls = broker.calls();
@@ -500,7 +504,7 @@ fn read_and_write_transfer_payloads_through_the_broker() {
         Call::Seek {
             handle: FILE_HANDLE,
             offset: -3,
-            whence: FileSeekWhence::End,
+            whence: FileSeekWhence::RelativeToEnd,
         }
     );
     assert_eq!(calls[4], Call::Close(FILE_HANDLE));
@@ -512,7 +516,7 @@ fn closing_releases_the_broker_object_and_the_descriptor() {
     let (broker, fs) = scripted_fs([opened()]);
 
     let fd = fs
-        .open_file(&context, "/file", OFlags::RDONLY, Mode::empty())
+        .open_file(&context, "/file", OFlags::RDONLY, FileMode::empty())
         .expect("open should succeed");
     fs.close_file(&fd).expect("close should succeed");
     assert_eq!(broker.calls()[1], Call::Close(FILE_HANDLE));
@@ -544,7 +548,7 @@ fn in_flight_read_keeps_the_broker_file_alive_after_close() {
         },
     ]);
     let fd = Arc::new(
-        fs.open_file(&Context::new(), "/file", OFlags::RDONLY, Mode::empty())
+        fs.open_file(&Context::new(), "/file", OFlags::RDONLY, FileMode::empty())
             .expect("open should succeed"),
     );
 
@@ -596,7 +600,7 @@ fn path_status_converts_broker_values() {
         .expect("status should succeed");
 
     assert_eq!(status.file_type, FileType::CharacterDevice);
-    assert_eq!(status.mode, Mode::from_bits(0o644).unwrap());
+    assert_eq!(status.mode, FileMode::from_bits(0o644).unwrap());
     assert_eq!(status.size, 12);
     assert_eq!(status.owner.user, 1);
     assert_eq!(status.owner.group, 2);
@@ -654,7 +658,7 @@ fn read_dir_reassembles_paged_broker_entries() {
             &context,
             "/dir",
             OFlags::RDONLY | OFlags::DIRECTORY,
-            Mode::empty(),
+            FileMode::empty(),
         )
         .expect("open should succeed");
     let entries = fs
@@ -701,11 +705,11 @@ fn broker_file_errors_map_to_guest_errors() {
     ]);
 
     assert!(matches!(
-        fs.open_file(&context, "/missing", OFlags::RDONLY, Mode::empty()),
+        fs.open_file(&context, "/missing", OFlags::RDONLY, FileMode::empty()),
         Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
     ));
     assert!(matches!(
-        fs.open_file(&context, "/secret", OFlags::RDONLY, Mode::empty()),
+        fs.open_file(&context, "/secret", OFlags::RDONLY, FileMode::empty()),
         Err(OpenError::AccessNotAllowed)
     ));
     assert!(matches!(
@@ -718,7 +722,7 @@ fn broker_file_errors_map_to_guest_errors() {
     ));
 
     let fd = fs
-        .open_file(&context, "/file", OFlags::WRONLY, Mode::empty())
+        .open_file(&context, "/file", OFlags::WRONLY, FileMode::empty())
         .expect("open should succeed");
     let mut buffer = [0; 4];
     assert!(matches!(

@@ -532,7 +532,7 @@ mod tests {
         assert_eq!(output, [4, 5]);
         assert_eq!(
             local
-                .seek_file(handle, 0, FileSeekWhence::Beginning)
+                .seek_file(handle, 0, FileSeekWhence::RelativeToBeginning)
                 .unwrap(),
             Ok(0)
         );

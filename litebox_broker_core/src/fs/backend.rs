@@ -8,13 +8,14 @@ use alloc::vec::Vec;
 use core::any::{Any, TypeId};
 use core::marker::PhantomData;
 
+use litebox_broker_protocol::fs::{FileMode as Mode, FileUser as UserInfo};
 use litebox_broker_protocol::stdio::StdioOutputStream;
 
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, ReadDirError, ReadError,
     RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
 };
-use super::{DirEntry, FileStatus, Mode, OFlags, UserInfo};
+use super::{DirEntry, FileStatus, OFlags};
 
 // This duplicates the cloneable type-erasure support from `litebox::utilities::anymap` because
 // broker core cannot depend on LiteBox. Keep it local unless broader reuse justifies a common home.
