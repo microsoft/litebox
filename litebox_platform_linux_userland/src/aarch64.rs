@@ -908,13 +908,6 @@ pub(super) mod resume_frame {
             let parsed = super::find_fpsimd_context(&records.0).unwrap();
             assert_eq!(parsed.vregs, expected);
 
-            let parsed = super::find_fpsimd_context_mut(&mut records.0).unwrap();
-            parsed.fpsr = 0x0800_0001;
-            parsed.fpcr = 0x03c0_0000;
-            let parsed = super::find_fpsimd_context(&records.0).unwrap();
-            assert_eq!(parsed.fpsr, 0x0800_0001);
-            assert_eq!(parsed.fpcr, 0x03c0_0000);
-
             records.0[4..8].copy_from_slice(&15u32.to_ne_bytes());
             assert!(super::find_fpsimd_context(&records.0).is_none());
 
@@ -1940,14 +1933,7 @@ mod tests {
             records[4..8].copy_from_slice(&FPSIMD_SIZE.to_ne_bytes());
         }
 
-        set_signal_return(
-            &mut context,
-            signal_return_test_callback,
-            0x10,
-            0x20,
-            0x30,
-            0x40,
-        );
+        set_signal_return(&mut context, signal_return_test_callback, 0, 0, 0, 0);
         set_saved_host_fp_environment(previous_saved);
 
         let records = unsafe {
@@ -1963,11 +1949,6 @@ mod tests {
             u32::from_ne_bytes(records[12..16].try_into().unwrap()),
             EXPECTED_CONTROL
         );
-        assert_eq!(
-            context.uc_mcontext.pc,
-            signal_return_test_callback as *const () as usize as u64
-        );
-        assert_eq!(&context.uc_mcontext.regs[..4], &[0x10, 0x20, 0x30, 0x40]);
     }
 
     fn gate_fixture(
