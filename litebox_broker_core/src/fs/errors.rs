@@ -5,8 +5,6 @@
 
 use thiserror::Error;
 
-use super::Mode;
-
 // XXX(jayb): We probably need to introduce a notion of `Stale` to many/most of these errors, in
 // order to more correctly support network-attached file systems.
 
@@ -209,7 +207,7 @@ pub enum PathError {
         #[cfg(debug_assertions)]
         dir: alloc::string::String,
         #[cfg(debug_assertions)]
-        perms: Mode,
+        perms: super::Mode,
     },
     #[error("invalid characters, not permitted by underlying file system")]
     InvalidPathname,

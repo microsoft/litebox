@@ -24,19 +24,22 @@
 //! Taro Milk Tea, Tapioca Bubbles, 50% Sugar, No Ice.
 //! ```
 
-use super::{
-    DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo,
-    backend::{CreationMetadata, DirHandle, FileHandle, HandleRef, WalkingDirHandle},
-    errors::{
-        ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-        ReadError, RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
-    },
-    inode_allocator::InodeAllocator,
-};
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::ops::Range;
 use hashbrown::HashMap;
+
+use super::{DirEntry, FileType};
+
+use super::{
+    Mode, NodeInfo, OFlags, UserInfo,
+    backend::{CreationMetadata, DirHandle, FileHandle, HandleRef, WalkingDirHandle},
+    errors::{
+        ChmodError, ChownError, MkdirError, OpenError, PathError, ReadDirError, ReadError,
+        RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
+    },
+    inode_allocator::InodeAllocator,
+};
 
 /// Block size for file system I/O operations
 // TODO(jayb): Determine appropriate block size
@@ -232,14 +235,18 @@ impl super::backend::Backend for TarRo {
         super::backend::SeekBehavior::PositionBased
     }
 
-    fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError> {
+    fn status(
+        &self,
+        h: HandleRef<'_>,
+    ) -> Result<super::FileStatus, super::errors::FileStatusError> {
         match h {
             HandleRef::File(h) => {
                 let file = &self.tar_index.files[h.get_typed::<Self>().idx];
-                Ok(FileStatus {
+                Ok(super::FileStatus {
                     file_type: FileType::RegularFile,
                     mode: file.mode,
-                    size: u64::try_from(file.data_range.len()).map_err(|_| FileStatusError::Io)?,
+                    size: u64::try_from(file.data_range.len())
+                        .map_err(|_| super::errors::FileStatusError::Io)?,
                     owner: file.owner,
                     node_info: file.node_info,
                     blksize: BLOCK_SIZE,
@@ -247,7 +254,7 @@ impl super::backend::Backend for TarRo {
             }
             HandleRef::Dir(h) => {
                 let dir = &self.tar_index.dirs[h.get_typed::<Self>().idx];
-                Ok(FileStatus {
+                Ok(super::FileStatus {
                     file_type: FileType::Directory,
                     mode: DEFAULT_DIR_MODE,
                     size: super::DEFAULT_DIRECTORY_SIZE,
