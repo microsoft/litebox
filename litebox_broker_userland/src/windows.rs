@@ -8,12 +8,10 @@ use std::ffi::OsString;
 use std::io::Result as IoResult;
 use std::os::windows::io::AsRawHandle;
 use std::process::Child;
-use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Instant;
 
 use clap::Parser as _;
-use litebox_broker_core::fs::FileService;
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
 use litebox_broker_platform_windows_userland::WindowsSyncPrimitivesProvider;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
@@ -29,13 +27,17 @@ use super::{SETUP_TIMEOUT, configured_socket_policy};
 pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
     let control_pipe = unique_control_pipe_name();
     let control_listener = WindowsNamedPipeListener::bind(&control_pipe)?;
-    let broker = BrokerCoreBuilder::new(
-        PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()).with_socket_policy(
-            configured_socket_policy(&args.allow_tcp_destination, &args.allow_udp_destination)?,
-        ),
-    )
-    .with_file_service(create_file_service(&args)?)
-    .build()?;
+    let policy = PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()).with_socket_policy(
+        configured_socket_policy(&args.allow_tcp_destination, &args.allow_udp_destination)?,
+    );
+    validate_fs_options(&args)?;
+    let fs = super::fs::create_file_service::<WindowsSyncPrimitivesProvider>(
+        Vec::new(),
+        args.fs_initial_files.as_deref(),
+    )?;
+    let broker = BrokerCoreBuilder::new(policy)
+        .with_file_service(fs)
+        .build()?;
 
     if args.in_process_runner {
         debug_assert!(args.unstable);
@@ -48,17 +50,14 @@ pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
     }
 }
 
-fn create_file_service(args: &super::CliArgs) -> Result<Arc<dyn FileService>, Box<dyn Error>> {
+fn validate_fs_options(args: &super::CliArgs) -> IoResult<()> {
     if args.fs_program.is_some() || args.fs_rewrite_syscalls || args.fs_virtualize_x18 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "Windows broker file systems require the program in the initial tar archive",
-        )
-        .into());
+        ));
     }
-    Ok(super::fs::create_file_service::<
-        WindowsSyncPrimitivesProvider,
-    >(Vec::new(), args.fs_initial_files.as_deref())?)
+    Ok(())
 }
 
 fn run_runner_in_process(
