@@ -1406,15 +1406,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 litebox_broker_protocol::fs::FileMode::empty(),
             )?;
             let mut header = [0u8; SHEBANG_MAX_LINE];
-            let files = self.files.borrow();
-            let n = match files.fs.read_file(&file, &mut header, Some(0)) {
+            let n = match self.global.litebox.read_file(&file, &mut header, Some(0)) {
                 Ok(n) => n,
                 Err(e) => {
-                    let _ = files.fs.close_file(&file);
+                    let _ = self.global.litebox.close_file(&file);
                     return Err(Errno::from(e));
                 }
             };
-            let _ = files.fs.close_file(&file);
+            let _ = self.global.litebox.close_file(&file);
 
             match parse_shebang(&header[..n]) {
                 Some((interp, opt_arg)) => {

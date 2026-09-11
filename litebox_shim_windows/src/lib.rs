@@ -409,16 +409,17 @@ impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
 
     #[must_use]
     pub fn build(self) -> WindowsShim<Platform> {
+        let litebox = Arc::new(self.litebox);
         let global = Arc::new(GlobalState {
             platform: self.platform,
-            page_manager: PageManager::new(&self.litebox),
-            registry: syscalls::registry::RegistryStore::new(&self.litebox),
+            page_manager: PageManager::new(&litebox),
+            registry: syscalls::registry::RegistryStore::new(Arc::clone(&litebox)),
             wnf_states: syscalls::wnf::WnfStateStore::new(
                 syscalls::wnf::WnfStateStoreData::default(),
             ),
             mui_generation: AtomicU32::new(1),
             qpc_boot_instant: TimeProvider::now(self.platform),
-            litebox: self.litebox,
+            litebox,
         });
         WindowsShim(global)
     }
@@ -493,7 +494,7 @@ impl<Platform: ShimPlatform> WindowsShim<Platform> {
         #[cfg(not(target_os = "windows"))]
         let _ = map_windows_user_shared_data::<Platform>(&self.0.page_manager)
             .ok_or(loader::WindowsLoadError::MapSharedMemory)?;
-        let fs = Arc::new(self.0.litebox.clone());
+        let fs = Arc::clone(&self.0.litebox);
         let load_info = loader::PeLoader::new(self.0.platform, fs.clone(), &self.0.page_manager)
             .load(path, &argv, &envp)?;
         // TODO: shared section should be only created once and shared across all processes, not created per-process.
@@ -540,7 +541,7 @@ struct GlobalState<Platform: ShimPlatform> {
     wnf_states: syscalls::wnf::WnfStateStore<Platform>,
     mui_generation: AtomicU32,
     qpc_boot_instant: <Platform as TimeProvider>::Instant,
-    litebox: LiteBox<Platform>,
+    litebox: Arc<LiteBox<Platform>>,
 }
 
 /// Per-process Windows state shared by every thread in the process.

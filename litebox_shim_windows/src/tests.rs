@@ -171,10 +171,10 @@ fn test_task_from_litebox(litebox: litebox::LiteBox<TestPlatform>) -> Task<TestP
     let platform = test_platform();
     let shim_builder =
         crate::WindowsShimBuilder::<TestPlatform>::new_with_litebox(platform, litebox);
-    let fs = Arc::new(shim_builder.litebox().clone());
     let fs_context = litebox::fs::Context::new();
     let shim = shim_builder.build();
     let WindowsShim(global) = shim;
+    let fs = Arc::clone(&global.litebox);
 
     let windows_shared_section_base = map_csr_server_shared_memory(&global.page_manager)
         .expect("mapping shared memory should succeed");

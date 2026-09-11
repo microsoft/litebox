@@ -140,8 +140,6 @@ fn file_open_options(flags: OFlags) -> Result<(FileAccessMode, FileOpenFlags), O
 
 /// Task state shared by `CLONE_FILES`.
 pub(crate) struct FilesState<Platform: ShimPlatform> {
-    /// The filesystem implementation, shared across tasks that share file system.
-    pub(crate) fs: litebox::LiteBox<Platform>,
     pub(crate) raw_descriptor_store:
         litebox::sync::RwLock<Platform, litebox::fd::RawDescriptorStorage>,
     /// Exclusive upper bound for raw file descriptor values.
@@ -149,9 +147,8 @@ pub(crate) struct FilesState<Platform: ShimPlatform> {
 }
 
 impl<Platform: ShimPlatform> FilesState<Platform> {
-    pub(crate) fn new(fs: &litebox::LiteBox<Platform>) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            fs: fs.clone(),
             raw_descriptor_store: litebox::sync::RwLock::new(
                 litebox::fd::RawDescriptorStorage::new(),
             ),
@@ -434,7 +431,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 }
             });
         let file = {
-            let files = self.files.borrow();
             let fs = self.fs.borrow();
             let context = fs.context.read();
             let path = path
@@ -442,8 +438,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 .map_err(litebox::fs::errors::PathError::from)?;
             let (access, open_flags) =
                 file_open_options(flags - OFlags::CLOEXEC).map_err(Errno::from)?;
-            files
-                .fs
+            self.global
+                .litebox
                 .open_file(&context, path, access, open_flags, mode)
                 .map_err(Errno::from)
         }?;
@@ -482,7 +478,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         let files = self.files.borrow();
         let raw_fd = files.insert_raw_fd(file).map_err(|file| {
-            files.fs.close_file(&file).unwrap();
+            self.global.litebox.close_file(&file).unwrap();
             Errno::EMFILE
         })?;
         Ok(u32::try_from(raw_fd).unwrap())
@@ -524,8 +520,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let fd = files.typed_fd(fd)?;
         fd.dispatch(
             |fd| {
-                files
-                    .fs
+                self.global
+                    .litebox
                     .truncate_file(fd, length, false)
                     .map_err(Errno::from)
             },
@@ -563,8 +559,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
                     mode,
                 )?;
-                let files = self.files.borrow();
-                let _ = files.fs.close_file(&file);
+                let _ = self.global.litebox.close_file(&file);
             }
             // TODO: Named pipe, socket, block and char files are not supported
             InodeType::NamedPipe
@@ -589,13 +584,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
 
         let path = self.resolve_path_at(dirfd, pathname)?;
-        let files = self.files.borrow();
         let fs = self.fs.borrow();
         let context = fs.context.read();
         if flags.contains(AtFlags::AT_REMOVEDIR) {
-            files.fs.rmdir_file(&context, path).map_err(Errno::from)
+            self.global
+                .litebox
+                .rmdir_file(&context, path)
+                .map_err(Errno::from)
         } else {
-            files.fs.unlink_file(&context, path).map_err(Errno::from)
+            self.global
+                .litebox
+                .unlink_file(&context, path)
+                .map_err(Errno::from)
         }
     }
 
@@ -614,14 +614,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
         buf: &mut [u8],
         offset: Option<usize>,
     ) -> Result<usize, Errno> {
-        let files = self.files.borrow();
         // We need to do this cell dance because otherwise Rust can't recognize that the two
         // closures are mutually exclusive.
         let buf: core::cell::RefCell<&mut [u8]> = core::cell::RefCell::new(buf);
         let result = fd.dispatch(
             |fd| {
-                files
-                    .fs
+                self.global
+                    .litebox
                     .read_file(fd, &mut buf.borrow_mut(), offset)
                     .map_err(Errno::from)
             },
@@ -699,10 +698,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
         buf: &[u8],
         offset: Option<usize>,
     ) -> Result<usize, Errno> {
-        let files = self.files.borrow();
         let is_inet_datagram = core::cell::Cell::new(false);
         let result = fd.dispatch(
-            |fd| files.fs.write_file(fd, buf, offset).map_err(Errno::from),
+            |fd| {
+                self.global
+                    .litebox
+                    .write_file(fd, buf, offset)
+                    .map_err(Errno::from)
+            },
             |fd| {
                 espipe_for_non_seekable_offset(offset)?;
                 is_inet_datagram.set(matches!(
@@ -780,9 +783,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         let rewind = isize::try_from(unread_n).map_err(|_| Errno::EOVERFLOW)?;
         let fd = in_fd.fs_only(Errno::EINVAL)?;
-        let files = self.files.borrow();
-        files
-            .fs
+        self.global
+            .litebox
             .seek_file(fd, -rewind, SeekWhence::RelativeToCurrentOffset)
             .map(|_| ())
             .map_err(Errno::from)
@@ -809,10 +811,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 usize::try_from(off).map_err(|_| Errno::EINVAL)
             })
             .transpose()?;
-
         let mut kernel_buf = vec![0u8; count.min(PAGE_SIZE)];
         let mut total: usize = 0;
-        let files = self.files.borrow();
 
         while total < count {
             let to_read = (count - total).min(kernel_buf.len());
@@ -825,8 +825,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 Errno::EINVAL
             };
             let read_result = match typed_in_fd.as_fs() {
-                Some(fd) => files
-                    .fs
+                Some(fd) => self
+                    .global
+                    .litebox
                     .read_file(fd, &mut kernel_buf[..to_read], cur_off)
                     .map_err(Errno::from),
                 None => Err(non_fs_err),
@@ -908,8 +909,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         whence: SeekWhence,
     ) -> Result<usize, Errno> {
         let fd = fd.fs_only(Errno::ESPIPE)?;
-        let files = self.files.borrow();
-        match files.fs.seek_file(fd, offset, whence) {
+        match self.global.litebox.seek_file(fd, offset, whence) {
             Ok(pos) => Ok(pos),
             Err(litebox::fs::errors::SeekError::NotAFile) => {
                 let base = match whence {
@@ -935,11 +935,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     fn do_mkdir(&self, pathname: impl path::Arg, mode: Mode) -> Result<(), Errno> {
         let mode = mode & !self.get_umask();
-        let files = self.files.borrow();
         let fs = self.fs.borrow();
         let context = fs.context.read();
-        files
-            .fs
+        self.global
+            .litebox
             .mkdir_file(&context, pathname, mode)
             .map_err(Errno::from)
     }
@@ -1031,7 +1030,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 if let Ok(raw_fd) = i32::try_from(raw_fd) {
                     self.finalize_elf_patch(raw_fd);
                 }
-                files.fs.close_file(&fd).map_err(Errno::from)
+                self.global.litebox.close_file(&fd).map_err(Errno::from)
             }
             AnyTypedFd::Network(fd) => self.global.close_socket(&self.wait_cx(), fd),
             AnyTypedFd::Pipes(fd) => self.global.close_linux_pipe(&fd),
@@ -1464,10 +1463,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         caller: AccessUserInfo,
     ) -> Result<(), Errno> {
         let status = {
-            let files = self.files.borrow();
             let fs = self.fs.borrow();
             let context = fs.context.read();
-            files.fs.path_file_status(&context, pathname)?
+            self.global.litebox.path_file_status(&context, pathname)?
         };
         let owner = status.owner.into();
         Self::do_access_mode(status.mode, owner, caller, &mode)
@@ -1503,7 +1501,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 let files = self.files.borrow();
                 let typed_fd = files.typed_fd(fd)?;
                 if let Some(file) = typed_fd.as_fs() {
-                    let status = files.fs.file_status(file)?;
+                    let status = self.global.litebox.file_status(file)?;
                     return Self::do_access_mode(status.mode, status.owner.into(), caller, &mode);
                 }
                 drop(files);
@@ -1600,7 +1598,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     pub(crate) fn file_status(&self, fd: i32) -> Result<FileStatus, Errno> {
         let files = self.files.borrow();
         let fd = files.typed_fd(fd)?;
-        Ok(files.fs.file_status(fd.fs_only(Errno::EBADF)?)?)
+        Ok(self.global.litebox.file_status(fd.fs_only(Errno::EBADF)?)?)
     }
 
     pub(crate) fn do_stat<T>(&self, fd: &AnyTypedFd<Platform>) -> Result<T, Errno>
@@ -1631,9 +1629,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let socket_mode = litebox_common_linux::InodeType::Socket as u32
             | u32::from((Mode::RWXU | Mode::RWXG | Mode::RWXO).bits());
         let rw_user_mode = u32::from((Mode::RUSR | Mode::WUSR).bits());
-        let files = self.files.borrow();
         fd.dispatch(
-            |fd| T::try_from(files.fs.file_status(fd)?),
+            |fd| T::try_from(self.global.litebox.file_status(fd)?),
             |_fd| Ok(T::from(synthetic(socket_mode, 4096))),
             |fd| {
                 Ok(T::from(synthetic(
@@ -1663,10 +1660,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
             normalized_path
         };
         let status = {
-            let files = self.files.borrow();
             let fs = self.fs.borrow();
             let context = fs.context.read();
-            files.fs.path_file_status(&context, path)?
+            self.global.litebox.path_file_status(&context, path)?
         };
         T::try_from(status)
     }
@@ -1711,10 +1707,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 // Take the cwd before locking the context: this lock is not recursive, so a
                 // waiting writer would deadlock a nested read.
                 let cwd = get_cwd();
-                let files = self.files.borrow();
                 let fs = self.fs.borrow();
                 let context = fs.context.read();
-                T::try_from(files.fs.path_file_status(&context, cwd)?)
+                T::try_from(self.global.litebox.path_file_status(&context, cwd)?)
             }
             FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
                 self.with_typed_fd(fd, |fd| self.do_stat(fd))
@@ -2004,9 +1999,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         // Verify the path exists and is a directory.
         {
-            let files = self.files.borrow();
             let context = fs.context.read();
-            match files.fs.path_file_status(&context, target.to_string()) {
+            match self
+                .global
+                .litebox
+                .path_file_status(&context, target.to_string())
+            {
                 Ok(status) => {
                     if status.file_type != FileType::Directory {
                         return Err(Errno::ENOTDIR);
@@ -2216,7 +2214,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             | IoctlArg::TIOCGWINSZ(..) => {
                 let fd = files.typed_fd(fd)?;
                 let fd = fd.fs_only(Errno::ENOTTY)?;
-                if !self.is_stdio(&files.fs, fd)? {
+                if !self.is_stdio(self.global.litebox.as_ref(), fd)? {
                     return Err(Errno::ENOTTY);
                 }
                 let stream = self
@@ -2677,7 +2675,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         file.dispatch(
             |fd| {
                 dup(self, &files, fd, close_on_exec, target, |fd| {
-                    let _ = files.fs.close_file(&fd);
+                    let _ = self.global.litebox.close_file(&fd);
                 })
             },
             |fd| {
@@ -2802,7 +2800,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let mut dir_off = dir_off.0;
         let mut nbytes = 0;
 
-        let mut entries = files.fs.read_file_directory(file)?;
+        let mut entries = self.global.litebox.read_file_directory(file)?;
         entries.sort_by(|a, b| a.name.cmp(&b.name));
 
         for entry in entries.iter().skip(dir_off) {

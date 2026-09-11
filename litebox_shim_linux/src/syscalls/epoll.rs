@@ -702,7 +702,7 @@ mod test {
             .expect("pipe2 failed");
         let rfd = i32::try_from(rfd_u).unwrap();
         let wfd = i32::try_from(wfd_u).unwrap();
-        let no_fds = FilesState::new(&task.files.borrow().fs);
+        let no_fds = FilesState::new();
         let fds = task.files.borrow().clone();
         set.add_fd(rfd, Events::IN);
 

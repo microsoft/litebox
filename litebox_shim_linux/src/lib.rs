@@ -222,16 +222,17 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
 
     /// Build the shim.
     pub fn build(self) -> LinuxShim<Platform> {
-        let net = Network::new(&self.litebox);
+        let litebox = Arc::new(self.litebox);
+        let net = Network::new(&litebox);
         let global = Arc::new(GlobalState {
             platform: self.platform,
-            pm: PageManager::new(&self.litebox),
+            pm: PageManager::new(&litebox),
             futex_manager: FutexManager::new(),
-            pipes: Pipes::new(&self.litebox),
+            pipes: Pipes::new(&litebox),
             net: litebox::sync::Mutex::new(net),
             boot_time: self.platform.now(),
             next_thread_id: 2.into(), // start from 2, as 1 is used by the main thread
-            litebox: self.litebox,
+            litebox,
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
             elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
         });
@@ -265,7 +266,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             egid,
         } = task;
 
-        let files = syscalls::file::FilesState::new(&self.0.litebox);
+        let files = syscalls::file::FilesState::new();
         files.set_max_fd(syscalls::process::RLIMIT_NOFILE_CUR);
         let files = Arc::new(files);
         let credentials = Arc::new(syscalls::process::Credentials {
@@ -317,7 +318,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
     }
 
     pub fn litebox(&self) -> &LiteBox<Platform> {
-        &self.0.litebox
+        self.0.litebox.as_ref()
     }
 
     /// Returns the platform this shim was built with.
@@ -357,8 +358,8 @@ impl<Platform: ShimPlatform> syscalls::file::FilesState<Platform> {
         global: &GlobalState<Platform>,
         context: &litebox::fs::Context,
     ) {
-        let stdin = self
-            .fs
+        let stdin = global
+            .litebox
             .open_file(
                 context,
                 "/dev/stdin",
@@ -367,8 +368,8 @@ impl<Platform: ShimPlatform> syscalls::file::FilesState<Platform> {
                 Mode::empty(),
             )
             .unwrap();
-        let stdout = self
-            .fs
+        let stdout = global
+            .litebox
             .open_file(
                 context,
                 "/dev/stdout",
@@ -377,8 +378,8 @@ impl<Platform: ShimPlatform> syscalls::file::FilesState<Platform> {
                 Mode::empty(),
             )
             .unwrap();
-        let stderr = self
-            .fs
+        let stderr = global
+            .litebox
             .open_file(
                 context,
                 "/dev/stderr",
@@ -1154,7 +1155,7 @@ struct GlobalState<Platform: ShimPlatform> {
     /// The platform instance used throughout the shim.
     platform: &'static Platform,
     /// The LiteBox instance used throughout the shim.
-    litebox: litebox::LiteBox<Platform>,
+    litebox: Arc<litebox::LiteBox<Platform>>,
     /// The page manager for managing virtual memory.
     pm: litebox::mm::PageManager<Platform, { PAGE_SIZE }>,
     /// The futex manager for handling futex operations.
@@ -1214,7 +1215,7 @@ mod test_utils {
             let pid = self
                 .next_thread_id
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            let files = Arc::new(syscalls::file::FilesState::new(&self.litebox));
+            let files = Arc::new(syscalls::file::FilesState::new());
             let credentials = Arc::new(syscalls::process::Credentials {
                 uid: 0,
                 euid: 0,

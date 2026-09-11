@@ -28,6 +28,7 @@ use core::mem::{offset_of, size_of};
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -74,7 +75,7 @@ pub(crate) struct RegistryKeyObject {
 }
 
 pub(crate) struct RegistryStore<Platform: crate::ShimPlatform> {
-    fs: LiteBox<Platform>,
+    fs: Arc<LiteBox<Platform>>,
     fs_context: litebox::fs::Context,
     /// Whether the built-in keys and values have been written to [`Self::fs`].
     ///
@@ -600,9 +601,9 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
     ///
     /// Construction performs no file operation: the built-in keys and values are
     /// seeded lazily by [`Self::fs`] when the guest first uses the registry.
-    pub(crate) fn new(litebox: &LiteBox<Platform>) -> Self {
+    pub(crate) fn new(litebox: Arc<LiteBox<Platform>>) -> Self {
         Self {
-            fs: litebox.clone(),
+            fs: litebox,
             fs_context: litebox::fs::Context::new(),
             defaults_seeded: Mutex::new(false),
             notification_state: Mutex::new(RegistryNotificationState::default()),
@@ -623,7 +624,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
                 seed_defaults(&self.fs, &self.fs_context);
             }
         }
-        &self.fs
+        self.fs.as_ref()
     }
 
     fn open_key(
@@ -2586,9 +2587,9 @@ mod tests {
     ///
     /// The store's defaults are written on first use, so callers observe them through any
     /// registry operation, exactly as a guest does.
-    fn test_registry() -> (LiteBox<TestPlatform>, RegistryStore<TestPlatform>) {
+    fn test_registry() -> (Arc<LiteBox<TestPlatform>>, RegistryStore<TestPlatform>) {
         let mode = FileMode::RWXU | FileMode::RWXG | FileMode::RWXO;
-        let litebox = crate::test_broker::litebox_with_broker_files(
+        let litebox = Arc::new(crate::test_broker::litebox_with_broker_files(
             test_platform(),
             alloc::vec![
                 (
@@ -2606,8 +2607,8 @@ mod tests {
                     },
                 ),
             ],
-        );
-        let registry = RegistryStore::new(&litebox);
+        ));
+        let registry = RegistryStore::new(Arc::clone(&litebox));
         (litebox, registry)
     }
 
@@ -2782,8 +2783,8 @@ mod tests {
     fn registry_store_construction_issues_no_file_requests() {
         // This broker association serves no files at all and panics on any request, so building
         // the store at all is the assertion.
-        let litebox = crate::test_broker::litebox(test_platform());
-        let registry = RegistryStore::new(&litebox);
+        let litebox = Arc::new(crate::test_broker::litebox(test_platform()));
+        let registry = RegistryStore::new(litebox);
         assert!(!*registry.defaults_seeded.lock());
     }
 
