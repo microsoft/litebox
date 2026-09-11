@@ -71,7 +71,7 @@ pub(crate) enum UnixSocketAddr {
 /// the socket file remains accessible. The file is automatically closed
 /// when this structure is dropped.
 enum UnixBoundSocketAddr<Platform: ShimPlatform> {
-    Path((String, FileFd, litebox::LiteBox<Platform>)),
+    Path((String, FileFd, Arc<litebox::LiteBox<Platform>>)),
     Abstract(Vec<u8>),
 }
 
@@ -119,11 +119,10 @@ impl UnixSocketAddr {
                 };
                 // TODO: extend fs to support creating sock file (i.e., with type `InodeType::Socket`)
                 let file = {
-                    let files = task.files.borrow();
                     let fs = task.fs.borrow();
                     let context = fs.context.read();
-                    files
-                        .fs
+                    task.global
+                        .litebox
                         .open_file(
                             &context,
                             path.as_str(),
@@ -139,7 +138,7 @@ impl UnixSocketAddr {
                 Ok(UnixBoundSocketAddr::Path((
                     path,
                     file,
-                    task.files.borrow().fs.clone(),
+                    Arc::clone(&task.global.litebox),
                 )))
             }
             UnixSocketAddr::Abstract(data) => {
