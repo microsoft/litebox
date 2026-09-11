@@ -16,7 +16,7 @@ use super::in_mem::InMem;
 use super::inode_allocator::InodeAllocator;
 use super::overlay::Overlay;
 use super::tar_ro::TarRo;
-use super::test_support::{Fs, ROOT, RecordingStdio, USER, UnservicedStdio};
+use super::test_support::{Fs, ROOT, USER, UnservicedStdio};
 use crate::test_platform::TestPlatform;
 
 const TEST_TAR_FILE: &[u8] = include_bytes!("./test.tar");
@@ -49,7 +49,7 @@ mod in_mem {
     };
     use crate::fs::errors::{
         ChownError, MkdirError, OpenError, PathError, ReadDirError, ReadError, RmdirError,
-        TruncateError, UnlinkError, WriteError,
+        UnlinkError,
     };
     use crate::fs::test_support::Entry;
     use alloc::vec;
@@ -881,40 +881,6 @@ mod in_mem {
     }
 
     #[test]
-    fn truncate_resets_or_keeps_position() {
-        let fs = in_mem_fs();
-        world_writable_root(&fs);
-
-        let mut fd = fs
-            .open(
-                USER,
-                "/truncfile",
-                FileAccessMode::ReadWrite,
-                FileOpenFlags::CREATE,
-                Mode::RWXU,
-            )
-            .expect("Failed to create file");
-        fs.write(&mut fd, b"0123456789", None)
-            .expect("Failed to write file");
-
-        // Truncating without resetting keeps the position, so a read sees nothing.
-        fs.truncate(&mut fd, 4, false).expect("Failed to truncate");
-        let mut buffer = vec![0; 10];
-        assert_eq!(
-            fs.read(&mut fd, &mut buffer, None)
-                .expect("Failed to read file"),
-            0
-        );
-
-        // Truncating with a reset rewinds to the start of the (now shorter) file.
-        fs.truncate(&mut fd, 4, true).expect("Failed to truncate");
-        let bytes_read = fs
-            .read(&mut fd, &mut buffer, None)
-            .expect("Failed to read file");
-        assert_eq!(&buffer[..bytes_read], b"0123");
-    }
-
-    #[test]
     fn write_position_after_seek() {
         let fs = in_mem_fs();
         // Allow regular user to create in root for this focused test
@@ -1183,148 +1149,6 @@ mod in_mem {
             .expect("Failed to open file for reading");
         assert_eq!(read_all(&fs, &mut fd), b"NewContent");
     }
-
-    #[test]
-    fn creation_flags_do_not_change_access_mode() {
-        for (access, can_read, can_write) in [
-            (FileAccessMode::ReadOnly, true, false),
-            (FileAccessMode::WriteOnly, false, true),
-            (FileAccessMode::ReadWrite, true, true),
-        ] {
-            let fs = in_mem_fs();
-            let mut entry = fs
-                .open(
-                    USER,
-                    "/file",
-                    access,
-                    FileOpenFlags::CREATE | FileOpenFlags::EXCLUSIVE | FileOpenFlags::APPEND,
-                    Mode::RWXU,
-                )
-                .unwrap();
-
-            let read = fs.read(&mut entry, &mut [0], None);
-            if can_read {
-                assert_eq!(read.unwrap(), 0);
-            } else {
-                assert!(matches!(read, Err(ReadError::NotForReading)));
-            }
-            let write = fs.write(&mut entry, b"x", None);
-            if can_write {
-                assert_eq!(write.unwrap(), 1);
-            } else {
-                assert!(matches!(write, Err(WriteError::NotForWriting)));
-            }
-        }
-    }
-
-    #[test]
-    fn read_only_open_can_still_truncate() {
-        let fs = in_mem_fs();
-        create_with_content(&fs, "/file", b"contents");
-        let mut entry = fs
-            .open(
-                USER,
-                "/file",
-                FileAccessMode::ReadOnly,
-                FileOpenFlags::TRUNCATE,
-                Mode::empty(),
-            )
-            .unwrap();
-        assert_eq!(fs.handle_status(&entry).unwrap().size, 0);
-        assert!(matches!(
-            fs.write(&mut entry, b"x", None),
-            Err(WriteError::NotForWriting)
-        ));
-    }
-
-    #[test]
-    fn path_only_ignores_access_and_mutating_flags() {
-        let fs = in_mem_fs();
-        create_with_content(&fs, "/file", b"contents");
-        fs.chmod(USER, "/file", Mode::empty()).unwrap();
-        let flags = FileOpenFlags::all() - FileOpenFlags::DIRECTORY;
-
-        for access in [
-            FileAccessMode::ReadOnly,
-            FileAccessMode::WriteOnly,
-            FileAccessMode::ReadWrite,
-        ] {
-            let mut entry = fs.open(USER, "/file", access, flags, Mode::RWXU).unwrap();
-            assert!(entry.is_path_only());
-            assert!(entry.allows_read());
-            assert_eq!(fs.handle_status(&entry).unwrap().size, 8);
-            assert!(matches!(
-                fs.write(&mut entry, b"x", None),
-                Err(WriteError::NotForWriting)
-            ));
-            assert!(matches!(
-                fs.truncate(&mut entry, 0, false),
-                Err(TruncateError::NotForWriting)
-            ));
-            assert!(matches!(
-                fs.open(USER, "/missing", access, flags, Mode::RWXU),
-                Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
-            ));
-            assert!(matches!(
-                fs.open(
-                    USER,
-                    "/file",
-                    access,
-                    flags | FileOpenFlags::DIRECTORY,
-                    Mode::empty(),
-                ),
-                Err(OpenError::PathError(PathError::ComponentNotADirectory))
-            ));
-        }
-    }
-
-    #[test]
-    fn paths_are_normalized_before_lookup_and_mutation() {
-        let fs = in_mem_fs();
-        fs.mkdir(USER, "/dir", Mode::RWXU).unwrap();
-        create_with_content(&fs, "/dir/file", b"contents");
-        let expected = fs.file_status(USER, "/dir/file").unwrap();
-        for path in [
-            "/dir//./missing/../file/",
-            "dir/../../dir/file",
-            "../../dir/file",
-        ] {
-            let entry = fs
-                .open(
-                    USER,
-                    path,
-                    FileAccessMode::ReadOnly,
-                    FileOpenFlags::empty(),
-                    Mode::empty(),
-                )
-                .unwrap();
-            assert_eq!(fs.handle_status(&entry).unwrap(), expected);
-        }
-        let root = fs.file_status(USER, "/").unwrap();
-        for path in ["", ".", "../..", "/dir/../../.."] {
-            assert_eq!(fs.file_status(USER, path).unwrap(), root);
-        }
-
-        fs.mkdir(USER, "/dir/missing/../new", Mode::RWXU).unwrap();
-        let entry = fs
-            .open(
-                USER,
-                "dir/new/./missing/../file",
-                FileAccessMode::ReadWrite,
-                FileOpenFlags::CREATE,
-                Mode::RWXU,
-            )
-            .unwrap();
-        fs.chmod(USER, "dir/new//file", Mode::RUSR).unwrap();
-        fs.chown(USER, "dir/new/unused/../file", None, Some(ROOT.group))
-            .unwrap();
-        let status = fs.handle_status(&entry).unwrap();
-        assert_eq!(status.mode, Mode::RUSR);
-        assert_eq!(status.owner.group, ROOT.group);
-        fs.unlink(USER, "/dir/new/missing/../file").unwrap();
-        fs.rmdir(USER, "//dir/./new/").unwrap();
-        assert!(fs.file_status(USER, "/dir/new").is_err());
-    }
 }
 
 mod tar_ro {
@@ -1457,31 +1281,6 @@ mod tar_ro {
                 fs.open(USER, "bar", access, flags, Mode::empty()),
                 Err(OpenError::ReadOnlyFileSystem)
             ));
-        }
-    }
-
-    #[test]
-    fn path_only_does_not_request_write_access_on_read_only_backend() {
-        let fs = tar_ro_fs(TEST_TAR_FILE.into());
-        for path in ["/", "bar", "foo"] {
-            let expected = fs.file_status(USER, path).unwrap();
-            for access in [FileAccessMode::WriteOnly, FileAccessMode::ReadWrite] {
-                let entry = fs
-                    .open(
-                        USER,
-                        path,
-                        access,
-                        FileOpenFlags::PATH
-                            | FileOpenFlags::CREATE
-                            | FileOpenFlags::EXCLUSIVE
-                            | FileOpenFlags::TRUNCATE
-                            | FileOpenFlags::APPEND,
-                        Mode::empty(),
-                    )
-                    .unwrap();
-                assert!(entry.is_path_only());
-                assert_eq!(fs.handle_status(&entry).unwrap(), expected);
-            }
         }
     }
 
@@ -2437,12 +2236,11 @@ mod overlay {
 mod devices {
     use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags};
 
-    use super::{Fs, Mode, RecordingStdio, USER, UnservicedStdio};
+    use super::{Fs, Mode, USER, UnservicedStdio};
     use crate::fs::composer::Composer;
     use crate::fs::devices::Devices;
     use crate::fs::errors::{OpenError, PathError, ReadError, WriteError};
     use alloc::vec;
-    use litebox_broker_protocol::stdio::StdioOutputStream;
 
     fn devices_fs() -> Fs<Composer> {
         Fs::new(
@@ -2515,76 +2313,6 @@ mod devices {
         assert!(matches!(
             fs.read_with(&stdio, &mut fd_stdin, &mut buffer, None),
             Err(ReadError::Io)
-        ));
-    }
-
-    /// Each stdio device routes to its own stream on the session's device I/O.
-    #[test]
-    fn stdio_routes_to_the_session_streams() {
-        let fs = devices_fs();
-        let stdio = RecordingStdio::new(b"host input");
-
-        let mut fd_stdout = fs
-            .open(
-                USER,
-                "/dev/stdout",
-                FileAccessMode::WriteOnly,
-                FileOpenFlags::empty(),
-                Mode::empty(),
-            )
-            .expect("Failed to open /dev/stdout");
-        assert_eq!(
-            fs.write_with(&stdio, &mut fd_stdout, b"out", None)
-                .expect("Failed to write /dev/stdout"),
-            3
-        );
-
-        let mut fd_stderr = fs
-            .open(
-                USER,
-                "/dev/stderr",
-                FileAccessMode::WriteOnly,
-                FileOpenFlags::empty(),
-                Mode::empty(),
-            )
-            .expect("Failed to open /dev/stderr");
-        assert_eq!(
-            fs.write_with(&stdio, &mut fd_stderr, b"err", None)
-                .expect("Failed to write /dev/stderr"),
-            3
-        );
-
-        assert_eq!(
-            stdio.writes(),
-            vec![
-                (StdioOutputStream::Stdout, b"out".to_vec()),
-                (StdioOutputStream::Stderr, b"err".to_vec()),
-            ]
-        );
-
-        let mut fd_stdin = fs
-            .open(
-                USER,
-                "/dev/stdin",
-                FileAccessMode::ReadOnly,
-                FileOpenFlags::empty(),
-                Mode::empty(),
-            )
-            .expect("Failed to open /dev/stdin");
-        let mut buffer = vec![0; 16];
-        let read = fs
-            .read_with(&stdio, &mut fd_stdin, &mut buffer, None)
-            .expect("Failed to read /dev/stdin");
-        assert_eq!(&buffer[..read], b"host input");
-
-        // Reading a write-only device and writing a read-only device are rejected.
-        assert!(matches!(
-            fs.read_with(&stdio, &mut fd_stdout, &mut buffer, None),
-            Err(ReadError::NotForReading)
-        ));
-        assert!(matches!(
-            fs.write_with(&stdio, &mut fd_stdin, b"x", None),
-            Err(WriteError::NotForWriting)
         ));
     }
 

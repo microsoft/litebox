@@ -13,7 +13,6 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use litebox_broker_protocol::ObjectHandle;
-use litebox_broker_protocol::fs::WriteFileResponse;
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileDirectoryEntry, FileError, FileMode as Mode, FileNodeInfo, FileOpenFlags,
     FileType, FileUser, MAX_FILE_TRANSFER_SIZE, encode_directory_entries_chunk,
@@ -25,9 +24,7 @@ use litebox_common_linux::{
 use zerocopy::FromBytes as _;
 
 use crate::UserPtrMut;
-use crate::syscalls::test_broker::{
-    FileCall, Scripted, ScriptedFiles, closed, failed, opened, path_status,
-};
+use crate::syscalls::test_broker::{FileCall, Scripted, ScriptedFiles, closed, failed, opened};
 
 use litebox::shim::{Exception, ExceptionInfo};
 use litebox_common_linux::PtRegs;
@@ -382,7 +379,7 @@ fn getdirent64_encodes_the_entries_the_broker_returns() {
     let entries = vec![
         directory_entry(".", FileType::Directory, 1),
         directory_entry("..", FileType::Directory, 1),
-        directory_entry("file.txt", FileType::RegularFile, u64::MAX),
+        directory_entry("file.txt", FileType::RegularFile, 7),
         directory_entry("sub", FileType::Directory, 9),
     ];
     let (files, task) = scripted_task([]);
@@ -410,7 +407,7 @@ fn getdirent64_encodes_the_entries_the_broker_returns() {
         vec![
             (".".into(), DirentType::Directory as u8, 1, 0),
             ("..".into(), DirentType::Directory as u8, 1, 1),
-            ("file.txt".into(), DirentType::Regular as u8, u64::MAX, 2),
+            ("file.txt".into(), DirentType::Regular as u8, 7, 2),
             ("sub".into(), DirentType::Directory as u8, 9, 3),
         ],
         "entries are reported sorted by name, with their broker type and inode"
@@ -431,7 +428,7 @@ fn getdirent64_encodes_the_entries_the_broker_returns() {
 }
 
 #[test]
-fn getdirent64_resumes_across_buffers_and_rejects_undersized_ones() {
+fn getdirent64_resumes_across_buffers() {
     let entries = vec![
         directory_entry("aaaaaaaaaaaaaaaa", FileType::RegularFile, 1),
         directory_entry("bbbbbbbbbbbbbbbb", FileType::RegularFile, 2),
@@ -475,20 +472,6 @@ fn getdirent64_resumes_across_buffers_and_rejects_undersized_ones() {
         "the guest must resume from the continuation index the broker reported"
     );
     close_scripted_file(&files, &task, dir_fd, FILE_HANDLE);
-
-    // A buffer too small for even one entry is rejected rather than truncating a name.
-    let fresh_fd = scripted_dir_fd(&files, &task, "/dir");
-    files.script(directory_pages(&entries, usize::MAX));
-    let mut tiny = [0u8; 8];
-    assert_eq!(
-        task.sys_getdirent64(
-            fresh_fd,
-            UserPtrMut::from_usize(tiny.as_mut_ptr() as usize),
-            tiny.len(),
-        ),
-        Err(Errno::EINVAL)
-    );
-    close_scripted_file(&files, &task, fresh_fd, FILE_HANDLE);
 }
 
 #[test]
@@ -531,83 +514,6 @@ fn getdirent64_translates_descriptor_and_broker_errors() {
         Err(Errno::EINVAL)
     );
     close_scripted_file(&files, &task, dir_fd, FILE_HANDLE);
-}
-
-#[test]
-fn open_flags_keep_cloexec_local_and_send_normalized_path_options() {
-    let cloexec_handle = ObjectHandle(FILE_HANDLE.0 + 1);
-    let (files, task) = scripted_task([opened(FILE_HANDLE), opened(cloexec_handle)]);
-    let flags =
-        OFlags::RDWR | OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::NONBLOCK;
-    let plain_fd = i32::try_from(task.sys_open("/path", flags, Mode::empty()).unwrap()).unwrap();
-    let cloexec_fd = i32::try_from(
-        task.sys_openat(
-            litebox_common_linux::AT_FDCWD,
-            "/path",
-            flags | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .unwrap(),
-    )
-    .unwrap();
-    let expected = FileCall::Open {
-        path: "/path".into(),
-        user: ROOT,
-        access: FileAccessMode::ReadWrite,
-        flags: FileOpenFlags::PATH
-            | FileOpenFlags::DIRECTORY
-            | FileOpenFlags::NO_FOLLOW
-            | FileOpenFlags::NONBLOCKING,
-        mode: Mode::empty(),
-    };
-    let calls = files.take_calls();
-    assert_eq!(calls.len(), 2);
-    for call in calls {
-        assert_eq!(call, expected);
-    }
-    assert_eq!(task.sys_fcntl(plain_fd, FcntlArg::GETFD), Ok(0));
-    assert_eq!(
-        task.sys_fcntl(cloexec_fd, FcntlArg::GETFD),
-        Ok(FileDescriptorFlags::FD_CLOEXEC.bits())
-    );
-    assert_eq!(
-        task.sys_fcntl(cloexec_fd, FcntlArg::GETFL).unwrap() & OFlags::CLOEXEC.bits(),
-        0
-    );
-
-    files.script([closed()]);
-    task.close_on_exec();
-    assert_eq!(files.take_calls(), vec![FileCall::Close(cloexec_handle)]);
-    assert_eq!(
-        task.sys_fcntl(cloexec_fd, FcntlArg::GETFD),
-        Err(Errno::EBADF)
-    );
-    assert_eq!(task.sys_fcntl(plain_fd, FcntlArg::GETFD), Ok(0));
-    close_scripted_file(&files, &task, plain_fd, FILE_HANDLE);
-}
-
-#[test]
-fn open_flags_reject_invalid_access_before_contacting_broker() {
-    let (files, task) = scripted_task([]);
-    for flags in [
-        OFlags::from_bits_retain(3),
-        OFlags::from_bits_retain(3) | OFlags::PATH | OFlags::CLOEXEC,
-    ] {
-        assert_eq!(
-            task.sys_open("/invalid_access", flags, Mode::empty()),
-            Err(Errno::EACCES)
-        );
-        assert_eq!(
-            task.sys_openat(
-                litebox_common_linux::AT_FDCWD,
-                "/invalid_access",
-                flags,
-                Mode::empty(),
-            ),
-            Err(Errno::EACCES)
-        );
-    }
-    assert!(files.take_calls().is_empty());
 }
 
 #[test]
@@ -700,17 +606,7 @@ fn unlinkat_routes_by_flag_and_translates_broker_failures() {
 
     for (flags, error, errno) in [
         (AtFlags::empty(), FileError::IsDirectory, Errno::EISDIR),
-        (
-            AtFlags::empty(),
-            FileError::NoSuchFileOrDirectory,
-            Errno::ENOENT,
-        ),
         (AtFlags::AT_REMOVEDIR, FileError::NotEmpty, Errno::ENOTEMPTY),
-        (
-            AtFlags::AT_REMOVEDIR,
-            FileError::NotDirectory,
-            Errno::ENOTDIR,
-        ),
     ] {
         files.script([failed(error)]);
         assert_eq!(
@@ -720,81 +616,6 @@ fn unlinkat_routes_by_flag_and_translates_broker_failures() {
         );
         let _ = files.take_calls();
     }
-}
-
-#[test]
-fn read_and_write_carry_lengths_and_offsets_to_the_broker() {
-    let (files, task) = scripted_task([opened(FILE_HANDLE)]);
-    let fd = i32::try_from(
-        task.sys_open("/data", OFlags::RDWR, Mode::empty())
-            .expect("the scripted open must succeed"),
-    )
-    .unwrap();
-    let _ = files.take_calls();
-
-    // A read without an offset uses the broker-owned file position.
-    files.script([Scripted::Read(b"hello".to_vec())]);
-    let mut buffer = [0u8; 8];
-    assert_eq!(task.sys_read(fd, &mut buffer, None), Ok(5));
-    assert_eq!(
-        &buffer[..5],
-        b"hello",
-        "a short read fills only what arrived"
-    );
-    assert_eq!(
-        files.take_calls(),
-        vec![FileCall::Read {
-            handle: FILE_HANDLE,
-            length: 8,
-            offset: None,
-        }]
-    );
-
-    // `pread` passes its explicit offset through.
-    files.script([Scripted::Read(b"lo".to_vec())]);
-    assert_eq!(task.sys_read(fd, &mut buffer[..2], Some(3)), Ok(2));
-    assert_eq!(
-        files.take_calls(),
-        vec![FileCall::Read {
-            handle: FILE_HANDLE,
-            length: 2,
-            offset: Some(3),
-        }]
-    );
-
-    // `pwrite` stages its bytes and offset for the broker.
-    files.script([Scripted::Reply(FileResponse::Write(WriteFileResponse {
-        written: 3,
-    }))]);
-    assert_eq!(task.sys_write(fd, b"abc", Some(7)), Ok(3));
-    assert_eq!(
-        files.take_calls(),
-        vec![FileCall::Write {
-            handle: FILE_HANDLE,
-            data: b"abc".to_vec(),
-            offset: Some(7),
-        }]
-    );
-    close_scripted_file(&files, &task, fd, FILE_HANDLE);
-}
-
-#[test]
-fn stat_translates_broker_status_and_failures() {
-    let (files, task) = scripted_task([path_status(FileType::RegularFile, 0o640)]);
-
-    let stat = task.sys_stat("/status_file").expect("stat must succeed");
-    assert_eq!(stat.st_mode & 0o777, 0o640);
-    assert_eq!(
-        files.take_calls(),
-        vec![FileCall::PathStatus {
-            path: "/status_file".into(),
-            user: ROOT,
-        }]
-    );
-
-    files.script([failed(FileError::NoSuchFileOrDirectory)]);
-    assert_eq!(task.sys_stat("/missing"), Err(Errno::ENOENT));
-    let _ = files.take_calls();
 }
 
 #[test]

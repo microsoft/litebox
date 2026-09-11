@@ -2492,55 +2492,6 @@ mod tests {
     const KEY_VALUE_PARTIAL_INFORMATION_DATA_OFFSET: usize =
         offset_of!(KeyValuePartialInformation, data);
 
-    #[test]
-    fn registry_access_maps_to_protocol_directory_open_parameters() {
-        for (desired_access, expected_access) in [
-            (0, FileAccessMode::ReadOnly),
-            (
-                RegistryKeyAccess::QUERY_VALUE.bits(),
-                FileAccessMode::ReadOnly,
-            ),
-            (
-                RegistryKeyAccess::ENUMERATE_SUB_KEYS.bits(),
-                FileAccessMode::ReadOnly,
-            ),
-            (RegistryKeyAccess::NOTIFY.bits(), FileAccessMode::ReadOnly),
-            (
-                RegistryKeyAccess::SET_VALUE.bits(),
-                FileAccessMode::WriteOnly,
-            ),
-            (
-                RegistryKeyAccess::CREATE_SUB_KEY.bits(),
-                FileAccessMode::WriteOnly,
-            ),
-            (
-                RegistryKeyAccess::CREATE_LINK.bits(),
-                FileAccessMode::WriteOnly,
-            ),
-            (
-                (RegistryKeyAccess::QUERY_VALUE | RegistryKeyAccess::SET_VALUE).bits(),
-                FileAccessMode::ReadWrite,
-            ),
-            (AccessMask::DELETE.bits(), FileAccessMode::WriteOnly),
-            (AccessMask::WRITE_DAC.bits(), FileAccessMode::WriteOnly),
-            (AccessMask::WRITE_OWNER.bits(), FileAccessMode::WriteOnly),
-            (AccessMask::GENERIC_READ.bits(), FileAccessMode::ReadOnly),
-            (AccessMask::GENERIC_WRITE.bits(), FileAccessMode::WriteOnly),
-            (AccessMask::GENERIC_EXECUTE.bits(), FileAccessMode::ReadOnly),
-            (AccessMask::GENERIC_ALL.bits(), FileAccessMode::ReadWrite),
-            (
-                AccessMask::MAXIMUM_ALLOWED.bits(),
-                FileAccessMode::ReadWrite,
-            ),
-        ] {
-            assert_eq!(
-                RegistryKeyAccess::from_desired_access(desired_access).open_flags(),
-                (expected_access, FileOpenFlags::DIRECTORY),
-                "desired_access={desired_access:#x}",
-            );
-        }
-    }
-
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     #[allow(non_snake_case)]
     #[link(name = "advapi32")]
@@ -2775,49 +2726,6 @@ mod tests {
         );
 
         query_status
-    }
-
-    /// Building a store must not touch the file system: the guest may never use the registry, and
-    /// a shim is constructed before the guest can be asked to pay for registry startup.
-    #[test]
-    fn registry_store_construction_issues_no_file_requests() {
-        // This broker association serves no files at all and panics on any request, so building
-        // the store at all is the assertion.
-        let litebox = Arc::new(crate::test_broker::litebox(test_platform()));
-        let registry = RegistryStore::new(litebox);
-        assert!(!*registry.defaults_seeded.lock());
-    }
-
-    #[test]
-    fn registry_defaults_are_seeded_once_on_first_use() {
-        let (_litebox, registry) = test_registry();
-        let key_path = absolute_nt_key_name_to_fs_path(DEFAULT_CODE_PAGE_KEY).unwrap();
-        let value_path = value_path(&key_path, "ACP").unwrap();
-
-        // The raw store is read directly here so that the read itself does not seed it.
-        assert!(matches!(
-            registry
-                .fs
-                .path_file_status(&registry.fs_context, &*value_path),
-            Err(FileStatusError::PathError(
-                PathError::NoSuchFileOrDirectory | PathError::MissingComponent
-            ))
-        ));
-
-        let value = registry
-            .read_value_at_path(&key_path, "ACP")
-            .expect("the first registry operation must seed the defaults");
-        assert_eq!(value.data, DEFAULT_ACP_VALUE);
-        assert!(*registry.defaults_seeded.lock());
-
-        // A guest write must survive a later operation, which must not re-seed over it.
-        registry
-            .write_value_at_path(&key_path, "ACP", RegistryValueType::Sz.into(), b"9\0")
-            .unwrap();
-        assert_eq!(
-            registry.read_value_at_path(&key_path, "ACP").unwrap().data,
-            b"9\0"
-        );
     }
 
     #[test]

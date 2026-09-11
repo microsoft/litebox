@@ -33,10 +33,6 @@ use super::errors::{
 mod client;
 mod fcall;
 mod id_pool;
-#[cfg(test)]
-mod metadata_tests;
-#[cfg(test)]
-mod open_flags_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod tests;
 

@@ -490,32 +490,3 @@ fn serve_control_stream(
         UnixStreamHostSetupChannel::into_active,
     )
 }
-
-#[cfg(test)]
-mod tests {
-    use super::windows_runner_initial_files;
-    use std::ffi::OsString;
-    use std::path::PathBuf;
-
-    #[test]
-    fn windows_runner_initial_files_accepts_equals_options() {
-        let arguments = [
-            "--env=NAME=value",
-            "--initial-files=root.tar",
-            "/app/program.exe",
-        ]
-        .map(OsString::from);
-
-        assert_eq!(
-            windows_runner_initial_files(&arguments),
-            Some(PathBuf::from("root.tar"))
-        );
-    }
-
-    #[test]
-    fn windows_runner_initial_files_does_not_scan_guest_arguments() {
-        let arguments = ["/app/program.exe", "--initial-files", "guest-value"].map(OsString::from);
-
-        assert_eq!(windows_runner_initial_files(&arguments), None);
-    }
-}

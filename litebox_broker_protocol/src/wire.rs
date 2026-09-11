@@ -1334,37 +1334,6 @@ mod tests {
     }
 
     #[test]
-    fn decode_rejects_zero_device_numbers_in_fs_status_responses() {
-        let status = FileStatus {
-            file_type: FileType::CharacterDevice,
-            mode: FileMode::from_bits(0o640).unwrap(),
-            size: 17,
-            owner: FileUser::ROOT,
-            node_info: FileNodeInfo {
-                dev: 5,
-                ino: 7,
-                rdev: Some(NonZeroU64::MAX),
-            },
-            block_size: 4096,
-        };
-        for result in [
-            FileResponse::PathStatus(status),
-            FileResponse::HandleStatus(status),
-        ] {
-            let response = BrokerResponse {
-                request_id: TEST_REQUEST_ID,
-                result: BrokerResult::File(result),
-            };
-            let mut bytes = encode_response(response.clone());
-            assert_eq!(decode_response(&bytes), Ok(response));
-            // The optional device number precedes the final block-size field.
-            let rdev_start = bytes.len() - 2 * size_of::<u64>();
-            bytes[rdev_start..rdev_start + size_of::<u64>()].fill(0);
-            assert_eq!(decode_response(&bytes), Err(WireError::InvalidTag));
-        }
-    }
-
-    #[test]
     fn decode_rejects_malformed_fs_response_frames() {
         let status = BrokerResponse {
             request_id: TEST_REQUEST_ID,

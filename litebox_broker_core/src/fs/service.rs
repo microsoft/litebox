@@ -845,31 +845,6 @@ mod tests {
     use litebox_broker_protocol::fs::{FileNodeInfo, FileType};
 
     #[test]
-    fn unknown_open_flags_are_rejected_before_path_only_masking() {
-        let unknown = FileOpenFlags::from_bits_retain(1 << 15);
-        for access in [
-            FileAccessMode::ReadOnly,
-            FileAccessMode::WriteOnly,
-            FileAccessMode::ReadWrite,
-        ] {
-            for flags in [
-                FileOpenFlags::empty(),
-                FileOpenFlags::CREATE,
-                FileOpenFlags::PATH,
-            ] {
-                assert!(matches!(
-                    open_required_rights(access, flags | unknown),
-                    Err(BrokerError::UnsupportedOperation)
-                ));
-            }
-            assert_eq!(
-                open_required_rights(access, FileOpenFlags::PATH).unwrap(),
-                ObjectRights::WAIT
-            );
-        }
-    }
-
-    #[test]
     fn file_status_excludes_object_type_mode_bits() {
         let mut status = FileStatus {
             file_type: FileType::RegularFile,

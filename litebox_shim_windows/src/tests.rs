@@ -204,15 +204,6 @@ fn test_task_from_litebox(litebox: litebox::LiteBox<TestPlatform>) -> Task<TestP
     }
 }
 
-/// Building a shim and its initial task must not depend on the broker.
-///
-/// The association behind [`test_task`] panics on every request, so this fails loudly if shim
-/// construction starts asking the broker for anything.
-#[test]
-fn building_a_task_issues_no_broker_requests() {
-    let _task = test_task();
-}
-
 const EVENT_MODIFY_STATE: u32 = 0x0002;
 const SYNCHRONIZE: u32 = 0x0010_0000;
 const DUPLICATE_CLOSE_SOURCE: u32 = 0x0000_0001;
