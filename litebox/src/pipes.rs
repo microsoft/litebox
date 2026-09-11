@@ -729,3 +729,13 @@ crate::fd::enable_fds_for_subsystem! {
     PipeEnd<Platform>;
     -> PipeFd<Platform>;
 }
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DescriptorEntry<Platform> {
+    /// Runs `f` with the [`IOPollable`] backing this pipe end.
+    pub fn with_iopollable<R>(&self, f: impl FnOnce(&dyn IOPollable) -> R) -> R {
+        match &self.entry {
+            PipeEnd::Receiver(receiver) => f(receiver.as_ref()),
+            PipeEnd::Sender(sender) => f(sender.as_ref()),
+        }
+    }
+}
