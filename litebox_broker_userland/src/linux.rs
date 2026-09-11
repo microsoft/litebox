@@ -16,11 +16,7 @@ use std::time::{Duration, Instant};
 
 use clap::Parser as _;
 use litebox_broker_core::fs::FileService;
-use litebox_broker_core::fs::composer::Composer;
-use litebox_broker_core::fs::in_mem::{InMem, InitialNode};
-use litebox_broker_core::fs::overlay::Overlay;
-use litebox_broker_core::fs::resolver::Resolver;
-use litebox_broker_core::fs::tar_ro::{EMPTY_TAR_FILE, TarRo};
+use litebox_broker_core::fs::in_mem::InitialNode;
 use litebox_broker_core::socket::HOST_GATEWAY_IPV4_ADDRESS;
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
 use litebox_broker_protocol::fs::{FileMode as Mode, FileUser as UserInfo};
@@ -132,51 +128,9 @@ fn create_file_service(args: &super::CliArgs) -> Result<Arc<dyn FileService>, Bo
         ));
     }
 
-    let writable_directory = |owner| InitialNode::Directory {
-        mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
-        owner,
-    };
-    if let Some((_, InitialNode::Directory { mode, .. })) =
-        entries.iter_mut().find(|(path, _)| path == "/tmp")
-    {
-        *mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
-    } else {
-        entries.push(("/tmp".to_owned(), writable_directory(UserInfo::ROOT)));
-    }
-    entries.push(("/registry".to_owned(), writable_directory(UserInfo::ROOT)));
-
-    let tar_data = match args.fs_initial_files.as_deref() {
-        Some(path) => {
-            if path.extension().and_then(|extension| extension.to_str()) != Some("tar") {
-                return Err(IoError::new(
-                    ErrorKind::InvalidInput,
-                    format!("expected a .tar file, found {}", path.display()),
-                )
-                .into());
-            }
-            std::borrow::Cow::Owned(std::fs::read(path)?)
-        }
-        None => std::borrow::Cow::Borrowed(EMPTY_TAR_FILE),
-    };
-    let in_mem =
-        InMem::<litebox_broker_platform_linux_userland::LinuxSyncPrimitivesProvider>::new_initialized(
-            entries,
-        );
-    let backend = Composer::builder()
-        .mount_nestable("/", |allocators| {
-            Overlay::<litebox_broker_platform_linux_userland::LinuxSyncPrimitivesProvider>::new(
-                in_mem,
-                TarRo::new(tar_data, allocators.next()),
-                allocators.next(),
-            )
-        })
-        .mount("/dev", litebox_broker_core::fs::devices::Devices::new)
-        .build()
-        .map_err(|_| IoError::other("failed to construct broker file service"))?;
-    Ok(Arc::new(Resolver::<
+    Ok(super::fs::create_file_service::<
         litebox_broker_platform_linux_userland::LinuxSyncPrimitivesProvider,
-        _,
-    >::new(backend)))
+    >(entries, args.fs_initial_files.as_deref())?)
 }
 
 fn guest_owner(previous_user: u32, user: u32) -> UserInfo {

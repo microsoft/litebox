@@ -14,14 +14,8 @@ use std::time::Instant;
 
 use clap::Parser as _;
 use litebox_broker_core::fs::FileService;
-use litebox_broker_core::fs::composer::Composer;
-use litebox_broker_core::fs::in_mem::{InMem, InitialNode};
-use litebox_broker_core::fs::overlay::Overlay;
-use litebox_broker_core::fs::resolver::Resolver;
-use litebox_broker_core::fs::tar_ro::{EMPTY_TAR_FILE, TarRo};
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
 use litebox_broker_platform_windows_userland::WindowsSyncPrimitivesProvider;
-use litebox_broker_protocol::fs::{FileMode as Mode, FileUser as UserInfo};
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport_windows_userland::named_pipe::{
     WindowsNamedPipeHostSetupChannel, WindowsNamedPipeListener, WindowsNamedPipeStream,
@@ -62,50 +56,9 @@ fn create_file_service(args: &super::CliArgs) -> Result<Arc<dyn FileService>, Bo
         )
         .into());
     }
-    let tar_data = match args.fs_initial_files.as_deref() {
-        Some(path) => {
-            if path.extension().and_then(|extension| extension.to_str()) != Some("tar") {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("expected a .tar file, found {}", path.display()),
-                )
-                .into());
-            }
-            std::borrow::Cow::Owned(std::fs::read(path)?)
-        }
-        None => std::borrow::Cow::Borrowed(EMPTY_TAR_FILE),
-    };
-    let mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
-    let in_mem = InMem::<WindowsSyncPrimitivesProvider>::new_initialized([
-        (
-            "/tmp",
-            InitialNode::Directory {
-                mode,
-                owner: UserInfo::ROOT,
-            },
-        ),
-        (
-            "/registry",
-            InitialNode::Directory {
-                mode,
-                owner: UserInfo::ROOT,
-            },
-        ),
-    ]);
-    let backend = Composer::builder()
-        .mount_nestable("/", |allocators| {
-            Overlay::<WindowsSyncPrimitivesProvider>::new(
-                in_mem,
-                TarRo::new(tar_data, allocators.next()),
-                allocators.next(),
-            )
-        })
-        .mount("/dev", litebox_broker_core::fs::devices::Devices::new)
-        .build()
-        .map_err(|_| std::io::Error::other("failed to construct broker file service"))?;
-    Ok(Arc::new(Resolver::<WindowsSyncPrimitivesProvider, _>::new(
-        backend,
-    )))
+    Ok(super::fs::create_file_service::<
+        WindowsSyncPrimitivesProvider,
+    >(Vec::new(), args.fs_initial_files.as_deref())?)
 }
 
 fn run_runner_in_process(
