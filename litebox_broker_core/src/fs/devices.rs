@@ -87,7 +87,7 @@ impl Device {
                 size: 0,
                 owner: UserInfo::ROOT,
                 node_info: STDIO_NODE_INFO,
-                block_size: STDIO_BLOCK_SIZE,
+                blksize: STDIO_BLOCK_SIZE,
             },
             Device::Null => FileStatus {
                 file_type: FileType::CharacterDevice,
@@ -95,7 +95,7 @@ impl Device {
                 size: 0,
                 owner: UserInfo::ROOT,
                 node_info: NULL_NODE_INFO,
-                block_size: NULL_BLOCK_SIZE,
+                blksize: NULL_BLOCK_SIZE,
             },
             Device::URandom => FileStatus {
                 file_type: FileType::CharacterDevice,
@@ -103,7 +103,7 @@ impl Device {
                 size: 0,
                 owner: UserInfo::ROOT,
                 node_info: URANDOM_NODE_INFO,
-                block_size: URANDOM_BLOCK_SIZE,
+                blksize: URANDOM_BLOCK_SIZE,
             },
         }
     }
@@ -238,7 +238,7 @@ impl Backend for Devices {
             .map(|(n, d)| DirEntry {
                 name: String::from(*n),
                 file_type: FileType::CharacterDevice,
-                node_info: Some(d.file_status().node_info),
+                ino_info: Some(d.file_status().node_info),
             })
             .collect())
     }
@@ -317,7 +317,7 @@ impl Backend for Devices {
                     size: super::DEFAULT_DIRECTORY_SIZE,
                     owner: UserInfo::ROOT,
                     node_info: self.root_inode,
-                    block_size: super::DEFAULT_DIRECTORY_SIZE,
+                    blksize: super::DEFAULT_DIRECTORY_SIZE,
                 })
             }
         }

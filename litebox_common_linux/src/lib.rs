@@ -474,7 +474,7 @@ impl TryFrom<FileStatus> for FileStat {
             size,
             owner: FileUser { user, group },
             node_info: FileNodeInfo { dev, ino, rdev },
-            block_size,
+            blksize: block_size,
             ..
         } = value;
         // Linux exposes signed sizes even where the Rust ABI struct uses `usize`.
@@ -615,7 +615,7 @@ impl TryFrom<FileStatus> for Statx {
             size,
             owner: FileUser { user, group },
             node_info: FileNodeInfo { dev, ino, rdev },
-            block_size,
+            blksize: block_size,
             ..
         } = value;
         let rdev = rdev.map_or(0, core::num::NonZeroU64::get);

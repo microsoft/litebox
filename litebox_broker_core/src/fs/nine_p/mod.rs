@@ -444,7 +444,7 @@ where
             .map(|entry| super::DirEntry {
                 name: String::from_utf8_lossy(&entry.name).into_owned(),
                 file_type: qid_type_to_file_type(entry.qid.typ),
-                node_info: Some(NodeInfo {
+                ino_info: Some(NodeInfo {
                     dev: self.device_id,
                     ino: entry.qid.path,
                     rdev: None,
@@ -735,7 +735,7 @@ fn rgetattr_to_file_status(attr: &fcall::Rgetattr, device_id: u64) -> Result<Fil
                 ino: attr.qid.path,
                 rdev: NonZeroU64::new(attr.stat.rdev),
             },
-            block_size: attr.stat.blksize,
+            blksize: attr.stat.blksize,
         })
     } else {
         Ok(FileStatus {
@@ -771,7 +771,7 @@ fn rgetattr_to_file_status(attr: &fcall::Rgetattr, device_id: u64) -> Result<Fil
                     None
                 },
             },
-            block_size: if attr.valid.contains(fcall::GetattrMask::BLOCKS) {
+            blksize: if attr.valid.contains(fcall::GetattrMask::BLOCKS) {
                 attr.stat.blksize
             } else {
                 0

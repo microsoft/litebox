@@ -873,7 +873,7 @@ mod tests {
                 ino: u64::MAX - 1,
                 rdev: NonZeroU64::new(u64::MAX),
             },
-            block_size: u64::MAX,
+            blksize: u64::MAX,
         };
         let mut expected = status;
         expected.mode = FileMode::from_bits(0o644).unwrap();

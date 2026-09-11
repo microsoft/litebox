@@ -72,7 +72,7 @@ pub struct FileStatus {
     /// Device and inode identity.
     pub node_info: FileNodeInfo,
     /// Preferred fs I/O block size.
-    pub block_size: u64,
+    pub blksize: u64,
 }
 
 /// One directory entry.
@@ -83,7 +83,7 @@ pub struct FileDirectoryEntry {
     /// Entry kind.
     pub file_type: FileType,
     /// Optional device and inode identity.
-    pub node_info: Option<FileNodeInfo>,
+    pub ino_info: Option<FileNodeInfo>,
 }
 
 /// File operation failure that is meaningful to the guest ABI.
@@ -566,7 +566,7 @@ pub fn try_decode_directory_entries(
         name.push_str(encoded_name);
         let file_type =
             file_type_from_raw(decoder.u8()?).ok_or(DirectoryPayloadError::Malformed)?;
-        let node_info = match decoder.u8()? {
+        let ino_info = match decoder.u8()? {
             0 => None,
             1 => {
                 let dev = decoder.u64()?;
@@ -585,7 +585,7 @@ pub fn try_decode_directory_entries(
         entries.push(FileDirectoryEntry {
             name,
             file_type,
-            node_info,
+            ino_info,
         });
     }
     if decoder.offset != payload.len() {
@@ -619,7 +619,7 @@ fn encoded_directory_entry_length(
         .checked_add(entry.name.len())
         .and_then(|length| length.checked_add(2))
         .and_then(|length| {
-            entry.node_info.map_or(Some(length), |node_info| {
+            entry.ino_info.map_or(Some(length), |node_info| {
                 length
                     .checked_add(size_of::<u64>() * 2 + 1)
                     .and_then(|length| {
@@ -669,7 +669,7 @@ fn encode_directory_entry(
     output.extend_from_slice(&name_len.to_le_bytes());
     output.extend_from_slice(name);
     output.push(file_type_raw(entry.file_type));
-    match entry.node_info {
+    match entry.ino_info {
         Some(node_info) => {
             output.push(1);
             output.extend_from_slice(&node_info.dev.to_le_bytes());
@@ -732,12 +732,12 @@ mod tests {
             FileDirectoryEntry {
                 name: ".".into(),
                 file_type: FileType::Directory,
-                node_info: None,
+                ino_info: None,
             },
             FileDirectoryEntry {
                 name: "regular".into(),
                 file_type: FileType::RegularFile,
-                node_info: Some(FileNodeInfo {
+                ino_info: Some(FileNodeInfo {
                     dev: 2,
                     ino: 3,
                     rdev: None,
@@ -746,7 +746,7 @@ mod tests {
             FileDirectoryEntry {
                 name: "device".into(),
                 file_type: FileType::CharacterDevice,
-                node_info: Some(FileNodeInfo {
+                ino_info: Some(FileNodeInfo {
                     dev: 5,
                     ino: 7,
                     rdev: NonZeroU64::new(11),
@@ -763,7 +763,7 @@ mod tests {
         let payload = encode_directory_entries(&[FileDirectoryEntry {
             name: "x".into(),
             file_type: FileType::CharacterDevice,
-            node_info: Some(FileNodeInfo {
+            ino_info: Some(FileNodeInfo {
                 dev: 2,
                 ino: 3,
                 rdev: NonZeroU64::new(5),
@@ -785,17 +785,17 @@ mod tests {
             FileDirectoryEntry {
                 name: "first".into(),
                 file_type: FileType::RegularFile,
-                node_info: None,
+                ino_info: None,
             },
             FileDirectoryEntry {
                 name: "second".into(),
                 file_type: FileType::Directory,
-                node_info: None,
+                ino_info: None,
             },
             FileDirectoryEntry {
                 name: "third".into(),
                 file_type: FileType::CharacterDevice,
-                node_info: None,
+                ino_info: None,
             },
         ];
         let first_two_length = encode_directory_entries(&entries[..2]).unwrap().len();
@@ -821,7 +821,7 @@ mod tests {
         let valid = encode_directory_entries(&[FileDirectoryEntry {
             name: "entry".into(),
             file_type: FileType::RegularFile,
-            node_info: None,
+            ino_info: None,
         }])
         .unwrap();
 
@@ -855,7 +855,7 @@ mod tests {
         let maximum_entry = FileDirectoryEntry {
             name: "x".repeat(maximum_name_length),
             file_type: FileType::RegularFile,
-            node_info: None,
+            ino_info: None,
         };
         let payload = encode_directory_entries(core::slice::from_ref(&maximum_entry)).unwrap();
         assert_eq!(payload.len(), MAX_FILE_TRANSFER_SIZE as usize);
@@ -864,7 +864,7 @@ mod tests {
         let oversized_entry = FileDirectoryEntry {
             name: "x".repeat(maximum_name_length + 1),
             file_type: FileType::RegularFile,
-            node_info: None,
+            ino_info: None,
         };
         assert_eq!(
             encode_directory_entries(&[oversized_entry]),

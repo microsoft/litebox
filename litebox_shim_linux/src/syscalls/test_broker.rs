@@ -607,7 +607,7 @@ pub(crate) fn status(file_type: FileType, mode: u16) -> FileStatus {
             ino: 42,
             rdev: None,
         },
-        block_size: DEFAULT_BLOCK_SIZE,
+        blksize: DEFAULT_BLOCK_SIZE,
     }
 }
 
