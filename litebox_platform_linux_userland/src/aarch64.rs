@@ -82,6 +82,7 @@ struct TlsBlock {
     outbound_stub: usize,
     outbound_pc: usize,
     resume_frame_initialized: u8,
+    host_fp_state: FpState,
     guest_vector_state: GuestVectorState,
     resume_frame: resume_frame::ResumeFrame,
 }
@@ -104,6 +105,7 @@ pub(super) mod tls_offset {
     pub(crate) const OUTBOUND_PC: usize = offset_of!(TlsBlock, outbound_pc);
     pub(crate) const RESUME_FRAME_INITIALIZED: usize =
         offset_of!(TlsBlock, resume_frame_initialized);
+    pub(super) const HOST_FP_STATE: usize = offset_of!(TlsBlock, host_fp_state);
     pub(super) const GUEST_VECTOR_STATE: usize = offset_of!(TlsBlock, guest_vector_state);
     pub(crate) const RESUME_FRAME: usize = offset_of!(TlsBlock, resume_frame);
 }
@@ -449,6 +451,11 @@ syscall_callback_in_guest_cleared:
     add  x0, x0, #512
     stp  w1, w2, [x0]
 
+    // Restore host FP state after saving the guest's.
+    ldp  w1, w2, [x17, #{HOST_FP_STATE}]
+    msr  fpsr, x1
+    msr  fpcr, x2
+
     // `x29` still holds the guest's frame pointer at this point (it was
     // spilled to `regs[29]` above). Re-establish the host value before the
     // `bl`, or the `.cfi_def_cfa x29, 160` rule would resolve against guest
@@ -523,6 +530,7 @@ interrupt_callback:
 ",
     GUEST_CONTEXT_SIZE = const core::mem::size_of::<litebox_common_linux::PtRegs>(),
     HOST_SP = const tls_offset::HOST_SP,
+    HOST_FP_STATE = const tls_offset::HOST_FP_STATE,
     GUEST_CONTEXT_TOP = const tls_offset::GUEST_CONTEXT_TOP,
     GUEST_VECTOR_STATE = const tls_offset::GUEST_VECTOR_STATE,
     IN_GUEST = const tls_offset::IN_GUEST,
@@ -613,6 +621,27 @@ pub(super) mod resume_frame {
         ucontext: Ucontext,
     }
 
+    type KernelSigcontext = litebox_common_linux::signal::aarch64::Sigcontext;
+
+    // Pin libc's signal context to the kernel layout used below.
+    const _: () = assert!(
+        size_of::<libc::mcontext_t>() == size_of::<KernelSigcontext>()
+            && align_of::<libc::mcontext_t>() == align_of::<KernelSigcontext>()
+            && core::mem::offset_of!(libc::mcontext_t, fault_address)
+                == core::mem::offset_of!(KernelSigcontext, fault_address)
+            && core::mem::offset_of!(libc::mcontext_t, regs)
+                == core::mem::offset_of!(KernelSigcontext, regs)
+            && core::mem::offset_of!(libc::mcontext_t, sp)
+                == core::mem::offset_of!(KernelSigcontext, sp)
+            && core::mem::offset_of!(libc::mcontext_t, pc)
+                == core::mem::offset_of!(KernelSigcontext, pc)
+            && core::mem::offset_of!(libc::mcontext_t, pstate)
+                == core::mem::offset_of!(KernelSigcontext, pstate)
+            // libc's private `__reserved` is the 4KiB tail.
+            && size_of::<libc::mcontext_t>() - size_of::<[u8; 4096]>()
+                == core::mem::offset_of!(KernelSigcontext, __reserved)
+    );
+
     /// Uses pre-aligned TLS storage to avoid lazy initialization on a path that
     /// must not panic.
     fn state() -> (*mut ResumeFrame, *mut u8, usize) {
@@ -656,28 +685,57 @@ pub(super) mod resume_frame {
         // the same as writing `SS_DISABLE`, which *would* tear it down.
     }
 
-    /// Finds the kernel FP/SIMD record in a bounded AArch64 context chain.
-    fn find_fpsimd_context(records: &[u8]) -> Option<&FpsimdContext> {
-        let mut records = records;
+    /// Finds the FPSIMD record offset in a bounded context chain.
+    fn fpsimd_context_offset(records: &[u8]) -> Option<usize> {
+        let mut offset = 0;
         loop {
-            let (header, _) = Aarch64Ctx::ref_from_prefix(records).ok()?;
+            let remaining = records.get(offset..)?;
+            let (header, _) = Aarch64Ctx::ref_from_prefix(remaining).ok()?;
             if header.magic == 0 && header.size == 0 {
                 return None;
             }
             let size = usize::try_from(header.size).ok()?;
-            if size < size_of::<Aarch64Ctx>() || size > records.len() || !size.is_multiple_of(16) {
+            if size < size_of::<Aarch64Ctx>() || size > remaining.len() || !size.is_multiple_of(16)
+            {
                 return None;
             }
             if header.magic == FPSIMD_MAGIC {
-                if size != size_of::<FpsimdContext>() {
-                    return None;
-                }
-                return FpsimdContext::ref_from_prefix(&records[..size])
-                    .ok()
-                    .map(|(context, _)| context);
+                return (size == size_of::<FpsimdContext>()).then_some(offset);
             }
-            records = &records[size..];
+            offset += size;
         }
+    }
+
+    fn find_fpsimd_context(records: &[u8]) -> Option<&FpsimdContext> {
+        let offset = fpsimd_context_offset(records)?;
+        FpsimdContext::ref_from_prefix(&records[offset..])
+            .ok()
+            .map(|(context, _)| context)
+    }
+
+    fn find_fpsimd_context_mut(records: &mut [u8]) -> Option<&mut FpsimdContext> {
+        let offset = fpsimd_context_offset(records)?;
+        FpsimdContext::mut_from_prefix(&mut records[offset..])
+            .ok()
+            .map(|(context, _)| context)
+    }
+
+    /// Installs host FP state in a redirected signal frame.
+    pub(super) fn install_host_fp_state(
+        context: &mut libc::ucontext_t,
+        status: u32,
+        control: u32,
+    ) -> bool {
+        // SAFETY: the module-level assertions pin this cast and `__reserved`.
+        let signal_context = unsafe {
+            &mut *core::ptr::from_mut(&mut context.uc_mcontext).cast::<KernelSigcontext>()
+        };
+        let Some(fpsimd) = find_fpsimd_context_mut(&mut signal_context.__reserved) else {
+            return false;
+        };
+        fpsimd.fpsr = status;
+        fpsimd.fpcr = control;
+        true
     }
 
     /// Returns this thread's platform-owned guest vector state.
@@ -690,37 +748,9 @@ pub(super) mod resume_frame {
     /// Copies kernel-saved guest FP/SIMD state from a host signal context.
     /// Returns false if the bounded extension-record chain has no valid record.
     pub(super) fn capture_signal_vector_state(context: &libc::ucontext_t, block: usize) -> bool {
-        const _: () = assert!(
-            size_of::<libc::mcontext_t>()
-                == size_of::<litebox_common_linux::signal::aarch64::Sigcontext>()
-                && align_of::<libc::mcontext_t>()
-                    == align_of::<litebox_common_linux::signal::aarch64::Sigcontext>()
-                && core::mem::offset_of!(libc::mcontext_t, fault_address)
-                    == core::mem::offset_of!(
-                        litebox_common_linux::signal::aarch64::Sigcontext,
-                        fault_address
-                    )
-                && core::mem::offset_of!(libc::mcontext_t, regs)
-                    == core::mem::offset_of!(
-                        litebox_common_linux::signal::aarch64::Sigcontext,
-                        regs
-                    )
-                && core::mem::offset_of!(libc::mcontext_t, sp)
-                    == core::mem::offset_of!(litebox_common_linux::signal::aarch64::Sigcontext, sp)
-                && core::mem::offset_of!(libc::mcontext_t, pc)
-                    == core::mem::offset_of!(litebox_common_linux::signal::aarch64::Sigcontext, pc)
-                && core::mem::offset_of!(libc::mcontext_t, pstate)
-                    == core::mem::offset_of!(
-                        litebox_common_linux::signal::aarch64::Sigcontext,
-                        pstate
-                    )
-        );
-        // SAFETY: the assertions above pin libc's public prefix and complete
-        // size/alignment to LiteBox's kernel-compatible sigcontext definition.
-        let signal_context = unsafe {
-            &*core::ptr::from_ref(&context.uc_mcontext)
-                .cast::<litebox_common_linux::signal::aarch64::Sigcontext>()
-        };
+        // SAFETY: the module-level assertions pin this cast and `__reserved`.
+        let signal_context =
+            unsafe { &*core::ptr::from_ref(&context.uc_mcontext).cast::<KernelSigcontext>() };
         let Some(fpsimd) = find_fpsimd_context(&signal_context.__reserved) else {
             return false;
         };
@@ -1049,6 +1079,10 @@ switch_to_guest_via_outbound_stub_start:
     ",
     load_tls_block_base!("x17"),
     "
+    // Save host FP state before installing the guest's.
+    mrs  x16, fpsr
+    mrs  x4,  fpcr
+    stp  w16, w4, [x17, #{HOST_FP_STATE}]
     mov  w16, #1
     strb w16, [x17, #{IN_GUEST}]
     ldrb w16, [x17, #{INTERRUPT}]
@@ -1167,6 +1201,7 @@ switch_to_guest_via_outbound_stub_end:
     ,
     IN_GUEST = const tls_offset::IN_GUEST,
     INTERRUPT = const tls_offset::INTERRUPT,
+    HOST_FP_STATE = const tls_offset::HOST_FP_STATE,
     GUEST_VECTOR_STATE = const tls_offset::GUEST_VECTOR_STATE,
     OUTBOUND_STUB = const tls_offset::OUTBOUND_STUB,
     SVC_FRAME_BYTES = const litebox_syscall_rewriter::aarch64::SVC_FRAME_BYTES,
@@ -1215,6 +1250,10 @@ switch_to_guest_via_sigreturn_start:
     ",
     load_tls_block_base!("x17"),
     "
+    // Save host FP state before `rt_sigreturn` installs the guest's.
+    mrs  x16, fpsr
+    mrs  x9,  fpcr
+    stp  w16, w9, [x17, #{HOST_FP_STATE}]
     mov  w16, #1
     strb w16, [x17, #{IN_GUEST}]
     ldrb w16, [x17, #{INTERRUPT}]
@@ -1238,6 +1277,7 @@ switch_to_guest_via_sigreturn_end:
     ,
     IN_GUEST = const tls_offset::IN_GUEST,
     INTERRUPT = const tls_offset::INTERRUPT,
+    HOST_FP_STATE = const tls_offset::HOST_FP_STATE,
     NR_RT_SIGRETURN = const resume_frame::NR_RT_SIGRETURN,
     );
 }
@@ -1498,6 +1538,47 @@ pub(super) fn fatal_aarch64_runtime_state() -> ! {
     }
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FpState {
+    status: u32,
+    control: u32,
+}
+
+/// Reads the host FP state saved at guest entry.
+fn host_fp_state() -> FpState {
+    let status: u32;
+    let control: u32;
+    // SAFETY: reads this thread's fixed TLS slots.
+    unsafe {
+        core::arch::asm!(
+            load_tls_block_base!("{block}"),
+            "ldp {status:w}, {control:w}, [{block}, #{state_off}]",
+            block = out(reg) _,
+            status = out(reg) status,
+            control = out(reg) control,
+            state_off = const tls_offset::HOST_FP_STATE,
+            options(nostack, preserves_flags, readonly)
+        );
+    }
+    FpState { status, control }
+}
+
+/// Restores the host FP state saved at guest entry.
+fn restore_host_fp_state() {
+    let state = host_fp_state();
+    // SAFETY: restores values previously read from FPSR/FPCR.
+    unsafe {
+        core::arch::asm!(
+            "msr fpsr, {status}",
+            "msr fpcr, {control}",
+            status = in(reg) u64::from(state.status),
+            control = in(reg) u64::from(state.control),
+            options(nomem, nostack)
+        );
+    }
+}
+
 /// Clears `in_guest` and returns the published guest context only if `in_guest`
 /// was set. Its registers may still require copying or gate canonicalization.
 pub(super) fn signal_handler_take_guest() -> Option<*mut litebox_common_linux::PtRegs> {
@@ -1519,6 +1600,8 @@ pub(super) fn signal_handler_take_guest() -> Option<*mut litebox_common_linux::P
         if was_in_guest == 0 {
             return None;
         }
+        // Signal delivery retains guest FP state; restore the host's.
+        restore_host_fp_state();
         let top = ((block + tls_offset::GUEST_CONTEXT_TOP) as *const usize).read_volatile();
         Some((top as *mut litebox_common_linux::PtRegs).sub(1))
     }
@@ -1587,6 +1670,13 @@ pub(super) fn set_signal_return(
     p2: isize,
     p3: isize,
 ) {
+    // Make `rt_sigreturn` enter the callback with host FP state.
+    let host_state = host_fp_state();
+    if !resume_frame::install_host_fp_state(context, host_state.status, host_state.control) {
+        // Kernel signal frames require FPSIMD; match the capture path's failure policy.
+        fatal_aarch64_runtime_state();
+    }
+
     let m = &mut context.uc_mcontext;
     m.pc = f as usize as u64;
     // AAPCS64: first four integer arguments in x0-x3.
@@ -1604,6 +1694,61 @@ mod tests {
     use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
     use litebox_common_linux::PtRegs;
     use litebox_common_linux::signal::{SigSet, Signal};
+
+    fn live_fp_state() -> FpState {
+        let status: u64;
+        let control: u64;
+        // SAFETY: reads architectural state without accessing memory.
+        unsafe {
+            core::arch::asm!(
+                "mrs {status}, fpsr",
+                "mrs {control}, fpcr",
+                status = out(reg) status,
+                control = out(reg) control,
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+        FpState {
+            status: u32::try_from(status).unwrap(),
+            control: u32::try_from(control).unwrap(),
+        }
+    }
+
+    fn set_live_fp_state(state: FpState) {
+        // SAFETY: the test changes only writable FPSR/FPCR bits.
+        unsafe {
+            core::arch::asm!(
+                "msr fpsr, {status}",
+                "msr fpcr, {control}",
+                status = in(reg) u64::from(state.status),
+                control = in(reg) u64::from(state.control),
+                options(nomem, nostack)
+            );
+        }
+    }
+
+    fn set_saved_host_fp_state(state: FpState) {
+        // SAFETY: writes this test thread's own fixed TLS slots.
+        unsafe {
+            core::arch::asm!(
+                load_tls_block_base!("{block}"),
+                "stp {status:w}, {control:w}, [{block}, #{state_off}]",
+                block = out(reg) _,
+                status = in(reg) state.status,
+                control = in(reg) state.control,
+                state_off = const tls_offset::HOST_FP_STATE,
+                options(nostack, preserves_flags)
+            );
+        }
+    }
+
+    struct RestoreLiveFpState(FpState);
+
+    impl Drop for RestoreLiveFpState {
+        fn drop(&mut self) {
+            set_live_fp_state(self.0);
+        }
+    }
 
     #[test]
     fn test_gate_patching_lands_in_the_runtime_tls_block() {
@@ -1704,6 +1849,91 @@ mod tests {
         assert!(state.registers.iter().all(|register| *register == 0));
         assert_eq!(state.fpsr, 0);
         assert_eq!(state.fpcr, 0);
+    }
+
+    #[test]
+    fn taking_guest_from_signal_restores_host_fp_state() {
+        const FPSR_IOC: u32 = 1;
+        const FPCR_RMODE_BIT: u32 = 1 << 22;
+
+        let original = live_fp_state();
+        let _restore = RestoreLiveFpState(original);
+        let previous_saved = host_fp_state();
+        let expected = FpState {
+            status: original.status ^ FPSR_IOC,
+            control: original.control ^ FPCR_RMODE_BIT,
+        };
+        set_saved_host_fp_state(expected);
+        set_live_fp_state(original);
+
+        let mut guest = PtRegs::default();
+        let block = tls_block_base();
+        let context_top = (block + tls_offset::GUEST_CONTEXT_TOP) as *mut usize;
+        let in_guest = (block + tls_offset::IN_GUEST) as *mut u8;
+        // SAFETY: accesses this test thread's transition slots.
+        let (previous_top, previous_in_guest) = unsafe {
+            let previous = (context_top.read_volatile(), in_guest.read_volatile());
+            context_top.write_volatile((&raw mut guest).wrapping_add(1) as usize);
+            in_guest.write_volatile(1);
+            previous
+        };
+
+        let captured = signal_handler_take_guest();
+        let actual = live_fp_state();
+        // SAFETY: restores the transition slots saved above.
+        unsafe {
+            context_top.write_volatile(previous_top);
+            in_guest.write_volatile(previous_in_guest);
+        }
+        set_saved_host_fp_state(previous_saved);
+
+        assert_eq!(captured, Some(&raw mut guest));
+        assert_eq!(actual.status, expected.status);
+        assert_eq!(actual.control, expected.control);
+    }
+
+    unsafe extern "C" fn signal_return_test_callback() {}
+
+    #[test]
+    fn signal_return_installs_host_fp_state_in_fpsimd_record() {
+        const FPSIMD_MAGIC: u32 = 0x4650_8001;
+        const FPSIMD_SIZE: u32 = 528;
+        const EXPECTED_STATUS: u32 = 0x0800_0011;
+        const EXPECTED_CONTROL: u32 = 0x00c0_0000;
+
+        let previous_saved = host_fp_state();
+        set_saved_host_fp_state(FpState {
+            status: EXPECTED_STATUS,
+            control: EXPECTED_CONTROL,
+        });
+        let mut context: libc::ucontext_t = unsafe { core::mem::zeroed() };
+        // SAFETY: layout is pinned above; the zeroed tail terminates the record.
+        {
+            let records = unsafe {
+                &mut (*core::ptr::from_mut(&mut context.uc_mcontext)
+                    .cast::<litebox_common_linux::signal::aarch64::Sigcontext>())
+                .__reserved
+            };
+            records[0..4].copy_from_slice(&FPSIMD_MAGIC.to_ne_bytes());
+            records[4..8].copy_from_slice(&FPSIMD_SIZE.to_ne_bytes());
+        }
+
+        set_signal_return(&mut context, signal_return_test_callback, 0, 0, 0, 0);
+        set_saved_host_fp_state(previous_saved);
+
+        let records = unsafe {
+            &(*core::ptr::from_ref(&context.uc_mcontext)
+                .cast::<litebox_common_linux::signal::aarch64::Sigcontext>())
+            .__reserved
+        };
+        assert_eq!(
+            u32::from_ne_bytes(records[8..12].try_into().unwrap()),
+            EXPECTED_STATUS
+        );
+        assert_eq!(
+            u32::from_ne_bytes(records[12..16].try_into().unwrap()),
+            EXPECTED_CONTROL
+        );
     }
 
     fn gate_fixture(
