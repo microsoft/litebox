@@ -931,12 +931,12 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         entries.push(DirEntry {
             name: String::from("."),
             file_type: FileType::Directory,
-            node_info: None,
+            ino_info: None,
         });
         entries.push(DirEntry {
             name: String::from(".."),
             file_type: FileType::Directory,
-            node_info: None,
+            ino_info: None,
         });
         entries.extend(self.backend.list_dir_at(dir.clone())?);
         Ok(entries)

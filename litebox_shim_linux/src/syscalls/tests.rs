@@ -89,7 +89,7 @@ pub(crate) fn directory_entry(name: &str, file_type: FileType, ino: u64) -> File
     FileDirectoryEntry {
         name: alloc::string::String::from(name),
         file_type,
-        node_info: Some(FileNodeInfo {
+        ino_info: Some(FileNodeInfo {
             dev: 1,
             ino,
             rdev: None,

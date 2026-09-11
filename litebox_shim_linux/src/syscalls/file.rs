@@ -2816,10 +2816,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 break;
             }
             let dirent64 = litebox_common_linux::LinuxDirent64 {
-                ino: entry
-                    .node_info
-                    .as_ref()
-                    .map_or(0, |node_info| node_info.ino),
+                ino: entry.ino_info.as_ref().map_or(0, |node_info| node_info.ino),
                 off: dir_off as u64,
                 len: u16::try_from(len).map_err(|_| Errno::EOVERFLOW)?,
                 typ: litebox_common_linux::DirentType::from(entry.file_type) as u8,

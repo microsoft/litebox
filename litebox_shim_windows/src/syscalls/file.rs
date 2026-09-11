@@ -280,7 +280,7 @@ impl FileStatusMetadata {
         let end_of_file = i64::try_from(status.size).unwrap_or(i64::MAX);
         let allocation_size = status
             .size
-            .checked_next_multiple_of(status.block_size.max(1))
+            .checked_next_multiple_of(status.blksize.max(1))
             .and_then(|size| i64::try_from(size).ok())
             .unwrap_or(i64::MAX);
         let file_id = status.node_info.ino;

@@ -394,7 +394,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                 DirEntry {
                     name: name.clone(),
                     file_type,
-                    node_info: Some(node_info),
+                    ino_info: Some(node_info),
                 }
             })
             .collect())
@@ -469,7 +469,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                     size: u64::try_from(file.data.len()).map_err(|_| FileStatusError::Io)?,
                     owner: file.perms.userinfo,
                     node_info: file.node_info,
-                    block_size: BLOCK_SIZE,
+                    blksize: BLOCK_SIZE,
                 })
             }
             super::backend::HandleRef::Dir(h) => {
@@ -480,7 +480,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                     size: super::DEFAULT_DIRECTORY_SIZE,
                     owner: dir.perms.userinfo,
                     node_info: dir.node_info,
-                    block_size: BLOCK_SIZE,
+                    blksize: BLOCK_SIZE,
                 })
             }
         }

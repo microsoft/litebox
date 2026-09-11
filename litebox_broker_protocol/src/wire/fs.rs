@@ -443,7 +443,7 @@ fn encode_status(encoder: &mut Encoder, status: FileStatus) {
     encoder.u64(status.node_info.dev);
     encoder.u64(status.node_info.ino);
     encode_optional_u64(encoder, status.node_info.rdev.map(NonZeroU64::get));
-    encoder.u64(status.block_size);
+    encoder.u64(status.blksize);
 }
 
 fn decode_status(decoder: &mut Decoder<'_>) -> Result<FileStatus, WireError> {
@@ -456,13 +456,13 @@ fn decode_status(decoder: &mut Decoder<'_>) -> Result<FileStatus, WireError> {
     let rdev = decode_optional_u64(decoder)?
         .map(|value| NonZeroU64::new(value).ok_or(WireError::InvalidTag))
         .transpose()?;
-    let block_size = decoder.u64()?;
+    let blksize = decoder.u64()?;
     Ok(FileStatus {
         file_type,
         mode,
         size,
         owner,
         node_info: FileNodeInfo { dev, ino, rdev },
-        block_size,
+        blksize,
     })
 }

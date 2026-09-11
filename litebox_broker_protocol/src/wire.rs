@@ -1099,7 +1099,7 @@ mod tests {
                     ino: u64::MAX,
                     rdev: Some(NonZeroU64::MAX),
                 },
-                block_size: u64::MAX,
+                blksize: u64::MAX,
             })),
             BrokerResult::File(FileResponse::HandleStatus(FileStatus {
                 file_type: FileType::CharacterDevice,
@@ -1114,7 +1114,7 @@ mod tests {
                     ino: u64::MAX,
                     rdev: Some(NonZeroU64::MAX),
                 },
-                block_size: u64::MAX,
+                blksize: u64::MAX,
             })),
             BrokerResult::File(FileResponse::Chmod),
             BrokerResult::File(FileResponse::Chown),
@@ -1347,7 +1347,7 @@ mod tests {
                     ino: 7,
                     rdev: None,
                 },
-                block_size: 4096,
+                blksize: 4096,
             })),
         };
         let status = encode_response(status);

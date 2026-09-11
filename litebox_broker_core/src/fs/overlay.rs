@@ -603,8 +603,8 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
             if entry.file_type != FileType::Directory {
                 blocked.insert(entry.name.clone());
             }
-            entry.node_info = entry
-                .node_info
+            entry.ino_info = entry
+                .ino_info
                 .take()
                 .map(|node| self.map_node(&mut self.state.lock().ids, None, node));
             entries.insert(
@@ -632,7 +632,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
                         continue;
                     }
                     let directory = lower_entry.file_type == FileType::Directory;
-                    let lower_node = lower_entry.node_info.take();
+                    let lower_node = lower_entry.ino_info.take();
                     let entry = entries
                         .entry(name.clone())
                         .or_insert_with(|| ResolvedEntry {
@@ -644,7 +644,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
                     entry.lower.get_or_insert(layer);
                     if !entry.upper && entry.lower == Some(layer) {
                         // This layer owns the entry, so its node is the one callers see.
-                        entry.entry.node_info = lower_node.map(|node| {
+                        entry.entry.ino_info = lower_node.map(|node| {
                             self.map_node(&mut self.state.lock().ids, Some(layer), node)
                         });
                     }
@@ -655,7 +655,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
                         entry.lower_directories[layer] = true;
                         // Several layers describe one logical directory; the one already resolved
                         // above owns the identity, and this layer's node adopts it.
-                        if let (Some(node), Some(id)) = (lower_node, entry.entry.node_info) {
+                        if let (Some(node), Some(id)) = (lower_node, entry.entry.ino_info) {
                             self.state
                                 .lock()
                                 .ids

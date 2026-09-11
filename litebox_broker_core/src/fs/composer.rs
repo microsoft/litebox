@@ -232,7 +232,7 @@ impl Composer {
                 name,
                 file_type: FileType::Directory,
                 // TODO(jayb): set up proper inode info for these
-                node_info: None,
+                ino_info: None,
             })
             .collect()
     }
@@ -280,7 +280,7 @@ impl Composer {
             size: super::DEFAULT_DIRECTORY_SIZE,
             owner: UserInfo::ROOT,
             node_info,
-            block_size: super::DEFAULT_DIRECTORY_SIZE,
+            blksize: super::DEFAULT_DIRECTORY_SIZE,
         }
     }
 

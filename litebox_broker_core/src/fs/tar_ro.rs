@@ -192,7 +192,7 @@ impl super::backend::Backend for TarRo {
                 DirEntry {
                     name: name.clone(),
                     file_type,
-                    node_info: Some(node_info),
+                    ino_info: Some(node_info),
                 }
             })
             .collect())
@@ -242,7 +242,7 @@ impl super::backend::Backend for TarRo {
                     size: u64::try_from(file.data_range.len()).map_err(|_| FileStatusError::Io)?,
                     owner: file.owner,
                     node_info: file.node_info,
-                    block_size: BLOCK_SIZE,
+                    blksize: BLOCK_SIZE,
                 })
             }
             HandleRef::Dir(h) => {
@@ -253,7 +253,7 @@ impl super::backend::Backend for TarRo {
                     size: super::DEFAULT_DIRECTORY_SIZE,
                     owner: dir.owner.unwrap_or(DEFAULT_DIRECTORY_OWNER),
                     node_info: dir.node_info,
-                    block_size: BLOCK_SIZE,
+                    blksize: BLOCK_SIZE,
                 })
             }
         }
