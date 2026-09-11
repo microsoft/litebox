@@ -30,7 +30,6 @@ pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
     let policy = PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()).with_socket_policy(
         configured_socket_policy(&args.allow_tcp_destination, &args.allow_udp_destination)?,
     );
-    validate_fs_options(&args)?;
     let fs = super::fs::create_file_service::<WindowsSyncPrimitivesProvider>(
         Vec::new(),
         args.fs_initial_files.as_deref(),
@@ -48,16 +47,6 @@ pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
             Ok(())
         })
     }
-}
-
-fn validate_fs_options(args: &super::CliArgs) -> IoResult<()> {
-    if args.fs_program.is_some() || args.fs_rewrite_syscalls || args.fs_virtualize_x18 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "Windows broker file systems require the program in the initial tar archive",
-        ));
-    }
-    Ok(())
 }
 
 fn run_runner_in_process(
