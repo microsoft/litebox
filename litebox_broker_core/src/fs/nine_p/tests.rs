@@ -12,10 +12,9 @@ use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 
-use litebox_broker_protocol::fs::{
-    FileAccessMode, FileMode as Mode, FileOpenFlags, FileSeekWhence as SeekWhence, FileType,
-};
+use litebox_broker_protocol::fs::{FileMode as Mode, FileSeekWhence as SeekWhence, FileType};
 
+use crate::fs::OFlags;
 use crate::fs::errors::{
     FileStatusError, MkdirError, OpenError, ReadDirError, ReadError, RmdirError, SeekError,
     TruncateError, UnlinkError, WriteError,
@@ -221,8 +220,7 @@ fn test_nine_p_create_and_read_file() {
         .open(
             USER,
             "/hello.txt",
-            FileAccessMode::WriteOnly,
-            FileOpenFlags::CREATE,
+            OFlags::CREAT | OFlags::WRONLY,
             Mode::RWXU,
         )
         .expect("failed to create file via 9P");
@@ -243,13 +241,7 @@ fn test_nine_p_create_and_read_file() {
 
     // Read the file back through 9P
     let mut fd = fs
-        .open(
-            USER,
-            "/hello.txt",
-            FileAccessMode::ReadOnly,
-            FileOpenFlags::empty(),
-            Mode::empty(),
-        )
+        .open(USER, "/hello.txt", OFlags::RDONLY, Mode::empty())
         .expect("failed to open file for reading via 9P");
 
     let mut buf = alloc::vec![0u8; 256];
@@ -277,8 +269,7 @@ fn test_nine_p_mkdir_and_readdir() {
         .open(
             USER,
             "/subdir/file.txt",
-            FileAccessMode::WriteOnly,
-            FileOpenFlags::CREATE,
+            OFlags::CREAT | OFlags::WRONLY,
             Mode::RWXU,
         )
         .expect("failed to create file in subdir");
@@ -287,13 +278,7 @@ fn test_nine_p_mkdir_and_readdir() {
 
     // Read the root directory
     let fd = fs
-        .open(
-            USER,
-            "/",
-            FileAccessMode::ReadOnly,
-            FileOpenFlags::DIRECTORY,
-            Mode::empty(),
-        )
+        .open(USER, "/", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
         .expect("failed to open root dir");
     let entries = fs.read_dir(&fd).expect("failed to readdir root");
     drop(fd);
@@ -309,8 +294,7 @@ fn test_nine_p_mkdir_and_readdir() {
         .open(
             USER,
             "/subdir",
-            FileAccessMode::ReadOnly,
-            FileOpenFlags::DIRECTORY,
+            OFlags::RDONLY | OFlags::DIRECTORY,
             Mode::empty(),
         )
         .expect("failed to open subdir");
@@ -338,8 +322,7 @@ fn test_nine_p_unlink_and_rmdir() {
         .open(
             USER,
             "/to_delete.txt",
-            FileAccessMode::WriteOnly,
-            FileOpenFlags::CREATE,
+            OFlags::CREAT | OFlags::WRONLY,
             Mode::RWXU,
         )
         .expect("failed to create file");
@@ -350,14 +333,8 @@ fn test_nine_p_unlink_and_rmdir() {
 
     // Verify the file is gone
     assert!(
-        fs.open(
-            USER,
-            "/to_delete.txt",
-            FileAccessMode::ReadOnly,
-            FileOpenFlags::empty(),
-            Mode::empty()
-        )
-        .is_err(),
+        fs.open(USER, "/to_delete.txt", OFlags::RDONLY, Mode::empty())
+            .is_err(),
         "file should no longer exist"
     );
 
@@ -384,8 +361,7 @@ fn test_nine_p_file_status() {
         .open(
             USER,
             "/status_test.txt",
-            FileAccessMode::WriteOnly,
-            FileOpenFlags::CREATE,
+            OFlags::CREAT | OFlags::WRONLY,
             Mode::RWXU,
         )
         .expect("failed to create file");
@@ -426,8 +402,7 @@ fn test_nine_p_seek_and_partial_read() {
         .open(
             USER,
             "/seek_test.txt",
-            FileAccessMode::WriteOnly,
-            FileOpenFlags::CREATE,
+            OFlags::CREAT | OFlags::WRONLY,
             Mode::RWXU,
         )
         .expect("failed to create file");
@@ -436,13 +411,7 @@ fn test_nine_p_seek_and_partial_read() {
 
     // Open for reading and seek
     let mut fd = fs
-        .open(
-            USER,
-            "/seek_test.txt",
-            FileAccessMode::ReadOnly,
-            FileOpenFlags::empty(),
-            Mode::empty(),
-        )
+        .open(USER, "/seek_test.txt", OFlags::RDONLY, Mode::empty())
         .expect("failed to open file for reading");
 
     // Seek to offset 5
@@ -469,8 +438,7 @@ fn test_nine_p_truncate() {
         .open(
             USER,
             "/trunc_test.txt",
-            FileAccessMode::ReadWrite,
-            FileOpenFlags::CREATE,
+            OFlags::CREAT | OFlags::RDWR,
             Mode::RWXU,
         )
         .expect("failed to create file");
@@ -503,13 +471,7 @@ fn test_nine_p_host_files_visible() {
 
     // Read file created on the host through 9P
     let mut fd = fs
-        .open(
-            USER,
-            "/host_file.txt",
-            FileAccessMode::ReadOnly,
-            FileOpenFlags::empty(),
-            Mode::empty(),
-        )
+        .open(USER, "/host_file.txt", OFlags::RDONLY, Mode::empty())
         .expect("failed to open host file via 9P");
     let mut buf = alloc::vec![0u8; 256];
     let n = fs.read(&mut fd, &mut buf, None).unwrap();
@@ -521,8 +483,7 @@ fn test_nine_p_host_files_visible() {
         .open(
             USER,
             "/host_dir",
-            FileAccessMode::ReadOnly,
-            FileOpenFlags::DIRECTORY,
+            OFlags::RDONLY | OFlags::DIRECTORY,
             Mode::empty(),
         )
         .expect("failed to open host dir via 9P");
@@ -610,13 +571,7 @@ fn test_nine_p_broken_open() {
     // 2 writes: version + attach. The next write (open's walk) will fail.
     let fs = connect_9p_broken(&server, 2);
 
-    let result = fs.open(
-        USER,
-        "/anything.txt",
-        FileAccessMode::ReadOnly,
-        FileOpenFlags::empty(),
-        Mode::empty(),
-    );
+    let result = fs.open(USER, "/anything.txt", OFlags::RDONLY, Mode::empty());
     assert!(matches!(result, Err(OpenError::Io)));
 }
 
@@ -626,13 +581,7 @@ fn test_nine_p_broken_create() {
     let server = DiodServer::start();
     let fs = connect_9p_broken(&server, 2);
 
-    let result = fs.open(
-        USER,
-        "/new.txt",
-        FileAccessMode::WriteOnly,
-        FileOpenFlags::CREATE,
-        Mode::RWXU,
-    );
+    let result = fs.open(USER, "/new.txt", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU);
     assert!(matches!(result, Err(OpenError::Io)));
 }
 
@@ -646,13 +595,7 @@ fn test_nine_p_broken_read() {
     // 4 writes: version + attach + walk + lopen. Then read will fail.
     let fs = connect_9p_broken(&server, 4);
     let mut fd = fs
-        .open(
-            USER,
-            "/read_me.txt",
-            FileAccessMode::ReadOnly,
-            FileOpenFlags::empty(),
-            Mode::empty(),
-        )
+        .open(USER, "/read_me.txt", OFlags::RDONLY, Mode::empty())
         .expect("open should succeed before break");
 
     let mut buf = alloc::vec![0u8; 64];
@@ -672,8 +615,7 @@ fn test_nine_p_broken_write() {
         .open(
             USER,
             "/write_me.txt",
-            FileAccessMode::WriteOnly,
-            FileOpenFlags::CREATE,
+            OFlags::CREAT | OFlags::WRONLY,
             Mode::RWXU,
         )
         .expect("create should succeed before break");
@@ -700,13 +642,7 @@ fn test_nine_p_broken_readdir() {
     // 4 writes: version + attach + walk + lopen for the directory.
     let fs = connect_9p_broken(&server, 4);
     let fd = fs
-        .open(
-            USER,
-            "/",
-            FileAccessMode::ReadOnly,
-            FileOpenFlags::DIRECTORY,
-            Mode::empty(),
-        )
+        .open(USER, "/", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
         .expect("open dir should succeed before break");
 
     let result = fs.read_dir(&fd);
@@ -757,13 +693,7 @@ fn test_nine_p_broken_truncate() {
     // 4 writes: version + attach + walk + lopen. Then truncate will fail.
     let fs = connect_9p_broken(&server, 4);
     let mut fd = fs
-        .open(
-            USER,
-            "/to_trunc.txt",
-            FileAccessMode::ReadWrite,
-            FileOpenFlags::empty(),
-            Mode::empty(),
-        )
+        .open(USER, "/to_trunc.txt", OFlags::RDWR, Mode::empty())
         .expect("open should succeed before break");
 
     let result = fs.truncate(&mut fd, 0, true);
@@ -780,13 +710,7 @@ fn test_nine_p_broken_seek() {
     // 4 writes: version + attach + walk + lopen. Then the getattr for seek will fail.
     let fs = connect_9p_broken(&server, 4);
     let mut fd = fs
-        .open(
-            USER,
-            "/to_seek.txt",
-            FileAccessMode::ReadOnly,
-            FileOpenFlags::empty(),
-            Mode::empty(),
-        )
+        .open(USER, "/to_seek.txt", OFlags::RDONLY, Mode::empty())
         .expect("open should succeed before break");
 
     let result = fs.seek(&mut fd, -1, SeekWhence::RelativeToEnd);
@@ -812,26 +736,14 @@ fn test_nine_p_deep_path_walk() {
     // Create a file at the bottom
     let file_path = path.clone() + "/deep_file.txt";
     let mut fd = fs
-        .open(
-            USER,
-            &file_path,
-            FileAccessMode::WriteOnly,
-            FileOpenFlags::CREATE,
-            Mode::RWXU,
-        )
+        .open(USER, &file_path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
         .expect("failed to create file in deep path");
     fs.write(&mut fd, b"deep content", None).unwrap();
     drop(fd);
 
     // Read it back
     let mut fd = fs
-        .open(
-            USER,
-            &file_path,
-            FileAccessMode::ReadOnly,
-            FileOpenFlags::empty(),
-            Mode::empty(),
-        )
+        .open(USER, &file_path, OFlags::RDONLY, Mode::empty())
         .expect("failed to open file in deep path");
     let mut buf = alloc::vec![0u8; 64];
     let n = fs.read(&mut fd, &mut buf, None).unwrap();
@@ -856,8 +768,7 @@ fn test_nine_p_chmod() {
         .open(
             USER,
             "/chmod_test.txt",
-            FileAccessMode::WriteOnly,
-            FileOpenFlags::CREATE,
+            OFlags::CREAT | OFlags::WRONLY,
             Mode::RWXU,
         )
         .expect("failed to create file");
@@ -898,8 +809,7 @@ fn test_nine_p_chown() {
         .open(
             USER,
             "/chown_test.txt",
-            FileAccessMode::WriteOnly,
-            FileOpenFlags::CREATE,
+            OFlags::CREAT | OFlags::WRONLY,
             Mode::RWXU,
         )
         .expect("failed to create file");
@@ -937,8 +847,7 @@ fn test_nine_p_handle_status() {
         .open(
             USER,
             "/fd_stat_test.txt",
-            FileAccessMode::WriteOnly,
-            FileOpenFlags::CREATE,
+            OFlags::CREAT | OFlags::WRONLY,
             Mode::RWXU,
         )
         .expect("failed to create file");
@@ -947,13 +856,7 @@ fn test_nine_p_handle_status() {
 
     // Open the file and check the open-handle status
     let fd = fs
-        .open(
-            USER,
-            "/fd_stat_test.txt",
-            FileAccessMode::ReadOnly,
-            FileOpenFlags::empty(),
-            Mode::empty(),
-        )
+        .open(USER, "/fd_stat_test.txt", OFlags::RDONLY, Mode::empty())
         .expect("failed to open file");
 
     let status = fs.handle_status(&fd).expect("handle status failed");
@@ -964,13 +867,7 @@ fn test_nine_p_handle_status() {
     drop(fd);
 
     let fd = fs
-        .open(
-            USER,
-            "/",
-            FileAccessMode::ReadOnly,
-            FileOpenFlags::DIRECTORY,
-            Mode::empty(),
-        )
+        .open(USER, "/", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
         .expect("failed to open root dir");
     let status = fs.handle_status(&fd).expect("handle status on dir failed");
     assert_eq!(status.file_type, FileType::Directory);
@@ -994,8 +891,7 @@ fn test_nine_p_large_read_write() {
         .open(
             USER,
             "/large_test.bin",
-            FileAccessMode::ReadWrite,
-            FileOpenFlags::CREATE,
+            OFlags::CREAT | OFlags::RDWR,
             Mode::RWXU,
         )
         .expect("failed to create file");
@@ -1015,13 +911,7 @@ fn test_nine_p_large_read_write() {
 
     // Read it all back
     let mut fd = fs
-        .open(
-            USER,
-            "/large_test.bin",
-            FileAccessMode::ReadOnly,
-            FileOpenFlags::empty(),
-            Mode::empty(),
-        )
+        .open(USER, "/large_test.bin", OFlags::RDONLY, Mode::empty())
         .expect("failed to open file for reading");
 
     let mut read_buf = alloc::vec![0u8; data_size];
@@ -1050,8 +940,7 @@ fn test_nine_p_explicit_offset_read_write() {
         .open(
             USER,
             "/offset_test.txt",
-            FileAccessMode::ReadWrite,
-            FileOpenFlags::CREATE,
+            OFlags::CREAT | OFlags::RDWR,
             Mode::RWXU,
         )
         .expect("failed to create file");
@@ -1078,13 +967,7 @@ fn test_nine_p_explicit_offset_read_write() {
 
     // Now test explicit offset reads
     let mut fd = fs
-        .open(
-            USER,
-            "/offset_test.txt",
-            FileAccessMode::ReadOnly,
-            FileOpenFlags::empty(),
-            Mode::empty(),
-        )
+        .open(USER, "/offset_test.txt", OFlags::RDONLY, Mode::empty())
         .expect("failed to open for reading");
 
     // Read 5 bytes at explicit offset 5 → "BBBBB"

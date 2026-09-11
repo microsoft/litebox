@@ -14,10 +14,7 @@ use alloc::vec::Vec;
 use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use litebox_broker_protocol::fs::{
-    FileAccessMode, FileDirectoryEntry, FileMode, FileNodeInfo, FileOpenFlags, FileStatus,
-    FileType, FileUser,
-};
+use litebox_broker_protocol::fs::{FileDirectoryEntry, FileMode, FileStatus, FileType, FileUser};
 use litebox_platform::sync;
 use thiserror::Error;
 
@@ -30,6 +27,7 @@ use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
     ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WalkError, WriteError,
 };
+use super::{NodeInfo, OFlags};
 mod client;
 mod fcall;
 mod id_pool;
@@ -55,7 +53,7 @@ pub struct NineP<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read +
     /// Handed out (shared) by [`Backend::root`](super::backend::Backend::root), so it must never
     /// be `Tlopen`ed or `Tlcreate`d; see the `is_backend_root` flag on the walking dir handle.
     root: Arc<OwnedFid<Platform, T>>,
-    /// Device id reported in every [`FileNodeInfo`] from this backend; inode numbers
+    /// Device id reported in every [`NodeInfo`] from this backend; inode numbers
     /// come from the server's qids instead.
     device_id: u64,
     /// Whether `unlinkat` is supported by the server
@@ -351,20 +349,16 @@ where
     fn owned_dir_at(
         &self,
         dir: WalkingDirHandle<'_>,
-        access: FileAccessMode,
-        flags: FileOpenFlags,
+        flags: OFlags,
     ) -> Result<DirHandle, OpenError> {
-        assert_supported_flags(flags);
-        if matches!(
-            access,
-            FileAccessMode::WriteOnly | FileAccessMode::ReadWrite
-        ) {
+        assert_supported_oflags(flags);
+        if flags.intersects(OFlags::WRONLY | OFlags::RDWR) {
             // TODO(jayb): POSIX requires `EISDIR` when write access is requested on a directory,
             // but `OpenError` has no such variant yet.
             unimplemented!()
         }
         let (fid, is_backend_root) = dir.into_typed::<Self>().into_dir();
-        if flags.contains(FileOpenFlags::PATH) {
+        if flags.contains(OFlags::PATH) {
             // An `O_PATH` handle is never opened server-side, so the walked fid can be handed over
             // as-is, even when it is the shared root fid.
             return Ok(DirHandle::from_typed::<Self>(NinePDirHandle { fid }));
@@ -399,13 +393,12 @@ where
         &self,
         dir: WalkingDirHandle<'_>,
         name: &str,
-        access: FileAccessMode,
-        flags: FileOpenFlags,
+        flags: OFlags,
     ) -> Result<Permissioned<FileHandle>, OpenError> {
-        assert_supported_flags(flags);
+        assert_supported_oflags(flags);
         // TODO: we do not support non-blocking, so ignore that flag instead of returning an error.
-        let flags = flags - FileOpenFlags::NONBLOCKING;
-        if flags.contains(FileOpenFlags::DIRECTORY) {
+        let flags = flags - OFlags::NONBLOCK;
+        if flags.contains(OFlags::DIRECTORY) {
             return Err(OpenError::PathError(PathError::ComponentNotADirectory));
         }
 
@@ -421,17 +414,14 @@ where
             }
         };
 
-        if !flags.contains(FileOpenFlags::PATH) {
+        if !flags.contains(OFlags::PATH) {
             // An `O_PATH` handle addresses the file without opening it server-side.
             //
             // The file exists (it is what stopped the walk), so the creation flags say nothing
             // about how to open it; the resolver enforces `O_CREAT | O_EXCL` itself.
             self.client.open(
                 &fid.fid,
-                open_flags_to_lopen(
-                    access,
-                    flags - FileOpenFlags::CREATE - FileOpenFlags::EXCLUSIVE,
-                ),
+                oflags_to_lopen(flags - OFlags::CREAT - OFlags::EXCL),
             )?;
         }
         Ok(Permissioned {
@@ -455,7 +445,7 @@ where
             .map(|entry| FileDirectoryEntry {
                 name: String::from_utf8_lossy(&entry.name).into_owned(),
                 file_type: qid_type_to_file_type(entry.qid.typ),
-                node_info: Some(FileNodeInfo {
+                node_info: Some(NodeInfo {
                     dev: self.device_id,
                     ino: entry.qid.path,
                     rdev: None,
@@ -640,41 +630,71 @@ fn backend_checked_components(count: usize) -> Vec<WalkedComponent> {
     ]
 }
 
-fn assert_supported_flags(flags: FileOpenFlags) {
-    if !flags.difference(FileOpenFlags::all()).is_empty() {
+/// Flags this backend knows how to honor when opening files/directories.
+const SUPPORTED_OFLAGS: OFlags = OFlags::CREAT
+    .union(OFlags::RDONLY)
+    .union(OFlags::WRONLY)
+    .union(OFlags::RDWR)
+    .union(OFlags::TRUNC)
+    .union(OFlags::NOCTTY)
+    .union(OFlags::EXCL)
+    .union(OFlags::DIRECTORY)
+    .union(OFlags::NONBLOCK)
+    .union(OFlags::LARGEFILE)
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::APPEND)
+    .union(OFlags::PATH);
+
+fn assert_supported_oflags(flags: OFlags) {
+    if flags.intersects(SUPPORTED_OFLAGS.complement()) {
         unimplemented!("{flags:?}")
     }
 }
 
-/// Convert canonical open intent to the 9P2000.L wire flags.
-fn open_flags_to_lopen(access: FileAccessMode, flags: FileOpenFlags) -> fcall::LOpenFlags {
-    let mut lflags = match access {
-        FileAccessMode::ReadOnly => fcall::LOpenFlags::empty(),
-        FileAccessMode::WriteOnly => fcall::LOpenFlags::O_WRONLY,
-        FileAccessMode::ReadWrite => fcall::LOpenFlags::O_RDWR,
-        _ => unimplemented!("{access:?}"),
-    };
+/// Convert [`OFlags`] to 9P `LOpenFlags`
+fn oflags_to_lopen(flags: OFlags) -> fcall::LOpenFlags {
+    let mut lflags = fcall::LOpenFlags::empty();
 
-    if flags.contains(FileOpenFlags::CREATE) {
+    // Access mode (RDONLY is 0, so we only check for WRONLY and RDWR)
+    if flags.contains(OFlags::RDWR) {
+        lflags |= fcall::LOpenFlags::O_RDWR;
+    } else if flags.contains(OFlags::WRONLY) {
+        lflags |= fcall::LOpenFlags::O_WRONLY;
+    }
+    // RDONLY is implicit if neither WRONLY nor RDWR
+
+    if flags.contains(OFlags::CREAT) {
         lflags |= fcall::LOpenFlags::O_CREAT;
     }
-    if flags.contains(FileOpenFlags::EXCLUSIVE) {
+    if flags.contains(OFlags::EXCL) {
         lflags |= fcall::LOpenFlags::O_EXCL;
     }
-    if flags.contains(FileOpenFlags::TRUNCATE) {
+    if flags.contains(OFlags::TRUNC) {
         lflags |= fcall::LOpenFlags::O_TRUNC;
     }
-    if flags.contains(FileOpenFlags::APPEND) {
+    if flags.contains(OFlags::APPEND) {
         lflags |= fcall::LOpenFlags::O_APPEND;
     }
-    if flags.contains(FileOpenFlags::DIRECTORY) {
+    if flags.contains(OFlags::DIRECTORY) {
         lflags |= fcall::LOpenFlags::O_DIRECTORY;
     }
-    if flags.contains(FileOpenFlags::NO_FOLLOW) {
+    if flags.contains(OFlags::NOFOLLOW) {
         lflags |= fcall::LOpenFlags::O_NOFOLLOW;
     }
-    if flags.contains(FileOpenFlags::NONBLOCKING) {
+    if flags.contains(OFlags::NONBLOCK) {
         lflags |= fcall::LOpenFlags::O_NONBLOCK;
+    }
+    if flags.contains(OFlags::SYNC) {
+        lflags |= fcall::LOpenFlags::O_SYNC;
+    }
+    if flags.contains(OFlags::DSYNC) {
+        lflags |= fcall::LOpenFlags::O_DSYNC;
+    }
+    if flags.contains(OFlags::DIRECT) {
+        lflags |= fcall::LOpenFlags::O_DIRECT;
+    }
+    if flags.contains(OFlags::NOATIME) {
+        lflags |= fcall::LOpenFlags::O_NOATIME;
     }
 
     lflags
@@ -711,7 +731,7 @@ fn rgetattr_to_file_status(attr: &fcall::Rgetattr, device_id: u64) -> Result<Fil
                 user: u16::try_from(attr.stat.uid).map_err(|_| Error::InvalidResponse)?,
                 group: u16::try_from(attr.stat.gid).map_err(|_| Error::InvalidResponse)?,
             },
-            node_info: FileNodeInfo {
+            node_info: NodeInfo {
                 dev: device_id,
                 ino: attr.qid.path,
                 rdev: NonZeroU64::new(attr.stat.rdev),
@@ -743,7 +763,7 @@ fn rgetattr_to_file_status(attr: &fcall::Rgetattr, device_id: u64) -> Result<Fil
                     0
                 },
             },
-            node_info: FileNodeInfo {
+            node_info: NodeInfo {
                 dev: device_id,
                 ino: attr.qid.path,
                 rdev: if attr.valid.contains(fcall::GetattrMask::RDEV) {

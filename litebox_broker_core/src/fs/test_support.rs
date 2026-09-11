@@ -10,11 +10,12 @@
 use alloc::vec::Vec;
 
 use litebox_broker_protocol::fs::{
-    FileAccessMode, FileDirectoryEntry, FileMode as Mode, FileOpenFlags,
-    FileSeekWhence as SeekWhence, FileStatus, FileUser as UserInfo,
+    FileDirectoryEntry, FileMode as Mode, FileSeekWhence as SeekWhence, FileStatus,
+    FileUser as UserInfo,
 };
 use litebox_broker_protocol::stdio::StdioOutputStream;
 
+use super::OFlags;
 use super::backend::{Backend, DeviceIo, NoDeviceIo};
 #[cfg(target_os = "linux")]
 use super::errors::TruncateError;
@@ -57,11 +58,10 @@ impl<BackendType: Backend + 'static> Fs<BackendType> {
         &self,
         user: UserInfo,
         path: &str,
-        access: FileAccessMode,
-        flags: FileOpenFlags,
+        flags: OFlags,
         mode: Mode,
     ) -> Result<Entry<BackendType>, OpenError> {
-        self.resolver.open(user, path, access, flags, mode)
+        self.resolver.open(user, path, flags, mode)
     }
 
     pub(in crate::fs) fn read(

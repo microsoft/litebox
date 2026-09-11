@@ -10,8 +10,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use litebox_broker_protocol::fs::{
-    FileAccessMode, FileDirectoryEntry, FileMode as Mode, FileNodeInfo, FileOpenFlags, FileStatus,
-    FileType, FileUser as UserInfo,
+    FileDirectoryEntry, FileMode as Mode, FileStatus, FileType, FileUser as UserInfo,
 };
 
 use super::backend::{
@@ -23,6 +22,7 @@ use super::errors::{
     ReadError, RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::inode_allocator::{InodeAllocator, InodeAllocators};
+use super::{NodeInfo, OFlags};
 use thiserror::Error;
 
 // XXX(jayb): consider removing this via a runtime reserved device ID?
@@ -53,7 +53,7 @@ struct Mount {
 #[derive(Clone)]
 struct VirtualDir {
     path: Vec<String>,
-    node_info: FileNodeInfo,
+    node_info: NodeInfo,
 }
 
 /// Composer construction errors.
@@ -546,8 +546,7 @@ impl Backend for Composer {
     fn owned_dir_at(
         &self,
         dir: WalkingDirHandle<'_>,
-        access: FileAccessMode,
-        flags: FileOpenFlags,
+        flags: OFlags,
     ) -> Result<DirHandle, OpenError> {
         let dir = dir.into_typed::<Self>();
         let inner = match dir.inner {
@@ -563,7 +562,7 @@ impl Backend for Composer {
                 mount_index,
                 handle: self.mounts[mount_index]
                     .backend
-                    .owned_dir_at(handle, access, flags)?,
+                    .owned_dir_at(handle, flags)?,
             },
         };
         Ok(DirHandle::from_typed::<Self>(ComposerDirHandle { inner }))
@@ -599,8 +598,7 @@ impl Backend for Composer {
         &self,
         dir: WalkingDirHandle<'_>,
         name: &str,
-        access: FileAccessMode,
-        flags: FileOpenFlags,
+        flags: OFlags,
     ) -> Result<Permissioned<FileHandle>, OpenError> {
         let dir = dir.into_typed::<Self>();
         match dir.inner {
@@ -619,7 +617,7 @@ impl Backend for Composer {
                 )?;
                 self.mounts[mount_index]
                     .backend
-                    .open_file_at(handle, name, access, flags)
+                    .open_file_at(handle, name, flags)
                     .map(|file| Permissioned {
                         item: FileHandle::from_typed::<Self>(ComposerFileHandle {
                             mount_index,

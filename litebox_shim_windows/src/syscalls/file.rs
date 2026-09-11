@@ -693,23 +693,23 @@ impl FileAccess {
 
         match create_disposition {
             CreateDisposition::Overwrite => {
-                flags.insert(FileOpenFlags::TRUNCATE);
+                flags = flags.union(FileOpenFlags::TRUNCATE);
             }
             CreateDisposition::Supersede | CreateDisposition::OverwriteIf => {
-                flags.insert(FileOpenFlags::CREATE | FileOpenFlags::TRUNCATE);
+                flags = flags.union(FileOpenFlags::CREATE | FileOpenFlags::TRUNCATE);
             }
             CreateDisposition::Create => {
-                flags.insert(FileOpenFlags::CREATE | FileOpenFlags::EXCLUSIVE);
+                flags = flags.union(FileOpenFlags::CREATE | FileOpenFlags::EXCLUSIVE);
             }
-            CreateDisposition::OpenIf => flags.insert(FileOpenFlags::CREATE),
+            CreateDisposition::OpenIf => flags = flags.union(FileOpenFlags::CREATE),
             CreateDisposition::Open => {}
         }
 
         if create_options.contains(FileCreateOptions::DIRECTORY_FILE) {
-            flags.insert(FileOpenFlags::DIRECTORY);
+            flags = flags.union(FileOpenFlags::DIRECTORY);
         }
         if create_options.contains(FileCreateOptions::NON_DIRECTORY_FILE) {
-            flags.insert(FileOpenFlags::NO_FOLLOW);
+            flags = flags.union(FileOpenFlags::NO_FOLLOW);
         }
 
         (access, flags)
