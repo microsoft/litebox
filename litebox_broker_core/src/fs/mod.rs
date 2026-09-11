@@ -25,8 +25,6 @@ pub mod resolver;
 mod service;
 pub mod tar_ro;
 #[cfg(test)]
-mod test_support;
-#[cfg(test)]
 mod tests;
 
 pub use litebox_broker_protocol::fs::{
