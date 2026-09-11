@@ -29,6 +29,10 @@ fn run_rewritten_target(target: &std::path::Path, virtualize_x18: bool) -> std::
             broker_path.display()
         );
         let mut command = std::process::Command::new(broker_path);
+        command
+            .arg("--fs-program")
+            .arg(target)
+            .arg("--fs-rewrite-syscalls");
         if virtualize_x18 {
             command.arg("--fs-virtualize-x18");
         }

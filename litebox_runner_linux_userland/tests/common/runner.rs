@@ -190,7 +190,7 @@ impl Runner {
 
         self.command
             .arg("--initial-files")
-            .arg(tar_file)
+            .arg(&tar_file)
             .arg(&self.cmd_path)
             .args(&self.cmd_args);
 
@@ -221,6 +221,7 @@ impl Runner {
             for host in &self.managed_proxy_hosts {
                 command.arg("--allow-host").arg(host);
             }
+            command.arg("--fs-initial-files").arg(&tar_file);
             if self.in_process_mode {
                 command.args(["--unstable", "--in-process-runner"]);
             } else {

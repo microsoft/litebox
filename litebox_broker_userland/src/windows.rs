@@ -18,7 +18,7 @@ use litebox_broker_core::fs::composer::Composer;
 use litebox_broker_core::fs::in_mem::{InMem, InitialNode};
 use litebox_broker_core::fs::overlay::Overlay;
 use litebox_broker_core::fs::resolver::Resolver;
-use litebox_broker_core::fs::tar_ro::TarRo;
+use litebox_broker_core::fs::tar_ro::{EMPTY_TAR_FILE, TarRo};
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
 use litebox_broker_protocol::fs::{FileMode as Mode, FileUser as UserInfo};
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
@@ -61,34 +61,19 @@ fn create_file_service(args: &super::CliArgs) -> Result<Arc<dyn FileService>, Bo
         )
         .into());
     }
-    let runner_args = litebox_runner_windows_userland::CliArgs::try_parse_from(
-        std::iter::once(OsString::from("litebox-runner-windows-userland"))
-            .chain(std::iter::once(OsString::from("--unstable")))
-            .chain(args.runner_arguments.iter().cloned()),
-    )
-    .ok();
-    let initial_files = args
-        .fs_initial_files
-        .clone()
-        .or_else(|| runner_args.and_then(|args| args.initial_files))
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Windows broker requires --fs-initial-files or runner --initial-files",
-            )
-        })?;
-    if initial_files
-        .extension()
-        .and_then(|extension| extension.to_str())
-        != Some("tar")
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("expected a .tar file, found {}", initial_files.display()),
-        )
-        .into());
-    }
-    let tar_data = std::borrow::Cow::Owned(std::fs::read(initial_files)?);
+    let tar_data = match args.fs_initial_files.as_deref() {
+        Some(path) => {
+            if path.extension().and_then(|extension| extension.to_str()) != Some("tar") {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("expected a .tar file, found {}", path.display()),
+                )
+                .into());
+            }
+            std::borrow::Cow::Owned(std::fs::read(path)?)
+        }
+        None => std::borrow::Cow::Borrowed(EMPTY_TAR_FILE),
+    };
     let mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
     let in_mem = InMem::<super::sync::WindowsSyncPrimitivesProvider>::new_initialized([
         (

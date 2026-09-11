@@ -122,7 +122,7 @@ struct CliArgs {
     /// Declare that rewritten AArch64 binaries use x18 virtualization.
     #[arg(long)]
     fs_virtualize_x18: bool,
-    /// Arguments to pass to the local runner.
+    /// Opaque arguments to pass to the local runner without interpretation.
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true, value_hint = clap::ValueHint::CommandWithArguments)]
     runner_arguments: Vec<OsString>,
 }
