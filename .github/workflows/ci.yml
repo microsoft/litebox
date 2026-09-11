@@ -319,6 +319,9 @@ jobs:
           #   `std` access, since it owns hosted Linux broker resources such as
           #   sockets and the epoll reactor.
           #
+          # - `litebox_broker_platform_windows_userland` is allowed to have
+          #   `std` access, since it owns hosted Windows broker resources.
+          #
           # - `litebox_broker_userland` is allowed to have `std` access,
           #   since it is the hosted userland broker executable.
           #
@@ -388,6 +391,7 @@ jobs:
             -not -path './Cargo.toml' \
             -not -path './litebox_broker_local_userland/Cargo.toml' \
             -not -path './litebox_broker_platform_linux_userland/Cargo.toml' \
+            -not -path './litebox_broker_platform_windows_userland/Cargo.toml' \
             -not -path './litebox_broker_transport_linux_userland/Cargo.toml' \
             -not -path './litebox_broker_transport_windows_userland/Cargo.toml' \
             -not -path './litebox_broker_userland/Cargo.toml' \
