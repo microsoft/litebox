@@ -1,0 +1,17 @@
+[package]
+name = "litebox_broker_platform_windows_userland"
+version = "0.1.0"
+edition = "2024"
+
+[target.'cfg(windows)'.dependencies]
+litebox_platform = { path = "../litebox_platform", version = "0.1.0" }
+windows-sys = { version = "0.60.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
+
+[features]
+lock_tracing = ["litebox_platform/lock_tracing"]
+
+[lints]
+workspace = true

@@ -21,17 +21,15 @@ litebox_syscall_rewriter = { path = "../litebox_syscall_rewriter", version = "0.
 tempfile = { version = "3", default-features = false }
 
 [target.'cfg(all(windows, target_arch = "x86_64"))'.dependencies]
+litebox_broker_platform_windows_userland = { path = "../litebox_broker_platform_windows_userland", version = "0.1.0" }
 litebox_broker_transport_windows_userland = { path = "../litebox_broker_transport_windows_userland", version = "0.1.0" }
 litebox_runner_windows_userland = { path = "../litebox_runner_windows_userland", version = "0.1.0" }
-windows-sys = { version = "0.60.2", features = [
-    "Win32_Foundation",
-    "Win32_System_Threading",
-] }
 
 [features]
 lock_tracing = [
     "litebox_platform/lock_tracing",
     "litebox_broker_platform_linux_userland/lock_tracing",
+    "litebox_broker_platform_windows_userland/lock_tracing",
     "litebox_runner_linux_userland/lock_tracing",
 ]
 aarch64_virtualize_x18 = ["litebox_runner_linux_userland/aarch64_virtualize_x18"]

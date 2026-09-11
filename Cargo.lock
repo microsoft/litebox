@@ -1523,6 +1523,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_broker_platform_windows_userland"
+version = "0.1.0"
+dependencies = [
+ "litebox_platform",
+ "windows-sys 0.60.2",
+]
+
+[[package]]
 name = "litebox_broker_protocol"
 version = "0.1.0"
 dependencies = [
@@ -1567,6 +1575,7 @@ dependencies = [
  "litebox_broker_host",
  "litebox_broker_local",
  "litebox_broker_platform_linux_userland",
+ "litebox_broker_platform_windows_userland",
  "litebox_broker_protocol",
  "litebox_broker_transport",
  "litebox_broker_transport_linux_userland",
@@ -1577,7 +1586,6 @@ dependencies = [
  "litebox_runner_windows_userland",
  "litebox_syscall_rewriter",
  "tempfile",
- "windows-sys 0.60.2",
 ]
 
 [[package]]
