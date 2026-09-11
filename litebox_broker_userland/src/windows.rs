@@ -20,6 +20,7 @@ use litebox_broker_core::fs::overlay::Overlay;
 use litebox_broker_core::fs::resolver::Resolver;
 use litebox_broker_core::fs::tar_ro::{EMPTY_TAR_FILE, TarRo};
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
+use litebox_broker_platform_windows_userland::WindowsSyncPrimitivesProvider;
 use litebox_broker_protocol::fs::{FileMode as Mode, FileUser as UserInfo};
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport_windows_userland::named_pipe::{
@@ -75,7 +76,7 @@ fn create_file_service(args: &super::CliArgs) -> Result<Arc<dyn FileService>, Bo
         None => std::borrow::Cow::Borrowed(EMPTY_TAR_FILE),
     };
     let mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
-    let in_mem = InMem::<super::sync::WindowsSyncPrimitivesProvider>::new_initialized([
+    let in_mem = InMem::<WindowsSyncPrimitivesProvider>::new_initialized([
         (
             "/tmp",
             InitialNode::Directory {
@@ -93,7 +94,7 @@ fn create_file_service(args: &super::CliArgs) -> Result<Arc<dyn FileService>, Bo
     ]);
     let backend = Composer::builder()
         .mount_nestable("/", |allocators| {
-            Overlay::<super::sync::WindowsSyncPrimitivesProvider>::new(
+            Overlay::<WindowsSyncPrimitivesProvider>::new(
                 in_mem,
                 TarRo::new(tar_data, allocators.next()),
                 allocators.next(),
@@ -102,10 +103,9 @@ fn create_file_service(args: &super::CliArgs) -> Result<Arc<dyn FileService>, Bo
         .mount("/dev", litebox_broker_core::fs::devices::Devices::new)
         .build()
         .map_err(|_| std::io::Error::other("failed to construct broker file service"))?;
-    Ok(Arc::new(Resolver::<
-        super::sync::WindowsSyncPrimitivesProvider,
-        _,
-    >::new(backend)))
+    Ok(Arc::new(Resolver::<WindowsSyncPrimitivesProvider, _>::new(
+        backend,
+    )))
 }
 
 fn run_runner_in_process(

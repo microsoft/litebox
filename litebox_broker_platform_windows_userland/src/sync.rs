@@ -1,26 +1,30 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-#![cfg(all(windows, target_arch = "x86_64"))]
+//! Windows-userland broker synchronization primitives.
 
 use core::ffi::c_void;
 use core::sync::atomic::AtomicU32;
 use core::time::Duration;
 
-use litebox_platform::sync::{ImmediatelyWokenUp, RawMutex, RawMutexProvider, UnblockedOrTimedOut};
+use litebox_platform::sync::{
+    ImmediatelyWokenUp, RawMutex as RawMutexTrait, RawMutexProvider, UnblockedOrTimedOut,
+};
 use windows_sys::Win32::Foundation::{ERROR_TIMEOUT, GetLastError};
 use windows_sys::Win32::System::Threading::{
     INFINITE, WaitOnAddress, WakeByAddressAll, WakeByAddressSingle,
 };
 
+/// Blocking synchronization primitives for a Windows-userland broker.
 #[derive(Clone, Copy, Debug, Default)]
-pub(super) struct WindowsSyncPrimitivesProvider;
+pub struct WindowsSyncPrimitivesProvider;
 
 impl RawMutexProvider for WindowsSyncPrimitivesProvider {
     type RawMutex = WindowsRawMutex;
 }
 
-pub(super) struct WindowsRawMutex {
+/// Raw blocking mutex used by the Windows-userland broker.
+pub struct WindowsRawMutex {
     state: AtomicU32,
 }
 
@@ -35,7 +39,7 @@ impl WindowsRawMutex {
         &self,
         expected: u32,
         timeout: Option<Duration>,
-    ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
+    ) -> UnblockedOrTimedOut {
         let timeout_ms = timeout.map_or(INFINITE, |timeout| {
             u32::try_from(timeout.as_millis().min(u128::from(INFINITE - 1))).unwrap()
         });
@@ -49,18 +53,18 @@ impl WindowsRawMutex {
             ) != 0
         };
         if unblocked {
-            Ok(UnblockedOrTimedOut::Unblocked)
+            UnblockedOrTimedOut::Unblocked
         } else {
             // SAFETY: GetLastError has no preconditions.
             match unsafe { GetLastError() } {
-                ERROR_TIMEOUT => Ok(UnblockedOrTimedOut::TimedOut),
+                ERROR_TIMEOUT => UnblockedOrTimedOut::TimedOut,
                 error => panic!("WaitOnAddress failed with error {error}"),
             }
         }
     }
 }
 
-impl RawMutex for WindowsRawMutex {
+impl RawMutexTrait for WindowsRawMutex {
     const INIT: Self = Self::new();
 
     fn underlying_atomic(&self) -> &AtomicU32 {
@@ -87,9 +91,8 @@ impl RawMutex for WindowsRawMutex {
 
     fn block(&self, expected: u32) -> Result<(), ImmediatelyWokenUp> {
         match self.block_or_maybe_timeout(expected, None) {
-            Ok(UnblockedOrTimedOut::Unblocked) => Ok(()),
-            Ok(UnblockedOrTimedOut::TimedOut) => unreachable!(),
-            Err(error) => Err(error),
+            UnblockedOrTimedOut::Unblocked => Ok(()),
+            UnblockedOrTimedOut::TimedOut => unreachable!(),
         }
     }
 
@@ -98,6 +101,6 @@ impl RawMutex for WindowsRawMutex {
         expected: u32,
         timeout: Duration,
     ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
-        self.block_or_maybe_timeout(expected, Some(timeout))
+        Ok(self.block_or_maybe_timeout(expected, Some(timeout)))
     }
 }

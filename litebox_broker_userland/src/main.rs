@@ -21,8 +21,6 @@ use litebox_broker_protocol::socket::{Ipv4Address, Port};
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(all(windows, target_arch = "x86_64"))]
-mod sync;
-#[cfg(all(windows, target_arch = "x86_64"))]
 mod windows;
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
