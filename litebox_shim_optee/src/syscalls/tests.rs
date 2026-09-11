@@ -32,17 +32,17 @@ fn test_sys_log() {
 #[test]
 fn test_cryp_random_number_generate_requires_broker() {
     let task = init_platform();
+    let mut buf = [0u8; 16];
     assert_eq!(
         task.sys_cryp_random_number_generate(&mut []),
         Ok(()),
         "zero-length random generation must not require a broker"
     );
-
-    let mut buf = [0u8; 16];
     assert_eq!(
         task.sys_cryp_random_number_generate(&mut buf),
         Err(litebox_common_optee::TeeResult::CommunicationError)
     );
+    assert_eq!(buf, [0; 16]);
 }
 
 #[test]
