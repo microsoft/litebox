@@ -1932,10 +1932,6 @@ impl litebox::platform::StdioProvider for WindowsUserland {
     }
 }
 
-#[global_allocator]
-static SLAB_ALLOC: litebox::mm::allocator::SafeZoneAllocator<'static, 28, WindowsUserland> =
-    litebox::mm::allocator::SafeZoneAllocator::new();
-
 impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
     fn alloc(layout: &std::alloc::Layout) -> Option<(usize, usize)> {
         let size = core::cmp::max(
