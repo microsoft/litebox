@@ -9,16 +9,15 @@ use std::os::linux::fs::MetadataExt as _;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::process::{Child, ChildStdout, Command, Stdio};
-use std::sync::Arc;
 use std::sync::mpsc::{RecvTimeoutError, sync_channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use clap::Parser as _;
-use litebox_broker_core::fs::FileService;
 use litebox_broker_core::fs::in_mem::InitialNode;
 use litebox_broker_core::socket::HOST_GATEWAY_IPV4_ADDRESS;
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
+use litebox_broker_platform_linux_userland::LinuxSyncPrimitivesProvider;
 use litebox_broker_protocol::fs::{FileMode as Mode, FileUser as UserInfo};
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory;
@@ -58,7 +57,10 @@ pub(super) fn run(mut args: super::CliArgs) -> Result<(), Box<dyn Error>> {
     let policy = PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()).with_socket_policy(
         configured_socket_policy(&args.allow_tcp_destination, &args.allow_udp_destination)?,
     );
-    let fs = create_file_service(&args)?;
+    let fs = super::fs::create_file_service::<LinuxSyncPrimitivesProvider>(
+        host_program_entries(&args)?,
+        args.fs_initial_files.as_deref(),
+    )?;
     let build_broker = || BrokerCoreBuilder::new(policy).with_file_service(fs).build();
     let broker = if args.in_process_runner {
         litebox_platform_linux_userland::with_guest_signals_blocked(build_broker)?
@@ -88,7 +90,9 @@ pub(super) fn run(mut args: super::CliArgs) -> Result<(), Box<dyn Error>> {
     }
 }
 
-fn create_file_service(args: &super::CliArgs) -> Result<Arc<dyn FileService>, Box<dyn Error>> {
+fn host_program_entries(
+    args: &super::CliArgs,
+) -> Result<Vec<(String, InitialNode)>, Box<dyn Error>> {
     let mut entries = Vec::new();
     if let Some(program) = args.fs_program.as_deref() {
         let program = std::path::absolute(program)?;
@@ -128,9 +132,7 @@ fn create_file_service(args: &super::CliArgs) -> Result<Arc<dyn FileService>, Bo
         ));
     }
 
-    Ok(super::fs::create_file_service::<
-        litebox_broker_platform_linux_userland::LinuxSyncPrimitivesProvider,
-    >(entries, args.fs_initial_files.as_deref())?)
+    Ok(entries)
 }
 
 fn guest_owner(previous_user: u32, user: u32) -> UserInfo {
