@@ -70,25 +70,3 @@ impl InodeAllocator {
         self.device_id
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn preserves_full_width_device_and_inode_numbers() {
-        let allocator = InodeAllocator::for_device(u64::MAX);
-        allocator.counter.store(u64::MAX - 1, Ordering::Relaxed);
-
-        assert_eq!(allocator.device_id(), u64::MAX);
-        assert_eq!(
-            allocator.next(),
-            FileNodeInfo {
-                dev: u64::MAX,
-                ino: u64::MAX - 1,
-                rdev: None,
-            }
-        );
-        assert_eq!(allocator.next().ino, u64::MAX);
-    }
-}

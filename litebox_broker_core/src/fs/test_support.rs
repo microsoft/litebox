@@ -16,9 +16,11 @@ use litebox_broker_protocol::fs::{
 use litebox_broker_protocol::stdio::StdioOutputStream;
 
 use super::backend::{Backend, DeviceIo, NoDeviceIo};
+#[cfg(target_os = "linux")]
+use super::errors::TruncateError;
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, ReadDirError, ReadError,
-    RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+    RmdirError, SeekError, UnlinkError, WriteError,
 };
 use super::resolver::{Resolver, ResolverEntry};
 use crate::test_platform::TestPlatform;
@@ -111,6 +113,7 @@ impl<BackendType: Backend + 'static> Fs<BackendType> {
         self.resolver.seek(entry, offset, whence)
     }
 
+    #[cfg(target_os = "linux")]
     pub(in crate::fs) fn truncate(
         &self,
         entry: &mut Entry<BackendType>,
@@ -202,42 +205,5 @@ impl DeviceIo for UnservicedStdio {
 
     fn fill_random(&self, _output: &mut [u8]) -> Result<(), ReadError> {
         Err(ReadError::Io)
-    }
-}
-
-/// Device I/O that records the standard-I/O transfers the devices backend asks for.
-pub(in crate::fs) struct RecordingStdio {
-    stdin: &'static [u8],
-    writes: std::sync::Mutex<Vec<(StdioOutputStream, Vec<u8>)>>,
-}
-
-impl RecordingStdio {
-    pub(in crate::fs) fn new(stdin: &'static [u8]) -> Self {
-        Self {
-            stdin,
-            writes: std::sync::Mutex::new(Vec::new()),
-        }
-    }
-
-    pub(in crate::fs) fn writes(&self) -> Vec<(StdioOutputStream, Vec<u8>)> {
-        self.writes.lock().unwrap().clone()
-    }
-}
-
-impl DeviceIo for RecordingStdio {
-    fn read_stdin(&self, output: &mut [u8]) -> Result<usize, ReadError> {
-        let read = self.stdin.len().min(output.len());
-        output[..read].copy_from_slice(&self.stdin[..read]);
-        Ok(read)
-    }
-
-    fn write_stdio(&self, stream: StdioOutputStream, input: &[u8]) -> Result<usize, WriteError> {
-        self.writes.lock().unwrap().push((stream, input.into()));
-        Ok(input.len())
-    }
-
-    fn fill_random(&self, output: &mut [u8]) -> Result<(), ReadError> {
-        output.fill(0x5a);
-        Ok(())
     }
 }

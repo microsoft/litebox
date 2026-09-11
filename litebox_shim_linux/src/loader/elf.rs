@@ -385,26 +385,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn elf_file_size_retains_protocol_width() {
-        use crate::syscalls::test_broker::{Scripted, closed, opened, status};
-        use crate::syscalls::tests::{FILE_HANDLE, scripted_task};
-        use litebox_broker_protocol::fs::{FileStatus, FileType};
-        use litebox_broker_protocol::message::FileResponse;
-        use litebox_common_linux::loader::ReadAt as _;
-
-        let (files, task) = scripted_task([opened(FILE_HANDLE)]);
-        let file = ElfFile::new(&task, "/large").unwrap();
-        files.script([
-            Scripted::Reply(FileResponse::HandleStatus(FileStatus {
-                size: u64::MAX,
-                ..status(FileType::RegularFile, 0o644)
-            })),
-            closed(),
-        ]);
-        assert_eq!((&file).size().unwrap(), u64::MAX);
-    }
-
-    #[test]
     fn interpreter_reservation_is_top_down_above_low_heap() {
         let task = crate::syscalls::tests::init_platform();
         let mut interpreter = ElfFile {

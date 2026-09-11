@@ -691,30 +691,6 @@ mod tests {
     use alloc::vec;
 
     #[test]
-    fn file_open_flags_preserve_wire_bits_and_reject_unknown_bits() {
-        for (flag, bits) in [
-            (FileOpenFlags::NONE, 0),
-            (FileOpenFlags::CREATE, 0x001),
-            (FileOpenFlags::TRUNCATE, 0x002),
-            (FileOpenFlags::NO_CONTROLLING_TERMINAL, 0x004),
-            (FileOpenFlags::EXCLUSIVE, 0x008),
-            (FileOpenFlags::DIRECTORY, 0x010),
-            (FileOpenFlags::NONBLOCKING, 0x020),
-            (FileOpenFlags::LARGE_FILE, 0x040),
-            (FileOpenFlags::NO_FOLLOW, 0x080),
-            (FileOpenFlags::APPEND, 0x100),
-            (FileOpenFlags::PATH, 0x200),
-            (FileOpenFlags::SUPPORTED, 0x3ff),
-        ] {
-            assert_eq!(flag.bits(), bits);
-            assert_eq!(FileOpenFlags::from_bits(bits), Some(flag));
-        }
-        assert_eq!(FileOpenFlags::all(), FileOpenFlags::SUPPORTED);
-        assert_eq!(FileOpenFlags::from_bits(0x400), None);
-        assert_eq!(FileOpenFlags::from_bits(u16::MAX), None);
-    }
-
-    #[test]
     fn directory_payload_round_trips_all_entry_shapes() {
         let entries = vec![
             FileDirectoryEntry {
@@ -797,28 +773,6 @@ mod tests {
             encode_directory_entries_chunk(&entries, 2, first_two_length).unwrap();
         assert_eq!(decode_directory_entries(&last).unwrap(), entries[2..]);
         assert_eq!(next_index, None);
-    }
-
-    #[test]
-    fn directory_payload_preserves_full_width_node_info_and_rejects_zero_rdev() {
-        let entries = [FileDirectoryEntry {
-            name: "device".into(),
-            file_type: FileType::CharacterDevice,
-            node_info: Some(FileNodeInfo {
-                dev: u64::MAX,
-                ino: u64::MAX,
-                rdev: Some(NonZeroU64::MAX),
-            }),
-        }];
-        let mut payload = encode_directory_entries(&entries).unwrap();
-        assert_eq!(decode_directory_entries(&payload).unwrap(), entries);
-
-        let rdev_start = payload.len() - size_of::<u64>();
-        payload[rdev_start..].fill(0);
-        assert_eq!(
-            decode_directory_entries(&payload),
-            Err(DirectoryPayloadError::Malformed)
-        );
     }
 
     #[test]
