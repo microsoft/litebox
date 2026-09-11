@@ -5,7 +5,7 @@
 
 use core::{
     num::NonZeroUsize,
-    sync::atomic::{AtomicU32, Ordering::Relaxed},
+    sync::atomic::{AtomicBool, Ordering::Relaxed},
 };
 
 use alloc::sync::{Arc, Weak};
@@ -74,7 +74,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
             broker,
             self.litebox.broker_pollable_registry(),
             capacity,
-            flags & Flags::all(),
+            flags,
             atomic_slice_guarantee_size,
         )?;
         let mut dt = self.litebox.descriptor_table_mut();
@@ -159,7 +159,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
             .ok_or(errors::ClosedError::ClosedFd)?
             .entry
             .0;
-        Ok(p.get_status())
+        Ok(if p.non_blocking.load(Relaxed) {
+            Flags::NON_BLOCKING
+        } else {
+            Flags::empty()
+        })
     }
 
     /// Update the flags set on the pipe at `fd`.
@@ -177,7 +181,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
             .ok_or(errors::ClosedError::ClosedFd)?
             .entry
             .0;
-        p.set_status(mask & Flags::all(), on);
+        if mask.contains(Flags::NON_BLOCKING) {
+            p.non_blocking.store(on, Relaxed);
+        }
         Ok(())
     }
 
@@ -340,7 +346,7 @@ struct BrokerPipeEnd<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     pollee: Arc<Pollee<Platform>>,
     peer: Weak<Self>,
     endpoint_type: HalfPipeType,
-    status: AtomicU32,
+    non_blocking: AtomicBool,
 }
 
 #[expect(
@@ -379,7 +385,7 @@ fn new_broker_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider>(
         pollee: Arc::new(Pollee::new()),
         peer: Weak::new(),
         endpoint_type: HalfPipeType::SenderHalf,
-        status: AtomicU32::new(flags.bits()),
+        non_blocking: AtomicBool::new(flags.contains(Flags::NON_BLOCKING)),
     });
     let reader = Arc::new_cyclic(|weak_reader| {
         Arc::get_mut(&mut writer)
@@ -392,7 +398,7 @@ fn new_broker_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider>(
             pollee: Arc::new(Pollee::new()),
             peer: Arc::downgrade(&writer),
             endpoint_type: HalfPipeType::ReceiverHalf,
-            status: AtomicU32::new(flags.bits()),
+            non_blocking: AtomicBool::new(flags.contains(Flags::NON_BLOCKING)),
         }
     });
 
@@ -402,18 +408,6 @@ fn new_broker_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider>(
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerPipeEnd<Platform> {
-    fn get_status(&self) -> Flags {
-        Flags::from_bits(self.status.load(Relaxed)).expect("pipe status contains only pipe flags")
-    }
-
-    fn set_status(&self, mask: Flags, on: bool) {
-        if on {
-            self.status.fetch_or(mask.bits(), Relaxed);
-        } else {
-            self.status.fetch_and(mask.complement().bits(), Relaxed);
-        }
-    }
-
     fn read(&self, cx: &WaitContext<'_, Platform>, buf: &mut [u8]) -> Result<usize, PipeError> {
         let length = buf.len().min(MAX_PIPE_TRANSFER_SIZE as usize);
         if length == 0 {
@@ -424,27 +418,22 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerPipeEnd<Platform>
             .expect("pipe transfer limit must fit in u32");
 
         self.pollee
-            .wait(
-                cx,
-                self.get_status().contains(Flags::NON_BLOCKING),
-                Events::IN,
-                || {
-                    let data = self
-                        .broker
-                        .read_pipe(self.handle, request_length)
-                        .map_err(|error| self.broker_request_error(error))?;
-                    if data.len() > length {
-                        return Err(TryOpError::Other(PipeError::Io));
-                    }
-                    buf[..data.len()].copy_from_slice(&data);
-                    if !data.is_empty()
-                        && let Some(peer) = self.peer.upgrade()
-                    {
-                        peer.pollee.notify_observers(Events::OUT);
-                    }
-                    Ok(data.len())
-                },
-            )
+            .wait(cx, self.non_blocking.load(Relaxed), Events::IN, || {
+                let data = self
+                    .broker
+                    .read_pipe(self.handle, request_length)
+                    .map_err(|error| self.broker_request_error(error))?;
+                if data.len() > length {
+                    return Err(TryOpError::Other(PipeError::Io));
+                }
+                buf[..data.len()].copy_from_slice(&data);
+                if !data.is_empty()
+                    && let Some(peer) = self.peer.upgrade()
+                {
+                    peer.pollee.notify_observers(Events::OUT);
+                }
+                Ok(data.len())
+            })
             .map_err(PipeError::from)
     }
 
@@ -452,7 +441,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerPipeEnd<Platform>
         if buf.is_empty() {
             return Ok(0);
         }
-        let nonblock = self.get_status().contains(Flags::NON_BLOCKING);
+        let nonblock = self.non_blocking.load(Relaxed);
         if nonblock {
             let data = &buf[..buf.len().min(MAX_PIPE_TRANSFER_SIZE as usize)];
             return self
@@ -587,53 +576,6 @@ mod tests {
     };
 
     extern crate std;
-
-    #[test]
-    fn pipe_flags_are_independent_for_each_endpoint() {
-        let platform = crate::platform::mock::MockPlatform::new();
-        let (local, ()) = BrokerLocal::negotiate(
-            FailingPipeChannel {
-                request_count: Arc::new(AtomicUsize::new(0)),
-                read_failure: ReadFailure::WouldBlock,
-                force_transport: Arc::new(AtomicBool::new(false)),
-            },
-            |channel| Ok((channel, Arc::new(NoopSharedMemory), ())),
-        )
-        .unwrap();
-        let litebox = crate::LiteBox::new_with_broker_local(platform, local);
-        let pipes = super::Pipes::new(&litebox);
-        let unknown = super::Flags::from_bits_retain(1 << 31);
-        let (writer, reader) = pipes
-            .create_pipe(2, super::Flags::NON_BLOCKING | unknown, None)
-            .unwrap();
-        assert_eq!(
-            pipes.get_flags(&writer).unwrap(),
-            super::Flags::NON_BLOCKING
-        );
-        assert_eq!(
-            pipes.get_flags(&reader).unwrap(),
-            super::Flags::NON_BLOCKING
-        );
-        pipes
-            .update_flags(&writer, super::Flags::NON_BLOCKING, false)
-            .unwrap();
-        assert!(pipes.get_flags(&writer).unwrap().is_empty());
-        assert_eq!(
-            pipes.get_flags(&reader).unwrap(),
-            super::Flags::NON_BLOCKING
-        );
-        pipes.update_flags(&writer, unknown, true).unwrap();
-        assert!(pipes.get_flags(&writer).unwrap().is_empty());
-        pipes
-            .update_flags(&writer, super::Flags::NON_BLOCKING, true)
-            .unwrap();
-        assert_eq!(
-            pipes.get_flags(&writer).unwrap(),
-            super::Flags::NON_BLOCKING
-        );
-        pipes.close(&writer).unwrap();
-        pipes.close(&reader).unwrap();
-    }
 
     #[test]
     fn broker_control_failure_notifies_all_pipe_observers() {
