@@ -16,7 +16,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use litebox_common_windows::nt_status::NtStatus;
 
 use litebox::LiteBox;
@@ -30,6 +30,7 @@ use litebox::sync::{Mutex, RawSyncPrimitivesProvider};
 use litebox::utils::TruncateExt as _;
 use litebox_common_windows::loader::PAGE_SIZE;
 use litebox_common_windows::{NtSysno, Win32Sysno};
+use litebox_platform::sync::{RawMutex as _, RawMutexProvider};
 use litebox_platform::time::TimeProvider;
 
 use crate::syscalls::event::{EventHandleObject, EventSubsystem};
@@ -593,16 +594,18 @@ pub struct Process<Platform: ShimPlatform> {
     trace_notifications: Mutex<Platform, syscalls::trace::TraceNotifications<Platform>>,
     gdi_state: Mutex<Platform, Option<syscalls::gdi::GdiProcessState>>,
     cookie: u32,
-    exit_code: AtomicI32,
     next_thread_id: AtomicUsize,
+    nr_threads: <Platform as RawMutexProvider>::RawMutex,
     threads: litebox::sync::RwLock<Platform, ProcessThreads<Platform>>,
 }
 
-/// The live threads of a process, and whether the process is tearing down.
+/// The live threads and exit state of a process.
 struct ProcessThreads<Platform: ShimPlatform> {
     /// Set once the process has started exiting. No further threads may be
     /// created, and the exit code is frozen.
     group_exit: bool,
+    /// The process exit code, updated by thread exits until group exit.
+    exit_code: i32,
     /// The thread objects of every thread that has not yet completed, keyed by
     /// thread ID.
     threads: BTreeMap<usize, Arc<syscalls::thread::ThreadObject<Platform>>>,
@@ -630,12 +633,33 @@ impl<Platform: ShimPlatform> Process<Platform> {
         }
         let previous = threads.threads.insert(thread_id, thread.clone());
         debug_assert!(previous.is_none(), "thread ID {thread_id} already exists");
+        let nr_threads = self.nr_threads.underlying_atomic();
+        nr_threads.store(nr_threads.load(Ordering::Relaxed) + 1, Ordering::Release);
         true
     }
 
     /// Unregisters a thread that failed to start or has completed.
     fn detach_thread(&self, thread_id: usize) {
-        self.threads.write().threads.remove(&thread_id);
+        let notify = {
+            let mut threads = self.threads.write();
+            threads.threads.remove(&thread_id);
+
+            let nr_threads = self.nr_threads.underlying_atomic();
+            let count = nr_threads.load(Ordering::Relaxed);
+            let new_count = count
+                .checked_sub(1)
+                .expect("decrementing from zero threads");
+            nr_threads.store(new_count, Ordering::Release);
+            if new_count == 0 {
+                debug_assert!(threads.threads.is_empty());
+                // The last thread exited. Prevent new threads.
+                threads.group_exit = true;
+            }
+            new_count == 0
+        };
+        if notify {
+            self.nr_threads.wake_all();
+        }
     }
 
     /// Returns the number of threads that have not yet completed.
@@ -667,14 +691,17 @@ impl<Platform: ShimPlatform> Process<Platform> {
         self.threads.read().threads.get(&thread_id).cloned()
     }
 
-    /// Wait for the process to exit, returning its exit code.
-    ///
-    /// Currently a placeholder that returns a fixed exit code immediately.
-    /// Once NT process lifecycle exists, this will actually block.
+    /// Waits for all guest threads in the process to complete, returning its exit code.
     #[must_use]
     pub fn wait(&self) -> i32 {
-        // TODO: Wait for the NT process object once process lifecycle exists.
-        self.exit_code.load(Ordering::Relaxed)
+        loop {
+            let remaining = self.nr_threads.underlying_atomic().load(Ordering::Acquire);
+            if remaining == 0 {
+                break;
+            }
+            let _ = self.nr_threads.block(remaining);
+        }
+        self.threads.read().exit_code
     }
 
     fn default(
@@ -714,10 +741,11 @@ impl<Platform: ShimPlatform> Process<Platform> {
             trace_notifications: Mutex::new(syscalls::trace::TraceNotifications::default()),
             gdi_state: Mutex::new(None),
             cookie: syscalls::process::default_process_cookie(),
-            exit_code: AtomicI32::new(DEFAULT_PROCESS_EXIT_CODE),
             next_thread_id: AtomicUsize::new(syscalls::process::INITIAL_THREAD_ID + 1),
+            nr_threads: <Platform as RawMutexProvider>::RawMutex::INIT,
             threads: litebox::sync::RwLock::new(ProcessThreads {
                 group_exit: false,
+                exit_code: DEFAULT_PROCESS_EXIT_CODE,
                 threads: BTreeMap::new(),
             }),
         }
@@ -748,8 +776,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
         });
     }
 
-    /// Marks the current thread as exiting with `exit_status`.
+    /// Updates the process exit status and marks the current thread as exiting.
     fn exit_thread(&self, exit_status: i32) {
+        let mut threads = self.process.threads.write();
+        if self.thread_object.is_exiting() {
+            return;
+        }
+        threads.exit_code = exit_status;
         self.thread_object.exit_thread(exit_status);
     }
 
@@ -761,7 +794,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return;
         }
         threads.group_exit = true;
-        self.process.exit_code.store(exit_status, Ordering::Relaxed);
+        threads.exit_code = exit_status;
         // Interrupting the caller is a no-op, because it is running in the
         // host, so this does not need to single it out.
         for thread in threads.threads.values() {
