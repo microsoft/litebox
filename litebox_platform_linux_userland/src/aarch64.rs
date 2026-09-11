@@ -1590,7 +1590,7 @@ fn restore_host_fp_environment() {
             "msr fpcr, {control}",
             status = in(reg) u64::from(environment.status),
             control = in(reg) u64::from(environment.control),
-            options(nomem, nostack, preserves_flags)
+            options(nomem, nostack)
         );
     }
 }
@@ -1693,6 +1693,7 @@ pub(super) fn set_signal_return(
         host_environment.status,
         host_environment.control,
     ) {
+        // Kernel signal frames require FPSIMD; match the capture path's failure policy.
         fatal_aarch64_runtime_state();
     }
 
@@ -1741,7 +1742,7 @@ mod tests {
                 "msr fpcr, {control}",
                 status = in(reg) u64::from(environment.status),
                 control = in(reg) u64::from(environment.control),
-                options(nomem, nostack, preserves_flags)
+                options(nomem, nostack)
             );
         }
     }
@@ -1879,6 +1880,7 @@ mod tests {
 
         let original = live_fp_environment();
         let _restore = RestoreLiveFpEnvironment(original);
+        let previous_saved = host_fp_environment();
         let expected = HostFpEnvironment {
             status: original.status ^ FPSR_IOC,
             control: original.control ^ FPCR_RMODE_BIT,
@@ -1887,25 +1889,27 @@ mod tests {
         set_live_fp_environment(original);
 
         let mut guest = PtRegs::default();
-        let guest_top = (&raw mut guest).wrapping_add(1) as usize;
-        // SAFETY: initializes this test thread's transition slots.
-        unsafe {
-            core::arch::asm!(
-                load_tls_block_base!("{block}"),
-                "str {guest_top}, [{block}, #{top_off}]",
-                "strb {one:w}, [{block}, #{in_guest_off}]",
-                block = out(reg) _,
-                one = in(reg) 1u32,
-                guest_top = in(reg) guest_top,
-                top_off = const tls_offset::GUEST_CONTEXT_TOP,
-                in_guest_off = const tls_offset::IN_GUEST,
-                options(nostack, preserves_flags)
-            );
-        }
+        let block = tls_block_base();
+        let context_top = (block + tls_offset::GUEST_CONTEXT_TOP) as *mut usize;
+        let in_guest = (block + tls_offset::IN_GUEST) as *mut u8;
+        // SAFETY: accesses this test thread's transition slots.
+        let (previous_top, previous_in_guest) = unsafe {
+            let previous = (context_top.read_volatile(), in_guest.read_volatile());
+            context_top.write_volatile((&raw mut guest).wrapping_add(1) as usize);
+            in_guest.write_volatile(1);
+            previous
+        };
 
-        let captured = signal_handler_take_guest().expect("in_guest was set");
-        assert_eq!(captured, &raw mut guest);
+        let captured = signal_handler_take_guest();
         let actual = live_fp_environment();
+        // SAFETY: restores the transition slots saved above.
+        unsafe {
+            context_top.write_volatile(previous_top);
+            in_guest.write_volatile(previous_in_guest);
+        }
+        set_saved_host_fp_environment(previous_saved);
+
+        assert_eq!(captured, Some(&raw mut guest));
         assert_eq!(actual.status, expected.status);
         assert_eq!(actual.control, expected.control);
     }
@@ -1919,6 +1923,7 @@ mod tests {
         const EXPECTED_STATUS: u32 = 0x0800_0011;
         const EXPECTED_CONTROL: u32 = 0x00c0_0000;
 
+        let previous_saved = host_fp_environment();
         set_saved_host_fp_environment(HostFpEnvironment {
             status: EXPECTED_STATUS,
             control: EXPECTED_CONTROL,
@@ -1943,6 +1948,7 @@ mod tests {
             0x30,
             0x40,
         );
+        set_saved_host_fp_environment(previous_saved);
 
         let records = unsafe {
             &(*core::ptr::from_ref(&context.uc_mcontext)
