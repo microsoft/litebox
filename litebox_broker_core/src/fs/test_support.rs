@@ -9,13 +9,8 @@
 
 use alloc::vec::Vec;
 
-use litebox_broker_protocol::fs::{
-    FileDirectoryEntry, FileMode as Mode, FileSeekWhence as SeekWhence, FileStatus,
-    FileUser as UserInfo,
-};
 use litebox_broker_protocol::stdio::StdioOutputStream;
 
-use super::OFlags;
 use super::backend::{Backend, DeviceIo, NoDeviceIo};
 #[cfg(target_os = "linux")]
 use super::errors::TruncateError;
@@ -24,6 +19,7 @@ use super::errors::{
     RmdirError, SeekError, UnlinkError, WriteError,
 };
 use super::resolver::{Resolver, ResolverEntry};
+use super::{DirEntry, FileStatus, Mode, OFlags, SeekWhence, UserInfo};
 use crate::test_platform::TestPlatform;
 
 /// The unprivileged user these tests act as unless they need root.
@@ -162,7 +158,7 @@ impl<BackendType: Backend + 'static> Fs<BackendType> {
     pub(in crate::fs) fn read_dir(
         &self,
         entry: &Entry<BackendType>,
-    ) -> Result<Vec<FileDirectoryEntry>, ReadDirError> {
+    ) -> Result<Vec<DirEntry>, ReadDirError> {
         self.resolver.read_dir(entry)
     }
 

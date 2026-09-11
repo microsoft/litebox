@@ -9,10 +9,6 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
-use litebox_broker_protocol::fs::{
-    FileDirectoryEntry, FileMode as Mode, FileStatus, FileType, FileUser as UserInfo,
-};
-
 use super::backend::{
     Backend, BackendHandles, CreationMetadata, DirHandle, FileHandle, HandleRef, PermissionCheck,
     Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkedComponent, WalkingDirHandle,
@@ -22,7 +18,7 @@ use super::errors::{
     ReadError, RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::inode_allocator::{InodeAllocator, InodeAllocators};
-use super::{NodeInfo, OFlags};
+use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
 use thiserror::Error;
 
 // XXX(jayb): consider removing this via a runtime reserved device ID?
@@ -229,10 +225,10 @@ impl Composer {
         children
     }
 
-    fn list_mount_children(&self, path: &[String]) -> Vec<FileDirectoryEntry> {
+    fn list_mount_children(&self, path: &[String]) -> Vec<DirEntry> {
         self.immediate_mount_children(path)
             .into_iter()
-            .map(|name| FileDirectoryEntry {
+            .map(|name| DirEntry {
                 name,
                 file_type: FileType::Directory,
                 // TODO(jayb): set up proper inode info for these
@@ -241,11 +237,7 @@ impl Composer {
             .collect()
     }
 
-    fn merge_mount_children(
-        &self,
-        mut entries: Vec<FileDirectoryEntry>,
-        path: &[String],
-    ) -> Vec<FileDirectoryEntry> {
+    fn merge_mount_children(&self, mut entries: Vec<DirEntry>, path: &[String]) -> Vec<DirEntry> {
         for child in self.list_mount_children(path) {
             entries.retain(|entry| entry.name != child.name);
             entries.push(child);
@@ -629,7 +621,7 @@ impl Backend for Composer {
         }
     }
 
-    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<FileDirectoryEntry>, ReadDirError> {
+    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
         let handle = handle.into_typed::<Self>();
         match handle.inner {
             ComposerDirHandleInner::Virtual { path } => Ok(self.list_mount_children(&path)),

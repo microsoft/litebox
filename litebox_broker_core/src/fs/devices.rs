@@ -8,9 +8,6 @@
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use litebox_broker_protocol::fs::{
-    FileDirectoryEntry, FileMode as Mode, FileStatus, FileType, FileUser as UserInfo,
-};
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::stdio::StdioOutputStream;
 
@@ -23,7 +20,7 @@ use super::errors::{
     ReadError, RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::inode_allocator::InodeAllocator;
-use super::{NodeInfo, OFlags};
+use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
 
 /// Block size for stdio devices
 const STDIO_BLOCK_SIZE: u64 = 1024;
@@ -234,11 +231,11 @@ impl Backend for Devices {
         })
     }
 
-    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<FileDirectoryEntry>, ReadDirError> {
+    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
         let _handle = handle.into_typed::<Self>();
         Ok(Device::ALL
             .iter()
-            .map(|(n, d)| FileDirectoryEntry {
+            .map(|(n, d)| DirEntry {
                 name: String::from(*n),
                 file_type: FileType::CharacterDevice,
                 node_info: Some(d.file_status().node_info),

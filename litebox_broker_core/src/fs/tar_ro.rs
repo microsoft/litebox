@@ -24,16 +24,8 @@
 //! Taro Milk Tea, Tapioca Bubbles, 50% Sugar, No Ice.
 //! ```
 
-use alloc::string::String;
-use alloc::vec::Vec;
-use core::ops::Range;
-use hashbrown::HashMap;
-use litebox_broker_protocol::fs::{
-    FileDirectoryEntry, FileMode as Mode, FileStatus, FileType, FileUser as UserInfo,
-};
-
 use super::{
-    NodeInfo, OFlags,
+    DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo,
     backend::{CreationMetadata, DirHandle, FileHandle, HandleRef, WalkingDirHandle},
     errors::{
         ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
@@ -41,6 +33,10 @@ use super::{
     },
     inode_allocator::InodeAllocator,
 };
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::ops::Range;
+use hashbrown::HashMap;
 
 /// Block size for file system I/O operations
 // TODO(jayb): Determine appropriate block size
@@ -179,7 +175,7 @@ impl super::backend::Backend for TarRo {
         })
     }
 
-    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<FileDirectoryEntry>, ReadDirError> {
+    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
         let handle = handle.into_typed::<Self>();
         Ok(self.tar_index.dirs[handle.idx]
             .children
@@ -193,7 +189,7 @@ impl super::backend::Backend for TarRo {
                         (FileType::Directory, self.tar_index.dirs[idx].node_info)
                     }
                 };
-                FileDirectoryEntry {
+                DirEntry {
                     name: name.clone(),
                     file_type,
                     node_info: Some(node_info),
