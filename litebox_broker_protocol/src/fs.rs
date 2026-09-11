@@ -197,6 +197,19 @@ bitflags! {
     }
 }
 
+impl FileMode {
+    /// Creates a mode from wider mode bits, discarding bits not defined by this protocol.
+    #[must_use]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "masking with u16-backed supported bits guarantees the result fits in u16"
+    )]
+    pub fn from_u32_bits_truncate(bits: u32) -> Self {
+        let bits = (bits & u32::from(Self::SUPPORTED.bits())) as u16;
+        Self::from_bits_retain(bits)
+    }
+}
+
 /// ABI-neutral fs open flags.
 ///
 /// These values are intentionally independent of target-specific `O_*` bit
@@ -725,6 +738,14 @@ impl<'a> DirectoryPayloadDecoder<'a> {
 mod tests {
     use super::*;
     use alloc::vec;
+
+    #[test]
+    fn file_mode_truncates_wider_bits() {
+        assert_eq!(
+            FileMode::from_u32_bits_truncate(u32::MAX),
+            FileMode::SUPPORTED
+        );
+    }
 
     #[test]
     fn directory_payload_round_trips_all_entry_shapes() {

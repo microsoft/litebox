@@ -709,12 +709,6 @@ fn qid_type_to_file_type(qid_type: fcall::QidType) -> super::FileType {
     }
 }
 
-fn file_mode(mode: u32) -> super::Mode {
-    let bits = u16::try_from(mode & u32::from(super::Mode::SUPPORTED.bits()))
-        .expect("supported file mode bits fit in u16");
-    super::Mode::from_bits_retain(bits)
-}
-
 /// Convert getattr response to FileStatus
 ///
 /// Inode numbers come from the server's qids; `device_id` is the device the caller reports this
@@ -728,7 +722,7 @@ fn rgetattr_to_file_status(
     if attr.valid.contains(fcall::GetattrMask::BASIC) {
         Ok(super::FileStatus {
             file_type,
-            mode: file_mode(attr.stat.mode),
+            mode: super::Mode::from_u32_bits_truncate(attr.stat.mode),
             size: attr.stat.size,
             owner: super::UserInfo {
                 user: u16::try_from(attr.stat.uid).map_err(|_| Error::InvalidResponse)?,
@@ -745,7 +739,7 @@ fn rgetattr_to_file_status(
         Ok(super::FileStatus {
             file_type,
             mode: if attr.valid.contains(fcall::GetattrMask::MODE) {
-                file_mode(attr.stat.mode)
+                super::Mode::from_u32_bits_truncate(attr.stat.mode)
             } else {
                 super::Mode::empty()
             },

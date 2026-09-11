@@ -83,14 +83,8 @@ impl<Platform: ShimPlatform> FsState<Platform> {
     }
 
     fn umask(&self) -> Mode {
-        file_mode_from_linux(self.umask.load(Ordering::Relaxed))
+        Mode::from_u32_bits_truncate(self.umask.load(Ordering::Relaxed))
     }
-}
-
-fn file_mode_from_linux(mode: u32) -> Mode {
-    let bits = u16::try_from(mode & u32::from(Mode::SUPPORTED.bits()))
-        .expect("supported file mode bits fit in u16");
-    Mode::from_bits_retain(bits)
 }
 
 /// Translate Linux open flags after descriptor-local `O_CLOEXEC` has been removed.
@@ -486,13 +480,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Handle syscall `umask`
     pub(crate) fn sys_umask(&self, new_mask: u32) -> Mode {
-        let new_mask = file_mode_from_linux(new_mask) & (Mode::RWXU | Mode::RWXG | Mode::RWXO);
+        let new_mask =
+            Mode::from_u32_bits_truncate(new_mask) & (Mode::RWXU | Mode::RWXG | Mode::RWXO);
         let old_mask = self
             .fs
             .borrow()
             .umask
             .swap(new_mask.bits().into(), Ordering::Relaxed);
-        file_mode_from_linux(old_mask)
+        Mode::from_u32_bits_truncate(old_mask)
     }
 
     /// Handle syscall `open`
@@ -552,7 +547,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
         match file_type {
             InodeType::File => {
-                let mode = file_mode_from_linux(mode_and_type & !FILE_TYPE_MASK);
+                let mode = Mode::from_u32_bits_truncate(mode_and_type & !FILE_TYPE_MASK);
                 let file = self.do_openat(
                     dirfd,
                     pathname,
@@ -951,7 +946,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         mode: u32,
     ) -> Result<(), Errno> {
         let pathname = self.resolve_path_at(dirfd, pathname)?;
-        self.do_mkdir(pathname, file_mode_from_linux(mode))
+        self.do_mkdir(pathname, Mode::from_u32_bits_truncate(mode))
     }
 
     pub(crate) fn do_close(&self, raw_fd: usize) -> Result<(), Errno> {
@@ -1511,7 +1506,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     group: stat.st_gid,
                 };
                 Self::do_access_mode(
-                    file_mode_from_linux(stat.st_mode & 0o7777),
+                    Mode::from_u32_bits_truncate(stat.st_mode & 0o7777),
                     owner,
                     caller,
                     &mode,
