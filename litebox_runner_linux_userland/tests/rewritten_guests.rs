@@ -12,10 +12,10 @@ mod common;
 
 fn run_rewritten_fixture(source: &str, unique_name: &str) -> std::process::Output {
     let target = common::compile(source, unique_name, true, false);
-    run_rewritten_target(&target, false)
+    run_rewritten_target(&target)
 }
 
-fn run_rewritten_target(target: &std::path::Path, virtualize_x18: bool) -> std::process::Output {
+fn run_rewritten_target(target: &std::path::Path) -> std::process::Output {
     let binary_path = std::env::var("NEXTEST_BIN_EXE_litebox_runner_linux_userland")
         .unwrap_or_else(|_| env!("CARGO_BIN_EXE_litebox_runner_linux_userland").to_string());
 
@@ -29,13 +29,6 @@ fn run_rewritten_target(target: &std::path::Path, virtualize_x18: bool) -> std::
             broker_path.display()
         );
         let mut command = std::process::Command::new(broker_path);
-        command
-            .arg("--fs-program")
-            .arg(target)
-            .arg("--fs-rewrite-syscalls");
-        if virtualize_x18 {
-            command.arg("--fs-virtualize-x18");
-        }
         command.arg("--runner").arg(&binary_path);
         command
     };
@@ -59,8 +52,9 @@ fn test_host_program_with_rewrite_syscalls() {
 
     assert!(
         output.status.success(),
-        "failed to run litebox_runner_linux_userland: {}",
-        output.status
+        "failed to run litebox_runner_linux_userland ({}): {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -165,7 +159,7 @@ fn test_x18_virtualization() {
         true,
         true,
     );
-    let output = run_rewritten_target(&target, true);
+    let output = run_rewritten_target(&target);
     assert!(
         output.status.success(),
         "x18 fixture failed ({}): {}",

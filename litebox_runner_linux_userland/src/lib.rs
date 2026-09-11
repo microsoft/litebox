@@ -4,11 +4,13 @@
 use anyhow::{Context as _, Result, anyhow};
 use clap::Parser;
 use litebox_platform_linux_userland::LinuxUserland as Platform;
+use std::os::linux::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
 use litebox_broker_local_userland as broker;
-
-extern crate alloc;
+use litebox_broker_protocol::fs::{
+    FileAccessMode, FileMode as Mode, FileOpenFlags, FileType, FileUser as UserInfo,
+};
 
 // Use a stable non-root guest identity instead of mirroring the host user. This keeps shim
 // credentials aligned with the in-memory filesystem default user and avoids truncating high host IDs.
@@ -137,6 +139,20 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         );
     }
 
+    let prog = if cli_args.program_from_tar {
+        PathBuf::from(&cli_args.program_and_arguments[0])
+    } else {
+        std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).with_context(|| {
+            format!(
+                "could not resolve program path {}",
+                cli_args.program_and_arguments[0]
+            )
+        })?
+    };
+    let host_program = (!cli_args.program_from_tar)
+        .then(|| prepare_host_program(&cli_args, &prog))
+        .transpose()?;
+
     // TODO(jb): Clean up platform initialization once we have https://github.com/MSRSSP/litebox/issues/24
     let platform = Platform::new();
 
@@ -167,6 +183,9 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         )
     })?;
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new_with_litebox(platform, litebox);
+    if let Some(host_program) = host_program {
+        stage_host_program(shim_builder.litebox(), host_program)?;
+    }
     // SAFETY: `gettid` takes no pointer arguments and has no Rust-side aliasing requirements.
     let tid = unsafe { libc::syscall(libc::SYS_gettid) }
         .try_into()
@@ -180,14 +199,6 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         euid: u32::from(DEFAULT_GUEST_UID),
         gid: u32::from(DEFAULT_GUEST_GID),
         egid: u32::from(DEFAULT_GUEST_GID),
-    };
-    // We need to get the file path before enabling seccomp.
-    // For --program-from-tar the path is already validated as absolute above,
-    // so use it directly instead of resolving against the host CWD.
-    let prog = if cli_args.program_from_tar {
-        PathBuf::from(&cli_args.program_and_arguments[0])
-    } else {
-        std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap()
     };
     let prog_path = prog.to_str().ok_or_else(|| {
         anyhow!(
@@ -246,6 +257,195 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
     }
 
     Ok(program.process.wait())
+}
+
+struct PreparedHostProgram {
+    path: String,
+    directories: Vec<(String, Mode, UserInfo)>,
+    mode: Mode,
+    owner: UserInfo,
+    data: Vec<u8>,
+}
+
+fn prepare_host_program(cli_args: &CliArgs, program: &Path) -> Result<PreparedHostProgram> {
+    if !program.exists() {
+        let mut message = format!(
+            "program not found on host filesystem: {}",
+            program.display()
+        );
+        if cli_args.initial_files.is_some() {
+            message.push_str(
+                "\nhint: if the program is inside the tar archive, add --program-from-tar",
+            );
+        }
+        anyhow::bail!(message);
+    }
+
+    let ancestors: Vec<_> = program.ancestors().skip(1).collect();
+    let mut previous_user = 0;
+    let mut directories = Vec::new();
+    for path in ancestors.into_iter().rev().skip(1) {
+        let metadata = path
+            .metadata()
+            .with_context(|| format!("failed to read metadata for {}", path.display()))?;
+        directories.push((
+            path_to_string(path)?,
+            Mode::from_u32_bits_truncate(metadata.st_mode()),
+            guest_owner(previous_user, metadata.st_uid()),
+        ));
+        previous_user = metadata.st_uid();
+    }
+
+    let mut data = std::fs::read(program)
+        .with_context(|| format!("failed to read program {}", program.display()))?;
+    if cli_args.rewrite_syscalls {
+        #[cfg(target_arch = "aarch64")]
+        {
+            data = litebox_syscall_rewriter::hook_syscalls_in_elf_with_options(
+                &data,
+                None,
+                litebox_syscall_rewriter::RewriteOptions::new(
+                    litebox_syscall_rewriter::TargetHost::Linux,
+                    cfg!(feature = "aarch64_virtualize_x18"),
+                ),
+            )
+            .with_context(|| format!("failed to rewrite {}", program.display()))?;
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            data = litebox_syscall_rewriter::hook_syscalls_in_elf(&data, None)
+                .with_context(|| format!("failed to rewrite {}", program.display()))?;
+        }
+    }
+
+    let metadata = program
+        .metadata()
+        .with_context(|| format!("failed to read metadata for {}", program.display()))?;
+    Ok(PreparedHostProgram {
+        path: path_to_string(program)?,
+        directories,
+        mode: Mode::from_u32_bits_truncate(metadata.st_mode()),
+        owner: guest_owner(previous_user, metadata.st_uid()),
+        data,
+    })
+}
+
+fn stage_host_program(
+    litebox: &litebox::LiteBox<Platform>,
+    program: PreparedHostProgram,
+) -> Result<()> {
+    let PreparedHostProgram {
+        path,
+        directories,
+        mode,
+        owner,
+        data,
+    } = program;
+    let mut context = litebox::fs::Context::new();
+    context.set_acting_user(UserInfo::ROOT);
+
+    // Keep ancestors root-owned and writable until all descendants have been staged. Final
+    // metadata is restored from leaf to root so restrictive host modes cannot block setup.
+    for (path, mode, _) in &directories {
+        let staging_mode = *mode | Mode::RWXU;
+        match litebox.mkdir_file(&context, path.as_str(), staging_mode) {
+            Ok(()) | Err(litebox::fs::errors::MkdirError::AlreadyExists) => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to stage program directory {path}"));
+            }
+        }
+        let status = litebox
+            .path_file_status(&context, path.as_str())
+            .with_context(|| format!("failed to inspect program directory {path}"))?;
+        if status.file_type != FileType::Directory {
+            anyhow::bail!("program path component is not a directory: {path}");
+        }
+        set_file_metadata(litebox, &context, path, staging_mode, UserInfo::ROOT)?;
+    }
+
+    match litebox.unlink_file(&context, path.as_str()) {
+        Ok(())
+        | Err(litebox::fs::errors::UnlinkError::PathError(
+            litebox::fs::errors::PathError::NoSuchFileOrDirectory
+            | litebox::fs::errors::PathError::MissingComponent,
+        )) => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to replace host program {path}"));
+        }
+    }
+    let fd = litebox
+        .open_file(
+            &context,
+            path.as_str(),
+            FileAccessMode::WriteOnly,
+            FileOpenFlags::CREATE | FileOpenFlags::EXCLUSIVE,
+            Mode::RWXU,
+        )
+        .with_context(|| format!("failed to stage host program {path}"))?;
+    let write_result = write_all(litebox, &fd, &path, &data);
+    let close_result = litebox
+        .close_file(&fd)
+        .with_context(|| format!("failed to close staged host program {path}"));
+    write_result?;
+    close_result?;
+    set_file_metadata(litebox, &context, &path, mode, owner)?;
+
+    for (path, mode, owner) in directories.into_iter().rev() {
+        set_file_metadata(litebox, &context, &path, mode, owner)?;
+    }
+    Ok(())
+}
+
+fn write_all(
+    litebox: &litebox::LiteBox<Platform>,
+    fd: &litebox::fs::FileFd,
+    path: &str,
+    data: &[u8],
+) -> Result<()> {
+    let mut offset = 0;
+    while offset < data.len() {
+        let written = litebox
+            .write_file(fd, &data[offset..], Some(offset))
+            .with_context(|| format!("failed to write staged host program {path}"))?;
+        if written == 0 {
+            anyhow::bail!("failed to write staged host program {path}: write returned zero");
+        }
+        offset += written;
+    }
+    Ok(())
+}
+
+fn set_file_metadata(
+    litebox: &litebox::LiteBox<Platform>,
+    context: &litebox::fs::Context,
+    path: &str,
+    mode: Mode,
+    owner: UserInfo,
+) -> Result<()> {
+    litebox
+        .chown_file(context, path, Some(owner.user), Some(owner.group))
+        .with_context(|| format!("failed to set owner for staged path {path}"))?;
+    litebox
+        .chmod_file(context, path, mode)
+        .with_context(|| format!("failed to set mode for staged path {path}"))
+}
+
+fn guest_owner(previous_user: u32, user: u32) -> UserInfo {
+    if previous_user == 0 && user == 0 {
+        UserInfo::ROOT
+    } else {
+        UserInfo {
+            user: DEFAULT_GUEST_UID,
+            group: DEFAULT_GUEST_GID,
+        }
+    }
+}
+
+fn path_to_string(path: &Path) -> Result<String> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("file path is not UTF-8: {}", path.display()))
 }
 
 fn apply_broker_proxy_environment(environment: &mut Vec<String>, proxy_url: Option<&str>) {

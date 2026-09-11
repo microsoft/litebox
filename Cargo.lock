@@ -1584,7 +1584,6 @@ dependencies = [
  "litebox_platform_linux_userland",
  "litebox_runner_linux_userland",
  "litebox_runner_windows_userland",
- "litebox_syscall_rewriter",
  "tempfile",
 ]
 

@@ -107,24 +107,9 @@ struct CliArgs {
         conflicts_with = "in_process_runner"
     )]
     runner: Option<PathBuf>,
-    /// Host program to populate into the broker-owned file system.
-    #[cfg(target_os = "linux")]
-    #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::ExecutablePath)]
-    fs_program: Option<PathBuf>,
     /// Tar archive to mount as the broker-owned initial file system.
-    ///
-    /// The guest program is expected to be in this archive unless supplied
-    /// through the Linux-only `--fs-program` option.
     #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
     fs_initial_files: Option<PathBuf>,
-    /// Rewrite the host program before populating the broker-owned file system.
-    #[cfg(target_os = "linux")]
-    #[arg(long, requires = "fs_program")]
-    fs_rewrite_syscalls: bool,
-    /// Declare that rewritten AArch64 binaries use x18 virtualization.
-    #[cfg(target_os = "linux")]
-    #[arg(long)]
-    fs_virtualize_x18: bool,
     /// Opaque arguments to pass to the local runner without interpretation.
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true, value_hint = clap::ValueHint::CommandWithArguments)]
     runner_arguments: Vec<OsString>,
