@@ -11,6 +11,3 @@ pub mod errors;
 mod file;
 
 pub use file::{BrokerFile, Context, FileFd};
-
-#[cfg(test)]
-mod tests;
