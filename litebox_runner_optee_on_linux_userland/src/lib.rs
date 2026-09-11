@@ -108,12 +108,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         coordinator,
         litebox.broker_notification_dispatcher(),
     )?;
-    let shim = litebox_shim_optee::OpteeShimBuilder::new_with_litebox(
-        platform,
-        session_manager,
-        litebox,
-    )
-    .build();
+    let shim =
+        litebox_shim_optee::OpteeShimBuilder::new_with_litebox(platform, session_manager, litebox)
+            .build();
 
     platform.initialize_boot_specific_kdf_support();
 
