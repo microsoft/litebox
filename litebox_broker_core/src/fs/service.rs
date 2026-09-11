@@ -14,6 +14,7 @@ use litebox_broker_protocol::fs::{
 use litebox_broker_protocol::stdio::{MAX_STDIO_TRANSFER_SIZE, StdioOutputStream};
 use litebox_platform::sync::{RawSyncPrimitivesProvider, RwLock};
 
+use super::OFlags;
 use super::backend::DeviceIo;
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
@@ -205,18 +206,11 @@ where
         flags: FileOpenFlags,
         mode: FileMode,
     ) -> ServiceResult<File> {
-        if !matches!(
-            access,
-            FileAccessMode::ReadOnly | FileAccessMode::WriteOnly | FileAccessMode::ReadWrite
-        ) || FileOpenFlags::from_bits(flags.bits()).is_none()
-        {
-            return Err(BrokerError::UnsupportedOperation);
-        }
-        let entry =
-            match Resolver::open(self, user, path, access, flags, mode & FileMode::SUPPORTED) {
-                Ok(entry) => entry,
-                Err(error) => return Ok(Err(file_open_error(error))),
-            };
+        let flags = open_flags(access, flags)?;
+        let entry = match Resolver::open(self, user, path, flags, mode & FileMode::SUPPORTED) {
+            Ok(entry) => entry,
+            Err(error) => return Ok(Err(file_open_error(error))),
+        };
         Ok(Ok(File(Arc::new(RwLock::<Platform, _>::new(entry)))))
     }
 
@@ -623,9 +617,6 @@ fn authorize(session: &BrokerSession, required: ObjectRights) -> Result<ObjectRi
 }
 
 fn open_required_rights(access: FileAccessMode, flags: FileOpenFlags) -> Result<ObjectRights> {
-    if FileOpenFlags::from_bits(flags.bits()).is_none() {
-        return Err(BrokerError::UnsupportedOperation);
-    }
     if flags.contains(FileOpenFlags::PATH) {
         return Ok(ObjectRights::WAIT);
     }
@@ -710,6 +701,32 @@ impl DeviceIo for SessionDeviceIo<'_> {
     fn fill_random(&self, output: &mut [u8]) -> core::result::Result<(), ReadError> {
         crate::random::fill(self.0, output).map_err(|_| ReadError::Io)
     }
+}
+
+fn open_flags(access: FileAccessMode, flags: FileOpenFlags) -> Result<OFlags> {
+    let mut output = match access {
+        FileAccessMode::ReadOnly => OFlags::RDONLY,
+        FileAccessMode::WriteOnly => OFlags::WRONLY,
+        FileAccessMode::ReadWrite => OFlags::RDWR,
+        _ => return Err(BrokerError::UnsupportedOperation),
+    };
+    for (file_flag, engine_flag) in [
+        (FileOpenFlags::CREATE, OFlags::CREAT),
+        (FileOpenFlags::TRUNCATE, OFlags::TRUNC),
+        (FileOpenFlags::NO_CONTROLLING_TERMINAL, OFlags::NOCTTY),
+        (FileOpenFlags::EXCLUSIVE, OFlags::EXCL),
+        (FileOpenFlags::DIRECTORY, OFlags::DIRECTORY),
+        (FileOpenFlags::NONBLOCKING, OFlags::NONBLOCK),
+        (FileOpenFlags::LARGE_FILE, OFlags::LARGEFILE),
+        (FileOpenFlags::NO_FOLLOW, OFlags::NOFOLLOW),
+        (FileOpenFlags::APPEND, OFlags::APPEND),
+        (FileOpenFlags::PATH, OFlags::PATH),
+    ] {
+        if flags.contains(file_flag) {
+            output |= engine_flag;
+        }
+    }
+    Ok(output)
 }
 
 fn mask_status_mode(status: &mut FileStatus) {

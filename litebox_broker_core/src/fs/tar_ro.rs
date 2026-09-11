@@ -29,11 +29,11 @@ use alloc::vec::Vec;
 use core::ops::Range;
 use hashbrown::HashMap;
 use litebox_broker_protocol::fs::{
-    FileAccessMode, FileDirectoryEntry, FileMode as Mode, FileNodeInfo, FileOpenFlags, FileStatus,
-    FileType, FileUser as UserInfo,
+    FileDirectoryEntry, FileMode as Mode, FileStatus, FileType, FileUser as UserInfo,
 };
 
 use super::{
+    NodeInfo, OFlags,
     backend::{CreationMetadata, DirHandle, FileHandle, HandleRef, WalkingDirHandle},
     errors::{
         ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
@@ -128,15 +128,9 @@ impl super::backend::Backend for TarRo {
     fn owned_dir_at(
         &self,
         dir: WalkingDirHandle<'_>,
-        access: FileAccessMode,
-        flags: FileOpenFlags,
+        flags: OFlags,
     ) -> Result<DirHandle, OpenError> {
-        if flags.intersects(FileOpenFlags::CREATE | FileOpenFlags::TRUNCATE)
-            || matches!(
-                access,
-                FileAccessMode::WriteOnly | FileAccessMode::ReadWrite
-            )
-        {
+        if flags.intersects(OFlags::CREAT | OFlags::TRUNC | OFlags::WRONLY | OFlags::RDWR) {
             return Err(OpenError::ReadOnlyFileSystem);
         }
         Ok(DirHandle::from_typed::<Self>(dir.into_typed::<Self>()))
@@ -152,8 +146,7 @@ impl super::backend::Backend for TarRo {
         &self,
         dir: WalkingDirHandle<'_>,
         name: &str,
-        access: FileAccessMode,
-        flags: FileOpenFlags,
+        flags: OFlags,
     ) -> Result<super::backend::Permissioned<FileHandle>, OpenError> {
         let dir = dir.into_typed::<Self>();
         let child = self.tar_index.dirs[dir.idx]
@@ -163,15 +156,14 @@ impl super::backend::Backend for TarRo {
         let IndexedChild::File(file_idx) = *child else {
             return Err(OpenError::PathError(PathError::ComponentNotADirectory));
         };
-        if flags.contains(FileOpenFlags::DIRECTORY) {
+        if flags.contains(OFlags::DIRECTORY) {
             return Err(OpenError::PathError(PathError::ComponentNotADirectory));
         }
-        if !flags.contains(FileOpenFlags::CREATE | FileOpenFlags::EXCLUSIVE)
-            && (flags.intersects(FileOpenFlags::CREATE | FileOpenFlags::TRUNCATE)
-                || matches!(
-                    access,
-                    FileAccessMode::WriteOnly | FileAccessMode::ReadWrite
-                ))
+        if !(flags.contains(OFlags::CREAT) && flags.contains(OFlags::EXCL))
+            && (flags.contains(OFlags::CREAT)
+                || flags.contains(OFlags::TRUNC)
+                || flags.contains(OFlags::WRONLY)
+                || flags.contains(OFlags::RDWR))
         {
             return Err(OpenError::ReadOnlyFileSystem);
         }
@@ -328,12 +320,12 @@ struct IndexedFile {
     data_range: Range<usize>,
     mode: Mode,
     owner: UserInfo,
-    node_info: FileNodeInfo,
+    node_info: NodeInfo,
 }
 
 struct IndexedDir {
     owner: Option<UserInfo>,
-    node_info: FileNodeInfo,
+    node_info: NodeInfo,
     children: HashMap<String, IndexedChild>,
 }
 

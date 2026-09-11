@@ -3,7 +3,7 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use litebox_broker_protocol::fs::FileNodeInfo;
+use super::NodeInfo;
 
 /// Hands out [`InodeAllocator`]s, each with its own device id.
 #[derive(Debug)]
@@ -53,11 +53,11 @@ impl InodeAllocator {
         Self::for_device(STANDALONE_DEVICE_ID)
     }
 
-    /// Allocate a fresh [`FileNodeInfo`] for a new entry on this backend.
+    /// Allocate a fresh [`NodeInfo`] for a new entry on this backend.
     #[must_use]
-    pub fn next(&self) -> FileNodeInfo {
+    pub fn next(&self) -> NodeInfo {
         let ino = self.counter.fetch_add(1, Ordering::Relaxed);
-        FileNodeInfo {
+        NodeInfo {
             dev: self.device_id(),
             ino,
             rdev: None,

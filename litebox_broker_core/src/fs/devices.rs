@@ -9,8 +9,7 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use litebox_broker_protocol::fs::{
-    FileAccessMode, FileDirectoryEntry, FileMode as Mode, FileNodeInfo, FileOpenFlags, FileStatus,
-    FileType, FileUser as UserInfo,
+    FileDirectoryEntry, FileMode as Mode, FileStatus, FileType, FileUser as UserInfo,
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::stdio::StdioOutputStream;
@@ -24,6 +23,7 @@ use super::errors::{
     ReadError, RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::inode_allocator::InodeAllocator;
+use super::{NodeInfo, OFlags};
 
 /// Block size for stdio devices
 const STDIO_BLOCK_SIZE: u64 = 1024;
@@ -40,20 +40,20 @@ const URANDOM_BLOCK_SIZE: u64 = 0x1000;
 /// name=/dev/stderr dev=64 ino=9 rdev=34822
 /// ```
 // XXX(jayb): Should we be pulling the device names and such from the inode allocator?
-const STDIO_NODE_INFO: FileNodeInfo = FileNodeInfo {
+const STDIO_NODE_INFO: NodeInfo = NodeInfo {
     dev: 64,
     ino: 9,
     rdev: core::num::NonZeroU64::new(34822),
 };
 /// Node info for /dev/null
-const NULL_NODE_INFO: FileNodeInfo = FileNodeInfo {
+const NULL_NODE_INFO: NodeInfo = NodeInfo {
     dev: 5,
     ino: 4,
     // major=1, minor=3
     rdev: core::num::NonZeroU64::new(0x103),
 };
 /// Node info for /dev/urandom
-const URANDOM_NODE_INFO: FileNodeInfo = FileNodeInfo {
+const URANDOM_NODE_INFO: NodeInfo = NodeInfo {
     dev: 5,
     ino: 8,
     // major=1, minor=9
@@ -115,7 +115,7 @@ impl Device {
 /// A [`super::backend::Backend`] that supports Unix-y devices.
 pub struct Devices {
     /// Stable inode info for this backend's root directory.
-    root_inode: FileNodeInfo,
+    root_inode: NodeInfo,
     _alloc: InodeAllocator,
 }
 
@@ -183,8 +183,7 @@ impl Backend for Devices {
     fn owned_dir_at(
         &self,
         dir: WalkingDirHandle<'_>,
-        _access: FileAccessMode,
-        _flags: FileOpenFlags,
+        _flags: OFlags,
     ) -> Result<DirHandle, OpenError> {
         Ok(DirHandle::from_typed::<Self>(dir.into_typed::<Self>()))
     }
@@ -199,17 +198,16 @@ impl Backend for Devices {
         &self,
         dir: WalkingDirHandle<'_>,
         name: &str,
-        _access: FileAccessMode,
-        flags: FileOpenFlags,
+        flags: OFlags,
     ) -> Result<Permissioned<FileHandle>, OpenError> {
         let _dir = dir.into_typed::<Self>();
         let device = Device::from_name(name)
             .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
 
-        if flags.contains(FileOpenFlags::DIRECTORY) {
+        if flags.contains(OFlags::DIRECTORY) {
             return Err(OpenError::PathError(PathError::ComponentNotADirectory));
         }
-        if flags.contains(FileOpenFlags::NONBLOCKING)
+        if flags.contains(OFlags::NONBLOCK)
             && matches!(
                 device,
                 Device::Stdin | Device::Stdout | Device::Stderr | Device::URandom
@@ -218,7 +216,7 @@ impl Backend for Devices {
             unimplemented!("Non-blocking I/O is not yet supported for {:?}", device);
         }
 
-        if flags.contains(FileOpenFlags::TRUNCATE) {
+        if flags.contains(OFlags::TRUNC) {
             // Note: matching Linux behavior, this does not actually perform any truncation, and
             // instead, it is silently ignored if you attempt to truncate upon opening stdio.
             debug_assert!(matches!(
@@ -377,12 +375,7 @@ mod tests {
     fn urandom_requires_broker_only_for_nonempty_reads() {
         let devices = Devices::new(InodeAllocator::standalone());
         let urandom = devices
-            .open_file_at(
-                devices.root(),
-                "urandom",
-                FileAccessMode::ReadOnly,
-                FileOpenFlags::empty(),
-            )
+            .open_file_at(devices.root(), "urandom", OFlags::RDONLY)
             .unwrap()
             .item;
 

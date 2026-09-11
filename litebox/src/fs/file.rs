@@ -5,13 +5,14 @@
 
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileDirectoryEntry, FileError, FileMode as Mode, FileOpenFlags,
-    FileSeekWhence as SeekWhence, FileStatus, FileUser as UserInfo, ResolvedPath,
+    FileSeekWhence as SeekWhence, FileStatus, FileUser as UserInfo,
 };
 
 use crate::path::Arg;
@@ -290,7 +291,7 @@ impl Context {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            cwd: Arc::new(ResolvedPath::root()),
+            cwd: Arc::new(ResolvedPath { components: vec![] }),
             user_info: UserInfo {
                 user: 1000,
                 group: 1000,
@@ -300,13 +301,45 @@ impl Context {
 
     /// Resolve `path` against the current context.
     pub fn resolve(&self, path: impl Arg) -> Result<ResolvedPath, PathError> {
-        Ok(self.cwd.resolve(path.as_rust_str()?))
+        let mut components = if path.as_rust_str()?.starts_with('/') {
+            vec![]
+        } else {
+            self.cwd.components.clone()
+        };
+        for component in path.components()? {
+            match component {
+                "" | "." => {}
+                ".." => {
+                    let _ = components.pop();
+                }
+                _ => components.push(component.into()),
+            }
+        }
+        Ok(ResolvedPath { components })
     }
 }
 
 impl Default for Context {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Absolute normalized path, created from [`Context::resolve`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedPath {
+    components: Vec<String>,
+}
+
+impl core::fmt::Display for ResolvedPath {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for component in &self.components {
+            write!(formatter, "/{component}")?;
+        }
+        if self.components.is_empty() {
+            formatter.write_str("/")?;
+        }
+        Ok(())
     }
 }
 

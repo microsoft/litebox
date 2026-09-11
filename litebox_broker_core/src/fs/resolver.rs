@@ -4,20 +4,24 @@
 //! Path management, permission checks, and open-state operations above [`super::backend`].
 
 use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 use litebox_broker_protocol::fs::{
-    FileAccessMode, FileDirectoryEntry, FileMode as Mode, FileOpenFlags,
-    FileSeekWhence as SeekWhence, FileStatus, FileType, FileUser as UserInfo, ResolvedPath,
+    FileDirectoryEntry, FileMode as Mode, FileSeekWhence as SeekWhence, FileStatus, FileType,
+    FileUser as UserInfo,
 };
 
-use super::backend::{
-    CreationMetadata, DeviceIo, DirHandle, Handle, HandleRef, PermissionCheck, PermissionInfo,
-    Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkingDirHandle,
-};
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
     ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WalkError, WriteError,
+};
+use super::{
+    OFlags,
+    backend::{
+        CreationMetadata, DeviceIo, DirHandle, Handle, HandleRef, PermissionCheck, PermissionInfo,
+        Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkingDirHandle,
+    },
 };
 
 /// The broker-core filesystem resolver, generic over its synchronization platform and
@@ -51,6 +55,22 @@ impl Context {
         self.user_info
     }
 
+    fn resolve(path: &str) -> ResolvedPath {
+        let mut components = vec![];
+        for component in path.split('/') {
+            match component {
+                "" | "." => {}
+                ".." => {
+                    let _ = components.pop();
+                }
+                _ => {
+                    components.push(component.into());
+                }
+            }
+        }
+        ResolvedPath { components }
+    }
+
     fn can_execute(&self, permissions: &PermissionInfo) -> bool {
         if self.user_info.user == permissions.owner.user {
             permissions.mode.contains(Mode::XUSR)
@@ -79,6 +99,17 @@ impl Context {
         } else {
             permissions.mode.contains(Mode::WOTH)
         }
+    }
+}
+
+struct ResolvedPath {
+    components: Vec<String>,
+}
+
+impl ResolvedPath {
+    fn parent_and_name(&self) -> Option<(Vec<&str>, &str)> {
+        let (name, parent) = self.components.split_last()?;
+        Some((parent.iter().map(String::as_str).collect(), name.as_str()))
     }
 }
 
@@ -114,7 +145,6 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         let Some((parent_components, name)) = path.parent_and_name() else {
             return Ok(None);
         };
-        let parent_components: Vec<_> = parent_components.iter().map(String::as_str).collect();
         let parent = self.walk_to_directory(
             context,
             self.backend.root(),
@@ -142,7 +172,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
 
     fn owned_parent_dir(&self, dir: WalkingDirHandle<'_>) -> Result<DirHandle, WalkError> {
         self.backend
-            .owned_dir_at(dir, FileAccessMode::ReadOnly, FileOpenFlags::PATH)
+            .owned_dir_at(dir, OFlags::PATH)
             .map_err(|error| match error {
                 OpenError::PathError(PathError::NoSuchFileOrDirectory) => {
                     PathError::MissingComponent.into()
@@ -155,7 +185,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     /// Resolve `path` to an owned handle on the file or directory it names, plus how permissions
     /// on it are to be checked.
     ///
-    /// The handle is taken with [`FileOpenFlags::PATH`], as it addresses the object for operations that
+    /// The handle is taken with [`OFlags::PATH`], as it addresses the object for operations that
     /// do not read or write its contents, and thus needs no access permissions on it.
     fn path_handle(
         &self,
@@ -166,15 +196,11 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             OpenError::PathError(error) => WalkError::PathError(error),
             _ => WalkError::Io,
         };
-        let components: Vec<_> = path.components().iter().map(String::as_str).collect();
+        let components: Vec<_> = path.components.iter().map(String::as_str).collect();
         if components.is_empty() {
             let root = self
                 .backend
-                .owned_dir_at(
-                    self.backend.root(),
-                    FileAccessMode::ReadOnly,
-                    FileOpenFlags::PATH,
-                )
+                .owned_dir_at(self.backend.root(), OFlags::PATH)
                 .map_err(map_open_error)?;
             // A backend root reports no permission metadata, so the backend is left to enforce
             // whatever it wants on it.
@@ -201,7 +227,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                     });
                 let dir = self
                     .backend
-                    .owned_dir_at(outcome.last, FileAccessMode::ReadOnly, FileOpenFlags::PATH)
+                    .owned_dir_at(outcome.last, OFlags::PATH)
                     .map_err(map_open_error)?;
                 Ok(Permissioned {
                     item: Handle::Dir(dir),
@@ -211,12 +237,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             WalkStopReason::StoppedAtNonDirectory => {
                 let file = self
                     .backend
-                    .open_file_at(
-                        outcome.last,
-                        components[walked],
-                        FileAccessMode::ReadOnly,
-                        FileOpenFlags::PATH,
-                    )
+                    .open_file_at(outcome.last, components[walked], OFlags::PATH)
                     .map_err(map_open_error)?;
                 Ok(Permissioned {
                     item: Handle::File(file.item),
@@ -365,36 +386,44 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
 impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Backend> {
     /// Opens a file
     ///
-    /// The `mode` is only significant when creating a file. [`FileOpenFlags::PATH`] ignores
-    /// `access` and all flags except [`FileOpenFlags::DIRECTORY`] and [`FileOpenFlags::NO_FOLLOW`].
+    /// The `mode` is only significant when creating a file
     pub fn open(
         &self,
         user: UserInfo,
         path: &str,
-        mut access: FileAccessMode,
-        mut flags: FileOpenFlags,
+        mut flags: OFlags,
         mode: Mode,
     ) -> Result<ResolverEntry<Backend>, OpenError> {
-        if !flags.difference(FileOpenFlags::all()).is_empty() {
+        const CURRENTLY_SUPPORTED_OFLAGS: OFlags = OFlags::CREAT
+            .union(OFlags::RDONLY)
+            .union(OFlags::WRONLY)
+            .union(OFlags::RDWR)
+            .union(OFlags::TRUNC)
+            .union(OFlags::NOCTTY)
+            .union(OFlags::EXCL)
+            .union(OFlags::DIRECTORY)
+            .union(OFlags::NONBLOCK)
+            .union(OFlags::LARGEFILE)
+            .union(OFlags::NOFOLLOW)
+            .union(OFlags::APPEND)
+            .union(OFlags::PATH);
+
+        if flags.intersects(CURRENTLY_SUPPORTED_OFLAGS.complement()) {
             unimplemented!("{flags:?}")
         }
-        let path_only = flags.contains(FileOpenFlags::PATH);
+        let path_only = flags.contains(OFlags::PATH);
         if path_only {
             // For `PATH`, we restrict what other flags are allowed, so a missing path cannot lead
             // to a creation, etc.
-            flags &= FileOpenFlags::PATH | FileOpenFlags::DIRECTORY | FileOpenFlags::NO_FOLLOW;
-            access = FileAccessMode::ReadOnly;
+            flags &= OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
         }
 
         let context = Context::new(user);
-        let path = ResolvedPath::root().resolve(path);
-        let (read_allowed, write_allowed) = match access {
-            FileAccessMode::ReadOnly => (true, false),
-            FileAccessMode::WriteOnly => (false, true),
-            FileAccessMode::ReadWrite => (true, true),
-            _ => unimplemented!("{access:?}"),
-        };
-        let append_mode = flags.contains(FileOpenFlags::APPEND);
+        let path = Context::resolve(path);
+        let access_mode = flags & (OFlags::WRONLY | OFlags::RDWR);
+        let read_allowed = access_mode == OFlags::RDONLY || access_mode == OFlags::RDWR;
+        let write_allowed = access_mode == OFlags::WRONLY || access_mode == OFlags::RDWR;
+        let append_mode = flags.contains(OFlags::APPEND);
         let entry = |handle, seek_behavior| ResolverEntry {
             handle,
             _backend: core::marker::PhantomData,
@@ -406,20 +435,17 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             seek_behavior,
         };
 
-        if path.components().is_empty() {
-            if flags.contains(FileOpenFlags::CREATE | FileOpenFlags::EXCLUSIVE) {
+        if path.components.is_empty() {
+            if flags.contains(OFlags::CREAT) && flags.contains(OFlags::EXCL) {
                 return Err(OpenError::AlreadyExists);
             }
             return Ok(entry(
-                Handle::Dir(
-                    self.backend
-                        .owned_dir_at(self.backend.root(), access, flags)?,
-                ),
+                Handle::Dir(self.backend.owned_dir_at(self.backend.root(), flags)?),
                 SeekBehavior::NonSeekable,
             ));
         }
 
-        let components: Vec<_> = path.components().iter().map(String::as_str).collect();
+        let components: Vec<_> = path.components.iter().map(String::as_str).collect();
         let walk = self.walk_path(
             &context,
             self.backend.root(),
@@ -437,11 +463,11 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         );
         match walk {
             Ok((outcome, _)) if outcome.stop_reason == WalkStopReason::CompleteDirectory => {
-                if flags.contains(FileOpenFlags::CREATE | FileOpenFlags::EXCLUSIVE) {
+                if flags.contains(OFlags::CREAT) && flags.contains(OFlags::EXCL) {
                     return Err(OpenError::AlreadyExists);
                 }
                 Ok(entry(
-                    Handle::Dir(self.backend.owned_dir_at(outcome.last, access, flags)?),
+                    Handle::Dir(self.backend.owned_dir_at(outcome.last, flags)?),
                     SeekBehavior::NonSeekable,
                 ))
             }
@@ -451,10 +477,8 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                 let name = components[walked];
                 // TODO(jayb): Reject O_CREAT | O_EXCL before invoking the backend, so open-time
                 // side effects like truncation cannot happen before AlreadyExists is returned.
-                let file = self
-                    .backend
-                    .open_file_at(outcome.last, name, access, flags)?;
-                if flags.contains(FileOpenFlags::CREATE | FileOpenFlags::EXCLUSIVE) {
+                let file = self.backend.open_file_at(outcome.last, name, flags)?;
+                if flags.contains(OFlags::CREAT) && flags.contains(OFlags::EXCL) {
                     return Err(OpenError::AlreadyExists);
                 }
                 if !path_only
@@ -472,13 +496,11 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                 unreachable!()
             }
             Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
-                if flags.contains(FileOpenFlags::CREATE) =>
+                if flags.contains(OFlags::CREAT) =>
             {
                 let Some((parent_components, name)) = path.parent_and_name() else {
                     unreachable!("root path was handled above")
                 };
-                let parent_components: Vec<_> =
-                    parent_components.iter().map(String::as_str).collect();
                 let parent = self
                     .walk_to_directory(
                         &context,
@@ -777,7 +799,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     /// Change the permissions of a file
     pub fn chmod(&self, user: UserInfo, path: &str, mode: Mode) -> Result<(), ChmodError> {
         let context = Context::new(user);
-        let path = ResolvedPath::root().resolve(path);
+        let path = Context::resolve(path);
         let handle = self
             .path_handle(&context, &path)
             .map_err(|error| match error {
@@ -799,7 +821,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         group: Option<u16>,
     ) -> Result<(), ChownError> {
         let context = Context::new(acting_user);
-        let path = ResolvedPath::root().resolve(path);
+        let path = Context::resolve(path);
         let handle = self
             .path_handle(&context, &path)
             .map_err(|error| match error {
@@ -815,7 +837,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     /// Unlink a file
     pub fn unlink(&self, user: UserInfo, path: &str) -> Result<(), UnlinkError> {
         let context = Context::new(user);
-        let path = ResolvedPath::root().resolve(path);
+        let path = Context::resolve(path);
         let Some((parent, name)) =
             self.parent_dir_and_name(&context, &path)
                 .map_err(|error| match error {
@@ -840,7 +862,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     /// Create a new directory
     pub fn mkdir(&self, user: UserInfo, path: &str, mode: Mode) -> Result<(), MkdirError> {
         let context = Context::new(user);
-        let path = ResolvedPath::root().resolve(path);
+        let path = Context::resolve(path);
         let Some((parent, name)) =
             self.parent_dir_and_name(&context, &path)
                 .map_err(|error| match error {
@@ -874,7 +896,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     /// Remove a directory
     pub fn rmdir(&self, user: UserInfo, path: &str) -> Result<(), RmdirError> {
         let context = Context::new(user);
-        let path = ResolvedPath::root().resolve(path);
+        let path = Context::resolve(path);
         let Some((parent, name)) =
             self.parent_dir_and_name(&context, &path)
                 .map_err(|error| match error {
@@ -930,23 +952,17 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
 
     /// Obtain the status of a file/directory/... on the file-system.
     pub fn file_status(&self, user: UserInfo, path: &str) -> Result<FileStatus, FileStatusError> {
-        let entry = self
-            .open(
-                user,
-                path,
-                FileAccessMode::ReadOnly,
-                FileOpenFlags::PATH,
-                Mode::empty(),
-            )
-            .map_err(|error| match error {
-                OpenError::PathError(error) => error.into(),
-                OpenError::Io
-                | OpenError::AccessNotAllowed
-                | OpenError::NoWritePerms
-                | OpenError::ReadOnlyFileSystem
-                | OpenError::AlreadyExists
-                | OpenError::TruncateError(_) => FileStatusError::Io,
-            })?;
+        let entry =
+            self.open(user, path, OFlags::PATH, Mode::empty())
+                .map_err(|error| match error {
+                    OpenError::PathError(error) => error.into(),
+                    OpenError::Io
+                    | OpenError::AccessNotAllowed
+                    | OpenError::NoWritePerms
+                    | OpenError::ReadOnlyFileSystem
+                    | OpenError::AlreadyExists
+                    | OpenError::TruncateError(_) => FileStatusError::Io,
+                })?;
         self.handle_status(&entry)
     }
 
