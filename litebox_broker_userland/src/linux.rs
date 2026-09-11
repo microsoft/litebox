@@ -5,20 +5,16 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Error as IoError, ErrorKind, Result as IoResult};
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::os::linux::fs::MetadataExt as _;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{RecvTimeoutError, sync_channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use clap::Parser as _;
-use litebox_broker_core::fs::in_mem::InitialNode;
 use litebox_broker_core::socket::HOST_GATEWAY_IPV4_ADDRESS;
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
 use litebox_broker_platform_linux_userland::LinuxSyncPrimitivesProvider;
-use litebox_broker_protocol::fs::{FileMode as Mode, FileUser as UserInfo};
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory;
 use litebox_broker_transport_linux_userland::unix_socket::{
@@ -29,8 +25,6 @@ use litebox_broker_userland::builder::BrokerCoreBuilder;
 use super::{SETUP_TIMEOUT, configured_socket_policy};
 
 const PROXY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-const DEFAULT_GUEST_UID: u16 = 1000;
-const DEFAULT_GUEST_GID: u16 = 1000;
 
 pub(super) fn run(mut args: super::CliArgs) -> Result<(), Box<dyn Error>> {
     let proxy = if args.allow_host.is_empty() {
@@ -58,7 +52,6 @@ pub(super) fn run(mut args: super::CliArgs) -> Result<(), Box<dyn Error>> {
         configured_socket_policy(&args.allow_tcp_destination, &args.allow_udp_destination)?,
     );
     let fs = super::fs::create_file_service::<LinuxSyncPrimitivesProvider>(
-        host_program_entries(&args)?,
         args.fs_initial_files.as_deref(),
     )?;
     let build_broker = || BrokerCoreBuilder::new(policy).with_file_service(fs).build();
@@ -88,68 +81,6 @@ pub(super) fn run(mut args: super::CliArgs) -> Result<(), Box<dyn Error>> {
             },
         )
     }
-}
-
-fn host_program_entries(
-    args: &super::CliArgs,
-) -> Result<Vec<(String, InitialNode)>, Box<dyn Error>> {
-    let mut entries = Vec::new();
-    if let Some(program) = args.fs_program.as_deref() {
-        let program = std::path::absolute(program)?;
-        let ancestors: Vec<_> = program.ancestors().skip(1).collect();
-        let mut previous_user = 0;
-        for path in ancestors.into_iter().rev().skip(1) {
-            let metadata = path.metadata()?;
-            let owner = guest_owner(previous_user, metadata.st_uid());
-            entries.push((
-                path_to_string(path)?,
-                InitialNode::Directory {
-                    mode: Mode::from_u32_bits_truncate(metadata.st_mode()),
-                    owner,
-                },
-            ));
-            previous_user = metadata.st_uid();
-        }
-        let mut program_data = std::fs::read(&program)?;
-        if args.fs_rewrite_syscalls {
-            program_data = litebox_syscall_rewriter::hook_syscalls_in_elf_with_options(
-                &program_data,
-                None,
-                litebox_syscall_rewriter::RewriteOptions::new(
-                    litebox_syscall_rewriter::TargetHost::Linux,
-                    args.fs_virtualize_x18 || cfg!(feature = "aarch64_virtualize_x18"),
-                ),
-            )?;
-        }
-        let metadata = program.metadata()?;
-        entries.push((
-            path_to_string(&program)?,
-            InitialNode::File {
-                mode: Mode::from_u32_bits_truncate(metadata.st_mode()),
-                owner: guest_owner(previous_user, metadata.st_uid()),
-                data: program_data.into(),
-            },
-        ));
-    }
-
-    Ok(entries)
-}
-
-fn guest_owner(previous_user: u32, user: u32) -> UserInfo {
-    if previous_user == 0 && user == 0 {
-        UserInfo::ROOT
-    } else {
-        UserInfo {
-            user: DEFAULT_GUEST_UID,
-            group: DEFAULT_GUEST_GID,
-        }
-    }
-}
-
-fn path_to_string(path: &Path) -> Result<String, IoError> {
-    path.to_str()
-        .map(str::to_owned)
-        .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "file path is not UTF-8"))
 }
 
 struct ManagedEgressProxy {

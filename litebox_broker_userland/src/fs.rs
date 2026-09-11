@@ -18,7 +18,6 @@ use litebox_broker_protocol::fs::{FileMode as Mode, FileUser as UserInfo};
 use litebox_platform::sync::RawSyncPrimitivesProvider;
 
 pub(super) fn create_file_service<Platform>(
-    mut entries: Vec<(String, InitialNode)>,
     initial_files: Option<&Path>,
 ) -> IoResult<Arc<dyn FileService>>
 where
@@ -28,14 +27,10 @@ where
         mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
         owner,
     };
-    if let Some((_, InitialNode::Directory { mode, .. })) =
-        entries.iter_mut().find(|(path, _)| path == "/tmp")
-    {
-        *mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
-    } else {
-        entries.push(("/tmp".to_owned(), writable_directory(UserInfo::ROOT)));
-    }
-    entries.push(("/registry".to_owned(), writable_directory(UserInfo::ROOT)));
+    let entries = vec![
+        ("/tmp".to_owned(), writable_directory(UserInfo::ROOT)),
+        ("/registry".to_owned(), writable_directory(UserInfo::ROOT)),
+    ];
 
     let tar_data = match initial_files {
         Some(path) => {
