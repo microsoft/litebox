@@ -7,7 +7,7 @@ use std::io::{BufRead, BufReader, Error as IoError, ErrorKind, Result as IoResul
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::os::linux::fs::MetadataExt as _;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::Arc;
 use std::sync::mpsc::{RecvTimeoutError, sync_channel};
@@ -93,62 +93,8 @@ pub(super) fn run(mut args: super::CliArgs) -> Result<(), Box<dyn Error>> {
 }
 
 fn create_file_service(args: &super::CliArgs) -> Result<Arc<dyn FileService>, Box<dyn Error>> {
-    let runner_args = inferred_linux_runner_args(args);
-    let windows_runner = runner_is_windows_on_linux(args);
-    let initial_files = args
-        .fs_initial_files
-        .clone()
-        .or_else(|| {
-            runner_args
-                .as_ref()
-                .and_then(|args| args.initial_files.clone())
-        })
-        .or_else(|| {
-            windows_runner
-                .then(|| windows_runner_initial_files(&args.runner_arguments))
-                .flatten()
-        });
-    let program_from_tar = runner_args
-        .as_ref()
-        .is_some_and(|args| args.program_from_tar)
-        || windows_runner
-        || (args.fs_program.is_none() && args.fs_initial_files.is_some());
-    if program_from_tar && initial_files.is_none() {
-        return Err(IoError::new(
-            ErrorKind::InvalidInput,
-            "a tar-backed guest program requires --fs-initial-files or runner --initial-files",
-        )
-        .into());
-    }
-    if runner_args.is_none()
-        && !windows_runner
-        && args.fs_program.is_none()
-        && args.fs_initial_files.is_none()
-    {
-        return Err(IoError::new(
-            ErrorKind::InvalidInput,
-            "could not infer broker filesystem inputs from runner arguments",
-        )
-        .into());
-    }
-    let program = args.fs_program.clone().or_else(|| {
-        (!program_from_tar)
-            .then(|| {
-                runner_args
-                    .as_ref()?
-                    .program_and_arguments
-                    .first()
-                    .map(PathBuf::from)
-            })
-            .flatten()
-    });
-    let rewrite_syscalls = args.fs_rewrite_syscalls
-        || runner_args
-            .as_ref()
-            .is_some_and(|args| args.rewrite_syscalls);
-
     let mut entries = Vec::new();
-    if let Some(program) = program.as_deref() {
+    if let Some(program) = args.fs_program.as_deref() {
         let program = std::path::absolute(program)?;
         let ancestors: Vec<_> = program.ancestors().skip(1).collect();
         let mut previous_user = 0;
@@ -165,7 +111,7 @@ fn create_file_service(args: &super::CliArgs) -> Result<Arc<dyn FileService>, Bo
             previous_user = metadata.st_uid();
         }
         let mut program_data = std::fs::read(&program)?;
-        if rewrite_syscalls {
+        if args.fs_rewrite_syscalls {
             program_data = litebox_syscall_rewriter::hook_syscalls_in_elf_with_options(
                 &program_data,
                 None,
@@ -199,7 +145,7 @@ fn create_file_service(args: &super::CliArgs) -> Result<Arc<dyn FileService>, Bo
     }
     entries.push(("/registry".to_owned(), writable_directory(UserInfo::ROOT)));
 
-    let tar_data = match initial_files.as_deref() {
+    let tar_data = match args.fs_initial_files.as_deref() {
         Some(path) => {
             if path.extension().and_then(|extension| extension.to_str()) != Some("tar") {
                 return Err(IoError::new(
@@ -242,59 +188,6 @@ fn guest_owner(previous_user: u32, user: u32) -> UserInfo {
             group: DEFAULT_GUEST_GID,
         }
     }
-}
-
-fn inferred_linux_runner_args(
-    args: &super::CliArgs,
-) -> Option<litebox_runner_linux_userland::CliArgs> {
-    if runner_is_windows_on_linux(args) {
-        return None;
-    }
-    litebox_runner_linux_userland::CliArgs::try_parse_from(
-        std::iter::once(OsString::from("litebox-runner-linux-userland"))
-            .chain(std::iter::once(OsString::from("--unstable")))
-            .chain(args.runner_arguments.iter().cloned()),
-    )
-    .ok()
-}
-
-fn runner_is_windows_on_linux(args: &super::CliArgs) -> bool {
-    args.runner
-        .as_deref()
-        .and_then(Path::file_name)
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.contains("windows_on_linux"))
-}
-
-fn windows_runner_initial_files(arguments: &[OsString]) -> Option<PathBuf> {
-    let mut arguments = arguments.iter();
-    while let Some(argument) = arguments.next() {
-        if argument == "--initial-files" {
-            return arguments.next().map(PathBuf::from);
-        }
-        if let Some(path) = argument
-            .to_str()
-            .and_then(|argument| argument.strip_prefix("--initial-files="))
-        {
-            return Some(PathBuf::from(path));
-        }
-        let argument = argument.to_str()?;
-        let option = argument
-            .split_once('=')
-            .map_or(argument, |(option, _)| option);
-        match option {
-            "--env" | "--broker-control-channel" => {
-                if !argument.contains('=') {
-                    arguments.next()?;
-                }
-            }
-            "-Z" | "--unstable" | "--forward-env" => {}
-            "--" => return None,
-            argument if argument.starts_with('-') => return None,
-            _ => return None,
-        }
-    }
-    None
 }
 
 fn path_to_string(path: &Path) -> Result<String, IoError> {

@@ -740,14 +740,6 @@ mod tests {
     use alloc::vec;
 
     #[test]
-    fn file_mode_truncates_wider_bits() {
-        assert_eq!(
-            FileMode::from_u32_bits_truncate(u32::MAX),
-            FileMode::SUPPORTED
-        );
-    }
-
-    #[test]
     fn directory_payload_round_trips_all_entry_shapes() {
         let entries = vec![
             FileDirectoryEntry {

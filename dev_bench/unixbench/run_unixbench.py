@@ -438,6 +438,7 @@ def run_litebox(
 
     cmd = [
         str(broker_path),
+        "--fs-initial-files", str(tar_path),
         "--runner", str(runner_path),
         "--env", "LD_LIBRARY_PATH=/lib64:/lib32:/lib",
         "--env", "HOME=/",
@@ -491,6 +492,7 @@ def run_litebox_windows(
     broker_path = runner_path.with_name("litebox-broker-userland.exe")
     cmd = [
         str(broker_path),
+        "--fs-initial-files", str(tar_path),
         "--runner", str(runner_path),
         "--env", "LD_LIBRARY_PATH=/lib64:/lib32:/lib",
         "--env", "HOME=/",

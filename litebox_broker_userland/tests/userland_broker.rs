@@ -45,8 +45,6 @@ fn run_parent_test() {
     let test_executable = std::env::current_exe().unwrap();
     let mut event_command = Command::new(env!("CARGO_BIN_EXE_litebox-broker-userland"));
     event_command
-        .arg("--fs-program")
-        .arg(&test_executable)
         .arg("--runner")
         .arg(&test_executable)
         .arg(RUNNER_ARGUMENT);
@@ -71,8 +69,6 @@ fn run_parent_test() {
     });
     let mut network_command = Command::new(env!("CARGO_BIN_EXE_litebox-broker-userland"));
     network_command
-        .arg("--fs-program")
-        .arg(&test_executable)
         .arg("--allow-tcp-destination")
         .arg(format!("{gateway}/32:{tcp_port}"))
         .arg("--allow-udp-destination")
