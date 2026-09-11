@@ -28,11 +28,11 @@ pub(crate) enum Cleanup {
 
 impl Cleanup {
     /// Undo the side effect. Runs only on an error path, so failures are ignored.
-    pub(crate) fn run(self, task: &Task) {
+    pub(crate) fn run<Platform: crate::OpteeShimPlatform>(self, task: &Task<Platform>) {
         match self {
             Self::None => {}
             Self::Unmap { addr, len } => {
-                let _ = task.sys_munmap(UserMutPtr::<u8>::from_usize(addr), len);
+                let _ = task.sys_munmap(UserMutPtr::<Platform, u8>::from_usize(addr), len);
             }
         }
     }

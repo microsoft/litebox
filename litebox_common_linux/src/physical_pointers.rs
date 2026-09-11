@@ -34,18 +34,13 @@
 //! mapping cannot alias any Rust reference.
 
 use crate::vmap::{
-    GlobalVmapManager, PhysPageAddr, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError,
-    VmapManager,
+    PhysPageAddr, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError, VmapManager,
 };
 use core::marker::PhantomData;
 use litebox::platform::common_providers::userspace_pointers::{
     UserConstPtr, UserMutPtr, ValidateAccess,
 };
 use zerocopy::{FromBytes, IntoBytes};
-
-/// The concrete [`PhysPageMapInfo`] produced by the `VmapManager` behind a [`GlobalVmapManager`].
-type MapInfoOf<V, const ALIGN: usize> =
-    <<V as GlobalVmapManager<ALIGN>>::Manager as VmapManager<ALIGN>>::MapInfo;
 
 #[inline]
 fn align_down(address: usize, align: usize) -> usize {
@@ -61,24 +56,24 @@ fn align_down(address: usize, align: usize) -> usize {
 /// Write methods require `T: IntoBytes` because values are written by copying their byte
 /// representation.
 ///
+/// - `vmgr`: A *borrowed* [`VmapManager`] used to map and unmap `pages`.
 /// - `pages`: An array of page-aligned physical addresses. We expect physical addresses in this array are
 ///   virtually contiguous.
 /// - `offset`: The offset within `pages[0]` where the object starts. It should be smaller than `ALIGN`.
 /// - `count`: The number of objects of type `T` that can be accessed from this pointer.
 /// - `T`: The type of the object being pointed to. `pages` with respect to `offset` should cover enough
 ///   memory for an object of type `T`.
-#[repr(C)]
-pub struct PhysMutPtr<T, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> {
+pub struct PhysMutPtr<'v, V: VmapManager<ALIGN>, T, const ALIGN: usize> {
+    vmgr: &'v V,
     pages: alloc::boxed::Box<[PhysPageAddr<ALIGN>]>,
     offset: usize,
     count: usize,
     _type: PhantomData<T>,
-    _vmap: PhantomData<V>,
 }
 
-impl<T, const ALIGN: usize, V> PhysMutPtr<T, ALIGN, V>
+impl<'v, V, T, const ALIGN: usize> PhysMutPtr<'v, V, T, ALIGN>
 where
-    V: GlobalVmapManager<ALIGN>,
+    V: VmapManager<ALIGN>,
 {
     /// Compile-time guard rejecting zero-sized types.
     ///
@@ -100,12 +95,17 @@ where
     /// memory. This is sound because the foreign `T` is never dereferenced as a Rust reference or
     /// via a typed load/store: all access goes through `copy_in`/`copy_out`, which cast the
     /// mapped pointer to `*mut u8` and perform a byte-granular, unaligned-safe `memcpy_fallible`.
-    pub fn new(pages: &[PhysPageAddr<ALIGN>], offset: usize) -> Result<Self, PhysPointerError> {
-        Self::from_boxed(pages.into(), offset)
+    pub fn new(
+        vmgr: &'v V,
+        pages: &[PhysPageAddr<ALIGN>],
+        offset: usize,
+    ) -> Result<Self, PhysPointerError> {
+        Self::from_boxed(vmgr, pages.into(), offset)
     }
 
     /// Create a new `PhysMutPtr` from an owned page list, consuming it without copying.
     fn from_boxed(
+        vmgr: &'v V,
         pages: alloc::boxed::Box<[PhysPageAddr<ALIGN>]>,
         offset: usize,
     ) -> Result<Self, PhysPointerError> {
@@ -129,13 +129,13 @@ where
                 core::mem::size_of::<T>(),
             ));
         }
-        V::manager().validate_unowned(&pages)?;
+        vmgr.validate_unowned(&pages)?;
         Ok(Self {
+            vmgr,
             offset,
             count: size / core::mem::size_of::<T>(),
             pages,
             _type: PhantomData,
-            _vmap: PhantomData,
         })
     }
 
@@ -143,7 +143,11 @@ where
     ///
     /// This is a shortcut for
     /// `PhysMutPtr::new([align_down(pa), align_down(pa) + ALIGN, ..., align_up(pa + bytes) - ALIGN], pa % ALIGN)`.
-    pub fn with_contiguous_pages(pa: usize, bytes: usize) -> Result<Self, PhysPointerError> {
+    pub fn with_contiguous_pages(
+        vmgr: &'v V,
+        pa: usize,
+        bytes: usize,
+    ) -> Result<Self, PhysPointerError> {
         if bytes < core::mem::size_of::<T>() {
             return Err(PhysPointerError::InsufficientPhysicalPages(
                 bytes,
@@ -170,7 +174,7 @@ where
                 .ok_or(PhysPointerError::Overflow)?;
         }
         // reuse the allocation
-        Self::from_boxed(pages.into_boxed_slice(), pa - start_page)
+        Self::from_boxed(vmgr, pages.into_boxed_slice(), pa - start_page)
     }
 
     /// Create a new `PhysMutPtr` from the given physical address for a single object.
@@ -178,8 +182,8 @@ where
     /// This is a shortcut for `PhysMutPtr::with_contiguous_pages(pa, size_of::<T>())`.
     ///
     /// Note: This module doesn't provide `as_usize` because LiteBox should not dereference physical addresses directly.
-    pub fn with_usize(pa: usize) -> Result<Self, PhysPointerError> {
-        Self::with_contiguous_pages(pa, core::mem::size_of::<T>())
+    pub fn with_usize(vmgr: &'v V, pa: usize) -> Result<Self, PhysPointerError> {
+        Self::with_contiguous_pages(vmgr, pa, core::mem::size_of::<T>())
     }
 
     /// Read the value at the given offset from the physical pointer.
@@ -314,7 +318,7 @@ where
         count: usize,
         size: usize,
         perms: PhysPageMapPermissions,
-    ) -> Result<MappedGuard<'_, T, ALIGN, V>, PhysPointerError> {
+    ) -> Result<MappedGuard<'_, V, T, ALIGN>, PhysPointerError> {
         let skip = self
             .offset
             .checked_add(
@@ -331,10 +335,10 @@ where
         let map_info = self.map_range(start, end, perms)?;
         let ptr = map_info.base().wrapping_add(skip % ALIGN).cast::<T>();
         Ok(MappedGuard {
+            vmgr: self.vmgr,
             map_info: Some(map_info),
             ptr,
             size,
-            _owner: PhantomData,
         })
     }
 
@@ -344,7 +348,7 @@ where
         start: usize,
         end: usize,
         perms: PhysPageMapPermissions,
-    ) -> Result<MapInfoOf<V, ALIGN>, PhysPointerError> {
+    ) -> Result<V::MapInfo, PhysPointerError> {
         if start >= end || end > self.pages.len() {
             return Err(PhysPointerError::IndexOutOfBounds(end, self.pages.len()));
         }
@@ -357,14 +361,11 @@ where
         // The platform `VmapManager` must map them only in a foreign-memory VA range, disjoint
         // from LiteBox-owned Rust objects. This caller never creates Rust references from the
         // returned pointer; `MappedGuard` uses it only for fault-tolerant raw byte copies.
-        unsafe { V::manager().vmap(sub_pages, perms) }
+        unsafe { self.vmgr.vmap(sub_pages, perms) }
     }
 }
 
-impl<const ALIGN: usize, V> PhysMutPtr<u8, ALIGN, V>
-where
-    V: GlobalVmapManager<ALIGN>,
-{
+impl<V: VmapManager<ALIGN>, const ALIGN: usize> PhysMutPtr<'_, V, u8, ALIGN> {
     /// Copy data to non-Rust userspace memory.
     pub fn copy_to_user<U: ValidateAccess>(
         &self,
@@ -404,8 +405,7 @@ where
 
 /// RAII guard that unmaps physical pages when dropped.
 ///
-/// Created by `map_and_get_ptr_guard`. Its lifetime is tied to the parent
-/// `PhysMutPtr`, and it owns the map info for the duration of the temporary mapping.
+/// Created by `map_and_get_ptr_guard`; its lifetime is tied to the parent `PhysMutPtr`.
 ///
 /// # Invariant
 ///
@@ -413,14 +413,14 @@ where
 /// at `ptr` lie within that mapping. The mapping refers to foreign (non-Rust) physical
 /// memory that another core may unmap concurrently, so `ptr` must only ever be accessed
 /// through [`Self::copy_in`]/[`Self::copy_out`], which perform fault-tolerant copies.
-struct MappedGuard<'a, T, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> {
-    map_info: Option<MapInfoOf<V, ALIGN>>,
+struct MappedGuard<'v, V: VmapManager<ALIGN>, T, const ALIGN: usize> {
+    vmgr: &'v V,
+    map_info: Option<V::MapInfo>,
     ptr: *mut T,
     size: usize,
-    _owner: PhantomData<&'a PhysMutPtr<T, ALIGN, V>>,
 }
 
-impl<T, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> MappedGuard<'_, T, ALIGN, V> {
+impl<V: VmapManager<ALIGN>, T, const ALIGN: usize> MappedGuard<'_, V, T, ALIGN> {
     fn copy_to_user<U: ValidateAccess>(
         &self,
         dst: UserMutPtr<U, u8>,
@@ -472,20 +472,20 @@ impl<T, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> MappedGuard<'_, T, ALIG
     }
 }
 
-impl<T, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> Drop for MappedGuard<'_, T, ALIGN, V> {
+impl<V: VmapManager<ALIGN>, T, const ALIGN: usize> Drop for MappedGuard<'_, V, T, ALIGN> {
     fn drop(&mut self) {
         // SAFETY: The platform is expected to handle unmapping safely. Drop cannot
         // report errors. If unmapping fails, drop the returned private map_info;
         // platform-specific resources that cannot be reclaimed are handled by the
         // platform `vunmap` implementation.
         if let Some(map_info) = self.map_info.take() {
-            let _ = unsafe { V::manager().vunmap(map_info) };
+            let _ = unsafe { self.vmgr.vunmap(map_info) };
         }
     }
 }
 
-impl<T, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> core::fmt::Debug
-    for PhysMutPtr<T, ALIGN, V>
+impl<V: VmapManager<ALIGN>, T, const ALIGN: usize> core::fmt::Debug
+    for PhysMutPtr<'_, V, T, ALIGN>
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PhysMutPtr")
@@ -497,14 +497,13 @@ impl<T, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> core::fmt::Debug
 
 /// Represent a physical pointer to a read-only object. This wraps around [`PhysMutPtr`] and
 /// exposes only copy-out access.
-#[repr(C)]
-pub struct PhysConstPtr<T, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> {
-    inner: PhysMutPtr<T, ALIGN, V>,
+pub struct PhysConstPtr<'v, V: VmapManager<ALIGN>, T, const ALIGN: usize> {
+    inner: PhysMutPtr<'v, V, T, ALIGN>,
 }
 
-impl<T: FromBytes, const ALIGN: usize, V> PhysConstPtr<T, ALIGN, V>
+impl<'v, V, T: FromBytes, const ALIGN: usize> PhysConstPtr<'v, V, T, ALIGN>
 where
-    V: GlobalVmapManager<ALIGN>,
+    V: VmapManager<ALIGN>,
 {
     /// Create a new `PhysConstPtr` from the given physical page array and offset.
     ///
@@ -512,9 +511,13 @@ where
     /// than `ALIGN`. Also, `pages` should contain enough pages to cover at least one object of
     /// type `T` starting from `offset`. If these conditions are not met, this function returns
     /// `Err(PhysPointerError)`.
-    pub fn new(pages: &[PhysPageAddr<ALIGN>], offset: usize) -> Result<Self, PhysPointerError> {
+    pub fn new(
+        vmgr: &'v V,
+        pages: &[PhysPageAddr<ALIGN>],
+        offset: usize,
+    ) -> Result<Self, PhysPointerError> {
         Ok(Self {
-            inner: PhysMutPtr::new(pages, offset)?,
+            inner: PhysMutPtr::new(vmgr, pages, offset)?,
         })
     }
 
@@ -522,9 +525,13 @@ where
     ///
     /// This is a shortcut for
     /// `PhysConstPtr::new([align_down(pa), align_down(pa) + ALIGN, ..., align_up(pa + bytes) - ALIGN], pa % ALIGN)`.
-    pub fn with_contiguous_pages(pa: usize, bytes: usize) -> Result<Self, PhysPointerError> {
+    pub fn with_contiguous_pages(
+        vmgr: &'v V,
+        pa: usize,
+        bytes: usize,
+    ) -> Result<Self, PhysPointerError> {
         Ok(Self {
-            inner: PhysMutPtr::with_contiguous_pages(pa, bytes)?,
+            inner: PhysMutPtr::with_contiguous_pages(vmgr, pa, bytes)?,
         })
     }
 
@@ -533,9 +540,9 @@ where
     /// This is a shortcut for `PhysConstPtr::with_contiguous_pages(pa, size_of::<T>())`.
     ///
     /// Note: This module doesn't provide `as_usize` because LiteBox should not dereference physical addresses directly.
-    pub fn with_usize(pa: usize) -> Result<Self, PhysPointerError> {
+    pub fn with_usize(vmgr: &'v V, pa: usize) -> Result<Self, PhysPointerError> {
         Ok(Self {
-            inner: PhysMutPtr::with_usize(pa)?,
+            inner: PhysMutPtr::with_usize(vmgr, pa)?,
         })
     }
 
@@ -564,10 +571,7 @@ where
     }
 }
 
-impl<const ALIGN: usize, V> PhysConstPtr<u8, ALIGN, V>
-where
-    V: GlobalVmapManager<ALIGN>,
-{
+impl<V: VmapManager<ALIGN>, const ALIGN: usize> PhysConstPtr<'_, V, u8, ALIGN> {
     /// Copy data to non-Rust userspace memory.
     pub fn copy_to_user<U: ValidateAccess>(
         &self,
@@ -578,8 +582,8 @@ where
     }
 }
 
-impl<T, const ALIGN: usize, V: GlobalVmapManager<ALIGN>> core::fmt::Debug
-    for PhysConstPtr<T, ALIGN, V>
+impl<V: VmapManager<ALIGN>, T, const ALIGN: usize> core::fmt::Debug
+    for PhysConstPtr<'_, V, T, ALIGN>
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PhysConstPtr")

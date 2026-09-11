@@ -42,9 +42,7 @@ use x509_cert::Certificate;
 /// Everything here is copied into VTL1 rather than read from VTL0 on demand, so
 /// policy decisions cannot be raced by VTL0 mutating the data behind them.
 pub struct Heki<P: Vtl0Gate> {
-    /// The VTL0 capability every handler acts through. Owned rather than
-    /// borrowed: gate types are zero-sized, so this costs nothing and keeps the
-    /// gate out of every handler signature.
+    /// The VTL0 capability used by each handler.
     pub(crate) gate: P,
     pub(crate) module_memory_metadata: ModuleMemoryMetadataMap,
     system_certs: once_cell::race::OnceBox<Box<[Certificate]>>,
