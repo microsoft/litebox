@@ -3,21 +3,23 @@
 
 //! Path management, permission checks, and open-state operations above [`super::backend`].
 
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::marker::PhantomData;
+
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
     ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::{
-    DirEntry, FileStatus, FileType, Mode, OFlags, SeekWhence, UserInfo,
+    FileType, Mode, OFlags,
     backend::{
         CreationMetadata, DeviceIo, DirHandle, Handle, HandleRef, PermissionCheck, PermissionInfo,
         Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkingDirHandle,
     },
 };
-use alloc::string::String;
-use alloc::vec;
-use alloc::vec::Vec;
-use core::marker::PhantomData;
+use super::{SeekWhence, UserInfo};
 
 /// The broker-core filesystem resolver, generic over its synchronization platform and
 /// [`Backend`](super::backend::Backend).
@@ -916,7 +918,10 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     /// Read directory entries from a directory file descriptor.
     ///
     /// Returns a list of file/directory names including synthesized `.` and `..` entries.
-    pub fn read_dir(&self, entry: &ResolverEntry<Backend>) -> Result<Vec<DirEntry>, ReadDirError> {
+    pub fn read_dir(
+        &self,
+        entry: &ResolverEntry<Backend>,
+    ) -> Result<Vec<super::DirEntry>, ReadDirError> {
         if entry.path_only {
             // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
             unimplemented!("read_dir on O_PATH fd")
@@ -928,12 +933,12 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
 
         let mut entries = Vec::new();
         // TODO(jayb): Fill in inode info for synthesized dot entries.
-        entries.push(DirEntry {
+        entries.push(super::DirEntry {
             name: String::from("."),
             file_type: FileType::Directory,
             ino_info: None,
         });
-        entries.push(DirEntry {
+        entries.push(super::DirEntry {
             name: String::from(".."),
             file_type: FileType::Directory,
             ino_info: None,
@@ -943,7 +948,11 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     }
 
     /// Obtain the status of a file/directory/... on the file-system.
-    pub fn file_status(&self, user: UserInfo, path: &str) -> Result<FileStatus, FileStatusError> {
+    pub fn file_status(
+        &self,
+        user: UserInfo,
+        path: &str,
+    ) -> Result<super::FileStatus, FileStatusError> {
         let entry =
             self.open(user, path, OFlags::PATH, Mode::empty())
                 .map_err(|error| match error {
@@ -962,7 +971,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     pub fn handle_status(
         &self,
         entry: &ResolverEntry<Backend>,
-    ) -> Result<FileStatus, FileStatusError> {
+    ) -> Result<super::FileStatus, FileStatusError> {
         self.backend.status(entry.handle.as_ref())
     }
 

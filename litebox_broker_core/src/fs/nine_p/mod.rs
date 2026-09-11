@@ -14,10 +14,10 @@ use alloc::vec::Vec;
 use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use litebox_platform::sync;
 use thiserror::Error;
 
 use self::fcall::Rlerror;
+use super::OFlags;
 use super::backend::{
     DirHandle, FileHandle, HandleRef, PermissionCheck, Permissioned, SeekBehavior, WalkOutcome,
     WalkStopReason, WalkedComponent, WalkingDirHandle,
@@ -26,7 +26,8 @@ use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
     ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WalkError, WriteError,
 };
-use super::{FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
+use litebox_platform::sync;
+
 mod client;
 mod fcall;
 mod id_pool;
@@ -52,7 +53,7 @@ pub struct NineP<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read +
     /// Handed out (shared) by [`Backend::root`](super::backend::Backend::root), so it must never
     /// be `Tlopen`ed or `Tlcreate`d; see the `is_backend_root` flag on the walking dir handle.
     root: Arc<OwnedFid<Platform, T>>,
-    /// Device id reported in every [`NodeInfo`] from this backend; inode numbers
+    /// Device id reported in every [`NodeInfo`](super::NodeInfo) from this backend; inode numbers
     /// come from the server's qids instead.
     device_id: u64,
     /// Whether `unlinkat` is supported by the server
@@ -444,7 +445,7 @@ where
             .map(|entry| super::DirEntry {
                 name: String::from_utf8_lossy(&entry.name).into_owned(),
                 file_type: qid_type_to_file_type(entry.qid.typ),
-                ino_info: Some(NodeInfo {
+                ino_info: Some(super::NodeInfo {
                     dev: self.device_id,
                     ino: entry.qid.path,
                     rdev: None,
@@ -497,7 +498,7 @@ where
         SeekBehavior::PositionBased
     }
 
-    fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError> {
+    fn status(&self, h: HandleRef<'_>) -> Result<super::FileStatus, FileStatusError> {
         let fid = match h {
             HandleRef::File(h) => &h.get_typed::<Self>().fid,
             HandleRef::Dir(h) => &h.get_typed::<Self>().fid,
@@ -569,7 +570,7 @@ where
         Ok(self.remove_at(&dir.into_typed::<Self>(), name, false)?)
     }
 
-    fn chmod(&self, h: HandleRef<'_>, mode: Mode) -> Result<(), ChmodError> {
+    fn chmod(&self, h: HandleRef<'_>, mode: super::Mode) -> Result<(), ChmodError> {
         let fid = match h {
             HandleRef::File(h) => &h.get_typed::<Self>().fid,
             HandleRef::Dir(h) => &h.get_typed::<Self>().fid,
@@ -700,37 +701,40 @@ fn oflags_to_lopen(flags: OFlags) -> fcall::LOpenFlags {
 }
 
 /// Convert a Qid type to our FileType
-fn qid_type_to_file_type(qid_type: fcall::QidType) -> FileType {
+fn qid_type_to_file_type(qid_type: fcall::QidType) -> super::FileType {
     if qid_type.contains(fcall::QidType::DIR) {
-        FileType::Directory
+        super::FileType::Directory
     } else {
-        FileType::RegularFile
+        super::FileType::RegularFile
     }
 }
 
-fn file_mode(mode: u32) -> Mode {
-    let bits = u16::try_from(mode & u32::from(Mode::SUPPORTED.bits()))
+fn file_mode(mode: u32) -> super::Mode {
+    let bits = u16::try_from(mode & u32::from(super::Mode::SUPPORTED.bits()))
         .expect("supported file mode bits fit in u16");
-    Mode::from_bits_retain(bits)
+    super::Mode::from_bits_retain(bits)
 }
 
 /// Convert getattr response to FileStatus
 ///
 /// Inode numbers come from the server's qids; `device_id` is the device the caller reports this
 /// filesystem as.
-fn rgetattr_to_file_status(attr: &fcall::Rgetattr, device_id: u64) -> Result<FileStatus, Error> {
+fn rgetattr_to_file_status(
+    attr: &fcall::Rgetattr,
+    device_id: u64,
+) -> Result<super::FileStatus, Error> {
     let file_type = qid_type_to_file_type(attr.qid.typ);
 
     if attr.valid.contains(fcall::GetattrMask::BASIC) {
-        Ok(FileStatus {
+        Ok(super::FileStatus {
             file_type,
             mode: file_mode(attr.stat.mode),
             size: attr.stat.size,
-            owner: UserInfo {
+            owner: super::UserInfo {
                 user: u16::try_from(attr.stat.uid).map_err(|_| Error::InvalidResponse)?,
                 group: u16::try_from(attr.stat.gid).map_err(|_| Error::InvalidResponse)?,
             },
-            node_info: NodeInfo {
+            node_info: super::NodeInfo {
                 dev: device_id,
                 ino: attr.qid.path,
                 rdev: NonZeroU64::new(attr.stat.rdev),
@@ -738,19 +742,19 @@ fn rgetattr_to_file_status(attr: &fcall::Rgetattr, device_id: u64) -> Result<Fil
             blksize: attr.stat.blksize,
         })
     } else {
-        Ok(FileStatus {
+        Ok(super::FileStatus {
             file_type,
             mode: if attr.valid.contains(fcall::GetattrMask::MODE) {
                 file_mode(attr.stat.mode)
             } else {
-                Mode::empty()
+                super::Mode::empty()
             },
             size: if attr.valid.contains(fcall::GetattrMask::SIZE) {
                 attr.stat.size
             } else {
                 0
             },
-            owner: UserInfo {
+            owner: super::UserInfo {
                 user: if attr.valid.contains(fcall::GetattrMask::UID) {
                     u16::try_from(attr.stat.uid).map_err(|_| Error::InvalidResponse)?
                 } else {
@@ -762,7 +766,7 @@ fn rgetattr_to_file_status(attr: &fcall::Rgetattr, device_id: u64) -> Result<Fil
                     0
                 },
             },
-            node_info: NodeInfo {
+            node_info: super::NodeInfo {
                 dev: device_id,
                 ino: attr.qid.path,
                 rdev: if attr.valid.contains(fcall::GetattrMask::RDEV) {
@@ -929,7 +933,7 @@ impl From<Error> for FileStatusError {
                     #[cfg(debug_assertions)]
                     dir: String::new(),
                     #[cfg(debug_assertions)]
-                    perms: Mode::empty(),
+                    perms: super::Mode::empty(),
                 }),
                 _ => FileStatusError::Io,
             },
@@ -1008,7 +1012,7 @@ impl From<Error> for WalkError {
                     #[cfg(debug_assertions)]
                     dir: String::new(),
                     #[cfg(debug_assertions)]
-                    perms: Mode::empty(),
+                    perms: super::Mode::empty(),
                 }),
                 _ => WalkError::Io,
             },
