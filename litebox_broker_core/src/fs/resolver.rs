@@ -699,25 +699,20 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                     .status(HandleRef::File(file))
                     .map_err(|_| SeekError::Io)?
                     .size;
+                let file_len = usize::try_from(file_len).map_err(|_| SeekError::InvalidOffset)?;
                 let base = match whence {
                     SeekWhence::RelativeToBeginning => 0,
-                    SeekWhence::RelativeToCurrentOffset => {
-                        u64::try_from(entry.position).map_err(|_| SeekError::InvalidOffset)?
-                    }
+                    SeekWhence::RelativeToCurrentOffset => entry.position,
                     SeekWhence::RelativeToEnd => file_len,
                 };
                 let new_position = base
-                    .checked_add_signed(
-                        i64::try_from(offset).map_err(|_| SeekError::InvalidOffset)?,
-                    )
+                    .checked_add_signed(offset)
                     .ok_or(SeekError::InvalidOffset)?;
                 // TODO(jayb): Linux allows regular files to seek past EOF, while some backends or
                 // file types may not. Model that distinction instead of using one resolver rule.
                 if new_position > file_len {
                     return Err(SeekError::InvalidOffset);
                 }
-                let new_position =
-                    usize::try_from(new_position).map_err(|_| SeekError::InvalidOffset)?;
                 entry.position = new_position;
                 Ok(new_position)
             }
