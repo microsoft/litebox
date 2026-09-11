@@ -158,7 +158,7 @@ fn create_file_service(args: &super::CliArgs) -> Result<Arc<dyn FileService>, Bo
             entries.push((
                 path_to_string(path)?,
                 InitialNode::Directory {
-                    mode: file_mode(metadata.st_mode()),
+                    mode: Mode::from_u32_bits_truncate(metadata.st_mode()),
                     owner,
                 },
             ));
@@ -179,7 +179,7 @@ fn create_file_service(args: &super::CliArgs) -> Result<Arc<dyn FileService>, Bo
         entries.push((
             path_to_string(&program)?,
             InitialNode::File {
-                mode: file_mode(metadata.st_mode()),
+                mode: Mode::from_u32_bits_truncate(metadata.st_mode()),
                 owner: guest_owner(previous_user, metadata.st_uid()),
                 data: program_data.into(),
             },
@@ -242,12 +242,6 @@ fn guest_owner(previous_user: u32, user: u32) -> UserInfo {
             group: DEFAULT_GUEST_GID,
         }
     }
-}
-
-fn file_mode(mode: u32) -> Mode {
-    let bits = u16::try_from(mode & u32::from(Mode::SUPPORTED.bits()))
-        .expect("supported file mode bits fit in u16");
-    Mode::from_bits_retain(bits)
 }
 
 fn inferred_linux_runner_args(

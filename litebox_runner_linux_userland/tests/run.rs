@@ -371,9 +371,7 @@ fn test_file_service(
             );
             let metadata =
                 std::fs::metadata(entry.path()).expect("failed to inspect runner test file");
-            let bits = u16::try_from(metadata.permissions().mode() & 0o7777)
-                .expect("supported file mode bits fit in u16");
-            let mode = Mode::from_bits_retain(bits);
+            let mode = Mode::from_u32_bits_truncate(metadata.permissions().mode());
             let node = if metadata.is_dir() {
                 InitialNode::Directory {
                     mode,
