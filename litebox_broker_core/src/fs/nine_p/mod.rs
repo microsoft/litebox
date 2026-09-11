@@ -14,7 +14,6 @@ use alloc::vec::Vec;
 use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use litebox_broker_protocol::fs::{FileDirectoryEntry, FileMode, FileStatus, FileType, FileUser};
 use litebox_platform::sync;
 use thiserror::Error;
 
@@ -27,7 +26,7 @@ use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
     ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WalkError, WriteError,
 };
-use super::{NodeInfo, OFlags};
+use super::{FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
 mod client;
 mod fcall;
 mod id_pool;
@@ -430,7 +429,7 @@ where
         })
     }
 
-    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<FileDirectoryEntry>, ReadDirError> {
+    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<super::DirEntry>, ReadDirError> {
         let handle = handle.into_typed::<Self>();
         let entries = self.client.readdir_all(&handle.fid.fid)?;
         Ok(entries
@@ -442,7 +441,7 @@ where
                 // have the resolver handle only cases where it is not handled by the backend?
                 !matches!(&*entry.name, b"." | b"..")
             })
-            .map(|entry| FileDirectoryEntry {
+            .map(|entry| super::DirEntry {
                 name: String::from_utf8_lossy(&entry.name).into_owned(),
                 file_type: qid_type_to_file_type(entry.qid.typ),
                 node_info: Some(NodeInfo {
@@ -570,7 +569,7 @@ where
         Ok(self.remove_at(&dir.into_typed::<Self>(), name, false)?)
     }
 
-    fn chmod(&self, h: HandleRef<'_>, mode: FileMode) -> Result<(), ChmodError> {
+    fn chmod(&self, h: HandleRef<'_>, mode: Mode) -> Result<(), ChmodError> {
         let fid = match h {
             HandleRef::File(h) => &h.get_typed::<Self>().fid,
             HandleRef::Dir(h) => &h.get_typed::<Self>().fid,
@@ -709,10 +708,10 @@ fn qid_type_to_file_type(qid_type: fcall::QidType) -> FileType {
     }
 }
 
-fn file_mode(mode: u32) -> FileMode {
-    let bits = u16::try_from(mode & u32::from(FileMode::SUPPORTED.bits()))
+fn file_mode(mode: u32) -> Mode {
+    let bits = u16::try_from(mode & u32::from(Mode::SUPPORTED.bits()))
         .expect("supported file mode bits fit in u16");
-    FileMode::from_bits_retain(bits)
+    Mode::from_bits_retain(bits)
 }
 
 /// Convert getattr response to FileStatus
@@ -727,7 +726,7 @@ fn rgetattr_to_file_status(attr: &fcall::Rgetattr, device_id: u64) -> Result<Fil
             file_type,
             mode: file_mode(attr.stat.mode),
             size: attr.stat.size,
-            owner: FileUser {
+            owner: UserInfo {
                 user: u16::try_from(attr.stat.uid).map_err(|_| Error::InvalidResponse)?,
                 group: u16::try_from(attr.stat.gid).map_err(|_| Error::InvalidResponse)?,
             },
@@ -744,14 +743,14 @@ fn rgetattr_to_file_status(attr: &fcall::Rgetattr, device_id: u64) -> Result<Fil
             mode: if attr.valid.contains(fcall::GetattrMask::MODE) {
                 file_mode(attr.stat.mode)
             } else {
-                FileMode::empty()
+                Mode::empty()
             },
             size: if attr.valid.contains(fcall::GetattrMask::SIZE) {
                 attr.stat.size
             } else {
                 0
             },
-            owner: FileUser {
+            owner: UserInfo {
                 user: if attr.valid.contains(fcall::GetattrMask::UID) {
                     u16::try_from(attr.stat.uid).map_err(|_| Error::InvalidResponse)?
                 } else {
@@ -930,7 +929,7 @@ impl From<Error> for FileStatusError {
                     #[cfg(debug_assertions)]
                     dir: String::new(),
                     #[cfg(debug_assertions)]
-                    perms: FileMode::empty(),
+                    perms: Mode::empty(),
                 }),
                 _ => FileStatusError::Io,
             },
@@ -1009,7 +1008,7 @@ impl From<Error> for WalkError {
                     #[cfg(debug_assertions)]
                     dir: String::new(),
                     #[cfg(debug_assertions)]
-                    perms: FileMode::empty(),
+                    perms: Mode::empty(),
                 }),
                 _ => WalkError::Io,
             },

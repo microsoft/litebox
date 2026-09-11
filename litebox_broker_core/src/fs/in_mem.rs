@@ -8,17 +8,14 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use hashbrown::HashMap;
 
-use litebox_broker_protocol::fs::{
-    FileDirectoryEntry, FileMode as Mode, FileStatus, FileType, FileUser as UserInfo,
-};
 use litebox_platform::sync;
 
-use super::NodeInfo;
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
     ReadError, RmdirError, TruncateError, UnlinkError, WriteError,
 };
 use super::inode_allocator::InodeAllocator;
+use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, UserInfo};
 
 /// A [`super::backend::Backend`] that stores all files in memory.
 ///
@@ -382,7 +379,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
     fn list_dir_at(
         &self,
         handle: super::backend::DirHandle,
-    ) -> Result<Vec<FileDirectoryEntry>, ReadDirError> {
+    ) -> Result<Vec<DirEntry>, ReadDirError> {
         Ok(handle
             .into_typed::<Self>()
             .dir
@@ -394,7 +391,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                     Node::File(file) => (FileType::RegularFile, file.read().node_info),
                     Node::Dir(dir) => (FileType::Directory, dir.read().node_info),
                 };
-                FileDirectoryEntry {
+                DirEntry {
                     name: name.clone(),
                     file_type,
                     node_info: Some(node_info),

@@ -8,16 +8,13 @@
 //! descriptor table involved: the semantics under test are owned by broker core.
 
 use alloc::borrow::Cow;
-use litebox_broker_protocol::fs::{
-    FileMode as Mode, FileSeekWhence as SeekWhence, FileType, FileUser as UserInfo,
-};
 
-use super::OFlags;
 use super::in_mem::InMem;
 use super::inode_allocator::InodeAllocator;
 use super::overlay::Overlay;
 use super::tar_ro::TarRo;
 use super::test_support::{Fs, ROOT, USER, UnservicedStdio};
+use super::{FileType, Mode, OFlags, SeekWhence, UserInfo};
 use crate::test_platform::TestPlatform;
 
 const TEST_TAR_FILE: &[u8] = include_bytes!("./test.tar");

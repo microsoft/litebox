@@ -20,9 +20,6 @@ use alloc::vec::Vec;
 
 use hashbrown::{HashMap, HashSet};
 
-use litebox_broker_protocol::fs::{
-    FileDirectoryEntry, FileMode as Mode, FileStatus, FileType, FileUser as UserInfo,
-};
 use litebox_platform::sync::{Mutex, MutexGuard, RawSyncPrimitivesProvider};
 
 use super::backend::{
@@ -35,7 +32,7 @@ use super::errors::{
     ReadError, RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::inode_allocator::InodeAllocator;
-use super::{NodeInfo, OFlags};
+use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
 
 /// The reserved namespace prefix; no overlay-visible name may start with it.
 const MARKER_PREFIX: &str = ".litebox-overlay-";
@@ -120,7 +117,7 @@ struct ResolvedDir {
 /// An overlay-visible directory entry, plus which layers contribute to it.
 struct ResolvedEntry {
     /// The entry as reported by the layer that owns it.
-    entry: FileDirectoryEntry,
+    entry: DirEntry,
     upper: bool,
     /// The highest-precedence lower backend with an entry of this name, if any.
     lower: Option<usize>,
@@ -890,10 +887,10 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         })
     }
 
-    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<FileDirectoryEntry>, ReadDirError> {
+    fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError> {
         let path = handle.into_typed::<Self>().path;
         let resolved = self.resolve_dir(&path).map_err(|_| ReadDirError::Io)?;
-        let mut entries: Vec<FileDirectoryEntry> = resolved
+        let mut entries: Vec<DirEntry> = resolved
             .entries
             .into_values()
             .map(|entry| entry.entry)

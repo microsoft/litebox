@@ -3,26 +3,21 @@
 
 //! Path management, permission checks, and open-state operations above [`super::backend`].
 
-use alloc::string::String;
-use alloc::vec;
-use alloc::vec::Vec;
-use core::marker::PhantomData;
-use litebox_broker_protocol::fs::{
-    FileDirectoryEntry, FileMode as Mode, FileSeekWhence as SeekWhence, FileStatus, FileType,
-    FileUser as UserInfo,
-};
-
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
     ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::{
-    OFlags,
+    DirEntry, FileStatus, FileType, Mode, OFlags, SeekWhence, UserInfo,
     backend::{
         CreationMetadata, DeviceIo, DirHandle, Handle, HandleRef, PermissionCheck, PermissionInfo,
         Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkingDirHandle,
     },
 };
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::marker::PhantomData;
 
 /// The broker-core filesystem resolver, generic over its synchronization platform and
 /// [`Backend`](super::backend::Backend).
@@ -921,10 +916,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     /// Read directory entries from a directory file descriptor.
     ///
     /// Returns a list of file/directory names including synthesized `.` and `..` entries.
-    pub fn read_dir(
-        &self,
-        entry: &ResolverEntry<Backend>,
-    ) -> Result<Vec<FileDirectoryEntry>, ReadDirError> {
+    pub fn read_dir(&self, entry: &ResolverEntry<Backend>) -> Result<Vec<DirEntry>, ReadDirError> {
         if entry.path_only {
             // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
             unimplemented!("read_dir on O_PATH fd")
@@ -936,12 +928,12 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
 
         let mut entries = Vec::new();
         // TODO(jayb): Fill in inode info for synthesized dot entries.
-        entries.push(FileDirectoryEntry {
+        entries.push(DirEntry {
             name: String::from("."),
             file_type: FileType::Directory,
             node_info: None,
         });
-        entries.push(FileDirectoryEntry {
+        entries.push(DirEntry {
             name: String::from(".."),
             file_type: FileType::Directory,
             node_info: None,

@@ -29,7 +29,10 @@ mod test_support;
 #[cfg(test)]
 mod tests;
 
-pub use litebox_broker_protocol::fs::FileNodeInfo as NodeInfo;
+pub use litebox_broker_protocol::fs::{
+    FileDirectoryEntry as DirEntry, FileMode as Mode, FileNodeInfo as NodeInfo,
+    FileSeekWhence as SeekWhence, FileStatus, FileType, FileUser as UserInfo,
+};
 pub(crate) use service::File;
 pub use service::{
     FileResult, FileService, UnsupportedFileService, chmod, chown, handle_status, mkdir, open,
