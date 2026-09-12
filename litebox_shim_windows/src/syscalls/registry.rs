@@ -88,6 +88,10 @@ pub(crate) struct RegistryStore<Platform: crate::ShimPlatform> {
 
 /// Reserved backing-store directory that contains a registry key's value files.
 const VALUES_DIR_NAME: &str = ".values";
+/// NT object-manager root accepted by registry syscalls.
+const REGISTRY_NT_ROOT: &str = r"\Registry";
+/// Broker filesystem subtree reserved for registry storage.
+pub(crate) const REGISTRY_FS_ROOT: &str = "/registry";
 const DEFAULT_CODE_PAGE_KEY: &str =
     "\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Nls\\CodePage";
 const DEFAULT_SESSION_MANAGER_KEY: &str =
@@ -632,6 +636,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         path: &str,
         desired_access: RegistryKeyAccess,
     ) -> Result<litebox::fs::FileFd, NtStatus> {
+        validate_registry_backing_path(path)?;
         let (access, flags) = desired_access.open_flags();
         self.fs()
             .open_file(&self.fs_context, path, access, flags, Mode::empty())
@@ -2202,11 +2207,20 @@ fn default_winsock_protocol_catalog_item(protocol: &DefaultWinsockProtocol) -> V
 }
 
 fn absolute_nt_key_name_to_fs_path(name: &str) -> Result<String, NtStatus> {
-    if !name.starts_with('\\') {
+    let Some(name) = name.strip_prefix('\\') else {
+        return Err(NtStatus::INVALID_PARAMETER);
+    };
+    let (root, remaining) = name
+        .split_once('\\')
+        .map_or((name, None), |(root, remaining)| (root, Some(remaining)));
+    if !root.eq_ignore_ascii_case(REGISTRY_NT_ROOT.trim_start_matches('\\')) {
         return Err(NtStatus::INVALID_PARAMETER);
     }
-    let mut path = String::from("/");
-    append_registry_components(&mut path, name.trim_start_matches('\\'))?;
+
+    let mut path = String::from(REGISTRY_FS_ROOT);
+    if let Some(remaining) = remaining {
+        append_registry_components(&mut path, remaining)?;
+    }
     Ok(path)
 }
 
@@ -2214,9 +2228,58 @@ fn relative_nt_key_name_to_fs_path(root: &str, name: &str) -> Result<String, NtS
     if name.starts_with('\\') {
         return absolute_nt_key_name_to_fs_path(name);
     }
+    validate_registry_backing_path(root)?;
     let mut path = String::from(root);
     append_registry_components(&mut path, name)?;
     Ok(path)
+}
+
+/// Returns whether broker path normalization places `path` in the registry subtree.
+pub(crate) fn is_registry_backing_path(path: &str) -> bool {
+    if !path.starts_with('/') {
+        return false;
+    }
+
+    // Walk backwards to account for `..` without allocating a normalized path.
+    let mut parent_components = 0usize;
+    let mut first_component = None;
+    for component in path.split('/').rev() {
+        match component {
+            "" | "." => {}
+            ".." => {
+                parent_components = parent_components.saturating_add(1);
+            }
+            _ if parent_components != 0 => {
+                parent_components -= 1;
+            }
+            _ => first_component = Some(component),
+        }
+    }
+
+    first_component.is_some_and(|component| {
+        component.eq_ignore_ascii_case(REGISTRY_FS_ROOT.trim_start_matches('/'))
+    })
+}
+
+fn validate_registry_backing_path(path: &str) -> Result<(), NtStatus> {
+    let Some(path) = path.strip_prefix('/') else {
+        return Err(NtStatus::INVALID_PARAMETER);
+    };
+    let mut components = path.split('/');
+    let Some(root) = components.next() else {
+        return Err(NtStatus::INVALID_PARAMETER);
+    };
+    if !root.eq_ignore_ascii_case(REGISTRY_FS_ROOT.trim_start_matches('/'))
+        || components.any(|component| {
+            component.is_empty()
+                || component == "."
+                || component == ".."
+                || component.contains('\\')
+        })
+    {
+        return Err(NtStatus::INVALID_PARAMETER);
+    }
+    Ok(())
 }
 
 fn append_registry_components(path: &mut String, name: &str) -> Result<(), NtStatus> {
@@ -2334,6 +2397,7 @@ fn create_key_path_in_fs<Platform: crate::ShimPlatform>(
     context: &litebox::fs::Context,
     path: &str,
 ) -> Result<Vec<String>, NtStatus> {
+    validate_registry_backing_path(path)?;
     let mut current = String::new();
     let mut created_keys = Vec::new();
     for component in path.trim_start_matches('/').split('/') {
@@ -2381,6 +2445,7 @@ fn ensure_directory_in_fs<Platform: crate::ShimPlatform>(
 }
 
 fn value_path(key_path: &str, value_name: &str) -> Result<String, NtStatus> {
+    validate_registry_backing_path(key_path)?;
     if !is_valid_value_name(value_name) {
         return Err(NtStatus::INVALID_PARAMETER);
     }
@@ -2551,7 +2616,7 @@ mod tests {
                     },
                 ),
                 (
-                    "/registry".into(),
+                    REGISTRY_FS_ROOT.into(),
                     litebox_broker_core::fs::in_mem::InitialNode::Directory {
                         mode,
                         owner: FileUser::ROOT,
@@ -2561,6 +2626,82 @@ mod tests {
         ));
         let registry = RegistryStore::new(Arc::clone(&litebox));
         (litebox, registry)
+    }
+
+    #[test]
+    fn registry_paths_are_confined_to_the_reserved_backing_root() {
+        assert_eq!(
+            absolute_nt_key_name_to_fs_path(r"\Registry").unwrap(),
+            REGISTRY_FS_ROOT
+        );
+        assert_eq!(
+            absolute_nt_key_name_to_fs_path(r"\REGISTRY\Machine\Software").unwrap(),
+            "/registry/machine/software"
+        );
+        assert_eq!(
+            relative_nt_key_name_to_fs_path("/registry/machine", r"Software\LiteBox").unwrap(),
+            "/registry/machine/software/litebox"
+        );
+
+        for path in [
+            "",
+            "Registry",
+            r"\\Registry",
+            r"\Machine",
+            r"\RegistrySibling",
+            r"\Registry\",
+            r"\Registry\.",
+            r"\Registry\..",
+            r"\Registry\Machine//Software",
+        ] {
+            assert_eq!(
+                absolute_nt_key_name_to_fs_path(path),
+                Err(NtStatus::INVALID_PARAMETER),
+                "{path}"
+            );
+        }
+        assert_eq!(
+            relative_nt_key_name_to_fs_path("/tmp", "child"),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+        assert_eq!(
+            value_path("/tmp", "value"),
+            Err(NtStatus::INVALID_PARAMETER)
+        );
+        for path in ["/tmp/../registry", "/registry/../tmp", "/registry//machine"] {
+            assert_eq!(
+                validate_registry_backing_path(path),
+                Err(NtStatus::INVALID_PARAMETER),
+                "{path}"
+            );
+        }
+
+        for path in [
+            "/registry",
+            "/Registry/machine",
+            "//registry/machine",
+            "/tmp/../registry/machine",
+        ] {
+            assert!(is_registry_backing_path(path), "{path}");
+        }
+        for path in ["/", "/tmp", "/registry-sibling", "/tmp/registry"] {
+            assert!(!is_registry_backing_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn registry_syscalls_reject_non_registry_absolute_roots() {
+        let task = crate::tests::test_task_with_broker_files(&[]);
+        for path in [r"\Machine\Software", r"\RegistrySibling\Software"] {
+            let path_utf16 = utf16(path);
+            let path_name = unicode_string(&path_utf16);
+            let object_attributes = object_attributes(&path_name, 0);
+            assert_eq!(
+                task.do_nt_open_key(RegistryKeyAccess::READ.bits(), object_attributes),
+                Err(NtStatus::INVALID_PARAMETER),
+                "{path}"
+            );
+        }
     }
 
     fn open_key(

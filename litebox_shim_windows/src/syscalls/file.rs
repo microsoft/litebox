@@ -1981,6 +1981,10 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                 continue;
             }
             let path = child_path(&file.path, &entry.name);
+            // Registry storage shares the broker filesystem but not the Windows file namespace.
+            if crate::syscalls::registry::is_registry_backing_path(&path) {
+                continue;
+            }
             let status = self
                 .fs
                 .path_file_status(&self.fs_context, path)
@@ -2866,6 +2870,90 @@ mod tests {
             NtStatus::SUCCESS
         );
         handle
+    }
+
+    #[test]
+    fn regular_file_namespace_rejects_and_hides_the_registry_store() {
+        run_with_test_platform_pointers(|| {
+            let task = crate::tests::test_task_with_broker_files(&[]);
+
+            for path in [
+                "/registry",
+                "/REGISTRY/machine",
+                r"\??\C:\registry\machine",
+                r"\Device\HarddiskVolume1\Registry",
+            ] {
+                assert_eq!(
+                    create_file(&task, path, FILE_GENERIC_READ, FILE_OPEN).0,
+                    NtStatus::OBJECT_PATH_NOT_FOUND,
+                    "{path}"
+                );
+            }
+            assert_eq!(
+                create_file(
+                    &task,
+                    "/registry/created-by-file-api",
+                    FILE_GENERIC_WRITE,
+                    FILE_CREATE
+                )
+                .0,
+                NtStatus::OBJECT_PATH_NOT_FOUND
+            );
+
+            let (_path, _name, query_attributes) = open_object_attributes("/registry");
+            let mut basic_information = FileBasicInformation::default();
+            assert_eq!(
+                task.sys_nt_query_attributes_file(
+                    Some(const_ptr(&query_attributes)),
+                    mut_ptr(&mut basic_information),
+                ),
+                NtStatus::OBJECT_PATH_NOT_FOUND
+            );
+
+            let root = open_fs_root(&task);
+            let (_path, _name, mut relative_attributes) = open_object_attributes("registry");
+            relative_attributes.root_directory = root;
+            let mut handle = Handle::default();
+            let mut io_status = IoStatusBlock::default();
+            assert_eq!(
+                task.sys_nt_open_file(
+                    mut_ptr(&mut handle),
+                    FILE_GENERIC_READ,
+                    Some(const_ptr(&relative_attributes)),
+                    mut_ptr(&mut io_status),
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    (FileCreateOptions::DIRECTORY_FILE
+                        | FileCreateOptions::SYNCHRONOUS_IO_NONALERT)
+                        .bits(),
+                ),
+                NtStatus::OBJECT_PATH_NOT_FOUND
+            );
+
+            let mut output = [0; 1024];
+            assert_eq!(
+                query_directory(
+                    &task,
+                    root,
+                    FileInformationClass::FileNamesInformation,
+                    DirectoryQueryFlags::RESTART_SCAN,
+                    None,
+                    &mut io_status,
+                    &mut output,
+                ),
+                NtStatus::SUCCESS
+            );
+            let names = directory_record_names(
+                &output,
+                FileInformationClass::FileNamesInformation,
+                io_status.information,
+            );
+            assert!(
+                names
+                    .iter()
+                    .all(|name| !name.eq_ignore_ascii_case("registry")),
+                "{names:?}"
+            );
+        });
     }
 
     fn open_ksecdd(task: &Task<TestPlatform>, desired_access: u32) -> Handle {

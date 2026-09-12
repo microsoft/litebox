@@ -1111,6 +1111,13 @@ struct PeImageFile<Platform: crate::ShimPlatform> {
 
 impl<Platform: crate::ShimPlatform> PeImageFile<Platform> {
     fn open(fs: Arc<litebox::LiteBox<Platform>>, path: &str) -> Result<Self, PeImageAccessError> {
+        // PE loading bypasses FilePathResolver, so enforce its namespace reservation here too.
+        if crate::syscalls::registry::is_registry_backing_path(path) {
+            return Err(litebox::fs::errors::OpenError::PathError(
+                litebox::fs::errors::PathError::InvalidPathname,
+            )
+            .into());
+        }
         let fd = fs.open_file(
             &litebox::fs::Context::new(),
             path,
@@ -1569,6 +1576,24 @@ fn utf16_byte_len(units: usize) -> Result<u16, PeImageAccessError> {
         .checked_mul(core::mem::size_of::<u16>())
         .and_then(|bytes| u16::try_from(bytes).ok())
         .ok_or(PeImageAccessError::AddressOverflow)
+}
+
+#[cfg(test)]
+mod backing_path_tests {
+    use super::*;
+
+    #[test]
+    fn pe_images_cannot_use_the_registry_backing_store() {
+        let fs = Arc::new(crate::test_broker::litebox(crate::tests::test_platform()));
+        assert!(matches!(
+            PeImageFile::open(fs, "/tmp/../registry/machine/value"),
+            Err(PeImageAccessError::Open(
+                litebox::fs::errors::OpenError::PathError(
+                    litebox::fs::errors::PathError::InvalidPathname
+                )
+            ))
+        ));
+    }
 }
 
 #[cfg(all(test, target_os = "windows", target_arch = "x86_64"))]

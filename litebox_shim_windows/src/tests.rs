@@ -137,7 +137,10 @@ pub(crate) fn test_task_with_broker_files(files: &[(&str, &[u8])]) -> Task<TestP
                 group: 1000,
             }),
         ),
-        ("/registry".into(), directory(UserInfo::ROOT)),
+        (
+            crate::syscalls::registry::REGISTRY_FS_ROOT.into(),
+            directory(UserInfo::ROOT),
+        ),
     ];
     if !files.is_empty() {
         entries.extend([
