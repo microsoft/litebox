@@ -30,7 +30,7 @@ pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
     let policy = PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()).with_socket_policy(
         configured_socket_policy(&args.allow_tcp_destination, &args.allow_udp_destination)?,
     );
-    let fs = super::fs::create_file_service::<WindowsSyncPrimitivesProvider>(
+    let fs = super::create_file_service::<WindowsSyncPrimitivesProvider>(
         args.fs_initial_files.as_deref(),
     )?;
     let broker = BrokerCoreBuilder::new(policy)

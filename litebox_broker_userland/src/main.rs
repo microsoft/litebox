@@ -1,24 +1,33 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use std::borrow::Cow;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+use litebox_broker_core::fs::FileService;
+use litebox_broker_core::fs::composer::Composer;
+use litebox_broker_core::fs::in_mem::{InMem, InitialNode};
+use litebox_broker_core::fs::overlay::Overlay;
+use litebox_broker_core::fs::resolver::Resolver;
+use litebox_broker_core::fs::tar_ro::{EMPTY_TAR_FILE, TarRo};
 use litebox_broker_core::{
     CallerCredential, DestinationPortRange, DestinationRule, Ipv4Cidr, SocketPolicy,
     SocketPolicyError,
 };
+use litebox_broker_protocol::fs::{FileMode as Mode, FileUser as UserInfo};
 use litebox_broker_protocol::socket::{Ipv4Address, Port};
+use litebox_platform::sync::RawSyncPrimitivesProvider;
 
-mod fs;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(all(windows, target_arch = "x86_64"))]
@@ -113,6 +122,46 @@ struct CliArgs {
     /// Opaque arguments to pass to the local runner without interpretation.
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true, value_hint = clap::ValueHint::CommandWithArguments)]
     runner_arguments: Vec<OsString>,
+}
+
+fn create_file_service<Platform>(initial_files: Option<&Path>) -> IoResult<Arc<dyn FileService>>
+where
+    Platform: RawSyncPrimitivesProvider,
+{
+    let writable_directory = |owner| InitialNode::Directory {
+        mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+        owner,
+    };
+    let entries = vec![
+        ("/tmp".to_owned(), writable_directory(UserInfo::ROOT)),
+        ("/registry".to_owned(), writable_directory(UserInfo::ROOT)),
+    ];
+
+    let tar_data = match initial_files {
+        Some(path) => {
+            if path.extension().and_then(|extension| extension.to_str()) != Some("tar") {
+                return Err(IoError::new(
+                    ErrorKind::InvalidInput,
+                    format!("expected a .tar file, found {}", path.display()),
+                ));
+            }
+            Cow::Owned(std::fs::read(path)?)
+        }
+        None => Cow::Borrowed(EMPTY_TAR_FILE),
+    };
+    let in_mem = InMem::<Platform>::new_initialized(entries);
+    let backend = Composer::builder()
+        .mount_nestable("/", |allocators| {
+            Overlay::<Platform>::new(
+                in_mem,
+                TarRo::new(tar_data, allocators.next()),
+                allocators.next(),
+            )
+        })
+        .mount("/dev", litebox_broker_core::fs::devices::Devices::new)
+        .build()
+        .map_err(|_| IoError::other("failed to construct broker file service"))?;
+    Ok(Arc::new(Resolver::<Platform, _>::new(backend)))
 }
 
 fn runner_command_arguments(
