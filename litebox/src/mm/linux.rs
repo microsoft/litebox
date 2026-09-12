@@ -894,11 +894,15 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             return None;
         }
         if let Some(suggested_address) = suggested_address {
-            if (Platform::TASK_ADDR_MAX - size) < suggested_address.0 {
-                return None;
+            if fixed_addr {
+                if (Platform::TASK_ADDR_MAX - size) < suggested_address.0 {
+                    return None;
+                }
+                return Some(suggested_address.0);
             }
-            if fixed_addr
-                || !self
+            if suggested_address.0 >= Platform::TASK_ADDR_MIN
+                && suggested_address.0 <= Platform::TASK_ADDR_MAX - size
+                && !self
                     .vmas
                     .overlaps(&(suggested_address.0..(suggested_address.0 + size)))
             {

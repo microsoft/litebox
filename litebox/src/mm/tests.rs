@@ -273,6 +273,56 @@ fn test_vmm_mapping() {
         ]
     );
 
+    // A nonfixed hint below TASK_ADDR_MIN must be ignored.
+    assert_eq!(
+        unsafe {
+            vmm.create_mapping(
+                Some(NonZeroAddress::new(DummyVmemBackend::TASK_ADDR_MIN - PAGE_SIZE).unwrap()),
+                NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+                VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD, false),
+                CreatePagesFlags::empty(),
+            )
+        }
+        .unwrap()
+        .as_usize(),
+        DummyVmemBackend::TASK_ADDR_MAX - 2 * PAGE_SIZE,
+    );
+    assert_eq!(
+        collect_mappings(&vmm),
+        vec![
+            start_addr..start_addr + PAGE_SIZE,
+            start_addr + PAGE_SIZE..start_addr + 2 * PAGE_SIZE,
+            start_addr + 4 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE,
+            start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE,
+            DummyVmemBackend::TASK_ADDR_MAX - 2 * PAGE_SIZE..DummyVmemBackend::TASK_ADDR_MAX,
+        ]
+    );
+
+    // A nonfixed hint whose range exceeds TASK_ADDR_MAX must be ignored.
+    assert_eq!(
+        unsafe {
+            vmm.create_mapping(
+                Some(NonZeroAddress::new(DummyVmemBackend::TASK_ADDR_MAX - PAGE_SIZE).unwrap()),
+                NonZeroPageSize::new(2 * PAGE_SIZE).unwrap(),
+                VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD, false),
+                CreatePagesFlags::empty(),
+            )
+        }
+        .unwrap()
+        .as_usize(),
+        DummyVmemBackend::TASK_ADDR_MAX - 4 * PAGE_SIZE,
+    );
+    assert_eq!(
+        collect_mappings(&vmm),
+        vec![
+            start_addr..start_addr + PAGE_SIZE,
+            start_addr + PAGE_SIZE..start_addr + 2 * PAGE_SIZE,
+            start_addr + 4 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE,
+            start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE,
+            DummyVmemBackend::TASK_ADDR_MAX - 4 * PAGE_SIZE..DummyVmemBackend::TASK_ADDR_MAX,
+        ]
+    );
+
     // shrink mapping
     assert!(
         unsafe {
@@ -291,7 +341,7 @@ fn test_vmm_mapping() {
             start_addr + 4 * PAGE_SIZE..start_addr + 6 * PAGE_SIZE,
             start_addr + 8 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE,
             start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE,
-            DummyVmemBackend::TASK_ADDR_MAX - PAGE_SIZE..DummyVmemBackend::TASK_ADDR_MAX,
+            DummyVmemBackend::TASK_ADDR_MAX - 4 * PAGE_SIZE..DummyVmemBackend::TASK_ADDR_MAX,
         ]
     );
 }
