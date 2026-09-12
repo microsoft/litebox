@@ -64,6 +64,8 @@ use spin::mutex::SpinMutex;
 
 mod error;
 pub mod readiness;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 
 pub use error::{BrokerHostError, Result};
 

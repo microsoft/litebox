@@ -3,6 +3,9 @@ name = "litebox_broker_host"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+test-support = []
+
 [dependencies]
 hashbrown = "0.15.2"
 litebox_broker_core = { path = "../litebox_broker_core", version = "0.1.0" }
