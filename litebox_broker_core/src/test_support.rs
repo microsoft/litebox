@@ -5,12 +5,14 @@
 
 use alloc::sync::Arc;
 
+use litebox_broker_protocol::stdio::{StdioOutputStream, StdioStream};
+
 use crate::{
-    BrokerCore, BrokerCoreLimits, PolicyEngine, Result,
+    AssociationCancellation, BrokerCore, BrokerCoreLimits, PolicyEngine, Result,
     fs::{FileService, UnsupportedFileService},
     random::{RandomProvider, RandomProviderError},
     socket::{SocketProvider, UnsupportedSocketProvider},
-    stdio::{StdioProvider, UnsupportedStdioProvider},
+    stdio::{StdioProvider, StdioProviderError, UnsupportedStdioProvider},
 };
 
 /// Builder for a test broker core with strict providers that reject unexpected operations.
@@ -94,5 +96,56 @@ struct FailingRandomProvider;
 impl RandomProvider for FailingRandomProvider {
     fn fill(&self, _output: &mut [u8]) -> core::result::Result<(), RandomProviderError> {
         Err(RandomProviderError)
+    }
+}
+
+/// Standard-I/O provider for tests that only exercise terminal detection.
+///
+/// Reads and writes panic so tests cannot accidentally use this as a functional
+/// standard-I/O implementation.
+#[derive(Default)]
+pub struct TerminalOnlyStdioProvider {
+    stdin_terminal: bool,
+    stdout_terminal: bool,
+    stderr_terminal: bool,
+}
+
+impl TerminalOnlyStdioProvider {
+    /// Marks `stream` as connected to a terminal.
+    #[must_use]
+    pub const fn with_terminal(mut self, stream: StdioStream) -> Self {
+        match stream {
+            StdioStream::Stdin => self.stdin_terminal = true,
+            StdioStream::Stdout => self.stdout_terminal = true,
+            StdioStream::Stderr => self.stderr_terminal = true,
+        }
+        self
+    }
+}
+
+impl StdioProvider for TerminalOnlyStdioProvider {
+    fn read(
+        &self,
+        _cancellation: &AssociationCancellation,
+        _output: &mut [u8],
+    ) -> core::result::Result<usize, StdioProviderError> {
+        panic!("terminal-only test stdio must not read standard input")
+    }
+
+    fn write(
+        &self,
+        _cancellation: &AssociationCancellation,
+        _stream: StdioOutputStream,
+        _input: &[u8],
+    ) -> core::result::Result<usize, StdioProviderError> {
+        panic!("terminal-only test stdio must not write standard output")
+    }
+
+    fn is_terminal(&self, stream: StdioStream) -> core::result::Result<bool, StdioProviderError> {
+        Ok(match stream {
+            StdioStream::Stdin => self.stdin_terminal,
+            StdioStream::Stdout => self.stdout_terminal,
+            StdioStream::Stderr => self.stderr_terminal,
+        })
     }
 }

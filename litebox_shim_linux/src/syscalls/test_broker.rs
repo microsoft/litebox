@@ -14,14 +14,13 @@ use std::sync::OnceLock;
 use litebox_broker_core::{
     BrokerCore, BrokerCoreLimits, ObjectRights, PolicyEngine,
     fs::{in_mem::InitialNode, resolver::Resolver},
-    stdio::{StdioProvider, StdioProviderError},
-    test_support::TestBrokerCoreBuilder,
+    test_support::{TerminalOnlyStdioProvider, TestBrokerCoreBuilder},
 };
 use litebox_broker_host::test_support::InProcessBrokerSetup;
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::{
     fs::{FileMode, FileUser},
-    stdio::{StdioOutputStream, StdioStream},
+    stdio::StdioStream,
 };
 
 use crate::syscalls::tests::TestPlatform;
@@ -65,34 +64,11 @@ fn test_broker() -> &'static BrokerCore {
             MAX_TEST_BROKER_REFERENCES,
             BrokerCoreLimits::DEFAULT.max_total_pipe_capacity,
         ))
-        .with_stdio_provider(Arc::new(TestStdioProvider))
+        .with_stdio_provider(Arc::new(
+            TerminalOnlyStdioProvider::default().with_terminal(StdioStream::Stdout),
+        ))
         .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)))
         .build()
         .expect("a test process may build only one broker core")
     })
-}
-
-struct TestStdioProvider;
-
-impl StdioProvider for TestStdioProvider {
-    fn read(
-        &self,
-        _cancellation: &litebox_broker_core::AssociationCancellation,
-        _output: &mut [u8],
-    ) -> core::result::Result<usize, StdioProviderError> {
-        panic!("Linux shim unit tests must not read host standard input")
-    }
-
-    fn write(
-        &self,
-        _cancellation: &litebox_broker_core::AssociationCancellation,
-        _stream: StdioOutputStream,
-        _input: &[u8],
-    ) -> core::result::Result<usize, StdioProviderError> {
-        panic!("Linux shim unit tests must not write host standard output")
-    }
-
-    fn is_terminal(&self, stream: StdioStream) -> core::result::Result<bool, StdioProviderError> {
-        Ok(stream == StdioStream::Stdout)
-    }
 }
