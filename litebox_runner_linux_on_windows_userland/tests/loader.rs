@@ -240,15 +240,11 @@ fn run_prog_with_windows_broker(
     tar.finish().unwrap();
     drop(tar);
 
-    let mut arguments = Vec::new();
+    let mut arguments: Vec<std::ffi::OsString> = Vec::new();
     if !libs.is_empty() {
         arguments.extend(["--env".into(), "LD_LIBRARY_PATH=/lib64:/lib32:/lib".into()]);
     }
-    arguments.extend([
-        "--initial-files".into(),
-        tar_path.clone().into_os_string(),
-        format!("/{exec_path}").into(),
-    ]);
+    arguments.push(format!("/{exec_path}").into());
     let status = std::process::Command::new(broker)
         .arg("--fs-initial-files")
         .arg(&tar_path)
@@ -357,15 +353,13 @@ fn run_dynamic_linked_prog_with_rewriter(
     // The program path refers to the tar-internal path.
     let prog_tar_path = format!("/bin/{prog_name_hooked}");
 
-    // Run litebox_runner_linux_on_windows_userland with the tar file
+    // Run litebox_runner_linux_on_windows_userland with the broker-owned file system.
     let mut args = vec![
         // Tell ld where to find the libraries.
         // See https://man7.org/linux/man-pages/man8/ld.so.8.html for how ld works.
         // Alternatively, we could add a `/etc/ld.so.cache` file to the rootfs.
         "--env",
         "LD_LIBRARY_PATH=/lib64:/lib32:/lib",
-        "--initial-files",
-        tar_target_file.to_str().unwrap(),
     ];
     args.push(&prog_tar_path);
     args.extend_from_slice(cmd_args);

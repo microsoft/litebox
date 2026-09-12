@@ -83,7 +83,6 @@ impl Runner {
             "LD_LIBRARY_PATH=/lib64:/lib32:/lib",
             "--env",
             "HOME=/",
-            "--program-from-tar",
         ]);
 
         Self {
@@ -188,11 +187,7 @@ impl Runner {
         assert!(tar_success, "failed to create tar file");
         println!("Tar file ready at: {}", tar_file.to_str().unwrap());
 
-        self.command
-            .arg("--initial-files")
-            .arg(&tar_file)
-            .arg(&self.cmd_path)
-            .args(&self.cmd_args);
+        self.command.arg(&self.cmd_path).args(&self.cmd_args);
 
         #[cfg(target_os = "linux")]
         if self.use_userland_broker || !self.managed_proxy_hosts.is_empty() {
