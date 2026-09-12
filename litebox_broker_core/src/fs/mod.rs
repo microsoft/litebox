@@ -26,6 +26,9 @@ pub mod resolver;
 mod service;
 pub mod tar_ro;
 
+#[cfg(test)]
+mod tests;
+
 pub(crate) use service::File;
 pub use service::{
     FileResult, FileService, UnsupportedFileService, chmod, chown, handle_status, mkdir, open,

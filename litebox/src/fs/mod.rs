@@ -83,12 +83,6 @@ pub mod in_mem {
 }
 
 #[doc(hidden)]
-#[cfg(test)]
-pub(crate) mod inode_allocator {
-    pub(crate) use litebox_broker_core::fs::inode_allocator::*;
-}
-
-#[doc(hidden)]
 pub mod nine_p {
     pub use litebox_broker_core::fs::nine_p::*;
 }
@@ -105,10 +99,6 @@ pub mod tar_ro {
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(all(test, target_os = "linux"))]
-#[path = "nine_p/tests.rs"]
-mod nine_p_tests;
 
 bitflags! {
     /// `S_I*` constants for open, ...
