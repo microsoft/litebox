@@ -28,12 +28,10 @@ use core::mem::{offset_of, size_of};
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
-use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
 use int_enum::IntEnum;
-use litebox::LiteBox;
 use litebox::event::{
     Events,
     polling::{Pollee, TryOpError},
@@ -49,6 +47,7 @@ use litebox_broker_protocol::fs::{FileAccessMode, FileMode as Mode, FileOpenFlag
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
+use crate::fs::{Fs, REGISTRY_ROOT};
 use crate::syscalls::Handle;
 use crate::{ConstPtr, MutPtr, Task, probe_guest_output_preserving_value, raw_handle_entry};
 
@@ -75,7 +74,7 @@ pub(crate) struct RegistryKeyObject {
 }
 
 pub(crate) struct RegistryStore<Platform: crate::ShimPlatform> {
-    fs: Arc<LiteBox<Platform>>,
+    fs: Fs<Platform>,
     fs_context: litebox::fs::Context,
     /// Whether the built-in keys and values have been written to [`Self::fs`].
     ///
@@ -90,8 +89,6 @@ pub(crate) struct RegistryStore<Platform: crate::ShimPlatform> {
 const VALUES_DIR_NAME: &str = ".values";
 /// NT object-manager root accepted by registry syscalls.
 const REGISTRY_NT_ROOT: &str = r"\Registry";
-/// Broker filesystem subtree reserved for registry storage.
-pub(crate) const REGISTRY_FS_ROOT: &str = "/registry";
 const DEFAULT_CODE_PAGE_KEY: &str =
     "\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Nls\\CodePage";
 const DEFAULT_SESSION_MANAGER_KEY: &str =
@@ -605,9 +602,9 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
     ///
     /// Construction performs no file operation: the built-in keys and values are
     /// seeded lazily by [`Self::fs`] when the guest first uses the registry.
-    pub(crate) fn new(litebox: Arc<LiteBox<Platform>>) -> Self {
+    pub(crate) fn new(fs: Fs<Platform>) -> Self {
         Self {
-            fs: litebox,
+            fs,
             fs_context: litebox::fs::Context::new(),
             defaults_seeded: Mutex::new(false),
             notification_state: Mutex::new(RegistryNotificationState::default()),
@@ -620,7 +617,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
     /// Seeding is attempted exactly once. As at startup, a failure is logged and
     /// abandons the rest of the defaults rather than failing the operation that
     /// triggered it, so a store that cannot be seeded still answers requests.
-    fn fs(&self) -> &LiteBox<Platform> {
+    fn fs(&self) -> &Fs<Platform> {
         {
             let mut seeded = self.defaults_seeded.lock();
             if !*seeded {
@@ -628,7 +625,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
                 seed_defaults(&self.fs, &self.fs_context);
             }
         }
-        self.fs.as_ref()
+        &self.fs
     }
 
     fn open_key(
@@ -636,7 +633,6 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         path: &str,
         desired_access: RegistryKeyAccess,
     ) -> Result<litebox::fs::FileFd, NtStatus> {
-        validate_registry_backing_path(path)?;
         let (access, flags) = desired_access.open_flags();
         self.fs()
             .open_file(&self.fs_context, path, access, flags, Mode::empty())
@@ -651,7 +647,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         let value_path = value_path(key_path, value_name)?;
         let status = self
             .fs()
-            .path_file_status(&self.fs_context, &*value_path)
+            .path_file_status(&self.fs_context, &value_path)
             .map_err(map_file_status_error)?;
         if status.file_type != FileType::RegularFile {
             return Err(NtStatus::OBJECT_TYPE_MISMATCH);
@@ -669,7 +665,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
             .fs()
             .open_file(
                 &self.fs_context,
-                &*value_path,
+                &value_path,
                 FileAccessMode::ReadOnly,
                 FileOpenFlags::NONE,
                 Mode::empty(),
@@ -770,7 +766,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         let mut summary = KeySummary::default();
         for entry in self
             .fs()
-            .read_file_directory(&key.fd)
+            .read_file_directory(&key.path, &key.fd)
             .map_err(map_read_dir_error)?
         {
             if entry.file_type == FileType::Directory
@@ -790,7 +786,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
             .fs()
             .open_file(
                 &self.fs_context,
-                &*values_path,
+                &values_path,
                 FileAccessMode::ReadOnly,
                 FileOpenFlags::DIRECTORY,
                 Mode::empty(),
@@ -798,7 +794,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
             .map_err(map_open_error)?;
         let values = self
             .fs()
-            .read_file_directory(&values_fd)
+            .read_file_directory(&values_path, &values_fd)
             .map_err(map_read_dir_error);
         let _ = self.fs().close_file(&values_fd);
         for entry in values? {
@@ -812,7 +808,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
             let path = format!("{values_path}/{}", entry.name);
             let size = self
                 .fs()
-                .path_file_status(&self.fs_context, &*path)
+                .path_file_status(&self.fs_context, &path)
                 .map_err(map_file_status_error)?
                 .size;
             if size < REGISTRY_VALUE_TYPE_SIZE as u64 {
@@ -839,7 +835,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         let mut names = Vec::new();
         for entry in self
             .fs()
-            .read_file_directory(&key.fd)
+            .read_file_directory(&key.path, &key.fd)
             .map_err(map_read_dir_error)?
         {
             if entry.file_type == FileType::Directory
@@ -861,7 +857,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
             .fs()
             .open_file(
                 &self.fs_context,
-                &*child_path,
+                &child_path,
                 FileAccessMode::ReadOnly,
                 FileOpenFlags::DIRECTORY,
                 Mode::empty(),
@@ -892,7 +888,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
             .fs()
             .open_file(
                 &self.fs_context,
-                &*values_path,
+                &values_path,
                 FileAccessMode::ReadOnly,
                 FileOpenFlags::DIRECTORY,
                 Mode::empty(),
@@ -900,7 +896,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
             .map_err(map_open_error)?;
         let entries = self
             .fs()
-            .read_file_directory(&values_fd)
+            .read_file_directory(&values_path, &values_fd)
             .map_err(map_read_dir_error);
         let _ = self.fs().close_file(&values_fd);
         let mut names = Vec::new();
@@ -920,7 +916,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
 /// remaining defaults in that group, matching the behavior guests saw when the
 /// defaults were written during shim construction.
 fn seed_defaults<Platform: crate::ShimPlatform>(
-    fs: &LiteBox<Platform>,
+    fs: &Fs<Platform>,
     fs_context: &litebox::fs::Context,
 ) {
     for key in [
@@ -2217,7 +2213,7 @@ fn absolute_nt_key_name_to_fs_path(name: &str) -> Result<String, NtStatus> {
         return Err(NtStatus::INVALID_PARAMETER);
     }
 
-    let mut path = String::from(REGISTRY_FS_ROOT);
+    let mut path = String::from(REGISTRY_ROOT);
     if let Some(remaining) = remaining {
         append_registry_components(&mut path, remaining)?;
     }
@@ -2228,58 +2224,9 @@ fn relative_nt_key_name_to_fs_path(root: &str, name: &str) -> Result<String, NtS
     if name.starts_with('\\') {
         return absolute_nt_key_name_to_fs_path(name);
     }
-    validate_registry_backing_path(root)?;
     let mut path = String::from(root);
     append_registry_components(&mut path, name)?;
     Ok(path)
-}
-
-/// Returns whether broker path normalization places `path` in the registry subtree.
-pub(crate) fn is_registry_backing_path(path: &str) -> bool {
-    if !path.starts_with('/') {
-        return false;
-    }
-
-    // Walk backwards to account for `..` without allocating a normalized path.
-    let mut parent_components = 0usize;
-    let mut first_component = None;
-    for component in path.split('/').rev() {
-        match component {
-            "" | "." => {}
-            ".." => {
-                parent_components = parent_components.saturating_add(1);
-            }
-            _ if parent_components != 0 => {
-                parent_components -= 1;
-            }
-            _ => first_component = Some(component),
-        }
-    }
-
-    first_component.is_some_and(|component| {
-        component.eq_ignore_ascii_case(REGISTRY_FS_ROOT.trim_start_matches('/'))
-    })
-}
-
-fn validate_registry_backing_path(path: &str) -> Result<(), NtStatus> {
-    let Some(path) = path.strip_prefix('/') else {
-        return Err(NtStatus::INVALID_PARAMETER);
-    };
-    let mut components = path.split('/');
-    let Some(root) = components.next() else {
-        return Err(NtStatus::INVALID_PARAMETER);
-    };
-    if !root.eq_ignore_ascii_case(REGISTRY_FS_ROOT.trim_start_matches('/'))
-        || components.any(|component| {
-            component.is_empty()
-                || component == "."
-                || component == ".."
-                || component.contains('\\')
-        })
-    {
-        return Err(NtStatus::INVALID_PARAMETER);
-    }
-    Ok(())
 }
 
 fn append_registry_components(path: &mut String, name: &str) -> Result<(), NtStatus> {
@@ -2307,7 +2254,7 @@ fn is_valid_key_component(component: &str) -> bool {
 }
 
 fn write_value_in_fs<Platform: crate::ShimPlatform>(
-    fs: &LiteBox<Platform>,
+    fs: &Fs<Platform>,
     context: &litebox::fs::Context,
     key_nt_path: &str,
     value_name: &str,
@@ -2319,7 +2266,7 @@ fn write_value_in_fs<Platform: crate::ShimPlatform>(
 }
 
 fn write_value_at_path<Platform: crate::ShimPlatform>(
-    fs: &LiteBox<Platform>,
+    fs: &Fs<Platform>,
     context: &litebox::fs::Context,
     key_path: &str,
     value_name: &str,
@@ -2330,7 +2277,7 @@ fn write_value_at_path<Platform: crate::ShimPlatform>(
     let fd = fs
         .open_file(
             context,
-            &*value_path,
+            &value_path,
             FileAccessMode::WriteOnly,
             FileOpenFlags::CREATE | FileOpenFlags::TRUNCATE,
             Mode::RUSR | Mode::WUSR | Mode::ROTH | Mode::WOTH,
@@ -2345,7 +2292,7 @@ fn write_value_at_path<Platform: crate::ShimPlatform>(
 }
 
 fn read_exact_at<Platform: crate::ShimPlatform>(
-    fs: &LiteBox<Platform>,
+    fs: &Fs<Platform>,
     fd: &litebox::fs::FileFd,
     mut data: &mut [u8],
 ) -> Result<(), NtStatus> {
@@ -2364,7 +2311,7 @@ fn read_exact_at<Platform: crate::ShimPlatform>(
 }
 
 fn write_all_at<Platform: crate::ShimPlatform>(
-    fs: &LiteBox<Platform>,
+    fs: &Fs<Platform>,
     fd: &litebox::fs::FileFd,
     mut data: &[u8],
     mut offset: usize,
@@ -2383,7 +2330,7 @@ fn write_all_at<Platform: crate::ShimPlatform>(
 }
 
 fn create_key_in_fs<Platform: crate::ShimPlatform>(
-    fs: &LiteBox<Platform>,
+    fs: &Fs<Platform>,
     context: &litebox::fs::Context,
     nt_path: &str,
 ) -> Result<String, NtStatus> {
@@ -2393,11 +2340,10 @@ fn create_key_in_fs<Platform: crate::ShimPlatform>(
 }
 
 fn create_key_path_in_fs<Platform: crate::ShimPlatform>(
-    fs: &LiteBox<Platform>,
+    fs: &Fs<Platform>,
     context: &litebox::fs::Context,
     path: &str,
 ) -> Result<Vec<String>, NtStatus> {
-    validate_registry_backing_path(path)?;
     let mut current = String::new();
     let mut created_keys = Vec::new();
     for component in path.trim_start_matches('/').split('/') {
@@ -2419,7 +2365,7 @@ fn create_key_path_in_fs<Platform: crate::ShimPlatform>(
 }
 
 fn ensure_directory_in_fs<Platform: crate::ShimPlatform>(
-    fs: &LiteBox<Platform>,
+    fs: &Fs<Platform>,
     context: &litebox::fs::Context,
     path: &str,
 ) -> Result<bool, NtStatus> {
@@ -2445,7 +2391,6 @@ fn ensure_directory_in_fs<Platform: crate::ShimPlatform>(
 }
 
 fn value_path(key_path: &str, value_name: &str) -> Result<String, NtStatus> {
-    validate_registry_backing_path(key_path)?;
     if !is_valid_value_name(value_name) {
         return Err(NtStatus::INVALID_PARAMETER);
     }
@@ -2529,6 +2474,8 @@ fn map_read_dir_error(error: ReadDirError) -> NtStatus {
 
 #[cfg(test)]
 mod tests {
+    use alloc::sync::Arc;
+
     use crate::tests::{
         TestPlatform, const_ptr, mut_byte_ptr, mut_ptr, object_attributes, test_platform,
         unicode_string, utf16_units as utf16,
@@ -2616,7 +2563,7 @@ mod tests {
                     },
                 ),
                 (
-                    REGISTRY_FS_ROOT.into(),
+                    REGISTRY_ROOT.into(),
                     litebox_broker_core::fs::in_mem::InitialNode::Directory {
                         mode,
                         owner: FileUser::ROOT,
@@ -2624,7 +2571,7 @@ mod tests {
                 ),
             ],
         ));
-        let registry = RegistryStore::new(Arc::clone(&litebox));
+        let registry = RegistryStore::new(Fs::registry(Arc::clone(&litebox)));
         (litebox, registry)
     }
 
@@ -2632,7 +2579,7 @@ mod tests {
     fn registry_paths_are_confined_to_the_reserved_backing_root() {
         assert_eq!(
             absolute_nt_key_name_to_fs_path(r"\Registry").unwrap(),
-            REGISTRY_FS_ROOT
+            REGISTRY_ROOT
         );
         assert_eq!(
             absolute_nt_key_name_to_fs_path(r"\REGISTRY\Machine\Software").unwrap(),
@@ -2659,33 +2606,6 @@ mod tests {
                 Err(NtStatus::INVALID_PARAMETER),
                 "{path}"
             );
-        }
-        assert_eq!(
-            relative_nt_key_name_to_fs_path("/tmp", "child"),
-            Err(NtStatus::INVALID_PARAMETER)
-        );
-        assert_eq!(
-            value_path("/tmp", "value"),
-            Err(NtStatus::INVALID_PARAMETER)
-        );
-        for path in ["/tmp/../registry", "/registry/../tmp", "/registry//machine"] {
-            assert_eq!(
-                validate_registry_backing_path(path),
-                Err(NtStatus::INVALID_PARAMETER),
-                "{path}"
-            );
-        }
-
-        for path in [
-            "/registry",
-            "/Registry/machine",
-            "//registry/machine",
-            "/tmp/../registry/machine",
-        ] {
-            assert!(is_registry_backing_path(path), "{path}");
-        }
-        for path in ["/", "/tmp", "/registry-sibling", "/tmp/registry"] {
-            assert!(!is_registry_backing_path(path), "{path}");
         }
     }
 
@@ -2878,7 +2798,7 @@ mod tests {
         assert_eq!(
             registry
                 .fs()
-                .path_file_status(&registry.fs_context, &*value_path)
+                .path_file_status(&registry.fs_context, &value_path)
                 .unwrap()
                 .file_type,
             FileType::RegularFile
@@ -2886,7 +2806,7 @@ mod tests {
         assert_eq!(
             registry
                 .fs()
-                .path_file_status(&registry.fs_context, &*value_path)
+                .path_file_status(&registry.fs_context, &value_path)
                 .unwrap()
                 .size,
             (REGISTRY_VALUE_TYPE_SIZE + DEFAULT_ACP_VALUE.len()) as u64
@@ -3411,7 +3331,7 @@ mod tests {
             .fs()
             .chmod_file(
                 &task.global.registry.fs_context,
-                &*private_path,
+                &private_path,
                 Mode::WUSR | Mode::XUSR,
             )
             .unwrap();

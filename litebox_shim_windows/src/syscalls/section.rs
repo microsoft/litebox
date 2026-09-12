@@ -1184,7 +1184,7 @@ fn write_section_basic_information<Platform: ShimPlatform>(
 
 fn write_section_image_information<Platform: ShimPlatform>(
     section: &SectionObject<Platform>,
-    fs: Arc<litebox::LiteBox<Platform>>,
+    fs: Arc<crate::fs::Fs<Platform>>,
     section_information: MutPtr<Platform, u8>,
     section_information_length: usize,
     return_length: Option<MutPtr<Platform, usize>>,

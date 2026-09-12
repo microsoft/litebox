@@ -137,10 +137,7 @@ pub(crate) fn test_task_with_broker_files(files: &[(&str, &[u8])]) -> Task<TestP
                 group: 1000,
             }),
         ),
-        (
-            crate::syscalls::registry::REGISTRY_FS_ROOT.into(),
-            directory(UserInfo::ROOT),
-        ),
+        (crate::fs::REGISTRY_ROOT.into(), directory(UserInfo::ROOT)),
     ];
     if !files.is_empty() {
         entries.extend([
@@ -177,7 +174,7 @@ fn test_task_from_litebox(litebox: litebox::LiteBox<TestPlatform>) -> Task<TestP
     let fs_context = litebox::fs::Context::new();
     let shim = shim_builder.build();
     let WindowsShim(global) = shim;
-    let fs = Arc::clone(&global.litebox);
+    let fs = Arc::clone(&global.fs);
 
     let windows_shared_section_base = map_csr_server_shared_memory(&global.page_manager)
         .expect("mapping shared memory should succeed");

@@ -57,6 +57,7 @@ use crate::syscalls::worker_factory::{
 };
 use crate::syscalls::{SyscallRequest, ThreadHandle, mm};
 
+mod fs;
 mod loader;
 mod nt_types;
 mod syscalls;
@@ -410,15 +411,19 @@ impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
     #[must_use]
     pub fn build(self) -> WindowsShim<Platform> {
         let litebox = Arc::new(self.litebox);
+        let fs = Arc::new(fs::Fs::regular(Arc::clone(&litebox)));
         let global = Arc::new(GlobalState {
             platform: self.platform,
             page_manager: PageManager::new(&litebox),
-            registry: syscalls::registry::RegistryStore::new(Arc::clone(&litebox)),
+            registry: syscalls::registry::RegistryStore::new(fs::Fs::registry(Arc::clone(
+                &litebox,
+            ))),
             wnf_states: syscalls::wnf::WnfStateStore::new(
                 syscalls::wnf::WnfStateStoreData::default(),
             ),
             mui_generation: AtomicU32::new(1),
             qpc_boot_instant: TimeProvider::now(self.platform),
+            fs,
             litebox,
         });
         WindowsShim(global)
@@ -494,7 +499,7 @@ impl<Platform: ShimPlatform> WindowsShim<Platform> {
         #[cfg(not(target_os = "windows"))]
         let _ = map_windows_user_shared_data::<Platform>(&self.0.page_manager)
             .ok_or(loader::WindowsLoadError::MapSharedMemory)?;
-        let fs = Arc::clone(&self.0.litebox);
+        let fs = Arc::clone(&self.0.fs);
         let load_info = loader::PeLoader::new(self.0.platform, fs.clone(), &self.0.page_manager)
             .load(path, &argv, &envp)?;
         // TODO: shared section should be only created once and shared across all processes, not created per-process.
@@ -541,6 +546,7 @@ struct GlobalState<Platform: ShimPlatform> {
     wnf_states: syscalls::wnf::WnfStateStore<Platform>,
     mui_generation: AtomicU32,
     qpc_boot_instant: <Platform as TimeProvider>::Instant,
+    fs: Arc<fs::Fs<Platform>>,
     litebox: Arc<LiteBox<Platform>>,
 }
 
@@ -707,7 +713,7 @@ impl<Platform: ShimPlatform> Process<Platform> {
 struct Task<Platform: ShimPlatform> {
     global: Arc<GlobalState<Platform>>,
     process: Arc<Process<Platform>>,
-    fs: Arc<LiteBox<Platform>>,
+    fs: Arc<fs::Fs<Platform>>,
     fs_context: litebox::fs::Context,
     wait_state: wait::WaitState<Platform>,
     io_completion_worker: Mutex<Platform, syscalls::iocp::IoCompletionWorkerState<Platform>>,

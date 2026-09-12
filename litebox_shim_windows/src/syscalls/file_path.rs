@@ -46,14 +46,14 @@ impl<'a, Platform: crate::ShimPlatform> FilePathResolver<'a, Platform> {
                 ..
             } => Err(NtStatus::NOT_A_DIRECTORY),
             FilePathRoot::Filesystem { path, .. } => {
-                regular_filesystem_target(join_absolute_components(path, name)?)
+                join_absolute_components(path, name).map(FileTarget::Filesystem)
             }
         }
     }
 
     fn resolve_absolute(&self, name: &str) -> Result<FileTarget, NtStatus> {
         if name.starts_with('/') {
-            return regular_filesystem_target(join_absolute_components("/", name)?);
+            return join_absolute_components("/", name).map(FileTarget::Filesystem);
         }
         if !is_absolute_windows_path(name) {
             return Err(NtStatus::OBJECT_PATH_SYNTAX_BAD);
@@ -85,7 +85,7 @@ fn file_device_path_to_file_target(
 ) -> Result<FileTarget, NtStatus> {
     match device {
         FileDeviceObject::Filesystem { root_path } => {
-            regular_filesystem_target(join_absolute_components(&root_path, remaining)?)
+            join_absolute_components(&root_path, remaining).map(FileTarget::Filesystem)
         }
         FileDeviceObject::ConsoleDriver => {
             CondrvObject::from_device_name(remaining).map(FileTarget::Condrv)
@@ -97,14 +97,6 @@ fn file_device_path_to_file_target(
                 Err(NtStatus::OBJECT_PATH_NOT_FOUND)
             }
         }
-    }
-}
-
-fn regular_filesystem_target(path: String) -> Result<FileTarget, NtStatus> {
-    if crate::syscalls::registry::is_registry_backing_path(&path) {
-        Err(NtStatus::OBJECT_PATH_NOT_FOUND)
-    } else {
-        Ok(FileTarget::Filesystem(path))
     }
 }
 
@@ -207,18 +199,6 @@ mod tests {
                 "/SystemRoot/not-an-object-path"
             )))
         );
-        for path in [
-            "/registry",
-            "/REGISTRY/Machine",
-            r"\??\C:\registry\machine",
-            r"\Device\HarddiskVolume1\Registry",
-        ] {
-            assert_eq!(
-                resolve(path),
-                Err(NtStatus::OBJECT_PATH_NOT_FOUND),
-                "{path}"
-            );
-        }
         assert_eq!(
             resolve("relative.txt"),
             Err(NtStatus::OBJECT_PATH_SYNTAX_BAD)
@@ -275,16 +255,6 @@ mod tests {
                 "child.txt",
             ),
             Err(NtStatus::NOT_A_DIRECTORY)
-        );
-        assert_eq!(
-            resolver.resolve(
-                FilePathRoot::Filesystem {
-                    path: "/",
-                    is_directory: true,
-                },
-                "registry"
-            ),
-            Err(NtStatus::OBJECT_PATH_NOT_FOUND)
         );
         assert_eq!(
             resolver.resolve(FilePathRoot::Condrv(CondrvObject::Reference), r"\Connect"),

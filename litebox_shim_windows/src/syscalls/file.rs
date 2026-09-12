@@ -1974,20 +1974,16 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         ];
         for entry in self
             .fs
-            .read_file_directory(fd)
+            .read_file_directory(&file.path, fd)
             .map_err(map_read_dir_error)?
         {
             if entry.name == "." || entry.name == ".." {
                 continue;
             }
             let path = child_path(&file.path, &entry.name);
-            // Registry storage shares the broker filesystem but not the Windows file namespace.
-            if crate::syscalls::registry::is_registry_backing_path(&path) {
-                continue;
-            }
             let status = self
                 .fs
-                .path_file_status(&self.fs_context, path)
+                .path_file_status(&self.fs_context, &path)
                 .map_err(map_file_status_error)?;
             entries.push(DirectoryEntry::from_status(entry.name, &status));
         }
