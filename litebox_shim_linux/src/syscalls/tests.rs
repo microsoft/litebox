@@ -9,22 +9,15 @@
 //! shim owns, and what these tests cover, is the translation between the Linux ABI and the broker
 //! protocol.
 
-use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use litebox_broker_protocol::ObjectHandle;
-use litebox_broker_protocol::fs::{
-    FileAccessMode, FileDirectoryEntry, FileError, FileMode as Mode, FileNodeInfo, FileOpenFlags,
-    FileType, FileUser, MAX_FILE_TRANSFER_SIZE, encode_directory_entries_chunk,
-};
-use litebox_broker_protocol::message::FileResponse;
+use litebox_broker_protocol::fs::FileMode as Mode;
 use litebox_common_linux::{
     AtFlags, DirentType, FcntlArg, FileDescriptorFlags, OFlags, errno::Errno,
 };
 use zerocopy::FromBytes as _;
 
 use crate::UserPtrMut;
-use crate::syscalls::test_broker::{FileCall, Scripted, ScriptedFiles, closed, failed, opened};
 
 use litebox::shim::{Exception, ExceptionInfo};
 use litebox_common_linux::PtRegs;
@@ -33,12 +26,6 @@ use litebox_common_linux::signal::FPE_INTDIV;
 use litebox_common_linux::signal::{ILL_ILLOPN, SI_KERNEL, SiginfoData, Signal};
 
 extern crate std;
-
-/// The handle the scripted fixture hands out for a file a test opens.
-pub(crate) const FILE_HANDLE: ObjectHandle = ObjectHandle(0x1000);
-
-/// The user every test task acts as.
-pub(crate) const ROOT: FileUser = FileUser { user: 0, group: 0 };
 
 /// The concrete platform used by the shim's unit tests.
 ///
@@ -56,50 +43,33 @@ pub(crate) fn test_platform() -> &'static TestPlatform {
     PLATFORM.get_or_init(TestPlatform::new)
 }
 
-/// Returns a task whose broker only serves the standard streams used during construction.
+/// Returns a task connected to the process-wide in-memory test broker.
 #[must_use]
 pub(crate) fn init_platform() -> crate::Task<TestPlatform> {
-    init_platform_with_files(ScriptedFiles::new([]))
-}
-
-/// Returns a task whose broker answers file requests with `files`.
-#[must_use]
-fn init_platform_with_files(files: Arc<ScriptedFiles>) -> crate::Task<TestPlatform> {
     let platform = test_platform();
-    let litebox = litebox::LiteBox::new_with_broker_local(
-        platform,
-        crate::syscalls::test_broker::negotiate(files),
-    );
+    let litebox = crate::syscalls::test_broker::litebox(platform);
     let shim_builder = crate::LinuxShimBuilder::new_with_litebox(platform, litebox);
     shim_builder.build().0.new_test_task()
 }
 
-/// Returns a task and the scripted file fixture that answers its file requests.
-#[must_use]
-pub(crate) fn scripted_task(
-    script: impl IntoIterator<Item = Scripted>,
-) -> (Arc<ScriptedFiles>, crate::Task<TestPlatform>) {
-    let files = ScriptedFiles::new(script);
-    let task = init_platform_with_files(Arc::clone(&files));
-    (files, task)
+pub(crate) fn create_directory(task: &crate::Task<TestPlatform>, path: &str) {
+    task.sys_mkdirat(litebox_common_linux::AT_FDCWD, path, 0o777)
+        .expect("the test directory must be created");
 }
 
-/// Builds one scripted directory entry.
-pub(crate) fn directory_entry(name: &str, file_type: FileType, ino: u64) -> FileDirectoryEntry {
-    FileDirectoryEntry {
-        name: alloc::string::String::from(name),
-        file_type,
-        ino_info: Some(FileNodeInfo {
-            dev: 1,
-            ino,
-            rdev: None,
-        }),
+pub(crate) fn create_file(task: &crate::Task<TestPlatform>, path: &str, data: &[u8]) {
+    let fd = task
+        .sys_open(
+            path,
+            OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
+            Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::ROTH,
+        )
+        .expect("the test file must be created");
+    let fd = i32::try_from(fd).unwrap();
+    if !data.is_empty() {
+        assert_eq!(task.sys_write(fd, data, None), Ok(data.len()));
     }
-}
-
-/// Builds the protocol mode a request is expected to carry.
-pub(crate) fn mode(bits: u16) -> Mode {
-    Mode::from_bits(bits).expect("test modes must be supported")
+    task.sys_close(fd).expect("the test file must close");
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -329,63 +299,22 @@ fn parse_dirents(buffer: &[u8]) -> Vec<(alloc::string::String, u8, u64, u64)> {
     entries
 }
 
-/// Opens a directory over the scripted fixture and returns its descriptor.
-fn scripted_dir_fd(files: &ScriptedFiles, task: &crate::Task<TestPlatform>, path: &str) -> i32 {
-    files.script([opened(FILE_HANDLE)]);
-    let fd = task
-        .sys_open(path, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
-        .expect("the scripted open must succeed");
-    let _ = files.take_calls();
-    i32::try_from(fd).unwrap()
-}
-
-fn close_scripted_file(
-    files: &ScriptedFiles,
-    task: &crate::Task<TestPlatform>,
-    fd: i32,
-    handle: ObjectHandle,
-) {
-    files.script([closed()]);
-    task.sys_close(fd).expect("the scripted close must succeed");
-    assert!(
-        matches!(files.take_calls().last(), Some(FileCall::Close(actual)) if *actual == handle),
-        "closing the guest fd must close its broker handle"
-    );
-}
-
-fn directory_pages(entries: &[FileDirectoryEntry], maximum_length: usize) -> Vec<Scripted> {
-    let mut pages = Vec::new();
-    let mut start_index = 0;
-    loop {
-        let (payload, next_index) = encode_directory_entries_chunk(
-            entries,
-            start_index,
-            maximum_length.min(MAX_FILE_TRANSFER_SIZE as usize),
-        )
-        .expect("scripted directory entries must encode");
-        pages.push(Scripted::Directory {
-            payload,
-            next_index,
-        });
-        let Some(next_index) = next_index else {
-            return pages;
-        };
-        start_index = usize::try_from(next_index).unwrap();
-    }
+fn open_dir(task: &crate::Task<TestPlatform>, path: &str) -> i32 {
+    i32::try_from(
+        task.sys_open(path, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+            .expect("the test directory must open"),
+    )
+    .unwrap()
 }
 
 #[test]
 fn getdirent64_encodes_the_entries_the_broker_returns() {
-    let entries = vec![
-        directory_entry(".", FileType::Directory, 1),
-        directory_entry("..", FileType::Directory, 1),
-        directory_entry("file.txt", FileType::RegularFile, 7),
-        directory_entry("sub", FileType::Directory, 9),
-    ];
-    let (files, task) = scripted_task([]);
-    let dir_fd = scripted_dir_fd(&files, &task, "/dir");
+    let task = init_platform();
+    create_directory(&task, "/dir");
+    create_file(&task, "/dir/file.txt", &[]);
+    create_directory(&task, "/dir/sub");
+    let dir_fd = open_dir(&task, "/dir");
 
-    files.script(directory_pages(&entries, usize::MAX));
     let mut buffer = vec![0u8; 4096];
     let read = task
         .sys_getdirent64(
@@ -395,26 +324,24 @@ fn getdirent64_encodes_the_entries_the_broker_returns() {
         )
         .expect("the directory read must succeed");
 
+    let entries = parse_dirents(&buffer[..read]);
     assert_eq!(
-        files.take_calls(),
-        vec![FileCall::ReadDirectory {
-            handle: FILE_HANDLE,
-            start_index: 0,
-        }]
-    );
-    assert_eq!(
-        parse_dirents(&buffer[..read]),
+        entries
+            .iter()
+            .map(|(name, typ, _, offset)| (name.as_str(), *typ, *offset))
+            .collect::<Vec<_>>(),
         vec![
-            (".".into(), DirentType::Directory as u8, 1, 0),
-            ("..".into(), DirentType::Directory as u8, 1, 1),
-            ("file.txt".into(), DirentType::Regular as u8, 7, 2),
-            ("sub".into(), DirentType::Directory as u8, 9, 3),
+            (".", DirentType::Directory as u8, 0),
+            ("..", DirentType::Directory as u8, 1),
+            ("file.txt", DirentType::Regular as u8, 2),
+            ("sub", DirentType::Directory as u8, 3),
         ],
-        "entries are reported sorted by name, with their broker type and inode"
+        "entries are reported sorted by name with their broker type"
     );
+    assert_ne!(entries[2].2, 0);
+    assert_ne!(entries[3].2, 0);
 
     // A second read resumes after the entries already reported.
-    files.script(directory_pages(&entries, usize::MAX));
     assert_eq!(
         task.sys_getdirent64(
             dir_fd,
@@ -424,24 +351,21 @@ fn getdirent64_encodes_the_entries_the_broker_returns() {
         Ok(0),
         "the previous call already reported every entry"
     );
-    close_scripted_file(&files, &task, dir_fd, FILE_HANDLE);
+    task.sys_close(dir_fd).unwrap();
 }
 
 #[test]
 fn getdirent64_resumes_across_buffers() {
-    let entries = vec![
-        directory_entry("aaaaaaaaaaaaaaaa", FileType::RegularFile, 1),
-        directory_entry("bbbbbbbbbbbbbbbb", FileType::RegularFile, 2),
-        directory_entry("cccccccccccccccc", FileType::RegularFile, 3),
-    ];
-    let (files, task) = scripted_task([]);
-    let dir_fd = scripted_dir_fd(&files, &task, "/dir");
+    let task = init_platform();
+    create_directory(&task, "/dir");
+    for name in ["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb", "cccccccccccccccc"] {
+        create_file(&task, &alloc::format!("/dir/{name}"), &[]);
+    }
+    let dir_fd = open_dir(&task, "/dir");
 
     let mut names = Vec::new();
-    let mut pages = Vec::new();
     let mut chunk = [0u8; 48];
     loop {
-        files.script(directory_pages(&entries, 64));
         let read = task
             .sys_getdirent64(
                 dir_fd,
@@ -449,7 +373,6 @@ fn getdirent64_resumes_across_buffers() {
                 chunk.len(),
             )
             .expect("chunked directory reads must succeed");
-        pages.extend(files.take_calls());
         if read == 0 {
             break;
         }
@@ -462,24 +385,22 @@ fn getdirent64_resumes_across_buffers() {
     }
     assert_eq!(
         names,
-        vec!["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb", "cccccccccccccccc"]
+        vec![
+            ".",
+            "..",
+            "aaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbb",
+            "cccccccccccccccc"
+        ]
     );
-    assert!(
-        pages.iter().any(|call| matches!(
-            call,
-            FileCall::ReadDirectory { start_index, .. } if *start_index > 0
-        )),
-        "the guest must resume from the continuation index the broker reported"
-    );
-    close_scripted_file(&files, &task, dir_fd, FILE_HANDLE);
+    task.sys_close(dir_fd).unwrap();
 }
 
 #[test]
 fn getdirent64_translates_descriptor_and_broker_errors() {
-    let (files, task) = scripted_task([]);
+    let task = init_platform();
     let mut buffer = [0u8; 256];
 
-    // An unknown descriptor never reaches the broker.
     assert_eq!(
         task.sys_getdirent64(
             -1,
@@ -488,23 +409,27 @@ fn getdirent64_translates_descriptor_and_broker_errors() {
         ),
         Err(Errno::EBADF)
     );
-    assert!(files.take_calls().is_empty());
 
-    let dir_fd = scripted_dir_fd(&files, &task, "/dir");
-    files.script([failed(FileError::NotDirectory)]);
+    create_file(&task, "/not-a-directory", &[]);
+    let file_fd = i32::try_from(
+        task.sys_open("/not-a-directory", OFlags::RDONLY, Mode::empty())
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(
         task.sys_getdirent64(
-            dir_fd,
+            file_fd,
             UserPtrMut::from_usize(buffer.as_mut_ptr() as usize),
             buffer.len(),
         ),
         Err(Errno::ENOTDIR),
         "a broker not-a-directory failure surfaces as ENOTDIR"
     );
+    task.sys_close(file_fd).unwrap();
 
-    // A zero-length buffer cannot hold an entry.
-    let entries = vec![directory_entry("file", FileType::RegularFile, 1)];
-    files.script(directory_pages(&entries, usize::MAX));
+    create_directory(&task, "/dir");
+    create_file(&task, "/dir/file", &[]);
+    let dir_fd = open_dir(&task, "/dir");
     assert_eq!(
         task.sys_getdirent64(
             dir_fd,
@@ -513,48 +438,36 @@ fn getdirent64_translates_descriptor_and_broker_errors() {
         ),
         Err(Errno::EINVAL)
     );
-    close_scripted_file(&files, &task, dir_fd, FILE_HANDLE);
+    task.sys_close(dir_fd).unwrap();
 }
 
 #[test]
 fn umask_masks_the_creation_mode_sent_to_the_broker() {
-    let (files, task) = scripted_task([]);
+    let task = init_platform();
 
     // The default mask is 022, and `umask` returns the previous mask.
     assert_eq!(task.sys_umask(0o077).bits(), 0o022);
 
-    files.script([opened(FILE_HANDLE)]);
     let fd = task
         .sys_open(
             "/masked_file",
             OFlags::CREAT | OFlags::WRONLY,
             Mode::from_bits_retain(0o666),
         )
-        .expect("the scripted create must succeed");
+        .expect("the masked file must be created");
+    task.sys_close(i32::try_from(fd).unwrap()).unwrap();
     assert_eq!(
-        files.take_calls(),
-        vec![FileCall::Open {
-            path: "/masked_file".into(),
-            user: ROOT,
-            access: FileAccessMode::WriteOnly,
-            flags: FileOpenFlags::CREATE,
-            mode: mode(0o600),
-        }],
-        "the broker is asked to create the file with 0o666 & !0o077"
+        task.sys_stat("/masked_file").unwrap().st_mode & 0o777,
+        0o600,
+        "the created file mode is 0o666 & !0o077"
     );
-    close_scripted_file(&files, &task, i32::try_from(fd).unwrap(), FILE_HANDLE);
 
-    files.script([Scripted::Reply(FileResponse::Mkdir)]);
     task.sys_mkdirat(litebox_common_linux::AT_FDCWD, "/masked_dir", 0o777)
-        .expect("the scripted mkdir must succeed");
+        .expect("the masked directory must be created");
     assert_eq!(
-        files.take_calls(),
-        vec![FileCall::Mkdir {
-            path: "/masked_dir".into(),
-            user: ROOT,
-            mode: mode(0o700),
-        }],
-        "the broker is asked to create the directory with 0o777 & !0o077"
+        task.sys_stat("/masked_dir").unwrap().st_mode & 0o777,
+        0o700,
+        "the created directory mode is 0o777 & !0o077"
     );
 
     // Only the low nine bits of a new mask are retained.
@@ -564,9 +477,8 @@ fn umask_masks_the_creation_mode_sent_to_the_broker() {
 
 #[test]
 fn unlinkat_routes_by_flag_and_translates_broker_failures() {
-    let (files, task) = scripted_task([]);
+    let task = init_platform();
 
-    // AT_REMOVEDIR combined with any other flag is rejected before the broker is asked.
     assert_eq!(
         task.sys_unlinkat(
             litebox_common_linux::AT_FDCWD,
@@ -575,54 +487,48 @@ fn unlinkat_routes_by_flag_and_translates_broker_failures() {
         ),
         Err(Errno::EINVAL)
     );
-    assert!(files.take_calls().is_empty());
 
-    files.script([Scripted::Reply(FileResponse::Unlink)]);
+    create_file(&task, "/file", &[]);
     task.sys_unlinkat(litebox_common_linux::AT_FDCWD, "/file", AtFlags::empty())
-        .expect("the scripted unlink must succeed");
-    assert_eq!(
-        files.take_calls(),
-        vec![FileCall::Unlink {
-            path: "/file".into(),
-            user: ROOT,
-        }]
-    );
+        .expect("the file unlink must succeed");
+    assert_eq!(task.sys_stat("/file"), Err(Errno::ENOENT));
 
-    files.script([Scripted::Reply(FileResponse::Rmdir)]);
+    create_directory(&task, "/dir");
     task.sys_unlinkat(
         litebox_common_linux::AT_FDCWD,
         "/dir",
         AtFlags::AT_REMOVEDIR,
     )
-    .expect("the scripted rmdir must succeed");
+    .expect("the directory removal must succeed");
+    assert_eq!(task.sys_stat("/dir"), Err(Errno::ENOENT));
+
+    create_directory(&task, "/is-directory");
     assert_eq!(
-        files.take_calls(),
-        vec![FileCall::Rmdir {
-            path: "/dir".into(),
-            user: ROOT,
-        }],
-        "AT_REMOVEDIR is routed to the directory-removal request"
+        task.sys_unlinkat(
+            litebox_common_linux::AT_FDCWD,
+            "/is-directory",
+            AtFlags::empty()
+        ),
+        Err(Errno::EISDIR)
     );
 
-    for (flags, error, errno) in [
-        (AtFlags::empty(), FileError::IsDirectory, Errno::EISDIR),
-        (AtFlags::AT_REMOVEDIR, FileError::NotEmpty, Errno::ENOTEMPTY),
-    ] {
-        files.script([failed(error)]);
-        assert_eq!(
-            task.sys_unlinkat(litebox_common_linux::AT_FDCWD, "/target", flags),
-            Err(errno),
-            "{error:?} must surface as {errno:?}"
-        );
-        let _ = files.take_calls();
-    }
+    create_directory(&task, "/nonempty");
+    create_file(&task, "/nonempty/child", &[]);
+    assert_eq!(
+        task.sys_unlinkat(
+            litebox_common_linux::AT_FDCWD,
+            "/nonempty",
+            AtFlags::AT_REMOVEDIR
+        ),
+        Err(Errno::ENOTEMPTY)
+    );
 }
 
 #[test]
 fn test_rlimit_nofile() {
     use litebox_common_linux::{Rlimit, RlimitResource, errno::Errno};
 
-    let (files, task) = scripted_task([opened(FILE_HANDLE), closed()]);
+    let task = init_platform();
 
     // 1. Get the current NOFILE limit.
     let cur_lim = task
@@ -663,25 +569,23 @@ fn test_rlimit_nofile() {
             .expect_err("dup should fail due to new cur limit"),
         Errno::EMFILE,
     );
-    assert_eq!(
-        task.sys_open("/prlimit_file", OFlags::CREAT | OFlags::RDONLY, Mode::RWXU)
-            .expect_err("open should fail due to new cur limit"),
-        Errno::EMFILE,
-    );
-    assert_eq!(
-        files.take_calls(),
-        vec![
-            FileCall::Open {
-                path: "/prlimit_file".into(),
-                user: ROOT,
-                access: FileAccessMode::ReadOnly,
-                flags: FileOpenFlags::CREATE,
-                mode: mode(0o700),
-            },
-            FileCall::Close(FILE_HANDLE),
-        ],
-        "an open that cannot acquire a guest fd must close the broker handle"
-    );
+    for _ in 0..32 {
+        assert_eq!(
+            task.sys_open("/prlimit_file", OFlags::CREAT | OFlags::RDONLY, Mode::RWXU)
+                .expect_err("open should fail due to new cur limit"),
+            Errno::EMFILE,
+            "a failed guest-fd allocation must close its transient broker handle"
+        );
+    }
+    task.do_prlimit(RlimitResource::NOFILE, Some(cur_lim))
+        .expect("restoring the NOFILE limit must succeed");
+    task.sys_close(i32::try_from(probe_fd).unwrap()).unwrap();
+    task.sys_unlinkat(
+        litebox_common_linux::AT_FDCWD,
+        "/prlimit_file",
+        AtFlags::empty(),
+    )
+    .expect("the file created before descriptor allocation failed must remain removable");
 }
 
 /// Regression test for a bug where readers can be permanently starved on

@@ -1531,76 +1531,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
 mod tests {
     use super::PAGE_SIZE;
     use litebox::platform::PageManagementProvider;
-    use litebox_broker_protocol::fs::{FileAccessMode, FileMode as Mode, FileOpenFlags};
+    use litebox_broker_protocol::fs::FileMode as Mode;
     use litebox_common_linux::{MRemapFlags, MapFlags, OFlags, ProtFlags, errno::Errno};
-    use object::{elf::FileHeader64, endian::LittleEndian};
 
-    use crate::syscalls::test_broker::{FileCall, Scripted, ScriptedFiles, closed, opened};
-    use crate::syscalls::tests::{
-        FILE_HANDLE, ROOT, TestPlatform as Platform, init_platform, mode, scripted_task,
-    };
-    use crate::{Task, UserPtrMut};
-
-    fn open_scripted_mmap_file(files: &ScriptedFiles, task: &Task<Platform>, path: &str) -> i32 {
-        files.script([opened(FILE_HANDLE)]);
-        let fd = i32::try_from(
-            task.sys_open(path, OFlags::RDONLY, Mode::empty())
-                .expect("the scripted open must succeed"),
-        )
-        .unwrap();
-        assert_eq!(
-            files.take_calls(),
-            alloc::vec![FileCall::Open {
-                path: path.into(),
-                user: ROOT,
-                access: FileAccessMode::ReadOnly,
-                flags: FileOpenFlags::from_bits(0).unwrap(),
-                mode: mode(0),
-            }]
-        );
-        fd
-    }
-
-    fn script_mmap_bytes(files: &ScriptedFiles, data: &[u8]) {
-        files.script([
-            Scripted::Read(data.to_vec()),
-            Scripted::Read(alloc::vec![]),
-            Scripted::Read(alloc::vec![]),
-        ]);
-    }
-
-    fn assert_mmap_reads(files: &ScriptedFiles, data_len: usize) {
-        assert_eq!(
-            files.take_calls(),
-            alloc::vec![
-                FileCall::Read {
-                    handle: FILE_HANDLE,
-                    length: u32::try_from(PAGE_SIZE).unwrap(),
-                    offset: Some(0),
-                },
-                FileCall::Read {
-                    handle: FILE_HANDLE,
-                    length: u32::try_from(PAGE_SIZE).unwrap(),
-                    offset: Some(u64::try_from(data_len).unwrap()),
-                },
-                FileCall::Read {
-                    handle: FILE_HANDLE,
-                    length: u32::try_from(core::mem::size_of::<FileHeader64<LittleEndian>>())
-                        .unwrap(),
-                    offset: Some(0),
-                },
-            ]
-        );
-    }
-
-    fn close_scripted_mmap_file(files: &ScriptedFiles, task: &Task<Platform>, fd: i32) {
-        files.script([closed()]);
-        task.sys_close(fd).expect("the scripted close must succeed");
-        assert_eq!(
-            files.take_calls(),
-            alloc::vec![FileCall::Close(FILE_HANDLE)]
-        );
-    }
+    use crate::UserPtrMut;
+    use crate::syscalls::tests::{TestPlatform as Platform, create_file, init_platform};
 
     #[test]
     fn full_capacity_anywhere_precedes_preferred_one_page() {
@@ -1805,9 +1740,13 @@ mod tests {
     #[test]
     fn test_file_backed_mmap() {
         let content = b"Hello, world!";
-        let (files, task) = scripted_task([]);
-        let fd = open_scripted_mmap_file(&files, &task, "/test.txt");
-        script_mmap_bytes(&files, content);
+        let task = init_platform();
+        create_file(&task, "/test.txt", content);
+        let fd = i32::try_from(
+            task.sys_open("/test.txt", OFlags::RDONLY, Mode::empty())
+                .unwrap(),
+        )
+        .unwrap();
         let addr = task
             .sys_mmap(
                 0,
@@ -1824,9 +1763,8 @@ mod tests {
                 .as_ref(),
             content.as_slice(),
         );
-        assert_mmap_reads(&files, content.len());
         task.sys_munmap(addr, 0x1000).unwrap();
-        close_scripted_mmap_file(&files, &task, fd);
+        task.sys_close(fd).unwrap();
     }
 
     #[test]
@@ -2132,9 +2070,13 @@ mod tests {
     #[test]
     fn test_map_shared_readonly_file() {
         let content = b"Hello, shared!";
-        let (files, task) = scripted_task([]);
-        let fd = open_scripted_mmap_file(&files, &task, "/shared.txt");
-        script_mmap_bytes(&files, content);
+        let task = init_platform();
+        create_file(&task, "/shared.txt", content);
+        let fd = i32::try_from(
+            task.sys_open("/shared.txt", OFlags::RDONLY, Mode::empty())
+                .unwrap(),
+        )
+        .unwrap();
 
         // MAP_SHARED with PROT_READ on a file should succeed
         let addr = task
@@ -2148,7 +2090,6 @@ mod tests {
                 .as_ref(),
             content.as_slice(),
         );
-        assert_mmap_reads(&files, content.len());
 
         // mprotect to add write permission should fail
         let err = task
@@ -2157,7 +2098,7 @@ mod tests {
         assert_eq!(err, Errno::EACCES);
 
         task.sys_munmap(addr, 0x1000).unwrap();
-        close_scripted_mmap_file(&files, &task, fd);
+        task.sys_close(fd).unwrap();
     }
 
     #[test]

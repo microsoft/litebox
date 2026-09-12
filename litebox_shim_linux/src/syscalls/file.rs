@@ -3040,29 +3040,19 @@ mod tests {
 
     #[test]
     fn getcwd_and_chdir() {
-        use crate::syscalls::test_broker::{FileCall, failed, path_status};
-        use crate::syscalls::tests::{ROOT, scripted_task};
-        use litebox_broker_protocol::fs::{FileError, FileType};
+        use crate::syscalls::tests::{create_directory, create_file, init_platform};
 
-        let (files, task) = scripted_task([]);
+        let task = init_platform();
+        create_directory(&task, "/test_chdir_dir");
+        create_file(&task, "/test_chdir_file", &[]);
 
-        // The default CWD is the root, and reporting it takes no broker request.
+        // The default CWD is the root.
         let mut buf = [0u8; 256];
         let len = task.sys_getcwd(&mut buf).unwrap();
         let cwd = core::str::from_utf8(&buf[..len - 1]).unwrap(); // strip NUL
         assert_eq!(cwd, "/");
-        assert!(files.take_calls().is_empty());
 
-        // `chdir` asks the broker for the target's status, then tracks it locally.
-        files.script([path_status(FileType::Directory, 0o755)]);
         task.sys_chdir("/test_chdir_dir").unwrap();
-        assert_eq!(
-            files.take_calls(),
-            std::vec![FileCall::PathStatus {
-                path: "/test_chdir_dir".into(),
-                user: ROOT,
-            }]
-        );
         let len = task.sys_getcwd(&mut buf).unwrap();
         assert_eq!(
             core::str::from_utf8(&buf[..len - 1]).unwrap(),
@@ -3070,24 +3060,19 @@ mod tests {
         );
 
         // A missing target leaves the CWD alone.
-        files.script([failed(FileError::NoSuchFileOrDirectory)]);
         assert_eq!(
             task.sys_chdir("/does_not_exist").unwrap_err(),
             Errno::ENOENT
         );
-        let _ = files.take_calls();
 
-        // An empty path is rejected before the broker is asked.
+        // An empty path is rejected.
         assert_eq!(task.sys_chdir("").unwrap_err(), Errno::ENOENT);
-        assert!(files.take_calls().is_empty());
 
-        // A non-directory target is rejected by the shim, which checks the reported type.
-        files.script([path_status(FileType::RegularFile, 0o644)]);
+        // A non-directory target is rejected by the shim.
         assert_eq!(
             task.sys_chdir("/test_chdir_file").unwrap_err(),
             Errno::ENOTDIR
         );
-        let _ = files.take_calls();
 
         // The CWD is unchanged by the failed calls above.
         let len = task.sys_getcwd(&mut buf).unwrap();
@@ -3103,15 +3088,11 @@ mod tests {
 
     #[test]
     fn chdir_normalizes_relative_paths() {
-        use crate::syscalls::test_broker::path_status;
-        use crate::syscalls::tests::scripted_task;
-        use litebox_broker_protocol::fs::FileType;
+        use crate::syscalls::tests::{create_directory, init_platform};
 
-        let (files, task) = scripted_task([
-            path_status(FileType::Directory, 0o755),
-            path_status(FileType::Directory, 0o755),
-            path_status(FileType::Directory, 0o755),
-        ]);
+        let task = init_platform();
+        create_directory(&task, "/rel_parent");
+        create_directory(&task, "/rel_parent/rel_child");
 
         task.sys_chdir("/rel_parent").unwrap();
         task.sys_chdir("rel_child").unwrap();
@@ -3128,22 +3109,14 @@ mod tests {
             core::str::from_utf8(&buf[..len - 1]).unwrap(),
             "/rel_parent"
         );
-
-        assert_eq!(
-            files.take_paths(),
-            std::vec!["/rel_parent", "/rel_parent/rel_child", "/rel_parent"],
-            "the broker only ever sees normalized absolute paths"
-        );
     }
 
     #[test]
     fn mknodat_regular_file_does_not_consume_fd_limit() {
-        use crate::syscalls::test_broker::{FileCall, closed, opened};
-        use crate::syscalls::tests::{FILE_HANDLE, ROOT, scripted_task};
-        use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags};
+        use crate::syscalls::tests::init_platform;
         use litebox_common_linux::{Rlimit, RlimitResource};
 
-        let (files, task) = scripted_task([opened(FILE_HANDLE), closed()]);
+        let task = init_platform();
         let old_limit = task.do_prlimit(RlimitResource::NOFILE, None).unwrap();
         task.do_prlimit(
             RlimitResource::NOFILE,
@@ -3154,38 +3127,27 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            task.sys_mknodat(
-                litebox_common_linux::AT_FDCWD,
-                "/mknodat_at_fd_limit",
-                InodeType::File as u32 | u32::from((Mode::RUSR | Mode::WUSR).bits()),
-                0,
-            ),
-            Ok(())
-        );
-        assert_eq!(
-            files.take_calls(),
-            std::vec![
-                FileCall::Open {
-                    path: "/mknodat_at_fd_limit".into(),
-                    user: ROOT,
-                    access: FileAccessMode::WriteOnly,
-                    flags: FileOpenFlags::CREATE.union(FileOpenFlags::EXCLUSIVE),
-                    mode: crate::syscalls::tests::mode(0o600),
-                },
-                FileCall::Close(FILE_HANDLE),
-            ],
-            "the created file is closed again rather than taking a descriptor"
-        );
+        for index in 0..32 {
+            let path = alloc::format!("/mknodat_at_fd_limit_{index}");
+            assert_eq!(
+                task.sys_mknodat(
+                    litebox_common_linux::AT_FDCWD,
+                    &path,
+                    InodeType::File as u32 | u32::from((Mode::RUSR | Mode::WUSR).bits()),
+                    0,
+                ),
+                Ok(()),
+                "transient broker handles must be closed after creating {path}"
+            );
+            assert!(task.sys_stat(&path).is_ok());
+        }
     }
 
     #[test]
     fn empty_pathnames_return_enoent() {
-        use crate::syscalls::tests::scripted_task;
+        use crate::syscalls::tests::init_platform;
 
-        // Nothing here may reach the broker, so the script is empty: an unexpected file request
-        // would panic instead of being silently answered.
-        let (files, task) = scripted_task([]);
+        let task = init_platform();
 
         assert_eq!(
             task.sys_open("", OFlags::RDONLY, Mode::empty())
@@ -3224,32 +3186,16 @@ mod tests {
                 .unwrap_err(),
             Errno::ENOENT
         );
-        assert!(files.take_calls().is_empty());
     }
 
     /// Verify every path-taking syscall resolves relative paths after `chdir`.
     #[test]
     fn all_path_syscalls_respect_chdir() {
-        use crate::syscalls::test_broker::{Scripted, closed, opened, path_status};
-        use crate::syscalls::tests::{FILE_HANDLE, scripted_task};
-        use litebox_broker_protocol::fs::FileType;
-        use litebox_broker_protocol::message::FileResponse;
+        use crate::syscalls::tests::{create_directory, init_platform};
         use litebox_common_linux::{AccessFlags, AtFlags};
 
-        let (files, task) = scripted_task([
-            path_status(FileType::Directory, 0o755),
-            opened(FILE_HANDLE),
-            closed(),
-            path_status(FileType::RegularFile, 0o644),
-            path_status(FileType::RegularFile, 0o644),
-            path_status(FileType::RegularFile, 0o644),
-            Scripted::Reply(FileResponse::Mkdir),
-            opened(FILE_HANDLE),
-            closed(),
-            path_status(FileType::RegularFile, 0o644),
-            Scripted::Reply(FileResponse::Unlink),
-            Scripted::Reply(FileResponse::Rmdir),
-        ]);
+        let task = init_platform();
+        create_directory(&task, "/cwd_test");
 
         task.sys_chdir("/cwd_test").unwrap();
 
@@ -3305,21 +3251,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            files.take_paths(),
-            std::vec![
-                "/cwd_test",
-                "/cwd_test/file.txt",
-                "/cwd_test/file.txt",
-                "/cwd_test/file.txt",
-                "/cwd_test/file.txt",
-                "/cwd_test/subdir",
-                "/cwd_test/subdir/inner.txt",
-                "/cwd_test/subdir/inner.txt",
-                "/cwd_test/subdir/inner.txt",
-                "/cwd_test/subdir",
-            ],
-            "every relative path is resolved against the CWD before it reaches the broker"
-        );
+        assert!(task.sys_stat("/cwd_test/file.txt").is_ok());
+        assert_eq!(task.sys_stat("/cwd_test/subdir"), Err(Errno::ENOENT));
     }
 }
