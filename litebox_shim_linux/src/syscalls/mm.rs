@@ -736,8 +736,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .ok()?;
                 let metadata =
                     litebox_syscall_rewriter::aarch64::ElfCodeMetadata::parse_aligned_in_place(
-                    &mut words, file_size,
-                )
+                        &mut words, file_size,
+                    )
                     .ok()?;
                 let upper_bound = metadata
                     .trampoline_size_upper_bound(
