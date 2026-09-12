@@ -19,11 +19,9 @@ extern crate std;
 use alloc::{string::String, sync::Arc, vec::Vec};
 
 use litebox_broker_core::{
-    BrokerCore, ObjectRights, PolicyEngine,
+    ObjectRights, PolicyEngine,
     fs::{in_mem::InitialNode, resolver::Resolver},
-    random::{RandomProvider, RandomProviderError},
-    socket::UnsupportedSocketProvider,
-    stdio::UnsupportedStdioProvider,
+    test_support::TestBrokerCoreBuilder,
 };
 use litebox_broker_host::test_support::{InProcessBrokerSetup, shared_memory};
 use litebox_broker_local::BrokerLocal;
@@ -114,13 +112,11 @@ pub(crate) fn litebox_with_broker_files(
         .mount("/dev", litebox_broker_core::fs::devices::Devices::new)
         .build()
         .unwrap();
-    let broker = BrokerCore::new(
-        PolicyEngine::with_unauthenticated_rights(ObjectRights::all()),
-        Arc::new(UnsupportedSocketProvider),
-        Arc::new(UnusedRandomProvider),
-        Arc::new(UnsupportedStdioProvider),
-        Arc::new(Resolver::<TestPlatform, _>::new(fs)),
-    )
+    let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        ObjectRights::all(),
+    ))
+    .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)))
+    .build()
     .expect("a test process may build only one broker core");
 
     let setup = InProcessBrokerSetup::new(broker);
@@ -133,12 +129,4 @@ pub(crate) fn litebox_with_broker_files(
     let litebox = litebox::LiteBox::new_with_broker_local(platform, broker_local);
     readiness.attach(litebox.broker_notification_dispatcher());
     litebox
-}
-
-struct UnusedRandomProvider;
-
-impl RandomProvider for UnusedRandomProvider {
-    fn fill(&self, _output: &mut [u8]) -> core::result::Result<(), RandomProviderError> {
-        Err(RandomProviderError)
-    }
 }

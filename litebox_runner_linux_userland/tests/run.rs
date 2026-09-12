@@ -426,21 +426,20 @@ fn spawn_test_broker_with_mode(
                 std::os::unix::net::UnixListener::bind(&server_control_socket_path)
                     .expect("failed to bind broker test control socket");
             let limits = litebox_broker_core::BrokerCoreLimits::DEFAULT;
-            let broker = litebox_broker_core::BrokerCore::new_with_limits(
-                policy,
-                limits,
-                std::sync::Arc::new(
+            let broker = litebox_broker_core::test_support::TestBrokerCoreBuilder::new(policy)
+                .with_limits(limits)
+                .with_socket_provider(std::sync::Arc::new(
                     litebox_broker_platform_linux_userland::LinuxSocketProvider::new(
                         limits.max_sockets,
                         limits.max_sockets_per_session,
                     )
                     .expect("failed to create broker test socket provider"),
-                ),
-                std::sync::Arc::new(TestRandomProvider),
-                std::sync::Arc::new(CapturingStdioProvider { stdout_tx }),
-                test_file_service(&file_roots),
-            )
-            .expect("failed to create broker core");
+                ))
+                .with_random_provider(std::sync::Arc::new(TestRandomProvider))
+                .with_stdio_provider(std::sync::Arc::new(CapturingStdioProvider { stdout_tx }))
+                .with_file_service(test_file_service(&file_roots))
+                .build()
+                .expect("failed to create broker core");
             ready_tx.send(()).expect("failed to report broker ready");
 
             let serve_connection = |control_stream, close_object_count_tx| {

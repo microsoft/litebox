@@ -43,6 +43,7 @@ path = "tests/userland_broker.rs"
 harness = false
 
 [dev-dependencies]
+litebox_broker_core = { path = "../litebox_broker_core", version = "0.1.0", features = ["test-support"] }
 litebox_broker_local = { path = "../litebox_broker_local", version = "0.1.0" }
 
 [lints]

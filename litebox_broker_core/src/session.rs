@@ -622,6 +622,7 @@ mod tests {
 
     use super::{SessionReferences, release_pending_reference};
     use crate::test_platform::TestPlatform;
+    use crate::test_support::TestBrokerCoreBuilder;
     use crate::{
         BrokerCore, BrokerCoreLimits, BrokerError, CallerCredential, ObjectRights, PolicyEngine,
         SocketPolicy,
@@ -886,9 +887,11 @@ mod tests {
             .mount("/dev", crate::fs::devices::Devices::new)
             .build()
             .unwrap();
-        let broker = BrokerCore::new_with_limits(
+        let broker = TestBrokerCoreBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_socket_policy(SocketPolicy::guest_network()),
+        )
+        .with_limits(
             BrokerCoreLimits::new_with_all_limits(
                 TEST_MAX_REFERENCES,
                 TEST_MAX_PIPE_CAPACITY,
@@ -899,11 +902,13 @@ mod tests {
                 TEST_MAX_REFERENCES_PER_SESSION,
                 TEST_MAX_PIPE_CAPACITY_PER_SESSION,
             ),
-            socket_provider.clone(),
-            Arc::new(crate::random::TestRandomProvider),
-            Arc::new(crate::stdio::UnsupportedStdioProvider),
-            Arc::new(crate::fs::resolver::Resolver::<TestPlatform, _>::new(fs)),
         )
+        .with_socket_provider(socket_provider.clone())
+        .with_random_provider(Arc::new(crate::random::TestRandomProvider))
+        .with_file_service(Arc::new(
+            crate::fs::resolver::Resolver::<TestPlatform, _>::new(fs),
+        ))
+        .build()
         .unwrap();
 
         check_event_reference_lifecycle(&broker);

@@ -4,21 +4,12 @@
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 
-struct FailingRandomProvider;
-
-impl RandomProvider for FailingRandomProvider {
-    fn fill(&self, _output: &mut [u8]) -> Result<(), RandomProviderError> {
-        Err(RandomProviderError)
-    }
-}
 use std::sync::mpsc::{Receiver, channel};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use litebox_broker_core::random::{RandomProvider, RandomProviderError};
-use litebox_broker_core::socket::UnsupportedSocketProvider;
-use litebox_broker_core::stdio::UnsupportedStdioProvider;
-use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
+use litebox_broker_core::test_support::TestBrokerCoreBuilder;
+use litebox_broker_core::{ObjectRights, PolicyEngine};
 use litebox_broker_host::{ConnectionTermination, setup_connection};
 use litebox_broker_local::{BrokerLocal, BrokerNotifications};
 use litebox_broker_protocol::ObjectHandle;
@@ -56,13 +47,10 @@ fn spawn_host(
     + 'static,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
-        let broker = BrokerCore::new(
-            PolicyEngine::with_unauthenticated_rights(ObjectRights::all()),
-            Arc::new(UnsupportedSocketProvider),
-            Arc::new(FailingRandomProvider),
-            Arc::new(UnsupportedStdioProvider),
-            Arc::new(litebox_broker_core::fs::UnsupportedFileService),
-        )
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
         .unwrap();
         let shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();
         let shared_buffers = SharedBufferPool::new(shared_memory, SHARED_BUFFER_LAYOUT).unwrap();
@@ -141,13 +129,10 @@ fn readiness_of(notification: Option<BrokerNotification>) -> ReadinessNotificati
 
 #[test]
 fn host_serves_control_requests_and_notifications_over_shared_rings() {
-    let broker = BrokerCore::new(
-        PolicyEngine::with_unauthenticated_rights(ObjectRights::all()),
-        Arc::new(UnsupportedSocketProvider),
-        Arc::new(FailingRandomProvider),
-        Arc::new(UnsupportedStdioProvider),
-        Arc::new(litebox_broker_core::fs::UnsupportedFileService),
-    )
+    let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        ObjectRights::all(),
+    ))
+    .build()
     .unwrap();
     let (local_control, host_control) = UnixStream::pair().unwrap();
     let host_shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();

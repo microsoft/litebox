@@ -14,9 +14,8 @@ use std::sync::OnceLock;
 use litebox_broker_core::{
     BrokerCore, BrokerCoreLimits, ObjectRights, PolicyEngine,
     fs::{in_mem::InitialNode, resolver::Resolver},
-    random::{RandomProvider, RandomProviderError},
-    socket::UnsupportedSocketProvider,
     stdio::{StdioProvider, StdioProviderError},
+    test_support::TestBrokerCoreBuilder,
 };
 use litebox_broker_host::test_support::InProcessBrokerSetup;
 use litebox_broker_local::BrokerLocal;
@@ -59,27 +58,18 @@ fn test_broker() -> &'static BrokerCore {
             .mount("/dev", litebox_broker_core::fs::devices::Devices::new)
             .build()
             .expect("the test filesystem must be valid");
-        BrokerCore::new_with_limits(
-            PolicyEngine::with_unauthenticated_rights(ObjectRights::all()),
-            BrokerCoreLimits::new(
-                MAX_TEST_BROKER_REFERENCES,
-                BrokerCoreLimits::DEFAULT.max_total_pipe_capacity,
-            ),
-            Arc::new(UnsupportedSocketProvider),
-            Arc::new(UnusedRandomProvider),
-            Arc::new(TestStdioProvider),
-            Arc::new(Resolver::<TestPlatform, _>::new(fs)),
-        )
+        TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .with_limits(BrokerCoreLimits::new(
+            MAX_TEST_BROKER_REFERENCES,
+            BrokerCoreLimits::DEFAULT.max_total_pipe_capacity,
+        ))
+        .with_stdio_provider(Arc::new(TestStdioProvider))
+        .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)))
+        .build()
         .expect("a test process may build only one broker core")
     })
-}
-
-struct UnusedRandomProvider;
-
-impl RandomProvider for UnusedRandomProvider {
-    fn fill(&self, _output: &mut [u8]) -> core::result::Result<(), RandomProviderError> {
-        Err(RandomProviderError)
-    }
 }
 
 struct TestStdioProvider;
