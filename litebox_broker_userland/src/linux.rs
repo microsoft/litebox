@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use clap::Parser as _;
 use litebox_broker_core::socket::HOST_GATEWAY_IPV4_ADDRESS;
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
+use litebox_broker_platform_linux_userland::LinuxSyncPrimitivesProvider;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory;
 use litebox_broker_transport_linux_userland::unix_socket::{
@@ -50,7 +51,10 @@ pub(super) fn run(mut args: super::CliArgs) -> Result<(), Box<dyn Error>> {
     let policy = PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()).with_socket_policy(
         configured_socket_policy(&args.allow_tcp_destination, &args.allow_udp_destination)?,
     );
-    let build_broker = || BrokerCoreBuilder::new(policy).build();
+    let fs = super::create_file_service::<LinuxSyncPrimitivesProvider>(
+        args.fs_initial_files.as_deref(),
+    )?;
+    let build_broker = || BrokerCoreBuilder::new(policy).with_file_service(fs).build();
     let broker = if args.in_process_runner {
         litebox_platform_linux_userland::with_guest_signals_blocked(build_broker)?
     } else {

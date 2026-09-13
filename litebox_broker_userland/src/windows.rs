@@ -13,6 +13,7 @@ use std::time::Instant;
 
 use clap::Parser as _;
 use litebox_broker_core::{BrokerCore, ObjectRights, PolicyEngine};
+use litebox_broker_platform_windows_userland::WindowsSyncPrimitivesProvider;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport_windows_userland::named_pipe::{
     WindowsNamedPipeHostSetupChannel, WindowsNamedPipeListener, WindowsNamedPipeStream,
@@ -26,12 +27,15 @@ use super::{SETUP_TIMEOUT, configured_socket_policy};
 pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
     let control_pipe = unique_control_pipe_name();
     let control_listener = WindowsNamedPipeListener::bind(&control_pipe)?;
-    let broker = BrokerCoreBuilder::new(
-        PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()).with_socket_policy(
-            configured_socket_policy(&args.allow_tcp_destination, &args.allow_udp_destination)?,
-        ),
-    )
-    .build()?;
+    let policy = PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()).with_socket_policy(
+        configured_socket_policy(&args.allow_tcp_destination, &args.allow_udp_destination)?,
+    );
+    let fs = super::create_file_service::<WindowsSyncPrimitivesProvider>(
+        args.fs_initial_files.as_deref(),
+    )?;
+    let broker = BrokerCoreBuilder::new(policy)
+        .with_file_service(fs)
+        .build()?;
 
     if args.in_process_runner {
         debug_assert!(args.unstable);
