@@ -3,12 +3,8 @@
 
 use litebox::fs::{Mode, OFlags};
 use litebox_broker_core::{
-    AssociationCancellation, BrokerCore, BrokerError, BrokerSession, CallerCredential,
-    ObjectRights, PolicyEngine, SessionId,
-    random::{RandomProvider, RandomProviderError},
-    readiness::ReadinessRegistration,
-    socket::{PlatformSocket, SocketProvider},
-    stdio::{StdioProvider, StdioProviderError},
+    BrokerCore, BrokerSession, CallerCredential, ObjectRights, PolicyEngine,
+    test_support::{TerminalOnlyStdioProvider, TestBrokerCoreBuilder},
 };
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::{
@@ -19,8 +15,7 @@ use litebox_broker_protocol::{
     },
     pipe::{CreatePipeResponse, ReadPipeResponse, WritePipeResponse},
     shared_buffer::{SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE},
-    socket::CreateSocketRequest,
-    stdio::{IsTerminalStdioResponse, StdioOutputStream, StdioStream},
+    stdio::{IsTerminalStdioResponse, StdioStream},
 };
 use litebox_broker_transport::{
     channel::{LocalCallChannel, LocalSetupChannel},
@@ -60,40 +55,15 @@ pub(crate) fn test_platform() -> &'static TestPlatform {
 fn test_broker() -> &'static BrokerCore {
     static BROKER: std::sync::OnceLock<BrokerCore> = std::sync::OnceLock::new();
     BROKER.get_or_init(|| {
-        BrokerCore::new(
-            PolicyEngine::with_unauthenticated_rights(ObjectRights::all()),
-            alloc::sync::Arc::new(PipeOnlySocketProvider),
-            alloc::sync::Arc::new(UnusedRandomProvider),
-            alloc::sync::Arc::new(TestStdioProvider),
-            alloc::sync::Arc::new(litebox_broker_core::fs::UnsupportedFileService),
-        )
+        TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .with_stdio_provider(alloc::sync::Arc::new(
+            TerminalOnlyStdioProvider::default().with_terminal(StdioStream::Stdout),
+        ))
+        .build()
         .unwrap()
     })
-}
-
-struct TestStdioProvider;
-
-impl StdioProvider for TestStdioProvider {
-    fn read(
-        &self,
-        _cancellation: &AssociationCancellation,
-        _output: &mut [u8],
-    ) -> core::result::Result<usize, StdioProviderError> {
-        Err(StdioProviderError::Unsupported)
-    }
-
-    fn write(
-        &self,
-        _cancellation: &AssociationCancellation,
-        _stream: StdioOutputStream,
-        _input: &[u8],
-    ) -> core::result::Result<usize, StdioProviderError> {
-        Err(StdioProviderError::Unsupported)
-    }
-
-    fn is_terminal(&self, stream: StdioStream) -> core::result::Result<bool, StdioProviderError> {
-        Ok(stream == StdioStream::Stdout)
-    }
 }
 
 #[must_use]
@@ -299,29 +269,6 @@ impl SharedMemory for TestSharedMemory {
             .ok_or(SharedMemoryError::InvalidRange)?;
         destination.copy_from_slice(source);
         Ok(())
-    }
-}
-
-struct PipeOnlySocketProvider;
-
-impl SocketProvider for PipeOnlySocketProvider {
-    fn create(
-        &self,
-        _session_id: SessionId,
-        _request: CreateSocketRequest,
-        _readiness: ReadinessRegistration,
-    ) -> litebox_broker_core::Result<alloc::sync::Arc<dyn PlatformSocket>> {
-        Err(BrokerError::UnsupportedOperation)
-    }
-
-    fn close_session(&self, _session_id: SessionId) {}
-}
-
-struct UnusedRandomProvider;
-
-impl RandomProvider for UnusedRandomProvider {
-    fn fill(&self, _output: &mut [u8]) -> core::result::Result<(), RandomProviderError> {
-        Err(RandomProviderError)
     }
 }
 

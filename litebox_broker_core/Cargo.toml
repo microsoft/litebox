@@ -3,6 +3,9 @@ name = "litebox_broker_core"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+test-support = []
+
 [dependencies]
 bitflags = { version = "2.9.0", default-features = false }
 hashbrown = "0.15.2"

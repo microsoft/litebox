@@ -12,5 +12,8 @@ rustix = { version = "1.1.2", default-features = false, features = ["event", "ne
 [features]
 lock_tracing = ["litebox_platform/lock_tracing"]
 
+[dev-dependencies]
+litebox_broker_core = { path = "../litebox_broker_core", version = "0.1.0", features = ["test-support"] }
+
 [lints]
 workspace = true

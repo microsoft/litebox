@@ -3,6 +3,9 @@ name = "litebox_broker_host"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+test-support = []
+
 [dependencies]
 hashbrown = "0.15.2"
 litebox_broker_core = { path = "../litebox_broker_core", version = "0.1.0" }
@@ -12,6 +15,7 @@ spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] 
 thiserror = { version = "2.0.6", default-features = false }
 
 [dev-dependencies]
+litebox_broker_core = { path = "../litebox_broker_core", version = "0.1.0", features = ["test-support"] }
 litebox_platform = { path = "../litebox_platform", version = "0.1.0" }
 
 [lints]
