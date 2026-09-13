@@ -35,5 +35,11 @@ lock_tracing = ["litebox_platform/lock_tracing"]
 panic_on_unclosed_fd_drop = []
 enforce_singleton_litebox_instance = []
 
+# TODO: Remove these dev-dependencies together with `fs::file_tests`, once production callers
+# exercise the broker file API end to end.
+[dev-dependencies]
+litebox_broker_core = { version = "0.1.0", path = "../litebox_broker_core", features = ["test-support"] }
+litebox_broker_host = { version = "0.1.0", path = "../litebox_broker_host", features = ["test-support"] }
+
 [lints]
 workspace = true

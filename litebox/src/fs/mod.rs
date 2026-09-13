@@ -5,6 +5,10 @@
 //!
 //! Filesystem resolution and backend implementations live in `litebox_broker_core`. This module
 //! retains LiteBox's guest values, descriptor integration, and compatibility module paths.
+//!
+//! [`Context`], [`FileFd`], and the broker-backed [`crate::LiteBox`] file operations are the
+//! broker file API. The [`resolver`] module and the compatibility modules below remain until every
+//! caller has migrated onto them.
 
 use bitflags::bitflags;
 
@@ -12,7 +16,14 @@ use core::ffi::c_uint;
 use core::num::NonZeroUsize;
 
 pub mod errors;
+mod file;
 pub mod resolver;
+
+// TODO: Remove this module once production callers exercise the broker file API.
+#[cfg(test)]
+mod file_tests;
+
+pub use file::{BrokerFile, Context, FileFd};
 
 // TODO: Remove these implementation-facing compatibility modules once LiteBox uses the broker
 // file APIs exclusively. They temporarily preserve local filesystem construction while resolver
