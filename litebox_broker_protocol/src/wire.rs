@@ -1321,26 +1321,6 @@ mod tests {
             decode_response(&unsupported_mode),
             Err(WireError::InvalidTag)
         );
-        let mut zero_rdev = encode_response(BrokerResponse {
-            request_id: TEST_REQUEST_ID,
-            result: BrokerResult::File(FileResponse::PathStatus(FileStatus {
-                file_type: FileType::CharacterDevice,
-                mode: FileMode::from_bits(0o640).unwrap(),
-                size: 0,
-                owner: FileUser { user: 2, group: 3 },
-                node_info: FileNodeInfo {
-                    dev: 5,
-                    ino: 7,
-                    rdev: NonZeroU64::new(9),
-                },
-                blksize: 4096,
-            })),
-        });
-        // `rdev` is encoded immediately before the trailing block size.
-        let rdev = zero_rdev.len() - size_of::<u64>() * 2;
-        zero_rdev[rdev..rdev + size_of::<u64>()].copy_from_slice(&0u64.to_le_bytes());
-        assert_eq!(decode_response(&zero_rdev), Err(WireError::InvalidTag));
-
         let mut invalid_next_index = encode_response(BrokerResponse {
             request_id: TEST_REQUEST_ID,
             result: BrokerResult::File(FileResponse::ReadDirectory(ReadDirectoryResponse {

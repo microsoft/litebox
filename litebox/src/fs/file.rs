@@ -429,14 +429,11 @@ fn read_directory_broker_error(error: crate::broker::error::BrokerControlError) 
 fn path_error(error: FileError) -> Option<PathError> {
     match error {
         FileError::NoSuchFileOrDirectory => Some(PathError::NoSuchFileOrDirectory),
-        // TODO: `PathError` still carries the compatibility `crate::fs::Mode` used by the local
-        // resolver path. It becomes a protocol `FileMode` once the resolver compatibility surface
-        // is removed.
         FileError::NoSearchPermissions => Some(PathError::NoSearchPerms {
             #[cfg(debug_assertions)]
             dir: String::new(),
             #[cfg(debug_assertions)]
-            perms: super::Mode::empty(),
+            perms: Mode::empty(),
         }),
         FileError::InvalidPathname => Some(PathError::InvalidPathname),
         FileError::MissingComponent => Some(PathError::MissingComponent),
