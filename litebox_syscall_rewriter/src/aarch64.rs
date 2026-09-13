@@ -208,17 +208,9 @@ impl ElfCodeMetadata {
             RewriteConfig::new(options.target_host(), options.virtualizes_x18()),
         )?;
         sites.into_iter().try_fold(0usize, |total, site| {
-            let gate_bytes = match site.kind {
-                PatchKind::Svc => SVC_SLOT_BYTES,
-                PatchKind::MsrTpidr(_) => MSR_SLOT_BYTES,
-                PatchKind::MrsTpidr(_) => MRS_SLOT_BYTES,
-                PatchKind::X18(X18TransformResult::Supported(_)) => X18_SLOT_BYTES,
-                PatchKind::X18(X18TransformResult::Unsupported(_)) => 0,
-                PatchKind::X18StackWriteback(_) => X18_STACK_WRITEBACK_SLOT_BYTES,
-                PatchKind::X18CompareBranch(_) => X18_COMPARE_BRANCH_SLOT_BYTES,
-                PatchKind::X18Adr(_) => X18_ADR_SLOT_BYTES,
-                PatchKind::X18Branch(_) => X18_BRANCH_SLOT_BYTES,
-            };
+            let gate_bytes = site.kind.metadata().map_or(0, |metadata| {
+                metadata.slot_size_for_host(options.target_host())
+            });
             // One prologue per site covers separate mapping batches.
             total
                 .checked_add(GATES_START_OFFSET)
@@ -470,6 +462,8 @@ pub const GATE_ALIGNMENT: usize = 16;
 pub const MRS_SLOT_BYTES: usize = 16;
 /// Byte size of an emitted `MSR TPIDR_EL0` gate slot.
 pub const MSR_SLOT_BYTES: usize = 48;
+/// First byte after the MSR gate's executable body and recovery branch.
+const MSR_GATE_BODY_END: usize = 40;
 /// Byte size of an emitted `SVC` gate slot.
 pub const SVC_SLOT_BYTES: usize = 64;
 /// Byte size of an ordinary self-contained x18 gate slot.
@@ -490,8 +484,7 @@ pub const GATE_SLOT_SIZES: [usize; 4] = [
     MSR_SLOT_BYTES,
     SVC_SLOT_BYTES,
 ];
-/// Candidate starts required to cover the largest executable gate body:
-/// `max(ceil(executable_end / GATE_ALIGNMENT))`, currently `ceil(52 / 16)`.
+/// Candidate starts required to cover the largest executable gate body.
 pub const GATE_PC_CANDIDATE_COUNT: usize = 4;
 const NOP: u32 = 0xD503_201F;
 
@@ -2347,6 +2340,7 @@ enum Opcode {
     Movz = 0xD280_0000,
     SubImm = 0xD100_0000,
     AddImm = 0x9100_0000,
+    AndImm = 0x9200_0000,
     StrUimm = 0xF900_0000,
     LdrUimm = 0xF940_0000,
     Stp = 0xA900_0000,
@@ -2426,6 +2420,47 @@ fn data_imm12(op: Opcode, rd: u8, rn: u8, imm12: u16) -> Option<u32> {
         return None;
     }
     Some(op.bits() | (u32::from(imm12) << RT2_SHIFT) | (u32::from(rn) << RN_SHIFT) | u32::from(rd))
+}
+
+/// Encodes a complete 64-bit logical-immediate instruction, including its
+/// `N:immr:imms` fields.
+fn logical_imm64(op: Opcode, rd: u8, rn: u8, immediate: u64) -> Option<u32> {
+    if immediate == 0 || immediate == u64::MAX {
+        return None;
+    }
+    for element_bits in [2u32, 4, 8, 16, 32, 64] {
+        let element_mask = u64::MAX >> (64 - element_bits);
+        let element = immediate & element_mask;
+        let mut replicated = 0;
+        for shift in (0..64).step_by(element_bits as usize) {
+            replicated |= element << shift;
+        }
+        if replicated != immediate {
+            continue;
+        }
+        let ones = element.count_ones();
+        let unrotated = (1u64 << ones) - 1;
+        for immr in 0..element_bits {
+            let rotated = if immr == 0 {
+                unrotated
+            } else {
+                (unrotated >> immr) | (unrotated << (element_bits - immr))
+            } & element_mask;
+            if rotated == element {
+                let n = u32::from(element_bits == 64);
+                let imms = ((!(element_bits - 1) << 1) | (ones - 1)) & 0x3f;
+                return Some(
+                    op.bits()
+                        | (n << 22)
+                        | (immr << 16)
+                        | (imms << 10)
+                        | (u32::from(rn) << RN_SHIFT)
+                        | u32::from(rd),
+                );
+            }
+        }
+    }
+    None
 }
 
 /// `op | imm12<<10 | rn<<5 | rt` — unsigned scaled (×8) 64-bit load/store
@@ -2512,6 +2547,12 @@ enum Insn {
         rd: u8,
         rn: u8,
         imm12: u16,
+    },
+    /// `AND Xd, Xn, #imm`.
+    AndImm {
+        rd: u8,
+        rn: u8,
+        imm: u64,
     },
     /// `STR Xt, [Xn, #imm_bytes]` (unsigned scaled; `imm_bytes` multiple of 8).
     StrUimm {
@@ -2612,6 +2653,7 @@ impl Insn {
             Insn::SubSp(imm12) => data_imm12(Opcode::SubImm, SP, SP, imm12),
             Insn::AddSp(imm12) => data_imm12(Opcode::AddImm, SP, SP, imm12),
             Insn::AddImm { rd, rn, imm12 } => data_imm12(Opcode::AddImm, rd, rn, imm12),
+            Insn::AndImm { rd, rn, imm } => logical_imm64(Opcode::AndImm, rd, rn, imm),
             Insn::StrUimm { rt, rn, imm_bytes } => ldst_uimm12(Opcode::StrUimm, rt, rn, imm_bytes),
             Insn::LdrUimm { rt, rn, imm_bytes } => ldst_uimm12(Opcode::LdrUimm, rt, rn, imm_bytes),
             Insn::Stp {
@@ -2720,6 +2762,17 @@ impl RewriteConfig {
     }
 }
 
+/// Bits occupied by Darwin's CPU-number tag in `TPIDRRO_EL0`.
+const DARWIN_TPIDRRO_CPU_TAG_MASK: u64 = 0b111;
+
+fn anchor_mask(rd: u8) -> Insn {
+    Insn::AndImm {
+        rd,
+        rn: rd,
+        imm: !DARWIN_TPIDRRO_CPU_TAG_MASK,
+    }
+}
+
 impl Host {
     /// The instruction a gate uses to read this host's per-thread anchor into
     /// `rd`.
@@ -2728,6 +2781,13 @@ impl Host {
             Host::Linux => Insn::MrsTpidrEl0(rd),
             Host::MacOs => Insn::MrsTpidrroEl0(rd),
             Host::Windows => Insn::MovReg { rd, rs: 18 },
+        }
+    }
+
+    fn emit_anchor_read(self, asm: &mut Asm, rd: u8) {
+        asm.emit(self.anchor_read(rd));
+        if self == Self::MacOs {
+            asm.emit(anchor_mask(rd));
         }
     }
 }
@@ -2766,6 +2826,30 @@ enum PatchKind {
     X18Adr(X18Adr),
     /// A terminal indirect branch through logical x18.
     X18Branch(X18IndirectBranchKind),
+}
+
+impl PatchKind {
+    fn metadata(self) -> Option<GateMetadata> {
+        Some(match self {
+            Self::Svc => GateMetadata::Svc,
+            Self::MsrTpidr(source) => GateMetadata::MsrTpidr { source },
+            Self::MrsTpidr(destination) => GateMetadata::MrsTpidr { destination },
+            Self::X18(X18TransformResult::Supported(transform)) => GateMetadata::X18 {
+                scratch: transform.scratch,
+            },
+            Self::X18(X18TransformResult::Unsupported(_)) => return None,
+            Self::X18StackWriteback(pair) => GateMetadata::X18StackWriteback {
+                scratch: pair.scratch,
+            },
+            Self::X18CompareBranch(branch) => GateMetadata::X18CompareBranch {
+                scratch: branch.scratch,
+            },
+            Self::X18Adr(adr) => GateMetadata::X18Adr {
+                scratch: adr.scratch,
+            },
+            Self::X18Branch(kind) => GateMetadata::X18Branch { kind },
+        })
+    }
 }
 
 /// Scans executable sections for Linux syscall/thread-pointer gates and, when
@@ -3034,6 +3118,7 @@ pub(crate) fn hook_syscalls_aarch64_with_code_ranges(
                     gate_offset,
                     trampoline_base_addr,
                     site,
+                    config.host,
                 )?,
                 PatchKind::MsrTpidr(rt) => emit_msr_gate(
                     &mut trampoline_data,
@@ -3090,6 +3175,7 @@ pub(crate) fn hook_syscalls_aarch64_with_code_ranges(
                     trampoline_base_addr,
                     site,
                     branch,
+                    config.host,
                 )?,
             }
         } else {
@@ -3197,6 +3283,7 @@ fn emit_svc_gate(
     gate_offset: usize,
     trampoline_base_addr: u64,
     site: &PatchSite,
+    host: Host,
 ) -> Result<GateBuild> {
     let gate_vaddr = checked_add_u64(trampoline_base_addr, gate_offset as u64, "SVC gate")?;
     let mut asm = Asm::new(gate_vaddr);
@@ -3283,7 +3370,7 @@ fn emit_svc_gate(
         trampoline_base_addr,
         gate_vaddr,
         GateMetadata::Svc,
-        SVC_SLOT_BYTES,
+        host,
     )?;
     Ok(GateBuild::Emitted)
 }
@@ -3337,7 +3424,7 @@ fn emit_msr_gate(
     });
 
     // MRS X16, <host anchor> — read the host anchor.
-    asm.emit(host.anchor_read(X16));
+    host.emit_anchor_read(&mut asm, X16);
 
     // LDR X17, [SP, #16] ; STR X17, [X16, #<tpidr offset>] — store the guest
     // value into its slot off the host anchor.
@@ -3377,7 +3464,7 @@ fn emit_msr_gate(
         trampoline_base_addr,
         gate_vaddr,
         GateMetadata::MsrTpidr { source: rt },
-        MSR_SLOT_BYTES,
+        host,
     )?;
     Ok(GateBuild::Emitted)
 }
@@ -3396,7 +3483,7 @@ fn emit_mrs_gate(
 ) -> Result<GateBuild> {
     let gate_vaddr = checked_add_u64(trampoline_base_addr, gate_offset as u64, "MRS gate")?;
     let mut asm = Asm::new(gate_vaddr);
-    asm.emit(host.anchor_read(rd));
+    host.emit_anchor_read(&mut asm, rd);
     asm.emit(Insn::LdrUimm {
         rt: rd,
         rn: rd,
@@ -3412,7 +3499,7 @@ fn emit_mrs_gate(
         trampoline_base_addr,
         gate_vaddr,
         GateMetadata::MrsTpidr { destination: rd },
-        MRS_SLOT_BYTES,
+        host,
     )?;
     Ok(GateBuild::Emitted)
 }
@@ -3440,7 +3527,7 @@ fn emit_x18_gate(
         rn: SP,
         imm_bytes: -(X18_FRAME_BYTES.cast_signed()),
     });
-    asm.emit(host.anchor_read(anchor_scratch));
+    host.emit_anchor_read(&mut asm, anchor_scratch);
     asm.emit(Insn::LdrUimm {
         rt: scratch,
         rn: anchor_scratch,
@@ -3484,7 +3571,7 @@ fn emit_x18_gate(
         rn: anchor_scratch,
         imm12: 0,
     });
-    asm.emit(host.anchor_read(anchor_scratch));
+    host.emit_anchor_read(&mut asm, anchor_scratch);
     asm.emit(Insn::StrUimm {
         rt: scratch,
         rn: anchor_scratch,
@@ -3506,7 +3593,7 @@ fn emit_x18_gate(
         trampoline_base_addr,
         gate_vaddr,
         GateMetadata::X18 { scratch },
-        X18_SLOT_BYTES,
+        host,
     )?;
     Ok(GateBuild::Emitted)
 }
@@ -3532,7 +3619,7 @@ fn emit_x18_stack_writeback_gate(
         rn: SP,
         imm_bytes: 0,
     });
-    asm.emit(host.anchor_read(pair.anchor_scratch));
+    host.emit_anchor_read(&mut asm, pair.anchor_scratch);
     asm.emit(Insn::LdrUimm {
         rt: pair.scratch,
         rn: pair.anchor_scratch,
@@ -3550,7 +3637,7 @@ fn emit_x18_stack_writeback_gate(
         rn: pair.anchor_scratch,
         imm12: 0,
     });
-    asm.emit(host.anchor_read(pair.anchor_scratch));
+    host.emit_anchor_read(&mut asm, pair.anchor_scratch);
     asm.emit(Insn::StrUimm {
         rt: pair.scratch,
         rn: pair.anchor_scratch,
@@ -3578,7 +3665,7 @@ fn emit_x18_stack_writeback_gate(
         GateMetadata::X18StackWriteback {
             scratch: pair.scratch,
         },
-        X18_STACK_WRITEBACK_SLOT_BYTES,
+        host,
     )?;
     Ok(GateBuild::Emitted)
 }
@@ -3604,7 +3691,7 @@ fn emit_x18_compare_branch_gate(
         rn: SP,
         imm_bytes: X18_FRAME_OFF_SCRATCHES.cast_signed(),
     });
-    asm.emit(host.anchor_read(branch.anchor_scratch));
+    host.emit_anchor_read(&mut asm, branch.anchor_scratch);
     asm.emit(Insn::LdrUimm {
         rt: branch.scratch,
         rn: branch.anchor_scratch,
@@ -3663,7 +3750,7 @@ fn emit_x18_compare_branch_gate(
         GateMetadata::X18CompareBranch {
             scratch: branch.scratch,
         },
-        X18_COMPARE_BRANCH_SLOT_BYTES,
+        host,
     )?;
     Ok(GateBuild::Emitted)
 }
@@ -3684,7 +3771,7 @@ fn emit_x18_adr_gate(
         rn: SP,
         imm_bytes: -(X18_FRAME_BYTES.cast_signed()),
     });
-    asm.emit(host.anchor_read(adr.anchor_scratch));
+    host.emit_anchor_read(&mut asm, adr.anchor_scratch);
     if !asm.adrp(adr.scratch, adr.target)? {
         return Ok(GateBuild::Unreachable);
     }
@@ -3716,7 +3803,7 @@ fn emit_x18_adr_gate(
         GateMetadata::X18Adr {
             scratch: adr.scratch,
         },
-        X18_ADR_SLOT_BYTES,
+        host,
     )?;
     Ok(GateBuild::Emitted)
 }
@@ -3727,6 +3814,7 @@ fn emit_x18_branch_gate(
     trampoline_base_addr: u64,
     site: &PatchSite,
     branch: X18IndirectBranchKind,
+    host: Host,
 ) -> Result<GateBuild> {
     // Unlike ordinary gates, indirect x18 branches are exception-emulated
     // because no physical scratch register can be consumed transparently.
@@ -3744,7 +3832,7 @@ fn emit_x18_branch_gate(
         trampoline_base_addr,
         gate_vaddr,
         GateMetadata::X18Branch { kind: branch },
-        X18_BRANCH_SLOT_BYTES,
+        host,
     )?;
     Ok(GateBuild::Emitted)
 }
@@ -3755,8 +3843,9 @@ fn append_gate_slot(
     trampoline_base: u64,
     slot_vaddr: u64,
     metadata: GateMetadata,
-    slot_size: usize,
+    host: Host,
 ) -> Result<()> {
+    let slot_size = metadata.slot_size_for(host);
     let metadata_offset = slot_size - GATE_METADATA_BYTES;
     if code.len() > metadata_offset {
         return Err(Error::AddressOverflow(format!(
@@ -3777,12 +3866,19 @@ fn append_gate_slot(
     let decoded = EncodedGateMetadata(u32::from_le_bytes(metadata_bytes))
         .decode()
         .ok_or_else(|| Error::AddressOverflow("emitter produced invalid metadata".into()))?;
-    debug_assert!(validate_gate_slot(
+    if !validate_gate_slot_inner_for_host(
         &code,
-        trampoline_base,
-        slot_vaddr,
-        decoded
-    ));
+        SlotAddressing::Placed {
+            trampoline_base,
+            slot_vaddr,
+        },
+        decoded,
+        host,
+    ) {
+        return Err(Error::TrampolinePatchFailure(
+            "emitter produced an invalid AArch64 gate".into(),
+        ));
+    }
     trampoline_data.extend_from_slice(&code);
     Ok(())
 }
@@ -3792,6 +3888,7 @@ fn append_gate_slot(
 /// canonicalization path must additionally fault-safely validate that the
 /// recovered original site branches into this slot before canonicalizing an
 /// interrupted context.
+#[cfg(test)]
 pub(crate) fn validate_gate_slot(
     slot: &[u8],
     trampoline_base: u64,
@@ -3829,21 +3926,22 @@ enum SlotAddressing {
     },
 }
 
+#[cfg(test)]
 fn validate_gate_slot_inner(
     slot: &[u8],
     addressing: SlotAddressing,
     metadata: GateMetadata,
 ) -> bool {
-    validate_gate_slot_inner_for_host(slot, addressing, metadata, None)
+    validate_gate_slot_inner_for_host(slot, addressing, metadata, Host::Linux)
 }
 
 fn validate_gate_slot_inner_for_host(
     slot: &[u8],
     addressing: SlotAddressing,
     metadata: GateMetadata,
-    host: Option<Host>,
+    host: Host,
 ) -> bool {
-    let slot_size = metadata.slot_size();
+    let slot_size = metadata.slot_size_for(host);
     // Both variants' positions are 16-byte aligned by construction, because the
     // blob is laid out and mapped at gate alignment.
     let anchor = match addressing {
@@ -3860,24 +3958,27 @@ fn validate_gate_slot_inner_for_host(
     if slot[metadata_offset..] != encoded.0.to_le_bytes() {
         return false;
     }
-    let word = |offset: usize| {
+    let word_at = |logical_offset: usize| {
+        let offset = metadata.offset_for_host(host, logical_offset);
         u32::from_le_bytes(
             slot[offset..offset + INSN_BYTES]
                 .try_into()
                 .expect("word-sized slice"),
         )
     };
-    let exact = |offset: usize, insn: Insn| word(offset) == insn.encode().unwrap();
+    let exact = |offset: usize, insn: Insn| word_at(offset) == insn.encode().unwrap();
     let padding_is_nops = |start: usize| {
-        (start..metadata_offset)
-            .step_by(INSN_BYTES)
-            .all(|offset| word(offset) == NOP)
+        slot[metadata.offset_for_host(host, start)..metadata_offset]
+            .as_chunks::<INSN_BYTES>()
+            .0
+            .iter()
+            .all(|word| u32::from_le_bytes(*word) == NOP)
     };
 
     match metadata {
         GateMetadata::Svc => {
-            let adrp = word(8);
-            let add = word(12);
+            let adrp = word_at(8);
+            let add = word_at(12);
             exact(0, Insn::SubSp(SVC_FRAME_BYTES))
                 && exact(
                     4,
@@ -3914,14 +4015,14 @@ fn validate_gate_slot_inner_for_host(
                     // Unplaced, the literal load is still relative to the blob,
                     // so it resolves to the header slot's own offset.
                     SlotAddressing::Unplaced { slot_offset } => {
-                        decode_ldr_literal_target(word(28), slot_offset + 28)
+                        decode_ldr_literal_target(word_at(28), slot_offset + 28)
                             == Some(HEADER_CALLBACK_OFFSET as u64)
                     }
                     SlotAddressing::Placed {
                         trampoline_base,
                         slot_vaddr,
                     } => {
-                        decode_ldr_literal_target(word(28), slot_vaddr + 28)
+                        decode_ldr_literal_target(word_at(28), slot_vaddr + 28)
                             == Some(trampoline_base + HEADER_CALLBACK_OFFSET as u64)
                     }
                 }
@@ -3942,27 +4043,30 @@ fn validate_gate_slot_inner_for_host(
                                 == Opcode::AddImm.bits()
                                     | (u32::from(X16) << RN_SHIFT)
                                     | u32::from(X16)
-                            && word(44) & OPCODE_TOP6_MASK == Opcode::B.bits()
+                            && word_at(44) & OPCODE_TOP6_MASK == Opcode::B.bits()
                     }
                     SlotAddressing::Placed { slot_vaddr, .. } => {
                         let return_from_adrp = decode_adrp_add_target(adrp, add, slot_vaddr + 8);
-                        let return_from_branch = decode_branch_target(word(44), slot_vaddr + 44);
+                        let return_from_branch = decode_branch_target(word_at(44), slot_vaddr + 44);
                         return_from_adrp.is_some() && return_from_adrp == return_from_branch
                     }
                 }
                 && padding_is_nops(48)
         }
         GateMetadata::MrsTpidr { destination } => {
-            is_host_anchor_read(word(0), destination, host)
-                && is_tpidr_access(word(4), Opcode::LdrUimm, destination, destination)
+            is_host_anchor_sequence(slot, metadata, 0, destination, host)
+                && is_tpidr_access(word_at(4), Opcode::LdrUimm, destination, destination)
                 && match addressing {
                     SlotAddressing::Unplaced { .. } => {
-                        word(8) & OPCODE_TOP6_MASK == Opcode::B.bits()
+                        word_at(8) & OPCODE_TOP6_MASK == Opcode::B.bits()
                     }
-                    SlotAddressing::Placed { slot_vaddr, .. } => {
-                        decode_branch_target(word(8), slot_vaddr + 8).is_some()
-                    }
+                    SlotAddressing::Placed { slot_vaddr, .. } => decode_branch_target(
+                        word_at(8),
+                        slot_vaddr + metadata.offset_for_host(host, 8) as u64,
+                    )
+                    .is_some(),
                 }
+                && padding_is_nops(MrsTpidrGateOffset::ExecutableEnd.as_usize())
         }
         GateMetadata::MsrTpidr { source } => {
             exact(0, Insn::SubSp(MSR_FRAME_BYTES))
@@ -3983,7 +4087,7 @@ fn validate_gate_slot_inner_for_host(
                         imm_bytes: MSR_FRAME_OFF_VALUE,
                     },
                 )
-                && is_host_anchor_read(word(12), X16, host)
+                && is_host_anchor_sequence(slot, metadata, 12, X16, host)
                 && exact(
                     16,
                     Insn::LdrUimm {
@@ -3992,7 +4096,7 @@ fn validate_gate_slot_inner_for_host(
                         imm_bytes: MSR_FRAME_OFF_VALUE,
                     },
                 )
-                && is_tpidr_access(word(20), Opcode::StrUimm, X17, X16)
+                && is_tpidr_access(word_at(20), Opcode::StrUimm, X17, X16)
                 && exact(
                     24,
                     Insn::Ldp {
@@ -4005,21 +4109,34 @@ fn validate_gate_slot_inner_for_host(
                 && exact(28, Insn::AddSp(MSR_FRAME_BYTES))
                 && match addressing {
                     SlotAddressing::Unplaced { .. } => {
-                        word(32) & OPCODE_TOP6_MASK == Opcode::B.bits()
-                            && word(36) & OPCODE_TOP6_MASK == Opcode::B.bits()
-                            && branch_local_target(word(32), 32)
-                                == branch_local_target(word(36), 36)
+                        word_at(32) & OPCODE_TOP6_MASK == Opcode::B.bits()
+                            && word_at(36) & OPCODE_TOP6_MASK == Opcode::B.bits()
+                            && branch_local_target(
+                                word_at(32),
+                                i64::try_from(metadata.offset_for_host(host, 32)).unwrap(),
+                            ) == branch_local_target(
+                                word_at(36),
+                                i64::try_from(metadata.offset_for_host(host, 36)).unwrap(),
+                            )
                     }
                     SlotAddressing::Placed { slot_vaddr, .. } => {
-                        decode_branch_target(word(32), slot_vaddr + 32)
-                            == decode_branch_target(word(36), slot_vaddr + 36)
-                            && decode_branch_target(word(32), slot_vaddr + 32).is_some()
+                        decode_branch_target(
+                            word_at(32),
+                            slot_vaddr + metadata.offset_for_host(host, 32) as u64,
+                        ) == decode_branch_target(
+                            word_at(36),
+                            slot_vaddr + metadata.offset_for_host(host, 36) as u64,
+                        ) && decode_branch_target(
+                            word_at(32),
+                            slot_vaddr + metadata.offset_for_host(host, 32) as u64,
+                        )
+                        .is_some()
                     }
                 }
-                && padding_is_nops(40)
+                && padding_is_nops(MSR_GATE_BODY_END)
         }
         GateMetadata::X18 { scratch } => {
-            let anchor_scratch = ((word(0) >> RT2_SHIFT) & REG_MASK) as u8;
+            let anchor_scratch = ((word_at(0) >> RT2_SHIFT) & REG_MASK) as u8;
             if !(7..=17).contains(&scratch)
                 || !(7..=17).contains(&anchor_scratch)
                 || anchor_scratch == scratch
@@ -4034,12 +4151,14 @@ fn validate_gate_slot_inner_for_host(
                     rn: SP,
                     imm_bytes: -(X18_FRAME_BYTES.cast_signed()),
                 },
-            ) && is_host_anchor_read(
-                word(X18GateOffset::FirstAnchor.as_usize()),
+            ) && is_host_anchor_sequence(
+                slot,
+                metadata,
+                X18GateOffset::FirstAnchor.as_usize(),
                 anchor_scratch,
                 host,
             ) && is_x18_access(
-                word(X18GateOffset::SlotLoad.as_usize()),
+                word_at(X18GateOffset::SlotLoad.as_usize()),
                 Opcode::LdrUimm,
                 scratch,
                 anchor_scratch,
@@ -4060,14 +4179,16 @@ fn validate_gate_slot_inner_for_host(
                     rn: anchor_scratch,
                     imm12: 0,
                 },
-            ) && is_host_anchor_read(
-                word(X18GateOffset::SecondAnchor.as_usize()),
+            ) && is_host_anchor_sequence(
+                slot,
+                metadata,
+                X18GateOffset::SecondAnchor.as_usize(),
                 anchor_scratch,
                 host,
-            ) && word(X18GateOffset::FirstAnchor.as_usize())
-                == word(X18GateOffset::SecondAnchor.as_usize())
+            ) && word_at(X18GateOffset::FirstAnchor.as_usize())
+                == word_at(X18GateOffset::SecondAnchor.as_usize())
                 && is_x18_access(
-                    word(X18GateOffset::SlotStore.as_usize()),
+                    word_at(X18GateOffset::SlotStore.as_usize()),
                     Opcode::StrUimm,
                     scratch,
                     anchor_scratch,
@@ -4081,12 +4202,12 @@ fn validate_gate_slot_inner_for_host(
                         imm_bytes: X18_FRAME_BYTES.cast_signed(),
                     },
                 )
-                && word(X18GateOffset::Return.as_usize()) & OPCODE_TOP6_MASK == Opcode::B.bits()
+                && word_at(X18GateOffset::Return.as_usize()) & OPCODE_TOP6_MASK == Opcode::B.bits()
                 && padding_is_nops(X18GateOffset::ExecutableEnd.as_usize())
         }
         GateMetadata::X18StackWriteback { scratch } => {
-            let anchor_scratch = ((word(4) >> RT2_SHIFT) & REG_MASK) as u8;
-            let transformed = word(X18StackWritebackOffset::Transform.as_usize());
+            let anchor_scratch = ((word_at(4) >> RT2_SHIFT) & REG_MASK) as u8;
+            let transformed = word_at(X18StackWritebackOffset::Transform.as_usize());
             let Some(layout) = decode_x18_stack_writeback(transformed) else {
                 return false;
             };
@@ -4137,8 +4258,8 @@ fn validate_gate_slot_inner_for_host(
                         imm_bytes: 0,
                     },
                 )
-                && is_host_anchor_read(word(8), anchor_scratch, host)
-                && is_x18_access(word(12), Opcode::LdrUimm, scratch, anchor_scratch)
+                && is_host_anchor_sequence(slot, metadata, 8, anchor_scratch, host)
+                && is_x18_access(word_at(12), Opcode::LdrUimm, scratch, anchor_scratch)
                 && exact(
                     16,
                     Insn::AddImm {
@@ -4156,9 +4277,9 @@ fn validate_gate_slot_inner_for_host(
                         imm12: 0,
                     },
                 )
-                && is_host_anchor_read(word(32), anchor_scratch, host)
-                && word(8) == word(32)
-                && is_x18_access(word(36), Opcode::StrUimm, scratch, anchor_scratch)
+                && is_host_anchor_sequence(slot, metadata, 32, anchor_scratch, host)
+                && word_at(8) == word_at(32)
+                && is_x18_access(word_at(36), Opcode::StrUimm, scratch, anchor_scratch)
                 && exact(
                     40,
                     Insn::Ldp {
@@ -4175,11 +4296,11 @@ fn validate_gate_slot_inner_for_host(
                             .unwrap(),
                     ),
                 )
-                && word(48) & OPCODE_TOP6_MASK == Opcode::B.bits()
+                && word_at(48) & OPCODE_TOP6_MASK == Opcode::B.bits()
                 && padding_is_nops(52)
         }
         GateMetadata::X18CompareBranch { scratch } => {
-            let anchor_scratch = ((word(4) >> RT2_SHIFT) & REG_MASK) as u8;
+            let anchor_scratch = ((word_at(4) >> RT2_SHIFT) & REG_MASK) as u8;
             if !(7..=17).contains(&scratch)
                 || !(7..=17).contains(&anchor_scratch)
                 || anchor_scratch == scratch
@@ -4196,8 +4317,8 @@ fn validate_gate_slot_inner_for_host(
                         imm_bytes: 0,
                     },
                 )
-                && is_host_anchor_read(word(8), anchor_scratch, host)
-                && is_x18_access(word(12), Opcode::LdrUimm, scratch, anchor_scratch)
+                && is_host_anchor_sequence(slot, metadata, 8, anchor_scratch, host)
+                && is_x18_access(word_at(12), Opcode::LdrUimm, scratch, anchor_scratch)
                 && ([
                     Insn::CbnzW {
                         rt: scratch,
@@ -4241,7 +4362,7 @@ fn validate_gate_slot_inner_for_host(
                     },
                 )
                 && exact(24, Insn::AddSp(X18_FRAME_BYTES))
-                && word(28) & OPCODE_TOP6_MASK == Opcode::B.bits()
+                && word_at(28) & OPCODE_TOP6_MASK == Opcode::B.bits()
                 && exact(
                     32,
                     Insn::Ldp {
@@ -4252,12 +4373,13 @@ fn validate_gate_slot_inner_for_host(
                     },
                 )
                 && exact(36, Insn::AddSp(X18_FRAME_BYTES))
-                && word(40) & OPCODE_TOP6_MASK == Opcode::B.bits()
+                && word_at(40) & OPCODE_TOP6_MASK == Opcode::B.bits()
+                && padding_is_nops(X18CompareBranchOffset::ExecutableEnd.as_usize())
         }
         GateMetadata::X18Adr { scratch } => {
-            let anchor_scratch = ((word(0) >> RT2_SHIFT) & REG_MASK) as u8;
-            let adrp = word(8);
-            let add = word(12);
+            let anchor_scratch = ((word_at(0) >> RT2_SHIFT) & REG_MASK) as u8;
+            let adrp = word_at(8);
+            let add = word_at(12);
             if !(7..=17).contains(&scratch)
                 || !(7..=17).contains(&anchor_scratch)
                 || anchor_scratch == scratch
@@ -4272,11 +4394,11 @@ fn validate_gate_slot_inner_for_host(
                     rn: SP,
                     imm_bytes: -(X18_FRAME_BYTES.cast_signed()),
                 },
-            ) && is_host_anchor_read(word(4), anchor_scratch, host)
+            ) && is_host_anchor_sequence(slot, metadata, 4, anchor_scratch, host)
                 && adrp & ADRP_SHAPE_MASK == Opcode::Adrp.bits() | u32::from(scratch)
                 && add & ADD_IMM_SHAPE_MASK
                     == Opcode::AddImm.bits() | (u32::from(scratch) << RN_SHIFT) | u32::from(scratch)
-                && is_x18_access(word(16), Opcode::StrUimm, scratch, anchor_scratch)
+                && is_x18_access(word_at(16), Opcode::StrUimm, scratch, anchor_scratch)
                 && exact(
                     20,
                     Insn::LdpPost {
@@ -4286,12 +4408,13 @@ fn validate_gate_slot_inner_for_host(
                         imm_bytes: X18_FRAME_BYTES.cast_signed(),
                     },
                 )
-                && word(24) & OPCODE_TOP6_MASK == Opcode::B.bits()
+                && word_at(24) & OPCODE_TOP6_MASK == Opcode::B.bits()
+                && padding_is_nops(X18AdrOffset::ExecutableEnd.as_usize())
         }
         GateMetadata::X18Branch { .. } => {
             exact(0, Insn::Brk(X18_BRANCH_BRK_IMM))
-                && word(4) & OPCODE_TOP6_MASK == Opcode::B.bits()
-                && word(8) == NOP
+                && word_at(4) & OPCODE_TOP6_MASK == Opcode::B.bits()
+                && word_at(8) == NOP
         }
     }
 }
@@ -4309,6 +4432,81 @@ impl GateMetadata {
             GateMetadata::X18Adr { .. } => X18_ADR_SLOT_BYTES,
             GateMetadata::X18Branch { .. } => X18_BRANCH_SLOT_BYTES,
         }
+    }
+
+    /// Returns this gate's slot size for the selected host layout.
+    pub const fn slot_size_for_host(self, host: crate::TargetHost) -> usize {
+        self.slot_size_for(match host {
+            crate::TargetHost::Linux => Host::Linux,
+            crate::TargetHost::MacOs => Host::MacOs,
+            crate::TargetHost::Windows => Host::Windows,
+        })
+    }
+
+    const fn slot_size_for(self, host: Host) -> usize {
+        if !matches!(host, Host::MacOs) {
+            return self.slot_size();
+        }
+        match self {
+            GateMetadata::MrsTpidr { .. } => MRS_SLOT_BYTES + GATE_ALIGNMENT,
+            GateMetadata::X18 { .. } => X18_SLOT_BYTES + GATE_ALIGNMENT,
+            GateMetadata::X18CompareBranch { .. } => X18_COMPARE_BRANCH_SLOT_BYTES + GATE_ALIGNMENT,
+            GateMetadata::X18Adr { .. } => X18_ADR_SLOT_BYTES + GATE_ALIGNMENT,
+            _ => self.slot_size(),
+        }
+    }
+
+    const fn macos_anchor_offsets(self) -> &'static [usize] {
+        match self {
+            GateMetadata::MrsTpidr { .. } => &[MrsTpidrGateOffset::Entry as usize],
+            GateMetadata::MsrTpidr { .. } => &[MsrTpidrGateOffset::ReadAnchor as usize],
+            GateMetadata::X18 { .. } => &[
+                X18GateOffset::FirstAnchor as usize,
+                X18GateOffset::SecondAnchor as usize,
+            ],
+            GateMetadata::X18StackWriteback { .. } => &[
+                X18StackWritebackOffset::FirstAnchor as usize,
+                X18StackWritebackOffset::SecondAnchor as usize,
+            ],
+            GateMetadata::X18CompareBranch { .. } => &[X18CompareBranchOffset::Anchor as usize],
+            GateMetadata::X18Adr { .. } => &[X18AdrOffset::Anchor as usize],
+            GateMetadata::Svc | GateMetadata::X18Branch { .. } => &[],
+        }
+    }
+
+    const fn offset_for_host(self, host: Host, logical: usize) -> usize {
+        if !matches!(host, Host::MacOs) {
+            return logical;
+        }
+        let anchors = self.macos_anchor_offsets();
+        let mut index = 0;
+        let mut extra = 0;
+        while index < anchors.len() {
+            if anchors[index] < logical {
+                extra += INSN_BYTES;
+            }
+            index += 1;
+        }
+        logical + extra
+    }
+
+    /// Converts a host-layout instruction offset to its host-neutral recovery stage.
+    pub fn recovery_offset_for_host(self, host: crate::TargetHost, host_offset: usize) -> usize {
+        if !matches!(host, crate::TargetHost::MacOs) {
+            return host_offset;
+        }
+        let anchors = self.macos_anchor_offsets();
+        let mut extra = 0;
+        for &anchor in anchors {
+            let mask = anchor + extra + INSN_BYTES;
+            if host_offset == mask {
+                return anchor + INSN_BYTES;
+            }
+            if host_offset > mask {
+                extra += INSN_BYTES;
+            }
+        }
+        host_offset - extra
     }
 
     /// First byte offset past the slot's executable body.
@@ -4333,6 +4531,10 @@ impl GateMetadata {
         }
     }
 
+    const fn executable_end_for_host(self, host: Host) -> usize {
+        self.offset_for_host(host, self.executable_end())
+    }
+
     /// Byte offset of the branch that returns to the instruction after the
     /// original site.
     pub(crate) const fn return_offset(self) -> usize {
@@ -4349,7 +4551,25 @@ impl GateMetadata {
             GateMetadata::X18Branch { .. } => X18_BRANCH_PROVENANCE_OFFSET,
         }
     }
+
+    const fn return_offset_for_host(self, host: Host) -> usize {
+        self.offset_for_host(host, self.return_offset())
+    }
 }
+
+// These macOS layouts have no spare instruction slots.
+const _: () = {
+    let msr = GateMetadata::MsrTpidr { source: 0 };
+    assert!(
+        msr.offset_for_host(Host::MacOs, MSR_GATE_BODY_END) + GATE_METADATA_BYTES
+            == msr.slot_size_for_host(crate::TargetHost::MacOs)
+    );
+    let stack = GateMetadata::X18StackWriteback { scratch: 7 };
+    assert!(
+        stack.executable_end_for_host(Host::MacOs) + GATE_METADATA_BYTES
+            == stack.slot_size_for_host(crate::TargetHost::MacOs)
+    );
+};
 
 /// Decode one little-endian metadata word copied from a candidate slot.
 pub fn decode_gate_metadata_word(word: u32) -> Option<GateMetadata> {
@@ -4448,7 +4668,10 @@ pub fn classify_copied_gate_slot_for_host(
     let metadata_word =
         u32::from_le_bytes(slot.get(slot.len().checked_sub(4)?..)?.try_into().ok()?);
     let metadata = EncodedGateMetadata(metadata_word).decode()?;
-    if metadata.slot_size() != slot.len() || offset >= metadata.executable_end() {
+    let selected_host: Host = host.into();
+    if metadata.slot_size_for_host(host) != slot.len()
+        || offset >= metadata.executable_end_for_host(selected_host)
+    {
         return None;
     }
     let trampoline_base = match metadata {
@@ -4482,11 +4705,11 @@ pub fn classify_copied_gate_slot_for_host(
             slot_vaddr,
         },
         metadata,
-        Some(host.into()),
+        host.into(),
     ) {
         return None;
     }
-    let return_offset = metadata.return_offset();
+    let return_offset = metadata.return_offset_for_host(selected_host);
     let return_target = decode_branch_target(
         u32::from_le_bytes(
             slot.get(return_offset..return_offset + INSN_BYTES)?
@@ -4498,17 +4721,27 @@ pub fn classify_copied_gate_slot_for_host(
     let conditional_target = if matches!(metadata, GateMetadata::X18CompareBranch { .. }) {
         decode_branch_target(
             u32::from_le_bytes(
-                slot[X18CompareBranchOffset::TakenBranch.as_usize()
-                    ..X18CompareBranchOffset::TakenBranch.as_usize() + INSN_BYTES]
+                slot[metadata.offset_for_host(
+                    selected_host,
+                    X18CompareBranchOffset::TakenBranch.as_usize(),
+                )
+                    ..metadata.offset_for_host(
+                        selected_host,
+                        X18CompareBranchOffset::TakenBranch.as_usize(),
+                    ) + INSN_BYTES]
                     .try_into()
                     .ok()?,
             ),
-            slot_vaddr + X18CompareBranchOffset::TakenBranch.as_usize() as u64,
+            slot_vaddr
+                + metadata.offset_for_host(
+                    selected_host,
+                    X18CompareBranchOffset::TakenBranch.as_usize(),
+                ) as u64,
         )?
     } else {
         0
     };
-    let (stack_delta, stack_frame_bytes) = stack_writeback_state(slot, metadata)?;
+    let (stack_delta, stack_frame_bytes) = stack_writeback_state(slot, metadata, selected_host)?;
     Some(ClassifiedGate {
         slot_offset: 0,
         slot_size: u8::try_from(slot.len()).ok()?,
@@ -4562,7 +4795,7 @@ fn classify_gate_pc_with_candidates<const N: usize>(
                         slot_vaddr,
                     },
                     metadata,
-                    Some(Host::Linux),
+                    Host::Linux,
                 )
             {
                 continue;
@@ -4592,7 +4825,8 @@ fn classify_gate_pc_with_candidates<const N: usize>(
             } else {
                 0
             };
-            let (stack_delta, stack_frame_bytes) = stack_writeback_state(slot, metadata)?;
+            let (stack_delta, stack_frame_bytes) =
+                stack_writeback_state(slot, metadata, Host::Linux)?;
             match_found = Some(ClassifiedGate {
                 slot_offset: start,
                 slot_size: u8::try_from(slot_size).ok()?,
@@ -4630,22 +4864,30 @@ fn is_x18_access(word: u32, opcode: Opcode, rt: u8, rn: u8) -> bool {
         )
 }
 
-fn is_host_anchor_read(word: u32, register: u8, host: Option<Host>) -> bool {
-    host.map_or_else(
-        || {
-            [Host::Linux, Host::MacOs, Host::Windows]
-                .into_iter()
-                .any(|host| host.anchor_read(register).encode() == Some(word))
-        },
-        |host| host.anchor_read(register).encode() == Some(word),
-    )
+fn is_host_anchor_sequence(
+    slot: &[u8],
+    metadata: GateMetadata,
+    logical_offset: usize,
+    register: u8,
+    host: Host,
+) -> bool {
+    let emitted_offset = metadata.offset_for_host(host, logical_offset);
+    let word_at_emitted_offset = |offset: usize| {
+        slot.get(offset..offset + INSN_BYTES)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u32::from_le_bytes)
+    };
+    word_at_emitted_offset(emitted_offset) == host.anchor_read(register).encode()
+        && (!matches!(host, Host::MacOs)
+            || word_at_emitted_offset(emitted_offset + INSN_BYTES)
+                == anchor_mask(register).encode())
 }
 
-fn stack_writeback_state(slot: &[u8], metadata: GateMetadata) -> Option<(i16, u16)> {
+fn stack_writeback_state(slot: &[u8], metadata: GateMetadata, host: Host) -> Option<(i16, u16)> {
     if !matches!(metadata, GateMetadata::X18StackWriteback { .. }) {
         return Some((0, 0));
     }
-    let offset = X18StackWritebackOffset::Transform.as_usize();
+    let offset = metadata.offset_for_host(host, X18StackWritebackOffset::Transform.as_usize());
     let layout = decode_x18_stack_writeback(u32::from_le_bytes(
         slot.get(offset..offset + INSN_BYTES)?.try_into().ok()?,
     ))?;
@@ -4653,6 +4895,8 @@ fn stack_writeback_state(slot: &[u8], metadata: GateMetadata) -> Option<(i16, u1
 }
 
 fn x18_anchor_scratch(slot: &[u8], metadata: GateMetadata) -> Option<u8> {
+    // These spill instructions precede the first host-anchor read, so their
+    // offsets are identical in the base and expanded macOS layouts.
     let offset = match metadata {
         GateMetadata::X18 { .. } | GateMetadata::X18Adr { .. } => 0,
         GateMetadata::X18StackWriteback { .. } | GateMetadata::X18CompareBranch { .. } => 4,
@@ -4918,14 +5162,14 @@ fn validate_trampoline_offsets_for_host(
             let Some(metadata) = EncodedGateMetadata(metadata_word).decode() else {
                 continue;
             };
-            if metadata.slot_size() != slot_size
+            if metadata.slot_size_for(host) != slot_size
                 || !validate_gate_slot_inner_for_host(
                     &trampoline[cursor..end],
                     SlotAddressing::Unplaced {
                         slot_offset: cursor as u64,
                     },
                     metadata,
-                    Some(host),
+                    host,
                 )
             {
                 continue;
@@ -4951,18 +5195,27 @@ fn validate_trampoline_offsets_for_host(
                 | GateMetadata::X18Branch { .. }
         );
         let instruction_offsets: &[usize] = match (metadata, x18) {
-            (GateMetadata::MrsTpidr { .. }, false) => &[cursor + 4],
-            (GateMetadata::MsrTpidr { .. }, false) => &[cursor + 20],
+            (GateMetadata::MrsTpidr { .. }, false) => &[
+                cursor + metadata.offset_for_host(host, MrsTpidrGateOffset::SlotLoad.as_usize())
+            ],
+            (GateMetadata::MsrTpidr { .. }, false) => &[
+                cursor + metadata.offset_for_host(host, MsrTpidrGateOffset::SlotStore.as_usize())
+            ],
             (GateMetadata::X18 { .. }, true) => &[
-                cursor + X18GateOffset::SlotLoad.as_usize(),
-                cursor + X18GateOffset::SlotStore.as_usize(),
+                cursor + metadata.offset_for_host(host, X18GateOffset::SlotLoad.as_usize()),
+                cursor + metadata.offset_for_host(host, X18GateOffset::SlotStore.as_usize()),
             ],
             (GateMetadata::X18StackWriteback { .. }, true) => &[
-                cursor + X18StackWritebackOffset::SlotLoad.as_usize(),
-                cursor + X18StackWritebackOffset::SlotStore.as_usize(),
+                cursor
+                    + metadata.offset_for_host(host, X18StackWritebackOffset::SlotLoad.as_usize()),
+                cursor
+                    + metadata.offset_for_host(host, X18StackWritebackOffset::SlotStore.as_usize()),
             ],
-            (GateMetadata::X18CompareBranch { .. }, true) => &[cursor + 12],
-            (GateMetadata::X18Adr { .. }, true) => &[cursor + 16],
+            (GateMetadata::X18CompareBranch { .. }, true) => &[cursor
+                + metadata.offset_for_host(host, X18CompareBranchOffset::SlotLoad.as_usize())],
+            (GateMetadata::X18Adr { .. }, true) => {
+                &[cursor + metadata.offset_for_host(host, X18AdrOffset::SlotStore.as_usize())]
+            }
             _ => &[],
         };
         for &offset in instruction_offsets {
@@ -5193,14 +5446,58 @@ mod tests {
             word_at(&trampoline, 16),
             Insn::MrsTpidrroEl0(9).encode().unwrap()
         );
+        assert_eq!(word_at(&trampoline, 20), anchor_mask(9).encode().unwrap());
         assert_eq!(
-            word_at(&trampoline, 32 + 12),
+            word_at(&trampoline, 48 + 12),
             Insn::MrsTpidrroEl0(X16).encode().unwrap()
         );
+        assert_eq!(
+            word_at(&trampoline, 48 + 16),
+            anchor_mask(X16).encode().unwrap()
+        );
         assert!(matches!(
-            decode_gate_metadata_word(word_at(&trampoline, 80 + SVC_SLOT_BYTES - 4)),
+            decode_gate_metadata_word(word_at(&trampoline, 96 + SVC_SLOT_BYTES - 4)),
             Some(GateMetadata::Svc)
         ));
+    }
+
+    #[test]
+    fn macos_masks_every_emitted_tpidrro_anchor() {
+        let words = [
+            Insn::MrsTpidrEl0(9).encode().unwrap(),
+            msr_tpidr_el0(5),
+            0xaa00_03f2, // mov x18, x0
+            0xa9bf_4ff2, // stp x18, x19, [sp, #-16]!
+            0x3500_0332, // cbnz w18, +0x64
+            0x1000_0072, // adr x18, +0xc
+        ];
+        let (_, outcome) = hook_words_opt_with_config(
+            &words,
+            0x1000,
+            0x400000,
+            RewriteConfig::new(crate::TargetHost::MacOs, true),
+        );
+        let trampoline = outcome.unwrap().trampoline;
+        let mut anchors = 0;
+        for offset in (0..trampoline.len() - INSN_BYTES).step_by(INSN_BYTES) {
+            let word = word_at(&trampoline, offset);
+            if word & !REG_MASK == Opcode::MrsTpidrroEl0.bits() {
+                let register = (word & REG_MASK) as u8;
+                assert_eq!(
+                    word_at(&trampoline, offset + INSN_BYTES),
+                    anchor_mask(register).encode().unwrap()
+                );
+                anchors += 1;
+            }
+        }
+        assert_eq!(anchors, 8);
+
+        let (_, linux) = hook_words(&[Insn::MrsTpidrEl0(9).encode().unwrap()], 0x1000, 0x400000);
+        assert_ne!(
+            word_at(&linux, GATES_START_OFFSET + INSN_BYTES),
+            anchor_mask(9).encode().unwrap()
+        );
+        assert_eq!(linux.len(), GATES_START_OFFSET + MRS_SLOT_BYTES);
     }
 
     #[test]
@@ -5577,8 +5874,9 @@ mod tests {
             .unwrap(),
             0x1000_0070
         );
-        // TPIDR_EL0 accessor.
+        // TPIDR_EL0 accessor and `AND X9, X9, #0xfffffffffffffff8`.
         assert_eq!(Insn::MrsTpidrEl0(9).encode().unwrap(), 0xD53B_D049);
+        assert_eq!(anchor_mask(9).encode().unwrap(), 0x927D_F129);
         // `MSR TPIDR_EL0, X9` guest word (scanned, never emitted).
         assert_eq!(msr_tpidr_el0(9), 0xD51B_D049);
         // Scaled (×8) 64-bit load/store: `ldr x9,[x9,#16]` / `str x17,[x16,#16]`.
@@ -5824,13 +6122,19 @@ mod tests {
                 hook_words_opt_with_config(&[0x0b12_0063], 0x1000, 0x400000, x18_config(host));
             let trampoline = outcome.unwrap().trampoline;
             let gate = &trampoline[GATES_START_OFFSET..];
-            assert_eq!(gate.len(), X18_SLOT_BYTES);
+            assert_eq!(
+                gate.len(),
+                GateMetadata::X18 { scratch: X17 }.slot_size_for(host)
+            );
             assert_eq!(
                 word_at(gate, X18GateOffset::FirstAnchor.as_usize()),
                 anchor_word
             );
+            if host == Host::MacOs {
+                assert_eq!(word_at(gate, 8), anchor_mask(X16).encode().unwrap());
+            }
             assert_eq!(
-                word_at(gate, X18_SLOT_BYTES - GATE_METADATA_BYTES),
+                word_at(gate, gate.len() - GATE_METADATA_BYTES),
                 EncodedGateMetadata::encode(GateMetadata::X18 { scratch: X17 })
                     .unwrap()
                     .0
@@ -5879,10 +6183,16 @@ mod tests {
                 kind: X18IndirectBranchKind::Ret,
             },
         ] {
-            assert!(
-                GATE_SLOT_SIZES.contains(&metadata.slot_size()),
-                "{metadata:?}"
-            );
+            for host in [
+                crate::TargetHost::Linux,
+                crate::TargetHost::MacOs,
+                crate::TargetHost::Windows,
+            ] {
+                assert!(
+                    GATE_SLOT_SIZES.contains(&metadata.slot_size_for_host(host)),
+                    "{metadata:?} on {host:?}"
+                );
+            }
         }
     }
 
@@ -7016,6 +7326,37 @@ mod tests {
     }
 
     #[test]
+    fn macos_recovery_offsets_cover_expanded_gate_layouts() {
+        for metadata in [
+            GateMetadata::MrsTpidr { destination: 9 },
+            GateMetadata::MsrTpidr { source: 9 },
+            GateMetadata::X18 { scratch: 17 },
+            GateMetadata::X18StackWriteback { scratch: 17 },
+            GateMetadata::X18CompareBranch { scratch: 17 },
+            GateMetadata::X18Adr { scratch: 17 },
+        ] {
+            for logical in (0..metadata.executable_end()).step_by(INSN_BYTES) {
+                let host_offset = metadata.offset_for_host(Host::MacOs, logical);
+                assert_eq!(
+                    metadata.recovery_offset_for_host(crate::TargetHost::MacOs, host_offset),
+                    logical,
+                    "{metadata:?} logical offset {logical}"
+                );
+            }
+            let mut extra = 0;
+            for &anchor in metadata.macos_anchor_offsets() {
+                let mask = anchor + extra + INSN_BYTES;
+                assert_eq!(
+                    metadata.recovery_offset_for_host(crate::TargetHost::MacOs, mask),
+                    anchor + INSN_BYTES,
+                    "{metadata:?} mask after anchor {anchor}"
+                );
+                extra += INSN_BYTES;
+            }
+        }
+    }
+
+    #[test]
     fn compact_metadata_exhaustively_rejects_invalid_encodings() {
         let valid = EncodedGateMetadata::encode(GateMetadata::MrsTpidr { destination: 9 })
             .unwrap()
@@ -7336,6 +7677,87 @@ mod tests {
                 !valid_emitted_tpidr_offset(invalid),
                 "accepted impossible byte offset {invalid}"
             );
+        }
+    }
+
+    #[test]
+    fn macos_copied_slot_classifier_covers_expanded_instructions_and_padding() {
+        let base = 0x400000;
+        let normal_words = [
+            Insn::MrsTpidrEl0(9).encode().unwrap(),
+            msr_tpidr_el0(5),
+            SVC_0,
+        ];
+        let (_, normal) = hook_words_opt_with_config(
+            &normal_words,
+            0x1000,
+            base,
+            RewriteConfig::new(crate::TargetHost::MacOs, true),
+        );
+        let x18_words = [
+            0xaa00_03f2, // mov x18, x0
+            0xa9bf_4ff2, // stp x18, x19, [sp, #-16]!
+            0x3500_0332, // cbnz w18, +0x64
+            0x1000_0072, // adr x18, +0xc
+            0xd61f_0240, // br x18
+        ];
+        let (_, x18) =
+            hook_words_opt_with_config(&x18_words, 0x2000, base, x18_config(Host::MacOs));
+
+        for (trampoline, sizes) in [
+            (normal.unwrap().trampoline, vec![32, 48, 64]),
+            (x18.unwrap().trampoline, vec![64, 64, 64, 48, 16]),
+        ] {
+            let mut start = GATES_START_OFFSET;
+            for size in sizes {
+                let slot = &trampoline[start..start + size];
+                let metadata = EncodedGateMetadata(u32::from_le_bytes(
+                    slot[size - GATE_METADATA_BYTES..].try_into().unwrap(),
+                ))
+                .decode()
+                .unwrap();
+                let executable_end = metadata.executable_end_for_host(Host::MacOs);
+                for offset in (0..executable_end).step_by(INSN_BYTES) {
+                    let classified = classify_copied_gate_slot_for_host(
+                        slot,
+                        base + start as u64,
+                        base + (start + offset) as u64,
+                        crate::TargetHost::MacOs,
+                    )
+                    .expect("emitted macOS slot must classify");
+                    assert_eq!(classified.slot_offset(), 0);
+                    assert_eq!(classified.slot_size(), u8::try_from(size).unwrap());
+                    assert_eq!(classified.metadata(), metadata);
+                }
+
+                // The MSR slot's second recovery branch lies beyond its
+                // guest-attributable range and immediately precedes metadata.
+                // All remaining pre-metadata words are validated padding.
+                let padding_start = match metadata {
+                    GateMetadata::MsrTpidr { .. } => size - GATE_METADATA_BYTES,
+                    GateMetadata::X18Branch { .. } => 8,
+                    _ => executable_end,
+                };
+                for padding in (padding_start..size - GATE_METADATA_BYTES).step_by(INSN_BYTES) {
+                    assert_eq!(
+                        u32::from_le_bytes(slot[padding..padding + 4].try_into().unwrap()),
+                        NOP
+                    );
+                    let mut corrupted = slot.to_vec();
+                    corrupted[padding..padding + 4]
+                        .copy_from_slice(&Insn::Brk(0).encode().unwrap().to_le_bytes());
+                    assert_eq!(
+                        classify_copied_gate_slot_for_host(
+                            &corrupted,
+                            base + start as u64,
+                            base + start as u64,
+                            crate::TargetHost::MacOs,
+                        ),
+                        None
+                    );
+                }
+                start += size;
+            }
         }
     }
 
