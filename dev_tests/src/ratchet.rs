@@ -34,7 +34,7 @@ fn ratchet_globals() -> Result<()> {
     ratchet(
         &[
             ("dev_bench/", 1),
-            ("litebox/", 7),
+            ("litebox/", 8),
             ("litebox_broker_core/", 1),
             ("litebox_broker_transport_linux_userland/", 1),
             ("litebox_broker_userland/", 1),
