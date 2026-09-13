@@ -9,6 +9,7 @@ extern crate alloc;
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
+use litebox_broker_local_userland as broker;
 use litebox_platform_linux_userland::LinuxUserland;
 use std::path::PathBuf;
 
@@ -32,9 +33,21 @@ pub struct CliArgs {
     /// Allow using unstable options.
     #[arg(short = 'Z', long = "unstable")]
     pub unstable: bool,
+    /// Broker-supplied Unix socket path for the local control channel.
+    #[arg(
+        long = "broker-control-channel",
+        value_name = "PATH",
+        value_hint = clap::ValueHint::FilePath,
+        hide = true,
+        requires = "unstable",
+        help_heading = "Unstable Options"
+    )]
+    pub broker_control_channel: Option<PathBuf>,
     /// Tar archive containing the program and its runtime files.
+    ///
+    /// This may be omitted when the broker was configured with `--fs-initial-files`.
     #[arg(long = "initial-files", value_name = "PATH_TO_TAR", value_hint = clap::ValueHint::FilePath)]
-    pub initial_files: PathBuf,
+    pub initial_files: Option<PathBuf>,
 }
 
 /// Run Windows PE programs with LiteBox on unmodified Linux.
@@ -60,36 +73,32 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         );
     }
 
-    let tar_file = &cli_args.initial_files;
-    if tar_file.extension().and_then(|x| x.to_str()) != Some("tar") {
-        anyhow::bail!("Expected a .tar file, found {}", tar_file.display());
-    }
-    let tar_data = std::fs::read(tar_file)
-        .with_context(|| format!("Could not read tar file at {}", tar_file.display()))?;
-
     let platform = LinuxUserland::new();
-    let shim_builder = litebox_shim_windows::WindowsShimBuilder::new(platform);
+    let control_socket = cli_args
+        .broker_control_channel
+        .as_deref()
+        .context("file operations require --broker-control-channel")?;
+    let broker::BrokerConnection {
+        local,
+        notifications,
+        coordinator,
+        positional_io_fds: _broker_positional_io_fds,
+        shutdown_fd: _broker_shutdown_fd,
+    } = broker::connect(control_socket)?;
+    let litebox = litebox::LiteBox::new_with_broker_local(platform, local);
+    coordinator.install_dispatch(litebox.broker_failure_dispatcher());
+    broker::start_notification_receiver(
+        notifications,
+        coordinator,
+        litebox.broker_notification_dispatcher(),
+    )?;
+    let shim_builder =
+        litebox_shim_windows::WindowsShimBuilder::new_with_litebox(platform, litebox);
 
     let (program_path, program_args) = cli_args
         .program_and_arguments
         .split_first()
         .context("program path missing - clap should have required at least one argument")?;
-
-    let initial_file_system = {
-        let in_mem = litebox::fs::in_mem::InMem::new_initialized([(
-            "/tmp",
-            litebox::fs::in_mem::InitialNode::Directory {
-                mode: litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
-                owner: litebox::fs::UserInfo {
-                    user: 1000,
-                    group: 1000,
-                },
-            },
-        )]);
-
-        shim_builder.default_fs(in_mem, tar_data.into())
-    };
-    let initial_file_system = std::sync::Arc::new(initial_file_system);
 
     let shim = shim_builder.build();
     let argv = std::iter::once(program_path.as_str())
@@ -113,7 +122,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     }
 
     let program = shim
-        .load_program(initial_file_system, program_path, argv, envp)
+        .load_program(program_path, argv, envp)
         .context("failed to load Windows PE program")?;
     // SAFETY: `WindowsShimEntrypoints::init` populates `rip`/`rsp`/`eflags` inside
     // `run_thread` before the initial guest thread executes, so the `PtRegs::default()`

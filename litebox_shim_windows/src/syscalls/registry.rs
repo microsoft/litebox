@@ -1,8 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Windows registry syscalls backed by a private file-system-shaped store (i.e.,
-//! an overlay file system with in-memory and tar backends).
+//! Windows registry syscalls backed by LiteBox's broker-backed file APIs.
 //!
 //! Registry keys are represented as directories and values as files under each
 //! key's `.values` directory:
@@ -24,7 +23,6 @@
 //! This is only an implementation detail: syscall handlers must expose registry
 //! object semantics rather than file semantics.
 
-use core::marker::PhantomData;
 use core::mem::{offset_of, size_of};
 
 use alloc::collections::BTreeMap;
@@ -34,22 +32,22 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use int_enum::IntEnum;
-use litebox::LiteBox;
 use litebox::event::{
     Events,
     polling::{Pollee, TryOpError},
 };
-use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd};
+use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry};
 use litebox::fs::errors::{
     FileStatusError, MkdirError, OpenError, PathError, ReadDirError, ReadError, WriteError,
 };
-use litebox::fs::{FileType, Mode, OFlags};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox::sync::Mutex;
 use litebox::utils::TruncateExt;
+use litebox_broker_protocol::fs::{FileAccessMode, FileMode as Mode, FileOpenFlags, FileType};
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
+use crate::fs::{Fs, REGISTRY_ROOT};
 use crate::syscalls::Handle;
 use crate::{ConstPtr, MutPtr, Task, probe_guest_output_preserving_value, raw_handle_entry};
 
@@ -58,39 +56,39 @@ use crate::nt_types::{
     read_unicode_string_at,
 };
 
-type RegistryFileSystem<Platform> =
-    litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>;
-
-pub(crate) struct RegistryKeySubsystem<Platform>(PhantomData<fn(Platform)>);
-
-impl<Platform: crate::ShimPlatform> FdEnabledSubsystem for RegistryKeySubsystem<Platform> {
-    type Entry = RegistryKeyObject<Platform>;
+impl FdEnabledSubsystem for RegistryKeyObject {
+    type Entry = Self;
 }
 
-impl<Platform: crate::ShimPlatform> FdEnabledSubsystemEntry for RegistryKeyObject<Platform> {}
+impl FdEnabledSubsystemEntry for RegistryKeyObject {}
 
-impl<Platform: crate::ShimPlatform> crate::WindowsHandleSubsystem
-    for RegistryKeySubsystem<Platform>
-{
+impl crate::WindowsHandleSubsystem for RegistryKeyObject {
     fn normalize_desired_access(desired_access: u32) -> u32 {
         RegistryKeyAccess::from_desired_access(desired_access).bits()
     }
 }
 
-pub(crate) struct RegistryKeyObject<Platform: crate::ShimPlatform> {
+pub(crate) struct RegistryKeyObject {
     path: String,
-    fd: TypedFd<RegistryFileSystem<Platform>>,
+    fd: litebox::fs::FileFd,
 }
 
 pub(crate) struct RegistryStore<Platform: crate::ShimPlatform> {
-    fs: RegistryFileSystem<Platform>,
-    fs_context: litebox::fs::resolver::Context,
+    fs: Fs<Platform>,
+    fs_context: litebox::fs::Context,
+    /// Whether the built-in keys and values have been written to [`Self::fs`].
+    ///
+    /// The defaults are written on first use rather than at construction so that
+    /// building a shim issues no file requests.
+    defaults_seeded: Mutex<Platform, bool>,
     notification_state: Mutex<Platform, RegistryNotificationState>,
     notification_pollee: Pollee<Platform>,
 }
 
 /// Reserved backing-store directory that contains a registry key's value files.
 const VALUES_DIR_NAME: &str = ".values";
+/// NT object-manager root accepted by registry syscalls.
+const REGISTRY_NT_ROOT: &str = r"\Registry";
 const DEFAULT_CODE_PAGE_KEY: &str =
     "\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Nls\\CodePage";
 const DEFAULT_SESSION_MANAGER_KEY: &str =
@@ -389,19 +387,17 @@ impl RegistryKeyAccess {
             normalized
         })
     }
-}
 
-impl From<RegistryKeyAccess> for OFlags {
-    fn from(desired_access: RegistryKeyAccess) -> Self {
-        let wants_read = desired_access.intersects(RegistryKeyAccess::FS_READ_ACCESS);
-        let wants_write = desired_access.intersects(RegistryKeyAccess::FS_WRITE_ACCESS);
+    fn open_flags(self) -> (FileAccessMode, FileOpenFlags) {
+        let wants_read = self.intersects(Self::FS_READ_ACCESS);
+        let wants_write = self.intersects(Self::FS_WRITE_ACCESS);
 
         let access = match (wants_read, wants_write) {
-            (true, true) => OFlags::RDWR,
-            (false, true) => OFlags::WRONLY,
-            _ => OFlags::RDONLY,
+            (true, true) => FileAccessMode::ReadWrite,
+            (false, true) => FileAccessMode::WriteOnly,
+            _ => FileAccessMode::ReadOnly,
         };
-        access | OFlags::DIRECTORY
+        (access, FileOpenFlags::DIRECTORY)
     }
 }
 
@@ -539,7 +535,7 @@ struct KeySummary {
     max_name_len: usize,
     values: usize,
     max_value_name_len: usize,
-    max_value_data_len: usize,
+    max_value_data_len: u64,
 }
 
 /// The `KEY_VALUE_BASIC_INFORMATION` structure defines a subset of the full
@@ -602,210 +598,44 @@ struct RegistryValue {
 }
 
 impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
-    pub(crate) fn new(litebox: &LiteBox<Platform>) -> Self {
-        let in_mem = litebox::fs::in_mem::InMem::<Platform>::new_initialized([(
-            "/",
-            litebox::fs::in_mem::InitialNode::Directory {
-                mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
-                owner: litebox::fs::UserInfo::ROOT,
-            },
-        )]);
-        let fs = litebox::fs::resolver::Resolver::new(
-            litebox,
-            litebox::fs::composer::Composer::builder()
-                .mount_nestable("/", |allocators| {
-                    litebox::fs::overlay::Overlay::<Platform>::new(
-                        in_mem,
-                        litebox::fs::tar_ro::TarRo::new(
-                            // TODO: Replace with tar file provided by the user
-                            litebox::fs::tar_ro::EMPTY_TAR_FILE.into(),
-                            allocators.next(),
-                        ),
-                        allocators.next(),
-                    )
-                })
-                .build()
-                .unwrap(),
-        );
-        let fs_context = litebox::fs::resolver::Context::new();
-        {
-            let fs = &fs;
-            for key in [
-                DEFAULT_SESSION_MANAGER_KEY,
-                DEFAULT_SEGMENT_HEAP_KEY,
-                DEFAULT_IMAGE_FILE_EXECUTION_OPTIONS_KEY,
-                DEFAULT_WINSOCK_PARAMETERS_KEY,
-                DEFAULT_WINSOCK_PROTOCOL_CATALOG_KEY,
-                DEFAULT_WINSOCK_IPV4_TCP_ENTRY_KEY,
-                DEFAULT_WINSOCK_IPV4_UDP_ENTRY_KEY,
-                DEFAULT_WINSOCK_IPV6_TCP_ENTRY_KEY,
-                DEFAULT_WINSOCK_IPV6_UDP_ENTRY_KEY,
-                DEFAULT_WINSOCK_NAMESPACE_CATALOG_KEY,
-                DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY,
-            ] {
-                if let Err(status) = create_key_in_fs(fs, &fs_context, key) {
-                    litebox_util_log::error!(key:% = key, status:? = status; "failed to initialize registry key");
-                    break;
-                }
-            }
-            for (name, value) in [
-                ("ACP", DEFAULT_ACP_VALUE),
-                ("OEMCP", DEFAULT_OEMCP_VALUE),
-                ("MACCP", DEFAULT_MACCP_VALUE),
-            ] {
-                if let Err(status) = write_value_in_fs(
-                    fs,
-                    &fs_context,
-                    DEFAULT_CODE_PAGE_KEY,
-                    name,
-                    RegistryValueType::Sz,
-                    value,
-                ) {
-                    litebox_util_log::error!(name:% = name, status:? = status; "failed to initialize registry value");
-                    break;
-                }
-            }
-
-            let mut winsock_values = vec![
-                (
-                    DEFAULT_WINSOCK_PARAMETERS_KEY,
-                    "WinSock_Registry_Version",
-                    RegistryValueType::Sz,
-                    utf16le_nul("2.0"),
-                ),
-                (
-                    DEFAULT_WINSOCK_PARAMETERS_KEY,
-                    "Current_Protocol_Catalog",
-                    RegistryValueType::Sz,
-                    utf16le_nul("Protocol_Catalog9"),
-                ),
-                (
-                    DEFAULT_WINSOCK_PARAMETERS_KEY,
-                    "Current_NameSpace_Catalog",
-                    RegistryValueType::Sz,
-                    utf16le_nul("NameSpace_Catalog5"),
-                ),
-                (
-                    DEFAULT_WINSOCK_PROTOCOL_CATALOG_KEY,
-                    "Num_Catalog_Entries64",
-                    RegistryValueType::Dword,
-                    WINSOCK_PROTOCOL_CATALOG_ENTRY_COUNT.to_le_bytes().to_vec(),
-                ),
-                (
-                    DEFAULT_WINSOCK_PROTOCOL_CATALOG_KEY,
-                    "Next_Catalog_Entry_ID",
-                    RegistryValueType::Dword,
-                    WINSOCK_NEXT_PROTOCOL_CATALOG_ENTRY_ID
-                        .to_le_bytes()
-                        .to_vec(),
-                ),
-                (
-                    DEFAULT_WINSOCK_PROTOCOL_CATALOG_KEY,
-                    "Serial_Access_Num",
-                    RegistryValueType::Dword,
-                    WINSOCK_INITIAL_CATALOG_SERIAL.to_le_bytes().to_vec(),
-                ),
-                (
-                    DEFAULT_WINSOCK_NAMESPACE_CATALOG_KEY,
-                    "Num_Catalog_Entries64",
-                    RegistryValueType::Dword,
-                    WINSOCK_NAMESPACE_CATALOG_ENTRY_COUNT.to_le_bytes().to_vec(),
-                ),
-                (
-                    DEFAULT_WINSOCK_NAMESPACE_CATALOG_KEY,
-                    "Serial_Access_Num",
-                    RegistryValueType::Dword,
-                    WINSOCK_INITIAL_CATALOG_SERIAL.to_le_bytes().to_vec(),
-                ),
-                (
-                    DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY,
-                    "LibraryPath",
-                    RegistryValueType::Sz,
-                    utf16le_nul("%SystemRoot%\\System32\\mswsock.dll"),
-                ),
-                (
-                    DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY,
-                    "DisplayString",
-                    RegistryValueType::Sz,
-                    utf16le_nul("@%SystemRoot%\\system32\\wshtcpip.dll,-60103"),
-                ),
-                (
-                    DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY,
-                    "ProviderId",
-                    RegistryValueType::Binary,
-                    WINSOCK_NAMESPACE_PROVIDER_ID.to_vec(),
-                ),
-                (
-                    DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY,
-                    "SupportedNameSpace",
-                    RegistryValueType::Dword,
-                    WINSOCK_NAMESPACE_DNS.to_le_bytes().to_vec(),
-                ),
-                (
-                    DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY,
-                    "Enabled",
-                    RegistryValueType::Dword,
-                    WINSOCK_NAMESPACE_PROVIDER_ENABLED.to_le_bytes().to_vec(),
-                ),
-                (
-                    DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY,
-                    "Version",
-                    RegistryValueType::Dword,
-                    WINSOCK_NAMESPACE_PROVIDER_VERSION.to_le_bytes().to_vec(),
-                ),
-                (
-                    DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY,
-                    "StoresServiceClassInfo",
-                    RegistryValueType::Dword,
-                    WINSOCK_NAMESPACE_STORES_SERVICE_CLASS_INFO
-                        .to_le_bytes()
-                        .to_vec(),
-                ),
-                (
-                    DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY,
-                    "ProviderInfo",
-                    RegistryValueType::Binary,
-                    Vec::new(),
-                ),
-            ];
-            for protocol in &DEFAULT_WINSOCK_PROTOCOLS {
-                winsock_values.push((
-                    protocol.entry_key,
-                    "PackedCatalogItem",
-                    RegistryValueType::Binary,
-                    default_winsock_protocol_catalog_item(protocol),
-                ));
-                winsock_values.push((
-                    protocol.entry_key,
-                    "ProtocolName",
-                    RegistryValueType::Sz,
-                    utf16le_nul(protocol.protocol_name),
-                ));
-            }
-            for (key, name, value_type, value) in winsock_values {
-                if let Err(status) =
-                    write_value_in_fs(fs, &fs_context, key, name, value_type, &value)
-                {
-                    litebox_util_log::error!(name:% = name, status:? = status; "failed to initialize Winsock registry value");
-                    break;
-                }
-            }
-        }
+    /// Creates a registry store over the guest's brokered file system.
+    ///
+    /// Construction performs no file operation: the built-in keys and values are
+    /// seeded lazily by [`Self::fs`] when the guest first uses the registry.
+    pub(crate) fn new(fs: Fs<Platform>) -> Self {
         Self {
             fs,
-            fs_context,
+            fs_context: litebox::fs::Context::new(),
+            defaults_seeded: Mutex::new(false),
             notification_state: Mutex::new(RegistryNotificationState::default()),
             notification_pollee: Pollee::new(),
         }
+    }
+
+    /// Returns the backing store, seeding the built-in registry contents on first use.
+    ///
+    /// Seeding is attempted exactly once. As at startup, a failure is logged and
+    /// abandons the rest of the defaults rather than failing the operation that
+    /// triggered it, so a store that cannot be seeded still answers requests.
+    fn fs(&self) -> &Fs<Platform> {
+        {
+            let mut seeded = self.defaults_seeded.lock();
+            if !*seeded {
+                *seeded = true;
+                seed_defaults(&self.fs, &self.fs_context);
+            }
+        }
+        &self.fs
     }
 
     fn open_key(
         &self,
         path: &str,
         desired_access: RegistryKeyAccess,
-    ) -> Result<TypedFd<RegistryFileSystem<Platform>>, NtStatus> {
-        self.fs
-            .open(&self.fs_context, path, desired_access.into(), Mode::empty())
+    ) -> Result<litebox::fs::FileFd, NtStatus> {
+        let (access, flags) = desired_access.open_flags();
+        self.fs()
+            .open_file(&self.fs_context, path, access, flags, Mode::empty())
             .map_err(map_open_error)
     }
 
@@ -816,34 +646,34 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
     ) -> Result<RegistryValue, NtStatus> {
         let value_path = value_path(key_path, value_name)?;
         let status = self
-            .fs
-            .file_status(&self.fs_context, &*value_path)
+            .fs()
+            .path_file_status(&self.fs_context, &value_path)
             .map_err(map_file_status_error)?;
         if status.file_type != FileType::RegularFile {
             return Err(NtStatus::OBJECT_TYPE_MISMATCH);
         }
-        if status.size < REGISTRY_VALUE_TYPE_SIZE {
+        if status.size < REGISTRY_VALUE_TYPE_SIZE as u64 {
             return Err(NtStatus::UNSUCCESSFUL);
         }
 
+        let size = usize::try_from(status.size).map_err(|_| NtStatus::NO_MEMORY)?;
+        let mut data = Vec::new();
+        data.try_reserve_exact(size)
+            .map_err(|_| NtStatus::NO_MEMORY)?;
+        data.resize(size, 0);
         let fd = self
-            .fs
-            .open(
+            .fs()
+            .open_file(
                 &self.fs_context,
-                &*value_path,
-                OFlags::RDONLY,
+                &value_path,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::NONE,
                 Mode::empty(),
             )
             .map_err(map_open_error)?;
-        let mut data = vec![0; status.size];
-        let read = self
-            .fs
-            .read(&fd, &mut data, Some(0))
-            .map_err(map_read_error)?;
-        let _ = self.fs.close(&fd);
-        if read != data.len() {
-            return Err(NtStatus::UNSUCCESSFUL);
-        }
+        let result = read_exact_at(self.fs(), &fd, &mut data);
+        let _ = self.fs().close_file(&fd);
+        result?;
 
         let value_type = u32::from_le_bytes(
             data[..REGISTRY_VALUE_TYPE_SIZE]
@@ -863,7 +693,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         value: &[u8],
     ) -> Result<(), NtStatus> {
         write_value_at_path(
-            &self.fs,
+            self.fs(),
             &self.fs_context,
             key_path,
             value_name,
@@ -932,9 +762,13 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         self.notification_pollee.notify_observers(Events::IN);
     }
 
-    fn key_summary(&self, key: &RegistryKeyObject<Platform>) -> Result<KeySummary, NtStatus> {
+    fn key_summary(&self, key: &RegistryKeyObject) -> Result<KeySummary, NtStatus> {
         let mut summary = KeySummary::default();
-        for entry in self.fs.read_dir(&key.fd).map_err(map_read_dir_error)? {
+        for entry in self
+            .fs()
+            .read_file_directory(&key.path, &key.fd)
+            .map_err(map_read_dir_error)?
+        {
             if entry.file_type == FileType::Directory
                 && entry.name != "."
                 && entry.name != ".."
@@ -949,16 +783,20 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
 
         let values_path = format!("{}/{}", key.path.trim_end_matches('/'), VALUES_DIR_NAME);
         let values_fd = self
-            .fs
-            .open(
+            .fs()
+            .open_file(
                 &self.fs_context,
-                &*values_path,
-                OFlags::RDONLY | OFlags::DIRECTORY,
+                &values_path,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::DIRECTORY,
                 Mode::empty(),
             )
             .map_err(map_open_error)?;
-        let values = self.fs.read_dir(&values_fd).map_err(map_read_dir_error);
-        let _ = self.fs.close(&values_fd);
+        let values = self
+            .fs()
+            .read_file_directory(&values_path, &values_fd)
+            .map_err(map_read_dir_error);
+        let _ = self.fs().close_file(&values_fd);
         for entry in values? {
             if entry.file_type != FileType::RegularFile {
                 continue;
@@ -969,16 +807,16 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
                 .max(entry.name.encode_utf16().count() * size_of::<u16>());
             let path = format!("{values_path}/{}", entry.name);
             let size = self
-                .fs
-                .file_status(&self.fs_context, &*path)
+                .fs()
+                .path_file_status(&self.fs_context, &path)
                 .map_err(map_file_status_error)?
                 .size;
-            if size < REGISTRY_VALUE_TYPE_SIZE {
+            if size < REGISTRY_VALUE_TYPE_SIZE as u64 {
                 return Err(NtStatus::UNSUCCESSFUL);
             }
             summary.max_value_data_len = summary
                 .max_value_data_len
-                .max(size - REGISTRY_VALUE_TYPE_SIZE);
+                .max(size - REGISTRY_VALUE_TYPE_SIZE as u64);
         }
         Ok(summary)
     }
@@ -991,11 +829,15 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
     /// subkey names are sorted before indexing.
     fn nth_subkey_name(
         &self,
-        key: &RegistryKeyObject<Platform>,
+        key: &RegistryKeyObject,
         index: u32,
     ) -> Result<Option<String>, NtStatus> {
         let mut names = Vec::new();
-        for entry in self.fs.read_dir(&key.fd).map_err(map_read_dir_error)? {
+        for entry in self
+            .fs()
+            .read_file_directory(&key.path, &key.fd)
+            .map_err(map_read_dir_error)?
+        {
             if entry.file_type == FileType::Directory
                 && entry.name != "."
                 && entry.name != ".."
@@ -1009,18 +851,15 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
     }
 
     /// Computes a [`KeySummary`] for the named direct subkey of `key`.
-    fn subkey_summary(
-        &self,
-        key: &RegistryKeyObject<Platform>,
-        name: &str,
-    ) -> Result<KeySummary, NtStatus> {
+    fn subkey_summary(&self, key: &RegistryKeyObject, name: &str) -> Result<KeySummary, NtStatus> {
         let child_path = format!("{}/{}", key.path.trim_end_matches('/'), name);
         let child_fd = self
-            .fs
-            .open(
+            .fs()
+            .open_file(
                 &self.fs_context,
-                &*child_path,
-                OFlags::RDONLY | OFlags::DIRECTORY,
+                &child_path,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::DIRECTORY,
                 Mode::empty(),
             )
             .map_err(map_open_error)?;
@@ -1029,7 +868,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
             fd: child_fd,
         };
         let summary = self.key_summary(&child);
-        let _ = self.fs.close(&child.fd);
+        let _ = self.fs().close_file(&child.fd);
         summary
     }
 
@@ -1041,21 +880,25 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
     /// files under the key's `.values` directory) are sorted before indexing.
     fn nth_value_name(
         &self,
-        key: &RegistryKeyObject<Platform>,
+        key: &RegistryKeyObject,
         index: u32,
     ) -> Result<Option<String>, NtStatus> {
         let values_path = format!("{}/{}", key.path.trim_end_matches('/'), VALUES_DIR_NAME);
         let values_fd = self
-            .fs
-            .open(
+            .fs()
+            .open_file(
                 &self.fs_context,
-                &*values_path,
-                OFlags::RDONLY | OFlags::DIRECTORY,
+                &values_path,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::DIRECTORY,
                 Mode::empty(),
             )
             .map_err(map_open_error)?;
-        let entries = self.fs.read_dir(&values_fd).map_err(map_read_dir_error);
-        let _ = self.fs.close(&values_fd);
+        let entries = self
+            .fs()
+            .read_file_directory(&values_path, &values_fd)
+            .map_err(map_read_dir_error);
+        let _ = self.fs().close_file(&values_fd);
         let mut names = Vec::new();
         for entry in entries? {
             if entry.file_type == FileType::RegularFile {
@@ -1067,12 +910,181 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
     }
 }
 
+/// Writes the built-in registry keys and values into `fs`.
+///
+/// Registry startup is best-effort: the first failure is logged and abandons the
+/// remaining defaults in that group, matching the behavior guests saw when the
+/// defaults were written during shim construction.
+fn seed_defaults<Platform: crate::ShimPlatform>(
+    fs: &Fs<Platform>,
+    fs_context: &litebox::fs::Context,
+) {
+    for key in [
+        DEFAULT_SESSION_MANAGER_KEY,
+        DEFAULT_SEGMENT_HEAP_KEY,
+        DEFAULT_IMAGE_FILE_EXECUTION_OPTIONS_KEY,
+        DEFAULT_WINSOCK_PARAMETERS_KEY,
+        DEFAULT_WINSOCK_PROTOCOL_CATALOG_KEY,
+        DEFAULT_WINSOCK_IPV4_TCP_ENTRY_KEY,
+        DEFAULT_WINSOCK_IPV4_UDP_ENTRY_KEY,
+        DEFAULT_WINSOCK_IPV6_TCP_ENTRY_KEY,
+        DEFAULT_WINSOCK_IPV6_UDP_ENTRY_KEY,
+        DEFAULT_WINSOCK_NAMESPACE_CATALOG_KEY,
+        DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY,
+    ] {
+        if let Err(status) = create_key_in_fs(fs, fs_context, key) {
+            litebox_util_log::error!(key:% = key, status:? = status; "failed to initialize registry key");
+            break;
+        }
+    }
+    for (name, value) in [
+        ("ACP", DEFAULT_ACP_VALUE),
+        ("OEMCP", DEFAULT_OEMCP_VALUE),
+        ("MACCP", DEFAULT_MACCP_VALUE),
+    ] {
+        if let Err(status) = write_value_in_fs(
+            fs,
+            fs_context,
+            DEFAULT_CODE_PAGE_KEY,
+            name,
+            RegistryValueType::Sz,
+            value,
+        ) {
+            litebox_util_log::error!(name:% = name, status:? = status; "failed to initialize registry value");
+            break;
+        }
+    }
+
+    let mut winsock_values = vec![
+        (
+            DEFAULT_WINSOCK_PARAMETERS_KEY,
+            "WinSock_Registry_Version",
+            RegistryValueType::Sz,
+            utf16le_nul("2.0"),
+        ),
+        (
+            DEFAULT_WINSOCK_PARAMETERS_KEY,
+            "Current_Protocol_Catalog",
+            RegistryValueType::Sz,
+            utf16le_nul("Protocol_Catalog9"),
+        ),
+        (
+            DEFAULT_WINSOCK_PARAMETERS_KEY,
+            "Current_NameSpace_Catalog",
+            RegistryValueType::Sz,
+            utf16le_nul("NameSpace_Catalog5"),
+        ),
+        (
+            DEFAULT_WINSOCK_PROTOCOL_CATALOG_KEY,
+            "Num_Catalog_Entries64",
+            RegistryValueType::Dword,
+            WINSOCK_PROTOCOL_CATALOG_ENTRY_COUNT.to_le_bytes().to_vec(),
+        ),
+        (
+            DEFAULT_WINSOCK_PROTOCOL_CATALOG_KEY,
+            "Next_Catalog_Entry_ID",
+            RegistryValueType::Dword,
+            WINSOCK_NEXT_PROTOCOL_CATALOG_ENTRY_ID
+                .to_le_bytes()
+                .to_vec(),
+        ),
+        (
+            DEFAULT_WINSOCK_PROTOCOL_CATALOG_KEY,
+            "Serial_Access_Num",
+            RegistryValueType::Dword,
+            WINSOCK_INITIAL_CATALOG_SERIAL.to_le_bytes().to_vec(),
+        ),
+        (
+            DEFAULT_WINSOCK_NAMESPACE_CATALOG_KEY,
+            "Num_Catalog_Entries64",
+            RegistryValueType::Dword,
+            WINSOCK_NAMESPACE_CATALOG_ENTRY_COUNT.to_le_bytes().to_vec(),
+        ),
+        (
+            DEFAULT_WINSOCK_NAMESPACE_CATALOG_KEY,
+            "Serial_Access_Num",
+            RegistryValueType::Dword,
+            WINSOCK_INITIAL_CATALOG_SERIAL.to_le_bytes().to_vec(),
+        ),
+        (
+            DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY,
+            "LibraryPath",
+            RegistryValueType::Sz,
+            utf16le_nul("%SystemRoot%\\System32\\mswsock.dll"),
+        ),
+        (
+            DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY,
+            "DisplayString",
+            RegistryValueType::Sz,
+            utf16le_nul("@%SystemRoot%\\system32\\wshtcpip.dll,-60103"),
+        ),
+        (
+            DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY,
+            "ProviderId",
+            RegistryValueType::Binary,
+            WINSOCK_NAMESPACE_PROVIDER_ID.to_vec(),
+        ),
+        (
+            DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY,
+            "SupportedNameSpace",
+            RegistryValueType::Dword,
+            WINSOCK_NAMESPACE_DNS.to_le_bytes().to_vec(),
+        ),
+        (
+            DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY,
+            "Enabled",
+            RegistryValueType::Dword,
+            WINSOCK_NAMESPACE_PROVIDER_ENABLED.to_le_bytes().to_vec(),
+        ),
+        (
+            DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY,
+            "Version",
+            RegistryValueType::Dword,
+            WINSOCK_NAMESPACE_PROVIDER_VERSION.to_le_bytes().to_vec(),
+        ),
+        (
+            DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY,
+            "StoresServiceClassInfo",
+            RegistryValueType::Dword,
+            WINSOCK_NAMESPACE_STORES_SERVICE_CLASS_INFO
+                .to_le_bytes()
+                .to_vec(),
+        ),
+        (
+            DEFAULT_WINSOCK_NAMESPACE_ENTRY_KEY,
+            "ProviderInfo",
+            RegistryValueType::Binary,
+            Vec::new(),
+        ),
+    ];
+    for protocol in &DEFAULT_WINSOCK_PROTOCOLS {
+        winsock_values.push((
+            protocol.entry_key,
+            "PackedCatalogItem",
+            RegistryValueType::Binary,
+            default_winsock_protocol_catalog_item(protocol),
+        ));
+        winsock_values.push((
+            protocol.entry_key,
+            "ProtocolName",
+            RegistryValueType::Sz,
+            utf16le_nul(protocol.protocol_name),
+        ));
+    }
+    for (key, name, value_type, value) in winsock_values {
+        if let Err(status) = write_value_in_fs(fs, fs_context, key, name, value_type, &value) {
+            litebox_util_log::error!(name:% = name, status:? = status; "failed to initialize Winsock registry value");
+            break;
+        }
+    }
+}
+
 impl<Platform: crate::ShimPlatform> Task<Platform> {
     fn registry_key_entry(
         &self,
         handle: Handle,
-    ) -> Result<litebox::fd::EntryHandle<Platform, RegistryKeySubsystem<Platform>>, NtStatus> {
-        raw_handle_entry::<Platform, RegistryKeySubsystem<Platform>>(
+    ) -> Result<litebox::fd::EntryHandle<Platform, RegistryKeyObject>, NtStatus> {
+        raw_handle_entry::<Platform, RegistryKeyObject>(
             &self.global.litebox,
             &self.process.handles,
             handle,
@@ -1082,26 +1094,22 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
 
     fn insert_registry_key_handle(
         &self,
-        key: RegistryKeyObject<Platform>,
+        key: RegistryKeyObject,
         granted_access: RegistryKeyAccess,
     ) -> Result<Handle, NtStatus> {
-        self.insert_typed_handle::<RegistryKeySubsystem<Platform>>(
-            key,
-            granted_access.bits(),
-            |key| {
-                self.close_registry_key(key);
-            },
-        )
+        self.insert_typed_handle::<RegistryKeyObject>(key, granted_access.bits(), |key| {
+            self.close_registry_key(key);
+        })
     }
 
     pub(crate) fn close_registry_key_handle(&self, handle: Handle) {
-        self.close_typed_handle::<RegistryKeySubsystem<Platform>>(handle, |key| {
+        self.close_typed_handle::<RegistryKeyObject>(handle, |key| {
             self.close_registry_key(key);
         });
     }
 
-    pub(crate) fn close_registry_key(&self, key: RegistryKeyObject<Platform>) {
-        let _ = self.global.registry.fs.close(&key.fd);
+    pub(crate) fn close_registry_key(&self, key: RegistryKeyObject) {
+        let _ = self.global.registry.fs().close_file(&key.fd);
     }
 
     pub(crate) fn sys_nt_open_key(
@@ -1239,8 +1247,8 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         let disposition = match self
             .global
             .registry
-            .fs
-            .file_status(&self.global.registry.fs_context, &path)
+            .fs()
+            .path_file_status(&self.global.registry.fs_context, &path)
         {
             Ok(status) if status.file_type == FileType::Directory => {
                 RegistryKeyDisposition::OpenedExistingKey
@@ -1250,7 +1258,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                 PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
             )) => {
                 for created_path in create_key_path_in_fs(
-                    &self.global.registry.fs,
+                    self.global.registry.fs(),
                     &self.global.registry.fs_context,
                     &path,
                 )? {
@@ -1392,7 +1400,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         length: u32,
         result_length: MutPtr<Platform, u32>,
     ) -> Result<(), NtStatus> {
-        let key = self.typed_handle_entry_with_access::<RegistryKeySubsystem<Platform>>(
+        let key = self.typed_handle_entry_with_access::<RegistryKeyObject>(
             key_handle,
             RegistryKeyAccess::QUERY_VALUE.bits(),
         )?;
@@ -1438,7 +1446,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         data: Option<ConstPtr<Platform, u8>>,
         data_size: u32,
     ) -> NtStatus {
-        let key = match self.typed_handle_entry_with_access::<RegistryKeySubsystem<Platform>>(
+        let key = match self.typed_handle_entry_with_access::<RegistryKeyObject>(
             key_handle,
             RegistryKeyAccess::SET_VALUE.bits(),
         ) {
@@ -1484,7 +1492,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         &self,
         params: NtNotifyChangeKeyRequest<Platform>,
     ) -> NtStatus {
-        let key = match self.typed_handle_entry_with_access::<RegistryKeySubsystem<Platform>>(
+        let key = match self.typed_handle_entry_with_access::<RegistryKeyObject>(
             params.key_handle,
             RegistryKeyAccess::NOTIFY.bits(),
         ) {
@@ -1650,9 +1658,9 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
     ) -> Result<(), NtStatus> {
         let key = if key_information_class == KeyInformationClass::Name {
             // Windows permits KeyNameInformation with any nonzero granted access.
-            self.typed_handle_entry_with_any_access::<RegistryKeySubsystem<Platform>>(key_handle)?
+            self.typed_handle_entry_with_any_access::<RegistryKeyObject>(key_handle)?
         } else {
-            self.typed_handle_entry_with_access::<RegistryKeySubsystem<Platform>>(
+            self.typed_handle_entry_with_access::<RegistryKeyObject>(
                 key_handle,
                 RegistryKeyAccess::QUERY_VALUE.bits(),
             )?
@@ -1727,7 +1735,8 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                     max_class_len: 0,
                     values: summary.values.trunc(),
                     max_value_name_len: summary.max_value_name_len.trunc(),
-                    max_value_data_len: summary.max_value_data_len.trunc(),
+                    max_value_data_len: u32::try_from(summary.max_value_data_len)
+                        .map_err(|_| NtStatus::UNSUCCESSFUL)?,
                     class: [],
                 };
                 write_query_information::<Platform>(
@@ -1775,7 +1784,8 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                     max_name_len: summary.max_name_len.trunc(),
                     values: summary.values.trunc(),
                     max_value_name_len: summary.max_value_name_len.trunc(),
-                    max_value_data_len: summary.max_value_data_len.trunc(),
+                    max_value_data_len: u32::try_from(summary.max_value_data_len)
+                        .map_err(|_| NtStatus::UNSUCCESSFUL)?,
                     name_length: leaf_name.len().trunc(),
                     padding: [0; 4],
                 };
@@ -1871,7 +1881,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         length: u32,
         result_length: MutPtr<Platform, u32>,
     ) -> Result<(), NtStatus> {
-        let key = self.typed_handle_entry_with_access::<RegistryKeySubsystem<Platform>>(
+        let key = self.typed_handle_entry_with_access::<RegistryKeyObject>(
             key_handle,
             RegistryKeyAccess::ENUMERATE_SUB_KEYS.bits(),
         )?;
@@ -1945,7 +1955,8 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                     max_class_len: 0,
                     values: summary.values.trunc(),
                     max_value_name_len: summary.max_value_name_len.trunc(),
-                    max_value_data_len: summary.max_value_data_len.trunc(),
+                    max_value_data_len: u32::try_from(summary.max_value_data_len)
+                        .map_err(|_| NtStatus::UNSUCCESSFUL)?,
                     class: [],
                 };
                 write_query_information::<Platform>(
@@ -1980,7 +1991,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         length: u32,
         result_length: MutPtr<Platform, u32>,
     ) -> Result<(), NtStatus> {
-        let key = self.typed_handle_entry_with_access::<RegistryKeySubsystem<Platform>>(
+        let key = self.typed_handle_entry_with_access::<RegistryKeyObject>(
             key_handle,
             RegistryKeyAccess::QUERY_VALUE.bits(),
         )?;
@@ -2192,11 +2203,20 @@ fn default_winsock_protocol_catalog_item(protocol: &DefaultWinsockProtocol) -> V
 }
 
 fn absolute_nt_key_name_to_fs_path(name: &str) -> Result<String, NtStatus> {
-    if !name.starts_with('\\') {
+    let Some(name) = name.strip_prefix('\\') else {
+        return Err(NtStatus::INVALID_PARAMETER);
+    };
+    let (root, remaining) = name
+        .split_once('\\')
+        .map_or((name, None), |(root, remaining)| (root, Some(remaining)));
+    if !root.eq_ignore_ascii_case(REGISTRY_NT_ROOT.trim_start_matches('\\')) {
         return Err(NtStatus::INVALID_PARAMETER);
     }
-    let mut path = String::from("/");
-    append_registry_components(&mut path, name.trim_start_matches('\\'))?;
+
+    let mut path = String::from(REGISTRY_ROOT);
+    if let Some(remaining) = remaining {
+        append_registry_components(&mut path, remaining)?;
+    }
     Ok(path)
 }
 
@@ -2234,8 +2254,8 @@ fn is_valid_key_component(component: &str) -> bool {
 }
 
 fn write_value_in_fs<Platform: crate::ShimPlatform>(
-    fs: &RegistryFileSystem<Platform>,
-    context: &litebox::fs::resolver::Context,
+    fs: &Fs<Platform>,
+    context: &litebox::fs::Context,
     key_nt_path: &str,
     value_name: &str,
     value_type: RegistryValueType,
@@ -2246,8 +2266,8 @@ fn write_value_in_fs<Platform: crate::ShimPlatform>(
 }
 
 fn write_value_at_path<Platform: crate::ShimPlatform>(
-    fs: &RegistryFileSystem<Platform>,
-    context: &litebox::fs::resolver::Context,
+    fs: &Fs<Platform>,
+    context: &litebox::fs::Context,
     key_path: &str,
     value_name: &str,
     value_type: u32,
@@ -2255,32 +2275,63 @@ fn write_value_at_path<Platform: crate::ShimPlatform>(
 ) -> Result<(), NtStatus> {
     let value_path = value_path(key_path, value_name)?;
     let fd = fs
-        .open(
+        .open_file(
             context,
-            &*value_path,
-            OFlags::CREAT | OFlags::WRONLY | OFlags::TRUNC,
+            &value_path,
+            FileAccessMode::WriteOnly,
+            FileOpenFlags::CREATE | FileOpenFlags::TRUNCATE,
             Mode::RUSR | Mode::WUSR | Mode::ROTH | Mode::WOTH,
         )
         .map_err(map_open_error)?;
-    let written = fs
-        .write(&fd, &value_type.to_le_bytes(), Some(0))
-        .map_err(map_write_error)?;
-    if written != REGISTRY_VALUE_TYPE_SIZE {
-        return Err(NtStatus::DISK_FULL);
+    let result = (|| {
+        write_all_at(fs, &fd, &value_type.to_le_bytes(), 0)?;
+        write_all_at(fs, &fd, value, REGISTRY_VALUE_TYPE_SIZE)
+    })();
+    let _ = fs.close_file(&fd);
+    result
+}
+
+fn read_exact_at<Platform: crate::ShimPlatform>(
+    fs: &Fs<Platform>,
+    fd: &litebox::fs::FileFd,
+    mut data: &mut [u8],
+) -> Result<(), NtStatus> {
+    let mut offset = 0;
+    while !data.is_empty() {
+        let read = fs
+            .read_file(fd, data, Some(offset))
+            .map_err(map_read_error)?;
+        if read == 0 {
+            return Err(NtStatus::UNSUCCESSFUL);
+        }
+        offset = offset.checked_add(read).ok_or(NtStatus::UNSUCCESSFUL)?;
+        data = &mut data[read..];
     }
-    let written = fs
-        .write(&fd, value, Some(REGISTRY_VALUE_TYPE_SIZE))
-        .map_err(map_write_error)?;
-    if written != value.len() {
-        return Err(NtStatus::DISK_FULL);
+    Ok(())
+}
+
+fn write_all_at<Platform: crate::ShimPlatform>(
+    fs: &Fs<Platform>,
+    fd: &litebox::fs::FileFd,
+    mut data: &[u8],
+    mut offset: usize,
+) -> Result<(), NtStatus> {
+    while !data.is_empty() {
+        let written = fs
+            .write_file(fd, data, Some(offset))
+            .map_err(map_write_error)?;
+        if written == 0 {
+            return Err(NtStatus::DISK_FULL);
+        }
+        offset = offset.checked_add(written).ok_or(NtStatus::DISK_FULL)?;
+        data = &data[written..];
     }
-    let _ = fs.close(&fd);
     Ok(())
 }
 
 fn create_key_in_fs<Platform: crate::ShimPlatform>(
-    fs: &RegistryFileSystem<Platform>,
-    context: &litebox::fs::resolver::Context,
+    fs: &Fs<Platform>,
+    context: &litebox::fs::Context,
     nt_path: &str,
 ) -> Result<String, NtStatus> {
     let path = absolute_nt_key_name_to_fs_path(nt_path)?;
@@ -2289,8 +2340,8 @@ fn create_key_in_fs<Platform: crate::ShimPlatform>(
 }
 
 fn create_key_path_in_fs<Platform: crate::ShimPlatform>(
-    fs: &RegistryFileSystem<Platform>,
-    context: &litebox::fs::resolver::Context,
+    fs: &Fs<Platform>,
+    context: &litebox::fs::Context,
     path: &str,
 ) -> Result<Vec<String>, NtStatus> {
     let mut current = String::new();
@@ -2314,16 +2365,16 @@ fn create_key_path_in_fs<Platform: crate::ShimPlatform>(
 }
 
 fn ensure_directory_in_fs<Platform: crate::ShimPlatform>(
-    fs: &RegistryFileSystem<Platform>,
-    context: &litebox::fs::resolver::Context,
+    fs: &Fs<Platform>,
+    context: &litebox::fs::Context,
     path: &str,
 ) -> Result<bool, NtStatus> {
-    match fs.file_status(context, path) {
+    match fs.path_file_status(context, path) {
         Ok(status) if status.file_type == FileType::Directory => Ok(false),
         Ok(_) => Err(NtStatus::OBJECT_TYPE_MISMATCH),
         Err(FileStatusError::PathError(
             PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
-        )) => match fs.mkdir(
+        )) => match fs.mkdir_file(
             context,
             path,
             Mode::RUSR | Mode::WUSR | Mode::XUSR | Mode::ROTH | Mode::WOTH | Mode::XOTH,
@@ -2423,6 +2474,8 @@ fn map_read_dir_error(error: ReadDirError) -> NtStatus {
 
 #[cfg(test)]
 mod tests {
+    use alloc::sync::Arc;
+
     use crate::tests::{
         TestPlatform, const_ptr, mut_byte_ptr, mut_ptr, object_attributes, test_platform,
         unicode_string, utf16_units as utf16,
@@ -2431,6 +2484,7 @@ mod tests {
     use super::*;
     use core::mem::size_of;
     use litebox::LiteBox;
+    use litebox_broker_protocol::fs::{FileMode, FileUser};
 
     extern crate std;
 
@@ -2492,10 +2546,82 @@ mod tests {
         fn RegDeleteTreeW(hKey: *mut core::ffi::c_void, lpSubKey: *const u16) -> i32;
     }
 
-    fn test_registry() -> (LiteBox<TestPlatform>, RegistryStore<TestPlatform>) {
-        let litebox = LiteBox::new(test_platform());
-        let registry = RegistryStore::new(&litebox);
+    /// Returns a registry store backed by a broker core that owns an empty registry hive.
+    ///
+    /// The store's defaults are written on first use, so callers observe them through any
+    /// registry operation, exactly as a guest does.
+    fn test_registry() -> (Arc<LiteBox<TestPlatform>>, RegistryStore<TestPlatform>) {
+        let mode = FileMode::RWXU | FileMode::RWXG | FileMode::RWXO;
+        let litebox = Arc::new(crate::test_broker::litebox_with_broker_files(
+            test_platform(),
+            alloc::vec![
+                (
+                    "/".into(),
+                    litebox_broker_core::fs::in_mem::InitialNode::Directory {
+                        mode,
+                        owner: FileUser::ROOT,
+                    },
+                ),
+                (
+                    REGISTRY_ROOT.into(),
+                    litebox_broker_core::fs::in_mem::InitialNode::Directory {
+                        mode,
+                        owner: FileUser::ROOT,
+                    },
+                ),
+            ],
+        ));
+        let registry = RegistryStore::new(Fs::registry(Arc::clone(&litebox)));
         (litebox, registry)
+    }
+
+    #[test]
+    fn registry_paths_are_confined_to_the_reserved_backing_root() {
+        assert_eq!(
+            absolute_nt_key_name_to_fs_path(r"\Registry").unwrap(),
+            REGISTRY_ROOT
+        );
+        assert_eq!(
+            absolute_nt_key_name_to_fs_path(r"\REGISTRY\Machine\Software").unwrap(),
+            "/registry/machine/software"
+        );
+        assert_eq!(
+            relative_nt_key_name_to_fs_path("/registry/machine", r"Software\LiteBox").unwrap(),
+            "/registry/machine/software/litebox"
+        );
+
+        for path in [
+            "",
+            "Registry",
+            r"\\Registry",
+            r"\Machine",
+            r"\RegistrySibling",
+            r"\Registry\",
+            r"\Registry\.",
+            r"\Registry\..",
+            r"\Registry\Machine//Software",
+        ] {
+            assert_eq!(
+                absolute_nt_key_name_to_fs_path(path),
+                Err(NtStatus::INVALID_PARAMETER),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn registry_syscalls_reject_non_registry_absolute_roots() {
+        let task = crate::tests::test_task_with_broker_files(&[]);
+        for path in [r"\Machine\Software", r"\RegistrySibling\Software"] {
+            let path_utf16 = utf16(path);
+            let path_name = unicode_string(&path_utf16);
+            let object_attributes = object_attributes(&path_name, 0);
+            assert_eq!(
+                task.do_nt_open_key(RegistryKeyAccess::READ.bits(), object_attributes),
+                Err(NtStatus::INVALID_PARAMETER),
+                "{path}"
+            );
+        }
     }
 
     fn open_key(
@@ -2665,29 +2791,38 @@ mod tests {
 
     #[test]
     fn registry_store_separates_values_from_subkeys() {
-        let (_litebox, registry) = test_registry();
+        let (litebox, registry) = test_registry();
         let key_path = absolute_nt_key_name_to_fs_path(DEFAULT_CODE_PAGE_KEY).unwrap();
         let value_path = value_path(&key_path, "ACP").unwrap();
 
         assert_eq!(
             registry
-                .fs
-                .file_status(&registry.fs_context, &*value_path)
+                .fs()
+                .path_file_status(&registry.fs_context, &value_path)
                 .unwrap()
                 .file_type,
             FileType::RegularFile
         );
         assert_eq!(
             registry
-                .fs
-                .file_status(&registry.fs_context, &*value_path)
+                .fs()
+                .path_file_status(&registry.fs_context, &value_path)
                 .unwrap()
                 .size,
-            REGISTRY_VALUE_TYPE_SIZE + DEFAULT_ACP_VALUE.len()
+            (REGISTRY_VALUE_TYPE_SIZE + DEFAULT_ACP_VALUE.len()) as u64
         );
         let value = registry.read_value_at_path(&key_path, "ACP").unwrap();
         assert_eq!(value.value_type, u32::from(RegistryValueType::Sz));
         assert_eq!(value.data, DEFAULT_ACP_VALUE);
+
+        let broker_fs = litebox;
+        assert_eq!(
+            broker_fs
+                .path_file_status(&litebox::fs::Context::new(), value_path.as_str())
+                .unwrap()
+                .file_type,
+            FileType::RegularFile
+        );
 
         let values_dir = absolute_nt_key_name_to_fs_path(
             "\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Nls\\CodePage\\.values",
@@ -2697,7 +2832,7 @@ mod tests {
 
     #[test]
     fn nt_create_key_reports_disposition_and_created_key_is_queryable() {
-        let task = crate::tests::test_task();
+        let task = crate::tests::test_task_with_broker_files(&[]);
         let key_name = r"\Registry\Machine\Software\LiteBoxCreatedKey";
         let key_name_utf16 = utf16(key_name);
         let key_name = unicode_string(&key_name_utf16);
@@ -2802,7 +2937,7 @@ mod tests {
 
     #[test]
     fn nt_enumerate_key_lists_subkeys_in_stable_sorted_order() {
-        let task = crate::tests::test_task();
+        let task = crate::tests::test_task_with_broker_files(&[]);
 
         let create_key = |path: &str| -> Handle {
             let name_utf16 = utf16(path);
@@ -2896,7 +3031,7 @@ mod tests {
 
     #[test]
     fn nt_set_value_key_replaces_and_round_trips_raw_types_and_empty_data() {
-        let task = crate::tests::test_task();
+        let task = crate::tests::test_task_with_broker_files(&[]);
         let key_name_utf16 = utf16(r"\Registry\Machine\Software\LiteBoxSetValueKey");
         let key_name = unicode_string(&key_name_utf16);
         let object_attributes = object_attributes(&key_name, 0);
@@ -2995,7 +3130,7 @@ mod tests {
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     #[test]
     fn registry_default_code_page_values_match_host() {
-        let task = crate::tests::test_task();
+        let task = crate::tests::test_task_with_broker_files(&[]);
         let key_handle = open_code_page_key(&task);
 
         for name in ["ACP", "OEMCP", "MACCP"] {
@@ -3030,7 +3165,7 @@ mod tests {
 
     #[test]
     fn nt_open_key_opens_existing_absolute_and_relative_keys() {
-        let task = crate::tests::test_task();
+        let task = crate::tests::test_task_with_broker_files(&[]);
         let nls_name = utf16("\\Registry\\Machine\\System\\CurrentControlSet\\Control\\Nls");
         let nls_name = unicode_string(&nls_name);
         let nls_object_attributes = object_attributes(&nls_name, 0);
@@ -3048,7 +3183,7 @@ mod tests {
 
     #[test]
     fn nt_open_key_reports_missing_absolute_key() {
-        let task = crate::tests::test_task();
+        let task = crate::tests::test_task_with_broker_files(&[]);
         let name = utf16("\\Registry\\Machine\\Software\\Missing");
         let name = unicode_string(&name);
         let object_attributes = object_attributes(&name, 0);
@@ -3062,7 +3197,7 @@ mod tests {
     fn synchronous_nt_notify_change_key_completes_after_matching_mutation() {
         use std::time::Duration;
 
-        let task = crate::tests::test_task();
+        let task = crate::tests::test_task_with_broker_files(&[]);
         let key_name_utf16 = utf16(r"\Registry\Machine\Software\LiteBoxSynchronousNotify");
         let key_name = unicode_string(&key_name_utf16);
         let object_attributes = object_attributes(&key_name, 0);
@@ -3115,7 +3250,7 @@ mod tests {
     fn synchronous_nt_notify_change_key_completes_after_subkey_creation() {
         use std::time::Duration;
 
-        let task = crate::tests::test_task();
+        let task = crate::tests::test_task_with_broker_files(&[]);
         let key_name_utf16 = utf16(r"\Registry\Machine\Software\LiteBoxSynchronousNameNotify");
         let key_name = unicode_string(&key_name_utf16);
         let parent_attributes = object_attributes(&key_name, 0);
@@ -3183,20 +3318,20 @@ mod tests {
 
     #[test]
     fn nt_open_key_checks_backing_fs_permissions() {
-        let task = crate::tests::test_task();
+        let task = crate::tests::test_task_with_broker_files(&[]);
         let private_key = "\\Registry\\Machine\\Software\\Private";
         let private_path = create_key_in_fs(
-            &task.global.registry.fs,
+            task.global.registry.fs(),
             &task.global.registry.fs_context,
             private_key,
         )
         .unwrap();
         task.global
             .registry
-            .fs
-            .chmod(
+            .fs()
+            .chmod_file(
                 &task.global.registry.fs_context,
-                &*private_path,
+                &private_path,
                 Mode::WUSR | Mode::XUSR,
             )
             .unwrap();
@@ -3220,7 +3355,7 @@ mod tests {
 
     #[test]
     fn nt_close_removes_registry_key_handle() {
-        let task = crate::tests::test_task();
+        let task = crate::tests::test_task_with_broker_files(&[]);
         let key_handle = open_code_page_key(&task);
         let value_name = utf16("ACP");
         let value_name = unicode_string(&value_name);
@@ -3256,7 +3391,7 @@ mod tests {
 
     #[test]
     fn nt_query_value_key_reports_partial_information() {
-        let task = crate::tests::test_task();
+        let task = crate::tests::test_task_with_broker_files(&[]);
         let key_handle = open_code_page_key(&task);
         let value_name = utf16("ACP");
         let value_name = unicode_string(&value_name);
@@ -3293,7 +3428,7 @@ mod tests {
     fn nt_query_value_key_without_query_access_matches_host() {
         assert_eq!(host_query_value_with_set_only_access(), ERROR_ACCESS_DENIED);
 
-        let task = crate::tests::test_task();
+        let task = crate::tests::test_task_with_broker_files(&[]);
         let code_page_name = utf16(DEFAULT_CODE_PAGE_KEY);
         let code_page_name = unicode_string(&code_page_name);
         let object_attributes = object_attributes(&code_page_name, 0);
@@ -3321,7 +3456,7 @@ mod tests {
 
     #[test]
     fn nt_query_value_key_reports_basic_and_full_information() {
-        let task = crate::tests::test_task();
+        let task = crate::tests::test_task_with_broker_files(&[]);
         let key_handle = open_code_page_key(&task);
         let value_name = utf16("OEMCP");
         let value_name = unicode_string(&value_name);
@@ -3381,7 +3516,7 @@ mod tests {
 
     #[test]
     fn nt_enumerate_value_key_lists_values_in_stable_sorted_order() {
-        let task = crate::tests::test_task();
+        let task = crate::tests::test_task_with_broker_files(&[]);
         // The code-page key is seeded with ACP, OEMCP, and MACCP values, which
         // are stored lower-cased and therefore enumerate as acp, maccp, oemcp.
         let key_handle = open_code_page_key(&task);
@@ -3461,7 +3596,7 @@ mod tests {
 
     #[test]
     fn nt_query_value_key_rejects_invalid_arguments() {
-        let task = crate::tests::test_task();
+        let task = crate::tests::test_task_with_broker_files(&[]);
         let key_handle = open_code_page_key(&task);
         let value_name = utf16("ACP");
         let value_name = unicode_string(&value_name);
@@ -3547,7 +3682,7 @@ mod tests {
 
     #[test]
     fn nt_query_key_reports_full_and_cached_information() {
-        let task = crate::tests::test_task();
+        let task = crate::tests::test_task_with_broker_files(&[]);
         let key_handle = open_code_page_key(&task);
 
         let mut full_bytes = [0u8; 64];

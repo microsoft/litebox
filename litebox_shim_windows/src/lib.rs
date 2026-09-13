@@ -11,7 +11,6 @@
 
 extern crate alloc;
 
-use alloc::borrow::Cow;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -33,16 +32,14 @@ use litebox_common_windows::{NtSysno, Win32Sysno};
 use litebox_platform::time::TimeProvider;
 
 use crate::syscalls::event::{EventHandleObject, EventSubsystem};
-use crate::syscalls::file::{FileObject, FileObjectSubsystem};
+use crate::syscalls::file::FileObject;
 use crate::syscalls::iocp::{IoCompletionHandleObject, IoCompletionSubsystem};
 use crate::syscalls::lpc::{LpcPortHandleObject, LpcPortSubsystem};
 use crate::syscalls::mutant::{MutantHandleObject, MutantSubsystem};
 use crate::syscalls::object_manager::{
     DirectoryHandleObject, DirectoryObjectSubsystem, ObjectManager,
 };
-use crate::syscalls::registry::{
-    NtNotifyChangeKeyRequest, RegistryKeyObject, RegistryKeySubsystem,
-};
+use crate::syscalls::registry::{NtNotifyChangeKeyRequest, RegistryKeyObject};
 use crate::syscalls::section::{
     MapViewOfSectionParameters, SectionHandleObject, SectionObject, SectionSubsystem,
 };
@@ -60,14 +57,14 @@ use crate::syscalls::worker_factory::{
 };
 use crate::syscalls::{SyscallRequest, ThreadHandle, mm};
 
+mod fs;
 mod loader;
 mod nt_types;
 mod syscalls;
 mod wait;
 
-#[allow(dead_code)]
-mod fs;
-
+#[cfg(test)]
+mod test_broker;
 #[cfg(test)]
 mod tests;
 
@@ -217,11 +214,6 @@ impl<Platform: ShimPlatform> Clone for WindowsSectionView<Platform> {
         }
     }
 }
-
-pub type DefaultFS<Platform> = WindowsFS<Platform>;
-
-pub type WindowsFS<Platform> =
-    litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>;
 
 fn write_value<Platform, T>(address: usize, value: T) -> Option<()>
 where
@@ -405,11 +397,6 @@ pub struct WindowsShimBuilder<Platform: ShimPlatform> {
 }
 
 impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
-    #[must_use]
-    pub fn new(platform: &'static Platform) -> Self {
-        Self::new_with_litebox(platform, LiteBox::new(platform))
-    }
-
     /// Creates a builder backed by an existing LiteBox instance.
     #[must_use]
     pub fn new_with_litebox(platform: &'static Platform, litebox: LiteBox<Platform>) -> Self {
@@ -421,28 +408,23 @@ impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
         &self.litebox
     }
 
-    /// Build the default file system with the given in-memory layer and tar data.
-    #[must_use]
-    pub fn default_fs(
-        &self,
-        in_mem: litebox::fs::in_mem::InMem<Platform>,
-        tar_data: Cow<'static, [u8]>,
-    ) -> DefaultFS<Platform> {
-        default_fs(&self.litebox, in_mem, tar_data)
-    }
-
     #[must_use]
     pub fn build(self) -> WindowsShim<Platform> {
+        let litebox = Arc::new(self.litebox);
+        let fs = Arc::new(fs::Fs::regular(Arc::clone(&litebox)));
         let global = Arc::new(GlobalState {
             platform: self.platform,
-            page_manager: PageManager::new(&self.litebox),
-            registry: syscalls::registry::RegistryStore::new(&self.litebox),
+            page_manager: PageManager::new(&litebox),
+            registry: syscalls::registry::RegistryStore::new(fs::Fs::registry(Arc::clone(
+                &litebox,
+            ))),
             wnf_states: syscalls::wnf::WnfStateStore::new(
                 syscalls::wnf::WnfStateStoreData::default(),
             ),
             mui_generation: AtomicU32::new(1),
             qpc_boot_instant: TimeProvider::now(self.platform),
-            litebox: self.litebox,
+            fs,
+            litebox,
         });
         WindowsShim(global)
     }
@@ -509,7 +491,6 @@ impl<Platform: ShimPlatform> WindowsShim<Platform> {
     /// Loads the program at `path` as the shim's initial task.
     pub fn load_program(
         &self,
-        fs: Arc<WindowsFS<Platform>>,
         path: &str,
         argv: Vec<alloc::ffi::CString>,
         envp: Vec<alloc::ffi::CString>,
@@ -518,6 +499,7 @@ impl<Platform: ShimPlatform> WindowsShim<Platform> {
         #[cfg(not(target_os = "windows"))]
         let _ = map_windows_user_shared_data::<Platform>(&self.0.page_manager)
             .ok_or(loader::WindowsLoadError::MapSharedMemory)?;
+        let fs = Arc::clone(&self.0.fs);
         let load_info = loader::PeLoader::new(self.0.platform, fs.clone(), &self.0.page_manager)
             .load(path, &argv, &envp)?;
         // TODO: shared section should be only created once and shared across all processes, not created per-process.
@@ -541,7 +523,7 @@ impl<Platform: ShimPlatform> WindowsShim<Platform> {
                     global: self.0.clone(),
                     process: process.clone(),
                     fs,
-                    fs_context: litebox::fs::resolver::Context::new(),
+                    fs_context: litebox::fs::Context::new(),
                     wait_state: wait::WaitState::new(self.0.platform),
                     io_completion_worker: Mutex::new(syscalls::iocp::IoCompletionWorkerState::new()),
                     entry_point: load_info.entry_point,
@@ -564,7 +546,8 @@ struct GlobalState<Platform: ShimPlatform> {
     wnf_states: syscalls::wnf::WnfStateStore<Platform>,
     mui_generation: AtomicU32,
     qpc_boot_instant: <Platform as TimeProvider>::Instant,
-    litebox: LiteBox<Platform>,
+    fs: Arc<fs::Fs<Platform>>,
+    litebox: Arc<LiteBox<Platform>>,
 }
 
 /// Per-process Windows state shared by every thread in the process.
@@ -730,8 +713,8 @@ impl<Platform: ShimPlatform> Process<Platform> {
 struct Task<Platform: ShimPlatform> {
     global: Arc<GlobalState<Platform>>,
     process: Arc<Process<Platform>>,
-    fs: Arc<WindowsFS<Platform>>,
-    fs_context: litebox::fs::resolver::Context,
+    fs: Arc<fs::Fs<Platform>>,
+    fs_context: litebox::fs::Context,
     wait_state: wait::WaitState<Platform>,
     io_completion_worker: Mutex<Platform, syscalls::iocp::IoCompletionWorkerState<Platform>>,
     entry_point: usize,
@@ -2517,8 +2500,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             };
         }
 
-        try_metadata!(FileObjectSubsystem<Platform>);
-        try_metadata!(RegistryKeySubsystem<Platform>);
+        try_metadata!(FileObject);
+        try_metadata!(RegistryKeyObject);
         try_metadata!(EventSubsystem<Platform>);
         try_metadata!(MutantSubsystem<Platform>);
         try_metadata!(SemaphoreSubsystem<Platform>);
@@ -2567,8 +2550,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             };
         }
 
-        try_set_attributes!(FileObjectSubsystem<Platform>);
-        try_set_attributes!(RegistryKeySubsystem<Platform>);
+        try_set_attributes!(FileObject);
+        try_set_attributes!(RegistryKeyObject);
         try_set_attributes!(EventSubsystem<Platform>);
         try_set_attributes!(MutantSubsystem<Platform>);
         try_set_attributes!(SemaphoreSubsystem<Platform>);
@@ -2739,8 +2722,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             };
         }
 
-        try_duplicate!(FileObjectSubsystem<Platform>);
-        try_duplicate!(RegistryKeySubsystem<Platform>);
+        try_duplicate!(FileObject);
+        try_duplicate!(RegistryKeyObject);
         try_duplicate!(EventSubsystem<Platform>);
         try_duplicate!(MutantSubsystem<Platform>);
         try_duplicate!(SemaphoreSubsystem<Platform>);
@@ -2850,8 +2833,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             };
         }
 
-        try_close!(FileObjectSubsystem<Platform>, file);
-        try_close!(RegistryKeySubsystem<Platform>, registry_key);
+        try_close!(FileObject, file);
+        try_close!(RegistryKeyObject, registry_key);
         try_close!(EventSubsystem<Platform>, event);
         try_close!(MutantSubsystem<Platform>, mutant);
         try_close!(SemaphoreSubsystem<Platform>, semaphore);
@@ -3016,9 +2999,9 @@ fn is_api_set_contract(dll_name: &str) -> bool {
 }
 
 trait RawHandleVisitor<Platform: ShimPlatform> {
-    fn file(&self, file: FileObject<Platform>);
+    fn file(&self, file: FileObject);
 
-    fn registry_key(&self, key: RegistryKeyObject<Platform>);
+    fn registry_key(&self, key: RegistryKeyObject);
 
     fn event(&self, event: EventHandleObject<Platform>);
 
@@ -3055,11 +3038,11 @@ struct CloseRawHandleVisitor<'task, Platform: ShimPlatform> {
 }
 
 impl<Platform: ShimPlatform> RawHandleVisitor<Platform> for CloseRawHandleVisitor<'_, Platform> {
-    fn file(&self, file: FileObject<Platform>) {
+    fn file(&self, file: FileObject) {
         self.task.close_file(file);
     }
 
-    fn registry_key(&self, key: RegistryKeyObject<Platform>) {
+    fn registry_key(&self, key: RegistryKeyObject) {
         self.task.close_registry_key(key);
     }
 
@@ -3185,28 +3168,4 @@ pub struct LoadedProgram<Platform: ShimPlatform> {
     pub entrypoints: WindowsShimEntrypoints<Platform>,
     /// Handle used to wait for the loaded program to exit.
     pub process: Arc<Process<Platform>>,
-}
-
-fn default_fs<Platform>(
-    litebox: &LiteBox<Platform>,
-    in_mem: litebox::fs::in_mem::InMem<Platform>,
-    tar_data: Cow<'static, [u8]>,
-) -> WindowsFS<Platform>
-where
-    Platform: ShimPlatform,
-{
-    litebox::fs::resolver::Resolver::new(
-        litebox,
-        litebox::fs::composer::Composer::builder()
-            .mount_nestable("/", |allocators| {
-                litebox::fs::overlay::Overlay::<Platform>::new(
-                    in_mem,
-                    litebox::fs::tar_ro::TarRo::new(tar_data, allocators.next()),
-                    allocators.next(),
-                )
-            })
-            .mount("/dev", litebox::fs::devices::Devices::new)
-            .build()
-            .unwrap(),
-    )
 }

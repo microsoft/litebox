@@ -5,12 +5,11 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::mem::size_of;
-use litebox::fd::TypedFd;
 use litebox::fs::errors::{FileStatusError, OpenError, PathError, ReadError};
-use litebox::fs::{FileType, Mode, OFlags};
 use litebox::mm::linux::{CreatePagesFlags, MappingError, NonZeroPageSize};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider};
 use litebox::utils::TruncateExt as _;
+use litebox_broker_protocol::fs::{FileAccessMode, FileMode as Mode, FileOpenFlags, FileType};
 use litebox_common_windows::loader::PAGE_SIZE;
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -446,8 +445,8 @@ struct MappedNlsSection {
     len: usize,
 }
 
-struct NlsSectionFile<Platform: ShimPlatform> {
-    fd: TypedFd<crate::WindowsFS<Platform>>,
+struct NlsSectionFile {
+    fd: litebox::fs::FileFd,
     len: usize,
 }
 
@@ -724,12 +723,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let alloc_len = match nls_section_alloc_len(section_len) {
             Ok(alloc_len) => alloc_len,
             Err(status) => {
-                let _ = self.fs.close(&section_file.fd);
+                let _ = self.fs.close_file(&section_file.fd);
                 return Err(status);
             }
         };
         let Some(page_len) = NonZeroPageSize::<PAGE_SIZE>::new(alloc_len) else {
-            let _ = self.fs.close(&section_file.fd);
+            let _ = self.fs.close_file(&section_file.fd);
             return Err(NtStatus::INVALID_PARAMETER);
         };
 
@@ -750,7 +749,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 },
             )
         };
-        let _ = self.fs.close(&section_file.fd);
+        let _ = self.fs.close_file(&section_file.fd);
         let mapping = mapping.map_err(|_| copy_status.unwrap_or(NtStatus::NO_MEMORY))?;
         Ok(MappedNlsSection {
             address: mapping.as_usize(),
@@ -761,43 +760,45 @@ impl<Platform: ShimPlatform> Task<Platform> {
     fn open_nls_section_file(
         &self,
         request: NlsSectionRequest<Platform>,
-    ) -> Result<NlsSectionFile<Platform>, NtStatus> {
+    ) -> Result<NlsSectionFile, NtStatus> {
         let path = nls_section_file_path(request.section_type, request.section_data)?;
         let fd = self
             .fs
-            .open(
+            .open_file(
                 &self.fs_context,
                 path.as_str(),
-                OFlags::RDONLY,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::NONE,
                 Mode::empty(),
             )
             .map_err(map_nls_open_error)?;
 
-        let status = match self.fs.fd_file_status(&fd) {
+        let status = match self.fs.file_status(&fd) {
             Ok(status) => status,
             Err(error) => {
-                let _ = self.fs.close(&fd);
+                let _ = self.fs.close_file(&fd);
                 return Err(map_nls_file_status_error(error));
             }
         };
         if status.file_type != FileType::RegularFile {
-            let _ = self.fs.close(&fd);
+            let _ = self.fs.close_file(&fd);
             return Err(NtStatus::OBJECT_TYPE_MISMATCH);
         }
         if status.size == 0 {
-            let _ = self.fs.close(&fd);
+            let _ = self.fs.close_file(&fd);
             return Err(NtStatus::OBJECT_NAME_NOT_FOUND);
         }
 
-        Ok(NlsSectionFile {
-            fd,
-            len: status.size,
-        })
+        let Ok(len) = usize::try_from(status.size) else {
+            let _ = self.fs.close_file(&fd);
+            return Err(NtStatus::SECTION_TOO_BIG);
+        };
+        Ok(NlsSectionFile { fd, len })
     }
 
     fn copy_nls_section_file(
         &self,
-        fd: &TypedFd<crate::WindowsFS<Platform>>,
+        fd: &litebox::fs::FileFd,
         section_len: usize,
         output: MutPtr<Platform, u8>,
     ) -> Result<usize, NtStatus> {
@@ -808,7 +809,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let chunk_len = remaining.min(PAGE_SIZE);
             let read = self
                 .fs
-                .read(fd, &mut chunk[..chunk_len], Some(offset))
+                .read_file(fd, &mut chunk[..chunk_len], Some(offset))
                 .map_err(map_nls_read_error)?;
             if read == 0 {
                 return Err(NtStatus::END_OF_FILE);
@@ -1235,7 +1236,7 @@ mod tests {
         #[test]
         fn nt_get_nls_section_ptr_matches_host_section_content() {
             let host_file_bytes = host_system32_file_bytes("c_1252.nls");
-            let task = crate::tests::test_task_with_nls_files(&[(
+            let task = crate::tests::test_task_with_broker_files(&[(
                 "/Windows/System32/c_1252.nls",
                 host_file_bytes.as_slice(),
             )]);
@@ -1286,7 +1287,7 @@ mod tests {
         #[test]
         fn nt_initialize_nls_files_matches_host_outputs() {
             let host_file_bytes = host_system32_file_bytes("locale.nls");
-            let task = crate::tests::test_task_with_nls_files(&[(
+            let task = crate::tests::test_task_with_broker_files(&[(
                 "/Windows/System32/locale.nls",
                 host_file_bytes.as_slice(),
             )]);
@@ -1420,7 +1421,7 @@ mod tests {
     #[test]
     fn nt_get_nls_section_ptr_maps_file_backed_section() {
         let section_bytes = vec![1, 2, 3, 4, 5];
-        let task = crate::tests::test_task_with_nls_files(&[(
+        let task = crate::tests::test_task_with_broker_files(&[(
             "/Windows/System32/c_1252.nls",
             section_bytes.as_slice(),
         )]);
@@ -1465,7 +1466,7 @@ mod tests {
     #[test]
     fn nt_get_nls_section_ptr_rejects_invalid_arguments() {
         let bytes = [0xaa];
-        let task = crate::tests::test_task_with_nls_files(&[(
+        let task = crate::tests::test_task_with_broker_files(&[(
             "/Windows/System32/c_437.nls",
             bytes.as_slice(),
         )]);
@@ -1522,7 +1523,7 @@ mod tests {
     #[test]
     fn nt_initialize_nls_files_maps_locale_file() {
         let locale_bytes = vec![0x44; PAGE_SIZE + 1];
-        let task = crate::tests::test_task_with_nls_files(&[(
+        let task = crate::tests::test_task_with_broker_files(&[(
             "/Windows/System32/locale.nls",
             locale_bytes.as_slice(),
         )]);
