@@ -56,20 +56,7 @@ impl<Platform: RawSyncPrimitivesProvider> SlotAllocator<Platform> {
         }
     }
 
-    pub(super) fn acquire_slot(
-        &self,
-        length: u32,
-    ) -> Result<SlotLease<'_, Platform>, AcquireError> {
-        if length > SHARED_BUFFER_SLOT_SIZE {
-            return Err(AcquireError::TooLarge);
-        }
-        self.acquire_count(length, 1)
-    }
-
-    pub(super) fn acquire_slots(
-        &self,
-        length: u32,
-    ) -> Result<SlotLease<'_, Platform>, AcquireError> {
+    pub(super) fn acquire(&self, length: u32) -> Result<SlotLease<'_, Platform>, AcquireError> {
         let slot_count = if length == 0 {
             1
         } else {
@@ -295,7 +282,7 @@ mod tests {
     fn leases_use_distinct_slots_and_reuse_released_slots() {
         let allocator = SlotAllocator::<MockPlatform>::new();
         let mut leases = (0..SHARED_BUFFER_SLOT_COUNT)
-            .map(|_| allocator.acquire_slot(7).unwrap())
+            .map(|_| allocator.acquire(7).unwrap())
             .collect::<Vec<_>>();
 
         for (index, lease) in leases.iter().enumerate() {
@@ -304,7 +291,7 @@ mod tests {
         }
 
         drop(leases.remove(0));
-        let reused = allocator.acquire_slot(9).unwrap();
+        let reused = allocator.acquire(9).unwrap();
         assert_eq!(reused.descriptor().slot_index, SharedBufferSlotIndex(0));
     }
 
@@ -313,27 +300,23 @@ mod tests {
         let allocator = SlotAllocator::<MockPlatform>::new();
 
         assert!(matches!(
-            allocator.acquire_slot(SHARED_BUFFER_SLOT_SIZE + 1),
+            allocator.acquire(SHARED_BUFFER_SLOT_COUNT * SHARED_BUFFER_SLOT_SIZE + 1),
             Err(AcquireError::TooLarge)
         ));
-        assert!(matches!(
-            allocator.acquire_slots(SHARED_BUFFER_SLOT_COUNT * SHARED_BUFFER_SLOT_SIZE + 1),
-            Err(AcquireError::TooLarge)
-        ));
-        assert!(allocator.acquire_slot(1).is_ok());
+        assert!(allocator.acquire(1).is_ok());
     }
 
     #[test]
     fn sequence_leases_acquire_all_required_slots_atomically() {
         let allocator = Arc::new(SlotAllocator::<MockPlatform>::new());
         let mut leases = (0..9)
-            .map(|_| allocator.acquire_slot(1).unwrap())
+            .map(|_| allocator.acquire(1).unwrap())
             .collect::<Vec<_>>();
         let waiter_allocator = Arc::clone(&allocator);
         let (sender, receiver) = mpsc::sync_channel(1);
         let waiter = std::thread::spawn(move || {
             let lease = waiter_allocator
-                .acquire_slots(8 * SHARED_BUFFER_SLOT_SIZE)
+                .acquire(8 * SHARED_BUFFER_SLOT_SIZE)
                 .unwrap();
             sender.send(lease.sequence()).unwrap();
         });
@@ -361,12 +344,12 @@ mod tests {
     fn exhausted_allocator_wakes_one_waiter_on_release() {
         let allocator = Arc::new(SlotAllocator::<MockPlatform>::new());
         let mut leases = (0..SHARED_BUFFER_SLOT_COUNT)
-            .map(|_| allocator.acquire_slot(1).unwrap())
+            .map(|_| allocator.acquire(1).unwrap())
             .collect::<Vec<_>>();
         let waiter_allocator = Arc::clone(&allocator);
         let (sender, receiver) = mpsc::sync_channel(1);
         let waiter = std::thread::spawn(move || {
-            let lease = waiter_allocator.acquire_slot(1).unwrap();
+            let lease = waiter_allocator.acquire(1).unwrap();
             sender.send(lease.descriptor()).unwrap();
         });
         while allocator.waiter_count() == 0 {
@@ -392,14 +375,14 @@ mod tests {
     fn exhausted_allocator_serves_waiters_in_arrival_order() {
         let allocator = Arc::new(SlotAllocator::<MockPlatform>::new());
         let mut leases = (0..SHARED_BUFFER_SLOT_COUNT)
-            .map(|_| allocator.acquire_slot(1).unwrap())
+            .map(|_| allocator.acquire(1).unwrap())
             .collect::<Vec<_>>();
 
         let first_allocator = Arc::clone(&allocator);
         let (first_acquired_sender, first_acquired_receiver) = mpsc::sync_channel(1);
         let (release_first_sender, release_first_receiver) = mpsc::sync_channel(1);
         let first = std::thread::spawn(move || {
-            let lease = first_allocator.acquire_slot(1).unwrap();
+            let lease = first_allocator.acquire(1).unwrap();
             first_acquired_sender.send(lease.descriptor()).unwrap();
             release_first_receiver.recv().unwrap();
         });
@@ -410,7 +393,7 @@ mod tests {
         let second_allocator = Arc::clone(&allocator);
         let (second_acquired_sender, second_acquired_receiver) = mpsc::sync_channel(1);
         let second = std::thread::spawn(move || {
-            let lease = second_allocator.acquire_slot(1).unwrap();
+            let lease = second_allocator.acquire(1).unwrap();
             second_acquired_sender.send(lease.descriptor()).unwrap();
         });
         while allocator.waiter_count() != 2 {
@@ -446,12 +429,12 @@ mod tests {
     fn association_failure_wakes_waiters_and_prevents_new_leases() {
         let allocator = Arc::new(SlotAllocator::<MockPlatform>::new());
         let _leases = (0..SHARED_BUFFER_SLOT_COUNT)
-            .map(|_| allocator.acquire_slot(1).unwrap())
+            .map(|_| allocator.acquire(1).unwrap())
             .collect::<Vec<_>>();
         let waiter_allocator = Arc::clone(&allocator);
         let (sender, receiver) = mpsc::sync_channel(1);
         let waiter = std::thread::spawn(move || {
-            sender.send(waiter_allocator.acquire_slot(1).err()).unwrap();
+            sender.send(waiter_allocator.acquire(1).err()).unwrap();
         });
         while allocator.waiter_count() == 0 {
             std::thread::yield_now();
@@ -463,7 +446,7 @@ mod tests {
             Some(AcquireError::AssociationFailed)
         );
         assert!(matches!(
-            allocator.acquire_slot(1),
+            allocator.acquire(1),
             Err(AcquireError::AssociationFailed)
         ));
         waiter.join().unwrap();

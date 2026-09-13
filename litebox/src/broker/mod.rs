@@ -391,23 +391,13 @@ where
         result
     }
 
-    fn acquire_shared_buffer_slot(
+    fn acquire_shared_buffer(
         &self,
         length: usize,
     ) -> core::result::Result<SlotLease<'_, Platform>, BrokerControlError> {
         let length = u32::try_from(length)
             .map_err(|_| BrokerControlError::Broker(ErrorCode::ResourceExhausted))?;
-        let result = self.slot_allocator.acquire_slot(length);
-        self.finish_shared_buffer_acquisition(result)
-    }
-
-    fn acquire_shared_buffer_slots(
-        &self,
-        length: usize,
-    ) -> core::result::Result<SlotLease<'_, Platform>, BrokerControlError> {
-        let length = u32::try_from(length)
-            .map_err(|_| BrokerControlError::Broker(ErrorCode::ResourceExhausted))?;
-        let result = self.slot_allocator.acquire_slots(length);
+        let result = self.slot_allocator.acquire(length);
         self.finish_shared_buffer_acquisition(result)
     }
 
@@ -444,7 +434,7 @@ where
         if output.len() > MAX_RANDOM_TRANSFER_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
-        let lease = self.acquire_shared_buffer_slot(output.len())?;
+        let lease = self.acquire_shared_buffer(output.len())?;
         self.request(|local| local.fill_random(lease.descriptor(), output))
     }
 
@@ -462,7 +452,7 @@ where
         // Keep blocking stdin reads from consuming the broker's shared worker
         // pool when multiple guest threads read concurrently.
         let _read_guard = self.stdio_read_lock.lock();
-        let lease = self.acquire_shared_buffer_slot(data.len())?;
+        let lease = self.acquire_shared_buffer(data.len())?;
         self.request(|local| local.read_stdio(lease.descriptor(), data))
     }
 
@@ -474,7 +464,7 @@ where
         if data.len() > MAX_STDIO_TRANSFER_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
-        let lease = self.acquire_shared_buffer_slot(data.len())?;
+        let lease = self.acquire_shared_buffer(data.len())?;
         self.request(|local| local.write_stdio(stream, lease.descriptor(), data))
     }
 
@@ -549,7 +539,7 @@ where
         if data.len() > MAX_SOCKET_TRANSFER_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
-        let lease = self.acquire_shared_buffer_slot(data.len())?;
+        let lease = self.acquire_shared_buffer(data.len())?;
         self.request(|local| local.send_socket(handle, lease.descriptor(), data, flags))
             .map(|result| match result {
                 Ok(sent) => SocketOutcome::Completed(sent),
@@ -569,7 +559,7 @@ where
         if data.len() > MAX_SOCKET_TRANSFER_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
-        let lease = self.acquire_shared_buffer_slot(data.len())?;
+        let lease = self.acquire_shared_buffer(data.len())?;
         self.request(|local| {
             local.receive_socket(
                 litebox_broker_protocol::socket::ReceiveSocketRequest {
@@ -599,7 +589,7 @@ where
         if data.len() > MAX_UDP_DATAGRAM_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
-        let lease = self.acquire_shared_buffer_slot(data.len())?;
+        let lease = self.acquire_shared_buffer(data.len())?;
         self.request(|local| {
             local.send_to_socket(handle, lease.descriptor(), data, flags, destination)
         })
@@ -618,7 +608,7 @@ where
         if data.len() > MAX_UDP_DATAGRAM_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
-        let lease = self.acquire_shared_buffer_slot(data.len())?;
+        let lease = self.acquire_shared_buffer(data.len())?;
         self.request(|local| local.receive_from_socket(handle, lease.descriptor(), data, flags))
             .map(|result| match result {
                 Ok(received) => SocketOutcome::Completed(received),
@@ -704,7 +694,7 @@ where
         data.try_reserve_exact(length as usize)
             .map_err(|_| BrokerControlError::Broker(ErrorCode::OutOfMemory))?;
         data.resize(length as usize, 0);
-        let lease = self.acquire_shared_buffer_slot(length as usize)?;
+        let lease = self.acquire_shared_buffer(length as usize)?;
         let read = self.request(|local| local.read_pipe(handle, lease.descriptor(), &mut data))?;
         data.truncate(read);
         Ok(data)
@@ -718,7 +708,7 @@ where
         if data.len() > MAX_PIPE_TRANSFER_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
-        let lease = self.acquire_shared_buffer_slot(data.len())?;
+        let lease = self.acquire_shared_buffer(data.len())?;
         self.request(|local| local.write_pipe(handle, lease.descriptor(), data))
     }
 
@@ -731,7 +721,10 @@ where
         mode: FileMode,
     ) -> core::result::Result<core::result::Result<ObjectHandle, FileError>, BrokerControlError>
     {
-        let lease = self.acquire_shared_buffer_slot(path.len())?;
+        if path.len() > SHARED_BUFFER_SLOT_SIZE as usize {
+            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
+        }
+        let lease = self.acquire_shared_buffer(path.len())?;
         self.request(|local| local.open_file(lease.descriptor(), path, user, access, flags, mode))
     }
 
@@ -743,7 +736,7 @@ where
     ) -> core::result::Result<core::result::Result<usize, FileError>, BrokerControlError> {
         let length = data.len().min(MAX_FILE_TRANSFER_SIZE as usize);
         let data = &mut data[..length];
-        let lease = self.acquire_shared_buffer_slots(length)?;
+        let lease = self.acquire_shared_buffer(length)?;
         self.request(|local| local.read_file(handle, lease.sequence(), data, offset))
     }
 
@@ -755,7 +748,7 @@ where
     ) -> core::result::Result<core::result::Result<usize, FileError>, BrokerControlError> {
         let length = data.len().min(MAX_FILE_TRANSFER_SIZE as usize);
         let data = &data[..length];
-        let lease = self.acquire_shared_buffer_slots(length)?;
+        let lease = self.acquire_shared_buffer(length)?;
         self.request(|local| local.write_file(handle, lease.sequence(), data, offset))
     }
 
@@ -787,7 +780,7 @@ where
         let mut entries = Vec::new();
         let mut start_index = 0;
         loop {
-            let lease = self.acquire_shared_buffer_slot(SHARED_BUFFER_SLOT_SIZE as usize)?;
+            let lease = self.acquire_shared_buffer(SHARED_BUFFER_SLOT_SIZE as usize)?;
             let response = self
                 .request(|local| local.read_directory(handle, lease.descriptor(), start_index))?;
             let (mut chunk, next_index) = match response {
@@ -814,7 +807,10 @@ where
         path: &str,
         user: FileUser,
     ) -> core::result::Result<core::result::Result<FileStatus, FileError>, BrokerControlError> {
-        let lease = self.acquire_shared_buffer_slot(path.len())?;
+        if path.len() > SHARED_BUFFER_SLOT_SIZE as usize {
+            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
+        }
+        let lease = self.acquire_shared_buffer(path.len())?;
         self.request(|local| local.path_file_status(lease.descriptor(), path, user))
     }
 
@@ -831,7 +827,10 @@ where
         user: FileUser,
         mode: FileMode,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
-        let lease = self.acquire_shared_buffer_slot(path.len())?;
+        if path.len() > SHARED_BUFFER_SLOT_SIZE as usize {
+            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
+        }
+        let lease = self.acquire_shared_buffer(path.len())?;
         self.request(|local| local.chmod_file(lease.descriptor(), path, user, mode))
     }
 
@@ -842,7 +841,10 @@ where
         user: Option<u16>,
         group: Option<u16>,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
-        let lease = self.acquire_shared_buffer_slot(path.len())?;
+        if path.len() > SHARED_BUFFER_SLOT_SIZE as usize {
+            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
+        }
+        let lease = self.acquire_shared_buffer(path.len())?;
         self.request(|local| local.chown_file(lease.descriptor(), path, acting_user, user, group))
     }
 
@@ -851,7 +853,10 @@ where
         path: &str,
         user: FileUser,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
-        let lease = self.acquire_shared_buffer_slot(path.len())?;
+        if path.len() > SHARED_BUFFER_SLOT_SIZE as usize {
+            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
+        }
+        let lease = self.acquire_shared_buffer(path.len())?;
         self.request(|local| local.unlink_file(lease.descriptor(), path, user))
     }
 
@@ -861,7 +866,10 @@ where
         user: FileUser,
         mode: FileMode,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
-        let lease = self.acquire_shared_buffer_slot(path.len())?;
+        if path.len() > SHARED_BUFFER_SLOT_SIZE as usize {
+            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
+        }
+        let lease = self.acquire_shared_buffer(path.len())?;
         self.request(|local| local.mkdir_file(lease.descriptor(), path, user, mode))
     }
 
@@ -870,7 +878,10 @@ where
         path: &str,
         user: FileUser,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
-        let lease = self.acquire_shared_buffer_slot(path.len())?;
+        if path.len() > SHARED_BUFFER_SLOT_SIZE as usize {
+            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
+        }
+        let lease = self.acquire_shared_buffer(path.len())?;
         self.request(|local| local.rmdir_file(lease.descriptor(), path, user))
     }
 
