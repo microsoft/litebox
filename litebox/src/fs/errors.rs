@@ -75,6 +75,8 @@ pub enum SeekError {
     ClosedFd,
     #[error("file descriptor does not point to a file")]
     NotAFile,
+    #[error("file descriptor is not open for seeking")]
+    NotForSeeking,
     #[error("would seek to an invalid (negative or past end) of seekable positions")]
     InvalidOffset,
     #[error("non-seekable file")]
@@ -194,6 +196,8 @@ pub enum ReadDirError {
     ClosedFd,
     #[error("fd does not point to a directory")]
     NotADirectory,
+    #[error("file descriptor is not open for reading")]
+    NotForReading,
     #[error("I/O error")]
     Io,
 }
