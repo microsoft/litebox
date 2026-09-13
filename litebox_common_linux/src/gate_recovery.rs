@@ -151,7 +151,7 @@ pub fn canonicalize(
             ) else {
                 continue;
             };
-            if metadata.slot_size() != slot_size {
+            if metadata.slot_size_for_host(host) != slot_size {
                 continue;
             }
             let mut slot = [0u8; SVC_SLOT_BYTES];
@@ -220,7 +220,7 @@ pub fn canonicalize(
             return Aarch64GateSignalResult::InvalidRuntimeState;
         }
     }
-    let offset = pc - slot_start;
+    let offset = metadata.recovery_offset_for_host(host, pc - slot_start);
     if matches!(metadata, GateMetadata::Svc) && offset >= SVC_GATE_BYTES {
         return if runtime.expected_outbound_stub == slot_start + SVC_GATE_BYTES
             && runtime.expected_outbound_pc == site + 4
