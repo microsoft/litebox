@@ -29,20 +29,15 @@ pub struct WindowsRawMutex {
 }
 
 impl WindowsRawMutex {
+    const MAX_FINITE_TIMEOUT_MS: u32 = INFINITE - 1;
+
     const fn new() -> Self {
         Self {
             state: AtomicU32::new(0),
         }
     }
 
-    fn block_or_maybe_timeout(
-        &self,
-        expected: u32,
-        timeout: Option<Duration>,
-    ) -> UnblockedOrTimedOut {
-        let timeout_ms = timeout.map_or(INFINITE, |timeout| {
-            u32::try_from(timeout.as_millis().min(u128::from(INFINITE - 1))).unwrap()
-        });
+    fn wait_on_address(&self, expected: u32, timeout_ms: u32) -> UnblockedOrTimedOut {
         // SAFETY: Both pointers remain valid for the call and identify equally sized u32 values.
         let unblocked = unsafe {
             WaitOnAddress(
@@ -59,6 +54,34 @@ impl WindowsRawMutex {
             match unsafe { GetLastError() } {
                 ERROR_TIMEOUT => UnblockedOrTimedOut::TimedOut,
                 error => panic!("WaitOnAddress failed with error {error}"),
+            }
+        }
+    }
+
+    fn block_or_maybe_timeout(
+        &self,
+        expected: u32,
+        timeout: Option<Duration>,
+    ) -> UnblockedOrTimedOut {
+        let Some(mut remaining) = timeout else {
+            return self.wait_on_address(expected, INFINITE);
+        };
+
+        loop {
+            let timeout_ms = remaining
+                .as_millis()
+                .saturating_add(u128::from(remaining.subsec_nanos() % 1_000_000 != 0))
+                .min(u128::from(Self::MAX_FINITE_TIMEOUT_MS));
+            let timeout_ms = u32::try_from(timeout_ms).unwrap();
+            match self.wait_on_address(expected, timeout_ms) {
+                UnblockedOrTimedOut::Unblocked => return UnblockedOrTimedOut::Unblocked,
+                UnblockedOrTimedOut::TimedOut => {
+                    let waited = Duration::from_millis(u64::from(timeout_ms));
+                    if remaining <= waited {
+                        return UnblockedOrTimedOut::TimedOut;
+                    }
+                    remaining -= waited;
+                }
             }
         }
     }
