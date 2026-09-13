@@ -23,11 +23,11 @@ use super::inode_allocator::InodeAllocator;
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
 
 /// Block size for stdio devices
-const STDIO_BLOCK_SIZE: usize = 1024;
+const STDIO_BLOCK_SIZE: u64 = 1024;
 /// Block size for null device
-const NULL_BLOCK_SIZE: usize = 0x1000;
+const NULL_BLOCK_SIZE: u64 = 0x1000;
 /// Block size for /dev/urandom
-const URANDOM_BLOCK_SIZE: usize = 0x1000;
+const URANDOM_BLOCK_SIZE: u64 = 0x1000;
 
 /// Constant node information for all 3 stdio devices:
 /// ```console
@@ -40,21 +40,21 @@ const URANDOM_BLOCK_SIZE: usize = 0x1000;
 const STDIO_NODE_INFO: NodeInfo = NodeInfo {
     dev: 64,
     ino: 9,
-    rdev: core::num::NonZeroUsize::new(34822),
+    rdev: core::num::NonZeroU64::new(34822),
 };
 /// Node info for /dev/null
 const NULL_NODE_INFO: NodeInfo = NodeInfo {
     dev: 5,
     ino: 4,
     // major=1, minor=3
-    rdev: core::num::NonZeroUsize::new(0x103),
+    rdev: core::num::NonZeroU64::new(0x103),
 };
 /// Node info for /dev/urandom
 const URANDOM_NODE_INFO: NodeInfo = NodeInfo {
     dev: 5,
     ino: 8,
     // major=1, minor=9
-    rdev: core::num::NonZeroUsize::new(0x109),
+    rdev: core::num::NonZeroU64::new(0x109),
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -316,7 +316,7 @@ impl Backend for Devices {
                     mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
                     size: super::DEFAULT_DIRECTORY_SIZE,
                     owner: UserInfo::ROOT,
-                    node_info: self.root_inode.clone(),
+                    node_info: self.root_inode,
                     blksize: super::DEFAULT_DIRECTORY_SIZE,
                 })
             }

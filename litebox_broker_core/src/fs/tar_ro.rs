@@ -43,7 +43,7 @@ use super::{
 
 /// Block size for file system I/O operations
 // TODO(jayb): Determine appropriate block size
-const BLOCK_SIZE: usize = 0;
+const BLOCK_SIZE: u64 = 0;
 
 /// A [`super::backend::Backend`] that stores all files in-memory, via a read-only `.tar` file.
 pub struct TarRo {
@@ -185,14 +185,12 @@ impl super::backend::Backend for TarRo {
             .iter()
             .map(|(name, child)| {
                 let (file_type, node_info) = match *child {
-                    IndexedChild::File(idx) => (
-                        FileType::RegularFile,
-                        self.tar_index.files[idx].node_info.clone(),
-                    ),
-                    IndexedChild::Dir(idx) => (
-                        FileType::Directory,
-                        self.tar_index.dirs[idx].node_info.clone(),
-                    ),
+                    IndexedChild::File(idx) => {
+                        (FileType::RegularFile, self.tar_index.files[idx].node_info)
+                    }
+                    IndexedChild::Dir(idx) => {
+                        (FileType::Directory, self.tar_index.dirs[idx].node_info)
+                    }
                 };
                 DirEntry {
                     name: name.clone(),
@@ -247,9 +245,10 @@ impl super::backend::Backend for TarRo {
                 Ok(super::FileStatus {
                     file_type: FileType::RegularFile,
                     mode: file.mode,
-                    size: file.data_range.len(),
+                    size: u64::try_from(file.data_range.len())
+                        .map_err(|_| super::errors::FileStatusError::Io)?,
                     owner: file.owner,
-                    node_info: file.node_info.clone(),
+                    node_info: file.node_info,
                     blksize: BLOCK_SIZE,
                 })
             }
@@ -260,7 +259,7 @@ impl super::backend::Backend for TarRo {
                     mode: DEFAULT_DIR_MODE,
                     size: super::DEFAULT_DIRECTORY_SIZE,
                     owner: dir.owner.unwrap_or(DEFAULT_DIRECTORY_OWNER),
-                    node_info: dir.node_info.clone(),
+                    node_info: dir.node_info,
                     blksize: BLOCK_SIZE,
                 })
             }

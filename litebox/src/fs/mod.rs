@@ -63,14 +63,14 @@ pub mod in_mem {
         fn from(node: InitialNode) -> Self {
             match node {
                 InitialNode::Directory { mode, owner } => Self::Directory {
-                    mode: litebox_broker_core::fs::Mode::from_bits_retain(mode.bits()),
+                    mode: litebox_broker_core::fs::Mode::from_u32_bits_truncate(mode.bits()),
                     owner: litebox_broker_core::fs::UserInfo {
                         user: owner.user,
                         group: owner.group,
                     },
                 },
                 InitialNode::File { mode, owner, data } => Self::File {
-                    mode: litebox_broker_core::fs::Mode::from_bits_retain(mode.bits()),
+                    mode: litebox_broker_core::fs::Mode::from_u32_bits_truncate(mode.bits()),
                     owner: litebox_broker_core::fs::UserInfo {
                         user: owner.user,
                         group: owner.group,
@@ -143,13 +143,9 @@ bitflags! {
 /// Types of files on a file-system.
 ///
 /// See [`resolver::Resolver::file_status`].
-#[derive(Debug, PartialEq, Eq, Clone)]
-#[non_exhaustive]
-pub enum FileType {
-    RegularFile,
-    Directory,
-    CharacterDevice,
-}
+///
+/// This is the canonical broker protocol object kind; LiteBox does not define its own.
+pub use litebox_broker_protocol::fs::FileType;
 
 bitflags! {
     /// `O_*` constants for use with open, ...

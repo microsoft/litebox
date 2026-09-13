@@ -285,7 +285,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
         if let Ok(upper_status) = self.upper.status(HandleRef::File(&upper)) {
             self.bind_copy_up(
                 layer,
-                status.node_info.clone(),
+                status.node_info,
                 upper_status.node_info,
                 Some(&upper),
             );
@@ -532,12 +532,11 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
         node: NodeInfo,
     ) -> NodeInfo {
         let rdev = node.rdev;
-        ids.entry(layer_node(layer, node))
+        *ids.entry(layer_node(layer, node))
             .or_insert_with(|| NodeInfo {
                 rdev,
                 ..self.alloc.next()
             })
-            .clone()
     }
 
     /// `status` as reported by `layer`, with its node identity replaced by the overlay's own.
@@ -560,7 +559,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
     ) {
         let mut state = self.state.lock();
         let id = self.map_node(&mut state.ids, Some(layer), lower);
-        state.ids.insert(layer_node(None, upper), id.clone());
+        state.ids.insert(layer_node(None, upper), id);
         if let Some(file) = upper_file {
             state.copied_up.insert(id, file.clone());
         }
@@ -645,7 +644,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
                     entry.lower.get_or_insert(layer);
                     if !entry.upper && entry.lower == Some(layer) {
                         // This layer owns the entry, so its node is the one callers see.
-                        entry.entry.ino_info = lower_node.clone().map(|node| {
+                        entry.entry.ino_info = lower_node.map(|node| {
                             self.map_node(&mut self.state.lock().ids, Some(layer), node)
                         });
                     }
@@ -656,7 +655,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
                         entry.lower_directories[layer] = true;
                         // Several layers describe one logical directory; the one already resolved
                         // above owns the identity, and this layer's node adopts it.
-                        if let (Some(node), Some(id)) = (lower_node, entry.entry.ino_info.clone()) {
+                        if let (Some(node), Some(id)) = (lower_node, entry.entry.ino_info) {
                             self.state
                                 .lock()
                                 .ids

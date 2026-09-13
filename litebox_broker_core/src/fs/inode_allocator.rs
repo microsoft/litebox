@@ -53,20 +53,20 @@ impl InodeAllocator {
         Self::for_device(STANDALONE_DEVICE_ID)
     }
 
-    /// Allocate a fresh `NodeInfo` for a new entry on this backend.
+    /// Allocate a fresh [`NodeInfo`] for a new entry on this backend.
     #[must_use]
     pub fn next(&self) -> NodeInfo {
         let ino = self.counter.fetch_add(1, Ordering::Relaxed);
         NodeInfo {
             dev: self.device_id(),
-            ino: ino.try_into().unwrap(),
+            ino,
             rdev: None,
         }
     }
 
     /// The device id this allocator hands out.
     #[must_use]
-    pub fn device_id(&self) -> usize {
-        self.device_id.try_into().unwrap()
+    pub fn device_id(&self) -> u64 {
+        self.device_id
     }
 }

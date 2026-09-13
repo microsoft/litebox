@@ -5,7 +5,9 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::num::NonZeroU64;
 
+use bitflags::bitflags;
 use thiserror::Error;
 
 use crate::ObjectHandle;
@@ -28,6 +30,11 @@ pub struct FileUser {
     pub group: u16,
 }
 
+impl FileUser {
+    /// The root user.
+    pub const ROOT: Self = Self { user: 0, group: 0 };
+}
+
 /// File object kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -41,14 +48,14 @@ pub enum FileType {
 }
 
 /// Device and inode identity.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FileNodeInfo {
     /// Device number.
     pub dev: u64,
     /// Inode number.
     pub ino: u64,
-    /// Referenced device number for special files.
-    pub rdev: Option<u64>,
+    /// Nonzero referenced device number for special files.
+    pub rdev: Option<NonZeroU64>,
 }
 
 /// Status returned for a fs object.
@@ -65,7 +72,7 @@ pub struct FileStatus {
     /// Device and inode identity.
     pub node_info: FileNodeInfo,
     /// Preferred fs I/O block size.
-    pub block_size: u64,
+    pub blksize: u64,
 }
 
 /// One directory entry.
@@ -76,7 +83,7 @@ pub struct FileDirectoryEntry {
     /// Entry kind.
     pub file_type: FileType,
     /// Optional device and inode identity.
-    pub node_info: Option<FileNodeInfo>,
+    pub ino_info: Option<FileNodeInfo>,
 }
 
 /// File operation failure that is meaningful to the guest ABI.
@@ -129,14 +136,13 @@ pub enum FileError {
 
 /// Seek origin.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum FileSeekWhence {
     /// Offset from the beginning of the file.
-    Beginning,
+    RelativeToBeginning,
     /// Offset from the file's current position.
-    Current,
+    RelativeToCurrentOffset,
     /// Offset from the end of the file.
-    End,
+    RelativeToEnd,
 }
 
 /// Access mode requested when opening a fs object.
@@ -151,29 +157,56 @@ pub enum FileAccessMode {
     ReadWrite,
 }
 
-/// ABI-neutral fs permission and special mode bits.
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct FileMode(u16);
+bitflags! {
+    /// ABI-neutral fs permission and special mode bits.
+    #[repr(transparent)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+    pub struct FileMode: u16 {
+        /// User (file owner) has read, write, and execute permission.
+        const RWXU = 0o00700;
+        /// User has read permission.
+        const RUSR = 0o00400;
+        /// User has write permission.
+        const WUSR = 0o00200;
+        /// User has execute permission.
+        const XUSR = 0o00100;
+        /// Group has read, write, and execute permission.
+        const RWXG = 0o00070;
+        /// Group has read permission.
+        const RGRP = 0o00040;
+        /// Group has write permission.
+        const WGRP = 0o00020;
+        /// Group has execute permission.
+        const XGRP = 0o00010;
+        /// Others have read, write, and execute permission.
+        const RWXO = 0o00007;
+        /// Others have read permission.
+        const ROTH = 0o00004;
+        /// Others have write permission.
+        const WOTH = 0o00002;
+        /// Others have execute permission.
+        const XOTH = 0o00001;
+        /// Set-user-ID bit.
+        const SUID = 0o0004000;
+        /// Set-group-ID bit.
+        const SGID = 0o0002000;
+        /// Sticky bit.
+        const SVTX = 0o0001000;
+        /// Every permission and special mode bit this protocol version defines.
+        const SUPPORTED = 0o0007777;
+    }
+}
 
 impl FileMode {
-    /// Every permission and special mode bit this protocol version defines.
-    pub const SUPPORTED: Self = Self(0o7777);
-
-    /// Creates a mode when every bit is defined by this protocol version.
+    /// Creates a mode from wider mode bits, discarding bits not defined by this protocol.
     #[must_use]
-    pub const fn from_bits(bits: u16) -> Option<Self> {
-        if bits & !Self::SUPPORTED.0 == 0 {
-            Some(Self(bits))
-        } else {
-            None
-        }
-    }
-
-    /// Returns the stable protocol bits.
-    #[must_use]
-    pub const fn bits(self) -> u16 {
-        self.0
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "masking with u16-backed supported bits guarantees the result fits in u16"
+    )]
+    pub fn from_u32_bits_truncate(bits: u32) -> Self {
+        let bits = (bits & u32::from(Self::SUPPORTED.bits())) as u16;
+        Self::from_bits_retain(bits)
     }
 }
 
@@ -208,7 +241,6 @@ impl FileOpenFlags {
     pub const APPEND: Self = Self(1 << 8);
     /// Open only for path-based operations.
     pub const PATH: Self = Self(1 << 9);
-
     /// Every open flag this protocol version defines.
     pub const SUPPORTED: Self = Self(
         Self::CREATE.0
@@ -547,14 +579,16 @@ pub fn try_decode_directory_entries(
         name.push_str(encoded_name);
         let file_type =
             file_type_from_raw(decoder.u8()?).ok_or(DirectoryPayloadError::Malformed)?;
-        let node_info = match decoder.u8()? {
+        let ino_info = match decoder.u8()? {
             0 => None,
             1 => {
                 let dev = decoder.u64()?;
                 let ino = decoder.u64()?;
                 let rdev = match decoder.u8()? {
                     0 => None,
-                    1 => Some(decoder.u64()?),
+                    1 => Some(
+                        NonZeroU64::new(decoder.u64()?).ok_or(DirectoryPayloadError::Malformed)?,
+                    ),
                     _ => return Err(DirectoryPayloadError::Malformed.into()),
                 };
                 Some(FileNodeInfo { dev, ino, rdev })
@@ -564,7 +598,7 @@ pub fn try_decode_directory_entries(
         entries.push(FileDirectoryEntry {
             name,
             file_type,
-            node_info,
+            ino_info,
         });
     }
     if decoder.offset != payload.len() {
@@ -598,7 +632,7 @@ fn encoded_directory_entry_length(
         .checked_add(entry.name.len())
         .and_then(|length| length.checked_add(2))
         .and_then(|length| {
-            entry.node_info.map_or(Some(length), |node_info| {
+            entry.ino_info.map_or(Some(length), |node_info| {
                 length
                     .checked_add(size_of::<u64>() * 2 + 1)
                     .and_then(|length| {
@@ -648,7 +682,7 @@ fn encode_directory_entry(
     output.extend_from_slice(&name_len.to_le_bytes());
     output.extend_from_slice(name);
     output.push(file_type_raw(entry.file_type));
-    match entry.node_info {
+    match entry.ino_info {
         Some(node_info) => {
             output.push(1);
             output.extend_from_slice(&node_info.dev.to_le_bytes());
@@ -656,7 +690,7 @@ fn encode_directory_entry(
             match node_info.rdev {
                 Some(rdev) => {
                     output.push(1);
-                    output.extend_from_slice(&rdev.to_le_bytes());
+                    output.extend_from_slice(&rdev.get().to_le_bytes());
                 }
                 None => output.push(0),
             }
@@ -711,12 +745,12 @@ mod tests {
             FileDirectoryEntry {
                 name: ".".into(),
                 file_type: FileType::Directory,
-                node_info: None,
+                ino_info: None,
             },
             FileDirectoryEntry {
                 name: "regular".into(),
                 file_type: FileType::RegularFile,
-                node_info: Some(FileNodeInfo {
+                ino_info: Some(FileNodeInfo {
                     dev: 2,
                     ino: 3,
                     rdev: None,
@@ -725,10 +759,10 @@ mod tests {
             FileDirectoryEntry {
                 name: "device".into(),
                 file_type: FileType::CharacterDevice,
-                node_info: Some(FileNodeInfo {
+                ino_info: Some(FileNodeInfo {
                     dev: 5,
                     ino: 7,
-                    rdev: Some(11),
+                    rdev: NonZeroU64::new(11),
                 }),
             },
         ];
@@ -742,10 +776,10 @@ mod tests {
         let payload = encode_directory_entries(&[FileDirectoryEntry {
             name: "x".into(),
             file_type: FileType::CharacterDevice,
-            node_info: Some(FileNodeInfo {
+            ino_info: Some(FileNodeInfo {
                 dev: 2,
                 ino: 3,
-                rdev: Some(5),
+                rdev: NonZeroU64::new(5),
             }),
         }])
         .unwrap();
@@ -759,22 +793,44 @@ mod tests {
     }
 
     #[test]
+    fn directory_payload_rejects_zero_rdev() {
+        let mut payload = encode_directory_entries(&[FileDirectoryEntry {
+            name: "x".into(),
+            file_type: FileType::CharacterDevice,
+            ino_info: Some(FileNodeInfo {
+                dev: 2,
+                ino: 3,
+                rdev: NonZeroU64::new(5),
+            }),
+        }])
+        .unwrap();
+
+        // `rdev` is the trailing value of the payload's only entry.
+        let rdev = payload.len() - size_of::<u64>();
+        payload[rdev..].copy_from_slice(&0u64.to_le_bytes());
+        assert_eq!(
+            decode_directory_entries(&payload),
+            Err(DirectoryPayloadError::Malformed)
+        );
+    }
+
+    #[test]
     fn directory_payload_chunks_use_entry_indexes() {
         let entries = [
             FileDirectoryEntry {
                 name: "first".into(),
                 file_type: FileType::RegularFile,
-                node_info: None,
+                ino_info: None,
             },
             FileDirectoryEntry {
                 name: "second".into(),
                 file_type: FileType::Directory,
-                node_info: None,
+                ino_info: None,
             },
             FileDirectoryEntry {
                 name: "third".into(),
                 file_type: FileType::CharacterDevice,
-                node_info: None,
+                ino_info: None,
             },
         ];
         let first_two_length = encode_directory_entries(&entries[..2]).unwrap().len();
@@ -800,7 +856,7 @@ mod tests {
         let valid = encode_directory_entries(&[FileDirectoryEntry {
             name: "entry".into(),
             file_type: FileType::RegularFile,
-            node_info: None,
+            ino_info: None,
         }])
         .unwrap();
 
@@ -834,7 +890,7 @@ mod tests {
         let maximum_entry = FileDirectoryEntry {
             name: "x".repeat(maximum_name_length),
             file_type: FileType::RegularFile,
-            node_info: None,
+            ino_info: None,
         };
         let payload = encode_directory_entries(core::slice::from_ref(&maximum_entry)).unwrap();
         assert_eq!(payload.len(), MAX_FILE_TRANSFER_SIZE as usize);
@@ -843,7 +899,7 @@ mod tests {
         let oversized_entry = FileDirectoryEntry {
             name: "x".repeat(maximum_name_length + 1),
             file_type: FileType::RegularFile,
-            node_info: None,
+            ino_info: None,
         };
         assert_eq!(
             encode_directory_entries(&[oversized_entry]),

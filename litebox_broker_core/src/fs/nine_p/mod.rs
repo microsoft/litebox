@@ -11,7 +11,7 @@
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::num::NonZeroUsize;
+use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use thiserror::Error;
@@ -31,7 +31,6 @@ use litebox_platform::sync;
 mod client;
 mod fcall;
 mod id_pool;
-
 #[cfg(all(test, target_os = "linux"))]
 mod tests;
 
@@ -56,7 +55,7 @@ pub struct NineP<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read +
     root: Arc<OwnedFid<Platform, T>>,
     /// Device id reported in every [`NodeInfo`](super::NodeInfo) from this backend; inode numbers
     /// come from the server's qids instead.
-    device_id: usize,
+    device_id: u64,
     /// Whether `unlinkat` is supported by the server
     unlinkat_supported: AtomicBool,
 }
@@ -443,18 +442,16 @@ where
                 // have the resolver handle only cases where it is not handled by the backend?
                 !matches!(&*entry.name, b"." | b"..")
             })
-            .map(|entry| {
-                Ok(super::DirEntry {
-                    name: String::from_utf8_lossy(&entry.name).into_owned(),
-                    file_type: qid_type_to_file_type(entry.qid.typ),
-                    ino_info: Some(super::NodeInfo {
-                        dev: self.device_id,
-                        ino: usize::try_from(entry.qid.path).map_err(|_| Error::InvalidResponse)?,
-                        rdev: None,
-                    }),
-                })
+            .map(|entry| super::DirEntry {
+                name: String::from_utf8_lossy(&entry.name).into_owned(),
+                file_type: qid_type_to_file_type(entry.qid.typ),
+                ino_info: Some(super::NodeInfo {
+                    dev: self.device_id,
+                    ino: entry.qid.path,
+                    rdev: None,
+                }),
             })
-            .collect::<Result<_, Error>>()?)
+            .collect())
     }
 
     fn read(
@@ -528,7 +525,7 @@ where
             fid,
             name,
             fcall::LOpenFlags::O_RDWR,
-            metadata.mode.bits(),
+            metadata.mode.bits().into(),
             u32::from(metadata.owner.group),
         )?;
         Ok(FileHandle::from_typed::<Self>(NinePFileHandle {
@@ -547,7 +544,7 @@ where
         self.client.mkdir(
             &dir.fid.fid,
             name,
-            metadata.mode.bits(),
+            metadata.mode.bits().into(),
             u32::from(metadata.owner.group),
         )?;
         // `Tmkdir` only reports the new directory's qid, so a walk is needed to address it.
@@ -579,7 +576,7 @@ where
             HandleRef::Dir(h) => &h.get_typed::<Self>().fid,
         };
         let stat = fcall::SetAttr {
-            mode: mode.bits(),
+            mode: mode.bits().into(),
             ..Default::default()
         };
         Ok(self
@@ -718,38 +715,36 @@ fn qid_type_to_file_type(qid_type: fcall::QidType) -> super::FileType {
 /// filesystem as.
 fn rgetattr_to_file_status(
     attr: &fcall::Rgetattr,
-    device_id: usize,
+    device_id: u64,
 ) -> Result<super::FileStatus, Error> {
     let file_type = qid_type_to_file_type(attr.qid.typ);
 
     if attr.valid.contains(fcall::GetattrMask::BASIC) {
         Ok(super::FileStatus {
             file_type,
-            mode: super::Mode::from_bits_truncate(attr.stat.mode),
-            size: usize::try_from(attr.stat.size).map_err(|_| Error::InvalidResponse)?,
+            mode: super::Mode::from_u32_bits_truncate(attr.stat.mode),
+            size: attr.stat.size,
             owner: super::UserInfo {
                 user: u16::try_from(attr.stat.uid).map_err(|_| Error::InvalidResponse)?,
                 group: u16::try_from(attr.stat.gid).map_err(|_| Error::InvalidResponse)?,
             },
             node_info: super::NodeInfo {
                 dev: device_id,
-                ino: usize::try_from(attr.qid.path).map_err(|_| Error::InvalidResponse)?,
-                rdev: NonZeroUsize::new(
-                    usize::try_from(attr.stat.rdev).map_err(|_| Error::InvalidResponse)?,
-                ),
+                ino: attr.qid.path,
+                rdev: NonZeroU64::new(attr.stat.rdev),
             },
-            blksize: usize::try_from(attr.stat.blksize).map_err(|_| Error::InvalidResponse)?,
+            blksize: attr.stat.blksize,
         })
     } else {
         Ok(super::FileStatus {
             file_type,
             mode: if attr.valid.contains(fcall::GetattrMask::MODE) {
-                super::Mode::from_bits_truncate(attr.stat.mode)
+                super::Mode::from_u32_bits_truncate(attr.stat.mode)
             } else {
                 super::Mode::empty()
             },
             size: if attr.valid.contains(fcall::GetattrMask::SIZE) {
-                usize::try_from(attr.stat.size).map_err(|_| Error::InvalidResponse)?
+                attr.stat.size
             } else {
                 0
             },
@@ -767,17 +762,15 @@ fn rgetattr_to_file_status(
             },
             node_info: super::NodeInfo {
                 dev: device_id,
-                ino: usize::try_from(attr.qid.path).map_err(|_| Error::InvalidResponse)?,
+                ino: attr.qid.path,
                 rdev: if attr.valid.contains(fcall::GetattrMask::RDEV) {
-                    NonZeroUsize::new(
-                        usize::try_from(attr.stat.rdev).map_err(|_| Error::InvalidResponse)?,
-                    )
+                    NonZeroU64::new(attr.stat.rdev)
                 } else {
                     None
                 },
             },
             blksize: if attr.valid.contains(fcall::GetattrMask::BLOCKS) {
-                usize::try_from(attr.stat.blksize).map_err(|_| Error::InvalidResponse)?
+                attr.stat.blksize
             } else {
                 0
             },

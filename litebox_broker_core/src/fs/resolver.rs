@@ -623,10 +623,13 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         let write_offset = match seek_behavior {
             SeekBehavior::NonSeekable | SeekBehavior::ZeroPosition => 0,
             SeekBehavior::PositionBased if entry.append_mode && offset.is_none() => {
-                self.backend
-                    .status(HandleRef::File(file))
-                    .map_err(|_| WriteError::Io)?
-                    .size
+                usize::try_from(
+                    self.backend
+                        .status(HandleRef::File(file))
+                        .map_err(|_| WriteError::Io)?
+                        .size,
+                )
+                .map_err(|_| WriteError::Io)?
             }
             SeekBehavior::PositionBased => offset.unwrap_or(entry.position),
         };
@@ -696,6 +699,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                     .status(HandleRef::File(file))
                     .map_err(|_| SeekError::Io)?
                     .size;
+                let file_len = usize::try_from(file_len).map_err(|_| SeekError::InvalidOffset)?;
                 let base = match whence {
                     SeekWhence::RelativeToBeginning => 0,
                     SeekWhence::RelativeToCurrentOffset => entry.position,
