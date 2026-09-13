@@ -2002,6 +2002,7 @@ dependencies = [
  "bitflags",
  "int-enum",
  "litebox",
+ "litebox_broker_protocol",
  "litebox_common_linux",
  "litebox_common_windows",
  "litebox_platform",
