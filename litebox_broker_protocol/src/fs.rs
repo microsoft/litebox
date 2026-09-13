@@ -21,6 +21,9 @@ pub const MAX_FILE_TRANSFER_SIZE: u32 = SHARED_BUFFER_SLOT_SIZE * MAX_FILE_TRANS
 
 const _: () =
     assert!(MAX_FILE_TRANSFER_SLOT_COUNT <= crate::shared_buffer::SHARED_BUFFER_SLOT_COUNT);
+const _: () = assert!(
+    MAX_FILE_TRANSFER_SLOT_COUNT as usize <= crate::shared_buffer::MAX_SHARED_BUFFER_SEQUENCE_SLOTS
+);
 
 /// File user identity used for permission checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

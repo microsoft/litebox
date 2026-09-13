@@ -75,7 +75,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }))? {
             FileResponse::Read(response) => {
                 assert!(
-                    response.read <= buffer.length,
+                    response.read <= buffer.length(),
                     "broker returned oversized file read"
                 );
                 let read = response.read as usize;
@@ -108,7 +108,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }))? {
             FileResponse::Write(response) => {
                 assert!(
-                    response.written <= buffer.length,
+                    response.written <= buffer.length(),
                     "broker returned oversized file write"
                 );
                 Ok(Ok(response.written as usize))
@@ -415,11 +415,12 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         buffer: SharedBufferSequence,
         expected_length: usize,
     ) -> Result<(), Channel::Error> {
-        if buffer.length > MAX_FILE_TRANSFER_SIZE {
+        if buffer.length() > MAX_FILE_TRANSFER_SIZE {
             return Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted));
         }
         assert_eq!(
-            expected_length, buffer.length as usize,
+            expected_length,
+            buffer.length() as usize,
             "shared file data must match its sequence"
         );
         buffer
@@ -573,7 +574,7 @@ mod tests {
         );
         assert_eq!(
             local
-                .write_file(handle, sequence(1 << 1, 3), b"abc", None)
+                .write_file(handle, sequence([1], 3), b"abc", None)
                 .unwrap(),
             Ok(3)
         );
@@ -586,7 +587,7 @@ mod tests {
         let mut output = [0; 2];
         assert_eq!(
             local
-                .read_file(handle, sequence(1 << 2, 2), &mut output, Some(1))
+                .read_file(handle, sequence([2], 2), &mut output, Some(1))
                 .unwrap(),
             Ok(2)
         );
@@ -638,7 +639,7 @@ mod tests {
         let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
         let (local, ()) =
             BrokerLocal::negotiate(channel, |channel| Ok((channel, memory, ()))).unwrap();
-        let oversized = sequence(1, MAX_FILE_TRANSFER_SIZE + 1);
+        let oversized = sequence([0], MAX_FILE_TRANSFER_SIZE + 1);
 
         assert!(matches!(
             local.read_file(ObjectHandle(1), oversized, &mut [], None),
@@ -668,7 +669,7 @@ mod tests {
         let data = (0..length)
             .map(|index| u8::try_from(index % 251).unwrap())
             .collect::<std::vec::Vec<_>>();
-        let buffer = sequence((1 << 1) | (1 << 3), u32::try_from(length).unwrap());
+        let buffer = sequence([1, 3], u32::try_from(length).unwrap());
 
         assert_eq!(
             local
@@ -704,7 +705,7 @@ mod tests {
             local
                 .read_file(
                     ObjectHandle(1),
-                    sequence((1 << 4) | (1 << 7), u32::try_from(length).unwrap()),
+                    sequence([4, 7], u32::try_from(length).unwrap()),
                     &mut output,
                     None,
                 )
@@ -721,8 +722,9 @@ mod tests {
         }
     }
 
-    const fn sequence(slot_mask: u32, length: u32) -> SharedBufferSequence {
-        SharedBufferSequence { slot_mask, length }
+    fn sequence<const N: usize>(slots: [u32; N], length: u32) -> SharedBufferSequence {
+        let slots = slots.map(SharedBufferSlotIndex);
+        SharedBufferSequence::new(&slots, length).unwrap()
     }
 
     #[derive(Clone)]

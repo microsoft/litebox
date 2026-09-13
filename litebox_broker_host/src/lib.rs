@@ -46,7 +46,7 @@ use litebox_broker_protocol::pipe::{
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::shared_buffer::{
     SHARED_BUFFER_LAYOUT, SHARED_BUFFER_SLOT_COUNT, SHARED_BUFFER_SLOT_SIZE,
-    SharedBufferDescriptor, SharedBufferSequence, SharedBufferSlotIndex,
+    SharedBufferDescriptor, SharedBufferSequence,
 };
 use litebox_broker_protocol::socket::{
     AcceptSocketResponse, BindSocketResponse, ConnectSocketResponse, CreateSocketResponse,
@@ -368,8 +368,11 @@ impl SharedBufferUsage {
     }
 
     fn end(&mut self, request_id: RequestId, sequence: SharedBufferSequence) {
-        for slot_index in slot_indices(sequence.slot_mask) {
-            let slot = &mut self.slots[slot_index.0 as usize];
+        for descriptor in sequence
+            .descriptors(SHARED_BUFFER_LAYOUT)
+            .expect("active shared-buffer sequence must remain valid")
+        {
+            let slot = &mut self.slots[descriptor.slot_index.0 as usize];
             assert_eq!(
                 *slot,
                 SharedBufferSlotState::Active(request_id),
@@ -378,17 +381,6 @@ impl SharedBufferUsage {
             *slot = SharedBufferSlotState::Idle(request_id);
         }
     }
-}
-
-fn slot_indices(mut slot_mask: u32) -> impl Iterator<Item = SharedBufferSlotIndex> {
-    core::iter::from_fn(move || {
-        if slot_mask == 0 {
-            return None;
-        }
-        let slot_index = slot_mask.trailing_zeros();
-        slot_mask &= !(1 << slot_index);
-        Some(SharedBufferSlotIndex(slot_index))
-    })
 }
 
 fn complete_request(
@@ -475,7 +467,7 @@ fn handle_file_request<Memory: SharedMemory>(
             offset,
         }) => {
             validate_file_sequence(buffer)?;
-            let mut data = allocate_zeroed(buffer.length)?;
+            let mut data = allocate_zeroed(buffer.length())?;
             match litebox_broker_core::fs::read(session, handle, &mut data, offset)
                 .map_err(RequestFailure::from)?
             {
@@ -659,7 +651,8 @@ fn validate_file_buffer(buffer: SharedBufferDescriptor) -> RequestResult<()> {
 }
 
 fn validate_file_sequence(buffer: SharedBufferSequence) -> RequestResult<()> {
-    if buffer.length > MAX_FILE_TRANSFER_SIZE || buffer.descriptors(SHARED_BUFFER_LAYOUT).is_err() {
+    if buffer.length() > MAX_FILE_TRANSFER_SIZE || buffer.descriptors(SHARED_BUFFER_LAYOUT).is_err()
+    {
         return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
     }
     Ok(())
@@ -690,7 +683,7 @@ fn read_file_sequence<Memory: SharedMemory>(
     buffer: SharedBufferSequence,
 ) -> RequestResult<Vec<u8>> {
     validate_file_sequence(buffer)?;
-    let mut data = allocate_zeroed(buffer.length)?;
+    let mut data = allocate_zeroed(buffer.length())?;
     let mut offset = 0;
     for descriptor in buffer
         .descriptors(shared_buffers.layout())
@@ -711,7 +704,7 @@ fn write_file_sequence<Memory: SharedMemory>(
     data: &[u8],
 ) -> RequestResult<()> {
     validate_file_sequence(buffer)?;
-    if data.len() > buffer.length as usize {
+    if data.len() > buffer.length() as usize {
         return Err(RequestFailure::Abort(ErrorCode::Internal));
     }
     let mut offset = 0;
@@ -1162,7 +1155,7 @@ mod tests {
     use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
     use litebox_broker_protocol::shared_buffer::{
         SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SHARED_BUFFER_SLOT_SIZE,
-        SharedBufferDescriptor,
+        SharedBufferDescriptor, SharedBufferSlotIndex,
     };
     use litebox_broker_protocol::socket::{
         AddressFamily, ConnectSocketRequest, CreateSocketRequest, IpProtocol, ReceiveFlags,
@@ -1573,7 +1566,7 @@ mod tests {
                 &session,
                 BrokerOperation::File(FileRequest::Write(WriteFileRequest {
                     handle: opened.handle,
-                    buffer: sequence(1 << 1, 3),
+                    buffer: sequence([1], 3),
                     offset: None,
                 })),
                 &shared_buffers,
@@ -1597,7 +1590,7 @@ mod tests {
                 &session,
                 BrokerOperation::File(FileRequest::Read(ReadFileRequest {
                     handle: opened.handle,
-                    buffer: sequence(1 << 2, 3),
+                    buffer: sequence([2], 3),
                     offset: None,
                 })),
                 &shared_buffers,
@@ -2438,53 +2431,57 @@ mod tests {
     fn shared_buffer_usage_rejects_invalid_descriptors() {
         let mut usage = SharedBufferUsage::new();
         usage
-            .begin(RequestId(1), sequence(1, 3), SHARED_BUFFER_LAYOUT)
+            .begin(RequestId(1), sequence([0], 3), SHARED_BUFFER_LAYOUT)
             .unwrap();
         assert_eq!(
-            usage.begin(RequestId(2), sequence(1, 3), SHARED_BUFFER_LAYOUT),
+            usage.begin(RequestId(2), sequence([0], 3), SHARED_BUFFER_LAYOUT),
             Err(ErrorCode::MalformedRequest)
         );
-        usage.end(RequestId(1), sequence(1, 3));
+        usage.end(RequestId(1), sequence([0], 3));
         assert_eq!(
-            usage.begin(RequestId(1), sequence(1, 3), SHARED_BUFFER_LAYOUT),
+            usage.begin(RequestId(1), sequence([0], 3), SHARED_BUFFER_LAYOUT),
             Err(ErrorCode::MalformedRequest)
         );
         assert_eq!(
-            usage.begin(RequestId(0), sequence(1, 3), SHARED_BUFFER_LAYOUT),
+            usage.begin(RequestId(0), sequence([0], 3), SHARED_BUFFER_LAYOUT),
             Err(ErrorCode::MalformedRequest)
         );
         assert!(
             usage
-                .begin(RequestId(3), sequence(1, 3), SHARED_BUFFER_LAYOUT)
+                .begin(RequestId(3), sequence([0], 3), SHARED_BUFFER_LAYOUT)
                 .is_ok()
         );
         assert_eq!(
-            usage.begin(RequestId(2), sequence(1 << 16, 3), SHARED_BUFFER_LAYOUT),
+            usage.begin(
+                RequestId(2),
+                sequence([SHARED_BUFFER_SLOT_COUNT], 3),
+                SHARED_BUFFER_LAYOUT
+            ),
             Err(ErrorCode::MalformedRequest)
         );
         assert_eq!(
             usage.begin(
                 RequestId(2),
-                sequence(1 << 1, SHARED_BUFFER_SLOT_SIZE + 1),
+                sequence([1], SHARED_BUFFER_SLOT_SIZE + 1),
                 SHARED_BUFFER_LAYOUT
             ),
             Err(ErrorCode::MalformedRequest)
         );
-        usage.end(RequestId(3), sequence(1, 3));
+        usage.end(RequestId(3), sequence([0], 3));
 
-        let first = sequence((1 << 0) | (1 << 2), SHARED_BUFFER_SLOT_SIZE + 1);
+        let first = sequence([0, 2], SHARED_BUFFER_SLOT_SIZE + 1);
         usage
             .begin(RequestId(4), first, SHARED_BUFFER_LAYOUT)
             .unwrap();
         assert_eq!(
             usage.begin(
                 RequestId(5),
-                sequence((1 << 1) | (1 << 2), SHARED_BUFFER_SLOT_SIZE + 1),
+                sequence([1, 2], SHARED_BUFFER_SLOT_SIZE + 1),
                 SHARED_BUFFER_LAYOUT,
             ),
             Err(ErrorCode::MalformedRequest)
         );
-        let second = sequence(1 << 1, 1);
+        let second = sequence([1], 1);
         usage
             .begin(RequestId(5), second, SHARED_BUFFER_LAYOUT)
             .unwrap();
@@ -2675,8 +2672,9 @@ mod tests {
         }
     }
 
-    const fn sequence(slot_mask: u32, length: u32) -> SharedBufferSequence {
-        SharedBufferSequence { slot_mask, length }
+    fn sequence<const N: usize>(slots: [u32; N], length: u32) -> SharedBufferSequence {
+        let slots = slots.map(SharedBufferSlotIndex);
+        SharedBufferSequence::new(&slots, length).unwrap()
     }
 
     fn handle_test_request(session: &BrokerSession, operation: BrokerOperation) -> BrokerResult {

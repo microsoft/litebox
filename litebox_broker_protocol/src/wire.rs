@@ -63,7 +63,7 @@ const RESPONSE_TAG_VERSION_MISMATCH: u8 = 255;
 const NOTIFICATION_TAG_READINESS: u8 = 0;
 
 /// Maximum byte length of any encoded active request or response.
-pub const MAX_ENCODED_ACTIVE_MESSAGE_SIZE: usize = 58;
+pub const MAX_ENCODED_ACTIVE_MESSAGE_SIZE: usize = 64;
 
 /// Maximum byte length of any encoded broker notification.
 pub const MAX_ENCODED_NOTIFICATION_SIZE: usize = 13;
@@ -613,26 +613,30 @@ mod tests {
             })),
             BrokerOperation::File(FileRequest::Read(ReadFileRequest {
                 handle,
-                buffer: SharedBufferSequence {
-                    slot_mask: (1 << 2) | (1 << 5),
-                    length: 64 * 1024 + 32,
-                },
-                offset: None,
+                buffer: SharedBufferSequence::new(
+                    &[
+                        SharedBufferSlotIndex(2),
+                        SharedBufferSlotIndex(5),
+                        SharedBufferSlotIndex(7),
+                        SharedBufferSlotIndex(9),
+                        SharedBufferSlotIndex(10),
+                        SharedBufferSlotIndex(11),
+                        SharedBufferSlotIndex(13),
+                        SharedBufferSlotIndex(15),
+                    ],
+                    512 * 1024,
+                )
+                .unwrap(),
+                offset: Some(u64::MAX),
             })),
             BrokerOperation::File(FileRequest::Read(ReadFileRequest {
                 handle,
-                buffer: SharedBufferSequence {
-                    slot_mask: 1 << 2,
-                    length: 32,
-                },
-                offset: Some(u64::MAX),
+                buffer: SharedBufferSequence::new(&[SharedBufferSlotIndex(2)], 32).unwrap(),
+                offset: None,
             })),
             BrokerOperation::File(FileRequest::Write(WriteFileRequest {
                 handle,
-                buffer: SharedBufferSequence {
-                    slot_mask: 1 << 3,
-                    length: 17,
-                },
+                buffer: SharedBufferSequence::new(&[SharedBufferSlotIndex(3)], 17).unwrap(),
                 offset: Some(11),
             })),
             BrokerOperation::File(FileRequest::Seek(SeekFileRequest {
@@ -826,7 +830,7 @@ mod tests {
                 Err(WireError::WrongMessagePhase)
             );
         }
-        assert!(maximum_encoded_size <= MAX_ENCODED_ACTIVE_MESSAGE_SIZE);
+        assert_eq!(maximum_encoded_size, MAX_ENCODED_ACTIVE_MESSAGE_SIZE);
     }
 
     #[test]
@@ -1146,7 +1150,7 @@ mod tests {
                 Err(WireError::WrongMessagePhase)
             );
         }
-        assert_eq!(maximum_encoded_size, MAX_ENCODED_ACTIVE_MESSAGE_SIZE);
+        assert_eq!(maximum_encoded_size, 58);
     }
 
     #[test]

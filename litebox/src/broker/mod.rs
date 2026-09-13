@@ -397,15 +397,7 @@ where
     ) -> core::result::Result<SlotLease<'_, Platform>, BrokerControlError> {
         let length = u32::try_from(length)
             .map_err(|_| BrokerControlError::Broker(ErrorCode::ResourceExhausted))?;
-        let result = self.slot_allocator.acquire(length);
-        self.finish_shared_buffer_acquisition(result)
-    }
-
-    fn finish_shared_buffer_acquisition<'a>(
-        &'a self,
-        result: core::result::Result<SlotLease<'a, Platform>, AcquireError>,
-    ) -> core::result::Result<SlotLease<'a, Platform>, BrokerControlError> {
-        match result {
+        match self.slot_allocator.acquire(length) {
             Ok(lease) => Ok(lease),
             Err(AcquireError::TooLarge) => {
                 Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted))
@@ -415,6 +407,16 @@ where
                 Err(BrokerControlError::AssociationFailed)
             }
         }
+    }
+
+    fn acquire_file_path_buffer(
+        &self,
+        path: &str,
+    ) -> core::result::Result<SlotLease<'_, Platform>, BrokerControlError> {
+        if path.len() > SHARED_BUFFER_SLOT_SIZE as usize {
+            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
+        }
+        self.acquire_shared_buffer(path.len())
     }
 
     fn fail_association(&self) {
@@ -721,10 +723,7 @@ where
         mode: FileMode,
     ) -> core::result::Result<core::result::Result<ObjectHandle, FileError>, BrokerControlError>
     {
-        if path.len() > SHARED_BUFFER_SLOT_SIZE as usize {
-            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
-        }
-        let lease = self.acquire_shared_buffer(path.len())?;
+        let lease = self.acquire_file_path_buffer(path)?;
         self.request(|local| local.open_file(lease.descriptor(), path, user, access, flags, mode))
     }
 
@@ -807,10 +806,7 @@ where
         path: &str,
         user: FileUser,
     ) -> core::result::Result<core::result::Result<FileStatus, FileError>, BrokerControlError> {
-        if path.len() > SHARED_BUFFER_SLOT_SIZE as usize {
-            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
-        }
-        let lease = self.acquire_shared_buffer(path.len())?;
+        let lease = self.acquire_file_path_buffer(path)?;
         self.request(|local| local.path_file_status(lease.descriptor(), path, user))
     }
 
@@ -827,10 +823,7 @@ where
         user: FileUser,
         mode: FileMode,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
-        if path.len() > SHARED_BUFFER_SLOT_SIZE as usize {
-            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
-        }
-        let lease = self.acquire_shared_buffer(path.len())?;
+        let lease = self.acquire_file_path_buffer(path)?;
         self.request(|local| local.chmod_file(lease.descriptor(), path, user, mode))
     }
 
@@ -841,10 +834,7 @@ where
         user: Option<u16>,
         group: Option<u16>,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
-        if path.len() > SHARED_BUFFER_SLOT_SIZE as usize {
-            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
-        }
-        let lease = self.acquire_shared_buffer(path.len())?;
+        let lease = self.acquire_file_path_buffer(path)?;
         self.request(|local| local.chown_file(lease.descriptor(), path, acting_user, user, group))
     }
 
@@ -853,10 +843,7 @@ where
         path: &str,
         user: FileUser,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
-        if path.len() > SHARED_BUFFER_SLOT_SIZE as usize {
-            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
-        }
-        let lease = self.acquire_shared_buffer(path.len())?;
+        let lease = self.acquire_file_path_buffer(path)?;
         self.request(|local| local.unlink_file(lease.descriptor(), path, user))
     }
 
@@ -866,10 +853,7 @@ where
         user: FileUser,
         mode: FileMode,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
-        if path.len() > SHARED_BUFFER_SLOT_SIZE as usize {
-            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
-        }
-        let lease = self.acquire_shared_buffer(path.len())?;
+        let lease = self.acquire_file_path_buffer(path)?;
         self.request(|local| local.mkdir_file(lease.descriptor(), path, user, mode))
     }
 
@@ -878,10 +862,7 @@ where
         path: &str,
         user: FileUser,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
-        if path.len() > SHARED_BUFFER_SLOT_SIZE as usize {
-            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
-        }
-        let lease = self.acquire_shared_buffer(path.len())?;
+        let lease = self.acquire_file_path_buffer(path)?;
         self.request(|local| local.rmdir_file(lease.descriptor(), path, user))
     }
 

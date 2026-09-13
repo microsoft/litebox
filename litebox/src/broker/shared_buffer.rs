@@ -3,25 +3,25 @@
 
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
+use alloc::vec;
+use alloc::vec::Vec;
 use core::sync::atomic::Ordering::{Acquire, Release};
 
 use litebox_broker_protocol::shared_buffer::{
-    SHARED_BUFFER_LAYOUT, SHARED_BUFFER_SLOT_COUNT, SHARED_BUFFER_SLOT_SIZE,
-    SharedBufferDescriptor, SharedBufferSequence,
+    MAX_SHARED_BUFFER_SEQUENCE_SLOTS, SHARED_BUFFER_LAYOUT, SHARED_BUFFER_SLOT_COUNT,
+    SHARED_BUFFER_SLOT_SIZE, SharedBufferDescriptor, SharedBufferSequence, SharedBufferSlotIndex,
 };
 use litebox_platform::sync::RawMutex as _;
 
 use crate::sync::{Mutex, RawSyncPrimitivesProvider};
-
-const ALLOCATED_SLOT_MASK: u64 = (1 << SHARED_BUFFER_SLOT_COUNT) - 1;
 
 pub(super) struct SlotAllocator<Platform: RawSyncPrimitivesProvider> {
     state: Mutex<Platform, AllocatorState<Platform>>,
 }
 
 struct AllocatorState<Platform: RawSyncPrimitivesProvider> {
-    allocated_slots: u64,
-    next_slot: u32,
+    allocated_slots: Vec<bool>,
+    next_slot: usize,
     failed: bool,
     waiters: VecDeque<Arc<SlotWaiter<Platform>>>,
 }
@@ -39,7 +39,7 @@ pub(super) struct SlotLease<'a, Platform: RawSyncPrimitivesProvider> {
 
 struct SlotWaiter<Platform: RawSyncPrimitivesProvider> {
     length: u32,
-    slot_count: u32,
+    slot_count: usize,
     result: Mutex<Platform, Option<Result<SharedBufferSequence, AcquireError>>>,
     completion: Platform::RawMutex,
 }
@@ -48,7 +48,7 @@ impl<Platform: RawSyncPrimitivesProvider> SlotAllocator<Platform> {
     pub(super) fn new() -> Self {
         Self {
             state: Mutex::new(AllocatorState {
-                allocated_slots: 0,
+                allocated_slots: vec![false; SHARED_BUFFER_SLOT_COUNT as usize],
                 next_slot: 0,
                 failed: false,
                 waiters: VecDeque::new(),
@@ -61,8 +61,8 @@ impl<Platform: RawSyncPrimitivesProvider> SlotAllocator<Platform> {
             1
         } else {
             length.div_ceil(SHARED_BUFFER_SLOT_SIZE)
-        };
-        if slot_count > SHARED_BUFFER_SLOT_COUNT {
+        } as usize;
+        if slot_count > MAX_SHARED_BUFFER_SEQUENCE_SLOTS {
             return Err(AcquireError::TooLarge);
         }
         self.acquire_count(length, slot_count)
@@ -71,7 +71,7 @@ impl<Platform: RawSyncPrimitivesProvider> SlotAllocator<Platform> {
     fn acquire_count(
         &self,
         length: u32,
-        slot_count: u32,
+        slot_count: usize,
     ) -> Result<SlotLease<'_, Platform>, AcquireError> {
         {
             let mut state = self.state.lock();
@@ -127,16 +127,21 @@ impl<Platform: RawSyncPrimitivesProvider> SlotAllocator<Platform> {
         true
     }
 
-    fn release(&self, slot_mask: u32) {
+    fn release(&self, sequence: SharedBufferSequence) {
         {
             let mut state = self.state.lock();
-            let slot_mask = u64::from(slot_mask);
-            assert_eq!(
-                state.allocated_slots & slot_mask,
-                slot_mask,
-                "shared-buffer slot released without an active lease"
-            );
-            state.allocated_slots &= !slot_mask;
+            for slot_index in sequence.slot_indices() {
+                let slot_index = slot_index.0 as usize;
+                let allocated = state
+                    .allocated_slots
+                    .get_mut(slot_index)
+                    .expect("leased shared-buffer slot must exist");
+                assert!(
+                    *allocated,
+                    "shared-buffer slot released without an active lease"
+                );
+                *allocated = false;
+            }
             if state.failed {
                 return;
             }
@@ -173,7 +178,7 @@ impl<Platform: RawSyncPrimitivesProvider> SlotAllocator<Platform> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider> SlotWaiter<Platform> {
-    fn new(length: u32, slot_count: u32) -> Self {
+    fn new(length: u32, slot_count: usize) -> Self {
         Self {
             length,
             slot_count,
@@ -227,41 +232,45 @@ impl<Platform: RawSyncPrimitivesProvider> SlotLease<'_, Platform> {
 
 impl<Platform: RawSyncPrimitivesProvider> Drop for SlotLease<'_, Platform> {
     fn drop(&mut self) {
-        self.allocator.release(self.sequence.slot_mask);
+        self.allocator.release(self.sequence);
     }
 }
 
 impl<Platform: RawSyncPrimitivesProvider> AllocatorState<Platform> {
-    fn allocate(&mut self, length: u32, slot_count: u32) -> Option<SharedBufferSequence> {
-        let mut available_slots = !self.allocated_slots & ALLOCATED_SLOT_MASK;
-        if available_slots.count_ones() < slot_count {
+    fn allocate(&mut self, length: u32, slot_count: usize) -> Option<SharedBufferSequence> {
+        if self
+            .allocated_slots
+            .iter()
+            .filter(|allocated| !**allocated)
+            .count()
+            < slot_count
+        {
             return None;
         }
 
-        let mut slot_mask = 0_u32;
+        let mut slot_indices = [SharedBufferSlotIndex::default(); MAX_SHARED_BUFFER_SEQUENCE_SLOTS];
         let mut next_slot = self.next_slot;
-        for _ in 0..slot_count {
-            let slot_index = Self::next_free_slot(available_slots, next_slot)
+        for stored_slot in &mut slot_indices[..slot_count] {
+            let slot_index = self
+                .next_free_slot(next_slot)
                 .expect("validated shared-buffer capacity must contain a free slot");
-            available_slots &= !(1 << slot_index);
-            slot_mask |= 1 << slot_index;
-            next_slot = (slot_index + 1) % SHARED_BUFFER_SLOT_COUNT;
+            self.allocated_slots[slot_index] = true;
+            *stored_slot = SharedBufferSlotIndex(
+                u32::try_from(slot_index).expect("shared-buffer slot index must fit in u32"),
+            );
+            next_slot = (slot_index + 1) % self.allocated_slots.len();
         }
-        self.allocated_slots |= u64::from(slot_mask);
         self.next_slot = next_slot;
-        Some(SharedBufferSequence { slot_mask, length })
+        Some(
+            SharedBufferSequence::new(&slot_indices[..slot_count], length)
+                .expect("allocated shared-buffer sequence must be valid"),
+        )
     }
 
-    fn next_free_slot(available_slots: u64, next_slot: u32) -> Option<u32> {
-        if available_slots == 0 {
-            return None;
-        }
-        let available_slots_after_next = available_slots & (u64::MAX << next_slot);
-        Some(if available_slots_after_next == 0 {
-            available_slots.trailing_zeros()
-        } else {
-            available_slots_after_next.trailing_zeros()
-        })
+    fn next_free_slot(&self, next_slot: usize) -> Option<usize> {
+        (0..self.allocated_slots.len())
+            .map(|offset| (next_slot + offset) % self.allocated_slots.len())
+            .find(|slot_index| !self.allocated_slots[*slot_index])
     }
 }
 
@@ -271,8 +280,6 @@ mod tests {
 
     use super::*;
     use alloc::sync::Arc;
-    use alloc::vec::Vec;
-    use litebox_broker_protocol::shared_buffer::SharedBufferSlotIndex;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -307,9 +314,23 @@ mod tests {
     }
 
     #[test]
+    fn allocator_state_supports_slots_beyond_bitmap_widths() {
+        let mut state = AllocatorState::<MockPlatform> {
+            allocated_slots: alloc::vec![true; 65],
+            next_slot: 64,
+            failed: false,
+            waiters: VecDeque::new(),
+        };
+        state.allocated_slots[64] = false;
+
+        let sequence = state.allocate(1, 1).unwrap();
+        assert_eq!(sequence.slot_indices(), &[SharedBufferSlotIndex(64)]);
+    }
+
+    #[test]
     fn sequence_leases_acquire_all_required_slots_atomically() {
         let allocator = Arc::new(SlotAllocator::<MockPlatform>::new());
-        let mut leases = (0..9)
+        let mut leases = (0..(SHARED_BUFFER_SLOT_COUNT - 7))
             .map(|_| allocator.acquire(1).unwrap())
             .collect::<Vec<_>>();
         let waiter_allocator = Arc::clone(&allocator);
@@ -331,12 +352,13 @@ mod tests {
 
         drop(leases.remove(0));
         let sequence = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert_eq!(sequence.slot_mask.count_ones(), 8);
-        assert_eq!(sequence.length, 8 * SHARED_BUFFER_SLOT_SIZE);
-        let retained_slot_mask = leases.iter().fold(0, |mask, lease| {
-            mask | (1 << lease.descriptor().slot_index.0)
-        });
-        assert_eq!(sequence.slot_mask & retained_slot_mask, 0);
+        assert_eq!(sequence.slot_indices().len(), 8);
+        assert_eq!(sequence.length(), 8 * SHARED_BUFFER_SLOT_SIZE);
+        assert!(sequence.slot_indices().iter().all(|slot_index| {
+            leases
+                .iter()
+                .all(|lease| lease.descriptor().slot_index != *slot_index)
+        }));
         waiter.join().unwrap();
     }
 
