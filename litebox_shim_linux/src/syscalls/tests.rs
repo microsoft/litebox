@@ -378,7 +378,8 @@ fn test_fcntl() {
         assert_eq!(task.sys_fcntl(fd, FcntlArg::GETFD).unwrap(), 0);
 
         // OFlags::RDWR should be ignored
-        task.sys_fcntl(fd, FcntlArg::SETFL(OFlags::RDWR)).unwrap();
+        task.sys_fcntl(fd, FcntlArg::SETFL(litebox_common_linux::OFlags::RDWR))
+            .unwrap();
         assert_eq!(task.sys_fcntl(fd, FcntlArg::GETFL).unwrap(), flags2.bits());
     };
 

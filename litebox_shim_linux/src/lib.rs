@@ -36,6 +36,14 @@ use litebox_common_linux::{
 };
 use litebox_platform::time::TimeProvider;
 
+fn legacy_o_flags(flags: litebox_common_linux::OFlags) -> litebox::fs::OFlags {
+    litebox::fs::OFlags::from_bits_retain(flags.bits())
+}
+
+fn legacy_file_mode(mode: litebox_broker_protocol::fs::FileMode) -> litebox::fs::Mode {
+    litebox::fs::Mode::from_bits_retain(u32::from(mode.bits()))
+}
+
 #[cfg(target_arch = "aarch64")]
 const fn aarch64_rewrite_options() -> litebox_syscall_rewriter::RewriteOptions {
     litebox_syscall_rewriter::RewriteOptions::new(
@@ -777,7 +785,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 oldfd,
                 newfd,
                 flags,
-            } => syscall!(sys_dup(oldfd, newfd, flags)),
+            } => syscall!(sys_dup(oldfd, newfd, flags.map(legacy_o_flags))),
             SyscallRequest::Socket {
                 domain,
                 type_and_flags,
@@ -981,11 +989,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 pathname,
                 flags,
                 mode,
-            } => pathname
-                .to_cstring::<Platform>()
-                .map_or(Err(Errno::EFAULT), |path| {
-                    syscall!(sys_openat(dirfd, path, flags, mode))
-                }),
+            } => {
+                let flags = legacy_o_flags(flags);
+                let mode = legacy_file_mode(mode);
+                pathname
+                    .to_cstring::<Platform>()
+                    .map_or(Err(Errno::EFAULT), |path| {
+                        syscall!(sys_openat(dirfd, path, flags, mode))
+                    })
+            }
             SyscallRequest::Ftruncate { fd, length } => syscall!(sys_ftruncate(fd, length)),
             SyscallRequest::Mknodat {
                 dirfd,
@@ -1075,6 +1087,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 syscall!(sys_eventfd2(initval, flags))
             }
             SyscallRequest::Pipe2 { pipefd, flags } => {
+                let flags = legacy_o_flags(flags);
                 self.sys_pipe2(flags).and_then(|(read_fd, write_fd)| {
                     pipefd
                         .write_at_offset::<Platform>(0, read_fd)
