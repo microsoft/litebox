@@ -8,20 +8,19 @@ use core::any::Any;
 
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::{
-    FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileNodeInfo, FileOpenFlags,
-    FileSeekWhence, FileStatus as ProtocolFileStatus, FileType as ProtocolFileType, FileUser,
-    MAX_FILE_TRANSFER_SIZE,
+    FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileOpenFlags, FileSeekWhence,
+    FileStatus, FileUser, MAX_FILE_TRANSFER_SIZE,
 };
 use litebox_broker_protocol::stdio::{MAX_STDIO_TRANSFER_SIZE, StdioOutputStream};
 use litebox_platform::sync::{RawSyncPrimitivesProvider, RwLock};
 
+use super::OFlags;
 use super::backend::DeviceIo;
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
     ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
 };
 use super::resolver::{Resolver, ResolverEntry};
-use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence, UserInfo};
 use crate::session::{ObjectEntry, ObjectRights};
 use crate::{BrokerError, BrokerSession, Result};
 
@@ -47,7 +46,7 @@ impl File {
 mod private {
     use super::{
         BrokerError, BrokerSession, File, FileAccessMode, FileDirectoryEntry, FileMode,
-        FileOpenFlags, FileSeekWhence, FileUser, ProtocolFileStatus, ServiceResult, Vec,
+        FileOpenFlags, FileSeekWhence, FileStatus, FileUser, ServiceResult, Vec,
     };
 
     pub trait Service: Send + Sync {
@@ -115,7 +114,7 @@ mod private {
             &self,
             _session: &BrokerSession,
             _file: &File,
-        ) -> ServiceResult<ProtocolFileStatus> {
+        ) -> ServiceResult<FileStatus> {
             Err(BrokerError::UnsupportedOperation)
         }
 
@@ -124,7 +123,7 @@ mod private {
             _session: &BrokerSession,
             _path: &str,
             _user: FileUser,
-        ) -> ServiceResult<ProtocolFileStatus> {
+        ) -> ServiceResult<FileStatus> {
             Err(BrokerError::UnsupportedOperation)
         }
 
@@ -208,7 +207,7 @@ where
         mode: FileMode,
     ) -> ServiceResult<File> {
         let flags = open_flags(access, flags)?;
-        let entry = match Resolver::open(self, user_info(user), path, flags, file_mode(mode)) {
+        let entry = match Resolver::open(self, user, path, flags, mode & FileMode::SUPPORTED) {
             Ok(entry) => entry,
             Err(error) => return Ok(Err(file_open_error(error))),
         };
@@ -295,7 +294,6 @@ where
         let Ok(offset) = isize::try_from(offset) else {
             return Ok(Err(FileError::InvalidOffset));
         };
-        let whence = seek_whence(whence)?;
         let state = file.state::<RwLock<Platform, ResolverEntry<Backend>>>()?;
         let entry = state.read();
         let seek = if entry.uses_position() {
@@ -364,26 +362,19 @@ where
             Ok(entries) => entries,
             Err(error) => return Ok(Err(file_read_directory_error(error))),
         };
-        let entries = entries
-            .into_iter()
-            .map(directory_entry)
-            .collect::<Result<Vec<_>>>()?;
         Ok(Ok(entries))
     }
 
-    fn handle_status(
-        &self,
-        _session: &BrokerSession,
-        file: &File,
-    ) -> ServiceResult<ProtocolFileStatus> {
+    fn handle_status(&self, _session: &BrokerSession, file: &File) -> ServiceResult<FileStatus> {
         let entry = file
             .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
             .read();
-        let status = match Resolver::handle_status(self, &entry) {
+        let mut status = match Resolver::handle_status(self, &entry) {
             Ok(status) => status,
             Err(error) => return Ok(Err(file_status_error(error))),
         };
-        Ok(Ok(file_status(status)?))
+        mask_status_mode(&mut status);
+        Ok(Ok(status))
     }
 
     fn path_status(
@@ -391,12 +382,13 @@ where
         _session: &BrokerSession,
         path: &str,
         user: FileUser,
-    ) -> ServiceResult<ProtocolFileStatus> {
-        let status = match Resolver::file_status(self, user_info(user), path) {
+    ) -> ServiceResult<FileStatus> {
+        let mut status = match Resolver::file_status(self, user, path) {
             Ok(status) => status,
             Err(error) => return Ok(Err(file_status_error(error))),
         };
-        Ok(Ok(file_status(status)?))
+        mask_status_mode(&mut status);
+        Ok(Ok(status))
     }
 
     fn chmod(
@@ -406,7 +398,7 @@ where
         user: FileUser,
         mode: FileMode,
     ) -> ServiceResult<()> {
-        Ok(Resolver::chmod(self, user_info(user), path, file_mode(mode)).map_err(file_chmod_error))
+        Ok(Resolver::chmod(self, user, path, mode & FileMode::SUPPORTED).map_err(file_chmod_error))
     }
 
     fn chown(
@@ -417,14 +409,11 @@ where
         user: Option<u16>,
         group: Option<u16>,
     ) -> ServiceResult<()> {
-        Ok(
-            Resolver::chown(self, user_info(acting_user), path, user, group)
-                .map_err(file_chown_error),
-        )
+        Ok(Resolver::chown(self, acting_user, path, user, group).map_err(file_chown_error))
     }
 
     fn unlink(&self, _session: &BrokerSession, path: &str, user: FileUser) -> ServiceResult<()> {
-        Ok(Resolver::unlink(self, user_info(user), path).map_err(file_unlink_error))
+        Ok(Resolver::unlink(self, user, path).map_err(file_unlink_error))
     }
 
     fn mkdir(
@@ -434,11 +423,11 @@ where
         user: FileUser,
         mode: FileMode,
     ) -> ServiceResult<()> {
-        Ok(Resolver::mkdir(self, user_info(user), path, file_mode(mode)).map_err(file_mkdir_error))
+        Ok(Resolver::mkdir(self, user, path, mode & FileMode::SUPPORTED).map_err(file_mkdir_error))
     }
 
     fn rmdir(&self, _session: &BrokerSession, path: &str, user: FileUser) -> ServiceResult<()> {
-        Ok(Resolver::rmdir(self, user_info(user), path).map_err(file_rmdir_error))
+        Ok(Resolver::rmdir(self, user, path).map_err(file_rmdir_error))
     }
 }
 
@@ -533,7 +522,7 @@ pub fn read_directory(
 pub fn handle_status(
     session: &BrokerSession,
     handle: ObjectHandle,
-) -> Result<FileResult<ProtocolFileStatus>> {
+) -> Result<FileResult<FileStatus>> {
     let file = file_with_any_rights(session, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
     session.core.fs.handle_status(session, &file)
 }
@@ -543,7 +532,7 @@ pub fn path_status(
     session: &BrokerSession,
     path: &str,
     user: FileUser,
-) -> Result<FileResult<ProtocolFileStatus>> {
+) -> Result<FileResult<FileStatus>> {
     authorize(session, ObjectRights::WAIT)?;
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
@@ -714,13 +703,6 @@ impl DeviceIo for SessionDeviceIo<'_> {
     }
 }
 
-const fn user_info(user: FileUser) -> UserInfo {
-    UserInfo {
-        user: user.user,
-        group: user.group,
-    }
-}
-
 fn open_flags(access: FileAccessMode, flags: FileOpenFlags) -> Result<OFlags> {
     let mut output = match access {
         FileAccessMode::ReadOnly => OFlags::RDONLY,
@@ -747,63 +729,12 @@ fn open_flags(access: FileAccessMode, flags: FileOpenFlags) -> Result<OFlags> {
     Ok(output)
 }
 
-fn file_mode(mode: FileMode) -> Mode {
-    Mode::from_bits_retain(u32::from(mode.bits()))
+fn mask_status_mode(status: &mut FileStatus) {
+    status.mode &= FileMode::SUPPORTED;
 }
 
-fn seek_whence(whence: FileSeekWhence) -> Result<SeekWhence> {
-    Ok(match whence {
-        FileSeekWhence::Beginning => SeekWhence::RelativeToBeginning,
-        FileSeekWhence::Current => SeekWhence::RelativeToCurrentOffset,
-        FileSeekWhence::End => SeekWhence::RelativeToEnd,
-        _ => return Err(BrokerError::UnsupportedOperation),
-    })
-}
-
-fn file_status(status: FileStatus) -> Result<ProtocolFileStatus> {
-    let mode_bits = u16::try_from(status.mode.bits() & u32::from(FileMode::SUPPORTED.bits()))
-        .map_err(|_| BrokerError::Internal)?;
-    let mode = FileMode::from_bits(mode_bits).ok_or(BrokerError::Internal)?;
-    Ok(ProtocolFileStatus {
-        file_type: file_type(status.file_type),
-        mode,
-        size: u64::try_from(status.size).map_err(|_| BrokerError::Internal)?,
-        owner: FileUser {
-            user: status.owner.user,
-            group: status.owner.group,
-        },
-        node_info: node_info(status.node_info)?,
-        block_size: u64::try_from(status.blksize).map_err(|_| BrokerError::Internal)?,
-    })
-}
-
-fn directory_entry(entry: DirEntry) -> Result<FileDirectoryEntry> {
-    Ok(FileDirectoryEntry {
-        name: entry.name,
-        file_type: file_type(entry.file_type),
-        node_info: entry.ino_info.map(node_info).transpose()?,
-    })
-}
-
-const fn file_type(file_type: FileType) -> ProtocolFileType {
-    match file_type {
-        FileType::RegularFile => ProtocolFileType::RegularFile,
-        FileType::Directory => ProtocolFileType::Directory,
-        FileType::CharacterDevice => ProtocolFileType::CharacterDevice,
-    }
-}
-
-fn node_info(node_info: NodeInfo) -> Result<FileNodeInfo> {
-    Ok(FileNodeInfo {
-        dev: u64::try_from(node_info.dev).map_err(|_| BrokerError::Internal)?,
-        ino: u64::try_from(node_info.ino).map_err(|_| BrokerError::Internal)?,
-        rdev: node_info
-            .rdev
-            .map(|rdev| u64::try_from(rdev.get()).map_err(|_| BrokerError::Internal))
-            .transpose()?,
-    })
-}
-
+// TODO: Define canonical per-operation protocol errors so these engine-to-protocol conversions can
+// be removed while retaining operation-specific error sets.
 fn file_path_error(error: PathError) -> FileError {
     match error {
         PathError::NoSuchFileOrDirectory => FileError::NoSuchFileOrDirectory,
@@ -927,23 +858,28 @@ fn file_status_error(error: FileStatusError) -> FileError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::num::NonZeroU64;
+    use litebox_broker_protocol::fs::{FileNodeInfo, FileType};
 
     #[test]
     fn file_status_excludes_object_type_mode_bits() {
-        let status = file_status(FileStatus {
+        let mut status = FileStatus {
             file_type: FileType::RegularFile,
-            mode: Mode::from_bits_retain(0o100644),
-            size: 1,
-            owner: UserInfo::ROOT,
-            node_info: NodeInfo {
-                dev: 2,
-                ino: 3,
-                rdev: None,
+            mode: FileMode::from_bits_retain(0o100644),
+            size: u64::MAX,
+            owner: FileUser::ROOT,
+            node_info: FileNodeInfo {
+                dev: u64::MAX,
+                ino: u64::MAX - 1,
+                rdev: NonZeroU64::new(u64::MAX),
             },
-            blksize: 4096,
-        })
-        .unwrap();
+            blksize: u64::MAX,
+        };
+        let mut expected = status;
+        expected.mode = FileMode::from_bits(0o644).unwrap();
 
-        assert_eq!(status.mode, FileMode::from_bits(0o644).unwrap());
+        mask_status_mode(&mut status);
+
+        assert_eq!(status, expected);
     }
 }

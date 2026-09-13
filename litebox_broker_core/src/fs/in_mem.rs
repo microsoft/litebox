@@ -388,8 +388,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             .iter()
             .map(|(name, child)| {
                 let (file_type, node_info) = match child {
-                    Node::File(file) => (FileType::RegularFile, file.read().node_info.clone()),
-                    Node::Dir(dir) => (FileType::Directory, dir.read().node_info.clone()),
+                    Node::File(file) => (FileType::RegularFile, file.read().node_info),
+                    Node::Dir(dir) => (FileType::Directory, dir.read().node_info),
                 };
                 DirEntry {
                     name: name.clone(),
@@ -466,9 +466,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                 Ok(FileStatus {
                     file_type: FileType::RegularFile,
                     mode: file.perms.mode,
-                    size: file.data.len(),
+                    size: u64::try_from(file.data.len()).map_err(|_| FileStatusError::Io)?,
                     owner: file.perms.userinfo,
-                    node_info: file.node_info.clone(),
+                    node_info: file.node_info,
                     blksize: BLOCK_SIZE,
                 })
             }
@@ -479,7 +479,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                     mode: dir.perms.mode,
                     size: super::DEFAULT_DIRECTORY_SIZE,
                     owner: dir.perms.userinfo,
-                    node_info: dir.node_info.clone(),
+                    node_info: dir.node_info,
                     blksize: BLOCK_SIZE,
                 })
             }
@@ -649,7 +649,7 @@ fn assert_supported_oflags(flags: super::OFlags) {
 
 /// Block size for file system I/O operations
 // TODO(jayb): Determine appropriate block size
-const BLOCK_SIZE: usize = 0;
+const BLOCK_SIZE: u64 = 0;
 
 enum Node<Platform: sync::RawSyncPrimitivesProvider> {
     File(FileNode<Platform>),

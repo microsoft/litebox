@@ -467,12 +467,12 @@ mod tests {
                 ino: 2,
                 rdev: None,
             },
-            block_size: 4096,
+            blksize: 4096,
         };
         let entries = [FileDirectoryEntry {
             name: "file".into(),
             file_type: FileType::RegularFile,
-            node_info: None,
+            ino_info: None,
         }];
         let directory_payload = encode_directory_entries(&entries).unwrap();
         let channel = ScriptedChannel::new([
@@ -532,7 +532,7 @@ mod tests {
         assert_eq!(output, [4, 5]);
         assert_eq!(
             local
-                .seek_file(handle, 0, FileSeekWhence::Beginning)
+                .seek_file(handle, 0, FileSeekWhence::RelativeToBeginning)
                 .unwrap(),
             Ok(0)
         );

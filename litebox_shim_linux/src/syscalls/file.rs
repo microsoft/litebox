@@ -2752,7 +2752,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 ino: entry.ino_info.as_ref().map_or(0, |node_info| node_info.ino) as u64,
                 off: dir_off as u64,
                 len: len.trunc(),
-                typ: litebox_common_linux::DirentType::from(entry.file_type.clone()) as u8,
+                typ: litebox_common_linux::DirentType::from(entry.file_type) as u8,
                 __name: [0; 0],
             };
             let hdr_ptr = UserPtrMut::from_usize(dirp.as_usize() + nbytes);

@@ -271,7 +271,7 @@ impl Composer {
             .virtual_dirs
             .iter()
             .find(|dir| dir.path == path)
-            .map(|dir| dir.node_info.clone())
+            .map(|dir| dir.node_info)
             .expect("virtual directory is precomputed");
         FileStatus {
             file_type: FileType::Directory,

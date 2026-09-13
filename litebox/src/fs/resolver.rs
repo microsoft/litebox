@@ -7,6 +7,7 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::num::NonZeroUsize;
 
 use litebox_broker_core::fs as broker_fs;
 use litebox_broker_core::fs::backend::DeviceIo;
@@ -19,7 +20,7 @@ use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
     ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
 };
-use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, SeekWhence, UserInfo};
+use super::{DirEntry, FileStatus, Mode, NodeInfo, OFlags, SeekWhence, UserInfo};
 
 /// The guest-facing filesystem entry point.
 pub struct Resolver<
@@ -370,7 +371,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: broker_fs::backend::Bac
         self.engine
             .read_dir(&entry.entry)
             .map_err(guest_read_dir_error)
-            .map(guest_directory_entries)
+            .and_then(guest_directory_entries)
     }
 
     /// Obtain the status of a path.
@@ -383,7 +384,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: broker_fs::backend::Bac
         self.engine
             .file_status(broker_user_info(context.acting_user()), &path)
             .map_err(guest_file_status_error)
-            .map(guest_file_status)
+            .and_then(guest_file_status)
     }
 
     /// Equivalent to [`Self::file_status`], but on an open `fd`.
@@ -397,7 +398,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: broker_fs::backend::Bac
         self.engine
             .handle_status(&entry.entry)
             .map_err(guest_file_status_error)
-            .map(guest_file_status)
+            .and_then(guest_file_status)
     }
 
     /// Get static backing data for a file, if available and supported.
@@ -417,11 +418,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: broker_fs::backend::Bac
 // APIs exclusively. They temporarily preserve LiteBox's guest-facing types while this facade calls
 // the broker-core engine directly.
 fn broker_mode(mode: Mode) -> broker_fs::Mode {
-    broker_fs::Mode::from_bits_retain(mode.bits())
+    broker_fs::Mode::from_u32_bits_truncate(mode.bits())
 }
 
 fn guest_mode(mode: broker_fs::Mode) -> Mode {
-    Mode::from_bits_retain(mode.bits())
+    Mode::from_bits_retain(mode.bits().into())
 }
 
 fn broker_open_flags(flags: OFlags) -> broker_fs::OFlags {
@@ -450,40 +451,44 @@ fn broker_seek_whence(whence: SeekWhence) -> broker_fs::SeekWhence {
     }
 }
 
-fn guest_file_type(file_type: broker_fs::FileType) -> FileType {
-    match file_type {
-        broker_fs::FileType::RegularFile => FileType::RegularFile,
-        broker_fs::FileType::Directory => FileType::Directory,
-        broker_fs::FileType::CharacterDevice => FileType::CharacterDevice,
-    }
+/// Narrows protocol node identity to LiteBox's guest-facing pointer-sized widths.
+///
+/// Returns `None` when a value does not fit, which only happens on hosts whose `usize` is narrower
+/// than the protocol's 64-bit identity fields.
+fn guest_node_info(node: broker_fs::NodeInfo) -> Option<NodeInfo> {
+    Some(NodeInfo {
+        dev: usize::try_from(node.dev).ok()?,
+        ino: usize::try_from(node.ino).ok()?,
+        rdev: node.rdev.map(NonZeroUsize::try_from).transpose().ok()?,
+    })
 }
 
-fn guest_node_info(node: broker_fs::NodeInfo) -> NodeInfo {
-    NodeInfo {
-        dev: node.dev,
-        ino: node.ino,
-        rdev: node.rdev,
-    }
-}
-
-fn guest_file_status(status: broker_fs::FileStatus) -> FileStatus {
-    FileStatus {
-        file_type: guest_file_type(status.file_type),
+fn guest_file_status(status: broker_fs::FileStatus) -> Result<FileStatus, FileStatusError> {
+    Ok(FileStatus {
+        file_type: status.file_type,
         mode: guest_mode(status.mode),
-        size: status.size,
+        size: usize::try_from(status.size).map_err(|_| FileStatusError::Io)?,
         owner: guest_user_info(status.owner),
-        node_info: guest_node_info(status.node_info),
-        blksize: status.blksize,
-    }
+        node_info: guest_node_info(status.node_info).ok_or(FileStatusError::Io)?,
+        blksize: usize::try_from(status.blksize).map_err(|_| FileStatusError::Io)?,
+    })
 }
 
-fn guest_directory_entries(entries: Vec<broker_fs::DirEntry>) -> Vec<DirEntry> {
+fn guest_directory_entries(
+    entries: Vec<broker_fs::DirEntry>,
+) -> Result<Vec<DirEntry>, ReadDirError> {
     entries
         .into_iter()
-        .map(|entry| DirEntry {
-            name: entry.name,
-            file_type: guest_file_type(entry.file_type),
-            ino_info: entry.ino_info.map(guest_node_info),
+        .map(|entry| {
+            let ino_info = match entry.ino_info {
+                Some(node) => Some(guest_node_info(node).ok_or(ReadDirError::Io)?),
+                None => None,
+            };
+            Ok(DirEntry {
+                name: entry.name,
+                file_type: entry.file_type,
+                ino_info,
+            })
         })
         .collect()
 }

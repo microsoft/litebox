@@ -465,6 +465,7 @@ mod tests {
     };
     use crate::{ObjectHandle, ProtocolVersion, RequestId};
     use core::net::{Ipv4Addr, SocketAddrV4};
+    use core::num::NonZeroU64;
 
     const TEST_REQUEST_ID: RequestId = RequestId(0x0102_0304_0506_0708);
 
@@ -635,7 +636,7 @@ mod tests {
             BrokerOperation::File(FileRequest::Seek(SeekFileRequest {
                 handle,
                 offset: -19,
-                whence: FileSeekWhence::Current,
+                whence: FileSeekWhence::RelativeToCurrentOffset,
             })),
             BrokerOperation::File(FileRequest::Truncate(TruncateFileRequest {
                 handle,
@@ -1096,9 +1097,9 @@ mod tests {
                 node_info: FileNodeInfo {
                     dev: u64::MAX,
                     ino: u64::MAX,
-                    rdev: Some(u64::MAX),
+                    rdev: Some(NonZeroU64::MAX),
                 },
-                block_size: u64::MAX,
+                blksize: u64::MAX,
             })),
             BrokerResult::File(FileResponse::HandleStatus(FileStatus {
                 file_type: FileType::CharacterDevice,
@@ -1111,9 +1112,9 @@ mod tests {
                 node_info: FileNodeInfo {
                     dev: u64::MAX,
                     ino: u64::MAX,
-                    rdev: Some(u64::MAX),
+                    rdev: Some(NonZeroU64::MAX),
                 },
-                block_size: u64::MAX,
+                blksize: u64::MAX,
             })),
             BrokerResult::File(FileResponse::Chmod),
             BrokerResult::File(FileResponse::Chown),
@@ -1308,7 +1309,7 @@ mod tests {
             operation: BrokerOperation::File(FileRequest::Seek(SeekFileRequest {
                 handle: ObjectHandle(13),
                 offset: 0,
-                whence: FileSeekWhence::Beginning,
+                whence: FileSeekWhence::RelativeToBeginning,
             })),
         });
         *invalid_whence.last_mut().unwrap() = 0xff;
@@ -1346,7 +1347,7 @@ mod tests {
                     ino: 7,
                     rdev: None,
                 },
-                block_size: 4096,
+                blksize: 4096,
             })),
         };
         let status = encode_response(status);
@@ -1362,6 +1363,26 @@ mod tests {
             decode_response(&unsupported_mode),
             Err(WireError::InvalidTag)
         );
+        let mut zero_rdev = encode_response(BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result: BrokerResult::File(FileResponse::PathStatus(FileStatus {
+                file_type: FileType::CharacterDevice,
+                mode: FileMode::from_bits(0o640).unwrap(),
+                size: 0,
+                owner: FileUser { user: 2, group: 3 },
+                node_info: FileNodeInfo {
+                    dev: 5,
+                    ino: 7,
+                    rdev: NonZeroU64::new(9),
+                },
+                blksize: 4096,
+            })),
+        });
+        // `rdev` is encoded immediately before the trailing block size.
+        let rdev = zero_rdev.len() - size_of::<u64>() * 2;
+        zero_rdev[rdev..rdev + size_of::<u64>()].copy_from_slice(&0u64.to_le_bytes());
+        assert_eq!(decode_response(&zero_rdev), Err(WireError::InvalidTag));
+
         let mut invalid_next_index = encode_response(BrokerResponse {
             request_id: TEST_REQUEST_ID,
             result: BrokerResult::File(FileResponse::ReadDirectory(ReadDirectoryResponse {
