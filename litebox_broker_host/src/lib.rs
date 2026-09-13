@@ -29,10 +29,10 @@ use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse};
 use litebox_broker_protocol::fs::{
     ChmodFileRequest, ChownFileRequest, DirectoryPayloadError, DirectoryTransferError, FileError,
-    HandleFileStatusRequest, MAX_FILE_BUFFER_SIZE, MAX_FILE_TRANSFER_SIZE, MkdirFileRequest,
-    OpenFileRequest, OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest,
-    ReadDirectoryResponse, ReadFileRequest, ReadFileResponse, RmdirFileRequest, SeekFileRequest,
-    SeekFileResponse, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
+    HandleFileStatusRequest, MAX_FILE_TRANSFER_SIZE, MkdirFileRequest, OpenFileRequest,
+    OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse,
+    ReadFileRequest, ReadFileResponse, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
+    TruncateFileRequest, UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
     encode_directory_entries_chunk,
 };
 use litebox_broker_protocol::message::{
@@ -45,8 +45,8 @@ use litebox_broker_protocol::pipe::{
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::shared_buffer::{
-    SHARED_BUFFER_LAYOUT, SHARED_BUFFER_SLOT_COUNT, SharedBufferDescriptor, SharedBufferSequence,
-    SharedBufferSlotIndex,
+    SHARED_BUFFER_LAYOUT, SHARED_BUFFER_SLOT_COUNT, SHARED_BUFFER_SLOT_SIZE,
+    SharedBufferDescriptor, SharedBufferSequence, SharedBufferSlotIndex,
 };
 use litebox_broker_protocol::socket::{
     AcceptSocketResponse, BindSocketResponse, ConnectSocketResponse, CreateSocketResponse,
@@ -652,7 +652,7 @@ fn handle_file_request<Memory: SharedMemory>(
 }
 
 fn validate_file_buffer(buffer: SharedBufferDescriptor) -> RequestResult<()> {
-    if buffer.length > MAX_FILE_BUFFER_SIZE {
+    if buffer.length > SHARED_BUFFER_SLOT_SIZE {
         return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
     }
     Ok(())

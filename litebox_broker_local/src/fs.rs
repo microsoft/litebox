@@ -8,13 +8,15 @@ use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{
     ChmodFileRequest, ChownFileRequest, DirectoryPayloadError, DirectoryTransferError,
     FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileOpenFlags, FileSeekWhence,
-    FileStatus, FileUser, HandleFileStatusRequest, MAX_FILE_BUFFER_SIZE, MAX_FILE_TRANSFER_SIZE,
-    MkdirFileRequest, OpenFileRequest, PathFileStatusRequest, ReadDirectoryRequest,
-    ReadFileRequest, RmdirFileRequest, SeekFileRequest, TruncateFileRequest, UnlinkFileRequest,
-    WriteFileRequest, try_decode_directory_entries,
+    FileStatus, FileUser, HandleFileStatusRequest, MAX_FILE_TRANSFER_SIZE, MkdirFileRequest,
+    OpenFileRequest, PathFileStatusRequest, ReadDirectoryRequest, ReadFileRequest,
+    RmdirFileRequest, SeekFileRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
+    try_decode_directory_entries,
 };
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, FileRequest, FileResponse};
-use litebox_broker_protocol::shared_buffer::{SharedBufferDescriptor, SharedBufferSequence};
+use litebox_broker_protocol::shared_buffer::{
+    SHARED_BUFFER_SLOT_SIZE, SharedBufferDescriptor, SharedBufferSequence,
+};
 use litebox_broker_transport::channel::LocalCallChannel;
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
@@ -394,7 +396,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         buffer: SharedBufferDescriptor,
         expected_length: usize,
     ) -> Result<(), Channel::Error> {
-        if buffer.length > MAX_FILE_BUFFER_SIZE {
+        if buffer.length > SHARED_BUFFER_SLOT_SIZE {
             return Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted));
         }
         assert_eq!(

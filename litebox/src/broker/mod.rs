@@ -14,11 +14,12 @@ use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{ConsumeEventResponse, EventConsumeMode};
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileOpenFlags, FileSeekWhence,
-    FileStatus, FileUser, MAX_FILE_BUFFER_SIZE, MAX_FILE_TRANSFER_SIZE,
+    FileStatus, FileUser, MAX_FILE_TRANSFER_SIZE,
 };
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::readiness::ReadinessFlags;
+use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_SLOT_SIZE;
 use litebox_broker_protocol::socket::{
     AcceptSocketResponse, MAX_SOCKET_TRANSFER_SIZE, MAX_UDP_DATAGRAM_SIZE,
     ReceiveFlags as BrokerReceiveFlags, ReceiveFromFlags as BrokerReceiveFromFlags,
@@ -787,7 +788,7 @@ where
         let mut entries = Vec::new();
         let mut start_index = 0;
         loop {
-            let lease = self.acquire_shared_buffer(MAX_FILE_BUFFER_SIZE)?;
+            let lease = self.acquire_shared_buffer(SHARED_BUFFER_SLOT_SIZE)?;
             let response = self
                 .request(|local| local.read_directory(handle, lease.descriptor(), start_index))?;
             let (mut chunk, next_index) = match response {
@@ -891,7 +892,7 @@ fn file_transfer_length(length: usize) -> core::result::Result<u32, BrokerContro
 }
 
 fn file_buffer_length(length: usize) -> core::result::Result<u32, BrokerControlError> {
-    if length > MAX_FILE_BUFFER_SIZE as usize {
+    if length > SHARED_BUFFER_SLOT_SIZE as usize {
         return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
     }
     Ok(u32::try_from(length).expect("validated file buffer length must fit in u32"))

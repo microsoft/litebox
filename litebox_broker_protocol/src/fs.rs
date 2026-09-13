@@ -13,21 +13,14 @@ use thiserror::Error;
 use crate::ObjectHandle;
 use crate::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferDescriptor, SharedBufferSequence};
 
-/// Maximum bytes transferred through one fs shared-buffer descriptor.
-///
-/// Paths and directory pages use one descriptor and therefore one slot.
-pub const MAX_FILE_BUFFER_SIZE: u32 = 64 * 1024;
-
 /// Maximum number of shared-buffer slots used by one file read or write.
 pub const MAX_FILE_TRANSFER_SLOT_COUNT: u32 = 8;
 
 /// Maximum bytes transferred by one logical file read or write.
-pub const MAX_FILE_TRANSFER_SIZE: u32 = MAX_FILE_BUFFER_SIZE * MAX_FILE_TRANSFER_SLOT_COUNT;
+pub const MAX_FILE_TRANSFER_SIZE: u32 = SHARED_BUFFER_SLOT_SIZE * MAX_FILE_TRANSFER_SLOT_COUNT;
 
-const _: () = {
-    assert!(MAX_FILE_BUFFER_SIZE <= SHARED_BUFFER_SLOT_SIZE);
+const _: () =
     assert!(MAX_FILE_TRANSFER_SLOT_COUNT <= crate::shared_buffer::SHARED_BUFFER_SLOT_COUNT);
-};
 
 /// File user identity used for permission checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -512,7 +505,7 @@ pub fn encode_directory_entries(
     entries: &[FileDirectoryEntry],
 ) -> Result<Vec<u8>, DirectoryPayloadError> {
     let (payload, next_index) =
-        encode_directory_entries_chunk(entries, 0, MAX_FILE_BUFFER_SIZE as usize)
+        encode_directory_entries_chunk(entries, 0, SHARED_BUFFER_SLOT_SIZE as usize)
             .map_err(DirectoryTransferError::into_payload_error)?;
     if next_index.is_some() {
         return Err(DirectoryPayloadError::TooLarge);
@@ -565,7 +558,7 @@ pub fn try_decode_directory_entries(
 ) -> Result<Vec<FileDirectoryEntry>, DirectoryTransferError> {
     const MINIMUM_ENTRY_LENGTH: usize = size_of::<u32>() + 2;
 
-    if payload.len() > MAX_FILE_BUFFER_SIZE as usize {
+    if payload.len() > SHARED_BUFFER_SLOT_SIZE as usize {
         return Err(DirectoryPayloadError::TooLarge.into());
     }
     let mut decoder = DirectoryPayloadDecoder { payload, offset: 0 };
@@ -659,7 +652,7 @@ fn directory_entries_chunk_end(
     maximum_length: usize,
 ) -> Result<(usize, usize), DirectoryPayloadError> {
     if start_index > entries.len()
-        || !(size_of::<u32>()..=MAX_FILE_BUFFER_SIZE as usize).contains(&maximum_length)
+        || !(size_of::<u32>()..=SHARED_BUFFER_SLOT_SIZE as usize).contains(&maximum_length)
     {
         return Err(DirectoryPayloadError::TooLarge);
     }
@@ -893,14 +886,15 @@ mod tests {
     #[test]
     fn directory_payload_is_bounded_by_one_transfer() {
         const ENTRY_OVERHEAD: usize = size_of::<u32>() + 2;
-        let maximum_name_length = MAX_FILE_BUFFER_SIZE as usize - size_of::<u32>() - ENTRY_OVERHEAD;
+        let maximum_name_length =
+            SHARED_BUFFER_SLOT_SIZE as usize - size_of::<u32>() - ENTRY_OVERHEAD;
         let maximum_entry = FileDirectoryEntry {
             name: "x".repeat(maximum_name_length),
             file_type: FileType::RegularFile,
             ino_info: None,
         };
         let payload = encode_directory_entries(core::slice::from_ref(&maximum_entry)).unwrap();
-        assert_eq!(payload.len(), MAX_FILE_BUFFER_SIZE as usize);
+        assert_eq!(payload.len(), SHARED_BUFFER_SLOT_SIZE as usize);
         assert_eq!(decode_directory_entries(&payload).unwrap(), [maximum_entry]);
 
         let oversized_entry = FileDirectoryEntry {
