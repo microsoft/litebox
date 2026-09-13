@@ -31,6 +31,8 @@ pub mod stdio;
 
 #[cfg(test)]
 mod test_platform;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

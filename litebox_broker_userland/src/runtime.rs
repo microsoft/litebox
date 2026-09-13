@@ -507,9 +507,9 @@ mod tests {
     use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
     use std::time::{Duration, Instant};
 
-    use litebox_broker_core::socket::UnsupportedSocketProvider;
     use litebox_broker_core::stdio::{StdioProvider, StdioProviderError, UnsupportedStdioProvider};
-    use litebox_broker_core::{AssociationCancellation, BrokerCore, ObjectRights, PolicyEngine};
+    use litebox_broker_core::test_support::TestBrokerCoreBuilder;
+    use litebox_broker_core::{AssociationCancellation, ObjectRights, PolicyEngine};
     use litebox_broker_host::setup_connection;
     use litebox_broker_protocol::BROKER_PROTOCOL_VERSION;
     use litebox_broker_protocol::RequestId;
@@ -683,13 +683,12 @@ mod tests {
         let (outcome_sender, outcome) = sync_channel(1);
         let (start, started) = sync_channel(1);
         let host = std::thread::spawn(move || {
-            let broker = BrokerCore::new(
-                PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()),
-                Arc::new(UnsupportedSocketProvider),
-                Arc::new(random::UserlandRandomProvider),
-                stdio_provider,
-                Arc::new(litebox_broker_core::fs::UnsupportedFileService),
-            )
+            let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_host_guaranteed_rights(
+                ObjectRights::all(),
+            ))
+            .with_random_provider(Arc::new(random::UserlandRandomProvider))
+            .with_stdio_provider(stdio_provider)
+            .build()
             .unwrap();
             let shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();
             let shared_buffers =

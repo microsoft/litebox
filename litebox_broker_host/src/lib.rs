@@ -64,6 +64,8 @@ use spin::mutex::SpinMutex;
 
 mod error;
 pub mod readiness;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 
 pub use error::{BrokerHostError, Result};
 
@@ -1055,6 +1057,7 @@ mod tests {
         PlatformSocketStatus, PlatformStreamReceive, SocketProvider,
     };
     use litebox_broker_core::stdio::{StdioProvider, StdioProviderError};
+    use litebox_broker_core::test_support::TestBrokerCoreBuilder;
     use litebox_broker_core::{
         AssociationCancellation, ObjectRights, PolicyEngine, SessionId, SocketPolicy,
     };
@@ -1414,14 +1417,18 @@ mod tests {
         let fs = litebox_broker_core::fs::in_mem::InMem::<TestSync>::new(
             litebox_broker_core::fs::inode_allocator::InodeAllocator::standalone(),
         );
-        let broker = BrokerCore::new(
+        let broker = TestBrokerCoreBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_socket_policy(SocketPolicy::guest_network()),
-            Arc::new(TestSocketProvider),
-            Arc::new(TestRandomProvider),
-            Arc::clone(&stdio_provider) as Arc<dyn StdioProvider>,
-            Arc::new(litebox_broker_core::fs::resolver::Resolver::<TestSync, _>::new(fs)),
         )
+        .with_socket_provider(Arc::new(TestSocketProvider))
+        .with_random_provider(Arc::new(TestRandomProvider))
+        .with_stdio_provider(stdio_provider.clone())
+        .with_file_service(Arc::new(litebox_broker_core::fs::resolver::Resolver::<
+            TestSync,
+            _,
+        >::new(fs)))
+        .build()
         .unwrap();
 
         test_channel_negotiates_routes_one_request_and_returns_peer_closed(&broker);
