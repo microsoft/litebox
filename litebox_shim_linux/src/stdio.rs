@@ -99,7 +99,7 @@ mod tests {
         let new_flags = flags | OFlags::NONBLOCK.bits();
         task.sys_fcntl(
             stdin2,
-            FcntlArg::SETFL(OFlags::from_bits(new_flags).unwrap()),
+            FcntlArg::SETFL(litebox_common_linux::OFlags::from_bits(new_flags).unwrap()),
         )
         .expect("Failed to set flags");
         assert_eq!(new_flags, task.sys_fcntl(stdin2, FcntlArg::GETFL).unwrap());

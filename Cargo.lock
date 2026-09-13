@@ -1598,6 +1598,7 @@ dependencies = [
  "elf",
  "int-enum",
  "litebox",
+ "litebox_broker_protocol",
  "litebox_syscall_rewriter",
  "syscalls",
  "thiserror",

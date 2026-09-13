@@ -68,15 +68,7 @@ impl<Platform: ShimPlatform> litebox_common_linux::loader::ReadAt for &'_ ElfFil
     }
 
     fn size(&mut self) -> Result<u64, Self::Error> {
-        #[cfg(target_arch = "x86_64")]
-        {
-            Ok(self.task.sys_fstat(self.fd)?.st_size as u64)
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            // The asm-generic ABI uses signed `st_size`; reject negative sizes.
-            u64::try_from(self.task.sys_fstat(self.fd)?.st_size).map_err(|_| Errno::EINVAL)
-        }
+        Ok(self.task.file_status(self.fd)?.size)
     }
 }
 

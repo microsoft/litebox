@@ -338,6 +338,8 @@ impl From<litebox::fs::errors::FileStatusError> for Errno {
     fn from(value: litebox::fs::errors::FileStatusError) -> Self {
         match value {
             litebox::fs::errors::FileStatusError::PathError(path_error) => path_error.into(),
+            litebox::fs::errors::FileStatusError::ClosedFd => Errno::EBADF,
+            litebox::fs::errors::FileStatusError::Io => Errno::EIO,
             _ => unimplemented!(),
         }
     }

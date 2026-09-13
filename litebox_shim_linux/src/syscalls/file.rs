@@ -17,6 +17,7 @@ use litebox::{
     stdio::StdioStream,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
+use litebox_broker_protocol::fs::{FileMode, FileNodeInfo, FileStatus, FileUser};
 use litebox_common_linux::{
     AccessFlags, AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat,
     InodeType, IoReadVec, IoWriteVec, IoctlArg, Statx, StatxMask, TimeParam, errno::Errno,
@@ -25,7 +26,8 @@ use litebox_common_linux::{
 use thiserror::Error;
 
 use crate::{
-    FileFd, GlobalState, LinuxFS, ShimPlatform, Task, UserPtr, UserPtrMut, syscalls::signal,
+    FileFd, GlobalState, LinuxFS, ShimPlatform, Task, UserPtr, UserPtrMut, legacy_o_flags,
+    syscalls::signal,
 };
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -42,6 +44,42 @@ impl From<litebox::fs::UserInfo> for AccessUserInfo {
             group: u32::from(value.group),
         }
     }
+}
+
+// Temporary adapters while the shim still executes filesystem operations through `litebox::fs`.
+fn protocol_file_status(status: litebox::fs::FileStatus) -> Result<FileStatus, Errno> {
+    let litebox::fs::FileStatus {
+        file_type,
+        mode,
+        size,
+        owner,
+        node_info,
+        blksize,
+        ..
+    } = status;
+    Ok(FileStatus {
+        file_type,
+        mode: FileMode::from_u32_bits_truncate(mode.bits()),
+        size: u64::try_from(size).map_err(|_| Errno::EOVERFLOW)?,
+        owner: FileUser {
+            user: owner.user,
+            group: owner.group,
+        },
+        node_info: FileNodeInfo {
+            dev: u64::try_from(node_info.dev).map_err(|_| Errno::EOVERFLOW)?,
+            ino: u64::try_from(node_info.ino).map_err(|_| Errno::EOVERFLOW)?,
+            rdev: node_info
+                .rdev
+                .map(|rdev| {
+                    core::num::NonZeroU64::new(
+                        u64::try_from(rdev.get()).map_err(|_| Errno::EOVERFLOW)?,
+                    )
+                    .ok_or(Errno::EOVERFLOW)
+                })
+                .transpose()?,
+        },
+        blksize: u64::try_from(blksize).map_err(|_| Errno::EOVERFLOW)?,
+    })
 }
 
 /// Task state shared by `CLONE_FS`.
@@ -1526,9 +1564,16 @@ fn set_file_descriptor_flags<Platform: ShimPlatform>(
 }
 
 impl<Platform: ShimPlatform> Task<Platform> {
+    /// Query filesystem metadata without narrowing it to a guest `stat` layout.
+    pub(crate) fn file_status(&self, fd: i32) -> Result<FileStatus, Errno> {
+        let files = self.files.borrow();
+        let fd = files.typed_fd(fd)?;
+        protocol_file_status(files.fs.fd_file_status(fd.fs_only(Errno::EBADF)?)?)
+    }
+
     pub(crate) fn do_stat<T>(&self, fd: &AnyTypedFd<Platform>) -> Result<T, Errno>
     where
-        T: From<litebox::fs::FileStatus> + From<FileStat>,
+        T: TryFrom<FileStatus, Error = Errno> + From<FileStat>,
     {
         // TODO: give correct values for the synthesized branches.
         let synthetic = |mode_bits: u32, blksize: usize| FileStat {
@@ -1557,11 +1602,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let files = self.files.borrow();
         fd.dispatch(
             |fd| {
-                files
-                    .fs
-                    .fd_file_status(fd)
-                    .map(T::from)
-                    .map_err(Errno::from)
+                let status = files.fs.fd_file_status(fd)?;
+                T::try_from(protocol_file_status(status)?)
             },
             |_fd| Ok(T::from(synthetic(socket_mode, 4096))),
             |fd| {
@@ -1579,7 +1621,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Get the file status of `pathname`.
     ///
     /// The `pathname` must be absolute.
-    fn do_path_stat<T: From<litebox::fs::FileStatus>>(
+    fn do_path_stat<T: TryFrom<FileStatus, Error = Errno>>(
         &self,
         pathname: impl path::Arg,
         follow_symlink: bool,
@@ -1597,7 +1639,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let context = fs.context.read();
             files.fs.file_status(&context, path)?
         };
-        Ok(T::from(status))
+        T::try_from(protocol_file_status(status)?)
     }
 
     /// Handle syscall `stat`
@@ -1628,7 +1670,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         flags: AtFlags,
     ) -> Result<T, Errno>
     where
-        T: From<litebox::fs::FileStatus> + From<FileStat>,
+        T: TryFrom<FileStatus, Error = Errno> + From<FileStat>,
     {
         let get_cwd = || self.cwd_prefix();
         let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
@@ -1643,7 +1685,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 let files = self.files.borrow();
                 let fs = self.fs.borrow();
                 let context = fs.context.read();
-                Ok(T::from(files.fs.file_status(&context, cwd)?))
+                T::try_from(protocol_file_status(files.fs.file_status(&context, cwd)?)?)
             }
             FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
                 self.with_typed_fd(fd, |fd| self.do_stat(fd))
@@ -1752,6 +1794,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .bits())
             }
             FcntlArg::SETFL(flags) => {
+                let flags = legacy_o_flags(flags);
                 let setfl_mask = OFlags::APPEND
                     | OFlags::NONBLOCK
                     | OFlags::NDELAY
