@@ -27,7 +27,10 @@ struct AllocatorState<Platform: RawSyncPrimitivesProvider> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct AcquireError;
+pub(super) enum AcquireError {
+    TooLarge,
+    AssociationFailed,
+}
 
 pub(super) struct SlotLease<'a, Platform: RawSyncPrimitivesProvider> {
     allocator: &'a SlotAllocator<Platform>,
@@ -57,10 +60,9 @@ impl<Platform: RawSyncPrimitivesProvider> SlotAllocator<Platform> {
         &self,
         length: u32,
     ) -> Result<SlotLease<'_, Platform>, AcquireError> {
-        assert!(
-            length <= SHARED_BUFFER_SLOT_SIZE,
-            "single shared-buffer slot length exceeds slot capacity"
-        );
+        if length > SHARED_BUFFER_SLOT_SIZE {
+            return Err(AcquireError::TooLarge);
+        }
         self.acquire_count(length, 1)
     }
 
@@ -73,10 +75,9 @@ impl<Platform: RawSyncPrimitivesProvider> SlotAllocator<Platform> {
         } else {
             length.div_ceil(SHARED_BUFFER_SLOT_SIZE)
         };
-        assert!(
-            slot_count <= SHARED_BUFFER_SLOT_COUNT,
-            "shared-buffer sequence length exceeds pool capacity"
-        );
+        if slot_count > SHARED_BUFFER_SLOT_COUNT {
+            return Err(AcquireError::TooLarge);
+        }
         self.acquire_count(length, slot_count)
     }
 
@@ -88,7 +89,7 @@ impl<Platform: RawSyncPrimitivesProvider> SlotAllocator<Platform> {
         {
             let mut state = self.state.lock();
             if state.failed {
-                return Err(AcquireError);
+                return Err(AcquireError::AssociationFailed);
             }
             if state.waiters.is_empty()
                 && let Some(sequence) = state.allocate(length, slot_count)
@@ -104,7 +105,7 @@ impl<Platform: RawSyncPrimitivesProvider> SlotAllocator<Platform> {
         {
             let mut state = self.state.lock();
             if state.failed {
-                return Err(AcquireError);
+                return Err(AcquireError::AssociationFailed);
             }
             if state.waiters.is_empty()
                 && let Some(sequence) = state.allocate(length, slot_count)
@@ -134,7 +135,7 @@ impl<Platform: RawSyncPrimitivesProvider> SlotAllocator<Platform> {
             core::mem::take(&mut state.waiters)
         };
         for waiter in waiters {
-            waiter.resolve(Err(AcquireError));
+            waiter.resolve(Err(AcquireError::AssociationFailed));
         }
         true
     }
@@ -308,6 +309,21 @@ mod tests {
     }
 
     #[test]
+    fn oversized_acquisitions_do_not_fail_the_allocator() {
+        let allocator = SlotAllocator::<MockPlatform>::new();
+
+        assert!(matches!(
+            allocator.acquire_slot(SHARED_BUFFER_SLOT_SIZE + 1),
+            Err(AcquireError::TooLarge)
+        ));
+        assert!(matches!(
+            allocator.acquire_slots(SHARED_BUFFER_SLOT_COUNT * SHARED_BUFFER_SLOT_SIZE + 1),
+            Err(AcquireError::TooLarge)
+        ));
+        assert!(allocator.acquire_slot(1).is_ok());
+    }
+
+    #[test]
     fn sequence_leases_acquire_all_required_slots_atomically() {
         let allocator = Arc::new(SlotAllocator::<MockPlatform>::new());
         let mut leases = (0..9)
@@ -435,17 +451,21 @@ mod tests {
         let waiter_allocator = Arc::clone(&allocator);
         let (sender, receiver) = mpsc::sync_channel(1);
         let waiter = std::thread::spawn(move || {
-            sender
-                .send(waiter_allocator.acquire_slot(1).is_err())
-                .unwrap();
+            sender.send(waiter_allocator.acquire_slot(1).err()).unwrap();
         });
         while allocator.waiter_count() == 0 {
             std::thread::yield_now();
         }
 
         assert!(allocator.fail());
-        assert!(receiver.recv_timeout(Duration::from_secs(1)).unwrap());
-        assert!(allocator.acquire_slot(1).is_err());
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Some(AcquireError::AssociationFailed)
+        );
+        assert!(matches!(
+            allocator.acquire_slot(1),
+            Err(AcquireError::AssociationFailed)
+        ));
         waiter.join().unwrap();
     }
 }

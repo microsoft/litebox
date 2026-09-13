@@ -19,7 +19,7 @@ use litebox_broker_protocol::fs::{
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::readiness::ReadinessFlags;
-use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_POOL_SIZE, SHARED_BUFFER_SLOT_SIZE};
+use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_SLOT_SIZE;
 use litebox_broker_protocol::socket::{
     AcceptSocketResponse, MAX_SOCKET_TRANSFER_SIZE, MAX_UDP_DATAGRAM_SIZE,
     ReceiveFlags as BrokerReceiveFlags, ReceiveFromFlags as BrokerReceiveFromFlags,
@@ -36,7 +36,7 @@ use crate::sync::{Mutex, RawSyncPrimitivesProvider};
 pub(crate) mod error;
 mod shared_buffer;
 use error::BrokerControlError;
-use shared_buffer::{SlotAllocator, SlotLease};
+use shared_buffer::{AcquireError, SlotAllocator, SlotLease};
 
 /// Local-core access to the negotiated broker control channel.
 ///
@@ -395,30 +395,36 @@ where
         &self,
         length: usize,
     ) -> core::result::Result<SlotLease<'_, Platform>, BrokerControlError> {
-        if length > SHARED_BUFFER_SLOT_SIZE as usize {
-            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
-        }
-        let length =
-            u32::try_from(length).expect("shared-buffer slot length must fit in protocol u32");
-        self.slot_allocator.acquire_slot(length).map_err(|_| {
-            self.fail_association();
-            BrokerControlError::AssociationFailed
-        })
+        let length = u32::try_from(length)
+            .map_err(|_| BrokerControlError::Broker(ErrorCode::ResourceExhausted))?;
+        let result = self.slot_allocator.acquire_slot(length);
+        self.finish_shared_buffer_acquisition(result)
     }
 
     fn acquire_shared_buffer_slots(
         &self,
         length: usize,
     ) -> core::result::Result<SlotLease<'_, Platform>, BrokerControlError> {
-        if length > SHARED_BUFFER_POOL_SIZE {
-            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
+        let length = u32::try_from(length)
+            .map_err(|_| BrokerControlError::Broker(ErrorCode::ResourceExhausted))?;
+        let result = self.slot_allocator.acquire_slots(length);
+        self.finish_shared_buffer_acquisition(result)
+    }
+
+    fn finish_shared_buffer_acquisition<'a>(
+        &'a self,
+        result: core::result::Result<SlotLease<'a, Platform>, AcquireError>,
+    ) -> core::result::Result<SlotLease<'a, Platform>, BrokerControlError> {
+        match result {
+            Ok(lease) => Ok(lease),
+            Err(AcquireError::TooLarge) => {
+                Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted))
+            }
+            Err(AcquireError::AssociationFailed) => {
+                self.fail_association();
+                Err(BrokerControlError::AssociationFailed)
+            }
         }
-        let length =
-            u32::try_from(length).expect("shared-buffer pool length must fit in protocol u32");
-        self.slot_allocator.acquire_slots(length).map_err(|_| {
-            self.fail_association();
-            BrokerControlError::AssociationFailed
-        })
     }
 
     fn fail_association(&self) {
