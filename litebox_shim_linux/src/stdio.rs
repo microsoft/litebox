@@ -7,13 +7,12 @@
 mod tests {
     use core::ffi::CStr;
 
-    use litebox::fs::{Mode, OFlags};
-    use litebox_common_linux::{FcntlArg, FileDescriptorFlags, IoctlArg, Termios, errno::Errno};
-
-    use crate::{
-        UserPtrMut,
-        syscalls::tests::{init_platform, init_platform_with_broker},
+    use litebox_broker_protocol::fs::FileMode as Mode;
+    use litebox_common_linux::{
+        FcntlArg, FileDescriptorFlags, IoctlArg, OFlags, Termios, errno::Errno,
     };
+
+    use crate::{UserPtrMut, syscalls::tests::init_platform};
 
     fn termios() -> Termios {
         Termios {
@@ -99,7 +98,7 @@ mod tests {
         let new_flags = flags | OFlags::NONBLOCK.bits();
         task.sys_fcntl(
             stdin2,
-            FcntlArg::SETFL(litebox_common_linux::OFlags::from_bits(new_flags).unwrap()),
+            FcntlArg::SETFL(OFlags::from_bits(new_flags).unwrap()),
         )
         .expect("Failed to set flags");
         assert_eq!(new_flags, task.sys_fcntl(stdin2, FcntlArg::GETFL).unwrap());
@@ -128,19 +127,8 @@ mod tests {
     }
 
     #[test]
-    fn test_stdio_terminal_query_requires_broker() {
-        let task = init_platform();
-        let mut termios = termios();
-
-        assert_eq!(
-            task.sys_ioctl(1, IoctlArg::TCGETS(UserPtrMut::from_ptr(&raw mut termios)),),
-            Err(Errno::EIO)
-        );
-    }
-
-    #[test]
     fn test_stdio_terminal_query_uses_broker() {
-        let task = init_platform_with_broker();
+        let task = init_platform();
         let mut termios = termios();
 
         assert_eq!(

@@ -9,14 +9,11 @@ clap = { version = "4.5.33", features = ["derive"] }
 libc = { version = "0.2.169", default-features = false }
 litebox = { version = "0.1.0", path = "../litebox" }
 litebox_broker_local_userland = { version = "0.1.0", path = "../litebox_broker_local_userland" }
-litebox_broker_protocol = { version = "0.1.0", path = "../litebox_broker_protocol" }
 litebox_broker_transport = { version = "0.1.0", path = "../litebox_broker_transport" }
 litebox_broker_transport_linux_userland = { version = "0.1.0", path = "../litebox_broker_transport_linux_userland" }
 litebox_common_linux = { version = "0.1.0", path = "../litebox_common_linux" }
 litebox_platform_linux_userland = { version = "0.1.0", path = "../litebox_platform_linux_userland" }
 litebox_shim_linux = { version = "0.1.0", path = "../litebox_shim_linux" }
-litebox_syscall_rewriter = { version = "0.1.0", path = "../litebox_syscall_rewriter" }
-memmap2 = "0.9.8"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 litebox_util_log = { version = "0.1.0", path = "../litebox_util_log", features = ["backend_tracing"] }
 
@@ -27,13 +24,13 @@ glob = "0.3"
 litebox_broker_core = { version = "0.1.0", path = "../litebox_broker_core", features = ["test-support"] }
 litebox_broker_host = { version = "0.1.0", path = "../litebox_broker_host" }
 litebox_broker_platform_linux_userland = { version = "0.1.0", path = "../litebox_broker_platform_linux_userland" }
+litebox_broker_protocol = { version = "0.1.0", path = "../litebox_broker_protocol" }
 litebox_broker_userland = { version = "0.1.0", path = "../litebox_broker_userland" }
 
 [features]
 lock_tracing = ["litebox/lock_tracing"]
-# Keep gate rewriting and platform register/signal virtualization in lockstep.
-# Enabling only the shim feature would split logical x18 between its TLS slot
-# and the physical register exposed by the platform.
+# Pre-rewritten guests that virtualize x18 require matching shim state and
+# platform register/signal handling.
 aarch64_virtualize_x18 = [
     "litebox_platform_linux_userland/aarch64_virtualize_x18",
     "litebox_shim_linux/aarch64_virtualize_x18",

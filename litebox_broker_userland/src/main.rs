@@ -80,6 +80,7 @@ impl FromStr for AllowedDestination {
 }
 
 #[derive(Parser, Debug)]
+#[allow(clippy::struct_excessive_bools)]
 struct CliArgs {
     /// Permit HTTP and HTTPS proxy requests to a hostname and destination ports.
     #[cfg(target_os = "linux")]

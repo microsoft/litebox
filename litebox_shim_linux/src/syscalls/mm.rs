@@ -5,13 +5,7 @@
 //! Most of these syscalls which are not backed by files are implemented in [`litebox_common_linux::mm`].
 
 use alloc::collections::{BTreeMap, BTreeSet};
-use litebox::{
-    mm::linux::{MappingError, PAGE_SIZE, PageRange},
-    platform::{
-        PageManagementProvider, RawConstPointer,
-        page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions},
-    },
-};
+use litebox::mm::linux::{MappingError, PAGE_SIZE};
 use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
 
 use crate::ShimPlatform;
@@ -24,8 +18,6 @@ use alloc::vec::Vec;
 use core::ops::Range;
 #[cfg(target_arch = "aarch64")]
 use litebox::mm::linux::VmFlags;
-#[cfg(target_arch = "aarch64")]
-use litebox::utils::ReinterpretUnsignedExt as _;
 use litebox::utils::TruncateExt as _;
 use object::elf::{ET_DYN, FileHeader64, PT_LOAD, ProgramHeader64};
 use object::endian::LittleEndian;
@@ -240,14 +232,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let is_exec = prot.contains(ProtFlags::PROT_EXEC);
         let typed_fd = self.typed_fd(fd).map_err(|_| MappingError::BadFD(fd))?;
 
-        // Perform the normal mmap first (CoW or memcpy fallback).
-        let result = if let Some(cow_result) =
-            self.try_cow_mmap_file(suggested_addr, len, &prot, &flags, &typed_fd, offset)
-        {
-            cow_result?
-        } else {
-            self.do_mmap_file_memcpy(suggested_addr, len, prot, flags, &typed_fd, offset)?
-        };
+        let result =
+            self.do_mmap_file_memcpy(suggested_addr, len, prot, flags, &typed_fd, offset)?;
 
         // Runtime syscall rewriting: patch PROT_EXEC segments in-place.
         if is_exec {
@@ -281,98 +267,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         Ok(result)
     }
 
-    /// Attempt to create a CoW mapping for a file with static backing data.
-    ///
-    /// Returns `Some(result)` if CoW was attempted (success or failure),
-    /// `None` if CoW is not applicable (fall back to memcpy).
-    // TODO(jb): does this need to be Option-Result or can it just be Option?
-    fn try_cow_mmap_file(
-        &self,
-        suggested_addr: Option<usize>,
-        len: usize,
-        prot: &ProtFlags,
-        flags: &MapFlags,
-        fd: &AnyTypedFd<Platform>,
-        offset: usize,
-    ) -> Option<Result<UserPtrMut<u8>, MappingError>> {
-        if !len.is_multiple_of(PAGE_SIZE) {
-            return None;
-        }
-
-        let files = self.files.borrow();
-        let static_data = files.fs.get_static_backing_data(fd.as_fs()?)?;
-
-        if offset > static_data.len() {
-            return None;
-        }
-
-        let available_len = static_data.len().saturating_sub(offset);
-        if available_len < len {
-            // Cannot fill full page
-            return None;
-        }
-
-        let fixed_behavior = if flags.contains(MapFlags::MAP_FIXED_NOREPLACE) {
-            FixedAddressBehavior::NoReplace
-        } else if flags.contains(MapFlags::MAP_FIXED) {
-            FixedAddressBehavior::Replace
-        } else {
-            FixedAddressBehavior::Hint
-        };
-
-        let permissions = {
-            let mut perms = MemoryRegionPermissions::empty();
-            perms.set(
-                MemoryRegionPermissions::READ,
-                prot.contains(ProtFlags::PROT_READ),
-            );
-            perms.set(
-                MemoryRegionPermissions::WRITE,
-                prot.contains(ProtFlags::PROT_WRITE),
-            );
-            perms.set(
-                MemoryRegionPermissions::EXEC,
-                prot.contains(ProtFlags::PROT_EXEC),
-            );
-            perms
-        };
-
-        // XXX: `try_allocate_cow_pages` and `register_existing_mapping` are not called under a
-        // unified lock, so there is a theoretical race if two threads concurrently attempt a
-        // fixed-address mapping with replacement at the same address. In practice this is benign:
-        // if a program races like this both threads will register the same mapping anyway. Updating
-        // to a begin/attempt/commit scheme could close this race window entirely.
-        match <_ as PageManagementProvider<{ PAGE_SIZE }>>::try_allocate_cow_pages(
-            self.global.platform,
-            suggested_addr.unwrap_or(0),
-            &static_data[offset..offset + len],
-            permissions,
-            fixed_behavior,
-        ) {
-            Ok(ptr) => {
-                let range =
-                    PageRange::new(ptr.as_usize(), ptr.as_usize().checked_add(len).unwrap())
-                        .unwrap();
-                // SAFETY: ptr is the freshly CoW-mapped region of exactly `len` bytes with
-                // `permissions`.
-                unsafe {
-                    self.global.pm.register_existing_mapping(
-                        range,
-                        permissions,
-                        true,
-                        fixed_behavior == FixedAddressBehavior::Replace,
-                        flags.contains(MapFlags::MAP_SHARED),
-                    )
-                }
-                .unwrap();
-                Some(Ok(UserPtrMut::from_platform_ptr::<Platform>(ptr)))
-            }
-            Err(_cow_not_supported) => None,
-        }
-    }
-
-    /// Fallback mmap implementation using page-by-page memcpy, for files where the CoW attempt
-    /// fails (either due to lack of support on platform, or non-static-backed data, etc.)
+    /// Map a file by reading its contents through the filesystem API into allocated pages.
     fn do_mmap_file_memcpy(
         &self,
         suggested_addr: Option<usize>,
@@ -849,26 +744,25 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let (code_metadata, trampoline_capacity) = if pre_patched {
             (None, 0)
         } else {
-            let scanned = self.sys_fstat(fd).ok().and_then(|stat| {
-                let file_size: usize = stat.st_size.reinterpret_as_unsigned().trunc();
+            let scanned = self.file_status(fd).ok().and_then(|stat| {
+                let file_size = usize::try_from(stat.size).ok()?;
                 let word_len = file_size.div_ceil(8);
                 let mut words = u64::new_vec_zeroed(word_len).ok()?;
                 let bytes = zerocopy::IntoBytes::as_mut_bytes(words.as_mut_slice());
-                match self.sys_read(fd, &mut bytes[..file_size], Some(0)) {
-                    Ok(n) if n == file_size => {
-                        let metadata = litebox_syscall_rewriter::aarch64::ElfCodeMetadata::parse_aligned_in_place(
-                            &mut words, file_size,
-                        ).ok()?;
-                        let upper_bound = metadata
-                            .trampoline_size_upper_bound(
-                                &zerocopy::IntoBytes::as_bytes(words.as_slice())[..file_size],
-                                crate::aarch64_rewrite_options(),
-                            )
-                            .ok();
-                        Some((metadata, upper_bound))
-                    }
-                    _ => None,
-                }
+                self.read_file_exact_at(fd, &mut bytes[..file_size], 0)
+                    .ok()?;
+                let metadata =
+                    litebox_syscall_rewriter::aarch64::ElfCodeMetadata::parse_aligned_in_place(
+                        &mut words, file_size,
+                    )
+                    .ok()?;
+                let upper_bound = metadata
+                    .trampoline_size_upper_bound(
+                        &zerocopy::IntoBytes::as_bytes(words.as_slice())[..file_size],
+                        crate::aarch64_rewrite_options(),
+                    )
+                    .ok();
+                Some((metadata, upper_bound))
             });
             if let Some((metadata, upper_bound)) = scanned {
                 let (executable_bytes, identified_bytes) = metadata.coverage_bytes();
@@ -1012,25 +906,39 @@ impl<Platform: ShimPlatform> Task<Platform> {
         true
     }
 
+    fn read_file_exact_at(
+        &self,
+        fd: i32,
+        mut data: &mut [u8],
+        mut offset: usize,
+    ) -> Result<(), Errno> {
+        while !data.is_empty() {
+            let read = self.sys_read(fd, data, Some(offset))?;
+            if read == 0 {
+                return Err(Errno::EIO);
+            }
+            offset = offset.checked_add(read).ok_or(Errno::EOVERFLOW)?;
+            data = &mut data[read..];
+        }
+        Ok(())
+    }
+
     /// Check if a file has the LITEBOX trampoline magic at its tail.
     /// Returns (is_pre_patched, file_offset, vaddr, trampoline_size).
     fn check_trampoline_magic(&self, fd: i32) -> (bool, u64, u64, u64) {
         const HEADER_SIZE: usize = 32; // TrampolineHeader64: magic(8) + file_offset(8) + vaddr(8) + size(8)
-        let Ok(stat) = self.sys_fstat(fd) else {
+        let Ok(stat) = self.file_status(fd) else {
             return (false, 0, 0, 0);
         };
-        #[cfg(target_arch = "x86_64")]
-        let file_size: usize = stat.st_size;
-        #[cfg(target_arch = "aarch64")]
-        let file_size: usize = {
-            // The asm-generic ABI uses signed `st_size`.
-            stat.st_size.reinterpret_as_unsigned().trunc()
-        };
-        if file_size < HEADER_SIZE {
+        let Some(tail_offset) = stat.size.checked_sub(HEADER_SIZE as u64) else {
             return (false, 0, 0, 0);
-        }
+        };
+        let Ok(tail_offset) = usize::try_from(tail_offset) else {
+            return (false, 0, 0, 0);
+        };
+
         let mut tail = [0u8; HEADER_SIZE];
-        match self.sys_read(fd, &mut tail, Some(file_size - HEADER_SIZE)) {
+        match self.sys_read(fd, &mut tail, Some(tail_offset)) {
             Ok(n) if n == HEADER_SIZE => {}
             _ => return (false, 0, 0, 0),
         }
@@ -1223,12 +1131,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 let mut tramp_data = alloc::vec![0u8; state.trampoline_file_size];
                 let file_off = state.trampoline_file_offset.trunc();
                 let tramp_ptr = UserPtrMut::<u8>::from_usize(tramp_addr);
-                match self.sys_read(fd, &mut tramp_data, Some(file_off)) {
-                    Ok(n) if n == tramp_data.len() => {}
-                    _ => {
-                        let _ = self.sys_munmap_raw(tramp_ptr, tramp_len);
-                        return false;
-                    }
+                if self
+                    .read_file_exact_at(fd, &mut tramp_data, file_off)
+                    .is_err()
+                {
+                    let _ = self.sys_munmap_raw(tramp_ptr, tramp_len);
+                    return false;
                 }
 
                 // Write syscall entry point to the first 8 bytes.
@@ -1641,15 +1549,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
 #[cfg(test)]
 mod tests {
     use super::PAGE_SIZE;
-    use litebox::fs::{Mode, OFlags};
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     use litebox::platform::PageManagementProvider;
+    use litebox_broker_protocol::fs::FileMode as Mode;
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     use litebox_common_linux::MRemapFlags;
-    use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno};
+    use litebox_common_linux::{MapFlags, OFlags, ProtFlags, errno::Errno};
 
-    use crate::syscalls::tests::TestPlatform as Platform;
-    use crate::{UserPtrMut, syscalls::tests::init_platform};
+    use crate::UserPtrMut;
+    use crate::syscalls::tests::{TestPlatform as Platform, create_file, init_platform};
 
     #[test]
     fn full_capacity_anywhere_precedes_preferred_one_page() {
@@ -1854,14 +1762,14 @@ mod tests {
 
     #[test]
     fn test_file_backed_mmap() {
-        let task = init_platform();
-
         let content = b"Hello, world!";
-        let fd = task
-            .sys_open("test.txt", OFlags::RDWR | OFlags::CREAT, Mode::RWXU)
-            .unwrap();
-        let fd = i32::try_from(fd).unwrap();
-        assert_eq!(task.sys_write(fd, content, None).unwrap(), content.len());
+        let task = init_platform();
+        create_file(&task, "/test.txt", content);
+        let fd = i32::try_from(
+            task.sys_open("/test.txt", OFlags::RDONLY, Mode::empty())
+                .unwrap(),
+        )
+        .unwrap();
         let addr = task
             .sys_mmap(
                 0,
@@ -2188,14 +2096,14 @@ mod tests {
     #[test]
     #[cfg_attr(target_os = "macos", ignore = "assumes 4 KiB host pages")]
     fn test_map_shared_readonly_file() {
-        let task = init_platform();
-
         let content = b"Hello, shared!";
-        let fd = task
-            .sys_open("shared.txt", OFlags::RDWR | OFlags::CREAT, Mode::RWXU)
-            .unwrap();
-        let fd = i32::try_from(fd).unwrap();
-        assert_eq!(task.sys_write(fd, content, None).unwrap(), content.len());
+        let task = init_platform();
+        create_file(&task, "/shared.txt", content);
+        let fd = i32::try_from(
+            task.sys_open("/shared.txt", OFlags::RDONLY, Mode::empty())
+                .unwrap(),
+        )
+        .unwrap();
 
         // MAP_SHARED with PROT_READ on a file should succeed
         let addr = task

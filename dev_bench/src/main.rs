@@ -450,9 +450,16 @@ fn run_rewritten_hello_static(ctx: BenchCtx<'_>) -> Result<()> {
         is_init,
         lock_tracing,
     } = ctx;
+    let tar_file = sh.current_dir().join("hello_static_rootfs.tar");
     if is_init {
         rewriter_hello_static(ctx.with_init(true))?;
         rewriter_hello_static(ctx.with_init(false))?;
+        sh.remove_path(&tar_file)?;
+        cmd!(
+            sh,
+            "tar --format=ustar -cf {tar_file} hello_static_rewritten"
+        )
+        .run()?;
         let features: &[&str] = if lock_tracing {
             &["--features", "lock_tracing"]
         } else {
@@ -463,11 +470,15 @@ fn run_rewritten_hello_static(ctx: BenchCtx<'_>) -> Result<()> {
             "cargo build -p litebox_runner_linux_userland --release {features...}"
         )
         .run()?;
+        cmd!(sh, "cargo build -p litebox_broker_userland --release").run()?;
     } else {
+        let broker = project_root.join("target/release/litebox-broker-userland");
+        let runner = project_root.join("target/release/litebox_runner_linux_userland");
         cmd!(
             sh,
-            "{project_root}/target/release/litebox_runner_linux_userland --unstable hello_static_rewritten"
-        ).run()?;
+            "{broker} --fs-initial-files {tar_file} --runner {runner} /hello_static_rewritten"
+        )
+        .run()?;
     }
     Ok(())
 }
@@ -586,9 +597,13 @@ fn run_rewritten_node(ctx: BenchCtx<'_>) -> Result<()> {
         rewriter_node(ctx.with_init(false))?;
 
         let tar_base_dir = sh.current_dir().join("node_tar_base");
-        sh.write_file(tar_base_dir.join("hello_world.js"), HELLO_WORLD_JS)?;
-        let libs = find_dependencies(sh, "node")?;
         sh.create_dir(&tar_base_dir)?;
+        sh.write_file(tar_base_dir.join("hello_world.js"), HELLO_WORLD_JS)?;
+        std::fs::copy(
+            sh.current_dir().join("node_rewritten"),
+            tar_base_dir.join("node_rewritten"),
+        )?;
+        let libs = find_dependencies(sh, "node")?;
         for lib in libs {
             let dest_path = tar_base_dir
                 .join(lib.strip_prefix("/").unwrap_or_else(|_| {
@@ -618,11 +633,14 @@ fn run_rewritten_node(ctx: BenchCtx<'_>) -> Result<()> {
             "cargo build -p litebox_runner_linux_userland {release...} {features...}"
         )
         .run()?;
+        cmd!(sh, "cargo build -p litebox_broker_userland {release...}").run()?;
     } else {
         let mode = if release_mode { "release" } else { "debug" };
+        let broker = project_root.join(format!("target/{mode}/litebox-broker-userland"));
+        let runner = project_root.join(format!("target/{mode}/litebox_runner_linux_userland"));
         cmd!(
             sh,
-            "{project_root}/target/{mode}/litebox_runner_linux_userland --unstable --env HOME=/ --initial-files {tar_file} node_rewritten hello_world.js"
+            "{broker} --fs-initial-files {tar_file} --runner {runner} --env HOME=/ /node_rewritten hello_world.js"
         ).run()?;
     }
     Ok(())

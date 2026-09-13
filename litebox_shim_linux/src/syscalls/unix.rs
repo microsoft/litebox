@@ -21,17 +21,18 @@ use litebox::{
         wait::WaitContext,
     },
     fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry},
-    fs::{Mode, OFlags, errors::OpenError},
+    fs::errors::OpenError,
     sync::{Mutex, RwLock},
     utils::TruncateExt as _,
 };
+use litebox_broker_protocol::fs::{FileAccessMode, FileMode as Mode, FileOpenFlags};
 use litebox_common_linux::{
-    IpOption, ReceiveFlags, SendFlags, ShutdownHow, SockFlags, SockType, SocketOption,
+    IpOption, OFlags, ReceiveFlags, SendFlags, ShutdownHow, SockFlags, SockType, SocketOption,
     SocketOptionName, errno::Errno,
 };
 
 use crate::{
-    FileFd, GlobalState, LinuxFS, ShimPlatform, Task, UserPtr, UserPtrMut,
+    FileFd, GlobalState, ShimPlatform, Task, UserPtr, UserPtrMut,
     channel::{Channel, ReadEnd, WriteEnd},
     syscalls::net::{SocketOptionValue, SocketOptions},
 };
@@ -70,7 +71,7 @@ pub(crate) enum UnixSocketAddr {
 /// the socket file remains accessible. The file is automatically closed
 /// when this structure is dropped.
 enum UnixBoundSocketAddr<Platform: ShimPlatform> {
-    Path((String, FileFd<Platform>, Arc<LinuxFS<Platform>>)),
+    Path((String, FileFd, Arc<litebox::LiteBox<Platform>>)),
     Abstract(Vec<u8>),
 }
 
@@ -112,20 +113,20 @@ impl UnixSocketAddr {
                 let flags = if is_server {
                     // create the socket file if not exists;
                     // use O_EXCL to ensure exclusive creation
-                    OFlags::CREAT | OFlags::EXCL | OFlags::RDWR
+                    FileOpenFlags::CREATE | FileOpenFlags::EXCLUSIVE
                 } else {
-                    OFlags::RDWR
+                    FileOpenFlags::NONE
                 };
                 // TODO: extend fs to support creating sock file (i.e., with type `InodeType::Socket`)
                 let file = {
-                    let files = task.files.borrow();
                     let fs = task.fs.borrow();
                     let context = fs.context.read();
-                    files
-                        .fs
-                        .open(
+                    task.global
+                        .litebox
+                        .open_file(
                             &context,
                             path.as_str(),
+                            FileAccessMode::ReadWrite,
                             flags,
                             Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
                         )
@@ -137,7 +138,7 @@ impl UnixSocketAddr {
                 Ok(UnixBoundSocketAddr::Path((
                     path,
                     file,
-                    task.files.borrow().fs.clone(),
+                    Arc::clone(&task.global.litebox),
                 )))
             }
             UnixSocketAddr::Abstract(data) => {
@@ -174,7 +175,7 @@ impl<Platform: ShimPlatform> Drop for UnixBoundSocketAddr<Platform> {
     fn drop(&mut self) {
         match self {
             Self::Path((_, file, fs)) => {
-                let _ = fs.close(file);
+                let _ = fs.close_file(file);
             }
             Self::Abstract(_) => {}
         }
