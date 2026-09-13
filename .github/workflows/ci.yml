@@ -248,6 +248,7 @@ jobs:
         -p litebox_broker_local
         -p litebox_broker_host
         -p litebox_broker_transport_windows_userland
+        -p litebox_broker_platform_windows_userland
         -p litebox_platform_windows_userland
         -p litebox_shim_linux
         -p litebox_shim_windows
