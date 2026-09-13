@@ -437,7 +437,7 @@ where
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
         let lease = self.acquire_shared_buffer(output.len())?;
-        self.request(|local| local.fill_random(lease.descriptor(), output))
+        self.request(|local| local.fill_random(lease.sequence(), output))
     }
 
     fn is_stdio_terminal(
@@ -455,7 +455,7 @@ where
         // pool when multiple guest threads read concurrently.
         let _read_guard = self.stdio_read_lock.lock();
         let lease = self.acquire_shared_buffer(data.len())?;
-        self.request(|local| local.read_stdio(lease.descriptor(), data))
+        self.request(|local| local.read_stdio(lease.sequence(), data))
     }
 
     fn write_stdio(
@@ -467,7 +467,7 @@ where
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
         let lease = self.acquire_shared_buffer(data.len())?;
-        self.request(|local| local.write_stdio(stream, lease.descriptor(), data))
+        self.request(|local| local.write_stdio(stream, lease.sequence(), data))
     }
 
     fn create_tcp_socket(&self) -> core::result::Result<ObjectHandle, BrokerControlError> {
@@ -542,7 +542,7 @@ where
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
         let lease = self.acquire_shared_buffer(data.len())?;
-        self.request(|local| local.send_socket(handle, lease.descriptor(), data, flags))
+        self.request(|local| local.send_socket(handle, lease.sequence(), data, flags))
             .map(|result| match result {
                 Ok(sent) => SocketOutcome::Completed(sent),
                 Err(error) => SocketOutcome::Failed(error),
@@ -566,7 +566,7 @@ where
             local.receive_socket(
                 litebox_broker_protocol::socket::ReceiveSocketRequest {
                     handle,
-                    buffer: lease.descriptor(),
+                    buffer: lease.sequence(),
                     flags,
                     peek_offset,
                     peek_length,
@@ -593,7 +593,7 @@ where
         }
         let lease = self.acquire_shared_buffer(data.len())?;
         self.request(|local| {
-            local.send_to_socket(handle, lease.descriptor(), data, flags, destination)
+            local.send_to_socket(handle, lease.sequence(), data, flags, destination)
         })
         .map(|result| match result {
             Ok(sent) => SocketOutcome::Completed(sent),
@@ -611,7 +611,7 @@ where
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
         let lease = self.acquire_shared_buffer(data.len())?;
-        self.request(|local| local.receive_from_socket(handle, lease.descriptor(), data, flags))
+        self.request(|local| local.receive_from_socket(handle, lease.sequence(), data, flags))
             .map(|result| match result {
                 Ok(received) => SocketOutcome::Completed(received),
                 Err(error) => SocketOutcome::Failed(error),
@@ -697,7 +697,7 @@ where
             .map_err(|_| BrokerControlError::Broker(ErrorCode::OutOfMemory))?;
         data.resize(length as usize, 0);
         let lease = self.acquire_shared_buffer(length as usize)?;
-        let read = self.request(|local| local.read_pipe(handle, lease.descriptor(), &mut data))?;
+        let read = self.request(|local| local.read_pipe(handle, lease.sequence(), &mut data))?;
         data.truncate(read);
         Ok(data)
     }
@@ -711,7 +711,7 @@ where
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
         let lease = self.acquire_shared_buffer(data.len())?;
-        self.request(|local| local.write_pipe(handle, lease.descriptor(), data))
+        self.request(|local| local.write_pipe(handle, lease.sequence(), data))
     }
 
     fn open_file(
@@ -724,7 +724,7 @@ where
     ) -> core::result::Result<core::result::Result<ObjectHandle, FileError>, BrokerControlError>
     {
         let lease = self.acquire_file_path_buffer(path)?;
-        self.request(|local| local.open_file(lease.descriptor(), path, user, access, flags, mode))
+        self.request(|local| local.open_file(lease.sequence(), path, user, access, flags, mode))
     }
 
     fn read_file(
@@ -780,8 +780,8 @@ where
         let mut start_index = 0;
         loop {
             let lease = self.acquire_shared_buffer(SHARED_BUFFER_SLOT_SIZE as usize)?;
-            let response = self
-                .request(|local| local.read_directory(handle, lease.descriptor(), start_index))?;
+            let response =
+                self.request(|local| local.read_directory(handle, lease.sequence(), start_index))?;
             let (mut chunk, next_index) = match response {
                 Ok(response) => response,
                 Err(error) => return Ok(Err(error)),
@@ -807,7 +807,7 @@ where
         user: FileUser,
     ) -> core::result::Result<core::result::Result<FileStatus, FileError>, BrokerControlError> {
         let lease = self.acquire_file_path_buffer(path)?;
-        self.request(|local| local.path_file_status(lease.descriptor(), path, user))
+        self.request(|local| local.path_file_status(lease.sequence(), path, user))
     }
 
     fn handle_file_status(
@@ -824,7 +824,7 @@ where
         mode: FileMode,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
         let lease = self.acquire_file_path_buffer(path)?;
-        self.request(|local| local.chmod_file(lease.descriptor(), path, user, mode))
+        self.request(|local| local.chmod_file(lease.sequence(), path, user, mode))
     }
 
     fn chown_file(
@@ -835,7 +835,7 @@ where
         group: Option<u16>,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
         let lease = self.acquire_file_path_buffer(path)?;
-        self.request(|local| local.chown_file(lease.descriptor(), path, acting_user, user, group))
+        self.request(|local| local.chown_file(lease.sequence(), path, acting_user, user, group))
     }
 
     fn unlink_file(
@@ -844,7 +844,7 @@ where
         user: FileUser,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
         let lease = self.acquire_file_path_buffer(path)?;
-        self.request(|local| local.unlink_file(lease.descriptor(), path, user))
+        self.request(|local| local.unlink_file(lease.sequence(), path, user))
     }
 
     fn mkdir_file(
@@ -854,7 +854,7 @@ where
         mode: FileMode,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
         let lease = self.acquire_file_path_buffer(path)?;
-        self.request(|local| local.mkdir_file(lease.descriptor(), path, user, mode))
+        self.request(|local| local.mkdir_file(lease.sequence(), path, user, mode))
     }
 
     fn rmdir_file(
@@ -863,7 +863,7 @@ where
         user: FileUser,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
         let lease = self.acquire_file_path_buffer(path)?;
-        self.request(|local| local.rmdir_file(lease.descriptor(), path, user))
+        self.request(|local| local.rmdir_file(lease.sequence(), path, user))
     }
 
     fn close_object(&self, handle: ObjectHandle) -> core::result::Result<(), BrokerControlError> {
@@ -900,7 +900,8 @@ mod tests {
     };
     use litebox_broker_protocol::pipe::{ReadPipeResponse, WritePipeResponse};
     use litebox_broker_protocol::shared_buffer::{
-        SHARED_BUFFER_POOL_SIZE, SHARED_BUFFER_SLOT_SIZE, SharedBufferDescriptor,
+        SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SHARED_BUFFER_SLOT_SIZE,
+        SharedBufferSequence,
     };
     use litebox_broker_transport::channel::{LocalCallChannel, LocalSetupChannel};
     use litebox_broker_transport::shared_memory::{SharedMemory, SharedMemoryError};
@@ -938,7 +939,8 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .unwrap();
         assert_ne!(
-            first_observed.0.slot_index, second_observed.0.slot_index,
+            first_observed.0.slot_indices(),
+            second_observed.0.slot_indices(),
             "simultaneous payload calls reused one slot"
         );
         let mut payloads = [first_observed.1, second_observed.1];
@@ -982,7 +984,8 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .unwrap();
         assert_ne!(
-            first_buffer.slot_index, second_buffer.slot_index,
+            first_buffer.slot_indices(),
+            second_buffer.slot_indices(),
             "simultaneous payload calls reused one slot"
         );
 
@@ -1046,13 +1049,13 @@ mod tests {
 
     struct ConcurrentPipeChannel {
         memory: TestSharedMemory,
-        observed_sender: mpsc::SyncSender<(SharedBufferDescriptor, std::vec::Vec<u8>)>,
+        observed_sender: mpsc::SyncSender<(SharedBufferSequence, std::vec::Vec<u8>)>,
         release: StdArc<(StdMutex<bool>, StdCondvar)>,
     }
 
     struct ConcurrentPipeReadChannel {
         memory: TestSharedMemory,
-        observed_sender: mpsc::SyncSender<SharedBufferDescriptor>,
+        observed_sender: mpsc::SyncSender<SharedBufferSequence>,
         release: StdArc<(StdMutex<bool>, StdCondvar)>,
     }
 
@@ -1086,10 +1089,16 @@ mod tests {
             let BrokerOperation::Pipe(PipeRequest::Write(write)) = request.operation else {
                 panic!("unexpected broker request");
             };
-            let mut payload = std::vec![0; write.buffer.length as usize];
+            let descriptor = write
+                .buffer
+                .descriptors(SHARED_BUFFER_LAYOUT)
+                .unwrap()
+                .next()
+                .unwrap();
+            let mut payload = std::vec![0; write.buffer.length() as usize];
             self.memory
                 .read(
-                    write.buffer.slot_index.0 as usize * SHARED_BUFFER_SLOT_SIZE as usize,
+                    descriptor.slot_index.0 as usize * SHARED_BUFFER_SLOT_SIZE as usize,
                     &mut payload,
                 )
                 .unwrap();
@@ -1102,7 +1111,7 @@ mod tests {
             Ok(BrokerResponse {
                 request_id: request.request_id,
                 result: BrokerResult::Pipe(PipeResponse::Write(WritePipeResponse {
-                    written: write.buffer.length,
+                    written: write.buffer.length(),
                 })),
             })
         }
@@ -1140,11 +1149,17 @@ mod tests {
             };
             let payload = std::vec![
                 u8::try_from(read.handle.0).unwrap();
-                read.buffer.length as usize
+                read.buffer.length() as usize
             ];
+            let descriptor = read
+                .buffer
+                .descriptors(SHARED_BUFFER_LAYOUT)
+                .unwrap()
+                .next()
+                .unwrap();
             self.memory
                 .write(
-                    read.buffer.slot_index.0 as usize * SHARED_BUFFER_SLOT_SIZE as usize,
+                    descriptor.slot_index.0 as usize * SHARED_BUFFER_SLOT_SIZE as usize,
                     &payload,
                 )
                 .unwrap();
@@ -1157,7 +1172,7 @@ mod tests {
             Ok(BrokerResponse {
                 request_id: request.request_id,
                 result: BrokerResult::Pipe(PipeResponse::Read(ReadPipeResponse {
-                    read: read.buffer.length,
+                    read: read.buffer.length(),
                 })),
             })
         }

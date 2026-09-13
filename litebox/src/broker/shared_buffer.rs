@@ -8,8 +8,8 @@ use alloc::vec::Vec;
 use core::sync::atomic::Ordering::{Acquire, Release};
 
 use litebox_broker_protocol::shared_buffer::{
-    MAX_SHARED_BUFFER_SEQUENCE_SLOTS, SHARED_BUFFER_LAYOUT, SHARED_BUFFER_SLOT_COUNT,
-    SHARED_BUFFER_SLOT_SIZE, SharedBufferDescriptor, SharedBufferSequence, SharedBufferSlotIndex,
+    MAX_SHARED_BUFFER_SEQUENCE_SLOTS, SHARED_BUFFER_SLOT_COUNT, SHARED_BUFFER_SLOT_SIZE,
+    SharedBufferSequence, SharedBufferSlotIndex,
 };
 use litebox_platform::sync::RawMutex as _;
 
@@ -210,21 +210,6 @@ impl<Platform: RawSyncPrimitivesProvider> SlotWaiter<Platform> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider> SlotLease<'_, Platform> {
-    pub(super) fn descriptor(&self) -> SharedBufferDescriptor {
-        let mut descriptors = self
-            .sequence
-            .descriptors(SHARED_BUFFER_LAYOUT)
-            .expect("allocated shared-buffer sequence must be valid");
-        let descriptor = descriptors
-            .next()
-            .expect("allocated shared-buffer sequence must contain one slot");
-        assert!(
-            descriptors.next().is_none(),
-            "multi-slot lease cannot be used as one shared-buffer descriptor"
-        );
-        descriptor
-    }
-
     pub(super) const fn sequence(&self) -> SharedBufferSequence {
         self.sequence
     }
@@ -293,13 +278,16 @@ mod tests {
             .collect::<Vec<_>>();
 
         for (index, lease) in leases.iter().enumerate() {
-            assert_eq!(lease.descriptor().slot_index.0 as usize, index);
-            assert_eq!(lease.descriptor().length, 7);
+            assert_eq!(lease.sequence().slot_indices()[0].0 as usize, index);
+            assert_eq!(lease.sequence().length(), 7);
         }
 
         drop(leases.remove(0));
         let reused = allocator.acquire(9).unwrap();
-        assert_eq!(reused.descriptor().slot_index, SharedBufferSlotIndex(0));
+        assert_eq!(
+            reused.sequence().slot_indices(),
+            &[SharedBufferSlotIndex(0)]
+        );
     }
 
     #[test]
@@ -357,7 +345,7 @@ mod tests {
         assert!(sequence.slot_indices().iter().all(|slot_index| {
             leases
                 .iter()
-                .all(|lease| lease.descriptor().slot_index != *slot_index)
+                .all(|lease| !lease.sequence().slot_indices().contains(slot_index))
         }));
         waiter.join().unwrap();
     }
@@ -372,7 +360,7 @@ mod tests {
         let (sender, receiver) = mpsc::sync_channel(1);
         let waiter = std::thread::spawn(move || {
             let lease = waiter_allocator.acquire(1).unwrap();
-            sender.send(lease.descriptor()).unwrap();
+            sender.send(lease.sequence()).unwrap();
         });
         while allocator.waiter_count() == 0 {
             std::thread::yield_now();
@@ -385,10 +373,7 @@ mod tests {
         drop(leases.remove(0));
         assert_eq!(
             receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
-            SharedBufferDescriptor {
-                slot_index: SharedBufferSlotIndex(0),
-                length: 1,
-            }
+            SharedBufferSequence::new(&[SharedBufferSlotIndex(0)], 1).unwrap()
         );
         waiter.join().unwrap();
     }
@@ -405,7 +390,7 @@ mod tests {
         let (release_first_sender, release_first_receiver) = mpsc::sync_channel(1);
         let first = std::thread::spawn(move || {
             let lease = first_allocator.acquire(1).unwrap();
-            first_acquired_sender.send(lease.descriptor()).unwrap();
+            first_acquired_sender.send(lease.sequence()).unwrap();
             release_first_receiver.recv().unwrap();
         });
         while allocator.waiter_count() != 1 {
@@ -416,7 +401,7 @@ mod tests {
         let (second_acquired_sender, second_acquired_receiver) = mpsc::sync_channel(1);
         let second = std::thread::spawn(move || {
             let lease = second_allocator.acquire(1).unwrap();
-            second_acquired_sender.send(lease.descriptor()).unwrap();
+            second_acquired_sender.send(lease.sequence()).unwrap();
         });
         while allocator.waiter_count() != 2 {
             std::thread::yield_now();
@@ -427,8 +412,8 @@ mod tests {
             first_acquired_receiver
                 .recv_timeout(Duration::from_secs(1))
                 .unwrap()
-                .slot_index,
-            SharedBufferSlotIndex(0)
+                .slot_indices(),
+            &[SharedBufferSlotIndex(0)]
         );
         assert!(matches!(
             second_acquired_receiver.try_recv(),
@@ -440,8 +425,8 @@ mod tests {
             second_acquired_receiver
                 .recv_timeout(Duration::from_secs(1))
                 .unwrap()
-                .slot_index,
-            SharedBufferSlotIndex(0)
+                .slot_indices(),
+            &[SharedBufferSlotIndex(0)]
         );
         first.join().unwrap();
         second.join().unwrap();

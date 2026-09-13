@@ -47,7 +47,7 @@ pub enum SharedBufferLayoutError {
     /// The requested byte range does not fit in one slot.
     #[error("shared-buffer range exceeds the slot size")]
     RangeExceedsSlot,
-    /// A multi-slot descriptor does not canonically cover its declared length.
+    /// A slot sequence does not canonically cover its declared length.
     #[error("invalid shared-buffer sequence")]
     InvalidSequence,
 }
@@ -121,15 +121,15 @@ impl SharedBufferLayout {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SharedBufferSlotIndex(pub u32);
 
-/// Identifies one operation-scoped region in the association shared-buffer pool.
+/// Identifies one slot segment within an operation-scoped shared-buffer sequence.
 ///
 /// The slot offset is derived from the trusted association layout and is never
-/// supplied by the peer. The request variant determines the transfer direction.
+/// supplied by the peer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SharedBufferDescriptor {
-    /// Slot used by this operation.
+pub struct SharedBufferSlotDescriptor {
+    /// Slot containing this segment.
     pub slot_index: SharedBufferSlotIndex,
-    /// Number of bytes used from the start of the slot.
+    /// Number of sequence bytes stored from the start of the slot.
     pub length: u32,
 }
 
@@ -170,18 +170,6 @@ impl SharedBufferSequence {
             slot_count,
             length,
         })
-    }
-
-    /// Converts one slot descriptor into a one-slot sequence.
-    #[must_use]
-    pub fn from_descriptor(descriptor: SharedBufferDescriptor) -> Self {
-        let mut slot_indices = [SharedBufferSlotIndex::default(); MAX_SHARED_BUFFER_SEQUENCE_SLOTS];
-        slot_indices[0] = descriptor.slot_index;
-        Self {
-            slot_indices,
-            slot_count: 1,
-            length: descriptor.length,
-        }
     }
 
     /// Returns the slots in transfer order.
@@ -236,7 +224,7 @@ pub struct SharedBufferSequenceDescriptors {
 }
 
 impl Iterator for SharedBufferSequenceDescriptors {
-    type Item = SharedBufferDescriptor;
+    type Item = SharedBufferSlotDescriptor;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.next_slot == self.slot_count {
@@ -246,7 +234,7 @@ impl Iterator for SharedBufferSequenceDescriptors {
         self.next_slot += 1;
         let length = self.remaining_length.min(self.slot_size);
         self.remaining_length -= length;
-        Some(SharedBufferDescriptor { slot_index, length })
+        Some(SharedBufferSlotDescriptor { slot_index, length })
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -329,15 +317,15 @@ mod tests {
         assert_eq!(
             descriptors,
             [
-                SharedBufferDescriptor {
+                SharedBufferSlotDescriptor {
                     slot_index: SharedBufferSlotIndex(1),
                     length: 8,
                 },
-                SharedBufferDescriptor {
+                SharedBufferSlotDescriptor {
                     slot_index: SharedBufferSlotIndex(3),
                     length: 8,
                 },
-                SharedBufferDescriptor {
+                SharedBufferSlotDescriptor {
                     slot_index: SharedBufferSlotIndex(4),
                     length: 2,
                 },
@@ -390,7 +378,7 @@ mod tests {
                 .descriptors(layout)
                 .unwrap()
                 .collect::<alloc::vec::Vec<_>>(),
-            [SharedBufferDescriptor {
+            [SharedBufferSlotDescriptor {
                 slot_index: SharedBufferSlotIndex(100),
                 length: 8,
             }]

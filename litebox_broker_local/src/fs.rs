@@ -14,9 +14,7 @@ use litebox_broker_protocol::fs::{
     try_decode_directory_entries,
 };
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, FileRequest, FileResponse};
-use litebox_broker_protocol::shared_buffer::{
-    SHARED_BUFFER_SLOT_SIZE, SharedBufferDescriptor, SharedBufferSequence,
-};
+use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
 use litebox_broker_transport::channel::LocalCallChannel;
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
@@ -29,18 +27,18 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// # Panics
     ///
-    /// Panics if the buffer descriptor is inconsistent or the broker returns
+    /// Panics if the buffer sequence is inconsistent or the broker returns
     /// a response for another file operation.
     pub fn open_file(
         &self,
-        path_buffer: SharedBufferDescriptor,
+        path_buffer: SharedBufferSequence,
         path: &str,
         user: FileUser,
         access: FileAccessMode,
         flags: FileOpenFlags,
         mode: FileMode,
     ) -> Result<FileOperationResult<ObjectHandle>, Channel::Error> {
-        self.write_file_buffer(path_buffer, path.as_bytes())?;
+        self.write_file_buffer(path_buffer, path.as_bytes(), SHARED_BUFFER_SLOT_SIZE)?;
         match self.request_file(FileRequest::Open(OpenFileRequest {
             path: path_buffer,
             user,
@@ -58,7 +56,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// # Panics
     ///
-    /// Panics if the buffer descriptor is inconsistent or the broker returns
+    /// Panics if the buffer sequence is inconsistent or the broker returns
     /// an invalid response.
     pub fn read_file(
         &self,
@@ -67,7 +65,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         destination: &mut [u8],
         offset: Option<u64>,
     ) -> Result<FileOperationResult<usize>, Channel::Error> {
-        self.validate_file_sequence(buffer, destination.len())?;
+        self.validate_file_buffer(buffer, destination.len(), MAX_FILE_TRANSFER_SIZE)?;
         match self.request_file(FileRequest::Read(ReadFileRequest {
             handle,
             buffer,
@@ -79,7 +77,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                     "broker returned oversized file read"
                 );
                 let read = response.read as usize;
-                self.read_file_sequence(buffer, &mut destination[..read]);
+                self.read_shared_buffer(buffer, &mut destination[..read]);
                 Ok(Ok(read))
             }
             FileResponse::Failed(error) => Ok(Err(error)),
@@ -91,7 +89,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// # Panics
     ///
-    /// Panics if the buffer descriptor is inconsistent or the broker returns
+    /// Panics if the buffer sequence is inconsistent or the broker returns
     /// an invalid response.
     pub fn write_file(
         &self,
@@ -100,7 +98,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         data: &[u8],
         offset: Option<u64>,
     ) -> Result<FileOperationResult<usize>, Channel::Error> {
-        self.write_file_sequence(buffer, data)?;
+        self.write_file_buffer(buffer, data, MAX_FILE_TRANSFER_SIZE)?;
         match self.request_file(FileRequest::Write(WriteFileRequest {
             handle,
             buffer,
@@ -166,15 +164,15 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// # Panics
     ///
-    /// Panics if the buffer descriptor is inconsistent or the broker returns
+    /// Panics if the buffer sequence is inconsistent or the broker returns
     /// an invalid response or directory payload.
     pub fn read_directory(
         &self,
         handle: ObjectHandle,
-        buffer: SharedBufferDescriptor,
+        buffer: SharedBufferSequence,
         start_index: u64,
     ) -> Result<DirectoryReadResult, Channel::Error> {
-        self.validate_file_buffer(buffer, buffer.length as usize)?;
+        self.validate_file_buffer(buffer, buffer.length() as usize, SHARED_BUFFER_SLOT_SIZE)?;
         match self.request_file(FileRequest::ReadDirectory(ReadDirectoryRequest {
             handle,
             buffer,
@@ -182,7 +180,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }))? {
             FileResponse::ReadDirectory(response) => {
                 assert!(
-                    response.length <= buffer.length,
+                    response.length <= buffer.length(),
                     "broker returned oversized file directory payload"
                 );
                 let mut payload = Vec::new();
@@ -190,9 +188,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                     .try_reserve_exact(response.length as usize)
                     .map_err(|_| BrokerLocalError::Broker(ErrorCode::OutOfMemory))?;
                 payload.resize(response.length as usize, 0);
-                self.shared_buffers
-                    .read(buffer.slot_index, &mut payload)
-                    .expect("validated shared file directory range must be accessible");
+                self.read_shared_buffer(buffer, &mut payload);
                 let entries = match try_decode_directory_entries(&payload) {
                     Ok(entries) => entries,
                     Err(DirectoryTransferError::OutOfMemory) => {
@@ -227,15 +223,15 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// # Panics
     ///
-    /// Panics if the buffer descriptor is inconsistent or the broker returns
+    /// Panics if the buffer sequence is inconsistent or the broker returns
     /// a response for another file operation.
     pub fn path_file_status(
         &self,
-        path_buffer: SharedBufferDescriptor,
+        path_buffer: SharedBufferSequence,
         path: &str,
         user: FileUser,
     ) -> Result<FileOperationResult<FileStatus>, Channel::Error> {
-        self.write_file_buffer(path_buffer, path.as_bytes())?;
+        self.write_file_buffer(path_buffer, path.as_bytes(), SHARED_BUFFER_SLOT_SIZE)?;
         match self.request_file(FileRequest::PathStatus(PathFileStatusRequest {
             path: path_buffer,
             user,
@@ -272,16 +268,16 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// # Panics
     ///
-    /// Panics if the buffer descriptor is inconsistent or the broker returns
+    /// Panics if the buffer sequence is inconsistent or the broker returns
     /// a response for another file operation.
     pub fn chmod_file(
         &self,
-        path_buffer: SharedBufferDescriptor,
+        path_buffer: SharedBufferSequence,
         path: &str,
         user: FileUser,
         mode: FileMode,
     ) -> Result<FileOperationResult<()>, Channel::Error> {
-        self.write_file_buffer(path_buffer, path.as_bytes())?;
+        self.write_file_buffer(path_buffer, path.as_bytes(), SHARED_BUFFER_SLOT_SIZE)?;
         match self.request_file(FileRequest::Chmod(ChmodFileRequest {
             path: path_buffer,
             user,
@@ -297,17 +293,17 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// # Panics
     ///
-    /// Panics if the buffer descriptor is inconsistent or the broker returns
+    /// Panics if the buffer sequence is inconsistent or the broker returns
     /// a response for another file operation.
     pub fn chown_file(
         &self,
-        path_buffer: SharedBufferDescriptor,
+        path_buffer: SharedBufferSequence,
         path: &str,
         acting_user: FileUser,
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<FileOperationResult<()>, Channel::Error> {
-        self.write_file_buffer(path_buffer, path.as_bytes())?;
+        self.write_file_buffer(path_buffer, path.as_bytes(), SHARED_BUFFER_SLOT_SIZE)?;
         match self.request_file(FileRequest::Chown(ChownFileRequest {
             path: path_buffer,
             acting_user,
@@ -324,15 +320,15 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// # Panics
     ///
-    /// Panics if the buffer descriptor is inconsistent or the broker returns
+    /// Panics if the buffer sequence is inconsistent or the broker returns
     /// a response for another file operation.
     pub fn unlink_file(
         &self,
-        path_buffer: SharedBufferDescriptor,
+        path_buffer: SharedBufferSequence,
         path: &str,
         user: FileUser,
     ) -> Result<FileOperationResult<()>, Channel::Error> {
-        self.write_file_buffer(path_buffer, path.as_bytes())?;
+        self.write_file_buffer(path_buffer, path.as_bytes(), SHARED_BUFFER_SLOT_SIZE)?;
         match self.request_file(FileRequest::Unlink(UnlinkFileRequest {
             path: path_buffer,
             user,
@@ -347,16 +343,16 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// # Panics
     ///
-    /// Panics if the buffer descriptor is inconsistent or the broker returns
+    /// Panics if the buffer sequence is inconsistent or the broker returns
     /// a response for another file operation.
     pub fn mkdir_file(
         &self,
-        path_buffer: SharedBufferDescriptor,
+        path_buffer: SharedBufferSequence,
         path: &str,
         user: FileUser,
         mode: FileMode,
     ) -> Result<FileOperationResult<()>, Channel::Error> {
-        self.write_file_buffer(path_buffer, path.as_bytes())?;
+        self.write_file_buffer(path_buffer, path.as_bytes(), SHARED_BUFFER_SLOT_SIZE)?;
         match self.request_file(FileRequest::Mkdir(MkdirFileRequest {
             path: path_buffer,
             user,
@@ -372,15 +368,15 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// # Panics
     ///
-    /// Panics if the buffer descriptor is inconsistent or the broker returns
+    /// Panics if the buffer sequence is inconsistent or the broker returns
     /// a response for another file operation.
     pub fn rmdir_file(
         &self,
-        path_buffer: SharedBufferDescriptor,
+        path_buffer: SharedBufferSequence,
         path: &str,
         user: FileUser,
     ) -> Result<FileOperationResult<()>, Channel::Error> {
-        self.write_file_buffer(path_buffer, path.as_bytes())?;
+        self.write_file_buffer(path_buffer, path.as_bytes(), SHARED_BUFFER_SLOT_SIZE)?;
         match self.request_file(FileRequest::Rmdir(RmdirFileRequest {
             path: path_buffer,
             user,
@@ -393,95 +389,26 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
 
     fn validate_file_buffer(
         &self,
-        buffer: SharedBufferDescriptor,
-        expected_length: usize,
-    ) -> Result<(), Channel::Error> {
-        if buffer.length > SHARED_BUFFER_SLOT_SIZE {
-            return Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted));
-        }
-        assert_eq!(
-            expected_length, buffer.length as usize,
-            "shared file data must match its descriptor"
-        );
-        self.shared_buffers
-            .layout()
-            .range(buffer.slot_index, expected_length)
-            .expect("shared file descriptor must identify a valid slot range");
-        Ok(())
-    }
-
-    fn validate_file_sequence(
-        &self,
         buffer: SharedBufferSequence,
         expected_length: usize,
+        max_length: u32,
     ) -> Result<(), Channel::Error> {
-        if buffer.length() > MAX_FILE_TRANSFER_SIZE {
+        if buffer.length() > max_length {
             return Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted));
         }
-        assert_eq!(
-            expected_length,
-            buffer.length() as usize,
-            "shared file data must match its sequence"
-        );
-        buffer
-            .descriptors(self.shared_buffers.layout())
-            .expect("shared file sequence must identify valid slot ranges");
+        self.validate_shared_buffer(buffer, expected_length);
         Ok(())
     }
 
     fn write_file_buffer(
         &self,
-        buffer: SharedBufferDescriptor,
-        data: &[u8],
-    ) -> Result<(), Channel::Error> {
-        self.validate_file_buffer(buffer, data.len())?;
-        self.shared_buffers
-            .write(buffer.slot_index, data)
-            .expect("validated shared file write range must be accessible");
-        Ok(())
-    }
-
-    fn write_file_sequence(
-        &self,
         buffer: SharedBufferSequence,
         data: &[u8],
+        max_length: u32,
     ) -> Result<(), Channel::Error> {
-        self.validate_file_sequence(buffer, data.len())?;
-        let mut offset = 0;
-        for descriptor in buffer
-            .descriptors(self.shared_buffers.layout())
-            .expect("validated shared file sequence must remain valid")
-        {
-            let end = offset + descriptor.length as usize;
-            self.shared_buffers
-                .write(descriptor.slot_index, &data[offset..end])
-                .expect("validated shared file sequence must be accessible");
-            offset = end;
-        }
+        self.validate_file_buffer(buffer, data.len(), max_length)?;
+        self.write_shared_buffer(buffer, data);
         Ok(())
-    }
-
-    fn read_file_sequence(&self, buffer: SharedBufferSequence, destination: &mut [u8]) {
-        let mut offset = 0;
-        for descriptor in buffer
-            .descriptors(self.shared_buffers.layout())
-            .expect("validated shared file sequence must remain valid")
-        {
-            if offset == destination.len() {
-                break;
-            }
-            let length = (destination.len() - offset).min(descriptor.length as usize);
-            let end = offset + length;
-            self.shared_buffers
-                .read(descriptor.slot_index, &mut destination[offset..end])
-                .expect("validated shared file sequence must be accessible");
-            offset = end;
-        }
-        assert_eq!(
-            offset,
-            destination.len(),
-            "shared file sequence must cover the broker read"
-        );
     }
 
     fn request_file(&self, request: FileRequest) -> Result<FileResponse, Channel::Error> {
@@ -562,7 +489,7 @@ mod tests {
         assert_eq!(
             local
                 .open_file(
-                    descriptor(0, 5),
+                    sequence([0], 5),
                     "/file",
                     ROOT,
                     FileAccessMode::ReadWrite,
@@ -600,7 +527,7 @@ mod tests {
         );
         assert_eq!(
             local
-                .path_file_status(descriptor(3, 5), "/file", ROOT)
+                .path_file_status(sequence([3], 5), "/file", ROOT)
                 .unwrap(),
             Ok(status)
         );
@@ -608,7 +535,7 @@ mod tests {
             local
                 .read_directory(
                     handle,
-                    descriptor(4, u32::try_from(directory_payload.len()).unwrap()),
+                    sequence([4], u32::try_from(directory_payload.len()).unwrap()),
                     0,
                 )
                 .unwrap(),
@@ -713,13 +640,6 @@ mod tests {
             Ok(length)
         );
         assert_eq!(output, data);
-    }
-
-    const fn descriptor(slot: u32, length: u32) -> SharedBufferDescriptor {
-        SharedBufferDescriptor {
-            slot_index: SharedBufferSlotIndex(slot),
-            length,
-        }
     }
 
     fn sequence<const N: usize>(slots: [u32; N], length: u32) -> SharedBufferSequence {

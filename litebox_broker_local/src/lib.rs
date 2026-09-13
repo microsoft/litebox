@@ -37,7 +37,7 @@ use litebox_broker_protocol::message::{
     BrokerRequest, BrokerResponse, BrokerResult,
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
-use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_LAYOUT;
+use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SharedBufferSequence};
 use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, ObjectHandle, RequestId};
 use litebox_broker_transport::channel::{
     LocalCallChannel, LocalNotificationChannel, LocalSetupChannel,
@@ -49,7 +49,7 @@ pub use error::{BrokerLocalError, Result};
 /// Typed broker-local control adapter for broker operations.
 ///
 /// The shared-buffer pool belongs to the broker association. Payload request
-/// descriptors identify operation-scoped slots managed by the caller.
+/// sequences identify operation-scoped slots managed by the caller.
 pub struct BrokerLocal<Channel: LocalCallChannel> {
     channel: Channel,
     shared_buffers: SharedBufferPool<Arc<dyn SharedMemory>>,
@@ -186,6 +186,59 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
+    fn validate_shared_buffer(&self, buffer: SharedBufferSequence, expected_length: usize) {
+        assert_eq!(
+            expected_length,
+            buffer.length() as usize,
+            "shared data must match its buffer sequence"
+        );
+        buffer
+            .descriptors(self.shared_buffers.layout())
+            .expect("shared buffer sequence must identify valid slot ranges");
+    }
+
+    fn write_shared_buffer(&self, buffer: SharedBufferSequence, data: &[u8]) {
+        self.validate_shared_buffer(buffer, data.len());
+        let mut offset = 0;
+        for descriptor in buffer
+            .descriptors(self.shared_buffers.layout())
+            .expect("validated shared buffer sequence must remain valid")
+        {
+            let end = offset + descriptor.length as usize;
+            self.shared_buffers
+                .write(descriptor.slot_index, &data[offset..end])
+                .expect("validated shared buffer sequence must be accessible");
+            offset = end;
+        }
+    }
+
+    fn read_shared_buffer(&self, buffer: SharedBufferSequence, destination: &mut [u8]) {
+        assert!(
+            destination.len() <= buffer.length() as usize,
+            "shared buffer sequence must cover the destination"
+        );
+        let mut offset = 0;
+        for descriptor in buffer
+            .descriptors(self.shared_buffers.layout())
+            .expect("shared buffer sequence must identify valid slot ranges")
+        {
+            if offset == destination.len() {
+                break;
+            }
+            let length = (destination.len() - offset).min(descriptor.length as usize);
+            let end = offset + length;
+            self.shared_buffers
+                .read(descriptor.slot_index, &mut destination[offset..end])
+                .expect("validated shared buffer sequence must be accessible");
+            offset = end;
+        }
+        assert_eq!(
+            offset,
+            destination.len(),
+            "shared buffer sequence must cover the destination"
+        );
+    }
+
     /// Checks the current readiness of a broker-owned object.
     ///
     /// # Panics
@@ -242,7 +295,7 @@ mod tests {
     use litebox_broker_protocol::ProtocolVersion;
     use litebox_broker_protocol::message::{ReadinessNotification, StdioRequest, StdioResponse};
     use litebox_broker_protocol::readiness::ReadinessFlags;
-    use litebox_broker_protocol::shared_buffer::{SharedBufferDescriptor, SharedBufferSlotIndex};
+    use litebox_broker_protocol::shared_buffer::{SharedBufferSequence, SharedBufferSlotIndex};
     use litebox_broker_protocol::stdio::{
         IsTerminalStdioRequest, IsTerminalStdioResponse, ReadStdioRequest, ReadStdioResponse,
         StdioOutputStream, StdioStream, WriteStdioRequest, WriteStdioResponse,
@@ -301,10 +354,7 @@ mod tests {
 
     #[test]
     fn write_stdio_stages_the_requested_stream_and_buffer() {
-        let descriptor = SharedBufferDescriptor {
-            slot_index: SharedBufferSlotIndex(2),
-            length: 3,
-        };
+        let buffer = sequence(2, 3);
         let channel = FakeControlChannel::new(
             None,
             Some(BrokerResult::Stdio(StdioResponse::Write(
@@ -319,7 +369,7 @@ mod tests {
 
         assert_eq!(
             local
-                .write_stdio(StdioOutputStream::Stderr, descriptor, b"err")
+                .write_stdio(StdioOutputStream::Stderr, buffer, b"err")
                 .unwrap(),
             2
         );
@@ -329,7 +379,7 @@ mod tests {
                 request_id: RequestId(0),
                 operation: BrokerOperation::Stdio(StdioRequest::Write(WriteStdioRequest {
                     stream: StdioOutputStream::Stderr,
-                    buffer: descriptor,
+                    buffer,
                 })),
             })
         );
@@ -337,10 +387,7 @@ mod tests {
 
     #[test]
     fn read_stdio_requests_and_reads_the_shared_buffer() {
-        let descriptor = SharedBufferDescriptor {
-            slot_index: SharedBufferSlotIndex(2),
-            length: 3,
-        };
+        let buffer = sequence(2, 3);
         let channel = FakeControlChannel::new(
             None,
             Some(BrokerResult::Stdio(StdioResponse::Read(
@@ -354,15 +401,13 @@ mod tests {
         };
         let mut output = [0xff; 3];
 
-        assert_eq!(local.read_stdio(descriptor, &mut output).unwrap(), 2);
+        assert_eq!(local.read_stdio(buffer, &mut output).unwrap(), 2);
         assert_eq!(output, [0, 0, 0xff]);
         assert_eq!(
             local.channel.sent_request.borrow().clone(),
             Some(BrokerRequest {
                 request_id: RequestId(0),
-                operation: BrokerOperation::Stdio(StdioRequest::Read(ReadStdioRequest {
-                    buffer: descriptor,
-                })),
+                operation: BrokerOperation::Stdio(StdioRequest::Read(ReadStdioRequest { buffer })),
             })
         );
     }
@@ -393,6 +438,10 @@ mod tests {
                 )),
             })
         );
+    }
+
+    fn sequence(slot: u32, length: u32) -> SharedBufferSequence {
+        SharedBufferSequence::new(&[SharedBufferSlotIndex(slot)], length).unwrap()
     }
 
     #[test]

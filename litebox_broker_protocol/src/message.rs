@@ -18,7 +18,7 @@ use crate::pipe::{
     WritePipeResponse,
 };
 use crate::readiness::ReadinessFlags;
-use crate::shared_buffer::SharedBufferDescriptor;
+use crate::shared_buffer::SharedBufferSequence;
 use crate::socket::{
     AcceptSocketRequest, AcceptSocketResponse, BindSocketRequest, BindSocketResponse,
     ConnectSocketRequest, ConnectSocketResponse, CreateSocketRequest, CreateSocketResponse,
@@ -55,11 +55,66 @@ pub enum BrokerOperation {
     /// Socket object request family.
     Socket(SocketRequest),
     /// Fill a shared buffer with cryptographically secure random bytes.
-    FillRandom(SharedBufferDescriptor),
+    FillRandom(SharedBufferSequence),
     /// Standard-I/O request family.
     Stdio(StdioRequest),
     /// File request family.
     File(FileRequest),
+}
+
+impl BrokerOperation {
+    /// Returns the operation-scoped shared-buffer sequence, if this operation uses one.
+    #[must_use]
+    pub const fn shared_buffer(&self) -> Option<SharedBufferSequence> {
+        match self {
+            Self::Pipe(
+                PipeRequest::Read(ReadPipeRequest { buffer, .. })
+                | PipeRequest::Write(WritePipeRequest { buffer, .. }),
+            )
+            | Self::Socket(
+                SocketRequest::Send(SendSocketRequest { buffer, .. })
+                | SocketRequest::SendTo(SendToSocketRequest { buffer, .. })
+                | SocketRequest::Receive(ReceiveSocketRequest { buffer, .. })
+                | SocketRequest::ReceiveFrom(ReceiveFromSocketRequest { buffer, .. }),
+            )
+            | Self::FillRandom(buffer)
+            | Self::Stdio(
+                StdioRequest::Read(ReadStdioRequest { buffer })
+                | StdioRequest::Write(WriteStdioRequest { buffer, .. }),
+            )
+            | Self::File(
+                FileRequest::Open(OpenFileRequest { path: buffer, .. })
+                | FileRequest::Read(ReadFileRequest { buffer, .. })
+                | FileRequest::Write(WriteFileRequest { buffer, .. })
+                | FileRequest::ReadDirectory(ReadDirectoryRequest { buffer, .. })
+                | FileRequest::PathStatus(PathFileStatusRequest { path: buffer, .. })
+                | FileRequest::Chmod(ChmodFileRequest { path: buffer, .. })
+                | FileRequest::Chown(ChownFileRequest { path: buffer, .. })
+                | FileRequest::Unlink(UnlinkFileRequest { path: buffer, .. })
+                | FileRequest::Mkdir(MkdirFileRequest { path: buffer, .. })
+                | FileRequest::Rmdir(RmdirFileRequest { path: buffer, .. }),
+            ) => Some(*buffer),
+            Self::CloseObject(_)
+            | Self::CheckReadiness(_)
+            | Self::Event(_)
+            | Self::Pipe(PipeRequest::Create(_))
+            | Self::Socket(
+                SocketRequest::Create(_)
+                | SocketRequest::Connect(_)
+                | SocketRequest::Bind(_)
+                | SocketRequest::Listen(_)
+                | SocketRequest::Accept(_)
+                | SocketRequest::Shutdown(_)
+                | SocketRequest::SetTcpOption(_)
+                | SocketRequest::GetTcpOption(_)
+                | SocketRequest::Status(_),
+            )
+            | Self::Stdio(StdioRequest::IsTerminal(_))
+            | Self::File(
+                FileRequest::Seek(_) | FileRequest::Truncate(_) | FileRequest::HandleStatus(_),
+            ) => None,
+        }
+    }
 }
 
 /// Request sent over an active broker control channel.

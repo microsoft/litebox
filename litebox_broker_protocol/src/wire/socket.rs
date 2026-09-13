@@ -97,20 +97,20 @@ pub(super) fn encode_socket_request(encoder: &mut Encoder, request: SocketReques
         SocketRequest::Send(request) => {
             encoder.u8(SOCKET_TAG_SEND);
             encoder.handle(request.handle);
-            encoder.shared_buffer_descriptor(request.buffer);
+            encoder.shared_buffer_sequence(request.buffer);
             encoder.u32(request.flags.0);
         }
         SocketRequest::SendTo(request) => {
             encoder.u8(SOCKET_TAG_SEND_TO);
             encoder.handle(request.handle);
-            encoder.shared_buffer_descriptor(request.buffer);
+            encoder.shared_buffer_sequence(request.buffer);
             encoder.u32(request.flags.0);
             encode_optional_address(encoder, request.destination);
         }
         SocketRequest::Receive(request) => {
             encoder.u8(SOCKET_TAG_RECEIVE);
             encoder.handle(request.handle);
-            encoder.shared_buffer_descriptor(request.buffer);
+            encoder.shared_buffer_sequence(request.buffer);
             encoder.u32(request.flags.0);
             encoder.u32(request.peek_offset);
             encoder.u32(request.peek_length);
@@ -118,7 +118,7 @@ pub(super) fn encode_socket_request(encoder: &mut Encoder, request: SocketReques
         SocketRequest::ReceiveFrom(request) => {
             encoder.u8(SOCKET_TAG_RECEIVE_FROM);
             encoder.handle(request.handle);
-            encoder.shared_buffer_descriptor(request.buffer);
+            encoder.shared_buffer_sequence(request.buffer);
             encoder.u32(request.flags.0);
         }
         SocketRequest::Shutdown(request) => {
@@ -184,25 +184,25 @@ pub(super) fn decode_socket_request(decoder: &mut Decoder<'_>) -> Result<SocketR
         })),
         SOCKET_TAG_SEND => Ok(SocketRequest::Send(SendSocketRequest {
             handle: decoder.handle()?,
-            buffer: decoder.shared_buffer_descriptor()?,
+            buffer: decoder.shared_buffer_sequence()?,
             flags: SendFlags(decoder.u32()?),
         })),
         SOCKET_TAG_SEND_TO => Ok(SocketRequest::SendTo(SendToSocketRequest {
             handle: decoder.handle()?,
-            buffer: decoder.shared_buffer_descriptor()?,
+            buffer: decoder.shared_buffer_sequence()?,
             flags: SendFlags(decoder.u32()?),
             destination: decode_optional_address(decoder)?,
         })),
         SOCKET_TAG_RECEIVE => Ok(SocketRequest::Receive(ReceiveSocketRequest {
             handle: decoder.handle()?,
-            buffer: decoder.shared_buffer_descriptor()?,
+            buffer: decoder.shared_buffer_sequence()?,
             flags: ReceiveFlags(decoder.u32()?),
             peek_offset: decoder.u32()?,
             peek_length: decoder.u32()?,
         })),
         SOCKET_TAG_RECEIVE_FROM => Ok(SocketRequest::ReceiveFrom(ReceiveFromSocketRequest {
             handle: decoder.handle()?,
-            buffer: decoder.shared_buffer_descriptor()?,
+            buffer: decoder.shared_buffer_sequence()?,
             flags: ReceiveFromFlags(decoder.u32()?),
         })),
         SOCKET_TAG_SHUTDOWN => Ok(SocketRequest::Shutdown(ShutdownSocketRequest {

@@ -11,7 +11,7 @@ use bitflags::bitflags;
 use thiserror::Error;
 
 use crate::ObjectHandle;
-use crate::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferDescriptor, SharedBufferSequence};
+use crate::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
 
 /// Maximum number of shared-buffer slots used by one file read or write.
 pub const MAX_FILE_TRANSFER_SLOT_COUNT: u32 = 8;
@@ -300,7 +300,7 @@ impl core::ops::BitOr for FileOpenFlags {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpenFileRequest {
     /// Shared-buffer region containing one absolute UTF-8 path.
-    pub path: SharedBufferDescriptor,
+    pub path: SharedBufferSequence,
     /// Caller identity for permission checks.
     pub user: FileUser,
     /// Requested access mode.
@@ -389,7 +389,7 @@ pub struct ReadDirectoryRequest {
     /// Broker-owned directory handle.
     pub handle: ObjectHandle,
     /// Shared-buffer destination for encoded entries.
-    pub buffer: SharedBufferDescriptor,
+    pub buffer: SharedBufferSequence,
     /// Entry index at which this response should begin.
     pub start_index: u64,
 }
@@ -407,7 +407,7 @@ pub struct ReadDirectoryResponse {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PathFileStatusRequest {
     /// Shared-buffer region containing one absolute UTF-8 path.
-    pub path: SharedBufferDescriptor,
+    pub path: SharedBufferSequence,
     /// Caller identity for permission checks.
     pub user: FileUser,
 }
@@ -423,7 +423,7 @@ pub struct HandleFileStatusRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChmodFileRequest {
     /// Shared-buffer region containing one absolute UTF-8 path.
-    pub path: SharedBufferDescriptor,
+    pub path: SharedBufferSequence,
     /// Caller identity for permission checks.
     pub user: FileUser,
     /// New mode bits.
@@ -434,7 +434,7 @@ pub struct ChmodFileRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChownFileRequest {
     /// Shared-buffer region containing one absolute UTF-8 path.
-    pub path: SharedBufferDescriptor,
+    pub path: SharedBufferSequence,
     /// Caller identity for permission checks.
     pub acting_user: FileUser,
     /// New user ID, if changed.
@@ -447,7 +447,7 @@ pub struct ChownFileRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UnlinkFileRequest {
     /// Shared-buffer region containing one absolute UTF-8 path.
-    pub path: SharedBufferDescriptor,
+    pub path: SharedBufferSequence,
     /// Caller identity for permission checks.
     pub user: FileUser,
 }
@@ -456,7 +456,7 @@ pub struct UnlinkFileRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MkdirFileRequest {
     /// Shared-buffer region containing one absolute UTF-8 path.
-    pub path: SharedBufferDescriptor,
+    pub path: SharedBufferSequence,
     /// Caller identity for permission checks.
     pub user: FileUser,
     /// New directory mode.
@@ -467,7 +467,7 @@ pub struct MkdirFileRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RmdirFileRequest {
     /// Shared-buffer region containing one absolute UTF-8 path.
-    pub path: SharedBufferDescriptor,
+    pub path: SharedBufferSequence,
     /// Caller identity for permission checks.
     pub user: FileUser,
 }

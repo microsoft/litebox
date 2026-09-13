@@ -517,8 +517,7 @@ mod tests {
         BrokerHandshakeResponse, BrokerNotification, BrokerOperation,
     };
     use litebox_broker_protocol::shared_buffer::{
-        SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SharedBufferDescriptor,
-        SharedBufferSlotIndex,
+        SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SharedBufferSequence, SharedBufferSlotIndex,
     };
     use litebox_broker_protocol::stdio::StdioOutputStream;
     use litebox_broker_transport::channel::{
@@ -923,10 +922,7 @@ mod tests {
     fn a_stalled_request_queue_fails_after_its_deadline() {
         let request = |request_id| BrokerRequest {
             request_id: RequestId(request_id),
-            operation: BrokerOperation::FillRandom(SharedBufferDescriptor {
-                slot_index: SharedBufferSlotIndex(0),
-                length: 1,
-            }),
+            operation: BrokerOperation::FillRandom(sequence(0, 1)),
         };
         let shutdown_called = Arc::new(AtomicBool::new(false));
         let failure_coordinator =
@@ -1023,15 +1019,7 @@ mod tests {
             started: started_sender,
         });
         let (local, notifications, shutdown, outcome, host) = spawn_dispatch(readiness, provider);
-        let reader = std::thread::spawn(move || {
-            local.read_stdio(
-                SharedBufferDescriptor {
-                    slot_index: SharedBufferSlotIndex(0),
-                    length: 1,
-                },
-                &mut [0],
-            )
-        });
+        let reader = std::thread::spawn(move || local.read_stdio(sequence(0, 1), &mut [0]));
         started_receiver
             .recv_timeout(TEST_SETUP_TIMEOUT)
             .expect("broker stdin provider did not start reading");
@@ -1056,14 +1044,7 @@ mod tests {
         });
         let (local, notifications, shutdown, outcome, host) = spawn_dispatch(readiness, provider);
         let writer = std::thread::spawn(move || {
-            local.write_stdio(
-                StdioOutputStream::Stdout,
-                SharedBufferDescriptor {
-                    slot_index: SharedBufferSlotIndex(0),
-                    length: 1,
-                },
-                b"x",
-            )
+            local.write_stdio(StdioOutputStream::Stdout, sequence(0, 1), b"x")
         });
         started_receiver
             .recv_timeout(TEST_SETUP_TIMEOUT)
@@ -1078,5 +1059,9 @@ mod tests {
         assert!(dispatch_result.is_err());
         assert!(writer.join().unwrap().is_err());
         host.join().unwrap();
+    }
+
+    fn sequence(slot: u32, length: u32) -> SharedBufferSequence {
+        SharedBufferSequence::new(&[SharedBufferSlotIndex(slot)], length).unwrap()
     }
 }
