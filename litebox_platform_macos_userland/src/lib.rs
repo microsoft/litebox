@@ -1324,10 +1324,6 @@ unsafe extern "C" fn syscall_callback() {
         "ldr x0, [sp, #{frame_retaddr}]",
         "str x0, [x17, #{regs_pc}]",
         "mrs x0, nzcv",
-        "mrs x1, ssbs",
-        "orr x0, x0, x1",
-        "mrs x1, dit",
-        "orr x0, x0, x1",
         "str x0, [x17, #{regs_pstate}]",
         "ldr x0, [x17, #0]",
         "str x0, [x17, #{regs_orig_x0}]",
@@ -1511,8 +1507,6 @@ unsafe extern "C" fn switch_to_guest_via_outbound_stub(_: &mut ThreadContext) ->
         "msr fpcr, x1",
         "ldr x0, [x16, #{regs_pstate}]",
         "msr nzcv, x0",
-        "msr ssbs, x0",
-        "msr dit, x0",
         "ldp x0, x1, [x16, #0]",
         "ldp x2, x3, [x16, #16]",
         "ldp x4, x5, [x16, #32]",
@@ -2319,9 +2313,9 @@ mod tests {
             ..switch_to_guest_via_sigreturn_end as *const () as usize;
         let outbound = switch_to_guest_via_outbound_stub_start as *const () as usize
             ..switch_to_guest_via_outbound_stub_end as *const () as usize;
-        assert_eq!(syscall_prologue.len(), 76 * size_of::<u32>());
+        assert_eq!(syscall_prologue.len(), 72 * size_of::<u32>());
         assert_eq!(sigreturn.len(), 3 * size_of::<u32>());
-        assert_eq!(outbound.len(), 53 * size_of::<u32>());
+        assert_eq!(outbound.len(), 51 * size_of::<u32>());
     }
 
     #[test]
