@@ -1577,6 +1577,7 @@ dependencies = [
  "litebox_broker_host",
  "litebox_broker_local",
  "litebox_broker_platform_linux_userland",
+ "litebox_broker_platform_windows_userland",
  "litebox_broker_protocol",
  "litebox_broker_transport",
  "litebox_broker_transport_linux_userland",
