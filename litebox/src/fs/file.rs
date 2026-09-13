@@ -93,7 +93,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
                     .transpose()
                     .map_err(|_| ReadError::Io)?,
             )
-            .map_err(|error| broker_fd_error(error, ReadError::ClosedFd, ReadError::Io))?
+            .map_err(read_broker_error)?
             .map_err(read_error)
     }
 
@@ -114,7 +114,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
                     .transpose()
                     .map_err(|_| WriteError::Io)?,
             )
-            .map_err(|error| broker_fd_error(error, WriteError::ClosedFd, WriteError::Io))?
+            .map_err(write_broker_error)?
             .map_err(write_error)
     }
 
@@ -130,7 +130,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
         let offset = file
             .broker
             .seek_file(file.handle, offset, whence)
-            .map_err(|error| broker_fd_error(error, SeekError::ClosedFd, SeekError::Io))?
+            .map_err(seek_broker_error)?
             .map_err(seek_error)?;
         usize::try_from(offset).map_err(|_| SeekError::InvalidOffset)
     }
@@ -149,7 +149,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
                 u64::try_from(length).map_err(|_| TruncateError::Io)?,
                 reset_offset,
             )
-            .map_err(|error| broker_fd_error(error, TruncateError::ClosedFd, TruncateError::Io))?
+            .map_err(truncate_broker_error)?
             .map_err(truncate_error)
     }
 
@@ -227,7 +227,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
         let file = self.broker_file(fd).ok_or(ReadDirError::ClosedFd)?;
         file.broker
             .read_directory(file.handle)
-            .map_err(|error| broker_fd_error(error, ReadDirError::ClosedFd, ReadDirError::Io))?
+            .map_err(read_directory_broker_error)?
             .map_err(read_dir_error)
     }
 
@@ -251,7 +251,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
         file.broker
             .handle_file_status(file.handle)
             .map_err(|error| {
-                broker_fd_error(error, FileStatusError::ClosedFd, FileStatusError::Io)
+                broker_fd_error(
+                    error,
+                    FileStatusError::ClosedFd,
+                    FileStatusError::Io,
+                    FileStatusError::Io,
+                )
             })?
             .map_err(file_status_error)
     }
@@ -358,14 +363,65 @@ impl Drop for BrokerFile {
     }
 }
 
-fn broker_fd_error<T>(error: crate::broker::error::BrokerControlError, closed: T, io: T) -> T {
+fn broker_fd_error<T>(
+    error: crate::broker::error::BrokerControlError,
+    closed: T,
+    invalid_rights: T,
+    io: T,
+) -> T {
     match error {
-        crate::broker::error::BrokerControlError::Broker(
-            ErrorCode::UnknownObject | ErrorCode::InvalidRights,
-        ) => closed,
+        crate::broker::error::BrokerControlError::Broker(ErrorCode::UnknownObject) => closed,
+        crate::broker::error::BrokerControlError::Broker(ErrorCode::InvalidRights) => {
+            invalid_rights
+        }
         crate::broker::error::BrokerControlError::AssociationFailed
         | crate::broker::error::BrokerControlError::Broker(_) => io,
     }
+}
+
+fn read_broker_error(error: crate::broker::error::BrokerControlError) -> ReadError {
+    broker_fd_error(
+        error,
+        ReadError::ClosedFd,
+        ReadError::NotForReading,
+        ReadError::Io,
+    )
+}
+
+fn write_broker_error(error: crate::broker::error::BrokerControlError) -> WriteError {
+    broker_fd_error(
+        error,
+        WriteError::ClosedFd,
+        WriteError::NotForWriting,
+        WriteError::Io,
+    )
+}
+
+fn truncate_broker_error(error: crate::broker::error::BrokerControlError) -> TruncateError {
+    broker_fd_error(
+        error,
+        TruncateError::ClosedFd,
+        TruncateError::NotForWriting,
+        TruncateError::Io,
+    )
+}
+
+fn seek_broker_error(error: crate::broker::error::BrokerControlError) -> SeekError {
+    broker_fd_error(
+        error,
+        SeekError::ClosedFd,
+        SeekError::NotForSeeking,
+        SeekError::Io,
+    )
+}
+
+fn read_directory_broker_error(error: crate::broker::error::BrokerControlError) -> ReadDirError {
+    broker_fd_error(
+        error,
+        ReadDirError::ClosedFd,
+        ReadDirError::NotForReading,
+        ReadDirError::Io,
+    )
 }
 
 // TODO: Define canonical per-operation protocol errors so these conversions can be removed without
@@ -408,7 +464,7 @@ fn open_error(error: FileError) -> OpenError {
 fn read_error(error: FileError) -> ReadError {
     match error {
         FileError::NotFile => ReadError::NotAFile,
-        FileError::NotForReading => ReadError::NotForReading,
+        FileError::AccessNotAllowed | FileError::NotForReading => ReadError::NotForReading,
         _ => ReadError::Io,
     }
 }
@@ -416,7 +472,7 @@ fn read_error(error: FileError) -> ReadError {
 fn write_error(error: FileError) -> WriteError {
     match error {
         FileError::NotFile => WriteError::NotAFile,
-        FileError::NotForWriting => WriteError::NotForWriting,
+        FileError::AccessNotAllowed | FileError::NotForWriting => WriteError::NotForWriting,
         _ => WriteError::Io,
     }
 }
@@ -424,6 +480,7 @@ fn write_error(error: FileError) -> WriteError {
 fn seek_error(error: FileError) -> SeekError {
     match error {
         FileError::NotFile => SeekError::NotAFile,
+        FileError::AccessNotAllowed => SeekError::NotForSeeking,
         FileError::InvalidOffset => SeekError::InvalidOffset,
         FileError::NonSeekable => SeekError::NonSeekable,
         _ => SeekError::Io,
@@ -433,7 +490,7 @@ fn seek_error(error: FileError) -> SeekError {
 fn truncate_error(error: FileError) -> TruncateError {
     match error {
         FileError::IsDirectory => TruncateError::IsDirectory,
-        FileError::NotForWriting => TruncateError::NotForWriting,
+        FileError::AccessNotAllowed | FileError::NotForWriting => TruncateError::NotForWriting,
         FileError::IsTerminalDevice => TruncateError::IsTerminalDevice,
         _ => TruncateError::Io,
     }
@@ -502,6 +559,7 @@ fn rmdir_error(error: FileError) -> RmdirError {
 fn read_dir_error(error: FileError) -> ReadDirError {
     match error {
         FileError::NotDirectory => ReadDirError::NotADirectory,
+        FileError::AccessNotAllowed | FileError::NotForReading => ReadDirError::NotForReading,
         _ => ReadDirError::Io,
     }
 }

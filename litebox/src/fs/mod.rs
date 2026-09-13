@@ -23,7 +23,7 @@ pub mod resolver;
 #[cfg(test)]
 mod file_tests;
 
-pub use file::{BrokerFile, Context, FileFd};
+pub use file::{BrokerFile, Context, FileFd, ResolvedPath};
 
 // TODO: Remove these implementation-facing compatibility modules once LiteBox uses the broker
 // file APIs exclusively. They temporarily preserve local filesystem construction while resolver
