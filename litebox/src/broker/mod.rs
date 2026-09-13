@@ -19,7 +19,7 @@ use litebox_broker_protocol::fs::{
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::readiness::ReadinessFlags;
-use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_SLOT_SIZE;
+use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_POOL_SIZE, SHARED_BUFFER_SLOT_SIZE};
 use litebox_broker_protocol::socket::{
     AcceptSocketResponse, MAX_SOCKET_TRANSFER_SIZE, MAX_UDP_DATAGRAM_SIZE,
     ReceiveFlags as BrokerReceiveFlags, ReceiveFromFlags as BrokerReceiveFromFlags,
@@ -391,21 +391,31 @@ where
         result
     }
 
-    fn acquire_shared_buffer(
+    fn acquire_shared_buffer_slot(
         &self,
-        length: u32,
+        length: usize,
     ) -> core::result::Result<SlotLease<'_, Platform>, BrokerControlError> {
-        self.slot_allocator.acquire(length).map_err(|_| {
+        if length > SHARED_BUFFER_SLOT_SIZE as usize {
+            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
+        }
+        let length =
+            u32::try_from(length).expect("shared-buffer slot length must fit in protocol u32");
+        self.slot_allocator.acquire_slot(length).map_err(|_| {
             self.fail_association();
             BrokerControlError::AssociationFailed
         })
     }
 
-    fn acquire_shared_buffer_sequence(
+    fn acquire_shared_buffer_slots(
         &self,
-        length: u32,
+        length: usize,
     ) -> core::result::Result<SlotLease<'_, Platform>, BrokerControlError> {
-        self.slot_allocator.acquire_sequence(length).map_err(|_| {
+        if length > SHARED_BUFFER_POOL_SIZE {
+            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
+        }
+        let length =
+            u32::try_from(length).expect("shared-buffer pool length must fit in protocol u32");
+        self.slot_allocator.acquire_slots(length).map_err(|_| {
             self.fail_association();
             BrokerControlError::AssociationFailed
         })
@@ -428,9 +438,7 @@ where
         if output.len() > MAX_RANDOM_TRANSFER_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
-        let length =
-            u32::try_from(output.len()).expect("validated random transfer length must fit in u32");
-        let lease = self.acquire_shared_buffer(length)?;
+        let lease = self.acquire_shared_buffer_slot(output.len())?;
         self.request(|local| local.fill_random(lease.descriptor(), output))
     }
 
@@ -448,9 +456,7 @@ where
         // Keep blocking stdin reads from consuming the broker's shared worker
         // pool when multiple guest threads read concurrently.
         let _read_guard = self.stdio_read_lock.lock();
-        let length = u32::try_from(data.len())
-            .expect("validated shared stdio transfer length must fit in u32");
-        let lease = self.acquire_shared_buffer(length)?;
+        let lease = self.acquire_shared_buffer_slot(data.len())?;
         self.request(|local| local.read_stdio(lease.descriptor(), data))
     }
 
@@ -462,9 +468,7 @@ where
         if data.len() > MAX_STDIO_TRANSFER_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
-        let length = u32::try_from(data.len())
-            .expect("validated shared stdio transfer length must fit in u32");
-        let lease = self.acquire_shared_buffer(length)?;
+        let lease = self.acquire_shared_buffer_slot(data.len())?;
         self.request(|local| local.write_stdio(stream, lease.descriptor(), data))
     }
 
@@ -539,9 +543,7 @@ where
         if data.len() > MAX_SOCKET_TRANSFER_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
-        let length = u32::try_from(data.len())
-            .expect("validated shared socket transfer length must fit in u32");
-        let lease = self.acquire_shared_buffer(length)?;
+        let lease = self.acquire_shared_buffer_slot(data.len())?;
         self.request(|local| local.send_socket(handle, lease.descriptor(), data, flags))
             .map(|result| match result {
                 Ok(sent) => SocketOutcome::Completed(sent),
@@ -561,9 +563,7 @@ where
         if data.len() > MAX_SOCKET_TRANSFER_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
-        let length = u32::try_from(data.len())
-            .expect("validated shared socket transfer length must fit in u32");
-        let lease = self.acquire_shared_buffer(length)?;
+        let lease = self.acquire_shared_buffer_slot(data.len())?;
         self.request(|local| {
             local.receive_socket(
                 litebox_broker_protocol::socket::ReceiveSocketRequest {
@@ -593,9 +593,7 @@ where
         if data.len() > MAX_UDP_DATAGRAM_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
-        let length =
-            u32::try_from(data.len()).expect("validated UDP datagram length must fit in u32");
-        let lease = self.acquire_shared_buffer(length)?;
+        let lease = self.acquire_shared_buffer_slot(data.len())?;
         self.request(|local| {
             local.send_to_socket(handle, lease.descriptor(), data, flags, destination)
         })
@@ -614,9 +612,7 @@ where
         if data.len() > MAX_UDP_DATAGRAM_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
-        let length =
-            u32::try_from(data.len()).expect("validated UDP receive length must fit in u32");
-        let lease = self.acquire_shared_buffer(length)?;
+        let lease = self.acquire_shared_buffer_slot(data.len())?;
         self.request(|local| local.receive_from_socket(handle, lease.descriptor(), data, flags))
             .map(|result| match result {
                 Ok(received) => SocketOutcome::Completed(received),
@@ -702,7 +698,7 @@ where
         data.try_reserve_exact(length as usize)
             .map_err(|_| BrokerControlError::Broker(ErrorCode::OutOfMemory))?;
         data.resize(length as usize, 0);
-        let lease = self.acquire_shared_buffer(length)?;
+        let lease = self.acquire_shared_buffer_slot(length as usize)?;
         let read = self.request(|local| local.read_pipe(handle, lease.descriptor(), &mut data))?;
         data.truncate(read);
         Ok(data)
@@ -716,9 +712,7 @@ where
         if data.len() > MAX_PIPE_TRANSFER_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
-        let length = u32::try_from(data.len())
-            .expect("validated shared pipe transfer length must fit in u32");
-        let lease = self.acquire_shared_buffer(length)?;
+        let lease = self.acquire_shared_buffer_slot(data.len())?;
         self.request(|local| local.write_pipe(handle, lease.descriptor(), data))
     }
 
@@ -731,8 +725,7 @@ where
         mode: FileMode,
     ) -> core::result::Result<core::result::Result<ObjectHandle, FileError>, BrokerControlError>
     {
-        let length = file_buffer_length(path.len())?;
-        let lease = self.acquire_shared_buffer(length)?;
+        let lease = self.acquire_shared_buffer_slot(path.len())?;
         self.request(|local| local.open_file(lease.descriptor(), path, user, access, flags, mode))
     }
 
@@ -742,9 +735,9 @@ where
         data: &mut [u8],
         offset: Option<u64>,
     ) -> core::result::Result<core::result::Result<usize, FileError>, BrokerControlError> {
-        let length = file_transfer_length(data.len().min(MAX_FILE_TRANSFER_SIZE as usize))?;
-        let data = &mut data[..length as usize];
-        let lease = self.acquire_shared_buffer_sequence(length)?;
+        let length = data.len().min(MAX_FILE_TRANSFER_SIZE as usize);
+        let data = &mut data[..length];
+        let lease = self.acquire_shared_buffer_slots(length)?;
         self.request(|local| local.read_file(handle, lease.sequence(), data, offset))
     }
 
@@ -754,9 +747,9 @@ where
         data: &[u8],
         offset: Option<u64>,
     ) -> core::result::Result<core::result::Result<usize, FileError>, BrokerControlError> {
-        let length = file_transfer_length(data.len().min(MAX_FILE_TRANSFER_SIZE as usize))?;
-        let data = &data[..length as usize];
-        let lease = self.acquire_shared_buffer_sequence(length)?;
+        let length = data.len().min(MAX_FILE_TRANSFER_SIZE as usize);
+        let data = &data[..length];
+        let lease = self.acquire_shared_buffer_slots(length)?;
         self.request(|local| local.write_file(handle, lease.sequence(), data, offset))
     }
 
@@ -788,7 +781,7 @@ where
         let mut entries = Vec::new();
         let mut start_index = 0;
         loop {
-            let lease = self.acquire_shared_buffer(SHARED_BUFFER_SLOT_SIZE)?;
+            let lease = self.acquire_shared_buffer_slot(SHARED_BUFFER_SLOT_SIZE as usize)?;
             let response = self
                 .request(|local| local.read_directory(handle, lease.descriptor(), start_index))?;
             let (mut chunk, next_index) = match response {
@@ -815,7 +808,7 @@ where
         path: &str,
         user: FileUser,
     ) -> core::result::Result<core::result::Result<FileStatus, FileError>, BrokerControlError> {
-        let lease = self.acquire_shared_buffer(file_buffer_length(path.len())?)?;
+        let lease = self.acquire_shared_buffer_slot(path.len())?;
         self.request(|local| local.path_file_status(lease.descriptor(), path, user))
     }
 
@@ -832,7 +825,7 @@ where
         user: FileUser,
         mode: FileMode,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
-        let lease = self.acquire_shared_buffer(file_buffer_length(path.len())?)?;
+        let lease = self.acquire_shared_buffer_slot(path.len())?;
         self.request(|local| local.chmod_file(lease.descriptor(), path, user, mode))
     }
 
@@ -843,7 +836,7 @@ where
         user: Option<u16>,
         group: Option<u16>,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
-        let lease = self.acquire_shared_buffer(file_buffer_length(path.len())?)?;
+        let lease = self.acquire_shared_buffer_slot(path.len())?;
         self.request(|local| local.chown_file(lease.descriptor(), path, acting_user, user, group))
     }
 
@@ -852,7 +845,7 @@ where
         path: &str,
         user: FileUser,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
-        let lease = self.acquire_shared_buffer(file_buffer_length(path.len())?)?;
+        let lease = self.acquire_shared_buffer_slot(path.len())?;
         self.request(|local| local.unlink_file(lease.descriptor(), path, user))
     }
 
@@ -862,7 +855,7 @@ where
         user: FileUser,
         mode: FileMode,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
-        let lease = self.acquire_shared_buffer(file_buffer_length(path.len())?)?;
+        let lease = self.acquire_shared_buffer_slot(path.len())?;
         self.request(|local| local.mkdir_file(lease.descriptor(), path, user, mode))
     }
 
@@ -871,7 +864,7 @@ where
         path: &str,
         user: FileUser,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
-        let lease = self.acquire_shared_buffer(file_buffer_length(path.len())?)?;
+        let lease = self.acquire_shared_buffer_slot(path.len())?;
         self.request(|local| local.rmdir_file(lease.descriptor(), path, user))
     }
 
@@ -882,20 +875,6 @@ where
     fn fail_connection(&self) {
         self.fail_association();
     }
-}
-
-fn file_transfer_length(length: usize) -> core::result::Result<u32, BrokerControlError> {
-    if length > MAX_FILE_TRANSFER_SIZE as usize {
-        return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
-    }
-    Ok(u32::try_from(length).expect("validated file transfer length must fit in u32"))
-}
-
-fn file_buffer_length(length: usize) -> core::result::Result<u32, BrokerControlError> {
-    if length > SHARED_BUFFER_SLOT_SIZE as usize {
-        return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
-    }
-    Ok(u32::try_from(length).expect("validated file buffer length must fit in u32"))
 }
 
 pub(crate) fn readiness_events(readiness: ReadinessFlags) -> Events {
