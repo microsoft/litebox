@@ -8,13 +8,13 @@ use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{
     ChmodFileRequest, ChownFileRequest, DirectoryPayloadError, DirectoryTransferError,
     FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileOpenFlags, FileSeekWhence,
-    FileStatus, FileUser, HandleFileStatusRequest, MAX_FILE_TRANSFER_SIZE, MkdirFileRequest,
-    OpenFileRequest, PathFileStatusRequest, ReadDirectoryRequest, ReadFileRequest,
-    RmdirFileRequest, SeekFileRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
-    try_decode_directory_entries,
+    FileStatus, FileUser, HandleFileStatusRequest, MAX_FILE_BUFFER_SIZE, MAX_FILE_TRANSFER_SIZE,
+    MkdirFileRequest, OpenFileRequest, PathFileStatusRequest, ReadDirectoryRequest,
+    ReadFileRequest, RmdirFileRequest, SeekFileRequest, TruncateFileRequest, UnlinkFileRequest,
+    WriteFileRequest, try_decode_directory_entries,
 };
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, FileRequest, FileResponse};
-use litebox_broker_protocol::shared_buffer::SharedBufferDescriptor;
+use litebox_broker_protocol::shared_buffer::{SharedBufferDescriptor, SharedBufferSequence};
 use litebox_broker_transport::channel::LocalCallChannel;
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
@@ -61,11 +61,11 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn read_file(
         &self,
         handle: ObjectHandle,
-        buffer: SharedBufferDescriptor,
+        buffer: SharedBufferSequence,
         destination: &mut [u8],
         offset: Option<u64>,
     ) -> Result<FileOperationResult<usize>, Channel::Error> {
-        self.validate_file_buffer(buffer, destination.len())?;
+        self.validate_file_sequence(buffer, destination.len())?;
         match self.request_file(FileRequest::Read(ReadFileRequest {
             handle,
             buffer,
@@ -77,9 +77,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                     "broker returned oversized file read"
                 );
                 let read = response.read as usize;
-                self.shared_buffers
-                    .read(buffer.slot_index, &mut destination[..read])
-                    .expect("validated shared file read range must be accessible");
+                self.read_file_sequence(buffer, &mut destination[..read]);
                 Ok(Ok(read))
             }
             FileResponse::Failed(error) => Ok(Err(error)),
@@ -96,11 +94,11 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn write_file(
         &self,
         handle: ObjectHandle,
-        buffer: SharedBufferDescriptor,
+        buffer: SharedBufferSequence,
         data: &[u8],
         offset: Option<u64>,
     ) -> Result<FileOperationResult<usize>, Channel::Error> {
-        self.write_file_buffer(buffer, data)?;
+        self.write_file_sequence(buffer, data)?;
         match self.request_file(FileRequest::Write(WriteFileRequest {
             handle,
             buffer,
@@ -396,7 +394,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         buffer: SharedBufferDescriptor,
         expected_length: usize,
     ) -> Result<(), Channel::Error> {
-        if buffer.length > MAX_FILE_TRANSFER_SIZE {
+        if buffer.length > MAX_FILE_BUFFER_SIZE {
             return Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted));
         }
         assert_eq!(
@@ -410,6 +408,24 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         Ok(())
     }
 
+    fn validate_file_sequence(
+        &self,
+        buffer: SharedBufferSequence,
+        expected_length: usize,
+    ) -> Result<(), Channel::Error> {
+        if buffer.length > MAX_FILE_TRANSFER_SIZE {
+            return Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted));
+        }
+        assert_eq!(
+            expected_length, buffer.length as usize,
+            "shared file data must match its sequence"
+        );
+        buffer
+            .descriptors(self.shared_buffers.layout())
+            .expect("shared file sequence must identify valid slot ranges");
+        Ok(())
+    }
+
     fn write_file_buffer(
         &self,
         buffer: SharedBufferDescriptor,
@@ -420,6 +436,49 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             .write(buffer.slot_index, data)
             .expect("validated shared file write range must be accessible");
         Ok(())
+    }
+
+    fn write_file_sequence(
+        &self,
+        buffer: SharedBufferSequence,
+        data: &[u8],
+    ) -> Result<(), Channel::Error> {
+        self.validate_file_sequence(buffer, data.len())?;
+        let mut offset = 0;
+        for descriptor in buffer
+            .descriptors(self.shared_buffers.layout())
+            .expect("validated shared file sequence must remain valid")
+        {
+            let end = offset + descriptor.length as usize;
+            self.shared_buffers
+                .write(descriptor.slot_index, &data[offset..end])
+                .expect("validated shared file sequence must be accessible");
+            offset = end;
+        }
+        Ok(())
+    }
+
+    fn read_file_sequence(&self, buffer: SharedBufferSequence, destination: &mut [u8]) {
+        let mut offset = 0;
+        for descriptor in buffer
+            .descriptors(self.shared_buffers.layout())
+            .expect("validated shared file sequence must remain valid")
+        {
+            if offset == destination.len() {
+                break;
+            }
+            let length = (destination.len() - offset).min(descriptor.length as usize);
+            let end = offset + length;
+            self.shared_buffers
+                .read(descriptor.slot_index, &mut destination[offset..end])
+                .expect("validated shared file sequence must be accessible");
+            offset = end;
+        }
+        assert_eq!(
+            offset,
+            destination.len(),
+            "shared file sequence must cover the broker read"
+        );
     }
 
     fn request_file(&self, request: FileRequest) -> Result<FileResponse, Channel::Error> {
@@ -512,7 +571,7 @@ mod tests {
         );
         assert_eq!(
             local
-                .write_file(handle, descriptor(1, 3), b"abc", None)
+                .write_file(handle, sequence(1 << 1, 3), b"abc", None)
                 .unwrap(),
             Ok(3)
         );
@@ -525,7 +584,7 @@ mod tests {
         let mut output = [0; 2];
         assert_eq!(
             local
-                .read_file(handle, descriptor(2, 2), &mut output, Some(1))
+                .read_file(handle, sequence(1 << 2, 2), &mut output, Some(1))
                 .unwrap(),
             Ok(2)
         );
@@ -577,7 +636,7 @@ mod tests {
         let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
         let (local, ()) =
             BrokerLocal::negotiate(channel, |channel| Ok((channel, memory, ()))).unwrap();
-        let oversized = descriptor(0, MAX_FILE_TRANSFER_SIZE + 1);
+        let oversized = sequence(1, MAX_FILE_TRANSFER_SIZE + 1);
 
         assert!(matches!(
             local.read_file(ObjectHandle(1), oversized, &mut [], None),
@@ -590,11 +649,78 @@ mod tests {
         assert!(local.channel.sent_operations.borrow().is_empty());
     }
 
+    #[test]
+    fn file_calls_stage_noncontiguous_multi_slot_data_in_order() {
+        let length = SHARED_BUFFER_SLOT_SIZE as usize + 3;
+        let channel = ScriptedChannel::new([
+            BrokerResult::File(FileResponse::Write(WriteFileResponse {
+                written: u32::try_from(length).unwrap(),
+            })),
+            BrokerResult::File(FileResponse::Read(ReadFileResponse {
+                read: u32::try_from(length).unwrap(),
+            })),
+        ]);
+        let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
+        let (local, ()) =
+            BrokerLocal::negotiate(channel, |channel| Ok((channel, memory.clone(), ()))).unwrap();
+        let data = (0..length)
+            .map(|index| u8::try_from(index % 251).unwrap())
+            .collect::<std::vec::Vec<_>>();
+        let buffer = sequence((1 << 1) | (1 << 3), u32::try_from(length).unwrap());
+
+        assert_eq!(
+            local
+                .write_file(ObjectHandle(1), buffer, &data, None)
+                .unwrap(),
+            Ok(length)
+        );
+        let mut first_slot = std::vec![0; SHARED_BUFFER_SLOT_SIZE as usize];
+        memory
+            .read(SHARED_BUFFER_SLOT_SIZE as usize, &mut first_slot)
+            .unwrap();
+        assert_eq!(first_slot, data[..SHARED_BUFFER_SLOT_SIZE as usize]);
+        let mut second_slot = [0; 3];
+        memory
+            .read(3 * SHARED_BUFFER_SLOT_SIZE as usize, &mut second_slot)
+            .unwrap();
+        assert_eq!(second_slot, data[SHARED_BUFFER_SLOT_SIZE as usize..]);
+
+        memory
+            .write(
+                4 * SHARED_BUFFER_SLOT_SIZE as usize,
+                &data[..SHARED_BUFFER_SLOT_SIZE as usize],
+            )
+            .unwrap();
+        memory
+            .write(
+                7 * SHARED_BUFFER_SLOT_SIZE as usize,
+                &data[SHARED_BUFFER_SLOT_SIZE as usize..],
+            )
+            .unwrap();
+        let mut output = std::vec![0; length];
+        assert_eq!(
+            local
+                .read_file(
+                    ObjectHandle(1),
+                    sequence((1 << 4) | (1 << 7), u32::try_from(length).unwrap()),
+                    &mut output,
+                    None,
+                )
+                .unwrap(),
+            Ok(length)
+        );
+        assert_eq!(output, data);
+    }
+
     const fn descriptor(slot: u32, length: u32) -> SharedBufferDescriptor {
         SharedBufferDescriptor {
             slot_index: SharedBufferSlotIndex(slot),
             length,
         }
+    }
+
+    const fn sequence(slot_mask: u32, length: u32) -> SharedBufferSequence {
+        SharedBufferSequence { slot_mask, length }
     }
 
     #[derive(Clone)]

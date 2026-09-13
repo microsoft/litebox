@@ -42,6 +42,9 @@ pub enum SharedBufferLayoutError {
     /// The requested byte range does not fit in one slot.
     #[error("shared-buffer range exceeds the slot size")]
     RangeExceedsSlot,
+    /// A multi-slot descriptor does not canonically cover its declared length.
+    #[error("invalid shared-buffer sequence")]
+    InvalidSequence,
 }
 
 /// Immutable fixed-slot layout for an association shared-buffer pool.
@@ -125,6 +128,98 @@ pub struct SharedBufferDescriptor {
     pub length: u32,
 }
 
+/// Identifies one operation-scoped byte sequence spread across fixed shared-buffer slots.
+///
+/// Selected slots are consumed in ascending index order. Every selected slot
+/// except the last contributes its full capacity; the last contributes the
+/// remaining bytes. The bitmap makes duplicate and overlapping slots
+/// unrepresentable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SharedBufferSequence {
+    /// Bitmap of slots used by this operation.
+    pub slot_mask: u32,
+    /// Aggregate number of bytes in the sequence.
+    pub length: u32,
+}
+
+impl SharedBufferSequence {
+    /// Converts one slot descriptor into a one-slot sequence.
+    ///
+    /// An out-of-range slot index produces an invalid sequence that normal
+    /// layout validation will reject.
+    #[must_use]
+    pub const fn from_descriptor(descriptor: SharedBufferDescriptor) -> Self {
+        let slot_mask = match 1_u32.checked_shl(descriptor.slot_index.0) {
+            Some(slot_mask) => slot_mask,
+            None => 0,
+        };
+        Self {
+            slot_mask,
+            length: descriptor.length,
+        }
+    }
+
+    /// Validates the sequence and returns its slot descriptors in transfer order.
+    pub fn descriptors(
+        self,
+        layout: SharedBufferLayout,
+    ) -> Result<SharedBufferSequenceDescriptors, SharedBufferLayoutError> {
+        let valid_slot_mask = if layout.slot_count() >= u32::BITS {
+            u32::MAX
+        } else {
+            (1_u32 << layout.slot_count()) - 1
+        };
+        if self.slot_mask == 0 || self.slot_mask & !valid_slot_mask != 0 {
+            return Err(SharedBufferLayoutError::InvalidSlot);
+        }
+        let required_slots = if self.length == 0 {
+            1
+        } else {
+            self.length.div_ceil(layout.slot_size())
+        };
+        if self.slot_mask.count_ones() != required_slots {
+            return Err(SharedBufferLayoutError::InvalidSequence);
+        }
+        Ok(SharedBufferSequenceDescriptors {
+            remaining_slots: self.slot_mask,
+            remaining_length: self.length,
+            slot_size: layout.slot_size(),
+        })
+    }
+}
+
+/// Iterator over the canonical slot descriptors in a [`SharedBufferSequence`].
+pub struct SharedBufferSequenceDescriptors {
+    remaining_slots: u32,
+    remaining_length: u32,
+    slot_size: u32,
+}
+
+impl Iterator for SharedBufferSequenceDescriptors {
+    type Item = SharedBufferDescriptor;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining_slots == 0 {
+            return None;
+        }
+        let slot_index = self.remaining_slots.trailing_zeros();
+        self.remaining_slots &= !(1 << slot_index);
+        let length = self.remaining_length.min(self.slot_size);
+        self.remaining_length -= length;
+        Some(SharedBufferDescriptor {
+            slot_index: SharedBufferSlotIndex(slot_index),
+            length,
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.remaining_slots.count_ones() as usize;
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for SharedBufferSequenceDescriptors {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,7 +234,8 @@ mod tests {
     #[test]
     fn larger_slots_do_not_change_existing_transfer_limits() {
         assert_eq!(crate::pipe::MAX_PIPE_TRANSFER_SIZE, 32 * 1024);
-        assert_eq!(crate::fs::MAX_FILE_TRANSFER_SIZE, 64 * 1024);
+        assert_eq!(crate::fs::MAX_FILE_BUFFER_SIZE, 64 * 1024);
+        assert_eq!(crate::fs::MAX_FILE_TRANSFER_SIZE, 512 * 1024);
         assert_eq!(crate::socket::MAX_SOCKET_TRANSFER_SIZE, 32 * 1024);
         assert_eq!(crate::socket::MAX_UDP_DATAGRAM_SIZE, 65_507);
         assert_eq!(crate::stdio::MAX_STDIO_TRANSFER_SIZE, 32 * 1024);
@@ -175,6 +271,78 @@ mod tests {
         assert_eq!(
             layout.range(SharedBufferSlotIndex(0), 9),
             Err(SharedBufferLayoutError::RangeExceedsSlot)
+        );
+    }
+
+    #[test]
+    fn sequence_descriptors_follow_slot_order_and_length() {
+        let layout = SharedBufferLayout::new(8, 5).unwrap();
+        let descriptors = SharedBufferSequence {
+            slot_mask: (1 << 1) | (1 << 3) | (1 << 4),
+            length: 18,
+        }
+        .descriptors(layout)
+        .unwrap()
+        .collect::<alloc::vec::Vec<_>>();
+
+        assert_eq!(
+            descriptors,
+            [
+                SharedBufferDescriptor {
+                    slot_index: SharedBufferSlotIndex(1),
+                    length: 8,
+                },
+                SharedBufferDescriptor {
+                    slot_index: SharedBufferSlotIndex(3),
+                    length: 8,
+                },
+                SharedBufferDescriptor {
+                    slot_index: SharedBufferSlotIndex(4),
+                    length: 2,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn sequence_validation_rejects_noncanonical_slot_sets() {
+        let layout = SharedBufferLayout::new(8, 3).unwrap();
+
+        assert_eq!(
+            SharedBufferSequence {
+                slot_mask: 0,
+                length: 0,
+            }
+            .descriptors(layout)
+            .err(),
+            Some(SharedBufferLayoutError::InvalidSlot)
+        );
+        assert_eq!(
+            SharedBufferSequence {
+                slot_mask: 1 << 3,
+                length: 1,
+            }
+            .descriptors(layout)
+            .err(),
+            Some(SharedBufferLayoutError::InvalidSlot)
+        );
+        assert_eq!(
+            SharedBufferSequence {
+                slot_mask: 0b11,
+                length: 8,
+            }
+            .descriptors(layout)
+            .err(),
+            Some(SharedBufferLayoutError::InvalidSequence)
+        );
+        assert_eq!(
+            SharedBufferSequence {
+                slot_mask: 0b1,
+                length: 9,
+            }
+            .descriptors(layout)
+            .err(),
+            Some(SharedBufferLayoutError::InvalidSequence)
         );
     }
 }

@@ -6,7 +6,8 @@ use alloc::sync::Arc;
 use core::sync::atomic::Ordering::{Acquire, Release};
 
 use litebox_broker_protocol::shared_buffer::{
-    SHARED_BUFFER_SLOT_COUNT, SharedBufferDescriptor, SharedBufferSlotIndex,
+    SHARED_BUFFER_LAYOUT, SHARED_BUFFER_SLOT_COUNT, SHARED_BUFFER_SLOT_SIZE,
+    SharedBufferDescriptor, SharedBufferSequence,
 };
 use litebox_platform::sync::RawMutex as _;
 
@@ -30,12 +31,13 @@ pub(super) struct AcquireError;
 
 pub(super) struct SlotLease<'a, Platform: RawSyncPrimitivesProvider> {
     allocator: &'a SlotAllocator<Platform>,
-    descriptor: SharedBufferDescriptor,
+    sequence: SharedBufferSequence,
 }
 
 struct SlotWaiter<Platform: RawSyncPrimitivesProvider> {
     length: u32,
-    result: Mutex<Platform, Option<Result<SharedBufferDescriptor, AcquireError>>>,
+    slot_count: u32,
+    result: Mutex<Platform, Option<Result<SharedBufferSequence, AcquireError>>>,
     completion: Platform::RawMutex,
 }
 
@@ -52,42 +54,68 @@ impl<Platform: RawSyncPrimitivesProvider> SlotAllocator<Platform> {
     }
 
     pub(super) fn acquire(&self, length: u32) -> Result<SlotLease<'_, Platform>, AcquireError> {
+        if length > SHARED_BUFFER_SLOT_SIZE {
+            return Err(AcquireError);
+        }
+        self.acquire_slots(length, 1)
+    }
+
+    pub(super) fn acquire_sequence(
+        &self,
+        length: u32,
+    ) -> Result<SlotLease<'_, Platform>, AcquireError> {
+        let slot_count = if length == 0 {
+            1
+        } else {
+            length.div_ceil(SHARED_BUFFER_SLOT_SIZE)
+        };
+        if slot_count > SHARED_BUFFER_SLOT_COUNT {
+            return Err(AcquireError);
+        }
+        self.acquire_slots(length, slot_count)
+    }
+
+    fn acquire_slots(
+        &self,
+        length: u32,
+        slot_count: u32,
+    ) -> Result<SlotLease<'_, Platform>, AcquireError> {
         {
             let mut state = self.state.lock();
             if state.failed {
                 return Err(AcquireError);
             }
             if state.waiters.is_empty()
-                && let Some(descriptor) = state.allocate(length)
+                && let Some(sequence) = state.allocate(length, slot_count)
             {
                 return Ok(SlotLease {
                     allocator: self,
-                    descriptor,
+                    sequence,
                 });
             }
         }
 
-        let waiter = Arc::new(SlotWaiter::new(length));
+        let waiter = Arc::new(SlotWaiter::new(length, slot_count));
         {
             let mut state = self.state.lock();
             if state.failed {
                 return Err(AcquireError);
             }
             if state.waiters.is_empty()
-                && let Some(descriptor) = state.allocate(length)
+                && let Some(sequence) = state.allocate(length, slot_count)
             {
                 return Ok(SlotLease {
                     allocator: self,
-                    descriptor,
+                    sequence,
                 });
             }
             state.waiters.push_back(Arc::clone(&waiter));
         }
 
-        let descriptor = waiter.wait()?;
+        let sequence = waiter.wait()?;
         Ok(SlotLease {
             allocator: self,
-            descriptor,
+            sequence,
         })
     }
 
@@ -106,26 +134,43 @@ impl<Platform: RawSyncPrimitivesProvider> SlotAllocator<Platform> {
         true
     }
 
-    fn release(&self, slot_index: SharedBufferSlotIndex) {
-        let mut state = self.state.lock();
-        let slot_mask = 1 << slot_index.0;
-        assert_ne!(
-            state.allocated_slots & slot_mask,
-            0,
-            "shared-buffer slot released without an active lease"
-        );
-        state.allocated_slots &= !slot_mask;
-        if state.failed {
-            return;
+    fn release(&self, slot_mask: u32) {
+        {
+            let mut state = self.state.lock();
+            let slot_mask = u64::from(slot_mask);
+            assert_eq!(
+                state.allocated_slots & slot_mask,
+                slot_mask,
+                "shared-buffer slot released without an active lease"
+            );
+            state.allocated_slots &= !slot_mask;
+            if state.failed {
+                return;
+            }
         }
-        let Some(waiter) = state.waiters.pop_front() else {
-            return;
-        };
-        let descriptor = state
-            .allocate(waiter.length)
-            .expect("released slot was not available");
-        drop(state);
-        waiter.resolve(Ok(descriptor));
+
+        loop {
+            let resolved = {
+                let mut state = self.state.lock();
+                if state.failed {
+                    return;
+                }
+                let Some(waiter) = state.waiters.front() else {
+                    return;
+                };
+                let length = waiter.length;
+                let slot_count = waiter.slot_count;
+                let Some(sequence) = state.allocate(length, slot_count) else {
+                    return;
+                };
+                let waiter = state
+                    .waiters
+                    .pop_front()
+                    .expect("front shared-buffer waiter must remain queued");
+                (waiter, sequence)
+            };
+            resolved.0.resolve(Ok(resolved.1));
+        }
     }
 
     #[cfg(test)]
@@ -135,15 +180,16 @@ impl<Platform: RawSyncPrimitivesProvider> SlotAllocator<Platform> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider> SlotWaiter<Platform> {
-    fn new(length: u32) -> Self {
+    fn new(length: u32, slot_count: u32) -> Self {
         Self {
             length,
+            slot_count,
             result: Mutex::new(None),
             completion: Platform::RawMutex::INIT,
         }
     }
 
-    fn resolve(&self, result: Result<SharedBufferDescriptor, AcquireError>) {
+    fn resolve(&self, result: Result<SharedBufferSequence, AcquireError>) {
         let mut stored = self.result.lock();
         assert!(stored.is_none(), "shared-buffer waiter already resolved");
         *stored = Some(result);
@@ -152,7 +198,7 @@ impl<Platform: RawSyncPrimitivesProvider> SlotWaiter<Platform> {
         self.completion.wake_one();
     }
 
-    fn wait(&self) -> Result<SharedBufferDescriptor, AcquireError> {
+    fn wait(&self) -> Result<SharedBufferSequence, AcquireError> {
         loop {
             let mut result = self.result.lock();
             if let Some(result) = result.take() {
@@ -166,34 +212,58 @@ impl<Platform: RawSyncPrimitivesProvider> SlotWaiter<Platform> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider> SlotLease<'_, Platform> {
-    pub(super) const fn descriptor(&self) -> SharedBufferDescriptor {
-        self.descriptor
+    pub(super) fn descriptor(&self) -> SharedBufferDescriptor {
+        let mut descriptors = self
+            .sequence
+            .descriptors(SHARED_BUFFER_LAYOUT)
+            .expect("allocated shared-buffer sequence must be valid");
+        let descriptor = descriptors
+            .next()
+            .expect("allocated shared-buffer sequence must contain one slot");
+        assert!(
+            descriptors.next().is_none(),
+            "multi-slot lease cannot be used as one shared-buffer descriptor"
+        );
+        descriptor
+    }
+
+    pub(super) const fn sequence(&self) -> SharedBufferSequence {
+        self.sequence
     }
 }
 
 impl<Platform: RawSyncPrimitivesProvider> Drop for SlotLease<'_, Platform> {
     fn drop(&mut self) {
-        self.allocator.release(self.descriptor.slot_index);
+        self.allocator.release(self.sequence.slot_mask);
     }
 }
 
 impl<Platform: RawSyncPrimitivesProvider> AllocatorState<Platform> {
-    fn allocate(&mut self, length: u32) -> Option<SharedBufferDescriptor> {
-        let slot_index = self.next_free_slot()?;
-        self.allocated_slots |= 1 << slot_index;
-        self.next_slot = (slot_index + 1) % SHARED_BUFFER_SLOT_COUNT;
-        Some(SharedBufferDescriptor {
-            slot_index: SharedBufferSlotIndex(slot_index),
-            length,
-        })
+    fn allocate(&mut self, length: u32, slot_count: u32) -> Option<SharedBufferSequence> {
+        let mut available_slots = !self.allocated_slots & ALLOCATED_SLOT_MASK;
+        if available_slots.count_ones() < slot_count {
+            return None;
+        }
+
+        let mut slot_mask = 0_u32;
+        let mut next_slot = self.next_slot;
+        for _ in 0..slot_count {
+            let slot_index = Self::next_free_slot(available_slots, next_slot)
+                .expect("validated shared-buffer capacity must contain a free slot");
+            available_slots &= !(1 << slot_index);
+            slot_mask |= 1 << slot_index;
+            next_slot = (slot_index + 1) % SHARED_BUFFER_SLOT_COUNT;
+        }
+        self.allocated_slots |= u64::from(slot_mask);
+        self.next_slot = next_slot;
+        Some(SharedBufferSequence { slot_mask, length })
     }
 
-    fn next_free_slot(&self) -> Option<u32> {
-        let available_slots = !self.allocated_slots & ALLOCATED_SLOT_MASK;
+    fn next_free_slot(available_slots: u64, next_slot: u32) -> Option<u32> {
         if available_slots == 0 {
             return None;
         }
-        let available_slots_after_next = available_slots & (u64::MAX << self.next_slot);
+        let available_slots_after_next = available_slots & (u64::MAX << next_slot);
         Some(if available_slots_after_next == 0 {
             available_slots.trailing_zeros()
         } else {
@@ -209,6 +279,7 @@ mod tests {
     use super::*;
     use alloc::sync::Arc;
     use alloc::vec::Vec;
+    use litebox_broker_protocol::shared_buffer::SharedBufferSlotIndex;
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -229,6 +300,40 @@ mod tests {
         drop(leases.remove(0));
         let reused = allocator.acquire(9).unwrap();
         assert_eq!(reused.descriptor().slot_index, SharedBufferSlotIndex(0));
+    }
+
+    #[test]
+    fn sequence_leases_acquire_all_required_slots_atomically() {
+        let allocator = Arc::new(SlotAllocator::<MockPlatform>::new());
+        let mut leases = (0..9)
+            .map(|_| allocator.acquire(1).unwrap())
+            .collect::<Vec<_>>();
+        let waiter_allocator = Arc::clone(&allocator);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let waiter = std::thread::spawn(move || {
+            let lease = waiter_allocator
+                .acquire_sequence(8 * SHARED_BUFFER_SLOT_SIZE)
+                .unwrap();
+            sender.send(lease.sequence()).unwrap();
+        });
+        while allocator.waiter_count() == 0 {
+            std::thread::yield_now();
+        }
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        drop(leases.remove(0));
+        let sequence = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(sequence.slot_mask.count_ones(), 8);
+        assert_eq!(sequence.length, 8 * SHARED_BUFFER_SLOT_SIZE);
+        let retained_slot_mask = leases.iter().fold(0, |mask, lease| {
+            mask | (1 << lease.descriptor().slot_index.0)
+        });
+        assert_eq!(sequence.slot_mask & retained_slot_mask, 0);
+        waiter.join().unwrap();
     }
 
     #[test]

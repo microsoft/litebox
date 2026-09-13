@@ -14,7 +14,7 @@ use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{ConsumeEventResponse, EventConsumeMode};
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileOpenFlags, FileSeekWhence,
-    FileStatus, FileUser, MAX_FILE_TRANSFER_SIZE,
+    FileStatus, FileUser, MAX_FILE_BUFFER_SIZE, MAX_FILE_TRANSFER_SIZE,
 };
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
@@ -400,6 +400,16 @@ where
         })
     }
 
+    fn acquire_shared_buffer_sequence(
+        &self,
+        length: u32,
+    ) -> core::result::Result<SlotLease<'_, Platform>, BrokerControlError> {
+        self.slot_allocator.acquire_sequence(length).map_err(|_| {
+            self.fail_association();
+            BrokerControlError::AssociationFailed
+        })
+    }
+
     fn fail_association(&self) {
         self.slot_allocator.fail();
         if self.local.lock().take().is_some() {
@@ -720,7 +730,7 @@ where
         mode: FileMode,
     ) -> core::result::Result<core::result::Result<ObjectHandle, FileError>, BrokerControlError>
     {
-        let length = file_transfer_length(path.len())?;
+        let length = file_buffer_length(path.len())?;
         let lease = self.acquire_shared_buffer(length)?;
         self.request(|local| local.open_file(lease.descriptor(), path, user, access, flags, mode))
     }
@@ -733,8 +743,8 @@ where
     ) -> core::result::Result<core::result::Result<usize, FileError>, BrokerControlError> {
         let length = file_transfer_length(data.len().min(MAX_FILE_TRANSFER_SIZE as usize))?;
         let data = &mut data[..length as usize];
-        let lease = self.acquire_shared_buffer(length)?;
-        self.request(|local| local.read_file(handle, lease.descriptor(), data, offset))
+        let lease = self.acquire_shared_buffer_sequence(length)?;
+        self.request(|local| local.read_file(handle, lease.sequence(), data, offset))
     }
 
     fn write_file(
@@ -745,8 +755,8 @@ where
     ) -> core::result::Result<core::result::Result<usize, FileError>, BrokerControlError> {
         let length = file_transfer_length(data.len().min(MAX_FILE_TRANSFER_SIZE as usize))?;
         let data = &data[..length as usize];
-        let lease = self.acquire_shared_buffer(length)?;
-        self.request(|local| local.write_file(handle, lease.descriptor(), data, offset))
+        let lease = self.acquire_shared_buffer_sequence(length)?;
+        self.request(|local| local.write_file(handle, lease.sequence(), data, offset))
     }
 
     fn seek_file(
@@ -777,7 +787,7 @@ where
         let mut entries = Vec::new();
         let mut start_index = 0;
         loop {
-            let lease = self.acquire_shared_buffer(MAX_FILE_TRANSFER_SIZE)?;
+            let lease = self.acquire_shared_buffer(MAX_FILE_BUFFER_SIZE)?;
             let response = self
                 .request(|local| local.read_directory(handle, lease.descriptor(), start_index))?;
             let (mut chunk, next_index) = match response {
@@ -804,7 +814,7 @@ where
         path: &str,
         user: FileUser,
     ) -> core::result::Result<core::result::Result<FileStatus, FileError>, BrokerControlError> {
-        let lease = self.acquire_shared_buffer(file_transfer_length(path.len())?)?;
+        let lease = self.acquire_shared_buffer(file_buffer_length(path.len())?)?;
         self.request(|local| local.path_file_status(lease.descriptor(), path, user))
     }
 
@@ -821,7 +831,7 @@ where
         user: FileUser,
         mode: FileMode,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
-        let lease = self.acquire_shared_buffer(file_transfer_length(path.len())?)?;
+        let lease = self.acquire_shared_buffer(file_buffer_length(path.len())?)?;
         self.request(|local| local.chmod_file(lease.descriptor(), path, user, mode))
     }
 
@@ -832,7 +842,7 @@ where
         user: Option<u16>,
         group: Option<u16>,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
-        let lease = self.acquire_shared_buffer(file_transfer_length(path.len())?)?;
+        let lease = self.acquire_shared_buffer(file_buffer_length(path.len())?)?;
         self.request(|local| local.chown_file(lease.descriptor(), path, acting_user, user, group))
     }
 
@@ -841,7 +851,7 @@ where
         path: &str,
         user: FileUser,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
-        let lease = self.acquire_shared_buffer(file_transfer_length(path.len())?)?;
+        let lease = self.acquire_shared_buffer(file_buffer_length(path.len())?)?;
         self.request(|local| local.unlink_file(lease.descriptor(), path, user))
     }
 
@@ -851,7 +861,7 @@ where
         user: FileUser,
         mode: FileMode,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
-        let lease = self.acquire_shared_buffer(file_transfer_length(path.len())?)?;
+        let lease = self.acquire_shared_buffer(file_buffer_length(path.len())?)?;
         self.request(|local| local.mkdir_file(lease.descriptor(), path, user, mode))
     }
 
@@ -860,7 +870,7 @@ where
         path: &str,
         user: FileUser,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
-        let lease = self.acquire_shared_buffer(file_transfer_length(path.len())?)?;
+        let lease = self.acquire_shared_buffer(file_buffer_length(path.len())?)?;
         self.request(|local| local.rmdir_file(lease.descriptor(), path, user))
     }
 
@@ -878,6 +888,13 @@ fn file_transfer_length(length: usize) -> core::result::Result<u32, BrokerContro
         return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
     }
     Ok(u32::try_from(length).expect("validated file transfer length must fit in u32"))
+}
+
+fn file_buffer_length(length: usize) -> core::result::Result<u32, BrokerControlError> {
+    if length > MAX_FILE_BUFFER_SIZE as usize {
+        return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
+    }
+    Ok(u32::try_from(length).expect("validated file buffer length must fit in u32"))
 }
 
 pub(crate) fn readiness_events(readiness: ReadinessFlags) -> Events {

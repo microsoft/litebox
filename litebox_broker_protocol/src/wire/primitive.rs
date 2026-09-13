@@ -3,7 +3,7 @@
 
 use alloc::vec::Vec;
 
-use crate::shared_buffer::{SharedBufferDescriptor, SharedBufferSlotIndex};
+use crate::shared_buffer::{SharedBufferDescriptor, SharedBufferSequence, SharedBufferSlotIndex};
 use crate::{ObjectHandle, ProtocolVersion, RequestId};
 
 use super::WireError;
@@ -49,6 +49,11 @@ impl Encoder {
     pub(super) fn shared_buffer_descriptor(&mut self, descriptor: SharedBufferDescriptor) {
         self.u32(descriptor.slot_index.0);
         self.u32(descriptor.length);
+    }
+
+    pub(super) fn shared_buffer_sequence(&mut self, sequence: SharedBufferSequence) {
+        self.u32(sequence.slot_mask);
+        self.u32(sequence.length);
     }
 }
 
@@ -107,6 +112,13 @@ impl<'a> Decoder<'a> {
     pub(super) fn shared_buffer_descriptor(&mut self) -> Result<SharedBufferDescriptor, WireError> {
         Ok(SharedBufferDescriptor {
             slot_index: SharedBufferSlotIndex(self.u32()?),
+            length: self.u32()?,
+        })
+    }
+
+    pub(super) fn shared_buffer_sequence(&mut self) -> Result<SharedBufferSequence, WireError> {
+        Ok(SharedBufferSequence {
+            slot_mask: self.u32()?,
             length: self.u32()?,
         })
     }

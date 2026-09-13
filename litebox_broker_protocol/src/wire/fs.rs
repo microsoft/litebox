@@ -76,13 +76,13 @@ pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
         FileRequest::Read(request) => {
             encoder.u8(REQUEST_TAG_READ);
             encoder.handle(request.handle);
-            encoder.shared_buffer_descriptor(request.buffer);
+            encoder.shared_buffer_sequence(request.buffer);
             encode_optional_u64(encoder, request.offset);
         }
         FileRequest::Write(request) => {
             encoder.u8(REQUEST_TAG_WRITE);
             encoder.handle(request.handle);
-            encoder.shared_buffer_descriptor(request.buffer);
+            encoder.shared_buffer_sequence(request.buffer);
             encode_optional_u64(encoder, request.offset);
         }
         FileRequest::Seek(request) => {
@@ -159,12 +159,12 @@ pub(super) fn decode_fs_request(decoder: &mut Decoder<'_>) -> Result<FileRequest
         })),
         REQUEST_TAG_READ => Ok(FileRequest::Read(ReadFileRequest {
             handle: decoder.handle()?,
-            buffer: decoder.shared_buffer_descriptor()?,
+            buffer: decoder.shared_buffer_sequence()?,
             offset: decode_optional_u64(decoder)?,
         })),
         REQUEST_TAG_WRITE => Ok(FileRequest::Write(WriteFileRequest {
             handle: decoder.handle()?,
-            buffer: decoder.shared_buffer_descriptor()?,
+            buffer: decoder.shared_buffer_sequence()?,
             offset: decode_optional_u64(decoder)?,
         })),
         REQUEST_TAG_SEEK => Ok(FileRequest::Seek(SeekFileRequest {

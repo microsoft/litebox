@@ -447,7 +447,9 @@ mod tests {
         CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
         WritePipeResponse,
     };
-    use crate::shared_buffer::{SharedBufferDescriptor, SharedBufferSlotIndex};
+    use crate::shared_buffer::{
+        SharedBufferDescriptor, SharedBufferSequence, SharedBufferSlotIndex,
+    };
     use crate::socket::{
         AcceptSocketRequest, AcceptSocketResponse, AddressFamily, BindSocketRequest,
         BindSocketResponse, ConnectSocketRequest, ConnectSocketResponse, CreateSocketRequest,
@@ -611,24 +613,24 @@ mod tests {
             })),
             BrokerOperation::File(FileRequest::Read(ReadFileRequest {
                 handle,
-                buffer: SharedBufferDescriptor {
-                    slot_index: SharedBufferSlotIndex(2),
-                    length: 32,
+                buffer: SharedBufferSequence {
+                    slot_mask: (1 << 2) | (1 << 5),
+                    length: 64 * 1024 + 32,
                 },
                 offset: None,
             })),
             BrokerOperation::File(FileRequest::Read(ReadFileRequest {
                 handle,
-                buffer: SharedBufferDescriptor {
-                    slot_index: SharedBufferSlotIndex(2),
+                buffer: SharedBufferSequence {
+                    slot_mask: 1 << 2,
                     length: 32,
                 },
                 offset: Some(u64::MAX),
             })),
             BrokerOperation::File(FileRequest::Write(WriteFileRequest {
                 handle,
-                buffer: SharedBufferDescriptor {
-                    slot_index: SharedBufferSlotIndex(3),
+                buffer: SharedBufferSequence {
+                    slot_mask: 1 << 3,
                     length: 17,
                 },
                 offset: Some(11),
