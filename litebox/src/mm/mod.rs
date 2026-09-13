@@ -442,6 +442,7 @@ where
             Err(linux::VmemResizeError::NotExist(_)) => Err(RemapError::AlreadyUnallocated),
             Err(linux::VmemResizeError::InvalidAddr { .. }) => Err(RemapError::AlreadyAllocated),
             Err(linux::VmemResizeError::OutOfMemory) => Err(RemapError::OutOfMemory),
+            Err(linux::VmemResizeError::PermissionDenied) => Err(RemapError::PermissionDenied),
         }
     }
 
