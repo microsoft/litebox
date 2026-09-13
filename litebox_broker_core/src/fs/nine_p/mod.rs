@@ -32,6 +32,9 @@ mod client;
 mod fcall;
 mod id_pool;
 
+#[cfg(all(test, target_os = "linux"))]
+mod tests;
+
 pub mod transport;
 
 /// A [`Backend`](super::backend::Backend) backed by a 9P2000.L server.
