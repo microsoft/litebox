@@ -21,7 +21,7 @@ use litebox::{
 use litebox_common_linux::{EpollEvent, EpollOp, errno::Errno};
 
 use super::file::FilesState;
-use crate::{GlobalState, LinuxFS, ShimPlatform};
+use crate::{GlobalState, ShimPlatform};
 
 pub(crate) struct EpollSubsystem<Platform: ShimPlatform>(core::marker::PhantomData<Platform>);
 impl<Platform: ShimPlatform> FdEnabledSubsystem for EpollSubsystem<Platform> {
@@ -43,7 +43,7 @@ bitflags::bitflags! {
 pub(crate) enum EpollDescriptor<Platform: ShimPlatform> {
     Eventfd(Arc<TypedFd<super::eventfd::EventfdSubsystem<Platform>>>),
     Epoll(Arc<TypedFd<super::epoll::EpollSubsystem<Platform>>>),
-    File(Arc<crate::FileFd<Platform>>),
+    File(Arc<crate::FileFd>),
     Socket(Arc<super::net::SocketFd<Platform>>),
     Pipe(Arc<litebox::pipes::PipeFd<Platform>>),
     Unix(Arc<TypedFd<crate::syscalls::unix::UnixSocketSubsystem<Platform>>>),
@@ -52,7 +52,7 @@ pub(crate) enum EpollDescriptor<Platform: ShimPlatform> {
 impl<Platform: ShimPlatform> EpollDescriptor<Platform> {
     pub fn try_from(files: &FilesState<Platform>, raw_fd: usize) -> Result<Self, Errno> {
         let rds = files.raw_descriptor_store.read();
-        if let Ok(fd) = rds.fd_from_raw_integer::<LinuxFS<Platform>>(raw_fd) {
+        if let Ok(fd) = rds.fd_from_raw_integer::<litebox::fs::BrokerFile>(raw_fd) {
             return Ok(EpollDescriptor::File(fd));
         }
         if let Ok(fd) = rds.fd_from_raw_integer::<crate::Network<Platform>>(raw_fd) {
@@ -81,7 +81,7 @@ impl<Platform: ShimPlatform> EpollDescriptor<Platform> {
 enum DescriptorRef<Platform: ShimPlatform> {
     Eventfd(Weak<TypedFd<super::eventfd::EventfdSubsystem<Platform>>>),
     Epoll(Weak<TypedFd<super::epoll::EpollSubsystem<Platform>>>),
-    File(Weak<crate::FileFd<Platform>>),
+    File(Weak<crate::FileFd>),
     Socket(Weak<super::net::SocketFd<Platform>>),
     Pipe(Weak<litebox::pipes::PipeFd<Platform>>),
     Unix(Weak<TypedFd<crate::syscalls::unix::UnixSocketSubsystem<Platform>>>),
@@ -643,7 +643,7 @@ mod test {
     }
 
     fn setup_epoll() -> (crate::Task<TestPlatform>, EpollFile<TestPlatform>) {
-        let task = crate::syscalls::tests::init_platform_with_broker();
+        let task = crate::syscalls::tests::init_platform();
 
         let epoll = EpollFile::new();
         (task, epoll)
@@ -694,15 +694,15 @@ mod test {
 
     #[test]
     fn test_poll() {
-        let task = crate::syscalls::tests::init_platform_with_broker();
+        let task = crate::syscalls::tests::init_platform();
 
         let mut set = super::PollSet::with_capacity(0);
         let (rfd_u, wfd_u) = task
-            .sys_pipe2(litebox::fs::OFlags::empty())
+            .sys_pipe2(litebox_common_linux::OFlags::empty())
             .expect("pipe2 failed");
         let rfd = i32::try_from(rfd_u).unwrap();
         let wfd = i32::try_from(wfd_u).unwrap();
-        let no_fds = FilesState::new(task.files.borrow().fs.clone());
+        let no_fds = FilesState::new();
         let fds = task.files.borrow().clone();
         set.add_fd(rfd, Events::IN);
 
@@ -750,10 +750,10 @@ mod test {
 
     #[test]
     fn test_pselect() {
-        let task = crate::syscalls::tests::init_platform_with_broker();
+        let task = crate::syscalls::tests::init_platform();
 
         let (rfd_u, wfd_u) = task
-            .sys_pipe2(litebox::fs::OFlags::empty())
+            .sys_pipe2(litebox_common_linux::OFlags::empty())
             .expect("pipe2 failed");
         let rfd = i32::try_from(rfd_u).unwrap();
         let wfd = i32::try_from(wfd_u).unwrap();
@@ -790,10 +790,10 @@ mod test {
 
     #[test]
     fn test_pselect_read_hup() {
-        let task = crate::syscalls::tests::init_platform_with_broker();
+        let task = crate::syscalls::tests::init_platform();
 
         let (rfd_u, wfd_u) = task
-            .sys_pipe2(litebox::fs::OFlags::empty())
+            .sys_pipe2(litebox_common_linux::OFlags::empty())
             .expect("pipe2 failed");
         let rfd = i32::try_from(rfd_u).unwrap();
         let wfd = i32::try_from(wfd_u).unwrap();

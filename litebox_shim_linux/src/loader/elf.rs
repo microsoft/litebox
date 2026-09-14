@@ -5,11 +5,11 @@
 
 use alloc::{ffi::CString, vec::Vec};
 use litebox::{
-    fs::{Mode, OFlags},
     mm::linux::{CreatePagesFlags, MappingError, PAGE_SIZE},
-    utils::{ReinterpretSignedExt, TruncateExt},
+    utils::ReinterpretSignedExt,
 };
-use litebox_common_linux::{MapFlags, errno::Errno, loader::ElfParsedFile};
+use litebox_broker_protocol::fs::FileMode as Mode;
+use litebox_common_linux::{MapFlags, OFlags, errno::Errno, loader::ElfParsedFile};
 use thiserror::Error;
 
 use crate::{
@@ -55,14 +55,17 @@ impl<Platform: ShimPlatform> litebox_common_linux::loader::ReadAt for &'_ ElfFil
                 return Ok(());
             }
             // Try to read the remaining bytes
-            let bytes_read = self.task.sys_read(self.fd, buf, Some(offset.trunc()))?;
+            let file_offset = usize::try_from(offset).map_err(|_| Errno::EOVERFLOW)?;
+            let bytes_read = self.task.sys_read(self.fd, buf, Some(file_offset))?;
             if bytes_read == 0 {
                 // reached the end of the file
                 return Err(Errno::ENODATA);
             } else {
                 // Successfully read some bytes
                 buf = &mut buf[bytes_read..];
-                offset += bytes_read as u64;
+                offset = offset
+                    .checked_add(bytes_read as u64)
+                    .ok_or(Errno::EOVERFLOW)?;
             }
         }
     }
@@ -140,7 +143,7 @@ impl<Platform: ShimPlatform> litebox_common_linux::loader::MapMemory for ElfFile
             prot.flags(),
             MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
             self.fd,
-            offset.trunc(),
+            usize::try_from(offset).map_err(|_| Errno::EOVERFLOW)?,
         )?;
         Ok(())
     }
@@ -380,10 +383,7 @@ mod tests {
     use alloc::vec::Vec;
 
     use crate::syscalls::tests::TestPlatform;
-    use litebox::{
-        fs::{Mode, OFlags},
-        platform::PageManagementProvider,
-    };
+    use litebox::platform::PageManagementProvider;
 
     use super::*;
 
@@ -393,9 +393,9 @@ mod tests {
     const ET_EXEC: u16 = 2;
     const ET_DYN: u16 = 3;
     #[cfg(target_arch = "x86_64")]
-    const EM_HOST: u16 = 62; // EM_X86_64
+    const EM_HOST: u16 = 62;
     #[cfg(target_arch = "aarch64")]
-    const EM_HOST: u16 = 183; // EM_AARCH64
+    const EM_HOST: u16 = 183;
     const PT_LOAD: u32 = 1;
     const PT_INTERP: u32 = 3;
     const PF_X: u32 = 1;
@@ -505,22 +505,16 @@ mod tests {
         buf
     }
 
-    fn write_file(task: &Task<TestPlatform>, path: &str, data: &[u8]) {
-        let fd = task
-            .sys_open(path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
-            .expect("failed to create test ELF");
-        let fd = i32::try_from(fd).expect("fd fits i32");
-        task.sys_write(fd, data, None)
-            .expect("failed to write test ELF");
-        task.sys_close(fd).expect("failed to close test ELF");
-    }
-
     #[test]
     #[cfg_attr(target_os = "macos", ignore = "macOS runner supports PIE guests only")]
     fn et_exec_interpreter_loads_top_down_above_low_heap() {
         let task = crate::syscalls::tests::init_platform();
-        write_file(&task, "/main", &minimal_elf(ET_EXEC, Some(INTERP_PATH)));
-        write_file(&task, "/ld.so", &minimal_elf(ET_DYN, None));
+        crate::syscalls::tests::create_file(
+            &task,
+            "/main",
+            &minimal_elf(ET_EXEC, Some(INTERP_PATH)),
+        );
+        crate::syscalls::tests::create_file(&task, "/ld.so", &minimal_elf(ET_DYN, None));
 
         let mut loader = ElfLoader::new(&task, "/main").expect("loader should parse test ELFs");
         let main = loader
@@ -536,13 +530,6 @@ mod tests {
             .load_mapped(task.global.platform)
             .expect("interpreter should load");
 
-        // The interpreter must land high — via the top-down search — so the
-        // low ET_EXEC brk heap below it is not capped. The exact address is
-        // not asserted: `get_unmmaped_area` returns the highest free gap, and
-        // host mappings seeded into the userland VMA tree can sit near the top
-        // and push that gap below the very top slot (see `mm/linux.rs`). Assert
-        // the invariant that matters — placement in the high half of the
-        // address space, far above the low-heap region — not one exact slot.
         let addr_max = <TestPlatform as PageManagementProvider<{ PAGE_SIZE }>>::TASK_ADDR_MAX;
         assert!(
             interp.base_addr >= addr_max / 2,

@@ -14,7 +14,6 @@
 
 extern crate alloc;
 
-use alloc::borrow::Cow;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -29,20 +28,15 @@ use litebox::{
     sync::futex::FutexManager,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _},
 };
+use litebox_broker_protocol::fs::{
+    FileAccessMode, FileMode as Mode, FileOpenFlags, FileSeekWhence as SeekWhence,
+};
 use litebox_common_linux::{
-    SyscallRequest,
+    OFlags, SyscallRequest,
     errno::Errno,
     user_pointers::{UserPtr, UserPtrMut},
 };
 use litebox_platform::time::TimeProvider;
-
-fn legacy_o_flags(flags: litebox_common_linux::OFlags) -> litebox::fs::OFlags {
-    litebox::fs::OFlags::from_bits_retain(flags.bits())
-}
-
-fn legacy_file_mode(mode: litebox_broker_protocol::fs::FileMode) -> litebox::fs::Mode {
-    litebox::fs::Mode::from_bits_retain(u32::from(mode.bits()))
-}
 
 #[cfg(target_arch = "aarch64")]
 const fn aarch64_rewrite_options() -> litebox_syscall_rewriter::RewriteOptions {
@@ -65,15 +59,9 @@ pub(crate) mod channel;
 pub mod loader;
 pub(crate) mod stdio;
 pub mod syscalls;
-pub mod transport;
 mod wait;
 
-pub type DefaultFS<Platform> = LinuxFS<Platform>;
-
-pub(crate) type LinuxFS<Platform> =
-    litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>;
-
-pub(crate) type FileFd<Platform> = litebox::fd::TypedFd<LinuxFS<Platform>>;
+pub(crate) use litebox::fs::FileFd;
 
 /// Aggregate bound capturing everything the shim requires of a platform.
 ///
@@ -233,27 +221,19 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         &self.litebox
     }
 
-    /// Create the default file system with the given in-memory layer and tar data.
-    pub fn default_fs(
-        &self,
-        in_mem: litebox::fs::in_mem::InMem<Platform>,
-        tar_data: Cow<'static, [u8]>,
-    ) -> DefaultFS<Platform> {
-        default_fs(&self.litebox, in_mem, tar_data)
-    }
-
     /// Build the shim.
     pub fn build(self) -> LinuxShim<Platform> {
-        let net = Network::new(&self.litebox);
+        let litebox = Arc::new(self.litebox);
+        let net = Network::new(&litebox);
         let global = Arc::new(GlobalState {
             platform: self.platform,
-            pm: PageManager::new(&self.litebox),
+            pm: PageManager::new(&litebox),
             futex_manager: FutexManager::new(),
-            pipes: Pipes::new(&self.litebox),
+            pipes: Pipes::new(&litebox),
             net: litebox::sync::Mutex::new(net),
             boot_time: self.platform.now(),
             next_thread_id: 2.into(), // start from 2, as 1 is used by the main thread
-            litebox: self.litebox,
+            litebox,
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
             elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
         });
@@ -273,7 +253,6 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
     /// initial register state.
     pub fn load_program(
         &self,
-        fs: alloc::sync::Arc<LinuxFS<Platform>>,
         task: litebox_common_linux::TaskParams,
         path: &str,
         argv: Vec<alloc::ffi::CString>,
@@ -288,7 +267,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             egid,
         } = task;
 
-        let files = syscalls::file::FilesState::new(fs);
+        let files = syscalls::file::FilesState::new();
         files.set_max_fd(syscalls::process::RLIMIT_NOFILE_CUR);
         let files = Arc::new(files);
         let credentials = Arc::new(syscalls::process::Credentials {
@@ -339,19 +318,8 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
         &self.0.pm
     }
 
-    /// Establish a TCP connection to the given address.
-    ///
-    /// Returns a [`transport::ShimTransport`] that can be used as a
-    /// byte-stream transport (e.g., for a 9P filesystem client).
-    pub fn tcp_connection(
-        &self,
-        addr: core::net::SocketAddr,
-    ) -> Result<transport::ShimTransport<Platform>, Errno> {
-        transport::ShimTransport::connect(self.0.clone(), addr)
-    }
-
     pub fn litebox(&self) -> &LiteBox<Platform> {
-        &self.0.litebox
+        self.0.litebox.as_ref()
     }
 
     /// Returns the platform this shim was built with.
@@ -389,50 +357,45 @@ impl<Platform: ShimPlatform> LinuxShimProcess<Platform> {
     }
 }
 
-/// Create the default file system with the given in-memory layer and tar data.
-fn default_fs<Platform: ShimPlatform>(
-    litebox: &LiteBox<Platform>,
-    in_mem: litebox::fs::in_mem::InMem<Platform>,
-    tar_data: Cow<'static, [u8]>,
-) -> LinuxFS<Platform> {
-    litebox::fs::resolver::Resolver::new(
-        litebox,
-        litebox::fs::composer::Composer::builder()
-            .mount_nestable("/", |allocators| {
-                litebox::fs::overlay::Overlay::<Platform>::new(
-                    in_mem,
-                    litebox::fs::tar_ro::TarRo::new(tar_data, allocators.next()),
-                    allocators.next(),
-                )
-            })
-            .mount("/dev", litebox::fs::devices::Devices::new)
-            .build()
-            .unwrap(),
-    )
-}
-
 // Special override so that `GETFL` can return stdio-specific flags
 #[derive(Clone)]
-pub(crate) struct StdioStatusFlags(litebox::fs::OFlags);
+pub(crate) struct StdioStatusFlags(OFlags);
 
 impl<Platform: ShimPlatform> syscalls::file::FilesState<Platform> {
     fn initialize_stdio_in_shared_descriptors_table(
         &self,
         global: &GlobalState<Platform>,
-        context: &litebox::fs::resolver::Context,
+        context: &litebox::fs::Context,
     ) {
-        use litebox::fs::{Mode, OFlags};
-        let stdin = self
-            .fs
-            .open(context, "/dev/stdin", OFlags::RDONLY, Mode::empty())
+        let stdin = global
+            .litebox
+            .open_file(
+                context,
+                "/dev/stdin",
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::NONE,
+                Mode::empty(),
+            )
             .unwrap();
-        let stdout = self
-            .fs
-            .open(context, "/dev/stdout", OFlags::WRONLY, Mode::empty())
+        let stdout = global
+            .litebox
+            .open_file(
+                context,
+                "/dev/stdout",
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::NONE,
+                Mode::empty(),
+            )
             .unwrap();
-        let stderr = self
-            .fs
-            .open(context, "/dev/stderr", OFlags::WRONLY, Mode::empty())
+        let stderr = global
+            .litebox
+            .open_file(
+                context,
+                "/dev/stderr",
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::NONE,
+                Mode::empty(),
+            )
             .unwrap();
         let mut dt = global.litebox.descriptor_table_mut();
         let mut rds = self.raw_descriptor_store.write();
@@ -488,7 +451,7 @@ impl<Platform: ShimPlatform> syscalls::file::FilesState<Platform> {
             };
         }
 
-        resolve_fd!(LinuxFS<Platform>, Fs);
+        resolve_fd!(litebox::fs::BrokerFile, Fs);
         resolve_fd!(Network<Platform>, Network);
         resolve_fd!(Pipes<Platform>, Pipes);
         resolve_fd!(syscalls::eventfd::EventfdSubsystem<Platform>, Eventfd);
@@ -628,43 +591,20 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     // If the read size is too large, we need to do some extra work to avoid OOMing.
                     // We read data in chunks and update the file offset ourselves only if the read succeeds.
                     self.with_typed_fd(fd, |fd| {
+                        let cur_loc = self.do_seek(fd, 0, SeekWhence::RelativeToCurrentOffset)?;
+                        let read_total = self.do_pread_with_user_buf(
+                            fd,
+                            buf,
+                            count,
+                            i64::try_from(cur_loc).map_err(|_| Errno::EOVERFLOW)?,
+                        )?;
+                        let new_loc = cur_loc.checked_add(read_total).ok_or(Errno::EOVERFLOW)?;
                         self.do_seek(
                             fd,
-                            0,
-                            litebox::fs::SeekWhence::RelativeToCurrentOffset,
-                        )
-                        .inspect_err(|e| {
-                            match *e {
-                                Errno::EBADF => (), // safe errors to return
-                                Errno::ESPIPE => {
-                                    unimplemented!("read on non-seekable fds with large buffers");
-                                }
-                                Errno::EINVAL => {
-                                    unreachable!("seekable file should not return EINVAL when getting current offset");
-                                }
-                                _ => {
-                                    unimplemented!("unexpected error from lseek: {}", e);
-                                }
-                            }
-                        })
-                        .and_then(|cur_loc| {
-                            self.do_pread_with_user_buf(
-                                fd,
-                                buf,
-                                count,
-                                i64::try_from(cur_loc).unwrap(),
-                            )
-                            .inspect(|read_total| {
-                                // Update the file offset to reflect the read we just did.
-                                self.do_seek(
-                                    fd,
-                                    (cur_loc + read_total).reinterpret_as_signed(),
-                                    litebox::fs::SeekWhence::RelativeToBeginning,
-                                )
-                                // Given that previous lseek and pread succeeded, this lseek should also succeed.
-                                .expect("lseek failed");
-                            })
-                        })
+                            isize::try_from(new_loc).map_err(|_| Errno::EOVERFLOW)?,
+                            SeekWhence::RelativeToBeginning,
+                        )?;
+                        Ok(read_total)
                     })
                 }
             }
@@ -786,7 +726,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 oldfd,
                 newfd,
                 flags,
-            } => syscall!(sys_dup(oldfd, newfd, flags.map(legacy_o_flags))),
+            } => syscall!(sys_dup(oldfd, newfd, flags)),
             SyscallRequest::Socket {
                 domain,
                 type_and_flags,
@@ -990,15 +930,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 pathname,
                 flags,
                 mode,
-            } => {
-                let flags = legacy_o_flags(flags);
-                let mode = legacy_file_mode(mode);
-                pathname
-                    .to_cstring::<Platform>()
-                    .map_or(Err(Errno::EFAULT), |path| {
-                        syscall!(sys_openat(dirfd, path, flags, mode))
-                    })
-            }
+            } => pathname
+                .to_cstring::<Platform>()
+                .map_or(Err(Errno::EFAULT), |path| {
+                    syscall!(sys_openat(dirfd, path, flags, mode))
+                }),
             SyscallRequest::Ftruncate { fd, length } => syscall!(sys_ftruncate(fd, length)),
             SyscallRequest::Mknodat {
                 dirfd,
@@ -1088,7 +1024,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 syscall!(sys_eventfd2(initval, flags))
             }
             SyscallRequest::Pipe2 { pipefd, flags } => {
-                let flags = legacy_o_flags(flags);
                 self.sys_pipe2(flags).and_then(|(read_fd, write_fd)| {
                     pipefd
                         .write_at_offset::<Platform>(0, read_fd)
@@ -1206,7 +1141,7 @@ struct GlobalState<Platform: ShimPlatform> {
     /// The platform instance used throughout the shim.
     platform: &'static Platform,
     /// The LiteBox instance used throughout the shim.
-    litebox: litebox::LiteBox<Platform>,
+    litebox: Arc<litebox::LiteBox<Platform>>,
     /// The page manager for managing virtual memory.
     pm: litebox::mm::PageManager<Platform, { PAGE_SIZE }>,
     /// The futex manager for handling futex operations.
@@ -1262,14 +1197,11 @@ mod test_utils {
 
     impl<Platform: ShimPlatform> GlobalState<Platform> {
         /// Make a new task with default values for testing.
-        pub(crate) fn new_test_task(
-            self: Arc<Self>,
-            fs: alloc::sync::Arc<LinuxFS<Platform>>,
-        ) -> Task<Platform> {
+        pub(crate) fn new_test_task(self: Arc<Self>) -> Task<Platform> {
             let pid = self
                 .next_thread_id
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            let files = Arc::new(syscalls::file::FilesState::new(fs));
+            let files = Arc::new(syscalls::file::FilesState::new());
             let credentials = Arc::new(syscalls::process::Credentials {
                 uid: 0,
                 euid: 0,

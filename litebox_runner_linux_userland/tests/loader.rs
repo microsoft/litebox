@@ -4,148 +4,24 @@
 mod cache;
 mod common;
 
-use std::ffi::CString;
-
-use litebox::fs::{Mode, OFlags};
-use litebox_platform_linux_userland::LinuxUserland as Platform;
-
-struct TestLauncher {
-    platform: &'static Platform,
-    shim_builder: litebox_shim_linux::LinuxShimBuilder<Platform>,
-    fs: litebox_shim_linux::DefaultFS<Platform>,
-    context: litebox::fs::resolver::Context,
-}
-
-impl TestLauncher {
-    fn init_platform(tar_data: &'static [u8], initial_files: &[&str]) -> Self {
-        let platform = Platform::new();
-        let shim_builder = litebox_shim_linux::LinuxShimBuilder::new(platform);
-
-        let in_mem = litebox::fs::in_mem::InMem::new_initialized([(
-            "/",
-            litebox::fs::in_mem::InitialNode::Directory {
-                mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
-                owner: litebox::fs::UserInfo::ROOT,
-            },
-        )]);
-        let tar_data = if tar_data.is_empty() {
-            litebox::fs::tar_ro::EMPTY_TAR_FILE.into()
-        } else {
-            tar_data.into()
-        };
-        let fs = shim_builder.default_fs(in_mem, tar_data);
-        let mut this = Self {
-            platform,
-            shim_builder,
-            fs,
-            context: litebox::fs::resolver::Context::new(),
-        };
-
-        for each in initial_files {
-            this.install_dir_all(std::path::Path::new(each).parent().unwrap());
-            let data = std::fs::read(each).unwrap();
-            this.install_file(data, each);
-        }
-
-        this
-    }
-
-    fn install_dir_all(&mut self, path: &std::path::Path) {
-        let mut ancestors: Vec<_> = path
-            .ancestors()
-            .filter(|a| *a != std::path::Path::new("/") && !a.as_os_str().is_empty())
-            .collect();
-        ancestors.reverse();
-        for ancestor in ancestors {
-            if let Err(e) = self.install_dir(ancestor.to_str().unwrap()) {
-                assert!(
-                    matches!(e, litebox::fs::errors::MkdirError::AlreadyExists),
-                    "Failed to create directory {}: {e}",
-                    ancestor.display()
-                );
-            }
-        }
-    }
-
-    fn install_dir(&mut self, path: &str) -> Result<(), litebox::fs::errors::MkdirError> {
-        self.fs
-            .mkdir(&self.context, path, Mode::RWXU | Mode::RWXG | Mode::RWXO)
-    }
-
-    fn install_file(&mut self, contents: Vec<u8>, out: &str) {
-        let fd = self
-            .fs
-            .open(
-                &self.context,
-                out,
-                OFlags::CREAT | OFlags::WRONLY,
-                Mode::RWXG | Mode::RWXO | Mode::RWXU,
-            )
-            .unwrap();
-        self.fs.write(&fd, &contents, None).unwrap();
-        self.fs.close(&fd).unwrap();
-    }
-
-    fn test_load_exec_common(self, executable_path: &str) {
-        let argv = vec![
-            CString::new(executable_path).unwrap(),
-            CString::new("hello").unwrap(),
-        ];
-        let envp = vec![
-            CString::new("PATH=/bin").unwrap(),
-            CString::new("HOME=/").unwrap(),
-        ];
-        let fs = std::sync::Arc::new(self.fs);
-        let shim = self.shim_builder.build();
-        let program = shim
-            .load_program(fs, self.platform.init_task(), executable_path, argv, envp)
-            .unwrap();
-        unsafe {
-            litebox_platform_linux_userland::run_thread(
-                program.entrypoints,
-                &mut litebox_common_linux::PtRegs::default(),
-            );
-        }
-        assert_eq!(
-            program.process.wait(),
-            0,
-            "process exited with non-zero code"
-        );
-    }
-}
+use common::runner::Runner;
 
 #[test]
 fn test_load_exec_dynamic() {
     let path = common::compile("./tests/hello.c", "hello_dylib", false, false);
-
-    let files_to_install = common::find_dependencies(path.to_str().unwrap());
-
-    let executable_path = "/hello_dylib";
-    let executable_data = std::fs::read(path).unwrap();
-
-    let mut launcher = TestLauncher::init_platform(
-        &[],
-        &files_to_install
-            .iter()
-            .map(std::string::String::as_str)
-            .collect::<Vec<_>>(),
-    );
-    launcher.install_file(executable_data, executable_path);
-    launcher.test_load_exec_common(executable_path);
+    Runner::new(&path, "loader_dynamic")
+        .env("PATH=/bin")
+        .arg("hello")
+        .run();
 }
 
 #[test]
 fn test_load_exec_static() {
     let path = common::compile("./tests/hello.c", "hello_exec", true, false);
-
-    let executable_path = "/hello_exec";
-    let executable_data = std::fs::read(path).unwrap();
-
-    let mut launcher = TestLauncher::init_platform(&[], &[]);
-
-    launcher.install_file(executable_data, executable_path);
-
-    launcher.test_load_exec_common(executable_path);
+    Runner::new(&path, "loader_static")
+        .env("PATH=/bin")
+        .arg("hello")
+        .run();
 }
 
 const HELLO_WORLD_NOLIBC: &str = r#"
@@ -277,10 +153,8 @@ fn test_syscall_rewriter() {
     let rewrite_success = common::rewrite_with_cache(&path, &hooked_path, &[]);
     assert!(rewrite_success, "failed to run syscall rewriter");
 
-    let executable_path = "/hello_exec_nolibc.hooked";
-    let executable_data = std::fs::read(hooked_path).unwrap();
-
-    let mut launcher = TestLauncher::init_platform(&[], &[]);
-    launcher.install_file(executable_data, executable_path);
-    launcher.test_load_exec_common(executable_path);
+    Runner::new_pre_rewritten(&hooked_path, "loader_pre_rewritten")
+        .env("PATH=/bin")
+        .arg("hello")
+        .run();
 }

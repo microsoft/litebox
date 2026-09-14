@@ -1,27 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use litebox::fs::{Mode, OFlags};
-use litebox_broker_core::{
-    BrokerCore, BrokerSession, CallerCredential, ObjectRights, PolicyEngine,
-    test_support::{TerminalOnlyStdioProvider, TestBrokerCoreBuilder},
-};
-use litebox_broker_local::BrokerLocal;
-use litebox_broker_protocol::{
-    BROKER_PROTOCOL_VERSION,
-    message::{
-        BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerOperation, BrokerRequest,
-        BrokerResponse, BrokerResult, PipeRequest, PipeResponse, StdioRequest, StdioResponse,
-    },
-    pipe::{CreatePipeResponse, ReadPipeResponse, WritePipeResponse},
-    shared_buffer::{SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SharedBufferSequence},
-    stdio::{IsTerminalStdioResponse, StdioStream},
-};
-use litebox_broker_transport::{
-    channel::{LocalCallChannel, LocalSetupChannel},
-    shared_memory::{SharedBufferPool, SharedMemory, SharedMemoryError},
-};
-use litebox_common_linux::{AtFlags, EfdFlags, FcntlArg, FileDescriptorFlags, errno::Errno};
+use litebox_broker_protocol::fs::FileMode as Mode;
+use litebox_common_linux::{AtFlags, FcntlArg, FileDescriptorFlags, OFlags, errno::Errno};
 use zerocopy::FromBytes as _;
 
 use crate::UserPtrMut;
@@ -33,8 +14,6 @@ use litebox_common_linux::signal::FPE_INTDIV;
 use litebox_common_linux::signal::{ILL_ILLOPN, SI_KERNEL, SiginfoData, Signal};
 
 extern crate std;
-
-const TEST_TAR_FILE: &[u8] = include_bytes!("../../../litebox_broker_core/src/fs/test.tar");
 
 /// The concrete platform used by the shim's unit tests.
 ///
@@ -54,248 +33,33 @@ pub(crate) fn test_platform() -> &'static TestPlatform {
     PLATFORM.get_or_init(TestPlatform::new)
 }
 
-fn test_broker() -> &'static BrokerCore {
-    static BROKER: std::sync::OnceLock<BrokerCore> = std::sync::OnceLock::new();
-    BROKER.get_or_init(|| {
-        TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
-            ObjectRights::all(),
-        ))
-        .with_stdio_provider(alloc::sync::Arc::new(
-            TerminalOnlyStdioProvider::default().with_terminal(StdioStream::Stdout),
-        ))
-        .build()
-        .unwrap()
-    })
-}
-
+/// Returns a task connected to the process-wide in-memory test broker.
 #[must_use]
 pub(crate) fn init_platform() -> crate::Task<TestPlatform> {
     let platform = test_platform();
-
-    init_platform_with_builder(crate::LinuxShimBuilder::new(platform))
+    let litebox = crate::syscalls::test_broker::litebox(platform);
+    let shim_builder = crate::LinuxShimBuilder::new_with_litebox(platform, litebox);
+    shim_builder.build().0.new_test_task()
 }
 
-#[must_use]
-pub(crate) fn init_platform_with_broker() -> crate::Task<TestPlatform> {
-    let platform = test_platform();
-    let setup = TestBrokerSetup::new();
-    let (broker_local, ()) = BrokerLocal::negotiate(setup, |setup| {
-        let memory: alloc::sync::Arc<dyn SharedMemory> = setup.memory.clone();
-        Ok((setup.activate(), memory, ()))
-    })
-    .unwrap();
-    let litebox = litebox::LiteBox::new_with_broker_local(platform, broker_local);
-    init_platform_with_builder(crate::LinuxShimBuilder::new_with_litebox(platform, litebox))
+pub(crate) fn create_directory(task: &crate::Task<TestPlatform>, path: &str) {
+    task.sys_mkdirat(litebox_common_linux::AT_FDCWD, path, 0o777)
+        .expect("the test directory must be created");
 }
 
-fn init_platform_with_builder(
-    shim_builder: crate::LinuxShimBuilder<TestPlatform>,
-) -> crate::Task<TestPlatform> {
-    let in_mem = litebox::fs::in_mem::InMem::new_initialized([(
-        "/",
-        litebox::fs::in_mem::InitialNode::Directory {
-            mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
-            owner: litebox::fs::UserInfo::ROOT,
-        },
-    )]);
-    let fs = alloc::sync::Arc::new(shim_builder.default_fs(in_mem, TEST_TAR_FILE.into()));
-    shim_builder.build().0.new_test_task(fs)
-}
-
-struct TestBrokerSetup {
-    memory: alloc::sync::Arc<TestSharedMemory>,
-    session: BrokerSession,
-}
-
-impl TestBrokerSetup {
-    fn new() -> Self {
-        Self {
-            memory: alloc::sync::Arc::new(TestSharedMemory::new()),
-            session: test_broker()
-                .create_session(CallerCredential::Unauthenticated)
-                .unwrap(),
-        }
+pub(crate) fn create_file(task: &crate::Task<TestPlatform>, path: &str, data: &[u8]) {
+    let fd = task
+        .sys_open(
+            path,
+            OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
+            Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::ROTH,
+        )
+        .expect("the test file must be created");
+    let fd = i32::try_from(fd).unwrap();
+    if !data.is_empty() {
+        assert_eq!(task.sys_write(fd, data, None), Ok(data.len()));
     }
-
-    fn activate(self) -> TestBrokerChannel {
-        let shared_buffers = SharedBufferPool::new(self.memory, SHARED_BUFFER_LAYOUT).unwrap();
-        TestBrokerChannel {
-            session: self.session,
-            shared_buffers,
-        }
-    }
-}
-
-impl LocalSetupChannel for TestBrokerSetup {
-    type Error = core::convert::Infallible;
-
-    fn send_handshake_request(
-        &mut self,
-        request: &BrokerHandshakeRequest,
-    ) -> core::result::Result<(), Self::Error> {
-        assert_eq!(request.protocol_version, BROKER_PROTOCOL_VERSION);
-        Ok(())
-    }
-
-    fn recv_handshake_response(
-        &mut self,
-    ) -> core::result::Result<Option<BrokerHandshakeResponse>, Self::Error> {
-        Ok(Some(BrokerHandshakeResponse::Negotiated {
-            broker_protocol_version: BROKER_PROTOCOL_VERSION,
-        }))
-    }
-}
-
-struct TestBrokerChannel {
-    session: BrokerSession,
-    shared_buffers: SharedBufferPool<alloc::sync::Arc<TestSharedMemory>>,
-}
-
-impl TestBrokerChannel {
-    fn write_shared_buffer(&self, buffer: SharedBufferSequence, data: &[u8]) {
-        let mut offset = 0;
-        for descriptor in buffer.descriptors(SHARED_BUFFER_LAYOUT).unwrap() {
-            if offset == data.len() {
-                break;
-            }
-            let length = (data.len() - offset).min(descriptor.length as usize);
-            let end = offset + length;
-            self.shared_buffers
-                .write(descriptor.slot_index, &data[offset..end])
-                .expect("broker write must use a valid shared buffer");
-            offset = end;
-        }
-        assert_eq!(offset, data.len());
-    }
-
-    fn read_shared_buffer(&self, buffer: SharedBufferSequence) -> std::vec::Vec<u8> {
-        let mut data = std::vec![0; buffer.length() as usize];
-        let mut offset = 0;
-        for descriptor in buffer.descriptors(SHARED_BUFFER_LAYOUT).unwrap() {
-            let end = offset + descriptor.length as usize;
-            self.shared_buffers
-                .read(descriptor.slot_index, &mut data[offset..end])
-                .expect("broker read must use a valid shared buffer");
-            offset = end;
-        }
-        data
-    }
-
-    fn execute(&self, operation: BrokerOperation) -> litebox_broker_core::Result<BrokerResult> {
-        match operation {
-            BrokerOperation::CloseObject(handle) => self
-                .session
-                .close_object_reference(handle)
-                .map(|()| BrokerResult::ObjectClosed),
-            BrokerOperation::CheckReadiness(handle) => self
-                .session
-                .check_readiness(handle)
-                .map(BrokerResult::Readiness),
-            BrokerOperation::Pipe(PipeRequest::Create(request)) => {
-                litebox_broker_core::pipe::create(
-                    &self.session,
-                    request.capacity,
-                    request.atomic_write_size,
-                )
-                .map(|(read_handle, write_handle)| {
-                    BrokerResult::Pipe(PipeResponse::Create(CreatePipeResponse {
-                        read_handle,
-                        write_handle,
-                    }))
-                })
-            }
-            BrokerOperation::Pipe(PipeRequest::Read(request)) => {
-                let data = litebox_broker_core::pipe::read(
-                    &self.session,
-                    request.handle,
-                    request.buffer.length(),
-                )?;
-                self.write_shared_buffer(request.buffer, &data);
-                Ok(BrokerResult::Pipe(PipeResponse::Read(ReadPipeResponse {
-                    read: u32::try_from(data.len()).unwrap(),
-                })))
-            }
-            BrokerOperation::Pipe(PipeRequest::Write(request)) => {
-                let data = self.read_shared_buffer(request.buffer);
-                litebox_broker_core::pipe::write(&self.session, request.handle, &data).map(
-                    |written| {
-                        BrokerResult::Pipe(PipeResponse::Write(WritePipeResponse {
-                            written: u32::try_from(written).unwrap(),
-                        }))
-                    },
-                )
-            }
-            BrokerOperation::Stdio(StdioRequest::IsTerminal(request)) => {
-                litebox_broker_core::stdio::is_terminal(&self.session, request.stream).map(
-                    |is_terminal| {
-                        BrokerResult::Stdio(StdioResponse::IsTerminal(IsTerminalStdioResponse {
-                            is_terminal,
-                        }))
-                    },
-                )
-            }
-            operation => panic!("unexpected pipe test broker operation: {operation:?}"),
-        }
-    }
-}
-
-impl LocalCallChannel for TestBrokerChannel {
-    type Error = core::convert::Infallible;
-
-    fn call(&self, request: BrokerRequest) -> core::result::Result<BrokerResponse, Self::Error> {
-        let result = self
-            .execute(request.operation)
-            .unwrap_or_else(|error| BrokerResult::Error(error.into()));
-        Ok(BrokerResponse {
-            request_id: request.request_id,
-            result,
-        })
-    }
-}
-
-struct TestSharedMemory(std::sync::Mutex<std::vec::Vec<u8>>);
-
-impl TestSharedMemory {
-    fn new() -> Self {
-        Self(std::sync::Mutex::new(std::vec![
-            0;
-            SHARED_BUFFER_POOL_SIZE
-        ]))
-    }
-}
-
-impl SharedMemory for TestSharedMemory {
-    fn len(&self) -> usize {
-        SHARED_BUFFER_POOL_SIZE
-    }
-
-    fn read(
-        &self,
-        offset: usize,
-        destination: &mut [u8],
-    ) -> core::result::Result<(), SharedMemoryError> {
-        let memory = self.0.lock().unwrap();
-        let end = offset
-            .checked_add(destination.len())
-            .ok_or(SharedMemoryError::InvalidRange)?;
-        let source = memory
-            .get(offset..end)
-            .ok_or(SharedMemoryError::InvalidRange)?;
-        destination.copy_from_slice(source);
-        Ok(())
-    }
-
-    fn write(&self, offset: usize, source: &[u8]) -> core::result::Result<(), SharedMemoryError> {
-        let mut memory = self.0.lock().unwrap();
-        let end = offset
-            .checked_add(source.len())
-            .ok_or(SharedMemoryError::InvalidRange)?;
-        let destination = memory
-            .get_mut(offset..end)
-            .ok_or(SharedMemoryError::InvalidRange)?;
-        destination.copy_from_slice(source);
-        Ok(())
-    }
+    task.sys_close(fd).expect("the test file must close");
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -389,7 +153,7 @@ fn exceptions_queue_their_corresponding_signals() {
 
 #[test]
 fn test_fcntl() {
-    let task = init_platform_with_broker();
+    let task = init_platform();
 
     let check = |fd: i32, flags1: OFlags, flags2: OFlags| {
         assert_eq!(
@@ -404,8 +168,7 @@ fn test_fcntl() {
         assert_eq!(task.sys_fcntl(fd, FcntlArg::GETFD).unwrap(), 0);
 
         // OFlags::RDWR should be ignored
-        task.sys_fcntl(fd, FcntlArg::SETFL(litebox_common_linux::OFlags::RDWR))
-            .unwrap();
+        task.sys_fcntl(fd, FcntlArg::SETFL(OFlags::RDWR)).unwrap();
         assert_eq!(task.sys_fcntl(fd, FcntlArg::GETFL).unwrap(), flags2.bits());
     };
 
@@ -417,16 +180,6 @@ fn test_fcntl() {
     check(read_fd, OFlags::RDONLY | OFlags::NONBLOCK, OFlags::RDONLY);
     let write_fd = i32::try_from(write_fd).unwrap();
     check(write_fd, OFlags::WRONLY | OFlags::NONBLOCK, OFlags::WRONLY);
-
-    // Eventfd requires broker control in this shim configuration.
-    let brokerless_task = init_platform();
-    assert_eq!(
-        brokerless_task.sys_eventfd2(
-            0,
-            EfdFlags::CLOEXEC | EfdFlags::SEMAPHORE | EfdFlags::NONBLOCK,
-        ),
-        Err(Errno::EIO)
-    );
 
     // Test fcntl with DUPFD
     let fd = task
@@ -450,15 +203,8 @@ fn test_fcntl() {
 }
 
 #[test]
-fn test_pipe2_requires_broker() {
-    let task = init_platform();
-
-    assert_eq!(task.sys_pipe2(OFlags::empty()), Err(Errno::EIO));
-}
-
-#[test]
 fn test_pipe2_race_with_concurrent_close() {
-    let task = init_platform_with_broker();
+    let task = init_platform();
     task.files.borrow().set_max_fd(4);
 
     let stop = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
@@ -517,25 +263,8 @@ fn test_getdent64() {
     let task = init_platform();
 
     // Create test files in root directory for testing
-    let file1_fd = task
-        .sys_open(
-            "/test_file1.txt",
-            OFlags::CREAT | OFlags::WRONLY,
-            Mode::RUSR | Mode::WUSR,
-        )
-        .expect("Failed to create test_file1.txt");
-    task.sys_close(file1_fd.try_into().unwrap())
-        .expect("Failed to close test_file1.txt");
-
-    let file2_fd = task
-        .sys_open(
-            "/test_file2.txt",
-            OFlags::CREAT | OFlags::WRONLY,
-            Mode::RUSR | Mode::WUSR,
-        )
-        .expect("Failed to create test_file2.txt");
-    task.sys_close(file2_fd.try_into().unwrap())
-        .expect("Failed to close test_file2.txt");
+    create_file(&task, "/test_file1.txt", &[]);
+    create_file(&task, "/test_file2.txt", &[]);
 
     // Open the root directory for testing
     let dir_fd = task
@@ -605,15 +334,7 @@ fn test_getdent64() {
     entry_names.sort();
     assert_eq!(
         entry_names,
-        alloc::vec![
-            ".",
-            "..",
-            "bar",
-            "dev",
-            "foo",
-            "test_file1.txt",
-            "test_file2.txt"
-        ]
+        alloc::vec![".", "..", "dev", "test_file1.txt", "test_file2.txt"]
     );
 
     // Verify that our test files have the correct type (regular file)
@@ -771,15 +492,7 @@ fn test_getdent64() {
     all_entries.sort();
     assert_eq!(
         all_entries,
-        alloc::vec![
-            ".",
-            "..",
-            "bar",
-            "dev",
-            "foo",
-            "test_file1.txt",
-            "test_file2.txt"
-        ]
+        alloc::vec![".", "..", "dev", "test_file1.txt", "test_file2.txt"]
     );
 }
 
@@ -789,7 +502,7 @@ fn test_umask_behavior() {
 
     // 1. Capture original mask without changing final state.
     let orig = task.sys_umask(0).bits(); // sets mask to 0, returns previous
-    let _ = task.sys_umask(orig); // restore original
+    let _ = task.sys_umask(u32::from(orig)); // restore original
 
     // We expect the default (from implementation) to be 0o022.
     assert_eq!(orig, 0o022, "Default umask should be 022 (got {orig:03o})");
@@ -817,8 +530,12 @@ fn test_umask_behavior() {
     // 3. Create a directory with mode 0o777; with umask 0o077 should become 0o700.
     let dir_mode = (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits();
     let test_dir = "/umask_rs_test_dir";
-    task.sys_mkdirat(litebox_common_linux::AT_FDCWD, test_dir, dir_mode)
-        .expect("Failed to create test directory");
+    task.sys_mkdirat(
+        litebox_common_linux::AT_FDCWD,
+        test_dir,
+        u32::from(dir_mode),
+    )
+    .expect("Failed to create directory");
 
     let stat_dir = task
         .sys_stat(test_dir)
@@ -839,14 +556,14 @@ fn test_umask_behavior() {
         "Only low 9 bits should be retained (expected 777)"
     );
     // Restore to original
-    let _ = task.sys_umask(orig);
+    let _ = task.sys_umask(u32::from(orig));
 }
 
 #[test]
 fn test_rlimit_nofile() {
     use litebox_common_linux::{Rlimit, RlimitResource, errno::Errno};
 
-    let task = crate::syscalls::tests::init_platform();
+    let task = init_platform();
 
     // 1. Get the current NOFILE limit.
     let cur_lim = task
@@ -887,11 +604,23 @@ fn test_rlimit_nofile() {
             .expect_err("dup should fail due to new cur limit"),
         Errno::EMFILE,
     );
-    assert_eq!(
-        task.sys_open("/prlimit_file", OFlags::CREAT | OFlags::RDONLY, Mode::RWXU)
-            .expect_err("open should fail due to new cur limit"),
-        Errno::EMFILE,
-    );
+    for _ in 0..32 {
+        assert_eq!(
+            task.sys_open("/prlimit_file", OFlags::CREAT | OFlags::RDONLY, Mode::RWXU)
+                .expect_err("open should fail due to new cur limit"),
+            Errno::EMFILE,
+            "a failed guest-fd allocation must close its transient broker handle"
+        );
+    }
+    task.do_prlimit(RlimitResource::NOFILE, Some(cur_lim))
+        .expect("restoring the NOFILE limit must succeed");
+    task.sys_close(i32::try_from(probe_fd).unwrap()).unwrap();
+    task.sys_unlinkat(
+        litebox_common_linux::AT_FDCWD,
+        "/prlimit_file",
+        AtFlags::empty(),
+    )
+    .expect("the file created before descriptor allocation failed must remain removable");
 }
 
 #[test]
@@ -920,8 +649,12 @@ fn test_unlinkat() {
     // 2. Create a directory and attempt to unlink without AT_REMOVEDIR -> EISDIR.
     let dir_path = "/unlink_dir";
     let dir_mode = (Mode::RWXU | Mode::RWXG | Mode::RWXO).bits();
-    task.sys_mkdirat(litebox_common_linux::AT_FDCWD, dir_path, dir_mode)
-        .expect("Failed to create directory");
+    task.sys_mkdirat(
+        litebox_common_linux::AT_FDCWD,
+        dir_path,
+        u32::from(dir_mode),
+    )
+    .expect("Failed to create directory");
     assert_eq!(
         task.sys_unlinkat(0, dir_path, AtFlags::empty()),
         Err(Errno::EISDIR),
@@ -930,8 +663,12 @@ fn test_unlinkat() {
 
     // 3. Create a non-empty directory and remove with AT_REMOVEDIR -> ENOTEMPTY.
     let nonempty_dir = "/unlink_dir_nonempty";
-    task.sys_mkdirat(litebox_common_linux::AT_FDCWD, nonempty_dir, dir_mode)
-        .expect("Failed to create non-empty directory");
+    task.sys_mkdirat(
+        litebox_common_linux::AT_FDCWD,
+        nonempty_dir,
+        u32::from(dir_mode),
+    )
+    .expect("Failed to create non-empty directory");
     let inner_file_fd = task
         .sys_open(
             "/unlink_dir_nonempty/inner.txt",
@@ -969,8 +706,12 @@ fn test_unlinkat() {
 
     // 6. Create and remove another empty directory to ensure repeatability.
     let empty_dir2 = "/unlink_empty_dir";
-    task.sys_mkdirat(litebox_common_linux::AT_FDCWD, empty_dir2, dir_mode)
-        .expect("Failed to create second empty directory");
+    task.sys_mkdirat(
+        litebox_common_linux::AT_FDCWD,
+        empty_dir2,
+        u32::from(dir_mode),
+    )
+    .expect("Failed to create second empty directory");
     task.sys_unlinkat(0, empty_dir2, AtFlags::AT_REMOVEDIR)
         .expect("Should remove second empty directory");
     assert_eq!(

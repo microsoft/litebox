@@ -1033,9 +1033,13 @@ pub enum MappingError {
     NotAFile,
     #[error("file not open for reading")]
     NotForReading,
+    #[error("invalid memory permissions")]
+    InvalidPermissions,
 
     #[error("mapping failed: {0}")]
     MapError(#[from] crate::platform::page_mgmt::AllocationError),
+    #[error("failed to apply mapping permissions: {0}")]
+    ProtectError(#[from] VmemProtectError),
 }
 
 /// Enable [`super::PageManager`] to handle page faults if its platform implements this trait

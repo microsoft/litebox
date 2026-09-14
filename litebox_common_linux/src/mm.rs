@@ -7,12 +7,32 @@ use litebox::{
     mm::linux::{
         CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, PAGE_SIZE, VmemUnmapError,
     },
-    platform::page_mgmt::DeallocationError,
+    platform::page_mgmt::{DeallocationError, MemoryRegionPermissions},
 };
 
 use crate::{MRemapFlags, MapFlags, ProtFlags, UserPtrMut, errno::Errno};
 
 const PAGE_MASK: usize = !(PAGE_SIZE - 1);
+
+fn memory_region_permissions(prot: &ProtFlags) -> Option<MemoryRegionPermissions> {
+    if prot.bits() & !ProtFlags::PROT_READ_WRITE_EXEC.bits() != 0 {
+        return None;
+    }
+    let mut permissions = MemoryRegionPermissions::empty();
+    permissions.set(
+        MemoryRegionPermissions::READ,
+        prot.contains(ProtFlags::PROT_READ),
+    );
+    permissions.set(
+        MemoryRegionPermissions::WRITE,
+        prot.contains(ProtFlags::PROT_WRITE),
+    );
+    permissions.set(
+        MemoryRegionPermissions::EXEC,
+        prot.contains(ProtFlags::PROT_EXEC),
+    );
+    Some(permissions)
+}
 
 pub fn do_mmap<
     Platform: litebox::platform::RawPointerProvider
@@ -59,29 +79,13 @@ pub fn do_mmap<
         None => None,
     };
     let length = NonZeroPageSize::new(len).ok_or(MappingError::UnAligned)?;
-    match prot {
-        ProtFlags::PROT_READ_EXEC => unsafe {
-            pm.create_executable_pages(suggested_addr, length, flags, op)
-        },
-        ProtFlags::PROT_READ_WRITE => unsafe {
-            pm.create_writable_pages(suggested_addr, length, flags, op)
-        },
-        ProtFlags::PROT_READ => unsafe {
-            pm.create_readable_pages(suggested_addr, length, flags, op)
-        },
-        ProtFlags::PROT_NONE => unsafe {
-            pm.create_inaccessible_pages(suggested_addr, length, flags, op)
-        },
-        _ => {
-            #[cfg(debug_assertions)]
-            todo!("Unsupported prot flags {:?}", prot);
-            // TODO: create inaccessible pages for now. Creating mapping
-            // for both executable and writable might be needed for JIT.
-            #[cfg(not(debug_assertions))]
-            unsafe {
-                pm.create_inaccessible_pages(suggested_addr, length, flags, op)
-            }
-        }
+    let permissions = memory_region_permissions(&prot).ok_or(MappingError::InvalidPermissions)?;
+    if flags.contains(CreatePagesFlags::MAP_FILE) || !permissions.is_empty() {
+        unsafe { pm.create_pages_with_permissions(suggested_addr, length, flags, permissions, op) }
+    } else {
+        // Anonymous PROT_NONE mappings are reservations and need no writable
+        // initialization window.
+        unsafe { pm.create_inaccessible_pages(suggested_addr, length, flags, op) }
     }
     .map(UserPtrMut::from_platform_ptr::<Platform>)
 }
@@ -140,20 +144,8 @@ pub fn sys_mprotect<
     }
 
     let addr = addr.to_platform_ptr::<Platform>();
-    match prot {
-        ProtFlags::PROT_READ_EXEC => unsafe { pm.make_pages_executable(addr, len) },
-        ProtFlags::PROT_READ_WRITE => unsafe { pm.make_pages_writable(addr, len) },
-        ProtFlags::PROT_READ => unsafe { pm.make_pages_readable(addr, len) },
-        ProtFlags::PROT_NONE => unsafe { pm.make_pages_inaccessible(addr, len) },
-        ProtFlags::PROT_READ_WRITE_EXEC => unsafe { pm.make_pages_rwx(addr, len) },
-        _ => {
-            #[cfg(debug_assertions)]
-            todo!("Unsupported prot flags {:?}", prot);
-            #[cfg(not(debug_assertions))]
-            return Err(Errno::EINVAL);
-        }
-    }
-    .map_err(Errno::from)
+    let permissions = memory_region_permissions(&prot).ok_or(Errno::EINVAL)?;
+    unsafe { pm.change_page_permissions(addr, len, permissions) }.map_err(Errno::from)
 }
 
 /// Handle syscall `mremap`

@@ -5,7 +5,7 @@
 
 use core::{
     num::NonZeroUsize,
-    sync::atomic::{AtomicU32, Ordering::Relaxed},
+    sync::atomic::{AtomicBool, Ordering::Relaxed},
 };
 
 use alloc::sync::{Arc, Weak};
@@ -28,7 +28,6 @@ use crate::{
         polling::{Pollee, TryOpError},
         wait::{WaitContext, WaitError},
     },
-    fs::OFlags,
     sync::RawSyncPrimitivesProvider,
 };
 
@@ -75,7 +74,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
             broker,
             self.litebox.broker_pollable_registry(),
             capacity,
-            OFlags::from(flags),
+            flags,
             atomic_slice_guarantee_size,
         )?;
         let mut dt = self.litebox.descriptor_table_mut();
@@ -160,7 +159,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
             .ok_or(errors::ClosedError::ClosedFd)?
             .entry
             .0;
-        Ok(Flags::from_oflags_truncate(p.get_status()))
+        Ok(if p.non_blocking.load(Relaxed) {
+            Flags::NON_BLOCKING
+        } else {
+            Flags::empty()
+        })
     }
 
     /// Update the flags set on the pipe at `fd`.
@@ -178,7 +181,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
             .ok_or(errors::ClosedError::ClosedFd)?
             .entry
             .0;
-        p.set_status(OFlags::from(mask), on);
+        if mask.contains(Flags::NON_BLOCKING) {
+            p.non_blocking.store(on, Relaxed);
+        }
         Ok(())
     }
 
@@ -215,21 +220,6 @@ bitflags::bitflags! {
         /// `NON_BLOCKING` impacts what happens when a full channel is written, or an empty channel
         /// is read from. If set, the operations returns immediately with a `WouldBlock` error.
         const NON_BLOCKING = 0x1;
-    }
-}
-
-impl Flags {
-    fn from_oflags_truncate(oflags: OFlags) -> Self {
-        let mut flags = Flags::empty();
-        flags.set(Flags::NON_BLOCKING, oflags.contains(OFlags::NONBLOCK));
-        flags
-    }
-}
-impl From<Flags> for OFlags {
-    fn from(flags: Flags) -> Self {
-        let mut oflags = OFlags::empty();
-        oflags.set(OFlags::NONBLOCK, flags.contains(Flags::NON_BLOCKING));
-        oflags
     }
 }
 
@@ -356,7 +346,7 @@ struct BrokerPipeEnd<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     pollee: Arc<Pollee<Platform>>,
     peer: Weak<Self>,
     endpoint_type: HalfPipeType,
-    status: AtomicU32,
+    non_blocking: AtomicBool,
 }
 
 #[expect(
@@ -367,7 +357,7 @@ fn new_broker_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider>(
     broker: Arc<dyn BrokerControl>,
     pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
     capacity: usize,
-    flags: OFlags,
+    flags: Flags,
     atomic_slice_guarantee_size: Option<NonZeroUsize>,
 ) -> Result<(Arc<BrokerPipeEnd<Platform>>, Arc<BrokerPipeEnd<Platform>>), errors::CreateError> {
     let atomic_write_size = atomic_slice_guarantee_size
@@ -395,7 +385,7 @@ fn new_broker_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider>(
         pollee: Arc::new(Pollee::new()),
         peer: Weak::new(),
         endpoint_type: HalfPipeType::SenderHalf,
-        status: AtomicU32::new((flags | OFlags::WRONLY).bits()),
+        non_blocking: AtomicBool::new(flags.contains(Flags::NON_BLOCKING)),
     });
     let reader = Arc::new_cyclic(|weak_reader| {
         Arc::get_mut(&mut writer)
@@ -408,7 +398,7 @@ fn new_broker_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider>(
             pollee: Arc::new(Pollee::new()),
             peer: Arc::downgrade(&writer),
             endpoint_type: HalfPipeType::ReceiverHalf,
-            status: AtomicU32::new((flags | OFlags::RDONLY).bits()),
+            non_blocking: AtomicBool::new(flags.contains(Flags::NON_BLOCKING)),
         }
     });
 
@@ -418,18 +408,6 @@ fn new_broker_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider>(
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerPipeEnd<Platform> {
-    fn get_status(&self) -> OFlags {
-        OFlags::from_bits(self.status.load(Relaxed)).unwrap() & OFlags::STATUS_FLAGS_MASK
-    }
-
-    fn set_status(&self, mask: OFlags, on: bool) {
-        if on {
-            self.status.fetch_or(mask.bits(), Relaxed);
-        } else {
-            self.status.fetch_and(mask.complement().bits(), Relaxed);
-        }
-    }
-
     fn read(&self, cx: &WaitContext<'_, Platform>, buf: &mut [u8]) -> Result<usize, PipeError> {
         let length = buf.len().min(MAX_PIPE_TRANSFER_SIZE as usize);
         if length == 0 {
@@ -440,27 +418,22 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerPipeEnd<Platform>
             .expect("pipe transfer limit must fit in u32");
 
         self.pollee
-            .wait(
-                cx,
-                self.get_status().contains(OFlags::NONBLOCK),
-                Events::IN,
-                || {
-                    let data = self
-                        .broker
-                        .read_pipe(self.handle, request_length)
-                        .map_err(|error| self.broker_request_error(error))?;
-                    if data.len() > length {
-                        return Err(TryOpError::Other(PipeError::Io));
-                    }
-                    buf[..data.len()].copy_from_slice(&data);
-                    if !data.is_empty()
-                        && let Some(peer) = self.peer.upgrade()
-                    {
-                        peer.pollee.notify_observers(Events::OUT);
-                    }
-                    Ok(data.len())
-                },
-            )
+            .wait(cx, self.non_blocking.load(Relaxed), Events::IN, || {
+                let data = self
+                    .broker
+                    .read_pipe(self.handle, request_length)
+                    .map_err(|error| self.broker_request_error(error))?;
+                if data.len() > length {
+                    return Err(TryOpError::Other(PipeError::Io));
+                }
+                buf[..data.len()].copy_from_slice(&data);
+                if !data.is_empty()
+                    && let Some(peer) = self.peer.upgrade()
+                {
+                    peer.pollee.notify_observers(Events::OUT);
+                }
+                Ok(data.len())
+            })
             .map_err(PipeError::from)
     }
 
@@ -468,7 +441,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerPipeEnd<Platform>
         if buf.is_empty() {
             return Ok(0);
         }
-        let nonblock = self.get_status().contains(OFlags::NONBLOCK);
+        let nonblock = self.non_blocking.load(Relaxed);
         if nonblock {
             let data = &buf[..buf.len().min(MAX_PIPE_TRANSFER_SIZE as usize)];
             return self

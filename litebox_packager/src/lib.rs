@@ -16,7 +16,7 @@ use tar::{Builder, Header};
 ///
 /// Discovers shared library dependencies, rewrites all ELF files using the
 /// syscall rewriter, and produces a .tar suitable for use with
-/// `litebox-runner-linux-userland --initial-files`.
+/// `litebox-broker-userland --fs-initial-files`.
 ///
 /// Supports two modes:
 /// - **Host mode** (default): Takes local ELF files, discovers dependencies via
