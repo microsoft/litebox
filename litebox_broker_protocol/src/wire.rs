@@ -63,7 +63,7 @@ const RESPONSE_TAG_VERSION_MISMATCH: u8 = 255;
 const NOTIFICATION_TAG_READINESS: u8 = 0;
 
 /// Maximum byte length of any encoded active request or response.
-pub const MAX_ENCODED_ACTIVE_MESSAGE_SIZE: usize = 64;
+pub const MAX_ENCODED_ACTIVE_MESSAGE_SIZE: usize = 67;
 
 /// Maximum byte length of any encoded broker notification.
 pub const MAX_ENCODED_NOTIFICATION_SIZE: usize = 13;
@@ -534,6 +534,22 @@ mod tests {
     #[test]
     fn request_codec_round_trips_all_variants() {
         let handle = ObjectHandle(13);
+        // The wire bound covers encodable requests before operation-specific
+        // transfer limits are validated.
+        let largest_sequence = SharedBufferSequence::new(
+            &[
+                SharedBufferSlotIndex(2),
+                SharedBufferSlotIndex(5),
+                SharedBufferSlotIndex(7),
+                SharedBufferSlotIndex(9),
+                SharedBufferSlotIndex(10),
+                SharedBufferSlotIndex(11),
+                SharedBufferSlotIndex(13),
+                SharedBufferSlotIndex(15),
+            ],
+            512 * 1024,
+        )
+        .unwrap();
         let operations = [
             BrokerOperation::CloseObject(handle),
             BrokerOperation::CheckReadiness(handle),
@@ -594,20 +610,7 @@ mod tests {
             })),
             BrokerOperation::File(FileRequest::Read(ReadFileRequest {
                 handle,
-                buffer: SharedBufferSequence::new(
-                    &[
-                        SharedBufferSlotIndex(2),
-                        SharedBufferSlotIndex(5),
-                        SharedBufferSlotIndex(7),
-                        SharedBufferSlotIndex(9),
-                        SharedBufferSlotIndex(10),
-                        SharedBufferSlotIndex(11),
-                        SharedBufferSlotIndex(13),
-                        SharedBufferSlotIndex(15),
-                    ],
-                    512 * 1024,
-                )
-                .unwrap(),
+                buffer: largest_sequence,
                 offset: Some(u64::MAX),
             })),
             BrokerOperation::File(FileRequest::Read(ReadFileRequest {
@@ -702,6 +705,12 @@ mod tests {
             })),
             BrokerOperation::Socket(SocketRequest::SendTo(SendToSocketRequest {
                 handle,
+                buffer: largest_sequence,
+                flags: SendFlags::NONE,
+                destination: Some(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 53)),
+            })),
+            BrokerOperation::Socket(SocketRequest::SendTo(SendToSocketRequest {
+                handle,
                 buffer: sequence(15, 0),
                 flags: SendFlags::NONE,
                 destination: None,
@@ -712,6 +721,13 @@ mod tests {
                 flags: ReceiveFlags::PEEK,
                 peek_offset: 2,
                 peek_length: 5,
+            })),
+            BrokerOperation::Socket(SocketRequest::Receive(ReceiveSocketRequest {
+                handle,
+                buffer: largest_sequence,
+                flags: ReceiveFlags::PEEK,
+                peek_offset: u32::MAX,
+                peek_length: u32::MAX,
             })),
             BrokerOperation::Socket(SocketRequest::ReceiveFrom(ReceiveFromSocketRequest {
                 handle,
