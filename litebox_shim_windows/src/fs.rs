@@ -37,6 +37,15 @@ impl Namespace {
             (Self::Registry, false) => Err(PathError::InvalidPathname),
         }
     }
+
+    fn hides_registry_entry(self, context: &Context, directory_path: &str) -> bool {
+        self == Self::Regular
+            && context
+                .resolve(directory_path)
+                .expect("resolving a Rust string path cannot fail")
+                .to_string()
+                == "/"
+    }
 }
 
 /// File facade that confines operations to one Windows shim namespace.
@@ -110,11 +119,12 @@ impl<Platform: crate::ShimPlatform> Fs<Platform> {
 
     pub(crate) fn read_file_directory(
         &self,
+        context: &Context,
         directory_path: &str,
         fd: &FileFd,
     ) -> Result<Vec<FileDirectoryEntry>, ReadDirError> {
         let mut entries = self.litebox.read_file_directory(fd)?;
-        if self.namespace == Namespace::Regular && directory_path == "/" {
+        if self.namespace.hides_registry_entry(context, directory_path) {
             entries.retain(|entry| {
                 !entry
                     .name
@@ -205,5 +215,16 @@ mod tests {
             Namespace::Registry.resolve_path(&context, "/tmp"),
             Err(PathError::InvalidPathname)
         ));
+    }
+
+    #[test]
+    fn regular_namespace_hides_registry_for_root_aliases() {
+        let context = Context::new();
+
+        for path in ["/", "/.", "//", "/tmp/..", "."] {
+            assert!(Namespace::Regular.hides_registry_entry(&context, path));
+        }
+        assert!(!Namespace::Regular.hides_registry_entry(&context, "/tmp"));
+        assert!(!Namespace::Registry.hides_registry_entry(&context, "/registry"));
     }
 }
