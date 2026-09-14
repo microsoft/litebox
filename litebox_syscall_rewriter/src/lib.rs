@@ -474,10 +474,6 @@ pub fn rewrite_pe_for_litebox(input_binary: &[u8], trampoline: Option<u64>) -> R
         )
     };
 
-    for section in &text_sections {
-        let section_data = section_slice_mut(buf, section)?;
-        rewrite_gs_to_fs_in_section(Arch::X86_64, section.vaddr, section_data)?;
-    }
     let control_transfer_targets = get_control_transfer_targets(Arch::X86_64, buf, &text_sections)?;
     rewrite_nt_sysnos_in_sections(
         Arch::X86_64,
@@ -822,34 +818,6 @@ fn instruction_writes_eax(
         }
     }
     false
-}
-
-fn rewrite_gs_to_fs_in_section(
-    arch: Arch,
-    section_base_addr: u64,
-    section_data: &mut [u8],
-) -> Result<usize> {
-    let instructions = decode_section_instructions(arch, section_data, section_base_addr)?;
-    let mut rewritten = 0;
-
-    for instruction in &instructions {
-        if instruction.memory_segment() != iced_x86::Register::GS {
-            continue;
-        }
-
-        let offset = usize::try_from(instruction.ip() - section_base_addr).unwrap();
-        let instruction_bytes = &mut section_data[offset..offset + instruction.len()];
-        let Some(segment_prefix) = instruction_bytes.iter_mut().find(|byte| **byte == 0x65) else {
-            return Err(Error::DisassemblyFailure(format!(
-                "GS memory operand at {:#x} has no GS segment prefix",
-                instruction.ip()
-            )));
-        };
-        *segment_prefix = 0x64;
-        rewritten += 1;
-    }
-
-    Ok(rewritten)
 }
 
 fn patch_syscalls_in_sections(

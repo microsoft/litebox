@@ -1793,7 +1793,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             Some(file_name) => match file_name
                 .read_at_offset(0)
                 .ok_or(NtStatus::ACCESS_VIOLATION)
-                .and_then(UnicodeString::read_string::<Platform>)
+                .and_then(crate::nt_types::read_unicode_string::<Platform>)
             {
                 Ok(pattern) => Some(pattern),
                 Err(status) => return status,

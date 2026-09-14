@@ -310,7 +310,7 @@ fn read_symbolic_link_target<Platform: RawPointerProvider>(
         return Err(NtStatus::INVALID_PARAMETER);
     }
 
-    let target = target.read_string::<Platform>()?;
+    let target = crate::nt_types::read_unicode_string::<Platform>(target)?;
     if target.is_empty() {
         return Err(NtStatus::INVALID_PARAMETER);
     }

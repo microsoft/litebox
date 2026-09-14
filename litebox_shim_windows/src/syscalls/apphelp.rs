@@ -8,7 +8,7 @@ use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox::utils::TruncateExt as _;
 use litebox_common_windows::nt_status::NtStatus;
 
-use crate::nt_types::AhcServiceData;
+use crate::nt_types::{AhcServiceData, read_unicode_string};
 use crate::{MutPtr, ShimPlatform};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, IntEnum)]
@@ -43,7 +43,7 @@ fn handle_lookup_cdb<Platform: ShimPlatform>(
         return NtStatus::INVALID_PARAMETER;
     }
 
-    match service_data.lookup_cdb.name.read_string::<Platform>() {
+    match read_unicode_string::<Platform>(service_data.lookup_cdb.name) {
         Ok(name) => {
             litebox_util_log::debug!(
                 lookup_cdb_name:% = name,

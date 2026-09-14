@@ -16,7 +16,7 @@ use litebox::utils::TruncateExt as _;
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-use crate::nt_types::{AccessMask, Luid, UnicodeString};
+use crate::nt_types::{AccessMask, Luid, UnicodeString, read_unicode_string};
 use crate::syscalls::{Handle, ProcessHandle};
 use crate::{
     ConstPtr, HandleAttributes, MutPtr, Task, WindowsHandleSubsystem, probe_guest_output_buffer,
@@ -700,8 +700,8 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         for index in 0..number_of_attributes as usize {
             let name = attributes
                 .read_at_offset(index.cast_signed())
-                .ok_or(NtStatus::ACCESS_VIOLATION)?
-                .read_string::<Platform>()?;
+                .ok_or(NtStatus::ACCESS_VIOLATION)
+                .and_then(read_unicode_string::<Platform>)?;
             names.push(name);
         }
         Ok(names)

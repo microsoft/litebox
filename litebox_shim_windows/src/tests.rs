@@ -75,7 +75,13 @@ pub(crate) fn test_platform() -> &'static TestPlatform {
         let platform = TestPlatform::new();
 
         #[cfg(target_os = "windows")]
-        let platform = TestPlatform::new();
+        let platform = {
+            let platform = TestPlatform::new();
+            TestPlatform::set_guest_tls_mode(
+                litebox_platform_windows_userland::GuestTlsMode::Windows,
+            );
+            platform
+        };
 
         platform
     })

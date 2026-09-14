@@ -1191,7 +1191,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             let Some(class) = class.read_at_offset(0) else {
                 return NtStatus::ACCESS_VIOLATION;
             };
-            if let Err(status) = class.read_string::<Platform>() {
+            if let Err(status) = crate::nt_types::read_unicode_string::<Platform>(class) {
                 return status;
             }
             // TODO(registry-class): Persist this optional legacy class string so
@@ -1343,7 +1343,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             Ok(()) => NtStatus::SUCCESS,
             Err(status) => {
                 litebox_util_log::debug!(
-                    value_name:? = value_name.read_string::<Platform>(),
+                    value_name:? = crate::nt_types::read_unicode_string::<Platform>(value_name),
                     status:? = status;
                     "NtQueryValueKey failed"
                 );
@@ -1448,7 +1448,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         let Some(value_name) = value_name.read_at_offset(0) else {
             return NtStatus::ACCESS_VIOLATION;
         };
-        let value_name = match value_name.read_string::<Platform>() {
+        let value_name = match crate::nt_types::read_unicode_string::<Platform>(value_name) {
             Ok(value_name) => value_name,
             Err(status) => return status,
         };
@@ -1984,7 +1984,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             key_handle,
             RegistryKeyAccess::QUERY_VALUE.bits(),
         )?;
-        let value_name = value_name.read_string::<Platform>()?;
+        let value_name = crate::nt_types::read_unicode_string::<Platform>(value_name)?;
         let value = key.with_entry(|key| {
             // TODO: Open the value relative to `key.fd` once the FS has an openat-style API.
             self.global

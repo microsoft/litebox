@@ -10,7 +10,7 @@ extern crate alloc;
 use anyhow::{Context as _, Result};
 use clap::Parser;
 use litebox_broker_local_userland as broker;
-use litebox_platform_windows_userland::WindowsUserland;
+use litebox_platform_windows_userland::{GuestTlsMode, WindowsUserland};
 use memmap2::Mmap;
 use std::path::{Path, PathBuf};
 
@@ -89,6 +89,7 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
     let tar_data = mmapped_file(tar_file)?;
 
     let platform = WindowsUserland::new();
+    WindowsUserland::set_guest_tls_mode(GuestTlsMode::Windows);
     let broker_connection = cli_args
         .broker_control_channel
         .as_deref()

@@ -19,9 +19,7 @@ use litebox::utils::TruncateExt as _;
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
-use crate::nt_types::{
-    AccessMask, ObjectAttributes, ObjectAttributesFlags, UnicodeString, read_object_attributes,
-};
+use crate::nt_types::{AccessMask, ObjectAttributes, ObjectAttributesFlags, UnicodeString};
 use crate::syscalls::Handle;
 use crate::syscalls::event::EventObject;
 use crate::syscalls::iocp::IoCompletionObject;
@@ -989,7 +987,9 @@ fn read_directory_name_string<Platform: RawPointerProvider>(
     if unicode_string.buffer == 0 {
         return Err(NtStatus::ACCESS_VIOLATION);
     }
-    Ok(Some(unicode_string.read_string::<Platform>()?))
+    Ok(Some(crate::nt_types::read_unicode_string::<Platform>(
+        unicode_string,
+    )?))
 }
 
 fn utf16_byte_len(value: &str) -> Result<usize, NtStatus> {
@@ -1225,7 +1225,8 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             }
             return Ok((None, None));
         };
-        let object_attributes = read_object_attributes::<Platform>(object_attributes_ptr)?;
+        let object_attributes =
+            crate::nt_types::read_object_attributes::<Platform>(object_attributes_ptr)?;
 
         if object_attributes.object_name == 0 {
             if require_name {
