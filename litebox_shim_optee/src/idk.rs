@@ -43,7 +43,8 @@ const IDKS_ENDORSEMENT_METADATA_LEN: usize = IDKS_ENDORSEMENT_MAGIC.len()
     + size_of::<u32>()
     + TA_DIGEST_LEN
     + size_of::<u8>()
-    + ISOLATION_SOLUTION.len();
+    + ISOLATION_SOLUTION.len()
+    + size_of::<u32>(); // DER leaf certificate length
 pub(crate) struct IdksPta;
 
 #[derive(Clone, Copy, TryFromPrimitive)]
@@ -81,6 +82,7 @@ impl IdksPta {
         }
     }
 
+    /// Parameter 0 is the TA data; parameter 1 receives the signed endorsement.
     fn endorse_data<Platform: crate::OpteeShimPlatform>(
         task: &Task<Platform>,
         params: &mut UteeParams,
@@ -107,8 +109,8 @@ impl IdksPta {
             .get_values(1)
             .map_err(|_| TeeResult::BadParameters)?
             .ok_or(TeeResult::BadParameters)?;
-        let required_endorsement_size = ta_data_size
-            .checked_add(IDKS_ENDORSEMENT_METADATA_LEN)
+        let ta_signing_cert = task.global.ta_signing_cert;
+        let required_endorsement_size = endorsement_data_len(ta_data_size, ta_signing_cert.len())
             .and_then(|size| size.checked_add(IDKS_ENDORSEMENT_SIGNATURE_LEN))
             .ok_or(TeeResult::BadParameters)?;
         let required_endorsement_size_u64 =
@@ -132,9 +134,14 @@ impl IdksPta {
             .to_owned_slice(ta_data_size)
             .ok_or(TeeResult::BadParameters)?
         };
-        let mut endorsement =
-            build_endorsement_data(&ta_data, &task.ta_app_id, task.ta_svn, &task.ta_digest)
-                .ok_or(TeeResult::BadParameters)?;
+        let mut endorsement = build_endorsement_data(
+            &ta_data,
+            &task.ta_app_id,
+            task.ta_svn,
+            &task.ta_digest,
+            ta_signing_cert,
+        )
+        .ok_or(TeeResult::BadParameters)?;
         let key_pair = get_identity_signing_key_pair(task.global.platform)
             .map_err(|_| TeeResult::GenericError)?;
         let signature = endorse_data_with(&endorsement, &key_pair.private_key)
@@ -151,14 +158,31 @@ impl IdksPta {
     }
 }
 
+fn endorsement_data_len(ta_data_len: usize, ta_signing_cert_len: usize) -> Option<usize> {
+    u32::try_from(ta_signing_cert_len).ok()?;
+    ta_data_len
+        .checked_add(IDKS_ENDORSEMENT_METADATA_LEN)?
+        .checked_add(ta_signing_cert_len)
+}
+
+/// Serializes the flat prefix covered by the IDK_S signature:
+/// MAGIC || VERSION || TA_DATA || TA_UUID || TA_SVN || TA_DIGEST || DEBUG ||
+/// ISOLATION_SOLUTION || TA_SIGNING_CERT_LEN || TA_SIGNING_CERT_DER.
+///
+/// Integers (including the u32 certificate length) and the UUID use little endian.
+/// TA_DATA retains its caller-known length. The certificate is the embedded TA
+/// signing leaf certificate, not the IDK_S certificate; its bytes are copied
+/// verbatim for the verifier to use when verifying the TA signature. An empty
+/// certificate placeholder is encoded with length zero.
 fn build_endorsement_data(
     ta_data: &[u8],
     ta_uuid: &TeeUuid,
     ta_svn: u32,
     ta_digest: &TaDigest,
+    ta_signing_cert: &[u8],
 ) -> Option<Vec<u8>> {
-    // MAGIC || VERSION || TA_DATA || TA_UUID || TA_SVN || TA_DIGEST || DEBUG || ISOLATION_SOLUTION
-    let capacity = ta_data.len().checked_add(IDKS_ENDORSEMENT_METADATA_LEN)?;
+    let capacity = endorsement_data_len(ta_data.len(), ta_signing_cert.len())?;
+    let cert_len = u32::try_from(ta_signing_cert.len()).ok()?;
     let mut endorsement = Vec::with_capacity(capacity);
     endorsement.extend_from_slice(IDKS_ENDORSEMENT_MAGIC);
     endorsement.extend_from_slice(&IDKS_ENDORSEMENT_VERSION.to_le_bytes());
@@ -168,6 +192,8 @@ fn build_endorsement_data(
     endorsement.extend_from_slice(ta_digest);
     endorsement.push(IDKS_DEBUG_FLAG);
     endorsement.extend_from_slice(ISOLATION_SOLUTION);
+    endorsement.extend_from_slice(&cert_len.to_le_bytes());
+    endorsement.extend_from_slice(ta_signing_cert);
     Some(endorsement)
 }
 
@@ -326,36 +352,176 @@ fn identity_signing_public_key_from_private_key(
 mod tests {
     use super::*;
 
-    #[test]
-    fn endorsement_signature_covers_plaintext_layout() {
-        use p384::ecdsa::{Signature, VerifyingKey, signature::Verifier};
+    // Opaque test bytes: the shim transports the certificate without parsing it.
+    const TEST_CERT: &[u8] = &[0x30, 0x03, 0x02, 0x01, 0x01];
 
-        let mut private_key = [0u8; IDENTITY_SIGNING_PRIVATE_KEY_LEN];
-        private_key[IDENTITY_SIGNING_PRIVATE_KEY_LEN - 1] = 1;
-        let ta_data = b"TA public key";
-        let ta_uuid = TeeUuid {
+    #[test]
+    fn endorsement_has_expected_flat_layout() {
+        let uuid = TeeUuid {
             time_low: 0x1122_3344,
             time_mid: 0x5566,
             time_hi_and_version: 0x7788,
             clock_seq_and_node: [0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00],
         };
+        let digest = [0xa5; TA_DIGEST_LEN];
+        for cert in [TEST_CERT, &[]] {
+            for data in [b"TA data".as_slice(), &[]] {
+                let endorsement = build_endorsement_data(data, &uuid, 7, &digest, cert).unwrap();
+                let mut expected = Vec::from(b"IDKS\x01\x00\x00\x00".as_slice());
+                expected.extend_from_slice(data);
+                expected.extend_from_slice(&[
+                    0x44, 0x33, 0x22, 0x11, 0x66, 0x55, 0x88, 0x77, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                    0xee, 0xff, 0x00,
+                ]);
+                expected.extend_from_slice(&[7, 0, 0, 0]);
+                expected.extend_from_slice(&digest);
+                expected.push(IDKS_DEBUG_FLAG);
+                expected.extend_from_slice(b"LVBS");
+                expected.extend_from_slice(&u32::try_from(cert.len()).unwrap().to_le_bytes());
+                expected.extend_from_slice(cert);
+                assert_eq!(endorsement, expected);
+                assert_eq!(
+                    endorsement.len(),
+                    endorsement_data_len(data.len(), cert.len()).unwrap()
+                );
+            }
+        }
+    }
 
-        let ta_svn = 7u32;
-        let ta_digest = [
-            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
-            0xee, 0xff, 0xf0, 0xe1, 0xd2, 0xc3, 0xb4, 0xa5, 0x96, 0x87, 0x78, 0x69, 0x5a, 0x4b,
-            0x3c, 0x2d, 0x1e, 0x0f,
-        ];
-        let expected_plaintext =
-            build_endorsement_data(ta_data, &ta_uuid, ta_svn, &ta_digest).unwrap();
+    #[test]
+    fn pta_endorsement_uses_global_certificate_and_reports_output_size() {
+        use p384::ecdsa::{Signature, VerifyingKey, signature::Verifier};
 
-        let signature = endorse_data_with(&expected_plaintext, &private_key).unwrap();
+        for cert in [TEST_CERT, &[]] {
+            let shim = crate::syscalls::tests::shim_builder()
+                .with_ta_signing_cert(cert)
+                .build();
+            let task = shim.0.new_test_task();
+            assert!(core::ptr::eq(task.global.ta_signing_cert, cert));
+
+            for data in [b"TA data".as_slice(), &[]] {
+                let mut params = UteeParams::new();
+                params.set_type(0, TeeParamType::MemrefInput).unwrap();
+                params.set_type(1, TeeParamType::MemrefOutput).unwrap();
+                let data_addr = if data.is_empty() {
+                    0
+                } else {
+                    data.as_ptr() as u64
+                };
+                params.set_values(0, data_addr, data.len() as u64).unwrap();
+                let expected = build_endorsement_data(
+                    data,
+                    &task.ta_app_id,
+                    task.ta_svn,
+                    &task.ta_digest,
+                    cert,
+                )
+                .unwrap();
+                let required_size = expected.len() + IDKS_ENDORSEMENT_SIGNATURE_LEN;
+
+                assert_eq!(
+                    IdksPta::endorse_data(&task, &mut params),
+                    Err(TeeResult::ShortBuffer)
+                );
+                assert_eq!(
+                    params.get_values(1).unwrap(),
+                    Some((0, required_size as u64))
+                );
+
+                let mut output = alloc::vec![0xcc; required_size + 1];
+                let output_addr = output.as_mut_ptr() as u64;
+                params
+                    .set_values(1, output_addr, (required_size - 1) as u64)
+                    .unwrap();
+                assert_eq!(
+                    IdksPta::endorse_data(&task, &mut params),
+                    Err(TeeResult::ShortBuffer)
+                );
+                assert!(output.iter().all(|byte| *byte == 0xcc));
+                assert_eq!(
+                    params.get_values(1).unwrap(),
+                    Some((output_addr, required_size as u64))
+                );
+
+                IdksPta::endorse_data(&task, &mut params).unwrap();
+                assert_eq!(&output[..expected.len()], expected);
+                assert_eq!(output[required_size], 0xcc);
+                let key_pair = get_identity_signing_key_pair(task.global.platform).unwrap();
+                let verifying_key = VerifyingKey::from_sec1_bytes(&key_pair.public_key).unwrap();
+                let signature =
+                    Signature::from_slice(&output[expected.len()..required_size]).unwrap();
+                verifying_key.verify(&expected, &signature).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn pta_rejects_keyiso_parameters_and_invalid_buffers() {
+        let task = crate::syscalls::tests::init_platform();
+        let mut params = UteeParams::new();
+        params.set_type(0, TeeParamType::MemrefInput).unwrap();
+        params.set_type(1, TeeParamType::MemrefInput).unwrap();
+        params.set_type(2, TeeParamType::MemrefOutput).unwrap();
+        assert_eq!(
+            IdksPta::endorse_data(&task, &mut params),
+            Err(TeeResult::BadParameters)
+        );
+
+        params.set_type(1, TeeParamType::MemrefOutput).unwrap();
+        params.set_type(2, TeeParamType::None).unwrap();
+        params.set_values(0, 0, 1).unwrap();
+        assert_eq!(
+            IdksPta::endorse_data(&task, &mut params),
+            Err(TeeResult::BadParameters)
+        );
+        params
+            .set_values(0, 1, (IDKS_ENDORSEMENT_DATA_MAX_SIZE + 1) as u64)
+            .unwrap();
+        assert_eq!(
+            IdksPta::endorse_data(&task, &mut params),
+            Err(TeeResult::BadParameters)
+        );
+        params.set_values(0, 0, 0).unwrap();
+        params.set_values(1, 0, u64::MAX).unwrap();
+        assert_eq!(
+            IdksPta::endorse_data(&task, &mut params),
+            Err(TeeResult::BadParameters)
+        );
+    }
+
+    #[test]
+    fn endorsement_length_rejects_overflow() {
+        assert!(endorsement_data_len(usize::MAX, 0).is_none());
+        assert!(endorsement_data_len(0, usize::MAX).is_none());
+        assert!(endorsement_data_len(0, u32::MAX as usize + 1).is_none());
+    }
+
+    #[test]
+    fn endorsement_signature_covers_plaintext_and_certificate() {
+        use p384::ecdsa::{Signature, VerifyingKey, signature::Verifier};
+
+        let mut private_key = [0u8; IDENTITY_SIGNING_PRIVATE_KEY_LEN];
+        private_key[IDENTITY_SIGNING_PRIVATE_KEY_LEN - 1] = 1;
+        let mut endorsement = build_endorsement_data(
+            b"TA data",
+            &TeeUuid::NIL,
+            7,
+            &[0xa5; TA_DIGEST_LEN],
+            TEST_CERT,
+        )
+        .unwrap();
+        let signature = endorse_data_with(&endorsement, &private_key).unwrap();
         let public_key = identity_signing_public_key_from_private_key(&private_key).unwrap();
         let verifying_key = VerifyingKey::from_sec1_bytes(&public_key).unwrap();
         let signature = Signature::from_slice(&signature).unwrap();
+        verifying_key.verify(&endorsement, &signature).unwrap();
 
-        verifying_key
-            .verify(&expected_plaintext, &signature)
-            .unwrap();
+        // Tamper with the TA data, digest, certificate length, and certificate bytes.
+        let cert_start = endorsement.len() - TEST_CERT.len();
+        for offset in [8, 8 + b"TA data".len() + 16 + 4, cert_start - 4, cert_start] {
+            endorsement[offset] ^= 1;
+            assert!(verifying_key.verify(&endorsement, &signature).is_err());
+            endorsement[offset] ^= 1;
+        }
     }
 }
