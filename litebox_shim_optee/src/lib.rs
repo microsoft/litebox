@@ -322,6 +322,8 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
                 // TODO: Populate this from trusted TA version metadata when available.
                 ta_svn: 0,
                 ta_digest,
+                // TODO: Set from the TA source when dynamic loading is supported.
+                ta_dynamic: false,
                 tee_cryp_state_map: TeeCrypStateMap::new(),
                 tee_obj_map: TeeObjMap::new(),
                 ta_handle_map: TaHandleMap::new(),
@@ -1493,6 +1495,7 @@ struct Task<Platform: OpteeShimPlatform> {
     ta_svn: u32,
     /// SHA-256 digest of the raw TA binary.
     ta_digest: TaDigest,
+    ta_dynamic: bool,
     /// TEE cryptography state map
     tee_cryp_state_map: TeeCrypStateMap,
     /// TEE object map
@@ -1662,6 +1665,7 @@ mod test_utils {
                 ta_app_id: TeeUuid::default(),
                 ta_svn: 0,
                 ta_digest: [0; TA_DIGEST_LEN],
+                ta_dynamic: false,
                 tee_cryp_state_map: TeeCrypStateMap::new(),
                 tee_obj_map: TeeObjMap::new(),
                 ta_handle_map: TaHandleMap::new(),
