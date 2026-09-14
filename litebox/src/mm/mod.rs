@@ -524,8 +524,13 @@ where
         unsafe { vmem.reset_pages(range, anonymous_only) }
     }
 
-    /// Internal common function used by `make_pages_*` to change page permissions.
-    fn change_page_permissions(
+    /// Change pages to the requested permissions.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure no accesses conflict with the permission change.
+    /// Callers should avoid writable executable mappings unless they are strictly required.
+    pub unsafe fn change_page_permissions(
         &self,
         ptr: Platform::RawMutPointer<u8>,
         len: usize,
@@ -538,21 +543,6 @@ where
         unsafe { vmem.protect_mapping(range, new_permissions) }
     }
 
-    /// Change pages to the requested permissions.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure no accesses conflict with the permission change.
-    /// Callers should avoid writable executable mappings unless they are strictly required.
-    pub unsafe fn set_page_permissions(
-        &self,
-        ptr: Platform::RawMutPointer<u8>,
-        len: usize,
-        permissions: MemoryRegionPermissions,
-    ) -> Result<(), VmemProtectError> {
-        self.change_page_permissions(ptr, len, permissions)
-    }
-
     /// Make pages readable and writable.
     ///
     /// # Safety
@@ -563,11 +553,13 @@ where
         ptr: Platform::RawMutPointer<u8>,
         len: usize,
     ) -> Result<(), VmemProtectError> {
-        self.change_page_permissions(
-            ptr,
-            len,
-            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
-        )
+        unsafe {
+            self.change_page_permissions(
+                ptr,
+                len,
+                MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+            )
+        }
     }
 
     /// Make pages readable and executable.
@@ -580,11 +572,13 @@ where
         ptr: Platform::RawMutPointer<u8>,
         len: usize,
     ) -> Result<(), VmemProtectError> {
-        self.change_page_permissions(
-            ptr,
-            len,
-            MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
-        )
+        unsafe {
+            self.change_page_permissions(
+                ptr,
+                len,
+                MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
+            )
+        }
     }
 
     /// Make pages readable only.
@@ -597,7 +591,7 @@ where
         ptr: Platform::RawMutPointer<u8>,
         len: usize,
     ) -> Result<(), VmemProtectError> {
-        self.change_page_permissions(ptr, len, MemoryRegionPermissions::READ)
+        unsafe { self.change_page_permissions(ptr, len, MemoryRegionPermissions::READ) }
     }
 
     /// Make pages inaccessible.
@@ -610,7 +604,7 @@ where
         ptr: Platform::RawMutPointer<u8>,
         len: usize,
     ) -> Result<(), VmemProtectError> {
-        self.change_page_permissions(ptr, len, MemoryRegionPermissions::empty())
+        unsafe { self.change_page_permissions(ptr, len, MemoryRegionPermissions::empty()) }
     }
 
     /// Make pages readable, writable and executable.
@@ -634,13 +628,15 @@ where
         ptr: Platform::RawMutPointer<u8>,
         len: usize,
     ) -> Result<(), VmemProtectError> {
-        self.change_page_permissions(
-            ptr,
-            len,
-            MemoryRegionPermissions::READ
-                | MemoryRegionPermissions::WRITE
-                | MemoryRegionPermissions::EXEC,
-        )
+        unsafe {
+            self.change_page_permissions(
+                ptr,
+                len,
+                MemoryRegionPermissions::READ
+                    | MemoryRegionPermissions::WRITE
+                    | MemoryRegionPermissions::EXEC,
+            )
+        }
     }
 
     /// Register an already-allocated memory region in the VMA tracker.

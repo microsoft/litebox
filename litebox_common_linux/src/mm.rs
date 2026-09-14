@@ -145,7 +145,7 @@ pub fn sys_mprotect<
 
     let addr = addr.to_platform_ptr::<Platform>();
     let permissions = memory_region_permissions(&prot).ok_or(Errno::EINVAL)?;
-    unsafe { pm.set_page_permissions(addr, len, permissions) }.map_err(Errno::from)
+    unsafe { pm.change_page_permissions(addr, len, permissions) }.map_err(Errno::from)
 }
 
 /// Handle syscall `mremap`
