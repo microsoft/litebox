@@ -7,7 +7,7 @@ use litebox::{
     mm::linux::{
         CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, PAGE_SIZE, VmemUnmapError,
     },
-    platform::page_mgmt::DeallocationError,
+    platform::page_mgmt::{DeallocationError, MemoryRegionPermissions},
 };
 
 use crate::{MRemapFlags, MapFlags, ProtFlags, UserPtrMut, errno::Errno};
@@ -59,31 +59,21 @@ pub fn do_mmap<
         None => None,
     };
     let length = NonZeroPageSize::new(len).ok_or(MappingError::UnAligned)?;
-    match prot {
-        ProtFlags::PROT_READ_EXEC => unsafe {
-            pm.create_executable_pages(suggested_addr, length, flags, op)
-        },
-        ProtFlags::PROT_READ_WRITE => unsafe {
-            pm.create_writable_pages(suggested_addr, length, flags, op)
-        },
-        ProtFlags::PROT_READ => unsafe {
-            pm.create_readable_pages(suggested_addr, length, flags, op)
-        },
-        ProtFlags::PROT_NONE => unsafe {
-            pm.create_inaccessible_pages(suggested_addr, length, flags, op)
-        },
-        _ => {
-            #[cfg(debug_assertions)]
-            todo!("Unsupported prot flags {:?}", prot);
-            // TODO: create inaccessible pages for now. Creating mapping
-            // for both executable and writable might be needed for JIT.
-            #[cfg(not(debug_assertions))]
-            unsafe {
-                pm.create_inaccessible_pages(suggested_addr, length, flags, op)
-            }
-        }
-    }
-    .map(UserPtrMut::from_platform_ptr::<Platform>)
+    let mut permissions = MemoryRegionPermissions::empty();
+    permissions.set(
+        MemoryRegionPermissions::READ,
+        prot.contains(ProtFlags::PROT_READ),
+    );
+    permissions.set(
+        MemoryRegionPermissions::WRITE,
+        prot.contains(ProtFlags::PROT_WRITE),
+    );
+    permissions.set(
+        MemoryRegionPermissions::EXEC,
+        prot.contains(ProtFlags::PROT_EXEC),
+    );
+    unsafe { pm.create_pages_with_permissions(suggested_addr, length, flags, permissions, op) }
+        .map(UserPtrMut::from_platform_ptr::<Platform>)
 }
 
 /// Handle syscall `munmap`

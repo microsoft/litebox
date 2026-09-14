@@ -98,11 +98,47 @@ where
         if before_perms != after_perms {
             let range =
                 PageRange::new(addr.as_usize(), addr.as_usize() + length.as_usize()).unwrap();
-            // `protect` should succeed, as we just created the mapping.
             let mut vmem = self.vmem.write();
-            unsafe { vmem.protect_mapping(range, after_perms) }.expect("failed to protect mapping");
+            if let Err(error) = unsafe { vmem.protect_mapping(range, after_perms) } {
+                unsafe { vmem.remove_mapping(range) }
+                    .expect("failed to remove mapping after permission update failure");
+                return Err(MappingError::ProtectError(error));
+            }
         }
         Ok(addr)
+    }
+
+    /// Create pages with the requested final permissions.
+    ///
+    /// The pages are temporarily readable and writable while `op` initializes
+    /// them, then changed to `permissions` before this function returns.
+    ///
+    /// # Safety
+    ///
+    /// If the suggested start address is given and [`CreatePagesFlags::FIXED_ADDR`] is set,
+    /// the kernel uses it directly without checking if it is available, causing overlapping
+    /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
+    pub unsafe fn create_pages_with_permissions<F>(
+        &self,
+        suggested_address: Option<NonZeroAddress<ALIGN>>,
+        length: NonZeroPageSize<ALIGN>,
+        flags: CreatePagesFlags,
+        permissions: MemoryRegionPermissions,
+        op: F,
+    ) -> Result<Platform::RawMutPointer<u8>, MappingError>
+    where
+        F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
+    {
+        unsafe {
+            self.create_pages(
+                suggested_address,
+                length,
+                flags,
+                MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+                permissions,
+                op,
+            )
+        }
     }
 
     /// Create readable and executable pages.

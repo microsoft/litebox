@@ -74,21 +74,25 @@ fn run_program(name: &str, aot: bool) {
 }
 
 #[test]
+#[ignore = "macOS runner requires broker support"]
 fn test_load_exec_dynamic() {
     run_program("hello_world_dyn", false);
 }
 
 #[test]
+#[ignore = "macOS runner requires broker support"]
 fn test_load_exec_dynamic_pthreads() {
     run_program("hello_thread", false);
 }
 
 #[test]
+#[ignore = "macOS runner requires broker support"]
 fn test_syscall_rewriter() {
     run_program("hello_world_dyn", true);
 }
 
 #[test]
+#[ignore = "macOS runner requires broker support"]
 fn test_syscall_rewriter_pthreads() {
     run_program("hello_thread", true);
 }

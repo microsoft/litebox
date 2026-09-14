@@ -2011,9 +2011,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 Err(FileStatusError::PathError(_)) => {
                     return Err(Errno::EACCES);
                 }
-                Err(_) => {
-                    return Err(Errno::ENOENT);
-                }
+                Err(FileStatusError::Io) => return Err(Errno::EIO),
+                Err(_) => return Err(Errno::ENOENT),
             }
         }
 
@@ -2118,8 +2117,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 let major = status.node_info.rdev.map_or(0, |v| v.get() >> 8);
                 Ok((136..=143).contains(&major) && status.file_type == FileType::CharacterDevice)
             }
-            Err(litebox::fs::errors::FileStatusError::ClosedFd) => Err(Errno::EBADF),
-            Err(_) => unimplemented!(),
+            Err(error) => Err(error.into()),
         }
     }
 

@@ -107,6 +107,18 @@ fn phdr(
 const EXIT_42: &[u32] = &[0xd2800540, 0xd2800ba8, 0xd4000001]; // x0=42; x8=exit; svc #0
 
 #[test]
+fn filesystem_startup_fails_closed_without_broker_support() {
+    let fixture = Fixture::new();
+    let output = fixture.run(&[]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("filesystem startup on macOS requires broker support")
+    );
+}
+
+#[test]
+#[ignore = "macOS runner requires broker support"]
 fn bad_syscall_pointer_returns_efault_without_host_crash() {
     let fixture = Fixture::new();
     let code = [
@@ -130,6 +142,7 @@ fn bad_syscall_pointer_returns_efault_without_host_crash() {
 }
 
 #[test]
+#[ignore = "macOS runner requires broker support"]
 fn guest_memory_fault_terminates_with_linux_status() {
     let fixture = Fixture::new();
     let code = [0xd2800000, 0xf9400000]; // mov x0, #0; ldr x0, [x0]
@@ -145,6 +158,7 @@ fn guest_memory_fault_terminates_with_linux_status() {
 }
 
 #[test]
+#[ignore = "macOS runner requires broker support"]
 fn guest_instruction_faults_deliver_sigill() {
     for (name, code) in [
         ("undefined instruction", vec![0]),
@@ -163,6 +177,7 @@ fn guest_instruction_faults_deliver_sigill() {
 }
 
 #[test]
+#[ignore = "macOS runner requires broker support"]
 fn fp_registers_survive_syscalls() {
     let fixture = Fixture::new();
     let code = [
@@ -189,6 +204,7 @@ fn fp_registers_survive_syscalls() {
 }
 
 #[test]
+#[ignore = "macOS runner requires broker support"]
 fn rejects_fixed_address_and_incompatible_page_layouts() {
     let fixture = Fixture::new();
     let mut binary = elf(EXIT_42);
@@ -217,6 +233,7 @@ fn rejects_fixed_address_and_incompatible_page_layouts() {
 }
 
 #[test]
+#[ignore = "macOS runner requires broker support"]
 fn preserves_scratch_registers_and_accepts_nonzero_svc_immediates() {
     let fixture = Fixture::new();
     let code = [

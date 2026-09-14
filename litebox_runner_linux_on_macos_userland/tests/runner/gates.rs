@@ -14,6 +14,7 @@ const X18: &[u32] = &[
 ];
 
 #[test]
+#[ignore = "macOS runner requires broker support"]
 fn guest_signal_return_restores_x18_and_vector_state() {
     let fixture = Fixture::new();
     // SIGUSR1 handler clobbers x18 and d0; synthetic rt_sigreturn restores them.
@@ -59,16 +60,19 @@ fn run_x18_fixture(aot: bool) {
 }
 
 #[test]
+#[ignore = "macOS runner requires broker support"]
 fn runtime_x18_gates_preserve_registers_and_branch_targets() {
     run_x18_fixture(false);
 }
 
 #[test]
+#[ignore = "macOS runner requires broker support"]
 fn aot_x18_gates_preserve_registers_and_branch_targets() {
     run_x18_fixture(true);
 }
 
 #[test]
+#[ignore = "macOS runner requires broker support"]
 fn clone_uses_distinct_guest_tls_and_x18_slots() {
     let fixture = Fixture::new();
     // Clone with SETTLS|CHILD_CLEARTID; child changes TP and x18. Parent waits

@@ -1548,9 +1548,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
 #[cfg(test)]
 mod tests {
-    use super::PAGE_SIZE;
+    use super::{PAGE_SIZE, Task};
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     use litebox::platform::PageManagementProvider;
+    use litebox::{
+        mm::linux::{NonZeroAddress, NonZeroPageSize},
+        platform::page_mgmt::MemoryRegionPermissions,
+    };
     use litebox_broker_protocol::fs::FileMode as Mode;
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     use litebox_common_linux::MRemapFlags;
@@ -1558,6 +1562,77 @@ mod tests {
 
     use crate::UserPtrMut;
     use crate::syscalls::tests::{TestPlatform as Platform, create_file, init_platform};
+
+    fn check_file_mmap_permissions(
+        task: &Task<Platform>,
+        fd: i32,
+        prot: ProtFlags,
+        expected: MemoryRegionPermissions,
+    ) {
+        let typed_fd = task
+            .typed_fd(fd)
+            .expect("test file descriptor should resolve");
+        let address = task
+            .do_mmap_file_memcpy(None, PAGE_SIZE, prot, MapFlags::MAP_PRIVATE, &typed_fd, 0)
+            .expect("file mapping should succeed");
+        let actual = task
+            .global
+            .pm
+            .get_memory_permissions(
+                NonZeroAddress::new(address.as_usize()).expect("mapping address is aligned"),
+                NonZeroPageSize::new(PAGE_SIZE).expect("page size is valid"),
+            )
+            .expect("mapping permissions should be tracked");
+        assert_eq!(actual, expected);
+        task.sys_munmap(address, PAGE_SIZE)
+            .expect("test mapping should unmap");
+    }
+
+    #[test]
+    fn file_mmap_preserves_requested_permissions() {
+        let task = init_platform();
+        create_file(&task, "/mmap-permissions", &[0x5a]);
+        let fd = i32::try_from(
+            task.sys_open("/mmap-permissions", OFlags::RDONLY, Mode::empty())
+                .expect("test file should open"),
+        )
+        .expect("file descriptor should fit i32");
+
+        for (prot, permissions) in [
+            (ProtFlags::PROT_NONE, MemoryRegionPermissions::empty()),
+            (ProtFlags::PROT_READ, MemoryRegionPermissions::READ),
+            (ProtFlags::PROT_WRITE, MemoryRegionPermissions::WRITE),
+            (ProtFlags::PROT_EXEC, MemoryRegionPermissions::EXEC),
+            (
+                ProtFlags::PROT_READ_WRITE,
+                MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+            ),
+            (
+                ProtFlags::PROT_READ_EXEC,
+                MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
+            ),
+        ] {
+            check_file_mmap_permissions(&task, fd, prot, permissions);
+        }
+
+        #[cfg(target_os = "linux")]
+        for (prot, permissions) in [
+            (
+                ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC,
+                MemoryRegionPermissions::WRITE | MemoryRegionPermissions::EXEC,
+            ),
+            (
+                ProtFlags::PROT_READ_WRITE_EXEC,
+                MemoryRegionPermissions::READ
+                    | MemoryRegionPermissions::WRITE
+                    | MemoryRegionPermissions::EXEC,
+            ),
+        ] {
+            check_file_mmap_permissions(&task, fd, prot, permissions);
+        }
+
+        task.sys_close(fd).expect("test file should close");
+    }
 
     #[test]
     fn full_capacity_anywhere_precedes_preferred_one_page() {

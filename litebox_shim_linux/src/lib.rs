@@ -591,43 +591,20 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     // If the read size is too large, we need to do some extra work to avoid OOMing.
                     // We read data in chunks and update the file offset ourselves only if the read succeeds.
                     self.with_typed_fd(fd, |fd| {
+                        let cur_loc = self.do_seek(fd, 0, SeekWhence::RelativeToCurrentOffset)?;
+                        let read_total = self.do_pread_with_user_buf(
+                            fd,
+                            buf,
+                            count,
+                            i64::try_from(cur_loc).map_err(|_| Errno::EOVERFLOW)?,
+                        )?;
+                        let new_loc = cur_loc.checked_add(read_total).ok_or(Errno::EOVERFLOW)?;
                         self.do_seek(
                             fd,
-                            0,
-                            SeekWhence::RelativeToCurrentOffset,
-                        )
-                        .inspect_err(|e| {
-                            match *e {
-                                Errno::EBADF => (), // safe errors to return
-                                Errno::ESPIPE => {
-                                    unimplemented!("read on non-seekable fds with large buffers");
-                                }
-                                Errno::EINVAL => {
-                                    unreachable!("seekable file should not return EINVAL when getting current offset");
-                                }
-                                _ => {
-                                    unimplemented!("unexpected error from lseek: {}", e);
-                                }
-                            }
-                        })
-                        .and_then(|cur_loc| {
-                            self.do_pread_with_user_buf(
-                                fd,
-                                buf,
-                                count,
-                                i64::try_from(cur_loc).unwrap(),
-                            )
-                            .inspect(|read_total| {
-                                // Update the file offset to reflect the read we just did.
-                                self.do_seek(
-                                    fd,
-                                    (cur_loc + read_total).reinterpret_as_signed(),
-                                    SeekWhence::RelativeToBeginning,
-                                )
-                                // Given that previous lseek and pread succeeded, this lseek should also succeed.
-                                .expect("lseek failed");
-                            })
-                        })
+                            isize::try_from(new_loc).map_err(|_| Errno::EOVERFLOW)?,
+                            SeekWhence::RelativeToBeginning,
+                        )?;
+                        Ok(read_total)
                     })
                 }
             }
