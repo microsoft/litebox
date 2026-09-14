@@ -1974,7 +1974,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         ];
         for entry in self
             .fs
-            .read_file_directory(&file.path, fd)
+            .read_file_directory(&self.fs_context, &file.path, fd)
             .map_err(map_read_dir_error)?
         {
             if entry.name == "." || entry.name == ".." {

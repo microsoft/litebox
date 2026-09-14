@@ -766,7 +766,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         let mut summary = KeySummary::default();
         for entry in self
             .fs()
-            .read_file_directory(&key.path, &key.fd)
+            .read_file_directory(&self.fs_context, &key.path, &key.fd)
             .map_err(map_read_dir_error)?
         {
             if entry.file_type == FileType::Directory
@@ -794,7 +794,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
             .map_err(map_open_error)?;
         let values = self
             .fs()
-            .read_file_directory(&values_path, &values_fd)
+            .read_file_directory(&self.fs_context, &values_path, &values_fd)
             .map_err(map_read_dir_error);
         let _ = self.fs().close_file(&values_fd);
         for entry in values? {
@@ -835,7 +835,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         let mut names = Vec::new();
         for entry in self
             .fs()
-            .read_file_directory(&key.path, &key.fd)
+            .read_file_directory(&self.fs_context, &key.path, &key.fd)
             .map_err(map_read_dir_error)?
         {
             if entry.file_type == FileType::Directory
@@ -896,7 +896,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
             .map_err(map_open_error)?;
         let entries = self
             .fs()
-            .read_file_directory(&values_path, &values_fd)
+            .read_file_directory(&self.fs_context, &values_path, &values_fd)
             .map_err(map_read_dir_error);
         let _ = self.fs().close_file(&values_fd);
         let mut names = Vec::new();
