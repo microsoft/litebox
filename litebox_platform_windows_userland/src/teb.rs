@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Native TEB state exchange and per-thread runtime-slot access.
 
 use core::ffi::c_void;

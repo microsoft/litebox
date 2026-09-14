@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Windows x64 TEB layout shared by the shim and host platform.
 
 use core::mem::{offset_of, size_of};
