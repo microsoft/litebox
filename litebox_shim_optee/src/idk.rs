@@ -38,7 +38,8 @@ const IDKS_DEBUG_FLAG: u8 = 0;
 const ISOLATION_SOLUTION: &[u8] = b"LVBS";
 pub(crate) const IDKS_ENDORSEMENT_SIGNATURE_LEN: usize = 96;
 const IDKS_ENDORSEMENT_METADATA_LEN: usize = IDKS_ENDORSEMENT_MAGIC.len()
-    + size_of::<u32>()
+    + size_of::<u32>() // version
+    + size_of::<u32>() // TA data length
     + size_of::<TeeUuid>()
     + size_of::<u32>()
     + TA_DIGEST_LEN
@@ -159,6 +160,7 @@ impl IdksPta {
 }
 
 fn endorsement_data_len(ta_data_len: usize, ta_signing_cert_len: usize) -> Option<usize> {
+    u32::try_from(ta_data_len).ok()?;
     u32::try_from(ta_signing_cert_len).ok()?;
     ta_data_len
         .checked_add(IDKS_ENDORSEMENT_METADATA_LEN)?
@@ -166,12 +168,12 @@ fn endorsement_data_len(ta_data_len: usize, ta_signing_cert_len: usize) -> Optio
 }
 
 /// Serializes the flat prefix covered by the IDK_S signature:
-/// MAGIC || VERSION || TA_DATA || TA_UUID || TA_SVN || TA_DIGEST || DEBUG ||
-/// ISOLATION_SOLUTION || TA_SIGNING_CERT_LEN || TA_SIGNING_CERT_DER.
+/// MAGIC || VERSION || TA_DATA_LEN || TA_DATA || TA_UUID || TA_SVN || TA_DIGEST ||
+/// DEBUG || ISOLATION_SOLUTION || TA_SIGNING_CERT_LEN || TA_SIGNING_CERT_DER.
 ///
-/// Integers (including the u32 certificate length) and the UUID use little endian.
-/// TA_DATA retains its caller-known length. The certificate is the embedded TA
-/// signing leaf certificate, not the IDK_S certificate; its bytes are copied
+/// Integers (including both u32 lengths) and the UUID use little endian.
+/// The certificate is the embedded TA signing leaf certificate, not the IDK_S
+/// certificate; its bytes are copied
 /// verbatim for the verifier to use when verifying the TA signature. An empty
 /// certificate placeholder is encoded with length zero.
 fn build_endorsement_data(
@@ -182,10 +184,12 @@ fn build_endorsement_data(
     ta_signing_cert: &[u8],
 ) -> Option<Vec<u8>> {
     let capacity = endorsement_data_len(ta_data.len(), ta_signing_cert.len())?;
+    let ta_data_len = u32::try_from(ta_data.len()).ok()?;
     let cert_len = u32::try_from(ta_signing_cert.len()).ok()?;
     let mut endorsement = Vec::with_capacity(capacity);
     endorsement.extend_from_slice(IDKS_ENDORSEMENT_MAGIC);
     endorsement.extend_from_slice(&IDKS_ENDORSEMENT_VERSION.to_le_bytes());
+    endorsement.extend_from_slice(&ta_data_len.to_le_bytes());
     endorsement.extend_from_slice(ta_data);
     endorsement.extend_from_slice(&ta_uuid.to_le_bytes());
     endorsement.extend_from_slice(&ta_svn.to_le_bytes());
@@ -364,10 +368,12 @@ mod tests {
             clock_seq_and_node: [0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00],
         };
         let digest = [0xa5; TA_DIGEST_LEN];
+        let long_data = [0x5a; 256];
         for cert in [TEST_CERT, &[]] {
-            for data in [b"TA data".as_slice(), &[]] {
+            for data in [b"TA data".as_slice(), &[], &long_data] {
                 let endorsement = build_endorsement_data(data, &uuid, 7, &digest, cert).unwrap();
                 let mut expected = Vec::from(b"IDKS\x01\x00\x00\x00".as_slice());
+                expected.extend_from_slice(&u32::try_from(data.len()).unwrap().to_le_bytes());
                 expected.extend_from_slice(data);
                 expected.extend_from_slice(&[
                     0x44, 0x33, 0x22, 0x11, 0x66, 0x55, 0x88, 0x77, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
@@ -384,6 +390,21 @@ mod tests {
                     endorsement.len(),
                     endorsement_data_len(data.len(), cert.len()).unwrap()
                 );
+
+                // Locate the variable fields using only the encoded lengths.
+                let data_len = u32::from_le_bytes(endorsement[8..12].try_into().unwrap()) as usize;
+                let (parsed_data, metadata) = endorsement[12..].split_at(data_len);
+                assert_eq!(parsed_data, data);
+                assert_eq!(&metadata[..16], uuid.to_le_bytes());
+                let cert_len_offset = 16 + 4 + TA_DIGEST_LEN + 1 + 4;
+                let cert_len = u32::from_le_bytes(
+                    metadata[cert_len_offset..cert_len_offset + 4]
+                        .try_into()
+                        .unwrap(),
+                ) as usize;
+                let (parsed_cert, remaining) = metadata[cert_len_offset + 4..].split_at(cert_len);
+                assert_eq!(parsed_cert, cert);
+                assert!(remaining.is_empty());
             }
         }
     }
@@ -494,6 +515,7 @@ mod tests {
         assert!(endorsement_data_len(usize::MAX, 0).is_none());
         assert!(endorsement_data_len(0, usize::MAX).is_none());
         assert!(endorsement_data_len(0, u32::MAX as usize + 1).is_none());
+        assert!(endorsement_data_len(u32::MAX as usize + 1, 0).is_none());
     }
 
     #[test]
@@ -516,9 +538,15 @@ mod tests {
         let signature = Signature::from_slice(&signature).unwrap();
         verifying_key.verify(&endorsement, &signature).unwrap();
 
-        // Tamper with the TA data, digest, certificate length, and certificate bytes.
+        // Tamper with the TA data length, data, digest, certificate length, and certificate bytes.
         let cert_start = endorsement.len() - TEST_CERT.len();
-        for offset in [8, 8 + b"TA data".len() + 16 + 4, cert_start - 4, cert_start] {
+        for offset in [
+            8,
+            12,
+            12 + b"TA data".len() + 16 + 4,
+            cert_start - 4,
+            cert_start,
+        ] {
             endorsement[offset] ^= 1;
             assert!(verifying_key.verify(&endorsement, &signature).is_err());
             endorsement[offset] ^= 1;
