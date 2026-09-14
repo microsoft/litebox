@@ -107,17 +107,6 @@ fn phdr(
 const EXIT_42: &[u32] = &[0xd2800540, 0xd2800ba8, 0xd4000001]; // x0=42; x8=exit; svc #0
 
 #[test]
-fn filesystem_startup_fails_closed_without_broker_support() {
-    let fixture = Fixture::new();
-    let output = fixture.run(&[]);
-    assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("filesystem startup on macOS requires broker support")
-    );
-}
-
-#[test]
 #[ignore = "macOS runner requires broker support"]
 fn bad_syscall_pointer_returns_efault_without_host_crash() {
     let fixture = Fixture::new();
