@@ -20,6 +20,7 @@ use sha2::Sha256;
 use zeroize::{Zeroize, Zeroizing};
 
 struct SystemPta;
+
 /// A common interface to interact with various PTAs including the system PTA.
 ///
 /// Add new PTAs here as needed.

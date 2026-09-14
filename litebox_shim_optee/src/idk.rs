@@ -46,7 +46,7 @@ const IDKS_ENDORSEMENT_METADATA_LEN: usize = IDKS_ENDORSEMENT_MAGIC.len()
     + size_of::<u8>() // TA dynamic flag
     + size_of::<u8>()
     + ISOLATION_SOLUTION.len()
-    + size_of::<u32>(); // DER leaf certificate length
+    + size_of::<u32>(); // certificate length
 pub(crate) struct IdksPta;
 
 #[derive(Clone, Copy, TryFromPrimitive)]
@@ -495,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    fn pta_rejects_keyiso_parameters_and_invalid_buffers() {
+    fn pta_rejects_invalid_parameter_types_and_buffers() {
         let task = crate::syscalls::tests::init_platform();
         let mut params = UteeParams::new();
         params.set_type(0, TeeParamType::MemrefInput).unwrap();
