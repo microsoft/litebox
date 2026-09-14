@@ -120,9 +120,19 @@ impl WindowsUserland {
     }
 
     fn set_thread_fs_base(fs_base: usize) {
-        let tls = unsafe { &*get_tls_ptr().expect("TLS not initialized") };
-        tls.guest_fs_base.set(fs_base);
-        Self::restore_thread_fs_base(tls);
+        if let Some(tls) = get_tls_ptr() {
+            unsafe {
+                (*tls).guest_fs_base.set(fs_base);
+            }
+        }
+        unsafe { litebox_common_linux::wrfsbase(fs_base) };
+    }
+
+    fn get_thread_fs_base() -> usize {
+        get_tls_ptr().map_or_else(
+            || unsafe { litebox_common_linux::rdfsbase() },
+            |tls| unsafe { &*tls }.guest_fs_base.get(),
+        )
     }
 
     fn restore_thread_fs_base(tls: &TlsState) {
@@ -131,7 +141,7 @@ impl WindowsUserland {
 }
 
 fn guest_tls_mode() -> GuestTlsMode {
-    match GUEST_TLS_MODE.load(Ordering::Acquire) {
+    match GUEST_TLS_MODE.load(Ordering::Relaxed) {
         mode if mode == GuestTlsMode::Linux as u8 => GuestTlsMode::Linux,
         mode if mode == GuestTlsMode::Windows as u8 => GuestTlsMode::Windows,
         GUEST_TLS_MODE_UNCONFIGURED => panic!("guest TLS mode is not configured"),
@@ -1942,9 +1952,7 @@ impl litebox::platform::ArchSpecificProvider for WindowsUserland {
         reg: &litebox::platform::ArchSpecificRegister,
     ) -> Result<usize, litebox::platform::ArchSpecificError> {
         match reg {
-            litebox::platform::ArchSpecificRegister::FsBase => get_tls_ptr()
-                .map(|tls| unsafe { &*tls }.guest_fs_base.get())
-                .ok_or(litebox::platform::ArchSpecificError::RegisterUnsupported),
+            litebox::platform::ArchSpecificRegister::FsBase => Ok(Self::get_thread_fs_base()),
             litebox::platform::ArchSpecificRegister::GsBase
                 if guest_tls_mode() == GuestTlsMode::Windows =>
             {
