@@ -174,8 +174,7 @@ impl<Platform: OpteeShimPlatform> OpteeShimBuilder<Platform> {
         }
     }
 
-    /// DER leaf certificate for TA signature verification, included in IDK_S endorsements.
-    /// Defaults to empty (no certificate).
+    /// A certificate for TA signature verification. Defaults to empty (no certificate).
     #[must_use]
     pub fn with_ta_signing_cert(mut self, ta_signing_cert: &'static [u8]) -> Self {
         self.ta_signing_cert = ta_signing_cert;
