@@ -57,7 +57,14 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                 litebox_broker_protocol::error::ErrorCode::ResourceExhausted,
             ));
         }
-        self.validate_shared_buffer(buffer, destination.len());
+        assert_eq!(
+            destination.len(),
+            buffer.length() as usize,
+            "shared data must match its buffer sequence"
+        );
+        let _ = buffer
+            .descriptors(self.shared_buffers.layout())
+            .expect("shared buffer sequence must identify valid slot ranges");
         let response = self.request_pipe(PipeRequest::Read(ReadPipeRequest { handle, buffer }))?;
         let PipeResponse::Read(response) = response else {
             panic!("broker returned unexpected pipe read response: {response:?}");

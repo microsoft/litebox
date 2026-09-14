@@ -471,7 +471,10 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         data: &[u8],
         flags: SendFlags,
     ) -> Result<core::result::Result<usize, SocketError>, Channel::Error> {
-        self.validate_socket_buffer(buffer, data.len());
+        assert!(
+            buffer.length() <= MAX_SOCKET_TRANSFER_SIZE,
+            "shared socket sequence exceeds the transfer limit"
+        );
         self.write_shared_buffer(buffer, data);
         match self.request_socket(SocketRequest::Send(SendSocketRequest {
             handle,
@@ -504,7 +507,10 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         flags: SendFlags,
         destination: Option<SocketAddrV4>,
     ) -> Result<core::result::Result<usize, SocketError>, Channel::Error> {
-        self.validate_udp_buffer(buffer, data.len());
+        assert!(
+            buffer.length() <= MAX_UDP_DATAGRAM_SIZE,
+            "shared UDP sequence exceeds the datagram limit"
+        );
         self.write_shared_buffer(buffer, data);
         match self.request_socket(SocketRequest::SendTo(SendToSocketRequest {
             handle,
@@ -623,7 +629,14 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             buffer.length() <= MAX_SOCKET_TRANSFER_SIZE,
             "shared socket sequence exceeds the transfer limit"
         );
-        self.validate_shared_buffer(buffer, data_len);
+        assert_eq!(
+            data_len,
+            buffer.length() as usize,
+            "shared data must match its buffer sequence"
+        );
+        let _ = buffer
+            .descriptors(self.shared_buffers.layout())
+            .expect("shared buffer sequence must identify valid slot ranges");
     }
 
     fn validate_udp_buffer(&self, buffer: SharedBufferSequence, data_len: usize) {
@@ -631,7 +644,14 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             buffer.length() <= MAX_UDP_DATAGRAM_SIZE,
             "shared UDP sequence exceeds the datagram limit"
         );
-        self.validate_shared_buffer(buffer, data_len);
+        assert_eq!(
+            data_len,
+            buffer.length() as usize,
+            "shared data must match its buffer sequence"
+        );
+        let _ = buffer
+            .descriptors(self.shared_buffers.layout())
+            .expect("shared buffer sequence must identify valid slot ranges");
     }
 
     fn request_socket(&self, request: SocketRequest) -> Result<SocketResponse, Channel::Error> {

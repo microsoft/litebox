@@ -396,7 +396,14 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         if buffer.length() > max_length {
             return Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted));
         }
-        self.validate_shared_buffer(buffer, expected_length);
+        assert_eq!(
+            expected_length,
+            buffer.length() as usize,
+            "shared data must match its buffer sequence"
+        );
+        let _ = buffer
+            .descriptors(self.shared_buffers.layout())
+            .expect("shared buffer sequence must identify valid slot ranges");
         Ok(())
     }
 
@@ -406,7 +413,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         data: &[u8],
         max_length: u32,
     ) -> Result<(), Channel::Error> {
-        self.validate_file_buffer(buffer, data.len(), max_length)?;
+        if buffer.length() > max_length {
+            return Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted));
+        }
         self.write_shared_buffer(buffer, data);
         Ok(())
     }

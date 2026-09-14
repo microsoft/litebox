@@ -188,7 +188,8 @@ impl SharedBufferSequence {
     pub fn descriptors(
         self,
         layout: SharedBufferLayout,
-    ) -> Result<SharedBufferSequenceDescriptors, SharedBufferLayoutError> {
+    ) -> Result<impl ExactSizeIterator<Item = SharedBufferSlotDescriptor>, SharedBufferLayoutError>
+    {
         let required_slots = if self.length == 0 {
             1
         } else {
@@ -204,46 +205,19 @@ impl SharedBufferSequence {
         {
             return Err(SharedBufferLayoutError::InvalidSlot);
         }
-        Ok(SharedBufferSequenceDescriptors {
-            slot_indices: self.slot_indices,
-            slot_count: usize::from(self.slot_count),
-            next_slot: 0,
-            remaining_length: self.length,
-            slot_size: layout.slot_size(),
-        })
+        let slot_size = layout.slot_size();
+        let mut remaining_length = self.length;
+        Ok(self
+            .slot_indices
+            .into_iter()
+            .take(usize::from(self.slot_count))
+            .map(move |slot_index| {
+                let length = remaining_length.min(slot_size);
+                remaining_length -= length;
+                SharedBufferSlotDescriptor { slot_index, length }
+            }))
     }
 }
-
-/// Iterator over the canonical slot descriptors in a [`SharedBufferSequence`].
-pub struct SharedBufferSequenceDescriptors {
-    slot_indices: [SharedBufferSlotIndex; MAX_SHARED_BUFFER_SEQUENCE_SLOTS],
-    slot_count: usize,
-    next_slot: usize,
-    remaining_length: u32,
-    slot_size: u32,
-}
-
-impl Iterator for SharedBufferSequenceDescriptors {
-    type Item = SharedBufferSlotDescriptor;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.next_slot == self.slot_count {
-            return None;
-        }
-        let slot_index = self.slot_indices[self.next_slot];
-        self.next_slot += 1;
-        let length = self.remaining_length.min(self.slot_size);
-        self.remaining_length -= length;
-        Some(SharedBufferSlotDescriptor { slot_index, length })
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.slot_count - self.next_slot;
-        (remaining, Some(remaining))
-    }
-}
-
-impl ExactSizeIterator for SharedBufferSequenceDescriptors {}
 
 #[cfg(test)]
 mod tests {

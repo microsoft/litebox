@@ -24,7 +24,14 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             buffer.length() <= MAX_RANDOM_TRANSFER_SIZE,
             "shared random sequence exceeds the transfer limit"
         );
-        self.validate_shared_buffer(buffer, output.len());
+        assert_eq!(
+            output.len(),
+            buffer.length() as usize,
+            "shared data must match its buffer sequence"
+        );
+        let _ = buffer
+            .descriptors(self.shared_buffers.layout())
+            .expect("shared buffer sequence must identify valid slot ranges");
         match self.request(BrokerOperation::FillRandom(buffer))? {
             BrokerResult::RandomFilled => {
                 self.read_shared_buffer(buffer, output);

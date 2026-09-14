@@ -152,7 +152,11 @@ fn run_fake_runner(args: &[OsString]) {
             local
                 .send_to_socket(
                     handle,
-                    sequence(0, request.len().try_into().unwrap()),
+                    SharedBufferSequence::new(
+                        &[SharedBufferSlotIndex(0)],
+                        request.len().try_into().unwrap(),
+                    )
+                    .unwrap(),
                     request,
                     SendFlags::NONE,
                     Some(std::net::SocketAddrV4::new(gateway, udp_port)),
@@ -180,7 +184,11 @@ fn run_fake_runner(args: &[OsString]) {
         let received = local
             .receive_from_socket(
                 handle,
-                sequence(1, reply.len().try_into().unwrap()),
+                SharedBufferSequence::new(
+                    &[SharedBufferSlotIndex(1)],
+                    reply.len().try_into().unwrap(),
+                )
+                .unwrap(),
                 &mut reply,
                 ReceiveFromFlags::NONE,
             )
@@ -236,7 +244,9 @@ fn run_fake_runner(args: &[OsString]) {
 
     let pipe = local.create_pipe(64, 16).unwrap();
     let data = b"shared pipe data";
-    let write_buffer = sequence(0, data.len().try_into().unwrap());
+    let write_buffer =
+        SharedBufferSequence::new(&[SharedBufferSlotIndex(0)], data.len().try_into().unwrap())
+            .unwrap();
     assert_eq!(
         local
             .write_pipe(pipe.write_handle, write_buffer, data)
@@ -247,16 +257,16 @@ fn run_fake_runner(args: &[OsString]) {
     let read = local
         .read_pipe(
             pipe.read_handle,
-            sequence(1, received.len().try_into().unwrap()),
+            SharedBufferSequence::new(
+                &[SharedBufferSlotIndex(1)],
+                received.len().try_into().unwrap(),
+            )
+            .unwrap(),
             &mut received,
         )
         .unwrap();
     assert_eq!(&received[..read], data);
     drop(local);
-}
-
-fn sequence(slot: u32, length: u32) -> SharedBufferSequence {
-    SharedBufferSequence::new(&[SharedBufferSlotIndex(slot)], length).unwrap()
 }
 
 struct ChildGuard {

@@ -186,23 +186,16 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    fn validate_shared_buffer(&self, buffer: SharedBufferSequence, expected_length: usize) {
+    fn write_shared_buffer(&self, buffer: SharedBufferSequence, data: &[u8]) {
         assert_eq!(
-            expected_length,
+            data.len(),
             buffer.length() as usize,
             "shared data must match its buffer sequence"
         );
-        buffer
-            .descriptors(self.shared_buffers.layout())
-            .expect("shared buffer sequence must identify valid slot ranges");
-    }
-
-    fn write_shared_buffer(&self, buffer: SharedBufferSequence, data: &[u8]) {
-        self.validate_shared_buffer(buffer, data.len());
         let mut offset = 0;
         for descriptor in buffer
             .descriptors(self.shared_buffers.layout())
-            .expect("validated shared buffer sequence must remain valid")
+            .expect("shared buffer sequence must identify valid slot ranges")
         {
             let end = offset + descriptor.length as usize;
             self.shared_buffers
