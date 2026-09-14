@@ -65,6 +65,9 @@ mod nt_types;
 mod syscalls;
 mod wait;
 
+#[allow(dead_code)]
+mod fs;
+
 #[cfg(test)]
 mod tests;
 
