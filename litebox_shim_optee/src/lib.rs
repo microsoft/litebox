@@ -308,11 +308,12 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
         ldelf_bin: &[u8],
         ta_uuid: TeeUuid,
     ) -> Result<LoadedProgram<Platform>, loader::elf::ElfLoaderError> {
-        let (ta_flags, ta_digest) = self
+        let (ta_binary, ta_flags) = self
             .0
             .ta_uuid_map
-            .get_metadata(&ta_uuid)
+            .get_with_flags(&ta_uuid)
             .ok_or(loader::elf::ElfLoaderError::OpenError(Errno::ENOENT))?;
+        let ta_digest = Sha256::digest(&ta_binary).into();
         let entrypoints = crate::OpteeShimEntrypoints {
             _not_send: core::marker::PhantomData,
             task: Task {
@@ -1423,8 +1424,6 @@ struct TaInfo {
     binary: Arc<[u8]>,
     /// Parsed TA flags from .ta_head section
     flags: TaFlags,
-    /// SHA-256 digest of the raw TA binary
-    digest: TaDigest,
 }
 
 /// Data structure to maintain a mapping from TA UUIDs to their binary data and flags.
@@ -1450,13 +1449,11 @@ impl TaUuidMap {
             return false;
         }
 
-        let digest = Sha256::digest(&ta_bin).into();
         let _replaced = self.inner.write().insert(
             uuid,
             TaInfo {
                 binary: ta_bin,
                 flags: ta_head.flags,
-                digest,
             },
         );
         true
@@ -1466,11 +1463,11 @@ impl TaUuidMap {
         self.inner.read().get(uuid).map(|info| info.binary.clone())
     }
 
-    fn get_metadata(&self, uuid: &TeeUuid) -> Option<(TaFlags, TaDigest)> {
+    fn get_with_flags(&self, uuid: &TeeUuid) -> Option<(Arc<[u8]>, TaFlags)> {
         self.inner
             .read()
             .get(uuid)
-            .map(|info| (info.flags, info.digest))
+            .map(|info| (info.binary.clone(), info.flags))
     }
 
     // Lazy removal of TA binaries when they are no longer needed.
