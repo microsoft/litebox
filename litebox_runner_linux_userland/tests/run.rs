@@ -334,6 +334,11 @@ fn test_file_service(
     use litebox_broker_platform_linux_userland::LinuxSyncPrimitivesProvider;
     use litebox_broker_protocol::fs::{FileMode as Mode, FileUser as UserInfo};
 
+    const GUEST_USER: UserInfo = UserInfo {
+        user: 1000,
+        group: 1000,
+    };
+
     let directory_mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
     let mut entries = vec![
         (
@@ -375,12 +380,12 @@ fn test_file_service(
             let node = if metadata.is_dir() {
                 InitialNode::Directory {
                     mode,
-                    owner: UserInfo::ROOT,
+                    owner: GUEST_USER,
                 }
             } else {
                 InitialNode::File {
                     mode,
-                    owner: UserInfo::ROOT,
+                    owner: GUEST_USER,
                     data: std::fs::read(entry.path())
                         .expect("failed to read runner test file")
                         .into(),

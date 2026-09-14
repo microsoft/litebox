@@ -90,6 +90,22 @@ fn prot_flags_from_permissions(permissions: MemoryRegionPermissions) -> ProtFlag
     prot
 }
 
+type ProtectionRange = (usize, usize, ProtFlags);
+type PatchRange = (i32, usize, usize, alloc::vec::Vec<ProtectionRange>);
+
+fn push_patch_range(
+    result: &mut alloc::vec::Vec<PatchRange>,
+    fd: i32,
+    protections: &mut alloc::vec::Vec<ProtectionRange>,
+) {
+    let (Some(first), Some(last)) = (protections.first(), protections.last()) else {
+        return;
+    };
+    let start = first.0;
+    let end = last.0 + last.1;
+    result.push((fd, start, end - start, core::mem::take(protections)));
+}
+
 /// Per-fd state for the shim's runtime ELF syscall rewriter.
 ///
 /// Tracks base address and trampoline write cursor for each ELF file that
@@ -258,9 +274,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // Runtime syscall rewriting: patch PROT_EXEC segments in-place.
         if is_exec {
             let syscall_entry = self.global.platform.get_syscall_entry_point();
+            let restore_protections = [(result.as_usize(), len, prot.clone())];
             if syscall_entry != 0
                 && self
-                    .maybe_patch_exec_segment(result, len, fd, syscall_entry, Some(offset), &prot)
+                    .maybe_patch_exec_segment(
+                        result,
+                        len,
+                        fd,
+                        syscall_entry,
+                        Some(offset),
+                        &restore_protections,
+                    )
                     .is_err()
             {
                 // Runtime patching, trampoline setup, or restoration of the
@@ -540,6 +564,19 @@ impl<Platform: ShimPlatform> Task<Platform> {
         litebox_common_linux::mm::sys_mprotect(&self.global.pm, addr, len, prot)
     }
 
+    fn restore_page_permissions(&self, protections: &[ProtectionRange]) -> Result<(), Errno> {
+        let mut first_error = None;
+        for (start, len, prot) in protections {
+            if let Err(error) =
+                self.sys_mprotect_raw(UserPtrMut::<u8>::from_usize(*start), *len, prot.clone())
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
     #[inline]
     pub(crate) fn sys_mremap(
         &self,
@@ -592,9 +629,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let mappings = self.global.pm.mappings();
 
         // Find unpatched file mappings that overlap this mprotect range.
-        // Split them at VMA boundaries so each patch operation can restore
-        // the permissions that existed before this mprotect request.
-        let to_patch: alloc::vec::Vec<(i32, usize, usize, ProtFlags)> = {
+        // Preserve the VMA boundaries for restoration without splitting the
+        // instruction stream passed to the runtime rewriter.
+        let to_patch: alloc::vec::Vec<PatchRange> = {
             let cache = self.global.elf_patch_cache.lock();
             let mut result = alloc::vec::Vec::new();
             for (&fd, state) in cache.iter() {
@@ -608,18 +645,27 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     if seg_start < mprotect_end && seg_end > mprotect_start {
                         let patch_start = seg_start.max(mprotect_start);
                         let patch_end = seg_end.min(mprotect_end);
+                        let mut restore_protections: alloc::vec::Vec<ProtectionRange> =
+                            alloc::vec::Vec::new();
                         for (mapping, flags) in &mappings {
                             let start = patch_start.max(mapping.start);
                             let end = patch_end.min(mapping.end);
                             if start < end {
-                                result.push((
-                                    fd,
+                                if restore_protections.last().is_some_and(
+                                    |(last_start, last_len, _)| {
+                                        last_start.saturating_add(*last_len) != start
+                                    },
+                                ) {
+                                    push_patch_range(&mut result, fd, &mut restore_protections);
+                                }
+                                restore_protections.push((
                                     start,
                                     end - start,
                                     prot_flags_from_permissions((*flags).into()),
                                 ));
                             }
                         }
+                        push_patch_range(&mut result, fd, &mut restore_protections);
                     }
                 }
             }
@@ -638,7 +684,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
         }
 
-        for (fd, patch_start, patch_len, restore_prot) in to_patch {
+        for (fd, patch_start, patch_len, restore_protections) in to_patch {
             let mapped_addr = UserPtrMut::<u8>::from_usize(patch_start);
             self.maybe_patch_exec_segment(
                 mapped_addr,
@@ -646,7 +692,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 fd,
                 syscall_entry,
                 None,
-                &restore_prot,
+                &restore_protections,
             )?;
         }
         Ok(())
@@ -997,7 +1043,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         len: usize,
         already_rw: bool,
         ranges: Option<&litebox_syscall_rewriter::aarch64::CodeScanRanges>,
-        restore_prot: &ProtFlags,
+        restore_protections: &[ProtectionRange],
     ) -> Result<(), Errno> {
         if !already_rw {
             self.sys_mprotect_raw(
@@ -1045,7 +1091,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         );
 
         // Restore the caller-selected permissions.
-        self.sys_mprotect_raw(mapped_addr, len, restore_prot.clone())
+        self.restore_page_permissions(restore_protections)
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -1054,7 +1100,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         mapped_addr: UserPtrMut<u8>,
         len: usize,
         already_rw: bool,
-        restore_prot: &ProtFlags,
+        restore_protections: &[ProtectionRange],
     ) -> Result<(), Errno> {
         if !already_rw {
             self.sys_mprotect_raw(
@@ -1087,7 +1133,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         );
 
         // Restore the caller-selected permissions.
-        self.sys_mprotect_raw(mapped_addr, len, restore_prot.clone())
+        self.restore_page_permissions(restore_protections)
     }
 
     /// Patch an executable segment in-place after it has been mapped.
@@ -1106,7 +1152,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         fd: i32,
         syscall_entry: usize,
         file_offset: Option<usize>,
-        restore_prot: &ProtFlags,
+        restore_protections: &[ProtectionRange],
     ) -> Result<(), Errno> {
         // Initialize patch state if this is the first mmap for this fd.
         // Typically the first mapping is at offset 0 (the ELF header), but
@@ -1224,12 +1270,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 len,
                 already_rw,
                 scan_ranges.as_ref(),
-                restore_prot,
+                restore_protections,
             )
         };
         #[cfg(target_arch = "x86_64")]
         let apply_trap_fallback = |mapped_addr, len, already_rw| {
-            self.apply_trap_fallback(mapped_addr, len, already_rw, restore_prot)
+            self.apply_trap_fallback(mapped_addr, len, already_rw, restore_protections)
         };
 
         // Allocate the trampoline region if not yet done.
@@ -1381,7 +1427,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         // Read the mapped code into a buffer, patch it, write back.
         let Some(code_owned) = mapped_addr.to_owned_slice::<Platform>(len) else {
-            let _ = self.sys_mprotect_raw(mapped_addr, len, restore_prot.clone());
+            let _ = self.restore_page_permissions(restore_protections);
             restore_trampoline_rx(self, state);
             panic!("fatal: failed to read code segment for patching");
         };
@@ -1490,7 +1536,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .copy_from_slice::<Platform>(0, &stubs)
                     .is_none()
                 {
-                    let _ = self.sys_mprotect_raw(mapped_addr, len, restore_prot.clone());
+                    let _ = self.restore_page_permissions(restore_protections);
                     restore_trampoline_rx(self, state);
                     panic!("fatal: failed to write trampoline stubs");
                 }
@@ -1501,7 +1547,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .is_none()
                 {
                     let _ = mapped_addr.copy_from_slice::<Platform>(0, &original_code);
-                    let _ = self.sys_mprotect_raw(mapped_addr, len, restore_prot.clone());
+                    let _ = self.restore_page_permissions(restore_protections);
                     restore_trampoline_rx(self, state);
                     panic!("fatal: failed to write patched code back to code segment");
                 }
@@ -1518,7 +1564,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         .is_none()
                 {
                     let _ = mapped_addr.copy_from_slice::<Platform>(0, &original_code);
-                    let _ = self.sys_mprotect_raw(mapped_addr, len, restore_prot.clone());
+                    let _ = self.restore_page_permissions(restore_protections);
                     panic!("fatal: failed to write trap bytes back to code segment");
                 }
                 // Fall through to restore the caller-selected protections below.
@@ -1532,7 +1578,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
 
         // Restore the caller-selected code-segment permissions.
-        let restored = self.sys_mprotect_raw(mapped_addr, len, restore_prot.clone());
+        let restored = self.restore_page_permissions(restore_protections);
         restore_trampoline_rx(self, state);
         restored
     }
@@ -1580,7 +1626,34 @@ mod tests {
     use crate::UserPtrMut;
     use crate::syscalls::tests::{TestPlatform as Platform, create_file, init_platform};
 
-    fn file_mapping_permissions(
+    fn runtime_patch_state(
+        file_mappings: BTreeSet<(usize, usize)>,
+        trampoline_addr: usize,
+        trampoline_mapped: bool,
+    ) -> ElfPatchState {
+        ElfPatchState {
+            pre_patched: false,
+            trampoline_file_offset: 0,
+            trampoline_file_size: 0,
+            trampoline_addr,
+            #[cfg(target_arch = "aarch64")]
+            load_span: None,
+            trampoline_cursor: 0,
+            trampoline_mapped,
+            trampoline_mapped_len: 0,
+            runtime_patches_committed: false,
+            #[cfg(target_arch = "aarch64")]
+            trampoline_invalidated: false,
+            #[cfg(target_arch = "aarch64")]
+            code_metadata: None,
+            #[cfg(target_arch = "aarch64")]
+            trampoline_capacity: 0,
+            file_mappings,
+            patched_ranges: BTreeSet::new(),
+        }
+    }
+
+    fn mapping_permissions(
         task: &Task<Platform>,
         address: UserPtrMut<u8>,
     ) -> MemoryRegionPermissions {
@@ -1602,7 +1675,7 @@ mod tests {
         let address = task
             .do_mmap_file(None, PAGE_SIZE, prot, MapFlags::MAP_PRIVATE, fd, 0)
             .expect("file mapping should succeed");
-        assert_eq!(file_mapping_permissions(task, address), expected);
+        assert_eq!(mapping_permissions(task, address), expected);
         task.sys_munmap(address, PAGE_SIZE)
             .expect("test mapping should unmap");
     }
@@ -1616,29 +1689,10 @@ mod tests {
                 .expect("test file should open"),
         )
         .expect("file descriptor should fit i32");
-        task.global.elf_patch_cache.lock().insert(
-            fd,
-            ElfPatchState {
-                pre_patched: false,
-                trampoline_file_offset: 0,
-                trampoline_file_size: 0,
-                trampoline_addr: 0,
-                #[cfg(target_arch = "aarch64")]
-                load_span: None,
-                trampoline_cursor: 0,
-                trampoline_mapped: true,
-                trampoline_mapped_len: 0,
-                runtime_patches_committed: false,
-                #[cfg(target_arch = "aarch64")]
-                trampoline_invalidated: false,
-                #[cfg(target_arch = "aarch64")]
-                code_metadata: None,
-                #[cfg(target_arch = "aarch64")]
-                trampoline_capacity: 0,
-                file_mappings: BTreeSet::new(),
-                patched_ranges: BTreeSet::new(),
-            },
-        );
+        task.global
+            .elf_patch_cache
+            .lock()
+            .insert(fd, runtime_patch_state(BTreeSet::new(), 0, true));
 
         for (prot, permissions) in [
             (ProtFlags::PROT_NONE, MemoryRegionPermissions::empty()),
@@ -1692,7 +1746,7 @@ mod tests {
             Err(Errno::EINVAL)
         );
         assert_eq!(
-            file_mapping_permissions(&task, address),
+            mapping_permissions(&task, address),
             MemoryRegionPermissions::READ
         );
         task.sys_munmap(address, PAGE_SIZE)
@@ -1719,7 +1773,7 @@ mod tests {
                 Err(Errno::EACCES)
             );
             assert_eq!(
-                file_mapping_permissions(&task, address),
+                mapping_permissions(&task, address),
                 MemoryRegionPermissions::READ
             );
             task.sys_munmap(address, PAGE_SIZE)
@@ -1727,6 +1781,146 @@ mod tests {
         }
 
         task.sys_close(fd).expect("test file should close");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn mprotect_rewrites_across_permission_boundaries() {
+        let task = init_platform();
+        let mut content = alloc::vec![0x90; 2 * PAGE_SIZE];
+        content[PAGE_SIZE - 1] = 0x0f;
+        content[PAGE_SIZE] = 0x05;
+        create_file(&task, "/mprotect-boundary", &content);
+        let fd = i32::try_from(
+            task.sys_open("/mprotect-boundary", OFlags::RDONLY, Mode::empty())
+                .expect("test file should open"),
+        )
+        .expect("file descriptor should fit i32");
+        let address = task
+            .do_mmap_file(
+                None,
+                2 * PAGE_SIZE,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_PRIVATE,
+                fd,
+                0,
+            )
+            .expect("file mapping should succeed");
+        task.global.elf_patch_cache.lock().insert(
+            fd,
+            runtime_patch_state(
+                BTreeSet::from([(address.as_usize(), 2 * PAGE_SIZE)]),
+                address.as_usize() + 2 * PAGE_SIZE,
+                false,
+            ),
+        );
+
+        task.sys_mprotect(
+            UserPtrMut::from_usize(address.as_usize() + PAGE_SIZE),
+            PAGE_SIZE,
+            ProtFlags::PROT_READ_WRITE,
+        )
+        .expect("second page permissions should change");
+        task.sys_mprotect(address, 2 * PAGE_SIZE, ProtFlags::PROT_READ_EXEC)
+            .expect("whole mapping should become executable");
+
+        let rewritten = UserPtrMut::<u8>::from_usize(address.as_usize() + PAGE_SIZE - 1)
+            .to_owned_slice::<Platform>(2)
+            .expect("rewritten bytes should remain readable");
+        assert_ne!(rewritten.as_ref(), &[0x0f, 0x05]);
+
+        task.sys_munmap(address, 2 * PAGE_SIZE)
+            .expect("test mapping should unmap");
+        task.sys_close(fd).expect("test file should close");
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[test]
+    fn mprotect_patches_only_mapped_runs() {
+        let task = init_platform();
+        let mut content = alloc::vec![0x90; 3 * PAGE_SIZE];
+        content[PAGE_SIZE / 2] = 0x0f;
+        content[PAGE_SIZE / 2 + 1] = 0x05;
+        create_file(&task, "/mprotect-mapped-run", &content);
+        let fd = i32::try_from(
+            task.sys_open("/mprotect-mapped-run", OFlags::RDONLY, Mode::empty())
+                .expect("test file should open"),
+        )
+        .expect("file descriptor should fit i32");
+        let address = task
+            .do_mmap_file(
+                None,
+                3 * PAGE_SIZE,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_PRIVATE,
+                fd,
+                0,
+            )
+            .expect("file mapping should succeed");
+        task.global.elf_patch_cache.lock().insert(
+            fd,
+            runtime_patch_state(
+                BTreeSet::from([(address.as_usize(), 3 * PAGE_SIZE)]),
+                address.as_usize() + 3 * PAGE_SIZE,
+                false,
+            ),
+        );
+
+        assert_eq!(
+            task.sys_mremap(address, 3 * PAGE_SIZE, PAGE_SIZE, MRemapFlags::empty(), 0,)
+                .expect("file mapping should shrink")
+                .as_usize(),
+            address.as_usize()
+        );
+        task.sys_mprotect(address, 3 * PAGE_SIZE, ProtFlags::PROT_READ_EXEC)
+            .expect("mapped portion should become executable");
+
+        let rewritten = UserPtrMut::<u8>::from_usize(address.as_usize() + PAGE_SIZE / 2)
+            .to_owned_slice::<Platform>(2)
+            .expect("rewritten bytes should remain readable");
+        assert_ne!(rewritten.as_ref(), &[0x0f, 0x05]);
+
+        task.sys_munmap(address, PAGE_SIZE)
+            .expect("test mapping should unmap");
+        task.sys_close(fd).expect("test file should close");
+    }
+
+    #[test]
+    fn permission_restoration_continues_after_error() {
+        let task = init_platform();
+        let missing = task
+            .do_mmap_anonymous(
+                None,
+                PAGE_SIZE,
+                ProtFlags::PROT_READ_WRITE,
+                MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE,
+            )
+            .expect("first test mapping should succeed");
+        let surviving = task
+            .do_mmap_anonymous(
+                None,
+                PAGE_SIZE,
+                ProtFlags::PROT_READ_WRITE,
+                MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE,
+            )
+            .expect("second test mapping should succeed");
+        task.sys_munmap(missing, PAGE_SIZE)
+            .expect("first test mapping should unmap");
+
+        assert!(
+            task.restore_page_permissions(&[
+                (missing.as_usize(), PAGE_SIZE, ProtFlags::PROT_READ),
+                (surviving.as_usize(), PAGE_SIZE, ProtFlags::PROT_READ),
+            ])
+            .is_err()
+        );
+        assert_eq!(
+            mapping_permissions(&task, surviving),
+            MemoryRegionPermissions::READ
+        );
+
+        task.sys_munmap(surviving, PAGE_SIZE)
+            .expect("second test mapping should unmap");
     }
 
     #[test]

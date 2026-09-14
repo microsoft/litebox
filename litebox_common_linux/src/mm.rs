@@ -80,8 +80,14 @@ pub fn do_mmap<
     };
     let length = NonZeroPageSize::new(len).ok_or(MappingError::UnAligned)?;
     let permissions = memory_region_permissions(&prot).ok_or(MappingError::InvalidPermissions)?;
-    unsafe { pm.create_pages_with_permissions(suggested_addr, length, flags, permissions, op) }
-        .map(UserPtrMut::from_platform_ptr::<Platform>)
+    if flags.contains(CreatePagesFlags::MAP_FILE) || !permissions.is_empty() {
+        unsafe { pm.create_pages_with_permissions(suggested_addr, length, flags, permissions, op) }
+    } else {
+        // Anonymous PROT_NONE mappings are reservations and need no writable
+        // initialization window.
+        unsafe { pm.create_inaccessible_pages(suggested_addr, length, flags, op) }
+    }
+    .map(UserPtrMut::from_platform_ptr::<Platform>)
 }
 
 /// Handle syscall `munmap`
