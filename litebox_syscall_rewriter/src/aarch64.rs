@@ -27,14 +27,14 @@
 //!
 //! ## Thread-pointer virtualization
 //!
-//! The guest's thread pointer is a host-managed slot at
-//! `[anchor + guest_tpidr_offset]` that the MSR and MRS gates store to and load
-//! from. Two registers are involved:
+//! Guest TLS is host-managed. Direct-TLS gates access fields relative to the
+//! host anchor. Indirect-TLS gates load a block pointer from the anchor-relative
+//! runtime slot before accessing its fields. Two registers are involved:
 //!
 //! * The one the *guest* uses: `TPIDR_EL0`, per the Linux ABI. This is an ELF
 //!   rewriter, so it is the only one gated; a PE guest's `x18` TEB pointer and
 //!   a Mach-O guest's `TPIDRRO_EL0` would need different gates.
-//! * The one anchoring the *host*'s per-thread block, selected by `Host` —
+//! * The one anchoring the host's TLS access sequence, selected by `Host` —
 //!   also `TPIDR_EL0` on a Linux host.
 //!
 //! Before execution, finalize placeholders with [`finalize_trampoline_gates`]
@@ -109,6 +109,7 @@
 
 use alloc::format;
 use alloc::string::ToString as _;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::Range;
 use object::read::{Object as _, ObjectSection as _, ObjectSegment as _, ObjectSymbol as _};
@@ -458,34 +459,37 @@ const X18_BRANCH_BRK_IMM: u16 = 0xB18;
 
 /// Alignment every emitted gate slot starts on.
 pub const GATE_ALIGNMENT: usize = 16;
-/// Byte size of an emitted `MRS TPIDR_EL0` gate slot.
+/// Byte size of a direct-TLS `MRS TPIDR_EL0` gate slot.
 pub const MRS_SLOT_BYTES: usize = 16;
-/// Byte size of an emitted `MSR TPIDR_EL0` gate slot.
+/// Byte size of a direct-TLS `MSR TPIDR_EL0` gate slot.
 pub const MSR_SLOT_BYTES: usize = 48;
 /// First byte after the MSR gate's executable body and recovery branch.
 const MSR_GATE_BODY_END: usize = 40;
 /// Byte size of an emitted `SVC` gate slot.
 pub const SVC_SLOT_BYTES: usize = 64;
-/// Byte size of an ordinary self-contained x18 gate slot.
+/// Byte size of a direct-TLS ordinary x18 gate slot.
 const X18_SLOT_BYTES: usize = 48;
-/// Byte size of a self-contained x18 compare/test-branch gate slot.
+/// Byte size of a direct-TLS x18 compare/test-branch gate slot.
 const X18_COMPARE_BRANCH_SLOT_BYTES: usize = 48;
-/// Byte size of a self-contained `ADR X18` gate slot.
+/// Byte size of a direct-TLS `ADR X18` gate slot.
 const X18_ADR_SLOT_BYTES: usize = 32;
-/// Byte size of an immediate SP-writeback pair x18 gate slot.
+/// Byte size of a direct-TLS immediate SP-writeback pair x18 gate slot.
 const X18_STACK_WRITEBACK_SLOT_BYTES: usize = 64;
 /// Byte size of a terminal `BR X18` trap gate slot.
 const X18_BRANCH_SLOT_BYTES: usize = 16;
 /// Distinct compact-slot sizes probed by classifiers and finalizers. Metadata
 /// distinguishes gate kinds that share a slot size.
-pub const GATE_SLOT_SIZES: [usize; 4] = [
+pub const GATE_SLOT_SIZES: [usize; 5] = [
     MRS_SLOT_BYTES,
     X18_ADR_SLOT_BYTES,
     MSR_SLOT_BYTES,
     SVC_SLOT_BYTES,
+    X18_STACK_WRITEBACK_SLOT_BYTES + GATE_ALIGNMENT,
 ];
+/// Largest compact gate slot on any supported host.
+pub const MAX_GATE_SLOT_BYTES: usize = X18_STACK_WRITEBACK_SLOT_BYTES + GATE_ALIGNMENT;
 /// Candidate starts required to cover the largest executable gate body.
-pub const GATE_PC_CANDIDATE_COUNT: usize = 4;
+pub const GATE_PC_CANDIDATE_COUNT: usize = MAX_GATE_SLOT_BYTES / GATE_ALIGNMENT;
 const NOP: u32 = 0xD503_201F;
 
 const GATE_METADATA_MAGIC: u32 = 0xB807;
@@ -1329,13 +1333,9 @@ fn substitute_x18(word: u32, replacement: u8) -> Option<u32> {
 
 // --- Guest thread-pointer virtualization ---
 //
-// The host reaches its per-thread block through an anchor register its OS
-// fixes, which `Host` names; the guest's logical thread pointer is a memory
-// slot the runtime reserves at some byte offset from that anchor. Every gated
-// guest read/write addresses the slot with a scaled `LDR`/`STR` off the
-// anchor. The rewriter does not know the offset -- it is a property of the
-// *host* runtime's link, not of the guest binary -- so it emits a placeholder
-// the loader overwrites.
+// The runtime supplies an anchor-relative offset for its guest TLS root: the
+// fields for direct TLS, or a block pointer for indirect TLS. The rewriter
+// emits a placeholder for that offset and the loader overwrites it.
 
 /// Largest value the `imm12` field of an unsigned-offset `LDR`/`STR` can hold.
 /// The field is 12 bits and unsigned, counting `0..=0xFFF` *scaled units*.
@@ -1349,28 +1349,23 @@ const LDST_UIMM12_SCALE_64BIT: u16 = 8;
 /// (`0xFFF * 8 = 32760`), derived from the encoding rather than written out.
 const LDR_UIMM12_MAX_BYTE_OFFSET: u16 = LDST_UIMM12_IMM_MAX * LDST_UIMM12_SCALE_64BIT;
 
-/// Alignment a runtime's guest thread-pointer slot must satisfy: the scale of
-/// the 64-bit unsigned-offset `LDR`/`STR` the gates address it with.
+/// Alignment the runtime-supplied guest TLS offset must satisfy.
 pub const GUEST_TPIDR_OFFSET_ALIGN: u16 = LDST_UIMM12_SCALE_64BIT;
 
-/// Guest x18 immediately follows the generic guest thread-pointer slot.
+/// Guest x18's ABI offset from the guest thread pointer field.
 pub const GUEST_X18_OFFSET_FROM_GUEST_TP: usize = core::mem::size_of::<usize>();
+const _: () = assert!(GUEST_X18_OFFSET_FROM_GUEST_TP == GUEST_TPIDR_OFFSET_ALIGN as usize);
 
-/// Largest byte offset from the host anchor at which a runtime may place the
-/// guest thread-pointer slot.
-///
-/// Not an independent policy choice: the gates reach the slot with one 64-bit
-/// unsigned-offset `LDR`/`STR`, so the bound *is* `LDR_UIMM12_MAX_BYTE_OFFSET`.
+/// Largest anchor-relative guest TLS root offset encodable by the gates.
 pub const MAX_GUEST_TPIDR_OFFSET: u16 = LDR_UIMM12_MAX_BYTE_OFFSET;
 
-/// The smallest guest thread-pointer offset a gate may be patched with.
+/// The smallest guest-TLS root offset a gate may be patched with.
 ///
 /// Rejects zero and the first anchor-relative slot; the runtime separately
 /// validates ownership of its selected slot.
 pub(crate) const MIN_GUEST_TPIDR_OFFSET: u16 = 16;
 
-/// Placeholder byte offset baked into every emitted gate's guest thread-pointer
-/// access, replaced at load time by [`patch_guest_tpidr_offset`].
+/// Placeholder for the runtime-supplied guest TLS offset.
 ///
 /// It is `MAX_GUEST_TPIDR_OFFSET`, the largest value the field can hold, so it
 /// cannot collide with a real runtime offset. That makes scanning for it exact,
@@ -1378,13 +1373,12 @@ pub(crate) const MIN_GUEST_TPIDR_OFFSET: u16 = 16;
 /// [`find_guest_tpidr_placeholder`] work off the emitted words alone with no
 /// side table of patch sites.
 ///
-/// It buys **no** run-time safety. An unpatched gate does not fault: it reads
-/// and writes one self-consistent address 32KB past the host thread pointer,
-/// quietly corrupting eight bytes of whatever is mapped there. A loader must
-/// use [`finalize_trampoline_gates`] (Linux without x18) or
-/// [`finalize_trampoline_gates_for_host`] before making a trampoline executable.
+/// It buys **no** run-time safety: an unpatched gate accesses arbitrary
+/// anchor-relative memory. A loader must use [`finalize_trampoline_gates`]
+/// (Linux without x18) or [`finalize_trampoline_gates_for_host`] before making
+/// a trampoline executable.
 pub(crate) const GUEST_TPIDR_OFFSET_PLACEHOLDER: u16 = MAX_GUEST_TPIDR_OFFSET;
-/// Distinct placeholder for the anchor-relative guest x18 slot.
+/// Distinct placeholder used by direct-TLS x18 gates.
 const GUEST_X18_OFFSET_PLACEHOLDER: u16 = MAX_GUEST_TPIDR_OFFSET - 8;
 
 /// Stack frame used by x18 gates to preserve their two scratch registers.
@@ -1448,7 +1442,7 @@ impl X18RecoveryPlan {
     }
 }
 
-/// Instruction boundaries in the persisted ordinary-x18 gate layout.
+/// Host-neutral instruction boundaries in an ordinary x18 gate.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum X18GateOffset {
@@ -1478,7 +1472,7 @@ pub enum X18GateOffset {
     ExecutableEnd = 44,
 }
 
-/// Instruction boundaries in the displacement-aware SP-writeback pair gate.
+/// Host-neutral instruction boundaries in a displacement-aware SP-writeback pair gate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum X18StackWritebackOffset {
@@ -1699,7 +1693,7 @@ impl X18GateOffset {
     }
 }
 
-/// Instruction boundaries in the persisted x18 compare/test-branch gate layout.
+/// Host-neutral instruction boundaries in an x18 compare/test-branch gate.
 #[derive(Clone, Copy)]
 #[repr(u8)]
 pub enum X18CompareBranchOffset {
@@ -1781,7 +1775,7 @@ impl X18CompareBranchOffset {
     }
 }
 
-/// Instruction boundaries in the persisted ADR-x18 gate layout.
+/// Host-neutral instruction boundaries in an ADR-x18 gate.
 #[derive(Clone, Copy)]
 #[repr(u8)]
 pub enum X18AdrOffset {
@@ -1895,7 +1889,7 @@ pub struct MrsTpidrRecoveryPlan {
     pub runtime_access: RuntimeAccess,
 }
 
-/// Instruction boundaries in the emitted MRS-TPIDR gate.
+/// Host-neutral instruction boundaries in an MRS-TPIDR gate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum MrsTpidrGateOffset {
@@ -2138,7 +2132,7 @@ pub struct MsrTpidrRecoveryPlan {
     pub runtime_access: RuntimeAccess,
 }
 
-/// Instruction boundaries in the emitted MSR-TPIDR gate.
+/// Host-neutral instruction boundaries in an MSR-TPIDR gate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum MsrTpidrGateOffset {
@@ -2722,16 +2716,13 @@ impl Insn {
 // Host anchor register
 // ============================================================
 
-/// The host OS the rewritten guest runs under. Its ABI fixes the *anchor
-/// register* a gate reads to reach the host's per-thread block, and this names
-/// which one; gates read it through [`Host::anchor_read`], so adding a host is
-/// a new variant plus its arm there.
+/// The host OS whose TLS and register conventions the gates use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Host {
     /// Linux host: the kernel preserves `TPIDR_EL0` across host execution, so
     /// the anchor lives there and the anchor read is `MRS Xd, TPIDR_EL0`.
     Linux,
-    /// macOS host: `TPIDRRO_EL0` points at the host per-thread block.
+    /// macOS host: `TPIDRRO_EL0` anchors pthread TSD slots.
     MacOs,
     /// Windows host: physical `x18` points at the thread environment block.
     Windows,
@@ -2788,6 +2779,33 @@ impl Host {
         asm.emit(self.anchor_read(rd));
         if self == Self::MacOs {
             asm.emit(anchor_mask(rd));
+        }
+    }
+
+    fn emit_tls_base_read(self, asm: &mut Asm, rd: u8) {
+        self.emit_anchor_read(asm, rd);
+        if self == Self::MacOs {
+            asm.emit(Insn::LdrUimm {
+                rt: rd,
+                rn: rd,
+                imm_bytes: GUEST_TPIDR_OFFSET_PLACEHOLDER,
+            });
+        }
+    }
+
+    const fn guest_tpidr_access_offset(self) -> u16 {
+        if matches!(self, Self::MacOs) {
+            0
+        } else {
+            GUEST_TPIDR_OFFSET_PLACEHOLDER
+        }
+    }
+
+    const fn guest_x18_access_offset(self) -> u16 {
+        if matches!(self, Self::MacOs) {
+            GUEST_TPIDR_OFFSET_ALIGN
+        } else {
+            GUEST_X18_OFFSET_PLACEHOLDER
         }
     }
 }
@@ -3379,21 +3397,9 @@ fn emit_svc_gate(
 // MSR + MRS gates
 // ============================================================
 
-/// Per-site MSR gate with a 32-byte frame, padded into one 48-byte slot.
-///
-/// Virtualizes a guest `MSR TPIDR_EL0, Xn` write by storing the guest value
-/// into the guest thread-pointer slot at `[anchor + guest_tpidr_offset]`:
-///
-/// 1. spill X16/X17 and capture `Xn` to the frame while all guest registers are
-///    still pristine, so `Xn` needs no special-casing even when it is one of the
-///    scratch registers just spilled or XZR;
-/// 2. read the host anchor into X16;
-/// 3. reload the captured value into X17 and store it to the slot;
-/// 4. restore X16/X17 and branch back to the instruction after the original MSR.
-///
-/// The slot is always reachable, so a guest value of `0` (XZR) is an ordinary
-/// store, never a fault. Requires `SP` to address a valid writable stack at the
-/// site (see the module docs). NZCV and X30 reach the guest unchanged.
+/// Virtualizes a guest `MSR TPIDR_EL0, Xn` write while preserving guest
+/// registers in a 32-byte stack frame. Requires a valid writable guest stack;
+/// NZCV and X30 reach the guest unchanged.
 fn emit_msr_gate(
     trampoline_data: &mut Vec<u8>,
     gate_offset: usize,
@@ -3423,11 +3429,8 @@ fn emit_msr_gate(
         imm_bytes: MSR_FRAME_OFF_VALUE,
     });
 
-    // MRS X16, <host anchor> — read the host anchor.
-    host.emit_anchor_read(&mut asm, X16);
+    host.emit_tls_base_read(&mut asm, X16);
 
-    // LDR X17, [SP, #16] ; STR X17, [X16, #<tpidr offset>] — store the guest
-    // value into its slot off the host anchor.
     asm.emit(Insn::LdrUimm {
         rt: X17,
         rn: SP,
@@ -3436,7 +3439,7 @@ fn emit_msr_gate(
     asm.emit(Insn::StrUimm {
         rt: X17,
         rn: X16,
-        imm_bytes: GUEST_TPIDR_OFFSET_PLACEHOLDER,
+        imm_bytes: host.guest_tpidr_access_offset(),
     });
 
     // Restore: LDP X16, X17, [SP] ; ADD SP, SP, #32.
@@ -3483,11 +3486,11 @@ fn emit_mrs_gate(
 ) -> Result<GateBuild> {
     let gate_vaddr = checked_add_u64(trampoline_base_addr, gate_offset as u64, "MRS gate")?;
     let mut asm = Asm::new(gate_vaddr);
-    host.emit_anchor_read(&mut asm, rd);
+    host.emit_tls_base_read(&mut asm, rd);
     asm.emit(Insn::LdrUimm {
         rt: rd,
         rn: rd,
-        imm_bytes: GUEST_TPIDR_OFFSET_PLACEHOLDER,
+        imm_bytes: host.guest_tpidr_access_offset(),
     });
     let return_addr = checked_add_u64(site.vaddr, INSN_BYTES_U64, "MRS return")?;
     if !asm.branch_to(return_addr)? {
@@ -3527,11 +3530,11 @@ fn emit_x18_gate(
         rn: SP,
         imm_bytes: -(X18_FRAME_BYTES.cast_signed()),
     });
-    host.emit_anchor_read(&mut asm, anchor_scratch);
+    host.emit_tls_base_read(&mut asm, anchor_scratch);
     asm.emit(Insn::LdrUimm {
         rt: scratch,
         rn: anchor_scratch,
-        imm_bytes: GUEST_X18_OFFSET_PLACEHOLDER,
+        imm_bytes: host.guest_x18_access_offset(),
     });
     asm.emit(Insn::AddImm {
         rd: anchor_scratch,
@@ -3571,11 +3574,11 @@ fn emit_x18_gate(
         rn: anchor_scratch,
         imm12: 0,
     });
-    host.emit_anchor_read(&mut asm, anchor_scratch);
+    host.emit_tls_base_read(&mut asm, anchor_scratch);
     asm.emit(Insn::StrUimm {
         rt: scratch,
         rn: anchor_scratch,
-        imm_bytes: GUEST_X18_OFFSET_PLACEHOLDER,
+        imm_bytes: host.guest_x18_access_offset(),
     });
     asm.emit(Insn::LdpPost {
         rt: scratch,
@@ -3619,11 +3622,11 @@ fn emit_x18_stack_writeback_gate(
         rn: SP,
         imm_bytes: 0,
     });
-    host.emit_anchor_read(&mut asm, pair.anchor_scratch);
+    host.emit_tls_base_read(&mut asm, pair.anchor_scratch);
     asm.emit(Insn::LdrUimm {
         rt: pair.scratch,
         rn: pair.anchor_scratch,
-        imm_bytes: GUEST_X18_OFFSET_PLACEHOLDER,
+        imm_bytes: host.guest_x18_access_offset(),
     });
     asm.emit(Insn::AddImm {
         rd: pair.anchor_scratch,
@@ -3637,11 +3640,11 @@ fn emit_x18_stack_writeback_gate(
         rn: pair.anchor_scratch,
         imm12: 0,
     });
-    host.emit_anchor_read(&mut asm, pair.anchor_scratch);
+    host.emit_tls_base_read(&mut asm, pair.anchor_scratch);
     asm.emit(Insn::StrUimm {
         rt: pair.scratch,
         rn: pair.anchor_scratch,
-        imm_bytes: GUEST_X18_OFFSET_PLACEHOLDER,
+        imm_bytes: host.guest_x18_access_offset(),
     });
     asm.emit(Insn::Ldp {
         rt: pair.scratch,
@@ -3691,11 +3694,11 @@ fn emit_x18_compare_branch_gate(
         rn: SP,
         imm_bytes: X18_FRAME_OFF_SCRATCHES.cast_signed(),
     });
-    host.emit_anchor_read(&mut asm, branch.anchor_scratch);
+    host.emit_tls_base_read(&mut asm, branch.anchor_scratch);
     asm.emit(Insn::LdrUimm {
         rt: branch.scratch,
         rn: branch.anchor_scratch,
-        imm_bytes: GUEST_X18_OFFSET_PLACEHOLDER,
+        imm_bytes: host.guest_x18_access_offset(),
     });
     asm.emit(match branch.kind {
         X18BranchKind::CbzW => Insn::CbzW {
@@ -3771,7 +3774,7 @@ fn emit_x18_adr_gate(
         rn: SP,
         imm_bytes: -(X18_FRAME_BYTES.cast_signed()),
     });
-    host.emit_anchor_read(&mut asm, adr.anchor_scratch);
+    host.emit_tls_base_read(&mut asm, adr.anchor_scratch);
     if !asm.adrp(adr.scratch, adr.target)? {
         return Ok(GateBuild::Unreachable);
     }
@@ -3783,7 +3786,7 @@ fn emit_x18_adr_gate(
     asm.emit(Insn::StrUimm {
         rt: adr.scratch,
         rn: adr.anchor_scratch,
-        imm_bytes: GUEST_X18_OFFSET_PLACEHOLDER,
+        imm_bytes: host.guest_x18_access_offset(),
     });
     asm.emit(Insn::LdpPost {
         rt: adr.scratch,
@@ -4054,8 +4057,8 @@ fn validate_gate_slot_inner_for_host(
                 && padding_is_nops(48)
         }
         GateMetadata::MrsTpidr { destination } => {
-            is_host_anchor_sequence(slot, metadata, 0, destination, host)
-                && is_tpidr_access(word_at(4), Opcode::LdrUimm, destination, destination)
+            is_host_tls_base_sequence(slot, metadata, 0, destination, host)
+                && is_tpidr_access(word_at(4), Opcode::LdrUimm, destination, destination, host)
                 && match addressing {
                     SlotAddressing::Unplaced { .. } => {
                         word_at(8) & OPCODE_TOP6_MASK == Opcode::B.bits()
@@ -4087,7 +4090,7 @@ fn validate_gate_slot_inner_for_host(
                         imm_bytes: MSR_FRAME_OFF_VALUE,
                     },
                 )
-                && is_host_anchor_sequence(slot, metadata, 12, X16, host)
+                && is_host_tls_base_sequence(slot, metadata, 12, X16, host)
                 && exact(
                     16,
                     Insn::LdrUimm {
@@ -4096,7 +4099,7 @@ fn validate_gate_slot_inner_for_host(
                         imm_bytes: MSR_FRAME_OFF_VALUE,
                     },
                 )
-                && is_tpidr_access(word_at(20), Opcode::StrUimm, X17, X16)
+                && is_tpidr_access(word_at(20), Opcode::StrUimm, X17, X16, host)
                 && exact(
                     24,
                     Insn::Ldp {
@@ -4151,7 +4154,7 @@ fn validate_gate_slot_inner_for_host(
                     rn: SP,
                     imm_bytes: -(X18_FRAME_BYTES.cast_signed()),
                 },
-            ) && is_host_anchor_sequence(
+            ) && is_host_tls_base_sequence(
                 slot,
                 metadata,
                 X18GateOffset::FirstAnchor.as_usize(),
@@ -4162,6 +4165,7 @@ fn validate_gate_slot_inner_for_host(
                 Opcode::LdrUimm,
                 scratch,
                 anchor_scratch,
+                host,
             ) && exact(
                 X18GateOffset::FrameAddress.as_usize(),
                 Insn::AddImm {
@@ -4179,7 +4183,7 @@ fn validate_gate_slot_inner_for_host(
                     rn: anchor_scratch,
                     imm12: 0,
                 },
-            ) && is_host_anchor_sequence(
+            ) && is_host_tls_base_sequence(
                 slot,
                 metadata,
                 X18GateOffset::SecondAnchor.as_usize(),
@@ -4192,6 +4196,7 @@ fn validate_gate_slot_inner_for_host(
                     Opcode::StrUimm,
                     scratch,
                     anchor_scratch,
+                    host,
                 )
                 && exact(
                     X18GateOffset::RestoreRegisters.as_usize(),
@@ -4258,8 +4263,8 @@ fn validate_gate_slot_inner_for_host(
                         imm_bytes: 0,
                     },
                 )
-                && is_host_anchor_sequence(slot, metadata, 8, anchor_scratch, host)
-                && is_x18_access(word_at(12), Opcode::LdrUimm, scratch, anchor_scratch)
+                && is_host_tls_base_sequence(slot, metadata, 8, anchor_scratch, host)
+                && is_x18_access(word_at(12), Opcode::LdrUimm, scratch, anchor_scratch, host)
                 && exact(
                     16,
                     Insn::AddImm {
@@ -4277,9 +4282,9 @@ fn validate_gate_slot_inner_for_host(
                         imm12: 0,
                     },
                 )
-                && is_host_anchor_sequence(slot, metadata, 32, anchor_scratch, host)
+                && is_host_tls_base_sequence(slot, metadata, 32, anchor_scratch, host)
                 && word_at(8) == word_at(32)
-                && is_x18_access(word_at(36), Opcode::StrUimm, scratch, anchor_scratch)
+                && is_x18_access(word_at(36), Opcode::StrUimm, scratch, anchor_scratch, host)
                 && exact(
                     40,
                     Insn::Ldp {
@@ -4317,8 +4322,8 @@ fn validate_gate_slot_inner_for_host(
                         imm_bytes: 0,
                     },
                 )
-                && is_host_anchor_sequence(slot, metadata, 8, anchor_scratch, host)
-                && is_x18_access(word_at(12), Opcode::LdrUimm, scratch, anchor_scratch)
+                && is_host_tls_base_sequence(slot, metadata, 8, anchor_scratch, host)
+                && is_x18_access(word_at(12), Opcode::LdrUimm, scratch, anchor_scratch, host)
                 && ([
                     Insn::CbnzW {
                         rt: scratch,
@@ -4394,11 +4399,11 @@ fn validate_gate_slot_inner_for_host(
                     rn: SP,
                     imm_bytes: -(X18_FRAME_BYTES.cast_signed()),
                 },
-            ) && is_host_anchor_sequence(slot, metadata, 4, anchor_scratch, host)
+            ) && is_host_tls_base_sequence(slot, metadata, 4, anchor_scratch, host)
                 && adrp & ADRP_SHAPE_MASK == Opcode::Adrp.bits() | u32::from(scratch)
                 && add & ADD_IMM_SHAPE_MASK
                     == Opcode::AddImm.bits() | (u32::from(scratch) << RN_SHIFT) | u32::from(scratch)
-                && is_x18_access(word_at(16), Opcode::StrUimm, scratch, anchor_scratch)
+                && is_x18_access(word_at(16), Opcode::StrUimm, scratch, anchor_scratch, host)
                 && exact(
                     20,
                     Insn::LdpPost {
@@ -4420,7 +4425,7 @@ fn validate_gate_slot_inner_for_host(
 }
 
 impl GateMetadata {
-    /// Fixed byte size of this metadata version's compact slot.
+    /// Byte size of this gate's direct-TLS layout.
     pub const fn slot_size(self) -> usize {
         match self {
             GateMetadata::Svc => SVC_SLOT_BYTES,
@@ -4449,14 +4454,18 @@ impl GateMetadata {
         }
         match self {
             GateMetadata::MrsTpidr { .. } => MRS_SLOT_BYTES + GATE_ALIGNMENT,
+            GateMetadata::MsrTpidr { .. } => MSR_SLOT_BYTES + GATE_ALIGNMENT,
             GateMetadata::X18 { .. } => X18_SLOT_BYTES + GATE_ALIGNMENT,
+            GateMetadata::X18StackWriteback { .. } => {
+                X18_STACK_WRITEBACK_SLOT_BYTES + GATE_ALIGNMENT
+            }
             GateMetadata::X18CompareBranch { .. } => X18_COMPARE_BRANCH_SLOT_BYTES + GATE_ALIGNMENT,
             GateMetadata::X18Adr { .. } => X18_ADR_SLOT_BYTES + GATE_ALIGNMENT,
             _ => self.slot_size(),
         }
     }
 
-    const fn macos_anchor_offsets(self) -> &'static [usize] {
+    const fn indirect_tls_anchor_offsets(self) -> &'static [usize] {
         match self {
             GateMetadata::MrsTpidr { .. } => &[MrsTpidrGateOffset::Entry as usize],
             GateMetadata::MsrTpidr { .. } => &[MsrTpidrGateOffset::ReadAnchor as usize],
@@ -4478,12 +4487,13 @@ impl GateMetadata {
         if !matches!(host, Host::MacOs) {
             return logical;
         }
-        let anchors = self.macos_anchor_offsets();
+        let anchors = self.indirect_tls_anchor_offsets();
         let mut index = 0;
         let mut extra = 0;
         while index < anchors.len() {
             if anchors[index] < logical {
-                extra += INSN_BYTES;
+                // Indirect TLS adds an anchor mask and a block-pointer load.
+                extra += 2 * INSN_BYTES;
             }
             index += 1;
         }
@@ -4495,15 +4505,16 @@ impl GateMetadata {
         if !matches!(host, crate::TargetHost::MacOs) {
             return host_offset;
         }
-        let anchors = self.macos_anchor_offsets();
+        let anchors = self.indirect_tls_anchor_offsets();
         let mut extra = 0;
         for &anchor in anchors {
             let mask = anchor + extra + INSN_BYTES;
-            if host_offset == mask {
+            let block_load = mask + INSN_BYTES;
+            if host_offset == mask || host_offset == block_load {
                 return anchor + INSN_BYTES;
             }
-            if host_offset > mask {
-                extra += INSN_BYTES;
+            if host_offset > block_load {
+                extra += 2 * INSN_BYTES;
             }
         }
         host_offset - extra
@@ -4557,17 +4568,17 @@ impl GateMetadata {
     }
 }
 
-// These macOS layouts have no spare instruction slots.
+// Keep each indirect-TLS body and its metadata within the selected slot.
 const _: () = {
     let msr = GateMetadata::MsrTpidr { source: 0 };
     assert!(
         msr.offset_for_host(Host::MacOs, MSR_GATE_BODY_END) + GATE_METADATA_BYTES
-            == msr.slot_size_for_host(crate::TargetHost::MacOs)
+            <= msr.slot_size_for_host(crate::TargetHost::MacOs)
     );
     let stack = GateMetadata::X18StackWriteback { scratch: 7 };
     assert!(
         stack.executable_end_for_host(Host::MacOs) + GATE_METADATA_BYTES
-            == stack.slot_size_for_host(crate::TargetHost::MacOs)
+            <= stack.slot_size_for_host(crate::TargetHost::MacOs)
     );
 };
 
@@ -4653,7 +4664,7 @@ pub fn classify_gate_pc(
     classify_gate_pc_with_candidates(trampoline, trampoline_base, pc, candidates)
 }
 
-/// Classify a copied compact slot, validating the selected host's TLS anchor.
+/// Classify a copied compact slot, validating the selected host's TLS access sequence.
 /// The caller must require exactly one matching candidate.
 pub fn classify_copied_gate_slot_for_host(
     slot: &[u8],
@@ -4848,23 +4859,33 @@ fn classify_gate_pc_with_candidates<const N: usize>(
     match_found
 }
 
-fn is_tpidr_access(word: u32, opcode: Opcode, rt: u8, rn: u8) -> bool {
+fn is_tpidr_access(word: u32, opcode: Opcode, rt: u8, rn: u8, host: Host) -> bool {
     if word & !LDST_UIMM12_IMM_MASK != opcode.bits() | (u32::from(rn) << RN_SHIFT) | u32::from(rt) {
         return false;
     }
     let encoded = (word & LDST_UIMM12_IMM_MASK) >> LDST_UIMM12_IMM_SHIFT;
-    valid_emitted_tpidr_offset(encoded * u32::from(GUEST_TPIDR_OFFSET_ALIGN))
+    let offset = encoded * u32::from(GUEST_TPIDR_OFFSET_ALIGN);
+    if host == Host::MacOs {
+        offset == 0
+    } else {
+        valid_emitted_tpidr_offset(offset)
+    }
 }
 
-fn is_x18_access(word: u32, opcode: Opcode, rt: u8, rn: u8) -> bool {
-    word & !LDST_UIMM12_IMM_MASK == opcode.bits() | (u32::from(rn) << RN_SHIFT) | u32::from(rt)
-        && valid_emitted_x18_offset(
-            ((word & LDST_UIMM12_IMM_MASK) >> LDST_UIMM12_IMM_SHIFT)
-                * u32::from(GUEST_TPIDR_OFFSET_ALIGN),
-        )
+fn is_x18_access(word: u32, opcode: Opcode, rt: u8, rn: u8, host: Host) -> bool {
+    if word & !LDST_UIMM12_IMM_MASK != opcode.bits() | (u32::from(rn) << RN_SHIFT) | u32::from(rt) {
+        return false;
+    }
+    let encoded = (word & LDST_UIMM12_IMM_MASK) >> LDST_UIMM12_IMM_SHIFT;
+    let offset = encoded * u32::from(GUEST_TPIDR_OFFSET_ALIGN);
+    if host == Host::MacOs {
+        offset == u32::from(GUEST_TPIDR_OFFSET_ALIGN)
+    } else {
+        valid_emitted_x18_offset(offset)
+    }
 }
 
-fn is_host_anchor_sequence(
+fn is_host_tls_base_sequence(
     slot: &[u8],
     metadata: GateMetadata,
     logical_offset: usize,
@@ -4879,8 +4900,11 @@ fn is_host_anchor_sequence(
     };
     word_at_emitted_offset(emitted_offset) == host.anchor_read(register).encode()
         && (!matches!(host, Host::MacOs)
-            || word_at_emitted_offset(emitted_offset + INSN_BYTES)
-                == anchor_mask(register).encode())
+            || (word_at_emitted_offset(emitted_offset + INSN_BYTES)
+                == anchor_mask(register).encode()
+                && word_at_emitted_offset(emitted_offset + 2 * INSN_BYTES).is_some_and(|word| {
+                    is_tpidr_access(word, Opcode::LdrUimm, register, register, Host::Linux)
+                })))
 }
 
 fn stack_writeback_state(slot: &[u8], metadata: GateMetadata, host: Host) -> Option<(i16, u16)> {
@@ -4896,7 +4920,7 @@ fn stack_writeback_state(slot: &[u8], metadata: GateMetadata, host: Host) -> Opt
 
 fn x18_anchor_scratch(slot: &[u8], metadata: GateMetadata) -> Option<u8> {
     // These spill instructions precede the first host-anchor read, so their
-    // offsets are identical in the base and expanded macOS layouts.
+    // offsets are identical in the direct- and indirect-TLS layouts.
     let offset = match metadata {
         GateMetadata::X18 { .. } | GateMetadata::X18Adr { .. } => 0,
         GateMetadata::X18StackWriteback { .. } | GateMetadata::X18CompareBranch { .. } => 4,
@@ -5006,7 +5030,11 @@ pub fn finalize_trampoline_gates(trampoline: &mut [u8], offset: u16) -> Result<(
     Ok(())
 }
 
-/// Validate and finalize guest TLS/x18 slots for `host`. Leaves bytes unchanged on error.
+/// Validate and finalize guest TLS offsets for `host`.
+///
+/// Direct-TLS gates patch the guest TP and x18 field offsets independently.
+/// Indirect-TLS gates patch both accesses with the root offset and use fixed
+/// in-block field offsets. Leaves bytes unchanged on error.
 pub fn finalize_trampoline_gates_for_host(
     trampoline: &mut [u8],
     guest_tpidr_offset: u16,
@@ -5026,32 +5054,33 @@ pub fn finalize_trampoline_gates_for_host(
     let host = host.into();
     let tp = validate_trampoline_offsets_for_host(trampoline, guest_tpidr_offset, false, host)?;
     validate_guest_offset(guest_x18_offset, true)?;
-    let x18 = validate_trampoline_offsets_for_host(trampoline, guest_x18_offset, true, host)?;
+    // Indirect-TLS gates patch the root pointer load; field offsets are fixed.
+    let x18_patch_value = if host == Host::MacOs {
+        guest_tpidr_offset
+    } else {
+        guest_x18_offset
+    };
+    let x18 = validate_trampoline_offsets_for_host(trampoline, x18_patch_value, true, host)?;
     // Both sets are validated before mutation, so an error cannot leave a partial patch.
     patch_offset_words(trampoline, &tp.patch_offsets, guest_tpidr_offset);
-    patch_offset_words(trampoline, &x18.patch_offsets, guest_x18_offset);
+    patch_offset_words(trampoline, &x18.patch_offsets, x18_patch_value);
     Ok(())
 }
 
-/// Whether a gate can be patched to reach `offset`: a multiple of
-/// [`GUEST_TPIDR_OFFSET_ALIGN`], far enough from the thread pointer that it
-/// cannot land on the host's own per-thread state, and below the value reserved
-/// for the unpatched placeholder.
+/// Whether `offset` is aligned and within the range accepted by guest TLS gates.
 pub fn is_patchable_guest_tpidr_offset(offset: u16) -> bool {
     offset.is_multiple_of(GUEST_TPIDR_OFFSET_ALIGN)
         && (MIN_GUEST_TPIDR_OFFSET..GUEST_TPIDR_OFFSET_PLACEHOLDER).contains(&offset)
 }
 
-/// Whether an x18 gate can be patched to reach `offset` without retaining a
-/// value reserved for an unpatched placeholder.
+/// Whether `offset` is valid for a direct-TLS x18 access.
 pub fn is_patchable_guest_x18_offset(offset: u16) -> bool {
     offset.is_multiple_of(GUEST_TPIDR_OFFSET_ALIGN)
         && (MIN_GUEST_TPIDR_OFFSET..GUEST_X18_OFFSET_PLACEHOLDER).contains(&offset)
 }
 
-/// Rewrites the guest thread-pointer offset in every gate of one emitted
-/// trampoline, replacing the emitted placeholder with `offset`. The loader must
-/// call this before making the trampoline executable.
+/// Rewrites the guest thread-pointer offset in every Linux gate of one emitted
+/// trampoline. The loader must call this before making the trampoline executable.
 ///
 /// Returns the number of instructions patched. Zero is normal: a binary whose
 /// only patch sites are `SVC` has no thread-pointer gate.
@@ -5194,36 +5223,61 @@ fn validate_trampoline_offsets_for_host(
                 | GateMetadata::X18Adr { .. }
                 | GateMetadata::X18Branch { .. }
         );
-        let instruction_offsets: &[usize] = match (metadata, x18) {
-            (GateMetadata::MrsTpidr { .. }, false) => &[
-                cursor + metadata.offset_for_host(host, MrsTpidrGateOffset::SlotLoad.as_usize())
-            ],
-            (GateMetadata::MsrTpidr { .. }, false) => &[
-                cursor + metadata.offset_for_host(host, MsrTpidrGateOffset::SlotStore.as_usize())
-            ],
-            (GateMetadata::X18 { .. }, true) => &[
-                cursor + metadata.offset_for_host(host, X18GateOffset::SlotLoad.as_usize()),
-                cursor + metadata.offset_for_host(host, X18GateOffset::SlotStore.as_usize()),
-            ],
-            (GateMetadata::X18StackWriteback { .. }, true) => &[
-                cursor
-                    + metadata.offset_for_host(host, X18StackWritebackOffset::SlotLoad.as_usize()),
-                cursor
-                    + metadata.offset_for_host(host, X18StackWritebackOffset::SlotStore.as_usize()),
-            ],
-            (GateMetadata::X18CompareBranch { .. }, true) => &[cursor
-                + metadata.offset_for_host(host, X18CompareBranchOffset::SlotLoad.as_usize())],
-            (GateMetadata::X18Adr { .. }, true) => {
-                &[cursor + metadata.offset_for_host(host, X18AdrOffset::SlotStore.as_usize())]
-            }
-            _ => &[],
+        let relevant = match metadata {
+            GateMetadata::MrsTpidr { .. } | GateMetadata::MsrTpidr { .. } => !x18,
+            GateMetadata::X18 { .. }
+            | GateMetadata::X18StackWriteback { .. }
+            | GateMetadata::X18CompareBranch { .. }
+            | GateMetadata::X18Adr { .. } => x18,
+            GateMetadata::Svc | GateMetadata::X18Branch { .. } => false,
         };
-        for &offset in instruction_offsets {
+        let instruction_offsets: Vec<usize> = if host == Host::MacOs && relevant {
+            metadata
+                .indirect_tls_anchor_offsets()
+                .iter()
+                .map(|&anchor| cursor + metadata.offset_for_host(host, anchor) + 2 * INSN_BYTES)
+                .collect()
+        } else {
+            match (metadata, x18) {
+                (GateMetadata::MrsTpidr { .. }, false) => vec![
+                    cursor
+                        + metadata.offset_for_host(host, MrsTpidrGateOffset::SlotLoad.as_usize()),
+                ],
+                (GateMetadata::MsrTpidr { .. }, false) => vec![
+                    cursor
+                        + metadata.offset_for_host(host, MsrTpidrGateOffset::SlotStore.as_usize()),
+                ],
+                (GateMetadata::X18 { .. }, true) => vec![
+                    cursor + metadata.offset_for_host(host, X18GateOffset::SlotLoad.as_usize()),
+                    cursor + metadata.offset_for_host(host, X18GateOffset::SlotStore.as_usize()),
+                ],
+                (GateMetadata::X18StackWriteback { .. }, true) => vec![
+                    cursor
+                        + metadata
+                            .offset_for_host(host, X18StackWritebackOffset::SlotLoad.as_usize()),
+                    cursor
+                        + metadata
+                            .offset_for_host(host, X18StackWritebackOffset::SlotStore.as_usize()),
+                ],
+                (GateMetadata::X18CompareBranch { .. }, true) => vec![
+                    cursor
+                        + metadata
+                            .offset_for_host(host, X18CompareBranchOffset::SlotLoad.as_usize()),
+                ],
+                (GateMetadata::X18Adr { .. }, true) => {
+                    vec![
+                        cursor + metadata.offset_for_host(host, X18AdrOffset::SlotStore.as_usize()),
+                    ]
+                }
+                _ => vec![],
+            }
+        };
+        for &offset in &instruction_offsets {
             let insn =
                 u32::from_le_bytes(trampoline[offset..offset + INSN_BYTES].try_into().unwrap());
             let encoded = (insn & LDST_UIMM12_IMM_MASK) >> LDST_UIMM12_IMM_SHIFT;
             let gate_offset = encoded * u32::from(GUEST_TPIDR_OFFSET_ALIGN);
-            let placeholder = if x18 {
+            let placeholder = if x18 && host != Host::MacOs {
                 GUEST_X18_OFFSET_PLACEHOLDER
             } else {
                 GUEST_TPIDR_OFFSET_PLACEHOLDER
@@ -5232,9 +5286,9 @@ fn validate_trampoline_offsets_for_host(
                 patch_offsets.push(offset);
             } else if gate_offset != u32::from(expected_offset) {
                 return Err(Error::TrampolinePatchFailure(format!(
-                    "AArch64 gate at byte {offset} addresses the host thread pointer at \
-                     {gate_offset}, which is neither the placeholder nor the offset being \
-                     patched in ({expected_offset})"
+                    "AArch64 gate at byte {offset} uses TLS offset {gate_offset}, which is \
+                     neither the placeholder nor the offset being patched in \
+                     ({expected_offset})"
                 )));
             }
         }
@@ -5455,8 +5509,18 @@ mod tests {
             word_at(&trampoline, 48 + 16),
             anchor_mask(X16).encode().unwrap()
         );
+        assert_eq!(
+            word_at(&trampoline, 24),
+            Insn::LdrUimm {
+                rt: 9,
+                rn: 9,
+                imm_bytes: GUEST_TPIDR_OFFSET_PLACEHOLDER,
+            }
+            .encode()
+            .unwrap()
+        );
         assert!(matches!(
-            decode_gate_metadata_word(word_at(&trampoline, 96 + SVC_SLOT_BYTES - 4)),
+            decode_gate_metadata_word(word_at(&trampoline, 112 + SVC_SLOT_BYTES - 4)),
             Some(GateMetadata::Svc)
         ));
     }
@@ -7344,14 +7408,17 @@ mod tests {
                 );
             }
             let mut extra = 0;
-            for &anchor in metadata.macos_anchor_offsets() {
+            for &anchor in metadata.indirect_tls_anchor_offsets() {
                 let mask = anchor + extra + INSN_BYTES;
-                assert_eq!(
-                    metadata.recovery_offset_for_host(crate::TargetHost::MacOs, mask),
-                    anchor + INSN_BYTES,
-                    "{metadata:?} mask after anchor {anchor}"
-                );
-                extra += INSN_BYTES;
+                let block_load = mask + INSN_BYTES;
+                for (name, offset) in [("mask", mask), ("block load", block_load)] {
+                    assert_eq!(
+                        metadata.recovery_offset_for_host(crate::TargetHost::MacOs, offset),
+                        anchor + INSN_BYTES,
+                        "{metadata:?} {name} after anchor {anchor}"
+                    );
+                }
+                extra += 2 * INSN_BYTES;
             }
         }
     }
@@ -7705,8 +7772,8 @@ mod tests {
             hook_words_opt_with_config(&x18_words, 0x2000, base, x18_config(Host::MacOs));
 
         for (trampoline, sizes) in [
-            (normal.unwrap().trampoline, vec![32, 48, 64]),
-            (x18.unwrap().trampoline, vec![64, 64, 64, 48, 16]),
+            (normal.unwrap().trampoline, vec![32, 64, 64]),
+            (x18.unwrap().trampoline, vec![64, 80, 64, 48, 16]),
         ] {
             let mut start = GATES_START_OFFSET;
             for size in sizes {

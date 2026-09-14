@@ -7,9 +7,9 @@ use crate::PtRegs;
 use litebox::utils::TruncateExt as _;
 use litebox_syscall_rewriter::TargetHost;
 use litebox_syscall_rewriter::aarch64::{
-    GATE_ALIGNMENT, GATE_PC_CANDIDATE_COUNT, GATE_SLOT_SIZES, GateMetadata, MSR_FRAME_BYTES,
-    MSR_FRAME_OFF_VALUE, MrsTpidrGateOffset, MrsTpidrValueSource, MsrTpidrFrameState,
-    MsrTpidrGateOffset, RuntimeAccess, SVC_FRAME_BYTES, SVC_GATE_BYTES, SVC_SLOT_BYTES,
+    GATE_ALIGNMENT, GATE_PC_CANDIDATE_COUNT, GATE_SLOT_SIZES, GateMetadata, MAX_GATE_SLOT_BYTES,
+    MSR_FRAME_BYTES, MSR_FRAME_OFF_VALUE, MrsTpidrGateOffset, MrsTpidrValueSource,
+    MsrTpidrFrameState, MsrTpidrGateOffset, RuntimeAccess, SVC_FRAME_BYTES, SVC_GATE_BYTES,
     SvcFrameState, SvcGateOffset, X18_FRAME_BYTES, X18AdrOffset, X18CompareBranchOffset,
     X18FaultAttribution, X18FrameState, X18GateOffset, X18Resume, X18StackWritebackFrameState,
     X18StackWritebackOffset, X18StackWritebackSpSource, X18ValueSource, x18_branch_recovery_plan,
@@ -154,7 +154,7 @@ pub fn canonicalize(
             if metadata.slot_size_for_host(host) != slot_size {
                 continue;
             }
-            let mut slot = [0u8; SVC_SLOT_BYTES];
+            let mut slot = [0u8; MAX_GATE_SLOT_BYTES];
             if !read(slot_start, &mut slot[..slot_size]) {
                 continue;
             }

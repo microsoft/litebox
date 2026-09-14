@@ -8,7 +8,7 @@ use std::cell::Cell;
 use std::ops::Range;
 use std::sync::{
     Arc, Mutex, OnceLock,
-    atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering},
 };
 use std::time::Duration;
 
@@ -33,8 +33,8 @@ use litebox_platform::time::{
     Instant as InstantTrait, SystemTime as SystemTimeTrait, TimeProvider,
 };
 use litebox_syscall_rewriter::aarch64::{
-    SVC_FRAME_BYTES, SVC_FRAME_OFF_RETADDR, SVC_FRAME_OFF_STUB, SVC_FRAME_OFF_X16,
-    is_patchable_guest_tpidr_offset, is_patchable_guest_x18_offset,
+    GUEST_X18_OFFSET_FROM_GUEST_TP, SVC_FRAME_BYTES, SVC_FRAME_OFF_RETADDR, SVC_FRAME_OFF_STUB,
+    SVC_FRAME_OFF_X16, is_patchable_guest_tpidr_offset,
 };
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -67,11 +67,11 @@ impl MacosUserland {
             Some(PAGE_SIZE),
             "unsupported macOS page size"
         );
-        TLS_KEYS
-            .get_or_init(create_tls_keys)
+        TLS_KEY
+            .get_or_init(create_tls_key)
             .as_ref()
             .unwrap_or_else(|error| panic!("failed to initialize macOS TLS: {error}"));
-        initialize_thread_tls().expect("failed to initialize macOS thread TLS");
+        initialize_thread_tls();
         register_exception_handlers().expect("failed to install macOS signal handlers");
         Box::leak(Box::new(Self {
             pages: std::sync::Mutex::new(std::collections::BTreeSet::new()),
@@ -775,9 +775,9 @@ impl litebox::platform::PageManagementProvider<PAGE_SIZE> for MacosUserland {
     }
 }
 
-// The macOS pthread TSD ABI addresses key slots relative to TPIDRRO_EL0.
-// TODO: use one pthread key pointing to a LiteBox-owned TlsBlock, reducing the
-// private ABI dependency to locating that single key slot.
+/// Layout of LiteBox's per-thread AArch64 state.
+///
+/// Field offsets are shared with transition assembly and rewritten guest gates.
 #[repr(C)]
 struct TlsBlock {
     guest_thread_pointer: usize,
@@ -787,7 +787,6 @@ struct TlsBlock {
     in_guest: usize,
     vector_state: usize,
     host_fp_state: usize,
-    initialized: usize,
 }
 
 mod tls_offset {
@@ -800,164 +799,96 @@ mod tls_offset {
     pub const IN_GUEST: usize = core::mem::offset_of!(TlsBlock, in_guest);
     pub const VECTOR_STATE: usize = core::mem::offset_of!(TlsBlock, vector_state);
     pub const HOST_FP_STATE: usize = core::mem::offset_of!(TlsBlock, host_fp_state);
-    pub const INITIALIZED: usize = core::mem::offset_of!(TlsBlock, initialized);
 }
 
-const TLS_SLOT_COUNT: usize = size_of::<TlsBlock>() / size_of::<usize>();
+// The macOS rewriter gates encode these two offsets directly after loading the
+// TlsBlock pointer from the pthread key slot.
+const _: () = assert!(tls_offset::GUEST_THREAD_POINTER == 0);
+const _: () = assert!(tls_offset::GUEST_X18 == GUEST_X18_OFFSET_FROM_GUEST_TP);
 
 #[derive(Debug)]
-struct GuestTlsKeys {
-    slots: [libc::pthread_key_t; TLS_SLOT_COUNT],
-    interrupt_signal: i32,
-}
+struct TlsKey(libc::pthread_key_t);
 
-static TLS_KEYS: OnceLock<Result<GuestTlsKeys, i32>> = OnceLock::new();
-static TLS_BLOCK_OFFSET: AtomicUsize = AtomicUsize::new(0);
+static TLS_KEY: OnceLock<Result<TlsKey, i32>> = OnceLock::new();
+static TLS_KEY_OFFSET: AtomicUsize = AtomicUsize::new(0);
 
-impl Drop for GuestTlsKeys {
+impl Drop for TlsKey {
     fn drop(&mut self) {
-        for key in self.slots {
-            // SAFETY: GuestTlsKeys owns every successfully allocated key.
-            unsafe { libc::pthread_key_delete(key) };
-        }
+        // SAFETY: TlsKey owns this key.
+        unsafe { libc::pthread_key_delete(self.0) };
     }
 }
 
-fn keys() -> &'static GuestTlsKeys {
-    let Some(Ok(keys)) = TLS_KEYS.get() else {
+fn tls_key() -> libc::pthread_key_t {
+    let Some(Ok(key)) = TLS_KEY.get() else {
         fatal_signal(b"macOS TLS is not initialized", 0);
     };
-    keys
+    key.0
 }
 
-unsafe extern "C" fn drop_vector_state(value: *mut libc::c_void) {
+unsafe extern "C" fn drop_tls_block(value: *mut libc::c_void) {
     if !value.is_null() {
-        // SAFETY: the vector-state slot contains only pointers created by Box::into_raw below.
-        unsafe { drop(Box::from_raw(value.cast::<GuestVectorState>())) };
+        // SAFETY: initialize_thread_tls stores an owned TlsBlock in this key.
+        let block = unsafe { Box::from_raw(value.cast::<TlsBlock>()) };
+        if block.vector_state != 0 {
+            // SAFETY: initialize_thread_tls gives the block ownership of this allocation.
+            unsafe { drop(Box::from_raw(block.vector_state as *mut GuestVectorState)) };
+        }
     }
 }
 
-fn validate_tls_layout(
-    keys: &[libc::pthread_key_t; TLS_SLOT_COUNT],
-    first: usize,
-) -> Result<(), i32> {
-    for (index, key) in keys.iter().copied().enumerate() {
-        let vector_sentinel = (index * size_of::<usize>() == tls_offset::VECTOR_STATE)
-            .then(|| Box::into_raw(Box::new(GuestVectorState::default())));
-        let sentinel = vector_sentinel.map_or(0x1234usize + index, |pointer| pointer as usize);
-        // SAFETY: the newly allocated key remains live; pthread treats the value as opaque.
-        let previous = unsafe { libc::pthread_getspecific(key) };
-        // SAFETY: the vector sentinel has the type required by its destructor; other slots
-        // have no destructor. Signal handlers have not been installed yet.
-        let error = unsafe { libc::pthread_setspecific(key, sentinel as *const libc::c_void) };
-        if error != 0 {
-            if let Some(pointer) = vector_sentinel {
-                // SAFETY: pthread did not take ownership after the failed call.
-                unsafe { drop(Box::from_raw(pointer)) };
-            }
-            return Err(error);
-        }
-
-        let mut value = [0u8; size_of::<usize>()];
-        let mut copied = 0;
-        let address = anchor() + first * size_of::<usize>() + index * size_of::<usize>();
-        // SAFETY: value and copied are writable; Mach validates the source address without faulting.
-        let valid = unsafe {
-            mach_vm_read_overwrite(
-                mach_task_self(),
-                address as u64,
-                value.len() as u64,
-                value.as_mut_ptr() as u64,
-                &raw mut copied,
-            ) == KernReturn::SUCCESS
-        } && copied == value.len() as u64
-            && usize::from_ne_bytes(value) == sentinel;
-
-        // SAFETY: restore the opaque value that preceded this temporary probe.
-        let error = unsafe { libc::pthread_setspecific(key, previous) };
-        if error != 0 {
-            // Keep a vector sentinel allocated if pthread still owns it; leaking is safer
-            // than letting key deletion retain a dangling destructor argument.
-            return Err(error);
-        }
-        if let Some(pointer) = vector_sentinel {
-            // SAFETY: restoring the prior value returned ownership to this function.
-            unsafe { drop(Box::from_raw(pointer)) };
-        }
-        if !valid {
-            return Err(libc::ENOTSUP);
-        }
-    }
-    Ok(())
-}
-
-fn create_tls_keys() -> Result<GuestTlsKeys, i32> {
-    let mut keys = [0; TLS_SLOT_COUNT];
-    for index in 0..TLS_SLOT_COUNT {
-        let destructor = (index * size_of::<usize>() == tls_offset::VECTOR_STATE)
-            .then_some(drop_vector_state as unsafe extern "C" fn(*mut libc::c_void));
-        // SAFETY: the array element is writable; only the vector slot owns its opaque pointer.
-        let error = unsafe { libc::pthread_key_create(&raw mut keys[index], destructor) };
-        if error != 0 {
-            for key in &keys[..index] {
-                // SAFETY: these keys were allocated by preceding iterations.
-                unsafe { libc::pthread_key_delete(*key) };
-            }
-            return Err(error);
-        }
-    }
-    let first: usize = keys[0].trunc();
-    if keys.iter().enumerate().any(|(index, key)| {
-        let key: usize = (*key).trunc();
-        key != first + index
-    }) || !u16::try_from(first * size_of::<usize>() + tls_offset::GUEST_THREAD_POINTER)
-        .is_ok_and(is_patchable_guest_tpidr_offset)
-        || !u16::try_from(first * size_of::<usize>() + tls_offset::GUEST_X18)
-            .is_ok_and(is_patchable_guest_x18_offset)
-    {
-        for key in keys {
-            // SAFETY: every key was allocated above and has not been published.
-            unsafe { libc::pthread_key_delete(key) };
-        }
-        return Err(libc::ENOTSUP);
-    }
-    if let Err(error) = validate_tls_layout(&keys, first) {
-        for key in keys {
-            // SAFETY: every key was allocated above and has not been published.
-            unsafe { libc::pthread_key_delete(key) };
-        }
+fn validate_tls_layout(key: libc::pthread_key_t, key_offset: usize) -> Result<(), i32> {
+    let sentinel = 0x1234usize;
+    // SAFETY: the newly allocated key remains live; pthread treats the value as opaque.
+    let previous = unsafe { libc::pthread_getspecific(key) };
+    // SAFETY: no destructor can run before this value is restored.
+    let error = unsafe { libc::pthread_setspecific(key, sentinel as *const libc::c_void) };
+    if error != 0 {
         return Err(error);
     }
-    let mut interrupt_signal = None;
-    for candidate in [libc::SIGUSR1, libc::SIGUSR2] {
-        // SAFETY: macOS sigaction contains integer fields; zero is a valid representation.
-        let mut disposition = unsafe { std::mem::zeroed::<libc::sigaction>() };
-        // SAFETY: disposition is writable and null requests a query.
-        if unsafe { libc::sigaction(candidate, core::ptr::null(), &raw mut disposition) } != 0 {
-            for key in keys {
-                // SAFETY: every key was allocated above and has not been published.
-                unsafe { libc::pthread_key_delete(key) };
-            }
-            // SAFETY: __error returns the current thread's live errno slot.
-            return Err(unsafe { *libc::__error() });
-        }
-        if disposition.sa_sigaction == libc::SIG_DFL {
-            interrupt_signal = Some(candidate);
-            break;
-        }
+    let mut value = [0u8; size_of::<usize>()];
+    let mut copied = 0;
+    let address = anchor() + key_offset;
+    // SAFETY: value and copied are writable; Mach validates the source address without faulting.
+    let valid = unsafe {
+        mach_vm_read_overwrite(
+            mach_task_self(),
+            address as u64,
+            value.len() as u64,
+            value.as_mut_ptr() as u64,
+            &raw mut copied,
+        ) == KernReturn::SUCCESS
+    } && copied == value.len() as u64
+        && usize::from_ne_bytes(value) == sentinel;
+    // SAFETY: restore the opaque value that preceded this temporary probe.
+    let error = unsafe { libc::pthread_setspecific(key, previous) };
+    if error != 0 {
+        return Err(error);
     }
-    let Some(interrupt_signal) = interrupt_signal else {
-        for key in keys {
-            // SAFETY: every key was allocated above and has not been published.
-            unsafe { libc::pthread_key_delete(key) };
-        }
-        return Err(libc::EBUSY);
-    };
-    TLS_BLOCK_OFFSET.store(first * size_of::<usize>(), Ordering::Relaxed);
-    Ok(GuestTlsKeys {
-        slots: keys,
-        interrupt_signal,
-    })
+    valid.then_some(()).ok_or(libc::ENOTSUP)
+}
+
+fn create_tls_key() -> Result<TlsKey, i32> {
+    let mut key = 0;
+    // SAFETY: key is writable; the destructor owns the block stored in it.
+    let error = unsafe { libc::pthread_key_create(&raw mut key, Some(drop_tls_block)) };
+    if error != 0 {
+        return Err(error);
+    }
+    let key_offset: usize = key.trunc();
+    let key_offset = key_offset * size_of::<usize>();
+    if !u16::try_from(key_offset).is_ok_and(is_patchable_guest_tpidr_offset) {
+        // SAFETY: key was allocated above and has not been published.
+        unsafe { libc::pthread_key_delete(key) };
+        return Err(libc::ENOTSUP);
+    }
+    if let Err(error) = validate_tls_layout(key, key_offset) {
+        // SAFETY: key was allocated above and has not been published.
+        unsafe { libc::pthread_key_delete(key) };
+        return Err(error);
+    }
+    TLS_KEY_OFFSET.store(key_offset, Ordering::Relaxed);
+    Ok(TlsKey(key))
 }
 
 fn anchor() -> usize {
@@ -969,59 +900,65 @@ fn anchor() -> usize {
     value & !0b111
 }
 
+fn tls_block_address() -> usize {
+    let slot = (anchor() + TLS_KEY_OFFSET.load(Ordering::Relaxed)) as *const usize;
+    // SAFETY: key creation validates this process-wide key-slot location.
+    unsafe { slot.read_volatile() }
+}
+
 fn tls_address(offset: usize) -> *mut usize {
-    (anchor() + TLS_BLOCK_OFFSET.load(Ordering::Relaxed) + offset) as *mut usize
+    let block = tls_block_address();
+    assert_ne!(block, 0, "macOS TLS is not initialized for this thread");
+    (block + offset) as *mut usize
 }
 
 fn read_tls(offset: usize) -> usize {
-    // SAFETY: key creation validates the process-wide pthread TSD layout before
-    // publishing the keys. Each thread has storage for every allocated slot,
-    // even before initialize_thread_tls populates its nonzero values.
-    unsafe { tls_address(offset).read_volatile() }
+    let block = tls_block_address();
+    if block == 0 {
+        // Signal handlers are process-wide and may run on a non-LiteBox thread.
+        return 0;
+    }
+    // SAFETY: a non-null key value is a live TlsBlock owned by this thread.
+    unsafe { ((block + offset) as *const usize).read_volatile() }
 }
 
 fn write_tls(offset: usize, value: usize) {
-    // SAFETY: key creation validates the process-wide pthread TSD layout before
-    // publishing the keys. The address is this thread's slot at that offset.
+    // SAFETY: create_tls_key validates the pthread slot before publishing the key,
+    // and initialize_thread_tls installs this thread's TlsBlock.
     unsafe { tls_address(offset).write_volatile(value) }
 }
 
-fn initialize_thread_tls() -> std::io::Result<()> {
-    let keys = keys();
-    let initialized_key = keys.slots[tls_offset::INITIALIZED / size_of::<usize>()];
+fn initialize_thread_tls() {
+    let key = tls_key();
     // SAFETY: the process-wide key remains allocated for the process lifetime.
-    if !unsafe { libc::pthread_getspecific(initialized_key) }.is_null() {
-        return Ok(());
+    if !unsafe { libc::pthread_getspecific(key) }.is_null() {
+        return;
     }
-    let vector_slot = tls_address(tls_offset::VECTOR_STATE);
-    // SAFETY: this thread's vector slot was validated above.
-    let vector = unsafe { vector_slot.read_volatile() };
-    if vector == 0 {
-        let vector = Box::into_raw(Box::new(GuestVectorState::default())) as usize;
-        // SAFETY: the key is allocated with drop_vector_state as its destructor.
-        let error = unsafe {
-            libc::pthread_setspecific(
-                keys.slots[tls_offset::VECTOR_STATE / size_of::<usize>()],
-                vector as *const libc::c_void,
-            )
-        };
-        if error != 0 {
-            // SAFETY: pthread did not take ownership after the failed call.
-            unsafe { drop(Box::from_raw(vector as *mut GuestVectorState)) };
-            return Err(std::io::Error::from_raw_os_error(error));
-        }
-    }
-    // Publish initialization only after every slot and owned allocation is valid.
-    // SAFETY: initialized_key is allocated and has no destructor.
-    let error = unsafe { libc::pthread_setspecific(initialized_key, core::ptr::dangling()) };
+    let vector = Box::into_raw(Box::new(GuestVectorState::default())) as usize;
+    let block = Box::new(TlsBlock {
+        guest_thread_pointer: 0,
+        guest_x18: 0,
+        active: 0,
+        current_thread: 0,
+        in_guest: 0,
+        vector_state: vector,
+        host_fp_state: 0,
+    });
+    let block = Box::into_raw(block);
+    // SAFETY: block matches the key destructor's contract.
+    let error = unsafe { libc::pthread_setspecific(key, block.cast()) };
     if error != 0 {
-        return Err(std::io::Error::from_raw_os_error(error));
+        // SAFETY: pthread did not take ownership after the failed call.
+        unsafe { drop_tls_block(block.cast()) };
+        panic!(
+            "failed to initialize macOS thread TLS: {}",
+            std::io::Error::from_raw_os_error(error)
+        );
     }
-    Ok(())
 }
 
 fn guest_thread_pointer_tp_offset() -> usize {
-    TLS_BLOCK_OFFSET.load(Ordering::Relaxed) + tls_offset::GUEST_THREAD_POINTER
+    TLS_KEY_OFFSET.load(Ordering::Relaxed)
 }
 fn get_guest_thread_pointer() -> usize {
     read_tls(tls_offset::GUEST_THREAD_POINTER)
@@ -1065,8 +1002,18 @@ impl litebox::platform::ArchSpecificProvider for MacosUserland {
     }
 }
 
+struct SignalState {
+    interrupt_signal: AtomicI32,
+    previous: OnceLock<[libc::sigaction; 5]>,
+}
+
+static SIGNAL_STATE: SignalState = SignalState {
+    interrupt_signal: AtomicI32::new(0),
+    previous: OnceLock::new(),
+};
+
 fn interrupt_signal() -> i32 {
-    keys().interrupt_signal
+    SIGNAL_STATE.interrupt_signal.load(Ordering::Relaxed)
 }
 
 fn host_signals() -> [i32; 5] {
@@ -1078,7 +1025,6 @@ fn host_signals() -> [i32; 5] {
         interrupt_signal(),
     ]
 }
-static PREVIOUS: OnceLock<[libc::sigaction; 5]> = OnceLock::new();
 // Private Darwin si_code values absent from libc's public constants.
 const SI_USER: i32 = 0x1_0001;
 const SI_QUEUE: i32 = 0x1_0002;
@@ -1107,7 +1053,7 @@ fn thread_start(
     mut ctx: PtRegs,
     vector_state: GuestVectorState,
 ) {
-    initialize_thread_tls().expect("failed to initialize macOS thread TLS");
+    initialize_thread_tls();
     set_guest_vector_state(&vector_state);
     // Allow caller to run some code before we return to the new thread.
     let shim = init_thread.init();
@@ -1158,11 +1104,9 @@ impl litebox::platform::ThreadProvider for MacosUserland {
         let ctx = ctx.clone();
         let vector_state =
             litebox::platform::GuestVectorStateProvider::get_guest_vector_state(self);
-        // TODO: report child startup failures synchronously. Unlike the Linux
-        // and Windows paths, initialize_thread_tls can fail after spawn_thread
-        // has already returned success. Unwinding still drops init_thread and
-        // its Task, so clear_child_tid is cleared and woken, but the guest sees
-        // only a child that exited before running its initialization callback.
+        // TODO: report child TLS setup failures synchronously. pthread_setspecific
+        // can still fail after spawn_thread has returned success, causing the child
+        // to exit before running its initialization callback.
         let _handle = std::thread::Builder::new()
             .spawn(move || thread_start(init_thread, ctx, vector_state))?;
         Ok(())
@@ -1176,7 +1120,7 @@ impl litebox::platform::ThreadProvider for MacosUserland {
 
     #[cfg(debug_assertions)]
     fn run_test_thread<R>(f: impl FnOnce() -> R) -> R {
-        initialize_thread_tls().expect("unsupported macOS TLS layout");
+        initialize_thread_tls();
         assert_eq!(read_tls(tls_offset::CURRENT_THREAD), 0);
         let handle = ThreadHandle(Arc::new(ThreadState {
             // SAFETY: pthread_self has no preconditions.
@@ -1286,9 +1230,10 @@ unsafe extern "C" fn syscall_callback() {
         "str x17, [sp, #{frame_scratch}]",
         "mrs x16, tpidrro_el0",
         "and x16, x16, #0xfffffffffffffff8",
-        "adrp x17, {tls_block_offset}@PAGE",
-        "ldr x17, [x17, {tls_block_offset}@PAGEOFF]",
+        "adrp x17, {tls_key_offset}@PAGE",
+        "ldr x17, [x17, {tls_key_offset}@PAGEOFF]",
         "add x16, x16, x17",
+        "ldr x16, [x16]", // LiteBox TlsBlock pointer
         "ldr x17, [x16, #{active}]", // ThreadContext
         "ldr x17, [x17, #{context}]", // PtRegs
         "stp x0, x1, [x17, #0]",
@@ -1387,9 +1332,10 @@ unsafe extern "C" fn syscall_callback() {
         // clobbered x16/x17. Recompute the TLS base before dereferencing it.
         "mrs x16, tpidrro_el0",
         "and x16, x16, #0xfffffffffffffff8",
-        "adrp x17, {tls_block_offset}@PAGE",
-        "ldr x17, [x17, {tls_block_offset}@PAGEOFF]",
+        "adrp x17, {tls_key_offset}@PAGE",
+        "ldr x17, [x17, {tls_key_offset}@PAGEOFF]",
         "add x16, x16, x17",
+        "ldr x16, [x16]", // LiteBox TlsBlock pointer
         "ldr x0, [x16, #{active}]", // ThreadContext
         "ldr x1, [x0, #{host_sp}]",
         "mov sp, x1",
@@ -1397,7 +1343,7 @@ unsafe extern "C" fn syscall_callback() {
         "bl {syscall_handler}",
         "b {finish_thread_arch}",
         ".cfi_endproc",
-        tls_block_offset = sym TLS_BLOCK_OFFSET,
+        tls_key_offset = sym TLS_KEY_OFFSET,
         active = const tls_offset::ACTIVE,
         in_guest = const tls_offset::IN_GUEST,
         guest_x18 = const tls_offset::GUEST_X18,
@@ -1434,9 +1380,10 @@ unsafe extern "C" fn switch_to_guest_via_sigreturn() -> ! {
     core::arch::naked_asm!(
         "mrs x16, tpidrro_el0",
         "and x16, x16, #0xfffffffffffffff8",
-        "adrp x17, {tls_block_offset}@PAGE",
-        "ldr x17, [x17, {tls_block_offset}@PAGEOFF]",
+        "adrp x17, {tls_key_offset}@PAGE",
+        "ldr x17, [x17, {tls_key_offset}@PAGEOFF]",
         "add x16, x16, x17",
+        "ldr x16, [x16]", // LiteBox TlsBlock pointer
         "mrs x17, fpsr",
         "mrs x9, fpcr",
         "stp w17, w9, [x16, #{host_fp_state}]",
@@ -1452,7 +1399,7 @@ unsafe extern "C" fn switch_to_guest_via_sigreturn() -> ! {
         // The signal handler redirects the first BRK. Trap again rather than
         // falling through if that invariant is ever violated.
         "brk #0",
-        tls_block_offset = sym TLS_BLOCK_OFFSET,
+        tls_key_offset = sym TLS_KEY_OFFSET,
         in_guest = const tls_offset::IN_GUEST,
         host_fp_state = const tls_offset::HOST_FP_STATE,
     );
@@ -1465,9 +1412,10 @@ unsafe extern "C" fn switch_to_guest_via_outbound_stub(_: &mut ThreadContext) ->
         "ldr x16, [x0, #{context}]",
         "mrs x17, tpidrro_el0",
         "and x17, x17, #0xfffffffffffffff8",
-        "adrp x1, {tls_block_offset}@PAGE",
-        "ldr x1, [x1, {tls_block_offset}@PAGEOFF]",
+        "adrp x1, {tls_key_offset}@PAGE",
+        "ldr x1, [x1, {tls_key_offset}@PAGEOFF]",
         "add x17, x17, x1",
+        "ldr x17, [x17]", // LiteBox TlsBlock pointer
         // Save host FP control state before installing the guest's.
         "mrs x1, fpsr",
         "mrs x2, fpcr",
@@ -1532,7 +1480,7 @@ unsafe extern "C" fn switch_to_guest_via_outbound_stub(_: &mut ThreadContext) ->
         ".alt_entry _switch_to_guest_via_outbound_stub_end",
         "_switch_to_guest_via_outbound_stub_end:",
         "b _litebox_macos_interrupt_callback",
-        tls_block_offset = sym TLS_BLOCK_OFFSET,
+        tls_key_offset = sym TLS_KEY_OFFSET,
         in_guest = const tls_offset::IN_GUEST,
         guest_x18 = const tls_offset::GUEST_X18,
         vector_state = const tls_offset::VECTOR_STATE,
@@ -1560,7 +1508,7 @@ where
 }
 
 fn run_thread_inner(shim: &dyn EnterShim<ExecutionContext = PtRegs>, ctx: &mut PtRegs) {
-    initialize_thread_tls().expect("unsupported macOS TLS layout");
+    initialize_thread_tls();
     assert!(
         read_tls(tls_offset::ACTIVE) == 0,
         "nested guest entry is not supported"
@@ -1890,6 +1838,29 @@ pub(crate) fn register_exception_handlers() -> std::io::Result<()> {
     if *installed {
         return Ok(());
     }
+    let mut selected_interrupt_signal = None;
+    for candidate in [libc::SIGUSR1, libc::SIGUSR2] {
+        // SAFETY: macOS sigaction contains integer fields; zero is a valid representation.
+        let mut disposition = unsafe { std::mem::zeroed::<libc::sigaction>() };
+        // SAFETY: disposition is writable and null requests a query.
+        if unsafe { libc::sigaction(candidate, core::ptr::null(), &raw mut disposition) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if disposition.sa_sigaction == libc::SIG_DFL {
+            selected_interrupt_signal = Some(candidate);
+            break;
+        }
+    }
+    let Some(selected_interrupt_signal) = selected_interrupt_signal else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            "no available interrupt signal",
+        ));
+    };
+    SIGNAL_STATE
+        .interrupt_signal
+        .store(selected_interrupt_signal, Ordering::Relaxed);
+
     // SAFETY: macOS sigaction contains integer fields; zero is a valid representation.
     let mut previous = unsafe { std::mem::zeroed::<[libc::sigaction; 5]>() };
     for (signal, previous) in host_signals().into_iter().zip(&mut previous) {
@@ -1898,7 +1869,7 @@ pub(crate) fn register_exception_handlers() -> std::io::Result<()> {
             return Err(std::io::Error::last_os_error());
         }
     }
-    let previous = PREVIOUS.get_or_init(|| previous);
+    let previous = SIGNAL_STATE.previous.get_or_init(|| previous);
     // SAFETY: zero is valid for every field; the handler, flags and mask are filled below.
     let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
     action.sa_sigaction = exception_signal_handler as *const () as usize;
@@ -2126,7 +2097,7 @@ unsafe fn next_signal_handler(signal: i32, info: *mut libc::siginfo_t, raw: *mut
     let Some(previous) = host_signals()
         .iter()
         .position(|s| *s == signal)
-        .and_then(|index| PREVIOUS.get()?.get(index))
+        .and_then(|index| SIGNAL_STATE.previous.get()?.get(index))
     else {
         fatal_signal(b"missing host signal disposition", 0);
     };
@@ -2313,7 +2284,7 @@ mod tests {
             ..switch_to_guest_via_sigreturn_end as *const () as usize;
         let outbound = switch_to_guest_via_outbound_stub_start as *const () as usize
             ..switch_to_guest_via_outbound_stub_end as *const () as usize;
-        assert_eq!(syscall_prologue.len(), 72 * size_of::<u32>());
+        assert_eq!(syscall_prologue.len(), 73 * size_of::<u32>());
         assert_eq!(sigreturn.len(), 3 * size_of::<u32>());
         assert_eq!(outbound.len(), 51 * size_of::<u32>());
     }
@@ -2609,7 +2580,7 @@ mod tests {
             ),
             (0x1234, 0x5678, 1)
         );
-        initialize_thread_tls().unwrap();
+        initialize_thread_tls();
         assert_eq!(
             (
                 get_guest_thread_pointer(),
