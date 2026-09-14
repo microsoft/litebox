@@ -29,7 +29,12 @@ bitflags::bitflags! {
 pub enum PageState {
     /// The address range is reserved but has no committed pages.
     Reserved,
-    /// The address range has committed pages with the specified permissions.
+    /// The address range has a mapping with the specified permissions.
+    ///
+    /// `committed` implies `reserved`.
+    ///
+    /// This includes Linux `PROT_NONE` mappings and Windows committed no-access pages;
+    /// it does not imply physical residency or immediate population.
     Committed(MemoryRegionPermissions),
 }
 
@@ -62,7 +67,19 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ///
     /// # Returns
     ///
-    /// On success, returns a raw mutable pointer to the start of the allocated memory region.
+    /// On success, returns a raw mutable pointer to the start of the allocated memory region
+    /// and transfers ownership of the requested-length range to the caller. `Reserved`
+    /// requests acquire inaccessible memory; `Committed` requests establish the requested
+    /// mapping directly. To commit an existing owned, uncommitted range, request `Committed`
+    /// with [`FixedAddressBehavior::Replace`]. This does not relocate the range. Do not use
+    /// replacement to change permissions on committed pages: it discards their contents;
+    /// use [`update_permissions`](Self::update_permissions) instead.
+    /// Both states relinquish ownership through [`deallocate_pages`](Self::deallocate_pages).
+    /// The returned base is aligned to `ALIGN`. Native reservation alignment, boundaries,
+    /// and any additional backing address space remain private to the provider.
+    /// The caller manages allocation lifetimes and must supply a range free of its live
+    /// allocations for non-replacement requests. Providers may reuse their own reserved
+    /// backing without independently tracking which subranges are live.
     ///
     /// # Errors
     ///
@@ -76,14 +93,23 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, AllocationError>;
 
-    /// De-allocated all pages in the given `range`.
+    /// Remove reserved or committed pages from an owned allocation, including page-aligned subranges.
+    ///
+    /// The caller relinquishes ownership of the range. Providers manage any native
+    /// reservation boundaries internally and may retain backing address space after partial
+    /// removal. A complete native reservation can be released when the caller relinquishes
+    /// its entire extent; providers need not track the lifetime of individual suballocations.
     ///
     /// # Safety
     ///
-    /// The caller must ensure that these pages are not in active use.
+    /// The caller must own the range through this provider and ensure that these pages
+    /// are not in active use. After success, the range must not be used or released again.
     unsafe fn deallocate_pages(&self, range: Range<usize>) -> Result<(), DeallocationError>;
 
     /// Remap pages from `old_range` to `new_range`.
+    ///
+    /// `new_range` specifies the requested size and a suggested destination address.
+    /// The provider may choose a different address; callers must use the returned pointer.
     ///
     /// ## Returns
     ///
@@ -94,7 +120,7 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     /// The caller must ensure that it is safe to move the `old_range` (i.e., these pages are not in
     /// active use).
     ///
-    /// The `new_range` must be larger than `old_range`, and must not overlap with `old_range`.
+    /// The `new_range` must be at least as large as `old_range`, and must not overlap with it.
     ///
     /// Both ranges must be aligned to `ALIGN`.
     unsafe fn remap_pages(
@@ -126,7 +152,7 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
                 temp_state,
                 false,
                 true,
-                FixedAddressBehavior::NoReplace,
+                FixedAddressBehavior::Hint,
             )
             .map_err(|e| match e {
                 AllocationError::OutOfMemory => RemapError::OutOfMemory,
@@ -170,7 +196,9 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         }
 
         if temp_state != state {
-            (unsafe { self.update_permissions(new_range.clone(), permissions) })
+            let allocated_range = new_ptr.as_usize()..new_ptr.as_usize() + new_range.len();
+            // SAFETY: These are the newly allocated committed pages, with no active users.
+            (unsafe { self.update_permissions(allocated_range, permissions) })
                 .expect("failed to restore permissions on new range");
         }
 
@@ -179,34 +207,20 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         Ok(new_ptr)
     }
 
-    /// Commit pages in an existing reserved address range.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that the permissions do not conflict with any currently active usage
-    /// of these pages.
-    ///
-    /// The default implementation is a no-op. Platforms that require an explicit commit operation must override this method.
-    unsafe fn commit_pages(
-        &self,
-        _range: Range<usize>,
-        _permissions: MemoryRegionPermissions,
-    ) -> Result<(), PageStateUpdateError> {
-        Ok(())
-    }
-
     /// Decommit pages while retaining ownership of the address range.
     ///
     /// # Safety
     ///
-    /// The caller must ensure that the contents of these pages are no longer in use.
+    /// The caller must own the range through this provider and ensure that the contents
+    /// of these pages are no longer in use.
     ///
-    /// The default implementation calls [`deallocate_pages`](Self::deallocate_pages) to release the platform backing.
-    unsafe fn decommit_pages(&self, range: Range<usize>) -> Result<(), PageStateUpdateError> {
-        unsafe { self.deallocate_pages(range) }.map_err(|error| match error {
-            DeallocationError::Unaligned => PageStateUpdateError::Unaligned,
-            DeallocationError::AlreadyUnallocated => PageStateUpdateError::Unallocated,
-        })
+    /// The default implementation returns [`PageStateUpdateError::UnsupportedByPlatform`].
+    ///
+    /// It deliberately does not fall back to [`deallocate_pages`](Self::deallocate_pages): that
+    /// would relinquish ownership of the address range. Recommit through
+    /// [`allocate_pages`](Self::allocate_pages) with `Committed` and `Replace`.
+    unsafe fn decommit_pages(&self, _range: Range<usize>) -> Result<(), PageStateUpdateError> {
+        Err(PageStateUpdateError::UnsupportedByPlatform)
     }
 
     /// Update the permissions on committed pages in `range`.
@@ -314,6 +328,10 @@ pub enum PageStateUpdateError {
     Unaligned,
     #[error("provided range contains unallocated pages")]
     Unallocated,
+    #[error("out of memory")]
+    OutOfMemory,
+    #[error("platform does not support page decommitment")]
+    UnsupportedByPlatform,
 }
 
 /// Possible errors for [`PageManagementProvider::try_allocate_cow_pages`]

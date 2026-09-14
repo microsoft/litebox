@@ -309,7 +309,11 @@ impl From<litebox::platform::page_mgmt::PageStateUpdateError> for Errno {
     fn from(value: litebox::platform::page_mgmt::PageStateUpdateError) -> Self {
         match value {
             litebox::platform::page_mgmt::PageStateUpdateError::Unaligned => Errno::EINVAL,
-            litebox::platform::page_mgmt::PageStateUpdateError::Unallocated => Errno::ENOMEM,
+            litebox::platform::page_mgmt::PageStateUpdateError::Unallocated
+            | litebox::platform::page_mgmt::PageStateUpdateError::OutOfMemory => Errno::ENOMEM,
+            litebox::platform::page_mgmt::PageStateUpdateError::UnsupportedByPlatform => {
+                Errno::ENOSYS
+            }
             _ => unimplemented!(),
         }
     }

@@ -17,6 +17,7 @@ use crate::platform::page_mgmt::AllocationError;
 use crate::platform::page_mgmt::FixedAddressBehavior;
 use crate::platform::page_mgmt::MemoryRegionPermissions;
 use crate::platform::page_mgmt::PageState;
+use crate::platform::page_mgmt::PageStateUpdateError;
 
 /// Page size in bytes
 pub const PAGE_SIZE: usize = 4096;
@@ -814,9 +815,29 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             // `intersection` is page aligned.
             unsafe {
                 match (old_state, new_state) {
-                    (PageState::Reserved, PageState::Committed(permissions)) => self
+                    (PageState::Reserved, PageState::Committed(_)) => self
                         .platform
-                        .commit_pages(intersection.clone(), permissions),
+                        .allocate_pages(
+                            intersection.clone(),
+                            new_state,
+                            vma.flags.contains(VmFlags::VM_GROWSDOWN),
+                            false,
+                            FixedAddressBehavior::Replace,
+                        )
+                        .map(|pointer| {
+                            assert_eq!(pointer.as_usize(), intersection.start);
+                        })
+                        .map_err(|error| match error {
+                            AllocationError::OutOfMemory => PageStateUpdateError::OutOfMemory,
+                            AllocationError::Unaligned => PageStateUpdateError::Unaligned,
+                            AllocationError::BelowMinAddress
+                            | AllocationError::AboveMaxAddress
+                            | AllocationError::AddressInUse
+                            | AllocationError::AddressInUseByPlatform
+                            | AllocationError::AddressPartiallyInUse => {
+                                PageStateUpdateError::Unallocated
+                            }
+                        }),
                     (PageState::Committed(_), PageState::Reserved) => {
                         self.platform.decommit_pages(intersection.clone())
                     }

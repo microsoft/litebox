@@ -1554,40 +1554,27 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         Ok(UserMutPtr::from_usize(res))
     }
 
-    unsafe fn commit_pages(
-        &self,
-        range: core::ops::Range<usize>,
-        permissions: MemoryRegionPermissions,
-    ) -> Result<(), litebox::platform::page_mgmt::PageStateUpdateError> {
-        unsafe {
-            <Self as litebox::platform::PageManagementProvider<ALIGN>>::update_permissions(
-                self,
-                range,
-                permissions,
-            )
-        }
-    }
-
     unsafe fn decommit_pages(
         &self,
         range: core::ops::Range<usize>,
     ) -> Result<(), litebox::platform::page_mgmt::PageStateUpdateError> {
-        unsafe {
-            <Self as litebox::platform::PageManagementProvider<ALIGN>>::update_permissions(
-                self,
-                range.clone(),
-                MemoryRegionPermissions::empty(),
-            )
-        }?;
-        unsafe {
-            syscalls::syscall3(
-                syscalls::Sysno::madvise,
+        // SAFETY: The caller owns every page and excludes active users. Replacing the owned
+        // mapping retains its address space and discards both private data and file backing.
+        let base = unsafe {
+            syscalls::syscall6(
+                syscalls::Sysno::mmap,
                 range.start,
                 range.len(),
-                libc::MADV_DONTNEED as usize,
+                ProtFlags::PROT_NONE.bits().reinterpret_as_unsigned() as usize,
+                (MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED)
+                    .bits()
+                    .reinterpret_as_unsigned() as usize,
+                usize::MAX,
+                0,
             )
         }
-        .expect("madvise(MADV_DONTNEED) failed");
+        .expect("failed to replace decommitted pages with an anonymous reservation");
+        assert_eq!(base, range.start);
         Ok(())
     }
 
@@ -1596,6 +1583,12 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         range: core::ops::Range<usize>,
         new_permissions: MemoryRegionPermissions,
     ) -> Result<(), litebox::platform::page_mgmt::PageStateUpdateError> {
+        let map_error = |error| match error {
+            syscalls::Errno::ENOMEM => {
+                litebox::platform::page_mgmt::PageStateUpdateError::OutOfMemory
+            }
+            other => panic!("unhandled mprotect error {other}"),
+        };
         #[cfg(target_arch = "x86_64")]
         unsafe {
             syscalls::syscall3(
@@ -1605,7 +1598,49 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                 prot_flags(new_permissions).bits().reinterpret_as_unsigned() as usize,
             )
         }
-        .expect("mprotect failed");
+        .map_err(map_error)?;
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            // Cache maintenance needs read permission. Keep execute disabled until
+            // the new instructions are visible to the fetch path.
+            //
+            // TODO: only a W->X transition needs this; `update_permissions` is not
+            // told the old permissions, so every transition to X pays for it.
+            // Revisit when the trait passes the old permissions.
+            let syncing = new_permissions.contains(MemoryRegionPermissions::EXEC);
+            let mapped_permissions = if syncing {
+                cache_sync_permissions(new_permissions)
+            } else {
+                new_permissions
+            };
+
+            unsafe {
+                syscalls::syscall3(
+                    syscalls::Sysno::mprotect,
+                    range.start,
+                    range.len(),
+                    prot_flags(mapped_permissions)
+                        .bits()
+                        .reinterpret_as_unsigned() as usize,
+                )
+            }
+            .map_err(map_error)?;
+            if syncing {
+                sync_instruction_stream(range.clone());
+                if mapped_permissions != new_permissions {
+                    unsafe {
+                        syscalls::syscall3(
+                            syscalls::Sysno::mprotect,
+                            range.start,
+                            range.len(),
+                            prot_flags(new_permissions).bits().reinterpret_as_unsigned() as usize,
+                        )
+                    }
+                    .map_err(map_error)?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -2511,26 +2546,48 @@ mod tests {
     }
 
     #[test]
-    fn test_reserved_page_lifecycle() {
+    fn test_direct_reserved_mapping_lifecycle() {
+        use litebox::mm::{
+            PageManager,
+            linux::{CreatePagesFlags, NonZeroPageSize, VmFlags},
+        };
+
         const PAGE_SIZE: usize = 4096;
 
         let platform = LinuxUserland::new(None);
-        let ptr = <LinuxUserland as PageManagementProvider<PAGE_SIZE>>::allocate_pages(
-            platform,
-            0..PAGE_SIZE,
-            PageState::Reserved,
-            false,
-            false,
-            FixedAddressBehavior::Hint,
-        )
+        let manager = PageManager::<_, PAGE_SIZE>::new(&litebox::LiteBox::new(platform));
+        let initial_mappings = manager.mappings();
+        // SAFETY: No fixed address is requested; the reservation has no concurrent users.
+        let ptr = unsafe {
+            manager.create_reserved_pages(
+                None,
+                NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+                CreatePagesFlags::empty(),
+            )
+        }
         .unwrap();
-        let range = ptr.as_usize()..ptr.as_usize() + PAGE_SIZE;
+        let _cleanup = litebox::utils::defer(|| {
+            // SAFETY: Only the test's allocation is removed; startup mappings are untouched.
+            unsafe { manager.remove_pages(ptr, PAGE_SIZE) }.unwrap();
+        });
+        let mapping_flags = || {
+            manager
+                .mappings()
+                .into_iter()
+                .find(|(range, _)| range.contains(&ptr.as_usize()))
+                .unwrap()
+                .1
+        };
+        assert!(mapping_flags().contains(VmFlags::VM_RESERVED));
 
-        // SAFETY: `range` is the reserved allocation returned immediately above.
+        // SAFETY: The page is exclusively owned; commitment may retain no-access permissions.
+        unsafe { manager.commit_pages(ptr, PAGE_SIZE, MemoryRegionPermissions::empty()) }.unwrap();
+        assert!(!mapping_flags().contains(VmFlags::VM_RESERVED));
+        // SAFETY: The committed page has no concurrent users.
         unsafe {
-            <LinuxUserland as PageManagementProvider<PAGE_SIZE>>::commit_pages(
-                platform,
-                range.clone(),
+            manager.commit_pages(
+                ptr,
+                PAGE_SIZE,
                 MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
             )
         }
@@ -2538,26 +2595,221 @@ mod tests {
         ptr.write_at_offset(0, 0xa5).unwrap();
 
         // SAFETY: The test no longer accesses the committed page before recommitting it.
-        unsafe {
-            <LinuxUserland as PageManagementProvider<PAGE_SIZE>>::decommit_pages(
-                platform,
-                range.clone(),
-            )
-        }
-        .unwrap();
-        // SAFETY: `range` remains owned by the provider after decommit.
-        unsafe {
-            <LinuxUserland as PageManagementProvider<PAGE_SIZE>>::commit_pages(
-                platform,
-                range.clone(),
-                MemoryRegionPermissions::READ,
-            )
-        }
-        .unwrap();
-        // SAFETY: The page was recommitted with read permission above.
-        assert_eq!(unsafe { (range.start as *const u8).read() }, 0);
+        unsafe { manager.decommit_pages(ptr, PAGE_SIZE) }.unwrap();
+        assert!(mapping_flags().contains(VmFlags::VM_RESERVED));
+        // SAFETY: The page remains owned by the manager after decommit.
+        unsafe { manager.commit_pages(ptr, PAGE_SIZE, MemoryRegionPermissions::READ) }.unwrap();
+        assert_eq!(ptr.read_at_offset(0).unwrap(), 0);
+        // SAFETY: The mapping is no longer accessed after removal.
+        unsafe { manager.remove_pages(ptr, PAGE_SIZE) }.unwrap();
+        assert_eq!(manager.mappings(), initial_mappings);
+    }
 
-        // SAFETY: `range` is no longer accessed after this deallocation.
+    #[test]
+    fn test_reservation_rejects_foreign_memory() {
+        use litebox::mm::{
+            PageManager,
+            linux::{CreatePagesFlags, NonZeroAddress, NonZeroPageSize},
+        };
+        use litebox::platform::page_mgmt::AllocationError;
+
+        const PAGE_SIZE: usize = 4096;
+        let platform = LinuxUserland::new(None);
+        let foreign = <LinuxUserland as PageManagementProvider<PAGE_SIZE>>::allocate_pages(
+            platform,
+            0..PAGE_SIZE,
+            PageState::Committed(MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE),
+            false,
+            false,
+            FixedAddressBehavior::Hint,
+        )
+        .unwrap();
+        let range = foreign.as_usize()..foreign.as_usize() + PAGE_SIZE;
+        let _cleanup = litebox::utils::defer(|| {
+            // SAFETY: The test exclusively owns the foreign mapping and no longer uses it.
+            unsafe {
+                <LinuxUserland as PageManagementProvider<PAGE_SIZE>>::deallocate_pages(
+                    platform,
+                    range.clone(),
+                )
+            }
+            .unwrap();
+        });
+        foreign.write_at_offset(0, 0xa5).unwrap();
+        let manager = PageManager::<_, PAGE_SIZE>::new(&litebox::LiteBox::new(platform));
+        let initial_mappings = manager.mappings();
+        // SAFETY: The range has no guest mapping. The manager must acquire it without
+        // replacing foreign mappings even though the guest requests a fixed address.
+        assert!(
+            unsafe {
+                manager.create_writable_pages(
+                    Some(NonZeroAddress::new(range.start).unwrap()),
+                    NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+                    CreatePagesFlags::FIXED_ADDR,
+                    |_| Ok(0),
+                )
+            }
+            .is_err()
+        );
+        assert_eq!(manager.mappings(), initial_mappings);
+        assert!(matches!(
+            <LinuxUserland as PageManagementProvider<PAGE_SIZE>>::allocate_pages(
+                platform,
+                range.clone(),
+                PageState::Reserved,
+                false,
+                false,
+                FixedAddressBehavior::NoReplace,
+            ),
+            Err(AllocationError::AddressInUse)
+        ));
+        let relocated = <LinuxUserland as PageManagementProvider<PAGE_SIZE>>::allocate_pages(
+            platform,
+            range.clone(),
+            PageState::Reserved,
+            false,
+            false,
+            FixedAddressBehavior::Hint,
+        )
+        .unwrap();
+        assert_ne!(relocated.as_usize(), range.start);
+        assert_eq!(foreign.read_at_offset(0).unwrap(), 0xa5);
+        // SAFETY: The relocated reservation was just acquired and has no active users.
+        unsafe {
+            <LinuxUserland as PageManagementProvider<PAGE_SIZE>>::deallocate_pages(
+                platform,
+                relocated.as_usize()..relocated.as_usize() + PAGE_SIZE,
+            )
+        }
+        .unwrap();
+    }
+
+    #[test]
+    fn test_direct_mapping_releases_file_backed_subrange() {
+        use litebox::mm::{
+            PageManager,
+            linux::{CreatePagesFlags, NonZeroAddress, NonZeroPageSize, PageRange},
+        };
+
+        const PAGE_SIZE: usize = 4096;
+        let platform = LinuxUserland::new(None);
+        let manager = PageManager::<_, PAGE_SIZE>::new(&litebox::LiteBox::new(platform));
+        let length = NonZeroPageSize::new(PAGE_SIZE).unwrap();
+        // SAFETY: No fixed address is requested and the mapping has no concurrent users.
+        let allocation = unsafe {
+            manager.create_writable_pages(
+                None,
+                NonZeroPageSize::new(PAGE_SIZE * 3).unwrap(),
+                CreatePagesFlags::empty(),
+                |_| Ok(0),
+            )
+        }
+        .unwrap();
+        allocation.write_at_offset(0, 0x12).unwrap();
+        allocation
+            .write_at_offset(isize::try_from(PAGE_SIZE * 2).unwrap(), 0x34)
+            .unwrap();
+        let pointer = super::UserMutPtr::<u8>::from_usize(allocation.as_usize() + PAGE_SIZE);
+        let range = pointer.as_usize()..pointer.as_usize() + PAGE_SIZE;
+        let _cleanup = litebox::utils::defer(|| {
+            // SAFETY: Only the test's allocation is removed; startup mappings are untouched.
+            unsafe { manager.remove_pages(allocation, PAGE_SIZE * 3) }.unwrap();
+        });
+        // SAFETY: The name is a valid C string; the returned descriptor is checked and owned below.
+        let descriptor =
+            unsafe { libc::memfd_create(c"reservation-backing".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(descriptor >= 0);
+        // SAFETY: The descriptor was just created and has no other owner.
+        let backing = unsafe { OwnedFd::from_raw_fd(descriptor) };
+        let contents = [0xa5_u8; PAGE_SIZE];
+        // SAFETY: The descriptor is live and contents is readable for its full length.
+        assert_eq!(
+            unsafe {
+                libc::pwrite(
+                    backing.as_raw_fd(),
+                    contents.as_ptr().cast(),
+                    contents.len(),
+                    0,
+                )
+            },
+            isize::try_from(PAGE_SIZE).unwrap()
+        );
+        // SAFETY: The test exclusively owns this page and permits replacing it with file backing.
+        let mapped = unsafe {
+            libc::mmap(
+                range.start as *mut _,
+                PAGE_SIZE,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE | libc::MAP_FIXED,
+                backing.as_raw_fd(),
+                0,
+            )
+        };
+        assert_eq!(mapped as usize, range.start);
+        // SAFETY: The freshly mapped page is exclusively owned, readable, and file-backed.
+        unsafe {
+            manager.register_existing_mapping(
+                PageRange::new(range.start, range.end).unwrap(),
+                MemoryRegionPermissions::READ,
+                true,
+                true,
+                false,
+            )
+        }
+        .unwrap();
+        assert_eq!(pointer.read_at_offset(0).unwrap(), 0xa5);
+        // SAFETY: The file-backed guest mapping has no concurrent users.
+        unsafe { manager.remove_pages(pointer, PAGE_SIZE) }.unwrap();
+        assert_eq!(allocation.read_at_offset(0).unwrap(), 0x12);
+        assert_eq!(
+            allocation
+                .read_at_offset(isize::try_from(PAGE_SIZE * 2).unwrap())
+                .unwrap(),
+            0x34
+        );
+        let released = <LinuxUserland as PageManagementProvider<PAGE_SIZE>>::allocate_pages(
+            platform,
+            range.clone(),
+            PageState::Reserved,
+            false,
+            false,
+            FixedAddressBehavior::NoReplace,
+        )
+        .unwrap();
+        assert_eq!(released.as_usize(), range.start);
+        // SAFETY: This independently acquired reservation is exclusively owned and unused.
+        unsafe {
+            <LinuxUserland as PageManagementProvider<PAGE_SIZE>>::deallocate_pages(
+                platform,
+                range.clone(),
+            )
+        }
+        .unwrap();
+        // SAFETY: This address has no guest mapping; NoReplace prevents overwriting host mappings.
+        let reused = unsafe {
+            manager.create_writable_pages(
+                Some(NonZeroAddress::new(range.start).unwrap()),
+                length,
+                CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::NOREPLACE,
+                |_| Ok(0),
+            )
+        }
+        .unwrap();
+        assert_eq!(reused.as_usize(), range.start);
+        assert_eq!(reused.read_at_offset(0).unwrap(), 0);
+        // SAFETY: The test's allocation has no concurrent users; startup mappings are untouched.
+        unsafe { manager.remove_pages(allocation, PAGE_SIZE * 3) }.unwrap();
+        let released = <LinuxUserland as PageManagementProvider<PAGE_SIZE>>::allocate_pages(
+            platform,
+            range.clone(),
+            PageState::Reserved,
+            false,
+            false,
+            FixedAddressBehavior::NoReplace,
+        )
+        .unwrap();
+        assert_eq!(released.as_usize(), range.start);
+        // SAFETY: The complete reacquired reservation is exclusively owned and unused.
         unsafe {
             <LinuxUserland as PageManagementProvider<PAGE_SIZE>>::deallocate_pages(platform, range)
         }
