@@ -1759,6 +1759,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_platform_windows_userland"
+version = "0.1.0"
+dependencies = [
+ "litebox",
+ "litebox_common_linux",
+ "litebox_platform",
+ "windows-sys 0.60.2",
+ "zerocopy",
+]
+
+[[package]]
 name = "litebox_runner_linux_on_macos_userland"
 version = "0.1.0"
 dependencies = [
@@ -1772,17 +1783,6 @@ dependencies = [
  "litebox_util_log",
  "tempfile",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "litebox_platform_windows_userland"
-version = "0.1.0"
-dependencies = [
- "litebox",
- "litebox_common_linux",
- "litebox_platform",
- "windows-sys 0.60.2",
- "zerocopy",
 ]
 
 [[package]]
