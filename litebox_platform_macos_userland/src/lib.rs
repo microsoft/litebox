@@ -1314,6 +1314,11 @@ impl WaitWakerProvider for MacosUserland {
 ///
 /// Must only be called from a signal handler on an initialized LiteBox thread.
 unsafe fn record_pending_host_signal(signal: litebox_common_linux::signal::Signal) {
+    // Signal delivery must not change the interrupted host operation's errno.
+    // SAFETY: __error returns this thread's live errno slot.
+    let errno = unsafe { libc::__error() };
+    // SAFETY: errno points to a live c_int for this thread.
+    let saved_errno = unsafe { errno.read() };
     let mask = 1u32 << (signal.as_i32() - 1);
     let waker_addr: usize;
     // SAFETY: both fields are naturally aligned in this thread's validated TSD
@@ -1350,6 +1355,7 @@ unsafe fn record_pending_host_signal(signal: litebox_common_linux::signal::Signa
             // until this handler returns.
             (&*(waker_addr as *const core::task::Waker)).wake_by_ref();
         }
+        errno.write(saved_errno);
     }
 }
 pub(crate) fn get_guest_vector_state() -> GuestVectorState {
@@ -2235,8 +2241,8 @@ unsafe extern "C" fn exception_signal_handler(
             // to the previous host disposition instead of exiting directly.
             fatal_signal(b"fault in macOS syscall transition", pc);
         }
-        // ThreadState::interrupt already recorded the request. Let the direct
-        // callback finish saving a coherent guest context before dispatching it.
+        // The interruption request is already recorded. Let the direct callback
+        // finish saving a coherent guest context before dispatching it.
         return;
     }
     if !ptr.is_null() && (in_outbound_transition || in_sigreturn_transition) {
@@ -2567,6 +2573,139 @@ mod tests {
             );
             platform.take_pending_signals(|_| panic!("signals were not drained"));
         });
+    }
+
+    #[test]
+    fn recording_host_signal_preserves_errno_across_wake() {
+        struct ErrnoWaker;
+        impl std::task::Wake for ErrnoWaker {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                // SAFETY: __error returns this thread's live errno slot.
+                unsafe { *libc::__error() = libc::ENOENT };
+            }
+        }
+
+        let platform = MacosUserland::new();
+        MacosUserland::run_test_thread(|| {
+            platform.update_waker(Some(core::task::Waker::from(Arc::new(ErrnoWaker))));
+            // SAFETY: __error returns this thread's live errno slot.
+            unsafe { *libc::__error() = libc::ETIMEDOUT };
+            // SAFETY: run_test_thread initializes this thread's platform TLS.
+            unsafe { record_pending_host_signal(litebox_common_linux::signal::Signal::SIGINT) };
+            // SAFETY: __error returns this thread's live errno slot.
+            assert_eq!(unsafe { *libc::__error() }, libc::ETIMEDOUT);
+            platform.update_waker(None);
+            platform.take_pending_signals(|_| {});
+        });
+    }
+
+    #[test]
+    fn host_signal_interrupts_wait_until() {
+        struct WaitProbe {
+            platform: &'static MacosUserland,
+            interrupted: Arc<AtomicBool>,
+        }
+        struct PendingSignal(&'static MacosUserland);
+
+        impl litebox::event::wait::CheckForInterrupt for PendingSignal {
+            fn check_for_interrupt(&self) -> bool {
+                let mut pending = false;
+                self.0.take_pending_signals(|_| pending = true);
+                pending
+            }
+        }
+
+        impl EnterShim for WaitProbe {
+            type ExecutionContext = PtRegs;
+
+            fn init(&self, _: &mut PtRegs) -> ContinueOperation {
+                let wait = litebox::event::wait::WaitState::new(self.platform);
+                let check = PendingSignal(self.platform);
+                let target = unsafe { libc::pthread_self() } as usize;
+                let (send, receive) = std::sync::mpsc::sync_channel(0);
+                let sender = std::thread::spawn(move || {
+                    receive.recv().unwrap();
+                    assert_eq!(
+                        unsafe { libc::pthread_kill(target as libc::pthread_t, libc::SIGINT) },
+                        0
+                    );
+                });
+                let mut notify = Some(send);
+                let result = wait
+                    .context()
+                    .with_check_for_interrupt(&check)
+                    .with_timeout(Duration::from_secs(5))
+                    .wait_until(|| {
+                        if let Some(send) = notify.take() {
+                            send.send(()).unwrap();
+                        }
+                        false
+                    });
+                sender.join().unwrap();
+                self.interrupted.store(
+                    matches!(result, Err(litebox::event::wait::WaitError::Interrupted)),
+                    Ordering::Relaxed,
+                );
+                ContinueOperation::Terminate
+            }
+
+            fn syscall(&self, _: &mut PtRegs) -> ContinueOperation {
+                unreachable!()
+            }
+
+            fn exception(&self, _: &mut PtRegs, _: &ExceptionInfo) -> ContinueOperation {
+                unreachable!()
+            }
+
+            fn interrupt(&self, _: &mut PtRegs) -> ContinueOperation {
+                unreachable!()
+            }
+        }
+
+        let platform = MacosUserland::new();
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let mut ctx = PtRegs::default();
+        // SAFETY: init terminates before attempting guest entry.
+        unsafe {
+            run_thread(
+                WaitProbe {
+                    platform,
+                    interrupted: interrupted.clone(),
+                },
+                &mut ctx,
+            );
+        }
+        assert!(interrupted.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn non_guest_thread_uses_host_signal_disposition() {
+        const CHILD_ENV: &str = "LITEBOX_MACOS_NON_GUEST_SIGNAL_TEST";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            use std::os::unix::process::ExitStatusExt as _;
+
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::non_guest_thread_uses_host_signal_disposition",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            assert_eq!(output.status.signal(), Some(libc::SIGINT), "{output:?}");
+            return;
+        }
+
+        MacosUserland::new();
+        // Bound a failure to restore the default SIGINT disposition.
+        unsafe { libc::alarm(5) };
+        assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
+        panic!("SIGINT returned on a non-guest thread");
     }
 
     #[test]
