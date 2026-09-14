@@ -5,6 +5,10 @@ use alloc::string::String;
 use core::mem::offset_of;
 use litebox::platform::{RawConstPointer as _, RawPointerProvider};
 use litebox_common_windows::nt_status::NtStatus;
+pub(crate) use litebox_common_windows::nt_types::{
+    ActivationContextStack, ClientId, GroupAffinity, Guid, ListEntry, ThreadEnvironmentBlock,
+    UnicodeString,
+};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::{ConstPtr, syscalls::Handle};
@@ -272,44 +276,26 @@ pub(crate) fn read_object_attributes<Platform: RawPointerProvider>(
     Ok(object_attributes)
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable)]
-pub(crate) struct UnicodeString {
-    pub(crate) length: u16,
-    pub(crate) maximum_length: u16,
-    pub(crate) padding_0: [u8; 4],
-    pub(crate) buffer: usize,
-}
-
-impl UnicodeString {
-    pub(crate) fn character_count(self) -> Result<usize, NtStatus> {
-        if !self.length.is_multiple_of(2) {
-            return Err(NtStatus::INVALID_PARAMETER);
-        }
-        if self.maximum_length < self.length {
-            return Err(NtStatus::INVALID_PARAMETER);
-        }
-        Ok(usize::from(self.length / 2))
+/// Reads a shared string descriptor through the shim's guest-memory provider.
+pub(crate) fn read_unicode_string<Platform: RawPointerProvider>(
+    value: UnicodeString,
+) -> Result<String, NtStatus> {
+    let character_count = value.character_count()?;
+    if character_count == 0 {
+        return Ok(String::new());
+    }
+    if value.buffer == 0 {
+        return Err(NtStatus::ACCESS_VIOLATION);
     }
 
-    pub(crate) fn read_string<Platform: RawPointerProvider>(self) -> Result<String, NtStatus> {
-        let character_count = self.character_count()?;
-        if character_count == 0 {
-            return Ok(String::new());
-        }
-        if self.buffer == 0 {
-            return Err(NtStatus::ACCESS_VIOLATION);
-        }
-
-        let buffer =
-            <Platform as litebox::platform::RawPointerProvider>::RawConstPointer::<u16>::from_usize(
-                self.buffer,
-            );
-        let Some(units) = buffer.to_owned_slice(character_count) else {
-            return Err(NtStatus::ACCESS_VIOLATION);
-        };
-        Ok(String::from_utf16_lossy(&units))
-    }
+    let buffer =
+        <Platform as litebox::platform::RawPointerProvider>::RawConstPointer::<u16>::from_usize(
+            value.buffer,
+        );
+    let Some(units) = buffer.to_owned_slice(character_count) else {
+        return Err(NtStatus::ACCESS_VIOLATION);
+    };
+    Ok(String::from_utf16_lossy(&units))
 }
 
 pub(crate) fn read_unicode_string_at<Platform: RawPointerProvider>(
@@ -317,8 +303,8 @@ pub(crate) fn read_unicode_string_at<Platform: RawPointerProvider>(
 ) -> Result<String, NtStatus> {
     ConstPtr::<Platform, UnicodeString>::from_usize(address)
         .read_at_offset(0)
-        .ok_or(NtStatus::ACCESS_VIOLATION)?
-        .read_string::<Platform>()
+        .ok_or(NtStatus::ACCESS_VIOLATION)
+        .and_then(read_unicode_string::<Platform>)
 }
 
 #[repr(C)]
@@ -463,187 +449,6 @@ pub(crate) struct ProcessEnvironmentBlock {
     pub(crate) leap_second_flags: u32,
     pub(crate) nt_global_flag_2: u32,
     pub(crate) extended_feature_disable_mask: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable)]
-pub(crate) struct NtTib {
-    pub(crate) exception_list: usize,
-    pub(crate) stack_base: usize,
-    pub(crate) stack_limit: usize,
-    pub(crate) sub_system_tib: usize,
-    pub(crate) fiber_data_or_version: usize,
-    pub(crate) arbitrary_user_pointer: usize,
-    pub(crate) self_pointer: usize,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable)]
-pub(crate) struct ActivationContextStack {
-    pub(crate) active_frame: usize,
-    pub(crate) frame_list_cache: ListEntry,
-    pub(crate) flags: u32,
-    pub(crate) next_cookie_sequence_number: u32,
-    pub(crate) stack_id: u32,
-    pub(crate) _padding: u32,
-}
-
-const _: () = assert!(core::mem::size_of::<ActivationContextStack>() == 0x28);
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable)]
-pub(crate) struct GdiTebBatch {
-    _reserved: [u8; 0x4e8],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq, FromBytes, IntoBytes, Immutable)]
-pub(crate) struct ClientId {
-    pub(crate) unique_process: usize,
-    pub(crate) unique_thread: usize,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq, FromBytes, IntoBytes, Immutable)]
-pub(crate) struct ListEntry {
-    pub(crate) flink: usize,
-    pub(crate) blink: usize,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, FromBytes, IntoBytes, Immutable)]
-pub(crate) struct Guid {
-    pub(crate) data: [u8; 16],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable)]
-pub(crate) struct GroupAffinity {
-    pub(crate) mask: usize,
-    pub(crate) group: u16,
-    pub(crate) reserved: [u16; 3],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable)]
-pub(crate) struct ThreadEnvironmentBlock {
-    pub(crate) nt_tib: NtTib,
-    pub(crate) environment_pointer: usize,
-    pub(crate) client_id: ClientId,
-    pub(crate) active_rpc_handle: usize,
-    pub(crate) thread_local_storage_pointer: usize,
-    /// Pointer to [`ProcessEnvironmentBlock`].
-    pub(crate) process_environment_block: usize,
-    pub(crate) last_error_value: u32,
-    pub(crate) count_of_owned_critical_sections: u32,
-    pub(crate) csr_client_thread: usize,
-    pub(crate) win_32_thread_info: usize,
-    pub(crate) user_32_reserved: [u32; 26],
-    pub(crate) user_reserved: [u32; 5],
-    pub(crate) padding_user_reserved: [u8; 4],
-    pub(crate) wow_32_reserved: usize,
-    pub(crate) current_locale: u32,
-    pub(crate) fp_software_status_register: u32,
-    pub(crate) reserved_for_debugger_instrumentation: [usize; 16],
-    pub(crate) system_reserved_1: [usize; 25],
-    pub(crate) heap_fls_data: usize,
-    pub(crate) rng_state: [u64; 4],
-    pub(crate) placeholder_compatibility_mode: i8,
-    pub(crate) placeholder_hydration_always_explicit: u8,
-    pub(crate) placeholder_reserved: [i8; 10],
-    pub(crate) proxied_process_id: u32,
-    pub(crate) activation_stack: ActivationContextStack,
-    pub(crate) working_on_behalf_ticket: [u8; 8],
-    pub(crate) exception_code: i32,
-    pub(crate) padding_0: [u8; 4],
-    pub(crate) activation_context_stack_pointer: usize,
-    pub(crate) instrumentation_callback_sp: u64,
-    pub(crate) instrumentation_callback_previous_pc: u64,
-    pub(crate) instrumentation_callback_previous_sp: u64,
-    pub(crate) tx_fs_context: u32,
-    pub(crate) instrumentation_callback_disabled: u8,
-    pub(crate) unaligned_load_store_exceptions: u8,
-    pub(crate) padding_1: [u8; 2],
-    pub(crate) gdi_teb_batch: GdiTebBatch,
-    pub(crate) real_client_id: ClientId,
-    pub(crate) gdi_cached_process_handle: usize,
-    pub(crate) gdi_client_pid: u32,
-    pub(crate) gdi_client_tid: u32,
-    pub(crate) gdi_thread_local_info: usize,
-    pub(crate) win_32_client_info: [u64; 62],
-    pub(crate) gl_dispatch_table: [usize; 233],
-    pub(crate) gl_reserved_1: [u64; 29],
-    pub(crate) gl_reserved_2: usize,
-    pub(crate) gl_section_info: usize,
-    pub(crate) gl_section: usize,
-    pub(crate) gl_table: usize,
-    pub(crate) gl_current_rc: usize,
-    pub(crate) gl_context: usize,
-    pub(crate) last_status_value: u32,
-    pub(crate) padding_2: [u8; 4],
-    pub(crate) static_unicode_string: UnicodeString,
-    pub(crate) static_unicode_buffer: [u16; 261],
-    pub(crate) padding_3: [u8; 6],
-    pub(crate) deallocation_stack: usize,
-    pub(crate) tls_slots: [usize; 64],
-    pub(crate) tls_links: ListEntry,
-    pub(crate) vdm: usize,
-    pub(crate) reserved_for_nt_rpc: usize,
-    pub(crate) dbg_ss_reserved: [usize; 2],
-    pub(crate) hard_error_mode: u32,
-    pub(crate) padding_4: [u8; 4],
-    pub(crate) instrumentation: [usize; 11],
-    pub(crate) activity_id: Guid,
-    pub(crate) sub_process_tag: usize,
-    pub(crate) perflib_data: usize,
-    pub(crate) etw_trace_data: usize,
-    pub(crate) win_sock_data: usize,
-    pub(crate) gdi_batch_count: u32,
-    pub(crate) ideal_processor_value: u32,
-    pub(crate) guaranteed_stack_bytes: u32,
-    pub(crate) padding_5: [u8; 4],
-    pub(crate) reserved_for_perf: usize,
-    pub(crate) reserved_for_ole: usize,
-    pub(crate) waiting_on_loader_lock: u32,
-    pub(crate) padding_6: [u8; 4],
-    pub(crate) saved_priority_state: usize,
-    pub(crate) reserved_for_code_coverage: u64,
-    pub(crate) thread_pool_data: usize,
-    pub(crate) tls_expansion_slots: usize,
-    pub(crate) chpe_v_2_cpu_area_info: usize,
-    pub(crate) unused: usize,
-    pub(crate) mui_generation: u32,
-    pub(crate) is_impersonating: u32,
-    pub(crate) nls_cache: usize,
-    pub(crate) p_shim_data: usize,
-    pub(crate) heap_data: u32,
-    pub(crate) padding_7: [u8; 4],
-    pub(crate) current_transaction_handle: usize,
-    pub(crate) active_frame: usize,
-    pub(crate) fls_data: usize,
-    pub(crate) preferred_languages: usize,
-    pub(crate) user_pref_languages: usize,
-    pub(crate) merged_pref_languages: usize,
-    pub(crate) mui_impersonation: u32,
-    pub(crate) cross_teb_flags: u16,
-    pub(crate) same_teb_flags: u16,
-    pub(crate) txn_scope_enter_callback: usize,
-    pub(crate) txn_scope_exit_callback: usize,
-    pub(crate) txn_scope_context: usize,
-    pub(crate) lock_count: u32,
-    pub(crate) wow_teb_offset: i32,
-    pub(crate) resource_ret_value: usize,
-    pub(crate) reserved_for_wdf: usize,
-    pub(crate) reserved_for_crt: u64,
-    pub(crate) effective_container_id: Guid,
-    pub(crate) last_sleep_counter: u64,
-    pub(crate) spin_call_count: u32,
-    pub(crate) padding_8: [u8; 4],
-    pub(crate) extended_feature_disable_mask: u64,
-    pub(crate) scheduler_shared_data_slot: usize,
-    pub(crate) heap_walk_context: usize,
-    pub(crate) primary_group_affinity: GroupAffinity,
-    pub(crate) rcu: [u32; 2],
 }
 
 bitflags::bitflags! {
@@ -826,7 +631,6 @@ pub(crate) struct RtlUserProcessParameters {
     pub(crate) attribute_list: usize,
 }
 
-const _: [(); 0x1878] = [(); core::mem::size_of::<ThreadEnvironmentBlock>()];
 const _: [(); 0x7d0] = [(); core::mem::size_of::<ProcessEnvironmentBlock>()];
 const _: [(); 0x4d0] = [(); core::mem::size_of::<X64Context>()];
 const _: [(); 0x450] = [(); core::mem::size_of::<RtlUserProcessParameters>()];

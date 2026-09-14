@@ -306,7 +306,7 @@ where
 
 fn set_guest_teb<Platform: ArchSpecificProvider>(platform: &Platform, teb_address: usize) -> bool {
     if let Err(error) =
-        platform.set_arch_specific_register(&ArchSpecificRegister::FsBase, teb_address)
+        platform.set_arch_specific_register(&ArchSpecificRegister::GsBase, teb_address)
     {
         litebox_util_log::warn!(error:? = error, teb:% = format_args!("{teb_address:#x}"); "Failed to set Windows TEB base");
         return false;

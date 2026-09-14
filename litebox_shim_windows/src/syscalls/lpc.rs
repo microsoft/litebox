@@ -791,7 +791,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let port_name = match port_name
             .read_at_offset(0)
             .ok_or(NtStatus::ACCESS_VIOLATION)
-            .and_then(UnicodeString::read_string::<Platform>)
+            .and_then(crate::nt_types::read_unicode_string::<Platform>)
         {
             Ok(name) => name,
             Err(status) => return status,
@@ -809,7 +809,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .port_name
             .read_at_offset(0)
             .ok_or(NtStatus::ACCESS_VIOLATION)
-            .and_then(UnicodeString::read_string::<Platform>)
+            .and_then(crate::nt_types::read_unicode_string::<Platform>)
         {
             Ok(name) => name,
             Err(status) => return status,

@@ -9,6 +9,7 @@ extern crate alloc;
 
 pub mod loader;
 pub mod nt_status;
+pub mod nt_types;
 
 macro_rules! nt_sysnos {
     ($(($number:literal, $name:ident)),+ $(,)?) => {

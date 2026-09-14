@@ -35,7 +35,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let Some(result_data_size_value) = result_data_size.read_at_offset(0) else {
             return NtStatus::ACCESS_VIOLATION;
         };
-        let value_name = match value_name.read_string::<Platform>() {
+        let value_name = match crate::nt_types::read_unicode_string::<Platform>(value_name) {
             Ok(value_name) => value_name,
             Err(status) => return status,
         };

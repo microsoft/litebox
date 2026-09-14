@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 //! A [LiteBox platform](../litebox/platform/index.html) for running LiteBox on userland Windows.
+//!
 
 // Restrict this crate to only work on Windows. For now, we are restricting this to only x86-64
 // Windows, but we _may_ allow for more in the future, if we find it useful to do so.
@@ -9,7 +10,7 @@
 
 use core::cell::{Cell, UnsafeCell};
 use core::panic;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use core::time::Duration;
 use std::cell::RefCell;
 use std::os::raw::c_void;
@@ -21,6 +22,7 @@ use litebox::platform::page_mgmt::{
 };
 use litebox::shim::{ContinueOperation, Exception};
 use litebox::utils::TruncateExt as _;
+use litebox_common_windows::nt_types::ThreadEnvironmentBlock;
 use litebox_platform::sync::{
     ImmediatelyWokenUp, RawMutex as RawMutexTrait, RawMutexProvider, UnblockedOrTimedOut,
     WaitWakerProvider,
@@ -47,10 +49,77 @@ use zerocopy::{FromBytes, IntoBytes};
 
 extern crate alloc;
 
-// Thread-local storage for FS base state
-thread_local! {
-    static THREAD_FS_BASE: Cell<usize> = const { Cell::new(0) };
+/// Like DynamoRIO's x64 fallback, use the last pointer-sized slot in the TEB's
+/// second page, beyond the shared `ThreadEnvironmentBlock`. The size of
+/// `ThreadEnvironmentBlock` is 0x1878 but its allocation is rounded up to 0x2000.
+const TEB_RUNTIME_TLS_OFFSET: usize = 0x2000 - size_of::<*const c_void>();
+const GUEST_TEB_SIZE: usize = size_of::<ThreadEnvironmentBlock>();
+/// Set to true and rebuild to enable whole TEB swapping for debugging purposes.
+/// Selective TEB swapping is faster but may miss certain internal state changes
+/// that whole TEB swapping would catch.
+const USE_WHOLE_TEB_SWAP: bool = false;
+/// State exchanged for non-graphical guests. GDI batching and Win32/OpenGL
+/// client arrays remain native; supporting guest graphics requires revisiting
+/// this selection. Keep the remaining state until narrower ownership is proven.
+static TEB_SWAP_RANGES: [[usize; 2]; 4] = [
+    [
+        0,
+        core::mem::offset_of!(ThreadEnvironmentBlock, gdi_teb_batch),
+    ],
+    [
+        core::mem::offset_of!(ThreadEnvironmentBlock, real_client_id),
+        core::mem::offset_of!(ThreadEnvironmentBlock, win_32_client_info),
+    ],
+    [
+        core::mem::offset_of!(ThreadEnvironmentBlock, last_status_value),
+        GUEST_TEB_SIZE,
+    ],
+    [0, 0],
+];
+const _: () = {
+    let mut index = 0;
+    while index < TEB_SWAP_RANGES.len() - 1 {
+        let [start, end] = TEB_SWAP_RANGES[index];
+        assert!(start < end && end <= GUEST_TEB_SIZE);
+        assert!(end - start >= 16);
+        assert!(start.is_multiple_of(8) && end.is_multiple_of(8));
+        if index > 0 {
+            assert!(TEB_SWAP_RANGES[index - 1][1] <= start);
+        }
+        index += 1;
+    }
+};
+/// Some pointers are relocated between the guest shadow and native TEB when
+/// they point inside the source TEB.
+static TEB_INTERNAL_POINTER_OFFSETS: [usize; 7] = [
+    core::mem::offset_of!(ThreadEnvironmentBlock, nt_tib.self_pointer),
+    core::mem::offset_of!(ThreadEnvironmentBlock, thread_local_storage_pointer),
+    core::mem::offset_of!(ThreadEnvironmentBlock, activation_stack.active_frame),
+    core::mem::offset_of!(
+        ThreadEnvironmentBlock,
+        activation_stack.frame_list_cache.flink
+    ),
+    core::mem::offset_of!(
+        ThreadEnvironmentBlock,
+        activation_stack.frame_list_cache.blink
+    ),
+    core::mem::offset_of!(ThreadEnvironmentBlock, activation_context_stack_pointer),
+    core::mem::offset_of!(ThreadEnvironmentBlock, static_unicode_string.buffer),
+];
+const PF_RDWRFSGSBASE_AVAILABLE: u32 = 22;
+
+/// Determines how the guest accesses its thread-local storage.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestTlsMode {
+    /// A Linux guest uses FS as its TLS base.
+    Linux = 1,
+    /// A Windows guest uses native GS with exchanged host/guest TEB state.
+    Windows = 2,
 }
+
+const GUEST_TLS_MODE_UNCONFIGURED: u8 = 0;
+static GUEST_TLS_MODE: AtomicU8 = AtomicU8::new(GUEST_TLS_MODE_UNCONFIGURED);
 
 /// The userland Windows platform.
 ///
@@ -74,30 +143,73 @@ impl core::fmt::Debug for WindowsUserland {
 unsafe impl Send for WindowsUserland {}
 unsafe impl Sync for WindowsUserland {}
 
-/// Helper functions for managing per-thread FS base
 impl WindowsUserland {
-    /// Get the current thread's FS base state
-    fn get_thread_fs_base() -> usize {
-        THREAD_FS_BASE.get()
-    }
-
-    /// Set the current thread's FS base
-    fn set_thread_fs_base(new_base: usize) {
-        THREAD_FS_BASE.set(new_base);
-        Self::restore_thread_fs_base();
-    }
-
-    /// Restore the current thread's FS base from saved state
-    fn restore_thread_fs_base() {
-        unsafe {
-            litebox_common_linux::wrfsbase(THREAD_FS_BASE.get());
+    /// Configures the process-wide guest TLS mode.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a different mode has already been configured.
+    pub fn set_guest_tls_mode(guest_tls_mode: GuestTlsMode) {
+        let guest_tls_mode = guest_tls_mode as u8;
+        if let Err(configured_mode) = GUEST_TLS_MODE.compare_exchange(
+            GUEST_TLS_MODE_UNCONFIGURED,
+            guest_tls_mode,
+            Ordering::Release,
+            Ordering::Acquire,
+        ) {
+            assert_eq!(
+                configured_mode, guest_tls_mode,
+                "guest TLS mode is already configured",
+            );
         }
     }
 
-    /// Initialize FS base state for a new thread
-    fn init_thread_fs_base() {
-        Self::set_thread_fs_base(0);
+    fn set_guest_teb(teb: usize) {
+        // SAFETY: Called on a managed thread while host TEB state is installed.
+        let tls = unsafe { &*get_tls_ptr().expect("TLS not initialized") };
+        tls.guest_teb.set(teb);
     }
+
+    fn set_thread_fs_base(fs_base: usize) {
+        let tls = unsafe { &*get_tls_ptr().expect("TLS not initialized") };
+        tls.guest_fs_base.set(fs_base);
+        Self::restore_thread_fs_base(tls);
+    }
+
+    fn restore_thread_fs_base(tls: &TlsState) {
+        unsafe { litebox_common_linux::wrfsbase(tls.guest_fs_base.get()) };
+    }
+}
+
+fn guest_tls_mode() -> GuestTlsMode {
+    match GUEST_TLS_MODE.load(Ordering::Acquire) {
+        mode if mode == GuestTlsMode::Linux as u8 => GuestTlsMode::Linux,
+        mode if mode == GuestTlsMode::Windows as u8 => GuestTlsMode::Windows,
+        GUEST_TLS_MODE_UNCONFIGURED => panic!("guest TLS mode is not configured"),
+        _ => unreachable!("invalid guest TLS mode"),
+    }
+}
+
+fn current_teb() -> *mut u8 {
+    let teb: *mut u8;
+    unsafe {
+        core::arch::asm!(
+            "mov {}, gs:[0x30]",
+            out(reg) teb,
+            options(nostack, preserves_flags, readonly),
+        );
+    }
+    teb
+}
+
+fn teb_runtime_tls_slot(teb: usize) -> *mut *const TlsState {
+    let address = teb + TEB_RUNTIME_TLS_OFFSET;
+    debug_assert!(address.is_multiple_of(align_of::<*const TlsState>()));
+    core::ptr::with_exposed_provenance_mut(address)
+}
+
+fn runtime_tls_slot() -> *mut *const TlsState {
+    teb_runtime_tls_slot(current_teb().addr())
 }
 
 /// Runs the Rust handler with host FP controls
@@ -170,8 +282,9 @@ unsafe extern "system" fn vectored_exception_handler_inner(
     // missing a real interrupt that arrives while resuming the guest. Go through
     // the interrupt path to ensure that any pending interrupts are also handled.
     if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
+        && guest_tls_mode() == GuestTlsMode::Linux
         && unsafe { litebox_common_linux::rdfsbase() } == 0
-        && WindowsUserland::get_thread_fs_base() != 0
+        && tls.guest_fs_base.get() != 0
     {
         set_context_to_interrupt_callback(context);
     } else {
@@ -270,8 +383,15 @@ impl WindowsUserland {
     ///
     /// # Panics
     ///
-    /// Panics if the TLS slot cannot be created.
+    /// Panics if Windows has not enabled user-mode FSGSBASE instructions.
     pub fn new() -> &'static Self {
+        assert!(
+            // SAFETY: `IsProcessorFeaturePresent` accepts any feature identifier and has no
+            // pointer or lifetime requirements.
+            unsafe { Win32_Threading::IsProcessorFeaturePresent(PF_RDWRFSGSBASE_AVAILABLE) != 0 },
+            "Windows has not enabled user-mode FSGSBASE instructions",
+        );
+
         let mut sys_info = Win32_SysInfo::SYSTEM_INFO::default();
         Self::get_system_information(&mut sys_info);
 
@@ -298,9 +418,6 @@ impl WindowsUserland {
             reserved_pages,
             sys_info: std::sync::RwLock::new(sys_info),
         };
-
-        // Initialize it's own fs-base (for the main thread)
-        WindowsUserland::init_thread_fs_base();
 
         // Windows sets FS_BASE to 0 regularly upon scheduling; we register an exception handler
         // to set FS_BASE back to a "stored" value whenever we notice that it has become 0.
@@ -402,31 +519,6 @@ impl litebox::platform::SignalProvider for WindowsUserland {
     }
 }
 
-/// Ensures the module-wide TLS slot index ([`TLS_INDEX`]) has been allocated.
-///
-/// This must be called before any code that reads `TLS_INDEX`. Both
-/// [`run_thread`] (guest threads) and `WindowsUserland::run_test_thread`
-/// (test threads) go through here.
-fn ensure_tls_index() {
-    // Allocate a TLS slot for this module if not already done. This is used as
-    // a place to store data across calls to the guest, since all the registers
-    // are used by the guest and will be clobbered.
-    //
-    // We use this instead of native TLS because accesses are easier from
-    // assembly. In particular, finding the module's TLS base requires extra
-    // registers and/or clobbering flags, whereas we can get the value of a
-    // TLS slot with only one register and no changes to flags.
-    static REGISTER_KEY: std::sync::Once = const { std::sync::Once::new() };
-    REGISTER_KEY.call_once(|| {
-        let index = unsafe { windows_sys::Win32::System::Threading::TlsAlloc() };
-        assert!(
-            index < 64,
-            "no non-extended TLS slots available: {index:#x}"
-        );
-        TLS_INDEX.store(index, Ordering::Relaxed);
-    });
-}
-
 /// Runs a guest thread using the provided shim and the given initial context.
 ///
 /// This will run until the thread terminates.
@@ -437,7 +529,6 @@ pub unsafe fn run_thread(
     shim: impl litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
     ctx: &mut litebox_common_linux::PtRegs,
 ) {
-    ensure_tls_index();
     run_thread_inner(&shim, ctx);
 }
 
@@ -743,8 +834,6 @@ enum GuestXstateFormat {
     Windows,
 }
 
-static TLS_INDEX: AtomicU32 = AtomicU32::new(u32::MAX);
-
 struct TlsState {
     host_sp: Cell<*mut u128>,
     host_bp: Cell<*mut u128>,
@@ -759,6 +848,10 @@ struct TlsState {
     guest_xsave_area: UnsafeCell<XsaveArea>,
     guest_xsave_mask: u64,
     guest_xstate_format: Cell<GuestXstateFormat>,
+    guest_fs_base: Cell<usize>,
+    guest_teb: Cell<usize>,
+    host_teb: Cell<*mut u8>,
+    host_teb_shadow: Box<UnsafeCell<[usize; GUEST_TEB_SIZE / size_of::<usize>()]>>,
     /// Bitmask of pending host-originated signals for this thread.
     pending_host_signals: AtomicU32,
     /// Pointer to the `Waker` currently being waited on, or null if not
@@ -784,40 +877,209 @@ impl TlsState {
             guest_xsave_area: UnsafeCell::new(guest_xsave_area),
             guest_xsave_mask: XsaveLayout::get().mask,
             guest_xstate_format: Cell::new(GuestXstateFormat::Native),
+            guest_fs_base: Cell::new(0),
+            guest_teb: Cell::new(0),
+            host_teb: Cell::new(core::ptr::null_mut()),
+            host_teb_shadow: Box::new(UnsafeCell::new([0; GUEST_TEB_SIZE / size_of::<usize>()])),
             pending_host_signals: AtomicU32::new(0),
             waiting_waker: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
         }
     }
 }
 
-/// Stores `tls` in the current thread's Windows TLS slot.
+/// Saves selected host TEB fields and installs guest fields without changing GS.
+/// `USE_WHOLE_TEB_SWAP` overrides the selection for both install and restore.
+///
+/// # Safety
+///
+/// `tls` must belong to this thread and have a configured, nonzero guest TEB.
+/// Its TEB allocations must be live, disjoint, and writable for `GUEST_TEB_SIZE`
+/// bytes. Host TEB state must be installed.
+#[unsafe(naked)]
+unsafe extern "C" fn install_guest_teb(tls: &TlsState) {
+    core::arch::naked_asm!(
+        ".if {USE_WHOLE_TEB_SWAP}",
+        "jmp {install_guest_whole_teb}",
+        ".endif",
+        "mov r10, [rcx + {GUEST_TEB}]",
+        "mov r8, [rcx + {HOST_TEB}]",
+        "mov r9, [rcx + {HOST_TEB_SHADOW}]",
+        "mov rcx, r10",
+        "mov rdx, r8",
+        "jmp .Lcopy_teb",
+        ".globl restore_host_teb",
+    "restore_host_teb:",
+        ".if {USE_WHOLE_TEB_SWAP}",
+        "jmp {restore_host_whole_teb}",
+        ".endif",
+        "mov r9, [rcx + {GUEST_TEB}]",
+        "mov r8, [rcx + {HOST_TEB}]",
+        "mov r10, [rcx + {HOST_TEB_SHADOW}]",
+        "mov rcx, r8",
+        "mov rdx, r9",
+        ".Lcopy_teb:",
+        "movq xmm3, rcx",
+        "lea rax, [rip + {SWAP_RANGES}]",
+    ".Lcopy_teb_range:",
+        "mov r11, [rax]",
+        "mov rcx, [rax + 8]",
+        "cmp r11, rcx",
+        "je .Lcopy_teb_done",
+        "sub rcx, 16",
+        "cmp r11, rcx",
+        "ja .Lcopy_teb_tail",
+    ".Lcopy_teb_blocks:",
+        "movdqu xmm0, [r8 + r11]",
+        "movdqu xmm1, [r10 + r11]",
+        "movdqu [r9 + r11], xmm0",
+        "movdqu [r8 + r11], xmm1",
+        "add r11, 16",
+        "cmp r11, rcx",
+        "jbe .Lcopy_teb_blocks",
+    ".Lcopy_teb_tail:",
+        "add rcx, 16",
+        "cmp r11, rcx",
+        "je .Lcopy_teb_next",
+        "movq xmm0, [r8 + r11]",
+        "movq xmm1, [r10 + r11]",
+        "movq [r9 + r11], xmm0",
+        "movq [r8 + r11], xmm1",
+    ".Lcopy_teb_next:",
+        "add rax, 16",
+        "jmp .Lcopy_teb_range",
+        ".Lcopy_teb_done:",
+        "movq r9, xmm3",
+        "mov r10, rdx",
+        "lea r8, [rip + {POINTER_OFFSETS}]",
+        "xor r11d, r11d",
+        "8:",
+        "mov rdx, [r8 + r11 * 8]",
+        "mov rax, [r10 + rdx]",
+        "sub rax, r9",
+        "cmp rax, {TEB_SIZE}",
+        "jae 10f",
+        "add rax, r10",
+        "mov [r10 + rdx], rax",
+        "10:",
+        "inc r11",
+        "cmp r11, {POINTER_COUNT}",
+        "jb 8b",
+        "ret",
+        GUEST_TEB = const core::mem::offset_of!(TlsState, guest_teb),
+        HOST_TEB = const core::mem::offset_of!(TlsState, host_teb),
+        HOST_TEB_SHADOW = const core::mem::offset_of!(TlsState, host_teb_shadow),
+        TEB_SIZE = const GUEST_TEB_SIZE,
+        SWAP_RANGES = sym TEB_SWAP_RANGES,
+        POINTER_OFFSETS = sym TEB_INTERNAL_POINTER_OFFSETS,
+        POINTER_COUNT = const TEB_INTERNAL_POINTER_OFFSETS.len(),
+        USE_WHOLE_TEB_SWAP = const USE_WHOLE_TEB_SWAP as usize,
+        install_guest_whole_teb = sym install_guest_whole_teb,
+        restore_host_whole_teb = sym restore_host_whole_teb,
+    );
+}
+
+/// Whole-modeled-TEB fallback for diagnosing selective exchange bugs.
+///
+/// # Safety
+///
+/// The same requirements as `install_guest_teb` apply.
+#[unsafe(naked)]
+unsafe extern "C" fn install_guest_whole_teb(tls: &TlsState) {
+    core::arch::naked_asm!(
+        "mov r10, [rcx + {GUEST_TEB}]",
+        "mov r8, [rcx + {HOST_TEB}]",
+        "mov r9, [rcx + {HOST_TEB_SHADOW}]",
+        "mov rcx, r10",
+        "mov rdx, r8",
+        "jmp .Lwhole_copy_teb",
+        ".globl restore_host_whole_teb",
+    "restore_host_whole_teb:",
+        "mov r9, [rcx + {GUEST_TEB}]",
+        "mov r8, [rcx + {HOST_TEB}]",
+        "mov r10, [rcx + {HOST_TEB_SHADOW}]",
+        "mov rcx, r8",
+        "mov rdx, r9",
+        ".Lwhole_copy_teb:",
+        "xor r11d, r11d",
+    ".Lwhole_copy_teb_blocks:",
+        "movdqu xmm0, [r8 + r11]",
+        "movdqu xmm1, [r8 + r11 + 16]",
+        "movdqu xmm2, [r8 + r11 + 32]",
+        "movdqu xmm3, [r8 + r11 + 48]",
+        "movdqu [r9 + r11], xmm0",
+        "movdqu [r9 + r11 + 16], xmm1",
+        "movdqu [r9 + r11 + 32], xmm2",
+        "movdqu [r9 + r11 + 48], xmm3",
+        "movdqu xmm0, [r10 + r11]",
+        "movdqu xmm1, [r10 + r11 + 16]",
+        "movdqu xmm2, [r10 + r11 + 32]",
+        "movdqu xmm3, [r10 + r11 + 48]",
+        "movdqu [r8 + r11], xmm0",
+        "movdqu [r8 + r11 + 16], xmm1",
+        "movdqu [r8 + r11 + 32], xmm2",
+        "movdqu [r8 + r11 + 48], xmm3",
+        "add r11, 64",
+        "cmp r11, {BLOCK_END}",
+        "jb .Lwhole_copy_teb_blocks",
+        "3:",
+        "mov rax, [r8 + r11]",
+        "mov [r9 + r11], rax",
+        "mov rax, [r10 + r11]",
+        "mov [r8 + r11], rax",
+        "add r11, 8",
+        "cmp r11, {TEB_SIZE}",
+        "jb 3b",
+        "mov r9, rcx",
+        "mov r10, rdx",
+        "lea r8, [rip + {POINTER_OFFSETS}]",
+        "xor r11d, r11d",
+        "8:",
+        "mov rdx, [r8 + r11 * 8]",
+        "mov rax, [r10 + rdx]",
+        "sub rax, r9",
+        "cmp rax, {TEB_SIZE}",
+        "jae 10f",
+        "add rax, r10",
+        "mov [r10 + rdx], rax",
+        "10:",
+        "inc r11",
+        "cmp r11, {POINTER_COUNT}",
+        "jb 8b",
+        "ret",
+        GUEST_TEB = const core::mem::offset_of!(TlsState, guest_teb),
+        HOST_TEB = const core::mem::offset_of!(TlsState, host_teb),
+        HOST_TEB_SHADOW = const core::mem::offset_of!(TlsState, host_teb_shadow),
+        TEB_SIZE = const GUEST_TEB_SIZE,
+        BLOCK_END = const GUEST_TEB_SIZE / 64 * 64,
+        POINTER_OFFSETS = sym TEB_INTERNAL_POINTER_OFFSETS,
+        POINTER_COUNT = const TEB_INTERNAL_POINTER_OFFSETS.len(),
+    );
+}
+
+/// Captures the native TEB and stores `tls` in its runtime slot.
 ///
 /// # Safety
 ///
 /// The caller must ensure `tls` remains valid for the duration of its use.
 unsafe fn install_tls(tls: &TlsState) {
-    let tls_index = TLS_INDEX.load(Ordering::Relaxed);
+    let host_teb = current_teb();
+    assert!(!host_teb.is_null(), "host TEB is not configured");
+    tls.host_teb.set(host_teb);
     unsafe {
-        windows_sys::Win32::System::Threading::TlsSetValue(
-            tls_index,
-            core::ptr::from_ref(tls).cast(),
-        );
+        teb_runtime_tls_slot(host_teb.addr()).write(core::ptr::from_ref(tls));
     }
 }
 
-/// Clears the current thread's Windows TLS slot.
+/// Clears the current thread's post-TEB runtime slot.
 fn uninstall_tls() {
-    let tls_index = TLS_INDEX.load(Ordering::Relaxed);
-    unsafe { windows_sys::Win32::System::Threading::TlsSetValue(tls_index, core::ptr::null()) };
+    // SAFETY: Teardown runs on the owning thread after host state was restored.
+    unsafe {
+        runtime_tls_slot().write(core::ptr::null());
+    }
 }
 
 fn get_tls_ptr() -> Option<*const TlsState> {
-    let tls_index = TLS_INDEX.load(Ordering::Relaxed);
-    if tls_index == u32::MAX {
-        return None;
-    }
-    let ptr =
-        unsafe { windows_sys::Win32::System::Threading::TlsGetValue(tls_index).cast::<TlsState>() };
+    let ptr = unsafe { runtime_tls_slot().read() };
     if ptr.is_null() {
         return None;
     }
@@ -883,9 +1145,6 @@ unsafe extern "C-unwind" fn run_thread_arch(thread_ctx: &mut ThreadContext, tls_
     .seh_savexmm xmm15, 9*16
     .seh_endprologue
 
-    // Offset into the TEB (gs segment) where TLS slots are stored.
-    .equ TEB_TLS_SLOTS_OFFSET, 5248
-
     push    rcx // Alignment
     push    rcx // Save thread_ctx
 
@@ -905,8 +1164,7 @@ unsafe extern "C-unwind" fn run_thread_arch(thread_ctx: &mut ThreadContext, tls_
     .globl  syscall_callback
 syscall_callback:
     // Get the TLS state from the TLS slot and clear the in-guest flag.
-    mov     r11d, DWORD PTR [rip + {TLS_INDEX}]
-    mov     r11, QWORD PTR gs:[r11 * 8 + TEB_TLS_SLOTS_OFFSET]
+    mov     r11, QWORD PTR gs:[{TEB_RUNTIME_TLS_OFFSET}]
     mov     BYTE PTR [r11 + {IS_IN_GUEST}], 0
     // Set rsp to the top of the guest context.
     mov     QWORD PTR [r11 + {SCRATCH}], rsp
@@ -950,6 +1208,13 @@ syscall_callback:
     /// Reestablish the stack and frame pointers.
     mov     rsp, [r11 + {HOST_SP}]
     mov     rbp, [r11 + {HOST_BP}]
+    cmp     BYTE PTR [rip + {GUEST_TLS_MODE}], {WINDOWS_TLS_MODE}
+    jne     2f
+    mov     rcx, r11
+    sub     rsp, 32
+    call    {restore_host_teb}
+    add     rsp, 32
+2:
 
     // Handle the syscall. This will jump back to the guest but
     // will return if the thread is exiting.
@@ -965,18 +1230,37 @@ exception_callback:
     // Handle the exception. The stack and frame pointers are already restored,
     // and the guest context is up to date. rcx contains a pointer to the
     // guest pt_regs, and rdx contains a pointer to the exception record.
+    mov  r11, QWORD PTR gs:[{TEB_RUNTIME_TLS_OFFSET}]
+    cmp  BYTE PTR [rip + {GUEST_TLS_MODE}], {WINDOWS_TLS_MODE}
+    jne  2f
+    sub  rsp, 48
+    mov  [rsp + 32], rcx
+    mov  [rsp + 40], rdx
+    mov  rcx, r11
+    call {restore_host_teb}
+    mov  rcx, [rsp + 32]
+    mov  rdx, [rsp + 40]
+    add  rsp, 48
+2:
     call {exception_handler}
     jmp .Ldone
 
 interrupt_callback:
-    mov     r11d, DWORD PTR [rip + {TLS_INDEX}]
-    mov     r11, QWORD PTR gs:[r11 * 8 + TEB_TLS_SLOTS_OFFSET]
+    mov  r11, QWORD PTR gs:[{TEB_RUNTIME_TLS_OFFSET}]
+    mov  BYTE PTR [r11 + {IS_IN_GUEST}], 0
     mov     rsp, [r11 + {HOST_SP}]
     mov     rbp, [r11 + {HOST_BP}]
     // Clear the x87 exception flags and restore the Windows ABI's standard host x87 control word and mxcsr.
     fnclex
     fldcw WORD PTR [rip + {HOST_X87_CONTROL_WORD}]
     ldmxcsr DWORD PTR [rip + {HOST_MXCSR}]
+    cmp  BYTE PTR [rip + {GUEST_TLS_MODE}], {WINDOWS_TLS_MODE}
+    jne  2f
+    mov  rcx, r11
+    sub  rsp, 32
+    call {restore_host_teb}
+    add  rsp, 32
+2:
     mov  rcx, QWORD PTR [rsp] // thread_ctx
     call {interrupt_handler}
     jmp .Ldone
@@ -1010,9 +1294,12 @@ interrupt_callback:
     syscall_handler = sym syscall_handler,
     exception_handler = sym exception_handler,
     interrupt_handler = sym interrupt_handler,
-    TLS_INDEX = sym TLS_INDEX,
+    TEB_RUNTIME_TLS_OFFSET = const TEB_RUNTIME_TLS_OFFSET,
     HOST_SP = const core::mem::offset_of!(TlsState, host_sp),
     HOST_BP = const core::mem::offset_of!(TlsState, host_bp),
+    GUEST_TLS_MODE = sym GUEST_TLS_MODE,
+    WINDOWS_TLS_MODE = const GuestTlsMode::Windows as u8,
+    restore_host_teb = sym restore_host_teb,
     GUEST_CONTEXT_TOP = const core::mem::offset_of!(TlsState, guest_context_top),
     SCRATCH = const core::mem::offset_of!(TlsState, scratch),
     IS_IN_GUEST = const core::mem::offset_of!(TlsState, is_in_guest),
@@ -1045,6 +1332,17 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
         // `switch_to_guest_end` and will set the `interrupt` and jump to
         // `interrupt_callback`.
         core::arch::naked_asm!(
+            "cmp BYTE PTR [rip + {GUEST_TLS_MODE}], {WINDOWS_TLS_MODE}",
+            "jne 3f",
+            "sub rsp, 56",
+            "mov [rsp + 32], rcx",
+            "mov [rsp + 40], rdx",
+            "mov rcx, rdx",
+            "call {install_guest_teb}",
+            "mov rcx, [rsp + 32]",
+            "mov rdx, [rsp + 40]",
+            "add rsp, 56",
+            "3:",
             "switch_to_guest_start:",
             "mov BYTE PTR [rdx + {IS_IN_GUEST}], 1",
             "cmp BYTE PTR [rdx + {INTERRUPT}], 0",
@@ -1083,6 +1381,9 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
             INTERRUPT = const core::mem::offset_of!(TlsState, interrupt),
             GUEST_XSAVE_PTR = const core::mem::offset_of!(TlsState, guest_xsave_ptr),
             XSAVE_MASK = const core::mem::offset_of!(TlsState, guest_xsave_mask),
+            GUEST_TLS_MODE = sym GUEST_TLS_MODE,
+            WINDOWS_TLS_MODE = const GuestTlsMode::Windows as u8,
+            install_guest_teb = sym install_guest_teb,
             interrupt_callback = sym interrupt_callback,
         );
     }
@@ -1134,6 +1435,12 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
         // Ensure the context is written before we set `is_in_guest` so that
         // `ThreadHandle::interrupt` can see a consistent state.
         std::sync::atomic::compiler_fence(Ordering::Release);
+        let windows_guest = guest_tls_mode() == GuestTlsMode::Windows;
+        // SAFETY: This thread owns both TEB states. Only the transition assembly
+        // and the native NtContinue stub run before control reaches the guest.
+        if windows_guest {
+            unsafe { install_guest_teb(tls) };
+        }
         unsafe {
             core::arch::asm!(
                 "mov BYTE PTR [{tls} + {IS_IN_GUEST}], 1",
@@ -1149,6 +1456,10 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
         }
         unsafe {
             let status = NtContinue(win_ctx, 0);
+            tls.is_in_guest.set(false);
+            if windows_guest {
+                restore_host_teb(tls);
+            }
             panic!(
                 "NtContinue failed: {}",
                 std::io::Error::from_raw_os_error(
@@ -1161,9 +1472,12 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
 
     let tls = unsafe { &*get_tls_ptr().expect("TLS not initialized") };
     assert!(!tls.is_in_guest.get());
-
-    // Restore fsbase for the guest.
-    WindowsUserland::restore_thread_fs_base();
+    match guest_tls_mode() {
+        GuestTlsMode::Linux => WindowsUserland::restore_thread_fs_base(tls),
+        GuestTlsMode::Windows => {
+            debug_assert_ne!(tls.guest_teb.get(), 0, "guest TEB is not configured");
+        }
+    }
 
     // The fast path for switching to the guest relies on rcx == rip. This is
     // the common case, because the syscall instruction sets rcx to rip at entry
@@ -1226,8 +1540,6 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
 
     #[cfg(debug_assertions)]
     fn run_test_thread<R>(f: impl FnOnce() -> R) -> R {
-        // Ensure the module-wide TLS slot is allocated.
-        ensure_tls_index();
         let tls = TlsState::new();
         ThreadHandle::run_with_handle(&tls, f)
     }
@@ -1871,8 +2183,17 @@ impl litebox::platform::ArchSpecificProvider for WindowsUserland {
         match reg {
             litebox::platform::ArchSpecificRegister::FsBase => {
                 if litebox_common_linux::arch::is_valid_user_fs_base(val) {
-                    // Use WindowsUserland's per-thread FS base management system
                     Self::set_thread_fs_base(val);
+                    Ok(())
+                } else {
+                    Err(litebox::platform::ArchSpecificError::RegisterUnpermittedValue)
+                }
+            }
+            litebox::platform::ArchSpecificRegister::GsBase
+                if guest_tls_mode() == GuestTlsMode::Windows =>
+            {
+                if val != 0 && litebox_common_linux::arch::is_valid_user_fs_base(val) {
+                    Self::set_guest_teb(val);
                     Ok(())
                 } else {
                     Err(litebox::platform::ArchSpecificError::RegisterUnpermittedValue)
@@ -1893,7 +2214,16 @@ impl litebox::platform::ArchSpecificProvider for WindowsUserland {
         reg: &litebox::platform::ArchSpecificRegister,
     ) -> Result<usize, litebox::platform::ArchSpecificError> {
         match reg {
-            litebox::platform::ArchSpecificRegister::FsBase => Ok(Self::get_thread_fs_base()),
+            litebox::platform::ArchSpecificRegister::FsBase => get_tls_ptr()
+                .map(|tls| unsafe { &*tls }.guest_fs_base.get())
+                .ok_or(litebox::platform::ArchSpecificError::RegisterUnsupported),
+            litebox::platform::ArchSpecificRegister::GsBase
+                if guest_tls_mode() == GuestTlsMode::Windows =>
+            {
+                get_tls_ptr()
+                    .map(|tls| unsafe { &*tls }.guest_teb.get())
+                    .ok_or(litebox::platform::ArchSpecificError::RegisterUnsupported)
+            }
             litebox::platform::ArchSpecificRegister::GsBase => {
                 // See note above: gs base is reserved by the Windows host.
                 Err(litebox::platform::ArchSpecificError::RegisterReserved)
@@ -2284,6 +2614,34 @@ unsafe extern "C" {
     fn interrupt_callback();
     fn switch_to_guest_start();
     fn switch_to_guest_end();
+
+    /// Writes selected guest TEB fields to its shadow and restores saved host fields.
+    /// Excluded graphics fields are neither saved nor restored; see `TEB_SWAP_RANGES`.
+    /// GS is unchanged. Internal guest pointers are relocated back into the shadow.
+    ///
+    /// # Safety
+    ///
+    /// `tls` must belong to this thread and have a configured, nonzero guest TEB.
+    /// Its TEB allocations must be live, disjoint, and writable for `GUEST_TEB_SIZE`
+    /// bytes. Guest TEB state must be installed and the host save area must contain
+    /// valid state.
+    #[expect(
+        improper_ctypes,
+        reason = "assembly entry in install_guest_teb uses Rust-computed TlsState offsets"
+    )]
+    fn restore_host_teb(tls: &TlsState);
+
+    /// Restores the entire modeled host TEB and writes guest state back to its shadow.
+    ///
+    /// # Safety
+    ///
+    /// The same requirements as `restore_host_teb` apply, and the preceding
+    /// install must have used `install_guest_whole_teb`.
+    #[expect(
+        improper_ctypes,
+        reason = "assembly entry in install_guest_whole_teb uses Rust-computed TlsState offsets"
+    )]
+    fn restore_host_whole_teb(tls: &TlsState);
 }
 
 unsafe extern "C-unwind" fn init_handler(thread_ctx: &mut ThreadContext<'_>) {
@@ -2328,7 +2686,6 @@ unsafe extern "C-unwind" fn exception_handler(
 }
 
 unsafe extern "C-unwind" fn interrupt_handler(thread_ctx: &mut ThreadContext<'_>) {
-    thread_ctx.tls.is_in_guest.set(false);
     thread_ctx.call_shim(|shim, ctx, interrupt| {
         if interrupt {
             shim.interrupt(ctx)
@@ -2416,6 +2773,198 @@ impl litebox::mm::linux::VmemPageFaultHandler for WindowsUserland {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "microbenchmark; run in release mode with --ignored --nocapture"]
+    fn benchmark_teb_exchange_selective_vs_whole() {
+        #[unsafe(naked)]
+        unsafe extern "C" fn round_trips<const SELECTIVE: bool>(
+            _tls: &super::TlsState,
+            _iterations: usize,
+        ) {
+            core::arch::naked_asm!(
+                "push rsi",
+                "push rdi",
+                "sub rsp, 40",
+                "mov rsi, rcx",
+                "mov rdi, rdx",
+                "2:",
+                "mov rcx, rsi",
+                ".if {SELECTIVE}",
+                "call {install_selective}",
+                "mov rcx, rsi",
+                "call {restore_selective}",
+                ".else",
+                "call {install_whole}",
+                "mov rcx, rsi",
+                "call {restore_whole}",
+                ".endif",
+                "dec rdi",
+                "jnz 2b",
+                "add rsp, 40",
+                "pop rdi",
+                "pop rsi",
+                "ret",
+                SELECTIVE = const SELECTIVE as usize,
+                install_selective = sym super::install_guest_teb,
+                restore_selective = sym super::restore_host_teb,
+                install_whole = sym super::install_guest_whole_teb,
+                restore_whole = sym super::restore_host_whole_teb,
+            );
+        }
+
+        const ITERATIONS: usize = 500_000;
+        const SAMPLES: usize = 21;
+        assert!(
+            !std::hint::black_box(super::USE_WHOLE_TEB_SWAP),
+            "disable the whole-TEB fallback before benchmarking"
+        );
+        let tls = super::TlsState::new();
+        let mut native = Box::new([0x1111_1111_1111_1111usize; super::GUEST_TEB_SIZE / 8]);
+        let mut guest = Box::new([0x2222_2222_2222_2222usize; super::GUEST_TEB_SIZE / 8]);
+        let guest_base = guest.as_mut_ptr().addr();
+        for offset in super::TEB_INTERNAL_POINTER_OFFSETS {
+            guest[offset / 8] = guest_base + offset;
+        }
+        let original_native = native.clone();
+        let original_guest = guest.clone();
+        tls.host_teb.set(native.as_mut_ptr().cast());
+        tls.guest_teb.set(guest_base);
+        // SAFETY: Both implementations use the same live, disjoint synthetic TEB
+        // buffers and balanced transitions; GS and the real host TEB are untouched.
+        unsafe {
+            round_trips::<false>(&tls, 10_000);
+            round_trips::<true>(&tls, 10_000);
+        }
+        let mut before = [0.0f64; SAMPLES];
+        let mut after = [0.0f64; SAMPLES];
+        for sample in 0..SAMPLES {
+            for selective in [sample % 2 != 0, sample % 2 == 0] {
+                let start = std::time::Instant::now();
+                // SAFETY: Same validated buffers and balanced transitions as warmup.
+                unsafe {
+                    if selective {
+                        round_trips::<true>(&tls, ITERATIONS);
+                    } else {
+                        round_trips::<false>(&tls, ITERATIONS);
+                    }
+                }
+                let elapsed = start.elapsed().as_secs_f64() * 1e9
+                    / f64::from(u32::try_from(ITERATIONS).unwrap());
+                if selective {
+                    after[sample] = elapsed;
+                } else {
+                    before[sample] = elapsed;
+                }
+                assert_eq!(native, original_native);
+                assert_eq!(guest, original_guest);
+            }
+        }
+        before.sort_by(f64::total_cmp);
+        after.sort_by(f64::total_cmp);
+        let selected_bytes: usize = super::TEB_SWAP_RANGES
+            .iter()
+            .map(|[start, end]| end - start)
+            .sum();
+        println!(
+            "Warm-cache synthetic TEB round trip (install + restore), {SAMPLES} samples, {ITERATIONS} iterations/sample; alternating order"
+        );
+        println!(
+            "Whole: {} bytes; median {:.2} ns, min {:.2}, max {:.2}",
+            super::GUEST_TEB_SIZE,
+            before[SAMPLES / 2],
+            before[0],
+            before[SAMPLES - 1],
+        );
+        println!(
+            "Selective: {selected_bytes} bytes; median {:.2} ns, min {:.2}, max {:.2}",
+            after[SAMPLES / 2],
+            after[0],
+            after[SAMPLES - 1],
+        );
+        println!(
+            "Reduction: {:.2} ns ({:.1}%); speedup {:.2}x",
+            before[SAMPLES / 2] - after[SAMPLES / 2],
+            (1.0 - after[SAMPLES / 2] / before[SAMPLES / 2]) * 100.0,
+            before[SAMPLES / 2] / after[SAMPLES / 2],
+        );
+    }
+
+    #[test]
+    fn configured_teb_exchange_preserves_selected_state() {
+        check_teb_exchange(
+            super::install_guest_teb,
+            super::restore_host_teb,
+            super::USE_WHOLE_TEB_SWAP,
+        );
+    }
+
+    #[test]
+    fn whole_teb_exchange_preserves_all_state() {
+        check_teb_exchange(
+            super::install_guest_whole_teb,
+            super::restore_host_whole_teb,
+            true,
+        );
+    }
+
+    fn check_teb_exchange(
+        install: unsafe extern "C" fn(&super::TlsState),
+        restore: unsafe extern "C" fn(&super::TlsState),
+        whole: bool,
+    ) {
+        let tls = super::TlsState::new();
+        let mut native = Box::new([0x1111_1111_1111_1111usize; super::GUEST_TEB_SIZE / 8]);
+        let mut guest = Box::new([0x2222_2222_2222_2222usize; super::GUEST_TEB_SIZE / 8]);
+        let native_base = native.as_mut_ptr().addr();
+        let guest_base = guest.as_mut_ptr().addr();
+        for offset in super::TEB_INTERNAL_POINTER_OFFSETS {
+            guest[offset / 8] = guest_base + offset;
+        }
+        let original_native = native.clone();
+        let original_guest = guest.clone();
+        tls.host_teb.set(native.as_mut_ptr().cast());
+        tls.guest_teb.set(guest_base);
+
+        // SAFETY: These disjoint, initialized buffers cover the modeled TEB.
+        // The helper does not access GS, so the actual native TEB stays installed.
+        unsafe { install(&tls) };
+        for index in 0..native.len() {
+            let offset = index * 8;
+            let selected = whole
+                || super::TEB_SWAP_RANGES
+                    .iter()
+                    .any(|&[start, end]| (start..end).contains(&offset));
+            let expected = if super::TEB_INTERNAL_POINTER_OFFSETS.contains(&offset) {
+                assert!(selected);
+                native_base + offset
+            } else if selected {
+                original_guest[index]
+            } else {
+                original_native[index]
+            };
+            assert_eq!(native[index], expected, "offset {offset:#x}");
+            if selected && !super::TEB_INTERNAL_POINTER_OFFSETS.contains(&offset) {
+                native[index] = 0x3333_3333_3333_3333;
+            }
+        }
+        // SAFETY: The same live buffers contain balanced host/guest states.
+        unsafe { restore(&tls) };
+        assert_eq!(native, original_native);
+        for index in 0..guest.len() {
+            let offset = index * 8;
+            let selected = whole
+                || super::TEB_SWAP_RANGES
+                    .iter()
+                    .any(|&[start, end]| (start..end).contains(&offset));
+            let expected = if selected && !super::TEB_INTERNAL_POINTER_OFFSETS.contains(&offset) {
+                0x3333_3333_3333_3333
+            } else {
+                original_guest[index]
+            };
+            assert_eq!(guest[index], expected, "offset {offset:#x}");
+        }
+    }
+
     use core::sync::atomic::AtomicU32;
     use std::thread::sleep;
 
@@ -2561,6 +3110,11 @@ mod tests {
             }
         }
 
+        crate::GUEST_TLS_MODE.store(
+            crate::GuestTlsMode::Linux as u8,
+            core::sync::atomic::Ordering::Release,
+        );
+
         // Place the spin loop outside this module so `is_in_ntdll_or_this`
         // classifies its RIP as guest code and `interrupt` exercises case 4,
         // which captures the live guest context and XSTATE.
@@ -2619,7 +3173,6 @@ mod tests {
             let ready_ref = &ready;
             let stop_ref = &stop;
             let worker = scope.spawn(move || {
-                crate::ensure_tls_index();
                 let shim = InterruptShim {
                     count: Cell::new(0),
                     avx: std::is_x86_feature_detected!("avx"),
@@ -2830,6 +3383,10 @@ mod tests {
             }
         }
 
+        crate::GUEST_TLS_MODE.store(
+            crate::GuestTlsMode::Linux as u8,
+            core::sync::atomic::Ordering::Release,
+        );
         for fast_entry in [false, true] {
             let shim = StateShim {
                 calls: Cell::new(0),
@@ -2847,7 +3404,6 @@ mod tests {
                 eflags: 0x202,
                 ..Default::default()
             };
-            crate::ensure_tls_index();
             crate::run_thread_inner(&shim, &mut ctx);
             assert_eq!(shim.calls.get(), 6);
             assert_eq!(

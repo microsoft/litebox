@@ -30,7 +30,12 @@ pub(crate) use litebox_platform_windows_userland::WindowsUserland as TestPlatfor
 /// Returns the process-wide test platform, initializing it once.
 pub(crate) fn test_platform() -> &'static TestPlatform {
     static PLATFORM: std::sync::OnceLock<&'static TestPlatform> = std::sync::OnceLock::new();
-    PLATFORM.get_or_init(TestPlatform::new)
+    PLATFORM.get_or_init(|| {
+        let platform = TestPlatform::new();
+        #[cfg(target_os = "windows")]
+        TestPlatform::set_guest_tls_mode(litebox_platform_windows_userland::GuestTlsMode::Linux);
+        platform
+    })
 }
 
 /// Returns a task connected to the process-wide in-memory test broker.
