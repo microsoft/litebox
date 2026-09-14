@@ -1248,6 +1248,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             match seek {
                 Ok(position) => Ok(position),
                 Err(SeekError::ClosedFd) => Err(NtStatus::INVALID_HANDLE),
+                Err(SeekError::NotForSeeking) => Err(NtStatus::ACCESS_DENIED),
                 Err(SeekError::NonSeekable | SeekError::InvalidOffset) => {
                     Err(NtStatus::INVALID_DEVICE_REQUEST)
                 }
@@ -1340,6 +1341,7 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
             match seek {
                 Ok(_) => Ok(()),
                 Err(SeekError::ClosedFd) => Err(NtStatus::INVALID_HANDLE),
+                Err(SeekError::NotForSeeking) => Err(NtStatus::ACCESS_DENIED),
                 Err(SeekError::InvalidOffset) => Err(NtStatus::INVALID_PARAMETER),
                 Err(SeekError::NonSeekable) => Err(NtStatus::INVALID_DEVICE_REQUEST),
                 Err(_) => Err(NtStatus::UNSUCCESSFUL),
@@ -2754,6 +2756,7 @@ fn map_read_dir_error(error: ReadDirError) -> NtStatus {
     match error {
         ReadDirError::ClosedFd => NtStatus::INVALID_HANDLE,
         ReadDirError::NotADirectory => NtStatus::NOT_A_DIRECTORY,
+        ReadDirError::NotForReading => NtStatus::ACCESS_DENIED,
         _ => NtStatus::UNSUCCESSFUL,
     }
 }

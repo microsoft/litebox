@@ -11,17 +11,15 @@ use anyhow::{Context as _, Result};
 use clap::Parser;
 use litebox_broker_local_userland as broker;
 use litebox_platform_windows_userland::{GuestTlsMode, WindowsUserland};
-use std::path::PathBuf;
 
 /// Runs a Windows PE program with LiteBox on unmodified Windows and returns its exit code.
 ///
-/// The program binary and any initial filesystem contents must be provided inside a tar archive via
-/// `--initial-files`. The program path refers to a path inside the tar archive.
+/// The program binary and runtime files must be available in the broker-owned file system.
 #[derive(Parser, Debug)]
 pub struct CliArgs {
     /// The program and arguments passed to it (e.g., `/app/program.exe --help`).
     ///
-    /// The program path refers to a path inside the tar archive provided via `--initial-files`.
+    /// The program path refers to a path inside the broker-owned file system.
     #[arg(required = true, trailing_var_arg = true, value_hint = clap::ValueHint::CommandWithArguments)]
     pub program_and_arguments: Vec<String>,
     /// Environment variables passed to the program (`K=V` pairs; can be invoked multiple times).
@@ -42,19 +40,9 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub broker_control_channel: Option<std::ffi::OsString>,
-    /// Tar archive containing the program and its runtime files.
-    ///
-    /// This may be omitted when the broker was configured with `--fs-initial-files`.
-    #[arg(long = "initial-files", value_name = "PATH_TO_TAR", value_hint = clap::ValueHint::FilePath)]
-    pub initial_files: Option<PathBuf>,
 }
 
 /// Run Windows PE programs with LiteBox on unmodified Windows.
-///
-/// # Panics
-///
-/// Panics if the initial in-memory file system fails to create `/tmp` — those
-/// operations cannot fail against a freshly-constructed file system.
 pub fn run(cli_args: CliArgs) -> Result<i32> {
     tracing_subscriber::fmt()
         .with_timer(tracing_subscriber::fmt::time::uptime())

@@ -39,11 +39,7 @@ fn run_hello_world_pe() {
     ] {
         // Verbose log for failure triage; not load-bearing for any assertion.
         command.env("LITEBOX_LOG", "debug");
-        command.args([
-            "--initial-files",
-            tar_path.to_str().unwrap(),
-            "/kernel32_import.exe",
-        ]);
+        command.arg("/kernel32_import.exe");
         println!("Running {mode} `{command:?}`");
         let output = command
             .output()
@@ -89,11 +85,7 @@ fn run_multithreaded_pe() {
 
     let mut command = brokered_windows_runner_command(&tar_path);
     command.env("LITEBOX_LOG", "debug");
-    command.args([
-        "--initial-files",
-        tar_path.to_str().unwrap(),
-        "/kernel32_multithread.exe",
-    ]);
+    command.arg("/kernel32_multithread.exe");
     println!("Running `{command:?}`");
     let output = command
         .output()
@@ -140,11 +132,7 @@ fn run_crt_locale_pe() {
 
     let mut command = brokered_windows_runner_command(&tar_path);
     command.env("LITEBOX_LOG", "debug");
-    command.args([
-        "--initial-files",
-        tar_path.to_str().unwrap(),
-        "/crt_locale.exe",
-    ]);
+    command.arg("/crt_locale.exe");
     println!("Running `{command:?}`");
     let output = command
         .output()

@@ -2468,6 +2468,7 @@ fn map_read_error(error: ReadError) -> NtStatus {
 fn map_read_dir_error(error: ReadDirError) -> NtStatus {
     match error {
         ReadDirError::NotADirectory => NtStatus::NOT_A_DIRECTORY,
+        ReadDirError::NotForReading => NtStatus::ACCESS_DENIED,
         _ => NtStatus::UNSUCCESSFUL,
     }
 }
