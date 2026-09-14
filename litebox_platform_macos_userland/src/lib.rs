@@ -46,6 +46,9 @@ pub const TASK_ADDR_MAX: usize = 0x7FFF_FE00_0000;
 
 pub struct MacosUserland {
     pages: std::sync::Mutex<std::collections::BTreeSet<usize>>,
+    /// One-time initialization snapshot of host mappings unavailable to guest programs.
+    /// Host mappings created after [`Self::new`] are not included.
+    reserved_pages: Vec<Range<usize>>,
 }
 
 impl core::fmt::Debug for MacosUserland {
@@ -58,7 +61,8 @@ impl MacosUserland {
     /// Initialize the platform.
     ///
     /// # Panics
-    /// Panics if the host page size, pthread TSD layout, or signal setup is unsupported.
+    /// Panics if the host page size, pthread TSD layout, signal setup, or host memory-map
+    /// snapshot is unsupported or cannot be initialized.
     pub fn new() -> &'static Self {
         // SAFETY: this scalar query has no pointer arguments.
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
@@ -73,9 +77,71 @@ impl MacosUserland {
             .unwrap_or_else(|error| panic!("failed to initialize macOS TLS: {error}"));
         initialize_thread_tls();
         register_exception_handlers().expect("failed to install macOS signal handlers");
+        let reserved_pages = Self::read_maps();
         Box::leak(Box::new(Self {
             pages: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            reserved_pages,
         }))
+    }
+
+    /// Take the macOS equivalent of a `/proc/self/maps` snapshot.
+    fn read_maps() -> Vec<Range<usize>> {
+        // SAFETY: `mach_task_self` takes no arguments and returns the calling task's send right.
+        let task = unsafe { mach_task_self() };
+        let mut reserved_pages = Vec::new();
+        let mut cursor = 0_u64;
+
+        loop {
+            let mut address = cursor;
+            let mut size = 0_u64;
+            // Only the returned range matters: mappings with every protection, including
+            // PROT_NONE reservations, must remain unavailable to the guest.
+            let mut info = [0_i32; VM_REGION_BASIC_INFO_COUNT_64 as usize];
+            let mut info_count = VM_REGION_BASIC_INFO_COUNT_64;
+            let mut object_name = MACH_PORT_NULL;
+            // SAFETY: all output pointers refer to initialized, writable storage of the
+            // sizes required by VM_REGION_BASIC_INFO_64, and `task` is our task port.
+            let result = unsafe {
+                mach_vm_region(
+                    task,
+                    &raw mut address,
+                    &raw mut size,
+                    VM_REGION_BASIC_INFO_64,
+                    info.as_mut_ptr(),
+                    &raw mut info_count,
+                    &raw mut object_name,
+                )
+            };
+            if result == KernReturn::INVALID_ADDRESS {
+                break;
+            }
+            assert_eq!(result, KernReturn::SUCCESS, "mach_vm_region failed");
+            if object_name != MACH_PORT_NULL {
+                // `mach_vm_region` transfers this send right to the caller.
+                // SAFETY: `object_name` is the right returned by the successful call above.
+                let deallocate_result = unsafe { mach_port_deallocate(task, object_name) };
+                assert_eq!(
+                    deallocate_result,
+                    KernReturn::SUCCESS,
+                    "mach_port_deallocate failed"
+                );
+            }
+
+            let end = address
+                .checked_add(size)
+                .expect("mach_vm_region returned an overflowing range");
+            assert!(size != 0 && end > cursor, "mach_vm_region did not advance");
+            let start = usize::try_from(address).expect("mapping address does not fit usize");
+            let end = usize::try_from(end).expect("mapping end does not fit usize");
+            assert!(
+                start.is_multiple_of(PAGE_SIZE) && end.is_multiple_of(PAGE_SIZE),
+                "mach_vm_region returned an unaligned range"
+            );
+            reserved_pages.push(start..end);
+            cursor = end as u64;
+        }
+
+        reserved_pages
     }
 }
 
@@ -372,6 +438,7 @@ struct KernReturn(libc::c_int);
 
 impl KernReturn {
     const SUCCESS: Self = Self(0);
+    const INVALID_ADDRESS: Self = Self(1);
     const PROTECTION_FAILURE: Self = Self(2);
     const RESOURCE_SHORTAGE: Self = Self(6);
 }
@@ -396,10 +463,26 @@ bitflags::bitflags! {
     }
 }
 
+const MACH_PORT_NULL: u32 = 0;
+const VM_REGION_BASIC_INFO_64: i32 = 9;
+// sizeof(vm_region_basic_info_data_64_t) / sizeof(integer_t) on macOS. The
+// SDK declares this structure with 4-byte packing, making it 36 bytes.
+const VM_REGION_BASIC_INFO_COUNT_64: u32 = 9;
+
 unsafe extern "C" {
     fn mach_task_self() -> u32;
+    fn mach_port_deallocate(task: u32, name: u32) -> KernReturn;
     fn mach_vm_allocate(task: u32, address: *mut u64, size: u64, flags: MachVmFlags) -> KernReturn;
     fn mach_vm_deallocate(task: u32, address: u64, size: u64) -> KernReturn;
+    fn mach_vm_region(
+        task: u32,
+        address: *mut u64,
+        size: *mut u64,
+        flavor: i32,
+        info: *mut i32,
+        info_count: *mut u32,
+        object_name: *mut u32,
+    ) -> KernReturn;
     fn mach_vm_read_overwrite(
         task: u32,
         address: u64,
@@ -769,9 +852,7 @@ impl litebox::platform::PageManagementProvider<PAGE_SIZE> for MacosUserland {
         Ok(())
     }
     fn reserved_pages(&self) -> impl Iterator<Item = &Range<usize>> {
-        // TODO: snapshot host mappings with mach_vm_region so Vmem avoids the
-        // runtime image, dyld cache, heap, and thread stacks during placement.
-        std::iter::empty()
+        self.reserved_pages.iter()
     }
 }
 
@@ -2275,6 +2356,37 @@ mod tests {
     };
     const RW: MemoryRegionPermissions =
         MemoryRegionPermissions::READ.union(MemoryRegionPermissions::WRITE);
+
+    #[test]
+    fn reserved_pages_snapshot_contains_host_mappings() {
+        let heap_value = Box::new(0_u8);
+        let stack_value = 0_u8;
+        let platform = MacosUserland::new();
+        let reserved_pages: Vec<_> = <MacosUserland as litebox::platform::PageManagementProvider<
+            PAGE_SIZE,
+        >>::reserved_pages(platform)
+        .collect();
+
+        assert!(!reserved_pages.is_empty());
+        let mut previous_end = 0;
+        for range in &reserved_pages {
+            assert!(range.start >= previous_end);
+            assert!(range.end > range.start);
+            assert!(range.start.is_multiple_of(PAGE_SIZE));
+            assert!(range.end.is_multiple_of(PAGE_SIZE));
+            previous_end = range.end;
+        }
+        for address in [
+            reserved_pages_snapshot_contains_host_mappings as *const () as usize,
+            std::ptr::from_ref(&stack_value) as usize,
+            std::ptr::from_ref(heap_value.as_ref()) as usize,
+        ] {
+            assert!(
+                reserved_pages.iter().any(|range| range.contains(&address)),
+                "host address {address:#x} is absent from the snapshot"
+            );
+        }
+    }
 
     #[test]
     fn transition_ranges_have_stable_sizes() {
