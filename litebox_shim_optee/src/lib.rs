@@ -174,10 +174,8 @@ impl<Platform: OpteeShimPlatform> OpteeShimBuilder<Platform> {
         }
     }
 
-    /// Set the embedded DER leaf certificate used by verifiers to verify TA signatures.
-    ///
-    /// The certificate is shared by reference and included verbatim in IDK_S endorsements.
-    /// It defaults to an empty placeholder when no certificate is embedded.
+    /// DER leaf certificate for TA signature verification, included in IDK_S endorsements.
+    /// Defaults to empty (no certificate).
     #[must_use]
     pub fn with_ta_signing_cert(mut self, ta_signing_cert: &'static [u8]) -> Self {
         self.ta_signing_cert = ta_signing_cert;
@@ -221,7 +219,6 @@ struct GlobalState<Platform: OpteeShimPlatform> {
     _litebox: litebox::LiteBox<Platform>,
     /// The TA UUID to binary map for TA loading.
     ta_uuid_map: &'static TaUuidMap,
-    /// Embedded DER TA signing leaf certificate, shared without copying.
     ta_signing_cert: &'static [u8],
     /// Tracks which non-concurrent PTAs (i.e., PTAs w/o `TaFlags::CONCURRENT`)
     /// are currently busy. A busy PTA is *rejected* with `TeeResult::Busy`

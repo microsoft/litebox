@@ -83,13 +83,15 @@ impl IdksPta {
         }
     }
 
-    /// Parameter 0 is the TA data; parameter 1 receives the signed endorsement.
     fn endorse_data<Platform: crate::OpteeShimPlatform>(
         task: &Task<Platform>,
         params: &mut UteeParams,
     ) -> Result<(), TeeResult> {
         use TeeParamType::{MemrefInput, MemrefOutput, None};
-
+        // [in]  params[0].memref.buffer   Opaque TA data
+        // [in]  params[0].memref.size     TA data size
+        // [out] params[1].memref.buffer   Output buffer for signed endorsement
+        // [out] params[1].memref.size     Buffer size
         if !params.has_types([MemrefInput, MemrefOutput, None, None]) {
             return Err(TeeResult::BadParameters);
         }
@@ -167,15 +169,12 @@ fn endorsement_data_len(ta_data_len: usize, ta_signing_cert_len: usize) -> Optio
         .checked_add(ta_signing_cert_len)
 }
 
-/// Serializes the flat prefix covered by the IDK_S signature:
+/// IDK_S-signed wire format:
 /// MAGIC || VERSION || TA_DATA_LEN || TA_DATA || TA_UUID || TA_SVN || TA_DIGEST ||
 /// DEBUG || ISOLATION_SOLUTION || TA_SIGNING_CERT_LEN || TA_SIGNING_CERT_DER.
 ///
-/// Integers (including both u32 lengths) and the UUID use little endian.
-/// The certificate is the embedded TA signing leaf certificate, not the IDK_S
-/// certificate; its bytes are copied
-/// verbatim for the verifier to use when verifying the TA signature. An empty
-/// certificate placeholder is encoded with length zero.
+/// Integers and UUID are little endian; both lengths are u32 byte counts.
+/// A zero certificate length means absent.
 fn build_endorsement_data(
     ta_data: &[u8],
     ta_uuid: &TeeUuid,
@@ -356,7 +355,7 @@ fn identity_signing_public_key_from_private_key(
 mod tests {
     use super::*;
 
-    // Opaque test bytes: the shim transports the certificate without parsing it.
+    // Opaque fixture; certificate validation is the verifier's responsibility.
     const TEST_CERT: &[u8] = &[0x30, 0x03, 0x02, 0x01, 0x01];
 
     #[test]
@@ -391,7 +390,7 @@ mod tests {
                     endorsement_data_len(data.len(), cert.len()).unwrap()
                 );
 
-                // Locate the variable fields using only the encoded lengths.
+                // Parsing must not require caller-supplied lengths.
                 let data_len = u32::from_le_bytes(endorsement[8..12].try_into().unwrap()) as usize;
                 let (parsed_data, metadata) = endorsement[12..].split_at(data_len);
                 assert_eq!(parsed_data, data);
@@ -538,7 +537,6 @@ mod tests {
         let signature = Signature::from_slice(&signature).unwrap();
         verifying_key.verify(&endorsement, &signature).unwrap();
 
-        // Tamper with the TA data length, data, digest, certificate length, and certificate bytes.
         let cert_start = endorsement.len() - TEST_CERT.len();
         for offset in [
             8,
