@@ -22,9 +22,16 @@ fn run_hello_world_pe() {
 
     let (broker, runner) = build_windows_broker();
     let mut separate_process = std::process::Command::new(&broker);
-    separate_process.arg("--runner").arg(runner);
+    separate_process
+        .arg("--fs-initial-files")
+        .arg(&tar_path)
+        .arg("--runner")
+        .arg(runner);
     let mut in_process = std::process::Command::new(broker);
-    in_process.args(["--unstable", "--in-process-runner"]);
+    in_process
+        .arg("--fs-initial-files")
+        .arg(&tar_path)
+        .args(["--unstable", "--in-process-runner"]);
 
     for (mode, mut command) in [
         ("separate-process", separate_process),
@@ -32,11 +39,7 @@ fn run_hello_world_pe() {
     ] {
         // Verbose log for failure triage; not load-bearing for any assertion.
         command.env("LITEBOX_LOG", "debug");
-        command.args([
-            "--initial-files",
-            tar_path.to_str().unwrap(),
-            "/kernel32_import.exe",
-        ]);
+        command.arg("/kernel32_import.exe");
         println!("Running {mode} `{command:?}`");
         let output = command
             .output()
@@ -80,13 +83,9 @@ fn run_multithreaded_pe() {
         std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kernel32_multithread.tar");
     create_tar_with_dir(&test_dir, &tar_path);
 
-    let mut command = brokered_windows_runner_command();
+    let mut command = brokered_windows_runner_command(&tar_path);
     command.env("LITEBOX_LOG", "debug");
-    command.args([
-        "--initial-files",
-        tar_path.to_str().unwrap(),
-        "/kernel32_multithread.exe",
-    ]);
+    command.arg("/kernel32_multithread.exe");
     println!("Running `{command:?}`");
     let output = command
         .output()
@@ -131,13 +130,9 @@ fn run_crt_locale_pe() {
     let tar_path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("crt_locale.tar");
     create_tar_with_dir(&test_dir, &tar_path);
 
-    let mut command = brokered_windows_runner_command();
+    let mut command = brokered_windows_runner_command(&tar_path);
     command.env("LITEBOX_LOG", "debug");
-    command.args([
-        "--initial-files",
-        tar_path.to_str().unwrap(),
-        "/crt_locale.exe",
-    ]);
+    command.arg("/crt_locale.exe");
     println!("Running `{command:?}`");
     let output = command
         .output()
@@ -185,10 +180,14 @@ fn build_windows_broker() -> (std::path::PathBuf, std::path::PathBuf) {
     (broker, runner)
 }
 
-fn brokered_windows_runner_command() -> std::process::Command {
+fn brokered_windows_runner_command(initial_files: &std::path::Path) -> std::process::Command {
     let (broker, runner) = build_windows_broker();
     let mut command = std::process::Command::new(broker);
-    command.arg("--runner").arg(runner);
+    command
+        .arg("--fs-initial-files")
+        .arg(initial_files)
+        .arg("--runner")
+        .arg(runner);
     command
 }
 
