@@ -155,6 +155,7 @@ pub struct OpteeShimBuilder<Platform: OpteeShimPlatform> {
     platform: &'static Platform,
     session_manager: &'static session::SessionManager<Platform>,
     litebox: LiteBox<Platform>,
+    ta_signing_cert: &'static [u8],
 }
 
 impl<Platform: OpteeShimPlatform> OpteeShimBuilder<Platform> {
@@ -169,7 +170,18 @@ impl<Platform: OpteeShimPlatform> OpteeShimBuilder<Platform> {
             platform,
             session_manager,
             litebox: LiteBox::new(platform),
+            ta_signing_cert: &[],
         }
+    }
+
+    /// Set the embedded DER leaf certificate used by verifiers to verify TA signatures.
+    ///
+    /// The certificate is shared by reference and included verbatim in IDK_S endorsements.
+    /// It defaults to an empty placeholder when no certificate is embedded.
+    #[must_use]
+    pub fn with_ta_signing_cert(mut self, ta_signing_cert: &'static [u8]) -> Self {
+        self.ta_signing_cert = ta_signing_cert;
+        self
     }
 
     /// Returns the litebox object for the shim.
@@ -186,6 +198,7 @@ impl<Platform: OpteeShimPlatform> OpteeShimBuilder<Platform> {
             pm: PageManager::new(&self.litebox),
             _litebox: self.litebox,
             ta_uuid_map: ta_uuid_map(),
+            ta_signing_cert: self.ta_signing_cert,
             pta_busy: spin::mutex::SpinMutex::new(HashSet::new()),
         });
         OpteeShim(global)
@@ -208,6 +221,8 @@ struct GlobalState<Platform: OpteeShimPlatform> {
     _litebox: litebox::LiteBox<Platform>,
     /// The TA UUID to binary map for TA loading.
     ta_uuid_map: &'static TaUuidMap,
+    /// Embedded DER TA signing leaf certificate, shared without copying.
+    ta_signing_cert: &'static [u8],
     /// Tracks which non-concurrent PTAs (i.e., PTAs w/o `TaFlags::CONCURRENT`)
     /// are currently busy. A busy PTA is *rejected* with `TeeResult::Busy`
     /// rather than queued.

@@ -241,7 +241,9 @@ pub fn init(is_bsp: bool) -> &'static Platform {
         .get()
         .expect("init must publish the platform before any core uses it");
     if is_bsp {
-        let shim = litebox_shim_optee::OpteeShimBuilder::new(platform, session_manager()).build();
+        let shim = litebox_shim_optee::OpteeShimBuilder::new(platform, session_manager())
+            .with_ta_signing_cert(TA_SIGNING_CERT_DER)
+            .build();
         register_embedded_tas(&shim);
     }
     platform
@@ -823,7 +825,9 @@ fn open_session_new_instance(
     client_identity: Option<litebox_common_optee::TeeIdentity>,
     ta_req_info: &litebox_shim_optee::msg_handler::TaRequestInfo<PAGE_SIZE>,
 ) -> Result<(), OpteeSmcReturnCode> {
-    let shim = litebox_shim_optee::OpteeShimBuilder::new(platform, session_manager()).build();
+    let shim = litebox_shim_optee::OpteeShimBuilder::new(platform, session_manager())
+        .with_ta_signing_cert(TA_SIGNING_CERT_DER)
+        .build();
     if shim.get_ta_bin(&ta_uuid).is_none() {
         msg_args.session = 0;
         msg_args.ret = TeeResult::ItemNotFound;
@@ -1412,6 +1416,8 @@ fn write_rpc_args_to_normal_world(
 // use include_bytes! to include ldelf
 const LDELF_BINARY: &[u8] = &[0u8; 0];
 const TA_BINARY: &[u8] = &[0u8; 0];
+// This is the TA signing leaf certificate, not an IDK_S certificate.
+const TA_SIGNING_CERT_DER: &[u8] = &[0u8; 0];
 const TA_BINARIES: &[&[u8]] = &[TA_BINARY];
 
 /// Register a TA binary embedded in the runner image.
