@@ -8,7 +8,7 @@ use std::cell::Cell;
 use std::ops::Range;
 use std::sync::{
     Arc, Mutex, OnceLock,
-    atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicUsize, Ordering},
 };
 use std::time::Duration;
 
@@ -416,30 +416,11 @@ impl litebox::platform::SignalProvider for MacosUserland {
     type Signal = litebox_common_linux::signal::Signal;
 
     fn take_pending_signals(&self, mut f: impl FnMut(Self::Signal)) {
-        let bits: u32;
-        // Atomic against record_pending_host_signal in this thread's signal handler.
-        // SAFETY: the TLS layout is validated during initialization and this is a
-        // naturally aligned u32 in the calling thread's TSD block.
-        unsafe {
-            core::arch::asm!(
-                "mrs {block}, tpidrro_el0",
-                "and {block}, {block}, #-8",
-                "add {addr}, {block}, {tls_key_offset}",
-                "ldr {addr}, [{addr}]", // LiteBox TlsBlock pointer
-                "add {addr}, {addr}, #{pending_off}",
-                "2:",
-                "ldaxr {bits:w}, [{addr}]",
-                "stlxr {status:w}, wzr, [{addr}]",
-                "cbnz {status:w}, 2b",
-                block = out(reg) _,
-                addr = out(reg) _,
-                bits = out(reg) bits,
-                status = out(reg) _,
-                tls_key_offset = in(reg) TLS_KEY_OFFSET.load(Ordering::Relaxed),
-                pending_off = const tls_offset::PENDING_HOST_SIGNALS,
-                options(nostack),
-            );
-        }
+        // Ordinary host threads have no platform TLS and are not guest signal
+        // targets. Do not create/register guest state just to poll for signals.
+        // Atomic RMW prevents losing an interrupting handler's update. Relaxed
+        // suffices: these bits are thread-owned and do not publish other data.
+        let bits = with_signal_state(|pending, _| pending.swap(0, Ordering::Relaxed)).unwrap_or(0);
         for signal in litebox_common_linux::signal::SigSet::from_u64(u64::from(bits)) {
             f(signal);
         }
@@ -895,8 +876,8 @@ struct TlsBlock {
     in_guest: usize,
     vector_state: usize,
     host_fp_state: usize,
-    pending_host_signals: usize,
-    wait_waker_addr: usize,
+    pending_host_signals: AtomicU32,
+    wait_waker_addr: AtomicPtr<core::task::Waker>,
 }
 
 mod tls_offset {
@@ -1024,6 +1005,27 @@ fn tls_address(offset: usize) -> *mut usize {
     (block + offset) as *mut usize
 }
 
+/// Access only the atomic signal fields, without borrowing the rest of the
+/// block (which transition code mutates). The callback bounds the references to
+/// this access rather than claiming that thread-owned storage lives forever.
+fn with_signal_state<R>(
+    f: impl FnOnce(&AtomicU32, &AtomicPtr<core::task::Waker>) -> R,
+) -> Option<R> {
+    let block = tls_block_address();
+    if block == 0 {
+        return None;
+    }
+    // SAFETY: the validated pthread slot owns a live TlsBlock for this thread.
+    // These fields are correctly aligned atomics, and the callback's references
+    // cannot escape. Signal handlers access these fields only atomically too.
+    unsafe {
+        Some(f(
+            &*((block + tls_offset::PENDING_HOST_SIGNALS) as *const AtomicU32),
+            &*((block + tls_offset::WAIT_WAKER_ADDR) as *const AtomicPtr<core::task::Waker>),
+        ))
+    }
+}
+
 fn read_tls(offset: usize) -> usize {
     let block = tls_block_address();
     if block == 0 {
@@ -1055,8 +1057,8 @@ fn initialize_thread_tls() {
         in_guest: 0,
         vector_state: vector,
         host_fp_state: 0,
-        pending_host_signals: 0,
-        wait_waker_addr: 0,
+        pending_host_signals: AtomicU32::new(0),
+        wait_waker_addr: AtomicPtr::new(core::ptr::null_mut()),
     });
     let block = Box::into_raw(block);
     // SAFETY: block matches the key destructor's contract.
@@ -1248,8 +1250,11 @@ impl litebox::platform::ThreadProvider for MacosUserland {
     fn run_test_thread<R>(f: impl FnOnce() -> R) -> R {
         initialize_thread_tls();
         assert_eq!(read_tls(tls_offset::CURRENT_THREAD), 0);
-        assert_eq!(read_tls(tls_offset::WAIT_WAKER_ADDR), 0);
-        write_tls(tls_offset::PENDING_HOST_SIGNALS, 0);
+        with_signal_state(|pending, waker| {
+            assert!(waker.load(Ordering::Relaxed).is_null());
+            pending.store(0, Ordering::Relaxed);
+        })
+        .expect("initialized thread TLS");
         let handle = ThreadHandle(Arc::new(ThreadState {
             // SAFETY: pthread_self has no preconditions.
             identity: Mutex::new(Some(unsafe { libc::pthread_self() } as usize)),
@@ -1276,37 +1281,20 @@ impl WaitWakerProvider for MacosUserland {
                 .unwrap()
                 .clone_from(&waker);
         }
-        let mut old = waker.map_or(core::ptr::null_mut(), |waker| {
-            Box::into_raw(Box::new(waker))
-        });
-        // Atomic against record_pending_host_signal in this thread's signal handler.
-        // SAFETY: the TLS layout is validated during initialization and the slot is
-        // naturally aligned. Every non-null value was allocated just above.
-        unsafe {
-            let new = old;
-            core::arch::asm!(
-                "mrs {block}, tpidrro_el0",
-                "and {block}, {block}, #-8",
-                "add {addr}, {block}, {tls_key_offset}",
-                "ldr {addr}, [{addr}]", // LiteBox TlsBlock pointer
-                "add {addr}, {addr}, #{waker_off}",
-                "2:",
-                "ldaxr {old}, [{addr}]",
-                "stlxr {status:w}, {new}, [{addr}]",
-                "cbnz {status:w}, 2b",
-                block = out(reg) _,
-                addr = out(reg) _,
-                old = out(reg) old,
-                new = in(reg) new,
-                status = out(reg) _,
-                tls_key_offset = in(reg) TLS_KEY_OFFSET.load(Ordering::Relaxed),
-                waker_off = const tls_offset::WAIT_WAKER_ADDR,
-                options(nostack),
-            );
+        // Plain host threads can use waits too, but have no signal TLS to
+        // publish into. Their ordinary event wakers still work independently.
+        with_signal_state(|_, slot| {
+            let new = waker.map_or(core::ptr::null_mut(), |waker| {
+                Box::into_raw(Box::new(waker))
+            });
+            // The handler runs on this same thread, so after the swap it cannot
+            // still be using the old pointer when execution resumes here.
+            let old = slot.swap(new, Ordering::AcqRel);
             if !old.is_null() {
-                drop(Box::from_raw(old));
+                // SAFETY: every non-null value was produced by Box::into_raw above.
+                unsafe { drop(Box::from_raw(old)) };
             }
-        }
+        });
     }
 }
 
@@ -1320,43 +1308,18 @@ unsafe fn record_pending_host_signal(signal: litebox_common_linux::signal::Signa
     // SAFETY: errno points to a live c_int for this thread.
     let saved_errno = unsafe { errno.read() };
     let mask = 1u32 << (signal.as_i32() - 1);
-    let waker_addr: usize;
-    // SAFETY: both fields are naturally aligned in this thread's validated TSD
-    // block. The exclusive sequence makes this atomic against the host-side
-    // exchanges in take_pending_signals and update_waker.
-    unsafe {
-        core::arch::asm!(
-            "mrs {block}, tpidrro_el0",
-            "and {block}, {block}, #-8",
-            "add {block}, {block}, {tls_key_offset}",
-            "ldr {block}, [{block}]", // LiteBox TlsBlock pointer
-            "add {addr}, {block}, #{pending_off}",
-            "2:",
-            "ldaxr {old:w}, [{addr}]",
-            "orr {new:w}, {old:w}, {mask:w}",
-            "stlxr {status:w}, {new:w}, [{addr}]",
-            "cbnz {status:w}, 2b",
-            "add {addr}, {block}, #{waker_off}",
-            "ldar {waker}, [{addr}]",
-            block = out(reg) _,
-            addr = out(reg) _,
-            old = out(reg) _,
-            new = out(reg) _,
-            status = out(reg) _,
-            waker = out(reg) waker_addr,
-            mask = in(reg) mask,
-            tls_key_offset = in(reg) TLS_KEY_OFFSET.load(Ordering::Relaxed),
-            pending_off = const tls_offset::PENDING_HOST_SIGNALS,
-            waker_off = const tls_offset::WAIT_WAKER_ADDR,
-            options(nostack),
-        );
-        if waker_addr != 0 {
-            // The interrupted thread cannot replace or free its published waker
-            // until this handler returns.
-            (&*(waker_addr as *const core::task::Waker)).wake_by_ref();
+    with_signal_state(|pending, slot| {
+        pending.fetch_or(mask, Ordering::Relaxed);
+        let waker = slot.load(Ordering::Acquire);
+        if !waker.is_null() {
+            // SAFETY: the handler interrupted this same thread, which cannot
+            // replace or free its published waker until the handler returns.
+            unsafe { (&*waker).wake_by_ref() };
         }
-        errno.write(saved_errno);
-    }
+    })
+    .expect("signal handler requires initialized thread TLS");
+    // SAFETY: errno points to a live c_int for this thread.
+    unsafe { errno.write(saved_errno) };
 }
 pub(crate) fn get_guest_vector_state() -> GuestVectorState {
     let state = read_tls(tls_offset::VECTOR_STATE) as *const GuestVectorState;
@@ -1726,8 +1689,11 @@ fn run_thread_inner(shim: &dyn EnterShim<ExecutionContext = PtRegs>, ctx: &mut P
         read_tls(tls_offset::ACTIVE) == 0,
         "nested guest entry is not supported"
     );
-    assert_eq!(read_tls(tls_offset::WAIT_WAKER_ADDR), 0);
-    write_tls(tls_offset::PENDING_HOST_SIGNALS, 0);
+    with_signal_state(|pending, waker| {
+        assert!(waker.load(Ordering::Relaxed).is_null());
+        pending.store(0, Ordering::Relaxed);
+    })
+    .expect("initialized thread TLS");
     set_guest_thread_pointer(0);
     set_guest_x18(0);
     let thread = ThreadHandle(Arc::new(ThreadState {
@@ -2553,6 +2519,117 @@ mod tests {
     }
 
     #[test]
+    fn host_thread_without_tls_can_poll_signals() {
+        let platform = MacosUserland::new();
+        std::thread::spawn(move || {
+            assert_eq!(tls_block_address(), 0);
+            platform.take_pending_signals(|_| panic!("host thread has no guest signals"));
+            assert_eq!(
+                tls_block_address(),
+                0,
+                "polling must not register the thread"
+            );
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn host_thread_without_tls_can_update_waker() {
+        let platform = MacosUserland::new();
+        std::thread::spawn(move || {
+            assert_eq!(tls_block_address(), 0);
+            // Retaining the waker here would leak it: this thread has no signal
+            // TLS, and the signal handler must use the host disposition instead.
+            let weak = {
+                let counter = Arc::new(SignalWakeCounter::default());
+                let weak = Arc::downgrade(&counter);
+                platform.update_waker(Some(core::task::Waker::from(counter)));
+                weak
+            };
+            assert!(weak.upgrade().is_none());
+            platform.update_waker(None);
+            assert_eq!(
+                tls_block_address(),
+                0,
+                "waiting must not register the thread"
+            );
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn host_thread_without_tls_still_receives_event_wakeups() {
+        let platform = MacosUserland::new();
+        let ready = Arc::new(AtomicBool::new(false));
+        let worker_ready = ready.clone();
+        let (send, receive) = std::sync::mpsc::sync_channel(0);
+        let worker = std::thread::spawn(move || {
+            assert_eq!(tls_block_address(), 0);
+            let wait = litebox::event::wait::WaitState::new(platform);
+            let mut notify = Some(send);
+            let result = wait
+                .context()
+                .with_timeout(Duration::from_secs(5))
+                .wait_until(|| {
+                    if let Some(send) = notify.take() {
+                        send.send(wait.context().waker().clone()).unwrap();
+                    }
+                    worker_ready.load(Ordering::Acquire)
+                });
+            result.expect("ordinary event wake must work without platform TLS");
+            assert_eq!(tls_block_address(), 0);
+        });
+        let waker = receive.recv_timeout(Duration::from_secs(5)).unwrap();
+        ready.store(true, Ordering::Release);
+        waker.wake();
+        worker.join().unwrap();
+    }
+
+    #[derive(Default)]
+    struct SignalWakeCounter(AtomicUsize);
+
+    impl std::task::Wake for SignalWakeCounter {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            // Deliberately no locks or allocation: this runs in a signal handler.
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn signal_waker_replacement_and_clear_release_ownership() {
+        let platform = MacosUserland::new();
+        MacosUserland::run_test_thread(|| {
+            let first = Arc::new(SignalWakeCounter::default());
+            let second = Arc::new(SignalWakeCounter::default());
+            let first_weak = Arc::downgrade(&first);
+            let second_weak = Arc::downgrade(&second);
+            platform.update_waker(Some(core::task::Waker::from(first.clone())));
+            // SAFETY: run_test_thread initialized TLS and no concurrent handler
+            // runs during this direct invocation on the same thread.
+            unsafe { record_pending_host_signal(litebox_common_linux::signal::Signal::SIGINT) };
+            assert_eq!(first.0.load(Ordering::Relaxed), 1);
+            platform.update_waker(Some(core::task::Waker::from(second.clone())));
+            unsafe { record_pending_host_signal(litebox_common_linux::signal::Signal::SIGINT) };
+            assert_eq!(first.0.load(Ordering::Relaxed), 1);
+            assert_eq!(second.0.load(Ordering::Relaxed), 1);
+            drop(first);
+            assert!(first_weak.upgrade().is_none(), "replaced waker leaked");
+            platform.update_waker(None);
+            unsafe { record_pending_host_signal(litebox_common_linux::signal::Signal::SIGINT) };
+            assert_eq!(second.0.load(Ordering::Relaxed), 1);
+            drop(second);
+            assert!(second_weak.upgrade().is_none(), "cleared waker leaked");
+            platform.take_pending_signals(|_| {});
+        });
+    }
+
+    #[test]
     fn pending_host_signals_are_coalesced_and_drained() {
         let platform = MacosUserland::new();
         MacosUserland::run_test_thread(|| {
@@ -2680,6 +2757,86 @@ mod tests {
             );
         }
         assert!(interrupted.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn asynchronous_signals_race_with_waker_replacement_and_drain() {
+        struct SignalRace(&'static MacosUserland);
+
+        impl EnterShim for SignalRace {
+            type ExecutionContext = PtRegs;
+
+            fn init(&self, _: &mut PtRegs) -> ContinueOperation {
+                const ITERATIONS: usize = 2_000;
+                let target = unsafe { libc::pthread_self() } as usize;
+                let requested = Arc::new(AtomicUsize::new(0));
+                let completed = Arc::new(AtomicUsize::new(0));
+                let request = requested.clone();
+                let complete = completed.clone();
+                let sender = std::thread::spawn(move || {
+                    for i in 1..=ITERATIONS {
+                        while request.load(Ordering::Acquire) < i {
+                            std::thread::yield_now();
+                        }
+                        // Deliver on a different thread while the target swaps
+                        // wakers and drains signals. pthread_t stays live until join.
+                        assert_eq!(
+                            unsafe { libc::pthread_kill(target as libc::pthread_t, libc::SIGINT) },
+                            0
+                        );
+                        complete.store(i, Ordering::Release);
+                    }
+                });
+                let counter = Arc::new(SignalWakeCounter::default());
+                let mut observed = 0;
+                for i in 1..=ITERATIONS {
+                    self.0
+                        .update_waker(Some(core::task::Waker::from(counter.clone())));
+                    requested.store(i, Ordering::Release);
+                    // Do not request the next signal until this one has been
+                    // observed: coalescing cannot hide a lost update here.
+                    while completed.load(Ordering::Acquire) < i || observed < i {
+                        self.0.update_waker(None);
+                        self.0.take_pending_signals(|signal| {
+                            assert_eq!(signal, litebox_common_linux::signal::Signal::SIGINT);
+                            observed += 1;
+                        });
+                        self.0
+                            .update_waker(Some(core::task::Waker::from(counter.clone())));
+                        std::thread::yield_now();
+                    }
+                }
+                sender.join().unwrap();
+                assert_eq!(observed, ITERATIONS, "a pending signal was lost");
+                // Also exercise a guaranteed non-null slot and then a cleared slot.
+                assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
+                self.0.take_pending_signals(|_| {});
+                assert!(counter.0.load(Ordering::Relaxed) > 0);
+                self.0.update_waker(None);
+                assert_eq!(Arc::strong_count(&counter), 1);
+                let wakes = counter.0.load(Ordering::Relaxed);
+                assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
+                assert_eq!(counter.0.load(Ordering::Relaxed), wakes);
+                self.0.take_pending_signals(|_| {});
+                ContinueOperation::Terminate
+            }
+
+            fn syscall(&self, _: &mut PtRegs) -> ContinueOperation {
+                unreachable!()
+            }
+
+            fn exception(&self, _: &mut PtRegs, _: &ExceptionInfo) -> ContinueOperation {
+                unreachable!()
+            }
+
+            fn interrupt(&self, _: &mut PtRegs) -> ContinueOperation {
+                unreachable!()
+            }
+        }
+
+        let platform = MacosUserland::new();
+        // SAFETY: init terminates without entering guest code.
+        unsafe { run_thread(SignalRace(platform), &mut PtRegs::default()) };
     }
 
     #[test]
