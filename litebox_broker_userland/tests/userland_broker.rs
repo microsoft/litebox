@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::{
-    SHARED_BUFFER_POOL_SIZE, SharedBufferDescriptor, SharedBufferSlotIndex,
+    SHARED_BUFFER_POOL_SIZE, SharedBufferSequence, SharedBufferSlotIndex,
 };
 use litebox_broker_protocol::socket::{ReceiveFromFlags, SendFlags, SocketConnectionStatus};
 use litebox_broker_transport::control_ring::ControlRing;
@@ -152,10 +152,11 @@ fn run_fake_runner(args: &[OsString]) {
             local
                 .send_to_socket(
                     handle,
-                    SharedBufferDescriptor {
-                        slot_index: SharedBufferSlotIndex(0),
-                        length: request.len().try_into().unwrap(),
-                    },
+                    SharedBufferSequence::new(
+                        &[SharedBufferSlotIndex(0)],
+                        request.len().try_into().unwrap(),
+                    )
+                    .unwrap(),
                     request,
                     SendFlags::NONE,
                     Some(std::net::SocketAddrV4::new(gateway, udp_port)),
@@ -183,10 +184,11 @@ fn run_fake_runner(args: &[OsString]) {
         let received = local
             .receive_from_socket(
                 handle,
-                SharedBufferDescriptor {
-                    slot_index: SharedBufferSlotIndex(1),
-                    length: reply.len().try_into().unwrap(),
-                },
+                SharedBufferSequence::new(
+                    &[SharedBufferSlotIndex(1)],
+                    reply.len().try_into().unwrap(),
+                )
+                .unwrap(),
                 &mut reply,
                 ReceiveFromFlags::NONE,
             )
@@ -242,10 +244,9 @@ fn run_fake_runner(args: &[OsString]) {
 
     let pipe = local.create_pipe(64, 16).unwrap();
     let data = b"shared pipe data";
-    let write_buffer = SharedBufferDescriptor {
-        slot_index: SharedBufferSlotIndex(0),
-        length: data.len().try_into().unwrap(),
-    };
+    let write_buffer =
+        SharedBufferSequence::new(&[SharedBufferSlotIndex(0)], data.len().try_into().unwrap())
+            .unwrap();
     assert_eq!(
         local
             .write_pipe(pipe.write_handle, write_buffer, data)
@@ -256,10 +257,11 @@ fn run_fake_runner(args: &[OsString]) {
     let read = local
         .read_pipe(
             pipe.read_handle,
-            SharedBufferDescriptor {
-                slot_index: SharedBufferSlotIndex(1),
-                length: received.len().try_into().unwrap(),
-            },
+            SharedBufferSequence::new(
+                &[SharedBufferSlotIndex(1)],
+                received.len().try_into().unwrap(),
+            )
+            .unwrap(),
             &mut received,
         )
         .unwrap();

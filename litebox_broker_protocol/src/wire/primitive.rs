@@ -3,7 +3,9 @@
 
 use alloc::vec::Vec;
 
-use crate::shared_buffer::{SharedBufferDescriptor, SharedBufferSlotIndex};
+use crate::shared_buffer::{
+    MAX_SHARED_BUFFER_SEQUENCE_SLOTS, SharedBufferSequence, SharedBufferSlotIndex,
+};
 use crate::{ObjectHandle, ProtocolVersion, RequestId};
 
 use super::WireError;
@@ -46,9 +48,13 @@ impl Encoder {
         self.u64(request_id.0);
     }
 
-    pub(super) fn shared_buffer_descriptor(&mut self, descriptor: SharedBufferDescriptor) {
-        self.u32(descriptor.slot_index.0);
-        self.u32(descriptor.length);
+    pub(super) fn shared_buffer_sequence(&mut self, sequence: SharedBufferSequence) {
+        self.u8(u8::try_from(sequence.slot_indices().len())
+            .expect("shared-buffer sequence length must fit in u8"));
+        for slot_index in sequence.slot_indices() {
+            self.u32(slot_index.0);
+        }
+        self.u32(sequence.length());
     }
 }
 
@@ -104,11 +110,17 @@ impl<'a> Decoder<'a> {
         Ok(RequestId(self.u64()?))
     }
 
-    pub(super) fn shared_buffer_descriptor(&mut self) -> Result<SharedBufferDescriptor, WireError> {
-        Ok(SharedBufferDescriptor {
-            slot_index: SharedBufferSlotIndex(self.u32()?),
-            length: self.u32()?,
-        })
+    pub(super) fn shared_buffer_sequence(&mut self) -> Result<SharedBufferSequence, WireError> {
+        let slot_count = usize::from(self.u8()?);
+        if slot_count > MAX_SHARED_BUFFER_SEQUENCE_SLOTS {
+            return Err(WireError::InvalidTag);
+        }
+        let mut slot_indices = [SharedBufferSlotIndex::default(); MAX_SHARED_BUFFER_SEQUENCE_SLOTS];
+        for slot_index in &mut slot_indices[..slot_count] {
+            *slot_index = SharedBufferSlotIndex(self.u32()?);
+        }
+        SharedBufferSequence::new(&slot_indices[..slot_count], self.u32()?)
+            .map_err(|_| WireError::InvalidTag)
     }
 
     fn take(&mut self, len: usize) -> Result<&'a [u8], WireError> {

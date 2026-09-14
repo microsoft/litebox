@@ -30,12 +30,12 @@ pub(super) fn encode_stdio_request(encoder: &mut Encoder, request: StdioRequest)
     match request {
         StdioRequest::Read(request) => {
             encoder.u8(REQUEST_TAG_READ);
-            encoder.shared_buffer_descriptor(request.buffer);
+            encoder.shared_buffer_sequence(request.buffer);
         }
         StdioRequest::Write(request) => {
             encoder.u8(REQUEST_TAG_WRITE);
             encode_output_stream(encoder, request.stream);
-            encoder.shared_buffer_descriptor(request.buffer);
+            encoder.shared_buffer_sequence(request.buffer);
         }
         StdioRequest::IsTerminal(request) => {
             encoder.u8(REQUEST_TAG_IS_TERMINAL);
@@ -47,11 +47,11 @@ pub(super) fn encode_stdio_request(encoder: &mut Encoder, request: StdioRequest)
 pub(super) fn decode_stdio_request(decoder: &mut Decoder<'_>) -> Result<StdioRequest, WireError> {
     match decoder.u8()? {
         REQUEST_TAG_READ => Ok(StdioRequest::Read(ReadStdioRequest {
-            buffer: decoder.shared_buffer_descriptor()?,
+            buffer: decoder.shared_buffer_sequence()?,
         })),
         REQUEST_TAG_WRITE => Ok(StdioRequest::Write(WriteStdioRequest {
             stream: decode_output_stream(decoder)?,
-            buffer: decoder.shared_buffer_descriptor()?,
+            buffer: decoder.shared_buffer_sequence()?,
         })),
         REQUEST_TAG_IS_TERMINAL => Ok(StdioRequest::IsTerminal(IsTerminalStdioRequest {
             stream: decode_stream(decoder)?,

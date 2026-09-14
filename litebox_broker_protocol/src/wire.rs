@@ -63,7 +63,7 @@ const RESPONSE_TAG_VERSION_MISMATCH: u8 = 255;
 const NOTIFICATION_TAG_READINESS: u8 = 0;
 
 /// Maximum byte length of any encoded active request or response.
-pub const MAX_ENCODED_ACTIVE_MESSAGE_SIZE: usize = 58;
+pub const MAX_ENCODED_ACTIVE_MESSAGE_SIZE: usize = 67;
 
 /// Maximum byte length of any encoded broker notification.
 pub const MAX_ENCODED_NOTIFICATION_SIZE: usize = 13;
@@ -158,7 +158,7 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
         BrokerOperation::FillRandom(buffer) => {
             encoder.u8(REQUEST_TAG_FILL_RANDOM);
             encoder.request_id(request_id);
-            encoder.shared_buffer_descriptor(buffer);
+            encoder.shared_buffer_sequence(buffer);
         }
         BrokerOperation::Stdio(request) => {
             encoder.u8(REQUEST_TAG_STDIO);
@@ -197,7 +197,7 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         REQUEST_TAG_EVENT => BrokerOperation::Event(event::decode_event_request(&mut decoder)?),
         REQUEST_TAG_PIPE => BrokerOperation::Pipe(pipe::decode_pipe_request(&mut decoder)?),
         REQUEST_TAG_SOCKET => BrokerOperation::Socket(socket::decode_socket_request(&mut decoder)?),
-        REQUEST_TAG_FILL_RANDOM => BrokerOperation::FillRandom(decoder.shared_buffer_descriptor()?),
+        REQUEST_TAG_FILL_RANDOM => BrokerOperation::FillRandom(decoder.shared_buffer_sequence()?),
         REQUEST_TAG_STDIO => BrokerOperation::Stdio(stdio::decode_stdio_request(&mut decoder)?),
         REQUEST_TAG_FILE => BrokerOperation::File(fs::decode_fs_request(&mut decoder)?),
         _ => unreachable!("active request tag was validated"),
@@ -447,7 +447,7 @@ mod tests {
         CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
         WritePipeResponse,
     };
-    use crate::shared_buffer::{SharedBufferDescriptor, SharedBufferSlotIndex};
+    use crate::shared_buffer::{SharedBufferSequence, SharedBufferSlotIndex};
     use crate::socket::{
         AcceptSocketRequest, AcceptSocketResponse, AddressFamily, BindSocketRequest,
         BindSocketResponse, ConnectSocketRequest, ConnectSocketResponse, CreateSocketRequest,
@@ -468,6 +468,10 @@ mod tests {
     use core::num::NonZeroU64;
 
     const TEST_REQUEST_ID: RequestId = RequestId(0x0102_0304_0506_0708);
+
+    fn sequence(slot_index: u32, length: u32) -> SharedBufferSequence {
+        SharedBufferSequence::new(&[SharedBufferSlotIndex(slot_index)], length).unwrap()
+    }
 
     const fn socket_status(status: SocketConnectionStatus) -> SocketStatusResponse {
         SocketStatusResponse {
@@ -530,6 +534,22 @@ mod tests {
     #[test]
     fn request_codec_round_trips_all_variants() {
         let handle = ObjectHandle(13);
+        // The wire bound covers encodable requests before operation-specific
+        // transfer limits are validated.
+        let largest_sequence = SharedBufferSequence::new(
+            &[
+                SharedBufferSlotIndex(2),
+                SharedBufferSlotIndex(5),
+                SharedBufferSlotIndex(7),
+                SharedBufferSlotIndex(9),
+                SharedBufferSlotIndex(10),
+                SharedBufferSlotIndex(11),
+                SharedBufferSlotIndex(13),
+                SharedBufferSlotIndex(15),
+            ],
+            512 * 1024,
+        )
+        .unwrap();
         let operations = [
             BrokerOperation::CloseObject(handle),
             BrokerOperation::CheckReadiness(handle),
@@ -554,41 +574,23 @@ mod tests {
             })),
             BrokerOperation::Pipe(PipeRequest::Read(ReadPipeRequest {
                 handle,
-                buffer: SharedBufferDescriptor {
-                    slot_index: SharedBufferSlotIndex(2),
-                    length: 32,
-                },
+                buffer: sequence(2, 32),
             })),
             BrokerOperation::Pipe(PipeRequest::Write(WritePipeRequest {
                 handle,
-                buffer: SharedBufferDescriptor {
-                    slot_index: SharedBufferSlotIndex(15),
-                    length: 3,
-                },
+                buffer: sequence(15, 3),
             })),
-            BrokerOperation::FillRandom(SharedBufferDescriptor {
-                slot_index: SharedBufferSlotIndex(7),
-                length: 256,
-            }),
+            BrokerOperation::FillRandom(sequence(7, 256)),
             BrokerOperation::Stdio(StdioRequest::Read(ReadStdioRequest {
-                buffer: SharedBufferDescriptor {
-                    slot_index: SharedBufferSlotIndex(4),
-                    length: 31,
-                },
+                buffer: sequence(4, 31),
             })),
             BrokerOperation::Stdio(StdioRequest::Write(WriteStdioRequest {
                 stream: StdioOutputStream::Stdout,
-                buffer: SharedBufferDescriptor {
-                    slot_index: SharedBufferSlotIndex(6),
-                    length: 17,
-                },
+                buffer: sequence(6, 17),
             })),
             BrokerOperation::Stdio(StdioRequest::Write(WriteStdioRequest {
                 stream: StdioOutputStream::Stderr,
-                buffer: SharedBufferDescriptor {
-                    slot_index: SharedBufferSlotIndex(5),
-                    length: 23,
-                },
+                buffer: sequence(5, 23),
             })),
             BrokerOperation::Stdio(StdioRequest::IsTerminal(IsTerminalStdioRequest {
                 stream: StdioStream::Stdin,
@@ -600,10 +602,7 @@ mod tests {
                 stream: StdioStream::Stderr,
             })),
             BrokerOperation::File(FileRequest::Open(OpenFileRequest {
-                path: SharedBufferDescriptor {
-                    slot_index: SharedBufferSlotIndex(1),
-                    length: 7,
-                },
+                path: sequence(1, 7),
                 user: FileUser { user: 2, group: 3 },
                 access: FileAccessMode::ReadWrite,
                 flags: FileOpenFlags::CREATE | FileOpenFlags::EXCLUSIVE | FileOpenFlags::NO_FOLLOW,
@@ -611,26 +610,17 @@ mod tests {
             })),
             BrokerOperation::File(FileRequest::Read(ReadFileRequest {
                 handle,
-                buffer: SharedBufferDescriptor {
-                    slot_index: SharedBufferSlotIndex(2),
-                    length: 32,
-                },
-                offset: None,
+                buffer: largest_sequence,
+                offset: Some(u64::MAX),
             })),
             BrokerOperation::File(FileRequest::Read(ReadFileRequest {
                 handle,
-                buffer: SharedBufferDescriptor {
-                    slot_index: SharedBufferSlotIndex(2),
-                    length: 32,
-                },
-                offset: Some(u64::MAX),
+                buffer: SharedBufferSequence::new(&[SharedBufferSlotIndex(2)], 32).unwrap(),
+                offset: None,
             })),
             BrokerOperation::File(FileRequest::Write(WriteFileRequest {
                 handle,
-                buffer: SharedBufferDescriptor {
-                    slot_index: SharedBufferSlotIndex(3),
-                    length: 17,
-                },
+                buffer: SharedBufferSequence::new(&[SharedBufferSlotIndex(3)], 17).unwrap(),
                 offset: Some(11),
             })),
             BrokerOperation::File(FileRequest::Seek(SeekFileRequest {
@@ -645,59 +635,38 @@ mod tests {
             })),
             BrokerOperation::File(FileRequest::ReadDirectory(ReadDirectoryRequest {
                 handle,
-                buffer: SharedBufferDescriptor {
-                    slot_index: SharedBufferSlotIndex(4),
-                    length: 256,
-                },
+                buffer: sequence(4, 256),
                 start_index: 19,
             })),
             BrokerOperation::File(FileRequest::PathStatus(PathFileStatusRequest {
-                path: SharedBufferDescriptor {
-                    slot_index: SharedBufferSlotIndex(5),
-                    length: 9,
-                },
+                path: sequence(5, 9),
                 user: FileUser { user: 2, group: 3 },
             })),
             BrokerOperation::File(FileRequest::HandleStatus(HandleFileStatusRequest {
                 handle,
             })),
             BrokerOperation::File(FileRequest::Chmod(ChmodFileRequest {
-                path: SharedBufferDescriptor {
-                    slot_index: SharedBufferSlotIndex(6),
-                    length: 9,
-                },
+                path: sequence(6, 9),
                 user: FileUser { user: 2, group: 3 },
                 mode: FileMode::from_bits(0o755).unwrap(),
             })),
             BrokerOperation::File(FileRequest::Chown(ChownFileRequest {
-                path: SharedBufferDescriptor {
-                    slot_index: SharedBufferSlotIndex(7),
-                    length: 9,
-                },
+                path: sequence(7, 9),
                 acting_user: FileUser { user: 0, group: 0 },
                 user: Some(2),
                 group: None,
             })),
             BrokerOperation::File(FileRequest::Unlink(UnlinkFileRequest {
-                path: SharedBufferDescriptor {
-                    slot_index: SharedBufferSlotIndex(8),
-                    length: 9,
-                },
+                path: sequence(8, 9),
                 user: FileUser { user: 2, group: 3 },
             })),
             BrokerOperation::File(FileRequest::Mkdir(MkdirFileRequest {
-                path: SharedBufferDescriptor {
-                    slot_index: SharedBufferSlotIndex(9),
-                    length: 9,
-                },
+                path: sequence(9, 9),
                 user: FileUser { user: 2, group: 3 },
                 mode: FileMode::from_bits(0o750).unwrap(),
             })),
             BrokerOperation::File(FileRequest::Rmdir(RmdirFileRequest {
-                path: SharedBufferDescriptor {
-                    slot_index: SharedBufferSlotIndex(10),
-                    length: 9,
-                },
+                path: sequence(10, 9),
                 user: FileUser { user: 2, group: 3 },
             })),
             BrokerOperation::Socket(SocketRequest::Create(CreateSocketRequest {
@@ -725,46 +694,44 @@ mod tests {
             })),
             BrokerOperation::Socket(SocketRequest::Send(SendSocketRequest {
                 handle,
-                buffer: SharedBufferDescriptor {
-                    slot_index: SharedBufferSlotIndex(15),
-                    length: 3,
-                },
+                buffer: sequence(15, 3),
                 flags: SendFlags::NONE,
             })),
             BrokerOperation::Socket(SocketRequest::SendTo(SendToSocketRequest {
                 handle,
-                buffer: SharedBufferDescriptor {
-                    slot_index: SharedBufferSlotIndex(15),
-                    length: 3,
-                },
+                buffer: sequence(15, 3),
                 flags: SendFlags::NONE,
                 destination: Some(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 53)),
             })),
             BrokerOperation::Socket(SocketRequest::SendTo(SendToSocketRequest {
                 handle,
-                buffer: SharedBufferDescriptor {
-                    slot_index: SharedBufferSlotIndex(15),
-                    length: 0,
-                },
+                buffer: largest_sequence,
+                flags: SendFlags::NONE,
+                destination: Some(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 53)),
+            })),
+            BrokerOperation::Socket(SocketRequest::SendTo(SendToSocketRequest {
+                handle,
+                buffer: sequence(15, 0),
                 flags: SendFlags::NONE,
                 destination: None,
             })),
             BrokerOperation::Socket(SocketRequest::Receive(ReceiveSocketRequest {
                 handle,
-                buffer: SharedBufferDescriptor {
-                    slot_index: SharedBufferSlotIndex(15),
-                    length: 3,
-                },
+                buffer: sequence(15, 3),
                 flags: ReceiveFlags::PEEK,
                 peek_offset: 2,
                 peek_length: 5,
             })),
+            BrokerOperation::Socket(SocketRequest::Receive(ReceiveSocketRequest {
+                handle,
+                buffer: largest_sequence,
+                flags: ReceiveFlags::PEEK,
+                peek_offset: u32::MAX,
+                peek_length: u32::MAX,
+            })),
             BrokerOperation::Socket(SocketRequest::ReceiveFrom(ReceiveFromSocketRequest {
                 handle,
-                buffer: SharedBufferDescriptor {
-                    slot_index: SharedBufferSlotIndex(15),
-                    length: 3,
-                },
+                buffer: sequence(15, 3),
                 flags: ReceiveFromFlags::PEEK,
             })),
             BrokerOperation::Socket(SocketRequest::Shutdown(ShutdownSocketRequest {
@@ -824,7 +791,7 @@ mod tests {
                 Err(WireError::WrongMessagePhase)
             );
         }
-        assert!(maximum_encoded_size <= MAX_ENCODED_ACTIVE_MESSAGE_SIZE);
+        assert_eq!(maximum_encoded_size, MAX_ENCODED_ACTIVE_MESSAGE_SIZE);
     }
 
     #[test]
@@ -833,10 +800,7 @@ mod tests {
         // bits; masking them here would hide them from that check, and a
         // dropped field would make an unsupported flag look like none at all.
         let handle = ObjectHandle(13);
-        let buffer = SharedBufferDescriptor {
-            slot_index: SharedBufferSlotIndex(15),
-            length: 3,
-        };
+        let buffer = sequence(15, 3);
         let unsupported = 0x8000_0001;
         for operation in [
             BrokerOperation::Socket(SocketRequest::Send(SendSocketRequest {
@@ -1144,7 +1108,7 @@ mod tests {
                 Err(WireError::WrongMessagePhase)
             );
         }
-        assert_eq!(maximum_encoded_size, MAX_ENCODED_ACTIVE_MESSAGE_SIZE);
+        assert_eq!(maximum_encoded_size, 58);
     }
 
     #[test]
@@ -1255,10 +1219,7 @@ mod tests {
         let open = BrokerRequest {
             request_id: TEST_REQUEST_ID,
             operation: BrokerOperation::File(FileRequest::Open(OpenFileRequest {
-                path: SharedBufferDescriptor {
-                    slot_index: SharedBufferSlotIndex(1),
-                    length: 9,
-                },
+                path: sequence(1, 9),
                 user: FileUser { user: 2, group: 3 },
                 access: FileAccessMode::ReadOnly,
                 flags: FileOpenFlags::CREATE,
@@ -1276,16 +1237,16 @@ mod tests {
 
         let open = encode_request(open);
         let mut unknown_access = open.clone();
-        unknown_access[22] = 0xff;
+        unknown_access[23] = 0xff;
         assert_eq!(decode_request(&unknown_access), Err(WireError::InvalidTag));
         let mut unsupported_flags = open.clone();
-        unsupported_flags[23..25].copy_from_slice(&(1u16 << 15).to_le_bytes());
+        unsupported_flags[24..26].copy_from_slice(&(1u16 << 15).to_le_bytes());
         assert_eq!(
             decode_request(&unsupported_flags),
             Err(WireError::InvalidTag)
         );
         let mut unsupported_mode = open.clone();
-        unsupported_mode[25..27].copy_from_slice(&0o10000u16.to_le_bytes());
+        unsupported_mode[26..28].copy_from_slice(&0o10000u16.to_le_bytes());
         assert_eq!(
             decode_request(&unsupported_mode),
             Err(WireError::InvalidTag)
@@ -1318,10 +1279,7 @@ mod tests {
         let chown = BrokerRequest {
             request_id: TEST_REQUEST_ID,
             operation: BrokerOperation::File(FileRequest::Chown(ChownFileRequest {
-                path: SharedBufferDescriptor {
-                    slot_index: SharedBufferSlotIndex(1),
-                    length: 9,
-                },
+                path: sequence(1, 9),
                 acting_user: FileUser { user: 0, group: 0 },
                 user: Some(2),
                 group: None,
@@ -1484,10 +1442,7 @@ mod tests {
             request_id: TEST_REQUEST_ID,
             operation: BrokerOperation::Socket(SocketRequest::SendTo(SendToSocketRequest {
                 handle: ObjectHandle(9),
-                buffer: SharedBufferDescriptor {
-                    slot_index: SharedBufferSlotIndex(1),
-                    length: 0,
-                },
+                buffer: sequence(1, 0),
                 flags: SendFlags::NONE,
                 destination: None,
             })),
@@ -1748,10 +1703,7 @@ mod tests {
             encode_request(BrokerRequest {
                 request_id: RequestId(13),
                 operation: BrokerOperation::File(FileRequest::Open(OpenFileRequest {
-                    path: SharedBufferDescriptor {
-                        slot_index: SharedBufferSlotIndex(2),
-                        length: 3,
-                    },
+                    path: sequence(2, 3),
                     user: FileUser { user: 5, group: 7 },
                     access: FileAccessMode::ReadWrite,
                     flags: FileOpenFlags::CREATE
@@ -1761,8 +1713,8 @@ mod tests {
                 })),
             }),
             [
-                8, 13, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 5, 0, 7, 0, 2, 137, 0, 160,
-                1,
+                8, 13, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0, 0, 0, 3, 0, 0, 0, 5, 0, 7, 0, 2, 137, 0,
+                160, 1,
             ]
         );
     }
@@ -1803,17 +1755,14 @@ mod tests {
                 request_id: RequestId(13),
                 operation: BrokerOperation::Socket(SocketRequest::SendTo(SendToSocketRequest {
                     handle: ObjectHandle(9),
-                    buffer: SharedBufferDescriptor {
-                        slot_index: SharedBufferSlotIndex(2),
-                        length: 3,
-                    },
+                    buffer: sequence(2, 3),
                     flags: SendFlags::NONE,
                     destination: Some(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 53,)),
                 })),
             }),
             [
-                5, 13, 0, 0, 0, 0, 0, 0, 0, 10, 9, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 0,
-                0, 0, 0, 1, 203, 0, 113, 7, 53, 0
+                5, 13, 0, 0, 0, 0, 0, 0, 0, 10, 9, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0, 0, 0, 3, 0, 0, 0,
+                0, 0, 0, 0, 1, 203, 0, 113, 7, 53, 0
             ]
         );
     }

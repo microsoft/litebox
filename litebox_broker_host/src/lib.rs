@@ -45,7 +45,7 @@ use litebox_broker_protocol::pipe::{
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::shared_buffer::{
-    SHARED_BUFFER_LAYOUT, SHARED_BUFFER_SLOT_COUNT, SharedBufferDescriptor, SharedBufferSlotIndex,
+    SHARED_BUFFER_LAYOUT, SHARED_BUFFER_SLOT_COUNT, SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence,
 };
 use litebox_broker_protocol::socket::{
     AcceptSocketResponse, BindSocketResponse, ConnectSocketResponse, CreateSocketResponse,
@@ -110,60 +110,17 @@ impl<Memory: SharedMemory> BrokerHostAssociation<'_, Memory> {
             request_id,
             operation,
         } = request;
-        let buffer_descriptor = match &operation {
-            BrokerOperation::Pipe(PipeRequest::Read(request)) => Some(request.buffer),
-            BrokerOperation::Pipe(PipeRequest::Write(request)) => Some(request.buffer),
-            BrokerOperation::Socket(SocketRequest::Send(request)) => Some(request.buffer),
-            BrokerOperation::Socket(SocketRequest::SendTo(request)) => Some(request.buffer),
-            BrokerOperation::Socket(SocketRequest::Receive(request)) => Some(request.buffer),
-            BrokerOperation::Socket(SocketRequest::ReceiveFrom(request)) => Some(request.buffer),
-            BrokerOperation::FillRandom(buffer)
-            | BrokerOperation::Stdio(
-                StdioRequest::Read(ReadStdioRequest { buffer })
-                | StdioRequest::Write(WriteStdioRequest { buffer, .. }),
-            )
-            | BrokerOperation::File(
-                FileRequest::Open(OpenFileRequest { path: buffer, .. })
-                | FileRequest::Read(ReadFileRequest { buffer, .. })
-                | FileRequest::Write(WriteFileRequest { buffer, .. })
-                | FileRequest::ReadDirectory(ReadDirectoryRequest { buffer, .. })
-                | FileRequest::PathStatus(PathFileStatusRequest { path: buffer, .. })
-                | FileRequest::Chmod(ChmodFileRequest { path: buffer, .. })
-                | FileRequest::Chown(ChownFileRequest { path: buffer, .. })
-                | FileRequest::Unlink(UnlinkFileRequest { path: buffer, .. })
-                | FileRequest::Mkdir(MkdirFileRequest { path: buffer, .. })
-                | FileRequest::Rmdir(RmdirFileRequest { path: buffer, .. }),
-            ) => Some(*buffer),
-            BrokerOperation::CloseObject(_)
-            | BrokerOperation::CheckReadiness(_)
-            | BrokerOperation::Event(_)
-            | BrokerOperation::Pipe(PipeRequest::Create(_))
-            | BrokerOperation::Stdio(StdioRequest::IsTerminal(_))
-            | BrokerOperation::File(
-                FileRequest::Seek(_) | FileRequest::Truncate(_) | FileRequest::HandleStatus(_),
-            )
-            | BrokerOperation::Socket(
-                SocketRequest::Create(_)
-                | SocketRequest::Connect(_)
-                | SocketRequest::Bind(_)
-                | SocketRequest::Listen(_)
-                | SocketRequest::Accept(_)
-                | SocketRequest::Shutdown(_)
-                | SocketRequest::SetTcpOption(_)
-                | SocketRequest::GetTcpOption(_)
-                | SocketRequest::Status(_),
-            ) => None,
-        };
+        let buffer_sequence = operation.shared_buffer();
 
         {
             let mut state = self.state.lock();
             if state.failed {
                 return Err(BrokerHostError::Broker(ErrorCode::Internal));
             }
-            if let Some(descriptor) = buffer_descriptor
+            if let Some(sequence) = buffer_sequence
                 && let Err(error) = state.shared_buffer_usage.begin(
                     request_id,
-                    descriptor,
+                    sequence,
                     self.shared_buffers.layout(),
                 )
             {
@@ -184,11 +141,11 @@ impl<Memory: SharedMemory> BrokerHostAssociation<'_, Memory> {
                 return Err(BrokerHostError::Broker(error));
             }
         };
-        if let Some(descriptor) = buffer_descriptor {
+        if let Some(sequence) = buffer_sequence {
             self.state
                 .lock()
                 .shared_buffer_usage
-                .end(request_id, descriptor.slot_index);
+                .end(request_id, sequence);
         }
         if let Err(error) = send_response(&BrokerResponse { request_id, result }) {
             self.state.lock().failed = true;
@@ -324,37 +281,47 @@ impl SharedBufferUsage {
     fn begin(
         &mut self,
         request_id: RequestId,
-        descriptor: SharedBufferDescriptor,
+        sequence: SharedBufferSequence,
         layout: litebox_broker_protocol::shared_buffer::SharedBufferLayout,
     ) -> core::result::Result<(), ErrorCode> {
-        if layout
-            .range(descriptor.slot_index, descriptor.length as usize)
-            .is_err()
-        {
-            return Err(ErrorCode::MalformedRequest);
-        }
-        let slot = &mut self.slots[descriptor.slot_index.0 as usize];
-        // A local lease spans response consumption, so honest reuse of this slot
-        // always carries a newer, non-wrapping request ID.
-        match *slot {
-            SharedBufferSlotState::Unused => {}
-            SharedBufferSlotState::Idle(last_request_id) if request_id > last_request_id => {}
-            SharedBufferSlotState::Idle(_) | SharedBufferSlotState::Active(_) => {
-                return Err(ErrorCode::MalformedRequest);
+        let descriptors = sequence
+            .descriptors(layout)
+            .map_err(|_| ErrorCode::MalformedRequest)?;
+        for descriptor in descriptors {
+            let slot = &self.slots[descriptor.slot_index.0 as usize];
+            // A local lease spans response consumption, so honest reuse of this
+            // slot always carries a newer, non-wrapping request ID.
+            match *slot {
+                SharedBufferSlotState::Unused => {}
+                SharedBufferSlotState::Idle(last_request_id) if request_id > last_request_id => {}
+                SharedBufferSlotState::Idle(_) | SharedBufferSlotState::Active(_) => {
+                    return Err(ErrorCode::MalformedRequest);
+                }
             }
         }
-        *slot = SharedBufferSlotState::Active(request_id);
+        for descriptor in sequence
+            .descriptors(layout)
+            .expect("validated shared-buffer sequence must remain valid")
+        {
+            self.slots[descriptor.slot_index.0 as usize] =
+                SharedBufferSlotState::Active(request_id);
+        }
         Ok(())
     }
 
-    fn end(&mut self, request_id: RequestId, slot_index: SharedBufferSlotIndex) {
-        let slot = &mut self.slots[slot_index.0 as usize];
-        assert_eq!(
-            *slot,
-            SharedBufferSlotState::Active(request_id),
-            "shared-buffer slot state changed before response emission"
-        );
-        *slot = SharedBufferSlotState::Idle(request_id);
+    fn end(&mut self, request_id: RequestId, sequence: SharedBufferSequence) {
+        for descriptor in sequence
+            .descriptors(SHARED_BUFFER_LAYOUT)
+            .expect("active shared-buffer sequence must remain valid")
+        {
+            let slot = &mut self.slots[descriptor.slot_index.0 as usize];
+            assert_eq!(
+                *slot,
+                SharedBufferSlotState::Active(request_id),
+                "shared-buffer slot state changed before response emission"
+            );
+            *slot = SharedBufferSlotState::Idle(request_id);
+        }
     }
 }
 
@@ -394,16 +361,12 @@ fn handle_request<Memory: SharedMemory>(
                 .map(BrokerResult::Socket)
         }
         BrokerOperation::FillRandom(buffer) => {
-            if buffer.length > MAX_RANDOM_TRANSFER_SIZE {
-                return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
-            }
-            let length = buffer.length as usize;
+            validate_shared_buffer(buffer, MAX_RANDOM_TRANSFER_SIZE)?;
+            let length = buffer.length() as usize;
             let mut data = [0u8; MAX_RANDOM_TRANSFER_SIZE as usize];
             let data = &mut data[..length];
             litebox_broker_core::random::fill(session, data).map_err(RequestFailure::from)?;
-            shared_buffers
-                .write(buffer.slot_index, data)
-                .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
+            write_shared_buffer(shared_buffers, buffer, data, MAX_RANDOM_TRANSFER_SIZE)?;
             Ok(BrokerResult::RandomFilled)
         }
         BrokerOperation::Stdio(request) => {
@@ -441,15 +404,18 @@ fn handle_file_request<Memory: SharedMemory>(
             buffer,
             offset,
         }) => {
-            validate_file_buffer(buffer)?;
-            let mut data = allocate_zeroed(buffer.length)?;
+            validate_shared_buffer(buffer, MAX_FILE_TRANSFER_SIZE)?;
+            let mut data = allocate_zeroed(buffer.length())?;
             match litebox_broker_core::fs::read(session, handle, &mut data, offset)
                 .map_err(RequestFailure::from)?
             {
                 Ok(read) => {
-                    shared_buffers
-                        .write(buffer.slot_index, &data[..read])
-                        .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
+                    write_shared_buffer(
+                        shared_buffers,
+                        buffer,
+                        &data[..read],
+                        MAX_FILE_TRANSFER_SIZE,
+                    )?;
                     Ok(FileResponse::Read(ReadFileResponse {
                         read: u32::try_from(read)
                             .expect("validated file read length must fit in u32"),
@@ -463,7 +429,7 @@ fn handle_file_request<Memory: SharedMemory>(
             buffer,
             offset,
         }) => {
-            let data = read_file_buffer(shared_buffers, buffer)?;
+            let data = read_shared_buffer(shared_buffers, buffer, MAX_FILE_TRANSFER_SIZE)?;
             match litebox_broker_core::fs::write(session, handle, &data, offset)
                 .map_err(RequestFailure::from)?
             {
@@ -501,7 +467,7 @@ fn handle_file_request<Memory: SharedMemory>(
             buffer,
             start_index,
         }) => {
-            validate_file_buffer(buffer)?;
+            validate_shared_buffer(buffer, SHARED_BUFFER_SLOT_SIZE)?;
             let entries = match litebox_broker_core::fs::read_directory(session, handle)
                 .map_err(RequestFailure::from)?
             {
@@ -514,27 +480,27 @@ fn handle_file_request<Memory: SharedMemory>(
                 Ok(start_index) => start_index.min(entries.len()),
                 Err(_) => return Ok(FileResponse::Failed(FileError::InvalidOffset)),
             };
-            let (payload, next_index) =
-                match encode_directory_entries_chunk(&entries, start_index, buffer.length as usize)
-                {
-                    Ok(page) => page,
-                    Err(DirectoryTransferError::Payload(
-                        DirectoryPayloadError::Malformed | DirectoryPayloadError::TooLarge,
-                    )) => return Ok(FileResponse::Failed(FileError::Io)),
-                    Err(DirectoryTransferError::OutOfMemory) => {
-                        return Err(RequestFailure::Respond(ErrorCode::OutOfMemory));
-                    }
-                    Err(error) => {
-                        let _ = error;
-                        return Err(RequestFailure::Abort(ErrorCode::Internal));
-                    }
-                };
-            shared_buffers
-                .write(buffer.slot_index, &payload)
-                .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
+            let (payload, next_index) = match encode_directory_entries_chunk(
+                &entries,
+                start_index,
+                buffer.length() as usize,
+            ) {
+                Ok(page) => page,
+                Err(DirectoryTransferError::Payload(
+                    DirectoryPayloadError::Malformed | DirectoryPayloadError::TooLarge,
+                )) => return Ok(FileResponse::Failed(FileError::Io)),
+                Err(DirectoryTransferError::OutOfMemory) => {
+                    return Err(RequestFailure::Respond(ErrorCode::OutOfMemory));
+                }
+                Err(error) => {
+                    let _ = error;
+                    return Err(RequestFailure::Abort(ErrorCode::Internal));
+                }
+            };
+            write_shared_buffer(shared_buffers, buffer, &payload, SHARED_BUFFER_SLOT_SIZE)?;
             Ok(FileResponse::ReadDirectory(ReadDirectoryResponse {
                 length: u32::try_from(payload.len())
-                    .expect("directory payload must fit its shared-buffer descriptor"),
+                    .expect("directory payload must fit its shared-buffer sequence"),
                 next_index,
             }))
         }
@@ -620,8 +586,8 @@ fn handle_file_request<Memory: SharedMemory>(
     }
 }
 
-fn validate_file_buffer(buffer: SharedBufferDescriptor) -> RequestResult<()> {
-    if buffer.length > MAX_FILE_TRANSFER_SIZE {
+fn validate_shared_buffer(buffer: SharedBufferSequence, max_length: u32) -> RequestResult<()> {
+    if buffer.length() > max_length || buffer.descriptors(SHARED_BUFFER_LAYOUT).is_err() {
         return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
     }
     Ok(())
@@ -635,23 +601,63 @@ fn allocate_zeroed(length: u32) -> RequestResult<Vec<u8>> {
     Ok(data)
 }
 
-fn read_file_buffer<Memory: SharedMemory>(
+fn read_shared_buffer<Memory: SharedMemory>(
     shared_buffers: &SharedBufferPool<Memory>,
-    buffer: SharedBufferDescriptor,
+    buffer: SharedBufferSequence,
+    max_length: u32,
 ) -> RequestResult<Vec<u8>> {
-    validate_file_buffer(buffer)?;
-    let mut data = allocate_zeroed(buffer.length)?;
-    shared_buffers
-        .read(buffer.slot_index, &mut data)
-        .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
+    validate_shared_buffer(buffer, max_length)?;
+    let mut data = allocate_zeroed(buffer.length())?;
+    let mut offset = 0;
+    for descriptor in buffer
+        .descriptors(shared_buffers.layout())
+        .map_err(|_| RequestFailure::Abort(ErrorCode::MalformedRequest))?
+    {
+        let end = offset + descriptor.length as usize;
+        shared_buffers
+            .read(descriptor.slot_index, &mut data[offset..end])
+            .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
+        offset = end;
+    }
     Ok(data)
+}
+
+fn write_shared_buffer<Memory: SharedMemory>(
+    shared_buffers: &SharedBufferPool<Memory>,
+    buffer: SharedBufferSequence,
+    data: &[u8],
+    max_length: u32,
+) -> RequestResult<()> {
+    validate_shared_buffer(buffer, max_length)?;
+    if data.len() > buffer.length() as usize {
+        return Err(RequestFailure::Abort(ErrorCode::Internal));
+    }
+    let mut offset = 0;
+    for descriptor in buffer
+        .descriptors(shared_buffers.layout())
+        .map_err(|_| RequestFailure::Abort(ErrorCode::MalformedRequest))?
+    {
+        if offset == data.len() {
+            break;
+        }
+        let length = (data.len() - offset).min(descriptor.length as usize);
+        let end = offset + length;
+        shared_buffers
+            .write(descriptor.slot_index, &data[offset..end])
+            .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
+        offset = end;
+    }
+    if offset != data.len() {
+        return Err(RequestFailure::Abort(ErrorCode::Internal));
+    }
+    Ok(())
 }
 
 fn read_file_path<Memory: SharedMemory>(
     shared_buffers: &SharedBufferPool<Memory>,
-    buffer: SharedBufferDescriptor,
+    buffer: SharedBufferSequence,
 ) -> RequestResult<alloc::string::String> {
-    let data = read_file_buffer(shared_buffers, buffer)?;
+    let data = read_shared_buffer(shared_buffers, buffer, SHARED_BUFFER_SLOT_SIZE)?;
     let path = alloc::string::String::from_utf8(data)
         .map_err(|_| RequestFailure::Abort(ErrorCode::MalformedRequest))?;
     if !path.starts_with('/') {
@@ -667,33 +673,22 @@ fn handle_stdio_request<Memory: SharedMemory>(
 ) -> RequestResult<StdioResponse> {
     match request {
         StdioRequest::Read(ReadStdioRequest { buffer }) => {
-            if buffer.length > MAX_STDIO_TRANSFER_SIZE {
-                return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
-            }
-            let mut data = Vec::new();
-            data.try_reserve_exact(buffer.length as usize)
-                .map_err(|_| RequestFailure::Respond(ErrorCode::OutOfMemory))?;
-            data.resize(buffer.length as usize, 0);
+            validate_shared_buffer(buffer, MAX_STDIO_TRANSFER_SIZE)?;
+            let mut data = allocate_zeroed(buffer.length())?;
             let read = litebox_broker_core::stdio::read(session, &mut data)
                 .map_err(RequestFailure::from)?;
-            shared_buffers
-                .write(buffer.slot_index, &data[..read])
-                .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
+            write_shared_buffer(
+                shared_buffers,
+                buffer,
+                &data[..read],
+                MAX_STDIO_TRANSFER_SIZE,
+            )?;
             Ok(StdioResponse::Read(ReadStdioResponse {
                 read: u32::try_from(read).expect("validated stdio read length must fit in u32"),
             }))
         }
         StdioRequest::Write(WriteStdioRequest { stream, buffer }) => {
-            if buffer.length > MAX_STDIO_TRANSFER_SIZE {
-                return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
-            }
-            let mut data = Vec::new();
-            data.try_reserve_exact(buffer.length as usize)
-                .map_err(|_| RequestFailure::Respond(ErrorCode::OutOfMemory))?;
-            data.resize(buffer.length as usize, 0);
-            shared_buffers
-                .read(buffer.slot_index, &mut data)
-                .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
+            let data = read_shared_buffer(shared_buffers, buffer, MAX_STDIO_TRANSFER_SIZE)?;
             let written = litebox_broker_core::stdio::write(session, stream, &data)
                 .map_err(RequestFailure::from)?;
             Ok(StdioResponse::Write(WriteStdioResponse {
@@ -779,19 +774,12 @@ fn handle_socket_request<Memory: SharedMemory>(
         }
         SocketRequest::Send(request) => {
             if request.flags.has_unsupported_bits()
-                || request.buffer.length > MAX_SOCKET_TRANSFER_SIZE
+                || request.buffer.length() > MAX_SOCKET_TRANSFER_SIZE
             {
                 return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
             }
-            let length = request.buffer.length as usize;
-            let mut data = Vec::new();
-            if data.try_reserve_exact(length).is_err() {
-                return Err(RequestFailure::Respond(ErrorCode::OutOfMemory));
-            }
-            data.resize(length, 0);
-            shared_buffers
-                .read(request.buffer.slot_index, &mut data)
-                .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
+            let data =
+                read_shared_buffer(shared_buffers, request.buffer, MAX_SOCKET_TRANSFER_SIZE)?;
             match litebox_broker_core::socket::send(session, request.handle, data, request.flags)
                 .map_err(RequestFailure::from)?
             {
@@ -805,19 +793,12 @@ fn handle_socket_request<Memory: SharedMemory>(
             }
         }
         SocketRequest::SendTo(request) => {
-            if request.flags.has_unsupported_bits() || request.buffer.length > MAX_UDP_DATAGRAM_SIZE
+            if request.flags.has_unsupported_bits()
+                || request.buffer.length() > MAX_UDP_DATAGRAM_SIZE
             {
                 return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
             }
-            let length = request.buffer.length as usize;
-            let mut data = Vec::new();
-            if data.try_reserve_exact(length).is_err() {
-                return Err(RequestFailure::Respond(ErrorCode::OutOfMemory));
-            }
-            data.resize(length, 0);
-            shared_buffers
-                .read(request.buffer.slot_index, &mut data)
-                .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
+            let data = read_shared_buffer(shared_buffers, request.buffer, MAX_UDP_DATAGRAM_SIZE)?;
             match litebox_broker_core::socket::send_to(
                 session,
                 request.handle,
@@ -839,23 +820,23 @@ fn handle_socket_request<Memory: SharedMemory>(
         }
         SocketRequest::Receive(request) => {
             let peek = request.flags.contains(ReceiveFlags::PEEK);
-            let peek_end = request.peek_offset.checked_add(request.buffer.length);
+            let peek_end = request.peek_offset.checked_add(request.buffer.length());
             let canonical_peek_length = request
                 .peek_length
                 .checked_sub(request.peek_offset)
                 .map(|remaining| remaining.min(MAX_SOCKET_TRANSFER_SIZE));
             if request.flags.has_unsupported_bits()
-                || request.buffer.length > MAX_SOCKET_TRANSFER_SIZE
+                || request.buffer.length() > MAX_SOCKET_TRANSFER_SIZE
                 || (!peek && (request.peek_offset != 0 || request.peek_length != 0))
                 || (peek
                     && (!request.peek_offset.is_multiple_of(MAX_SOCKET_TRANSFER_SIZE)
-                        || canonical_peek_length != Some(request.buffer.length)
+                        || canonical_peek_length != Some(request.buffer.length())
                         || peek_end.is_none_or(|end| request.peek_length < end)
                         || request.peek_length > MAX_SOCKET_PEEK_SIZE))
             {
                 return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
             }
-            let length = request.buffer.length as usize;
+            let length = request.buffer.length() as usize;
             match litebox_broker_core::socket::receive(
                 session,
                 request.handle,
@@ -870,9 +851,12 @@ fn handle_socket_request<Memory: SharedMemory>(
                     let response = match received {
                         litebox_broker_core::socket::PlatformStreamReceive::Received(data) => {
                             let received = data.len();
-                            shared_buffers
-                                .write(request.buffer.slot_index, &data)
-                                .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
+                            write_shared_buffer(
+                                shared_buffers,
+                                request.buffer,
+                                &data,
+                                MAX_SOCKET_TRANSFER_SIZE,
+                            )?;
                             ReceiveSocketResponse::Received(
                                 received
                                     .try_into()
@@ -889,11 +873,12 @@ fn handle_socket_request<Memory: SharedMemory>(
             }
         }
         SocketRequest::ReceiveFrom(request) => {
-            if request.flags.has_unsupported_bits() || request.buffer.length > MAX_UDP_DATAGRAM_SIZE
+            if request.flags.has_unsupported_bits()
+                || request.buffer.length() > MAX_UDP_DATAGRAM_SIZE
             {
                 return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
             }
-            let length = request.buffer.length as usize;
+            let length = request.buffer.length() as usize;
             match litebox_broker_core::socket::receive_from(
                 session,
                 request.handle,
@@ -903,9 +888,12 @@ fn handle_socket_request<Memory: SharedMemory>(
             .map_err(RequestFailure::from)?
             {
                 SocketOutcome::Completed(received) => {
-                    shared_buffers
-                        .write(request.buffer.slot_index, &received.data)
-                        .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
+                    write_shared_buffer(
+                        shared_buffers,
+                        request.buffer,
+                        &received.data,
+                        MAX_UDP_DATAGRAM_SIZE,
+                    )?;
                     Ok(SocketResponse::ReceiveFrom(ReceiveFromSocketResponse {
                         received: received
                             .data
@@ -969,15 +957,16 @@ fn handle_pipe_request<Memory: SharedMemory>(
                 .map_err(RequestFailure::from)
         }
         PipeRequest::Read(request) => {
-            if request.buffer.length > MAX_PIPE_TRANSFER_SIZE {
-                return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
-            }
+            validate_shared_buffer(request.buffer, MAX_PIPE_TRANSFER_SIZE)?;
             let data =
-                litebox_broker_core::pipe::read(session, request.handle, request.buffer.length)
+                litebox_broker_core::pipe::read(session, request.handle, request.buffer.length())
                     .map_err(RequestFailure::from)?;
-            shared_buffers
-                .write(request.buffer.slot_index, &data)
-                .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
+            write_shared_buffer(
+                shared_buffers,
+                request.buffer,
+                &data,
+                MAX_PIPE_TRANSFER_SIZE,
+            )?;
             Ok(PipeResponse::Read(ReadPipeResponse {
                 read: data
                     .len()
@@ -986,18 +975,7 @@ fn handle_pipe_request<Memory: SharedMemory>(
             }))
         }
         PipeRequest::Write(request) => {
-            if request.buffer.length > MAX_PIPE_TRANSFER_SIZE {
-                return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
-            }
-            let length = request.buffer.length as usize;
-            let mut data = Vec::new();
-            if data.try_reserve_exact(length).is_err() {
-                return Err(RequestFailure::Respond(ErrorCode::OutOfMemory));
-            }
-            data.resize(length, 0);
-            shared_buffers
-                .read(request.buffer.slot_index, &mut data)
-                .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
+            let data = read_shared_buffer(shared_buffers, request.buffer, MAX_PIPE_TRANSFER_SIZE)?;
             litebox_broker_core::pipe::write(session, request.handle, &data)
                 .map_err(RequestFailure::from)
                 .and_then(|written| {
@@ -1074,7 +1052,7 @@ mod tests {
     use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
     use litebox_broker_protocol::shared_buffer::{
         SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SHARED_BUFFER_SLOT_SIZE,
-        SharedBufferDescriptor,
+        SharedBufferSlotIndex,
     };
     use litebox_broker_protocol::socket::{
         AddressFamily, ConnectSocketRequest, CreateSocketRequest, IpProtocol, ReceiveFlags,
@@ -1443,18 +1421,18 @@ mod tests {
         test_channel_aborts_without_response_on_shared_memory_failure(&broker);
         test_channel_rejects_incompatible_shared_buffer_layout(&broker);
         active_request_closes_object_reference(&broker);
-        association_shared_buffer_descriptors_stage_pipe_data(&broker);
-        association_shared_buffer_descriptors_stage_socket_data(&broker);
-        association_shared_buffer_descriptor_stages_random_data(&broker);
-        association_shared_buffer_descriptor_stages_stdio_data(&broker, &stdio_provider);
-        association_shared_buffer_descriptors_stage_file_data(&broker);
-        shared_buffer_usage_rejects_invalid_descriptors();
+        association_shared_buffer_sequences_stage_pipe_data(&broker);
+        association_shared_buffer_sequences_stage_socket_data(&broker);
+        association_shared_buffer_sequence_stages_random_data(&broker);
+        association_shared_buffer_sequence_stages_stdio_data(&broker, &stdio_provider);
+        association_shared_buffer_sequences_stage_file_data(&broker);
+        shared_buffer_usage_rejects_invalid_sequences();
         association_executes_distinct_slots_concurrently(&broker);
         association_allows_slot_reuse_during_response_emission(&broker);
         association_allows_out_of_order_responses(&broker);
     }
 
-    fn association_shared_buffer_descriptors_stage_file_data(broker: &BrokerCore) {
+    fn association_shared_buffer_sequences_stage_file_data(broker: &BrokerCore) {
         let session = broker
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();
@@ -1465,7 +1443,7 @@ mod tests {
         let opened = handle_test_request_with_buffers(
             &session,
             BrokerOperation::File(FileRequest::Open(OpenFileRequest {
-                path: descriptor(0, 5),
+                path: single_slot_sequence(0, 5),
                 user: ROOT,
                 access: FileAccessMode::ReadWrite,
                 flags: FileOpenFlags::CREATE,
@@ -1485,7 +1463,7 @@ mod tests {
                 &session,
                 BrokerOperation::File(FileRequest::Write(WriteFileRequest {
                     handle: opened.handle,
-                    buffer: descriptor(1, 3),
+                    buffer: sequence([1], 3),
                     offset: None,
                 })),
                 &shared_buffers,
@@ -1509,7 +1487,7 @@ mod tests {
                 &session,
                 BrokerOperation::File(FileRequest::Read(ReadFileRequest {
                     handle: opened.handle,
-                    buffer: descriptor(2, 3),
+                    buffer: sequence([2], 3),
                     offset: None,
                 })),
                 &shared_buffers,
@@ -1528,7 +1506,7 @@ mod tests {
         let directory = handle_test_request_with_buffers(
             &session,
             BrokerOperation::File(FileRequest::Open(OpenFileRequest {
-                path: descriptor(3, 1),
+                path: single_slot_sequence(3, 1),
                 user: ROOT,
                 access: FileAccessMode::ReadOnly,
                 flags: FileOpenFlags::DIRECTORY,
@@ -1543,7 +1521,7 @@ mod tests {
             &session,
             BrokerOperation::File(FileRequest::ReadDirectory(ReadDirectoryRequest {
                 handle: directory.handle,
-                buffer: descriptor(4, 64),
+                buffer: single_slot_sequence(4, 64),
                 start_index: 0,
             })),
             &shared_buffers,
@@ -1566,7 +1544,7 @@ mod tests {
         session.close_object_reference(directory.handle).unwrap();
     }
 
-    fn association_shared_buffer_descriptor_stages_random_data(broker: &BrokerCore) {
+    fn association_shared_buffer_sequence_stages_random_data(broker: &BrokerCore) {
         let session = broker
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();
@@ -1578,7 +1556,7 @@ mod tests {
         assert_eq!(
             handle_test_request_with_buffers(
                 &session,
-                BrokerOperation::FillRandom(descriptor(3, 3)),
+                BrokerOperation::FillRandom(single_slot_sequence(3, 3)),
                 &shared_buffers,
             ),
             BrokerResult::RandomFilled
@@ -1592,7 +1570,7 @@ mod tests {
         assert_eq!(
             handle_request(
                 &session,
-                BrokerOperation::FillRandom(descriptor(3, MAX_RANDOM_TRANSFER_SIZE + 1)),
+                BrokerOperation::FillRandom(single_slot_sequence(3, MAX_RANDOM_TRANSFER_SIZE + 1)),
                 &shared_buffers,
                 &test_readiness_sink(),
             ),
@@ -1605,7 +1583,7 @@ mod tests {
         assert_eq!(
             handle_request(
                 &session,
-                BrokerOperation::FillRandom(descriptor(3, 2)),
+                BrokerOperation::FillRandom(single_slot_sequence(3, 2)),
                 &shared_buffers,
                 &test_readiness_sink(),
             ),
@@ -1618,7 +1596,7 @@ mod tests {
         assert_eq!(output, [0xa5; 2]);
     }
 
-    fn association_shared_buffer_descriptor_stages_stdio_data(
+    fn association_shared_buffer_sequence_stages_stdio_data(
         broker: &BrokerCore,
         provider: &TestStdioProvider,
     ) {
@@ -1635,7 +1613,7 @@ mod tests {
             handle_test_request_with_buffers(
                 &session,
                 BrokerOperation::Stdio(StdioRequest::Read(ReadStdioRequest {
-                    buffer: descriptor(6, 3),
+                    buffer: single_slot_sequence(6, 3),
                 })),
                 &shared_buffers,
             ),
@@ -1654,7 +1632,7 @@ mod tests {
             handle_test_request_with_buffers(
                 &session,
                 BrokerOperation::Stdio(StdioRequest::Read(ReadStdioRequest {
-                    buffer: descriptor(6, 4),
+                    buffer: single_slot_sequence(6, 4),
                 })),
                 &shared_buffers,
             ),
@@ -1673,7 +1651,7 @@ mod tests {
             handle_test_request_with_buffers(
                 &session,
                 BrokerOperation::Stdio(StdioRequest::Read(ReadStdioRequest {
-                    buffer: descriptor(6, 4),
+                    buffer: single_slot_sequence(6, 4),
                 })),
                 &shared_buffers,
             ),
@@ -1690,7 +1668,7 @@ mod tests {
                 &session,
                 BrokerOperation::Stdio(StdioRequest::Write(WriteStdioRequest {
                     stream: StdioOutputStream::Stderr,
-                    buffer: descriptor(7, 5),
+                    buffer: single_slot_sequence(7, 5),
                 })),
                 &shared_buffers,
             ),
@@ -1721,7 +1699,7 @@ mod tests {
                 &session,
                 BrokerOperation::Stdio(StdioRequest::Write(WriteStdioRequest {
                     stream: StdioOutputStream::Stdout,
-                    buffer: descriptor(7, MAX_STDIO_TRANSFER_SIZE + 1),
+                    buffer: single_slot_sequence(7, MAX_STDIO_TRANSFER_SIZE + 1),
                 })),
                 &shared_buffers,
                 &test_readiness_sink(),
@@ -1732,7 +1710,7 @@ mod tests {
             handle_request(
                 &session,
                 BrokerOperation::Stdio(StdioRequest::Read(ReadStdioRequest {
-                    buffer: descriptor(7, MAX_STDIO_TRANSFER_SIZE + 1),
+                    buffer: single_slot_sequence(7, MAX_STDIO_TRANSFER_SIZE + 1),
                 })),
                 &shared_buffers,
                 &test_readiness_sink(),
@@ -1924,7 +1902,7 @@ mod tests {
                 Ok(HostReceive::Message(BrokerOperation::Pipe(
                     PipeRequest::Read(ReadPipeRequest {
                         handle: ObjectHandle(u64::MAX),
-                        buffer: descriptor(0, 1),
+                        buffer: single_slot_sequence(0, 1),
                     }),
                 ))),
                 Ok(HostReceive::Message(BrokerOperation::Event(
@@ -1951,7 +1929,7 @@ mod tests {
     fn test_channel_aborts_on_stale_shared_buffer_request(broker: &BrokerCore) {
         let stale_request = BrokerOperation::Pipe(PipeRequest::Read(ReadPipeRequest {
             handle: ObjectHandle(u64::MAX),
-            buffer: descriptor(0, 1),
+            buffer: single_slot_sequence(0, 1),
         }));
         let mut channel = FakeHostControlChannel::new(
             std::vec::Vec::from([Ok(HostReceive::Message(BrokerHandshakeRequest {
@@ -2065,7 +2043,7 @@ mod tests {
         );
     }
 
-    fn association_shared_buffer_descriptors_stage_pipe_data(broker: &BrokerCore) {
+    fn association_shared_buffer_sequences_stage_pipe_data(broker: &BrokerCore) {
         let session = broker
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();
@@ -2093,7 +2071,7 @@ mod tests {
             &session,
             BrokerOperation::Pipe(PipeRequest::Write(WritePipeRequest {
                 handle: response.write_handle,
-                buffer: descriptor(2, 3),
+                buffer: single_slot_sequence(2, 3),
             })),
             &shared_buffers,
         );
@@ -2106,7 +2084,7 @@ mod tests {
             &session,
             BrokerOperation::Pipe(PipeRequest::Read(ReadPipeRequest {
                 handle: response.read_handle,
-                buffer: descriptor(4, 3),
+                buffer: single_slot_sequence(4, 3),
             })),
             &shared_buffers,
         );
@@ -2126,7 +2104,7 @@ mod tests {
         assert_eq!(second_slot, [9]);
     }
 
-    fn association_shared_buffer_descriptors_stage_socket_data(broker: &BrokerCore) {
+    fn association_shared_buffer_sequences_stage_socket_data(broker: &BrokerCore) {
         let session = broker
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();
@@ -2191,7 +2169,7 @@ mod tests {
                 &session,
                 BrokerOperation::Socket(SocketRequest::Send(SendSocketRequest {
                     handle: response.handle,
-                    buffer: descriptor(2, 3),
+                    buffer: single_slot_sequence(2, 3),
                     flags: SendFlags::NONE,
                 })),
                 &shared_buffers,
@@ -2203,7 +2181,7 @@ mod tests {
                 &session,
                 BrokerOperation::Socket(SocketRequest::Receive(ReceiveSocketRequest {
                     handle: response.handle,
-                    buffer: descriptor(4, 4),
+                    buffer: single_slot_sequence(4, 4),
                     flags: ReceiveFlags::PEEK,
                     peek_offset: 0,
                     peek_length: 4,
@@ -2234,7 +2212,7 @@ mod tests {
                 &session,
                 BrokerOperation::Socket(SocketRequest::Send(SendSocketRequest {
                     handle: response.handle,
-                    buffer: descriptor(2, 0),
+                    buffer: single_slot_sequence(2, 0),
                     flags: SendFlags(1),
                 })),
                 &shared_buffers,
@@ -2247,7 +2225,7 @@ mod tests {
                 &session,
                 BrokerOperation::Socket(SocketRequest::Receive(ReceiveSocketRequest {
                     handle: response.handle,
-                    buffer: descriptor(2, 0),
+                    buffer: single_slot_sequence(2, 0),
                     flags: ReceiveFlags(ReceiveFlags::SUPPORTED.0 | (1 << 31)),
                     peek_offset: 0,
                     peek_length: 0,
@@ -2262,7 +2240,7 @@ mod tests {
                 &session,
                 BrokerOperation::Socket(SocketRequest::Receive(ReceiveSocketRequest {
                     handle: response.handle,
-                    buffer: descriptor(2, 1),
+                    buffer: single_slot_sequence(2, 1),
                     flags: ReceiveFlags::PEEK,
                     peek_offset: 1,
                     peek_length: 2,
@@ -2302,7 +2280,7 @@ mod tests {
                 &session,
                 BrokerOperation::Socket(SocketRequest::SendTo(SendToSocketRequest {
                     handle: udp.handle,
-                    buffer: descriptor(3, 2),
+                    buffer: single_slot_sequence(3, 2),
                     flags: SendFlags::NONE,
                     destination: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 53)),
                 })),
@@ -2315,7 +2293,7 @@ mod tests {
                 &session,
                 BrokerOperation::Socket(SocketRequest::ReceiveFrom(ReceiveFromSocketRequest {
                     handle: udp.handle,
-                    buffer: descriptor(5, 2),
+                    buffer: single_slot_sequence(5, 2),
                     flags: ReceiveFromFlags::PEEK,
                 })),
                 &shared_buffers,
@@ -2336,7 +2314,7 @@ mod tests {
                 &session,
                 BrokerOperation::Socket(SocketRequest::ReceiveFrom(ReceiveFromSocketRequest {
                     handle: udp.handle,
-                    buffer: descriptor(5, 0),
+                    buffer: single_slot_sequence(5, 0),
                     flags: ReceiveFromFlags(1 << 31),
                 })),
                 &shared_buffers,
@@ -2347,41 +2325,65 @@ mod tests {
         session.close_object_reference(udp.handle).unwrap();
     }
 
-    fn shared_buffer_usage_rejects_invalid_descriptors() {
+    fn shared_buffer_usage_rejects_invalid_sequences() {
         let mut usage = SharedBufferUsage::new();
         usage
-            .begin(RequestId(1), descriptor(0, 3), SHARED_BUFFER_LAYOUT)
+            .begin(RequestId(1), sequence([0], 3), SHARED_BUFFER_LAYOUT)
             .unwrap();
         assert_eq!(
-            usage.begin(RequestId(2), descriptor(0, 3), SHARED_BUFFER_LAYOUT),
+            usage.begin(RequestId(2), sequence([0], 3), SHARED_BUFFER_LAYOUT),
             Err(ErrorCode::MalformedRequest)
         );
-        usage.end(RequestId(1), SharedBufferSlotIndex(0));
+        usage.end(RequestId(1), sequence([0], 3));
         assert_eq!(
-            usage.begin(RequestId(1), descriptor(0, 3), SHARED_BUFFER_LAYOUT),
+            usage.begin(RequestId(1), sequence([0], 3), SHARED_BUFFER_LAYOUT),
             Err(ErrorCode::MalformedRequest)
         );
         assert_eq!(
-            usage.begin(RequestId(0), descriptor(0, 3), SHARED_BUFFER_LAYOUT),
+            usage.begin(RequestId(0), sequence([0], 3), SHARED_BUFFER_LAYOUT),
             Err(ErrorCode::MalformedRequest)
         );
         assert!(
             usage
-                .begin(RequestId(3), descriptor(0, 3), SHARED_BUFFER_LAYOUT)
+                .begin(RequestId(3), sequence([0], 3), SHARED_BUFFER_LAYOUT)
                 .is_ok()
         );
         assert_eq!(
-            usage.begin(RequestId(2), descriptor(16, 3), SHARED_BUFFER_LAYOUT),
+            usage.begin(
+                RequestId(2),
+                sequence([SHARED_BUFFER_SLOT_COUNT], 3),
+                SHARED_BUFFER_LAYOUT
+            ),
             Err(ErrorCode::MalformedRequest)
         );
         assert_eq!(
             usage.begin(
                 RequestId(2),
-                descriptor(1, SHARED_BUFFER_SLOT_SIZE + 1),
+                sequence([1], SHARED_BUFFER_SLOT_SIZE + 1),
                 SHARED_BUFFER_LAYOUT
             ),
             Err(ErrorCode::MalformedRequest)
         );
+        usage.end(RequestId(3), sequence([0], 3));
+
+        let first = sequence([0, 2], SHARED_BUFFER_SLOT_SIZE + 1);
+        usage
+            .begin(RequestId(4), first, SHARED_BUFFER_LAYOUT)
+            .unwrap();
+        assert_eq!(
+            usage.begin(
+                RequestId(5),
+                sequence([1, 2], SHARED_BUFFER_SLOT_SIZE + 1),
+                SHARED_BUFFER_LAYOUT,
+            ),
+            Err(ErrorCode::MalformedRequest)
+        );
+        let second = sequence([1], 1);
+        usage
+            .begin(RequestId(5), second, SHARED_BUFFER_LAYOUT)
+            .unwrap();
+        usage.end(RequestId(4), first);
+        usage.end(RequestId(5), second);
     }
 
     fn association_executes_distinct_slots_concurrently(broker: &BrokerCore) {
@@ -2528,7 +2530,7 @@ mod tests {
             request_id: RequestId(request_id),
             operation: BrokerOperation::Pipe(PipeRequest::Read(ReadPipeRequest {
                 handle: ObjectHandle(u64::MAX),
-                buffer: descriptor(slot_index, 1),
+                buffer: single_slot_sequence(slot_index, 1),
             })),
         }
     }
@@ -2538,7 +2540,7 @@ mod tests {
             request_id: RequestId(request_id),
             operation: BrokerOperation::Pipe(PipeRequest::Write(WritePipeRequest {
                 handle,
-                buffer: descriptor(slot_index, 1),
+                buffer: single_slot_sequence(slot_index, 1),
             })),
         }
     }
@@ -2560,11 +2562,13 @@ mod tests {
         }
     }
 
-    const fn descriptor(slot: u32, length: u32) -> SharedBufferDescriptor {
-        SharedBufferDescriptor {
-            slot_index: SharedBufferSlotIndex(slot),
-            length,
-        }
+    fn single_slot_sequence(slot: u32, length: u32) -> SharedBufferSequence {
+        sequence([slot], length)
+    }
+
+    fn sequence<const N: usize>(slots: [u32; N], length: u32) -> SharedBufferSequence {
+        let slots = slots.map(SharedBufferSlotIndex);
+        SharedBufferSequence::new(&slots, length).unwrap()
     }
 
     fn handle_test_request(session: &BrokerSession, operation: BrokerOperation) -> BrokerResult {
@@ -2740,7 +2744,7 @@ mod tests {
                     .push(Ok(HostReceive::Message(BrokerOperation::Pipe(
                         PipeRequest::Write(WritePipeRequest {
                             handle: response.write_handle,
-                            buffer: descriptor(0, 1),
+                            buffer: single_slot_sequence(0, 1),
                         }),
                     ))));
                 self.operations.push(Ok(HostReceive::PeerClosed));

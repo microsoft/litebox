@@ -11,15 +11,19 @@ use bitflags::bitflags;
 use thiserror::Error;
 
 use crate::ObjectHandle;
-use crate::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferDescriptor};
+use crate::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
 
-/// Maximum bytes transferred through one fs shared-buffer request.
-///
-/// This remains independent of slot capacity so increasing the shared-buffer
-/// layout does not silently change fs protocol behavior.
-pub const MAX_FILE_TRANSFER_SIZE: u32 = 64 * 1024;
+/// Maximum number of shared-buffer slots used by one file read or write.
+pub const MAX_FILE_TRANSFER_SLOT_COUNT: u32 = 8;
 
-const _: () = assert!(MAX_FILE_TRANSFER_SIZE <= SHARED_BUFFER_SLOT_SIZE);
+/// Maximum bytes transferred by one logical file read or write.
+pub const MAX_FILE_TRANSFER_SIZE: u32 = SHARED_BUFFER_SLOT_SIZE * MAX_FILE_TRANSFER_SLOT_COUNT;
+
+const _: () =
+    assert!(MAX_FILE_TRANSFER_SLOT_COUNT <= crate::shared_buffer::SHARED_BUFFER_SLOT_COUNT);
+const _: () = assert!(
+    MAX_FILE_TRANSFER_SLOT_COUNT as usize <= crate::shared_buffer::MAX_SHARED_BUFFER_SEQUENCE_SLOTS
+);
 
 /// File user identity used for permission checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -296,7 +300,7 @@ impl core::ops::BitOr for FileOpenFlags {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpenFileRequest {
     /// Shared-buffer region containing one absolute UTF-8 path.
-    pub path: SharedBufferDescriptor,
+    pub path: SharedBufferSequence,
     /// Caller identity for permission checks.
     pub user: FileUser,
     /// Requested access mode.
@@ -319,8 +323,8 @@ pub struct OpenFileResponse {
 pub struct ReadFileRequest {
     /// Broker-owned file handle.
     pub handle: ObjectHandle,
-    /// Shared-buffer destination.
-    pub buffer: SharedBufferDescriptor,
+    /// Shared-buffer destination sequence.
+    pub buffer: SharedBufferSequence,
     /// Explicit offset, or `None` to use and update the shared position.
     pub offset: Option<u64>,
 }
@@ -337,8 +341,8 @@ pub struct ReadFileResponse {
 pub struct WriteFileRequest {
     /// Broker-owned file handle.
     pub handle: ObjectHandle,
-    /// Shared-buffer source.
-    pub buffer: SharedBufferDescriptor,
+    /// Shared-buffer source sequence.
+    pub buffer: SharedBufferSequence,
     /// Explicit offset, or `None` to use and update the shared position.
     pub offset: Option<u64>,
 }
@@ -385,7 +389,7 @@ pub struct ReadDirectoryRequest {
     /// Broker-owned directory handle.
     pub handle: ObjectHandle,
     /// Shared-buffer destination for encoded entries.
-    pub buffer: SharedBufferDescriptor,
+    pub buffer: SharedBufferSequence,
     /// Entry index at which this response should begin.
     pub start_index: u64,
 }
@@ -403,7 +407,7 @@ pub struct ReadDirectoryResponse {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PathFileStatusRequest {
     /// Shared-buffer region containing one absolute UTF-8 path.
-    pub path: SharedBufferDescriptor,
+    pub path: SharedBufferSequence,
     /// Caller identity for permission checks.
     pub user: FileUser,
 }
@@ -419,7 +423,7 @@ pub struct HandleFileStatusRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChmodFileRequest {
     /// Shared-buffer region containing one absolute UTF-8 path.
-    pub path: SharedBufferDescriptor,
+    pub path: SharedBufferSequence,
     /// Caller identity for permission checks.
     pub user: FileUser,
     /// New mode bits.
@@ -430,7 +434,7 @@ pub struct ChmodFileRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChownFileRequest {
     /// Shared-buffer region containing one absolute UTF-8 path.
-    pub path: SharedBufferDescriptor,
+    pub path: SharedBufferSequence,
     /// Caller identity for permission checks.
     pub acting_user: FileUser,
     /// New user ID, if changed.
@@ -443,7 +447,7 @@ pub struct ChownFileRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UnlinkFileRequest {
     /// Shared-buffer region containing one absolute UTF-8 path.
-    pub path: SharedBufferDescriptor,
+    pub path: SharedBufferSequence,
     /// Caller identity for permission checks.
     pub user: FileUser,
 }
@@ -452,7 +456,7 @@ pub struct UnlinkFileRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MkdirFileRequest {
     /// Shared-buffer region containing one absolute UTF-8 path.
-    pub path: SharedBufferDescriptor,
+    pub path: SharedBufferSequence,
     /// Caller identity for permission checks.
     pub user: FileUser,
     /// New directory mode.
@@ -463,7 +467,7 @@ pub struct MkdirFileRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RmdirFileRequest {
     /// Shared-buffer region containing one absolute UTF-8 path.
-    pub path: SharedBufferDescriptor,
+    pub path: SharedBufferSequence,
     /// Caller identity for permission checks.
     pub user: FileUser,
 }
@@ -504,7 +508,7 @@ pub fn encode_directory_entries(
     entries: &[FileDirectoryEntry],
 ) -> Result<Vec<u8>, DirectoryPayloadError> {
     let (payload, next_index) =
-        encode_directory_entries_chunk(entries, 0, MAX_FILE_TRANSFER_SIZE as usize)
+        encode_directory_entries_chunk(entries, 0, SHARED_BUFFER_SLOT_SIZE as usize)
             .map_err(DirectoryTransferError::into_payload_error)?;
     if next_index.is_some() {
         return Err(DirectoryPayloadError::TooLarge);
@@ -557,7 +561,7 @@ pub fn try_decode_directory_entries(
 ) -> Result<Vec<FileDirectoryEntry>, DirectoryTransferError> {
     const MINIMUM_ENTRY_LENGTH: usize = size_of::<u32>() + 2;
 
-    if payload.len() > MAX_FILE_TRANSFER_SIZE as usize {
+    if payload.len() > SHARED_BUFFER_SLOT_SIZE as usize {
         return Err(DirectoryPayloadError::TooLarge.into());
     }
     let mut decoder = DirectoryPayloadDecoder { payload, offset: 0 };
@@ -651,7 +655,7 @@ fn directory_entries_chunk_end(
     maximum_length: usize,
 ) -> Result<(usize, usize), DirectoryPayloadError> {
     if start_index > entries.len()
-        || !(size_of::<u32>()..=MAX_FILE_TRANSFER_SIZE as usize).contains(&maximum_length)
+        || !(size_of::<u32>()..=SHARED_BUFFER_SLOT_SIZE as usize).contains(&maximum_length)
     {
         return Err(DirectoryPayloadError::TooLarge);
     }
@@ -886,14 +890,14 @@ mod tests {
     fn directory_payload_is_bounded_by_one_transfer() {
         const ENTRY_OVERHEAD: usize = size_of::<u32>() + 2;
         let maximum_name_length =
-            MAX_FILE_TRANSFER_SIZE as usize - size_of::<u32>() - ENTRY_OVERHEAD;
+            SHARED_BUFFER_SLOT_SIZE as usize - size_of::<u32>() - ENTRY_OVERHEAD;
         let maximum_entry = FileDirectoryEntry {
             name: "x".repeat(maximum_name_length),
             file_type: FileType::RegularFile,
             ino_info: None,
         };
         let payload = encode_directory_entries(core::slice::from_ref(&maximum_entry)).unwrap();
-        assert_eq!(payload.len(), MAX_FILE_TRANSFER_SIZE as usize);
+        assert_eq!(payload.len(), SHARED_BUFFER_SLOT_SIZE as usize);
         assert_eq!(decode_directory_entries(&payload).unwrap(), [maximum_entry]);
 
         let oversized_entry = FileDirectoryEntry {

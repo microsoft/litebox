@@ -7,7 +7,7 @@ use litebox_broker_protocol::pipe::{
     CreatePipeRequest, CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeRequest,
     WritePipeRequest,
 };
-use litebox_broker_protocol::shared_buffer::SharedBufferDescriptor;
+use litebox_broker_protocol::shared_buffer::SharedBufferSequence;
 use litebox_broker_transport::channel::LocalCallChannel;
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
@@ -38,7 +38,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     /// Reads bytes from a broker-owned pipe into an operation-scoped shared
     /// buffer lease.
     ///
-    /// The caller must retain exclusive ownership of the descriptor's slot
+    /// The caller must retain exclusive ownership of the sequence's slots
     /// until this method returns.
     ///
     /// # Panics
@@ -49,42 +49,39 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn read_pipe(
         &self,
         handle: ObjectHandle,
-        buffer: SharedBufferDescriptor,
+        buffer: SharedBufferSequence,
         destination: &mut [u8],
     ) -> Result<usize, Channel::Error> {
-        if buffer.length > MAX_PIPE_TRANSFER_SIZE {
+        if buffer.length() > MAX_PIPE_TRANSFER_SIZE {
             return Err(BrokerLocalError::Broker(
                 litebox_broker_protocol::error::ErrorCode::ResourceExhausted,
             ));
         }
         assert_eq!(
             destination.len(),
-            buffer.length as usize,
-            "shared pipe read destination must match its descriptor"
+            buffer.length() as usize,
+            "shared data must match its buffer sequence"
         );
-        self.shared_buffers
-            .layout()
-            .range(buffer.slot_index, destination.len())
-            .expect("shared pipe read descriptor must identify a valid slot range");
+        let _ = buffer
+            .descriptors(self.shared_buffers.layout())
+            .expect("shared buffer sequence must identify valid slot ranges");
         let response = self.request_pipe(PipeRequest::Read(ReadPipeRequest { handle, buffer }))?;
         let PipeResponse::Read(response) = response else {
             panic!("broker returned unexpected pipe read response: {response:?}");
         };
         assert!(
-            response.read <= buffer.length,
+            response.read <= buffer.length(),
             "broker returned oversized pipe read"
         );
         let read = response.read as usize;
-        self.shared_buffers
-            .read(buffer.slot_index, &mut destination[..read])
-            .expect("validated shared pipe read range must be accessible");
+        self.read_shared_buffer(buffer, &mut destination[..read]);
         Ok(read)
     }
 
     /// Writes bytes to a broker-owned pipe from an operation-scoped shared
     /// buffer lease.
     ///
-    /// The caller must retain exclusive ownership of the descriptor's slot
+    /// The caller must retain exclusive ownership of the sequence's slots
     /// until this method returns.
     ///
     /// # Panics
@@ -94,22 +91,15 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn write_pipe(
         &self,
         handle: ObjectHandle,
-        buffer: SharedBufferDescriptor,
+        buffer: SharedBufferSequence,
         data: &[u8],
     ) -> Result<usize, Channel::Error> {
-        if buffer.length > MAX_PIPE_TRANSFER_SIZE {
+        if buffer.length() > MAX_PIPE_TRANSFER_SIZE {
             return Err(BrokerLocalError::Broker(
                 litebox_broker_protocol::error::ErrorCode::ResourceExhausted,
             ));
         }
-        assert_eq!(
-            data.len(),
-            buffer.length as usize,
-            "shared pipe write data must match its descriptor"
-        );
-        self.shared_buffers
-            .write(buffer.slot_index, data)
-            .expect("validated shared pipe write range must be accessible");
+        self.write_shared_buffer(buffer, data);
         let response =
             self.request_pipe(PipeRequest::Write(WritePipeRequest { handle, buffer }))?;
         let PipeResponse::Write(response) = response else {
@@ -156,7 +146,7 @@ mod tests {
     use litebox_broker_transport::shared_memory::{SharedMemory, SharedMemoryError};
 
     #[test]
-    fn pipe_uses_the_descriptor_slot_for_data_operations() {
+    fn pipe_uses_the_sequence_slot_for_data_operations() {
         let read_handle = ObjectHandle(1);
         let write_handle = ObjectHandle(2);
         let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
@@ -170,8 +160,8 @@ mod tests {
         ]);
         let (local, ()) =
             BrokerLocal::negotiate(channel, |channel| Ok((channel, memory.clone(), ()))).unwrap();
-        let write_buffer = descriptor(2, 3);
-        let read_buffer = descriptor(4, 3);
+        let write_buffer = sequence(2, 3);
+        let read_buffer = sequence(4, 3);
 
         local.create_pipe(64, 16).unwrap();
         assert_eq!(
@@ -220,7 +210,7 @@ mod tests {
         let channel = ScriptedChannel::new([]);
         let (local, ()) =
             BrokerLocal::negotiate(channel, |channel| Ok((channel, memory, ()))).unwrap();
-        let oversized = descriptor(0, MAX_PIPE_TRANSFER_SIZE + 1);
+        let oversized = sequence(0, MAX_PIPE_TRANSFER_SIZE + 1);
 
         assert!(matches!(
             local.read_pipe(ObjectHandle(1), oversized, &mut []),
@@ -249,7 +239,7 @@ mod tests {
             BrokerLocal::negotiate(channel, |channel| Ok((channel, memory, ()))).unwrap();
         let mut destination = [0];
 
-        let _ = local.read_pipe(ObjectHandle(1), descriptor(0, 1), &mut destination);
+        let _ = local.read_pipe(ObjectHandle(1), sequence(0, 1), &mut destination);
     }
 
     #[test]
@@ -263,14 +253,11 @@ mod tests {
         let (local, ()) =
             BrokerLocal::negotiate(channel, |channel| Ok((channel, memory, ()))).unwrap();
 
-        let _ = local.write_pipe(ObjectHandle(1), descriptor(0, 1), &[0]);
+        let _ = local.write_pipe(ObjectHandle(1), sequence(0, 1), &[0]);
     }
 
-    const fn descriptor(slot: u32, length: u32) -> SharedBufferDescriptor {
-        SharedBufferDescriptor {
-            slot_index: SharedBufferSlotIndex(slot),
-            length,
-        }
+    fn sequence(slot: u32, length: u32) -> SharedBufferSequence {
+        SharedBufferSequence::new(&[SharedBufferSlotIndex(slot)], length).unwrap()
     }
 
     #[derive(Clone)]

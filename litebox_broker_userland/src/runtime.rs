@@ -517,8 +517,7 @@ mod tests {
         BrokerHandshakeResponse, BrokerNotification, BrokerOperation,
     };
     use litebox_broker_protocol::shared_buffer::{
-        SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SharedBufferDescriptor,
-        SharedBufferSlotIndex,
+        SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SharedBufferSequence, SharedBufferSlotIndex,
     };
     use litebox_broker_protocol::stdio::StdioOutputStream;
     use litebox_broker_transport::channel::{
@@ -923,10 +922,9 @@ mod tests {
     fn a_stalled_request_queue_fails_after_its_deadline() {
         let request = |request_id| BrokerRequest {
             request_id: RequestId(request_id),
-            operation: BrokerOperation::FillRandom(SharedBufferDescriptor {
-                slot_index: SharedBufferSlotIndex(0),
-                length: 1,
-            }),
+            operation: BrokerOperation::FillRandom(
+                SharedBufferSequence::new(&[SharedBufferSlotIndex(0)], 1).unwrap(),
+            ),
         };
         let shutdown_called = Arc::new(AtomicBool::new(false));
         let failure_coordinator =
@@ -1025,10 +1023,7 @@ mod tests {
         let (local, notifications, shutdown, outcome, host) = spawn_dispatch(readiness, provider);
         let reader = std::thread::spawn(move || {
             local.read_stdio(
-                SharedBufferDescriptor {
-                    slot_index: SharedBufferSlotIndex(0),
-                    length: 1,
-                },
+                SharedBufferSequence::new(&[SharedBufferSlotIndex(0)], 1).unwrap(),
                 &mut [0],
             )
         });
@@ -1058,10 +1053,7 @@ mod tests {
         let writer = std::thread::spawn(move || {
             local.write_stdio(
                 StdioOutputStream::Stdout,
-                SharedBufferDescriptor {
-                    slot_index: SharedBufferSlotIndex(0),
-                    length: 1,
-                },
+                SharedBufferSequence::new(&[SharedBufferSlotIndex(0)], 1).unwrap(),
                 b"x",
             )
         });

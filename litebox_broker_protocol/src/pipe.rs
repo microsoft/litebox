@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 use crate::ObjectHandle;
-use crate::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferDescriptor};
+use crate::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
 
 /// Maximum pipe bytes transferred by one broker request.
 ///
@@ -38,7 +38,7 @@ pub struct ReadPipeRequest {
     /// Read endpoint handle.
     pub handle: ObjectHandle,
     /// Leased shared-buffer region to receive the bytes.
-    pub buffer: SharedBufferDescriptor,
+    pub buffer: SharedBufferSequence,
 }
 
 /// Response describing bytes read into shared memory.
@@ -54,7 +54,7 @@ pub struct WritePipeRequest {
     /// Write endpoint handle.
     pub handle: ObjectHandle,
     /// Leased shared-buffer region containing the staged bytes.
-    pub buffer: SharedBufferDescriptor,
+    pub buffer: SharedBufferSequence,
 }
 
 /// Response describing a completed pipe write.

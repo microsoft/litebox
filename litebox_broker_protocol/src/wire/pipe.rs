@@ -27,12 +27,12 @@ pub(super) fn encode_pipe_request(encoder: &mut Encoder, request: PipeRequest) {
         PipeRequest::Read(request) => {
             encoder.u8(PIPE_REQUEST_TAG_READ);
             encoder.handle(request.handle);
-            encoder.shared_buffer_descriptor(request.buffer);
+            encoder.shared_buffer_sequence(request.buffer);
         }
         PipeRequest::Write(request) => {
             encoder.u8(PIPE_REQUEST_TAG_WRITE);
             encoder.handle(request.handle);
-            encoder.shared_buffer_descriptor(request.buffer);
+            encoder.shared_buffer_sequence(request.buffer);
         }
     }
 }
@@ -45,11 +45,11 @@ pub(super) fn decode_pipe_request(decoder: &mut Decoder<'_>) -> Result<PipeReque
         })),
         PIPE_REQUEST_TAG_READ => Ok(PipeRequest::Read(ReadPipeRequest {
             handle: decoder.handle()?,
-            buffer: decoder.shared_buffer_descriptor()?,
+            buffer: decoder.shared_buffer_sequence()?,
         })),
         PIPE_REQUEST_TAG_WRITE => Ok(PipeRequest::Write(WritePipeRequest {
             handle: decoder.handle()?,
-            buffer: decoder.shared_buffer_descriptor()?,
+            buffer: decoder.shared_buffer_sequence()?,
         })),
         _ => Err(WireError::InvalidTag),
     }

@@ -14,7 +14,7 @@ use litebox_broker_protocol::{
         BrokerResponse, BrokerResult, PipeRequest, PipeResponse, StdioRequest, StdioResponse,
     },
     pipe::{CreatePipeResponse, ReadPipeResponse, WritePipeResponse},
-    shared_buffer::{SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE},
+    shared_buffer::{SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SharedBufferSequence},
     stdio::{IsTerminalStdioResponse, StdioStream},
 };
 use litebox_broker_transport::{
@@ -152,6 +152,35 @@ struct TestBrokerChannel {
 }
 
 impl TestBrokerChannel {
+    fn write_shared_buffer(&self, buffer: SharedBufferSequence, data: &[u8]) {
+        let mut offset = 0;
+        for descriptor in buffer.descriptors(SHARED_BUFFER_LAYOUT).unwrap() {
+            if offset == data.len() {
+                break;
+            }
+            let length = (data.len() - offset).min(descriptor.length as usize);
+            let end = offset + length;
+            self.shared_buffers
+                .write(descriptor.slot_index, &data[offset..end])
+                .expect("broker write must use a valid shared buffer");
+            offset = end;
+        }
+        assert_eq!(offset, data.len());
+    }
+
+    fn read_shared_buffer(&self, buffer: SharedBufferSequence) -> std::vec::Vec<u8> {
+        let mut data = std::vec![0; buffer.length() as usize];
+        let mut offset = 0;
+        for descriptor in buffer.descriptors(SHARED_BUFFER_LAYOUT).unwrap() {
+            let end = offset + descriptor.length as usize;
+            self.shared_buffers
+                .read(descriptor.slot_index, &mut data[offset..end])
+                .expect("broker read must use a valid shared buffer");
+            offset = end;
+        }
+        data
+    }
+
     fn execute(&self, operation: BrokerOperation) -> litebox_broker_core::Result<BrokerResult> {
         match operation {
             BrokerOperation::CloseObject(handle) => self
@@ -179,20 +208,15 @@ impl TestBrokerChannel {
                 let data = litebox_broker_core::pipe::read(
                     &self.session,
                     request.handle,
-                    request.buffer.length,
+                    request.buffer.length(),
                 )?;
-                self.shared_buffers
-                    .write(request.buffer.slot_index, &data)
-                    .expect("pipe broker read must use a valid shared buffer");
+                self.write_shared_buffer(request.buffer, &data);
                 Ok(BrokerResult::Pipe(PipeResponse::Read(ReadPipeResponse {
                     read: u32::try_from(data.len()).unwrap(),
                 })))
             }
             BrokerOperation::Pipe(PipeRequest::Write(request)) => {
-                let mut data = std::vec![0; request.buffer.length as usize];
-                self.shared_buffers
-                    .read(request.buffer.slot_index, &mut data)
-                    .expect("pipe broker write must use a valid shared buffer");
+                let data = self.read_shared_buffer(request.buffer);
                 litebox_broker_core::pipe::write(&self.session, request.handle, &data).map(
                     |written| {
                         BrokerResult::Pipe(PipeResponse::Write(WritePipeResponse {

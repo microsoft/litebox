@@ -12,7 +12,7 @@
 use core::net::SocketAddrV4;
 
 use crate::ObjectHandle;
-use crate::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferDescriptor};
+use crate::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
 use thiserror::Error;
 
 /// Maximum socket bytes transferred by one broker request.
@@ -381,7 +381,7 @@ pub struct SendSocketRequest {
     /// Socket handle.
     pub handle: ObjectHandle,
     /// Leased shared-buffer region containing the staged bytes.
-    pub buffer: SharedBufferDescriptor,
+    pub buffer: SharedBufferSequence,
     /// Send flags.
     pub flags: SendFlags,
 }
@@ -399,7 +399,7 @@ pub struct SendToSocketRequest {
     /// Socket handle.
     pub handle: ObjectHandle,
     /// Leased shared-buffer region containing the complete datagram.
-    pub buffer: SharedBufferDescriptor,
+    pub buffer: SharedBufferSequence,
     /// Send flags.
     pub flags: SendFlags,
     /// Explicit destination, or `None` to use the connected peer.
@@ -419,7 +419,7 @@ pub struct ReceiveSocketRequest {
     /// Socket handle.
     pub handle: ObjectHandle,
     /// Leased shared-buffer region to receive the bytes.
-    pub buffer: SharedBufferDescriptor,
+    pub buffer: SharedBufferSequence,
     /// Receive flags.
     pub flags: ReceiveFlags,
     /// Byte offset from the start of the stream for a peek request.
@@ -449,7 +449,7 @@ pub struct ReceiveFromSocketRequest {
     /// Socket handle.
     pub handle: ObjectHandle,
     /// Leased shared-buffer receive region.
-    pub buffer: SharedBufferDescriptor,
+    pub buffer: SharedBufferSequence,
     /// Datagram receive flags.
     pub flags: ReceiveFromFlags,
 }

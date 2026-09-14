@@ -18,7 +18,9 @@ use litebox_broker_host::test_support::InProcessBrokerSetup;
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileMode, FileOpenFlags, FileSeekWhence, FileType, FileUser,
+    MAX_FILE_TRANSFER_SIZE,
 };
+use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_SLOT_SIZE;
 use spin::mutex::SpinMutex;
 
 use crate::LiteBox;
@@ -144,6 +146,43 @@ fn broker_file_round_trip() {
         litebox.path_file_status(&context, "/round_trip"),
         Err(crate::fs::errors::FileStatusError::PathError(_))
     ));
+}
+
+#[test]
+fn broker_file_round_trips_maximum_transfer() {
+    let litebox = broker_litebox();
+    let context = Context::new();
+    let fd = create_file(&litebox, &context, "/maximum_transfer");
+    let data = (0..MAX_FILE_TRANSFER_SIZE as usize)
+        .map(|index| u8::try_from(index % 251).unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(litebox.write_file(&fd, &data, None).unwrap(), data.len());
+    assert_eq!(
+        litebox
+            .seek_file(&fd, 0, FileSeekWhence::RelativeToBeginning)
+            .unwrap(),
+        0
+    );
+    let mut output = alloc::vec![0; data.len()];
+    assert_eq!(
+        litebox.read_file(&fd, &mut output, None).unwrap(),
+        data.len()
+    );
+    assert_eq!(output, data);
+
+    let short_length = SHARED_BUFFER_SLOT_SIZE as usize + 3;
+    litebox.truncate_file(&fd, short_length, true).unwrap();
+    output.fill(0xa5);
+    assert_eq!(
+        litebox.read_file(&fd, &mut output, None).unwrap(),
+        short_length
+    );
+    assert_eq!(output[..short_length], data[..short_length]);
+    assert!(output[short_length..].iter().all(|byte| *byte == 0xa5));
+
+    litebox.close_file(&fd).unwrap();
+    litebox.unlink_file(&context, "/maximum_transfer").unwrap();
 }
 
 #[test]

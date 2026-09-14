@@ -19,6 +19,7 @@ use litebox_broker_protocol::fs::{
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::readiness::ReadinessFlags;
+use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_SLOT_SIZE;
 use litebox_broker_protocol::socket::{
     AcceptSocketResponse, MAX_SOCKET_TRANSFER_SIZE, MAX_UDP_DATAGRAM_SIZE,
     ReceiveFlags as BrokerReceiveFlags, ReceiveFromFlags as BrokerReceiveFromFlags,
@@ -35,7 +36,7 @@ use crate::sync::{Mutex, RawSyncPrimitivesProvider};
 pub(crate) mod error;
 mod shared_buffer;
 use error::BrokerControlError;
-use shared_buffer::{SlotAllocator, SlotLease};
+use shared_buffer::{AcquireError, SlotAllocator, SlotLease};
 
 /// Local-core access to the negotiated broker control channel.
 ///
@@ -392,12 +393,30 @@ where
 
     fn acquire_shared_buffer(
         &self,
-        length: u32,
+        length: usize,
     ) -> core::result::Result<SlotLease<'_, Platform>, BrokerControlError> {
-        self.slot_allocator.acquire(length).map_err(|_| {
-            self.fail_association();
-            BrokerControlError::AssociationFailed
-        })
+        let length = u32::try_from(length)
+            .map_err(|_| BrokerControlError::Broker(ErrorCode::ResourceExhausted))?;
+        match self.slot_allocator.acquire(length) {
+            Ok(lease) => Ok(lease),
+            Err(AcquireError::TooLarge) => {
+                Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted))
+            }
+            Err(AcquireError::AssociationFailed) => {
+                self.fail_association();
+                Err(BrokerControlError::AssociationFailed)
+            }
+        }
+    }
+
+    fn acquire_file_path_buffer(
+        &self,
+        path: &str,
+    ) -> core::result::Result<SlotLease<'_, Platform>, BrokerControlError> {
+        if path.len() > SHARED_BUFFER_SLOT_SIZE as usize {
+            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
+        }
+        self.acquire_shared_buffer(path.len())
     }
 
     fn fail_association(&self) {
@@ -417,10 +436,8 @@ where
         if output.len() > MAX_RANDOM_TRANSFER_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
-        let length =
-            u32::try_from(output.len()).expect("validated random transfer length must fit in u32");
-        let lease = self.acquire_shared_buffer(length)?;
-        self.request(|local| local.fill_random(lease.descriptor(), output))
+        let lease = self.acquire_shared_buffer(output.len())?;
+        self.request(|local| local.fill_random(lease.sequence(), output))
     }
 
     fn is_stdio_terminal(
@@ -437,10 +454,8 @@ where
         // Keep blocking stdin reads from consuming the broker's shared worker
         // pool when multiple guest threads read concurrently.
         let _read_guard = self.stdio_read_lock.lock();
-        let length = u32::try_from(data.len())
-            .expect("validated shared stdio transfer length must fit in u32");
-        let lease = self.acquire_shared_buffer(length)?;
-        self.request(|local| local.read_stdio(lease.descriptor(), data))
+        let lease = self.acquire_shared_buffer(data.len())?;
+        self.request(|local| local.read_stdio(lease.sequence(), data))
     }
 
     fn write_stdio(
@@ -451,10 +466,8 @@ where
         if data.len() > MAX_STDIO_TRANSFER_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
-        let length = u32::try_from(data.len())
-            .expect("validated shared stdio transfer length must fit in u32");
-        let lease = self.acquire_shared_buffer(length)?;
-        self.request(|local| local.write_stdio(stream, lease.descriptor(), data))
+        let lease = self.acquire_shared_buffer(data.len())?;
+        self.request(|local| local.write_stdio(stream, lease.sequence(), data))
     }
 
     fn create_tcp_socket(&self) -> core::result::Result<ObjectHandle, BrokerControlError> {
@@ -528,10 +541,8 @@ where
         if data.len() > MAX_SOCKET_TRANSFER_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
-        let length = u32::try_from(data.len())
-            .expect("validated shared socket transfer length must fit in u32");
-        let lease = self.acquire_shared_buffer(length)?;
-        self.request(|local| local.send_socket(handle, lease.descriptor(), data, flags))
+        let lease = self.acquire_shared_buffer(data.len())?;
+        self.request(|local| local.send_socket(handle, lease.sequence(), data, flags))
             .map(|result| match result {
                 Ok(sent) => SocketOutcome::Completed(sent),
                 Err(error) => SocketOutcome::Failed(error),
@@ -550,14 +561,12 @@ where
         if data.len() > MAX_SOCKET_TRANSFER_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
-        let length = u32::try_from(data.len())
-            .expect("validated shared socket transfer length must fit in u32");
-        let lease = self.acquire_shared_buffer(length)?;
+        let lease = self.acquire_shared_buffer(data.len())?;
         self.request(|local| {
             local.receive_socket(
                 litebox_broker_protocol::socket::ReceiveSocketRequest {
                     handle,
-                    buffer: lease.descriptor(),
+                    buffer: lease.sequence(),
                     flags,
                     peek_offset,
                     peek_length,
@@ -582,11 +591,9 @@ where
         if data.len() > MAX_UDP_DATAGRAM_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
-        let length =
-            u32::try_from(data.len()).expect("validated UDP datagram length must fit in u32");
-        let lease = self.acquire_shared_buffer(length)?;
+        let lease = self.acquire_shared_buffer(data.len())?;
         self.request(|local| {
-            local.send_to_socket(handle, lease.descriptor(), data, flags, destination)
+            local.send_to_socket(handle, lease.sequence(), data, flags, destination)
         })
         .map(|result| match result {
             Ok(sent) => SocketOutcome::Completed(sent),
@@ -603,10 +610,8 @@ where
         if data.len() > MAX_UDP_DATAGRAM_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
-        let length =
-            u32::try_from(data.len()).expect("validated UDP receive length must fit in u32");
-        let lease = self.acquire_shared_buffer(length)?;
-        self.request(|local| local.receive_from_socket(handle, lease.descriptor(), data, flags))
+        let lease = self.acquire_shared_buffer(data.len())?;
+        self.request(|local| local.receive_from_socket(handle, lease.sequence(), data, flags))
             .map(|result| match result {
                 Ok(received) => SocketOutcome::Completed(received),
                 Err(error) => SocketOutcome::Failed(error),
@@ -691,8 +696,8 @@ where
         data.try_reserve_exact(length as usize)
             .map_err(|_| BrokerControlError::Broker(ErrorCode::OutOfMemory))?;
         data.resize(length as usize, 0);
-        let lease = self.acquire_shared_buffer(length)?;
-        let read = self.request(|local| local.read_pipe(handle, lease.descriptor(), &mut data))?;
+        let lease = self.acquire_shared_buffer(length as usize)?;
+        let read = self.request(|local| local.read_pipe(handle, lease.sequence(), &mut data))?;
         data.truncate(read);
         Ok(data)
     }
@@ -705,10 +710,8 @@ where
         if data.len() > MAX_PIPE_TRANSFER_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
-        let length = u32::try_from(data.len())
-            .expect("validated shared pipe transfer length must fit in u32");
-        let lease = self.acquire_shared_buffer(length)?;
-        self.request(|local| local.write_pipe(handle, lease.descriptor(), data))
+        let lease = self.acquire_shared_buffer(data.len())?;
+        self.request(|local| local.write_pipe(handle, lease.sequence(), data))
     }
 
     fn open_file(
@@ -720,9 +723,8 @@ where
         mode: FileMode,
     ) -> core::result::Result<core::result::Result<ObjectHandle, FileError>, BrokerControlError>
     {
-        let length = file_transfer_length(path.len())?;
-        let lease = self.acquire_shared_buffer(length)?;
-        self.request(|local| local.open_file(lease.descriptor(), path, user, access, flags, mode))
+        let lease = self.acquire_file_path_buffer(path)?;
+        self.request(|local| local.open_file(lease.sequence(), path, user, access, flags, mode))
     }
 
     fn read_file(
@@ -731,10 +733,10 @@ where
         data: &mut [u8],
         offset: Option<u64>,
     ) -> core::result::Result<core::result::Result<usize, FileError>, BrokerControlError> {
-        let length = file_transfer_length(data.len().min(MAX_FILE_TRANSFER_SIZE as usize))?;
-        let data = &mut data[..length as usize];
+        let length = data.len().min(MAX_FILE_TRANSFER_SIZE as usize);
+        let data = &mut data[..length];
         let lease = self.acquire_shared_buffer(length)?;
-        self.request(|local| local.read_file(handle, lease.descriptor(), data, offset))
+        self.request(|local| local.read_file(handle, lease.sequence(), data, offset))
     }
 
     fn write_file(
@@ -743,10 +745,10 @@ where
         data: &[u8],
         offset: Option<u64>,
     ) -> core::result::Result<core::result::Result<usize, FileError>, BrokerControlError> {
-        let length = file_transfer_length(data.len().min(MAX_FILE_TRANSFER_SIZE as usize))?;
-        let data = &data[..length as usize];
+        let length = data.len().min(MAX_FILE_TRANSFER_SIZE as usize);
+        let data = &data[..length];
         let lease = self.acquire_shared_buffer(length)?;
-        self.request(|local| local.write_file(handle, lease.descriptor(), data, offset))
+        self.request(|local| local.write_file(handle, lease.sequence(), data, offset))
     }
 
     fn seek_file(
@@ -777,9 +779,9 @@ where
         let mut entries = Vec::new();
         let mut start_index = 0;
         loop {
-            let lease = self.acquire_shared_buffer(MAX_FILE_TRANSFER_SIZE)?;
-            let response = self
-                .request(|local| local.read_directory(handle, lease.descriptor(), start_index))?;
+            let lease = self.acquire_shared_buffer(SHARED_BUFFER_SLOT_SIZE as usize)?;
+            let response =
+                self.request(|local| local.read_directory(handle, lease.sequence(), start_index))?;
             let (mut chunk, next_index) = match response {
                 Ok(response) => response,
                 Err(error) => return Ok(Err(error)),
@@ -804,8 +806,8 @@ where
         path: &str,
         user: FileUser,
     ) -> core::result::Result<core::result::Result<FileStatus, FileError>, BrokerControlError> {
-        let lease = self.acquire_shared_buffer(file_transfer_length(path.len())?)?;
-        self.request(|local| local.path_file_status(lease.descriptor(), path, user))
+        let lease = self.acquire_file_path_buffer(path)?;
+        self.request(|local| local.path_file_status(lease.sequence(), path, user))
     }
 
     fn handle_file_status(
@@ -821,8 +823,8 @@ where
         user: FileUser,
         mode: FileMode,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
-        let lease = self.acquire_shared_buffer(file_transfer_length(path.len())?)?;
-        self.request(|local| local.chmod_file(lease.descriptor(), path, user, mode))
+        let lease = self.acquire_file_path_buffer(path)?;
+        self.request(|local| local.chmod_file(lease.sequence(), path, user, mode))
     }
 
     fn chown_file(
@@ -832,8 +834,8 @@ where
         user: Option<u16>,
         group: Option<u16>,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
-        let lease = self.acquire_shared_buffer(file_transfer_length(path.len())?)?;
-        self.request(|local| local.chown_file(lease.descriptor(), path, acting_user, user, group))
+        let lease = self.acquire_file_path_buffer(path)?;
+        self.request(|local| local.chown_file(lease.sequence(), path, acting_user, user, group))
     }
 
     fn unlink_file(
@@ -841,8 +843,8 @@ where
         path: &str,
         user: FileUser,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
-        let lease = self.acquire_shared_buffer(file_transfer_length(path.len())?)?;
-        self.request(|local| local.unlink_file(lease.descriptor(), path, user))
+        let lease = self.acquire_file_path_buffer(path)?;
+        self.request(|local| local.unlink_file(lease.sequence(), path, user))
     }
 
     fn mkdir_file(
@@ -851,8 +853,8 @@ where
         user: FileUser,
         mode: FileMode,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
-        let lease = self.acquire_shared_buffer(file_transfer_length(path.len())?)?;
-        self.request(|local| local.mkdir_file(lease.descriptor(), path, user, mode))
+        let lease = self.acquire_file_path_buffer(path)?;
+        self.request(|local| local.mkdir_file(lease.sequence(), path, user, mode))
     }
 
     fn rmdir_file(
@@ -860,8 +862,8 @@ where
         path: &str,
         user: FileUser,
     ) -> core::result::Result<core::result::Result<(), FileError>, BrokerControlError> {
-        let lease = self.acquire_shared_buffer(file_transfer_length(path.len())?)?;
-        self.request(|local| local.rmdir_file(lease.descriptor(), path, user))
+        let lease = self.acquire_file_path_buffer(path)?;
+        self.request(|local| local.rmdir_file(lease.sequence(), path, user))
     }
 
     fn close_object(&self, handle: ObjectHandle) -> core::result::Result<(), BrokerControlError> {
@@ -871,13 +873,6 @@ where
     fn fail_connection(&self) {
         self.fail_association();
     }
-}
-
-fn file_transfer_length(length: usize) -> core::result::Result<u32, BrokerControlError> {
-    if length > MAX_FILE_TRANSFER_SIZE as usize {
-        return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
-    }
-    Ok(u32::try_from(length).expect("validated file transfer length must fit in u32"))
 }
 
 pub(crate) fn readiness_events(readiness: ReadinessFlags) -> Events {
@@ -905,7 +900,8 @@ mod tests {
     };
     use litebox_broker_protocol::pipe::{ReadPipeResponse, WritePipeResponse};
     use litebox_broker_protocol::shared_buffer::{
-        SHARED_BUFFER_POOL_SIZE, SHARED_BUFFER_SLOT_SIZE, SharedBufferDescriptor,
+        SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SHARED_BUFFER_SLOT_SIZE,
+        SharedBufferSequence,
     };
     use litebox_broker_transport::channel::{LocalCallChannel, LocalSetupChannel};
     use litebox_broker_transport::shared_memory::{SharedMemory, SharedMemoryError};
@@ -943,7 +939,8 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .unwrap();
         assert_ne!(
-            first_observed.0.slot_index, second_observed.0.slot_index,
+            first_observed.0.slot_indices(),
+            second_observed.0.slot_indices(),
             "simultaneous payload calls reused one slot"
         );
         let mut payloads = [first_observed.1, second_observed.1];
@@ -987,7 +984,8 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .unwrap();
         assert_ne!(
-            first_buffer.slot_index, second_buffer.slot_index,
+            first_buffer.slot_indices(),
+            second_buffer.slot_indices(),
             "simultaneous payload calls reused one slot"
         );
 
@@ -1051,13 +1049,13 @@ mod tests {
 
     struct ConcurrentPipeChannel {
         memory: TestSharedMemory,
-        observed_sender: mpsc::SyncSender<(SharedBufferDescriptor, std::vec::Vec<u8>)>,
+        observed_sender: mpsc::SyncSender<(SharedBufferSequence, std::vec::Vec<u8>)>,
         release: StdArc<(StdMutex<bool>, StdCondvar)>,
     }
 
     struct ConcurrentPipeReadChannel {
         memory: TestSharedMemory,
-        observed_sender: mpsc::SyncSender<SharedBufferDescriptor>,
+        observed_sender: mpsc::SyncSender<SharedBufferSequence>,
         release: StdArc<(StdMutex<bool>, StdCondvar)>,
     }
 
@@ -1091,10 +1089,16 @@ mod tests {
             let BrokerOperation::Pipe(PipeRequest::Write(write)) = request.operation else {
                 panic!("unexpected broker request");
             };
-            let mut payload = std::vec![0; write.buffer.length as usize];
+            let descriptor = write
+                .buffer
+                .descriptors(SHARED_BUFFER_LAYOUT)
+                .unwrap()
+                .next()
+                .unwrap();
+            let mut payload = std::vec![0; write.buffer.length() as usize];
             self.memory
                 .read(
-                    write.buffer.slot_index.0 as usize * SHARED_BUFFER_SLOT_SIZE as usize,
+                    descriptor.slot_index.0 as usize * SHARED_BUFFER_SLOT_SIZE as usize,
                     &mut payload,
                 )
                 .unwrap();
@@ -1107,7 +1111,7 @@ mod tests {
             Ok(BrokerResponse {
                 request_id: request.request_id,
                 result: BrokerResult::Pipe(PipeResponse::Write(WritePipeResponse {
-                    written: write.buffer.length,
+                    written: write.buffer.length(),
                 })),
             })
         }
@@ -1145,11 +1149,17 @@ mod tests {
             };
             let payload = std::vec![
                 u8::try_from(read.handle.0).unwrap();
-                read.buffer.length as usize
+                read.buffer.length() as usize
             ];
+            let descriptor = read
+                .buffer
+                .descriptors(SHARED_BUFFER_LAYOUT)
+                .unwrap()
+                .next()
+                .unwrap();
             self.memory
                 .write(
-                    read.buffer.slot_index.0 as usize * SHARED_BUFFER_SLOT_SIZE as usize,
+                    descriptor.slot_index.0 as usize * SHARED_BUFFER_SLOT_SIZE as usize,
                     &payload,
                 )
                 .unwrap();
@@ -1162,7 +1172,7 @@ mod tests {
             Ok(BrokerResponse {
                 request_id: request.request_id,
                 result: BrokerResult::Pipe(PipeResponse::Read(ReadPipeResponse {
-                    read: read.buffer.length,
+                    read: read.buffer.length(),
                 })),
             })
         }
