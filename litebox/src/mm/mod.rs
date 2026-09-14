@@ -538,6 +538,21 @@ where
         unsafe { vmem.protect_mapping(range, new_permissions) }
     }
 
+    /// Change pages to the requested permissions.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure no accesses conflict with the permission change.
+    /// Callers should avoid writable executable mappings unless they are strictly required.
+    pub unsafe fn set_page_permissions(
+        &self,
+        ptr: Platform::RawMutPointer<u8>,
+        len: usize,
+        permissions: MemoryRegionPermissions,
+    ) -> Result<(), VmemProtectError> {
+        self.change_page_permissions(ptr, len, permissions)
+    }
+
     /// Make pages readable and writable.
     ///
     /// # Safety

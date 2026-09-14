@@ -1033,6 +1033,8 @@ pub enum MappingError {
     NotAFile,
     #[error("file not open for reading")]
     NotForReading,
+    #[error("invalid memory permissions")]
+    InvalidPermissions,
 
     #[error("mapping failed: {0}")]
     MapError(#[from] crate::platform::page_mgmt::AllocationError),

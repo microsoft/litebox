@@ -5,7 +5,10 @@
 //! Most of these syscalls which are not backed by files are implemented in [`litebox_common_linux::mm`].
 
 use alloc::collections::{BTreeMap, BTreeSet};
-use litebox::mm::linux::{MappingError, PAGE_SIZE};
+use litebox::{
+    mm::linux::{MappingError, PAGE_SIZE},
+    platform::page_mgmt::MemoryRegionPermissions,
+};
 use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
 
 use crate::ShimPlatform;
@@ -68,6 +71,23 @@ fn finalize_trampoline_gates(
         litebox_syscall_rewriter::aarch64::finalize_trampoline_gates(trampoline, offset)
             .map_err(|e| format!("failed to patch guest thread-pointer offset {offset}: {e}"))
     }
+}
+
+fn prot_flags_from_permissions(permissions: MemoryRegionPermissions) -> ProtFlags {
+    let mut prot = ProtFlags::PROT_NONE;
+    prot.set(
+        ProtFlags::PROT_READ,
+        permissions.contains(MemoryRegionPermissions::READ),
+    );
+    prot.set(
+        ProtFlags::PROT_WRITE,
+        permissions.contains(MemoryRegionPermissions::WRITE),
+    );
+    prot.set(
+        ProtFlags::PROT_EXEC,
+        permissions.contains(MemoryRegionPermissions::EXEC),
+    );
+    prot
 }
 
 /// Per-fd state for the shim's runtime ELF syscall rewriter.
@@ -233,18 +253,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let typed_fd = self.typed_fd(fd).map_err(|_| MappingError::BadFD(fd))?;
 
         let result =
-            self.do_mmap_file_memcpy(suggested_addr, len, prot, flags, &typed_fd, offset)?;
+            self.do_mmap_file_memcpy(suggested_addr, len, prot.clone(), flags, &typed_fd, offset)?;
 
         // Runtime syscall rewriting: patch PROT_EXEC segments in-place.
         if is_exec {
             let syscall_entry = self.global.platform.get_syscall_entry_point();
             if syscall_entry != 0
-                && !self.maybe_patch_exec_segment(result, len, fd, syscall_entry, Some(offset))
+                && self
+                    .maybe_patch_exec_segment(result, len, fd, syscall_entry, Some(offset), &prot)
+                    .is_err()
             {
-                // Trampoline setup failed for a pre-patched binary whose
-                // .text already contains JMPs to the trampoline address.
-                // Continuing would guarantee a SIGSEGV on the first
-                // rewritten syscall, so fail the mmap instead.
+                // Runtime patching, trampoline setup, or restoration of the
+                // requested permissions failed, so fail the mmap.
                 let _ = self.sys_munmap(result, len);
                 return Err(MappingError::OutOfMemory);
             }
@@ -441,16 +461,19 @@ impl<Platform: ShimPlatform> Task<Platform> {
         len: usize,
         prot: ProtFlags,
     ) -> Result<(), Errno> {
+        if !addr.as_usize().is_multiple_of(PAGE_SIZE)
+            || !len.is_multiple_of(PAGE_SIZE)
+            || addr.as_usize().checked_add(len).is_none()
+            || prot.bits() & !ProtFlags::PROT_READ_WRITE_EXEC.bits() != 0
+        {
+            return Err(Errno::EINVAL);
+        }
+
         // Intercept transitions to PROT_EXEC: patch unpatched file mappings.
         if prot.contains(ProtFlags::PROT_EXEC) {
             let syscall_entry = self.global.platform.get_syscall_entry_point();
             if syscall_entry != 0 {
-                #[cfg(target_arch = "x86_64")]
-                self.maybe_patch_on_mprotect_exec(addr, len, syscall_entry);
-                #[cfg(target_arch = "aarch64")]
-                if !self.maybe_patch_on_mprotect_exec(addr, len, syscall_entry) {
-                    return Err(Errno::ENOMEM);
-                }
+                self.maybe_patch_on_mprotect_exec(addr, len, syscall_entry)?;
             }
         }
         // Only AArch64 needs protection from loader reprotection of its holes;
@@ -563,14 +586,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
         addr: UserPtrMut<u8>,
         len: usize,
         syscall_entry: usize,
-    ) -> bool {
+    ) -> Result<(), Errno> {
         let mprotect_start = addr.as_usize();
         let mprotect_end = mprotect_start.saturating_add(len);
+        let mappings = self.global.pm.mappings();
 
         // Find unpatched file mappings that overlap this mprotect range.
-        // We collect (fd, vaddr, seg_len, file_offset) to avoid holding
-        // the lock while patching.
-        let to_patch: alloc::vec::Vec<(i32, usize, usize)> = {
+        // Split them at VMA boundaries so each patch operation can restore
+        // the permissions that existed before this mprotect request.
+        let to_patch: alloc::vec::Vec<(i32, usize, usize, ProtFlags)> = {
             let cache = self.global.elf_patch_cache.lock();
             let mut result = alloc::vec::Vec::new();
             for (&fd, state) in cache.iter() {
@@ -582,7 +606,20 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     let seg_end = seg_start.saturating_add(seg_len);
                     // Check overlap with the mprotect range.
                     if seg_start < mprotect_end && seg_end > mprotect_start {
-                        result.push((fd, seg_start, seg_len));
+                        let patch_start = seg_start.max(mprotect_start);
+                        let patch_end = seg_end.min(mprotect_end);
+                        for (mapping, flags) in &mappings {
+                            let start = patch_start.max(mapping.start);
+                            let end = patch_end.min(mapping.end);
+                            if start < end {
+                                result.push((
+                                    fd,
+                                    start,
+                                    end - start,
+                                    prot_flags_from_permissions((*flags).into()),
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -592,7 +629,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // A single mprotect range should only overlap mappings from one fd
         // (a given vaddr range is backed by at most one file at a time).
         if to_patch.len() > 1 {
-            let fds: BTreeSet<i32> = to_patch.iter().map(|(fd, _, _)| *fd).collect();
+            let fds: BTreeSet<i32> = to_patch.iter().map(|(fd, _, _, _)| *fd).collect();
             if fds.len() > 1 {
                 litebox_util_log::warn!(
                     addr:? = mprotect_start, len:? = len, fds:? = fds;
@@ -601,24 +638,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
         }
 
-        for (fd, seg_start, seg_len) in to_patch {
-            // Clamp to the intersection of the tracked mapping and the
-            // mprotect range — only patch the portion becoming executable.
-            // Re-running the rewriter on already-patched bytes is safe,
-            // so we don't need to track sub-range overlaps precisely.
-            let seg_end = seg_start.saturating_add(seg_len);
-            let patch_start = seg_start.max(mprotect_start);
-            let patch_end = seg_end.min(mprotect_end);
-            let patch_len = patch_end.saturating_sub(patch_start);
-            if patch_len == 0 {
-                continue;
-            }
+        for (fd, patch_start, patch_len, restore_prot) in to_patch {
             let mapped_addr = UserPtrMut::<u8>::from_usize(patch_start);
-            if !self.maybe_patch_exec_segment(mapped_addr, patch_len, fd, syscall_entry, None) {
-                return false;
-            }
+            self.maybe_patch_exec_segment(
+                mapped_addr,
+                patch_len,
+                fd,
+                syscall_entry,
+                None,
+                &restore_prot,
+            )?;
         }
-        true
+        Ok(())
     }
 
     /// Initialize ELF patch state for an fd on its first mmap.
@@ -952,12 +983,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     /// Apply the trap fallback to a mapped code segment: replace every patch
-    /// site with the rewriter's trap, then restore RX.
+    /// site with the rewriter's trap, then restore the caller-selected permissions.
     ///
     /// If `already_rw` is true, the segment is assumed to already be writable
     /// and the initial mprotect RW is skipped.
     ///
-    /// Panics on infrastructure failures (mprotect/read/write/disassembly).
+    /// Returns an error if those permissions cannot be restored.
+    /// Panics on other infrastructure failures (mprotect/read/write/disassembly).
     #[cfg(target_arch = "aarch64")]
     fn apply_aarch64_trap_fallback(
         &self,
@@ -965,7 +997,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         len: usize,
         already_rw: bool,
         ranges: Option<&litebox_syscall_rewriter::aarch64::CodeScanRanges>,
-    ) {
+        restore_prot: &ProtFlags,
+    ) -> Result<(), Errno> {
         if !already_rw {
             self.sys_mprotect_raw(
                 mapped_addr,
@@ -1011,17 +1044,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
             "fatal: failed to write trap bytes back to code segment"
         );
 
-        // Restore RX.
-        self.sys_mprotect_raw(
-            mapped_addr,
-            len,
-            ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
-        )
-        .expect("fatal: failed to restore code segment to RX after trap fallback");
+        // Restore the caller-selected permissions.
+        self.sys_mprotect_raw(mapped_addr, len, restore_prot.clone())
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn apply_trap_fallback(&self, mapped_addr: UserPtrMut<u8>, len: usize, already_rw: bool) {
+    fn apply_trap_fallback(
+        &self,
+        mapped_addr: UserPtrMut<u8>,
+        len: usize,
+        already_rw: bool,
+        restore_prot: &ProtFlags,
+    ) -> Result<(), Errno> {
         if !already_rw {
             self.sys_mprotect_raw(
                 mapped_addr,
@@ -1052,13 +1086,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             "fatal: failed to write trap bytes back to code segment"
         );
 
-        // Restore RX.
-        self.sys_mprotect_raw(
-            mapped_addr,
-            len,
-            ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
-        )
-        .expect("fatal: failed to restore code segment to RX after trap fallback");
+        // Restore the caller-selected permissions.
+        self.sys_mprotect_raw(mapped_addr, len, restore_prot.clone())
     }
 
     /// Patch an executable segment in-place after it has been mapped.
@@ -1068,10 +1097,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// For unpatched binaries: calls `patch_code_segment()` to rewrite syscall
     /// instructions and places the generated stubs in the trampoline region.
     ///
-    /// Returns `true` on success or non-fatal skip. Returns `false` when a
-    /// pre-patched binary's trampoline could not be set up — the caller must
-    /// fail the mapping because the code already contains JMPs to the
-    /// trampoline address.
+    /// Returns an error when a pre-patched binary's trampoline cannot be set
+    /// up or the caller-selected code permissions cannot be restored.
     fn maybe_patch_exec_segment(
         &self,
         mapped_addr: UserPtrMut<u8>,
@@ -1079,7 +1106,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         fd: i32,
         syscall_entry: usize,
         file_offset: Option<usize>,
-    ) -> bool {
+        restore_prot: &ProtFlags,
+    ) -> Result<(), Errno> {
         // Initialize patch state if this is the first mmap for this fd.
         // Typically the first mapping is at offset 0 (the ELF header), but
         // some loaders may map an executable segment at a non-zero offset first.
@@ -1092,11 +1120,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // linker loads shared libraries sequentially.
         let mut cache = self.global.elf_patch_cache.lock();
         let Some(state) = cache.get_mut(&fd) else {
-            return true; // No patch state — not an ELF we're tracking
+            return Ok(()); // No patch state — not an ELF we're tracking
         };
         #[cfg(target_arch = "aarch64")]
         if state.trampoline_invalidated {
-            return false;
+            return Err(Errno::ENOMEM);
         }
 
         if state.pre_patched {
@@ -1109,7 +1137,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 // object-span reservation, so validate ownership before MAP_FIXED.
                 #[cfg(target_arch = "aarch64")]
                 if !self.trampoline_range_is_safe_to_map(state, tramp_addr, tramp_len) {
-                    return false;
+                    return Err(Errno::ENOMEM);
                 }
                 let alloc_result = self.do_mmap_anonymous(
                     Some(tramp_addr),
@@ -1118,13 +1146,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
                 );
                 let Ok(alloc_ptr) = alloc_result else {
-                    return false;
+                    return Err(Errno::ENOMEM);
                 };
                 let actual_addr = alloc_ptr.as_usize();
                 if actual_addr != tramp_addr {
                     let _ =
                         self.sys_munmap_raw(UserPtrMut::<u8>::from_usize(actual_addr), tramp_len);
-                    return false;
+                    return Err(Errno::ENOMEM);
                 }
 
                 // Read trampoline data from the file.
@@ -1136,7 +1164,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .is_err()
                 {
                     let _ = self.sys_munmap_raw(tramp_ptr, tramp_len);
-                    return false;
+                    return Err(Errno::ENOMEM);
                 }
 
                 // Write syscall entry point to the first 8 bytes.
@@ -1149,7 +1177,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 if let Err(e) = finalize_trampoline_gates(self.global.platform, &mut tramp_data) {
                     litebox_util_log::error!(err:% = e; "refusing to map a trampoline whose guest thread-pointer gates are not patched");
                     let _ = self.sys_munmap_raw(tramp_ptr, tramp_len);
-                    return false;
+                    return Err(Errno::ENOMEM);
                 }
 
                 // Write to the mapped region.
@@ -1158,7 +1186,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .is_none()
                 {
                     let _ = self.sys_munmap_raw(tramp_ptr, tramp_len);
-                    return false;
+                    return Err(Errno::ENOMEM);
                 }
 
                 // Protect as RX immediately.
@@ -1171,13 +1199,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .is_err()
                 {
                     let _ = self.sys_munmap_raw(tramp_ptr, tramp_len);
-                    return false;
+                    return Err(Errno::ENOMEM);
                 }
 
                 state.trampoline_mapped = true;
                 state.trampoline_mapped_len = tramp_len;
             }
-            return true;
+            return Ok(());
         }
 
         // ── Runtime patching path (unpatched binaries) ───────────────
@@ -1191,11 +1219,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
         });
         #[cfg(target_arch = "aarch64")]
         let apply_trap_fallback = |mapped_addr, len, already_rw| {
-            self.apply_aarch64_trap_fallback(mapped_addr, len, already_rw, scan_ranges.as_ref());
+            self.apply_aarch64_trap_fallback(
+                mapped_addr,
+                len,
+                already_rw,
+                scan_ranges.as_ref(),
+                restore_prot,
+            )
         };
         #[cfg(target_arch = "x86_64")]
         let apply_trap_fallback = |mapped_addr, len, already_rw| {
-            self.apply_trap_fallback(mapped_addr, len, already_rw);
+            self.apply_trap_fallback(mapped_addr, len, already_rw, restore_prot)
         };
 
         // Allocate the trampoline region if not yet done.
@@ -1267,8 +1301,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 } else {
                     litebox_util_log::warn!("failed to allocate trampoline region");
                 }
-                apply_trap_fallback(mapped_addr, len, false);
-                return true;
+                return apply_trap_fallback(mapped_addr, len, false);
             };
             let actual_addr = actual_addr_ptr.as_usize();
 
@@ -1281,8 +1314,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 );
                 let _ =
                     self.sys_munmap_raw(UserPtrMut::<u8>::from_usize(actual_addr), reservation_len);
-                apply_trap_fallback(mapped_addr, len, false);
-                return true;
+                return apply_trap_fallback(mapped_addr, len, false);
             }
 
             state.trampoline_addr = actual_addr;
@@ -1296,8 +1328,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     litebox_util_log::warn!("failed to write syscall entry point to trampoline");
                     let _ = self
                         .sys_munmap_raw(UserPtrMut::<u8>::from_usize(actual_addr), reservation_len);
-                    apply_trap_fallback(mapped_addr, len, false);
-                    return true;
+                    return apply_trap_fallback(mapped_addr, len, false);
                 }
                 state.trampoline_cursor = litebox_syscall_rewriter::TRAMPOLINE_ENTRY_POINT_BYTES;
             } else {
@@ -1310,7 +1341,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // Performance guard: skip if this exact range was already patched.
         let mapping_key = (mapped_addr.as_usize(), len);
         if state.patched_ranges.contains(&mapping_key) {
-            return true;
+            return Ok(());
         }
         state.patched_ranges.insert(mapping_key);
 
@@ -1350,11 +1381,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         // Read the mapped code into a buffer, patch it, write back.
         let Some(code_owned) = mapped_addr.to_owned_slice::<Platform>(len) else {
-            let _ = self.sys_mprotect_raw(
-                mapped_addr,
-                len,
-                ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
-            );
+            let _ = self.sys_mprotect_raw(mapped_addr, len, restore_prot.clone());
             restore_trampoline_rx(self, state);
             panic!("fatal: failed to read code segment for patching");
         };
@@ -1420,17 +1447,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     let mut stubs = stubs;
                     if let Err(e) = finalize_trampoline_gates(self.global.platform, &mut stubs) {
                         litebox_util_log::error!(err:% = e; "refusing to install runtime gates whose guest thread-pointer is not patched");
-                        apply_trap_fallback(mapped_addr, len, true);
+                        let restored = apply_trap_fallback(mapped_addr, len, true);
                         restore_trampoline_rx(self, state);
-                        return true;
+                        return restored;
                     }
                     stubs
                 };
                 let Some(new_cursor) = state.trampoline_cursor.checked_add(stubs.len()) else {
                     litebox_util_log::warn!("trampoline cursor overflow");
-                    apply_trap_fallback(mapped_addr, len, true);
+                    let restored = apply_trap_fallback(mapped_addr, len, true);
                     restore_trampoline_rx(self, state);
-                    return true;
+                    return restored;
                 };
                 let tramp_pages_needed = align_up(new_cursor, PAGE_SIZE);
                 if tramp_pages_needed > state.trampoline_mapped_len {
@@ -1448,9 +1475,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         .is_err()
                     {
                         litebox_util_log::warn!("failed to expand trampoline region");
-                        apply_trap_fallback(mapped_addr, len, true);
+                        let restored = apply_trap_fallback(mapped_addr, len, true);
                         restore_trampoline_rx(self, state);
-                        return true;
+                        return restored;
                     }
                     state.trampoline_mapped_len = tramp_pages_needed;
                 }
@@ -1463,11 +1490,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .copy_from_slice::<Platform>(0, &stubs)
                     .is_none()
                 {
-                    let _ = self.sys_mprotect_raw(
-                        mapped_addr,
-                        len,
-                        ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
-                    );
+                    let _ = self.sys_mprotect_raw(mapped_addr, len, restore_prot.clone());
                     restore_trampoline_rx(self, state);
                     panic!("fatal: failed to write trampoline stubs");
                 }
@@ -1478,11 +1501,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .is_none()
                 {
                     let _ = mapped_addr.copy_from_slice::<Platform>(0, &original_code);
-                    let _ = self.sys_mprotect_raw(
-                        mapped_addr,
-                        len,
-                        ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
-                    );
+                    let _ = self.sys_mprotect_raw(mapped_addr, len, restore_prot.clone());
                     restore_trampoline_rx(self, state);
                     panic!("fatal: failed to write patched code back to code segment");
                 }
@@ -1499,26 +1518,23 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         .is_none()
                 {
                     let _ = mapped_addr.copy_from_slice::<Platform>(0, &original_code);
+                    let _ = self.sys_mprotect_raw(mapped_addr, len, restore_prot.clone());
                     panic!("fatal: failed to write trap bytes back to code segment");
                 }
-                // Fall through to restore RX protections below.
+                // Fall through to restore the caller-selected protections below.
             }
             Err(e) => {
                 litebox_util_log::warn!(err:? = e; "patch_code_segment failed");
-                apply_trap_fallback(mapped_addr, len, true);
+                let restored = apply_trap_fallback(mapped_addr, len, true);
                 restore_trampoline_rx(self, state);
-                return true;
+                return restored;
             }
         }
 
-        // Restore the code segment to RX.
-        let _ = self.sys_mprotect_raw(
-            mapped_addr,
-            len,
-            ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
-        );
+        // Restore the caller-selected code-segment permissions.
+        let restored = self.sys_mprotect_raw(mapped_addr, len, restore_prot.clone());
         restore_trampoline_rx(self, state);
-        true
+        restored
     }
 
     /// Finalize the ELF patching state for `fd`.
@@ -1548,7 +1564,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PAGE_SIZE, Task};
+    use super::{ElfPatchState, PAGE_SIZE, Task};
+    use alloc::collections::BTreeSet;
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     use litebox::platform::PageManagementProvider;
     use litebox::{
@@ -1563,27 +1580,29 @@ mod tests {
     use crate::UserPtrMut;
     use crate::syscalls::tests::{TestPlatform as Platform, create_file, init_platform};
 
+    fn file_mapping_permissions(
+        task: &Task<Platform>,
+        address: UserPtrMut<u8>,
+    ) -> MemoryRegionPermissions {
+        task.global
+            .pm
+            .get_memory_permissions(
+                NonZeroAddress::new(address.as_usize()).expect("mapping address is aligned"),
+                NonZeroPageSize::new(PAGE_SIZE).expect("page size is valid"),
+            )
+            .expect("mapping permissions should be tracked")
+    }
+
     fn check_file_mmap_permissions(
         task: &Task<Platform>,
         fd: i32,
         prot: ProtFlags,
         expected: MemoryRegionPermissions,
     ) {
-        let typed_fd = task
-            .typed_fd(fd)
-            .expect("test file descriptor should resolve");
         let address = task
-            .do_mmap_file_memcpy(None, PAGE_SIZE, prot, MapFlags::MAP_PRIVATE, &typed_fd, 0)
+            .do_mmap_file(None, PAGE_SIZE, prot, MapFlags::MAP_PRIVATE, fd, 0)
             .expect("file mapping should succeed");
-        let actual = task
-            .global
-            .pm
-            .get_memory_permissions(
-                NonZeroAddress::new(address.as_usize()).expect("mapping address is aligned"),
-                NonZeroPageSize::new(PAGE_SIZE).expect("page size is valid"),
-            )
-            .expect("mapping permissions should be tracked");
-        assert_eq!(actual, expected);
+        assert_eq!(file_mapping_permissions(task, address), expected);
         task.sys_munmap(address, PAGE_SIZE)
             .expect("test mapping should unmap");
     }
@@ -1591,12 +1610,35 @@ mod tests {
     #[test]
     fn file_mmap_preserves_requested_permissions() {
         let task = init_platform();
-        create_file(&task, "/mmap-permissions", &[0x5a]);
+        create_file(&task, "/mmap-permissions", &[0]);
         let fd = i32::try_from(
             task.sys_open("/mmap-permissions", OFlags::RDONLY, Mode::empty())
                 .expect("test file should open"),
         )
         .expect("file descriptor should fit i32");
+        task.global.elf_patch_cache.lock().insert(
+            fd,
+            ElfPatchState {
+                pre_patched: false,
+                trampoline_file_offset: 0,
+                trampoline_file_size: 0,
+                trampoline_addr: 0,
+                #[cfg(target_arch = "aarch64")]
+                load_span: None,
+                trampoline_cursor: 0,
+                trampoline_mapped: true,
+                trampoline_mapped_len: 0,
+                runtime_patches_committed: false,
+                #[cfg(target_arch = "aarch64")]
+                trampoline_invalidated: false,
+                #[cfg(target_arch = "aarch64")]
+                code_metadata: None,
+                #[cfg(target_arch = "aarch64")]
+                trampoline_capacity: 0,
+                file_mappings: BTreeSet::new(),
+                patched_ranges: BTreeSet::new(),
+            },
+        );
 
         for (prot, permissions) in [
             (ProtFlags::PROT_NONE, MemoryRegionPermissions::empty()),
@@ -1629,6 +1671,59 @@ mod tests {
             ),
         ] {
             check_file_mmap_permissions(&task, fd, prot, permissions);
+        }
+
+        let address = task
+            .do_mmap_file(
+                None,
+                PAGE_SIZE,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_PRIVATE,
+                fd,
+                0,
+            )
+            .expect("file mapping should succeed");
+        assert_eq!(
+            task.sys_mprotect(
+                address,
+                PAGE_SIZE,
+                ProtFlags::PROT_EXEC | ProtFlags::PROT_GROWSDOWN,
+            ),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            file_mapping_permissions(&task, address),
+            MemoryRegionPermissions::READ
+        );
+        task.sys_munmap(address, PAGE_SIZE)
+            .expect("test mapping should unmap");
+
+        #[cfg(target_os = "macos")]
+        {
+            let address = task
+                .do_mmap_file(
+                    None,
+                    PAGE_SIZE,
+                    ProtFlags::PROT_READ,
+                    MapFlags::MAP_PRIVATE,
+                    fd,
+                    0,
+                )
+                .expect("file mapping should succeed");
+            assert_eq!(
+                task.sys_mprotect(
+                    address,
+                    PAGE_SIZE,
+                    ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC,
+                ),
+                Err(Errno::EACCES)
+            );
+            assert_eq!(
+                file_mapping_permissions(&task, address),
+                MemoryRegionPermissions::READ
+            );
+            task.sys_munmap(address, PAGE_SIZE)
+                .expect("test mapping should unmap");
         }
 
         task.sys_close(fd).expect("test file should close");
