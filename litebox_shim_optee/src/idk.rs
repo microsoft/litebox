@@ -43,6 +43,7 @@ const IDKS_ENDORSEMENT_METADATA_LEN: usize = IDKS_ENDORSEMENT_MAGIC.len()
     + size_of::<TeeUuid>()
     + size_of::<u32>()
     + TA_DIGEST_LEN
+    + size_of::<u8>() // TA dynamic flag
     + size_of::<u8>()
     + ISOLATION_SOLUTION.len()
     + size_of::<u32>(); // DER leaf certificate length
@@ -142,6 +143,7 @@ impl IdksPta {
             &task.ta_app_id,
             task.ta_svn,
             &task.ta_digest,
+            task.ta_dynamic,
             ta_signing_cert,
         )
         .ok_or(TeeResult::BadParameters)?;
@@ -171,7 +173,7 @@ fn endorsement_data_len(ta_data_len: usize, ta_signing_cert_len: usize) -> Optio
 
 /// IDK_S-signed wire format:
 /// MAGIC || VERSION || TA_DATA_LEN || TA_DATA || TA_UUID || TA_SVN || TA_DIGEST ||
-/// DEBUG || ISOLATION_SOLUTION || TA_SIGNING_CERT_LEN || TA_SIGNING_CERT_DER.
+/// TA_DYNAMIC || DEBUG || ISOLATION_SOLUTION || TA_SIGNING_CERT_LEN || TA_SIGNING_CERT_DER.
 ///
 /// Integers and UUID are little endian; both lengths are u32 byte counts.
 /// A zero certificate length means absent.
@@ -180,6 +182,7 @@ fn build_endorsement_data(
     ta_uuid: &TeeUuid,
     ta_svn: u32,
     ta_digest: &TaDigest,
+    ta_dynamic: bool,
     ta_signing_cert: &[u8],
 ) -> Option<Vec<u8>> {
     let capacity = endorsement_data_len(ta_data.len(), ta_signing_cert.len())?;
@@ -193,6 +196,7 @@ fn build_endorsement_data(
     endorsement.extend_from_slice(&ta_uuid.to_le_bytes());
     endorsement.extend_from_slice(&ta_svn.to_le_bytes());
     endorsement.extend_from_slice(ta_digest);
+    endorsement.push(u8::from(ta_dynamic));
     endorsement.push(IDKS_DEBUG_FLAG);
     endorsement.extend_from_slice(ISOLATION_SOLUTION);
     endorsement.extend_from_slice(&cert_len.to_le_bytes());
@@ -368,9 +372,15 @@ mod tests {
         };
         let digest = [0xa5; TA_DIGEST_LEN];
         let long_data = [0x5a; 256];
-        for cert in [TEST_CERT, &[]] {
+        for (cert, ta_dynamic) in [
+            (TEST_CERT, false),
+            (TEST_CERT, true),
+            (&[][..], false),
+            (&[][..], true),
+        ] {
             for data in [b"TA data".as_slice(), &[], &long_data] {
-                let endorsement = build_endorsement_data(data, &uuid, 7, &digest, cert).unwrap();
+                let endorsement =
+                    build_endorsement_data(data, &uuid, 7, &digest, ta_dynamic, cert).unwrap();
                 let mut expected = Vec::from(b"IDKS\x01\x00\x00\x00".as_slice());
                 expected.extend_from_slice(&u32::try_from(data.len()).unwrap().to_le_bytes());
                 expected.extend_from_slice(data);
@@ -380,6 +390,7 @@ mod tests {
                 ]);
                 expected.extend_from_slice(&[7, 0, 0, 0]);
                 expected.extend_from_slice(&digest);
+                expected.push(u8::from(ta_dynamic));
                 expected.push(IDKS_DEBUG_FLAG);
                 expected.extend_from_slice(b"LVBS");
                 expected.extend_from_slice(&u32::try_from(cert.len()).unwrap().to_le_bytes());
@@ -395,7 +406,8 @@ mod tests {
                 let (parsed_data, metadata) = endorsement[12..].split_at(data_len);
                 assert_eq!(parsed_data, data);
                 assert_eq!(&metadata[..16], uuid.to_le_bytes());
-                let cert_len_offset = 16 + 4 + TA_DIGEST_LEN + 1 + 4;
+                assert_eq!(metadata[16 + 4 + TA_DIGEST_LEN], u8::from(ta_dynamic));
+                let cert_len_offset = 16 + 4 + TA_DIGEST_LEN + 1 + 1 + 4;
                 let cert_len = u32::from_le_bytes(
                     metadata[cert_len_offset..cert_len_offset + 4]
                         .try_into()
@@ -412,11 +424,17 @@ mod tests {
     fn pta_endorsement_uses_global_certificate_and_reports_output_size() {
         use p384::ecdsa::{Signature, VerifyingKey, signature::Verifier};
 
-        for cert in [TEST_CERT, &[]] {
+        for (cert, ta_dynamic) in [
+            (TEST_CERT, false),
+            (TEST_CERT, true),
+            (&[][..], false),
+            (&[][..], true),
+        ] {
             let shim = crate::syscalls::tests::shim_builder()
                 .with_ta_signing_cert(cert)
                 .build();
-            let task = shim.0.new_test_task();
+            let mut task = shim.0.new_test_task();
+            task.ta_dynamic = ta_dynamic;
             assert!(core::ptr::eq(task.global.ta_signing_cert, cert));
 
             for data in [b"TA data".as_slice(), &[]] {
@@ -434,6 +452,7 @@ mod tests {
                     &task.ta_app_id,
                     task.ta_svn,
                     &task.ta_digest,
+                    task.ta_dynamic,
                     cert,
                 )
                 .unwrap();
@@ -528,6 +547,7 @@ mod tests {
             &TeeUuid::NIL,
             7,
             &[0xa5; TA_DIGEST_LEN],
+            false,
             TEST_CERT,
         )
         .unwrap();
@@ -542,6 +562,7 @@ mod tests {
             8,
             12,
             12 + b"TA data".len() + 16 + 4,
+            12 + b"TA data".len() + 16 + 4 + TA_DIGEST_LEN,
             cert_start - 4,
             cert_start,
         ] {
