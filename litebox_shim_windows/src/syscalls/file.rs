@@ -16,7 +16,7 @@ use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProv
 use litebox::utils::TruncateExt as _;
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileMode as Mode, FileOpenFlags, FileSeekWhence as SeekWhence, FileStatus,
-    FileType,
+    FileType, MAX_FILE_TRANSFER_SIZE,
 };
 use litebox_common_windows::nt_status::NtStatus;
 use zerocopy::byteorder::native_endian::U32;
@@ -50,8 +50,7 @@ const FILE_SHARE_READ: u32 = 0x0000_0001;
 const FILE_SHARE_WRITE: u32 = 0x0000_0002;
 const FILE_SHARE_DELETE: u32 = 0x0000_0004;
 
-// Match the broker file payload limit so a successful chunk is not mistaken for a short transfer.
-const FILE_IO_CHUNK_SIZE: usize = 0x10_000;
+const FILE_IO_CHUNK_SIZE: usize = MAX_FILE_TRANSFER_SIZE as usize;
 
 /// Append at the current end of file
 const FILE_WRITE_TO_END_OF_FILE: i64 = -1;
@@ -1660,7 +1659,10 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                         && operation == FileIoOperation::Write =>
             {
                 let status = file
-                    .with_entry(|file| self.fs.path_file_status(&self.fs_context, &file.path))
+                    .with_entry(|file| match &file.backing {
+                        FileObjectBacking::Filesystem { fd, .. } => self.fs.file_status(fd),
+                        _ => self.fs.path_file_status(&self.fs_context, &file.path),
+                    })
                     .map_err(map_file_status_error)?;
                 Some(usize::try_from(status.size).map_err(|_| NtStatus::INVALID_PARAMETER)?)
             }

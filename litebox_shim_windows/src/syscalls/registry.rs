@@ -634,9 +634,29 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         desired_access: RegistryKeyAccess,
     ) -> Result<litebox::fs::FileFd, NtStatus> {
         let (access, flags) = desired_access.open_flags();
-        self.fs()
+        match self
+            .fs()
             .open_file(&self.fs_context, path, access, flags, Mode::empty())
-            .map_err(map_open_error)
+        {
+            // Registry rights are enforced by the NT handle. An immutable lower overlay
+            // directory can still back mutations whose child paths are copied up.
+            Err(OpenError::ReadOnlyFileSystem)
+                if matches!(
+                    access,
+                    FileAccessMode::WriteOnly | FileAccessMode::ReadWrite
+                ) =>
+            {
+                self.fs().open_file(
+                    &self.fs_context,
+                    path,
+                    FileAccessMode::ReadOnly,
+                    flags,
+                    Mode::empty(),
+                )
+            }
+            result => result,
+        }
+        .map_err(map_open_error)
     }
 
     fn read_value_at_path(
@@ -699,6 +719,7 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
             value_name,
             value_type,
             value,
+            FileOpenFlags::CREATE | FileOpenFlags::TRUNCATE,
         )?;
         self.record_change(key_path, RegistryNotifyFilter::LAST_SET);
         Ok(())
@@ -781,17 +802,9 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
             }
         }
 
-        let values_path = format!("{}/{}", key.path.trim_end_matches('/'), VALUES_DIR_NAME);
-        let values_fd = self
-            .fs()
-            .open_file(
-                &self.fs_context,
-                &values_path,
-                FileAccessMode::ReadOnly,
-                FileOpenFlags::DIRECTORY,
-                Mode::empty(),
-            )
-            .map_err(map_open_error)?;
+        let Some((values_path, values_fd)) = self.open_values_directory(&key.path)? else {
+            return Ok(summary);
+        };
         let values = self
             .fs()
             .read_file_directory(&self.fs_context, &values_path, &values_fd)
@@ -819,6 +832,26 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
                 .max(size - REGISTRY_VALUE_TYPE_SIZE as u64);
         }
         Ok(summary)
+    }
+
+    fn open_values_directory(
+        &self,
+        key_path: &str,
+    ) -> Result<Option<(String, litebox::fs::FileFd)>, NtStatus> {
+        let values_path = values_directory_path(key_path);
+        match self.fs().open_file(
+            &self.fs_context,
+            &values_path,
+            FileAccessMode::ReadOnly,
+            FileOpenFlags::DIRECTORY,
+            Mode::empty(),
+        ) {
+            Ok(fd) => Ok(Some((values_path, fd))),
+            Err(OpenError::PathError(
+                PathError::NoSuchFileOrDirectory | PathError::MissingComponent,
+            )) => Ok(None),
+            Err(error) => Err(map_open_error(error)),
+        }
     }
 
     /// Returns the deterministically-ordered leaf name of the `index`-th direct
@@ -883,17 +916,9 @@ impl<Platform: crate::ShimPlatform> RegistryStore<Platform> {
         key: &RegistryKeyObject,
         index: u32,
     ) -> Result<Option<String>, NtStatus> {
-        let values_path = format!("{}/{}", key.path.trim_end_matches('/'), VALUES_DIR_NAME);
-        let values_fd = self
-            .fs()
-            .open_file(
-                &self.fs_context,
-                &values_path,
-                FileAccessMode::ReadOnly,
-                FileOpenFlags::DIRECTORY,
-                Mode::empty(),
-            )
-            .map_err(map_open_error)?;
+        let Some((values_path, values_fd)) = self.open_values_directory(&key.path)? else {
+            return Ok(None);
+        };
         let entries = self
             .fs()
             .read_file_directory(&self.fs_context, &values_path, &values_fd)
@@ -2262,7 +2287,18 @@ fn write_value_in_fs<Platform: crate::ShimPlatform>(
     value: &[u8],
 ) -> Result<(), NtStatus> {
     let key_path = create_key_in_fs(fs, context, key_nt_path)?;
-    write_value_at_path(fs, context, &key_path, value_name, value_type.into(), value)
+    match write_value_at_path(
+        fs,
+        context,
+        &key_path,
+        value_name,
+        value_type.into(),
+        value,
+        FileOpenFlags::CREATE | FileOpenFlags::EXCLUSIVE,
+    ) {
+        Err(NtStatus::OBJECT_NAME_COLLISION) => Ok(()),
+        result => result,
+    }
 }
 
 fn write_value_at_path<Platform: crate::ShimPlatform>(
@@ -2272,14 +2308,17 @@ fn write_value_at_path<Platform: crate::ShimPlatform>(
     value_name: &str,
     value_type: u32,
     value: &[u8],
+    flags: FileOpenFlags,
 ) -> Result<(), NtStatus> {
+    let values_path = values_directory_path(key_path);
+    ensure_directory_in_fs(fs, context, &values_path)?;
     let value_path = value_path(key_path, value_name)?;
     let fd = fs
         .open_file(
             context,
             &value_path,
             FileAccessMode::WriteOnly,
-            FileOpenFlags::CREATE | FileOpenFlags::TRUNCATE,
+            flags,
             Mode::RUSR | Mode::WUSR | Mode::ROTH | Mode::WOTH,
         )
         .map_err(map_open_error)?;
@@ -2395,14 +2434,14 @@ fn value_path(key_path: &str, value_name: &str) -> Result<String, NtStatus> {
         return Err(NtStatus::INVALID_PARAMETER);
     }
 
-    let mut path = String::from(key_path);
-    if !path.ends_with('/') {
-        path.push('/');
-    }
-    path.push_str(VALUES_DIR_NAME);
+    let mut path = values_directory_path(key_path);
     path.push('/');
     path.push_str(&value_name.to_ascii_lowercase());
     Ok(path)
+}
+
+fn values_directory_path(key_path: &str) -> String {
+    format!("{}/{}", key_path.trim_end_matches('/'), VALUES_DIR_NAME)
 }
 
 fn is_valid_value_name(value_name: &str) -> bool {

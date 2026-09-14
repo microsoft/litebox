@@ -15,13 +15,12 @@ use std::path::PathBuf;
 
 /// Run Windows PE programs with LiteBox on unmodified Linux.
 ///
-/// The program binary and any initial filesystem contents must be provided inside a tar archive via
-/// `--initial-files`. The program path refers to a path inside the tar archive.
+/// The program binary and runtime files must be available in the broker-owned file system.
 #[derive(Parser, Debug)]
 pub struct CliArgs {
     /// The program and arguments passed to it (e.g., `/app/program.exe --help`).
     ///
-    /// The program path refers to a path inside the tar archive provided via `--initial-files`.
+    /// The program path refers to a path inside the broker-owned file system.
     #[arg(required = true, trailing_var_arg = true, value_hint = clap::ValueHint::CommandWithArguments)]
     pub program_and_arguments: Vec<String>,
     /// Environment variables passed to the program (`K=V` pairs; can be invoked multiple times).
@@ -43,20 +42,23 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub broker_control_channel: Option<PathBuf>,
-    /// Tar archive containing the program and its runtime files.
-    ///
-    /// This may be omitted when the broker was configured with `--fs-initial-files`.
-    #[arg(long = "initial-files", value_name = "PATH_TO_TAR", value_hint = clap::ValueHint::FilePath)]
-    pub initial_files: Option<PathBuf>,
+    /// Broker-supplied proxy URL for managed HTTP and HTTPS egress.
+    #[arg(
+        long = "broker-proxy-url",
+        value_name = "URL",
+        hide = true,
+        requires = "broker_control_channel",
+        help_heading = "Unstable Options"
+    )]
+    pub broker_proxy_url: Option<String>,
 }
 
 /// Run Windows PE programs with LiteBox on unmodified Linux.
-///
-/// # Panics
-///
-/// Panics if the initial in-memory file system fails to create `/tmp` - those
-/// operations cannot fail against a freshly-constructed file system.
 pub fn run(cli_args: CliArgs) -> Result<()> {
+    if cli_args.broker_proxy_url.is_some() {
+        anyhow::bail!("managed broker proxy is not supported by this runner");
+    }
+
     tracing_subscriber::fmt()
         .with_timer(tracing_subscriber::fmt::time::uptime())
         .with_level(true)
@@ -84,14 +86,18 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         coordinator,
         positional_io_fds: _broker_positional_io_fds,
         shutdown_fd: _broker_shutdown_fd,
-    } = broker::connect(control_socket)?;
+    } = litebox_platform_linux_userland::with_guest_signals_blocked(|| {
+        broker::connect(control_socket)
+    })?;
     let litebox = litebox::LiteBox::new_with_broker_local(platform, local);
     coordinator.install_dispatch(litebox.broker_failure_dispatcher());
-    broker::start_notification_receiver(
-        notifications,
-        coordinator,
-        litebox.broker_notification_dispatcher(),
-    )?;
+    litebox_platform_linux_userland::with_guest_signals_blocked(|| {
+        broker::start_notification_receiver(
+            notifications,
+            coordinator,
+            litebox.broker_notification_dispatcher(),
+        )
+    })?;
     let shim_builder =
         litebox_shim_windows::WindowsShimBuilder::new_with_litebox(platform, litebox);
 
