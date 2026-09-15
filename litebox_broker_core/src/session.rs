@@ -622,11 +622,10 @@ mod tests {
 
     use super::{SessionReferences, release_pending_reference};
     use crate::test_platform::TestPlatform;
-    use crate::test_support::TestBrokerCoreBuilder;
+    use crate::test_support::{TestBrokerCoreBuilder, TestStdioProvider};
     use crate::{
-        AssociationCancellation, BrokerCore, BrokerCoreLimits, BrokerError, CallerCredential,
-        ObjectRights, PolicyEngine, SocketPolicy,
-        stdio::{StdioProvider, StdioProviderError},
+        BrokerCore, BrokerCoreLimits, BrokerError, CallerCredential, ObjectRights, PolicyEngine,
+        SocketPolicy,
     };
     use litebox_broker_protocol::ObjectHandle;
     use litebox_broker_protocol::event::{EventConsumeMode, EventConsumption};
@@ -634,7 +633,6 @@ mod tests {
         FileAccessMode, FileError, FileMode, FileOpenFlags, FileSeekWhence, FileType, FileUser,
     };
     use litebox_broker_protocol::readiness::ReadinessFlags;
-    use litebox_broker_protocol::stdio::{StdioOutputStream, StdioStream};
     use std::{sync::Arc, vec, vec::Vec};
 
     const TEST_MAX_REFERENCES: usize = 4;
@@ -642,41 +640,6 @@ mod tests {
     const TEST_MAX_REFERENCES_PER_SESSION: usize = 2;
     const TEST_MAX_PIPE_CAPACITY_PER_SESSION: usize = 4;
     const ROOT: FileUser = FileUser { user: 0, group: 0 };
-
-    struct TestStdioProvider;
-
-    impl StdioProvider for TestStdioProvider {
-        fn read(
-            &self,
-            cancellation: &AssociationCancellation,
-            output: &mut [u8],
-        ) -> core::result::Result<usize, StdioProviderError> {
-            if cancellation.is_cancelled() {
-                return Err(StdioProviderError::Closed);
-            }
-            output.fill(b'i');
-            Ok(output.len())
-        }
-
-        fn write(
-            &self,
-            cancellation: &AssociationCancellation,
-            _stream: StdioOutputStream,
-            input: &[u8],
-        ) -> core::result::Result<usize, StdioProviderError> {
-            if cancellation.is_cancelled() {
-                return Err(StdioProviderError::Closed);
-            }
-            Ok(input.len())
-        }
-
-        fn is_terminal(
-            &self,
-            _stream: StdioStream,
-        ) -> core::result::Result<bool, StdioProviderError> {
-            Ok(false)
-        }
-    }
 
     #[test]
     fn pending_reference_release_checks_both_counters() {
@@ -972,7 +935,7 @@ mod tests {
         )
         .with_socket_provider(socket_provider.clone())
         .with_random_provider(Arc::new(crate::random::TestRandomProvider))
-        .with_stdio_provider(Arc::new(TestStdioProvider))
+        .with_stdio_provider(Arc::new(TestStdioProvider::default()))
         .with_file_service(Arc::new(
             crate::fs::resolver::Resolver::<TestPlatform, _>::new(fs),
         ))

@@ -3,9 +3,12 @@
 
 //! Strict default providers for constructing broker cores in tests.
 
+use alloc::collections::VecDeque;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use litebox_broker_protocol::stdio::{StdioOutputStream, StdioStream};
+use spin::Mutex;
 
 use crate::{
     AssociationCancellation, BrokerCore, BrokerCoreLimits, PolicyEngine, Result,
@@ -96,6 +99,100 @@ struct FailingRandomProvider;
 impl RandomProvider for FailingRandomProvider {
     fn fill(&self, _output: &mut [u8]) -> core::result::Result<(), RandomProviderError> {
         Err(RandomProviderError)
+    }
+}
+
+/// Functional standard-I/O provider for tests.
+///
+/// Reads drain buffered input, writes and terminal queries are recorded, and
+/// reads and writes fail once their association is cancelled.
+pub struct TestStdioProvider {
+    input: Mutex<VecDeque<u8>>,
+    writes: Mutex<Vec<(StdioOutputStream, Vec<u8>)>>,
+    terminal_queries: Mutex<Vec<StdioStream>>,
+    stdin_terminal: bool,
+    stdout_terminal: bool,
+    stderr_terminal: bool,
+}
+
+impl Default for TestStdioProvider {
+    fn default() -> Self {
+        Self {
+            input: Mutex::new(VecDeque::new()),
+            writes: Mutex::new(Vec::new()),
+            terminal_queries: Mutex::new(Vec::new()),
+            stdin_terminal: false,
+            stdout_terminal: false,
+            stderr_terminal: false,
+        }
+    }
+}
+
+impl TestStdioProvider {
+    /// Marks `stream` as connected to a terminal.
+    #[must_use]
+    pub const fn with_terminal(mut self, stream: StdioStream) -> Self {
+        match stream {
+            StdioStream::Stdin => self.stdin_terminal = true,
+            StdioStream::Stdout => self.stdout_terminal = true,
+            StdioStream::Stderr => self.stderr_terminal = true,
+        }
+        self
+    }
+
+    /// Appends bytes that subsequent standard-input reads will drain.
+    pub fn push_input(&self, input: &[u8]) {
+        self.input.lock().extend(input.iter().copied());
+    }
+
+    /// Returns a snapshot of the recorded standard-output writes.
+    pub fn writes(&self) -> Vec<(StdioOutputStream, Vec<u8>)> {
+        self.writes.lock().clone()
+    }
+
+    /// Returns a snapshot of the recorded terminal queries.
+    pub fn terminal_queries(&self) -> Vec<StdioStream> {
+        self.terminal_queries.lock().clone()
+    }
+}
+
+impl StdioProvider for TestStdioProvider {
+    fn read(
+        &self,
+        cancellation: &AssociationCancellation,
+        output: &mut [u8],
+    ) -> core::result::Result<usize, StdioProviderError> {
+        if cancellation.is_cancelled() {
+            return Err(StdioProviderError::Closed);
+        }
+        let mut input = self.input.lock();
+        let read = input.len().min(output.len());
+        for (destination, source) in output.iter_mut().zip(input.drain(..read)) {
+            *destination = source;
+        }
+        Ok(read)
+    }
+
+    fn write(
+        &self,
+        cancellation: &AssociationCancellation,
+        stream: StdioOutputStream,
+        input: &[u8],
+    ) -> core::result::Result<usize, StdioProviderError> {
+        if cancellation.is_cancelled() {
+            return Err(StdioProviderError::Closed);
+        }
+        self.writes.lock().push((stream, input.to_vec()));
+        Ok(input.len())
+    }
+
+    fn is_terminal(&self, stream: StdioStream) -> core::result::Result<bool, StdioProviderError> {
+        self.terminal_queries.lock().push(stream);
+        Ok(match stream {
+            StdioStream::Stdin => self.stdin_terminal,
+            StdioStream::Stdout => self.stdout_terminal,
+            StdioStream::Stderr => self.stderr_terminal,
+        })
     }
 }
 
