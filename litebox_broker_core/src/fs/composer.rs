@@ -610,12 +610,18 @@ impl Backend for Composer {
                 self.mounts[mount_index]
                     .backend
                     .open_file_at(handle, name, flags)
-                    .map(|file| Permissioned {
-                        item: FileHandle::from_typed::<Self>(ComposerFileHandle {
-                            mount_index,
-                            handle: file.item,
-                        }),
-                        permissions: file.permissions,
+                    .map(|file| {
+                        let device = file.item.device();
+                        Permissioned {
+                            item: FileHandle::from_typed_with_device::<Self>(
+                                ComposerFileHandle {
+                                    mount_index,
+                                    handle: file.item,
+                                },
+                                device,
+                            ),
+                            permissions: file.permissions,
+                        }
                     })
             }
         }
@@ -636,17 +642,11 @@ impl Backend for Composer {
         }
     }
 
-    fn read(
-        &self,
-        device_io: &dyn super::backend::DeviceIo,
-        h: &FileHandle,
-        buf: &mut [u8],
-        offset: usize,
-    ) -> Result<usize, ReadError> {
+    fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError> {
         let h = h.get_typed::<Self>();
         self.mounts[h.mount_index]
             .backend
-            .read(device_io, &h.handle, buf, offset)
+            .read(&h.handle, buf, offset)
     }
 
     fn get_static_backing_data(&self, h: &FileHandle) -> Option<&'static [u8]> {
@@ -656,17 +656,11 @@ impl Backend for Composer {
             .get_static_backing_data(&h.handle)
     }
 
-    fn write(
-        &self,
-        device_io: &dyn super::backend::DeviceIo,
-        h: &FileHandle,
-        buf: &[u8],
-        offset: usize,
-    ) -> Result<usize, WriteError> {
+    fn write(&self, h: &FileHandle, buf: &[u8], offset: usize) -> Result<usize, WriteError> {
         let h = h.get_typed::<Self>();
         self.mounts[h.mount_index]
             .backend
-            .write(device_io, &h.handle, buf, offset)
+            .write(&h.handle, buf, offset)
     }
 
     fn truncate(&self, h: &FileHandle, length: usize) -> Result<(), TruncateError> {
@@ -721,10 +715,14 @@ impl Backend for Composer {
                     .backend
                     .create_file_at(handle, name, metadata)
                     .map(|handle| {
-                        FileHandle::from_typed::<Self>(ComposerFileHandle {
-                            mount_index,
-                            handle,
-                        })
+                        let device = handle.device();
+                        FileHandle::from_typed_with_device::<Self>(
+                            ComposerFileHandle {
+                                mount_index,
+                                handle,
+                            },
+                            device,
+                        )
                     })
             }
         }

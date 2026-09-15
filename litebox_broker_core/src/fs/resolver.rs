@@ -15,7 +15,7 @@ use super::errors::{
 use super::{
     FileType, Mode, OFlags,
     backend::{
-        CreationMetadata, DeviceIo, DirHandle, Handle, HandleRef, PermissionCheck, PermissionInfo,
+        CreationMetadata, DirHandle, Handle, HandleRef, PermissionCheck, PermissionInfo,
         Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkingDirHandle,
     },
 };
@@ -537,9 +537,8 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         }
     }
 
-    fn read_inner(
+    pub(crate) fn read_without_position_update(
         &self,
-        device_io: &dyn DeviceIo,
         entry: &ResolverEntry<Backend>,
         buf: &mut [u8],
         offset: Option<usize>,
@@ -561,7 +560,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             SeekBehavior::NonSeekable | SeekBehavior::ZeroPosition => 0,
             SeekBehavior::PositionBased => offset.unwrap_or(entry.position),
         };
-        let read = self.backend.read(device_io, file, buf, read_offset)?;
+        let read = self.backend.read(file, buf, read_offset)?;
         Ok((read, read_offset))
     }
 
@@ -576,33 +575,19 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     /// Panics if the updated file offset would overflow `usize`.
     pub fn read(
         &self,
-        device_io: &dyn DeviceIo,
         entry: &mut ResolverEntry<Backend>,
         buf: &mut [u8],
         offset: Option<usize>,
     ) -> Result<usize, ReadError> {
-        let (read, read_offset) = self.read_inner(device_io, entry, buf, offset)?;
+        let (read, read_offset) = self.read_without_position_update(entry, buf, offset)?;
         if entry.uses_position() && offset.is_none() {
             entry.position = read_offset.checked_add(read).unwrap();
         }
         Ok(read)
     }
 
-    pub(crate) fn read_without_position_update(
+    pub(crate) fn write_without_position_update(
         &self,
-        device_io: &dyn DeviceIo,
-        entry: &ResolverEntry<Backend>,
-        buf: &mut [u8],
-        offset: Option<usize>,
-    ) -> Result<usize, ReadError> {
-        debug_assert!(offset.is_some() || !entry.uses_position());
-        self.read_inner(device_io, entry, buf, offset)
-            .map(|(read, _)| read)
-    }
-
-    fn write_inner(
-        &self,
-        device_io: &dyn DeviceIo,
         entry: &ResolverEntry<Backend>,
         buf: &[u8],
         offset: Option<usize>,
@@ -633,7 +618,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             }
             SeekBehavior::PositionBased => offset.unwrap_or(entry.position),
         };
-        let written = self.backend.write(device_io, file, buf, write_offset)?;
+        let written = self.backend.write(file, buf, write_offset)?;
         Ok((written, write_offset))
     }
 
@@ -648,28 +633,15 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     /// Panics if the updated file offset would overflow `usize`.
     pub fn write(
         &self,
-        device_io: &dyn DeviceIo,
         entry: &mut ResolverEntry<Backend>,
         buf: &[u8],
         offset: Option<usize>,
     ) -> Result<usize, WriteError> {
-        let (written, write_offset) = self.write_inner(device_io, entry, buf, offset)?;
+        let (written, write_offset) = self.write_without_position_update(entry, buf, offset)?;
         if entry.uses_position() && offset.is_none() {
             entry.position = write_offset.checked_add(written).unwrap();
         }
         Ok(written)
-    }
-
-    pub(crate) fn write_without_position_update(
-        &self,
-        device_io: &dyn DeviceIo,
-        entry: &ResolverEntry<Backend>,
-        buf: &[u8],
-        offset: Option<usize>,
-    ) -> Result<usize, WriteError> {
-        debug_assert!(offset.is_some() || !entry.uses_position());
-        self.write_inner(device_io, entry, buf, offset)
-            .map(|(written, _)| written)
     }
 
     /// Reposition read/write file offset, by changing it to `offset` relative to `whence`.
@@ -1007,6 +979,17 @@ impl<Backend: super::backend::Backend> ResolverEntry<Backend> {
 
     pub(crate) const fn allows_read(&self) -> bool {
         self.read_allowed
+    }
+
+    pub(crate) const fn allows_write(&self) -> bool {
+        self.write_allowed
+    }
+
+    pub(crate) fn device(&self) -> Option<super::devices::Device> {
+        match &self.handle {
+            Handle::File(file) => file.device(),
+            Handle::Dir(_) => None,
+        }
     }
 
     pub(crate) const fn uses_position(&self) -> bool {

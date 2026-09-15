@@ -11,11 +11,9 @@ use litebox_broker_protocol::fs::{
     FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileOpenFlags, FileSeekWhence,
     FileStatus, FileUser, MAX_FILE_TRANSFER_SIZE,
 };
-use litebox_broker_protocol::stdio::{MAX_STDIO_TRANSFER_SIZE, StdioOutputStream};
 use litebox_platform::sync::{RawSyncPrimitivesProvider, RwLock};
 
 use super::OFlags;
-use super::backend::DeviceIo;
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
     ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
@@ -226,18 +224,27 @@ where
         };
         let state = file.state::<RwLock<Platform, ResolverEntry<Backend>>>()?;
         let entry = state.read();
-        let read = if offset.is_some() || !entry.uses_position() {
+        let read = if let Some(device) = entry.device() {
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            self.read_without_position_update(&SessionDeviceIo(session), &entry, output, offset)
+            if !entry.allows_read() {
+                return Ok(Err(FileError::NotForReading));
+            }
+            device.read(session, output)
+        } else if offset.is_some() || !entry.uses_position() {
+            if entry.is_path_only() {
+                return Ok(Err(FileError::AccessNotAllowed));
+            }
+            self.read_without_position_update(&entry, output, offset)
+                .map(|(read, _)| read)
         } else {
             drop(entry);
             let mut entry = state.write();
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            Resolver::read(self, &SessionDeviceIo(session), &mut entry, output, offset)
+            Resolver::read(self, &mut entry, output, offset)
         };
         let read = match read {
             Ok(read) => read,
@@ -261,18 +268,27 @@ where
         };
         let state = file.state::<RwLock<Platform, ResolverEntry<Backend>>>()?;
         let entry = state.read();
-        let written = if offset.is_some() || !entry.uses_position() {
+        let written = if let Some(device) = entry.device() {
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            self.write_without_position_update(&SessionDeviceIo(session), &entry, input, offset)
+            if !entry.allows_write() {
+                return Ok(Err(FileError::NotForWriting));
+            }
+            device.write(session, input)
+        } else if offset.is_some() || !entry.uses_position() {
+            if entry.is_path_only() {
+                return Ok(Err(FileError::AccessNotAllowed));
+            }
+            self.write_without_position_update(&entry, input, offset)
+                .map(|(written, _)| written)
         } else {
             drop(entry);
             let mut entry = state.write();
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            Resolver::write(self, &SessionDeviceIo(session), &mut entry, input, offset)
+            Resolver::write(self, &mut entry, input, offset)
         };
         let written = match written {
             Ok(written) => written,
@@ -678,28 +694,6 @@ fn file_with_any_rights(
             Err(BrokerError::InvalidRights)
         }
         ObjectEntry::Reserved => Err(BrokerError::Internal),
-    }
-}
-
-struct SessionDeviceIo<'session>(&'session BrokerSession);
-
-impl DeviceIo for SessionDeviceIo<'_> {
-    fn read_stdin(&self, output: &mut [u8]) -> core::result::Result<usize, ReadError> {
-        let length = output.len().min(MAX_STDIO_TRANSFER_SIZE as usize);
-        crate::stdio::read(self.0, &mut output[..length]).map_err(|_| ReadError::Io)
-    }
-
-    fn write_stdio(
-        &self,
-        stream: StdioOutputStream,
-        input: &[u8],
-    ) -> core::result::Result<usize, WriteError> {
-        let length = input.len().min(MAX_STDIO_TRANSFER_SIZE as usize);
-        crate::stdio::write(self.0, stream, &input[..length]).map_err(|_| WriteError::Io)
-    }
-
-    fn fill_random(&self, output: &mut [u8]) -> core::result::Result<(), ReadError> {
-        crate::random::fill(self.0, output).map_err(|_| ReadError::Io)
     }
 }
 

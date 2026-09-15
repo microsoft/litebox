@@ -1034,11 +1034,8 @@ mod tests {
         AcceptedPlatformSocket, PlatformConnectError, PlatformDatagramReceive, PlatformSocket,
         PlatformSocketStatus, PlatformStreamReceive, SocketProvider,
     };
-    use litebox_broker_core::stdio::{StdioProvider, StdioProviderError};
-    use litebox_broker_core::test_support::TestBrokerCoreBuilder;
-    use litebox_broker_core::{
-        AssociationCancellation, ObjectRights, PolicyEngine, SessionId, SocketPolicy,
-    };
+    use litebox_broker_core::test_support::{TestBrokerCoreBuilder, TestStdioProvider};
+    use litebox_broker_core::{ObjectRights, PolicyEngine, SessionId, SocketPolicy};
     use litebox_broker_protocol::event::{
         AddEventRequest, ConsumeEventRequest, CreateEventRequest, EventConsumeMode,
     };
@@ -1068,7 +1065,6 @@ mod tests {
     use litebox_platform::sync::{
         ImmediatelyWokenUp, RawMutex, RawMutexProvider, UnblockedOrTimedOut,
     };
-    use std::collections::VecDeque;
     use std::sync::{Arc, Condvar, Mutex, mpsc};
     use std::time::Duration;
 
@@ -1199,46 +1195,6 @@ mod tests {
             }
             output.fill(0x5a);
             Ok(())
-        }
-    }
-
-    #[derive(Default)]
-    struct TestStdioProvider {
-        input: Mutex<VecDeque<u8>>,
-        writes: Mutex<Vec<(StdioOutputStream, Vec<u8>)>>,
-        terminal_queries: Mutex<Vec<StdioStream>>,
-    }
-
-    impl StdioProvider for TestStdioProvider {
-        fn read(
-            &self,
-            _cancellation: &AssociationCancellation,
-            output: &mut [u8],
-        ) -> core::result::Result<usize, StdioProviderError> {
-            let mut input = self.input.lock().unwrap();
-            let read = input.len().min(output.len());
-            for (destination, source) in output.iter_mut().zip(input.drain(..read)) {
-                *destination = source;
-            }
-            Ok(read)
-        }
-
-        fn write(
-            &self,
-            _cancellation: &AssociationCancellation,
-            stream: StdioOutputStream,
-            input: &[u8],
-        ) -> core::result::Result<usize, StdioProviderError> {
-            self.writes.lock().unwrap().push((stream, input.to_vec()));
-            Ok(input.len())
-        }
-
-        fn is_terminal(
-            &self,
-            stream: StdioStream,
-        ) -> core::result::Result<bool, StdioProviderError> {
-            self.terminal_queries.lock().unwrap().push(stream);
-            Ok(stream == StdioStream::Stderr)
         }
     }
 
@@ -1391,7 +1347,8 @@ mod tests {
 
     #[test]
     fn host_request_handling_uses_one_broker_core() {
-        let stdio_provider = Arc::new(TestStdioProvider::default());
+        let stdio_provider =
+            Arc::new(TestStdioProvider::default().with_terminal(StdioStream::Stderr));
         let fs = litebox_broker_core::fs::in_mem::InMem::<TestSync>::new(
             litebox_broker_core::fs::inode_allocator::InodeAllocator::standalone(),
         );
@@ -1607,7 +1564,7 @@ mod tests {
         shared_buffers
             .write(SharedBufferSlotIndex(7), b"error")
             .unwrap();
-        provider.input.lock().unwrap().extend(b"input");
+        provider.push_input(b"input");
 
         assert_eq!(
             handle_test_request_with_buffers(
@@ -1675,7 +1632,7 @@ mod tests {
             BrokerResult::Stdio(StdioResponse::Write(WriteStdioResponse { written: 5 }))
         );
         assert_eq!(
-            provider.writes.lock().unwrap().as_slice(),
+            provider.writes().as_slice(),
             [(StdioOutputStream::Stderr, b"error".to_vec())]
         );
         assert_eq!(
@@ -1691,7 +1648,7 @@ mod tests {
             }))
         );
         assert_eq!(
-            provider.terminal_queries.lock().unwrap().as_slice(),
+            provider.terminal_queries().as_slice(),
             [StdioStream::Stderr]
         );
         assert_eq!(

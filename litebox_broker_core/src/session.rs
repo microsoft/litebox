@@ -622,7 +622,7 @@ mod tests {
 
     use super::{SessionReferences, release_pending_reference};
     use crate::test_platform::TestPlatform;
-    use crate::test_support::TestBrokerCoreBuilder;
+    use crate::test_support::{TestBrokerCoreBuilder, TestStdioProvider};
     use crate::{
         BrokerCore, BrokerCoreLimits, BrokerError, CallerCredential, ObjectRights, PolicyEngine,
         SocketPolicy,
@@ -633,7 +633,8 @@ mod tests {
         FileAccessMode, FileError, FileMode, FileOpenFlags, FileSeekWhence, FileType, FileUser,
     };
     use litebox_broker_protocol::readiness::ReadinessFlags;
-    use std::{sync::Arc, vec::Vec};
+    use litebox_broker_protocol::stdio::StdioOutputStream;
+    use std::{sync::Arc, vec, vec::Vec};
 
     const TEST_MAX_REFERENCES: usize = 4;
     const TEST_MAX_PIPE_CAPACITY: usize = 8;
@@ -726,7 +727,7 @@ mod tests {
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
     }
 
-    fn check_file_reference_lifecycle(broker: &BrokerCore) {
+    fn check_file_reference_lifecycle(broker: &BrokerCore, stdio_provider: &TestStdioProvider) {
         let source = broker
             .create_session(CallerCredential::Unauthenticated)
             .unwrap();
@@ -870,13 +871,85 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let mut random_bytes = [0; 4];
+        let mut random_bytes =
+            vec![0; litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE as usize + 1];
         assert_eq!(
             crate::fs::read(&source, random, &mut random_bytes, None),
-            Ok(Ok(4))
+            Ok(Ok(random_bytes.len()))
         );
-        assert_eq!(random_bytes, [0x5a; 4]);
+        assert!(random_bytes.iter().all(|byte| *byte == 0x5a));
         assert_eq!(source.close_object_reference(random), Ok(()));
+
+        let write_only_random = broker
+            .fs
+            .open(
+                &source,
+                "/dev/urandom",
+                ROOT,
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::NONE,
+                FileMode::default(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            broker.fs.read(&source, &write_only_random, &mut [0], None),
+            Ok(Err(FileError::NotForReading))
+        );
+
+        let read_only_null = broker
+            .fs
+            .open(
+                &source,
+                "/dev/null",
+                ROOT,
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::NONE,
+                FileMode::default(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            broker.fs.write(&source, &read_only_null, &[0], None),
+            Ok(Err(FileError::NotForWriting))
+        );
+
+        let stdout = crate::fs::open(
+            &source,
+            "/dev/stdout",
+            ROOT,
+            FileAccessMode::WriteOnly,
+            FileOpenFlags::NONE,
+            FileMode::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let duplicated_stdout = source
+            .duplicate_object_reference_to(stdout, &target, ObjectRights::WRITE)
+            .unwrap();
+        source.request_cancellation();
+        assert_eq!(
+            crate::fs::write(&source, stdout, b"source", None),
+            Ok(Err(FileError::Io))
+        );
+        let stdio_input =
+            vec![b'x'; litebox_broker_protocol::stdio::MAX_STDIO_TRANSFER_SIZE as usize + 1];
+        assert_eq!(
+            crate::fs::write(&target, duplicated_stdout, &stdio_input, None),
+            Ok(Ok(
+                litebox_broker_protocol::stdio::MAX_STDIO_TRANSFER_SIZE as usize
+            ))
+        );
+        assert_eq!(
+            stdio_provider.writes(),
+            vec![(
+                StdioOutputStream::Stdout,
+                stdio_input[..litebox_broker_protocol::stdio::MAX_STDIO_TRANSFER_SIZE as usize]
+                    .to_vec()
+            )]
+        );
+        assert_eq!(source.close_object_reference(stdout), Ok(()));
+        assert_eq!(target.close_object_reference(duplicated_stdout), Ok(()));
     }
 
     #[test]
@@ -887,6 +960,7 @@ mod tests {
             .mount("/dev", crate::fs::devices::Devices::new)
             .build()
             .unwrap();
+        let stdio_provider = Arc::new(TestStdioProvider::default());
         let broker = TestBrokerCoreBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_socket_policy(SocketPolicy::guest_network()),
@@ -905,6 +979,7 @@ mod tests {
         )
         .with_socket_provider(socket_provider.clone())
         .with_random_provider(Arc::new(crate::random::TestRandomProvider))
+        .with_stdio_provider(stdio_provider.clone())
         .with_file_service(Arc::new(
             crate::fs::resolver::Resolver::<TestPlatform, _>::new(fs),
         ))
@@ -922,7 +997,7 @@ mod tests {
         check_pipe_capacity_quota_is_per_session(&broker);
         check_pipe_capacity_outlives_session_for_in_flight_object(&broker);
         check_supported_references_duplicate_between_sessions(&broker);
-        check_file_reference_lifecycle(&broker);
+        check_file_reference_lifecycle(&broker, &stdio_provider);
         crate::socket::tests::check_socket_lifecycle(&broker, &socket_provider);
         check_pair_handle_exhaustion(&broker);
 

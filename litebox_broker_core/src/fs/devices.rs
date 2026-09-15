@@ -9,11 +9,11 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
-use litebox_broker_protocol::stdio::StdioOutputStream;
+use litebox_broker_protocol::stdio::{MAX_STDIO_TRANSFER_SIZE, StdioOutputStream};
 
 use super::backend::{
-    Backend, BackendHandles, CreationMetadata, DeviceIo, DirHandle, FileHandle, HandleRef,
-    PermissionCheck, Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkingDirHandle,
+    Backend, BackendHandles, CreationMetadata, DirHandle, FileHandle, HandleRef, PermissionCheck,
+    Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkingDirHandle,
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
@@ -21,6 +21,7 @@ use super::errors::{
 };
 use super::inode_allocator::InodeAllocator;
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
+use crate::BrokerSession;
 
 /// Block size for stdio devices
 const STDIO_BLOCK_SIZE: u64 = 1024;
@@ -58,7 +59,7 @@ const URANDOM_NODE_INFO: NodeInfo = NodeInfo {
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Device {
+pub(crate) enum Device {
     Stdin,
     Stdout,
     Stderr,
@@ -77,6 +78,38 @@ impl Device {
 
     fn from_name(name: &str) -> Option<Self> {
         Self::ALL.iter().find(|(n, _)| *n == name).map(|(_, d)| *d)
+    }
+
+    pub(crate) fn read(
+        self,
+        session: &BrokerSession,
+        output: &mut [u8],
+    ) -> Result<usize, ReadError> {
+        match self {
+            Device::Stdin => {
+                let length = output.len().min(MAX_STDIO_TRANSFER_SIZE as usize);
+                crate::stdio::read(session, &mut output[..length]).map_err(|_| ReadError::Io)
+            }
+            Device::Stdout | Device::Stderr => Err(ReadError::NotForReading),
+            Device::Null => Ok(0),
+            Device::URandom => {
+                for chunk in output.chunks_mut(MAX_RANDOM_TRANSFER_SIZE as usize) {
+                    crate::random::fill(session, chunk).map_err(|_| ReadError::Io)?;
+                }
+                Ok(output.len())
+            }
+        }
+    }
+
+    pub(crate) fn write(self, session: &BrokerSession, input: &[u8]) -> Result<usize, WriteError> {
+        let stream = match self {
+            Device::Stdin => return Err(WriteError::NotForWriting),
+            Device::Stdout => StdioOutputStream::Stdout,
+            Device::Stderr => StdioOutputStream::Stderr,
+            Device::Null | Device::URandom => return Ok(input.len()),
+        };
+        let length = input.len().min(MAX_STDIO_TRANSFER_SIZE as usize);
+        crate::stdio::write(session, stream, &input[..length]).map_err(|_| WriteError::Io)
     }
 
     fn file_status(self) -> FileStatus {
@@ -226,7 +259,10 @@ impl Backend for Devices {
         }
 
         Ok(Permissioned {
-            item: FileHandle::from_typed::<Self>(DeviceFileHandle { device }),
+            item: FileHandle::from_typed_with_device::<Self>(
+                DeviceFileHandle { device },
+                Some(device),
+            ),
             permissions: PermissionCheck::ByBackend,
         })
     }
@@ -243,55 +279,34 @@ impl Backend for Devices {
             .collect())
     }
 
-    fn read(
-        &self,
-        device_io: &dyn DeviceIo,
-        h: &FileHandle,
-        buf: &mut [u8],
-        _offset: usize,
-    ) -> Result<usize, ReadError> {
+    fn read(&self, h: &FileHandle, buf: &mut [u8], _offset: usize) -> Result<usize, ReadError> {
         let h = h.get_typed::<Self>();
         match h.device {
-            Device::Stdin => device_io.read_stdin(buf),
             Device::Stdout | Device::Stderr => Err(ReadError::NotForReading),
-            Device::Null => {
-                // /dev/null read returns EOF
-                Ok(0)
-            }
-            Device::URandom => {
-                for chunk in buf.chunks_mut(MAX_RANDOM_TRANSFER_SIZE as usize) {
-                    device_io.fill_random(chunk)?;
+            Device::Null => Ok(0),
+            Device::Stdin | Device::URandom => {
+                if buf.is_empty() {
+                    Ok(0)
+                } else {
+                    Err(ReadError::Io)
                 }
-                Ok(buf.len())
             }
         }
     }
 
-    fn write(
-        &self,
-        device_io: &dyn DeviceIo,
-        h: &FileHandle,
-        buf: &[u8],
-        _offset: usize,
-    ) -> Result<usize, WriteError> {
+    fn write(&self, h: &FileHandle, buf: &[u8], _offset: usize) -> Result<usize, WriteError> {
         let h = h.get_typed::<Self>();
-        let stream = match h.device {
-            Device::Stdin => return Err(WriteError::NotForWriting),
-            Device::Stdout => StdioOutputStream::Stdout,
-            Device::Stderr => StdioOutputStream::Stderr,
-            Device::Null | Device::URandom => {
-                // /dev/null discards data: report as if written fully
-                //
-                // Writing to /dev/random or /dev/urandom will update the entropy
-                // pool with the data written, but this will not result in a higher
-                // entropy count. This means that it will impact the contents read
-                // from both files, but it will not make reads from /dev/random
-                // faster. For simplicity, we just discard the data written to
-                // /dev/urandom here.
-                return Ok(buf.len());
+        match h.device {
+            Device::Stdin => Err(WriteError::NotForWriting),
+            Device::Stdout | Device::Stderr => {
+                if buf.is_empty() {
+                    Ok(0)
+                } else {
+                    Err(WriteError::Io)
+                }
             }
-        };
-        device_io.write_stdio(stream, buf)
+            Device::Null | Device::URandom => Ok(buf.len()),
+        }
     }
 
     fn truncate(&self, _h: &FileHandle, _len: usize) -> Result<(), TruncateError> {
@@ -365,7 +380,6 @@ impl Backend for Devices {
 
 #[cfg(test)]
 mod tests {
-    use super::super::backend::NoDeviceIo;
     use super::*;
 
     #[test]
@@ -376,9 +390,10 @@ mod tests {
             .unwrap()
             .item;
 
-        assert_eq!(devices.read(&NoDeviceIo, &urandom, &mut [], 0).unwrap(), 0);
+        assert_eq!(urandom.device(), Some(Device::URandom));
+        assert_eq!(devices.read(&urandom, &mut [], 0).unwrap(), 0);
         assert!(matches!(
-            devices.read(&NoDeviceIo, &urandom, &mut [0], 0),
+            devices.read(&urandom, &mut [0], 0),
             Err(ReadError::Io)
         ));
     }
