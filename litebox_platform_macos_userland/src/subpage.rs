@@ -599,14 +599,353 @@ mod tests {
 
     use super::*;
 
-    use crate::{MacosUserland, UserMutPtr};
+    use crate::{MacosUserland, UserMutPtr, run_thread};
     use litebox::platform::{
         PageManagementProvider as _, RawConstPointer as _, RawMutPointer as _,
+    };
+    use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
+    use litebox_common_linux::PtRegs;
+    use litebox_common_linux::loader::{
+        AccessMemory as _, ElfParsedFile, MapMemory, Protection, ReadAt,
     };
 
     const R: Perm = Perm::READ;
     const RW: Perm = Perm::READ.union(Perm::WRITE);
     const RX: Perm = Perm::READ.union(Perm::EXEC);
+
+    struct TestMapping {
+        platform: &'static MacosUserland,
+        range: Range<usize>,
+    }
+
+    impl TestMapping {
+        fn new(len: usize) -> Self {
+            let platform = MacosUserland::new();
+            // Own whole native pages so no unrelated mapping shares our backing.
+            let len = len.next_multiple_of(HOST_PAGE_SIZE);
+            let base = platform
+                .allocate_pages(
+                    TASK_ADDR_MIN..TASK_ADDR_MIN + len,
+                    RW,
+                    false,
+                    true,
+                    FixedAddressBehavior::Hint,
+                )
+                .unwrap()
+                .as_usize();
+            Self {
+                platform,
+                range: base..base + len,
+            }
+        }
+
+        fn write_code(&self, offset: usize, code: &[u32]) {
+            let bytes: Vec<_> = code.iter().flat_map(|word| word.to_le_bytes()).collect();
+            self.write(self.range.start + offset, &bytes);
+        }
+
+        fn write(&self, address: usize, data: &[u8]) {
+            let mut platform = self.platform;
+            platform.write(address, data).unwrap();
+        }
+
+        fn read(&self, address: usize, data: &mut [u8]) {
+            let mut platform = self.platform;
+            assert_eq!(platform.read(address, data).unwrap(), data.len());
+        }
+
+        fn protect(&self, range: Range<usize>, permissions: Perm) {
+            assert!(self.range.start <= range.start && range.end <= self.range.end);
+            // SAFETY: the test owns this mapping and changes permissions only while idle.
+            unsafe {
+                self.platform
+                    .update_permissions(range, permissions)
+                    .unwrap();
+            }
+        }
+    }
+
+    impl Drop for TestMapping {
+        fn drop(&mut self) {
+            // SAFETY: all guest execution has stopped before the test releases its mapping.
+            unsafe { self.platform.deallocate_pages(self.range.clone()).unwrap() };
+        }
+    }
+
+    struct Image(Vec<u8>);
+    impl ReadAt for Image {
+        type Error = ();
+
+        fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), ()> {
+            let start = usize::try_from(offset).map_err(|_| ())?;
+            let end = start.checked_add(buf.len()).ok_or(())?;
+            buf.copy_from_slice(self.0.get(start..end).ok_or(())?);
+            Ok(())
+        }
+
+        fn size(&mut self) -> Result<u64, ()> {
+            Ok(self.0.len() as u64)
+        }
+    }
+
+    struct ImageMapper<'a> {
+        image: &'a Image,
+        mapping: Option<TestMapping>,
+    }
+
+    impl MapMemory for ImageMapper<'_> {
+        type Error = ();
+
+        fn reserve(&mut self, len: usize, align: usize) -> Result<usize, ()> {
+            // These fixtures require only guest-page alignment; native allocation is stronger.
+            assert_eq!(align, PAGE_SIZE);
+            assert!(self.mapping.is_none());
+            let mapping = TestMapping::new(len);
+            mapping.protect(mapping.range.clone(), Perm::empty());
+            let base = mapping.range.start;
+            assert_eq!(base % align, 0);
+            self.mapping = Some(mapping);
+            Ok(base)
+        }
+
+        fn map_file(
+            &mut self,
+            address: usize,
+            len: usize,
+            offset: u64,
+            prot: &Protection,
+        ) -> Result<(), ()> {
+            let offset = usize::try_from(offset).unwrap();
+            assert_eq!(offset % PAGE_SIZE, 0);
+            self.map_zero(
+                address,
+                len,
+                &Protection {
+                    read: true,
+                    write: true,
+                    execute: false,
+                },
+            )?;
+            let data = &self.image.0[offset..self.image.0.len().min(offset + len)];
+            self.mapping.as_ref().unwrap().write(address, data);
+            self.protect(address, len, prot)
+        }
+
+        fn map_zero(&mut self, address: usize, len: usize, prot: &Protection) -> Result<(), ()> {
+            let mapping = self.mapping.as_ref().unwrap();
+            assert!(mapping.range.start <= address && address + len <= mapping.range.end);
+            mapping
+                .platform
+                .allocate_pages(
+                    address..address + len,
+                    RW,
+                    false,
+                    true,
+                    FixedAddressBehavior::Replace,
+                )
+                .unwrap();
+            self.protect(address, len, prot)
+        }
+
+        fn protect(&mut self, address: usize, len: usize, prot: &Protection) -> Result<(), ()> {
+            let mut permissions = Perm::empty();
+            permissions.set(Perm::READ, prot.read);
+            permissions.set(Perm::WRITE, prot.write);
+            permissions.set(Perm::EXEC, prot.execute);
+            self.mapping
+                .as_ref()
+                .unwrap()
+                .protect(address..address + len, permissions);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn accepts_4k_loads_sharing_a_native_page() {
+        // RO headers at VA 0 and RX text at VA 0x2000. The text's file offset
+        // (0x1000) is congruent at 4 KiB but deliberately not at 16 KiB.
+        let mut image = Image(vec![0; 2 * PAGE_SIZE]);
+        let bytes = &mut image.0;
+        bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        bytes[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+        bytes[18..20].copy_from_slice(&183u16.to_le_bytes()); // EM_AARCH64
+        bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+        bytes[24..32].copy_from_slice(&0x2000u64.to_le_bytes());
+        bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
+        bytes[52..54].copy_from_slice(&64u16.to_le_bytes());
+        bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
+        bytes[56..58].copy_from_slice(&2u16.to_le_bytes());
+        for (index, (flags, offset, vaddr, size)) in
+            [(4u32, 0u64, 0u64, 0x1000u64), (5, 0x1000, 0x2000, 8)]
+                .into_iter()
+                .enumerate()
+        {
+            let ph = &mut bytes[64 + index * 56..120 + index * 56];
+            ph[..4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+            ph[4..8].copy_from_slice(&flags.to_le_bytes());
+            for (i, value) in [offset, vaddr, 0, size, size, 0x1000]
+                .into_iter()
+                .enumerate()
+            {
+                ph[8 + i * 8..16 + i * 8].copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        bytes[PAGE_SIZE..PAGE_SIZE + 4].copy_from_slice(&0xd2800540u32.to_le_bytes()); // mov x0, #42
+        bytes[PAGE_SIZE + 4..PAGE_SIZE + 8].copy_from_slice(&0xd65f03c0u32.to_le_bytes()); // ret
+        let elf = ElfParsedFile::parse(&mut image).unwrap();
+        let mut mapper = ImageMapper {
+            image: &image,
+            mapping: None,
+        };
+        let info = elf
+            .load(&mut mapper, &mut MacosUserland::new(), None)
+            .unwrap();
+        let mapping = mapper.mapping.as_ref().unwrap();
+        assert_eq!(info.entry_point, info.base_addr + 2 * PAGE_SIZE);
+        assert_eq!(info.phdrs_addr, info.base_addr + 64);
+        assert_eq!(info.num_phdrs, 2);
+        assert_eq!(info.brk, info.base_addr + HOST_PAGE_SIZE);
+        let mut headers = vec![0; PAGE_SIZE];
+        mapping.read(info.base_addr, &mut headers);
+        assert_eq!(headers, image.0[..PAGE_SIZE]);
+        let mut platform = mapping.platform;
+        assert!(platform.write(info.base_addr, &[0]).is_err());
+        let result: usize;
+        // SAFETY: the real ELF loader and platform mapper installed a C-ABI mov/ret stub.
+        unsafe {
+            core::arch::asm!("blr {entry}", entry = in(reg) info.entry_point,
+                lateout("x0") result, clobber_abi("C"));
+        }
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn executes_and_writes_mixed_subpages_from_another_native_page() {
+        let mapping = TestMapping::new(2 * HOST_PAGE_SIZE);
+        let base = mapping.range.start;
+        let helper = base + HOST_PAGE_SIZE;
+        let data = helper + PAGE_SIZE;
+        // Only caller-saved registers are modified. x1=data, x2=helper.
+        mapping.write_code(
+            0,
+            &[
+                0xaa1e03e9, // mov x9, x30
+                0xd63f0040, // blr x2 -- helper's native page becomes RX
+                0xb9000020, // str w0, [x1] -- helper's native page becomes RW
+                0xd63f0040, // blr x2 -- back to RX
+                0x11000400, // add w0, w0, #1
+                0xb9000020, // str w0, [x1] -- back to RW
+                0xaa0903fe, // mov x30, x9
+                0xd65f03c0, // ret
+            ],
+        );
+        mapping.write_code(HOST_PAGE_SIZE, &[0xd2800540, 0xd65f03c0]); // mov x0, #42; ret
+        mapping.protect(base..base + HOST_PAGE_SIZE, RX);
+        mapping.protect(helper..helper + PAGE_SIZE, RX);
+        let result: usize;
+        // SAFETY: both code stubs obey the C ABI and all code/data mappings remain live.
+        unsafe {
+            core::arch::asm!("blr {entry}", entry = in(reg) base,
+                in("x1") data, in("x2") helper, lateout("x0") result, clobber_abi("C"));
+        }
+        assert_eq!(result, 43);
+        let mut stored = [0; 4];
+        mapping.read(data, &mut stored);
+        assert_eq!(u32::from_le_bytes(stored), 43);
+    }
+
+    #[test]
+    fn same_native_page_store_faults_instead_of_looping() {
+        const CHILD_ENV: &str = "LITEBOX_SUBPAGE_SAME_PAGE_STORE_TEST";
+        const COMPLETED: &str = "same-page store fault verified";
+        struct FaultProbe<'a> {
+            entry: usize,
+            data: usize,
+            stack: usize,
+            fault: &'a std::cell::Cell<Option<(usize, ExceptionInfo)>>,
+        }
+        impl EnterShim for FaultProbe<'_> {
+            type ExecutionContext = PtRegs;
+
+            fn init(&self, ctx: &mut PtRegs) -> ContinueOperation {
+                ctx.pc = self.entry;
+                ctx.sp = self.stack;
+                ctx.regs[0] = 42;
+                ctx.regs[1] = self.data;
+                ContinueOperation::Resume
+            }
+            fn syscall(&self, _: &mut PtRegs) -> ContinueOperation {
+                panic!("unexpected syscall");
+            }
+            fn exception(&self, ctx: &mut PtRegs, info: &ExceptionInfo) -> ContinueOperation {
+                self.fault.set(Some((ctx.pc, *info)));
+                ContinueOperation::Terminate
+            }
+            fn interrupt(&self, _: &mut PtRegs) -> ContinueOperation {
+                ContinueOperation::Resume
+            }
+        }
+        if std::env::var_os(CHILD_ENV).is_none() {
+            // Isolate a fatal fault and bound an accidental RX/RW retry loop.
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "subpage::tests::same_native_page_store_faults_instead_of_looping",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while child.try_wait().unwrap().is_none() {
+                if std::time::Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    let output = child.wait_with_output().unwrap();
+                    panic!("same-page store did not terminate: {output:?}");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            // Also reject a stale --exact filter that silently runs zero child tests.
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains(COMPLETED),
+                "{output:?}"
+            );
+            return;
+        }
+        let mapping = TestMapping::new(2 * HOST_PAGE_SIZE);
+        let base = mapping.range.start;
+        // If the store incorrectly succeeds, the BRK reports a distinguishable exception.
+        mapping.write_code(0, &[0xb9000020, 0xd4200000]); // str w0, [x1]; brk #0
+        mapping.protect(base..base + PAGE_SIZE, RX);
+        let fault = std::cell::Cell::new(None);
+        // SAFETY: the probe supplies live code/data and a separate writable guest stack.
+        unsafe {
+            run_thread(
+                FaultProbe {
+                    entry: base,
+                    data: base + PAGE_SIZE,
+                    stack: mapping.range.end,
+                    fault: &fault,
+                },
+                &mut PtRegs::default(),
+            );
+        }
+        let (pc, info) = fault
+            .get()
+            .expect("store must reach the shim's exception handler");
+        assert_eq!(pc, base);
+        assert_eq!(info.fault_address, base + PAGE_SIZE);
+        assert_eq!(info.esr >> 26, 0x24); // Data abort from a lower exception level.
+        assert_ne!(info.esr & (1 << 6), 0); // Write, not instruction fetch.
+        let mut stored = [0; 4];
+        mapping.read(base + PAGE_SIZE, &mut stored);
+        assert_eq!(stored, [0; 4], "the rejected store must not execute");
+        println!("{COMPLETED}");
+    }
 
     struct TestPages(Pages);
     impl TestPages {
