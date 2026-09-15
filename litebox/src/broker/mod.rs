@@ -906,18 +906,18 @@ mod tests {
     use std::sync::{Arc as StdArc, Condvar as StdCondvar, Mutex as StdMutex, mpsc};
     use std::time::Duration;
 
-    use litebox_broker_protocol::BROKER_PROTOCOL_VERSION;
     use litebox_broker_protocol::message::{
-        BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerOperation, BrokerRequest,
-        BrokerResponse, BrokerResult, PipeRequest, PipeResponse,
+        BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult, PipeRequest, PipeResponse,
     };
     use litebox_broker_protocol::pipe::{ReadPipeResponse, WritePipeResponse};
     use litebox_broker_protocol::shared_buffer::{
         SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SHARED_BUFFER_SLOT_SIZE,
         SharedBufferSequence,
     };
-    use litebox_broker_transport::channel::{LocalCallChannel, LocalSetupChannel};
+    use litebox_broker_transport::channel::LocalCallChannel;
     use litebox_broker_transport::shared_memory::{SharedMemory, SharedMemoryError};
+
+    use litebox_broker_local::test_support::broker_local;
 
     use crate::platform::mock::MockPlatform;
 
@@ -931,10 +931,11 @@ mod tests {
             observed_sender,
             release: StdArc::clone(&release),
         };
-        let (local, ()) = BrokerLocal::negotiate(channel, |channel| {
-            Ok((channel, Arc::new(memory) as Arc<dyn SharedMemory>, ()))
-        })
-        .unwrap();
+        let local = broker_local(
+            channel,
+            litebox_broker_protocol::ProcessId(1),
+            Arc::new(memory),
+        );
         let control = Arc::new(BrokerLocalControl::<MockPlatform, _>::new(
             local,
             Arc::new(BrokerPollableRegistry::new()),
@@ -977,10 +978,11 @@ mod tests {
             observed_sender,
             release: StdArc::clone(&release),
         };
-        let (local, ()) = BrokerLocal::negotiate(channel, |channel| {
-            Ok((channel, Arc::new(memory) as Arc<dyn SharedMemory>, ()))
-        })
-        .unwrap();
+        let local = broker_local(
+            channel,
+            litebox_broker_protocol::ProcessId(1),
+            Arc::new(memory),
+        );
         let control = Arc::new(BrokerLocalControl::<MockPlatform, _>::new(
             local,
             Arc::new(BrokerPollableRegistry::new()),
@@ -1072,27 +1074,6 @@ mod tests {
         release: StdArc<(StdMutex<bool>, StdCondvar)>,
     }
 
-    impl LocalSetupChannel for ConcurrentPipeChannel {
-        type Error = Infallible;
-
-        fn send_handshake_request(
-            &mut self,
-            request: &BrokerHandshakeRequest,
-        ) -> core::result::Result<(), Self::Error> {
-            assert_eq!(request.protocol_version, BROKER_PROTOCOL_VERSION);
-            Ok(())
-        }
-
-        fn recv_handshake_response(
-            &mut self,
-        ) -> core::result::Result<Option<BrokerHandshakeResponse>, Self::Error> {
-            Ok(Some(BrokerHandshakeResponse::Negotiated {
-                broker_protocol_version: BROKER_PROTOCOL_VERSION,
-                process_id: litebox_broker_protocol::ProcessId(1),
-            }))
-        }
-    }
-
     impl LocalCallChannel for ConcurrentPipeChannel {
         type Error = Infallible;
 
@@ -1128,27 +1109,6 @@ mod tests {
                     written: write.buffer.length(),
                 })),
             })
-        }
-    }
-
-    impl LocalSetupChannel for ConcurrentPipeReadChannel {
-        type Error = Infallible;
-
-        fn send_handshake_request(
-            &mut self,
-            request: &BrokerHandshakeRequest,
-        ) -> core::result::Result<(), Self::Error> {
-            assert_eq!(request.protocol_version, BROKER_PROTOCOL_VERSION);
-            Ok(())
-        }
-
-        fn recv_handshake_response(
-            &mut self,
-        ) -> core::result::Result<Option<BrokerHandshakeResponse>, Self::Error> {
-            Ok(Some(BrokerHandshakeResponse::Negotiated {
-                broker_protocol_version: BROKER_PROTOCOL_VERSION,
-                process_id: litebox_broker_protocol::ProcessId(1),
-            }))
         }
     }
 

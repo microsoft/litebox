@@ -235,10 +235,7 @@ where
             }
             Err(error) => return Err(BrokerHostError::from(error)),
         };
-        let response = BrokerHandshakeResponse::Negotiated {
-            broker_protocol_version: BROKER_PROTOCOL_VERSION,
-            process_id: process.id(),
-        };
+        let response = BrokerHandshakeResponse::negotiated(process.id());
         setup_channel
             .send_handshake_response(&response)
             .map_err(BrokerHostError::Channel)?;

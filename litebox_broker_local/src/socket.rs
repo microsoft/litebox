@@ -88,16 +88,15 @@ mod tests {
     use alloc::sync::Arc;
     use core::cell::RefCell;
     use core::convert::Infallible;
-    use litebox_broker_protocol::message::{
-        BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerRequest, BrokerResponse,
-    };
+    use litebox_broker_protocol::message::{BrokerRequest, BrokerResponse};
     use litebox_broker_protocol::shared_buffer::{
         SHARED_BUFFER_POOL_SIZE, SHARED_BUFFER_SLOT_SIZE, SharedBufferSlotIndex,
     };
-    use litebox_broker_transport::channel::LocalSetupChannel;
     use litebox_broker_transport::shared_memory::{SharedMemory, SharedMemoryError};
     use std::collections::VecDeque;
     use std::sync::Mutex;
+
+    use crate::test_support::broker_local;
 
     #[test]
     fn udp_operations_stage_complete_datagrams() {
@@ -116,8 +115,11 @@ mod tests {
             })),
         ]);
         let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
-        let (local, ()) =
-            BrokerLocal::negotiate(channel, |channel| Ok((channel, memory.clone(), ()))).unwrap();
+        let local = broker_local(
+            channel,
+            litebox_broker_protocol::ProcessId(1),
+            memory.clone(),
+        );
 
         assert_eq!(local.create_udp_socket().unwrap(), handle);
         assert_eq!(
@@ -187,8 +189,7 @@ mod tests {
             )),
         ]);
         let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
-        let (local, ()) =
-            BrokerLocal::negotiate(channel, |channel| Ok((channel, memory, ()))).unwrap();
+        let local = broker_local(channel, litebox_broker_protocol::ProcessId(1), memory);
 
         local
             .set_tcp_option(handle, TcpOptionValue::NoDelay(true))
@@ -287,30 +288,6 @@ mod tests {
                 results: RefCell::new(results.into_iter().collect()),
                 sent_operations: RefCell::new(std::vec::Vec::new()),
             }
-        }
-    }
-
-    impl LocalSetupChannel for ScriptedChannel {
-        type Error = Infallible;
-
-        fn send_handshake_request(
-            &mut self,
-            request: &BrokerHandshakeRequest,
-        ) -> core::result::Result<(), Self::Error> {
-            assert_eq!(
-                request.protocol_version,
-                litebox_broker_protocol::BROKER_PROTOCOL_VERSION
-            );
-            Ok(())
-        }
-
-        fn recv_handshake_response(
-            &mut self,
-        ) -> core::result::Result<Option<BrokerHandshakeResponse>, Self::Error> {
-            Ok(Some(BrokerHandshakeResponse::Negotiated {
-                broker_protocol_version: litebox_broker_protocol::BROKER_PROTOCOL_VERSION,
-                process_id: litebox_broker_protocol::ProcessId(1),
-            }))
         }
     }
 

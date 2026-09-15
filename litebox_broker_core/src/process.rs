@@ -801,25 +801,6 @@ mod tests {
     const ROOT: FileUser = FileUser { user: 0, group: 0 };
 
     #[test]
-    fn processes_receive_distinct_broker_ids() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
-            ObjectRights::all(),
-        ))
-        .build()
-        .unwrap();
-        let first = broker
-            .create_process(CallerCredential::Unauthenticated)
-            .unwrap();
-        let second = broker
-            .create_process(CallerCredential::Unauthenticated)
-            .unwrap();
-
-        assert_ne!(first.id(), second.id());
-        assert_eq!(first.parent_id(), None);
-        assert_eq!(second.parent_id(), None);
-    }
-
-    #[test]
     fn process_and_thread_ids_share_one_numeric_namespace() {
         let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
@@ -834,10 +815,11 @@ mod tests {
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
 
-        assert_eq!(first.threads.lock().get(&thread).unwrap().id(), thread);
         assert_eq!(first.id().0, 1);
+        assert_eq!(first.parent_id(), None);
         assert_eq!(thread.0, 2);
         assert_eq!(second.id().0, 3);
+        assert_eq!(second.parent_id(), None);
     }
 
     #[test]
@@ -907,79 +889,7 @@ mod tests {
     }
 
     #[test]
-    fn fallback_drop_keeps_thread_quota_reserved() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
-            ObjectRights::all(),
-        ))
-        .with_limits(BrokerCoreLimits::DEFAULT.with_thread_quotas(1, 1))
-        .build()
-        .unwrap();
-        let process = broker
-            .create_process(CallerCredential::Unauthenticated)
-            .unwrap();
-        process.create_thread().unwrap();
-
-        drop(process);
-
-        let replacement = broker
-            .create_process(CallerCredential::Unauthenticated)
-            .unwrap();
-        assert_eq!(
-            replacement.create_thread(),
-            Err(BrokerError::ResourceExhausted)
-        );
-    }
-
-    #[test]
-    fn process_registry_tracks_live_processes() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
-            ObjectRights::all(),
-        ))
-        .build()
-        .unwrap();
-        let process = broker
-            .create_process(CallerCredential::Unauthenticated)
-            .unwrap();
-        let process_id = process.id();
-        let registered = broker
-            .processes
-            .read()
-            .get(&process_id)
-            .and_then(alloc::sync::Weak::upgrade)
-            .unwrap();
-        assert!(Arc::ptr_eq(&process, &registered));
-        drop(registered);
-
-        process.finish();
-
-        assert!(!broker.processes.read().contains_key(&process_id));
-    }
-
-    #[test]
-    fn finish_releases_process_id_for_reuse() {
-        let mut broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
-            ObjectRights::all(),
-        ))
-        .build()
-        .unwrap();
-        broker.ids =
-            alloc::sync::Arc::new(spin::Mutex::new(crate::id::IdAllocator::new(1).unwrap()));
-        let process = broker
-            .create_process(CallerCredential::Unauthenticated)
-            .unwrap();
-        let process_id = process.id();
-
-        process.finish();
-
-        let replacement = broker
-            .create_process(CallerCredential::Unauthenticated)
-            .unwrap();
-        assert_eq!(replacement.id(), process_id);
-        replacement.finish();
-    }
-
-    #[test]
-    fn finish_releases_owned_thread_ids() {
+    fn finish_removes_process_and_releases_owned_ids() {
         let mut broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
@@ -993,8 +903,17 @@ mod tests {
         let process_id = process.id();
         let thread_id = process.create_thread().unwrap();
         assert_eq!(broker.active_thread_count.load(Ordering::Relaxed), 1);
+        let registered = broker
+            .processes
+            .read()
+            .get(&process_id)
+            .and_then(alloc::sync::Weak::upgrade)
+            .unwrap();
+        assert!(Arc::ptr_eq(&process, &registered));
+        drop(registered);
 
         process.finish();
+        assert!(!broker.processes.read().contains_key(&process_id));
         assert_eq!(broker.active_thread_count.load(Ordering::Relaxed), 0);
 
         let replacement = broker
@@ -1005,37 +924,15 @@ mod tests {
     }
 
     #[test]
-    fn fallback_drop_leaves_process_id_occupied() {
+    fn fallback_drop_retains_process_and_thread_ids_and_quota() {
         let mut broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
+        .with_limits(BrokerCoreLimits::DEFAULT.with_thread_quotas(1, 1))
         .build()
         .unwrap();
         broker.ids =
-            alloc::sync::Arc::new(spin::Mutex::new(crate::id::IdAllocator::new(2).unwrap()));
-        let process = broker
-            .create_process(CallerCredential::Unauthenticated)
-            .unwrap();
-        let process_id = process.id();
-
-        drop(process);
-
-        let replacement = broker
-            .create_process(CallerCredential::Unauthenticated)
-            .unwrap();
-        assert_ne!(replacement.id(), process_id);
-        replacement.finish();
-    }
-
-    #[test]
-    fn fallback_drop_leaves_process_and_thread_ids_occupied() {
-        let mut broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
-            ObjectRights::all(),
-        ))
-        .build()
-        .unwrap();
-        broker.ids =
-            alloc::sync::Arc::new(spin::Mutex::new(crate::id::IdAllocator::new(3).unwrap()));
+            alloc::sync::Arc::new(spin::Mutex::new(crate::id::IdAllocator::new(4).unwrap()));
         let process = broker
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
@@ -1043,16 +940,26 @@ mod tests {
         let thread_id = process.create_thread().unwrap();
 
         drop(process);
+        assert_eq!(broker.active_thread_count.load(Ordering::Relaxed), 1);
 
-        let replacement = broker
+        let first_replacement = broker
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
-        assert_ne!(replacement.id(), process_id);
-        assert_ne!(replacement.id().0, thread_id.0);
+        let second_replacement = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        assert_ne!(first_replacement.id(), process_id);
+        assert_ne!(first_replacement.id().0, thread_id.0);
+        assert_ne!(second_replacement.id(), process_id);
+        assert_ne!(second_replacement.id().0, thread_id.0);
         assert_eq!(
-            replacement.create_thread(),
+            first_replacement.create_thread(),
             Err(BrokerError::ResourceExhausted)
         );
+        assert!(matches!(
+            broker.create_process(CallerCredential::Unauthenticated),
+            Err(BrokerError::ResourceExhausted)
+        ));
     }
 
     #[test]

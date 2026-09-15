@@ -559,16 +559,16 @@ mod tests {
     use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use alloc::sync::Arc;
-    use litebox_broker_local::BrokerLocal;
+    use litebox_broker_local::test_support::broker_local;
+    use litebox_broker_protocol::ObjectHandle;
     use litebox_broker_protocol::error::ErrorCode;
     use litebox_broker_protocol::message::{
-        BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerOperation,
-        BrokerRequest, BrokerResponse, BrokerResult, PipeRequest, ReadinessNotification,
+        BrokerNotification, BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
+        PipeRequest, ReadinessNotification,
     };
     use litebox_broker_protocol::pipe::CreatePipeResponse;
     use litebox_broker_protocol::readiness::ReadinessFlags;
-    use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, ObjectHandle};
-    use litebox_broker_transport::channel::{LocalCallChannel, LocalSetupChannel};
+    use litebox_broker_transport::channel::LocalCallChannel;
 
     use crate::{
         event::{Events, observer::Observer, wait::WaitState},
@@ -582,15 +582,15 @@ mod tests {
         let platform = crate::platform::mock::MockPlatform::new();
         let request_count = Arc::new(AtomicUsize::new(0));
         let force_transport = Arc::new(AtomicBool::new(false));
-        let (local, ()) = BrokerLocal::negotiate(
+        let local = broker_local(
             FailingPipeChannel {
                 request_count: Arc::clone(&request_count),
                 read_failure: ReadFailure::Transport,
                 force_transport,
             },
-            |channel| Ok((channel, Arc::new(NoopSharedMemory), ())),
-        )
-        .unwrap();
+            litebox_broker_protocol::ProcessId(1),
+            Arc::new(NoopSharedMemory),
+        );
         let litebox = crate::LiteBox::new_with_broker_local(platform, local);
         let pipes = super::Pipes::new(&litebox);
         let (writer, reader) = pipes.create_pipe(2, super::Flags::empty(), None).unwrap();
@@ -628,15 +628,15 @@ mod tests {
         let platform = crate::platform::mock::MockPlatform::new();
         let request_count = Arc::new(AtomicUsize::new(0));
         let force_transport = Arc::new(AtomicBool::new(false));
-        let (local, ()) = BrokerLocal::negotiate(
+        let local = broker_local(
             FailingPipeChannel {
                 request_count: Arc::clone(&request_count),
                 read_failure: ReadFailure::WouldBlock,
                 force_transport: Arc::clone(&force_transport),
             },
-            |channel| Ok((channel, Arc::new(NoopSharedMemory), ())),
-        )
-        .unwrap();
+            litebox_broker_protocol::ProcessId(1),
+            Arc::new(NoopSharedMemory),
+        );
         let litebox = Arc::new(crate::LiteBox::new_with_broker_local(platform, local));
         let pipes = super::Pipes::new(&litebox);
         let (writer, reader) = pipes.create_pipe(2, super::Flags::empty(), None).unwrap();
@@ -771,26 +771,6 @@ mod tests {
     enum ReadFailure {
         Transport,
         WouldBlock,
-    }
-
-    impl LocalSetupChannel for FailingPipeChannel {
-        type Error = ();
-
-        fn send_handshake_request(
-            &mut self,
-            _request: &BrokerHandshakeRequest,
-        ) -> core::result::Result<(), Self::Error> {
-            Ok(())
-        }
-
-        fn recv_handshake_response(
-            &mut self,
-        ) -> core::result::Result<Option<BrokerHandshakeResponse>, Self::Error> {
-            Ok(Some(BrokerHandshakeResponse::Negotiated {
-                broker_protocol_version: BROKER_PROTOCOL_VERSION,
-                process_id: litebox_broker_protocol::ProcessId(1),
-            }))
-        }
     }
 
     impl LocalCallChannel for FailingPipeChannel {

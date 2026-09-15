@@ -34,5 +34,8 @@ lock_tracing = ["litebox_platform/lock_tracing"]
 panic_on_unclosed_fd_drop = []
 enforce_singleton_litebox_instance = []
 
+[dev-dependencies]
+litebox_broker_local = { version = "0.1.0", path = "../litebox_broker_local", features = ["test-support"] }
+
 [lints]
 workspace = true

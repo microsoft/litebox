@@ -32,7 +32,9 @@ use crate::stdio::{
     IsTerminalStdioRequest, IsTerminalStdioResponse, ReadStdioRequest, ReadStdioResponse,
     WriteStdioRequest, WriteStdioResponse,
 };
-use crate::{ObjectHandle, ProcessId, ProtocolVersion, RequestId, ThreadId};
+use crate::{
+    BROKER_PROTOCOL_VERSION, ObjectHandle, ProcessId, ProtocolVersion, RequestId, ThreadId,
+};
 
 /// Broker handshake request sent before the control channel is active.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -156,6 +158,17 @@ pub enum BrokerHandshakeResponse {
     },
     /// Handshake failed with an ABI-neutral broker error.
     Error(ErrorCode),
+}
+
+impl BrokerHandshakeResponse {
+    /// Creates a successful handshake response for the current broker protocol.
+    #[must_use]
+    pub const fn negotiated(process_id: ProcessId) -> Self {
+        Self::Negotiated {
+            broker_protocol_version: BROKER_PROTOCOL_VERSION,
+            process_id,
+        }
+    }
 }
 
 /// Broker-owned event object request.
