@@ -338,6 +338,8 @@ mod tests {
     use litebox_broker_transport::channel::LocalNotificationChannel;
     use std::sync::Mutex;
 
+    use crate::test_support::test_broker_local;
+
     fn test_process_id() -> ProcessId {
         ProcessId(1)
     }
@@ -345,7 +347,10 @@ mod tests {
     #[test]
     fn negotiate_runs_setup_after_response_before_active_requests() {
         let channel = FakeControlChannel::new(
-            Some(BrokerHandshakeResponse::negotiated(test_process_id())),
+            Some(BrokerHandshakeResponse::Negotiated {
+                broker_protocol_version: BROKER_PROTOCOL_VERSION,
+                process_id: test_process_id(),
+            }),
             None,
         );
         let setup_calls = Cell::new(0);
@@ -374,12 +379,7 @@ mod tests {
         let request = BrokerOperation::CloseObject(handle);
         let response = BrokerResult::ObjectClosed;
         let channel = FakeControlChannel::new(None, Some(response.clone()));
-        let local = BrokerLocal {
-            process_id: test_process_id(),
-            channel,
-            shared_buffers: noop_shared_buffers(),
-            next_request_id: AtomicU64::new(0),
-        };
+        let local = test_broker_local(channel, noop_shared_memory());
 
         assert!(local.close_object(handle).is_ok());
         assert_eq!(
@@ -392,15 +392,10 @@ mod tests {
     }
 
     #[test]
-    fn create_thread_sends_request_and_returns_id() {
+    fn thread_lifecycle_sends_owned_id() {
         let thread_id = ThreadId(7);
         let channel = FakeControlChannel::new(None, Some(BrokerResult::ThreadCreated(thread_id)));
-        let local = BrokerLocal {
-            process_id: test_process_id(),
-            channel,
-            shared_buffers: noop_shared_buffers(),
-            next_request_id: AtomicU64::new(0),
-        };
+        let local = test_broker_local(channel, noop_shared_memory());
 
         assert_eq!(local.create_thread().unwrap(), thread_id);
         assert_eq!(
@@ -410,24 +405,13 @@ mod tests {
                 operation: BrokerOperation::CreateThread,
             })
         );
-    }
 
-    #[test]
-    fn exit_thread_sends_owned_id() {
-        let thread_id = ThreadId(7);
-        let channel = FakeControlChannel::new(None, Some(BrokerResult::ThreadExited));
-        let local = BrokerLocal {
-            process_id: test_process_id(),
-            channel,
-            shared_buffers: noop_shared_buffers(),
-            next_request_id: AtomicU64::new(0),
-        };
-
+        *local.channel.response.borrow_mut() = Some(BrokerResult::ThreadExited);
         local.exit_thread(thread_id).unwrap();
         assert_eq!(
             local.channel.sent_request.borrow().clone(),
             Some(BrokerRequest {
-                request_id: RequestId(0),
+                request_id: RequestId(1),
                 operation: BrokerOperation::ExitThread(thread_id),
             })
         );
@@ -442,12 +426,7 @@ mod tests {
                 WriteStdioResponse { written: 2 },
             ))),
         );
-        let local = BrokerLocal {
-            process_id: test_process_id(),
-            channel,
-            shared_buffers: noop_shared_buffers(),
-            next_request_id: AtomicU64::new(0),
-        };
+        let local = test_broker_local(channel, noop_shared_memory());
 
         assert_eq!(
             local
@@ -476,12 +455,7 @@ mod tests {
                 ReadStdioResponse { read: 2 },
             ))),
         );
-        let local = BrokerLocal {
-            process_id: test_process_id(),
-            channel,
-            shared_buffers: noop_shared_buffers(),
-            next_request_id: AtomicU64::new(0),
-        };
+        let local = test_broker_local(channel, noop_shared_memory());
         let mut output = [0xff; 3];
 
         assert_eq!(local.read_stdio(buffer, &mut output).unwrap(), 2);
@@ -503,12 +477,7 @@ mod tests {
                 IsTerminalStdioResponse { is_terminal: true },
             ))),
         );
-        let local = BrokerLocal {
-            process_id: test_process_id(),
-            channel,
-            shared_buffers: noop_shared_buffers(),
-            next_request_id: AtomicU64::new(0),
-        };
+        let local = test_broker_local(channel, noop_shared_memory());
 
         assert!(local.is_stdio_terminal(StdioStream::Stderr).unwrap());
         assert_eq!(
@@ -532,12 +501,7 @@ mod tests {
     fn active_requests_use_monotonic_identifiers() {
         let handle = ObjectHandle(7);
         let channel = FakeControlChannel::new(None, Some(BrokerResult::ObjectClosed));
-        let local = BrokerLocal {
-            process_id: test_process_id(),
-            channel,
-            shared_buffers: noop_shared_buffers(),
-            next_request_id: AtomicU64::new(0),
-        };
+        let local = test_broker_local(channel, noop_shared_memory());
 
         local.close_object(handle).unwrap();
         assert_eq!(
@@ -567,14 +531,12 @@ mod tests {
 
     #[test]
     fn concurrent_active_requests_use_distinct_identifiers() {
-        let local = Arc::new(BrokerLocal {
-            process_id: test_process_id(),
-            channel: ConcurrentCallChannel {
+        let local = Arc::new(test_broker_local(
+            ConcurrentCallChannel {
                 request_ids: Mutex::new(std::vec::Vec::new()),
             },
-            shared_buffers: noop_shared_buffers(),
-            next_request_id: AtomicU64::new(0),
-        });
+            noop_shared_memory(),
+        ));
         let callers = (0..16)
             .map(|handle| {
                 let local = Arc::clone(&local);
@@ -596,12 +558,7 @@ mod tests {
     #[test]
     fn active_request_rejects_mismatched_response_identifier() {
         let channel = FakeControlChannel::new(None, Some(BrokerResult::ObjectClosed));
-        let local = BrokerLocal {
-            process_id: test_process_id(),
-            channel,
-            shared_buffers: noop_shared_buffers(),
-            next_request_id: AtomicU64::new(0),
-        };
+        let local = test_broker_local(channel, noop_shared_memory());
         local.channel.response_id.set(Some(RequestId(9)));
 
         assert!(matches!(
@@ -616,12 +573,8 @@ mod tests {
     #[test]
     fn active_request_identifier_exhaustion_does_not_wrap() {
         let channel = FakeControlChannel::new(None, Some(BrokerResult::ObjectClosed));
-        let local = BrokerLocal {
-            process_id: test_process_id(),
-            channel,
-            shared_buffers: noop_shared_buffers(),
-            next_request_id: AtomicU64::new(u64::MAX),
-        };
+        let local = test_broker_local(channel, noop_shared_memory());
+        local.next_request_id.store(u64::MAX, Ordering::Relaxed);
 
         assert!(matches!(
             local.close_object(ObjectHandle(7)),
@@ -634,12 +587,7 @@ mod tests {
     fn active_request_returns_recoverable_broker_errors() {
         for error in [ErrorCode::WouldBlock, ErrorCode::UnsupportedOperation] {
             let channel = FakeControlChannel::new(None, Some(BrokerResult::Error(error)));
-            let local = BrokerLocal {
-                process_id: test_process_id(),
-                channel,
-                shared_buffers: noop_shared_buffers(),
-                next_request_id: AtomicU64::new(0),
-            };
+            let local = test_broker_local(channel, noop_shared_memory());
 
             assert!(matches!(
                 local.create_event_with_count(0),
@@ -652,12 +600,7 @@ mod tests {
     #[should_panic(expected = "broker returned unrecoverable error")]
     fn active_request_panics_on_unrecoverable_broker_error() {
         let channel = FakeControlChannel::new(None, Some(BrokerResult::Error(ErrorCode::Internal)));
-        let local = BrokerLocal {
-            process_id: test_process_id(),
-            channel,
-            shared_buffers: noop_shared_buffers(),
-            next_request_id: AtomicU64::new(0),
-        };
+        let local = test_broker_local(channel, noop_shared_memory());
 
         let _ = local.create_event_with_count(0);
     }
@@ -758,7 +701,10 @@ mod tests {
     #[test]
     fn negotiate_propagates_shared_memory_receive_error() {
         let channel = FakeControlChannel::new(
-            Some(BrokerHandshakeResponse::negotiated(test_process_id())),
+            Some(BrokerHandshakeResponse::Negotiated {
+                broker_protocol_version: BROKER_PROTOCOL_VERSION,
+                process_id: test_process_id(),
+            }),
             None,
         );
 
@@ -778,7 +724,10 @@ mod tests {
     #[should_panic(expected = "broker association shared memory has an invalid size")]
     fn negotiate_rejects_invalid_shared_memory_size() {
         let channel = FakeControlChannel::new(
-            Some(BrokerHandshakeResponse::negotiated(test_process_id())),
+            Some(BrokerHandshakeResponse::Negotiated {
+                broker_protocol_version: BROKER_PROTOCOL_VERSION,
+                process_id: test_process_id(),
+            }),
             None,
         );
 
@@ -854,10 +803,6 @@ mod tests {
         Arc::new(NoopSharedMemory {
             length: litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE,
         })
-    }
-
-    fn noop_shared_buffers() -> SharedBufferPool<Arc<dyn SharedMemory>> {
-        SharedBufferPool::new(noop_shared_memory(), SHARED_BUFFER_LAYOUT).unwrap()
     }
 
     impl FakeControlChannel {

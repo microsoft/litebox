@@ -170,7 +170,8 @@ fn map_host_error(error: BrokerHostError<IoError>) -> IoError {
 /// teardown guards below reach for.
 struct HostAssociationFailureCoordinator<Shutdown> {
     failed: AtomicBool,
-    unwound: AtomicBool,
+    /// Whether an association worker panicked, requiring teardown without ID reuse.
+    panicked: AtomicBool,
     error: Mutex<Option<IoError>>,
     shutdown: Shutdown,
 }
@@ -181,7 +182,7 @@ impl<Shutdown: HostAssociationShutdown<Error = IoError>>
     const fn new(shutdown: Shutdown) -> Self {
         Self {
             failed: AtomicBool::new(false),
-            unwound: AtomicBool::new(false),
+            panicked: AtomicBool::new(false),
             error: Mutex::new(None),
             shutdown,
         }
@@ -202,13 +203,13 @@ impl<Shutdown: HostAssociationShutdown<Error = IoError>>
         let _ = self.shutdown.shutdown();
     }
 
-    fn report_unwind(&self, error: IoError) {
-        self.unwound.store(true, Ordering::Release);
+    fn report_panic(&self, error: IoError) {
+        self.panicked.store(true, Ordering::Release);
         self.report(error);
     }
 
-    fn unwound(&self) -> bool {
-        self.unwound.load(Ordering::Acquire)
+    fn panicked(&self) -> bool {
+        self.panicked.load(Ordering::Acquire)
     }
 
     /// Ends the association transport without recording a failure.
@@ -245,7 +246,7 @@ impl<Shutdown: HostAssociationShutdown<Error = IoError>> Drop
     fn drop(&mut self) {
         if std::thread::panicking() {
             self.failure_coordinator
-                .report_unwind(IoError::other("broker readiness publisher panicked"));
+                .report_panic(IoError::other("broker readiness publisher panicked"));
         }
     }
 }
@@ -374,7 +375,7 @@ where
         drop(cancellation);
         for worker in workers {
             if worker.join().is_err() {
-                failure_coordinator.report_unwind(IoError::other("broker request worker panicked"));
+                failure_coordinator.report_panic(IoError::other("broker request worker panicked"));
             }
         }
         // Readiness publication lives exactly as long as the association. The
@@ -389,8 +390,7 @@ where
         if let Some(publisher) = publisher
             && publisher.join().is_err()
         {
-            failure_coordinator
-                .report_unwind(IoError::other("broker readiness publisher panicked"));
+            failure_coordinator.report_panic(IoError::other("broker readiness publisher panicked"));
         }
     });
 
@@ -401,7 +401,7 @@ where
     let Ok(association) = Arc::try_unwrap(association) else {
         panic!("all broker association workers must be joined before teardown");
     };
-    if failure_coordinator.unwound() {
+    if failure_coordinator.panicked() {
         drop(association);
     } else {
         association.finish();
@@ -513,7 +513,7 @@ fn run_worker<Memory, ResponseSink, Shutdown>(
             Ok(Ok(())) => {}
             Ok(Err(error)) => failure_coordinator.report(map_host_error(error)),
             Err(_) => {
-                failure_coordinator.report_unwind(IoError::other("broker request worker panicked"));
+                failure_coordinator.report_panic(IoError::other("broker request worker panicked"));
             }
         }
     }
@@ -913,7 +913,7 @@ mod tests {
         ));
         reader.join().unwrap();
         assert!(publisher.join().is_err());
-        assert!(failure_coordinator.unwound());
+        assert!(failure_coordinator.panicked());
         assert!(failure_coordinator.take_error().is_some());
     }
 
@@ -937,7 +937,7 @@ mod tests {
             Ok(HostReceive::PeerClosed) | Err(_)
         ));
         let error = failure_coordinator.take_error().unwrap();
-        assert!(!failure_coordinator.unwound());
+        assert!(!failure_coordinator.panicked());
         assert_eq!(error.kind(), ErrorKind::TimedOut);
         assert_eq!(error.to_string(), "first failure");
     }

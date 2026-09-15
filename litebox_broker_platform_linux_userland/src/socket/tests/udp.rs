@@ -1129,7 +1129,7 @@ fn reactor_preserves_udp_datagram_semantics() {
 }
 
 #[test]
-fn guest_udp_namespace_routes_across_processs_and_filters_private_endpoints() {
+fn guest_udp_namespace_routes_across_processes_and_filters_private_endpoints() {
     let provider = Arc::new(LinuxSocketProvider::new(6, 3).unwrap());
     let broker = test_broker_core(
         PolicyEngine::with_unauthenticated_rights(ObjectRights::all())

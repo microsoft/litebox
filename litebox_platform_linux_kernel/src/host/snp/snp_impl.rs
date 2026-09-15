@@ -100,6 +100,22 @@ fn current() -> Option<&'static mut bindings::vsbox_task> {
     }
 }
 
+impl SnpLinuxKernel {
+    pub fn init_task(
+        &self,
+        boot_params: &bindings::vmpl2_boot_params,
+    ) -> litebox_common_linux::TaskParams {
+        litebox_common_linux::TaskParams {
+            pid: boot_params.pid,
+            ppid: boot_params.ppid,
+            uid: boot_params.uid,
+            gid: boot_params.gid,
+            euid: boot_params.euid,
+            egid: boot_params.egid,
+        }
+    }
+}
+
 unsafe impl litebox::platform::ThreadLocalStorageProvider for SnpLinuxKernel {
     fn get_thread_local_storage() -> *mut () {
         let tls = get_tls();
@@ -253,14 +269,9 @@ impl litebox::platform::ThreadProvider for SnpLinuxKernel {
         // Note this is different from the usual clone3 syscall as we have a driver running
         // in VMPL0's kernel and handling the syscall differently.
         // The first argument will be placed into the new thread's RSI register (i.e. the second argument).
-        if let Err(error) = HostSnpInterface::syscalls(SyscallN::<2, NR_SYSCALL_CLONE3> {
+        HostSnpInterface::syscalls(SyscallN::<2, NR_SYSCALL_CLONE3> {
             args: [thread_start_arg_ptr as u64, flags.bits()],
-        }) {
-            // SAFETY: clone3 rejected the request, so ownership of the allocation
-            // was not transferred to a child thread and remains with this caller.
-            drop(unsafe { Box::from_raw(thread_start_arg_ptr) });
-            return Err(error);
-        }
+        })?;
         Ok(())
     }
 
