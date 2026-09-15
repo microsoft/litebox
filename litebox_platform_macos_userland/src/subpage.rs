@@ -127,7 +127,7 @@ impl Mapping {
             base: target.trunc(),
             len: HOST_PAGE_SIZE,
         };
-        protect_range(alias.base, alias.len, Perm::READ | Perm::WRITE).map_err(allocation_error)?;
+        protect(alias.base, Perm::READ | Perm::WRITE).map_err(allocation_error)?;
         Ok(alias)
     }
 }
@@ -143,12 +143,8 @@ fn protect(base: usize, permissions: Perm) -> Result<(), PermissionUpdateError> 
     } else {
         permissions
     };
-    protect_range(base, HOST_PAGE_SIZE, native)
-}
-
-fn protect_range(base: usize, len: usize, permissions: Perm) -> Result<(), PermissionUpdateError> {
-    // SAFETY: callers hold the registry lock and own this entire native range.
-    if unsafe { libc::mprotect(base as *mut _, len, prot_flags(permissions)) } != 0 {
+    // SAFETY: callers hold the registry lock and own this entire native page.
+    if unsafe { libc::mprotect(base as *mut _, HOST_PAGE_SIZE, prot_flags(native)) } != 0 {
         return Err(permission_error());
     }
     Ok(())
@@ -410,11 +406,6 @@ mod recovery {
         pages: UnsafeCell::new(HashMap::with_hasher(BuildHasherDefault::new())),
     };
 
-    fn in_registry() -> bool {
-        // Preallocated TSD avoids lazy TLS initialization in the signal handler.
-        read_tls(tls_offset::PAGE_RECOVERY_LOCK) != 0
-    }
-
     struct Guard {
         registry: &'static Registry,
         writer: bool,
@@ -446,7 +437,11 @@ mod recovery {
     }
 
     pub(super) fn begin_update() -> Update {
-        assert!(!in_registry(), "recursive native page update");
+        assert_eq!(
+            read_tls(tls_offset::PAGE_RECOVERY_LOCK),
+            0,
+            "recursive native page update"
+        );
         write_tls(tls_offset::PAGE_RECOVERY_LOCK, 1);
         // Give updates priority so repeated faults cannot starve them.
         REGISTRY.writers.fetch_add(1, Ordering::AcqRel);
@@ -483,34 +478,6 @@ mod recovery {
         }
     }
 
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Access {
-        Execute,
-        Write,
-    }
-
-    fn access(esr: u64) -> Option<Access> {
-        const FSC_MASK: u64 = 0x3f;
-        const FSC_PERMISSION_LEVEL_0: u64 = 0x0c;
-        const FSC_PERMISSION_LEVEL_3: u64 = 0x0f;
-        const ISS_WRITE_NOT_READ: u64 = 1 << 6;
-
-        if !(FSC_PERMISSION_LEVEL_0..=FSC_PERMISSION_LEVEL_3).contains(&(esr & FSC_MASK)) {
-            return None;
-        }
-        match Exception(exception_class(esr)) {
-            Exception::INSTRUCTION_ABORT_LOWER_EL | Exception::INSTRUCTION_ABORT_CURRENT_EL => {
-                Some(Access::Execute)
-            }
-            Exception::DATA_ABORT_LOWER_EL | Exception::DATA_ABORT_CURRENT_EL
-                if esr & ISS_WRITE_NOT_READ != 0 =>
-            {
-                Some(Access::Write)
-            }
-            _ => None,
-        }
-    }
-
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) enum Recovery {
         Unhandled,
@@ -522,8 +489,29 @@ mod recovery {
     /// For synchronous SIGSEGV/SIGBUS only. Never allocates or blocks.
     /// Defer when the gate is busy; never retry our own interrupted update.
     pub(super) fn recover(pc: usize, fault_address: usize, esr: u64) -> Recovery {
-        let Some(access) = access(esr) else {
+        #[derive(PartialEq, Eq)]
+        enum Access {
+            Execute,
+            Write,
+        }
+        const FSC_MASK: u64 = 0x3f;
+        const FSC_PERMISSION_LEVEL_0: u64 = 0x0c;
+        const FSC_PERMISSION_LEVEL_3: u64 = 0x0f;
+        const ISS_WRITE_NOT_READ: u64 = 1 << 6;
+
+        if !(FSC_PERMISSION_LEVEL_0..=FSC_PERMISSION_LEVEL_3).contains(&(esr & FSC_MASK)) {
             return Recovery::Unhandled;
+        }
+        let access = match Exception(exception_class(esr)) {
+            Exception::INSTRUCTION_ABORT_LOWER_EL | Exception::INSTRUCTION_ABORT_CURRENT_EL => {
+                Access::Execute
+            }
+            Exception::DATA_ABORT_LOWER_EL | Exception::DATA_ABORT_CURRENT_EL
+                if esr & ISS_WRITE_NOT_READ != 0 =>
+            {
+                Access::Write
+            }
+            _ => return Recovery::Unhandled,
         };
         let base = host_base(if access == Access::Execute {
             pc
@@ -534,7 +522,8 @@ mod recovery {
         if access == Access::Write && host_base(pc) == base {
             return Recovery::Unhandled;
         }
-        if in_registry() {
+        // Preallocated TSD avoids lazy TLS initialization in the signal handler.
+        if read_tls(tls_offset::PAGE_RECOVERY_LOCK) != 0 {
             return Recovery::Unhandled;
         }
         if REGISTRY.writers.load(Ordering::Acquire) != 0
