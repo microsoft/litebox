@@ -1,11 +1,12 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Best-effort 4 KiB guest pages on 16 KiB macOS backing.
+//! Page ownership on 16 KiB macOS backing.
 //!
-//! Host permissions are fused across live subpages: RO/PROT_NONE subpages and
-//! unmapped holes can inherit neighboring access. Mixed W/X pages switch between
-//! RW and RX on faults because Darwin cannot provide ordinary RWX mappings.
+//! Native instances track one slot per host page. With `subpage_compat`, 4 KiB
+//! instances fuse permissions across live subpages: RO/PROT_NONE subpages and
+//! unmapped holes can inherit neighboring access. Only these instances publish
+//! recovery state for switching mixed W/X pages between RW and RX.
 
 use litebox::utils::TruncateExt as _;
 use std::collections::HashMap;
@@ -13,15 +14,16 @@ use std::ops::Range;
 
 use super::{
     AllocationError, DeallocationError, FixedAddressBehavior, HOST_PAGE_SIZE, KernReturn,
-    MachVmFlags, MemoryRegionPermissions as Perm, PAGE_SIZE, PermissionUpdateError, TASK_ADDR_MAX,
+    MachVmFlags, MemoryRegionPermissions as Perm, PermissionUpdateError, TASK_ADDR_MAX,
     TASK_ADDR_MIN, mach_task_self, mach_vm_allocate, prot_flags, sys_icache_invalidate,
 };
 
-const SUBPAGES: usize = HOST_PAGE_SIZE / PAGE_SIZE;
-type Slots = [Option<Perm>; SUBPAGES];
+// Fixed-capacity storage for the smallest supported granularity.
+const MAX_SUBPAGES: usize = HOST_PAGE_SIZE / 4096;
+type Slots = [Option<Perm>; MAX_SUBPAGES];
 
 #[derive(Default)]
-pub(super) struct Pages(HashMap<usize, Slots>);
+pub(super) struct Pages<const PAGE_SIZE: usize>(HashMap<usize, Slots>);
 
 fn host_base(address: usize) -> usize {
     address & !(HOST_PAGE_SIZE - 1)
@@ -44,7 +46,12 @@ fn fused(slots: Slots) -> Perm {
     permissions
 }
 
-fn change_slots(slots: &mut Slots, base: usize, range: &Range<usize>, value: Option<Perm>) {
+fn change_slots<const PAGE_SIZE: usize>(
+    slots: &mut Slots,
+    base: usize,
+    range: &Range<usize>,
+    value: Option<Perm>,
+) {
     for address in
         (base.max(range.start)..(base + HOST_PAGE_SIZE).min(range.end)).step_by(PAGE_SIZE)
     {
@@ -132,6 +139,7 @@ impl Mapping {
     }
 }
 
+#[cfg(feature = "subpage_compat")]
 pub(super) fn recover_fault(pc: usize, fault_address: usize, esr: u64) -> bool {
     recovery::recover(pc, fault_address, esr) != recovery::Recovery::Unhandled
 }
@@ -157,7 +165,7 @@ fn flush(base: usize, permissions: Perm) {
     }
 }
 
-impl Pages {
+impl<const PAGE_SIZE: usize> Pages<PAGE_SIZE> {
     pub(super) fn contains_range(&self, range: Range<usize>) -> bool {
         range.step_by(PAGE_SIZE).all(|address| {
             self.0
@@ -232,15 +240,15 @@ impl Pages {
                 let changes: Vec<_> = (base..base + len)
                     .step_by(HOST_PAGE_SIZE)
                     .map(|address| {
-                        let mut slots = [None; SUBPAGES];
-                        change_slots(&mut slots, address, &range, Some(permissions));
+                        let mut slots = [None; MAX_SUBPAGES];
+                        change_slots::<PAGE_SIZE>(&mut slots, address, &range, Some(permissions));
                         (address, slots)
                     })
                     .collect();
                 let mut update = self.protect_changes(&changes).map_err(allocation_error)?;
                 for (base, slots) in changes {
                     flush(base, fused(slots));
-                    update.set(base, Some(fused(slots)));
+                    update.set::<PAGE_SIZE>(base, Some(fused(slots)));
                     self.0.insert(base, slots);
                 }
                 std::mem::forget(mapping); // Ownership transferred to the registry.
@@ -251,7 +259,7 @@ impl Pages {
 
         let mut changes = Vec::new();
         for base in host_range(&range).step_by(HOST_PAGE_SIZE) {
-            let mut slots = self.0.get(&base).copied().unwrap_or([None; SUBPAGES]);
+            let mut slots = self.0.get(&base).copied().unwrap_or([None; MAX_SUBPAGES]);
             if behavior != FixedAddressBehavior::Replace {
                 for address in (base.max(range.start)..(base + HOST_PAGE_SIZE).min(range.end))
                     .step_by(PAGE_SIZE)
@@ -261,7 +269,7 @@ impl Pages {
                     }
                 }
             }
-            change_slots(&mut slots, base, &range, Some(permissions));
+            change_slots::<PAGE_SIZE>(&mut slots, base, &range, Some(permissions));
             changes.push((base, slots));
         }
         let mut reservations = Vec::new();
@@ -301,7 +309,7 @@ impl Pages {
         }
         for (base, slots) in changes {
             flush(base, fused(slots));
-            update.set(base, Some(fused(slots)));
+            update.set::<PAGE_SIZE>(base, Some(fused(slots)));
             self.0.insert(base, slots);
         }
         for reservation in reservations {
@@ -325,13 +333,13 @@ impl Pages {
         let mut changes = Vec::new();
         for base in host_range(&range).step_by(HOST_PAGE_SIZE) {
             let mut slots = self.0[&base];
-            change_slots(&mut slots, base, &range, Some(permissions));
+            change_slots::<PAGE_SIZE>(&mut slots, base, &range, Some(permissions));
             changes.push((base, slots));
         }
         let mut update = self.protect_changes(&changes)?;
         for (base, slots) in changes {
             flush(base, fused(slots));
-            update.set(base, Some(fused(slots)));
+            update.set::<PAGE_SIZE>(base, Some(fused(slots)));
             self.0.insert(base, slots);
         }
         Ok(())
@@ -353,7 +361,7 @@ impl Pages {
                 .collect()
         };
         for (base, slots) in &mut changes {
-            change_slots(slots, *base, &range, None);
+            change_slots::<PAGE_SIZE>(slots, *base, &range, None);
         }
         let mut update = self
             .protect_changes(&changes)
@@ -365,10 +373,10 @@ impl Pages {
                     len: HOST_PAGE_SIZE,
                 });
                 self.0.remove(&base);
-                update.set(base, None);
+                update.set::<PAGE_SIZE>(base, None);
             } else {
                 self.0.insert(base, slots);
-                update.set(base, Some(fused(slots)));
+                update.set::<PAGE_SIZE>(base, Some(fused(slots)));
             }
         }
         Ok(())
@@ -387,8 +395,12 @@ mod recovery {
     use std::marker::PhantomData;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    use super::{HOST_PAGE_SIZE, Perm, host_base};
-    use crate::{Exception, exception_class, read_tls, tls_offset, write_tls};
+    #[cfg(feature = "subpage_compat")]
+    use super::host_base;
+    use super::{HOST_PAGE_SIZE, Perm};
+    #[cfg(feature = "subpage_compat")]
+    use crate::{Exception, exception_class};
+    use crate::{read_tls, tls_offset, write_tls};
 
     struct Registry {
         busy: AtomicBool,
@@ -413,6 +425,7 @@ mod recovery {
         _not_send: PhantomData<*mut ()>,
     }
 
+    #[cfg(feature = "subpage_compat")]
     impl Guard {
         fn permissions(&self, base: usize) -> Option<Perm> {
             // SAFETY: the guard owns exclusive access to REGISTRY.pages.
@@ -462,7 +475,15 @@ mod recovery {
     }
 
     impl Update {
-        pub(super) fn set(&mut self, base: usize, permissions: Option<Perm>) {
+        pub(super) fn set<const PAGE_SIZE: usize>(
+            &mut self,
+            base: usize,
+            permissions: Option<Perm>,
+        ) {
+            // Native mappings must never participate in compatibility fault recovery.
+            if PAGE_SIZE == HOST_PAGE_SIZE {
+                return;
+            }
             // SAFETY: Update owns the exclusive gate; only ordinary threads call set.
             let pages = unsafe { &mut *self.guard.registry.pages.get() };
             if let Some(permissions) = permissions {
@@ -472,12 +493,13 @@ mod recovery {
             }
         }
 
-        #[cfg(test)]
+        #[cfg(all(test, feature = "subpage_compat"))]
         pub(super) fn permissions(&self, base: usize) -> Option<Perm> {
             self.guard.permissions(base)
         }
     }
 
+    #[cfg(feature = "subpage_compat")]
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) enum Recovery {
         Unhandled,
@@ -488,6 +510,7 @@ mod recovery {
 
     /// For synchronous SIGSEGV/SIGBUS only. Never allocates or blocks.
     /// Defer when the gate is busy; never retry our own interrupted update.
+    #[cfg(feature = "subpage_compat")]
     pub(super) fn recover(pc: usize, fault_address: usize, esr: u64) -> Recovery {
         #[derive(PartialEq, Eq)]
         enum Access {
@@ -579,7 +602,7 @@ mod recovery {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "subpage_compat"))]
 mod tests {
     #![expect(
         clippy::cast_possible_wrap,
@@ -588,7 +611,8 @@ mod tests {
 
     use super::*;
 
-    use crate::{MacosUserland, UserMutPtr, run_thread};
+    use crate::{MacosUserland4K as MacosUserland, UserMutPtr, run_thread};
+    use litebox::mm::linux::PAGE_SIZE;
     use litebox::platform::{
         PageManagementProvider as _, RawConstPointer as _, RawMutPointer as _,
     };
@@ -868,7 +892,7 @@ mod tests {
         println!("{COMPLETED}");
     }
 
-    struct TestPages(Pages);
+    struct TestPages(Pages<PAGE_SIZE>);
     impl TestPages {
         fn new() -> Self {
             MacosUserland::new(); // Install exception-table recovery for fault-safe probes.

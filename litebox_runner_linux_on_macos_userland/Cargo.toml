@@ -8,7 +8,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 litebox = { path = "../litebox", version = "0.1.0" }
 litebox_common_linux = { path = "../litebox_common_linux", version = "0.1.0" }
-litebox_platform_macos_userland = { path = "../litebox_platform_macos_userland", version = "0.1.0" }
+litebox_platform_macos_userland = { path = "../litebox_platform_macos_userland", version = "0.1.0", features = ["subpage_compat"] }
 litebox_shim_linux = { path = "../litebox_shim_linux", version = "0.1.0", default-features = false, features = ["alarm_fallback"] }
 litebox_util_log = { path = "../litebox_util_log", version = "0.1.0", features = ["backend_tracing"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

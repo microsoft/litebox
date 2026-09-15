@@ -36,34 +36,52 @@ use litebox_syscall_rewriter::aarch64::{
 };
 use zerocopy::{FromBytes, IntoBytes};
 
-pub use litebox::mm::linux::PAGE_SIZE;
-pub use litebox_common_linux::HOST_PAGE_SIZE;
+/// Native page size on AArch64 macOS. Independent of any guest ABI.
+pub const HOST_PAGE_SIZE: usize = 16384;
+/// The default platform uses native pages, even with `subpage_compat` enabled.
+pub const PAGE_SIZE: usize = HOST_PAGE_SIZE;
+
+/// Native 16 KiB page management.
+pub type MacosUserland = MacosUserlandWithPageSize<HOST_PAGE_SIZE>;
+
+/// Opt-in 4 KiB guest pages with best-effort subpage permissions.
+#[cfg(feature = "subpage_compat")]
+pub type MacosUserland4K = MacosUserlandWithPageSize<4096>;
 mod subpage;
 /// The macOS host's Mach-O `__PAGEZERO` reserves the first 4 GiB.
 pub const TASK_ADDR_MIN: usize = 0x1_0000_0000;
 /// Exclusive upper bound for guest mappings (`MACH_VM_MAX_ADDRESS` on AArch64 macOS).
 pub const TASK_ADDR_MAX: usize = 0x7FFF_FE00_0000;
 
-pub struct MacosUserland {
-    pages: Mutex<subpage::Pages>,
+/// Shared platform implementation. Use [`MacosUserland`] for native pages or
+/// `MacosUserland4K` (requires `subpage_compat`) for 4 KiB guests.
+pub struct MacosUserlandWithPageSize<const PAGE_SIZE: usize> {
+    pages: Mutex<subpage::Pages<PAGE_SIZE>>,
     /// One-time initialization snapshot of host mappings unavailable to guest programs.
     /// Host mappings created after [`Self::new`] are not included.
     reserved_pages: Vec<Range<usize>>,
 }
 
-impl core::fmt::Debug for MacosUserland {
+impl<const PAGE_SIZE: usize> core::fmt::Debug for MacosUserlandWithPageSize<PAGE_SIZE> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("MacosUserland").finish_non_exhaustive()
     }
 }
 
-impl MacosUserland {
+impl<const PAGE_SIZE: usize> MacosUserlandWithPageSize<PAGE_SIZE> {
     /// Initialize the platform.
     ///
     /// # Panics
     /// Panics if the host page size, pthread TSD layout, signal setup, or host memory-map
     /// snapshot is unsupported or cannot be initialized.
     pub fn new() -> &'static Self {
+        const {
+            assert!(
+                PAGE_SIZE == HOST_PAGE_SIZE
+                    || (cfg!(feature = "subpage_compat") && PAGE_SIZE == 4096),
+                "4 KiB guest pages require subpage_compat"
+            );
+        }
         // SAFETY: this scalar query has no pointer arguments.
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         assert_eq!(
@@ -134,7 +152,7 @@ impl MacosUserland {
             let start = usize::try_from(address).expect("mapping address does not fit usize");
             let end = usize::try_from(end).expect("mapping end does not fit usize");
             assert!(
-                start.is_multiple_of(PAGE_SIZE) && end.is_multiple_of(PAGE_SIZE),
+                start.is_multiple_of(HOST_PAGE_SIZE) && end.is_multiple_of(HOST_PAGE_SIZE),
                 "mach_vm_region returned an unaligned range"
             );
             reserved_pages.push(start..end);
@@ -145,7 +163,7 @@ impl MacosUserland {
     }
 }
 
-impl litebox::platform::Provider for MacosUserland {}
+impl<const PAGE_SIZE: usize> litebox::platform::Provider for MacosUserlandWithPageSize<PAGE_SIZE> {}
 
 type UserMutPtr<T> = litebox::platform::common_providers::userspace_pointers::UserMutPtr<
     litebox::platform::common_providers::userspace_pointers::NoValidation,
@@ -155,7 +173,9 @@ type UserConstPtr<T> = litebox::platform::common_providers::userspace_pointers::
     litebox::platform::common_providers::userspace_pointers::NoValidation,
     T,
 >;
-impl litebox::platform::RawPointerProvider for MacosUserland {
+impl<const PAGE_SIZE: usize> litebox::platform::RawPointerProvider
+    for MacosUserlandWithPageSize<PAGE_SIZE>
+{
     type RawConstPointer<T: FromBytes> = UserConstPtr<T>;
     type RawMutPointer<T: FromBytes + IntoBytes> = UserMutPtr<T>;
 }
@@ -165,7 +185,9 @@ thread_local! {
 }
 
 // SAFETY: the pointer is isolated by host TLS and initialized to null.
-unsafe impl litebox::platform::ThreadLocalStorageProvider for MacosUserland {
+unsafe impl<const PAGE_SIZE: usize> litebox::platform::ThreadLocalStorageProvider
+    for MacosUserlandWithPageSize<PAGE_SIZE>
+{
     fn get_thread_local_storage() -> *mut () {
         PLATFORM_TLS.get()
     }
@@ -175,7 +197,7 @@ unsafe impl litebox::platform::ThreadLocalStorageProvider for MacosUserland {
     }
 }
 
-impl TimeProvider for MacosUserland {
+impl<const PAGE_SIZE: usize> TimeProvider for MacosUserlandWithPageSize<PAGE_SIZE> {
     type Instant = Instant;
     type SystemTime = SystemTime;
 
@@ -351,7 +373,7 @@ impl RawMutex {
     }
 }
 
-impl RawMutexProvider for MacosUserland {
+impl<const PAGE_SIZE: usize> RawMutexProvider for MacosUserlandWithPageSize<PAGE_SIZE> {
     type RawMutex = RawMutex;
 }
 
@@ -408,7 +430,9 @@ impl RawMutexTrait for RawMutex {
     }
 }
 
-impl litebox::platform::TimerProvider for MacosUserland {
+impl<const PAGE_SIZE: usize> litebox::platform::TimerProvider
+    for MacosUserlandWithPageSize<PAGE_SIZE>
+{
     type TimerHandle = TimerHandle;
     type Signal = litebox_common_linux::signal::Signal;
 
@@ -557,7 +581,9 @@ impl litebox::platform::TimerHandle for TimerHandle {
     }
 }
 
-impl litebox::platform::SignalProvider for MacosUserland {
+impl<const PAGE_SIZE: usize> litebox::platform::SignalProvider
+    for MacosUserlandWithPageSize<PAGE_SIZE>
+{
     type Signal = litebox_common_linux::signal::Signal;
 
     fn take_pending_signals(&self, mut f: impl FnMut(Self::Signal)) {
@@ -578,7 +604,9 @@ impl litebox::platform::SignalProvider for MacosUserland {
         }
     }
 }
-impl litebox::mm::linux::VmemPageFaultHandler for MacosUserland {
+impl<const PAGE_SIZE: usize> litebox::mm::linux::VmemPageFaultHandler
+    for MacosUserlandWithPageSize<PAGE_SIZE>
+{
     unsafe fn handle_page_fault(
         &self,
         _: usize,
@@ -651,7 +679,7 @@ unsafe extern "C" {
     ) -> KernReturn;
     fn sys_icache_invalidate(start: *mut libc::c_void, size: usize);
 }
-fn is_page_aligned(range: &Range<usize>) -> bool {
+fn is_page_aligned<const PAGE_SIZE: usize>(range: &Range<usize>) -> bool {
     range.start < range.end
         && range.start.is_multiple_of(PAGE_SIZE)
         && range.end.is_multiple_of(PAGE_SIZE)
@@ -672,7 +700,9 @@ fn prot_flags(permissions: MemoryRegionPermissions) -> i32 {
     }
     flags
 }
-impl litebox::platform::PageManagementProvider<PAGE_SIZE> for MacosUserland {
+impl<const PAGE_SIZE: usize> litebox::platform::PageManagementProvider<PAGE_SIZE>
+    for MacosUserlandWithPageSize<PAGE_SIZE>
+{
     const TASK_ADDR_MIN: usize = TASK_ADDR_MIN;
     const TASK_ADDR_MAX: usize = TASK_ADDR_MAX;
     fn allocate_pages(
@@ -688,7 +718,7 @@ impl litebox::platform::PageManagementProvider<PAGE_SIZE> for MacosUserland {
         let _ = can_grow_down;
         // Eager population is an optional performance hint.
         let _ = populate_pages_immediately;
-        if !is_page_aligned(&range) {
+        if !is_page_aligned::<PAGE_SIZE>(&range) {
             return Err(AllocationError::Unaligned);
         }
         if range.start < TASK_ADDR_MIN {
@@ -707,7 +737,7 @@ impl litebox::platform::PageManagementProvider<PAGE_SIZE> for MacosUserland {
             .map(Self::RawMutPointer::from_usize)
     }
     unsafe fn deallocate_pages(&self, range: Range<usize>) -> Result<(), DeallocationError> {
-        if !is_page_aligned(&range) {
+        if !is_page_aligned::<PAGE_SIZE>(&range) {
             return Err(DeallocationError::Unaligned);
         }
         self.pages.lock().unwrap().deallocate(range)
@@ -718,7 +748,7 @@ impl litebox::platform::PageManagementProvider<PAGE_SIZE> for MacosUserland {
         new_range: Range<usize>,
         permissions: MemoryRegionPermissions,
     ) -> Result<Self::RawMutPointer<u8>, RemapError> {
-        if !is_page_aligned(&old_range) || !is_page_aligned(&new_range) {
+        if !is_page_aligned::<PAGE_SIZE>(&old_range) || !is_page_aligned::<PAGE_SIZE>(&new_range) {
             return Err(RemapError::Unaligned);
         }
         if old_range.start < new_range.end && new_range.start < old_range.end {
@@ -839,7 +869,7 @@ impl litebox::platform::PageManagementProvider<PAGE_SIZE> for MacosUserland {
         range: Range<usize>,
         permissions: MemoryRegionPermissions,
     ) -> Result<(), PermissionUpdateError> {
-        if !is_page_aligned(&range) {
+        if !is_page_aligned::<PAGE_SIZE>(&range) {
             return Err(PermissionUpdateError::Unaligned);
         }
         if permissions.contains(MemoryRegionPermissions::WRITE | MemoryRegionPermissions::EXEC) {
@@ -1080,7 +1110,9 @@ fn set_guest_x18(value: usize) {
     write_tls(tls_offset::GUEST_X18, value);
 }
 
-impl litebox::platform::ArchSpecificProvider for MacosUserland {
+impl<const PAGE_SIZE: usize> litebox::platform::ArchSpecificProvider
+    for MacosUserlandWithPageSize<PAGE_SIZE>
+{
     fn get_arch_specific_register(
         &self,
         reg: &ArchSpecificRegister,
@@ -1262,7 +1294,9 @@ impl ThreadHandle {
     }
 }
 
-impl litebox::platform::ThreadProvider for MacosUserland {
+impl<const PAGE_SIZE: usize> litebox::platform::ThreadProvider
+    for MacosUserlandWithPageSize<PAGE_SIZE>
+{
     type ExecutionContext = litebox_common_linux::PtRegs;
     type ThreadSpawnError = std::io::Error;
     type ThreadHandle = ThreadHandle;
@@ -1320,7 +1354,7 @@ impl litebox::platform::ThreadProvider for MacosUserland {
     }
 }
 
-impl WaitWakerProvider for MacosUserland {
+impl<const PAGE_SIZE: usize> WaitWakerProvider for MacosUserlandWithPageSize<PAGE_SIZE> {
     fn update_waker(&self, waker: Option<core::task::Waker>) {
         if read_tls(tls_offset::CURRENT_THREAD) != 0 {
             ThreadHandle::current()
@@ -1383,7 +1417,9 @@ pub(crate) fn set_guest_vector_state(state: &GuestVectorState) {
     unsafe { saved.write_volatile(state.clone()) };
 }
 
-impl litebox::platform::GuestVectorStateProvider for MacosUserland {
+impl<const PAGE_SIZE: usize> litebox::platform::GuestVectorStateProvider
+    for MacosUserlandWithPageSize<PAGE_SIZE>
+{
     type GuestVectorState = litebox_common_linux::GuestVectorState;
     fn get_guest_vector_state(&self) -> Self::GuestVectorState {
         get_guest_vector_state()
@@ -1392,7 +1428,9 @@ impl litebox::platform::GuestVectorStateProvider for MacosUserland {
         set_guest_vector_state(state);
     }
 }
-impl litebox::platform::SystemInfoProvider for MacosUserland {
+impl<const PAGE_SIZE: usize> litebox::platform::SystemInfoProvider
+    for MacosUserlandWithPageSize<PAGE_SIZE>
+{
     fn get_syscall_entry_point(&self) -> usize {
         syscall_callback as *const () as usize
     }
@@ -2208,6 +2246,7 @@ unsafe extern "C" fn exception_signal_handler(
     // SAFETY: SA_SIGINFO supplies a live siginfo for this invocation.
     let code = unsafe { (*info).si_code };
     let memory_fault = is_synchronous_memory_fault(signal, code, esr);
+    #[cfg(feature = "subpage_compat")]
     if memory_fault && subpage::recover_fault(pc, mc.__es.__far.trunc(), esr) {
         return;
     }
@@ -2545,6 +2584,124 @@ mod tests {
     };
     const RW: MemoryRegionPermissions =
         MemoryRegionPermissions::READ.union(MemoryRegionPermissions::WRITE);
+
+    #[test]
+    fn native_page_size_rejects_subpage_operations() {
+        let platform = MacosUserland::new();
+        assert_eq!(PAGE_SIZE, 16384);
+        let base = platform
+            .allocate_pages(
+                TASK_ADDR_MIN..TASK_ADDR_MIN + 2 * HOST_PAGE_SIZE,
+                RW,
+                false,
+                true,
+                FixedAddressBehavior::Hint,
+            )
+            .unwrap()
+            .as_usize();
+        let _cleanup = litebox::utils::defer(|| {
+            // SAFETY: this test owns the range and never executes it.
+            unsafe {
+                platform
+                    .deallocate_pages(base..base + 2 * HOST_PAGE_SIZE)
+                    .unwrap();
+            }
+        });
+        // Reject both a subpage length and a subpage-aligned start. These
+        // assertions also run with subpage_compat enabled through another crate.
+        for range in [base..base + 4096, base + 4096..base + HOST_PAGE_SIZE] {
+            assert!(matches!(
+                platform.allocate_pages(
+                    range.clone(),
+                    RW,
+                    false,
+                    true,
+                    FixedAddressBehavior::Replace,
+                ),
+                Err(AllocationError::Unaligned)
+            ));
+            // SAFETY: these invalid ranges are within our idle mapping.
+            unsafe {
+                assert!(matches!(
+                    platform.update_permissions(range.clone(), MemoryRegionPermissions::READ),
+                    Err(PermissionUpdateError::Unaligned)
+                ));
+                assert!(matches!(
+                    platform.deallocate_pages(range.clone()),
+                    Err(DeallocationError::Unaligned)
+                ));
+                assert!(matches!(
+                    platform.remap_pages(
+                        range,
+                        base + HOST_PAGE_SIZE..base + 2 * HOST_PAGE_SIZE,
+                        RW
+                    ),
+                    Err(RemapError::Unaligned)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "subpage_compat")]
+    fn native_and_subpage_instances_keep_distinct_permissions() {
+        let native = MacosUserland::new();
+        let compat = MacosUserland4K::new();
+        let native_memory = native
+            .allocate_pages(
+                TASK_ADDR_MIN..TASK_ADDR_MIN + HOST_PAGE_SIZE,
+                RW,
+                false,
+                true,
+                FixedAddressBehavior::Hint,
+            )
+            .unwrap();
+        let compat_memory = compat
+            .allocate_pages(
+                TASK_ADDR_MIN..TASK_ADDR_MIN + 8192,
+                RW,
+                false,
+                true,
+                FixedAddressBehavior::Hint,
+            )
+            .unwrap();
+        let base = native_memory.as_usize();
+        let subpage_base = compat_memory.as_usize();
+        let _cleanup = litebox::utils::defer(|| {
+            // SAFETY: both ranges belong to this test and have no active users.
+            unsafe {
+                native
+                    .deallocate_pages(base..base + HOST_PAGE_SIZE)
+                    .unwrap();
+                compat
+                    .deallocate_pages(subpage_base..subpage_base + 8192)
+                    .unwrap();
+            }
+        });
+        // A permitted access is recoverable only for a compatibility mapping.
+        let write_permission_fault = (0x24 << 26) | (1 << 6) | 0x0f;
+        assert!(!subpage::recover_fault(0, base, write_permission_fault));
+        assert!(subpage::recover_fault(
+            0,
+            subpage_base,
+            write_permission_fault
+        ));
+        // SAFETY: this test owns both idle ranges.
+        unsafe {
+            native
+                .update_permissions(base..base + HOST_PAGE_SIZE, MemoryRegionPermissions::READ)
+                .unwrap();
+            compat
+                .update_permissions(
+                    subpage_base..subpage_base + 4096,
+                    MemoryRegionPermissions::READ,
+                )
+                .unwrap();
+        }
+        // Only the 4 KiB instance inherits WRITE from its neighboring subpage.
+        assert_eq!(native_memory.write_at_offset(0, 42), None);
+        assert_eq!(compat_memory.write_at_offset(0, 42), Some(()));
+    }
 
     /// Run host-only test code with the same registration as a guest sibling.
     fn run_process_test_thread(process: Arc<ProcessState>, f: impl FnOnce()) {
