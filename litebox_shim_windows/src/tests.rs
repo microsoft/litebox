@@ -338,7 +338,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 }
 
 #[test]
-fn objectless_test_tasks_use_distinct_negotiated_process_ids() {
+fn objectless_test_tasks_use_distinct_broker_process_ids() {
     let first = test_task();
     let second = test_task();
 

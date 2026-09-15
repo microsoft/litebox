@@ -28,6 +28,9 @@ mod random;
 mod socket;
 mod stdio;
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
+
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -65,6 +68,17 @@ pub struct BrokerNotifications<Channel: LocalNotificationChannel> {
 }
 
 impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
+    fn new(channel: Channel, process_id: ProcessId, shared_memory: Arc<dyn SharedMemory>) -> Self {
+        let shared_buffers = SharedBufferPool::new(shared_memory, SHARED_BUFFER_LAYOUT)
+            .expect("broker association shared memory has an invalid size");
+        Self {
+            channel,
+            process_id,
+            shared_buffers,
+            next_request_id: AtomicU64::new(0),
+        }
+    }
+
     /// Negotiates the broker protocol on `setup`, then consumes it into the
     /// active call channel and association shared memory before active requests
     /// begin.
@@ -110,17 +124,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                 );
                 let (channel, shared_memory, activated) =
                     activate(setup).map_err(BrokerLocalError::Channel)?;
-                let shared_buffers = SharedBufferPool::new(shared_memory, SHARED_BUFFER_LAYOUT)
-                    .expect("broker association shared memory has an invalid size");
-                Ok((
-                    Self {
-                        channel,
-                        process_id,
-                        shared_buffers,
-                        next_request_id: AtomicU64::new(0),
-                    },
-                    activated,
-                ))
+                Ok((Self::new(channel, process_id, shared_memory), activated))
             }
             BrokerHandshakeResponse::VersionMismatch { .. } => {
                 Err(BrokerLocalError::Broker(ErrorCode::UnsupportedVersion))
@@ -341,10 +345,7 @@ mod tests {
     #[test]
     fn negotiate_runs_setup_after_response_before_active_requests() {
         let channel = FakeControlChannel::new(
-            Some(BrokerHandshakeResponse::Negotiated {
-                broker_protocol_version: BROKER_PROTOCOL_VERSION,
-                process_id: test_process_id(),
-            }),
+            Some(BrokerHandshakeResponse::negotiated(test_process_id())),
             None,
         );
         let setup_calls = Cell::new(0);
@@ -757,10 +758,7 @@ mod tests {
     #[test]
     fn negotiate_propagates_shared_memory_receive_error() {
         let channel = FakeControlChannel::new(
-            Some(BrokerHandshakeResponse::Negotiated {
-                broker_protocol_version: BROKER_PROTOCOL_VERSION,
-                process_id: test_process_id(),
-            }),
+            Some(BrokerHandshakeResponse::negotiated(test_process_id())),
             None,
         );
 
@@ -780,10 +778,7 @@ mod tests {
     #[should_panic(expected = "broker association shared memory has an invalid size")]
     fn negotiate_rejects_invalid_shared_memory_size() {
         let channel = FakeControlChannel::new(
-            Some(BrokerHandshakeResponse::Negotiated {
-                broker_protocol_version: BROKER_PROTOCOL_VERSION,
-                process_id: test_process_id(),
-            }),
+            Some(BrokerHandshakeResponse::negotiated(test_process_id())),
             None,
         );
 
@@ -930,26 +925,6 @@ mod tests {
 
     struct ConcurrentCallChannel {
         request_ids: Mutex<std::vec::Vec<RequestId>>,
-    }
-
-    impl LocalSetupChannel for ConcurrentCallChannel {
-        type Error = Infallible;
-
-        fn send_handshake_request(
-            &mut self,
-            _request: &BrokerHandshakeRequest,
-        ) -> core::result::Result<(), Self::Error> {
-            Ok(())
-        }
-
-        fn recv_handshake_response(
-            &mut self,
-        ) -> core::result::Result<Option<BrokerHandshakeResponse>, Self::Error> {
-            Ok(Some(BrokerHandshakeResponse::Negotiated {
-                broker_protocol_version: BROKER_PROTOCOL_VERSION,
-                process_id: test_process_id(),
-            }))
-        }
     }
 
     impl LocalCallChannel for ConcurrentCallChannel {

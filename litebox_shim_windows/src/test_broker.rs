@@ -8,11 +8,11 @@
 //! authority — policy and filesystem semantics — belongs to `litebox_broker_core` and is tested
 //! there.
 //!
-//! Ordinary shim tests therefore use [`litebox`], whose association negotiates the protocol and
-//! owns shared memory but serves no objects beyond broker-managed process and thread state. Any
-//! object request it receives is a bug in the test or in the shim and panics. The few tests that
-//! genuinely exercise file-backed behavior (registry persistence and defaults, NLS section
-//! mapping, file syscalls, and file-backed sections) use [`litebox_with_broker_files`].
+//! Ordinary shim tests therefore use [`litebox`], whose association owns shared memory but serves
+//! no objects beyond broker-managed process and thread state. Any object request it receives is a
+//! bug in the test or in the shim and panics. The few tests that genuinely exercise file-backed
+//! behavior (registry persistence and defaults, NLS section mapping, file syscalls, and file-backed
+//! sections) use [`litebox_with_broker_files`].
 
 extern crate std;
 
@@ -24,26 +24,16 @@ use litebox_broker_core::{
     test_support::TestBrokerCoreBuilder,
 };
 use litebox_broker_host::test_support::{InProcessBrokerSetup, shared_memory};
-use litebox_broker_local::BrokerLocal;
-use litebox_broker_protocol::{
-    BROKER_PROTOCOL_VERSION,
-    message::{
-        BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerOperation, BrokerRequest,
-        BrokerResponse,
-    },
-};
-use litebox_broker_transport::{
-    channel::{LocalCallChannel, LocalSetupChannel},
-    shared_memory::SharedMemory,
-};
+use litebox_broker_local::{BrokerLocal, test_support::broker_local};
+use litebox_broker_protocol::message::{BrokerOperation, BrokerRequest, BrokerResponse};
+use litebox_broker_transport::channel::LocalCallChannel;
 
 use crate::tests::TestPlatform;
 
 /// Returns a LiteBox whose broker association serves no objects.
 ///
-/// The association negotiates the protocol and owns real shared memory, so the local side of the
-/// boundary behaves normally, but object requests panic. Process and thread lifecycle operations are
-/// handled by a real broker core.
+/// The association owns real shared memory, so active broker operations behave normally, but object
+/// requests panic. Process and thread lifecycle operations are handled by a real broker core.
 pub(crate) fn litebox(
     platform: &'static TestPlatform,
 ) -> (
@@ -51,20 +41,17 @@ pub(crate) fn litebox(
     litebox_broker_protocol::ProcessId,
 ) {
     let broker = crate::tests::objectless_broker();
-    let channel = ObjectlessChannel {
-        memory: shared_memory(),
-        process: Some(
-            broker
-                .create_process(CallerCredential::Unauthenticated)
-                .unwrap(),
-        ),
-    };
-    let (broker_local, ()) = BrokerLocal::negotiate(channel, |channel| {
-        let memory = Arc::clone(&channel.memory);
-        Ok((channel, memory, ()))
-    })
-    .expect("the objectless broker fixture must negotiate");
-    let process_id = broker_local.process_id();
+    let process = broker
+        .create_process(CallerCredential::Unauthenticated)
+        .unwrap();
+    let process_id = process.id();
+    let broker_local = broker_local(
+        ObjectlessChannel {
+            process: Some(process),
+        },
+        process_id,
+        shared_memory(),
+    );
     (
         litebox::LiteBox::new_with_broker_local(platform, broker_local),
         process_id,
@@ -73,7 +60,6 @@ pub(crate) fn litebox(
 
 /// The local end of an association that owns shared memory but no objects.
 struct ObjectlessChannel {
-    memory: Arc<dyn SharedMemory>,
     process: Option<Arc<BrokerProcess>>,
 }
 
@@ -90,27 +76,6 @@ impl Drop for ObjectlessChannel {
         if let Some(process) = self.process.take() {
             process.finish();
         }
-    }
-}
-
-impl LocalSetupChannel for ObjectlessChannel {
-    type Error = core::convert::Infallible;
-
-    fn send_handshake_request(
-        &mut self,
-        request: &BrokerHandshakeRequest,
-    ) -> core::result::Result<(), Self::Error> {
-        assert_eq!(request.protocol_version, BROKER_PROTOCOL_VERSION);
-        Ok(())
-    }
-
-    fn recv_handshake_response(
-        &mut self,
-    ) -> core::result::Result<Option<BrokerHandshakeResponse>, Self::Error> {
-        Ok(Some(BrokerHandshakeResponse::Negotiated {
-            broker_protocol_version: BROKER_PROTOCOL_VERSION,
-            process_id: self.process().id(),
-        }))
     }
 }
 
