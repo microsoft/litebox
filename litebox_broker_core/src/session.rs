@@ -6,12 +6,13 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::event::EventObject;
 use crate::fs::File;
+use crate::identity::ProcessIdLease;
 use crate::pipe::PipeObject;
 use crate::socket::SocketObject;
-use crate::{BrokerCore, BrokerError, Result};
+use crate::{BrokerCore, BrokerError, ProcessAuthorityKey, Result};
 use hashbrown::HashMap;
-use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::readiness::ReadinessFlags;
+use litebox_broker_protocol::{ObjectHandle, ProcessId, ProcessIdentity};
 use spin::{Mutex, rwlock::RwLock};
 
 /// Caller identity information supplied by the broker entry layer.
@@ -27,11 +28,6 @@ pub enum CallerCredential {
     /// Explicit deployment mode for the initial unauthenticated userland POC.
     Unauthenticated,
 }
-
-/// Broker-assigned session identity.
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SessionId(pub u64);
 
 /// Cancellation state shared by potentially blocking operations in one broker
 /// association.
@@ -64,7 +60,7 @@ bitflags::bitflags! {
 
 pub(crate) struct ObjectReference {
     pub(crate) object: Arc<RwLock<ObjectEntry>>,
-    pub(crate) session_id: SessionId,
+    pub(crate) owner: ProcessAuthorityKey,
     pub(crate) rights: ObjectRights,
     session_reference_index: usize,
 }
@@ -89,8 +85,12 @@ struct SessionReferences {
 /// on that session. Dropping the session releases all object references it owns.
 pub struct BrokerSession {
     pub(crate) core: BrokerCore,
-    /// Broker-assigned session identity.
-    pub(crate) session_id: SessionId,
+    /// Broker-assigned process authority.
+    pub(crate) authority: ProcessAuthorityKey,
+    /// Process-ID reservation, released only after complete teardown.
+    process_lease: Option<ProcessIdLease>,
+    /// Authoritative parent identity, absent for a root process.
+    parent_id: Option<ProcessId>,
     /// Broker-entry-authenticated caller credential for this session.
     pub(crate) caller_credential: CallerCredential,
     /// Handles of the live object references owned by this session.
@@ -107,12 +107,16 @@ impl BrokerSession {
     /// Creates an authenticated session identity.
     pub(crate) fn new(
         core: BrokerCore,
-        session_id: SessionId,
+        process_lease: ProcessIdLease,
+        parent_id: Option<ProcessId>,
         caller_credential: CallerCredential,
     ) -> Self {
+        let authority = process_lease.key();
         Self {
             core,
-            session_id,
+            authority,
+            process_lease: Some(process_lease),
+            parent_id,
             caller_credential,
             references: Mutex::new(SessionReferences {
                 handles: Vec::new(),
@@ -124,10 +128,31 @@ impl BrokerSession {
         }
     }
 
+    /// Returns the broker-assigned identity for this root process.
+    #[must_use]
+    pub const fn process_identity(&self) -> ProcessIdentity {
+        ProcessIdentity {
+            id: self.authority.process_id(),
+            parent_id: self.parent_id,
+        }
+    }
+
     /// Requests cooperative cancellation of potentially blocking operations
     /// because this association is ending.
     pub fn request_cancellation(&self) {
         self.cancellation.cancel();
+    }
+
+    /// Completes a non-unwinding session teardown and releases its process ID.
+    ///
+    /// Dropping a session without calling this method performs the same
+    /// authority cleanup but poisons the numeric ID so an unwind cannot make it
+    /// eligible for reuse.
+    pub fn finish(mut self) {
+        let invariant_fault = self.cleanup();
+        if let Some(process_lease) = self.process_lease.take() {
+            process_lease.release(invariant_fault);
+        }
     }
 
     pub(crate) fn create_object_reference(&self, object: ObjectEntry) -> Result<ObjectHandle> {
@@ -213,7 +238,7 @@ impl BrokerSession {
         let object = {
             let references = self.core.references.read();
             let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
-            if reference.session_id != self.session_id {
+            if reference.owner != self.authority {
                 return Err(BrokerError::UnknownObject);
             }
             if !reference.rights.contains(rights) {
@@ -381,7 +406,7 @@ impl BrokerSession {
             handle,
             ObjectReference {
                 object,
-                session_id: self.session_id,
+                owner: self.authority,
                 rights,
                 session_reference_index,
             },
@@ -402,7 +427,7 @@ impl BrokerSession {
     ) -> Result<Arc<RwLock<ObjectEntry>>> {
         let references = self.core.references.read();
         let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
-        if reference.session_id != self.session_id {
+        if reference.owner != self.authority {
             return Err(BrokerError::UnknownObject);
         }
         if !reference.rights.contains(required_rights) {
@@ -419,7 +444,7 @@ impl BrokerSession {
         debug_assert!(!allowed_rights.is_empty());
         let references = self.core.references.read();
         let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
-        if reference.session_id != self.session_id {
+        if reference.owner != self.authority {
             return Err(BrokerError::UnknownObject);
         }
         if !reference.rights.intersects(allowed_rights) {
@@ -467,7 +492,7 @@ impl BrokerSession {
         // reach the shared rollback below instead of dropping the removed
         // reference while either reference-index lock is held.
         let removal_result = (|| {
-            if reference.session_id != self.session_id {
+            if reference.owner != self.authority {
                 return Err(BrokerError::UnknownObject);
             }
             if reference_handles.get(index) != Some(&handle) {
@@ -484,7 +509,7 @@ impl BrokerSession {
                 let moved_reference = references
                     .get_mut(&moved_handle)
                     .ok_or(BrokerError::Internal)?;
-                if moved_reference.session_id != self.session_id
+                if moved_reference.owner != self.authority
                     || moved_reference.session_reference_index != last_index
                 {
                     return Err(BrokerError::Internal);
@@ -505,6 +530,66 @@ impl BrokerSession {
             return Err(error);
         }
         Ok(reference)
+    }
+
+    fn cleanup(&mut self) -> bool {
+        if self.process_lease.is_none() {
+            return false;
+        }
+
+        let mut invariant_fault = self.references.lock().pending_handles != 0;
+        loop {
+            let Some(handle) = self.references.lock().handles.pop() else {
+                break;
+            };
+            // Do not restore an inconsistent handle: retrying it forever would
+            // prevent later valid references from being released.
+            let reference = {
+                let mut references = self.core.references.write();
+                let Some(reference) = references.get(&handle) else {
+                    invariant_fault = true;
+                    continue;
+                };
+                if reference.owner != self.authority {
+                    invariant_fault = true;
+                    continue;
+                }
+                let Some(reference) = references.remove(&handle) else {
+                    invariant_fault = true;
+                    continue;
+                };
+                reference
+            };
+            // Object destruction may release platform resources and must never
+            // run while either reference index lock is held.
+            drop(reference);
+        }
+
+        loop {
+            let stale = {
+                let references = self.core.references.read();
+                references.iter().find_map(|(handle, reference)| {
+                    (reference.owner == self.authority).then_some(*handle)
+                })
+            };
+            let Some(handle) = stale else {
+                break;
+            };
+            invariant_fault = true;
+            let reference = self.core.references.write().remove(&handle);
+            drop(reference);
+        }
+        debug_assert!(
+            !self
+                .core
+                .references
+                .read()
+                .values()
+                .any(|reference| reference.owner == self.authority)
+        );
+
+        self.core.socket_provider.close_process(self.authority);
+        invariant_fault
     }
 }
 
@@ -589,30 +674,7 @@ fn release_pending_reference(
 
 impl Drop for BrokerSession {
     fn drop(&mut self) {
-        loop {
-            let Some(handle) = self.references.lock().handles.pop() else {
-                break;
-            };
-            // Do not restore an inconsistent handle: retrying it forever would
-            // prevent later valid references from being released.
-            let reference = {
-                let mut references = self.core.references.write();
-                let Some(reference) = references.get(&handle) else {
-                    continue;
-                };
-                if reference.session_id != self.session_id {
-                    continue;
-                }
-                let Some(reference) = references.remove(&handle) else {
-                    continue;
-                };
-                reference
-            };
-            // Object destruction may release platform resources and must never
-            // run while either reference index lock is held.
-            drop(reference);
-        }
-        self.core.socket_provider.close_session(self.session_id);
+        let _ = self.cleanup();
     }
 }
 
@@ -641,6 +703,92 @@ mod tests {
     const TEST_MAX_REFERENCES_PER_SESSION: usize = 2;
     const TEST_MAX_PIPE_CAPACITY_PER_SESSION: usize = 4;
     const ROOT: FileUser = FileUser { user: 0, group: 0 };
+
+    #[test]
+    fn sessions_receive_distinct_checked_process_identities() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        let first = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let second = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+
+        assert_ne!(first.process_identity().id, second.process_identity().id);
+        assert_eq!(first.process_identity().parent_id, None);
+        assert_eq!(second.process_identity().parent_id, None);
+    }
+
+    #[test]
+    fn finish_retires_process_identity_for_reuse() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .with_limits(BrokerCoreLimits::DEFAULT.with_process_id_limits(1, 2))
+        .build()
+        .unwrap();
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let process_id = session.process_identity().id;
+
+        session.finish();
+
+        let replacement = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        assert_eq!(replacement.process_identity().id, process_id);
+        replacement.finish();
+    }
+
+    #[test]
+    fn fallback_drop_poisons_consistent_process_identity() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .with_limits(BrokerCoreLimits::DEFAULT.with_process_id_limits(1, 2))
+        .build()
+        .unwrap();
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let process_id = session.process_identity().id;
+
+        drop(session);
+
+        let replacement = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        assert_ne!(replacement.process_identity().id, process_id);
+        replacement.finish();
+    }
+
+    #[test]
+    fn drop_sweeps_unindexed_references_and_poisons_identity() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        let session = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        let process_id = session.process_identity().id;
+        crate::event::create(&session, 1).unwrap();
+        session.references.lock().handles.clear();
+
+        drop(session);
+
+        assert!(broker.references.read().is_empty());
+        let replacement = broker
+            .create_session(CallerCredential::Unauthenticated)
+            .unwrap();
+        assert_ne!(replacement.process_identity().id, process_id);
+    }
 
     #[test]
     fn pending_reference_release_checks_both_counters() {

@@ -72,13 +72,15 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         local,
         notifications,
     } = broker::connect(control_pipe)?;
+    let process_identity = local.process_identity();
     let litebox = litebox::LiteBox::new_with_broker_local(platform, local);
     broker::start_notification_receiver(
         notifications,
         litebox.broker_notification_dispatcher(),
         litebox.broker_failure_dispatcher(),
     )?;
-    let shim_builder = litebox_shim_linux::LinuxShimBuilder::new_with_litebox(platform, litebox);
+    let shim_builder =
+        litebox_shim_linux::LinuxShimBuilder::new_with_litebox(platform, litebox, process_identity);
 
     // The program path is a Unix-style path inside the tar archive.
     let prog_path = &cli_args.program_and_arguments[0];
@@ -106,7 +108,21 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     };
 
     let program = shim
-        .load_program(platform.init_task(), prog_path, argv, envp)
+        .load_program(
+            litebox_common_linux::TaskParams {
+                pid: process_identity.id.get().try_into().unwrap(),
+                ppid: process_identity
+                    .parent_id
+                    .map_or(0, |parent_id| parent_id.get().try_into().unwrap()),
+                uid: 1000,
+                gid: 1000,
+                euid: 1000,
+                egid: 1000,
+            },
+            prog_path,
+            argv,
+            envp,
+        )
         .unwrap();
     unsafe {
         litebox_platform_windows_userland::run_thread(

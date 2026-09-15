@@ -14,7 +14,7 @@ use litebox_broker_core::socket::{
     GuestSocketBinding, GuestSourceLease, PlatformConnectError, host_socket_destination,
     is_internal_socket_address, normalize_socket_destination,
 };
-use litebox_broker_core::{BrokerError, Result as BrokerResult, SessionId};
+use litebox_broker_core::{BrokerError, ProcessAuthorityKey, Result as BrokerResult};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
     MAX_SOCKET_PEEK_SIZE, MAX_SOCKET_TRANSFER_SIZE, ReceiveFlags, ShutdownMode,
@@ -198,7 +198,7 @@ pub(super) struct GuestTcpListenerState {
 pub(super) struct QueuedGuestTcpConnection {
     pub(super) socket: OwnedFd,
     pub(super) connector_socket_id: u64,
-    pub(super) connector_session_id: SessionId,
+    pub(super) connector_process_authority: ProcessAuthorityKey,
     pub(super) local_address: SocketAddrV4,
     pub(super) guest_source_lease: GuestSourceLease,
 }
@@ -1284,10 +1284,10 @@ impl Reactor {
         requested_destination: SocketAddrV4,
         guest_source_lease: Option<GuestSourceLease>,
     ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
-        let session_id = self
+        let process_authority = self
             .sockets
             .get(&id)
-            .and_then(|socket| socket.guest_local_address.map(|_| socket.session_id))
+            .and_then(|socket| socket.guest_local_address.map(|_| socket.process_authority))
             .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?;
         let binding = self
             .tcp
@@ -1322,7 +1322,7 @@ impl Reactor {
                 .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?;
             return self.connect_internal_tcp_socketpair(
                 id,
-                session_id,
+                process_authority,
                 listener_id,
                 concrete_address,
                 guest_source_lease,
@@ -1372,7 +1372,7 @@ impl Reactor {
     fn connect_internal_tcp_socketpair(
         &mut self,
         connector_socket_id: u64,
-        connector_session_id: SessionId,
+        connector_process_authority: ProcessAuthorityKey,
         listener_id: u64,
         local_address: SocketAddrV4,
         guest_source_lease: GuestSourceLease,
@@ -1390,7 +1390,7 @@ impl Reactor {
         )?;
         let session = self
             .sessions
-            .get(&connector_session_id)
+            .get(&connector_process_authority)
             .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?;
         let next_pending_count = session
             .pending_guest_connection_count
@@ -1504,13 +1504,13 @@ impl Reactor {
             .push_back(QueuedGuestTcpConnection {
                 socket: accepted_socket,
                 connector_socket_id,
-                connector_session_id,
+                connector_process_authority,
                 local_address,
                 guest_source_lease,
             });
         self.tcp.queued_guest_connection_count = next_queued_count;
         self.sessions
-            .get_mut(&connector_session_id)
+            .get_mut(&connector_process_authority)
             .expect("validated connector session missing")
             .pending_guest_connection_count = next_pending_count;
 
@@ -1530,7 +1530,7 @@ impl Reactor {
         Ok(SocketConnectionStatus::Connected)
     }
 
-    pub(super) fn remove_tcp_socket(&mut self, id: u64, session_id: SessionId) {
+    pub(super) fn remove_tcp_socket(&mut self, id: u64, process_authority: ProcessAuthorityKey) {
         if self
             .tcp
             .peek_cache
@@ -1541,7 +1541,7 @@ impl Reactor {
         }
         let session_closing = self
             .sessions
-            .get(&session_id)
+            .get(&process_authority)
             .is_some_and(|session| session.closing);
         let queued_connection = self
             .sockets
@@ -1610,7 +1610,7 @@ impl Reactor {
         if reset_peer && let Some(connector_socket_id) = guest_connector_socket_id {
             self.mark_guest_peer_reset(connector_socket_id);
         }
-        if let Some(session) = self.sessions.get_mut(&session_id) {
+        if let Some(session) = self.sessions.get_mut(&process_authority) {
             session.live_socket_count = session
                 .live_socket_count
                 .checked_sub(1)
@@ -1620,7 +1620,10 @@ impl Reactor {
             .retain(|_, session| retain_session_state(session));
     }
 
-    fn release_queued_guest_connection(&mut self, connector_session_id: SessionId) {
+    fn release_queued_guest_connection(
+        &mut self,
+        connector_process_authority: ProcessAuthorityKey,
+    ) {
         self.tcp.queued_guest_connection_count = self
             .tcp
             .queued_guest_connection_count
@@ -1628,7 +1631,7 @@ impl Reactor {
             .expect("reactor queued guest connection count underflow");
         let session = self
             .sessions
-            .get_mut(&connector_session_id)
+            .get_mut(&connector_process_authority)
             .expect("queued guest connection session state missing");
         session.pending_guest_connection_count = session
             .pending_guest_connection_count
@@ -1642,7 +1645,7 @@ impl Reactor {
         reset_connectors: bool,
     ) {
         for connection in queued {
-            self.release_queued_guest_connection(connection.connector_session_id);
+            self.release_queued_guest_connection(connection.connector_process_authority);
             if let Some(connector) = self.sockets.get_mut(&connection.connector_socket_id)
                 && let Ok(tcp) = connector.tcp_state_mut()
                 && let Some(endpoint) = tcp.guest_endpoint.as_mut()
@@ -1658,7 +1661,10 @@ impl Reactor {
             .retain(|_, session| retain_session_state(session));
     }
 
-    pub(super) fn purge_connector_session_queues(&mut self, session_id: SessionId) {
+    pub(super) fn purge_connector_session_queues(
+        &mut self,
+        process_authority: ProcessAuthorityKey,
+    ) {
         loop {
             let queued = self.sockets.iter().find_map(|(listener_id, socket)| {
                 socket
@@ -1666,10 +1672,9 @@ impl Reactor {
                     .ok()
                     .and_then(|tcp| tcp.listener.as_ref())
                     .and_then(|listener| {
-                        listener
-                            .queue
-                            .iter()
-                            .find(|connection| connection.connector_session_id == session_id)
+                        listener.queue.iter().find(|connection| {
+                            connection.connector_process_authority == process_authority
+                        })
                     })
                     .map(|connection| (*listener_id, connection.connector_socket_id))
             });
@@ -1703,7 +1708,7 @@ impl Reactor {
         let Some(connection) = connection else {
             return false;
         };
-        self.release_queued_guest_connection(connection.connector_session_id);
+        self.release_queued_guest_connection(connection.connector_process_authority);
         if let Some(connector) = self.sockets.get_mut(&connection.connector_socket_id)
             && let Ok(tcp) = connector.tcp_state_mut()
             && let Some(endpoint) = tcp.guest_endpoint.as_mut()
@@ -1888,12 +1893,12 @@ impl Reactor {
             return Err(BrokerError::Internal);
         }
         let (
-            listener_session_id,
+            listener_process_authority,
             listener_tcp_no_delay,
             listener_tcp_keep_alive,
             queue_length,
             accepted_connector_socket_id,
-            accepted_connector_session_id,
+            accepted_connector_process_authority,
         ) = {
             let listener = self
                 .sockets
@@ -1904,7 +1909,7 @@ impl Reactor {
                 return Ok(SocketOutcome::Failed(SocketError::NotConnected));
             };
             (
-                listener.session_id,
+                listener.process_authority,
                 tcp.no_delay,
                 tcp.keep_alive,
                 listener_state.queue.len(),
@@ -1915,7 +1920,7 @@ impl Reactor {
                 listener_state
                     .queue
                     .front()
-                    .map(|queued| queued.connector_session_id),
+                    .map(|queued| queued.connector_process_authority),
             )
         };
         if queue_length == 0 {
@@ -1924,17 +1929,18 @@ impl Reactor {
         }
         let accepted_connector_socket_id =
             accepted_connector_socket_id.ok_or(BrokerError::Internal)?;
-        let accepted_connector_session_id =
-            accepted_connector_session_id.ok_or(BrokerError::Internal)?;
+        let accepted_connector_process_authority =
+            accepted_connector_process_authority.ok_or(BrokerError::Internal)?;
         let listener_session = self
             .sessions
-            .get(&listener_session_id)
+            .get(&listener_process_authority)
             .ok_or(BrokerError::Internal)?;
         let next_listener_live_count = listener_session
             .live_socket_count
             .checked_add(1)
             .ok_or(BrokerError::ResourceExhausted)?;
-        let transferred_pending = usize::from(accepted_connector_session_id == listener_session_id);
+        let transferred_pending =
+            usize::from(accepted_connector_process_authority == listener_process_authority);
         let next_listener_total = next_listener_live_count
             .checked_add(listener_session.pending_guest_connection_count)
             .and_then(|count| count.checked_sub(transferred_pending))
@@ -1993,11 +1999,11 @@ impl Reactor {
         let QueuedGuestTcpConnection {
             socket,
             connector_socket_id,
-            connector_session_id,
+            connector_process_authority,
             local_address,
             guest_source_lease,
         } = queued;
-        self.release_queued_guest_connection(connector_session_id);
+        self.release_queued_guest_connection(connector_process_authority);
         if let Some(connector) = self.sockets.get_mut(&connector_socket_id)
             && let Ok(tcp) = connector.tcp_state_mut()
             && let Some(endpoint) = tcp.guest_endpoint.as_mut()
@@ -2008,7 +2014,7 @@ impl Reactor {
         self.sockets.insert(
             accepted_id,
             SocketEntry {
-                session_id: listener_session_id,
+                process_authority: listener_process_authority,
                 transport: SocketTransportState::Tcp(TcpSocketState {
                     descriptor: TcpDescriptor::InternalUnix(socket),
                     listener: None,
@@ -2035,7 +2041,7 @@ impl Reactor {
         );
         let session = self
             .sessions
-            .get_mut(&listener_session_id)
+            .get_mut(&listener_process_authority)
             .ok_or(BrokerError::Internal)?;
         session.live_socket_count = next_listener_live_count;
         if queue_length == 1 {

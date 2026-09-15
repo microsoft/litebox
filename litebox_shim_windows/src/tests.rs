@@ -123,6 +123,15 @@ pub(crate) fn test_task() -> Task<TestPlatform> {
     test_task_from_litebox(crate::test_broker::litebox(test_platform()))
 }
 
+pub(crate) fn test_task_with_process_identity(
+    process_identity: litebox_broker_protocol::ProcessIdentity,
+) -> Task<TestPlatform> {
+    test_task_from_litebox_with_identity(
+        crate::test_broker::litebox(test_platform()),
+        process_identity,
+    )
+}
+
 /// Returns a task whose broker serves `files` from an in-memory filesystem.
 ///
 /// Reserved for tests that genuinely exercise file-backed behavior. Every other test must use
@@ -174,9 +183,33 @@ pub(crate) fn test_task_with_broker_files(files: &[(&str, &[u8])]) -> Task<TestP
 }
 
 fn test_task_from_litebox(litebox: litebox::LiteBox<TestPlatform>) -> Task<TestPlatform> {
+    let process_identity = litebox_broker_protocol::ProcessIdentity {
+        id: litebox_broker_protocol::ProcessId::new(
+            u32::try_from(crate::syscalls::process::INITIAL_PROCESS_ID)
+                .expect("the initial Windows test process ID must fit u32"),
+        )
+        .unwrap(),
+        parent_id: None,
+    };
+    test_task_from_litebox_with_identity(litebox, process_identity)
+}
+
+fn test_task_from_litebox_with_identity(
+    litebox: litebox::LiteBox<TestPlatform>,
+    process_identity: litebox_broker_protocol::ProcessIdentity,
+) -> Task<TestPlatform> {
     let platform = test_platform();
-    let shim_builder =
-        crate::WindowsShimBuilder::<TestPlatform>::new_with_litebox(platform, litebox);
+    let initial_thread_id =
+        if process_identity.id.get() < litebox_broker_protocol::MAX_ALLOCATED_TASK_ID {
+            process_identity.id.get() + 1
+        } else {
+            1
+        };
+    let shim_builder = crate::WindowsShimBuilder::<TestPlatform>::new_with_litebox(
+        platform,
+        litebox,
+        process_identity,
+    );
     let fs_context = litebox::fs::Context::new();
     let shim = shim_builder.build();
     let WindowsShim(global) = shim;
@@ -187,12 +220,17 @@ fn test_task_from_litebox(litebox: litebox::LiteBox<TestPlatform>) -> Task<TestP
     let windows_shared_section =
         crate::syscalls::section::load_time_windows_shared_section(windows_shared_section_base);
 
-    let process = Arc::new(Process::default(None, windows_shared_section));
+    let process = Arc::new(Process::new(
+        process_identity,
+        initial_thread_id,
+        None,
+        windows_shared_section,
+    ));
     let thread_object = Arc::new(crate::syscalls::thread::ThreadObject::new(
-        crate::syscalls::process::INITIAL_THREAD_ID,
+        initial_thread_id as usize,
         0,
     ));
-    assert!(process.attach_thread(crate::syscalls::process::INITIAL_THREAD_ID, &thread_object));
+    assert!(process.attach_thread(initial_thread_id as usize, &thread_object));
 
     Task {
         global,
@@ -256,7 +294,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     pub(crate) fn clone_for_test_with_teb(&self, teb_address: usize) -> Option<Self> {
-        let thread_id = self.process.allocate_thread_id();
+        let thread_id = self.process.allocate_thread_id()?;
         let thread_object = Arc::new(crate::syscalls::thread::ThreadObject::new(
             thread_id,
             teb_address,

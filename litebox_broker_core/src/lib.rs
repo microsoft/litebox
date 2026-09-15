@@ -21,6 +21,7 @@ extern crate std;
 mod error;
 pub mod event;
 pub mod fs;
+mod identity;
 pub mod pipe;
 mod policy;
 pub mod random;
@@ -39,19 +40,19 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use hashbrown::HashMap;
 use litebox_broker_protocol::ObjectHandle;
-use spin::rwlock::RwLock;
+use spin::{Mutex, rwlock::RwLock};
 
 pub use error::BrokerError;
 use fs::FileService;
+pub use identity::ProcessAuthorityKey;
+use identity::{ProcessIdAllocator, ProcessIdLease};
 pub use policy::{
     DestinationPortRange, DestinationRule, Ipv4Cidr, MAX_DESTINATION_RULES, PolicyEngine,
     PolicyProfile, SocketPolicy, SocketPolicyError,
 };
 use random::RandomProvider;
 use session::ObjectReference;
-pub use session::{
-    AssociationCancellation, BrokerSession, CallerCredential, ObjectRights, SessionId,
-};
+pub use session::{AssociationCancellation, BrokerSession, CallerCredential, ObjectRights};
 use socket::{BrokerSocketPorts, SocketProvider};
 use stdio::StdioProvider;
 
@@ -75,6 +76,10 @@ pub struct BrokerCoreLimits {
     pub max_sockets: usize,
     /// Maximum live platform socket resources owned by one session.
     pub max_sockets_per_session: usize,
+    /// Number of fully retired process IDs delayed before reuse.
+    pub process_id_quarantine_capacity: usize,
+    /// Maximum process IDs permanently excluded after teardown invariant faults.
+    pub max_poisoned_process_ids: usize,
 }
 
 impl BrokerCoreLimits {
@@ -87,6 +92,8 @@ impl BrokerCoreLimits {
         max_pipe_capacity_per_session: 16 * 1024 * 1024,
         max_sockets: 1024,
         max_sockets_per_session: 256,
+        process_id_quarantine_capacity: 1024,
+        max_poisoned_process_ids: 64,
     };
 
     /// Creates a broker core limit set.
@@ -101,6 +108,8 @@ impl BrokerCoreLimits {
             max_pipe_capacity_per_session: max_total_pipe_capacity,
             max_sockets: Self::DEFAULT.max_sockets,
             max_sockets_per_session: Self::DEFAULT.max_sockets_per_session,
+            process_id_quarantine_capacity: Self::DEFAULT.process_id_quarantine_capacity,
+            max_poisoned_process_ids: Self::DEFAULT.max_poisoned_process_ids,
         }
     }
 
@@ -121,6 +130,8 @@ impl BrokerCoreLimits {
             max_pipe_capacity_per_session: max_total_pipe_capacity,
             max_sockets,
             max_sockets_per_session,
+            process_id_quarantine_capacity: Self::DEFAULT.process_id_quarantine_capacity,
+            max_poisoned_process_ids: Self::DEFAULT.max_poisoned_process_ids,
         }
     }
 
@@ -137,6 +148,20 @@ impl BrokerCoreLimits {
         Self {
             max_references_per_session,
             max_pipe_capacity_per_session,
+            ..self
+        }
+    }
+
+    /// Returns these limits with explicit process-ID retirement bounds.
+    #[must_use]
+    pub const fn with_process_id_limits(
+        self,
+        process_id_quarantine_capacity: usize,
+        max_poisoned_process_ids: usize,
+    ) -> Self {
+        Self {
+            process_id_quarantine_capacity,
+            max_poisoned_process_ids,
             ..self
         }
     }
@@ -157,7 +182,7 @@ impl Default for BrokerCoreLimits {
 pub struct BrokerCore {
     pub(crate) policy: Arc<PolicyEngine>,
     pub(crate) limits: BrokerCoreLimits,
-    pub(crate) next_session_id: Arc<RwLock<u64>>,
+    pub(crate) process_ids: Arc<Mutex<ProcessIdAllocator>>,
     pub(crate) next_reference_handle: Arc<RwLock<u64>>,
     pub(crate) references: Arc<RwLock<HashMap<ObjectHandle, ObjectReference>>>,
     pub(crate) pending_references: Arc<AtomicUsize>,
@@ -200,6 +225,10 @@ impl BrokerCore {
         stdio_provider: Arc<dyn StdioProvider>,
         fs: Arc<dyn FileService>,
     ) -> Result<Self> {
+        let process_ids = ProcessIdAllocator::new(
+            limits.process_id_quarantine_capacity,
+            limits.max_poisoned_process_ids,
+        )?;
         BROKER_CORE_CREATED
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| BrokerError::BrokerCoreAlreadyExists)?;
@@ -207,7 +236,7 @@ impl BrokerCore {
         Ok(Self {
             policy: Arc::new(policy),
             limits,
-            next_session_id: Arc::new(RwLock::new(1)),
+            process_ids: Arc::new(Mutex::new(process_ids)),
             next_reference_handle: Arc::new(RwLock::new(1)),
             references: Arc::new(RwLock::new(HashMap::new())),
             pending_references: Arc::new(AtomicUsize::new(0)),
@@ -255,14 +284,12 @@ impl BrokerCore {
 
     /// Allocates broker authority state for one authenticated caller session.
     pub fn create_session(&self, caller_credential: CallerCredential) -> Result<BrokerSession> {
-        let mut next_session_id = self.next_session_id.write();
-        let session_id = *next_session_id;
-        *next_session_id = session_id
-            .checked_add(1)
-            .ok_or(BrokerError::ResourceExhausted)?;
+        let authority = self.process_ids.lock().allocate()?;
+        let lease = ProcessIdLease::new(Arc::clone(&self.process_ids), authority);
         Ok(BrokerSession::new(
             self.clone(),
-            SessionId(session_id),
+            lease,
+            None,
             caller_credential,
         ))
     }

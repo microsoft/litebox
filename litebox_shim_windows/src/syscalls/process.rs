@@ -15,9 +15,10 @@ use crate::{ConstPtr, MutPtr, ShimPlatform, Task};
 
 const ACTIVE_PROCESS_EXIT_STATUS: i32 = 0x0000_0103;
 const NORMAL_PROCESS_BASE_PRIORITY: i32 = 8;
+#[cfg(test)]
 pub(crate) const INITIAL_PROCESS_ID: usize = 1;
-pub(crate) const INITIAL_THREAD_ID: usize = 1;
-const GUEST_PARENT_PROCESS_ID: usize = 0;
+#[cfg(all(test, target_os = "windows"))]
+pub(crate) const INITIAL_THREAD_ID: usize = 2;
 const GUEST_PROCESS_AFFINITY_MASK: usize = 1;
 const PROCESS_DEBUG_FLAGS_NO_DEBUGGER: u32 = 1;
 const PROCESS_COOKIE: u32 = 0xdead_beef;
@@ -820,7 +821,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             base_priority: NORMAL_PROCESS_BASE_PRIORITY,
             _padding1: 0,
             unique_process_id: self.process.id,
-            inherited_from_unique_process_id: GUEST_PARENT_PROCESS_ID,
+            inherited_from_unique_process_id: self.process.parent_id,
         }
     }
 }
@@ -909,6 +910,24 @@ mod tests {
                 "a host Windows probe leaves ReturnLength unchanged when ProcessInformation faults"
             );
         });
+    }
+
+    #[test]
+    fn process_basic_information_uses_broker_identity() {
+        let process_identity = litebox_broker_protocol::ProcessIdentity {
+            id: litebox_broker_protocol::ProcessId::new(37).unwrap(),
+            parent_id: Some(litebox_broker_protocol::ProcessId::new(11).unwrap()),
+        };
+        let task = crate::tests::test_task_with_process_identity(process_identity);
+
+        let information = task.process_basic_information();
+
+        assert_eq!(information.unique_process_id, 37);
+        assert_eq!(information.inherited_from_unique_process_id, 11);
+        assert_ne!(
+            task.thread_object.thread_id(),
+            information.unique_process_id
+        );
     }
 
     #[test]

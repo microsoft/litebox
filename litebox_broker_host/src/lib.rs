@@ -96,6 +96,11 @@ impl<Memory: SharedMemory> BrokerHostAssociation<'_, Memory> {
         self.session.request_cancellation();
     }
 
+    /// Completes non-unwinding association teardown and releases its process ID.
+    pub fn finish(self) {
+        self.session.finish();
+    }
+
     /// Executes one active request and emits its response.
     ///
     /// Any fatal broker or response-channel error permanently fails this
@@ -190,7 +195,6 @@ where
         PeerCredential::Unauthenticated => CallerCredential::Unauthenticated,
         _ => return Err(BrokerHostError::Broker(ErrorCode::PolicyDenied)),
     };
-    let session = core.create_session(caller_credential)?;
     loop {
         let request = match setup_channel
             .recv_handshake_request()
@@ -211,30 +215,43 @@ where
         };
 
         let negotiated = request.protocol_version == BROKER_PROTOCOL_VERSION;
-        let response = if negotiated {
-            BrokerHandshakeResponse::Negotiated {
-                broker_protocol_version: BROKER_PROTOCOL_VERSION,
+        if !negotiated {
+            setup_channel
+                .send_handshake_response(&BrokerHandshakeResponse::VersionMismatch {
+                    broker_protocol_version: BROKER_PROTOCOL_VERSION,
+                })
+                .map_err(BrokerHostError::Channel)?;
+            continue;
+        }
+
+        let session = match core.create_session(caller_credential) {
+            Ok(session) => session,
+            Err(litebox_broker_core::BrokerError::ResourceExhausted) => {
+                let error = ErrorCode::ResourceExhausted;
+                setup_channel
+                    .send_handshake_response(&BrokerHandshakeResponse::Error(error))
+                    .map_err(BrokerHostError::Channel)?;
+                return Ok(Err(ConnectionTermination::Rejected(error)));
             }
-        } else {
-            BrokerHandshakeResponse::VersionMismatch {
-                broker_protocol_version: BROKER_PROTOCOL_VERSION,
-            }
+            Err(error) => return Err(BrokerHostError::from(error)),
+        };
+        let response = BrokerHandshakeResponse::Negotiated {
+            broker_protocol_version: BROKER_PROTOCOL_VERSION,
+            process_identity: session.process_identity(),
         };
         setup_channel
             .send_handshake_response(&response)
             .map_err(BrokerHostError::Channel)?;
-        if negotiated {
-            send_shared_memory(setup_channel).map_err(BrokerHostError::Channel)?;
-            return Ok(Ok(BrokerHostAssociation {
-                session,
-                shared_buffers,
-                readiness_sink,
-                state: SpinMutex::new(AssociationState {
-                    failed: false,
-                    shared_buffer_usage: SharedBufferUsage::new(),
-                }),
-            }));
-        }
+        send_shared_memory(setup_channel).map_err(BrokerHostError::Channel)?;
+        return Ok(Ok(BrokerHostAssociation {
+            session,
+            shared_buffers,
+            readiness_sink,
+            state: SpinMutex::new(AssociationState {
+                failed: false,
+                shared_buffer_usage: SharedBufferUsage::new(),
+            }),
+        }));
     }
 }
 
@@ -1020,6 +1037,8 @@ pub enum ConnectionTermination {
     PeerClosed,
     /// The peer violated the protocol.
     ProtocolViolation,
+    /// Setup was rejected with a typed broker error.
+    Rejected(ErrorCode),
 }
 
 #[cfg(test)]
@@ -1035,7 +1054,7 @@ mod tests {
         PlatformSocketStatus, PlatformStreamReceive, SocketProvider,
     };
     use litebox_broker_core::test_support::{TestBrokerCoreBuilder, TestStdioProvider};
-    use litebox_broker_core::{ObjectRights, PolicyEngine, SessionId, SocketPolicy};
+    use litebox_broker_core::{ObjectRights, PolicyEngine, ProcessAuthorityKey, SocketPolicy};
     use litebox_broker_protocol::event::{
         AddEventRequest, ConsumeEventRequest, CreateEventRequest, EventConsumeMode,
     };
@@ -1060,7 +1079,9 @@ mod tests {
         TcpOptionValue,
     };
     use litebox_broker_protocol::stdio::{StdioOutputStream, StdioStream};
-    use litebox_broker_protocol::{ObjectHandle, ProtocolVersion, RequestId};
+    use litebox_broker_protocol::{
+        ObjectHandle, ProcessId, ProcessIdentity, ProtocolVersion, RequestId,
+    };
     use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemoryError};
     use litebox_platform::sync::{
         ImmediatelyWokenUp, RawMutex, RawMutexProvider, UnblockedOrTimedOut,
@@ -1069,6 +1090,13 @@ mod tests {
     use std::time::Duration;
 
     const ROOT: FileUser = FileUser { user: 0, group: 0 };
+
+    fn root_process_identity(id: u32) -> ProcessIdentity {
+        ProcessIdentity {
+            id: ProcessId::new(id).unwrap(),
+            parent_id: None,
+        }
+    }
 
     struct TestRawMutex {
         state: AtomicU32,
@@ -1170,7 +1198,7 @@ mod tests {
     impl SocketProvider for TestSocketProvider {
         fn create(
             &self,
-            _session_id: SessionId,
+            _process_authority: ProcessAuthorityKey,
             request: CreateSocketRequest,
             readiness: ReadinessRegistration,
         ) -> litebox_broker_core::Result<Arc<dyn PlatformSocket>> {
@@ -1182,7 +1210,7 @@ mod tests {
             }))
         }
 
-        fn close_session(&self, _session_id: SessionId) {}
+        fn close_process(&self, _process_authority: ProcessAuthorityKey) {}
     }
 
     struct TestRandomProvider;
@@ -1696,7 +1724,8 @@ mod tests {
         assert_eq!(
             channel.handshake_responses[0],
             BrokerHandshakeResponse::Negotiated {
-                broker_protocol_version: BROKER_PROTOCOL_VERSION
+                broker_protocol_version: BROKER_PROTOCOL_VERSION,
+                process_identity: root_process_identity(1),
             }
         );
         let handle = match &channel.results[0] {
@@ -1730,7 +1759,8 @@ mod tests {
                     broker_protocol_version: BROKER_PROTOCOL_VERSION
                 },
                 BrokerHandshakeResponse::Negotiated {
-                    broker_protocol_version: BROKER_PROTOCOL_VERSION
+                    broker_protocol_version: BROKER_PROTOCOL_VERSION,
+                    process_identity: root_process_identity(2),
                 }
             ]
         );
@@ -1763,6 +1793,13 @@ mod tests {
             }]
         );
         assert!(!setup_called.get());
+        assert_eq!(
+            broker
+                .create_session(CallerCredential::Unauthenticated)
+                .unwrap()
+                .process_identity(),
+            root_process_identity(3)
+        );
     }
 
     fn test_channel_rejects_active_request_before_negotiation(broker: &BrokerCore) {
@@ -1795,7 +1832,8 @@ mod tests {
         assert_eq!(
             channel.handshake_responses,
             [BrokerHandshakeResponse::Negotiated {
-                broker_protocol_version: BROKER_PROTOCOL_VERSION
+                broker_protocol_version: BROKER_PROTOCOL_VERSION,
+                process_identity: root_process_identity(4),
             }]
         );
         assert!(channel.results.is_empty());
@@ -2570,21 +2608,25 @@ mod tests {
             Ok(association) => association,
             Err(termination) => return Ok(termination),
         };
-        loop {
-            let request = match control_channel
-                .recv_request()
-                .map_err(BrokerHostError::Channel)?
-            {
-                HostReceive::Message(request) => request,
-                HostReceive::ProtocolViolation => {
-                    return Ok(ConnectionTermination::ProtocolViolation);
-                }
-                HostReceive::PeerClosed => break,
-            };
-            association
-                .execute_request(request, |response| control_channel.send_response(response))?;
-        }
-        Ok(ConnectionTermination::PeerClosed)
+        let result = (|| {
+            loop {
+                let request = match control_channel
+                    .recv_request()
+                    .map_err(BrokerHostError::Channel)?
+                {
+                    HostReceive::Message(request) => request,
+                    HostReceive::ProtocolViolation => {
+                        return Ok(ConnectionTermination::ProtocolViolation);
+                    }
+                    HostReceive::PeerClosed => break,
+                };
+                association
+                    .execute_request(request, |response| control_channel.send_response(response))?;
+            }
+            Ok(ConnectionTermination::PeerClosed)
+        })();
+        association.finish();
+        result
     }
 
     struct FakeHostControlChannel {

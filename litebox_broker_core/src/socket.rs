@@ -22,7 +22,7 @@ use spin::Mutex;
 
 use crate::readiness::{ReadinessRegistration, ReadinessSink};
 use crate::session::{ObjectEntry, ObjectRights};
-use crate::{BrokerError, BrokerSession, Result, SessionId};
+use crate::{BrokerError, BrokerSession, ProcessAuthorityKey, Result};
 
 const DEFAULT_TCP_LISTEN_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
 const DEFAULT_LOCAL_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
@@ -452,30 +452,30 @@ pub struct PlatformDatagramReceive {
 /// Broker-wide socket provider supplied by the host platform.
 ///
 /// The provider creates per-socket [`PlatformSocket`] resources and owns any
-/// bookkeeping shared across sockets and sessions. Sessions identify ownership
+/// bookkeeping shared across sockets and processes. Authority keys identify ownership
 /// and accounting domains, not separate provider namespaces. Operations on an
 /// individual socket belong to [`PlatformSocket`], not this shared provider.
 pub trait SocketProvider: Send + Sync {
-    /// Creates one nonblocking socket resource for a broker session.
+    /// Creates one nonblocking socket resource for a broker process.
     ///
     /// Any provider-retained clones must become inert when
     /// [`PlatformSocket::retire`] is called. On success, the returned socket
     /// retains `readiness` and publishes any nonempty initial snapshot before
     /// returning. On error, the provider releases all resources and session
-    /// accounting allocated by the attempt.
+    /// process accounting allocated by the attempt.
     fn create(
         &self,
-        session_id: SessionId,
+        process_authority: ProcessAuthorityKey,
         request: CreateSocketRequest,
         readiness: ReadinessRegistration,
     ) -> Result<Arc<dyn PlatformSocket>>;
 
-    /// Releases remaining provider state charged to a session after its socket
+    /// Releases remaining provider state charged to a process after its socket
     /// references close.
     ///
     /// This is a teardown and accounting boundary, not a separate network
-    /// namespace; it must not disturb endpoints owned by other sessions.
-    fn close_session(&self, session_id: SessionId);
+    /// namespace; it must not disturb endpoints owned by other processes.
+    fn close_process(&self, process_authority: ProcessAuthorityKey);
 }
 
 /// One nonblocking socket resource created by [`SocketProvider`].
@@ -635,14 +635,14 @@ pub struct UnsupportedSocketProvider;
 impl SocketProvider for UnsupportedSocketProvider {
     fn create(
         &self,
-        _session_id: SessionId,
+        _process_authority: ProcessAuthorityKey,
         _request: CreateSocketRequest,
         _readiness: ReadinessRegistration,
     ) -> Result<Arc<dyn PlatformSocket>> {
         Err(BrokerError::UnsupportedOperation)
     }
 
-    fn close_session(&self, _session_id: SessionId) {}
+    fn close_process(&self, _process_authority: ProcessAuthorityKey) {}
 }
 
 /// Creates a broker-owned socket.
@@ -663,7 +663,7 @@ pub fn create(
         match session
             .core
             .socket_provider
-            .create(session.session_id, request, readiness.clone())
+            .create(session.authority, request, readiness.clone())
         {
             Ok(socket) => socket,
             Err(error) => {

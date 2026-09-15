@@ -170,6 +170,7 @@ fn map_host_error(error: BrokerHostError<IoError>) -> IoError {
 /// teardown guards below reach for.
 struct HostAssociationFailureCoordinator<Shutdown> {
     failed: AtomicBool,
+    unwound: AtomicBool,
     error: Mutex<Option<IoError>>,
     shutdown: Shutdown,
 }
@@ -180,6 +181,7 @@ impl<Shutdown: HostAssociationShutdown<Error = IoError>>
     const fn new(shutdown: Shutdown) -> Self {
         Self {
             failed: AtomicBool::new(false),
+            unwound: AtomicBool::new(false),
             error: Mutex::new(None),
             shutdown,
         }
@@ -198,6 +200,15 @@ impl<Shutdown: HostAssociationShutdown<Error = IoError>>
             .lock()
             .expect("broker association failure mutex poisoned") = Some(error);
         let _ = self.shutdown.shutdown();
+    }
+
+    fn report_unwind(&self, error: IoError) {
+        self.unwound.store(true, Ordering::Release);
+        self.report(error);
+    }
+
+    fn unwound(&self) -> bool {
+        self.unwound.load(Ordering::Acquire)
     }
 
     /// Ends the association transport without recording a failure.
@@ -234,7 +245,7 @@ impl<Shutdown: HostAssociationShutdown<Error = IoError>> Drop
     fn drop(&mut self) {
         if std::thread::panicking() {
             self.failure_coordinator
-                .report(IoError::other("broker readiness publisher panicked"));
+                .report_unwind(IoError::other("broker readiness publisher panicked"));
         }
     }
 }
@@ -363,7 +374,7 @@ where
         drop(cancellation);
         for worker in workers {
             if worker.join().is_err() {
-                failure_coordinator.report(IoError::other("broker request worker panicked"));
+                failure_coordinator.report_unwind(IoError::other("broker request worker panicked"));
             }
         }
         // Readiness publication lives exactly as long as the association. The
@@ -378,14 +389,24 @@ where
         if let Some(publisher) = publisher
             && publisher.join().is_err()
         {
-            failure_coordinator.report(IoError::other("broker readiness publisher panicked"));
+            failure_coordinator
+                .report_unwind(IoError::other("broker readiness publisher panicked"));
         }
     });
 
-    match failure_coordinator.take_error() {
+    let result = match failure_coordinator.take_error() {
         Some(error) => Err(error),
         None => Ok(()),
+    };
+    let Ok(association) = Arc::try_unwrap(association) else {
+        panic!("all broker association workers must be joined before teardown");
+    };
+    if failure_coordinator.unwound() {
+        drop(association);
+    } else {
+        association.finish();
     }
+    result
 }
 
 fn read_requests<RequestSource, Shutdown>(
@@ -492,7 +513,7 @@ fn run_worker<Memory, ResponseSink, Shutdown>(
             Ok(Ok(())) => {}
             Ok(Err(error)) => failure_coordinator.report(map_host_error(error)),
             Err(_) => {
-                failure_coordinator.report(IoError::other("broker request worker panicked"));
+                failure_coordinator.report_unwind(IoError::other("broker request worker panicked"));
             }
         }
     }
@@ -596,6 +617,10 @@ mod tests {
         control_channel
             .send_handshake_response(&BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
+                process_identity: litebox_broker_protocol::ProcessIdentity {
+                    id: litebox_broker_protocol::ProcessId::new(1).unwrap(),
+                    parent_id: None,
+                },
             })
             .unwrap();
         local_setup.recv_handshake_response().unwrap().unwrap();
@@ -891,6 +916,7 @@ mod tests {
         ));
         reader.join().unwrap();
         assert!(publisher.join().is_err());
+        assert!(failure_coordinator.unwound());
         assert!(failure_coordinator.take_error().is_some());
     }
 
@@ -914,6 +940,7 @@ mod tests {
             Ok(HostReceive::PeerClosed) | Err(_)
         ));
         let error = failure_coordinator.take_error().unwrap();
+        assert!(!failure_coordinator.unwound());
         assert_eq!(error.kind(), ErrorKind::TimedOut);
         assert_eq!(error.to_string(), "first failure");
     }

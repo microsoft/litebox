@@ -540,8 +540,8 @@ pub(crate) struct TestSocketProvider {
 
 #[derive(Default)]
 struct TestSocketState {
-    creates: StdMutex<std::vec::Vec<(SessionId, CreateSocketRequest)>>,
-    closed_sessions: StdMutex<std::vec::Vec<SessionId>>,
+    creates: StdMutex<std::vec::Vec<(ProcessAuthorityKey, CreateSocketRequest)>>,
+    closed_sessions: StdMutex<std::vec::Vec<ProcessAuthorityKey>>,
     sent: StdMutex<std::vec::Vec<u8>>,
     next_send_count: StdMutex<Option<usize>>,
     connect_calls: AtomicUsize,
@@ -697,7 +697,7 @@ impl TestSocketProvider {
 impl SocketProvider for TestSocketProvider {
     fn create(
         &self,
-        session_id: SessionId,
+        process_authority: ProcessAuthorityKey,
         request: CreateSocketRequest,
         readiness: ReadinessRegistration,
     ) -> Result<Arc<dyn PlatformSocket>> {
@@ -705,7 +705,7 @@ impl SocketProvider for TestSocketProvider {
             .creates
             .lock()
             .unwrap()
-            .push((session_id, request));
+            .push((process_authority, request));
         if self.state.fail_create.swap(false, Ordering::Relaxed) {
             *self.state.failed_readiness.lock().unwrap() = Some(readiness);
             return Err(BrokerError::OutOfMemory);
@@ -730,8 +730,12 @@ impl SocketProvider for TestSocketProvider {
         Ok(socket)
     }
 
-    fn close_session(&self, session_id: SessionId) {
-        self.state.closed_sessions.lock().unwrap().push(session_id);
+    fn close_process(&self, process_authority: ProcessAuthorityKey) {
+        self.state
+            .closed_sessions
+            .lock()
+            .unwrap()
+            .push(process_authority);
     }
 }
 
@@ -1321,7 +1325,13 @@ fn test_broker_with_policy(
                 .with_socket_policy(*socket_policy),
         ),
         limits: crate::BrokerCoreLimits::new_with_all_limits(16, 4, 8, 8),
-        next_session_id: Arc::new(spin::RwLock::new(1)),
+        process_ids: Arc::new(spin::Mutex::new(
+            crate::identity::ProcessIdAllocator::new(
+                crate::BrokerCoreLimits::DEFAULT.process_id_quarantine_capacity,
+                crate::BrokerCoreLimits::DEFAULT.max_poisoned_process_ids,
+            )
+            .unwrap(),
+        )),
         next_reference_handle: Arc::new(spin::RwLock::new(1)),
         references: Arc::new(spin::RwLock::new(hashbrown::HashMap::new())),
         pending_references: Arc::new(AtomicUsize::new(0)),
@@ -1903,7 +1913,7 @@ fn check_socket_operations_and_policy(broker: &BrokerCore, provider: &TestSocket
     let handle = create(&session, create_request(), readiness.clone()).unwrap();
     assert_eq!(
         provider.state.creates.lock().unwrap().last(),
-        Some(&(session.session_id, create_request()))
+        Some(&(session.authority, create_request()))
     );
     assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 1);
     assert_eq!(session.reserved_sockets.load(Ordering::Relaxed), 1);
@@ -2089,7 +2099,7 @@ fn check_socket_operations_and_policy(broker: &BrokerCore, provider: &TestSocket
             TcpOptionValue::KeepAlive(true),
         ]
     );
-    let session_id = session.session_id;
+    let process_authority = session.authority;
     drop(other);
     drop(session);
     assert!(
@@ -2098,7 +2108,7 @@ fn check_socket_operations_and_policy(broker: &BrokerCore, provider: &TestSocket
             .closed_sessions
             .lock()
             .unwrap()
-            .contains(&session_id)
+            .contains(&process_authority)
     );
 }
 

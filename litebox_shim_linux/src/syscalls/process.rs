@@ -723,7 +723,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             alloc::sync::Arc::new((**self.fs.borrow()).clone())
         };
 
-        let child_tid = self.global.next_thread_id.fetch_add(1, Ordering::Relaxed);
+        let child_tid = self.global.allocate_thread_id().ok_or(Errno::EAGAIN)?;
         if let Some(parent_tid_ptr) = set_parent_tid {
             let _ = parent_tid_ptr.write_at_offset::<Platform>(0, child_tid);
         }

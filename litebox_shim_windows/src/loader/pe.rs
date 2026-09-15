@@ -31,7 +31,6 @@ use crate::nt_types::{
     RtlUserProcessParameters, ThreadEnvironmentBlock, UnicodeString, X64Context,
 };
 use crate::syscalls::mm::{MemoryType, PageProtection};
-use crate::syscalls::process::{INITIAL_PROCESS_ID, INITIAL_THREAD_ID};
 
 const NTDLL_WRITABLE_SECTIONS: &[&[u8]] = &[b".mrdata"];
 const NTDLL_PATH: &str = "/Windows/System32/ntdll.dll";
@@ -92,6 +91,7 @@ struct ProcessEnvironmentInput<'a> {
     image_path: &'a str,
     argv: &'a [CString],
     envp: &'a [CString],
+    client_id: ClientId,
 }
 
 pub(crate) struct WindowsThreadEnvironment {
@@ -124,6 +124,7 @@ impl<'a, Platform: crate::ShimPlatform> PeLoader<'a, Platform> {
         path: &str,
         argv: &[CString],
         envp: &[CString],
+        client_id: ClientId,
     ) -> Result<PeLoadInfo<Platform>, WindowsLoadError> {
         let image = load_image(self.platform, self.fs.clone(), path, self.page_manager)?;
         let application_entry_point = image.mapping.entry_point;
@@ -147,6 +148,7 @@ impl<'a, Platform: crate::ShimPlatform> PeLoader<'a, Platform> {
                 image_path: path,
                 argv,
                 envp,
+                client_id,
             },
         )?;
         if let Some(ntdll) = &ntdll {
@@ -378,8 +380,8 @@ fn create_process_environment<Platform: crate::ShimPlatform>(
         INITIAL_STACK_SIZE,
         peb_ptr,
         ClientId {
-            unique_process: INITIAL_PROCESS_ID,
-            unique_thread: INITIAL_THREAD_ID,
+            unique_process: input.client_id.unique_process,
+            unique_thread: input.client_id.unique_thread,
         },
         true,
     )?;
@@ -2024,6 +2026,14 @@ mod tests {
             synthetic.teb.process_environment_block,
             synthetic.environment.peb
         );
+        assert_eq!(
+            synthetic.teb.client_id,
+            ClientId {
+                unique_process: crate::syscalls::process::INITIAL_PROCESS_ID,
+                unique_thread: crate::syscalls::process::INITIAL_THREAD_ID,
+            }
+        );
+        assert_eq!(synthetic.teb.real_client_id, synthetic.teb.client_id);
         assert_eq!(synthetic.teb.thread_local_storage_pointer, 0);
         assert_eq!(current_teb.process_environment_block, peb_address);
         assert_eq!(current_teb.client_id, host_client_id());
@@ -2573,6 +2583,10 @@ mod tests {
                 image_path: "test.exe",
                 argv: &argv,
                 envp: &envp,
+                client_id: ClientId {
+                    unique_process: crate::syscalls::process::INITIAL_PROCESS_ID,
+                    unique_thread: crate::syscalls::process::INITIAL_THREAD_ID,
+                },
             },
         )
         .expect("failed to create synthetic Windows process environment");

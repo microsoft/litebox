@@ -32,7 +32,7 @@ use crate::stdio::{
     IsTerminalStdioRequest, IsTerminalStdioResponse, ReadStdioRequest, ReadStdioResponse,
     WriteStdioRequest, WriteStdioResponse,
 };
-use crate::{ObjectHandle, ProtocolVersion, RequestId};
+use crate::{ObjectHandle, ProcessIdentity, ProtocolVersion, RequestId};
 
 /// Broker handshake request sent before the control channel is active.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -136,6 +136,8 @@ pub enum BrokerHandshakeResponse {
         /// The broker returns its supported version after validating that the
         /// requested version matches it.
         broker_protocol_version: ProtocolVersion,
+        /// Broker-assigned identity for this process.
+        process_identity: ProcessIdentity,
     },
     /// Negotiation failed because the requested version is unsupported.
     ///

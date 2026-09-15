@@ -38,7 +38,7 @@ use litebox_broker_protocol::message::{
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SharedBufferSequence};
-use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, ObjectHandle, RequestId};
+use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, ObjectHandle, ProcessIdentity, RequestId};
 use litebox_broker_transport::channel::{
     LocalCallChannel, LocalNotificationChannel, LocalSetupChannel,
 };
@@ -52,6 +52,7 @@ pub use error::{BrokerLocalError, Result};
 /// sequences identify operation-scoped slots managed by the caller.
 pub struct BrokerLocal<Channel: LocalCallChannel> {
     channel: Channel,
+    process_identity: ProcessIdentity,
     shared_buffers: SharedBufferPool<Arc<dyn SharedMemory>>,
     next_request_id: AtomicU64,
 }
@@ -99,6 +100,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         {
             response @ BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version,
+                process_identity,
             } => {
                 assert_eq!(
                     requested, broker_protocol_version,
@@ -111,6 +113,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                 Ok((
                     Self {
                         channel,
+                        process_identity,
                         shared_buffers,
                         next_request_id: AtomicU64::new(0),
                     },
@@ -121,9 +124,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                 Err(BrokerLocalError::Broker(ErrorCode::UnsupportedVersion))
             }
             BrokerHandshakeResponse::Error(error) => match error {
-                ErrorCode::UnsupportedVersion | ErrorCode::PolicyDenied => {
-                    Err(BrokerLocalError::Broker(error))
-                }
+                ErrorCode::UnsupportedVersion
+                | ErrorCode::PolicyDenied
+                | ErrorCode::ResourceExhausted => Err(BrokerLocalError::Broker(error)),
                 ErrorCode::MalformedRequest
                 | ErrorCode::ProtocolState
                 | ErrorCode::UnsupportedOperation
@@ -131,6 +134,12 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                 _ => panic!("broker returned unexpected negotiation error: {error}"),
             },
         }
+    }
+
+    /// Returns the broker-assigned identity of this process.
+    #[must_use]
+    pub const fn process_identity(&self) -> ProcessIdentity {
+        self.process_identity
     }
 
     /// Sends one active broker request.
@@ -284,8 +293,6 @@ mod tests {
     use super::*;
     use core::cell::{Cell, RefCell};
     use core::convert::Infallible;
-    use litebox_broker_protocol::ObjectHandle;
-    use litebox_broker_protocol::ProtocolVersion;
     use litebox_broker_protocol::message::{ReadinessNotification, StdioRequest, StdioResponse};
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_protocol::shared_buffer::{SharedBufferSequence, SharedBufferSlotIndex};
@@ -293,14 +300,23 @@ mod tests {
         IsTerminalStdioRequest, IsTerminalStdioResponse, ReadStdioRequest, ReadStdioResponse,
         StdioOutputStream, StdioStream, WriteStdioRequest, WriteStdioResponse,
     };
+    use litebox_broker_protocol::{ObjectHandle, ProcessId, ProcessIdentity, ProtocolVersion};
     use litebox_broker_transport::channel::LocalNotificationChannel;
     use std::sync::Mutex;
+
+    fn test_process_identity() -> ProcessIdentity {
+        ProcessIdentity {
+            id: ProcessId::new(1).unwrap(),
+            parent_id: None,
+        }
+    }
 
     #[test]
     fn negotiate_runs_setup_after_response_before_active_requests() {
         let channel = FakeControlChannel::new(
             Some(BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
+                process_identity: test_process_identity(),
             }),
             None,
         );
@@ -321,6 +337,7 @@ mod tests {
             })
         );
         assert_eq!(setup_calls.get(), 1);
+        assert_eq!(local.process_identity(), test_process_identity());
     }
 
     #[test]
@@ -330,6 +347,7 @@ mod tests {
         let response = BrokerResult::ObjectClosed;
         let channel = FakeControlChannel::new(None, Some(response.clone()));
         let local = BrokerLocal {
+            process_identity: test_process_identity(),
             channel,
             shared_buffers: noop_shared_buffers(),
             next_request_id: AtomicU64::new(0),
@@ -355,6 +373,7 @@ mod tests {
             ))),
         );
         let local = BrokerLocal {
+            process_identity: test_process_identity(),
             channel,
             shared_buffers: noop_shared_buffers(),
             next_request_id: AtomicU64::new(0),
@@ -388,6 +407,7 @@ mod tests {
             ))),
         );
         let local = BrokerLocal {
+            process_identity: test_process_identity(),
             channel,
             shared_buffers: noop_shared_buffers(),
             next_request_id: AtomicU64::new(0),
@@ -414,6 +434,7 @@ mod tests {
             ))),
         );
         let local = BrokerLocal {
+            process_identity: test_process_identity(),
             channel,
             shared_buffers: noop_shared_buffers(),
             next_request_id: AtomicU64::new(0),
@@ -442,6 +463,7 @@ mod tests {
         let handle = ObjectHandle(7);
         let channel = FakeControlChannel::new(None, Some(BrokerResult::ObjectClosed));
         let local = BrokerLocal {
+            process_identity: test_process_identity(),
             channel,
             shared_buffers: noop_shared_buffers(),
             next_request_id: AtomicU64::new(0),
@@ -476,6 +498,7 @@ mod tests {
     #[test]
     fn concurrent_active_requests_use_distinct_identifiers() {
         let local = Arc::new(BrokerLocal {
+            process_identity: test_process_identity(),
             channel: ConcurrentCallChannel {
                 request_ids: Mutex::new(std::vec::Vec::new()),
             },
@@ -504,6 +527,7 @@ mod tests {
     fn active_request_rejects_mismatched_response_identifier() {
         let channel = FakeControlChannel::new(None, Some(BrokerResult::ObjectClosed));
         let local = BrokerLocal {
+            process_identity: test_process_identity(),
             channel,
             shared_buffers: noop_shared_buffers(),
             next_request_id: AtomicU64::new(0),
@@ -523,6 +547,7 @@ mod tests {
     fn active_request_identifier_exhaustion_does_not_wrap() {
         let channel = FakeControlChannel::new(None, Some(BrokerResult::ObjectClosed));
         let local = BrokerLocal {
+            process_identity: test_process_identity(),
             channel,
             shared_buffers: noop_shared_buffers(),
             next_request_id: AtomicU64::new(u64::MAX),
@@ -540,6 +565,7 @@ mod tests {
         for error in [ErrorCode::WouldBlock, ErrorCode::UnsupportedOperation] {
             let channel = FakeControlChannel::new(None, Some(BrokerResult::Error(error)));
             let local = BrokerLocal {
+                process_identity: test_process_identity(),
                 channel,
                 shared_buffers: noop_shared_buffers(),
                 next_request_id: AtomicU64::new(0),
@@ -557,6 +583,7 @@ mod tests {
     fn active_request_panics_on_unrecoverable_broker_error() {
         let channel = FakeControlChannel::new(None, Some(BrokerResult::Error(ErrorCode::Internal)));
         let local = BrokerLocal {
+            process_identity: test_process_identity(),
             channel,
             shared_buffers: noop_shared_buffers(),
             next_request_id: AtomicU64::new(0),
@@ -571,6 +598,7 @@ mod tests {
         let channel = FakeControlChannel::new(
             Some(BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version,
+                process_identity: test_process_identity(),
             }),
             None,
         );
@@ -622,6 +650,24 @@ mod tests {
     }
 
     #[test]
+    fn negotiate_returns_process_identity_exhaustion() {
+        let channel = FakeControlChannel::new(
+            Some(BrokerHandshakeResponse::Error(ErrorCode::ResourceExhausted)),
+            None,
+        );
+        let setup_called = Cell::new(false);
+
+        assert!(matches!(
+            BrokerLocal::negotiate(channel, |channel| {
+                setup_called.set(true);
+                Ok((channel, noop_shared_memory(), ()))
+            }),
+            Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted))
+        ));
+        assert!(!setup_called.get());
+    }
+
+    #[test]
     fn negotiate_skips_setup_before_panicking_on_unrecoverable_broker_error() {
         let channel = FakeControlChannel::new(
             Some(BrokerHandshakeResponse::Error(ErrorCode::Internal)),
@@ -644,6 +690,7 @@ mod tests {
         let channel = FakeControlChannel::new(
             Some(BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
+                process_identity: test_process_identity(),
             }),
             None,
         );
@@ -666,6 +713,7 @@ mod tests {
         let channel = FakeControlChannel::new(
             Some(BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
+                process_identity: test_process_identity(),
             }),
             None,
         );
@@ -830,6 +878,7 @@ mod tests {
         ) -> core::result::Result<Option<BrokerHandshakeResponse>, Self::Error> {
             Ok(Some(BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
+                process_identity: test_process_identity(),
             }))
         }
     }
