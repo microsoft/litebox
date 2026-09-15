@@ -750,6 +750,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .shared_pending
             .lock()
             .push(&self.process().limits, signal, siginfo);
+        // Publish before waking: the receiving thread may block this signal,
+        // while an eligible sibling is asleep or executing guest code. Waking
+        // only at platform receipt lets siblings check too early and miss it.
+        self.interrupt_siblings();
     }
 
     /// Forces a signal to be delivered on next call to `check_for_signals`.

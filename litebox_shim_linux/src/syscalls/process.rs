@@ -253,6 +253,23 @@ impl<Platform: ShimPlatform> Process<Platform> {
 }
 
 impl<Platform: ShimPlatform> Task<Platform> {
+    /// Recheck shared pending signals on siblings, whether sleeping or in guest code.
+    pub(crate) fn interrupt_siblings(&self) {
+        let siblings: Vec<_> = self
+            .thread
+            .process
+            .inner
+            .lock()
+            .threads
+            .iter()
+            .filter(|&(&tid, _)| tid != self.tid)
+            .map(|(_, thread)| thread.clone())
+            .collect();
+        for sibling in siblings {
+            sibling.interrupt();
+        }
+    }
+
     /// Updates the process exit status for a thread exit.
     fn exit_thread(&self, code: i8) {
         let mut inner = self.thread.process.inner.lock();
@@ -1914,10 +1931,6 @@ mod tests {
     /// After the alarm deadline passes, a blocking operation should be
     /// interrupted and SIGALRM should be pending.
     #[test]
-    #[cfg_attr(
-        target_os = "macos",
-        ignore = "host sleep is not interrupted by fallback alarms"
-    )]
     fn test_alarm_fires_after_deadline() {
         use litebox_common_linux::{ClockId, TimerFlags, Timespec};
         use litebox_platform::time::{Instant as _, TimeProvider};
@@ -1972,6 +1985,78 @@ mod tests {
             // The alarm should be consumed (deadline cleared).
             let remaining = task.sys_alarm(0).unwrap();
             assert_eq!(remaining, 0, "alarm should have been cleared by check");
+        });
+    }
+
+    #[test]
+    fn test_shared_signal_wakes_unblocked_sibling_after_queueing() {
+        use crate::{Task, syscalls::tests::TestPlatform};
+        use core::{cell::Cell, time::Duration};
+        use litebox::event::wait::{CheckForInterrupt, WaitError};
+        use litebox::platform::ThreadProvider as _;
+        use litebox_common_linux::signal::{SigSet, SigmaskHow, Signal};
+        use std::sync::mpsc;
+
+        // Hold the sibling just after it checked an empty queue. A wake issued
+        // before queue_signals publishes SIGALRM cannot substitute for the
+        // required wake after publication.
+        struct FirstCheck<'a> {
+            task: &'a Task<TestPlatform>,
+            first: Cell<bool>,
+            checked: mpsc::SyncSender<()>,
+            resume: mpsc::Receiver<()>,
+        }
+        impl CheckForInterrupt for FirstCheck<'_> {
+            fn check_for_interrupt(&self) -> bool {
+                let pending = self.task.check_for_interrupt();
+                if self.first.replace(false) {
+                    assert!(!pending);
+                    self.checked.send(()).unwrap();
+                    self.resume.recv_timeout(Duration::from_secs(5)).unwrap();
+                }
+                pending
+            }
+        }
+
+        let task = crate::syscalls::tests::init_platform();
+        TestPlatform::run_test_thread(|| {
+            let (checked_tx, checked_rx) = mpsc::sync_channel(0);
+            let (resume_tx, resume_rx) = mpsc::sync_channel(0);
+            // Clone before blocking SIGALRM so the sibling remains eligible.
+            let sibling = task.spawn_clone_for_test(move |sibling| {
+                TestPlatform::run_test_thread(|| {
+                    sibling.handle_init_request(&mut litebox_common_linux::PtRegs::default());
+                    let check = FirstCheck {
+                        task: &sibling,
+                        first: Cell::new(true),
+                        checked: checked_tx,
+                        resume: resume_rx,
+                    };
+                    let result = sibling
+                        .wait_cx()
+                        .with_check_for_interrupt(&check)
+                        .with_timeout(Duration::from_secs(5))
+                        .sleep();
+                    assert!(matches!(result, WaitError::Interrupted), "{result:?}");
+                    assert!(sibling.pending_signal_set().contains(Signal::SIGALRM));
+                });
+            });
+            let blocked = SigSet::empty().with(Signal::SIGALRM);
+            task.sys_rt_sigprocmask(
+                SigmaskHow::SIG_BLOCK,
+                Some(UserPtr::from_ptr(&raw const blocked)),
+                None,
+                core::mem::size_of::<SigSet>(),
+            )
+            .unwrap();
+            checked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            // Simulate this thread draining the platform timer notification.
+            // It blocks SIGALRM, so the sibling must be interrupted after the
+            // notification has been transferred into the shared pending queue.
+            task.queue_signals(Signal::SIGALRM);
+            assert!(!task.has_pending_signals());
+            resume_tx.send(()).unwrap();
+            sibling.join().unwrap();
         });
     }
 
@@ -2115,8 +2200,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(target_os = "macos", ignore = "requires platform timer support")]
-    #[cfg_attr(target_os = "macos", allow(unused_variables))]
     fn test_timer_delivers_correct_signal() {
         use litebox::platform::{TimerHandle as _, TimerProvider as _};
         use litebox_common_linux::signal::Signal;

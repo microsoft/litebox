@@ -7,7 +7,7 @@
 use std::cell::Cell;
 use std::ops::Range;
 use std::sync::{
-    Arc, Mutex, OnceLock,
+    Arc, Condvar, Mutex, OnceLock,
     atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicUsize, Ordering},
 };
 use std::time::Duration;
@@ -16,9 +16,7 @@ use litebox::platform::page_mgmt::{
     AllocationError, DeallocationError, FixedAddressBehavior, MemoryRegionPermissions,
     PermissionUpdateError, RemapError,
 };
-use litebox::platform::{
-    ArchSpecificError, ArchSpecificRegister, RawConstPointer as _, trivial_providers,
-};
+use litebox::platform::{ArchSpecificError, ArchSpecificRegister, RawConstPointer as _};
 use litebox::shim::{ContinueOperation, EnterShim, Exception, ExceptionInfo};
 use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
 use litebox_common_linux::gate_recovery::{
@@ -409,16 +407,170 @@ impl RawMutexTrait for RawMutex {
 }
 
 impl litebox::platform::TimerProvider for MacosUserland {
-    type TimerHandle = trivial_providers::UnsupportedTimerHandle;
+    type TimerHandle = TimerHandle;
     type Signal = litebox_common_linux::signal::Signal;
+
+    fn create_timer(
+        &self,
+        signal: Self::Signal,
+    ) -> Result<Self::TimerHandle, litebox::platform::TimerCreationError> {
+        Ok(TimerHandle::new(signal))
+    }
 }
+
+struct TimerState {
+    arming: Option<(std::time::Instant, Duration)>,
+    target_process: Option<Arc<ProcessState>>,
+    shutdown: bool,
+}
+
+struct TimerShared {
+    state: Mutex<TimerState>,
+    changed: Condvar,
+}
+
+/// A re-armable one-shot timer backed by a host worker thread.
+///
+/// macOS has no POSIX `timer_create`. At expiry the worker records the guest
+/// signal and uses the platform's private interrupt signal to preempt a guest
+/// busy-loop.
+pub struct TimerHandle {
+    shared: Arc<TimerShared>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl TimerHandle {
+    fn new(signal: litebox_common_linux::signal::Signal) -> Self {
+        assert!(
+            (1..32).contains(&signal.as_i32()),
+            "macOS timers do not support real-time guest signals"
+        );
+        let shared = Arc::new(TimerShared {
+            state: Mutex::new(TimerState {
+                arming: None,
+                target_process: None,
+                shutdown: false,
+            }),
+            changed: Condvar::new(),
+        });
+        let worker_shared = shared.clone();
+
+        // Block before spawning so the worker inherits the mask and cannot
+        // consume guest-directed host signals during startup.
+        // SAFETY: both sigsets are initialized output storage and this changes
+        // only the calling thread's mask, which is restored below.
+        let old_mask = unsafe {
+            let mut signals = core::mem::zeroed::<libc::sigset_t>();
+            let mut old_mask = core::mem::zeroed::<libc::sigset_t>();
+            libc::sigemptyset(&raw mut signals);
+            for &(host_signal, _) in FORWARDED_SIGNALS {
+                libc::sigaddset(&raw mut signals, host_signal);
+            }
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_BLOCK, &raw const signals, &raw mut old_mask),
+                0
+            );
+            old_mask
+        };
+        let worker = std::thread::Builder::new()
+            .name("litebox-macos-timer".into())
+            .spawn(move || timer_worker(&worker_shared, signal));
+        // SAFETY: old_mask was returned by pthread_sigmask for this thread.
+        assert_eq!(
+            unsafe {
+                libc::pthread_sigmask(
+                    libc::SIG_SETMASK,
+                    &raw const old_mask,
+                    core::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let worker = worker.expect("failed to create macOS timer worker");
+        Self {
+            shared,
+            worker: Some(worker),
+        }
+    }
+}
+
+fn timer_worker(shared: &TimerShared, signal: litebox_common_linux::signal::Signal) {
+    let mut state = shared.state.lock().unwrap();
+    loop {
+        if state.shutdown {
+            return;
+        }
+        let Some((armed_at, duration)) = state.arming else {
+            state = shared.changed.wait(state).unwrap();
+            continue;
+        };
+        let elapsed = armed_at.elapsed();
+        if elapsed < duration {
+            // Avoid converting an arbitrarily large guest duration into an
+            // absolute std::time::Instant or a platform condvar deadline.
+            const MAX_WAIT: Duration = Duration::from_hours(24);
+            let wait = duration.checked_sub(elapsed).unwrap().min(MAX_WAIT);
+            let (new_state, _) = shared.changed.wait_timeout(state, wait).unwrap();
+            state = new_state;
+            continue;
+        }
+
+        state.arming = None;
+        let target_process = state.target_process.take();
+        drop(state);
+        if let Some(target_process) = target_process {
+            target_process.deliver_signal(signal);
+        }
+        state = shared.state.lock().unwrap();
+    }
+}
+
+impl Drop for TimerHandle {
+    fn drop(&mut self) {
+        {
+            let mut state = self.shared.state.lock().unwrap();
+            state.shutdown = true;
+            state.arming = None;
+            state.target_process = None;
+            self.shared.changed.notify_one();
+        }
+        if let Some(worker) = self.worker.take() {
+            worker.join().expect("macOS timer worker panicked");
+        }
+    }
+}
+
+impl litebox::platform::TimerHandle for TimerHandle {
+    fn set_timer(&self, duration: Duration) {
+        let mut state = self.shared.state.lock().unwrap();
+        if duration.is_zero() {
+            state.arming = None;
+            state.target_process = None;
+        } else {
+            let current = ThreadHandle::current();
+            state.arming = Some((std::time::Instant::now(), duration));
+            state.target_process = Some(current.0.process.clone());
+        }
+        self.shared.changed.notify_one();
+    }
+}
+
 impl litebox::platform::SignalProvider for MacosUserland {
     type Signal = litebox_common_linux::signal::Signal;
 
     fn take_pending_signals(&self, mut f: impl FnMut(Self::Signal)) {
         // Atomic swap avoids losing handler updates; Relaxed suffices because
         // the bits publish no other data.
-        let bits = with_signal_state(|pending, _| pending.swap(0, Ordering::Relaxed)).unwrap_or(0);
+        let mut bits =
+            with_signal_state(|pending, _| pending.swap(0, Ordering::Relaxed)).unwrap_or(0);
+        if read_tls(tls_offset::CURRENT_THREAD) != 0 {
+            // Drain process-wide timer signals once into the shim's shared queue.
+            bits |= ThreadHandle::current()
+                .0
+                .process
+                .pending_signals
+                .swap(0, Ordering::Relaxed);
+        }
         for signal in litebox_common_linux::signal::SigSet::from_u64(u64::from(bits)) {
             f(signal);
         }
@@ -1113,9 +1265,16 @@ impl litebox::platform::ArchSpecificProvider for MacosUserland {
     }
 }
 
+const FORWARDED_SIGNALS: &[(i32, litebox_common_linux::signal::Signal)] = &[
+    (libc::SIGINT, litebox_common_linux::signal::Signal::SIGINT),
+    (libc::SIGALRM, litebox_common_linux::signal::Signal::SIGALRM),
+];
+const EXCEPTION_SIGNALS: [i32; 4] = [libc::SIGTRAP, libc::SIGSEGV, libc::SIGBUS, libc::SIGILL];
+const HOST_SIGNAL_COUNT: usize = EXCEPTION_SIGNALS.len() + 1 + FORWARDED_SIGNALS.len();
+
 struct SignalState {
     interrupt_signal: AtomicI32,
-    previous: OnceLock<[libc::sigaction; 7]>,
+    previous: OnceLock<[libc::sigaction; HOST_SIGNAL_COUNT]>,
 }
 
 static SIGNAL_STATE: SignalState = SignalState {
@@ -1128,23 +1287,16 @@ fn interrupt_signal() -> i32 {
 }
 
 fn forwarded_guest_signal(signal: i32) -> Option<litebox_common_linux::signal::Signal> {
-    match signal {
-        libc::SIGINT => Some(litebox_common_linux::signal::Signal::SIGINT),
-        libc::SIGALRM => Some(litebox_common_linux::signal::Signal::SIGALRM),
-        _ => None,
-    }
+    FORWARDED_SIGNALS
+        .iter()
+        .find_map(|&(host, guest)| (host == signal).then_some(guest))
 }
 
-fn host_signals() -> [i32; 7] {
-    [
-        libc::SIGTRAP,
-        libc::SIGSEGV,
-        libc::SIGBUS,
-        libc::SIGILL,
-        interrupt_signal(),
-        libc::SIGINT,
-        libc::SIGALRM,
-    ]
+fn host_signals() -> impl Iterator<Item = i32> {
+    EXCEPTION_SIGNALS
+        .into_iter()
+        .chain(core::iter::once(interrupt_signal()))
+        .chain(FORWARDED_SIGNALS.iter().map(|&(host, _)| host))
 }
 // Private Darwin si_code values absent from libc's public constants.
 const SI_USER: i32 = 0x1_0001;
@@ -1173,23 +1325,54 @@ fn thread_start(
     init_thread: Box<dyn litebox::shim::InitThread<ExecutionContext = PtRegs>>,
     mut ctx: PtRegs,
     vector_state: GuestVectorState,
+    process: Arc<ProcessState>,
 ) {
     initialize_thread_tls();
     set_guest_vector_state(&vector_state);
     // Allow caller to run some code before we return to the new thread.
     let shim = init_thread.init();
-    run_thread_inner(shim.as_ref(), &mut ctx);
+    run_thread_inner_with_process(shim.as_ref(), &mut ctx, process);
+}
+
+#[derive(Default)]
+struct ProcessState {
+    /// Undrained timer signals survive any individual thread's exit.
+    pending_signals: AtomicU32,
+}
+
+impl ProcessState {
+    fn deliver_signal(self: &Arc<Self>, signal: litebox_common_linux::signal::Signal) {
+        self.pending_signals
+            .fetch_or(1u32 << (signal.as_i32() - 1), Ordering::Relaxed);
+        let targets: Vec<_> = ACTIVE_THREADS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|thread| Arc::ptr_eq(&thread.0.process, self))
+            .cloned()
+            .collect();
+        // Wake all siblings outside the registry lock to tolerate exits.
+        // New threads check pending signals before running or sleeping.
+        for target in targets {
+            target.interrupt();
+        }
+    }
 }
 
 struct ThreadState {
     // Cleared before thread exit to prevent pthread ID-reuse races.
     identity: Mutex<Option<usize>>,
     interrupted: AtomicBool,
+    /// State shared by all host threads belonging to one guest process.
+    process: Arc<ProcessState>,
     // Signal handlers use WAIT_WAKER_ADDR instead: they cannot lock this mutex.
     waker: Mutex<Option<core::task::Waker>>,
 }
 #[derive(Clone)]
 pub struct ThreadHandle(Arc<ThreadState>);
+
+static ACTIVE_THREADS: Mutex<Vec<ThreadHandle>> = Mutex::new(Vec::new());
+
 impl ThreadHandle {
     fn current() -> Self {
         let handle = read_tls(tls_offset::CURRENT_THREAD) as *const ThreadHandle;
@@ -1226,11 +1409,16 @@ impl litebox::platform::ThreadProvider for MacosUserland {
         let ctx = ctx.clone();
         let vector_state =
             litebox::platform::GuestVectorStateProvider::get_guest_vector_state(self);
+        let process = if read_tls(tls_offset::CURRENT_THREAD) == 0 {
+            Arc::new(ProcessState::default())
+        } else {
+            ThreadHandle::current().0.process.clone()
+        };
         // TODO: report child TLS setup failures synchronously. pthread_setspecific
         // can still fail after spawn_thread has returned success, causing the child
         // to exit before running its initialization callback.
         let _handle = std::thread::Builder::new()
-            .spawn(move || thread_start(init_thread, ctx, vector_state))?;
+            .spawn(move || thread_start(init_thread, ctx, vector_state, process))?;
         Ok(())
     }
     fn current_thread(&self) -> Self::ThreadHandle {
@@ -1253,11 +1441,17 @@ impl litebox::platform::ThreadProvider for MacosUserland {
             // SAFETY: pthread_self has no preconditions.
             identity: Mutex::new(Some(unsafe { libc::pthread_self() } as usize)),
             interrupted: AtomicBool::new(false),
+            process: Arc::new(ProcessState::default()),
             waker: Mutex::new(None),
         }));
         write_tls(tls_offset::CURRENT_THREAD, (&raw const handle) as usize);
+        ACTIVE_THREADS.lock().unwrap().push(handle.clone());
         let cleanup_handle = handle.clone();
         let _cleanup = litebox::utils::defer(move || {
+            ACTIVE_THREADS
+                .lock()
+                .unwrap()
+                .retain(|active| !Arc::ptr_eq(&active.0, &cleanup_handle.0));
             *cleanup_handle.0.identity.lock().unwrap() = None;
             write_tls(tls_offset::CURRENT_THREAD, 0);
         });
@@ -1676,6 +1870,14 @@ where
 }
 
 fn run_thread_inner(shim: &dyn EnterShim<ExecutionContext = PtRegs>, ctx: &mut PtRegs) {
+    run_thread_inner_with_process(shim, ctx, Arc::new(ProcessState::default()));
+}
+
+fn run_thread_inner_with_process(
+    shim: &dyn EnterShim<ExecutionContext = PtRegs>,
+    ctx: &mut PtRegs,
+    process: Arc<ProcessState>,
+) {
     initialize_thread_tls();
     assert!(
         read_tls(tls_offset::ACTIVE) == 0,
@@ -1692,6 +1894,7 @@ fn run_thread_inner(shim: &dyn EnterShim<ExecutionContext = PtRegs>, ctx: &mut P
         // SAFETY: pthread_self has no preconditions; unregister before thread exit.
         identity: Mutex::new(Some(unsafe { libc::pthread_self() } as usize)),
         interrupted: AtomicBool::new(false),
+        process,
         waker: Mutex::new(None),
     }));
     let mut thread_ctx = ThreadContext {
@@ -1712,7 +1915,12 @@ fn run_thread_inner(shim: &dyn EnterShim<ExecutionContext = PtRegs>, ctx: &mut P
         (&raw const thread_ctx.thread) as usize,
     );
     let thread_handle = thread_ctx.thread.clone();
+    ACTIVE_THREADS.lock().unwrap().push(thread_handle.clone());
     let _registration = litebox::utils::defer(move || {
+        ACTIVE_THREADS
+            .lock()
+            .unwrap()
+            .retain(|active| !Arc::ptr_eq(&active.0, &thread_handle.0));
         *thread_handle.0.identity.lock().unwrap() = None;
         write_tls(tls_offset::ACTIVE, 0);
         write_tls(tls_offset::CURRENT_THREAD, 0);
@@ -2035,8 +2243,8 @@ pub(crate) fn register_exception_handlers() -> std::io::Result<()> {
         .store(selected_interrupt_signal, Ordering::Relaxed);
 
     // SAFETY: macOS sigaction contains integer fields; zero is a valid representation.
-    let mut previous = unsafe { std::mem::zeroed::<[libc::sigaction; 7]>() };
-    for (signal, previous) in host_signals().into_iter().zip(&mut previous) {
+    let mut previous = unsafe { std::mem::zeroed::<[libc::sigaction; HOST_SIGNAL_COUNT]>() };
+    for (signal, previous) in host_signals().zip(&mut previous) {
         // SAFETY: previous is writable and null requests a query without installing a handler.
         if unsafe { libc::sigaction(signal, core::ptr::null(), previous) } != 0 {
             return Err(std::io::Error::last_os_error());
@@ -2052,19 +2260,20 @@ pub(crate) fn register_exception_handlers() -> std::io::Result<()> {
         // Allow nested memory faults for fallible reads, but prevent forwarded
         // signals from re-entering this handler with IN_GUEST still set.
         libc::sigaddset(&raw mut action.sa_mask, interrupt_signal());
-        libc::sigaddset(&raw mut action.sa_mask, libc::SIGINT);
-        libc::sigaddset(&raw mut action.sa_mask, libc::SIGALRM);
+        for &(host_signal, _) in FORWARDED_SIGNALS {
+            libc::sigaddset(&raw mut action.sa_mask, host_signal);
+        }
         libc::sigaddset(&raw mut action.sa_mask, libc::SIGTRAP);
     }
     let restore = |count| {
-        for (signal, previous) in host_signals().into_iter().zip(previous.iter()).take(count) {
+        for (signal, previous) in host_signals().zip(previous.iter()).take(count) {
             // SAFETY: these immutable actions were returned by sigaction for the same signals.
             unsafe {
                 libc::sigaction(signal, previous, core::ptr::null_mut());
             }
         }
     };
-    for (index, signal) in host_signals().into_iter().enumerate() {
+    for (index, signal) in host_signals().enumerate() {
         action.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
         if forwarded_guest_signal(signal).is_none() {
             action.sa_flags |= libc::SA_NODEFER;
@@ -2296,8 +2505,7 @@ unsafe extern "C" fn exception_signal_handler(
 
 unsafe fn next_signal_handler(signal: i32, info: *mut libc::siginfo_t, raw: *mut libc::c_void) {
     let Some(previous) = host_signals()
-        .iter()
-        .position(|s| *s == signal)
+        .position(|s| s == signal)
         .and_then(|index| SIGNAL_STATE.previous.get()?.get(index))
     else {
         fatal_signal(b"missing host signal disposition", 0);
@@ -2472,10 +2680,117 @@ mod tests {
     use super::*;
     use litebox::platform::{
         PageManagementProvider as _, RawMutPointer as _, SignalProvider as _,
-        SystemInfoProvider as _, ThreadProvider as _,
+        SystemInfoProvider as _, ThreadProvider as _, TimerHandle as _, TimerProvider as _,
     };
     const RW: MemoryRegionPermissions =
         MemoryRegionPermissions::READ.union(MemoryRegionPermissions::WRITE);
+
+    /// Run host-only test code with the same registration as a guest sibling.
+    fn run_process_test_thread(process: Arc<ProcessState>, f: impl FnOnce()) {
+        struct InitOnly<F>(std::cell::RefCell<Option<F>>);
+        impl<F: FnOnce()> EnterShim for InitOnly<F> {
+            type ExecutionContext = PtRegs;
+
+            fn init(&self, _: &mut PtRegs) -> ContinueOperation {
+                self.0.borrow_mut().take().unwrap()();
+                ContinueOperation::Terminate
+            }
+            fn syscall(&self, _: &mut PtRegs) -> ContinueOperation {
+                unreachable!()
+            }
+            fn exception(&self, _: &mut PtRegs, _: &ExceptionInfo) -> ContinueOperation {
+                unreachable!()
+            }
+            fn interrupt(&self, _: &mut PtRegs) -> ContinueOperation {
+                unreachable!()
+            }
+        }
+        run_thread_inner_with_process(
+            &InitOnly(std::cell::RefCell::new(Some(f))),
+            &mut PtRegs::default(),
+            process,
+        );
+    }
+
+    #[test]
+    fn timer_notification_survives_targets_exiting_during_delivery() {
+        use litebox_common_linux::signal::Signal;
+        use std::sync::mpsc;
+
+        // Pause the worker after it snapshots the thread list. This waker is
+        // installed only in ThreadState, never in the signal-handler TLS slot.
+        struct PauseDelivery {
+            reached: mpsc::SyncSender<()>,
+            resume: Mutex<mpsc::Receiver<()>>,
+        }
+        impl std::task::Wake for PauseDelivery {
+            fn wake(self: Arc<Self>) {
+                self.reached.send(()).unwrap();
+                self.resume
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            }
+        }
+
+        let platform = MacosUserland::new();
+        let process = Arc::new(ProcessState::default());
+        let (reached_tx, reached_rx) = mpsc::sync_channel(0);
+        let (resume_tx, resume_rx) = mpsc::sync_channel(0);
+        let pause = core::task::Waker::from(Arc::new(PauseDelivery {
+            reached: reached_tx,
+            resume: Mutex::new(resume_rx),
+        }));
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (exit_first_tx, exit_first_rx) = mpsc::channel();
+        let (exit_second_tx, exit_second_rx) = mpsc::channel();
+        let first_process = process.clone();
+        let first_ready = ready_tx.clone();
+        let first = std::thread::spawn(move || {
+            run_process_test_thread(first_process, || {
+                *ThreadHandle::current().0.waker.lock().unwrap() = Some(pause);
+                first_ready.send(()).unwrap();
+                exit_first_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            });
+        });
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let second_process = process.clone();
+        let second = std::thread::spawn(move || {
+            run_process_test_thread(second_process, || {
+                ready_tx.send(()).unwrap();
+                exit_second_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            });
+        });
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        run_process_test_thread(process.clone(), || {
+            let timer = platform.create_timer(Signal::SIGALRM).unwrap();
+            timer.set_timer(Duration::from_millis(1));
+            reached_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            // First exits without draining. Second's cloned identity is cleared
+            // before the worker reaches it. Neither may discard the alarm.
+            exit_first_tx.send(()).unwrap();
+            exit_second_tx.send(()).unwrap();
+            first.join().unwrap();
+            second.join().unwrap();
+            resume_tx.send(()).unwrap();
+            // Joining the worker completes delivery to this surviving sibling.
+            drop(timer);
+            assert!(
+                ThreadHandle::current()
+                    .0
+                    .interrupted
+                    .load(Ordering::Acquire)
+            );
+            let mut signals = Vec::new();
+            platform.take_pending_signals(|signal| signals.push(signal));
+            assert_eq!(signals, [Signal::SIGALRM]);
+        });
+        run_process_test_thread(process, || {
+            platform.take_pending_signals(|_| panic!("timer was delivered more than once"));
+        });
+    }
 
     #[test]
     fn reserved_pages_snapshot_contains_host_mappings() {
