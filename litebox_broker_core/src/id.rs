@@ -3,10 +3,7 @@
 
 //! Shared broker process and thread ID allocation.
 
-use alloc::sync::Arc;
-
 use hashbrown::HashSet;
-use spin::Mutex;
 
 use crate::{BrokerError, Result};
 
@@ -16,25 +13,6 @@ use crate::{BrokerError, Result};
 /// uLiteBox uses that reserved value for the synthetic Windows CSR server
 /// identity and never allocates it to a guest process or thread.
 pub(crate) const MAX_ALLOCATED_ID: u32 = 0x3fff_fffe;
-
-pub(crate) struct IdReservation {
-    allocator: Arc<Mutex<IdAllocator>>,
-    id: u32,
-}
-
-impl IdReservation {
-    pub(crate) const fn new(allocator: Arc<Mutex<IdAllocator>>, id: u32) -> Self {
-        Self { allocator, id }
-    }
-
-    pub(crate) const fn id(&self) -> u32 {
-        self.id
-    }
-
-    pub(crate) fn release(self) {
-        self.allocator.lock().release(self.id);
-    }
-}
 
 pub(crate) struct IdAllocator {
     next: u32,
@@ -81,7 +59,7 @@ impl IdAllocator {
         }
     }
 
-    fn release(&mut self, id: u32) {
+    pub(crate) fn release(&mut self, id: u32) {
         if !self.occupied.remove(&id) {
             self.failed = true;
         }
@@ -90,11 +68,7 @@ impl IdAllocator {
 
 #[cfg(test)]
 mod tests {
-    use alloc::sync::Arc;
-
-    use spin::Mutex;
-
-    use super::{IdAllocator, IdReservation, MAX_ALLOCATED_ID};
+    use super::{IdAllocator, MAX_ALLOCATED_ID};
     use crate::BrokerError;
 
     #[test]
@@ -120,17 +94,5 @@ mod tests {
             IdAllocator::new(MAX_ALLOCATED_ID + 1),
             Err(BrokerError::ResourceExhausted)
         ));
-    }
-
-    #[test]
-    fn dropped_reservation_remains_occupied() {
-        let allocator = Arc::new(Mutex::new(IdAllocator::new(1).unwrap()));
-        let id = allocator.lock().allocate().unwrap();
-        drop(IdReservation::new(Arc::clone(&allocator), id));
-
-        assert_eq!(
-            allocator.lock().allocate(),
-            Err(BrokerError::ResourceExhausted)
-        );
     }
 }
