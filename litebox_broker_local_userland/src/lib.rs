@@ -3,7 +3,18 @@
 
 //! Hosted userland bindings for the portable broker local endpoint.
 
-#![cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+#![cfg(any(
+    target_os = "linux",
+    all(windows, target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64")
+))]
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod macos;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub use macos::{
+    BrokerAssociationFailureCoordinator, BrokerConnection, connect, start_notification_receiver,
+};
 
 #[cfg(target_os = "linux")]
 mod linux;

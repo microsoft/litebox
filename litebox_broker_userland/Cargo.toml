@@ -24,6 +24,11 @@ litebox_broker_platform_windows_userland = { path = "../litebox_broker_platform_
 litebox_broker_transport_windows_userland = { path = "../litebox_broker_transport_windows_userland", version = "0.1.0" }
 litebox_runner_windows_userland = { path = "../litebox_runner_windows_userland", version = "0.1.0" }
 
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+litebox_broker_platform_macos_userland = { path = "../litebox_broker_platform_macos_userland", version = "0.1.0" }
+litebox_broker_transport_macos_userland = { path = "../litebox_broker_transport_macos_userland", version = "0.1.0" }
+tempfile = { version = "3", default-features = false }
+
 [features]
 lock_tracing = [
     "litebox_platform/lock_tracing",
@@ -42,9 +47,17 @@ name = "userland_broker"
 path = "tests/userland_broker.rs"
 harness = false
 
+[[test]]
+name = "macos_stdio"
+path = "tests/macos_stdio.rs"
+harness = false
+
 [dev-dependencies]
 litebox_broker_core = { path = "../litebox_broker_core", version = "0.1.0", features = ["test-support"] }
 litebox_broker_local = { path = "../litebox_broker_local", version = "0.1.0" }
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dev-dependencies]
+litebox_runner_linux_on_macos_userland = { path = "../litebox_runner_linux_on_macos_userland", version = "0.1.0" }
 
 [lints]
 workspace = true

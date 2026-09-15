@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
+    "litebox_broker_platform_macos_userland",
+    "litebox_broker_transport_macos_userland",
     "litebox",
     "litebox_broker_local",
     "litebox_broker_local_userland",
@@ -45,6 +47,8 @@ members = [
     "dev_bench",
 ]
 default-members = [
+    "litebox_broker_platform_macos_userland",
+    "litebox_broker_transport_macos_userland",
     "litebox",
     "litebox_broker_local",
     "litebox_broker_local_userland",

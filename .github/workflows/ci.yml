@@ -70,6 +70,9 @@ jobs:
       - run: |
           ./.github/tools/github_actions_run_cargo nextest
           ./.github/tools/github_actions_run_cargo nextest -p litebox_runner_optee_on_linux_userland
+      # Nextest does not execute harness=false integration-test binaries.
+      - name: Test userland broker integration
+        run: ./.github/tools/github_actions_run_cargo test -p litebox_broker_userland --test userland_broker
       - run: |
           ./.github/tools/github_actions_run_cargo test --doc
           # We need to run `cargo test --doc` separately because doc tests
@@ -127,6 +130,9 @@ jobs:
           ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features $AARCH64_CRATES
       - run: ./.github/tools/github_actions_run_cargo build $AARCH64_CRATES --features litebox_common_linux/aarch64_gate_recovery
       - run: ./.github/tools/github_actions_run_cargo nextest $AARCH64_CRATES --features litebox_common_linux/aarch64_gate_recovery
+      # Nextest does not execute harness=false integration-test binaries.
+      - name: Test userland broker integration
+        run: ./.github/tools/github_actions_run_cargo test -p litebox_broker_userland --test userland_broker
       - name: Test AArch64 x18 virtualization
         run: |
           ./.github/tools/github_actions_run_cargo nextest -p litebox_syscall_rewriter -p litebox_platform_linux_userland -p litebox_shim_linux --features litebox_platform_linux_userland/aarch64_virtualize_x18,litebox_shim_linux/aarch64_virtualize_x18
@@ -147,6 +153,10 @@ jobs:
       MACOS_AARCH64_CRATES: >-
         -p dev_tests
         -p litebox
+        -p litebox_broker_local_userland
+        -p litebox_broker_platform_macos_userland
+        -p litebox_broker_transport_macos_userland
+        -p litebox_broker_userland
         -p litebox_common_linux
         -p litebox_syscall_rewriter
         -p litebox_platform_macos_userland
@@ -173,6 +183,9 @@ jobs:
         run: |
           ./.github/tools/github_actions_run_cargo clippy --all-targets --no-default-features -p litebox_platform_macos_userland
           ./.github/tools/github_actions_run_cargo nextest --no-default-features -p litebox_platform_macos_userland
+      # macos_stdio is harness=false: nextest cannot discover or execute it.
+      - name: Test macOS broker stdio and Seatbelt transport compatibility
+        run: ./.github/tools/github_actions_run_cargo test -p litebox_broker_userland --test macos_stdio
       - run: ./.github/tools/github_actions_run_cargo test --doc $MACOS_AARCH64_CRATES
       - name: Build documentation (fail on warnings)
         env:
@@ -351,9 +364,13 @@ jobs:
           #   both the local and the broker/host endpoints of the current
           #   Unix-domain-socket control channel.
           #
+          # - `litebox_broker_transport_macos_userland` is allowed to have
+          #   `std` access, since it owns hosted macOS Unix sockets, shared-memory
+          #   descriptor transfer, and the transport's worker/liveness threads.
+          #
           # - `litebox_broker_local_userland` is allowed to have `std` access,
           #   since it binds the portable broker local endpoint to the hosted
-          #   Linux or Windows userland transport.
+          #   Linux, macOS, or Windows userland transport.
           #
           # - `litebox_broker_transport_windows_userland` is allowed to have
           #   `std` access, since it is the Windows-userland binding for the
@@ -362,6 +379,10 @@ jobs:
           # - `litebox_broker_platform_linux_userland` is allowed to have
           #   `std` access, since it owns hosted Linux broker resources such as
           #   sockets and the epoll reactor.
+          #
+          # - `litebox_broker_platform_macos_userland` is allowed to have
+          #   `std` access, since its hosted macOS synchronization provider uses
+          #   standard-library mutexes and condition variables.
           #
           # - `litebox_broker_platform_windows_userland` is allowed to have
           #   `std` access, since it owns hosted Windows broker resources.
@@ -432,8 +453,10 @@ jobs:
             -not -path './Cargo.toml' \
             -not -path './litebox_broker_local_userland/Cargo.toml' \
             -not -path './litebox_broker_platform_linux_userland/Cargo.toml' \
+            -not -path './litebox_broker_platform_macos_userland/Cargo.toml' \
             -not -path './litebox_broker_platform_windows_userland/Cargo.toml' \
             -not -path './litebox_broker_transport_linux_userland/Cargo.toml' \
+            -not -path './litebox_broker_transport_macos_userland/Cargo.toml' \
             -not -path './litebox_broker_transport_windows_userland/Cargo.toml' \
             -not -path './litebox_broker_userland/Cargo.toml' \
             -not -path './litebox_egress_proxy/Cargo.toml' \

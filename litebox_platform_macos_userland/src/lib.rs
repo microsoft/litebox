@@ -1139,6 +1139,68 @@ impl<const PAGE_SIZE: usize> litebox::platform::ArchSpecificProvider
     }
 }
 
+/// Run host-worker setup while guest-directed asynchronous signals are blocked.
+/// Newly spawned workers inherit the mask. Restoration of the calling thread's
+/// mask is attempted whether setup returns or panics. Restoration errors are
+/// returned on the normal path; during unwinding restoration is best-effort so
+/// it cannot replace the original panic with a double-panic abort.
+pub fn with_guest_signals_blocked<T>(setup: impl FnOnce() -> T) -> std::io::Result<T> {
+    // SAFETY: initialized output storage; these APIs only alter this thread's mask.
+    let old_mask = unsafe {
+        let mut signals = core::mem::zeroed::<libc::sigset_t>();
+        let mut old = core::mem::zeroed::<libc::sigset_t>();
+        libc::sigemptyset(&raw mut signals);
+        for &(host, _) in FORWARDED_SIGNALS {
+            libc::sigaddset(&raw mut signals, host);
+        }
+        let result = libc::pthread_sigmask(libc::SIG_BLOCK, &raw const signals, &raw mut old);
+        if result != 0 {
+            return Err(std::io::Error::from_raw_os_error(result));
+        }
+        old
+    };
+    run_with_signal_mask_restore(setup, move || {
+        // SAFETY: the saved set was returned by pthread_sigmask on this thread.
+        let result = unsafe {
+            libc::pthread_sigmask(
+                libc::SIG_SETMASK,
+                &raw const old_mask,
+                core::ptr::null_mut(),
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::from_raw_os_error(result))
+        }
+    })
+}
+
+/// Execute setup and attempt restoration exactly once, including on unwind.
+/// The restoration callback must report failures as errors, never panic.
+fn run_with_signal_mask_restore<T>(
+    setup: impl FnOnce() -> T,
+    restore: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<T> {
+    struct Restore<F: FnOnce() -> std::io::Result<()>>(Option<F>);
+    impl<F: FnOnce() -> std::io::Result<()>> Restore<F> {
+        fn restore(&mut self) -> std::io::Result<()> {
+            self.0.take().map_or(Ok(()), |restore| restore())
+        }
+    }
+    impl<F: FnOnce() -> std::io::Result<()>> Drop for Restore<F> {
+        fn drop(&mut self) {
+            // Only the unwind path still has a callback. Do not panic or use a
+            // potentially panicking logger here if pthread_sigmask fails.
+            let _ = self.restore();
+        }
+    }
+    let mut restore = Restore(Some(restore));
+    let result = setup();
+    restore.restore()?;
+    Ok(result)
+}
+
 const FORWARDED_SIGNALS: &[(i32, litebox_common_linux::signal::Signal)] = &[
     (libc::SIGINT, litebox_common_linux::signal::Signal::SIGINT),
     (libc::SIGALRM, litebox_common_linux::signal::Signal::SIGALRM),
@@ -2641,6 +2703,30 @@ mod tests {
     }
 
     #[test]
+    fn signal_mask_restore_returns_normal_path_errors_once() {
+        for fail in [false, true] {
+            let calls = Cell::new(0);
+            let result = run_with_signal_mask_restore(
+                || 42,
+                || {
+                    calls.set(calls.get() + 1);
+                    if fail {
+                        Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            if fail {
+                assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EINVAL));
+            } else {
+                assert_eq!(result.unwrap(), 42);
+            }
+            assert_eq!(calls.get(), 1);
+        }
+    }
+
+    #[test]
     #[cfg(feature = "subpage_compat")]
     fn native_and_subpage_instances_keep_distinct_permissions() {
         let native = MacosUserland::new();
@@ -2699,6 +2785,71 @@ mod tests {
         // Only the 4 KiB instance inherits WRITE from its neighboring subpage.
         assert_eq!(native_memory.write_at_offset(0, 42), None);
         assert_eq!(compat_memory.write_at_offset(0, 42), Some(()));
+    }
+
+    #[test]
+    fn signal_mask_restore_failure_during_unwind_preserves_original_panic() {
+        for fail in [false, true] {
+            let calls = Cell::new(0);
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = run_with_signal_mask_restore(
+                    || panic!("original setup panic"),
+                    || {
+                        calls.set(calls.get() + 1);
+                        if fail {
+                            Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                );
+            }))
+            .unwrap_err();
+            assert_eq!(panic.downcast_ref::<&str>(), Some(&"original setup panic"));
+            assert_eq!(calls.get(), 1);
+        }
+    }
+
+    fn current_signal_mask() -> libc::sigset_t {
+        // SAFETY: mask is writable output storage; a null input queries the
+        // calling thread's mask without changing it.
+        unsafe {
+            let mut mask = core::mem::zeroed();
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_SETMASK, core::ptr::null(), &raw mut mask),
+                0
+            );
+            mask
+        }
+    }
+
+    #[test]
+    fn signal_mask_restored_after_setup_return_and_unwind() {
+        let original = current_signal_mask();
+        let check_blocked = || {
+            let mask = current_signal_mask();
+            for &(host, _) in FORWARDED_SIGNALS {
+                // SAFETY: mask is initialized and host is a valid signal number.
+                assert_eq!(unsafe { libc::sigismember(&raw const mask, host) }, 1);
+            }
+        };
+        let result = with_guest_signals_blocked(|| {
+            check_blocked();
+            // Workers inherit the blocked mask, not the caller's restored mask.
+            std::thread::spawn(check_blocked).join().unwrap();
+            Err::<(), _>("setup error")
+        })
+        .unwrap();
+        assert_eq!(result, Err("setup error"));
+        assert_eq!(current_signal_mask(), original);
+        let panic = std::panic::catch_unwind(|| {
+            let _ = with_guest_signals_blocked(|| {
+                check_blocked();
+                panic!("setup panic");
+            });
+        });
+        assert!(panic.is_err());
+        assert_eq!(current_signal_mask(), original);
     }
 
     /// Run host-only test code with the same registration as a guest sibling.

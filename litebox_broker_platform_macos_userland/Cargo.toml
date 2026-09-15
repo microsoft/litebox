@@ -1,0 +1,10 @@
+[package]
+name = "litebox_broker_platform_macos_userland"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+litebox_platform = { path = "../litebox_platform", version = "0.1.0" }
+
+[lints]
+workspace = true

@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::str::FromStr;
 use std::sync::Arc;
+#[cfg(not(target_os = "macos"))]
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -30,6 +31,8 @@ use litebox_platform::sync::RawSyncPrimitivesProvider;
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod macos;
 #[cfg(all(windows, target_arch = "x86_64"))]
 mod windows;
 
@@ -194,9 +197,16 @@ fn run_runner_process(
             "--runner is required outside in-process mode",
         )
     })?;
-    let mut runner = Command::new(runner_path)
-        .args(runner_command_arguments(args, control_channel, proxy_url))
-        .spawn()?;
+    let mut command = Command::new(runner_path);
+    command.args(runner_command_arguments(args, control_channel, proxy_url));
+    // The untrusted macOS runner must use broker RPC for host standard I/O,
+    // not inherit descriptors that bypass the broker's policy.
+    #[cfg(target_os = "macos")]
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut runner = command.spawn()?;
     let runner_process_id = runner.id();
     let association_result = serve(&mut runner, runner_process_id);
     if association_result.is_err() {
@@ -210,8 +220,10 @@ fn run_runner_process(
     Ok(())
 }
 
+#[cfg(not(target_os = "macos"))]
 type InProcessRunnerResult = Result<i32, String>;
 
+#[cfg(not(target_os = "macos"))]
 fn finish_in_process_runner(
     runner: JoinHandle<InProcessRunnerResult>,
     association_result: IoResult<()>,
@@ -318,7 +330,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     windows::run(CliArgs::parse())
 }
 
-#[cfg(not(any(target_os = "linux", all(windows, target_arch = "x86_64"))))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    macos::run(CliArgs::parse())
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    all(windows, target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64")
+)))]
 fn main() {}
 
 #[cfg(test)]
