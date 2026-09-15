@@ -394,8 +394,8 @@ where
 pub struct WindowsShimBuilder<Platform: ShimPlatform> {
     platform: &'static Platform,
     litebox: LiteBox<Platform>,
-    process_id: litebox_broker_protocol::ProcessId,
-    parent_id: Option<litebox_broker_protocol::ProcessId>,
+    process_id: usize,
+    parent_id: Option<usize>,
     initial_thread: litebox::thread::Thread,
 }
 
@@ -405,8 +405,8 @@ impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
     pub fn new_with_litebox(
         platform: &'static Platform,
         litebox: LiteBox<Platform>,
-        process_id: litebox_broker_protocol::ProcessId,
-        parent_id: Option<litebox_broker_protocol::ProcessId>,
+        process_id: usize,
+        parent_id: Option<usize>,
         initial_thread: litebox::thread::Thread,
     ) -> Self {
         Self {
@@ -425,7 +425,7 @@ impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
 
     #[must_use]
     pub fn build(self) -> WindowsShim<Platform> {
-        debug_assert_ne!(self.initial_thread.id().0, self.process_id.0);
+        debug_assert_ne!(self.initial_thread.id() as usize, self.process_id);
         let litebox = Arc::new(self.litebox);
         let fs = Arc::new(fs::Fs::regular(Arc::clone(&litebox)));
         let global = Arc::new(GlobalState {
@@ -537,8 +537,8 @@ impl<Platform: ShimPlatform> WindowsShim<Platform> {
                 &argv,
                 &envp,
                 nt_types::ClientId {
-                    unique_process: self.0.process_id.0 as usize,
-                    unique_thread: initial_thread_id.0 as usize,
+                    unique_process: self.0.process_id,
+                    unique_thread: initial_thread_id as usize,
                 },
             )?;
         // TODO: shared section should be only created once and shared across all processes, not created per-process.
@@ -555,12 +555,12 @@ impl<Platform: ShimPlatform> WindowsShim<Platform> {
         process.peb_address = load_info.environment.peb;
         let process = Arc::new(process);
         let thread_object = Arc::new(syscalls::thread::ThreadObject::new(
-            initial_thread_id.0 as usize,
+            initial_thread_id as usize,
             load_info.environment.teb,
         ));
-        let attached = process.attach_thread(initial_thread_id.0 as usize, &thread_object);
+        let attached = process.attach_thread(initial_thread_id as usize, &thread_object);
         debug_assert!(attached, "a freshly created process cannot be exiting");
-        let broker_thread = self
+        let litebox_thread = self
             .0
             .initial_thread
             .lock()
@@ -579,7 +579,7 @@ impl<Platform: ShimPlatform> WindowsShim<Platform> {
                     stack_top: load_info.stack_top,
                     context: load_info.environment.context,
                     thread_object,
-                    broker_thread: Mutex::new(Some(broker_thread)),
+                    litebox_thread: Mutex::new(Some(litebox_thread)),
                 },
                 _not_send: PhantomData,
             },
@@ -596,8 +596,8 @@ struct GlobalState<Platform: ShimPlatform> {
     wnf_states: syscalls::wnf::WnfStateStore<Platform>,
     mui_generation: AtomicU32,
     qpc_boot_instant: <Platform as TimeProvider>::Instant,
-    process_id: litebox_broker_protocol::ProcessId,
-    parent_id: Option<litebox_broker_protocol::ProcessId>,
+    process_id: usize,
+    parent_id: Option<usize>,
     initial_thread: Mutex<Platform, Option<litebox::thread::Thread>>,
     fs: Arc<fs::Fs<Platform>>,
     litebox: Arc<LiteBox<Platform>>,
@@ -710,8 +710,8 @@ impl<Platform: ShimPlatform> Process<Platform> {
     }
 
     fn new(
-        process_id: litebox_broker_protocol::ProcessId,
-        parent_id: Option<litebox_broker_protocol::ProcessId>,
+        process_id: usize,
+        parent_id: Option<usize>,
         virtual_allocations: Option<WindowsVirtualAllocations<Platform>>,
         windows_shared_section: Arc<SectionObject<Platform>>,
     ) -> Self {
@@ -725,8 +725,8 @@ impl<Platform: ShimPlatform> Process<Platform> {
             "seeded Windows shared section must have seeded ancestors: {status:?}"
         );
         Process {
-            id: process_id.0 as usize,
-            parent_id: parent_id.map_or(0, |parent_id| parent_id.0 as usize),
+            id: process_id,
+            parent_id: parent_id.unwrap_or(0),
             ntdll: None,
             peb_address: 0,
             handles: WindowsHandleStore::<Platform>::new(litebox::fd::RawDescriptorStorage::new()),
@@ -770,8 +770,8 @@ struct Task<Platform: ShimPlatform> {
     context: usize,
     /// The NT thread object backing this task.
     thread_object: Arc<syscalls::thread::ThreadObject<Platform>>,
-    /// Broker lifecycle for this thread.
-    broker_thread: Mutex<Platform, Option<litebox::thread::Thread>>,
+    /// LiteBox thread owned by this task.
+    litebox_thread: Mutex<Platform, Option<litebox::thread::Thread>>,
 }
 
 impl<Platform: ShimPlatform> Task<Platform> {
@@ -781,18 +781,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
             self.release_io_completion_worker();
             self.thread_object.abandon_owned_mutants(thread_id);
             self.process.detach_thread(thread_id);
-            let broker_thread = self
-                .broker_thread
+            let litebox_thread = self
+                .litebox_thread
                 .lock()
                 .take()
-                .expect("a live Windows task must own its broker thread");
-            debug_assert_eq!(broker_thread.id().0 as usize, thread_id);
-            let broker_thread_id = broker_thread.id();
-            if let Err(error) = broker_thread.exit() {
+                .expect("a live Windows task must own its LiteBox thread");
+            debug_assert_eq!(litebox_thread.id() as usize, thread_id);
+            let litebox_thread_id = litebox_thread.id();
+            if let Err(error) = litebox_thread.exit() {
                 litebox_util_log::error!(
                     error:% = error,
-                    thread_id = broker_thread_id.0;
-                    "failed to record broker thread exit"
+                    thread_id = litebox_thread_id;
+                    "failed to record thread exit"
                 );
             }
         });

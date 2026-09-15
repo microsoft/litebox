@@ -152,8 +152,7 @@ pub extern "C" fn sandbox_process_init(
     #[cfg(debug_assertions)]
     litebox_util_log::debug!("sandbox_process_init called");
 
-    let shim_builder =
-        litebox_shim_linux::LinuxShimBuilder::new(platform, litebox_broker_protocol::ProcessId(1));
+    let shim_builder = litebox_shim_linux::LinuxShimBuilder::new(platform, 1);
     let shim = shim_builder.build();
     let initialized = SHIM.set(Box::new(shim)).is_ok();
     assert!(initialized, "shim initialized more than once");

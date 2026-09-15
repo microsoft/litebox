@@ -360,7 +360,7 @@ impl<Platform: ShimPlatform> IOPollable for ThreadObject<Platform> {
 
 struct NewThreadArgs<Platform: ShimPlatform> {
     task: Task<Platform>,
-    broker_thread: Arc<Mutex<Platform, Option<litebox::thread::Thread>>>,
+    litebox_thread: Arc<Mutex<Platform, Option<litebox::thread::Thread>>>,
 }
 
 impl<Platform: ShimPlatform> litebox::shim::InitThread for NewThreadArgs<Platform> {
@@ -371,13 +371,13 @@ impl<Platform: ShimPlatform> litebox::shim::InitThread for NewThreadArgs<Platfor
     ) -> Box<dyn litebox::shim::EnterShim<ExecutionContext = Self::ExecutionContext>> {
         let Self {
             task,
-            broker_thread,
+            litebox_thread,
         } = *self;
-        let broker_thread = broker_thread
+        let litebox_thread = litebox_thread
             .lock()
             .take()
-            .expect("a spawned task must receive its broker thread");
-        *task.broker_thread.lock() = Some(broker_thread);
+            .expect("a spawned task must receive its LiteBox thread");
+        *task.litebox_thread.lock() = Some(litebox_thread);
         Box::new(WindowsShimEntrypoints {
             task,
             _not_send: PhantomData,
@@ -477,7 +477,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let Some(ntdll) = self.process.ntdll else {
             return NtStatus::NOT_SUPPORTED;
         };
-        let mut broker_thread = match self.global.litebox.create_thread() {
+        let mut litebox_thread = match self.global.litebox.create_thread() {
             Ok(thread) => Some(thread),
             Err(error) => {
                 litebox_util_log::error!(
@@ -487,20 +487,19 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 return NtStatus::QUOTA_EXCEEDED;
             }
         };
-        let thread_id = broker_thread
+        let thread_id = litebox_thread
             .as_ref()
-            .expect("new broker thread missing")
-            .id()
-            .0 as usize;
+            .expect("new LiteBox thread missing")
+            .id() as usize;
         let mut rollback_thread = || {
-            let broker_thread = broker_thread
+            let litebox_thread = litebox_thread
                 .take()
-                .expect("broker thread rollback must run only once");
-            let broker_thread_id = broker_thread.id();
-            if let Err(error) = broker_thread.exit() {
+                .expect("LiteBox thread rollback must run only once");
+            let litebox_thread_id = litebox_thread.id();
+            if let Err(error) = litebox_thread.exit() {
                 litebox_util_log::error!(
                     error:% = error,
-                    thread_id = broker_thread_id.0;
+                    thread_id = litebox_thread_id;
                     "Failed to roll back Windows thread"
                 );
             }
@@ -580,9 +579,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
             stack_top: environment.stack_top,
             context: environment.context,
             thread_object: thread,
-            broker_thread: Mutex::new(None),
+            litebox_thread: Mutex::new(None),
         };
-        let broker_thread = Arc::new(Mutex::new(broker_thread));
+        let litebox_thread = Arc::new(Mutex::new(litebox_thread));
         // SAFETY: `child_ctx` points at mapped guest code and stack created above, and the
         // destination thread constructs its non-Send shim entrypoints inside `InitThread::init`.
         if let Err(error) = unsafe {
@@ -590,22 +589,22 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 &child_ctx,
                 Box::new(NewThreadArgs {
                     task,
-                    broker_thread: Arc::clone(&broker_thread),
+                    litebox_thread: Arc::clone(&litebox_thread),
                 }),
             )
         } {
             litebox_util_log::error!(error:% = error; "Failed to spawn Windows guest thread");
             self.close_typed_handle::<ThreadSubsystem<Platform>>(handle, drop);
             self.process.detach_thread(thread_id);
-            let broker_thread = broker_thread
+            let litebox_thread = litebox_thread
                 .lock()
                 .take()
-                .expect("failed host spawn must return the thread lifecycle");
-            let broker_thread_id = broker_thread.id();
-            if let Err(error) = broker_thread.exit() {
+                .expect("failed host spawn must return the LiteBox thread");
+            let litebox_thread_id = litebox_thread.id();
+            if let Err(error) = litebox_thread.exit() {
                 litebox_util_log::error!(
                     error:% = error,
-                    thread_id = broker_thread_id.0;
+                    thread_id = litebox_thread_id;
                     "Failed to roll back Windows thread"
                 );
             }

@@ -146,12 +146,12 @@ fn map_csr_server_shared_memory(
 
 pub(crate) fn test_task() -> Task<TestPlatform> {
     let (litebox, process_id) = crate::test_broker::litebox(test_platform());
-    test_task_from_litebox_with_process_id(litebox, process_id, None)
+    test_task_from_litebox_with_process_id(litebox, process_id.0 as usize, None)
 }
 
 pub(crate) fn test_task_with_process_id(
-    process_id: litebox_broker_protocol::ProcessId,
-    parent_id: Option<litebox_broker_protocol::ProcessId>,
+    process_id: usize,
+    parent_id: Option<usize>,
 ) -> Task<TestPlatform> {
     let (litebox, _) = crate::test_broker::litebox(test_platform());
     test_task_from_litebox_with_process_id(litebox, process_id, parent_id)
@@ -203,13 +203,13 @@ pub(crate) fn test_task_with_broker_files(files: &[(&str, &[u8])]) -> Task<TestP
 
     let (litebox, process_id) =
         crate::test_broker::litebox_with_broker_files(test_platform(), entries);
-    test_task_from_litebox_with_process_id(litebox, process_id, None)
+    test_task_from_litebox_with_process_id(litebox, process_id.0 as usize, None)
 }
 
 fn test_task_from_litebox_with_process_id(
     litebox: litebox::LiteBox<TestPlatform>,
-    process_id: litebox_broker_protocol::ProcessId,
-    parent_id: Option<litebox_broker_protocol::ProcessId>,
+    process_id: usize,
+    parent_id: Option<usize>,
 ) -> Task<TestPlatform> {
     let platform = test_platform();
     let initial_thread = litebox
@@ -240,11 +240,11 @@ fn test_task_from_litebox_with_process_id(
         windows_shared_section,
     ));
     let thread_object = Arc::new(crate::syscalls::thread::ThreadObject::new(
-        initial_thread_id.0 as usize,
+        initial_thread_id as usize,
         0,
     ));
-    assert!(process.attach_thread(initial_thread_id.0 as usize, &thread_object));
-    let broker_thread = global.initial_thread.lock().take();
+    assert!(process.attach_thread(initial_thread_id as usize, &thread_object));
+    let litebox_thread = global.initial_thread.lock().take();
 
     Task {
         global,
@@ -259,7 +259,7 @@ fn test_task_from_litebox_with_process_id(
         stack_top: 0,
         context: 0,
         thread_object,
-        broker_thread: litebox::sync::Mutex::new(broker_thread),
+        litebox_thread: litebox::sync::Mutex::new(litebox_thread),
     }
 }
 
@@ -309,14 +309,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     pub(crate) fn clone_for_test_with_teb(&self, teb_address: usize) -> Option<Self> {
-        let broker_thread = self.global.litebox.create_thread().ok()?;
-        let thread_id = broker_thread.id().0 as usize;
+        let litebox_thread = self.global.litebox.create_thread().ok()?;
+        let thread_id = litebox_thread.id() as usize;
         let thread_object = Arc::new(crate::syscalls::thread::ThreadObject::new(
             thread_id,
             teb_address,
         ));
         if !self.process.attach_thread(thread_id, &thread_object) {
-            let _ = broker_thread.exit();
+            let _ = litebox_thread.exit();
             return None;
         }
         Some(Task {
@@ -332,7 +332,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             stack_top: 0,
             context: 0,
             thread_object,
-            broker_thread: litebox::sync::Mutex::new(Some(broker_thread)),
+            litebox_thread: litebox::sync::Mutex::new(Some(litebox_thread)),
         })
     }
 }
@@ -342,8 +342,8 @@ fn objectless_test_tasks_use_distinct_broker_process_ids() {
     let first = test_task();
     let second = test_task();
 
-    assert_eq!(first.process.id, first.global.process_id.0 as usize);
-    assert_eq!(second.process.id, second.global.process_id.0 as usize);
+    assert_eq!(first.process.id, first.global.process_id);
+    assert_eq!(second.process.id, second.global.process_id);
     assert_ne!(first.process.id, second.process.id);
 }
 

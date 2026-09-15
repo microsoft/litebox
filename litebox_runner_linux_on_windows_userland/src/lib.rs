@@ -72,7 +72,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         local,
         notifications,
     } = broker::connect(control_pipe)?;
-    let process_id = local.process_id();
+    let process_id = i32::try_from(local.process_id().0)
+        .context("broker process ID does not fit Linux pid_t")?;
     let litebox = litebox::LiteBox::new_with_broker_local(platform, local);
     broker::start_notification_receiver(
         notifications,
@@ -110,7 +111,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let program = shim
         .load_program(
             litebox_common_linux::TaskParams {
-                pid: process_id.0.try_into().unwrap(),
+                pid: process_id,
                 ppid: 0,
                 uid: 1000,
                 gid: 1000,

@@ -913,11 +913,8 @@ mod tests {
     }
 
     #[test]
-    fn process_basic_information_uses_broker_identity() {
-        let task = crate::tests::test_task_with_process_id(
-            litebox_broker_protocol::ProcessId(37),
-            Some(litebox_broker_protocol::ProcessId(11)),
-        );
+    fn process_basic_information_uses_assigned_identity() {
+        let task = crate::tests::test_task_with_process_id(37, Some(11));
 
         let information = task.process_basic_information();
 

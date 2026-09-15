@@ -100,22 +100,6 @@ fn current() -> Option<&'static mut bindings::vsbox_task> {
     }
 }
 
-impl SnpLinuxKernel {
-    pub fn init_task(
-        &self,
-        boot_params: &bindings::vmpl2_boot_params,
-    ) -> litebox_common_linux::TaskParams {
-        litebox_common_linux::TaskParams {
-            pid: boot_params.pid,
-            ppid: boot_params.ppid,
-            uid: boot_params.uid,
-            gid: boot_params.gid,
-            euid: boot_params.euid,
-            egid: boot_params.egid,
-        }
-    }
-}
-
 unsafe impl litebox::platform::ThreadLocalStorageProvider for SnpLinuxKernel {
     fn get_thread_local_storage() -> *mut () {
         let tls = get_tls();

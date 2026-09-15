@@ -551,8 +551,8 @@ type ThreadLocalDescriptor = UserPtrMut<u8>;
 struct NewThreadArgs<Platform: ShimPlatform> {
     /// Task struct that maintains all per-thread data
     task: Task<Platform>,
-    /// Thread lifecycle retained by the caller until host spawn succeeds.
-    broker_thread: Arc<Mutex<Platform, Option<litebox::thread::Thread>>>,
+    /// LiteBox thread retained by the caller until host spawn succeeds.
+    litebox_thread: Arc<Mutex<Platform, Option<litebox::thread::Thread>>>,
     /// Prevents guest execution until the parent publishes `PARENT_SETTID`.
     start: Option<Arc<AtomicBool>>,
 }
@@ -566,7 +566,7 @@ impl<Platform: ShimPlatform> litebox::shim::InitThread for NewThreadArgs<Platfor
     {
         let Self {
             mut task,
-            broker_thread,
+            litebox_thread,
             start,
         } = *self;
         if let Some(start) = start {
@@ -574,11 +574,11 @@ impl<Platform: ShimPlatform> litebox::shim::InitThread for NewThreadArgs<Platfor
                 core::hint::spin_loop();
             }
         }
-        let broker_thread = broker_thread
+        let litebox_thread = litebox_thread
             .lock()
             .take()
-            .expect("a spawned task must receive its broker thread");
-        task.broker_thread = Some(broker_thread);
+            .expect("a spawned task must receive its LiteBox thread");
+        task.litebox_thread = Some(litebox_thread);
 
         Box::new(crate::LinuxShimEntrypoints {
             task,
@@ -741,9 +741,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
             alloc::sync::Arc::new((**self.fs.borrow()).clone())
         };
 
-        let broker_thread = self.global.create_thread().map_err(|_| Errno::EAGAIN)?;
-        let child_tid = i32::try_from(broker_thread.id().0)
-            .expect("the broker-assigned thread ID must fit Linux pid_t");
+        let litebox_thread = self.global.create_thread().map_err(|_| Errno::EAGAIN)?;
+        let child_tid = i32::try_from(litebox_thread.id())
+            .expect("the assigned thread ID must fit Linux pid_t");
 
         let sp = if stack != 0 {
             let stack: usize = stack.trunc();
@@ -753,12 +753,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
 
         let Some(thread) = self.thread.new_thread(child_tid) else {
-            let thread_id = broker_thread.id();
-            if let Err(error) = broker_thread.exit() {
+            let thread_id = litebox_thread.id();
+            if let Err(error) = litebox_thread.exit() {
                 litebox_util_log::error!(
                     error:% = error,
-                    thread_id = thread_id.0;
-                    "failed to record broker thread exit during rollback"
+                    thread_id;
+                    "failed to record thread exit during rollback"
                 );
             }
             return Err(Errno::EBUSY);
@@ -770,14 +770,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
         });
         thread.clear_child_tid.set(clear_child_tid);
         let child_start = set_parent_tid.map(|_| Arc::new(AtomicBool::new(false)));
-        let broker_thread = Arc::new(Mutex::new(Some(broker_thread)));
+        let litebox_thread = Arc::new(Mutex::new(Some(litebox_thread)));
         let r = unsafe {
             self.global.platform.spawn_thread(
                 ctx,
                 Box::new(NewThreadArgs {
                     task: Task {
                         global: self.global.clone(),
-                        broker_thread: None,
+                        litebox_thread: None,
                         wait_state: crate::wait::WaitState::new(self.global.platform),
                         thread,
                         pid: self.pid,
@@ -789,23 +789,23 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         files: self.files.clone(), // TODO: !CLONE_FILES support
                         signals: self.signals.clone_for_new_task(),
                     },
-                    broker_thread: Arc::clone(&broker_thread),
+                    litebox_thread: Arc::clone(&litebox_thread),
                     start: child_start.clone(),
                 }),
             )
         };
         if let Err(err) = r {
             litebox_util_log::error!(err:% = err; "failed to spawn thread");
-            let broker_thread = broker_thread
+            let litebox_thread = litebox_thread
                 .lock()
                 .take()
-                .expect("failed host spawn must return the thread lifecycle");
-            let thread_id = broker_thread.id();
-            if let Err(error) = broker_thread.exit() {
+                .expect("failed host spawn must return the LiteBox thread");
+            let thread_id = litebox_thread.id();
+            if let Err(error) = litebox_thread.exit() {
                 litebox_util_log::error!(
                     error:% = error,
-                    thread_id = thread_id.0;
-                    "failed to record broker thread exit during rollback"
+                    thread_id;
+                    "failed to record thread exit during rollback"
                 );
             }
             // Treat all spawn errors as `ENOMEM`. `EAGAIN` and other errors are
