@@ -21,7 +21,7 @@ extern crate std;
 mod error;
 pub mod event;
 pub mod fs;
-mod identity;
+mod id;
 pub mod pipe;
 mod policy;
 mod process;
@@ -44,7 +44,7 @@ use spin::{Mutex, rwlock::RwLock};
 
 pub use error::BrokerError;
 use fs::FileService;
-use identity::{IdAllocator, IdReservation, MAX_ALLOCATED_ID};
+use id::{IdAllocator, IdReservation, MAX_ALLOCATED_ID};
 pub use policy::{
     DestinationPortRange, DestinationRule, Ipv4Cidr, MAX_DESTINATION_RULES, PolicyEngine,
     PolicyProfile, SocketPolicy, SocketPolicyError,

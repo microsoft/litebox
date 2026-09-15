@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+//! Shared broker process and thread ID allocation.
+
 use alloc::sync::Arc;
 
 use hashbrown::HashSet;

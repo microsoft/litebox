@@ -64,7 +64,7 @@ impl Thread {
     /// Panics if the broker returns an error that is invalid for thread
     /// teardown.
     pub fn exit(self) -> Result<(), ExitError> {
-        self.broker.exit_thread(self.id).map_err(map_exit_error)
+        self.broker.exit_thread(self.id).map_err(ExitError::from)
     }
 }
 
@@ -77,32 +77,36 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     /// creation.
     pub fn create_thread(&self) -> Result<Thread, CreateError> {
         let broker = self.broker_control().ok_or(CreateError::BrokerRequired)?;
-        let id = broker.create_thread().map_err(map_create_error)?;
+        let id = broker.create_thread().map_err(CreateError::from)?;
         Ok(Thread { id, broker })
     }
 }
 
-fn map_create_error(error: BrokerControlError) -> CreateError {
-    match error {
-        BrokerControlError::AssociationFailed => CreateError::AssociationFailed,
-        BrokerControlError::Broker(
-            litebox_broker_protocol::error::ErrorCode::ResourceExhausted
-            | litebox_broker_protocol::error::ErrorCode::OutOfMemory,
-        ) => CreateError::ResourceExhausted,
-        BrokerControlError::Broker(error) => {
-            panic!("broker returned unexpected create-thread error: {error}")
+impl From<BrokerControlError> for CreateError {
+    fn from(error: BrokerControlError) -> Self {
+        match error {
+            BrokerControlError::AssociationFailed => Self::AssociationFailed,
+            BrokerControlError::Broker(
+                litebox_broker_protocol::error::ErrorCode::ResourceExhausted
+                | litebox_broker_protocol::error::ErrorCode::OutOfMemory,
+            ) => Self::ResourceExhausted,
+            BrokerControlError::Broker(error) => {
+                panic!("broker returned unexpected create-thread error: {error}")
+            }
         }
     }
 }
 
-fn map_exit_error(error: BrokerControlError) -> ExitError {
-    match error {
-        BrokerControlError::AssociationFailed => ExitError::AssociationFailed,
-        BrokerControlError::Broker(litebox_broker_protocol::error::ErrorCode::UnknownObject) => {
-            ExitError::UnknownThread
-        }
-        BrokerControlError::Broker(error) => {
-            panic!("broker returned unexpected exit-thread error: {error}")
+impl From<BrokerControlError> for ExitError {
+    fn from(error: BrokerControlError) -> Self {
+        match error {
+            BrokerControlError::AssociationFailed => Self::AssociationFailed,
+            BrokerControlError::Broker(
+                litebox_broker_protocol::error::ErrorCode::UnknownObject,
+            ) => Self::UnknownThread,
+            BrokerControlError::Broker(error) => {
+                panic!("broker returned unexpected exit-thread error: {error}")
+            }
         }
     }
 }

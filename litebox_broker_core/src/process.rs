@@ -6,7 +6,7 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::event::EventObject;
 use crate::fs::File;
-use crate::identity::IdReservation;
+use crate::id::IdReservation;
 use crate::pipe::PipeObject;
 use crate::socket::SocketObject;
 use crate::{BrokerCore, BrokerError, Result};
@@ -858,9 +858,8 @@ mod tests {
         ))
         .build()
         .unwrap();
-        broker.ids = alloc::sync::Arc::new(spin::Mutex::new(
-            crate::identity::IdAllocator::new(2).unwrap(),
-        ));
+        broker.ids =
+            alloc::sync::Arc::new(spin::Mutex::new(crate::id::IdAllocator::new(2).unwrap()));
         let process = broker
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
@@ -974,9 +973,8 @@ mod tests {
         ))
         .build()
         .unwrap();
-        broker.ids = alloc::sync::Arc::new(spin::Mutex::new(
-            crate::identity::IdAllocator::new(1).unwrap(),
-        ));
+        broker.ids =
+            alloc::sync::Arc::new(spin::Mutex::new(crate::id::IdAllocator::new(1).unwrap()));
         let process = broker
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
@@ -998,9 +996,8 @@ mod tests {
         ))
         .build()
         .unwrap();
-        broker.ids = alloc::sync::Arc::new(spin::Mutex::new(
-            crate::identity::IdAllocator::new(2).unwrap(),
-        ));
+        broker.ids =
+            alloc::sync::Arc::new(spin::Mutex::new(crate::id::IdAllocator::new(2).unwrap()));
         let process = broker
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
@@ -1025,9 +1022,8 @@ mod tests {
         ))
         .build()
         .unwrap();
-        broker.ids = alloc::sync::Arc::new(spin::Mutex::new(
-            crate::identity::IdAllocator::new(2).unwrap(),
-        ));
+        broker.ids =
+            alloc::sync::Arc::new(spin::Mutex::new(crate::id::IdAllocator::new(2).unwrap()));
         let process = broker
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
@@ -1049,9 +1045,8 @@ mod tests {
         ))
         .build()
         .unwrap();
-        broker.ids = alloc::sync::Arc::new(spin::Mutex::new(
-            crate::identity::IdAllocator::new(3).unwrap(),
-        ));
+        broker.ids =
+            alloc::sync::Arc::new(spin::Mutex::new(crate::id::IdAllocator::new(3).unwrap()));
         let process = broker
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
