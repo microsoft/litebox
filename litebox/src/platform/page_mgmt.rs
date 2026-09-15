@@ -133,7 +133,7 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         debug_assert!(new_range.start.is_multiple_of(ALIGN));
         debug_assert!(old_range.len().is_multiple_of(ALIGN));
         debug_assert!(new_range.len().is_multiple_of(ALIGN));
-        debug_assert!(new_range.len() > old_range.len());
+        debug_assert!(new_range.len() >= old_range.len());
         debug_assert!(old_range.start.max(new_range.start) >= old_range.end.min(new_range.end));
         // Default implementation: allocate new pages, copy data, deallocate old pages
         let permissions = match state {

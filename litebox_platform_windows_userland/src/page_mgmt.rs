@@ -521,27 +521,28 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
 
         let mut has_reserved_pages = false;
         let mut has_committed_pages = false;
+        let mut has_foreign_pages = false;
         let _ = process_memory_range_by_regions(suggested_range.clone(), |_, information| {
             let state = information.State;
-            if state == Win32_Memory::MEM_COMMIT {
-                has_committed_pages = true;
+            if state != Win32_Memory::MEM_FREE
+                && !reservations.contains_key(&information.AllocationBase.addr())
+            {
+                has_foreign_pages = true;
                 return Err(());
+            } else if state == Win32_Memory::MEM_COMMIT {
+                has_committed_pages = true;
             } else if state == Win32_Memory::MEM_RESERVE {
                 has_reserved_pages = true;
-                if !reservations.contains_key(&information.AllocationBase.addr()) {
-                    // The region is reserved but not tracked in our reservations, treat it as unavailable.
-                    has_committed_pages = true;
-                    return Err(());
-                }
             }
             Ok(true)
         });
 
         // Handle `reserve` request
         if PageState::Reserved == initial_state {
-            let address_in_use = has_committed_pages || has_reserved_pages;
             match fixed_address_behavior {
-                FixedAddressBehavior::Hint if address_in_use => {
+                FixedAddressBehavior::Hint
+                    if has_foreign_pages || has_committed_pages || has_reserved_pages =>
+                {
                     let range = self.reserve_and_maybe_commit::<ALIGN>(
                         &mut reservations,
                         0..suggested_range.len(),
@@ -551,21 +552,32 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                     )?;
                     return Ok(UserMutPtr::from_ptr(range.start as *mut u8));
                 }
-                FixedAddressBehavior::NoReplace if address_in_use => {
+                FixedAddressBehavior::NoReplace if has_foreign_pages => {
+                    return Err(AllocationError::AddressInUseByPlatform);
+                }
+                FixedAddressBehavior::NoReplace if has_committed_pages => {
                     return Err(AllocationError::AddressInUse);
                 }
                 FixedAddressBehavior::Hint | FixedAddressBehavior::NoReplace => {
-                    let range = self.reserve_and_maybe_commit::<ALIGN>(
+                    let range = self.acquire::<ALIGN>(
                         &mut reservations,
                         suggested_range,
-                        initial_state,
-                        populate_pages_immediately,
                         fixed_address_behavior,
                     )?;
                     return Ok(UserMutPtr::from_ptr(range.start as *mut u8));
                 }
                 FixedAddressBehavior::Replace => {
-                    panic!("FixedAddressBehavior::Replace is not yet implemented");
+                    if has_foreign_pages {
+                        return Err(AllocationError::AddressInUseByPlatform);
+                    }
+                    let range = self.acquire::<ALIGN>(
+                        &mut reservations,
+                        suggested_range,
+                        FixedAddressBehavior::Replace,
+                    )?;
+                    // SAFETY: The caller authorizes replacement of this fully owned range.
+                    unsafe { Self::decommit(&reservations, range.clone()) };
+                    return Ok(UserMutPtr::from_ptr(range.start as *mut u8));
                 }
             }
         }
