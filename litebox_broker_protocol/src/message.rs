@@ -142,7 +142,7 @@ pub enum BrokerHandshakeResponse {
         /// The broker returns its supported version after validating that the
         /// requested version matches it.
         broker_protocol_version: ProtocolVersion,
-        /// Broker-assigned process ID.
+        /// Assigned process ID.
         process_id: ProcessId,
     },
     /// Negotiation failed because the requested version is unsupported.

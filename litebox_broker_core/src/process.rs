@@ -91,7 +91,7 @@ impl BrokerThread {
         Self { id }
     }
 
-    /// Returns the broker-assigned thread ID.
+    /// Returns the assigned thread ID.
     #[must_use]
     pub const fn id(&self) -> ThreadId {
         self.id
@@ -105,7 +105,7 @@ impl BrokerThread {
 /// serving its association.
 pub struct BrokerProcess {
     pub(crate) core: BrokerCore,
-    /// Broker-assigned process ID and internal authority.
+    /// Assigned process ID and internal authority.
     pub(crate) id: ProcessId,
     cleaned_up: bool,
     /// Authoritative parent process ID, absent for a root process.
@@ -149,7 +149,7 @@ impl BrokerProcess {
         }
     }
 
-    /// Returns the broker-assigned process ID.
+    /// Returns the assigned process ID.
     #[must_use]
     pub const fn id(&self) -> ProcessId {
         self.id

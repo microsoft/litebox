@@ -146,7 +146,7 @@ fn map_csr_server_shared_memory(
 
 pub(crate) fn test_task() -> Task<TestPlatform> {
     let (litebox, process_id) = crate::test_broker::litebox(test_platform());
-    test_task_from_litebox_with_process_id(litebox, process_id.0 as usize, None)
+    test_task_from_litebox_with_process_id(litebox, process_id, None)
 }
 
 pub(crate) fn test_task_with_process_id(
@@ -203,7 +203,7 @@ pub(crate) fn test_task_with_broker_files(files: &[(&str, &[u8])]) -> Task<TestP
 
     let (litebox, process_id) =
         crate::test_broker::litebox_with_broker_files(test_platform(), entries);
-    test_task_from_litebox_with_process_id(litebox, process_id.0 as usize, None)
+    test_task_from_litebox_with_process_id(litebox, process_id, None)
 }
 
 fn test_task_from_litebox_with_process_id(
@@ -338,7 +338,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 }
 
 #[test]
-fn objectless_test_tasks_use_distinct_broker_process_ids() {
+fn objectless_test_tasks_use_distinct_process_ids() {
     let first = test_task();
     let second = test_task();
 
