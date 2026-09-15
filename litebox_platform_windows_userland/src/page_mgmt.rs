@@ -128,7 +128,8 @@ fn do_query_on_region(mbi: &mut Win32_Memory::MEMORY_BASIC_INFORMATION, base_add
 ///
 /// # Parameters
 /// - `range`: The memory range to process
-/// - `operation`: A closure that takes (region_range, region_state) and returns Result<bool, E>.
+/// - `operation`: A closure that takes the clipped region range and a reference to its
+///   `MEMORY_BASIC_INFORMATION`, and returns Result<bool, E>.
 ///
 /// # Panics
 ///
@@ -138,7 +139,7 @@ fn process_memory_range_by_regions<F, E>(
     mut operation: F,
 ) -> Result<(), E>
 where
-    F: FnMut(core::ops::Range<usize>, Win32_Memory::VIRTUAL_ALLOCATION_TYPE) -> Result<bool, E>,
+    F: FnMut(core::ops::Range<usize>, &Win32_Memory::MEMORY_BASIC_INFORMATION) -> Result<bool, E>,
 {
     while !range.is_empty() {
         let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
@@ -146,7 +147,7 @@ where
         let region_end = mbi.BaseAddress as usize + mbi.RegionSize;
         assert!(mbi.BaseAddress as usize <= range.start && range.start < region_end);
         let len = region_end.min(range.end) - range.start;
-        let success = operation(range.start..range.start + len, mbi.State)?;
+        let success = operation(range.start..range.start + len, &mbi)?;
         assert!(
             success,
             "operation failed on region {:p}-{:p}: {}",
@@ -305,11 +306,11 @@ impl WindowsUserland {
         let mut uncommitted = Vec::new();
         process_memory_range_by_regions(
             range.clone(),
-            |segment, state| -> Result<bool, core::convert::Infallible> {
-                if state == Win32_Memory::MEM_RESERVE {
+            |segment, information| -> Result<bool, core::convert::Infallible> {
+                if information.State == Win32_Memory::MEM_RESERVE {
                     uncommitted.push(segment);
                 } else {
-                    assert_eq!(state, Win32_Memory::MEM_COMMIT);
+                    assert_eq!(information.State, Win32_Memory::MEM_COMMIT);
                 }
                 Ok(true)
             },
@@ -503,7 +504,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, AllocationError> {
         debug_assert!(ALIGN.is_multiple_of(self.sys_info.read().unwrap().dwPageSize as usize));
-        debug_assert!(ALIGN.is_multiple_of(self.sys_info.read().unwrap().dwPageSize as usize));
         debug_assert_alignment!(suggested_range, ALIGN);
 
         let mut reservations = self.reservations.lock().unwrap();
@@ -521,14 +521,14 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
 
         let mut has_reserved_pages = false;
         let mut has_committed_pages = false;
-        let _ = process_memory_range_by_regions(suggested_range.clone(), |r, state| {
+        let _ = process_memory_range_by_regions(suggested_range.clone(), |_, information| {
+            let state = information.State;
             if state == Win32_Memory::MEM_COMMIT {
                 has_committed_pages = true;
                 return Err(());
             } else if state == Win32_Memory::MEM_RESERVE {
                 has_reserved_pages = true;
-                // TODO: r.start is the start address of the reserved region or the overlapping region with the suggested range.
-                if !reservations.contains_key(&r.start) {
+                if !reservations.contains_key(&information.AllocationBase.addr()) {
                     // The region is reserved but not tracked in our reservations, treat it as unavailable.
                     has_committed_pages = true;
                     return Err(());
@@ -731,8 +731,8 @@ mod tests {
             let mut regions = Vec::new();
             process_memory_range_by_regions(
                 r,
-                |region, state| -> Result<bool, core::convert::Infallible> {
-                    regions.push((region, state));
+                |region, information| -> Result<bool, core::convert::Infallible> {
+                    regions.push((region, information.State));
                     Ok(true)
                 },
             )
