@@ -212,15 +212,16 @@ fn test_task_from_litebox_with_process_id(
     parent_id: Option<litebox_broker_protocol::ProcessId>,
 ) -> Task<TestPlatform> {
     let platform = test_platform();
-    let initial_thread_id = litebox
-        .allocate_thread_id()
-        .expect("the test broker must allocate an initial thread ID");
+    let initial_thread = litebox
+        .create_thread()
+        .expect("the test broker must create an initial thread");
+    let initial_thread_id = initial_thread.id();
     let shim_builder = crate::WindowsShimBuilder::<TestPlatform>::new_with_litebox(
         platform,
         litebox,
         process_id,
         parent_id,
-        initial_thread_id,
+        initial_thread,
     );
     let fs_context = litebox::fs::Context::new();
     let shim = shim_builder.build();
@@ -243,6 +244,7 @@ fn test_task_from_litebox_with_process_id(
         0,
     ));
     assert!(process.attach_thread(initial_thread_id.get() as usize, &thread_object));
+    let broker_thread = global.initial_thread.lock().take();
 
     Task {
         global,
@@ -257,6 +259,7 @@ fn test_task_from_litebox_with_process_id(
         stack_top: 0,
         context: 0,
         thread_object,
+        broker_thread: litebox::sync::Mutex::new(broker_thread),
     }
 }
 
@@ -306,14 +309,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     pub(crate) fn clone_for_test_with_teb(&self, teb_address: usize) -> Option<Self> {
-        let broker_thread_id = self.global.litebox.allocate_thread_id().ok()?;
-        let thread_id = broker_thread_id.get() as usize;
+        let broker_thread = self.global.litebox.create_thread().ok()?;
+        let thread_id = broker_thread.id().get() as usize;
         let thread_object = Arc::new(crate::syscalls::thread::ThreadObject::new(
             thread_id,
             teb_address,
         ));
         if !self.process.attach_thread(thread_id, &thread_object) {
-            let _ = self.global.litebox.release_thread_id(broker_thread_id);
+            let _ = broker_thread.finish();
             return None;
         }
         Some(Task {
@@ -329,6 +332,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             stack_top: 0,
             context: 0,
             thread_object,
+            broker_thread: litebox::sync::Mutex::new(Some(broker_thread)),
         })
     }
 }

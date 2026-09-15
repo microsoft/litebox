@@ -146,13 +146,13 @@ impl BrokerProcess {
         self.parent_id
     }
 
-    /// Allocates a globally unique thread ID owned by this process.
+    /// Creates a broker thread belonging to this process.
     ///
     /// # Panics
     ///
     /// Panics if the shared ID allocator violates its checked-ID or uniqueness
     /// invariants.
-    pub fn allocate_thread_id(&self) -> Result<ThreadId> {
+    pub fn create_thread(&self) -> Result<ThreadId> {
         let mut thread_ids = self.thread_ids.lock();
         if thread_ids.len() >= self.core.limits.max_threads_per_process {
             return Err(BrokerError::ResourceExhausted);
@@ -183,8 +183,8 @@ impl BrokerProcess {
         Ok(thread_id)
     }
 
-    /// Releases a thread ID allocated to this process.
-    pub fn release_thread_id(&self, thread_id: ThreadId) -> Result<()> {
+    /// Finishes a broker thread after its local task teardown completes.
+    pub fn finish_thread(&self, thread_id: ThreadId) -> Result<()> {
         let reservation = self
             .thread_ids
             .lock()
@@ -812,7 +812,7 @@ mod tests {
         let first = broker
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
-        let thread = first.allocate_thread_id().unwrap();
+        let thread = first.create_thread().unwrap();
         let second = broker
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
@@ -835,11 +835,11 @@ mod tests {
         let process = broker
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
-        let first = process.allocate_thread_id().unwrap();
+        let first = process.create_thread().unwrap();
 
-        process.release_thread_id(first).unwrap();
+        process.finish_thread(first).unwrap();
 
-        assert_eq!(process.allocate_thread_id().unwrap(), first);
+        assert_eq!(process.create_thread().unwrap(), first);
     }
 
     #[test]
@@ -855,13 +855,13 @@ mod tests {
         let second = broker
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
-        let thread = first.allocate_thread_id().unwrap();
+        let thread = first.create_thread().unwrap();
 
         assert_eq!(
-            second.release_thread_id(thread),
+            second.finish_thread(thread),
             Err(BrokerError::UnknownObject)
         );
-        assert_eq!(first.release_thread_id(thread), Ok(()));
+        assert_eq!(first.finish_thread(thread), Ok(()));
     }
 
     #[test]
@@ -881,21 +881,15 @@ mod tests {
         let third = broker
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
-        let first_thread = first.allocate_thread_id().unwrap();
-        let second_thread = second.allocate_thread_id().unwrap();
+        let first_thread = first.create_thread().unwrap();
+        let second_thread = second.create_thread().unwrap();
 
-        assert_eq!(
-            first.allocate_thread_id(),
-            Err(BrokerError::ResourceExhausted)
-        );
-        assert_eq!(
-            third.allocate_thread_id(),
-            Err(BrokerError::ResourceExhausted)
-        );
+        assert_eq!(first.create_thread(), Err(BrokerError::ResourceExhausted));
+        assert_eq!(third.create_thread(), Err(BrokerError::ResourceExhausted));
 
-        first.release_thread_id(first_thread).unwrap();
-        assert!(third.allocate_thread_id().is_ok());
-        second.release_thread_id(second_thread).unwrap();
+        first.finish_thread(first_thread).unwrap();
+        assert!(third.create_thread().is_ok());
+        second.finish_thread(second_thread).unwrap();
     }
 
     #[test]
@@ -909,7 +903,7 @@ mod tests {
         let process = broker
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
-        process.allocate_thread_id().unwrap();
+        process.create_thread().unwrap();
 
         drop(process);
 
@@ -917,7 +911,7 @@ mod tests {
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         assert_eq!(
-            replacement.allocate_thread_id(),
+            replacement.create_thread(),
             Err(BrokerError::ResourceExhausted)
         );
     }
@@ -985,7 +979,7 @@ mod tests {
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let process_id = process.id();
-        let thread_id = process.allocate_thread_id().unwrap();
+        let thread_id = process.create_thread().unwrap();
         assert_eq!(broker.reserved_threads.load(Ordering::Relaxed), 1);
 
         process.finish();
@@ -995,7 +989,7 @@ mod tests {
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         assert_eq!(replacement.id(), process_id);
-        assert_eq!(replacement.allocate_thread_id().unwrap(), thread_id);
+        assert_eq!(replacement.create_thread().unwrap(), thread_id);
     }
 
     #[test]
@@ -1036,7 +1030,7 @@ mod tests {
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let process_id = process.id();
-        let thread_id = process.allocate_thread_id().unwrap();
+        let thread_id = process.create_thread().unwrap();
 
         drop(process);
 
@@ -1046,7 +1040,7 @@ mod tests {
         assert_ne!(replacement.id(), process_id);
         assert_ne!(replacement.id().get(), thread_id.get());
         assert_eq!(
-            replacement.allocate_thread_id(),
+            replacement.create_thread(),
             Err(BrokerError::ResourceExhausted)
         );
     }

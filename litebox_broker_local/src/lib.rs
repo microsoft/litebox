@@ -144,30 +144,30 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         self.process_id
     }
 
-    /// Allocates a globally unique thread ID for this process.
+    /// Creates a broker thread belonging to this process.
     ///
     /// # Panics
     ///
     /// Panics if the broker returns a response for a different operation.
-    pub fn allocate_thread_id(&self) -> Result<ThreadId, Channel::Error> {
-        match self.request(BrokerOperation::AllocateThreadId)? {
-            BrokerResult::ThreadIdAllocated(thread_id) => Ok(thread_id),
+    pub fn create_thread(&self) -> Result<ThreadId, Channel::Error> {
+        match self.request(BrokerOperation::CreateThread)? {
+            BrokerResult::ThreadCreated(thread_id) => Ok(thread_id),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
-            response => panic!("broker returned unexpected thread-ID response: {response:?}"),
+            response => panic!("broker returned unexpected create-thread response: {response:?}"),
         }
     }
 
-    /// Releases a thread ID previously allocated for this process.
+    /// Finishes a broker thread after local teardown completes.
     ///
     /// # Panics
     ///
     /// Panics if the broker returns a response for a different operation.
-    pub fn release_thread_id(&self, thread_id: ThreadId) -> Result<(), Channel::Error> {
-        match self.request(BrokerOperation::ReleaseThreadId(thread_id))? {
-            BrokerResult::ThreadIdReleased => Ok(()),
+    pub fn finish_thread(&self, thread_id: ThreadId) -> Result<(), Channel::Error> {
+        match self.request(BrokerOperation::FinishThread(thread_id))? {
+            BrokerResult::ThreadFinished => Ok(()),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
             response => {
-                panic!("broker returned unexpected thread-ID release response: {response:?}")
+                panic!("broker returned unexpected finish-thread response: {response:?}")
             }
         }
     }
@@ -391,10 +391,9 @@ mod tests {
     }
 
     #[test]
-    fn allocate_thread_id_sends_request_and_returns_id() {
+    fn create_thread_sends_request_and_returns_id() {
         let thread_id = ThreadId::new(7).unwrap();
-        let channel =
-            FakeControlChannel::new(None, Some(BrokerResult::ThreadIdAllocated(thread_id)));
+        let channel = FakeControlChannel::new(None, Some(BrokerResult::ThreadCreated(thread_id)));
         let local = BrokerLocal {
             process_id: test_process_id(),
             channel,
@@ -402,20 +401,20 @@ mod tests {
             next_request_id: AtomicU64::new(0),
         };
 
-        assert_eq!(local.allocate_thread_id().unwrap(), thread_id);
+        assert_eq!(local.create_thread().unwrap(), thread_id);
         assert_eq!(
             local.channel.sent_request.borrow().clone(),
             Some(BrokerRequest {
                 request_id: RequestId(0),
-                operation: BrokerOperation::AllocateThreadId,
+                operation: BrokerOperation::CreateThread,
             })
         );
     }
 
     #[test]
-    fn release_thread_id_sends_owned_id() {
+    fn finish_thread_sends_owned_id() {
         let thread_id = ThreadId::new(7).unwrap();
-        let channel = FakeControlChannel::new(None, Some(BrokerResult::ThreadIdReleased));
+        let channel = FakeControlChannel::new(None, Some(BrokerResult::ThreadFinished));
         let local = BrokerLocal {
             process_id: test_process_id(),
             channel,
@@ -423,12 +422,12 @@ mod tests {
             next_request_id: AtomicU64::new(0),
         };
 
-        local.release_thread_id(thread_id).unwrap();
+        local.finish_thread(thread_id).unwrap();
         assert_eq!(
             local.channel.sent_request.borrow().clone(),
             Some(BrokerRequest {
                 request_id: RequestId(0),
-                operation: BrokerOperation::ReleaseThreadId(thread_id),
+                operation: BrokerOperation::FinishThread(thread_id),
             })
         );
     }

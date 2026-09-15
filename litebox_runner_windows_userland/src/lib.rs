@@ -65,8 +65,8 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         notifications,
     } = broker::connect(control_pipe)?;
     let process_id = local.process_id();
-    let initial_thread_id = local.allocate_thread_id()?;
     let litebox = litebox::LiteBox::new_with_broker_local(platform, local);
+    let initial_thread = litebox.create_thread()?;
     broker::start_notification_receiver(
         notifications,
         litebox.broker_notification_dispatcher(),
@@ -77,7 +77,7 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         litebox,
         process_id,
         None,
-        initial_thread_id,
+        initial_thread,
     );
 
     let (program_path, program_args) = cli_args

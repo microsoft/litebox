@@ -304,7 +304,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             _not_send: core::marker::PhantomData,
             task: Task {
                 global: self.0.clone(),
-                broker_thread_id: None,
+                broker_thread: None,
                 thread: syscalls::process::ThreadState::new_process(pid),
                 wait_state: wait::WaitState::new(self.0.platform),
                 pid,
@@ -1184,7 +1184,7 @@ struct GlobalState<Platform: ShimPlatform> {
 
 struct Task<Platform: ShimPlatform> {
     global: Arc<GlobalState<Platform>>,
-    broker_thread_id: Option<litebox_broker_protocol::ThreadId>,
+    broker_thread: Option<litebox::thread::Thread>,
     wait_state: wait::WaitState<Platform>,
     thread: syscalls::process::ThreadState<Platform>,
     /// Process ID
@@ -1207,24 +1207,23 @@ struct Task<Platform: ShimPlatform> {
 }
 
 impl<Platform: ShimPlatform> GlobalState<Platform> {
-    fn allocate_thread_id(
-        &self,
-    ) -> Result<litebox_broker_protocol::ThreadId, litebox::ThreadIdError> {
-        self.litebox.allocate_thread_id()
+    fn create_thread(&self) -> Result<litebox::thread::Thread, litebox::thread::CreateError> {
+        self.litebox.create_thread()
     }
 }
 
 impl<Platform: ShimPlatform> Drop for Task<Platform> {
     fn drop(&mut self) {
         self.prepare_for_exit();
-        if let Some(thread_id) = self.broker_thread_id.take()
-            && let Err(error) = self.global.litebox.release_thread_id(thread_id)
-        {
-            litebox_util_log::error!(
-                error:% = error,
-                thread_id = thread_id.get();
-                "failed to release broker thread ID"
-            );
+        if let Some(thread) = self.broker_thread.take() {
+            let thread_id = thread.id();
+            if let Err(error) = thread.finish() {
+                litebox_util_log::error!(
+                    error:% = error,
+                    thread_id = thread_id.get();
+                    "failed to finish broker thread"
+                );
+            }
         }
     }
 }
@@ -1250,7 +1249,7 @@ mod test_utils {
             files.initialize_stdio_in_shared_descriptors_table(&self, &fs_state.context.read());
             Task {
                 wait_state: wait::WaitState::new(self.platform),
-                broker_thread_id: None,
+                broker_thread: None,
                 thread: syscalls::process::ThreadState::new_process(pid),
                 pid,
                 ppid: 0,
@@ -1268,17 +1267,17 @@ mod test_utils {
     impl<Platform: ShimPlatform> Task<Platform> {
         /// Returns a clone of this task with a new TID for testing.
         pub(crate) fn clone_for_test(&self) -> Option<Self> {
-            let broker_thread_id = self.global.allocate_thread_id().ok()?;
-            let tid = i32::try_from(broker_thread_id.get())
+            let broker_thread = self.global.create_thread().ok()?;
+            let tid = i32::try_from(broker_thread.id().get())
                 .expect("the checked broker thread ID must fit Linux pid_t");
             let Some(thread) = self.thread.new_thread(tid) else {
-                let _ = self.global.litebox.release_thread_id(broker_thread_id);
+                let _ = broker_thread.finish();
                 return None;
             };
             let task = Task {
                 wait_state: wait::WaitState::new(self.global.platform),
                 global: self.global.clone(),
-                broker_thread_id: Some(broker_thread_id),
+                broker_thread: Some(broker_thread),
                 thread,
                 pid: self.pid,
                 ppid: self.ppid,

@@ -43,8 +43,8 @@ const REQUEST_TAG_SOCKET: u8 = 5;
 const REQUEST_TAG_FILL_RANDOM: u8 = 6;
 const REQUEST_TAG_STDIO: u8 = 7;
 const REQUEST_TAG_FILE: u8 = 8;
-const REQUEST_TAG_ALLOCATE_THREAD_ID: u8 = 9;
-const REQUEST_TAG_RELEASE_THREAD_ID: u8 = 10;
+const REQUEST_TAG_CREATE_THREAD: u8 = 9;
+const REQUEST_TAG_FINISH_THREAD: u8 = 10;
 
 // Paired request and successful-response tags intentionally share values.
 const RESPONSE_TAG_NEGOTIATED: u8 = 0;
@@ -56,8 +56,8 @@ const RESPONSE_TAG_SOCKET: u8 = 5;
 const RESPONSE_TAG_RANDOM_FILLED: u8 = 6;
 const RESPONSE_TAG_STDIO: u8 = 7;
 const RESPONSE_TAG_FILE: u8 = 8;
-const RESPONSE_TAG_THREAD_ID_ALLOCATED: u8 = 9;
-const RESPONSE_TAG_THREAD_ID_RELEASED: u8 = 10;
+const RESPONSE_TAG_THREAD_CREATED: u8 = 9;
+const RESPONSE_TAG_THREAD_FINISHED: u8 = 10;
 
 // Reserve the top of the tag space for responses without paired requests.
 const RESPONSE_TAG_ERROR: u8 = 253;
@@ -115,8 +115,8 @@ pub fn decode_handshake_request(frame: &[u8]) -> Result<BrokerHandshakeRequest, 
         | REQUEST_TAG_FILL_RANDOM
         | REQUEST_TAG_STDIO
         | REQUEST_TAG_FILE
-        | REQUEST_TAG_ALLOCATE_THREAD_ID
-        | REQUEST_TAG_RELEASE_THREAD_ID => {
+        | REQUEST_TAG_CREATE_THREAD
+        | REQUEST_TAG_FINISH_THREAD => {
             return Err(WireError::WrongMessagePhase);
         }
         _ => return Err(WireError::InvalidTag),
@@ -136,12 +136,12 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
         operation,
     } = request;
     match operation {
-        BrokerOperation::AllocateThreadId => {
-            encoder.u8(REQUEST_TAG_ALLOCATE_THREAD_ID);
+        BrokerOperation::CreateThread => {
+            encoder.u8(REQUEST_TAG_CREATE_THREAD);
             encoder.request_id(request_id);
         }
-        BrokerOperation::ReleaseThreadId(thread_id) => {
-            encoder.u8(REQUEST_TAG_RELEASE_THREAD_ID);
+        BrokerOperation::FinishThread(thread_id) => {
+            encoder.u8(REQUEST_TAG_FINISH_THREAD);
             encoder.request_id(request_id);
             encoder.thread_id(thread_id);
         }
@@ -203,14 +203,14 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         | REQUEST_TAG_FILL_RANDOM
         | REQUEST_TAG_STDIO
         | REQUEST_TAG_FILE
-        | REQUEST_TAG_ALLOCATE_THREAD_ID
-        | REQUEST_TAG_RELEASE_THREAD_ID => {}
+        | REQUEST_TAG_CREATE_THREAD
+        | REQUEST_TAG_FINISH_THREAD => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
     let operation = match tag {
-        REQUEST_TAG_ALLOCATE_THREAD_ID => BrokerOperation::AllocateThreadId,
-        REQUEST_TAG_RELEASE_THREAD_ID => BrokerOperation::ReleaseThreadId(decoder.thread_id()?),
+        REQUEST_TAG_CREATE_THREAD => BrokerOperation::CreateThread,
+        REQUEST_TAG_FINISH_THREAD => BrokerOperation::FinishThread(decoder.thread_id()?),
         REQUEST_TAG_CLOSE_OBJECT => BrokerOperation::CloseObject(decoder.handle()?),
         REQUEST_TAG_CHECK_READINESS => BrokerOperation::CheckReadiness(decoder.handle()?),
         REQUEST_TAG_EVENT => BrokerOperation::Event(event::decode_event_request(&mut decoder)?),
@@ -275,8 +275,8 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
         | RESPONSE_TAG_RANDOM_FILLED
         | RESPONSE_TAG_STDIO
         | RESPONSE_TAG_FILE
-        | RESPONSE_TAG_THREAD_ID_ALLOCATED
-        | RESPONSE_TAG_THREAD_ID_RELEASED => {
+        | RESPONSE_TAG_THREAD_CREATED
+        | RESPONSE_TAG_THREAD_FINISHED => {
             return Err(WireError::WrongMessagePhase);
         }
         RESPONSE_TAG_VERSION_MISMATCH => BrokerHandshakeResponse::VersionMismatch {
@@ -299,13 +299,13 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
     let mut encoder = Encoder::default();
     let BrokerResponse { request_id, result } = response;
     match result {
-        BrokerResult::ThreadIdAllocated(thread_id) => {
-            encoder.u8(RESPONSE_TAG_THREAD_ID_ALLOCATED);
+        BrokerResult::ThreadCreated(thread_id) => {
+            encoder.u8(RESPONSE_TAG_THREAD_CREATED);
             encoder.request_id(request_id);
             encoder.thread_id(thread_id);
         }
-        BrokerResult::ThreadIdReleased => {
-            encoder.u8(RESPONSE_TAG_THREAD_ID_RELEASED);
+        BrokerResult::ThreadFinished => {
+            encoder.u8(RESPONSE_TAG_THREAD_FINISHED);
             encoder.request_id(request_id);
         }
         BrokerResult::ObjectClosed => {
@@ -372,8 +372,8 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         | RESPONSE_TAG_RANDOM_FILLED
         | RESPONSE_TAG_STDIO
         | RESPONSE_TAG_FILE
-        | RESPONSE_TAG_THREAD_ID_ALLOCATED
-        | RESPONSE_TAG_THREAD_ID_RELEASED => {}
+        | RESPONSE_TAG_THREAD_CREATED
+        | RESPONSE_TAG_THREAD_FINISHED => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -382,8 +382,8 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         RESPONSE_TAG_PIPE => BrokerResult::Pipe(pipe::decode_pipe_response(&mut decoder)?),
         RESPONSE_TAG_SOCKET => BrokerResult::Socket(socket::decode_socket_response(&mut decoder)?),
         RESPONSE_TAG_ERROR => BrokerResult::Error(decode_error_code(&mut decoder)?),
-        RESPONSE_TAG_THREAD_ID_ALLOCATED => BrokerResult::ThreadIdAllocated(decoder.thread_id()?),
-        RESPONSE_TAG_THREAD_ID_RELEASED => BrokerResult::ThreadIdReleased,
+        RESPONSE_TAG_THREAD_CREATED => BrokerResult::ThreadCreated(decoder.thread_id()?),
+        RESPONSE_TAG_THREAD_FINISHED => BrokerResult::ThreadFinished,
         RESPONSE_TAG_OBJECT_CLOSED => BrokerResult::ObjectClosed,
         RESPONSE_TAG_READINESS => BrokerResult::Readiness(ReadinessFlags(decoder.u32()?)),
         RESPONSE_TAG_RANDOM_FILLED => BrokerResult::RandomFilled,
@@ -596,8 +596,8 @@ mod tests {
         )
         .unwrap();
         let operations = [
-            BrokerOperation::AllocateThreadId,
-            BrokerOperation::ReleaseThreadId(thread_id(17)),
+            BrokerOperation::CreateThread,
+            BrokerOperation::FinishThread(thread_id(17)),
             BrokerOperation::CloseObject(handle),
             BrokerOperation::CheckReadiness(handle),
             BrokerOperation::Event(EventRequest::Create(CreateEventRequest {
@@ -1005,8 +1005,8 @@ mod tests {
     fn response_codec_round_trips_all_variants() {
         let handle = ObjectHandle(13);
         let results = [
-            BrokerResult::ThreadIdAllocated(thread_id(17)),
-            BrokerResult::ThreadIdReleased,
+            BrokerResult::ThreadCreated(thread_id(17)),
+            BrokerResult::ThreadFinished,
             BrokerResult::ObjectClosed,
             BrokerResult::Readiness(ReadinessFlags::READ),
             BrokerResult::Readiness(ReadinessFlags::WRITE),
@@ -1249,7 +1249,7 @@ mod tests {
         for invalid_thread_id in [0, MAX_ALLOCATED_ID + 1] {
             let mut frame = encode_request(BrokerRequest {
                 request_id: TEST_REQUEST_ID,
-                operation: BrokerOperation::ReleaseThreadId(thread_id(1)),
+                operation: BrokerOperation::FinishThread(thread_id(1)),
             });
             let thread_id_offset = frame.len() - 4;
             frame[thread_id_offset..].copy_from_slice(&invalid_thread_id.to_le_bytes());
@@ -1694,7 +1694,7 @@ mod tests {
         for invalid_thread_id in [0, MAX_ALLOCATED_ID + 1] {
             let mut frame = encode_response(BrokerResponse {
                 request_id: TEST_REQUEST_ID,
-                result: BrokerResult::ThreadIdAllocated(thread_id(1)),
+                result: BrokerResult::ThreadCreated(thread_id(1)),
             });
             let thread_id_offset = frame.len() - 4;
             frame[thread_id_offset..].copy_from_slice(&invalid_thread_id.to_le_bytes());

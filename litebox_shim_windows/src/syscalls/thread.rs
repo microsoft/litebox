@@ -360,6 +360,7 @@ impl<Platform: ShimPlatform> IOPollable for ThreadObject<Platform> {
 
 struct NewThreadArgs<Platform: ShimPlatform> {
     task: Task<Platform>,
+    broker_thread: Arc<Mutex<Platform, Option<litebox::thread::Thread>>>,
 }
 
 impl<Platform: ShimPlatform> litebox::shim::InitThread for NewThreadArgs<Platform> {
@@ -368,7 +369,15 @@ impl<Platform: ShimPlatform> litebox::shim::InitThread for NewThreadArgs<Platfor
     fn init(
         self: Box<Self>,
     ) -> Box<dyn litebox::shim::EnterShim<ExecutionContext = Self::ExecutionContext>> {
-        let Self { task } = *self;
+        let Self {
+            task,
+            broker_thread,
+        } = *self;
+        let broker_thread = broker_thread
+            .lock()
+            .take()
+            .expect("a spawned task must receive its broker thread");
+        *task.broker_thread.lock() = Some(broker_thread);
         Box::new(WindowsShimEntrypoints {
             task,
             _not_send: PhantomData,
@@ -468,23 +477,31 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let Some(ntdll) = self.process.ntdll else {
             return NtStatus::NOT_SUPPORTED;
         };
-        let broker_thread_id = match self.global.litebox.allocate_thread_id() {
-            Ok(thread_id) => thread_id,
+        let mut broker_thread = match self.global.litebox.create_thread() {
+            Ok(thread) => Some(thread),
             Err(error) => {
                 litebox_util_log::error!(
                     error:% = error;
-                    "Failed to allocate Windows thread ID"
+                    "Failed to create Windows thread"
                 );
                 return NtStatus::QUOTA_EXCEEDED;
             }
         };
-        let thread_id = broker_thread_id.get() as usize;
-        let release_thread_id = || {
-            if let Err(error) = self.global.litebox.release_thread_id(broker_thread_id) {
+        let thread_id = broker_thread
+            .as_ref()
+            .expect("new broker thread missing")
+            .id()
+            .get() as usize;
+        let mut finish_thread = || {
+            let broker_thread = broker_thread
+                .take()
+                .expect("broker thread rollback must run only once");
+            let broker_thread_id = broker_thread.id();
+            if let Err(error) = broker_thread.finish() {
                 litebox_util_log::error!(
                     error:% = error,
                     thread_id = broker_thread_id.get();
-                    "Failed to roll back Windows thread ID"
+                    "Failed to roll back Windows thread"
                 );
             }
         };
@@ -501,7 +518,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             Ok(environment) => environment,
             Err(error) => {
                 litebox_util_log::error!(error:% = error; "Failed to create Windows thread environment");
-                release_thread_id();
+                finish_thread();
                 return NtStatus::NO_MEMORY;
             }
         };
@@ -515,7 +532,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .write_at_offset(0, initial_context)
             .is_none()
         {
-            release_thread_id();
+            finish_thread();
             return NtStatus::ACCESS_VIOLATION;
         }
         let mut child_ctx = ctx.clone();
@@ -534,7 +551,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         );
         if !self.process.attach_thread(thread_id, &thread) {
             // The process is tearing down; refuse to start another thread.
-            release_thread_id();
+            finish_thread();
             return NtStatus::PROCESS_IS_TERMINATING;
         }
         let granted_access = ThreadAccess::from_desired_access(desired_access);
@@ -548,7 +565,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             Ok(handle) => handle,
             Err(status) => {
                 self.process.detach_thread(thread_id);
-                release_thread_id();
+                finish_thread();
                 return status;
             }
         };
@@ -563,18 +580,35 @@ impl<Platform: ShimPlatform> Task<Platform> {
             stack_top: environment.stack_top,
             context: environment.context,
             thread_object: thread,
+            broker_thread: Mutex::new(None),
         };
+        let broker_thread = Arc::new(Mutex::new(broker_thread));
         // SAFETY: `child_ctx` points at mapped guest code and stack created above, and the
         // destination thread constructs its non-Send shim entrypoints inside `InitThread::init`.
         if let Err(error) = unsafe {
-            self.global
-                .platform
-                .spawn_thread(&child_ctx, Box::new(NewThreadArgs { task }))
+            self.global.platform.spawn_thread(
+                &child_ctx,
+                Box::new(NewThreadArgs {
+                    task,
+                    broker_thread: Arc::clone(&broker_thread),
+                }),
+            )
         } {
             litebox_util_log::error!(error:% = error; "Failed to spawn Windows guest thread");
             self.close_typed_handle::<ThreadSubsystem<Platform>>(handle, drop);
             self.process.detach_thread(thread_id);
-            release_thread_id();
+            let broker_thread = broker_thread
+                .lock()
+                .take()
+                .expect("failed host spawn must return the thread lifecycle");
+            let broker_thread_id = broker_thread.id();
+            if let Err(error) = broker_thread.finish() {
+                litebox_util_log::error!(
+                    error:% = error,
+                    thread_id = broker_thread_id.get();
+                    "Failed to roll back Windows thread"
+                );
+            }
             return NtStatus::NO_MEMORY;
         }
 

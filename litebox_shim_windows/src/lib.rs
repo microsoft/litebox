@@ -396,7 +396,7 @@ pub struct WindowsShimBuilder<Platform: ShimPlatform> {
     litebox: LiteBox<Platform>,
     process_id: litebox_broker_protocol::ProcessId,
     parent_id: Option<litebox_broker_protocol::ProcessId>,
-    initial_thread_id: litebox_broker_protocol::ThreadId,
+    initial_thread: litebox::thread::Thread,
 }
 
 impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
@@ -407,14 +407,14 @@ impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
         litebox: LiteBox<Platform>,
         process_id: litebox_broker_protocol::ProcessId,
         parent_id: Option<litebox_broker_protocol::ProcessId>,
-        initial_thread_id: litebox_broker_protocol::ThreadId,
+        initial_thread: litebox::thread::Thread,
     ) -> Self {
         Self {
             platform,
             litebox,
             process_id,
             parent_id,
-            initial_thread_id,
+            initial_thread,
         }
     }
 
@@ -425,7 +425,7 @@ impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
 
     #[must_use]
     pub fn build(self) -> WindowsShim<Platform> {
-        debug_assert_ne!(self.initial_thread_id.get(), self.process_id.get());
+        debug_assert_ne!(self.initial_thread.id().get(), self.process_id.get());
         let litebox = Arc::new(self.litebox);
         let fs = Arc::new(fs::Fs::regular(Arc::clone(&litebox)));
         let global = Arc::new(GlobalState {
@@ -441,7 +441,7 @@ impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
             qpc_boot_instant: TimeProvider::now(self.platform),
             process_id: self.process_id,
             parent_id: self.parent_id,
-            initial_thread_id: self.initial_thread_id,
+            initial_thread: Mutex::new(Some(self.initial_thread)),
             fs,
             litebox,
         });
@@ -508,6 +508,11 @@ pub struct WindowsShim<Platform: ShimPlatform>(Arc<GlobalState<Platform>>);
 
 impl<Platform: ShimPlatform> WindowsShim<Platform> {
     /// Loads the program at `path` as the shim's initial task.
+    ///
+    /// # Panics
+    ///
+    /// Panics if another initial program has already been loaded from this
+    /// shim.
     pub fn load_program(
         &self,
         path: &str,
@@ -519,6 +524,13 @@ impl<Platform: ShimPlatform> WindowsShim<Platform> {
         let _ = map_windows_user_shared_data::<Platform>(&self.0.page_manager)
             .ok_or(loader::WindowsLoadError::MapSharedMemory)?;
         let fs = Arc::clone(&self.0.fs);
+        let initial_thread_id = self
+            .0
+            .initial_thread
+            .lock()
+            .as_ref()
+            .expect("the initial thread may load only one program")
+            .id();
         let load_info = loader::PeLoader::new(self.0.platform, fs.clone(), &self.0.page_manager)
             .load(
                 path,
@@ -526,7 +538,7 @@ impl<Platform: ShimPlatform> WindowsShim<Platform> {
                 &envp,
                 nt_types::ClientId {
                     unique_process: self.0.process_id.get() as usize,
-                    unique_thread: self.0.initial_thread_id.get() as usize,
+                    unique_thread: initial_thread_id.get() as usize,
                 },
             )?;
         // TODO: shared section should be only created once and shared across all processes, not created per-process.
@@ -543,12 +555,17 @@ impl<Platform: ShimPlatform> WindowsShim<Platform> {
         process.peb_address = load_info.environment.peb;
         let process = Arc::new(process);
         let thread_object = Arc::new(syscalls::thread::ThreadObject::new(
-            self.0.initial_thread_id.get() as usize,
+            initial_thread_id.get() as usize,
             load_info.environment.teb,
         ));
-        let attached =
-            process.attach_thread(self.0.initial_thread_id.get() as usize, &thread_object);
+        let attached = process.attach_thread(initial_thread_id.get() as usize, &thread_object);
         debug_assert!(attached, "a freshly created process cannot be exiting");
+        let broker_thread = self
+            .0
+            .initial_thread
+            .lock()
+            .take()
+            .expect("the initial thread must remain available after loading");
         Ok(LoadedProgram {
             entrypoints: WindowsShimEntrypoints {
                 task: Task {
@@ -562,6 +579,7 @@ impl<Platform: ShimPlatform> WindowsShim<Platform> {
                     stack_top: load_info.stack_top,
                     context: load_info.environment.context,
                     thread_object,
+                    broker_thread: Mutex::new(Some(broker_thread)),
                 },
                 _not_send: PhantomData,
             },
@@ -580,7 +598,7 @@ struct GlobalState<Platform: ShimPlatform> {
     qpc_boot_instant: <Platform as TimeProvider>::Instant,
     process_id: litebox_broker_protocol::ProcessId,
     parent_id: Option<litebox_broker_protocol::ProcessId>,
-    initial_thread_id: litebox_broker_protocol::ThreadId,
+    initial_thread: Mutex<Platform, Option<litebox::thread::Thread>>,
     fs: Arc<fs::Fs<Platform>>,
     litebox: Arc<LiteBox<Platform>>,
 }
@@ -752,6 +770,8 @@ struct Task<Platform: ShimPlatform> {
     context: usize,
     /// The NT thread object backing this task.
     thread_object: Arc<syscalls::thread::ThreadObject<Platform>>,
+    /// Broker lifecycle for this thread.
+    broker_thread: Mutex<Platform, Option<litebox::thread::Thread>>,
 }
 
 impl<Platform: ShimPlatform> Task<Platform> {
@@ -761,15 +781,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
             self.release_io_completion_worker();
             self.thread_object.abandon_owned_mutants(thread_id);
             self.process.detach_thread(thread_id);
-            let thread_id = u32::try_from(thread_id)
-                .ok()
-                .and_then(litebox_broker_protocol::ThreadId::new)
-                .expect("broker thread IDs must fit the checked protocol range");
-            if let Err(error) = self.global.litebox.release_thread_id(thread_id) {
+            let broker_thread = self
+                .broker_thread
+                .lock()
+                .take()
+                .expect("a live Windows task must own its broker thread");
+            debug_assert_eq!(broker_thread.id().get() as usize, thread_id);
+            let broker_thread_id = broker_thread.id();
+            if let Err(error) = broker_thread.finish() {
                 litebox_util_log::error!(
                     error:% = error,
-                    thread_id = thread_id.get();
-                    "failed to release broker thread ID"
+                    thread_id = broker_thread_id.get();
+                    "failed to finish broker thread"
                 );
             }
         });

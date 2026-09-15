@@ -44,10 +44,10 @@ pub struct BrokerHandshakeRequest {
 /// Operation requested over an active broker control channel.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BrokerOperation {
-    /// Allocate a globally unique thread ID owned by this process.
-    AllocateThreadId,
-    /// Release a thread ID previously allocated to this process.
-    ReleaseThreadId(ThreadId),
+    /// Create a broker thread belonging to this process.
+    CreateThread,
+    /// Finish a broker thread after local teardown completes.
+    FinishThread(ThreadId),
     /// Close one broker object reference.
     CloseObject(ObjectHandle),
     /// Check the current readiness of a broker-owned object.
@@ -98,8 +98,8 @@ impl BrokerOperation {
                 | FileRequest::Mkdir(MkdirFileRequest { path: buffer, .. })
                 | FileRequest::Rmdir(RmdirFileRequest { path: buffer, .. }),
             ) => Some(*buffer),
-            Self::AllocateThreadId
-            | Self::ReleaseThreadId(_)
+            Self::CreateThread
+            | Self::FinishThread(_)
             | Self::CloseObject(_)
             | Self::CheckReadiness(_)
             | Self::Event(_)
@@ -214,10 +214,10 @@ pub enum SocketRequest {
 /// Result returned for an active broker operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BrokerResult {
-    /// A new thread ID owned by this process.
-    ThreadIdAllocated(ThreadId),
-    /// A thread ID was released.
-    ThreadIdReleased,
+    /// A thread was created with this broker-assigned ID.
+    ThreadCreated(ThreadId),
+    /// Thread teardown completed.
+    ThreadFinished,
     /// Object close operation completed.
     ObjectClosed,
     /// Current readiness of a broker-owned object.

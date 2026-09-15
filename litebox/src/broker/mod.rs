@@ -49,12 +49,9 @@ use shared_buffer::{AcquireError, SlotAllocator, SlotLease};
 /// Longer-term broker integrations should move away from blocking control calls
 /// once the local-core wait and notification model supports that shape.
 pub(crate) trait BrokerControl: Send + Sync {
-    fn allocate_thread_id(&self) -> core::result::Result<ThreadId, BrokerControlError>;
+    fn create_thread(&self) -> core::result::Result<ThreadId, BrokerControlError>;
 
-    fn release_thread_id(
-        &self,
-        thread_id: ThreadId,
-    ) -> core::result::Result<(), BrokerControlError>;
+    fn finish_thread(&self, thread_id: ThreadId) -> core::result::Result<(), BrokerControlError>;
 
     fn fill_random(&self, output: &mut [u8]) -> core::result::Result<(), BrokerControlError>;
 
@@ -440,15 +437,12 @@ where
     Platform: RawSyncPrimitivesProvider + TimeProvider,
     Channel: LocalCallChannel + Send + Sync,
 {
-    fn allocate_thread_id(&self) -> core::result::Result<ThreadId, BrokerControlError> {
-        self.request(BrokerLocal::allocate_thread_id)
+    fn create_thread(&self) -> core::result::Result<ThreadId, BrokerControlError> {
+        self.request(BrokerLocal::create_thread)
     }
 
-    fn release_thread_id(
-        &self,
-        thread_id: ThreadId,
-    ) -> core::result::Result<(), BrokerControlError> {
-        self.request(|local| local.release_thread_id(thread_id))
+    fn finish_thread(&self, thread_id: ThreadId) -> core::result::Result<(), BrokerControlError> {
+        self.request(|local| local.finish_thread(thread_id))
     }
 
     fn fill_random(&self, output: &mut [u8]) -> core::result::Result<(), BrokerControlError> {
