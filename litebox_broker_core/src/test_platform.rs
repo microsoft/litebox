@@ -27,10 +27,10 @@ impl RawMutex for TestRawMutex {
         &self.state
     }
 
-    fn wake_many(&self, count: usize) -> usize {
+    fn wake_many(&self, _count: usize) -> usize {
         let _waiters = self.waiters.lock().unwrap();
         self.wake.notify_all();
-        count
+        0
     }
 
     fn block(&self, expected: u32) -> Result<(), ImmediatelyWokenUp> {
