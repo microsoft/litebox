@@ -5,6 +5,8 @@
 //! Most of these syscalls which are not backed by files are implemented in [`litebox_common_linux::mm`].
 
 use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::sync::Arc;
+use litebox::fs::errors::ReadError;
 use litebox::{
     mm::linux::{MappingError, PAGE_SIZE, PageRange},
     platform::{
@@ -14,6 +16,7 @@ use litebox::{
 };
 use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
 
+use crate::FileFd;
 use crate::ShimPlatform;
 use crate::Task;
 use crate::UserPtrMut;
@@ -27,7 +30,7 @@ compile_error!("ELF patching code assumes 64-bit pointers (u64 <-> usize is loss
 
 const ENDIAN: LittleEndian = LittleEndian;
 
-/// Per-fd state for the shim's runtime ELF syscall rewriter.
+/// Per-descriptor state for the shim's runtime ELF syscall rewriter.
 ///
 /// Tracks base address and trampoline write cursor for each ELF file that
 /// has executable segments mapped via `do_mmap_file()`.
@@ -59,8 +62,43 @@ pub(crate) struct ElfPatchState {
     patched_ranges: BTreeSet<(usize, usize)>,
 }
 
-/// Per-process collection of ELF patching state, keyed by fd number.
-pub(crate) type ElfPatchCache = BTreeMap<i32, ElfPatchState>;
+/// Identity of a resolved filesystem descriptor.
+pub(crate) struct ElfPatchKey<Platform: ShimPlatform>(Arc<FileFd<Platform>>);
+
+impl<Platform: ShimPlatform> Clone for ElfPatchKey<Platform> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl<Platform: ShimPlatform> PartialEq for ElfPatchKey<Platform> {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl<Platform: ShimPlatform> Eq for ElfPatchKey<Platform> {}
+
+impl<Platform: ShimPlatform> PartialOrd for ElfPatchKey<Platform> {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<Platform: ShimPlatform> Ord for ElfPatchKey<Platform> {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        Arc::as_ptr(&self.0).cmp(&Arc::as_ptr(&other.0))
+    }
+}
+
+/// Per-process ELF patching state, keyed by retained descriptor identity.
+///
+/// TODO: Deferred patching currently assumes the descriptor remains open until its
+/// mappings gain `PROT_EXEC`. Closing the descriptor removes its entry even if
+/// mappings survive, so `mmap -> close -> mprotect(PROT_EXEC)` can skip patching.
+/// Supporting that sequence requires patch state to follow mapping lifetime,
+/// independently of descriptor lifetime.
+pub(crate) type ElfPatchCache<Platform> = BTreeMap<ElfPatchKey<Platform>, ElfPatchState>;
 
 #[inline]
 fn align_up(addr: usize, align: usize) -> usize {
@@ -103,9 +141,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         len: usize,
         prot: ProtFlags,
         flags: MapFlags,
-    ) -> Result<UserPtrMut<u8>, MappingError> {
+    ) -> Result<UserPtrMut<u8>, Errno> {
         let op = |_| Ok(0);
         self.do_mmap(suggested_addr, len, prot, flags, false, op)
+            .map_err(Errno::from)
     }
 
     fn do_mmap_file(
@@ -116,9 +155,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         flags: MapFlags,
         fd: i32,
         offset: usize,
-    ) -> Result<UserPtrMut<u8>, MappingError> {
+    ) -> Result<UserPtrMut<u8>, Errno> {
         let is_exec = prot.contains(ProtFlags::PROT_EXEC);
-        let typed_fd = self.typed_fd(fd).map_err(|_| MappingError::BadFD(fd))?;
+        let AnyTypedFd::Fs(typed_fd) = self.typed_fd(fd)? else {
+            return Err(Errno::ENODEV);
+        };
 
         // Perform the normal mmap first (CoW or memcpy fallback).
         let result = if let Some(cow_result) =
@@ -129,26 +170,34 @@ impl<Platform: ShimPlatform> Task<Platform> {
             self.do_mmap_file_memcpy(suggested_addr, len, prot, flags, &typed_fd, offset)?
         };
 
+        let patch_key = ElfPatchKey(typed_fd);
+
         // Runtime syscall rewriting: patch PROT_EXEC segments in-place.
         if is_exec {
             let syscall_entry = self.global.platform.get_syscall_entry_point();
             if syscall_entry != 0
-                && !self.maybe_patch_exec_segment(result, len, fd, syscall_entry, Some(offset))
+                && !self.maybe_patch_exec_segment(
+                    result,
+                    len,
+                    &patch_key,
+                    syscall_entry,
+                    Some(offset),
+                )
             {
                 // Trampoline setup failed for a pre-patched binary whose
                 // .text already contains JMPs to the trampoline address.
                 // Continuing would guarantee a SIGSEGV on the first
                 // rewritten syscall, so fail the mmap instead.
                 let _ = self.sys_munmap(result, len);
-                return Err(MappingError::OutOfMemory);
+                return Err(Errno::ENOMEM);
             }
         } else {
             // Ensure patch state is initialized for this fd (no-op if already done).
-            self.init_elf_patch_state(fd, result.as_usize(), offset);
+            self.init_elf_patch_state(&patch_key, result.as_usize(), offset);
             // Track non-exec file mappings so we can patch them if they later
             // gain PROT_EXEC via mprotect.
             let mut cache = self.global.elf_patch_cache.lock();
-            if let Some(state) = cache.get_mut(&fd) {
+            if let Some(state) = cache.get_mut(&patch_key) {
                 let mapping_key = (result.as_usize(), len);
                 // Overlapping entries are safe here: file_mappings is only used
                 // to know which (addr, len) ranges belong to this fd so we can
@@ -172,7 +221,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         len: usize,
         prot: &ProtFlags,
         flags: &MapFlags,
-        fd: &AnyTypedFd<Platform>,
+        fd: &FileFd<Platform>,
         offset: usize,
     ) -> Option<Result<UserPtrMut<u8>, MappingError>> {
         if !len.is_multiple_of(PAGE_SIZE) {
@@ -180,7 +229,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
 
         let files = self.files.borrow();
-        let static_data = files.fs.get_static_backing_data(fd.as_fs()?)?;
+        let static_data = files.fs.get_static_backing_data(fd)?;
 
         if offset > static_data.len() {
             return None;
@@ -259,7 +308,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         len: usize,
         prot: ProtFlags,
         flags: MapFlags,
-        fd: &AnyTypedFd<Platform>,
+        fd: &FileFd<Platform>,
         offset: usize,
     ) -> Result<UserPtrMut<u8>, MappingError> {
         let op = |ptr: UserPtrMut<u8>| -> Result<usize, MappingError> {
@@ -271,16 +320,19 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let mut buffer = [0; PAGE_SIZE];
             let mut copied = 0;
             while copied < len {
-                let size =
-                    self.do_read(fd, &mut buffer, Some(file_offset))
-                        .map_err(|e| match e {
-                            // The raw fd was resolved once at syscall entry and is intentionally
-                            // not retained; this payload is discarded when converted to EBADF.
-                            Errno::EBADF => MappingError::BadFD(-1),
-                            Errno::EISDIR => MappingError::NotAFile,
-                            Errno::EACCES => MappingError::NotForReading,
-                            _ => unimplemented!(),
-                        })?;
+                let size = self
+                    .files
+                    .borrow()
+                    .fs
+                    .read(fd, &mut buffer, Some(file_offset))
+                    .map_err(|e| match e {
+                        // The raw fd was resolved once at syscall entry and is intentionally
+                        // not retained; this payload is discarded when converted to EBADF.
+                        ReadError::ClosedFd => MappingError::BadFD(-1),
+                        ReadError::NotAFile => MappingError::NotAFile,
+                        ReadError::NotForReading => MappingError::NotForReading,
+                        _ => unimplemented!(),
+                    })?;
                 if size == 0 {
                     break;
                 }
@@ -361,7 +413,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         } else {
             self.do_mmap_file(suggested_addr, aligned_len, prot, flags, fd, offset)
         }
-        .map_err(Errno::from)
     }
 
     /// Handle syscall `munmap`
@@ -475,12 +526,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let mprotect_end = mprotect_start.saturating_add(len);
 
         // Find unpatched file mappings that overlap this mprotect range.
-        // We collect (fd, vaddr, seg_len, file_offset) to avoid holding
+        // We collect (descriptor identity, vaddr, seg_len) to avoid holding
         // the lock while patching.
-        let to_patch: alloc::vec::Vec<(i32, usize, usize)> = {
+        let to_patch: alloc::vec::Vec<(ElfPatchKey<Platform>, usize, usize)> = {
             let cache = self.global.elf_patch_cache.lock();
             let mut result = alloc::vec::Vec::new();
-            for (&fd, state) in cache.iter() {
+            for (fd, state) in cache.iter() {
                 if state.pre_patched {
                     continue;
                 }
@@ -488,7 +539,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     let seg_end = seg_start.saturating_add(seg_len);
                     // Check overlap with the mprotect range.
                     if seg_start < mprotect_end && seg_end > mprotect_start {
-                        result.push((fd, seg_start, seg_len));
+                        result.push((fd.clone(), seg_start, seg_len));
                     }
                 }
             }
@@ -498,10 +549,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // A single mprotect range should only overlap mappings from one fd
         // (a given vaddr range is backed by at most one file at a time).
         if to_patch.len() > 1 {
-            let fds: BTreeSet<i32> = to_patch.iter().map(|(fd, _, _)| *fd).collect();
+            let fds: BTreeSet<_> = to_patch
+                .iter()
+                .map(|(fd, _, _)| Arc::as_ptr(&fd.0) as usize)
+                .collect();
             if fds.len() > 1 {
                 litebox_util_log::warn!(
-                    addr:? = mprotect_start, len:? = len, fds:? = fds;
+                    addr:? = mprotect_start, len:? = len, count:? = fds.len();
                     "mprotect +EXEC range overlaps file mappings from multiple fds"
                 );
             }
@@ -520,7 +574,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 continue;
             }
             let mapped_addr = UserPtrMut::<u8>::from_usize(patch_start);
-            self.maybe_patch_exec_segment(mapped_addr, patch_len, fd, syscall_entry, None);
+            self.maybe_patch_exec_segment(mapped_addr, patch_len, &fd, syscall_entry, None);
         }
     }
 
@@ -537,15 +591,22 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// segment is being mapped so we can look up its `p_vaddr`.
     ///
     /// x86_64 only: assumes 64-bit ELF layout and program header offsets.
-    fn init_elf_patch_state(&self, fd: i32, mapped_addr: usize, file_offset: usize) {
+    fn init_elf_patch_state(
+        &self,
+        fd: &ElfPatchKey<Platform>,
+        mapped_addr: usize,
+        file_offset: usize,
+    ) {
         // Quick check: skip if already initialized.
-        if self.global.elf_patch_cache.lock().contains_key(&fd) {
+        let mut cache = self.global.elf_patch_cache.lock();
+        if cache.contains_key(fd) {
             return;
         }
+        let typed_fd = AnyTypedFd::Fs(Arc::clone(&fd.0));
 
         // Read the ELF header (64 bytes for Elf64).
         let mut ehdr_buf = [0u8; core::mem::size_of::<FileHeader64<LittleEndian>>()];
-        match self.sys_read(fd, &mut ehdr_buf, Some(0)) {
+        match self.do_read(&typed_fd, &mut ehdr_buf, Some(0)) {
             Ok(n) if n == ehdr_buf.len() => {}
             _ => return, // Not readable or short read, skip
         }
@@ -578,7 +639,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return; // Sanity check
         }
         let mut phdrs_buf = alloc::vec![0u8; phdrs_size];
-        match self.sys_read(fd, &mut phdrs_buf, Some(e_phoff)) {
+        match self.do_read(&typed_fd, &mut phdrs_buf, Some(e_phoff)) {
             Ok(n) if n == phdrs_buf.len() => {}
             _ => return,
         }
@@ -622,7 +683,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         // Check if file is pre-patched by reading the last 32 bytes for magic
         let (pre_patched, tramp_file_offset, tramp_vaddr, tramp_file_size) =
-            self.check_trampoline_magic(fd);
+            self.check_trampoline_magic(&typed_fd);
 
         // Compute the trampoline virtual address.
         // - Pre-patched: use the exact address from the trampoline header (the
@@ -652,27 +713,28 @@ impl<Platform: ShimPlatform> Task<Platform> {
             base + max_end.next_multiple_of(PAGE_SIZE)
         };
 
-        // Insert under lock (re-check for races).
-        let mut cache = self.global.elf_patch_cache.lock();
-        cache.entry(fd).or_insert(ElfPatchState {
-            pre_patched,
-            trampoline_file_offset: tramp_file_offset,
-            trampoline_file_size: tramp_file_size.trunc(),
-            trampoline_addr: trampoline_vaddr,
-            trampoline_cursor: 0,
-            trampoline_mapped: false,
-            trampoline_mapped_len: 0,
-            runtime_patches_committed: false,
-            file_mappings: BTreeSet::new(),
-            patched_ranges: BTreeSet::new(),
-        });
+        cache.insert(
+            fd.clone(),
+            ElfPatchState {
+                pre_patched,
+                trampoline_file_offset: tramp_file_offset,
+                trampoline_file_size: tramp_file_size.trunc(),
+                trampoline_addr: trampoline_vaddr,
+                trampoline_cursor: 0,
+                trampoline_mapped: false,
+                trampoline_mapped_len: 0,
+                runtime_patches_committed: false,
+                file_mappings: BTreeSet::new(),
+                patched_ranges: BTreeSet::new(),
+            },
+        );
     }
 
     /// Check if a file has the LITEBOX trampoline magic at its tail.
     /// Returns (is_pre_patched, file_offset, vaddr, trampoline_size).
-    fn check_trampoline_magic(&self, fd: i32) -> (bool, u64, u64, u64) {
+    fn check_trampoline_magic(&self, fd: &AnyTypedFd<Platform>) -> (bool, u64, u64, u64) {
         const HEADER_SIZE: usize = 32; // TrampolineHeader64: magic(8) + file_offset(8) + vaddr(8) + size(8)
-        let Ok(stat) = self.sys_fstat(fd) else {
+        let Ok(stat) = self.do_stat::<litebox_common_linux::FileStat>(fd) else {
             return (false, 0, 0, 0);
         };
         let file_size = stat.st_size;
@@ -680,7 +742,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return (false, 0, 0, 0);
         }
         let mut tail = [0u8; HEADER_SIZE];
-        match self.sys_read(fd, &mut tail, Some(file_size - HEADER_SIZE)) {
+        match self.do_read(fd, &mut tail, Some(file_size - HEADER_SIZE)) {
             Ok(n) if n == HEADER_SIZE => {}
             _ => return (false, 0, 0, 0),
         }
@@ -757,22 +819,22 @@ impl<Platform: ShimPlatform> Task<Platform> {
         &self,
         mapped_addr: UserPtrMut<u8>,
         len: usize,
-        fd: i32,
+        fd: &ElfPatchKey<Platform>,
         syscall_entry: usize,
         file_offset: Option<usize>,
     ) -> bool {
         // Initialize patch state if this is the first mmap for this fd.
         // Typically the first mapping is at offset 0 (the ELF header), but
         // some loaders may map an executable segment at a non-zero offset first.
-        if !self.global.elf_patch_cache.lock().contains_key(&fd) {
-            self.init_elf_patch_state(fd, mapped_addr.as_usize(), file_offset.unwrap_or(0));
+        if let Some(file_offset) = file_offset {
+            self.init_elf_patch_state(fd, mapped_addr.as_usize(), file_offset);
         }
 
         // This lock guards the elf_patch_cache and is held for the entire
         // patching operation. In practice this is fine because the dynamic
         // linker loads shared libraries sequentially.
         let mut cache = self.global.elf_patch_cache.lock();
-        let Some(state) = cache.get_mut(&fd) else {
+        let Some(state) = cache.get_mut(fd) else {
             return true; // No patch state — not an ELF we're tracking
         };
 
@@ -807,7 +869,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 let mut tramp_data = alloc::vec![0u8; state.trampoline_file_size];
                 let file_off = state.trampoline_file_offset.trunc();
                 let tramp_ptr = UserPtrMut::<u8>::from_usize(tramp_addr);
-                match self.sys_read(fd, &mut tramp_data, Some(file_off)) {
+                let typed_fd = AnyTypedFd::Fs(Arc::clone(&fd.0));
+                match self.do_read(&typed_fd, &mut tramp_data, Some(file_off)) {
                     Ok(n) if n == tramp_data.len() => {}
                     _ => {
                         let _ = self.sys_munmap_raw(tramp_ptr, tramp_len);
@@ -1090,10 +1153,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Finalize the ELF patching state for `fd`.
     ///
-    /// Removes the cache entry (preventing stale state if the fd is reused)
-    /// and unmaps any trampoline that was allocated but never used.
-    pub(crate) fn finalize_elf_patch(&self, fd: i32) {
-        let state = self.global.elf_patch_cache.lock().remove(&fd);
+    /// Removes the cache entry and unmaps any trampoline that was allocated but never used.
+    pub(crate) fn finalize_elf_patch(&self, fd: Arc<FileFd<Platform>>) {
+        let state = self.global.elf_patch_cache.lock().remove(&ElfPatchKey(fd));
         if let Some(state) = state
             && state.trampoline_mapped
             && !state.pre_patched

@@ -1197,7 +1197,7 @@ struct GlobalState<Platform: ShimPlatform> {
     /// UNIX domain socket address table
     unix_addr_table: litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable<Platform>>,
     /// Per-process collection of ELF patching state for runtime syscall rewriting.
-    elf_patch_cache: litebox::sync::Mutex<Platform, syscalls::mm::ElfPatchCache>,
+    elf_patch_cache: litebox::sync::Mutex<Platform, syscalls::mm::ElfPatchCache<Platform>>,
 }
 
 struct Task<Platform: ShimPlatform> {
