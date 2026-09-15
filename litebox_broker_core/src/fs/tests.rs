@@ -4,7 +4,7 @@
 //! Filesystem semantics for the broker-core resolver and its backends.
 //!
 //! These tests drive the resolver and the backends directly. There is deliberately no broker
-//! session, transport, or guest descriptor table involved: the semantics under test are owned by
+//! process, transport, or guest descriptor table involved: the semantics under test are owned by
 //! broker core.
 
 use alloc::borrow::Cow;
@@ -1813,8 +1813,8 @@ mod devices {
         )
     }
 
-    /// Stdio devices hold no data of their own: every non-empty transfer needs the session's
-    /// device I/O, and fails when the session cannot service it.
+    /// Stdio devices hold no data of their own: every non-empty transfer needs the process's
+    /// device I/O, and fails when the process cannot service it.
     #[test]
     fn stdio_requires_broker() {
         let fs = devices_fs();

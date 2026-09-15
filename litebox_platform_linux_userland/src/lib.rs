@@ -326,35 +326,6 @@ impl LinuxUserland {
         reserved_pages
     }
 
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "panicking only on failures of documented linux contracts"
-    )]
-    pub fn init_task(&self) -> litebox_common_linux::TaskParams {
-        let tid = unsafe { syscalls::raw::syscall0(syscalls::Sysno::gettid) }
-            .try_into()
-            .unwrap();
-        let ppid = unsafe { syscalls::raw::syscall0(syscalls::Sysno::getppid) }
-            .try_into()
-            .unwrap();
-        litebox_common_linux::TaskParams {
-            pid: tid,
-            ppid,
-            uid: unsafe { syscalls::raw::syscall0(syscalls::Sysno::getuid) }
-                .try_into()
-                .unwrap(),
-            euid: unsafe { syscalls::raw::syscall0(syscalls::Sysno::geteuid) }
-                .try_into()
-                .unwrap(),
-            gid: unsafe { syscalls::raw::syscall0(syscalls::Sysno::getgid) }
-                .try_into()
-                .unwrap(),
-            egid: unsafe { syscalls::raw::syscall0(syscalls::Sysno::getegid) }
-                .try_into()
-                .unwrap(),
-        }
-    }
-
     #[allow(
         clippy::missing_panics_doc,
         reason = "the seccomp filter rules are hardcoded and not expected to fail"

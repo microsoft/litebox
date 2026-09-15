@@ -43,6 +43,8 @@ const REQUEST_TAG_SOCKET: u8 = 5;
 const REQUEST_TAG_FILL_RANDOM: u8 = 6;
 const REQUEST_TAG_STDIO: u8 = 7;
 const REQUEST_TAG_FILE: u8 = 8;
+const REQUEST_TAG_CREATE_THREAD: u8 = 9;
+const REQUEST_TAG_EXIT_THREAD: u8 = 10;
 
 // Paired request and successful-response tags intentionally share values.
 const RESPONSE_TAG_NEGOTIATED: u8 = 0;
@@ -54,6 +56,8 @@ const RESPONSE_TAG_SOCKET: u8 = 5;
 const RESPONSE_TAG_RANDOM_FILLED: u8 = 6;
 const RESPONSE_TAG_STDIO: u8 = 7;
 const RESPONSE_TAG_FILE: u8 = 8;
+const RESPONSE_TAG_THREAD_CREATED: u8 = 9;
+const RESPONSE_TAG_THREAD_EXITED: u8 = 10;
 
 // Reserve the top of the tag space for responses without paired requests.
 const RESPONSE_TAG_ERROR: u8 = 253;
@@ -110,7 +114,9 @@ pub fn decode_handshake_request(frame: &[u8]) -> Result<BrokerHandshakeRequest, 
         | REQUEST_TAG_SOCKET
         | REQUEST_TAG_FILL_RANDOM
         | REQUEST_TAG_STDIO
-        | REQUEST_TAG_FILE => {
+        | REQUEST_TAG_FILE
+        | REQUEST_TAG_CREATE_THREAD
+        | REQUEST_TAG_EXIT_THREAD => {
             return Err(WireError::WrongMessagePhase);
         }
         _ => return Err(WireError::InvalidTag),
@@ -130,6 +136,15 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
         operation,
     } = request;
     match operation {
+        BrokerOperation::CreateThread => {
+            encoder.u8(REQUEST_TAG_CREATE_THREAD);
+            encoder.request_id(request_id);
+        }
+        BrokerOperation::ExitThread(thread_id) => {
+            encoder.u8(REQUEST_TAG_EXIT_THREAD);
+            encoder.request_id(request_id);
+            encoder.thread_id(thread_id);
+        }
         BrokerOperation::CloseObject(handle) => {
             encoder.u8(REQUEST_TAG_CLOSE_OBJECT);
             encoder.request_id(request_id);
@@ -187,11 +202,15 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         | REQUEST_TAG_SOCKET
         | REQUEST_TAG_FILL_RANDOM
         | REQUEST_TAG_STDIO
-        | REQUEST_TAG_FILE => {}
+        | REQUEST_TAG_FILE
+        | REQUEST_TAG_CREATE_THREAD
+        | REQUEST_TAG_EXIT_THREAD => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
     let operation = match tag {
+        REQUEST_TAG_CREATE_THREAD => BrokerOperation::CreateThread,
+        REQUEST_TAG_EXIT_THREAD => BrokerOperation::ExitThread(decoder.thread_id()?),
         REQUEST_TAG_CLOSE_OBJECT => BrokerOperation::CloseObject(decoder.handle()?),
         REQUEST_TAG_CHECK_READINESS => BrokerOperation::CheckReadiness(decoder.handle()?),
         REQUEST_TAG_EVENT => BrokerOperation::Event(event::decode_event_request(&mut decoder)?),
@@ -218,9 +237,11 @@ pub fn encode_handshake_response(response: BrokerHandshakeResponse) -> Vec<u8> {
     match response {
         BrokerHandshakeResponse::Negotiated {
             broker_protocol_version,
+            process_id,
         } => {
             encoder.u8(RESPONSE_TAG_NEGOTIATED);
             encoder.protocol_version(broker_protocol_version);
+            encoder.process_id(process_id);
         }
         BrokerHandshakeResponse::VersionMismatch {
             broker_protocol_version,
@@ -243,6 +264,7 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
     let response = match tag {
         RESPONSE_TAG_NEGOTIATED => BrokerHandshakeResponse::Negotiated {
             broker_protocol_version: decoder.protocol_version()?,
+            process_id: decoder.process_id()?,
         },
         RESPONSE_TAG_EVENT
         | RESPONSE_TAG_OBJECT_CLOSED
@@ -252,7 +274,9 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
         | RESPONSE_TAG_SOCKET
         | RESPONSE_TAG_RANDOM_FILLED
         | RESPONSE_TAG_STDIO
-        | RESPONSE_TAG_FILE => {
+        | RESPONSE_TAG_FILE
+        | RESPONSE_TAG_THREAD_CREATED
+        | RESPONSE_TAG_THREAD_EXITED => {
             return Err(WireError::WrongMessagePhase);
         }
         RESPONSE_TAG_VERSION_MISMATCH => BrokerHandshakeResponse::VersionMismatch {
@@ -275,6 +299,15 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
     let mut encoder = Encoder::default();
     let BrokerResponse { request_id, result } = response;
     match result {
+        BrokerResult::ThreadCreated(thread_id) => {
+            encoder.u8(RESPONSE_TAG_THREAD_CREATED);
+            encoder.request_id(request_id);
+            encoder.thread_id(thread_id);
+        }
+        BrokerResult::ThreadExited => {
+            encoder.u8(RESPONSE_TAG_THREAD_EXITED);
+            encoder.request_id(request_id);
+        }
         BrokerResult::ObjectClosed => {
             encoder.u8(RESPONSE_TAG_OBJECT_CLOSED);
             encoder.request_id(request_id);
@@ -338,7 +371,9 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         | RESPONSE_TAG_SOCKET
         | RESPONSE_TAG_RANDOM_FILLED
         | RESPONSE_TAG_STDIO
-        | RESPONSE_TAG_FILE => {}
+        | RESPONSE_TAG_FILE
+        | RESPONSE_TAG_THREAD_CREATED
+        | RESPONSE_TAG_THREAD_EXITED => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -347,6 +382,8 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         RESPONSE_TAG_PIPE => BrokerResult::Pipe(pipe::decode_pipe_response(&mut decoder)?),
         RESPONSE_TAG_SOCKET => BrokerResult::Socket(socket::decode_socket_response(&mut decoder)?),
         RESPONSE_TAG_ERROR => BrokerResult::Error(decode_error_code(&mut decoder)?),
+        RESPONSE_TAG_THREAD_CREATED => BrokerResult::ThreadCreated(decoder.thread_id()?),
+        RESPONSE_TAG_THREAD_EXITED => BrokerResult::ThreadExited,
         RESPONSE_TAG_OBJECT_CLOSED => BrokerResult::ObjectClosed,
         RESPONSE_TAG_READINESS => BrokerResult::Readiness(ReadinessFlags(decoder.u32()?)),
         RESPONSE_TAG_RANDOM_FILLED => BrokerResult::RandomFilled,
@@ -463,11 +500,19 @@ mod tests {
         IsTerminalStdioRequest, IsTerminalStdioResponse, ReadStdioRequest, ReadStdioResponse,
         StdioOutputStream, StdioStream, WriteStdioRequest, WriteStdioResponse,
     };
-    use crate::{ObjectHandle, ProtocolVersion, RequestId};
+    use crate::{ObjectHandle, ProcessId, ProtocolVersion, RequestId, ThreadId};
     use core::net::{Ipv4Addr, SocketAddrV4};
     use core::num::NonZeroU64;
 
     const TEST_REQUEST_ID: RequestId = RequestId(0x0102_0304_0506_0708);
+
+    fn process_id(id: u32) -> ProcessId {
+        ProcessId(id)
+    }
+
+    fn thread_id(id: u32) -> ThreadId {
+        ThreadId(id)
+    }
 
     fn sequence(slot_index: u32, length: u32) -> SharedBufferSequence {
         SharedBufferSequence::new(&[SharedBufferSlotIndex(slot_index)], length).unwrap()
@@ -551,6 +596,8 @@ mod tests {
         )
         .unwrap();
         let operations = [
+            BrokerOperation::CreateThread,
+            BrokerOperation::ExitThread(thread_id(17)),
             BrokerOperation::CloseObject(handle),
             BrokerOperation::CheckReadiness(handle),
             BrokerOperation::Event(EventRequest::Create(CreateEventRequest {
@@ -926,6 +973,16 @@ mod tests {
                 request
             );
         }
+        for thread_id in [ThreadId(0), ThreadId(u32::MAX)] {
+            let request = BrokerRequest {
+                request_id: TEST_REQUEST_ID,
+                operation: BrokerOperation::ExitThread(thread_id),
+            };
+            assert_eq!(
+                decode_request(&encode_request(request.clone())).unwrap(),
+                request
+            );
+        }
     }
 
     #[test]
@@ -933,6 +990,11 @@ mod tests {
         let responses = [
             BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: ProtocolVersion(1),
+                process_id: process_id(1),
+            },
+            BrokerHandshakeResponse::Negotiated {
+                broker_protocol_version: ProtocolVersion(1),
+                process_id: process_id(7),
             },
             BrokerHandshakeResponse::VersionMismatch {
                 broker_protocol_version: ProtocolVersion(1),
@@ -953,6 +1015,8 @@ mod tests {
     fn response_codec_round_trips_all_variants() {
         let handle = ObjectHandle(13);
         let results = [
+            BrokerResult::ThreadCreated(thread_id(17)),
+            BrokerResult::ThreadExited,
             BrokerResult::ObjectClosed,
             BrokerResult::Readiness(ReadinessFlags::READ),
             BrokerResult::Readiness(ReadinessFlags::WRITE),
@@ -1117,6 +1181,16 @@ mod tests {
             let response = BrokerResponse {
                 request_id,
                 result: BrokerResult::ObjectClosed,
+            };
+            assert_eq!(
+                decode_response(&encode_response(response.clone())).unwrap(),
+                response
+            );
+        }
+        for thread_id in [ThreadId(0), ThreadId(u32::MAX)] {
+            let response = BrokerResponse {
+                request_id: TEST_REQUEST_ID,
+                result: BrokerResult::ThreadCreated(thread_id),
             };
             assert_eq!(
                 decode_response(&encode_response(response.clone())).unwrap(),
@@ -1580,6 +1654,7 @@ mod tests {
 
         let mut frame = encode_handshake_response(BrokerHandshakeResponse::Negotiated {
             broker_protocol_version: ProtocolVersion(1),
+            process_id: process_id(1),
         });
         frame.push(0xff);
         assert_eq!(
@@ -1597,6 +1672,7 @@ mod tests {
         for response in [
             BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: ProtocolVersion(1),
+                process_id: process_id(1),
             },
             BrokerHandshakeResponse::VersionMismatch {
                 broker_protocol_version: ProtocolVersion(1),

@@ -21,11 +21,12 @@ extern crate std;
 mod error;
 pub mod event;
 pub mod fs;
+mod id;
 pub mod pipe;
 mod policy;
+mod process;
 pub mod random;
 pub mod readiness;
-mod session;
 pub mod socket;
 pub mod stdio;
 
@@ -34,109 +35,137 @@ mod test_platform;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use hashbrown::HashMap;
-use litebox_broker_protocol::ObjectHandle;
-use spin::rwlock::RwLock;
+use litebox_broker_protocol::{ObjectHandle, ProcessId};
+use spin::{Mutex, rwlock::RwLock};
 
 pub use error::BrokerError;
 use fs::FileService;
+use id::{IdAllocator, MAX_ALLOCATED_ID};
 pub use policy::{
     DestinationPortRange, DestinationRule, Ipv4Cidr, MAX_DESTINATION_RULES, PolicyEngine,
     PolicyProfile, SocketPolicy, SocketPolicyError,
 };
-use random::RandomProvider;
-use session::ObjectReference;
-pub use session::{
-    AssociationCancellation, BrokerSession, CallerCredential, ObjectRights, SessionId,
+use process::ObjectReference;
+pub use process::{
+    AssociationCancellation, BrokerProcess, BrokerThread, CallerCredential, ObjectRights,
 };
+use random::RandomProvider;
 use socket::{BrokerSocketPorts, SocketProvider};
 use stdio::StdioProvider;
 
 /// BrokerCore result type.
 pub type Result<T> = core::result::Result<T, BrokerError>;
 
-/// Broker-wide ceilings and per-session quotas for broker-owned authority state.
+/// Broker-wide ceilings and per-process quotas for broker-owned authority state.
 ///
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct BrokerCoreLimits {
-    /// Maximum live object references across all sessions.
+    /// Maximum live object references across all processes.
     pub max_references: usize,
-    /// Maximum live object references owned by one session.
-    pub max_references_per_session: usize,
-    /// Maximum total capacity in bytes reserved by live pipes across all sessions.
+    /// Maximum live object references owned by one process.
+    pub max_references_per_process: usize,
+    /// Maximum total capacity in bytes reserved by live pipes across all processes.
     pub max_total_pipe_capacity: usize,
-    /// Maximum capacity in bytes reserved by live pipes created by one session.
-    pub max_pipe_capacity_per_session: usize,
-    /// Maximum live platform socket resources across all sessions.
+    /// Maximum capacity in bytes reserved by live pipes created by one process.
+    pub max_pipe_capacity_per_process: usize,
+    /// Maximum live platform socket resources across all processes.
     pub max_sockets: usize,
-    /// Maximum live platform socket resources owned by one session.
-    pub max_sockets_per_session: usize,
+    /// Maximum live platform socket resources owned by one process.
+    pub max_sockets_per_process: usize,
+    /// Maximum live broker-allocated thread IDs.
+    pub max_threads: usize,
+    /// Maximum live broker-allocated thread IDs owned by one process.
+    pub max_threads_per_process: usize,
 }
 
 impl BrokerCoreLimits {
-    /// Conservative default limits that allow four sessions to reach each
+    /// Conservative default limits that allow four processes to reach each
     /// broker-wide ceiling only when all four spend their full quotas.
     pub const DEFAULT: Self = Self {
         max_references: 4096,
-        max_references_per_session: 1024,
+        max_references_per_process: 1024,
         max_total_pipe_capacity: 64 * 1024 * 1024,
-        max_pipe_capacity_per_session: 16 * 1024 * 1024,
+        max_pipe_capacity_per_process: 16 * 1024 * 1024,
         max_sockets: 1024,
-        max_sockets_per_session: 256,
+        max_sockets_per_process: 256,
+        max_threads: 4096,
+        max_threads_per_process: 1024,
     };
 
     /// Creates a broker core limit set.
     ///
-    /// The reference and pipe-capacity session quotas initially match their
-    /// broker-wide limits. Use [`Self::with_session_quotas`] to override them.
+    /// The reference and pipe-capacity process quotas initially match their
+    /// broker-wide limits. Use [`Self::with_process_quotas`] to override them.
     pub const fn new(max_references: usize, max_total_pipe_capacity: usize) -> Self {
         Self {
             max_references,
-            max_references_per_session: max_references,
+            max_references_per_process: max_references,
             max_total_pipe_capacity,
-            max_pipe_capacity_per_session: max_total_pipe_capacity,
+            max_pipe_capacity_per_process: max_total_pipe_capacity,
             max_sockets: Self::DEFAULT.max_sockets,
-            max_sockets_per_session: Self::DEFAULT.max_sockets_per_session,
+            max_sockets_per_process: Self::DEFAULT.max_sockets_per_process,
+            max_threads: Self::DEFAULT.max_threads,
+            max_threads_per_process: Self::DEFAULT.max_threads_per_process,
         }
     }
 
     /// Creates a broker core limit set with explicit socket limits.
     ///
-    /// The reference and pipe-capacity session quotas initially match their
-    /// broker-wide limits. Use [`Self::with_session_quotas`] to override them.
+    /// The reference and pipe-capacity process quotas initially match their
+    /// broker-wide limits. Use [`Self::with_process_quotas`] to override them.
     pub const fn new_with_all_limits(
         max_references: usize,
         max_total_pipe_capacity: usize,
         max_sockets: usize,
-        max_sockets_per_session: usize,
+        max_sockets_per_process: usize,
     ) -> Self {
         Self {
             max_references,
-            max_references_per_session: max_references,
+            max_references_per_process: max_references,
             max_total_pipe_capacity,
-            max_pipe_capacity_per_session: max_total_pipe_capacity,
+            max_pipe_capacity_per_process: max_total_pipe_capacity,
             max_sockets,
-            max_sockets_per_session,
+            max_sockets_per_process,
+            max_threads: Self::DEFAULT.max_threads,
+            max_threads_per_process: Self::DEFAULT.max_threads_per_process,
         }
     }
 
-    /// Returns these limits with explicit per-session reference and pipe-capacity quotas.
+    /// Returns these limits with explicit per-process reference and pipe-capacity quotas.
     ///
     /// A quota above its broker-wide limit is accepted; the broker-wide limit
     /// still applies, so the effective limit is the smaller value.
     #[must_use]
-    pub const fn with_session_quotas(
+    pub const fn with_process_quotas(
         self,
-        max_references_per_session: usize,
-        max_pipe_capacity_per_session: usize,
+        max_references_per_process: usize,
+        max_pipe_capacity_per_process: usize,
     ) -> Self {
         Self {
-            max_references_per_session,
-            max_pipe_capacity_per_session,
+            max_references_per_process,
+            max_pipe_capacity_per_process,
+            ..self
+        }
+    }
+
+    /// Returns these limits with explicit broker-wide and per-process thread quotas.
+    ///
+    /// A per-process quota above the broker-wide limit is accepted; the
+    /// broker-wide limit still applies.
+    #[must_use]
+    pub const fn with_thread_quotas(
+        self,
+        max_threads: usize,
+        max_threads_per_process: usize,
+    ) -> Self {
+        Self {
+            max_threads,
+            max_threads_per_process,
             ..self
         }
     }
@@ -157,7 +186,10 @@ impl Default for BrokerCoreLimits {
 pub struct BrokerCore {
     pub(crate) policy: Arc<PolicyEngine>,
     pub(crate) limits: BrokerCoreLimits,
-    pub(crate) next_session_id: Arc<RwLock<u64>>,
+    pub(crate) ids: Arc<Mutex<IdAllocator>>,
+    pub(crate) processes: Arc<RwLock<HashMap<ProcessId, Weak<BrokerProcess>>>>,
+    /// Number of broker threads created and not normally retired.
+    pub(crate) active_thread_count: Arc<AtomicUsize>,
     pub(crate) next_reference_handle: Arc<RwLock<u64>>,
     pub(crate) references: Arc<RwLock<HashMap<ObjectHandle, ObjectReference>>>,
     pub(crate) pending_references: Arc<AtomicUsize>,
@@ -200,6 +232,7 @@ impl BrokerCore {
         stdio_provider: Arc<dyn StdioProvider>,
         fs: Arc<dyn FileService>,
     ) -> Result<Self> {
+        let ids = IdAllocator::new(MAX_ALLOCATED_ID)?;
         BROKER_CORE_CREATED
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| BrokerError::BrokerCoreAlreadyExists)?;
@@ -207,7 +240,9 @@ impl BrokerCore {
         Ok(Self {
             policy: Arc::new(policy),
             limits,
-            next_session_id: Arc::new(RwLock::new(1)),
+            ids: Arc::new(Mutex::new(ids)),
+            processes: Arc::new(RwLock::new(HashMap::new())),
+            active_thread_count: Arc::new(AtomicUsize::new(0)),
             next_reference_handle: Arc::new(RwLock::new(1)),
             references: Arc::new(RwLock::new(HashMap::new())),
             pending_references: Arc::new(AtomicUsize::new(0)),
@@ -253,17 +288,32 @@ impl BrokerCore {
         Ok((first, second))
     }
 
-    /// Allocates broker authority state for one authenticated caller session.
-    pub fn create_session(&self, caller_credential: CallerCredential) -> Result<BrokerSession> {
-        let mut next_session_id = self.next_session_id.write();
-        let session_id = *next_session_id;
-        *next_session_id = session_id
-            .checked_add(1)
-            .ok_or(BrokerError::ResourceExhausted)?;
-        Ok(BrokerSession::new(
+    /// Allocates and registers one authenticated broker process.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the shared ID allocator violates its range or uniqueness
+    /// invariants.
+    pub fn create_process(
+        &self,
+        caller_credential: CallerCredential,
+    ) -> Result<Arc<BrokerProcess>> {
+        let mut processes = self.processes.write();
+        processes
+            .try_reserve(1)
+            .map_err(|_| BrokerError::OutOfMemory)?;
+        let raw_id = self.ids.lock().allocate()?;
+        let id = ProcessId(raw_id);
+        let process = Arc::new(BrokerProcess::new(
             self.clone(),
-            SessionId(session_id),
+            id,
+            None,
             caller_credential,
-        ))
+        ));
+        assert!(
+            processes.insert(id, Arc::downgrade(&process)).is_none(),
+            "the ID allocator returned an occupied process ID"
+        );
+        Ok(process)
     }
 }

@@ -10,15 +10,15 @@ use crate::pipe::PipeObject;
 use crate::socket::SocketObject;
 use crate::{BrokerCore, BrokerError, Result};
 use hashbrown::HashMap;
-use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::readiness::ReadinessFlags;
+use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
 use spin::{Mutex, rwlock::RwLock};
 
 /// Caller identity information supplied by the broker entry layer.
 ///
 /// The first userland proof of concept does not authenticate Unix-socket peers,
 /// but BrokerCore still accepts an explicit credential value so authenticated
-/// servers or hosts can plumb identity through the same session-creation seam.
+/// servers or hosts can plumb identity through the same process-creation seam.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum CallerCredential {
@@ -27,11 +27,6 @@ pub enum CallerCredential {
     /// Explicit deployment mode for the initial unauthenticated userland POC.
     Unauthenticated,
 }
-
-/// Broker-assigned session identity.
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SessionId(pub u64);
 
 /// Cancellation state shared by potentially blocking operations in one broker
 /// association.
@@ -64,9 +59,9 @@ bitflags::bitflags! {
 
 pub(crate) struct ObjectReference {
     pub(crate) object: Arc<RwLock<ObjectEntry>>,
-    pub(crate) session_id: SessionId,
+    pub(crate) owner: ProcessId,
     pub(crate) rights: ObjectRights,
-    session_reference_index: usize,
+    process_reference_index: usize,
 }
 
 pub(crate) enum ObjectEntry {
@@ -77,57 +72,166 @@ pub(crate) enum ObjectEntry {
     Socket(SocketObject),
 }
 
-struct SessionReferences {
+struct ProcessReferences {
     handles: Vec<ObjectHandle>,
     pending_handles: usize,
 }
 
-/// Broker-owned authority token for one authenticated caller session.
+/// Broker-owned state for one guest thread.
 ///
-/// User mode does not choose this value. The broker entry layer authenticates
-/// the caller, then BrokerCore assigns this identity for all operations received
-/// on that session. Dropping the session releases all object references it owns.
-pub struct BrokerSession {
+/// Execution remains platform-local. This object owns the authoritative
+/// broker identity and is the extension point for execution-control state when
+/// a broker platform needs to manage thread execution.
+pub struct BrokerThread {
+    id: ThreadId,
+}
+
+impl BrokerThread {
+    const fn new(id: ThreadId) -> Self {
+        Self { id }
+    }
+
+    /// Returns the assigned thread ID.
+    #[must_use]
+    pub const fn id(&self) -> ThreadId {
+        self.id
+    }
+}
+
+/// Broker-owned state for one authenticated guest process.
+///
+/// User mode cannot choose the process ID. The broker entry layer authenticates
+/// the caller, then [`BrokerCore`] creates and registers this object before
+/// serving its association.
+pub struct BrokerProcess {
     pub(crate) core: BrokerCore,
-    /// Broker-assigned session identity.
-    pub(crate) session_id: SessionId,
-    /// Broker-entry-authenticated caller credential for this session.
+    /// Assigned process ID and internal authority.
+    pub(crate) id: ProcessId,
+    cleaned_up: bool,
+    /// Authoritative parent process ID, absent for a root process.
+    parent_id: Option<ProcessId>,
+    /// Broker-entry-authenticated caller credential for this process.
     pub(crate) caller_credential: CallerCredential,
-    /// Handles of the live object references owned by this session.
-    references: Mutex<SessionReferences>,
-    /// Pipe capacity charged to this session by live pipe objects.
+    /// Handles of the live object references owned by this process.
+    references: Mutex<ProcessReferences>,
+    /// Authoritative broker threads owned by this process.
+    threads: Mutex<HashMap<ThreadId, BrokerThread>>,
+    /// Pipe capacity charged to this process by live pipe objects.
     pub(crate) reserved_pipe_capacity: Arc<AtomicUsize>,
     /// Socket quota held by pending, live, and closing in-flight resources.
     pub(crate) reserved_sockets: Arc<AtomicUsize>,
-    /// Cancellation state for potentially blocking operations in this session.
+    /// Cancellation state for potentially blocking operations in this process.
     pub(crate) cancellation: AssociationCancellation,
 }
 
-impl BrokerSession {
-    /// Creates an authenticated session identity.
+impl BrokerProcess {
+    /// Creates authenticated broker process state.
     pub(crate) fn new(
         core: BrokerCore,
-        session_id: SessionId,
+        id: ProcessId,
+        parent_id: Option<ProcessId>,
         caller_credential: CallerCredential,
     ) -> Self {
         Self {
             core,
-            session_id,
+            id,
+            cleaned_up: false,
+            parent_id,
             caller_credential,
-            references: Mutex::new(SessionReferences {
+            references: Mutex::new(ProcessReferences {
                 handles: Vec::new(),
                 pending_handles: 0,
             }),
+            threads: Mutex::new(HashMap::new()),
             reserved_pipe_capacity: Arc::new(AtomicUsize::new(0)),
             reserved_sockets: Arc::new(AtomicUsize::new(0)),
             cancellation: AssociationCancellation::default(),
         }
     }
 
+    /// Returns the assigned process ID.
+    #[must_use]
+    pub const fn id(&self) -> ProcessId {
+        self.id
+    }
+
+    /// Returns the current parent process ID, if any.
+    #[must_use]
+    pub const fn parent_id(&self) -> Option<ProcessId> {
+        self.parent_id
+    }
+
+    /// Creates a broker thread belonging to this process.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the shared ID allocator violates its range or uniqueness
+    /// invariants.
+    pub fn create_thread(&self) -> Result<ThreadId> {
+        let mut threads = self.threads.lock();
+        if threads.len() >= self.core.limits.max_threads_per_process {
+            return Err(BrokerError::ResourceExhausted);
+        }
+        threads
+            .try_reserve(1)
+            .map_err(|_| BrokerError::OutOfMemory)?;
+        self.core
+            .active_thread_count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                (count < self.core.limits.max_threads).then(|| count + 1)
+            })
+            .map_err(|_| BrokerError::ResourceExhausted)?;
+        let raw_id = match self.core.ids.lock().allocate() {
+            Ok(id) => id,
+            Err(error) => {
+                self.core
+                    .active_thread_count
+                    .fetch_sub(1, Ordering::Relaxed);
+                return Err(error);
+            }
+        };
+        let thread = BrokerThread::new(ThreadId(raw_id));
+        let thread_id = thread.id();
+        assert!(
+            threads.insert(thread_id, thread).is_none(),
+            "the ID allocator returned an occupied thread ID"
+        );
+        Ok(thread_id)
+    }
+
+    /// Records broker thread exit after its local task teardown completes.
+    pub fn exit_thread(&self, thread_id: ThreadId) -> Result<()> {
+        let thread = self
+            .threads
+            .lock()
+            .remove(&thread_id)
+            .ok_or(BrokerError::UnknownObject)?;
+        self.core
+            .active_thread_count
+            .fetch_sub(1, Ordering::Relaxed);
+        self.core.ids.lock().release(thread.id().0);
+        Ok(())
+    }
+
     /// Requests cooperative cancellation of potentially blocking operations
     /// because this association is ending.
     pub fn request_cancellation(&self) {
         self.cancellation.cancel();
+    }
+
+    /// Completes non-unwinding process teardown and releases its IDs.
+    ///
+    /// Dropping a process without calling this method performs authority
+    /// cleanup but leaves its numeric IDs occupied so they cannot be reused
+    /// after an unwind.
+    /// # Panics
+    ///
+    /// Panics if another owner still holds this process.
+    pub fn finish(self: Arc<Self>) {
+        let Ok(mut process) = Arc::try_unwrap(self) else {
+            panic!("all broker process owners must be released before teardown");
+        };
+        process.cleanup(true);
     }
 
     pub(crate) fn create_object_reference(&self, object: ObjectEntry) -> Result<ObjectHandle> {
@@ -144,8 +248,8 @@ impl BrokerSession {
         object: Arc<RwLock<ObjectEntry>>,
         rights: ObjectRights,
     ) -> Result<ObjectHandle> {
-        let mut session_references = self.references.lock();
-        self.prepare_session_references(&mut session_references, 1)?;
+        let mut process_references = self.references.lock();
+        self.prepare_process_references(&mut process_references, 1)?;
         let mut references = self.core.references.write();
         let preparation = (|| {
             let pending = self.core.pending_references.load(Ordering::Relaxed);
@@ -173,13 +277,13 @@ impl BrokerSession {
             Ok(handle) => handle,
             Err(error) => {
                 drop(references);
-                drop(session_references);
+                drop(process_references);
                 return Err(error);
             }
         };
         self.insert_object_reference(
             &mut references,
-            &mut session_references.handles,
+            &mut process_references.handles,
             handle,
             object,
             rights,
@@ -188,22 +292,22 @@ impl BrokerSession {
         Ok(handle)
     }
 
-    /// Duplicates a supported object reference into another session.
+    /// Duplicates a supported object reference into another process.
     ///
     /// The returned handle is owned by `target` and refers to the same
     /// underlying event, file, or pipe endpoint. `rights` must be nonempty, allowed by
     /// the target's policy, and no broader than the source reference's rights.
     /// The source reference is unchanged. Socket references are not supported
-    /// because their readiness registration is currently bound to one session
+    /// because their readiness registration is currently bound to one process
     /// and handle.
     ///
-    /// Pipe capacity remains charged to the session that created the pipe.
+    /// Pipe capacity remains charged to the process that created the pipe.
     /// Child creation must call this operation explicitly according to the
     /// guest operating system's inheritance semantics.
     pub fn duplicate_object_reference_to(
         &self,
         handle: ObjectHandle,
-        target: &BrokerSession,
+        target: &BrokerProcess,
         rights: ObjectRights,
     ) -> Result<ObjectHandle> {
         if rights.is_empty() {
@@ -213,7 +317,7 @@ impl BrokerSession {
         let object = {
             let references = self.core.references.read();
             let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
-            if reference.session_id != self.session_id {
+            if reference.owner != self.id {
                 return Err(BrokerError::UnknownObject);
             }
             if !reference.rights.contains(rights) {
@@ -252,8 +356,8 @@ impl BrokerSession {
             .principal_object_rights(self.caller_credential)?;
         let first = Arc::new(RwLock::new(first));
         let second = Arc::new(RwLock::new(second));
-        let mut session_references = self.references.lock();
-        self.prepare_session_references(&mut session_references, 2)?;
+        let mut process_references = self.references.lock();
+        self.prepare_process_references(&mut process_references, 2)?;
         let mut references = self.core.references.write();
         let preparation = (|| {
             let pending = self.core.pending_references.load(Ordering::Relaxed);
@@ -285,14 +389,14 @@ impl BrokerSession {
             Ok(handles) => handles,
             Err(error) => {
                 drop(references);
-                drop(session_references);
+                drop(process_references);
                 return Err(error);
             }
         };
         for (handle, object) in [(first_handle, first), (second_handle, second)] {
             self.insert_object_reference(
                 &mut references,
-                &mut session_references.handles,
+                &mut process_references.handles,
                 handle,
                 object,
                 rights,
@@ -306,8 +410,8 @@ impl BrokerSession {
         rights: ObjectRights,
     ) -> Result<PendingObjectReference<'_>> {
         let object = Arc::new(RwLock::new(ObjectEntry::Reserved));
-        let mut session_references = self.references.lock();
-        let next_session_pending = self.prepare_session_references(&mut session_references, 1)?;
+        let mut process_references = self.references.lock();
+        let next_process_pending = self.prepare_process_references(&mut process_references, 1)?;
         let mut references = self.core.references.write();
         let pending_references = self.core.pending_references.load(Ordering::Relaxed);
         if references
@@ -334,9 +438,9 @@ impl BrokerSession {
                 pending.checked_add(1)
             })
             .map_err(|_| BrokerError::ResourceExhausted)?;
-        session_references.pending_handles = next_session_pending;
+        process_references.pending_handles = next_process_pending;
         Ok(PendingObjectReference {
-            session: self,
+            process: self,
             handle,
             rights,
             object,
@@ -344,24 +448,24 @@ impl BrokerSession {
         })
     }
 
-    fn prepare_session_references(
+    fn prepare_process_references(
         &self,
-        session_references: &mut SessionReferences,
+        process_references: &mut ProcessReferences,
         additional: usize,
     ) -> Result<usize> {
-        let pending_and_additional = session_references
+        let pending_and_additional = process_references
             .pending_handles
             .checked_add(additional)
             .ok_or(BrokerError::ResourceExhausted)?;
-        if session_references
+        if process_references
             .handles
             .len()
             .checked_add(pending_and_additional)
-            .is_none_or(|count| count > self.core.limits.max_references_per_session)
+            .is_none_or(|count| count > self.core.limits.max_references_per_process)
         {
             return Err(BrokerError::ResourceExhausted);
         }
-        session_references
+        process_references
             .handles
             .try_reserve(pending_and_additional)
             .map_err(|_| BrokerError::OutOfMemory)?;
@@ -376,14 +480,14 @@ impl BrokerSession {
         object: Arc<RwLock<ObjectEntry>>,
         rights: ObjectRights,
     ) {
-        let session_reference_index = reference_handles.len();
+        let process_reference_index = reference_handles.len();
         references.insert(
             handle,
             ObjectReference {
                 object,
-                session_id: self.session_id,
+                owner: self.id,
                 rights,
-                session_reference_index,
+                process_reference_index,
             },
         );
         reference_handles.push(handle);
@@ -402,7 +506,7 @@ impl BrokerSession {
     ) -> Result<Arc<RwLock<ObjectEntry>>> {
         let references = self.core.references.read();
         let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
-        if reference.session_id != self.session_id {
+        if reference.owner != self.id {
             return Err(BrokerError::UnknownObject);
         }
         if !reference.rights.contains(required_rights) {
@@ -419,7 +523,7 @@ impl BrokerSession {
         debug_assert!(!allowed_rights.is_empty());
         let references = self.core.references.read();
         let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
-        if reference.session_id != self.session_id {
+        if reference.owner != self.id {
             return Err(BrokerError::UnknownObject);
         }
         if !reference.rights.intersects(allowed_rights) {
@@ -444,7 +548,7 @@ impl BrokerSession {
         Ok(socket.readiness())
     }
 
-    /// Closes one object reference owned by this session.
+    /// Closes one object reference owned by this process.
     ///
     /// The underlying object is released when this was the last live reference.
     /// Destruction happens after releasing the process-wide reference-table
@@ -456,18 +560,18 @@ impl BrokerSession {
     }
 
     fn remove_object_reference(&self, handle: ObjectHandle) -> Result<ObjectReference> {
-        let mut session_references = self.references.lock();
-        let reference_handles = &mut session_references.handles;
+        let mut process_references = self.references.lock();
+        let reference_handles = &mut process_references.handles;
         let mut references = self.core.references.write();
         let reference = references
             .remove(&handle)
             .ok_or(BrokerError::UnknownObject)?;
-        let index = reference.session_reference_index;
+        let index = reference.process_reference_index;
         // Keep fallible validation in a nested scope so `?` and early returns
         // reach the shared rollback below instead of dropping the removed
         // reference while either reference-index lock is held.
         let removal_result = (|| {
-            if reference.session_id != self.session_id {
+            if reference.owner != self.id {
                 return Err(BrokerError::UnknownObject);
             }
             if reference_handles.get(index) != Some(&handle) {
@@ -484,12 +588,12 @@ impl BrokerSession {
                 let moved_reference = references
                     .get_mut(&moved_handle)
                     .ok_or(BrokerError::Internal)?;
-                if moved_reference.session_id != self.session_id
-                    || moved_reference.session_reference_index != last_index
+                if moved_reference.owner != self.id
+                    || moved_reference.process_reference_index != last_index
                 {
                     return Err(BrokerError::Internal);
                 }
-                moved_reference.session_reference_index = index;
+                moved_reference.process_reference_index = index;
             }
             reference_handles.swap_remove(index);
             Ok(())
@@ -498,7 +602,7 @@ impl BrokerSession {
         if let Err(error) = removal_result {
             let replaced_reference = references.insert(handle, reference);
             drop(references);
-            drop(session_references);
+            drop(process_references);
             if replaced_reference.is_some() {
                 return Err(BrokerError::Internal);
             }
@@ -506,10 +610,87 @@ impl BrokerSession {
         }
         Ok(reference)
     }
+
+    fn cleanup(&mut self, release_ids: bool) -> bool {
+        if self.cleaned_up {
+            return false;
+        }
+        self.cleaned_up = true;
+
+        let mut invariant_fault = self.references.lock().pending_handles != 0;
+        loop {
+            let Some(handle) = self.references.lock().handles.pop() else {
+                break;
+            };
+            // Do not restore an inconsistent handle: retrying it forever would
+            // prevent later valid references from being released.
+            let reference = {
+                let mut references = self.core.references.write();
+                let Some(reference) = references.get(&handle) else {
+                    invariant_fault = true;
+                    continue;
+                };
+                if reference.owner != self.id {
+                    invariant_fault = true;
+                    continue;
+                }
+                let Some(reference) = references.remove(&handle) else {
+                    invariant_fault = true;
+                    continue;
+                };
+                reference
+            };
+            // Object destruction may release platform resources and must never
+            // run while either reference index lock is held.
+            drop(reference);
+        }
+
+        loop {
+            let stale = {
+                let references = self.core.references.read();
+                references
+                    .iter()
+                    .find_map(|(handle, reference)| (reference.owner == self.id).then_some(*handle))
+            };
+            let Some(handle) = stale else {
+                break;
+            };
+            invariant_fault = true;
+            let reference = self.core.references.write().remove(&handle);
+            drop(reference);
+        }
+        debug_assert!(
+            !self
+                .core
+                .references
+                .read()
+                .values()
+                .any(|reference| reference.owner == self.id)
+        );
+
+        self.core.socket_provider.close_process(self.id);
+
+        if self.core.processes.write().remove(&self.id).is_none() {
+            invariant_fault = true;
+        }
+
+        let threads = core::mem::take(&mut *self.threads.lock());
+        if release_ids && !invariant_fault {
+            self.core
+                .active_thread_count
+                .fetch_sub(threads.len(), Ordering::Relaxed);
+            let mut ids = self.core.ids.lock();
+            for thread in threads.into_values() {
+                ids.release(thread.id().0);
+            }
+            ids.release(self.id.0);
+        }
+        invariant_fault
+    }
 }
 
-pub(crate) struct PendingObjectReference<'session> {
-    session: &'session BrokerSession,
+pub(crate) struct PendingObjectReference<'process> {
+    process: &'process BrokerProcess,
     handle: ObjectHandle,
     rights: ObjectRights,
     object: Arc<RwLock<ObjectEntry>>,
@@ -525,27 +706,27 @@ impl PendingObjectReference<'_> {
         if !matches!(&*self.object.read(), ObjectEntry::Reserved) {
             return Err(BrokerError::Internal);
         }
-        let mut session_references = self.session.references.lock();
-        let mut references = self.session.core.references.write();
+        let mut process_references = self.process.references.lock();
+        let mut references = self.process.core.references.write();
         if references.contains_key(&self.handle) {
             drop(references);
-            drop(session_references);
+            drop(process_references);
             return Err(BrokerError::Internal);
         }
         if !release_pending_reference(
-            &self.session.core.pending_references,
-            &mut session_references,
+            &self.process.core.pending_references,
+            &mut process_references,
         ) {
             self.active = false;
             drop(references);
-            drop(session_references);
+            drop(process_references);
             return Err(BrokerError::Internal);
         }
         self.active = false;
         *self.object.write() = object;
-        self.session.insert_object_reference(
+        self.process.insert_object_reference(
             &mut references,
-            &mut session_references.handles,
+            &mut process_references.handles,
             self.handle,
             Arc::clone(&self.object),
             self.rights,
@@ -557,10 +738,10 @@ impl PendingObjectReference<'_> {
 impl Drop for PendingObjectReference<'_> {
     fn drop(&mut self) {
         if self.active {
-            let mut session_references = self.session.references.lock();
+            let mut process_references = self.process.references.lock();
             let released = release_pending_reference(
-                &self.session.core.pending_references,
-                &mut session_references,
+                &self.process.core.pending_references,
+                &mut process_references,
             );
             self.active = false;
             assert!(
@@ -573,46 +754,23 @@ impl Drop for PendingObjectReference<'_> {
 
 fn release_pending_reference(
     core_pending_references: &AtomicUsize,
-    session_references: &mut SessionReferences,
+    process_references: &mut ProcessReferences,
 ) -> bool {
-    let next_pending_handles = session_references.pending_handles.checked_sub(1);
+    let next_pending_handles = process_references.pending_handles.checked_sub(1);
     let core_released = core_pending_references
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
             pending.checked_sub(1)
         })
         .is_ok();
     if let Some(next_pending_handles) = next_pending_handles {
-        session_references.pending_handles = next_pending_handles;
+        process_references.pending_handles = next_pending_handles;
     }
     next_pending_handles.is_some() && core_released
 }
 
-impl Drop for BrokerSession {
+impl Drop for BrokerProcess {
     fn drop(&mut self) {
-        loop {
-            let Some(handle) = self.references.lock().handles.pop() else {
-                break;
-            };
-            // Do not restore an inconsistent handle: retrying it forever would
-            // prevent later valid references from being released.
-            let reference = {
-                let mut references = self.core.references.write();
-                let Some(reference) = references.get(&handle) else {
-                    continue;
-                };
-                if reference.session_id != self.session_id {
-                    continue;
-                }
-                let Some(reference) = references.remove(&handle) else {
-                    continue;
-                };
-                reference
-            };
-            // Object destruction may release platform resources and must never
-            // run while either reference index lock is held.
-            drop(reference);
-        }
-        self.core.socket_provider.close_session(self.session_id);
+        let _ = self.cleanup(false);
     }
 }
 
@@ -620,7 +778,7 @@ impl Drop for BrokerSession {
 mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{SessionReferences, release_pending_reference};
+    use super::{ProcessReferences, release_pending_reference};
     use crate::test_platform::TestPlatform;
     use crate::test_support::{TestBrokerCoreBuilder, TestStdioProvider};
     use crate::{
@@ -638,41 +796,226 @@ mod tests {
 
     const TEST_MAX_REFERENCES: usize = 4;
     const TEST_MAX_PIPE_CAPACITY: usize = 8;
-    const TEST_MAX_REFERENCES_PER_SESSION: usize = 2;
-    const TEST_MAX_PIPE_CAPACITY_PER_SESSION: usize = 4;
+    const TEST_MAX_REFERENCES_PER_PROCESS: usize = 2;
+    const TEST_MAX_PIPE_CAPACITY_PER_PROCESS: usize = 4;
     const ROOT: FileUser = FileUser { user: 0, group: 0 };
+
+    #[test]
+    fn process_and_thread_ids_share_one_numeric_namespace() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        let first = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let thread = first.create_thread().unwrap();
+        let second = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+
+        assert_eq!(first.id().0, 1);
+        assert_eq!(first.parent_id(), None);
+        assert_eq!(thread.0, 2);
+        assert_eq!(second.id().0, 3);
+        assert_eq!(second.parent_id(), None);
+    }
+
+    #[test]
+    fn released_thread_id_is_reused_after_rotation() {
+        let mut broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        broker.ids =
+            alloc::sync::Arc::new(spin::Mutex::new(crate::id::IdAllocator::new(2).unwrap()));
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let first = process.create_thread().unwrap();
+
+        process.exit_thread(first).unwrap();
+
+        assert_eq!(process.create_thread().unwrap(), first);
+    }
+
+    #[test]
+    fn process_cannot_release_another_process_thread_id() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        let first = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let second = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let thread = first.create_thread().unwrap();
+
+        assert_eq!(second.exit_thread(thread), Err(BrokerError::UnknownObject));
+        assert_eq!(first.exit_thread(thread), Ok(()));
+    }
+
+    #[test]
+    fn thread_quotas_are_global_and_per_process() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .with_limits(BrokerCoreLimits::DEFAULT.with_thread_quotas(2, 1))
+        .build()
+        .unwrap();
+        let first = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let second = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let third = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let first_thread = first.create_thread().unwrap();
+        let second_thread = second.create_thread().unwrap();
+
+        assert_eq!(first.create_thread(), Err(BrokerError::ResourceExhausted));
+        assert_eq!(third.create_thread(), Err(BrokerError::ResourceExhausted));
+
+        first.exit_thread(first_thread).unwrap();
+        assert!(third.create_thread().is_ok());
+        second.exit_thread(second_thread).unwrap();
+    }
+
+    #[test]
+    fn finish_removes_process_and_releases_owned_ids() {
+        let mut broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        broker.ids =
+            alloc::sync::Arc::new(spin::Mutex::new(crate::id::IdAllocator::new(2).unwrap()));
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let process_id = process.id();
+        let thread_id = process.create_thread().unwrap();
+        assert_eq!(broker.active_thread_count.load(Ordering::Relaxed), 1);
+        let registered = broker
+            .processes
+            .read()
+            .get(&process_id)
+            .and_then(alloc::sync::Weak::upgrade)
+            .unwrap();
+        assert!(Arc::ptr_eq(&process, &registered));
+        drop(registered);
+
+        process.finish();
+        assert!(!broker.processes.read().contains_key(&process_id));
+        assert_eq!(broker.active_thread_count.load(Ordering::Relaxed), 0);
+
+        let replacement = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        assert_eq!(replacement.id(), process_id);
+        assert_eq!(replacement.create_thread().unwrap(), thread_id);
+    }
+
+    #[test]
+    fn fallback_drop_retains_process_and_thread_ids_and_quota() {
+        let mut broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .with_limits(BrokerCoreLimits::DEFAULT.with_thread_quotas(1, 1))
+        .build()
+        .unwrap();
+        broker.ids =
+            alloc::sync::Arc::new(spin::Mutex::new(crate::id::IdAllocator::new(4).unwrap()));
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let process_id = process.id();
+        let thread_id = process.create_thread().unwrap();
+
+        drop(process);
+        assert_eq!(broker.active_thread_count.load(Ordering::Relaxed), 1);
+
+        let first_replacement = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let second_replacement = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        assert_ne!(first_replacement.id(), process_id);
+        assert_ne!(first_replacement.id().0, thread_id.0);
+        assert_ne!(second_replacement.id(), process_id);
+        assert_ne!(second_replacement.id().0, thread_id.0);
+        assert_eq!(
+            first_replacement.create_thread(),
+            Err(BrokerError::ResourceExhausted)
+        );
+        assert!(matches!(
+            broker.create_process(CallerCredential::Unauthenticated),
+            Err(BrokerError::ResourceExhausted)
+        ));
+    }
+
+    #[test]
+    fn drop_sweeps_unindexed_references_and_leaves_id_occupied() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let process_id = process.id();
+        crate::event::create(&process, 1).unwrap();
+        process.references.lock().handles.clear();
+
+        drop(process);
+
+        assert!(broker.references.read().is_empty());
+        let replacement = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        assert_ne!(replacement.id(), process_id);
+    }
 
     #[test]
     fn pending_reference_release_checks_both_counters() {
         let core_pending_references = AtomicUsize::new(1);
-        let mut session_references = SessionReferences {
+        let mut process_references = ProcessReferences {
             handles: Vec::new(),
             pending_handles: 1,
         };
         assert!(release_pending_reference(
             &core_pending_references,
-            &mut session_references
+            &mut process_references
         ));
         assert_eq!(core_pending_references.load(Ordering::Relaxed), 0);
-        assert_eq!(session_references.pending_handles, 0);
+        assert_eq!(process_references.pending_handles, 0);
 
         assert!(!release_pending_reference(
             &core_pending_references,
-            &mut session_references
+            &mut process_references
         ));
         assert_eq!(core_pending_references.load(Ordering::Relaxed), 0);
-        assert_eq!(session_references.pending_handles, 0);
+        assert_eq!(process_references.pending_handles, 0);
     }
 
-    fn check_supported_references_duplicate_between_sessions(broker: &BrokerCore) {
+    fn check_supported_references_duplicate_between_processes(broker: &BrokerCore) {
         let source = broker
-            .create_session(CallerCredential::Unauthenticated)
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let target = broker
-            .create_session(CallerCredential::Unauthenticated)
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let denied_target = broker
-            .create_session(CallerCredential::HostGuaranteed)
+            .create_process(CallerCredential::HostGuaranteed)
             .unwrap();
 
         let event = crate::event::create(&source, 1).unwrap();
@@ -729,10 +1072,10 @@ mod tests {
 
     fn check_file_reference_lifecycle(broker: &BrokerCore, stdio_provider: &TestStdioProvider) {
         let source = broker
-            .create_session(CallerCredential::Unauthenticated)
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let target = broker
-            .create_session(CallerCredential::Unauthenticated)
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let mode = FileMode::from_bits(0o600).unwrap();
         let file = crate::fs::open(
@@ -972,9 +1315,9 @@ mod tests {
                 2,
                 1,
             )
-            .with_session_quotas(
-                TEST_MAX_REFERENCES_PER_SESSION,
-                TEST_MAX_PIPE_CAPACITY_PER_SESSION,
+            .with_process_quotas(
+                TEST_MAX_REFERENCES_PER_PROCESS,
+                TEST_MAX_PIPE_CAPACITY_PER_PROCESS,
             ),
         )
         .with_socket_provider(socket_provider.clone())
@@ -987,16 +1330,16 @@ mod tests {
         .unwrap();
 
         check_event_reference_lifecycle(&broker);
-        check_session_drop_releases_references(&broker);
+        check_process_drop_releases_references(&broker);
         check_pipe_lifecycle(&broker);
         check_pipe_reader_closure(&broker);
         check_corrupt_index_fails_without_mutation(&broker);
         check_corrupt_index_does_not_break_teardown(&broker);
-        check_reference_quota_is_per_session(&broker);
-        check_pending_references_count_toward_session_quota(&broker);
-        check_pipe_capacity_quota_is_per_session(&broker);
-        check_pipe_capacity_outlives_session_for_in_flight_object(&broker);
-        check_supported_references_duplicate_between_sessions(&broker);
+        check_reference_quota_is_per_process(&broker);
+        check_pending_references_count_toward_process_quota(&broker);
+        check_pipe_capacity_quota_is_per_process(&broker);
+        check_pipe_capacity_outlives_process_for_in_flight_object(&broker);
+        check_supported_references_duplicate_between_processes(&broker);
         check_file_reference_lifecycle(&broker, &stdio_provider);
         crate::socket::tests::check_socket_lifecycle(&broker, &socket_provider);
         check_pair_handle_exhaustion(&broker);
@@ -1006,18 +1349,18 @@ mod tests {
     }
 
     fn check_event_reference_lifecycle(broker: &BrokerCore) {
-        let session = broker
-            .create_session(CallerCredential::Unauthenticated)
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let other = broker
-            .create_session(CallerCredential::Unauthenticated)
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
-        let handle = crate::event::create(&session, 0).unwrap();
+        let handle = crate::event::create(&process, 0).unwrap();
         let unknown_handle = ObjectHandle(handle.0.checked_add(1).unwrap());
 
         assert_ne!(unknown_handle, handle);
         assert_eq!(
-            session.check_readiness(unknown_handle),
+            process.check_readiness(unknown_handle),
             Err(BrokerError::UnknownObject)
         );
 
@@ -1026,52 +1369,52 @@ mod tests {
             Err(BrokerError::UnknownObject)
         );
 
-        assert_eq!(session.check_readiness(handle), Ok(ReadinessFlags::WRITE));
+        assert_eq!(process.check_readiness(handle), Ok(ReadinessFlags::WRITE));
         assert_eq!(
-            crate::event::add(&session, handle, 1),
+            crate::event::add(&process, handle, 1),
             Ok(ReadinessFlags::READ | ReadinessFlags::WRITE)
         );
         assert_eq!(
-            crate::event::consume(&session, handle, EventConsumeMode::One),
+            crate::event::consume(&process, handle, EventConsumeMode::One),
             Ok(EventConsumption {
                 value: 1,
                 readiness: ReadinessFlags::WRITE,
             })
         );
-        let second_handle = crate::event::create(&session, 0).unwrap();
+        let second_handle = crate::event::create(&process, 0).unwrap();
         assert_eq!(
-            crate::event::create(&session, 0),
+            crate::event::create(&process, 0),
             Err(BrokerError::ResourceExhausted)
         );
         assert_eq!(
-            crate::pipe::create(&session, 4, 2),
+            crate::pipe::create(&process, 4, 2),
             Err(BrokerError::ResourceExhausted)
         );
-        assert_eq!(session.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
+        assert_eq!(process.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
         // Closing the older handle exercises swap-removing a non-last entry.
-        assert_eq!(session.close_object_reference(handle), Ok(()));
+        assert_eq!(process.close_object_reference(handle), Ok(()));
         assert_eq!(
-            session.close_object_reference(handle),
+            process.close_object_reference(handle),
             Err(BrokerError::UnknownObject)
         );
-        assert_eq!(session.close_object_reference(second_handle), Ok(()));
+        assert_eq!(process.close_object_reference(second_handle), Ok(()));
         assert!(broker.references.read().is_empty());
     }
 
-    fn check_session_drop_releases_references(broker: &BrokerCore) {
-        let session = broker
-            .create_session(CallerCredential::Unauthenticated)
+    fn check_process_drop_releases_references(broker: &BrokerCore) {
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
-        let first = crate::event::create(&session, 0).unwrap();
-        let second = crate::event::create(&session, 0).unwrap();
+        let first = crate::event::create(&process, 0).unwrap();
+        let second = crate::event::create(&process, 0).unwrap();
         assert_ne!(first, second);
         {
             let references = broker.references.read();
             assert_eq!(references.len(), 2);
         }
 
-        drop(session);
+        drop(process);
 
         {
             let references = broker.references.read();
@@ -1080,120 +1423,120 @@ mod tests {
     }
 
     fn check_pipe_lifecycle(broker: &BrokerCore) {
-        let session = broker
-            .create_session(CallerCredential::Unauthenticated)
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         assert_eq!(
-            crate::pipe::create(&session, 5, 2),
+            crate::pipe::create(&process, 5, 2),
             Err(BrokerError::ResourceExhausted)
         );
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
-        let (reader, writer) = crate::pipe::create(&session, 4, 2).unwrap();
+        let (reader, writer) = crate::pipe::create(&process, 4, 2).unwrap();
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 4);
         assert_eq!(
-            session.check_readiness(reader),
+            process.check_readiness(reader),
             Ok(ReadinessFlags::default())
         );
         assert_eq!(
-            crate::pipe::read(&session, reader, 1),
+            crate::pipe::read(&process, reader, 1),
             Err(BrokerError::WouldBlock)
         );
-        assert_eq!(crate::pipe::write(&session, writer, &[1, 2]), Ok(2));
-        assert_eq!(crate::pipe::write(&session, writer, &[3, 4, 5]), Ok(2));
+        assert_eq!(crate::pipe::write(&process, writer, &[1, 2]), Ok(2));
+        assert_eq!(crate::pipe::write(&process, writer, &[3, 4, 5]), Ok(2));
         assert_eq!(
-            crate::pipe::write(&session, writer, &[5]),
+            crate::pipe::write(&process, writer, &[5]),
             Err(BrokerError::WouldBlock)
         );
         assert_eq!(
-            crate::pipe::read(&session, reader, 3),
+            crate::pipe::read(&process, reader, 3),
             Ok(std::vec::Vec::from([1, 2, 3]))
         );
-        assert_eq!(crate::pipe::write(&session, writer, &[5, 6]), Ok(2));
-        assert_eq!(session.close_object_reference(writer), Ok(()));
+        assert_eq!(crate::pipe::write(&process, writer, &[5, 6]), Ok(2));
+        assert_eq!(process.close_object_reference(writer), Ok(()));
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 4);
         assert_eq!(
-            session.check_readiness(reader),
+            process.check_readiness(reader),
             Ok(ReadinessFlags::READ | ReadinessFlags::HANGUP)
         );
         assert_eq!(
-            crate::pipe::read(&session, reader, 4),
+            crate::pipe::read(&process, reader, 4),
             Ok(std::vec::Vec::from([4, 5, 6]))
         );
         assert_eq!(
-            crate::pipe::read(&session, reader, 1),
+            crate::pipe::read(&process, reader, 1),
             Ok(std::vec::Vec::new())
         );
-        assert_eq!(session.close_object_reference(reader), Ok(()));
+        assert_eq!(process.close_object_reference(reader), Ok(()));
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
     }
 
     fn check_pipe_reader_closure(broker: &BrokerCore) {
-        let session = broker
-            .create_session(CallerCredential::Unauthenticated)
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
-        let (reader, writer) = crate::pipe::create(&session, 4, 2).unwrap();
+        let (reader, writer) = crate::pipe::create(&process, 4, 2).unwrap();
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 4);
-        assert_eq!(session.close_object_reference(reader), Ok(()));
-        assert_eq!(crate::pipe::write(&session, writer, &[]), Ok(0));
+        assert_eq!(process.close_object_reference(reader), Ok(()));
+        assert_eq!(crate::pipe::write(&process, writer, &[]), Ok(0));
         assert_eq!(
-            crate::pipe::write(&session, writer, &[1]),
+            crate::pipe::write(&process, writer, &[1]),
             Err(BrokerError::PeerClosed)
         );
         assert_eq!(
-            session.check_readiness(writer),
+            process.check_readiness(writer),
             Ok(ReadinessFlags::WRITE | ReadinessFlags::ERROR)
         );
-        assert_eq!(session.close_object_reference(writer), Ok(()));
+        assert_eq!(process.close_object_reference(writer), Ok(()));
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
     }
 
     fn check_corrupt_index_fails_without_mutation(broker: &BrokerCore) {
-        let session = broker
-            .create_session(CallerCredential::Unauthenticated)
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
-        let older = crate::event::create(&session, 0).unwrap();
-        let newer = crate::event::create(&session, 0).unwrap();
+        let older = crate::event::create(&process, 0).unwrap();
+        let newer = crate::event::create(&process, 0).unwrap();
         {
             let mut references = broker.references.write();
-            references.get_mut(&older).unwrap().session_reference_index = usize::MAX;
+            references.get_mut(&older).unwrap().process_reference_index = usize::MAX;
         }
 
         assert_eq!(
-            session.close_object_reference(older),
+            process.close_object_reference(older),
             Err(BrokerError::Internal)
         );
         {
             let mut references = broker.references.write();
-            references.get_mut(&older).unwrap().session_reference_index = 0;
+            references.get_mut(&older).unwrap().process_reference_index = 0;
         }
-        assert_eq!(session.close_object_reference(older), Ok(()));
-        assert_eq!(session.close_object_reference(newer), Ok(()));
+        assert_eq!(process.close_object_reference(older), Ok(()));
+        assert_eq!(process.close_object_reference(newer), Ok(()));
     }
 
     fn check_corrupt_index_does_not_break_teardown(broker: &BrokerCore) {
-        let session = broker
-            .create_session(CallerCredential::Unauthenticated)
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
-        let _older = crate::event::create(&session, 0).unwrap();
-        let newer = crate::event::create(&session, 0).unwrap();
+        let _older = crate::event::create(&process, 0).unwrap();
+        let newer = crate::event::create(&process, 0).unwrap();
         broker
             .references
             .write()
             .get_mut(&newer)
             .unwrap()
-            .session_reference_index = usize::MAX;
+            .process_reference_index = usize::MAX;
 
-        drop(session);
+        drop(process);
 
         assert!(broker.references.read().is_empty());
     }
 
-    fn check_reference_quota_is_per_session(broker: &BrokerCore) {
+    fn check_reference_quota_is_per_process(broker: &BrokerCore) {
         let greedy = broker
-            .create_session(CallerCredential::Unauthenticated)
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let neighbor = broker
-            .create_session(CallerCredential::Unauthenticated)
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
 
         let greedy_first = crate::event::create(&greedy, 0).unwrap();
@@ -1208,7 +1551,7 @@ mod tests {
         assert_eq!(broker.references.read().len(), TEST_MAX_REFERENCES);
 
         let latecomer = broker
-            .create_session(CallerCredential::Unauthenticated)
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         assert_eq!(
             crate::event::create(&latecomer, 0),
@@ -1225,22 +1568,22 @@ mod tests {
         assert!(broker.references.read().is_empty());
     }
 
-    fn check_pending_references_count_toward_session_quota(broker: &BrokerCore) {
-        let session = broker
-            .create_session(CallerCredential::Unauthenticated)
+    fn check_pending_references_count_toward_process_quota(broker: &BrokerCore) {
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let neighbor = broker
-            .create_session(CallerCredential::Unauthenticated)
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
 
-        let first = session
+        let first = process
             .reserve_object_reference(ObjectRights::WAIT)
             .unwrap();
-        let second = session
+        let second = process
             .reserve_object_reference(ObjectRights::WAIT)
             .unwrap();
         assert!(matches!(
-            session.reserve_object_reference(ObjectRights::WAIT),
+            process.reserve_object_reference(ObjectRights::WAIT),
             Err(BrokerError::ResourceExhausted)
         ));
 
@@ -1252,34 +1595,34 @@ mod tests {
         assert_eq!(broker.pending_references.load(Ordering::Relaxed), 0);
     }
 
-    fn check_pipe_capacity_quota_is_per_session(broker: &BrokerCore) {
+    fn check_pipe_capacity_quota_is_per_process(broker: &BrokerCore) {
         let greedy = broker
-            .create_session(CallerCredential::Unauthenticated)
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let neighbor = broker
-            .create_session(CallerCredential::Unauthenticated)
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
 
         let (greedy_reader, greedy_writer) =
-            crate::pipe::create(&greedy, TEST_MAX_PIPE_CAPACITY_PER_SESSION as u64, 2).unwrap();
+            crate::pipe::create(&greedy, TEST_MAX_PIPE_CAPACITY_PER_PROCESS as u64, 2).unwrap();
         assert_eq!(
             crate::pipe::create(&greedy, 1, 1),
             Err(BrokerError::ResourceExhausted)
         );
         assert_eq!(
             greedy.reserved_pipe_capacity.load(Ordering::Relaxed),
-            TEST_MAX_PIPE_CAPACITY_PER_SESSION
+            TEST_MAX_PIPE_CAPACITY_PER_PROCESS
         );
 
         let (neighbor_reader, neighbor_writer) =
-            crate::pipe::create(&neighbor, TEST_MAX_PIPE_CAPACITY_PER_SESSION as u64, 2).unwrap();
+            crate::pipe::create(&neighbor, TEST_MAX_PIPE_CAPACITY_PER_PROCESS as u64, 2).unwrap();
         assert_eq!(
             broker.reserved_pipe_capacity.load(Ordering::Relaxed),
             TEST_MAX_PIPE_CAPACITY
         );
 
         let latecomer = broker
-            .create_session(CallerCredential::Unauthenticated)
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         assert_eq!(
             crate::pipe::create(&latecomer, 1, 1),
@@ -1297,54 +1640,54 @@ mod tests {
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
     }
 
-    fn check_pipe_capacity_outlives_session_for_in_flight_object(broker: &BrokerCore) {
-        let session = broker
-            .create_session(CallerCredential::Unauthenticated)
+    fn check_pipe_capacity_outlives_process_for_in_flight_object(broker: &BrokerCore) {
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let (reader, _writer) =
-            crate::pipe::create(&session, TEST_MAX_PIPE_CAPACITY_PER_SESSION as u64, 2).unwrap();
-        let object = session
+            crate::pipe::create(&process, TEST_MAX_PIPE_CAPACITY_PER_PROCESS as u64, 2).unwrap();
+        let object = process
             .authorized_object(reader, ObjectRights::WAIT)
             .unwrap();
-        let session_capacity = Arc::clone(&session.reserved_pipe_capacity);
+        let process_capacity = Arc::clone(&process.reserved_pipe_capacity);
 
-        drop(session);
+        drop(process);
 
         assert!(broker.references.read().is_empty());
         assert_eq!(
-            session_capacity.load(Ordering::Relaxed),
-            TEST_MAX_PIPE_CAPACITY_PER_SESSION
+            process_capacity.load(Ordering::Relaxed),
+            TEST_MAX_PIPE_CAPACITY_PER_PROCESS
         );
         assert_eq!(
             broker.reserved_pipe_capacity.load(Ordering::Relaxed),
-            TEST_MAX_PIPE_CAPACITY_PER_SESSION
+            TEST_MAX_PIPE_CAPACITY_PER_PROCESS
         );
 
         drop(object);
 
-        assert_eq!(session_capacity.load(Ordering::Relaxed), 0);
+        assert_eq!(process_capacity.load(Ordering::Relaxed), 0);
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
     }
 
     fn check_pair_handle_exhaustion(broker: &BrokerCore) {
-        let session = broker
-            .create_session(CallerCredential::Unauthenticated)
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         {
             let mut next_reference_handle = broker.next_reference_handle.write();
             *next_reference_handle = u64::MAX - 1;
         }
         assert_eq!(
-            crate::pipe::create(&session, 4, 2),
+            crate::pipe::create(&process, 4, 2),
             Err(BrokerError::ResourceExhausted)
         );
         assert_eq!(*broker.next_reference_handle.read(), u64::MAX - 1);
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
-        let handle = crate::event::create(&session, 0).unwrap();
+        let handle = crate::event::create(&process, 0).unwrap();
         assert_eq!(handle, ObjectHandle(u64::MAX - 1));
-        assert_eq!(session.close_object_reference(handle), Ok(()));
+        assert_eq!(process.close_object_reference(handle), Ok(()));
         assert_eq!(
-            crate::event::create(&session, 0),
+            crate::event::create(&process, 0),
             Err(BrokerError::ResourceExhausted)
         );
     }

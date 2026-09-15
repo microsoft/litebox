@@ -29,6 +29,7 @@ pub struct InProcessBrokerSetup {
     broker: BrokerCore,
     memory: Arc<InProcessSharedMemory>,
     readiness: Arc<InProcessReadinessSink>,
+    association: Option<BrokerHostAssociation<'static, Arc<InProcessSharedMemory>>>,
 }
 
 impl InProcessBrokerSetup {
@@ -38,6 +39,7 @@ impl InProcessBrokerSetup {
             broker,
             memory: Arc::new(InProcessSharedMemory::new()),
             readiness: Arc::new(InProcessReadinessSink::default()),
+            association: None,
         }
     }
 
@@ -57,20 +59,11 @@ impl InProcessBrokerSetup {
     ///
     /// Panics if the fixed test shared-memory layout is invalid or the canned
     /// unauthenticated host setup cannot establish the association.
-    pub fn activate(self) -> InProcessBrokerChannel {
-        let shared_buffers = Box::leak(Box::new(
-            SharedBufferPool::new(self.memory, SHARED_BUFFER_LAYOUT)
-                .expect("the in-process shared-buffer layout must be valid"),
-        ));
-        let association = crate::setup_connection(
-            &self.broker,
-            &mut InProcessHostSetup,
-            shared_buffers,
-            self.readiness,
-            |_| Ok(()),
-        )
-        .expect("the in-process broker setup must succeed")
-        .expect("the in-process broker must accept the connection");
+    pub fn activate(mut self) -> InProcessBrokerChannel {
+        let association = self
+            .association
+            .take()
+            .expect("the in-process local endpoint must negotiate before activation");
         InProcessBrokerChannel { association }
     }
 }
@@ -89,9 +82,29 @@ impl LocalSetupChannel for InProcessBrokerSetup {
     fn recv_handshake_response(
         &mut self,
     ) -> core::result::Result<Option<BrokerHandshakeResponse>, Self::Error> {
-        Ok(Some(BrokerHandshakeResponse::Negotiated {
-            broker_protocol_version: BROKER_PROTOCOL_VERSION,
-        }))
+        assert!(
+            self.association.is_none(),
+            "the in-process broker association must be negotiated only once"
+        );
+        let shared_buffers = Box::leak(Box::new(
+            SharedBufferPool::new(Arc::clone(&self.memory), SHARED_BUFFER_LAYOUT)
+                .expect("the in-process shared-buffer layout must be valid"),
+        ));
+        let mut host_setup = InProcessHostSetup { response: None };
+        let readiness: Arc<dyn ReadinessSink> = self.readiness.clone();
+        let association = crate::setup_connection(
+            &self.broker,
+            &mut host_setup,
+            shared_buffers,
+            readiness,
+            |_| Ok(()),
+        )
+        .expect("the in-process broker setup must succeed")
+        .expect("the in-process broker must accept the connection");
+        self.association = Some(association);
+        Ok(Some(host_setup.response.expect(
+            "the in-process broker must send a handshake response",
+        )))
     }
 }
 
@@ -113,7 +126,9 @@ impl LocalCallChannel for InProcessBrokerChannel {
     }
 }
 
-struct InProcessHostSetup;
+struct InProcessHostSetup {
+    response: Option<BrokerHandshakeResponse>,
+}
 
 impl HostSetupChannel for InProcessHostSetup {
     type Error = Infallible;
@@ -138,6 +153,7 @@ impl HostSetupChannel for InProcessHostSetup {
             response,
             BrokerHandshakeResponse::Negotiated { .. }
         ));
+        self.response = Some(response.clone());
         Ok(())
     }
 }

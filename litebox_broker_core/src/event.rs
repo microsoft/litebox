@@ -3,8 +3,8 @@
 
 //! Broker-owned event object operations.
 
-use crate::session::{ObjectEntry, ObjectRights};
-use crate::{BrokerError, BrokerSession, Result};
+use crate::process::{ObjectEntry, ObjectRights};
+use crate::{BrokerError, BrokerProcess, Result};
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::event::{EventConsumeMode, EventConsumption};
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -12,17 +12,17 @@ use litebox_broker_protocol::readiness::ReadinessFlags;
 pub(crate) const MAX_EVENT_COUNT: u64 = u64::MAX - 1;
 
 /// Creates a broker-owned event object with initial readiness credits.
-pub fn create(session: &BrokerSession, initial_count: u64) -> Result<ObjectHandle> {
+pub fn create(process: &BrokerProcess, initial_count: u64) -> Result<ObjectHandle> {
     if initial_count > MAX_EVENT_COUNT {
         return Err(BrokerError::ResourceExhausted);
     }
 
-    session.create_object_reference(ObjectEntry::Event(EventObject::new(initial_count)))
+    process.create_object_reference(ObjectEntry::Event(EventObject::new(initial_count)))
 }
 
 /// Adds readiness credits to a broker-owned event object.
-pub fn add(session: &BrokerSession, handle: ObjectHandle, value: u64) -> Result<ReadinessFlags> {
-    let object = session.authorized_object(handle, ObjectRights::WRITE)?;
+pub fn add(process: &BrokerProcess, handle: ObjectHandle, value: u64) -> Result<ReadinessFlags> {
+    let object = process.authorized_object(handle, ObjectRights::WRITE)?;
     let mut object = object.write();
     match &mut *object {
         ObjectEntry::Event(event) => event.add(value),
@@ -35,11 +35,11 @@ pub fn add(session: &BrokerSession, handle: ObjectHandle, value: u64) -> Result<
 
 /// Consumes readiness credits from a broker-owned event object.
 pub fn consume(
-    session: &BrokerSession,
+    process: &BrokerProcess,
     handle: ObjectHandle,
     mode: EventConsumeMode,
 ) -> Result<EventConsumption> {
-    let object = session.authorized_object(handle, ObjectRights::WAIT)?;
+    let object = process.authorized_object(handle, ObjectRights::WAIT)?;
     let mut object = object.write();
     match &mut *object {
         ObjectEntry::Event(event) => event.consume(mode),

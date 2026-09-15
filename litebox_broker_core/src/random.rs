@@ -6,7 +6,7 @@
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use thiserror::Error;
 
-use crate::{BrokerError, BrokerSession, Result};
+use crate::{BrokerError, BrokerProcess, Result};
 
 /// Failure reported by a trusted random provider.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -36,14 +36,14 @@ impl RandomProvider for TestRandomProvider {
 }
 
 /// Fills `output` from the random provider configured for this broker.
-pub fn fill(session: &BrokerSession, output: &mut [u8]) -> Result<()> {
+pub fn fill(process: &BrokerProcess, output: &mut [u8]) -> Result<()> {
     if output.len() > MAX_RANDOM_TRANSFER_SIZE as usize {
         return Err(BrokerError::ResourceExhausted);
     }
     if output.is_empty() {
         return Ok(());
     }
-    session
+    process
         .core
         .random_provider
         .fill(output)

@@ -73,20 +73,6 @@ impl crate::mm::MemoryProvider for LvbsLinuxKernel {
     }
 }
 
-impl LvbsLinuxKernel {
-    // TODO: replace it with actual implementation (e.g., atomically increment PID/TID)
-    pub fn init_task(&self) -> litebox_common_linux::TaskParams {
-        litebox_common_linux::TaskParams {
-            pid: 1,
-            ppid: 1,
-            uid: 1000,
-            gid: 1000,
-            euid: 1000,
-            egid: 1000,
-        }
-    }
-}
-
 unsafe impl litebox::platform::ThreadLocalStorageProvider for LvbsLinuxKernel {
     fn get_thread_local_storage() -> *mut () {
         let tls = with_per_cpu_variables(|pcv| pcv.tls.get());

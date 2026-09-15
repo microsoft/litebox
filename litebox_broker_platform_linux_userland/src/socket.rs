@@ -20,7 +20,8 @@ use litebox_broker_core::socket::{
     PlatformDatagramReceive, PlatformSocket, PlatformSocketStatus, PlatformStreamReceive,
     SocketProvider,
 };
-use litebox_broker_core::{BrokerError, Result as BrokerResult, SessionId};
+use litebox_broker_core::{BrokerError, Result as BrokerResult};
+use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
     AddressFamily, CreateSocketRequest, IpProtocol, MAX_UDP_DATAGRAM_SIZE, ReceiveFlags,
@@ -168,10 +169,10 @@ pub struct LinuxSocketProvider {
 }
 
 impl LinuxSocketProvider {
-    /// Starts a provider with global and per-session socket limits.
-    pub fn new(max_sockets: usize, max_sockets_per_session: usize) -> IoResult<Self> {
+    /// Starts a provider with global and per-process socket limits.
+    pub fn new(max_sockets: usize, max_sockets_per_process: usize) -> IoResult<Self> {
         Ok(Self {
-            reactor: Arc::new(ReactorClient::start(max_sockets, max_sockets_per_session)?),
+            reactor: Arc::new(ReactorClient::start(max_sockets, max_sockets_per_process)?),
         })
     }
 }
@@ -179,7 +180,7 @@ impl LinuxSocketProvider {
 impl SocketProvider for LinuxSocketProvider {
     fn create(
         &self,
-        session_id: SessionId,
+        process_authority: ProcessId,
         request: CreateSocketRequest,
         readiness: ReadinessRegistration,
     ) -> BrokerResult<Arc<dyn PlatformSocket>> {
@@ -200,7 +201,7 @@ impl SocketProvider for LinuxSocketProvider {
         });
         self.reactor.request(|response| ReactorCommand::Create {
             id,
-            session_id,
+            process_authority,
             request,
             readiness,
             snapshot,
@@ -210,8 +211,8 @@ impl SocketProvider for LinuxSocketProvider {
         Ok(socket)
     }
 
-    fn close_session(&self, session_id: SessionId) {
-        self.reactor.close_session(session_id);
+    fn close_process(&self, process_authority: ProcessId) {
+        self.reactor.close_process(process_authority);
     }
 }
 
@@ -417,7 +418,7 @@ struct ReactorClient {
 }
 
 impl ReactorClient {
-    fn start(max_sockets: usize, max_sockets_per_session: usize) -> IoResult<Self> {
+    fn start(max_sockets: usize, max_sockets_per_process: usize) -> IoResult<Self> {
         let epoll_fd = epoll::create(epoll::CreateFlags::CLOEXEC)?;
         let wake = Arc::new(eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK)?);
         epoll::add(
@@ -449,9 +450,9 @@ impl ReactorClient {
                     sockets,
                     tcp: ReactorTcpState::default(),
                     udp: ReactorUdpState::default(),
-                    sessions: HashMap::new(),
+                    processes: HashMap::new(),
                     max_sockets,
-                    max_sockets_per_session,
+                    max_sockets_per_process,
                     events,
                 };
                 if started.send(true).is_err() {
@@ -607,6 +608,19 @@ impl ReactorClient {
     }
 
     #[cfg(test)]
+    fn has_udp_source_accounting(&self, process_authority: ProcessId) -> bool {
+        let (response, receive) = sync_channel(1);
+        self.commands
+            .send(ReactorCommand::HasUdpSourceAccounting {
+                process_authority,
+                response,
+            })
+            .unwrap();
+        self.signal().unwrap();
+        receive.recv().unwrap()
+    }
+
+    #[cfg(test)]
     fn udp_native_endpoint_count(&self) -> usize {
         let (response, receive) = sync_channel(1);
         self.commands
@@ -670,10 +684,10 @@ impl ReactorClient {
     }
 
     #[cfg(test)]
-    fn session_state_count(&self) -> usize {
+    fn process_state_count(&self) -> usize {
         let (response, receive) = sync_channel(1);
         self.commands
-            .send(ReactorCommand::SessionStateCount { response })
+            .send(ReactorCommand::ProcessStateCount { response })
             .unwrap();
         self.signal().unwrap();
         receive.recv().unwrap()
@@ -702,12 +716,12 @@ impl ReactorClient {
         receive.recv().unwrap();
     }
 
-    fn close_session(&self, session_id: SessionId) {
+    fn close_process(&self, process_authority: ProcessId) {
         let (response, receive) = sync_channel(1);
         if self
             .commands
-            .send(ReactorCommand::CloseSession {
-                session_id,
+            .send(ReactorCommand::CloseProcess {
+                process_authority,
                 response,
             })
             .is_err()
@@ -773,7 +787,7 @@ impl Drop for ReactorClient {
 enum ReactorCommand {
     Create {
         id: u64,
-        session_id: SessionId,
+        process_authority: ProcessId,
         request: CreateSocketRequest,
         readiness: ReadinessRegistration,
         snapshot: Arc<SocketSnapshot>,
@@ -852,8 +866,8 @@ enum ReactorCommand {
         id: u64,
         response: SyncSender<()>,
     },
-    CloseSession {
-        session_id: SessionId,
+    CloseProcess {
+        process_authority: ProcessId,
         response: SyncSender<()>,
     },
     #[cfg(test)]
@@ -872,6 +886,11 @@ enum ReactorCommand {
     #[cfg(test)]
     UdpQueuedDatagramCount {
         response: SyncSender<usize>,
+    },
+    #[cfg(test)]
+    HasUdpSourceAccounting {
+        process_authority: ProcessId,
+        response: SyncSender<bool>,
     },
     #[cfg(test)]
     UdpNativeEndpointCount {
@@ -898,7 +917,7 @@ enum ReactorCommand {
         response: SyncSender<usize>,
     },
     #[cfg(test)]
-    SessionStateCount {
+    ProcessStateCount {
         response: SyncSender<usize>,
     },
     #[cfg(test)]
@@ -939,9 +958,9 @@ struct Reactor {
     sockets: HashMap<u64, SocketEntry>,
     tcp: ReactorTcpState,
     udp: ReactorUdpState,
-    sessions: HashMap<SessionId, ReactorSessionState>,
+    processes: HashMap<ProcessId, ReactorProcessState>,
     max_sockets: usize,
-    max_sockets_per_session: usize,
+    max_sockets_per_process: usize,
     events: Vec<epoll::Event>,
 }
 
@@ -954,7 +973,7 @@ enum SocketTransportState {
 /// Reactor-owned transport-independent socket state and its
 /// transport-specific payload.
 struct SocketEntry {
-    session_id: SessionId,
+    process_authority: ProcessId,
     transport: SocketTransportState,
     readiness: ReadinessRegistration,
     snapshot: Arc<SocketSnapshot>,
@@ -988,11 +1007,11 @@ impl SocketEntry {
     }
 }
 
-/// Reactor-side per-session socket and teardown state.
+/// Reactor-side per-process socket and teardown state.
 ///
-/// Sessions are ownership domains, not guest network namespaces.
+/// Processes are ownership domains, not guest network namespaces.
 #[derive(Default)]
-struct ReactorSessionState {
+struct ReactorProcessState {
     live_socket_count: usize,
     pending_guest_connection_count: usize,
     udp_external_peer_count: usize,
@@ -1007,7 +1026,7 @@ enum SocketKind {
     Udp,
 }
 
-fn retain_session_state(state: &ReactorSessionState) -> bool {
+fn retain_process_state(state: &ReactorProcessState) -> bool {
     !state.closing
         || state.live_socket_count != 0
         || state.pending_guest_connection_count != 0
@@ -1406,10 +1425,10 @@ impl Reactor {
     }
 
     fn remove_socket(&mut self, id: u64) {
-        let Some((kind, session_id)) = self
+        let Some((kind, process_authority)) = self
             .sockets
             .get(&id)
-            .map(|socket| (socket.kind(), socket.session_id))
+            .map(|socket| (socket.kind(), socket.process_authority))
         else {
             return;
         };
@@ -1430,25 +1449,25 @@ impl Reactor {
                 .external_peer_count
                 .checked_sub(external_peer_count)
                 .expect("reactor UDP external peer count underflow");
-            let session = self
-                .sessions
-                .get_mut(&session_id)
-                .expect("UDP socket session state missing");
-            session.udp_external_peer_count = session
+            let process = self
+                .processes
+                .get_mut(&process_authority)
+                .expect("UDP socket process state missing");
+            process.udp_external_peer_count = process
                 .udp_external_peer_count
                 .checked_sub(external_peer_count)
-                .expect("session UDP external peer count underflow");
+                .expect("process UDP external peer count underflow");
             self.sockets.remove(&id);
-            session.live_socket_count = session
+            process.live_socket_count = process
                 .live_socket_count
                 .checked_sub(1)
-                .expect("session socket count underflow");
-            self.sessions
-                .retain(|_, session| retain_session_state(session));
+                .expect("process socket count underflow");
+            self.processes
+                .retain(|_, process| retain_process_state(process));
             return;
         }
 
-        self.remove_tcp_socket(id, session_id);
+        self.remove_tcp_socket(id, process_authority);
     }
 
     fn run(&mut self) -> core::result::Result<(), ReactorFailure> {
@@ -1510,15 +1529,21 @@ impl Reactor {
             match command {
                 ReactorCommand::Create {
                     id,
-                    session_id,
+                    process_authority,
                     request,
                     readiness,
                     snapshot,
                     lifecycle,
                     response,
                 } => {
-                    let outcome = self
-                        .create_socket(id, session_id, request, readiness, snapshot, &lifecycle);
+                    let outcome = self.create_socket(
+                        id,
+                        process_authority,
+                        request,
+                        readiness,
+                        snapshot,
+                        &lifecycle,
+                    );
                     let created = outcome.is_ok();
                     if response.send(outcome).is_err() && created {
                         self.remove_socket(id);
@@ -1650,23 +1675,27 @@ impl Reactor {
                     self.remove_socket(id);
                     let _ = response.send(());
                 }
-                ReactorCommand::CloseSession {
-                    session_id,
+                ReactorCommand::CloseProcess {
+                    process_authority,
                     response,
                 } => {
-                    if let Some(session) = self.sessions.get_mut(&session_id) {
-                        session.closing = true;
+                    if let Some(process) = self.processes.get_mut(&process_authority) {
+                        process.closing = true;
                     }
-                    while let Some(id) = self
-                        .sockets
-                        .iter()
-                        .find_map(|(id, socket)| (socket.session_id == session_id).then_some(*id))
-                    {
+                    while let Some(id) = self.sockets.iter().find_map(|(id, socket)| {
+                        (socket.process_authority == process_authority).then_some(*id)
+                    }) {
                         self.remove_socket(id);
                     }
-                    self.purge_connector_session_queues(session_id);
-                    self.sessions
-                        .retain(|_, session| retain_session_state(session));
+                    self.purge_connector_process_queues(process_authority);
+                    self.retire_udp_source(process_authority);
+                    if let Some(process) = self.processes.remove(&process_authority) {
+                        debug_assert_eq!(process.live_socket_count, 0);
+                        debug_assert_eq!(process.pending_guest_connection_count, 0);
+                        debug_assert_eq!(process.udp_external_peer_count, 0);
+                        debug_assert_eq!(process.udp_queued_datagrams, 0);
+                        debug_assert_eq!(process.udp_queued_bytes, 0);
+                    }
                     let _ = response.send(());
                 }
                 #[cfg(test)]
@@ -1712,6 +1741,13 @@ impl Reactor {
                     let _ = response.send(self.udp.queued_datagrams);
                 }
                 #[cfg(test)]
+                ReactorCommand::HasUdpSourceAccounting {
+                    process_authority,
+                    response,
+                } => {
+                    let _ = response.send(self.has_udp_source_accounting(process_authority));
+                }
+                #[cfg(test)]
                 ReactorCommand::UdpNativeEndpointCount { response } => {
                     let _ = response.send(self.udp.native_endpoints.len());
                 }
@@ -1754,8 +1790,8 @@ impl Reactor {
                     let _ = response.send(self.udp.external_peer_count);
                 }
                 #[cfg(test)]
-                ReactorCommand::SessionStateCount { response } => {
-                    let _ = response.send(self.sessions.len());
+                ReactorCommand::ProcessStateCount { response } => {
+                    let _ = response.send(self.processes.len());
                 }
                 #[cfg(test)]
                 ReactorCommand::UdpNativeHeadDatagramBytes {
@@ -1827,7 +1863,7 @@ impl Reactor {
                     }
                     self.tcp.clear_live_state();
                     self.udp.clear_live_state();
-                    self.sessions.clear();
+                    self.processes.clear();
                     let _ = response.send(());
                     return true;
                 }
@@ -1839,7 +1875,7 @@ impl Reactor {
     fn create_socket(
         &mut self,
         id: u64,
-        session_id: SessionId,
+        process_authority: ProcessId,
         request: CreateSocketRequest,
         readiness: ReadinessRegistration,
         snapshot: Arc<SocketSnapshot>,
@@ -1857,22 +1893,22 @@ impl Reactor {
         if self.sockets.contains_key(&id) {
             return Err(BrokerError::Internal);
         }
-        if !self.sessions.contains_key(&session_id) {
-            self.sessions
+        if !self.processes.contains_key(&process_authority) {
+            self.processes
                 .try_reserve(1)
                 .map_err(|_| BrokerError::OutOfMemory)?;
         }
-        let session = self.sessions.get(&session_id);
-        if session.is_some_and(|session| session.closing) {
+        let process = self.processes.get(&process_authority);
+        if process.is_some_and(|process| process.closing) {
             return Err(BrokerError::UnknownObject);
         }
-        let next_live_socket_count = session
-            .map_or(0, |session| session.live_socket_count)
+        let next_live_socket_count = process
+            .map_or(0, |process| process.live_socket_count)
             .checked_add(1)
             .ok_or(BrokerError::ResourceExhausted)?;
         if next_live_socket_count
-            .checked_add(session.map_or(0, |session| session.pending_guest_connection_count))
-            .is_none_or(|count| count > self.max_sockets_per_session)
+            .checked_add(process.map_or(0, |process| process.pending_guest_connection_count))
+            .is_none_or(|count| count > self.max_sockets_per_process)
         {
             return Err(BrokerError::ResourceExhausted);
         }
@@ -1893,7 +1929,7 @@ impl Reactor {
         self.sockets.insert(
             id,
             SocketEntry {
-                session_id,
+                process_authority,
                 transport,
                 readiness,
                 snapshot,
@@ -1904,8 +1940,8 @@ impl Reactor {
                 guest_local_address: None,
             },
         );
-        self.sessions
-            .entry(session_id)
+        self.processes
+            .entry(process_authority)
             .or_default()
             .live_socket_count = next_live_socket_count;
         Ok(())
@@ -1922,7 +1958,7 @@ impl Reactor {
         self.sockets.clear();
         self.tcp.clear_live_state();
         self.udp.clear_live_state();
-        self.sessions.clear();
+        self.processes.clear();
     }
 }
 

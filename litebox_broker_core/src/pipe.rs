@@ -11,8 +11,8 @@ use litebox_broker_protocol::pipe::MAX_PIPE_TRANSFER_SIZE;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use spin::rwlock::RwLock;
 
-use crate::session::{ObjectEntry, ObjectRights};
-use crate::{BrokerError, BrokerSession, Result};
+use crate::process::{ObjectEntry, ObjectRights};
+use crate::{BrokerError, BrokerProcess, Result};
 
 /// Maximum capacity accepted by the control-path pipe prototype.
 pub const MAX_PIPE_CAPACITY: usize = 1024 * 1024;
@@ -20,7 +20,7 @@ pub const MAX_PIPE_CAPACITY: usize = 1024 * 1024;
 /// Creates a broker-owned pipe and returns its read and write endpoint handles.
 ///
 pub fn create(
-    session: &BrokerSession,
+    process: &BrokerProcess,
     capacity: u64,
     atomic_write_size: u64,
 ) -> Result<(ObjectHandle, ObjectHandle)> {
@@ -35,7 +35,7 @@ pub fn create(
         return Err(BrokerError::ResourceExhausted);
     }
 
-    let capacity_reservation = PipeCapacityReservation::new(session, capacity)?;
+    let capacity_reservation = PipeCapacityReservation::new(process, capacity)?;
     let mut data = VecDeque::new();
     data.try_reserve_exact(capacity)
         .map_err(|_| BrokerError::OutOfMemory)?;
@@ -47,18 +47,18 @@ pub fn create(
         write_open: true,
         _capacity_reservation: capacity_reservation,
     }));
-    session.create_object_reference_pair(
+    process.create_object_reference_pair(
         ObjectEntry::Pipe(PipeObject::reader(Arc::clone(&state))),
         ObjectEntry::Pipe(PipeObject::writer(state)),
     )
 }
 
 /// Reads up to `length` bytes from a broker-owned pipe.
-pub fn read(session: &BrokerSession, handle: ObjectHandle, length: u32) -> Result<Vec<u8>> {
+pub fn read(process: &BrokerProcess, handle: ObjectHandle, length: u32) -> Result<Vec<u8>> {
     if length > MAX_PIPE_TRANSFER_SIZE {
         return Err(BrokerError::ResourceExhausted);
     }
-    let object = session.authorized_object(handle, ObjectRights::WAIT)?;
+    let object = process.authorized_object(handle, ObjectRights::WAIT)?;
     let object = object.read();
     match &*object {
         ObjectEntry::Pipe(pipe) => pipe.read(length as usize),
@@ -70,11 +70,11 @@ pub fn read(session: &BrokerSession, handle: ObjectHandle, length: u32) -> Resul
 }
 
 /// Writes bytes to a broker-owned pipe.
-pub fn write(session: &BrokerSession, handle: ObjectHandle, data: &[u8]) -> Result<usize> {
+pub fn write(process: &BrokerProcess, handle: ObjectHandle, data: &[u8]) -> Result<usize> {
     if data.len() > MAX_PIPE_TRANSFER_SIZE as usize {
         return Err(BrokerError::ResourceExhausted);
     }
-    let object = session.authorized_object(handle, ObjectRights::WRITE)?;
+    let object = process.authorized_object(handle, ObjectRights::WRITE)?;
     let object = object.read();
     match &*object {
         ObjectEntry::Pipe(pipe) => pipe.write(data),
@@ -201,22 +201,22 @@ struct PipeCapacityReservation {
 }
 
 impl PipeCapacityReservation {
-    fn new(session: &BrokerSession, capacity: usize) -> Result<Self> {
-        let global_counter = Arc::clone(&session.core.reserved_pipe_capacity);
+    fn new(process: &BrokerProcess, capacity: usize) -> Result<Self> {
+        let global_counter = Arc::clone(&process.core.reserved_pipe_capacity);
         global_counter
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
                 reserved
                     .checked_add(capacity)
-                    .filter(|total| *total <= session.core.limits.max_total_pipe_capacity)
+                    .filter(|total| *total <= process.core.limits.max_total_pipe_capacity)
             })
             .map_err(|_| BrokerError::ResourceExhausted)?;
 
-        let session_counter = Arc::clone(&session.reserved_pipe_capacity);
+        let session_counter = Arc::clone(&process.reserved_pipe_capacity);
         if session_counter
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
                 reserved
                     .checked_add(capacity)
-                    .filter(|total| *total <= session.core.limits.max_pipe_capacity_per_session)
+                    .filter(|total| *total <= process.core.limits.max_pipe_capacity_per_process)
             })
             .is_err()
         {
@@ -241,7 +241,7 @@ impl Drop for PipeCapacityReservation {
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
                 reserved.checked_sub(self.capacity)
             })
-            .expect("reserved session pipe capacity must include every live pipe");
+            .expect("reserved process pipe capacity must include every live pipe");
         self.global_counter
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
                 reserved.checked_sub(self.capacity)

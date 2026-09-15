@@ -139,7 +139,7 @@ fn platform_socket_provider(
     Ok(Arc::new(
         litebox_broker_platform_linux_userland::LinuxSocketProvider::new(
             limits.max_sockets,
-            limits.max_sockets_per_session,
+            limits.max_sockets_per_process,
         )?,
     ))
 }

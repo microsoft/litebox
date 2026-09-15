@@ -28,6 +28,22 @@ pub mod socket;
 pub mod stdio;
 pub mod wire;
 
+/// Guest process ID carried by broker protocol messages.
+///
+/// The broker core owns allocation and validity rules; the protocol preserves
+/// the numeric value without applying semantic checks.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProcessId(pub u32);
+
+/// Guest thread ID carried by broker protocol messages.
+///
+/// The broker core owns allocation and validity rules; the protocol preserves
+/// the numeric value without applying semantic checks.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ThreadId(pub u32);
+
 /// Opaque broker object reference handle.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]

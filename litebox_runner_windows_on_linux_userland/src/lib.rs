@@ -89,7 +89,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     } = litebox_platform_linux_userland::with_guest_signals_blocked(|| {
         broker::connect(control_socket)
     })?;
+    let process_id = local.process_id().0 as usize;
     let litebox = litebox::LiteBox::new_with_broker_local(platform, local);
+    let initial_thread = litebox.create_thread()?;
     coordinator.install_dispatch(litebox.broker_failure_dispatcher());
     litebox_platform_linux_userland::with_guest_signals_blocked(|| {
         broker::start_notification_receiver(
@@ -98,8 +100,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             litebox.broker_notification_dispatcher(),
         )
     })?;
-    let shim_builder =
-        litebox_shim_windows::WindowsShimBuilder::new_with_litebox(platform, litebox);
+    let shim_builder = litebox_shim_windows::WindowsShimBuilder::new_with_litebox(
+        platform,
+        litebox,
+        process_id,
+        None,
+        initial_thread,
+    );
 
     let (program_path, program_args) = cli_args
         .program_and_arguments

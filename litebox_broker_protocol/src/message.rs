@@ -32,7 +32,7 @@ use crate::stdio::{
     IsTerminalStdioRequest, IsTerminalStdioResponse, ReadStdioRequest, ReadStdioResponse,
     WriteStdioRequest, WriteStdioResponse,
 };
-use crate::{ObjectHandle, ProtocolVersion, RequestId};
+use crate::{ObjectHandle, ProcessId, ProtocolVersion, RequestId, ThreadId};
 
 /// Broker handshake request sent before the control channel is active.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,6 +44,10 @@ pub struct BrokerHandshakeRequest {
 /// Operation requested over an active broker control channel.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BrokerOperation {
+    /// Create a broker thread belonging to this process.
+    CreateThread,
+    /// Record broker thread exit after local teardown completes.
+    ExitThread(ThreadId),
     /// Close one broker object reference.
     CloseObject(ObjectHandle),
     /// Check the current readiness of a broker-owned object.
@@ -94,7 +98,9 @@ impl BrokerOperation {
                 | FileRequest::Mkdir(MkdirFileRequest { path: buffer, .. })
                 | FileRequest::Rmdir(RmdirFileRequest { path: buffer, .. }),
             ) => Some(*buffer),
-            Self::CloseObject(_)
+            Self::CreateThread
+            | Self::ExitThread(_)
+            | Self::CloseObject(_)
             | Self::CheckReadiness(_)
             | Self::Event(_)
             | Self::Pipe(PipeRequest::Create(_))
@@ -136,6 +142,8 @@ pub enum BrokerHandshakeResponse {
         /// The broker returns its supported version after validating that the
         /// requested version matches it.
         broker_protocol_version: ProtocolVersion,
+        /// Assigned process ID.
+        process_id: ProcessId,
     },
     /// Negotiation failed because the requested version is unsupported.
     ///
@@ -206,6 +214,10 @@ pub enum SocketRequest {
 /// Result returned for an active broker operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BrokerResult {
+    /// A thread was created with this broker-assigned ID.
+    ThreadCreated(ThreadId),
+    /// Thread exit completed.
+    ThreadExited,
     /// Object close operation completed.
     ObjectClosed,
     /// Current readiness of a broker-owned object.

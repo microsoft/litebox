@@ -28,7 +28,7 @@ use crate::syscalls::tests::TestPlatform;
 const MAX_TEST_BROKER_REFERENCES: usize = 16;
 
 /// Returns a LiteBox connected to the process-wide test broker.
-pub(crate) fn litebox(platform: &'static TestPlatform) -> litebox::LiteBox<TestPlatform> {
+pub(crate) fn litebox(platform: &'static TestPlatform) -> (litebox::LiteBox<TestPlatform>, i32) {
     let setup = InProcessBrokerSetup::new(test_broker().clone());
     let readiness = setup.readiness_sink();
     let (broker_local, ()) = BrokerLocal::negotiate(setup, |setup| {
@@ -36,9 +36,11 @@ pub(crate) fn litebox(platform: &'static TestPlatform) -> litebox::LiteBox<TestP
         Ok((setup.activate(), memory, ()))
     })
     .expect("the test broker must negotiate");
+    let process_id =
+        i32::try_from(broker_local.process_id().0).expect("process ID must fit Linux pid_t");
     let litebox = litebox::LiteBox::new_with_broker_local(platform, broker_local);
     readiness.attach(litebox.broker_notification_dispatcher());
-    litebox
+    (litebox, process_id)
 }
 
 fn test_broker() -> &'static BrokerCore {
