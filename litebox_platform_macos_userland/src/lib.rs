@@ -416,8 +416,8 @@ impl litebox::platform::SignalProvider for MacosUserland {
     type Signal = litebox_common_linux::signal::Signal;
 
     fn take_pending_signals(&self, mut f: impl FnMut(Self::Signal)) {
-        // Do not initialize TLS for host threads. The RMW preserves handler updates;
-        // Relaxed suffices because the bits publish no other data.
+        // Atomic swap avoids losing handler updates; Relaxed suffices because
+        // the bits publish no other data.
         let bits = with_signal_state(|pending, _| pending.swap(0, Ordering::Relaxed)).unwrap_or(0);
         for signal in litebox_common_linux::signal::SigSet::from_u64(u64::from(bits)) {
             f(signal);
@@ -1275,7 +1275,6 @@ impl WaitWakerProvider for MacosUserland {
                 .unwrap()
                 .clone_from(&waker);
         }
-        // Host threads without TLS still support ordinary event wakeups.
         with_signal_state(|_, slot| {
             let new = waker.map_or(core::ptr::null_mut(), |waker| {
                 Box::into_raw(Box::new(waker))
