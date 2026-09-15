@@ -29,12 +29,7 @@ bitflags::bitflags! {
 pub enum PageState {
     /// The address range is reserved but has no committed pages.
     Reserved,
-    /// The address range has a mapping with the specified permissions.
-    ///
-    /// `committed` implies `reserved`.
-    ///
-    /// This includes Linux `PROT_NONE` mappings and Windows committed no-access pages;
-    /// it does not imply physical residency or immediate population.
+    /// The address range is reserved and committed with the specified permissions.
     Committed(MemoryRegionPermissions),
 }
 
@@ -67,19 +62,7 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ///
     /// # Returns
     ///
-    /// On success, returns a raw mutable pointer to the start of the allocated memory region
-    /// and transfers ownership of the requested-length range to the caller. `Reserved`
-    /// requests acquire inaccessible memory; `Committed` requests establish the requested
-    /// mapping directly. To commit an existing owned, uncommitted range, request `Committed`
-    /// with [`FixedAddressBehavior::Replace`]. This does not relocate the range. Do not use
-    /// replacement to change permissions on committed pages: it discards their contents;
-    /// use [`update_permissions`](Self::update_permissions) instead.
-    /// Both states relinquish ownership through [`deallocate_pages`](Self::deallocate_pages).
-    /// The returned base is aligned to `ALIGN`. Native reservation alignment, boundaries,
-    /// and any additional backing address space remain private to the provider.
-    /// The caller manages allocation lifetimes and must supply a range free of its live
-    /// allocations for non-replacement requests. Providers may reuse their own reserved
-    /// backing without independently tracking which subranges are live.
+    /// On success, returns a raw mutable pointer to the start of the allocated memory region.
     ///
     /// # Errors
     ///
@@ -93,17 +76,15 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, AllocationError>;
 
-    /// Remove reserved or committed pages from an owned allocation, including page-aligned subranges.
+    /// De-allocated all pages in the given `range`.
     ///
-    /// The caller relinquishes ownership of the range. Providers manage any native
-    /// reservation boundaries internally and may retain backing address space after partial
-    /// removal. A complete native reservation can be released when the caller relinquishes
-    /// its entire extent; providers need not track the lifetime of individual suballocations.
+    /// It does not necessarily release the reservation of the underlying address space,
+    /// e.g., it may only decommit the pages if the given range does not match the
+    /// originally allocated range returned by [`allocate_pages`](Self::allocate_pages).
     ///
     /// # Safety
     ///
-    /// The caller must own the range through this provider and ensure that these pages
-    /// are not in active use. After success, the range must not be used or released again.
+    /// The caller must ensure that these pages are not in active use.
     unsafe fn deallocate_pages(&self, range: Range<usize>) -> Result<(), DeallocationError>;
 
     /// Remap pages from `old_range` to `new_range`.

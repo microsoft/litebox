@@ -255,13 +255,14 @@ where
 
     /// Reserve an address range without committing pages.
     ///
+    /// Platforms that do not support reserving pages may emulate reservation with committed,
+    /// inaccessible pages. [`CreatePagesFlags::MAP_FILE`] and [`CreatePagesFlags::SHARED`] are
+    /// invalid for reserved pages.
+    ///
     /// # Safety
     ///
     /// When replacing a fixed mapping, the caller must ensure that overlapping mappings are not
-    /// in use. The caller must also ensure that `flags` correctly describe the mapping.
-    ///
-    /// Platforms that do not support reserving pages may emulate it by creating committed but inaccessible pages.
-    /// [`CreatePagesFlags::MAP_FILE`] and [`CreatePagesFlags::SHARED`] are invalid for reserved pages.
+    /// in use.
     pub unsafe fn create_reserved_pages(
         &self,
         suggested_address: Option<NonZeroAddress<ALIGN>>,
@@ -506,12 +507,11 @@ where
         unsafe { vmem.reset_pages(range, anonymous_only) }
     }
 
-    /// Commit pages in a reserved range set by [`create_reserved_pages`](Self::create_reserved_pages).
+    /// Commit pages reserved by [`create_reserved_pages`](Self::create_reserved_pages).
     ///
     /// # Safety
     ///
-    /// The caller must ensure that the range belongs to this page manager and that the requested
-    /// permissions do not conflict with concurrent access.
+    /// The caller must ensure that the requested permissions do not conflict with concurrent access.
     pub unsafe fn commit_pages(
         &self,
         ptr: Platform::RawMutPointer<u8>,
@@ -529,8 +529,7 @@ where
     ///
     /// # Safety
     ///
-    /// The caller must ensure that the range belongs to this page manager and that its contents
-    /// are no longer in use.
+    /// The caller must ensure that its contents are no longer in use.
     pub unsafe fn decommit_pages(
         &self,
         ptr: Platform::RawMutPointer<u8>,

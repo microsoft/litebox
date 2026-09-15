@@ -282,12 +282,12 @@ impl WindowsUserland {
         // the current `const` values in PageManagementProvider.
         #[cfg(debug_assertions)]
         {
-            println!("System information.");
-            println!(
+            eprintln!("System information.");
+            eprintln!(
                 "=> Max user address: {:#x}",
                 sys_info.lpMaximumApplicationAddress as usize
             );
-            println!(
+            eprintln!(
                 "=> Min user address: {:#x}",
                 sys_info.lpMinimumApplicationAddress as usize
             );

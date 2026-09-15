@@ -78,6 +78,15 @@ impl VmFlags {
         };
         may | shared_flag
     }
+
+    fn for_new_mapping(flags: &CreatePagesFlags, file_backed: bool) -> Self {
+        Self::may_flags_for_mapping(flags.contains(CreatePagesFlags::SHARED), file_backed)
+            | if flags.contains(CreatePagesFlags::IS_STACK) {
+                Self::VM_GROWSDOWN
+            } else {
+                Self::empty()
+            }
+    }
 }
 
 impl From<MemoryRegionPermissions> for VmFlags {
@@ -757,22 +766,22 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         range: PageRange<ALIGN>,
         permissions: MemoryRegionPermissions,
     ) -> Result<(), VmemProtectError> {
-        let range: Range<usize> = range.into();
         if self
             .vmas
-            .overlapping(range.clone())
+            .overlapping(range.start..range.end)
             .any(|(_, vma)| vma.flags.contains(VmFlags::VM_RESERVED))
         {
-            return Err(VmemProtectError::InvalidRange(range));
+            return Err(VmemProtectError::InvalidRange(range.into()));
         }
-        unsafe {
-            self.update_mapping_state(
-                PageRange::new(range.start, range.end).unwrap(),
-                PageState::Committed(permissions),
-            )
-        }
+        unsafe { self.update_mapping_state(range, PageState::Committed(permissions)) }
     }
 
+    /// Update the state of existing mappings to the given [`new_state`](PageState).
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure it is safe to change the state of the given range, e.g., no more
+    /// write access to the range if it is changed to read-only.
     pub(super) unsafe fn update_mapping_state(
         &mut self,
         range: PageRange<ALIGN>,
@@ -885,17 +894,13 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         suggested_new_address: Option<NonZeroAddress<ALIGN>>,
         length: NonZeroPageSize<ALIGN>,
         flags: CreatePagesFlags,
-        permissions: MemoryRegionPermissions,
+        perms: MemoryRegionPermissions,
     ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
-        let shared = flags.contains(CreatePagesFlags::SHARED);
         let file_backed = flags.contains(CreatePagesFlags::MAP_FILE);
-        let mapping_flags = VmFlags::may_flags_for_mapping(shared, file_backed)
-            | if flags.contains(CreatePagesFlags::IS_STACK) {
-                VmFlags::VM_GROWSDOWN
-            } else {
-                VmFlags::empty()
-            };
-        let vma = VmArea::new(VmFlags::from(permissions) | mapping_flags, file_backed);
+        let vma = VmArea::new(
+            VmFlags::from(perms) | VmFlags::for_new_mapping(&flags, file_backed),
+            file_backed,
+        );
         unsafe { self.create_mapping(suggested_new_address, length, vma, flags) }
             .map_err(MappingError::MapError)
     }
@@ -910,13 +915,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         if flags.intersects(CreatePagesFlags::SHARED | CreatePagesFlags::MAP_FILE) {
             return Err(MappingError::InvalidFlags);
         }
-        let mapping_flags = VmFlags::may_flags_for_mapping(false, false)
-            | if flags.contains(CreatePagesFlags::IS_STACK) {
-                VmFlags::VM_GROWSDOWN
-            } else {
-                VmFlags::empty()
-            };
-        let vma = VmArea::new(mapping_flags | VmFlags::VM_RESERVED, false);
+        let vma = VmArea::new(
+            VmFlags::VM_RESERVED | VmFlags::for_new_mapping(&flags, false),
+            false,
+        );
         unsafe { self.create_mapping(suggested_new_address, length, vma, flags) }
             .map_err(MappingError::MapError)
     }
