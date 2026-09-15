@@ -197,8 +197,6 @@ impl RewriteOptions {
 /// executable-section GS segment overrides rewritten to FS and `syscall`
 /// instructions redirected through a LiteBox trampoline footer. AArch64 Mach-O
 /// inputs are passed through [`hook_syscalls_in_macho_with_options`].
-/// Default hosts are Linux for ELF, macOS for Mach-O, and Windows for PE.
-/// Override the host with [`rewrite_binary_with_options`].
 pub fn rewrite_binary(input_binary: &[u8], trampoline: Option<u64>) -> Result<Vec<u8>> {
     rewrite_binary_with_options(
         input_binary,
@@ -218,12 +216,19 @@ pub fn rewrite_binary_with_options(
     if is_pe_binary(input_binary) {
         rewrite_pe_for_litebox(input_binary, trampoline)
     } else if matches!(
-        input_binary.get(..4),
+        input_binary
+            .first_chunk::<4>()
+            .copied()
+            .map(u32::from_le_bytes),
         Some(
-            [0xce | 0xcf, 0xfa, 0xed, 0xfe]
-                | [0xfe, 0xed, 0xfa, 0xce | 0xcf]
-                | [0xca, 0xfe, 0xba, 0xbe | 0xbf]
-                | [0xbe | 0xbf, 0xba, 0xfe, 0xca]
+            object::macho::MH_MAGIC
+                | object::macho::MH_CIGAM
+                | object::macho::MH_MAGIC_64
+                | object::macho::MH_CIGAM_64
+                | object::macho::FAT_MAGIC
+                | object::macho::FAT_CIGAM
+                | object::macho::FAT_MAGIC_64
+                | object::macho::FAT_CIGAM_64
         )
     ) {
         hook_syscalls_in_macho_with_options(input_binary, trampoline, options)

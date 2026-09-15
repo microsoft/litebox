@@ -1,29 +1,14 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Rewrite AArch64 Mach-O syscall and thread-pointer accesses for LiteBox on macOS.
+//! AArch64 Mach-O rewriting for LiteBox on macOS.
 //!
-//! Supports thin, little-endian executables, dylibs, bundles and dyld images.
-//! arm64e, universal, encrypted and shared-cache images are rejected.
+//! SVC callbacks receive SP decremented by [`aarch64::DARWIN_SVC_FRAME_BYTES`],
+//! with saved x16 (the syscall number) at `[SP]`. They must supply Darwin's x0/x1
+//! results and NZCV carry, preserve other registers, and return through the
+//! outbound stub with SP still pointing to the gate frame.
 //!
-//! `SVC #0x80` redirects to a callback; `MRS TPIDRRO_EL0` reads the logical
-//! guest thread pointer. TPIDRRO_EL0 writes and other SVC immediates are rejected.
-//! Scanning excludes `LC_DATA_IN_CODE` ranges; unmarked inline data matching
-//! syscall/TLS encodings may be rewritten.
-//!
-//! Use [`CodeMetadata`] to locate code in file-backed mappings and [`Rewriter`],
-//! configured for the runner's host, to patch those mappings before execution.
-//!
-//! The standalone CLI can also rewrite a whole file and append a `LITEBOX0`
-//! trampoline footer. This invalidates code signatures.
-//!
-//! # Callback ABI
-//!
-//! SVC gates preserve the 128-byte red zone and decrement SP by
-//! [`crate::aarch64::DARWIN_SVC_FRAME_BYTES`]. Saved x16 at frame offset zero
-//! holds the syscall number. The callback must supply Darwin's x0/x1 results
-//! and NZCV carry, preserve other registers, and return through the outbound
-//! stub with SP pointing to the gate frame.
+//! Unmarked inline data matching syscall/TLS encodings may be rewritten.
 
 use alloc::{format, string::ToString as _, vec, vec::Vec};
 use core::ops::Range;
@@ -32,25 +17,27 @@ use object::{LittleEndian as LE, macho};
 use zerocopy::IntoBytes as _;
 
 use crate::{
-    Arch, Error, LoadSegment, Result, RewriteOptions, TRAMPOLINE_MAGIC, TargetHost,
-    TextSectionInfo, TrampolineHeader64, TrampolinePlacement, aarch64, append_trampoline_footer,
-    checked_add_u64, is_already_hooked, trampoline_placement_for,
+    Arch, Error, LoadSegment, MACOS_TRAMPOLINE_PAGE_SIZE, Result, RewriteOptions, TRAMPOLINE_MAGIC,
+    TargetHost, TextSectionInfo, TrampolineHeader64, TrampolinePlacement,
+    aarch64::{self, INSN_BYTES_U64},
+    append_trampoline_footer, checked_add_u64, is_already_hooked, trampoline_placement_for,
 };
 
-/// Code ranges used to rewrite file-backed mappings of a Mach-O image.
+const LOAD_COMMAND_ALIGNMENT: u32 = 8;
+
 pub struct CodeMetadata {
     code: Vec<TextSectionInfo>,
     segments: Vec<LoadSegment>,
 }
 
 impl CodeMetadata {
-    /// Parse code sections and exclude `LC_DATA_IN_CODE` ranges.
+    /// Expects a thin Mach-O slice.
     pub fn parse(image: &[u8]) -> Result<Self> {
         parse_image(image)?
             .ok_or_else(|| Error::UnsupportedExecutable("relocatable Mach-O object".into()))
     }
 
-    /// Return sorted code ranges relative to a file-backed mapping.
+    /// `file_offset` is slice-relative; returned ranges are mapping-relative.
     pub fn ranges_for_mapping(
         &self,
         file_offset: u64,
@@ -61,13 +48,11 @@ impl CodeMetadata {
         Ok(ranges)
     }
 
-    /// Bound the gate storage needed for this image's patch sites.
     pub fn trampoline_size_upper_bound(&self, image: &[u8], rewriter: Rewriter) -> Result<usize> {
         aarch64::macho_trampoline_size_upper_bound(image, &self.code, rewriter.host)
     }
 }
 
-/// Darwin code rewriter configured for the runner's host platform.
 #[derive(Clone, Copy)]
 pub struct Rewriter {
     host: TargetHost,
@@ -83,12 +68,12 @@ impl Rewriter {
         Ok(Self { host })
     }
 
-    /// Patch code in an mmap-backed mapping and return finalized gates and trapped PCs.
+    /// Returns (finalized gates, trapped PCs). Code is unchanged on error.
     ///
-    /// `ranges` must be sorted, non-overlapping instruction ranges within `code`.
-    /// The caller must reserve gate storage at `trampoline_vaddr`, copy the returned
-    /// gates there, and synchronize instruction caches before executing either mapping.
-    /// `guest_tp_offset` is the runtime TLS field/slot offset. On error, code is unchanged.
+    /// Ranges are sorted, non-overlapping and relative to `code`. Copy returned gates
+    /// to reserved storage at `trampoline_vaddr` and synchronize instruction caches
+    /// for code and gates before execution. `guest_tp_offset` is the host TSD byte
+    /// offset of the guest TLS-block pointer.
     pub fn patch_code_segment(
         self,
         code: &mut [u8],
@@ -121,8 +106,7 @@ impl Rewriter {
         Ok((outcome.trampoline, outcome.trapped_sites))
     }
 
-    /// Trap all patch sites when gate allocation is unavailable.
-    /// The caller must synchronize the instruction cache before executing the mapping.
+    /// Allocation-failure fallback; synchronize the instruction cache before execution.
     pub fn trap_code_segment(
         self,
         code: &mut [u8],
@@ -139,7 +123,6 @@ impl Rewriter {
         aarch64::trap_macho_patch_sites(code, &sections)
     }
 
-    /// Validate gates against this runner's layout and finalize guest TLS offsets.
     /// Leaves the trampoline unchanged on error.
     pub fn finalize_trampoline_gates(
         self,
@@ -149,9 +132,8 @@ impl Rewriter {
         aarch64::finalize_macho_trampoline(trampoline, guest_tp_offset, self.host)
     }
 
-    /// Classify a copied gate slot using this runner's layout.
-    /// Recovery must verify that the original site branches into the slot and
-    /// use `DARWIN_SVC_FRAME_BYTES` when restoring SP from an SVC gate frame.
+    /// Recovery must verify the original site's branch. SVC frame recovery uses
+    /// [`aarch64::DARWIN_SVC_FRAME_BYTES`].
     pub fn classify_gate_slot(
         self,
         slot: &[u8],
@@ -167,7 +149,7 @@ impl Rewriter {
     }
 }
 
-/// Rewrite a Mach-O file using macOS TLS gates. `None` leaves the callback for the loader.
+/// AOT rewriting of a thin slice. `None` leaves the callback slot for the loader.
 pub fn hook_syscalls_in_macho(input: &[u8], callback: Option<u64>) -> Result<Vec<u8>> {
     hook_syscalls_in_macho_with_options(
         input,
@@ -176,13 +158,10 @@ pub fn hook_syscalls_in_macho(input: &[u8], callback: Option<u64>) -> Result<Vec
     )
 }
 
-/// AOT file rewriting. Relocatable objects are returned unchanged.
-/// The ELF-only `virtualize_x18` option is ignored.
-///
-/// The loader must map the footer payload at its recorded address with the
-/// image's slide, install the callback, finalize TLS offsets, and synchronize
-/// instruction caches. The payload is 4 KiB file-aligned; hosts requiring larger
-/// alignment must copy it into a suitable mapping.
+/// The loader must map the footer payload at its recorded address plus the image
+/// slide, install the callback, finalize TLS offsets, and synchronize instruction
+/// caches. The payload is 4 KiB file-aligned; copy it if larger alignment is required.
+/// Rewriting invalidates code signatures.
 pub fn hook_syscalls_in_macho_with_options(
     input: &[u8],
     callback: Option<u64>,
@@ -195,7 +174,11 @@ pub fn hook_syscalls_in_macho_with_options(
     if is_already_hooked(input, Arch::Aarch64) {
         return Ok(input.to_vec());
     }
-    let placement = trampoline_placement_for(&metadata.segments, object::elf::EM_AARCH64, 0x4000)?;
+    let placement = trampoline_placement_for(
+        &metadata.segments,
+        object::elf::EM_AARCH64,
+        MACOS_TRAMPOLINE_PAGE_SIZE,
+    )?;
     let attempt = |addr, limit| {
         rewrite_at(
             input,
@@ -219,13 +202,13 @@ pub fn hook_syscalls_in_macho_with_options(
 }
 
 fn parse_image(input: &[u8]) -> Result<Option<CodeMetadata>> {
-    if input.get(..4) != Some(&[0xcf, 0xfa, 0xed, 0xfe]) {
+    if input.get(..4) != Some(macho::MH_MAGIC_64.to_le_bytes().as_slice()) {
         return Err(Error::UnsupportedExecutable(
             "expected thin little-endian AArch64 Mach-O (extract universal slices first)".into(),
         ));
     }
     // The object parser requires aligned storage.
-    let mut storage = vec![0u64; input.len().div_ceil(8)];
+    let mut storage = vec![0u64; input.len().div_ceil(size_of::<u64>())];
     let bytes = storage.as_mut_bytes();
     bytes[..input.len()].copy_from_slice(input);
     let bytes = &mut bytes[..input.len()];
@@ -275,13 +258,14 @@ fn code_metadata(bytes: &[u8]) -> Result<(Vec<TextSectionInfo>, Vec<LoadSegment>
     let header = macho::MachHeader64::<LE>::parse(bytes, 0).map_err(parse_error)?;
     let mut commands = header.load_commands(LE, bytes, 0).map_err(parse_error)?;
     let mut command_bytes = 0u64;
-    let commands_end = 32 + u64::from(header.sizeofcmds(LE));
+    let commands_end =
+        size_of::<macho::MachHeader64<LE>>() as u64 + u64::from(header.sizeofcmds(LE));
     let mut sections = Vec::new();
     let mut segments: Vec<LoadSegment> = Vec::new();
     let mut data_ranges = Vec::new();
     let mut file_ranges: Vec<Range<usize>> = Vec::new();
     while let Some(command) = commands.next().map_err(parse_error)? {
-        if !command.cmdsize().is_multiple_of(8) {
+        if !command.cmdsize().is_multiple_of(LOAD_COMMAND_ALIGNMENT) {
             return Err(Error::ParseError("unaligned Mach-O load command".into()));
         }
         command_bytes += u64::from(command.cmdsize());
@@ -304,6 +288,8 @@ fn code_metadata(bytes: &[u8]) -> Result<(Vec<TextSectionInfo>, Vec<LoadSegment>
             ));
         }
         if command.cmd() == macho::LC_DATA_IN_CODE {
+            const ENTRY_BYTES: usize = size_of::<macho::DataInCodeEntry<LE>>();
+            const LENGTH_OFFSET: usize = core::mem::offset_of!(macho::DataInCodeEntry<LE>, length);
             let info = command
                 .data::<macho::LinkeditDataCommand<LE>>()
                 .map_err(parse_error)?;
@@ -312,18 +298,26 @@ fn code_metadata(bytes: &[u8]) -> Result<(Vec<TextSectionInfo>, Vec<LoadSegment>
                 u64::from(info.datasize.get(LE)),
                 bytes.len(),
             )?;
-            if !range.len().is_multiple_of(8) {
+            if !range.len().is_multiple_of(ENTRY_BYTES) {
                 return Err(Error::ParseError(
                     "partial Mach-O data-in-code entry".into(),
                 ));
             }
-            for entry in bytes[range].as_chunks::<8>().0 {
-                let start = u64::from(u32::from_le_bytes(entry[..4].try_into().unwrap()));
-                let size = u64::from(u16::from_le_bytes(entry[4..6].try_into().unwrap()));
+            for entry in bytes[range].as_chunks::<ENTRY_BYTES>().0 {
+                let start = u64::from(u32::from_le_bytes(
+                    entry[..size_of::<u32>()].try_into().unwrap(),
+                ));
+                let size = u64::from(u16::from_le_bytes(
+                    entry[LENGTH_OFFSET..][..size_of::<u16>()]
+                        .try_into()
+                        .unwrap(),
+                ));
                 checked_range(start, size, bytes.len())?;
                 if size != 0 {
-                    // Exclude whole instruction words.
-                    data_ranges.push((start & !3)..(start + size).next_multiple_of(4));
+                    data_ranges.push(
+                        (start & !(INSN_BYTES_U64 - 1))
+                            ..(start + size).next_multiple_of(INSN_BYTES_U64),
+                    );
                 }
             }
         }
@@ -351,7 +345,7 @@ fn code_metadata(bytes: &[u8]) -> Result<(Vec<TextSectionInfo>, Vec<LoadSegment>
                 vaddr,
                 memsz,
                 filesz,
-                align: 0x4000,
+                align: MACOS_TRAMPOLINE_PAGE_SIZE,
             });
         }
         if filesz != 0 {
@@ -390,9 +384,9 @@ fn code_metadata(bytes: &[u8]) -> Result<(Vec<TextSectionInfo>, Vec<LoadSegment>
                 || range.end as u64 > offset + filesz
                 || address - vaddr != section_offset - offset
                 || (size != 0 && section_offset < commands_end)
-                || !address.is_multiple_of(4)
-                || !section_offset.is_multiple_of(4)
-                || !size.is_multiple_of(4)
+                || !address.is_multiple_of(INSN_BYTES_U64)
+                || !section_offset.is_multiple_of(INSN_BYTES_U64)
+                || !size.is_multiple_of(INSN_BYTES_U64)
             {
                 return Err(Error::ParseError(
                     "invalid Mach-O code section mapping".into(),
@@ -484,7 +478,7 @@ fn rewrite_at(
         return Ok(out);
     };
     let needed = (outcome.trampoline.len() as u64)
-        .checked_next_multiple_of(0x4000)
+        .checked_next_multiple_of(MACOS_TRAMPOLINE_PAGE_SIZE)
         .ok_or_else(|| Error::AddressOverflow("Mach-O trampoline size".into()))?;
     checked_add_u64(addr, needed, "Mach-O trampoline end")?;
     if let Some(available) = limit

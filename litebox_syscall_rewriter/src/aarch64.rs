@@ -2268,7 +2268,7 @@ const INSN_BYTES_LOG2: u32 = 2;
 const INSN_BYTES: usize = 1 << INSN_BYTES_LOG2;
 
 /// [`INSN_BYTES`] where a virtual address is being measured.
-const INSN_BYTES_U64: u64 = 1 << INSN_BYTES_LOG2;
+pub(crate) const INSN_BYTES_U64: u64 = 1 << INSN_BYTES_LOG2;
 
 /// The metadata word closing every compact gate slot.
 const GATE_METADATA_BYTES: usize = 4;
@@ -3531,7 +3531,7 @@ fn emit_svc_gate(
         "the outbound stub must be SVC_OUTBOUND_STUB_BYTES long"
     );
 
-    append_gate_slot_with_layout(
+    append_gate_slot(
         trampoline_data,
         asm.finish(),
         trampoline_base_addr,
@@ -3616,7 +3616,7 @@ fn emit_msr_gate(
         trampoline_base_addr,
         gate_vaddr,
         GateMetadata::MsrTpidr { source: rt },
-        host,
+        GateLayout::linux(host),
     )?;
     Ok(GateBuild::Emitted)
 }
@@ -3651,7 +3651,7 @@ fn emit_mrs_gate(
         trampoline_base_addr,
         gate_vaddr,
         GateMetadata::MrsTpidr { destination: rd },
-        host,
+        GateLayout::linux(host),
     )?;
     Ok(GateBuild::Emitted)
 }
@@ -3745,7 +3745,7 @@ fn emit_x18_gate(
         trampoline_base_addr,
         gate_vaddr,
         GateMetadata::X18 { scratch },
-        host,
+        GateLayout::linux(host),
     )?;
     Ok(GateBuild::Emitted)
 }
@@ -3817,7 +3817,7 @@ fn emit_x18_stack_writeback_gate(
         GateMetadata::X18StackWriteback {
             scratch: pair.scratch,
         },
-        host,
+        GateLayout::linux(host),
     )?;
     Ok(GateBuild::Emitted)
 }
@@ -3902,7 +3902,7 @@ fn emit_x18_compare_branch_gate(
         GateMetadata::X18CompareBranch {
             scratch: branch.scratch,
         },
-        host,
+        GateLayout::linux(host),
     )?;
     Ok(GateBuild::Emitted)
 }
@@ -3955,7 +3955,7 @@ fn emit_x18_adr_gate(
         GateMetadata::X18Adr {
             scratch: adr.scratch,
         },
-        host,
+        GateLayout::linux(host),
     )?;
     Ok(GateBuild::Emitted)
 }
@@ -3984,30 +3984,12 @@ fn emit_x18_branch_gate(
         trampoline_base_addr,
         gate_vaddr,
         GateMetadata::X18Branch { kind: branch },
-        host,
+        GateLayout::linux(host),
     )?;
     Ok(GateBuild::Emitted)
 }
 
 fn append_gate_slot(
-    trampoline_data: &mut Vec<u8>,
-    code: Vec<u8>,
-    trampoline_base: u64,
-    slot_vaddr: u64,
-    metadata: GateMetadata,
-    host: Host,
-) -> Result<()> {
-    append_gate_slot_with_layout(
-        trampoline_data,
-        code,
-        trampoline_base,
-        slot_vaddr,
-        metadata,
-        GateLayout::linux(host),
-    )
-}
-
-fn append_gate_slot_with_layout(
     trampoline_data: &mut Vec<u8>,
     mut code: Vec<u8>,
     trampoline_base: u64,
@@ -4122,7 +4104,7 @@ fn validate_gate_slot_inner_with_layout(
             let frame_bytes = layout.svc_frame_bytes;
             let adrp = word_at(8);
             let add = word_at(12);
-            exact(0, Insn::SubSp(frame_bytes))
+            exact(SvcGateOffset::Entry.as_usize(), Insn::SubSp(frame_bytes))
                 && exact(
                     4,
                     Insn::StrUimm {
@@ -4178,7 +4160,10 @@ fn validate_gate_slot_inner_with_layout(
                         imm_bytes: SVC_FRAME_OFF_X16,
                     },
                 )
-                && exact(40, Insn::AddSp(frame_bytes))
+                && exact(
+                    SvcGateOffset::OutboundRestoreSp.as_usize(),
+                    Insn::AddSp(frame_bytes),
+                )
                 && match addressing {
                     SlotAddressing::Unplaced { .. } => {
                         adrp & ADRP_SHAPE_MASK == Opcode::Adrp.bits() | u32::from(X16)
