@@ -174,42 +174,46 @@ impl<Platform: ShimPlatform> Task<Platform> {
             self.do_mmap_file_memcpy(suggested_addr, len, prot, flags, &typed_fd, offset)?
         };
 
-        let patch_key = ElfPatchKey(typed_fd);
+        // A zero entry point means the platform has no syscall rewriting.
+        let syscall_entry = self.global.platform.get_syscall_entry_point();
+        if syscall_entry == 0 {
+            return Ok(result);
+        }
 
+        let patch_key = ElfPatchKey(typed_fd);
         // Runtime syscall rewriting: patch PROT_EXEC segments in-place.
         if is_exec {
-            let syscall_entry = self.global.platform.get_syscall_entry_point();
-            if syscall_entry != 0 {
-                if let Err(e) =
-                    self.maybe_patch_exec_segment(result, len, &patch_key, syscall_entry, offset)
-                {
-                    // The segment may still contain raw `syscall` instructions, or
-                    // (for a pre-patched binary) JMPs to a trampoline that was never
-                    // mapped. Either way, exposing it as executable is unsafe, so
-                    // fail the mmap instead.
+            if let Err(e) =
+                self.maybe_patch_exec_segment(result, len, &patch_key, syscall_entry, offset)
+            {
+                // The segment may still contain raw `syscall` instructions, or
+                // (for a pre-patched binary) JMPs to a trampoline that was never
+                // mapped. Either way, exposing it as executable is unsafe, so
+                // fail the mmap instead.
+                let _ = self.sys_munmap(result, len);
+                return Err(e);
+            }
+            // The patcher leaves the segment read-execute, so a writable request
+            // has to be re-applied. That drops the patch record: the guest can
+            // now overwrite the rewritten code.
+            if prot.contains(ProtFlags::PROT_WRITE) {
+                if let Err(e) = self.sys_mprotect_raw(result, len, prot) {
                     let _ = self.sys_munmap(result, len);
                     return Err(e);
                 }
-                // The patcher restores the mapping to RX.
-                debug_assert!(
-                    !prot.contains(ProtFlags::PROT_WRITE),
-                    "mapping should not be writable after patching"
-                );
+                self.invalidate_patched_ranges(result.as_usize(), len);
             }
         } else {
             // Ensure patch state is initialized for this fd (no-op if already done).
             self.init_elf_patch_state(&patch_key, result.as_usize(), offset);
-            // Track non-exec file mappings so we can patch them if they later
-            // gain PROT_EXEC via mprotect.
-            let mut cache = self.global.elf_patch_cache.lock();
-            if let Some(Some(state)) = cache.get_mut(&patch_key) {
-                let mapping_key = (result.as_usize(), len);
-                // Overlapping entries are safe here: file_mappings is only used
-                // to know which (addr, len) ranges belong to this fd so we can
-                // patch them later if mprotect adds PROT_EXEC.  Duplicates or
-                // overlaps are harmless — the patching logic is idempotent.
-                state.file_mappings.insert(mapping_key);
-            }
+        }
+
+        // Track the mapping so a later mprotect(+EXEC) can (re)patch it.
+        // Overlapping entries are safe here: file_mappings only records which
+        // (addr, len) ranges belong to this fd, and patching is idempotent.
+        let mut cache = self.global.elf_patch_cache.lock();
+        if let Some(Some(state)) = cache.get_mut(&patch_key) {
+            state.file_mappings.insert((result.as_usize(), len));
         }
 
         Ok(result)
@@ -478,20 +482,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
         len: usize,
         prot: ProtFlags,
     ) -> Result<(), Errno> {
-        // Intercept transitions to PROT_EXEC: patch unpatched file mappings.
-        if prot.contains(ProtFlags::PROT_EXEC) {
-            let syscall_entry = self.global.platform.get_syscall_entry_point();
-            if syscall_entry != 0 {
-                // If a tracked mapping cannot be patched we must not let it become executable.
-                self.maybe_patch_on_mprotect_exec(addr, len, syscall_entry)?;
-            }
+        let syscall_entry = self.global.platform.get_syscall_entry_point();
+        // If a tracked mapping cannot be patched we must not let it become executable.
+        if syscall_entry != 0 && prot.contains(ProtFlags::PROT_EXEC) {
+            self.maybe_patch_on_mprotect_exec(addr, len, syscall_entry)?;
         }
         self.sys_mprotect_raw(addr, len, prot)?;
-        if prot.contains(ProtFlags::PROT_WRITE) {
-            let syscall_entry = self.global.platform.get_syscall_entry_point();
-            if syscall_entry != 0 {
-                self.invalidate_patched_ranges(addr.as_usize(), len);
-            }
+        if syscall_entry != 0 && prot.contains(ProtFlags::PROT_WRITE) {
+            self.invalidate_patched_ranges(addr.as_usize(), len);
         }
         Ok(())
     }
