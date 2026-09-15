@@ -106,9 +106,10 @@ pub(crate) fn receive_fd(stream: &mut UnixStream, deadline: Option<Instant>) -> 
         invalid |= length > available - offset;
         if header.cmsg_level == libc::SOL_SOCKET && header.cmsg_type == libc::SCM_RIGHTS {
             let data = &control.0[offset + HEADER..offset + bounded];
-            invalid |= !data.len().is_multiple_of(size_of::<i32>());
-            for bytes in data.chunks_exact(size_of::<i32>()) {
-                let raw = i32::from_ne_bytes(bytes.try_into().unwrap());
+            let (descriptors, remainder) = data.as_chunks::<{ size_of::<i32>() }>();
+            invalid |= !remainder.is_empty();
+            for bytes in descriptors {
+                let raw = i32::from_ne_bytes(*bytes);
                 if raw < 0 {
                     invalid = true;
                     continue;

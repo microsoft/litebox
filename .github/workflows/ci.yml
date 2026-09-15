@@ -70,7 +70,6 @@ jobs:
       - run: |
           ./.github/tools/github_actions_run_cargo nextest
           ./.github/tools/github_actions_run_cargo nextest -p litebox_runner_optee_on_linux_userland
-      # Nextest does not execute harness=false integration-test binaries.
       - name: Test userland broker integration
         run: ./.github/tools/github_actions_run_cargo test -p litebox_broker_userland --test userland_broker
       - run: |
@@ -130,7 +129,6 @@ jobs:
           ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features $AARCH64_CRATES
       - run: ./.github/tools/github_actions_run_cargo build $AARCH64_CRATES --features litebox_common_linux/aarch64_gate_recovery
       - run: ./.github/tools/github_actions_run_cargo nextest $AARCH64_CRATES --features litebox_common_linux/aarch64_gate_recovery
-      # Nextest does not execute harness=false integration-test binaries.
       - name: Test userland broker integration
         run: ./.github/tools/github_actions_run_cargo test -p litebox_broker_userland --test userland_broker
       - name: Test AArch64 x18 virtualization

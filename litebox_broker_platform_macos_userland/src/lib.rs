@@ -75,7 +75,7 @@ impl RawMutexTrait for MacosRawMutex {
         }
         // Bound conversion to the host condvar's absolute deadline. A bounded
         // wait ending early is a permitted spurious wakeup, not a full timeout.
-        let bounded = timeout.min(Duration::from_secs(86400));
+        let bounded = timeout.min(Duration::from_hours(24));
         let (_gate, result) = self.changed.wait_timeout(gate, bounded).unwrap();
         Ok(if result.timed_out() && bounded == timeout {
             UnblockedOrTimedOut::TimedOut
