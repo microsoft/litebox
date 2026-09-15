@@ -316,7 +316,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             teb_address,
         ));
         if !self.process.attach_thread(thread_id, &thread_object) {
-            let _ = broker_thread.finish();
+            let _ = broker_thread.exit();
             return None;
         }
         Some(Task {

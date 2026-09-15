@@ -788,11 +788,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 .expect("a live Windows task must own its broker thread");
             debug_assert_eq!(broker_thread.id().get() as usize, thread_id);
             let broker_thread_id = broker_thread.id();
-            if let Err(error) = broker_thread.finish() {
+            if let Err(error) = broker_thread.exit() {
                 litebox_util_log::error!(
                     error:% = error,
                     thread_id = broker_thread_id.get();
-                    "failed to finish broker thread"
+                    "failed to record broker thread exit"
                 );
             }
         });

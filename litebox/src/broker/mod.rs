@@ -51,7 +51,7 @@ use shared_buffer::{AcquireError, SlotAllocator, SlotLease};
 pub(crate) trait BrokerControl: Send + Sync {
     fn create_thread(&self) -> core::result::Result<ThreadId, BrokerControlError>;
 
-    fn finish_thread(&self, thread_id: ThreadId) -> core::result::Result<(), BrokerControlError>;
+    fn exit_thread(&self, thread_id: ThreadId) -> core::result::Result<(), BrokerControlError>;
 
     fn fill_random(&self, output: &mut [u8]) -> core::result::Result<(), BrokerControlError>;
 
@@ -441,8 +441,8 @@ where
         self.request(BrokerLocal::create_thread)
     }
 
-    fn finish_thread(&self, thread_id: ThreadId) -> core::result::Result<(), BrokerControlError> {
-        self.request(|local| local.finish_thread(thread_id))
+    fn exit_thread(&self, thread_id: ThreadId) -> core::result::Result<(), BrokerControlError> {
+        self.request(|local| local.exit_thread(thread_id))
     }
 
     fn fill_random(&self, output: &mut [u8]) -> core::result::Result<(), BrokerControlError> {

@@ -157,17 +157,17 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Finishes a broker thread after local teardown completes.
+    /// Records broker thread exit after local teardown completes.
     ///
     /// # Panics
     ///
     /// Panics if the broker returns a response for a different operation.
-    pub fn finish_thread(&self, thread_id: ThreadId) -> Result<(), Channel::Error> {
-        match self.request(BrokerOperation::FinishThread(thread_id))? {
-            BrokerResult::ThreadFinished => Ok(()),
+    pub fn exit_thread(&self, thread_id: ThreadId) -> Result<(), Channel::Error> {
+        match self.request(BrokerOperation::ExitThread(thread_id))? {
+            BrokerResult::ThreadExited => Ok(()),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
             response => {
-                panic!("broker returned unexpected finish-thread response: {response:?}")
+                panic!("broker returned unexpected exit-thread response: {response:?}")
             }
         }
     }
@@ -412,9 +412,9 @@ mod tests {
     }
 
     #[test]
-    fn finish_thread_sends_owned_id() {
+    fn exit_thread_sends_owned_id() {
         let thread_id = ThreadId::new(7).unwrap();
-        let channel = FakeControlChannel::new(None, Some(BrokerResult::ThreadFinished));
+        let channel = FakeControlChannel::new(None, Some(BrokerResult::ThreadExited));
         let local = BrokerLocal {
             process_id: test_process_id(),
             channel,
@@ -422,12 +422,12 @@ mod tests {
             next_request_id: AtomicU64::new(0),
         };
 
-        local.finish_thread(thread_id).unwrap();
+        local.exit_thread(thread_id).unwrap();
         assert_eq!(
             local.channel.sent_request.borrow().clone(),
             Some(BrokerRequest {
                 request_id: RequestId(0),
-                operation: BrokerOperation::FinishThread(thread_id),
+                operation: BrokerOperation::ExitThread(thread_id),
             })
         );
     }

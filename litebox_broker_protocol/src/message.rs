@@ -46,8 +46,8 @@ pub struct BrokerHandshakeRequest {
 pub enum BrokerOperation {
     /// Create a broker thread belonging to this process.
     CreateThread,
-    /// Finish a broker thread after local teardown completes.
-    FinishThread(ThreadId),
+    /// Record broker thread exit after local teardown completes.
+    ExitThread(ThreadId),
     /// Close one broker object reference.
     CloseObject(ObjectHandle),
     /// Check the current readiness of a broker-owned object.
@@ -99,7 +99,7 @@ impl BrokerOperation {
                 | FileRequest::Rmdir(RmdirFileRequest { path: buffer, .. }),
             ) => Some(*buffer),
             Self::CreateThread
-            | Self::FinishThread(_)
+            | Self::ExitThread(_)
             | Self::CloseObject(_)
             | Self::CheckReadiness(_)
             | Self::Event(_)
@@ -216,8 +216,8 @@ pub enum SocketRequest {
 pub enum BrokerResult {
     /// A thread was created with this broker-assigned ID.
     ThreadCreated(ThreadId),
-    /// Thread teardown completed.
-    ThreadFinished,
+    /// Thread exit completed.
+    ThreadExited,
     /// Object close operation completed.
     ObjectClosed,
     /// Current readiness of a broker-owned object.

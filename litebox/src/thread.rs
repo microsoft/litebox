@@ -27,9 +27,9 @@ pub enum CreateError {
     ResourceExhausted,
 }
 
-/// Error returned while finishing a broker-backed thread.
+/// Error returned while exiting a broker-backed thread.
 #[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq)]
-pub enum FinishError {
+pub enum ExitError {
     /// The broker association is no longer usable.
     #[error("broker association failed")]
     AssociationFailed,
@@ -41,10 +41,10 @@ pub enum FinishError {
 /// One broker-backed thread belonging to the associated process.
 ///
 /// The shim owns this value for the lifetime of its local task. Normal task
-/// teardown must call [`Self::finish`] after guest and local thread cleanup.
-/// Dropping it without finishing leaves broker ownership in place until process
+/// teardown must call [`Self::exit`] after guest and local thread cleanup.
+/// Dropping it without exiting leaves broker ownership in place until process
 /// teardown.
-#[must_use = "normal thread teardown must call Thread::finish"]
+#[must_use = "normal thread teardown must call Thread::exit"]
 pub struct Thread {
     id: ThreadId,
     broker: Arc<dyn BrokerControl>,
@@ -57,14 +57,14 @@ impl Thread {
         self.id
     }
 
-    /// Completes normal thread teardown.
+    /// Records normal thread exit after local teardown completes.
     ///
     /// # Panics
     ///
     /// Panics if the broker returns an error that is invalid for thread
     /// teardown.
-    pub fn finish(self) -> Result<(), FinishError> {
-        self.broker.finish_thread(self.id).map_err(map_finish_error)
+    pub fn exit(self) -> Result<(), ExitError> {
+        self.broker.exit_thread(self.id).map_err(map_exit_error)
     }
 }
 
@@ -95,14 +95,14 @@ fn map_create_error(error: BrokerControlError) -> CreateError {
     }
 }
 
-fn map_finish_error(error: BrokerControlError) -> FinishError {
+fn map_exit_error(error: BrokerControlError) -> ExitError {
     match error {
-        BrokerControlError::AssociationFailed => FinishError::AssociationFailed,
+        BrokerControlError::AssociationFailed => ExitError::AssociationFailed,
         BrokerControlError::Broker(litebox_broker_protocol::error::ErrorCode::UnknownObject) => {
-            FinishError::UnknownThread
+            ExitError::UnknownThread
         }
         BrokerControlError::Broker(error) => {
-            panic!("broker returned unexpected finish-thread error: {error}")
+            panic!("broker returned unexpected exit-thread error: {error}")
         }
     }
 }
