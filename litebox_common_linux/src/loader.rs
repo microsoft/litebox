@@ -11,7 +11,7 @@
 use alloc::vec::Vec;
 use elf::file::FileHeader;
 use litebox::{
-    mm::linux::PAGE_SIZE,
+    mm::linux::{HOST_PAGE_SIZE, PAGE_SIZE},
     platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider},
     utils::{ReinterpretSignedExt as _, TruncateExt as _},
 };
@@ -224,7 +224,8 @@ impl ElfParsedFile {
 
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            // Reject LOADs that overlap after native-page alignment.
+            // Reject LOADs that overlap after guest-page alignment. Distinct 4 KiB
+            // LOADs may share a native macOS page; the platform fuses permissions.
             let mut ranges = alloc::vec::Vec::new();
             let table = elf::segment::SegmentTable::new(header.endianness, CLASS, &phdrs);
             for ph in table
@@ -559,9 +560,13 @@ impl ElfParsedFile {
             // Reserve space for a runtime trampoline so brk starts past it.
             // The runtime patching path (do_mmap_file → maybe_patch_exec_segment)
             // will allocate the actual trampoline in this region via MAP_FIXED.
-            info.brk = page_align_up(info.brk) + page_align_up(size);
+            // Match the runtime rewriter's native-page-aligned placement.
+            info.brk = info.brk.next_multiple_of(HOST_PAGE_SIZE) + page_align_up(size);
         }
 
+        // The initial writable brk heap must not share native backing with an
+        // executable LOAD or trampoline. Guest mmap/mprotect still use 4 KiB.
+        info.brk = info.brk.next_multiple_of(HOST_PAGE_SIZE);
         Ok(info)
     }
 
