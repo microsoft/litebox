@@ -20,12 +20,6 @@ use crate::platform::page_mgmt::MemoryRegionPermissions;
 /// Page size in bytes.
 pub const PAGE_SIZE: usize = 4096;
 
-/// Native page size supported by the platform. Guest-facing alignment remains [`PAGE_SIZE`].
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-pub const HOST_PAGE_SIZE: usize = 4096;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub const HOST_PAGE_SIZE: usize = 16384;
-
 bitflags::bitflags! {
     /// Flags to describe the properties of a memory region.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]

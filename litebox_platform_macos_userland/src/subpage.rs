@@ -7,6 +7,7 @@
 //! unmapped holes can inherit neighboring access. Mixed W/X pages switch between
 //! RW and RX on faults because Darwin cannot provide ordinary RWX mappings.
 
+use litebox::utils::TruncateExt as _;
 use std::collections::HashMap;
 use std::ops::Range;
 
@@ -34,11 +35,7 @@ fn host_range(range: &Range<usize>) -> Range<usize> {
             .unwrap_or(usize::MAX)
 }
 
-#[expect(
-    clippy::trivially_copy_pass_by_ref,
-    reason = "used with borrowed registry entries"
-)]
-fn fused(slots: &Slots) -> Perm {
+fn fused(slots: Slots) -> Perm {
     let mut permissions = slots.iter().flatten().fold(Perm::empty(), |p, s| p | *s);
     // Cache maintenance requires executable pages to be readable.
     if permissions.contains(Perm::EXEC) {
@@ -127,7 +124,7 @@ impl Mapping {
             return Err(result.into());
         }
         let alias = Self {
-            base: usize::try_from(target).expect("Mach address fits usize on AArch64"),
+            base: target.trunc(),
             len: HOST_PAGE_SIZE,
         };
         protect_range(alias.base, alias.len, Perm::READ | Perm::WRITE).map_err(allocation_error)?;
@@ -180,9 +177,13 @@ impl Pages {
     ) -> Result<recovery::Update, PermissionUpdateError> {
         let update = recovery::begin_update();
         for (index, (base, slots)) in changes.iter().enumerate() {
-            if let Err(error) = protect(*base, fused(slots)) {
+            if let Err(error) = protect(*base, fused(*slots)) {
                 for (base, _) in &changes[..index] {
-                    let previous = self.0.get(base).map_or(Perm::READ | Perm::WRITE, fused);
+                    let previous = self
+                        .0
+                        .get(base)
+                        .copied()
+                        .map_or(Perm::READ | Perm::WRITE, fused);
                     protect(*base, previous).expect("failed to roll back native page protection");
                 }
                 return Err(error);
@@ -242,8 +243,8 @@ impl Pages {
                     .collect();
                 let mut update = self.protect_changes(&changes).map_err(allocation_error)?;
                 for (base, slots) in changes {
-                    flush(base, fused(&slots));
-                    update.set(base, Some(fused(&slots)));
+                    flush(base, fused(slots));
+                    update.set(base, Some(fused(slots)));
                     self.0.insert(base, slots);
                 }
                 std::mem::forget(mapping); // Ownership transferred to the registry.
@@ -303,8 +304,8 @@ impl Pages {
             };
         }
         for (base, slots) in changes {
-            flush(base, fused(&slots));
-            update.set(base, Some(fused(&slots)));
+            flush(base, fused(slots));
+            update.set(base, Some(fused(slots)));
             self.0.insert(base, slots);
         }
         for reservation in reservations {
@@ -333,8 +334,8 @@ impl Pages {
         }
         let mut update = self.protect_changes(&changes)?;
         for (base, slots) in changes {
-            flush(base, fused(&slots));
-            update.set(base, Some(fused(&slots)));
+            flush(base, fused(slots));
+            update.set(base, Some(fused(slots)));
             self.0.insert(base, slots);
         }
         Ok(())
@@ -342,7 +343,6 @@ impl Pages {
 
     pub(super) fn deallocate(&mut self, range: Range<usize>) -> Result<(), DeallocationError> {
         // Bound sparse-unmap work by the smaller of the span and table capacity.
-        // HashMap iteration costs O(capacity), not O(len).
         let native = host_range(&range);
         let mut changes: Vec<_> = if native.len().div_ceil(HOST_PAGE_SIZE) <= self.0.capacity() {
             native
@@ -372,7 +372,7 @@ impl Pages {
                 update.set(base, None);
             } else {
                 self.0.insert(base, slots);
-                update.set(base, Some(fused(&slots)));
+                update.set(base, Some(fused(slots)));
             }
         }
         Ok(())
@@ -392,7 +392,7 @@ mod recovery {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::{HOST_PAGE_SIZE, Perm, host_base};
-    use crate::{Exception, read_tls, tls_offset, write_tls};
+    use crate::{Exception, exception_class, read_tls, tls_offset, write_tls};
 
     struct Registry {
         busy: AtomicBool,
@@ -490,21 +490,20 @@ mod recovery {
     }
 
     fn access(esr: u64) -> Option<Access> {
-        // Only permission faults, not translation/alignment/external aborts.
-        if !(0x0c..=0x0f).contains(&(esr & 0x3f)) {
+        const FSC_MASK: u64 = 0x3f;
+        const FSC_PERMISSION_LEVEL_0: u64 = 0x0c;
+        const FSC_PERMISSION_LEVEL_3: u64 = 0x0f;
+        const ISS_WRITE_NOT_READ: u64 = 1 << 6;
+
+        if !(FSC_PERMISSION_LEVEL_0..=FSC_PERMISSION_LEVEL_3).contains(&(esr & FSC_MASK)) {
             return None;
         }
-        match (esr >> 26) & 0x3f {
-            class
-                if class == u64::from(Exception::INSTRUCTION_ABORT_LOWER_EL.0)
-                    || class == u64::from(Exception::INSTRUCTION_ABORT_CURRENT_EL.0) =>
-            {
+        match Exception(exception_class(esr)) {
+            Exception::INSTRUCTION_ABORT_LOWER_EL | Exception::INSTRUCTION_ABORT_CURRENT_EL => {
                 Some(Access::Execute)
             }
-            class
-                if (class == u64::from(Exception::DATA_ABORT_LOWER_EL.0)
-                    || class == u64::from(Exception::DATA_ABORT_CURRENT_EL.0))
-                    && esr & (1 << 6) != 0 =>
+            Exception::DATA_ABORT_LOWER_EL | Exception::DATA_ABORT_CURRENT_EL
+                if esr & ISS_WRITE_NOT_READ != 0 =>
             {
                 Some(Access::Write)
             }

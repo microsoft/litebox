@@ -6,10 +6,10 @@
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use litebox::{
-    mm::linux::{HOST_PAGE_SIZE, MappingError, PAGE_SIZE},
+    mm::linux::{MappingError, PAGE_SIZE},
     platform::page_mgmt::MemoryRegionPermissions,
 };
-use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
+use litebox_common_linux::{HOST_PAGE_SIZE, MRemapFlags, MapFlags, ProtFlags, errno::Errno};
 
 use crate::ShimPlatform;
 use crate::Task;

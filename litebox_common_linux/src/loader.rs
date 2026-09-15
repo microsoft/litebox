@@ -11,14 +11,14 @@
 use alloc::vec::Vec;
 use elf::file::FileHeader;
 use litebox::{
-    mm::linux::{HOST_PAGE_SIZE, PAGE_SIZE},
+    mm::linux::PAGE_SIZE,
     platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider},
     utils::{ReinterpretSignedExt as _, TruncateExt as _},
 };
 use thiserror::Error;
 use zerocopy::FromBytes;
 
-use crate::errno::Errno;
+use crate::{HOST_PAGE_SIZE, errno::Errno};
 
 type Endian = elf::endian::LittleEndian;
 
@@ -224,8 +224,7 @@ impl ElfParsedFile {
 
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            // Reject LOADs that overlap after guest-page alignment. Distinct 4 KiB
-            // LOADs may share a native macOS page; the platform fuses permissions.
+            // Reject LOADs that overlap after guest-page alignment.
             let mut ranges = alloc::vec::Vec::new();
             let table = elf::segment::SegmentTable::new(header.endianness, CLASS, &phdrs);
             for ph in table
@@ -565,7 +564,7 @@ impl ElfParsedFile {
         }
 
         // The initial writable brk heap must not share native backing with an
-        // executable LOAD or trampoline. Guest mmap/mprotect still use 4 KiB.
+        // executable LOAD or trampoline. Guest mmap/mprotect still use the guest page size.
         info.brk = info.brk.next_multiple_of(HOST_PAGE_SIZE);
         Ok(info)
     }

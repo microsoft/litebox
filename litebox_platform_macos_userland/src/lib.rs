@@ -36,7 +36,8 @@ use litebox_syscall_rewriter::aarch64::{
 };
 use zerocopy::{FromBytes, IntoBytes};
 
-pub use litebox::mm::linux::{HOST_PAGE_SIZE, PAGE_SIZE};
+pub use litebox::mm::linux::PAGE_SIZE;
+pub use litebox_common_linux::HOST_PAGE_SIZE;
 mod subpage;
 /// The macOS host's Mach-O `__PAGEZERO` reserves the first 4 GiB.
 pub const TASK_ADDR_MIN: usize = 0x1_0000_0000;
@@ -2160,7 +2161,9 @@ pub(crate) fn register_exception_handlers() -> std::io::Result<()> {
 }
 
 fn exception_class(esr: u64) -> u8 {
-    (esr >> 26).trunc()
+    const EC_SHIFT: u32 = 26;
+    const EC_MASK: u64 = 0x3f;
+    ((esr >> EC_SHIFT) & EC_MASK).trunc()
 }
 
 fn is_synchronous_memory_fault(signal: i32, code: i32, esr: u64) -> bool {
@@ -2184,7 +2187,7 @@ fn is_synchronous_memory_fault(signal: i32, code: i32, esr: u64) -> bool {
 fn gate_interruption(signal: i32, code: i32, esr: u64) -> GateInterruption {
     if is_synchronous_memory_fault(signal, code, esr) {
         GateInterruption::Synchronous
-    } else if signal == libc::SIGTRAP && esr >> 26 == u64::from(Exception::BRK64.0) {
+    } else if signal == libc::SIGTRAP && exception_class(esr) == Exception::BRK64.0 {
         GateInterruption::Breakpoint
     } else {
         GateInterruption::Asynchronous
