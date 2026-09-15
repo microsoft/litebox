@@ -36,10 +36,8 @@ use litebox_syscall_rewriter::aarch64::{
 };
 use zerocopy::{FromBytes, IntoBytes};
 
-/// Native page size on AArch64 macOS. Independent of any guest ABI.
+/// Native page size on AArch64 macOS.
 pub const HOST_PAGE_SIZE: usize = 16384;
-/// The default platform uses native pages, even with `subpage_compat` enabled.
-pub const PAGE_SIZE: usize = HOST_PAGE_SIZE;
 
 /// Native 16 KiB page management.
 pub type MacosUserland = MacosUserlandWithPageSize<HOST_PAGE_SIZE>;
@@ -2588,7 +2586,7 @@ mod tests {
     #[test]
     fn native_page_size_rejects_subpage_operations() {
         let platform = MacosUserland::new();
-        assert_eq!(PAGE_SIZE, 16384);
+        assert_eq!(HOST_PAGE_SIZE, 16384);
         let base = platform
             .allocate_pages(
                 TASK_ADDR_MIN..TASK_ADDR_MIN + 2 * HOST_PAGE_SIZE,
@@ -2816,7 +2814,7 @@ mod tests {
         let stack_value = 0_u8;
         let platform = MacosUserland::new();
         let reserved_pages: Vec<_> = <MacosUserland as litebox::platform::PageManagementProvider<
-            PAGE_SIZE,
+            HOST_PAGE_SIZE,
         >>::reserved_pages(platform)
         .collect();
 
@@ -2825,8 +2823,8 @@ mod tests {
         for range in &reserved_pages {
             assert!(range.start >= previous_end);
             assert!(range.end > range.start);
-            assert!(range.start.is_multiple_of(PAGE_SIZE));
-            assert!(range.end.is_multiple_of(PAGE_SIZE));
+            assert!(range.start.is_multiple_of(HOST_PAGE_SIZE));
+            assert!(range.end.is_multiple_of(HOST_PAGE_SIZE));
             previous_end = range.end;
         }
         for address in [
@@ -3313,7 +3311,7 @@ mod tests {
         let (trampoline, trapped) = patch_code_segment_with_options(
             &mut code,
             base as u64,
-            (base + PAGE_SIZE / 2) as u64,
+            (base + HOST_PAGE_SIZE / 2) as u64,
             platform.get_syscall_entry_point() as u64,
             RewriteOptions::new(TargetHost::MacOs, true),
         )
@@ -3321,7 +3319,7 @@ mod tests {
         assert!(trapped.is_empty());
         assert_eq!(memory.write_slice_at_offset(0, &code), Some(()));
         assert_eq!(
-            memory.write_slice_at_offset((PAGE_SIZE / 2).cast_signed(), &trampoline),
+            memory.write_slice_at_offset((HOST_PAGE_SIZE / 2).cast_signed(), &trampoline),
             Some(())
         );
         // SAFETY: code is initialized and has no active readers before publication.
@@ -3488,14 +3486,14 @@ mod tests {
         let p = MacosUserland::new();
         let ptr = p
             .allocate_pages(
-                TASK_ADDR_MIN..TASK_ADDR_MIN + PAGE_SIZE,
+                TASK_ADDR_MIN..TASK_ADDR_MIN + HOST_PAGE_SIZE,
                 RW,
                 false,
                 true,
                 FixedAddressBehavior::Hint,
             )
             .unwrap();
-        let range = ptr.as_usize()..ptr.as_usize() + PAGE_SIZE;
+        let range = ptr.as_usize()..ptr.as_usize() + HOST_PAGE_SIZE;
         let _unmap = litebox::utils::defer(|| {
             // SAFETY: the test owns the mapping and its code has returned before cleanup.
             unsafe {
@@ -3530,14 +3528,14 @@ mod tests {
         let p = MacosUserland::new();
         let source = p
             .allocate_pages(
-                TASK_ADDR_MIN..TASK_ADDR_MIN + PAGE_SIZE,
+                TASK_ADDR_MIN..TASK_ADDR_MIN + HOST_PAGE_SIZE,
                 RW,
                 false,
                 true,
                 FixedAddressBehavior::Hint,
             )
             .unwrap();
-        let source_range = source.as_usize()..source.as_usize() + PAGE_SIZE;
+        let source_range = source.as_usize()..source.as_usize() + HOST_PAGE_SIZE;
         assert_eq!(
             source.write_slice_at_offset(0, &[0x40, 0x05, 0x80, 0xd2, 0xc0, 0x03, 0x5f, 0xd6]),
             Some(())
@@ -3552,14 +3550,14 @@ mod tests {
         }
         let target = p
             .allocate_pages(
-                TASK_ADDR_MIN..TASK_ADDR_MIN + 2 * PAGE_SIZE,
+                TASK_ADDR_MIN..TASK_ADDR_MIN + 2 * HOST_PAGE_SIZE,
                 RW,
                 false,
                 true,
                 FixedAddressBehavior::Hint,
             )
             .unwrap();
-        let target_range = target.as_usize()..target.as_usize() + 2 * PAGE_SIZE;
+        let target_range = target.as_usize()..target.as_usize() + 2 * HOST_PAGE_SIZE;
         // SAFETY: release the probe, then occupy its range as host memory so
         // remap_pages must choose a different destination without replacing it.
         unsafe { p.deallocate_pages(target_range.clone()).unwrap() };
@@ -3615,14 +3613,14 @@ mod tests {
         let p = MacosUserland::new();
         let ptr = p
             .allocate_pages(
-                TASK_ADDR_MIN..TASK_ADDR_MIN + PAGE_SIZE,
+                TASK_ADDR_MIN..TASK_ADDR_MIN + HOST_PAGE_SIZE,
                 RW,
                 false,
                 true,
                 FixedAddressBehavior::Hint,
             )
             .unwrap();
-        let range = ptr.as_usize()..ptr.as_usize() + PAGE_SIZE;
+        let range = ptr.as_usize()..ptr.as_usize() + HOST_PAGE_SIZE;
         let _unmap = litebox::utils::defer(|| {
             // SAFETY: the test owns this mapping and has no active accesses at cleanup.
             unsafe {
@@ -3650,7 +3648,7 @@ mod tests {
                 mach_vm_protect(
                     mach_task_self(),
                     range.start as u64,
-                    PAGE_SIZE as u64,
+                    HOST_PAGE_SIZE as u64,
                     1,
                     libc::PROT_READ
                 ),
@@ -3666,11 +3664,10 @@ mod tests {
     #[test]
     fn native_pages_preserve_neighbors_and_reject_collisions() {
         // Native-page boundaries still provide exact hardware protection.
-        const PAGE_SIZE: usize = HOST_PAGE_SIZE;
         let p = MacosUserland::new();
         let ptr = p
             .allocate_pages(
-                TASK_ADDR_MIN..TASK_ADDR_MIN + 2 * PAGE_SIZE,
+                TASK_ADDR_MIN..TASK_ADDR_MIN + 2 * HOST_PAGE_SIZE,
                 RW,
                 false,
                 true,
@@ -3678,12 +3675,15 @@ mod tests {
             )
             .unwrap();
         let base = ptr.as_usize();
-        assert_eq!(base % PAGE_SIZE, 0);
+        assert_eq!(base % HOST_PAGE_SIZE, 0);
         assert_eq!(ptr.read_at_offset(0), Some(0));
-        assert_eq!(ptr.write_at_offset(PAGE_SIZE.cast_signed(), 0x5a), Some(()));
+        assert_eq!(
+            ptr.write_at_offset(HOST_PAGE_SIZE.cast_signed(), 0x5a),
+            Some(())
+        );
         assert!(matches!(
             p.allocate_pages(
-                base..base + PAGE_SIZE,
+                base..base + HOST_PAGE_SIZE,
                 RW,
                 false,
                 true,
@@ -3692,30 +3692,33 @@ mod tests {
             Err(AllocationError::AddressInUse)
         ));
         p.allocate_pages(
-            base..base + PAGE_SIZE,
+            base..base + HOST_PAGE_SIZE,
             RW,
             false,
             true,
             FixedAddressBehavior::Replace,
         )
         .unwrap();
-        assert_eq!(ptr.read_at_offset(PAGE_SIZE.cast_signed()), Some(0x5a));
+        assert_eq!(ptr.read_at_offset(HOST_PAGE_SIZE.cast_signed()), Some(0x5a));
         // SAFETY: no accesses to the first test-owned page overlap this permission change.
         unsafe {
-            p.update_permissions(base..base + PAGE_SIZE, MemoryRegionPermissions::READ)
+            p.update_permissions(base..base + HOST_PAGE_SIZE, MemoryRegionPermissions::READ)
                 .unwrap();
         }
         assert_eq!(ptr.write_at_offset(0, 1), None); // Fault-safe exception-table recovery
-        assert_eq!(ptr.write_at_offset(PAGE_SIZE.cast_signed(), 0x6b), Some(()));
+        assert_eq!(
+            ptr.write_at_offset(HOST_PAGE_SIZE.cast_signed(), 0x6b),
+            Some(())
+        );
         // SAFETY: the first page is idle; subsequent probes use fallible raw accesses.
         unsafe {
-            p.deallocate_pages(base..base + PAGE_SIZE).unwrap();
+            p.deallocate_pages(base..base + HOST_PAGE_SIZE).unwrap();
         }
         assert_eq!(ptr.read_at_offset(0), None);
-        assert_eq!(ptr.read_at_offset(PAGE_SIZE.cast_signed()), Some(0x6b));
+        assert_eq!(ptr.read_at_offset(HOST_PAGE_SIZE.cast_signed()), Some(0x6b));
         // SAFETY: the remaining test-owned page is no longer accessed.
         unsafe {
-            p.deallocate_pages(base + PAGE_SIZE..base + 2 * PAGE_SIZE)
+            p.deallocate_pages(base + HOST_PAGE_SIZE..base + 2 * HOST_PAGE_SIZE)
                 .unwrap();
         }
     }
@@ -3727,7 +3730,7 @@ mod tests {
         let host = unsafe {
             libc::mmap(
                 core::ptr::null_mut(),
-                PAGE_SIZE,
+                HOST_PAGE_SIZE,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE | libc::MAP_ANON,
                 -1,
@@ -3745,7 +3748,7 @@ mod tests {
         ] {
             assert!(matches!(
                 p.allocate_pages(
-                    host as usize..host as usize + PAGE_SIZE,
+                    host as usize..host as usize + HOST_PAGE_SIZE,
                     RW,
                     false,
                     true,
@@ -3756,14 +3759,14 @@ mod tests {
         }
         // SAFETY: the range is idle; the platform must leave this unowned mapping intact.
         unsafe {
-            p.deallocate_pages(host as usize..host as usize + PAGE_SIZE)
+            p.deallocate_pages(host as usize..host as usize + HOST_PAGE_SIZE)
                 .unwrap();
         }
         // SAFETY: rejected replacements and unowned deallocation leave the initialized byte mapped.
         assert_eq!(unsafe { host.cast::<u8>().read() }, 0x42);
         // SAFETY: this releases the test's still-live mapping after its last access.
         unsafe {
-            libc::munmap(host, PAGE_SIZE);
+            libc::munmap(host, HOST_PAGE_SIZE);
         }
     }
 }
