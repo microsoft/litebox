@@ -7,7 +7,7 @@
 use std::cell::Cell;
 use std::ops::Range;
 use std::sync::{
-    Arc, Condvar, Mutex, OnceLock,
+    Arc, Condvar, Mutex, OnceLock, Weak,
     atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicUsize, Ordering},
 };
 use std::time::Duration;
@@ -1338,18 +1338,21 @@ fn thread_start(
 struct ProcessState {
     /// Undrained timer signals survive any individual thread's exit.
     pending_signals: AtomicU32,
+    /// Weak entries avoid a cycle with ThreadState::process.
+    threads: Mutex<Vec<Weak<ThreadState>>>,
 }
 
 impl ProcessState {
-    fn deliver_signal(self: &Arc<Self>, signal: litebox_common_linux::signal::Signal) {
+    fn deliver_signal(&self, signal: litebox_common_linux::signal::Signal) {
         self.pending_signals
             .fetch_or(1u32 << (signal.as_i32() - 1), Ordering::Relaxed);
-        let targets: Vec<_> = ACTIVE_THREADS
+        let targets: Vec<_> = self
+            .threads
             .lock()
             .unwrap()
             .iter()
-            .filter(|thread| Arc::ptr_eq(&thread.0.process, self))
-            .cloned()
+            .filter_map(Weak::upgrade)
+            .map(ThreadHandle)
             .collect();
         // Wake all siblings outside the registry lock to tolerate exits.
         // New threads check pending signals before running or sleeping.
@@ -1371,14 +1374,32 @@ struct ThreadState {
 #[derive(Clone)]
 pub struct ThreadHandle(Arc<ThreadState>);
 
-static ACTIVE_THREADS: Mutex<Vec<ThreadHandle>> = Mutex::new(Vec::new());
-
 impl ThreadHandle {
     fn current() -> Self {
         let handle = read_tls(tls_offset::CURRENT_THREAD) as *const ThreadHandle;
         assert!(!handle.is_null(), "not running a LiteBox thread");
         // SAFETY: CURRENT_THREAD points to this thread's live stack-owned handle.
         unsafe { (*handle).clone() }
+    }
+
+    fn register(&self) {
+        self.0
+            .process
+            .threads
+            .lock()
+            .unwrap()
+            .push(Arc::downgrade(&self.0));
+    }
+
+    fn unregister(&self) {
+        let entry = Arc::downgrade(&self.0);
+        self.0
+            .process
+            .threads
+            .lock()
+            .unwrap()
+            .retain(|active| !active.ptr_eq(&entry));
+        *self.0.identity.lock().unwrap() = None;
     }
 
     fn interrupt(&self) {
@@ -1445,14 +1466,10 @@ impl litebox::platform::ThreadProvider for MacosUserland {
             waker: Mutex::new(None),
         }));
         write_tls(tls_offset::CURRENT_THREAD, (&raw const handle) as usize);
-        ACTIVE_THREADS.lock().unwrap().push(handle.clone());
+        handle.register();
         let cleanup_handle = handle.clone();
         let _cleanup = litebox::utils::defer(move || {
-            ACTIVE_THREADS
-                .lock()
-                .unwrap()
-                .retain(|active| !Arc::ptr_eq(&active.0, &cleanup_handle.0));
-            *cleanup_handle.0.identity.lock().unwrap() = None;
+            cleanup_handle.unregister();
             write_tls(tls_offset::CURRENT_THREAD, 0);
         });
         f()
@@ -1915,13 +1932,9 @@ fn run_thread_inner_with_process(
         (&raw const thread_ctx.thread) as usize,
     );
     let thread_handle = thread_ctx.thread.clone();
-    ACTIVE_THREADS.lock().unwrap().push(thread_handle.clone());
+    thread_handle.register();
     let _registration = litebox::utils::defer(move || {
-        ACTIVE_THREADS
-            .lock()
-            .unwrap()
-            .retain(|active| !Arc::ptr_eq(&active.0, &thread_handle.0));
-        *thread_handle.0.identity.lock().unwrap() = None;
+        thread_handle.unregister();
         write_tls(tls_offset::ACTIVE, 0);
         write_tls(tls_offset::CURRENT_THREAD, 0);
         write_tls(tls_offset::IN_GUEST, 0);

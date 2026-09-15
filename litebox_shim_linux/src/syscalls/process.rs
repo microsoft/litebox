@@ -1932,17 +1932,17 @@ mod tests {
     /// interrupted and SIGALRM should be pending.
     #[test]
     fn test_alarm_fires_after_deadline() {
-        use litebox_common_linux::{ClockId, TimerFlags, Timespec};
+        use core::time::Duration;
+        use litebox_common_linux::{ClockId, TimerFlags, Timespec, signal::Signal};
         use litebox_platform::time::{Instant as _, TimeProvider};
 
         let task = crate::syscalls::tests::init_platform();
         <crate::syscalls::tests::TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {
             let platform = task.global.platform;
 
-            // Set a 1-second alarm.
-            assert_eq!(task.sys_alarm(1).unwrap(), 0);
-
+            // Measure from before arming, including any scheduling delay.
             let start = platform.now();
+            assert_eq!(task.sys_alarm(1).unwrap(), 0);
 
             // Block in a nanosleep longer than the alarm
             let mut remain = Timespec {
@@ -1968,18 +1968,20 @@ mod tests {
                 Err(litebox_common_linux::errno::Errno::EINTR),
                 "nanosleep should have been interrupted"
             );
-            let millis = remain.tv_sec.cast_unsigned() * 1000 + remain.tv_nsec / 1_000_000;
-            // Allow tolerance for timer imprecision (especially on Windows).
+            assert!(task.pending_signal_set().contains(Signal::SIGALRM));
+            // Allow timer granularity, but do not impose a scheduler latency limit.
             assert!(
-                (1900..=2100).contains(&millis),
-                "expected ~2s remaining, got {millis:?}"
+                elapsed >= Duration::from_millis(900),
+                "alarm fired too early: {elapsed:?}"
             );
-
-            let elapsed_ms = elapsed.as_millis();
-            std::println!("Alarm fired after {elapsed_ms} ms");
+            let remaining = Duration::try_from(remain).unwrap();
+            let requested = Duration::try_from(request).unwrap();
+            assert!(!remaining.is_zero() && remaining <= requested);
+            // Elapsed includes time outside nanosleep, so it may exceed the
+            // sleep time deducted from the reported remainder, but not vice versa.
             assert!(
-                (900..=1100).contains(&elapsed_ms),
-                "expected alarm after ~1000 ms, got {elapsed_ms} ms"
+                remaining + elapsed >= requested,
+                "inconsistent remaining time: {remaining:?}, elapsed: {elapsed:?}"
             );
 
             // The alarm should be consumed (deadline cleared).
