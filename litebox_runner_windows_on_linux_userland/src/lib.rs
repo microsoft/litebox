@@ -89,7 +89,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     } = litebox_platform_linux_userland::with_guest_signals_blocked(|| {
         broker::connect(control_socket)
     })?;
-    let process_id = local.process_id();
+    let process_id = local.process_id().0 as usize;
     let litebox = litebox::LiteBox::new_with_broker_local(platform, local);
     let initial_thread = litebox.create_thread()?;
     coordinator.install_dispatch(litebox.broker_failure_dispatcher());

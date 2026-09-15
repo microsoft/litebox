@@ -203,15 +203,12 @@ impl<Platform: ShimPlatform> LinuxShimEntrypoints<Platform> {
 pub struct LinuxShimBuilder<Platform: ShimPlatform> {
     platform: &'static Platform,
     litebox: LiteBox<Platform>,
-    process_id: litebox_broker_protocol::ProcessId,
+    process_id: i32,
 }
 
 impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
     /// Returns a new shim builder using the given platform.
-    pub fn new(
-        platform: &'static Platform,
-        process_id: litebox_broker_protocol::ProcessId,
-    ) -> Self {
+    pub fn new(platform: &'static Platform, process_id: i32) -> Self {
         Self::new_with_litebox(platform, LiteBox::new(platform), process_id)
     }
 
@@ -219,7 +216,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
     pub fn new_with_litebox(
         platform: &'static Platform,
         litebox: LiteBox<Platform>,
-        process_id: litebox_broker_protocol::ProcessId,
+        process_id: i32,
     ) -> Self {
         Self {
             platform,
@@ -263,10 +260,6 @@ impl<Platform: ShimPlatform> Clone for LinuxShim<Platform> {
 impl<Platform: ShimPlatform> LinuxShim<Platform> {
     /// Loads the program at `path` as the shim's initial task, returning the
     /// initial register state.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the broker-assigned process ID cannot fit Linux `pid_t`.
     pub fn load_program(
         &self,
         task: litebox_common_linux::TaskParams,
@@ -282,9 +275,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             gid,
             egid,
         } = task;
-        let expected_pid = i32::try_from(self.0.process_id.0)
-            .expect("the broker-assigned process ID must fit Linux pid_t");
-        if pid != expected_pid || ppid != 0 {
+        if pid != self.0.process_id || ppid != 0 {
             return Err(loader::elf::ElfLoaderError::InvalidProcessId);
         }
 
@@ -304,7 +295,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             _not_send: core::marker::PhantomData,
             task: Task {
                 global: self.0.clone(),
-                broker_thread: None,
+                litebox_thread: None,
                 thread: syscalls::process::ThreadState::new_process(pid),
                 wait_state: wait::WaitState::new(self.0.platform),
                 pid,
@@ -1174,8 +1165,8 @@ struct GlobalState<Platform: ShimPlatform> {
     net: litebox::sync::Mutex<Platform, Network<Platform>>,
     /// The time when the shim was started.
     boot_time: <Platform as TimeProvider>::Instant,
-    /// Broker-assigned process ID.
-    process_id: litebox_broker_protocol::ProcessId,
+    /// Process ID assigned to this shim.
+    process_id: i32,
     /// UNIX domain socket address table
     unix_addr_table: litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable<Platform>>,
     /// Per-process collection of ELF patching state for runtime syscall rewriting.
@@ -1184,7 +1175,7 @@ struct GlobalState<Platform: ShimPlatform> {
 
 struct Task<Platform: ShimPlatform> {
     global: Arc<GlobalState<Platform>>,
-    broker_thread: Option<litebox::thread::Thread>,
+    litebox_thread: Option<litebox::thread::Thread>,
     wait_state: wait::WaitState<Platform>,
     thread: syscalls::process::ThreadState<Platform>,
     /// Process ID
@@ -1215,13 +1206,13 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
 impl<Platform: ShimPlatform> Drop for Task<Platform> {
     fn drop(&mut self) {
         self.prepare_for_exit();
-        if let Some(thread) = self.broker_thread.take() {
+        if let Some(thread) = self.litebox_thread.take() {
             let thread_id = thread.id();
             if let Err(error) = thread.exit() {
                 litebox_util_log::error!(
                     error:% = error,
-                    thread_id = thread_id.0;
-                    "failed to record broker thread exit"
+                    thread_id;
+                    "failed to record thread exit"
                 );
             }
         }
@@ -1236,8 +1227,7 @@ mod test_utils {
     impl<Platform: ShimPlatform> GlobalState<Platform> {
         /// Make a new task with default values for testing.
         pub(crate) fn new_test_task(self: Arc<Self>) -> Task<Platform> {
-            let pid = i32::try_from(self.process_id.0)
-                .expect("the broker-assigned process ID must fit Linux pid_t");
+            let pid = self.process_id;
             let files = Arc::new(syscalls::file::FilesState::new());
             let credentials = Arc::new(syscalls::process::Credentials {
                 uid: 0,
@@ -1249,7 +1239,7 @@ mod test_utils {
             files.initialize_stdio_in_shared_descriptors_table(&self, &fs_state.context.read());
             Task {
                 wait_state: wait::WaitState::new(self.platform),
-                broker_thread: None,
+                litebox_thread: None,
                 thread: syscalls::process::ThreadState::new_process(pid),
                 pid,
                 ppid: 0,
@@ -1267,17 +1257,17 @@ mod test_utils {
     impl<Platform: ShimPlatform> Task<Platform> {
         /// Returns a clone of this task with a new TID for testing.
         pub(crate) fn clone_for_test(&self) -> Option<Self> {
-            let broker_thread = self.global.create_thread().ok()?;
-            let tid = i32::try_from(broker_thread.id().0)
-                .expect("the broker-assigned thread ID must fit Linux pid_t");
+            let litebox_thread = self.global.create_thread().ok()?;
+            let tid = i32::try_from(litebox_thread.id())
+                .expect("the assigned thread ID must fit Linux pid_t");
             let Some(thread) = self.thread.new_thread(tid) else {
-                let _ = broker_thread.exit();
+                let _ = litebox_thread.exit();
                 return None;
             };
             let task = Task {
                 wait_state: wait::WaitState::new(self.global.platform),
                 global: self.global.clone(),
-                broker_thread: Some(broker_thread),
+                litebox_thread: Some(litebox_thread),
                 thread,
                 pid: self.pid,
                 ppid: self.ppid,
