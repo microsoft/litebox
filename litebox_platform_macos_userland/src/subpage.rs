@@ -605,71 +605,15 @@ mod tests {
     };
     use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
     use litebox_common_linux::PtRegs;
-    use litebox_common_linux::loader::{
-        AccessMemory as _, ElfParsedFile, MapMemory, Protection, ReadAt,
-    };
+    use litebox_common_linux::loader::{ElfParsedFile, MapMemory, Protection, ReadAt};
 
     const R: Perm = Perm::READ;
     const RW: Perm = Perm::READ.union(Perm::WRITE);
     const RX: Perm = Perm::READ.union(Perm::EXEC);
 
-    struct TestMapping {
-        platform: &'static MacosUserland,
-        range: Range<usize>,
-    }
-
-    impl TestMapping {
-        fn new(len: usize) -> Self {
-            let platform = MacosUserland::new();
-            // Own whole native pages so no unrelated mapping shares our backing.
-            let len = len.next_multiple_of(HOST_PAGE_SIZE);
-            let base = platform
-                .allocate_pages(
-                    TASK_ADDR_MIN..TASK_ADDR_MIN + len,
-                    RW,
-                    false,
-                    true,
-                    FixedAddressBehavior::Hint,
-                )
-                .unwrap()
-                .as_usize();
-            Self {
-                platform,
-                range: base..base + len,
-            }
-        }
-
-        fn write_code(&self, offset: usize, code: &[u32]) {
-            let bytes: Vec<_> = code.iter().flat_map(|word| word.to_le_bytes()).collect();
-            self.write(self.range.start + offset, &bytes);
-        }
-
-        fn write(&self, address: usize, data: &[u8]) {
-            let mut platform = self.platform;
-            platform.write(address, data).unwrap();
-        }
-
-        fn read(&self, address: usize, data: &mut [u8]) {
-            let mut platform = self.platform;
-            assert_eq!(platform.read(address, data).unwrap(), data.len());
-        }
-
-        fn protect(&self, range: Range<usize>, permissions: Perm) {
-            assert!(self.range.start <= range.start && range.end <= self.range.end);
-            // SAFETY: the test owns this mapping and changes permissions only while idle.
-            unsafe {
-                self.platform
-                    .update_permissions(range, permissions)
-                    .unwrap();
-            }
-        }
-    }
-
-    impl Drop for TestMapping {
-        fn drop(&mut self) {
-            // SAFETY: all guest execution has stopped before the test releases its mapping.
-            unsafe { self.platform.deallocate_pages(self.range.clone()).unwrap() };
-        }
+    fn write_code(address: usize, code: &[u32]) {
+        let bytes: Vec<_> = code.iter().flat_map(|word| word.to_le_bytes()).collect();
+        assert_eq!(ptr(address).write_slice_at_offset(0, &bytes), Some(()));
     }
 
     struct Image(Vec<u8>);
@@ -690,7 +634,7 @@ mod tests {
 
     struct ImageMapper<'a> {
         image: &'a Image,
-        mapping: Option<TestMapping>,
+        pages: TestPages,
     }
 
     impl MapMemory for ImageMapper<'_> {
@@ -699,12 +643,8 @@ mod tests {
         fn reserve(&mut self, len: usize, align: usize) -> Result<usize, ()> {
             // These fixtures require only guest-page alignment; native allocation is stronger.
             assert_eq!(align, PAGE_SIZE);
-            assert!(self.mapping.is_none());
-            let mapping = TestMapping::new(len);
-            mapping.protect(mapping.range.clone(), Perm::empty());
-            let base = mapping.range.start;
+            let base = self.pages.allocate(len, Perm::empty());
             assert_eq!(base % align, 0);
-            self.mapping = Some(mapping);
             Ok(base)
         }
 
@@ -717,32 +657,19 @@ mod tests {
         ) -> Result<(), ()> {
             let offset = usize::try_from(offset).unwrap();
             assert_eq!(offset % PAGE_SIZE, 0);
-            self.map_zero(
-                address,
-                len,
-                &Protection {
-                    read: true,
-                    write: true,
-                    execute: false,
-                },
-            )?;
+            self.pages
+                .0
+                .allocate(address..address + len, RW, FixedAddressBehavior::Replace)
+                .unwrap();
             let data = &self.image.0[offset..self.image.0.len().min(offset + len)];
-            self.mapping.as_ref().unwrap().write(address, data);
+            assert_eq!(ptr(address).write_slice_at_offset(0, data), Some(()));
             self.protect(address, len, prot)
         }
 
         fn map_zero(&mut self, address: usize, len: usize, prot: &Protection) -> Result<(), ()> {
-            let mapping = self.mapping.as_ref().unwrap();
-            assert!(mapping.range.start <= address && address + len <= mapping.range.end);
-            mapping
-                .platform
-                .allocate_pages(
-                    address..address + len,
-                    RW,
-                    false,
-                    true,
-                    FixedAddressBehavior::Replace,
-                )
+            self.pages
+                .0
+                .allocate(address..address + len, RW, FixedAddressBehavior::Replace)
                 .unwrap();
             self.protect(address, len, prot)
         }
@@ -752,10 +679,10 @@ mod tests {
             permissions.set(Perm::READ, prot.read);
             permissions.set(Perm::WRITE, prot.write);
             permissions.set(Perm::EXEC, prot.execute);
-            self.mapping
-                .as_ref()
-                .unwrap()
-                .protect(address..address + len, permissions);
+            self.pages
+                .0
+                .update_permissions(address..address + len, permissions)
+                .unwrap();
             Ok(())
         }
     }
@@ -795,39 +722,32 @@ mod tests {
         let elf = ElfParsedFile::parse(&mut image).unwrap();
         let mut mapper = ImageMapper {
             image: &image,
-            mapping: None,
+            pages: TestPages::new(),
         };
         let info = elf
             .load(&mut mapper, &mut MacosUserland::new(), None)
             .unwrap();
-        let mapping = mapper.mapping.as_ref().unwrap();
         assert_eq!(info.entry_point, info.base_addr + 2 * PAGE_SIZE);
         assert_eq!(info.phdrs_addr, info.base_addr + 64);
         assert_eq!(info.num_phdrs, 2);
         assert_eq!(info.brk, info.base_addr + HOST_PAGE_SIZE);
-        let mut headers = vec![0; PAGE_SIZE];
-        mapping.read(info.base_addr, &mut headers);
-        assert_eq!(headers, image.0[..PAGE_SIZE]);
-        let mut platform = mapping.platform;
-        assert!(platform.write(info.base_addr, &[0]).is_err());
-        let result: usize;
-        // SAFETY: the real ELF loader and platform mapper installed a C-ABI mov/ret stub.
-        unsafe {
-            core::arch::asm!("blr {entry}", entry = in(reg) info.entry_point,
-                lateout("x0") result, clobber_abi("C"));
-        }
-        assert_eq!(result, 42);
+        assert_eq!(
+            &*ptr(info.base_addr).to_owned_slice(PAGE_SIZE).unwrap(),
+            &image.0[..PAGE_SIZE]
+        );
+        assert_eq!(ptr(info.base_addr).write_at_offset(0, 0), None);
+        assert_eq!(execute(info.entry_point), 42);
     }
 
     #[test]
     fn executes_and_writes_mixed_subpages_from_another_native_page() {
-        let mapping = TestMapping::new(2 * HOST_PAGE_SIZE);
-        let base = mapping.range.start;
+        let mut pages = TestPages::new();
+        let base = pages.allocate(2 * HOST_PAGE_SIZE, RW);
         let helper = base + HOST_PAGE_SIZE;
         let data = helper + PAGE_SIZE;
         // Only caller-saved registers are modified. x1=data, x2=helper.
-        mapping.write_code(
-            0,
+        write_code(
+            base,
             &[
                 0xaa1e03e9, // mov x9, x30
                 0xd63f0040, // blr x2 -- helper's native page becomes RX
@@ -839,9 +759,15 @@ mod tests {
                 0xd65f03c0, // ret
             ],
         );
-        mapping.write_code(HOST_PAGE_SIZE, &[0xd2800540, 0xd65f03c0]); // mov x0, #42; ret
-        mapping.protect(base..base + HOST_PAGE_SIZE, RX);
-        mapping.protect(helper..helper + PAGE_SIZE, RX);
+        write_code(helper, &[0xd2800540, 0xd65f03c0]); // mov x0, #42; ret
+        pages
+            .0
+            .update_permissions(base..base + HOST_PAGE_SIZE, RX)
+            .unwrap();
+        pages
+            .0
+            .update_permissions(helper..helper + PAGE_SIZE, RX)
+            .unwrap();
         let result: usize;
         // SAFETY: both code stubs obey the C ABI and all code/data mappings remain live.
         unsafe {
@@ -849,9 +775,10 @@ mod tests {
                 in("x1") data, in("x2") helper, lateout("x0") result, clobber_abi("C"));
         }
         assert_eq!(result, 43);
-        let mut stored = [0; 4];
-        mapping.read(data, &mut stored);
-        assert_eq!(u32::from_le_bytes(stored), 43);
+        assert_eq!(
+            UserMutPtr::<u32>::from_usize(data).read_at_offset(0),
+            Some(43)
+        );
     }
 
     #[test]
@@ -916,11 +843,14 @@ mod tests {
             );
             return;
         }
-        let mapping = TestMapping::new(2 * HOST_PAGE_SIZE);
-        let base = mapping.range.start;
+        let mut pages = TestPages::new();
+        let base = pages.allocate(2 * HOST_PAGE_SIZE, RW);
         // If the store incorrectly succeeds, the BRK reports a distinguishable exception.
-        mapping.write_code(0, &[0xb9000020, 0xd4200000]); // str w0, [x1]; brk #0
-        mapping.protect(base..base + PAGE_SIZE, RX);
+        write_code(base, &[0xb9000020, 0xd4200000]); // str w0, [x1]; brk #0
+        pages
+            .0
+            .update_permissions(base..base + PAGE_SIZE, RX)
+            .unwrap();
         let fault = std::cell::Cell::new(None);
         // SAFETY: the probe supplies live code/data and a separate writable guest stack.
         unsafe {
@@ -928,7 +858,7 @@ mod tests {
                 FaultProbe {
                     entry: base,
                     data: base + PAGE_SIZE,
-                    stack: mapping.range.end,
+                    stack: base + 2 * HOST_PAGE_SIZE,
                     fault: &fault,
                 },
                 &mut PtRegs::default(),
@@ -941,9 +871,11 @@ mod tests {
         assert_eq!(info.fault_address, base + PAGE_SIZE);
         assert_eq!(info.esr >> 26, 0x24); // Data abort from a lower exception level.
         assert_ne!(info.esr & (1 << 6), 0); // Write, not instruction fetch.
-        let mut stored = [0; 4];
-        mapping.read(base + PAGE_SIZE, &mut stored);
-        assert_eq!(stored, [0; 4], "the rejected store must not execute");
+        assert_eq!(
+            UserMutPtr::<u32>::from_usize(base + PAGE_SIZE).read_at_offset(0),
+            Some(0),
+            "the rejected store must not execute"
+        );
         println!("{COMPLETED}");
     }
 
