@@ -20,7 +20,7 @@ use crate::FileFd;
 use crate::ShimPlatform;
 use crate::Task;
 use crate::UserPtrMut;
-use crate::syscalls::file::AnyTypedFd;
+use crate::syscalls::file::{AnyTypedFd, FilesState};
 use litebox::utils::TruncateExt as _;
 use object::elf::{ET_DYN, FileHeader64, PT_LOAD, ProgramHeader64};
 use object::endian::LittleEndian;
@@ -93,12 +93,16 @@ impl<Platform: ShimPlatform> Ord for ElfPatchKey<Platform> {
 
 /// Per-process ELF patching state, keyed by retained descriptor identity.
 ///
+/// A `None` value is a negative cache entry, recorded when a descriptor has been
+/// probed and found not to be an ELF image we patch. It stops the header probe
+/// from re-running on every mapping of the same descriptor.
+///
 /// TODO: Deferred patching currently assumes the descriptor remains open until its
 /// mappings gain `PROT_EXEC`. Closing the descriptor removes its entry even if
 /// mappings survive, so `mmap -> close -> mprotect(PROT_EXEC)` can skip patching.
 /// Supporting that sequence requires patch state to follow mapping lifetime,
 /// independently of descriptor lifetime.
-pub(crate) type ElfPatchCache<Platform> = BTreeMap<ElfPatchKey<Platform>, ElfPatchState>;
+pub(crate) type ElfPatchCache<Platform> = BTreeMap<ElfPatchKey<Platform>, Option<ElfPatchState>>;
 
 #[inline]
 fn align_up(addr: usize, align: usize) -> usize {
@@ -163,7 +167,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         // Perform the normal mmap first (CoW or memcpy fallback).
         let result = if let Some(cow_result) =
-            self.try_cow_mmap_file(suggested_addr, len, &prot, &flags, &typed_fd, offset)
+            self.try_cow_mmap_file(suggested_addr, len, prot, &flags, &typed_fd, offset)
         {
             cow_result?
         } else {
@@ -175,21 +179,22 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // Runtime syscall rewriting: patch PROT_EXEC segments in-place.
         if is_exec {
             let syscall_entry = self.global.platform.get_syscall_entry_point();
-            if syscall_entry != 0
-                && !self.maybe_patch_exec_segment(
-                    result,
-                    len,
-                    &patch_key,
-                    syscall_entry,
-                    Some(offset),
-                )
-            {
-                // Trampoline setup failed for a pre-patched binary whose
-                // .text already contains JMPs to the trampoline address.
-                // Continuing would guarantee a SIGSEGV on the first
-                // rewritten syscall, so fail the mmap instead.
-                let _ = self.sys_munmap(result, len);
-                return Err(Errno::ENOMEM);
+            if syscall_entry != 0 {
+                if let Err(e) =
+                    self.maybe_patch_exec_segment(result, len, &patch_key, syscall_entry, offset)
+                {
+                    // The segment may still contain raw `syscall` instructions, or
+                    // (for a pre-patched binary) JMPs to a trampoline that was never
+                    // mapped. Either way, exposing it as executable is unsafe, so
+                    // fail the mmap instead.
+                    let _ = self.sys_munmap(result, len);
+                    return Err(e);
+                }
+                // The patcher restores the mapping to RX.
+                debug_assert!(
+                    !prot.contains(ProtFlags::PROT_WRITE),
+                    "mapping should not be writable after patching"
+                );
             }
         } else {
             // Ensure patch state is initialized for this fd (no-op if already done).
@@ -197,7 +202,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             // Track non-exec file mappings so we can patch them if they later
             // gain PROT_EXEC via mprotect.
             let mut cache = self.global.elf_patch_cache.lock();
-            if let Some(state) = cache.get_mut(&patch_key) {
+            if let Some(Some(state)) = cache.get_mut(&patch_key) {
                 let mapping_key = (result.as_usize(), len);
                 // Overlapping entries are safe here: file_mappings is only used
                 // to know which (addr, len) ranges belong to this fd so we can
@@ -219,7 +224,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         &self,
         suggested_addr: Option<usize>,
         len: usize,
-        prot: &ProtFlags,
+        prot: ProtFlags,
         flags: &MapFlags,
         fd: &FileFd<Platform>,
         offset: usize,
@@ -316,23 +321,23 @@ impl<Platform: ShimPlatform> Task<Platform> {
             // `sys_read` does not handle page faults, so we need to use a
             // temporary buffer to read the data from fs (without worrying page
             // faults) and write it to the user buffer with page fault handling.
+            let files = self.files.borrow();
             let mut file_offset = offset;
             let mut buffer = [0; PAGE_SIZE];
             let mut copied = 0;
             while copied < len {
-                let size = self
-                    .files
-                    .borrow()
-                    .fs
-                    .read(fd, &mut buffer, Some(file_offset))
-                    .map_err(|e| match e {
-                        // The raw fd was resolved once at syscall entry and is intentionally
-                        // not retained; this payload is discarded when converted to EBADF.
-                        ReadError::ClosedFd => MappingError::BadFD(-1),
-                        ReadError::NotAFile => MappingError::NotAFile,
-                        ReadError::NotForReading => MappingError::NotForReading,
-                        _ => unimplemented!(),
-                    })?;
+                let size =
+                    files
+                        .fs
+                        .read(fd, &mut buffer, Some(file_offset))
+                        .map_err(|e| match e {
+                            // The raw fd was resolved once at syscall entry and is intentionally
+                            // not retained; this payload is discarded when converted to EBADF.
+                            ReadError::ClosedFd => MappingError::BadFD(-1),
+                            ReadError::NotAFile => MappingError::NotAFile,
+                            ReadError::NotForReading => MappingError::NotForReading,
+                            _ => unimplemented!(),
+                        })?;
                 if size == 0 {
                     break;
                 }
@@ -438,7 +443,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     fn clear_file_mappings_for_range(&self, unmap_start: usize, unmap_len: usize) {
         let unmap_end = unmap_start.saturating_add(unmap_len);
         let mut cache = self.global.elf_patch_cache.lock();
-        for state in cache.values_mut() {
+        for state in cache.values_mut().flatten() {
             state.file_mappings.retain(|&(vaddr, seg_len)| {
                 let seg_end = vaddr.saturating_add(seg_len);
                 seg_end <= unmap_start || vaddr >= unmap_end
@@ -450,8 +455,23 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
     }
 
+    /// Forget that ranges overlapping `[start, start + len)` were patched.
+    ///
+    /// The rewriter leaves patched code read-execute, so the guest must request
+    /// `PROT_WRITE` before it can modify it. Once it does, the patch no longer
+    /// holds and the rewriter has to run again if the range becomes executable.
+    fn invalidate_patched_ranges(&self, start: usize, len: usize) {
+        let end = start.saturating_add(len);
+        let mut cache = self.global.elf_patch_cache.lock();
+        for state in cache.values_mut().flatten() {
+            state.patched_ranges.retain(|&(vaddr, seg_len)| {
+                let seg_end = vaddr.saturating_add(seg_len);
+                seg_end <= start || vaddr >= end
+            });
+        }
+    }
+
     /// Handle syscall `mprotect`
-    #[inline]
     pub(crate) fn sys_mprotect(
         &self,
         addr: UserPtrMut<u8>,
@@ -462,10 +482,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if prot.contains(ProtFlags::PROT_EXEC) {
             let syscall_entry = self.global.platform.get_syscall_entry_point();
             if syscall_entry != 0 {
-                self.maybe_patch_on_mprotect_exec(addr, len, syscall_entry);
+                // If a tracked mapping cannot be patched we must not let it become executable.
+                self.maybe_patch_on_mprotect_exec(addr, len, syscall_entry)?;
             }
         }
-        self.sys_mprotect_raw(addr, len, prot)
+        self.sys_mprotect_raw(addr, len, prot)?;
+        if prot.contains(ProtFlags::PROT_WRITE) {
+            let syscall_entry = self.global.platform.get_syscall_entry_point();
+            if syscall_entry != 0 {
+                self.invalidate_patched_ranges(addr.as_usize(), len);
+            }
+        }
+        Ok(())
     }
 
     /// Raw mprotect without exec interception — used internally by the
@@ -521,30 +549,36 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Check all tracked file mappings for unpatched regions that overlap the
     /// mprotect range. If found, run the runtime rewriter before the region
     /// becomes executable.
-    fn maybe_patch_on_mprotect_exec(&self, addr: UserPtrMut<u8>, len: usize, syscall_entry: usize) {
+    fn maybe_patch_on_mprotect_exec(
+        &self,
+        addr: UserPtrMut<u8>,
+        len: usize,
+        syscall_entry: usize,
+    ) -> Result<(), Errno> {
         let mprotect_start = addr.as_usize();
         let mprotect_end = mprotect_start.saturating_add(len);
 
+        // Held for the whole operation: releasing it between selecting and
+        // patching would let a concurrent `close` drop the patch state and
+        // leave unpatched code to become executable.
+        let mut cache = self.global.elf_patch_cache.lock();
+
         // Find unpatched file mappings that overlap this mprotect range.
-        // We collect (descriptor identity, vaddr, seg_len) to avoid holding
-        // the lock while patching.
-        let to_patch: alloc::vec::Vec<(ElfPatchKey<Platform>, usize, usize)> = {
-            let cache = self.global.elf_patch_cache.lock();
-            let mut result = alloc::vec::Vec::new();
-            for (fd, state) in cache.iter() {
-                if state.pre_patched {
-                    continue;
-                }
-                for &(seg_start, seg_len) in &state.file_mappings {
-                    let seg_end = seg_start.saturating_add(seg_len);
-                    // Check overlap with the mprotect range.
-                    if seg_start < mprotect_end && seg_end > mprotect_start {
-                        result.push((fd.clone(), seg_start, seg_len));
-                    }
+        let mut to_patch: alloc::vec::Vec<(ElfPatchKey<Platform>, usize, usize)> =
+            alloc::vec::Vec::new();
+        for (fd, state) in cache.iter() {
+            let Some(state) = state else { continue };
+            if state.pre_patched {
+                continue;
+            }
+            for &(seg_start, seg_len) in &state.file_mappings {
+                let seg_end = seg_start.saturating_add(seg_len);
+                // Check overlap with the mprotect range.
+                if seg_start < mprotect_end && seg_end > mprotect_start {
+                    to_patch.push((fd.clone(), seg_start, seg_len));
                 }
             }
-            result
-        };
+        }
 
         // A single mprotect range should only overlap mappings from one fd
         // (a given vaddr range is backed by at most one file at a time).
@@ -554,8 +588,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 .map(|(fd, _, _)| Arc::as_ptr(&fd.0) as usize)
                 .collect();
             if fds.len() > 1 {
+                let ranges: alloc::vec::Vec<_> = to_patch
+                    .iter()
+                    .map(|&(_, seg_start, seg_len)| (seg_start, seg_len))
+                    .collect();
                 litebox_util_log::warn!(
-                    addr:? = mprotect_start, len:? = len, count:? = fds.len();
+                    addr:? = mprotect_start, len:? = len, fds:? = fds.len(), ranges:? = ranges;
                     "mprotect +EXEC range overlaps file mappings from multiple fds"
                 );
             }
@@ -573,12 +611,36 @@ impl<Platform: ShimPlatform> Task<Platform> {
             if patch_len == 0 {
                 continue;
             }
+            let Some(Some(state)) = cache.get_mut(&fd) else {
+                continue;
+            };
             let mapped_addr = UserPtrMut::<u8>::from_usize(patch_start);
-            self.maybe_patch_exec_segment(mapped_addr, patch_len, &fd, syscall_entry, None);
+            self.patch_exec_segment(mapped_addr, patch_len, &fd, state, syscall_entry)?;
         }
+        Ok(())
     }
 
     /// Initialize ELF patch state for an fd on its first mmap.
+    fn init_elf_patch_state(
+        &self,
+        fd: &ElfPatchKey<Platform>,
+        mapped_addr: usize,
+        file_offset: usize,
+    ) {
+        if self.global.elf_patch_cache.lock().contains_key(fd) {
+            return;
+        }
+        // Probe outside the lock so header I/O does not serialize other mappings.
+        let state = self.probe_elf_patch_state(&fd.0, mapped_addr, file_offset);
+        self.global
+            .elf_patch_cache
+            .lock()
+            .entry(fd.clone())
+            .or_insert(state);
+    }
+
+    /// Read `fd`'s ELF headers and derive its patch state, or `None` if it is
+    /// not an ELF image we patch.
     ///
     /// Reads the ELF header to determine the trampoline address (page-aligned
     /// end of the highest PT_LOAD segment) and checks the file tail for the
@@ -591,34 +653,27 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// segment is being mapped so we can look up its `p_vaddr`.
     ///
     /// x86_64 only: assumes 64-bit ELF layout and program header offsets.
-    fn init_elf_patch_state(
+    fn probe_elf_patch_state(
         &self,
-        fd: &ElfPatchKey<Platform>,
+        fd: &FileFd<Platform>,
         mapped_addr: usize,
         file_offset: usize,
-    ) {
-        // Quick check: skip if already initialized.
-        let mut cache = self.global.elf_patch_cache.lock();
-        if cache.contains_key(fd) {
-            return;
-        }
-        let typed_fd = AnyTypedFd::Fs(Arc::clone(&fd.0));
+    ) -> Option<ElfPatchState> {
+        let files = self.files.borrow();
 
         // Read the ELF header (64 bytes for Elf64).
         let mut ehdr_buf = [0u8; core::mem::size_of::<FileHeader64<LittleEndian>>()];
-        match self.do_read(&typed_fd, &mut ehdr_buf, Some(0)) {
+        match files.fs.read(fd, &mut ehdr_buf, Some(0)) {
             Ok(n) if n == ehdr_buf.len() => {}
-            _ => return, // Not readable or short read, skip
+            _ => return None, // Not readable or short read, skip
         }
 
         // Parse as typed ELF64 header.
-        let Ok((ehdr, _)) = object::from_bytes::<FileHeader64<LittleEndian>>(&ehdr_buf) else {
-            return;
-        };
+        let (ehdr, _) = object::from_bytes::<FileHeader64<LittleEndian>>(&ehdr_buf).ok()?;
 
         // Verify ELF magic
         if &ehdr.e_ident.magic != b"\x7fELF" {
-            return;
+            return None;
         }
 
         let e_type = ehdr.e_type.get(ENDIAN);
@@ -628,20 +683,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         // Validate e_phentsize: must be at least sizeof(Elf64_Phdr).
         if e_phentsize < core::mem::size_of::<ProgramHeader64<LittleEndian>>() {
-            return;
+            return None;
         }
 
         // Read program headers.
-        let Some(phdrs_size) = e_phentsize.checked_mul(e_phnum) else {
-            return;
-        };
+        let phdrs_size = e_phentsize.checked_mul(e_phnum)?;
         if phdrs_size == 0 || phdrs_size > 0x10000 {
-            return; // Sanity check
+            return None; // Sanity check
         }
         let mut phdrs_buf = alloc::vec![0u8; phdrs_size];
-        match self.do_read(&typed_fd, &mut phdrs_buf, Some(e_phoff)) {
+        match files.fs.read(fd, &mut phdrs_buf, Some(e_phoff)) {
             Ok(n) if n == phdrs_buf.len() => {}
-            _ => return,
+            _ => return None,
         }
 
         // Find highest PT_LOAD end (p_vaddr + p_memsz) and compute base_addr
@@ -678,12 +731,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
 
         if max_load_end == 0 {
-            return; // No PT_LOAD segments
+            return None; // No PT_LOAD segments
         }
 
         // Check if file is pre-patched by reading the last 32 bytes for magic
         let (pre_patched, tramp_file_offset, tramp_vaddr, tramp_file_size) =
-            self.check_trampoline_magic(&typed_fd);
+            Self::check_trampoline_magic(&files, fd);
 
         // Compute the trampoline virtual address.
         // - Pre-patched: use the exact address from the trampoline header (the
@@ -694,9 +747,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let trampoline_vaddr = if pre_patched {
             if e_type == ET_DYN {
                 let Some(base) = base_addr else {
-                    panic!(
-                        "fatal: pre-patched ET_DYN binary but cannot determine load base address"
+                    litebox_util_log::warn!(
+                        mapped_addr:? = mapped_addr, file_offset:? = file_offset;
+                        "pre-patched ET_DYN binary but cannot determine load base address"
                     );
+                    return None;
                 };
                 let vaddr: usize = tramp_vaddr.trunc();
                 base + vaddr
@@ -713,36 +768,36 @@ impl<Platform: ShimPlatform> Task<Platform> {
             base + max_end.next_multiple_of(PAGE_SIZE)
         };
 
-        cache.insert(
-            fd.clone(),
-            ElfPatchState {
-                pre_patched,
-                trampoline_file_offset: tramp_file_offset,
-                trampoline_file_size: tramp_file_size.trunc(),
-                trampoline_addr: trampoline_vaddr,
-                trampoline_cursor: 0,
-                trampoline_mapped: false,
-                trampoline_mapped_len: 0,
-                runtime_patches_committed: false,
-                file_mappings: BTreeSet::new(),
-                patched_ranges: BTreeSet::new(),
-            },
-        );
+        Some(ElfPatchState {
+            pre_patched,
+            trampoline_file_offset: tramp_file_offset,
+            trampoline_file_size: tramp_file_size.trunc(),
+            trampoline_addr: trampoline_vaddr,
+            trampoline_cursor: 0,
+            trampoline_mapped: false,
+            trampoline_mapped_len: 0,
+            runtime_patches_committed: false,
+            file_mappings: BTreeSet::new(),
+            patched_ranges: BTreeSet::new(),
+        })
     }
 
     /// Check if a file has the LITEBOX trampoline magic at its tail.
     /// Returns (is_pre_patched, file_offset, vaddr, trampoline_size).
-    fn check_trampoline_magic(&self, fd: &AnyTypedFd<Platform>) -> (bool, u64, u64, u64) {
+    fn check_trampoline_magic(
+        files: &FilesState<Platform>,
+        fd: &FileFd<Platform>,
+    ) -> (bool, u64, u64, u64) {
         const HEADER_SIZE: usize = 32; // TrampolineHeader64: magic(8) + file_offset(8) + vaddr(8) + size(8)
-        let Ok(stat) = self.do_stat::<litebox_common_linux::FileStat>(fd) else {
+        let Ok(stat) = files.fs.fd_file_status(fd) else {
             return (false, 0, 0, 0);
         };
-        let file_size = stat.st_size;
+        let file_size = stat.size;
         if file_size < HEADER_SIZE {
             return (false, 0, 0, 0);
         }
         let mut tail = [0u8; HEADER_SIZE];
-        match self.do_read(fd, &mut tail, Some(file_size - HEADER_SIZE)) {
+        match files.fs.read(fd, &mut tail, Some(file_size - HEADER_SIZE)) {
             Ok(n) if n == HEADER_SIZE => {}
             _ => return (false, 0, 0, 0),
         }
@@ -761,47 +816,103 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// If `already_rw` is true, the segment is assumed to already be writable
     /// and the initial mprotect RW is skipped.
     ///
-    /// Panics on infrastructure failures (mprotect/read/write/disassembly).
-    fn apply_trap_fallback(&self, mapped_addr: UserPtrMut<u8>, len: usize, already_rw: bool) {
+    /// On any error the segment is left non-executable.
+    fn apply_trap_fallback(
+        &self,
+        mapped_addr: UserPtrMut<u8>,
+        len: usize,
+        already_rw: bool,
+    ) -> Result<(), Errno> {
         if !already_rw {
             self.sys_mprotect_raw(
                 mapped_addr,
                 len,
                 ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-            )
-            .expect("fatal: failed to mprotect code segment RW for trap fallback");
+            )?;
         }
 
-        // Read, patch using the rewriter (proper disassembly), write back.
-        let Some(code_owned) = mapped_addr.to_owned_slice::<Platform>(len) else {
-            panic!("fatal: failed to read code segment for trap fallback");
-        };
+        let result = self.trap_syscalls_in_place(mapped_addr, len);
+        self.restore_rx_or_deny_exec(mapped_addr, len, result)
+    }
+
+    /// Rewrite every `syscall` instruction in an already-writable segment to a
+    /// trap, using the rewriter's disassembler.
+    fn trap_syscalls_in_place(&self, mapped_addr: UserPtrMut<u8>, len: usize) -> Result<(), Errno> {
+        let code_owned = mapped_addr
+            .to_owned_slice::<Platform>(len)
+            .ok_or(Errno::EFAULT)?;
         let mut code_buf = code_owned.into_vec();
         let code_vaddr = mapped_addr.as_usize() as u64;
         let count = litebox_syscall_rewriter::trap_all_syscalls_in_code(&mut code_buf, code_vaddr)
-            .unwrap_or_else(|e| {
-                panic!("fatal: failed to disassemble code segment for trap fallback: {e:?}");
-            });
+            .map_err(|e| {
+                litebox_util_log::warn!(
+                    err:? = e, addr:? = mapped_addr.as_usize(), len:? = len;
+                    "failed to disassemble code segment for trap fallback"
+                );
+                Errno::ENOEXEC
+            })?;
         if count > 0 {
             litebox_util_log::warn!(
                 count:? = count, addr:? = mapped_addr.as_usize(), len:? = len;
                 "applied trap fallback to syscall instructions"
             );
         }
-        assert!(
-            mapped_addr
-                .copy_from_slice::<Platform>(0, &code_buf)
-                .is_some(),
-            "fatal: failed to write trap bytes back to code segment"
-        );
+        mapped_addr
+            .copy_from_slice::<Platform>(0, &code_buf)
+            .ok_or(Errno::EFAULT)
+    }
 
-        // Restore RX.
-        self.sys_mprotect_raw(
-            mapped_addr,
-            len,
-            ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
-        )
-        .expect("fatal: failed to restore code segment to RX after trap fallback");
+    /// Restore read-execute on a segment the patcher made writable.
+    ///
+    /// Patched code is never left writable: the guest must go through
+    /// `mprotect(PROT_WRITE)` to modify it, which invalidates the patch so the
+    /// rewriter runs again before the range can become executable.
+    ///
+    /// If `result` already failed, or the restore itself fails, the segment is
+    /// forced to `PROT_READ` so a failed patch can never leave it executable.
+    fn restore_rx_or_deny_exec(
+        &self,
+        mapped_addr: UserPtrMut<u8>,
+        len: usize,
+        result: Result<(), Errno>,
+    ) -> Result<(), Errno> {
+        let restore = match result {
+            Ok(()) => self.sys_mprotect_raw(
+                mapped_addr,
+                len,
+                ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
+            ),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = restore {
+            let _ = self.sys_mprotect_raw(mapped_addr, len, ProtFlags::PROT_READ);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Patch an executable segment mapped by `mmap` from `fd`.
+    ///
+    /// Initializes patch state for the descriptor if this is its first mapping,
+    /// then defers to [`Self::patch_exec_segment`].
+    fn maybe_patch_exec_segment(
+        &self,
+        mapped_addr: UserPtrMut<u8>,
+        len: usize,
+        fd: &ElfPatchKey<Platform>,
+        syscall_entry: usize,
+        file_offset: usize,
+    ) -> Result<(), Errno> {
+        self.init_elf_patch_state(fd, mapped_addr.as_usize(), file_offset);
+
+        // This lock guards the elf_patch_cache and is held for the entire
+        // patching operation. In practice this is fine because the dynamic
+        // linker loads shared libraries sequentially.
+        let mut cache = self.global.elf_patch_cache.lock();
+        let Some(Some(state)) = cache.get_mut(fd) else {
+            return Ok(()); // No patch state — not an ELF we're tracking
+        };
+        self.patch_exec_segment(mapped_addr, len, fd, state, syscall_entry)
     }
 
     /// Patch an executable segment in-place after it has been mapped.
@@ -811,33 +922,20 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// For unpatched binaries: calls `patch_code_segment()` to rewrite syscall
     /// instructions and places the generated stubs in the trampoline region.
     ///
-    /// Returns `true` on success or non-fatal skip. Returns `false` when a
-    /// pre-patched binary's trampoline could not be set up — the caller must
-    /// fail the mapping because the code already contains JMPs to the
-    /// trampoline address.
-    fn maybe_patch_exec_segment(
+    /// Fails closed: any error leaves the segment non-executable and must be
+    /// surfaced to the guest, because the code may still contain raw `syscall`
+    /// instructions or JMPs to a trampoline that was never mapped.
+    ///
+    /// Must be called with the `elf_patch_cache` lock held (`state` is borrowed
+    /// from it); only `_raw` mm helpers may be used from here.
+    fn patch_exec_segment(
         &self,
         mapped_addr: UserPtrMut<u8>,
         len: usize,
         fd: &ElfPatchKey<Platform>,
+        state: &mut ElfPatchState,
         syscall_entry: usize,
-        file_offset: Option<usize>,
-    ) -> bool {
-        // Initialize patch state if this is the first mmap for this fd.
-        // Typically the first mapping is at offset 0 (the ELF header), but
-        // some loaders may map an executable segment at a non-zero offset first.
-        if let Some(file_offset) = file_offset {
-            self.init_elf_patch_state(fd, mapped_addr.as_usize(), file_offset);
-        }
-
-        // This lock guards the elf_patch_cache and is held for the entire
-        // patching operation. In practice this is fine because the dynamic
-        // linker loads shared libraries sequentially.
-        let mut cache = self.global.elf_patch_cache.lock();
-        let Some(state) = cache.get_mut(fd) else {
-            return true; // No patch state — not an ELF we're tracking
-        };
-
+    ) -> Result<(), Errno> {
         if state.pre_patched {
             // Pre-patched binary: map the trampoline data from the file.
             if !state.trampoline_mapped && state.trampoline_file_size > 0 {
@@ -849,32 +947,33 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 // and we MUST map here. The region may already be reserved as
                 // PROT_NONE by the ElfLoader's reserve() call, which would
                 // cause MAP_FIXED_NOREPLACE to fail with EEXIST.
-                let alloc_result = self.do_mmap_anonymous(
+                let alloc_ptr = self.do_mmap_anonymous(
                     Some(tramp_addr),
                     tramp_len,
                     ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
                     MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
-                );
-                let Ok(alloc_ptr) = alloc_result else {
-                    return false;
-                };
+                )?;
                 let actual_addr = alloc_ptr.as_usize();
                 if actual_addr != tramp_addr {
                     let _ =
                         self.sys_munmap_raw(UserPtrMut::<u8>::from_usize(actual_addr), tramp_len);
-                    return false;
+                    return Err(Errno::ENOMEM);
                 }
 
                 // Read trampoline data from the file.
                 let mut tramp_data = alloc::vec![0u8; state.trampoline_file_size];
                 let file_off = state.trampoline_file_offset.trunc();
                 let tramp_ptr = UserPtrMut::<u8>::from_usize(tramp_addr);
-                let typed_fd = AnyTypedFd::Fs(Arc::clone(&fd.0));
-                match self.do_read(&typed_fd, &mut tramp_data, Some(file_off)) {
+                match self
+                    .files
+                    .borrow()
+                    .fs
+                    .read(&fd.0, &mut tramp_data, Some(file_off))
+                {
                     Ok(n) if n == tramp_data.len() => {}
                     _ => {
                         let _ = self.sys_munmap_raw(tramp_ptr, tramp_len);
-                        return false;
+                        return Err(Errno::EIO);
                     }
                 }
 
@@ -889,26 +988,23 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .is_none()
                 {
                     let _ = self.sys_munmap_raw(tramp_ptr, tramp_len);
-                    return false;
+                    return Err(Errno::EFAULT);
                 }
 
                 // Protect as RX immediately.
-                if self
-                    .sys_mprotect_raw(
-                        tramp_ptr,
-                        tramp_len,
-                        ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
-                    )
-                    .is_err()
-                {
+                if let Err(e) = self.sys_mprotect_raw(
+                    tramp_ptr,
+                    tramp_len,
+                    ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
+                ) {
                     let _ = self.sys_munmap_raw(tramp_ptr, tramp_len);
-                    return false;
+                    return Err(e);
                 }
 
                 state.trampoline_mapped = true;
                 state.trampoline_mapped_len = tramp_len;
             }
-            return true;
+            return Ok(());
         }
 
         // ── Runtime patching path (unpatched binaries) ───────────────
@@ -939,8 +1035,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 });
             let Ok(actual_addr_ptr) = actual_addr else {
                 litebox_util_log::warn!("failed to allocate trampoline region");
-                self.apply_trap_fallback(mapped_addr, len, false);
-                return true;
+                return self.apply_trap_fallback(mapped_addr, len, false);
             };
             let actual_addr = actual_addr_ptr.as_usize();
 
@@ -956,8 +1051,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     "trampoline too far from code segment, skipping patching"
                 );
                 let _ = self.sys_munmap_raw(UserPtrMut::<u8>::from_usize(actual_addr), PAGE_SIZE);
-                self.apply_trap_fallback(mapped_addr, len, false);
-                return true;
+                return self.apply_trap_fallback(mapped_addr, len, false);
             }
 
             state.trampoline_addr = actual_addr;
@@ -970,8 +1064,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             {
                 litebox_util_log::warn!("failed to write syscall entry point to trampoline");
                 let _ = self.sys_munmap_raw(UserPtrMut::<u8>::from_usize(actual_addr), PAGE_SIZE);
-                self.apply_trap_fallback(mapped_addr, len, false);
-                return true;
+                return self.apply_trap_fallback(mapped_addr, len, false);
             }
             state.trampoline_cursor = 8; // stubs start after the 8-byte entry
             state.trampoline_mapped = true;
@@ -981,9 +1074,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // Performance guard: skip if this exact range was already patched.
         let mapping_key = (mapped_addr.as_usize(), len);
         if state.patched_ranges.contains(&mapping_key) {
-            return true;
+            return Ok(());
         }
-        state.patched_ranges.insert(mapping_key);
 
         let restore_trampoline_rx = |task: &Self, state: &ElfPatchState| {
             if state.trampoline_mapped_len > 0 {
@@ -997,37 +1089,37 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         // Make the trampoline RW for writing stubs.
         if state.trampoline_mapped_len > 0
-            && self
-                .sys_mprotect_raw(
-                    UserPtrMut::<u8>::from_usize(state.trampoline_addr),
-                    state.trampoline_mapped_len,
-                    ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-                )
-                .is_err()
-        {
-            panic!("fatal: failed to mprotect trampoline to RW");
-        }
-        if self
-            .sys_mprotect_raw(
-                mapped_addr,
-                len,
+            && let Err(e) = self.sys_mprotect_raw(
+                UserPtrMut::<u8>::from_usize(state.trampoline_addr),
+                state.trampoline_mapped_len,
                 ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
             )
-            .is_err()
         {
-            restore_trampoline_rx(self, state);
-            panic!("fatal: failed to mprotect code segment to RW for patching");
+            litebox_util_log::warn!(err:? = e; "failed to mprotect trampoline to RW");
+            return Err(e);
         }
+        // Nothing has been modified yet, so failing here leaves the segment
+        // exactly as the caller found it.
+        if let Err(e) = self.sys_mprotect_raw(
+            mapped_addr,
+            len,
+            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+        ) {
+            litebox_util_log::warn!(
+                err:? = e, addr:? = addr_usize, len:? = len;
+                "failed to mprotect code segment to RW for patching"
+            );
+            restore_trampoline_rx(self, state);
+            return Err(e);
+        }
+
+        // Past this point the segment is writable, so every exit must go
+        // through `restore_rx_or_deny_exec`.
 
         // Read the mapped code into a buffer, patch it, write back.
         let Some(code_owned) = mapped_addr.to_owned_slice::<Platform>(len) else {
-            let _ = self.sys_mprotect_raw(
-                mapped_addr,
-                len,
-                ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
-            );
             restore_trampoline_rx(self, state);
-            panic!("fatal: failed to read code segment for patching");
+            return self.restore_rx_or_deny_exec(mapped_addr, len, Err(Errno::EFAULT));
         };
         let mut code_buf = code_owned.into_vec();
         let original_code = code_buf.clone();
@@ -1054,13 +1146,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
             Err(e) => Err(e),
         };
-        match patch_result {
+        let outcome: Result<(), Errno> = match patch_result {
             Ok(stubs) if !stubs.is_empty() => {
                 let Some(new_cursor) = state.trampoline_cursor.checked_add(stubs.len()) else {
                     litebox_util_log::warn!("trampoline cursor overflow");
-                    self.apply_trap_fallback(mapped_addr, len, true);
                     restore_trampoline_rx(self, state);
-                    return true;
+                    return self.apply_trap_fallback(mapped_addr, len, true);
                 };
                 let tramp_pages_needed = align_up(new_cursor, PAGE_SIZE);
                 if tramp_pages_needed > state.trampoline_mapped_len {
@@ -1078,9 +1169,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         .is_err()
                     {
                         litebox_util_log::warn!("failed to expand trampoline region");
-                        self.apply_trap_fallback(mapped_addr, len, true);
                         restore_trampoline_rx(self, state);
-                        return true;
+                        return self.apply_trap_fallback(mapped_addr, len, true);
                     }
                     state.trampoline_mapped_len = tramp_pages_needed;
                 }
@@ -1093,31 +1183,21 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .copy_from_slice::<Platform>(0, &stubs)
                     .is_none()
                 {
-                    let _ = self.sys_mprotect_raw(
-                        mapped_addr,
-                        len,
-                        ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
-                    );
-                    restore_trampoline_rx(self, state);
-                    panic!("fatal: failed to write trampoline stubs");
-                }
-
-                // Write patched code back to the mapped region.
-                if mapped_addr
+                    litebox_util_log::warn!("failed to write trampoline stubs");
+                    Err(Errno::EFAULT)
+                } else if mapped_addr
                     .copy_from_slice::<Platform>(0, &code_buf)
                     .is_none()
                 {
+                    // Write patched code back to the mapped region.
+                    litebox_util_log::warn!("failed to write patched code back to code segment");
                     let _ = mapped_addr.copy_from_slice::<Platform>(0, &original_code);
-                    let _ = self.sys_mprotect_raw(
-                        mapped_addr,
-                        len,
-                        ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
-                    );
-                    restore_trampoline_rx(self, state);
-                    panic!("fatal: failed to write patched code back to code segment");
+                    Err(Errno::EFAULT)
+                } else {
+                    state.trampoline_cursor = new_cursor;
+                    state.runtime_patches_committed = true;
+                    Ok(())
                 }
-                state.trampoline_cursor = new_cursor;
-                state.runtime_patches_committed = true;
             }
             Ok(_) => {
                 // No trampoline stubs were generated, but the rewriter may
@@ -1128,34 +1208,39 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         .copy_from_slice::<Platform>(0, &code_buf)
                         .is_none()
                 {
+                    litebox_util_log::warn!("failed to write trap bytes back to code segment");
                     let _ = mapped_addr.copy_from_slice::<Platform>(0, &original_code);
-                    panic!("fatal: failed to write trap bytes back to code segment");
+                    Err(Errno::EFAULT)
+                } else {
+                    Ok(())
                 }
-                // Fall through to restore RX protections below.
             }
             Err(e) => {
                 litebox_util_log::warn!(err:? = e; "patch_code_segment failed");
-                self.apply_trap_fallback(mapped_addr, len, true);
                 restore_trampoline_rx(self, state);
-                return true;
+                return self.apply_trap_fallback(mapped_addr, len, true);
             }
-        }
+        };
 
-        // Restore the code segment to RX.
-        let _ = self.sys_mprotect_raw(
-            mapped_addr,
-            len,
-            ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
-        );
         restore_trampoline_rx(self, state);
-        true
+        // Only a committed patch may be skipped next time; marking a failed
+        // attempt would let the guard above wave raw syscalls through to RX.
+        if outcome.is_ok() {
+            state.patched_ranges.insert(mapping_key);
+        }
+        self.restore_rx_or_deny_exec(mapped_addr, len, outcome)
     }
 
     /// Finalize the ELF patching state for `fd`.
     ///
     /// Removes the cache entry and unmaps any trampoline that was allocated but never used.
     pub(crate) fn finalize_elf_patch(&self, fd: Arc<FileFd<Platform>>) {
-        let state = self.global.elf_patch_cache.lock().remove(&ElfPatchKey(fd));
+        let state = self
+            .global
+            .elf_patch_cache
+            .lock()
+            .remove(&ElfPatchKey(fd))
+            .flatten();
         if let Some(state) = state
             && state.trampoline_mapped
             && !state.pre_patched
@@ -1182,6 +1267,110 @@ mod tests {
 
     use crate::syscalls::tests::TestPlatform as Platform;
     use crate::{UserPtrMut, syscalls::tests::init_platform};
+
+    /// A minimal ET_DYN ELF64 image with a single `PT_LOAD` segment, padded to
+    /// `len` bytes so that mapping it succeeds.
+    fn minimal_elf(len: usize) -> alloc::vec::Vec<u8> {
+        const EHDR_SIZE: u16 = 64;
+        const PHDR_SIZE: u16 = 56;
+        let ehdr_size = usize::from(EHDR_SIZE);
+        let mut buf = alloc::vec![0u8; len];
+
+        buf[0..4].copy_from_slice(b"\x7fELF");
+        buf[4] = 2; // ELFCLASS64
+        buf[5] = 1; // ELFDATA2LSB
+        buf[6] = 1; // EV_CURRENT
+        buf[16..18].copy_from_slice(&3u16.to_le_bytes()); // e_type = ET_DYN
+        buf[18..20].copy_from_slice(&62u16.to_le_bytes()); // e_machine = EM_X86_64
+        buf[20..24].copy_from_slice(&1u32.to_le_bytes()); // e_version
+        buf[32..40].copy_from_slice(&u64::from(EHDR_SIZE).to_le_bytes()); // e_phoff
+        buf[52..54].copy_from_slice(&EHDR_SIZE.to_le_bytes()); // e_ehsize
+        buf[54..56].copy_from_slice(&PHDR_SIZE.to_le_bytes()); // e_phentsize
+        buf[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+
+        let ph = &mut buf[ehdr_size..ehdr_size + usize::from(PHDR_SIZE)];
+        ph[0..4].copy_from_slice(&1u32.to_le_bytes()); // p_type = PT_LOAD
+        ph[4..8].copy_from_slice(&5u32.to_le_bytes()); // p_flags = R|X
+        ph[32..40].copy_from_slice(&(len as u64).to_le_bytes()); // p_filesz
+        ph[40..48].copy_from_slice(&(len as u64).to_le_bytes()); // p_memsz
+        ph[48..56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
+        buf
+    }
+
+    /// Closing a descriptor must drop its ELF patch state, so that a later
+    /// descriptor reusing the same fd number does not inherit it.
+    #[test]
+    fn test_elf_patch_state_not_reused_across_fd_reuse() {
+        let task = init_platform(None);
+
+        let elf = minimal_elf(0x1000);
+        let elf_fd = i32::try_from(
+            task.sys_open("lib.so", OFlags::RDWR | OFlags::CREAT, Mode::RWXU)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(task.sys_write(elf_fd, &elf, None).unwrap(), elf.len());
+
+        let addr = task
+            .sys_mmap(
+                0,
+                0x1000,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_PRIVATE,
+                elf_fd,
+                0,
+            )
+            .unwrap();
+
+        // The ELF was recognized and the mapping is tracked for deferred patching.
+        {
+            let cache = task.global.elf_patch_cache.lock();
+            assert_eq!(cache.len(), 1);
+            let state = cache.values().next().unwrap().as_ref().unwrap();
+            assert!(state.file_mappings.contains(&(addr.as_usize(), 0x1000)));
+        }
+
+        task.sys_munmap(addr, 0x1000).unwrap();
+        task.sys_close(elf_fd).unwrap();
+        assert!(
+            task.global.elf_patch_cache.lock().is_empty(),
+            "closing the descriptor must drop its patch state"
+        );
+
+        // Reopen so the same raw fd number is handed out again, this time for a
+        // file that is not an ELF image.
+        let plain_fd = i32::try_from(
+            task.sys_open("plain.bin", OFlags::RDWR | OFlags::CREAT, Mode::RWXU)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(plain_fd, elf_fd, "expected the fd number to be reused");
+        assert_eq!(
+            task.sys_write(plain_fd, &[0xab; 0x1000], None).unwrap(),
+            0x1000
+        );
+
+        let addr = task
+            .sys_mmap(
+                0,
+                0x1000,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_PRIVATE,
+                plain_fd,
+                0,
+            )
+            .unwrap();
+
+        // Negative cache entry: probed once, not an ELF, no state inherited.
+        {
+            let cache = task.global.elf_patch_cache.lock();
+            assert_eq!(cache.len(), 1);
+            assert!(cache.values().next().unwrap().is_none());
+        }
+
+        task.sys_munmap(addr, 0x1000).unwrap();
+        task.sys_close(plain_fd).unwrap();
+    }
 
     #[test]
     fn test_anonymous_mmap() {

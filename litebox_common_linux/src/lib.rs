@@ -101,7 +101,7 @@ pub mod ioctl {
 
 bitflags::bitflags! {
     /// Desired memory protection of a memory mapping.
-    #[derive(PartialEq, Debug)]
+    #[derive(Clone, Copy, PartialEq, Debug)]
     pub struct ProtFlags: core::ffi::c_int {
         /// Pages cannot be accessed.
         const PROT_NONE = 0;
