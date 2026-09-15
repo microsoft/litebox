@@ -1692,6 +1692,7 @@ mod tests {
         invalid_error.extend_from_slice(&TEST_REQUEST_ID.0.to_le_bytes());
         invalid_error.extend_from_slice(&u16::MAX.to_le_bytes());
         assert_eq!(decode_response(&invalid_error), Err(WireError::InvalidTag));
+
         let truncated = [RESPONSE_TAG_EVENT, 2, 2, 0];
         assert_eq!(decode_response(&truncated), Err(WireError::TruncatedFrame));
 
