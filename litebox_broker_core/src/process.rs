@@ -6,7 +6,6 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::event::EventObject;
 use crate::fs::File;
-use crate::id::IdReservation;
 use crate::pipe::PipeObject;
 use crate::socket::SocketObject;
 use crate::{BrokerCore, BrokerError, Result};
@@ -85,25 +84,17 @@ struct ProcessReferences {
 /// a broker platform needs to manage thread execution.
 pub struct BrokerThread {
     id: ThreadId,
-    id_reservation: IdReservation,
 }
 
 impl BrokerThread {
-    fn new(id_reservation: IdReservation) -> Self {
-        Self {
-            id: ThreadId(id_reservation.id()),
-            id_reservation,
-        }
+    const fn new(id: ThreadId) -> Self {
+        Self { id }
     }
 
     /// Returns the broker-assigned thread ID.
     #[must_use]
     pub const fn id(&self) -> ThreadId {
         self.id
-    }
-
-    fn release_id(self) {
-        self.id_reservation.release();
     }
 }
 
@@ -116,8 +107,6 @@ pub struct BrokerProcess {
     pub(crate) core: BrokerCore,
     /// Broker-assigned process ID and internal authority.
     pub(crate) id: ProcessId,
-    /// Process-ID reservation, released only after complete teardown.
-    id_reservation: Option<IdReservation>,
     cleaned_up: bool,
     /// Authoritative parent process ID, absent for a root process.
     parent_id: Option<ProcessId>,
@@ -139,15 +128,13 @@ impl BrokerProcess {
     /// Creates authenticated broker process state.
     pub(crate) fn new(
         core: BrokerCore,
-        id_reservation: IdReservation,
+        id: ProcessId,
         parent_id: Option<ProcessId>,
         caller_credential: CallerCredential,
     ) -> Self {
-        let id = ProcessId(id_reservation.id());
         Self {
             core,
             id,
-            id_reservation: Some(id_reservation),
             cleaned_up: false,
             parent_id,
             caller_credential,
@@ -189,7 +176,7 @@ impl BrokerProcess {
             .try_reserve(1)
             .map_err(|_| BrokerError::OutOfMemory)?;
         self.core
-            .reserved_threads
+            .active_thread_count
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
                 (count < self.core.limits.max_threads).then(|| count + 1)
             })
@@ -197,12 +184,13 @@ impl BrokerProcess {
         let raw_id = match self.core.ids.lock().allocate() {
             Ok(id) => id,
             Err(error) => {
-                self.core.reserved_threads.fetch_sub(1, Ordering::Relaxed);
+                self.core
+                    .active_thread_count
+                    .fetch_sub(1, Ordering::Relaxed);
                 return Err(error);
             }
         };
-        let reservation = IdReservation::new(Arc::clone(&self.core.ids), raw_id);
-        let thread = BrokerThread::new(reservation);
+        let thread = BrokerThread::new(ThreadId(raw_id));
         let thread_id = thread.id();
         assert!(
             threads.insert(thread_id, thread).is_none(),
@@ -218,8 +206,10 @@ impl BrokerProcess {
             .lock()
             .remove(&thread_id)
             .ok_or(BrokerError::UnknownObject)?;
-        self.core.reserved_threads.fetch_sub(1, Ordering::Relaxed);
-        thread.release_id();
+        self.core
+            .active_thread_count
+            .fetch_sub(1, Ordering::Relaxed);
+        self.core.ids.lock().release(thread.id().0);
         Ok(())
     }
 
@@ -687,14 +677,13 @@ impl BrokerProcess {
         let threads = core::mem::take(&mut *self.threads.lock());
         if release_ids && !invariant_fault {
             self.core
-                .reserved_threads
+                .active_thread_count
                 .fetch_sub(threads.len(), Ordering::Relaxed);
+            let mut ids = self.core.ids.lock();
             for thread in threads.into_values() {
-                thread.release_id();
+                ids.release(thread.id().0);
             }
-            if let Some(id_reservation) = self.id_reservation.take() {
-                id_reservation.release();
-            }
+            ids.release(self.id.0);
         }
         invariant_fault
     }
@@ -1003,10 +992,10 @@ mod tests {
             .unwrap();
         let process_id = process.id();
         let thread_id = process.create_thread().unwrap();
-        assert_eq!(broker.reserved_threads.load(Ordering::Relaxed), 1);
+        assert_eq!(broker.active_thread_count.load(Ordering::Relaxed), 1);
 
         process.finish();
-        assert_eq!(broker.reserved_threads.load(Ordering::Relaxed), 0);
+        assert_eq!(broker.active_thread_count.load(Ordering::Relaxed), 0);
 
         let replacement = broker
             .create_process(CallerCredential::Unauthenticated)

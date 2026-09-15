@@ -44,7 +44,7 @@ use spin::{Mutex, rwlock::RwLock};
 
 pub use error::BrokerError;
 use fs::FileService;
-use id::{IdAllocator, IdReservation, MAX_ALLOCATED_ID};
+use id::{IdAllocator, MAX_ALLOCATED_ID};
 pub use policy::{
     DestinationPortRange, DestinationRule, Ipv4Cidr, MAX_DESTINATION_RULES, PolicyEngine,
     PolicyProfile, SocketPolicy, SocketPolicyError,
@@ -188,7 +188,8 @@ pub struct BrokerCore {
     pub(crate) limits: BrokerCoreLimits,
     pub(crate) ids: Arc<Mutex<IdAllocator>>,
     pub(crate) processes: Arc<RwLock<HashMap<ProcessId, Weak<BrokerProcess>>>>,
-    pub(crate) reserved_threads: Arc<AtomicUsize>,
+    /// Number of broker threads created and not normally retired.
+    pub(crate) active_thread_count: Arc<AtomicUsize>,
     pub(crate) next_reference_handle: Arc<RwLock<u64>>,
     pub(crate) references: Arc<RwLock<HashMap<ObjectHandle, ObjectReference>>>,
     pub(crate) pending_references: Arc<AtomicUsize>,
@@ -241,7 +242,7 @@ impl BrokerCore {
             limits,
             ids: Arc::new(Mutex::new(ids)),
             processes: Arc::new(RwLock::new(HashMap::new())),
-            reserved_threads: Arc::new(AtomicUsize::new(0)),
+            active_thread_count: Arc::new(AtomicUsize::new(0)),
             next_reference_handle: Arc::new(RwLock::new(1)),
             references: Arc::new(RwLock::new(HashMap::new())),
             pending_references: Arc::new(AtomicUsize::new(0)),
@@ -302,11 +303,10 @@ impl BrokerCore {
             .try_reserve(1)
             .map_err(|_| BrokerError::OutOfMemory)?;
         let raw_id = self.ids.lock().allocate()?;
-        let reservation = IdReservation::new(Arc::clone(&self.ids), raw_id);
         let id = ProcessId(raw_id);
         let process = Arc::new(BrokerProcess::new(
             self.clone(),
-            reservation,
+            id,
             None,
             caller_credential,
         ));
