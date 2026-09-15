@@ -142,7 +142,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Returns the broker-assigned process ID.
+    /// Returns the assigned process ID.
     #[must_use]
     pub const fn process_id(&self) -> ProcessId {
         self.process_id

@@ -110,7 +110,7 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         broker::connect(control_socket_path)
     })?;
     let process_id = i32::try_from(broker_local.process_id().0)
-        .context("broker process ID does not fit Linux pid_t")?;
+        .context("process ID does not fit Linux pid_t")?;
     broker_positional_io_fds.extend(positional_io_fds);
     broker_shutdown_fds.push(shutdown_fd);
     let litebox = litebox::LiteBox::new_with_broker_local(platform, broker_local);
