@@ -1969,16 +1969,18 @@ mod tests {
                 "nanosleep should have been interrupted"
             );
             assert!(task.pending_signal_set().contains(Signal::SIGALRM));
-            // Allow timer granularity, but do not impose a scheduler latency limit.
+            // Allow extra scheduling delay for macOS's timer worker on CI.
+            let late_tolerance_ms = if cfg!(target_os = "macos") { 500 } else { 100 };
             assert!(
-                elapsed >= Duration::from_millis(900),
-                "alarm fired too early: {elapsed:?}"
+                (Duration::from_millis(900)..=Duration::from_millis(1000 + late_tolerance_ms)).contains(&elapsed),
+                "expected alarm after ~1s, got {elapsed:?}"
             );
             let remaining = Duration::try_from(remain).unwrap();
+            assert!(
+                (Duration::from_millis(2000 - late_tolerance_ms)..=Duration::from_millis(2100)).contains(&remaining),
+                "expected ~2s remaining, got {remaining:?}"
+            );
             let requested = Duration::try_from(request).unwrap();
-            assert!(!remaining.is_zero() && remaining <= requested);
-            // Elapsed includes time outside nanosleep, so it may exceed the
-            // sleep time deducted from the reported remainder, but not vice versa.
             assert!(
                 remaining + elapsed >= requested,
                 "inconsistent remaining time: {remaining:?}, elapsed: {elapsed:?}"
