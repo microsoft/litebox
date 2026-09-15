@@ -15,7 +15,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use litebox_common_windows::nt_status::NtStatus;
 
 use litebox::LiteBox;
@@ -394,7 +394,9 @@ where
 pub struct WindowsShimBuilder<Platform: ShimPlatform> {
     platform: &'static Platform,
     litebox: LiteBox<Platform>,
-    process_identity: litebox_broker_protocol::ProcessIdentity,
+    process_id: litebox_broker_protocol::ProcessId,
+    parent_id: Option<litebox_broker_protocol::ProcessId>,
+    initial_thread_id: litebox_broker_protocol::ThreadId,
 }
 
 impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
@@ -403,12 +405,16 @@ impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
     pub fn new_with_litebox(
         platform: &'static Platform,
         litebox: LiteBox<Platform>,
-        process_identity: litebox_broker_protocol::ProcessIdentity,
+        process_id: litebox_broker_protocol::ProcessId,
+        parent_id: Option<litebox_broker_protocol::ProcessId>,
+        initial_thread_id: litebox_broker_protocol::ThreadId,
     ) -> Self {
         Self {
             platform,
             litebox,
-            process_identity,
+            process_id,
+            parent_id,
+            initial_thread_id,
         }
     }
 
@@ -419,13 +425,7 @@ impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
 
     #[must_use]
     pub fn build(self) -> WindowsShim<Platform> {
-        let process_id = self.process_identity.id.get();
-        let initial_thread_id = if process_id < litebox_broker_protocol::MAX_ALLOCATED_TASK_ID {
-            process_id + 1
-        } else {
-            1
-        };
-        debug_assert_ne!(initial_thread_id, process_id);
+        debug_assert_ne!(self.initial_thread_id.get(), self.process_id.get());
         let litebox = Arc::new(self.litebox);
         let fs = Arc::new(fs::Fs::regular(Arc::clone(&litebox)));
         let global = Arc::new(GlobalState {
@@ -439,8 +439,9 @@ impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
             ),
             mui_generation: AtomicU32::new(1),
             qpc_boot_instant: TimeProvider::now(self.platform),
-            process_identity: self.process_identity,
-            initial_thread_id,
+            process_id: self.process_id,
+            parent_id: self.parent_id,
+            initial_thread_id: self.initial_thread_id,
             fs,
             litebox,
         });
@@ -524,8 +525,8 @@ impl<Platform: ShimPlatform> WindowsShim<Platform> {
                 &argv,
                 &envp,
                 nt_types::ClientId {
-                    unique_process: self.0.process_identity.id.get() as usize,
-                    unique_thread: self.0.initial_thread_id as usize,
+                    unique_process: self.0.process_id.get() as usize,
+                    unique_thread: self.0.initial_thread_id.get() as usize,
                 },
             )?;
         // TODO: shared section should be only created once and shared across all processes, not created per-process.
@@ -533,8 +534,8 @@ impl<Platform: ShimPlatform> WindowsShim<Platform> {
             load_info.environment.windows_shared_section,
         );
         let mut process = Process::new(
-            self.0.process_identity,
-            self.0.initial_thread_id,
+            self.0.process_id,
+            self.0.parent_id,
             Some(load_info.virtual_allocations),
             windows_shared_section,
         );
@@ -542,10 +543,11 @@ impl<Platform: ShimPlatform> WindowsShim<Platform> {
         process.peb_address = load_info.environment.peb;
         let process = Arc::new(process);
         let thread_object = Arc::new(syscalls::thread::ThreadObject::new(
-            self.0.initial_thread_id as usize,
+            self.0.initial_thread_id.get() as usize,
             load_info.environment.teb,
         ));
-        let attached = process.attach_thread(self.0.initial_thread_id as usize, &thread_object);
+        let attached =
+            process.attach_thread(self.0.initial_thread_id.get() as usize, &thread_object);
         debug_assert!(attached, "a freshly created process cannot be exiting");
         Ok(LoadedProgram {
             entrypoints: WindowsShimEntrypoints {
@@ -576,8 +578,9 @@ struct GlobalState<Platform: ShimPlatform> {
     wnf_states: syscalls::wnf::WnfStateStore<Platform>,
     mui_generation: AtomicU32,
     qpc_boot_instant: <Platform as TimeProvider>::Instant,
-    process_identity: litebox_broker_protocol::ProcessIdentity,
-    initial_thread_id: u32,
+    process_id: litebox_broker_protocol::ProcessId,
+    parent_id: Option<litebox_broker_protocol::ProcessId>,
+    initial_thread_id: litebox_broker_protocol::ThreadId,
     fs: Arc<fs::Fs<Platform>>,
     litebox: Arc<LiteBox<Platform>>,
 }
@@ -614,7 +617,6 @@ pub struct Process<Platform: ShimPlatform> {
     gdi_state: Mutex<Platform, Option<syscalls::gdi::GdiProcessState>>,
     cookie: u32,
     exit_code: AtomicI32,
-    next_thread_id: AtomicUsize,
     threads: litebox::sync::RwLock<Platform, ProcessThreads<Platform>>,
 }
 
@@ -629,33 +631,6 @@ struct ProcessThreads<Platform: ShimPlatform> {
 }
 
 impl<Platform: ShimPlatform> Process<Platform> {
-    /// Allocates the NT thread ID for a newly created thread.
-    ///
-    /// TODO: IDs are never reused, so a thread ID that has been observed by the guest
-    /// can never name a different thread later.
-    fn allocate_thread_id(&self) -> Option<usize> {
-        let mut next = self.next_thread_id.load(Ordering::Relaxed);
-        loop {
-            let mut candidate = next;
-            if candidate == self.id {
-                candidate = candidate.checked_add(1)?;
-            }
-            if candidate > litebox_broker_protocol::MAX_ALLOCATED_TASK_ID as usize {
-                return None;
-            }
-            let following = candidate.checked_add(1)?;
-            match self.next_thread_id.compare_exchange_weak(
-                next,
-                following,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return Some(candidate),
-                Err(actual) => next = actual,
-            }
-        }
-    }
-
     /// Registers a newly created thread, returning `false` if the process is
     /// already exiting and the thread must not start.
     fn attach_thread(
@@ -717,8 +692,8 @@ impl<Platform: ShimPlatform> Process<Platform> {
     }
 
     fn new(
-        process_identity: litebox_broker_protocol::ProcessIdentity,
-        initial_thread_id: u32,
+        process_id: litebox_broker_protocol::ProcessId,
+        parent_id: Option<litebox_broker_protocol::ProcessId>,
         virtual_allocations: Option<WindowsVirtualAllocations<Platform>>,
         windows_shared_section: Arc<SectionObject<Platform>>,
     ) -> Self {
@@ -732,10 +707,8 @@ impl<Platform: ShimPlatform> Process<Platform> {
             "seeded Windows shared section must have seeded ancestors: {status:?}"
         );
         Process {
-            id: process_identity.id.get() as usize,
-            parent_id: process_identity
-                .parent_id
-                .map_or(0, |parent_id| parent_id.get() as usize),
+            id: process_id.get() as usize,
+            parent_id: parent_id.map_or(0, |parent_id| parent_id.get() as usize),
             ntdll: None,
             peb_address: 0,
             handles: WindowsHandleStore::<Platform>::new(litebox::fd::RawDescriptorStorage::new()),
@@ -759,7 +732,6 @@ impl<Platform: ShimPlatform> Process<Platform> {
             gdi_state: Mutex::new(None),
             cookie: syscalls::process::default_process_cookie(),
             exit_code: AtomicI32::new(DEFAULT_PROCESS_EXIT_CODE),
-            next_thread_id: AtomicUsize::new(initial_thread_id as usize + 1),
             threads: litebox::sync::RwLock::new(ProcessThreads {
                 group_exit: false,
                 threads: BTreeMap::new(),
@@ -789,6 +761,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
             self.release_io_completion_worker();
             self.thread_object.abandon_owned_mutants(thread_id);
             self.process.detach_thread(thread_id);
+            let thread_id = u32::try_from(thread_id)
+                .ok()
+                .and_then(litebox_broker_protocol::ThreadId::new)
+                .expect("broker thread IDs must fit the checked protocol range");
+            if let Err(error) = self.global.litebox.release_thread_id(thread_id) {
+                litebox_util_log::error!(
+                    error:% = error,
+                    thread_id = thread_id.get();
+                    "failed to release broker thread ID"
+                );
+            }
         });
     }
 

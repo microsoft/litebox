@@ -21,7 +21,7 @@ use super::errors::{
 };
 use super::inode_allocator::InodeAllocator;
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
-use crate::BrokerSession;
+use crate::BrokerProcess;
 
 /// Block size for stdio devices
 const STDIO_BLOCK_SIZE: u64 = 1024;
@@ -82,26 +82,26 @@ impl Device {
 
     pub(crate) fn read(
         self,
-        session: &BrokerSession,
+        process: &BrokerProcess,
         output: &mut [u8],
     ) -> Result<usize, ReadError> {
         match self {
             Device::Stdin => {
                 let length = output.len().min(MAX_STDIO_TRANSFER_SIZE as usize);
-                crate::stdio::read(session, &mut output[..length]).map_err(|_| ReadError::Io)
+                crate::stdio::read(process, &mut output[..length]).map_err(|_| ReadError::Io)
             }
             Device::Stdout | Device::Stderr => Err(ReadError::NotForReading),
             Device::Null => Ok(0),
             Device::URandom => {
                 for chunk in output.chunks_mut(MAX_RANDOM_TRANSFER_SIZE as usize) {
-                    crate::random::fill(session, chunk).map_err(|_| ReadError::Io)?;
+                    crate::random::fill(process, chunk).map_err(|_| ReadError::Io)?;
                 }
                 Ok(output.len())
             }
         }
     }
 
-    pub(crate) fn write(self, session: &BrokerSession, input: &[u8]) -> Result<usize, WriteError> {
+    pub(crate) fn write(self, process: &BrokerProcess, input: &[u8]) -> Result<usize, WriteError> {
         let stream = match self {
             Device::Stdin => return Err(WriteError::NotForWriting),
             Device::Stdout => StdioOutputStream::Stdout,
@@ -109,7 +109,7 @@ impl Device {
             Device::Null | Device::URandom => return Ok(input.len()),
         };
         let length = input.len().min(MAX_STDIO_TRANSFER_SIZE as usize);
-        crate::stdio::write(session, stream, &input[..length]).map_err(|_| WriteError::Io)
+        crate::stdio::write(process, stream, &input[..length]).map_err(|_| WriteError::Io)
     }
 
     fn file_status(self) -> FileStatus {

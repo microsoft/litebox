@@ -551,6 +551,8 @@ type ThreadLocalDescriptor = UserPtrMut<u8>;
 struct NewThreadArgs<Platform: ShimPlatform> {
     /// Task struct that maintains all per-thread data
     task: Task<Platform>,
+    /// Prevents guest execution until the parent publishes `PARENT_SETTID`.
+    start: Option<Arc<AtomicBool>>,
 }
 
 impl<Platform: ShimPlatform> litebox::shim::InitThread for NewThreadArgs<Platform> {
@@ -560,7 +562,12 @@ impl<Platform: ShimPlatform> litebox::shim::InitThread for NewThreadArgs<Platfor
         self: alloc::boxed::Box<Self>,
     ) -> alloc::boxed::Box<dyn litebox::shim::EnterShim<ExecutionContext = Self::ExecutionContext>>
     {
-        let Self { task } = *self;
+        let Self { task, start } = *self;
+        if let Some(start) = start {
+            while !start.load(Ordering::Acquire) {
+                core::hint::spin_loop();
+            }
+        }
 
         Box::new(crate::LinuxShimEntrypoints {
             task,
@@ -723,10 +730,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
             alloc::sync::Arc::new((**self.fs.borrow()).clone())
         };
 
-        let child_tid = self.global.allocate_thread_id().ok_or(Errno::EAGAIN)?;
-        if let Some(parent_tid_ptr) = set_parent_tid {
-            let _ = parent_tid_ptr.write_at_offset::<Platform>(0, child_tid);
-        }
+        let broker_thread_id = self
+            .global
+            .allocate_thread_id()
+            .map_err(|_| Errno::EAGAIN)?;
+        let child_tid = i32::try_from(broker_thread_id.get())
+            .expect("the checked broker thread ID must fit Linux pid_t");
 
         let sp = if stack != 0 {
             let stack: usize = stack.trunc();
@@ -735,20 +744,30 @@ impl<Platform: ShimPlatform> Task<Platform> {
             None
         };
 
-        let thread = self.thread.new_thread(child_tid).ok_or(Errno::EBUSY)?;
+        let Some(thread) = self.thread.new_thread(child_tid) else {
+            if let Err(error) = self.global.litebox.release_thread_id(broker_thread_id) {
+                litebox_util_log::error!(
+                    error:% = error,
+                    thread_id = broker_thread_id.get();
+                    "failed to roll back broker thread ID"
+                );
+            }
+            return Err(Errno::EBUSY);
+        };
         thread.init_state.set(ThreadInitState::NewThread {
             stack: sp,
             tls,
             set_child_tid,
         });
         thread.clear_child_tid.set(clear_child_tid);
-
+        let child_start = set_parent_tid.map(|_| Arc::new(AtomicBool::new(false)));
         let r = unsafe {
             self.global.platform.spawn_thread(
                 ctx,
                 Box::new(NewThreadArgs {
                     task: Task {
                         global: self.global.clone(),
+                        broker_thread_id: Some(broker_thread_id),
                         wait_state: crate::wait::WaitState::new(self.global.platform),
                         thread,
                         pid: self.pid,
@@ -760,6 +779,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         files: self.files.clone(), // TODO: !CLONE_FILES support
                         signals: self.signals.clone_for_new_task(),
                     },
+                    start: child_start.clone(),
                 }),
             )
         };
@@ -769,6 +789,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
             // for conditions the user can control (such as "in-shim" rlimit
             // violations).
             return Err(Errno::ENOMEM);
+        }
+        if let Some(parent_tid_ptr) = set_parent_tid {
+            let _ = parent_tid_ptr.write_at_offset::<Platform>(0, child_tid);
+        }
+        if let Some(child_start) = child_start {
+            child_start.store(true, Ordering::Release);
         }
 
         Ok(usize::try_from(child_tid).unwrap())

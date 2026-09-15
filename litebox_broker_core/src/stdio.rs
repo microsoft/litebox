@@ -6,7 +6,7 @@
 use litebox_broker_protocol::stdio::{MAX_STDIO_TRANSFER_SIZE, StdioOutputStream, StdioStream};
 use thiserror::Error;
 
-use crate::{AssociationCancellation, BrokerError, BrokerSession, Result};
+use crate::{AssociationCancellation, BrokerError, BrokerProcess, Result};
 
 /// Failure reported by a trusted standard-I/O provider.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -88,17 +88,17 @@ impl StdioProvider for UnsupportedStdioProvider {
 }
 
 /// Reads standard input through the provider configured for this broker.
-pub fn read(session: &BrokerSession, output: &mut [u8]) -> Result<usize> {
+pub fn read(process: &BrokerProcess, output: &mut [u8]) -> Result<usize> {
     if output.len() > MAX_STDIO_TRANSFER_SIZE as usize {
         return Err(BrokerError::ResourceExhausted);
     }
     if output.is_empty() {
         return Ok(0);
     }
-    let read = session
+    let read = process
         .core
         .stdio_provider
-        .read(&session.cancellation, output)?;
+        .read(&process.cancellation, output)?;
     if read > output.len() {
         return Err(BrokerError::Internal);
     }
@@ -106,17 +106,17 @@ pub fn read(session: &BrokerSession, output: &mut [u8]) -> Result<usize> {
 }
 
 /// Writes `input` through the standard-I/O provider configured for this broker.
-pub fn write(session: &BrokerSession, stream: StdioOutputStream, input: &[u8]) -> Result<usize> {
+pub fn write(process: &BrokerProcess, stream: StdioOutputStream, input: &[u8]) -> Result<usize> {
     if input.len() > MAX_STDIO_TRANSFER_SIZE as usize {
         return Err(BrokerError::ResourceExhausted);
     }
     if input.is_empty() {
         return Ok(0);
     }
-    let written = session
+    let written = process
         .core
         .stdio_provider
-        .write(&session.cancellation, stream, input)?;
+        .write(&process.cancellation, stream, input)?;
     if written > input.len() {
         return Err(BrokerError::Internal);
     }
@@ -124,8 +124,8 @@ pub fn write(session: &BrokerSession, stream: StdioOutputStream, input: &[u8]) -
 }
 
 /// Determines whether a standard stream is connected to a terminal.
-pub fn is_terminal(session: &BrokerSession, stream: StdioStream) -> Result<bool> {
-    session
+pub fn is_terminal(process: &BrokerProcess, stream: StdioStream) -> Result<bool> {
+    process
         .core
         .stdio_provider
         .is_terminal(stream)

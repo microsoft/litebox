@@ -253,9 +253,14 @@ impl litebox::platform::ThreadProvider for SnpLinuxKernel {
         // Note this is different from the usual clone3 syscall as we have a driver running
         // in VMPL0's kernel and handling the syscall differently.
         // The first argument will be placed into the new thread's RSI register (i.e. the second argument).
-        HostSnpInterface::syscalls(SyscallN::<2, NR_SYSCALL_CLONE3> {
+        if let Err(error) = HostSnpInterface::syscalls(SyscallN::<2, NR_SYSCALL_CLONE3> {
             args: [thread_start_arg_ptr as u64, flags.bits()],
-        })?;
+        }) {
+            // SAFETY: clone3 rejected the request, so ownership of the allocation
+            // was not transferred to a child thread and remains with this caller.
+            drop(unsafe { Box::from_raw(thread_start_arg_ptr) });
+            return Err(error);
+        }
         Ok(())
     }
 

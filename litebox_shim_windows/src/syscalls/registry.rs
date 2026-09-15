@@ -2592,7 +2592,7 @@ mod tests {
     /// registry operation, exactly as a guest does.
     fn test_registry() -> (Arc<LiteBox<TestPlatform>>, RegistryStore<TestPlatform>) {
         let mode = FileMode::RWXU | FileMode::RWXG | FileMode::RWXO;
-        let litebox = Arc::new(crate::test_broker::litebox_with_broker_files(
+        let (litebox, _) = crate::test_broker::litebox_with_broker_files(
             test_platform(),
             alloc::vec![
                 (
@@ -2610,7 +2610,8 @@ mod tests {
                     },
                 ),
             ],
-        ));
+        );
+        let litebox = Arc::new(litebox);
         let registry = RegistryStore::new(Fs::registry(Arc::clone(&litebox)));
         (litebox, registry)
     }

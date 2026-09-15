@@ -16,7 +16,8 @@ use litebox_broker_core::socket::{
     GUEST_IPV4_ADDRESS, GuestSocketBinding, PlatformConnectError, host_socket_destination,
     is_internal_socket_address, normalize_socket_destination,
 };
-use litebox_broker_core::{BrokerError, ProcessAuthorityKey, Result as BrokerResult};
+use litebox_broker_core::{BrokerError, Result as BrokerResult};
+use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
     MAX_UDP_DATAGRAM_SIZE, ReceiveFromFlags, SocketError, SocketOutcome,
@@ -56,7 +57,7 @@ pub(super) struct ReactorUdpState {
     pub(super) external_peer_count: usize,
     pub(super) queued_datagrams: usize,
     pub(super) queued_bytes: usize,
-    pub(super) queued_by_source: HashMap<ProcessAuthorityKey, UdpQueueAccounting>,
+    pub(super) queued_by_source: HashMap<ProcessId, UdpQueueAccounting>,
     pub(super) event_tokens: HashMap<u64, UdpEventTarget>,
     pub(super) next_event_token: u64,
 }
@@ -125,7 +126,7 @@ pub(super) struct UdpSocketState {
     pub(super) peer: Option<ReactorUdpPeer>,
     internal_receive_queue: VecDeque<InternalDatagram>,
     internal_receive_bytes: usize,
-    queued_by_source: HashMap<ProcessAuthorityKey, UdpQueueAccounting>,
+    queued_by_source: HashMap<ProcessId, UdpQueueAccounting>,
     pub(super) peeked_origin: Option<UdpReceiveOrigin>,
     pub(super) next_receive_origin: UdpReceiveOrigin,
     pub(super) native_endpoint: Option<UdpNativeEndpoint>,
@@ -184,7 +185,7 @@ impl UdpNativeErrorState {
 struct InternalDatagram {
     payload: Vec<u8>,
     source_address: SocketAddrV4,
-    source_process_authority: ProcessAuthorityKey,
+    source_process_authority: Option<ProcessId>,
 }
 
 pub(super) struct UdpNativeEndpoint {
@@ -349,17 +350,17 @@ impl Reactor {
             }
             socket.process_authority
         };
-        let session = self
-            .sessions
+        let process = self
+            .processes
             .get(&process_authority)
             .ok_or(BrokerError::Internal)?;
         if self.udp.external_peer_count
             >= self
                 .max_sockets
                 .saturating_mul(MAX_UDP_EXTERNAL_PEERS_PER_SOCKET)
-            || session.udp_external_peer_count
+            || process.udp_external_peer_count
                 >= self
-                    .max_sockets_per_session
+                    .max_sockets_per_process
                     .saturating_mul(MAX_UDP_EXTERNAL_PEERS_PER_SOCKET)
         {
             return Err(BrokerError::ResourceExhausted);
@@ -390,11 +391,11 @@ impl Reactor {
             .external_peer_count
             .checked_add(1)
             .ok_or(BrokerError::ResourceExhausted)?;
-        let session = self
-            .sessions
+        let process = self
+            .processes
             .get_mut(&process_authority)
             .ok_or(BrokerError::Internal)?;
-        session.udp_external_peer_count = session
+        process.udp_external_peer_count = process
             .udp_external_peer_count
             .checked_add(1)
             .ok_or(BrokerError::ResourceExhausted)?;
@@ -422,14 +423,14 @@ impl Reactor {
             .external_peer_count
             .checked_sub(1)
             .expect("reactor UDP external peer count underflow");
-        let session = self
-            .sessions
+        let process = self
+            .processes
             .get_mut(&socket.process_authority)
-            .expect("UDP external peer session state missing");
-        session.udp_external_peer_count = session
+            .expect("UDP external peer process state missing");
+        process.udp_external_peer_count = process
             .udp_external_peer_count
             .checked_sub(1)
-            .expect("session UDP external peer count underflow");
+            .expect("process UDP external peer count underflow");
     }
 
     pub(super) fn clear_udp_external_peers(&mut self, socket_id: u64) -> BrokerResult<()> {
@@ -449,11 +450,11 @@ impl Reactor {
             .external_peer_count
             .checked_sub(count)
             .ok_or(BrokerError::Internal)?;
-        let session = self
-            .sessions
+        let process = self
+            .processes
             .get_mut(&process_authority)
             .ok_or(BrokerError::Internal)?;
-        session.udp_external_peer_count = session
+        process.udp_external_peer_count = process
             .udp_external_peer_count
             .checked_sub(count)
             .ok_or(BrokerError::Internal)?;
@@ -461,7 +462,7 @@ impl Reactor {
     }
 
     fn udp_queue_limits(&self) -> (usize, usize, usize, usize) {
-        udp_queue_limits(self.max_sockets, self.max_sockets_per_session)
+        udp_queue_limits(self.max_sockets, self.max_sockets_per_process)
     }
 
     pub(super) fn udp_readiness(&self, socket_id: u64) -> BrokerResult<ReadinessFlags> {
@@ -636,7 +637,7 @@ impl Reactor {
     fn udp_queue_would_drop(
         &self,
         receiver_id: u64,
-        source_process_authority: ProcessAuthorityKey,
+        source_process_authority: ProcessId,
         length: usize,
     ) -> BrokerResult<bool> {
         let receiver = self
@@ -644,8 +645,8 @@ impl Reactor {
             .get(&receiver_id)
             .ok_or(BrokerError::UnknownObject)?;
         let udp = receiver.udp_state()?;
-        let receiver_session = self
-            .sessions
+        let receiver_process = self
+            .processes
             .get(&receiver.process_authority)
             .ok_or(BrokerError::Internal)?;
         let source = self
@@ -659,7 +660,7 @@ impl Reactor {
             .get(&source_process_authority)
             .copied()
             .unwrap_or_default();
-        let (global_datagrams, global_bytes, session_datagrams, session_bytes) =
+        let (global_datagrams, global_bytes, process_datagrams, process_bytes) =
             self.udp_queue_limits();
 
         Ok(
@@ -670,10 +671,10 @@ impl Reactor {
                 || receiver_source.bytes.saturating_add(length) > MAX_UDP_QUEUE_BYTES_PER_SOURCE
                 || self.udp.queued_datagrams >= global_datagrams
                 || self.udp.queued_bytes.saturating_add(length) > global_bytes
-                || receiver_session.udp_queued_datagrams >= session_datagrams
-                || receiver_session.udp_queued_bytes.saturating_add(length) > session_bytes
-                || source.datagrams >= session_datagrams
-                || source.bytes.saturating_add(length) > session_bytes,
+                || receiver_process.udp_queued_datagrams >= process_datagrams
+                || receiver_process.udp_queued_bytes.saturating_add(length) > process_bytes
+                || source.datagrams >= process_datagrams
+                || source.bytes.saturating_add(length) > process_bytes,
         )
     }
 
@@ -760,15 +761,15 @@ impl Reactor {
         let datagram = InternalDatagram {
             payload: stored_payload,
             source_address,
-            source_process_authority,
+            source_process_authority: Some(source_process_authority),
         };
         let receiver_process_authority = self
             .sockets
             .get(&destination_socket_id)
             .ok_or(BrokerError::Internal)?
             .process_authority;
-        let receiver_session = self
-            .sessions
+        let receiver_process = self
+            .processes
             .get_mut(&receiver_process_authority)
             .ok_or(BrokerError::Internal)?;
         {
@@ -794,8 +795,8 @@ impl Reactor {
                 .or_default();
             source.datagrams += 1;
             source.bytes += payload.len();
-            receiver_session.udp_queued_datagrams += 1;
-            receiver_session.udp_queued_bytes += payload.len();
+            receiver_process.udp_queued_datagrams += 1;
+            receiver_process.udp_queued_bytes += payload.len();
         }
 
         if was_empty && self.publish_udp_readiness(destination_socket_id).is_err() {
@@ -834,24 +835,25 @@ impl Reactor {
             .internal_receive_bytes
             .checked_sub(datagram.payload.len())
             .expect("UDP receiver byte count underflow");
-        let remove_receiver_source = {
-            let source = udp
-                .queued_by_source
-                .get_mut(&datagram.source_process_authority)
-                .expect("UDP receiver source accounting missing");
-            source.datagrams = source
-                .datagrams
-                .checked_sub(1)
-                .expect("UDP receiver source datagram count underflow");
-            source.bytes = source
-                .bytes
-                .checked_sub(datagram.payload.len())
-                .expect("UDP receiver source byte count underflow");
-            source.datagrams == 0
-        };
-        if remove_receiver_source {
-            udp.queued_by_source
-                .remove(&datagram.source_process_authority);
+        if let Some(source_process_authority) = datagram.source_process_authority {
+            let remove_receiver_source = {
+                let source = udp
+                    .queued_by_source
+                    .get_mut(&source_process_authority)
+                    .expect("UDP receiver source accounting missing");
+                source.datagrams = source
+                    .datagrams
+                    .checked_sub(1)
+                    .expect("UDP receiver source datagram count underflow");
+                source.bytes = source
+                    .bytes
+                    .checked_sub(datagram.payload.len())
+                    .expect("UDP receiver source byte count underflow");
+                source.datagrams == 0
+            };
+            if remove_receiver_source {
+                udp.queued_by_source.remove(&source_process_authority);
+            }
         }
 
         self.udp.queued_datagrams = self
@@ -864,39 +866,89 @@ impl Reactor {
             .queued_bytes
             .checked_sub(datagram.payload.len())
             .expect("global UDP byte count underflow");
-        let remove_source = {
-            let source = self
-                .udp
-                .queued_by_source
-                .get_mut(&datagram.source_process_authority)
-                .expect("global UDP source accounting missing");
-            source.datagrams = source
-                .datagrams
-                .checked_sub(1)
-                .expect("global UDP source datagram count underflow");
-            source.bytes = source
-                .bytes
-                .checked_sub(datagram.payload.len())
-                .expect("global UDP source byte count underflow");
-            source.datagrams == 0
-        };
-        if remove_source {
-            self.udp
-                .queued_by_source
-                .remove(&datagram.source_process_authority);
+        if let Some(source_process_authority) = datagram.source_process_authority {
+            let remove_source = {
+                let source = self
+                    .udp
+                    .queued_by_source
+                    .get_mut(&source_process_authority)
+                    .expect("global UDP source accounting missing");
+                source.datagrams = source
+                    .datagrams
+                    .checked_sub(1)
+                    .expect("global UDP source datagram count underflow");
+                source.bytes = source
+                    .bytes
+                    .checked_sub(datagram.payload.len())
+                    .expect("global UDP source byte count underflow");
+                source.datagrams == 0
+            };
+            if remove_source {
+                self.udp.queued_by_source.remove(&source_process_authority);
+            }
         }
-        let receiver_session = self
-            .sessions
+        let receiver_process = self
+            .processes
             .get_mut(&receiver_process_authority)
-            .expect("UDP receiver session accounting missing");
-        receiver_session.udp_queued_datagrams = receiver_session
+            .expect("UDP receiver process accounting missing");
+        receiver_process.udp_queued_datagrams = receiver_process
             .udp_queued_datagrams
             .checked_sub(1)
-            .expect("session UDP datagram count underflow");
-        receiver_session.udp_queued_bytes = receiver_session
+            .expect("process UDP datagram count underflow");
+        receiver_process.udp_queued_bytes = receiver_process
             .udp_queued_bytes
             .checked_sub(datagram.payload.len())
-            .expect("session UDP byte count underflow");
+            .expect("process UDP byte count underflow");
+    }
+
+    pub(super) fn retire_udp_source(&mut self, source_process_authority: ProcessId) {
+        let expected = self
+            .udp
+            .queued_by_source
+            .remove(&source_process_authority)
+            .unwrap_or_default();
+        let mut retired = UdpQueueAccounting::default();
+        for socket in self.sockets.values_mut() {
+            let Ok(udp) = socket.udp_state_mut() else {
+                continue;
+            };
+            let expected_from_socket = udp
+                .queued_by_source
+                .remove(&source_process_authority)
+                .unwrap_or_default();
+            let mut retired_from_socket = UdpQueueAccounting::default();
+            for datagram in &mut udp.internal_receive_queue {
+                if datagram.source_process_authority == Some(source_process_authority) {
+                    datagram.source_process_authority = None;
+                    retired_from_socket.datagrams += 1;
+                    retired_from_socket.bytes += datagram.payload.len();
+                }
+            }
+            debug_assert_eq!(
+                retired_from_socket.datagrams,
+                expected_from_socket.datagrams
+            );
+            debug_assert_eq!(retired_from_socket.bytes, expected_from_socket.bytes);
+            retired.datagrams += retired_from_socket.datagrams;
+            retired.bytes += retired_from_socket.bytes;
+        }
+        debug_assert_eq!(retired.datagrams, expected.datagrams);
+        debug_assert_eq!(retired.bytes, expected.bytes);
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_udp_source_accounting(&self, source_process_authority: ProcessId) -> bool {
+        self.udp
+            .queued_by_source
+            .contains_key(&source_process_authority)
+            || self.sockets.values().any(|socket| {
+                socket.udp_state().is_ok_and(|udp| {
+                    udp.queued_by_source.contains_key(&source_process_authority)
+                        || udp.internal_receive_queue.iter().any(|datagram| {
+                            datagram.source_process_authority == Some(source_process_authority)
+                        })
+                })
+            })
     }
 
     pub(super) fn clear_udp_receive_queue(&mut self, socket_id: u64) -> BrokerResult<()> {
@@ -1214,8 +1266,8 @@ impl Reactor {
         }
         self.rearm_udp_endpoint(target.socket_id)?;
         // The cached snapshot remains authoritative if this association cannot
-        // accept a notification. One session's sink must not fail the shared
-        // reactor and every other session using it.
+        // accept a notification. One process's sink must not fail the shared
+        // reactor and every other process using it.
         let _ = self.publish_udp_readiness(target.socket_id);
         Ok(())
     }
@@ -1779,21 +1831,21 @@ fn udp_readable_after_error(peeked_origin: Option<UdpReceiveOrigin>) -> bool {
 
 pub(super) fn udp_queue_limits(
     max_sockets: usize,
-    max_sockets_per_session: usize,
+    max_sockets_per_process: usize,
 ) -> (usize, usize, usize, usize) {
     let global_datagrams = max_sockets.saturating_mul(MAX_UDP_QUEUE_DATAGRAMS_PER_SOCKET);
     let global_bytes = max_sockets.saturating_mul(MAX_UDP_QUEUE_BYTES_PER_SOCKET);
-    let session_datagrams = max_sockets_per_session
+    let process_datagrams = max_sockets_per_process
         .saturating_mul(MAX_UDP_QUEUE_DATAGRAMS_PER_SOCKET)
         .min(global_datagrams.saturating_sub(1));
-    let session_bytes = max_sockets_per_session
+    let process_bytes = max_sockets_per_process
         .saturating_mul(MAX_UDP_QUEUE_BYTES_PER_SOCKET)
         .min(global_bytes.saturating_sub(MAX_UDP_DATAGRAM_SIZE as usize));
     (
         global_datagrams,
         global_bytes,
-        session_datagrams,
-        session_bytes,
+        process_datagrams,
+        process_bytes,
     )
 }
 
@@ -1900,13 +1952,13 @@ mod tests {
     }
 
     #[test]
-    fn udp_session_queue_limits_remain_below_global_limits() {
-        let (global_datagrams, global_bytes, session_datagrams, session_bytes) =
+    fn udp_process_queue_limits_remain_below_global_limits() {
+        let (global_datagrams, global_bytes, process_datagrams, process_bytes) =
             udp_queue_limits(2, 2);
-        assert_eq!(global_datagrams - session_datagrams, 1);
-        assert_eq!(global_bytes - session_bytes, MAX_UDP_DATAGRAM_SIZE as usize);
-        let (_, _, single_session_datagrams, single_session_bytes) = udp_queue_limits(1, 1);
-        assert_ne!(single_session_datagrams, 0);
-        assert_ne!(single_session_bytes, 0);
+        assert_eq!(global_datagrams - process_datagrams, 1);
+        assert_eq!(global_bytes - process_bytes, MAX_UDP_DATAGRAM_SIZE as usize);
+        let (_, _, single_process_datagrams, single_process_bytes) = udp_queue_limits(1, 1);
+        assert_ne!(single_process_datagrams, 0);
+        assert_ne!(single_process_bytes, 0);
     }
 }

@@ -707,10 +707,7 @@ mod control_ring_tests {
             &mut host_stream,
             &encode_handshake_response(BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: litebox_broker_protocol::BROKER_PROTOCOL_VERSION,
-                process_identity: litebox_broker_protocol::ProcessIdentity {
-                    id: litebox_broker_protocol::ProcessId::new(1).unwrap(),
-                    parent_id: None,
-                },
+                process_id: litebox_broker_protocol::ProcessId::new(1).unwrap(),
             }),
             None,
         )

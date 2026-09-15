@@ -38,7 +38,9 @@ use litebox_broker_protocol::message::{
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SharedBufferSequence};
-use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, ObjectHandle, ProcessIdentity, RequestId};
+use litebox_broker_protocol::{
+    BROKER_PROTOCOL_VERSION, ObjectHandle, ProcessId, RequestId, ThreadId,
+};
 use litebox_broker_transport::channel::{
     LocalCallChannel, LocalNotificationChannel, LocalSetupChannel,
 };
@@ -52,7 +54,7 @@ pub use error::{BrokerLocalError, Result};
 /// sequences identify operation-scoped slots managed by the caller.
 pub struct BrokerLocal<Channel: LocalCallChannel> {
     channel: Channel,
-    process_identity: ProcessIdentity,
+    process_id: ProcessId,
     shared_buffers: SharedBufferPool<Arc<dyn SharedMemory>>,
     next_request_id: AtomicU64,
 }
@@ -100,7 +102,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         {
             response @ BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version,
-                process_identity,
+                process_id,
             } => {
                 assert_eq!(
                     requested, broker_protocol_version,
@@ -113,7 +115,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                 Ok((
                     Self {
                         channel,
-                        process_identity,
+                        process_id,
                         shared_buffers,
                         next_request_id: AtomicU64::new(0),
                     },
@@ -136,10 +138,38 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Returns the broker-assigned identity of this process.
+    /// Returns the broker-assigned process ID.
     #[must_use]
-    pub const fn process_identity(&self) -> ProcessIdentity {
-        self.process_identity
+    pub const fn process_id(&self) -> ProcessId {
+        self.process_id
+    }
+
+    /// Allocates a globally unique thread ID for this process.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for a different operation.
+    pub fn allocate_thread_id(&self) -> Result<ThreadId, Channel::Error> {
+        match self.request(BrokerOperation::AllocateThreadId)? {
+            BrokerResult::ThreadIdAllocated(thread_id) => Ok(thread_id),
+            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
+            response => panic!("broker returned unexpected thread-ID response: {response:?}"),
+        }
+    }
+
+    /// Releases a thread ID previously allocated for this process.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for a different operation.
+    pub fn release_thread_id(&self, thread_id: ThreadId) -> Result<(), Channel::Error> {
+        match self.request(BrokerOperation::ReleaseThreadId(thread_id))? {
+            BrokerResult::ThreadIdReleased => Ok(()),
+            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
+            response => {
+                panic!("broker returned unexpected thread-ID release response: {response:?}")
+            }
+        }
     }
 
     /// Sends one active broker request.
@@ -300,15 +330,12 @@ mod tests {
         IsTerminalStdioRequest, IsTerminalStdioResponse, ReadStdioRequest, ReadStdioResponse,
         StdioOutputStream, StdioStream, WriteStdioRequest, WriteStdioResponse,
     };
-    use litebox_broker_protocol::{ObjectHandle, ProcessId, ProcessIdentity, ProtocolVersion};
+    use litebox_broker_protocol::{ObjectHandle, ProcessId, ProtocolVersion, ThreadId};
     use litebox_broker_transport::channel::LocalNotificationChannel;
     use std::sync::Mutex;
 
-    fn test_process_identity() -> ProcessIdentity {
-        ProcessIdentity {
-            id: ProcessId::new(1).unwrap(),
-            parent_id: None,
-        }
+    fn test_process_id() -> ProcessId {
+        ProcessId::new(1).unwrap()
     }
 
     #[test]
@@ -316,7 +343,7 @@ mod tests {
         let channel = FakeControlChannel::new(
             Some(BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
-                process_identity: test_process_identity(),
+                process_id: test_process_id(),
             }),
             None,
         );
@@ -337,7 +364,7 @@ mod tests {
             })
         );
         assert_eq!(setup_calls.get(), 1);
-        assert_eq!(local.process_identity(), test_process_identity());
+        assert_eq!(local.process_id(), test_process_id());
     }
 
     #[test]
@@ -347,7 +374,7 @@ mod tests {
         let response = BrokerResult::ObjectClosed;
         let channel = FakeControlChannel::new(None, Some(response.clone()));
         let local = BrokerLocal {
-            process_identity: test_process_identity(),
+            process_id: test_process_id(),
             channel,
             shared_buffers: noop_shared_buffers(),
             next_request_id: AtomicU64::new(0),
@@ -364,6 +391,49 @@ mod tests {
     }
 
     #[test]
+    fn allocate_thread_id_sends_request_and_returns_id() {
+        let thread_id = ThreadId::new(7).unwrap();
+        let channel =
+            FakeControlChannel::new(None, Some(BrokerResult::ThreadIdAllocated(thread_id)));
+        let local = BrokerLocal {
+            process_id: test_process_id(),
+            channel,
+            shared_buffers: noop_shared_buffers(),
+            next_request_id: AtomicU64::new(0),
+        };
+
+        assert_eq!(local.allocate_thread_id().unwrap(), thread_id);
+        assert_eq!(
+            local.channel.sent_request.borrow().clone(),
+            Some(BrokerRequest {
+                request_id: RequestId(0),
+                operation: BrokerOperation::AllocateThreadId,
+            })
+        );
+    }
+
+    #[test]
+    fn release_thread_id_sends_owned_id() {
+        let thread_id = ThreadId::new(7).unwrap();
+        let channel = FakeControlChannel::new(None, Some(BrokerResult::ThreadIdReleased));
+        let local = BrokerLocal {
+            process_id: test_process_id(),
+            channel,
+            shared_buffers: noop_shared_buffers(),
+            next_request_id: AtomicU64::new(0),
+        };
+
+        local.release_thread_id(thread_id).unwrap();
+        assert_eq!(
+            local.channel.sent_request.borrow().clone(),
+            Some(BrokerRequest {
+                request_id: RequestId(0),
+                operation: BrokerOperation::ReleaseThreadId(thread_id),
+            })
+        );
+    }
+
+    #[test]
     fn write_stdio_stages_the_requested_stream_and_buffer() {
         let buffer = sequence(2, 3);
         let channel = FakeControlChannel::new(
@@ -373,7 +443,7 @@ mod tests {
             ))),
         );
         let local = BrokerLocal {
-            process_identity: test_process_identity(),
+            process_id: test_process_id(),
             channel,
             shared_buffers: noop_shared_buffers(),
             next_request_id: AtomicU64::new(0),
@@ -407,7 +477,7 @@ mod tests {
             ))),
         );
         let local = BrokerLocal {
-            process_identity: test_process_identity(),
+            process_id: test_process_id(),
             channel,
             shared_buffers: noop_shared_buffers(),
             next_request_id: AtomicU64::new(0),
@@ -434,7 +504,7 @@ mod tests {
             ))),
         );
         let local = BrokerLocal {
-            process_identity: test_process_identity(),
+            process_id: test_process_id(),
             channel,
             shared_buffers: noop_shared_buffers(),
             next_request_id: AtomicU64::new(0),
@@ -463,7 +533,7 @@ mod tests {
         let handle = ObjectHandle(7);
         let channel = FakeControlChannel::new(None, Some(BrokerResult::ObjectClosed));
         let local = BrokerLocal {
-            process_identity: test_process_identity(),
+            process_id: test_process_id(),
             channel,
             shared_buffers: noop_shared_buffers(),
             next_request_id: AtomicU64::new(0),
@@ -498,7 +568,7 @@ mod tests {
     #[test]
     fn concurrent_active_requests_use_distinct_identifiers() {
         let local = Arc::new(BrokerLocal {
-            process_identity: test_process_identity(),
+            process_id: test_process_id(),
             channel: ConcurrentCallChannel {
                 request_ids: Mutex::new(std::vec::Vec::new()),
             },
@@ -527,7 +597,7 @@ mod tests {
     fn active_request_rejects_mismatched_response_identifier() {
         let channel = FakeControlChannel::new(None, Some(BrokerResult::ObjectClosed));
         let local = BrokerLocal {
-            process_identity: test_process_identity(),
+            process_id: test_process_id(),
             channel,
             shared_buffers: noop_shared_buffers(),
             next_request_id: AtomicU64::new(0),
@@ -547,7 +617,7 @@ mod tests {
     fn active_request_identifier_exhaustion_does_not_wrap() {
         let channel = FakeControlChannel::new(None, Some(BrokerResult::ObjectClosed));
         let local = BrokerLocal {
-            process_identity: test_process_identity(),
+            process_id: test_process_id(),
             channel,
             shared_buffers: noop_shared_buffers(),
             next_request_id: AtomicU64::new(u64::MAX),
@@ -565,7 +635,7 @@ mod tests {
         for error in [ErrorCode::WouldBlock, ErrorCode::UnsupportedOperation] {
             let channel = FakeControlChannel::new(None, Some(BrokerResult::Error(error)));
             let local = BrokerLocal {
-                process_identity: test_process_identity(),
+                process_id: test_process_id(),
                 channel,
                 shared_buffers: noop_shared_buffers(),
                 next_request_id: AtomicU64::new(0),
@@ -583,7 +653,7 @@ mod tests {
     fn active_request_panics_on_unrecoverable_broker_error() {
         let channel = FakeControlChannel::new(None, Some(BrokerResult::Error(ErrorCode::Internal)));
         let local = BrokerLocal {
-            process_identity: test_process_identity(),
+            process_id: test_process_id(),
             channel,
             shared_buffers: noop_shared_buffers(),
             next_request_id: AtomicU64::new(0),
@@ -598,7 +668,7 @@ mod tests {
         let channel = FakeControlChannel::new(
             Some(BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version,
-                process_identity: test_process_identity(),
+                process_id: test_process_id(),
             }),
             None,
         );
@@ -650,7 +720,7 @@ mod tests {
     }
 
     #[test]
-    fn negotiate_returns_process_identity_exhaustion() {
+    fn negotiate_returns_process_id_exhaustion() {
         let channel = FakeControlChannel::new(
             Some(BrokerHandshakeResponse::Error(ErrorCode::ResourceExhausted)),
             None,
@@ -690,7 +760,7 @@ mod tests {
         let channel = FakeControlChannel::new(
             Some(BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
-                process_identity: test_process_identity(),
+                process_id: test_process_id(),
             }),
             None,
         );
@@ -713,7 +783,7 @@ mod tests {
         let channel = FakeControlChannel::new(
             Some(BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
-                process_identity: test_process_identity(),
+                process_id: test_process_id(),
             }),
             None,
         );
@@ -878,7 +948,7 @@ mod tests {
         ) -> core::result::Result<Option<BrokerHandshakeResponse>, Self::Error> {
             Ok(Some(BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
-                process_identity: test_process_identity(),
+                process_id: test_process_id(),
             }))
         }
     }

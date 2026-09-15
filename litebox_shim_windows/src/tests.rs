@@ -15,7 +15,10 @@ use alloc::vec::Vec;
 use core::mem::size_of;
 use litebox::platform::RawConstPointer as _;
 use litebox::utils::TruncateExt as _;
-use litebox_broker_core::fs::in_mem::InitialNode;
+use litebox_broker_core::{
+    BrokerCore, ObjectRights, PolicyEngine, fs::in_mem::InitialNode,
+    test_support::TestBrokerCoreBuilder,
+};
 use litebox_broker_protocol::fs::{FileMode as Mode, FileUser as UserInfo};
 
 use crate::nt_types::{ObjectAttributes, UnicodeString};
@@ -27,6 +30,11 @@ use crate::{ConstPtr, MutPtr, Process, ShimPlatform, Task, WindowsShim};
 pub(crate) type TestPlatform = litebox_platform_linux_userland::LinuxUserland;
 #[cfg(target_os = "windows")]
 pub(crate) type TestPlatform = litebox_platform_windows_userland::WindowsUserland;
+
+struct TestContext {
+    platform: &'static TestPlatform,
+    objectless_broker: std::sync::OnceLock<BrokerCore>,
+}
 
 pub(crate) fn const_ptr<T: zerocopy::FromBytes>(value: &T) -> ConstPtr<TestPlatform, T> {
     ConstPtr::<TestPlatform, T>::from_usize(core::ptr::from_ref(value).cast::<u8>() as usize)
@@ -76,9 +84,9 @@ pub(crate) fn object_attributes(name: &UnicodeString, attributes: u32) -> Object
     }
 }
 
-pub(crate) fn test_platform() -> &'static TestPlatform {
-    static PLATFORM: std::sync::OnceLock<&'static TestPlatform> = std::sync::OnceLock::new();
-    PLATFORM.get_or_init(|| {
+fn test_context() -> &'static TestContext {
+    static CONTEXT: std::sync::OnceLock<TestContext> = std::sync::OnceLock::new();
+    CONTEXT.get_or_init(|| {
         #[cfg(target_os = "linux")]
         let platform = TestPlatform::new();
 
@@ -91,7 +99,24 @@ pub(crate) fn test_platform() -> &'static TestPlatform {
             platform
         };
 
-        platform
+        TestContext {
+            platform,
+            objectless_broker: std::sync::OnceLock::new(),
+        }
+    })
+}
+
+pub(crate) fn test_platform() -> &'static TestPlatform {
+    test_context().platform
+}
+
+pub(crate) fn objectless_broker() -> &'static BrokerCore {
+    test_context().objectless_broker.get_or_init(|| {
+        TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .expect("a test process may build only one broker core")
     })
 }
 
@@ -120,16 +145,16 @@ fn map_csr_server_shared_memory(
 }
 
 pub(crate) fn test_task() -> Task<TestPlatform> {
-    test_task_from_litebox(crate::test_broker::litebox(test_platform()))
+    let (litebox, process_id) = crate::test_broker::litebox(test_platform());
+    test_task_from_litebox_with_process_id(litebox, process_id, None)
 }
 
-pub(crate) fn test_task_with_process_identity(
-    process_identity: litebox_broker_protocol::ProcessIdentity,
+pub(crate) fn test_task_with_process_id(
+    process_id: litebox_broker_protocol::ProcessId,
+    parent_id: Option<litebox_broker_protocol::ProcessId>,
 ) -> Task<TestPlatform> {
-    test_task_from_litebox_with_identity(
-        crate::test_broker::litebox(test_platform()),
-        process_identity,
-    )
+    let (litebox, _) = crate::test_broker::litebox(test_platform());
+    test_task_from_litebox_with_process_id(litebox, process_id, parent_id)
 }
 
 /// Returns a task whose broker serves `files` from an in-memory filesystem.
@@ -176,39 +201,26 @@ pub(crate) fn test_task_with_broker_files(files: &[(&str, &[u8])]) -> Task<TestP
         )
     }));
 
-    test_task_from_litebox(crate::test_broker::litebox_with_broker_files(
-        test_platform(),
-        entries,
-    ))
+    let (litebox, process_id) =
+        crate::test_broker::litebox_with_broker_files(test_platform(), entries);
+    test_task_from_litebox_with_process_id(litebox, process_id, None)
 }
 
-fn test_task_from_litebox(litebox: litebox::LiteBox<TestPlatform>) -> Task<TestPlatform> {
-    let process_identity = litebox_broker_protocol::ProcessIdentity {
-        id: litebox_broker_protocol::ProcessId::new(
-            u32::try_from(crate::syscalls::process::INITIAL_PROCESS_ID)
-                .expect("the initial Windows test process ID must fit u32"),
-        )
-        .unwrap(),
-        parent_id: None,
-    };
-    test_task_from_litebox_with_identity(litebox, process_identity)
-}
-
-fn test_task_from_litebox_with_identity(
+fn test_task_from_litebox_with_process_id(
     litebox: litebox::LiteBox<TestPlatform>,
-    process_identity: litebox_broker_protocol::ProcessIdentity,
+    process_id: litebox_broker_protocol::ProcessId,
+    parent_id: Option<litebox_broker_protocol::ProcessId>,
 ) -> Task<TestPlatform> {
     let platform = test_platform();
-    let initial_thread_id =
-        if process_identity.id.get() < litebox_broker_protocol::MAX_ALLOCATED_TASK_ID {
-            process_identity.id.get() + 1
-        } else {
-            1
-        };
+    let initial_thread_id = litebox
+        .allocate_thread_id()
+        .expect("the test broker must allocate an initial thread ID");
     let shim_builder = crate::WindowsShimBuilder::<TestPlatform>::new_with_litebox(
         platform,
         litebox,
-        process_identity,
+        process_id,
+        parent_id,
+        initial_thread_id,
     );
     let fs_context = litebox::fs::Context::new();
     let shim = shim_builder.build();
@@ -221,16 +233,16 @@ fn test_task_from_litebox_with_identity(
         crate::syscalls::section::load_time_windows_shared_section(windows_shared_section_base);
 
     let process = Arc::new(Process::new(
-        process_identity,
-        initial_thread_id,
+        process_id,
+        parent_id,
         None,
         windows_shared_section,
     ));
     let thread_object = Arc::new(crate::syscalls::thread::ThreadObject::new(
-        initial_thread_id as usize,
+        initial_thread_id.get() as usize,
         0,
     ));
-    assert!(process.attach_thread(initial_thread_id as usize, &thread_object));
+    assert!(process.attach_thread(initial_thread_id.get() as usize, &thread_object));
 
     Task {
         global,
@@ -294,12 +306,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     pub(crate) fn clone_for_test_with_teb(&self, teb_address: usize) -> Option<Self> {
-        let thread_id = self.process.allocate_thread_id()?;
+        let broker_thread_id = self.global.litebox.allocate_thread_id().ok()?;
+        let thread_id = broker_thread_id.get() as usize;
         let thread_object = Arc::new(crate::syscalls::thread::ThreadObject::new(
             thread_id,
             teb_address,
         ));
         if !self.process.attach_thread(thread_id, &thread_object) {
+            let _ = self.global.litebox.release_thread_id(broker_thread_id);
             return None;
         }
         Some(Task {
@@ -317,6 +331,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
             thread_object,
         })
     }
+}
+
+#[test]
+fn objectless_test_tasks_use_distinct_negotiated_process_ids() {
+    let first = test_task();
+    let second = test_task();
+
+    assert_eq!(first.process.id, first.global.process_id.get() as usize);
+    assert_eq!(second.process.id, second.global.process_id.get() as usize);
+    assert_ne!(first.process.id, second.process.id);
 }
 
 fn create_event(task: &Task<TestPlatform>, desired_access: u32) -> Handle {
