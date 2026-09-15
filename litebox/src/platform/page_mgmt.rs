@@ -334,6 +334,20 @@ pub enum PageStateUpdateError {
     UnsupportedByPlatform,
 }
 
+impl From<AllocationError> for PageStateUpdateError {
+    fn from(value: AllocationError) -> Self {
+        match value {
+            AllocationError::Unaligned => Self::Unaligned,
+            AllocationError::OutOfMemory => Self::OutOfMemory,
+            AllocationError::BelowMinAddress
+            | AllocationError::AboveMaxAddress
+            | AllocationError::AddressInUse
+            | AllocationError::AddressInUseByPlatform
+            | AllocationError::AddressPartiallyInUse => Self::Unallocated,
+        }
+    }
+}
+
 /// Possible errors for [`PageManagementProvider::try_allocate_cow_pages`]
 ///
 /// ```text

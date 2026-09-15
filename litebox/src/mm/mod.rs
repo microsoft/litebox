@@ -80,14 +80,7 @@ where
     {
         let addr = {
             let mut vmem = self.vmem.write();
-            unsafe {
-                vmem.create_pages(
-                    suggested_address,
-                    length,
-                    flags,
-                    PageState::Committed(before_perms),
-                )
-            }?
+            unsafe { vmem.create_pages(suggested_address, length, flags, before_perms) }?
         };
         // call the user function with the pages
         // Note `op` may trigger page fault handler which requires write lock to `vmem`.
@@ -267,7 +260,8 @@ where
     /// When replacing a fixed mapping, the caller must ensure that overlapping mappings are not
     /// in use. The caller must also ensure that `flags` correctly describe the mapping.
     ///
-    /// Platforms that do not support reserving pages may emulate it by creating inaccessible pages.
+    /// Platforms that do not support reserving pages may emulate it by creating committed but inaccessible pages.
+    /// [`CreatePagesFlags::MAP_FILE`] and [`CreatePagesFlags::SHARED`] are invalid for reserved pages.
     pub unsafe fn create_reserved_pages(
         &self,
         suggested_address: Option<NonZeroAddress<ALIGN>>,
@@ -275,7 +269,7 @@ where
         flags: CreatePagesFlags,
     ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
         let mut vmem = self.vmem.write();
-        unsafe { vmem.create_pages(suggested_address, length, flags, PageState::Reserved) }
+        unsafe { vmem.create_reserved_pages(suggested_address, length, flags) }
     }
 
     /// Create stack pages.
@@ -376,7 +370,7 @@ where
                     Some(suggested_address),
                     length,
                     CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
-                    PageState::Committed(perms),
+                    perms,
                 )
             }?;
         }
@@ -747,9 +741,6 @@ where
                 .ok_or(PageFaultError::AccessError("no mapping"))?;
             (r.start, *vma)
         };
-        if vma.flags().contains(VmFlags::VM_RESERVED) {
-            return Err(PageFaultError::AccessError("reserved page"));
-        }
         if fault_addr < start {
             // address is out of range, test if it is next to a stack
             if !vma.flags().contains(VmFlags::VM_GROWSDOWN) {

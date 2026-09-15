@@ -102,6 +102,26 @@ impl From<MemoryRegionPermissions> for VmFlags {
     }
 }
 
+impl From<PageState> for VmFlags {
+    fn from(value: PageState) -> Self {
+        match value {
+            PageState::Reserved => Self::VM_RESERVED,
+            // `MemoryRegionPermissions` is a subset of `VmFlags` and we only need the access flags.
+            PageState::Committed(permissions) => Self::from(permissions) & Self::VM_ACCESS_FLAGS,
+        }
+    }
+}
+
+impl From<VmFlags> for PageState {
+    fn from(value: VmFlags) -> Self {
+        if value.contains(VmFlags::VM_RESERVED) {
+            Self::Reserved
+        } else {
+            Self::Committed(value.into())
+        }
+    }
+}
+
 impl From<VmFlags> for MemoryRegionPermissions {
     fn from(value: VmFlags) -> Self {
         let mut flags = MemoryRegionPermissions::empty();
@@ -287,29 +307,11 @@ impl VmArea {
         self.is_file_backed
     }
 
-    /// Get the provider-facing allocation state of this area.
-    pub(super) fn page_state(self) -> PageState {
-        if self.flags.contains(VmFlags::VM_RESERVED) {
-            PageState::Reserved
-        } else {
-            PageState::Committed(self.flags.into())
-        }
-    }
-
     /// Create a new [`VmArea`] with the given flags.
     #[inline]
     pub(super) fn new(flags: VmFlags, is_file_backed: bool) -> Self {
         Self {
-            flags: flags & !VmFlags::VM_RESERVED,
-            is_file_backed,
-        }
-    }
-
-    /// Create a reserved memory area with no committed pages.
-    #[inline]
-    pub(super) fn new_reserved(flags: VmFlags, is_file_backed: bool) -> Self {
-        Self {
-            flags: (flags & !VmFlags::VM_ACCESS_FLAGS) | VmFlags::VM_RESERVED,
+            flags,
             is_file_backed,
         }
     }
@@ -515,7 +517,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             .platform
             .allocate_pages(
                 suggested_range.into(),
-                vma.page_state(),
+                PageState::from(vma.flags()),
                 vma.flags.contains(VmFlags::VM_GROWSDOWN),
                 populate_pages_immediately,
                 platform_fixed_address_behavior,
@@ -727,8 +729,11 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             .ok_or(VmemMoveError::OutOfMemory)?;
         let new_range = PageRange::<ALIGN>::new(new_addr, new_addr + new_size.as_usize()).unwrap();
         let new_addr = unsafe {
-            self.platform
-                .remap_pages(old_range.into(), new_range.into(), vma.page_state())
+            self.platform.remap_pages(
+                old_range.into(),
+                new_range.into(),
+                PageState::from(vma.flags()),
+            )
         }
         .map_err(VmemMoveError::RemapError)?;
 
@@ -739,7 +744,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         Ok(new_addr)
     }
 
-    /// Change the permissions ([`VmFlags::VM_ACCESS_FLAGS`]) of a range in the virtual address space.
+    /// Change the permissions ([`VmFlags::VM_ACCESS_FLAGS`]) of committed mappings in the virtual address space.
     ///
     /// See <https://elixir.bootlin.com/linux/v5.19.17/source/mm/mprotect.c#L617> for reference.
     ///
@@ -758,7 +763,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             .overlapping(range.clone())
             .any(|(_, vma)| vma.flags.contains(VmFlags::VM_RESERVED))
         {
-            return Err(VmemProtectError::NotCommitted(range));
+            return Err(VmemProtectError::InvalidRange(range));
         }
         unsafe {
             self.update_mapping_state(
@@ -773,25 +778,19 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         range: PageRange<ALIGN>,
         new_state: PageState,
     ) -> Result<(), VmemProtectError> {
-        // `MemoryRegionPermissions` is a subset of `VmFlags` and we only change the access flags
-        let flags = match new_state {
-            PageState::Reserved => VmFlags::VM_RESERVED,
-            PageState::Committed(permissions) => {
-                VmFlags::from_bits(u32::from(permissions.bits())).unwrap()
-                    & VmFlags::VM_ACCESS_FLAGS
-            }
-        };
+        let flags = VmFlags::from(new_state);
         let range = range.start..range.end;
+        if self.vmas.gaps(&range).next().is_some() {
+            // The whole range must be allocated
+            return Err(VmemProtectError::InvalidRange(range));
+        }
         let mut mappings_to_change = Vec::new();
         for (r, vma) in self.vmas.overlapping(range.clone()) {
             mappings_to_change.push((r.start, r.end, *vma));
         }
-        if mappings_to_change.is_empty() {
-            return Err(VmemProtectError::InvalidRange(range));
-        }
 
         for (start, end, vma) in mappings_to_change {
-            let old_state = vma.page_state();
+            let old_state = PageState::from(vma.flags());
             if old_state == new_state {
                 continue;
             }
@@ -827,24 +826,14 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                         .map(|pointer| {
                             assert_eq!(pointer.as_usize(), intersection.start);
                         })
-                        .map_err(|error| match error {
-                            AllocationError::OutOfMemory => PageStateUpdateError::OutOfMemory,
-                            AllocationError::Unaligned => PageStateUpdateError::Unaligned,
-                            AllocationError::BelowMinAddress
-                            | AllocationError::AboveMaxAddress
-                            | AllocationError::AddressInUse
-                            | AllocationError::AddressInUseByPlatform
-                            | AllocationError::AddressPartiallyInUse => {
-                                PageStateUpdateError::Unallocated
-                            }
-                        }),
+                        .map_err(PageStateUpdateError::from),
                     (PageState::Committed(_), PageState::Reserved) => {
                         self.platform.decommit_pages(intersection.clone())
                     }
                     (PageState::Committed(_), PageState::Committed(permissions)) => self
                         .platform
                         .update_permissions(intersection.clone(), permissions),
-                    (PageState::Reserved, PageState::Reserved) => unreachable!(),
+                    (PageState::Reserved, PageState::Reserved) => Ok(()),
                 }
             }
             .map_err(|e| {
@@ -896,7 +885,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         suggested_new_address: Option<NonZeroAddress<ALIGN>>,
         length: NonZeroPageSize<ALIGN>,
         flags: CreatePagesFlags,
-        state: PageState,
+        permissions: MemoryRegionPermissions,
     ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
         let shared = flags.contains(CreatePagesFlags::SHARED);
         let file_backed = flags.contains(CreatePagesFlags::MAP_FILE);
@@ -906,12 +895,28 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             } else {
                 VmFlags::empty()
             };
-        let vma = match state {
-            PageState::Reserved => VmArea::new_reserved(mapping_flags, file_backed),
-            PageState::Committed(permissions) => {
-                VmArea::new(VmFlags::from(permissions) | mapping_flags, file_backed)
-            }
-        };
+        let vma = VmArea::new(VmFlags::from(permissions) | mapping_flags, file_backed);
+        unsafe { self.create_mapping(suggested_new_address, length, vma, flags) }
+            .map_err(MappingError::MapError)
+    }
+
+    /// Reserve an anonymous address range without committing pages.
+    pub(super) unsafe fn create_reserved_pages(
+        &mut self,
+        suggested_new_address: Option<NonZeroAddress<ALIGN>>,
+        length: NonZeroPageSize<ALIGN>,
+        flags: CreatePagesFlags,
+    ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
+        if flags.intersects(CreatePagesFlags::SHARED | CreatePagesFlags::MAP_FILE) {
+            return Err(MappingError::InvalidFlags);
+        }
+        let mapping_flags = VmFlags::may_flags_for_mapping(false, false)
+            | if flags.contains(CreatePagesFlags::IS_STACK) {
+                VmFlags::VM_GROWSDOWN
+            } else {
+                VmFlags::empty()
+            };
+        let vma = VmArea::new(mapping_flags | VmFlags::VM_RESERVED, false);
         unsafe { self.create_mapping(suggested_new_address, length, vma, flags) }
             .map_err(MappingError::MapError)
     }
@@ -1064,8 +1069,6 @@ pub enum VmemProtectError {
     UnAligned(Range<usize>),
     #[error("the range {0:?} has no mapping memory")]
     InvalidRange(Range<usize>),
-    #[error("the range {0:?} contains reserved pages")]
-    NotCommitted(Range<usize>),
     #[error("failed to change permissions from {old:?} to {new:?}")]
     NoAccess { old: VmFlags, new: VmFlags },
     #[error("mprotect failed: {0}")]
@@ -1078,6 +1081,8 @@ pub enum VmemProtectError {
 pub enum MappingError {
     #[error("arg is not aligned")]
     UnAligned,
+    #[error("invalid page creation flags")]
+    InvalidFlags,
     #[error("not enough memory")]
     OutOfMemory,
 
