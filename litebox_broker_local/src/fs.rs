@@ -446,7 +446,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
-    use crate::test_support::broker_local;
+    use crate::test_support::test_broker_local;
 
     const ROOT: FileUser = FileUser { user: 0, group: 0 };
 
@@ -490,11 +490,7 @@ mod tests {
         memory
             .write(4 * SHARED_BUFFER_SLOT_SIZE as usize, &directory_payload)
             .unwrap();
-        let local = broker_local(
-            channel,
-            litebox_broker_protocol::ProcessId(1),
-            memory.clone(),
-        );
+        let local = test_broker_local(channel, memory.clone());
 
         assert_eq!(
             local
@@ -574,7 +570,7 @@ mod tests {
     fn file_calls_reject_oversized_transfers_before_request() {
         let channel = ScriptedChannel::new([]);
         let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
-        let local = broker_local(channel, litebox_broker_protocol::ProcessId(1), memory);
+        let local = test_broker_local(channel, memory);
         let oversized = sequence([0], MAX_FILE_TRANSFER_SIZE + 1);
 
         assert!(matches!(
@@ -600,11 +596,7 @@ mod tests {
             })),
         ]);
         let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
-        let local = broker_local(
-            channel,
-            litebox_broker_protocol::ProcessId(1),
-            memory.clone(),
-        );
+        let local = test_broker_local(channel, memory.clone());
         let data = (0..length)
             .map(|index| u8::try_from(index % 251).unwrap())
             .collect::<std::vec::Vec<_>>();

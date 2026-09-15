@@ -96,7 +96,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
-    use crate::test_support::broker_local;
+    use crate::test_support::test_broker_local;
 
     #[test]
     fn udp_operations_stage_complete_datagrams() {
@@ -115,11 +115,7 @@ mod tests {
             })),
         ]);
         let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
-        let local = broker_local(
-            channel,
-            litebox_broker_protocol::ProcessId(1),
-            memory.clone(),
-        );
+        let local = test_broker_local(channel, memory.clone());
 
         assert_eq!(local.create_udp_socket().unwrap(), handle);
         assert_eq!(
@@ -189,7 +185,7 @@ mod tests {
             )),
         ]);
         let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
-        let local = broker_local(channel, litebox_broker_protocol::ProcessId(1), memory);
+        let local = test_broker_local(channel, memory);
 
         local
             .set_tcp_option(handle, TcpOptionValue::NoDelay(true))

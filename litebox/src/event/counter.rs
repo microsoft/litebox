@@ -177,7 +177,7 @@ mod tests {
     use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
     use alloc::sync::Arc;
-    use litebox_broker_local::test_support::broker_local;
+    use litebox_broker_local::test_support::test_broker_local;
     use litebox_broker_protocol::error::ErrorCode;
     use litebox_broker_protocol::event::{CreateEventResponse, EventConsumption};
     use litebox_broker_protocol::message::{
@@ -201,7 +201,7 @@ mod tests {
         let consume_attempts = Arc::new(AtomicUsize::new(0));
         let read_ready = Arc::new(AtomicBool::new(false));
         let request_count = Arc::new(AtomicUsize::new(0));
-        let local = broker_local(
+        let local = test_broker_local(
             FakeLocalChannel {
                 next_handle: AtomicU64::new(handle.0),
                 consume_attempts: consume_attempts.clone(),
@@ -209,7 +209,6 @@ mod tests {
                 request_count,
                 fail_requests: Arc::new(AtomicBool::new(false)),
             },
-            litebox_broker_protocol::ProcessId(1),
             Arc::new(NoopSharedMemory),
         );
         let litebox = LiteBox::new_with_broker_local(platform, local);
@@ -259,7 +258,7 @@ mod tests {
         let handle = ObjectHandle(7);
         let consume_attempts = Arc::new(AtomicUsize::new(0));
         let request_count = Arc::new(AtomicUsize::new(0));
-        let local = broker_local(
+        let local = test_broker_local(
             FakeLocalChannel {
                 next_handle: AtomicU64::new(handle.0),
                 consume_attempts: Arc::clone(&consume_attempts),
@@ -267,7 +266,6 @@ mod tests {
                 request_count: Arc::clone(&request_count),
                 fail_requests: Arc::new(AtomicBool::new(false)),
             },
-            litebox_broker_protocol::ProcessId(1),
             Arc::new(NoopSharedMemory),
         );
         let litebox = Arc::new(LiteBox::new_with_broker_local(platform, local));
@@ -310,7 +308,7 @@ mod tests {
         let handle = ObjectHandle(7);
         let request_count = Arc::new(AtomicUsize::new(0));
         let fail_requests = Arc::new(AtomicBool::new(false));
-        let local = broker_local(
+        let local = test_broker_local(
             FakeLocalChannel {
                 next_handle: AtomicU64::new(handle.0),
                 consume_attempts: Arc::new(AtomicUsize::new(0)),
@@ -318,7 +316,6 @@ mod tests {
                 request_count: Arc::clone(&request_count),
                 fail_requests: Arc::clone(&fail_requests),
             },
-            litebox_broker_protocol::ProcessId(1),
             Arc::new(NoopSharedMemory),
         );
         let litebox = LiteBox::new_with_broker_local(platform, local);
@@ -346,7 +343,7 @@ mod tests {
         let platform = MockPlatform::new();
         let handle = ObjectHandle(7);
         let request_count = Arc::new(AtomicUsize::new(0));
-        let local = broker_local(
+        let local = test_broker_local(
             FakeLocalChannel {
                 next_handle: AtomicU64::new(handle.0),
                 consume_attempts: Arc::new(AtomicUsize::new(0)),
@@ -354,7 +351,6 @@ mod tests {
                 request_count: Arc::clone(&request_count),
                 fail_requests: Arc::new(AtomicBool::new(false)),
             },
-            litebox_broker_protocol::ProcessId(1),
             Arc::new(NoopSharedMemory),
         );
         let litebox = LiteBox::new_with_broker_local(platform, local);
