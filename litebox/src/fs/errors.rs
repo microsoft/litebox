@@ -1,20 +1,14 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Possible errors from [`Resolver`]
-
-#[expect(
-    unused_imports,
-    reason = "used for doc string links to work out, but not for code"
-)]
-use super::resolver::Resolver;
+//! Errors from LiteBox file operations.
 
 use thiserror::Error;
 
 // XXX(jayb): We probably need to introduce a notion of `Stale` to many/most of these errors, in
 // order to more correctly support network-attached file systems.
 
-/// Possible errors from [`Resolver::open`]
+/// Possible errors from [`crate::LiteBox::open_file`].
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum OpenError {
@@ -34,12 +28,12 @@ pub enum OpenError {
     PathError(#[from] PathError),
 }
 
-/// Possible errors from [`Resolver::close`]
+/// Possible errors from [`crate::LiteBox::close_file`].
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum CloseError {}
 
-/// Possible errors from [`Resolver::read`]
+/// Possible errors from [`crate::LiteBox::read_file`].
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum ReadError {
@@ -53,7 +47,7 @@ pub enum ReadError {
     Io,
 }
 
-/// Possible errors from [`Resolver::write`]
+/// Possible errors from [`crate::LiteBox::write_file`].
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum WriteError {
@@ -67,7 +61,7 @@ pub enum WriteError {
     Io,
 }
 
-/// Possible errors from [`Resolver::seek`]
+/// Possible errors from [`crate::LiteBox::seek_file`].
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum SeekError {
@@ -85,7 +79,7 @@ pub enum SeekError {
     Io,
 }
 
-/// Possible errors from [`Resolver::truncate`]
+/// Possible errors from [`crate::LiteBox::truncate_file`].
 #[derive(Error, Debug)]
 pub enum TruncateError {
     #[error("fd has been closed already")]
@@ -100,7 +94,7 @@ pub enum TruncateError {
     Io,
 }
 
-/// Possible errors from [`Resolver::chmod`]
+/// Possible errors from [`crate::LiteBox::chmod_file`].
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum ChmodError {
@@ -117,7 +111,7 @@ pub enum ChmodError {
     PathError(#[from] PathError),
 }
 
-/// Possible errors from [`Resolver::chown`]
+/// Possible errors from [`crate::LiteBox::chown_file`].
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum ChownError {
@@ -134,7 +128,7 @@ pub enum ChownError {
     PathError(#[from] PathError),
 }
 
-/// Possible errors from [`Resolver::unlink`]
+/// Possible errors from [`crate::LiteBox::unlink_file`].
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum UnlinkError {
@@ -150,7 +144,7 @@ pub enum UnlinkError {
     PathError(#[from] PathError),
 }
 
-/// Possible errors from [`Resolver::mkdir`]
+/// Possible errors from [`crate::LiteBox::mkdir_file`].
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum MkdirError {
@@ -166,7 +160,7 @@ pub enum MkdirError {
     PathError(#[from] PathError),
 }
 
-/// Possible errors from [`Resolver::rmdir`]
+/// Possible errors from [`crate::LiteBox::rmdir_file`].
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum RmdirError {
@@ -188,7 +182,7 @@ pub enum RmdirError {
     PathError(#[from] PathError),
 }
 
-/// Possible errors from [`Resolver::read_dir`]
+/// Possible errors from [`crate::LiteBox::read_file_directory`].
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum ReadDirError {
@@ -202,22 +196,12 @@ pub enum ReadDirError {
     Io,
 }
 
-/// Possible errors from [`Resolver::file_status`]
+/// Possible errors from [`crate::LiteBox::path_file_status`] and [`crate::LiteBox::file_status`].
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum FileStatusError {
     #[error("fd has been closed already")]
     ClosedFd,
-    #[error("I/O error")]
-    Io,
-    #[error(transparent)]
-    PathError(#[from] PathError),
-}
-
-/// Possible errors from a backend walk
-#[non_exhaustive]
-#[derive(Error, Debug)]
-pub enum WalkError {
     #[error("I/O error")]
     Io,
     #[error(transparent)]
@@ -234,7 +218,7 @@ pub enum PathError {
         #[cfg(debug_assertions)]
         dir: alloc::string::String,
         #[cfg(debug_assertions)]
-        perms: crate::fs::Mode,
+        perms: litebox_broker_protocol::fs::FileMode,
     },
     #[error("invalid characters, not permitted by underlying file system")]
     InvalidPathname,

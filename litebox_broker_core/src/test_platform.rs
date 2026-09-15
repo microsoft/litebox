@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Host synchronization for broker-core unit tests.
+//! Synchronization platform shared by broker-core unit tests.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use core::time::Duration;
@@ -9,6 +9,7 @@ use core::time::Duration;
 use litebox_platform::sync::{ImmediatelyWokenUp, RawMutex, RawMutexProvider, UnblockedOrTimedOut};
 use std::sync::{Condvar, Mutex};
 
+/// A [`RawMutex`] built on the host's condition variables.
 pub(crate) struct TestRawMutex {
     state: AtomicU32,
     waiters: Mutex<()>,
@@ -26,16 +27,9 @@ impl RawMutex for TestRawMutex {
         &self.state
     }
 
-    fn wake_many(&self, count: usize) -> usize {
+    fn wake_many(&self, _count: usize) -> usize {
         let _waiters = self.waiters.lock().unwrap();
-        if count == i32::MAX as usize {
-            self.wake.notify_all();
-        } else {
-            for _ in 0..count {
-                self.wake.notify_one();
-            }
-        }
-        // The host condition variable does not report how many waiters were woken.
+        self.wake.notify_all();
         0
     }
 
@@ -44,7 +38,10 @@ impl RawMutex for TestRawMutex {
         if self.state.load(Ordering::Acquire) != expected {
             return Err(ImmediatelyWokenUp);
         }
-        let _waiters = self.wake.wait(waiters).unwrap();
+        let _waiters = self
+            .wake
+            .wait_while(waiters, |()| self.state.load(Ordering::Acquire) == expected)
+            .unwrap();
         Ok(())
     }
 
@@ -57,7 +54,12 @@ impl RawMutex for TestRawMutex {
         if self.state.load(Ordering::Acquire) != expected {
             return Err(ImmediatelyWokenUp);
         }
-        let (_waiters, result) = self.wake.wait_timeout(waiters, timeout).unwrap();
+        let (_waiters, result) = self
+            .wake
+            .wait_timeout_while(waiters, timeout, |()| {
+                self.state.load(Ordering::Acquire) == expected
+            })
+            .unwrap();
         Ok(if result.timed_out() {
             UnblockedOrTimedOut::TimedOut
         } else {
@@ -66,6 +68,7 @@ impl RawMutex for TestRawMutex {
     }
 }
 
+/// The platform broker-core tests instantiate platform-generic types with.
 pub(crate) struct TestPlatform;
 
 impl RawMutexProvider for TestPlatform {

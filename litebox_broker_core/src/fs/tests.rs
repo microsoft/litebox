@@ -1,58 +1,69 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Engine semantics exercised without LiteBox's context or descriptor table.
+//! Filesystem semantics for the broker-core resolver and its backends.
+//!
+//! These tests drive the resolver and the backends directly. There is deliberately no broker
+//! session, transport, or guest descriptor table involved: the semantics under test are owned by
+//! broker core.
 
 use alloc::borrow::Cow;
 
-use super::UserInfo;
-use super::backend::Backend;
+use litebox_broker_protocol::stdio::StdioOutputStream;
+
+use super::backend::{DeviceIo, NoDeviceIo};
+use super::errors::{ReadError, WriteError};
 use super::in_mem::InMem;
 use super::inode_allocator::InodeAllocator;
 use super::overlay::Overlay;
-use super::resolver::Resolver;
+use super::resolver::{Resolver, ResolverEntry};
 use super::tar_ro::TarRo;
+use super::{FileType, Mode, OFlags, SeekWhence, UserInfo};
 use crate::test_platform::TestPlatform;
 
+const TEST_TAR_FILE: &[u8] = include_bytes!("./test.tar");
 const USER: UserInfo = UserInfo {
     user: 1000,
     group: 1000,
 };
+const ROOT: UserInfo = UserInfo::ROOT;
+
+struct UnservicedStdio;
+
+impl DeviceIo for UnservicedStdio {
+    fn read_stdin(&self, output: &mut [u8]) -> Result<usize, ReadError> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        Err(ReadError::Io)
+    }
+
+    fn write_stdio(&self, _stream: StdioOutputStream, input: &[u8]) -> Result<usize, WriteError> {
+        if input.is_empty() {
+            return Ok(0);
+        }
+        Err(WriteError::Io)
+    }
+
+    fn fill_random(&self, _output: &mut [u8]) -> Result<(), ReadError> {
+        Err(ReadError::Io)
+    }
+}
+
+fn in_mem_fs() -> Resolver<TestPlatform, InMem<TestPlatform>> {
+    Resolver::new(InMem::<TestPlatform>::new(InodeAllocator::standalone()))
+}
 
 fn tar_ro_fs(tar_data: Cow<'static, [u8]>) -> Resolver<TestPlatform, TarRo> {
     Resolver::new(TarRo::new(tar_data, InodeAllocator::standalone()))
 }
 
-type InMemFs = Resolver<TestPlatform, InMem<TestPlatform>>;
-
-fn in_mem_fs() -> InMemFs {
-    Resolver::new(InMem::new(InodeAllocator::standalone()))
-}
-
-/// Run `f` with the acting user set to root.
-fn with_root_privileges<Platform, B: Backend>(
-    fs: &Resolver<Platform, B>,
-    f: impl FnOnce(&Resolver<Platform, B>, UserInfo),
-) {
-    f(fs, UserInfo::ROOT);
-}
-
-/// Run `f` with the acting user set to `user`/`group`, so that tests can exercise operations
-/// whose outcome depends on the acting user.
-fn with_user<Platform, B: Backend>(
-    fs: &Resolver<Platform, B>,
-    user: u16,
-    group: u16,
-    f: impl FnOnce(&Resolver<Platform, B>, UserInfo),
-) {
-    f(fs, UserInfo { user, group });
-}
-
-type OverlayFs = Resolver<TestPlatform, Overlay<TestPlatform>>;
-
 /// An overlay of `upper` over a tar-backed lower layer.
-fn overlay_fs(upper: InMem<TestPlatform>, tar_data: Cow<'static, [u8]>) -> OverlayFs {
-    Resolver::new(Overlay::new(
+fn overlay_fs(
+    upper: InMem<TestPlatform>,
+    tar_data: Cow<'static, [u8]>,
+) -> Resolver<TestPlatform, Overlay<TestPlatform>> {
+    Resolver::new(Overlay::<TestPlatform>::new(
         upper,
         TarRo::new(tar_data, InodeAllocator::standalone()),
         InodeAllocator::standalone(),
@@ -60,75 +71,85 @@ fn overlay_fs(upper: InMem<TestPlatform>, tar_data: Cow<'static, [u8]>) -> Overl
 }
 
 mod in_mem {
-    use super::USER;
-    use crate::fs::backend::NoDeviceIo;
-    use crate::fs::{Mode, OFlags};
+    use super::{
+        FileType, InMem, Mode, NoDeviceIo, OFlags, ROOT, Resolver, ResolverEntry, SeekWhence,
+        TestPlatform, USER, UserInfo, in_mem_fs,
+    };
+    use crate::fs::errors::{
+        ChownError, MkdirError, OpenError, PathError, ReadDirError, ReadError, RmdirError,
+        UnlinkError,
+    };
     use alloc::vec;
     use alloc::vec::Vec;
-    extern crate std;
 
-    use super::{with_root_privileges, with_user};
+    type InMemFs = Resolver<TestPlatform, InMem<TestPlatform>>;
+    type InMemEntry = ResolverEntry<InMem<TestPlatform>>;
+
+    /// Create `/tmp` as root, so that the unprivileged user can create entries in it.
+    fn world_writable_tmp(fs: &InMemFs) {
+        fs.mkdir(ROOT, "/tmp", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+            .expect("Failed to create /tmp");
+    }
+
+    /// Make the root directory world-writable, so tests can create entries directly in it.
+    fn world_writable_root(fs: &InMemFs) {
+        fs.chmod(ROOT, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+            .expect("Failed to chmod /");
+    }
 
     #[test]
     fn root_file_creation_and_deletion() {
-        with_root_privileges(&super::in_mem_fs(), |fs, user| {
-            // Test file creation
-            let path = "/testfile";
-            let fd = fs
-                .open(user, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
-                .expect("Failed to create file");
+        let fs = in_mem_fs();
 
-            drop(fd);
+        // Test file creation
+        let path = "/testfile";
+        let fd = fs
+            .open(ROOT, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .expect("Failed to create file");
+        drop(fd);
 
-            // Test file deletion
-            fs.unlink(user, path).expect("Failed to unlink file");
-            assert!(
-                fs.open(user, path, OFlags::RDONLY, Mode::RWXU).is_err(),
-                "File should not exist"
-            );
-        });
+        // Test file deletion
+        fs.unlink(ROOT, path).expect("Failed to unlink file");
+        assert!(
+            fs.open(ROOT, path, OFlags::RDONLY, Mode::RWXU).is_err(),
+            "File should not exist"
+        );
     }
 
     #[test]
     fn root_file_read_write() {
-        with_root_privileges(&super::in_mem_fs(), |fs, user| {
-            // Create and write to a file
-            let path = "/testfile";
-            let mut fd = fs
-                .open(user, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
-                .expect("Failed to create file");
-            let data = b"Hello, world!";
-            fs.write(&NoDeviceIo, &mut fd, data, None)
-                .expect("Failed to write to file");
-            drop(fd);
+        let fs = in_mem_fs();
 
-            // Read from the file
-            let mut fd = fs
-                .open(user, path, OFlags::RDONLY, Mode::RWXU)
-                .expect("Failed to open file");
-            let mut buffer = vec![0; data.len()];
-            let bytes_read = fs
-                .read(&NoDeviceIo, &mut fd, &mut buffer, None)
-                .expect("Failed to read from file");
-            assert_eq!(bytes_read, data.len());
-            assert_eq!(&buffer, data);
-            drop(fd);
-        });
+        // Create and write to a file
+        let path = "/testfile";
+        let mut fd = fs
+            .open(ROOT, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .expect("Failed to create file");
+        let data = b"Hello, world!";
+        fs.write(&NoDeviceIo, &mut fd, data, None)
+            .expect("Failed to write to file");
+        drop(fd);
+
+        // Read from the file
+        let mut fd = fs
+            .open(ROOT, path, OFlags::RDONLY, Mode::RWXU)
+            .expect("Failed to open file");
+        let mut buffer = vec![0; data.len()];
+        let bytes_read = fs
+            .read(&NoDeviceIo, &mut fd, &mut buffer, None)
+            .expect("Failed to read from file");
+        assert_eq!(bytes_read, data.len());
+        assert_eq!(&buffer, data);
     }
 
     #[test]
     fn write_only_open_does_not_require_read_permission() {
-        let user = USER;
-
-        let fs = super::in_mem_fs();
-        with_root_privileges(&fs, |fs, user| {
-            fs.mkdir(user, "/tmp", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                .expect("Failed to create /tmp");
-        });
+        let fs = in_mem_fs();
+        world_writable_tmp(&fs);
 
         let path = "/tmp/write_only";
         let mut fd = fs
-            .open(user, path, OFlags::CREAT | OFlags::WRONLY, Mode::WUSR)
+            .open(USER, path, OFlags::CREAT | OFlags::WRONLY, Mode::WUSR)
             .expect("Failed to create write-only file");
         fs.write(&NoDeviceIo, &mut fd, b"x", None)
             .expect("Failed to write file");
@@ -136,101 +157,83 @@ mod in_mem {
         let mut buffer = [0];
         assert!(matches!(
             fs.read(&NoDeviceIo, &mut fd, &mut buffer, None),
-            Err(crate::fs::errors::ReadError::NotForReading)
+            Err(ReadError::NotForReading)
         ));
         drop(fd);
 
         assert!(matches!(
-            fs.open(user, path, OFlags::RDONLY, Mode::empty()),
-            Err(crate::fs::errors::OpenError::AccessNotAllowed)
+            fs.open(USER, path, OFlags::RDONLY, Mode::empty()),
+            Err(OpenError::AccessNotAllowed)
         ));
     }
 
     #[test]
     fn newly_created_file_does_not_require_its_own_permissions() {
-        let user = USER;
-
-        let fs = super::in_mem_fs();
-        with_root_privileges(&fs, |fs, user| {
-            fs.mkdir(user, "/tmp", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                .expect("Failed to create /tmp");
-        });
+        let fs = in_mem_fs();
+        world_writable_tmp(&fs);
 
         let path = "/tmp/zero_mode";
         let mut fd = fs
-            .open(user, path, OFlags::CREAT | OFlags::WRONLY, Mode::empty())
+            .open(USER, path, OFlags::CREAT | OFlags::WRONLY, Mode::empty())
             .expect("Failed to create zero-mode file");
         fs.write(&NoDeviceIo, &mut fd, b"x", None)
             .expect("Failed to write file");
         drop(fd);
 
-        let status = fs.file_status(user, path).expect("Failed to stat file");
+        let status = fs.file_status(USER, path).expect("Failed to stat file");
         assert_eq!(status.mode, Mode::empty());
         assert!(matches!(
-            fs.open(user, path, OFlags::WRONLY, Mode::empty()),
-            Err(crate::fs::errors::OpenError::AccessNotAllowed)
+            fs.open(USER, path, OFlags::WRONLY, Mode::empty()),
+            Err(OpenError::AccessNotAllowed)
         ));
     }
 
     #[test]
     fn root_directory_creation_and_removal() {
-        with_root_privileges(&super::in_mem_fs(), |fs, user| {
-            // Test directory creation
-            let path = "/testdir";
-            fs.mkdir(user, path, Mode::RWXU)
-                .expect("Failed to create directory");
+        let fs = in_mem_fs();
 
-            // Test directory removal
-            fs.rmdir(user, path).expect("Failed to remove directory");
-            assert!(
-                fs.open(user, path, OFlags::RDONLY, Mode::RWXU).is_err(),
-                "Directory should not exist"
-            );
-        });
+        // Test directory creation
+        let path = "/testdir";
+        fs.mkdir(ROOT, path, Mode::RWXU)
+            .expect("Failed to create directory");
+
+        // Test directory removal
+        fs.rmdir(ROOT, path).expect("Failed to remove directory");
+        assert!(
+            fs.open(ROOT, path, OFlags::RDONLY, Mode::RWXU).is_err(),
+            "Directory should not exist"
+        );
     }
 
     #[test]
     fn file_creation_and_deletion() {
-        let user = USER;
-
-        let fs = super::in_mem_fs();
-        with_root_privileges(&fs, |fs, user| {
-            // Make `/tmp` and set up with reasonable privs so normal users can do things in there.
-            fs.mkdir(user, "/tmp", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                .expect("Failed to create /tmp");
-        });
+        let fs = in_mem_fs();
+        world_writable_tmp(&fs);
 
         // Test file creation
         let path = "/tmp/testfile";
         let fd = fs
-            .open(user, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .open(USER, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to create file");
-
         drop(fd);
 
         // Test file deletion
-        fs.unlink(user, path).expect("Failed to unlink file");
+        fs.unlink(USER, path).expect("Failed to unlink file");
         assert!(
-            fs.open(user, path, OFlags::RDONLY, Mode::RWXU).is_err(),
+            fs.open(USER, path, OFlags::RDONLY, Mode::RWXU).is_err(),
             "File should not exist"
         );
     }
 
     #[test]
     fn file_read_write() {
-        let user = USER;
-
-        let fs = super::in_mem_fs();
-        with_root_privileges(&fs, |fs, user| {
-            // Make `/tmp` and set up with reasonable privs so normal users can do things in there.
-            fs.mkdir(user, "/tmp", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                .expect("Failed to create /tmp");
-        });
+        let fs = in_mem_fs();
+        world_writable_tmp(&fs);
 
         // Create and write to a file
         let path = "/tmp/testfile";
         let mut fd = fs
-            .open(user, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .open(USER, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to create file");
         let data = b"Hello, world!";
         fs.write(&NoDeviceIo, &mut fd, data, None)
@@ -241,7 +244,7 @@ mod in_mem {
 
         // Read from the file
         let mut fd = fs
-            .open(user, path, OFlags::RDONLY, Mode::RWXU)
+            .open(USER, path, OFlags::RDONLY, Mode::RWXU)
             .expect("Failed to open file");
         let mut buffer = vec![0; data.len()];
         let bytes_read = fs
@@ -253,268 +256,242 @@ mod in_mem {
         assert_eq!(bytes_read, data.len());
         assert_eq!(bytes_read2, data.len() - 2);
         assert_eq!(&buffer, data);
-        drop(fd);
     }
 
     #[test]
     fn directory_creation_and_removal() {
-        let user = USER;
-
-        let fs = super::in_mem_fs();
-        with_root_privileges(&fs, |fs, user| {
-            // Make `/tmp` and set up with reasonable privs so normal users can do things in there.
-            fs.mkdir(user, "/tmp", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                .expect("Failed to create /tmp");
-        });
+        let fs = in_mem_fs();
+        world_writable_tmp(&fs);
 
         // Test directory creation
         let path = "/tmp/testdir";
-        fs.mkdir(user, path, Mode::RWXU)
+        fs.mkdir(USER, path, Mode::RWXU)
             .expect("Failed to create directory");
 
         // Test directory removal
-        fs.rmdir(user, path).expect("Failed to remove directory");
+        fs.rmdir(USER, path).expect("Failed to remove directory");
         assert!(
-            fs.open(user, path, OFlags::RDONLY, Mode::RWXU).is_err(),
+            fs.open(USER, path, OFlags::RDONLY, Mode::RWXU).is_err(),
             "Directory should not exist"
         );
     }
 
     #[test]
     fn read_dir_empty() {
-        with_root_privileges(&super::in_mem_fs(), |fs, user| {
-            let fd = fs
-                .open(user, "/", OFlags::RDONLY, Mode::empty())
-                .expect("Failed to open root directory");
-            let entries = fs
-                .read_dir(&fd)
-                .expect("Failed to read directory")
-                .iter()
-                .map(|e| e.name.clone())
-                .collect::<Vec<_>>();
-            assert_eq!(
-                entries,
-                vec![".", ".."],
-                "Root directory should contain . and .."
-            );
-            drop(fd);
-        });
+        let fs = in_mem_fs();
+
+        let fd = fs
+            .open(ROOT, "/", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open root directory");
+        let entries = fs
+            .read_dir(&fd)
+            .expect("Failed to read directory")
+            .iter()
+            .map(|e| e.name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries,
+            vec![".", ".."],
+            "Root directory should contain . and .."
+        );
     }
 
     #[test]
     fn read_dir_with_files_and_dirs() {
-        with_root_privileges(&super::in_mem_fs(), |fs, user| {
-            // Create a directory structure
-            fs.mkdir(user, "/testdir", Mode::RWXU)
-                .expect("Failed to create directory");
-            let fd1 = fs
-                .open(
-                    user,
-                    "/testfile1",
-                    OFlags::CREAT | OFlags::WRONLY,
-                    Mode::RWXU,
-                )
-                .expect("Failed to create file1");
-            drop(fd1);
-            let fd2 = fs
-                .open(
-                    user,
-                    "/testfile2",
-                    OFlags::CREAT | OFlags::WRONLY,
-                    Mode::RWXU,
-                )
-                .expect("Failed to create file2");
-            drop(fd2);
+        let fs = in_mem_fs();
 
-            // Read root directory
-            let fd = fs
-                .open(user, "/", OFlags::RDONLY, Mode::empty())
-                .expect("Failed to open root directory");
-            let entries = fs.read_dir(&fd).expect("Failed to read directory");
-            drop(fd);
+        // Create a directory structure
+        fs.mkdir(ROOT, "/testdir", Mode::RWXU)
+            .expect("Failed to create directory");
+        let fd1 = fs
+            .open(
+                ROOT,
+                "/testfile1",
+                OFlags::CREAT | OFlags::WRONLY,
+                Mode::RWXU,
+            )
+            .expect("Failed to create file1");
+        drop(fd1);
+        let fd2 = fs
+            .open(
+                ROOT,
+                "/testfile2",
+                OFlags::CREAT | OFlags::WRONLY,
+                Mode::RWXU,
+            )
+            .expect("Failed to create file2");
+        drop(fd2);
 
-            // Should have 5 entries: ., .., testdir, testfile1, testfile2
-            assert_eq!(entries.len(), 5);
+        // Read root directory
+        let fd = fs
+            .open(ROOT, "/", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open root directory");
+        let entries = fs.read_dir(&fd).expect("Failed to read directory");
+        drop(fd);
 
-            let mut names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
-            names.sort_unstable();
-            assert_eq!(names, vec![".", "..", "testdir", "testfile1", "testfile2"]);
+        // Should have 5 entries: ., .., testdir, testfile1, testfile2
+        assert_eq!(entries.len(), 5);
 
-            // Check file types
-            for entry in &entries {
-                match entry.name.as_str() {
-                    "testdir" | "." | ".." => {
-                        assert_eq!(entry.file_type, crate::fs::FileType::Directory);
-                    }
-                    "testfile1" | "testfile2" => {
-                        assert_eq!(entry.file_type, crate::fs::FileType::RegularFile);
-                    }
-                    _ => panic!("Unexpected entry: {}", entry.name),
+        let mut names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec![".", "..", "testdir", "testfile1", "testfile2"]);
+
+        // Check file types
+        for entry in &entries {
+            match entry.name.as_str() {
+                "testdir" | "." | ".." => {
+                    assert_eq!(entry.file_type, FileType::Directory);
                 }
-                if entry.name != "." && entry.name != ".." {
-                    assert!(entry.ino_info.is_some(), "Inode info should be present");
-                } else {
-                    // TODO(jayb): Re-enable this assertion once the resolver fills in
-                    // inode information for the synthesized `.` and `..` entries.
+                "testfile1" | "testfile2" => {
+                    assert_eq!(entry.file_type, FileType::RegularFile);
                 }
+                _ => panic!("Unexpected entry: {}", entry.name),
             }
+            if entry.name != "." && entry.name != ".." {
+                assert!(entry.ino_info.is_some(), "Inode info should be present");
+            } else {
+                // TODO(jayb): Re-enable this assertion once the resolver fills in
+                // inode information for the synthesized `.` and `..` entries.
+            }
+        }
 
-            // Read the subdirectory (should be empty)
-            let fd = fs
-                .open(user, "/testdir", OFlags::RDONLY, Mode::empty())
-                .expect("Failed to open subdirectory");
-            let entries = fs
-                .read_dir(&fd)
-                .expect("Failed to read subdirectory")
-                .iter()
-                .map(|e| e.name.clone())
-                .collect::<Vec<_>>();
-            assert!(entries.len() == 2, "Subdirectory should contain . and ..");
-            drop(fd);
-        });
+        // Read the subdirectory (should be empty)
+        let fd = fs
+            .open(ROOT, "/testdir", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open subdirectory");
+        let entries = fs
+            .read_dir(&fd)
+            .expect("Failed to read subdirectory")
+            .iter()
+            .map(|e| e.name.clone())
+            .collect::<Vec<_>>();
+        assert!(entries.len() == 2, "Subdirectory should contain . and ..");
     }
 
     #[test]
     fn read_dir_file_not_directory() {
-        with_root_privileges(&super::in_mem_fs(), |fs, user| {
-            // Create a file
-            let fd = fs
-                .open(
-                    user,
-                    "/testfile",
-                    OFlags::CREAT | OFlags::WRONLY,
-                    Mode::RWXU,
-                )
-                .expect("Failed to create file");
-            drop(fd);
+        let fs = in_mem_fs();
 
-            // Try to read_dir on the file (should fail)
-            let fd = fs
-                .open(user, "/testfile", OFlags::RDONLY, Mode::empty())
-                .expect("Failed to open file");
-            let result = fs.read_dir(&fd);
-            drop(fd);
+        // Create a file
+        let fd = fs
+            .open(
+                ROOT,
+                "/testfile",
+                OFlags::CREAT | OFlags::WRONLY,
+                Mode::RWXU,
+            )
+            .expect("Failed to create file");
+        drop(fd);
 
-            assert!(matches!(
-                result,
-                Err(crate::fs::errors::ReadDirError::NotADirectory)
-            ));
-        });
+        // Try to read_dir on the file (should fail)
+        let fd = fs
+            .open(ROOT, "/testfile", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open file");
+        assert!(matches!(fs.read_dir(&fd), Err(ReadDirError::NotADirectory)));
     }
 
     #[test]
     fn parent_dir_write_permissions_are_enforced() {
-        let fs = super::in_mem_fs();
+        let fs = in_mem_fs();
 
-        with_root_privileges(&fs, |fs, user| {
-            // A root-owned 0755 directory, holding a file and a directory to try to remove.
-            fs.mkdir(
-                user,
-                "/rootdir",
-                Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
+        // A root-owned 0755 directory, holding a file and a directory to try to remove.
+        fs.mkdir(
+            ROOT,
+            "/rootdir",
+            Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
+        )
+        .expect("Failed to create directory");
+        let fd = fs
+            .open(
+                ROOT,
+                "/rootdir/file",
+                OFlags::CREAT | OFlags::WRONLY,
+                Mode::RWXU,
             )
+            .expect("Failed to create file");
+        drop(fd);
+        fs.mkdir(ROOT, "/rootdir/sub", Mode::RWXU)
+            .expect("Failed to create subdirectory");
+
+        // A world-writable directory, for the positive case.
+        fs.mkdir(ROOT, "/opendir", Mode::RWXU | Mode::RWXG | Mode::RWXO)
             .expect("Failed to create directory");
-            let fd = fs
-                .open(
-                    user,
-                    "/rootdir/file",
-                    OFlags::CREAT | OFlags::WRONLY,
-                    Mode::RWXU,
-                )
-                .expect("Failed to create file");
-            drop(fd);
-            fs.mkdir(user, "/rootdir/sub", Mode::RWXU)
-                .expect("Failed to create subdirectory");
 
-            // A world-writable directory, for the positive case.
-            fs.mkdir(user, "/opendir", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                .expect("Failed to create directory");
-        });
+        assert!(matches!(
+            fs.open(
+                USER,
+                "/rootdir/new",
+                OFlags::CREAT | OFlags::WRONLY,
+                Mode::RWXU
+            ),
+            Err(OpenError::NoWritePerms)
+        ));
+        assert!(matches!(
+            fs.mkdir(USER, "/rootdir/newdir", Mode::RWXU),
+            Err(MkdirError::NoWritePerms)
+        ));
+        assert!(matches!(
+            fs.unlink(USER, "/rootdir/file"),
+            Err(UnlinkError::NoWritePerms)
+        ));
+        assert!(matches!(
+            fs.rmdir(USER, "/rootdir/sub"),
+            Err(RmdirError::NoWritePerms)
+        ));
 
-        with_user(&fs, 1000, 1000, |fs, user| {
-            assert!(matches!(
-                fs.open(
-                    user,
-                    "/rootdir/new",
-                    OFlags::CREAT | OFlags::WRONLY,
-                    Mode::RWXU
-                ),
-                Err(crate::fs::errors::OpenError::NoWritePerms)
-            ));
-            assert!(matches!(
-                fs.mkdir(user, "/rootdir/newdir", Mode::RWXU),
-                Err(crate::fs::errors::MkdirError::NoWritePerms)
-            ));
-            assert!(matches!(
-                fs.unlink(user, "/rootdir/file"),
-                Err(crate::fs::errors::UnlinkError::NoWritePerms)
-            ));
-            assert!(matches!(
-                fs.rmdir(user, "/rootdir/sub"),
-                Err(crate::fs::errors::RmdirError::NoWritePerms)
-            ));
-
-            // The same operations succeed in a directory the user may write.
-            let fd = fs
-                .open(
-                    user,
-                    "/opendir/new",
-                    OFlags::CREAT | OFlags::WRONLY,
-                    Mode::RWXU,
-                )
-                .expect("Failed to create file");
-            drop(fd);
-            fs.mkdir(user, "/opendir/newdir", Mode::RWXU)
-                .expect("Failed to create directory");
-            fs.unlink(user, "/opendir/new")
-                .expect("Failed to unlink file");
-            fs.rmdir(user, "/opendir/newdir")
-                .expect("Failed to remove directory");
-        });
+        // The same operations succeed in a directory the user may write.
+        let fd = fs
+            .open(
+                USER,
+                "/opendir/new",
+                OFlags::CREAT | OFlags::WRONLY,
+                Mode::RWXU,
+            )
+            .expect("Failed to create file");
+        drop(fd);
+        fs.mkdir(USER, "/opendir/newdir", Mode::RWXU)
+            .expect("Failed to create directory");
+        fs.unlink(USER, "/opendir/new")
+            .expect("Failed to unlink file");
+        fs.rmdir(USER, "/opendir/newdir")
+            .expect("Failed to remove directory");
     }
 
     #[test]
     fn chown_test() {
-        let user = USER;
-
-        let fs = super::in_mem_fs();
+        let fs = in_mem_fs();
 
         // Create a test file as root
-        with_root_privileges(&fs, |fs, user| {
-            let path = "/testfile";
-            let fd = fs
-                .open(user, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
-                .expect("Failed to create file");
-            drop(fd);
-
-            // First chown to 1000:1000 as root (should succeed)
-            fs.chown(user, path, Some(1000), Some(1000))
-                .expect("Failed to chown as root");
-        });
-
-        // Switch to user 1000 and test that owner can chown (should succeed)
         let path = "/testfile";
-        with_user(&fs, 1000, 1000, |fs, user| {
-            fs.chown(user, path, Some(123), Some(456))
-                .expect("Failed to chown as owner");
-        });
+        let fd = fs
+            .open(ROOT, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .expect("Failed to create file");
+        drop(fd);
 
-        // Switch to a different user and test that non-owner cannot chown (should fail)
-        with_user(&fs, 500, 500, |fs, user| {
-            match fs.chown(user, path, Some(789), Some(101)) {
-                Err(crate::fs::errors::ChownError::NotTheOwner) => {
-                    // Expected behavior
-                }
-                Ok(()) => panic!("Non-owner should not be able to chown"),
-                Err(e) => panic!("Unexpected error: {e:?}"),
+        // First chown to 1000:1000 as root (should succeed)
+        fs.chown(ROOT, path, Some(1000), Some(1000))
+            .expect("Failed to chown as root");
+
+        // The owner may chown (should succeed)
+        fs.chown(USER, path, Some(123), Some(456))
+            .expect("Failed to chown as owner");
+
+        // A different user may not chown (should fail)
+        let other = UserInfo {
+            user: 500,
+            group: 500,
+        };
+        match fs.chown(other, path, Some(789), Some(101)) {
+            Err(ChownError::NotTheOwner) => {
+                // Expected behavior
             }
-        });
+            Ok(()) => panic!("Non-owner should not be able to chown"),
+            Err(e) => panic!("Unexpected error: {e:?}"),
+        }
 
         // Test chown on non-existent file (should fail)
-        match fs.chown(user, "/nonexistent", Some(123), Some(456)) {
-            Err(crate::fs::errors::ChownError::PathError(
-                crate::fs::errors::PathError::NoSuchFileOrDirectory,
-            )) => {
+        match fs.chown(USER, "/nonexistent", Some(123), Some(456)) {
+            Err(ChownError::PathError(PathError::NoSuchFileOrDirectory)) => {
                 // Expected behavior
             }
             Ok(()) => panic!("Should not be able to chown non-existent file"),
@@ -522,35 +499,26 @@ mod in_mem {
         }
 
         // Test partial chown (change only user, leave group unchanged)
-        with_root_privileges(&fs, |fs, user| {
-            fs.chown(user, path, Some(999), None)
-                .expect("Failed to chown user only");
-        });
+        fs.chown(ROOT, path, Some(999), None)
+            .expect("Failed to chown user only");
 
         // Test partial chown (change only group, leave user unchanged)
-        with_root_privileges(&fs, |fs, user| {
-            fs.chown(user, path, None, Some(888))
-                .expect("Failed to chown group only");
-        });
+        fs.chown(ROOT, path, None, Some(888))
+            .expect("Failed to chown group only");
     }
 
     #[test]
     fn o_directory_flag_tests() {
-        let user = USER;
+        let fs = in_mem_fs();
+        world_writable_root(&fs);
 
-        let fs = super::in_mem_fs();
-
-        with_root_privileges(&fs, |fs, user| {
-            fs.chmod(user, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                .expect("Failed to chmod /");
-        });
         // Create test directory and file
-        fs.mkdir(user, "/testdir", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+        fs.mkdir(USER, "/testdir", Mode::RWXU | Mode::RWXG | Mode::RWXO)
             .expect("Failed to create directory");
 
         let fd = fs
             .open(
-                user,
+                USER,
                 "/testfile",
                 OFlags::CREAT | OFlags::WRONLY,
                 Mode::RWXU,
@@ -561,7 +529,7 @@ mod in_mem {
         // Test O_DIRECTORY on a directory (should succeed)
         let fd = fs
             .open(
-                user,
+                USER,
                 "/testdir",
                 OFlags::RDONLY | OFlags::DIRECTORY,
                 Mode::empty(),
@@ -572,34 +540,30 @@ mod in_mem {
         // Test O_DIRECTORY on a regular file (should fail)
         assert!(matches!(
             fs.open(
-                user,
+                USER,
                 "/testfile",
                 OFlags::RDONLY | OFlags::DIRECTORY,
                 Mode::empty()
             ),
-            Err(crate::fs::errors::OpenError::PathError(
-                crate::fs::errors::PathError::ComponentNotADirectory
-            ))
+            Err(OpenError::PathError(PathError::ComponentNotADirectory))
         ));
 
         // Test O_DIRECTORY on non-existent path (should fail)
         assert!(matches!(
             fs.open(
-                user,
+                USER,
                 "/nonexistent",
                 OFlags::RDONLY | OFlags::DIRECTORY,
                 Mode::empty()
             ),
-            Err(crate::fs::errors::OpenError::PathError(
-                crate::fs::errors::PathError::NoSuchFileOrDirectory
-            ))
+            Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
         ));
 
         // Test O_DIRECTORY with O_CREAT on non-existent path
         // According to the implementation, O_DIRECTORY should be ignored when O_CREAT is specified
         let fd = fs
             .open(
-                user,
+                USER,
                 "/newfile",
                 OFlags::CREAT | OFlags::WRONLY | OFlags::DIRECTORY,
                 Mode::RWXU,
@@ -609,9 +573,9 @@ mod in_mem {
 
         // Verify it created a regular file, not a directory
         let stat = fs
-            .file_status(user, "/newfile")
+            .file_status(USER, "/newfile")
             .expect("Failed to get file status");
-        assert_eq!(stat.file_type, crate::fs::FileType::RegularFile);
+        assert_eq!(stat.file_type, FileType::RegularFile);
 
         // TODO(jayb): Restore coverage of `O_RDWR | O_DIRECTORY` once `OpenError` can report
         // `EISDIR`; see the matching TODO in `InMem::owned_dir_at`. The legacy in-memory file
@@ -620,19 +584,13 @@ mod in_mem {
 
     #[test]
     fn o_excl_flag_tests() {
-        let user = USER;
-
-        let fs = super::in_mem_fs();
-
-        with_root_privileges(&fs, |fs, user| {
-            fs.chmod(user, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                .expect("Failed to chmod /");
-        });
+        let fs = in_mem_fs();
+        world_writable_root(&fs);
 
         // Test O_CREAT | O_EXCL on non-existent file (should succeed)
         let mut fd = fs
             .open(
-                user,
+                USER,
                 "/newfile",
                 OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
                 Mode::RWXU,
@@ -647,18 +605,18 @@ mod in_mem {
         // Test O_CREAT | O_EXCL on existing file (should fail)
         assert!(matches!(
             fs.open(
-                user,
+                USER,
                 "/newfile",
                 OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
                 Mode::RWXU,
             ),
-            Err(crate::fs::errors::OpenError::AlreadyExists)
+            Err(OpenError::AlreadyExists)
         ));
 
         // Test O_EXCL without O_CREAT (should be ignored and succeed)
         let mut fd = fs
             .open(
-                user,
+                USER,
                 "/newfile",
                 OFlags::EXCL | OFlags::RDONLY,
                 Mode::empty(),
@@ -675,39 +633,33 @@ mod in_mem {
 
         // Test O_CREAT without O_EXCL on existing file (should succeed)
         let fd = fs
-            .open(user, "/newfile", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .open(USER, "/newfile", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to open existing file with O_CREAT (without O_EXCL)");
         drop(fd);
 
         // Test O_CREAT | O_EXCL on directory (should fail)
-        fs.mkdir(user, "/testdir", Mode::RWXU)
+        fs.mkdir(USER, "/testdir", Mode::RWXU)
             .expect("Failed to create directory");
         assert!(matches!(
             fs.open(
-                user,
+                USER,
                 "/testdir",
                 OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
                 Mode::RWXU,
             ),
-            Err(crate::fs::errors::OpenError::AlreadyExists)
+            Err(OpenError::AlreadyExists)
         ));
     }
 
     #[test]
     fn open_with_trunc() {
-        let user = USER;
-
-        let fs = super::in_mem_fs();
-
-        with_root_privileges(&fs, |fs, user| {
-            fs.chmod(user, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                .expect("Failed to chmod /");
-        });
+        let fs = in_mem_fs();
+        world_writable_root(&fs);
 
         // Create a file and write some initial content
         let path = "/testfile";
         let mut fd = fs
-            .open(user, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .open(USER, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to create file");
         let initial_data = b"Hello, world! This is initial content.";
         fs.write(&NoDeviceIo, &mut fd, initial_data, None)
@@ -716,7 +668,7 @@ mod in_mem {
 
         // Verify initial content was written
         let mut fd = fs
-            .open(user, path, OFlags::RDONLY, Mode::empty())
+            .open(USER, path, OFlags::RDONLY, Mode::empty())
             .expect("Failed to open file for reading");
         let mut buffer = vec![0; initial_data.len()];
         let bytes_read = fs
@@ -728,7 +680,7 @@ mod in_mem {
 
         // Test O_TRUNC with O_WRONLY - should truncate file
         let mut fd = fs
-            .open(user, path, OFlags::WRONLY | OFlags::TRUNC, Mode::empty())
+            .open(USER, path, OFlags::WRONLY | OFlags::TRUNC, Mode::empty())
             .expect("Failed to open file with O_TRUNC | O_WRONLY");
 
         // Write new content to the truncated file
@@ -739,7 +691,7 @@ mod in_mem {
 
         // Verify the file was truncated and contains only new content
         let mut fd = fs
-            .open(user, path, OFlags::RDONLY, Mode::empty())
+            .open(USER, path, OFlags::RDONLY, Mode::empty())
             .expect("Failed to open file for verification");
         let mut buffer = vec![0; initial_data.len()];
         let bytes_read = fs
@@ -750,15 +702,15 @@ mod in_mem {
         drop(fd);
 
         // Test O_TRUNC with O_RDWR - should also truncate
-        fs.write(
-            &NoDeviceIo,
-            &mut fs.open(user, path, OFlags::WRONLY, Mode::empty()).unwrap(),
-            b"More content to truncate",
-            None,
-        )
-        .unwrap();
         let mut fd = fs
-            .open(user, path, OFlags::RDWR | OFlags::TRUNC, Mode::empty())
+            .open(USER, path, OFlags::WRONLY, Mode::empty())
+            .expect("Failed to open file for writing");
+        fs.write(&NoDeviceIo, &mut fd, b"More content to truncate", None)
+            .expect("Failed to write more content");
+        drop(fd);
+
+        let mut fd = fs
+            .open(USER, path, OFlags::RDWR | OFlags::TRUNC, Mode::empty())
             .expect("Failed to open file with O_TRUNC | O_RDWR");
 
         // File should be empty after truncation
@@ -773,32 +725,24 @@ mod in_mem {
         fs.write(&NoDeviceIo, &mut fd, test_data, None)
             .expect("Failed to write after RDWR truncation");
 
-        fs.seek(&mut fd, 0, crate::fs::SeekWhence::RelativeToBeginning)
+        fs.seek(&mut fd, 0, SeekWhence::RelativeToBeginning)
             .expect("Failed to seek to beginning");
         let bytes_read = fs
             .read(&NoDeviceIo, &mut fd, &mut buffer, None)
             .expect("Failed to read after write");
         assert_eq!(bytes_read, test_data.len());
         assert_eq!(&buffer[..bytes_read], test_data);
-        drop(fd);
     }
 
     #[test]
     fn write_position_after_seek() {
-        use crate::fs::SeekWhence;
-
-        let user = USER;
-
-        let fs = super::in_mem_fs();
-        with_root_privileges(&fs, |fs, user| {
-            // Allow regular user to create in root for this focused test
-            fs.chmod(user, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                .expect("chmod / failed");
-        });
+        let fs = in_mem_fs();
+        // Allow regular user to create in root for this focused test
+        world_writable_root(&fs);
 
         let mut fd = fs
             .open(
-                user,
+                USER,
                 "/posfile",
                 OFlags::CREAT | OFlags::RDWR,
                 Mode::RWXU | Mode::RWXG | Mode::RWXO,
@@ -817,7 +761,7 @@ mod in_mem {
         fs.write(&NoDeviceIo, &mut fd, b"X", None)
             .expect("overwrite failed");
 
-        // The file offset should now be at 2.
+        // The file offset should now be at 1.
         assert_eq!(
             fs.seek(&mut fd, 0, SeekWhence::RelativeToCurrentOffset)
                 .expect("seek failed"),
@@ -845,78 +789,63 @@ mod in_mem {
             .expect("read 2 failed");
         assert_eq!(n2, 8);
         assert_eq!(&buf2[..n2], b"Xbcdef12");
+    }
 
-        drop(fd);
+    /// Create `path` holding `data`, as the unprivileged user.
+    fn create_with_content(fs: &InMemFs, path: &str, data: &[u8]) {
+        let mut fd = fs
+            .open(USER, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .expect("Failed to create file");
+        fs.write(&NoDeviceIo, &mut fd, data, None)
+            .expect("Failed to write initial content");
+    }
+
+    /// Read the whole of `fd` from its current position.
+    fn read_all(fs: &InMemFs, fd: &mut InMemEntry) -> Vec<u8> {
+        let mut buffer = vec![0; 64];
+        let bytes_read = fs
+            .read(&NoDeviceIo, fd, &mut buffer, None)
+            .expect("Failed to read from file");
+        buffer.truncate(bytes_read);
+        buffer
     }
 
     #[test]
     fn o_append_flag_basic() {
-        let user = USER;
-
-        let fs = super::in_mem_fs();
-
-        with_root_privileges(&fs, |fs, user| {
-            fs.chmod(user, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                .expect("Failed to chmod /");
-        });
+        let fs = in_mem_fs();
+        world_writable_root(&fs);
 
         // Create a file and write some initial content
         let path = "/testfile";
-        let mut fd = fs
-            .open(user, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
-            .expect("Failed to create file");
-        let initial_data = b"Hello";
-        fs.write(&NoDeviceIo, &mut fd, initial_data, None)
-            .expect("Failed to write initial content");
-        drop(fd);
+        create_with_content(&fs, path, b"Hello");
 
         // Re-open with O_APPEND and write more data
         let mut fd = fs
-            .open(user, path, OFlags::WRONLY | OFlags::APPEND, Mode::empty())
+            .open(USER, path, OFlags::WRONLY | OFlags::APPEND, Mode::empty())
             .expect("Failed to open file with O_APPEND");
-        let append_data = b" World";
-        fs.write(&NoDeviceIo, &mut fd, append_data, None)
+        fs.write(&NoDeviceIo, &mut fd, b" World", None)
             .expect("Failed to append data");
         drop(fd);
 
         // Verify the file contains both pieces of data concatenated
         let mut fd = fs
-            .open(user, path, OFlags::RDONLY, Mode::empty())
+            .open(USER, path, OFlags::RDONLY, Mode::empty())
             .expect("Failed to open file for reading");
-        let mut buffer = vec![0; 11];
-        let bytes_read = fs
-            .read(&NoDeviceIo, &mut fd, &mut buffer, None)
-            .expect("Failed to read from file");
-        assert_eq!(bytes_read, 11);
-        assert_eq!(&buffer[..bytes_read], b"Hello World");
-        drop(fd);
+        assert_eq!(read_all(&fs, &mut fd), b"Hello World");
     }
 
     #[test]
     fn o_append_flag_seek_ignored_for_write() {
-        use crate::fs::SeekWhence;
-
-        let user = USER;
-
-        let fs = super::in_mem_fs();
-
-        with_root_privileges(&fs, |fs, user| {
-            fs.chmod(user, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                .expect("Failed to chmod /");
-        });
+        let fs = in_mem_fs();
+        world_writable_root(&fs);
 
         // Create a file and write some initial content
         let path = "/testfile";
-        let mut fd = fs
-            .open(user, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
-            .expect("Failed to create file");
-        fs.write(&NoDeviceIo, &mut fd, b"ABCDEF", None)
-            .expect("Failed to write initial content");
-        drop(fd);
+        create_with_content(&fs, path, b"ABCDEF");
 
         // Re-open with O_APPEND
         let mut fd = fs
-            .open(user, path, OFlags::WRONLY | OFlags::APPEND, Mode::empty())
+            .open(USER, path, OFlags::WRONLY | OFlags::APPEND, Mode::empty())
             .expect("Failed to open file with O_APPEND");
 
         // Seek to beginning - this should succeed but writes should still append
@@ -930,51 +859,27 @@ mod in_mem {
 
         // Verify the file content: original data followed by appended data
         let mut fd = fs
-            .open(user, path, OFlags::RDONLY, Mode::empty())
+            .open(USER, path, OFlags::RDONLY, Mode::empty())
             .expect("Failed to open file for reading");
-        let mut buffer = vec![0; 20];
-        let bytes_read = fs
-            .read(&NoDeviceIo, &mut fd, &mut buffer, None)
-            .expect("Failed to read from file");
-        assert_eq!(bytes_read, 9);
-        assert_eq!(&buffer[..bytes_read], b"ABCDEF123");
-        drop(fd);
+        assert_eq!(read_all(&fs, &mut fd), b"ABCDEF123");
     }
 
     #[test]
     fn o_append_flag_with_rdwr() {
-        use crate::fs::SeekWhence;
-
-        let user = USER;
-
-        let fs = super::in_mem_fs();
-
-        with_root_privileges(&fs, |fs, user| {
-            fs.chmod(user, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                .expect("Failed to chmod /");
-        });
+        let fs = in_mem_fs();
+        world_writable_root(&fs);
 
         // Create a file with initial content
         let path = "/testfile";
-        let mut fd = fs
-            .open(user, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
-            .expect("Failed to create file");
-        fs.write(&NoDeviceIo, &mut fd, b"Hello", None)
-            .expect("Failed to write initial content");
-        drop(fd);
+        create_with_content(&fs, path, b"Hello");
 
         // Re-open with O_RDWR | O_APPEND
         let mut fd = fs
-            .open(user, path, OFlags::RDWR | OFlags::APPEND, Mode::empty())
+            .open(USER, path, OFlags::RDWR | OFlags::APPEND, Mode::empty())
             .expect("Failed to open file with O_RDWR | O_APPEND");
 
         // Read should work normally from the beginning
-        let mut buffer = vec![0; 10];
-        let bytes_read = fs
-            .read(&NoDeviceIo, &mut fd, &mut buffer, None)
-            .expect("Failed to read from file");
-        assert_eq!(bytes_read, 5);
-        assert_eq!(&buffer[..bytes_read], b"Hello");
+        assert_eq!(read_all(&fs, &mut fd), b"Hello");
 
         // Seek to beginning - write should still append despite position being at 0
         fs.seek(&mut fd, 0, SeekWhence::RelativeToBeginning)
@@ -987,38 +892,21 @@ mod in_mem {
         // Seek to beginning and read the whole file
         fs.seek(&mut fd, 0, SeekWhence::RelativeToBeginning)
             .expect("Seek failed");
-        let mut buffer = vec![0; 20];
-        let bytes_read = fs
-            .read(&NoDeviceIo, &mut fd, &mut buffer, None)
-            .expect("Failed to read from file");
-        assert_eq!(bytes_read, 11);
-        assert_eq!(&buffer[..bytes_read], b"Hello World");
-        drop(fd);
+        assert_eq!(read_all(&fs, &mut fd), b"Hello World");
     }
 
     #[test]
     fn o_append_pwrite_ignores_append_mode() {
-        let user = USER;
-
-        let fs = super::in_mem_fs();
-
-        with_root_privileges(&fs, |fs, user| {
-            fs.chmod(user, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                .expect("Failed to chmod /");
-        });
+        let fs = in_mem_fs();
+        world_writable_root(&fs);
 
         // Create a file with initial content
         let path = "/testfile";
-        let mut fd = fs
-            .open(user, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
-            .expect("Failed to create file");
-        fs.write(&NoDeviceIo, &mut fd, b"ABCDEF", None)
-            .expect("Failed to write initial content");
-        drop(fd);
+        create_with_content(&fs, path, b"ABCDEF");
 
         // Re-open with O_APPEND
         let mut fd = fs
-            .open(user, path, OFlags::WRONLY | OFlags::APPEND, Mode::empty())
+            .open(USER, path, OFlags::WRONLY | OFlags::APPEND, Mode::empty())
             .expect("Failed to open file with O_APPEND");
 
         // pwrite (write with explicit offset) should ignore O_APPEND per POSIX
@@ -1028,41 +916,24 @@ mod in_mem {
 
         // Verify the file content: XX should be at position 2, not appended
         let mut fd = fs
-            .open(user, path, OFlags::RDONLY, Mode::empty())
+            .open(USER, path, OFlags::RDONLY, Mode::empty())
             .expect("Failed to open file for reading");
-        let mut buffer = vec![0; 10];
-        let bytes_read = fs
-            .read(&NoDeviceIo, &mut fd, &mut buffer, None)
-            .expect("Failed to read from file");
-        assert_eq!(bytes_read, 6);
-        assert_eq!(&buffer[..bytes_read], b"ABXXEF");
-        drop(fd);
+        assert_eq!(read_all(&fs, &mut fd), b"ABXXEF");
     }
 
     #[test]
     fn o_append_with_trunc() {
-        let user = USER;
-
-        let fs = super::in_mem_fs();
-
-        with_root_privileges(&fs, |fs, user| {
-            fs.chmod(user, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                .expect("Failed to chmod /");
-        });
+        let fs = in_mem_fs();
+        world_writable_root(&fs);
 
         // Create a file with initial content
         let path = "/testfile";
-        let mut fd = fs
-            .open(user, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
-            .expect("Failed to create file");
-        fs.write(&NoDeviceIo, &mut fd, b"Original content", None)
-            .expect("Failed to write initial content");
-        drop(fd);
+        create_with_content(&fs, path, b"Original content");
 
         // Re-open with O_TRUNC | O_APPEND
         let mut fd = fs
             .open(
-                user,
+                USER,
                 path,
                 OFlags::WRONLY | OFlags::TRUNC | OFlags::APPEND,
                 Mode::empty(),
@@ -1078,35 +949,23 @@ mod in_mem {
 
         // Verify the file content
         let mut fd = fs
-            .open(user, path, OFlags::RDONLY, Mode::empty())
+            .open(USER, path, OFlags::RDONLY, Mode::empty())
             .expect("Failed to open file for reading");
-        let mut buffer = vec![0; 20];
-        let bytes_read = fs
-            .read(&NoDeviceIo, &mut fd, &mut buffer, None)
-            .expect("Failed to read from file");
-        assert_eq!(bytes_read, 10);
-        assert_eq!(&buffer[..bytes_read], b"NewContent");
-        drop(fd);
+        assert_eq!(read_all(&fs, &mut fd), b"NewContent");
     }
 }
 
 mod tar_ro {
-    use super::USER;
-    use crate::fs::backend::NoDeviceIo;
-    use crate::fs::{Mode, OFlags};
+    use super::{FileType, Mode, NoDeviceIo, OFlags, TEST_TAR_FILE, USER, tar_ro_fs};
+    use crate::fs::errors::{OpenError, PathError, ReadDirError};
     use alloc::vec;
     use alloc::vec::Vec;
-    extern crate std;
-
-    const TEST_TAR_FILE: &[u8] = include_bytes!("./test.tar");
 
     #[test]
     fn file_read() {
-        let user = USER;
-
-        let fs = super::tar_ro_fs(TEST_TAR_FILE.into());
+        let fs = tar_ro_fs(TEST_TAR_FILE.into());
         let mut fd = fs
-            .open(user, "foo", OFlags::RDONLY, Mode::RWXU)
+            .open(USER, "foo", OFlags::RDONLY, Mode::RWXU)
             .expect("Failed to open file");
         let mut buffer = vec![0; 1024];
         let bytes_read = fs
@@ -1114,114 +973,94 @@ mod tar_ro {
             .expect("Failed to read from file");
         assert_eq!(&buffer[..bytes_read], b"testfoo\n");
         drop(fd);
+
         let mut fd = fs
-            .open(user, "bar/baz", OFlags::RDONLY, Mode::empty())
+            .open(USER, "bar/baz", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open file");
         let mut buffer = vec![0; 1024];
         let bytes_read = fs
             .read(&NoDeviceIo, &mut fd, &mut buffer, None)
             .expect("Failed to read from file");
         assert_eq!(&buffer[..bytes_read], b"test bar baz\n");
-        drop(fd);
     }
 
     #[test]
     fn dir_and_nonexist_checks() {
-        let user = USER;
-
-        let fs = super::tar_ro_fs(TEST_TAR_FILE.into());
+        let fs = tar_ro_fs(TEST_TAR_FILE.into());
         assert!(matches!(
-            fs.open(user, "bar/ba", OFlags::RDONLY, Mode::empty()),
-            Err(crate::fs::errors::OpenError::PathError(
-                crate::fs::errors::PathError::NoSuchFileOrDirectory
-            )),
+            fs.open(USER, "bar/ba", OFlags::RDONLY, Mode::empty()),
+            Err(OpenError::PathError(PathError::NoSuchFileOrDirectory)),
         ));
-        let fd = fs
-            .open(user, "bar", OFlags::RDONLY, Mode::empty())
+        fs.open(USER, "bar", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open dir");
-        drop(fd);
     }
 
     #[test]
     fn o_directory_flag_tests() {
-        let user = USER;
-
-        let fs = super::tar_ro_fs(TEST_TAR_FILE.into());
+        let fs = tar_ro_fs(TEST_TAR_FILE.into());
 
         // Test O_DIRECTORY on a directory (should succeed)
-        let fd = fs
-            .open(
-                user,
-                "bar",
-                OFlags::RDONLY | OFlags::DIRECTORY,
-                Mode::empty(),
-            )
-            .expect("Failed to open directory with O_DIRECTORY");
-        drop(fd);
+        fs.open(
+            USER,
+            "bar",
+            OFlags::RDONLY | OFlags::DIRECTORY,
+            Mode::empty(),
+        )
+        .expect("Failed to open directory with O_DIRECTORY");
 
         // Test O_DIRECTORY on a regular file (should fail)
         assert!(matches!(
             fs.open(
-                user,
+                USER,
                 "foo",
                 OFlags::RDONLY | OFlags::DIRECTORY,
                 Mode::empty()
             ),
-            Err(crate::fs::errors::OpenError::PathError(
-                crate::fs::errors::PathError::ComponentNotADirectory
-            ))
+            Err(OpenError::PathError(PathError::ComponentNotADirectory))
         ));
 
         // Test O_DIRECTORY on non-existent path (should fail)
         assert!(matches!(
             fs.open(
-                user,
+                USER,
                 "nonexistent",
                 OFlags::RDONLY | OFlags::DIRECTORY,
                 Mode::empty()
             ),
-            Err(crate::fs::errors::OpenError::PathError(
-                crate::fs::errors::PathError::NoSuchFileOrDirectory
-            ))
+            Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
         ));
 
         // Test O_DIRECTORY on nested file (should fail)
         assert!(matches!(
             fs.open(
-                user,
+                USER,
                 "bar/baz",
                 OFlags::RDONLY | OFlags::DIRECTORY,
                 Mode::empty()
             ),
-            Err(crate::fs::errors::OpenError::PathError(
-                crate::fs::errors::PathError::ComponentNotADirectory
-            ))
+            Err(OpenError::PathError(PathError::ComponentNotADirectory))
         ));
     }
 
     #[test]
     fn write_or_truncate_open_of_directory_fails() {
-        let user = USER;
-
-        let fs = super::tar_ro_fs(TEST_TAR_FILE.into());
+        let fs = tar_ro_fs(TEST_TAR_FILE.into());
 
         for flags in [OFlags::WRONLY, OFlags::RDWR, OFlags::TRUNC] {
             assert!(matches!(
-                fs.open(user, "bar", flags, Mode::empty()),
-                Err(crate::fs::errors::OpenError::ReadOnlyFileSystem)
+                fs.open(USER, "bar", flags, Mode::empty()),
+                Err(OpenError::ReadOnlyFileSystem)
             ));
         }
     }
 
     #[test]
     fn read_dir_subdirectory() {
-        let user = USER;
-
-        let fs = super::tar_ro_fs(TEST_TAR_FILE.into());
+        let fs = tar_ro_fs(TEST_TAR_FILE.into());
 
         // Read root directory
         let fd = fs
-            .open(user, "/", OFlags::RDONLY, Mode::empty())
+            .open(USER, "/", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open root directory");
         let entries = fs.read_dir(&fd).expect("Failed to read root directory");
         drop(fd);
@@ -1237,9 +1076,9 @@ mod tar_ro {
         for entry in &entries {
             match entry.name.as_str() {
                 "foo" => {
-                    assert_eq!(entry.file_type, crate::fs::FileType::RegularFile);
+                    assert_eq!(entry.file_type, FileType::RegularFile);
                 }
-                "bar" | "." | ".." => assert_eq!(entry.file_type, crate::fs::FileType::Directory),
+                "bar" | "." | ".." => assert_eq!(entry.file_type, FileType::Directory),
                 _ => panic!("Unexpected entry: {}", entry.name),
             }
             if entry.name != "." && entry.name != ".." {
@@ -1252,53 +1091,40 @@ mod tar_ro {
 
         // Read `bar` directory
         let fd = fs
-            .open(user, "bar", OFlags::RDONLY, Mode::empty())
+            .open(USER, "bar", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open bar directory");
         let entries = fs.read_dir(&fd).expect("Failed to read bar directory");
-        drop(fd);
 
-        // Should have 3 entry: ., .., baz (file)
+        // Should have 3 entries: ., .., baz (file)
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[2].name, "baz");
-        assert_eq!(entries[2].file_type, crate::fs::FileType::RegularFile);
+        assert_eq!(entries[2].file_type, FileType::RegularFile);
     }
 
     #[test]
     fn read_dir_file_not_directory() {
-        let user = USER;
-
-        let fs = super::tar_ro_fs(TEST_TAR_FILE.into());
+        let fs = tar_ro_fs(TEST_TAR_FILE.into());
 
         let fd = fs
-            .open(user, "foo", OFlags::RDONLY, Mode::empty())
+            .open(USER, "foo", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open foo file");
-        let result = fs.read_dir(&fd);
-        drop(fd);
-
-        assert!(matches!(
-            result,
-            Err(crate::fs::errors::ReadDirError::NotADirectory)
-        ));
+        assert!(matches!(fs.read_dir(&fd), Err(ReadDirError::NotADirectory)));
     }
 }
 
 mod overlay {
-    use super::USER;
-    use crate::fs::backend::NoDeviceIo;
+    use super::{
+        FileType, Mode, NoDeviceIo, OFlags, Overlay, Resolver, SeekWhence, TEST_TAR_FILE,
+        TestPlatform, USER, UserInfo,
+    };
+    use crate::fs::errors::{FileStatusError, OpenError, PathError, RmdirError};
     use crate::fs::in_mem::{InMem, InitialNode};
-    use crate::fs::{FileType, Mode, OFlags, UserInfo};
-    use crate::test_platform::TestPlatform;
     use alloc::vec;
     use alloc::vec::Vec;
     extern crate std;
 
-    const TEST_TAR_FILE: &[u8] = include_bytes!("./test.tar");
-
     /// The user these tests act as, and so the owner of anything they are set up as having created.
-    const ACTING_USER: UserInfo = UserInfo {
-        user: 1000,
-        group: 1000,
-    };
+    const ACTING_USER: UserInfo = USER;
     const ALL_PERMS: Mode = Mode::RWXU.union(Mode::RWXG).union(Mode::RWXO);
 
     /// An upper backend whose root is writable by the acting user, holding `entries`.
@@ -1321,75 +1147,64 @@ mod overlay {
         )
     }
 
-    fn overlay_fs(upper: InMem<TestPlatform>) -> super::OverlayFs {
+    fn overlay_fs(upper: InMem<TestPlatform>) -> Resolver<TestPlatform, Overlay<TestPlatform>> {
         super::overlay_fs(upper, TEST_TAR_FILE.into())
     }
 
     #[test]
     fn file_read_from_lower() {
-        let user = USER;
-
         let fs = overlay_fs(upper([]));
         let mut fd = fs
-            .open(user, "foo", OFlags::RDONLY, Mode::RWXU)
+            .open(USER, "foo", OFlags::RDONLY, Mode::RWXU)
             .expect("Failed to open file");
         let mut buffer = vec![0; 1024];
         let bytes_read = fs
             .read(&NoDeviceIo, &mut fd, &mut buffer, None)
             .expect("Failed to read from file");
         assert_eq!(&buffer[..bytes_read], b"testfoo\n");
-        let stat = fs.handle_status(&fd).expect("Failed to fd file stat");
+        let stat = fs.handle_status(&fd).expect("Failed to handle stat");
         assert_eq!(stat.file_type, FileType::RegularFile);
         assert_eq!(stat.mode, Mode::from_bits(0o644).unwrap());
         drop(fd);
 
-        let stat = fs.file_status(user, "bar").expect("Failed to file stat");
+        let stat = fs.file_status(USER, "bar").expect("Failed to file stat");
         assert_eq!(stat.file_type, FileType::Directory);
         assert_eq!(stat.mode, Mode::from_bits(0o777).unwrap());
 
         let mut fd = fs
-            .open(user, "bar/baz", OFlags::RDONLY, Mode::empty())
+            .open(USER, "bar/baz", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open file");
         let mut buffer = vec![0; 1024];
         let bytes_read = fs
             .read(&NoDeviceIo, &mut fd, &mut buffer, None)
             .expect("Failed to read from file");
         assert_eq!(&buffer[..bytes_read], b"test bar baz\n");
-        let stat = fs.handle_status(&fd).expect("Failed to fd file stat");
+        let stat = fs.handle_status(&fd).expect("Failed to handle stat");
         assert_eq!(stat.file_type, FileType::RegularFile);
         assert_eq!(stat.mode, Mode::from_bits(0o644).unwrap());
-        drop(fd);
     }
 
     #[test]
     fn dir_and_nonexist_checks() {
-        let user = USER;
-
         let fs = overlay_fs(upper([]));
         assert!(matches!(
-            fs.open(user, "bar/ba", OFlags::RDONLY, Mode::empty()),
-            Err(crate::fs::errors::OpenError::PathError(
-                crate::fs::errors::PathError::NoSuchFileOrDirectory
-            )),
+            fs.open(USER, "bar/ba", OFlags::RDONLY, Mode::empty()),
+            Err(OpenError::PathError(PathError::NoSuchFileOrDirectory)),
         ));
-        let fd = fs
-            .open(user, "bar", OFlags::RDONLY, Mode::empty())
+        fs.open(USER, "bar", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open dir");
-        drop(fd);
     }
 
     /// Check that for the same file, even though it started as a lower file, writing to it copies
     /// it up and redirects handles already open on it, so every descriptor sees the update.
     #[test]
     fn file_read_write_copy_up() {
-        let user = USER;
-
         let fs = overlay_fs(upper([]));
         let mut fd1 = fs
-            .open(user, "foo", OFlags::RDONLY, Mode::RWXU)
+            .open(USER, "foo", OFlags::RDONLY, Mode::RWXU)
             .expect("Failed to open file");
         let mut fd2 = fs
-            .open(user, "foo", OFlags::WRONLY, Mode::RWXU)
+            .open(USER, "foo", OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to open file");
 
         let mut buffer = vec![0; 1024];
@@ -1402,29 +1217,24 @@ mod overlay {
         fs.write(&NoDeviceIo, &mut fd2, b"share", None)
             .expect("Failed to write to file");
 
-        fs.seek(&mut fd1, 0, crate::fs::SeekWhence::RelativeToBeginning)
+        fs.seek(&mut fd1, 0, SeekWhence::RelativeToBeginning)
             .expect("Failed to seek to start");
         let bytes_read = fs
             .read(&NoDeviceIo, &mut fd1, &mut buffer, None)
             .expect("Failed to read from file");
         assert_eq!(&buffer[..bytes_read], b"shareoo\n");
-
-        drop(fd1);
-        drop(fd2);
     }
 
     /// Similar to [`file_read_write_copy_up`] but also confirm that file positions have been
     /// maintained.
     #[test]
     fn file_read_write_copy_up_keeps_position() {
-        let user = USER;
-
         let fs = overlay_fs(upper([]));
         let mut fd1 = fs
-            .open(user, "foo", OFlags::RDONLY, Mode::RWXU)
+            .open(USER, "foo", OFlags::RDONLY, Mode::RWXU)
             .expect("Failed to open file");
         let mut fd2 = fs
-            .open(user, "foo", OFlags::WRONLY, Mode::RWXU)
+            .open(USER, "foo", OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to open file");
 
         let mut buffer = vec![0; 4];
@@ -1441,18 +1251,13 @@ mod overlay {
             .read(&NoDeviceIo, &mut fd1, &mut buffer, None)
             .expect("Failed to read from file");
         assert_eq!(&buffer[..bytes_read], b"eoo\n");
-
-        drop(fd1);
-        drop(fd2);
     }
 
     #[test]
     fn file_deletion() {
-        let user = USER;
-
         let fs = overlay_fs(upper([]));
         let mut fd = fs
-            .open(user, "foo", OFlags::RDONLY, Mode::RWXU)
+            .open(USER, "foo", OFlags::RDONLY, Mode::RWXU)
             .expect("Failed to open file");
 
         let mut buffer = vec![0; 4];
@@ -1464,7 +1269,7 @@ mod overlay {
         assert_eq!(&buffer[..bytes_read], b"test");
 
         // Then we delete it
-        fs.unlink(user, "foo").unwrap();
+        fs.unlink(USER, "foo").unwrap();
 
         // This should not really impact the readability; file is fine.
         let bytes_read = fs
@@ -1475,17 +1280,13 @@ mod overlay {
         // But if we close and attempt to re-open, it should not exist
         drop(fd);
         assert!(matches!(
-            fs.open(user, "foo", OFlags::RDONLY, Mode::empty()),
-            Err(crate::fs::errors::OpenError::PathError(
-                crate::fs::errors::PathError::NoSuchFileOrDirectory
-            )),
+            fs.open(USER, "foo", OFlags::RDONLY, Mode::empty()),
+            Err(OpenError::PathError(PathError::NoSuchFileOrDirectory)),
         ));
     }
 
     #[test]
     fn o_directory_flag_tests() {
-        let user = USER;
-
         let fs = overlay_fs(upper([
             (
                 "/upperdir",
@@ -1505,77 +1306,65 @@ mod overlay {
         ]));
 
         // Test O_DIRECTORY on directory from lower layer (tar)
-        let fd = fs
-            .open(
-                user,
-                "bar",
-                OFlags::RDONLY | OFlags::DIRECTORY,
-                Mode::empty(),
-            )
-            .expect("Failed to open lower layer directory with O_DIRECTORY");
-        drop(fd);
+        fs.open(
+            USER,
+            "bar",
+            OFlags::RDONLY | OFlags::DIRECTORY,
+            Mode::empty(),
+        )
+        .expect("Failed to open lower layer directory with O_DIRECTORY");
 
         // Test O_DIRECTORY on directory from upper layer (in_mem)
-        let fd = fs
-            .open(
-                user,
-                "/upperdir",
-                OFlags::RDONLY | OFlags::DIRECTORY,
-                Mode::empty(),
-            )
-            .expect("Failed to open upper layer directory with O_DIRECTORY");
-        drop(fd);
+        fs.open(
+            USER,
+            "/upperdir",
+            OFlags::RDONLY | OFlags::DIRECTORY,
+            Mode::empty(),
+        )
+        .expect("Failed to open upper layer directory with O_DIRECTORY");
 
         // Test O_DIRECTORY on file from lower layer (should fail)
         assert!(matches!(
             fs.open(
-                user,
+                USER,
                 "foo",
                 OFlags::RDONLY | OFlags::DIRECTORY,
                 Mode::empty()
             ),
-            Err(crate::fs::errors::OpenError::PathError(
-                crate::fs::errors::PathError::ComponentNotADirectory
-            ))
+            Err(OpenError::PathError(PathError::ComponentNotADirectory))
         ));
 
         // Test O_DIRECTORY on file from upper layer (should fail)
         assert!(matches!(
             fs.open(
-                user,
+                USER,
                 "/upperfile",
                 OFlags::RDONLY | OFlags::DIRECTORY,
                 Mode::empty()
             ),
-            Err(crate::fs::errors::OpenError::PathError(
-                crate::fs::errors::PathError::ComponentNotADirectory
-            ))
+            Err(OpenError::PathError(PathError::ComponentNotADirectory))
         ));
 
         // Test O_DIRECTORY on nested file from lower layer (should fail)
         assert!(matches!(
             fs.open(
-                user,
+                USER,
                 "bar/baz",
                 OFlags::RDONLY | OFlags::DIRECTORY,
                 Mode::empty()
             ),
-            Err(crate::fs::errors::OpenError::PathError(
-                crate::fs::errors::PathError::ComponentNotADirectory
-            ))
+            Err(OpenError::PathError(PathError::ComponentNotADirectory))
         ));
 
         // Test O_DIRECTORY on non-existent path (should fail)
         assert!(matches!(
             fs.open(
-                user,
+                USER,
                 "nonexistent",
                 OFlags::RDONLY | OFlags::DIRECTORY,
                 Mode::empty()
             ),
-            Err(crate::fs::errors::OpenError::PathError(
-                crate::fs::errors::PathError::NoSuchFileOrDirectory
-            ))
+            Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
         ));
     }
 
@@ -1583,11 +1372,9 @@ mod overlay {
     // Regression test for #250: a file that already exists in the lower layer should not be
     // shadowed by an attempt to create a file.
     fn file_create_exist_in_lower() {
-        let user = USER;
-
         let fs = overlay_fs(upper([]));
         let mut fd = fs
-            .open(user, "foo", OFlags::RDWR | OFlags::CREAT, Mode::RWXU)
+            .open(USER, "foo", OFlags::RDWR | OFlags::CREAT, Mode::RWXU)
             .expect("Failed to open file");
         let mut buffer = vec![0; 4];
 
@@ -1600,21 +1387,18 @@ mod overlay {
 
     #[test]
     fn read_dir_from_lower_layer() {
-        let user = USER;
-
         let fs = overlay_fs(upper([]));
 
         // Read bar subdirectory
         let fd = fs
-            .open(user, "bar", OFlags::RDONLY, Mode::empty())
+            .open(USER, "bar", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open bar directory");
         let entries = fs.read_dir(&fd).expect("Failed to read bar directory");
-        drop(fd);
 
         // Should have 3 entries: ., .., baz (file)
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[2].name, "baz");
-        assert_eq!(entries[2].file_type, crate::fs::FileType::RegularFile);
+        assert_eq!(entries[2].file_type, FileType::RegularFile);
         assert!(
             entries[2].ino_info.is_some(),
             "Inode info should be present"
@@ -1623,8 +1407,6 @@ mod overlay {
 
     #[test]
     fn read_dir_from_upper_layer() {
-        let user = USER;
-
         let fs = overlay_fs(upper([
             (
                 "/upperdir",
@@ -1645,7 +1427,7 @@ mod overlay {
 
         // Read root directory (should contain entries from both layers)
         let fd = fs
-            .open(user, "/", OFlags::RDONLY, Mode::empty())
+            .open(USER, "/", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open root directory");
         let entries = fs.read_dir(&fd).expect("Failed to read root directory");
         drop(fd);
@@ -1664,10 +1446,10 @@ mod overlay {
         for entry in &entries {
             match entry.name.as_str() {
                 "foo" | "upperfile" => {
-                    assert_eq!(entry.file_type, crate::fs::FileType::RegularFile);
+                    assert_eq!(entry.file_type, FileType::RegularFile);
                 }
                 "bar" | "upperdir" | "." | ".." => {
-                    assert_eq!(entry.file_type, crate::fs::FileType::Directory);
+                    assert_eq!(entry.file_type, FileType::Directory);
                 }
                 _ => panic!("Unexpected entry: {}", entry.name),
             }
@@ -1681,10 +1463,9 @@ mod overlay {
 
         // Read upperdir directory (should be from upper layer)
         let fd = fs
-            .open(user, "/upperdir", OFlags::RDONLY, Mode::empty())
+            .open(USER, "/upperdir", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open upperdir");
         let entries = fs.read_dir(&fd).expect("Failed to read upperdir");
-        drop(fd);
 
         // only . and ..
         assert_eq!(entries.len(), 2);
@@ -1692,26 +1473,24 @@ mod overlay {
 
     #[test]
     fn o_excl_tests() {
-        let user = USER;
-
         let fs = overlay_fs(upper([]));
 
         // Test O_CREAT | O_EXCL on file that exists in lower layer (should fail)
         // "foo" exists in the tar file
         assert!(matches!(
             fs.open(
-                user,
+                USER,
                 "foo",
                 OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
                 Mode::RWXU,
             ),
-            Err(crate::fs::errors::OpenError::AlreadyExists)
+            Err(OpenError::AlreadyExists)
         ));
 
         // Test O_CREAT | O_EXCL on file that doesn't exist anywhere (should succeed)
         let mut fd = fs
             .open(
-                user,
+                USER,
                 "/newfile",
                 OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
                 Mode::RWXU,
@@ -1725,35 +1504,35 @@ mod overlay {
         // Test O_CREAT | O_EXCL on file that now exists in upper layer (should fail)
         assert!(matches!(
             fs.open(
-                user,
+                USER,
                 "/newfile",
                 OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
                 Mode::RWXU,
             ),
-            Err(crate::fs::errors::OpenError::AlreadyExists)
+            Err(OpenError::AlreadyExists)
         ));
 
         // Test O_CREAT | O_EXCL on directory that exists in lower layer (should fail)
         // "bar" is a directory in the tar file
         assert!(matches!(
             fs.open(
-                user,
+                USER,
                 "bar",
                 OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
                 Mode::RWXU,
             ),
-            Err(crate::fs::errors::OpenError::AlreadyExists)
+            Err(OpenError::AlreadyExists)
         ));
 
         // Test O_CREAT | O_EXCL on file that was deleted (tombstoned) should succeed
         // First delete a file from lower layer
-        fs.unlink(user, "foo")
+        fs.unlink(USER, "foo")
             .expect("Failed to unlink lower layer file");
 
         // Now try to create it with O_EXCL (should succeed since it's tombstoned)
         let mut fd = fs
             .open(
-                user,
+                USER,
                 "foo",
                 OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
                 Mode::RWXU,
@@ -1766,7 +1545,7 @@ mod overlay {
 
         // Verify the new content
         let mut fd = fs
-            .open(user, "foo", OFlags::RDONLY, Mode::empty())
+            .open(USER, "foo", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open recreated file");
         let mut buffer = vec![0; 15];
         let bytes_read = fs
@@ -1779,7 +1558,7 @@ mod overlay {
         // Create a file in upper layer first
         let mut fd = fs
             .open(
-                user,
+                USER,
                 "/upper_only_file",
                 OFlags::CREAT | OFlags::WRONLY,
                 Mode::RWXU,
@@ -1792,39 +1571,36 @@ mod overlay {
         // Now try O_CREAT | O_EXCL on the same file (should fail)
         assert!(matches!(
             fs.open(
-                user,
+                USER,
                 "/upper_only_file",
                 OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
                 Mode::RWXU,
             ),
-            Err(crate::fs::errors::OpenError::AlreadyExists)
+            Err(OpenError::AlreadyExists)
         ));
     }
 
     #[test]
     fn dir_creation_inside_lower_existing_dir() {
-        let user = USER;
-
         let fs = overlay_fs(upper([]));
 
         // Create the directory /bar/test (where /bar already exists inside the tar file)
-        fs.mkdir(user, "/bar/test", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+        fs.mkdir(USER, "/bar/test", Mode::RWXU | Mode::RWXG | Mode::RWXO)
             .expect("Failed to create /bar/test directory");
 
         // Verify the directory was created
         let stat = fs
-            .file_status(user, "/bar/test")
+            .file_status(USER, "/bar/test")
             .expect("Failed to get status of /bar/test");
         assert_eq!(stat.file_type, FileType::Directory);
 
         // Verify we can open the directory
         let fd = fs
-            .open(user, "/bar/test", OFlags::RDONLY, Mode::empty())
+            .open(USER, "/bar/test", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open /bar/test directory");
         let entries = fs
             .read_dir(&fd)
             .expect("Failed to read /bar/test directory");
-        drop(fd);
 
         // Should contain only . and .. entries
         assert_eq!(entries.len(), 2);
@@ -1835,14 +1611,12 @@ mod overlay {
 
     #[test]
     fn file_creation_materializes_ancestor_dirs() {
-        let user = USER;
-
         let fs = overlay_fs(upper([]));
 
         // Open bar/test for writing (where bar exists in lower layer but test doesn't exist)
         // This should create ancestor directories and allow file creation
         let mut fd = fs
-            .open(user, "bar/test", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .open(USER, "bar/test", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to open bar/test for writing");
 
         // Write data to the file
@@ -1853,7 +1627,7 @@ mod overlay {
 
         // Read the file back
         let mut fd = fs
-            .open(user, "bar/test", OFlags::RDONLY, Mode::empty())
+            .open(USER, "bar/test", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open bar/test for reading");
         let mut buffer = vec![0; 1024];
         let bytes_read = fs
@@ -1864,21 +1638,19 @@ mod overlay {
 
         // Verify the file exists and has correct type
         let stat = fs
-            .file_status(user, "bar/test")
+            .file_status(USER, "bar/test")
             .expect("Failed to get status of bar/test");
         assert_eq!(stat.file_type, FileType::RegularFile);
     }
 
     #[test]
     fn file_modification_materializes_ancestor_dirs() {
-        let user = USER;
-
         let fs = overlay_fs(upper([]));
 
         // Open bar/baz for writing (both bar and baz exist in lower layer)
         // This copies up the ancestor directories and allows the file to be modified
         let mut fd = fs
-            .open(user, "bar/baz", OFlags::WRONLY, Mode::RWXU)
+            .open(USER, "bar/baz", OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to open bar/baz for writing");
 
         // Write new data to the file (overwriting existing content)
@@ -1889,7 +1661,7 @@ mod overlay {
 
         // Read the file back to verify it was modified
         let mut fd = fs
-            .open(user, "bar/baz", OFlags::RDONLY, Mode::empty())
+            .open(USER, "bar/baz", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open bar/baz for reading");
         let mut buffer = vec![0; 1024];
         let bytes_read = fs
@@ -1901,20 +1673,18 @@ mod overlay {
 
         // Verify the file still exists and has correct type
         let stat = fs
-            .file_status(user, "bar/baz")
+            .file_status(USER, "bar/baz")
             .expect("Failed to get status of bar/baz");
         assert_eq!(stat.file_type, FileType::RegularFile);
     }
 
     #[test]
     fn open_with_trunc() {
-        let user = USER;
-
         let fs = overlay_fs(upper([]));
 
         // Open with O_TRUNC should copy the file up into the upper backend, empty
         let mut fd = fs
-            .open(user, "foo", OFlags::RDWR | OFlags::TRUNC, Mode::empty())
+            .open(USER, "foo", OFlags::RDWR | OFlags::TRUNC, Mode::empty())
             .expect("Failed to open file with O_TRUNC");
 
         // File should be truncated (empty)
@@ -1931,62 +1701,51 @@ mod overlay {
 
         // Verify the content persists
         let mut fd = fs
-            .open(user, "foo", OFlags::RDONLY, Mode::empty())
+            .open(USER, "foo", OFlags::RDONLY, Mode::empty())
             .expect("Failed to reopen file");
         let mut buffer = vec![0; 1024];
         let bytes_read = fs
             .read(&NoDeviceIo, &mut fd, &mut buffer, None)
             .expect("Failed to read file");
         assert_eq!(&buffer[..bytes_read], b"new content");
-        drop(fd);
     }
 
     #[test]
     fn rmdir_upper_only_directory() {
-        use crate::fs::errors::{PathError, RmdirError};
-
-        let user = USER;
-
         let fs = overlay_fs(upper([]));
 
         // Create an empty directory only in upper layer
-        fs.mkdir(user, "/upper_empty", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+        fs.mkdir(USER, "/upper_empty", Mode::RWXU | Mode::RWXG | Mode::RWXO)
             .expect("mkdir upper_empty failed");
 
         // Remove it
-        fs.rmdir(user, "/upper_empty")
+        fs.rmdir(USER, "/upper_empty")
             .expect("rmdir upper_empty should succeed");
 
         // Verify it no longer exists
         assert!(matches!(
-            fs.file_status(user, "/upper_empty"),
-            Err(crate::fs::errors::FileStatusError::PathError(
-                PathError::NoSuchFileOrDirectory
-            ))
+            fs.file_status(USER, "/upper_empty"),
+            Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory))
         ));
 
         // Second removal should yield NoSuchFileOrDirectory (path error)
         assert!(matches!(
-            fs.rmdir(user, "/upper_empty"),
+            fs.rmdir(USER, "/upper_empty"),
             Err(RmdirError::PathError(PathError::NoSuchFileOrDirectory))
         ));
     }
 
     #[test]
     fn rmdir_upper_directory_not_empty_then_empty() {
-        use crate::fs::errors::{PathError, RmdirError};
-
-        let user = USER;
-
         let fs = overlay_fs(upper([]));
 
-        fs.mkdir(user, "/upper_dir", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+        fs.mkdir(USER, "/upper_dir", Mode::RWXU | Mode::RWXG | Mode::RWXO)
             .expect("mkdir upper_dir failed");
 
         // Create a file inside making directory non-empty
         let fd = fs
             .open(
-                user,
+                USER,
                 "/upper_dir/file",
                 OFlags::CREAT | OFlags::WRONLY,
                 Mode::RWXU | Mode::RWXG,
@@ -1996,51 +1755,41 @@ mod overlay {
 
         // Attempt to remove while non-empty
         assert!(matches!(
-            fs.rmdir(user, "/upper_dir"),
+            fs.rmdir(USER, "/upper_dir"),
             Err(RmdirError::NotEmpty)
         ));
 
         // Remove inner file
-        fs.unlink(user, "/upper_dir/file")
+        fs.unlink(USER, "/upper_dir/file")
             .expect("unlink inner failed");
 
         // Now should succeed
-        fs.rmdir(user, "/upper_dir")
+        fs.rmdir(USER, "/upper_dir")
             .expect("rmdir upper_dir should succeed");
 
         // Confirm gone
         assert!(matches!(
-            fs.file_status(user, "/upper_dir"),
-            Err(crate::fs::errors::FileStatusError::PathError(
-                PathError::NoSuchFileOrDirectory
-            ))
+            fs.file_status(USER, "/upper_dir"),
+            Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory))
         ));
     }
 
     #[test]
     fn rmdir_lower_directory_non_empty() {
-        use crate::fs::errors::RmdirError;
-
-        let user = USER;
-
         let fs = overlay_fs(upper([]));
 
         // "bar" exists in lower layer and contains "baz" (non-empty)
-        assert!(matches!(fs.rmdir(user, "bar"), Err(RmdirError::NotEmpty)));
+        assert!(matches!(fs.rmdir(USER, "bar"), Err(RmdirError::NotEmpty)));
     }
 
     #[test]
     fn rmdir_not_a_directory() {
-        use crate::fs::errors::RmdirError;
-
-        let user = USER;
-
         let fs = overlay_fs(upper([]));
 
         // Create a regular file (upper only)
         let fd = fs
             .open(
-                user,
+                USER,
                 "/regular_file",
                 OFlags::CREAT | OFlags::WRONLY,
                 Mode::RWXU | Mode::RWXG,
@@ -2050,7 +1799,7 @@ mod overlay {
 
         // rmdir should fail with NotADirectory
         assert!(matches!(
-            fs.rmdir(user, "/regular_file"),
+            fs.rmdir(USER, "/regular_file"),
             Err(RmdirError::NotADirectory)
         ));
     }
@@ -2061,17 +1810,15 @@ mod overlay {
         use std::thread;
         use std::time::Duration;
 
-        let user = USER;
-
         let fs = overlay_fs(upper([]));
 
-        fs.file_status(user, "foo").expect("Failed to stat foo");
+        fs.file_status(USER, "foo").expect("Failed to stat foo");
 
         // Writing to the lower-layer file triggers copy-up. Run it on a worker thread.
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let mut fd = fs
-                .open(user, "foo", OFlags::WRONLY, Mode::RWXU)
+                .open(USER, "foo", OFlags::WRONLY, Mode::RWXU)
                 .expect("Failed to open file for writing");
             fs.write(&NoDeviceIo, &mut fd, b"x", None)
                 .expect("Failed to write to file");
@@ -2081,5 +1828,159 @@ mod overlay {
 
         rx.recv_timeout(Duration::from_secs(2))
             .expect("copy-up deadlocked");
+    }
+}
+
+mod devices {
+    use super::{Mode, OFlags, Resolver, TestPlatform, USER, UnservicedStdio};
+    use crate::fs::composer::Composer;
+    use crate::fs::devices::Devices;
+    use crate::fs::errors::{OpenError, PathError, ReadError, WriteError};
+    use alloc::vec;
+
+    fn devices_fs() -> Resolver<TestPlatform, Composer> {
+        Resolver::new(
+            Composer::builder()
+                .mount("/dev", Devices::new)
+                .build()
+                .unwrap(),
+        )
+    }
+
+    /// Stdio devices hold no data of their own: every non-empty transfer needs the session's
+    /// device I/O, and fails when the session cannot service it.
+    #[test]
+    fn stdio_requires_broker() {
+        let fs = devices_fs();
+        let stdio = UnservicedStdio;
+
+        let mut fd_stdout = fs
+            .open(USER, "/dev/stdout", OFlags::WRONLY, Mode::empty())
+            .expect("Failed to open /dev/stdout");
+        assert!(matches!(fs.write(&stdio, &mut fd_stdout, b"", None), Ok(0)));
+        assert!(matches!(
+            fs.write(&stdio, &mut fd_stdout, b"Hello, stdout!", None),
+            Err(WriteError::Io)
+        ));
+        drop(fd_stdout);
+
+        let mut fd_stderr = fs
+            .open(USER, "/dev/stderr", OFlags::WRONLY, Mode::empty())
+            .expect("Failed to open /dev/stderr");
+        assert!(matches!(fs.write(&stdio, &mut fd_stderr, b"", None), Ok(0)));
+        assert!(matches!(
+            fs.write(&stdio, &mut fd_stderr, b"Hello, stderr!", None),
+            Err(WriteError::Io)
+        ));
+        drop(fd_stderr);
+
+        let mut fd_stdin = fs
+            .open(USER, "/dev/stdin", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open /dev/stdin");
+        assert!(matches!(
+            fs.read(&stdio, &mut fd_stdin, &mut [], None),
+            Ok(0)
+        ));
+        let mut buffer = vec![0; 13];
+        assert!(matches!(
+            fs.read(&stdio, &mut fd_stdin, &mut buffer, None),
+            Err(ReadError::Io)
+        ));
+    }
+
+    #[test]
+    fn non_dev_path_fails() {
+        let fs = devices_fs();
+
+        // Attempt to open a non-/dev/* path
+        assert!(matches!(
+            fs.open(USER, "foo", OFlags::RDONLY, Mode::empty()),
+            Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
+        ));
+    }
+}
+
+mod composed {
+    use super::{InMem, Mode, OFlags, Resolver, TestPlatform, USER, UnservicedStdio, UserInfo};
+    use crate::fs::composer::Composer;
+    use crate::fs::devices::Devices;
+    use crate::fs::errors::{ReadError, WriteError};
+    use crate::fs::in_mem::InitialNode;
+    use alloc::vec;
+
+    fn composed_fs() -> Resolver<TestPlatform, Composer> {
+        Resolver::new(
+            Composer::builder()
+                .mount("/", |_| {
+                    InMem::<TestPlatform>::new_initialized([(
+                        "/",
+                        InitialNode::Directory {
+                            mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+                            owner: UserInfo::ROOT,
+                        },
+                    )])
+                })
+                .mount("/dev", Devices::new)
+                .build()
+                .unwrap(),
+        )
+    }
+
+    #[test]
+    fn stdio_requires_broker() {
+        let fs = composed_fs();
+        let stdio = UnservicedStdio;
+
+        let mut fd_stdout = fs
+            .open(USER, "/dev/stdout", OFlags::WRONLY, Mode::empty())
+            .expect("Failed to open /dev/stdout");
+        assert!(matches!(fs.write(&stdio, &mut fd_stdout, b"", None), Ok(0)));
+        assert!(matches!(
+            fs.write(&stdio, &mut fd_stdout, b"Hello, composed stdout!", None),
+            Err(WriteError::Io)
+        ));
+        drop(fd_stdout);
+
+        let mut fd_stderr = fs
+            .open(USER, "/dev/stderr", OFlags::WRONLY, Mode::empty())
+            .expect("Failed to open /dev/stderr");
+        assert!(matches!(fs.write(&stdio, &mut fd_stderr, b"", None), Ok(0)));
+        assert!(matches!(
+            fs.write(&stdio, &mut fd_stderr, b"Hello, composed stderr!", None),
+            Err(WriteError::Io)
+        ));
+        drop(fd_stderr);
+
+        let mut fd_stdin = fs
+            .open(USER, "/dev/stdin", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open /dev/stdin");
+        assert!(matches!(
+            fs.read(&stdio, &mut fd_stdin, &mut [], None),
+            Ok(0)
+        ));
+        let mut buffer = vec![0; 1024];
+        assert!(matches!(
+            fs.read(&stdio, &mut fd_stdin, &mut buffer, None),
+            Err(ReadError::Io)
+        ));
+    }
+
+    #[test]
+    fn write_to_non_dev() {
+        let fs = composed_fs();
+
+        // Test file creation
+        let path = "/testfile";
+        let fd = fs
+            .open(USER, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .expect("Failed to create file");
+        drop(fd);
+
+        // Test file deletion
+        fs.unlink(USER, path).expect("Failed to unlink file");
+        assert!(
+            fs.open(USER, path, OFlags::RDONLY, Mode::RWXU).is_err(),
+            "File should not exist"
+        );
     }
 }

@@ -1,7 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! 9P engine tests using a real `diod` server and fault-injected transports.
+//! 9P filesystem semantics, exercised against a real `diod` server.
+//!
+//! These tests drive the broker-core resolver over the [`NineP`] backend, so they cover the
+//! client's protocol handling and the resolver semantics layered on it. They need `diod`
+//! installed (`apt install diod`).
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::io::{Read as _, Write as _};
@@ -15,11 +19,12 @@ use crate::fs::errors::{
 };
 use crate::fs::inode_allocator::InodeAllocator;
 use crate::fs::resolver::Resolver;
-use crate::fs::{Mode, OFlags};
+use crate::fs::{FileType, Mode, OFlags, SeekWhence};
 use crate::test_platform::TestPlatform;
 
 use super::{NineP, transport};
 
+/// A resolver over a 9P backend reached through `T`.
 type NinePFs<T> = Resolver<TestPlatform, NineP<TestPlatform, T>>;
 
 const USER: crate::fs::UserInfo = crate::fs::UserInfo {
@@ -46,7 +51,7 @@ fn attach<T: transport::Read + transport::Write>(
     .expect("failed to create 9P filesystem")
 }
 
-/// A wrapper around `TcpStream` that implements the broker-core 9P transport traits.
+/// A wrapper around `TcpStream` that implements the 9P transport traits.
 struct TcpTransport {
     stream: TcpStream,
 }
@@ -211,15 +216,13 @@ fn connect_9p(server: &DiodServer) -> NinePFs<TcpTransport> {
 
 #[test]
 fn test_nine_p_create_and_read_file() {
-    let user = USER;
-
     let server = DiodServer::start();
     let fs = connect_9p(&server);
 
     // Create a file and write to it
     let mut fd = fs
         .open(
-            user,
+            USER,
             "/hello.txt",
             OFlags::CREAT | OFlags::WRONLY,
             Mode::RWXU,
@@ -242,7 +245,7 @@ fn test_nine_p_create_and_read_file() {
 
     // Read the file back through 9P
     let mut fd = fs
-        .open(user, "/hello.txt", OFlags::RDONLY, Mode::empty())
+        .open(USER, "/hello.txt", OFlags::RDONLY, Mode::empty())
         .expect("failed to open file for reading via 9P");
 
     let mut buf = alloc::vec![0u8; 256];
@@ -256,21 +259,19 @@ fn test_nine_p_create_and_read_file() {
 
 #[test]
 fn test_nine_p_mkdir_and_readdir() {
-    let user = USER;
-
     let server = DiodServer::start();
     let fs = connect_9p(&server);
 
     // Create directories
-    fs.mkdir(user, "/subdir", Mode::RWXU)
+    fs.mkdir(USER, "/subdir", Mode::RWXU)
         .expect("failed to mkdir via 9P");
-    fs.mkdir(user, "/subdir/nested", Mode::RWXU)
+    fs.mkdir(USER, "/subdir/nested", Mode::RWXU)
         .expect("failed to mkdir nested via 9P");
 
     // Create a file inside the subdirectory
     let mut fd = fs
         .open(
-            user,
+            USER,
             "/subdir/file.txt",
             OFlags::CREAT | OFlags::WRONLY,
             Mode::RWXU,
@@ -282,7 +283,7 @@ fn test_nine_p_mkdir_and_readdir() {
 
     // Read the root directory
     let fd = fs
-        .open(user, "/", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+        .open(USER, "/", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
         .expect("failed to open root dir");
     let entries = fs.read_dir(&fd).expect("failed to readdir root");
     drop(fd);
@@ -296,7 +297,7 @@ fn test_nine_p_mkdir_and_readdir() {
     // Read the subdirectory
     let fd = fs
         .open(
-            user,
+            USER,
             "/subdir",
             OFlags::RDONLY | OFlags::DIRECTORY,
             Mode::empty(),
@@ -318,15 +319,13 @@ fn test_nine_p_mkdir_and_readdir() {
 
 #[test]
 fn test_nine_p_unlink_and_rmdir() {
-    let user = USER;
-
     let server = DiodServer::start();
     let fs = connect_9p(&server);
 
     // Create a file, then delete it
     let fd = fs
         .open(
-            user,
+            USER,
             "/to_delete.txt",
             OFlags::CREAT | OFlags::WRONLY,
             Mode::RWXU,
@@ -334,20 +333,20 @@ fn test_nine_p_unlink_and_rmdir() {
         .expect("failed to create file");
     drop(fd);
 
-    fs.unlink(user, "/to_delete.txt")
+    fs.unlink(USER, "/to_delete.txt")
         .expect("failed to unlink file via 9P");
 
     // Verify the file is gone
     assert!(
-        fs.open(user, "/to_delete.txt", OFlags::RDONLY, Mode::empty())
+        fs.open(USER, "/to_delete.txt", OFlags::RDONLY, Mode::empty())
             .is_err(),
         "file should no longer exist"
     );
 
     // Create a directory, then remove it
-    fs.mkdir(user, "/to_remove", Mode::RWXU)
+    fs.mkdir(USER, "/to_remove", Mode::RWXU)
         .expect("failed to mkdir");
-    fs.rmdir(user, "/to_remove")
+    fs.rmdir(USER, "/to_remove")
         .expect("failed to rmdir via 9P");
 
     // Verify the directory is gone on the host
@@ -359,15 +358,13 @@ fn test_nine_p_unlink_and_rmdir() {
 
 #[test]
 fn test_nine_p_file_status() {
-    let user = USER;
-
     let server = DiodServer::start();
     let fs = connect_9p(&server);
 
     // Create a file with known content
     let mut fd = fs
         .open(
-            user,
+            USER,
             "/status_test.txt",
             OFlags::CREAT | OFlags::WRONLY,
             Mode::RWXU,
@@ -379,38 +376,36 @@ fn test_nine_p_file_status() {
 
     // Check file_status via path
     let status = fs
-        .file_status(user, "/status_test.txt")
+        .file_status(USER, "/status_test.txt")
         .expect("failed to stat file");
     assert_eq!(
         status.file_type,
-        crate::fs::FileType::RegularFile,
+        FileType::RegularFile,
         "should be a regular file"
     );
     assert_eq!(status.size, 10, "file size should be 10 bytes");
 
     // Check directory status
-    fs.mkdir(user, "/stat_dir", Mode::RWXU).unwrap();
+    fs.mkdir(USER, "/stat_dir", Mode::RWXU).unwrap();
     let status = fs
-        .file_status(user, "/stat_dir")
+        .file_status(USER, "/stat_dir")
         .expect("failed to stat dir");
     assert_eq!(
         status.file_type,
-        crate::fs::FileType::Directory,
+        FileType::Directory,
         "should be a directory"
     );
 }
 
 #[test]
 fn test_nine_p_seek_and_partial_read() {
-    let user = USER;
-
     let server = DiodServer::start();
     let fs = connect_9p(&server);
 
     // Write a file with known content
     let mut fd = fs
         .open(
-            user,
+            USER,
             "/seek_test.txt",
             OFlags::CREAT | OFlags::WRONLY,
             Mode::RWXU,
@@ -421,12 +416,12 @@ fn test_nine_p_seek_and_partial_read() {
 
     // Open for reading and seek
     let mut fd = fs
-        .open(user, "/seek_test.txt", OFlags::RDONLY, Mode::empty())
+        .open(USER, "/seek_test.txt", OFlags::RDONLY, Mode::empty())
         .expect("failed to open file for reading");
 
     // Seek to offset 5
     let pos = fs
-        .seek(&mut fd, 5, crate::fs::SeekWhence::RelativeToBeginning)
+        .seek(&mut fd, 5, SeekWhence::RelativeToBeginning)
         .expect("failed to seek");
     assert_eq!(pos, 5);
 
@@ -442,15 +437,13 @@ fn test_nine_p_seek_and_partial_read() {
 
 #[test]
 fn test_nine_p_truncate() {
-    let user = USER;
-
     let server = DiodServer::start();
     let fs = connect_9p(&server);
 
     // Write a file
     let mut fd = fs
         .open(
-            user,
+            USER,
             "/trunc_test.txt",
             OFlags::CREAT | OFlags::RDWR,
             Mode::RWXU,
@@ -471,8 +464,6 @@ fn test_nine_p_truncate() {
 
 #[test]
 fn test_nine_p_host_files_visible() {
-    let user = USER;
-
     let server = DiodServer::start();
 
     // Pre-populate some files on the host side
@@ -488,7 +479,7 @@ fn test_nine_p_host_files_visible() {
 
     // Read file created on the host through 9P
     let mut fd = fs
-        .open(user, "/host_file.txt", OFlags::RDONLY, Mode::empty())
+        .open(USER, "/host_file.txt", OFlags::RDONLY, Mode::empty())
         .expect("failed to open host file via 9P");
     let mut buf = alloc::vec![0u8; 256];
     let n = fs.read(&NoDeviceIo, &mut fd, &mut buf, None).unwrap();
@@ -498,7 +489,7 @@ fn test_nine_p_host_files_visible() {
     // List host directory through 9P
     let fd = fs
         .open(
-            user,
+            USER,
             "/host_dir",
             OFlags::RDONLY | OFlags::DIRECTORY,
             Mode::empty(),
@@ -584,54 +575,35 @@ fn connect_9p_broken(server: &DiodServer, allowed_writes: usize) -> NinePFs<Brok
 /// breaks after the filesystem has been attached.
 #[test]
 fn test_nine_p_broken_open() {
-    let user = USER;
-
     let server = DiodServer::start();
     // 2 writes: version + attach. The next write (open's walk) will fail.
     let fs = connect_9p_broken(&server, 2);
 
-    let result = fs.open(user, "/anything.txt", OFlags::RDONLY, Mode::empty());
+    let result = fs.open(USER, "/anything.txt", OFlags::RDONLY, Mode::empty());
     assert!(matches!(result, Err(OpenError::Io)));
 }
 
 /// Creating a file should fail when the connection is broken.
 #[test]
 fn test_nine_p_broken_create() {
-    let user = USER;
-
     let server = DiodServer::start();
     let fs = connect_9p_broken(&server, 2);
 
-    let result = fs.open(user, "/new.txt", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU);
+    let result = fs.open(USER, "/new.txt", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU);
     assert!(matches!(result, Err(OpenError::Io)));
 }
 
 /// Reading from an fd obtained before the break should fail.
 #[test]
 fn test_nine_p_broken_read() {
-    let user = USER;
-
     let server = DiodServer::start();
 
-    // Pre-create a file via normal connection
-    {
-        let fs = connect_9p(&server);
-        let mut fd = fs
-            .open(
-                user,
-                "/read_me.txt",
-                OFlags::CREAT | OFlags::WRONLY,
-                Mode::RWXU,
-            )
-            .unwrap();
-        fs.write(&NoDeviceIo, &mut fd, b"data", None).unwrap();
-        drop(fd);
-    }
+    std::fs::write(server.export_path().join("read_me.txt"), b"data").unwrap();
 
     // 4 writes: version + attach + walk + lopen. Then read will fail.
     let fs = connect_9p_broken(&server, 4);
     let mut fd = fs
-        .open(user, "/read_me.txt", OFlags::RDONLY, Mode::empty())
+        .open(USER, "/read_me.txt", OFlags::RDONLY, Mode::empty())
         .expect("open should succeed before break");
 
     let mut buf = alloc::vec![0u8; 64];
@@ -642,8 +614,6 @@ fn test_nine_p_broken_read() {
 /// Writing to an fd obtained before the break should fail.
 #[test]
 fn test_nine_p_broken_write() {
-    let user = USER;
-
     let server = DiodServer::start();
 
     // 5 writes: version + attach + walk (which reports the file as missing) + the clone of the
@@ -651,7 +621,7 @@ fn test_nine_p_broken_write() {
     let fs = connect_9p_broken(&server, 5);
     let mut fd = fs
         .open(
-            user,
+            USER,
             "/write_me.txt",
             OFlags::CREAT | OFlags::WRONLY,
             Mode::RWXU,
@@ -665,26 +635,22 @@ fn test_nine_p_broken_write() {
 /// mkdir should fail when the connection is broken.
 #[test]
 fn test_nine_p_broken_mkdir() {
-    let user = USER;
-
     let server = DiodServer::start();
     let fs = connect_9p_broken(&server, 2);
 
-    let result = fs.mkdir(user, "/broken_dir", Mode::RWXU);
+    let result = fs.mkdir(USER, "/broken_dir", Mode::RWXU);
     assert!(matches!(result, Err(MkdirError::Io)));
 }
 
 /// readdir should fail when the connection breaks during the directory read.
 #[test]
 fn test_nine_p_broken_readdir() {
-    let user = USER;
-
     let server = DiodServer::start();
 
     // 4 writes: version + attach + walk + lopen for the directory.
     let fs = connect_9p_broken(&server, 4);
     let fd = fs
-        .open(user, "/", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+        .open(USER, "/", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
         .expect("open dir should succeed before break");
 
     let result = fs.read_dir(&fd);
@@ -694,85 +660,48 @@ fn test_nine_p_broken_readdir() {
 /// unlink should fail when the connection is broken.
 #[test]
 fn test_nine_p_broken_unlink() {
-    let user = USER;
-
     let server = DiodServer::start();
 
-    // Pre-create a file
-    {
-        let fs = connect_9p(&server);
-        let fd = fs
-            .open(
-                user,
-                "/to_unlink.txt",
-                OFlags::CREAT | OFlags::WRONLY,
-                Mode::RWXU,
-            )
-            .unwrap();
-        drop(fd);
-    }
+    std::fs::write(server.export_path().join("to_unlink.txt"), b"").unwrap();
 
     let fs = connect_9p_broken(&server, 2);
-    let result = fs.unlink(user, "/to_unlink.txt");
+    let result = fs.unlink(USER, "/to_unlink.txt");
     assert!(matches!(result, Err(UnlinkError::Io)));
 }
 
 /// rmdir should fail when the connection is broken.
 #[test]
 fn test_nine_p_broken_rmdir() {
-    let user = USER;
-
     let server = DiodServer::start();
 
-    // Pre-create a directory
-    {
-        let fs = connect_9p(&server);
-        fs.mkdir(user, "/to_rmdir", Mode::RWXU).unwrap();
-    }
+    std::fs::create_dir(server.export_path().join("to_rmdir")).unwrap();
 
     let fs = connect_9p_broken(&server, 2);
-    let result = fs.rmdir(user, "/to_rmdir");
+    let result = fs.rmdir(USER, "/to_rmdir");
     assert!(matches!(result, Err(RmdirError::Io)));
 }
 
 /// file_status should fail when the connection is broken.
 #[test]
 fn test_nine_p_broken_file_status() {
-    let user = USER;
-
     let server = DiodServer::start();
     let fs = connect_9p_broken(&server, 2);
 
-    let result = fs.file_status(user, "/");
+    let result = fs.file_status(USER, "/");
     assert!(matches!(result, Err(FileStatusError::Io)));
 }
 
 /// truncate should fail when the connection breaks after open.
 #[test]
 fn test_nine_p_broken_truncate() {
-    let user = USER;
-
     let server = DiodServer::start();
 
-    // Pre-create a file
-    {
-        let fs = connect_9p(&server);
-        let mut fd = fs
-            .open(
-                user,
-                "/to_trunc.txt",
-                OFlags::CREAT | OFlags::WRONLY,
-                Mode::RWXU,
-            )
-            .unwrap();
-        fs.write(&NoDeviceIo, &mut fd, b"some data", None).unwrap();
-        drop(fd);
-    }
+    std::fs::write(server.export_path().join("to_trunc.txt"), b"some data").unwrap();
 
     // 4 writes: version + attach + walk + lopen. Then truncate will fail.
     let fs = connect_9p_broken(&server, 4);
     let mut fd = fs
-        .open(user, "/to_trunc.txt", OFlags::RDWR, Mode::empty())
+        .open(USER, "/to_trunc.txt", OFlags::RDWR, Mode::empty())
         .expect("open should succeed before break");
 
     let result = fs.truncate(&mut fd, 0, true);
@@ -782,40 +711,23 @@ fn test_nine_p_broken_truncate() {
 /// seek (RelativeToEnd, which requires a getattr) should fail when broken.
 #[test]
 fn test_nine_p_broken_seek() {
-    let user = USER;
-
     let server = DiodServer::start();
 
-    // Pre-create a file
-    {
-        let fs = connect_9p(&server);
-        let mut fd = fs
-            .open(
-                user,
-                "/to_seek.txt",
-                OFlags::CREAT | OFlags::WRONLY,
-                Mode::RWXU,
-            )
-            .unwrap();
-        fs.write(&NoDeviceIo, &mut fd, b"data", None).unwrap();
-        drop(fd);
-    }
+    std::fs::write(server.export_path().join("to_seek.txt"), b"data").unwrap();
 
     // 4 writes: version + attach + walk + lopen. Then the getattr for seek will fail.
     let fs = connect_9p_broken(&server, 4);
     let mut fd = fs
-        .open(user, "/to_seek.txt", OFlags::RDONLY, Mode::empty())
+        .open(USER, "/to_seek.txt", OFlags::RDONLY, Mode::empty())
         .expect("open should succeed before break");
 
-    let result = fs.seek(&mut fd, -1, crate::fs::SeekWhence::RelativeToEnd);
+    let result = fs.seek(&mut fd, -1, SeekWhence::RelativeToEnd);
     assert!(matches!(result, Err(SeekError::Io)));
 }
 
 #[test]
 fn test_nine_p_deep_path_walk() {
     use core::fmt::Write as _;
-
-    let user = USER;
 
     let server = DiodServer::start();
     let fs = connect_9p(&server);
@@ -825,14 +737,14 @@ fn test_nine_p_deep_path_walk() {
     for i in 0..20 {
         path.push('/');
         write!(path, "d{i}").unwrap();
-        fs.mkdir(user, &path, Mode::RWXU)
+        fs.mkdir(USER, &path, Mode::RWXU)
             .expect("failed to mkdir deep path component");
     }
 
     // Create a file at the bottom
     let file_path = path.clone() + "/deep_file.txt";
     let mut fd = fs
-        .open(user, &file_path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+        .open(USER, &file_path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
         .expect("failed to create file in deep path");
     fs.write(&NoDeviceIo, &mut fd, b"deep content", None)
         .unwrap();
@@ -840,7 +752,7 @@ fn test_nine_p_deep_path_walk() {
 
     // Read it back
     let mut fd = fs
-        .open(user, &file_path, OFlags::RDONLY, Mode::empty())
+        .open(USER, &file_path, OFlags::RDONLY, Mode::empty())
         .expect("failed to open file in deep path");
     let mut buf = alloc::vec![0u8; 64];
     let n = fs.read(&NoDeviceIo, &mut fd, &mut buf, None).unwrap();
@@ -849,23 +761,21 @@ fn test_nine_p_deep_path_walk() {
 
     // Verify file_status works through the deep path
     let status = fs
-        .file_status(user, &file_path)
+        .file_status(USER, &file_path)
         .expect("failed to stat deep file");
-    assert_eq!(status.file_type, crate::fs::FileType::RegularFile);
+    assert_eq!(status.file_type, FileType::RegularFile);
     assert_eq!(status.size, 12);
 }
 
 #[test]
 fn test_nine_p_chmod() {
-    let user = USER;
-
     let server = DiodServer::start();
     let fs = connect_9p(&server);
 
     // Create a file
     let fd = fs
         .open(
-            user,
+            USER,
             "/chmod_test.txt",
             OFlags::CREAT | OFlags::WRONLY,
             Mode::RWXU,
@@ -874,7 +784,7 @@ fn test_nine_p_chmod() {
     drop(fd);
 
     // Change permissions to read-only for user
-    fs.chmod(user, "/chmod_test.txt", Mode::RUSR)
+    fs.chmod(USER, "/chmod_test.txt", Mode::RUSR)
         .expect("chmod failed");
 
     // Verify via host filesystem
@@ -889,7 +799,7 @@ fn test_nine_p_chmod() {
 
     // Also verify via 9P file_status
     let status = fs
-        .file_status(user, "/chmod_test.txt")
+        .file_status(USER, "/chmod_test.txt")
         .expect("file_status failed");
     assert!(status.mode.contains(Mode::RUSR), "mode should contain RUSR");
     assert!(
@@ -900,15 +810,13 @@ fn test_nine_p_chmod() {
 
 #[test]
 fn test_nine_p_chown() {
-    let user = USER;
-
     let server = DiodServer::start();
     let fs = connect_9p(&server);
 
     // Create a file
     let fd = fs
         .open(
-            user,
+            USER,
             "/chown_test.txt",
             OFlags::CREAT | OFlags::WRONLY,
             Mode::RWXU,
@@ -918,12 +826,12 @@ fn test_nine_p_chown() {
 
     // Get current ownership
     let status_before = fs
-        .file_status(user, "/chown_test.txt")
+        .file_status(USER, "/chown_test.txt")
         .expect("file_status failed");
 
     // Change group to the same value (chown to a different uid/gid requires root)
     fs.chown(
-        user,
+        USER,
         "/chown_test.txt",
         Some(status_before.owner.user),
         Some(status_before.owner.group),
@@ -932,23 +840,21 @@ fn test_nine_p_chown() {
 
     // Verify ownership hasn't changed
     let status_after = fs
-        .file_status(user, "/chown_test.txt")
+        .file_status(USER, "/chown_test.txt")
         .expect("file_status failed after chown");
     assert_eq!(status_after.owner.user, status_before.owner.user);
     assert_eq!(status_after.owner.group, status_before.owner.group);
 }
 
 #[test]
-fn test_nine_p_fd_file_status() {
-    let user = USER;
-
+fn test_nine_p_handle_status() {
     let server = DiodServer::start();
     let fs = connect_9p(&server);
 
     // Create a file with known content
     let mut fd = fs
         .open(
-            user,
+            USER,
             "/fd_stat_test.txt",
             OFlags::CREAT | OFlags::WRONLY,
             Mode::RWXU,
@@ -958,30 +864,28 @@ fn test_nine_p_fd_file_status() {
         .unwrap();
     drop(fd);
 
-    // Open the file and check fd_file_status
+    // Open the file and check the open-handle status
     let fd = fs
-        .open(user, "/fd_stat_test.txt", OFlags::RDONLY, Mode::empty())
+        .open(USER, "/fd_stat_test.txt", OFlags::RDONLY, Mode::empty())
         .expect("failed to open file");
 
-    let status = fs.handle_status(&fd).expect("fd_file_status failed");
-    assert_eq!(status.file_type, crate::fs::FileType::RegularFile);
+    let status = fs.handle_status(&fd).expect("handle status failed");
+    assert_eq!(status.file_type, FileType::RegularFile);
     assert_eq!(status.size, 13, "file size should be 13 bytes");
 
-    // Also check fd_file_status on a directory
+    // Also check the handle status on a directory
     drop(fd);
 
     let fd = fs
-        .open(user, "/", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+        .open(USER, "/", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
         .expect("failed to open root dir");
-    let status = fs.handle_status(&fd).expect("fd_file_status on dir failed");
-    assert_eq!(status.file_type, crate::fs::FileType::Directory);
+    let status = fs.handle_status(&fd).expect("handle status on dir failed");
+    assert_eq!(status.file_type, FileType::Directory);
     drop(fd);
 }
 
 #[test]
 fn test_nine_p_large_read_write() {
-    let user = USER;
-
     let server = DiodServer::start();
     let fs = connect_9p(&server);
 
@@ -995,7 +899,7 @@ fn test_nine_p_large_read_write() {
 
     let mut fd = fs
         .open(
-            user,
+            USER,
             "/large_test.bin",
             OFlags::CREAT | OFlags::RDWR,
             Mode::RWXU,
@@ -1017,7 +921,7 @@ fn test_nine_p_large_read_write() {
 
     // Read it all back
     let mut fd = fs
-        .open(user, "/large_test.bin", OFlags::RDONLY, Mode::empty())
+        .open(USER, "/large_test.bin", OFlags::RDONLY, Mode::empty())
         .expect("failed to open file for reading");
 
     let mut read_buf = alloc::vec![0u8; data_size];
@@ -1039,14 +943,12 @@ fn test_nine_p_large_read_write() {
 
 #[test]
 fn test_nine_p_explicit_offset_read_write() {
-    let user = USER;
-
     let server = DiodServer::start();
     let fs = connect_9p(&server);
 
     let mut fd = fs
         .open(
-            user,
+            USER,
             "/offset_test.txt",
             OFlags::CREAT | OFlags::RDWR,
             Mode::RWXU,
@@ -1075,7 +977,7 @@ fn test_nine_p_explicit_offset_read_write() {
 
     // Now test explicit offset reads
     let mut fd = fs
-        .open(user, "/offset_test.txt", OFlags::RDONLY, Mode::empty())
+        .open(USER, "/offset_test.txt", OFlags::RDONLY, Mode::empty())
         .expect("failed to open for reading");
 
     // Read 5 bytes at explicit offset 5 → "BBBBB"

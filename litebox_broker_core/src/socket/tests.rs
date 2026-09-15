@@ -3,7 +3,6 @@
 
 use super::*;
 use crate::readiness::tests::TestReadinessSink;
-use crate::test_support::TestBrokerCoreBuilder;
 use crate::{BrokerCore, CallerCredential};
 use litebox_broker_protocol::socket::{AddressFamily, IpProtocol, SocketType};
 use std::net::Ipv4Addr;
@@ -1316,14 +1315,24 @@ fn test_broker_with_policy(
     socket_provider: Arc<dyn SocketProvider>,
     socket_policy: &crate::SocketPolicy,
 ) -> BrokerCore {
-    TestBrokerCoreBuilder::new(
-        crate::PolicyEngine::with_unauthenticated_rights(crate::ObjectRights::all())
-            .with_socket_policy(*socket_policy),
-    )
-    .with_limits(crate::BrokerCoreLimits::new_with_all_limits(16, 4, 8, 8))
-    .with_socket_provider(socket_provider)
-    .build()
-    .unwrap()
+    BrokerCore {
+        policy: Arc::new(
+            crate::PolicyEngine::with_unauthenticated_rights(crate::ObjectRights::all())
+                .with_socket_policy(*socket_policy),
+        ),
+        limits: crate::BrokerCoreLimits::new_with_all_limits(16, 4, 8, 8),
+        next_session_id: Arc::new(spin::RwLock::new(1)),
+        next_reference_handle: Arc::new(spin::RwLock::new(1)),
+        references: Arc::new(spin::RwLock::new(hashbrown::HashMap::new())),
+        pending_references: Arc::new(AtomicUsize::new(0)),
+        reserved_pipe_capacity: Arc::new(AtomicUsize::new(0)),
+        reserved_sockets: Arc::new(AtomicUsize::new(0)),
+        random_provider: Arc::new(crate::random::TestRandomProvider),
+        stdio_provider: Arc::new(crate::stdio::UnsupportedStdioProvider),
+        socket_provider,
+        fs: Arc::new(crate::fs::UnsupportedFileService),
+        socket_ports: BrokerSocketPorts::default(),
+    }
 }
 
 pub(crate) fn check_socket_lifecycle(broker: &BrokerCore, provider: &TestSocketProvider) {

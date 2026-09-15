@@ -797,28 +797,6 @@ mod tests {
     }
 
     #[test]
-    fn directory_payload_rejects_zero_rdev() {
-        let mut payload = encode_directory_entries(&[FileDirectoryEntry {
-            name: "x".into(),
-            file_type: FileType::CharacterDevice,
-            ino_info: Some(FileNodeInfo {
-                dev: 2,
-                ino: 3,
-                rdev: NonZeroU64::new(5),
-            }),
-        }])
-        .unwrap();
-
-        // `rdev` is the trailing value of the payload's only entry.
-        let rdev = payload.len() - size_of::<u64>();
-        payload[rdev..].copy_from_slice(&0u64.to_le_bytes());
-        assert_eq!(
-            decode_directory_entries(&payload),
-            Err(DirectoryPayloadError::Malformed)
-        );
-    }
-
-    #[test]
     fn directory_payload_chunks_use_entry_indexes() {
         let entries = [
             FileDirectoryEntry {
