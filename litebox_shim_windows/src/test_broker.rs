@@ -24,7 +24,7 @@ use litebox_broker_core::{
     test_support::TestBrokerCoreBuilder,
 };
 use litebox_broker_host::test_support::{InProcessBrokerSetup, shared_memory};
-use litebox_broker_local::{BrokerLocal, test_support::broker_local};
+use litebox_broker_local::{BrokerLocal, test_support::test_broker_local_with_process_id};
 use litebox_broker_protocol::message::{BrokerOperation, BrokerRequest, BrokerResponse};
 use litebox_broker_transport::channel::LocalCallChannel;
 
@@ -45,7 +45,7 @@ pub(crate) fn litebox(
         .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let process_id = process.id();
-    let broker_local = broker_local(
+    let broker_local = test_broker_local_with_process_id(
         ObjectlessChannel {
             process: Some(process),
         },

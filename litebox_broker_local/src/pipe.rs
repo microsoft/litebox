@@ -143,7 +143,7 @@ mod tests {
     use litebox_broker_transport::channel::LocalCallChannel;
     use litebox_broker_transport::shared_memory::{SharedMemory, SharedMemoryError};
 
-    use crate::test_support::broker_local;
+    use crate::test_support::test_broker_local;
 
     #[test]
     fn pipe_uses_the_sequence_slot_for_data_operations() {
@@ -158,11 +158,7 @@ mod tests {
             BrokerResult::Pipe(PipeResponse::Write(WritePipeResponse { written: 2 })),
             BrokerResult::Pipe(PipeResponse::Read(ReadPipeResponse { read: 2 })),
         ]);
-        let local = broker_local(
-            channel,
-            litebox_broker_protocol::ProcessId(1),
-            memory.clone(),
-        );
+        let local = test_broker_local(channel, memory.clone());
         let write_buffer = sequence(2, 3);
         let read_buffer = sequence(4, 3);
 
@@ -211,7 +207,7 @@ mod tests {
     fn pipe_rejects_oversized_transfers_before_request() {
         let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
         let channel = ScriptedChannel::new([]);
-        let local = broker_local(channel, litebox_broker_protocol::ProcessId(1), memory);
+        let local = test_broker_local(channel, memory);
         let oversized = sequence(0, MAX_PIPE_TRANSFER_SIZE + 1);
 
         assert!(matches!(
@@ -237,7 +233,7 @@ mod tests {
                 read: 2,
             }))]);
         let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
-        let local = broker_local(channel, litebox_broker_protocol::ProcessId(1), memory);
+        let local = test_broker_local(channel, memory);
         let mut destination = [0];
 
         let _ = local.read_pipe(ObjectHandle(1), sequence(0, 1), &mut destination);
@@ -251,7 +247,7 @@ mod tests {
                 written: 2,
             }))]);
         let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
-        let local = broker_local(channel, litebox_broker_protocol::ProcessId(1), memory);
+        let local = test_broker_local(channel, memory);
 
         let _ = local.write_pipe(ObjectHandle(1), sequence(0, 1), &[0]);
     }

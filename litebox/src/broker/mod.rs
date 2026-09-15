@@ -917,7 +917,7 @@ mod tests {
     use litebox_broker_transport::channel::LocalCallChannel;
     use litebox_broker_transport::shared_memory::{SharedMemory, SharedMemoryError};
 
-    use litebox_broker_local::test_support::broker_local;
+    use litebox_broker_local::test_support::test_broker_local;
 
     use crate::platform::mock::MockPlatform;
 
@@ -931,11 +931,7 @@ mod tests {
             observed_sender,
             release: StdArc::clone(&release),
         };
-        let local = broker_local(
-            channel,
-            litebox_broker_protocol::ProcessId(1),
-            Arc::new(memory),
-        );
+        let local = test_broker_local(channel, Arc::new(memory));
         let control = Arc::new(BrokerLocalControl::<MockPlatform, _>::new(
             local,
             Arc::new(BrokerPollableRegistry::new()),
@@ -978,11 +974,7 @@ mod tests {
             observed_sender,
             release: StdArc::clone(&release),
         };
-        let local = broker_local(
-            channel,
-            litebox_broker_protocol::ProcessId(1),
-            Arc::new(memory),
-        );
+        let local = test_broker_local(channel, Arc::new(memory));
         let control = Arc::new(BrokerLocalControl::<MockPlatform, _>::new(
             local,
             Arc::new(BrokerPollableRegistry::new()),
