@@ -754,11 +754,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         let Some(thread) = self.thread.new_thread(child_tid) else {
             let thread_id = broker_thread.id();
-            if let Err(error) = broker_thread.finish() {
+            if let Err(error) = broker_thread.exit() {
                 litebox_util_log::error!(
                     error:% = error,
                     thread_id = thread_id.get();
-                    "failed to roll back broker thread"
+                    "failed to record broker thread exit during rollback"
                 );
             }
             return Err(Errno::EBUSY);
@@ -801,11 +801,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 .take()
                 .expect("failed host spawn must return the thread lifecycle");
             let thread_id = broker_thread.id();
-            if let Err(error) = broker_thread.finish() {
+            if let Err(error) = broker_thread.exit() {
                 litebox_util_log::error!(
                     error:% = error,
                     thread_id = thread_id.get();
-                    "failed to roll back broker thread"
+                    "failed to record broker thread exit during rollback"
                 );
             }
             // Treat all spawn errors as `ENOMEM`. `EAGAIN` and other errors are

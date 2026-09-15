@@ -492,12 +492,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .expect("new broker thread missing")
             .id()
             .get() as usize;
-        let mut finish_thread = || {
+        let mut rollback_thread = || {
             let broker_thread = broker_thread
                 .take()
                 .expect("broker thread rollback must run only once");
             let broker_thread_id = broker_thread.id();
-            if let Err(error) = broker_thread.finish() {
+            if let Err(error) = broker_thread.exit() {
                 litebox_util_log::error!(
                     error:% = error,
                     thread_id = broker_thread_id.get();
@@ -518,7 +518,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             Ok(environment) => environment,
             Err(error) => {
                 litebox_util_log::error!(error:% = error; "Failed to create Windows thread environment");
-                finish_thread();
+                rollback_thread();
                 return NtStatus::NO_MEMORY;
             }
         };
@@ -532,7 +532,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .write_at_offset(0, initial_context)
             .is_none()
         {
-            finish_thread();
+            rollback_thread();
             return NtStatus::ACCESS_VIOLATION;
         }
         let mut child_ctx = ctx.clone();
@@ -551,7 +551,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         );
         if !self.process.attach_thread(thread_id, &thread) {
             // The process is tearing down; refuse to start another thread.
-            finish_thread();
+            rollback_thread();
             return NtStatus::PROCESS_IS_TERMINATING;
         }
         let granted_access = ThreadAccess::from_desired_access(desired_access);
@@ -565,7 +565,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             Ok(handle) => handle,
             Err(status) => {
                 self.process.detach_thread(thread_id);
-                finish_thread();
+                rollback_thread();
                 return status;
             }
         };
@@ -602,7 +602,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 .take()
                 .expect("failed host spawn must return the thread lifecycle");
             let broker_thread_id = broker_thread.id();
-            if let Err(error) = broker_thread.finish() {
+            if let Err(error) = broker_thread.exit() {
                 litebox_util_log::error!(
                     error:% = error,
                     thread_id = broker_thread_id.get();

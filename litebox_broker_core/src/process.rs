@@ -183,8 +183,8 @@ impl BrokerProcess {
         Ok(thread_id)
     }
 
-    /// Finishes a broker thread after its local task teardown completes.
-    pub fn finish_thread(&self, thread_id: ThreadId) -> Result<()> {
+    /// Records broker thread exit after its local task teardown completes.
+    pub fn exit_thread(&self, thread_id: ThreadId) -> Result<()> {
         let reservation = self
             .thread_ids
             .lock()
@@ -837,7 +837,7 @@ mod tests {
             .unwrap();
         let first = process.create_thread().unwrap();
 
-        process.finish_thread(first).unwrap();
+        process.exit_thread(first).unwrap();
 
         assert_eq!(process.create_thread().unwrap(), first);
     }
@@ -857,11 +857,8 @@ mod tests {
             .unwrap();
         let thread = first.create_thread().unwrap();
 
-        assert_eq!(
-            second.finish_thread(thread),
-            Err(BrokerError::UnknownObject)
-        );
-        assert_eq!(first.finish_thread(thread), Ok(()));
+        assert_eq!(second.exit_thread(thread), Err(BrokerError::UnknownObject));
+        assert_eq!(first.exit_thread(thread), Ok(()));
     }
 
     #[test]
@@ -887,9 +884,9 @@ mod tests {
         assert_eq!(first.create_thread(), Err(BrokerError::ResourceExhausted));
         assert_eq!(third.create_thread(), Err(BrokerError::ResourceExhausted));
 
-        first.finish_thread(first_thread).unwrap();
+        first.exit_thread(first_thread).unwrap();
         assert!(third.create_thread().is_ok());
-        second.finish_thread(second_thread).unwrap();
+        second.exit_thread(second_thread).unwrap();
     }
 
     #[test]

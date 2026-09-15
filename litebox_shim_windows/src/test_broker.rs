@@ -123,10 +123,10 @@ impl LocalCallChannel for ObjectlessChannel {
                 |error| litebox_broker_protocol::message::BrokerResult::Error(error.into()),
                 litebox_broker_protocol::message::BrokerResult::ThreadCreated,
             ),
-            BrokerOperation::FinishThread(thread_id) => {
-                self.process().finish_thread(thread_id).map_or_else(
+            BrokerOperation::ExitThread(thread_id) => {
+                self.process().exit_thread(thread_id).map_or_else(
                     |error| litebox_broker_protocol::message::BrokerResult::Error(error.into()),
-                    |()| litebox_broker_protocol::message::BrokerResult::ThreadFinished,
+                    |()| litebox_broker_protocol::message::BrokerResult::ThreadExited,
                 )
             }
             BrokerOperation::File(request) => panic!(

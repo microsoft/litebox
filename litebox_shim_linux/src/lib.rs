@@ -1217,11 +1217,11 @@ impl<Platform: ShimPlatform> Drop for Task<Platform> {
         self.prepare_for_exit();
         if let Some(thread) = self.broker_thread.take() {
             let thread_id = thread.id();
-            if let Err(error) = thread.finish() {
+            if let Err(error) = thread.exit() {
                 litebox_util_log::error!(
                     error:% = error,
                     thread_id = thread_id.get();
-                    "failed to finish broker thread"
+                    "failed to record broker thread exit"
                 );
             }
         }
@@ -1271,7 +1271,7 @@ mod test_utils {
             let tid = i32::try_from(broker_thread.id().get())
                 .expect("the checked broker thread ID must fit Linux pid_t");
             let Some(thread) = self.thread.new_thread(tid) else {
-                let _ = broker_thread.finish();
+                let _ = broker_thread.exit();
                 return None;
             };
             let task = Task {

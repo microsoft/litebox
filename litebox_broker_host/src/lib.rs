@@ -363,9 +363,9 @@ fn handle_request<Memory: SharedMemory>(
             .create_thread()
             .map(BrokerResult::ThreadCreated)
             .map_err(RequestFailure::from),
-        BrokerOperation::FinishThread(thread_id) => process
-            .finish_thread(thread_id)
-            .map(|()| BrokerResult::ThreadFinished)
+        BrokerOperation::ExitThread(thread_id) => process
+            .exit_thread(thread_id)
+            .map(|()| BrokerResult::ThreadExited)
             .map_err(RequestFailure::from),
         BrokerOperation::CloseObject(handle) => process
             .close_object_reference(handle)
@@ -2052,11 +2052,11 @@ mod tests {
         };
         assert_ne!(thread_id.get(), process.id().get());
         assert_eq!(
-            handle_test_request(&process, BrokerOperation::FinishThread(thread_id)),
-            BrokerResult::ThreadFinished
+            handle_test_request(&process, BrokerOperation::ExitThread(thread_id)),
+            BrokerResult::ThreadExited
         );
         assert_eq!(
-            handle_test_request(&process, BrokerOperation::FinishThread(thread_id)),
+            handle_test_request(&process, BrokerOperation::ExitThread(thread_id)),
             BrokerResult::Error(ErrorCode::UnknownObject)
         );
     }
