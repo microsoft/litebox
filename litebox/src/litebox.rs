@@ -6,33 +6,15 @@
 use alloc::sync::Arc;
 
 use litebox_broker_local::BrokerLocal;
-use litebox_broker_protocol::ThreadId;
 use litebox_broker_protocol::message::BrokerNotification;
 use litebox_broker_transport::channel::LocalCallChannel;
 use litebox_platform::time::TimeProvider;
 
 use crate::{
-    broker::{self, error::BrokerControlError},
+    broker,
     fd::Descriptors,
     sync::{RawSyncPrimitivesProvider, RwLock},
 };
-
-/// Error returned while managing a broker-assigned thread ID.
-#[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq)]
-pub enum ThreadIdError {
-    /// This LiteBox instance has no broker association.
-    #[error("thread ID allocation requires a broker")]
-    BrokerRequired,
-    /// The broker association is no longer usable.
-    #[error("broker association failed")]
-    AssociationFailed,
-    /// The broker cannot allocate another thread ID.
-    #[error("thread ID capacity is exhausted")]
-    ResourceExhausted,
-    /// The thread ID is not owned by this process.
-    #[error("unknown thread ID")]
-    UnknownThread,
-}
 
 /// A full LiteBox system.
 ///
@@ -47,22 +29,6 @@ pub struct LiteBox<Platform: RawSyncPrimitivesProvider> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
-    /// Allocates a globally unique thread ID owned by this process.
-    pub fn allocate_thread_id(&self) -> Result<ThreadId, ThreadIdError> {
-        let broker = self.broker_control().ok_or(ThreadIdError::BrokerRequired)?;
-        broker
-            .allocate_thread_id()
-            .map_err(Self::map_thread_id_error)
-    }
-
-    /// Releases a thread ID previously allocated by this process.
-    pub fn release_thread_id(&self, thread_id: ThreadId) -> Result<(), ThreadIdError> {
-        let broker = self.broker_control().ok_or(ThreadIdError::BrokerRequired)?;
-        broker
-            .release_thread_id(thread_id)
-            .map_err(Self::map_thread_id_error)
-    }
-
     /// Create a new (empty) [`LiteBox`] instance for the given `platform`.
     ///
     /// # Panics
@@ -75,22 +41,6 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
             None,
             Arc::new(broker::BrokerPollableRegistry::new()),
         )
-    }
-
-    fn map_thread_id_error(error: BrokerControlError) -> ThreadIdError {
-        match error {
-            BrokerControlError::AssociationFailed => ThreadIdError::AssociationFailed,
-            BrokerControlError::Broker(
-                litebox_broker_protocol::error::ErrorCode::ResourceExhausted
-                | litebox_broker_protocol::error::ErrorCode::OutOfMemory,
-            ) => ThreadIdError::ResourceExhausted,
-            BrokerControlError::Broker(
-                litebox_broker_protocol::error::ErrorCode::UnknownObject,
-            ) => ThreadIdError::UnknownThread,
-            BrokerControlError::Broker(error) => {
-                panic!("broker returned unexpected thread-ID error: {error}")
-            }
-        }
     }
 
     /// Create a new [`LiteBox`] instance with a negotiated broker-local control adapter installed.

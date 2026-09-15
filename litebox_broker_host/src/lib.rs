@@ -359,13 +359,13 @@ fn handle_request<Memory: SharedMemory>(
     readiness_sink: &Arc<dyn ReadinessSink>,
 ) -> RequestResult<BrokerResult> {
     match operation {
-        BrokerOperation::AllocateThreadId => process
-            .allocate_thread_id()
-            .map(BrokerResult::ThreadIdAllocated)
+        BrokerOperation::CreateThread => process
+            .create_thread()
+            .map(BrokerResult::ThreadCreated)
             .map_err(RequestFailure::from),
-        BrokerOperation::ReleaseThreadId(thread_id) => process
-            .release_thread_id(thread_id)
-            .map(|()| BrokerResult::ThreadIdReleased)
+        BrokerOperation::FinishThread(thread_id) => process
+            .finish_thread(thread_id)
+            .map(|()| BrokerResult::ThreadFinished)
             .map_err(RequestFailure::from),
         BrokerOperation::CloseObject(handle) => process
             .close_object_reference(handle)
@@ -2046,17 +2046,17 @@ mod tests {
         let process = broker
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
-        let response = handle_test_request(&process, BrokerOperation::AllocateThreadId);
-        let BrokerResult::ThreadIdAllocated(thread_id) = response else {
+        let response = handle_test_request(&process, BrokerOperation::CreateThread);
+        let BrokerResult::ThreadCreated(thread_id) = response else {
             panic!("unexpected thread-ID allocation response: {response:?}");
         };
         assert_ne!(thread_id.get(), process.id().get());
         assert_eq!(
-            handle_test_request(&process, BrokerOperation::ReleaseThreadId(thread_id)),
-            BrokerResult::ThreadIdReleased
+            handle_test_request(&process, BrokerOperation::FinishThread(thread_id)),
+            BrokerResult::ThreadFinished
         );
         assert_eq!(
-            handle_test_request(&process, BrokerOperation::ReleaseThreadId(thread_id)),
+            handle_test_request(&process, BrokerOperation::FinishThread(thread_id)),
             BrokerResult::Error(ErrorCode::UnknownObject)
         );
     }

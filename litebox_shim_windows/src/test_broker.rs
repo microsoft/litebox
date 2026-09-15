@@ -42,7 +42,7 @@ use crate::tests::TestPlatform;
 /// Returns a LiteBox whose broker association serves no objects.
 ///
 /// The association negotiates the protocol and owns real shared memory, so the local side of the
-/// boundary behaves normally, but object requests panic. Process and thread ID operations are
+/// boundary behaves normally, but object requests panic. Process and thread lifecycle operations are
 /// handled by a real broker core.
 pub(crate) fn litebox(
     platform: &'static TestPlatform,
@@ -119,14 +119,14 @@ impl LocalCallChannel for ObjectlessChannel {
 
     fn call(&self, request: BrokerRequest) -> core::result::Result<BrokerResponse, Self::Error> {
         let result = match request.operation {
-            BrokerOperation::AllocateThreadId => self.process().allocate_thread_id().map_or_else(
+            BrokerOperation::CreateThread => self.process().create_thread().map_or_else(
                 |error| litebox_broker_protocol::message::BrokerResult::Error(error.into()),
-                litebox_broker_protocol::message::BrokerResult::ThreadIdAllocated,
+                litebox_broker_protocol::message::BrokerResult::ThreadCreated,
             ),
-            BrokerOperation::ReleaseThreadId(thread_id) => {
-                self.process().release_thread_id(thread_id).map_or_else(
+            BrokerOperation::FinishThread(thread_id) => {
+                self.process().finish_thread(thread_id).map_or_else(
                     |error| litebox_broker_protocol::message::BrokerResult::Error(error.into()),
-                    |()| litebox_broker_protocol::message::BrokerResult::ThreadIdReleased,
+                    |()| litebox_broker_protocol::message::BrokerResult::ThreadFinished,
                 )
             }
             BrokerOperation::File(request) => panic!(
