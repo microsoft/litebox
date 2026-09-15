@@ -124,7 +124,7 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
     let shim_builder =
         litebox_shim_linux::LinuxShimBuilder::new_with_litebox(platform, litebox, process_id);
     let task_params = litebox_common_linux::TaskParams {
-        pid: process_id.get().try_into().unwrap(),
+        pid: process_id.0.try_into().unwrap(),
         ppid: 0,
         uid: u32::from(DEFAULT_GUEST_UID),
         euid: u32::from(DEFAULT_GUEST_UID),

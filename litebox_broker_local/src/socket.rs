@@ -309,7 +309,7 @@ mod tests {
         ) -> core::result::Result<Option<BrokerHandshakeResponse>, Self::Error> {
             Ok(Some(BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: litebox_broker_protocol::BROKER_PROTOCOL_VERSION,
-                process_id: litebox_broker_protocol::ProcessId::new(1).unwrap(),
+                process_id: litebox_broker_protocol::ProcessId(1),
             }))
         }
     }

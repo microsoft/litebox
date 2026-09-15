@@ -335,7 +335,7 @@ mod tests {
     use std::sync::Mutex;
 
     fn test_process_id() -> ProcessId {
-        ProcessId::new(1).unwrap()
+        ProcessId(1)
     }
 
     #[test]
@@ -392,7 +392,7 @@ mod tests {
 
     #[test]
     fn create_thread_sends_request_and_returns_id() {
-        let thread_id = ThreadId::new(7).unwrap();
+        let thread_id = ThreadId(7);
         let channel = FakeControlChannel::new(None, Some(BrokerResult::ThreadCreated(thread_id)));
         let local = BrokerLocal {
             process_id: test_process_id(),
@@ -413,7 +413,7 @@ mod tests {
 
     #[test]
     fn exit_thread_sends_owned_id() {
-        let thread_id = ThreadId::new(7).unwrap();
+        let thread_id = ThreadId(7);
         let channel = FakeControlChannel::new(None, Some(BrokerResult::ThreadExited));
         let local = BrokerLocal {
             process_id: test_process_id(),

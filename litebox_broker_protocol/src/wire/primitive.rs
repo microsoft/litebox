@@ -41,11 +41,11 @@ impl Encoder {
     }
 
     pub(super) fn process_id(&mut self, process_id: ProcessId) {
-        self.u32(process_id.get());
+        self.u32(process_id.0);
     }
 
     pub(super) fn thread_id(&mut self, thread_id: ThreadId) {
-        self.u32(thread_id.get());
+        self.u32(thread_id.0);
     }
 
     pub(super) fn handle(&mut self, handle: ObjectHandle) {
@@ -111,11 +111,11 @@ impl<'a> Decoder<'a> {
     }
 
     pub(super) fn process_id(&mut self) -> Result<ProcessId, WireError> {
-        ProcessId::new(self.u32()?).ok_or(WireError::InvalidTag)
+        Ok(ProcessId(self.u32()?))
     }
 
     pub(super) fn thread_id(&mut self) -> Result<ThreadId, WireError> {
-        ThreadId::new(self.u32()?).ok_or(WireError::InvalidTag)
+        Ok(ThreadId(self.u32()?))
     }
 
     pub(super) fn handle(&mut self) -> Result<ObjectHandle, WireError> {

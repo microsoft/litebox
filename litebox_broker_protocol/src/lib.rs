@@ -28,58 +28,21 @@ pub mod socket;
 pub mod stdio;
 pub mod wire;
 
-/// Highest numeric process or thread identity allocated by the broker.
+/// Guest process ID carried by broker protocol messages.
 ///
-/// Linux reserves the next value, `0x3fff_ffff`, as its futex TID mask. uLiteBox
-/// uses that reserved value for the synthetic Windows CSR server identity and
-/// never allocates it to a guest process or thread.
-pub const MAX_ALLOCATED_ID: u32 = 0x3fff_fffe;
-
-/// Broker-assigned guest process ID.
+/// The broker core owns allocation and validity rules; the protocol preserves
+/// the numeric value without applying semantic checks.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ProcessId(u32);
+pub struct ProcessId(pub u32);
 
-impl ProcessId {
-    /// Creates a checked broker process ID.
-    #[must_use]
-    pub const fn new(value: u32) -> Option<Self> {
-        if value > 0 && value <= MAX_ALLOCATED_ID {
-            Some(Self(value))
-        } else {
-            None
-        }
-    }
-
-    /// Returns the guest-visible numeric identity.
-    #[must_use]
-    pub const fn get(self) -> u32 {
-        self.0
-    }
-}
-
-/// Broker-assigned guest thread ID.
+/// Guest thread ID carried by broker protocol messages.
+///
+/// The broker core owns allocation and validity rules; the protocol preserves
+/// the numeric value without applying semantic checks.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ThreadId(u32);
-
-impl ThreadId {
-    /// Creates a checked broker thread identity.
-    #[must_use]
-    pub const fn new(value: u32) -> Option<Self> {
-        if value > 0 && value <= MAX_ALLOCATED_ID {
-            Some(Self(value))
-        } else {
-            None
-        }
-    }
-
-    /// Returns the guest-visible numeric identity.
-    #[must_use]
-    pub const fn get(self) -> u32 {
-        self.0
-    }
-}
+pub struct ThreadId(pub u32);
 
 /// Opaque broker object reference handle.
 #[repr(transparent)]
@@ -98,28 +61,3 @@ pub struct ProtocolVersion(pub u16);
 
 /// Current broker protocol version.
 pub const BROKER_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(2);
-
-#[cfg(test)]
-mod tests {
-    use super::{MAX_ALLOCATED_ID, ProcessId, ThreadId};
-
-    #[test]
-    fn process_id_checks_allocatable_range() {
-        assert_eq!(ProcessId::new(0), None);
-        assert_eq!(
-            ProcessId::new(MAX_ALLOCATED_ID).map(ProcessId::get),
-            Some(MAX_ALLOCATED_ID)
-        );
-        assert_eq!(ProcessId::new(MAX_ALLOCATED_ID + 1), None);
-    }
-
-    #[test]
-    fn thread_id_checks_allocatable_range() {
-        assert_eq!(ThreadId::new(0), None);
-        assert_eq!(
-            ThreadId::new(MAX_ALLOCATED_ID).map(ThreadId::get),
-            Some(MAX_ALLOCATED_ID)
-        );
-        assert_eq!(ThreadId::new(MAX_ALLOCATED_ID + 1), None);
-    }
-}

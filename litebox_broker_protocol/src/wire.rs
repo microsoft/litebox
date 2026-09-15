@@ -500,18 +500,18 @@ mod tests {
         IsTerminalStdioRequest, IsTerminalStdioResponse, ReadStdioRequest, ReadStdioResponse,
         StdioOutputStream, StdioStream, WriteStdioRequest, WriteStdioResponse,
     };
-    use crate::{MAX_ALLOCATED_ID, ObjectHandle, ProcessId, ProtocolVersion, RequestId, ThreadId};
+    use crate::{ObjectHandle, ProcessId, ProtocolVersion, RequestId, ThreadId};
     use core::net::{Ipv4Addr, SocketAddrV4};
     use core::num::NonZeroU64;
 
     const TEST_REQUEST_ID: RequestId = RequestId(0x0102_0304_0506_0708);
 
     fn process_id(id: u32) -> ProcessId {
-        ProcessId::new(id).unwrap()
+        ProcessId(id)
     }
 
     fn thread_id(id: u32) -> ThreadId {
-        ThreadId::new(id).unwrap()
+        ThreadId(id)
     }
 
     fn sequence(slot_index: u32, length: u32) -> SharedBufferSequence {
@@ -973,6 +973,16 @@ mod tests {
                 request
             );
         }
+        for thread_id in [ThreadId(0), ThreadId(u32::MAX)] {
+            let request = BrokerRequest {
+                request_id: TEST_REQUEST_ID,
+                operation: BrokerOperation::ExitThread(thread_id),
+            };
+            assert_eq!(
+                decode_request(&encode_request(request.clone())).unwrap(),
+                request
+            );
+        }
     }
 
     #[test]
@@ -1177,6 +1187,16 @@ mod tests {
                 response
             );
         }
+        for thread_id in [ThreadId(0), ThreadId(u32::MAX)] {
+            let response = BrokerResponse {
+                request_id: TEST_REQUEST_ID,
+                result: BrokerResult::ThreadCreated(thread_id),
+            };
+            assert_eq!(
+                decode_response(&encode_response(response.clone())).unwrap(),
+                response
+            );
+        }
     }
 
     #[test]
@@ -1246,15 +1266,6 @@ mod tests {
             decode_request(&[REQUEST_TAG_EVENT, 0, 0, 0, 0, 0, 0, 0]),
             Err(WireError::TruncatedFrame)
         );
-        for invalid_thread_id in [0, MAX_ALLOCATED_ID + 1] {
-            let mut frame = encode_request(BrokerRequest {
-                request_id: TEST_REQUEST_ID,
-                operation: BrokerOperation::ExitThread(thread_id(1)),
-            });
-            let thread_id_offset = frame.len() - 4;
-            frame[thread_id_offset..].copy_from_slice(&invalid_thread_id.to_le_bytes());
-            assert_eq!(decode_request(&frame), Err(WireError::InvalidTag));
-        }
         let mut unknown_consume_mode = encode_request(BrokerRequest {
             request_id: TEST_REQUEST_ID,
             operation: BrokerOperation::Event(EventRequest::Consume(ConsumeEventRequest {
@@ -1618,16 +1629,6 @@ mod tests {
             Err(WireError::InvalidTag)
         );
         assert_eq!(
-            decode_handshake_response(&[RESPONSE_TAG_NEGOTIATED, 1, 0, 0, 0, 0, 0]),
-            Err(WireError::InvalidTag)
-        );
-        let mut invalid_process_id = Vec::from([RESPONSE_TAG_NEGOTIATED, 1, 0]);
-        invalid_process_id.extend_from_slice(&(MAX_ALLOCATED_ID + 1).to_le_bytes());
-        assert_eq!(
-            decode_handshake_response(&invalid_process_id),
-            Err(WireError::InvalidTag)
-        );
-        assert_eq!(
             decode_handshake_response(&encode_response(BrokerResponse {
                 request_id: TEST_REQUEST_ID,
                 result: BrokerResult::Event(EventResponse::Create(CreateEventResponse {
@@ -1691,16 +1692,6 @@ mod tests {
         invalid_error.extend_from_slice(&TEST_REQUEST_ID.0.to_le_bytes());
         invalid_error.extend_from_slice(&u16::MAX.to_le_bytes());
         assert_eq!(decode_response(&invalid_error), Err(WireError::InvalidTag));
-        for invalid_thread_id in [0, MAX_ALLOCATED_ID + 1] {
-            let mut frame = encode_response(BrokerResponse {
-                request_id: TEST_REQUEST_ID,
-                result: BrokerResult::ThreadCreated(thread_id(1)),
-            });
-            let thread_id_offset = frame.len() - 4;
-            frame[thread_id_offset..].copy_from_slice(&invalid_thread_id.to_le_bytes());
-            assert_eq!(decode_response(&frame), Err(WireError::InvalidTag));
-        }
-
         let truncated = [RESPONSE_TAG_EVENT, 2, 2, 0];
         assert_eq!(decode_response(&truncated), Err(WireError::TruncatedFrame));
 

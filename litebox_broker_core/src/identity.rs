@@ -4,10 +4,16 @@
 use alloc::sync::Arc;
 
 use hashbrown::HashSet;
-use litebox_broker_protocol::MAX_ALLOCATED_ID;
 use spin::Mutex;
 
 use crate::{BrokerError, Result};
+
+/// Highest numeric process or thread identity allocated by the broker.
+///
+/// Linux reserves the next value, `0x3fff_ffff`, as its futex TID mask.
+/// uLiteBox uses that reserved value for the synthetic Windows CSR server
+/// identity and never allocates it to a guest process or thread.
+pub(crate) const MAX_ALLOCATED_ID: u32 = 0x3fff_fffe;
 
 pub(crate) struct IdReservation {
     allocator: Arc<Mutex<IdAllocator>>,
@@ -86,7 +92,7 @@ mod tests {
 
     use spin::Mutex;
 
-    use super::{IdAllocator, IdReservation};
+    use super::{IdAllocator, IdReservation, MAX_ALLOCATED_ID};
     use crate::BrokerError;
 
     #[test]
@@ -100,6 +106,18 @@ mod tests {
 
         assert_eq!(allocator.allocate().unwrap(), first);
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn allocator_rejects_ids_outside_the_guest_range() {
+        assert!(matches!(
+            IdAllocator::new(0),
+            Err(BrokerError::ResourceExhausted)
+        ));
+        assert!(matches!(
+            IdAllocator::new(MAX_ALLOCATED_ID + 1),
+            Err(BrokerError::ResourceExhausted)
+        ));
     }
 
     #[test]

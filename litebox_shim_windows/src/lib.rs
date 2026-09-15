@@ -425,7 +425,7 @@ impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
 
     #[must_use]
     pub fn build(self) -> WindowsShim<Platform> {
-        debug_assert_ne!(self.initial_thread.id().get(), self.process_id.get());
+        debug_assert_ne!(self.initial_thread.id().0, self.process_id.0);
         let litebox = Arc::new(self.litebox);
         let fs = Arc::new(fs::Fs::regular(Arc::clone(&litebox)));
         let global = Arc::new(GlobalState {
@@ -537,8 +537,8 @@ impl<Platform: ShimPlatform> WindowsShim<Platform> {
                 &argv,
                 &envp,
                 nt_types::ClientId {
-                    unique_process: self.0.process_id.get() as usize,
-                    unique_thread: initial_thread_id.get() as usize,
+                    unique_process: self.0.process_id.0 as usize,
+                    unique_thread: initial_thread_id.0 as usize,
                 },
             )?;
         // TODO: shared section should be only created once and shared across all processes, not created per-process.
@@ -555,10 +555,10 @@ impl<Platform: ShimPlatform> WindowsShim<Platform> {
         process.peb_address = load_info.environment.peb;
         let process = Arc::new(process);
         let thread_object = Arc::new(syscalls::thread::ThreadObject::new(
-            initial_thread_id.get() as usize,
+            initial_thread_id.0 as usize,
             load_info.environment.teb,
         ));
-        let attached = process.attach_thread(initial_thread_id.get() as usize, &thread_object);
+        let attached = process.attach_thread(initial_thread_id.0 as usize, &thread_object);
         debug_assert!(attached, "a freshly created process cannot be exiting");
         let broker_thread = self
             .0
@@ -725,8 +725,8 @@ impl<Platform: ShimPlatform> Process<Platform> {
             "seeded Windows shared section must have seeded ancestors: {status:?}"
         );
         Process {
-            id: process_id.get() as usize,
-            parent_id: parent_id.map_or(0, |parent_id| parent_id.get() as usize),
+            id: process_id.0 as usize,
+            parent_id: parent_id.map_or(0, |parent_id| parent_id.0 as usize),
             ntdll: None,
             peb_address: 0,
             handles: WindowsHandleStore::<Platform>::new(litebox::fd::RawDescriptorStorage::new()),
@@ -786,12 +786,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 .lock()
                 .take()
                 .expect("a live Windows task must own its broker thread");
-            debug_assert_eq!(broker_thread.id().get() as usize, thread_id);
+            debug_assert_eq!(broker_thread.id().0 as usize, thread_id);
             let broker_thread_id = broker_thread.id();
             if let Err(error) = broker_thread.exit() {
                 litebox_util_log::error!(
                     error:% = error,
-                    thread_id = broker_thread_id.get();
+                    thread_id = broker_thread_id.0;
                     "failed to record broker thread exit"
                 );
             }

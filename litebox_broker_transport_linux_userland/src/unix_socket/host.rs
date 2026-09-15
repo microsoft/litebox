@@ -612,7 +612,7 @@ mod tests {
         ));
         host.send_handshake_response(&BrokerHandshakeResponse::Negotiated {
             broker_protocol_version: BROKER_PROTOCOL_VERSION,
-            process_id: litebox_broker_protocol::ProcessId::new(1).unwrap(),
+            process_id: litebox_broker_protocol::ProcessId(1),
         })
         .unwrap();
         assert!(matches!(
