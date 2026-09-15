@@ -50,7 +50,9 @@ pub use policy::{
     PolicyProfile, SocketPolicy, SocketPolicyError,
 };
 use process::ObjectReference;
-pub use process::{AssociationCancellation, BrokerProcess, CallerCredential, ObjectRights};
+pub use process::{
+    AssociationCancellation, BrokerProcess, BrokerThread, CallerCredential, ObjectRights,
+};
 use random::RandomProvider;
 use socket::{BrokerSocketPorts, SocketProvider};
 use stdio::StdioProvider;

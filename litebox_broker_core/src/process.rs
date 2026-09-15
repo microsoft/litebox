@@ -78,6 +78,35 @@ struct ProcessReferences {
     pending_handles: usize,
 }
 
+/// Broker-owned state for one guest thread.
+///
+/// Execution remains platform-local. This object owns the authoritative
+/// broker identity and is the extension point for execution-control state when
+/// a broker platform needs to manage thread execution.
+pub struct BrokerThread {
+    id: ThreadId,
+    id_reservation: IdReservation,
+}
+
+impl BrokerThread {
+    fn new(id_reservation: IdReservation) -> Self {
+        Self {
+            id: ThreadId(id_reservation.id()),
+            id_reservation,
+        }
+    }
+
+    /// Returns the broker-assigned thread ID.
+    #[must_use]
+    pub const fn id(&self) -> ThreadId {
+        self.id
+    }
+
+    fn release_id(self) {
+        self.id_reservation.release();
+    }
+}
+
 /// Broker-owned state for one authenticated guest process.
 ///
 /// User mode cannot choose the process ID. The broker entry layer authenticates
@@ -96,8 +125,8 @@ pub struct BrokerProcess {
     pub(crate) caller_credential: CallerCredential,
     /// Handles of the live object references owned by this process.
     references: Mutex<ProcessReferences>,
-    /// Broker-allocated thread IDs owned by this process.
-    thread_ids: Mutex<HashMap<ThreadId, IdReservation>>,
+    /// Authoritative broker threads owned by this process.
+    threads: Mutex<HashMap<ThreadId, BrokerThread>>,
     /// Pipe capacity charged to this process by live pipe objects.
     pub(crate) reserved_pipe_capacity: Arc<AtomicUsize>,
     /// Socket quota held by pending, live, and closing in-flight resources.
@@ -126,7 +155,7 @@ impl BrokerProcess {
                 handles: Vec::new(),
                 pending_handles: 0,
             }),
-            thread_ids: Mutex::new(HashMap::new()),
+            threads: Mutex::new(HashMap::new()),
             reserved_pipe_capacity: Arc::new(AtomicUsize::new(0)),
             reserved_sockets: Arc::new(AtomicUsize::new(0)),
             cancellation: AssociationCancellation::default(),
@@ -152,11 +181,11 @@ impl BrokerProcess {
     /// Panics if the shared ID allocator violates its range or uniqueness
     /// invariants.
     pub fn create_thread(&self) -> Result<ThreadId> {
-        let mut thread_ids = self.thread_ids.lock();
-        if thread_ids.len() >= self.core.limits.max_threads_per_process {
+        let mut threads = self.threads.lock();
+        if threads.len() >= self.core.limits.max_threads_per_process {
             return Err(BrokerError::ResourceExhausted);
         }
-        thread_ids
+        threads
             .try_reserve(1)
             .map_err(|_| BrokerError::OutOfMemory)?;
         self.core
@@ -173,9 +202,10 @@ impl BrokerProcess {
             }
         };
         let reservation = IdReservation::new(Arc::clone(&self.core.ids), raw_id);
-        let thread_id = ThreadId(raw_id);
+        let thread = BrokerThread::new(reservation);
+        let thread_id = thread.id();
         assert!(
-            thread_ids.insert(thread_id, reservation).is_none(),
+            threads.insert(thread_id, thread).is_none(),
             "the ID allocator returned an occupied thread ID"
         );
         Ok(thread_id)
@@ -183,13 +213,13 @@ impl BrokerProcess {
 
     /// Records broker thread exit after its local task teardown completes.
     pub fn exit_thread(&self, thread_id: ThreadId) -> Result<()> {
-        let reservation = self
-            .thread_ids
+        let thread = self
+            .threads
             .lock()
             .remove(&thread_id)
             .ok_or(BrokerError::UnknownObject)?;
         self.core.reserved_threads.fetch_sub(1, Ordering::Relaxed);
-        reservation.release();
+        thread.release_id();
         Ok(())
     }
 
@@ -654,13 +684,13 @@ impl BrokerProcess {
             invariant_fault = true;
         }
 
-        let thread_ids = core::mem::take(&mut *self.thread_ids.lock());
+        let threads = core::mem::take(&mut *self.threads.lock());
         if release_ids && !invariant_fault {
             self.core
                 .reserved_threads
-                .fetch_sub(thread_ids.len(), Ordering::Relaxed);
-            for reservation in thread_ids.into_values() {
-                reservation.release();
+                .fetch_sub(threads.len(), Ordering::Relaxed);
+            for thread in threads.into_values() {
+                thread.release_id();
             }
             if let Some(id_reservation) = self.id_reservation.take() {
                 id_reservation.release();
@@ -782,7 +812,7 @@ mod tests {
     const ROOT: FileUser = FileUser { user: 0, group: 0 };
 
     #[test]
-    fn processes_receive_distinct_checked_ids() {
+    fn processes_receive_distinct_broker_ids() {
         let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
@@ -815,6 +845,7 @@ mod tests {
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
 
+        assert_eq!(first.threads.lock().get(&thread).unwrap().id(), thread);
         assert_eq!(first.id().0, 1);
         assert_eq!(thread.0, 2);
         assert_eq!(second.id().0, 3);
