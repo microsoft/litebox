@@ -147,6 +147,8 @@ jobs:
       MACOS_AARCH64_CRATES: >-
         -p dev_tests
         -p litebox
+        -p litebox_common_macos
+        -p litebox_broker_platform_macos_userland
         -p litebox_common_linux
         -p litebox_syscall_rewriter
         -p litebox_platform_macos_userland
@@ -169,6 +171,8 @@ jobs:
       - run: ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features $MACOS_AARCH64_CRATES
       - run: ./.github/tools/github_actions_run_cargo build $MACOS_AARCH64_CRATES
       - run: ./.github/tools/github_actions_run_cargo nextest $MACOS_AARCH64_CRATES
+      - name: Test macOS broker synchronization with lock tracing
+        run: ./.github/tools/github_actions_run_cargo nextest --all-features -p litebox_broker_platform_macos_userland
       - name: Check native macOS platform without subpage compatibility
         run: |
           ./.github/tools/github_actions_run_cargo clippy --all-targets --no-default-features -p litebox_platform_macos_userland
@@ -363,6 +367,10 @@ jobs:
           #   `std` access, since it owns hosted Linux broker resources such as
           #   sockets and the epoll reactor.
           #
+          # - `litebox_broker_platform_macos_userland` is allowed to have
+          #   `std` access, since its hosted macOS synchronization provider uses
+          #   libSystem address waits and host error reporting.
+          #
           # - `litebox_broker_platform_windows_userland` is allowed to have
           #   `std` access, since it owns hosted Windows broker resources.
           #
@@ -432,6 +440,7 @@ jobs:
             -not -path './Cargo.toml' \
             -not -path './litebox_broker_local_userland/Cargo.toml' \
             -not -path './litebox_broker_platform_linux_userland/Cargo.toml' \
+            -not -path './litebox_broker_platform_macos_userland/Cargo.toml' \
             -not -path './litebox_broker_platform_windows_userland/Cargo.toml' \
             -not -path './litebox_broker_transport_linux_userland/Cargo.toml' \
             -not -path './litebox_broker_transport_windows_userland/Cargo.toml' \

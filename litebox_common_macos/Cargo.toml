@@ -1,0 +1,10 @@
+[package]
+name = "litebox_common_macos"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bitflags = { version = "2.9", default-features = false }
+
+[lints]
+workspace = true

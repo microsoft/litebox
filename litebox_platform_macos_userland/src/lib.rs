@@ -23,6 +23,7 @@ use litebox_common_linux::gate_recovery::{
     Aarch64GateSignalResult, GateInterruption, GateRuntimeState, canonicalize,
 };
 use litebox_common_linux::{GuestVectorState, PtRegs};
+use litebox_common_macos::{OsClockId, OsSyncFlags, OsSyncResult};
 use litebox_platform::sync::{
     ImmediatelyWokenUp, RawMutex as RawMutexTrait, RawMutexProvider, UnblockedOrTimedOut,
     WaitWakerProvider,
@@ -265,26 +266,13 @@ impl SystemTimeTrait for SystemTime {
     }
 }
 
-bitflags::bitflags! {
-    #[repr(transparent)]
-    struct OsSyncFlags: u32 {
-        const NONE = 0;
-        const SHARED = 1;
-    }
-}
-
-#[repr(u32)]
-enum OsClockId {
-    MachAbsoluteTime = 32,
-}
-
 unsafe extern "C" {
     fn os_sync_wait_on_address(
         address: *mut libc::c_void,
         value: u64,
         size: usize,
         flags: OsSyncFlags,
-    ) -> i32;
+    ) -> OsSyncResult;
     fn os_sync_wait_on_address_with_timeout(
         address: *mut libc::c_void,
         value: u64,
@@ -292,17 +280,17 @@ unsafe extern "C" {
         flags: OsSyncFlags,
         clock: OsClockId,
         timeout_ns: u64,
-    ) -> i32;
+    ) -> OsSyncResult;
     fn os_sync_wake_by_address_any(
         address: *mut libc::c_void,
         size: usize,
         flags: OsSyncFlags,
-    ) -> i32;
+    ) -> OsSyncResult;
     fn os_sync_wake_by_address_all(
         address: *mut libc::c_void,
         size: usize,
         flags: OsSyncFlags,
-    ) -> i32;
+    ) -> OsSyncResult;
 }
 
 pub struct RawMutex {
@@ -340,7 +328,7 @@ impl RawMutex {
                     self.address(),
                     u64::from(val),
                     size_of::<u32>(),
-                    OsSyncFlags::NONE,
+                    OsSyncFlags::empty(),
                     OsClockId::MachAbsoluteTime,
                     timeout_ns,
                 )
@@ -352,11 +340,11 @@ impl RawMutex {
                     self.address(),
                     u64::from(val),
                     size_of::<u32>(),
-                    OsSyncFlags::NONE,
+                    OsSyncFlags::empty(),
                 )
             }
         };
-        if result >= 0 {
+        if result.is_success() {
             return Ok(UnblockedOrTimedOut::Unblocked);
         }
 
@@ -387,9 +375,9 @@ impl RawMutexTrait for RawMutex {
         if n >= i32::MAX as usize {
             // SAFETY: address points to the aligned AtomicU32 used by matching waits.
             let result = unsafe {
-                os_sync_wake_by_address_all(self.address(), size_of::<u32>(), OsSyncFlags::NONE)
+                os_sync_wake_by_address_all(self.address(), size_of::<u32>(), OsSyncFlags::empty())
             };
-            assert!(result == 0 || unsafe { *libc::__error() } == libc::ENOENT);
+            assert!(result.is_success() || unsafe { *libc::__error() } == libc::ENOENT);
             return 0;
         }
 
@@ -397,9 +385,9 @@ impl RawMutexTrait for RawMutex {
         for _ in 0..n {
             // SAFETY: address points to the aligned AtomicU32 used by matching waits.
             let result = unsafe {
-                os_sync_wake_by_address_any(self.address(), size_of::<u32>(), OsSyncFlags::NONE)
+                os_sync_wake_by_address_any(self.address(), size_of::<u32>(), OsSyncFlags::empty())
             };
-            if result == 0 {
+            if result.is_success() {
                 woken += 1;
             } else {
                 // SAFETY: __error returns this thread's live errno slot.

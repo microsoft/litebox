@@ -1523,6 +1523,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_broker_platform_macos_userland"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "litebox_common_macos",
+ "litebox_platform",
+]
+
+[[package]]
 name = "litebox_broker_platform_windows_userland"
 version = "0.1.0"
 dependencies = [
@@ -1614,6 +1623,13 @@ dependencies = [
  "thiserror",
  "x86_64",
  "zerocopy",
+]
+
+[[package]]
+name = "litebox_common_macos"
+version = "0.1.0"
+dependencies = [
+ "bitflags",
 ]
 
 [[package]]
@@ -1751,6 +1767,7 @@ dependencies = [
  "libc",
  "litebox",
  "litebox_common_linux",
+ "litebox_common_macos",
  "litebox_platform",
  "litebox_syscall_rewriter",
  "zerocopy",
