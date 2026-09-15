@@ -16,7 +16,7 @@ use litebox_broker_core::socket::{
     GUEST_IPV4_ADDRESS, GuestSocketBinding, PlatformConnectError, host_socket_destination,
     is_internal_socket_address, normalize_socket_destination,
 };
-use litebox_broker_core::{BrokerError, Result as BrokerResult, SessionId};
+use litebox_broker_core::{BrokerError, ProcessAuthorityKey, Result as BrokerResult};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
     MAX_UDP_DATAGRAM_SIZE, ReceiveFromFlags, SocketError, SocketOutcome,
@@ -56,7 +56,7 @@ pub(super) struct ReactorUdpState {
     pub(super) external_peer_count: usize,
     pub(super) queued_datagrams: usize,
     pub(super) queued_bytes: usize,
-    pub(super) queued_by_source: HashMap<SessionId, UdpQueueAccounting>,
+    pub(super) queued_by_source: HashMap<ProcessAuthorityKey, UdpQueueAccounting>,
     pub(super) event_tokens: HashMap<u64, UdpEventTarget>,
     pub(super) next_event_token: u64,
 }
@@ -125,7 +125,7 @@ pub(super) struct UdpSocketState {
     pub(super) peer: Option<ReactorUdpPeer>,
     internal_receive_queue: VecDeque<InternalDatagram>,
     internal_receive_bytes: usize,
-    queued_by_source: HashMap<SessionId, UdpQueueAccounting>,
+    queued_by_source: HashMap<ProcessAuthorityKey, UdpQueueAccounting>,
     pub(super) peeked_origin: Option<UdpReceiveOrigin>,
     pub(super) next_receive_origin: UdpReceiveOrigin,
     pub(super) native_endpoint: Option<UdpNativeEndpoint>,
@@ -184,7 +184,7 @@ impl UdpNativeErrorState {
 struct InternalDatagram {
     payload: Vec<u8>,
     source_address: SocketAddrV4,
-    source_session_id: SessionId,
+    source_process_authority: ProcessAuthorityKey,
 }
 
 pub(super) struct UdpNativeEndpoint {
@@ -334,7 +334,7 @@ impl Reactor {
         socket_id: u64,
         external_destination: SocketAddrV4,
     ) -> BrokerResult<bool> {
-        let session_id = {
+        let process_authority = {
             let socket = self.sockets.get(&socket_id).ok_or(BrokerError::Internal)?;
             let udp = socket.udp_state()?;
             let host_destination = host_socket_destination(external_destination);
@@ -347,11 +347,11 @@ impl Reactor {
             if udp.external_peers.len() >= MAX_UDP_EXTERNAL_PEERS_PER_SOCKET {
                 return Err(BrokerError::ResourceExhausted);
             }
-            socket.session_id
+            socket.process_authority
         };
         let session = self
             .sessions
-            .get(&session_id)
+            .get(&process_authority)
             .ok_or(BrokerError::Internal)?;
         if self.udp.external_peer_count
             >= self
@@ -392,7 +392,7 @@ impl Reactor {
             .ok_or(BrokerError::ResourceExhausted)?;
         let session = self
             .sessions
-            .get_mut(&session_id)
+            .get_mut(&process_authority)
             .ok_or(BrokerError::Internal)?;
         session.udp_external_peer_count = session
             .udp_external_peer_count
@@ -424,7 +424,7 @@ impl Reactor {
             .expect("reactor UDP external peer count underflow");
         let session = self
             .sessions
-            .get_mut(&socket.session_id)
+            .get_mut(&socket.process_authority)
             .expect("UDP external peer session state missing");
         session.udp_external_peer_count = session
             .udp_external_peer_count
@@ -433,16 +433,16 @@ impl Reactor {
     }
 
     pub(super) fn clear_udp_external_peers(&mut self, socket_id: u64) -> BrokerResult<()> {
-        let (session_id, count) = {
+        let (process_authority, count) = {
             let socket = self
                 .sockets
                 .get_mut(&socket_id)
                 .ok_or(BrokerError::Internal)?;
-            let session_id = socket.session_id;
+            let process_authority = socket.process_authority;
             let udp = socket.udp_state_mut()?;
             let count = udp.external_peers.len();
             udp.external_peers.clear();
-            (session_id, count)
+            (process_authority, count)
         };
         self.udp.external_peer_count = self
             .udp
@@ -451,7 +451,7 @@ impl Reactor {
             .ok_or(BrokerError::Internal)?;
         let session = self
             .sessions
-            .get_mut(&session_id)
+            .get_mut(&process_authority)
             .ok_or(BrokerError::Internal)?;
         session.udp_external_peer_count = session
             .udp_external_peer_count
@@ -636,7 +636,7 @@ impl Reactor {
     fn udp_queue_would_drop(
         &self,
         receiver_id: u64,
-        source_session_id: SessionId,
+        source_process_authority: ProcessAuthorityKey,
         length: usize,
     ) -> BrokerResult<bool> {
         let receiver = self
@@ -646,17 +646,17 @@ impl Reactor {
         let udp = receiver.udp_state()?;
         let receiver_session = self
             .sessions
-            .get(&receiver.session_id)
+            .get(&receiver.process_authority)
             .ok_or(BrokerError::Internal)?;
         let source = self
             .udp
             .queued_by_source
-            .get(&source_session_id)
+            .get(&source_process_authority)
             .copied()
             .unwrap_or_default();
         let receiver_source = udp
             .queued_by_source
-            .get(&source_session_id)
+            .get(&source_process_authority)
             .copied()
             .unwrap_or_default();
         let (global_datagrams, global_bytes, session_datagrams, session_bytes) =
@@ -684,13 +684,13 @@ impl Reactor {
         source_address: SocketAddrV4,
         payload: &[u8],
     ) -> BrokerResult<SocketOutcome<usize>> {
-        let source_session_id = {
+        let source_process_authority = {
             let source = self
                 .sockets
                 .get(&source_socket_id)
                 .ok_or(BrokerError::Internal)?;
             source.udp_state()?;
-            source.session_id
+            source.process_authority
         };
         let accepts_source = {
             let Some(destination) = self.sockets.get(&destination_socket_id) else {
@@ -710,7 +710,11 @@ impl Reactor {
             }
         };
         if !accepts_source
-            || self.udp_queue_would_drop(destination_socket_id, source_session_id, payload.len())?
+            || self.udp_queue_would_drop(
+                destination_socket_id,
+                source_process_authority,
+                payload.len(),
+            )?
         {
             return Ok(SocketOutcome::Completed(payload.len()));
         }
@@ -720,7 +724,11 @@ impl Reactor {
             .try_reserve_exact(payload.len())
             .map_err(|_| BrokerError::OutOfMemory)?;
         stored_payload.extend_from_slice(payload);
-        if !self.udp.queued_by_source.contains_key(&source_session_id) {
+        if !self
+            .udp
+            .queued_by_source
+            .contains_key(&source_process_authority)
+        {
             self.udp
                 .queued_by_source
                 .try_reserve(1)
@@ -735,7 +743,7 @@ impl Reactor {
             udp.internal_receive_queue
                 .try_reserve(1)
                 .map_err(|_| BrokerError::OutOfMemory)?;
-            if !udp.queued_by_source.contains_key(&source_session_id) {
+            if !udp.queued_by_source.contains_key(&source_process_authority) {
                 udp.queued_by_source
                     .try_reserve(1)
                     .map_err(|_| BrokerError::OutOfMemory)?;
@@ -752,16 +760,16 @@ impl Reactor {
         let datagram = InternalDatagram {
             payload: stored_payload,
             source_address,
-            source_session_id,
+            source_process_authority,
         };
-        let receiver_session_id = self
+        let receiver_process_authority = self
             .sockets
             .get(&destination_socket_id)
             .ok_or(BrokerError::Internal)?
-            .session_id;
+            .process_authority;
         let receiver_session = self
             .sessions
-            .get_mut(&receiver_session_id)
+            .get_mut(&receiver_process_authority)
             .ok_or(BrokerError::Internal)?;
         {
             let destination = self
@@ -770,7 +778,10 @@ impl Reactor {
                 .ok_or(BrokerError::Internal)?;
             let udp = destination.udp_state_mut()?;
             udp.internal_receive_bytes += datagram.payload.len();
-            let source = udp.queued_by_source.entry(source_session_id).or_default();
+            let source = udp
+                .queued_by_source
+                .entry(source_process_authority)
+                .or_default();
             source.datagrams += 1;
             source.bytes += datagram.payload.len();
             udp.internal_receive_queue.push_back(datagram);
@@ -779,7 +790,7 @@ impl Reactor {
             let source = self
                 .udp
                 .queued_by_source
-                .entry(source_session_id)
+                .entry(source_process_authority)
                 .or_default();
             source.datagrams += 1;
             source.bytes += payload.len();
@@ -815,7 +826,7 @@ impl Reactor {
             .sockets
             .get_mut(&receiver_id)
             .expect("UDP receiver disappeared before accounting release");
-        let receiver_session_id = receiver.session_id;
+        let receiver_process_authority = receiver.process_authority;
         let udp = receiver
             .udp_state_mut()
             .expect("UDP receiver changed kind before accounting release");
@@ -826,7 +837,7 @@ impl Reactor {
         let remove_receiver_source = {
             let source = udp
                 .queued_by_source
-                .get_mut(&datagram.source_session_id)
+                .get_mut(&datagram.source_process_authority)
                 .expect("UDP receiver source accounting missing");
             source.datagrams = source
                 .datagrams
@@ -839,7 +850,8 @@ impl Reactor {
             source.datagrams == 0
         };
         if remove_receiver_source {
-            udp.queued_by_source.remove(&datagram.source_session_id);
+            udp.queued_by_source
+                .remove(&datagram.source_process_authority);
         }
 
         self.udp.queued_datagrams = self
@@ -856,7 +868,7 @@ impl Reactor {
             let source = self
                 .udp
                 .queued_by_source
-                .get_mut(&datagram.source_session_id)
+                .get_mut(&datagram.source_process_authority)
                 .expect("global UDP source accounting missing");
             source.datagrams = source
                 .datagrams
@@ -871,11 +883,11 @@ impl Reactor {
         if remove_source {
             self.udp
                 .queued_by_source
-                .remove(&datagram.source_session_id);
+                .remove(&datagram.source_process_authority);
         }
         let receiver_session = self
             .sessions
-            .get_mut(&receiver_session_id)
+            .get_mut(&receiver_process_authority)
             .expect("UDP receiver session accounting missing");
         receiver_session.udp_queued_datagrams = receiver_session
             .udp_queued_datagrams

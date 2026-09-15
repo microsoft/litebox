@@ -582,6 +582,7 @@ fn run_test_broker_connection(
         .join()
         .expect("broker readiness publisher panicked")
         .expect("broker readiness publication failed");
+    association.finish();
     close_object_count_tx
         .send(close_object_count)
         .expect("failed to report broker close-object count");

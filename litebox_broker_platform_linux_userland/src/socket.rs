@@ -20,7 +20,7 @@ use litebox_broker_core::socket::{
     PlatformDatagramReceive, PlatformSocket, PlatformSocketStatus, PlatformStreamReceive,
     SocketProvider,
 };
-use litebox_broker_core::{BrokerError, Result as BrokerResult, SessionId};
+use litebox_broker_core::{BrokerError, ProcessAuthorityKey, Result as BrokerResult};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
     AddressFamily, CreateSocketRequest, IpProtocol, MAX_UDP_DATAGRAM_SIZE, ReceiveFlags,
@@ -179,7 +179,7 @@ impl LinuxSocketProvider {
 impl SocketProvider for LinuxSocketProvider {
     fn create(
         &self,
-        session_id: SessionId,
+        process_authority: ProcessAuthorityKey,
         request: CreateSocketRequest,
         readiness: ReadinessRegistration,
     ) -> BrokerResult<Arc<dyn PlatformSocket>> {
@@ -200,7 +200,7 @@ impl SocketProvider for LinuxSocketProvider {
         });
         self.reactor.request(|response| ReactorCommand::Create {
             id,
-            session_id,
+            process_authority,
             request,
             readiness,
             snapshot,
@@ -210,8 +210,8 @@ impl SocketProvider for LinuxSocketProvider {
         Ok(socket)
     }
 
-    fn close_session(&self, session_id: SessionId) {
-        self.reactor.close_session(session_id);
+    fn close_process(&self, process_authority: ProcessAuthorityKey) {
+        self.reactor.close_process(process_authority);
     }
 }
 
@@ -702,12 +702,12 @@ impl ReactorClient {
         receive.recv().unwrap();
     }
 
-    fn close_session(&self, session_id: SessionId) {
+    fn close_process(&self, process_authority: ProcessAuthorityKey) {
         let (response, receive) = sync_channel(1);
         if self
             .commands
-            .send(ReactorCommand::CloseSession {
-                session_id,
+            .send(ReactorCommand::CloseProcess {
+                process_authority,
                 response,
             })
             .is_err()
@@ -773,7 +773,7 @@ impl Drop for ReactorClient {
 enum ReactorCommand {
     Create {
         id: u64,
-        session_id: SessionId,
+        process_authority: ProcessAuthorityKey,
         request: CreateSocketRequest,
         readiness: ReadinessRegistration,
         snapshot: Arc<SocketSnapshot>,
@@ -852,8 +852,8 @@ enum ReactorCommand {
         id: u64,
         response: SyncSender<()>,
     },
-    CloseSession {
-        session_id: SessionId,
+    CloseProcess {
+        process_authority: ProcessAuthorityKey,
         response: SyncSender<()>,
     },
     #[cfg(test)]
@@ -939,7 +939,7 @@ struct Reactor {
     sockets: HashMap<u64, SocketEntry>,
     tcp: ReactorTcpState,
     udp: ReactorUdpState,
-    sessions: HashMap<SessionId, ReactorSessionState>,
+    sessions: HashMap<ProcessAuthorityKey, ReactorSessionState>,
     max_sockets: usize,
     max_sockets_per_session: usize,
     events: Vec<epoll::Event>,
@@ -954,7 +954,7 @@ enum SocketTransportState {
 /// Reactor-owned transport-independent socket state and its
 /// transport-specific payload.
 struct SocketEntry {
-    session_id: SessionId,
+    process_authority: ProcessAuthorityKey,
     transport: SocketTransportState,
     readiness: ReadinessRegistration,
     snapshot: Arc<SocketSnapshot>,
@@ -1406,10 +1406,10 @@ impl Reactor {
     }
 
     fn remove_socket(&mut self, id: u64) {
-        let Some((kind, session_id)) = self
+        let Some((kind, process_authority)) = self
             .sockets
             .get(&id)
-            .map(|socket| (socket.kind(), socket.session_id))
+            .map(|socket| (socket.kind(), socket.process_authority))
         else {
             return;
         };
@@ -1432,7 +1432,7 @@ impl Reactor {
                 .expect("reactor UDP external peer count underflow");
             let session = self
                 .sessions
-                .get_mut(&session_id)
+                .get_mut(&process_authority)
                 .expect("UDP socket session state missing");
             session.udp_external_peer_count = session
                 .udp_external_peer_count
@@ -1448,7 +1448,7 @@ impl Reactor {
             return;
         }
 
-        self.remove_tcp_socket(id, session_id);
+        self.remove_tcp_socket(id, process_authority);
     }
 
     fn run(&mut self) -> core::result::Result<(), ReactorFailure> {
@@ -1510,15 +1510,21 @@ impl Reactor {
             match command {
                 ReactorCommand::Create {
                     id,
-                    session_id,
+                    process_authority,
                     request,
                     readiness,
                     snapshot,
                     lifecycle,
                     response,
                 } => {
-                    let outcome = self
-                        .create_socket(id, session_id, request, readiness, snapshot, &lifecycle);
+                    let outcome = self.create_socket(
+                        id,
+                        process_authority,
+                        request,
+                        readiness,
+                        snapshot,
+                        &lifecycle,
+                    );
                     let created = outcome.is_ok();
                     if response.send(outcome).is_err() && created {
                         self.remove_socket(id);
@@ -1650,21 +1656,19 @@ impl Reactor {
                     self.remove_socket(id);
                     let _ = response.send(());
                 }
-                ReactorCommand::CloseSession {
-                    session_id,
+                ReactorCommand::CloseProcess {
+                    process_authority,
                     response,
                 } => {
-                    if let Some(session) = self.sessions.get_mut(&session_id) {
+                    if let Some(session) = self.sessions.get_mut(&process_authority) {
                         session.closing = true;
                     }
-                    while let Some(id) = self
-                        .sockets
-                        .iter()
-                        .find_map(|(id, socket)| (socket.session_id == session_id).then_some(*id))
-                    {
+                    while let Some(id) = self.sockets.iter().find_map(|(id, socket)| {
+                        (socket.process_authority == process_authority).then_some(*id)
+                    }) {
                         self.remove_socket(id);
                     }
-                    self.purge_connector_session_queues(session_id);
+                    self.purge_connector_session_queues(process_authority);
                     self.sessions
                         .retain(|_, session| retain_session_state(session));
                     let _ = response.send(());
@@ -1839,7 +1843,7 @@ impl Reactor {
     fn create_socket(
         &mut self,
         id: u64,
-        session_id: SessionId,
+        process_authority: ProcessAuthorityKey,
         request: CreateSocketRequest,
         readiness: ReadinessRegistration,
         snapshot: Arc<SocketSnapshot>,
@@ -1857,12 +1861,12 @@ impl Reactor {
         if self.sockets.contains_key(&id) {
             return Err(BrokerError::Internal);
         }
-        if !self.sessions.contains_key(&session_id) {
+        if !self.sessions.contains_key(&process_authority) {
             self.sessions
                 .try_reserve(1)
                 .map_err(|_| BrokerError::OutOfMemory)?;
         }
-        let session = self.sessions.get(&session_id);
+        let session = self.sessions.get(&process_authority);
         if session.is_some_and(|session| session.closing) {
             return Err(BrokerError::UnknownObject);
         }
@@ -1893,7 +1897,7 @@ impl Reactor {
         self.sockets.insert(
             id,
             SocketEntry {
-                session_id,
+                process_authority,
                 transport,
                 readiness,
                 snapshot,
@@ -1905,7 +1909,7 @@ impl Reactor {
             },
         );
         self.sessions
-            .entry(session_id)
+            .entry(process_authority)
             .or_default()
             .live_socket_count = next_live_socket_count;
         Ok(())

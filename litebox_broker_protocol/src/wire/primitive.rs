@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use crate::shared_buffer::{
     MAX_SHARED_BUFFER_SEQUENCE_SLOTS, SharedBufferSequence, SharedBufferSlotIndex,
 };
-use crate::{ObjectHandle, ProtocolVersion, RequestId};
+use crate::{ObjectHandle, ProcessId, ProcessIdentity, ProtocolVersion, RequestId};
 
 use super::WireError;
 
@@ -38,6 +38,25 @@ impl Encoder {
 
     pub(super) fn protocol_version(&mut self, version: ProtocolVersion) {
         self.u16(version.0);
+    }
+
+    pub(super) fn process_id(&mut self, process_id: ProcessId) {
+        self.u32(process_id.get());
+    }
+
+    pub(super) fn optional_process_id(&mut self, process_id: Option<ProcessId>) {
+        match process_id {
+            None => self.u8(0),
+            Some(process_id) => {
+                self.u8(1);
+                self.process_id(process_id);
+            }
+        }
+    }
+
+    pub(super) fn process_identity(&mut self, identity: ProcessIdentity) {
+        self.process_id(identity.id);
+        self.optional_process_id(identity.parent_id);
     }
 
     pub(super) fn handle(&mut self, handle: ObjectHandle) {
@@ -100,6 +119,25 @@ impl<'a> Decoder<'a> {
 
     pub(super) fn protocol_version(&mut self) -> Result<ProtocolVersion, WireError> {
         Ok(ProtocolVersion(self.u16()?))
+    }
+
+    pub(super) fn process_id(&mut self) -> Result<ProcessId, WireError> {
+        ProcessId::new(self.u32()?).ok_or(WireError::InvalidTag)
+    }
+
+    pub(super) fn optional_process_id(&mut self) -> Result<Option<ProcessId>, WireError> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => self.process_id().map(Some),
+            _ => Err(WireError::InvalidTag),
+        }
+    }
+
+    pub(super) fn process_identity(&mut self) -> Result<ProcessIdentity, WireError> {
+        Ok(ProcessIdentity {
+            id: self.process_id()?,
+            parent_id: self.optional_process_id()?,
+        })
     }
 
     pub(super) fn handle(&mut self) -> Result<ObjectHandle, WireError> {

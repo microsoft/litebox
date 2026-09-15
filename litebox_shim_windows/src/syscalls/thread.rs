@@ -468,7 +468,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let Some(ntdll) = self.process.ntdll else {
             return NtStatus::NOT_SUPPORTED;
         };
-        let thread_id = self.process.allocate_thread_id();
+        let Some(thread_id) = self.process.allocate_thread_id() else {
+            return NtStatus::QUOTA_EXCEEDED;
+        };
         let environment = match create_thread_environment(
             &self.global.page_manager,
             stack_size,

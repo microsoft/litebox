@@ -64,14 +64,18 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         local,
         notifications,
     } = broker::connect(control_pipe)?;
+    let process_identity = local.process_identity();
     let litebox = litebox::LiteBox::new_with_broker_local(platform, local);
     broker::start_notification_receiver(
         notifications,
         litebox.broker_notification_dispatcher(),
         litebox.broker_failure_dispatcher(),
     )?;
-    let shim_builder =
-        litebox_shim_windows::WindowsShimBuilder::new_with_litebox(platform, litebox);
+    let shim_builder = litebox_shim_windows::WindowsShimBuilder::new_with_litebox(
+        platform,
+        litebox,
+        process_identity,
+    );
 
     let (program_path, program_args) = cli_args
         .program_and_arguments

@@ -422,20 +422,6 @@ impl WindowsUserland {
         let gran = self.sys_info.read().unwrap().dwAllocationGranularity as usize;
         x & !(gran - 1)
     }
-
-    pub fn init_task(&self) -> litebox_common_linux::TaskParams {
-        // TODO: Currently we are using a static thread ID and credentials (faked).
-        // This is a placeholder for future implementation to use passthrough.
-        litebox_common_linux::TaskParams {
-            pid: 1000,
-            // TODO: placeholder for actual PPID
-            ppid: 0,
-            uid: 1000,
-            gid: 1000,
-            euid: 1000,
-            egid: 1000,
-        }
-    }
 }
 
 impl litebox::platform::Provider for WindowsUserland {}

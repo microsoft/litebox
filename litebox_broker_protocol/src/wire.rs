@@ -218,9 +218,11 @@ pub fn encode_handshake_response(response: BrokerHandshakeResponse) -> Vec<u8> {
     match response {
         BrokerHandshakeResponse::Negotiated {
             broker_protocol_version,
+            process_identity,
         } => {
             encoder.u8(RESPONSE_TAG_NEGOTIATED);
             encoder.protocol_version(broker_protocol_version);
+            encoder.process_identity(process_identity);
         }
         BrokerHandshakeResponse::VersionMismatch {
             broker_protocol_version,
@@ -243,6 +245,7 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
     let response = match tag {
         RESPONSE_TAG_NEGOTIATED => BrokerHandshakeResponse::Negotiated {
             broker_protocol_version: decoder.protocol_version()?,
+            process_identity: decoder.process_identity()?,
         },
         RESPONSE_TAG_EVENT
         | RESPONSE_TAG_OBJECT_CLOSED
@@ -463,11 +466,18 @@ mod tests {
         IsTerminalStdioRequest, IsTerminalStdioResponse, ReadStdioRequest, ReadStdioResponse,
         StdioOutputStream, StdioStream, WriteStdioRequest, WriteStdioResponse,
     };
-    use crate::{ObjectHandle, ProtocolVersion, RequestId};
+    use crate::{ObjectHandle, ProcessId, ProcessIdentity, ProtocolVersion, RequestId};
     use core::net::{Ipv4Addr, SocketAddrV4};
     use core::num::NonZeroU64;
 
     const TEST_REQUEST_ID: RequestId = RequestId(0x0102_0304_0506_0708);
+
+    fn process_identity(id: u32, parent_id: Option<u32>) -> ProcessIdentity {
+        ProcessIdentity {
+            id: ProcessId::new(id).unwrap(),
+            parent_id: parent_id.map(|id| ProcessId::new(id).unwrap()),
+        }
+    }
 
     fn sequence(slot_index: u32, length: u32) -> SharedBufferSequence {
         SharedBufferSequence::new(&[SharedBufferSlotIndex(slot_index)], length).unwrap()
@@ -933,6 +943,11 @@ mod tests {
         let responses = [
             BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: ProtocolVersion(1),
+                process_identity: process_identity(1, None),
+            },
+            BrokerHandshakeResponse::Negotiated {
+                broker_protocol_version: ProtocolVersion(1),
+                process_identity: process_identity(7, Some(3)),
             },
             BrokerHandshakeResponse::VersionMismatch {
                 broker_protocol_version: ProtocolVersion(1),
@@ -1555,6 +1570,22 @@ mod tests {
             Err(WireError::InvalidTag)
         );
         assert_eq!(
+            decode_handshake_response(&[RESPONSE_TAG_NEGOTIATED, 1, 0, 0, 0, 0, 0]),
+            Err(WireError::InvalidTag)
+        );
+        assert_eq!(
+            decode_handshake_response(&[RESPONSE_TAG_NEGOTIATED, 1, 0, 0xff, 0xff, 0xff, 0x3f, 0,]),
+            Err(WireError::InvalidTag)
+        );
+        assert_eq!(
+            decode_handshake_response(&[RESPONSE_TAG_NEGOTIATED, 1, 0, 1, 0, 0, 0, 2,]),
+            Err(WireError::InvalidTag)
+        );
+        assert_eq!(
+            decode_handshake_response(&[RESPONSE_TAG_NEGOTIATED, 1, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0,]),
+            Err(WireError::InvalidTag)
+        );
+        assert_eq!(
             decode_handshake_response(&encode_response(BrokerResponse {
                 request_id: TEST_REQUEST_ID,
                 result: BrokerResult::Event(EventResponse::Create(CreateEventResponse {
@@ -1580,6 +1611,7 @@ mod tests {
 
         let mut frame = encode_handshake_response(BrokerHandshakeResponse::Negotiated {
             broker_protocol_version: ProtocolVersion(1),
+            process_identity: process_identity(1, None),
         });
         frame.push(0xff);
         assert_eq!(
@@ -1597,6 +1629,7 @@ mod tests {
         for response in [
             BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: ProtocolVersion(1),
+                process_identity: process_identity(1, None),
             },
             BrokerHandshakeResponse::VersionMismatch {
                 broker_protocol_version: ProtocolVersion(1),
