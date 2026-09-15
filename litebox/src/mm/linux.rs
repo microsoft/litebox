@@ -17,12 +17,7 @@ use crate::platform::page_mgmt::AllocationError;
 use crate::platform::page_mgmt::FixedAddressBehavior;
 use crate::platform::page_mgmt::MemoryRegionPermissions;
 
-/// Host page size in bytes on Apple Silicon macOS.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub const PAGE_SIZE: usize = 16384;
-
 /// Page size in bytes.
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 pub const PAGE_SIZE: usize = 4096;
 
 bitflags::bitflags! {

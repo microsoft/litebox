@@ -34,6 +34,14 @@ extern crate alloc;
 
 use user_pointers::{UserPtr, UserPtrMut};
 
+/// Host page size in bytes.
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+pub const HOST_PAGE_SIZE: usize = 4096;
+
+/// Host page size in bytes.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub const HOST_PAGE_SIZE: usize = 16384;
+
 /// Number of AArch64 general-purpose registers saved by the Linux user ABI
 /// (`x0` through `x30`).
 #[cfg(target_arch = "aarch64")]

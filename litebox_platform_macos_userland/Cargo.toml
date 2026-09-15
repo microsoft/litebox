@@ -12,5 +12,8 @@ libc = { version = "0.2.169", default-features = false }
 litebox_syscall_rewriter = { path = "../litebox_syscall_rewriter", version = "0.1.0", default-features = false }
 zerocopy = { version = "0.8", default-features = false }
 
+[features]
+subpage_compat = []
+
 [lints]
 workspace = true

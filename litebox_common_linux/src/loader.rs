@@ -18,7 +18,7 @@ use litebox::{
 use thiserror::Error;
 use zerocopy::FromBytes;
 
-use crate::errno::Errno;
+use crate::{HOST_PAGE_SIZE, errno::Errno};
 
 type Endian = elf::endian::LittleEndian;
 
@@ -224,7 +224,7 @@ impl ElfParsedFile {
 
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            // Reject LOADs that overlap after native-page alignment.
+            // Reject LOADs that overlap after guest-page alignment.
             let mut ranges = alloc::vec::Vec::new();
             let table = elf::segment::SegmentTable::new(header.endianness, CLASS, &phdrs);
             for ph in table
@@ -559,9 +559,13 @@ impl ElfParsedFile {
             // Reserve space for a runtime trampoline so brk starts past it.
             // The runtime patching path (do_mmap_file → maybe_patch_exec_segment)
             // will allocate the actual trampoline in this region via MAP_FIXED.
-            info.brk = page_align_up(info.brk) + page_align_up(size);
+            // Match the runtime rewriter's native-page-aligned placement.
+            info.brk = info.brk.next_multiple_of(HOST_PAGE_SIZE) + page_align_up(size);
         }
 
+        // The initial writable brk heap must not share native backing with an
+        // executable LOAD or trampoline. Guest mmap/mprotect still use the guest page size.
+        info.brk = info.brk.next_multiple_of(HOST_PAGE_SIZE);
         Ok(info)
     }
 

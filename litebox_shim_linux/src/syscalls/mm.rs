@@ -9,7 +9,7 @@ use litebox::{
     mm::linux::{MappingError, PAGE_SIZE},
     platform::page_mgmt::MemoryRegionPermissions,
 };
-use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
+use litebox_common_linux::{HOST_PAGE_SIZE, MRemapFlags, MapFlags, ProtFlags, errno::Errno};
 
 use crate::ShimPlatform;
 use crate::Task;
@@ -907,9 +907,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 return;
             };
             let offset: usize = offset.trunc();
-            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-            let offset = align_up(offset, PAGE_SIZE);
-            base + offset
+            // Keep a runtime trampoline's RW staging off the ELF's RX host
+            // page, even when its guest LOAD alignment is smaller.
+            align_up(base + offset, HOST_PAGE_SIZE)
         };
 
         // Never synthesize an ET_DYN span from an unknown base: it could cover
@@ -2155,7 +2155,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(target_os = "macos", ignore = "assumes 4 KiB host pages")]
     fn test_mremap() {
         let task = init_platform();
 
@@ -2194,7 +2193,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(target_os = "macos", ignore = "assumes 4 KiB host pages")]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "fixed address lies in Darwin's PAGEZERO"
+    )]
     fn test_mmap_fixed_noreplace() {
         let task = init_platform();
 
@@ -2399,7 +2401,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(target_os = "macos", ignore = "assumes 4 KiB host pages")]
     fn test_map_shared_anonymous() {
         let task = init_platform();
 
@@ -2458,7 +2459,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(target_os = "macos", ignore = "assumes 4 KiB host pages")]
     fn test_map_shared_readonly_file() {
         let content = b"Hello, shared!";
         let task = init_platform();

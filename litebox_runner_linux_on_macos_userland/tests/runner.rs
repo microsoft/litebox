@@ -204,17 +204,17 @@ fn rejects_fixed_address_and_incompatible_page_layouts() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("Unsupported ELF type"));
 
     binary[16..18].copy_from_slice(&3u16.to_le_bytes());
-    // 4 KiB congruent, but not 16 KiB congruent.
-    binary[80..88].copy_from_slice(&0x1000u64.to_le_bytes());
+    // Not even guest-page congruent.
+    binary[80..88].copy_from_slice(&0x100u64.to_le_bytes());
     std::fs::write(fixture.0.join("program"), &binary).unwrap();
     let output = fixture.run(&[]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("Bad ELF format"));
 
-    // Disjoint LOADs sharing a native page.
+    // LOADs sharing a guest page are still invalid.
     binary = elf(EXIT_42);
     binary[56..58].copy_from_slice(&2u16.to_le_bytes());
-    phdr(&mut binary[120..176], 1, 6, 0x2000, 0x2000, 0, 16, 0x1000);
+    phdr(&mut binary[120..176], 1, 4, 0x1000, 0x1000, 0, 16, 0x1000);
     std::fs::write(fixture.0.join("program"), &binary).unwrap();
     let output = fixture.run(&[]);
     assert!(!output.status.success());
