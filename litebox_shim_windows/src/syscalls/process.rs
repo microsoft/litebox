@@ -915,8 +915,8 @@ mod tests {
     #[test]
     fn process_basic_information_uses_broker_identity() {
         let task = crate::tests::test_task_with_process_id(
-            litebox_broker_protocol::ProcessId::new(37).unwrap(),
-            Some(litebox_broker_protocol::ProcessId::new(11).unwrap()),
+            litebox_broker_protocol::ProcessId(37),
+            Some(litebox_broker_protocol::ProcessId(11)),
         );
 
         let information = task.process_basic_information();

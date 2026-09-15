@@ -46,7 +46,7 @@ pub(crate) fn init_platform() -> crate::Task<TestPlatform> {
     let shim_builder = crate::LinuxShimBuilder::new_with_litebox(
         platform,
         litebox,
-        litebox_broker_protocol::ProcessId::new(1).unwrap(),
+        litebox_broker_protocol::ProcessId(1),
     );
     shim_builder.build().0.new_test_task()
 }

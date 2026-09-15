@@ -39,12 +39,12 @@ use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use hashbrown::HashMap;
-use litebox_broker_protocol::{MAX_ALLOCATED_ID, ObjectHandle, ProcessId};
+use litebox_broker_protocol::{ObjectHandle, ProcessId};
 use spin::{Mutex, rwlock::RwLock};
 
 pub use error::BrokerError;
 use fs::FileService;
-use identity::{IdAllocator, IdReservation};
+use identity::{IdAllocator, IdReservation, MAX_ALLOCATED_ID};
 pub use policy::{
     DestinationPortRange, DestinationRule, Ipv4Cidr, MAX_DESTINATION_RULES, PolicyEngine,
     PolicyProfile, SocketPolicy, SocketPolicyError,
@@ -289,7 +289,7 @@ impl BrokerCore {
     ///
     /// # Panics
     ///
-    /// Panics if the shared ID allocator violates its checked-ID or uniqueness
+    /// Panics if the shared ID allocator violates its range or uniqueness
     /// invariants.
     pub fn create_process(
         &self,
@@ -301,7 +301,7 @@ impl BrokerCore {
             .map_err(|_| BrokerError::OutOfMemory)?;
         let raw_id = self.ids.lock().allocate()?;
         let reservation = IdReservation::new(Arc::clone(&self.ids), raw_id);
-        let id = ProcessId::new(raw_id).expect("the ID allocator must return a checked process ID");
+        let id = ProcessId(raw_id);
         let process = Arc::new(BrokerProcess::new(
             self.clone(),
             reservation,

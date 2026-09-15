@@ -240,10 +240,10 @@ fn test_task_from_litebox_with_process_id(
         windows_shared_section,
     ));
     let thread_object = Arc::new(crate::syscalls::thread::ThreadObject::new(
-        initial_thread_id.get() as usize,
+        initial_thread_id.0 as usize,
         0,
     ));
-    assert!(process.attach_thread(initial_thread_id.get() as usize, &thread_object));
+    assert!(process.attach_thread(initial_thread_id.0 as usize, &thread_object));
     let broker_thread = global.initial_thread.lock().take();
 
     Task {
@@ -310,7 +310,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     pub(crate) fn clone_for_test_with_teb(&self, teb_address: usize) -> Option<Self> {
         let broker_thread = self.global.litebox.create_thread().ok()?;
-        let thread_id = broker_thread.id().get() as usize;
+        let thread_id = broker_thread.id().0 as usize;
         let thread_object = Arc::new(crate::syscalls::thread::ThreadObject::new(
             thread_id,
             teb_address,
@@ -342,8 +342,8 @@ fn objectless_test_tasks_use_distinct_negotiated_process_ids() {
     let first = test_task();
     let second = test_task();
 
-    assert_eq!(first.process.id, first.global.process_id.get() as usize);
-    assert_eq!(second.process.id, second.global.process_id.get() as usize);
+    assert_eq!(first.process.id, first.global.process_id.0 as usize);
+    assert_eq!(second.process.id, second.global.process_id.0 as usize);
     assert_ne!(first.process.id, second.process.id);
 }
 

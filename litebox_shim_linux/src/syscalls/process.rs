@@ -742,8 +742,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
 
         let broker_thread = self.global.create_thread().map_err(|_| Errno::EAGAIN)?;
-        let child_tid = i32::try_from(broker_thread.id().get())
-            .expect("the checked broker thread ID must fit Linux pid_t");
+        let child_tid = i32::try_from(broker_thread.id().0)
+            .expect("the broker-assigned thread ID must fit Linux pid_t");
 
         let sp = if stack != 0 {
             let stack: usize = stack.trunc();
@@ -757,7 +757,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             if let Err(error) = broker_thread.exit() {
                 litebox_util_log::error!(
                     error:% = error,
-                    thread_id = thread_id.get();
+                    thread_id = thread_id.0;
                     "failed to record broker thread exit during rollback"
                 );
             }
@@ -804,7 +804,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             if let Err(error) = broker_thread.exit() {
                 litebox_util_log::error!(
                     error:% = error,
-                    thread_id = thread_id.get();
+                    thread_id = thread_id.0;
                     "failed to record broker thread exit during rollback"
                 );
             }

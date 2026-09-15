@@ -266,7 +266,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
     ///
     /// # Panics
     ///
-    /// Panics if the checked process ID cannot fit Linux `pid_t`.
+    /// Panics if the broker-assigned process ID cannot fit Linux `pid_t`.
     pub fn load_program(
         &self,
         task: litebox_common_linux::TaskParams,
@@ -282,8 +282,8 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             gid,
             egid,
         } = task;
-        let expected_pid = i32::try_from(self.0.process_id.get())
-            .expect("the checked process ID must fit Linux pid_t");
+        let expected_pid = i32::try_from(self.0.process_id.0)
+            .expect("the broker-assigned process ID must fit Linux pid_t");
         if pid != expected_pid || ppid != 0 {
             return Err(loader::elf::ElfLoaderError::InvalidProcessId);
         }
@@ -1220,7 +1220,7 @@ impl<Platform: ShimPlatform> Drop for Task<Platform> {
             if let Err(error) = thread.exit() {
                 litebox_util_log::error!(
                     error:% = error,
-                    thread_id = thread_id.get();
+                    thread_id = thread_id.0;
                     "failed to record broker thread exit"
                 );
             }
@@ -1236,8 +1236,8 @@ mod test_utils {
     impl<Platform: ShimPlatform> GlobalState<Platform> {
         /// Make a new task with default values for testing.
         pub(crate) fn new_test_task(self: Arc<Self>) -> Task<Platform> {
-            let pid = i32::try_from(self.process_id.get())
-                .expect("the checked process ID must fit Linux pid_t");
+            let pid = i32::try_from(self.process_id.0)
+                .expect("the broker-assigned process ID must fit Linux pid_t");
             let files = Arc::new(syscalls::file::FilesState::new());
             let credentials = Arc::new(syscalls::process::Credentials {
                 uid: 0,
@@ -1268,8 +1268,8 @@ mod test_utils {
         /// Returns a clone of this task with a new TID for testing.
         pub(crate) fn clone_for_test(&self) -> Option<Self> {
             let broker_thread = self.global.create_thread().ok()?;
-            let tid = i32::try_from(broker_thread.id().get())
-                .expect("the checked broker thread ID must fit Linux pid_t");
+            let tid = i32::try_from(broker_thread.id().0)
+                .expect("the broker-assigned thread ID must fit Linux pid_t");
             let Some(thread) = self.thread.new_thread(tid) else {
                 let _ = broker_thread.exit();
                 return None;

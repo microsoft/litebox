@@ -298,6 +298,6 @@ mod tests {
         let BrokerHandshakeResponse::Negotiated { process_id, .. } = response else {
             panic!("the in-process broker must negotiate");
         };
-        assert_eq!(process_id.get(), 2);
+        assert_eq!(process_id.0, 2);
     }
 }

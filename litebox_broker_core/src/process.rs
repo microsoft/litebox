@@ -114,8 +114,7 @@ impl BrokerProcess {
         parent_id: Option<ProcessId>,
         caller_credential: CallerCredential,
     ) -> Self {
-        let id = ProcessId::new(id_reservation.id())
-            .expect("the ID allocator must return a checked process ID");
+        let id = ProcessId(id_reservation.id());
         Self {
             core,
             id,
@@ -150,7 +149,7 @@ impl BrokerProcess {
     ///
     /// # Panics
     ///
-    /// Panics if the shared ID allocator violates its checked-ID or uniqueness
+    /// Panics if the shared ID allocator violates its range or uniqueness
     /// invariants.
     pub fn create_thread(&self) -> Result<ThreadId> {
         let mut thread_ids = self.thread_ids.lock();
@@ -174,8 +173,7 @@ impl BrokerProcess {
             }
         };
         let reservation = IdReservation::new(Arc::clone(&self.core.ids), raw_id);
-        let thread_id =
-            ThreadId::new(raw_id).expect("the ID allocator must return a checked thread ID");
+        let thread_id = ThreadId(raw_id);
         assert!(
             thread_ids.insert(thread_id, reservation).is_none(),
             "the ID allocator returned an occupied thread ID"
@@ -817,9 +815,9 @@ mod tests {
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
 
-        assert_eq!(first.id().get(), 1);
-        assert_eq!(thread.get(), 2);
-        assert_eq!(second.id().get(), 3);
+        assert_eq!(first.id().0, 1);
+        assert_eq!(thread.0, 2);
+        assert_eq!(second.id().0, 3);
     }
 
     #[test]
@@ -1035,7 +1033,7 @@ mod tests {
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         assert_ne!(replacement.id(), process_id);
-        assert_ne!(replacement.id().get(), thread_id.get());
+        assert_ne!(replacement.id().0, thread_id.0);
         assert_eq!(
             replacement.create_thread(),
             Err(BrokerError::ResourceExhausted)

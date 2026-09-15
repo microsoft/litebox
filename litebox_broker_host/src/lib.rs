@@ -1098,7 +1098,7 @@ mod tests {
     const ROOT: FileUser = FileUser { user: 0, group: 0 };
 
     fn root_process_id(id: u32) -> ProcessId {
-        ProcessId::new(id).unwrap()
+        ProcessId(id)
     }
 
     struct TestRawMutex {
@@ -2050,7 +2050,7 @@ mod tests {
         let BrokerResult::ThreadCreated(thread_id) = response else {
             panic!("unexpected thread-ID allocation response: {response:?}");
         };
-        assert_ne!(thread_id.get(), process.id().get());
+        assert_ne!(thread_id.0, process.id().0);
         assert_eq!(
             handle_test_request(&process, BrokerOperation::ExitThread(thread_id)),
             BrokerResult::ThreadExited

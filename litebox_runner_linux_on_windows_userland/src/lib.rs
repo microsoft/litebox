@@ -110,7 +110,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let program = shim
         .load_program(
             litebox_common_linux::TaskParams {
-                pid: process_id.get().try_into().unwrap(),
+                pid: process_id.0.try_into().unwrap(),
                 ppid: 0,
                 uid: 1000,
                 gid: 1000,

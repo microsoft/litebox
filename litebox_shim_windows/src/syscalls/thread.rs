@@ -491,7 +491,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .as_ref()
             .expect("new broker thread missing")
             .id()
-            .get() as usize;
+            .0 as usize;
         let mut rollback_thread = || {
             let broker_thread = broker_thread
                 .take()
@@ -500,7 +500,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             if let Err(error) = broker_thread.exit() {
                 litebox_util_log::error!(
                     error:% = error,
-                    thread_id = broker_thread_id.get();
+                    thread_id = broker_thread_id.0;
                     "Failed to roll back Windows thread"
                 );
             }
@@ -605,7 +605,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             if let Err(error) = broker_thread.exit() {
                 litebox_util_log::error!(
                     error:% = error,
-                    thread_id = broker_thread_id.get();
+                    thread_id = broker_thread_id.0;
                     "Failed to roll back Windows thread"
                 );
             }
