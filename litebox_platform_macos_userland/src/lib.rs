@@ -416,10 +416,8 @@ impl litebox::platform::SignalProvider for MacosUserland {
     type Signal = litebox_common_linux::signal::Signal;
 
     fn take_pending_signals(&self, mut f: impl FnMut(Self::Signal)) {
-        // Ordinary host threads have no platform TLS and are not guest signal
-        // targets. Do not create/register guest state just to poll for signals.
-        // Atomic RMW prevents losing an interrupting handler's update. Relaxed
-        // suffices: these bits are thread-owned and do not publish other data.
+        // Do not initialize TLS for host threads. The RMW preserves handler updates;
+        // Relaxed suffices because the bits publish no other data.
         let bits = with_signal_state(|pending, _| pending.swap(0, Ordering::Relaxed)).unwrap_or(0);
         for signal in litebox_common_linux::signal::SigSet::from_u64(u64::from(bits)) {
             f(signal);
@@ -1005,9 +1003,7 @@ fn tls_address(offset: usize) -> *mut usize {
     (block + offset) as *mut usize
 }
 
-/// Access only the atomic signal fields, without borrowing the rest of the
-/// block (which transition code mutates). The callback bounds the references to
-/// this access rather than claiming that thread-owned storage lives forever.
+/// Borrow only the atomic fields; transition code mutates the rest of TLS.
 fn with_signal_state<R>(
     f: impl FnOnce(&AtomicU32, &AtomicPtr<core::task::Waker>) -> R,
 ) -> Option<R> {
@@ -1015,9 +1011,8 @@ fn with_signal_state<R>(
     if block == 0 {
         return None;
     }
-    // SAFETY: the validated pthread slot owns a live TlsBlock for this thread.
-    // These fields are correctly aligned atomics, and the callback's references
-    // cannot escape. Signal handlers access these fields only atomically too.
+    // SAFETY: the slot holds this thread's live TlsBlock. The aligned atomic
+    // references cannot escape the callback, and handlers use atomic access too.
     unsafe {
         Some(f(
             &*((block + tls_offset::PENDING_HOST_SIGNALS) as *const AtomicU32),
@@ -1190,8 +1185,7 @@ struct ThreadState {
     // Cleared before thread exit to prevent pthread ID-reuse races.
     identity: Mutex<Option<usize>>,
     interrupted: AtomicBool,
-    // Used by ordinary cross-thread interruption. Signal handlers use the
-    // separately published WAIT_WAKER_ADDR because they cannot lock a mutex.
+    // Signal handlers use WAIT_WAKER_ADDR instead: they cannot lock this mutex.
     waker: Mutex<Option<core::task::Waker>>,
 }
 #[derive(Clone)]
@@ -1281,14 +1275,12 @@ impl WaitWakerProvider for MacosUserland {
                 .unwrap()
                 .clone_from(&waker);
         }
-        // Plain host threads can use waits too, but have no signal TLS to
-        // publish into. Their ordinary event wakers still work independently.
+        // Host threads without TLS still support ordinary event wakeups.
         with_signal_state(|_, slot| {
             let new = waker.map_or(core::ptr::null_mut(), |waker| {
                 Box::into_raw(Box::new(waker))
             });
-            // The handler runs on this same thread, so after the swap it cannot
-            // still be using the old pointer when execution resumes here.
+            // Same-thread handlers finish using the old pointer before we resume.
             let old = slot.swap(new, Ordering::AcqRel);
             if !old.is_null() {
                 // SAFETY: every non-null value was produced by Box::into_raw above.
@@ -1298,9 +1290,10 @@ impl WaitWakerProvider for MacosUserland {
     }
 }
 
-/// Records a traditional host signal and wakes an interruptible shim wait.
+/// Record a host signal and wake an interruptible shim wait.
 ///
-/// Must only be called from a signal handler on an initialized LiteBox thread.
+/// # Safety
+/// Requires initialized thread TLS and a signal-safe published waker.
 unsafe fn record_pending_host_signal(signal: litebox_common_linux::signal::Signal) {
     // Signal delivery must not change the interrupted host operation's errno.
     // SAFETY: __error returns this thread's live errno slot.
@@ -2073,7 +2066,6 @@ pub(crate) fn register_exception_handlers() -> std::io::Result<()> {
         }
     };
     for (index, signal) in host_signals().into_iter().enumerate() {
-        // Forwarded signals should not recursively interrupt their own handler.
         action.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
         if forwarded_guest_signal(signal).is_none() {
             action.sa_flags |= libc::SA_NODEFER;
@@ -2171,8 +2163,7 @@ unsafe extern "C" fn exception_signal_handler(
     if let Some(guest_signal) = forwarded_signal
         && !ptr.is_null()
     {
-        // Record before requesting shim entry so take_pending_signals observes
-        // the signal whether this interrupted guest execution or a shim wait.
+        // SAFETY: ACTIVE implies initialized TLS; shim waits publish signal-safe wakers.
         unsafe { record_pending_host_signal(guest_signal) };
         // SAFETY: ACTIVE remains live for the duration of run_thread_arch.
         let thread_ctx = unsafe { &*ptr };
@@ -2236,8 +2227,8 @@ unsafe extern "C" fn exception_signal_handler(
         if (signal != interrupt_signal() && forwarded_signal.is_none())
             || (ptr.is_null() && forwarded_signal.is_some())
         {
-            // A forwarded signal should only select a registered guest thread.
-            // Preserve its host disposition if it reaches any other thread.
+            // Non-guest threads retain the host disposition.
+            // SAFETY: the kernel-provided signal arguments remain live.
             unsafe { next_signal_handler(signal, info, raw) };
         }
         return;
@@ -2519,47 +2510,6 @@ mod tests {
     }
 
     #[test]
-    fn host_thread_without_tls_can_poll_signals() {
-        let platform = MacosUserland::new();
-        std::thread::spawn(move || {
-            assert_eq!(tls_block_address(), 0);
-            platform.take_pending_signals(|_| panic!("host thread has no guest signals"));
-            assert_eq!(
-                tls_block_address(),
-                0,
-                "polling must not register the thread"
-            );
-        })
-        .join()
-        .unwrap();
-    }
-
-    #[test]
-    fn host_thread_without_tls_can_update_waker() {
-        let platform = MacosUserland::new();
-        std::thread::spawn(move || {
-            assert_eq!(tls_block_address(), 0);
-            // Retaining the waker here would leak it: this thread has no signal
-            // TLS, and the signal handler must use the host disposition instead.
-            let weak = {
-                let counter = Arc::new(SignalWakeCounter::default());
-                let weak = Arc::downgrade(&counter);
-                platform.update_waker(Some(core::task::Waker::from(counter)));
-                weak
-            };
-            assert!(weak.upgrade().is_none());
-            platform.update_waker(None);
-            assert_eq!(
-                tls_block_address(),
-                0,
-                "waiting must not register the thread"
-            );
-        })
-        .join()
-        .unwrap();
-    }
-
-    #[test]
     fn host_thread_without_tls_still_receives_event_wakeups() {
         let platform = MacosUserland::new();
         let ready = Arc::new(AtomicBool::new(false));
@@ -2567,6 +2517,14 @@ mod tests {
         let (send, receive) = std::sync::mpsc::sync_channel(0);
         let worker = std::thread::spawn(move || {
             assert_eq!(tls_block_address(), 0);
+            platform.take_pending_signals(|_| panic!("host thread has no guest signals"));
+            let counter = Arc::new(SignalWakeCounter::default());
+            let weak = Arc::downgrade(&counter);
+            platform.update_waker(Some(core::task::Waker::from(counter)));
+            assert!(
+                weak.upgrade().is_none(),
+                "host thread retained a signal waker"
+            );
             let wait = litebox::event::wait::WaitState::new(platform);
             let mut notify = Some(send);
             let result = wait
@@ -2596,7 +2554,6 @@ mod tests {
         }
 
         fn wake_by_ref(self: &Arc<Self>) {
-            // Deliberately no locks or allocation: this runs in a signal handler.
             self.0.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -2610,8 +2567,7 @@ mod tests {
             let first_weak = Arc::downgrade(&first);
             let second_weak = Arc::downgrade(&second);
             platform.update_waker(Some(core::task::Waker::from(first.clone())));
-            // SAFETY: run_test_thread initialized TLS and no concurrent handler
-            // runs during this direct invocation on the same thread.
+            // SAFETY: TLS is initialized and SignalWakeCounter is signal-safe.
             unsafe { record_pending_host_signal(litebox_common_linux::signal::Signal::SIGINT) };
             assert_eq!(first.0.load(Ordering::Relaxed), 1);
             platform.update_waker(Some(core::task::Waker::from(second.clone())));
@@ -2626,29 +2582,6 @@ mod tests {
             drop(second);
             assert!(second_weak.upgrade().is_none(), "cleared waker leaked");
             platform.take_pending_signals(|_| {});
-        });
-    }
-
-    #[test]
-    fn pending_host_signals_are_coalesced_and_drained() {
-        let platform = MacosUserland::new();
-        MacosUserland::run_test_thread(|| {
-            // SAFETY: run_test_thread initializes this thread's platform TLS.
-            unsafe {
-                record_pending_host_signal(litebox_common_linux::signal::Signal::SIGINT);
-                record_pending_host_signal(litebox_common_linux::signal::Signal::SIGALRM);
-                record_pending_host_signal(litebox_common_linux::signal::Signal::SIGINT);
-            }
-            let mut signals = Vec::new();
-            platform.take_pending_signals(|signal| signals.push(signal));
-            assert_eq!(
-                signals,
-                [
-                    litebox_common_linux::signal::Signal::SIGINT,
-                    litebox_common_linux::signal::Signal::SIGALRM,
-                ]
-            );
-            platform.take_pending_signals(|_| panic!("signals were not drained"));
         });
     }
 
@@ -2682,10 +2615,7 @@ mod tests {
 
     #[test]
     fn host_signal_interrupts_wait_until() {
-        struct WaitProbe {
-            platform: &'static MacosUserland,
-            interrupted: Arc<AtomicBool>,
-        }
+        struct WaitProbe(&'static MacosUserland);
         struct PendingSignal(&'static MacosUserland);
 
         impl litebox::event::wait::CheckForInterrupt for PendingSignal {
@@ -2700,8 +2630,8 @@ mod tests {
             type ExecutionContext = PtRegs;
 
             fn init(&self, _: &mut PtRegs) -> ContinueOperation {
-                let wait = litebox::event::wait::WaitState::new(self.platform);
-                let check = PendingSignal(self.platform);
+                let wait = litebox::event::wait::WaitState::new(self.0);
+                let check = PendingSignal(self.0);
                 let target = unsafe { libc::pthread_self() } as usize;
                 let (send, receive) = std::sync::mpsc::sync_channel(0);
                 let sender = std::thread::spawn(move || {
@@ -2723,9 +2653,9 @@ mod tests {
                         false
                     });
                 sender.join().unwrap();
-                self.interrupted.store(
+                assert!(
                     matches!(result, Err(litebox::event::wait::WaitError::Interrupted)),
-                    Ordering::Relaxed,
+                    "{result:?}"
                 );
                 ContinueOperation::Terminate
             }
@@ -2744,19 +2674,8 @@ mod tests {
         }
 
         let platform = MacosUserland::new();
-        let interrupted = Arc::new(AtomicBool::new(false));
-        let mut ctx = PtRegs::default();
-        // SAFETY: init terminates before attempting guest entry.
-        unsafe {
-            run_thread(
-                WaitProbe {
-                    platform,
-                    interrupted: interrupted.clone(),
-                },
-                &mut ctx,
-            );
-        }
-        assert!(interrupted.load(Ordering::Relaxed));
+        // SAFETY: init terminates before guest entry.
+        unsafe { run_thread(WaitProbe(platform), &mut PtRegs::default()) };
     }
 
     #[test]
@@ -2768,6 +2687,7 @@ mod tests {
 
             fn init(&self, _: &mut PtRegs) -> ContinueOperation {
                 const ITERATIONS: usize = 2_000;
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
                 let target = unsafe { libc::pthread_self() } as usize;
                 let requested = Arc::new(AtomicUsize::new(0));
                 let completed = Arc::new(AtomicUsize::new(0));
@@ -2776,10 +2696,13 @@ mod tests {
                 let sender = std::thread::spawn(move || {
                     for i in 1..=ITERATIONS {
                         while request.load(Ordering::Acquire) < i {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "signal request stalled"
+                            );
                             std::thread::yield_now();
                         }
-                        // Deliver on a different thread while the target swaps
-                        // wakers and drains signals. pthread_t stays live until join.
+                        // SAFETY: the target thread stays live until join.
                         assert_eq!(
                             unsafe { libc::pthread_kill(target as libc::pthread_t, libc::SIGINT) },
                             0
@@ -2793,9 +2716,9 @@ mod tests {
                     self.0
                         .update_waker(Some(core::task::Waker::from(counter.clone())));
                     requested.store(i, Ordering::Release);
-                    // Do not request the next signal until this one has been
-                    // observed: coalescing cannot hide a lost update here.
+                    // One signal in flight prevents coalescing from hiding a lost update.
                     while completed.load(Ordering::Acquire) < i || observed < i {
+                        assert!(std::time::Instant::now() < deadline, "signal {i} was lost");
                         self.0.update_waker(None);
                         self.0.take_pending_signals(|signal| {
                             assert_eq!(signal, litebox_common_linux::signal::Signal::SIGINT);
@@ -2808,7 +2731,6 @@ mod tests {
                 }
                 sender.join().unwrap();
                 assert_eq!(observed, ITERATIONS, "a pending signal was lost");
-                // Also exercise a guaranteed non-null slot and then a cleared slot.
                 assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
                 self.0.take_pending_signals(|_| {});
                 assert!(counter.0.load(Ordering::Relaxed) > 0);
@@ -2867,18 +2789,15 @@ mod tests {
 
     #[test]
     fn host_signals_interrupt_and_reach_the_shim() {
-        struct SignalProbe {
-            platform: &'static MacosUserland,
-            observed: Arc<AtomicU32>,
-        }
+        struct SignalProbe(&'static MacosUserland);
 
         impl EnterShim for SignalProbe {
             type ExecutionContext = PtRegs;
 
             fn init(&self, _: &mut PtRegs) -> ContinueOperation {
-                // raise is thread-directed, so both signals reach this registered guest thread.
                 assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
                 assert_eq!(unsafe { libc::raise(libc::SIGALRM) }, 0);
+                assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
                 ContinueOperation::Resume
             }
 
@@ -2891,30 +2810,29 @@ mod tests {
             }
 
             fn interrupt(&self, _: &mut PtRegs) -> ContinueOperation {
-                self.platform.take_pending_signals(|signal| {
-                    self.observed
-                        .fetch_or(1 << (signal.as_i32() - 1), Ordering::Relaxed);
+                use litebox_common_linux::signal::Signal;
+
+                let mut signals = Vec::new();
+                self.0.take_pending_signals(|signal| {
+                    signals.push(signal);
+                    if signal == Signal::SIGINT {
+                        // A signal arriving during drain must survive until the next poll.
+                        assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
+                    }
                 });
+                assert_eq!(signals, [Signal::SIGINT, Signal::SIGALRM]);
+                signals.clear();
+                self.0.take_pending_signals(|signal| signals.push(signal));
+                assert_eq!(signals, [Signal::SIGINT]);
+                self.0
+                    .take_pending_signals(|_| panic!("signals were not drained"));
                 ContinueOperation::Terminate
             }
         }
 
         let platform = MacosUserland::new();
-        let observed = Arc::new(AtomicU32::new(0));
-        let mut ctx = PtRegs::default();
-        // SAFETY: init terminates before attempting guest entry.
-        unsafe {
-            run_thread(
-                SignalProbe {
-                    platform,
-                    observed: observed.clone(),
-                },
-                &mut ctx,
-            );
-        }
-        let expected = (1 << (litebox_common_linux::signal::Signal::SIGINT.as_i32() - 1))
-            | (1 << (litebox_common_linux::signal::Signal::SIGALRM.as_i32() - 1));
-        assert_eq!(observed.load(Ordering::Relaxed), expected);
+        // SAFETY: queued signals dispatch interrupt, which terminates before guest entry.
+        unsafe { run_thread(SignalProbe(platform), &mut PtRegs::default()) };
     }
 
     #[test]
