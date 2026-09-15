@@ -237,6 +237,7 @@ where
                 return Ok(Err(FileError::AccessNotAllowed));
             }
             self.read_without_position_update(&entry, output, offset)
+                .map(|(read, _)| read)
         } else {
             drop(entry);
             let mut entry = state.write();
@@ -280,6 +281,7 @@ where
                 return Ok(Err(FileError::AccessNotAllowed));
             }
             self.write_without_position_update(&entry, input, offset)
+                .map(|(written, _)| written)
         } else {
             drop(entry);
             let mut entry = state.write();
