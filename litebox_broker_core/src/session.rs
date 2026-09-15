@@ -624,8 +624,9 @@ mod tests {
     use crate::test_platform::TestPlatform;
     use crate::test_support::TestBrokerCoreBuilder;
     use crate::{
-        BrokerCore, BrokerCoreLimits, BrokerError, CallerCredential, ObjectRights, PolicyEngine,
-        SocketPolicy,
+        AssociationCancellation, BrokerCore, BrokerCoreLimits, BrokerError, CallerCredential,
+        ObjectRights, PolicyEngine, SocketPolicy,
+        stdio::{StdioProvider, StdioProviderError},
     };
     use litebox_broker_protocol::ObjectHandle;
     use litebox_broker_protocol::event::{EventConsumeMode, EventConsumption};
@@ -633,13 +634,49 @@ mod tests {
         FileAccessMode, FileError, FileMode, FileOpenFlags, FileSeekWhence, FileType, FileUser,
     };
     use litebox_broker_protocol::readiness::ReadinessFlags;
-    use std::{sync::Arc, vec::Vec};
+    use litebox_broker_protocol::stdio::{StdioOutputStream, StdioStream};
+    use std::{sync::Arc, vec, vec::Vec};
 
     const TEST_MAX_REFERENCES: usize = 4;
     const TEST_MAX_PIPE_CAPACITY: usize = 8;
     const TEST_MAX_REFERENCES_PER_SESSION: usize = 2;
     const TEST_MAX_PIPE_CAPACITY_PER_SESSION: usize = 4;
     const ROOT: FileUser = FileUser { user: 0, group: 0 };
+
+    struct TestStdioProvider;
+
+    impl StdioProvider for TestStdioProvider {
+        fn read(
+            &self,
+            cancellation: &AssociationCancellation,
+            output: &mut [u8],
+        ) -> core::result::Result<usize, StdioProviderError> {
+            if cancellation.is_cancelled() {
+                return Err(StdioProviderError::Closed);
+            }
+            output.fill(b'i');
+            Ok(output.len())
+        }
+
+        fn write(
+            &self,
+            cancellation: &AssociationCancellation,
+            _stream: StdioOutputStream,
+            input: &[u8],
+        ) -> core::result::Result<usize, StdioProviderError> {
+            if cancellation.is_cancelled() {
+                return Err(StdioProviderError::Closed);
+            }
+            Ok(input.len())
+        }
+
+        fn is_terminal(
+            &self,
+            _stream: StdioStream,
+        ) -> core::result::Result<bool, StdioProviderError> {
+            Ok(false)
+        }
+    }
 
     #[test]
     fn pending_reference_release_checks_both_counters() {
@@ -870,13 +907,43 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let mut random_bytes = [0; 4];
+        let mut random_bytes =
+            vec![0; litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE as usize + 1];
         assert_eq!(
             crate::fs::read(&source, random, &mut random_bytes, None),
-            Ok(Ok(4))
+            Ok(Ok(random_bytes.len()))
         );
-        assert_eq!(random_bytes, [0x5a; 4]);
+        assert!(random_bytes.iter().all(|byte| *byte == 0x5a));
         assert_eq!(source.close_object_reference(random), Ok(()));
+
+        let stdout = crate::fs::open(
+            &source,
+            "/dev/stdout",
+            ROOT,
+            FileAccessMode::WriteOnly,
+            FileOpenFlags::NONE,
+            FileMode::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let duplicated_stdout = source
+            .duplicate_object_reference_to(stdout, &target, ObjectRights::WRITE)
+            .unwrap();
+        source.request_cancellation();
+        assert_eq!(
+            crate::fs::write(&source, stdout, b"source", None),
+            Ok(Err(FileError::Io))
+        );
+        let stdio_input =
+            vec![b'x'; litebox_broker_protocol::stdio::MAX_STDIO_TRANSFER_SIZE as usize + 1];
+        assert_eq!(
+            crate::fs::write(&target, duplicated_stdout, &stdio_input, None),
+            Ok(Ok(
+                litebox_broker_protocol::stdio::MAX_STDIO_TRANSFER_SIZE as usize
+            ))
+        );
+        assert_eq!(source.close_object_reference(stdout), Ok(()));
+        assert_eq!(target.close_object_reference(duplicated_stdout), Ok(()));
     }
 
     #[test]
@@ -905,6 +972,7 @@ mod tests {
         )
         .with_socket_provider(socket_provider.clone())
         .with_random_provider(Arc::new(crate::random::TestRandomProvider))
+        .with_stdio_provider(Arc::new(TestStdioProvider))
         .with_file_service(Arc::new(
             crate::fs::resolver::Resolver::<TestPlatform, _>::new(fs),
         ))
