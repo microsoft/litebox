@@ -1324,36 +1324,40 @@ mod tests {
         let task = init_platform(None);
         let platform = task.global.platform;
         let mut data = alloc::vec::Vec::new();
-        // Find an address that is allocated to the global allocator but not in reserved regions.
-        // LiteBox's page manager is not aware of the global allocator's allocations.
+        let mut count = 0;
+        // Model an external allocator allocation that LiteBox's page manager does not track.
         let addr = loop {
-            #[allow(
-                unused_variables,
-                reason = "the following features are mutually exclusive"
-            )]
-            #[cfg(target_os = "windows")]
+            assert!(
+                count < 100,
+                "Failed to find a suitable address after 100 attempts"
+            );
+            count += 1;
             let addr = {
-                let buf = alloc::vec::Vec::<u8>::with_capacity(0x10_0000);
-                let addr = buf.as_ptr() as usize;
-                data.push(buf);
-                addr
-            };
-            #[cfg(target_os = "linux")]
-            let addr = {
-                let addr = unsafe {
-                    libc::mmap(
-                        core::ptr::null_mut(),
-                        0x10_000,
-                        libc::PROT_READ | libc::PROT_WRITE,
-                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                        -1,
-                        0,
+                use litebox::platform::{
+                    RawConstPointer as _,
+                    page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions},
+                };
+
+                let allocation = <Platform as PageManagementProvider<4096>>::allocate_pages(
+                    platform,
+                    0..0x2000,
+                    MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+                    false,
+                    false,
+                    FixedAddressBehavior::Hint,
+                )
+                .unwrap()
+                .as_usize();
+                // SAFETY: The first page belongs to this test and has no outstanding references.
+                unsafe {
+                    <Platform as PageManagementProvider<4096>>::deallocate_pages(
+                        platform,
+                        allocation..allocation + 0x1000,
                     )
-                } as usize;
-                data.push(alloc::vec::Vec::<u8>::from(unsafe {
-                    core::slice::from_raw_parts(addr as *const u8, 0x10_000)
-                }));
-                addr
+                    .unwrap();
+                }
+                data.push(allocation);
+                allocation + 0x1000
             };
 
             let mut included = false;
@@ -1411,6 +1415,20 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err, Errno::ENOMEM);
+
+        task.sys_munmap(res, 0x1000).unwrap();
+        task.sys_munmap(UserPtrMut::from_usize(addr - 0x1000), 0x1000)
+            .unwrap();
+        for allocation in data {
+            // SAFETY: The remaining page belongs to this test and was never mapped by the shim.
+            unsafe {
+                <Platform as PageManagementProvider<4096>>::deallocate_pages(
+                    platform,
+                    allocation + 0x1000..allocation + 0x2000,
+                )
+                .unwrap();
+            }
+        }
     }
 
     #[test]
