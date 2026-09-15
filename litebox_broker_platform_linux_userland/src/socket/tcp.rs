@@ -14,7 +14,8 @@ use litebox_broker_core::socket::{
     GuestSocketBinding, GuestSourceLease, PlatformConnectError, host_socket_destination,
     is_internal_socket_address, normalize_socket_destination,
 };
-use litebox_broker_core::{BrokerError, ProcessAuthorityKey, Result as BrokerResult};
+use litebox_broker_core::{BrokerError, Result as BrokerResult};
+use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{
     MAX_SOCKET_PEEK_SIZE, MAX_SOCKET_TRANSFER_SIZE, ReceiveFlags, ShutdownMode,
@@ -31,7 +32,7 @@ use rustix::net::{
 
 use super::{
     Reactor, SocketEntry, SocketKind, SocketLifecycle, SocketSnapshot, SocketTransportState,
-    broker_error_from_errno, can_consume_synchronous_error, retain_session_state,
+    broker_error_from_errno, can_consume_synchronous_error, retain_process_state,
     socket_error_from_errno, socket_operation_error_from_errno, take_socket_error, update_snapshot,
     zeroed_vec,
 };
@@ -198,7 +199,7 @@ pub(super) struct GuestTcpListenerState {
 pub(super) struct QueuedGuestTcpConnection {
     pub(super) socket: OwnedFd,
     pub(super) connector_socket_id: u64,
-    pub(super) connector_process_authority: ProcessAuthorityKey,
+    pub(super) connector_process_authority: ProcessId,
     pub(super) local_address: SocketAddrV4,
     pub(super) guest_source_lease: GuestSourceLease,
 }
@@ -1085,7 +1086,7 @@ pub(super) fn handle_socket_event(
 ) -> BrokerResult<()> {
     // Readiness publication is best-effort on the shared reactor path: a single
     // association's publication failure must not fail the reactor for every
-    // other session using it (this mirrors the UDP endpoint handler).
+    // other process using it (this mirrors the UDP endpoint handler).
     // `update_snapshot` commits the cached snapshot before publishing, so a
     // dropped notification leaves the cached readiness authoritative. In
     // production an admitted socket's publication does not fail: the broker
@@ -1372,7 +1373,7 @@ impl Reactor {
     fn connect_internal_tcp_socketpair(
         &mut self,
         connector_socket_id: u64,
-        connector_process_authority: ProcessAuthorityKey,
+        connector_process_authority: ProcessId,
         listener_id: u64,
         local_address: SocketAddrV4,
         guest_source_lease: GuestSourceLease,
@@ -1388,24 +1389,24 @@ impl Reactor {
         let combined_count = self.sockets.len().checked_add(next_queued_count).ok_or(
             PlatformConnectError::PeerUnchanged(BrokerError::ResourceExhausted),
         )?;
-        let session = self
-            .sessions
+        let process = self
+            .processes
             .get(&connector_process_authority)
             .ok_or(PlatformConnectError::PeerUnchanged(BrokerError::Internal))?;
-        let next_pending_count = session
+        let next_pending_count = process
             .pending_guest_connection_count
             .checked_add(1)
             .ok_or(PlatformConnectError::PeerUnchanged(
                 BrokerError::ResourceExhausted,
             ))?;
-        let connector_session_count = session
+        let connector_process_count = process
             .live_socket_count
             .checked_add(next_pending_count)
             .ok_or(PlatformConnectError::PeerUnchanged(
                 BrokerError::ResourceExhausted,
             ))?;
         if combined_count > self.max_sockets
-            || connector_session_count > self.max_sockets_per_session
+            || connector_process_count > self.max_sockets_per_process
         {
             return Err(PlatformConnectError::PeerUnchanged(
                 BrokerError::ResourceExhausted,
@@ -1509,9 +1510,9 @@ impl Reactor {
                 guest_source_lease,
             });
         self.tcp.queued_guest_connection_count = next_queued_count;
-        self.sessions
+        self.processes
             .get_mut(&connector_process_authority)
-            .expect("validated connector session missing")
+            .expect("validated connector process missing")
             .pending_guest_connection_count = next_pending_count;
 
         if let Err(error) = update_snapshot(
@@ -1530,7 +1531,7 @@ impl Reactor {
         Ok(SocketConnectionStatus::Connected)
     }
 
-    pub(super) fn remove_tcp_socket(&mut self, id: u64, process_authority: ProcessAuthorityKey) {
+    pub(super) fn remove_tcp_socket(&mut self, id: u64, process_authority: ProcessId) {
         if self
             .tcp
             .peek_cache
@@ -1539,10 +1540,10 @@ impl Reactor {
         {
             self.tcp.peek_cache = None;
         }
-        let session_closing = self
-            .sessions
+        let process_closing = self
+            .processes
             .get(&process_authority)
-            .is_some_and(|session| session.closing);
+            .is_some_and(|process| process.closing);
         let queued_connection = self
             .sockets
             .get(&id)
@@ -1559,7 +1560,7 @@ impl Reactor {
             .get(&id)
             .and_then(|socket| socket.tcp_state().ok())
             .is_some_and(|tcp| tcp.abortive_close);
-        if (session_closing || abortive_close)
+        if (process_closing || abortive_close)
             && let Some((listener_id, connector_socket_id)) = queued_connection
         {
             self.remove_queued_guest_connection(listener_id, connector_socket_id, false);
@@ -1610,33 +1611,30 @@ impl Reactor {
         if reset_peer && let Some(connector_socket_id) = guest_connector_socket_id {
             self.mark_guest_peer_reset(connector_socket_id);
         }
-        if let Some(session) = self.sessions.get_mut(&process_authority) {
-            session.live_socket_count = session
+        if let Some(process) = self.processes.get_mut(&process_authority) {
+            process.live_socket_count = process
                 .live_socket_count
                 .checked_sub(1)
-                .expect("session socket count underflow");
+                .expect("process socket count underflow");
         }
-        self.sessions
-            .retain(|_, session| retain_session_state(session));
+        self.processes
+            .retain(|_, process| retain_process_state(process));
     }
 
-    fn release_queued_guest_connection(
-        &mut self,
-        connector_process_authority: ProcessAuthorityKey,
-    ) {
+    fn release_queued_guest_connection(&mut self, connector_process_authority: ProcessId) {
         self.tcp.queued_guest_connection_count = self
             .tcp
             .queued_guest_connection_count
             .checked_sub(1)
             .expect("reactor queued guest connection count underflow");
-        let session = self
-            .sessions
+        let process = self
+            .processes
             .get_mut(&connector_process_authority)
-            .expect("queued guest connection session state missing");
-        session.pending_guest_connection_count = session
+            .expect("queued guest connection process state missing");
+        process.pending_guest_connection_count = process
             .pending_guest_connection_count
             .checked_sub(1)
-            .expect("session queued guest connection count underflow");
+            .expect("process queued guest connection count underflow");
     }
 
     fn discard_queued_guest_connections(
@@ -1657,14 +1655,11 @@ impl Reactor {
                 self.mark_guest_socket_reset(connection.connector_socket_id);
             }
         }
-        self.sessions
-            .retain(|_, session| retain_session_state(session));
+        self.processes
+            .retain(|_, process| retain_process_state(process));
     }
 
-    pub(super) fn purge_connector_session_queues(
-        &mut self,
-        process_authority: ProcessAuthorityKey,
-    ) {
+    pub(super) fn purge_connector_process_queues(&mut self, process_authority: ProcessId) {
         loop {
             let queued = self.sockets.iter().find_map(|(listener_id, socket)| {
                 socket
@@ -1720,8 +1715,8 @@ impl Reactor {
             self.mark_guest_socket_reset(connection.connector_socket_id);
         }
         let _ = self.publish_listener_queue_readiness(listener_id);
-        self.sessions
-            .retain(|_, session| retain_session_state(session));
+        self.processes
+            .retain(|_, process| retain_process_state(process));
         true
     }
 
@@ -1931,21 +1926,21 @@ impl Reactor {
             accepted_connector_socket_id.ok_or(BrokerError::Internal)?;
         let accepted_connector_process_authority =
             accepted_connector_process_authority.ok_or(BrokerError::Internal)?;
-        let listener_session = self
-            .sessions
+        let listener_process = self
+            .processes
             .get(&listener_process_authority)
             .ok_or(BrokerError::Internal)?;
-        let next_listener_live_count = listener_session
+        let next_listener_live_count = listener_process
             .live_socket_count
             .checked_add(1)
             .ok_or(BrokerError::ResourceExhausted)?;
         let transferred_pending =
             usize::from(accepted_connector_process_authority == listener_process_authority);
         let next_listener_total = next_listener_live_count
-            .checked_add(listener_session.pending_guest_connection_count)
+            .checked_add(listener_process.pending_guest_connection_count)
             .and_then(|count| count.checked_sub(transferred_pending))
             .ok_or(BrokerError::Internal)?;
-        if next_listener_total > self.max_sockets_per_session {
+        if next_listener_total > self.max_sockets_per_process {
             return Err(BrokerError::ResourceExhausted);
         }
         {
@@ -2039,11 +2034,11 @@ impl Reactor {
                 guest_local_address: Some(local_address),
             },
         );
-        let session = self
-            .sessions
+        let process = self
+            .processes
             .get_mut(&listener_process_authority)
             .ok_or(BrokerError::Internal)?;
-        session.live_socket_count = next_listener_live_count;
+        process.live_socket_count = next_listener_live_count;
         if queue_length == 1 {
             let _ = self.publish_listener_queue_readiness(listener_id);
         }

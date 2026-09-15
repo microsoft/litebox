@@ -506,7 +506,7 @@ fn test_nine_p_host_files_visible() {
 
 /// A transport wrapper that allows a fixed number of write-message calls to
 /// succeed, then fails all subsequent I/O. This simulates a connection that
-/// breaks in the middle of a session.
+/// breaks in the middle of a process.
 ///
 /// Reads are only failed once a write has actually been rejected, so the
 /// response to the last successful write is still received.

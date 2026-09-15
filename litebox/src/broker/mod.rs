@@ -10,6 +10,7 @@ use core::net::SocketAddrV4;
 use hashbrown::HashMap;
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::ObjectHandle;
+use litebox_broker_protocol::ThreadId;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{ConsumeEventResponse, EventConsumeMode};
 use litebox_broker_protocol::fs::{
@@ -48,6 +49,13 @@ use shared_buffer::{AcquireError, SlotAllocator, SlotLease};
 /// Longer-term broker integrations should move away from blocking control calls
 /// once the local-core wait and notification model supports that shape.
 pub(crate) trait BrokerControl: Send + Sync {
+    fn allocate_thread_id(&self) -> core::result::Result<ThreadId, BrokerControlError>;
+
+    fn release_thread_id(
+        &self,
+        thread_id: ThreadId,
+    ) -> core::result::Result<(), BrokerControlError>;
+
     fn fill_random(&self, output: &mut [u8]) -> core::result::Result<(), BrokerControlError>;
 
     fn is_stdio_terminal(
@@ -432,6 +440,17 @@ where
     Platform: RawSyncPrimitivesProvider + TimeProvider,
     Channel: LocalCallChannel + Send + Sync,
 {
+    fn allocate_thread_id(&self) -> core::result::Result<ThreadId, BrokerControlError> {
+        self.request(BrokerLocal::allocate_thread_id)
+    }
+
+    fn release_thread_id(
+        &self,
+        thread_id: ThreadId,
+    ) -> core::result::Result<(), BrokerControlError> {
+        self.request(|local| local.release_thread_id(thread_id))
+    }
+
     fn fill_random(&self, output: &mut [u8]) -> core::result::Result<(), BrokerControlError> {
         if output.len() > MAX_RANDOM_TRANSFER_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
@@ -1075,10 +1094,7 @@ mod tests {
         ) -> core::result::Result<Option<BrokerHandshakeResponse>, Self::Error> {
             Ok(Some(BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
-                process_identity: litebox_broker_protocol::ProcessIdentity {
-                    id: litebox_broker_protocol::ProcessId::new(1).unwrap(),
-                    parent_id: None,
-                },
+                process_id: litebox_broker_protocol::ProcessId::new(1).unwrap(),
             }))
         }
     }
@@ -1137,10 +1153,7 @@ mod tests {
         ) -> core::result::Result<Option<BrokerHandshakeResponse>, Self::Error> {
             Ok(Some(BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
-                process_identity: litebox_broker_protocol::ProcessIdentity {
-                    id: litebox_broker_protocol::ProcessId::new(1).unwrap(),
-                    parent_id: None,
-                },
+                process_id: litebox_broker_protocol::ProcessId::new(1).unwrap(),
             }))
         }
     }

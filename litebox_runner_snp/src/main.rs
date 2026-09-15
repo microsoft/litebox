@@ -154,10 +154,7 @@ pub extern "C" fn sandbox_process_init(
 
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new(
         platform,
-        litebox_broker_protocol::ProcessIdentity {
-            id: litebox_broker_protocol::ProcessId::new(1).unwrap(),
-            parent_id: None,
-        },
+        litebox_broker_protocol::ProcessId::new(1).unwrap(),
     );
     let shim = shim_builder.build();
     let initialized = SHIM.set(Box::new(shim)).is_ok();

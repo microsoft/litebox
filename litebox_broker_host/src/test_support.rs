@@ -282,10 +282,10 @@ mod tests {
         ))
         .build()
         .unwrap();
-        broker
-            .create_session(CallerCredential::Unauthenticated)
-            .unwrap()
-            .finish();
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        litebox_broker_core::BrokerProcess::finish(process);
         let mut setup = InProcessBrokerSetup::new(broker);
 
         setup
@@ -295,12 +295,9 @@ mod tests {
             .unwrap();
         let response = setup.recv_handshake_response().unwrap().unwrap();
 
-        let BrokerHandshakeResponse::Negotiated {
-            process_identity, ..
-        } = response
-        else {
+        let BrokerHandshakeResponse::Negotiated { process_id, .. } = response else {
             panic!("the in-process broker must negotiate");
         };
-        assert_eq!(process_identity.id.get(), 2);
+        assert_eq!(process_id.get(), 2);
     }
 }

@@ -436,7 +436,7 @@ fn spawn_test_broker_with_mode(
                 .with_socket_provider(std::sync::Arc::new(
                     litebox_broker_platform_linux_userland::LinuxSocketProvider::new(
                         limits.max_sockets,
-                        limits.max_sockets_per_session,
+                        limits.max_sockets_per_process,
                     )
                     .expect("failed to create broker test socket provider"),
                 ))

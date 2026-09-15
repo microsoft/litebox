@@ -2560,7 +2560,7 @@ mod tests {
     fn created_process_environment_snapshot() -> CreatedProcessEnvironmentSnapshot {
         // Process environment construction only writes guest memory, so this needs no files and
         // uses the objectless broker association.
-        let litebox = crate::test_broker::litebox(crate::tests::test_platform());
+        let (litebox, _) = crate::test_broker::litebox(crate::tests::test_platform());
         let page_manager = crate::WindowsPageManager::<crate::tests::TestPlatform>::new(&litebox);
         let image = loaded_module_image(application_module_base());
 

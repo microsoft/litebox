@@ -468,8 +468,25 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let Some(ntdll) = self.process.ntdll else {
             return NtStatus::NOT_SUPPORTED;
         };
-        let Some(thread_id) = self.process.allocate_thread_id() else {
-            return NtStatus::QUOTA_EXCEEDED;
+        let broker_thread_id = match self.global.litebox.allocate_thread_id() {
+            Ok(thread_id) => thread_id,
+            Err(error) => {
+                litebox_util_log::error!(
+                    error:% = error;
+                    "Failed to allocate Windows thread ID"
+                );
+                return NtStatus::QUOTA_EXCEEDED;
+            }
+        };
+        let thread_id = broker_thread_id.get() as usize;
+        let release_thread_id = || {
+            if let Err(error) = self.global.litebox.release_thread_id(broker_thread_id) {
+                litebox_util_log::error!(
+                    error:% = error,
+                    thread_id = broker_thread_id.get();
+                    "Failed to roll back Windows thread ID"
+                );
+            }
         };
         let environment = match create_thread_environment(
             &self.global.page_manager,
@@ -484,6 +501,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             Ok(environment) => environment,
             Err(error) => {
                 litebox_util_log::error!(error:% = error; "Failed to create Windows thread environment");
+                release_thread_id();
                 return NtStatus::NO_MEMORY;
             }
         };
@@ -497,6 +515,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .write_at_offset(0, initial_context)
             .is_none()
         {
+            release_thread_id();
             return NtStatus::ACCESS_VIOLATION;
         }
         let mut child_ctx = ctx.clone();
@@ -515,6 +534,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         );
         if !self.process.attach_thread(thread_id, &thread) {
             // The process is tearing down; refuse to start another thread.
+            release_thread_id();
             return NtStatus::PROCESS_IS_TERMINATING;
         }
         let granted_access = ThreadAccess::from_desired_access(desired_access);
@@ -528,6 +548,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             Ok(handle) => handle,
             Err(status) => {
                 self.process.detach_thread(thread_id);
+                release_thread_id();
                 return status;
             }
         };
@@ -553,6 +574,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             litebox_util_log::error!(error:% = error; "Failed to spawn Windows guest thread");
             self.close_typed_handle::<ThreadSubsystem<Platform>>(handle, drop);
             self.process.detach_thread(thread_id);
+            release_thread_id();
             return NtStatus::NO_MEMORY;
         }
 

@@ -15,7 +15,7 @@ use crate::{ConstPtr, MutPtr, ShimPlatform, Task};
 
 const ACTIVE_PROCESS_EXIT_STATUS: i32 = 0x0000_0103;
 const NORMAL_PROCESS_BASE_PRIORITY: i32 = 8;
-#[cfg(test)]
+#[cfg(all(test, target_os = "windows"))]
 pub(crate) const INITIAL_PROCESS_ID: usize = 1;
 #[cfg(all(test, target_os = "windows"))]
 pub(crate) const INITIAL_THREAD_ID: usize = 2;
@@ -914,11 +914,10 @@ mod tests {
 
     #[test]
     fn process_basic_information_uses_broker_identity() {
-        let process_identity = litebox_broker_protocol::ProcessIdentity {
-            id: litebox_broker_protocol::ProcessId::new(37).unwrap(),
-            parent_id: Some(litebox_broker_protocol::ProcessId::new(11).unwrap()),
-        };
-        let task = crate::tests::test_task_with_process_identity(process_identity);
+        let task = crate::tests::test_task_with_process_id(
+            litebox_broker_protocol::ProcessId::new(37).unwrap(),
+            Some(litebox_broker_protocol::ProcessId::new(11).unwrap()),
+        );
 
         let information = task.process_basic_information();
 

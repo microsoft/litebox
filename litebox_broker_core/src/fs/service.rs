@@ -19,8 +19,8 @@ use super::errors::{
     ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
 };
 use super::resolver::{Resolver, ResolverEntry};
-use crate::session::{ObjectEntry, ObjectRights};
-use crate::{BrokerError, BrokerSession, Result};
+use crate::process::{ObjectEntry, ObjectRights};
+use crate::{BrokerError, BrokerProcess, Result};
 
 /// Guest-visible result of a broker file operation.
 pub type FileResult<T> = core::result::Result<T, FileError>;
@@ -43,14 +43,14 @@ impl File {
 
 mod private {
     use super::{
-        BrokerError, BrokerSession, File, FileAccessMode, FileDirectoryEntry, FileMode,
+        BrokerError, BrokerProcess, File, FileAccessMode, FileDirectoryEntry, FileMode,
         FileOpenFlags, FileSeekWhence, FileStatus, FileUser, ServiceResult, Vec,
     };
 
     pub trait Service: Send + Sync {
         fn open(
             &self,
-            _session: &BrokerSession,
+            _session: &BrokerProcess,
             _path: &str,
             _user: FileUser,
             _access: FileAccessMode,
@@ -62,7 +62,7 @@ mod private {
 
         fn read(
             &self,
-            _session: &BrokerSession,
+            _session: &BrokerProcess,
             _file: &File,
             _output: &mut [u8],
             _offset: Option<u64>,
@@ -72,7 +72,7 @@ mod private {
 
         fn write(
             &self,
-            _session: &BrokerSession,
+            _session: &BrokerProcess,
             _file: &File,
             _input: &[u8],
             _offset: Option<u64>,
@@ -82,7 +82,7 @@ mod private {
 
         fn seek(
             &self,
-            _session: &BrokerSession,
+            _session: &BrokerProcess,
             _file: &File,
             _offset: i64,
             _whence: FileSeekWhence,
@@ -92,7 +92,7 @@ mod private {
 
         fn truncate(
             &self,
-            _session: &BrokerSession,
+            _session: &BrokerProcess,
             _file: &File,
             _length: u64,
             _reset_offset: bool,
@@ -102,7 +102,7 @@ mod private {
 
         fn read_directory(
             &self,
-            _session: &BrokerSession,
+            _session: &BrokerProcess,
             _file: &File,
         ) -> ServiceResult<Vec<FileDirectoryEntry>> {
             Err(BrokerError::UnsupportedOperation)
@@ -110,7 +110,7 @@ mod private {
 
         fn handle_status(
             &self,
-            _session: &BrokerSession,
+            _session: &BrokerProcess,
             _file: &File,
         ) -> ServiceResult<FileStatus> {
             Err(BrokerError::UnsupportedOperation)
@@ -118,7 +118,7 @@ mod private {
 
         fn path_status(
             &self,
-            _session: &BrokerSession,
+            _session: &BrokerProcess,
             _path: &str,
             _user: FileUser,
         ) -> ServiceResult<FileStatus> {
@@ -127,7 +127,7 @@ mod private {
 
         fn chmod(
             &self,
-            _session: &BrokerSession,
+            _session: &BrokerProcess,
             _path: &str,
             _user: FileUser,
             _mode: FileMode,
@@ -137,7 +137,7 @@ mod private {
 
         fn chown(
             &self,
-            _session: &BrokerSession,
+            _session: &BrokerProcess,
             _path: &str,
             _acting_user: FileUser,
             _user: Option<u16>,
@@ -148,7 +148,7 @@ mod private {
 
         fn unlink(
             &self,
-            _session: &BrokerSession,
+            _session: &BrokerProcess,
             _path: &str,
             _user: FileUser,
         ) -> ServiceResult<()> {
@@ -157,7 +157,7 @@ mod private {
 
         fn mkdir(
             &self,
-            _session: &BrokerSession,
+            _session: &BrokerProcess,
             _path: &str,
             _user: FileUser,
             _mode: FileMode,
@@ -167,7 +167,7 @@ mod private {
 
         fn rmdir(
             &self,
-            _session: &BrokerSession,
+            _session: &BrokerProcess,
             _path: &str,
             _user: FileUser,
         ) -> ServiceResult<()> {
@@ -197,7 +197,7 @@ where
 {
     fn open(
         &self,
-        _session: &BrokerSession,
+        _session: &BrokerProcess,
         path: &str,
         user: FileUser,
         access: FileAccessMode,
@@ -214,7 +214,7 @@ where
 
     fn read(
         &self,
-        session: &BrokerSession,
+        process: &BrokerProcess,
         file: &File,
         output: &mut [u8],
         offset: Option<u64>,
@@ -231,7 +231,7 @@ where
             if !entry.allows_read() {
                 return Ok(Err(FileError::NotForReading));
             }
-            device.read(session, output)
+            device.read(process, output)
         } else if offset.is_some() || !entry.uses_position() {
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
@@ -258,7 +258,7 @@ where
 
     fn write(
         &self,
-        session: &BrokerSession,
+        process: &BrokerProcess,
         file: &File,
         input: &[u8],
         offset: Option<u64>,
@@ -275,7 +275,7 @@ where
             if !entry.allows_write() {
                 return Ok(Err(FileError::NotForWriting));
             }
-            device.write(session, input)
+            device.write(process, input)
         } else if offset.is_some() || !entry.uses_position() {
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
@@ -302,7 +302,7 @@ where
 
     fn seek(
         &self,
-        _session: &BrokerSession,
+        _session: &BrokerProcess,
         file: &File,
         offset: i64,
         whence: FileSeekWhence,
@@ -334,7 +334,7 @@ where
 
     fn truncate(
         &self,
-        _session: &BrokerSession,
+        _session: &BrokerProcess,
         file: &File,
         length: u64,
         reset_offset: bool,
@@ -362,7 +362,7 @@ where
 
     fn read_directory(
         &self,
-        _session: &BrokerSession,
+        _session: &BrokerProcess,
         file: &File,
     ) -> ServiceResult<Vec<FileDirectoryEntry>> {
         let entry = file
@@ -381,7 +381,7 @@ where
         Ok(Ok(entries))
     }
 
-    fn handle_status(&self, _session: &BrokerSession, file: &File) -> ServiceResult<FileStatus> {
+    fn handle_status(&self, _session: &BrokerProcess, file: &File) -> ServiceResult<FileStatus> {
         let entry = file
             .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
             .read();
@@ -395,7 +395,7 @@ where
 
     fn path_status(
         &self,
-        _session: &BrokerSession,
+        _session: &BrokerProcess,
         path: &str,
         user: FileUser,
     ) -> ServiceResult<FileStatus> {
@@ -409,7 +409,7 @@ where
 
     fn chmod(
         &self,
-        _session: &BrokerSession,
+        _session: &BrokerProcess,
         path: &str,
         user: FileUser,
         mode: FileMode,
@@ -419,7 +419,7 @@ where
 
     fn chown(
         &self,
-        _session: &BrokerSession,
+        _session: &BrokerProcess,
         path: &str,
         acting_user: FileUser,
         user: Option<u16>,
@@ -428,13 +428,13 @@ where
         Ok(Resolver::chown(self, acting_user, path, user, group).map_err(file_chown_error))
     }
 
-    fn unlink(&self, _session: &BrokerSession, path: &str, user: FileUser) -> ServiceResult<()> {
+    fn unlink(&self, _session: &BrokerProcess, path: &str, user: FileUser) -> ServiceResult<()> {
         Ok(Resolver::unlink(self, user, path).map_err(file_unlink_error))
     }
 
     fn mkdir(
         &self,
-        _session: &BrokerSession,
+        _session: &BrokerProcess,
         path: &str,
         user: FileUser,
         mode: FileMode,
@@ -442,29 +442,29 @@ where
         Ok(Resolver::mkdir(self, user, path, mode & FileMode::SUPPORTED).map_err(file_mkdir_error))
     }
 
-    fn rmdir(&self, _session: &BrokerSession, path: &str, user: FileUser) -> ServiceResult<()> {
+    fn rmdir(&self, _session: &BrokerProcess, path: &str, user: FileUser) -> ServiceResult<()> {
         Ok(Resolver::rmdir(self, user, path).map_err(file_rmdir_error))
     }
 }
 
-/// Opens an absolute path and installs its broker-owned open state in `session`.
+/// Opens an absolute path and installs its broker-owned open state in `process`.
 pub fn open(
-    session: &BrokerSession,
+    process: &BrokerProcess,
     path: &str,
     user: FileUser,
     access: FileAccessMode,
     flags: FileOpenFlags,
     mode: FileMode,
 ) -> Result<FileResult<ObjectHandle>> {
-    let rights = authorize(session, open_required_rights(access, flags)?)?;
+    let rights = authorize(process, open_required_rights(access, flags)?)?;
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    let reference = session.reserve_object_reference(rights)?;
-    let file = match session
+    let reference = process.reserve_object_reference(rights)?;
+    let file = match process
         .core
         .fs
-        .open(session, path, user, access, flags, mode)?
+        .open(process, path, user, access, flags, mode)?
     {
         Ok(file) => file,
         Err(error) => return Ok(Err(error)),
@@ -474,7 +474,7 @@ pub fn open(
 
 /// Reads bytes from a broker-owned open file.
 pub fn read(
-    session: &BrokerSession,
+    process: &BrokerProcess,
     handle: ObjectHandle,
     output: &mut [u8],
     offset: Option<u64>,
@@ -482,13 +482,13 @@ pub fn read(
     if output.len() > MAX_FILE_TRANSFER_SIZE as usize {
         return Err(BrokerError::ResourceExhausted);
     }
-    let file = file(session, handle, ObjectRights::WAIT)?;
-    session.core.fs.read(session, &file, output, offset)
+    let file = file(process, handle, ObjectRights::WAIT)?;
+    process.core.fs.read(process, &file, output, offset)
 }
 
 /// Writes bytes to a broker-owned open file.
 pub fn write(
-    session: &BrokerSession,
+    process: &BrokerProcess,
     handle: ObjectHandle,
     input: &[u8],
     offset: Option<u64>,
@@ -496,135 +496,135 @@ pub fn write(
     if input.len() > MAX_FILE_TRANSFER_SIZE as usize {
         return Err(BrokerError::ResourceExhausted);
     }
-    let file = file(session, handle, ObjectRights::WRITE)?;
-    session.core.fs.write(session, &file, input, offset)
+    let file = file(process, handle, ObjectRights::WRITE)?;
+    process.core.fs.write(process, &file, input, offset)
 }
 
 /// Repositions the shared offset of a broker-owned open file.
 pub fn seek(
-    session: &BrokerSession,
+    process: &BrokerProcess,
     handle: ObjectHandle,
     offset: i64,
     whence: FileSeekWhence,
 ) -> Result<FileResult<u64>> {
-    let file = file_with_any_rights(session, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
-    session.core.fs.seek(session, &file, offset, whence)
+    let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
+    process.core.fs.seek(process, &file, offset, whence)
 }
 
 /// Changes the length of a broker-owned open file.
 pub fn truncate(
-    session: &BrokerSession,
+    process: &BrokerProcess,
     handle: ObjectHandle,
     length: u64,
     reset_offset: bool,
 ) -> Result<FileResult<()>> {
-    let file = file(session, handle, ObjectRights::WRITE)?;
-    session
+    let file = file(process, handle, ObjectRights::WRITE)?;
+    process
         .core
         .fs
-        .truncate(session, &file, length, reset_offset)
+        .truncate(process, &file, length, reset_offset)
 }
 
 /// Returns a fresh enumeration of a broker-owned open directory.
 pub fn read_directory(
-    session: &BrokerSession,
+    process: &BrokerProcess,
     handle: ObjectHandle,
 ) -> Result<FileResult<Vec<FileDirectoryEntry>>> {
-    let file = file(session, handle, ObjectRights::WAIT)?;
-    session.core.fs.read_directory(session, &file)
+    let file = file(process, handle, ObjectRights::WAIT)?;
+    process.core.fs.read_directory(process, &file)
 }
 
 /// Returns status for a broker-owned open object.
 pub fn handle_status(
-    session: &BrokerSession,
+    process: &BrokerProcess,
     handle: ObjectHandle,
 ) -> Result<FileResult<FileStatus>> {
-    let file = file_with_any_rights(session, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
-    session.core.fs.handle_status(session, &file)
+    let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
+    process.core.fs.handle_status(process, &file)
 }
 
 /// Returns status for an absolute path.
 pub fn path_status(
-    session: &BrokerSession,
+    process: &BrokerProcess,
     path: &str,
     user: FileUser,
 ) -> Result<FileResult<FileStatus>> {
-    authorize(session, ObjectRights::WAIT)?;
+    authorize(process, ObjectRights::WAIT)?;
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    session.core.fs.path_status(session, path, user)
+    process.core.fs.path_status(process, path, user)
 }
 
 /// Changes mode bits for an absolute path.
 pub fn chmod(
-    session: &BrokerSession,
+    process: &BrokerProcess,
     path: &str,
     user: FileUser,
     mode: FileMode,
 ) -> Result<FileResult<()>> {
-    authorize(session, ObjectRights::WRITE)?;
+    authorize(process, ObjectRights::WRITE)?;
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    session.core.fs.chmod(session, path, user, mode)
+    process.core.fs.chmod(process, path, user, mode)
 }
 
 /// Changes ownership for an absolute path.
 pub fn chown(
-    session: &BrokerSession,
+    process: &BrokerProcess,
     path: &str,
     acting_user: FileUser,
     user: Option<u16>,
     group: Option<u16>,
 ) -> Result<FileResult<()>> {
-    authorize(session, ObjectRights::WRITE)?;
+    authorize(process, ObjectRights::WRITE)?;
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    session
+    process
         .core
         .fs
-        .chown(session, path, acting_user, user, group)
+        .chown(process, path, acting_user, user, group)
 }
 
 /// Removes a file at an absolute path.
-pub fn unlink(session: &BrokerSession, path: &str, user: FileUser) -> Result<FileResult<()>> {
-    authorize(session, ObjectRights::WRITE)?;
+pub fn unlink(process: &BrokerProcess, path: &str, user: FileUser) -> Result<FileResult<()>> {
+    authorize(process, ObjectRights::WRITE)?;
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    session.core.fs.unlink(session, path, user)
+    process.core.fs.unlink(process, path, user)
 }
 
 /// Creates a directory at an absolute path.
 pub fn mkdir(
-    session: &BrokerSession,
+    process: &BrokerProcess,
     path: &str,
     user: FileUser,
     mode: FileMode,
 ) -> Result<FileResult<()>> {
-    authorize(session, ObjectRights::WRITE)?;
+    authorize(process, ObjectRights::WRITE)?;
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    session.core.fs.mkdir(session, path, user, mode)
+    process.core.fs.mkdir(process, path, user, mode)
 }
 
 /// Removes a directory at an absolute path.
-pub fn rmdir(session: &BrokerSession, path: &str, user: FileUser) -> Result<FileResult<()>> {
-    authorize(session, ObjectRights::WRITE)?;
+pub fn rmdir(process: &BrokerProcess, path: &str, user: FileUser) -> Result<FileResult<()>> {
+    authorize(process, ObjectRights::WRITE)?;
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
-    session.core.fs.rmdir(session, path, user)
+    process.core.fs.rmdir(process, path, user)
 }
 
-fn authorize(session: &BrokerSession, required: ObjectRights) -> Result<ObjectRights> {
-    let rights = session
+fn authorize(process: &BrokerProcess, required: ObjectRights) -> Result<ObjectRights> {
+    let rights = process
         .core
         .policy
-        .principal_object_rights(session.caller_credential)?;
+        .principal_object_rights(process.caller_credential)?;
     if rights.contains(required) {
         Ok(rights)
     } else {
@@ -666,11 +666,11 @@ fn checked_offset(offset: Option<u64>, length: usize) -> FileResult<Option<usize
 }
 
 fn file(
-    session: &BrokerSession,
+    process: &BrokerProcess,
     handle: ObjectHandle,
     required_rights: ObjectRights,
 ) -> Result<File> {
-    let object = session.authorized_object(handle, required_rights)?;
+    let object = process.authorized_object(handle, required_rights)?;
     let object = object.read();
     match &*object {
         ObjectEntry::File(file) => Ok(file.clone()),
@@ -682,11 +682,11 @@ fn file(
 }
 
 fn file_with_any_rights(
-    session: &BrokerSession,
+    process: &BrokerProcess,
     handle: ObjectHandle,
     allowed_rights: ObjectRights,
 ) -> Result<File> {
-    let object = session.authorized_object_with_any_rights(handle, allowed_rights)?;
+    let object = process.authorized_object_with_any_rights(handle, allowed_rights)?;
     let object = object.read();
     match &*object {
         ObjectEntry::File(file) => Ok(file.clone()),

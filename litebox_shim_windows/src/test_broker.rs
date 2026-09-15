@@ -9,17 +9,17 @@
 //! there.
 //!
 //! Ordinary shim tests therefore use [`litebox`], whose association negotiates the protocol and
-//! owns shared memory but serves no objects: any request it receives is a bug in the test or in
-//! the shim, and panics. The few tests that genuinely exercise file-backed behavior (registry
-//! persistence and defaults, NLS section mapping, file syscalls, and file-backed sections) use
-//! [`litebox_with_broker_files`], which owns a broker core for the test process.
+//! owns shared memory but serves no objects beyond broker-managed process and thread state. Any
+//! object request it receives is a bug in the test or in the shim and panics. The few tests that
+//! genuinely exercise file-backed behavior (registry persistence and defaults, NLS section
+//! mapping, file syscalls, and file-backed sections) use [`litebox_with_broker_files`].
 
 extern crate std;
 
 use alloc::{string::String, sync::Arc, vec::Vec};
 
 use litebox_broker_core::{
-    ObjectRights, PolicyEngine,
+    BrokerProcess, CallerCredential, ObjectRights, PolicyEngine,
     fs::{in_mem::InitialNode, resolver::Resolver},
     test_support::TestBrokerCoreBuilder,
 };
@@ -42,23 +42,55 @@ use crate::tests::TestPlatform;
 /// Returns a LiteBox whose broker association serves no objects.
 ///
 /// The association negotiates the protocol and owns real shared memory, so the local side of the
-/// boundary behaves normally, but every request panics. This keeps tests that are not about
-/// broker-backed resources honest about what they exercise.
-pub(crate) fn litebox(platform: &'static TestPlatform) -> litebox::LiteBox<TestPlatform> {
+/// boundary behaves normally, but object requests panic. Process and thread ID operations are
+/// handled by a real broker core.
+pub(crate) fn litebox(
+    platform: &'static TestPlatform,
+) -> (
+    litebox::LiteBox<TestPlatform>,
+    litebox_broker_protocol::ProcessId,
+) {
+    let broker = crate::tests::objectless_broker();
     let channel = ObjectlessChannel {
         memory: shared_memory(),
+        process: Some(
+            broker
+                .create_process(CallerCredential::Unauthenticated)
+                .unwrap(),
+        ),
     };
     let (broker_local, ()) = BrokerLocal::negotiate(channel, |channel| {
         let memory = Arc::clone(&channel.memory);
         Ok((channel, memory, ()))
     })
     .expect("the objectless broker fixture must negotiate");
-    litebox::LiteBox::new_with_broker_local(platform, broker_local)
+    let process_id = broker_local.process_id();
+    (
+        litebox::LiteBox::new_with_broker_local(platform, broker_local),
+        process_id,
+    )
 }
 
 /// The local end of an association that owns shared memory but no objects.
 struct ObjectlessChannel {
     memory: Arc<dyn SharedMemory>,
+    process: Option<Arc<BrokerProcess>>,
+}
+
+impl ObjectlessChannel {
+    fn process(&self) -> &BrokerProcess {
+        self.process
+            .as_deref()
+            .expect("the objectless broker process must remain active")
+    }
+}
+
+impl Drop for ObjectlessChannel {
+    fn drop(&mut self) {
+        if let Some(process) = self.process.take() {
+            process.finish();
+        }
+    }
 }
 
 impl LocalSetupChannel for ObjectlessChannel {
@@ -77,10 +109,7 @@ impl LocalSetupChannel for ObjectlessChannel {
     ) -> core::result::Result<Option<BrokerHandshakeResponse>, Self::Error> {
         Ok(Some(BrokerHandshakeResponse::Negotiated {
             broker_protocol_version: BROKER_PROTOCOL_VERSION,
-            process_identity: litebox_broker_protocol::ProcessIdentity {
-                id: litebox_broker_protocol::ProcessId::new(1).unwrap(),
-                parent_id: None,
-            },
+            process_id: self.process().id(),
         }))
     }
 }
@@ -89,13 +118,27 @@ impl LocalCallChannel for ObjectlessChannel {
     type Error = core::convert::Infallible;
 
     fn call(&self, request: BrokerRequest) -> core::result::Result<BrokerResponse, Self::Error> {
-        match request.operation {
+        let result = match request.operation {
+            BrokerOperation::AllocateThreadId => self.process().allocate_thread_id().map_or_else(
+                |error| litebox_broker_protocol::message::BrokerResult::Error(error.into()),
+                litebox_broker_protocol::message::BrokerResult::ThreadIdAllocated,
+            ),
+            BrokerOperation::ReleaseThreadId(thread_id) => {
+                self.process().release_thread_id(thread_id).map_or_else(
+                    |error| litebox_broker_protocol::message::BrokerResult::Error(error.into()),
+                    |()| litebox_broker_protocol::message::BrokerResult::ThreadIdReleased,
+                )
+            }
             BrokerOperation::File(request) => panic!(
                 "this task's broker serves no files; tests that need them must build their task \
                  with `crate::tests::test_task_with_broker_files`: {request:?}"
             ),
             operation => panic!("this task's broker serves no objects: {operation:?}"),
-        }
+        };
+        Ok(BrokerResponse {
+            request_id: request.request_id,
+            result,
+        })
     }
 }
 
@@ -109,7 +152,10 @@ impl LocalCallChannel for ObjectlessChannel {
 pub(crate) fn litebox_with_broker_files(
     platform: &'static TestPlatform,
     entries: Vec<(String, InitialNode)>,
-) -> litebox::LiteBox<TestPlatform> {
+) -> (
+    litebox::LiteBox<TestPlatform>,
+    litebox_broker_protocol::ProcessId,
+) {
     let in_mem = litebox_broker_core::fs::in_mem::InMem::<TestPlatform>::new_initialized(entries);
     let fs = litebox_broker_core::fs::composer::Composer::builder()
         .mount("/", |_| in_mem)
@@ -130,7 +176,8 @@ pub(crate) fn litebox_with_broker_files(
         Ok((setup.activate(), memory, ()))
     })
     .unwrap();
+    let process_id = broker_local.process_id();
     let litebox = litebox::LiteBox::new_with_broker_local(platform, broker_local);
     readiness.attach(litebox.broker_notification_dispatcher());
-    litebox
+    (litebox, process_id)
 }

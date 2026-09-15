@@ -1872,6 +1872,7 @@ version = "0.1.0"
 dependencies = [
  "arrayvec",
  "litebox",
+ "litebox_broker_protocol",
  "litebox_common_linux",
  "litebox_platform_linux_kernel",
  "litebox_shim_linux",
