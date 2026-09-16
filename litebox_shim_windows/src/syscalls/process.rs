@@ -1130,6 +1130,7 @@ mod tests {
 
                 if supported_status != NtStatus::INVALID_INFO_CLASS {
                     assert_eq!(supported_status, NtStatus::SUCCESS);
+                    let task = crate::tests::test_task();
 
                     for (
                         process_handle,
@@ -1234,7 +1235,6 @@ mod tests {
                             host_process_information,
                             process_information_length,
                         );
-                        let task = crate::tests::test_task();
                         let shim = task.sys_nt_set_information_process(
                             shim_process_handle,
                             process_information_class,
