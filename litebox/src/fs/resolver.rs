@@ -663,8 +663,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             return Err(ReadError::NotForReading);
         }
         if entry.entry.path_only {
-            // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
-            unimplemented!("read from O_PATH fd")
+            return Err(ReadError::NotForReading);
         }
 
         let read_offset = match seek_behavior {
@@ -711,8 +710,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             return Err(WriteError::NotForWriting);
         }
         if entry.entry.path_only {
-            // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
-            unimplemented!("write to O_PATH fd")
+            return Err(WriteError::NotForWriting);
         }
 
         let write_offset = match seek_behavior {
@@ -752,8 +750,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             Handle::Dir(_) => return Err(SeekError::NotAFile),
         };
         if entry.entry.path_only {
-            // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
-            unimplemented!("seek on O_PATH fd")
+            return Err(SeekError::NonSeekable);
         }
 
         match entry.entry.seek_behavior {
@@ -810,8 +807,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             return Err(TruncateError::NotForWriting);
         }
         if entry.entry.path_only {
-            // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
-            unimplemented!("truncate O_PATH fd")
+            return Err(TruncateError::NotForWriting);
         }
 
         self.backend.truncate(file, length)?;
@@ -957,8 +953,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             .ok_or(ReadDirError::ClosedFd)?;
         let entry = entry.get_entry();
         if entry.entry.path_only {
-            // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
-            unimplemented!("read_dir on O_PATH fd")
+            return Err(ReadDirError::NotADirectory);
         }
         let dir = match &entry.entry.handle {
             Handle::File(_) => return Err(ReadDirError::NotADirectory),
