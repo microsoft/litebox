@@ -470,6 +470,10 @@ pub fn hook_syscalls_in_elf_with_options(
 /// LiteBox trampoline appended as a file overlay. The Windows shim loader maps
 /// that overlay by reading the footer this function appends.
 pub fn rewrite_pe_for_litebox(input_binary: &[u8], trampoline: Option<u64>) -> Result<Vec<u8>> {
+    if is_already_hooked(input_binary, Arch::X86_64) {
+        return Ok(input_binary.to_vec());
+    }
+
     let mut backing = vec![0u64; input_binary.len().div_ceil(8)];
     let buf: &mut [u8] = zerocopy::IntoBytes::as_mut_bytes(backing.as_mut_slice());
     buf[..input_binary.len()].copy_from_slice(input_binary);
@@ -481,9 +485,6 @@ pub fn rewrite_pe_for_litebox(input_binary: &[u8], trampoline: Option<u64>) -> R
             return Err(Error::UnsupportedExecutable(
                 "PE rewriting currently supports only x86-64".into(),
             ));
-        }
-        if is_already_hooked(input_binary, Arch::X86_64) {
-            return Ok(input_binary.to_vec());
         }
         let optional_header = pe.nt_headers().optional_header();
         let size_of_image = u64::from(optional_header.size_of_image());
