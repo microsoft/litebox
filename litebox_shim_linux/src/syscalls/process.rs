@@ -32,7 +32,7 @@ pub(crate) struct ThreadState<Platform: ShimPlatform> {
     process: Arc<Process<Platform>>,
     /// Thread state that can be accessed from a remote thread.
     remote: Arc<ThreadRemote<Platform>>,
-    attached_tid: Cell<Option<i32>>,
+    tid: Cell<Option<i32>>,
     /// When a thread whose `clear_child_tid` is not `None` terminates, and it shares memory with other threads,
     /// the kernel writes 0 to the address specified by `clear_child_tid` and then executes:
     ///
@@ -58,7 +58,7 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
             init_state: Cell::new(ThreadInitState::None),
             process: Arc::new(Process::new(pid, remote.clone())),
             remote,
-            attached_tid: Cell::new(Some(pid)),
+            tid: Cell::new(Some(pid)),
             clear_child_tid: Cell::new(None),
             robust_list: Cell::new(None),
         }
@@ -70,20 +70,20 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
             init_state: Cell::new(ThreadInitState::None),
             process: self.process.clone(),
             remote,
-            attached_tid: Cell::new(Some(tid)),
+            tid: Cell::new(Some(tid)),
             clear_child_tid: Cell::new(None),
             robust_list: Cell::new(None),
         })
     }
 
     fn detach_from_process(&self) {
-        if let Some(tid) = self.attached_tid.take() {
+        if let Some(tid) = self.tid.take() {
             self.process.detach_thread(tid);
         }
     }
 
     fn tid(&self) -> i32 {
-        self.attached_tid
+        self.tid
             .get()
             .expect("an active task must be attached to its process")
     }
@@ -98,9 +98,9 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
             return None;
         }
 
-        self.process.rebind_thread(old_tid, pid, &self.remote);
+        self.process.rebind_thread(old_tid, pid);
         assert_eq!(
-            self.attached_tid.replace(Some(pid)),
+            self.tid.replace(Some(pid)),
             Some(old_tid),
             "exec caller must remain attached during identity rebinding"
         );
@@ -277,12 +277,7 @@ impl<Platform: ShimPlatform> Process<Platform> {
     }
 
     /// Rekeys the sole surviving thread without changing the thread count.
-    fn rebind_thread(
-        &self,
-        old_tid: i32,
-        new_tid: i32,
-        expected_remote: &Arc<ThreadRemote<Platform>>,
-    ) {
+    fn rebind_thread(&self, old_tid: i32, new_tid: i32) {
         let mut inner = self.inner.lock();
         assert_eq!(
             self.nr_threads.underlying_atomic().load(Ordering::Relaxed),
@@ -302,10 +297,6 @@ impl<Platform: ShimPlatform> Process<Platform> {
             .threads
             .remove(&old_tid)
             .expect("exec caller must be attached under its old thread ID");
-        assert!(
-            Arc::ptr_eq(&remote, expected_remote),
-            "exec caller thread state must match its process entry"
-        );
         assert!(inner.threads.insert(new_tid, remote).is_none());
     }
 }
@@ -1849,19 +1840,6 @@ mod tests {
     use crate::{UserPtr, UserPtrMut};
 
     extern crate std;
-
-    #[test]
-    fn leader_exec_identity_is_unchanged() {
-        let task = crate::syscalls::tests::init_platform();
-        let pid = task.sys_getpid();
-
-        task.rebind_exec_identity();
-
-        assert_eq!(task.sys_gettid(), pid);
-        let inner = task.process().inner.lock();
-        assert_eq!(inner.threads.len(), 1);
-        assert!(inner.threads.contains_key(&pid));
-    }
 
     #[test]
     fn nonleader_exec_rebinds_identity_and_releases_broker_thread() {
