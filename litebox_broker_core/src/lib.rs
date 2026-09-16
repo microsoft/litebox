@@ -65,6 +65,8 @@ pub type Result<T> = core::result::Result<T, BrokerError>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct BrokerCoreLimits {
+    /// Maximum broker processes that have not completed core teardown.
+    pub max_processes: usize,
     /// Maximum live object references across all processes.
     pub max_references: usize,
     /// Maximum live object references owned by one process.
@@ -84,9 +86,9 @@ pub struct BrokerCoreLimits {
 }
 
 impl BrokerCoreLimits {
-    /// Conservative default limits that allow four processes to reach each
-    /// broker-wide ceiling only when all four spend their full quotas.
+    /// Conservative default authority-state limits.
     pub const DEFAULT: Self = Self {
+        max_processes: 1024,
         max_references: 4096,
         max_references_per_process: 1024,
         max_total_pipe_capacity: 64 * 1024 * 1024,
@@ -103,6 +105,7 @@ impl BrokerCoreLimits {
     /// broker-wide limits. Use [`Self::with_process_quotas`] to override them.
     pub const fn new(max_references: usize, max_total_pipe_capacity: usize) -> Self {
         Self {
+            max_processes: Self::DEFAULT.max_processes,
             max_references,
             max_references_per_process: max_references,
             max_total_pipe_capacity,
@@ -125,6 +128,7 @@ impl BrokerCoreLimits {
         max_sockets_per_process: usize,
     ) -> Self {
         Self {
+            max_processes: Self::DEFAULT.max_processes,
             max_references,
             max_references_per_process: max_references,
             max_total_pipe_capacity,
@@ -149,6 +153,15 @@ impl BrokerCoreLimits {
         Self {
             max_references_per_process,
             max_pipe_capacity_per_process,
+            ..self
+        }
+    }
+
+    /// Returns these limits with an explicit broker process limit.
+    #[must_use]
+    pub const fn with_process_limit(self, max_processes: usize) -> Self {
+        Self {
+            max_processes,
             ..self
         }
     }
@@ -299,6 +312,9 @@ impl BrokerCore {
         caller_credential: CallerCredential,
     ) -> Result<Arc<BrokerProcess>> {
         let mut processes = self.processes.write();
+        if processes.len() >= self.limits.max_processes {
+            return Err(BrokerError::ResourceExhausted);
+        }
         processes
             .try_reserve(1)
             .map_err(|_| BrokerError::OutOfMemory)?;
