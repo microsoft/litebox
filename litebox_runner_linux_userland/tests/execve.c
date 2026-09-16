@@ -5,8 +5,10 @@
 //
 // Phase 1:
 //   - Open two file descriptors: one with O_CLOEXEC, one without.
-//   - Exec self, passing their numeric values as argv[1] (cloexec) and argv[2] (keep).
+//   - Have a nonleader thread exec self, passing their numeric values as
+//     argv[1] (cloexec) and argv[2] (keep).
 // Phase 2 (after exec):
+//   - Verify that the exec caller became the process leader.
 //   - Verify the CLOEXEC fd is closed (fcntl -> EBADF).
 //   - Verify the non‑CLOEXEC fd is still open.
 // Exit status 0 on success; nonzero on failure.
@@ -21,6 +23,7 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 
 #define CLO_PATH "/tmp/execve_clo"
 #define KEEP_PATH "/tmp/execve_keep"
@@ -43,6 +46,34 @@ void* spin_thread(void* arg) {
     for (;;) {
         SPIN_HINT();
     }
+}
+
+struct exec_args {
+    char *path;
+    char **argv;
+    char **envp;
+};
+
+void* exec_thread(void* arg) {
+    struct exec_args *args = arg;
+    pid_t pid = getpid();
+    pid_t tid = syscall(SYS_gettid);
+    if (tid == pid) {
+        fprintf(stderr, "exec thread unexpectedly has leader TID %d\n", tid);
+        abort();
+    }
+
+    execve("nonsense", args->argv, args->envp);
+    if (errno != ENOENT) {
+        die("execve nonsense");
+    }
+    if (getpid() != pid || syscall(SYS_gettid) != tid) {
+        fprintf(stderr, "failed exec changed nonleader identity\n");
+        abort();
+    }
+
+    execve(args->path, args->argv, args->envp);
+    die("execve");
 }
 
 int main(int argc, char *argv[], char *envp[]) {
@@ -70,11 +101,6 @@ int main(int argc, char *argv[], char *envp[]) {
         new_envp[0] = "PHASE=after_exec";
         new_envp[1] = NULL;
 
-        execve("nonsense", new_argv, new_envp);  // should fail
-        if (errno != ENOENT) {
-            die("execve nonsense");
-        }
-
         // Spawn some threads that should be terminated on exec.
         for (int i = 0; i < 20; i++) {
             pthread_t thread;
@@ -86,8 +112,23 @@ int main(int argc, char *argv[], char *envp[]) {
             pthread_detach(thread);
         }
 
-        execve(argv[0], new_argv, new_envp);
-        die("execve");
+        struct exec_args exec_args = {
+            .path = argv[0],
+            .argv = new_argv,
+            .envp = new_envp,
+        };
+        pthread_t execer;
+        int rc = pthread_create(&execer, NULL, exec_thread, &exec_args);
+        if (rc) {
+            fprintf(stderr, "pthread_create execer: %s\n", strerror(rc));
+            abort();
+        }
+        pthread_detach(execer);
+
+        // The nonleader exec caller terminates this leader and the spin threads.
+        for (;;) {
+            pause();
+        }
     }
 
     // Phase 2: verify.
@@ -107,6 +148,15 @@ int main(int argc, char *argv[], char *envp[]) {
     int keep_errno = errno;
 
     int ok = 1;
+
+    // A nonleader exec caller becomes the process leader.
+    pid_t pid = getpid();
+    pid_t tid = syscall(SYS_gettid);
+    if (tid != pid) {
+        fprintf(stderr, "[FAIL] gettid %d does not match getpid %d after exec\n",
+                tid, pid);
+        ok = 0;
+    }
 
     // CLOEXEC one should be closed.
     if (!(clo_flags == -1 && clo_errno == EBADF)) {
@@ -130,7 +180,8 @@ int main(int argc, char *argv[], char *envp[]) {
     unlink(KEEP_PATH);
 
     if (ok) {
-        printf("[OK] cloexec fd %d closed; keep fd %d open\n", fd_clo, fd_keep);
+        printf("[OK] exec caller became leader; cloexec fd %d closed; keep fd %d open\n",
+               fd_clo, fd_keep);
         return 0;
     }
     return 1;
