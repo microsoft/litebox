@@ -28,6 +28,7 @@ jobs:
         uses: azure/cli@v2
         env:
           ADO_ORGANIZATION: https://dev.azure.com/msazure
+          ADO_PIPELINE_BRANCH: main
           ADO_PIPELINE_ID: "471678"
           ADO_PROJECT: LSG-linux
           LITEBOX_COMMIT: ${{ github.event.pull_request.head.sha }}
@@ -38,6 +39,7 @@ jobs:
             echo "Triggering ADO pipeline for Litebox commit ${LITEBOX_COMMIT}..."
             BUILD_RESULT="$(az pipelines run \
               --id "${ADO_PIPELINE_ID}" \
+              --branch "${ADO_PIPELINE_BRANCH}" \
               --organization "${ADO_ORGANIZATION}" \
               --project "${ADO_PROJECT}" \
               --parameters "liteboxCommit=${LITEBOX_COMMIT}" \
