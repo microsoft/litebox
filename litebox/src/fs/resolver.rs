@@ -343,42 +343,48 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             });
         }
 
-        let outcome =
-            self.backend
-                .walk_directories(from, components)
+        let mut from = from;
+        let mut offset = 0;
+        loop {
+            let outcome = self
+                .backend
+                .walk_directories(from, &components[offset..])
                 .map_err(|error| match error {
                     WalkError::PathError(PathError::NoSuchFileOrDirectory) => {
                         PathError::MissingComponent.into()
                     }
                     error => error,
                 })?;
-        Self::check_walk_permissions(
-            context,
-            #[cfg(debug_assertions)]
-            absolute_components,
-            &outcome,
-            SearchScope::AllComponents,
-        )?;
+            let continuing = matches!(outcome.stop_reason, WalkStopReason::Continue);
+            Self::check_walk_permissions(
+                context,
+                #[cfg(debug_assertions)]
+                &absolute_components[offset..],
+                &outcome,
+                SearchScope::AllComponents,
+            )?;
+            let walked = outcome.components.len();
+            offset += walked;
 
-        match outcome.stop_reason {
-            WalkStopReason::CompleteDirectory => {
-                assert_eq!(outcome.components.len(), components.len());
-                let permissions = outcome
-                    .components
-                    .last()
-                    .map(|component| component.permissions.clone());
-                Ok(WalkedDir {
-                    handle: outcome.last,
-                    permissions,
-                })
-            }
-            WalkStopReason::StoppedAtNonDirectory => {
-                Err(WalkError::PathError(PathError::ComponentNotADirectory))
-            }
-            WalkStopReason::Continue => {
-                // TODO(jayb): Continue walking from `outcome.last` once partial backend walks are
-                // supported by the resolver.
-                unimplemented!("partial backend walks are not supported yet")
+            match outcome.stop_reason {
+                WalkStopReason::CompleteDirectory => {
+                    assert_eq!(walked, components.len() - (offset - walked));
+                    let permissions = outcome
+                        .components
+                        .last()
+                        .map(|component| component.permissions.clone());
+                    return Ok(WalkedDir {
+                        handle: outcome.last,
+                        permissions,
+                    });
+                }
+                WalkStopReason::StoppedAtNonDirectory => {
+                    return Err(WalkError::PathError(PathError::ComponentNotADirectory));
+                }
+                WalkStopReason::Continue => {
+                    assert!(continuing && walked > 0);
+                    from = outcome.last;
+                }
             }
         }
     }
@@ -392,31 +398,40 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         scope: SearchScope,
     ) -> Result<(WalkOutcome<WalkingDirHandle<'a>>, usize), WalkError> {
         assert!(!components.is_empty());
-        let outcome = self.backend.walk_directories(from, components)?;
-        Self::check_walk_permissions(
-            context,
-            #[cfg(debug_assertions)]
-            absolute_components,
-            &outcome,
-            scope,
-        )?;
+        let mut from = from;
+        let mut offset = 0;
+        loop {
+            let outcome = self.backend.walk_directories(from, &components[offset..])?;
+            let continuing = matches!(outcome.stop_reason, WalkStopReason::Continue);
+            Self::check_walk_permissions(
+                context,
+                #[cfg(debug_assertions)]
+                &absolute_components[offset..],
+                &outcome,
+                if continuing {
+                    SearchScope::AllComponents
+                } else {
+                    scope
+                },
+            )?;
 
-        let walked = outcome.components.len();
-        match outcome.stop_reason {
-            WalkStopReason::CompleteDirectory => {
-                assert_eq!(walked, components.len());
-                Ok((outcome, walked))
-            }
-            WalkStopReason::StoppedAtNonDirectory if walked + 1 == components.len() => {
-                Ok((outcome, walked))
-            }
-            WalkStopReason::StoppedAtNonDirectory => {
-                Err(WalkError::PathError(PathError::ComponentNotADirectory))
-            }
-            WalkStopReason::Continue => {
-                // TODO(jayb): Continue walking from `outcome.last` once partial backend walks are
-                // supported by the resolver.
-                unimplemented!("partial backend walks are not supported yet")
+            let walked = outcome.components.len();
+            offset += walked;
+            match outcome.stop_reason {
+                WalkStopReason::CompleteDirectory => {
+                    assert_eq!(walked, components.len() - (offset - walked));
+                    return Ok((outcome, offset));
+                }
+                WalkStopReason::StoppedAtNonDirectory if offset == components.len() - 1 => {
+                    return Ok((outcome, offset));
+                }
+                WalkStopReason::StoppedAtNonDirectory => {
+                    return Err(WalkError::PathError(PathError::ComponentNotADirectory));
+                }
+                WalkStopReason::Continue => {
+                    assert!(continuing && walked > 0);
+                    from = outcome.last;
+                }
             }
         }
     }
