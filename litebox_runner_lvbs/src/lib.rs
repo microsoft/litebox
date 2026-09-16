@@ -806,7 +806,7 @@ fn open_session_new_instance(
         .task_page_table(task_pt_id)
         .map_err(|_| OpteeSmcReturnCode::EBadCmd)
         .inspect_err(|error| {
-            debug_serial_println!("Failed to retain task page table: {error:?}");
+            debug_serial_println!("Failed to acquire task page-table handle: {error:?}");
             teardown_ta_page_table(platform, task_pt_id);
         })?;
 
@@ -815,9 +815,9 @@ fn open_session_new_instance(
         teardown_ta_page_table(platform, task_pt_id);
     })?;
 
-    let shim = shim.retain_page_table(page_table).ok_or_else(|| {
-        debug_serial_println!("BUG: failed to retain task page table");
-        debug_assert!(false, "failed to retain task page table");
+    let shim = shim.with_page_table_keepalive(page_table).ok_or_else(|| {
+        debug_serial_println!("BUG: failed to attach task page-table keepalive");
+        debug_assert!(false, "failed to attach task page-table keepalive");
         teardown_ta_page_table(platform, task_pt_id);
         OpteeSmcReturnCode::ENotAvail
     })?;
