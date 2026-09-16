@@ -15,10 +15,6 @@ use crate::{ConstPtr, MutPtr, ShimPlatform, Task};
 
 const ACTIVE_PROCESS_EXIT_STATUS: i32 = 0x0000_0103;
 const NORMAL_PROCESS_BASE_PRIORITY: i32 = 8;
-#[cfg(all(test, target_os = "windows"))]
-pub(crate) const INITIAL_PROCESS_ID: usize = 1;
-#[cfg(all(test, target_os = "windows"))]
-pub(crate) const INITIAL_THREAD_ID: usize = 2;
 const GUEST_PROCESS_AFFINITY_MASK: usize = 1;
 const PROCESS_DEBUG_FLAGS_NO_DEBUGGER: u32 = 1;
 const PROCESS_COOKIE: u32 = 0xdead_beef;
@@ -910,20 +906,6 @@ mod tests {
                 "a host Windows probe leaves ReturnLength unchanged when ProcessInformation faults"
             );
         });
-    }
-
-    #[test]
-    fn process_basic_information_uses_assigned_identity() {
-        let task = crate::tests::test_task_with_process_id(37, Some(11));
-
-        let information = task.process_basic_information();
-
-        assert_eq!(information.unique_process_id, 37);
-        assert_eq!(information.inherited_from_unique_process_id, 11);
-        assert_ne!(
-            task.thread_object.thread_id(),
-            information.unique_process_id
-        );
     }
 
     #[test]

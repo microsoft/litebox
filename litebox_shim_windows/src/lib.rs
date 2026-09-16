@@ -536,10 +536,8 @@ impl<Platform: ShimPlatform> WindowsShim<Platform> {
                 path,
                 &argv,
                 &envp,
-                nt_types::ClientId {
-                    unique_process: self.0.process_id,
-                    unique_thread: initial_thread_id as usize,
-                },
+                self.0.process_id,
+                initial_thread_id as usize,
             )?;
         // TODO: shared section should be only created once and shared across all processes, not created per-process.
         let windows_shared_section = crate::syscalls::section::load_time_windows_shared_section(

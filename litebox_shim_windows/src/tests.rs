@@ -15,10 +15,7 @@ use alloc::vec::Vec;
 use core::mem::size_of;
 use litebox::platform::RawConstPointer as _;
 use litebox::utils::TruncateExt as _;
-use litebox_broker_core::{
-    BrokerCore, ObjectRights, PolicyEngine, fs::in_mem::InitialNode,
-    test_support::TestBrokerCoreBuilder,
-};
+use litebox_broker_core::fs::in_mem::InitialNode;
 use litebox_broker_protocol::fs::{FileMode as Mode, FileUser as UserInfo};
 
 use crate::nt_types::{ObjectAttributes, UnicodeString};
@@ -30,11 +27,6 @@ use crate::{ConstPtr, MutPtr, Process, ShimPlatform, Task, WindowsShim};
 pub(crate) type TestPlatform = litebox_platform_linux_userland::LinuxUserland;
 #[cfg(target_os = "windows")]
 pub(crate) type TestPlatform = litebox_platform_windows_userland::WindowsUserland;
-
-struct TestContext {
-    platform: &'static TestPlatform,
-    objectless_broker: std::sync::OnceLock<BrokerCore>,
-}
 
 pub(crate) fn const_ptr<T: zerocopy::FromBytes>(value: &T) -> ConstPtr<TestPlatform, T> {
     ConstPtr::<TestPlatform, T>::from_usize(core::ptr::from_ref(value).cast::<u8>() as usize)
@@ -84,9 +76,9 @@ pub(crate) fn object_attributes(name: &UnicodeString, attributes: u32) -> Object
     }
 }
 
-fn test_context() -> &'static TestContext {
-    static CONTEXT: std::sync::OnceLock<TestContext> = std::sync::OnceLock::new();
-    CONTEXT.get_or_init(|| {
+pub(crate) fn test_platform() -> &'static TestPlatform {
+    static PLATFORM: std::sync::OnceLock<&'static TestPlatform> = std::sync::OnceLock::new();
+    PLATFORM.get_or_init(|| {
         #[cfg(target_os = "linux")]
         let platform = TestPlatform::new();
 
@@ -99,24 +91,7 @@ fn test_context() -> &'static TestContext {
             platform
         };
 
-        TestContext {
-            platform,
-            objectless_broker: std::sync::OnceLock::new(),
-        }
-    })
-}
-
-pub(crate) fn test_platform() -> &'static TestPlatform {
-    test_context().platform
-}
-
-pub(crate) fn objectless_broker() -> &'static BrokerCore {
-    test_context().objectless_broker.get_or_init(|| {
-        TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
-            ObjectRights::all(),
-        ))
-        .build()
-        .expect("a test process may build only one broker core")
+        platform
     })
 }
 
@@ -147,14 +122,6 @@ fn map_csr_server_shared_memory(
 pub(crate) fn test_task() -> Task<TestPlatform> {
     let (litebox, process_id) = crate::test_broker::litebox(test_platform());
     test_task_from_litebox_with_process_id(litebox, process_id, None)
-}
-
-pub(crate) fn test_task_with_process_id(
-    process_id: usize,
-    parent_id: Option<usize>,
-) -> Task<TestPlatform> {
-    let (litebox, _) = crate::test_broker::litebox(test_platform());
-    test_task_from_litebox_with_process_id(litebox, process_id, parent_id)
 }
 
 /// Returns a task whose broker serves `files` from an in-memory filesystem.
@@ -335,16 +302,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             litebox_thread: litebox::sync::Mutex::new(Some(litebox_thread)),
         })
     }
-}
-
-#[test]
-fn objectless_test_tasks_use_distinct_process_ids() {
-    let first = test_task();
-    let second = test_task();
-
-    assert_eq!(first.process.id, first.global.process_id);
-    assert_eq!(second.process.id, second.global.process_id);
-    assert_ne!(first.process.id, second.process.id);
 }
 
 fn create_event(task: &Task<TestPlatform>, desired_access: u32) -> Handle {

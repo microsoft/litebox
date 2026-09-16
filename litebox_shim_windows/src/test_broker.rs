@@ -15,6 +15,7 @@
 extern crate std;
 
 use alloc::{string::String, sync::Arc, vec::Vec};
+use std::sync::OnceLock;
 
 use litebox_broker_core::{
     BrokerCore, ObjectRights, PolicyEngine,
@@ -28,7 +29,18 @@ use crate::tests::TestPlatform;
 
 /// Returns a LiteBox whose broker association has no file service.
 pub(crate) fn litebox(platform: &'static TestPlatform) -> (litebox::LiteBox<TestPlatform>, usize) {
-    connect(platform, crate::tests::objectless_broker().clone())
+    connect(platform, test_broker().clone())
+}
+
+fn test_broker() -> &'static BrokerCore {
+    static BROKER: OnceLock<BrokerCore> = OnceLock::new();
+    BROKER.get_or_init(|| {
+        TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .expect("a test process may build only one broker core")
+    })
 }
 
 /// Returns a LiteBox associated with a broker core that serves `entries` from memory.

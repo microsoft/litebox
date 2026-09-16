@@ -491,7 +491,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .as_ref()
             .expect("new LiteBox thread missing")
             .id() as usize;
-        let mut rollback_thread = || {
+        let mut exit_unstarted_thread = || {
             let litebox_thread = litebox_thread
                 .take()
                 .expect("LiteBox thread rollback must run only once");
@@ -517,7 +517,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             Ok(environment) => environment,
             Err(error) => {
                 litebox_util_log::error!(error:% = error; "Failed to create Windows thread environment");
-                rollback_thread();
+                exit_unstarted_thread();
                 return NtStatus::NO_MEMORY;
             }
         };
@@ -531,7 +531,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .write_at_offset(0, initial_context)
             .is_none()
         {
-            rollback_thread();
+            exit_unstarted_thread();
             return NtStatus::ACCESS_VIOLATION;
         }
         let mut child_ctx = ctx.clone();
@@ -550,7 +550,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         );
         if !self.process.attach_thread(thread_id, &thread) {
             // The process is tearing down; refuse to start another thread.
-            rollback_thread();
+            exit_unstarted_thread();
             return NtStatus::PROCESS_IS_TERMINATING;
         }
         let granted_access = ThreadAccess::from_desired_access(desired_access);
@@ -564,7 +564,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             Ok(handle) => handle,
             Err(status) => {
                 self.process.detach_thread(thread_id);
-                rollback_thread();
+                exit_unstarted_thread();
                 return status;
             }
         };

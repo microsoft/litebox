@@ -19,7 +19,7 @@ use crate::{ConstPtr, MutPtr, ShimPlatform, Task, probe_guest_output_preserving_
 // Maximum total message length advertised by `\Windows\ApiPort` on the target x64 Windows build.
 // TODO(csr-api-message-union): model the full CSR API message union and derive this from its size.
 const CSR_MAX_MESSAGE_LENGTH: u32 = 0x148;
-const CSR_SERVER_PROCESS_ID: usize = 0x3fff_ffff;
+const CSR_SERVER_PROCESS_ID: usize = 1;
 const USERSRV_SERVER_DLL_INDEX: u32 = 3;
 const USER_CONNECT_VERSION: u64 = 0x0e41_05d9;
 const USERSRV_BACKING_SIZE: usize = crate::PAGE_SIZE;
