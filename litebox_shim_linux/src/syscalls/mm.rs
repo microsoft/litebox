@@ -24,6 +24,7 @@ use crate::syscalls::file::{AnyTypedFd, FilesState};
 use litebox::utils::TruncateExt as _;
 use object::elf::{ET_DYN, FileHeader64, PT_LOAD, ProgramHeader64};
 use object::endian::LittleEndian;
+use rangemap::RangeSet;
 
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("ELF patching code assumes 64-bit pointers (u64 <-> usize is lossless)");
@@ -49,15 +50,15 @@ pub(crate) struct ElfPatchState {
     trampoline_mapped: bool,
     /// Total number of trampoline bytes currently mapped.
     trampoline_mapped_len: usize,
-    /// Tracks file-backed mappings for this fd as (vaddr, len) pairs.
+    /// Tracks file-backed virtual address ranges for this descriptor.
     /// Used to find mappings that need patching when mprotect adds PROT_EXEC.
     /// Cleared on munmap to allow re-patching.
-    file_mappings: BTreeSet<(usize, usize)>,
+    file_mappings: RangeSet<usize>,
     /// Ranges that have already been patched by the runtime rewriter.
     /// This is a performance guard only — re-running the rewriter on
     /// already-patched code is safe because the second run will not see
     /// syscall instructions. Cleared on munmap alongside file_mappings.
-    patched_ranges: BTreeSet<(usize, usize)>,
+    patched_ranges: RangeSet<usize>,
 }
 
 /// Identity of a resolved filesystem descriptor.
@@ -206,7 +207,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // (addr, len) ranges belong to this fd, and patching is idempotent.
         let mut cache = self.global.elf_patch_cache.lock();
         if let Some(Some(state)) = cache.get_mut(&patch_key) {
-            state.file_mappings.insert((result.as_usize(), len));
+            let start = result.as_usize();
+            state.file_mappings.insert(start..start.saturating_add(len));
         }
 
         Ok(result)
@@ -446,8 +448,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let unmap_end = unmap_start.saturating_add(unmap_len);
         let mut cache = self.global.elf_patch_cache.lock();
         for state in cache.values_mut().flatten() {
-            Self::subtract_range(&mut state.file_mappings, unmap_start, unmap_end);
-            Self::subtract_range(&mut state.patched_ranges, unmap_start, unmap_end);
+            state.file_mappings.remove(unmap_start..unmap_end);
+            state.patched_ranges.remove(unmap_start..unmap_end);
         }
 
         let stale_keys: alloc::vec::Vec<_> = cache
@@ -470,36 +472,19 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
     }
 
-    fn subtract_range(ranges: &mut BTreeSet<(usize, usize)>, start: usize, end: usize) {
-        let old_ranges = core::mem::take(ranges);
-        for (range_start, range_len) in old_ranges {
-            let range_end = range_start.saturating_add(range_len);
-            if range_end <= start || range_start >= end {
-                ranges.insert((range_start, range_len));
-                continue;
-            }
-            if range_start < start {
-                ranges.insert((range_start, start - range_start));
-            }
-            if range_end > end {
-                ranges.insert((end, range_end - end));
-            }
-        }
-    }
-
     /// Forget that ranges overlapping `[start, start + len)` were patched.
     ///
     /// The rewriter leaves patched code read-execute, so the guest must request
     /// `PROT_WRITE` before it can modify it. Once it does, the patch no longer
     /// holds and the rewriter has to run again if the range becomes executable.
     fn invalidate_patched_ranges(&self, start: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
         let end = start.saturating_add(len);
         let mut cache = self.global.elf_patch_cache.lock();
         for state in cache.values_mut().flatten() {
-            state.patched_ranges.retain(|&(vaddr, seg_len)| {
-                let seg_end = vaddr.saturating_add(seg_len);
-                seg_end <= start || vaddr >= end
-            });
+            state.patched_ranges.remove(start..end);
         }
     }
 
@@ -594,11 +579,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
             alloc::vec::Vec::new();
         for (fd, state) in cache.iter() {
             let Some(state) = state else { continue };
-            for &(seg_start, seg_len) in &state.file_mappings {
-                let seg_end = seg_start.saturating_add(seg_len);
+            for segment in state.file_mappings.iter() {
+                let seg_start = segment.start;
+                let seg_end = segment.end;
                 // Check overlap with the mprotect range.
                 if seg_start < mprotect_end && seg_end > mprotect_start {
-                    to_patch.push((fd.clone(), seg_start, seg_len));
+                    to_patch.push((fd.clone(), seg_start, seg_end - seg_start));
                 }
             }
         }
@@ -810,8 +796,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             trampoline_cursor: 0,
             trampoline_mapped: false,
             trampoline_mapped_len: 0,
-            file_mappings: BTreeSet::new(),
-            patched_ranges: BTreeSet::new(),
+            file_mappings: RangeSet::new(),
+            patched_ranges: RangeSet::new(),
         })
     }
 
@@ -1091,8 +1077,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
 
         // Performance guard: skip if this exact range was already patched.
-        let mapping_key = (mapped_addr.as_usize(), len);
-        if state.patched_ranges.contains(&mapping_key) {
+        let mapping_start = mapped_addr.as_usize();
+        let mapping_range = mapping_start..mapping_start.saturating_add(len);
+        if state.patched_ranges.gaps(&mapping_range).next().is_none() {
             return Ok(());
         }
 
@@ -1244,7 +1231,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // Only a committed patch may be skipped next time; marking a failed
         // attempt would let the guard above wave raw syscalls through to RX.
         if outcome.is_ok() {
-            state.patched_ranges.insert(mapping_key);
+            state.patched_ranges.insert(mapping_range);
         }
         self.restore_rx_or_deny_exec(mapped_addr, len, outcome)
     }
@@ -1340,34 +1327,37 @@ mod tests {
         elf
     }
 
-    #[test]
-    fn test_deferred_elf_patch_survives_close() {
+    fn map_elf(name: &str, elf: &[u8], len: usize) -> (crate::Task<Platform>, i32, UserPtrMut<u8>) {
         let task = init_platform(None);
-        let elf = minimal_elf(0x1000);
         let fd = i32::try_from(
-            task.sys_open("deferred.so", OFlags::RDWR | OFlags::CREAT, Mode::RWXU)
+            task.sys_open(name, OFlags::RDWR | OFlags::CREAT, Mode::RWXU)
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(task.sys_write(fd, &elf, None).unwrap(), elf.len());
-
+        assert_eq!(task.sys_write(fd, elf, None).unwrap(), elf.len());
         let addr = task
-            .sys_mmap(
-                0,
-                0x1000,
-                ProtFlags::PROT_READ,
-                MapFlags::MAP_PRIVATE,
-                fd,
-                0,
-            )
+            .sys_mmap(0, len, ProtFlags::PROT_READ, MapFlags::MAP_PRIVATE, fd, 0)
             .unwrap();
+        (task, fd, addr)
+    }
+
+    #[test]
+    fn test_deferred_elf_patch_survives_close() {
+        let elf = minimal_elf(0x1000);
+        let (task, fd, addr) = map_elf("deferred.so", &elf, 0x1000);
         task.sys_close(fd).unwrap();
 
         {
             let cache = task.global.elf_patch_cache.lock();
             let state = cache.values().next().unwrap().as_ref().unwrap();
             assert!(state.descriptor_closed);
-            assert!(state.file_mappings.contains(&(addr.as_usize(), 0x1000)));
+            assert!(
+                state
+                    .file_mappings
+                    .gaps(&(addr.as_usize()..addr.as_usize() + 0x1000))
+                    .next()
+                    .is_none()
+            );
         }
 
         task.sys_mprotect(addr, 0x1000, ProtFlags::PROT_READ_EXEC)
@@ -1375,7 +1365,13 @@ mod tests {
         {
             let cache = task.global.elf_patch_cache.lock();
             let state = cache.values().next().unwrap().as_ref().unwrap();
-            assert!(state.patched_ranges.contains(&(addr.as_usize(), 0x1000)));
+            assert!(
+                state
+                    .patched_ranges
+                    .gaps(&(addr.as_usize()..addr.as_usize() + 0x1000))
+                    .next()
+                    .is_none()
+            );
         }
 
         task.sys_munmap(addr, 0x1000).unwrap();
@@ -1384,25 +1380,8 @@ mod tests {
 
     #[test]
     fn test_deferred_pre_patched_trampoline_survives_close() {
-        let task = init_platform(None);
         let elf = minimal_pre_patched_elf();
-        let fd = i32::try_from(
-            task.sys_open("pre-patched.so", OFlags::RDWR | OFlags::CREAT, Mode::RWXU)
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(task.sys_write(fd, &elf, None).unwrap(), elf.len());
-
-        let addr = task
-            .sys_mmap(
-                0,
-                0x1000,
-                ProtFlags::PROT_READ,
-                MapFlags::MAP_PRIVATE,
-                fd,
-                0,
-            )
-            .unwrap();
+        let (task, fd, addr) = map_elf("pre-patched.so", &elf, 0x1000);
         task.sys_close(fd).unwrap();
         task.sys_mprotect(addr, 0x1000, ProtFlags::PROT_READ_EXEC)
             .unwrap();
@@ -1421,38 +1400,19 @@ mod tests {
 
     #[test]
     fn test_deferred_elf_state_survives_partial_unmap() {
-        let task = init_platform(None);
         let elf = minimal_elf(0x2000);
-        let fd = i32::try_from(
-            task.sys_open("partial.so", OFlags::RDWR | OFlags::CREAT, Mode::RWXU)
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(task.sys_write(fd, &elf, None).unwrap(), elf.len());
-
-        let addr = task
-            .sys_mmap(
-                0,
-                0x2000,
-                ProtFlags::PROT_READ,
-                MapFlags::MAP_PRIVATE,
-                fd,
-                0,
-            )
-            .unwrap();
+        let (task, fd, addr) = map_elf("partial.so", &elf, 0x2000);
         task.sys_close(fd).unwrap();
         task.sys_munmap(addr, 0x1000).unwrap();
 
         {
             let cache = task.global.elf_patch_cache.lock();
             let state = cache.values().next().unwrap().as_ref().unwrap();
+            let mappings = state.file_mappings.iter().collect::<alloc::vec::Vec<_>>();
+            assert_eq!(mappings.len(), 1);
             assert_eq!(
-                state
-                    .file_mappings
-                    .iter()
-                    .copied()
-                    .collect::<alloc::vec::Vec<_>>(),
-                [(addr.as_usize() + 0x1000, 0x1000)]
+                mappings[0],
+                &(addr.as_usize() + 0x1000..addr.as_usize() + 0x2000)
             );
         }
 
@@ -1465,33 +1425,21 @@ mod tests {
     /// descriptor reusing the same fd number does not inherit it.
     #[test]
     fn test_elf_patch_state_not_reused_across_fd_reuse() {
-        let task = init_platform(None);
-
         let elf = minimal_elf(0x1000);
-        let elf_fd = i32::try_from(
-            task.sys_open("lib.so", OFlags::RDWR | OFlags::CREAT, Mode::RWXU)
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(task.sys_write(elf_fd, &elf, None).unwrap(), elf.len());
-
-        let addr = task
-            .sys_mmap(
-                0,
-                0x1000,
-                ProtFlags::PROT_READ,
-                MapFlags::MAP_PRIVATE,
-                elf_fd,
-                0,
-            )
-            .unwrap();
+        let (task, elf_fd, addr) = map_elf("lib.so", &elf, 0x1000);
 
         // The ELF was recognized and the mapping is tracked for deferred patching.
         {
             let cache = task.global.elf_patch_cache.lock();
             assert_eq!(cache.len(), 1);
             let state = cache.values().next().unwrap().as_ref().unwrap();
-            assert!(state.file_mappings.contains(&(addr.as_usize(), 0x1000)));
+            assert!(
+                state
+                    .file_mappings
+                    .gaps(&(addr.as_usize()..addr.as_usize() + 0x1000))
+                    .next()
+                    .is_none()
+            );
         }
 
         task.sys_munmap(addr, 0x1000).unwrap();
