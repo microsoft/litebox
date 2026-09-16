@@ -239,10 +239,14 @@ where
             broker_protocol_version: BROKER_PROTOCOL_VERSION,
             process_id: process.id(),
         };
-        setup_channel
-            .send_handshake_response(&response)
-            .map_err(BrokerHostError::Channel)?;
-        send_shared_memory(setup_channel).map_err(BrokerHostError::Channel)?;
+        if let Err(error) = setup_channel.send_handshake_response(&response) {
+            BrokerProcess::finish(process);
+            return Err(BrokerHostError::Channel(error));
+        }
+        if let Err(error) = send_shared_memory(setup_channel) {
+            BrokerProcess::finish(process);
+            return Err(BrokerHostError::Channel(error));
+        }
         return Ok(Ok(BrokerHostAssociation {
             process,
             shared_buffers,

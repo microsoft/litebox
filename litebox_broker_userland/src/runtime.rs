@@ -121,7 +121,13 @@ where
         }
     };
     let (request_source, response_sink, notification_channel, shutdown) =
-        activate(control_channel, control_ring)?;
+        match activate(control_channel, control_ring) {
+            Ok(active) => active,
+            Err(error) => {
+                association.finish();
+                return Err(error);
+            }
+        };
     dispatch_requests(
         association,
         readiness,
