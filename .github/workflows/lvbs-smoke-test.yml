@@ -20,8 +20,8 @@ jobs:
       - name: Azure login
         uses: azure/login@v2
         with:
-          client-id: ${{ secrets.ADO_SP_ClientID }}
-          tenant-id: ${{ secrets.ADO_SP_TenantID }}
+          client-id: ${{ secrets.ADO_SP_CLIENTID }}
+          tenant-id: ${{ secrets.ADO_SP_TENANTID }}
           allow-no-subscriptions: true
 
       - name: Trigger ADO pipeline and wait for completion
