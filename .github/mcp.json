@@ -1,0 +1,17 @@
+{
+        "mcpServers": {
+                "azure-devops": {
+                        "type": "stdio",
+                        "command": "npx",
+                        "args": [
+                                "-y",
+                                "@azure-devops/mcp@latest",
+                                "msazure"
+                        ],
+                        "env": {
+                                "ADO_DEFAULT_PROJECT": "LSG-linux"
+                        },
+                        "tools": ["*"]
+                }
+        }
+}
