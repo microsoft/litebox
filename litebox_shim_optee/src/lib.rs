@@ -184,7 +184,7 @@ impl<Platform: OpteeShimPlatform> OpteeShimBuilder<Platform> {
             _litebox: self.litebox,
             ta_uuid_map: ta_uuid_map(),
             pta_busy: spin::mutex::SpinMutex::new(HashSet::new()),
-            retained_page_table: None,
+            page_table_keepalive: None,
         });
         OpteeShim(global)
     }
@@ -214,9 +214,9 @@ struct GlobalState<Platform: OpteeShimPlatform> {
     /// blocking/queuing the caller until the PTA is free. We currently reject
     /// instead of serialize; revisit if a PTA needs true serialization.
     pta_busy: spin::mutex::SpinMutex<HashSet<PseudoTa>>,
-    /// Declared last so the retained task table drops after the shim state.
+    /// Keeps the TA page table alive; declared last to drop after all other shim state.
     // TODO: Replace type erasure with a typed platform page-table handle.
-    retained_page_table: Option<Box<dyn Send + Sync>>,
+    page_table_keepalive: Option<Box<dyn Send + Sync>>,
 }
 
 impl<Platform: OpteeShimPlatform> GlobalState<Platform> {
@@ -289,14 +289,18 @@ impl<Platform: OpteeShimPlatform> Clone for OpteeShim<Platform> {
 }
 
 impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
-    /// Retains the task page table before the shim is shared.
+    /// Keeps the TA page table alive until all other shim state is dropped.
+    /// Must be called before the shim is shared.
     #[must_use]
-    pub fn retain_page_table<T: Send + Sync + 'static>(mut self, page_table: T) -> Option<Self> {
+    pub fn with_page_table_keepalive<T: Send + Sync + 'static>(
+        mut self,
+        page_table: T,
+    ) -> Option<Self> {
         let global = Arc::get_mut(&mut self.0)?;
-        if global.retained_page_table.is_some() {
+        if global.page_table_keepalive.is_some() {
             return None;
         }
-        global.retained_page_table = Some(Box::new(page_table));
+        global.page_table_keepalive = Some(Box::new(page_table));
         Some(self)
     }
 
