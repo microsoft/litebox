@@ -31,7 +31,6 @@ use crate::nt_types::{
     RtlUserProcessParameters, ThreadEnvironmentBlock, UnicodeString, X64Context,
 };
 use crate::syscalls::mm::{MemoryType, PageProtection};
-use crate::syscalls::process::{INITIAL_PROCESS_ID, INITIAL_THREAD_ID};
 
 const NTDLL_WRITABLE_SECTIONS: &[&[u8]] = &[b".mrdata"];
 const NTDLL_PATH: &str = "/Windows/System32/ntdll.dll";
@@ -92,6 +91,8 @@ struct ProcessEnvironmentInput<'a> {
     image_path: &'a str,
     argv: &'a [CString],
     envp: &'a [CString],
+    process_id: usize,
+    thread_id: usize,
 }
 
 pub(crate) struct WindowsThreadEnvironment {
@@ -124,6 +125,8 @@ impl<'a, Platform: crate::ShimPlatform> PeLoader<'a, Platform> {
         path: &str,
         argv: &[CString],
         envp: &[CString],
+        process_id: usize,
+        thread_id: usize,
     ) -> Result<PeLoadInfo<Platform>, WindowsLoadError> {
         let image = load_image(self.platform, self.fs.clone(), path, self.page_manager)?;
         let application_entry_point = image.mapping.entry_point;
@@ -147,6 +150,8 @@ impl<'a, Platform: crate::ShimPlatform> PeLoader<'a, Platform> {
                 image_path: path,
                 argv,
                 envp,
+                process_id,
+                thread_id,
             },
         )?;
         if let Some(ntdll) = &ntdll {
@@ -378,8 +383,8 @@ fn create_process_environment<Platform: crate::ShimPlatform>(
         INITIAL_STACK_SIZE,
         peb_ptr,
         ClientId {
-            unique_process: INITIAL_PROCESS_ID,
-            unique_thread: INITIAL_THREAD_ID,
+            unique_process: input.process_id,
+            unique_thread: input.thread_id,
         },
         true,
     )?;
@@ -2550,7 +2555,7 @@ mod tests {
     fn created_process_environment_snapshot() -> CreatedProcessEnvironmentSnapshot {
         // Process environment construction only writes guest memory, so this needs no files and
         // uses the objectless broker association.
-        let litebox = crate::test_broker::litebox(crate::tests::test_platform());
+        let (litebox, _) = crate::test_broker::litebox(crate::tests::test_platform());
         let page_manager = crate::WindowsPageManager::<crate::tests::TestPlatform>::new(&litebox);
         let image = loaded_module_image(application_module_base());
 
@@ -2573,6 +2578,8 @@ mod tests {
                 image_path: "test.exe",
                 argv: &argv,
                 envp: &envp,
+                process_id: 1,
+                thread_id: 2,
             },
         )
         .expect("failed to create synthetic Windows process environment");

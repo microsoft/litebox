@@ -261,6 +261,7 @@ mod tests {
         host.send_handshake_response(
             &litebox_broker_protocol::message::BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: litebox_broker_protocol::BROKER_PROTOCOL_VERSION,
+                process_id: litebox_broker_protocol::ProcessId(1),
             },
         )
         .unwrap();

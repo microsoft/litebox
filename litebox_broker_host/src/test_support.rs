@@ -5,6 +5,7 @@
 
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use core::convert::Infallible;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use litebox_broker_core::{BrokerCore, readiness::ReadinessSink};
 use litebox_broker_protocol::{
@@ -29,6 +30,7 @@ pub struct InProcessBrokerSetup {
     broker: BrokerCore,
     memory: Arc<InProcessSharedMemory>,
     readiness: Arc<InProcessReadinessSink>,
+    association: Option<BrokerHostAssociation<'static, Arc<InProcessSharedMemory>>>,
 }
 
 impl InProcessBrokerSetup {
@@ -38,6 +40,7 @@ impl InProcessBrokerSetup {
             broker,
             memory: Arc::new(InProcessSharedMemory::new()),
             readiness: Arc::new(InProcessReadinessSink::default()),
+            association: None,
         }
     }
 
@@ -57,21 +60,15 @@ impl InProcessBrokerSetup {
     ///
     /// Panics if the fixed test shared-memory layout is invalid or the canned
     /// unauthenticated host setup cannot establish the association.
-    pub fn activate(self) -> InProcessBrokerChannel {
-        let shared_buffers = Box::leak(Box::new(
-            SharedBufferPool::new(self.memory, SHARED_BUFFER_LAYOUT)
-                .expect("the in-process shared-buffer layout must be valid"),
-        ));
-        let association = crate::setup_connection(
-            &self.broker,
-            &mut InProcessHostSetup,
-            shared_buffers,
-            self.readiness,
-            |_| Ok(()),
-        )
-        .expect("the in-process broker setup must succeed")
-        .expect("the in-process broker must accept the connection");
-        InProcessBrokerChannel { association }
+    pub fn activate(mut self) -> InProcessBrokerChannel {
+        let association = self
+            .association
+            .take()
+            .expect("the in-process local endpoint must negotiate before activation");
+        InProcessBrokerChannel {
+            association: Some(association),
+            panicked: AtomicBool::new(false),
+        }
     }
 }
 
@@ -89,31 +86,91 @@ impl LocalSetupChannel for InProcessBrokerSetup {
     fn recv_handshake_response(
         &mut self,
     ) -> core::result::Result<Option<BrokerHandshakeResponse>, Self::Error> {
-        Ok(Some(BrokerHandshakeResponse::Negotiated {
-            broker_protocol_version: BROKER_PROTOCOL_VERSION,
-        }))
+        assert!(
+            self.association.is_none(),
+            "the in-process broker association must be negotiated only once"
+        );
+        let shared_buffers = Box::leak(Box::new(
+            SharedBufferPool::new(Arc::clone(&self.memory), SHARED_BUFFER_LAYOUT)
+                .expect("the in-process shared-buffer layout must be valid"),
+        ));
+        let mut host_setup = InProcessHostSetup { response: None };
+        let readiness: Arc<dyn ReadinessSink> = self.readiness.clone();
+        let association = crate::setup_connection(
+            &self.broker,
+            &mut host_setup,
+            shared_buffers,
+            readiness,
+            |_| Ok(()),
+        )
+        .expect("the in-process broker setup must succeed")
+        .expect("the in-process broker must accept the connection");
+        self.association = Some(association);
+        Ok(Some(host_setup.response.expect(
+            "the in-process broker must send a handshake response",
+        )))
     }
 }
 
 /// Active request channel for an in-process broker association.
 pub struct InProcessBrokerChannel {
-    association: BrokerHostAssociation<'static, Arc<InProcessSharedMemory>>,
+    association: Option<BrokerHostAssociation<'static, Arc<InProcessSharedMemory>>>,
+    panicked: AtomicBool,
 }
 
 impl LocalCallChannel for InProcessBrokerChannel {
     type Error = BrokerHostError<Infallible>;
 
     fn call(&self, request: BrokerRequest) -> core::result::Result<BrokerResponse, Self::Error> {
+        let mut guard = InProcessCallGuard {
+            panicked: &self.panicked,
+            completed: false,
+        };
         let mut response = None;
-        self.association.execute_request(request, |value| {
-            response = Some(value.clone());
-            Ok(())
-        })?;
-        Ok(response.expect("the in-process broker must publish one response"))
+        let result = self
+            .association
+            .as_ref()
+            .expect("the in-process broker association must remain active")
+            .execute_request(request, |value| {
+                response = Some(value.clone());
+                Ok(())
+            })
+            .map(|()| response.expect("the in-process broker must publish one response"));
+        guard.completed = true;
+        result
     }
 }
 
-struct InProcessHostSetup;
+impl Drop for InProcessBrokerChannel {
+    fn drop(&mut self) {
+        let association = self
+            .association
+            .take()
+            .expect("the in-process broker association must be finished once");
+        if self.panicked.load(Ordering::Acquire) {
+            drop(association);
+        } else {
+            association.finish();
+        }
+    }
+}
+
+struct InProcessCallGuard<'a> {
+    panicked: &'a AtomicBool,
+    completed: bool,
+}
+
+impl Drop for InProcessCallGuard<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.panicked.store(true, Ordering::Release);
+        }
+    }
+}
+
+struct InProcessHostSetup {
+    response: Option<BrokerHandshakeResponse>,
+}
 
 impl HostSetupChannel for InProcessHostSetup {
     type Error = Infallible;
@@ -138,6 +195,7 @@ impl HostSetupChannel for InProcessHostSetup {
             response,
             BrokerHandshakeResponse::Negotiated { .. }
         ));
+        self.response = Some(response.clone());
         Ok(())
     }
 }
@@ -244,5 +302,68 @@ impl SharedMemory for InProcessSharedMemory {
             .ok_or(SharedMemoryError::InvalidRange)?;
         destination.copy_from_slice(source);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use litebox_broker_core::{
+        BrokerCoreLimits, ObjectRights, PolicyEngine, test_support::TestBrokerCoreBuilder,
+    };
+    use litebox_broker_protocol::{
+        RequestId,
+        message::{BrokerOperation, BrokerRequest, BrokerResult},
+    };
+    use litebox_broker_transport::channel::{LocalCallChannel, LocalSetupChannel};
+
+    use super::*;
+
+    #[test]
+    fn dropping_active_channel_releases_remaining_thread_quota() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .with_limits(BrokerCoreLimits::DEFAULT.with_thread_quotas(1, 1))
+        .build()
+        .unwrap();
+
+        let first = active_channel(broker.clone());
+        assert!(matches!(
+            first
+                .call(BrokerRequest {
+                    request_id: RequestId(0),
+                    operation: BrokerOperation::CreateThread,
+                })
+                .unwrap()
+                .result,
+            BrokerResult::ThreadCreated(_)
+        ));
+        drop(first);
+
+        let second = active_channel(broker);
+        assert!(matches!(
+            second
+                .call(BrokerRequest {
+                    request_id: RequestId(0),
+                    operation: BrokerOperation::CreateThread,
+                })
+                .unwrap()
+                .result,
+            BrokerResult::ThreadCreated(_)
+        ));
+    }
+
+    fn active_channel(broker: litebox_broker_core::BrokerCore) -> InProcessBrokerChannel {
+        let mut setup = InProcessBrokerSetup::new(broker);
+        setup
+            .send_handshake_request(&BrokerHandshakeRequest {
+                protocol_version: BROKER_PROTOCOL_VERSION,
+            })
+            .unwrap();
+        assert!(matches!(
+            setup.recv_handshake_response().unwrap().unwrap(),
+            BrokerHandshakeResponse::Negotiated { .. }
+        ));
+        setup.activate()
     }
 }

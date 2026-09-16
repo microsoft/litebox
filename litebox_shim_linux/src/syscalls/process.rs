@@ -551,6 +551,10 @@ type ThreadLocalDescriptor = UserPtrMut<u8>;
 struct NewThreadArgs<Platform: ShimPlatform> {
     /// Task struct that maintains all per-thread data
     task: Task<Platform>,
+    /// LiteBox thread retained by the caller until host spawn succeeds.
+    litebox_thread: Arc<Mutex<Platform, Option<litebox::thread::Thread>>>,
+    /// Prevents guest execution until the parent publishes `PARENT_SETTID`.
+    start: Option<Arc<AtomicBool>>,
 }
 
 impl<Platform: ShimPlatform> litebox::shim::InitThread for NewThreadArgs<Platform> {
@@ -560,7 +564,21 @@ impl<Platform: ShimPlatform> litebox::shim::InitThread for NewThreadArgs<Platfor
         self: alloc::boxed::Box<Self>,
     ) -> alloc::boxed::Box<dyn litebox::shim::EnterShim<ExecutionContext = Self::ExecutionContext>>
     {
-        let Self { task } = *self;
+        let Self {
+            mut task,
+            litebox_thread,
+            start,
+        } = *self;
+        if let Some(start) = start {
+            while !start.load(Ordering::Acquire) {
+                core::hint::spin_loop();
+            }
+        }
+        let litebox_thread = litebox_thread
+            .lock()
+            .take()
+            .expect("a spawned task must receive its LiteBox thread");
+        task.litebox_thread = Some(litebox_thread);
 
         Box::new(crate::LinuxShimEntrypoints {
             task,
@@ -723,10 +741,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
             alloc::sync::Arc::new((**self.fs.borrow()).clone())
         };
 
-        let child_tid = self.global.next_thread_id.fetch_add(1, Ordering::Relaxed);
-        if let Some(parent_tid_ptr) = set_parent_tid {
-            let _ = parent_tid_ptr.write_at_offset::<Platform>(0, child_tid);
-        }
+        let litebox_thread = self.global.create_thread().map_err(|_| Errno::EAGAIN)?;
+        let child_tid = i32::try_from(litebox_thread.id())
+            .expect("the assigned thread ID must fit Linux pid_t");
 
         let sp = if stack != 0 {
             let stack: usize = stack.trunc();
@@ -735,20 +752,32 @@ impl<Platform: ShimPlatform> Task<Platform> {
             None
         };
 
-        let thread = self.thread.new_thread(child_tid).ok_or(Errno::EBUSY)?;
+        let Some(thread) = self.thread.new_thread(child_tid) else {
+            let thread_id = litebox_thread.id();
+            if let Err(error) = litebox_thread.exit() {
+                litebox_util_log::error!(
+                    error:% = error,
+                    thread_id;
+                    "failed to record thread exit during rollback"
+                );
+            }
+            return Err(Errno::EBUSY);
+        };
         thread.init_state.set(ThreadInitState::NewThread {
             stack: sp,
             tls,
             set_child_tid,
         });
         thread.clear_child_tid.set(clear_child_tid);
-
+        let child_start = set_parent_tid.map(|_| Arc::new(AtomicBool::new(false)));
+        let litebox_thread = Arc::new(Mutex::new(Some(litebox_thread)));
         let r = unsafe {
             self.global.platform.spawn_thread(
                 ctx,
                 Box::new(NewThreadArgs {
                     task: Task {
                         global: self.global.clone(),
+                        litebox_thread: None,
                         wait_state: crate::wait::WaitState::new(self.global.platform),
                         thread,
                         pid: self.pid,
@@ -760,15 +789,35 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         files: self.files.clone(), // TODO: !CLONE_FILES support
                         signals: self.signals.clone_for_new_task(),
                     },
+                    litebox_thread: Arc::clone(&litebox_thread),
+                    start: child_start.clone(),
                 }),
             )
         };
         if let Err(err) = r {
             litebox_util_log::error!(err:% = err; "failed to spawn thread");
+            let litebox_thread = litebox_thread
+                .lock()
+                .take()
+                .expect("failed host spawn must return the LiteBox thread");
+            let thread_id = litebox_thread.id();
+            if let Err(error) = litebox_thread.exit() {
+                litebox_util_log::error!(
+                    error:% = error,
+                    thread_id;
+                    "failed to record thread exit during rollback"
+                );
+            }
             // Treat all spawn errors as `ENOMEM`. `EAGAIN` and other errors are
             // for conditions the user can control (such as "in-shim" rlimit
             // violations).
             return Err(Errno::ENOMEM);
+        }
+        if let Some(parent_tid_ptr) = set_parent_tid {
+            let _ = parent_tid_ptr.write_at_offset::<Platform>(0, child_tid);
+        }
+        if let Some(child_start) = child_start {
+            child_start.store(true, Ordering::Release);
         }
 
         Ok(usize::try_from(child_tid).unwrap())

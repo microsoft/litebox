@@ -15,9 +15,6 @@ use crate::{ConstPtr, MutPtr, ShimPlatform, Task};
 
 const ACTIVE_PROCESS_EXIT_STATUS: i32 = 0x0000_0103;
 const NORMAL_PROCESS_BASE_PRIORITY: i32 = 8;
-pub(crate) const INITIAL_PROCESS_ID: usize = 1;
-pub(crate) const INITIAL_THREAD_ID: usize = 1;
-const GUEST_PARENT_PROCESS_ID: usize = 0;
 const GUEST_PROCESS_AFFINITY_MASK: usize = 1;
 const PROCESS_DEBUG_FLAGS_NO_DEBUGGER: u32 = 1;
 const PROCESS_COOKIE: u32 = 0xdead_beef;
@@ -820,7 +817,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             base_priority: NORMAL_PROCESS_BASE_PRIORITY,
             _padding1: 0,
             unique_process_id: self.process.id,
-            inherited_from_unique_process_id: GUEST_PARENT_PROCESS_ID,
+            inherited_from_unique_process_id: self.process.parent_id,
         }
     }
 }
@@ -1133,6 +1130,7 @@ mod tests {
 
                 if supported_status != NtStatus::INVALID_INFO_CLASS {
                     assert_eq!(supported_status, NtStatus::SUCCESS);
+                    let task = crate::tests::test_task();
 
                     for (
                         process_handle,
@@ -1237,7 +1235,6 @@ mod tests {
                             host_process_information,
                             process_information_length,
                         );
-                        let task = crate::tests::test_task();
                         let shim = task.sys_nt_set_information_process(
                             shim_process_handle,
                             process_information_class,

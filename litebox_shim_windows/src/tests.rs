@@ -120,7 +120,8 @@ fn map_csr_server_shared_memory(
 }
 
 pub(crate) fn test_task() -> Task<TestPlatform> {
-    test_task_from_litebox(crate::test_broker::litebox(test_platform()))
+    let (litebox, process_id) = crate::test_broker::litebox(test_platform());
+    test_task_from_litebox_with_process_id(litebox, process_id, None)
 }
 
 /// Returns a task whose broker serves `files` from an in-memory filesystem.
@@ -167,16 +168,28 @@ pub(crate) fn test_task_with_broker_files(files: &[(&str, &[u8])]) -> Task<TestP
         )
     }));
 
-    test_task_from_litebox(crate::test_broker::litebox_with_broker_files(
-        test_platform(),
-        entries,
-    ))
+    let (litebox, process_id) =
+        crate::test_broker::litebox_with_broker_files(test_platform(), entries);
+    test_task_from_litebox_with_process_id(litebox, process_id, None)
 }
 
-fn test_task_from_litebox(litebox: litebox::LiteBox<TestPlatform>) -> Task<TestPlatform> {
+fn test_task_from_litebox_with_process_id(
+    litebox: litebox::LiteBox<TestPlatform>,
+    process_id: usize,
+    parent_id: Option<usize>,
+) -> Task<TestPlatform> {
     let platform = test_platform();
-    let shim_builder =
-        crate::WindowsShimBuilder::<TestPlatform>::new_with_litebox(platform, litebox);
+    let initial_thread = litebox
+        .create_thread()
+        .expect("the test broker must create an initial thread");
+    let initial_thread_id = initial_thread.id();
+    let shim_builder = crate::WindowsShimBuilder::<TestPlatform>::new_with_litebox(
+        platform,
+        litebox,
+        process_id,
+        parent_id,
+        initial_thread,
+    );
     let fs_context = litebox::fs::Context::new();
     let shim = shim_builder.build();
     let WindowsShim(global) = shim;
@@ -187,12 +200,18 @@ fn test_task_from_litebox(litebox: litebox::LiteBox<TestPlatform>) -> Task<TestP
     let windows_shared_section =
         crate::syscalls::section::load_time_windows_shared_section(windows_shared_section_base);
 
-    let process = Arc::new(Process::default(None, windows_shared_section));
+    let process = Arc::new(Process::new(
+        process_id,
+        parent_id,
+        None,
+        windows_shared_section,
+    ));
     let thread_object = Arc::new(crate::syscalls::thread::ThreadObject::new(
-        crate::syscalls::process::INITIAL_THREAD_ID,
+        initial_thread_id as usize,
         0,
     ));
-    assert!(process.attach_thread(crate::syscalls::process::INITIAL_THREAD_ID, &thread_object));
+    assert!(process.attach_thread(initial_thread_id as usize, &thread_object));
+    let litebox_thread = global.initial_thread.lock().take();
 
     Task {
         global,
@@ -207,6 +226,7 @@ fn test_task_from_litebox(litebox: litebox::LiteBox<TestPlatform>) -> Task<TestP
         stack_top: 0,
         context: 0,
         thread_object,
+        litebox_thread: litebox::sync::Mutex::new(litebox_thread),
     }
 }
 
@@ -256,12 +276,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     pub(crate) fn clone_for_test_with_teb(&self, teb_address: usize) -> Option<Self> {
-        let thread_id = self.process.allocate_thread_id();
+        let litebox_thread = self.global.litebox.create_thread().ok()?;
+        let thread_id = litebox_thread.id() as usize;
         let thread_object = Arc::new(crate::syscalls::thread::ThreadObject::new(
             thread_id,
             teb_address,
         ));
         if !self.process.attach_thread(thread_id, &thread_object) {
+            let _ = litebox_thread.exit();
             return None;
         }
         Some(Task {
@@ -277,6 +299,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             stack_top: 0,
             context: 0,
             thread_object,
+            litebox_thread: litebox::sync::Mutex::new(Some(litebox_thread)),
         })
     }
 }

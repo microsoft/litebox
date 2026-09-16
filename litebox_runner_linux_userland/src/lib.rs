@@ -109,6 +109,8 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
     } = litebox_platform_linux_userland::with_guest_signals_blocked(|| {
         broker::connect(control_socket_path)
     })?;
+    let process_id = i32::try_from(broker_local.process_id().0)
+        .context("process ID does not fit Linux pid_t")?;
     broker_positional_io_fds.extend(positional_io_fds);
     broker_shutdown_fds.push(shutdown_fd);
     let litebox = litebox::LiteBox::new_with_broker_local(platform, broker_local);
@@ -120,16 +122,11 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
             litebox.broker_notification_dispatcher(),
         )
     })?;
-    let shim_builder = litebox_shim_linux::LinuxShimBuilder::new_with_litebox(platform, litebox);
-    // SAFETY: `gettid` takes no pointer arguments and has no Rust-side aliasing requirements.
-    let tid = unsafe { libc::syscall(libc::SYS_gettid) }
-        .try_into()
-        .context("failed to convert gettid result to i32")?;
-    // SAFETY: `getppid` takes no arguments and has no Rust-side aliasing requirements.
-    let ppid = unsafe { libc::getppid() };
+    let shim_builder =
+        litebox_shim_linux::LinuxShimBuilder::new_with_litebox(platform, litebox, process_id);
     let task_params = litebox_common_linux::TaskParams {
-        pid: tid,
-        ppid,
+        pid: process_id,
+        ppid: 0,
         uid: u32::from(DEFAULT_GUEST_UID),
         euid: u32::from(DEFAULT_GUEST_UID),
         gid: u32::from(DEFAULT_GUEST_GID),

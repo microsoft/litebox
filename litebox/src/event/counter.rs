@@ -177,16 +177,15 @@ mod tests {
     use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
     use alloc::sync::Arc;
-    use litebox_broker_local::BrokerLocal;
+    use litebox_broker_local::test_support::test_broker_local;
     use litebox_broker_protocol::error::ErrorCode;
     use litebox_broker_protocol::event::{CreateEventResponse, EventConsumption};
     use litebox_broker_protocol::message::{
-        BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerOperation,
-        BrokerRequest, BrokerResponse, BrokerResult, EventRequest, EventResponse,
-        ReadinessNotification,
+        BrokerNotification, BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
+        EventRequest, EventResponse, ReadinessNotification,
     };
     use litebox_broker_protocol::readiness::ReadinessFlags;
-    use litebox_broker_transport::channel::{LocalCallChannel, LocalSetupChannel};
+    use litebox_broker_transport::channel::LocalCallChannel;
 
     use super::*;
     use crate::LiteBox;
@@ -202,7 +201,7 @@ mod tests {
         let consume_attempts = Arc::new(AtomicUsize::new(0));
         let read_ready = Arc::new(AtomicBool::new(false));
         let request_count = Arc::new(AtomicUsize::new(0));
-        let (local, ()) = BrokerLocal::negotiate(
+        let local = test_broker_local(
             FakeLocalChannel {
                 next_handle: AtomicU64::new(handle.0),
                 consume_attempts: consume_attempts.clone(),
@@ -210,9 +209,8 @@ mod tests {
                 request_count,
                 fail_requests: Arc::new(AtomicBool::new(false)),
             },
-            |channel| Ok((channel, Arc::new(NoopSharedMemory), ())),
-        )
-        .unwrap();
+            Arc::new(NoopSharedMemory),
+        );
         let litebox = LiteBox::new_with_broker_local(platform, local);
         let counter = Arc::new(EventCounter::new(&litebox, 0).unwrap());
 
@@ -260,7 +258,7 @@ mod tests {
         let handle = ObjectHandle(7);
         let consume_attempts = Arc::new(AtomicUsize::new(0));
         let request_count = Arc::new(AtomicUsize::new(0));
-        let (local, ()) = BrokerLocal::negotiate(
+        let local = test_broker_local(
             FakeLocalChannel {
                 next_handle: AtomicU64::new(handle.0),
                 consume_attempts: Arc::clone(&consume_attempts),
@@ -268,9 +266,8 @@ mod tests {
                 request_count: Arc::clone(&request_count),
                 fail_requests: Arc::new(AtomicBool::new(false)),
             },
-            |channel| Ok((channel, Arc::new(NoopSharedMemory), ())),
-        )
-        .unwrap();
+            Arc::new(NoopSharedMemory),
+        );
         let litebox = Arc::new(LiteBox::new_with_broker_local(platform, local));
         let counter = Arc::new(EventCounter::new(&litebox, 0).unwrap());
 
@@ -311,7 +308,7 @@ mod tests {
         let handle = ObjectHandle(7);
         let request_count = Arc::new(AtomicUsize::new(0));
         let fail_requests = Arc::new(AtomicBool::new(false));
-        let (local, ()) = BrokerLocal::negotiate(
+        let local = test_broker_local(
             FakeLocalChannel {
                 next_handle: AtomicU64::new(handle.0),
                 consume_attempts: Arc::new(AtomicUsize::new(0)),
@@ -319,9 +316,8 @@ mod tests {
                 request_count: Arc::clone(&request_count),
                 fail_requests: Arc::clone(&fail_requests),
             },
-            |channel| Ok((channel, Arc::new(NoopSharedMemory), ())),
-        )
-        .unwrap();
+            Arc::new(NoopSharedMemory),
+        );
         let litebox = LiteBox::new_with_broker_local(platform, local);
         let first = EventCounter::new(&litebox, 0).unwrap();
         let second = EventCounter::new(&litebox, 0).unwrap();
@@ -347,7 +343,7 @@ mod tests {
         let platform = MockPlatform::new();
         let handle = ObjectHandle(7);
         let request_count = Arc::new(AtomicUsize::new(0));
-        let (local, ()) = BrokerLocal::negotiate(
+        let local = test_broker_local(
             FakeLocalChannel {
                 next_handle: AtomicU64::new(handle.0),
                 consume_attempts: Arc::new(AtomicUsize::new(0)),
@@ -355,9 +351,8 @@ mod tests {
                 request_count: Arc::clone(&request_count),
                 fail_requests: Arc::new(AtomicBool::new(false)),
             },
-            |channel| Ok((channel, Arc::new(NoopSharedMemory), ())),
-        )
-        .unwrap();
+            Arc::new(NoopSharedMemory),
+        );
         let litebox = LiteBox::new_with_broker_local(platform, local);
         let counter = EventCounter::new(&litebox, 0).unwrap();
         let read_observer = Arc::new(ReadObserver(AtomicBool::new(false)));
@@ -432,25 +427,6 @@ mod tests {
         ) -> core::result::Result<(), litebox_broker_transport::shared_memory::SharedMemoryError>
         {
             Ok(())
-        }
-    }
-
-    impl LocalSetupChannel for FakeLocalChannel {
-        type Error = ();
-
-        fn send_handshake_request(
-            &mut self,
-            _request: &BrokerHandshakeRequest,
-        ) -> core::result::Result<(), Self::Error> {
-            Ok(())
-        }
-
-        fn recv_handshake_response(
-            &mut self,
-        ) -> core::result::Result<Option<BrokerHandshakeResponse>, Self::Error> {
-            Ok(Some(BrokerHandshakeResponse::Negotiated {
-                broker_protocol_version: litebox_broker_protocol::BROKER_PROTOCOL_VERSION,
-            }))
         }
     }
 

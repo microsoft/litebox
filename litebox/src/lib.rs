@@ -28,6 +28,7 @@ pub mod random;
 pub mod shim;
 pub mod stdio;
 pub mod sync;
+pub mod thread;
 pub mod tls;
 
 // The core [`LiteBox`] object itself, re-exported here publicly, just to keep management of the

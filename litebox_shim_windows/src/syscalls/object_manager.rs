@@ -82,7 +82,7 @@ impl From<ObjectHandleFlagInformation> for crate::HandleAttributes {
     }
 }
 
-// Wine's server seeds these object-manager directories during init_directories/create_session;
+// Wine's server seeds these object-manager directories during init_directories/create_process;
 // ReactOS initializes the same root-style namespace through ObpRootDirectoryObject.
 const SEEDED_DIRECTORY_PATHS: &[&str] = &[
     r"\",

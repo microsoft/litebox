@@ -294,6 +294,7 @@ mod tests {
             ));
             host.send_handshake_response(&BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
+                process_id: litebox_broker_protocol::ProcessId(1),
             })
             .unwrap();
             let memory = WindowsSharedMemory::create(4096).unwrap();
@@ -335,6 +336,7 @@ mod tests {
             setup
                 .send_handshake_response(&BrokerHandshakeResponse::Negotiated {
                     broker_protocol_version: BROKER_PROTOCOL_VERSION,
+                    process_id: litebox_broker_protocol::ProcessId(1),
                 })
                 .unwrap();
             let (mut requests, responses, mut notifications, _shutdown) =
@@ -410,6 +412,7 @@ mod tests {
             setup
                 .send_handshake_response(&BrokerHandshakeResponse::Negotiated {
                     broker_protocol_version: BROKER_PROTOCOL_VERSION,
+                    process_id: litebox_broker_protocol::ProcessId(1),
                 })
                 .unwrap();
             let (mut requests, responses, _notifications, _shutdown) =
@@ -481,6 +484,7 @@ mod tests {
             setup
                 .send_handshake_response(&BrokerHandshakeResponse::Negotiated {
                     broker_protocol_version: BROKER_PROTOCOL_VERSION,
+                    process_id: litebox_broker_protocol::ProcessId(1),
                 })
                 .unwrap();
             let (mut requests, responses, _notifications, shutdown) =
@@ -558,6 +562,7 @@ mod tests {
             setup
                 .send_handshake_response(&BrokerHandshakeResponse::Negotiated {
                     broker_protocol_version: BROKER_PROTOCOL_VERSION,
+                    process_id: litebox_broker_protocol::ProcessId(1),
                 })
                 .unwrap();
             let (mut requests, _responses, _notifications, shutdown) =

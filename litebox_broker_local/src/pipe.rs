@@ -133,17 +133,17 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
-    use litebox_broker_protocol::BROKER_PROTOCOL_VERSION;
     use litebox_broker_protocol::message::{
-        BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerOperation, BrokerRequest,
-        BrokerResponse, BrokerResult,
+        BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
     };
     use litebox_broker_protocol::pipe::{ReadPipeResponse, WritePipeResponse};
     use litebox_broker_protocol::shared_buffer::{
         SHARED_BUFFER_POOL_SIZE, SHARED_BUFFER_SLOT_SIZE, SharedBufferSlotIndex,
     };
-    use litebox_broker_transport::channel::{LocalCallChannel, LocalSetupChannel};
+    use litebox_broker_transport::channel::LocalCallChannel;
     use litebox_broker_transport::shared_memory::{SharedMemory, SharedMemoryError};
+
+    use crate::test_support::test_broker_local;
 
     #[test]
     fn pipe_uses_the_sequence_slot_for_data_operations() {
@@ -158,8 +158,7 @@ mod tests {
             BrokerResult::Pipe(PipeResponse::Write(WritePipeResponse { written: 2 })),
             BrokerResult::Pipe(PipeResponse::Read(ReadPipeResponse { read: 2 })),
         ]);
-        let (local, ()) =
-            BrokerLocal::negotiate(channel, |channel| Ok((channel, memory.clone(), ()))).unwrap();
+        let local = test_broker_local(channel, memory.clone());
         let write_buffer = sequence(2, 3);
         let read_buffer = sequence(4, 3);
 
@@ -208,8 +207,7 @@ mod tests {
     fn pipe_rejects_oversized_transfers_before_request() {
         let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
         let channel = ScriptedChannel::new([]);
-        let (local, ()) =
-            BrokerLocal::negotiate(channel, |channel| Ok((channel, memory, ()))).unwrap();
+        let local = test_broker_local(channel, memory);
         let oversized = sequence(0, MAX_PIPE_TRANSFER_SIZE + 1);
 
         assert!(matches!(
@@ -235,8 +233,7 @@ mod tests {
                 read: 2,
             }))]);
         let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
-        let (local, ()) =
-            BrokerLocal::negotiate(channel, |channel| Ok((channel, memory, ()))).unwrap();
+        let local = test_broker_local(channel, memory);
         let mut destination = [0];
 
         let _ = local.read_pipe(ObjectHandle(1), sequence(0, 1), &mut destination);
@@ -250,8 +247,7 @@ mod tests {
                 written: 2,
             }))]);
         let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
-        let (local, ()) =
-            BrokerLocal::negotiate(channel, |channel| Ok((channel, memory, ()))).unwrap();
+        let local = test_broker_local(channel, memory);
 
         let _ = local.write_pipe(ObjectHandle(1), sequence(0, 1), &[0]);
     }
@@ -318,26 +314,6 @@ mod tests {
                 results: RefCell::new(results.into_iter().collect()),
                 sent_operations: RefCell::new(Vec::new()),
             }
-        }
-    }
-
-    impl LocalSetupChannel for ScriptedChannel {
-        type Error = Infallible;
-
-        fn send_handshake_request(
-            &mut self,
-            request: &BrokerHandshakeRequest,
-        ) -> core::result::Result<(), Self::Error> {
-            assert_eq!(request.protocol_version, BROKER_PROTOCOL_VERSION);
-            Ok(())
-        }
-
-        fn recv_handshake_response(
-            &mut self,
-        ) -> core::result::Result<Option<BrokerHandshakeResponse>, Self::Error> {
-            Ok(Some(BrokerHandshakeResponse::Negotiated {
-                broker_protocol_version: BROKER_PROTOCOL_VERSION,
-            }))
         }
     }
 

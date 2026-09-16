@@ -20,9 +20,9 @@ use litebox_broker_protocol::socket::{
 };
 use spin::Mutex;
 
+use crate::process::{ObjectEntry, ObjectRights};
 use crate::readiness::{ReadinessRegistration, ReadinessSink};
-use crate::session::{ObjectEntry, ObjectRights};
-use crate::{BrokerError, BrokerSession, Result, SessionId};
+use crate::{BrokerError, BrokerProcess, ProcessId, Result};
 
 const DEFAULT_TCP_LISTEN_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
 const DEFAULT_LOCAL_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
@@ -214,7 +214,7 @@ impl GuestPortBinding {
 
 /// Broker-wide authority for guest-visible transport port namespaces.
 ///
-/// Socket resources own reservations. Sessions remain ownership, quota, and
+/// Socket resources own reservations. Processes remain ownership, quota, and
 /// teardown domains rather than separate network namespaces. TCP and UDP use
 /// independent port spaces, and guest ports remain independent of host ports.
 #[derive(Clone, Default)]
@@ -452,30 +452,30 @@ pub struct PlatformDatagramReceive {
 /// Broker-wide socket provider supplied by the host platform.
 ///
 /// The provider creates per-socket [`PlatformSocket`] resources and owns any
-/// bookkeeping shared across sockets and sessions. Sessions identify ownership
+/// bookkeeping shared across sockets and processes. Authority keys identify ownership
 /// and accounting domains, not separate provider namespaces. Operations on an
 /// individual socket belong to [`PlatformSocket`], not this shared provider.
 pub trait SocketProvider: Send + Sync {
-    /// Creates one nonblocking socket resource for a broker session.
+    /// Creates one nonblocking socket resource for a broker process.
     ///
     /// Any provider-retained clones must become inert when
     /// [`PlatformSocket::retire`] is called. On success, the returned socket
     /// retains `readiness` and publishes any nonempty initial snapshot before
-    /// returning. On error, the provider releases all resources and session
-    /// accounting allocated by the attempt.
+    /// returning. On error, the provider releases all resources and process
+    /// process accounting allocated by the attempt.
     fn create(
         &self,
-        session_id: SessionId,
+        process_authority: ProcessId,
         request: CreateSocketRequest,
         readiness: ReadinessRegistration,
     ) -> Result<Arc<dyn PlatformSocket>>;
 
-    /// Releases remaining provider state charged to a session after its socket
+    /// Releases remaining provider state charged to a process after its socket
     /// references close.
     ///
     /// This is a teardown and accounting boundary, not a separate network
-    /// namespace; it must not disturb endpoints owned by other sessions.
-    fn close_session(&self, session_id: SessionId);
+    /// namespace; it must not disturb endpoints owned by other processes.
+    fn close_process(&self, process_authority: ProcessId);
 }
 
 /// One nonblocking socket resource created by [`SocketProvider`].
@@ -635,35 +635,35 @@ pub struct UnsupportedSocketProvider;
 impl SocketProvider for UnsupportedSocketProvider {
     fn create(
         &self,
-        _session_id: SessionId,
+        _process_authority: ProcessId,
         _request: CreateSocketRequest,
         _readiness: ReadinessRegistration,
     ) -> Result<Arc<dyn PlatformSocket>> {
         Err(BrokerError::UnsupportedOperation)
     }
 
-    fn close_session(&self, _session_id: SessionId) {}
+    fn close_process(&self, _process_authority: ProcessId) {}
 }
 
 /// Creates a broker-owned socket.
 pub fn create(
-    session: &BrokerSession,
+    process: &BrokerProcess,
     request: CreateSocketRequest,
     readiness_sink: Arc<dyn ReadinessSink>,
 ) -> Result<ObjectHandle> {
-    let rights = session
+    let rights = process
         .core
         .policy
-        .authorize_socket_create(session.caller_credential, request)?;
-    let quota = Arc::new(SocketQuotaReservation::new(session)?);
-    let reference = session.reserve_object_reference(rights)?;
+        .authorize_socket_create(process.caller_credential, request)?;
+    let quota = Arc::new(SocketQuotaReservation::new(process)?);
+    let reference = process.reserve_object_reference(rights)?;
     let readiness =
         ReadinessRegistration::new_with_retirement_guard(reference.handle(), readiness_sink, quota);
     let platform_socket =
-        match session
+        match process
             .core
             .socket_provider
-            .create(session.session_id, request, readiness.clone())
+            .create(process.id, request, readiness.clone())
         {
             Ok(socket) => socket,
             Err(error) => {
@@ -691,11 +691,11 @@ pub fn create(
 /// failed attempt preserves the previous peer. Policy denial is a per-request
 /// [`SocketOutcome::Failed`] that also preserves existing state.
 pub fn connect(
-    session: &BrokerSession,
+    process: &BrokerProcess,
     handle: ObjectHandle,
     address: SocketAddrV4,
 ) -> Result<SocketOutcome<SocketConnectionStatus>> {
-    let object = session.authorized_object(handle, ObjectRights::WRITE)?;
+    let object = process.authorized_object(handle, ObjectRights::WRITE)?;
     let create_request = {
         let object = object.read();
         let ObjectEntry::Socket(socket) = &*object else {
@@ -714,8 +714,8 @@ pub fn connect(
 
     // Destination denial is an operation-level socket failure. Failures while
     // evaluating policy remain broker errors.
-    match session.core.policy.authorize_socket_connect(
-        session.caller_credential,
+    match process.core.policy.authorize_socket_connect(
+        process.caller_credential,
         create_request.protocol,
         destination,
     ) {
@@ -727,7 +727,7 @@ pub fn connect(
     }
 
     if is_udp(create_request) {
-        return connect_datagram(session, &object, create_request, destination);
+        return connect_datagram(process, &object, create_request, destination);
     }
 
     let (resource, needs_bind) = {
@@ -752,7 +752,7 @@ pub fn connect(
     };
     if needs_bind {
         let binding =
-            match reserve_and_bind(session, create_request, &resource, DEFAULT_LOCAL_ADDRESS) {
+            match reserve_and_bind(process, create_request, &resource, DEFAULT_LOCAL_ADDRESS) {
                 Ok(binding) => binding,
                 Err(error) => {
                     finish_connect(&object, SocketConnectionStatus::Unconnected);
@@ -815,11 +815,11 @@ pub fn connect(
 
 /// Binds a socket to a supported guest-namespace address.
 pub fn bind(
-    session: &BrokerSession,
+    process: &BrokerProcess,
     handle: ObjectHandle,
     address: SocketAddrV4,
 ) -> Result<SocketOutcome<SocketAddrV4>> {
-    let object = session.authorized_object(handle, ObjectRights::WRITE)?;
+    let object = process.authorized_object(handle, ObjectRights::WRITE)?;
     let (resource, create_request) = {
         let mut object = object.write();
         let ObjectEntry::Socket(socket) = &mut *object else {
@@ -839,7 +839,7 @@ pub fn bind(
         socket.configuration_in_flight = true;
         (Arc::clone(&socket.resource), socket.create_request)
     };
-    match reserve_and_bind(session, create_request, &resource, address) {
+    match reserve_and_bind(process, create_request, &resource, address) {
         Ok(ReserveAndBindOutcome::Completed(local_address, port_binding)) => {
             finish_configuration(&object, Some(local_address), Some(port_binding), false)?;
             Ok(SocketOutcome::Completed(local_address))
@@ -865,14 +865,14 @@ pub fn bind(
 ///
 /// An unbound socket is first bound to an ephemeral loopback endpoint.
 pub fn listen(
-    session: &BrokerSession,
+    process: &BrokerProcess,
     handle: ObjectHandle,
     backlog: u32,
 ) -> Result<SocketOutcome<SocketAddrV4>> {
     if backlog > MAX_TCP_LISTEN_BACKLOG {
         return Err(BrokerError::UnsupportedOperation);
     }
-    let object = session.authorized_object(handle, ObjectRights::WRITE)?;
+    let object = process.authorized_object(handle, ObjectRights::WRITE)?;
     let (resource, create_request, existing_local_address) = {
         let mut object = object.write();
         let ObjectEntry::Socket(socket) = &mut *object else {
@@ -902,7 +902,7 @@ pub fn listen(
     let mut port_binding = None;
     if local_address.is_none() {
         let binding = match reserve_and_bind(
-            session,
+            process,
             create_request,
             &resource,
             DEFAULT_TCP_LISTEN_ADDRESS,
@@ -953,11 +953,11 @@ pub fn listen(
 
 /// Accepts one pending TCP connection and creates a broker socket capability.
 pub fn accept(
-    session: &BrokerSession,
+    process: &BrokerProcess,
     handle: ObjectHandle,
     readiness_sink: Arc<dyn ReadinessSink>,
 ) -> Result<SocketOutcome<AcceptedBrokerSocket>> {
-    let listener = session.authorized_object(handle, ObjectRights::WAIT)?;
+    let listener = process.authorized_object(handle, ObjectRights::WAIT)?;
     let (listener_resource, create_request) = {
         let listener = listener.read();
         let ObjectEntry::Socket(socket) = &*listener else {
@@ -971,12 +971,12 @@ pub fn accept(
         }
         (Arc::clone(&socket.resource), socket.create_request)
     };
-    let rights = session
+    let rights = process
         .core
         .policy
-        .principal_object_rights(session.caller_credential)?;
-    let quota = Arc::new(SocketQuotaReservation::new(session)?);
-    let reference = session.reserve_object_reference(rights)?;
+        .principal_object_rights(process.caller_credential)?;
+    let quota = Arc::new(SocketQuotaReservation::new(process)?);
+    let reference = process.reserve_object_reference(rights)?;
     let readiness =
         ReadinessRegistration::new_with_retirement_guard(reference.handle(), readiness_sink, quota);
     let accepted = match listener_resource.platform_socket.accept(readiness.clone()) {
@@ -1018,7 +1018,7 @@ pub fn accept(
 
 /// Sends TCP stream bytes without waiting for readiness.
 pub fn send(
-    session: &BrokerSession,
+    process: &BrokerProcess,
     handle: ObjectHandle,
     data: Vec<u8>,
     flags: SendFlags,
@@ -1028,7 +1028,7 @@ pub fn send(
     }
     let length = data.len();
     let (resource, create_request, resource_retired) =
-        socket_state(session, handle, ObjectRights::WRITE)?;
+        socket_state(process, handle, ObjectRights::WRITE)?;
     if !is_tcp(create_request) {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
@@ -1051,7 +1051,7 @@ pub fn send(
 /// the platform. A temporarily full socket returns
 /// [`BrokerError::WouldBlock`].
 pub fn send_to(
-    session: &BrokerSession,
+    process: &BrokerProcess,
     handle: ObjectHandle,
     data: Vec<u8>,
     flags: SendFlags,
@@ -1061,7 +1061,7 @@ pub fn send_to(
         return Err(BrokerError::UnsupportedOperation);
     }
     let length = data.len();
-    let object = session.authorized_object(handle, ObjectRights::WRITE)?;
+    let object = process.authorized_object(handle, ObjectRights::WRITE)?;
     let create_request = {
         let object = object.read();
         let ObjectEntry::Socket(socket) = &*object else {
@@ -1080,8 +1080,8 @@ pub fn send_to(
         None => None,
     };
     if let Some(destination) = destination {
-        match session.core.policy.authorize_socket_connect(
-            session.caller_credential,
+        match process.core.policy.authorize_socket_connect(
+            process.caller_credential,
             create_request.protocol,
             destination,
         ) {
@@ -1116,7 +1116,7 @@ pub fn send_to(
         (Arc::clone(&socket.resource), needs_bind)
     };
     if needs_bind {
-        match reserve_and_bind(session, create_request, &resource, DEFAULT_LOCAL_ADDRESS) {
+        match reserve_and_bind(process, create_request, &resource, DEFAULT_LOCAL_ADDRESS) {
             Ok(ReserveAndBindOutcome::Completed(local_address, port_binding)) => {
                 finish_configuration(&object, Some(local_address), Some(port_binding), false)?;
             }
@@ -1153,7 +1153,7 @@ pub fn send_to(
 
 /// Receives TCP stream bytes without waiting for readiness.
 pub fn receive(
-    session: &BrokerSession,
+    process: &BrokerProcess,
     handle: ObjectHandle,
     length: usize,
     flags: ReceiveFlags,
@@ -1179,7 +1179,7 @@ pub fn receive(
         return Err(BrokerError::UnsupportedOperation);
     }
     let (resource, create_request, resource_retired) =
-        socket_state(session, handle, ObjectRights::WAIT)?;
+        socket_state(process, handle, ObjectRights::WAIT)?;
     if !is_tcp(create_request) {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
@@ -1206,7 +1206,7 @@ pub fn receive(
 ///
 /// When no datagram is available, returns [`BrokerError::WouldBlock`].
 pub fn receive_from(
-    session: &BrokerSession,
+    process: &BrokerProcess,
     handle: ObjectHandle,
     length: usize,
     flags: ReceiveFromFlags,
@@ -1215,7 +1215,7 @@ pub fn receive_from(
         return Err(BrokerError::UnsupportedOperation);
     }
     let (resource, create_request, resource_retired) =
-        socket_state(session, handle, ObjectRights::WAIT)?;
+        socket_state(process, handle, ObjectRights::WAIT)?;
     if !is_udp(create_request) {
         return Ok(SocketOutcome::Failed(SocketError::InvalidArgument));
     }
@@ -1235,12 +1235,12 @@ pub fn receive_from(
 
 /// Sets a typed option on a broker-owned TCP socket.
 pub fn set_tcp_option(
-    session: &BrokerSession,
+    process: &BrokerProcess,
     handle: ObjectHandle,
     value: TcpOptionValue,
 ) -> Result<()> {
     let (resource, create_request, resource_retired) =
-        socket_state(session, handle, ObjectRights::WRITE)?;
+        socket_state(process, handle, ObjectRights::WRITE)?;
     if !is_tcp(create_request) {
         return Err(BrokerError::UnsupportedOperation);
     }
@@ -1252,12 +1252,12 @@ pub fn set_tcp_option(
 
 /// Reads a typed option from a broker-owned TCP socket.
 pub fn get_tcp_option(
-    session: &BrokerSession,
+    process: &BrokerProcess,
     handle: ObjectHandle,
     name: TcpOptionName,
 ) -> Result<TcpOptionValue> {
     let (resource, create_request, resource_retired) =
-        socket_state(session, handle, ObjectRights::WAIT)?;
+        socket_state(process, handle, ObjectRights::WAIT)?;
     if !is_tcp(create_request) {
         return Err(BrokerError::UnsupportedOperation);
     }
@@ -1282,11 +1282,11 @@ pub fn get_tcp_option(
 /// listener with `Completed` or `Failed(NotConnected)` transitions it to
 /// `Failed(NotConnected)`.
 pub fn shutdown(
-    session: &BrokerSession,
+    process: &BrokerProcess,
     handle: ObjectHandle,
     mode: ShutdownMode,
 ) -> Result<SocketOutcome<()>> {
-    let object = session.authorized_object(handle, ObjectRights::WRITE)?;
+    let object = process.authorized_object(handle, ObjectRights::WRITE)?;
     let (resource, serializes_configuration, shuts_down_listener) = {
         let mut object = object.write();
         let ObjectEntry::Socket(socket) = &mut *object else {
@@ -1345,8 +1345,8 @@ pub fn shutdown(
 /// refining the local address, and validating the snapshot. A platform report
 /// that contradicts broker-owned state retires the socket, latches
 /// `Failed(Other)`, and returns [`BrokerError::Internal`].
-pub fn status(session: &BrokerSession, handle: ObjectHandle) -> Result<SocketStatusResponse> {
-    let object = session.authorized_object(handle, ObjectRights::WAIT)?;
+pub fn status(process: &BrokerProcess, handle: ObjectHandle) -> Result<SocketStatusResponse> {
+    let object = process.authorized_object(handle, ObjectRights::WAIT)?;
     let datagram = {
         let object = object.read();
         let ObjectEntry::Socket(socket) = &*object else {
@@ -1612,11 +1612,11 @@ fn datagram_status(object: &spin::RwLock<ObjectEntry>) -> Result<SocketStatusRes
 
 #[cfg(test)]
 fn socket_resource(
-    session: &BrokerSession,
+    process: &BrokerProcess,
     handle: ObjectHandle,
     required_rights: ObjectRights,
 ) -> Result<Arc<SocketResource>> {
-    let object = session.authorized_object(handle, required_rights)?;
+    let object = process.authorized_object(handle, required_rights)?;
     let object = object.read();
     let ObjectEntry::Socket(socket) = &*object else {
         return Err(BrokerError::InvalidRights);
@@ -1625,11 +1625,11 @@ fn socket_resource(
 }
 
 fn socket_state(
-    session: &BrokerSession,
+    process: &BrokerProcess,
     handle: ObjectHandle,
     required_rights: ObjectRights,
 ) -> Result<(Arc<SocketResource>, CreateSocketRequest, bool)> {
-    let object = session.authorized_object(handle, required_rights)?;
+    let object = process.authorized_object(handle, required_rights)?;
     let object = object.read();
     let ObjectEntry::Socket(socket) = &*object else {
         return Err(BrokerError::InvalidRights);
@@ -1648,12 +1648,12 @@ enum ReserveAndBindOutcome {
 }
 
 fn reserve_and_bind(
-    session: &BrokerSession,
+    process: &BrokerProcess,
     create_request: CreateSocketRequest,
     resource: &SocketResource,
     requested_address: SocketAddrV4,
 ) -> Result<ReserveAndBindOutcome> {
-    let (local_address, port_binding) = match session
+    let (local_address, port_binding) = match process
         .core
         .socket_ports
         .reserve(create_request, requested_address)?
@@ -1677,7 +1677,7 @@ fn retire_before_releasing_binding(resource: &SocketResource, port_binding: Arc<
 }
 
 fn connect_datagram(
-    session: &BrokerSession,
+    process: &BrokerProcess,
     object: &spin::RwLock<ObjectEntry>,
     create_request: CreateSocketRequest,
     destination: SocketAddrV4,
@@ -1702,7 +1702,7 @@ fn connect_datagram(
     };
     if needs_bind {
         let binding =
-            match reserve_and_bind(session, create_request, &resource, DEFAULT_LOCAL_ADDRESS) {
+            match reserve_and_bind(process, create_request, &resource, DEFAULT_LOCAL_ADDRESS) {
                 Ok(binding) => binding,
                 Err(error) => {
                     finish_datagram_connect(object, previous_status, false);
@@ -2080,37 +2080,37 @@ impl Drop for SocketResource {
 
 struct SocketQuotaReservation {
     global: Arc<AtomicUsize>,
-    session: Arc<AtomicUsize>,
+    process: Arc<AtomicUsize>,
 }
 
 impl SocketQuotaReservation {
-    fn new(session: &BrokerSession) -> Result<Self> {
+    fn new(process: &BrokerProcess) -> Result<Self> {
         reserve_socket(
-            &session.core.reserved_sockets,
-            session.core.limits.max_sockets,
+            &process.core.reserved_sockets,
+            process.core.limits.max_sockets,
         )?;
         if reserve_socket(
-            &session.reserved_sockets,
-            session.core.limits.max_sockets_per_session,
+            &process.reserved_sockets,
+            process.core.limits.max_sockets_per_process,
         )
         .is_err()
         {
-            session
+            process
                 .core
                 .reserved_sockets
                 .fetch_sub(1, Ordering::Relaxed);
             return Err(BrokerError::ResourceExhausted);
         }
         Ok(Self {
-            global: Arc::clone(&session.core.reserved_sockets),
-            session: Arc::clone(&session.reserved_sockets),
+            global: Arc::clone(&process.core.reserved_sockets),
+            process: Arc::clone(&process.reserved_sockets),
         })
     }
 }
 
 impl Drop for SocketQuotaReservation {
     fn drop(&mut self) {
-        self.session.fetch_sub(1, Ordering::Relaxed);
+        self.process.fetch_sub(1, Ordering::Relaxed);
         self.global.fetch_sub(1, Ordering::Relaxed);
     }
 }

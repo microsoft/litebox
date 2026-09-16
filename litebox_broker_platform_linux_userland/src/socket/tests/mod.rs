@@ -12,7 +12,7 @@ use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_core::socket::{GUEST_IPV4_ADDRESS, HOST_GATEWAY_IPV4_ADDRESS};
 use litebox_broker_core::test_support::TestBrokerCoreBuilder;
 use litebox_broker_core::{
-    BrokerCore, BrokerCoreLimits, BrokerSession, CallerCredential, DestinationPortRange,
+    BrokerCore, BrokerCoreLimits, BrokerProcess, CallerCredential, DestinationPortRange,
     DestinationRule, Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy,
 };
 use litebox_broker_protocol::ObjectHandle;
@@ -166,26 +166,26 @@ fn failed_close_acknowledgement_waits_for_reactor_termination() {
 }
 
 fn send_bytes(
-    session: &BrokerSession,
+    process: &BrokerProcess,
     handle: ObjectHandle,
     data: &[u8],
     flags: SendFlags,
 ) -> BrokerResult<SocketOutcome<usize>> {
-    litebox_broker_core::socket::send(session, handle, data.to_vec(), flags)
+    litebox_broker_core::socket::send(process, handle, data.to_vec(), flags)
 }
 
 fn send_datagram(
-    session: &BrokerSession,
+    process: &BrokerProcess,
     handle: ObjectHandle,
     data: &[u8],
     flags: SendFlags,
     destination: Option<SocketAddrV4>,
 ) -> BrokerResult<SocketOutcome<usize>> {
-    litebox_broker_core::socket::send_to(session, handle, data.to_vec(), flags, destination)
+    litebox_broker_core::socket::send_to(process, handle, data.to_vec(), flags, destination)
 }
 
 fn receive_into(
-    session: &BrokerSession,
+    process: &BrokerProcess,
     handle: ObjectHandle,
     data: &mut [u8],
     flags: ReceiveFlags,
@@ -193,7 +193,7 @@ fn receive_into(
     peek_length: u32,
 ) -> BrokerResult<SocketOutcome<ReceiveSocketResponse>> {
     match litebox_broker_core::socket::receive(
-        session,
+        process,
         handle,
         data.len(),
         flags,
@@ -217,12 +217,12 @@ fn receive_into(
 }
 
 fn receive_datagram_into(
-    session: &BrokerSession,
+    process: &BrokerProcess,
     handle: ObjectHandle,
     data: &mut [u8],
     flags: ReceiveFromFlags,
 ) -> BrokerResult<SocketOutcome<ReceivedPlatformDatagram>> {
-    match litebox_broker_core::socket::receive_from(session, handle, data.len(), flags)? {
+    match litebox_broker_core::socket::receive_from(process, handle, data.len(), flags)? {
         SocketOutcome::Completed(received) => {
             data[..received.data.len()].copy_from_slice(&received.data);
             Ok(SocketOutcome::Completed(ReceivedPlatformDatagram {
@@ -377,8 +377,8 @@ fn directional_shutdown_survives_readiness_publication_failure() {
         provider,
     )
     .unwrap();
-    let session = broker
-        .create_session(CallerCredential::Unauthenticated)
+    let process = broker
+        .create_process(CallerCredential::Unauthenticated)
         .unwrap();
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
@@ -387,10 +387,10 @@ fn directional_shutdown_survives_readiness_publication_failure() {
         fail_next_publish: Mutex::new(None),
     });
 
-    let tcp = create_socket(&session, readiness.clone());
+    let tcp = create_socket(&process, readiness.clone());
     assert!(matches!(
         litebox_broker_core::socket::connect(
-            &session,
+            &process,
             tcp,
             gateway_address(socket_address_v4(address)),
         ),
@@ -398,25 +398,25 @@ fn directional_shutdown_survives_readiness_publication_failure() {
             SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
         ))
     ));
-    wait_until_connected(&session, tcp, &publications);
+    wait_until_connected(&process, tcp, &publications);
     readiness.fail_next_publish_matching(tcp, ReadinessFlags::READ, ReadinessFlags::WRITE);
     assert_eq!(
-        litebox_broker_core::socket::shutdown(&session, tcp, ShutdownMode::Both),
+        litebox_broker_core::socket::shutdown(&process, tcp, ShutdownMode::Both),
         Ok(SocketOutcome::Completed(()))
     );
     readiness.assert_no_pending_publish_failure();
-    let tcp_readiness = session.check_readiness(tcp).unwrap();
+    let tcp_readiness = process.check_readiness(tcp).unwrap();
     assert!(tcp_readiness.contains(ReadinessFlags::READ));
     assert!(!tcp_readiness.contains(ReadinessFlags::WRITE));
 
-    let udp = create_udp_socket(&session, readiness.clone());
+    let udp = create_udp_socket(&process, readiness.clone());
     readiness.fail_next_publish_matching(udp, ReadinessFlags::READ, ReadinessFlags::WRITE);
     assert_eq!(
-        litebox_broker_core::socket::shutdown(&session, udp, ShutdownMode::Both),
+        litebox_broker_core::socket::shutdown(&process, udp, ShutdownMode::Both),
         Ok(SocketOutcome::Completed(()))
     );
     readiness.assert_no_pending_publish_failure();
-    let udp_readiness = session.check_readiness(udp).unwrap();
+    let udp_readiness = process.check_readiness(udp).unwrap();
     assert!(udp_readiness.contains(ReadinessFlags::READ));
     assert!(!udp_readiness.contains(ReadinessFlags::WRITE));
 
@@ -442,11 +442,11 @@ fn non_loopback_local_ipv4() -> Option<Ipv4Addr> {
 }
 
 fn create_socket(
-    session: &litebox_broker_core::BrokerSession,
+    process: &litebox_broker_core::BrokerProcess,
     readiness: Arc<dyn ReadinessSink>,
 ) -> ObjectHandle {
     litebox_broker_core::socket::create(
-        session,
+        process,
         CreateSocketRequest {
             address_family: AddressFamily::Ipv4,
             socket_type: SocketType::Stream,
@@ -458,11 +458,11 @@ fn create_socket(
 }
 
 fn create_udp_socket(
-    session: &litebox_broker_core::BrokerSession,
+    process: &litebox_broker_core::BrokerProcess,
     readiness: Arc<dyn ReadinessSink>,
 ) -> ObjectHandle {
     litebox_broker_core::socket::create(
-        session,
+        process,
         CreateSocketRequest {
             address_family: AddressFamily::Ipv4,
             socket_type: SocketType::Datagram,
@@ -474,13 +474,13 @@ fn create_udp_socket(
 }
 
 fn wait_until_connected(
-    session: &litebox_broker_core::BrokerSession,
+    process: &litebox_broker_core::BrokerProcess,
     handle: ObjectHandle,
     publications: &Receiver<(ObjectHandle, ReadinessFlags)>,
 ) {
     let deadline = Instant::now() + TEST_TIMEOUT;
     loop {
-        match litebox_broker_core::socket::status(session, handle)
+        match litebox_broker_core::socket::status(process, handle)
             .unwrap()
             .status
         {
@@ -499,13 +499,13 @@ fn wait_until_connected(
 }
 
 fn wait_until_failed(
-    session: &litebox_broker_core::BrokerSession,
+    process: &litebox_broker_core::BrokerProcess,
     handle: ObjectHandle,
     publications: &Receiver<(ObjectHandle, ReadinessFlags)>,
 ) -> SocketError {
     let deadline = Instant::now() + TEST_TIMEOUT;
     loop {
-        match litebox_broker_core::socket::status(session, handle)
+        match litebox_broker_core::socket::status(process, handle)
             .unwrap()
             .status
         {
@@ -519,14 +519,14 @@ fn wait_until_failed(
 }
 
 fn wait_for_end_of_stream(
-    session: &litebox_broker_core::BrokerSession,
+    process: &litebox_broker_core::BrokerProcess,
     handle: ObjectHandle,
     publications: &Receiver<(ObjectHandle, ReadinessFlags)>,
 ) {
     let deadline = Instant::now() + TEST_TIMEOUT;
     loop {
         let mut byte = [0_u8; 1];
-        match receive_into(session, handle, &mut byte, ReceiveFlags::NONE, 0, 0) {
+        match receive_into(process, handle, &mut byte, ReceiveFlags::NONE, 0, 0) {
             Ok(SocketOutcome::Completed(ReceiveSocketResponse::EndOfStream)) => return,
             Err(BrokerError::WouldBlock) => {
                 wait_for_readiness_until(
@@ -572,13 +572,13 @@ fn wait_for_readiness_publication(
 }
 
 fn wait_until_ready(
-    session: &litebox_broker_core::BrokerSession,
+    process: &litebox_broker_core::BrokerProcess,
     publications: &Receiver<(ObjectHandle, ReadinessFlags)>,
     handle: ObjectHandle,
     readiness: ReadinessFlags,
 ) {
     wait_until_ready_until(
-        session,
+        process,
         publications,
         handle,
         readiness,
@@ -587,14 +587,14 @@ fn wait_until_ready(
 }
 
 fn wait_until_ready_until(
-    session: &litebox_broker_core::BrokerSession,
+    process: &litebox_broker_core::BrokerProcess,
     publications: &Receiver<(ObjectHandle, ReadinessFlags)>,
     handle: ObjectHandle,
     readiness: ReadinessFlags,
     deadline: Instant,
 ) {
     loop {
-        if session.check_readiness(handle).unwrap().contains(readiness) {
+        if process.check_readiness(handle).unwrap().contains(readiness) {
             return;
         }
         // Notifications are wake hints and may be stale by the time the
