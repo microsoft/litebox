@@ -32,14 +32,15 @@ const ENDIAN: LittleEndian = LittleEndian;
 
 /// Per-descriptor state for the shim's runtime ELF syscall rewriter.
 ///
-/// Tracks base address and trampoline write cursor for each ELF file that
+/// Tracks base address and trampoline data for each ELF file that
 /// has executable segments mapped via `do_mmap_file()`.
 pub(crate) struct ElfPatchState {
     /// Whether this file is already pre-patched (trampoline magic found at file tail).
     pre_patched: bool,
-    /// For pre-patched binaries: file offset and size of the trampoline data.
-    trampoline_file_offset: u64,
-    trampoline_file_size: usize,
+    /// For pre-patched binaries, trampoline bytes cached while the descriptor is open.
+    trampoline_data: Option<alloc::vec::Vec<u8>>,
+    /// The descriptor no longer names this state, but mappings may still need it.
+    descriptor_closed: bool,
     /// Start address of the trampoline region (runtime).
     trampoline_addr: usize,
     /// Current write position within the trampoline (byte offset from `trampoline_addr`).
@@ -48,9 +49,6 @@ pub(crate) struct ElfPatchState {
     trampoline_mapped: bool,
     /// Total number of trampoline bytes currently mapped.
     trampoline_mapped_len: usize,
-    /// Whether any runtime-generated stubs were successfully linked from code
-    /// in this fd to the trampoline.
-    runtime_patches_committed: bool,
     /// Tracks file-backed mappings for this fd as (vaddr, len) pairs.
     /// Used to find mappings that need patching when mprotect adds PROT_EXEC.
     /// Cleared on munmap to allow re-patching.
@@ -97,11 +95,6 @@ impl<Platform: ShimPlatform> Ord for ElfPatchKey<Platform> {
 /// probed and found not to be an ELF image we patch. It stops the header probe
 /// from re-running on every mapping of the same descriptor.
 ///
-/// TODO: Deferred patching currently assumes the descriptor remains open until its
-/// mappings gain `PROT_EXEC`. Closing the descriptor removes its entry even if
-/// mappings survive, so `mmap -> close -> mprotect(PROT_EXEC)` can skip patching.
-/// Supporting that sequence requires patch state to follow mapping lifetime,
-/// independently of descriptor lifetime.
 pub(crate) type ElfPatchCache<Platform> = BTreeMap<ElfPatchKey<Platform>, Option<ElfPatchState>>;
 
 #[inline]
@@ -445,17 +438,52 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// unmapped range, so that re-mapping the same file region will be
     /// re-patched instead of skipped.
     fn clear_file_mappings_for_range(&self, unmap_start: usize, unmap_len: usize) {
+        let syscall_entry = self.global.platform.get_syscall_entry_point();
+        if syscall_entry == 0 {
+            return;
+        }
+
         let unmap_end = unmap_start.saturating_add(unmap_len);
         let mut cache = self.global.elf_patch_cache.lock();
         for state in cache.values_mut().flatten() {
-            state.file_mappings.retain(|&(vaddr, seg_len)| {
-                let seg_end = vaddr.saturating_add(seg_len);
-                seg_end <= unmap_start || vaddr >= unmap_end
-            });
-            state.patched_ranges.retain(|&(vaddr, seg_len)| {
-                let seg_end = vaddr.saturating_add(seg_len);
-                seg_end <= unmap_start || vaddr >= unmap_end
-            });
+            Self::subtract_range(&mut state.file_mappings, unmap_start, unmap_end);
+            Self::subtract_range(&mut state.patched_ranges, unmap_start, unmap_end);
+        }
+
+        let stale_keys: alloc::vec::Vec<_> = cache
+            .iter()
+            .filter(|(_, state)| {
+                state
+                    .as_ref()
+                    .is_some_and(|state| state.descriptor_closed && state.file_mappings.is_empty())
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        let stale_states: alloc::vec::Vec<_> = stale_keys
+            .into_iter()
+            .filter_map(|key| cache.remove(&key).flatten())
+            .collect();
+        drop(cache);
+
+        for state in stale_states {
+            self.release_elf_patch_state(state);
+        }
+    }
+
+    fn subtract_range(ranges: &mut BTreeSet<(usize, usize)>, start: usize, end: usize) {
+        let old_ranges = core::mem::take(ranges);
+        for (range_start, range_len) in old_ranges {
+            let range_end = range_start.saturating_add(range_len);
+            if range_end <= start || range_start >= end {
+                ranges.insert((range_start, range_len));
+                continue;
+            }
+            if range_start < start {
+                ranges.insert((range_start, start - range_start));
+            }
+            if range_end > end {
+                ranges.insert((end, range_end - end));
+            }
         }
     }
 
@@ -566,9 +594,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             alloc::vec::Vec::new();
         for (fd, state) in cache.iter() {
             let Some(state) = state else { continue };
-            if state.pre_patched {
-                continue;
-            }
             for &(seg_start, seg_len) in &state.file_mappings {
                 let seg_end = seg_start.saturating_add(seg_len);
                 // Check overlap with the mprotect range.
@@ -613,7 +638,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 continue;
             };
             let mapped_addr = UserPtrMut::<u8>::from_usize(patch_start);
-            self.patch_exec_segment(mapped_addr, patch_len, &fd, state, syscall_entry)?;
+            self.patch_exec_segment(mapped_addr, patch_len, state, syscall_entry)?;
         }
         Ok(())
     }
@@ -735,6 +760,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // Check if file is pre-patched by reading the last 32 bytes for magic
         let (pre_patched, tramp_file_offset, tramp_vaddr, tramp_file_size) =
             Self::check_trampoline_magic(&files, fd);
+        let trampoline_data = if pre_patched && tramp_file_size > 0 {
+            let trampoline_size: usize = tramp_file_size.try_into().ok()?;
+            let trampoline_offset: usize = tramp_file_offset.try_into().ok()?;
+            let mut data = alloc::vec![0u8; trampoline_size];
+            match files.fs.read(fd, &mut data, Some(trampoline_offset)) {
+                Ok(n) if n == data.len() => Some(data),
+                _ => None,
+            }
+        } else {
+            Some(alloc::vec::Vec::new())
+        };
 
         // Compute the trampoline virtual address.
         // - Pre-patched: use the exact address from the trampoline header (the
@@ -768,13 +804,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         Some(ElfPatchState {
             pre_patched,
-            trampoline_file_offset: tramp_file_offset,
-            trampoline_file_size: tramp_file_size.trunc(),
+            trampoline_data,
+            descriptor_closed: false,
             trampoline_addr: trampoline_vaddr,
             trampoline_cursor: 0,
             trampoline_mapped: false,
             trampoline_mapped_len: 0,
-            runtime_patches_committed: false,
             file_mappings: BTreeSet::new(),
             patched_ranges: BTreeSet::new(),
         })
@@ -910,7 +945,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let Some(Some(state)) = cache.get_mut(fd) else {
             return Ok(()); // No patch state — not an ELF we're tracking
         };
-        self.patch_exec_segment(mapped_addr, len, fd, state, syscall_entry)
+        self.patch_exec_segment(mapped_addr, len, state, syscall_entry)
     }
 
     /// Patch an executable segment in-place after it has been mapped.
@@ -930,15 +965,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
         &self,
         mapped_addr: UserPtrMut<u8>,
         len: usize,
-        fd: &ElfPatchKey<Platform>,
         state: &mut ElfPatchState,
         syscall_entry: usize,
     ) -> Result<(), Errno> {
         if state.pre_patched {
-            // Pre-patched binary: map the trampoline data from the file.
-            if !state.trampoline_mapped && state.trampoline_file_size > 0 {
+            // Pre-patched binary: map the trampoline data cached during probing.
+            let trampoline_size = state.trampoline_data.as_ref().ok_or(Errno::EIO)?.len();
+            if !state.trampoline_mapped && trampoline_size > 0 {
                 let tramp_addr = state.trampoline_addr;
-                let tramp_len = align_up(state.trampoline_file_size, PAGE_SIZE);
+                let tramp_len = align_up(trampoline_size, PAGE_SIZE);
 
                 // Allocate RW region at the trampoline address. Use MAP_FIXED
                 // because the code already contains JMPs to this exact address
@@ -958,22 +993,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     return Err(Errno::ENOMEM);
                 }
 
-                // Read trampoline data from the file.
-                let mut tramp_data = alloc::vec![0u8; state.trampoline_file_size];
-                let file_off = state.trampoline_file_offset.trunc();
+                let mut tramp_data = state.trampoline_data.clone().ok_or(Errno::EIO)?;
                 let tramp_ptr = UserPtrMut::<u8>::from_usize(tramp_addr);
-                match self
-                    .files
-                    .borrow()
-                    .fs
-                    .read(&fd.0, &mut tramp_data, Some(file_off))
-                {
-                    Ok(n) if n == tramp_data.len() => {}
-                    _ => {
-                        let _ = self.sys_munmap_raw(tramp_ptr, tramp_len);
-                        return Err(Errno::EIO);
-                    }
-                }
 
                 // Write syscall entry point to the first 8 bytes.
                 if tramp_data.len() >= 8 {
@@ -1193,7 +1214,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     Err(Errno::EFAULT)
                 } else {
                     state.trampoline_cursor = new_cursor;
-                    state.runtime_patches_committed = true;
                     Ok(())
                 }
             }
@@ -1231,26 +1251,37 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Finalize the ELF patching state for `fd`.
     ///
-    /// Removes the cache entry and unmaps any trampoline that was allocated but never used.
+    /// Detaches the descriptor from its patch state. Mapping-owned state remains
+    /// available for deferred patching until its final mapping is unmapped.
     pub(crate) fn finalize_elf_patch(&self, fd: Arc<FileFd<Platform>>) {
-        let state = self
-            .global
-            .elf_patch_cache
-            .lock()
-            .remove(&ElfPatchKey(fd))
-            .flatten();
-        if let Some(state) = state
-            && state.trampoline_mapped
-            && !state.pre_patched
-            && !state.runtime_patches_committed
-        {
-            let tramp_len = state.trampoline_mapped_len;
-            if tramp_len > 0 {
-                let _ = self.sys_munmap(
-                    UserPtrMut::<u8>::from_usize(state.trampoline_addr),
-                    tramp_len,
-                );
+        let syscall_entry = self.global.platform.get_syscall_entry_point();
+        if syscall_entry == 0 {
+            return;
+        }
+
+        let key = ElfPatchKey(fd);
+        let state = {
+            let mut cache = self.global.elf_patch_cache.lock();
+            match cache.get_mut(&key) {
+                Some(Some(state)) if !state.file_mappings.is_empty() => {
+                    state.descriptor_closed = true;
+                    None
+                }
+                Some(_) => cache.remove(&key).flatten(),
+                None => None,
             }
+        };
+        if let Some(state) = state {
+            self.release_elf_patch_state(state);
+        }
+    }
+
+    fn release_elf_patch_state(&self, state: ElfPatchState) {
+        if state.trampoline_mapped && state.trampoline_mapped_len > 0 {
+            let _ = self.sys_munmap_raw(
+                UserPtrMut::<u8>::from_usize(state.trampoline_addr),
+                state.trampoline_mapped_len,
+            );
         }
     }
 }
@@ -1293,6 +1324,141 @@ mod tests {
         ph[40..48].copy_from_slice(&(len as u64).to_le_bytes()); // p_memsz
         ph[48..56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
         buf
+    }
+
+    fn minimal_pre_patched_elf() -> alloc::vec::Vec<u8> {
+        const TRAMPOLINE_OFFSET: usize = 0x1000;
+        const TRAMPOLINE_VADDR: u64 = 0x1000;
+        const TRAMPOLINE_SIZE: usize = 8;
+
+        let mut elf = minimal_elf(TRAMPOLINE_OFFSET);
+        elf.extend_from_slice(&[0; TRAMPOLINE_SIZE]);
+        elf.extend_from_slice(litebox_syscall_rewriter::TRAMPOLINE_MAGIC);
+        elf.extend_from_slice(&(TRAMPOLINE_OFFSET as u64).to_le_bytes());
+        elf.extend_from_slice(&TRAMPOLINE_VADDR.to_le_bytes());
+        elf.extend_from_slice(&(TRAMPOLINE_SIZE as u64).to_le_bytes());
+        elf
+    }
+
+    #[test]
+    fn test_deferred_elf_patch_survives_close() {
+        let task = init_platform(None);
+        let elf = minimal_elf(0x1000);
+        let fd = i32::try_from(
+            task.sys_open("deferred.so", OFlags::RDWR | OFlags::CREAT, Mode::RWXU)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(task.sys_write(fd, &elf, None).unwrap(), elf.len());
+
+        let addr = task
+            .sys_mmap(
+                0,
+                0x1000,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_PRIVATE,
+                fd,
+                0,
+            )
+            .unwrap();
+        task.sys_close(fd).unwrap();
+
+        {
+            let cache = task.global.elf_patch_cache.lock();
+            let state = cache.values().next().unwrap().as_ref().unwrap();
+            assert!(state.descriptor_closed);
+            assert!(state.file_mappings.contains(&(addr.as_usize(), 0x1000)));
+        }
+
+        task.sys_mprotect(addr, 0x1000, ProtFlags::PROT_READ_EXEC)
+            .unwrap();
+        {
+            let cache = task.global.elf_patch_cache.lock();
+            let state = cache.values().next().unwrap().as_ref().unwrap();
+            assert!(state.patched_ranges.contains(&(addr.as_usize(), 0x1000)));
+        }
+
+        task.sys_munmap(addr, 0x1000).unwrap();
+        assert!(task.global.elf_patch_cache.lock().is_empty());
+    }
+
+    #[test]
+    fn test_deferred_pre_patched_trampoline_survives_close() {
+        let task = init_platform(None);
+        let elf = minimal_pre_patched_elf();
+        let fd = i32::try_from(
+            task.sys_open("pre-patched.so", OFlags::RDWR | OFlags::CREAT, Mode::RWXU)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(task.sys_write(fd, &elf, None).unwrap(), elf.len());
+
+        let addr = task
+            .sys_mmap(
+                0,
+                0x1000,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_PRIVATE,
+                fd,
+                0,
+            )
+            .unwrap();
+        task.sys_close(fd).unwrap();
+        task.sys_mprotect(addr, 0x1000, ProtFlags::PROT_READ_EXEC)
+            .unwrap();
+
+        {
+            let cache = task.global.elf_patch_cache.lock();
+            let state = cache.values().next().unwrap().as_ref().unwrap();
+            assert!(state.pre_patched);
+            assert!(state.trampoline_mapped);
+            assert_eq!(state.trampoline_data.as_ref().unwrap().len(), 8);
+        }
+
+        task.sys_munmap(addr, 0x1000).unwrap();
+        assert!(task.global.elf_patch_cache.lock().is_empty());
+    }
+
+    #[test]
+    fn test_deferred_elf_state_survives_partial_unmap() {
+        let task = init_platform(None);
+        let elf = minimal_elf(0x2000);
+        let fd = i32::try_from(
+            task.sys_open("partial.so", OFlags::RDWR | OFlags::CREAT, Mode::RWXU)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(task.sys_write(fd, &elf, None).unwrap(), elf.len());
+
+        let addr = task
+            .sys_mmap(
+                0,
+                0x2000,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_PRIVATE,
+                fd,
+                0,
+            )
+            .unwrap();
+        task.sys_close(fd).unwrap();
+        task.sys_munmap(addr, 0x1000).unwrap();
+
+        {
+            let cache = task.global.elf_patch_cache.lock();
+            let state = cache.values().next().unwrap().as_ref().unwrap();
+            assert_eq!(
+                state
+                    .file_mappings
+                    .iter()
+                    .copied()
+                    .collect::<alloc::vec::Vec<_>>(),
+                [(addr.as_usize() + 0x1000, 0x1000)]
+            );
+        }
+
+        task.sys_munmap(UserPtrMut::from_usize(addr.as_usize() + 0x1000), 0x1000)
+            .unwrap();
+        assert!(task.global.elf_patch_cache.lock().is_empty());
     }
 
     /// Closing a descriptor must drop its ELF patch state, so that a later
