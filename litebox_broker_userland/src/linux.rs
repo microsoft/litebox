@@ -42,12 +42,6 @@ pub(super) fn run(mut args: super::CliArgs) -> Result<(), Box<dyn Error>> {
         .as_ref()
         .map(|proxy| format!("http://{HOST_GATEWAY_IPV4_ADDRESS}:{}", proxy.port));
 
-    let socket_dir = tempfile::Builder::new()
-        .prefix("litebox-broker-userland-")
-        .tempdir()?;
-    let control_socket_path = socket_dir.path().join("broker.sock");
-    let control_listener = UnixListener::bind(&control_socket_path)?;
-    control_listener.set_nonblocking(true)?;
     let policy = PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()).with_socket_policy(
         configured_socket_policy(&args.allow_tcp_destination, &args.allow_udp_destination)?,
     );
@@ -63,6 +57,12 @@ pub(super) fn run(mut args: super::CliArgs) -> Result<(), Box<dyn Error>> {
 
     if args.in_process_runner {
         debug_assert!(args.unstable);
+        let socket_dir = tempfile::Builder::new()
+            .prefix("litebox-broker-userland-")
+            .tempdir()?;
+        let control_socket_path = socket_dir.path().join("broker.sock");
+        let control_listener = UnixListener::bind(&control_socket_path)?;
+        control_listener.set_nonblocking(true)?;
         run_runner_in_process(
             &args,
             control_socket_path.as_os_str(),
@@ -71,15 +71,7 @@ pub(super) fn run(mut args: super::CliArgs) -> Result<(), Box<dyn Error>> {
             &control_listener,
         )
     } else {
-        crate::run_runner_process(
-            &args,
-            control_socket_path.as_os_str(),
-            proxy_url.as_deref(),
-            |runner, runner_process_id| {
-                serve_runner_process(&broker, &control_listener, runner, runner_process_id)?;
-                Ok(())
-            },
-        )
+        crate::run_runner_instance(&args, proxy_url.as_deref(), &broker)
     }
 }
 
@@ -205,27 +197,6 @@ fn run_runner_in_process(
         let association_result = serve_runner_in_process(broker, control_listener, &runner);
         crate::finish_in_process_runner(runner, association_result)
     })
-}
-
-fn serve_runner_process(
-    broker: &BrokerCore,
-    control_listener: &UnixListener,
-    runner: &mut Child,
-    runner_process_id: u32,
-) -> IoResult<()> {
-    let setup_deadline = Instant::now() + SETUP_TIMEOUT;
-    let control_stream = crate::accept_runner_channel(
-        setup_deadline,
-        "control",
-        || {
-            runner
-                .try_wait()
-                .map(|status| status.map(|status| format!("exited with {status}")))
-        },
-        || control_listener.accept().map(|(stream, _)| stream),
-    )?;
-    validate_peer_process(&control_stream, runner_process_id)?;
-    serve_control_stream(broker, control_stream, setup_deadline)
 }
 
 fn serve_runner_in_process(

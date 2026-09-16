@@ -8,14 +8,16 @@
 //! [`litebox_broker_core::BrokerCore`] ([`builder`]), the generic association
 //! runtime that serves one association from setup through
 //! teardown ([`runtime`]), and threaded readiness publication
-//! ([`readiness`]). The `litebox-broker-userland` binary composes these with
-//! CLI parsing, launching and supervising a separate or explicitly non-secure
-//! in-process LiteBox runner, and the platform-specific transport endpoints from
-//! `litebox_broker_transport_linux_userland` and
-//! `litebox_broker_transport_windows_userland`.
+//! ([`readiness`]). On supported out-of-process hosts, the `runner` module owns
+//! one runner and its platform-specific transport endpoint. The
+//! `litebox-broker-userland` binary composes these with CLI parsing, broker
+//! policy, shared services, and the explicitly non-secure in-process runner
+//! mode.
 
 pub mod builder;
 pub mod readiness;
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+pub mod runner;
 pub mod runtime;
 
 mod random;

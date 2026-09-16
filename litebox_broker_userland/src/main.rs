@@ -7,13 +7,14 @@ use std::ffi::{OsStr, OsString};
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+use litebox_broker_core::BrokerCore;
 use litebox_broker_core::fs::FileService;
 use litebox_broker_core::fs::composer::Composer;
 use litebox_broker_core::fs::in_mem::{InMem, InitialNode};
@@ -182,11 +183,11 @@ fn runner_command_arguments(
     runner_arguments
 }
 
-fn run_runner_process(
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+fn run_runner_instance(
     args: &CliArgs,
-    control_channel: &OsStr,
     proxy_url: Option<&str>,
-    serve: impl FnOnce(&mut Child, u32) -> Result<(), Box<dyn Error>>,
+    broker: &BrokerCore,
 ) -> Result<(), Box<dyn Error>> {
     let runner_path = args.runner.as_ref().ok_or_else(|| {
         IoError::new(
@@ -194,16 +195,15 @@ fn run_runner_process(
             "--runner is required outside in-process mode",
         )
     })?;
-    let mut runner = Command::new(runner_path)
-        .args(runner_command_arguments(args, control_channel, proxy_url))
-        .spawn()?;
-    let runner_process_id = runner.id();
-    let association_result = serve(&mut runner, runner_process_id);
-    if association_result.is_err() {
-        let _ = runner.kill();
+    let mut config = litebox_broker_userland::runner::RunnerConfig::new(
+        runner_path.clone(),
+        args.runner_arguments.clone(),
+    );
+    if let Some(proxy_url) = proxy_url {
+        config = config.with_proxy_url(proxy_url.to_owned());
     }
-    let runner_status = runner.wait()?;
-    association_result?;
+    let runner_status =
+        litebox_broker_userland::runner::RunnerInstance::spawn(config)?.run(broker)?;
     if !runner_status.success() {
         return Err(IoError::other(format!("runner exited with {runner_status}")).into());
     }
