@@ -32,7 +32,7 @@ pub(crate) struct ThreadState<Platform: ShimPlatform> {
     process: Arc<Process<Platform>>,
     /// Thread state that can be accessed from a remote thread.
     remote: Arc<ThreadRemote<Platform>>,
-    attached_tid: Cell<Option<i32>>,
+    tid: Cell<Option<i32>>,
     /// When a thread whose `clear_child_tid` is not `None` terminates, and it shares memory with other threads,
     /// the kernel writes 0 to the address specified by `clear_child_tid` and then executes:
     ///
@@ -58,7 +58,7 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
             init_state: Cell::new(ThreadInitState::None),
             process: Arc::new(Process::new(pid, remote.clone())),
             remote,
-            attached_tid: Cell::new(Some(pid)),
+            tid: Cell::new(Some(pid)),
             clear_child_tid: Cell::new(None),
             robust_list: Cell::new(None),
         }
@@ -70,16 +70,41 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
             init_state: Cell::new(ThreadInitState::None),
             process: self.process.clone(),
             remote,
-            attached_tid: Cell::new(Some(tid)),
+            tid: Cell::new(Some(tid)),
             clear_child_tid: Cell::new(None),
             robust_list: Cell::new(None),
         })
     }
 
     fn detach_from_process(&self) {
-        if let Some(tid) = self.attached_tid.take() {
+        if let Some(tid) = self.tid.take() {
             self.process.detach_thread(tid);
         }
+    }
+
+    fn tid(&self) -> i32 {
+        self.tid
+            .get()
+            .expect("an active task must be attached to its process")
+    }
+
+    /// Rebinds the sole surviving exec caller to the process leader ID.
+    ///
+    /// Returns the former nonleader thread ID, or `None` if the caller was
+    /// already the process leader.
+    fn rebind_for_exec(&self, pid: i32) -> Option<i32> {
+        let old_tid = self.tid();
+        if old_tid == pid {
+            return None;
+        }
+
+        self.process.rebind_thread(old_tid, pid);
+        assert_eq!(
+            self.tid.replace(Some(pid)),
+            Some(old_tid),
+            "exec caller must remain attached during identity rebinding"
+        );
+        Some(old_tid)
     }
 }
 
@@ -250,9 +275,37 @@ impl<Platform: ShimPlatform> Process<Platform> {
             self.nr_threads.wake_all();
         }
     }
+
+    /// Rekeys the sole surviving thread without changing the thread count.
+    fn rebind_thread(&self, old_tid: i32, new_tid: i32) {
+        let mut inner = self.inner.lock();
+        assert_eq!(
+            self.nr_threads.underlying_atomic().load(Ordering::Relaxed),
+            1,
+            "exec identity rebinding requires one surviving thread"
+        );
+        assert_eq!(
+            inner.threads.len(),
+            1,
+            "exec identity rebinding requires one thread entry"
+        );
+        assert!(
+            !inner.threads.contains_key(&new_tid),
+            "process leader ID {new_tid} must be vacant before exec rebinding"
+        );
+        let remote = inner
+            .threads
+            .remove(&old_tid)
+            .expect("exec caller must be attached under its old thread ID");
+        assert!(inner.threads.insert(new_tid, remote).is_none());
+    }
 }
 
 impl<Platform: ShimPlatform> Task<Platform> {
+    pub(crate) fn tid(&self) -> i32 {
+        self.thread.tid()
+    }
+
     /// Recheck shared pending signals on siblings, whether sleeping or in guest code.
     pub(crate) fn interrupt_siblings(&self) {
         let siblings: Vec<_> = self
@@ -262,7 +315,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .lock()
             .threads
             .iter()
-            .filter(|&(&tid, _)| tid != self.tid)
+            .filter(|&(&tid, _)| tid != self.tid())
             .map(|(_, thread)| thread.clone())
             .collect();
         for sibling in siblings {
@@ -307,7 +360,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 return false;
             }
             for (&tid, thread) in &inner.threads {
-                if tid == self.tid {
+                if tid == self.tid() {
                     continue;
                 }
                 thread.is_exiting.store(true, Ordering::Relaxed);
@@ -331,6 +384,34 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         self.thread.process.inner.lock().is_killing_other_threads = false;
         true
+    }
+
+    /// Transfers a surviving nonleader exec caller to the process leader
+    /// identity and retires its former broker thread ID.
+    fn rebind_exec_identity(&self) {
+        let Some(old_tid) = self.thread.rebind_for_exec(self.pid) else {
+            return;
+        };
+
+        // Publish the leader identity locally before releasing the old broker
+        // ID so no local process state can refer to a reusable thread ID.
+        let thread = self
+            .litebox_thread
+            .take()
+            .expect("a nonleader task must own a LiteBox thread");
+        assert_eq!(
+            i32::try_from(thread.id()).expect("broker thread ID must fit Linux pid_t"),
+            old_tid,
+            "LiteBox thread ownership must match the old Linux thread ID"
+        );
+        let thread_id = thread.id();
+        if let Err(error) = thread.exit() {
+            litebox_util_log::error!(
+                error:% = error,
+                thread_id;
+                "failed to record thread exit during exec identity rebinding"
+            );
+        }
     }
 
     /// Returns true if the task is exiting and should not continue running
@@ -565,7 +646,7 @@ impl<Platform: ShimPlatform> litebox::shim::InitThread for NewThreadArgs<Platfor
     ) -> alloc::boxed::Box<dyn litebox::shim::EnterShim<ExecutionContext = Self::ExecutionContext>>
     {
         let Self {
-            mut task,
+            task,
             litebox_thread,
             start,
         } = *self;
@@ -578,7 +659,7 @@ impl<Platform: ShimPlatform> litebox::shim::InitThread for NewThreadArgs<Platfor
             .lock()
             .take()
             .expect("a spawned task must receive its LiteBox thread");
-        task.litebox_thread = Some(litebox_thread);
+        task.litebox_thread.set(Some(litebox_thread));
 
         Box::new(crate::LinuxShimEntrypoints {
             task,
@@ -777,11 +858,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 Box::new(NewThreadArgs {
                     task: Task {
                         global: self.global.clone(),
-                        litebox_thread: None,
+                        litebox_thread: Cell::new(None),
                         wait_state: crate::wait::WaitState::new(self.global.platform),
                         thread,
                         pid: self.pid,
-                        tid: child_tid,
                         ppid: self.ppid,
                         credentials: self.credentials.clone(),
                         comm: self.comm.clone(),
@@ -826,12 +906,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `set_tid_address`.
     pub(crate) fn sys_set_tid_address(&self, tidptr: UserPtrMut<i32>) -> i32 {
         self.thread.clear_child_tid.set(Some(tidptr));
-        self.tid
+        self.tid()
     }
 
     /// Handle syscall `gettid`.
     pub(crate) fn sys_gettid(&self) -> i32 {
-        self.tid
+        self.tid()
     }
 }
 
@@ -1586,6 +1666,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let _ = wake_robust_list::<Platform>(robust_list);
         }
         self.thread.clear_child_tid.set(None);
+        self.rebind_exec_identity();
 
         self.signals.reset_for_exec();
 
@@ -1747,7 +1828,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
                 if let Some(child_tid_ptr) = set_child_tid {
                     // Set the child TID if requested.
-                    let _ = child_tid_ptr.write_at_offset::<Platform>(0, self.tid);
+                    let _ = child_tid_ptr.write_at_offset::<Platform>(0, self.tid());
                 }
             }
         }
@@ -1759,6 +1840,54 @@ mod tests {
     use crate::{UserPtr, UserPtrMut};
 
     extern crate std;
+
+    #[test]
+    fn nonleader_exec_rebinds_identity_and_releases_broker_thread() {
+        use litebox::thread::CreateError;
+        use litebox_broker_core::BrokerCoreLimits;
+
+        let platform = crate::syscalls::tests::test_platform();
+        let limits = BrokerCoreLimits::new(
+            super::super::test_broker::MAX_TEST_BROKER_REFERENCES,
+            BrokerCoreLimits::DEFAULT.max_total_pipe_capacity,
+        )
+        .with_thread_quotas(1, 1);
+        let (litebox, process_id) =
+            crate::syscalls::test_broker::litebox_with_limits(platform, limits);
+        let shim_builder = crate::LinuxShimBuilder::new_with_litebox(platform, litebox, process_id);
+        let leader = shim_builder.build().0.new_test_task();
+        let task = leader
+            .clone_for_test()
+            .expect("the sole broker thread slot must be available");
+        let old_tid = task.sys_gettid();
+        let process = task.process().clone();
+
+        assert_ne!(old_tid, process_id);
+        assert!(matches!(
+            task.global.create_thread(),
+            Err(CreateError::ResourceExhausted)
+        ));
+
+        drop(leader);
+        task.rebind_exec_identity();
+
+        assert_eq!(task.sys_getpid(), process_id);
+        assert_eq!(task.sys_gettid(), process_id);
+        {
+            let inner = process.inner.lock();
+            assert_eq!(inner.threads.len(), 1);
+            assert!(inner.threads.contains_key(&process_id));
+            assert!(!inner.threads.contains_key(&old_tid));
+        }
+
+        let replacement = task
+            .global
+            .create_thread()
+            .expect("exec rebinding must release the old broker thread slot");
+        replacement
+            .exit()
+            .expect("the replacement broker thread must exit");
+    }
 
     #[test]
     fn resource_limit_cur_never_exceeds_max() {
@@ -2167,7 +2296,7 @@ mod tests {
             .expect("block SIGUSR1 failed");
 
             assert_eq!(task.sys_alarm(1).unwrap(), 0);
-            task.sys_tkill(task.tid, Signal::SIGUSR1.as_i32())
+            task.sys_tkill(task.tid(), Signal::SIGUSR1.as_i32())
                 .expect("tkill failed");
             assert!(!task.has_pending_signals(), "blocked SIGUSR1 should not be deliverable");
 

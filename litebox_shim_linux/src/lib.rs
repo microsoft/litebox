@@ -295,12 +295,11 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             _not_send: core::marker::PhantomData,
             task: Task {
                 global: self.0.clone(),
-                litebox_thread: None,
+                litebox_thread: Cell::new(None),
                 thread: syscalls::process::ThreadState::new_process(pid),
                 wait_state: wait::WaitState::new(self.0.platform),
                 pid,
                 ppid,
-                tid: pid,
                 credentials,
                 comm: [0; litebox_common_linux::TASK_COMM_LEN].into(), // set at load time
                 fs: fs_state.into(),
@@ -1175,15 +1174,13 @@ struct GlobalState<Platform: ShimPlatform> {
 
 struct Task<Platform: ShimPlatform> {
     global: Arc<GlobalState<Platform>>,
-    litebox_thread: Option<litebox::thread::Thread>,
+    litebox_thread: Cell<Option<litebox::thread::Thread>>,
     wait_state: wait::WaitState<Platform>,
     thread: syscalls::process::ThreadState<Platform>,
     /// Process ID
     pid: i32,
     /// Parent Process ID
     ppid: i32,
-    /// Thread ID
-    tid: i32,
     /// Task credentials. These are set per task but are Arc'd to save space
     /// since most tasks never change their credentials.
     credentials: Arc<syscalls::process::Credentials>,
@@ -1239,11 +1236,10 @@ mod test_utils {
             files.initialize_stdio_in_shared_descriptors_table(&self, &fs_state.context.read());
             Task {
                 wait_state: wait::WaitState::new(self.platform),
-                litebox_thread: None,
+                litebox_thread: Cell::new(None),
                 thread: syscalls::process::ThreadState::new_process(pid),
                 pid,
                 ppid: 0,
-                tid: pid,
                 credentials,
                 comm: Cell::new(*b"test\0\0\0\0\0\0\0\0\0\0\0\0"),
                 fs: fs_state.into(),
@@ -1267,11 +1263,10 @@ mod test_utils {
             let task = Task {
                 wait_state: wait::WaitState::new(self.global.platform),
                 global: self.global.clone(),
-                litebox_thread: Some(litebox_thread),
+                litebox_thread: Cell::new(Some(litebox_thread)),
                 thread,
                 pid: self.pid,
                 ppid: self.ppid,
-                tid,
                 credentials: self.credentials.clone(),
                 comm: self.comm.clone(),
                 fs: self.fs.clone(),

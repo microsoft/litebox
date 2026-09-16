@@ -25,11 +25,25 @@ use litebox_broker_protocol::{
 
 use crate::syscalls::tests::TestPlatform;
 
-const MAX_TEST_BROKER_REFERENCES: usize = 16;
+pub(crate) const MAX_TEST_BROKER_REFERENCES: usize = 16;
 
 /// Returns a LiteBox connected to the process-wide test broker.
 pub(crate) fn litebox(platform: &'static TestPlatform) -> (litebox::LiteBox<TestPlatform>, i32) {
-    let setup = InProcessBrokerSetup::new(test_broker().clone());
+    litebox_with_limits(
+        platform,
+        BrokerCoreLimits::new(
+            MAX_TEST_BROKER_REFERENCES,
+            BrokerCoreLimits::DEFAULT.max_total_pipe_capacity,
+        ),
+    )
+}
+
+/// Returns a LiteBox connected to the process-wide test broker with explicit limits.
+pub(crate) fn litebox_with_limits(
+    platform: &'static TestPlatform,
+    limits: BrokerCoreLimits,
+) -> (litebox::LiteBox<TestPlatform>, i32) {
+    let setup = InProcessBrokerSetup::new(test_broker(limits).clone());
     let readiness = setup.readiness_sink();
     let (broker_local, ()) = BrokerLocal::negotiate(setup, |setup| {
         let memory = setup.shared_memory();
@@ -43,7 +57,7 @@ pub(crate) fn litebox(platform: &'static TestPlatform) -> (litebox::LiteBox<Test
     (litebox, process_id)
 }
 
-fn test_broker() -> &'static BrokerCore {
+fn test_broker(limits: BrokerCoreLimits) -> &'static BrokerCore {
     static BROKER: OnceLock<BrokerCore> = OnceLock::new();
     BROKER.get_or_init(|| {
         let root = InitialNode::Directory {
@@ -62,10 +76,7 @@ fn test_broker() -> &'static BrokerCore {
         TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
-        .with_limits(BrokerCoreLimits::new(
-            MAX_TEST_BROKER_REFERENCES,
-            BrokerCoreLimits::DEFAULT.max_total_pipe_capacity,
-        ))
+        .with_limits(limits)
         .with_stdio_provider(Arc::new(
             TerminalOnlyStdioProvider::default().with_terminal(StdioStream::Stdout),
         ))

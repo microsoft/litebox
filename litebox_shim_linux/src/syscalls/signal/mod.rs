@@ -568,7 +568,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     fn do_kill(&self, pid: Option<i32>, tid: Option<i32>, signal: i32) -> Result<usize, Errno> {
         let signal = Signal::try_from(signal)?;
-        if pid.is_none_or(|pid| pid == self.pid) && tid.is_none_or(|tid| tid == self.tid) {
+        if pid.is_none_or(|pid| pid == self.pid) && tid.is_none_or(|tid| tid == self.tid()) {
             self.send_signal(signal, siginfo_kill(signal));
             Ok(0)
         } else {
@@ -639,7 +639,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                             litebox_util_log::error!(
                                 signal:? = signal,
                                 pid:% = self.pid,
-                                tid:% = self.tid;
+                                tid:% = self.tid();
                                 "fatal signal: terminating task"
                             );
                             self.exit_group(ExitStatus::Signal(signal));
