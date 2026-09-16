@@ -202,8 +202,8 @@ fn run_runner_instance(
     if let Some(proxy_url) = proxy_url {
         config = config.with_proxy_url(proxy_url.to_owned());
     }
-    let runner_status =
-        litebox_broker_userland::runner::RunnerInstance::spawn(config)?.run(broker)?;
+    let runner_status = litebox_broker_userland::runner::RunnerInstance::start(config)?
+        .run_to_completion(broker)?;
     if !runner_status.success() {
         return Err(IoError::other(format!("runner exited with {runner_status}")).into());
     }

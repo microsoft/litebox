@@ -67,21 +67,21 @@ impl RunnerConfig {
 
 /// One out-of-process runner and its dedicated broker control endpoint.
 ///
-/// Dropping an instance before [`Self::run`] completes terminates and reaps the
-/// runner.
+/// Dropping an instance before [`Self::run_to_completion`] completes
+/// terminates and reaps the runner.
 pub struct RunnerInstance {
-    child: Child,
+    runner: Child,
     endpoint: PlatformRunnerEndpoint,
 }
 
 impl RunnerInstance {
     /// Creates the runner's dedicated control endpoint and starts the runner.
-    pub fn spawn(config: RunnerConfig) -> IoResult<Self> {
+    pub fn start(config: RunnerConfig) -> IoResult<Self> {
         let endpoint = PlatformRunnerEndpoint::create()?;
-        let child = Command::new(&config.executable)
+        let runner = Command::new(&config.executable)
             .args(config.arguments(endpoint.control_channel()))
             .spawn()?;
-        Ok(Self { child, endpoint })
+        Ok(Self { runner, endpoint })
     }
 
     /// Serves the runner's broker association and waits for its host process.
@@ -89,13 +89,13 @@ impl RunnerInstance {
     /// Association failure terminates the runner before it is reaped. A
     /// non-successful runner exit is returned as ordinary instance data for the
     /// caller to interpret.
-    pub fn run(mut self, broker: &BrokerCore) -> IoResult<ExitStatus> {
-        let association_result = self.endpoint.serve(broker, &mut self.child);
+    pub fn run_to_completion(mut self, broker: &BrokerCore) -> IoResult<ExitStatus> {
+        let association_result = self.endpoint.serve(broker, &mut self.runner);
         self.endpoint.close();
         if association_result.is_err() {
-            let _ = self.child.kill();
+            let _ = self.runner.kill();
         }
-        let runner_status = self.child.wait()?;
+        let runner_status = self.runner.wait()?;
         association_result?;
         Ok(runner_status)
     }
@@ -104,9 +104,9 @@ impl RunnerInstance {
 impl Drop for RunnerInstance {
     fn drop(&mut self) {
         self.endpoint.close();
-        if !matches!(self.child.try_wait(), Ok(Some(_status))) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+        if !matches!(self.runner.try_wait(), Ok(Some(_status))) {
+            let _ = self.runner.kill();
+            let _ = self.runner.wait();
         }
     }
 }
