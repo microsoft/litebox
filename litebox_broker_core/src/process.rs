@@ -889,6 +889,31 @@ mod tests {
     }
 
     #[test]
+    fn process_limit_is_released_after_normal_teardown() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .with_limits(BrokerCoreLimits::DEFAULT.with_process_limit(1))
+        .build()
+        .unwrap();
+        let first = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+
+        assert!(matches!(
+            broker.create_process(CallerCredential::Unauthenticated),
+            Err(BrokerError::ResourceExhausted)
+        ));
+
+        first.finish();
+        assert!(
+            broker
+                .create_process(CallerCredential::Unauthenticated)
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn finish_removes_process_and_releases_owned_ids() {
         let mut broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
