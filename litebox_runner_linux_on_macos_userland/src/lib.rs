@@ -6,6 +6,7 @@
 
 use anyhow::{Result, bail};
 use clap::Parser;
+use litebox_platform_macos_userland::{GuestAbi, set_guest_abi};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -34,6 +35,7 @@ pub struct CliArgs {
 
 /// Returns an error until the macOS runner can connect to a broker.
 pub fn run(cli_args: CliArgs) -> Result<i32> {
+    set_guest_abi(GuestAbi::Linux);
     tracing_subscriber::fmt()
         .with_timer(tracing_subscriber::fmt::time::uptime())
         .with_level(true)

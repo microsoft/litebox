@@ -1,0 +1,20 @@
+[package]
+name = "litebox_shim_macos"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+litebox = { path = "../litebox", version = "0.1.0" }
+litebox_common_macos = { path = "../litebox_common_macos", version = "0.1.0" }
+litebox_util_log = { path = "../litebox_util_log", version = "0.1.0" }
+litebox_syscall_rewriter = { path = "../litebox_syscall_rewriter", version = "0.1.0", default-features = false }
+
+[features]
+# Enable the local stdio adapter used by runner tests.
+test-stdio = []
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dev-dependencies]
+litebox_platform_macos_userland = { path = "../litebox_platform_macos_userland", version = "0.1.0" }
+
+[lints]
+workspace = true

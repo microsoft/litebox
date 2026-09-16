@@ -36,6 +36,38 @@ use litebox_syscall_rewriter::aarch64::{
 };
 use zerocopy::{FromBytes, IntoBytes};
 
+/// Process-wide guest syscall convention. The discriminants are the gate
+/// frame sizes used by the register-save assembly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+pub enum GuestAbi {
+    Linux = SVC_FRAME_BYTES as usize,
+    Darwin = litebox_syscall_rewriter::aarch64::DARWIN_SVC_FRAME_BYTES as usize,
+}
+
+static GUEST_ABI: OnceLock<GuestAbi> = OnceLock::new();
+
+/// Configure the syscall convention for all guests in this host process.
+/// Repeating the same selection is allowed. Configure it before entering
+/// or spawning guest threads; it applies across all platform instances and
+/// page-size variants.
+///
+/// # Panics
+/// Panics if a different ABI has already been configured.
+pub fn set_guest_abi(abi: GuestAbi) {
+    assert_eq!(
+        *GUEST_ABI.get_or_init(|| abi),
+        abi,
+        "guest ABI is already configured"
+    );
+}
+
+fn guest_abi() -> GuestAbi {
+    *GUEST_ABI
+        .get()
+        .expect("guest ABI must be configured before guest execution")
+}
+
 /// Native page size on AArch64 macOS.
 pub const HOST_PAGE_SIZE: usize = 16384;
 
@@ -1183,6 +1215,7 @@ enum GuestExit {
 }
 
 struct ThreadContext<'a> {
+    guest_abi: GuestAbi,
     shim: &'a dyn EnterShim<ExecutionContext = PtRegs>,
     ctx: &'a mut PtRegs,
     host_sp: usize,
@@ -1303,14 +1336,20 @@ impl<const PAGE_SIZE: usize> litebox::platform::ThreadProvider
         ctx: &Self::ExecutionContext,
         init_thread: Box<dyn litebox::shim::InitThread<ExecutionContext = Self::ExecutionContext>>,
     ) -> Result<(), Self::ThreadSpawnError> {
-        let ctx = ctx.clone();
-        let vector_state =
-            litebox::platform::GuestVectorStateProvider::get_guest_vector_state(self);
+        if GUEST_ABI.get().is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "guest ABI must be configured before spawning guest threads",
+            ));
+        }
         let process = if read_tls(tls_offset::CURRENT_THREAD) == 0 {
             Arc::new(ProcessState::default())
         } else {
             ThreadHandle::current().0.process.clone()
         };
+        let ctx = ctx.clone();
+        let vector_state =
+            litebox::platform::GuestVectorStateProvider::get_guest_vector_state(self);
         // TODO: report child TLS setup failures synchronously. pthread_setspecific
         // can still fail after spawn_thread has returned success, causing the child
         // to exit before running its initialization callback.
@@ -1440,7 +1479,8 @@ impl<const PAGE_SIZE: usize> litebox::platform::SystemInfoProvider
     }
 }
 
-// The rewriter leaves the fourth word of its 32-byte SVC frame unused.
+// Linux and Darwin gates share a 32-byte control-frame prefix. The fourth
+// word is unused by the rewriter; Darwin adds 128 bytes to preserve its red zone.
 const MACOS_SVC_FRAME_OFF_SCRATCH: u16 = 24;
 
 const _: () = assert!(
@@ -1523,7 +1563,8 @@ unsafe extern "C" fn syscall_callback() {
         "stp x25, x26, [x17, #200]",
         "stp x27, x28, [x17, #216]",
         "stp x29, x30, [x17, #232]",
-        "add x0, sp, #{svc_frame}",
+        "ldr x0, [x2, #{thread_guest_abi}]",
+        "add x0, sp, x0",
         "str x0, [x17, #{regs_sp}]",
         "ldr x0, [sp, #{frame_retaddr}]",
         "str x0, [x17, #{regs_pc}]",
@@ -1532,8 +1573,8 @@ unsafe extern "C" fn syscall_callback() {
         "ldr x0, [x17, #0]",
         "str x0, [x17, #{regs_orig_x0}]",
         "str w8, [x17, #{regs_syscallno}]",
-        "mov x0, #-38",
-        "str x0, [x17, #0]",
+        // syscall_handler supplies the -ENOSYS entry value for Linux guests;
+        // Darwin syscall dispatch reads the saved x0 argument.
         // Save guest vector state before entering host Rust code.
         "ldr x0, [x16, #{vector_state}]",
         "stp q0, q1, [x0, #0]",
@@ -1621,7 +1662,7 @@ unsafe extern "C" fn syscall_callback() {
         vector_fpsr = const core::mem::offset_of!(GuestVectorState, fpsr),
         vector_fpcr = const core::mem::offset_of!(GuestVectorState, fpcr),
         host_fp_state = const tls_offset::HOST_FP_STATE,
-        svc_frame = const SVC_FRAME_BYTES,
+        thread_guest_abi = const core::mem::offset_of!(ThreadContext, guest_abi),
         frame_x16 = const SVC_FRAME_OFF_X16,
         frame_retaddr = const SVC_FRAME_OFF_RETADDR,
         frame_stub = const SVC_FRAME_OFF_STUB,
@@ -1712,6 +1753,11 @@ unsafe extern "C" fn switch_to_guest_via_outbound_stub(_: &mut ThreadContext) ->
         "msr fpsr, x1",
         "ldr w1, [x0, #{vector_fpcr}]",
         "msr fpcr, x1",
+        // Restore SP to the captured SVC control frame. The outbound stub
+        // restores guest x16 and releases the ABI-specific frame.
+        "ldr x0, [x17, #{active}]",
+        "ldr x0, [x0, #{thread_svc_frame}]",
+        "mov sp, x0",
         "ldr x0, [x16, #{regs_pstate}]",
         "msr nzcv, x0",
         "ldp x0, x1, [x16, #0]",
@@ -1729,8 +1775,6 @@ unsafe extern "C" fn switch_to_guest_via_outbound_stub(_: &mut ThreadContext) ->
         "ldp x25, x26, [x16, #200]",
         "ldp x27, x28, [x16, #216]",
         "ldp x29, x30, [x16, #232]",
-        "ldr x16, [x16, #{regs_sp}]",
-        "sub sp, x16, #{svc_frame}",
         "ldr x16, [sp, #{frame_stub}]",
         "br x16",
         "_switch_to_guest_via_outbound_stub_interrupted:",
@@ -1746,19 +1790,23 @@ unsafe extern "C" fn switch_to_guest_via_outbound_stub(_: &mut ThreadContext) ->
         host_fp_state = const tls_offset::HOST_FP_STATE,
         context = const core::mem::offset_of!(ThreadContext, ctx),
         interrupted = const core::mem::offset_of!(ThreadContext, interrupted),
-        regs_sp = const core::mem::offset_of!(PtRegs, sp),
+        active = const tls_offset::ACTIVE,
+        thread_svc_frame = const core::mem::offset_of!(ThreadContext, svc_frame),
         regs_pstate = const core::mem::offset_of!(PtRegs, pstate),
         vector_fpsr = const core::mem::offset_of!(GuestVectorState, fpsr),
         vector_fpcr = const core::mem::offset_of!(GuestVectorState, fpcr),
-        svc_frame = const SVC_FRAME_BYTES,
         frame_stub = const SVC_FRAME_OFF_STUB,
     );
 }
 
-/// Run a guest thread.
+/// Run a guest thread using the process-wide syscall convention.
+///
+/// # Panics
+/// Panics if [`set_guest_abi`] has not been called.
 ///
 /// # Safety
-/// The shim must supply valid mappings and macOS-targeted rewritten guest code.
+/// The shim must retain valid guest mappings with code rewritten for a macOS
+/// host and finalized gates matching the configured guest ABI.
 pub unsafe fn run_thread<T>(shim: T, ctx: &mut PtRegs)
 where
     T: EnterShim<ExecutionContext = PtRegs>,
@@ -1775,6 +1823,7 @@ fn run_thread_inner_with_process(
     ctx: &mut PtRegs,
     process: Arc<ProcessState>,
 ) {
+    let guest_abi = guest_abi();
     initialize_thread_tls();
     assert!(
         read_tls(tls_offset::ACTIVE) == 0,
@@ -1795,6 +1844,7 @@ fn run_thread_inner_with_process(
         waker: Mutex::new(None),
     }));
     let mut thread_ctx = ThreadContext {
+        guest_abi,
         shim,
         ctx,
         host_sp: 0,
@@ -1926,7 +1976,7 @@ impl ThreadContext<'_> {
 
 unsafe fn switch_to_guest(thread_ctx: &mut ThreadContext) -> ! {
     if thread_ctx.outbound_stub != 0
-        && thread_ctx.ctx.sp == thread_ctx.svc_frame + usize::from(SVC_FRAME_BYTES)
+        && thread_ctx.ctx.sp == thread_ctx.svc_frame + thread_ctx.guest_abi as usize
         && thread_ctx.ctx.pc == thread_ctx.outbound_pc
         && thread_ctx.ctx.regs[16] == thread_ctx.outbound_x16
     {
@@ -1958,6 +2008,9 @@ unsafe fn switch_to_guest(thread_ctx: &mut ThreadContext) -> ! {
 }
 
 extern "C-unwind" fn syscall_handler(thread_ctx: &mut ThreadContext) {
+    if thread_ctx.guest_abi == GuestAbi::Linux {
+        thread_ctx.ctx.regs[0] = (-38isize).cast_unsigned();
+    }
     thread_ctx.call_shim(|shim, ctx| shim.syscall(ctx));
 }
 
@@ -2345,20 +2398,31 @@ unsafe extern "C" fn exception_signal_handler(
     let thread_ctx = unsafe { &mut *ptr };
 
     copy_signal_context(thread_ctx.ctx, mc);
-    match canonicalize(
-        thread_ctx.ctx,
-        GateRuntimeState {
-            guest_thread_pointer_addr: tls_address(tls_offset::GUEST_THREAD_POINTER) as usize,
-            // Signal exits have an authoritative XNU context and do not
-            // originate from the direct outbound-stub resume path.
-            expected_outbound_stub: 0,
-            expected_outbound_pc: 0,
-        },
-        gate_interruption(signal, code, esr),
-        litebox_syscall_rewriter::TargetHost::MacOs,
-        true,
-        read_guest,
-    ) {
+    let runtime = GateRuntimeState {
+        guest_thread_pointer_addr: tls_address(tls_offset::GUEST_THREAD_POINTER) as usize,
+        // Signal exits have an authoritative XNU context and do not
+        // originate from the direct outbound-stub resume path.
+        expected_outbound_stub: 0,
+        expected_outbound_pc: 0,
+    };
+    let interruption = gate_interruption(signal, code, esr);
+    let recovery = match thread_ctx.guest_abi {
+        GuestAbi::Linux => canonicalize(
+            thread_ctx.ctx,
+            runtime,
+            interruption,
+            litebox_syscall_rewriter::TargetHost::MacOs,
+            true,
+            read_guest,
+        ),
+        GuestAbi::Darwin => litebox_common_linux::gate_recovery::canonicalize_darwin(
+            thread_ctx.ctx,
+            runtime,
+            interruption,
+            read_guest,
+        ),
+    };
+    match recovery {
         Aarch64GateSignalResult::NotGate => {}
         Aarch64GateSignalResult::Canonicalized(ctx) => *thread_ctx.ctx = ctx,
         Aarch64GateSignalResult::ResumeGuest(ctx) => {
@@ -2721,6 +2785,7 @@ mod tests {
                 unreachable!()
             }
         }
+        set_guest_abi(GuestAbi::Linux);
         run_thread_inner_with_process(
             &InitOnly(std::cell::RefCell::new(Some(f))),
             &mut PtRegs::default(),
@@ -3003,6 +3068,7 @@ mod tests {
             }
         }
 
+        set_guest_abi(GuestAbi::Linux);
         let platform = MacosUserland::new();
         // SAFETY: init terminates before guest entry.
         unsafe { run_thread(WaitProbe(platform), &mut PtRegs::default()) };
@@ -3086,6 +3152,7 @@ mod tests {
             }
         }
 
+        set_guest_abi(GuestAbi::Linux);
         let platform = MacosUserland::new();
         // SAFETY: init terminates without entering guest code.
         unsafe { run_thread(SignalRace(platform), &mut PtRegs::default()) };
@@ -3160,6 +3227,7 @@ mod tests {
             }
         }
 
+        set_guest_abi(GuestAbi::Linux);
         let platform = MacosUserland::new();
         // SAFETY: queued signals dispatch interrupt, which terminates before guest entry.
         unsafe { run_thread(SignalProbe(platform), &mut PtRegs::default()) };
@@ -3173,9 +3241,9 @@ mod tests {
             ..switch_to_guest_via_sigreturn_end as *const () as usize;
         let outbound = switch_to_guest_via_outbound_stub_start as *const () as usize
             ..switch_to_guest_via_outbound_stub_end as *const () as usize;
-        assert_eq!(syscall_prologue.len(), 73 * size_of::<u32>());
+        assert_eq!(syscall_prologue.len(), 72 * size_of::<u32>());
         assert_eq!(sigreturn.len(), 3 * size_of::<u32>());
-        assert_eq!(outbound.len(), 51 * size_of::<u32>());
+        assert_eq!(outbound.len(), 52 * size_of::<u32>());
     }
 
     #[test]
@@ -3214,6 +3282,7 @@ mod tests {
             }
         }
 
+        set_guest_abi(GuestAbi::Linux);
         MacosUserland::new();
         let result = std::panic::catch_unwind(|| {
             let mut ctx = PtRegs::default();
@@ -3296,6 +3365,7 @@ mod tests {
             }
         }
 
+        set_guest_abi(GuestAbi::Linux);
         let platform = MacosUserland::new();
         let memory = platform
             .allocate_pages(
