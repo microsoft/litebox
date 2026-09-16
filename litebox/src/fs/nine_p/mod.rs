@@ -352,11 +352,6 @@ where
         flags: OFlags,
     ) -> Result<DirHandle, OpenError> {
         assert_supported_oflags(flags);
-        if flags.intersects(OFlags::WRONLY | OFlags::RDWR) {
-            // TODO(jayb): POSIX requires `EISDIR` when write access is requested on a directory,
-            // but `OpenError` has no such variant yet.
-            unimplemented!()
-        }
         let (fid, is_backend_root) = dir.into_typed::<Self>().into_dir();
         if flags.contains(OFlags::PATH) {
             // An `O_PATH` handle is never opened server-side, so the walked fid can be handed over

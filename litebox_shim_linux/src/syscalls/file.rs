@@ -365,10 +365,23 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let files = self.files.borrow();
         let fs = self.fs.borrow();
         let context = fs.context.read();
-        files
+        let file = files
             .fs
             .open(&context, path, flags - OFlags::CLOEXEC, mode)
-            .map_err(Errno::from)
+            .map_err(Errno::from)?;
+        if flags.intersects(OFlags::WRONLY | OFlags::RDWR)
+            && !flags.contains(OFlags::PATH)
+            && files
+                .fs
+                .fd_file_status(&file)
+                .map_err(Errno::from)?
+                .file_type
+                == litebox::fs::FileType::Directory
+        {
+            files.fs.close(&file).unwrap();
+            return Err(Errno::EISDIR);
+        }
+        Ok(file)
     }
 
     fn do_openat(

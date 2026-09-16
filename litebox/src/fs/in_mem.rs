@@ -298,11 +298,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         flags: super::OFlags,
     ) -> Result<super::backend::DirHandle, OpenError> {
         assert_supported_oflags(flags);
-        if flags.intersects(super::OFlags::WRONLY | super::OFlags::RDWR) {
-            // TODO(jayb): POSIX requires `EISDIR` when write access is requested on a directory,
-            // but `OpenError` has no such variant yet.
-            unimplemented!()
-        }
         Ok(super::backend::DirHandle::from_typed::<Self>(
             InMemDirHandle {
                 flags,
