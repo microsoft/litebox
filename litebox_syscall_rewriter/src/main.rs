@@ -10,7 +10,7 @@ use std::io::Write as _;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::PathBuf;
 
-/// Rewrite ELF files to hook syscalls, or PE files to hook syscalls and change GS TEB accesses to FS.
+/// Rewrite ELF or AArch64 Mach-O syscall/TLS accesses, or PE syscalls and GS TEB accesses.
 #[derive(Parser, Debug)]
 #[command(arg_required_else_help = true)]
 struct CliArgs {
@@ -22,31 +22,19 @@ struct CliArgs {
     /// Absolute address to set in the trampoline (default = 0)
     #[arg(long)]
     trampoline_addr: Option<u64>,
-    /// AArch64 ELF only: host anchor ABI; only Linux has an in-tree runtime
-    #[arg(long, value_enum, default_value_t)]
-    target_host: CliTargetHost,
+    /// Host TLS ABI for AArch64 gates (default: ELF=linux, Mach-O=macos, PE=windows)
+    #[arg(long, value_enum)]
+    target_host: Option<CliTargetHost>,
     /// AArch64 ELF only: virtualize guest x18 on Linux (development/testing)
     #[arg(long)]
     virtualize_x18: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+#[derive(Clone, Copy, Debug, ValueEnum)]
 enum CliTargetHost {
-    #[default]
     Linux,
     Macos,
     Windows,
-}
-
-impl CliArgs {
-    fn rewrite_options(&self) -> litebox_syscall_rewriter::RewriteOptions {
-        let host = match self.target_host {
-            CliTargetHost::Linux => litebox_syscall_rewriter::TargetHost::Linux,
-            CliTargetHost::Macos => litebox_syscall_rewriter::TargetHost::MacOs,
-            CliTargetHost::Windows => litebox_syscall_rewriter::TargetHost::Windows,
-        };
-        litebox_syscall_rewriter::RewriteOptions::new(host, self.virtualize_x18)
-    }
 }
 
 fn copy_file_permissions(
@@ -73,10 +61,18 @@ fn main() -> anyhow::Result<()> {
     let mut input_binary = std::fs::File::open(&cli_args.input_binary)?;
     let mut input_binary_bytes = vec![];
     input_binary.read_to_end(&mut input_binary_bytes)?;
+    let host = match cli_args.target_host {
+        Some(CliTargetHost::Linux) => litebox_syscall_rewriter::TargetHost::Linux,
+        Some(CliTargetHost::Macos) => litebox_syscall_rewriter::TargetHost::MacOs,
+        Some(CliTargetHost::Windows) => litebox_syscall_rewriter::TargetHost::Windows,
+        None => {
+            litebox_syscall_rewriter::RewriteOptions::for_binary(&input_binary_bytes).target_host()
+        }
+    };
     let output_binary = litebox_syscall_rewriter::rewrite_binary_with_options(
         &input_binary_bytes,
         cli_args.trampoline_addr,
-        cli_args.rewrite_options(),
+        litebox_syscall_rewriter::RewriteOptions::new(host, cli_args.virtualize_x18),
     )?;
     let output_path = cli_args.output_binary.unwrap_or_else(|| {
         cli_args.input_binary.with_file_name(

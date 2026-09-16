@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! AArch64 (ARM64) syscall rewriting support for Linux ELF binaries.
+//! AArch64 syscall and thread-pointer gates.
 //!
 //! Instructions are a fixed 4 bytes and `B imm26` reaches ±128MB, so a site is
 //! replaced in place by a branch into its trampoline gate. A site out of that
@@ -17,6 +17,8 @@
 //! * `MSR TPIDR_EL0, Xn` — thread-pointer write, stored to the guest slot.
 //! * `MRS Xd, TPIDR_EL0` — thread-pointer read, loaded from it. `MRS XZR,
 //!   TPIDR_EL0` is a discarded read and is left native.
+//! * Darwin `SVC #0x80` — syscall, preserving the 128-byte red zone.
+//! * `MRS Xd, TPIDRRO_EL0` — Darwin thread-pointer read.
 //!
 //! ### Assumption: executable sections contain only instructions
 //!
@@ -27,18 +29,17 @@
 //!
 //! ## Thread-pointer virtualization
 //!
-//! Guest TLS is host-managed. Direct-TLS gates access fields relative to the
-//! host anchor. Indirect-TLS gates load a block pointer from the anchor-relative
-//! runtime slot before accessing its fields. Two registers are involved:
+//! TLS gates access runtime-owned guest state through the selected host anchor.
+//! Direct-TLS gates access anchor-relative fields; indirect-TLS gates load a
+//! block pointer from an anchor-relative runtime slot first.
 //!
-//! * The one the *guest* uses: `TPIDR_EL0`, per the Linux ABI. This is an ELF
-//!   rewriter, so it is the only one gated; a PE guest's `x18` TEB pointer and
-//!   a Mach-O guest's `TPIDRRO_EL0` would need different gates.
-//! * The one anchoring the host's TLS access sequence, selected by `Host` —
-//!   also `TPIDR_EL0` on a Linux host.
+//! Guest thread-pointer reads use `TPIDR_EL0` for ELF or `TPIDRRO_EL0` for
+//! Mach-O. `TPIDRRO_EL0` is read-only at EL0, so there is no userspace write
+//! to virtualize.
 //!
-//! Before execution, finalize placeholders with [`finalize_trampoline_gates`]
-//! (Linux without x18) or [`finalize_trampoline_gates_for_host`] (TLS/x18).
+//! ELF callers must finalize placeholders with [`finalize_trampoline_gates`]
+//! (Linux without x18) or [`finalize_trampoline_gates_for_host`] before execution.
+//! [`crate::macho::Rewriter::patch_code_segment`] returns finalized gates.
 //! Unpatched gates can corrupt host memory without faulting.
 //!
 //! ## Gate scratch storage
@@ -277,7 +278,7 @@ fn executable_segments(
     clippy::cast_possible_truncation,
     reason = "the crate requires 64-bit pointers"
 )]
-fn project_file_ranges(
+pub(crate) fn project_file_ranges(
     ranges: &[TextSectionInfo],
     mapping_file_offset: u64,
     mapping_len: usize,
@@ -430,6 +431,9 @@ fn ranges_to_sections(
 /// `SVC #0` (supervisor call) — the canonical syscall instruction.
 const SVC_0: u32 = 0xD400_0001;
 
+/// `SVC #0x80`, used by Darwin syscall stubs.
+const DARWIN_SVC: u32 = 0xD400_1001;
+
 /// Mask/match for *any* `SVC #imm16`. Linux dispatches every `SVC64` exception
 /// to the syscall handler regardless of the immediate (the syscall number comes
 /// from `x8`), so all immediates are rewritten, not just `svc #0`. The `imm16`
@@ -552,7 +556,7 @@ const GATE_METADATA_USED_MASK: u32 = GATE_METADATA_MAGIC_MASK
 pub enum GateMetadata {
     /// A trapped `SVC`: the shim performs the syscall.
     Svc,
-    /// A trapped `MRS <Xd>, TPIDR_EL0`, reading the guest thread pointer.
+    /// Read the logical guest thread pointer into the destination register.
     MrsTpidr {
         /// Register the guest thread pointer is read into.
         destination: u8,
@@ -1865,6 +1869,9 @@ pub const fn x18_branch_recovery_plan(offset: usize) -> Option<X18RecoveryPlan> 
 /// ABI: `switch_to_guest` sets `SP` to `PtRegs::sp - SVC_FRAME_BYTES` before
 /// entering an outbound stub, because the stub pops this frame.
 pub const SVC_FRAME_BYTES: u16 = 32;
+/// Darwin SVC stack decrement, including the 128-byte red zone.
+/// Frame fields use the `SVC_FRAME_OFF_*` offsets.
+pub const DARWIN_SVC_FRAME_BYTES: u16 = SVC_FRAME_BYTES + 128;
 /// Saved guest X16. ABI: the outbound stub reloads `X16` from here.
 pub const SVC_FRAME_OFF_X16: u16 = 0;
 /// Post-SVC return address. ABI: the runtime's syscall callback reads it and
@@ -2261,7 +2268,7 @@ const INSN_BYTES_LOG2: u32 = 2;
 const INSN_BYTES: usize = 1 << INSN_BYTES_LOG2;
 
 /// [`INSN_BYTES`] where a virtual address is being measured.
-const INSN_BYTES_U64: u64 = 1 << INSN_BYTES_LOG2;
+pub(crate) const INSN_BYTES_U64: u64 = 1 << INSN_BYTES_LOG2;
 
 /// The metadata word closing every compact gate slot.
 const GATE_METADATA_BYTES: usize = 4;
@@ -2316,11 +2323,7 @@ const ADD_IMM_SHAPE_MASK: u32 = 0xFFC0_03FF;
 /// `LDR (literal)` opcode bits plus `Rt`, ignoring the immediate.
 const LDR_LITERAL_SHAPE_MASK: u32 = 0xFF00_001F;
 
-/// Base opcode of an emitted instruction: every fixed bit set with all operand
-/// fields zeroed. An encoder selects a variant and ORs in its operands via
-/// [`Opcode::bits`]. (`MRS TPIDR_EL0` is encoded from [`Opcode::MrsTpidrEl0`],
-/// whose bits equal [`MRS_TPIDR_EL0_BITS`] — the scan-detection pattern in
-/// [`find_patch_sites_with_code_ranges`].)
+/// Fixed instruction bits with operand fields zeroed, for encoding and matching.
 #[repr(u32)]
 #[derive(Clone, Copy)]
 enum Opcode {
@@ -2343,6 +2346,7 @@ enum Opcode {
     LdpPost = 0xA8C0_0000,
     MrsTpidrEl0 = MRS_TPIDR_EL0_BITS,
     MrsTpidrroEl0 = 0xD53B_D060,
+    MsrTpidrroEl0 = 0xD51B_D060,
     MovReg = 0xAA00_03E0,
     CbnzW = 0x3500_0000,
     CbzW = 0x3400_0000,
@@ -2728,6 +2732,29 @@ pub(crate) enum Host {
     Windows,
 }
 
+/// Runner-selected TLS and SVC stack-frame layout.
+#[derive(Clone, Copy)]
+pub(crate) struct GateLayout {
+    host: Host,
+    svc_frame_bytes: u16,
+}
+
+impl GateLayout {
+    const fn linux(host: Host) -> Self {
+        Self {
+            host,
+            svc_frame_bytes: SVC_FRAME_BYTES,
+        }
+    }
+
+    pub(crate) const fn darwin(host: Host) -> Self {
+        Self {
+            host,
+            svc_frame_bytes: DARWIN_SVC_FRAME_BYTES,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct RewriteConfig {
     host: Host,
@@ -2816,7 +2843,7 @@ impl Host {
 
 /// A located instruction to rewrite.
 struct PatchSite {
-    /// Byte offset of the instruction within the ELF file image.
+    /// Byte offset of the instruction within the code buffer.
     file_offset: usize,
     /// Virtual address of the instruction.
     vaddr: u64,
@@ -2832,7 +2859,7 @@ enum PatchKind {
     Svc,
     /// `MSR TPIDR_EL0, Xt`; the `u8` is the source register (0-31).
     MsrTpidr(u8),
-    /// `MRS Xd, TPIDR_EL0`; the `u8` is the destination register (0-30).
+    /// Guest thread-pointer read; the `u8` is the destination register (0-30).
     MrsTpidr(u8),
     /// An x18 use detected under explicit virtualization.
     X18(X18TransformResult),
@@ -3043,7 +3070,7 @@ fn find_patch_sites_with_code_ranges(
 
 /// Outcome of rewriting one AArch64 image's patch sites.
 pub(crate) struct HookOutcome {
-    /// Trampoline blob the caller appends after the ELF (page-aligned).
+    /// Emitted gates, including the callback header.
     pub trampoline: Vec<u8>,
     /// Virtual addresses of patch sites replaced with a trap instead of a
     /// redirect, because the inbound `B` or one of the gate's own branches fell
@@ -3102,9 +3129,130 @@ pub(crate) fn hook_syscalls_aarch64_with_code_ranges(
     }
     let sites = find_patch_sites_with_code_ranges(executable_sections, code_sections, buf, config)?;
 
+    hook_sites(
+        buf,
+        &sites,
+        trampoline_base_addr,
+        callback,
+        config,
+        GateLayout::linux(config.host),
+    )
+}
+
+/// Rewrite Darwin SVC and TPIDRRO_EL0 accesses into trampoline gates.
+pub(crate) fn hook_macho(
+    buf: &mut [u8],
+    sections: &[TextSectionInfo],
+    trampoline_base_addr: u64,
+    callback: u64,
+    options: crate::RewriteOptions,
+) -> Result<Option<HookOutcome>> {
+    if options.target_host() != crate::TargetHost::MacOs {
+        return Err(Error::UnsupportedExecutable(
+            "Mach-O rewriting requires a macOS host".into(),
+        ));
+    }
+    let config = RewriteConfig::new(options.target_host(), false);
+    let sites = find_macho_patch_sites(sections, buf)?;
+    hook_sites(
+        buf,
+        &sites,
+        trampoline_base_addr,
+        callback,
+        config,
+        GateLayout::darwin(config.host),
+    )
+}
+
+fn find_macho_patch_sites(sections: &[TextSectionInfo], buf: &[u8]) -> Result<Vec<PatchSite>> {
+    let mut sites = Vec::new();
+    for section in sections {
+        let data = crate::section_slice(buf, section)?;
+        let start = usize::try_from(section.file_offset)
+            .map_err(|_| Error::ParseError("Mach-O section offset".into()))?;
+        if !section.file_offset.is_multiple_of(INSN_BYTES_U64)
+            || !section.vaddr.is_multiple_of(INSN_BYTES_U64)
+            || !data.len().is_multiple_of(INSN_BYTES)
+        {
+            return Err(Error::ParseError(
+                "unaligned Mach-O instruction range".into(),
+            ));
+        }
+        for (index, bytes) in data.as_chunks::<INSN_BYTES>().0.iter().enumerate() {
+            let word = u32::from_le_bytes(*bytes);
+            let vaddr = checked_add_u64(section.vaddr, (index * INSN_BYTES) as u64, "Mach-O site")?;
+            let opcode = word & !REG_MASK;
+            let kind = if word & SVC_OPCODE_MASK == SVC_OPCODE_BITS {
+                if word != DARWIN_SVC {
+                    return Err(Error::UnsupportedExecutable(format!(
+                        "unsupported Darwin SVC immediate (expected #0x80) at {vaddr:#x}"
+                    )));
+                }
+                PatchKind::Svc
+            } else if opcode == Opcode::MrsTpidrroEl0.bits() {
+                let destination = (word & REG_MASK) as u8;
+                if destination == XZR {
+                    continue;
+                }
+                PatchKind::MrsTpidr(destination)
+            } else if opcode == Opcode::MsrTpidrroEl0.bits() {
+                return Err(Error::UnsupportedExecutable(format!(
+                    "unsupported Darwin TPIDRRO_EL0 write at {vaddr:#x}"
+                )));
+            } else {
+                continue;
+            };
+            sites.push(PatchSite {
+                file_offset: start + index * INSN_BYTES,
+                vaddr,
+                kind,
+            });
+        }
+    }
+    sites.sort_unstable_by_key(|site| site.file_offset);
+    Ok(sites)
+}
+
+pub(crate) fn trap_macho_patch_sites(
+    buf: &mut [u8],
+    sections: &[TextSectionInfo],
+) -> Result<usize> {
+    let sites = find_macho_patch_sites(sections, buf)?;
+    for site in &sites {
+        trap_site(buf, site.file_offset);
+    }
+    Ok(sites.len())
+}
+
+pub(crate) fn macho_trampoline_size_upper_bound(
+    buf: &[u8],
+    sections: &[TextSectionInfo],
+    host: crate::TargetHost,
+) -> Result<usize> {
+    let sites = find_macho_patch_sites(sections, buf)?;
+    sites.iter().try_fold(0usize, |total, site| {
+        // Allow a separate callback header for each mapping batch.
+        total
+            .checked_add(GATES_START_OFFSET)
+            .and_then(|size| size.checked_add(site.kind.metadata()?.slot_size_for_host(host)))
+            .ok_or_else(|| Error::AddressOverflow("Mach-O trampoline size".into()))
+    })
+}
+
+fn hook_sites(
+    buf: &mut [u8],
+    sites: &[PatchSite],
+    trampoline_base_addr: u64,
+    callback: u64,
+    config: RewriteConfig,
+    layout: GateLayout,
+) -> Result<Option<HookOutcome>> {
+    if !trampoline_base_addr.is_multiple_of(GATE_ALIGNMENT as u64) {
+        return Err(Error::AddressOverflow(
+            "unaligned AArch64 trampoline address".into(),
+        ));
+    }
     if sites.is_empty() {
-        // No patch sites: nothing to redirect, so no trampoline is
-        // emitted. The caller writes a size-0 sentinel header instead.
         return Ok(None);
     }
 
@@ -3113,7 +3261,7 @@ pub(crate) fn hook_syscalls_aarch64_with_code_ranges(
 
     let mut trapped_sites: Vec<u64> = Vec::new();
 
-    for site in &sites {
+    for site in sites {
         let gate_offset = trampoline_data.len();
         let gate_vaddr =
             checked_add_u64(trampoline_base_addr, gate_offset as u64, "trampoline gate")?;
@@ -3136,7 +3284,7 @@ pub(crate) fn hook_syscalls_aarch64_with_code_ranges(
                     gate_offset,
                     trampoline_base_addr,
                     site,
-                    config.host,
+                    layout,
                 )?,
                 PatchKind::MsrTpidr(rt) => emit_msr_gate(
                     &mut trampoline_data,
@@ -3301,13 +3449,14 @@ fn emit_svc_gate(
     gate_offset: usize,
     trampoline_base_addr: u64,
     site: &PatchSite,
-    host: Host,
+    layout: GateLayout,
 ) -> Result<GateBuild> {
     let gate_vaddr = checked_add_u64(trampoline_base_addr, gate_offset as u64, "SVC gate")?;
     let mut asm = Asm::new(gate_vaddr);
 
-    // SUB SP, SP, #32 ; STR X16, [SP] — save the guest X16.
-    asm.emit(Insn::SubSp(SVC_FRAME_BYTES));
+    let frame_bytes = layout.svc_frame_bytes;
+    // Darwin spills below the red zone; neither SUB nor ADD changes NZCV.
+    asm.emit(Insn::SubSp(frame_bytes));
     asm.emit(Insn::StrUimm {
         rt: X16,
         rn: SP,
@@ -3365,13 +3514,13 @@ fn emit_svc_gate(
         "the outbound stub must start immediately after the gate"
     );
 
-    // The outbound stub: LDR X16, [SP] ; ADD SP, SP, #32 ; B <site+4>.
+    // Restore guest X16 and SP, then return to site+4.
     asm.emit(Insn::LdrUimm {
         rt: X16,
         rn: SP,
         imm_bytes: SVC_FRAME_OFF_X16,
     });
-    asm.emit(Insn::AddSp(SVC_FRAME_BYTES));
+    asm.emit(Insn::AddSp(frame_bytes));
     if !asm.branch_to(return_addr)? {
         return Ok(GateBuild::Unreachable);
     }
@@ -3388,7 +3537,7 @@ fn emit_svc_gate(
         trampoline_base_addr,
         gate_vaddr,
         GateMetadata::Svc,
-        host,
+        layout,
     )?;
     Ok(GateBuild::Emitted)
 }
@@ -3453,7 +3602,7 @@ fn emit_msr_gate(
 
     // Two branches to the same return address. Only the first executes; the
     // pair pins the slot's absolute position, so the original PC need not be
-    // stored in metadata. `validate_gate_slot` requires both to decode to one
+    // stored in metadata. Gate validation requires both to decode to one
     // target, so a gate that can encode only the first is unclassifiable and
     // must not be emitted -- which costs the second branch's 4 bytes of reach.
     let return_addr = checked_add_u64(site.vaddr, INSN_BYTES_U64, "MSR return")?;
@@ -3467,7 +3616,7 @@ fn emit_msr_gate(
         trampoline_base_addr,
         gate_vaddr,
         GateMetadata::MsrTpidr { source: rt },
-        host,
+        GateLayout::linux(host),
     )?;
     Ok(GateBuild::Emitted)
 }
@@ -3502,7 +3651,7 @@ fn emit_mrs_gate(
         trampoline_base_addr,
         gate_vaddr,
         GateMetadata::MrsTpidr { destination: rd },
-        host,
+        GateLayout::linux(host),
     )?;
     Ok(GateBuild::Emitted)
 }
@@ -3596,7 +3745,7 @@ fn emit_x18_gate(
         trampoline_base_addr,
         gate_vaddr,
         GateMetadata::X18 { scratch },
-        host,
+        GateLayout::linux(host),
     )?;
     Ok(GateBuild::Emitted)
 }
@@ -3668,7 +3817,7 @@ fn emit_x18_stack_writeback_gate(
         GateMetadata::X18StackWriteback {
             scratch: pair.scratch,
         },
-        host,
+        GateLayout::linux(host),
     )?;
     Ok(GateBuild::Emitted)
 }
@@ -3753,7 +3902,7 @@ fn emit_x18_compare_branch_gate(
         GateMetadata::X18CompareBranch {
             scratch: branch.scratch,
         },
-        host,
+        GateLayout::linux(host),
     )?;
     Ok(GateBuild::Emitted)
 }
@@ -3806,7 +3955,7 @@ fn emit_x18_adr_gate(
         GateMetadata::X18Adr {
             scratch: adr.scratch,
         },
-        host,
+        GateLayout::linux(host),
     )?;
     Ok(GateBuild::Emitted)
 }
@@ -3835,7 +3984,7 @@ fn emit_x18_branch_gate(
         trampoline_base_addr,
         gate_vaddr,
         GateMetadata::X18Branch { kind: branch },
-        host,
+        GateLayout::linux(host),
     )?;
     Ok(GateBuild::Emitted)
 }
@@ -3846,9 +3995,9 @@ fn append_gate_slot(
     trampoline_base: u64,
     slot_vaddr: u64,
     metadata: GateMetadata,
-    host: Host,
+    layout: GateLayout,
 ) -> Result<()> {
-    let slot_size = metadata.slot_size_for(host);
+    let slot_size = metadata.slot_size_for(layout.host);
     let metadata_offset = slot_size - GATE_METADATA_BYTES;
     if code.len() > metadata_offset {
         return Err(Error::AddressOverflow(format!(
@@ -3869,14 +4018,14 @@ fn append_gate_slot(
     let decoded = EncodedGateMetadata(u32::from_le_bytes(metadata_bytes))
         .decode()
         .ok_or_else(|| Error::AddressOverflow("emitter produced invalid metadata".into()))?;
-    if !validate_gate_slot_inner_for_host(
+    if !validate_gate_slot_inner_with_layout(
         &code,
         SlotAddressing::Placed {
             trampoline_base,
             slot_vaddr,
         },
         decoded,
-        host,
+        layout,
     ) {
         return Err(Error::TrampolinePatchFailure(
             "emitter produced an invalid AArch64 gate".into(),
@@ -3884,28 +4033,6 @@ fn append_gate_slot(
     }
     trampoline_data.extend_from_slice(&code);
     Ok(())
-}
-
-/// Validate the complete instruction template and metadata word of one slot.
-/// This is structural recognition, not authentication: the gate-signal
-/// canonicalization path must additionally fault-safely validate that the
-/// recovered original site branches into this slot before canonicalizing an
-/// interrupted context.
-#[cfg(test)]
-pub(crate) fn validate_gate_slot(
-    slot: &[u8],
-    trampoline_base: u64,
-    slot_vaddr: u64,
-    metadata: GateMetadata,
-) -> bool {
-    validate_gate_slot_inner(
-        slot,
-        SlotAddressing::Placed {
-            trampoline_base,
-            slot_vaddr,
-        },
-        metadata,
-    )
 }
 
 /// Where a slot being validated lives, which decides how exactly its branch and
@@ -3929,21 +4056,15 @@ enum SlotAddressing {
     },
 }
 
-#[cfg(test)]
-fn validate_gate_slot_inner(
+/// Validate gate instructions and metadata. Recovery must also fault-safely
+/// verify that the original site branches into this slot.
+fn validate_gate_slot_inner_with_layout(
     slot: &[u8],
     addressing: SlotAddressing,
     metadata: GateMetadata,
+    layout: GateLayout,
 ) -> bool {
-    validate_gate_slot_inner_for_host(slot, addressing, metadata, Host::Linux)
-}
-
-fn validate_gate_slot_inner_for_host(
-    slot: &[u8],
-    addressing: SlotAddressing,
-    metadata: GateMetadata,
-    host: Host,
-) -> bool {
+    let host = layout.host;
     let slot_size = metadata.slot_size_for(host);
     // Both variants' positions are 16-byte aligned by construction, because the
     // blob is laid out and mapped at gate alignment.
@@ -3980,9 +4101,10 @@ fn validate_gate_slot_inner_for_host(
 
     match metadata {
         GateMetadata::Svc => {
+            let frame_bytes = layout.svc_frame_bytes;
             let adrp = word_at(8);
             let add = word_at(12);
-            exact(0, Insn::SubSp(SVC_FRAME_BYTES))
+            exact(SvcGateOffset::Entry.as_usize(), Insn::SubSp(frame_bytes))
                 && exact(
                     4,
                     Insn::StrUimm {
@@ -4038,7 +4160,10 @@ fn validate_gate_slot_inner_for_host(
                         imm_bytes: SVC_FRAME_OFF_X16,
                     },
                 )
-                && exact(40, Insn::AddSp(SVC_FRAME_BYTES))
+                && exact(
+                    SvcGateOffset::OutboundRestoreSp.as_usize(),
+                    Insn::AddSp(frame_bytes),
+                )
                 && match addressing {
                     SlotAddressing::Unplaced { .. } => {
                         adrp & ADRP_SHAPE_MASK == Opcode::Adrp.bits() | u32::from(X16)
@@ -4664,13 +4789,22 @@ pub fn classify_gate_pc(
     classify_gate_pc_with_candidates(trampoline, trampoline_base, pc, candidates)
 }
 
-/// Classify a copied compact slot, validating the selected host's TLS access sequence.
+/// Classify an ELF guest's copied gate slot using the selected host's TLS layout.
 /// The caller must require exactly one matching candidate.
 pub fn classify_copied_gate_slot_for_host(
     slot: &[u8],
     slot_vaddr: u64,
     pc: u64,
     host: crate::TargetHost,
+) -> Option<ClassifiedGate> {
+    classify_copied_gate_slot_with_layout(slot, slot_vaddr, pc, GateLayout::linux(host.into()))
+}
+
+pub(crate) fn classify_copied_gate_slot_with_layout(
+    slot: &[u8],
+    slot_vaddr: u64,
+    pc: u64,
+    layout: GateLayout,
 ) -> Option<ClassifiedGate> {
     let offset = usize::try_from(pc.checked_sub(slot_vaddr)?).ok()?;
     if !pc.is_multiple_of(INSN_BYTES_U64) || !slot_vaddr.is_multiple_of(GATE_ALIGNMENT as u64) {
@@ -4679,8 +4813,8 @@ pub fn classify_copied_gate_slot_for_host(
     let metadata_word =
         u32::from_le_bytes(slot.get(slot.len().checked_sub(4)?..)?.try_into().ok()?);
     let metadata = EncodedGateMetadata(metadata_word).decode()?;
-    let selected_host: Host = host.into();
-    if metadata.slot_size_for_host(host) != slot.len()
+    let selected_host = layout.host;
+    if metadata.slot_size_for(selected_host) != slot.len()
         || offset >= metadata.executable_end_for_host(selected_host)
     {
         return None;
@@ -4706,17 +4840,17 @@ pub fn classify_copied_gate_slot_for_host(
         | GateMetadata::X18Branch { .. } => 0,
     };
     // For `Svc` the base was just recovered from the slot's own literal load,
-    // so `validate_gate_slot`'s callback check is a tautology here. The other
+    // so the callback-target check is a tautology here. The other
     // template checks still do real work; this is structural recognition, not
     // authentication.
-    if !validate_gate_slot_inner_for_host(
+    if !validate_gate_slot_inner_with_layout(
         slot,
         SlotAddressing::Placed {
             trampoline_base,
             slot_vaddr,
         },
         metadata,
-        host.into(),
+        layout,
     ) {
         return None;
     }
@@ -4799,14 +4933,14 @@ fn classify_gate_pc_with_candidates<const N: usize>(
             // decoded metadata's layout accessors apply to these bytes.
             if metadata.slot_size() != slot_size
                 || relative >= start + metadata.executable_end()
-                || !validate_gate_slot_inner_for_host(
+                || !validate_gate_slot_inner_with_layout(
                     slot,
                     SlotAddressing::Placed {
                         trampoline_base,
                         slot_vaddr,
                     },
                     metadata,
-                    Host::Linux,
+                    GateLayout::linux(Host::Linux),
                 )
             {
                 continue;
@@ -5030,7 +5164,7 @@ pub fn finalize_trampoline_gates(trampoline: &mut [u8], offset: u16) -> Result<(
     Ok(())
 }
 
-/// Validate and finalize guest TLS offsets for `host`.
+/// Validate and finalize an ELF guest's TLS gates for `host`.
 ///
 /// Direct-TLS gates patch the guest TP and x18 field offsets independently.
 /// Indirect-TLS gates patch both accesses with the root offset and use fixed
@@ -5064,6 +5198,27 @@ pub fn finalize_trampoline_gates_for_host(
     // Both sets are validated before mutation, so an error cannot leave a partial patch.
     patch_offset_words(trampoline, &tp.patch_offsets, guest_tpidr_offset);
     patch_offset_words(trampoline, &x18.patch_offsets, x18_patch_value);
+    Ok(())
+}
+
+pub(crate) fn finalize_macho_trampoline(
+    trampoline: &mut [u8],
+    offset: u16,
+    host: crate::TargetHost,
+) -> Result<()> {
+    validate_guest_offset(offset, false)?;
+    let validation = validate_trampoline_offsets_with_layout(
+        trampoline,
+        offset,
+        false,
+        GateLayout::darwin(host.into()),
+    )?;
+    if validation.has_x18_gate {
+        return Err(Error::TrampolinePatchFailure(
+            "unexpected x18 gate in Mach-O trampoline".into(),
+        ));
+    }
+    patch_offset_words(trampoline, &validation.patch_offsets, offset);
     Ok(())
 }
 
@@ -5155,6 +5310,21 @@ fn validate_trampoline_offsets_for_host(
     x18: bool,
     host: Host,
 ) -> Result<TrampolineValidation> {
+    validate_trampoline_offsets_with_layout(
+        trampoline,
+        expected_offset,
+        x18,
+        GateLayout::linux(host),
+    )
+}
+
+fn validate_trampoline_offsets_with_layout(
+    trampoline: &[u8],
+    expected_offset: u16,
+    x18: bool,
+    layout: GateLayout,
+) -> Result<TrampolineValidation> {
+    let host = layout.host;
     if trampoline.len() < GATES_START_OFFSET || !trampoline.len().is_multiple_of(INSN_BYTES) {
         return Err(Error::TrampolinePatchFailure(
             "malformed AArch64 trampoline length".into(),
@@ -5192,13 +5362,13 @@ fn validate_trampoline_offsets_for_host(
                 continue;
             };
             if metadata.slot_size_for(host) != slot_size
-                || !validate_gate_slot_inner_for_host(
+                || !validate_gate_slot_inner_with_layout(
                     &trampoline[cursor..end],
                     SlotAddressing::Unplaced {
                         slot_offset: cursor as u64,
                     },
                     metadata,
-                    host,
+                    layout,
                 )
             {
                 continue;
@@ -6104,11 +6274,14 @@ mod tests {
                 scratch: pair.scratch
             }
         );
-        assert!(validate_gate_slot(
+        assert!(validate_gate_slot_inner_with_layout(
             gate,
-            0x400000,
-            0x400000 + GATES_START_OFFSET as u64,
+            SlotAddressing::Placed {
+                trampoline_base: 0x400000,
+                slot_vaddr: 0x400000 + GATES_START_OFFSET as u64,
+            },
             metadata,
+            GateLayout::linux(Host::Linux),
         ));
         assert_eq!(word_at(gate, 0), Insn::SubSp(32).encode().unwrap());
         assert_eq!(word_at(gate, 44), Insn::AddSp(16).encode().unwrap());
@@ -6671,15 +6844,21 @@ mod tests {
 
     #[test]
     fn svc_with_nonzero_immediate_is_also_rewritten() {
-        // Linux dispatches every `SVC64` exception to the syscall handler
-        // regardless of the immediate (the syscall number comes from x8), so
-        // `svc #imm` with imm != 0 must be rewritten too. imm16 occupies bits
-        // [20:5], so `svc #1` is `SVC_0 | (1 << 5)`.
-        let svc_imm1 = SVC_0 | (1 << 5);
-        let (patched, tramp) = hook_words(&[svc_imm1], 0x1000, 0x200000);
-        // The SVC word became a `B` into the gate.
-        assert_eq!(word_at(&patched, 0) & OPCODE_TOP6_MASK, Opcode::B.bits());
-        assert_eq!(tramp.len(), GATES_START_OFFSET + SVC_GATE_SIZE);
+        // Linux ignores the immediate; #0x80 does not select the Darwin frame.
+        for immediate in [1, 0x80] {
+            let word = SVC_0 | (immediate << 5);
+            let (patched, tramp) = hook_words(&[word], 0x1000, 0x200000);
+            assert_eq!(word_at(&patched, 0) & OPCODE_TOP6_MASK, Opcode::B.bits());
+            assert_eq!(tramp.len(), GATES_START_OFFSET + SVC_GATE_SIZE);
+            assert_eq!(
+                word_at(&tramp, GATES_START_OFFSET),
+                Insn::SubSp(SVC_FRAME_BYTES).encode().unwrap()
+            );
+            assert_eq!(
+                decode_gate_metadata_word(word_at(&tramp, tramp.len() - 4)),
+                Some(GateMetadata::Svc)
+            );
+        }
     }
 
     #[test]

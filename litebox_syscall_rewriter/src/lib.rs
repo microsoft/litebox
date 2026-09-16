@@ -19,6 +19,9 @@
 //! on Linux and macOS. Guest x18 virtualization is optional on Linux and always
 //! enabled on macOS. Windows target selection still provides only x18 host-anchor
 //! emission scaffolding, without an in-tree AArch64 runtime.
+//!
+//! AArch64 Mach-O syscall and thread-pointer rewriting is supported; see
+//! [`mod@macho`] for loader requirements.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
@@ -31,6 +34,8 @@ compile_error!(
 );
 
 pub mod aarch64;
+pub mod macho;
+pub use macho::{hook_syscalls_in_macho, hook_syscalls_in_macho_with_options};
 
 /// Callback-slot bytes the caller must populate; zero when emitted inline.
 #[cfg(target_arch = "x86_64")]
@@ -151,6 +156,21 @@ pub struct RewriteOptions {
 }
 
 impl RewriteOptions {
+    /// Default options by format: macOS for Mach-O, Windows for PE, Linux otherwise.
+    pub fn for_binary(input_binary: &[u8]) -> Self {
+        let host = match object::FileKind::parse(input_binary) {
+            Ok(
+                object::FileKind::MachO32
+                | object::FileKind::MachO64
+                | object::FileKind::MachOFat32
+                | object::FileKind::MachOFat64,
+            ) => TargetHost::MacOs,
+            Ok(object::FileKind::Pe32 | object::FileKind::Pe64) => TargetHost::Windows,
+            _ => TargetHost::Linux,
+        };
+        Self::new(host, false)
+    }
+
     /// Selects the AArch64 host and whether Linux guest `x18` accesses are
     /// virtualized. Non-Linux targets always virtualize `x18`.
     pub const fn new(target_host: TargetHost, virtualize_x18: bool) -> Self {
@@ -175,14 +195,19 @@ impl RewriteOptions {
 ///
 /// ELF64 inputs are passed through [`hook_syscalls_in_elf`]. PE64 inputs have
 /// executable-section GS segment overrides rewritten to FS and `syscall`
-/// instructions redirected through a LiteBox trampoline footer.
+/// instructions redirected through a LiteBox trampoline footer. AArch64 Mach-O
+/// inputs are passed through [`hook_syscalls_in_macho_with_options`].
 pub fn rewrite_binary(input_binary: &[u8], trampoline: Option<u64>) -> Result<Vec<u8>> {
-    rewrite_binary_with_options(input_binary, trampoline, RewriteOptions::default())
+    rewrite_binary_with_options(
+        input_binary,
+        trampoline,
+        RewriteOptions::for_binary(input_binary),
+    )
 }
 
 /// Rewrite a supported binary with explicit architecture-specific options.
 ///
-/// The options affect AArch64 ELF rewriting and are ignored for PE input.
+/// The options affect AArch64 ELF and Mach-O rewriting and are ignored for PE input.
 pub fn rewrite_binary_with_options(
     input_binary: &[u8],
     trampoline: Option<u64>,
@@ -190,6 +215,23 @@ pub fn rewrite_binary_with_options(
 ) -> Result<Vec<u8>> {
     if is_pe_binary(input_binary) {
         rewrite_pe_for_litebox(input_binary, trampoline)
+    } else if matches!(
+        input_binary
+            .first_chunk::<4>()
+            .copied()
+            .map(u32::from_le_bytes),
+        Some(
+            object::macho::MH_MAGIC
+                | object::macho::MH_CIGAM
+                | object::macho::MH_MAGIC_64
+                | object::macho::MH_CIGAM_64
+                | object::macho::FAT_MAGIC
+                | object::macho::FAT_CIGAM
+                | object::macho::FAT_MAGIC_64
+                | object::macho::FAT_CIGAM_64
+        )
+    ) {
+        hook_syscalls_in_macho_with_options(input_binary, trampoline, options)
     } else {
         hook_syscalls_in_elf_with_options(input_binary, trampoline, options)
     }
@@ -439,6 +481,11 @@ pub fn rewrite_pe_for_litebox(input_binary: &[u8], trampoline: Option<u64>) -> R
 
     let (text_sections, sysno_map, trampoline_base_rva, trampoline_base_addr) = {
         let pe = PeFile64::parse(&*buf).map_err(|e| Error::ParseError(e.to_string()))?;
+        if pe.architecture() != object::Architecture::X86_64 {
+            return Err(Error::UnsupportedExecutable(
+                "PE rewriting currently supports only x86-64".into(),
+            ));
+        }
         let optional_header = pe.nt_headers().optional_header();
         let size_of_image = u64::from(optional_header.size_of_image());
         let trampoline_base_rva =
@@ -450,11 +497,6 @@ pub fn rewrite_pe_for_litebox(input_binary: &[u8], trampoline: Option<u64>) -> R
         )?;
 
         let file = object::File::parse(&*buf).map_err(|e| Error::ParseError(e.to_string()))?;
-        match file {
-            object::File::Pe64(_) if file.architecture() == object::Architecture::X86_64 => {}
-            _ => return Ok(input_binary.to_vec()),
-        }
-
         let text_sections = match pe_text_sections(&file) {
             Ok(sections) => sections,
             Err(InternalError::NoTextSectionFound) => return Ok(input_binary.to_vec()),
