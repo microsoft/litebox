@@ -8,7 +8,7 @@ use anyhow::{Context as _, Result, bail};
 use clap::Parser;
 use litebox_common_macos::TaskParams;
 use litebox_platform_macos_userland::{GuestAbi, MacosUserland, set_guest_abi};
-#[cfg(not(feature = "test-stdio"))]
+#[cfg(not(feature = "test-broker"))]
 use litebox_shim_macos::MacosShimBuilder;
 use std::ffi::CString;
 
@@ -23,7 +23,7 @@ pub struct CliArgs {
     pub environment_variables: Vec<String>,
 }
 
-#[cfg(feature = "test-stdio")]
+#[cfg(feature = "test-broker")]
 mod test_broker;
 
 pub fn run(cli_args: CliArgs) -> Result<i32> {
@@ -45,9 +45,9 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         .collect::<Result<Vec<_>, _>>()
         .context("NUL in environment entry")?;
     let platform = MacosUserland::new();
-    #[cfg(not(feature = "test-stdio"))]
+    #[cfg(not(feature = "test-broker"))]
     let builder = MacosShimBuilder::new(platform);
-    #[cfg(feature = "test-stdio")]
+    #[cfg(feature = "test-broker")]
     let (builder, stdio) = test_broker::setup(platform)?;
     let program = builder
         .build()
@@ -63,7 +63,7 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
     unsafe {
         litebox_platform_macos_userland::run_thread(entrypoints, &mut initial_ctx);
     }
-    #[cfg(feature = "test-stdio")]
+    #[cfg(feature = "test-broker")]
     test_broker::flush_output(&stdio)?;
     process
         .exit_status()
