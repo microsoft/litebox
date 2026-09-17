@@ -52,7 +52,7 @@ pub use policy::{
 use process::ObjectReference;
 pub use process::{
     AssociationCancellation, BrokerProcess, BrokerThread, CallerCredential, ObjectRights,
-    PendingProcess, PreparedProcess,
+    PendingProcess, ProcessStartCommit,
 };
 use random::RandomProvider;
 use socket::{BrokerSocketPorts, SocketProvider};
@@ -312,14 +312,14 @@ impl BrokerCore {
         &self,
         caller_credential: CallerCredential,
     ) -> Result<Arc<BrokerProcess>> {
-        self.create_process_with_parent(None, caller_credential, process::ProcessLifecycle::Running)
+        self.create_process_with_parent(None, caller_credential, process::ProcessState::Running)
     }
 
     fn create_process_with_parent(
         &self,
         parent_id: Option<ProcessId>,
         caller_credential: CallerCredential,
-        lifecycle: process::ProcessLifecycle,
+        state: process::ProcessState,
     ) -> Result<Arc<BrokerProcess>> {
         let mut processes = self.processes.write();
         if processes.len() >= self.limits.max_processes {
@@ -335,7 +335,7 @@ impl BrokerCore {
             id,
             parent_id,
             caller_credential,
-            lifecycle,
+            state,
         ));
         assert!(
             processes.insert(id, Arc::downgrade(&process)).is_none(),

@@ -10,7 +10,7 @@ use std::process::{Child, Command, ExitStatus};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use litebox_broker_core::{BrokerCore, BrokerProcess, PendingProcess, PreparedProcess};
+use litebox_broker_core::{BrokerCore, BrokerProcess, PendingProcess, ProcessStartCommit};
 use litebox_broker_host::{BrokerHostExtensionError, copy_shared_buffer};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult};
@@ -185,7 +185,7 @@ struct RunnerChildrenState {
 struct ChildLaunch {
     parent_id: ProcessId,
     child_id: ProcessId,
-    prepared: PreparedProcess,
+    start_commit: ProcessStartCommit,
     state: Mutex<ChildLaunchState>,
     changed: Condvar,
 }
@@ -282,7 +282,7 @@ impl RunnerChildren {
         let launch = Arc::new(ChildLaunch {
             parent_id: parent.id(),
             child_id,
-            prepared: pending.prepared(),
+            start_commit: pending.start_commit(),
             state: Mutex::new(ChildLaunchState::Starting),
             changed: Condvar::new(),
         });
@@ -550,7 +550,7 @@ impl ChildLaunch {
                 _ => ErrorCode::ProtocolState,
             });
         }
-        self.prepared.commit().map_err(ErrorCode::from)?;
+        self.start_commit.commit().map_err(ErrorCode::from)?;
         *state = ChildLaunchState::Committed;
         self.changed.notify_all();
         Ok(())

@@ -110,7 +110,7 @@ pub struct BrokerProcess {
     cleaned_up: bool,
     /// Authoritative parent process ID, absent for a root process.
     parent_id: Option<ProcessId>,
-    lifecycle: Arc<Mutex<ProcessLifecycle>>,
+    state: Arc<Mutex<ProcessState>>,
     /// Broker-entry-authenticated caller credential for this process.
     pub(crate) caller_credential: CallerCredential,
     /// Handles of the live object references owned by this process.
@@ -126,7 +126,7 @@ pub struct BrokerProcess {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ProcessLifecycle {
+pub(crate) enum ProcessState {
     Attaching,
     Running,
     Exiting,
@@ -134,21 +134,19 @@ pub(crate) enum ProcessLifecycle {
 
 /// Commit authority for one broker-reserved child process.
 #[derive(Clone)]
-pub struct PreparedProcess {
-    lifecycle: Arc<Mutex<ProcessLifecycle>>,
-}
+pub struct ProcessStartCommit(Arc<Mutex<ProcessState>>);
 
-impl PreparedProcess {
+impl ProcessStartCommit {
     /// Commits a prepared child after its start result reaches the parent.
     pub fn commit(&self) -> Result<()> {
-        let mut lifecycle = self.lifecycle.lock();
-        match *lifecycle {
-            ProcessLifecycle::Attaching => {
-                *lifecycle = ProcessLifecycle::Running;
+        let mut state = self.0.lock();
+        match *state {
+            ProcessState::Attaching => {
+                *state = ProcessState::Running;
                 Ok(())
             }
-            ProcessLifecycle::Running => Err(BrokerError::Internal),
-            ProcessLifecycle::Exiting => Err(BrokerError::PeerClosed),
+            ProcessState::Running => Err(BrokerError::Internal),
+            ProcessState::Exiting => Err(BrokerError::PeerClosed),
         }
     }
 }
@@ -156,7 +154,7 @@ impl PreparedProcess {
 /// Broker-reserved child process awaiting association setup.
 pub struct PendingProcess {
     process: Option<Arc<BrokerProcess>>,
-    prepared: PreparedProcess,
+    start_commit: ProcessStartCommit,
     inherited_objects: Vec<ObjectHandle>,
 }
 
@@ -176,8 +174,8 @@ impl PendingProcess {
 
     /// Returns commit authority without transferring association ownership.
     #[must_use]
-    pub fn prepared(&self) -> PreparedProcess {
-        self.prepared.clone()
+    pub fn start_commit(&self) -> ProcessStartCommit {
+        self.start_commit.clone()
     }
 
     /// Returns child-owned handles in the parent's inheritance-manifest order.
@@ -205,12 +203,10 @@ impl PendingProcess {
     ///
     /// Panics if the pending process was internally transferred twice.
     #[must_use]
-    pub fn attach(mut self) -> (Arc<BrokerProcess>, PreparedProcess) {
-        let process = self
-            .process
+    pub fn attach(mut self) -> Arc<BrokerProcess> {
+        self.process
             .take()
-            .expect("pending process must remain active");
-        (process, self.prepared.clone())
+            .expect("pending process must remain active")
     }
 }
 
@@ -229,14 +225,14 @@ impl BrokerProcess {
         id: ProcessId,
         parent_id: Option<ProcessId>,
         caller_credential: CallerCredential,
-        lifecycle: ProcessLifecycle,
+        state: ProcessState,
     ) -> Self {
         Self {
             core,
             id,
             cleaned_up: false,
             parent_id,
-            lifecycle: Arc::new(Mutex::new(lifecycle)),
+            state: Arc::new(Mutex::new(state)),
             caller_credential,
             references: Mutex::new(ProcessReferences {
                 handles: Vec::new(),
@@ -264,7 +260,7 @@ impl BrokerProcess {
     /// Returns whether parent acknowledgement committed this process.
     #[must_use]
     pub fn is_running(&self) -> bool {
-        *self.lifecycle.lock() == ProcessLifecycle::Running
+        *self.state.lock() == ProcessState::Running
     }
 
     /// Reserves one child process inheriting this process's authenticated credential.
@@ -272,14 +268,12 @@ impl BrokerProcess {
         let process = self.core.create_process_with_parent(
             Some(self.id),
             self.caller_credential,
-            ProcessLifecycle::Attaching,
+            ProcessState::Attaching,
         )?;
-        let prepared = PreparedProcess {
-            lifecycle: Arc::clone(&process.lifecycle),
-        };
+        let start_commit = ProcessStartCommit(Arc::clone(&process.state));
         let mut pending = PendingProcess {
             process: Some(process),
-            prepared,
+            start_commit,
             inherited_objects: Vec::new(),
         };
         pending
@@ -772,7 +766,7 @@ impl BrokerProcess {
             return false;
         }
         self.cleaned_up = true;
-        *self.lifecycle.lock() = ProcessLifecycle::Exiting;
+        *self.state.lock() = ProcessState::Exiting;
 
         let mut invariant_fault = self.references.lock().pending_handles != 0;
         loop {
@@ -993,7 +987,8 @@ mod tests {
         let pending = parent.prepare_child(&[source_handle]).unwrap();
         let child_id = pending.id();
         let inherited_handle = pending.inherited_objects()[0];
-        let (child, prepared) = pending.attach();
+        let start_commit = pending.start_commit();
+        let child = pending.attach();
 
         assert_eq!(child.id(), child_id);
         assert_eq!(child.parent_id(), Some(parent.id()));
@@ -1004,7 +999,7 @@ mod tests {
         );
         assert!(!child.is_running());
 
-        prepared.commit().unwrap();
+        start_commit.commit().unwrap();
         assert!(child.is_running());
     }
 
@@ -1039,11 +1034,13 @@ mod tests {
         let parent = broker
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
-        let (child, prepared) = parent.prepare_child(&[]).unwrap().attach();
+        let pending = parent.prepare_child(&[]).unwrap();
+        let start_commit = pending.start_commit();
+        let child = pending.attach();
 
         child.finish();
 
-        assert_eq!(prepared.commit(), Err(BrokerError::PeerClosed));
+        assert_eq!(start_commit.commit(), Err(BrokerError::PeerClosed));
     }
 
     #[test]
@@ -1057,7 +1054,7 @@ mod tests {
         let parent = broker
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
-        let (child, _prepared) = parent.prepare_child(&[]).unwrap().attach();
+        let child = parent.prepare_child(&[]).unwrap().attach();
 
         assert_eq!(
             parent.prepare_child(&[]).err(),

@@ -408,7 +408,7 @@ where
         .send_handshake_response(&response)
         .map_err(BrokerHostError::Channel)?;
     send_shared_memory(setup_channel).map_err(BrokerHostError::Channel)?;
-    let (process, _prepared) = pending.attach();
+    let process = pending.attach();
     Ok(Ok(new_association(process, shared_buffers, readiness_sink)))
 }
 
