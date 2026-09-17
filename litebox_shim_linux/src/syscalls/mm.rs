@@ -102,6 +102,7 @@ impl<Platform: ShimPlatform> Ord for ElfPatchKey<Platform> {
 /// probed and found not to be an ELF image we patch. It stops the header probe
 /// from re-running on every mapping of the same descriptor.
 ///
+/// File contents are assumed to remain unchanged while a cache entry exists.
 pub(crate) type ElfPatchCache<Platform> = BTreeMap<ElfPatchKey<Platform>, Option<ElfPatchState>>;
 
 #[inline]
@@ -433,9 +434,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `munmap`
     #[inline]
     pub(crate) fn sys_munmap(&self, addr: UserPtrMut<u8>, len: usize) -> Result<(), Errno> {
-        let result = self.sys_munmap_raw(addr, len);
+        let aligned_len = len
+            .checked_next_multiple_of(PAGE_SIZE)
+            .ok_or(Errno::EINVAL)?;
+        let result = self.sys_munmap_raw(addr, aligned_len);
         if result.is_ok() {
-            self.clear_file_mappings_for_range(addr.as_usize(), len);
+            self.clear_file_mappings_for_range(addr.as_usize(), aligned_len);
         }
         result
     }
