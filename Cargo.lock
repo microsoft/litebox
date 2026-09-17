@@ -1622,6 +1622,7 @@ version = "0.1.0"
 dependencies = [
  "bitflags",
  "litebox",
+ "litebox_broker_protocol",
  "litebox_common_linux",
  "litebox_syscall_rewriter",
  "object",

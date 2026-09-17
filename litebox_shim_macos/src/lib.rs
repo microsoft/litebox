@@ -4,7 +4,7 @@
 //! Minimal Darwin BSD shim for static AArch64 Mach-O guests.
 //!
 //! Guest mappings and file operations use LiteBox. The runner supplies inherited
-//! descriptors. Guest file opening and networking are unsupported.
+//! descriptors. Networking is unsupported.
 
 #![no_std]
 #![cfg(target_arch = "aarch64")]
@@ -263,6 +263,10 @@ impl<P: ShimPlatform> Task<P> {
                 }
                 let bytes = buf.to_owned_slice::<P>(length).ok_or(Errno::EFAULT)?;
                 self.do_write(&fd, &bytes)
+            }
+            SyscallRequest::Open { path, flags, mode } => {
+                let path = self.read_path(path)?;
+                self.sys_open(path, flags, mode).to_syscall_result()
             }
             SyscallRequest::Close { fd } => self.sys_close(fd).to_syscall_result(),
             SyscallRequest::Dup { fd } => self.sys_dup(fd).to_syscall_result(),

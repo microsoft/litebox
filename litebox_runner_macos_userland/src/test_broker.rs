@@ -99,24 +99,6 @@ pub(crate) fn setup(
             .inherit_file(fd)
             .map_err(|error| anyhow!("inheriting {path}: {error}"))?;
     }
-    if mmap_image.is_some() {
-        let fd = builder
-            .litebox()
-            .open_file(
-                &context,
-                "/mmap-image",
-                FileAccessMode::ReadOnly,
-                FileOpenFlags::NONE,
-                FileMode::empty(),
-            )
-            .context("opening mmap test image")?;
-        let raw = builder
-            .inherit_file(fd)
-            .map_err(|error| anyhow!("inheriting mmap test image: {error}"))?;
-        if raw != 3 {
-            return Err(anyhow!("mmap test image received fd {raw}, expected 3"));
-        }
-    }
     Ok((builder, stdio))
 }
 

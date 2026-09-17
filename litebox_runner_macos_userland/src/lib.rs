@@ -23,7 +23,7 @@ pub struct CliArgs {
     /// Guest environment entry (KEY=VALUE). Host environment is not forwarded.
     #[arg(long = "env")]
     pub environment_variables: Vec<String>,
-    /// Host Mach-O exposed as guest fd 3 for mmap rewriting tests.
+    /// Host Mach-O exposed at /mmap-image for mmap rewriting tests.
     #[cfg(feature = "test-broker")]
     #[arg(long, hide = true, value_hint = clap::ValueHint::FilePath)]
     pub test_mmap_image: Option<PathBuf>,

@@ -70,6 +70,36 @@ bitflags::bitflags! {
 }
 
 bitflags::bitflags! {
+    /// Supported Darwin `open` flags.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct OpenFlags: core::ffi::c_int {
+        const RDONLY = 0;
+        const WRONLY = 0x0001;
+        const RDWR = 0x0002;
+        const NONBLOCK = 0x0004;
+        const APPEND = 0x0008;
+        const NOFOLLOW = 0x0100;
+        const CREAT = 0x0200;
+        const TRUNC = 0x0400;
+        const EXCL = 0x0800;
+        const NOCTTY = 0x0002_0000;
+        const DIRECTORY = 0x0010_0000;
+        const CLOEXEC = 0x0100_0000;
+    }
+}
+
+bitflags::bitflags! {
+    /// Darwin descriptor-local flags.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct FileDescriptorFlags: u32 {
+        const FD_CLOEXEC = 1;
+    }
+}
+
+/// Darwin pathname limit, including the terminating NUL.
+pub const PATH_MAX: usize = 1024;
+
+bitflags::bitflags! {
     /// Supported Darwin `mmap` flags.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct MmapFlags: core::ffi::c_int {

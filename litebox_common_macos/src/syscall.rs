@@ -4,10 +4,11 @@
 //! Typed BSD syscall decoding.
 
 use litebox::utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _};
+use litebox_broker_protocol::fs::FileMode;
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::{
-    MmapFlags, VmProtection,
+    MmapFlags, OpenFlags, VmProtection,
     errno::Errno,
     user_pointers::{UserPtr, UserPtrMut},
 };
@@ -17,6 +18,7 @@ pub mod nr {
     pub const EXIT: usize = 1;
     pub const READ: usize = 3;
     pub const WRITE: usize = 4;
+    pub const OPEN: usize = 5;
     pub const CLOSE: usize = 6;
     pub const GETPID: usize = 20;
     pub const GETUID: usize = 24;
@@ -30,6 +32,7 @@ pub mod nr {
     pub const MMAP: usize = 197;
     pub const READ_NOCANCEL: usize = 396;
     pub const WRITE_NOCANCEL: usize = 397;
+    pub const OPEN_NOCANCEL: usize = 398;
     pub const CLOSE_NOCANCEL: usize = 399;
 }
 
@@ -72,6 +75,11 @@ pub enum SyscallRequest {
         fd: i32,
         buf: UserPtr<u8>,
         count: usize,
+    },
+    Open {
+        path: UserPtr<core::ffi::c_char>,
+        flags: OpenFlags,
+        mode: FileMode,
     },
     Close {
         fd: i32,
@@ -141,6 +149,11 @@ impl SyscallRequest {
                 fd: int_arg(0),
                 buf: UserPtr::from_usize(args[1]),
                 count: args[2],
+            },
+            nr::OPEN | nr::OPEN_NOCANCEL => Self::Open {
+                path: UserPtr::from_usize(args[0]),
+                flags: OpenFlags::from_bits(int_arg(1)).ok_or(Errno::EINVAL)?,
+                mode: FileMode::from_u32_bits_truncate(int_arg(2).reinterpret_as_unsigned()),
             },
             nr::CLOSE | nr::CLOSE_NOCANCEL => Self::Close { fd: int_arg(0) },
             nr::DUP => Self::Dup { fd: int_arg(0) },

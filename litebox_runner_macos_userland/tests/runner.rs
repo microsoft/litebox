@@ -276,24 +276,47 @@ fn runner_executes_mmap_rewritten_macho_code() {
         &format!(
             ".global _start\n\
              _start:\n\
+             adr x0, 4f\n\
+             mov x1, #0\n\
+             mov x2, #0\n\
+             mov x16, #5\n\
+             svc #0x80\n\
+             b.cs 2f\n\
+             mov x19, x0\n\
+             adr x0, 4f\n\
+             mov x1, #0x01000000\n\
+             mov x2, #0\n\
+             mov x16, #398\n\
+             svc #0x80\n\
+             b.cs 2f\n\
+             mov x20, x0\n\
+             mov x0, x19\n\
+             mov x16, #6\n\
+             svc #0x80\n\
+             b.cs 2f\n\
              mov x0, #0\n\
              mov x1, #1\n\
              lsl x1, x1, #14\n\
              mov x2, #1\n\
              mov x3, #2\n\
-             mov x4, #3\n\
+             mov x4, x20\n\
              mov x5, #0\n\
              mov x16, #197\n\
              svc #0x80\n\
              b.cs 2f\n\
-             mov x11, x0\n\
+             mov x19, x0\n\
+             mov x0, x20\n\
+             mov x16, #399\n\
+             svc #0x80\n\
+             b.cs 2f\n\
+             mov x0, x19\n\
              mov x1, #1\n\
              mov x2, #5\n\
              mov x16, #74\n\
              svc #0x80\n\
              b.cs 2f\n\
              ldr x9, 1f\n\
-             add x9, x11, x9\n\
+             add x9, x19, x9\n\
              blr x9\n\
              cmp x0, #1\n\
              mov x0, #43\n\
@@ -304,7 +327,9 @@ fn runner_executes_mmap_rewritten_macho_code() {
              1: .quad {mapped:#x}\n\
              2: mov x0, #44\n\
              3: mov x16, #1\n\
-             svc #0x80\n"
+             svc #0x80\n\
+             4: .asciz \"/mmap-image\"\n\
+             .p2align 2\n"
         ),
     );
     let output = Command::new(env!("CARGO_BIN_EXE_litebox_runner_macos_userland"))
