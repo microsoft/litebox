@@ -220,7 +220,9 @@ impl<P: ShimPlatform> Task<P> {
     }
 
     fn do_syscall(&self, ctx: &PtRegs) -> Result<usize, Errno> {
-        let request = SyscallRequest::try_from_raw(ctx.regs[16], ctx, |_| {})?;
+        let request = SyscallRequest::try_from_raw(ctx.regs[16], ctx, |args| {
+            litebox_util_log::warn!(feature:% = args; "unsupported");
+        })?;
         match request {
             SyscallRequest::Exit { status } => {
                 self.sys_exit(status);
@@ -260,7 +262,8 @@ impl<P: ShimPlatform> Task<P> {
     }
 
     fn io_length(count: usize) -> Result<usize, Errno> {
-        if count > isize::MAX.cast_unsigned() {
+        // XNU limits each read/write request to INT_MAX bytes.
+        if count > core::ffi::c_int::MAX.cast_unsigned() as usize {
             return Err(Errno::EINVAL);
         }
         Ok(count.min(MAX_KERNEL_BUF_SIZE))

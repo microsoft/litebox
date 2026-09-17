@@ -139,7 +139,7 @@ fn write_error(error: WriteError) -> Errno {
 mod tests {
     extern crate std;
     use super::*;
-    use crate::{MacosShimBuilder, Process};
+    use crate::{MAX_KERNEL_BUF_SIZE, MacosShimBuilder, Process};
     use alloc::vec;
     use core::sync::atomic::AtomicI32;
     use litebox::mm::linux::{CreatePagesFlags, NonZeroAddress, NonZeroPageSize};
@@ -157,7 +157,9 @@ mod tests {
     };
     use litebox_broker_host::test_support::InProcessBrokerSetup;
     use litebox_broker_local::BrokerLocal;
-    use litebox_broker_protocol::fs::{FileAccessMode, FileMode, FileOpenFlags, FileUser};
+    use litebox_broker_protocol::fs::{
+        FileAccessMode, FileMode, FileOpenFlags, FileSeekWhence, FileUser,
+    };
     use litebox_common_macos::{PAGE_SIZE, PtRegs, TaskParams, syscall::nr};
     use litebox_platform_macos_userland::MacosUserland as Platform;
 
@@ -232,7 +234,7 @@ mod tests {
         let buf = unsafe {
             task.global.pm.create_writable_pages(
                 NonZeroAddress::new(Platform::TASK_ADDR_MIN),
-                NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+                NonZeroPageSize::new(MAX_KERNEL_BUF_SIZE).unwrap(),
                 CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
                 |_| Ok(0),
             )
@@ -246,10 +248,29 @@ mod tests {
             ctx.regs[2] = count;
             task.do_syscall(&ctx)
         };
+        let max_count = core::ffi::c_int::MAX.cast_unsigned() as usize;
+        let source = task.files.typed_fd(0).unwrap();
+        let untouched = [0xa5; 16];
+        buf.copy_from_slice(0, &untouched).unwrap();
+        // The FD and 64 KiB buffer are valid: rejection must precede clamping
+        // and must neither transfer data nor advance the shared file offset.
+        for number in [nr::READ, nr::READ_NOCANCEL, nr::WRITE, nr::WRITE_NOCANCEL] {
+            for count in [max_count + 1, usize::MAX] {
+                assert_eq!(invoke(number, 0, count), Err(Errno::EINVAL));
+                assert_eq!(
+                    task.global
+                        .litebox
+                        .seek_file(&source, 0, FileSeekWhence::RelativeToCurrentOffset)
+                        .unwrap(),
+                    0
+                );
+                assert_eq!(task.global.litebox.file_status(&source).unwrap().size, 6);
+                assert_eq!(&*buf.to_owned_slice(untouched.len()).unwrap(), &untouched);
+            }
+        }
         assert_eq!(invoke(nr::READ, 0, 2), Ok(2));
         assert_eq!(&*buf.to_owned_slice(2).unwrap(), b"ab");
         assert_eq!(invoke(nr::DUP, 0, 0), Ok(2));
-        let source = task.files.typed_fd(0).unwrap();
         assert_eq!(invoke(nr::CLOSE, 0, 0), Ok(0));
         assert_eq!(invoke(nr::READ, 0, 2), Err(Errno::EBADF));
         assert_eq!(task.do_read(&source, &mut [0; 2]), Err(Errno::EBADF));
@@ -261,6 +282,8 @@ mod tests {
         assert_eq!(invoke(nr::WRITE, 1, 2), Err(Errno::EBADF));
         assert_eq!(invoke(nr::READ, 1, 6), Ok(6));
         assert_eq!(&*buf.to_owned_slice(6).unwrap(), b"abcdXY");
+        // INT_MAX itself is permitted; at EOF it returns zero bytes.
+        assert_eq!(invoke(nr::READ, 1, max_count), Ok(0));
         assert_eq!(invoke(nr::CLOSE, 2, 0), Ok(0));
         assert_eq!(invoke(nr::CLOSE, 2, 0), Err(Errno::EBADF));
 
