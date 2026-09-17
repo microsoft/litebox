@@ -8,9 +8,11 @@ use anyhow::{Context as _, Result, bail};
 use clap::Parser;
 use litebox_common_macos::TaskParams;
 use litebox_platform_macos_userland::{GuestAbi, MacosUserland, set_guest_abi};
-#[cfg(not(feature = "test-stdio"))]
+#[cfg(not(feature = "test-broker"))]
 use litebox_shim_macos::MacosShimBuilder;
 use std::ffi::CString;
+#[cfg(feature = "test-broker")]
+use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(about = "Run AOT-rewritten static AArch64 Mach-O programs (no dyld; limited Mach traps)")]
@@ -21,9 +23,13 @@ pub struct CliArgs {
     /// Guest environment entry (KEY=VALUE). Host environment is not forwarded.
     #[arg(long = "env")]
     pub environment_variables: Vec<String>,
+    /// Host Mach-O exposed as guest fd 3 for mmap rewriting tests.
+    #[cfg(feature = "test-broker")]
+    #[arg(long, hide = true, value_hint = clap::ValueHint::FilePath)]
+    pub test_mmap_image: Option<PathBuf>,
 }
 
-#[cfg(feature = "test-stdio")]
+#[cfg(feature = "test-broker")]
 mod test_broker;
 
 pub fn run(cli_args: CliArgs) -> Result<i32> {
@@ -45,10 +51,18 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         .collect::<Result<Vec<_>, _>>()
         .context("NUL in environment entry")?;
     let platform = MacosUserland::new();
-    #[cfg(not(feature = "test-stdio"))]
+    #[cfg(not(feature = "test-broker"))]
     let builder = MacosShimBuilder::new(platform);
-    #[cfg(feature = "test-stdio")]
-    let (builder, stdio) = test_broker::setup(platform)?;
+    #[cfg(feature = "test-broker")]
+    let (builder, stdio) = {
+        let mmap_image = cli_args
+            .test_mmap_image
+            .as_deref()
+            .map(std::fs::read)
+            .transpose()
+            .context("reading mmap test image")?;
+        test_broker::setup(platform, mmap_image.as_deref())?
+    };
     let program = builder
         .build()
         .load_program(TaskParams::default(), &data, argv, envp)
@@ -63,7 +77,7 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
     unsafe {
         litebox_platform_macos_userland::run_thread(entrypoints, &mut initial_ctx);
     }
-    #[cfg(feature = "test-stdio")]
+    #[cfg(feature = "test-broker")]
     test_broker::flush_output(&stdio)?;
     process
         .exit_status()

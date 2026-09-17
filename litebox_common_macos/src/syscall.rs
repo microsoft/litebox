@@ -7,6 +7,7 @@ use litebox::utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, Tru
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::{
+    MmapFlags, VmProtection,
     errno::Errno,
     user_pointers::{UserPtr, UserPtrMut},
 };
@@ -24,6 +25,9 @@ pub mod nr {
     pub const DUP: usize = 41;
     pub const GETEGID: usize = 43;
     pub const GETGID: usize = 47;
+    pub const MUNMAP: usize = 73;
+    pub const MPROTECT: usize = 74;
+    pub const MMAP: usize = 197;
     pub const READ_NOCANCEL: usize = 396;
     pub const WRITE_NOCANCEL: usize = 397;
     pub const CLOSE_NOCANCEL: usize = 399;
@@ -75,6 +79,23 @@ pub enum SyscallRequest {
     Dup {
         fd: i32,
     },
+    Mmap {
+        address: usize,
+        length: usize,
+        protection: VmProtection,
+        flags: MmapFlags,
+        fd: i32,
+        offset: i64,
+    },
+    Munmap {
+        address: usize,
+        length: usize,
+    },
+    Mprotect {
+        address: usize,
+        length: usize,
+        protection: VmProtection,
+    },
     Getpid,
     Getppid,
     Getuid,
@@ -123,6 +144,23 @@ impl SyscallRequest {
             },
             nr::CLOSE | nr::CLOSE_NOCANCEL => Self::Close { fd: int_arg(0) },
             nr::DUP => Self::Dup { fd: int_arg(0) },
+            nr::MMAP => Self::Mmap {
+                address: args[0],
+                length: args[1],
+                protection: VmProtection::from_bits(int_arg(2)).ok_or(Errno::EINVAL)?,
+                flags: MmapFlags::from_bits(int_arg(3)).ok_or(Errno::EINVAL)?,
+                fd: int_arg(4),
+                offset: args[5].reinterpret_as_signed() as i64,
+            },
+            nr::MUNMAP => Self::Munmap {
+                address: args[0],
+                length: args[1],
+            },
+            nr::MPROTECT => Self::Mprotect {
+                address: args[0],
+                length: args[1],
+                protection: VmProtection::from_bits(int_arg(2)).ok_or(Errno::EINVAL)?,
+            },
             nr::GETPID => Self::Getpid,
             nr::GETPPID => Self::Getppid,
             nr::GETUID => Self::Getuid,
@@ -179,6 +217,33 @@ mod tests {
             SyscallRequest::from_args(u32::MAX as usize - 2, [0; 8]),
             Ok(SyscallRequest::MachAbsoluteTime)
         ));
+        let request = SyscallRequest::from_args(
+            nr::MMAP,
+            [0x4000, 0x8000, 5, 0x12, usize::MAX, 0x1234, 0, 0],
+        )
+        .unwrap();
+        assert!(matches!(
+            request,
+            SyscallRequest::Mmap {
+                address: 0x4000,
+                length: 0x8000,
+                protection,
+                flags,
+                fd: -1,
+                offset: 0x1234,
+            } if protection == (VmProtection::READ | VmProtection::EXECUTE)
+                && flags == (MmapFlags::PRIVATE | MmapFlags::FIXED)
+        ));
+        for (protection, flags) in [(8, 2), (1, 4)] {
+            assert_eq!(
+                SyscallRequest::from_args(
+                    nr::MMAP,
+                    [0, 0x4000, protection, flags, usize::MAX, 0, 0, 0],
+                )
+                .unwrap_err(),
+                Errno::EINVAL
+            );
+        }
     }
 
     #[cfg(target_arch = "aarch64")]

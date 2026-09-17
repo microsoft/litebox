@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! In-process broker fixture for the test-stdio runner feature.
+//! In-process broker fixture for the test-broker runner feature.
 
 use anyhow::{Context as _, Result, anyhow};
 use litebox::LiteBox;
@@ -30,6 +30,7 @@ use std::{
 
 pub(crate) fn setup(
     platform: &'static MacosUserland,
+    mmap_image: Option<&[u8]>,
 ) -> Result<(MacosShimBuilder<MacosUserland>, Arc<TestStdioProvider>)> {
     let stdio = Arc::new(TestStdioProvider::default());
     let mut input = Vec::new();
@@ -37,13 +38,24 @@ pub(crate) fn setup(
         .read_to_end(&mut input)
         .context("reading test input")?;
     stdio.push_input(&input);
-    let fs = InMem::<MacosUserland>::new_initialized(vec![(
+    let mut initial_nodes = vec![(
         "/",
         InitialNode::Directory {
             mode: FileMode::RWXU | FileMode::RWXG | FileMode::RWXO,
             owner: FileUser::ROOT,
         },
-    )]);
+    )];
+    if let Some(image) = mmap_image {
+        initial_nodes.push((
+            "/mmap-image",
+            InitialNode::File {
+                mode: FileMode::RWXU | FileMode::RWXG | FileMode::RWXO,
+                owner: FileUser::ROOT,
+                data: image.to_vec().into(),
+            },
+        ));
+    }
+    let fs = InMem::<MacosUserland>::new_initialized(initial_nodes);
     let fs = Composer::builder()
         .mount("/", |_| fs)
         .mount("/dev", Devices::new)
@@ -86,6 +98,24 @@ pub(crate) fn setup(
         builder
             .inherit_file(fd)
             .map_err(|error| anyhow!("inheriting {path}: {error}"))?;
+    }
+    if mmap_image.is_some() {
+        let fd = builder
+            .litebox()
+            .open_file(
+                &context,
+                "/mmap-image",
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::NONE,
+                FileMode::empty(),
+            )
+            .context("opening mmap test image")?;
+        let raw = builder
+            .inherit_file(fd)
+            .map_err(|error| anyhow!("inheriting mmap test image: {error}"))?;
+        if raw != 3 {
+            return Err(anyhow!("mmap test image received fd {raw}, expected 3"));
+        }
     }
     Ok((builder, stdio))
 }

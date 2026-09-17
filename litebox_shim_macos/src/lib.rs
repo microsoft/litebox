@@ -11,12 +11,15 @@
 
 extern crate alloc;
 
-use alloc::{ffi::CString, sync::Arc, vec, vec::Vec};
+use alloc::{collections::BTreeMap, ffi::CString, sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicI32, Ordering};
 use litebox::platform::page_mgmt::MemoryRegionPermissions as Permissions;
 use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
 use litebox::{
-    LiteBox, mm::PageManager, platform::PageManagementProvider, sync::RawSyncPrimitivesProvider,
+    LiteBox,
+    mm::PageManager,
+    platform::PageManagementProvider,
+    sync::{Mutex, RawSyncPrimitivesProvider},
 };
 use litebox_common_macos::{
     PAGE_SIZE, PtRegs, SIGINT, SIGSEGV, STACK_ALIGNMENT, SyscallRequest, TaskParams, errno::Errno,
@@ -84,6 +87,7 @@ impl<P: ShimPlatform> MacosShimBuilder<P> {
                 platform: self.platform,
                 pm: PageManager::new(&self.litebox),
                 litebox: self.litebox,
+                macho_mappings: Mutex::new(BTreeMap::new()),
             }),
             files: self.files,
         }
@@ -153,6 +157,7 @@ struct GlobalState<P: ShimPlatform> {
     platform: &'static P,
     litebox: Arc<LiteBox<P>>,
     pm: PageManager<P, PAGE_SIZE>,
+    macho_mappings: Mutex<P, BTreeMap<usize, syscalls::mm::MachoMapping>>,
 }
 
 impl<P: ShimPlatform> Drop for GlobalState<P> {
@@ -259,6 +264,26 @@ impl<P: ShimPlatform> Task<P> {
             }
             SyscallRequest::Close { fd } => self.sys_close(fd).to_syscall_result(),
             SyscallRequest::Dup { fd } => self.sys_dup(fd).to_syscall_result(),
+            SyscallRequest::Mmap {
+                address,
+                length,
+                protection,
+                flags,
+                fd,
+                offset,
+            } => self
+                .sys_mmap(address, length, protection, flags, fd, offset)
+                .to_syscall_result(),
+            SyscallRequest::Munmap { address, length } => {
+                self.sys_munmap(address, length).to_syscall_result()
+            }
+            SyscallRequest::Mprotect {
+                address,
+                length,
+                protection,
+            } => self
+                .sys_mprotect(address, length, protection)
+                .to_syscall_result(),
             SyscallRequest::Getpid => Ok(self.sys_getpid().cast_unsigned() as usize),
             SyscallRequest::Getppid => Ok(self.sys_getppid().cast_unsigned() as usize),
             SyscallRequest::Getuid => Ok(self.sys_getuid() as usize),

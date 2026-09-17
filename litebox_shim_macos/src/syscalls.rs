@@ -10,6 +10,7 @@ use litebox::{
 use litebox_common_macos::{KernReturn, syscall::MachTimebaseInfo, user_pointers::UserPtrMut};
 
 pub(crate) mod file;
+pub(crate) mod mm;
 
 impl<P: ShimPlatform> Task<P> {
     pub(crate) fn sys_exit(&self, status: i32) {

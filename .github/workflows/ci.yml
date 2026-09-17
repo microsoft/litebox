@@ -172,11 +172,10 @@ jobs:
       - run: ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features $MACOS_AARCH64_CRATES
       - run: ./.github/tools/github_actions_run_cargo build $MACOS_AARCH64_CRATES
       - run: ./.github/tools/github_actions_run_cargo nextest $MACOS_AARCH64_CRATES
-      - name: Test native macOS runner with test-only stdio
+      - name: Test native macOS runner with in-process broker
         run: >-
           ./.github/tools/github_actions_run_cargo nextest
-          -p litebox_runner_macos_userland --features test-stdio
-          -E 'test(=static_macho_rewriter_e2e)'
+          -p litebox_runner_macos_userland --features test-broker
       - name: Check native macOS platform without subpage compatibility
         run: |
           ./.github/tools/github_actions_run_cargo clippy --all-targets --no-default-features -p litebox_platform_macos_userland

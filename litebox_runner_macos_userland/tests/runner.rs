@@ -4,7 +4,7 @@
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
 use litebox_common_macos::{TaskParams, VmProtection, loader::MachoParsedFile};
-#[cfg(feature = "test-stdio")]
+#[cfg(feature = "test-broker")]
 use std::io::Write as _;
 use std::{
     path::{Path, PathBuf},
@@ -44,6 +44,64 @@ fn assemble(dir: &Path, source: &str) -> PathBuf {
         );
     }
     binary
+}
+
+#[cfg(feature = "test-broker")]
+fn assemble_dylib(dir: &Path, source: &str) -> PathBuf {
+    let asm = dir.join("mapped.s");
+    let obj = dir.join("mapped.o");
+    let dylib = dir.join("mapped.dylib");
+    std::fs::write(&asm, source).unwrap();
+    for mut command in [
+        {
+            let mut c = Command::new("xcrun");
+            c.args(["as", "-arch", "arm64"])
+                .arg(&asm)
+                .arg("-o")
+                .arg(&obj);
+            c
+        },
+        {
+            let mut c = Command::new("xcrun");
+            c.args(["clang", "-arch", "arm64", "-dynamiclib"])
+                .arg(&obj)
+                .arg("-o")
+                .arg(&dylib);
+            c
+        },
+    ] {
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    dylib
+}
+
+#[cfg(feature = "test-broker")]
+fn symbol_address(image: &Path, symbol: &str) -> usize {
+    let output = Command::new("xcrun")
+        .args(["nm", "-n"])
+        .arg(image)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            let address = fields.next()?;
+            let _kind = fields.next()?;
+            (fields.next()? == symbol).then(|| usize::from_str_radix(address, 16).unwrap())
+        })
+        .unwrap()
 }
 
 /// Invoke the rewriter CLI and return the path of its .hooked artifact.
@@ -128,20 +186,24 @@ fn assert_svc_gates(original: &[u8], rewritten: &[u8]) -> usize {
 }
 
 /// Both feature configurations exercise the same AOT pipeline and gate ABI.
-/// test-stdio adds I/O checks; without it the fixture checks stdio is absent.
+/// test-broker adds I/O checks; without it the fixture checks stdio is absent.
 #[test]
 fn static_macho_rewriter_e2e() {
     let dir = tempfile::tempdir().unwrap();
     let source = format!(
         ".set TEST_STDIO, {}\n{}",
-        usize::from(cfg!(feature = "test-stdio")),
+        usize::from(cfg!(feature = "test-broker")),
         include_str!("fixtures/static_macho.S"),
     );
     let binary = assemble(dir.path(), &source);
     let hooked = rewrite(&binary);
     let original = std::fs::read(&binary).unwrap();
     let rewritten = std::fs::read(&hooked).unwrap();
-    let expected_sites = if cfg!(feature = "test-stdio") { 23 } else { 15 };
+    let expected_sites = if cfg!(feature = "test-broker") {
+        23
+    } else {
+        15
+    };
     assert_eq!(assert_svc_gates(&original, &rewritten), expected_sites);
     let parsed = MachoParsedFile::parse(&original).unwrap();
     // Parsing is independent of the byte slice's alignment.
@@ -162,12 +224,12 @@ fn static_macho_rewriter_e2e() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    #[cfg(feature = "test-stdio")]
+    #[cfg(feature = "test-broker")]
     child.stdin.take().unwrap().write_all(b"hello\n").unwrap();
     // No input is needed in the default configuration.
     drop(child.stdin.take());
     let output = child.wait_with_output().unwrap();
-    #[cfg(feature = "test-stdio")]
+    #[cfg(feature = "test-broker")]
     {
         println!("guest stdout: {}", String::from_utf8_lossy(&output.stdout));
         eprintln!("guest stderr: {}", String::from_utf8_lossy(&output.stderr));
@@ -178,7 +240,7 @@ fn static_macho_rewriter_e2e() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let expected: &[u8] = if cfg!(feature = "test-stdio") {
+    let expected: &[u8] = if cfg!(feature = "test-broker") {
         b"hello\n"
     } else {
         b""
@@ -193,6 +255,70 @@ fn static_macho_rewriter_e2e() {
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("not rewritten"));
+}
+
+#[cfg(feature = "test-broker")]
+#[test]
+fn runner_executes_mmap_rewritten_macho_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let dylib = assemble_dylib(
+        dir.path(),
+        ".section __TEXT,__text,regular,pure_instructions\n\
+         .global _mapped\n\
+         _mapped:\n\
+         mov x16, #20\n\
+         svc #0x80\n\
+         ret\n",
+    );
+    let mapped = symbol_address(&dylib, "_mapped");
+    let bootstrap = assemble(
+        dir.path(),
+        &format!(
+            ".global _start\n\
+             _start:\n\
+             mov x0, #0\n\
+             mov x1, #1\n\
+             lsl x1, x1, #14\n\
+             mov x2, #1\n\
+             mov x3, #2\n\
+             mov x4, #3\n\
+             mov x5, #0\n\
+             mov x16, #197\n\
+             svc #0x80\n\
+             b.cs 2f\n\
+             mov x11, x0\n\
+             mov x1, #1\n\
+             mov x2, #5\n\
+             mov x16, #74\n\
+             svc #0x80\n\
+             b.cs 2f\n\
+             ldr x9, 1f\n\
+             add x9, x11, x9\n\
+             blr x9\n\
+             cmp x0, #1\n\
+             mov x0, #43\n\
+             mov x10, #42\n\
+             csel x0, x10, x0, eq\n\
+             b 3f\n\
+             .p2align 3\n\
+             1: .quad {mapped:#x}\n\
+             2: mov x0, #44\n\
+             3: mov x16, #1\n\
+             svc #0x80\n"
+        ),
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_litebox_runner_macos_userland"))
+        .arg("--test-mmap-image")
+        .arg(&dylib)
+        .arg(rewrite(&bootstrap))
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(42),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

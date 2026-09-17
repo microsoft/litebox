@@ -69,6 +69,17 @@ bitflags::bitflags! {
     }
 }
 
+bitflags::bitflags! {
+    /// Supported Darwin `mmap` flags.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct MmapFlags: core::ffi::c_int {
+        const SHARED = 0x0001;
+        const PRIVATE = 0x0002;
+        const FIXED = 0x0010;
+        const ANONYMOUS = 0x1000;
+    }
+}
+
 /// Native Apple Silicon page size.
 pub const PAGE_SIZE: usize = 16384;
 
