@@ -14,7 +14,32 @@ use object::{
     LittleEndian as LE, macho,
     read::macho::{MachHeader as _, Segment as _},
 };
-use zerocopy::IntoBytes as _;
+use zerocopy::{
+    FromBytes, Immutable, IntoBytes, KnownLayout,
+    byteorder::{LittleEndian, U64},
+};
+
+bitflags::bitflags! {
+    /// Mach virtual-memory protections.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct VmProtection: u32 {
+        const READ = macho::VM_PROT_READ;
+        const WRITE = macho::VM_PROT_WRITE;
+        const EXECUTE = macho::VM_PROT_EXECUTE;
+    }
+}
+
+const TRAMPOLINE_FILE_ALIGNMENT: usize = 4096;
+
+/// On-disk AOT footer, with explicitly little-endian fields.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable, KnownLayout)]
+struct TrampolineHeader64 {
+    magic: [u8; 8],
+    file_offset: U64<LittleEndian>,
+    vaddr: U64<LittleEndian>,
+    trampoline_size: U64<LittleEndian>,
+}
 
 /// Bound both the input file and the reserved virtual span for this subset.
 const MAX_IMAGE_SIZE: usize = 256 * 1024 * 1024;
@@ -39,8 +64,7 @@ pub enum MachoLoaderError {
 pub struct Segment {
     pub virtual_range: Range<usize>,
     pub file_range: Range<usize>,
-    /// Mach VM_PROT_READ/WRITE/EXECUTE bits.
-    pub protection: u32,
+    pub protection: VmProtection,
 }
 
 #[derive(Debug)]
@@ -52,7 +76,7 @@ pub struct MachoParsedFile {
 
 /// AOT trampoline payload described by the rewriter's 64-bit footer.
 #[derive(Debug)]
-pub struct Trampoline {
+pub struct TrampolineInfo {
     pub file_range: Range<usize>,
     pub virtual_range: Range<usize>,
 }
@@ -64,28 +88,25 @@ impl MachoParsedFile {
     pub fn parse_trampoline(
         &mut self,
         data: &[u8],
-    ) -> Result<Option<Trampoline>, MachoLoaderError> {
+    ) -> Result<Option<TrampolineInfo>, MachoLoaderError> {
         let footer_start = data
             .len()
-            .checked_sub(32)
+            .checked_sub(size_of::<TrampolineHeader64>())
             .ok_or(MachoLoaderError::Unrewritten)?;
-        let footer = &data[footer_start..];
-        if &footer[..8] != litebox_syscall_rewriter::TRAMPOLINE_MAGIC {
-            return Err(if &footer[..7] == b"LITEBOX" {
+        let header = TrampolineHeader64::read_from_bytes(&data[footer_start..])
+            .map_err(|_| MachoLoaderError::Rewrite)?;
+        if header.magic != *litebox_syscall_rewriter::TRAMPOLINE_MAGIC {
+            return Err(if header.magic.starts_with(b"LITEBOX") {
                 MachoLoaderError::Rewrite
             } else {
                 MachoLoaderError::Unrewritten
             });
         }
-        let word = |offset| -> Result<usize, MachoLoaderError> {
-            let bytes = footer[offset..offset + 8]
-                .try_into()
-                .map_err(|_| MachoLoaderError::Rewrite)?;
-            usize::try_from(u64::from_le_bytes(bytes)).map_err(|_| MachoLoaderError::Rewrite)
-        };
-        let file_offset = word(8)?;
-        let address = word(16)?;
-        let size = word(24)?;
+        let file_offset =
+            usize::try_from(header.file_offset.get()).map_err(|_| MachoLoaderError::Rewrite)?;
+        let address = usize::try_from(header.vaddr.get()).map_err(|_| MachoLoaderError::Rewrite)?;
+        let size =
+            usize::try_from(header.trampoline_size.get()).map_err(|_| MachoLoaderError::Rewrite)?;
         if self
             .segments
             .iter()
@@ -107,10 +128,10 @@ impl MachoParsedFile {
             .checked_add(size)
             .and_then(|end| end.checked_next_multiple_of(PAGE_SIZE))
             .ok_or(MachoLoaderError::Rewrite)?;
-        if !file_offset.is_multiple_of(4096)
+        if !file_offset.is_multiple_of(TRAMPOLINE_FILE_ALIGNMENT)
             || !address.is_multiple_of(PAGE_SIZE)
-            || size < 16
-            || !size.is_multiple_of(4)
+            || size < litebox_syscall_rewriter::aarch64::GATE_ALIGNMENT
+            || !size.is_multiple_of(size_of::<u32>())
             || file_end != footer_start
             || self.segments.iter().any(|s| {
                 s.file_range.end > file_offset
@@ -124,7 +145,7 @@ impl MachoParsedFile {
             return Err(MachoLoaderError::Rewrite);
         }
         self.virtual_range = span;
-        Ok(Some(Trampoline {
+        Ok(Some(TrampolineInfo {
             file_range: file_offset..file_end,
             virtual_range: address..end,
         }))
@@ -235,16 +256,16 @@ impl MachoParsedFile {
                     let file_end = offset
                         .checked_add(file_size)
                         .ok_or(Invalid("file range overflow"))?;
-                    let protection = seg.initprot.get(LE);
+                    let protection = VmProtection::from_bits(seg.initprot.get(LE))
+                        .ok_or(Invalid("segment protection"))?;
                     if file_size > size
                         || file_end > data.len()
                         || !start.is_multiple_of(PAGE_SIZE)
                         || !size.is_multiple_of(PAGE_SIZE)
-                        || protection & !7 != 0
                     {
                         return Err(Invalid("segment bounds/alignment/protection"));
                     }
-                    if protection & 6 == 6 {
+                    if protection.contains(VmProtection::WRITE | VmProtection::EXECUTE) {
                         return Err(Unsupported("writable executable segment"));
                     }
                     if size != 0 {
@@ -282,7 +303,7 @@ impl MachoParsedFile {
         let entry = entry.ok_or(Unsupported("missing LC_UNIXTHREAD"))?;
         if !entry.is_multiple_of(4)
             || !segments.iter().any(|s| {
-                s.protection & 4 != 0
+                s.protection.contains(VmProtection::EXECUTE)
                     && (s.virtual_range.start..s.virtual_range.start + s.file_range.len())
                         .contains(&entry)
             })
@@ -311,7 +332,7 @@ mod tests {
             (20, 72 + 288),
             (32, macho::LC_SEGMENT_64),
             (36, 72),
-            (92, 5),
+            (92, (VmProtection::READ | VmProtection::EXECUTE).bits()),
             (104, macho::LC_UNIXTHREAD),
             (108, 288),
             (112, 6),
@@ -353,7 +374,7 @@ mod tests {
             );
         }
         let mut writable_code = data;
-        writable_code[92..96].copy_from_slice(&7u32.to_le_bytes());
+        writable_code[92..96].copy_from_slice(&VmProtection::all().bits().to_le_bytes());
         assert!(matches!(
             MachoParsedFile::parse(&writable_code),
             Err(MachoLoaderError::Unsupported(_))
@@ -395,25 +416,50 @@ mod tests {
         let mut data = image();
         let file_offset = data.len();
         data.extend_from_slice(&[0u8; 64]);
-        data.extend_from_slice(litebox_syscall_rewriter::TRAMPOLINE_MAGIC);
-        for value in [file_offset as u64, 0x1_0000_4000, 64] {
-            data.extend_from_slice(&value.to_le_bytes());
-        }
-        let footer = data.len() - 32;
+        let header = TrampolineHeader64 {
+            magic: *litebox_syscall_rewriter::TRAMPOLINE_MAGIC,
+            file_offset: (file_offset as u64).into(),
+            vaddr: 0x1_0000_4000.into(),
+            trampoline_size: 64.into(),
+        };
+        let footer = data.len();
+        data.extend_from_slice(header.as_bytes());
         let mut plan = MachoParsedFile::parse(&data).unwrap();
         let trampoline = plan.parse_trampoline(&data).unwrap().unwrap();
         assert_eq!(trampoline.file_range, file_offset..file_offset + 64);
         assert_eq!(plan.virtual_range, 0x1_0000_0000..0x1_0000_8000);
-        for (offset, value) in [
-            (8, 1u64),
-            (8, 0),
-            (16, 0x1_0000_0000),
-            (16, u64::MAX),
-            (24, 63),
-            (24, 68),
+        for invalid_header in [
+            TrampolineHeader64 {
+                file_offset: 1.into(),
+                ..header
+            },
+            TrampolineHeader64 {
+                file_offset: 0.into(),
+                ..header
+            },
+            TrampolineHeader64 {
+                vaddr: 0x1_0000_0000.into(),
+                ..header
+            },
+            TrampolineHeader64 {
+                vaddr: u64::MAX.into(),
+                ..header
+            },
+            TrampolineHeader64 {
+                trampoline_size: 63.into(),
+                ..header
+            },
+            TrampolineHeader64 {
+                trampoline_size: 68.into(),
+                ..header
+            },
+            TrampolineHeader64 {
+                magic: *b"LITEBOX9",
+                ..header
+            },
         ] {
             let mut invalid = data.clone();
-            invalid[footer + offset..footer + offset + 8].copy_from_slice(&value.to_le_bytes());
+            invalid[footer..].copy_from_slice(invalid_header.as_bytes());
             assert!(
                 MachoParsedFile::parse(&invalid)
                     .unwrap()
@@ -421,19 +467,21 @@ mod tests {
                     .is_err()
             );
         }
-        data[footer + 7] = b'9';
-        assert!(matches!(
-            plan.parse_trampoline(&data),
-            Err(MachoLoaderError::Rewrite)
-        ));
         let raw = image();
         assert!(matches!(
             MachoParsedFile::parse(&raw).unwrap().parse_trampoline(&raw),
             Err(MachoLoaderError::Unrewritten)
         ));
         let mut sentinel = raw;
-        sentinel.extend_from_slice(litebox_syscall_rewriter::TRAMPOLINE_MAGIC);
-        sentinel.extend_from_slice(&[0; 24]);
+        sentinel.extend_from_slice(
+            TrampolineHeader64 {
+                magic: *litebox_syscall_rewriter::TRAMPOLINE_MAGIC,
+                file_offset: 0.into(),
+                vaddr: 0.into(),
+                trampoline_size: 0.into(),
+            }
+            .as_bytes(),
+        );
         assert!(
             MachoParsedFile::parse(&sentinel)
                 .unwrap()

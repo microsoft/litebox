@@ -10,7 +10,8 @@ use litebox_platform_macos_userland::MacosUserland as Platform;
 
 fn task(shim: MacosShim<Platform>) -> Task<Platform> {
     Task {
-        global: shim.0,
+        global: shim.global,
+        files: shim.files,
         params: TaskParams::default(),
         process: Process(Arc::new(AtomicI32::new(-1))),
     }

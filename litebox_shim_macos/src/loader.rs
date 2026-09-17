@@ -14,7 +14,11 @@ use litebox::mm::{
 };
 use litebox::platform::page_mgmt::MemoryRegionPermissions as Permissions;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
-use litebox_common_macos::{PAGE_SIZE, PtRegs, loader::MachoParsedFile, user_pointers::UserPtrMut};
+use litebox_common_macos::{
+    PAGE_SIZE, PtRegs,
+    loader::{MachoParsedFile, VmProtection},
+    user_pointers::UserPtrMut,
+};
 use litebox_syscall_rewriter::{
     TargetHost,
     macho::{CodeMetadata, Rewriter},
@@ -22,7 +26,7 @@ use litebox_syscall_rewriter::{
 
 pub use litebox_common_macos::loader::MachoLoaderError;
 
-const STACK_SIZE: usize = 1024 * 1024;
+const STACK_SIZE: usize = 8 * 1024 * 1024;
 
 fn reserve<P: ShimPlatform>(
     pm: &PageManager<P, PAGE_SIZE>,
@@ -100,9 +104,18 @@ pub(crate) fn load<P: ShimPlatform>(
             .ok_or(MachoLoaderError::Memory)?;
         // Anonymous allocations are zero-filled, including BSS and padding.
         let mut protection = Permissions::empty();
-        protection.set(Permissions::READ, segment.protection & 1 != 0);
-        protection.set(Permissions::WRITE, segment.protection & 2 != 0);
-        protection.set(Permissions::EXEC, segment.protection & 4 != 0);
+        protection.set(
+            Permissions::READ,
+            segment.protection.contains(VmProtection::READ),
+        );
+        protection.set(
+            Permissions::WRITE,
+            segment.protection.contains(VmProtection::WRITE),
+        );
+        protection.set(
+            Permissions::EXEC,
+            segment.protection.contains(VmProtection::EXECUTE),
+        );
         // The macOS platform synchronizes instruction caches on RW -> RX.
         protect(pm, range, protection)?;
     }

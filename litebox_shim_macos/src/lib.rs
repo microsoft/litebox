@@ -3,31 +3,27 @@
 
 //! Minimal Darwin BSD shim for static AArch64 Mach-O guests.
 //!
-//! Guest mappings use LiteBox's page manager. The `test-stdio` feature enables
-//! a local I/O adapter with LiteBox-managed test descriptors. Filesystem,
-//! networking, and broker-backed stdio are unsupported.
+//! Guest mappings and file operations use LiteBox. The runner supplies inherited
+//! descriptors. Guest file opening and networking are unsupported.
 
 #![no_std]
 #![cfg(target_arch = "aarch64")]
 
 extern crate alloc;
 
-use alloc::{ffi::CString, sync::Arc, vec::Vec};
+use alloc::{ffi::CString, sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicI32, Ordering};
 use litebox::platform::page_mgmt::MemoryRegionPermissions as Permissions;
 use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
 use litebox::{
     LiteBox, mm::PageManager, platform::PageManagementProvider, sync::RawSyncPrimitivesProvider,
 };
-use litebox_common_macos::{PAGE_SIZE, PtRegs, SyscallRequest, TaskParams, errno::Errno};
+use litebox_common_macos::{
+    PAGE_SIZE, PtRegs, SIGINT, SIGSEGV, SyscallRequest, TaskParams, errno::Errno,
+};
 
 pub mod loader;
 pub mod syscalls;
-#[cfg(any(test, feature = "test-stdio"))]
-mod test_stdio;
-#[cfg(any(test, feature = "test-stdio"))]
-pub use test_stdio::Stdio;
-
 #[cfg(all(test, target_os = "macos"))]
 mod tests;
 
@@ -50,9 +46,8 @@ impl<
 
 pub struct MacosShimBuilder<P: ShimPlatform> {
     platform: &'static P,
-    litebox: LiteBox<P>,
-    #[cfg(any(test, feature = "test-stdio"))]
-    stdio: Option<Arc<dyn Stdio>>,
+    litebox: Arc<LiteBox<P>>,
+    files: Arc<syscalls::file::FilesState<P>>,
 }
 
 impl<P: ShimPlatform> MacosShimBuilder<P> {
@@ -63,11 +58,11 @@ impl<P: ShimPlatform> MacosShimBuilder<P> {
     /// Build a shim around an existing LiteBox instance. `platform` must be
     /// the same platform used to construct `litebox`.
     pub fn new_with_litebox(platform: &'static P, litebox: LiteBox<P>) -> Self {
+        let litebox = Arc::new(litebox);
         Self {
             platform,
+            files: Arc::new(syscalls::file::FilesState::new(Arc::clone(&litebox))),
             litebox,
-            #[cfg(any(test, feature = "test-stdio"))]
-            stdio: None,
         }
     }
 
@@ -75,30 +70,30 @@ impl<P: ShimPlatform> MacosShimBuilder<P> {
         &self.litebox
     }
 
-    /// Install a test-only local stdio adapter. Without an adapter, no standard
-    /// descriptors are installed and I/O returns EBADF.
-    #[cfg(any(test, feature = "test-stdio"))]
-    #[must_use]
-    pub fn with_stdio(mut self, stdio: Arc<dyn Stdio>) -> Self {
-        self.stdio = Some(stdio);
-        self
+    /// Transfer a LiteBox file into the guest's descriptor namespace.
+    /// `fd` must belong to this builder's LiteBox instance.
+    pub fn inherit_file(&mut self, fd: litebox::fs::FileFd) -> Result<u32, Errno> {
+        self.files.insert_file(fd)
     }
 
     pub fn build(self) -> MacosShim<P> {
-        let litebox = Arc::new(self.litebox);
-        MacosShim(Arc::new(GlobalState {
-            platform: self.platform,
-            pm: PageManager::new(&litebox),
-            #[cfg(any(test, feature = "test-stdio"))]
-            test_stdio: test_stdio::TestStdio::new(Arc::clone(&litebox), self.stdio),
-            _litebox: litebox,
-        }))
+        MacosShim {
+            global: Arc::new(GlobalState {
+                platform: self.platform,
+                pm: PageManager::new(&self.litebox),
+                litebox: self.litebox,
+            }),
+            files: self.files,
+        }
     }
 }
 
 /// One guest address space. Loading consumes the shim; the entrypoints retain
 /// its shared global state for the guest's lifetime.
-pub struct MacosShim<P: ShimPlatform>(Arc<GlobalState<P>>);
+pub struct MacosShim<P: ShimPlatform> {
+    global: Arc<GlobalState<P>>,
+    files: Arc<syscalls::file::FilesState<P>>,
+}
 
 impl<P: ShimPlatform> MacosShim<P> {
     pub fn load_program(
@@ -108,10 +103,11 @@ impl<P: ShimPlatform> MacosShim<P> {
         argv: Vec<CString>,
         envp: Vec<CString>,
     ) -> Result<LoadedProgram<P>, loader::MachoLoaderError> {
-        let initial_ctx = loader::load(&self.0.pm, self.0.platform, image, &argv, &envp)?;
+        let initial_ctx = loader::load(&self.global.pm, self.global.platform, image, &argv, &envp)?;
         let process = Process(Arc::new(AtomicI32::new(-1)));
         let task = Task {
-            global: self.0,
+            global: self.global,
+            files: self.files,
             params,
             process: process.clone(),
         };
@@ -153,11 +149,8 @@ pub struct MacosShimEntrypoints<P: ShimPlatform> {
 
 struct GlobalState<P: ShimPlatform> {
     platform: &'static P,
-    // Retain the LiteBox instance for the lifetime of the address space.
-    _litebox: Arc<LiteBox<P>>,
+    litebox: Arc<LiteBox<P>>,
     pm: PageManager<P, PAGE_SIZE>,
-    #[cfg(any(test, feature = "test-stdio"))]
-    test_stdio: test_stdio::TestStdio<P>,
 }
 
 impl<P: ShimPlatform> Drop for GlobalState<P> {
@@ -182,28 +175,27 @@ impl<P: ShimPlatform> Drop for GlobalState<P> {
 
 struct Task<P: ShimPlatform> {
     global: Arc<GlobalState<P>>,
+    files: Arc<syscalls::file::FilesState<P>>,
     params: TaskParams,
     process: Process,
 }
 
+const MAX_KERNEL_BUF_SIZE: usize = 64 * 1024;
+
 // Normalize typed syscall handler results for register write-back.
-#[cfg(any(test, feature = "test-stdio"))]
 trait ToSyscallResult {
     fn to_syscall_result(self) -> Result<usize, Errno>;
 }
-#[cfg(any(test, feature = "test-stdio"))]
 impl ToSyscallResult for Result<(), Errno> {
     fn to_syscall_result(self) -> Result<usize, Errno> {
         self.map(|()| 0)
     }
 }
-#[cfg(any(test, feature = "test-stdio"))]
 impl ToSyscallResult for Result<usize, Errno> {
     fn to_syscall_result(self) -> Result<usize, Errno> {
         self
     }
 }
-#[cfg(any(test, feature = "test-stdio"))]
 impl ToSyscallResult for Result<u32, Errno> {
     fn to_syscall_result(self) -> Result<usize, Errno> {
         self.map(|v| v as usize)
@@ -229,20 +221,35 @@ impl<P: ShimPlatform> Task<P> {
 
     fn do_syscall(&self, ctx: &PtRegs) -> Result<usize, Errno> {
         let request = SyscallRequest::try_from_raw(ctx.regs[16], ctx, |_| {})?;
-        #[cfg(any(test, feature = "test-stdio"))]
-        if let Some(result) = self.global.test_stdio.dispatch(self, request) {
-            return result;
-        }
         match request {
             SyscallRequest::Exit { status } => {
                 self.sys_exit(status);
                 Ok(0)
             }
-            // No production descriptor provider is installed.
-            SyscallRequest::Read { .. }
-            | SyscallRequest::Write { .. }
-            | SyscallRequest::Close { .. }
-            | SyscallRequest::Dup { .. } => Err(Errno::EBADF),
+            SyscallRequest::Read { fd, buf, count } => {
+                let fd = self.files.typed_fd(fd)?;
+                let length = Self::io_length(count)?;
+                self.check_user_buffer(buf.as_usize(), length, Permissions::WRITE)?;
+                let mut bytes = vec![0; length];
+                let size = self.do_read(&fd, &mut bytes)?;
+                if size != 0 {
+                    buf.copy_from_slice::<P>(0, &bytes[..size])
+                        .ok_or(Errno::EFAULT)?;
+                }
+                Ok(size)
+            }
+            SyscallRequest::Write { fd, buf, count } => {
+                let fd = self.files.typed_fd(fd)?;
+                let length = Self::io_length(count)?;
+                self.check_user_buffer(buf.as_usize(), length, Permissions::READ)?;
+                if length == 0 {
+                    return self.do_write(&fd, &[]);
+                }
+                let bytes = buf.to_owned_slice::<P>(length).ok_or(Errno::EFAULT)?;
+                self.do_write(&fd, &bytes)
+            }
+            SyscallRequest::Close { fd } => self.sys_close(fd).to_syscall_result(),
+            SyscallRequest::Dup { fd } => self.sys_dup(fd).to_syscall_result(),
             SyscallRequest::Getpid => Ok(self.sys_getpid().cast_unsigned() as usize),
             SyscallRequest::Getppid => Ok(self.sys_getppid().cast_unsigned() as usize),
             SyscallRequest::Getuid => Ok(self.sys_getuid() as usize),
@@ -250,6 +257,13 @@ impl<P: ShimPlatform> Task<P> {
             SyscallRequest::Getgid => Ok(self.sys_getgid() as usize),
             SyscallRequest::Getegid => Ok(self.sys_getegid() as usize),
         }
+    }
+
+    fn io_length(count: usize) -> Result<usize, Errno> {
+        if count > isize::MAX.cast_unsigned() {
+            return Err(Errno::EINVAL);
+        }
+        Ok(count.min(MAX_KERNEL_BUF_SIZE))
     }
 
     fn check_user_buffer(
@@ -282,7 +296,7 @@ impl<P: ShimPlatform> Task<P> {
                 .check_user_buffer(ctx.pc, 4, Permissions::EXEC)
                 .is_err()
         {
-            self.process.exit(128 + 11);
+            self.process.exit(128 + SIGSEGV);
             ContinueOperation::Terminate
         } else {
             ContinueOperation::Resume
@@ -305,13 +319,13 @@ impl<P: ShimPlatform> EnterShim for MacosShimEntrypoints<P> {
     fn exception(&self, _ctx: &mut PtRegs, _info: &ExceptionInfo) -> ContinueOperation {
         // Syscalls enter through the rewriter's direct callback. Unhandled
         // guest faults terminate the process.
-        self.task.process.exit(128 + 11);
+        self.task.process.exit(128 + SIGSEGV);
         ContinueOperation::Terminate
     }
 
     fn interrupt(&self, _ctx: &mut PtRegs) -> ContinueOperation {
         // Terminate interrupted guests because guest signal delivery is unsupported.
-        self.task.process.exit(128 + 2);
+        self.task.process.exit(128 + SIGINT);
         ContinueOperation::Terminate
     }
 }

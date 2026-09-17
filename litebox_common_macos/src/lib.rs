@@ -19,6 +19,11 @@ pub use syscall::SyscallRequest;
 /// Native Apple Silicon page size.
 pub const PAGE_SIZE: usize = 16384;
 
+/// Darwin interrupt signal.
+pub const SIGINT: i32 = 2;
+/// Darwin invalid-memory-reference signal.
+pub const SIGSEGV: i32 = 11;
+
 /// Virtual process credentials, not the runner's host identity.
 #[derive(Clone, Copy, Debug)]
 pub struct TaskParams {

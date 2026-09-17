@@ -47,10 +47,7 @@ pub enum GuestAbi {
 
 static GUEST_ABI: OnceLock<GuestAbi> = OnceLock::new();
 
-/// Configure the syscall convention for all guests in this host process.
-/// Repeating the same selection is allowed. Configure it before entering
-/// or spawning guest threads; it applies across all platform instances and
-/// page-size variants.
+/// Set the process-wide guest ABI before running or spawning guest threads.
 ///
 /// # Panics
 /// Panics if a different ABI has already been configured.
@@ -1823,7 +1820,6 @@ fn run_thread_inner_with_process(
     ctx: &mut PtRegs,
     process: Arc<ProcessState>,
 ) {
-    let guest_abi = guest_abi();
     initialize_thread_tls();
     assert!(
         read_tls(tls_offset::ACTIVE) == 0,
@@ -1844,7 +1840,7 @@ fn run_thread_inner_with_process(
         waker: Mutex::new(None),
     }));
     let mut thread_ctx = ThreadContext {
-        guest_abi,
+        guest_abi: guest_abi(),
         shim,
         ctx,
         host_sp: 0,
@@ -2009,7 +2005,8 @@ unsafe fn switch_to_guest(thread_ctx: &mut ThreadContext) -> ! {
 
 extern "C-unwind" fn syscall_handler(thread_ctx: &mut ThreadContext) {
     if thread_ctx.guest_abi == GuestAbi::Linux {
-        thread_ctx.ctx.regs[0] = (-38isize).cast_unsigned();
+        thread_ctx.ctx.regs[0] =
+            (litebox_common_linux::errno::Errno::ENOSYS.as_neg() as isize).cast_unsigned();
     }
     thread_ctx.call_shim(|shim, ctx| shim.syscall(ctx));
 }

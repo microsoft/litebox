@@ -56,8 +56,7 @@ pub enum SyscallRequest {
 }
 
 impl SyscallRequest {
-    /// Decode without dereferencing guest memory. Darwin allows eight register
-    /// arguments. C `int` arguments use the low 32 bits, including their sign.
+    /// Convert raw register arguments into a typed BSD syscall request.
     pub fn from_args(number: usize, args: [usize; 8]) -> Result<Self, Errno> {
         let int_arg = |i: usize| {
             // Truncate to the low 32 bits and interpret them as a signed C int.

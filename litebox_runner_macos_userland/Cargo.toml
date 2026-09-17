@@ -9,7 +9,10 @@ clap = { version = "4", features = ["derive"] }
 litebox_common_macos = { path = "../litebox_common_macos", version = "0.1.0" }
 litebox_platform_macos_userland = { path = "../litebox_platform_macos_userland", version = "0.1.0" }
 litebox_shim_macos = { path = "../litebox_shim_macos", version = "0.1.0" }
-libc = { version = "0.2", optional = true }
+litebox_broker_core = { path = "../litebox_broker_core", version = "0.1.0", features = ["test-support"], optional = true }
+litebox_broker_host = { path = "../litebox_broker_host", version = "0.1.0", features = ["test-support"], optional = true }
+litebox_broker_local = { path = "../litebox_broker_local", version = "0.1.0", optional = true }
+litebox_broker_protocol = { path = "../litebox_broker_protocol", version = "0.1.0", optional = true }
 litebox = { path = "../litebox", version = "0.1.0", optional = true }
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dev-dependencies]
@@ -18,8 +21,8 @@ litebox_syscall_rewriter = { path = "../litebox_syscall_rewriter", version = "0.
 litebox = { path = "../litebox", version = "0.1.0" }
 
 [features]
-# Tests only; production stdio must be broker-backed.
-test-stdio = ["litebox_shim_macos/test-stdio", "dep:libc", "dep:litebox"]
+# In-process broker fixture with buffered stdin and captured stdout/stderr.
+test-stdio = ["dep:litebox", "dep:litebox_broker_core", "dep:litebox_broker_host", "dep:litebox_broker_local", "dep:litebox_broker_protocol"]
 
 [lints]
 workspace = true

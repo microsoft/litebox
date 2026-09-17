@@ -8,6 +8,7 @@ use anyhow::{Context as _, Result, bail};
 use clap::Parser;
 use litebox_common_macos::TaskParams;
 use litebox_platform_macos_userland::{GuestAbi, MacosUserland, set_guest_abi};
+#[cfg(not(feature = "test-stdio"))]
 use litebox_shim_macos::MacosShimBuilder;
 use std::ffi::CString;
 
@@ -23,7 +24,7 @@ pub struct CliArgs {
 }
 
 #[cfg(feature = "test-stdio")]
-mod test_stdio;
+mod test_broker;
 
 pub fn run(cli_args: CliArgs) -> Result<i32> {
     set_guest_abi(GuestAbi::Darwin);
@@ -43,10 +44,11 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         .map(|s| CString::new(s.as_bytes()))
         .collect::<Result<Vec<_>, _>>()
         .context("NUL in environment entry")?;
-    let builder = MacosShimBuilder::new(MacosUserland::new());
-    // The test-stdio feature connects guest standard streams to host stdio.
+    let platform = MacosUserland::new();
+    #[cfg(not(feature = "test-stdio"))]
+    let builder = MacosShimBuilder::new(platform);
     #[cfg(feature = "test-stdio")]
-    let builder = builder.with_stdio(std::sync::Arc::new(test_stdio::HostStdio));
+    let (builder, stdio) = test_broker::setup(platform)?;
     let program = builder
         .build()
         .load_program(TaskParams::default(), &data, argv, envp)
@@ -61,6 +63,8 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
     unsafe {
         litebox_platform_macos_userland::run_thread(entrypoints, &mut initial_ctx);
     }
+    #[cfg(feature = "test-stdio")]
+    test_broker::flush_output(&stdio)?;
     process
         .exit_status()
         .context("guest stopped without an exit status")

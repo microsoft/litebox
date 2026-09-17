@@ -3,7 +3,10 @@
 
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
-use litebox_common_macos::{TaskParams, loader::MachoParsedFile};
+use litebox_common_macos::{
+    TaskParams,
+    loader::{MachoParsedFile, VmProtection},
+};
 #[cfg(feature = "test-stdio")]
 use std::io::Write as _;
 use std::{
@@ -85,7 +88,7 @@ fn assert_svc_gates(original: &[u8], rewritten: &[u8]) -> usize {
     let rewriter = Rewriter::new(TargetHost::MacOs).unwrap();
     let mut count = 0;
     for segment in &plan.segments {
-        if segment.protection & 4 == 0 {
+        if !segment.protection.contains(VmProtection::EXECUTE) {
             continue;
         }
         for range in metadata
@@ -302,7 +305,7 @@ fn loader_teardown_and_argument_limit() {
         }
     }
 
-    let huge_arg = std::ffi::CString::new(vec![b'a'; 2 * 1024 * 1024]).unwrap();
+    let huge_arg = std::ffi::CString::new(vec![b'a'; 9 * 1024 * 1024]).unwrap();
     let result = MacosShimBuilder::new(platform).build().load_program(
         TaskParams::default(),
         &data,

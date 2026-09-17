@@ -1,9 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Typed BSD process syscall implementations.
+//! Typed BSD syscall implementations.
 
 use crate::{ShimPlatform, Task};
+
+pub(crate) mod file;
 
 impl<P: ShimPlatform> Task<P> {
     pub(crate) fn sys_exit(&self, status: i32) {
