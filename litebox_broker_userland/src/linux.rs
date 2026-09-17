@@ -71,7 +71,7 @@ pub(super) fn run(mut args: super::CliArgs) -> Result<(), Box<dyn Error>> {
             &control_listener,
         )
     } else {
-        crate::run_runner_supervisor(&args, proxy_url.as_deref(), broker)
+        crate::run_runner_instance(&args, proxy_url.as_deref(), broker)
     }
 }
 

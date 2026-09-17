@@ -184,7 +184,7 @@ fn runner_command_arguments(
 }
 
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
-fn run_runner_supervisor(
+fn run_runner_instance(
     args: &CliArgs,
     proxy_url: Option<&str>,
     broker: BrokerCore,
@@ -202,8 +202,8 @@ fn run_runner_supervisor(
     if let Some(proxy_url) = proxy_url {
         config = config.with_proxy_url(proxy_url.to_owned());
     }
-    let mut runner_results = litebox_broker_userland::supervisor::RunnerSupervisor::new(broker)
-        .run_to_completion(vec![config]);
+    let mut runner_results =
+        litebox_broker_userland::runner::run_all_to_completion(broker, vec![config]);
     let runner_status = runner_results
         .pop()
         .expect("one configured runner must produce one result")?;

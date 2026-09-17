@@ -39,7 +39,7 @@ pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
         let control_listener = WindowsNamedPipeListener::bind(&control_pipe)?;
         run_runner_in_process(&args, &control_pipe, &broker, control_listener)
     } else {
-        crate::run_runner_supervisor(&args, None, broker)
+        crate::run_runner_instance(&args, None, broker)
     }
 }
 

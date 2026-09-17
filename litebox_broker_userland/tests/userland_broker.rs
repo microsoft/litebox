@@ -19,8 +19,7 @@ use litebox_broker_protocol::shared_buffer::{
 use litebox_broker_protocol::socket::{ReceiveFromFlags, SendFlags, SocketConnectionStatus};
 use litebox_broker_transport::control_ring::ControlRing;
 use litebox_broker_transport_linux_userland::unix_socket::UnixStreamLocalSetupChannel;
-use litebox_broker_userland::runner::RunnerConfig;
-use litebox_broker_userland::supervisor::RunnerSupervisor;
+use litebox_broker_userland::runner::{RunnerConfig, run_all_to_completion};
 
 const RUNNER_ARGUMENT: &str = "broker-userland-test-runner";
 const NETWORK_RUNNER_ARGUMENT: &str = "broker-userland-network-test-runner";
@@ -118,8 +117,7 @@ fn run_supervisor_test(test_executable: &Path) {
         runner_config(SUPERVISOR_FIRST_RUNNER_ARGUMENT),
         runner_config(SUPERVISOR_SECOND_RUNNER_ARGUMENT),
     ];
-    let supervisor =
-        std::thread::spawn(move || RunnerSupervisor::new(broker).run_to_completion(runners));
+    let runners = std::thread::spawn(move || run_all_to_completion(broker, runners));
 
     let deadline = Instant::now() + BROKER_PROCESS_TIMEOUT;
     let mut first = None;
@@ -168,7 +166,7 @@ fn run_supervisor_test(test_executable: &Path) {
     second.write_all(&[SUPERVISOR_EXIT]).unwrap();
     assert_eq!(second.read(&mut unexpected).unwrap(), 0);
 
-    let mut runner_results = supervisor.join().unwrap().into_iter();
+    let mut runner_results = runners.join().unwrap().into_iter();
     assert_eq!(
         runner_results.next().unwrap().unwrap().code(),
         Some(SUPERVISOR_FIRST_EXIT_CODE)
