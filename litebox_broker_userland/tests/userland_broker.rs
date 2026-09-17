@@ -2,12 +2,15 @@
 // Licensed under the MIT license.
 
 use std::ffi::{OsStr, OsString};
-use std::io::{ErrorKind, Result};
+use std::io::{ErrorKind, Read, Result, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Child, Command};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use litebox_broker_core::test_support::TestBrokerCoreBuilder;
+use litebox_broker_core::{ObjectRights, PolicyEngine};
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::{
@@ -16,10 +19,20 @@ use litebox_broker_protocol::shared_buffer::{
 use litebox_broker_protocol::socket::{ReceiveFromFlags, SendFlags, SocketConnectionStatus};
 use litebox_broker_transport::control_ring::ControlRing;
 use litebox_broker_transport_linux_userland::unix_socket::UnixStreamLocalSetupChannel;
+use litebox_broker_userland::runner::RunnerConfig;
+use litebox_broker_userland::supervisor::RunnerSupervisor;
 
 const RUNNER_ARGUMENT: &str = "broker-userland-test-runner";
 const NETWORK_RUNNER_ARGUMENT: &str = "broker-userland-network-test-runner";
+const SUPERVISOR_FIRST_RUNNER_ARGUMENT: &str = "broker-userland-supervisor-first-runner";
+const SUPERVISOR_SECOND_RUNNER_ARGUMENT: &str = "broker-userland-supervisor-second-runner";
 const BROKER_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
+const SUPERVISOR_EXIT: u8 = 0;
+const SUPERVISOR_CHECK_BROKER: u8 = 1;
+const SUPERVISOR_BROKER_OK: u8 = 2;
+const SUPERVISOR_FIRST_RUNNER: u8 = 3;
+const SUPERVISOR_SECOND_RUNNER: u8 = 4;
+const SUPERVISOR_FIRST_EXIT_CODE: i32 = 7;
 
 fn main() {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
@@ -38,11 +51,11 @@ fn run_parent_test() {
     // runner. Cargo starts this executable without broker args, so it runs the
     // parent path here. The broker then starts the same executable with the real
     // runner argv (`--unstable --broker-control-channel <path>`), which runs
-    // `run_fake_runner`. After
-    // the fake runner finishes its broker requests, it terminates the broker
-    // parent process; this lets the test exercise the long-running broker
-    // without a test-only shutdown path.
+    // `run_fake_runner`. After the fake runner finishes its broker requests,
+    // the broker exits naturally when its sole runner and association drain.
     let test_executable = std::env::current_exe().unwrap();
+    run_supervisor_test(&test_executable);
+
     let mut event_command = Command::new(env!("CARGO_BIN_EXE_litebox-broker-userland"));
     event_command
         .arg("--runner")
@@ -80,6 +93,88 @@ fn run_parent_test() {
         .arg(udp_port.to_string());
     wait_for_broker(network_command);
     server.join().unwrap();
+}
+
+fn run_supervisor_test(test_executable: &Path) {
+    let coordinator = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    coordinator.set_nonblocking(true).unwrap();
+    let coordinator_port = coordinator.local_addr().unwrap().port();
+    let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_host_guaranteed_rights(
+        ObjectRights::all(),
+    ))
+    .build()
+    .unwrap();
+    let runner_executable = test_executable.to_owned();
+    let runner_config = |argument| {
+        RunnerConfig::new(
+            runner_executable.clone(),
+            vec![
+                OsString::from(argument),
+                OsString::from(coordinator_port.to_string()),
+            ],
+        )
+    };
+    let runners = vec![
+        runner_config(SUPERVISOR_FIRST_RUNNER_ARGUMENT),
+        runner_config(SUPERVISOR_SECOND_RUNNER_ARGUMENT),
+    ];
+    let supervisor =
+        std::thread::spawn(move || RunnerSupervisor::new(broker).run_to_completion(runners));
+
+    let deadline = Instant::now() + BROKER_PROCESS_TIMEOUT;
+    let mut first = None;
+    let mut second = None;
+    while (first.is_none() || second.is_none()) && Instant::now() < deadline {
+        match coordinator.accept() {
+            Ok((mut runner, _address)) => {
+                runner
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                runner
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut registration = [0; 5];
+                runner.read_exact(&mut registration).unwrap();
+                let process_id = u32::from_ne_bytes(registration[1..].try_into().unwrap());
+                match registration[0] {
+                    SUPERVISOR_FIRST_RUNNER => {
+                        assert!(first.replace((runner, process_id)).is_none());
+                    }
+                    SUPERVISOR_SECOND_RUNNER => {
+                        assert!(second.replace((runner, process_id)).is_none());
+                    }
+                    runner => panic!("unexpected supervised runner {runner}"),
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("failed to accept supervised runner: {error}"),
+        }
+    }
+
+    let (mut first, first_process_id) = first.expect("first supervised runner did not connect");
+    let (mut second, second_process_id) = second.expect("second supervised runner did not connect");
+    assert_ne!(first_process_id, second_process_id);
+
+    first.write_all(&[SUPERVISOR_EXIT]).unwrap();
+    let mut unexpected = [0];
+    assert_eq!(first.read(&mut unexpected).unwrap(), 0);
+
+    second.write_all(&[SUPERVISOR_CHECK_BROKER]).unwrap();
+    let mut response = [0];
+    second.read_exact(&mut response).unwrap();
+    assert_eq!(response[0], SUPERVISOR_BROKER_OK);
+    second.write_all(&[SUPERVISOR_EXIT]).unwrap();
+    assert_eq!(second.read(&mut unexpected).unwrap(), 0);
+
+    let mut runner_results = supervisor.join().unwrap().into_iter();
+    assert_eq!(
+        runner_results.next().unwrap().unwrap().code(),
+        Some(SUPERVISOR_FIRST_EXIT_CODE)
+    );
+    assert!(runner_results.next().unwrap().unwrap().success());
+    assert!(runner_results.next().is_none());
 }
 
 fn wait_for_broker(mut command: Command) {
@@ -128,6 +223,44 @@ fn run_fake_runner(args: &[OsString]) {
     })
     .unwrap();
     let local = Arc::new(local);
+
+    let runner_argument = args.get(3).and_then(|argument| argument.to_str());
+    if matches!(
+        runner_argument,
+        Some(SUPERVISOR_FIRST_RUNNER_ARGUMENT | SUPERVISOR_SECOND_RUNNER_ARGUMENT)
+    ) {
+        assert_eq!(args.len(), 5, "unexpected runner arguments: {args:?}");
+        let coordinator_port = args[4].to_str().unwrap().parse::<u16>().unwrap();
+        let mut coordinator =
+            TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, coordinator_port)).unwrap();
+        coordinator
+            .write_all(&[
+                if runner_argument == Some(SUPERVISOR_FIRST_RUNNER_ARGUMENT) {
+                    SUPERVISOR_FIRST_RUNNER
+                } else {
+                    SUPERVISOR_SECOND_RUNNER
+                },
+            ])
+            .unwrap();
+        coordinator
+            .write_all(&local.process_id().0.to_ne_bytes())
+            .unwrap();
+
+        let mut command = [0];
+        coordinator.read_exact(&mut command).unwrap();
+        if runner_argument == Some(SUPERVISOR_FIRST_RUNNER_ARGUMENT) {
+            assert_eq!(command[0], SUPERVISOR_EXIT);
+            std::process::exit(SUPERVISOR_FIRST_EXIT_CODE);
+        }
+
+        assert_eq!(command[0], SUPERVISOR_CHECK_BROKER);
+        let handle = local.create_event_with_count(0).unwrap();
+        local.close_object(handle).unwrap();
+        coordinator.write_all(&[SUPERVISOR_BROKER_OK]).unwrap();
+        coordinator.read_exact(&mut command).unwrap();
+        assert_eq!(command[0], SUPERVISOR_EXIT);
+        return;
+    }
 
     if args.get(3).and_then(|argument| argument.to_str()) == Some(NETWORK_RUNNER_ARGUMENT) {
         assert_eq!(args.len(), 6, "unexpected runner arguments: {args:?}");

@@ -184,10 +184,10 @@ fn runner_command_arguments(
 }
 
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
-fn run_runner_instance(
+fn run_runner_supervisor(
     args: &CliArgs,
     proxy_url: Option<&str>,
-    broker: &BrokerCore,
+    broker: BrokerCore,
 ) -> Result<(), Box<dyn Error>> {
     let runner_path = args.runner.as_ref().ok_or_else(|| {
         IoError::new(
@@ -202,8 +202,11 @@ fn run_runner_instance(
     if let Some(proxy_url) = proxy_url {
         config = config.with_proxy_url(proxy_url.to_owned());
     }
-    let runner_status = litebox_broker_userland::runner::RunnerInstance::start(config)?
-        .run_to_completion(broker)?;
+    let mut runner_results = litebox_broker_userland::supervisor::RunnerSupervisor::new(broker)
+        .run_to_completion(vec![config]);
+    let runner_status = runner_results
+        .pop()
+        .expect("one configured runner must produce one result")?;
     if !runner_status.success() {
         return Err(IoError::other(format!("runner exited with {runner_status}")).into());
     }
