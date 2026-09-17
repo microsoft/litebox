@@ -28,3 +28,4 @@ workspace = true
 
 [dev-dependencies]
 litebox_platform_linux_userland = { path = "../litebox_platform_linux_userland/", version = "0.1.0", default-features = false, features = ["optee_syscall"] }
+tempfile = "3"
