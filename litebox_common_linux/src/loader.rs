@@ -93,6 +93,13 @@ struct TrampolineHeader32 {
     trampoline_size: u32,
 }
 
+/// Size in bytes of the trampoline footer for the target architecture.
+pub const TRAMPOLINE_HEADER_SIZE: usize = if cfg!(target_pointer_width = "64") {
+    size_of::<TrampolineHeader64>()
+} else {
+    size_of::<TrampolineHeader32>()
+};
+
 const CLASS: elf::file::Class = if cfg!(target_pointer_width = "64") {
     elf::file::Class::ELF64
 } else {
@@ -265,11 +272,7 @@ impl ElfParsedFile {
 
         let file_size = file.size().map_err(ElfParseError::Io)?;
 
-        let header_size = if cfg!(target_pointer_width = "64") {
-            size_of::<TrampolineHeader64>()
-        } else {
-            size_of::<TrampolineHeader32>()
-        };
+        let header_size = TRAMPOLINE_HEADER_SIZE;
 
         // File must be large enough to contain the header
         if file_size < header_size as u64 {
@@ -279,7 +282,7 @@ impl ElfParsedFile {
 
         // Read the header from the end of the file
         let header_offset = file_size - header_size as u64;
-        let mut header_buf = [0u8; size_of::<TrampolineHeader64>()]; // Max header size
+        let mut header_buf = [0u8; TRAMPOLINE_HEADER_SIZE];
         file.read_at(header_offset, &mut header_buf[..header_size])
             .map_err(ElfParseError::Io)?;
 
