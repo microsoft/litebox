@@ -19,7 +19,7 @@ use litebox::{
     LiteBox, mm::PageManager, platform::PageManagementProvider, sync::RawSyncPrimitivesProvider,
 };
 use litebox_common_macos::{
-    PAGE_SIZE, PtRegs, SIGINT, SIGSEGV, SyscallRequest, TaskParams, errno::Errno,
+    PAGE_SIZE, PtRegs, SIGINT, SIGSEGV, STACK_ALIGNMENT, SyscallRequest, TaskParams, errno::Errno,
 };
 
 pub mod loader;
@@ -290,10 +290,10 @@ impl<P: ShimPlatform> Task<P> {
     fn continuation(&self, ctx: &PtRegs) -> ContinueOperation {
         if self.process.exit_status().is_some() {
             ContinueOperation::Terminate
-        } else if !ctx.pc.is_multiple_of(4)
-            || !ctx.sp.is_multiple_of(16)
+        } else if !ctx.pc.is_multiple_of(size_of::<u32>())
+            || !ctx.sp.is_multiple_of(STACK_ALIGNMENT)
             || self
-                .check_user_buffer(ctx.pc, 4, Permissions::EXEC)
+                .check_user_buffer(ctx.pc, size_of::<u32>(), Permissions::EXEC)
                 .is_err()
         {
             self.process.exit(128 + SIGSEGV);

@@ -7,7 +7,7 @@
 //! Dynamic linking and relocations are unsupported.
 //! Images are slid as a unit, so guest code must be position independent.
 
-use crate::PAGE_SIZE;
+use crate::{PAGE_SIZE, VmProtection};
 use alloc::{vec, vec::Vec};
 use core::ops::Range;
 use object::{
@@ -16,20 +16,35 @@ use object::{
 };
 use zerocopy::{
     FromBytes, Immutable, IntoBytes, KnownLayout,
-    byteorder::{LittleEndian, U64},
+    byteorder::{LittleEndian, U32, U64},
 };
 
-bitflags::bitflags! {
-    /// Mach virtual-memory protections.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct VmProtection: u32 {
-        const READ = macho::VM_PROT_READ;
-        const WRITE = macho::VM_PROT_WRITE;
-        const EXECUTE = macho::VM_PROT_EXECUTE;
-    }
+const TRAMPOLINE_FILE_ALIGNMENT: usize = 4096;
+const MACH_HEADER_SIZE: usize = size_of::<macho::MachHeader64<LE>>();
+const ARM_THREAD_STATE64: u32 = 6;
+
+/// Mach ARM_THREAD_STATE64 payload.
+#[repr(C)]
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout)]
+struct Aarch64ThreadState64 {
+    x: [U64<LittleEndian>; 29],
+    fp: U64<LittleEndian>,
+    lr: U64<LittleEndian>,
+    sp: U64<LittleEndian>,
+    pc: U64<LittleEndian>,
+    cpsr: U32<LittleEndian>,
+    pad: U32<LittleEndian>,
 }
 
-const TRAMPOLINE_FILE_ALIGNMENT: usize = 4096;
+#[repr(C)]
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout)]
+struct UnixThreadCommand64 {
+    cmd: U32<LittleEndian>,
+    cmdsize: U32<LittleEndian>,
+    flavor: U32<LittleEndian>,
+    count: U32<LittleEndian>,
+    state: Aarch64ThreadState64,
+}
 
 /// On-disk AOT footer, with explicitly little-endian fields.
 #[repr(C)]
@@ -159,13 +174,12 @@ impl MachoParsedFile {
         }
         // object requires aligned storage. Only the header and load commands
         // need it; segment contents and the AOT payload need not be copied.
-        let mut header_storage = [0u64; 4];
-        let header_bytes = data
-            .get(..size_of_val(&header_storage))
-            .ok_or(Invalid("header"))?;
-        header_storage.as_mut_bytes().copy_from_slice(header_bytes);
-        let header = macho::MachHeader64::<LE>::parse(header_storage.as_bytes(), 0)
-            .map_err(|_| Invalid("header"))?;
+        let mut header_storage = [0u64; MACH_HEADER_SIZE.div_ceil(size_of::<u64>())];
+        let header_bytes = data.get(..MACH_HEADER_SIZE).ok_or(Invalid("header"))?;
+        header_storage.as_mut_bytes()[..MACH_HEADER_SIZE].copy_from_slice(header_bytes);
+        let header =
+            macho::MachHeader64::<LE>::parse(&header_storage.as_bytes()[..MACH_HEADER_SIZE], 0)
+                .map_err(|_| Invalid("header"))?;
         if !header.is_little_endian()
             || header.cputype(LE) != macho::CPU_TYPE_ARM64
             || !matches!(
@@ -179,13 +193,13 @@ impl MachoParsedFile {
         if header.flags(LE) & (macho::MH_DYLDLINK | macho::MH_DYLIB_IN_CACHE) != 0 {
             return Err(Unsupported("dynamically linked/shared-cache image"));
         }
-        let metadata_len = size_of_val(&header_storage)
+        let metadata_len = MACH_HEADER_SIZE
             .checked_add(
                 usize::try_from(header.sizeofcmds(LE)).map_err(|_| Invalid("load commands"))?,
             )
             .ok_or(Invalid("load commands"))?;
         let metadata = data.get(..metadata_len).ok_or(Invalid("load commands"))?;
-        let mut aligned = vec![0u64; metadata_len.div_ceil(8)];
+        let mut aligned = vec![0u64; metadata_len.div_ceil(size_of::<u64>())];
         aligned.as_mut_bytes()[..metadata_len].copy_from_slice(metadata);
         let mut commands = header
             .load_commands(LE, &aligned.as_bytes()[..metadata_len], 0)
@@ -205,22 +219,18 @@ impl MachoParsedFile {
                     return Err(Unsupported("dynamic linking/LC_MAIN/fixups"));
                 }
                 macho::LC_UNIXTHREAD => {
-                    let bytes = command.raw_data();
-                    // ARM_THREAD_STATE64: flavor 6, count 68 u32 words.
-                    if bytes.len() != 16 + 68 * 4
-                        || bytes[8..12] != 6u32.to_le_bytes()
-                        || bytes[12..16] != 68u32.to_le_bytes()
+                    let thread = UnixThreadCommand64::read_from_bytes(command.raw_data())
+                        .map_err(|_| Invalid("AArch64 thread state"))?;
+                    let state_words = size_of::<Aarch64ThreadState64>() / size_of::<u32>();
+                    if thread.flavor.get() != ARM_THREAD_STATE64
+                        || usize::try_from(thread.count.get()).ok() != Some(state_words)
                         || entry.is_some()
                     {
                         return Err(Invalid("AArch64 thread state"));
                     }
                     entry = Some(
-                        usize::try_from(u64::from_le_bytes(
-                            bytes[272..280]
-                                .try_into()
-                                .map_err(|_| Invalid("thread PC"))?,
-                        ))
-                        .map_err(|_| Invalid("entry address overflow"))?,
+                        usize::try_from(thread.state.pc.get())
+                            .map_err(|_| Invalid("entry address overflow"))?,
                     );
                 }
                 macho::LC_SEGMENT_64 => {
@@ -256,14 +266,14 @@ impl MachoParsedFile {
                     let file_end = offset
                         .checked_add(file_size)
                         .ok_or(Invalid("file range overflow"))?;
-                    let protection = VmProtection::from_bits(seg.initprot.get(LE))
+                    let protection = VmProtection::from_bits(seg.initprot.get(LE).cast_signed())
                         .ok_or(Invalid("segment protection"))?;
                     if file_size > size
                         || file_end > data.len()
                         || !start.is_multiple_of(PAGE_SIZE)
                         || !size.is_multiple_of(PAGE_SIZE)
                     {
-                        return Err(Invalid("segment bounds/alignment/protection"));
+                        return Err(Invalid("segment bounds/alignment"));
                     }
                     if protection.contains(VmProtection::WRITE | VmProtection::EXECUTE) {
                         return Err(Unsupported("writable executable segment"));
@@ -301,7 +311,7 @@ impl MachoParsedFile {
             return Err(Unsupported("image larger than 256 MiB"));
         }
         let entry = entry.ok_or(Unsupported("missing LC_UNIXTHREAD"))?;
-        if !entry.is_multiple_of(4)
+        if !entry.is_multiple_of(size_of::<u32>())
             || !segments.iter().any(|s| {
                 s.protection.contains(VmProtection::EXECUTE)
                     && (s.virtual_range.start..s.virtual_range.start + s.file_range.len())
@@ -332,7 +342,12 @@ mod tests {
             (20, 72 + 288),
             (32, macho::LC_SEGMENT_64),
             (36, 72),
-            (92, (VmProtection::READ | VmProtection::EXECUTE).bits()),
+            (
+                92,
+                (VmProtection::READ | VmProtection::EXECUTE)
+                    .bits()
+                    .cast_unsigned(),
+            ),
             (104, macho::LC_UNIXTHREAD),
             (108, 288),
             (112, 6),
@@ -371,6 +386,14 @@ mod tests {
             assert!(
                 MachoParsedFile::parse(&bad).is_err(),
                 "offset={offset} value={value:#x}"
+            );
+        }
+        for (offset, value) in [(112, 0u32), (116, 67), (116, 69), (108, 280), (92, 1 << 31)] {
+            let mut bad = data.clone();
+            bad[offset..offset + size_of::<u32>()].copy_from_slice(&value.to_le_bytes());
+            assert!(
+                MachoParsedFile::parse(&bad).is_err(),
+                "accepted invalid field at {offset}"
             );
         }
         let mut writable_code = data;

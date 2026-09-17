@@ -15,8 +15,7 @@ use litebox::mm::{
 use litebox::platform::page_mgmt::MemoryRegionPermissions as Permissions;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox_common_macos::{
-    PAGE_SIZE, PtRegs,
-    loader::{MachoParsedFile, VmProtection},
+    PAGE_SIZE, PtRegs, STACK_ALIGNMENT, VmProtection, loader::MachoParsedFile,
     user_pointers::UserPtrMut,
 };
 use litebox_syscall_rewriter::{
@@ -85,7 +84,7 @@ pub(crate) fn load<P: ShimPlatform>(
             .guest_thread_pointer_offset()
             .and_then(|offset| u16::try_from(offset).ok())
             .ok_or(MachoLoaderError::Rewrite)?;
-        gates[..8].copy_from_slice(&callback.to_le_bytes());
+        gates[..size_of::<usize>()].copy_from_slice(&callback.to_le_bytes());
         rewriter
             .finalize_trampoline_gates(&mut gates, tls_offset)
             .map_err(|_| MachoLoaderError::Rewrite)?;
@@ -183,7 +182,7 @@ fn stack_image(
         .checked_sub(string_bytes)
         .and_then(|position| position.checked_sub(pointer_bytes))
         .ok_or(MachoLoaderError::ArgumentsTooLarge)?
-        & !15;
+        & !(STACK_ALIGNMENT - 1);
     let mut bytes = vec![0u8; size - sp];
     let mut position = bytes.len();
     let mut pointers = vec![argv.len()];
@@ -200,7 +199,7 @@ fn stack_image(
     }
     pointers.push(0); // empty apple[]
     for (slot, value) in bytes[..pointer_bytes]
-        .as_chunks_mut::<8>()
+        .as_chunks_mut::<{ size_of::<usize>() }>()
         .0
         .iter_mut()
         .zip(pointers)

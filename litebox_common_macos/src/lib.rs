@@ -16,8 +16,21 @@ pub mod syscall;
 pub use litebox_common_linux::{PtRegs, user_pointers};
 pub use syscall::SyscallRequest;
 
+bitflags::bitflags! {
+    /// Mach virtual-memory protections.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct VmProtection: core::ffi::c_int {
+        const READ = object::macho::VM_PROT_READ.cast_signed();
+        const WRITE = object::macho::VM_PROT_WRITE.cast_signed();
+        const EXECUTE = object::macho::VM_PROT_EXECUTE.cast_signed();
+    }
+}
+
 /// Native Apple Silicon page size.
 pub const PAGE_SIZE: usize = 16384;
+
+/// AArch64 user-stack alignment in bytes.
+pub const STACK_ALIGNMENT: usize = 16;
 
 /// Darwin interrupt signal.
 pub const SIGINT: i32 = 2;

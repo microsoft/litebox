@@ -3,10 +3,7 @@
 
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
-use litebox_common_macos::{
-    TaskParams,
-    loader::{MachoParsedFile, VmProtection},
-};
+use litebox_common_macos::{TaskParams, VmProtection, loader::MachoParsedFile};
 #[cfg(feature = "test-stdio")]
 use std::io::Write as _;
 use std::{

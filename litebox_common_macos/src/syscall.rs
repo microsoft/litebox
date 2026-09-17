@@ -3,6 +3,8 @@
 
 //! Typed BSD syscall decoding.
 
+use litebox::utils::{ReinterpretSignedExt as _, TruncateExt as _};
+
 use crate::{
     errno::Errno,
     user_pointers::{UserPtr, UserPtrMut},
@@ -58,11 +60,7 @@ pub enum SyscallRequest {
 impl SyscallRequest {
     /// Convert raw register arguments into a typed BSD syscall request.
     pub fn from_args(number: usize, args: [usize; 8]) -> Result<Self, Errno> {
-        let int_arg = |i: usize| {
-            // Truncate to the low 32 bits and interpret them as a signed C int.
-            let bytes = args[i].to_le_bytes();
-            i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-        };
+        let int_arg = |i: usize| -> i32 { args[i].reinterpret_as_signed().trunc() };
         Ok(match number {
             nr::EXIT => Self::Exit { status: int_arg(0) },
             nr::READ | nr::READ_NOCANCEL => Self::Read {
