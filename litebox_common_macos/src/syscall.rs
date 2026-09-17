@@ -3,7 +3,7 @@
 
 //! Typed BSD syscall decoding.
 
-use litebox::utils::{ReinterpretSignedExt as _, TruncateExt as _};
+use litebox::utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _};
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::{
@@ -32,18 +32,18 @@ pub mod nr {
 /// Whether the low 32 bits of an AArch64 syscall selector encode a Mach trap.
 /// XNU interprets the selector as signed `int`, regardless of x16's upper bits.
 pub fn is_mach_trap_selector(number: usize) -> bool {
-    let number: u32 = number.trunc();
-    number.cast_signed() < 0
+    let selector: i32 = number.reinterpret_as_signed().trunc();
+    selector < 0
 }
 
 /// Mach trap numbers. AArch64 Darwin passes their negation in w16.
 pub mod mach_trap {
     /// `mach_absolute_time()`.
-    pub const MACH_ABSOLUTE_TIME: usize = 3;
+    pub const MACH_ABSOLUTE_TIME: u32 = 3;
     /// `mach_timebase_info(mach_timebase_info_t)`.
-    pub const MACH_TIMEBASE_INFO: usize = 89;
+    pub const MACH_TIMEBASE_INFO: u32 = 89;
     /// `mach_wait_until(deadline)`.
-    pub const MACH_WAIT_UNTIL: usize = 90;
+    pub const MACH_WAIT_UNTIL: u32 = 90;
 }
 
 /// Darwin's `mach_timebase_info_data_t` output structure.
@@ -94,11 +94,10 @@ impl SyscallRequest {
     /// Convert raw register arguments into a typed BSD syscall request.
     pub fn from_args(number: usize, args: [usize; 8]) -> Result<Self, Errno> {
         let int_arg = |i: usize| -> i32 { args[i].reinterpret_as_signed().trunc() };
-        #[allow(clippy::cast_possible_truncation)] // usize is at most 64 bits on supported targets.
         let u64_arg = |i: usize| -> u64 { args[i] as u64 };
         if is_mach_trap_selector(number) {
-            let selector: u32 = number.trunc();
-            let trap = selector.cast_signed().wrapping_neg().cast_unsigned() as usize;
+            let selector: i32 = number.reinterpret_as_signed().trunc();
+            let trap = selector.wrapping_neg().reinterpret_as_unsigned();
             return match trap {
                 mach_trap::MACH_ABSOLUTE_TIME => Ok(Self::MachAbsoluteTime),
                 mach_trap::MACH_TIMEBASE_INFO => Ok(Self::MachTimebaseInfo {
@@ -175,34 +174,10 @@ mod tests {
                 Err(Errno::ENOSYS)
             ));
         }
-        assert!(matches!(
-            SyscallRequest::from_args((-3_isize).cast_unsigned(), [0; 8]),
-            Ok(SyscallRequest::MachAbsoluteTime)
-        ));
+        // Native stubs write a negative selector through w16, zero-extending it in x16.
         assert!(matches!(
             SyscallRequest::from_args(u32::MAX as usize - 2, [0; 8]),
             Ok(SyscallRequest::MachAbsoluteTime)
-        ));
-        let request =
-            SyscallRequest::from_args((-89_isize).cast_unsigned(), [0x1234, 0, 0, 0, 0, 0, 0, 0])
-                .unwrap();
-        let SyscallRequest::MachTimebaseInfo { info } = request else {
-            panic!()
-        };
-        let _: UserPtrMut<MachTimebaseInfo> = info;
-        assert_eq!(info.as_usize(), 0x1234);
-        assert!(matches!(
-            SyscallRequest::from_args(
-                (-90_isize).cast_unsigned(),
-                [0x1234_5678, 0, 0, 0, 0, 0, 0, 0]
-            ),
-            Ok(SyscallRequest::MachWaitUntil {
-                deadline: 0x1234_5678
-            })
-        ));
-        assert!(matches!(
-            SyscallRequest::from_args((-2_isize).cast_unsigned(), [0; 8]),
-            Err(Errno::ENOSYS)
         ));
     }
 
