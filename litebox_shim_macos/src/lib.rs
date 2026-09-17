@@ -32,6 +32,7 @@ pub trait ShimPlatform:
     PageManagementProvider<PAGE_SIZE>
     + RawSyncPrimitivesProvider
     + litebox::platform::SystemInfoProvider
+    + litebox_common_macos::MachClock
     + 'static
 {
 }
@@ -39,6 +40,7 @@ impl<
     P: PageManagementProvider<PAGE_SIZE>
         + RawSyncPrimitivesProvider
         + litebox::platform::SystemInfoProvider
+        + litebox_common_macos::MachClock
         + 'static,
 > ShimPlatform for P
 {
@@ -204,17 +206,22 @@ impl ToSyscallResult for Result<u32, Errno> {
 
 impl<P: ShimPlatform> Task<P> {
     fn handle_syscall_request(&self, ctx: &mut PtRegs) {
-        // Darwin returns positive errno in x0 with carry set. Success clears
-        // carry; x1 and the other condition flags remain unchanged.
+        // BSD calls report errno through carry. Mach traps update x0 without
+        // changing condition flags.
         const CARRY: u64 = 1 << 29;
+        let is_mach = litebox_common_macos::syscall::is_mach_trap_selector(ctx.regs[16]);
         match self.do_syscall(ctx) {
             Ok(value) => {
                 ctx.regs[0] = value;
-                ctx.pstate &= !CARRY;
+                if !is_mach {
+                    ctx.pstate &= !CARRY;
+                }
             }
             Err(error) => {
                 ctx.regs[0] = error.raw();
-                ctx.pstate |= CARRY;
+                if !is_mach {
+                    ctx.pstate |= CARRY;
+                }
             }
         }
     }
@@ -258,6 +265,13 @@ impl<P: ShimPlatform> Task<P> {
             SyscallRequest::Geteuid => Ok(self.sys_geteuid() as usize),
             SyscallRequest::Getgid => Ok(self.sys_getgid() as usize),
             SyscallRequest::Getegid => Ok(self.sys_getegid() as usize),
+            SyscallRequest::MachAbsoluteTime => Ok(self.sys_mach_absolute_time()),
+            SyscallRequest::MachTimebaseInfo { info } => {
+                Ok(self.sys_mach_timebase_info(info).into())
+            }
+            SyscallRequest::MachWaitUntil { deadline } => {
+                Ok(self.sys_mach_wait_until(deadline).into())
+            }
         }
     }
 

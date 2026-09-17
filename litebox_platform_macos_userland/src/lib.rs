@@ -23,6 +23,7 @@ use litebox_common_linux::gate_recovery::{
     Aarch64GateSignalResult, GateInterruption, GateRuntimeState, canonicalize,
 };
 use litebox_common_linux::{GuestVectorState, PtRegs};
+use litebox_common_macos::{KernReturn, MachClock, syscall::MachTimebaseInfo};
 use litebox_platform::sync::{
     ImmediatelyWokenUp, RawMutex as RawMutexTrait, RawMutexProvider, UnblockedOrTimedOut,
     WaitWakerProvider,
@@ -221,6 +222,26 @@ unsafe impl<const PAGE_SIZE: usize> litebox::platform::ThreadLocalStorageProvide
 
     unsafe fn replace_thread_local_storage(value: *mut ()) -> *mut () {
         PLATFORM_TLS.replace(value)
+    }
+}
+
+impl<const PAGE_SIZE: usize> MachClock for MacosUserlandWithPageSize<PAGE_SIZE> {
+    fn mach_absolute_time(&self) -> u64 {
+        // SAFETY: this scalar query has no pointer arguments or preconditions.
+        unsafe { mach_absolute_time() }
+    }
+
+    fn mach_timebase_info(&self) -> MachTimebaseInfo {
+        let mut info = MachTimebaseInfo::default();
+        // SAFETY: `info` is writable output storage for mach_timebase_info.
+        let result = unsafe { mach_timebase_info(&raw mut info) };
+        assert_eq!(result, KernReturn::SUCCESS, "mach_timebase_info failed");
+        info
+    }
+
+    fn mach_wait_until(&self, deadline: u64) -> KernReturn {
+        // SAFETY: the deadline is a scalar in mach_absolute_time's clock domain.
+        unsafe { mach_wait_until(deadline) }
     }
 }
 
@@ -647,27 +668,6 @@ impl<const PAGE_SIZE: usize> litebox::mm::linux::VmemPageFaultHandler
     }
 }
 
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct KernReturn(libc::c_int);
-
-impl KernReturn {
-    const SUCCESS: Self = Self(0);
-    const INVALID_ADDRESS: Self = Self(1);
-    const PROTECTION_FAILURE: Self = Self(2);
-    const RESOURCE_SHORTAGE: Self = Self(6);
-}
-
-impl From<KernReturn> for AllocationError {
-    fn from(result: KernReturn) -> Self {
-        match result {
-            KernReturn::PROTECTION_FAILURE => Self::PermissionDenied,
-            KernReturn::RESOURCE_SHORTAGE => Self::OutOfMemory,
-            _ => Self::AddressInUseByPlatform,
-        }
-    }
-}
-
 bitflags::bitflags! {
     #[repr(transparent)]
     struct MachVmFlags: i32 {
@@ -685,6 +685,9 @@ const VM_REGION_BASIC_INFO_64: i32 = 9;
 const VM_REGION_BASIC_INFO_COUNT_64: u32 = 9;
 
 unsafe extern "C" {
+    fn mach_absolute_time() -> u64;
+    fn mach_timebase_info(info: *mut MachTimebaseInfo) -> KernReturn;
+    fn mach_wait_until(deadline: u64) -> KernReturn;
     fn mach_task_self() -> u32;
     fn mach_port_deallocate(task: u32, name: u32) -> KernReturn;
     fn mach_vm_allocate(task: u32, address: *mut u64, size: u64, flags: MachVmFlags) -> KernReturn;

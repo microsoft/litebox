@@ -13,7 +13,7 @@ use litebox_shim_macos::MacosShimBuilder;
 use std::ffi::CString;
 
 #[derive(Parser, Debug)]
-#[command(about = "Run AOT-rewritten static AArch64 Mach-O programs (no dyld or Mach traps)")]
+#[command(about = "Run AOT-rewritten static AArch64 Mach-O programs (no dyld; limited Mach traps)")]
 pub struct CliArgs {
     /// Host path of a Mach-O processed by litebox_syscall_rewriter, followed by guest arguments.
     #[arg(required = true, trailing_var_arg = true, value_hint = clap::ValueHint::CommandWithArguments)]

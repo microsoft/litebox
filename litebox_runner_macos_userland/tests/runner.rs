@@ -141,7 +141,7 @@ fn static_macho_rewriter_e2e() {
     let hooked = rewrite(&binary);
     let original = std::fs::read(&binary).unwrap();
     let rewritten = std::fs::read(&hooked).unwrap();
-    let expected_sites = if cfg!(feature = "test-stdio") { 18 } else { 10 };
+    let expected_sites = if cfg!(feature = "test-stdio") { 23 } else { 15 };
     assert_eq!(assert_svc_gates(&original, &rewritten), expected_sites);
     let parsed = MachoParsedFile::parse(&original).unwrap();
     // Parsing is independent of the byte slice's alignment.
