@@ -382,7 +382,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                     return Err(WalkError::PathError(PathError::ComponentNotADirectory));
                 }
                 WalkStopReason::Continue => {
-                    assert!(continuing && walked > 0);
+                    assert!(continuing && walked > 0 && offset < components.len());
                     from = outcome.last;
                 }
             }
@@ -429,7 +429,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                     return Err(WalkError::PathError(PathError::ComponentNotADirectory));
                 }
                 WalkStopReason::Continue => {
-                    assert!(continuing && walked > 0);
+                    assert!(continuing && walked > 0 && offset < components.len());
                     from = outcome.last;
                 }
             }
