@@ -46,6 +46,64 @@ fn assemble(dir: &Path, source: &str) -> PathBuf {
     binary
 }
 
+#[cfg(feature = "test-broker")]
+fn assemble_dylib(dir: &Path, source: &str) -> PathBuf {
+    let asm = dir.join("mapped.s");
+    let obj = dir.join("mapped.o");
+    let dylib = dir.join("mapped.dylib");
+    std::fs::write(&asm, source).unwrap();
+    for mut command in [
+        {
+            let mut c = Command::new("xcrun");
+            c.args(["as", "-arch", "arm64"])
+                .arg(&asm)
+                .arg("-o")
+                .arg(&obj);
+            c
+        },
+        {
+            let mut c = Command::new("xcrun");
+            c.args(["clang", "-arch", "arm64", "-dynamiclib"])
+                .arg(&obj)
+                .arg("-o")
+                .arg(&dylib);
+            c
+        },
+    ] {
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    dylib
+}
+
+#[cfg(feature = "test-broker")]
+fn symbol_address(image: &Path, symbol: &str) -> usize {
+    let output = Command::new("xcrun")
+        .args(["nm", "-n"])
+        .arg(image)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            let address = fields.next()?;
+            let _kind = fields.next()?;
+            (fields.next()? == symbol).then(|| usize::from_str_radix(address, 16).unwrap())
+        })
+        .unwrap()
+}
+
 /// Invoke the rewriter CLI and return the path of its .hooked artifact.
 fn rewrite(input: &Path) -> PathBuf {
     let output_path = input.with_extension("hooked");
@@ -230,6 +288,95 @@ fn static_macho_loader_e2e() {
         assert_eq!(output.stdout, expected);
         assert_eq!(output.stderr, expected);
     }
+}
+
+#[cfg(feature = "test-broker")]
+#[test]
+fn runner_executes_mmap_mprotect_rewritten_macho_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let dylib = assemble_dylib(
+        dir.path(),
+        ".section __TEXT,__text,regular,pure_instructions\n\
+         .global _mapped\n\
+         _mapped:\n\
+         mov x16, #20\n\
+         svc #0x80\n\
+         ret\n",
+    );
+    let mapped = symbol_address(&dylib, "_mapped");
+    let bootstrap = assemble(
+        dir.path(),
+        &format!(
+            ".global _start\n\
+             _start:\n\
+             adr x0, 4f\n\
+             mov x1, #0\n\
+             mov x2, #0\n\
+             mov x16, #5\n\
+             svc #0x80\n\
+             b.cs 2f\n\
+             mov x19, x0\n\
+             adr x0, 4f\n\
+             mov x1, #0x01000000\n\
+             mov x2, #0\n\
+             mov x16, #398\n\
+             svc #0x80\n\
+             b.cs 2f\n\
+             mov x20, x0\n\
+             mov x0, x19\n\
+             mov x16, #6\n\
+             svc #0x80\n\
+             b.cs 2f\n\
+             mov x0, #0\n\
+             mov x1, #1\n\
+             lsl x1, x1, #14\n\
+             mov x2, #1\n\
+             mov x3, #2\n\
+             mov x4, x20\n\
+             mov x5, #0\n\
+             mov x16, #197\n\
+             svc #0x80\n\
+             b.cs 2f\n\
+             mov x19, x0\n\
+             mov x0, x20\n\
+             mov x16, #399\n\
+             svc #0x80\n\
+             b.cs 2f\n\
+             mov x0, x19\n\
+             mov x1, #1\n\
+             mov x2, #5\n\
+             mov x16, #74\n\
+             svc #0x80\n\
+             b.cs 2f\n\
+             ldr x9, 1f\n\
+             add x9, x19, x9\n\
+             blr x9\n\
+             cmp x0, #1\n\
+             mov x0, #43\n\
+             mov x10, #42\n\
+             csel x0, x10, x0, eq\n\
+             b 3f\n\
+             .p2align 3\n\
+             1: .quad {mapped:#x}\n\
+             2: mov x0, #44\n\
+             3: mov x16, #1\n\
+             svc #0x80\n\
+             4: .asciz \"/mmap-image\"\n\
+             .p2align 2\n"
+        ),
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_litebox_runner_macos_userland"))
+        .arg("--test-mmap-image")
+        .arg(&dylib)
+        .arg(&bootstrap)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(42),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
