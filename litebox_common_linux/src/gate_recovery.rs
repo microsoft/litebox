@@ -3,6 +3,9 @@
 
 //! Host-independent recovery for the AArch64 rewriter gate ABI.
 
+// TODO: Move shared AArch64 gate recovery and register-context types into an
+// OS-neutral module/crate: both Linux and native Darwin guests use them.
+
 use crate::PtRegs;
 use litebox::utils::TruncateExt as _;
 use litebox_syscall_rewriter::TargetHost;
@@ -111,6 +114,17 @@ fn resolve_x18_recovery_pc(
     })
 }
 
+/// The guest ABI determines which host and register-virtualization options
+/// apply. Darwin gates always target macOS and do not virtualize x18.
+#[derive(Clone, Copy)]
+enum GateAbi {
+    Linux {
+        host: TargetHost,
+        virtualize_x18: bool,
+    },
+    Darwin,
+}
+
 /// Recover an interrupted compact gate from normalized registers and fault-safe reads.
 /// Non-gate candidates and invalid runtime state are reported separately.
 pub fn canonicalize(
@@ -119,10 +133,51 @@ pub fn canonicalize(
     interruption: GateInterruption,
     host: TargetHost,
     virtualize_x18: bool,
+    read: impl FnMut(usize, &mut [u8]) -> bool,
+) -> Aarch64GateSignalResult {
+    canonicalize_impl(
+        context,
+        runtime,
+        interruption,
+        GateAbi::Linux {
+            host,
+            virtualize_x18,
+        },
+        read,
+    )
+}
+
+/// Recover interrupted Darwin Mach-O gates using the macOS host ABI and
+/// Darwin's red-zone-preserving frame layout.
+pub fn canonicalize_darwin(
+    context: &PtRegs,
+    runtime: GateRuntimeState,
+    interruption: GateInterruption,
+    read: impl FnMut(usize, &mut [u8]) -> bool,
+) -> Aarch64GateSignalResult {
+    canonicalize_impl(context, runtime, interruption, GateAbi::Darwin, read)
+}
+
+fn canonicalize_impl(
+    context: &PtRegs,
+    runtime: GateRuntimeState,
+    interruption: GateInterruption,
+    abi: GateAbi,
     mut read: impl FnMut(usize, &mut [u8]) -> bool,
 ) -> Aarch64GateSignalResult {
-    const SVC_FRAME: usize = SVC_FRAME_BYTES as usize;
     const MSR_FRAME: usize = MSR_FRAME_BYTES as usize;
+    let (host, virtualize_x18, svc_frame) = match abi {
+        GateAbi::Linux {
+            host,
+            virtualize_x18,
+        } => (host, virtualize_x18, SVC_FRAME_BYTES),
+        GateAbi::Darwin => (
+            TargetHost::MacOs,
+            false,
+            litebox_syscall_rewriter::aarch64::DARWIN_SVC_FRAME_BYTES,
+        ),
+    };
+    let svc_frame = usize::from(svc_frame);
     let pc = context.pc as u64;
     if !pc.is_multiple_of(4) {
         return Aarch64GateSignalResult::NotGate;
@@ -163,14 +218,26 @@ pub fn canonicalize(
             // must not cause the runtime to abort. This includes PCs in a real
             // slot's padding or metadata: no prologue ran, so retain the
             // interrupted registers.
-            let Some(classified) =
-                litebox_syscall_rewriter::aarch64::classify_copied_gate_slot_for_host(
-                    &slot[..slot_size],
-                    slot_start as u64,
-                    pc as u64,
-                    host,
-                )
-            else {
+            let classified = match abi {
+                GateAbi::Darwin => litebox_syscall_rewriter::macho::Rewriter::new(host)
+                    .ok()
+                    .and_then(|rewriter| {
+                        rewriter.classify_gate_slot(
+                            &slot[..slot_size],
+                            slot_start as u64,
+                            pc as u64,
+                        )
+                    }),
+                GateAbi::Linux { .. } => {
+                    litebox_syscall_rewriter::aarch64::classify_copied_gate_slot_for_host(
+                        &slot[..slot_size],
+                        slot_start as u64,
+                        pc as u64,
+                        host,
+                    )
+                }
+            };
+            let Some(classified) = classified else {
                 continue;
             };
             if found.is_some() {
@@ -357,7 +424,7 @@ pub fn canonicalize(
             let guest_sp = match plan.frame {
                 SvcFrameState::NoFrame => canonical.sp,
                 SvcFrameState::FrameAtSpX16Live | SvcFrameState::RestoreX16FromFrame => {
-                    canonical.sp.wrapping_add(SVC_FRAME)
+                    canonical.sp.wrapping_add(svc_frame)
                 }
             };
             if let Some(saved_x16) = saved_x16 {
@@ -625,4 +692,91 @@ pub fn canonicalize(
     }
     canonical.orig_x0 = canonical.regs[0];
     Aarch64GateSignalResult::Canonicalized(canonical)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use litebox_syscall_rewriter::{aarch64::DARWIN_SVC_FRAME_BYTES, macho::Rewriter};
+
+    #[test]
+    #[expect(clippy::single_range_in_vec_init, reason = "one executable code range")]
+    fn darwin_svc_recovery_uses_the_real_gate_and_red_zone_frame() {
+        const SITE: usize = 0x1000_0000;
+        const TRAMPOLINE: usize = 0x1000_4000;
+        const STACK: usize = 0x2000_0000;
+        const GUEST_SP: usize = STACK + DARWIN_SVC_FRAME_BYTES as usize;
+        let mut code = 0xd4001001u32.to_le_bytes();
+        let (gates, trapped) = Rewriter::new(TargetHost::MacOs)
+            .unwrap()
+            .patch_code_segment(
+                &mut code,
+                SITE as u64,
+                &[0..4],
+                TRAMPOLINE as u64,
+                0x1234,
+                96,
+            )
+            .unwrap();
+        assert!(trapped.is_empty());
+        let mut frame = [0u8; DARWIN_SVC_FRAME_BYTES as usize];
+        frame[..8].copy_from_slice(&20usize.to_ne_bytes());
+        let read = |address: usize, output: &mut [u8]| {
+            for (base, bytes) in [
+                (SITE, code.as_slice()),
+                (TRAMPOLINE, gates.as_slice()),
+                (STACK, frame.as_slice()),
+            ] {
+                if let Some(offset) = address.checked_sub(base)
+                    && let Some(end) = offset.checked_add(output.len())
+                    && let Some(source) = bytes.get(offset..end)
+                {
+                    output.copy_from_slice(source);
+                    return true;
+                }
+            }
+            false
+        };
+        let runtime = GateRuntimeState {
+            guest_thread_pointer_addr: 0x3000_0000,
+            expected_outbound_stub: 0,
+            expected_outbound_pc: 0,
+        };
+        for (offset, sp, x16) in [
+            (0, GUEST_SP, 20),
+            (4, STACK, 20),
+            (12, STACK, 0xfeed),
+            (32, STACK, 0x1234),
+        ] {
+            let mut ctx = PtRegs {
+                pc: TRAMPOLINE + 16 + offset,
+                sp,
+                ..PtRegs::default()
+            };
+            ctx.regs[0] = 77;
+            ctx.regs[16] = x16;
+            let Aarch64GateSignalResult::Canonicalized(recovered) =
+                canonicalize_darwin(&ctx, runtime, GateInterruption::Asynchronous, read)
+            else {
+                panic!("Darwin recovery failed at offset {offset}")
+            };
+            assert_eq!(recovered.pc, SITE);
+            assert_eq!(recovered.sp, GUEST_SP);
+            assert_eq!(recovered.regs[16], 20);
+            assert_eq!(recovered.regs[0], 77);
+            assert_eq!(recovered.orig_x0, 77);
+            // The Linux decoder must not accept a Darwin frame layout.
+            assert!(matches!(
+                canonicalize(
+                    &ctx,
+                    runtime,
+                    GateInterruption::Asynchronous,
+                    TargetHost::MacOs,
+                    true,
+                    read
+                ),
+                Aarch64GateSignalResult::NotGate
+            ));
+        }
+    }
 }

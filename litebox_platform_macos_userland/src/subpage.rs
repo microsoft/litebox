@@ -865,6 +865,7 @@ mod tests {
             .update_permissions(base..base + PAGE_SIZE, RX)
             .unwrap();
         let fault = std::cell::Cell::new(None);
+        crate::set_guest_abi(crate::GuestAbi::Linux);
         // SAFETY: the probe supplies live code/data and a separate writable guest stack.
         unsafe {
             run_thread(

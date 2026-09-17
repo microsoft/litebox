@@ -34,6 +34,10 @@ pub(crate) fn test_platform() -> &'static TestPlatform {
         let platform = TestPlatform::new();
         #[cfg(target_os = "windows")]
         TestPlatform::set_guest_tls_mode(litebox_platform_windows_userland::GuestTlsMode::Linux);
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        litebox_platform_macos_userland::set_guest_abi(
+            litebox_platform_macos_userland::GuestAbi::Linux,
+        );
         platform
     })
 }

@@ -148,10 +148,13 @@ jobs:
         -p dev_tests
         -p litebox
         -p litebox_common_linux
+        -p litebox_common_macos
         -p litebox_syscall_rewriter
         -p litebox_platform_macos_userland
         -p litebox_shim_linux
+        -p litebox_shim_macos
         -p litebox_runner_linux_on_macos_userland
+        -p litebox_runner_macos_userland
     steps:
       - name: Check out repo
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -169,6 +172,11 @@ jobs:
       - run: ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features $MACOS_AARCH64_CRATES
       - run: ./.github/tools/github_actions_run_cargo build $MACOS_AARCH64_CRATES
       - run: ./.github/tools/github_actions_run_cargo nextest $MACOS_AARCH64_CRATES
+      - name: Test native macOS runner with test-only stdio
+        run: >-
+          ./.github/tools/github_actions_run_cargo nextest
+          -p litebox_runner_macos_userland --features test-stdio
+          -E 'test(=static_macho_rewriter_e2e)'
       - name: Check native macOS platform without subpage compatibility
         run: |
           ./.github/tools/github_actions_run_cargo clippy --all-targets --no-default-features -p litebox_platform_macos_userland
@@ -378,6 +386,9 @@ jobs:
           # - `litebox_runner_linux_on_macos_userland` is allowed to have `std`
           #   access since it loads files and runs LiteBox on a hosted platform.
           #
+          # - `litebox_runner_macos_userland` is allowed to have `std` access,
+          #   since it loads Mach-O files and launches guests on hosted macOS.
+          #
           # - `litebox_runner_linux_on_windows_userland` is allowed to have `std`
           #   access since it is a hosted executable that connects to the broker
           #   and launches the LiteBox guest.
@@ -441,6 +452,7 @@ jobs:
             -not -path './litebox_platform_macos_userland/Cargo.toml' \
             -not -path './litebox_platform_windows_userland/Cargo.toml' \
             -not -path './litebox_runner_linux_on_macos_userland/Cargo.toml' \
+            -not -path './litebox_runner_macos_userland/Cargo.toml' \
             -not -path './litebox_runner_linux_on_windows_userland/Cargo.toml' \
             -not -path './litebox_runner_windows_on_linux_userland/Cargo.toml' \
             -not -path './litebox_platform_lvbs/Cargo.toml' \
