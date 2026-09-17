@@ -102,7 +102,7 @@ impl<Platform: ShimPlatform> Ord for ElfPatchKey<Platform> {
 /// probed and found not to be an ELF image we patch. It stops the header probe
 /// from re-running on every mapping of the same descriptor.
 ///
-/// File contents are assumed to remain unchanged while a cache entry exists.
+/// TODO: File contents are assumed to remain unchanged while a cache entry exists.
 pub(crate) type ElfPatchCache<Platform> = BTreeMap<ElfPatchKey<Platform>, Option<ElfPatchState>>;
 
 #[inline]
