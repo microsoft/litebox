@@ -16,6 +16,49 @@ pub mod syscall;
 pub use litebox_common_linux::{PtRegs, user_pointers};
 pub use syscall::SyscallRequest;
 
+/// Return value used by Mach kernel APIs and traps.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KernReturn(i32);
+
+impl KernReturn {
+    pub const SUCCESS: Self = Self(0);
+    pub const INVALID_ADDRESS: Self = Self(1);
+    pub const PROTECTION_FAILURE: Self = Self(2);
+    pub const RESOURCE_SHORTAGE: Self = Self(6);
+
+    pub const fn from_raw(value: i32) -> Self {
+        Self(value)
+    }
+
+    pub const fn raw(self) -> i32 {
+        self.0
+    }
+}
+
+impl From<KernReturn> for usize {
+    fn from(result: KernReturn) -> Self {
+        result.raw().cast_unsigned() as Self
+    }
+}
+
+/// Darwin's sleep-adjusted absolute clock interface.
+pub trait MachClock {
+    fn mach_absolute_time(&self) -> u64;
+    fn mach_timebase_info(&self) -> syscall::MachTimebaseInfo;
+    fn mach_wait_until(&self, deadline: u64) -> KernReturn;
+}
+
+impl From<KernReturn> for litebox::platform::page_mgmt::AllocationError {
+    fn from(result: KernReturn) -> Self {
+        match result {
+            KernReturn::PROTECTION_FAILURE => Self::PermissionDenied,
+            KernReturn::RESOURCE_SHORTAGE => Self::OutOfMemory,
+            _ => Self::AddressInUseByPlatform,
+        }
+    }
+}
+
 bitflags::bitflags! {
     /// Mach virtual-memory protections.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]

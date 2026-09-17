@@ -126,6 +126,52 @@ redzone:
     cmp x0, #1000
     b.ne fail
 
+    // Native Darwin stubs write the signed trap selector through w16. Mach
+    // returns preserve condition flags rather than applying BSD carry handling.
+    mov w16, #-3 // mach_absolute_time
+    mov x9, #0x20000000
+    msr nzcv, x9
+    svc #0x80
+    b.cc fail
+    cbz x0, fail
+    mov x21, x0
+    mov w16, #-3
+    mov x9, #0x20000000
+    msr nzcv, x9
+    svc #0x80
+    b.cc fail
+    cmp x0, x21
+    b.lo fail
+
+    // Waiting for an already-reached absolute deadline succeeds immediately.
+    mov w16, #-90 // mach_wait_until
+    mov x9, #0x20000000
+    msr nzcv, x9
+    svc #0x80
+    b.cc fail
+    cbnz x0, fail
+
+    sub x0, sp, #16
+    stp xzr, xzr, [x0]
+    mov w16, #-89 // mach_timebase_info
+    mov x9, #0x20000000
+    msr nzcv, x9
+    svc #0x80
+    b.cc fail
+    cbnz x0, fail
+    ldp w9, w10, [sp, #-16]
+    cbz w9, fail
+    cbz w10, fail
+
+    // XNU ignores mach_timebase_info's copyout failure.
+    mov x0, #0
+    mov w16, #-89
+    mov x9, #0x20000000
+    msr nzcv, x9
+    svc #0x80
+    b.cc fail
+    cbnz x0, fail
+
     // Negative descriptors return EBADF.
     mov x0, #-1
     mov x16, #6
