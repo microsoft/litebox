@@ -52,7 +52,6 @@ pub use policy::{
 use process::ObjectReference;
 pub use process::{
     AssociationCancellation, BrokerProcess, BrokerThread, CallerCredential, ObjectRights,
-    PendingProcess, ProcessStartCommit,
 };
 use random::RandomProvider;
 use socket::{BrokerSocketPorts, SocketProvider};

@@ -12,8 +12,7 @@
 //!
 //! New object families should add a top-level broker message tag and a private
 //! family codec module instead of adding flat helpers here. Existing payloads
-//! are positional; changing fields is an ABI change, so prefer a new operation
-//! tag or explicit negotiated-version gate for payload evolution.
+//! are positional, so update both endpoints and their codec tests together.
 
 use alloc::vec::Vec;
 use thiserror::Error;
@@ -26,7 +25,7 @@ use crate::message::{
 use crate::process::{
     InheritedProcessObjects, MAX_INHERITED_PROCESS_OBJECTS, ProcessBootstrap,
     ProcessBootstrapFormat, ProcessBootstrapVersion, ProcessReadyRequest, ProcessStartToken,
-    StartProcessRequest, StartedProcess,
+    ProcessStartup, StartProcessRequest, StartedProcess,
 };
 use crate::readiness::ReadinessFlags;
 
@@ -72,7 +71,6 @@ const RESPONSE_TAG_PROCESS_READY: u8 = 13;
 
 // Reserve the top of the tag space for responses without paired requests.
 const RESPONSE_TAG_ERROR: u8 = 253;
-const RESPONSE_TAG_PREPARED: u8 = 252;
 const RESPONSE_TAG_HANDSHAKE_ERROR: u8 = 254;
 const RESPONSE_TAG_VERSION_MISMATCH: u8 = 255;
 
@@ -296,29 +294,29 @@ pub fn encode_handshake_response(response: BrokerHandshakeResponse) -> Vec<u8> {
         BrokerHandshakeResponse::Negotiated {
             broker_protocol_version,
             process_id,
+            startup,
         } => {
             encoder.u8(RESPONSE_TAG_NEGOTIATED);
             encoder.protocol_version(broker_protocol_version);
             encoder.process_id(process_id);
-        }
-        BrokerHandshakeResponse::Prepared {
-            broker_protocol_version,
-            process_id,
-            bootstrap:
-                ProcessBootstrap {
-                    format,
-                    version,
-                    buffer,
-                },
-            inherited_objects,
-        } => {
-            encoder.u8(RESPONSE_TAG_PREPARED);
-            encoder.protocol_version(broker_protocol_version);
-            encoder.process_id(process_id);
-            encoder.u32(format.0);
-            encoder.u16(version.0);
-            encoder.shared_buffer_sequence(buffer);
-            encode_inherited_objects(&mut encoder, inherited_objects);
+            match startup {
+                Some(ProcessStartup {
+                    bootstrap:
+                        ProcessBootstrap {
+                            format,
+                            version,
+                            buffer,
+                        },
+                    inherited_objects,
+                }) => {
+                    encoder.u8(1);
+                    encoder.u32(format.0);
+                    encoder.u16(version.0);
+                    encoder.shared_buffer_sequence(buffer);
+                    encode_inherited_objects(&mut encoder, inherited_objects);
+                }
+                None => encoder.u8(0),
+            }
         }
         BrokerHandshakeResponse::VersionMismatch {
             broker_protocol_version,
@@ -342,16 +340,18 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
         RESPONSE_TAG_NEGOTIATED => BrokerHandshakeResponse::Negotiated {
             broker_protocol_version: decoder.protocol_version()?,
             process_id: decoder.process_id()?,
-        },
-        RESPONSE_TAG_PREPARED => BrokerHandshakeResponse::Prepared {
-            broker_protocol_version: decoder.protocol_version()?,
-            process_id: decoder.process_id()?,
-            bootstrap: ProcessBootstrap {
-                format: ProcessBootstrapFormat(decoder.u32()?),
-                version: ProcessBootstrapVersion(decoder.u16()?),
-                buffer: decoder.shared_buffer_sequence()?,
+            startup: match decoder.u8()? {
+                0 => None,
+                1 => Some(ProcessStartup {
+                    bootstrap: ProcessBootstrap {
+                        format: ProcessBootstrapFormat(decoder.u32()?),
+                        version: ProcessBootstrapVersion(decoder.u16()?),
+                        buffer: decoder.shared_buffer_sequence()?,
+                    },
+                    inherited_objects: decode_inherited_objects(&mut decoder)?,
+                }),
+                _ => return Err(WireError::InvalidTag),
             },
-            inherited_objects: decode_inherited_objects(&mut decoder)?,
         },
         RESPONSE_TAG_EVENT
         | RESPONSE_TAG_OBJECT_CLOSED
@@ -469,10 +469,7 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
     let mut decoder = Decoder::new(frame);
     let tag = decoder.u8()?;
     match tag {
-        RESPONSE_TAG_NEGOTIATED
-        | RESPONSE_TAG_PREPARED
-        | RESPONSE_TAG_HANDSHAKE_ERROR
-        | RESPONSE_TAG_VERSION_MISMATCH => {
+        RESPONSE_TAG_NEGOTIATED | RESPONSE_TAG_HANDSHAKE_ERROR | RESPONSE_TAG_VERSION_MISMATCH => {
             return Err(WireError::WrongMessagePhase);
         }
         RESPONSE_TAG_EVENT
@@ -647,7 +644,8 @@ mod tests {
     };
     use crate::process::{
         InheritedProcessObjects, ProcessBootstrap, ProcessBootstrapFormat, ProcessBootstrapVersion,
-        ProcessReadyRequest, ProcessStartToken, StartProcessRequest, StartedProcess,
+        ProcessReadyRequest, ProcessStartToken, ProcessStartup, StartProcessRequest,
+        StartedProcess,
     };
     use crate::shared_buffer::{SharedBufferSequence, SharedBufferSlotIndex};
     use crate::socket::{
@@ -730,11 +728,10 @@ mod tests {
         assert_eq!(
             [
                 RESPONSE_TAG_ERROR,
-                RESPONSE_TAG_PREPARED,
                 RESPONSE_TAG_HANDSHAKE_ERROR,
                 RESPONSE_TAG_VERSION_MISMATCH,
             ],
-            [253, 252, 254, 255]
+            [253, 254, 255]
         );
     }
 
@@ -1188,24 +1185,23 @@ mod tests {
             BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: ProtocolVersion(1),
                 process_id: process_id(1),
+                startup: None,
             },
             BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: ProtocolVersion(1),
                 process_id: process_id(7),
-            },
-            BrokerHandshakeResponse::Prepared {
-                broker_protocol_version: ProtocolVersion(1),
-                process_id: process_id(9),
-                bootstrap: ProcessBootstrap {
-                    format: ProcessBootstrapFormat(0x7465_7374),
-                    version: ProcessBootstrapVersion(1),
-                    buffer: sequence(0, 37),
-                },
-                inherited_objects: InheritedProcessObjects::new(&[
-                    ObjectHandle(5),
-                    ObjectHandle(6),
-                ])
-                .unwrap(),
+                startup: Some(ProcessStartup {
+                    bootstrap: ProcessBootstrap {
+                        format: ProcessBootstrapFormat(0x7465_7374),
+                        version: ProcessBootstrapVersion(1),
+                        buffer: sequence(0, 37),
+                    },
+                    inherited_objects: InheritedProcessObjects::new(&[
+                        ObjectHandle(5),
+                        ObjectHandle(6),
+                    ])
+                    .unwrap(),
+                }),
             },
             BrokerHandshakeResponse::VersionMismatch {
                 broker_protocol_version: ProtocolVersion(1),
@@ -1875,10 +1871,19 @@ mod tests {
             Err(WireError::WrongMessagePhase)
         );
 
-        let mut frame = encode_handshake_response(BrokerHandshakeResponse::Negotiated {
+        let negotiated = BrokerHandshakeResponse::Negotiated {
             broker_protocol_version: ProtocolVersion(1),
             process_id: process_id(1),
-        });
+            startup: None,
+        };
+        let mut invalid_startup = encode_handshake_response(negotiated.clone());
+        *invalid_startup.last_mut().unwrap() = 2;
+        assert_eq!(
+            decode_handshake_response(&invalid_startup),
+            Err(WireError::InvalidTag)
+        );
+
+        let mut frame = encode_handshake_response(negotiated);
         frame.push(0xff);
         assert_eq!(
             decode_handshake_response(&frame),
@@ -1896,16 +1901,19 @@ mod tests {
             BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: ProtocolVersion(1),
                 process_id: process_id(1),
+                startup: None,
             },
-            BrokerHandshakeResponse::Prepared {
+            BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: ProtocolVersion(1),
                 process_id: process_id(2),
-                bootstrap: ProcessBootstrap {
-                    format: ProcessBootstrapFormat(3),
-                    version: ProcessBootstrapVersion(4),
-                    buffer: sequence(0, 5),
-                },
-                inherited_objects: InheritedProcessObjects::EMPTY,
+                startup: Some(ProcessStartup {
+                    bootstrap: ProcessBootstrap {
+                        format: ProcessBootstrapFormat(3),
+                        version: ProcessBootstrapVersion(4),
+                        buffer: sequence(0, 5),
+                    },
+                    inherited_objects: InheritedProcessObjects::EMPTY,
+                }),
             },
             BrokerHandshakeResponse::VersionMismatch {
                 broker_protocol_version: ProtocolVersion(1),

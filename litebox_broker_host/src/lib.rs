@@ -24,7 +24,7 @@ extern crate std;
 use alloc::{sync::Arc, vec::Vec};
 
 use litebox_broker_core::readiness::ReadinessSink;
-use litebox_broker_core::{BrokerCore, BrokerProcess, CallerCredential, PendingProcess};
+use litebox_broker_core::{BrokerCore, BrokerProcess, CallerCredential};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse};
 use litebox_broker_protocol::fs::{
@@ -45,7 +45,7 @@ use litebox_broker_protocol::pipe::{
 };
 use litebox_broker_protocol::process::{
     InheritedProcessObjects, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessBootstrap, ProcessBootstrapFormat,
-    ProcessBootstrapVersion,
+    ProcessBootstrapVersion, ProcessStartup,
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::shared_buffer::{
@@ -62,7 +62,7 @@ use litebox_broker_protocol::stdio::{
     IsTerminalStdioRequest, IsTerminalStdioResponse, MAX_STDIO_TRANSFER_SIZE, ReadStdioRequest,
     ReadStdioResponse, WriteStdioRequest, WriteStdioResponse,
 };
-use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, RequestId};
+use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, ObjectHandle, RequestId};
 use litebox_broker_transport::channel::{HostReceive, HostSetupChannel, PeerCredential};
 use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemory};
 use spin::mutex::SpinMutex;
@@ -104,14 +104,16 @@ pub enum BrokerHostExtensionError {
     Abort(ErrorCode),
 }
 
-/// Opaque bootstrap staged for one broker-reserved prepared child.
-pub struct PreparedProcessBootstrap<'a> {
+/// Child startup data staged during broker negotiation.
+pub struct ProcessStartupData {
     /// Platform-defined format.
     pub format: ProcessBootstrapFormat,
     /// Version within the platform-defined format.
     pub version: ProcessBootstrapVersion,
     /// Opaque platform bytes.
-    pub payload: &'a [u8],
+    pub payload: Vec<u8>,
+    /// Child-owned broker handles in the parent's inheritance-manifest order.
+    pub inherited_objects: Vec<ObjectHandle>,
 }
 
 impl<Memory: SharedMemory> BrokerHostAssociation<'_, Memory> {
@@ -241,6 +243,8 @@ pub fn copy_shared_buffer<Memory: SharedMemory>(
 /// association is returned.
 pub fn setup_connection<'a, SetupChannel, Memory, ChannelError>(
     core: &BrokerCore,
+    process: Option<Arc<BrokerProcess>>,
+    startup: Option<ProcessStartupData>,
     setup_channel: &mut SetupChannel,
     shared_buffers: &'a SharedBufferPool<Memory>,
     readiness_sink: Arc<dyn ReadinessSink>,
@@ -253,6 +257,37 @@ where
     if shared_buffers.layout() != SHARED_BUFFER_LAYOUT {
         return Err(BrokerHostError::SharedBufferLayoutMismatch);
     }
+    if process.is_some() != startup.is_some() {
+        return Err(BrokerHostError::Broker(ErrorCode::Internal));
+    }
+    let startup = match startup {
+        Some(ProcessStartupData {
+            format,
+            version,
+            payload,
+            inherited_objects,
+        }) => {
+            if payload.len() > MAX_PROCESS_BOOTSTRAP_SIZE as usize {
+                return Err(BrokerHostError::Broker(ErrorCode::ResourceExhausted));
+            }
+            let bootstrap_length = u32::try_from(payload.len())
+                .map_err(|_| BrokerHostError::Broker(ErrorCode::ResourceExhausted))?;
+            let buffer = SharedBufferSequence::new(&[SharedBufferSlotIndex(0)], bootstrap_length)
+                .map_err(|_| BrokerHostError::Broker(ErrorCode::Internal))?;
+            write_shared_buffer(shared_buffers, buffer, &payload, MAX_PROCESS_BOOTSTRAP_SIZE)
+                .map_err(|error| BrokerHostError::Broker(request_failure_error(error)))?;
+            Some(ProcessStartup {
+                bootstrap: ProcessBootstrap {
+                    format,
+                    version,
+                    buffer,
+                },
+                inherited_objects: InheritedProcessObjects::new(&inherited_objects)
+                    .ok_or(BrokerHostError::Broker(ErrorCode::Internal))?,
+            })
+        }
+        None => None,
+    };
     let limits = core.limits();
     // Sockets are currently the only externally backed objects. Add future
     // resource limits here so every live registration fits in the
@@ -270,6 +305,7 @@ where
         PeerCredential::Unauthenticated => CallerCredential::Unauthenticated,
         _ => return Err(BrokerHostError::Broker(ErrorCode::PolicyDenied)),
     };
+    let mut process = process;
     loop {
         let request = match setup_channel
             .recv_handshake_request()
@@ -299,117 +335,47 @@ where
             continue;
         }
 
-        let process = match core.create_process(caller_credential) {
-            Ok(process) => process,
-            Err(litebox_broker_core::BrokerError::ResourceExhausted) => {
-                let error = ErrorCode::ResourceExhausted;
+        let finish_on_setup_error = process.is_none();
+        let process = match process.take() {
+            Some(process) if process.caller_credential() == caller_credential => process,
+            Some(_) => {
+                let error = ErrorCode::PolicyDenied;
                 setup_channel
                     .send_handshake_response(&BrokerHandshakeResponse::Error(error))
                     .map_err(BrokerHostError::Channel)?;
                 return Ok(Err(ConnectionTermination::Rejected(error)));
             }
-            Err(error) => return Err(BrokerHostError::from(error)),
+            None => match core.create_process(caller_credential) {
+                Ok(process) => process,
+                Err(litebox_broker_core::BrokerError::ResourceExhausted) => {
+                    let error = ErrorCode::ResourceExhausted;
+                    setup_channel
+                        .send_handshake_response(&BrokerHandshakeResponse::Error(error))
+                        .map_err(BrokerHostError::Channel)?;
+                    return Ok(Err(ConnectionTermination::Rejected(error)));
+                }
+                Err(error) => return Err(BrokerHostError::from(error)),
+            },
         };
         let response = BrokerHandshakeResponse::Negotiated {
             broker_protocol_version: BROKER_PROTOCOL_VERSION,
             process_id: process.id(),
+            startup,
         };
         if let Err(error) = setup_channel.send_handshake_response(&response) {
-            BrokerProcess::finish(process);
+            if finish_on_setup_error {
+                BrokerProcess::finish(process);
+            }
             return Err(BrokerHostError::Channel(error));
         }
         if let Err(error) = send_shared_memory(setup_channel) {
-            BrokerProcess::finish(process);
+            if finish_on_setup_error {
+                BrokerProcess::finish(process);
+            }
             return Err(BrokerHostError::Channel(error));
         }
         return Ok(Ok(new_association(process, shared_buffers, readiness_sink)));
     }
-}
-
-/// Authenticates and negotiates one broker-reserved prepared child connection.
-pub fn setup_prepared_connection<'a, SetupChannel, Memory, ChannelError>(
-    pending: PendingProcess,
-    setup_channel: &mut SetupChannel,
-    shared_buffers: &'a SharedBufferPool<Memory>,
-    readiness_sink: Arc<dyn ReadinessSink>,
-    bootstrap: PreparedProcessBootstrap<'_>,
-    send_shared_memory: impl FnOnce(&mut SetupChannel) -> core::result::Result<(), ChannelError>,
-) -> Result<ConnectionSetup<'a, Memory>, ChannelError>
-where
-    SetupChannel: HostSetupChannel<Error = ChannelError>,
-    Memory: SharedMemory,
-{
-    if shared_buffers.layout() != SHARED_BUFFER_LAYOUT {
-        return Err(BrokerHostError::SharedBufferLayoutMismatch);
-    }
-    if bootstrap.payload.len() > MAX_PROCESS_BOOTSTRAP_SIZE as usize {
-        return Err(BrokerHostError::Broker(ErrorCode::ResourceExhausted));
-    }
-    let process_id = pending.id();
-    let transport_credential = match setup_channel
-        .peer_credential()
-        .map_err(BrokerHostError::Channel)?
-    {
-        PeerCredential::HostGuaranteed => CallerCredential::HostGuaranteed,
-        PeerCredential::Unauthenticated => CallerCredential::Unauthenticated,
-        _ => return Err(BrokerHostError::Broker(ErrorCode::PolicyDenied)),
-    };
-    if transport_credential != pending.caller_credential() {
-        return Err(BrokerHostError::Broker(ErrorCode::PolicyDenied));
-    }
-    let request = match setup_channel
-        .recv_handshake_request()
-        .map_err(BrokerHostError::Channel)?
-    {
-        HostReceive::Message(request) => request,
-        HostReceive::ProtocolViolation => {
-            setup_channel
-                .send_handshake_response(&BrokerHandshakeResponse::Error(ErrorCode::ProtocolState))
-                .map_err(BrokerHostError::Channel)?;
-            return Ok(Err(ConnectionTermination::ProtocolViolation));
-        }
-        HostReceive::PeerClosed => return Ok(Err(ConnectionTermination::PeerClosed)),
-    };
-    if request.protocol_version != BROKER_PROTOCOL_VERSION {
-        setup_channel
-            .send_handshake_response(&BrokerHandshakeResponse::VersionMismatch {
-                broker_protocol_version: BROKER_PROTOCOL_VERSION,
-            })
-            .map_err(BrokerHostError::Channel)?;
-        return Ok(Err(ConnectionTermination::Rejected(
-            ErrorCode::UnsupportedVersion,
-        )));
-    }
-
-    let bootstrap_length = u32::try_from(bootstrap.payload.len())
-        .map_err(|_| BrokerHostError::Broker(ErrorCode::ResourceExhausted))?;
-    let buffer = SharedBufferSequence::new(&[SharedBufferSlotIndex(0)], bootstrap_length)
-        .map_err(|_| BrokerHostError::Broker(ErrorCode::Internal))?;
-    write_shared_buffer(
-        shared_buffers,
-        buffer,
-        bootstrap.payload,
-        MAX_PROCESS_BOOTSTRAP_SIZE,
-    )
-    .map_err(|error| BrokerHostError::Broker(request_failure_error(error)))?;
-
-    let response = BrokerHandshakeResponse::Prepared {
-        broker_protocol_version: BROKER_PROTOCOL_VERSION,
-        process_id,
-        bootstrap: ProcessBootstrap {
-            format: bootstrap.format,
-            version: bootstrap.version,
-            buffer,
-        },
-        inherited_objects: InheritedProcessObjects::new(pending.inherited_objects())
-            .ok_or(BrokerHostError::Broker(ErrorCode::Internal))?,
-    };
-    setup_channel
-        .send_handshake_response(&response)
-        .map_err(BrokerHostError::Channel)?;
-    send_shared_memory(setup_channel).map_err(BrokerHostError::Channel)?;
-    let process = pending.attach();
-    Ok(Ok(new_association(process, shared_buffers, readiness_sink)))
 }
 
 fn new_association<Memory: SharedMemory>(
@@ -1914,6 +1880,7 @@ mod tests {
             BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
                 process_id: root_process_id(1),
+                startup: None,
             }
         );
         let handle = match &channel.results[0] {
@@ -1949,6 +1916,7 @@ mod tests {
                 BrokerHandshakeResponse::Negotiated {
                     broker_protocol_version: BROKER_PROTOCOL_VERSION,
                     process_id: root_process_id(2),
+                    startup: None,
                 }
             ]
         );
@@ -2022,6 +1990,7 @@ mod tests {
             [BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
                 process_id: root_process_id(4),
+                startup: None,
             }]
         );
         assert!(channel.results.is_empty());
@@ -2807,6 +2776,8 @@ mod tests {
     ) -> Result<ConnectionTermination, ()> {
         let association = match setup_connection(
             broker,
+            None,
+            None,
             control_channel,
             shared_buffers,
             test_readiness_sink(),

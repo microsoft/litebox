@@ -18,8 +18,8 @@ use crate::pipe::{
     WritePipeResponse,
 };
 use crate::process::{
-    InheritedProcessObjects, ProcessBootstrap, ProcessReadyRequest, ProcessStartToken,
-    StartProcessRequest, StartedProcess,
+    ProcessBootstrap, ProcessReadyRequest, ProcessStartToken, ProcessStartup, StartProcessRequest,
+    StartedProcess,
 };
 use crate::readiness::ReadinessFlags;
 use crate::shared_buffer::SharedBufferSequence;
@@ -70,9 +70,9 @@ pub enum BrokerOperation {
     File(FileRequest),
     /// Start one child process from an opaque platform bootstrap.
     StartProcess(StartProcessRequest),
-    /// Commit a prepared process after its start result reaches the parent.
+    /// Commit a child process after its start result reaches the parent.
     AcknowledgeProcessStart(ProcessStartToken),
-    /// Report that this prepared process is ready to begin guest execution.
+    /// Report that this child process is ready to begin guest execution.
     ProcessReady(ProcessReadyRequest),
 }
 
@@ -160,17 +160,8 @@ pub enum BrokerHandshakeResponse {
         broker_protocol_version: ProtocolVersion,
         /// Assigned process ID.
         process_id: ProcessId,
-    },
-    /// Negotiation result for a broker-reserved prepared child.
-    Prepared {
-        /// Broker protocol version supported by this endpoint.
-        broker_protocol_version: ProtocolVersion,
-        /// Broker-assigned child process ID.
-        process_id: ProcessId,
-        /// Opaque platform bootstrap staged in the child's shared-buffer pool.
-        bootstrap: ProcessBootstrap,
-        /// Child-owned broker handles corresponding to the parent's inheritance manifest.
-        inherited_objects: InheritedProcessObjects,
+        /// Child startup data, absent for the initial process.
+        startup: Option<ProcessStartup>,
     },
     /// Negotiation failed because the requested version is unsupported.
     ///
@@ -263,9 +254,9 @@ pub enum BrokerResult {
     File(FileResponse),
     /// A child was materialized and is ready for parent acknowledgement.
     ProcessStarted(StartedProcess),
-    /// Parent acknowledgement committed the prepared child.
+    /// Parent acknowledgement committed the child.
     ProcessStartAcknowledged,
-    /// Parent acknowledgement released this prepared child.
+    /// Parent acknowledgement released the child.
     ProcessReady,
     /// Operation failed with an ABI-neutral broker error.
     Error(ErrorCode),

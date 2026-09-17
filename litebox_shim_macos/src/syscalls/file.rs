@@ -330,7 +330,7 @@ mod tests {
         .unwrap();
         let setup = InProcessBrokerSetup::new(broker);
         let readiness = setup.readiness_sink();
-        let (local, ()) = BrokerLocal::negotiate(setup, |setup| {
+        let (local, _startup, ()) = BrokerLocal::negotiate(setup, |setup| {
             let memory = setup.shared_memory();
             Ok((setup.activate(), memory, ()))
         })

@@ -26,7 +26,7 @@ const RUNNER_ARGUMENT: &str = "broker-userland-test-runner";
 const NETWORK_RUNNER_ARGUMENT: &str = "broker-userland-network-test-runner";
 const CHILD_START_RUNNER_ARGUMENT: &str = "broker-userland-child-start-runner";
 const CHILD_CANCEL_RUNNER_ARGUMENT: &str = "broker-userland-child-cancel-runner";
-const PREPARED_CHILD_ARGUMENT: &str = "--prepared-child";
+const CHILD_ARGUMENT: &str = "--child";
 const TEST_BOOTSTRAP_FORMAT: ProcessBootstrapFormat = ProcessBootstrapFormat(0x7465_7374);
 const FAILING_BOOTSTRAP_FORMAT: ProcessBootstrapFormat = ProcessBootstrapFormat(0x6661_696c);
 const BROKER_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
@@ -145,12 +145,12 @@ fn run_fake_runner(args: &[OsString]) {
     );
 
     let control_socket_path = args.get(2).unwrap();
-    if args.get(3).and_then(|argument| argument.to_str()) == Some(PREPARED_CHILD_ARGUMENT) {
-        run_fake_prepared_child(Path::new(control_socket_path));
+    if args.get(3).and_then(|argument| argument.to_str()) == Some(CHILD_ARGUMENT) {
+        run_fake_child(Path::new(control_socket_path));
         return;
     }
     let setup_channel = connect_control_with_retry(Path::new(control_socket_path)).unwrap();
-    let (local, ()) = BrokerLocal::negotiate(setup_channel, |mut setup| {
+    let (local, startup, ()) = BrokerLocal::negotiate(setup_channel, |mut setup| {
         let shared_memory = setup.receive_memfd(
             SHARED_BUFFER_POOL_SIZE,
             Some(Instant::now() + Duration::from_secs(5)),
@@ -167,6 +167,7 @@ fn run_fake_runner(args: &[OsString]) {
         Ok((call_channel, Arc::new(shared_memory), ()))
     })
     .unwrap();
+    assert!(startup.is_none());
     let local = Arc::new(local);
 
     if args.get(3).and_then(|argument| argument.to_str()) == Some(NETWORK_RUNNER_ARGUMENT) {
@@ -372,9 +373,9 @@ fn run_fake_runner(args: &[OsString]) {
     drop(local);
 }
 
-fn run_fake_prepared_child(control_socket_path: &Path) {
+fn run_fake_child(control_socket_path: &Path) {
     let setup_channel = connect_control_with_retry(control_socket_path).unwrap();
-    let (local, bootstrap, ()) = BrokerLocal::negotiate_prepared(setup_channel, |mut setup| {
+    let (local, bootstrap, ()) = BrokerLocal::negotiate(setup_channel, |mut setup| {
         let shared_memory = setup.receive_memfd(
             SHARED_BUFFER_POOL_SIZE,
             Some(Instant::now() + Duration::from_secs(5)),
@@ -391,6 +392,7 @@ fn run_fake_prepared_child(control_socket_path: &Path) {
         Ok((call_channel, Arc::new(shared_memory), ()))
     })
     .unwrap();
+    let bootstrap = bootstrap.expect("child negotiation must include startup data");
     if bootstrap.format == FAILING_BOOTSTRAP_FORMAT {
         return;
     }
@@ -407,7 +409,7 @@ fn run_fake_prepared_child(control_socket_path: &Path) {
     match local.process_ready(None) {
         Ok(()) => {}
         Err(BrokerLocalError::Broker(ErrorCode::PeerClosed)) => return,
-        Err(error) => panic!("prepared child readiness failed: {error}"),
+        Err(error) => panic!("child readiness failed: {error}"),
     }
     std::fs::OpenOptions::new()
         .append(true)

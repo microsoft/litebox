@@ -59,6 +59,8 @@ fn spawn_host(
         let mut control = UnixStreamHostSetupChannel::from_accepted(stream);
         let association = setup_connection(
             &broker,
+            None,
+            None,
             &mut control,
             &shared_buffers,
             Arc::new(ReadinessPublisherRuntime::new()),
@@ -91,7 +93,7 @@ fn negotiate_local(
     BrokerLocal<UnixControlRingLocalCallChannel>,
     BrokerNotifications<UnixControlRingLocalNotificationChannel>,
 ) {
-    let (local, notifications) = BrokerLocal::negotiate(
+    let (local, _startup, notifications) = BrokerLocal::negotiate(
         UnixStreamLocalSetupChannel::from_connected(stream),
         |mut setup| {
             let shared_memory = setup.receive_memfd(SHARED_BUFFER_POOL_SIZE, None)?;
@@ -150,6 +152,8 @@ fn host_serves_control_requests_and_notifications_over_shared_rings() {
         let mut control = UnixStreamHostSetupChannel::from_accepted(host_control);
         let association = setup_connection(
             &broker,
+            None,
+            None,
             &mut control,
             &host_shared_buffers,
             Arc::new(ReadinessPublisherRuntime::new()),
@@ -176,7 +180,7 @@ fn host_serves_control_requests_and_notifications_over_shared_rings() {
         }
     });
 
-    let (local, notification_channel) = BrokerLocal::negotiate(
+    let (local, _startup, notification_channel) = BrokerLocal::negotiate(
         UnixStreamLocalSetupChannel::from_connected(local_control),
         |mut setup| {
             let shared_memory = setup.receive_memfd(SHARED_BUFFER_POOL_SIZE, None)?;

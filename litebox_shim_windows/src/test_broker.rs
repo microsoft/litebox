@@ -77,7 +77,7 @@ fn connect(
 ) -> (litebox::LiteBox<TestPlatform>, usize) {
     let setup = InProcessBrokerSetup::new(broker);
     let readiness = setup.readiness_sink();
-    let (broker_local, ()) = BrokerLocal::negotiate(setup, |setup| {
+    let (broker_local, _startup, ()) = BrokerLocal::negotiate(setup, |setup| {
         let memory = setup.shared_memory();
         Ok((setup.activate(), memory, ()))
     })

@@ -286,10 +286,7 @@ impl HostSetupChannel for UnixStreamHostSetupChannel {
             &encode_handshake_response(response.clone()),
             self.setup_deadline,
         )?;
-        self.negotiated = matches!(
-            response,
-            BrokerHandshakeResponse::Negotiated { .. } | BrokerHandshakeResponse::Prepared { .. }
-        );
+        self.negotiated = matches!(response, BrokerHandshakeResponse::Negotiated { .. });
         Ok(())
     }
 }
@@ -616,6 +613,7 @@ mod tests {
         host.send_handshake_response(&BrokerHandshakeResponse::Negotiated {
             broker_protocol_version: BROKER_PROTOCOL_VERSION,
             process_id: litebox_broker_protocol::ProcessId(1),
+            startup: None,
         })
         .unwrap();
         assert!(matches!(

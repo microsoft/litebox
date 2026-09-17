@@ -27,8 +27,8 @@ use std::time::{Duration, Instant};
 
 use litebox_broker_core::BrokerCore;
 use litebox_broker_host::{
-    BrokerHostAssociation, BrokerHostError, ConnectionTermination, PreparedProcessBootstrap,
-    setup_connection, setup_prepared_connection,
+    BrokerHostAssociation, BrokerHostError, ConnectionTermination, ProcessStartupData,
+    setup_connection,
 };
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::message::BrokerRequest;
@@ -41,7 +41,7 @@ use litebox_broker_transport::control_ring::ControlRing;
 use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedBufferPool, SharedMemory};
 
 use crate::readiness::ReadinessPublisherRuntime;
-use crate::runner::{PreparedRunner, RunnerChildren};
+use crate::runner::{ChildRunner, RunnerChildren};
 
 const REQUEST_QUEUE_CAPACITY: usize = 64;
 const REQUEST_QUEUE_RETRY_DELAY: Duration = Duration::from_millis(1);
@@ -94,6 +94,7 @@ where
         send_shared_memory,
         activate,
         None,
+        None,
     )
 }
 
@@ -105,7 +106,7 @@ pub(crate) fn serve_runner_association<
     NotificationChannel,
     Shutdown,
 >(
-    broker: &BrokerCore,
+    child: Option<ChildRunner>,
     control_channel: SetupChannel,
     create_shared_memory: impl FnOnce() -> IoResult<Memory>,
     create_control_memory: impl FnOnce() -> IoResult<Memory>,
@@ -124,17 +125,20 @@ where
     NotificationChannel: HostNotificationChannel<Error = IoError> + Send,
     Shutdown: HostAssociationShutdown<Error = IoError> + Send + Sync,
 {
+    let broker = children.broker.clone();
     serve_association_with_children(
-        broker,
+        &broker,
         control_channel,
         create_shared_memory,
         create_control_memory,
         send_shared_memory,
         activate,
         Some(children),
+        child,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve_association_with_children<
     Memory,
     SetupChannel,
@@ -153,6 +157,7 @@ fn serve_association_with_children<
         ControlRing<Memory>,
     ) -> IoResult<(RequestSource, ResponseSink, NotificationChannel, Shutdown)>,
     children: Option<Arc<RunnerChildren>>,
+    child: Option<ChildRunner>,
 ) -> IoResult<()>
 where
     Memory: ControlRingMemory,
@@ -162,6 +167,25 @@ where
     NotificationChannel: HostNotificationChannel<Error = IoError> + Send,
     Shutdown: HostAssociationShutdown<Error = IoError> + Send + Sync,
 {
+    let is_child = child.is_some();
+    let (process, startup) = match child {
+        Some(ChildRunner {
+            process,
+            inherited_objects,
+            format,
+            version,
+            bootstrap,
+        }) => (
+            Some(process),
+            Some(ProcessStartupData {
+                format,
+                version,
+                payload: bootstrap,
+                inherited_objects,
+            }),
+        ),
+        None => (None, None),
+    };
     let shared_memory = create_shared_memory()?;
     let shared_buffers = SharedBufferPool::new(shared_memory, SHARED_BUFFER_LAYOUT)
         .map_err(|error| IoError::new(ErrorKind::InvalidData, error.to_string()))?;
@@ -171,6 +195,8 @@ where
     let readiness = Arc::new(ReadinessPublisherRuntime::new());
     let association = match setup_connection(
         broker,
+        process,
+        startup,
         &mut control_channel,
         &shared_buffers,
         readiness.clone(),
@@ -202,7 +228,9 @@ where
         match activate(control_channel, control_ring) {
             Ok(active) => active,
             Err(error) => {
-                association.finish();
+                if !is_child {
+                    association.finish();
+                }
                 return Err(error);
             }
         };
@@ -214,99 +242,6 @@ where
         notification_channel,
         shutdown,
         children,
-    )
-}
-
-pub(crate) fn serve_prepared_association<
-    Memory,
-    SetupChannel,
-    RequestSource,
-    ResponseSink,
-    NotificationChannel,
-    Shutdown,
->(
-    prepared: PreparedRunner,
-    mut control_channel: SetupChannel,
-    create_shared_memory: impl FnOnce() -> IoResult<Memory>,
-    create_control_memory: impl FnOnce() -> IoResult<Memory>,
-    send_shared_memory: impl FnOnce(&mut SetupChannel, &Memory, &Memory) -> IoResult<()>,
-    activate: impl FnOnce(
-        SetupChannel,
-        ControlRing<Memory>,
-    ) -> IoResult<(RequestSource, ResponseSink, NotificationChannel, Shutdown)>,
-    children: Arc<RunnerChildren>,
-) -> IoResult<()>
-where
-    Memory: ControlRingMemory,
-    SetupChannel: HostSetupChannel<Error = IoError>,
-    RequestSource: HostRequestSource<Error = IoError>,
-    ResponseSink: HostResponseSink<Error = IoError> + Clone + Send,
-    NotificationChannel: HostNotificationChannel<Error = IoError> + Send,
-    Shutdown: HostAssociationShutdown<Error = IoError> + Send + Sync,
-{
-    let PreparedRunner {
-        pending,
-        format,
-        version,
-        bootstrap,
-    } = prepared;
-    let shared_memory = create_shared_memory()?;
-    let shared_buffers = SharedBufferPool::new(shared_memory, SHARED_BUFFER_LAYOUT)
-        .map_err(|error| IoError::new(ErrorKind::InvalidData, error.to_string()))?;
-    let control_memory = create_control_memory()?;
-    let control_ring = ControlRing::new(control_memory)
-        .map_err(|error| IoError::other(format!("failed to create control ring: {error:?}")))?;
-    let readiness = Arc::new(ReadinessPublisherRuntime::new());
-    let association = match setup_prepared_connection(
-        pending,
-        &mut control_channel,
-        &shared_buffers,
-        readiness.clone(),
-        PreparedProcessBootstrap {
-            format,
-            version,
-            payload: &bootstrap,
-        },
-        |channel| send_shared_memory(channel, shared_buffers.memory(), control_ring.memory()),
-    )
-    .map_err(map_host_error)?
-    {
-        Ok(association) => association,
-        Err(ConnectionTermination::PeerClosed) => {
-            return Err(IoError::new(
-                ErrorKind::UnexpectedEof,
-                "prepared runner closed before completing broker setup",
-            ));
-        }
-        Err(ConnectionTermination::ProtocolViolation) => {
-            return Err(IoError::new(
-                ErrorKind::InvalidData,
-                "prepared runner violated the broker protocol during setup",
-            ));
-        }
-        Err(_) => {
-            return Err(IoError::new(
-                ErrorKind::InvalidData,
-                "prepared runner ended broker setup unexpectedly",
-            ));
-        }
-    };
-    let (request_source, response_sink, notification_channel, shutdown) =
-        match activate(control_channel, control_ring) {
-            Ok(active) => active,
-            Err(error) => {
-                association.finish();
-                return Err(error);
-            }
-        };
-    dispatch_requests_with_children(
-        association,
-        readiness,
-        request_source,
-        response_sink,
-        notification_channel,
-        shutdown,
-        Some(children),
     )
 }
 
@@ -850,6 +785,7 @@ mod tests {
             .send_handshake_response(&BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
                 process_id: litebox_broker_protocol::ProcessId(1),
+                startup: None,
             })
             .unwrap();
         local_setup.recv_handshake_response().unwrap().unwrap();
@@ -892,27 +828,28 @@ mod tests {
         UnixControlRingLocalNotificationChannel,
         UnixControlRingLocalShutdown,
     ) {
-        let (local, (notifications, shutdown)) = litebox_broker_local::BrokerLocal::negotiate(
-            UnixStreamLocalSetupChannel::from_connected(stream),
-            |mut setup| {
-                let shared_memory = setup.receive_memfd(SHARED_BUFFER_POOL_SIZE, None)?;
-                let control_memory = setup.receive_control_ring(None)?;
-                let control_ring = ControlRing::new(control_memory).map_err(|error| {
-                    IoError::new(
-                        ErrorKind::InvalidData,
-                        format!("invalid test control ring: {error:?}"),
-                    )
-                })?;
-                let (call_channel, notifications, shutdown) =
-                    setup.into_active(control_ring, || {})?;
-                Ok((
-                    call_channel,
-                    Arc::new(shared_memory),
-                    (notifications, shutdown),
-                ))
-            },
-        )
-        .unwrap();
+        let (local, _startup, (notifications, shutdown)) =
+            litebox_broker_local::BrokerLocal::negotiate(
+                UnixStreamLocalSetupChannel::from_connected(stream),
+                |mut setup| {
+                    let shared_memory = setup.receive_memfd(SHARED_BUFFER_POOL_SIZE, None)?;
+                    let control_memory = setup.receive_control_ring(None)?;
+                    let control_ring = ControlRing::new(control_memory).map_err(|error| {
+                        IoError::new(
+                            ErrorKind::InvalidData,
+                            format!("invalid test control ring: {error:?}"),
+                        )
+                    })?;
+                    let (call_channel, notifications, shutdown) =
+                        setup.into_active(control_ring, || {})?;
+                    Ok((
+                        call_channel,
+                        Arc::new(shared_memory),
+                        (notifications, shutdown),
+                    ))
+                },
+            )
+            .unwrap();
         (local, notifications, shutdown)
     }
 
@@ -954,6 +891,8 @@ mod tests {
             );
             let association = setup_connection(
                 &broker,
+                None,
+                None,
                 &mut control,
                 &shared_buffers,
                 readiness.clone(),

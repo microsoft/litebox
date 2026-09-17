@@ -158,10 +158,7 @@ impl HostSetupChannel for WindowsNamedPipeHostSetupChannel {
             &encode_handshake_response(response.clone()),
             self.setup_deadline,
         )?;
-        self.negotiated = matches!(
-            response,
-            BrokerHandshakeResponse::Negotiated { .. } | BrokerHandshakeResponse::Prepared { .. }
-        );
+        self.negotiated = matches!(response, BrokerHandshakeResponse::Negotiated { .. });
         Ok(())
     }
 }

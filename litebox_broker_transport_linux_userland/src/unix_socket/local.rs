@@ -307,11 +307,7 @@ impl LocalSetupChannel for UnixStreamLocalSetupChannel {
         match frame {
             Some(frame) => {
                 let response = decode_handshake_response(&frame).map_err(wire_error)?;
-                self.negotiated = matches!(
-                    &response,
-                    BrokerHandshakeResponse::Negotiated { .. }
-                        | BrokerHandshakeResponse::Prepared { .. }
-                );
+                self.negotiated = matches!(&response, BrokerHandshakeResponse::Negotiated { .. });
                 Ok(Some(response))
             }
             None => Ok(None),
@@ -712,6 +708,7 @@ mod control_ring_tests {
             &encode_handshake_response(BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: litebox_broker_protocol::BROKER_PROTOCOL_VERSION,
                 process_id: litebox_broker_protocol::ProcessId(1),
+                startup: None,
             }),
             None,
         )

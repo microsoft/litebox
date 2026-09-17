@@ -10,7 +10,7 @@ use std::process::{Child, Command, ExitStatus};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use litebox_broker_core::{BrokerCore, BrokerProcess, PendingProcess, ProcessStartCommit};
+use litebox_broker_core::{BrokerCore, BrokerProcess};
 use litebox_broker_host::{BrokerHostExtensionError, copy_shared_buffer};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult};
@@ -18,7 +18,7 @@ use litebox_broker_protocol::process::{
     MAX_PROCESS_BOOTSTRAP_SIZE, ProcessBootstrapFormat, ProcessBootstrapVersion, ProcessStartToken,
     StartedProcess,
 };
-use litebox_broker_protocol::{ProcessId, ThreadId};
+use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
 use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemory};
 
 #[cfg(target_os = "linux")]
@@ -33,14 +33,14 @@ use windows::PlatformRunnerEndpoint;
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(10);
-const PREPARED_CHILD_ARGUMENT: &str = "--prepared-child";
+const CHILD_ARGUMENT: &str = "--child";
 const MAX_PENDING_CHILD_STARTS: usize = crate::WORKER_COUNT - 1;
 const _: () = assert!(MAX_PENDING_CHILD_STARTS > 0);
 
 /// Configuration for starting one out-of-process runner.
 ///
 /// Dynamically started descendants use the same executable with the hidden
-/// `--prepared-child` argument instead of the root arguments.
+/// `--child` argument instead of the root arguments.
 #[derive(Clone)]
 pub struct RunnerConfig {
     executable: PathBuf,
@@ -81,10 +81,10 @@ impl RunnerConfig {
         arguments
     }
 
-    fn prepared_child(&self) -> Self {
+    fn child(&self) -> Self {
         Self {
             executable: self.executable.clone(),
-            arguments: vec![OsString::from(PREPARED_CHILD_ARGUMENT)],
+            arguments: vec![OsString::from(CHILD_ARGUMENT)],
             proxy_url: self.proxy_url.clone(),
         }
     }
@@ -107,7 +107,7 @@ impl RunnerInstance {
         let runner = Command::new(&config.executable)
             .args(config.arguments(endpoint.control_channel()))
             .spawn()?;
-        let child_config = config.prepared_child();
+        let child_config = config.child();
         Ok(Self {
             runner,
             endpoint,
@@ -121,10 +121,8 @@ impl RunnerInstance {
     /// non-successful runner exit is returned as ordinary instance data for the
     /// caller to interpret.
     pub fn run_to_completion(mut self, broker: &BrokerCore) -> IoResult<ExitStatus> {
-        let children = RunnerChildren::new(self.child_config.clone());
-        let association_result =
-            self.endpoint
-                .serve(broker, &mut self.runner, Arc::clone(&children));
+        let children = RunnerChildren::new(self.child_config.clone(), broker.clone());
+        let association_result = self.endpoint.serve(&mut self.runner, Arc::clone(&children));
         self.endpoint.close();
         if association_result.is_err() {
             let _ = self.runner.kill();
@@ -136,14 +134,12 @@ impl RunnerInstance {
         Ok(runner_status)
     }
 
-    fn run_prepared_to_completion(
+    fn run_child_to_completion(
         mut self,
-        prepared: PreparedRunner,
+        child: ChildRunner,
         children: Arc<RunnerChildren>,
     ) -> IoResult<ExitStatus> {
-        let association_result = self
-            .endpoint
-            .serve_prepared(&mut self.runner, prepared, children);
+        let association_result = self.endpoint.serve_child(&mut self.runner, child, children);
         self.endpoint.close();
         if association_result.is_err() {
             let _ = self.runner.kill();
@@ -165,13 +161,15 @@ impl Drop for RunnerInstance {
 }
 
 pub(crate) struct RunnerChildren {
+    pub(crate) broker: BrokerCore,
     config: RunnerConfig,
     state: Mutex<RunnerChildrenState>,
     drained: Condvar,
 }
 
-pub(crate) struct PreparedRunner {
-    pub(crate) pending: PendingProcess,
+pub(crate) struct ChildRunner {
+    pub(crate) process: Arc<BrokerProcess>,
+    pub(crate) inherited_objects: Vec<ObjectHandle>,
     pub(crate) format: ProcessBootstrapFormat,
     pub(crate) version: ProcessBootstrapVersion,
     pub(crate) bootstrap: Vec<u8>,
@@ -184,8 +182,7 @@ struct RunnerChildrenState {
 
 struct ChildLaunch {
     parent_id: ProcessId,
-    child_id: ProcessId,
-    start_commit: ProcessStartCommit,
+    process: Arc<BrokerProcess>,
     state: Mutex<ChildLaunchState>,
     changed: Condvar,
 }
@@ -202,8 +199,9 @@ enum ChildLaunchState {
 }
 
 impl RunnerChildren {
-    fn new(config: RunnerConfig) -> Arc<Self> {
+    fn new(config: RunnerConfig, broker: BrokerCore) -> Arc<Self> {
         Arc::new(Self {
+            broker,
             config,
             state: Mutex::new(RunnerChildrenState {
                 launches: Vec::new(),
@@ -275,49 +273,56 @@ impl RunnerChildren {
         if !parent.is_running() {
             return Err(ErrorCode::ProtocolState);
         }
-        let pending = parent
-            .prepare_child(requested_inherited_objects)
+        let (process, inherited_objects) = parent
+            .create_child(requested_inherited_objects)
             .map_err(ErrorCode::from)?;
-        let child_id = pending.id();
+        let child_id = process.id();
         let launch = Arc::new(ChildLaunch {
             parent_id: parent.id(),
-            child_id,
-            start_commit: pending.start_commit(),
+            process: Arc::clone(&process),
             state: Mutex::new(ChildLaunchState::Starting),
             changed: Condvar::new(),
         });
-        let token = loop {
-            let mut token = [0; 8];
-            getrandom::fill(&mut token).map_err(|_| ErrorCode::Internal)?;
-            let token = ProcessStartToken(u64::from_ne_bytes(token));
-            let mut state = self
-                .state
-                .lock()
-                .expect("runner child state mutex poisoned");
-            state
-                .launches
-                .try_reserve(1)
-                .map_err(|_| ErrorCode::OutOfMemory)?;
-            if parent.is_cancellation_requested() {
-                return Err(ErrorCode::PeerClosed);
+        let token = match (|| {
+            loop {
+                let mut token = [0; 8];
+                getrandom::fill(&mut token).map_err(|_| ErrorCode::Internal)?;
+                let token = ProcessStartToken(u64::from_ne_bytes(token));
+                let mut state = self
+                    .state
+                    .lock()
+                    .expect("runner child state mutex poisoned");
+                state
+                    .launches
+                    .try_reserve(1)
+                    .map_err(|_| ErrorCode::OutOfMemory)?;
+                if parent.is_cancellation_requested() {
+                    return Err(ErrorCode::PeerClosed);
+                }
+                if state.launches.len() >= MAX_PENDING_CHILD_STARTS {
+                    return Err(ErrorCode::ResourceExhausted);
+                }
+                if state
+                    .launches
+                    .iter()
+                    .any(|(candidate, _)| *candidate == token)
+                {
+                    continue;
+                }
+                let active_instances = state
+                    .active_instances
+                    .checked_add(1)
+                    .ok_or(ErrorCode::ResourceExhausted)?;
+                state.launches.push((token, Arc::clone(&launch)));
+                state.active_instances = active_instances;
+                return Ok(token);
             }
-            if state.launches.len() >= MAX_PENDING_CHILD_STARTS {
-                return Err(ErrorCode::ResourceExhausted);
+        })() {
+            Ok(token) => token,
+            Err(error) => {
+                BrokerProcess::finish(process);
+                return Err(error);
             }
-            if state
-                .launches
-                .iter()
-                .any(|(candidate, _)| *candidate == token)
-            {
-                continue;
-            }
-            let active_instances = state
-                .active_instances
-                .checked_add(1)
-                .ok_or(ErrorCode::ResourceExhausted)?;
-            state.launches.push((token, Arc::clone(&launch)));
-            state.active_instances = active_instances;
-            break token;
         };
 
         let children = Arc::clone(self);
@@ -326,11 +331,12 @@ impl RunnerChildren {
         let thread = std::thread::Builder::new()
             .name(format!("litebox-runner-{}", child_id.0))
             .spawn(move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     RunnerInstance::start(config).and_then(|instance| {
-                        instance.run_prepared_to_completion(
-                            PreparedRunner {
-                                pending,
+                        instance.run_child_to_completion(
+                            ChildRunner {
+                                process,
+                                inherited_objects,
                                 format,
                                 version,
                                 bootstrap,
@@ -338,12 +344,20 @@ impl RunnerChildren {
                             Arc::clone(&children),
                         )
                     })
-                }))
-                .unwrap_or_else(|_| Err(IoError::other("prepared runner thread panicked")));
-                children.child_finished(token, &thread_launch, result);
+                }));
+                match outcome {
+                    Ok(result) => children.child_finished(token, &thread_launch, result, false),
+                    Err(_) => children.child_finished(
+                        token,
+                        &thread_launch,
+                        Err(IoError::other("child runner thread panicked")),
+                        true,
+                    ),
+                }
             });
         if thread.is_err() {
             self.remove_launch(token);
+            BrokerProcess::finish(Arc::clone(&launch.process));
             self.finish_instance();
             return Err(ErrorCode::OutOfMemory);
         }
@@ -393,7 +407,7 @@ impl RunnerChildren {
                     .launches
                     .iter()
                     .position(|(_, launch)| {
-                        launch.parent_id == process_id || launch.child_id == process_id
+                        launch.parent_id == process_id || launch.process.id() == process_id
                     })
                     .map(|index| state.launches.swap_remove(index).1)
             };
@@ -419,7 +433,7 @@ impl RunnerChildren {
             .expect("runner child state mutex poisoned")
             .launches
             .iter()
-            .find_map(|(_, launch)| (launch.child_id == child_id).then(|| Arc::clone(launch)))
+            .find_map(|(_, launch)| (launch.process.id() == child_id).then(|| Arc::clone(launch)))
     }
 
     fn remove_launch(&self, token: ProcessStartToken) {
@@ -441,11 +455,15 @@ impl RunnerChildren {
         token: ProcessStartToken,
         launch: &ChildLaunch,
         result: IoResult<ExitStatus>,
+        panicked: bool,
     ) {
         if result.is_err() || result.is_ok_and(|status| !status.success()) {
             launch.abort(ErrorCode::PeerClosed);
         }
         self.remove_launch(token);
+        if !panicked {
+            BrokerProcess::finish(Arc::clone(&launch.process));
+        }
         self.finish_instance();
     }
 
@@ -550,7 +568,7 @@ impl ChildLaunch {
                 _ => ErrorCode::ProtocolState,
             });
         }
-        self.start_commit.commit().map_err(ErrorCode::from)?;
+        self.process.commit_start().map_err(ErrorCode::from)?;
         *state = ChildLaunchState::Committed;
         self.changed.notify_all();
         Ok(())

@@ -69,7 +69,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Reports that this prepared process is ready and waits for parent acknowledgement.
+    /// Reports that this child process is ready and waits for parent acknowledgement.
     ///
     /// # Panics
     ///

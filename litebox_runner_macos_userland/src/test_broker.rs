@@ -69,7 +69,7 @@ pub(crate) fn setup(
     .map_err(|error| anyhow!("test broker: {error:?}"))?;
     let setup = InProcessBrokerSetup::new(core);
     let readiness = setup.readiness_sink();
-    let (local, ()) = BrokerLocal::negotiate(setup, |setup| {
+    let (local, _startup, ()) = BrokerLocal::negotiate(setup, |setup| {
         let memory = setup.shared_memory();
         Ok((setup.activate(), memory, ()))
     })

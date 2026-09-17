@@ -107,10 +107,9 @@ pub struct BrokerProcess {
     pub(crate) core: BrokerCore,
     /// Assigned process ID and internal authority.
     pub(crate) id: ProcessId,
-    cleaned_up: bool,
     /// Authoritative parent process ID, absent for a root process.
     parent_id: Option<ProcessId>,
-    state: Arc<Mutex<ProcessState>>,
+    state: Mutex<ProcessState>,
     /// Broker-entry-authenticated caller credential for this process.
     pub(crate) caller_credential: CallerCredential,
     /// Handles of the live object references owned by this process.
@@ -132,92 +131,6 @@ pub(crate) enum ProcessState {
     Exiting,
 }
 
-/// Commit authority for one broker-reserved child process.
-#[derive(Clone)]
-pub struct ProcessStartCommit(Arc<Mutex<ProcessState>>);
-
-impl ProcessStartCommit {
-    /// Commits a prepared child after its start result reaches the parent.
-    pub fn commit(&self) -> Result<()> {
-        let mut state = self.0.lock();
-        match *state {
-            ProcessState::Attaching => {
-                *state = ProcessState::Running;
-                Ok(())
-            }
-            ProcessState::Running => Err(BrokerError::Internal),
-            ProcessState::Exiting => Err(BrokerError::PeerClosed),
-        }
-    }
-}
-
-/// Broker-reserved child process awaiting association setup.
-pub struct PendingProcess {
-    process: Option<Arc<BrokerProcess>>,
-    start_commit: ProcessStartCommit,
-    inherited_objects: Vec<ObjectHandle>,
-}
-
-impl PendingProcess {
-    /// Returns the reserved child process ID.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the pending process was internally transferred twice.
-    #[must_use]
-    pub fn id(&self) -> ProcessId {
-        self.process
-            .as_ref()
-            .expect("pending process must remain active")
-            .id()
-    }
-
-    /// Returns commit authority without transferring association ownership.
-    #[must_use]
-    pub fn start_commit(&self) -> ProcessStartCommit {
-        self.start_commit.clone()
-    }
-
-    /// Returns child-owned handles in the parent's inheritance-manifest order.
-    #[must_use]
-    pub fn inherited_objects(&self) -> &[ObjectHandle] {
-        &self.inherited_objects
-    }
-
-    /// Returns the credential inherited from the parent process.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the pending process was internally transferred twice.
-    #[must_use]
-    pub fn caller_credential(&self) -> CallerCredential {
-        self.process
-            .as_ref()
-            .expect("pending process must remain active")
-            .caller_credential
-    }
-
-    /// Transfers the reserved process into its authenticated association.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the pending process was internally transferred twice.
-    #[must_use]
-    pub fn attach(mut self) -> Arc<BrokerProcess> {
-        self.process
-            .take()
-            .expect("pending process must remain active")
-    }
-}
-
-impl Drop for PendingProcess {
-    fn drop(&mut self) {
-        if let Some(process) = self.process.take() {
-            BrokerProcess::finish(process);
-        }
-    }
-}
-
 impl BrokerProcess {
     /// Creates authenticated broker process state.
     pub(crate) fn new(
@@ -230,9 +143,8 @@ impl BrokerProcess {
         Self {
             core,
             id,
-            cleaned_up: false,
             parent_id,
-            state: Arc::new(Mutex::new(state)),
+            state: Mutex::new(state),
             caller_credential,
             references: Mutex::new(ProcessReferences {
                 handles: Vec::new(),
@@ -257,36 +169,64 @@ impl BrokerProcess {
         self.parent_id
     }
 
+    /// Returns the credential authenticated for this process association.
+    #[must_use]
+    pub const fn caller_credential(&self) -> CallerCredential {
+        self.caller_credential
+    }
+
     /// Returns whether parent acknowledgement committed this process.
     #[must_use]
     pub fn is_running(&self) -> bool {
         *self.state.lock() == ProcessState::Running
     }
 
-    /// Reserves one child process inheriting this process's authenticated credential.
-    pub fn prepare_child(&self, inherited_objects: &[ObjectHandle]) -> Result<PendingProcess> {
+    /// Commits this child after its start result reaches the parent.
+    pub fn commit_start(&self) -> Result<()> {
+        let mut state = self.state.lock();
+        match *state {
+            ProcessState::Attaching => {
+                *state = ProcessState::Running;
+                Ok(())
+            }
+            ProcessState::Running => Err(BrokerError::Internal),
+            ProcessState::Exiting => Err(BrokerError::PeerClosed),
+        }
+    }
+
+    /// Creates one child process inheriting this process's authenticated credential.
+    ///
+    /// Returned handles follow the requested inheritance order. If later host
+    /// launch or association setup fails normally, the caller must finish the
+    /// returned process; dropping it preserves its IDs as unwind protection.
+    pub fn create_child(
+        &self,
+        inherited_objects: &[ObjectHandle],
+    ) -> Result<(Arc<BrokerProcess>, Vec<ObjectHandle>)> {
         let process = self.core.create_process_with_parent(
             Some(self.id),
             self.caller_credential,
             ProcessState::Attaching,
         )?;
-        let start_commit = ProcessStartCommit(Arc::clone(&process.state));
-        let mut pending = PendingProcess {
-            process: Some(process),
-            start_commit,
-            inherited_objects: Vec::new(),
-        };
-        pending
-            .inherited_objects
-            .try_reserve_exact(inherited_objects.len())
-            .map_err(|_| BrokerError::OutOfMemory)?;
-        for handle in inherited_objects {
-            let child = pending.process.as_ref().ok_or(BrokerError::Internal)?;
-            let child_handle =
-                self.duplicate_object_reference_to_preserving_rights(*handle, child)?;
-            pending.inherited_objects.push(child_handle);
+        let inherited_result = (|| {
+            let mut child_handles = Vec::new();
+            child_handles
+                .try_reserve_exact(inherited_objects.len())
+                .map_err(|_| BrokerError::OutOfMemory)?;
+            for handle in inherited_objects {
+                let child_handle =
+                    self.duplicate_object_reference_to_preserving_rights(*handle, &process)?;
+                child_handles.push(child_handle);
+            }
+            Ok(child_handles)
+        })();
+        match inherited_result {
+            Ok(child_handles) => Ok((process, child_handles)),
+            Err(error) => {
+                BrokerProcess::finish(process);
+                Err(error)
+            }
         }
-        Ok(pending)
     }
 
     /// Creates a broker thread belonging to this process.
@@ -357,15 +297,9 @@ impl BrokerProcess {
     ///
     /// Dropping a process without calling this method performs authority
     /// cleanup but leaves its numeric IDs occupied so they cannot be reused
-    /// after an unwind.
-    /// # Panics
-    ///
-    /// Panics if another owner still holds this process.
+    /// after an unwind. Calling this method more than once is harmless.
     pub fn finish(self: Arc<Self>) {
-        let Ok(mut process) = Arc::try_unwrap(self) else {
-            panic!("all broker process owners must be released before teardown");
-        };
-        process.cleanup(true);
+        self.cleanup(true);
     }
 
     pub(crate) fn create_object_reference(&self, object: ObjectEntry) -> Result<ObjectHandle> {
@@ -761,12 +695,13 @@ impl BrokerProcess {
         Ok(reference)
     }
 
-    fn cleanup(&mut self, release_ids: bool) -> bool {
-        if self.cleaned_up {
+    fn cleanup(&self, release_ids: bool) -> bool {
+        let mut process_state = self.state.lock();
+        if *process_state == ProcessState::Exiting {
             return false;
         }
-        self.cleaned_up = true;
-        *self.state.lock() = ProcessState::Exiting;
+        *process_state = ProcessState::Exiting;
+        drop(process_state);
 
         let mut invariant_fault = self.references.lock().pending_handles != 0;
         loop {
@@ -974,7 +909,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_child_is_parented_and_requires_commit() {
+    fn child_is_parented_and_requires_commit() {
         let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
@@ -984,11 +919,9 @@ mod tests {
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let source_handle = crate::event::create(&parent, 1).unwrap();
-        let pending = parent.prepare_child(&[source_handle]).unwrap();
-        let child_id = pending.id();
-        let inherited_handle = pending.inherited_objects()[0];
-        let start_commit = pending.start_commit();
-        let child = pending.attach();
+        let (child, inherited_objects) = parent.create_child(&[source_handle]).unwrap();
+        let child_id = child.id();
+        let inherited_handle = inherited_objects[0];
 
         assert_eq!(child.id(), child_id);
         assert_eq!(child.parent_id(), Some(parent.id()));
@@ -999,12 +932,12 @@ mod tests {
         );
         assert!(!child.is_running());
 
-        start_commit.commit().unwrap();
+        child.commit_start().unwrap();
         assert!(child.is_running());
     }
 
     #[test]
-    fn dropped_prepared_child_releases_process_capacity() {
+    fn finished_uncommitted_child_releases_process_capacity() {
         let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
@@ -1014,37 +947,18 @@ mod tests {
         let parent = broker
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
-        let pending = parent.prepare_child(&[]).unwrap();
+        let (child, _) = parent.create_child(&[]).unwrap();
 
         assert_eq!(
-            parent.prepare_child(&[]).err(),
+            parent.create_child(&[]).err(),
             Some(BrokerError::ResourceExhausted)
         );
-        drop(pending);
-        assert!(parent.prepare_child(&[]).is_ok());
-    }
-
-    #[test]
-    fn prepared_child_cannot_commit_after_teardown() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
-            ObjectRights::all(),
-        ))
-        .build()
-        .unwrap();
-        let parent = broker
-            .create_process(CallerCredential::Unauthenticated)
-            .unwrap();
-        let pending = parent.prepare_child(&[]).unwrap();
-        let start_commit = pending.start_commit();
-        let child = pending.attach();
-
         child.finish();
-
-        assert_eq!(start_commit.commit(), Err(BrokerError::PeerClosed));
+        assert!(parent.create_child(&[]).is_ok());
     }
 
     #[test]
-    fn attached_child_releases_process_capacity_after_teardown() {
+    fn child_cannot_commit_after_teardown() {
         let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
@@ -1054,14 +968,35 @@ mod tests {
         let parent = broker
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
-        let child = parent.prepare_child(&[]).unwrap().attach();
+        let (child, _) = parent.create_child(&[]).unwrap();
+
+        Arc::clone(&child).finish();
+        Arc::clone(&child).finish();
+
+        assert_eq!(child.commit_start(), Err(BrokerError::PeerClosed));
+        let (replacement, _) = parent.create_child(&[]).unwrap();
+        replacement.finish();
+    }
+
+    #[test]
+    fn child_releases_process_capacity_after_teardown() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .with_limits(BrokerCoreLimits::DEFAULT.with_process_limit(2))
+        .build()
+        .unwrap();
+        let parent = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let (child, _) = parent.create_child(&[]).unwrap();
 
         assert_eq!(
-            parent.prepare_child(&[]).err(),
+            parent.create_child(&[]).err(),
             Some(BrokerError::ResourceExhausted)
         );
         child.finish();
-        assert!(parent.prepare_child(&[]).is_ok());
+        assert!(parent.create_child(&[]).is_ok());
     }
 
     #[test]

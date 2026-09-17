@@ -8,14 +8,13 @@ use std::process::Child;
 use std::sync::Arc;
 use std::time::Instant;
 
-use litebox_broker_core::BrokerCore;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport_windows_userland::named_pipe::{
     WindowsNamedPipeHostSetupChannel, WindowsNamedPipeListener, validate_client_process,
 };
 use litebox_broker_transport_windows_userland::shared_memory::WindowsSharedMemory;
 
-use super::{PreparedRunner, RunnerChildren, SETUP_TIMEOUT, accept_runner_channel};
+use super::{ChildRunner, RunnerChildren, SETUP_TIMEOUT, accept_runner_channel};
 
 pub(super) struct PlatformRunnerEndpoint {
     pipe_name: OsString,
@@ -38,12 +37,10 @@ impl PlatformRunnerEndpoint {
 
     pub(super) fn serve(
         &mut self,
-        broker: &BrokerCore,
         runner: &mut Child,
         children: Arc<RunnerChildren>,
     ) -> IoResult<()> {
         serve_runner_process(
-            broker,
             self.listener
                 .as_mut()
                 .expect("a live runner instance must own its control listener"),
@@ -52,18 +49,18 @@ impl PlatformRunnerEndpoint {
         )
     }
 
-    pub(super) fn serve_prepared(
+    pub(super) fn serve_child(
         &mut self,
         runner: &mut Child,
-        prepared: PreparedRunner,
+        child: ChildRunner,
         children: Arc<RunnerChildren>,
     ) -> IoResult<()> {
-        serve_prepared_runner_process(
+        serve_child_runner_process(
             self.listener
                 .as_mut()
                 .expect("a live runner instance must own its control listener"),
             runner,
-            prepared,
+            child,
             children,
         )
     }
@@ -74,7 +71,6 @@ impl PlatformRunnerEndpoint {
 }
 
 fn serve_runner_process(
-    broker: &BrokerCore,
     control_listener: &mut WindowsNamedPipeListener,
     runner: &mut Child,
     children: Arc<RunnerChildren>,
@@ -82,7 +78,7 @@ fn serve_runner_process(
     let (control_channel, _setup_deadline) = accept_control_channel(control_listener, runner)?;
     let runner_process = runner.as_raw_handle();
     crate::runtime::serve_runner_association(
-        broker,
+        None,
         control_channel,
         || WindowsSharedMemory::create(SHARED_BUFFER_POOL_SIZE),
         WindowsSharedMemory::create_control_ring,
@@ -95,16 +91,16 @@ fn serve_runner_process(
     )
 }
 
-fn serve_prepared_runner_process(
+fn serve_child_runner_process(
     control_listener: &mut WindowsNamedPipeListener,
     runner: &mut Child,
-    prepared: PreparedRunner,
+    child: ChildRunner,
     children: Arc<RunnerChildren>,
 ) -> IoResult<()> {
     let (control_channel, _setup_deadline) = accept_control_channel(control_listener, runner)?;
     let runner_process = runner.as_raw_handle();
-    crate::runtime::serve_prepared_association(
-        prepared,
+    crate::runtime::serve_runner_association(
+        Some(child),
         control_channel,
         || WindowsSharedMemory::create(SHARED_BUFFER_POOL_SIZE),
         WindowsSharedMemory::create_control_ring,

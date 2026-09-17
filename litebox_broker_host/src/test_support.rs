@@ -98,6 +98,8 @@ impl LocalSetupChannel for InProcessBrokerSetup {
         let readiness: Arc<dyn ReadinessSink> = self.readiness.clone();
         let association = crate::setup_connection(
             &self.broker,
+            None,
+            None,
             &mut host_setup,
             shared_buffers,
             readiness,

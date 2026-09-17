@@ -12,7 +12,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result};
-use litebox_broker_local::{BrokerLocal, BrokerNotifications, PreparedProcessBootstrap};
+use litebox_broker_local::{BrokerLocal, BrokerNotifications, ProcessStartupData};
 use litebox_broker_protocol::message::BrokerNotification;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport::control_ring::ControlRing;
@@ -40,6 +40,24 @@ pub struct BrokerConnection {
 
 /// Connects to and negotiates an association with a Linux-userland broker.
 pub fn connect(control_socket_path: &Path) -> Result<BrokerConnection> {
+    let (connection, startup) = connect_with_startup(control_socket_path)?;
+    if startup.is_some() {
+        anyhow::bail!("initial broker association returned child startup data");
+    }
+    Ok(connection)
+}
+
+/// Connects a child runner and receives its startup data.
+pub fn connect_child(control_socket_path: &Path) -> Result<(BrokerConnection, ProcessStartupData)> {
+    let (connection, startup) = connect_with_startup(control_socket_path)?;
+    let startup =
+        startup.ok_or_else(|| anyhow::anyhow!("child broker association omitted startup data"))?;
+    Ok((connection, startup))
+}
+
+fn connect_with_startup(
+    control_socket_path: &Path,
+) -> Result<(BrokerConnection, Option<ProcessStartupData>)> {
     let setup_deadline = Instant::now() + SETUP_TIMEOUT;
     let setup_channel = connect_with_retry(
         control_socket_path,
@@ -54,7 +72,7 @@ pub fn connect(control_socket_path: &Path) -> Result<BrokerConnection> {
         )
     })?;
     let association_coordinator = Arc::new(BrokerAssociationFailureCoordinator::new());
-    let (local, (notification_channel, positional_io_fds, shutdown_fd)) =
+    let (local, startup, (notification_channel, positional_io_fds, shutdown_fd)) =
         BrokerLocal::negotiate(setup_channel, |mut setup| {
             let shared_memory =
                 setup.receive_memfd(SHARED_BUFFER_POOL_SIZE, Some(setup_deadline))?;
@@ -85,64 +103,6 @@ pub fn connect(control_socket_path: &Path) -> Result<BrokerConnection> {
             ))
         })
         .context("broker negotiation failed")?;
-    Ok(BrokerConnection {
-        local,
-        notifications: BrokerNotifications::new(notification_channel),
-        coordinator: association_coordinator,
-        positional_io_fds,
-        shutdown_fd,
-    })
-}
-
-/// Connects to and negotiates a broker-reserved prepared Linux process.
-pub fn connect_prepared(
-    control_socket_path: &Path,
-) -> Result<(BrokerConnection, PreparedProcessBootstrap)> {
-    let setup_deadline = Instant::now() + SETUP_TIMEOUT;
-    let setup_channel = connect_with_retry(
-        control_socket_path,
-        setup_deadline,
-        "timed out connecting to broker",
-        |path, deadline| UnixStreamLocalSetupChannel::connect_with_setup_deadline(path, deadline),
-    )
-    .with_context(|| {
-        format!(
-            "failed to connect to broker at {}",
-            control_socket_path.display()
-        )
-    })?;
-    let association_coordinator = Arc::new(BrokerAssociationFailureCoordinator::new());
-    let (local, bootstrap, (notification_channel, positional_io_fds, shutdown_fd)) =
-        BrokerLocal::negotiate_prepared(setup_channel, |mut setup| {
-            let shared_memory =
-                setup.receive_memfd(SHARED_BUFFER_POOL_SIZE, Some(setup_deadline))?;
-            let control_memory = setup.receive_control_ring(Some(setup_deadline))?;
-            let positional_io_fds = [
-                shared_memory.as_fd().as_raw_fd(),
-                control_memory.as_fd().as_raw_fd(),
-            ];
-            let control_ring = ControlRing::new(control_memory).map_err(|error| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("invalid broker control ring: {error:?}"),
-                )
-            })?;
-            let weak_association_coordinator = Arc::downgrade(&association_coordinator);
-            let (call_channel, notification_channel, association_shutdown) =
-                setup.into_active(control_ring, move || {
-                    if let Some(association_coordinator) = weak_association_coordinator.upgrade() {
-                        association_coordinator.report_failure();
-                    }
-                })?;
-            let shutdown_fd = association_shutdown.as_fd().as_raw_fd();
-            association_coordinator.install_shutdown(association_shutdown)?;
-            Ok((
-                call_channel,
-                Arc::new(shared_memory),
-                (notification_channel, positional_io_fds, shutdown_fd),
-            ))
-        })
-        .context("prepared broker negotiation failed")?;
     Ok((
         BrokerConnection {
             local,
@@ -151,7 +111,7 @@ pub fn connect_prepared(
             positional_io_fds,
             shutdown_fd,
         },
-        bootstrap,
+        startup,
     ))
 }
 
@@ -323,6 +283,7 @@ mod tests {
             &litebox_broker_protocol::message::BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: litebox_broker_protocol::BROKER_PROTOCOL_VERSION,
                 process_id: litebox_broker_protocol::ProcessId(1),
+                startup: None,
             },
         )
         .unwrap();

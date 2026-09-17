@@ -31,7 +31,7 @@ pub struct CliArgs {
     ///
     /// The program path must be absolute and refer to a file in the broker-owned file system.
     #[arg(
-        required_unless_present = "prepared_child",
+        required_unless_present = "child",
         trailing_var_arg = true,
         value_hint = clap::ValueHint::CommandWithArguments
     )]
@@ -45,14 +45,14 @@ pub struct CliArgs {
     /// Allow using unstable options
     #[arg(short = 'Z', long = "unstable")]
     pub unstable: bool,
-    /// Connect as a broker-reserved prepared child.
+    /// Start as a dynamically launched child.
     #[arg(
-        long = "prepared-child",
+        long = "child",
         hide = true,
         requires_all = ["unstable", "broker_control_channel"],
         help_heading = "Unstable Options"
     )]
-    pub prepared_child: bool,
+    pub child: bool,
     /// Broker-supplied Unix socket path for the local control channel.
     #[arg(
         long = "broker-control-channel",
@@ -98,19 +98,17 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         )
         .init();
 
-    if cli_args.prepared_child {
+    if cli_args.child {
         if !cli_args.program_and_arguments.is_empty() {
-            return Err(anyhow!(
-                "--prepared-child does not accept a root program argument"
-            ));
+            return Err(anyhow!("--child does not accept a root program argument"));
         }
         let control_socket_path = cli_args
             .broker_control_channel
             .as_deref()
-            .context("--prepared-child requires --broker-control-channel")?;
-        let (_connection, bootstrap) = broker::connect_prepared(control_socket_path)?;
+            .context("--child requires --broker-control-channel")?;
+        let (_connection, bootstrap) = broker::connect_child(control_socket_path)?;
         return Err(anyhow!(
-            "unsupported prepared Linux process bootstrap format {:?} version {:?}",
+            "unsupported child Linux process bootstrap format {:?} version {:?}",
             bootstrap.format,
             bootstrap.version
         ));
@@ -256,17 +254,17 @@ mod tests {
     }
 
     #[test]
-    fn prepared_child_does_not_require_a_root_program() {
+    fn child_does_not_require_a_root_program() {
         let args = CliArgs::try_parse_from([
             "runner",
             "--unstable",
             "--broker-control-channel",
             "/tmp/broker.sock",
-            "--prepared-child",
+            "--child",
         ])
         .unwrap();
 
-        assert!(args.prepared_child);
+        assert!(args.child);
         assert!(args.program_and_arguments.is_empty());
     }
 

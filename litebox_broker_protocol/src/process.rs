@@ -20,12 +20,12 @@ pub struct ProcessBootstrapFormat(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProcessBootstrapVersion(pub u16);
 
-/// Association-scoped token for acknowledging a prepared process start.
+/// Association-scoped token for acknowledging a child process start.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProcessStartToken(pub u64);
 
-/// Ordered broker-object handles inherited by a prepared child.
+/// Ordered broker-object handles inherited by a child.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct InheritedProcessObjects {
     handles: [ObjectHandle; MAX_INHERITED_PROCESS_OBJECTS],
@@ -73,6 +73,15 @@ pub struct ProcessBootstrap {
     pub buffer: SharedBufferSequence,
 }
 
+/// Child startup data delivered during broker negotiation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessStartup {
+    /// Opaque platform bootstrap staged in the child's shared-buffer pool.
+    pub bootstrap: ProcessBootstrap,
+    /// Child-owned broker handles in the parent's inheritance-manifest order.
+    pub inherited_objects: InheritedProcessObjects,
+}
+
 /// Starts one child process from an opaque platform bootstrap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StartProcessRequest {
@@ -93,7 +102,7 @@ pub struct StartedProcess {
     pub initial_thread_id: Option<ThreadId>,
 }
 
-/// Reports that a prepared child finished restoring its initial state.
+/// Reports that a child finished restoring its initial state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProcessReadyRequest {
     /// Broker-assigned initial thread ID when it differs from the process ID.

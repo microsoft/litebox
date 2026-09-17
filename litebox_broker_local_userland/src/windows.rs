@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
-use litebox_broker_local::{BrokerLocal, BrokerNotifications, PreparedProcessBootstrap};
+use litebox_broker_local::{BrokerLocal, BrokerNotifications, ProcessStartupData};
 use litebox_broker_protocol::message::BrokerNotification;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport::control_ring::ControlRing;
@@ -27,6 +27,24 @@ pub struct BrokerConnection {
 
 /// Connects to and negotiates an association with a Windows-userland broker.
 pub fn connect(control_pipe: &OsStr) -> Result<BrokerConnection> {
+    let (connection, startup) = connect_with_startup(control_pipe)?;
+    if startup.is_some() {
+        anyhow::bail!("initial broker association returned child startup data");
+    }
+    Ok(connection)
+}
+
+/// Connects a child runner and receives its startup data.
+pub fn connect_child(control_pipe: &OsStr) -> Result<(BrokerConnection, ProcessStartupData)> {
+    let (connection, startup) = connect_with_startup(control_pipe)?;
+    let startup =
+        startup.ok_or_else(|| anyhow::anyhow!("child broker association omitted startup data"))?;
+    Ok((connection, startup))
+}
+
+fn connect_with_startup(
+    control_pipe: &OsStr,
+) -> Result<(BrokerConnection, Option<ProcessStartupData>)> {
     let deadline = Instant::now() + SETUP_TIMEOUT;
     let setup =
         WindowsNamedPipeLocalSetupChannel::connect_with_setup_deadline(control_pipe, deadline)
@@ -36,7 +54,7 @@ pub fn connect(control_pipe: &OsStr) -> Result<BrokerConnection> {
                     std::path::Path::new(control_pipe).display()
                 )
             })?;
-    let (local, notifications) = BrokerLocal::negotiate(setup, |mut setup| {
+    let (local, startup, notifications) = BrokerLocal::negotiate(setup, |mut setup| {
         let shared_memory = Arc::new(setup.receive_shared_memory(SHARED_BUFFER_POOL_SIZE)?);
         let control_memory = setup.receive_control_ring()?;
         let control_ring = ControlRing::new(control_memory).map_err(|error| {
@@ -49,44 +67,12 @@ pub fn connect(control_pipe: &OsStr) -> Result<BrokerConnection> {
         Ok((calls, shared_memory, notifications))
     })
     .context("broker negotiation failed")?;
-    Ok(BrokerConnection {
-        local,
-        notifications: BrokerNotifications::new(notifications),
-    })
-}
-
-/// Connects to and negotiates a broker-reserved prepared Windows process.
-pub fn connect_prepared(
-    control_pipe: &OsStr,
-) -> Result<(BrokerConnection, PreparedProcessBootstrap)> {
-    let deadline = Instant::now() + SETUP_TIMEOUT;
-    let setup =
-        WindowsNamedPipeLocalSetupChannel::connect_with_setup_deadline(control_pipe, deadline)
-            .with_context(|| {
-                format!(
-                    "failed to connect to broker at {}",
-                    std::path::Path::new(control_pipe).display()
-                )
-            })?;
-    let (local, bootstrap, notifications) = BrokerLocal::negotiate_prepared(setup, |mut setup| {
-        let shared_memory = Arc::new(setup.receive_shared_memory(SHARED_BUFFER_POOL_SIZE)?);
-        let control_memory = setup.receive_control_ring()?;
-        let control_ring = ControlRing::new(control_memory).map_err(|error| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("invalid broker control ring: {error:?}"),
-            )
-        })?;
-        let (calls, notifications) = setup.into_active(control_ring)?;
-        Ok((calls, shared_memory, notifications))
-    })
-    .context("prepared broker negotiation failed")?;
     Ok((
         BrokerConnection {
             local,
             notifications: BrokerNotifications::new(notifications),
         },
-        bootstrap,
+        startup,
     ))
 }
 

@@ -21,7 +21,7 @@ pub struct CliArgs {
     ///
     /// The program path refers to a path inside the broker-owned file system.
     #[arg(
-        required_unless_present = "prepared_child",
+        required_unless_present = "child",
         trailing_var_arg = true,
         value_hint = clap::ValueHint::CommandWithArguments
     )]
@@ -35,14 +35,14 @@ pub struct CliArgs {
     /// Allow using unstable options.
     #[arg(short = 'Z', long = "unstable")]
     pub unstable: bool,
-    /// Connect as a broker-reserved prepared child.
+    /// Start as a dynamically launched child.
     #[arg(
-        long = "prepared-child",
+        long = "child",
         hide = true,
         requires_all = ["unstable", "broker_control_channel"],
         help_heading = "Unstable Options"
     )]
-    pub prepared_child: bool,
+    pub child: bool,
     /// Broker-supplied Windows named-pipe path for the local control channel.
     #[arg(
         long = "broker-control-channel",
@@ -66,17 +66,17 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         )
         .init();
 
-    if cli_args.prepared_child {
+    if cli_args.child {
         if !cli_args.program_and_arguments.is_empty() {
-            anyhow::bail!("--prepared-child does not accept a root program argument");
+            anyhow::bail!("--child does not accept a root program argument");
         }
         let control_pipe = cli_args
             .broker_control_channel
             .as_deref()
-            .context("--prepared-child requires --broker-control-channel")?;
-        let (_connection, bootstrap) = broker::connect_prepared(control_pipe)?;
+            .context("--child requires --broker-control-channel")?;
+        let (_connection, bootstrap) = broker::connect_child(control_pipe)?;
         anyhow::bail!(
-            "unsupported prepared Windows process bootstrap format {:?} version {:?}",
+            "unsupported child Windows process bootstrap format {:?} version {:?}",
             bootstrap.format,
             bootstrap.version
         );
