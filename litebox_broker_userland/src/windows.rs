@@ -6,8 +6,6 @@
 use std::error::Error;
 use std::ffi::OsString;
 use std::io::Result as IoResult;
-use std::os::windows::io::AsRawHandle;
-use std::process::Child;
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -25,8 +23,6 @@ use litebox_broker_userland::builder::BrokerCoreBuilder;
 use super::{SETUP_TIMEOUT, configured_socket_policy};
 
 pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
-    let control_pipe = unique_control_pipe_name();
-    let control_listener = WindowsNamedPipeListener::bind(&control_pipe)?;
     let policy = PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()).with_socket_policy(
         configured_socket_policy(&args.allow_tcp_destination, &args.allow_udp_destination)?,
     );
@@ -39,12 +35,11 @@ pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
 
     if args.in_process_runner {
         debug_assert!(args.unstable);
+        let control_pipe = unique_control_pipe_name();
+        let control_listener = WindowsNamedPipeListener::bind(&control_pipe)?;
         run_runner_in_process(&args, &control_pipe, &broker, control_listener)
     } else {
-        crate::run_runner_process(&args, &control_pipe, None, |runner, runner_process_id| {
-            serve_runner_process(&broker, control_listener, runner, runner_process_id)?;
-            Ok(())
-        })
+        crate::run_runner_instance(&args, None, &broker)
     }
 }
 
@@ -65,36 +60,6 @@ fn run_runner_in_process(
         })?;
     let association_result = serve_runner_in_process(broker, control_listener, &runner);
     crate::finish_in_process_runner(runner, association_result)
-}
-
-fn serve_runner_process(
-    broker: &BrokerCore,
-    mut control_listener: WindowsNamedPipeListener,
-    runner: &mut Child,
-    runner_process_id: u32,
-) -> IoResult<()> {
-    let setup_deadline = Instant::now() + SETUP_TIMEOUT;
-    let control_stream = crate::accept_runner_channel(
-        setup_deadline,
-        "control",
-        || {
-            runner
-                .try_wait()
-                .map(|status| status.map(|status| format!("exited with {status}")))
-        },
-        || control_listener.try_accept(),
-    )?;
-    validate_client_process(&control_stream, runner_process_id)?;
-    let runner_process = runner.as_raw_handle();
-    serve_control_stream(
-        broker,
-        control_stream,
-        setup_deadline,
-        |channel, shared_memory, control_memory| {
-            channel.send_shared_memory(shared_memory, runner_process)?;
-            channel.send_shared_memory(control_memory, runner_process)
-        },
-    )
 }
 
 fn serve_runner_in_process(
