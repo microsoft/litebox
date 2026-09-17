@@ -2,8 +2,15 @@
 // Licensed under the MIT license.
 
 //! Darwin virtual-memory syscalls and mmap-time Mach-O rewriting.
+//!
+//! Mappings retain cached rewrite metadata after their descriptors are closed.
 
-use alloc::{collections::BTreeSet, sync::Arc, vec, vec::Vec};
+use alloc::{
+    collections::BTreeSet,
+    sync::{Arc, Weak},
+    vec,
+    vec::Vec,
+};
 use core::ops::Range;
 use litebox::{
     mm::linux::{CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize},
@@ -24,14 +31,35 @@ const MAX_MACHO_IMAGE_SIZE: usize = 256 * 1024 * 1024;
 pub(crate) struct MachoMapping {
     range: Range<usize>,
     file_offset: usize,
-    image: Arc<MachoImage>,
+    patch_info: Arc<MachoPatchInfo>,
     patched_ranges: BTreeSet<(usize, usize)>,
     trampolines: Vec<Range<usize>>,
 }
 
-struct MachoImage {
-    bytes: Arc<[u8]>,
+struct MachoPatchInfo {
     metadata: CodeMetadata,
+    trampoline_capacity: usize,
+}
+
+pub(crate) struct CachedMachoPatchInfo {
+    file: Weak<litebox::fs::FileFd>,
+    patch_info: Arc<MachoPatchInfo>,
+}
+
+/// Tries preferred-full, anywhere-full, then preferred-one-page, matching the Linux shim.
+fn choose_trampoline_reservation<T>(
+    capacity: usize,
+    mut map_preferred: impl FnMut(usize) -> Option<T>,
+    mut map_anywhere: impl FnMut(usize) -> Option<T>,
+) -> Option<(T, usize)> {
+    map_preferred(capacity)
+        .map(|reservation| (reservation, capacity))
+        .or_else(|| map_anywhere(capacity).map(|reservation| (reservation, capacity)))
+        .or_else(|| {
+            (capacity > PAGE_SIZE)
+                .then(|| map_preferred(PAGE_SIZE).map(|reservation| (reservation, PAGE_SIZE)))
+                .flatten()
+        })
 }
 
 fn permissions(protection: VmProtection) -> Permissions {
@@ -130,12 +158,19 @@ impl<P: ShimPlatform> Task<P> {
         }
 
         let file = self.files.typed_fd(fd)?;
-        if protection.contains(VmProtection::EXECUTE) {
-            let image = self.read_macho_file(&file)?;
-            return self.mmap_buffer(suggested, length, protection, flags, offset, image);
-        }
-
-        let macho = self.try_read_macho_file(&file);
+        let executable = protection.contains(VmProtection::EXECUTE);
+        let macho = if executable {
+            Some(self.macho_patch_info(fd, &file)?)
+        } else {
+            self.macho_patch_info(fd, &file).ok()
+        };
+        let ranges = if let Some(info) = macho.as_ref().filter(|_| executable) {
+            info.metadata
+                .ranges_for_mapping(offset as u64, length.as_usize())
+                .map_err(|_| Errno::ENOEXEC)?
+        } else {
+            Vec::new()
+        };
         let final_permissions = permissions(protection);
         let mut create_flags = mapping_flags(flags, true);
         if macho.is_some() && !flags.contains(MmapFlags::FIXED) {
@@ -143,9 +178,10 @@ impl<P: ShimPlatform> Task<P> {
         }
         let mut file_offset = offset;
         let mut buffer = [0; PAGE_SIZE];
+        let mut trampoline = None;
         // SAFETY: MAP_FIXED has Darwin's replacement semantics. Initialization
         // runs while the new mapping is private to this syscall and still RW.
-        let pointer = unsafe {
+        let result = unsafe {
             self.global.pm.create_pages_with_permissions(
                 suggested,
                 length,
@@ -171,63 +207,14 @@ impl<P: ShimPlatform> Task<P> {
                             .checked_add(read)
                             .ok_or(MappingError::OutOfMemory)?;
                     }
-                    Ok(copied)
-                },
-            )
-        }
-        .map_err(mapping_error)?;
-        let address = pointer.as_usize();
-        if let Some(image) = macho {
-            self.track_macho_mapping(MachoMapping {
-                range: address..address + length.as_usize(),
-                file_offset: offset,
-                image,
-                patched_ranges: BTreeSet::new(),
-                trampolines: Vec::new(),
-            });
-        }
-        Ok(address)
-    }
-
-    fn mmap_buffer(
-        &self,
-        suggested: Option<NonZeroAddress<PAGE_SIZE>>,
-        length: NonZeroPageSize<PAGE_SIZE>,
-        protection: VmProtection,
-        flags: MmapFlags,
-        offset: usize,
-        image: Arc<MachoImage>,
-    ) -> Result<usize, Errno> {
-        let ranges = image
-            .metadata
-            .ranges_for_mapping(offset as u64, length.as_usize())
-            .map_err(|_| Errno::ENOEXEC)?;
-        let source = image.bytes.get(offset..).unwrap_or_default();
-        let mut create_flags = mapping_flags(flags, true);
-        if !flags.contains(MmapFlags::FIXED) {
-            create_flags |= CreatePagesFlags::ENSURE_SPACE_AFTER;
-        }
-        // SAFETY: MAP_FIXED has Darwin's replacement semantics. The source is
-        // copied and rewritten while the new mapping is private and still RW.
-        let mut trampoline = None;
-        let result = unsafe {
-            self.global.pm.create_pages_with_permissions(
-                suggested,
-                length,
-                create_flags,
-                permissions(protection),
-                |pointer| {
-                    let copied = source.len().min(length.as_usize());
-                    pointer
-                        .copy_from_slice(0, &source[..copied])
-                        .ok_or(MappingError::OutOfMemory)?;
-                    trampoline = self.rewrite_macho_mapping(
-                        pointer,
-                        length.as_usize(),
-                        &ranges,
-                        &image.bytes,
-                        &image.metadata,
-                    )?;
+                    if let Some(info) = macho.as_ref().filter(|_| executable) {
+                        trampoline = self.rewrite_macho_mapping(
+                            pointer,
+                            length.as_usize(),
+                            &ranges,
+                            info.trampoline_capacity,
+                        )?;
+                    }
                     Ok(copied)
                 },
             )
@@ -242,13 +229,19 @@ impl<P: ShimPlatform> Task<P> {
             }
         };
         let address = pointer.as_usize();
-        self.track_macho_mapping(MachoMapping {
-            range: address..address + length.as_usize(),
-            file_offset: offset,
-            image,
-            patched_ranges: BTreeSet::from([(address, length.as_usize())]),
-            trampolines: trampoline.into_iter().collect(),
-        });
+        if let Some(patch_info) = macho {
+            let mut patched_ranges = BTreeSet::new();
+            if executable {
+                patched_ranges.insert((address, length.as_usize()));
+            }
+            self.track_macho_mapping(MachoMapping {
+                range: address..address + length.as_usize(),
+                file_offset: offset,
+                patch_info,
+                patched_ranges,
+                trampolines: trampoline.into_iter().collect(),
+            });
+        }
         Ok(address)
     }
 
@@ -257,25 +250,12 @@ impl<P: ShimPlatform> Task<P> {
         pointer: P::RawMutPointer<u8>,
         length: usize,
         ranges: &[core::ops::Range<usize>],
-        image: &[u8],
-        metadata: &CodeMetadata,
+        capacity: usize,
     ) -> Result<Option<Range<usize>>, MappingError> {
         if ranges.is_empty() {
             return Ok(None);
         }
         let rewriter = Rewriter::new(TargetHost::MacOs).map_err(|_| MappingError::OutOfMemory)?;
-        let capacity = metadata
-            .trampoline_size_upper_bound(image, rewriter)
-            .and_then(|size| {
-                size.max(PAGE_SIZE)
-                    .checked_next_multiple_of(PAGE_SIZE)
-                    .ok_or_else(|| {
-                        litebox_syscall_rewriter::Error::AddressOverflow(
-                            "Mach-O trampoline size".into(),
-                        )
-                    })
-            })
-            .map_err(|_| MappingError::OutOfMemory)?;
         let callback = self.global.platform.get_syscall_entry_point();
         let tls_offset = self
             .global
@@ -283,52 +263,133 @@ impl<P: ShimPlatform> Task<P> {
             .guest_thread_pointer_offset()
             .and_then(|offset| u16::try_from(offset).ok())
             .ok_or(MappingError::OutOfMemory)?;
-        let hint = self
-            .trampoline_address_after(pointer.as_usize(), length, capacity)
-            .and_then(NonZeroAddress::new)
-            .ok_or(MappingError::OutOfMemory)?;
-        let trampoline_length = NonZeroPageSize::new(capacity).ok_or(MappingError::OutOfMemory)?;
         let mut code = pointer
             .to_owned_slice(length)
             .ok_or(MappingError::OutOfMemory)?
             .into_vec();
-        // SAFETY: the trampoline is private staging. The callback patches code
-        // before either mapping is executable, and create_executable_pages
-        // performs the cache-synchronizing RW-to-RX transition.
-        let trampoline = unsafe {
-            self.global.pm.create_executable_pages(
-                Some(hint),
-                trampoline_length,
-                CreatePagesFlags::FIXED_ADDR
-                    | CreatePagesFlags::NOREPLACE
-                    | CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
-                |trampoline| {
-                    let (gates, trapped) = rewriter
-                        .patch_code_segment(
-                            &mut code,
-                            pointer.as_usize() as u64,
-                            ranges,
-                            trampoline.as_usize() as u64,
-                            callback as u64,
-                            tls_offset,
-                        )
-                        .map_err(|_| MappingError::OutOfMemory)?;
-                    if !trapped.is_empty() || gates.len() > capacity {
-                        return Err(MappingError::OutOfMemory);
-                    }
-                    trampoline
-                        .copy_from_slice(0, &gates)
-                        .ok_or(MappingError::OutOfMemory)?;
-                    Ok(gates.len())
-                },
-            )
-        }?;
-        let range = trampoline.as_usize()..trampoline.as_usize() + capacity;
-        if pointer.copy_from_slice(0, &code).is_none() {
+        let mut range = self.reserve_trampoline(pointer.as_usize(), length, capacity)?;
+        let result = (|| {
+            let (gates, trapped) = rewriter
+                .patch_code_segment(
+                    &mut code,
+                    pointer.as_usize() as u64,
+                    ranges,
+                    range.start as u64,
+                    callback as u64,
+                    tls_offset,
+                )
+                .map_err(|error| {
+                    litebox_util_log::warn!(error:% = error; "Mach-O mapping rewrite failed");
+                    MappingError::OutOfMemory
+                })?;
+            if !trapped.is_empty() {
+                return Err(MappingError::OutOfMemory);
+            }
+            self.grow_trampoline(&mut range, gates.len())?;
+            P::RawMutPointer::from_usize(range.start)
+                .copy_from_slice(0, &gates)
+                .ok_or(MappingError::OutOfMemory)?;
+            // SAFETY: no code points to these gates until the final code copy.
+            // The platform's RW-to-RX transition synchronizes instruction caches.
+            unsafe {
+                self.global.pm.change_page_permissions(
+                    P::RawMutPointer::from_usize(range.start),
+                    range.len(),
+                    Permissions::READ | Permissions::EXEC,
+                )
+            }
+            .map_err(MappingError::ProtectError)?;
+            pointer
+                .copy_from_slice(0, &code)
+                .ok_or(MappingError::OutOfMemory)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
             self.remove_trampoline(range);
-            return Err(MappingError::OutOfMemory);
+            return Err(error);
         }
         Ok(Some(range))
+    }
+
+    fn reserve_trampoline(
+        &self,
+        code_address: usize,
+        code_length: usize,
+        capacity: usize,
+    ) -> Result<Range<usize>, MappingError> {
+        let code_end = code_address
+            .checked_add(code_length)
+            .ok_or(MappingError::OutOfMemory)?;
+        let reachable = |address: usize| {
+            address
+                .abs_diff(code_address)
+                .max(address.abs_diff(code_end))
+                <= litebox_syscall_rewriter::MAX_TRAMPOLINE_DISPLACEMENT
+        };
+        // TODO: derive preferred placement from the full image load layout once
+        // dynamic loading is supported, as the Linux shim does for ELF.
+        let hint = self
+            .trampoline_address_after(code_address, code_length, capacity)
+            .filter(|&address| reachable(address))
+            .or_else(|| {
+                self.trampoline_address_after(code_address, code_length, PAGE_SIZE)
+                    .filter(|&address| reachable(address))
+            });
+        let map = |hint, length| {
+            let address = self.allocate_trampoline(hint, length).ok()?;
+            if !reachable(address) {
+                self.remove_trampoline(address..address + length);
+                return None;
+            }
+            Some(address)
+        };
+        choose_trampoline_reservation(
+            capacity,
+            |length| map(Some(hint?), length),
+            |length| map(None, length),
+        )
+        .map(|(address, length)| address..address + length)
+        .ok_or(MappingError::OutOfMemory)
+    }
+
+    fn allocate_trampoline(
+        &self,
+        address: Option<usize>,
+        length: usize,
+    ) -> Result<usize, MappingError> {
+        let suggested = address
+            .map(|address| NonZeroAddress::new(address).ok_or(MappingError::OutOfMemory))
+            .transpose()?;
+        let length = NonZeroPageSize::new(length).ok_or(MappingError::OutOfMemory)?;
+        let mut flags = CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY;
+        flags.set(
+            CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::NOREPLACE,
+            suggested.is_some(),
+        );
+        // SAFETY: fixed allocations use NOREPLACE; non-fixed allocations let
+        // the platform choose unused memory. No existing mappings are replaced.
+        unsafe {
+            self.global
+                .pm
+                .create_writable_pages(suggested, length, flags, |_| Ok(0))
+        }
+        .map(|pointer| pointer.as_usize())
+    }
+
+    fn grow_trampoline(&self, range: &mut Range<usize>, used: usize) -> Result<(), MappingError> {
+        let required = used
+            .max(PAGE_SIZE)
+            .checked_next_multiple_of(PAGE_SIZE)
+            .ok_or(MappingError::OutOfMemory)?;
+        if required > range.len() {
+            let end = range
+                .start
+                .checked_add(required)
+                .ok_or(MappingError::OutOfMemory)?;
+            self.allocate_trampoline(Some(range.end), end - range.end)?;
+            range.end = end;
+        }
+        Ok(())
     }
 
     fn track_macho_mapping(&self, mapping: MachoMapping) {
@@ -351,7 +412,16 @@ impl<P: ShimPlatform> Task<P> {
         }
     }
 
-    fn read_macho_file(&self, file: &litebox::fs::FileFd) -> Result<Arc<MachoImage>, Errno> {
+    fn macho_patch_info(
+        &self,
+        fd: i32,
+        file: &Arc<litebox::fs::FileFd>,
+    ) -> Result<Arc<MachoPatchInfo>, Errno> {
+        if let Some(cached) = self.global.macho_patch_cache.lock().get(&fd)
+            && cached.file.ptr_eq(&Arc::downgrade(file))
+        {
+            return Ok(Arc::clone(&cached.patch_info));
+        }
         let size = usize::try_from(
             self.global
                 .litebox
@@ -369,22 +439,40 @@ impl<P: ShimPlatform> Task<P> {
             litebox_util_log::warn!(error:% = error; "refusing executable mmap of invalid Mach-O");
             Errno::ENOEXEC
         })?;
-        Ok(Arc::new(MachoImage {
-            bytes: bytes.into(),
+        let rewriter = Rewriter::new(TargetHost::MacOs).map_err(|_| Errno::ENOEXEC)?;
+        let trampoline_capacity = metadata
+            .trampoline_size_upper_bound(&bytes, rewriter)
+            .and_then(|size| {
+                size.max(PAGE_SIZE)
+                    .checked_next_multiple_of(PAGE_SIZE)
+                    .ok_or_else(|| litebox_syscall_rewriter::Error::AddressOverflow(
+                        "Mach-O trampoline size".into(),
+                    ))
+            })
+            .unwrap_or_else(|error| {
+                litebox_util_log::warn!(error:% = error; "Mach-O sizing unavailable; starting with one trampoline page");
+                PAGE_SIZE
+            });
+        let patch_info = Arc::new(MachoPatchInfo {
             metadata,
-        }))
-    }
-
-    fn try_read_macho_file(&self, file: &litebox::fs::FileFd) -> Option<Arc<MachoImage>> {
-        self.read_macho_file(file).ok()
+            trampoline_capacity,
+        });
+        self.global.macho_patch_cache.lock().insert(
+            fd,
+            CachedMachoPatchInfo {
+                file: Arc::downgrade(file),
+                patch_info: Arc::clone(&patch_info),
+            },
+        );
+        Ok(patch_info)
     }
 
     fn rewrite_mprotect_range(&self, address: usize, length: usize) -> Result<(), Errno> {
-        struct Patch {
+        struct RewriteRange {
             mapping_start: usize,
             range: Range<usize>,
             file_offset: usize,
-            image: Arc<MachoImage>,
+            patch_info: Arc<MachoPatchInfo>,
         }
 
         let end = address + length;
@@ -404,11 +492,11 @@ impl<P: ShimPlatform> Task<P> {
                         continue;
                     }
                     if cursor < patched_start {
-                        patches.push(Patch {
+                        patches.push(RewriteRange {
                             mapping_start,
                             range: cursor..patched_start.min(patch_end),
                             file_offset: mapping.file_offset + cursor - mapping.range.start,
-                            image: Arc::clone(&mapping.image),
+                            patch_info: Arc::clone(&mapping.patch_info),
                         });
                     }
                     cursor = cursor.max(patched_end);
@@ -417,11 +505,11 @@ impl<P: ShimPlatform> Task<P> {
                     }
                 }
                 if cursor < patch_end {
-                    patches.push(Patch {
+                    patches.push(RewriteRange {
                         mapping_start,
                         range: cursor..patch_end,
                         file_offset: mapping.file_offset + cursor - mapping.range.start,
-                        image: Arc::clone(&mapping.image),
+                        patch_info: Arc::clone(&mapping.patch_info),
                     });
                 }
             }
@@ -430,7 +518,7 @@ impl<P: ShimPlatform> Task<P> {
 
         for patch in patches {
             let ranges = patch
-                .image
+                .patch_info
                 .metadata
                 .ranges_for_mapping(patch.file_offset as u64, patch.range.len())
                 .map_err(|_| Errno::ENOEXEC)?;
@@ -458,8 +546,7 @@ impl<P: ShimPlatform> Task<P> {
                 P::RawMutPointer::from_usize(patch.range.start),
                 patch.range.len(),
                 &ranges,
-                &patch.image.bytes,
-                &patch.image.metadata,
+                patch.patch_info.trampoline_capacity,
             );
             let mut restore_error = None;
             for (range, protection) in previous {
@@ -748,6 +835,153 @@ mod tests {
         ctx.regs[3] = usize::try_from(MmapFlags::PRIVATE.bits().cast_unsigned()).unwrap();
         ctx.regs[4] = 0;
         task.do_syscall(&ctx)
+    }
+
+    #[test]
+    fn preferred_gap_fits_full_capacity() {
+        let task = task_with_file(&macho_image());
+        let base = task.allocate_trampoline(None, 6 * PAGE_SIZE).unwrap();
+        task.sys_munmap(base + PAGE_SIZE, PAGE_SIZE).unwrap();
+        task.sys_munmap(base + 3 * PAGE_SIZE, 2 * PAGE_SIZE)
+            .unwrap();
+        let range = task
+            .reserve_trampoline(base, PAGE_SIZE, 2 * PAGE_SIZE)
+            .unwrap();
+        assert_eq!(range, base + 3 * PAGE_SIZE..base + 5 * PAGE_SIZE);
+        task.remove_trampoline(range);
+        task.sys_munmap(base, PAGE_SIZE).unwrap();
+        task.sys_munmap(base + 2 * PAGE_SIZE, PAGE_SIZE).unwrap();
+        task.sys_munmap(base + 5 * PAGE_SIZE, PAGE_SIZE).unwrap();
+    }
+
+    #[test]
+    fn sizing_failure_retains_tracking_and_allows_trampoline_growth() {
+        let mut image = macho_image();
+        image.resize(2 * PAGE_SIZE, 0);
+        put64(&mut image, 64, (2 * PAGE_SIZE) as u64);
+        put64(&mut image, 80, (2 * PAGE_SIZE) as u64);
+        put64(&mut image, 32 + 72 + 40, (PAGE_SIZE + 4 - TEXT) as u64);
+        for offset in (TEXT..PAGE_SIZE).step_by(4) {
+            put32(&mut image, offset, SVC);
+        }
+        // Unsupported SVC in an unmapped page prevents whole-file sizing.
+        put32(&mut image, PAGE_SIZE, 0xd400_0001);
+        let task = task_with_file(&image);
+        let address = mmap_with_protection(&task, VmProtection::READ).unwrap();
+        task.sys_close(0).unwrap();
+        task.sys_mprotect(
+            address,
+            PAGE_SIZE,
+            VmProtection::READ | VmProtection::EXECUTE,
+        )
+        .unwrap();
+        let code = UserPtr::<u8>::from_usize(address + TEXT)
+            .to_owned_slice::<Platform>(4)
+            .unwrap();
+        let target = usize::try_from(
+            decode_branch_target(
+                u32::from_le_bytes(*code.first_chunk().unwrap()),
+                (address + TEXT) as u64,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        {
+            let mappings = task.global.macho_mappings.lock();
+            let mapping = &mappings[&address];
+            assert_eq!(mapping.patch_info.trampoline_capacity, PAGE_SIZE);
+            assert!(
+                mapping
+                    .trampolines
+                    .iter()
+                    .any(|range| range.contains(&target) && range.len() > PAGE_SIZE)
+            );
+        }
+        task.sys_munmap(address, PAGE_SIZE).unwrap();
+    }
+
+    #[test]
+    fn one_page_fallback_grows_without_replacing_neighbors() {
+        use litebox_common_macos::user_pointers::UserPtrMut;
+
+        let task = task_with_file(&macho_image());
+        let base = task.allocate_trampoline(None, 4 * PAGE_SIZE).unwrap();
+        task.sys_munmap(base, 3 * PAGE_SIZE).unwrap();
+        let blocker = base + 3 * PAGE_SIZE;
+        UserPtrMut::<u8>::from_usize(blocker)
+            .copy_from_slice::<Platform>(0, b"neighbor")
+            .unwrap();
+        let (address, length) = choose_trampoline_reservation(
+            4 * PAGE_SIZE,
+            |length| task.allocate_trampoline(Some(base), length).ok(),
+            |_| None,
+        )
+        .unwrap();
+        assert_eq!((address, length), (base, PAGE_SIZE));
+        let mut range = address..address + length;
+        UserPtrMut::<u8>::from_usize(address)
+            .copy_from_slice::<Platform>(0, b"gate")
+            .unwrap();
+        task.grow_trampoline(&mut range, 2 * PAGE_SIZE + 1).unwrap();
+        assert_eq!(range, base..base + 3 * PAGE_SIZE);
+        assert_eq!(
+            &*UserPtr::<u8>::from_usize(base)
+                .to_owned_slice::<Platform>(4)
+                .unwrap(),
+            b"gate"
+        );
+        assert!(task.grow_trampoline(&mut range, 4 * PAGE_SIZE).is_err());
+        assert_eq!(range, base..base + 3 * PAGE_SIZE);
+        assert_eq!(
+            &*UserPtr::<u8>::from_usize(blocker)
+                .to_owned_slice::<Platform>(8)
+                .unwrap(),
+            b"neighbor"
+        );
+        task.remove_trampoline(range);
+        task.sys_munmap(blocker, PAGE_SIZE).unwrap();
+    }
+
+    #[test]
+    fn cached_metadata_does_not_cache_mapped_file_contents() {
+        let task = task_with_file(&macho_image());
+        let original = mmap_with_protection(&task, VmProtection::READ).unwrap();
+        let writer = task
+            .global
+            .litebox
+            .open_file(
+                &litebox::fs::Context::new(),
+                "/image",
+                FileAccessMode::ReadWrite,
+                FileOpenFlags::NONE,
+                FileMode::empty(),
+            )
+            .unwrap();
+        let nop = 0xd503_201fu32.to_le_bytes();
+        assert_eq!(
+            task.global
+                .litebox
+                .write_file(&writer, &nop, Some(TEXT))
+                .unwrap(),
+            4
+        );
+        let updated =
+            mmap_with_protection(&task, VmProtection::READ | VmProtection::EXECUTE).unwrap();
+        assert_eq!(
+            &*UserPtr::<u8>::from_usize(updated + TEXT)
+                .to_owned_slice::<Platform>(4)
+                .unwrap(),
+            &nop,
+        );
+        assert_eq!(
+            &*UserPtr::<u8>::from_usize(original + TEXT)
+                .to_owned_slice::<Platform>(4)
+                .unwrap(),
+            &SVC.to_le_bytes(),
+        );
+        task.global.litebox.close_file(&writer).unwrap();
+        task.sys_munmap(original, PAGE_SIZE).unwrap();
+        task.sys_munmap(updated, PAGE_SIZE).unwrap();
     }
 
     #[test]

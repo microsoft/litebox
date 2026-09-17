@@ -112,6 +112,7 @@ impl<P: ShimPlatform> Task<P> {
     }
 
     pub(crate) fn sys_close(&self, fd: i32) -> Result<(), Errno> {
+        self.global.macho_patch_cache.lock().remove(&fd);
         self.files.close(fd)
     }
     pub(crate) fn sys_dup(&self, fd: i32) -> Result<u32, Errno> {

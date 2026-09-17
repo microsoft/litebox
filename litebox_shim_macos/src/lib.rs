@@ -88,6 +88,7 @@ impl<P: ShimPlatform> MacosShimBuilder<P> {
                 pm: PageManager::new(&self.litebox),
                 litebox: self.litebox,
                 macho_mappings: Mutex::new(BTreeMap::new()),
+                macho_patch_cache: Mutex::new(BTreeMap::new()),
             }),
             files: self.files,
         }
@@ -158,6 +159,7 @@ struct GlobalState<P: ShimPlatform> {
     litebox: Arc<LiteBox<P>>,
     pm: PageManager<P, PAGE_SIZE>,
     macho_mappings: Mutex<P, BTreeMap<usize, syscalls::mm::MachoMapping>>,
+    macho_patch_cache: Mutex<P, BTreeMap<i32, syscalls::mm::CachedMachoPatchInfo>>,
 }
 
 impl<P: ShimPlatform> Drop for GlobalState<P> {
