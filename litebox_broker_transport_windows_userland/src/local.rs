@@ -158,7 +158,13 @@ impl LocalSetupChannel for WindowsNamedPipeLocalSetupChannel {
         let response = read_frame(file_handle(&self.stream), self.setup_deadline)?
             .map(|frame| decode_handshake_response(&frame).map_err(wire_error))
             .transpose()?;
-        self.negotiated = matches!(response, Some(BrokerHandshakeResponse::Negotiated { .. }));
+        self.negotiated = matches!(
+            response,
+            Some(
+                BrokerHandshakeResponse::Negotiated { .. }
+                    | BrokerHandshakeResponse::Prepared { .. }
+            )
+        );
         Ok(response)
     }
 }

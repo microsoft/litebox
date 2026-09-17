@@ -52,6 +52,7 @@ pub use policy::{
 use process::ObjectReference;
 pub use process::{
     AssociationCancellation, BrokerProcess, BrokerThread, CallerCredential, ObjectRights,
+    PendingProcess, PreparedProcess,
 };
 use random::RandomProvider;
 use socket::{BrokerSocketPorts, SocketProvider};
@@ -311,6 +312,15 @@ impl BrokerCore {
         &self,
         caller_credential: CallerCredential,
     ) -> Result<Arc<BrokerProcess>> {
+        self.create_process_with_parent(None, caller_credential, process::ProcessLifecycle::Running)
+    }
+
+    fn create_process_with_parent(
+        &self,
+        parent_id: Option<ProcessId>,
+        caller_credential: CallerCredential,
+        lifecycle: process::ProcessLifecycle,
+    ) -> Result<Arc<BrokerProcess>> {
         let mut processes = self.processes.write();
         if processes.len() >= self.limits.max_processes {
             return Err(BrokerError::ResourceExhausted);
@@ -323,8 +333,9 @@ impl BrokerCore {
         let process = Arc::new(BrokerProcess::new(
             self.clone(),
             id,
-            None,
+            parent_id,
             caller_credential,
+            lifecycle,
         ));
         assert!(
             processes.insert(id, Arc::downgrade(&process)).is_none(),

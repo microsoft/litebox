@@ -307,7 +307,11 @@ impl LocalSetupChannel for UnixStreamLocalSetupChannel {
         match frame {
             Some(frame) => {
                 let response = decode_handshake_response(&frame).map_err(wire_error)?;
-                self.negotiated = matches!(&response, BrokerHandshakeResponse::Negotiated { .. });
+                self.negotiated = matches!(
+                    &response,
+                    BrokerHandshakeResponse::Negotiated { .. }
+                        | BrokerHandshakeResponse::Prepared { .. }
+                );
                 Ok(Some(response))
             }
             None => Ok(None),

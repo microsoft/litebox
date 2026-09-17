@@ -27,7 +27,8 @@ use std::time::{Duration, Instant};
 
 use litebox_broker_core::BrokerCore;
 use litebox_broker_host::{
-    BrokerHostAssociation, BrokerHostError, ConnectionTermination, setup_connection,
+    BrokerHostAssociation, BrokerHostError, ConnectionTermination, PreparedProcessBootstrap,
+    setup_connection, setup_prepared_connection,
 };
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::message::BrokerRequest;
@@ -40,6 +41,7 @@ use litebox_broker_transport::control_ring::ControlRing;
 use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedBufferPool, SharedMemory};
 
 use crate::readiness::ReadinessPublisherRuntime;
+use crate::runner::{PreparedRunner, RunnerChildren};
 
 const REQUEST_QUEUE_CAPACITY: usize = 64;
 const REQUEST_QUEUE_RETRY_DELAY: Duration = Duration::from_millis(1);
@@ -67,6 +69,81 @@ pub fn serve_association<
     Shutdown,
 >(
     broker: &BrokerCore,
+    control_channel: SetupChannel,
+    create_shared_memory: impl FnOnce() -> IoResult<Memory>,
+    create_control_memory: impl FnOnce() -> IoResult<Memory>,
+    send_shared_memory: impl FnOnce(&mut SetupChannel, &Memory, &Memory) -> IoResult<()>,
+    activate: impl FnOnce(
+        SetupChannel,
+        ControlRing<Memory>,
+    ) -> IoResult<(RequestSource, ResponseSink, NotificationChannel, Shutdown)>,
+) -> IoResult<()>
+where
+    Memory: ControlRingMemory,
+    SetupChannel: HostSetupChannel<Error = IoError>,
+    RequestSource: HostRequestSource<Error = IoError>,
+    ResponseSink: HostResponseSink<Error = IoError> + Clone + Send,
+    NotificationChannel: HostNotificationChannel<Error = IoError> + Send,
+    Shutdown: HostAssociationShutdown<Error = IoError> + Send + Sync,
+{
+    serve_association_with_children(
+        broker,
+        control_channel,
+        create_shared_memory,
+        create_control_memory,
+        send_shared_memory,
+        activate,
+        None,
+    )
+}
+
+pub(crate) fn serve_runner_association<
+    Memory,
+    SetupChannel,
+    RequestSource,
+    ResponseSink,
+    NotificationChannel,
+    Shutdown,
+>(
+    broker: &BrokerCore,
+    control_channel: SetupChannel,
+    create_shared_memory: impl FnOnce() -> IoResult<Memory>,
+    create_control_memory: impl FnOnce() -> IoResult<Memory>,
+    send_shared_memory: impl FnOnce(&mut SetupChannel, &Memory, &Memory) -> IoResult<()>,
+    activate: impl FnOnce(
+        SetupChannel,
+        ControlRing<Memory>,
+    ) -> IoResult<(RequestSource, ResponseSink, NotificationChannel, Shutdown)>,
+    children: Arc<RunnerChildren>,
+) -> IoResult<()>
+where
+    Memory: ControlRingMemory,
+    SetupChannel: HostSetupChannel<Error = IoError>,
+    RequestSource: HostRequestSource<Error = IoError>,
+    ResponseSink: HostResponseSink<Error = IoError> + Clone + Send,
+    NotificationChannel: HostNotificationChannel<Error = IoError> + Send,
+    Shutdown: HostAssociationShutdown<Error = IoError> + Send + Sync,
+{
+    serve_association_with_children(
+        broker,
+        control_channel,
+        create_shared_memory,
+        create_control_memory,
+        send_shared_memory,
+        activate,
+        Some(children),
+    )
+}
+
+fn serve_association_with_children<
+    Memory,
+    SetupChannel,
+    RequestSource,
+    ResponseSink,
+    NotificationChannel,
+    Shutdown,
+>(
+    broker: &BrokerCore,
     mut control_channel: SetupChannel,
     create_shared_memory: impl FnOnce() -> IoResult<Memory>,
     create_control_memory: impl FnOnce() -> IoResult<Memory>,
@@ -75,6 +152,7 @@ pub fn serve_association<
         SetupChannel,
         ControlRing<Memory>,
     ) -> IoResult<(RequestSource, ResponseSink, NotificationChannel, Shutdown)>,
+    children: Option<Arc<RunnerChildren>>,
 ) -> IoResult<()>
 where
     Memory: ControlRingMemory,
@@ -128,13 +206,107 @@ where
                 return Err(error);
             }
         };
-    dispatch_requests(
+    dispatch_requests_with_children(
         association,
         readiness,
         request_source,
         response_sink,
         notification_channel,
         shutdown,
+        children,
+    )
+}
+
+pub(crate) fn serve_prepared_association<
+    Memory,
+    SetupChannel,
+    RequestSource,
+    ResponseSink,
+    NotificationChannel,
+    Shutdown,
+>(
+    prepared: PreparedRunner,
+    mut control_channel: SetupChannel,
+    create_shared_memory: impl FnOnce() -> IoResult<Memory>,
+    create_control_memory: impl FnOnce() -> IoResult<Memory>,
+    send_shared_memory: impl FnOnce(&mut SetupChannel, &Memory, &Memory) -> IoResult<()>,
+    activate: impl FnOnce(
+        SetupChannel,
+        ControlRing<Memory>,
+    ) -> IoResult<(RequestSource, ResponseSink, NotificationChannel, Shutdown)>,
+    children: Arc<RunnerChildren>,
+) -> IoResult<()>
+where
+    Memory: ControlRingMemory,
+    SetupChannel: HostSetupChannel<Error = IoError>,
+    RequestSource: HostRequestSource<Error = IoError>,
+    ResponseSink: HostResponseSink<Error = IoError> + Clone + Send,
+    NotificationChannel: HostNotificationChannel<Error = IoError> + Send,
+    Shutdown: HostAssociationShutdown<Error = IoError> + Send + Sync,
+{
+    let PreparedRunner {
+        pending,
+        format,
+        version,
+        bootstrap,
+    } = prepared;
+    let shared_memory = create_shared_memory()?;
+    let shared_buffers = SharedBufferPool::new(shared_memory, SHARED_BUFFER_LAYOUT)
+        .map_err(|error| IoError::new(ErrorKind::InvalidData, error.to_string()))?;
+    let control_memory = create_control_memory()?;
+    let control_ring = ControlRing::new(control_memory)
+        .map_err(|error| IoError::other(format!("failed to create control ring: {error:?}")))?;
+    let readiness = Arc::new(ReadinessPublisherRuntime::new());
+    let association = match setup_prepared_connection(
+        pending,
+        &mut control_channel,
+        &shared_buffers,
+        readiness.clone(),
+        PreparedProcessBootstrap {
+            format,
+            version,
+            payload: &bootstrap,
+        },
+        |channel| send_shared_memory(channel, shared_buffers.memory(), control_ring.memory()),
+    )
+    .map_err(map_host_error)?
+    {
+        Ok(association) => association,
+        Err(ConnectionTermination::PeerClosed) => {
+            return Err(IoError::new(
+                ErrorKind::UnexpectedEof,
+                "prepared runner closed before completing broker setup",
+            ));
+        }
+        Err(ConnectionTermination::ProtocolViolation) => {
+            return Err(IoError::new(
+                ErrorKind::InvalidData,
+                "prepared runner violated the broker protocol during setup",
+            ));
+        }
+        Err(_) => {
+            return Err(IoError::new(
+                ErrorKind::InvalidData,
+                "prepared runner ended broker setup unexpectedly",
+            ));
+        }
+    };
+    let (request_source, response_sink, notification_channel, shutdown) =
+        match activate(control_channel, control_ring) {
+            Ok(active) => active,
+            Err(error) => {
+                association.finish();
+                return Err(error);
+            }
+        };
+    dispatch_requests_with_children(
+        association,
+        readiness,
+        request_source,
+        response_sink,
+        notification_channel,
+        shutdown,
+        Some(children),
     )
 }
 
@@ -296,13 +468,47 @@ impl<Memory: SharedMemory> Drop for AssociationCancellationGuard<'_, '_, Memory>
 /// `readiness` is created by the caller rather than here so readiness sources
 /// can record into the same runtime this publishes from. The Linux network
 /// reactor is currently its production source.
+#[cfg(all(test, target_os = "linux"))]
 fn dispatch_requests<Memory, RequestSource, ResponseSink, NotificationChannel, Shutdown>(
+    association: BrokerHostAssociation<'_, Memory>,
+    readiness: Arc<ReadinessPublisherRuntime>,
+    request_source: RequestSource,
+    response_sink: ResponseSink,
+    notification_channel: NotificationChannel,
+    shutdown: Shutdown,
+) -> IoResult<()>
+where
+    Memory: SharedMemory,
+    RequestSource: HostRequestSource<Error = IoError>,
+    ResponseSink: HostResponseSink<Error = IoError> + Clone + Send,
+    NotificationChannel: HostNotificationChannel<Error = IoError> + Send,
+    Shutdown: HostAssociationShutdown<Error = IoError> + Send + Sync,
+{
+    dispatch_requests_with_children(
+        association,
+        readiness,
+        request_source,
+        response_sink,
+        notification_channel,
+        shutdown,
+        None,
+    )
+}
+
+fn dispatch_requests_with_children<
+    Memory,
+    RequestSource,
+    ResponseSink,
+    NotificationChannel,
+    Shutdown,
+>(
     association: BrokerHostAssociation<'_, Memory>,
     readiness: Arc<ReadinessPublisherRuntime>,
     mut request_source: RequestSource,
     response_sink: ResponseSink,
     mut notification_channel: NotificationChannel,
     shutdown: Shutdown,
+    children: Option<Arc<RunnerChildren>>,
 ) -> IoResult<()>
 where
     Memory: SharedMemory,
@@ -359,6 +565,7 @@ where
             let request_receiver = Arc::clone(&request_receiver);
             let response_sink = response_sink.clone();
             let worker_failure_coordinator = Arc::clone(&failure_coordinator);
+            let worker_children = children.clone();
             match std::thread::Builder::new()
                 .name(format!("litebox-broker-worker-{worker_id}"))
                 .spawn_scoped(scope, move || {
@@ -367,6 +574,7 @@ where
                         &request_receiver,
                         &response_sink,
                         &worker_failure_coordinator,
+                        worker_children.as_ref(),
                     );
                 }) {
                 Ok(worker) => workers.push(worker),
@@ -379,6 +587,9 @@ where
 
         read_requests(&mut request_source, request_sender, &failure_coordinator);
         drop(cancellation);
+        if let Some(children) = &children {
+            children.association_ended(association.process_id());
+        }
         for worker in workers {
             if worker.join().is_err() {
                 failure_coordinator.report_panic(IoError::other("broker request worker panicked"));
@@ -497,6 +708,7 @@ fn run_worker<Memory, ResponseSink, Shutdown>(
     request_receiver: &Mutex<Receiver<BrokerRequest>>,
     response_sink: &ResponseSink,
     failure_coordinator: &HostAssociationFailureCoordinator<Shutdown>,
+    children: Option<&Arc<RunnerChildren>>,
 ) where
     Memory: SharedMemory,
     ResponseSink: HostResponseSink<Error = IoError>,
@@ -514,7 +726,21 @@ fn run_worker<Memory, ResponseSink, Shutdown>(
             continue;
         }
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            association.execute_request(request, |response| response_sink.send_response(response))
+            let process_id = association.process_id();
+            association.execute_request_with(
+                request,
+                |process, operation, shared_buffers| {
+                    children.and_then(|children| {
+                        children.handle_operation(process, operation, shared_buffers)
+                    })
+                },
+                |response| response_sink.send_response(response),
+                |result| {
+                    if let Some(children) = children {
+                        children.response_sent(process_id, result);
+                    }
+                },
+            )
         })) {
             Ok(Ok(())) => {}
             Ok(Err(error)) => failure_coordinator.report(map_host_error(error)),

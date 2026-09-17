@@ -24,6 +24,7 @@ mod error;
 mod event;
 mod fs;
 mod pipe;
+mod process;
 mod random;
 mod socket;
 mod stdio;
@@ -31,13 +32,16 @@ mod stdio;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::message::{
     BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerOperation,
     BrokerRequest, BrokerResponse, BrokerResult,
+};
+use litebox_broker_protocol::process::{
+    InheritedProcessObjects, ProcessBootstrapFormat, ProcessBootstrapVersion,
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SharedBufferSequence};
@@ -65,6 +69,19 @@ pub struct BrokerLocal<Channel: LocalCallChannel> {
 /// Broker-local receive adapter for broker-initiated asynchronous notifications.
 pub struct BrokerNotifications<Channel: LocalNotificationChannel> {
     channel: Channel,
+}
+
+/// Opaque bootstrap delivered to one broker-reserved prepared process.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedProcessBootstrap {
+    /// Platform-defined format.
+    pub format: ProcessBootstrapFormat,
+    /// Version within the platform-defined format.
+    pub version: ProcessBootstrapVersion,
+    /// Opaque platform bytes.
+    pub payload: Vec<u8>,
+    /// Child-owned broker handles in the parent's inheritance-manifest order.
+    pub inherited_objects: InheritedProcessObjects,
 }
 
 impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
@@ -126,6 +143,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                     activate(setup).map_err(BrokerLocalError::Channel)?;
                 Ok((Self::new(channel, process_id, shared_memory), activated))
             }
+            response @ BrokerHandshakeResponse::Prepared { .. } => {
+                panic!("broker returned unexpected negotiation response: {response:?}")
+            }
             BrokerHandshakeResponse::VersionMismatch { .. } => {
                 Err(BrokerLocalError::Broker(ErrorCode::UnsupportedVersion))
             }
@@ -139,6 +159,72 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                 | ErrorCode::Internal => panic!("broker returned unrecoverable error: {error}"),
                 _ => panic!("broker returned unexpected negotiation error: {error}"),
             },
+        }
+    }
+
+    /// Negotiates one broker-reserved prepared process and copies its bootstrap.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response inconsistent with prepared
+    /// negotiation or setup returns shared memory with an invalid size.
+    pub fn negotiate_prepared<Setup: LocalSetupChannel<Error = Channel::Error>, Activated>(
+        mut setup: Setup,
+        activate: impl FnOnce(
+            Setup,
+        ) -> core::result::Result<
+            (Channel, Arc<dyn SharedMemory>, Activated),
+            Channel::Error,
+        >,
+    ) -> Result<(Self, PreparedProcessBootstrap, Activated), Channel::Error> {
+        let requested = BROKER_PROTOCOL_VERSION;
+        setup
+            .send_handshake_request(&BrokerHandshakeRequest {
+                protocol_version: requested,
+            })
+            .map_err(BrokerLocalError::Channel)?;
+        match setup
+            .recv_handshake_response()
+            .map_err(BrokerLocalError::Channel)?
+            .ok_or(BrokerLocalError::ChannelClosed)?
+        {
+            response @ BrokerHandshakeResponse::Prepared {
+                broker_protocol_version,
+                process_id,
+                bootstrap,
+                inherited_objects,
+            } => {
+                assert_eq!(
+                    requested, broker_protocol_version,
+                    "broker returned unexpected prepared negotiation response: {response:?}"
+                );
+                let (channel, shared_memory, activated) =
+                    activate(setup).map_err(BrokerLocalError::Channel)?;
+                let local = Self::new(channel, process_id, shared_memory);
+                let mut payload = Vec::new();
+                payload
+                    .try_reserve_exact(bootstrap.buffer.length() as usize)
+                    .map_err(|_| BrokerLocalError::Broker(ErrorCode::OutOfMemory))?;
+                payload.resize(bootstrap.buffer.length() as usize, 0);
+                local.read_shared_buffer(bootstrap.buffer, &mut payload);
+                Ok((
+                    local,
+                    PreparedProcessBootstrap {
+                        format: bootstrap.format,
+                        version: bootstrap.version,
+                        payload,
+                        inherited_objects,
+                    },
+                    activated,
+                ))
+            }
+            response @ BrokerHandshakeResponse::Negotiated { .. } => {
+                panic!("broker returned unexpected prepared negotiation response: {response:?}")
+            }
+            BrokerHandshakeResponse::VersionMismatch { .. } => {
+                Err(BrokerLocalError::Broker(ErrorCode::UnsupportedVersion))
+            }
+            BrokerHandshakeResponse::Error(error) => Err(BrokerLocalError::Broker(error)),
         }
     }
 

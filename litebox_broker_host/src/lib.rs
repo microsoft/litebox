@@ -24,7 +24,7 @@ extern crate std;
 use alloc::{sync::Arc, vec::Vec};
 
 use litebox_broker_core::readiness::ReadinessSink;
-use litebox_broker_core::{BrokerCore, BrokerProcess, CallerCredential};
+use litebox_broker_core::{BrokerCore, BrokerProcess, CallerCredential, PendingProcess};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse};
 use litebox_broker_protocol::fs::{
@@ -43,9 +43,14 @@ use litebox_broker_protocol::message::{
 use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
 };
+use litebox_broker_protocol::process::{
+    InheritedProcessObjects, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessBootstrap, ProcessBootstrapFormat,
+    ProcessBootstrapVersion,
+};
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::shared_buffer::{
     SHARED_BUFFER_LAYOUT, SHARED_BUFFER_SLOT_COUNT, SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence,
+    SharedBufferSlotIndex,
 };
 use litebox_broker_protocol::socket::{
     AcceptSocketResponse, BindSocketResponse, ConnectSocketResponse, CreateSocketResponse,
@@ -90,7 +95,32 @@ struct AssociationState {
     shared_buffer_usage: SharedBufferUsage,
 }
 
+/// Failure classification for deployment-specific broker operations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrokerHostExtensionError {
+    /// Return an error result and keep serving the association.
+    Respond(ErrorCode),
+    /// Fail the association without publishing a response.
+    Abort(ErrorCode),
+}
+
+/// Opaque bootstrap staged for one broker-reserved prepared child.
+pub struct PreparedProcessBootstrap<'a> {
+    /// Platform-defined format.
+    pub format: ProcessBootstrapFormat,
+    /// Version within the platform-defined format.
+    pub version: ProcessBootstrapVersion,
+    /// Opaque platform bytes.
+    pub payload: &'a [u8],
+}
+
 impl<Memory: SharedMemory> BrokerHostAssociation<'_, Memory> {
+    /// Returns the broker-assigned process ID for this association.
+    #[must_use]
+    pub fn process_id(&self) -> litebox_broker_protocol::ProcessId {
+        self.process.id()
+    }
+
     /// Requests cancellation of provider operations after the peer disconnects.
     pub fn request_cancellation(&self) {
         self.process.request_cancellation();
@@ -110,6 +140,30 @@ impl<Memory: SharedMemory> BrokerHostAssociation<'_, Memory> {
         &self,
         request: BrokerRequest,
         send_response: impl FnOnce(&BrokerResponse) -> core::result::Result<(), ChannelError>,
+    ) -> Result<(), ChannelError> {
+        self.execute_request_with(
+            request,
+            |_process, _operation, _shared_buffers| None,
+            send_response,
+            |_result| {},
+        )
+    }
+
+    /// Executes one active request with an optional deployment-specific operation handler.
+    ///
+    /// The extension runs after shared-buffer ownership is validated and while
+    /// any operation-scoped sequence remains reserved for this request.
+    pub fn execute_request_with<ChannelError>(
+        &self,
+        request: BrokerRequest,
+        extension: impl FnOnce(
+            &BrokerProcess,
+            &BrokerOperation,
+            &SharedBufferPool<Memory>,
+        )
+            -> Option<core::result::Result<BrokerResult, BrokerHostExtensionError>>,
+        send_response: impl FnOnce(&BrokerResponse) -> core::result::Result<(), ChannelError>,
+        response_sent: impl FnOnce(&BrokerResult),
     ) -> Result<(), ChannelError> {
         let BrokerRequest {
             request_id,
@@ -134,12 +188,19 @@ impl<Memory: SharedMemory> BrokerHostAssociation<'_, Memory> {
             }
         }
 
-        let result = match complete_request(handle_request(
-            &self.process,
-            operation,
-            self.shared_buffers,
-            &self.readiness_sink,
-        )) {
+        let request_result = match extension(&self.process, &operation, self.shared_buffers) {
+            Some(result) => result.map_err(|error| match error {
+                BrokerHostExtensionError::Respond(error) => RequestFailure::Respond(error),
+                BrokerHostExtensionError::Abort(error) => RequestFailure::Abort(error),
+            }),
+            None => handle_request(
+                &self.process,
+                operation,
+                self.shared_buffers,
+                &self.readiness_sink,
+            ),
+        };
+        let result = match complete_request(request_result) {
             Ok(result) => result,
             Err(error) => {
                 self.state.lock().failed = true;
@@ -152,12 +213,26 @@ impl<Memory: SharedMemory> BrokerHostAssociation<'_, Memory> {
                 .shared_buffer_usage
                 .end(request_id, sequence);
         }
-        if let Err(error) = send_response(&BrokerResponse { request_id, result }) {
+        let response = BrokerResponse { request_id, result };
+        if let Err(error) = send_response(&response) {
             self.state.lock().failed = true;
             return Err(BrokerHostError::Channel(error));
         }
+        response_sent(&response.result);
         Ok(())
     }
+}
+
+/// Copies a validated operation-scoped shared-buffer sequence.
+pub fn copy_shared_buffer<Memory: SharedMemory>(
+    shared_buffers: &SharedBufferPool<Memory>,
+    buffer: SharedBufferSequence,
+    maximum_length: u32,
+) -> core::result::Result<Vec<u8>, BrokerHostExtensionError> {
+    read_shared_buffer(shared_buffers, buffer, maximum_length).map_err(|error| match error {
+        RequestFailure::Respond(error) => BrokerHostExtensionError::Respond(error),
+        RequestFailure::Abort(error) => BrokerHostExtensionError::Abort(error),
+    })
 }
 
 /// Authenticates and negotiates one broker control connection.
@@ -247,15 +322,109 @@ where
             BrokerProcess::finish(process);
             return Err(BrokerHostError::Channel(error));
         }
-        return Ok(Ok(BrokerHostAssociation {
-            process,
-            shared_buffers,
-            readiness_sink,
-            state: SpinMutex::new(AssociationState {
-                failed: false,
-                shared_buffer_usage: SharedBufferUsage::new(),
-            }),
-        }));
+        return Ok(Ok(new_association(process, shared_buffers, readiness_sink)));
+    }
+}
+
+/// Authenticates and negotiates one broker-reserved prepared child connection.
+pub fn setup_prepared_connection<'a, SetupChannel, Memory, ChannelError>(
+    pending: PendingProcess,
+    setup_channel: &mut SetupChannel,
+    shared_buffers: &'a SharedBufferPool<Memory>,
+    readiness_sink: Arc<dyn ReadinessSink>,
+    bootstrap: PreparedProcessBootstrap<'_>,
+    send_shared_memory: impl FnOnce(&mut SetupChannel) -> core::result::Result<(), ChannelError>,
+) -> Result<ConnectionSetup<'a, Memory>, ChannelError>
+where
+    SetupChannel: HostSetupChannel<Error = ChannelError>,
+    Memory: SharedMemory,
+{
+    if shared_buffers.layout() != SHARED_BUFFER_LAYOUT {
+        return Err(BrokerHostError::SharedBufferLayoutMismatch);
+    }
+    if bootstrap.payload.len() > MAX_PROCESS_BOOTSTRAP_SIZE as usize {
+        return Err(BrokerHostError::Broker(ErrorCode::ResourceExhausted));
+    }
+    let process_id = pending.id();
+    let transport_credential = match setup_channel
+        .peer_credential()
+        .map_err(BrokerHostError::Channel)?
+    {
+        PeerCredential::HostGuaranteed => CallerCredential::HostGuaranteed,
+        PeerCredential::Unauthenticated => CallerCredential::Unauthenticated,
+        _ => return Err(BrokerHostError::Broker(ErrorCode::PolicyDenied)),
+    };
+    if transport_credential != pending.caller_credential() {
+        return Err(BrokerHostError::Broker(ErrorCode::PolicyDenied));
+    }
+    let request = match setup_channel
+        .recv_handshake_request()
+        .map_err(BrokerHostError::Channel)?
+    {
+        HostReceive::Message(request) => request,
+        HostReceive::ProtocolViolation => {
+            setup_channel
+                .send_handshake_response(&BrokerHandshakeResponse::Error(ErrorCode::ProtocolState))
+                .map_err(BrokerHostError::Channel)?;
+            return Ok(Err(ConnectionTermination::ProtocolViolation));
+        }
+        HostReceive::PeerClosed => return Ok(Err(ConnectionTermination::PeerClosed)),
+    };
+    if request.protocol_version != BROKER_PROTOCOL_VERSION {
+        setup_channel
+            .send_handshake_response(&BrokerHandshakeResponse::VersionMismatch {
+                broker_protocol_version: BROKER_PROTOCOL_VERSION,
+            })
+            .map_err(BrokerHostError::Channel)?;
+        return Ok(Err(ConnectionTermination::Rejected(
+            ErrorCode::UnsupportedVersion,
+        )));
+    }
+
+    let bootstrap_length = u32::try_from(bootstrap.payload.len())
+        .map_err(|_| BrokerHostError::Broker(ErrorCode::ResourceExhausted))?;
+    let buffer = SharedBufferSequence::new(&[SharedBufferSlotIndex(0)], bootstrap_length)
+        .map_err(|_| BrokerHostError::Broker(ErrorCode::Internal))?;
+    write_shared_buffer(
+        shared_buffers,
+        buffer,
+        bootstrap.payload,
+        MAX_PROCESS_BOOTSTRAP_SIZE,
+    )
+    .map_err(|error| BrokerHostError::Broker(request_failure_error(error)))?;
+
+    let response = BrokerHandshakeResponse::Prepared {
+        broker_protocol_version: BROKER_PROTOCOL_VERSION,
+        process_id,
+        bootstrap: ProcessBootstrap {
+            format: bootstrap.format,
+            version: bootstrap.version,
+            buffer,
+        },
+        inherited_objects: InheritedProcessObjects::new(pending.inherited_objects())
+            .ok_or(BrokerHostError::Broker(ErrorCode::Internal))?,
+    };
+    setup_channel
+        .send_handshake_response(&response)
+        .map_err(BrokerHostError::Channel)?;
+    send_shared_memory(setup_channel).map_err(BrokerHostError::Channel)?;
+    let (process, _prepared) = pending.attach();
+    Ok(Ok(new_association(process, shared_buffers, readiness_sink)))
+}
+
+fn new_association<Memory: SharedMemory>(
+    process: Arc<BrokerProcess>,
+    shared_buffers: &SharedBufferPool<Memory>,
+    readiness_sink: Arc<dyn ReadinessSink>,
+) -> BrokerHostAssociation<'_, Memory> {
+    BrokerHostAssociation {
+        process,
+        shared_buffers,
+        readiness_sink,
+        state: SpinMutex::new(AssociationState {
+            failed: false,
+            shared_buffer_usage: SharedBufferUsage::new(),
+        }),
     }
 }
 
@@ -356,6 +525,12 @@ fn complete_request(
     }
 }
 
+const fn request_failure_error(error: RequestFailure) -> ErrorCode {
+    match error {
+        RequestFailure::Respond(error) | RequestFailure::Abort(error) => error,
+    }
+}
+
 fn handle_request<Memory: SharedMemory>(
     process: &BrokerProcess,
     operation: BrokerOperation,
@@ -403,6 +578,11 @@ fn handle_request<Memory: SharedMemory>(
         }
         BrokerOperation::File(request) => {
             handle_file_request(process, request, shared_buffers).map(BrokerResult::File)
+        }
+        BrokerOperation::StartProcess(_)
+        | BrokerOperation::AcknowledgeProcessStart(_)
+        | BrokerOperation::ProcessReady(_) => {
+            Err(RequestFailure::Respond(ErrorCode::UnsupportedOperation))
         }
     }
 }

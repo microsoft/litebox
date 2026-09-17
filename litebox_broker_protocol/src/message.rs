@@ -17,6 +17,10 @@ use crate::pipe::{
     CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
     WritePipeResponse,
 };
+use crate::process::{
+    InheritedProcessObjects, ProcessBootstrap, ProcessReadyRequest, ProcessStartToken,
+    StartProcessRequest, StartedProcess,
+};
 use crate::readiness::ReadinessFlags;
 use crate::shared_buffer::SharedBufferSequence;
 use crate::socket::{
@@ -64,6 +68,12 @@ pub enum BrokerOperation {
     Stdio(StdioRequest),
     /// File request family.
     File(FileRequest),
+    /// Start one child process from an opaque platform bootstrap.
+    StartProcess(StartProcessRequest),
+    /// Commit a prepared process after its start result reaches the parent.
+    AcknowledgeProcessStart(ProcessStartToken),
+    /// Report that this prepared process is ready to begin guest execution.
+    ProcessReady(ProcessReadyRequest),
 }
 
 impl BrokerOperation {
@@ -97,7 +107,11 @@ impl BrokerOperation {
                 | FileRequest::Unlink(UnlinkFileRequest { path: buffer, .. })
                 | FileRequest::Mkdir(MkdirFileRequest { path: buffer, .. })
                 | FileRequest::Rmdir(RmdirFileRequest { path: buffer, .. }),
-            ) => Some(*buffer),
+            )
+            | Self::StartProcess(StartProcessRequest {
+                bootstrap: ProcessBootstrap { buffer, .. },
+                ..
+            }) => Some(*buffer),
             Self::CreateThread
             | Self::ExitThread(_)
             | Self::CloseObject(_)
@@ -118,7 +132,9 @@ impl BrokerOperation {
             | Self::Stdio(StdioRequest::IsTerminal(_))
             | Self::File(
                 FileRequest::Seek(_) | FileRequest::Truncate(_) | FileRequest::HandleStatus(_),
-            ) => None,
+            )
+            | Self::AcknowledgeProcessStart(_)
+            | Self::ProcessReady(_) => None,
         }
     }
 }
@@ -144,6 +160,17 @@ pub enum BrokerHandshakeResponse {
         broker_protocol_version: ProtocolVersion,
         /// Assigned process ID.
         process_id: ProcessId,
+    },
+    /// Negotiation result for a broker-reserved prepared child.
+    Prepared {
+        /// Broker protocol version supported by this endpoint.
+        broker_protocol_version: ProtocolVersion,
+        /// Broker-assigned child process ID.
+        process_id: ProcessId,
+        /// Opaque platform bootstrap staged in the child's shared-buffer pool.
+        bootstrap: ProcessBootstrap,
+        /// Child-owned broker handles corresponding to the parent's inheritance manifest.
+        inherited_objects: InheritedProcessObjects,
     },
     /// Negotiation failed because the requested version is unsupported.
     ///
@@ -234,6 +261,12 @@ pub enum BrokerResult {
     Stdio(StdioResponse),
     /// File response family.
     File(FileResponse),
+    /// A child was materialized and is ready for parent acknowledgement.
+    ProcessStarted(StartedProcess),
+    /// Parent acknowledgement committed the prepared child.
+    ProcessStartAcknowledged,
+    /// Parent acknowledgement released this prepared child.
+    ProcessReady,
     /// Operation failed with an ABI-neutral broker error.
     Error(ErrorCode),
 }

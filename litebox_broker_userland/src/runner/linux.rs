@@ -6,6 +6,7 @@ use std::io::Result as IoResult;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::Child;
+use std::sync::Arc;
 use std::time::Instant;
 
 use litebox_broker_core::BrokerCore;
@@ -15,7 +16,7 @@ use litebox_broker_transport_linux_userland::unix_socket::{
     UnixStreamHostSetupChannel, validate_peer_process,
 };
 
-use super::{SETUP_TIMEOUT, accept_runner_channel};
+use super::{PreparedRunner, RunnerChildren, SETUP_TIMEOUT, accept_runner_channel};
 
 pub(super) struct PlatformRunnerEndpoint {
     socket_path: PathBuf,
@@ -42,13 +43,35 @@ impl PlatformRunnerEndpoint {
         self.socket_path.as_os_str()
     }
 
-    pub(super) fn serve(&mut self, broker: &BrokerCore, runner: &mut Child) -> IoResult<()> {
+    pub(super) fn serve(
+        &mut self,
+        broker: &BrokerCore,
+        runner: &mut Child,
+        children: Arc<RunnerChildren>,
+    ) -> IoResult<()> {
         serve_runner_process(
             broker,
             self.listener
                 .as_ref()
                 .expect("a live runner instance must own its control listener"),
             runner,
+            children,
+        )
+    }
+
+    pub(super) fn serve_prepared(
+        &mut self,
+        runner: &mut Child,
+        prepared: PreparedRunner,
+        children: Arc<RunnerChildren>,
+    ) -> IoResult<()> {
+        serve_prepared_runner_process(
+            self.listener
+                .as_ref()
+                .expect("a live runner instance must own its control listener"),
+            runner,
+            prepared,
+            children,
         )
     }
 
@@ -62,7 +85,50 @@ fn serve_runner_process(
     broker: &BrokerCore,
     control_listener: &UnixListener,
     runner: &mut Child,
+    children: Arc<RunnerChildren>,
 ) -> IoResult<()> {
+    let (control_channel, setup_deadline) = accept_control_channel(control_listener, runner)?;
+    crate::runtime::serve_runner_association(
+        broker,
+        control_channel,
+        || MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE),
+        MemfdSharedMemory::create_control_ring,
+        |channel, shared_memory, control_memory| {
+            channel.send_memfd(shared_memory, Some(setup_deadline))?;
+            channel.send_memfd(control_memory, Some(setup_deadline))?;
+            Ok(())
+        },
+        UnixStreamHostSetupChannel::into_active,
+        children,
+    )
+}
+
+fn serve_prepared_runner_process(
+    control_listener: &UnixListener,
+    runner: &mut Child,
+    prepared: PreparedRunner,
+    children: Arc<RunnerChildren>,
+) -> IoResult<()> {
+    let (control_channel, setup_deadline) = accept_control_channel(control_listener, runner)?;
+    crate::runtime::serve_prepared_association(
+        prepared,
+        control_channel,
+        || MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE),
+        MemfdSharedMemory::create_control_ring,
+        |channel, shared_memory, control_memory| {
+            channel.send_memfd(shared_memory, Some(setup_deadline))?;
+            channel.send_memfd(control_memory, Some(setup_deadline))?;
+            Ok(())
+        },
+        UnixStreamHostSetupChannel::into_active,
+        children,
+    )
+}
+
+fn accept_control_channel(
+    control_listener: &UnixListener,
+    runner: &mut Child,
+) -> IoResult<(UnixStreamHostSetupChannel, Instant)> {
     let setup_deadline = Instant::now() + SETUP_TIMEOUT;
     let control_stream = accept_runner_channel(
         setup_deadline,
@@ -75,18 +141,8 @@ fn serve_runner_process(
         || control_listener.accept().map(|(stream, _)| stream),
     )?;
     validate_peer_process(&control_stream, runner.id())?;
-    let control_channel =
-        UnixStreamHostSetupChannel::from_host_guaranteed(control_stream, setup_deadline);
-    crate::runtime::serve_association(
-        broker,
-        control_channel,
-        || MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE),
-        MemfdSharedMemory::create_control_ring,
-        |channel, shared_memory, control_memory| {
-            channel.send_memfd(shared_memory, Some(setup_deadline))?;
-            channel.send_memfd(control_memory, Some(setup_deadline))?;
-            Ok(())
-        },
-        UnixStreamHostSetupChannel::into_active,
-    )
+    Ok((
+        UnixStreamHostSetupChannel::from_host_guaranteed(control_stream, setup_deadline),
+        setup_deadline,
+    ))
 }
