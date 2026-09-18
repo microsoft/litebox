@@ -171,6 +171,15 @@ impl ElfPatchState {
 /// Identity of a resolved filesystem descriptor.
 pub(crate) struct ElfPatchKey(Arc<FileFd>);
 
+impl core::fmt::Debug for ElfPatchKey {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_tuple("ElfPatchKey")
+            .field(&Arc::as_ptr(&self.0))
+            .finish()
+    }
+}
+
 impl Clone for ElfPatchKey {
     fn clone(&self) -> Self {
         Self(Arc::clone(&self.0))
