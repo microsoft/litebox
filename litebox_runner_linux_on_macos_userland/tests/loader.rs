@@ -53,15 +53,16 @@ fn run_program(name: &str, aot: bool) {
             .args(["-Z", "--initial-files"])
             .arg(&archive)
             .args(["--env", "LD_LIBRARY_PATH=/lib/aarch64-linux-gnu"]);
-        if from_tar {
-            command
-                .arg("--program-from-tar")
-                .arg(format!("/bin/{name}"));
+        let expected_argv0 = if from_tar {
+            let program = format!("/bin/{name}");
+            command.arg("--program-from-tar").arg(&program);
+            program
         } else {
-            command.arg(root.join("bin").join(name));
-        }
+            let program = root.join("bin").join(name);
+            command.arg(&program);
+            program.display().to_string()
+        };
         let output = command.output().unwrap();
-        // Stdout requires a broker; these tests check successful execution.
         assert_eq!(
             output.status.code(),
             Some(0),
@@ -70,29 +71,51 @@ fn run_program(name: &str, aot: bool) {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        if name == "hello_world_dyn" {
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let expected_prefix = format!(
+                "argv[0] = {expected_argv0}\nenvp[0] = LD_LIBRARY_PATH=/lib/aarch64-linux-gnu\nElapsed time: "
+            );
+            assert!(
+                stdout.starts_with(&expected_prefix) && stdout.ends_with(" seconds\n"),
+                "unexpected guest stdout: {stdout:?}"
+            );
+        }
     }
 }
 
 #[test]
-#[ignore = "macOS runner requires broker support"]
+#[cfg_attr(
+    not(feature = "test-broker"),
+    ignore = "macOS runner requires broker support"
+)]
 fn test_load_exec_dynamic() {
     run_program("hello_world_dyn", false);
 }
 
 #[test]
-#[ignore = "macOS runner requires broker support"]
+#[cfg_attr(
+    not(feature = "test-broker"),
+    ignore = "macOS runner requires broker support"
+)]
 fn test_load_exec_dynamic_pthreads() {
     run_program("hello_thread", false);
 }
 
 #[test]
-#[ignore = "macOS runner requires broker support"]
+#[cfg_attr(
+    not(feature = "test-broker"),
+    ignore = "macOS runner requires broker support"
+)]
 fn test_syscall_rewriter() {
     run_program("hello_world_dyn", true);
 }
 
 #[test]
-#[ignore = "macOS runner requires broker support"]
+#[cfg_attr(
+    not(feature = "test-broker"),
+    ignore = "macOS runner requires broker support"
+)]
 fn test_syscall_rewriter_pthreads() {
     run_program("hello_thread", true);
 }
