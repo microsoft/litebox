@@ -46,6 +46,39 @@ pub type MacosUserland = MacosUserlandWithPageSize<HOST_PAGE_SIZE>;
 #[cfg(feature = "subpage_compat")]
 pub type MacosUserland4K = MacosUserlandWithPageSize<4096>;
 mod subpage;
+
+// Diagnostic-only: enable before signal handlers are installed. The handler
+// never consults the environment or uses the allocator/logger.
+static FAULT_TRACE: AtomicBool = AtomicBool::new(false);
+static FAULT_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn trace_memory_fault(pc: usize, sp: usize, far: usize, esr: u64) {
+    if !FAULT_TRACE.load(Ordering::Relaxed)
+        || FAULT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= 32
+    {
+        return;
+    }
+    let mut output = *b"FAULT pc=0x0000000000000000 sp=0x0000000000000000 far=0x0000000000000000 esr=0x0000000000000000\n";
+    for (offset, value) in [
+        (11, pc as u64),
+        (33, sp as u64),
+        (56, far as u64),
+        (79, esr),
+    ] {
+        for index in 0..16 {
+            output[offset + index] =
+                b"0123456789abcdef"[((value >> ((15 - index) * 4)) & 15) as usize];
+        }
+    }
+    // SAFETY: errno is thread-local; the buffer is stack-owned. write is
+    // async-signal-safe. Preserve errno for interrupted host operations.
+    unsafe {
+        let errno = libc::__error();
+        let saved = *errno;
+        libc::write(libc::STDERR_FILENO, output.as_ptr().cast(), output.len());
+        *errno = saved;
+    }
+}
 /// The macOS host's Mach-O `__PAGEZERO` reserves the first 4 GiB.
 pub const TASK_ADDR_MIN: usize = 0x1_0000_0000;
 /// Exclusive upper bound for guest mappings (`MACH_VM_MAX_ADDRESS` on AArch64 macOS).
@@ -73,6 +106,10 @@ impl<const PAGE_SIZE: usize> MacosUserlandWithPageSize<PAGE_SIZE> {
     /// Panics if the host page size, pthread TSD layout, signal setup, or host memory-map
     /// snapshot is unsupported or cannot be initialized.
     pub fn new() -> &'static Self {
+        FAULT_TRACE.store(
+            std::env::var_os("LITEBOX_FAULT_TRACE").is_some(),
+            Ordering::Relaxed,
+        );
         const {
             assert!(
                 PAGE_SIZE == HOST_PAGE_SIZE
@@ -2244,6 +2281,9 @@ unsafe extern "C" fn exception_signal_handler(
     // SAFETY: SA_SIGINFO supplies a live siginfo for this invocation.
     let code = unsafe { (*info).si_code };
     let memory_fault = is_synchronous_memory_fault(signal, code, esr);
+    if memory_fault {
+        trace_memory_fault(pc, mc.__ss.__sp.trunc(), mc.__es.__far.trunc(), esr);
+    }
     #[cfg(feature = "subpage_compat")]
     if memory_fault && subpage::recover_fault(pc, mc.__es.__far.trunc(), esr) {
         return;

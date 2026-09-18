@@ -237,6 +237,9 @@ impl<const PAGE_SIZE: usize> Pages<PAGE_SIZE> {
                     continue;
                 }
                 let range = base..base + range.len();
+                if super::FAULT_TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!("MAP hint actual={range:x?} permissions={permissions:?}");
+                }
                 let changes: Vec<_> = (base..base + len)
                     .step_by(HOST_PAGE_SIZE)
                     .map(|address| {
@@ -257,6 +260,11 @@ impl<const PAGE_SIZE: usize> Pages<PAGE_SIZE> {
             return Err(error);
         }
 
+        if super::FAULT_TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "MAP fixed range={range:x?} permissions={permissions:?} behavior={behavior:?}"
+            );
+        }
         let mut changes = Vec::new();
         for base in host_range(&range).step_by(HOST_PAGE_SIZE) {
             let mut slots = self.0.get(&base).copied().unwrap_or([None; MAX_SUBPAGES]);
@@ -329,6 +337,9 @@ impl<const PAGE_SIZE: usize> Pages<PAGE_SIZE> {
         let _ = prot_flags(permissions);
         if !self.contains_range(range.clone()) {
             return Err(PermissionUpdateError::Unallocated);
+        }
+        if super::FAULT_TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("MAP protect range={range:x?} permissions={permissions:?}");
         }
         let mut changes = Vec::new();
         for base in host_range(&range).step_by(HOST_PAGE_SIZE) {
