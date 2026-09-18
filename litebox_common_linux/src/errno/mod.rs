@@ -186,6 +186,7 @@ impl From<litebox::net::errors::CloseError> for Errno {
 impl From<litebox::fs::errors::ReadError> for Errno {
     fn from(value: litebox::fs::errors::ReadError) -> Self {
         match value {
+            litebox::fs::errors::ReadError::ClosedFd => Errno::EBADF,
             litebox::fs::errors::ReadError::NotAFile => Errno::EISDIR,
             litebox::fs::errors::ReadError::NotForReading => Errno::EBADF,
             litebox::fs::errors::ReadError::Io => Errno::EIO,
@@ -344,8 +345,8 @@ impl From<litebox::path::ConversionError> for Errno {
 impl From<litebox::fs::errors::FileStatusError> for Errno {
     fn from(value: litebox::fs::errors::FileStatusError) -> Self {
         match value {
-            litebox::fs::errors::FileStatusError::PathError(path_error) => path_error.into(),
             litebox::fs::errors::FileStatusError::ClosedFd => Errno::EBADF,
+            litebox::fs::errors::FileStatusError::PathError(path_error) => path_error.into(),
             litebox::fs::errors::FileStatusError::Io => Errno::EIO,
             _ => unimplemented!(),
         }
