@@ -44,8 +44,7 @@ use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
 };
 use litebox_broker_protocol::process::{
-    InheritedProcessObjects, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessBootstrap, ProcessBootstrapFormat,
-    ProcessBootstrapVersion, ProcessStartup,
+    MAX_PROCESS_BOOTSTRAP_SIZE, ProcessBootstrap, ProcessStartup, ProcessStartupData,
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::shared_buffer::{
@@ -62,7 +61,7 @@ use litebox_broker_protocol::stdio::{
     IsTerminalStdioRequest, IsTerminalStdioResponse, MAX_STDIO_TRANSFER_SIZE, ReadStdioRequest,
     ReadStdioResponse, WriteStdioRequest, WriteStdioResponse,
 };
-use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, ObjectHandle, RequestId};
+use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, RequestId};
 use litebox_broker_transport::channel::{HostReceive, HostSetupChannel, PeerCredential};
 use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemory};
 use spin::mutex::SpinMutex;
@@ -93,27 +92,6 @@ pub struct BrokerHostAssociation<'a, Memory: SharedMemory> {
 struct AssociationState {
     failed: bool,
     shared_buffer_usage: SharedBufferUsage,
-}
-
-/// Failure classification for broker request handling.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RequestFailure {
-    /// Return an error result and keep serving the association.
-    Respond(ErrorCode),
-    /// Fail the association without publishing a response.
-    Abort(ErrorCode),
-}
-
-/// Child startup data staged during broker negotiation.
-pub struct ProcessStartupData {
-    /// Platform-defined format.
-    pub format: ProcessBootstrapFormat,
-    /// Version within the platform-defined format.
-    pub version: ProcessBootstrapVersion,
-    /// Opaque platform bytes.
-    pub payload: Vec<u8>,
-    /// Child-owned broker handles in the parent's inheritance-manifest order.
-    pub inherited_objects: Vec<ObjectHandle>,
 }
 
 impl<'a, Memory: SharedMemory> BrokerHostAssociation<'a, Memory> {
@@ -283,8 +261,7 @@ where
                     version,
                     buffer,
                 },
-                inherited_objects: InheritedProcessObjects::new(&inherited_objects)
-                    .ok_or(BrokerHostError::Broker(ErrorCode::Internal))?,
+                inherited_objects,
             })
         }
         None => None,
@@ -385,6 +362,15 @@ where
 }
 
 type RequestResult<T> = core::result::Result<T, RequestFailure>;
+
+/// Failure classification for broker request handling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestFailure {
+    /// Return an error result and keep serving the association.
+    Respond(ErrorCode),
+    /// Fail the association without publishing a response.
+    Abort(ErrorCode),
+}
 
 impl From<litebox_broker_core::BrokerError> for RequestFailure {
     fn from(error: litebox_broker_core::BrokerError) -> Self {

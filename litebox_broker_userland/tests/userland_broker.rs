@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use litebox_broker_local::{BrokerLocal, BrokerLocalError};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::process::{
-    InheritedProcessObjects, ProcessBootstrapFormat, ProcessBootstrapVersion,
+    InheritedProcessObjects, ProcessBootstrapFormat, ProcessBootstrapVersion, ProcessStartupData,
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::{
@@ -20,13 +20,14 @@ use litebox_broker_protocol::shared_buffer::{
 };
 use litebox_broker_protocol::socket::{ReceiveFromFlags, SendFlags, SocketConnectionStatus};
 use litebox_broker_transport::control_ring::ControlRing;
-use litebox_broker_transport_linux_userland::unix_socket::UnixStreamLocalSetupChannel;
+use litebox_broker_transport_linux_userland::unix_socket::{
+    UnixControlRingLocalCallChannel, UnixStreamLocalSetupChannel,
+};
 
 const RUNNER_ARGUMENT: &str = "broker-userland-test-runner";
 const NETWORK_RUNNER_ARGUMENT: &str = "broker-userland-network-test-runner";
 const CHILD_START_RUNNER_ARGUMENT: &str = "broker-userland-child-start-runner";
 const CHILD_CANCEL_RUNNER_ARGUMENT: &str = "broker-userland-child-cancel-runner";
-const CHILD_ARGUMENT: &str = "--child";
 const TEST_BOOTSTRAP_FORMAT: ProcessBootstrapFormat = ProcessBootstrapFormat(0x7465_7374);
 const FAILING_BOOTSTRAP_FORMAT: ProcessBootstrapFormat = ProcessBootstrapFormat(0x6661_696c);
 const BROKER_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
@@ -145,10 +146,6 @@ fn run_fake_runner(args: &[OsString]) {
     );
 
     let control_socket_path = args.get(2).unwrap();
-    if args.get(3).and_then(|argument| argument.to_str()) == Some(CHILD_ARGUMENT) {
-        run_fake_child(Path::new(control_socket_path));
-        return;
-    }
     let setup_channel = connect_control_with_retry(Path::new(control_socket_path)).unwrap();
     let (local, startup, ()) = BrokerLocal::negotiate(setup_channel, |mut setup| {
         let shared_memory = setup.receive_memfd(
@@ -167,7 +164,10 @@ fn run_fake_runner(args: &[OsString]) {
         Ok((call_channel, Arc::new(shared_memory), ()))
     })
     .unwrap();
-    assert!(startup.is_none());
+    if let Some(bootstrap) = startup {
+        run_fake_child(local, bootstrap);
+        return;
+    }
     let local = Arc::new(local);
 
     if args.get(3).and_then(|argument| argument.to_str()) == Some(NETWORK_RUNNER_ARGUMENT) {
@@ -373,26 +373,10 @@ fn run_fake_runner(args: &[OsString]) {
     drop(local);
 }
 
-fn run_fake_child(control_socket_path: &Path) {
-    let setup_channel = connect_control_with_retry(control_socket_path).unwrap();
-    let (local, bootstrap, ()) = BrokerLocal::negotiate(setup_channel, |mut setup| {
-        let shared_memory = setup.receive_memfd(
-            SHARED_BUFFER_POOL_SIZE,
-            Some(Instant::now() + Duration::from_secs(5)),
-        )?;
-        let control_memory =
-            setup.receive_control_ring(Some(Instant::now() + Duration::from_secs(5)))?;
-        let control_ring = ControlRing::new(control_memory).map_err(|error| {
-            std::io::Error::new(
-                ErrorKind::InvalidData,
-                format!("invalid test control ring: {error:?}"),
-            )
-        })?;
-        let (call_channel, _notifications, _shutdown) = setup.into_active(control_ring, || {})?;
-        Ok((call_channel, Arc::new(shared_memory), ()))
-    })
-    .unwrap();
-    let bootstrap = bootstrap.expect("child negotiation must include startup data");
+fn run_fake_child(
+    local: BrokerLocal<UnixControlRingLocalCallChannel>,
+    bootstrap: ProcessStartupData,
+) {
     if bootstrap.format == FAILING_BOOTSTRAP_FORMAT {
         local
             .report_process_start_failure(ErrorCode::UnsupportedOperation)

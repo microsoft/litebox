@@ -12,8 +12,9 @@ use std::{
 };
 
 use anyhow::{Context as _, Result};
-use litebox_broker_local::{BrokerLocal, BrokerNotifications, ProcessStartupData};
+use litebox_broker_local::{BrokerLocal, BrokerNotifications};
 use litebox_broker_protocol::message::BrokerNotification;
+use litebox_broker_protocol::process::ProcessStartupData;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport::control_ring::ControlRing;
 use litebox_broker_transport_linux_userland::unix_socket::{
@@ -39,23 +40,7 @@ pub struct BrokerConnection {
 }
 
 /// Connects to and negotiates an association with a Linux-userland broker.
-pub fn connect(control_socket_path: &Path) -> Result<BrokerConnection> {
-    let (connection, startup) = connect_with_startup(control_socket_path)?;
-    if startup.is_some() {
-        anyhow::bail!("initial broker association returned child startup data");
-    }
-    Ok(connection)
-}
-
-/// Connects a child runner and receives its startup data.
-pub fn connect_child(control_socket_path: &Path) -> Result<(BrokerConnection, ProcessStartupData)> {
-    let (connection, startup) = connect_with_startup(control_socket_path)?;
-    let startup =
-        startup.ok_or_else(|| anyhow::anyhow!("child broker association omitted startup data"))?;
-    Ok((connection, startup))
-}
-
-fn connect_with_startup(
+pub fn connect(
     control_socket_path: &Path,
 ) -> Result<(BrokerConnection, Option<ProcessStartupData>)> {
     let setup_deadline = Instant::now() + SETUP_TIMEOUT;

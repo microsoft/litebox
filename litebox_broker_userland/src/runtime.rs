@@ -27,12 +27,12 @@ use std::time::{Duration, Instant};
 
 use litebox_broker_core::{BrokerCore, BrokerProcess};
 use litebox_broker_host::{
-    BrokerHostAssociation, BrokerHostError, ConnectionTermination, ProcessStartupData,
-    setup_connection,
+    BrokerHostAssociation, BrokerHostError, ConnectionTermination, setup_connection,
 };
 use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::message::{BrokerOperation, BrokerRequest};
+use litebox_broker_protocol::process::ProcessStartupData;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_LAYOUT;
 use litebox_broker_transport::channel::{
     HostAssociationShutdown, HostNotificationChannel, HostReceive, HostRequestSource,

@@ -9,11 +9,10 @@
 mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::{
-    BrokerAssociationFailureCoordinator, BrokerConnection, connect, connect_child,
-    start_notification_receiver,
+    BrokerAssociationFailureCoordinator, BrokerConnection, connect, start_notification_receiver,
 };
 
 #[cfg(all(windows, target_arch = "x86_64"))]
 mod windows;
 #[cfg(all(windows, target_arch = "x86_64"))]
-pub use windows::{BrokerConnection, connect, connect_child, start_notification_receiver};
+pub use windows::{BrokerConnection, connect, start_notification_receiver};

@@ -40,9 +40,7 @@ use litebox_broker_protocol::message::{
     BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerOperation,
     BrokerRequest, BrokerResponse, BrokerResult,
 };
-use litebox_broker_protocol::process::{
-    InheritedProcessObjects, ProcessBootstrapFormat, ProcessBootstrapVersion,
-};
+use litebox_broker_protocol::process::ProcessStartupData;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SharedBufferSequence};
 use litebox_broker_protocol::{
@@ -69,19 +67,6 @@ pub struct BrokerLocal<Channel: LocalCallChannel> {
 /// Broker-local receive adapter for broker-initiated asynchronous notifications.
 pub struct BrokerNotifications<Channel: LocalNotificationChannel> {
     channel: Channel,
-}
-
-/// Child startup data delivered during broker negotiation.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ProcessStartupData {
-    /// Platform-defined format.
-    pub format: ProcessBootstrapFormat,
-    /// Version within the platform-defined format.
-    pub version: ProcessBootstrapVersion,
-    /// Opaque platform bytes.
-    pub payload: Vec<u8>,
-    /// Child-owned broker handles in the parent's inheritance-manifest order.
-    pub inherited_objects: InheritedProcessObjects,
 }
 
 impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
@@ -366,7 +351,6 @@ mod tests {
     use core::cell::{Cell, RefCell};
     use core::convert::Infallible;
     use litebox_broker_protocol::message::{ReadinessNotification, StdioRequest, StdioResponse};
-    use litebox_broker_protocol::process::{ProcessBootstrap, ProcessStartup};
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_protocol::shared_buffer::{SharedBufferSequence, SharedBufferSlotIndex};
     use litebox_broker_protocol::stdio::{
@@ -412,36 +396,6 @@ mod tests {
         assert_eq!(setup_calls.get(), 1);
         assert!(startup.is_none());
         assert_eq!(local.process_id(), test_process_id());
-    }
-
-    #[test]
-    fn negotiate_returns_child_startup_data() {
-        let inherited_objects = InheritedProcessObjects::new(&[ObjectHandle(7)]).unwrap();
-        let channel = FakeControlChannel::new(
-            Some(BrokerHandshakeResponse::Negotiated {
-                broker_protocol_version: BROKER_PROTOCOL_VERSION,
-                process_id: test_process_id(),
-                startup: Some(ProcessStartup {
-                    bootstrap: ProcessBootstrap {
-                        format: ProcessBootstrapFormat(3),
-                        version: ProcessBootstrapVersion(4),
-                        buffer: SharedBufferSequence::new(&[SharedBufferSlotIndex(0)], 5).unwrap(),
-                    },
-                    inherited_objects,
-                }),
-            }),
-            None,
-        );
-
-        let (_local, startup, ()) =
-            BrokerLocal::negotiate(channel, |channel| Ok((channel, noop_shared_memory(), ())))
-                .unwrap();
-        let startup = startup.unwrap();
-
-        assert_eq!(startup.format, ProcessBootstrapFormat(3));
-        assert_eq!(startup.version, ProcessBootstrapVersion(4));
-        assert_eq!(startup.payload, [0; 5]);
-        assert_eq!(startup.inherited_objects, inherited_objects);
     }
 
     #[test]

@@ -31,11 +31,7 @@ pub struct CliArgs {
     /// The program and arguments passed to it (e.g., `/usr/bin/python3 --version`).
     ///
     /// The program path must be absolute and refer to a file in the broker-owned file system.
-    #[arg(
-        required_unless_present = "child",
-        trailing_var_arg = true,
-        value_hint = clap::ValueHint::CommandWithArguments
-    )]
+    #[arg(trailing_var_arg = true, value_hint = clap::ValueHint::CommandWithArguments)]
     pub program_and_arguments: Vec<String>,
     /// Environment variables passed to the program (`K=V` pairs; can be invoked multiple times)
     #[arg(long = "env")]
@@ -46,14 +42,6 @@ pub struct CliArgs {
     /// Allow using unstable options
     #[arg(short = 'Z', long = "unstable")]
     pub unstable: bool,
-    /// Start as a dynamically launched child.
-    #[arg(
-        long = "child",
-        hide = true,
-        requires_all = ["unstable", "broker_control_channel"],
-        help_heading = "Unstable Options"
-    )]
-    pub child: bool,
     /// Broker-supplied Unix socket path for the local control channel.
     #[arg(
         long = "broker-control-channel",
@@ -99,15 +87,15 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         )
         .init();
 
-    if cli_args.child {
-        if !cli_args.program_and_arguments.is_empty() {
-            return Err(anyhow!("--child does not accept a root program argument"));
-        }
-        let control_socket_path = cli_args
-            .broker_control_channel
-            .as_deref()
-            .context("--child requires --broker-control-channel")?;
-        let (connection, bootstrap) = broker::connect_child(control_socket_path)?;
+    let control_socket_path = cli_args
+        .broker_control_channel
+        .as_deref()
+        .context("file operations require --broker-control-channel")?;
+    let (connection, startup) =
+        litebox_platform_linux_userland::with_guest_signals_blocked(|| {
+            broker::connect(control_socket_path)
+        })?;
+    if let Some(bootstrap) = startup {
         connection
             .local
             .report_process_start_failure(ErrorCode::UnsupportedOperation)?;
@@ -131,19 +119,13 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
 
     let mut broker_positional_io_fds = Vec::new();
     let mut broker_shutdown_fds = Vec::new();
-    let control_socket_path = cli_args
-        .broker_control_channel
-        .as_deref()
-        .context("file operations require --broker-control-channel")?;
     let broker::BrokerConnection {
         local: broker_local,
         notifications: broker_notifications,
         coordinator: broker_association_coordinator,
         positional_io_fds,
         shutdown_fd,
-    } = litebox_platform_linux_userland::with_guest_signals_blocked(|| {
-        broker::connect(control_socket_path)
-    })?;
+    } = connection;
     let process_id = i32::try_from(broker_local.process_id().0)
         .context("process ID does not fit Linux pid_t")?;
     broker_positional_io_fds.extend(positional_io_fds);
@@ -258,17 +240,15 @@ mod tests {
     }
 
     #[test]
-    fn child_does_not_require_a_root_program() {
+    fn broker_connection_does_not_require_a_root_program() {
         let args = CliArgs::try_parse_from([
             "runner",
             "--unstable",
             "--broker-control-channel",
             "/tmp/broker.sock",
-            "--child",
         ])
         .unwrap();
 
-        assert!(args.child);
         assert!(args.program_and_arguments.is_empty());
     }
 

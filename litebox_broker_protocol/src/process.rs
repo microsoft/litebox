@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use alloc::vec::Vec;
+
 use crate::shared_buffer::SharedBufferSequence;
 use crate::{ObjectHandle, ProcessId, ThreadId};
 
@@ -78,6 +80,19 @@ pub struct ProcessBootstrap {
 pub struct ProcessStartup {
     /// Opaque platform bootstrap staged in the child's shared-buffer pool.
     pub bootstrap: ProcessBootstrap,
+    /// Child-owned broker handles in the parent's inheritance-manifest order.
+    pub inherited_objects: InheritedProcessObjects,
+}
+
+/// Owned child startup data delivered during broker negotiation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessStartupData {
+    /// Platform-defined format.
+    pub format: ProcessBootstrapFormat,
+    /// Version within the platform-defined format.
+    pub version: ProcessBootstrapVersion,
+    /// Opaque platform bytes.
+    pub payload: Vec<u8>,
     /// Child-owned broker handles in the parent's inheritance-manifest order.
     pub inherited_objects: InheritedProcessObjects,
 }

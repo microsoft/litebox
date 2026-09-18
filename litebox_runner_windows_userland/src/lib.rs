@@ -21,11 +21,7 @@ pub struct CliArgs {
     /// The program and arguments passed to it (e.g., `/app/program.exe --help`).
     ///
     /// The program path refers to a path inside the broker-owned file system.
-    #[arg(
-        required_unless_present = "child",
-        trailing_var_arg = true,
-        value_hint = clap::ValueHint::CommandWithArguments
-    )]
+    #[arg(trailing_var_arg = true, value_hint = clap::ValueHint::CommandWithArguments)]
     pub program_and_arguments: Vec<String>,
     /// Environment variables passed to the program (`K=V` pairs; can be invoked multiple times).
     #[arg(long = "env")]
@@ -36,14 +32,6 @@ pub struct CliArgs {
     /// Allow using unstable options.
     #[arg(short = 'Z', long = "unstable")]
     pub unstable: bool,
-    /// Start as a dynamically launched child.
-    #[arg(
-        long = "child",
-        hide = true,
-        requires_all = ["unstable", "broker_control_channel"],
-        help_heading = "Unstable Options"
-    )]
-    pub child: bool,
     /// Broker-supplied Windows named-pipe path for the local control channel.
     #[arg(
         long = "broker-control-channel",
@@ -67,15 +55,12 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         )
         .init();
 
-    if cli_args.child {
-        if !cli_args.program_and_arguments.is_empty() {
-            anyhow::bail!("--child does not accept a root program argument");
-        }
-        let control_pipe = cli_args
-            .broker_control_channel
-            .as_deref()
-            .context("--child requires --broker-control-channel")?;
-        let (connection, bootstrap) = broker::connect_child(control_pipe)?;
+    let control_pipe = cli_args
+        .broker_control_channel
+        .as_deref()
+        .context("file operations require --broker-control-channel")?;
+    let (connection, startup) = broker::connect(control_pipe)?;
+    if let Some(bootstrap) = startup {
         connection
             .local
             .report_process_start_failure(ErrorCode::UnsupportedOperation)?;
@@ -88,14 +73,10 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
 
     let platform = WindowsUserland::new();
     WindowsUserland::set_guest_tls_mode(GuestTlsMode::Windows);
-    let control_pipe = cli_args
-        .broker_control_channel
-        .as_deref()
-        .context("file operations require --broker-control-channel")?;
     let broker::BrokerConnection {
         local,
         notifications,
-    } = broker::connect(control_pipe)?;
+    } = connection;
     let process_id = local.process_id().0 as usize;
     let litebox = litebox::LiteBox::new_with_broker_local(platform, local);
     let initial_thread = litebox.create_thread()?;
@@ -115,7 +96,7 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
     let (program_path, program_args) = cli_args
         .program_and_arguments
         .split_first()
-        .context("program path missing — clap should have required at least one argument")?;
+        .context("program path missing")?;
 
     let shim = shim_builder.build();
     let argv = std::iter::once(program_path.as_str())

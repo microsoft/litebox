@@ -6,8 +6,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
-use litebox_broker_local::{BrokerLocal, BrokerNotifications, ProcessStartupData};
+use litebox_broker_local::{BrokerLocal, BrokerNotifications};
 use litebox_broker_protocol::message::BrokerNotification;
+use litebox_broker_protocol::process::ProcessStartupData;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport::control_ring::ControlRing;
 use litebox_broker_transport_windows_userland::control_ring::{
@@ -26,25 +27,7 @@ pub struct BrokerConnection {
 }
 
 /// Connects to and negotiates an association with a Windows-userland broker.
-pub fn connect(control_pipe: &OsStr) -> Result<BrokerConnection> {
-    let (connection, startup) = connect_with_startup(control_pipe)?;
-    if startup.is_some() {
-        anyhow::bail!("initial broker association returned child startup data");
-    }
-    Ok(connection)
-}
-
-/// Connects a child runner and receives its startup data.
-pub fn connect_child(control_pipe: &OsStr) -> Result<(BrokerConnection, ProcessStartupData)> {
-    let (connection, startup) = connect_with_startup(control_pipe)?;
-    let startup =
-        startup.ok_or_else(|| anyhow::anyhow!("child broker association omitted startup data"))?;
-    Ok((connection, startup))
-}
-
-fn connect_with_startup(
-    control_pipe: &OsStr,
-) -> Result<(BrokerConnection, Option<ProcessStartupData>)> {
+pub fn connect(control_pipe: &OsStr) -> Result<(BrokerConnection, Option<ProcessStartupData>)> {
     let deadline = Instant::now() + SETUP_TIMEOUT;
     let setup =
         WindowsNamedPipeLocalSetupChannel::connect_with_setup_deadline(control_pipe, deadline)

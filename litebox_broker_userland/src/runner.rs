@@ -18,10 +18,10 @@ use litebox_broker_host::{RequestFailure, copy_shared_buffer};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult};
 use litebox_broker_protocol::process::{
-    MAX_PROCESS_BOOTSTRAP_SIZE, ProcessBootstrapFormat, ProcessBootstrapVersion, ProcessStartToken,
-    StartedProcess,
+    InheritedProcessObjects, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessBootstrapFormat,
+    ProcessBootstrapVersion, ProcessStartToken, StartedProcess,
 };
-use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
+use litebox_broker_protocol::{ProcessId, ThreadId};
 use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemory};
 
 use crate::runtime::AssociationFailureCause;
@@ -43,7 +43,6 @@ const PROCESS_START_ACKNOWLEDGEMENT_PUBLICATION_TIMEOUT: Duration = Duration::fr
 const PROCESS_START_SUPERVISOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_EXIT_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(10);
-const CHILD_ARGUMENT: &str = "--child";
 const MAX_PENDING_CHILD_STARTS: usize = crate::WORKER_COUNT - 1;
 const _: () = assert!(MAX_PENDING_CHILD_STARTS > 0);
 const _: () = assert!(crate::runtime::LIFECYCLE_CONTROL_WORKER_COUNT > MAX_PENDING_CHILD_STARTS);
@@ -51,8 +50,8 @@ const _: () = assert!(crate::runtime::LIFECYCLE_CONTROL_QUEUE_CAPACITY >= MAX_PE
 
 /// Configuration for starting one out-of-process runner.
 ///
-/// Dynamically started descendants use the same executable with the hidden
-/// `--child` argument instead of the root arguments.
+/// Dynamically started descendants use the same executable without the root
+/// arguments and derive their role from broker startup data.
 #[derive(Clone)]
 pub struct RunnerConfig {
     executable: PathBuf,
@@ -96,7 +95,7 @@ impl RunnerConfig {
     fn child(&self) -> Self {
         Self {
             executable: self.executable.clone(),
-            arguments: vec![OsString::from(CHILD_ARGUMENT)],
+            arguments: Vec::new(),
             proxy_url: self.proxy_url.clone(),
         }
     }
@@ -410,7 +409,7 @@ pub(crate) struct RunnerChildren {
 pub(crate) struct ChildRunner {
     pub(crate) process: Arc<BrokerProcess>,
     pub(crate) launch: Arc<ChildLaunch>,
-    pub(crate) inherited_objects: Vec<ObjectHandle>,
+    pub(crate) inherited_objects: InheritedProcessObjects,
     pub(crate) format: ProcessBootstrapFormat,
     pub(crate) version: ProcessBootstrapVersion,
     pub(crate) bootstrap: Vec<u8>,
@@ -559,7 +558,7 @@ impl RunnerChildren {
                         request.bootstrap.format,
                         request.bootstrap.version,
                         bootstrap,
-                        request.inherited_objects.as_slice(),
+                        request.inherited_objects,
                     )
                     .map_err(process_extension_error)
                 })
@@ -640,14 +639,16 @@ impl RunnerChildren {
         format: ProcessBootstrapFormat,
         version: ProcessBootstrapVersion,
         bootstrap: Vec<u8>,
-        requested_inherited_objects: &[litebox_broker_protocol::ObjectHandle],
+        requested_inherited_objects: InheritedProcessObjects,
     ) -> Result<StartedProcess, ErrorCode> {
         if !parent.is_running() {
             return Err(ErrorCode::ProtocolState);
         }
         let (process, inherited_objects) = parent
-            .create_child(requested_inherited_objects)
+            .create_child(requested_inherited_objects.as_slice())
             .map_err(ErrorCode::from)?;
+        let inherited_objects = InheritedProcessObjects::new(&inherited_objects)
+            .expect("child handle count must match the bounded inheritance request");
         let child_id = process.id();
         let launch = Arc::new(ChildLaunch {
             parent_id: parent.id(),
