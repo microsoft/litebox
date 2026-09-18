@@ -374,7 +374,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
             && files
                 .fs
                 .fd_file_status(&file)
-                .map_err(Errno::from)?
+                .map_err(|error| {
+                    files.fs.close(&file).unwrap();
+                    Errno::from(error)
+                })?
                 .file_type
                 == litebox::fs::FileType::Directory
         {
