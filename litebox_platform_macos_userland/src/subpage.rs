@@ -8,7 +8,6 @@
 //! unmapped holes can inherit neighboring access. Only these instances publish
 //! recovery state for switching mixed W/X pages between RW and RX.
 
-use litebox::utils::TruncateExt as _;
 use std::collections::HashMap;
 use std::ops::Range;
 
@@ -85,57 +84,6 @@ impl Drop for Mapping {
     fn drop(&mut self) {
         // SAFETY: this object exclusively owns the entire native mapping.
         assert_eq!(unsafe { libc::munmap(self.base as *mut _, self.len) }, 0);
-    }
-}
-
-unsafe extern "C" {
-    fn mach_vm_remap(
-        task: u32,
-        target: *mut u64,
-        size: u64,
-        mask: u64,
-        flags: MachVmFlags,
-        source_task: u32,
-        source: u64,
-        copy: i32,
-        current_protection: *mut i32,
-        max_protection: *mut i32,
-        inheritance: u32,
-    ) -> KernReturn;
-}
-
-impl Mapping {
-    /// Writable alias for zeroing without revoking a neighbor's execute access.
-    fn write_alias(base: usize) -> Result<Self, AllocationError> {
-        let mut target = 0;
-        let mut current = 0;
-        let mut maximum = 0;
-        // SAFETY: the registry owns the source; all outputs are valid. copy=false
-        // shares the backing storage, and ANYWHERE cannot overwrite host memory.
-        let result = unsafe {
-            mach_vm_remap(
-                mach_task_self(),
-                &raw mut target,
-                HOST_PAGE_SIZE as u64,
-                0,
-                MachVmFlags::ANYWHERE,
-                mach_task_self(),
-                base as u64,
-                0,
-                &raw mut current,
-                &raw mut maximum,
-                2, // VM_INHERIT_NONE
-            )
-        };
-        if result != KernReturn::SUCCESS {
-            return Err(result.into());
-        }
-        let alias = Self {
-            base: target.trunc(),
-            len: HOST_PAGE_SIZE,
-        };
-        protect(alias.base, Perm::READ | Perm::WRITE).map_err(allocation_error)?;
-        Ok(alias)
     }
 }
 
@@ -273,11 +221,8 @@ impl<const PAGE_SIZE: usize> Pages<PAGE_SIZE> {
             changes.push((base, slots));
         }
         let mut reservations = Vec::new();
-        let mut aliases = Vec::new();
         for (base, _) in &changes {
-            if self.0.contains_key(base) {
-                aliases.push((*base, Mapping::write_alias(*base)?));
-            } else {
+            if !self.0.contains_key(base) {
                 let mut address = *base as u64;
                 // SAFETY: the native-aligned FIXED reservation cannot overwrite host memory.
                 let result = unsafe {
@@ -297,18 +242,35 @@ impl<const PAGE_SIZE: usize> Pages<PAGE_SIZE> {
                 });
             }
         }
+        // Diagnostic variant: preflight final protections, but never create a
+        // writable alias of executable backing. The recovery gate remains held
+        // across staging, zeroing, cache maintenance, and the final protections.
         let mut update = self.protect_changes(&changes).map_err(allocation_error)?;
-        for (base, alias) in &aliases {
+        for (base, _) in &changes {
+            if let Err(error) = protect(*base, Perm::READ | Perm::WRITE) {
+                for (base, _) in &changes {
+                    let previous = self
+                        .0
+                        .get(base)
+                        .copied()
+                        .map_or(Perm::READ | Perm::WRITE, fused);
+                    protect(*base, previous).expect("failed to roll back staging protection");
+                }
+                return Err(allocation_error(error));
+            }
+        }
+        for (base, _) in &changes {
             let start = range.start.max(*base);
             let end = range.end.min(base + HOST_PAGE_SIZE);
-            // SAFETY: the temporary alias is writable, shares this owned guest page,
-            // and only the subpages being replaced/allocated are touched.
-            unsafe {
-                std::ptr::write_bytes((alias.base + start - base) as *mut u8, 0, end - start);
-            };
+            // SAFETY: all affected native pages are writable and pinned by the
+            // recovery gate; only the requested guest subpages are zeroed.
+            unsafe { std::ptr::write_bytes(start as *mut u8, 0, end - start) };
         }
         for (base, slots) in changes {
             flush(base, fused(slots));
+            // These permissions were preflighted above. Fail loudly in this
+            // diagnostic rather than return with partially initialized pages.
+            protect(base, fused(slots)).expect("failed to restore preflighted protection");
             update.set::<PAGE_SIZE>(base, Some(fused(slots)));
             self.0.insert(base, slots);
         }
