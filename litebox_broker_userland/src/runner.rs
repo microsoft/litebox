@@ -438,6 +438,8 @@ enum ChildLaunchPhase {
     Ready { initial_thread_id: Option<ThreadId> },
     Committing,
     Committed,
+    CompletingStart,
+    StartComplete,
     Aborted(ErrorCode),
 }
 
@@ -460,7 +462,6 @@ struct ChildLaunchData {
     acknowledgement_publication_watchdog: DeadlineState,
     start_failure_publication_watchdog: DeadlineState,
     active_control_callbacks: usize,
-    pinned_initial_thread_id: Option<ThreadId>,
     runner_finished: bool,
     finalization_taken: bool,
 }
@@ -663,7 +664,6 @@ impl RunnerChildren {
                 acknowledgement_publication_watchdog: DeadlineState::Unarmed,
                 start_failure_publication_watchdog: DeadlineState::Unarmed,
                 active_control_callbacks: 0,
-                pinned_initial_thread_id: None,
                 runner_finished: false,
                 finalization_taken: false,
             }),
@@ -1318,7 +1318,10 @@ impl ChildLaunch {
                         .expect("child launch mutex poisoned");
                 }
                 ChildLaunchPhase::Ready { initial_thread_id } => return Ok(initial_thread_id),
-                ChildLaunchPhase::Committing | ChildLaunchPhase::Committed => {
+                ChildLaunchPhase::Committing
+                | ChildLaunchPhase::Committed
+                | ChildLaunchPhase::CompletingStart
+                | ChildLaunchPhase::StartComplete => {
                     return Err(ErrorCode::ProtocolState);
                 }
                 ChildLaunchPhase::Aborted(error) => return Err(error),
@@ -1327,40 +1330,31 @@ impl ChildLaunch {
     }
 
     fn ready_and_wait(&self, initial_thread_id: Option<ThreadId>) -> Result<(), ErrorCode> {
-        if let Some(thread_id) = initial_thread_id {
-            self.process
-                .pin_startup_thread(thread_id)
-                .map_err(|error| match error {
-                    BrokerError::UnknownObject => ErrorCode::ProtocolState,
-                    error => ErrorCode::from(error),
-                })?;
-        }
+        self.process
+            .mark_start_ready(initial_thread_id)
+            .map_err(|error| match error {
+                BrokerError::UnknownObject => ErrorCode::ProtocolState,
+                error => ErrorCode::from(error),
+            })?;
         let mut state = self.state.lock().expect("child launch mutex poisoned");
         if !matches!(state.phase, ChildLaunchPhase::Starting) {
-            let error = match state.phase {
+            return Err(match state.phase {
                 ChildLaunchPhase::Aborted(error) => error,
                 _ => ErrorCode::ProtocolState,
-            };
-            drop(state);
-            if let Some(thread_id) = initial_thread_id {
-                let _ = self.process.release_startup_thread(thread_id);
-            }
-            return Err(error);
+            });
         }
-        state.pinned_initial_thread_id = initial_thread_id;
         state.phase = ChildLaunchPhase::Ready { initial_thread_id };
         self.changed.notify_all();
         loop {
             match state.phase {
-                ChildLaunchPhase::Committed
-                    if state.pinned_initial_thread_id.is_none()
-                        && state.active_control_callbacks == 0 =>
-                {
+                ChildLaunchPhase::StartComplete if state.active_control_callbacks == 0 => {
                     return Ok(());
                 }
                 ChildLaunchPhase::Ready { .. }
                 | ChildLaunchPhase::Committing
-                | ChildLaunchPhase::Committed => {
+                | ChildLaunchPhase::Committed
+                | ChildLaunchPhase::CompletingStart
+                | ChildLaunchPhase::StartComplete => {
                     state = self
                         .changed
                         .wait(state)
@@ -1515,7 +1509,13 @@ impl ChildLaunch {
                     return Ok(ProcessStartAcknowledgement::Failed(error));
                 }
                 (ChildLaunchPhase::Starting, _) => return Err(ErrorCode::ProtocolState),
-                (ChildLaunchPhase::Committing | ChildLaunchPhase::Committed, _) => {
+                (
+                    ChildLaunchPhase::Committing
+                    | ChildLaunchPhase::Committed
+                    | ChildLaunchPhase::CompletingStart
+                    | ChildLaunchPhase::StartComplete,
+                    _,
+                ) => {
                     return Err(ErrorCode::ProtocolState);
                 }
                 (_, StartResultPublication::NotStarted) => {
@@ -1612,7 +1612,10 @@ impl ChildLaunch {
                     | ShutdownRequest::ExpectedStartFailure
                     | ShutdownRequest::Unexpected => (None, None),
                 },
-                ChildLaunchPhase::Committing | ChildLaunchPhase::Committed => (None, None),
+                ChildLaunchPhase::Committing
+                | ChildLaunchPhase::Committed
+                | ChildLaunchPhase::CompletingStart
+                | ChildLaunchPhase::StartComplete => (None, None),
             }
         };
         if let Some(association_failure) = association_failure {
@@ -1662,7 +1665,10 @@ impl ChildLaunch {
                 .lock()
                 .expect("child launch mutex poisoned")
                 .phase,
-            ChildLaunchPhase::Committing | ChildLaunchPhase::Committed
+            ChildLaunchPhase::Committing
+                | ChildLaunchPhase::Committed
+                | ChildLaunchPhase::CompletingStart
+                | ChildLaunchPhase::StartComplete
         )
     }
 
@@ -1685,7 +1691,7 @@ impl ChildLaunch {
         complete_deadline(&mut state.acknowledgement_publication_watchdog);
         complete_deadline(&mut state.start_failure_publication_watchdog);
         self.changed.notify_all();
-        ReceiptResolution::Resolved(self.release_startup_pin_and_take_finalization(state))
+        ReceiptResolution::Resolved(self.complete_process_start_and_take_finalization(state))
     }
 
     fn begin_receipt_drain(&self) {
@@ -1708,7 +1714,7 @@ impl ChildLaunch {
         complete_deadline(&mut state.acknowledgement_publication_watchdog);
         complete_deadline(&mut state.start_failure_publication_watchdog);
         self.changed.notify_all();
-        self.release_startup_pin_and_take_finalization(state)
+        self.complete_process_start_and_take_finalization(state)
     }
 
     fn expire_initial_receipt_deadline(&self) -> Option<ReceiptExpiration> {
@@ -1888,30 +1894,28 @@ impl ChildLaunch {
         true
     }
 
-    fn release_startup_pin_and_take_finalization(
+    fn complete_process_start_and_take_finalization(
         &self,
         mut state: MutexGuard<'_, ChildLaunchData>,
     ) -> Option<bool> {
-        let pinned_thread_id = state.pinned_initial_thread_id.take();
-        if pinned_thread_id.is_none() {
+        if !matches!(state.phase, ChildLaunchPhase::Committed) {
             return take_finalization(&mut state);
         }
+        state.phase = ChildLaunchPhase::CompletingStart;
         state.active_control_callbacks = state
             .active_control_callbacks
             .checked_add(1)
             .expect("process-start control callback count must remain bounded");
         drop(state);
 
-        let release_failed = self
-            .process
-            .release_startup_thread(pinned_thread_id.expect("thread pin was checked"))
-            .is_err();
+        let completion_failed = self.process.complete_start().is_err();
         let mut state = self.state.lock().expect("child launch mutex poisoned");
         state.active_control_callbacks = state
             .active_control_callbacks
             .checked_sub(1)
             .expect("process-start control callback count must remain balanced");
-        state.abnormal |= release_failed;
+        state.abnormal |= completion_failed;
+        state.phase = ChildLaunchPhase::StartComplete;
         self.changed.notify_all();
         take_finalization(&mut state)
     }
@@ -1965,7 +1969,10 @@ fn expire_launch(
                 (None, None)
             }
         }
-        ChildLaunchPhase::Committing | ChildLaunchPhase::Committed => (None, None),
+        ChildLaunchPhase::Committing
+        | ChildLaunchPhase::Committed
+        | ChildLaunchPhase::CompletingStart
+        | ChildLaunchPhase::StartComplete => (None, None),
     };
     changed.notify_all();
     Some(ReceiptExpiration {
@@ -2031,7 +2038,10 @@ fn expire_internal_resolution(
                     Some(Instant::now() + PROCESS_START_SUPERVISOR_SHUTDOWN_TIMEOUT),
                 )
             }
-            ChildLaunchPhase::Starting | ChildLaunchPhase::Committed => {
+            ChildLaunchPhase::Starting
+            | ChildLaunchPhase::Committed
+            | ChildLaunchPhase::CompletingStart
+            | ChildLaunchPhase::StartComplete => {
                 state.active_control_callbacks -= 1;
                 return None;
             }
@@ -2230,7 +2240,10 @@ mod tests {
     };
     use std::time::{Duration, Instant};
 
-    fn launch_with_broker(publication: StartResultPublication) -> (BrokerCore, Arc<ChildLaunch>) {
+    fn launch_with_broker_in_phase(
+        publication: StartResultPublication,
+        phase: ChildLaunchPhase,
+    ) -> (BrokerCore, Arc<ChildLaunch>) {
         let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
@@ -2241,15 +2254,16 @@ mod tests {
             .unwrap();
         let (process, _) = parent.create_child(&[]).unwrap();
         parent.finish();
+        if let ChildLaunchPhase::Ready { initial_thread_id } = phase {
+            process.mark_start_ready(initial_thread_id).unwrap();
+        }
         (
             broker,
             Arc::new(ChildLaunch {
                 parent_id: ProcessId(1),
                 process,
                 state: Mutex::new(ChildLaunchData {
-                    phase: ChildLaunchPhase::Ready {
-                        initial_thread_id: None,
-                    },
+                    phase,
                     publication,
                     shutdown: None,
                     association_failure: None,
@@ -2260,7 +2274,6 @@ mod tests {
                     acknowledgement_publication_watchdog: DeadlineState::Unarmed,
                     start_failure_publication_watchdog: DeadlineState::Unarmed,
                     active_control_callbacks: 0,
-                    pinned_initial_thread_id: None,
                     runner_finished: false,
                     finalization_taken: false,
                 }),
@@ -2269,8 +2282,21 @@ mod tests {
         )
     }
 
+    fn launch_with_broker(publication: StartResultPublication) -> (BrokerCore, Arc<ChildLaunch>) {
+        launch_with_broker_in_phase(
+            publication,
+            ChildLaunchPhase::Ready {
+                initial_thread_id: None,
+            },
+        )
+    }
+
     fn launch(publication: StartResultPublication) -> Arc<ChildLaunch> {
         launch_with_broker(publication).1
+    }
+
+    fn starting_launch(publication: StartResultPublication) -> Arc<ChildLaunch> {
+        launch_with_broker_in_phase(publication, ChildLaunchPhase::Starting).1
     }
 
     #[test]
@@ -2327,8 +2353,7 @@ mod tests {
 
     #[test]
     fn reported_bootstrap_rejection_selects_normal_rollback() {
-        let launch = launch(StartResultPublication::NotStarted);
-        launch.state.lock().unwrap().phase = ChildLaunchPhase::Starting;
+        let launch = starting_launch(StartResultPublication::NotStarted);
 
         launch
             .report_start_failure(ErrorCode::UnsupportedOperation)
@@ -2409,8 +2434,7 @@ mod tests {
 
     #[test]
     fn process_ready_interrupted_by_abort_returns_the_abort_cause() {
-        let ready = launch(StartResultPublication::NotStarted);
-        ready.state.lock().unwrap().phase = ChildLaunchPhase::Starting;
+        let ready = starting_launch(StartResultPublication::NotStarted);
         ready.abort(ErrorCode::PeerClosed, false, true);
         assert!(matches!(
             ready.ready_and_wait(None),
@@ -2422,8 +2446,7 @@ mod tests {
 
     #[test]
     fn failure_report_interrupted_by_abort_returns_the_abort_cause() {
-        let failed = launch(StartResultPublication::NotStarted);
-        failed.state.lock().unwrap().phase = ChildLaunchPhase::Starting;
+        let failed = starting_launch(StartResultPublication::NotStarted);
         failed.abort(ErrorCode::PeerClosed, false, true);
         assert!(matches!(
             failed.report_start_failure(ErrorCode::UnsupportedOperation),
@@ -2488,8 +2511,7 @@ mod tests {
 
     #[test]
     fn start_failure_publication_timeout_terminates_the_child() {
-        let launch = launch(StartResultPublication::NotStarted);
-        launch.state.lock().unwrap().phase = ChildLaunchPhase::Starting;
+        let launch = starting_launch(StartResultPublication::NotStarted);
         launch
             .report_start_failure(ErrorCode::UnsupportedOperation)
             .unwrap();
@@ -2665,22 +2687,27 @@ mod tests {
     }
 
     #[test]
-    fn receipt_resolution_releases_the_initial_thread_pin() {
-        let launch = launch(StartResultPublication::Delivered);
+    fn receipt_resolution_completes_process_start() {
+        let launch = starting_launch(StartResultPublication::Delivered);
         let thread_id = launch.process.create_thread().unwrap();
-        launch.process.pin_startup_thread(thread_id).unwrap();
-        launch.state.lock().unwrap().pinned_initial_thread_id = Some(thread_id);
+        launch.process.mark_start_ready(Some(thread_id)).unwrap();
+        launch.process.commit_start().unwrap();
+        launch.state.lock().unwrap().phase = ChildLaunchPhase::Committed;
 
         launch.resolve_receipt();
+        launch.resolve_receipt();
 
+        let state = launch.state.lock().unwrap();
+        assert!(matches!(state.phase, ChildLaunchPhase::StartComplete));
+        assert!(!state.abnormal);
+        drop(state);
         assert_eq!(launch.process.exit_thread(thread_id), Ok(()));
         Arc::clone(&launch.process).finish();
     }
 
     #[test]
-    fn process_ready_waits_until_the_initial_thread_pin_is_released() {
-        let launch = launch(StartResultPublication::Delivered);
-        launch.state.lock().unwrap().phase = ChildLaunchPhase::Starting;
+    fn process_ready_waits_until_process_start_is_complete() {
+        let launch = starting_launch(StartResultPublication::Delivered);
         let thread_id = launch.process.create_thread().unwrap();
         let waiting = Arc::clone(&launch);
         let (sender, receiver) = mpsc::sync_channel(1);
@@ -2694,6 +2721,7 @@ mod tests {
         while !matches!(state.phase, ChildLaunchPhase::Ready { .. }) {
             state = launch.changed.wait(state).unwrap();
         }
+        launch.process.commit_start().unwrap();
         state.phase = ChildLaunchPhase::Committed;
         launch.changed.notify_all();
         drop(state);
