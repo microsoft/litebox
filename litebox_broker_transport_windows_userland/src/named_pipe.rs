@@ -474,9 +474,9 @@ mod tests {
     }
 
     #[test]
-    fn pending_capacity_reserves_lifecycle_calls() {
+    fn pending_capacity_preserves_process_start_calls() {
         use litebox_broker_transport::pending_calls::{
-            MAX_ORDINARY_PENDING_CALLS, RESERVED_LIFECYCLE_PENDING_CALLS,
+            MAX_ORDINARY_PENDING_CALLS, RESERVED_PENDING_CALL_CAPACITY,
         };
 
         let control_name = pipe_name("pending-capacity-control");
@@ -517,7 +517,7 @@ mod tests {
                         BrokerOperation::AcknowledgeProcessStart(_)
                     ))
                     .count(),
-                RESERVED_LIFECYCLE_PENDING_CALLS
+                RESERVED_PENDING_CALL_CAPACITY
             );
             let released_request = published
                 .iter()
@@ -568,12 +568,12 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-        callers.extend((0..RESERVED_LIFECYCLE_PENDING_CALLS).map(|index| {
-            let lifecycle_calls = Arc::clone(&calls);
-            let lifecycle_start = Arc::clone(&start);
+        callers.extend((0..RESERVED_PENDING_CALL_CAPACITY).map(|index| {
+            let reserved_calls = Arc::clone(&calls);
+            let reserved_start = Arc::clone(&start);
             std::thread::spawn(move || {
-                lifecycle_start.wait();
-                lifecycle_calls.call(BrokerRequest {
+                reserved_start.wait();
+                reserved_calls.call(BrokerRequest {
                     request_id: RequestId((MAX_ORDINARY_PENDING_CALLS + 1 + index) as u64),
                     operation: BrokerOperation::AcknowledgeProcessStart(
                         litebox_broker_protocol::process::ProcessStartToken(index as u64),

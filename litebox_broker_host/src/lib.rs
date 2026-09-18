@@ -44,7 +44,7 @@ use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
 };
 use litebox_broker_protocol::process::{
-    MAX_PROCESS_BOOTSTRAP_SIZE, ProcessBootstrap, ProcessStartup, ProcessStartupData,
+    MAX_PROCESS_BOOTSTRAP_SIZE, ProcessStartupData, ProcessStartupDescriptor,
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::shared_buffer::{
@@ -255,12 +255,10 @@ where
                 .map_err(|_| BrokerHostError::Broker(ErrorCode::Internal))?;
             write_shared_buffer(shared_buffers, buffer, &payload, MAX_PROCESS_BOOTSTRAP_SIZE)
                 .map_err(|error| BrokerHostError::Broker(error.into()))?;
-            Some(ProcessStartup {
-                bootstrap: ProcessBootstrap {
-                    format,
-                    version,
-                    buffer,
-                },
+            Some(ProcessStartupDescriptor {
+                format,
+                version,
+                buffer,
                 inherited_objects,
             })
         }
@@ -517,7 +515,7 @@ fn handle_request<Memory: SharedMemory>(
         }
         BrokerOperation::StartProcess(_)
         | BrokerOperation::AcknowledgeProcessStart(_)
-        | BrokerOperation::ProcessReady(_)
+        | BrokerOperation::ReportProcessReady(_)
         | BrokerOperation::ReportProcessStartFailure(_) => {
             Err(RequestFailure::Respond(ErrorCode::UnsupportedOperation))
         }

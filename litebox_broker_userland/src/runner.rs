@@ -547,22 +547,18 @@ impl RunnerChildren {
     ) -> Option<Result<BrokerResult, RequestFailure>> {
         match operation {
             BrokerOperation::StartProcess(request) => Some(
-                copy_shared_buffer(
-                    shared_buffers,
-                    request.bootstrap.buffer,
-                    MAX_PROCESS_BOOTSTRAP_SIZE,
-                )
-                .and_then(|bootstrap| {
-                    self.start_process(
-                        process,
-                        request.bootstrap.format,
-                        request.bootstrap.version,
-                        bootstrap,
-                        request.inherited_objects,
-                    )
-                    .map_err(process_extension_error)
-                })
-                .map(BrokerResult::ProcessStarted),
+                copy_shared_buffer(shared_buffers, request.buffer, MAX_PROCESS_BOOTSTRAP_SIZE)
+                    .and_then(|bootstrap| {
+                        self.start_process(
+                            process,
+                            request.format,
+                            request.version,
+                            bootstrap,
+                            request.inherited_objects,
+                        )
+                        .map_err(process_extension_error)
+                    })
+                    .map(BrokerResult::ProcessStarted),
             ),
             BrokerOperation::AcknowledgeProcessStart(token) => {
                 Some(match self.resolve_acknowledgement(process.id(), *token) {
@@ -575,8 +571,8 @@ impl RunnerChildren {
                     Err(error) => Err(RequestFailure::Abort(error)),
                 })
             }
-            BrokerOperation::ProcessReady(request) => Some(
-                self.process_ready(process.id(), request.initial_thread_id)
+            BrokerOperation::ReportProcessReady(initial_thread_id) => Some(
+                self.process_ready(process.id(), *initial_thread_id)
                     .map(|()| BrokerResult::ProcessReady)
                     .map_err(process_extension_error),
             ),

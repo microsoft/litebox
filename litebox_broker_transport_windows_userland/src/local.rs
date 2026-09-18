@@ -235,7 +235,9 @@ impl LocalCallChannel for WindowsControlRingLocalCallChannel {
             BrokerOperation::AcknowledgeProcessStart(_)
                 | BrokerOperation::ReportProcessStartFailure(_)
         ) {
-            association.pending_calls.register_lifecycle(request_id)
+            association
+                .pending_calls
+                .register_with_reserved_capacity(request_id)
         } else {
             association.pending_calls.register(request_id)
         }

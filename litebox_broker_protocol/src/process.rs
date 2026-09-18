@@ -64,23 +64,16 @@ impl InheritedProcessObjects {
     }
 }
 
-/// Opaque bootstrap descriptor supplied when starting a process.
+/// Child startup descriptor transported through the broker protocol.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ProcessBootstrap {
+pub struct ProcessStartupDescriptor {
     /// Platform-defined format.
     pub format: ProcessBootstrapFormat,
     /// Version within the platform-defined format.
     pub version: ProcessBootstrapVersion,
     /// Operation-scoped shared-buffer sequence containing the bootstrap bytes.
     pub buffer: SharedBufferSequence,
-}
-
-/// Child startup data delivered during broker negotiation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ProcessStartup {
-    /// Opaque platform bootstrap staged in the child's shared-buffer pool.
-    pub bootstrap: ProcessBootstrap,
-    /// Child-owned broker handles in the parent's inheritance-manifest order.
+    /// Broker handles inherited in manifest order.
     pub inherited_objects: InheritedProcessObjects,
 }
 
@@ -97,15 +90,6 @@ pub struct ProcessStartupData {
     pub inherited_objects: InheritedProcessObjects,
 }
 
-/// Starts one child process from an opaque platform bootstrap.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StartProcessRequest {
-    /// Opaque bootstrap staged in the parent's shared-buffer pool.
-    pub bootstrap: ProcessBootstrap,
-    /// Parent-owned broker handles inherited in manifest order.
-    pub inherited_objects: InheritedProcessObjects,
-}
-
 /// Reports a materialized child that is ready for parent acknowledgement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StartedProcess {
@@ -113,13 +97,6 @@ pub struct StartedProcess {
     pub token: ProcessStartToken,
     /// Broker-assigned child process ID.
     pub process_id: ProcessId,
-    /// Broker-assigned initial thread ID when it differs from the process ID.
-    pub initial_thread_id: Option<ThreadId>,
-}
-
-/// Reports that a child finished restoring its initial state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ProcessReadyRequest {
     /// Broker-assigned initial thread ID when it differs from the process ID.
     pub initial_thread_id: Option<ThreadId>,
 }

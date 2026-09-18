@@ -23,9 +23,8 @@ use crate::message::{
     BrokerRequest, BrokerResponse, BrokerResult, ReadinessNotification,
 };
 use crate::process::{
-    InheritedProcessObjects, MAX_INHERITED_PROCESS_OBJECTS, ProcessBootstrap,
-    ProcessBootstrapFormat, ProcessBootstrapVersion, ProcessReadyRequest, ProcessStartToken,
-    ProcessStartup, StartProcessRequest, StartedProcess,
+    InheritedProcessObjects, MAX_INHERITED_PROCESS_OBJECTS, ProcessBootstrapFormat,
+    ProcessBootstrapVersion, ProcessStartToken, ProcessStartupDescriptor, StartedProcess,
 };
 use crate::readiness::ReadinessFlags;
 
@@ -201,13 +200,10 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
             encoder.request_id(request_id);
             fs::encode_fs_request(&mut encoder, request);
         }
-        BrokerOperation::StartProcess(StartProcessRequest {
-            bootstrap:
-                ProcessBootstrap {
-                    format,
-                    version,
-                    buffer,
-                },
+        BrokerOperation::StartProcess(ProcessStartupDescriptor {
+            format,
+            version,
+            buffer,
             inherited_objects,
         }) => {
             encoder.u8(REQUEST_TAG_START_PROCESS);
@@ -222,7 +218,7 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
             encoder.request_id(request_id);
             encoder.u64(token.0);
         }
-        BrokerOperation::ProcessReady(ProcessReadyRequest { initial_thread_id }) => {
+        BrokerOperation::ReportProcessReady(initial_thread_id) => {
             encoder.u8(REQUEST_TAG_PROCESS_READY);
             encoder.request_id(request_id);
             encode_optional_thread_id(&mut encoder, initial_thread_id);
@@ -270,20 +266,18 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         REQUEST_TAG_FILL_RANDOM => BrokerOperation::FillRandom(decoder.shared_buffer_sequence()?),
         REQUEST_TAG_STDIO => BrokerOperation::Stdio(stdio::decode_stdio_request(&mut decoder)?),
         REQUEST_TAG_FILE => BrokerOperation::File(fs::decode_fs_request(&mut decoder)?),
-        REQUEST_TAG_START_PROCESS => BrokerOperation::StartProcess(StartProcessRequest {
-            bootstrap: ProcessBootstrap {
-                format: ProcessBootstrapFormat(decoder.u32()?),
-                version: ProcessBootstrapVersion(decoder.u16()?),
-                buffer: decoder.shared_buffer_sequence()?,
-            },
+        REQUEST_TAG_START_PROCESS => BrokerOperation::StartProcess(ProcessStartupDescriptor {
+            format: ProcessBootstrapFormat(decoder.u32()?),
+            version: ProcessBootstrapVersion(decoder.u16()?),
+            buffer: decoder.shared_buffer_sequence()?,
             inherited_objects: decode_inherited_objects(&mut decoder)?,
         }),
         REQUEST_TAG_ACKNOWLEDGE_PROCESS_START => {
             BrokerOperation::AcknowledgeProcessStart(ProcessStartToken(decoder.u64()?))
         }
-        REQUEST_TAG_PROCESS_READY => BrokerOperation::ProcessReady(ProcessReadyRequest {
-            initial_thread_id: decode_optional_thread_id(&mut decoder)?,
-        }),
+        REQUEST_TAG_PROCESS_READY => {
+            BrokerOperation::ReportProcessReady(decode_optional_thread_id(&mut decoder)?)
+        }
         REQUEST_TAG_REPORT_PROCESS_START_FAILURE => {
             BrokerOperation::ReportProcessStartFailure(decode_error_code(&mut decoder)?)
         }
@@ -312,13 +306,10 @@ pub fn encode_handshake_response(response: BrokerHandshakeResponse) -> Vec<u8> {
             encoder.protocol_version(broker_protocol_version);
             encoder.process_id(process_id);
             match startup {
-                Some(ProcessStartup {
-                    bootstrap:
-                        ProcessBootstrap {
-                            format,
-                            version,
-                            buffer,
-                        },
+                Some(ProcessStartupDescriptor {
+                    format,
+                    version,
+                    buffer,
                     inherited_objects,
                 }) => {
                     encoder.u8(1);
@@ -354,12 +345,10 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
             process_id: decoder.process_id()?,
             startup: match decoder.u8()? {
                 0 => None,
-                1 => Some(ProcessStartup {
-                    bootstrap: ProcessBootstrap {
-                        format: ProcessBootstrapFormat(decoder.u32()?),
-                        version: ProcessBootstrapVersion(decoder.u16()?),
-                        buffer: decoder.shared_buffer_sequence()?,
-                    },
+                1 => Some(ProcessStartupDescriptor {
+                    format: ProcessBootstrapFormat(decoder.u32()?),
+                    version: ProcessBootstrapVersion(decoder.u16()?),
+                    buffer: decoder.shared_buffer_sequence()?,
                     inherited_objects: decode_inherited_objects(&mut decoder)?,
                 }),
                 _ => return Err(WireError::InvalidTag),
@@ -665,9 +654,8 @@ mod tests {
         WritePipeResponse,
     };
     use crate::process::{
-        InheritedProcessObjects, ProcessBootstrap, ProcessBootstrapFormat, ProcessBootstrapVersion,
-        ProcessReadyRequest, ProcessStartToken, ProcessStartup, StartProcessRequest,
-        StartedProcess,
+        InheritedProcessObjects, ProcessBootstrapFormat, ProcessBootstrapVersion,
+        ProcessStartToken, ProcessStartupDescriptor, StartedProcess,
     };
     use crate::shared_buffer::{SharedBufferSequence, SharedBufferSlotIndex};
     use crate::socket::{
@@ -1015,12 +1003,10 @@ mod tests {
                 name: TcpOptionName::KeepAlive,
             })),
             BrokerOperation::Socket(SocketRequest::Status(SocketStatusRequest { handle })),
-            BrokerOperation::StartProcess(StartProcessRequest {
-                bootstrap: ProcessBootstrap {
-                    format: ProcessBootstrapFormat(u32::MAX),
-                    version: ProcessBootstrapVersion(u16::MAX),
-                    buffer: largest_sequence,
-                },
+            BrokerOperation::StartProcess(ProcessStartupDescriptor {
+                format: ProcessBootstrapFormat(u32::MAX),
+                version: ProcessBootstrapVersion(u16::MAX),
+                buffer: largest_sequence,
                 inherited_objects: InheritedProcessObjects::new(&[
                     ObjectHandle(1),
                     ObjectHandle(2),
@@ -1030,12 +1016,8 @@ mod tests {
                 .unwrap(),
             }),
             BrokerOperation::AcknowledgeProcessStart(ProcessStartToken(u64::MAX)),
-            BrokerOperation::ProcessReady(ProcessReadyRequest {
-                initial_thread_id: None,
-            }),
-            BrokerOperation::ProcessReady(ProcessReadyRequest {
-                initial_thread_id: Some(thread_id(19)),
-            }),
+            BrokerOperation::ReportProcessReady(None),
+            BrokerOperation::ReportProcessReady(Some(thread_id(19))),
             BrokerOperation::ReportProcessStartFailure(ErrorCode::UnsupportedOperation),
         ];
         let mut maximum_encoded_size = 0;
@@ -1215,12 +1197,10 @@ mod tests {
             BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: ProtocolVersion(1),
                 process_id: process_id(7),
-                startup: Some(ProcessStartup {
-                    bootstrap: ProcessBootstrap {
-                        format: ProcessBootstrapFormat(0x7465_7374),
-                        version: ProcessBootstrapVersion(1),
-                        buffer: sequence(0, 37),
-                    },
+                startup: Some(ProcessStartupDescriptor {
+                    format: ProcessBootstrapFormat(0x7465_7374),
+                    version: ProcessBootstrapVersion(1),
+                    buffer: sequence(0, 37),
                     inherited_objects: InheritedProcessObjects::new(&[
                         ObjectHandle(5),
                         ObjectHandle(6),
@@ -1932,12 +1912,10 @@ mod tests {
             BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: ProtocolVersion(1),
                 process_id: process_id(2),
-                startup: Some(ProcessStartup {
-                    bootstrap: ProcessBootstrap {
-                        format: ProcessBootstrapFormat(3),
-                        version: ProcessBootstrapVersion(4),
-                        buffer: sequence(0, 5),
-                    },
+                startup: Some(ProcessStartupDescriptor {
+                    format: ProcessBootstrapFormat(3),
+                    version: ProcessBootstrapVersion(4),
+                    buffer: sequence(0, 5),
                     inherited_objects: InheritedProcessObjects::EMPTY,
                 }),
             },

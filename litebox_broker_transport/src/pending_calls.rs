@@ -13,10 +13,10 @@ use litebox_broker_protocol::message::BrokerResponse;
 
 /// Maximum number of active calls waiting for broker responses.
 pub const MAX_PENDING_CALLS: usize = 64;
-/// Pending-call capacity reserved for lifecycle-control operations.
-pub const RESERVED_LIFECYCLE_PENDING_CALLS: usize = 8;
-/// Maximum active ordinary calls after preserving lifecycle-control capacity.
-pub const MAX_ORDINARY_PENDING_CALLS: usize = MAX_PENDING_CALLS - RESERVED_LIFECYCLE_PENDING_CALLS;
+/// Pending-call capacity unavailable to ordinary operations.
+pub const RESERVED_PENDING_CALL_CAPACITY: usize = 8;
+/// Maximum active ordinary calls after preserving reserved capacity.
+pub const MAX_ORDINARY_PENDING_CALLS: usize = MAX_PENDING_CALLS - RESERVED_PENDING_CALL_CAPACITY;
 
 /// A mutex usable by [`PendingCalls`].
 pub trait PendingCallsMutex<T> {
@@ -81,30 +81,27 @@ pub enum PendingCallsError<Error> {
 
 /// Concurrent registry of requests awaiting broker responses.
 pub struct PendingCalls<Sync: PendingCallsSync, Error> {
-    state: Sync::Mutex<PendingCallsState<Sync, Error>>,
-    capacity_available: Sync::Condvar<PendingCallsState<Sync, Error>>,
+    state: Sync::Mutex<PendingCallsInner<Sync, Error>>,
+    capacity_available: Sync::Condvar<PendingCallsInner<Sync, Error>>,
 }
 
-struct PendingCallsState<Sync: PendingCallsSync, Error> {
-    calls: BTreeMap<RequestId, RegisteredPendingCall<Sync, Error>>,
+struct PendingCallsInner<Sync: PendingCallsSync, Error> {
+    calls: BTreeMap<RequestId, Arc<PendingCall<Sync, Error>>>,
     ordinary_calls: usize,
     failure: Option<Arc<Error>>,
 }
 
-struct RegisteredPendingCall<Sync: PendingCallsSync, Error> {
-    call: Arc<PendingCall<Sync, Error>>,
-    ordinary: bool,
-}
-
 /// Completion state for one request awaiting a broker response.
 pub struct PendingCall<Sync: PendingCallsSync, Error> {
+    counts_against_ordinary_limit: bool,
     result: Sync::Mutex<Option<Result<BrokerResponse, Arc<Error>>>>,
     result_ready: Sync::Condvar<Option<Result<BrokerResponse, Arc<Error>>>>,
 }
 
 impl<Sync: PendingCallsSync, Error> PendingCall<Sync, Error> {
-    fn new() -> Self {
+    fn new(counts_against_ordinary_limit: bool) -> Self {
         Self {
+            counts_against_ordinary_limit,
             result: Sync::mutex(None),
             result_ready: Sync::condvar(),
         }
@@ -133,7 +130,7 @@ impl<Sync: PendingCallsSync, Error> PendingCalls<Sync, Error> {
     /// Creates an empty live pending-call registry.
     pub fn new() -> Self {
         Self {
-            state: Sync::mutex(PendingCallsState {
+            state: Sync::mutex(PendingCallsInner {
                 calls: BTreeMap::new(),
                 ordinary_calls: 0,
                 failure: None,
@@ -147,26 +144,27 @@ impl<Sync: PendingCallsSync, Error> PendingCalls<Sync, Error> {
         &self,
         request_id: RequestId,
     ) -> Result<Arc<PendingCall<Sync, Error>>, PendingCallsError<Error>> {
-        self.register_with_class(request_id, true)
+        self.register_inner(request_id, true)
     }
 
-    /// Registers lifecycle-control work using capacity ordinary calls cannot consume.
-    pub fn register_lifecycle(
+    /// Registers work using capacity ordinary calls cannot consume.
+    pub fn register_with_reserved_capacity(
         &self,
         request_id: RequestId,
     ) -> Result<Arc<PendingCall<Sync, Error>>, PendingCallsError<Error>> {
-        self.register_with_class(request_id, false)
+        self.register_inner(request_id, false)
     }
 
-    fn register_with_class(
+    fn register_inner(
         &self,
         request_id: RequestId,
-        ordinary: bool,
+        counts_against_ordinary_limit: bool,
     ) -> Result<Arc<PendingCall<Sync, Error>>, PendingCallsError<Error>> {
-        let pending_call = Arc::new(PendingCall::new());
+        let pending_call = Arc::new(PendingCall::new(counts_against_ordinary_limit));
         let mut state = self.state.lock();
         while (state.calls.len() >= MAX_PENDING_CALLS
-            || (ordinary && state.ordinary_calls >= MAX_ORDINARY_PENDING_CALLS))
+            || (counts_against_ordinary_limit
+                && state.ordinary_calls >= MAX_ORDINARY_PENDING_CALLS))
             && state.failure.is_none()
         {
             state = self.capacity_available.wait(state);
@@ -176,11 +174,8 @@ impl<Sync: PendingCallsSync, Error> PendingCalls<Sync, Error> {
         }
         match state.calls.entry(request_id) {
             Entry::Vacant(entry) => {
-                entry.insert(RegisteredPendingCall {
-                    call: Arc::clone(&pending_call),
-                    ordinary,
-                });
-                if ordinary {
+                entry.insert(Arc::clone(&pending_call));
+                if counts_against_ordinary_limit {
                     state.ordinary_calls += 1;
                 }
             }
@@ -201,17 +196,17 @@ impl<Sync: PendingCallsSync, Error> PendingCalls<Sync, Error> {
             if let Some(error) = state.failure.as_ref() {
                 return Err(PendingCallsError::AssociationFailed(Arc::clone(error)));
             }
-            let Some(registered) = state.calls.remove(&response.request_id) else {
+            let Some(pending_call) = state.calls.remove(&response.request_id) else {
                 return Err(PendingCallsError::UnknownResponseId);
             };
-            if registered.ordinary {
+            if pending_call.counts_against_ordinary_limit {
                 state.ordinary_calls = state
                     .ordinary_calls
                     .checked_sub(1)
                     .expect("ordinary pending-call count must remain balanced");
             }
             self.capacity_available.notify_all();
-            registered.call
+            pending_call
         };
         pending_call.resolve(Ok(response));
         Ok(())
@@ -232,8 +227,8 @@ impl<Sync: PendingCallsSync, Error> PendingCalls<Sync, Error> {
             self.capacity_available.notify_all();
             pending_calls
         };
-        for registered in pending_calls.into_values() {
-            registered.call.resolve(Err(Arc::clone(&error)));
+        for pending_call in pending_calls.into_values() {
+            pending_call.resolve(Err(Arc::clone(&error)));
         }
         true
     }

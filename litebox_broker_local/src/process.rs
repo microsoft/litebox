@@ -5,9 +5,8 @@ use litebox_broker_protocol::ThreadId;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult};
 use litebox_broker_protocol::process::{
-    InheritedProcessObjects, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessBootstrap, ProcessBootstrapFormat,
-    ProcessBootstrapVersion, ProcessReadyRequest, ProcessStartToken, StartProcessRequest,
-    StartedProcess,
+    InheritedProcessObjects, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessBootstrapFormat,
+    ProcessBootstrapVersion, ProcessStartToken, ProcessStartupDescriptor, StartedProcess,
 };
 use litebox_broker_protocol::shared_buffer::SharedBufferSequence;
 use litebox_broker_transport::channel::LocalCallChannel;
@@ -37,12 +36,10 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             return Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted));
         }
         self.write_shared_buffer(buffer, bootstrap);
-        match self.request(BrokerOperation::StartProcess(StartProcessRequest {
-            bootstrap: ProcessBootstrap {
-                format,
-                version,
-                buffer,
-            },
+        match self.request(BrokerOperation::StartProcess(ProcessStartupDescriptor {
+            format,
+            version,
+            buffer,
             inherited_objects,
         }))? {
             BrokerResult::ProcessStarted(started) => Ok(started),
@@ -77,9 +74,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// Panics if the broker returns a response for another operation.
     pub fn process_ready(&self, initial_thread_id: Option<ThreadId>) -> Result<(), Channel::Error> {
-        match self.request(BrokerOperation::ProcessReady(ProcessReadyRequest {
-            initial_thread_id,
-        }))? {
+        match self.request(BrokerOperation::ReportProcessReady(initial_thread_id))? {
             BrokerResult::ProcessReady => Ok(()),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
             response => panic!("broker returned unexpected process-ready response: {response:?}"),

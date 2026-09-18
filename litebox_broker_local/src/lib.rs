@@ -134,13 +134,13 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                     Some(startup) => {
                         let mut payload = Vec::new();
                         payload
-                            .try_reserve_exact(startup.bootstrap.buffer.length() as usize)
+                            .try_reserve_exact(startup.buffer.length() as usize)
                             .map_err(|_| BrokerLocalError::Broker(ErrorCode::OutOfMemory))?;
-                        payload.resize(startup.bootstrap.buffer.length() as usize, 0);
-                        local.read_shared_buffer(startup.bootstrap.buffer, &mut payload);
+                        payload.resize(startup.buffer.length() as usize, 0);
+                        local.read_shared_buffer(startup.buffer, &mut payload);
                         Some(ProcessStartupData {
-                            format: startup.bootstrap.format,
-                            version: startup.bootstrap.version,
+                            format: startup.format,
+                            version: startup.version,
                             payload,
                             inherited_objects: startup.inherited_objects,
                         })

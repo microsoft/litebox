@@ -17,10 +17,7 @@ use crate::pipe::{
     CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
     WritePipeResponse,
 };
-use crate::process::{
-    ProcessBootstrap, ProcessReadyRequest, ProcessStartToken, ProcessStartup, StartProcessRequest,
-    StartedProcess,
-};
+use crate::process::{ProcessStartToken, ProcessStartupDescriptor, StartedProcess};
 use crate::readiness::ReadinessFlags;
 use crate::shared_buffer::SharedBufferSequence;
 use crate::socket::{
@@ -69,11 +66,11 @@ pub enum BrokerOperation {
     /// File request family.
     File(FileRequest),
     /// Start one child process from an opaque platform bootstrap.
-    StartProcess(StartProcessRequest),
+    StartProcess(ProcessStartupDescriptor),
     /// Commit a child process after its start result reaches the parent.
     AcknowledgeProcessStart(ProcessStartToken),
     /// Report that this child process is ready to begin guest execution.
-    ProcessReady(ProcessReadyRequest),
+    ReportProcessReady(Option<ThreadId>),
     /// Report that this child rejected its startup data before becoming ready.
     ReportProcessStartFailure(ErrorCode),
 }
@@ -110,10 +107,7 @@ impl BrokerOperation {
                 | FileRequest::Mkdir(MkdirFileRequest { path: buffer, .. })
                 | FileRequest::Rmdir(RmdirFileRequest { path: buffer, .. }),
             )
-            | Self::StartProcess(StartProcessRequest {
-                bootstrap: ProcessBootstrap { buffer, .. },
-                ..
-            }) => Some(*buffer),
+            | Self::StartProcess(ProcessStartupDescriptor { buffer, .. }) => Some(*buffer),
             Self::CreateThread
             | Self::ExitThread(_)
             | Self::CloseObject(_)
@@ -136,7 +130,7 @@ impl BrokerOperation {
                 FileRequest::Seek(_) | FileRequest::Truncate(_) | FileRequest::HandleStatus(_),
             )
             | Self::AcknowledgeProcessStart(_)
-            | Self::ProcessReady(_)
+            | Self::ReportProcessReady(_)
             | Self::ReportProcessStartFailure(_) => None,
         }
     }
@@ -164,7 +158,7 @@ pub enum BrokerHandshakeResponse {
         /// Assigned process ID.
         process_id: ProcessId,
         /// Child startup data, absent for the initial process.
-        startup: Option<ProcessStartup>,
+        startup: Option<ProcessStartupDescriptor>,
     },
     /// Negotiation failed because the requested version is unsupported.
     ///
