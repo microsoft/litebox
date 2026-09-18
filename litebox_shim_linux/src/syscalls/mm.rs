@@ -171,6 +171,13 @@ impl ElfPatchState {
 /// Identity of a resolved filesystem descriptor.
 pub(crate) struct ElfPatchKey(Arc<FileFd>);
 
+impl ElfPatchKey {
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn new(fd: Arc<FileFd>) -> Self {
+        Self(fd)
+    }
+}
+
 impl core::fmt::Debug for ElfPatchKey {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter

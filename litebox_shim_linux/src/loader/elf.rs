@@ -248,20 +248,33 @@ impl<'a, Platform: ShimPlatform> FileAndParsed<'a, Platform> {
         };
         let result = self.parsed.load(&mut self.file, &mut &*platform, reserve)?;
         #[cfg(target_arch = "aarch64")]
-        if self.parsed.has_trampoline()
-            && !self
+        if self.parsed.has_trampoline() {
+            let crate::syscalls::file::AnyTypedFd::Fs(fd) =
+                self.file.task.typed_fd(self.file.fd).map_err(|_| {
+                    ElfLoaderError::LoadError(
+                        litebox_common_linux::loader::ElfLoadError::InvalidProgramHeader,
+                    )
+                })?
+            else {
+                return Err(ElfLoaderError::LoadError(
+                    litebox_common_linux::loader::ElfLoadError::InvalidProgramHeader,
+                ));
+            };
+            let patch_key = crate::syscalls::mm::ElfPatchKey::new(fd);
+            if !self
                 .file
                 .task
                 .global
                 .elf_patch_cache
                 .lock()
-                .get(&self.file.fd)
+                .get(&patch_key)
                 .is_some_and(crate::syscalls::mm::ElfPatchState::trampoline_is_populated)
-        {
-            litebox_util_log::error!(fd:? = self.file.fd; "AArch64 trampoline was not populated while loading the ELF");
-            return Err(ElfLoaderError::LoadError(
-                litebox_common_linux::loader::ElfLoadError::InvalidProgramHeader,
-            ));
+            {
+                litebox_util_log::error!(fd:? = self.file.fd; "AArch64 trampoline was not populated while loading the ELF");
+                return Err(ElfLoaderError::LoadError(
+                    litebox_common_linux::loader::ElfLoadError::InvalidProgramHeader,
+                ));
+            }
         }
         Ok(result)
     }
