@@ -17,13 +17,13 @@ use litebox_broker_core::BrokerCore;
 
 #[cfg(target_os = "linux")]
 mod linux;
-mod process_start;
+mod process_manager;
 #[cfg(all(windows, target_arch = "x86_64"))]
 mod windows;
 
 #[cfg(target_os = "linux")]
 use linux::PlatformRunnerEndpoint;
-pub(crate) use process_start::{AssociationFailure, RunnerProcessManager, RunnerStartup};
+pub(crate) use process_manager::{AssociationFailure, RunnerProcessManager, RunnerStartup};
 #[cfg(all(windows, target_arch = "x86_64"))]
 use windows::PlatformRunnerEndpoint;
 
@@ -75,7 +75,7 @@ impl RunnerConfig {
         arguments
     }
 
-    fn for_process_start(&self) -> Self {
+    fn without_initial_arguments(&self) -> Self {
         Self {
             executable: self.executable.clone(),
             arguments: Vec::new(),
@@ -92,7 +92,7 @@ pub struct RunnerInstance {
     runner: Arc<Mutex<Child>>,
     shutdown: Arc<RunnerShutdown>,
     endpoint: PlatformRunnerEndpoint,
-    process_start_config: RunnerConfig,
+    started_runner_config: RunnerConfig,
 }
 
 struct RunnerShutdown {
@@ -202,12 +202,12 @@ impl RunnerInstance {
             changed: Condvar::new(),
             termination_dispatched: AtomicBool::new(false),
         });
-        let process_start_config = config.for_process_start();
+        let started_runner_config = config.without_initial_arguments();
         Ok(Self {
             runner,
             shutdown,
             endpoint,
-            process_start_config,
+            started_runner_config,
         })
     }
 
@@ -222,7 +222,7 @@ impl RunnerInstance {
     /// Panics if another runner owner poisoned the process mutex.
     pub fn run_to_completion(mut self, broker: &BrokerCore) -> IoResult<ExitStatus> {
         let process_manager =
-            RunnerProcessManager::new(self.process_start_config.clone(), broker.clone());
+            RunnerProcessManager::new(self.started_runner_config.clone(), broker.clone());
         let mut association_result =
             self.endpoint
                 .serve(&self.runner, None, Arc::clone(&process_manager));
@@ -275,13 +275,8 @@ fn runner_exit_signal(status: ExitStatus) -> Option<i32> {
     status.signal()
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
-const fn runner_exit_signal(_status: ExitStatus) -> Option<i32> {
-    None
-}
-
-#[cfg(not(any(target_os = "linux", all(windows, target_arch = "x86_64"))))]
-const fn runner_exit_signal(_status: ExitStatus) -> Option<i32> {
+#[cfg(not(target_os = "linux"))]
+fn runner_exit_signal(_status: ExitStatus) -> Option<i32> {
     None
 }
 

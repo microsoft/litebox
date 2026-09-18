@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Coordination for broker-requested runner process starts.
+//! Shared coordination for out-of-process runner instances.
 
 use std::io::{Error as IoError, Result as IoResult};
 use std::process::ExitStatus;
@@ -37,18 +37,18 @@ const _: () =
 const _: () =
     assert!(crate::runtime::PROCESS_START_CONTROL_QUEUE_CAPACITY >= MAX_PENDING_PROCESS_STARTS);
 
-/// Shared coordination for runner process starts and active associations.
+/// Shared ownership and coordination for runner processes and associations.
 pub(crate) struct RunnerProcessManager {
     broker: BrokerCore,
-    process_start_config: RunnerConfig,
-    state: Mutex<RunnerProcessManagerInner>,
+    started_runner_config: RunnerConfig,
+    state: Mutex<RunnerProcessManagerState>,
     drained: Condvar,
 }
 
 /// Startup context for a runner whose broker process was created by its parent.
 pub(crate) struct RunnerStartup {
     process: Arc<BrokerProcess>,
-    start: Arc<ProcessStart>,
+    transaction: Arc<ProcessStartTransaction>,
     data: ProcessStartupData,
 }
 
@@ -95,8 +95,8 @@ impl TerminationProvenance {
     }
 }
 
-struct RunnerProcessManagerInner {
-    starts: Vec<(ProcessStartToken, Arc<ProcessStart>)>,
+struct RunnerProcessManagerState {
+    transactions: Vec<(ProcessStartToken, Arc<ProcessStartTransaction>)>,
     associations: Vec<(ProcessId, AssociationFailure)>,
     active_instances: usize,
     active_watchdogs: usize,
@@ -104,14 +104,16 @@ struct RunnerProcessManagerInner {
 
 pub(crate) type AssociationFailure = Arc<dyn Fn() + Send + Sync>;
 
-pub(crate) struct ProcessStartDrain {
-    starts: Vec<Arc<ProcessStart>>,
+/// Transactions retained while an ending association drains in-flight work.
+pub(crate) struct AssociationDrain {
+    transactions: Vec<Arc<ProcessStartTransaction>>,
 }
 
-struct ProcessStart {
+/// State for one `StartProcess` request from admission through finalization.
+struct ProcessStartTransaction {
     parent_id: ProcessId,
     process: Arc<BrokerProcess>,
-    state: Mutex<ProcessStartInner>,
+    state: Mutex<ProcessStartTransactionState>,
     changed: Condvar,
 }
 
@@ -133,7 +135,7 @@ enum StartResultPublication {
     Delivered,
 }
 
-struct ProcessStartInner {
+struct ProcessStartTransactionState {
     phase: ProcessStartPhase,
     publication: StartResultPublication,
     shutdown: Option<Arc<RunnerShutdown>>,
@@ -214,7 +216,7 @@ impl RunnerInstance {
         startup: RunnerStartup,
         process_manager: Arc<RunnerProcessManager>,
     ) -> RunnerCompletion {
-        let start = Arc::clone(&startup.start);
+        let start = Arc::clone(&startup.transaction);
         start.install_shutdown(Arc::clone(&self.shutdown));
         let association_result = self
             .endpoint
@@ -293,12 +295,12 @@ impl RunnerInstance {
 }
 
 impl RunnerProcessManager {
-    pub(super) fn new(process_start_config: RunnerConfig, broker: BrokerCore) -> Arc<Self> {
+    pub(super) fn new(started_runner_config: RunnerConfig, broker: BrokerCore) -> Arc<Self> {
         Arc::new(Self {
             broker,
-            process_start_config,
-            state: Mutex::new(RunnerProcessManagerInner {
-                starts: Vec::new(),
+            started_runner_config,
+            state: Mutex::new(RunnerProcessManagerState {
+                transactions: Vec::new(),
                 associations: Vec::new(),
                 active_instances: 0,
                 active_watchdogs: 0,
@@ -365,7 +367,7 @@ impl RunnerProcessManager {
     ) {
         match (operation, result) {
             (_, BrokerResult::ProcessStarted(started)) => {
-                let Some(start) = self.find_start(started.token) else {
+                let Some(start) = self.find_transaction(started.token) else {
                     return;
                 };
                 if start.parent_id == process_id {
@@ -376,16 +378,16 @@ impl RunnerProcessManager {
                 BrokerOperation::AcknowledgeProcessStart(token),
                 BrokerResult::ProcessStartAcknowledged | BrokerResult::ProcessStartFailed(_),
             ) => {
-                let Some(start) = self.find_start(*token) else {
+                let Some(start) = self.find_transaction(*token) else {
                     return;
                 };
                 if start.parent_id != process_id {
                     return;
                 }
                 if let ReceiptResolution::Resolved(finalization) = start.resolve_receipt() {
-                    self.remove_start(*token);
+                    self.remove_transaction(*token);
                     if let Some(abnormal) = finalization {
-                        self.finish_process_start(&start, abnormal);
+                        self.finish_transaction(&start, abnormal);
                     }
                 }
             }
@@ -393,7 +395,7 @@ impl RunnerProcessManager {
                 BrokerOperation::ReportProcessStartFailure(error),
                 BrokerResult::ProcessStartFailed(reported),
             ) if error == reported => {
-                if let Some(start) = self.find_process_start(process_id) {
+                if let Some(start) = self.find_transaction_by_process_id(process_id) {
                     start.start_failure_response_sent(*error);
                 }
             }
@@ -418,10 +420,10 @@ impl RunnerProcessManager {
         let inherited_objects = InheritedProcessObjects::new(&inherited_objects)
             .expect("child handle count must match the bounded inheritance request");
         let process_id = process.id();
-        let start = Arc::new(ProcessStart {
+        let start = Arc::new(ProcessStartTransaction {
             parent_id: parent.id(),
             process: Arc::clone(&process),
-            state: Mutex::new(ProcessStartInner {
+            state: Mutex::new(ProcessStartTransactionState {
                 phase: ProcessStartPhase::Starting,
                 publication: StartResultPublication::NotStarted,
                 shutdown: None,
@@ -448,17 +450,17 @@ impl RunnerProcessManager {
                     .lock()
                     .expect("runner process manager state mutex poisoned");
                 state
-                    .starts
+                    .transactions
                     .try_reserve(1)
                     .map_err(|_| ErrorCode::OutOfMemory)?;
                 if parent.is_cancellation_requested() {
                     return Err(ErrorCode::PeerClosed);
                 }
-                if state.starts.len() >= MAX_PENDING_PROCESS_STARTS {
+                if state.transactions.len() >= MAX_PENDING_PROCESS_STARTS {
                     return Err(ErrorCode::ResourceExhausted);
                 }
                 if state
-                    .starts
+                    .transactions
                     .iter()
                     .any(|(candidate, _)| *candidate == token)
                 {
@@ -468,7 +470,7 @@ impl RunnerProcessManager {
                     .active_instances
                     .checked_add(1)
                     .ok_or(ErrorCode::ResourceExhausted)?;
-                state.starts.push((token, Arc::clone(&start)));
+                state.transactions.push((token, Arc::clone(&start)));
                 state.active_instances = active_instances;
                 return Ok(token);
             }
@@ -481,8 +483,8 @@ impl RunnerProcessManager {
         };
 
         let process_manager = Arc::clone(self);
-        let config = self.process_start_config.clone();
-        let thread_start = Arc::clone(&start);
+        let config = self.started_runner_config.clone();
+        let thread_transaction = Arc::clone(&start);
         let thread = std::thread::Builder::new()
             .name(format!("litebox-runner-{}", process_id.0))
             .spawn(move || {
@@ -491,7 +493,7 @@ impl RunnerProcessManager {
                         instance.run_started_process_to_completion(
                             RunnerStartup {
                                 process,
-                                start: Arc::clone(&thread_start),
+                                transaction: Arc::clone(&thread_transaction),
                                 data: ProcessStartupData {
                                     format,
                                     version,
@@ -505,11 +507,11 @@ impl RunnerProcessManager {
                 }));
                 match outcome {
                     Ok(Ok(result)) => {
-                        process_manager.runner_finished(token, &thread_start, result, false);
+                        process_manager.runner_finished(token, &thread_transaction, result, false);
                     }
                     Ok(Err(error)) => process_manager.runner_finished(
                         token,
-                        &thread_start,
+                        &thread_transaction,
                         RunnerCompletion {
                             result: Err(error),
                             runner_success: None,
@@ -523,7 +525,7 @@ impl RunnerProcessManager {
                     ),
                     Err(_) => process_manager.runner_finished(
                         token,
-                        &thread_start,
+                        &thread_transaction,
                         RunnerCompletion {
                             result: Err(IoError::other("runner process thread panicked")),
                             runner_success: None,
@@ -538,7 +540,7 @@ impl RunnerProcessManager {
                 }
             });
         if thread.is_err() {
-            self.remove_start(token);
+            self.remove_transaction(token);
             start.process.cleanup(true);
             self.finish_instance();
             return Err(ErrorCode::OutOfMemory);
@@ -573,7 +575,9 @@ impl RunnerProcessManager {
         parent_id: ProcessId,
         token: ProcessStartToken,
     ) -> Result<(), ErrorCode> {
-        let start = self.find_start(token).ok_or(ErrorCode::UnknownObject)?;
+        let start = self
+            .find_transaction(token)
+            .ok_or(ErrorCode::UnknownObject)?;
         if start.parent_id != parent_id {
             return Err(ErrorCode::UnknownObject);
         }
@@ -614,7 +618,7 @@ impl RunnerProcessManager {
         parent_id: ProcessId,
         token: ProcessStartToken,
     ) -> Result<ProcessStartAcknowledgement, ErrorCode> {
-        let start = self.find_start(token).ok_or(ErrorCode::PeerClosed)?;
+        let start = self.find_transaction(token).ok_or(ErrorCode::PeerClosed)?;
         if start.parent_id != parent_id {
             return Err(ErrorCode::UnknownObject);
         }
@@ -627,7 +631,7 @@ impl RunnerProcessManager {
         initial_thread_id: Option<ThreadId>,
     ) -> Result<(), ErrorCode> {
         let start = self
-            .find_process_start(process_id)
+            .find_transaction_by_process_id(process_id)
             .ok_or(ErrorCode::PeerClosed)?;
         start.ready_and_wait(initial_thread_id)
     }
@@ -638,7 +642,7 @@ impl RunnerProcessManager {
         error: ErrorCode,
     ) -> Result<(), ErrorCode> {
         let (token, start) = self
-            .find_process_start_entry(process_id)
+            .find_transaction_entry_by_process_id(process_id)
             .ok_or(ErrorCode::PeerClosed)?;
         start.report_start_failure(error)?;
         if self
@@ -653,43 +657,45 @@ impl RunnerProcessManager {
         Ok(())
     }
 
-    pub(crate) fn association_ending(&self, process_id: ProcessId) -> ProcessStartDrain {
-        let draining = self
+    pub(crate) fn association_ending(&self, process_id: ProcessId) -> AssociationDrain {
+        let draining_transactions = self
             .state
             .lock()
             .expect("runner process manager state mutex poisoned")
-            .starts
+            .transactions
             .iter()
             .filter(|(_, start)| start.parent_id == process_id)
             .map(|(_, start)| Arc::clone(start))
             .collect::<Vec<_>>();
-        for start in &draining {
+        for start in &draining_transactions {
             start.abort(ErrorCode::PeerClosed, false, true);
             start.begin_receipt_drain();
         }
 
-        let process_start = {
+        let transaction = {
             self.state
                 .lock()
                 .expect("runner process manager state mutex poisoned")
-                .starts
+                .transactions
                 .iter()
                 .find_map(|(_, start)| {
                     (start.process.id() == process_id).then(|| Arc::clone(start))
                 })
         };
-        if let Some(start) = process_start {
+        if let Some(start) = transaction {
             start.association_closed();
         }
-        ProcessStartDrain { starts: draining }
+        AssociationDrain {
+            transactions: draining_transactions,
+        }
     }
 
-    pub(crate) fn association_ended(&self, process_id: ProcessId, draining: ProcessStartDrain) {
+    pub(crate) fn association_ended(&self, process_id: ProcessId, draining: AssociationDrain) {
         self.unregister_association(process_id);
-        for start in draining.starts {
-            self.remove_start_by_process_id(start.process.id());
+        for start in draining.transactions {
+            self.remove_transaction_by_process_id(start.process.id());
             if let Some(abnormal) = start.finish_receipt_drain() {
-                self.finish_process_start(&start, abnormal);
+                self.finish_transaction(&start, abnormal);
             }
         }
     }
@@ -725,7 +731,7 @@ impl RunnerProcessManager {
         process_id: ProcessId,
         failure: AssociationFailure,
     ) {
-        if let Some(start) = self.find_process_start(process_id) {
+        if let Some(start) = self.find_transaction_by_process_id(process_id) {
             start.install_association_failure(failure);
         }
     }
@@ -758,7 +764,7 @@ impl RunnerProcessManager {
     fn arm_initial_receipt_deadline(
         self: &Arc<Self>,
         token: ProcessStartToken,
-        start: &Arc<ProcessStart>,
+        start: &Arc<ProcessStartTransaction>,
         deadline: Instant,
     ) -> Result<(), ()> {
         let start = Arc::clone(start);
@@ -777,7 +783,7 @@ impl RunnerProcessManager {
     fn arm_internal_resolution_watchdog(
         self: &Arc<Self>,
         token: ProcessStartToken,
-        start: &Arc<ProcessStart>,
+        start: &Arc<ProcessStartTransaction>,
     ) -> Result<(), ()> {
         let start = Arc::clone(start);
         let parent_failure = self.find_association_failure(start.parent_id);
@@ -795,7 +801,7 @@ impl RunnerProcessManager {
     fn arm_acknowledgement_publication_watchdog(
         self: &Arc<Self>,
         token: ProcessStartToken,
-        start: &Arc<ProcessStart>,
+        start: &Arc<ProcessStartTransaction>,
     ) -> Result<(), ()> {
         let start = Arc::clone(start);
         let parent_failure = self.find_association_failure(start.parent_id);
@@ -813,7 +819,7 @@ impl RunnerProcessManager {
     fn arm_start_failure_publication_watchdog(
         self: &Arc<Self>,
         token: ProcessStartToken,
-        start: &Arc<ProcessStart>,
+        start: &Arc<ProcessStartTransaction>,
     ) -> Result<(), ()> {
         let start = Arc::clone(start);
         self.spawn_watchdog(
@@ -857,7 +863,7 @@ impl RunnerProcessManager {
     fn apply_receipt_expiration(
         &self,
         token: ProcessStartToken,
-        start: &ProcessStart,
+        start: &ProcessStartTransaction,
         expiration: ReceiptExpiration,
         parent_failure: Option<AssociationFailure>,
     ) {
@@ -880,12 +886,12 @@ impl RunnerProcessManager {
             true
         };
         if let Some(abnormal) = start.complete_timeout_callback() {
-            self.finish_process_start(start, abnormal);
+            self.finish_transaction(start, abnormal);
         }
         if fail_parent && !parent_failed {
-            self.remove_start(token);
+            self.remove_transaction(token);
             if let Some(abnormal) = start.finish_receipt_drain() {
-                self.finish_process_start(start, abnormal);
+                self.finish_transaction(start, abnormal);
             }
         }
         if let Some(deadline) = commit_supervision_deadline
@@ -895,66 +901,69 @@ impl RunnerProcessManager {
         }
     }
 
-    fn find_start(&self, token: ProcessStartToken) -> Option<Arc<ProcessStart>> {
+    fn find_transaction(&self, token: ProcessStartToken) -> Option<Arc<ProcessStartTransaction>> {
         self.state
             .lock()
             .expect("runner process manager state mutex poisoned")
-            .starts
+            .transactions
             .iter()
             .find_map(|(candidate, start)| (*candidate == token).then(|| Arc::clone(start)))
     }
 
-    fn find_process_start(&self, process_id: ProcessId) -> Option<Arc<ProcessStart>> {
-        self.find_process_start_entry(process_id)
+    fn find_transaction_by_process_id(
+        &self,
+        process_id: ProcessId,
+    ) -> Option<Arc<ProcessStartTransaction>> {
+        self.find_transaction_entry_by_process_id(process_id)
             .map(|(_, start)| start)
     }
 
-    fn find_process_start_entry(
+    fn find_transaction_entry_by_process_id(
         &self,
         process_id: ProcessId,
-    ) -> Option<(ProcessStartToken, Arc<ProcessStart>)> {
+    ) -> Option<(ProcessStartToken, Arc<ProcessStartTransaction>)> {
         self.state
             .lock()
             .expect("runner process manager state mutex poisoned")
-            .starts
+            .transactions
             .iter()
             .find_map(|(token, start)| {
                 (start.process.id() == process_id).then(|| (*token, Arc::clone(start)))
             })
     }
 
-    fn remove_start(&self, token: ProcessStartToken) {
+    fn remove_transaction(&self, token: ProcessStartToken) {
         let mut state = self
             .state
             .lock()
             .expect("runner process manager state mutex poisoned");
         if let Some(index) = state
-            .starts
+            .transactions
             .iter()
             .position(|(candidate, _)| *candidate == token)
         {
-            state.starts.swap_remove(index);
+            state.transactions.swap_remove(index);
         }
     }
 
-    fn remove_start_by_process_id(&self, process_id: ProcessId) {
+    fn remove_transaction_by_process_id(&self, process_id: ProcessId) {
         let mut state = self
             .state
             .lock()
             .expect("runner process manager state mutex poisoned");
         if let Some(index) = state
-            .starts
+            .transactions
             .iter()
             .position(|(_, start)| start.process.id() == process_id)
         {
-            state.starts.swap_remove(index);
+            state.transactions.swap_remove(index);
         }
     }
 
     fn runner_finished(
         &self,
         token: ProcessStartToken,
-        start: &ProcessStart,
+        start: &ProcessStartTransaction,
         result: RunnerCompletion,
         thread_panicked: bool,
     ) {
@@ -983,17 +992,17 @@ impl RunnerProcessManager {
             start.abort(ErrorCode::PeerClosed, false, false);
         }
         if !start.retains_published_receipt() {
-            self.remove_start(token);
+            self.remove_transaction(token);
             if let ReceiptResolution::Resolved(finalization) = start.resolve_receipt() {
                 debug_assert!(finalization.is_none());
             }
         }
         if let Some(abnormal) = start.runner_finished(abnormal) {
-            self.finish_process_start(start, abnormal);
+            self.finish_transaction(start, abnormal);
         }
     }
 
-    fn finish_process_start(&self, start: &ProcessStart, abnormal: bool) {
+    fn finish_transaction(&self, start: &ProcessStartTransaction, abnormal: bool) {
         start.process.cleanup(!abnormal);
         self.finish_instance();
     }
@@ -1076,16 +1085,19 @@ const fn process_start_failure_is_expected(error: ErrorCode) -> bool {
     )
 }
 
-impl ProcessStart {
+impl ProcessStartTransaction {
     fn wait_until_ready(&self) -> Result<Option<ThreadId>, ErrorCode> {
-        let mut state = self.state.lock().expect("process start mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("process start transaction mutex poisoned");
         loop {
             match state.phase {
                 ProcessStartPhase::Starting => {
                     state = self
                         .changed
                         .wait(state)
-                        .expect("process start mutex poisoned");
+                        .expect("process start transaction mutex poisoned");
                 }
                 ProcessStartPhase::Ready { initial_thread_id } => return Ok(initial_thread_id),
                 ProcessStartPhase::Committing
@@ -1106,7 +1118,10 @@ impl ProcessStart {
                 BrokerError::UnknownObject => ErrorCode::ProtocolState,
                 error => ErrorCode::from(error),
             })?;
-        let mut state = self.state.lock().expect("process start mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("process start transaction mutex poisoned");
         if !matches!(state.phase, ProcessStartPhase::Starting) {
             return Err(match state.phase {
                 ProcessStartPhase::Aborted(error) => error,
@@ -1128,7 +1143,7 @@ impl ProcessStart {
                     state = self
                         .changed
                         .wait(state)
-                        .expect("process start mutex poisoned");
+                        .expect("process start transaction mutex poisoned");
                 }
                 ProcessStartPhase::Aborted(error) => return Err(error),
                 ProcessStartPhase::Starting => unreachable!("ready state cannot regress"),
@@ -1137,7 +1152,10 @@ impl ProcessStart {
     }
 
     fn begin_start_result_publication(&self) -> Result<Instant, ErrorCode> {
-        let mut state = self.state.lock().expect("process start mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("process start transaction mutex poisoned");
         match state.phase {
             ProcessStartPhase::Ready { .. }
                 if state.publication == StartResultPublication::NotStarted =>
@@ -1154,7 +1172,10 @@ impl ProcessStart {
         if !process_start_failure_is_expected(error) {
             return Err(ErrorCode::ProtocolState);
         }
-        let mut state = self.state.lock().expect("process start mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("process start transaction mutex poisoned");
         match state.phase {
             ProcessStartPhase::Starting => {}
             ProcessStartPhase::Aborted(error) => return Err(error),
@@ -1172,7 +1193,10 @@ impl ProcessStart {
 
     fn start_failure_response_sent(&self, error: ErrorCode) {
         let (association_failure, shutdown) = {
-            let mut state = self.state.lock().expect("process start mutex poisoned");
+            let mut state = self
+                .state
+                .lock()
+                .expect("process start transaction mutex poisoned");
             complete_deadline(&mut state.start_failure_publication_watchdog);
             let actions = if matches!(state.phase, ProcessStartPhase::Aborted(cause) if cause == error)
                 && state.shutdown_request == ShutdownRequest::ExpectedStartFailurePending
@@ -1197,7 +1221,10 @@ impl ProcessStart {
     }
 
     fn admit_acknowledgement(&self) -> Result<(), ErrorCode> {
-        let mut state = self.state.lock().expect("process start mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("process start transaction mutex poisoned");
         if state.publication == StartResultPublication::NotStarted {
             return Err(ErrorCode::ProtocolState);
         }
@@ -1225,7 +1252,10 @@ impl ProcessStart {
     }
 
     fn resolve_acknowledgement(&self) -> Result<ProcessStartAcknowledgement, ErrorCode> {
-        let mut state = self.state.lock().expect("process start mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("process start transaction mutex poisoned");
         loop {
             match state.receipt {
                 ReceiptState::AcknowledgementAdmitted => {}
@@ -1245,14 +1275,17 @@ impl ProcessStart {
                     state = self
                         .changed
                         .wait(state)
-                        .expect("process start mutex poisoned");
+                        .expect("process start transaction mutex poisoned");
                 }
                 (ProcessStartPhase::Ready { .. }, StartResultPublication::Delivered) => {
                     debug_assert!(matches!(state.resolution_watchdog, DeadlineState::Armed(_)));
                     state.phase = ProcessStartPhase::Committing;
                     drop(state);
                     let commit_result = self.process.commit_start().map_err(ErrorCode::from);
-                    state = self.state.lock().expect("process start mutex poisoned");
+                    state = self
+                        .state
+                        .lock()
+                        .expect("process start transaction mutex poisoned");
                     match commit_result {
                         Ok(()) => {
                             state.phase = ProcessStartPhase::Committed;
@@ -1296,7 +1329,10 @@ impl ProcessStart {
     }
 
     fn mark_start_result_delivered(&self) {
-        let mut state = self.state.lock().expect("process start mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("process start transaction mutex poisoned");
         if state.publication == StartResultPublication::Publishing {
             state.publication = StartResultPublication::Delivered;
             if state.receipt == ReceiptState::AcknowledgementAdmitted
@@ -1316,7 +1352,10 @@ impl ProcessStart {
 
     fn install_shutdown(&self, shutdown: Arc<RunnerShutdown>) {
         let shutdown = {
-            let mut state = self.state.lock().expect("process start mutex poisoned");
+            let mut state = self
+                .state
+                .lock()
+                .expect("process start transaction mutex poisoned");
             state.shutdown = Some(Arc::clone(&shutdown));
             (state.shutdown_request != ShutdownRequest::None).then_some(shutdown)
         };
@@ -1327,7 +1366,10 @@ impl ProcessStart {
 
     fn install_association_failure(&self, failure: AssociationFailure) {
         let failure = {
-            let mut state = self.state.lock().expect("process start mutex poisoned");
+            let mut state = self
+                .state
+                .lock()
+                .expect("process start transaction mutex poisoned");
             state.association_failure = Some(Arc::clone(&failure));
             (state.shutdown_request != ShutdownRequest::None).then_some(failure)
         };
@@ -1338,7 +1380,10 @@ impl ProcessStart {
 
     fn abort(&self, error: ErrorCode, abnormal: bool, expected_shutdown: bool) {
         let (association_failure, shutdown) = {
-            let mut state = self.state.lock().expect("process start mutex poisoned");
+            let mut state = self
+                .state
+                .lock()
+                .expect("process start transaction mutex poisoned");
             state.abnormal |= abnormal;
             match state.phase {
                 ProcessStartPhase::Starting | ProcessStartPhase::Ready { .. } => {
@@ -1397,7 +1442,10 @@ impl ProcessStart {
     }
 
     fn association_closed(&self) {
-        let mut state = self.state.lock().expect("process start mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("process start transaction mutex poisoned");
         state.association_failure = None;
         if matches!(
             state.phase,
@@ -1409,7 +1457,10 @@ impl ProcessStart {
     }
 
     fn mark_shutdown_expected(&self) {
-        let mut state = self.state.lock().expect("process start mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("process start transaction mutex poisoned");
         if state.shutdown_request == ShutdownRequest::None {
             state.shutdown_request = ShutdownRequest::Expected;
         }
@@ -1418,14 +1469,14 @@ impl ProcessStart {
     fn mark_abnormal(&self) {
         self.state
             .lock()
-            .expect("process start mutex poisoned")
+            .expect("process start transaction mutex poisoned")
             .abnormal = true;
     }
 
     fn shutdown_request(&self) -> ShutdownRequest {
         self.state
             .lock()
-            .expect("process start mutex poisoned")
+            .expect("process start transaction mutex poisoned")
             .shutdown_request
     }
 
@@ -1433,7 +1484,7 @@ impl ProcessStart {
         matches!(
             self.state
                 .lock()
-                .expect("process start mutex poisoned")
+                .expect("process start transaction mutex poisoned")
                 .phase,
             ProcessStartPhase::Committing
                 | ProcessStartPhase::Committed
@@ -1443,13 +1494,19 @@ impl ProcessStart {
     }
 
     fn retains_published_receipt(&self) -> bool {
-        let state = self.state.lock().expect("process start mutex poisoned");
+        let state = self
+            .state
+            .lock()
+            .expect("process start transaction mutex poisoned");
         state.publication != StartResultPublication::NotStarted
             && state.receipt != ReceiptState::Resolved
     }
 
     fn resolve_receipt(&self) -> ReceiptResolution {
-        let mut state = self.state.lock().expect("process start mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("process start transaction mutex poisoned");
         if matches!(
             state.receipt,
             ReceiptState::TimeoutPending | ReceiptState::Draining
@@ -1461,11 +1518,14 @@ impl ProcessStart {
         complete_deadline(&mut state.acknowledgement_publication_watchdog);
         complete_deadline(&mut state.start_failure_publication_watchdog);
         self.changed.notify_all();
-        ReceiptResolution::Resolved(self.complete_process_start_and_take_finalization(state))
+        ReceiptResolution::Resolved(self.complete_and_take_finalization(state))
     }
 
     fn begin_receipt_drain(&self) {
-        let mut state = self.state.lock().expect("process start mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("process start transaction mutex poisoned");
         if state.receipt != ReceiptState::Resolved {
             state.receipt = ReceiptState::Draining;
             if !matches!(state.phase, ProcessStartPhase::Committing) {
@@ -1478,17 +1538,23 @@ impl ProcessStart {
     }
 
     fn finish_receipt_drain(&self) -> Option<bool> {
-        let mut state = self.state.lock().expect("process start mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("process start transaction mutex poisoned");
         state.receipt = ReceiptState::Resolved;
         complete_deadline(&mut state.resolution_watchdog);
         complete_deadline(&mut state.acknowledgement_publication_watchdog);
         complete_deadline(&mut state.start_failure_publication_watchdog);
         self.changed.notify_all();
-        self.complete_process_start_and_take_finalization(state)
+        self.complete_and_take_finalization(state)
     }
 
     fn expire_initial_receipt_deadline(&self) -> Option<ReceiptExpiration> {
-        let mut state = self.state.lock().expect("process start mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("process start transaction mutex poisoned");
         let (error, abnormal) = match (state.receipt, state.publication) {
             (ReceiptState::AwaitingAcknowledgement, _) => (ErrorCode::PeerClosed, false),
             (ReceiptState::AcknowledgementAdmitted, StartResultPublication::Publishing) => {
@@ -1496,11 +1562,14 @@ impl ProcessStart {
             }
             _ => return None,
         };
-        expire_start(&mut state, error, abnormal, true, &self.changed)
+        expire_transaction(&mut state, error, abnormal, true, &self.changed)
     }
 
     fn wait_for_initial_receipt_deadline(&self, deadline: Instant) -> Option<ReceiptExpiration> {
-        let mut state = self.state.lock().expect("process start mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("process start transaction mutex poisoned");
         loop {
             if !matches!(
                 (state.receipt, state.publication),
@@ -1519,7 +1588,7 @@ impl ProcessStart {
             let (next, _) = self
                 .changed
                 .wait_timeout(state, remaining)
-                .expect("process start mutex poisoned");
+                .expect("process start transaction mutex poisoned");
             state = next;
         }
         let (error, abnormal) = match (state.receipt, state.publication) {
@@ -1529,18 +1598,21 @@ impl ProcessStart {
             }
             _ => return None,
         };
-        expire_start(&mut state, error, abnormal, true, &self.changed)
+        expire_transaction(&mut state, error, abnormal, true, &self.changed)
     }
 
     fn wait_for_internal_resolution_timeout(&self) -> Option<ReceiptExpiration> {
-        let mut state = self.state.lock().expect("process start mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("process start transaction mutex poisoned");
         loop {
             match state.resolution_watchdog {
                 DeadlineState::Unarmed => {
                     state = self
                         .changed
                         .wait(state)
-                        .expect("process start mutex poisoned");
+                        .expect("process start transaction mutex poisoned");
                 }
                 DeadlineState::Armed(deadline) => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1551,7 +1623,7 @@ impl ProcessStart {
                     let (next, _) = self
                         .changed
                         .wait_timeout(state, remaining)
-                        .expect("process start mutex poisoned");
+                        .expect("process start transaction mutex poisoned");
                     state = next;
                 }
                 DeadlineState::Disarmed | DeadlineState::Fired => return None,
@@ -1560,20 +1632,23 @@ impl ProcessStart {
     }
 
     fn wait_for_acknowledgement_publication_timeout(&self) -> Option<ReceiptExpiration> {
-        let mut state = self.state.lock().expect("process start mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("process start transaction mutex poisoned");
         loop {
             match state.acknowledgement_publication_watchdog {
                 DeadlineState::Unarmed => {
                     state = self
                         .changed
                         .wait(state)
-                        .expect("process start mutex poisoned");
+                        .expect("process start transaction mutex poisoned");
                 }
                 DeadlineState::Armed(deadline) => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
                         state.acknowledgement_publication_watchdog = DeadlineState::Fired;
-                        return expire_start(
+                        return expire_transaction(
                             &mut state,
                             ErrorCode::PeerClosed,
                             false,
@@ -1584,7 +1659,7 @@ impl ProcessStart {
                     let (next, _) = self
                         .changed
                         .wait_timeout(state, remaining)
-                        .expect("process start mutex poisoned");
+                        .expect("process start transaction mutex poisoned");
                     state = next;
                 }
                 DeadlineState::Disarmed | DeadlineState::Fired => return None,
@@ -1593,7 +1668,10 @@ impl ProcessStart {
     }
 
     fn wait_for_start_failure_publication_timeout(&self) -> Option<ReceiptExpiration> {
-        let mut state = self.state.lock().expect("process start mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("process start transaction mutex poisoned");
         loop {
             match state.start_failure_publication_watchdog {
                 DeadlineState::Armed(deadline) => {
@@ -1605,7 +1683,7 @@ impl ProcessStart {
                     let (next, _) = self
                         .changed
                         .wait_timeout(state, remaining)
-                        .expect("process start mutex poisoned");
+                        .expect("process start transaction mutex poisoned");
                     state = next;
                 }
                 DeadlineState::Unarmed | DeadlineState::Disarmed | DeadlineState::Fired => {
@@ -1616,7 +1694,10 @@ impl ProcessStart {
     }
 
     fn fail_start_failure_publication_watchdog(&self) -> Option<ReceiptExpiration> {
-        let mut state = self.state.lock().expect("process start mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("process start transaction mutex poisoned");
         if !matches!(
             state.start_failure_publication_watchdog,
             DeadlineState::Armed(_)
@@ -1628,15 +1709,21 @@ impl ProcessStart {
     }
 
     fn fail_internal_resolution_watchdog(&self) -> Option<ReceiptExpiration> {
-        let mut state = self.state.lock().expect("process start mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("process start transaction mutex poisoned");
         complete_deadline(&mut state.resolution_watchdog);
         complete_deadline(&mut state.acknowledgement_publication_watchdog);
         complete_deadline(&mut state.start_failure_publication_watchdog);
-        expire_start(&mut state, ErrorCode::Internal, true, true, &self.changed)
+        expire_transaction(&mut state, ErrorCode::Internal, true, true, &self.changed)
     }
 
     fn complete_timeout_callback(&self) -> Option<bool> {
-        let mut state = self.state.lock().expect("process start mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("process start transaction mutex poisoned");
         state.active_control_callbacks = state
             .active_control_callbacks
             .checked_sub(1)
@@ -1646,7 +1733,10 @@ impl ProcessStart {
     }
 
     fn wait_for_commit_resolution(&self, deadline: Instant) -> bool {
-        let mut state = self.state.lock().expect("process start mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("process start transaction mutex poisoned");
         while matches!(state.phase, ProcessStartPhase::Committing) {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -1655,7 +1745,7 @@ impl ProcessStart {
             let (next, wait_result) = self
                 .changed
                 .wait_timeout(state, remaining)
-                .expect("process start mutex poisoned");
+                .expect("process start transaction mutex poisoned");
             state = next;
             if wait_result.timed_out() && matches!(state.phase, ProcessStartPhase::Committing) {
                 return false;
@@ -1664,9 +1754,9 @@ impl ProcessStart {
         true
     }
 
-    fn complete_process_start_and_take_finalization(
+    fn complete_and_take_finalization(
         &self,
-        mut state: MutexGuard<'_, ProcessStartInner>,
+        mut state: MutexGuard<'_, ProcessStartTransactionState>,
     ) -> Option<bool> {
         if !matches!(state.phase, ProcessStartPhase::Committed) {
             return take_finalization(&mut state);
@@ -1679,7 +1769,10 @@ impl ProcessStart {
         drop(state);
 
         let completion_failed = self.process.complete_start().is_err();
-        let mut state = self.state.lock().expect("process start mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("process start transaction mutex poisoned");
         state.active_control_callbacks = state
             .active_control_callbacks
             .checked_sub(1)
@@ -1691,15 +1784,18 @@ impl ProcessStart {
     }
 
     fn runner_finished(&self, abnormal: bool) -> Option<bool> {
-        let mut state = self.state.lock().expect("process start mutex poisoned");
+        let mut state = self
+            .state
+            .lock()
+            .expect("process start transaction mutex poisoned");
         state.abnormal |= abnormal;
         state.runner_finished = true;
         take_finalization(&mut state)
     }
 }
 
-fn expire_start(
-    state: &mut ProcessStartInner,
+fn expire_transaction(
+    state: &mut ProcessStartTransactionState,
     error: ErrorCode,
     abnormal: bool,
     fail_parent: bool,
@@ -1754,7 +1850,7 @@ fn expire_start(
 }
 
 fn expire_start_failure_publication(
-    state: &mut ProcessStartInner,
+    state: &mut ProcessStartTransactionState,
     changed: &Condvar,
 ) -> Option<ReceiptExpiration> {
     if !matches!(state.phase, ProcessStartPhase::Aborted(_))
@@ -1774,7 +1870,7 @@ fn expire_start_failure_publication(
 }
 
 fn expire_internal_resolution(
-    state: &mut ProcessStartInner,
+    state: &mut ProcessStartTransactionState,
     changed: &Condvar,
 ) -> Option<ReceiptExpiration> {
     let committing_drain = state.receipt == ReceiptState::Draining
@@ -1837,7 +1933,7 @@ fn complete_deadline(state: &mut DeadlineState) {
     }
 }
 
-fn complete_acknowledgement_resolution(state: &mut ProcessStartInner) {
+fn complete_acknowledgement_resolution(state: &mut ProcessStartTransactionState) {
     complete_deadline(&mut state.resolution_watchdog);
     if state.receipt == ReceiptState::AcknowledgementAdmitted {
         arm_deadline(
@@ -1847,7 +1943,7 @@ fn complete_acknowledgement_resolution(state: &mut ProcessStartInner) {
     }
 }
 
-fn take_finalization(state: &mut ProcessStartInner) -> Option<bool> {
+fn take_finalization(state: &mut ProcessStartTransactionState) -> Option<bool> {
     if state.finalization_taken
         || state.active_control_callbacks != 0
         || state.receipt != ReceiptState::Resolved
@@ -1866,9 +1962,9 @@ fn take_finalization(state: &mut ProcessStartInner) -> Option<bool> {
 mod tests {
     use super::{
         DeadlineState, PROCESS_START_RECEIPT_TIMEOUT, PROCESS_START_SUPERVISOR_SHUTDOWN_TIMEOUT,
-        ProcessStart, ProcessStartAcknowledgement, ProcessStartInner, ProcessStartPhase,
-        ReceiptResolution, ReceiptState, RunnerConfig, RunnerProcessManager,
-        RunnerProcessManagerInner, ShutdownRequest, StartResultPublication,
+        ProcessStartAcknowledgement, ProcessStartPhase, ProcessStartTransaction,
+        ProcessStartTransactionState, ReceiptResolution, ReceiptState, RunnerConfig,
+        RunnerProcessManager, RunnerProcessManagerState, ShutdownRequest, StartResultPublication,
     };
     use litebox_broker_core::test_support::TestBrokerCoreBuilder;
     use litebox_broker_core::{BrokerCore, CallerCredential, ObjectRights, PolicyEngine};
@@ -1884,10 +1980,10 @@ mod tests {
     };
     use std::time::{Duration, Instant};
 
-    fn start_with_broker_in_phase(
+    fn transaction_with_broker_in_phase(
         publication: StartResultPublication,
         phase: ProcessStartPhase,
-    ) -> (BrokerCore, Arc<ProcessStart>) {
+    ) -> (BrokerCore, Arc<ProcessStartTransaction>) {
         let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
@@ -1903,10 +1999,10 @@ mod tests {
         }
         (
             broker,
-            Arc::new(ProcessStart {
+            Arc::new(ProcessStartTransaction {
                 parent_id: ProcessId(1),
                 process,
-                state: Mutex::new(ProcessStartInner {
+                state: Mutex::new(ProcessStartTransactionState {
                     phase,
                     publication,
                     shutdown: None,
@@ -1926,8 +2022,10 @@ mod tests {
         )
     }
 
-    fn start_with_broker(publication: StartResultPublication) -> (BrokerCore, Arc<ProcessStart>) {
-        start_with_broker_in_phase(
+    fn transaction_with_broker(
+        publication: StartResultPublication,
+    ) -> (BrokerCore, Arc<ProcessStartTransaction>) {
+        transaction_with_broker_in_phase(
             publication,
             ProcessStartPhase::Ready {
                 initial_thread_id: None,
@@ -1935,17 +2033,17 @@ mod tests {
         )
     }
 
-    fn start(publication: StartResultPublication) -> Arc<ProcessStart> {
-        start_with_broker(publication).1
+    fn transaction(publication: StartResultPublication) -> Arc<ProcessStartTransaction> {
+        transaction_with_broker(publication).1
     }
 
-    fn starting_process(publication: StartResultPublication) -> Arc<ProcessStart> {
-        start_with_broker_in_phase(publication, ProcessStartPhase::Starting).1
+    fn starting_transaction(publication: StartResultPublication) -> Arc<ProcessStartTransaction> {
+        transaction_with_broker_in_phase(publication, ProcessStartPhase::Starting).1
     }
 
     #[test]
     fn publication_captures_an_absolute_receipt_deadline() {
-        let start = start(StartResultPublication::NotStarted);
+        let start = transaction(StartResultPublication::NotStarted);
         let before = Instant::now();
 
         let deadline = start.begin_start_result_publication().unwrap();
@@ -1957,14 +2055,14 @@ mod tests {
 
     #[test]
     fn acknowledgement_ingress_claims_receipt_before_worker_resolution() {
-        let (broker, start) = start_with_broker(StartResultPublication::Delivered);
+        let (broker, start) = transaction_with_broker(StartResultPublication::Delivered);
         let token = ProcessStartToken(7);
         let parent_id = start.parent_id;
         let process_manager = Arc::new(RunnerProcessManager {
             broker,
-            process_start_config: RunnerConfig::new(PathBuf::new(), Vec::new()),
-            state: Mutex::new(RunnerProcessManagerInner {
-                starts: vec![(token, Arc::clone(&start))],
+            started_runner_config: RunnerConfig::new(PathBuf::new(), Vec::new()),
+            state: Mutex::new(RunnerProcessManagerState {
+                transactions: vec![(token, Arc::clone(&start))],
                 associations: Vec::new(),
                 active_instances: 1,
                 active_watchdogs: 0,
@@ -1999,7 +2097,7 @@ mod tests {
 
     #[test]
     fn reported_bootstrap_rejection_selects_normal_rollback() {
-        let start = starting_process(StartResultPublication::NotStarted);
+        let start = starting_transaction(StartResultPublication::NotStarted);
 
         start
             .report_start_failure(ErrorCode::UnsupportedOperation)
@@ -2027,7 +2125,7 @@ mod tests {
 
     #[test]
     fn acknowledgement_waits_for_publication_bookkeeping() {
-        let start = start(StartResultPublication::Publishing);
+        let start = transaction(StartResultPublication::Publishing);
         start.admit_acknowledgement().unwrap();
         let waiting = Arc::clone(&start);
         let (sender, receiver) = mpsc::sync_channel(1);
@@ -2065,7 +2163,7 @@ mod tests {
 
     #[test]
     fn acknowledgement_interrupted_by_drain_returns_peer_closed() {
-        let start = start(StartResultPublication::Publishing);
+        let start = transaction(StartResultPublication::Publishing);
         start.admit_acknowledgement().unwrap();
         let waiting = Arc::clone(&start);
         let worker = std::thread::spawn(move || waiting.resolve_acknowledgement());
@@ -2080,7 +2178,7 @@ mod tests {
 
     #[test]
     fn process_ready_interrupted_by_abort_returns_the_abort_cause() {
-        let ready = starting_process(StartResultPublication::NotStarted);
+        let ready = starting_transaction(StartResultPublication::NotStarted);
         ready.abort(ErrorCode::PeerClosed, false, true);
         assert!(matches!(
             ready.ready_and_wait(None),
@@ -2092,7 +2190,7 @@ mod tests {
 
     #[test]
     fn failure_report_interrupted_by_abort_returns_the_abort_cause() {
-        let failed = starting_process(StartResultPublication::NotStarted);
+        let failed = starting_transaction(StartResultPublication::NotStarted);
         failed.abort(ErrorCode::PeerClosed, false, true);
         assert!(matches!(
             failed.report_start_failure(ErrorCode::UnsupportedOperation),
@@ -2104,7 +2202,7 @@ mod tests {
 
     #[test]
     fn delivery_arms_the_resolution_watchdog_before_the_worker_resumes() {
-        let start = start(StartResultPublication::Publishing);
+        let start = transaction(StartResultPublication::Publishing);
         start.admit_acknowledgement().unwrap();
 
         assert!(matches!(
@@ -2124,7 +2222,7 @@ mod tests {
 
     #[test]
     fn acknowledgement_publication_timeout_retains_receipt_for_drain() {
-        let start = start(StartResultPublication::Delivered);
+        let start = transaction(StartResultPublication::Delivered);
         start.admit_acknowledgement().unwrap();
         assert!(matches!(
             start.resolve_acknowledgement(),
@@ -2157,7 +2255,7 @@ mod tests {
 
     #[test]
     fn start_failure_publication_timeout_terminates_the_runner() {
-        let start = starting_process(StartResultPublication::NotStarted);
+        let start = starting_transaction(StartResultPublication::NotStarted);
         start
             .report_start_failure(ErrorCode::UnsupportedOperation)
             .unwrap();
@@ -2190,7 +2288,7 @@ mod tests {
 
     #[test]
     fn precommit_resolution_timeout_returns_typed_internal_failure() {
-        let start = start(StartResultPublication::Delivered);
+        let start = transaction(StartResultPublication::Delivered);
         start.admit_acknowledgement().unwrap();
         start.state.lock().unwrap().resolution_watchdog = DeadlineState::Armed(Instant::now());
 
@@ -2231,7 +2329,7 @@ mod tests {
 
     #[test]
     fn process_start_abort_fails_an_installed_active_association() {
-        let start = start(StartResultPublication::NotStarted);
+        let start = transaction(StartResultPublication::NotStarted);
         let failed = Arc::new(AtomicBool::new(false));
         let recorded = Arc::clone(&failed);
         start.install_association_failure(Arc::new(move || {
@@ -2246,7 +2344,7 @@ mod tests {
 
     #[test]
     fn supervisor_wait_observes_commit_resolution() {
-        let start = start(StartResultPublication::Delivered);
+        let start = transaction(StartResultPublication::Delivered);
         start.state.lock().unwrap().phase = ProcessStartPhase::Committing;
         let waiting = Arc::clone(&start);
         let worker = std::thread::spawn(move || {
@@ -2263,7 +2361,7 @@ mod tests {
 
     #[test]
     fn receipt_drain_keeps_commit_supervision_armed() {
-        let start = start(StartResultPublication::Delivered);
+        let start = transaction(StartResultPublication::Delivered);
         start.admit_acknowledgement().unwrap();
         {
             let mut state = start.state.lock().unwrap();
@@ -2294,7 +2392,7 @@ mod tests {
 
     #[test]
     fn published_abort_returns_typed_start_failure() {
-        let start = start(StartResultPublication::Publishing);
+        let start = transaction(StartResultPublication::Publishing);
         start.abort(ErrorCode::PeerClosed, false, false);
         start.mark_start_result_delivered();
         start.admit_acknowledgement().unwrap();
@@ -2309,7 +2407,7 @@ mod tests {
 
     #[test]
     fn acknowledgement_before_publication_is_protocol_violation() {
-        let start = start(StartResultPublication::NotStarted);
+        let start = transaction(StartResultPublication::NotStarted);
 
         assert!(matches!(
             start.admit_acknowledgement(),
@@ -2321,7 +2419,7 @@ mod tests {
 
     #[test]
     fn published_receipt_defers_process_finalization() {
-        let start = start(StartResultPublication::Delivered);
+        let start = transaction(StartResultPublication::Delivered);
         start.abort(ErrorCode::PeerClosed, false, false);
 
         assert_eq!(start.runner_finished(false), None);
@@ -2334,7 +2432,7 @@ mod tests {
 
     #[test]
     fn receipt_resolution_completes_process_start() {
-        let start = starting_process(StartResultPublication::Delivered);
+        let start = starting_transaction(StartResultPublication::Delivered);
         let thread_id = start.process.create_thread().unwrap();
         start.process.mark_start_ready(Some(thread_id)).unwrap();
         start.process.commit_start().unwrap();
@@ -2353,7 +2451,7 @@ mod tests {
 
     #[test]
     fn process_ready_waits_until_process_start_is_complete() {
-        let start = starting_process(StartResultPublication::Delivered);
+        let start = starting_transaction(StartResultPublication::Delivered);
         let thread_id = start.process.create_thread().unwrap();
         let waiting = Arc::clone(&start);
         let (sender, receiver) = mpsc::sync_channel(1);
@@ -2385,7 +2483,7 @@ mod tests {
 
     #[test]
     fn acknowledgement_admission_preserves_the_publication_deadline() {
-        let start = start(StartResultPublication::Publishing);
+        let start = transaction(StartResultPublication::Publishing);
         start.admit_acknowledgement().unwrap();
 
         let _expiration = start.expire_initial_receipt_deadline().unwrap();
@@ -2402,7 +2500,7 @@ mod tests {
 
     #[test]
     fn receipt_timeout_defers_finalization_until_association_drain() {
-        let start = start(StartResultPublication::Delivered);
+        let start = transaction(StartResultPublication::Delivered);
 
         assert_eq!(start.runner_finished(false), None);
         let _expiration = start.expire_initial_receipt_deadline().unwrap();
@@ -2418,7 +2516,7 @@ mod tests {
 
     #[test]
     fn unpublished_start_waits_for_receipt_drain_before_finalization() {
-        let start = start(StartResultPublication::NotStarted);
+        let start = transaction(StartResultPublication::NotStarted);
 
         start.begin_receipt_drain();
         assert_eq!(start.runner_finished(false), None);
@@ -2428,7 +2526,7 @@ mod tests {
 
     #[test]
     fn deferred_finalization_uses_the_latest_abnormal_disposition() {
-        let start = start(StartResultPublication::Publishing);
+        let start = transaction(StartResultPublication::Publishing);
         start.admit_acknowledgement().unwrap();
 
         assert_eq!(start.runner_finished(false), None);
@@ -2441,14 +2539,14 @@ mod tests {
 
     #[test]
     fn acknowledgement_send_does_not_steal_a_timed_out_receipt_from_drain() {
-        let (broker, start) = start_with_broker(StartResultPublication::Delivered);
+        let (broker, start) = transaction_with_broker(StartResultPublication::Delivered);
         let token = ProcessStartToken(7);
         let parent_id = start.parent_id;
         let process_manager = RunnerProcessManager {
             broker,
-            process_start_config: RunnerConfig::new(PathBuf::new(), Vec::new()),
-            state: Mutex::new(RunnerProcessManagerInner {
-                starts: vec![(token, Arc::clone(&start))],
+            started_runner_config: RunnerConfig::new(PathBuf::new(), Vec::new()),
+            state: Mutex::new(RunnerProcessManagerState {
+                transactions: vec![(token, Arc::clone(&start))],
                 associations: Vec::new(),
                 active_instances: 1,
                 active_watchdogs: 0,
@@ -2464,11 +2562,11 @@ mod tests {
             &BrokerResult::ProcessStartAcknowledged,
         );
 
-        assert!(process_manager.find_start(token).is_some());
+        assert!(process_manager.find_transaction(token).is_some());
         assert_eq!(start.complete_timeout_callback(), None);
         let draining = process_manager.association_ending(parent_id);
-        assert_eq!(draining.starts.len(), 1);
+        assert_eq!(draining.transactions.len(), 1);
         process_manager.association_ended(parent_id, draining);
-        assert!(process_manager.find_start(token).is_none());
+        assert!(process_manager.find_transaction(token).is_none());
     }
 }

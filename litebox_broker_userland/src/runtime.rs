@@ -524,7 +524,7 @@ where
         sync_channel(PROCESS_START_CONTROL_QUEUE_CAPACITY);
     let process_start_receiver = Arc::new(Mutex::new(process_start_receiver));
 
-    let draining_starts = std::thread::scope(|scope| {
+    let association_drain = std::thread::scope(|scope| {
         let publisher_readiness = Arc::clone(&readiness);
         let publisher_failure_coordinator = Arc::clone(&failure_coordinator);
         let publisher = std::thread::Builder::new()
@@ -621,7 +621,7 @@ where
             process_id,
         );
         drop(cancellation);
-        let draining_starts = process_manager
+        let association_drain = process_manager
             .as_ref()
             .map(|process_manager| process_manager.association_ending(process_id));
         for worker in workers {
@@ -643,11 +643,12 @@ where
         {
             failure_coordinator.report_panic(IoError::other("broker readiness publisher panicked"));
         }
-        draining_starts
+        association_drain
     });
 
-    if let (Some(process_manager), Some(draining_starts)) = (&process_manager, draining_starts) {
-        process_manager.association_ended(process_id, draining_starts);
+    if let (Some(process_manager), Some(association_drain)) = (&process_manager, association_drain)
+    {
+        process_manager.association_ended(process_id, association_drain);
     }
 
     let result = match failure_coordinator.take_error() {
