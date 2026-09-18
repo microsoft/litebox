@@ -623,6 +623,7 @@ impl From<FileError> for SeekError {
             FileError::AccessNotAllowed => Self::NotForSeeking,
             FileError::InvalidOffset => Self::InvalidOffset,
             FileError::NonSeekable => Self::NonSeekable,
+            FileError::PathOnly => Self::NotOpenForSeeking,
             _ => Self::Io,
         }
     }
@@ -633,6 +634,7 @@ impl From<FileError> for TruncateError {
         match error {
             FileError::IsDirectory => Self::IsDirectory,
             FileError::AccessNotAllowed | FileError::NotForWriting => Self::NotForWriting,
+            FileError::PathOnly => Self::NotOpenForWriting,
             FileError::IsTerminalDevice => Self::IsTerminalDevice,
             _ => Self::Io,
         }
@@ -713,6 +715,7 @@ impl From<FileError> for ReadDirError {
     fn from(error: FileError) -> Self {
         match error {
             FileError::NotDirectory => Self::NotADirectory,
+            FileError::PathOnly => Self::NotOpenForReading,
             FileError::AccessNotAllowed | FileError::NotForReading => Self::NotForReading,
             _ => Self::Io,
         }

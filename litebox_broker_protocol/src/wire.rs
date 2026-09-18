@@ -1360,6 +1360,7 @@ mod tests {
             (FileError::NotDirectory, 19),
             (FileError::Busy, 20),
             (FileError::NotEmpty, 21),
+            (FileError::PathOnly, 22),
         ] {
             let response = BrokerResponse {
                 request_id: TEST_REQUEST_ID,

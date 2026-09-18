@@ -80,6 +80,8 @@ pub enum SeekError {
     InvalidOffset,
     #[error("non-seekable file")]
     NonSeekable,
+    #[error("file descriptor is not open for seeking")]
+    NotOpenForSeeking,
     #[error("I/O error")]
     Io,
 }
@@ -93,6 +95,8 @@ pub enum TruncateError {
     IsDirectory,
     #[error("file is not opened for writing")]
     NotForWriting,
+    #[error("file descriptor is not open for writing")]
+    NotOpenForWriting,
     #[error("file descriptor points to a terminal device")]
     IsTerminalDevice,
     #[error("I/O error")]
@@ -197,6 +201,8 @@ pub enum ReadDirError {
     NotADirectory,
     #[error("file descriptor is not open for reading")]
     NotForReading,
+    #[error("file descriptor is not open for reading")]
+    NotOpenForReading,
     #[error("I/O error")]
     Io,
 }

@@ -335,6 +335,7 @@ pub(super) fn encode_file_error(encoder: &mut Encoder, error: FileError) {
         FileError::NotDirectory => 19,
         FileError::Busy => 20,
         FileError::NotEmpty => 21,
+        FileError::PathOnly => 22,
     });
 }
 
@@ -361,6 +362,7 @@ pub(super) fn decode_file_error(decoder: &mut Decoder<'_>) -> Result<FileError, 
         19 => Ok(FileError::NotDirectory),
         20 => Ok(FileError::Busy),
         21 => Ok(FileError::NotEmpty),
+        22 => Ok(FileError::PathOnly),
         _ => Err(WireError::InvalidTag),
     }
 }

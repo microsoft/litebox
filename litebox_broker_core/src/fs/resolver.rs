@@ -562,6 +562,9 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         buf: &mut [u8],
         offset: Option<usize>,
     ) -> Result<(usize, usize), ReadError> {
+        if entry.path_only {
+            return Err(ReadError::NotForReading);
+        }
         let file = match &entry.handle {
             Handle::File(file) => file,
             Handle::Dir(_) => return Err(ReadError::NotAFile),
@@ -569,10 +572,6 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         let seek_behavior = entry.seek_behavior;
         if !entry.read_allowed {
             return Err(ReadError::NotForReading);
-        }
-        if entry.path_only {
-            // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
-            unimplemented!("read from O_PATH fd")
         }
 
         let read_offset = match seek_behavior {
@@ -611,6 +610,9 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         buf: &[u8],
         offset: Option<usize>,
     ) -> Result<(usize, usize), WriteError> {
+        if entry.path_only {
+            return Err(WriteError::NotForWriting);
+        }
         let file = match &entry.handle {
             Handle::File(file) => file,
             Handle::Dir(_) => return Err(WriteError::NotAFile),
@@ -618,10 +620,6 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         let seek_behavior = entry.seek_behavior;
         if !entry.write_allowed {
             return Err(WriteError::NotForWriting);
-        }
-        if entry.path_only {
-            // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
-            unimplemented!("write to O_PATH fd")
         }
 
         let write_offset = match seek_behavior {
@@ -677,8 +675,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             Handle::Dir(_) => return Err(SeekError::NotAFile),
         };
         if entry.path_only {
-            // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
-            unimplemented!("seek on O_PATH fd")
+            return Err(SeekError::NotOpenForSeeking);
         }
 
         match entry.seek_behavior {
@@ -718,8 +715,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             Handle::Dir(_) => return Err(SeekError::NotAFile),
         }
         if entry.path_only {
-            // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
-            unimplemented!("seek on O_PATH fd")
+            return Err(SeekError::NotOpenForSeeking);
         }
 
         match entry.seek_behavior {
@@ -759,12 +755,11 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             Handle::File(file) => file,
             Handle::Dir(_) => return Err(TruncateError::IsDirectory),
         };
+        if entry.path_only {
+            return Err(TruncateError::NotOpenForWriting);
+        }
         if !entry.write_allowed {
             return Err(TruncateError::NotForWriting);
-        }
-        if entry.path_only {
-            // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
-            unimplemented!("truncate O_PATH fd")
         }
 
         self.backend.truncate(file, length)?;
@@ -909,8 +904,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         entry: &ResolverEntry<Backend>,
     ) -> Result<Vec<super::DirEntry>, ReadDirError> {
         if entry.path_only {
-            // TODO(jayb): Add an error variant for operations not permitted on O_PATH fds.
-            unimplemented!("read_dir on O_PATH fd")
+            return Err(ReadDirError::NotOpenForReading);
         }
         let dir = match &entry.handle {
             Handle::File(_) => return Err(ReadDirError::NotADirectory),

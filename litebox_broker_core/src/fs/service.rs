@@ -821,6 +821,7 @@ fn file_seek_error(error: SeekError) -> FileError {
         SeekError::NotAFile => FileError::NotFile,
         SeekError::InvalidOffset => FileError::InvalidOffset,
         SeekError::NonSeekable => FileError::NonSeekable,
+        SeekError::NotOpenForSeeking => FileError::PathOnly,
         SeekError::ClosedFd | SeekError::Io => FileError::Io,
     }
 }
@@ -829,6 +830,7 @@ fn file_truncate_error(error: TruncateError) -> FileError {
     match error {
         TruncateError::IsDirectory => FileError::IsDirectory,
         TruncateError::NotForWriting => FileError::NotForWriting,
+        TruncateError::NotOpenForWriting => FileError::PathOnly,
         TruncateError::IsTerminalDevice => FileError::IsTerminalDevice,
         TruncateError::ClosedFd | TruncateError::Io => FileError::Io,
     }
@@ -887,6 +889,7 @@ fn file_rmdir_error(error: RmdirError) -> FileError {
 fn file_read_directory_error(error: ReadDirError) -> FileError {
     match error {
         ReadDirError::NotADirectory => FileError::NotDirectory,
+        ReadDirError::NotOpenForReading => FileError::PathOnly,
         ReadDirError::ClosedFd | ReadDirError::Io => FileError::Io,
     }
 }

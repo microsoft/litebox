@@ -136,6 +136,8 @@ pub enum FileError {
     Busy,
     #[error("directory is not empty")]
     NotEmpty,
+    #[error("operation is not permitted on an O_PATH file descriptor")]
+    PathOnly,
 }
 
 /// Seek origin.
