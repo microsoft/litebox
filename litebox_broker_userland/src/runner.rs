@@ -32,9 +32,9 @@ mod linux;
 mod windows;
 
 #[cfg(target_os = "linux")]
-use linux::{PlatformRunnerEndpoint, PlatformRunnerShutdown};
+use linux::PlatformRunnerEndpoint;
 #[cfg(all(windows, target_arch = "x86_64"))]
-use windows::{PlatformRunnerEndpoint, PlatformRunnerShutdown};
+use windows::PlatformRunnerEndpoint;
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_START_RECEIPT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -124,7 +124,7 @@ struct ChildRunResult {
 }
 
 struct RunnerShutdown {
-    platform: PlatformRunnerShutdown,
+    runner: Arc<Mutex<Child>>,
     state: Mutex<RunnerShutdownState>,
     changed: Condvar,
     termination_dispatched: AtomicBool,
@@ -184,7 +184,21 @@ impl RunnerShutdown {
             }
         }
         drop(state);
-        if !matches!(self.platform.has_exited(), Ok(true)) && self.platform.shutdown() {
+        let termination_dispatched = {
+            // Serialize observation and termination so collecting an exit
+            // status can never expose a reusable PID between the check and
+            // the kill request.
+            let mut runner = self.runner.lock().expect("runner process mutex poisoned");
+            match runner.try_wait() {
+                Ok(Some(_)) => false,
+                Ok(None) => runner.kill().is_ok(),
+                Err(_) => {
+                    let _ = runner.kill();
+                    false
+                }
+            }
+        };
+        if termination_dispatched {
             self.termination_dispatched.store(true, Ordering::Release);
         }
         let mut state = self.state.lock().expect("runner shutdown mutex poisoned");
@@ -206,7 +220,7 @@ impl RunnerShutdown {
     }
 
     fn has_exited(&self) -> IoResult<bool> {
-        self.platform.has_exited()
+        runner_has_exited(&self.runner)
     }
 
     fn termination_was_dispatched(&self) -> bool {
@@ -232,18 +246,20 @@ impl RunnerInstance {
     /// Creates the runner's dedicated control endpoint and starts the runner.
     pub fn start(config: RunnerConfig) -> IoResult<Self> {
         let endpoint = PlatformRunnerEndpoint::create()?;
-        let runner = Command::new(&config.executable)
-            .args(config.arguments(endpoint.control_channel()))
-            .spawn()?;
+        let runner = Arc::new(Mutex::new(
+            Command::new(&config.executable)
+                .args(config.arguments(endpoint.control_channel()))
+                .spawn()?,
+        ));
         let shutdown = Arc::new(RunnerShutdown {
-            platform: PlatformRunnerShutdown::new(&runner),
+            runner: Arc::clone(&runner),
             state: Mutex::new(RunnerShutdownState::Active),
             changed: Condvar::new(),
             termination_dispatched: AtomicBool::new(false),
         });
         let child_config = config.child();
         Ok(Self {
-            runner: Arc::new(Mutex::new(runner)),
+            runner,
             shutdown,
             endpoint,
             child_config,
@@ -273,11 +289,7 @@ impl RunnerInstance {
             self.shutdown.shutdown();
         }
         self.shutdown.retire();
-        let runner_status = self
-            .runner
-            .lock()
-            .expect("runner process mutex poisoned")
-            .wait();
+        let runner_status = wait_for_runner_exit(&self.runner);
         let root_abnormal = association_result.abnormal
             || association_result.panicked
             || runner_exited.is_err()
@@ -348,11 +360,7 @@ impl RunnerInstance {
             }
         };
         self.shutdown.retire();
-        let runner_status = self
-            .runner
-            .lock()
-            .expect("runner process mutex poisoned")
-            .wait();
+        let runner_status = wait_for_runner_exit(&self.runner);
         if runner_status.is_err() {
             launch.mark_abnormal();
         }
@@ -388,10 +396,7 @@ impl Drop for RunnerInstance {
         self.endpoint.close();
         self.shutdown.shutdown();
         self.shutdown.retire();
-        let mut runner = self.runner.lock().expect("runner process mutex poisoned");
-        if !matches!(runner.try_wait(), Ok(Some(_status))) {
-            let _ = runner.wait();
-        }
+        let _ = wait_for_runner_exit(&self.runner);
     }
 }
 
@@ -2180,6 +2185,29 @@ fn accept_runner_channel<Channel>(
     }
 }
 
+fn runner_has_exited(runner: &Arc<Mutex<Child>>) -> IoResult<bool> {
+    // A pre-authentication caller stops accepting before acting on `true`;
+    // post-authentication callers no longer rely on PID-based authentication.
+    runner
+        .lock()
+        .expect("runner process mutex poisoned")
+        .try_wait()
+        .map(|status| status.is_some())
+}
+
+fn wait_for_runner_exit(runner: &Arc<Mutex<Child>>) -> IoResult<ExitStatus> {
+    loop {
+        if let Some(status) = runner
+            .lock()
+            .expect("runner process mutex poisoned")
+            .try_wait()?
+        {
+            return Ok(status);
+        }
+        std::thread::sleep(ACCEPT_RETRY_DELAY);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2773,24 +2801,25 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn shutdown_can_terminate_while_the_launch_owner_waits() {
-        use super::{PlatformRunnerShutdown, RunnerShutdown, RunnerShutdownState};
+        use super::{RunnerShutdown, RunnerShutdownState, wait_for_runner_exit};
         use std::process::Command;
 
-        let child = Command::new("sh")
-            .args(["-c", "exec sleep 30"])
-            .spawn()
-            .unwrap();
+        let child = Arc::new(Mutex::new(
+            Command::new("sh")
+                .args(["-c", "exec sleep 30"])
+                .spawn()
+                .unwrap(),
+        ));
         let shutdown = RunnerShutdown {
-            platform: PlatformRunnerShutdown::new(&child),
+            runner: Arc::clone(&child),
             state: Mutex::new(RunnerShutdownState::Active),
             changed: Condvar::new(),
             termination_dispatched: AtomicBool::new(false),
         };
-        let child = Arc::new(Mutex::new(child));
         let waiting = Arc::clone(&child);
         let (finished, completion) = mpsc::sync_channel(1);
         let waiter = std::thread::spawn(move || {
-            let status = waiting.lock().unwrap().wait().unwrap();
+            let status = wait_for_runner_exit(&waiting).unwrap();
             finished.send(status).unwrap();
         });
 
@@ -2808,12 +2837,14 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn shutdown_after_observed_exit_records_no_termination() {
-        use super::{PlatformRunnerShutdown, RunnerShutdown, RunnerShutdownState};
+        use super::{RunnerShutdown, RunnerShutdownState, wait_for_runner_exit};
         use std::process::Command;
 
-        let mut child = Command::new("sh").args(["-c", "exit 1"]).spawn().unwrap();
+        let child = Arc::new(Mutex::new(
+            Command::new("sh").args(["-c", "exit 1"]).spawn().unwrap(),
+        ));
         let shutdown = RunnerShutdown {
-            platform: PlatformRunnerShutdown::new(&child),
+            runner: Arc::clone(&child),
             state: Mutex::new(RunnerShutdownState::Active),
             changed: Condvar::new(),
             termination_dispatched: AtomicBool::new(false),
@@ -2824,7 +2855,7 @@ mod tests {
         shutdown.retire();
 
         assert!(!shutdown.termination_was_dispatched());
-        assert!(!child.wait().unwrap().success());
+        assert!(!wait_for_runner_exit(&child).unwrap().success());
     }
 
     #[cfg(target_os = "linux")]

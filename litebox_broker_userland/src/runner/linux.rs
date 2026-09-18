@@ -15,34 +15,8 @@ use litebox_broker_transport_linux_userland::unix_socket::{
     UnixStreamHostSetupChannel, validate_peer_process,
 };
 
-use super::{ChildRunner, RunnerChildren, SETUP_TIMEOUT, accept_runner_channel};
+use super::{ChildRunner, RunnerChildren, SETUP_TIMEOUT, accept_runner_channel, runner_has_exited};
 use crate::runtime::{AssociationFailureCause, AssociationRunResult};
-
-pub(super) struct PlatformRunnerShutdown {
-    process_id: u32,
-}
-
-fn runner_has_exited(runner: &Arc<Mutex<Child>>) -> IoResult<bool> {
-    non_reaping_runner_has_exited(runner.lock().expect("runner process mutex poisoned").id())
-}
-
-impl PlatformRunnerShutdown {
-    pub(super) fn new(runner: &Child) -> Self {
-        Self {
-            process_id: runner.id(),
-        }
-    }
-
-    pub(super) fn shutdown(&self) -> bool {
-        // SAFETY: the unreaped `Child` keeps this PID allocated to the runner
-        // until the launch owner closes the endpoint and waits for it.
-        unsafe { libc::kill(self.process_id.cast_signed(), libc::SIGKILL) == 0 }
-    }
-
-    pub(super) fn has_exited(&self) -> IoResult<bool> {
-        non_reaping_runner_has_exited(self.process_id)
-    }
-}
 
 pub(super) struct PlatformRunnerEndpoint {
     socket_path: PathBuf,
@@ -207,10 +181,7 @@ fn accept_control_channel(
     let control_stream = accept_runner_channel(
         setup_deadline,
         "control",
-        || {
-            non_reaping_runner_has_exited(runner_id)
-                .map(|exited| exited.then(|| "exited".to_owned()))
-        },
+        || runner_has_exited(runner).map(|exited| exited.then(|| "exited".to_owned())),
         || control_listener.accept().map(|(stream, _)| stream),
     )?;
     validate_peer_process(&control_stream, runner_id)?;
@@ -218,25 +189,4 @@ fn accept_control_channel(
         UnixStreamHostSetupChannel::from_host_guaranteed(control_stream, setup_deadline),
         setup_deadline,
     ))
-}
-
-fn non_reaping_runner_has_exited(runner_id: u32) -> IoResult<bool> {
-    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
-    // SAFETY: `info` points to writable `siginfo_t` storage, and `waitid` is
-    // restricted to observing this known child without consuming its status.
-    let result = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            runner_id,
-            info.as_mut_ptr(),
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-        )
-    };
-    if result != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: successful `waitid` initialized `info`; `si_pid == 0` denotes
-    // that the nonblocking observation found no waitable child state.
-    let exited = unsafe { info.assume_init().si_pid() != 0 };
-    Ok(exited)
 }
