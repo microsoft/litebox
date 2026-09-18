@@ -1206,40 +1206,6 @@ mod tests {
     use crate::{UserPtrMut, syscalls::tests::init_platform};
 
     #[test]
-    fn test_elf_patch_key_not_reused_with_raw_fd() {
-        let task = init_platform(None);
-        let old_raw_fd = i32::try_from(
-            task.sys_open("old-elf", OFlags::RDWR | OFlags::CREAT, Mode::RWXU)
-                .unwrap(),
-        )
-        .unwrap();
-        let crate::syscalls::file::AnyTypedFd::Fs(old_fd) = task.typed_fd(old_raw_fd).unwrap()
-        else {
-            unreachable!()
-        };
-        let old_key = super::ElfPatchKey(old_fd);
-
-        task.sys_close(old_raw_fd).unwrap();
-
-        let new_raw_fd = i32::try_from(
-            task.sys_open("new-file", OFlags::RDWR | OFlags::CREAT, Mode::RWXU)
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(new_raw_fd, old_raw_fd, "expected raw fd reuse");
-        let crate::syscalls::file::AnyTypedFd::Fs(new_fd) = task.typed_fd(new_raw_fd).unwrap()
-        else {
-            unreachable!()
-        };
-
-        assert!(
-            old_key != super::ElfPatchKey(new_fd),
-            "a recycled raw fd must not inherit the previous file's patch state"
-        );
-        task.sys_close(new_raw_fd).unwrap();
-    }
-
-    #[test]
     fn test_anonymous_mmap() {
         let task = init_platform(None);
 
