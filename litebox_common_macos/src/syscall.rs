@@ -4,9 +4,11 @@
 //! Typed BSD syscall decoding.
 
 use litebox::utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _};
+use litebox_broker_protocol::fs::FileMode;
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::{
+    MmapFlags, OpenFlags, VmProtection,
     errno::Errno,
     user_pointers::{UserPtr, UserPtrMut},
 };
@@ -16,6 +18,7 @@ pub mod nr {
     pub const EXIT: usize = 1;
     pub const READ: usize = 3;
     pub const WRITE: usize = 4;
+    pub const OPEN: usize = 5;
     pub const CLOSE: usize = 6;
     pub const GETPID: usize = 20;
     pub const GETUID: usize = 24;
@@ -24,8 +27,12 @@ pub mod nr {
     pub const DUP: usize = 41;
     pub const GETEGID: usize = 43;
     pub const GETGID: usize = 47;
+    pub const MUNMAP: usize = 73;
+    pub const MPROTECT: usize = 74;
+    pub const MMAP: usize = 197;
     pub const READ_NOCANCEL: usize = 396;
     pub const WRITE_NOCANCEL: usize = 397;
+    pub const OPEN_NOCANCEL: usize = 398;
     pub const CLOSE_NOCANCEL: usize = 399;
 }
 
@@ -69,11 +76,33 @@ pub enum SyscallRequest {
         buf: UserPtr<u8>,
         count: usize,
     },
+    Open {
+        path: UserPtr<core::ffi::c_char>,
+        flags: OpenFlags,
+        mode: FileMode,
+    },
     Close {
         fd: i32,
     },
     Dup {
         fd: i32,
+    },
+    Mmap {
+        address: usize,
+        length: usize,
+        protection: VmProtection,
+        flags: MmapFlags,
+        fd: i32,
+        offset: i64,
+    },
+    Munmap {
+        address: usize,
+        length: usize,
+    },
+    Mprotect {
+        address: usize,
+        length: usize,
+        protection: VmProtection,
     },
     Getpid,
     Getppid,
@@ -121,8 +150,30 @@ impl SyscallRequest {
                 buf: UserPtr::from_usize(args[1]),
                 count: args[2],
             },
+            nr::OPEN | nr::OPEN_NOCANCEL => Self::Open {
+                path: UserPtr::from_usize(args[0]),
+                flags: OpenFlags::from_bits(int_arg(1)).ok_or(Errno::EINVAL)?,
+                mode: FileMode::from_u32_bits_truncate(int_arg(2).reinterpret_as_unsigned()),
+            },
             nr::CLOSE | nr::CLOSE_NOCANCEL => Self::Close { fd: int_arg(0) },
             nr::DUP => Self::Dup { fd: int_arg(0) },
+            nr::MMAP => Self::Mmap {
+                address: args[0],
+                length: args[1],
+                protection: VmProtection::from_bits(int_arg(2)).ok_or(Errno::EINVAL)?,
+                flags: MmapFlags::from_bits(int_arg(3)).ok_or(Errno::EINVAL)?,
+                fd: int_arg(4),
+                offset: args[5].reinterpret_as_signed() as i64,
+            },
+            nr::MUNMAP => Self::Munmap {
+                address: args[0],
+                length: args[1],
+            },
+            nr::MPROTECT => Self::Mprotect {
+                address: args[0],
+                length: args[1],
+                protection: VmProtection::from_bits(int_arg(2)).ok_or(Errno::EINVAL)?,
+            },
             nr::GETPID => Self::Getpid,
             nr::GETPPID => Self::Getppid,
             nr::GETUID => Self::Getuid,
@@ -179,6 +230,33 @@ mod tests {
             SyscallRequest::from_args(u32::MAX as usize - 2, [0; 8]),
             Ok(SyscallRequest::MachAbsoluteTime)
         ));
+        let request = SyscallRequest::from_args(
+            nr::MMAP,
+            [0x4000, 0x8000, 5, 0x12, usize::MAX, 0x1234, 0, 0],
+        )
+        .unwrap();
+        assert!(matches!(
+            request,
+            SyscallRequest::Mmap {
+                address: 0x4000,
+                length: 0x8000,
+                protection,
+                flags,
+                fd: -1,
+                offset: 0x1234,
+            } if protection == (VmProtection::READ | VmProtection::EXECUTE)
+                && flags == (MmapFlags::PRIVATE | MmapFlags::FIXED)
+        ));
+        for (protection, flags) in [(8, 2), (1, 4)] {
+            assert_eq!(
+                SyscallRequest::from_args(
+                    nr::MMAP,
+                    [0, 0x4000, protection, flags, usize::MAX, 0, 0, 0],
+                )
+                .unwrap_err(),
+                Errno::EINVAL
+            );
+        }
     }
 
     #[cfg(target_arch = "aarch64")]

@@ -63,6 +63,7 @@ pub enum Errno {
     ESHUTDOWN = 58,
     ETIMEDOUT = 60,
     ECONNREFUSED = 61,
+    ENAMETOOLONG = 63,
     ENOTEMPTY = 66,
     ENOSYS = 78,
     EOPNOTSUPP = 102,

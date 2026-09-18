@@ -21,8 +21,8 @@ litebox_syscall_rewriter = { path = "../litebox_syscall_rewriter", version = "0.
 litebox = { path = "../litebox", version = "0.1.0" }
 
 [features]
-# In-process broker fixture with buffered stdin and captured stdout/stderr.
-test-stdio = ["dep:litebox", "dep:litebox_broker_core", "dep:litebox_broker_host", "dep:litebox_broker_local", "dep:litebox_broker_protocol"]
+# Development-only in-process broker fixture.
+test-broker = ["dep:litebox", "dep:litebox_broker_core", "dep:litebox_broker_host", "dep:litebox_broker_local", "dep:litebox_broker_protocol"]
 
 [lints]
 workspace = true

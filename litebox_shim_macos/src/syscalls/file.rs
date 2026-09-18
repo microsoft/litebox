@@ -4,17 +4,20 @@
 //! Guest descriptor namespace and LiteBox file operations.
 
 use crate::{ShimPlatform, Task};
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
 use litebox::{
     LiteBox,
     fd::RawDescriptorStorage,
     fs::{
         BrokerFile, FileFd,
-        errors::{ReadError, WriteError},
+        errors::{OpenError, PathError, ReadError, TruncateError, WriteError},
     },
     sync::RwLock,
 };
-use litebox_common_macos::errno::Errno;
+use litebox_broker_protocol::fs::{FileAccessMode, FileMode, FileOpenFlags, FileUser};
+use litebox_common_macos::{
+    FileDescriptorFlags, OpenFlags, PAGE_SIZE, PATH_MAX, errno::Errno, user_pointers::UserPtr,
+};
 
 const MAX_FDS: usize = 1024;
 
@@ -87,6 +90,98 @@ impl<P: ShimPlatform> Drop for FilesState<P> {
 }
 
 impl<P: ShimPlatform> Task<P> {
+    pub(crate) fn sys_open(
+        &self,
+        path: impl litebox::path::Arg,
+        flags: OpenFlags,
+        mode: FileMode,
+    ) -> Result<u32, Errno> {
+        let path = path.as_rust_str().map_err(|_| Errno::EINVAL)?;
+        if path.is_empty() {
+            return Err(Errno::ENOENT);
+        }
+        if path.len() >= PATH_MAX {
+            return Err(Errno::ENAMETOOLONG);
+        }
+        if path.as_bytes().contains(&0) {
+            return Err(Errno::EINVAL);
+        }
+        let access = match flags.bits() & 3 {
+            0 => FileAccessMode::ReadOnly,
+            1 => FileAccessMode::WriteOnly,
+            2 => FileAccessMode::ReadWrite,
+            _ => return Err(Errno::EINVAL),
+        };
+        let mut open_flags = FileOpenFlags::NONE;
+        for (guest, broker) in [
+            (OpenFlags::CREAT, FileOpenFlags::CREATE),
+            (OpenFlags::TRUNC, FileOpenFlags::TRUNCATE),
+            (OpenFlags::EXCL, FileOpenFlags::EXCLUSIVE),
+            (OpenFlags::APPEND, FileOpenFlags::APPEND),
+            (OpenFlags::NONBLOCK, FileOpenFlags::NONBLOCKING),
+            (OpenFlags::NOFOLLOW, FileOpenFlags::NO_FOLLOW),
+            (OpenFlags::NOCTTY, FileOpenFlags::NO_CONTROLLING_TERMINAL),
+            (OpenFlags::DIRECTORY, FileOpenFlags::DIRECTORY),
+        ] {
+            if flags.contains(guest) {
+                open_flags = open_flags.union(broker);
+            }
+        }
+        let mut context = litebox::fs::Context::new();
+        context.set_acting_user(FileUser {
+            user: u16::try_from(self.params.euid).map_err(|_| Errno::EINVAL)?,
+            group: u16::try_from(self.params.egid).map_err(|_| Errno::EINVAL)?,
+        });
+        // Until chdir/umask are supported, use cwd "/" and the Linux shim's default umask.
+        let mode = mode & !(FileMode::WGRP | FileMode::WOTH);
+        // Keep the free slot exclusive until open succeeds and the FD is published.
+        // TODO: reserve a slot without holding the FD-table lock across broker IPC.
+        let mut raw = self.files.raw.write();
+        if raw.iter_alive().count() >= MAX_FDS {
+            return Err(Errno::EMFILE);
+        }
+        let file = self
+            .global
+            .litebox
+            .open_file(&context, path, access, open_flags, mode)
+            .map_err(open_error)?;
+        if flags.contains(OpenFlags::CLOEXEC) {
+            // TODO: honor FD_CLOEXEC when macOS exec is implemented.
+            let old = self
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC);
+            assert!(old.is_none());
+        }
+        Ok(u32::try_from(raw.fd_into_raw_integer(file)).expect("fd bounded by MAX_FDS"))
+    }
+
+    pub(crate) fn read_path(&self, path: UserPtr<core::ffi::c_char>) -> Result<String, Errno> {
+        let mut bytes = Vec::new();
+        while bytes.len() < PATH_MAX {
+            let address = path
+                .as_usize()
+                .checked_add(bytes.len())
+                .ok_or(Errno::EFAULT)?;
+            let length = (PAGE_SIZE - address % PAGE_SIZE).min(PATH_MAX - bytes.len());
+            self.check_user_buffer(
+                address,
+                length,
+                litebox::platform::page_mgmt::MemoryRegionPermissions::READ,
+            )?;
+            let chunk = UserPtr::<u8>::from_usize(address)
+                .to_owned_slice::<P>(length)
+                .ok_or(Errno::EFAULT)?;
+            if let Some(end) = chunk.iter().position(|&byte| byte == 0) {
+                bytes.extend_from_slice(&chunk[..end]);
+                return String::from_utf8(bytes).map_err(|_| Errno::EINVAL);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Err(Errno::ENAMETOOLONG)
+    }
+
     pub(crate) fn do_read(&self, fd: &FileFd, buf: &mut [u8]) -> Result<usize, Errno> {
         let size = self
             .global
@@ -116,6 +211,28 @@ impl<P: ShimPlatform> Task<P> {
     }
     pub(crate) fn sys_dup(&self, fd: i32) -> Result<u32, Errno> {
         self.files.dup(fd)
+    }
+}
+
+fn open_error(error: OpenError) -> Errno {
+    match error {
+        OpenError::AccessNotAllowed | OpenError::NoWritePerms => Errno::EACCES,
+        OpenError::ReadOnlyFileSystem => Errno::EROFS,
+        OpenError::AlreadyExists => Errno::EEXIST,
+        OpenError::PathError(error) => match error {
+            PathError::NoSuchFileOrDirectory | PathError::MissingComponent => Errno::ENOENT,
+            PathError::NoSearchPerms { .. } => Errno::EACCES,
+            PathError::InvalidPathname => Errno::EINVAL,
+            PathError::ComponentNotADirectory => Errno::ENOTDIR,
+        },
+        OpenError::TruncateError(error) => match error {
+            TruncateError::ClosedFd => Errno::EBADF,
+            TruncateError::IsDirectory => Errno::EISDIR,
+            TruncateError::NotForWriting => Errno::EACCES,
+            TruncateError::IsTerminalDevice => Errno::EINVAL,
+            TruncateError::Io => Errno::EIO,
+        },
+        _ => Errno::EIO,
     }
 }
 
@@ -160,7 +277,9 @@ mod tests {
     use litebox_broker_protocol::fs::{
         FileAccessMode, FileMode, FileOpenFlags, FileSeekWhence, FileUser,
     };
-    use litebox_common_macos::{PAGE_SIZE, PtRegs, TaskParams, syscall::nr};
+    use litebox_common_macos::{
+        MmapFlags, PAGE_SIZE, PtRegs, TaskParams, VmProtection, syscall::nr,
+    };
     use litebox_platform_macos_userland::MacosUserland as Platform;
 
     #[test]
@@ -288,18 +407,9 @@ mod tests {
         assert_eq!(invoke(nr::CLOSE, 2, 0), Err(Errno::EBADF));
 
         // Invalid output buffers must not advance a file's offset.
-        let fd = task
-            .global
-            .litebox
-            .open_file(
-                &context,
-                "/data",
-                FileAccessMode::ReadOnly,
-                FileOpenFlags::NONE,
-                FileMode::empty(),
-            )
-            .unwrap();
-        let fresh = task.files.insert_file(fd).unwrap() as usize;
+        let fresh = task
+            .sys_open("/data", OpenFlags::RDONLY, FileMode::empty())
+            .unwrap() as usize;
         // SAFETY: the test owns this idle mapping.
         unsafe {
             task.global
@@ -318,6 +428,98 @@ mod tests {
         assert_eq!(invoke(nr::READ, fresh, 2), Ok(2));
         assert_eq!(&*buf.to_owned_slice(2).unwrap(), b"ab");
 
+        let open = |number, path, flags: OpenFlags, mode| {
+            let mut ctx = PtRegs::default();
+            ctx.regs[16] = number;
+            ctx.regs[0] = path;
+            ctx.regs[1] = flags.bits().cast_unsigned() as usize;
+            ctx.regs[2] = mode;
+            task.do_syscall(&ctx)
+        };
+        // The terminator is the last mapped byte: open must not read the next page.
+        let path_offset = MAX_KERNEL_BUF_SIZE - b"/new\0".len();
+        buf.copy_from_slice(path_offset, b"/new\0").unwrap();
+        let path = buf.as_usize() + path_offset;
+        let flags = OpenFlags::RDWR | OpenFlags::CREAT | OpenFlags::EXCL | OpenFlags::CLOEXEC;
+        let created = open(nr::OPEN, path, flags, 0o666).unwrap();
+        let descriptor_flags = |fd| {
+            let fd = task.files.typed_fd(i32::try_from(fd).unwrap()).unwrap();
+            task.global
+                .litebox
+                .descriptor_table()
+                .with_metadata(&fd, |flags: &FileDescriptorFlags| *flags)
+        };
+        let duplicate = invoke(nr::DUP, created, 0).unwrap();
+        assert!(matches!(
+            descriptor_flags(duplicate),
+            Err(litebox::fd::MetadataError::NoSuchMetadata)
+        ));
+        assert_eq!(
+            descriptor_flags(created).unwrap(),
+            FileDescriptorFlags::FD_CLOEXEC
+        );
+        assert_eq!(invoke(nr::CLOSE, duplicate, 0), Ok(0));
+        let status = task
+            .global
+            .litebox
+            .file_status(
+                &task
+                    .files
+                    .typed_fd(i32::try_from(created).unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(status.mode, FileMode::from_u32_bits_truncate(0o644));
+        assert_eq!(
+            status.owner,
+            FileUser {
+                user: 1000,
+                group: 1000
+            }
+        );
+        assert_eq!(
+            open(nr::OPEN_NOCANCEL, path, flags, 0o666),
+            Err(Errno::EEXIST)
+        );
+        buf.copy_from_slice(0, b"new").unwrap();
+        assert_eq!(invoke(nr::WRITE, created, 3), Ok(3));
+        assert_eq!(invoke(nr::CLOSE, created, 0), Ok(0));
+        let reopened = open(nr::OPEN_NOCANCEL, path, OpenFlags::RDONLY, 0).unwrap();
+        assert!(matches!(
+            descriptor_flags(reopened),
+            Err(litebox::fd::MetadataError::NoSuchMetadata)
+        ));
+        assert_eq!(invoke(nr::READ, reopened, 3), Ok(3));
+        assert_eq!(&*buf.to_owned_slice(3).unwrap(), b"new");
+        assert_eq!(invoke(nr::CLOSE_NOCANCEL, reopened, 0), Ok(0));
+        assert_eq!(open(nr::OPEN, 0, OpenFlags::RDONLY, 0), Err(Errno::EFAULT));
+        buf.copy_from_slice(0, &[b'x'; PATH_MAX]).unwrap();
+        assert_eq!(
+            open(nr::OPEN, buf.as_usize(), OpenFlags::RDONLY, 0),
+            Err(Errno::ENAMETOOLONG)
+        );
+        buf.copy_from_slice(0, b"\0").unwrap();
+        assert_eq!(
+            open(nr::OPEN, buf.as_usize(), OpenFlags::RDONLY, 0),
+            Err(Errno::ENOENT)
+        );
+
+        let directory = task
+            .sys_open("/", OpenFlags::RDONLY, FileMode::empty())
+            .unwrap();
+        assert_eq!(
+            task.sys_mmap(
+                0,
+                PAGE_SIZE,
+                VmProtection::READ,
+                MmapFlags::PRIVATE,
+                i32::try_from(directory).unwrap(),
+                0,
+            ),
+            Err(Errno::EINVAL)
+        );
+        task.sys_close(i32::try_from(directory).unwrap()).unwrap();
+
         // Publishing a duplicate is atomic with the descriptor limit check.
         std::thread::scope(|scope| {
             for _ in 0..4 {
@@ -334,7 +536,40 @@ mod tests {
             assert_eq!(task.sys_dup(1), Ok(u32::try_from(expected).unwrap()));
         }
         assert_eq!(task.sys_dup(1), Err(Errno::EMFILE));
+        buf.copy_from_slice(0, b"/data\0").unwrap();
+        assert_eq!(
+            open(
+                nr::OPEN,
+                buf.as_usize(),
+                OpenFlags::WRONLY | OpenFlags::TRUNC,
+                0
+            ),
+            Err(Errno::EMFILE),
+        );
+        let mut contents = [0; 6];
+        assert_eq!(
+            task.global
+                .litebox
+                .read_file(&task.files.typed_fd(1).unwrap(), &mut contents, Some(0),)
+                .unwrap(),
+            6
+        );
+        assert_eq!(&contents, b"abcdXY");
+        buf.copy_from_slice(0, b"/not-created\0").unwrap();
+        assert_eq!(
+            open(
+                nr::OPEN_NOCANCEL,
+                buf.as_usize(),
+                OpenFlags::WRONLY | OpenFlags::CREAT,
+                0o600
+            ),
+            Err(Errno::EMFILE),
+        );
         task.sys_close(12).unwrap();
+        assert_eq!(
+            open(nr::OPEN, buf.as_usize(), OpenFlags::RDONLY, 0),
+            Err(Errno::ENOENT),
+        );
         assert_eq!(task.sys_dup(1), Ok(12));
     }
 }

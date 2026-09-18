@@ -4,7 +4,7 @@
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
 use litebox_common_macos::{TaskParams, VmProtection, loader::MachoParsedFile};
-#[cfg(feature = "test-stdio")]
+#[cfg(feature = "test-broker")]
 use std::io::Write as _;
 use std::{
     path::{Path, PathBuf},
@@ -128,20 +128,24 @@ fn assert_svc_gates(original: &[u8], rewritten: &[u8]) -> usize {
 }
 
 /// Both feature configurations exercise the same AOT pipeline and gate ABI.
-/// test-stdio adds I/O checks; without it the fixture checks stdio is absent.
+/// test-broker adds I/O checks; without it the fixture checks stdio is absent.
 #[test]
 fn static_macho_rewriter_e2e() {
     let dir = tempfile::tempdir().unwrap();
     let source = format!(
         ".set TEST_STDIO, {}\n{}",
-        usize::from(cfg!(feature = "test-stdio")),
+        usize::from(cfg!(feature = "test-broker")),
         include_str!("fixtures/static_macho.S"),
     );
     let binary = assemble(dir.path(), &source);
     let hooked = rewrite(&binary);
     let original = std::fs::read(&binary).unwrap();
     let rewritten = std::fs::read(&hooked).unwrap();
-    let expected_sites = if cfg!(feature = "test-stdio") { 23 } else { 15 };
+    let expected_sites = if cfg!(feature = "test-broker") {
+        23
+    } else {
+        15
+    };
     assert_eq!(assert_svc_gates(&original, &rewritten), expected_sites);
     let parsed = MachoParsedFile::parse(&original).unwrap();
     // Parsing is independent of the byte slice's alignment.
@@ -162,12 +166,12 @@ fn static_macho_rewriter_e2e() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    #[cfg(feature = "test-stdio")]
+    #[cfg(feature = "test-broker")]
     child.stdin.take().unwrap().write_all(b"hello\n").unwrap();
     // No input is needed in the default configuration.
     drop(child.stdin.take());
     let output = child.wait_with_output().unwrap();
-    #[cfg(feature = "test-stdio")]
+    #[cfg(feature = "test-broker")]
     {
         println!("guest stdout: {}", String::from_utf8_lossy(&output.stdout));
         eprintln!("guest stderr: {}", String::from_utf8_lossy(&output.stderr));
@@ -178,7 +182,7 @@ fn static_macho_rewriter_e2e() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let expected: &[u8] = if cfg!(feature = "test-stdio") {
+    let expected: &[u8] = if cfg!(feature = "test-broker") {
         b"hello\n"
     } else {
         b""

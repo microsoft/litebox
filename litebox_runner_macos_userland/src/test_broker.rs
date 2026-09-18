@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! In-process broker fixture for the test-stdio runner feature.
+//! In-process broker fixture for the test-broker runner feature.
 
 use anyhow::{Context as _, Result, anyhow};
 use litebox::LiteBox;
