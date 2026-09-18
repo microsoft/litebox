@@ -651,6 +651,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             .entry_handle(fd)
             .ok_or(ReadError::ClosedFd)?;
         let mut entry = entry.get_entry_mut();
+        if entry.entry.path_only {
+            return Err(ReadError::NotForReading);
+        }
         // XXX(jayb): This over-holds the descriptor-entry lock across backend I/O. We need a
         // smaller per-open-file-description primitive for position/append serialization, so the
         // descriptor entry can be unlocked before potentially blocking backend calls.
@@ -660,9 +663,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         };
         let seek_behavior = entry.entry.seek_behavior;
         if !entry.entry.read_allowed {
-            return Err(ReadError::NotForReading);
-        }
-        if entry.entry.path_only {
             return Err(ReadError::NotForReading);
         }
 
@@ -698,6 +698,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             .entry_handle(fd)
             .ok_or(WriteError::ClosedFd)?;
         let mut entry = entry.get_entry_mut();
+        if entry.entry.path_only {
+            return Err(WriteError::NotForWriting);
+        }
         // XXX(jayb): This over-holds the descriptor-entry lock across backend I/O. We need a
         // smaller per-open-file-description primitive for position/append serialization, so the
         // descriptor entry can be unlocked before potentially blocking backend calls.
@@ -707,9 +710,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         };
         let seek_behavior = entry.entry.seek_behavior;
         if !entry.entry.write_allowed {
-            return Err(WriteError::NotForWriting);
-        }
-        if entry.entry.path_only {
             return Err(WriteError::NotForWriting);
         }
 
