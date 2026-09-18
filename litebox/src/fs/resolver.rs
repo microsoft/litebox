@@ -750,7 +750,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             Handle::Dir(_) => return Err(SeekError::NotAFile),
         };
         if entry.entry.path_only {
-            return Err(SeekError::NonSeekable);
+            return Err(SeekError::NotOpenForSeeking);
         }
 
         match entry.entry.seek_behavior {
@@ -803,10 +803,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             Handle::File(file) => file,
             Handle::Dir(_) => return Err(TruncateError::IsDirectory),
         };
-        if !entry.entry.write_allowed {
-            return Err(TruncateError::NotForWriting);
-        }
         if entry.entry.path_only {
+            return Err(TruncateError::NotOpenForWriting);
+        }
+        if !entry.entry.write_allowed {
             return Err(TruncateError::NotForWriting);
         }
 
@@ -953,7 +953,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             .ok_or(ReadDirError::ClosedFd)?;
         let entry = entry.get_entry();
         if entry.entry.path_only {
-            return Err(ReadDirError::NotADirectory);
+            return Err(ReadDirError::NotOpenForReading);
         }
         let dir = match &entry.entry.handle {
             Handle::File(_) => return Err(ReadDirError::NotADirectory),
