@@ -228,7 +228,8 @@ pub fn sys_brk<
     pm: &litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
     addr: UserPtrMut<u8>,
 ) -> Result<usize, Errno> {
-    unsafe { pm.brk(addr.as_usize()) }.map_err(Errno::from)
+    // On failure, the brk syscall returns the current break, not a negative errno.
+    unsafe { pm.brk(addr.as_usize()).or_else(|_| pm.brk(0)) }.map_err(Errno::from)
 }
 
 pub fn sys_madvise<
