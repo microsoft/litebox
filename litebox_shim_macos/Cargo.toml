@@ -11,6 +11,7 @@ litebox_util_log = { path = "../litebox_util_log", version = "0.1.0" }
 litebox_syscall_rewriter = { path = "../litebox_syscall_rewriter", version = "0.1.0", default-features = false }
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dev-dependencies]
+tempfile = "3"
 litebox_broker_core = { path = "../litebox_broker_core", version = "0.1.0", features = ["test-support"] }
 litebox_broker_host = { path = "../litebox_broker_host", version = "0.1.0", features = ["test-support"] }
 litebox_broker_local = { path = "../litebox_broker_local", version = "0.1.0" }

@@ -10,7 +10,7 @@ use litebox::{
     fd::RawDescriptorStorage,
     fs::{
         BrokerFile, FileFd,
-        errors::{OpenError, PathError, ReadError, TruncateError, WriteError},
+        errors::{FileStatusError, OpenError, PathError, ReadError, TruncateError, WriteError},
     },
     sync::RwLock,
 };
@@ -182,11 +182,18 @@ impl<P: ShimPlatform> Task<P> {
         Err(Errno::ENAMETOOLONG)
     }
 
-    pub(crate) fn do_read(&self, fd: &FileFd, buf: &mut [u8]) -> Result<usize, Errno> {
+    /// Read at an explicit offset without changing the shared offset, or use
+    /// and advance the shared offset when `offset` is `None`.
+    pub(crate) fn do_read(
+        &self,
+        fd: &FileFd,
+        buf: &mut [u8],
+        offset: Option<usize>,
+    ) -> Result<usize, Errno> {
         let size = self
             .global
             .litebox
-            .read_file(fd, buf, None)
+            .read_file(fd, buf, offset)
             .map_err(read_error)?;
         if size > buf.len() {
             return Err(Errno::EIO);
@@ -219,12 +226,7 @@ fn open_error(error: OpenError) -> Errno {
         OpenError::AccessNotAllowed | OpenError::NoWritePerms => Errno::EACCES,
         OpenError::ReadOnlyFileSystem => Errno::EROFS,
         OpenError::AlreadyExists => Errno::EEXIST,
-        OpenError::PathError(error) => match error {
-            PathError::NoSuchFileOrDirectory | PathError::MissingComponent => Errno::ENOENT,
-            PathError::NoSearchPerms { .. } => Errno::EACCES,
-            PathError::InvalidPathname => Errno::EINVAL,
-            PathError::ComponentNotADirectory => Errno::ENOTDIR,
-        },
+        OpenError::PathError(error) => path_error(error),
         OpenError::TruncateError(error) => match error {
             TruncateError::ClosedFd => Errno::EBADF,
             TruncateError::IsDirectory => Errno::EISDIR,
@@ -232,6 +234,23 @@ fn open_error(error: OpenError) -> Errno {
             TruncateError::IsTerminalDevice => Errno::EINVAL,
             TruncateError::Io => Errno::EIO,
         },
+        _ => Errno::EIO,
+    }
+}
+
+fn path_error(error: PathError) -> Errno {
+    match error {
+        PathError::NoSuchFileOrDirectory | PathError::MissingComponent => Errno::ENOENT,
+        PathError::NoSearchPerms { .. } => Errno::EACCES,
+        PathError::InvalidPathname => Errno::EINVAL,
+        PathError::ComponentNotADirectory => Errno::ENOTDIR,
+    }
+}
+
+pub(crate) fn file_status_error(error: FileStatusError) -> Errno {
+    match error {
+        FileStatusError::ClosedFd => Errno::EBADF,
+        FileStatusError::PathError(error) => path_error(error),
         _ => Errno::EIO,
     }
 }
@@ -392,7 +411,15 @@ mod tests {
         assert_eq!(invoke(nr::DUP, 0, 0), Ok(2));
         assert_eq!(invoke(nr::CLOSE, 0, 0), Ok(0));
         assert_eq!(invoke(nr::READ, 0, 2), Err(Errno::EBADF));
-        assert_eq!(task.do_read(&source, &mut [0; 2]), Err(Errno::EBADF));
+        assert_eq!(task.do_read(&source, &mut [0; 2], None), Err(Errno::EBADF));
+        assert_eq!(
+            task.global
+                .litebox
+                .file_status(&source)
+                .map_err(file_status_error)
+                .unwrap_err(),
+            Errno::EBADF
+        );
         assert_eq!(invoke(nr::READ, 2, 2), Ok(2));
         assert_eq!(&*buf.to_owned_slice(2).unwrap(), b"cd");
         buf.copy_from_slice(0, b"XY").unwrap();

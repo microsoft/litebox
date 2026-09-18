@@ -1,17 +1,18 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Validated load plan for the initial static Mach-O subset.
+//! Validated AArch64 Mach-O load plans and universal-binary selection.
 //!
-//! Parsing produces a load plan for thin AArch64 executables with LC_UNIXTHREAD.
-//! Dynamic linking and relocations are unsupported.
-//! Images are slid as a unit, so guest code must be position independent.
+//! Requires static executables with `LC_UNIXTHREAD`; dynamic linking and
+//! relocations are unsupported. Images slide as a unit, so guest code must
+//! be position independent.
 
 use crate::{PAGE_SIZE, VmProtection};
 use alloc::{vec, vec::Vec};
 use core::ops::Range;
+use litebox::utils::ReinterpretSignedExt as _;
 use object::{
-    LittleEndian as LE, macho,
+    BigEndian as BE, LittleEndian as LE, macho,
     read::macho::{MachHeader as _, Segment as _},
 };
 use zerocopy::{
@@ -22,6 +23,7 @@ use zerocopy::{
 const TRAMPOLINE_FILE_ALIGNMENT: usize = 4096;
 const MACH_HEADER_SIZE: usize = size_of::<macho::MachHeader64<LE>>();
 const ARM_THREAD_STATE64: u32 = 6;
+const LOAD_COMMAND_ALIGNMENT: usize = size_of::<u64>();
 
 /// Mach ARM_THREAD_STATE64 payload.
 #[repr(C)]
@@ -56,11 +58,13 @@ struct TrampolineHeader64 {
     trampoline_size: U64<LittleEndian>,
 }
 
-/// Bound both the input file and the reserved virtual span for this subset.
-const MAX_IMAGE_SIZE: usize = 256 * 1024 * 1024;
+/// Shared admission limit for runner reads, shim snapshots and parsed virtual spans.
+pub const MAX_IMAGE_SIZE: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MachoLoaderError {
+    #[error("Mach-O file operation failed: {0}")]
+    File(#[from] crate::errno::Errno),
     #[error("malformed Mach-O: {0}")]
     Invalid(&'static str),
     #[error("unsupported Mach-O: {0}")]
@@ -188,7 +192,9 @@ impl MachoParsedFile {
             )
             || header.filetype(LE) != macho::MH_EXECUTE
         {
-            return Err(Unsupported("expected thin AArch64 MH_EXECUTE (not arm64e)"));
+            return Err(Unsupported(
+                "unexpected file type or architecture (requires arm64, not arm64e)",
+            ));
         }
         if header.flags(LE) & (macho::MH_DYLDLINK | macho::MH_DYLIB_IN_CACHE) != 0 {
             return Err(Unsupported("dynamically linked/shared-cache image"));
@@ -206,7 +212,17 @@ impl MachoParsedFile {
             .map_err(|_| Invalid("load commands"))?;
         let mut segments = Vec::new();
         let mut entry = None;
+        let mut command_bytes = 0usize;
         while let Some(command) = commands.next().map_err(|_| Invalid("load command"))? {
+            let raw = command.raw_data();
+            if raw.len() < size_of::<macho::LoadCommand<LE>>()
+                || !raw.len().is_multiple_of(LOAD_COMMAND_ALIGNMENT)
+            {
+                return Err(Invalid("load command alignment"));
+            }
+            command_bytes = command_bytes
+                .checked_add(raw.len())
+                .ok_or(Invalid("load commands"))?;
             match command.cmd() {
                 macho::LC_LOAD_DYLINKER
                 | macho::LC_LOAD_DYLIB
@@ -266,8 +282,9 @@ impl MachoParsedFile {
                     let file_end = offset
                         .checked_add(file_size)
                         .ok_or(Invalid("file range overflow"))?;
-                    let protection = VmProtection::from_bits(seg.initprot.get(LE).cast_signed())
-                        .ok_or(Invalid("segment protection"))?;
+                    let protection =
+                        VmProtection::from_bits(seg.initprot.get(LE).reinterpret_as_signed())
+                            .ok_or(Invalid("segment protection"))?;
                     if file_size > size
                         || file_end > data.len()
                         || !start.is_multiple_of(PAGE_SIZE)
@@ -288,6 +305,9 @@ impl MachoParsedFile {
                 }
                 _ => {}
             }
+        }
+        if command_bytes != metadata_len - MACH_HEADER_SIZE {
+            return Err(Invalid("load command count/size mismatch"));
         }
         segments.sort_unstable_by_key(|s| s.virtual_range.start);
         if segments
@@ -310,7 +330,7 @@ impl MachoParsedFile {
         if end - start > MAX_IMAGE_SIZE {
             return Err(Unsupported("image larger than 256 MiB"));
         }
-        let entry = entry.ok_or(Unsupported("missing LC_UNIXTHREAD"))?;
+        let entry = entry.ok_or(Unsupported("missing or invalid entry point"))?;
         if !entry.is_multiple_of(size_of::<u32>())
             || !segments.iter().any(|s| {
                 s.protection.contains(VmProtection::EXECUTE)
@@ -328,76 +348,315 @@ impl MachoParsedFile {
     }
 }
 
+/// Select the unique arm64 (not arm64e) slice, or return thin input unchanged.
+///
+/// Pass the returned slice to the parser and rewriter: their file offsets are
+/// slice-relative. Malformed universal headers are rejected, not treated as thin.
+pub fn arm64_slice(data: &[u8]) -> Result<&[u8], MachoLoaderError> {
+    use MachoLoaderError::{Invalid, Unsupported};
+    const HEADER_SIZE: usize = size_of::<macho::FatHeader>();
+    if data.len() > MAX_IMAGE_SIZE {
+        return Err(Unsupported("file larger than 256 MiB"));
+    }
+    let magic = data.get(..size_of::<u32>()).ok_or(Invalid("header"))?;
+    let wide = if magic == macho::FAT_MAGIC.to_be_bytes() {
+        false
+    } else if magic == macho::FAT_MAGIC_64.to_be_bytes() {
+        true
+    } else {
+        return Ok(data);
+    };
+    // object requires aligned storage. Copy only the validated header/table,
+    // not the images, so caller alignment and container size do not drive copies.
+    let mut header_storage = [0u64; HEADER_SIZE.div_ceil(size_of::<u64>())];
+    header_storage.as_mut_bytes()[..HEADER_SIZE]
+        .copy_from_slice(data.get(..HEADER_SIZE).ok_or(Invalid("fat header"))?);
+    let (header, _) = object::pod::from_bytes::<macho::FatHeader>(header_storage.as_bytes())
+        .map_err(|()| Invalid("fat header"))?;
+    let count = usize::try_from(header.nfat_arch.get(BE)).map_err(|_| Invalid("fat table"))?;
+    let stride = if wide {
+        size_of::<macho::FatArch64>()
+    } else {
+        size_of::<macho::FatArch32>()
+    };
+    let table_end = count
+        .checked_mul(stride)
+        .and_then(|n| n.checked_add(HEADER_SIZE))
+        .ok_or(Invalid("fat table"))?;
+    let metadata = data.get(..table_end).ok_or(Invalid("fat table"))?;
+    let mut aligned = vec![0u64; table_end.div_ceil(size_of::<u64>())];
+    aligned.as_mut_bytes()[..table_end].copy_from_slice(metadata);
+    let metadata = &aligned.as_bytes()[..table_end];
+    if wide {
+        let fat = object::read::macho::MachOFatFile64::parse(metadata)
+            .map_err(|_| Invalid("fat table"))?;
+        if fat.arches().iter().any(|arch| arch.reserved.get(BE) != 0) {
+            return Err(Invalid("fat reserved field"));
+        }
+        select_arm64(data, fat.arches(), table_end)
+    } else {
+        let fat = object::read::macho::MachOFatFile32::parse(metadata)
+            .map_err(|_| Invalid("fat table"))?;
+        select_arm64(data, fat.arches(), table_end)
+    }
+}
+
+fn select_arm64<'a, A: object::read::macho::FatArch>(
+    data: &'a [u8],
+    arches: &[A],
+    table_end: usize,
+) -> Result<&'a [u8], MachoLoaderError> {
+    use MachoLoaderError::{Invalid, Unsupported};
+    let mut selected = None;
+    for arch in arches {
+        let offset = usize::try_from(arch.offset().into()).map_err(|_| Invalid("fat offset"))?;
+        let size = usize::try_from(arch.size().into()).map_err(|_| Invalid("fat size"))?;
+        let end = offset.checked_add(size).ok_or(Invalid("fat range"))?;
+        let align = 1usize
+            .checked_shl(arch.align())
+            .ok_or(Invalid("fat alignment"))?;
+        if offset < table_end || size == 0 || !offset.is_multiple_of(align) || end > data.len() {
+            return Err(Invalid("fat slice bounds/alignment"));
+        }
+        if arch.cputype() == macho::CPU_TYPE_ARM64
+            && matches!(
+                arch.cpusubtype(),
+                macho::CPU_SUBTYPE_ARM64_ALL | macho::CPU_SUBTYPE_ARM64_V8
+            )
+        {
+            if selected.is_some() {
+                return Err(Invalid("ambiguous arm64 slices"));
+            }
+            selected = Some(&data[offset..end]);
+        }
+    }
+    selected.ok_or(Unsupported("universal binary has no supported arm64 slice"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::mem::offset_of;
+    use litebox::utils::ReinterpretUnsignedExt as _;
+    type Header = macho::MachHeader64<LE>;
+    type SegmentCommand = macho::SegmentCommand64<LE>;
+    const SEGMENT_START: usize = size_of::<Header>();
+    const THREAD_START: usize = SEGMENT_START + size_of::<SegmentCommand>();
+    const METADATA_END: usize = THREAD_START + size_of::<UnixThreadCommand64>();
+    const FILETYPE: usize = offset_of!(Header, filetype);
+    const COMMAND_COUNT: usize = offset_of!(Header, ncmds);
+    const COMMAND_BYTES: usize = offset_of!(Header, sizeofcmds);
+    const VMADDR: usize = SEGMENT_START + offset_of!(SegmentCommand, vmaddr);
+    const VMSIZE: usize = SEGMENT_START + offset_of!(SegmentCommand, vmsize);
+    const FILEOFF: usize = SEGMENT_START + offset_of!(SegmentCommand, fileoff);
+    const FILESIZE: usize = SEGMENT_START + offset_of!(SegmentCommand, filesize);
+    const PROTECTION: usize = SEGMENT_START + offset_of!(SegmentCommand, initprot);
+    const THREAD_SIZE: usize = THREAD_START + offset_of!(UnixThreadCommand64, cmdsize);
+    const THREAD_FLAVOR: usize = THREAD_START + offset_of!(UnixThreadCommand64, flavor);
+    const THREAD_COUNT: usize = THREAD_START + offset_of!(UnixThreadCommand64, count);
+    const THREAD_PC: usize = THREAD_START
+        + offset_of!(UnixThreadCommand64, state)
+        + offset_of!(Aarch64ThreadState64, pc);
+    const STATE_WORDS: usize = size_of::<Aarch64ThreadState64>() / size_of::<u32>();
+    const IMAGE_BASE: u64 = 0x1_0000_0000;
+    const ENTRY: u64 = IMAGE_BASE + (PAGE_SIZE / 2) as u64;
+
+    fn put32(data: &mut [u8], offset: usize, value: u32) {
+        data[offset..offset + size_of::<u32>()].copy_from_slice(&value.to_le_bytes());
+    }
     // A small synthetic image makes range validation testable on any host.
     fn image() -> Vec<u8> {
         let mut data = vec![0; PAGE_SIZE];
         for (offset, value) in [
-            (0, macho::MH_MAGIC_64),
-            (4, macho::CPU_TYPE_ARM64),
-            (12, macho::MH_EXECUTE),
-            (16, 2),
-            (20, 72 + 288),
-            (32, macho::LC_SEGMENT_64),
-            (36, 72),
+            (offset_of!(Header, magic), macho::MH_MAGIC_64),
+            (offset_of!(Header, cputype), macho::CPU_TYPE_ARM64),
+            (FILETYPE, macho::MH_EXECUTE),
+            (COMMAND_COUNT, 2), // one segment and one thread command
             (
-                92,
+                COMMAND_BYTES,
+                u32::try_from(METADATA_END - SEGMENT_START).unwrap(),
+            ),
+            (
+                SEGMENT_START + offset_of!(SegmentCommand, cmd),
+                macho::LC_SEGMENT_64,
+            ),
+            (
+                SEGMENT_START + offset_of!(SegmentCommand, cmdsize),
+                u32::try_from(size_of::<SegmentCommand>()).unwrap(),
+            ),
+            (
+                PROTECTION,
                 (VmProtection::READ | VmProtection::EXECUTE)
                     .bits()
-                    .cast_unsigned(),
+                    .reinterpret_as_unsigned(),
             ),
-            (104, macho::LC_UNIXTHREAD),
-            (108, 288),
-            (112, 6),
-            (116, 68),
+            (
+                THREAD_START + offset_of!(UnixThreadCommand64, cmd),
+                macho::LC_UNIXTHREAD,
+            ),
+            (
+                THREAD_SIZE,
+                u32::try_from(size_of::<UnixThreadCommand64>()).unwrap(),
+            ),
+            (THREAD_FLAVOR, ARM_THREAD_STATE64),
+            (THREAD_COUNT, u32::try_from(STATE_WORDS).unwrap()),
         ] {
-            data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            put32(&mut data, offset, value);
         }
         for (offset, value) in [
-            (56, 0x1_0000_0000u64),
-            (64, PAGE_SIZE as u64),
-            (80, PAGE_SIZE as u64),
-            (376, 0x1_0000_1000u64),
+            (VMADDR, IMAGE_BASE),
+            (VMSIZE, PAGE_SIZE as u64),
+            (FILESIZE, PAGE_SIZE as u64),
+            (THREAD_PC, ENTRY),
         ] {
-            data[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+            data[offset..offset + size_of::<u64>()].copy_from_slice(&value.to_le_bytes());
         }
         data
+    }
+
+    #[test]
+    fn universal_slices_are_bounded_and_architecture_specific() {
+        use object::{
+            endian::{U32, U64},
+            pod::bytes_of,
+        };
+        const HEADER_SIZE: usize = size_of::<macho::FatHeader>();
+        const COUNT: usize = offset_of!(macho::FatHeader, nfat_arch);
+        let thin = image();
+        assert_eq!(arm64_slice(&thin).unwrap(), thin);
+        for wide in [false, true] {
+            let header = macho::FatHeader {
+                magic: U32::new(
+                    BE,
+                    if wide {
+                        macho::FAT_MAGIC_64
+                    } else {
+                        macho::FAT_MAGIC
+                    },
+                ),
+                nfat_arch: U32::new(BE, 1),
+            };
+            let mut fat = bytes_of(&header).to_vec();
+            let (subtype, offset_field, offset_size, alignment, stride) = if wide {
+                let arch = macho::FatArch64 {
+                    cputype: U32::new(BE, macho::CPU_TYPE_ARM64),
+                    cpusubtype: U32::new(BE, macho::CPU_SUBTYPE_ARM64_ALL),
+                    offset: U64::new(BE, PAGE_SIZE as u64),
+                    size: U64::new(BE, thin.len() as u64),
+                    align: U32::new(BE, PAGE_SIZE.ilog2()),
+                    reserved: U32::new(BE, 0),
+                };
+                fat.extend_from_slice(bytes_of(&arch));
+                (
+                    offset_of!(macho::FatArch64, cpusubtype),
+                    offset_of!(macho::FatArch64, offset),
+                    size_of::<u64>(),
+                    offset_of!(macho::FatArch64, align),
+                    size_of::<macho::FatArch64>(),
+                )
+            } else {
+                let arch = macho::FatArch32 {
+                    cputype: U32::new(BE, macho::CPU_TYPE_ARM64),
+                    cpusubtype: U32::new(BE, macho::CPU_SUBTYPE_ARM64_ALL),
+                    offset: U32::new(BE, u32::try_from(PAGE_SIZE).unwrap()),
+                    size: U32::new(BE, u32::try_from(thin.len()).unwrap()),
+                    align: U32::new(BE, PAGE_SIZE.ilog2()),
+                };
+                fat.extend_from_slice(bytes_of(&arch));
+                (
+                    offset_of!(macho::FatArch32, cpusubtype),
+                    offset_of!(macho::FatArch32, offset),
+                    size_of::<u32>(),
+                    offset_of!(macho::FatArch32, align),
+                    size_of::<macho::FatArch32>(),
+                )
+            };
+            fat.resize(PAGE_SIZE, 0);
+            fat.extend_from_slice(&thin);
+            assert_eq!(arm64_slice(&fat).unwrap(), thin);
+            let mut unaligned = vec![0];
+            unaligned.extend_from_slice(&fat);
+            assert_eq!(arm64_slice(&unaligned[1..]).unwrap(), thin);
+            for len in [
+                size_of::<u32>(),
+                HEADER_SIZE - 1,
+                HEADER_SIZE + stride - 1,
+                PAGE_SIZE,
+                fat.len() - 1,
+            ] {
+                assert!(arm64_slice(&fat[..len]).is_err());
+            }
+            for (offset, value) in [
+                (COUNT, u32::MAX), // table multiplication / bounds
+                (HEADER_SIZE + subtype, macho::CPU_SUBTYPE_ARM64E),
+                (HEADER_SIZE + offset_field, u32::MAX), // slice past EOF
+                (HEADER_SIZE + alignment, usize::BITS), // alignment shift overflow
+            ] {
+                let mut bad = fat.clone();
+                bad[offset..offset + size_of::<u32>()].copy_from_slice(&value.to_be_bytes());
+                assert!(arm64_slice(&bad).is_err(), "wide={wide}, field={offset}");
+            }
+            let mut bad = fat.clone();
+            let start = HEADER_SIZE + offset_field;
+            bad[start..start + offset_size].fill(0); // points into header
+            assert!(arm64_slice(&bad).is_err());
+            if wide {
+                let mut bad = fat.clone();
+                let reserved = HEADER_SIZE + offset_of!(macho::FatArch64, reserved);
+                bad[reserved..reserved + size_of::<u32>()].copy_from_slice(&1u32.to_be_bytes());
+                assert!(arm64_slice(&bad).is_err());
+            }
+            fat[COUNT..COUNT + size_of::<u32>()].copy_from_slice(&2u32.to_be_bytes());
+            fat.copy_within(HEADER_SIZE..HEADER_SIZE + stride, HEADER_SIZE + stride);
+            assert!(arm64_slice(&fat).is_err()); // ambiguous arm64 slices
+        }
     }
 
     #[test]
     fn segment_and_entry_validation() {
         let data = image();
         let parsed = MachoParsedFile::parse(&data).unwrap();
-        assert_eq!(parsed.entry, 0x1_0000_1000);
+        assert_eq!(parsed.entry, usize::try_from(ENTRY).unwrap());
         assert_eq!(parsed.virtual_range.len(), PAGE_SIZE);
         for (offset, value) in [
-            (56, u64::MAX - 0x3fff),      // vmaddr + vmsize overflow
-            (64, 1),                      // unaligned vmsize
-            (64, 0),                      // filesize > vmsize
-            (72, u64::MAX),               // fileoff + filesize overflow
-            (80, (PAGE_SIZE + 1) as u64), // file data past EOF
-            (376, 0),                     // entry outside executable memory
-            (376, 0x1_0000_1001),         // unaligned PC
+            (VMADDR, u64::MAX - (PAGE_SIZE - 1) as u64), // vmaddr + vmsize overflow
+            (VMSIZE, 1),                                 // unaligned vmsize
+            (VMSIZE, 0),                                 // filesize > vmsize
+            (FILEOFF, u64::MAX),                         // fileoff + filesize overflow
+            (FILESIZE, (PAGE_SIZE + 1) as u64),          // file data past EOF
+            (THREAD_PC, 0),                              // entry outside executable memory
+            (THREAD_PC, ENTRY + 1),                      // unaligned PC
         ] {
             let mut bad = data.clone();
-            bad[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+            bad[offset..offset + size_of::<u64>()].copy_from_slice(&value.to_le_bytes());
             assert!(
                 MachoParsedFile::parse(&bad).is_err(),
                 "offset={offset} value={value:#x}"
             );
         }
-        for (offset, value) in [(112, 0u32), (116, 67), (116, 69), (108, 280), (92, 1 << 31)] {
+        for (offset, value) in [
+            (THREAD_FLAVOR, 0),
+            (THREAD_COUNT, u32::try_from(STATE_WORDS - 1).unwrap()),
+            (THREAD_COUNT, u32::try_from(STATE_WORDS + 1).unwrap()),
+            (
+                THREAD_SIZE,
+                u32::try_from(size_of::<UnixThreadCommand64>() - LOAD_COMMAND_ALIGNMENT).unwrap(),
+            ),
+            (PROTECTION, u32::MAX),
+        ] {
             let mut bad = data.clone();
-            bad[offset..offset + size_of::<u32>()].copy_from_slice(&value.to_le_bytes());
+            put32(&mut bad, offset, value);
             assert!(
                 MachoParsedFile::parse(&bad).is_err(),
                 "accepted invalid field at {offset}"
             );
         }
         let mut writable_code = data;
-        writable_code[92..96].copy_from_slice(&VmProtection::all().bits().to_le_bytes());
+        put32(
+            &mut writable_code,
+            PROTECTION,
+            VmProtection::all().bits().reinterpret_as_unsigned(),
+        );
         assert!(matches!(
             MachoParsedFile::parse(&writable_code),
             Err(MachoLoaderError::Unsupported(_))
@@ -408,7 +667,7 @@ mod tests {
     fn load_command_copy_is_bounded_by_the_file() {
         let mut data = image();
         // A huge sizeofcmds must be rejected before allocating its claimed size.
-        data[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
+        put32(&mut data, COMMAND_BYTES, u32::MAX);
         assert!(matches!(
             MachoParsedFile::parse(&data),
             Err(MachoLoaderError::Invalid("load commands"))
@@ -421,36 +680,53 @@ mod tests {
         unaligned.extend_from_slice(&data);
         let parsed = MachoParsedFile::parse(&unaligned[1..]).unwrap();
         assert_eq!(parsed.segments[0].file_range, 0..PAGE_SIZE);
-        assert!(parsed.segments[0].file_range.end > 32 + 72 + 288);
+        assert!(parsed.segments[0].file_range.end > METADATA_END);
         // Truncate valid metadata at header, command, and file-data boundaries.
-        for len in [0, 4, 31, 32, 103, 104, 391, 392, data.len() - 1] {
+        for len in [
+            0,
+            size_of::<u32>(),
+            SEGMENT_START - 1,
+            SEGMENT_START,
+            THREAD_START - 1,
+            THREAD_START,
+            METADATA_END - 1,
+            METADATA_END,
+            data.len() - 1,
+        ] {
             assert!(
                 MachoParsedFile::parse(&data[..len]).is_err(),
                 "accepted truncation at {len}"
             );
         }
-        let mut excessive_commands = data;
-        excessive_commands[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert!(MachoParsedFile::parse(&excessive_commands).is_err());
+        let mut invalid_count = data;
+        for count in [1, u32::MAX] {
+            put32(&mut invalid_count, COMMAND_COUNT, count);
+            assert!(MachoParsedFile::parse(&invalid_count).is_err());
+        }
     }
 
     #[test]
     fn trampoline_footer_is_bounded_and_disjoint() {
+        const TRAMPOLINE_BYTES: usize = litebox_syscall_rewriter::aarch64::GATE_ALIGNMENT;
         let mut data = image();
         let file_offset = data.len();
-        data.extend_from_slice(&[0u8; 64]);
+        data.extend_from_slice(&[0u8; TRAMPOLINE_BYTES]);
         let header = TrampolineHeader64 {
             magic: *litebox_syscall_rewriter::TRAMPOLINE_MAGIC,
             file_offset: (file_offset as u64).into(),
-            vaddr: 0x1_0000_4000.into(),
-            trampoline_size: 64.into(),
+            vaddr: (IMAGE_BASE + PAGE_SIZE as u64).into(),
+            trampoline_size: (TRAMPOLINE_BYTES as u64).into(),
         };
         let footer = data.len();
         data.extend_from_slice(header.as_bytes());
         let mut plan = MachoParsedFile::parse(&data).unwrap();
         let trampoline = plan.parse_trampoline(&data).unwrap().unwrap();
-        assert_eq!(trampoline.file_range, file_offset..file_offset + 64);
-        assert_eq!(plan.virtual_range, 0x1_0000_0000..0x1_0000_8000);
+        assert_eq!(
+            trampoline.file_range,
+            file_offset..file_offset + TRAMPOLINE_BYTES
+        );
+        let base = usize::try_from(IMAGE_BASE).unwrap();
+        assert_eq!(plan.virtual_range, base..base + 2 * PAGE_SIZE);
         for invalid_header in [
             TrampolineHeader64 {
                 file_offset: 1.into(),
@@ -461,7 +737,7 @@ mod tests {
                 ..header
             },
             TrampolineHeader64 {
-                vaddr: 0x1_0000_0000.into(),
+                vaddr: IMAGE_BASE.into(),
                 ..header
             },
             TrampolineHeader64 {
@@ -469,11 +745,11 @@ mod tests {
                 ..header
             },
             TrampolineHeader64 {
-                trampoline_size: 63.into(),
+                trampoline_size: ((TRAMPOLINE_BYTES - 1) as u64).into(),
                 ..header
             },
             TrampolineHeader64 {
-                trampoline_size: 68.into(),
+                trampoline_size: ((TRAMPOLINE_BYTES + size_of::<u32>()) as u64).into(),
                 ..header
             },
             TrampolineHeader64 {
