@@ -1785,7 +1785,6 @@ dependencies = [
  "litebox_util_log",
  "object",
  "once_cell",
- "rangemap",
  "ringbuf",
  "spin 0.9.8",
  "syscalls",

@@ -1515,9 +1515,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         unsafe { self.global.pm.release_memory(release) }
             .expect("failed to release memory mappings");
 
-        // Every tracked ELF mapping and trampoline died with the old address space.
-        self.global.elf_patch_cache.lock().clear();
-
         self.global
             .platform
             .set_arch_specific_register(&ArchSpecificRegister::FsBase, 0)
