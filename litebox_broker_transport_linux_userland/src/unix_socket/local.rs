@@ -323,8 +323,7 @@ impl LocalCallChannel for UnixControlRingLocalCallChannel {
         let request_id = request.request_id;
         let pending_call = if matches!(
             &request.operation,
-            BrokerOperation::AcknowledgeProcessStart(_)
-                | BrokerOperation::ReportProcessStartFailure(_)
+            BrokerOperation::ReportProcessStartFailure(_)
         ) {
             association
                 .pending_calls
@@ -775,7 +774,7 @@ mod control_ring_tests {
     }
 
     #[test]
-    fn pending_capacity_preserves_process_start_calls() {
+    fn pending_capacity_preserves_process_start_failure_reports() {
         use litebox_broker_transport::pending_calls::{
             MAX_ORDINARY_PENDING_CALLS, RESERVED_PENDING_CALL_CAPACITY,
         };
@@ -800,8 +799,8 @@ mod control_ring_tests {
                 reserved_start.wait();
                 reserved_channel.call(BrokerRequest {
                     request_id: RequestId((MAX_ORDINARY_PENDING_CALLS + 1 + index) as u64),
-                    operation: BrokerOperation::AcknowledgeProcessStart(
-                        litebox_broker_protocol::process::ProcessStartToken(index as u64),
+                    operation: BrokerOperation::ReportProcessStartFailure(
+                        litebox_broker_protocol::error::ErrorCode::UnsupportedOperation,
                     ),
                 })
             })
@@ -814,14 +813,14 @@ mod control_ring_tests {
         }
         assert!(published.iter().any(|request| matches!(
             &request.operation,
-            BrokerOperation::AcknowledgeProcessStart(_)
+            BrokerOperation::ReportProcessStartFailure(_)
         )));
         assert_eq!(
             published
                 .iter()
                 .filter(|request| matches!(
                     &request.operation,
-                    BrokerOperation::AcknowledgeProcessStart(_)
+                    BrokerOperation::ReportProcessStartFailure(_)
                 ))
                 .count(),
             RESERVED_PENDING_CALL_CAPACITY

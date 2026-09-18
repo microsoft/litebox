@@ -514,7 +514,6 @@ fn handle_request<Memory: SharedMemory>(
             handle_file_request(process, request, shared_buffers).map(BrokerResult::File)
         }
         BrokerOperation::StartProcess(_)
-        | BrokerOperation::AcknowledgeProcessStart(_)
         | BrokerOperation::ReportProcessReady(_)
         | BrokerOperation::ReportProcessStartFailure(_) => {
             Err(RequestFailure::Respond(ErrorCode::UnsupportedOperation))

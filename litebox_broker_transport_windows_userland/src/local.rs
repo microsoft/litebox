@@ -232,8 +232,7 @@ impl LocalCallChannel for WindowsControlRingLocalCallChannel {
         let request_id = request.request_id;
         let pending_call = if matches!(
             &request.operation,
-            BrokerOperation::AcknowledgeProcessStart(_)
-                | BrokerOperation::ReportProcessStartFailure(_)
+            BrokerOperation::ReportProcessStartFailure(_)
         ) {
             association
                 .pending_calls

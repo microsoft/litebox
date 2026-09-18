@@ -17,7 +17,7 @@ use crate::pipe::{
     CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
     WritePipeResponse,
 };
-use crate::process::{ProcessStartToken, ProcessStartupDescriptor, StartedProcess};
+use crate::process::{ProcessStartupDescriptor, StartedProcess};
 use crate::readiness::ReadinessFlags;
 use crate::shared_buffer::SharedBufferSequence;
 use crate::socket::{
@@ -67,8 +67,6 @@ pub enum BrokerOperation {
     File(FileRequest),
     /// Start one child process from an opaque platform bootstrap.
     StartProcess(ProcessStartupDescriptor),
-    /// Commit a child process after its start result reaches the parent.
-    AcknowledgeProcessStart(ProcessStartToken),
     /// Report that this child process is ready to begin guest execution.
     ReportProcessReady(Option<ThreadId>),
     /// Report that this child rejected its startup data before becoming ready.
@@ -129,7 +127,6 @@ impl BrokerOperation {
             | Self::File(
                 FileRequest::Seek(_) | FileRequest::Truncate(_) | FileRequest::HandleStatus(_),
             )
-            | Self::AcknowledgeProcessStart(_)
             | Self::ReportProcessReady(_)
             | Self::ReportProcessStartFailure(_) => None,
         }
@@ -249,13 +246,11 @@ pub enum BrokerResult {
     Stdio(StdioResponse),
     /// File response family.
     File(FileResponse),
-    /// A child was materialized and is ready for parent acknowledgement.
+    /// A child completed broker startup.
     ProcessStarted(StartedProcess),
-    /// Parent acknowledgement committed the child.
-    ProcessStartAcknowledged,
-    /// A child-start failure was reported or observed before commit.
+    /// A child-start failure was reported or observed before startup completed.
     ProcessStartFailed(ErrorCode),
-    /// Parent acknowledgement released the child.
+    /// The broker accepted the child's ready report.
     ProcessReady,
     /// Operation failed with an ABI-neutral broker error.
     Error(ErrorCode),

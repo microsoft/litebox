@@ -22,11 +22,6 @@ pub struct ProcessBootstrapFormat(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProcessBootstrapVersion(pub u16);
 
-/// Association-scoped token for acknowledging a child process start.
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ProcessStartToken(pub u64);
-
 /// Ordered broker-object handles inherited by a child.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct InheritedProcessObjects {
@@ -90,11 +85,9 @@ pub struct ProcessStartupData {
     pub inherited_objects: InheritedProcessObjects,
 }
 
-/// Reports a materialized child that is ready for parent acknowledgement.
+/// Reports a child process that completed broker startup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StartedProcess {
-    /// Token that must be acknowledged before the child may begin guest execution.
-    pub token: ProcessStartToken,
     /// Broker-assigned child process ID.
     pub process_id: ProcessId,
     /// Broker-assigned initial thread ID when it differs from the process ID.

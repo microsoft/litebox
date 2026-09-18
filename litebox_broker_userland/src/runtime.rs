@@ -29,9 +29,8 @@ use litebox_broker_core::{BrokerCore, BrokerProcess};
 use litebox_broker_host::{
     BrokerHostAssociation, BrokerHostError, ConnectionTermination, setup_connection,
 };
-use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::error::ErrorCode;
-use litebox_broker_protocol::message::{BrokerOperation, BrokerRequest};
+use litebox_broker_protocol::message::BrokerRequest;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_LAYOUT;
 use litebox_broker_transport::channel::{
     HostAssociationShutdown, HostNotificationChannel, HostReceive, HostRequestSource,
@@ -44,8 +43,6 @@ use crate::readiness::ReadinessPublisherRuntime;
 use crate::runner::{RunnerProcessManager, RunnerStartup};
 
 const REQUEST_QUEUE_CAPACITY: usize = 64;
-pub(crate) const PROCESS_START_CONTROL_WORKER_COUNT: usize = crate::WORKER_COUNT;
-pub(crate) const PROCESS_START_CONTROL_QUEUE_CAPACITY: usize = crate::WORKER_COUNT;
 const REQUEST_QUEUE_RETRY_DELAY: Duration = Duration::from_millis(1);
 const REQUEST_QUEUE_STALL_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -509,22 +506,16 @@ where
                 "process association terminated by process-start control",
             ));
         });
-        if let Err(error) = process_manager
-            .register_association(association.process_id(), Arc::clone(&association_failure))
+        if let Err(error) =
+            process_manager.register_association(association.process_id(), association_failure)
         {
             failure_coordinator.report(error);
-        } else {
-            process_manager
-                .install_process_association_failure(association.process_id(), association_failure);
         }
     }
     let (request_sender, request_receiver) = sync_channel(REQUEST_QUEUE_CAPACITY);
     let request_receiver = Arc::new(Mutex::new(request_receiver));
-    let (process_start_sender, process_start_receiver) =
-        sync_channel(PROCESS_START_CONTROL_QUEUE_CAPACITY);
-    let process_start_receiver = Arc::new(Mutex::new(process_start_receiver));
 
-    let association_drain = std::thread::scope(|scope| {
+    std::thread::scope(|scope| {
         let publisher_readiness = Arc::clone(&readiness);
         let publisher_failure_coordinator = Arc::clone(&failure_coordinator);
         let publisher = std::thread::Builder::new()
@@ -561,32 +552,7 @@ where
             association: &association,
         };
 
-        let mut workers =
-            Vec::with_capacity(crate::WORKER_COUNT + PROCESS_START_CONTROL_WORKER_COUNT);
-        for worker_id in 0..PROCESS_START_CONTROL_WORKER_COUNT {
-            let association = Arc::clone(&association);
-            let process_start_receiver = Arc::clone(&process_start_receiver);
-            let response_sink = response_sink.clone();
-            let worker_failure_coordinator = Arc::clone(&failure_coordinator);
-            let process_manager_for_worker = process_manager.clone();
-            match std::thread::Builder::new()
-                .name(format!("litebox-broker-process-start-worker-{worker_id}"))
-                .spawn_scoped(scope, move || {
-                    run_worker(
-                        &association,
-                        &process_start_receiver,
-                        &response_sink,
-                        &worker_failure_coordinator,
-                        process_manager_for_worker.as_ref(),
-                    );
-                }) {
-                Ok(worker) => workers.push(worker),
-                Err(error) => {
-                    failure_coordinator.report(error);
-                    break;
-                }
-            }
-        }
+        let mut workers = Vec::with_capacity(crate::WORKER_COUNT);
         for worker_id in 0..crate::WORKER_COUNT {
             let association = Arc::clone(&association);
             let request_receiver = Arc::clone(&request_receiver);
@@ -612,18 +578,11 @@ where
             }
         }
 
-        read_requests(
-            &mut request_source,
-            request_sender,
-            process_start_sender,
-            &failure_coordinator,
-            process_manager.as_ref(),
-            process_id,
-        );
+        read_requests(&mut request_source, request_sender, &failure_coordinator);
         drop(cancellation);
-        let association_drain = process_manager
-            .as_ref()
-            .map(|process_manager| process_manager.association_ending(process_id));
+        if let Some(process_manager) = &process_manager {
+            process_manager.association_ending(process_id);
+        }
         for worker in workers {
             if worker.join().is_err() {
                 failure_coordinator.report_panic(IoError::other("broker request worker panicked"));
@@ -643,12 +602,10 @@ where
         {
             failure_coordinator.report_panic(IoError::other("broker readiness publisher panicked"));
         }
-        association_drain
     });
 
-    if let (Some(process_manager), Some(association_drain)) = (&process_manager, association_drain)
-    {
-        process_manager.association_ended(process_id, association_drain);
+    if let Some(process_manager) = &process_manager {
+        process_manager.association_ended(process_id);
     }
 
     let result = match failure_coordinator.take_error() {
@@ -676,10 +633,7 @@ where
 fn read_requests<RequestSource, Shutdown>(
     request_source: &mut RequestSource,
     request_sender: SyncSender<BrokerRequest>,
-    process_start_sender: SyncSender<BrokerRequest>,
     failure_coordinator: &HostAssociationFailureCoordinator<Shutdown>,
-    process_manager: Option<&Arc<RunnerProcessManager>>,
-    process_id: ProcessId,
 ) where
     RequestSource: HostRequestSource<Error = IoError>,
     Shutdown: HostAssociationShutdown<Error = IoError>,
@@ -690,24 +644,8 @@ fn read_requests<RequestSource, Shutdown>(
         }
         match request_source.recv_request() {
             Ok(HostReceive::Message(request)) => {
-                if let BrokerOperation::AcknowledgeProcessStart(token) = &request.operation
-                    && let Some(process_manager) = process_manager
-                    && let Err(error) = process_manager.admit_acknowledgement(process_id, *token)
-                {
-                    failure_coordinator.report(map_host_error(BrokerHostError::Broker(error)));
-                    break;
-                }
-                let sender = if matches!(
-                    &request.operation,
-                    BrokerOperation::AcknowledgeProcessStart(_)
-                        | BrokerOperation::ReportProcessStartFailure(_)
-                ) {
-                    &process_start_sender
-                } else {
-                    &request_sender
-                };
                 if !enqueue_request(
-                    sender,
+                    &request_sender,
                     request,
                     failure_coordinator,
                     REQUEST_QUEUE_STALL_TIMEOUT,
@@ -792,7 +730,6 @@ fn run_worker<Memory, ResponseSink, Shutdown>(
             continue;
         }
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let process_id = association.process_id();
             association.execute_request_with(
                 request,
                 |process, operation, shared_buffers| {
@@ -801,11 +738,7 @@ fn run_worker<Memory, ResponseSink, Shutdown>(
                     })
                 },
                 |response| response_sink.send_response(response),
-                |operation, result| {
-                    if let Some(process_manager) = process_manager {
-                        process_manager.response_sent(process_id, operation, result);
-                    }
-                },
+                |_, _| {},
             )
         })) {
             Ok(Ok(()) | Err(BrokerHostError::AssociationFailed)) => {}

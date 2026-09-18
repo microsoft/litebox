@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 
 use litebox_broker_core::BrokerCore;
 
+use crate::runtime::AssociationFailureCause;
+
 #[cfg(target_os = "linux")]
 mod linux;
 mod process_manager;
@@ -108,6 +110,43 @@ enum RunnerShutdownState {
     Firing,
     Fired,
     Retired,
+}
+
+struct RunnerCompletion {
+    result: IoResult<ExitStatus>,
+    runner_success: Option<bool>,
+    runner_signal: Option<i32>,
+    runner_exit_code: Option<i32>,
+    termination_provenance: TerminationProvenance,
+    association_panicked: bool,
+    shutdown_observation_failed: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct TerminationProvenance(u8);
+
+impl TerminationProvenance {
+    const BROKER_TERMINATION: u8 = 1;
+    const REPORTED_START_FAILURE: u8 = 2;
+
+    const fn new(broker_termination: bool, reported_start_failure: bool) -> Self {
+        let mut value = 0;
+        if broker_termination {
+            value |= Self::BROKER_TERMINATION;
+        }
+        if reported_start_failure {
+            value |= Self::REPORTED_START_FAILURE;
+        }
+        Self(value)
+    }
+
+    const fn broker_termination(self) -> bool {
+        self.0 & Self::BROKER_TERMINATION != 0
+    }
+
+    const fn reported_start_failure(self) -> bool {
+        self.0 & Self::REPORTED_START_FAILURE != 0
+    }
 }
 
 impl RunnerShutdown {
@@ -256,6 +295,88 @@ impl RunnerInstance {
         runner_exited?;
         association_result.result?;
         Ok(runner_status)
+    }
+
+    fn run_started_process_to_completion(
+        mut self,
+        startup: RunnerStartup,
+        process_manager: Arc<RunnerProcessManager>,
+    ) -> RunnerCompletion {
+        let transaction = startup.transaction();
+        transaction.install_shutdown(Arc::clone(&self.shutdown));
+        let association_result = self
+            .endpoint
+            .serve(&self.runner, Some(startup), process_manager);
+        self.endpoint.close();
+        let shutdown_request = transaction.shutdown_request();
+        let shutdown_was_expected = shutdown_request.was_expected();
+        if association_result.abnormal {
+            transaction.mark_abnormal();
+        }
+        let runner_exited = if !shutdown_was_expected
+            && matches!(
+                association_result.failure_cause,
+                AssociationFailureCause::None | AssociationFailureCause::PeerClosed
+            )
+            && !association_result.panicked
+        {
+            self.shutdown
+                .wait_for_exit(PROCESS_EXIT_OBSERVATION_TIMEOUT)
+        } else {
+            self.shutdown.has_exited()
+        };
+        let shutdown_observation_failed = match runner_exited {
+            Ok(true) => {
+                if association_result.failure_cause == AssociationFailureCause::Other {
+                    transaction.mark_abnormal();
+                }
+                false
+            }
+            Ok(false) => {
+                if !shutdown_was_expected
+                    || association_result.failure_cause == AssociationFailureCause::Other
+                {
+                    transaction.mark_abnormal();
+                }
+                transaction.mark_shutdown_expected();
+                self.shutdown.shutdown();
+                false
+            }
+            Err(_) => {
+                transaction.mark_abnormal();
+                self.shutdown.shutdown();
+                true
+            }
+        };
+        self.shutdown.retire();
+        let runner_status = wait_for_runner_exit(&self.runner);
+        if runner_status.is_err() {
+            transaction.mark_abnormal();
+        }
+        let runner_success = runner_status.as_ref().ok().map(ExitStatus::success);
+        let runner_signal = runner_status
+            .as_ref()
+            .ok()
+            .copied()
+            .and_then(runner_exit_signal);
+        let runner_exit_code = runner_status.as_ref().ok().and_then(ExitStatus::code);
+        let termination_provenance = TerminationProvenance::new(
+            self.shutdown.termination_was_dispatched(),
+            shutdown_request.expected_start_failure_was_reported(),
+        );
+        let result = runner_status.and_then(|status| {
+            association_result.result?;
+            Ok(status)
+        });
+        RunnerCompletion {
+            result,
+            runner_success,
+            runner_signal,
+            runner_exit_code,
+            termination_provenance,
+            association_panicked: association_result.panicked,
+            shutdown_observation_failed,
+        }
     }
 }
 

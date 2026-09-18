@@ -27,7 +27,6 @@ use litebox_broker_transport_linux_userland::unix_socket::{
 const RUNNER_ARGUMENT: &str = "broker-userland-test-runner";
 const NETWORK_RUNNER_ARGUMENT: &str = "broker-userland-network-test-runner";
 const CHILD_START_RUNNER_ARGUMENT: &str = "broker-userland-child-start-runner";
-const CHILD_CANCEL_RUNNER_ARGUMENT: &str = "broker-userland-child-cancel-runner";
 const TEST_BOOTSTRAP_FORMAT: ProcessBootstrapFormat = ProcessBootstrapFormat(0x7465_7374);
 const FAILING_BOOTSTRAP_FORMAT: ProcessBootstrapFormat = ProcessBootstrapFormat(0x6661_696c);
 const BROKER_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
@@ -73,19 +72,6 @@ fn run_parent_test() {
     assert!(child_result.starts_with("ready:"));
     assert!(child_result.ends_with("\nstarted\nfinished\n"));
     std::fs::remove_file(child_marker).unwrap();
-
-    let cancelled_marker = unique_child_marker_path();
-    let mut cancel_command = Command::new(env!("CARGO_BIN_EXE_litebox-broker-userland"));
-    cancel_command
-        .arg("--runner")
-        .arg(&test_executable)
-        .arg(CHILD_CANCEL_RUNNER_ARGUMENT)
-        .arg(&cancelled_marker);
-    wait_for_broker(cancel_command);
-    let cancelled_result = std::fs::read_to_string(&cancelled_marker).unwrap();
-    assert!(cancelled_result.starts_with("ready:"));
-    assert_eq!(cancelled_result.lines().count(), 1);
-    std::fs::remove_file(cancelled_marker).unwrap();
 
     let gateway = std::net::Ipv4Addr::new(10, 0, 2, 1);
     let tcp_listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -278,32 +264,10 @@ fn run_fake_runner(args: &[OsString]) {
             )
             .unwrap();
         assert_eq!(started.initial_thread_id, None);
-        let ready = format!("ready:{}\n", started.process_id.0);
-        wait_for_marker(marker, &ready);
-        std::thread::sleep(Duration::from_millis(100));
-        assert_eq!(std::fs::read_to_string(marker).unwrap(), ready);
-        local.acknowledge_process_start(started.token).unwrap();
-        return;
-    }
-    if args.get(3).and_then(|argument| argument.to_str()) == Some(CHILD_CANCEL_RUNNER_ARGUMENT) {
-        assert_eq!(args.len(), 5, "unexpected runner arguments: {args:?}");
-        let marker = Path::new(&args[4]);
-        let bootstrap = marker.as_os_str().as_encoded_bytes();
-        let inherited_event = local.create_event_with_count(1).unwrap();
-        let started = local
-            .request_process_start(
-                TEST_BOOTSTRAP_FORMAT,
-                ProcessBootstrapVersion(1),
-                SharedBufferSequence::new(
-                    &[SharedBufferSlotIndex(0)],
-                    bootstrap.len().try_into().unwrap(),
-                )
-                .unwrap(),
-                bootstrap,
-                InheritedProcessObjects::new(&[inherited_event]).unwrap(),
-            )
-            .unwrap();
-        wait_for_marker(marker, &format!("ready:{}\n", started.process_id.0));
+        wait_for_marker(
+            marker,
+            &format!("ready:{}\nstarted\nfinished\n", started.process_id.0),
+        );
         return;
     }
     assert_eq!(

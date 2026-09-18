@@ -13,7 +13,7 @@ use litebox_broker_protocol::message::BrokerResponse;
 
 /// Maximum number of active calls waiting for broker responses.
 pub const MAX_PENDING_CALLS: usize = 64;
-/// Pending-call capacity unavailable to ordinary operations.
+/// Pending-call capacity reserved for control requests that must report failure.
 pub const RESERVED_PENDING_CALL_CAPACITY: usize = 8;
 /// Maximum active ordinary calls after preserving reserved capacity.
 pub const MAX_ORDINARY_PENDING_CALLS: usize = MAX_PENDING_CALLS - RESERVED_PENDING_CALL_CAPACITY;

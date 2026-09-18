@@ -6,7 +6,7 @@ use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult};
 use litebox_broker_protocol::process::{
     InheritedProcessObjects, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessBootstrapFormat,
-    ProcessBootstrapVersion, ProcessStartToken, ProcessStartupDescriptor, StartedProcess,
+    ProcessBootstrapVersion, ProcessStartupDescriptor, StartedProcess,
 };
 use litebox_broker_protocol::shared_buffer::SharedBufferSequence;
 use litebox_broker_transport::channel::LocalCallChannel;
@@ -16,9 +16,9 @@ use crate::{BrokerLocal, BrokerLocalError, Result};
 impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     /// Requests materialization of one child process.
     ///
-    /// The returned token must be acknowledged before the child may begin
-    /// guest execution. The caller must retain exclusive ownership of the
-    /// bootstrap sequence until this method returns.
+    /// This call blocks until the child reports ready or startup fails. The
+    /// caller must retain exclusive ownership of the bootstrap sequence until
+    /// this method returns.
     ///
     /// # Panics
     ///
@@ -48,27 +48,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Acknowledges a successful process-start result and releases the child.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the broker returns a response for another operation.
-    pub fn acknowledge_process_start(
-        &self,
-        token: ProcessStartToken,
-    ) -> Result<(), Channel::Error> {
-        match self.request(BrokerOperation::AcknowledgeProcessStart(token))? {
-            BrokerResult::ProcessStartAcknowledged => Ok(()),
-            BrokerResult::ProcessStartFailed(error) | BrokerResult::Error(error) => {
-                Err(BrokerLocalError::Broker(error))
-            }
-            response => {
-                panic!("broker returned unexpected process-start acknowledgement: {response:?}")
-            }
-        }
-    }
-
-    /// Reports that this child process is ready and waits for parent acknowledgement.
+    /// Reports that this child process is ready and waits for broker startup completion.
     ///
     /// # Panics
     ///

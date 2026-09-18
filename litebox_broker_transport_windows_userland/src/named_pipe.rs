@@ -507,14 +507,14 @@ mod tests {
             }
             assert!(published.iter().any(|request| matches!(
                 &request.operation,
-                BrokerOperation::AcknowledgeProcessStart(_)
+                BrokerOperation::ReportProcessStartFailure(_)
             )));
             assert_eq!(
                 published
                     .iter()
                     .filter(|request| matches!(
                         &request.operation,
-                        BrokerOperation::AcknowledgeProcessStart(_)
+                        BrokerOperation::ReportProcessStartFailure(_)
                     ))
                     .count(),
                 RESERVED_PENDING_CALL_CAPACITY
@@ -575,8 +575,8 @@ mod tests {
                 reserved_start.wait();
                 reserved_calls.call(BrokerRequest {
                     request_id: RequestId((MAX_ORDINARY_PENDING_CALLS + 1 + index) as u64),
-                    operation: BrokerOperation::AcknowledgeProcessStart(
-                        litebox_broker_protocol::process::ProcessStartToken(index as u64),
+                    operation: BrokerOperation::ReportProcessStartFailure(
+                        litebox_broker_protocol::error::ErrorCode::UnsupportedOperation,
                     ),
                 })
             })

@@ -128,7 +128,6 @@ pub struct BrokerProcess {
 pub(crate) enum ProcessState {
     Attaching,
     StartReady { initial_thread_id: Option<ThreadId> },
-    StartCommitted { initial_thread_id: Option<ThreadId> },
     Running,
     Exiting,
 }
@@ -177,13 +176,10 @@ impl BrokerProcess {
         self.caller_credential
     }
 
-    /// Returns whether parent acknowledgement committed this process.
+    /// Returns whether this process completed broker startup.
     #[must_use]
     pub fn is_running(&self) -> bool {
-        matches!(
-            *self.state.lock(),
-            ProcessState::StartCommitted { .. } | ProcessState::Running
-        )
+        matches!(*self.state.lock(), ProcessState::Running)
     }
 
     /// Records the initial thread supplied by `ProcessReady`.
@@ -192,9 +188,9 @@ impl BrokerProcess {
         match *state {
             ProcessState::Attaching => {}
             ProcessState::Exiting => return Err(BrokerError::PeerClosed),
-            ProcessState::StartReady { .. }
-            | ProcessState::StartCommitted { .. }
-            | ProcessState::Running => return Err(BrokerError::Internal),
+            ProcessState::StartReady { .. } | ProcessState::Running => {
+                return Err(BrokerError::Internal);
+            }
         }
         if let Some(thread_id) = initial_thread_id
             && !self.threads.lock().contains_key(&thread_id)
@@ -205,32 +201,15 @@ impl BrokerProcess {
         Ok(())
     }
 
-    /// Commits this child after its start result reaches the parent.
-    pub fn commit_start(&self) -> Result<()> {
-        let mut state = self.state.lock();
-        match *state {
-            ProcessState::StartReady { initial_thread_id } => {
-                *state = ProcessState::StartCommitted { initial_thread_id };
-                Ok(())
-            }
-            ProcessState::Attaching
-            | ProcessState::StartCommitted { .. }
-            | ProcessState::Running => Err(BrokerError::Internal),
-            ProcessState::Exiting => Err(BrokerError::PeerClosed),
-        }
-    }
-
-    /// Completes startup after the acknowledgement response is published.
+    /// Completes startup after the runner reports ready.
     pub fn complete_start(&self) -> Result<()> {
         let mut state = self.state.lock();
         match *state {
-            ProcessState::StartCommitted { .. } => {
+            ProcessState::StartReady { .. } => {
                 *state = ProcessState::Running;
                 Ok(())
             }
-            ProcessState::Attaching | ProcessState::StartReady { .. } | ProcessState::Running => {
-                Err(BrokerError::Internal)
-            }
+            ProcessState::Attaching | ProcessState::Running => Err(BrokerError::Internal),
             ProcessState::Exiting => Err(BrokerError::PeerClosed),
         }
     }
@@ -320,8 +299,6 @@ impl BrokerProcess {
         if matches!(
             *state,
             ProcessState::StartReady {
-                initial_thread_id: Some(pinned),
-            } | ProcessState::StartCommitted {
                 initial_thread_id: Some(pinned),
             } if pinned == thread_id
         ) {
@@ -984,7 +961,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_states_defer_initial_thread_exit_until_publication_completes() {
+    fn startup_states_defer_initial_thread_exit_until_start_completes() {
         let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
@@ -998,17 +975,15 @@ mod tests {
 
         process.mark_start_ready(Some(thread)).unwrap();
         assert_eq!(process.exit_thread(thread), Err(BrokerError::WouldBlock));
-        process.commit_start().unwrap();
-        assert!(process.is_running());
-        assert_eq!(process.exit_thread(thread), Err(BrokerError::WouldBlock));
         process.complete_start().unwrap();
+        assert!(process.is_running());
         assert_eq!(process.exit_thread(thread), Ok(()));
         process.cleanup(true);
         parent.cleanup(true);
     }
 
     #[test]
-    fn child_is_parented_and_requires_commit() {
+    fn child_is_parented_and_requires_start_completion() {
         let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
@@ -1030,20 +1005,13 @@ mod tests {
         assert!(!child.is_running());
 
         child.mark_start_ready(None).unwrap();
-        child.commit_start().unwrap();
-        assert!(child.is_running());
-        assert!(matches!(
-            *child.state.lock(),
-            ProcessState::StartCommitted {
-                initial_thread_id: None
-            }
-        ));
         child.complete_start().unwrap();
+        assert!(child.is_running());
         assert_eq!(*child.state.lock(), ProcessState::Running);
     }
 
     #[test]
-    fn finished_uncommitted_child_releases_process_capacity() {
+    fn finished_attaching_child_releases_process_capacity() {
         let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
@@ -1064,7 +1032,7 @@ mod tests {
     }
 
     #[test]
-    fn child_cannot_commit_after_teardown() {
+    fn child_cannot_complete_start_after_teardown() {
         let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
@@ -1079,7 +1047,7 @@ mod tests {
         child.cleanup(true);
         child.cleanup(true);
 
-        assert_eq!(child.commit_start(), Err(BrokerError::PeerClosed));
+        assert_eq!(child.complete_start(), Err(BrokerError::PeerClosed));
         let (replacement, _) = parent.create_child(&[]).unwrap();
         replacement.cleanup(true);
     }

@@ -24,7 +24,7 @@ use crate::message::{
 };
 use crate::process::{
     InheritedProcessObjects, MAX_INHERITED_PROCESS_OBJECTS, ProcessBootstrapFormat,
-    ProcessBootstrapVersion, ProcessStartToken, ProcessStartupDescriptor, StartedProcess,
+    ProcessBootstrapVersion, ProcessStartupDescriptor, StartedProcess,
 };
 use crate::readiness::ReadinessFlags;
 
@@ -49,7 +49,7 @@ const REQUEST_TAG_FILE: u8 = 8;
 const REQUEST_TAG_CREATE_THREAD: u8 = 9;
 const REQUEST_TAG_EXIT_THREAD: u8 = 10;
 const REQUEST_TAG_START_PROCESS: u8 = 11;
-const REQUEST_TAG_ACKNOWLEDGE_PROCESS_START: u8 = 12;
+// Tag 12 is reserved for the removed process-start acknowledgement.
 const REQUEST_TAG_PROCESS_READY: u8 = 13;
 const REQUEST_TAG_REPORT_PROCESS_START_FAILURE: u8 = 14;
 
@@ -66,7 +66,7 @@ const RESPONSE_TAG_FILE: u8 = 8;
 const RESPONSE_TAG_THREAD_CREATED: u8 = 9;
 const RESPONSE_TAG_THREAD_EXITED: u8 = 10;
 const RESPONSE_TAG_PROCESS_STARTED: u8 = 11;
-const RESPONSE_TAG_PROCESS_START_ACKNOWLEDGED: u8 = 12;
+// Tag 12 is reserved for the removed process-start acknowledgement.
 const RESPONSE_TAG_PROCESS_READY: u8 = 13;
 const RESPONSE_TAG_PROCESS_START_FAILED: u8 = 14;
 
@@ -129,7 +129,6 @@ pub fn decode_handshake_request(frame: &[u8]) -> Result<BrokerHandshakeRequest, 
         | REQUEST_TAG_CREATE_THREAD
         | REQUEST_TAG_EXIT_THREAD
         | REQUEST_TAG_START_PROCESS
-        | REQUEST_TAG_ACKNOWLEDGE_PROCESS_START
         | REQUEST_TAG_PROCESS_READY
         | REQUEST_TAG_REPORT_PROCESS_START_FAILURE => {
             return Err(WireError::WrongMessagePhase);
@@ -213,11 +212,6 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
             encoder.shared_buffer_sequence(buffer);
             encode_inherited_objects(&mut encoder, inherited_objects);
         }
-        BrokerOperation::AcknowledgeProcessStart(token) => {
-            encoder.u8(REQUEST_TAG_ACKNOWLEDGE_PROCESS_START);
-            encoder.request_id(request_id);
-            encoder.u64(token.0);
-        }
         BrokerOperation::ReportProcessReady(initial_thread_id) => {
             encoder.u8(REQUEST_TAG_PROCESS_READY);
             encoder.request_id(request_id);
@@ -249,7 +243,6 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         | REQUEST_TAG_CREATE_THREAD
         | REQUEST_TAG_EXIT_THREAD
         | REQUEST_TAG_START_PROCESS
-        | REQUEST_TAG_ACKNOWLEDGE_PROCESS_START
         | REQUEST_TAG_PROCESS_READY
         | REQUEST_TAG_REPORT_PROCESS_START_FAILURE => {}
         _ => return Err(WireError::InvalidTag),
@@ -272,9 +265,6 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
             buffer: decoder.shared_buffer_sequence()?,
             inherited_objects: decode_inherited_objects(&mut decoder)?,
         }),
-        REQUEST_TAG_ACKNOWLEDGE_PROCESS_START => {
-            BrokerOperation::AcknowledgeProcessStart(ProcessStartToken(decoder.u64()?))
-        }
         REQUEST_TAG_PROCESS_READY => {
             BrokerOperation::ReportProcessReady(decode_optional_thread_id(&mut decoder)?)
         }
@@ -366,7 +356,6 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
         | RESPONSE_TAG_THREAD_CREATED
         | RESPONSE_TAG_THREAD_EXITED
         | RESPONSE_TAG_PROCESS_STARTED
-        | RESPONSE_TAG_PROCESS_START_ACKNOWLEDGED
         | RESPONSE_TAG_PROCESS_START_FAILED
         | RESPONSE_TAG_PROCESS_READY => {
             return Err(WireError::WrongMessagePhase);
@@ -439,19 +428,13 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
             fs::encode_fs_response(&mut encoder, response);
         }
         BrokerResult::ProcessStarted(StartedProcess {
-            token,
             process_id,
             initial_thread_id,
         }) => {
             encoder.u8(RESPONSE_TAG_PROCESS_STARTED);
             encoder.request_id(request_id);
-            encoder.u64(token.0);
             encoder.process_id(process_id);
             encode_optional_thread_id(&mut encoder, initial_thread_id);
-        }
-        BrokerResult::ProcessStartAcknowledged => {
-            encoder.u8(RESPONSE_TAG_PROCESS_START_ACKNOWLEDGED);
-            encoder.request_id(request_id);
         }
         BrokerResult::ProcessStartFailed(error) => {
             encoder.u8(RESPONSE_TAG_PROCESS_START_FAILED);
@@ -491,7 +474,6 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         | RESPONSE_TAG_THREAD_CREATED
         | RESPONSE_TAG_THREAD_EXITED
         | RESPONSE_TAG_PROCESS_STARTED
-        | RESPONSE_TAG_PROCESS_START_ACKNOWLEDGED
         | RESPONSE_TAG_PROCESS_START_FAILED
         | RESPONSE_TAG_PROCESS_READY => {}
         _ => return Err(WireError::InvalidTag),
@@ -510,11 +492,9 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         RESPONSE_TAG_STDIO => BrokerResult::Stdio(stdio::decode_stdio_response(&mut decoder)?),
         RESPONSE_TAG_FILE => BrokerResult::File(fs::decode_fs_response(&mut decoder)?),
         RESPONSE_TAG_PROCESS_STARTED => BrokerResult::ProcessStarted(StartedProcess {
-            token: ProcessStartToken(decoder.u64()?),
             process_id: decoder.process_id()?,
             initial_thread_id: decode_optional_thread_id(&mut decoder)?,
         }),
-        RESPONSE_TAG_PROCESS_START_ACKNOWLEDGED => BrokerResult::ProcessStartAcknowledged,
         RESPONSE_TAG_PROCESS_START_FAILED => {
             BrokerResult::ProcessStartFailed(decode_error_code(&mut decoder)?)
         }
@@ -655,7 +635,7 @@ mod tests {
     };
     use crate::process::{
         InheritedProcessObjects, ProcessBootstrapFormat, ProcessBootstrapVersion,
-        ProcessStartToken, ProcessStartupDescriptor, StartedProcess,
+        ProcessStartupDescriptor, StartedProcess,
     };
     use crate::shared_buffer::{SharedBufferSequence, SharedBufferSlotIndex};
     use crate::socket::{
@@ -715,7 +695,6 @@ mod tests {
                 RESPONSE_TAG_THREAD_CREATED,
                 RESPONSE_TAG_THREAD_EXITED,
                 RESPONSE_TAG_PROCESS_STARTED,
-                RESPONSE_TAG_PROCESS_START_ACKNOWLEDGED,
                 RESPONSE_TAG_PROCESS_READY,
                 RESPONSE_TAG_PROCESS_START_FAILED,
             ],
@@ -732,7 +711,6 @@ mod tests {
                 REQUEST_TAG_CREATE_THREAD,
                 REQUEST_TAG_EXIT_THREAD,
                 REQUEST_TAG_START_PROCESS,
-                REQUEST_TAG_ACKNOWLEDGE_PROCESS_START,
                 REQUEST_TAG_PROCESS_READY,
                 REQUEST_TAG_REPORT_PROCESS_START_FAILURE,
             ]
@@ -1015,7 +993,6 @@ mod tests {
                 ])
                 .unwrap(),
             }),
-            BrokerOperation::AcknowledgeProcessStart(ProcessStartToken(u64::MAX)),
             BrokerOperation::ReportProcessReady(None),
             BrokerOperation::ReportProcessReady(Some(thread_id(19))),
             BrokerOperation::ReportProcessStartFailure(ErrorCode::UnsupportedOperation),
@@ -1363,16 +1340,13 @@ mod tests {
             BrokerResult::File(FileResponse::Rmdir),
             BrokerResult::File(FileResponse::Failed(FileError::Io)),
             BrokerResult::ProcessStarted(StartedProcess {
-                token: ProcessStartToken(u64::MAX),
                 process_id: process_id(u32::MAX),
                 initial_thread_id: None,
             }),
             BrokerResult::ProcessStarted(StartedProcess {
-                token: ProcessStartToken(7),
                 process_id: process_id(9),
                 initial_thread_id: Some(thread_id(11)),
             }),
-            BrokerResult::ProcessStartAcknowledged,
             BrokerResult::ProcessStartFailed(ErrorCode::PeerClosed),
             BrokerResult::ProcessReady,
             BrokerResult::Error(ErrorCode::PolicyDenied),
