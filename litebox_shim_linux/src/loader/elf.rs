@@ -25,6 +25,7 @@ struct ElfFile<'a, Platform: ShimPlatform> {
     task: &'a Task<Platform>,
     fd: i32,
     load_high: bool,
+    runtime_trampoline_room: usize,
 }
 
 impl<'a, Platform: ShimPlatform> ElfFile<'a, Platform> {
@@ -36,6 +37,7 @@ impl<'a, Platform: ShimPlatform> ElfFile<'a, Platform> {
             task,
             fd,
             load_high: false,
+            runtime_trampoline_room: 0,
         })
     }
 }
@@ -85,7 +87,20 @@ impl<Platform: ShimPlatform> litebox_common_linux::loader::MapMemory for ElfFile
     fn reserve(&mut self, len: usize, align: usize) -> Result<usize, Self::Error> {
         // Allocate a mapping large enough that even if it's maximally misaligned we can
         // still fit `len` bytes.
-        let mapping_len = len + (align.max(PAGE_SIZE) - PAGE_SIZE);
+        // Include the runtime trampoline and initial heap in address selection,
+        // even when the low hint is occupied and placement falls back to top-down.
+        // Unmap this extra tail below: runtime rewriting uses NOREPLACE to claim
+        // its trampoline, and brk must be able to grow into unoccupied pages.
+        let heap_headroom = if self.load_high {
+            0
+        } else {
+            litebox::mm::linux::DEFAULT_RESERVED_SPACE_SIZE
+        };
+        let mapping_len = len
+            .checked_add(align.max(PAGE_SIZE) - PAGE_SIZE)
+            .and_then(|len| len.checked_add(self.runtime_trampoline_room))
+            .and_then(|len| len.checked_add(heap_headroom))
+            .ok_or(Errno::ENOMEM)?;
         let hint = if self.load_high {
             // Reserve the interpreter top-down by passing no hint: LiteBox's
             // `get_unmmaped_area` then runs its top-down search and returns
@@ -246,6 +261,8 @@ impl<'a, Platform: ShimPlatform> FileAndParsed<'a, Platform> {
         } else {
             None
         };
+        self.file.runtime_trampoline_room =
+            reserve.map_or(0, |size| size + litebox_common_linux::HOST_PAGE_SIZE);
         let result = self.parsed.load(&mut self.file, &mut &*platform, reserve)?;
         #[cfg(target_arch = "aarch64")]
         if self.parsed.has_trampoline()
@@ -503,6 +520,35 @@ mod tests {
             buf[INTERP_PATH_OFFSET..INTERP_PATH_OFFSET + interp.len()].copy_from_slice(interp);
         }
         buf
+    }
+
+    #[test]
+    fn pie_fallback_placement_leaves_room_for_trampoline_and_heap() {
+        let task = crate::syscalls::tests::init_platform();
+        let hint = crate::loader::DEFAULT_LOW_ADDR;
+        // An occupied low hint must trigger the same top-down fallback as a
+        // host mapping discovered in the macOS reserved-pages snapshot.
+        match task.sys_mmap(
+            hint,
+            PAGE_SIZE,
+            litebox_common_linux::ProtFlags::PROT_NONE,
+            MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
+            -1,
+            0,
+        ) {
+            Ok(_) | Err(Errno::EEXIST) => {}
+            Err(error) => panic!("could not occupy the low ELF hint: {error}"),
+        }
+        crate::syscalls::tests::create_file(&task, "/main", &minimal_elf(ET_DYN, None));
+        let mut loader = ElfLoader::new(&task, "/main").unwrap();
+        let main = loader.main.load_mapped(task.global.platform).unwrap();
+        assert_ne!(main.base_addr, hint);
+        let limit = <TestPlatform as PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MAX;
+        assert!(
+            main.brk <= limit - litebox::mm::linux::DEFAULT_RESERVED_SPACE_SIZE,
+            "initial brk {:#x} leaves no heap headroom below {limit:#x}",
+            main.brk,
+        );
     }
 
     #[test]

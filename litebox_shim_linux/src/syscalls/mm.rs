@@ -1626,6 +1626,21 @@ mod tests {
     use crate::UserPtrMut;
     use crate::syscalls::tests::{TestPlatform as Platform, create_file, init_platform};
 
+    #[test]
+    fn brk_failure_returns_current_break_instead_of_errno() {
+        let task = init_platform();
+        let limit =
+            <Platform as litebox::platform::PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MAX;
+        let initial = limit - PAGE_SIZE;
+        task.global.pm.set_initial_brk(initial);
+        assert_eq!(task.sys_brk(UserPtrMut::from_usize(0)), Ok(initial));
+        assert_eq!(
+            task.sys_brk(UserPtrMut::from_usize(limit + PAGE_SIZE)),
+            Ok(initial)
+        );
+        assert_eq!(task.sys_brk(UserPtrMut::from_usize(0)), Ok(initial));
+    }
+
     fn runtime_patch_state(
         file_mappings: BTreeSet<(usize, usize)>,
         trampoline_addr: usize,
