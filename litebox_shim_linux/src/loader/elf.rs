@@ -85,7 +85,14 @@ impl<Platform: ShimPlatform> litebox_common_linux::loader::MapMemory for ElfFile
     fn reserve(&mut self, len: usize, align: usize) -> Result<usize, Self::Error> {
         // Allocate a mapping large enough that even if it's maximally misaligned we can
         // still fit `len` bytes.
-        let mapping_len = len + (align.max(PAGE_SIZE) - PAGE_SIZE);
+        // Keep room for the runtime trampoline and native-page rounding when
+        // placement falls back to the top of the address space. The existing
+        // tail trim releases this space for trampoline allocation and brk.
+        let mapping_len = len
+            .checked_add(align.max(PAGE_SIZE) - PAGE_SIZE)
+            .and_then(|len| len.checked_add(litebox::mm::linux::DEFAULT_RESERVED_SPACE_SIZE))
+            .and_then(|len| len.checked_add(litebox_common_linux::HOST_PAGE_SIZE))
+            .ok_or(Errno::ENOMEM)?;
         let hint = if self.load_high {
             // Reserve the interpreter top-down by passing no hint: LiteBox's
             // `get_unmmaped_area` then runs its top-down search and returns
@@ -503,6 +510,35 @@ mod tests {
             buf[INTERP_PATH_OFFSET..INTERP_PATH_OFFSET + interp.len()].copy_from_slice(interp);
         }
         buf
+    }
+
+    #[test]
+    fn pie_fallback_placement_leaves_room_for_trampoline_and_heap() {
+        let task = crate::syscalls::tests::init_platform();
+        let hint = crate::loader::DEFAULT_LOW_ADDR;
+        // An occupied low hint must trigger the same top-down fallback as a
+        // host mapping discovered in the macOS reserved-pages snapshot.
+        match task.sys_mmap(
+            hint,
+            PAGE_SIZE,
+            litebox_common_linux::ProtFlags::PROT_NONE,
+            MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
+            -1,
+            0,
+        ) {
+            Ok(_) | Err(Errno::EEXIST) => {}
+            Err(error) => panic!("could not occupy the low ELF hint: {error}"),
+        }
+        crate::syscalls::tests::create_file(&task, "/main", &minimal_elf(ET_DYN, None));
+        let mut loader = ElfLoader::new(&task, "/main").unwrap();
+        let main = loader.main.load_mapped(task.global.platform).unwrap();
+        assert_ne!(main.base_addr, hint);
+        let limit = <TestPlatform as PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MAX;
+        assert!(
+            main.brk <= limit - PAGE_SIZE,
+            "initial brk {:#x} leaves no heap headroom below {limit:#x}",
+            main.brk,
+        );
     }
 
     #[test]
