@@ -255,17 +255,19 @@ impl PerCpuVariables {
             .map(|(_, page_table)| Arc::clone(page_table))
     }
 
+    /// Replaces and returns the active task page table.
+    ///
     /// # Safety
     ///
     /// CR3 must no longer reference the previous table. A new ID must match
     /// CR3. Interrupts must be disabled, and this must not run in exception context.
-    pub(crate) unsafe fn set_active_page_table(
+    pub(crate) unsafe fn replace_active_page_table(
         &self,
         page_table: Option<(usize, Arc<crate::mm::PageTable<PAGE_SIZE>>)>,
-    ) {
-        // Safety: Only this core accesses the field, interrupts are disabled,
-        // and the update cannot fault.
-        unsafe { *self.active_page_table.get() = page_table }
+    ) -> Option<(usize, Arc<crate::mm::PageTable<PAGE_SIZE>>)> {
+        // Safety: Core-local, IRQs are disabled, and the update cannot fault.
+        // Return the old owner so the caller can drop it after restoring IRQs.
+        unsafe { core::mem::replace(&mut *self.active_page_table.get(), page_table) }
     }
 }
 

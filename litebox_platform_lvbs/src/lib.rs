@@ -198,7 +198,7 @@ impl core::ops::Deref for PageTableHandle<'_> {
 /// Future work could implement KPTI-style isolation to reduce the kernel attack surface
 /// exposed to user TAs, mitigating potential side-channel attacks.
 pub struct PageTableManager {
-    /// The base page table, containing only VTL1 kernel mappings (no user-space).
+    /// The base (kernel) page table; lives for the kernel's lifetime and is never dropped.
     base_page_table: mm::PageTable<PAGE_SIZE>,
     /// Cached physical frame of the base page table (for fast CR3 comparison).
     base_page_table_frame: PhysFrame<Size4KiB>,
@@ -249,6 +249,18 @@ impl PageTableManager {
         );
     }
 
+    /// Returns an owning handle to a registered task page table.
+    ///
+    /// The table remains alive while this handle exists.
+    pub fn task_page_table(&self, task_pt_id: usize) -> Result<PageTableHandle<'_>, Errno> {
+        if task_pt_id == BASE_PAGE_TABLE_ID {
+            return Err(Errno::EINVAL);
+        }
+        let task_pts = self.task_page_tables.read();
+        let page_table = Arc::clone(task_pts.get(&task_pt_id).ok_or(Errno::ENOENT)?);
+        Ok(PageTableHandle::task(page_table))
+    }
+
     /// Returns the ID of the current page table based on the CR3 register.
     ///
     /// Returns `BASE_PAGE_TABLE_ID` (0) if the base page table is active,
@@ -287,15 +299,16 @@ impl PageTableManager {
     ///   after the switch (including the code being executed and stack)
     /// - No references to user-space memory are held across the switch
     pub unsafe fn load_base(&self) {
-        x86_64::instructions::interrupts::without_interrupts(|| {
-            // Ensure decreasing/dropping `Arc` for the previous page table (`set_active_page_table()`)
-            // only after switching CR3 (`mm::PageTable::load()`).
+        let previous = x86_64::instructions::interrupts::without_interrupts(|| {
+            // Replace the per-CPU owner only after CR3 stops referencing it.
             self.base_page_table.load();
             with_per_cpu_variables(|pcv| {
                 // Safety: CR3 now references the base page table and interrupts are disabled.
-                unsafe { pcv.set_active_page_table(None) }
-            });
+                unsafe { pcv.replace_active_page_table(None) }
+            })
         });
+        // Last-owner reclamation must run with IRQs enabled.
+        drop(previous);
     }
 
     /// Loads the specified task page table by updating CR3.
@@ -323,15 +336,16 @@ impl PageTableManager {
             Arc::clone(task_pts.get(&task_pt_id).ok_or(Errno::ENOENT)?)
         };
 
-        x86_64::instructions::interrupts::without_interrupts(|| {
-            // Ensure decreasing/dropping `Arc` for the previous page table (`set_active_page_table()`)
-            // only after switching CR3 (`mm::PageTable::load()`).
+        let previous = x86_64::instructions::interrupts::without_interrupts(|| {
+            // Replace the per-CPU owner only after CR3 stops referencing it.
             pt.load();
             with_per_cpu_variables(|pcv| {
                 // Safety: CR3 now references `pt` and interrupts are disabled.
-                unsafe { pcv.set_active_page_table(Some((task_pt_id, pt))) }
-            });
+                unsafe { pcv.replace_active_page_table(Some((task_pt_id, pt))) }
+            })
         });
+        // Last-owner reclamation must run with IRQs enabled.
+        drop(previous);
         Ok(())
     }
 
@@ -363,63 +377,25 @@ impl PageTableManager {
         Ok(task_pt_id)
     }
 
-    /// Deletes a task page table by its ID.
-    ///
-    /// This function:
-    /// 1. Clean up page table structure frames (P1-P3)
-    /// 2. Drop the page table (deallocating the top-level P4 frame)
-    ///
-    /// # Arguments
-    ///
-    /// * `task_pt_id` - The ID of the task page table to delete
+    /// Unregisters a task table; retained handles keep it alive.
     ///
     /// # Safety
     ///
-    /// The caller must ensure that:
-    /// - All user data frames have been released before calling this function
-    /// - No references or pointers to memory mapped by this page table are held after deletion
+    /// The caller must ensure final destruction is safe: user leaf frames are
+    /// exclusively owned and no access outlives all remaining handles.
     ///
-    /// # Returns
-    ///
-    /// - `Ok(())` if the page table was successfully deleted
-    /// - `Err(Errno::EINVAL)` if the page table ID is the base page table
-    /// - `Err(Errno::ENOENT)` if the page table ID does not exist
-    /// - `Err(Errno::EBUSY)` if the page table is active or has outstanding handles
-    pub unsafe fn delete_task_page_table(&self, task_pt_id: usize) -> Result<(), Errno> {
+    /// Returns `EINVAL` for the base ID and `ENOENT` if it is not registered.
+    pub unsafe fn unregister_task_page_table(&self, task_pt_id: usize) -> Result<(), Errno> {
         if task_pt_id == BASE_PAGE_TABLE_ID {
             return Err(Errno::EINVAL);
         }
 
-        let mut task_pts = self.task_page_tables.write();
-
-        // Fast path for the page table active on this core.
-        let (cr3_frame, _) = x86_64::registers::control::Cr3::read();
-        let cr3_id: usize = cr3_frame.start_address().as_u64().trunc();
-        if cr3_id == task_pt_id {
-            return Err(Errno::EBUSY);
-        }
-
-        if let Some(pt) = task_pts.remove(&task_pt_id) {
-            // An active CR3 retains a per-CPU Arc.
-            let pt = match Arc::try_unwrap(pt) {
-                Ok(pt) => pt,
-                Err(pt) => {
-                    task_pts.insert(task_pt_id, pt);
-                    return Err(Errno::EBUSY);
-                }
-            };
-            drop(task_pts);
-
-            // Safety: successful unwrap proves the table is neither active nor
-            // borrowed. Kernel slots are base-owned and must not be freed.
-            unsafe {
-                pt.cleanup_page_table_frames();
-            }
-            // The PageTable's Drop impl will deallocate the top-level (P4) frame
-            Ok(())
-        } else {
-            Err(Errno::ENOENT)
-        }
+        let pt = {
+            let mut task_pts = self.task_page_tables.write();
+            task_pts.remove(&task_pt_id).ok_or(Errno::ENOENT)?
+        };
+        drop(pt);
+        Ok(())
     }
 }
 
@@ -725,27 +701,17 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         self.page_table_manager.create_task_page_table()
     }
 
-    /// Deletes a task page table by its ID.
-    ///
-    /// This function:
-    /// 1. Cleans up page table structure frames (P1-P3)
-    /// 2. Drops the page table (deallocating the top-level P4 frame)
+    /// Unregisters a task table; retained handles keep it alive.
     ///
     /// # Safety
     ///
-    /// The caller must ensure that:
-    /// - All user data frames have been released before calling this function
-    /// - No references or pointers to memory mapped by this page table are held after deletion
-    ///
-    /// # Returns
-    ///
-    /// - `Ok(())` if successful
-    /// - `Err(Errno::EINVAL)` if the page table is the base page table
-    /// - `Err(Errno::ENOENT)` if the page table doesn't exist
-    /// - `Err(Errno::EBUSY)` if the page table is active or has outstanding handles
-    pub unsafe fn delete_task_page_table(&self, task_pt_id: usize) -> Result<(), Errno> {
-        // Safety: caller guarantees no dangling references
-        unsafe { self.page_table_manager.delete_task_page_table(task_pt_id) }
+    /// See [`PageTableManager::unregister_task_page_table`].
+    pub unsafe fn unregister_task_page_table(&self, task_pt_id: usize) -> Result<(), Errno> {
+        // Safety: the caller upholds the manager's destruction requirements.
+        unsafe {
+            self.page_table_manager
+                .unregister_task_page_table(task_pt_id)
+        }
     }
 
     /// Switch to the specified page table.
