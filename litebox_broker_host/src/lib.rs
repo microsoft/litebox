@@ -130,7 +130,7 @@ impl<Memory: SharedMemory> BrokerHostAssociation<'_, Memory> {
 
     /// Completes non-unwinding association teardown and releases its process ID.
     pub fn finish(self) {
-        BrokerProcess::finish(self.process);
+        self.process.cleanup(true);
     }
 
     /// Executes one active request and emits its response.
@@ -395,13 +395,13 @@ where
         let process_retained = retain_process(&process);
         if let Err(error) = setup_channel.send_handshake_response(&response) {
             if finish_on_setup_error && !process_retained {
-                BrokerProcess::finish(process);
+                process.cleanup(true);
             }
             return Err(BrokerHostError::Channel(error));
         }
         if let Err(error) = send_shared_memory(setup_channel) {
             if finish_on_setup_error && !process_retained {
-                BrokerProcess::finish(process);
+                process.cleanup(true);
             }
             return Err(BrokerHostError::Channel(error));
         }
@@ -1637,7 +1637,7 @@ mod tests {
             .unwrap()
             .expect("deployment owner must retain the negotiated process");
         assert!(process.is_running());
-        process.finish();
+        process.cleanup(true);
     }
 
     fn association_shared_buffer_sequences_stage_file_data(broker: &BrokerCore) {

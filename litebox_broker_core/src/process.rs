@@ -77,10 +77,6 @@ struct ProcessReferences {
     pending_handles: usize,
 }
 
-struct ProcessThreads {
-    entries: HashMap<ThreadId, BrokerThread>,
-}
-
 /// Broker-owned state for one guest thread.
 ///
 /// Execution remains platform-local. This object owns the authoritative
@@ -119,7 +115,7 @@ pub struct BrokerProcess {
     /// Handles of the live object references owned by this process.
     references: Mutex<ProcessReferences>,
     /// Authoritative broker threads owned by this process.
-    threads: Mutex<ProcessThreads>,
+    threads: Mutex<HashMap<ThreadId, BrokerThread>>,
     /// Pipe capacity charged to this process by live pipe objects.
     pub(crate) reserved_pipe_capacity: Arc<AtomicUsize>,
     /// Socket quota held by pending, live, and closing in-flight resources.
@@ -156,9 +152,7 @@ impl BrokerProcess {
                 handles: Vec::new(),
                 pending_handles: 0,
             }),
-            threads: Mutex::new(ProcessThreads {
-                entries: HashMap::new(),
-            }),
+            threads: Mutex::new(HashMap::new()),
             reserved_pipe_capacity: Arc::new(AtomicUsize::new(0)),
             reserved_sockets: Arc::new(AtomicUsize::new(0)),
             cancellation: AssociationCancellation::default(),
@@ -203,7 +197,7 @@ impl BrokerProcess {
             | ProcessState::Running => return Err(BrokerError::Internal),
         }
         if let Some(thread_id) = initial_thread_id
-            && !self.threads.lock().entries.contains_key(&thread_id)
+            && !self.threads.lock().contains_key(&thread_id)
         {
             return Err(BrokerError::UnknownObject);
         }
@@ -270,7 +264,7 @@ impl BrokerProcess {
         match inherited_result {
             Ok(child_handles) => Ok((process, child_handles)),
             Err(error) => {
-                BrokerProcess::finish(process);
+                process.cleanup(true);
                 Err(error)
             }
         }
@@ -284,11 +278,10 @@ impl BrokerProcess {
     /// invariants.
     pub fn create_thread(&self) -> Result<ThreadId> {
         let mut threads = self.threads.lock();
-        if threads.entries.len() >= self.core.limits.max_threads_per_process {
+        if threads.len() >= self.core.limits.max_threads_per_process {
             return Err(BrokerError::ResourceExhausted);
         }
         threads
-            .entries
             .try_reserve(1)
             .map_err(|_| BrokerError::OutOfMemory)?;
         self.core
@@ -309,7 +302,7 @@ impl BrokerProcess {
         let thread = BrokerThread::new(ThreadId(raw_id));
         let thread_id = thread.id();
         assert!(
-            threads.entries.insert(thread_id, thread).is_none(),
+            threads.insert(thread_id, thread).is_none(),
             "the ID allocator returned an occupied thread ID"
         );
         Ok(thread_id)
@@ -318,7 +311,7 @@ impl BrokerProcess {
     /// Returns whether this process owns the live broker thread.
     #[must_use]
     pub fn owns_thread(&self, thread_id: ThreadId) -> bool {
-        self.threads.lock().entries.contains_key(&thread_id)
+        self.threads.lock().contains_key(&thread_id)
     }
 
     /// Records broker thread exit after its local task teardown completes.
@@ -336,7 +329,6 @@ impl BrokerProcess {
         }
         let mut threads = self.threads.lock();
         let thread = threads
-            .entries
             .remove(&thread_id)
             .ok_or(BrokerError::UnknownObject)?;
         drop(state);
@@ -358,24 +350,6 @@ impl BrokerProcess {
     #[must_use]
     pub fn is_cancellation_requested(&self) -> bool {
         self.cancellation.is_cancelled()
-    }
-
-    /// Completes non-unwinding process teardown and releases its IDs.
-    ///
-    /// Dropping a process without calling this method performs authority
-    /// cleanup but leaves its numeric IDs occupied so they cannot be reused
-    /// after an unwind. Calling this method more than once is harmless.
-    pub fn finish(self: Arc<Self>) {
-        self.cleanup(true);
-    }
-
-    /// Completes abnormal process teardown without releasing numeric IDs.
-    ///
-    /// Calling this method more than once is harmless. It is used after an
-    /// unwind or invariant failure where reusing process or thread IDs would
-    /// make later observations ambiguous.
-    pub fn finish_abnormal(self: Arc<Self>) {
-        self.cleanup(false);
     }
 
     pub(crate) fn create_object_reference(&self, object: ObjectEntry) -> Result<ObjectHandle> {
@@ -771,10 +745,15 @@ impl BrokerProcess {
         Ok(reference)
     }
 
-    fn cleanup(&self, release_ids: bool) -> bool {
+    /// Cleans up this process, optionally releasing its numeric IDs for reuse.
+    ///
+    /// Set `release_ids` only after fully accounted teardown. Dropping a
+    /// process calls this with `false`, retaining IDs after an unwind or other
+    /// uncertain retirement. Calling this method more than once is harmless.
+    pub fn cleanup(&self, release_ids: bool) {
         let mut process_state = self.state.lock();
         if *process_state == ProcessState::Exiting {
-            return false;
+            return;
         }
         *process_state = ProcessState::Exiting;
         drop(process_state);
@@ -836,10 +815,7 @@ impl BrokerProcess {
             invariant_fault = true;
         }
 
-        let threads = {
-            let mut threads = self.threads.lock();
-            core::mem::take(&mut threads.entries)
-        };
+        let threads = core::mem::take(&mut *self.threads.lock());
         if release_ids && !invariant_fault {
             self.core
                 .active_thread_count
@@ -850,7 +826,6 @@ impl BrokerProcess {
             }
             ids.release(self.id.0);
         }
-        invariant_fault
     }
 }
 
@@ -935,7 +910,7 @@ fn release_pending_reference(
 
 impl Drop for BrokerProcess {
     fn drop(&mut self) {
-        let _ = self.cleanup(false);
+        self.cleanup(false);
     }
 }
 
@@ -1028,8 +1003,8 @@ mod tests {
         assert_eq!(process.exit_thread(thread), Err(BrokerError::WouldBlock));
         process.complete_start().unwrap();
         assert_eq!(process.exit_thread(thread), Ok(()));
-        process.finish();
-        parent.finish();
+        process.cleanup(true);
+        parent.cleanup(true);
     }
 
     #[test]
@@ -1044,10 +1019,8 @@ mod tests {
             .unwrap();
         let source_handle = crate::event::create(&parent, 1).unwrap();
         let (child, inherited_objects) = parent.create_child(&[source_handle]).unwrap();
-        let child_id = child.id();
         let inherited_handle = inherited_objects[0];
 
-        assert_eq!(child.id(), child_id);
         assert_eq!(child.parent_id(), Some(parent.id()));
         assert_ne!(inherited_handle, source_handle);
         assert_eq!(
@@ -1086,7 +1059,7 @@ mod tests {
             parent.create_child(&[]).err(),
             Some(BrokerError::ResourceExhausted)
         );
-        child.finish();
+        child.cleanup(true);
         assert!(parent.create_child(&[]).is_ok());
     }
 
@@ -1103,33 +1076,12 @@ mod tests {
             .unwrap();
         let (child, _) = parent.create_child(&[]).unwrap();
 
-        Arc::clone(&child).finish();
-        Arc::clone(&child).finish();
+        child.cleanup(true);
+        child.cleanup(true);
 
         assert_eq!(child.commit_start(), Err(BrokerError::PeerClosed));
         let (replacement, _) = parent.create_child(&[]).unwrap();
-        replacement.finish();
-    }
-
-    #[test]
-    fn child_releases_process_capacity_after_teardown() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
-            ObjectRights::all(),
-        ))
-        .with_limits(BrokerCoreLimits::DEFAULT.with_process_limit(2))
-        .build()
-        .unwrap();
-        let parent = broker
-            .create_process(CallerCredential::Unauthenticated)
-            .unwrap();
-        let (child, _) = parent.create_child(&[]).unwrap();
-
-        assert_eq!(
-            parent.create_child(&[]).err(),
-            Some(BrokerError::ResourceExhausted)
-        );
-        child.finish();
-        assert!(parent.create_child(&[]).is_ok());
+        replacement.cleanup(true);
     }
 
     #[test]
@@ -1215,7 +1167,7 @@ mod tests {
             Err(BrokerError::ResourceExhausted)
         ));
 
-        first.finish();
+        first.cleanup(true);
         assert!(
             broker
                 .create_process(CallerCredential::Unauthenticated)
@@ -1247,7 +1199,7 @@ mod tests {
         assert!(Arc::ptr_eq(&process, &registered));
         drop(registered);
 
-        process.finish();
+        process.cleanup(true);
         assert!(!broker.processes.read().contains_key(&process_id));
         assert_eq!(broker.active_thread_count.load(Ordering::Relaxed), 0);
 

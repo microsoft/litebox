@@ -301,7 +301,7 @@ impl RunnerInstance {
                 ) || runner_exit_code_is_crash(status.code())
             });
         if let Some(process) = association_result.process.take() {
-            finish_child_process(&process, root_abnormal);
+            process.cleanup(!root_abnormal);
         }
         children.wait_for_drain();
         let runner_status = runner_status?;
@@ -706,7 +706,7 @@ impl RunnerChildren {
         })() {
             Ok(token) => token,
             Err(error) => {
-                BrokerProcess::finish(process);
+                process.cleanup(true);
                 return Err(error);
             }
         };
@@ -766,7 +766,7 @@ impl RunnerChildren {
             });
         if thread.is_err() {
             self.remove_launch(token);
-            BrokerProcess::finish(Arc::clone(&launch.process));
+            launch.process.cleanup(true);
             self.finish_instance();
             return Err(ErrorCode::OutOfMemory);
         }
@@ -1224,7 +1224,7 @@ impl RunnerChildren {
     }
 
     fn finish_child_launch(&self, launch: &ChildLaunch, abnormal: bool) {
-        finish_child_process(&launch.process, abnormal);
+        launch.process.cleanup(!abnormal);
         self.finish_instance();
     }
 
@@ -2092,14 +2092,6 @@ fn take_finalization(state: &mut ChildLaunchData) -> Option<bool> {
     Some(state.abnormal)
 }
 
-fn finish_child_process(process: &Arc<BrokerProcess>, abnormal: bool) {
-    if abnormal {
-        Arc::clone(process).finish_abnormal();
-    } else {
-        Arc::clone(process).finish();
-    }
-}
-
 #[cfg(target_os = "linux")]
 fn runner_exit_signal(status: ExitStatus) -> Option<i32> {
     use std::os::unix::process::ExitStatusExt;
@@ -2253,7 +2245,7 @@ mod tests {
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let (process, _) = parent.create_child(&[]).unwrap();
-        parent.finish();
+        parent.cleanup(true);
         if let ChildLaunchPhase::Ready { initial_thread_id } = phase {
             process.mark_start_ready(initial_thread_id).unwrap();
         }
@@ -2345,7 +2337,7 @@ mod tests {
             &BrokerOperation::AcknowledgeProcessStart(token),
             &BrokerResult::ProcessStartAcknowledged,
         );
-        Arc::clone(&launch.process).finish();
+        launch.process.cleanup(true);
         children.finish_instance();
         children.wait_for_drain();
         assert_eq!(children.state.lock().unwrap().active_watchdogs, 0);
@@ -2376,7 +2368,7 @@ mod tests {
             launch.resolve_receipt(),
             ReceiptResolution::Resolved(Some(false))
         ));
-        Arc::clone(&launch.process).finish();
+        launch.process.cleanup(true);
     }
 
     #[test]
@@ -2414,7 +2406,7 @@ mod tests {
         ));
 
         launch.resolve_receipt();
-        Arc::clone(&launch.process).finish();
+        launch.process.cleanup(true);
     }
 
     #[test]
@@ -2429,7 +2421,7 @@ mod tests {
 
         assert!(matches!(worker.join().unwrap(), Err(ErrorCode::PeerClosed)));
         launch.finish_receipt_drain();
-        Arc::clone(&launch.process).finish();
+        launch.process.cleanup(true);
     }
 
     #[test]
@@ -2441,7 +2433,7 @@ mod tests {
             Err(ErrorCode::PeerClosed)
         ));
         ready.resolve_receipt();
-        Arc::clone(&ready.process).finish();
+        ready.process.cleanup(true);
     }
 
     #[test]
@@ -2453,7 +2445,7 @@ mod tests {
             Err(ErrorCode::PeerClosed)
         ));
         failed.resolve_receipt();
-        Arc::clone(&failed.process).finish();
+        failed.process.cleanup(true);
     }
 
     #[test]
@@ -2473,7 +2465,7 @@ mod tests {
 
         launch.begin_receipt_drain();
         launch.finish_receipt_drain();
-        Arc::clone(&launch.process).finish();
+        launch.process.cleanup(true);
     }
 
     #[test]
@@ -2506,7 +2498,7 @@ mod tests {
         assert_eq!(launch.complete_timeout_callback(), None);
         launch.begin_receipt_drain();
         launch.finish_receipt_drain();
-        Arc::clone(&launch.process).finish();
+        launch.process.cleanup(true);
     }
 
     #[test]
@@ -2539,7 +2531,7 @@ mod tests {
             launch.resolve_receipt(),
             ReceiptResolution::Resolved(Some(false))
         ));
-        Arc::clone(&launch.process).finish();
+        launch.process.cleanup(true);
     }
 
     #[test]
@@ -2580,7 +2572,7 @@ mod tests {
             DeadlineState::Armed(_)
         ));
         launch.resolve_receipt();
-        Arc::clone(&launch.process).finish_abnormal();
+        launch.process.cleanup(false);
     }
 
     #[test]
@@ -2595,7 +2587,7 @@ mod tests {
         launch.abort(ErrorCode::PeerClosed, false, true);
 
         assert!(failed.load(Ordering::Acquire));
-        Arc::clone(&launch.process).finish();
+        launch.process.cleanup(true);
     }
 
     #[test]
@@ -2612,7 +2604,7 @@ mod tests {
         launch.changed.notify_all();
 
         assert!(worker.join().unwrap());
-        Arc::clone(&launch.process).finish();
+        launch.process.cleanup(true);
     }
 
     #[test]
@@ -2643,7 +2635,7 @@ mod tests {
         launch.changed.notify_all();
         assert_eq!(launch.complete_timeout_callback(), None);
         launch.finish_receipt_drain();
-        Arc::clone(&launch.process).finish_abnormal();
+        launch.process.cleanup(false);
     }
 
     #[test]
@@ -2658,7 +2650,7 @@ mod tests {
             Ok(ProcessStartAcknowledgement::Failed(ErrorCode::PeerClosed))
         ));
         launch.resolve_receipt();
-        Arc::clone(&launch.process).finish();
+        launch.process.cleanup(true);
     }
 
     #[test]
@@ -2670,7 +2662,7 @@ mod tests {
             Err(ErrorCode::ProtocolState)
         ));
         launch.resolve_receipt();
-        Arc::clone(&launch.process).finish();
+        launch.process.cleanup(true);
     }
 
     #[test]
@@ -2683,7 +2675,7 @@ mod tests {
             launch.resolve_receipt(),
             ReceiptResolution::Resolved(Some(false))
         ));
-        Arc::clone(&launch.process).finish();
+        launch.process.cleanup(true);
     }
 
     #[test]
@@ -2702,7 +2694,7 @@ mod tests {
         assert!(!state.abnormal);
         drop(state);
         assert_eq!(launch.process.exit_thread(thread_id), Ok(()));
-        Arc::clone(&launch.process).finish();
+        launch.process.cleanup(true);
     }
 
     #[test]
@@ -2734,7 +2726,7 @@ mod tests {
         );
         worker.join().unwrap();
         assert_eq!(launch.process.exit_thread(thread_id), Ok(()));
-        Arc::clone(&launch.process).finish();
+        launch.process.cleanup(true);
     }
 
     #[test]
@@ -2751,7 +2743,7 @@ mod tests {
         assert!(state.abnormal);
         drop(state);
         assert_eq!(launch.complete_timeout_callback(), None);
-        Arc::clone(&launch.process).finish();
+        launch.process.cleanup(true);
     }
 
     #[test]
@@ -2767,7 +2759,7 @@ mod tests {
         assert_eq!(launch.complete_timeout_callback(), None);
         launch.begin_receipt_drain();
         assert_eq!(launch.finish_receipt_drain(), Some(false));
-        Arc::clone(&launch.process).finish();
+        launch.process.cleanup(true);
     }
 
     #[test]
@@ -2777,7 +2769,7 @@ mod tests {
         launch.begin_receipt_drain();
         assert_eq!(launch.runner_finished(false), None);
         assert_eq!(launch.finish_receipt_drain(), Some(false));
-        Arc::clone(&launch.process).finish();
+        launch.process.cleanup(true);
     }
 
     #[test]
@@ -2790,7 +2782,7 @@ mod tests {
         assert_eq!(launch.complete_timeout_callback(), None);
         launch.begin_receipt_drain();
         assert_eq!(launch.finish_receipt_drain(), Some(true));
-        Arc::clone(&launch.process).finish_abnormal();
+        launch.process.cleanup(false);
     }
 
     #[test]
