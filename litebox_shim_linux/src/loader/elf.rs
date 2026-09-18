@@ -25,6 +25,7 @@ struct ElfFile<'a, Platform: ShimPlatform> {
     task: &'a Task<Platform>,
     fd: i32,
     load_high: bool,
+    reserve_runtime_trampoline: bool,
 }
 
 impl<'a, Platform: ShimPlatform> ElfFile<'a, Platform> {
@@ -36,6 +37,7 @@ impl<'a, Platform: ShimPlatform> ElfFile<'a, Platform> {
             task,
             fd,
             load_high: false,
+            reserve_runtime_trampoline: false,
         })
     }
 }
@@ -78,7 +80,20 @@ impl<Platform: ShimPlatform> litebox_common_linux::loader::MapMemory for ElfFile
     fn reserve(&mut self, len: usize, align: usize) -> Result<usize, Self::Error> {
         // Allocate a mapping large enough that even if it's maximally misaligned we can
         // still fit `len` bytes.
-        let mapping_len = len + (align.max(PAGE_SIZE) - PAGE_SIZE);
+        // Leave room above the ELF for runtime trampoline and/or initial heap page.
+        // This room is required when a low hint falls back to top-down placement.
+        // This matters when a low hint falls
+        let mapping_len = len
+            .checked_add(align.max(PAGE_SIZE) - PAGE_SIZE)
+            .and_then(|len| {
+                len.checked_add(if self.reserve_runtime_trampoline {
+                    litebox::mm::linux::DEFAULT_RESERVED_SPACE_SIZE
+                } else {
+                    0
+                })
+            })
+            .and_then(|len| len.checked_add(if self.load_high { 0 } else { PAGE_SIZE }))
+            .ok_or(Errno::ENOMEM)?;
         let hint = if self.load_high {
             // Reserve the interpreter top-down by passing no hint: LiteBox's
             // `get_unmmaped_area` then runs its top-down search and returns
@@ -169,6 +184,20 @@ impl<Platform: ShimPlatform> litebox_common_linux::loader::MapMemory for ElfFile
     }
 }
 
+/// Reserve the initial heap page address to prevent the loader from using it.
+struct HeapPageReservation<'a, Platform: ShimPlatform> {
+    task: &'a Task<Platform>,
+    address: UserPtrMut<u8>,
+}
+
+impl<Platform: ShimPlatform> Drop for HeapPageReservation<'_, Platform> {
+    fn drop(&mut self) {
+        self.task
+            .sys_munmap(self.address, PAGE_SIZE)
+            .expect("failed to release initial heap page reservation");
+    }
+}
+
 /// Struct to hold the information needed to start the program
 /// (entry point and user stack top).
 pub struct ElfLoadInfo {
@@ -230,6 +259,7 @@ impl<'a, Platform: ShimPlatform> FileAndParsed<'a, Platform> {
         } else {
             None
         };
+        self.file.reserve_runtime_trampoline = reserve.is_some();
         let result = self.parsed.load(&mut self.file, &mut &*platform, reserve);
         Ok(result?)
     }
@@ -267,6 +297,24 @@ impl<'a, Platform: ShimPlatform> ElfLoader<'a, Platform> {
 
         // Load the main ELF file first so that it gets privileged addresses.
         let info = self.main.load_mapped(global.platform)?;
+
+        // Keep interpreter and stack allocations off the initial heap page.
+        let task = self.main.file.task;
+        let _heap_page = match task.sys_mmap(
+            info.brk,
+            PAGE_SIZE,
+            litebox_common_linux::ProtFlags::PROT_NONE,
+            MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
+            -1,
+            0,
+        ) {
+            Ok(address) => Some(HeapPageReservation { task, address }),
+            // A mapping already exists, so no extra reservation is needed.
+            Err(Errno::EEXIST) => None,
+            Err(error) => {
+                return Err(litebox_common_linux::loader::ElfLoadError::Map(error).into());
+            }
+        };
 
         // Load the interpreter ELF file, if any.
         let interp = if let Some(interp) = &mut self.interp {
@@ -484,38 +532,88 @@ mod tests {
     }
 
     #[test]
-    fn et_exec_interpreter_loads_top_down_above_low_heap() {
+    fn pie_fallback_placement_leaves_room_for_trampoline_and_heap() {
+        check_pie_fallback_heap(None);
+        check_pie_fallback_heap(Some(INTERP_PATH));
+    }
+
+    fn check_pie_fallback_heap(interp: Option<&[u8]>) {
         let task = crate::syscalls::tests::init_platform(None);
+        let hint = crate::loader::DEFAULT_LOW_ADDR;
+        // Occupy the preferred ELF address to force top-down placement.
+        let _low_hint = match task.sys_mmap(
+            hint,
+            PAGE_SIZE,
+            litebox_common_linux::ProtFlags::PROT_NONE,
+            MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
+            -1,
+            0,
+        ) {
+            Ok(address) => Some(HeapPageReservation {
+                task: &task,
+                address,
+            }),
+            Err(Errno::EEXIST) => None,
+            Err(error) => panic!("could not occupy the low ELF hint: {error}"),
+        };
+        write_file(&task, "/main", &minimal_elf(ET_DYN, interp));
+        if interp.is_some() {
+            write_file(&task, "/ld.so", &minimal_elf(ET_DYN, None));
+        }
+        let mut loader = ElfLoader::new(&task, "/main").unwrap();
+        loader
+            .load(Vec::new(), Vec::new(), AuxVec::new())
+            .expect("complete loader sequence should succeed");
+        let initial = task.sys_brk(UserPtrMut::from_usize(0)).unwrap();
+        // The main has one page and no embedded trampoline. Its break thus
+        // identifies the base even when the returned entry is the interpreter's.
+        let main_base = initial - PAGE_SIZE - litebox::mm::linux::DEFAULT_RESERVED_SPACE_SIZE;
+        assert_ne!(main_base, hint);
+        // Check actual availability after interpreter/stack allocation, not
+        // merely address bounds (host mappings may lie below TASK_ADDR_MAX).
+        assert_eq!(
+            task.sys_brk(UserPtrMut::from_usize(initial + PAGE_SIZE)),
+            Ok(initial + PAGE_SIZE),
+            "the initial heap page must remain available after loading",
+        );
+    }
+
+    #[test]
+    fn et_exec_with_occupied_heap_still_loads_interpreter_high() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let initial_brk = usize::try_from(EXEC_LOAD_ADDR).expect("address fits usize")
+            + PAGE_SIZE
+            + litebox::mm::linux::DEFAULT_RESERVED_SPACE_SIZE;
+        let occupied = task
+            .sys_mmap(
+                initial_brk,
+                PAGE_SIZE,
+                litebox_common_linux::ProtFlags::PROT_NONE,
+                MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
+                -1,
+                0,
+            )
+            .expect("initial heap page should be available before loading");
+        let _occupied = HeapPageReservation {
+            task: &task,
+            address: occupied,
+        };
+
         write_file(&task, "/main", &minimal_elf(ET_EXEC, Some(INTERP_PATH)));
         write_file(&task, "/ld.so", &minimal_elf(ET_DYN, None));
-
         let mut loader = ElfLoader::new(&task, "/main").expect("loader should parse test ELFs");
-        let main = loader
-            .main
-            .load_mapped(task.global.platform)
-            .expect("main should load");
-        assert_eq!(main.base_addr, 0);
+        let info = loader
+            .load(Vec::new(), Vec::new(), AuxVec::new())
+            .expect("an occupied initial heap page must not prevent loading");
+        assert_eq!(task.sys_brk(UserPtrMut::from_usize(0)), Ok(initial_brk));
 
-        let interp = loader
-            .interp
-            .as_mut()
-            .expect("test main should have PT_INTERP")
-            .load_mapped(task.global.platform)
-            .expect("interpreter should load");
-
-        // The interpreter must land high — via the top-down search — so the
-        // low ET_EXEC brk heap below it is not capped. The exact address is
-        // not asserted: `get_unmmaped_area` returns the highest free gap, and
-        // host mappings seeded into the userland VMA tree can sit near the top
-        // and push that gap below the very top slot (see `mm/linux.rs`). Assert
-        // the invariant that matters — placement in the high half of the
-        // address space, far above the low-heap region — not one exact slot.
+        // The minimal interpreter's entry is its base address. It must land
+        // top-down, far above the low ET_EXEC image and heap.
         let addr_max = <TestPlatform as PageManagementProvider<{ PAGE_SIZE }>>::TASK_ADDR_MAX;
         assert!(
-            interp.base_addr >= addr_max / 2,
-            "ET_EXEC interpreter loaded at {:#x}, near the low-heap region {:#x} rather than top-down high (>= {:#x})",
-            interp.base_addr,
-            crate::loader::DEFAULT_LOW_ADDR,
+            info.entry_point >= addr_max / 2,
+            "ET_EXEC interpreter loaded near the low heap at {:#x}, expected >= {:#x}",
+            info.entry_point,
             addr_max / 2,
         );
     }
