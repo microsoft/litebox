@@ -119,7 +119,7 @@ fn align_down(addr: usize, align: usize) -> usize {
 
 impl<Platform: ShimPlatform> Task<Platform> {
     #[inline]
-    fn do_mmap(
+    pub(crate) fn do_mmap(
         &self,
         suggested_addr: Option<usize>,
         len: usize,
@@ -140,7 +140,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     #[inline]
-    fn do_mmap_anonymous(
+    pub(crate) fn do_mmap_anonymous(
         &self,
         suggested_addr: Option<usize>,
         len: usize,
