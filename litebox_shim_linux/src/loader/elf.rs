@@ -87,6 +87,7 @@ struct ElfFile<'a, Platform: ShimPlatform> {
     task: &'a Task<Platform>,
     fd: i32,
     load_high: bool,
+    reserve_runtime_trampoline: bool,
 }
 
 impl<'a, Platform: ShimPlatform> ElfFile<'a, Platform> {
@@ -98,6 +99,7 @@ impl<'a, Platform: ShimPlatform> ElfFile<'a, Platform> {
             task,
             fd,
             load_high: false,
+            reserve_runtime_trampoline: false,
         })
     }
 }
@@ -138,9 +140,18 @@ impl<Platform: ShimPlatform> litebox_common_linux::loader::MapMemory for ElfFile
     type Error = Errno;
 
     fn reserve(&mut self, len: usize, align: usize) -> Result<usize, Self::Error> {
-        // Allocate a mapping large enough that even if it's maximally misaligned we can
-        // still fit `len` bytes.
-        let mapping_len = len + (align.max(PAGE_SIZE) - PAGE_SIZE);
+        // Allocate a mapping which should be large enough to fit `len` bytes.
+        // For an unpatched ELF, also include the runtime trampoline.
+        let mapping_len = len
+            .checked_add(align.max(PAGE_SIZE) - PAGE_SIZE)
+            .and_then(|len| {
+                len.checked_add(if self.reserve_runtime_trampoline {
+                    litebox::mm::linux::DEFAULT_RESERVED_SPACE_SIZE
+                } else {
+                    0
+                })
+            })
+            .ok_or(Errno::ENOMEM)?;
         let aligned_len = mapping_len
             .checked_next_multiple_of(PAGE_SIZE)
             .ok_or(Errno::ENOMEM)?;
@@ -304,6 +315,7 @@ impl<'a, Platform: ShimPlatform> FileAndParsed<'a, Platform> {
         } else {
             None
         };
+        self.file.reserve_runtime_trampoline = reserve.is_some();
         let result = self.parsed.load(&mut self.file, &mut &*platform, reserve);
         Ok(result?)
     }
@@ -584,6 +596,27 @@ mod tests {
             .expect("failed to release test PIE reservation");
         task.sys_munmap(occupied, PAGE_SIZE)
             .expect("failed to release occupied hint");
+
+        // Runtime-trampoline space participates in the gap search.
+        let trampoline_blocker = task
+            .sys_mmap(
+                hint + PAGE_SIZE,
+                PAGE_SIZE,
+                litebox_common_linux::ProtFlags::PROT_NONE,
+                MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
+                -1,
+                0,
+            )
+            .expect("failed to block the runtime-trampoline region");
+        pie.reserve_runtime_trampoline = true;
+        let reserved =
+            litebox_common_linux::loader::MapMemory::reserve(&mut pie, PAGE_SIZE, PAGE_SIZE)
+                .expect("PIE reservation should include runtime-trampoline space");
+        assert_eq!(reserved, hint + 2 * PAGE_SIZE);
+        task.sys_munmap(UserPtrMut::from_usize(reserved), PAGE_SIZE)
+            .expect("failed to release trampoline-aware reservation");
+        task.sys_munmap(trampoline_blocker, PAGE_SIZE)
+            .expect("failed to release trampoline blocker");
 
         // Exercise both retryable collision sources deterministically.
         let mut attempts = Vec::new();
