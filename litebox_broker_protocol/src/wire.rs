@@ -52,6 +52,7 @@ const REQUEST_TAG_EXIT_THREAD: u8 = 10;
 const REQUEST_TAG_START_PROCESS: u8 = 11;
 const REQUEST_TAG_ACKNOWLEDGE_PROCESS_START: u8 = 12;
 const REQUEST_TAG_PROCESS_READY: u8 = 13;
+const REQUEST_TAG_REPORT_PROCESS_START_FAILURE: u8 = 14;
 
 // Paired request and successful-response tags intentionally share values.
 const RESPONSE_TAG_NEGOTIATED: u8 = 0;
@@ -68,6 +69,7 @@ const RESPONSE_TAG_THREAD_EXITED: u8 = 10;
 const RESPONSE_TAG_PROCESS_STARTED: u8 = 11;
 const RESPONSE_TAG_PROCESS_START_ACKNOWLEDGED: u8 = 12;
 const RESPONSE_TAG_PROCESS_READY: u8 = 13;
+const RESPONSE_TAG_PROCESS_START_FAILED: u8 = 14;
 
 // Reserve the top of the tag space for responses without paired requests.
 const RESPONSE_TAG_ERROR: u8 = 253;
@@ -129,7 +131,8 @@ pub fn decode_handshake_request(frame: &[u8]) -> Result<BrokerHandshakeRequest, 
         | REQUEST_TAG_EXIT_THREAD
         | REQUEST_TAG_START_PROCESS
         | REQUEST_TAG_ACKNOWLEDGE_PROCESS_START
-        | REQUEST_TAG_PROCESS_READY => {
+        | REQUEST_TAG_PROCESS_READY
+        | REQUEST_TAG_REPORT_PROCESS_START_FAILURE => {
             return Err(WireError::WrongMessagePhase);
         }
         _ => return Err(WireError::InvalidTag),
@@ -224,6 +227,11 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
             encoder.request_id(request_id);
             encode_optional_thread_id(&mut encoder, initial_thread_id);
         }
+        BrokerOperation::ReportProcessStartFailure(error) => {
+            encoder.u8(REQUEST_TAG_REPORT_PROCESS_START_FAILURE);
+            encoder.request_id(request_id);
+            encode_error_code(&mut encoder, error);
+        }
     }
     encoder.finish()
 }
@@ -246,7 +254,8 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         | REQUEST_TAG_EXIT_THREAD
         | REQUEST_TAG_START_PROCESS
         | REQUEST_TAG_ACKNOWLEDGE_PROCESS_START
-        | REQUEST_TAG_PROCESS_READY => {}
+        | REQUEST_TAG_PROCESS_READY
+        | REQUEST_TAG_REPORT_PROCESS_START_FAILURE => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -275,6 +284,9 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         REQUEST_TAG_PROCESS_READY => BrokerOperation::ProcessReady(ProcessReadyRequest {
             initial_thread_id: decode_optional_thread_id(&mut decoder)?,
         }),
+        REQUEST_TAG_REPORT_PROCESS_START_FAILURE => {
+            BrokerOperation::ReportProcessStartFailure(decode_error_code(&mut decoder)?)
+        }
         _ => unreachable!("active request tag was validated"),
     };
     decoder.finish()?;
@@ -366,6 +378,7 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
         | RESPONSE_TAG_THREAD_EXITED
         | RESPONSE_TAG_PROCESS_STARTED
         | RESPONSE_TAG_PROCESS_START_ACKNOWLEDGED
+        | RESPONSE_TAG_PROCESS_START_FAILED
         | RESPONSE_TAG_PROCESS_READY => {
             return Err(WireError::WrongMessagePhase);
         }
@@ -451,6 +464,11 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
             encoder.u8(RESPONSE_TAG_PROCESS_START_ACKNOWLEDGED);
             encoder.request_id(request_id);
         }
+        BrokerResult::ProcessStartFailed(error) => {
+            encoder.u8(RESPONSE_TAG_PROCESS_START_FAILED);
+            encoder.request_id(request_id);
+            encode_error_code(&mut encoder, error);
+        }
         BrokerResult::ProcessReady => {
             encoder.u8(RESPONSE_TAG_PROCESS_READY);
             encoder.request_id(request_id);
@@ -485,6 +503,7 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         | RESPONSE_TAG_THREAD_EXITED
         | RESPONSE_TAG_PROCESS_STARTED
         | RESPONSE_TAG_PROCESS_START_ACKNOWLEDGED
+        | RESPONSE_TAG_PROCESS_START_FAILED
         | RESPONSE_TAG_PROCESS_READY => {}
         _ => return Err(WireError::InvalidTag),
     }
@@ -507,6 +526,9 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
             initial_thread_id: decode_optional_thread_id(&mut decoder)?,
         }),
         RESPONSE_TAG_PROCESS_START_ACKNOWLEDGED => BrokerResult::ProcessStartAcknowledged,
+        RESPONSE_TAG_PROCESS_START_FAILED => {
+            BrokerResult::ProcessStartFailed(decode_error_code(&mut decoder)?)
+        }
         RESPONSE_TAG_PROCESS_READY => BrokerResult::ProcessReady,
         _ => unreachable!("active response tag was validated"),
     };
@@ -707,6 +729,7 @@ mod tests {
                 RESPONSE_TAG_PROCESS_STARTED,
                 RESPONSE_TAG_PROCESS_START_ACKNOWLEDGED,
                 RESPONSE_TAG_PROCESS_READY,
+                RESPONSE_TAG_PROCESS_START_FAILED,
             ],
             [
                 REQUEST_TAG_NEGOTIATE,
@@ -723,6 +746,7 @@ mod tests {
                 REQUEST_TAG_START_PROCESS,
                 REQUEST_TAG_ACKNOWLEDGE_PROCESS_START,
                 REQUEST_TAG_PROCESS_READY,
+                REQUEST_TAG_REPORT_PROCESS_START_FAILURE,
             ]
         );
         assert_eq!(
@@ -1012,6 +1036,7 @@ mod tests {
             BrokerOperation::ProcessReady(ProcessReadyRequest {
                 initial_thread_id: Some(thread_id(19)),
             }),
+            BrokerOperation::ReportProcessStartFailure(ErrorCode::UnsupportedOperation),
         ];
         let mut maximum_encoded_size = 0;
 
@@ -1368,6 +1393,7 @@ mod tests {
                 initial_thread_id: Some(thread_id(11)),
             }),
             BrokerResult::ProcessStartAcknowledged,
+            BrokerResult::ProcessStartFailed(ErrorCode::PeerClosed),
             BrokerResult::ProcessReady,
             BrokerResult::Error(ErrorCode::PolicyDenied),
             BrokerResult::Error(ErrorCode::WouldBlock),

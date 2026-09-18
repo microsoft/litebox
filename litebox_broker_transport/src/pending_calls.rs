@@ -13,6 +13,10 @@ use litebox_broker_protocol::message::BrokerResponse;
 
 /// Maximum number of active calls waiting for broker responses.
 pub const MAX_PENDING_CALLS: usize = 64;
+/// Pending-call capacity reserved for lifecycle-control operations.
+pub const RESERVED_LIFECYCLE_PENDING_CALLS: usize = 8;
+/// Maximum active ordinary calls after preserving lifecycle-control capacity.
+pub const MAX_ORDINARY_PENDING_CALLS: usize = MAX_PENDING_CALLS - RESERVED_LIFECYCLE_PENDING_CALLS;
 
 /// A mutex usable by [`PendingCalls`].
 pub trait PendingCallsMutex<T> {
@@ -82,8 +86,14 @@ pub struct PendingCalls<Sync: PendingCallsSync, Error> {
 }
 
 struct PendingCallsState<Sync: PendingCallsSync, Error> {
-    calls: BTreeMap<RequestId, Arc<PendingCall<Sync, Error>>>,
+    calls: BTreeMap<RequestId, RegisteredPendingCall<Sync, Error>>,
+    ordinary_calls: usize,
     failure: Option<Arc<Error>>,
+}
+
+struct RegisteredPendingCall<Sync: PendingCallsSync, Error> {
+    call: Arc<PendingCall<Sync, Error>>,
+    ordinary: bool,
 }
 
 /// Completion state for one request awaiting a broker response.
@@ -125,6 +135,7 @@ impl<Sync: PendingCallsSync, Error> PendingCalls<Sync, Error> {
         Self {
             state: Sync::mutex(PendingCallsState {
                 calls: BTreeMap::new(),
+                ordinary_calls: 0,
                 failure: None,
             }),
             capacity_available: Sync::condvar(),
@@ -136,9 +147,28 @@ impl<Sync: PendingCallsSync, Error> PendingCalls<Sync, Error> {
         &self,
         request_id: RequestId,
     ) -> Result<Arc<PendingCall<Sync, Error>>, PendingCallsError<Error>> {
+        self.register_with_class(request_id, true)
+    }
+
+    /// Registers lifecycle-control work using capacity ordinary calls cannot consume.
+    pub fn register_lifecycle(
+        &self,
+        request_id: RequestId,
+    ) -> Result<Arc<PendingCall<Sync, Error>>, PendingCallsError<Error>> {
+        self.register_with_class(request_id, false)
+    }
+
+    fn register_with_class(
+        &self,
+        request_id: RequestId,
+        ordinary: bool,
+    ) -> Result<Arc<PendingCall<Sync, Error>>, PendingCallsError<Error>> {
         let pending_call = Arc::new(PendingCall::new());
         let mut state = self.state.lock();
-        while state.calls.len() == MAX_PENDING_CALLS && state.failure.is_none() {
+        while (state.calls.len() >= MAX_PENDING_CALLS
+            || (ordinary && state.ordinary_calls >= MAX_ORDINARY_PENDING_CALLS))
+            && state.failure.is_none()
+        {
             state = self.capacity_available.wait(state);
         }
         if let Some(error) = state.failure.as_ref() {
@@ -146,7 +176,13 @@ impl<Sync: PendingCallsSync, Error> PendingCalls<Sync, Error> {
         }
         match state.calls.entry(request_id) {
             Entry::Vacant(entry) => {
-                entry.insert(Arc::clone(&pending_call));
+                entry.insert(RegisteredPendingCall {
+                    call: Arc::clone(&pending_call),
+                    ordinary,
+                });
+                if ordinary {
+                    state.ordinary_calls += 1;
+                }
             }
             Entry::Occupied(_) => return Err(PendingCallsError::DuplicateRequestId),
         }
@@ -154,17 +190,28 @@ impl<Sync: PendingCallsSync, Error> PendingCalls<Sync, Error> {
     }
 
     /// Completes the pending call identified by `response`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal ordinary-call count is inconsistent with the
+    /// registered requests.
     pub fn complete(&self, response: BrokerResponse) -> Result<(), PendingCallsError<Error>> {
         let pending_call = {
             let mut state = self.state.lock();
             if let Some(error) = state.failure.as_ref() {
                 return Err(PendingCallsError::AssociationFailed(Arc::clone(error)));
             }
-            let Some(pending_call) = state.calls.remove(&response.request_id) else {
+            let Some(registered) = state.calls.remove(&response.request_id) else {
                 return Err(PendingCallsError::UnknownResponseId);
             };
-            self.capacity_available.notify_one();
-            pending_call
+            if registered.ordinary {
+                state.ordinary_calls = state
+                    .ordinary_calls
+                    .checked_sub(1)
+                    .expect("ordinary pending-call count must remain balanced");
+            }
+            self.capacity_available.notify_all();
+            registered.call
         };
         pending_call.resolve(Ok(response));
         Ok(())
@@ -181,11 +228,12 @@ impl<Sync: PendingCallsSync, Error> PendingCalls<Sync, Error> {
             }
             state.failure = Some(Arc::clone(&error));
             let pending_calls = core::mem::take(&mut state.calls);
+            state.ordinary_calls = 0;
             self.capacity_available.notify_all();
             pending_calls
         };
-        for pending_call in pending_calls.into_values() {
-            pending_call.resolve(Err(Arc::clone(&error)));
+        for registered in pending_calls.into_values() {
+            registered.call.resolve(Err(Arc::clone(&error)));
         }
         true
     }

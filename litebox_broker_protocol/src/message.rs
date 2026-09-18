@@ -74,6 +74,8 @@ pub enum BrokerOperation {
     AcknowledgeProcessStart(ProcessStartToken),
     /// Report that this child process is ready to begin guest execution.
     ProcessReady(ProcessReadyRequest),
+    /// Report that this child rejected its startup data before becoming ready.
+    ReportProcessStartFailure(ErrorCode),
 }
 
 impl BrokerOperation {
@@ -134,7 +136,8 @@ impl BrokerOperation {
                 FileRequest::Seek(_) | FileRequest::Truncate(_) | FileRequest::HandleStatus(_),
             )
             | Self::AcknowledgeProcessStart(_)
-            | Self::ProcessReady(_) => None,
+            | Self::ProcessReady(_)
+            | Self::ReportProcessStartFailure(_) => None,
         }
     }
 }
@@ -256,6 +259,8 @@ pub enum BrokerResult {
     ProcessStarted(StartedProcess),
     /// Parent acknowledgement committed the child.
     ProcessStartAcknowledged,
+    /// A child-start failure was reported or observed before commit.
+    ProcessStartFailed(ErrorCode),
     /// Parent acknowledgement released the child.
     ProcessReady,
     /// Operation failed with an ABI-neutral broker error.

@@ -22,8 +22,8 @@ use rustix::net::{
 };
 
 use litebox_broker_protocol::message::{
-    BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequest,
-    BrokerResponse,
+    BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerOperation,
+    BrokerRequest, BrokerResponse,
 };
 use litebox_broker_protocol::wire::{
     decode_handshake_response, decode_notification, decode_response, encode_handshake_request,
@@ -321,10 +321,16 @@ impl LocalCallChannel for UnixControlRingLocalCallChannel {
     fn call(&self, request: BrokerRequest) -> IoResult<BrokerResponse> {
         let association = &self.association;
         let request_id = request.request_id;
-        let pending_call = association
-            .pending_calls
-            .register(request_id)
-            .map_err(pending_calls_error)?;
+        let pending_call = if matches!(
+            &request.operation,
+            BrokerOperation::AcknowledgeProcessStart(_)
+                | BrokerOperation::ReportProcessStartFailure(_)
+        ) {
+            association.pending_calls.register_lifecycle(request_id)
+        } else {
+            association.pending_calls.register(request_id)
+        }
+        .map_err(pending_calls_error)?;
         let request_frame = encode_request(request);
 
         let write_result = {
@@ -767,11 +773,15 @@ mod control_ring_tests {
     }
 
     #[test]
-    fn pending_capacity_blocks_before_sixty_fifth_publication() {
+    fn pending_capacity_reserves_lifecycle_calls() {
+        use litebox_broker_transport::pending_calls::{
+            MAX_ORDINARY_PENDING_CALLS, RESERVED_LIFECYCLE_PENDING_CALLS,
+        };
+
         let (channel, shutdown, mut responses, mut requests, _peer) = activate_local(|| {});
         let channel = Arc::new(channel);
         let start = Arc::new(Barrier::new(MAX_PENDING_CALLS + 2));
-        let callers = (0..=MAX_PENDING_CALLS)
+        let mut callers = (0..=MAX_ORDINARY_PENDING_CALLS)
             .map(|id| {
                 let channel = Arc::clone(&channel);
                 let start = Arc::clone(&start);
@@ -781,15 +791,53 @@ mod control_ring_tests {
                 })
             })
             .collect::<Vec<_>>();
+        callers.extend((0..RESERVED_LIFECYCLE_PENDING_CALLS).map(|index| {
+            let lifecycle_channel = Arc::clone(&channel);
+            let lifecycle_start = Arc::clone(&start);
+            thread::spawn(move || {
+                lifecycle_start.wait();
+                lifecycle_channel.call(BrokerRequest {
+                    request_id: RequestId((MAX_ORDINARY_PENDING_CALLS + 1 + index) as u64),
+                    operation: BrokerOperation::AcknowledgeProcessStart(
+                        litebox_broker_protocol::process::ProcessStartToken(index as u64),
+                    ),
+                })
+            })
+        }));
         start.wait();
 
         let mut published = Vec::new();
         for _ in 0..MAX_PENDING_CALLS {
-            published.push(read_request(&mut requests).request_id);
+            published.push(read_request(&mut requests));
         }
-        write_payload(&mut responses, &encode_response(response(published[0])));
-        let released = read_request(&mut requests).request_id;
-        assert!(!published.contains(&released));
+        assert!(published.iter().any(|request| matches!(
+            &request.operation,
+            BrokerOperation::AcknowledgeProcessStart(_)
+        )));
+        assert_eq!(
+            published
+                .iter()
+                .filter(|request| matches!(
+                    &request.operation,
+                    BrokerOperation::AcknowledgeProcessStart(_)
+                ))
+                .count(),
+            RESERVED_LIFECYCLE_PENDING_CALLS
+        );
+        let released_request = published
+            .iter()
+            .find(|request| matches!(&request.operation, BrokerOperation::CloseObject(_)))
+            .unwrap();
+        write_payload(
+            &mut responses,
+            &encode_response(response(released_request.request_id)),
+        );
+        let released = read_request(&mut requests);
+        assert!(
+            !published
+                .iter()
+                .any(|request| request.request_id == released.request_id)
+        );
 
         shutdown.shutdown().unwrap();
         let completed = callers

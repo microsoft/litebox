@@ -262,7 +262,7 @@ fn run_fake_runner(args: &[OsString]) {
                 bootstrap,
                 inherited_objects,
             ),
-            Err(BrokerLocalError::Broker(ErrorCode::PeerClosed))
+            Err(BrokerLocalError::Broker(ErrorCode::UnsupportedOperation))
         ));
         let started = local
             .request_process_start(
@@ -394,6 +394,9 @@ fn run_fake_child(control_socket_path: &Path) {
     .unwrap();
     let bootstrap = bootstrap.expect("child negotiation must include startup data");
     if bootstrap.format == FAILING_BOOTSTRAP_FORMAT {
+        local
+            .report_process_start_failure(ErrorCode::UnsupportedOperation)
+            .unwrap();
         return;
     }
     assert_eq!(bootstrap.format, TEST_BOOTSTRAP_FORMAT);

@@ -62,7 +62,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ) -> Result<(), Channel::Error> {
         match self.request(BrokerOperation::AcknowledgeProcessStart(token))? {
             BrokerResult::ProcessStartAcknowledged => Ok(()),
-            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
+            BrokerResult::ProcessStartFailed(error) | BrokerResult::Error(error) => {
+                Err(BrokerLocalError::Broker(error))
+            }
             response => {
                 panic!("broker returned unexpected process-start acknowledgement: {response:?}")
             }
@@ -81,6 +83,25 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             BrokerResult::ProcessReady => Ok(()),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
             response => panic!("broker returned unexpected process-ready response: {response:?}"),
+        }
+    }
+
+    /// Reports that this child rejected its startup data before becoming ready.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for another operation or echoes
+    /// a different failure.
+    pub fn report_process_start_failure(&self, error: ErrorCode) -> Result<(), Channel::Error> {
+        match self.request(BrokerOperation::ReportProcessStartFailure(error))? {
+            BrokerResult::ProcessStartFailed(reported) if reported == error => Ok(()),
+            BrokerResult::ProcessStartFailed(reported) => {
+                panic!("broker reported a different process-start failure: {reported}")
+            }
+            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
+            response => {
+                panic!("broker returned unexpected process-start failure response: {response:?}")
+            }
         }
     }
 }

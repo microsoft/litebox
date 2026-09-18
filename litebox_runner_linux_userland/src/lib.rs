@@ -3,6 +3,7 @@
 
 use anyhow::{Context as _, Result, anyhow};
 use clap::Parser;
+use litebox_broker_protocol::error::ErrorCode;
 use litebox_platform_linux_userland::LinuxUserland as Platform;
 use std::path::PathBuf;
 
@@ -106,7 +107,10 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
             .broker_control_channel
             .as_deref()
             .context("--child requires --broker-control-channel")?;
-        let (_connection, bootstrap) = broker::connect_child(control_socket_path)?;
+        let (connection, bootstrap) = broker::connect_child(control_socket_path)?;
+        connection
+            .local
+            .report_process_start_failure(ErrorCode::UnsupportedOperation)?;
         return Err(anyhow!(
             "unsupported child Linux process bootstrap format {:?} version {:?}",
             bootstrap.format,

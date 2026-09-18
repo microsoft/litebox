@@ -474,7 +474,11 @@ mod tests {
     }
 
     #[test]
-    fn pending_capacity_blocks_before_sixty_fifth_publication() {
+    fn pending_capacity_reserves_lifecycle_calls() {
+        use litebox_broker_transport::pending_calls::{
+            MAX_ORDINARY_PENDING_CALLS, RESERVED_LIFECYCLE_PENDING_CALLS,
+        };
+
         let control_name = pipe_name("pending-capacity-control");
         let control_listener = WindowsNamedPipeListener::bind(&control_name).unwrap();
         let (local_ring, host_ring) = control_rings();
@@ -499,18 +503,40 @@ mod tests {
                 let HostReceive::Message(request) = requests.recv_request().unwrap() else {
                     panic!("expected pending request");
                 };
-                published.push(request.request_id);
+                published.push(request);
             }
+            assert!(published.iter().any(|request| matches!(
+                &request.operation,
+                BrokerOperation::AcknowledgeProcessStart(_)
+            )));
+            assert_eq!(
+                published
+                    .iter()
+                    .filter(|request| matches!(
+                        &request.operation,
+                        BrokerOperation::AcknowledgeProcessStart(_)
+                    ))
+                    .count(),
+                RESERVED_LIFECYCLE_PENDING_CALLS
+            );
+            let released_request = published
+                .iter()
+                .find(|request| matches!(&request.operation, BrokerOperation::CloseObject(_)))
+                .unwrap();
             responses
                 .send_response(&BrokerResponse {
-                    request_id: published[0],
+                    request_id: released_request.request_id,
                     result: BrokerResult::ObjectClosed,
                 })
                 .unwrap();
             let HostReceive::Message(released) = requests.recv_request().unwrap() else {
                 panic!("expected released request");
             };
-            assert!(!published.contains(&released.request_id));
+            assert!(
+                !published
+                    .iter()
+                    .any(|request| request.request_id == released.request_id)
+            );
             shutdown.shutdown().unwrap();
         });
 
@@ -529,7 +555,7 @@ mod tests {
         let start = Arc::new(Barrier::new(
             litebox_broker_transport::pending_calls::MAX_PENDING_CALLS + 2,
         ));
-        let callers = (0..=litebox_broker_transport::pending_calls::MAX_PENDING_CALLS)
+        let mut callers = (0..=MAX_ORDINARY_PENDING_CALLS)
             .map(|id| {
                 let calls = Arc::clone(&calls);
                 let start = Arc::clone(&start);
@@ -542,6 +568,19 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
+        callers.extend((0..RESERVED_LIFECYCLE_PENDING_CALLS).map(|index| {
+            let lifecycle_calls = Arc::clone(&calls);
+            let lifecycle_start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                lifecycle_start.wait();
+                lifecycle_calls.call(BrokerRequest {
+                    request_id: RequestId((MAX_ORDINARY_PENDING_CALLS + 1 + index) as u64),
+                    operation: BrokerOperation::AcknowledgeProcessStart(
+                        litebox_broker_protocol::process::ProcessStartToken(index as u64),
+                    ),
+                })
+            })
+        }));
         start.wait();
 
         host.join().unwrap();

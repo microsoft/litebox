@@ -10,6 +10,7 @@ extern crate alloc;
 use anyhow::{Context as _, Result};
 use clap::Parser;
 use litebox_broker_local_userland as broker;
+use litebox_broker_protocol::error::ErrorCode;
 use litebox_platform_windows_userland::{GuestTlsMode, WindowsUserland};
 
 /// Runs a Windows PE program with LiteBox on unmodified Windows and returns its exit code.
@@ -74,7 +75,10 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
             .broker_control_channel
             .as_deref()
             .context("--child requires --broker-control-channel")?;
-        let (_connection, bootstrap) = broker::connect_child(control_pipe)?;
+        let (connection, bootstrap) = broker::connect_child(control_pipe)?;
+        connection
+            .local
+            .report_process_start_failure(ErrorCode::UnsupportedOperation)?;
         anyhow::bail!(
             "unsupported child Windows process bootstrap format {:?} version {:?}",
             bootstrap.format,

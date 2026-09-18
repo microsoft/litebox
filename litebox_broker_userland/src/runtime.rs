@@ -25,13 +25,14 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use litebox_broker_core::BrokerCore;
+use litebox_broker_core::{BrokerCore, BrokerProcess};
 use litebox_broker_host::{
     BrokerHostAssociation, BrokerHostError, ConnectionTermination, ProcessStartupData,
-    setup_connection,
+    setup_connection_with_process,
 };
+use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::error::ErrorCode;
-use litebox_broker_protocol::message::BrokerRequest;
+use litebox_broker_protocol::message::{BrokerOperation, BrokerRequest};
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_LAYOUT;
 use litebox_broker_transport::channel::{
     HostAssociationShutdown, HostNotificationChannel, HostReceive, HostRequestSource,
@@ -44,8 +45,26 @@ use crate::readiness::ReadinessPublisherRuntime;
 use crate::runner::{ChildRunner, RunnerChildren};
 
 const REQUEST_QUEUE_CAPACITY: usize = 64;
+pub(crate) const LIFECYCLE_CONTROL_WORKER_COUNT: usize = crate::WORKER_COUNT;
+pub(crate) const LIFECYCLE_CONTROL_QUEUE_CAPACITY: usize = crate::WORKER_COUNT;
 const REQUEST_QUEUE_RETRY_DELAY: Duration = Duration::from_millis(1);
 const REQUEST_QUEUE_STALL_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub(crate) struct AssociationRunResult {
+    pub(crate) result: IoResult<()>,
+    pub(crate) process: Option<Arc<BrokerProcess>>,
+    pub(crate) panicked: bool,
+    pub(crate) abnormal: bool,
+    pub(crate) failure_cause: AssociationFailureCause,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AssociationFailureCause {
+    None,
+    PeerClosed,
+    RunnerExit,
+    Other,
+}
 
 /// Serves one broker association from setup through teardown.
 ///
@@ -84,7 +103,7 @@ where
     RequestSource: HostRequestSource<Error = IoError>,
     ResponseSink: HostResponseSink<Error = IoError> + Clone + Send,
     NotificationChannel: HostNotificationChannel<Error = IoError> + Send,
-    Shutdown: HostAssociationShutdown<Error = IoError> + Send + Sync,
+    Shutdown: HostAssociationShutdown<Error = IoError> + Send + Sync + 'static,
 {
     serve_association_with_children(
         broker,
@@ -93,6 +112,9 @@ where
         create_control_memory,
         send_shared_memory,
         activate,
+        None,
+        None,
+        None,
         None,
         None,
     )
@@ -116,17 +138,21 @@ pub(crate) fn serve_runner_association<
         ControlRing<Memory>,
     ) -> IoResult<(RequestSource, ResponseSink, NotificationChannel, Shutdown)>,
     children: Arc<RunnerChildren>,
-) -> IoResult<()>
+) -> AssociationRunResult
 where
     Memory: ControlRingMemory,
     SetupChannel: HostSetupChannel<Error = IoError>,
     RequestSource: HostRequestSource<Error = IoError>,
     ResponseSink: HostResponseSink<Error = IoError> + Clone + Send,
     NotificationChannel: HostNotificationChannel<Error = IoError> + Send,
-    Shutdown: HostAssociationShutdown<Error = IoError> + Send + Sync,
+    Shutdown: HostAssociationShutdown<Error = IoError> + Send + Sync + 'static,
 {
+    let panicked = AtomicBool::new(false);
+    let abnormal = AtomicBool::new(false);
+    let process = Mutex::new(None);
+    let defer_process_finish = child.is_none();
     let broker = children.broker.clone();
-    serve_association_with_children(
+    let result = serve_association_with_children(
         &broker,
         control_channel,
         create_shared_memory,
@@ -135,7 +161,33 @@ where
         activate,
         Some(children),
         child,
-    )
+        Some(&panicked),
+        Some(&abnormal),
+        defer_process_finish.then_some(&process),
+    );
+    let failure_cause = match result.as_ref() {
+        Ok(()) => AssociationFailureCause::None,
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::BrokenPipe
+                    | ErrorKind::UnexpectedEof
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+            ) =>
+        {
+            AssociationFailureCause::PeerClosed
+        }
+        Err(_) => AssociationFailureCause::Other,
+    };
+    AssociationRunResult {
+        result,
+        process: process.into_inner().expect("runner process mutex poisoned"),
+        panicked: panicked.load(Ordering::Acquire),
+        abnormal: abnormal.load(Ordering::Acquire)
+            || failure_cause == AssociationFailureCause::Other,
+        failure_cause,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -158,6 +210,9 @@ fn serve_association_with_children<
     ) -> IoResult<(RequestSource, ResponseSink, NotificationChannel, Shutdown)>,
     children: Option<Arc<RunnerChildren>>,
     child: Option<ChildRunner>,
+    panicked_out: Option<&AtomicBool>,
+    abnormal_out: Option<&AtomicBool>,
+    process_out: Option<&Mutex<Option<Arc<BrokerProcess>>>>,
 ) -> IoResult<()>
 where
     Memory: ControlRingMemory,
@@ -165,12 +220,13 @@ where
     RequestSource: HostRequestSource<Error = IoError>,
     ResponseSink: HostResponseSink<Error = IoError> + Clone + Send,
     NotificationChannel: HostNotificationChannel<Error = IoError> + Send,
-    Shutdown: HostAssociationShutdown<Error = IoError> + Send + Sync,
+    Shutdown: HostAssociationShutdown<Error = IoError> + Send + Sync + 'static,
 {
     let is_child = child.is_some();
     let (process, startup) = match child {
         Some(ChildRunner {
             process,
+            launch: _,
             inherited_objects,
             format,
             version,
@@ -193,13 +249,20 @@ where
     let control_ring = ControlRing::new(control_memory)
         .map_err(|error| IoError::other(format!("failed to create control ring: {error:?}")))?;
     let readiness = Arc::new(ReadinessPublisherRuntime::new());
-    let association = match setup_connection(
+    let association = match setup_connection_with_process(
         broker,
         process,
         startup,
         &mut control_channel,
         &shared_buffers,
         readiness.clone(),
+        |process| {
+            let Some(process_out) = process_out else {
+                return false;
+            };
+            *process_out.lock().expect("runner process mutex poisoned") = Some(Arc::clone(process));
+            true
+        },
         |channel| send_shared_memory(channel, shared_buffers.memory(), control_ring.memory()),
     )
     .map_err(map_host_error)?
@@ -228,7 +291,7 @@ where
         match activate(control_channel, control_ring) {
             Ok(active) => active,
             Err(error) => {
-                if !is_child {
+                if !is_child && process_out.is_none() {
                     association.finish();
                 }
                 return Err(error);
@@ -242,6 +305,9 @@ where
         notification_channel,
         shutdown,
         children,
+        !is_child && process_out.is_none(),
+        panicked_out,
+        abnormal_out,
     )
 }
 
@@ -272,6 +338,9 @@ fn map_host_error(error: BrokerHostError<IoError>) -> IoError {
         BrokerHostError::SharedBufferLayoutMismatch => {
             IoError::new(ErrorKind::InvalidData, description)
         }
+        BrokerHostError::AssociationFailed => {
+            IoError::new(ErrorKind::ConnectionAborted, description)
+        }
         _ => IoError::other(description),
     }
 }
@@ -285,6 +354,7 @@ struct HostAssociationFailureCoordinator<Shutdown> {
     failed: AtomicBool,
     /// Whether an association worker panicked, requiring teardown without ID reuse.
     panicked: AtomicBool,
+    abnormal: AtomicBool,
     error: Mutex<Option<IoError>>,
     shutdown: Shutdown,
 }
@@ -296,6 +366,7 @@ impl<Shutdown: HostAssociationShutdown<Error = IoError>>
         Self {
             failed: AtomicBool::new(false),
             panicked: AtomicBool::new(false),
+            abnormal: AtomicBool::new(false),
             error: Mutex::new(None),
             shutdown,
         }
@@ -306,6 +377,15 @@ impl<Shutdown: HostAssociationShutdown<Error = IoError>>
     }
 
     fn report(&self, error: IoError) {
+        if !matches!(
+            error.kind(),
+            ErrorKind::BrokenPipe
+                | ErrorKind::UnexpectedEof
+                | ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+        ) {
+            self.abnormal.store(true, Ordering::Release);
+        }
         if self.failed.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -323,6 +403,10 @@ impl<Shutdown: HostAssociationShutdown<Error = IoError>>
 
     fn panicked(&self) -> bool {
         self.panicked.load(Ordering::Acquire)
+    }
+
+    fn abnormal(&self) -> bool {
+        self.abnormal.load(Ordering::Acquire)
     }
 
     /// Ends the association transport without recording a failure.
@@ -417,7 +501,7 @@ where
     RequestSource: HostRequestSource<Error = IoError>,
     ResponseSink: HostResponseSink<Error = IoError> + Clone + Send,
     NotificationChannel: HostNotificationChannel<Error = IoError> + Send,
-    Shutdown: HostAssociationShutdown<Error = IoError> + Send + Sync,
+    Shutdown: HostAssociationShutdown<Error = IoError> + Send + Sync + 'static,
 {
     dispatch_requests_with_children(
         association,
@@ -427,9 +511,13 @@ where
         notification_channel,
         shutdown,
         None,
+        true,
+        None,
+        None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_requests_with_children<
     Memory,
     RequestSource,
@@ -444,20 +532,43 @@ fn dispatch_requests_with_children<
     mut notification_channel: NotificationChannel,
     shutdown: Shutdown,
     children: Option<Arc<RunnerChildren>>,
+    finish_process: bool,
+    panicked_out: Option<&AtomicBool>,
+    abnormal_out: Option<&AtomicBool>,
 ) -> IoResult<()>
 where
     Memory: SharedMemory,
     RequestSource: HostRequestSource<Error = IoError>,
     ResponseSink: HostResponseSink<Error = IoError> + Clone + Send,
     NotificationChannel: HostNotificationChannel<Error = IoError> + Send,
-    Shutdown: HostAssociationShutdown<Error = IoError> + Send + Sync,
+    Shutdown: HostAssociationShutdown<Error = IoError> + Send + Sync + 'static,
 {
     let association = Arc::new(association);
+    let process_id = association.process_id();
     let failure_coordinator = Arc::new(HostAssociationFailureCoordinator::new(shutdown));
+    if let Some(children) = &children {
+        let association_failure = Arc::clone(&failure_coordinator);
+        let association_failure: crate::runner::AssociationFailure = Arc::new(move || {
+            association_failure.report(IoError::new(
+                ErrorKind::ConnectionAborted,
+                "process association terminated by lifecycle control",
+            ));
+        });
+        if let Err(error) = children
+            .register_association(association.process_id(), Arc::clone(&association_failure))
+        {
+            failure_coordinator.report(error);
+        } else {
+            children
+                .install_child_association_failure(association.process_id(), association_failure);
+        }
+    }
     let (request_sender, request_receiver) = sync_channel(REQUEST_QUEUE_CAPACITY);
     let request_receiver = Arc::new(Mutex::new(request_receiver));
+    let (control_sender, control_receiver) = sync_channel(LIFECYCLE_CONTROL_QUEUE_CAPACITY);
+    let control_receiver = Arc::new(Mutex::new(control_receiver));
 
-    std::thread::scope(|scope| {
+    let draining_launches = std::thread::scope(|scope| {
         let publisher_readiness = Arc::clone(&readiness);
         let publisher_failure_coordinator = Arc::clone(&failure_coordinator);
         let publisher = std::thread::Builder::new()
@@ -494,7 +605,31 @@ where
             association: &association,
         };
 
-        let mut workers = Vec::with_capacity(crate::WORKER_COUNT);
+        let mut workers = Vec::with_capacity(crate::WORKER_COUNT + LIFECYCLE_CONTROL_WORKER_COUNT);
+        for worker_id in 0..LIFECYCLE_CONTROL_WORKER_COUNT {
+            let association = Arc::clone(&association);
+            let control_receiver = Arc::clone(&control_receiver);
+            let response_sink = response_sink.clone();
+            let worker_failure_coordinator = Arc::clone(&failure_coordinator);
+            let worker_children = children.clone();
+            match std::thread::Builder::new()
+                .name(format!("litebox-broker-lifecycle-worker-{worker_id}"))
+                .spawn_scoped(scope, move || {
+                    run_worker(
+                        &association,
+                        &control_receiver,
+                        &response_sink,
+                        &worker_failure_coordinator,
+                        worker_children.as_ref(),
+                    );
+                }) {
+                Ok(worker) => workers.push(worker),
+                Err(error) => {
+                    failure_coordinator.report(error);
+                    break;
+                }
+            }
+        }
         for worker_id in 0..crate::WORKER_COUNT {
             let association = Arc::clone(&association);
             let request_receiver = Arc::clone(&request_receiver);
@@ -520,11 +655,18 @@ where
             }
         }
 
-        read_requests(&mut request_source, request_sender, &failure_coordinator);
+        read_requests(
+            &mut request_source,
+            request_sender,
+            control_sender,
+            &failure_coordinator,
+            children.as_ref(),
+            process_id,
+        );
         drop(cancellation);
-        if let Some(children) = &children {
-            children.association_ended(association.process_id());
-        }
+        let draining_launches = children
+            .as_ref()
+            .map_or_else(Vec::new, |children| children.association_ending(process_id));
         for worker in workers {
             if worker.join().is_err() {
                 failure_coordinator.report_panic(IoError::other("broker request worker panicked"));
@@ -544,7 +686,12 @@ where
         {
             failure_coordinator.report_panic(IoError::other("broker readiness publisher panicked"));
         }
+        draining_launches
     });
+
+    if let Some(children) = &children {
+        children.association_ended(process_id, draining_launches);
+    }
 
     let result = match failure_coordinator.take_error() {
         Some(error) => Err(error),
@@ -553,7 +700,14 @@ where
     let Ok(association) = Arc::try_unwrap(association) else {
         panic!("all broker association workers must be joined before teardown");
     };
-    if failure_coordinator.panicked() {
+    let panicked = failure_coordinator.panicked();
+    if let Some(panicked_out) = panicked_out {
+        panicked_out.store(panicked, Ordering::Release);
+    }
+    if let Some(abnormal_out) = abnormal_out {
+        abnormal_out.store(failure_coordinator.abnormal(), Ordering::Release);
+    }
+    if panicked || !finish_process {
         drop(association);
     } else {
         association.finish();
@@ -564,7 +718,10 @@ where
 fn read_requests<RequestSource, Shutdown>(
     request_source: &mut RequestSource,
     request_sender: SyncSender<BrokerRequest>,
+    control_sender: SyncSender<BrokerRequest>,
     failure_coordinator: &HostAssociationFailureCoordinator<Shutdown>,
+    children: Option<&Arc<RunnerChildren>>,
+    process_id: ProcessId,
 ) where
     RequestSource: HostRequestSource<Error = IoError>,
     Shutdown: HostAssociationShutdown<Error = IoError>,
@@ -575,8 +732,24 @@ fn read_requests<RequestSource, Shutdown>(
         }
         match request_source.recv_request() {
             Ok(HostReceive::Message(request)) => {
+                if let BrokerOperation::AcknowledgeProcessStart(token) = &request.operation
+                    && let Some(children) = children
+                    && let Err(error) = children.admit_acknowledgement(process_id, *token)
+                {
+                    failure_coordinator.report(map_host_error(BrokerHostError::Broker(error)));
+                    break;
+                }
+                let sender = if matches!(
+                    &request.operation,
+                    BrokerOperation::AcknowledgeProcessStart(_)
+                        | BrokerOperation::ReportProcessStartFailure(_)
+                ) {
+                    &control_sender
+                } else {
+                    &request_sender
+                };
                 if !enqueue_request(
-                    &request_sender,
+                    sender,
                     request,
                     failure_coordinator,
                     REQUEST_QUEUE_STALL_TIMEOUT,
@@ -670,14 +843,14 @@ fn run_worker<Memory, ResponseSink, Shutdown>(
                     })
                 },
                 |response| response_sink.send_response(response),
-                |result| {
+                |operation, result| {
                     if let Some(children) = children {
-                        children.response_sent(process_id, result);
+                        children.response_sent(process_id, operation, result);
                     }
                 },
             )
         })) {
-            Ok(Ok(())) => {}
+            Ok(Ok(()) | Err(BrokerHostError::AssociationFailed)) => {}
             Ok(Err(error)) => failure_coordinator.report(map_host_error(error)),
             Err(_) => {
                 failure_coordinator.report_panic(IoError::other("broker request worker panicked"));
@@ -1111,6 +1284,24 @@ mod tests {
         assert!(!failure_coordinator.panicked());
         assert_eq!(error.kind(), ErrorKind::TimedOut);
         assert_eq!(error.to_string(), "first failure");
+    }
+
+    #[test]
+    fn later_protocol_failure_upgrades_abnormal_disposition() {
+        let association = live_association();
+        let failure_coordinator = HostAssociationFailureCoordinator::new(association.shutdown);
+
+        failure_coordinator.report(IoError::new(
+            ErrorKind::ConnectionAborted,
+            "lifecycle shutdown",
+        ));
+        failure_coordinator.report(IoError::new(ErrorKind::InvalidData, "protocol failure"));
+
+        assert!(failure_coordinator.abnormal());
+        assert_eq!(
+            failure_coordinator.take_error().unwrap().kind(),
+            ErrorKind::ConnectionAborted
+        );
     }
 
     #[test]

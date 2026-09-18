@@ -77,6 +77,11 @@ struct ProcessReferences {
     pending_handles: usize,
 }
 
+struct ProcessThreads {
+    entries: HashMap<ThreadId, BrokerThread>,
+    startup_pin: Option<ThreadId>,
+}
+
 /// Broker-owned state for one guest thread.
 ///
 /// Execution remains platform-local. This object owns the authoritative
@@ -115,7 +120,7 @@ pub struct BrokerProcess {
     /// Handles of the live object references owned by this process.
     references: Mutex<ProcessReferences>,
     /// Authoritative broker threads owned by this process.
-    threads: Mutex<HashMap<ThreadId, BrokerThread>>,
+    threads: Mutex<ProcessThreads>,
     /// Pipe capacity charged to this process by live pipe objects.
     pub(crate) reserved_pipe_capacity: Arc<AtomicUsize>,
     /// Socket quota held by pending, live, and closing in-flight resources.
@@ -150,7 +155,10 @@ impl BrokerProcess {
                 handles: Vec::new(),
                 pending_handles: 0,
             }),
-            threads: Mutex::new(HashMap::new()),
+            threads: Mutex::new(ProcessThreads {
+                entries: HashMap::new(),
+                startup_pin: None,
+            }),
             reserved_pipe_capacity: Arc::new(AtomicUsize::new(0)),
             reserved_sockets: Arc::new(AtomicUsize::new(0)),
             cancellation: AssociationCancellation::default(),
@@ -237,10 +245,11 @@ impl BrokerProcess {
     /// invariants.
     pub fn create_thread(&self) -> Result<ThreadId> {
         let mut threads = self.threads.lock();
-        if threads.len() >= self.core.limits.max_threads_per_process {
+        if threads.entries.len() >= self.core.limits.max_threads_per_process {
             return Err(BrokerError::ResourceExhausted);
         }
         threads
+            .entries
             .try_reserve(1)
             .map_err(|_| BrokerError::OutOfMemory)?;
         self.core
@@ -261,19 +270,52 @@ impl BrokerProcess {
         let thread = BrokerThread::new(ThreadId(raw_id));
         let thread_id = thread.id();
         assert!(
-            threads.insert(thread_id, thread).is_none(),
+            threads.entries.insert(thread_id, thread).is_none(),
             "the ID allocator returned an occupied thread ID"
         );
         Ok(thread_id)
     }
 
+    /// Returns whether this process owns the live broker thread.
+    #[must_use]
+    pub fn owns_thread(&self, thread_id: ThreadId) -> bool {
+        self.threads.lock().entries.contains_key(&thread_id)
+    }
+
+    /// Pins a live thread while its identity is part of process-start publication.
+    pub fn pin_startup_thread(&self, thread_id: ThreadId) -> Result<()> {
+        let mut threads = self.threads.lock();
+        if !threads.entries.contains_key(&thread_id) {
+            return Err(BrokerError::UnknownObject);
+        }
+        if threads.startup_pin.is_some() {
+            return Err(BrokerError::Internal);
+        }
+        threads.startup_pin = Some(thread_id);
+        Ok(())
+    }
+
+    /// Releases a thread identity after process-start publication reaches a terminal state.
+    pub fn release_startup_thread(&self, thread_id: ThreadId) -> Result<()> {
+        let mut threads = self.threads.lock();
+        if threads.startup_pin != Some(thread_id) {
+            return Err(BrokerError::Internal);
+        }
+        threads.startup_pin = None;
+        Ok(())
+    }
+
     /// Records broker thread exit after its local task teardown completes.
     pub fn exit_thread(&self, thread_id: ThreadId) -> Result<()> {
-        let thread = self
-            .threads
-            .lock()
+        let mut threads = self.threads.lock();
+        if threads.startup_pin == Some(thread_id) {
+            return Err(BrokerError::WouldBlock);
+        }
+        let thread = threads
+            .entries
             .remove(&thread_id)
             .ok_or(BrokerError::UnknownObject)?;
+        drop(threads);
         self.core
             .active_thread_count
             .fetch_sub(1, Ordering::Relaxed);
@@ -300,6 +342,15 @@ impl BrokerProcess {
     /// after an unwind. Calling this method more than once is harmless.
     pub fn finish(self: Arc<Self>) {
         self.cleanup(true);
+    }
+
+    /// Completes abnormal process teardown without releasing numeric IDs.
+    ///
+    /// Calling this method more than once is harmless. It is used after an
+    /// unwind or invariant failure where reusing process or thread IDs would
+    /// make later observations ambiguous.
+    pub fn finish_abnormal(self: Arc<Self>) {
+        self.cleanup(false);
     }
 
     pub(crate) fn create_object_reference(&self, object: ObjectEntry) -> Result<ObjectHandle> {
@@ -760,7 +811,11 @@ impl BrokerProcess {
             invariant_fault = true;
         }
 
-        let threads = core::mem::take(&mut *self.threads.lock());
+        let threads = {
+            let mut threads = self.threads.lock();
+            threads.startup_pin = None;
+            core::mem::take(&mut threads.entries)
+        };
         if release_ids && !invariant_fault {
             self.core
                 .active_thread_count
@@ -906,6 +961,45 @@ mod tests {
         assert_eq!(thread.0, 2);
         assert_eq!(second.id().0, 3);
         assert_eq!(second.parent_id(), None);
+    }
+
+    #[test]
+    fn process_recognizes_only_its_live_threads() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        let first = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let second = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let thread = first.create_thread().unwrap();
+
+        assert!(first.owns_thread(thread));
+        assert!(!second.owns_thread(thread));
+        first.exit_thread(thread).unwrap();
+        assert!(!first.owns_thread(thread));
+    }
+
+    #[test]
+    fn startup_thread_pin_defers_thread_exit_until_publication_completes() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let thread = process.create_thread().unwrap();
+
+        process.pin_startup_thread(thread).unwrap();
+        assert_eq!(process.exit_thread(thread), Err(BrokerError::WouldBlock));
+        process.release_startup_thread(thread).unwrap();
+        assert_eq!(process.exit_thread(thread), Ok(()));
     }
 
     #[test]

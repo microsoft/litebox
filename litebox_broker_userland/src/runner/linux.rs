@@ -6,7 +6,7 @@ use std::io::Result as IoResult;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::Child;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
@@ -16,6 +16,33 @@ use litebox_broker_transport_linux_userland::unix_socket::{
 };
 
 use super::{ChildRunner, RunnerChildren, SETUP_TIMEOUT, accept_runner_channel};
+use crate::runtime::{AssociationFailureCause, AssociationRunResult};
+
+pub(super) struct PlatformRunnerShutdown {
+    process_id: u32,
+}
+
+fn runner_has_exited(runner: &Arc<Mutex<Child>>) -> IoResult<bool> {
+    non_reaping_runner_has_exited(runner.lock().expect("runner process mutex poisoned").id())
+}
+
+impl PlatformRunnerShutdown {
+    pub(super) fn new(runner: &Child) -> Self {
+        Self {
+            process_id: runner.id(),
+        }
+    }
+
+    pub(super) fn shutdown(&self) -> bool {
+        // SAFETY: the unreaped `Child` keeps this PID allocated to the runner
+        // until the launch owner closes the endpoint and waits for it.
+        unsafe { libc::kill(self.process_id.cast_signed(), libc::SIGKILL) == 0 }
+    }
+
+    pub(super) fn has_exited(&self) -> IoResult<bool> {
+        non_reaping_runner_has_exited(self.process_id)
+    }
+}
 
 pub(super) struct PlatformRunnerEndpoint {
     socket_path: PathBuf,
@@ -44,9 +71,9 @@ impl PlatformRunnerEndpoint {
 
     pub(super) fn serve(
         &mut self,
-        runner: &mut Child,
+        runner: &Arc<Mutex<Child>>,
         children: Arc<RunnerChildren>,
-    ) -> IoResult<()> {
+    ) -> AssociationRunResult {
         serve_runner_process(
             self.listener
                 .as_ref()
@@ -58,10 +85,10 @@ impl PlatformRunnerEndpoint {
 
     pub(super) fn serve_child(
         &mut self,
-        runner: &mut Child,
+        runner: &Arc<Mutex<Child>>,
         child: ChildRunner,
         children: Arc<RunnerChildren>,
-    ) -> IoResult<()> {
+    ) -> AssociationRunResult {
         serve_child_runner_process(
             self.listener
                 .as_ref()
@@ -80,10 +107,26 @@ impl PlatformRunnerEndpoint {
 
 fn serve_runner_process(
     control_listener: &UnixListener,
-    runner: &mut Child,
+    runner: &Arc<Mutex<Child>>,
     children: Arc<RunnerChildren>,
-) -> IoResult<()> {
-    let (control_channel, setup_deadline) = accept_control_channel(control_listener, runner)?;
+) -> AssociationRunResult {
+    let (control_channel, setup_deadline) = match accept_control_channel(control_listener, runner) {
+        Ok(connection) => connection,
+        Err(error) => {
+            let failure_cause = if runner_has_exited(runner).unwrap_or(false) {
+                AssociationFailureCause::RunnerExit
+            } else {
+                AssociationFailureCause::Other
+            };
+            return AssociationRunResult {
+                result: Err(error),
+                process: None,
+                panicked: false,
+                abnormal: failure_cause == AssociationFailureCause::Other,
+                failure_cause,
+            };
+        }
+    };
     crate::runtime::serve_runner_association(
         None,
         control_channel,
@@ -101,12 +144,36 @@ fn serve_runner_process(
 
 fn serve_child_runner_process(
     control_listener: &UnixListener,
-    runner: &mut Child,
+    runner: &Arc<Mutex<Child>>,
     child: ChildRunner,
     children: Arc<RunnerChildren>,
-) -> IoResult<()> {
-    let (control_channel, setup_deadline) = accept_control_channel(control_listener, runner)?;
-    crate::runtime::serve_runner_association(
+) -> AssociationRunResult {
+    let (control_channel, setup_deadline) = match accept_control_channel(control_listener, runner) {
+        Ok(connection) => connection,
+        Err(error) => {
+            let failure_cause = if runner_has_exited(runner).unwrap_or(false) {
+                AssociationFailureCause::RunnerExit
+            } else if matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+            ) {
+                AssociationFailureCause::PeerClosed
+            } else {
+                AssociationFailureCause::Other
+            };
+            return AssociationRunResult {
+                result: Err(error),
+                process: None,
+                panicked: false,
+                abnormal: failure_cause == AssociationFailureCause::Other,
+                failure_cause,
+            };
+        }
+    };
+    let mut result = crate::runtime::serve_runner_association(
         Some(child),
         control_channel,
         || MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE),
@@ -118,27 +185,58 @@ fn serve_child_runner_process(
         },
         UnixStreamHostSetupChannel::into_active,
         children,
-    )
+    );
+    if result.failure_cause == AssociationFailureCause::Other
+        && result
+            .result
+            .as_ref()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::BrokenPipe)
+        && runner_has_exited(runner).unwrap_or(false)
+    {
+        result.failure_cause = AssociationFailureCause::RunnerExit;
+    }
+    result
 }
 
 fn accept_control_channel(
     control_listener: &UnixListener,
-    runner: &mut Child,
+    runner: &Arc<Mutex<Child>>,
 ) -> IoResult<(UnixStreamHostSetupChannel, Instant)> {
     let setup_deadline = Instant::now() + SETUP_TIMEOUT;
+    let runner_id = runner.lock().expect("runner process mutex poisoned").id();
     let control_stream = accept_runner_channel(
         setup_deadline,
         "control",
         || {
-            runner
-                .try_wait()
-                .map(|status| status.map(|status| format!("exited with {status}")))
+            non_reaping_runner_has_exited(runner_id)
+                .map(|exited| exited.then(|| "exited".to_owned()))
         },
         || control_listener.accept().map(|(stream, _)| stream),
     )?;
-    validate_peer_process(&control_stream, runner.id())?;
+    validate_peer_process(&control_stream, runner_id)?;
     Ok((
         UnixStreamHostSetupChannel::from_host_guaranteed(control_stream, setup_deadline),
         setup_deadline,
     ))
+}
+
+fn non_reaping_runner_has_exited(runner_id: u32) -> IoResult<bool> {
+    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+    // SAFETY: `info` points to writable `siginfo_t` storage, and `waitid` is
+    // restricted to observing this known child without consuming its status.
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            runner_id,
+            info.as_mut_ptr(),
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: successful `waitid` initialized `info`; `si_pid == 0` denotes
+    // that the nonblocking observation found no waitable child state.
+    let exited = unsafe { info.assume_init().si_pid() != 0 };
+    Ok(exited)
 }
