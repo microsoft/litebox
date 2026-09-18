@@ -95,9 +95,9 @@ struct AssociationState {
     shared_buffer_usage: SharedBufferUsage,
 }
 
-/// Failure classification for deployment-specific broker operations.
+/// Failure classification for broker request handling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BrokerHostExtensionError {
+pub enum RequestFailure {
     /// Return an error result and keep serving the association.
     Respond(ErrorCode),
     /// Fail the association without publishing a response.
@@ -116,7 +116,23 @@ pub struct ProcessStartupData {
     pub inherited_objects: Vec<ObjectHandle>,
 }
 
-impl<Memory: SharedMemory> BrokerHostAssociation<'_, Memory> {
+impl<'a, Memory: SharedMemory> BrokerHostAssociation<'a, Memory> {
+    fn new(
+        process: Arc<BrokerProcess>,
+        shared_buffers: &'a SharedBufferPool<Memory>,
+        readiness_sink: Arc<dyn ReadinessSink>,
+    ) -> Self {
+        Self {
+            process,
+            shared_buffers,
+            readiness_sink,
+            state: SpinMutex::new(AssociationState {
+                failed: false,
+                shared_buffer_usage: SharedBufferUsage::new(),
+            }),
+        }
+    }
+
     /// Returns the broker-assigned process ID for this association.
     #[must_use]
     pub fn process_id(&self) -> litebox_broker_protocol::ProcessId {
@@ -162,8 +178,7 @@ impl<Memory: SharedMemory> BrokerHostAssociation<'_, Memory> {
             &BrokerProcess,
             &BrokerOperation,
             &SharedBufferPool<Memory>,
-        )
-            -> Option<core::result::Result<BrokerResult, BrokerHostExtensionError>>,
+        ) -> Option<core::result::Result<BrokerResult, RequestFailure>>,
         send_response: impl FnOnce(&BrokerResponse) -> core::result::Result<(), ChannelError>,
         response_sent: impl FnOnce(&BrokerOperation, &BrokerResult),
     ) -> Result<(), ChannelError> {
@@ -192,10 +207,7 @@ impl<Memory: SharedMemory> BrokerHostAssociation<'_, Memory> {
         }
 
         let request_result = match extension(&self.process, &operation, self.shared_buffers) {
-            Some(result) => result.map_err(|error| match error {
-                BrokerHostExtensionError::Respond(error) => RequestFailure::Respond(error),
-                BrokerHostExtensionError::Abort(error) => RequestFailure::Abort(error),
-            }),
+            Some(result) => result,
             None => handle_request(
                 &self.process,
                 operation,
@@ -226,51 +238,10 @@ impl<Memory: SharedMemory> BrokerHostAssociation<'_, Memory> {
     }
 }
 
-/// Copies a validated operation-scoped shared-buffer sequence.
-pub fn copy_shared_buffer<Memory: SharedMemory>(
-    shared_buffers: &SharedBufferPool<Memory>,
-    buffer: SharedBufferSequence,
-    maximum_length: u32,
-) -> core::result::Result<Vec<u8>, BrokerHostExtensionError> {
-    read_shared_buffer(shared_buffers, buffer, maximum_length).map_err(|error| match error {
-        RequestFailure::Respond(error) => BrokerHostExtensionError::Respond(error),
-        RequestFailure::Abort(error) => BrokerHostExtensionError::Abort(error),
-    })
-}
-
-/// Authenticates and negotiates one broker control connection.
-///
-/// `send_shared_memory` runs after version negotiation and before the active
-/// association is returned.
-pub fn setup_connection<'a, SetupChannel, Memory, ChannelError>(
-    core: &BrokerCore,
-    process: Option<Arc<BrokerProcess>>,
-    startup: Option<ProcessStartupData>,
-    setup_channel: &mut SetupChannel,
-    shared_buffers: &'a SharedBufferPool<Memory>,
-    readiness_sink: Arc<dyn ReadinessSink>,
-    send_shared_memory: impl FnOnce(&mut SetupChannel) -> core::result::Result<(), ChannelError>,
-) -> Result<ConnectionSetup<'a, Memory>, ChannelError>
-where
-    SetupChannel: HostSetupChannel<Error = ChannelError>,
-    Memory: SharedMemory,
-{
-    setup_connection_with_process(
-        core,
-        process,
-        startup,
-        setup_channel,
-        shared_buffers,
-        readiness_sink,
-        |_| false,
-        send_shared_memory,
-    )
-}
-
 /// Authenticates and negotiates one broker control connection while allowing
 /// a deployment owner to retain the negotiated process before setup completes.
 #[allow(clippy::too_many_arguments)]
-pub fn setup_connection_with_process<'a, SetupChannel, Memory, ChannelError>(
+pub fn setup_connection<'a, SetupChannel, Memory, ChannelError>(
     core: &BrokerCore,
     process: Option<Arc<BrokerProcess>>,
     startup: Option<ProcessStartupData>,
@@ -305,7 +276,7 @@ where
             let buffer = SharedBufferSequence::new(&[SharedBufferSlotIndex(0)], bootstrap_length)
                 .map_err(|_| BrokerHostError::Broker(ErrorCode::Internal))?;
             write_shared_buffer(shared_buffers, buffer, &payload, MAX_PROCESS_BOOTSTRAP_SIZE)
-                .map_err(|error| BrokerHostError::Broker(request_failure_error(error)))?;
+                .map_err(|error| BrokerHostError::Broker(error.into()))?;
             Some(ProcessStartup {
                 bootstrap: ProcessBootstrap {
                     format,
@@ -405,35 +376,15 @@ where
             }
             return Err(BrokerHostError::Channel(error));
         }
-        return Ok(Ok(new_association(process, shared_buffers, readiness_sink)));
-    }
-}
-
-fn new_association<Memory: SharedMemory>(
-    process: Arc<BrokerProcess>,
-    shared_buffers: &SharedBufferPool<Memory>,
-    readiness_sink: Arc<dyn ReadinessSink>,
-) -> BrokerHostAssociation<'_, Memory> {
-    BrokerHostAssociation {
-        process,
-        shared_buffers,
-        readiness_sink,
-        state: SpinMutex::new(AssociationState {
-            failed: false,
-            shared_buffer_usage: SharedBufferUsage::new(),
-        }),
+        return Ok(Ok(BrokerHostAssociation::new(
+            process,
+            shared_buffers,
+            readiness_sink,
+        )));
     }
 }
 
 type RequestResult<T> = core::result::Result<T, RequestFailure>;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RequestFailure {
-    /// Send an error response and continue serving the association.
-    Respond(ErrorCode),
-    /// Terminate the association without sending a response.
-    Abort(ErrorCode),
-}
 
 impl From<litebox_broker_core::BrokerError> for RequestFailure {
     fn from(error: litebox_broker_core::BrokerError) -> Self {
@@ -443,6 +394,14 @@ impl From<litebox_broker_core::BrokerError> for RequestFailure {
                 Self::Abort(ErrorCode::Internal)
             }
             error => Self::Respond(error.into()),
+        }
+    }
+}
+
+impl From<RequestFailure> for ErrorCode {
+    fn from(error: RequestFailure) -> Self {
+        match error {
+            RequestFailure::Respond(error) | RequestFailure::Abort(error) => error,
         }
     }
 }
@@ -519,12 +478,6 @@ fn complete_request(
         Ok(response) => Ok(response),
         Err(RequestFailure::Respond(error)) => Ok(BrokerResult::Error(error)),
         Err(RequestFailure::Abort(error)) => Err(error),
-    }
-}
-
-const fn request_failure_error(error: RequestFailure) -> ErrorCode {
-    match error {
-        RequestFailure::Respond(error) | RequestFailure::Abort(error) => error,
     }
 }
 
@@ -636,7 +589,7 @@ fn handle_file_request<Memory: SharedMemory>(
             buffer,
             offset,
         }) => {
-            let data = read_shared_buffer(shared_buffers, buffer, MAX_FILE_TRANSFER_SIZE)?;
+            let data = copy_shared_buffer(shared_buffers, buffer, MAX_FILE_TRANSFER_SIZE)?;
             match litebox_broker_core::fs::write(process, handle, &data, offset)
                 .map_err(RequestFailure::from)?
             {
@@ -808,7 +761,8 @@ fn allocate_zeroed(length: u32) -> RequestResult<Vec<u8>> {
     Ok(data)
 }
 
-fn read_shared_buffer<Memory: SharedMemory>(
+/// Copies a validated operation-scoped shared-buffer sequence.
+pub fn copy_shared_buffer<Memory: SharedMemory>(
     shared_buffers: &SharedBufferPool<Memory>,
     buffer: SharedBufferSequence,
     max_length: u32,
@@ -864,7 +818,7 @@ fn read_file_path<Memory: SharedMemory>(
     shared_buffers: &SharedBufferPool<Memory>,
     buffer: SharedBufferSequence,
 ) -> RequestResult<alloc::string::String> {
-    let data = read_shared_buffer(shared_buffers, buffer, SHARED_BUFFER_SLOT_SIZE)?;
+    let data = copy_shared_buffer(shared_buffers, buffer, SHARED_BUFFER_SLOT_SIZE)?;
     let path = alloc::string::String::from_utf8(data)
         .map_err(|_| RequestFailure::Abort(ErrorCode::MalformedRequest))?;
     if !path.starts_with('/') {
@@ -895,7 +849,7 @@ fn handle_stdio_request<Memory: SharedMemory>(
             }))
         }
         StdioRequest::Write(WriteStdioRequest { stream, buffer }) => {
-            let data = read_shared_buffer(shared_buffers, buffer, MAX_STDIO_TRANSFER_SIZE)?;
+            let data = copy_shared_buffer(shared_buffers, buffer, MAX_STDIO_TRANSFER_SIZE)?;
             let written = litebox_broker_core::stdio::write(process, stream, &data)
                 .map_err(RequestFailure::from)?;
             Ok(StdioResponse::Write(WriteStdioResponse {
@@ -986,7 +940,7 @@ fn handle_socket_request<Memory: SharedMemory>(
                 return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
             }
             let data =
-                read_shared_buffer(shared_buffers, request.buffer, MAX_SOCKET_TRANSFER_SIZE)?;
+                copy_shared_buffer(shared_buffers, request.buffer, MAX_SOCKET_TRANSFER_SIZE)?;
             match litebox_broker_core::socket::send(process, request.handle, data, request.flags)
                 .map_err(RequestFailure::from)?
             {
@@ -1005,7 +959,7 @@ fn handle_socket_request<Memory: SharedMemory>(
             {
                 return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
             }
-            let data = read_shared_buffer(shared_buffers, request.buffer, MAX_UDP_DATAGRAM_SIZE)?;
+            let data = copy_shared_buffer(shared_buffers, request.buffer, MAX_UDP_DATAGRAM_SIZE)?;
             match litebox_broker_core::socket::send_to(
                 process,
                 request.handle,
@@ -1182,7 +1136,7 @@ fn handle_pipe_request<Memory: SharedMemory>(
             }))
         }
         PipeRequest::Write(request) => {
-            let data = read_shared_buffer(shared_buffers, request.buffer, MAX_PIPE_TRANSFER_SIZE)?;
+            let data = copy_shared_buffer(shared_buffers, request.buffer, MAX_PIPE_TRANSFER_SIZE)?;
             litebox_broker_core::pipe::write(process, request.handle, &data)
                 .map_err(RequestFailure::from)
                 .and_then(|written| {
@@ -1616,7 +1570,7 @@ mod tests {
         let retained = Mutex::new(None);
 
         assert!(matches!(
-            setup_connection_with_process(
+            setup_connection(
                 broker,
                 None,
                 None,
@@ -2864,6 +2818,7 @@ mod tests {
             control_channel,
             shared_buffers,
             test_readiness_sink(),
+            |_| false,
             send_shared_memory,
         )? {
             Ok(association) => association,

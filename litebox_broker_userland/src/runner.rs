@@ -14,7 +14,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use litebox_broker_core::{BrokerCore, BrokerError, BrokerProcess};
-use litebox_broker_host::{BrokerHostExtensionError, copy_shared_buffer};
+use litebox_broker_host::{RequestFailure, copy_shared_buffer};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult};
 use litebox_broker_protocol::process::{
@@ -545,7 +545,7 @@ impl RunnerChildren {
         process: &BrokerProcess,
         operation: &BrokerOperation,
         shared_buffers: &SharedBufferPool<Memory>,
-    ) -> Option<Result<BrokerResult, BrokerHostExtensionError>> {
+    ) -> Option<Result<BrokerResult, RequestFailure>> {
         match operation {
             BrokerOperation::StartProcess(request) => Some(
                 copy_shared_buffer(
@@ -573,7 +573,7 @@ impl RunnerChildren {
                     Ok(ProcessStartAcknowledgement::Failed(error)) => {
                         Ok(BrokerResult::ProcessStartFailed(error))
                     }
-                    Err(error) => Err(BrokerHostExtensionError::Abort(error)),
+                    Err(error) => Err(RequestFailure::Abort(error)),
                 })
             }
             BrokerOperation::ProcessReady(request) => Some(
@@ -1280,7 +1280,7 @@ impl Drop for WatchdogCompletion {
     }
 }
 
-const fn process_extension_error(error: ErrorCode) -> BrokerHostExtensionError {
+const fn process_extension_error(error: ErrorCode) -> RequestFailure {
     match error {
         ErrorCode::PolicyDenied
         | ErrorCode::UnknownObject
@@ -1289,8 +1289,8 @@ const fn process_extension_error(error: ErrorCode) -> BrokerHostExtensionError {
         | ErrorCode::WouldBlock
         | ErrorCode::PeerClosed
         | ErrorCode::OutOfMemory
-        | ErrorCode::UnsupportedOperation => BrokerHostExtensionError::Respond(error),
-        _ => BrokerHostExtensionError::Abort(error),
+        | ErrorCode::UnsupportedOperation => RequestFailure::Respond(error),
+        _ => RequestFailure::Abort(error),
     }
 }
 

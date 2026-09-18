@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use litebox_broker_core::{BrokerCore, BrokerProcess};
 use litebox_broker_host::{
     BrokerHostAssociation, BrokerHostError, ConnectionTermination, ProcessStartupData,
-    setup_connection_with_process,
+    setup_connection,
 };
 use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::error::ErrorCode;
@@ -249,7 +249,7 @@ where
     let control_ring = ControlRing::new(control_memory)
         .map_err(|error| IoError::other(format!("failed to create control ring: {error:?}")))?;
     let readiness = Arc::new(ReadinessPublisherRuntime::new());
-    let association = match setup_connection_with_process(
+    let association = match setup_connection(
         broker,
         process,
         startup,
@@ -1069,6 +1069,7 @@ mod tests {
                 &mut control,
                 &shared_buffers,
                 readiness.clone(),
+                |_| false,
                 |channel| {
                     channel.send_memfd(shared_buffers.memory(), None)?;
                     channel.send_memfd(control_ring.memory(), None)

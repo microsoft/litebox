@@ -64,6 +64,7 @@ fn spawn_host(
             &mut control,
             &shared_buffers,
             Arc::new(ReadinessPublisherRuntime::new()),
+            |_| false,
             |channel| {
                 channel.send_memfd(shared_buffers.memory(), None)?;
                 channel.send_memfd(control_ring.memory(), None)
@@ -157,6 +158,7 @@ fn host_serves_control_requests_and_notifications_over_shared_rings() {
             &mut control,
             &host_shared_buffers,
             Arc::new(ReadinessPublisherRuntime::new()),
+            |_| false,
             |channel| {
                 channel.send_memfd(host_shared_buffers.memory(), None)?;
                 channel.send_memfd(host_control_ring.memory(), None)

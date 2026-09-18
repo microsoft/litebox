@@ -526,6 +526,7 @@ fn run_test_broker_connection(
         &mut channel,
         &shared_buffers,
         readiness.clone(),
+        |_| false,
         |channel| {
             channel.send_memfd(shared_buffers.memory(), Some(setup_deadline))?;
             channel.send_memfd(control_ring.memory(), Some(setup_deadline))

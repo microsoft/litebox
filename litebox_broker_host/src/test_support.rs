@@ -103,6 +103,7 @@ impl LocalSetupChannel for InProcessBrokerSetup {
             &mut host_setup,
             shared_buffers,
             readiness,
+            |_| false,
             |_| Ok(()),
         )
         .expect("the in-process broker setup must succeed")
