@@ -98,7 +98,7 @@ fn serve_control_stream(
 ) -> IoResult<()> {
     let control_channel =
         WindowsNamedPipeHostSetupChannel::from_host_guaranteed(control_stream, setup_deadline);
-    litebox_broker_userland::runtime::serve_association(
+    litebox_broker_userland::runtime::serve_in_process_runner_association(
         broker,
         control_channel,
         || WindowsSharedMemory::create(SHARED_BUFFER_POOL_SIZE),

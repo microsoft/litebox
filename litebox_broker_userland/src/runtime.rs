@@ -14,8 +14,8 @@
 //! transport.
 //!
 //! Concurrency and worker sizing are deliberately not part of the public
-//! surface: [`serve_association`] is the only entry point, and it owns how
-//! many workers dispatch requests and how deeply the request queue may buffer.
+//! surface. Both association entry points delegate to one internal runtime
+//! that owns worker counts and request queue capacity.
 
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
@@ -32,7 +32,6 @@ use litebox_broker_host::{
 use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::message::{BrokerOperation, BrokerRequest};
-use litebox_broker_protocol::process::ProcessStartupData;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_LAYOUT;
 use litebox_broker_transport::channel::{
     HostAssociationShutdown, HostNotificationChannel, HostReceive, HostRequestSource,
@@ -42,11 +41,11 @@ use litebox_broker_transport::control_ring::ControlRing;
 use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedBufferPool, SharedMemory};
 
 use crate::readiness::ReadinessPublisherRuntime;
-use crate::runner::{ChildRunner, RunnerChildren};
+use crate::runner::{RunnerProcessManager, RunnerStartup};
 
 const REQUEST_QUEUE_CAPACITY: usize = 64;
-pub(crate) const LIFECYCLE_CONTROL_WORKER_COUNT: usize = crate::WORKER_COUNT;
-pub(crate) const LIFECYCLE_CONTROL_QUEUE_CAPACITY: usize = crate::WORKER_COUNT;
+pub(crate) const PROCESS_START_CONTROL_WORKER_COUNT: usize = crate::WORKER_COUNT;
+pub(crate) const PROCESS_START_CONTROL_QUEUE_CAPACITY: usize = crate::WORKER_COUNT;
 const REQUEST_QUEUE_RETRY_DELAY: Duration = Duration::from_millis(1);
 const REQUEST_QUEUE_STALL_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -66,7 +65,7 @@ pub(crate) enum AssociationFailureCause {
     Other,
 }
 
-/// Serves one broker association from setup through teardown.
+/// Serves an association for the development-only in-process runner.
 ///
 /// `control_channel` must already be configured with whatever deadline and
 /// peer authentication its transport requires; this function only negotiates
@@ -79,7 +78,7 @@ pub(crate) enum AssociationFailureCause {
 /// Returns once the association ends, whether by a clean peer close or a
 /// failure. Layout mismatches and broker setup failures are mapped to a
 /// precise [`std::io::Error`] rather than left as an opaque boxed error.
-pub fn serve_association<
+pub fn serve_in_process_runner_association<
     Memory,
     SetupChannel,
     RequestSource,
@@ -105,7 +104,7 @@ where
     NotificationChannel: HostNotificationChannel<Error = IoError> + Send,
     Shutdown: HostAssociationShutdown<Error = IoError> + Send + Sync + 'static,
 {
-    serve_association_with_children(
+    serve_association_inner(
         broker,
         control_channel,
         create_shared_memory,
@@ -120,7 +119,11 @@ where
     )
 }
 
-pub(crate) fn serve_runner_association<
+/// Serves an initial or parent-started association for an out-of-process runner.
+///
+/// Unlike the in-process path, this reports process ownership and failure
+/// details to `RunnerInstance`, which owns runner termination and cleanup.
+pub(crate) fn serve_out_of_process_runner_association<
     Memory,
     SetupChannel,
     RequestSource,
@@ -128,7 +131,7 @@ pub(crate) fn serve_runner_association<
     NotificationChannel,
     Shutdown,
 >(
-    child: Option<ChildRunner>,
+    startup: Option<RunnerStartup>,
     control_channel: SetupChannel,
     create_shared_memory: impl FnOnce() -> IoResult<Memory>,
     create_control_memory: impl FnOnce() -> IoResult<Memory>,
@@ -137,7 +140,7 @@ pub(crate) fn serve_runner_association<
         SetupChannel,
         ControlRing<Memory>,
     ) -> IoResult<(RequestSource, ResponseSink, NotificationChannel, Shutdown)>,
-    children: Arc<RunnerChildren>,
+    process_manager: Arc<RunnerProcessManager>,
 ) -> AssociationRunResult
 where
     Memory: ControlRingMemory,
@@ -150,17 +153,17 @@ where
     let panicked = AtomicBool::new(false);
     let abnormal = AtomicBool::new(false);
     let process = Mutex::new(None);
-    let defer_process_finish = child.is_none();
-    let broker = children.broker.clone();
-    let result = serve_association_with_children(
+    let defer_process_finish = startup.is_none();
+    let broker = process_manager.broker();
+    let result = serve_association_inner(
         &broker,
         control_channel,
         create_shared_memory,
         create_control_memory,
         send_shared_memory,
         activate,
-        Some(children),
-        child,
+        Some(process_manager),
+        startup,
         Some(&panicked),
         Some(&abnormal),
         defer_process_finish.then_some(&process),
@@ -191,7 +194,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn serve_association_with_children<
+fn serve_association_inner<
     Memory,
     SetupChannel,
     RequestSource,
@@ -208,8 +211,8 @@ fn serve_association_with_children<
         SetupChannel,
         ControlRing<Memory>,
     ) -> IoResult<(RequestSource, ResponseSink, NotificationChannel, Shutdown)>,
-    children: Option<Arc<RunnerChildren>>,
-    child: Option<ChildRunner>,
+    process_manager: Option<Arc<RunnerProcessManager>>,
+    startup: Option<RunnerStartup>,
     panicked_out: Option<&AtomicBool>,
     abnormal_out: Option<&AtomicBool>,
     process_out: Option<&Mutex<Option<Arc<BrokerProcess>>>>,
@@ -222,24 +225,12 @@ where
     NotificationChannel: HostNotificationChannel<Error = IoError> + Send,
     Shutdown: HostAssociationShutdown<Error = IoError> + Send + Sync + 'static,
 {
-    let is_child = child.is_some();
-    let (process, startup) = match child {
-        Some(ChildRunner {
-            process,
-            launch: _,
-            inherited_objects,
-            format,
-            version,
-            bootstrap,
-        }) => (
-            Some(process),
-            Some(ProcessStartupData {
-                format,
-                version,
-                payload: bootstrap,
-                inherited_objects,
-            }),
-        ),
+    let is_started_process = startup.is_some();
+    let (process, startup) = match startup {
+        Some(startup) => {
+            let (process, data) = startup.into_process_and_data();
+            (Some(process), Some(data))
+        }
         None => (None, None),
     };
     let shared_memory = create_shared_memory()?;
@@ -291,21 +282,21 @@ where
         match activate(control_channel, control_ring) {
             Ok(active) => active,
             Err(error) => {
-                if !is_child && process_out.is_none() {
+                if !is_started_process && process_out.is_none() {
                     association.finish();
                 }
                 return Err(error);
             }
         };
-    dispatch_requests_with_children(
+    dispatch_requests(
         association,
         readiness,
         request_source,
         response_sink,
         notification_channel,
         shutdown,
-        children,
-        !is_child && process_out.is_none(),
+        process_manager,
+        !is_started_process && process_out.is_none(),
         panicked_out,
         abnormal_out,
     )
@@ -487,51 +478,15 @@ impl<Memory: SharedMemory> Drop for AssociationCancellationGuard<'_, '_, Memory>
 /// `readiness` is created by the caller rather than here so readiness sources
 /// can record into the same runtime this publishes from. The Linux network
 /// reactor is currently its production source.
-#[cfg(all(test, target_os = "linux"))]
-fn dispatch_requests<Memory, RequestSource, ResponseSink, NotificationChannel, Shutdown>(
-    association: BrokerHostAssociation<'_, Memory>,
-    readiness: Arc<ReadinessPublisherRuntime>,
-    request_source: RequestSource,
-    response_sink: ResponseSink,
-    notification_channel: NotificationChannel,
-    shutdown: Shutdown,
-) -> IoResult<()>
-where
-    Memory: SharedMemory,
-    RequestSource: HostRequestSource<Error = IoError>,
-    ResponseSink: HostResponseSink<Error = IoError> + Clone + Send,
-    NotificationChannel: HostNotificationChannel<Error = IoError> + Send,
-    Shutdown: HostAssociationShutdown<Error = IoError> + Send + Sync + 'static,
-{
-    dispatch_requests_with_children(
-        association,
-        readiness,
-        request_source,
-        response_sink,
-        notification_channel,
-        shutdown,
-        None,
-        true,
-        None,
-        None,
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
-fn dispatch_requests_with_children<
-    Memory,
-    RequestSource,
-    ResponseSink,
-    NotificationChannel,
-    Shutdown,
->(
+fn dispatch_requests<Memory, RequestSource, ResponseSink, NotificationChannel, Shutdown>(
     association: BrokerHostAssociation<'_, Memory>,
     readiness: Arc<ReadinessPublisherRuntime>,
     mut request_source: RequestSource,
     response_sink: ResponseSink,
     mut notification_channel: NotificationChannel,
     shutdown: Shutdown,
-    children: Option<Arc<RunnerChildren>>,
+    process_manager: Option<Arc<RunnerProcessManager>>,
     finish_process: bool,
     panicked_out: Option<&AtomicBool>,
     abnormal_out: Option<&AtomicBool>,
@@ -546,29 +501,30 @@ where
     let association = Arc::new(association);
     let process_id = association.process_id();
     let failure_coordinator = Arc::new(HostAssociationFailureCoordinator::new(shutdown));
-    if let Some(children) = &children {
+    if let Some(process_manager) = &process_manager {
         let association_failure = Arc::clone(&failure_coordinator);
         let association_failure: crate::runner::AssociationFailure = Arc::new(move || {
             association_failure.report(IoError::new(
                 ErrorKind::ConnectionAborted,
-                "process association terminated by lifecycle control",
+                "process association terminated by process-start control",
             ));
         });
-        if let Err(error) = children
+        if let Err(error) = process_manager
             .register_association(association.process_id(), Arc::clone(&association_failure))
         {
             failure_coordinator.report(error);
         } else {
-            children
-                .install_child_association_failure(association.process_id(), association_failure);
+            process_manager
+                .install_process_association_failure(association.process_id(), association_failure);
         }
     }
     let (request_sender, request_receiver) = sync_channel(REQUEST_QUEUE_CAPACITY);
     let request_receiver = Arc::new(Mutex::new(request_receiver));
-    let (control_sender, control_receiver) = sync_channel(LIFECYCLE_CONTROL_QUEUE_CAPACITY);
-    let control_receiver = Arc::new(Mutex::new(control_receiver));
+    let (process_start_sender, process_start_receiver) =
+        sync_channel(PROCESS_START_CONTROL_QUEUE_CAPACITY);
+    let process_start_receiver = Arc::new(Mutex::new(process_start_receiver));
 
-    let draining_launches = std::thread::scope(|scope| {
+    let draining_starts = std::thread::scope(|scope| {
         let publisher_readiness = Arc::clone(&readiness);
         let publisher_failure_coordinator = Arc::clone(&failure_coordinator);
         let publisher = std::thread::Builder::new()
@@ -605,22 +561,23 @@ where
             association: &association,
         };
 
-        let mut workers = Vec::with_capacity(crate::WORKER_COUNT + LIFECYCLE_CONTROL_WORKER_COUNT);
-        for worker_id in 0..LIFECYCLE_CONTROL_WORKER_COUNT {
+        let mut workers =
+            Vec::with_capacity(crate::WORKER_COUNT + PROCESS_START_CONTROL_WORKER_COUNT);
+        for worker_id in 0..PROCESS_START_CONTROL_WORKER_COUNT {
             let association = Arc::clone(&association);
-            let control_receiver = Arc::clone(&control_receiver);
+            let process_start_receiver = Arc::clone(&process_start_receiver);
             let response_sink = response_sink.clone();
             let worker_failure_coordinator = Arc::clone(&failure_coordinator);
-            let worker_children = children.clone();
+            let process_manager_for_worker = process_manager.clone();
             match std::thread::Builder::new()
-                .name(format!("litebox-broker-lifecycle-worker-{worker_id}"))
+                .name(format!("litebox-broker-process-start-worker-{worker_id}"))
                 .spawn_scoped(scope, move || {
                     run_worker(
                         &association,
-                        &control_receiver,
+                        &process_start_receiver,
                         &response_sink,
                         &worker_failure_coordinator,
-                        worker_children.as_ref(),
+                        process_manager_for_worker.as_ref(),
                     );
                 }) {
                 Ok(worker) => workers.push(worker),
@@ -635,7 +592,7 @@ where
             let request_receiver = Arc::clone(&request_receiver);
             let response_sink = response_sink.clone();
             let worker_failure_coordinator = Arc::clone(&failure_coordinator);
-            let worker_children = children.clone();
+            let process_manager_for_worker = process_manager.clone();
             match std::thread::Builder::new()
                 .name(format!("litebox-broker-worker-{worker_id}"))
                 .spawn_scoped(scope, move || {
@@ -644,7 +601,7 @@ where
                         &request_receiver,
                         &response_sink,
                         &worker_failure_coordinator,
-                        worker_children.as_ref(),
+                        process_manager_for_worker.as_ref(),
                     );
                 }) {
                 Ok(worker) => workers.push(worker),
@@ -658,15 +615,15 @@ where
         read_requests(
             &mut request_source,
             request_sender,
-            control_sender,
+            process_start_sender,
             &failure_coordinator,
-            children.as_ref(),
+            process_manager.as_ref(),
             process_id,
         );
         drop(cancellation);
-        let draining_launches = children
+        let draining_starts = process_manager
             .as_ref()
-            .map_or_else(Vec::new, |children| children.association_ending(process_id));
+            .map(|process_manager| process_manager.association_ending(process_id));
         for worker in workers {
             if worker.join().is_err() {
                 failure_coordinator.report_panic(IoError::other("broker request worker panicked"));
@@ -686,11 +643,11 @@ where
         {
             failure_coordinator.report_panic(IoError::other("broker readiness publisher panicked"));
         }
-        draining_launches
+        draining_starts
     });
 
-    if let Some(children) = &children {
-        children.association_ended(process_id, draining_launches);
+    if let (Some(process_manager), Some(draining_starts)) = (&process_manager, draining_starts) {
+        process_manager.association_ended(process_id, draining_starts);
     }
 
     let result = match failure_coordinator.take_error() {
@@ -718,9 +675,9 @@ where
 fn read_requests<RequestSource, Shutdown>(
     request_source: &mut RequestSource,
     request_sender: SyncSender<BrokerRequest>,
-    control_sender: SyncSender<BrokerRequest>,
+    process_start_sender: SyncSender<BrokerRequest>,
     failure_coordinator: &HostAssociationFailureCoordinator<Shutdown>,
-    children: Option<&Arc<RunnerChildren>>,
+    process_manager: Option<&Arc<RunnerProcessManager>>,
     process_id: ProcessId,
 ) where
     RequestSource: HostRequestSource<Error = IoError>,
@@ -733,8 +690,8 @@ fn read_requests<RequestSource, Shutdown>(
         match request_source.recv_request() {
             Ok(HostReceive::Message(request)) => {
                 if let BrokerOperation::AcknowledgeProcessStart(token) = &request.operation
-                    && let Some(children) = children
-                    && let Err(error) = children.admit_acknowledgement(process_id, *token)
+                    && let Some(process_manager) = process_manager
+                    && let Err(error) = process_manager.admit_acknowledgement(process_id, *token)
                 {
                     failure_coordinator.report(map_host_error(BrokerHostError::Broker(error)));
                     break;
@@ -744,7 +701,7 @@ fn read_requests<RequestSource, Shutdown>(
                     BrokerOperation::AcknowledgeProcessStart(_)
                         | BrokerOperation::ReportProcessStartFailure(_)
                 ) {
-                    &control_sender
+                    &process_start_sender
                 } else {
                     &request_sender
                 };
@@ -816,7 +773,7 @@ fn run_worker<Memory, ResponseSink, Shutdown>(
     request_receiver: &Mutex<Receiver<BrokerRequest>>,
     response_sink: &ResponseSink,
     failure_coordinator: &HostAssociationFailureCoordinator<Shutdown>,
-    children: Option<&Arc<RunnerChildren>>,
+    process_manager: Option<&Arc<RunnerProcessManager>>,
 ) where
     Memory: SharedMemory,
     ResponseSink: HostResponseSink<Error = IoError>,
@@ -838,14 +795,14 @@ fn run_worker<Memory, ResponseSink, Shutdown>(
             association.execute_request_with(
                 request,
                 |process, operation, shared_buffers| {
-                    children.and_then(|children| {
-                        children.handle_operation(process, operation, shared_buffers)
+                    process_manager.and_then(|process_manager| {
+                        process_manager.handle_operation(process, operation, shared_buffers)
                     })
                 },
                 |response| response_sink.send_response(response),
                 |operation, result| {
-                    if let Some(children) = children {
-                        children.response_sent(process_id, operation, result);
+                    if let Some(process_manager) = process_manager {
+                        process_manager.response_sent(process_id, operation, result);
                     }
                 },
             )
@@ -1088,6 +1045,10 @@ mod tests {
                     response_sink,
                     notifications,
                     shutdown,
+                    None,
+                    true,
+                    None,
+                    None,
                 ))
                 .unwrap();
         });
@@ -1294,7 +1255,7 @@ mod tests {
 
         failure_coordinator.report(IoError::new(
             ErrorKind::ConnectionAborted,
-            "lifecycle shutdown",
+            "process shutdown",
         ));
         failure_coordinator.report(IoError::new(ErrorKind::InvalidData, "protocol failure"));
 
