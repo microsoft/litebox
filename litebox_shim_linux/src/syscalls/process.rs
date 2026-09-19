@@ -1851,14 +1851,14 @@ mod tests {
             super::super::test_broker::MAX_TEST_BROKER_REFERENCES,
             BrokerCoreLimits::DEFAULT.max_total_pipe_capacity,
         )
-        .with_thread_quotas(1, 1);
+        .with_thread_quotas(2, 2);
         let (litebox, process_id) =
             crate::syscalls::test_broker::litebox_with_limits(platform, limits);
         let shim_builder = crate::LinuxShimBuilder::new_with_litebox(platform, litebox, process_id);
         let leader = shim_builder.build().0.new_test_task();
         let task = leader
             .clone_for_test()
-            .expect("the sole broker thread slot must be available");
+            .expect("the thread slot after the negotiated initial thread must be available");
         let old_tid = task.sys_gettid();
         let process = task.process().clone();
 
