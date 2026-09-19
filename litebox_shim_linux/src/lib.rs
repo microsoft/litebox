@@ -258,34 +258,11 @@ impl<Platform: ShimPlatform> Clone for LinuxShim<Platform> {
 }
 
 impl<Platform: ShimPlatform> LinuxShim<Platform> {
-    /// Loads the program at `path` as the shim's initial task, returning the
-    /// initial register state.
+    /// Loads a program using the initial thread allocated during broker negotiation.
     pub fn load_program(
         &self,
         task: litebox_common_linux::TaskParams,
-        path: &str,
-        argv: Vec<alloc::ffi::CString>,
-        envp: Vec<alloc::ffi::CString>,
-    ) -> Result<LoadedProgram<Platform>, loader::elf::ElfLoaderError> {
-        self.load_program_inner(task, None, path, argv, envp)
-    }
-
-    /// Loads a program whose initial thread was allocated during broker negotiation.
-    pub fn load_program_with_initial_thread(
-        &self,
-        task: litebox_common_linux::TaskParams,
         initial_thread: litebox::thread::Thread,
-        path: &str,
-        argv: Vec<alloc::ffi::CString>,
-        envp: Vec<alloc::ffi::CString>,
-    ) -> Result<LoadedProgram<Platform>, loader::elf::ElfLoaderError> {
-        self.load_program_inner(task, Some(initial_thread), path, argv, envp)
-    }
-
-    fn load_program_inner(
-        &self,
-        task: litebox_common_linux::TaskParams,
-        initial_thread: Option<litebox::thread::Thread>,
         path: &str,
         argv: Vec<alloc::ffi::CString>,
         envp: Vec<alloc::ffi::CString>,
@@ -318,7 +295,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             _not_send: core::marker::PhantomData,
             task: Task {
                 global: self.0.clone(),
-                litebox_thread: Cell::new(initial_thread),
+                litebox_thread: Cell::new(Some(initial_thread)),
                 thread: syscalls::process::ThreadState::new_process(pid),
                 wait_state: wait::WaitState::new(self.0.platform),
                 pid,

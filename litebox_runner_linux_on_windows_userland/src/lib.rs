@@ -117,7 +117,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     };
 
     let program = shim
-        .load_program_with_initial_thread(
+        .load_program(
             litebox_common_linux::TaskParams {
                 pid: process_id,
                 ppid: 0,

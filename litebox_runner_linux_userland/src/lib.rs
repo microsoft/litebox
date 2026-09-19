@@ -169,8 +169,7 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         &broker_shutdown_fds,
     );
 
-    let program =
-        shim.load_program_with_initial_thread(task_params, initial_thread, prog_path, argv, envp)?;
+    let program = shim.load_program(task_params, initial_thread, prog_path, argv, envp)?;
 
     #[cfg(feature = "lock_tracing")]
     litebox::sync::start_recording();
@@ -237,7 +236,7 @@ mod tests {
     }
 
     #[test]
-    fn broker_connection_does_not_require_a_root_program() {
+    fn child_runner_cli_does_not_require_root_program() {
         let args = CliArgs::try_parse_from([
             "runner",
             "--unstable",
