@@ -24,7 +24,7 @@ use crate::message::{
 };
 use crate::process::{
     InheritedProcessObjects, MAX_INHERITED_PROCESS_OBJECTS, ProcessBootstrapFormat,
-    ProcessBootstrapVersion, ProcessStartupDescriptor, StartedProcess,
+    ProcessBootstrapVersion, ProcessIdentity, ProcessStartupDescriptor,
 };
 use crate::readiness::ReadinessFlags;
 
@@ -408,7 +408,7 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
             encoder.request_id(request_id);
             fs::encode_fs_response(&mut encoder, response);
         }
-        BrokerResult::ProcessStarted(StartedProcess {
+        BrokerResult::ProcessStarted(ProcessIdentity {
             process_id,
             initial_thread_id,
         }) => {
@@ -461,7 +461,7 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         RESPONSE_TAG_RANDOM_FILLED => BrokerResult::RandomFilled,
         RESPONSE_TAG_STDIO => BrokerResult::Stdio(stdio::decode_stdio_response(&mut decoder)?),
         RESPONSE_TAG_FILE => BrokerResult::File(fs::decode_fs_response(&mut decoder)?),
-        RESPONSE_TAG_PROCESS_STARTED => BrokerResult::ProcessStarted(StartedProcess {
+        RESPONSE_TAG_PROCESS_STARTED => BrokerResult::ProcessStarted(ProcessIdentity {
             process_id: decoder.process_id()?,
             initial_thread_id: decoder.thread_id()?,
         }),
@@ -583,8 +583,8 @@ mod tests {
         WritePipeResponse,
     };
     use crate::process::{
-        InheritedProcessObjects, ProcessBootstrapFormat, ProcessBootstrapVersion,
-        ProcessStartupDescriptor, StartedProcess,
+        InheritedProcessObjects, ProcessBootstrapFormat, ProcessBootstrapVersion, ProcessIdentity,
+        ProcessStartupDescriptor,
     };
     use crate::shared_buffer::{SharedBufferSequence, SharedBufferSlotIndex};
     use crate::socket::{
@@ -1283,11 +1283,11 @@ mod tests {
             BrokerResult::File(FileResponse::Mkdir),
             BrokerResult::File(FileResponse::Rmdir),
             BrokerResult::File(FileResponse::Failed(FileError::Io)),
-            BrokerResult::ProcessStarted(StartedProcess {
+            BrokerResult::ProcessStarted(ProcessIdentity {
                 process_id: process_id(u32::MAX),
                 initial_thread_id: thread_id(u32::MAX - 1),
             }),
-            BrokerResult::ProcessStarted(StartedProcess {
+            BrokerResult::ProcessStarted(ProcessIdentity {
                 process_id: process_id(9),
                 initial_thread_id: thread_id(11),
             }),

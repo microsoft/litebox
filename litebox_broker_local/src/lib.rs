@@ -41,7 +41,7 @@ use litebox_broker_protocol::message::{
 };
 use litebox_broker_protocol::process::{
     InheritedProcessObjects, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessBootstrapFormat,
-    ProcessBootstrapVersion, ProcessStartupData, ProcessStartupDescriptor, StartedProcess,
+    ProcessBootstrapVersion, ProcessIdentity, ProcessStartupData, ProcessStartupDescriptor,
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SharedBufferSequence};
@@ -205,7 +205,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         buffer: SharedBufferSequence,
         bootstrap: &[u8],
         inherited_objects: InheritedProcessObjects,
-    ) -> Result<StartedProcess, Channel::Error> {
+    ) -> Result<ProcessIdentity, Channel::Error> {
         if buffer.length() > MAX_PROCESS_BOOTSTRAP_SIZE {
             return Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted));
         }

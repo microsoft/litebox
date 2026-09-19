@@ -17,7 +17,7 @@ use crate::pipe::{
     CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
     WritePipeResponse,
 };
-use crate::process::{ProcessStartupDescriptor, StartedProcess};
+use crate::process::{ProcessIdentity, ProcessStartupDescriptor};
 use crate::readiness::ReadinessFlags;
 use crate::shared_buffer::SharedBufferSequence;
 use crate::socket::{
@@ -243,7 +243,7 @@ pub enum BrokerResult {
     /// File response family.
     File(FileResponse),
     /// A child established its broker association.
-    ProcessStarted(StartedProcess),
+    ProcessStarted(ProcessIdentity),
     /// Operation failed with an ABI-neutral broker error.
     Error(ErrorCode),
 }

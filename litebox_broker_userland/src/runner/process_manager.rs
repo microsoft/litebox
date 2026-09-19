@@ -13,7 +13,7 @@ use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult};
 use litebox_broker_protocol::process::{
     InheritedProcessObjects, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessBootstrapFormat,
-    ProcessBootstrapVersion, ProcessStartupData, StartedProcess,
+    ProcessBootstrapVersion, ProcessIdentity, ProcessStartupData,
 };
 use litebox_broker_protocol::{ProcessId, ThreadId};
 use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemory};
@@ -159,7 +159,7 @@ impl RunnerProcessManager {
         version: ProcessBootstrapVersion,
         bootstrap: Vec<u8>,
         requested_inherited_objects: InheritedProcessObjects,
-    ) -> Result<StartedProcess, ErrorCode> {
+    ) -> Result<ProcessIdentity, ErrorCode> {
         if !parent.is_running() {
             return Err(ErrorCode::ProtocolState);
         }
@@ -288,7 +288,7 @@ impl RunnerProcessManager {
         let deadline = Instant::now() + PROCESS_START_TIMEOUT;
         let result = transaction
             .wait_until_running(deadline)
-            .map(|()| StartedProcess {
+            .map(|()| ProcessIdentity {
                 process_id,
                 initial_thread_id: transaction.initial_thread_id,
             });
