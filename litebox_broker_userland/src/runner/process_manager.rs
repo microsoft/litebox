@@ -7,7 +7,7 @@ use std::io::{Error as IoError, Result as IoResult};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use litebox_broker_core::{BrokerCore, BrokerError, BrokerProcess};
+use litebox_broker_core::{BrokerCore, BrokerProcess};
 use litebox_broker_host::{RequestFailure, copy_shared_buffer};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult};
@@ -20,7 +20,7 @@ use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemory};
 
 use super::{
     RunnerCompletion, RunnerConfig, RunnerInstance, RunnerShutdown, TerminationProvenance,
-    runner_exit_code_is_crash, runner_exit_code_is_expected_shutdown, runner_signal_is_abnormal,
+    runner_exit_code_is_crash, runner_signal_is_abnormal,
 };
 
 const PROCESS_START_TIMEOUT: Duration = Duration::from_secs(5);
@@ -38,6 +38,7 @@ pub(crate) struct RunnerProcessManager {
 /// Startup context for a runner whose broker process was created by its parent.
 pub(crate) struct RunnerStartup {
     process: Arc<BrokerProcess>,
+    initial_thread_id: ThreadId,
     transaction: Arc<ProcessStartTransaction>,
     data: ProcessStartupData,
 }
@@ -47,8 +48,10 @@ impl RunnerStartup {
         Arc::clone(&self.transaction)
     }
 
-    pub(crate) fn into_process_and_data(self) -> (Arc<BrokerProcess>, ProcessStartupData) {
-        (self.process, self.data)
+    pub(crate) fn into_process_and_data(
+        self,
+    ) -> ((Arc<BrokerProcess>, ThreadId), ProcessStartupData) {
+        ((self.process, self.initial_thread_id), self.data)
     }
 }
 
@@ -64,6 +67,7 @@ pub(crate) type AssociationFailure = Arc<dyn Fn() + Send + Sync>;
 pub(super) struct ProcessStartTransaction {
     parent_id: ProcessId,
     process: Arc<BrokerProcess>,
+    initial_thread_id: ThreadId,
     state: Mutex<ProcessStartTransactionState>,
     changed: Condvar,
 }
@@ -71,8 +75,6 @@ pub(super) struct ProcessStartTransaction {
 #[derive(Clone, Copy)]
 enum ProcessStartPhase {
     Starting,
-    Ready { initial_thread_id: Option<ThreadId> },
-    Completing { cancellation: Option<ErrorCode> },
     Running,
     Failed(ErrorCode),
 }
@@ -83,7 +85,6 @@ struct ProcessStartTransactionState {
     association_failure: Option<AssociationFailure>,
     shutdown_request: ShutdownRequest,
     abnormal: bool,
-    start_completed: bool,
     finalization: FinalizationState,
 }
 
@@ -99,17 +100,12 @@ enum FinalizationState {
 pub(super) enum ShutdownRequest {
     None,
     Expected,
-    ExpectedStartFailure,
     Unexpected,
 }
 
 impl ShutdownRequest {
     pub(super) const fn was_expected(self) -> bool {
-        matches!(self, Self::Expected | Self::ExpectedStartFailure)
-    }
-
-    pub(super) const fn expected_start_failure_was_reported(self) -> bool {
-        matches!(self, Self::ExpectedStartFailure)
+        matches!(self, Self::Expected)
     }
 }
 
@@ -152,16 +148,6 @@ impl RunnerProcessManager {
                     })
                     .map(BrokerResult::ProcessStarted),
             ),
-            BrokerOperation::ReportProcessReady(initial_thread_id) => Some(
-                self.process_ready(process.id(), *initial_thread_id)
-                    .map(|()| BrokerResult::ProcessReady)
-                    .map_err(process_extension_error),
-            ),
-            BrokerOperation::ReportProcessStartFailure(error) => Some(
-                self.report_process_start_failure(process.id(), *error)
-                    .map(|()| BrokerResult::ProcessStartFailed(*error))
-                    .map_err(process_extension_error),
-            ),
             _ => None,
         }
     }
@@ -180,19 +166,26 @@ impl RunnerProcessManager {
         let (process, inherited_objects) = parent
             .create_child(requested_inherited_objects.as_slice())
             .map_err(ErrorCode::from)?;
+        let initial_thread_id = match process.create_thread() {
+            Ok(initial_thread_id) => initial_thread_id,
+            Err(error) => {
+                process.cleanup(true);
+                return Err(ErrorCode::from(error));
+            }
+        };
         let inherited_objects = InheritedProcessObjects::new(&inherited_objects)
             .expect("child handle count must match the bounded inheritance request");
         let process_id = process.id();
         let transaction = Arc::new(ProcessStartTransaction {
             parent_id: parent.id(),
             process: Arc::clone(&process),
+            initial_thread_id,
             state: Mutex::new(ProcessStartTransactionState {
                 phase: ProcessStartPhase::Starting,
                 shutdown: None,
                 association_failure: None,
                 shutdown_request: ShutdownRequest::None,
                 abnormal: false,
-                start_completed: false,
                 finalization: FinalizationState::Active,
             }),
             changed: Condvar::new(),
@@ -233,6 +226,7 @@ impl RunnerProcessManager {
                         instance.run_started_process_to_completion(
                             RunnerStartup {
                                 process,
+                                initial_thread_id,
                                 transaction: Arc::clone(&thread_transaction),
                                 data: ProcessStartupData {
                                     format,
@@ -249,11 +243,9 @@ impl RunnerProcessManager {
                     Ok(Ok(result)) => {
                         process_manager.runner_finished(&thread_transaction, result, false);
                     }
-                    Ok(Err(error)) => process_manager.runner_finished(
+                    Ok(Err(_error)) => process_manager.runner_finished(
                         &thread_transaction,
                         RunnerCompletion {
-                            result: Err(error),
-                            runner_success: None,
                             runner_signal: None,
                             runner_exit_code: None,
                             termination_provenance: TerminationProvenance::default(),
@@ -265,8 +257,6 @@ impl RunnerProcessManager {
                     Err(_) => process_manager.runner_finished(
                         &thread_transaction,
                         RunnerCompletion {
-                            result: Err(IoError::other("runner process thread panicked")),
-                            runner_success: None,
                             runner_signal: None,
                             runner_exit_code: None,
                             termination_provenance: TerminationProvenance::default(),
@@ -287,43 +277,16 @@ impl RunnerProcessManager {
 
         let deadline = Instant::now() + PROCESS_START_TIMEOUT;
         let result = transaction
-            .wait_until_ready(deadline)
-            .and_then(|initial_thread_id| {
-                if parent.is_cancellation_requested() {
-                    transaction.abort(ErrorCode::PeerClosed, false, true);
-                    return Err(ErrorCode::PeerClosed);
-                }
-                transaction.complete_start()?;
-                Ok(StartedProcess {
-                    process_id,
-                    initial_thread_id,
-                })
+            .wait_until_running(deadline)
+            .map(|()| StartedProcess {
+                process_id,
+                initial_thread_id: transaction.initial_thread_id,
             });
         self.remove_transaction(process_id);
         if let Some(abnormal) = transaction.protocol_finished() {
             self.finish_transaction(&transaction, abnormal);
         }
         result
-    }
-
-    fn process_ready(
-        &self,
-        process_id: ProcessId,
-        initial_thread_id: Option<ThreadId>,
-    ) -> Result<(), ErrorCode> {
-        self.find_transaction(process_id)
-            .ok_or(ErrorCode::PeerClosed)?
-            .ready_and_wait(initial_thread_id)
-    }
-
-    fn report_process_start_failure(
-        &self,
-        process_id: ProcessId,
-        error: ErrorCode,
-    ) -> Result<(), ErrorCode> {
-        self.find_transaction(process_id)
-            .ok_or(ErrorCode::PeerClosed)?
-            .report_start_failure(error)
     }
 
     pub(crate) fn association_ending(&self, process_id: ProcessId) {
@@ -361,6 +324,7 @@ impl RunnerProcessManager {
         &self,
         process_id: ProcessId,
         failure: AssociationFailure,
+        is_started_process: bool,
     ) -> IoResult<()> {
         let transaction = {
             let mut state = self
@@ -387,8 +351,25 @@ impl RunnerProcessManager {
                 .find(|transaction| transaction.process.id() == process_id)
                 .cloned()
         };
-        if let Some(transaction) = transaction {
+        if is_started_process {
+            let Some(transaction) = transaction else {
+                self.unregister_association(process_id);
+                return Err(IoError::other(
+                    "started process has no pending start transaction",
+                ));
+            };
             transaction.install_association_failure(failure);
+            if let Err(error) = transaction.activate() {
+                self.unregister_association(process_id);
+                return Err(IoError::other(format!(
+                    "failed to activate broker process association: {error}"
+                )));
+            }
+        } else if transaction.is_some() {
+            self.unregister_association(process_id);
+            return Err(IoError::other(
+                "root process unexpectedly has a pending start transaction",
+            ));
         }
         Ok(())
     }
@@ -405,16 +386,6 @@ impl RunnerProcessManager {
         {
             state.associations.swap_remove(index);
         }
-    }
-
-    fn find_transaction(&self, process_id: ProcessId) -> Option<Arc<ProcessStartTransaction>> {
-        self.state
-            .lock()
-            .expect("runner process manager state mutex poisoned")
-            .transactions
-            .iter()
-            .find(|transaction| transaction.process.id() == process_id)
-            .cloned()
     }
 
     fn remove_transaction(&self, process_id: ProcessId) {
@@ -437,14 +408,6 @@ impl RunnerProcessManager {
         result: RunnerCompletion,
         thread_panicked: bool,
     ) {
-        let unexpected_runner_failure = result.runner_success == Some(false)
-            && result.runner_signal.is_none()
-            && !transaction.start_completed()
-            && !result.termination_provenance.reported_start_failure()
-            && !runner_exit_code_is_expected_shutdown(
-                result.runner_exit_code,
-                result.termination_provenance.broker_termination(),
-            );
         let unexpected_crash = runner_signal_is_abnormal(
             result.runner_signal,
             result.termination_provenance.broker_termination(),
@@ -453,13 +416,8 @@ impl RunnerProcessManager {
             || result.association_panicked
             || result.shutdown_observation_failed
             || unexpected_crash
-            || runner_exit_code_is_crash(result.runner_exit_code)
-            || unexpected_runner_failure;
-        if result.result.is_err() || result.runner_success != Some(true) {
-            transaction.abort(ErrorCode::PeerClosed, abnormal, false);
-        } else if !transaction.start_completed() {
-            transaction.abort(ErrorCode::PeerClosed, false, false);
-        }
+            || runner_exit_code_is_crash(result.runner_exit_code);
+        transaction.abort(ErrorCode::PeerClosed, abnormal, false);
         if let Some(abnormal) = transaction.runner_finished(abnormal) {
             self.finish_transaction(transaction, abnormal);
         }
@@ -512,20 +470,8 @@ const fn process_extension_error(error: ErrorCode) -> RequestFailure {
     }
 }
 
-const fn process_start_failure_is_expected(error: ErrorCode) -> bool {
-    matches!(
-        error,
-        ErrorCode::UnsupportedOperation
-            | ErrorCode::PolicyDenied
-            | ErrorCode::InvalidRights
-            | ErrorCode::ResourceExhausted
-            | ErrorCode::WouldBlock
-            | ErrorCode::OutOfMemory
-    )
-}
-
 impl ProcessStartTransaction {
-    fn wait_until_ready(&self, deadline: Instant) -> Result<Option<ThreadId>, ErrorCode> {
+    fn wait_until_running(&self, deadline: Instant) -> Result<(), ErrorCode> {
         let mut state = self
             .state
             .lock()
@@ -551,53 +497,13 @@ impl ProcessStartTransaction {
                         return Err(ErrorCode::Internal);
                     }
                 }
-                ProcessStartPhase::Ready { initial_thread_id } => return Ok(initial_thread_id),
-                ProcessStartPhase::Completing { .. } | ProcessStartPhase::Running => {
-                    return Err(ErrorCode::ProtocolState);
-                }
-                ProcessStartPhase::Failed(error) => return Err(error),
-            }
-        }
-    }
-
-    fn ready_and_wait(&self, initial_thread_id: Option<ThreadId>) -> Result<(), ErrorCode> {
-        let mut state = self
-            .state
-            .lock()
-            .expect("process start transaction mutex poisoned");
-        if !matches!(state.phase, ProcessStartPhase::Starting) {
-            return Err(match state.phase {
-                ProcessStartPhase::Failed(error) => error,
-                _ => ErrorCode::ProtocolState,
-            });
-        }
-        self.process
-            .mark_start_ready(initial_thread_id)
-            .map_err(|error| match error {
-                BrokerError::UnknownObject => ErrorCode::ProtocolState,
-                error => ErrorCode::from(error),
-            })?;
-        state.phase = ProcessStartPhase::Ready { initial_thread_id };
-        self.changed.notify_all();
-        loop {
-            match state.phase {
-                ProcessStartPhase::Ready { .. } | ProcessStartPhase::Completing { .. } => {
-                    state = self
-                        .changed
-                        .wait(state)
-                        .expect("process start transaction mutex poisoned");
-                }
                 ProcessStartPhase::Running => return Ok(()),
                 ProcessStartPhase::Failed(error) => return Err(error),
-                ProcessStartPhase::Starting => unreachable!("ready state cannot regress"),
             }
         }
     }
 
-    fn report_start_failure(&self, error: ErrorCode) -> Result<(), ErrorCode> {
-        if !process_start_failure_is_expected(error) {
-            return Err(ErrorCode::ProtocolState);
-        }
+    fn activate(&self) -> Result<(), ErrorCode> {
         let mut state = self
             .state
             .lock()
@@ -605,71 +511,24 @@ impl ProcessStartTransaction {
         match state.phase {
             ProcessStartPhase::Starting => {}
             ProcessStartPhase::Failed(error) => return Err(error),
-            _ => return Err(ErrorCode::ProtocolState),
+            ProcessStartPhase::Running => return Err(ErrorCode::ProtocolState),
         }
-        state.phase = ProcessStartPhase::Failed(error);
-        state.shutdown_request = ShutdownRequest::ExpectedStartFailure;
-        self.changed.notify_all();
-        Ok(())
-    }
-
-    fn complete_start(&self) -> Result<(), ErrorCode> {
-        {
-            let mut state = self
-                .state
-                .lock()
-                .expect("process start transaction mutex poisoned");
-            match state.phase {
-                ProcessStartPhase::Ready { .. } => {
-                    state.phase = ProcessStartPhase::Completing { cancellation: None };
+        match self.process.complete_start().map_err(ErrorCode::from) {
+            Ok(()) => {
+                state.phase = ProcessStartPhase::Running;
+                self.changed.notify_all();
+                Ok(())
+            }
+            Err(error) => {
+                state.phase = ProcessStartPhase::Failed(error);
+                state.abnormal |= error == ErrorCode::Internal;
+                if state.shutdown_request == ShutdownRequest::None {
+                    state.shutdown_request = ShutdownRequest::Expected;
                 }
-                ProcessStartPhase::Failed(error) => return Err(error),
-                _ => return Err(ErrorCode::ProtocolState),
+                self.changed.notify_all();
+                Err(error)
             }
         }
-
-        let completion = self.process.complete_start().map_err(ErrorCode::from);
-        let (result, association_failure, shutdown) = {
-            let mut state = self
-                .state
-                .lock()
-                .expect("process start transaction mutex poisoned");
-            let ProcessStartPhase::Completing { cancellation } = state.phase else {
-                unreachable!("process completion phase cannot change independently");
-            };
-            match completion {
-                Ok(()) => {
-                    state.start_completed = true;
-                    if let Some(error) = cancellation {
-                        state.phase = ProcessStartPhase::Failed(error);
-                        (Err(error), None, None)
-                    } else {
-                        state.phase = ProcessStartPhase::Running;
-                        (Ok(()), None, None)
-                    }
-                }
-                Err(error) => {
-                    state.phase = ProcessStartPhase::Failed(error);
-                    state.abnormal |= error == ErrorCode::Internal;
-                    if state.shutdown_request == ShutdownRequest::None {
-                        state.shutdown_request = ShutdownRequest::Expected;
-                    }
-                    (
-                        Err(error),
-                        state.association_failure.as_ref().map(Arc::clone),
-                        state.shutdown.clone(),
-                    )
-                }
-            }
-        };
-        self.changed.notify_all();
-        if let Some(association_failure) = association_failure {
-            association_failure();
-        }
-        if let Some(shutdown) = shutdown {
-            shutdown.shutdown();
-        }
-        result
     }
 
     pub(super) fn install_shutdown(&self, shutdown: Arc<RunnerShutdown>) {
@@ -707,18 +566,10 @@ impl ProcessStartTransaction {
                 .lock()
                 .expect("process start transaction mutex poisoned");
             state.abnormal |= abnormal;
-            let should_terminate = match &mut state.phase {
-                ProcessStartPhase::Starting | ProcessStartPhase::Ready { .. } => {
+            let should_terminate = match state.phase {
+                ProcessStartPhase::Starting => {
                     state.phase = ProcessStartPhase::Failed(error);
                     true
-                }
-                ProcessStartPhase::Completing { cancellation } => {
-                    if cancellation.is_none() {
-                        *cancellation = Some(error);
-                        true
-                    } else {
-                        false
-                    }
                 }
                 ProcessStartPhase::Failed(_) | ProcessStartPhase::Running => false,
             };
@@ -753,14 +604,9 @@ impl ProcessStartTransaction {
             .lock()
             .expect("process start transaction mutex poisoned");
         state.association_failure = None;
-        match &mut state.phase {
-            ProcessStartPhase::Starting | ProcessStartPhase::Ready { .. } => {
+        match state.phase {
+            ProcessStartPhase::Starting => {
                 state.phase = ProcessStartPhase::Failed(ErrorCode::PeerClosed);
-            }
-            ProcessStartPhase::Completing { cancellation } => {
-                if cancellation.is_none() {
-                    *cancellation = Some(ErrorCode::PeerClosed);
-                }
             }
             ProcessStartPhase::Failed(_) | ProcessStartPhase::Running => {}
         }
@@ -789,13 +635,6 @@ impl ProcessStartTransaction {
             .lock()
             .expect("process start transaction mutex poisoned")
             .shutdown_request
-    }
-
-    fn start_completed(&self) -> bool {
-        self.state
-            .lock()
-            .expect("process start transaction mutex poisoned")
-            .start_completed
     }
 
     fn protocol_finished(&self) -> Option<bool> {
@@ -847,7 +686,7 @@ mod tests {
     use litebox_broker_core::{BrokerCore, CallerCredential, ObjectRights, PolicyEngine};
     use litebox_broker_protocol::error::ErrorCode;
     use std::path::PathBuf;
-    use std::sync::{Arc, Condvar, Mutex, mpsc};
+    use std::sync::{Arc, Condvar, Mutex};
     use std::time::{Duration, Instant};
 
     fn starting_transaction() -> (BrokerCore, Arc<ProcessStartTransaction>) {
@@ -861,19 +700,20 @@ mod tests {
             .unwrap();
         let parent_id = parent.id();
         let (process, _) = parent.create_child(&[]).unwrap();
+        let initial_thread_id = process.create_thread().unwrap();
         parent.cleanup(true);
         (
             broker,
             Arc::new(ProcessStartTransaction {
                 parent_id,
                 process,
+                initial_thread_id,
                 state: Mutex::new(ProcessStartTransactionState {
                     phase: ProcessStartPhase::Starting,
                     shutdown: None,
                     association_failure: None,
                     shutdown_request: ShutdownRequest::None,
                     abnormal: false,
-                    start_completed: false,
                     finalization: FinalizationState::Active,
                 }),
                 changed: Condvar::new(),
@@ -882,37 +722,21 @@ mod tests {
     }
 
     #[test]
-    fn ready_report_waits_for_broker_start_completion() {
+    fn association_activation_wakes_the_parent_request() {
         let (_broker, transaction) = starting_transaction();
-        let ready = Arc::clone(&transaction);
-        let waiter = std::thread::spawn(move || ready.ready_and_wait(None));
+        let waiting = Arc::clone(&transaction);
+        let waiter = std::thread::spawn(move || {
+            waiting.wait_until_running(Instant::now() + Duration::from_secs(1))
+        });
 
-        assert_eq!(
-            transaction
-                .wait_until_ready(Instant::now() + Duration::from_secs(1))
-                .unwrap(),
-            None
-        );
-        transaction.complete_start().unwrap();
-
+        transaction.activate().unwrap();
         waiter.join().unwrap().unwrap();
         assert!(transaction.process.is_running());
-        transaction.process.cleanup(true);
-    }
-
-    #[test]
-    fn reported_start_failure_wakes_the_parent_request() {
-        let (_broker, transaction) = starting_transaction();
-
-        transaction
-            .report_start_failure(ErrorCode::UnsupportedOperation)
-            .unwrap();
-
-        assert_eq!(
-            transaction.wait_until_ready(Instant::now() + Duration::from_secs(1)),
-            Err(ErrorCode::UnsupportedOperation)
+        assert!(
+            transaction
+                .process
+                .owns_thread(transaction.initial_thread_id)
         );
-        assert!(transaction.shutdown_request().was_expected());
         transaction.process.cleanup(true);
     }
 
@@ -922,7 +746,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_millis(1);
 
         assert_eq!(
-            transaction.wait_until_ready(deadline),
+            transaction.wait_until_running(deadline),
             Err(ErrorCode::Internal)
         );
         assert!(matches!(
@@ -933,17 +757,16 @@ mod tests {
     }
 
     #[test]
-    fn parent_abort_releases_a_ready_child() {
+    fn parent_abort_prevents_association_activation() {
         let (_broker, transaction) = starting_transaction();
-        let ready = Arc::clone(&transaction);
-        let waiter = std::thread::spawn(move || ready.ready_and_wait(None));
-        transaction
-            .wait_until_ready(Instant::now() + Duration::from_secs(1))
-            .unwrap();
 
         transaction.abort(ErrorCode::PeerClosed, false, true);
 
-        assert_eq!(waiter.join().unwrap(), Err(ErrorCode::PeerClosed));
+        assert_eq!(transaction.activate(), Err(ErrorCode::PeerClosed));
+        assert_eq!(
+            transaction.wait_until_running(Instant::now() + Duration::from_secs(1)),
+            Err(ErrorCode::PeerClosed)
+        );
         transaction.process.cleanup(true);
     }
 
@@ -975,14 +798,14 @@ mod tests {
         manager.association_ending(parent_id);
 
         assert_eq!(
-            transaction.wait_until_ready(Instant::now() + PROCESS_START_TIMEOUT),
+            transaction.wait_until_running(Instant::now() + PROCESS_START_TIMEOUT),
             Err(ErrorCode::PeerClosed)
         );
         transaction.process.cleanup(true);
     }
 
     #[test]
-    fn association_registration_installs_pending_failure_callback() {
+    fn association_registration_activates_the_process() {
         let (broker, transaction) = starting_transaction();
         let process_id = transaction.process.id();
         let manager = RunnerProcessManager {
@@ -995,19 +818,35 @@ mod tests {
             }),
             drained: Condvar::new(),
         };
-        let (failed, failure) = mpsc::sync_channel(1);
-
         manager
-            .register_association(
-                process_id,
-                Arc::new(move || {
-                    let _ = failed.send(());
-                }),
-            )
+            .register_association(process_id, Arc::new(|| {}), true)
             .unwrap();
-        transaction.abort(ErrorCode::Internal, true, true);
 
-        failure.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(transaction.process.is_running());
+        transaction.process.cleanup(true);
+    }
+
+    #[test]
+    fn late_started_association_is_not_activated_as_a_root() {
+        let (broker, transaction) = starting_transaction();
+        let process_id = transaction.process.id();
+        let manager = RunnerProcessManager {
+            broker,
+            started_runner_config: RunnerConfig::new(PathBuf::new(), Vec::new()),
+            state: Mutex::new(RunnerProcessManagerState {
+                transactions: Vec::new(),
+                associations: Vec::new(),
+                active_instances: 1,
+            }),
+            drained: Condvar::new(),
+        };
+
+        assert!(
+            manager
+                .register_association(process_id, Arc::new(|| {}), true)
+                .is_err()
+        );
+        assert!(!transaction.process.is_running());
         transaction.process.cleanup(true);
     }
 }

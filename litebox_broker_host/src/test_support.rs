@@ -65,6 +65,9 @@ impl InProcessBrokerSetup {
             .association
             .take()
             .expect("the in-process local endpoint must negotiate before activation");
+        association
+            .activate_process()
+            .expect("the in-process broker process must activate once");
         InProcessBrokerChannel {
             association: Some(association),
             panicked: AtomicBool::new(false),
@@ -326,7 +329,7 @@ mod tests {
         let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
-        .with_limits(BrokerCoreLimits::DEFAULT.with_thread_quotas(1, 1))
+        .with_limits(BrokerCoreLimits::DEFAULT.with_thread_quotas(2, 2))
         .build()
         .unwrap();
 

@@ -67,10 +67,6 @@ pub enum BrokerOperation {
     File(FileRequest),
     /// Start one child process from an opaque platform bootstrap.
     StartProcess(ProcessStartupDescriptor),
-    /// Report that this child process is ready to begin guest execution.
-    ReportProcessReady(Option<ThreadId>),
-    /// Report that this child rejected its startup data before becoming ready.
-    ReportProcessStartFailure(ErrorCode),
 }
 
 impl BrokerOperation {
@@ -126,9 +122,7 @@ impl BrokerOperation {
             | Self::Stdio(StdioRequest::IsTerminal(_))
             | Self::File(
                 FileRequest::Seek(_) | FileRequest::Truncate(_) | FileRequest::HandleStatus(_),
-            )
-            | Self::ReportProcessReady(_)
-            | Self::ReportProcessStartFailure(_) => None,
+            ) => None,
         }
     }
 }
@@ -154,6 +148,8 @@ pub enum BrokerHandshakeResponse {
         broker_protocol_version: ProtocolVersion,
         /// Assigned process ID.
         process_id: ProcessId,
+        /// Assigned initial thread ID.
+        initial_thread_id: ThreadId,
         /// Child startup data, absent for the initial process.
         startup: Option<ProcessStartupDescriptor>,
     },
@@ -246,12 +242,8 @@ pub enum BrokerResult {
     Stdio(StdioResponse),
     /// File response family.
     File(FileResponse),
-    /// A child completed broker startup.
+    /// A child established its broker association.
     ProcessStarted(StartedProcess),
-    /// A child-start failure was reported or observed before startup completed.
-    ProcessStartFailed(ErrorCode),
-    /// The broker accepted the child's ready report.
-    ProcessReady,
     /// Operation failed with an ABI-neutral broker error.
     Error(ErrorCode),
 }

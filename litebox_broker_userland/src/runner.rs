@@ -113,8 +113,6 @@ enum RunnerShutdownState {
 }
 
 struct RunnerCompletion {
-    result: IoResult<ExitStatus>,
-    runner_success: Option<bool>,
     runner_signal: Option<i32>,
     runner_exit_code: Option<i32>,
     termination_provenance: TerminationProvenance,
@@ -123,29 +121,15 @@ struct RunnerCompletion {
 }
 
 #[derive(Clone, Copy, Default)]
-struct TerminationProvenance(u8);
+struct TerminationProvenance(bool);
 
 impl TerminationProvenance {
-    const BROKER_TERMINATION: u8 = 1;
-    const REPORTED_START_FAILURE: u8 = 2;
-
-    const fn new(broker_termination: bool, reported_start_failure: bool) -> Self {
-        let mut value = 0;
-        if broker_termination {
-            value |= Self::BROKER_TERMINATION;
-        }
-        if reported_start_failure {
-            value |= Self::REPORTED_START_FAILURE;
-        }
-        Self(value)
+    const fn new(broker_termination: bool) -> Self {
+        Self(broker_termination)
     }
 
     const fn broker_termination(self) -> bool {
-        self.0 & Self::BROKER_TERMINATION != 0
-    }
-
-    const fn reported_start_failure(self) -> bool {
-        self.0 & Self::REPORTED_START_FAILURE != 0
+        self.0
     }
 }
 
@@ -353,24 +337,15 @@ impl RunnerInstance {
         if runner_status.is_err() {
             transaction.mark_abnormal();
         }
-        let runner_success = runner_status.as_ref().ok().map(ExitStatus::success);
         let runner_signal = runner_status
             .as_ref()
             .ok()
             .copied()
             .and_then(runner_exit_signal);
         let runner_exit_code = runner_status.as_ref().ok().and_then(ExitStatus::code);
-        let termination_provenance = TerminationProvenance::new(
-            self.shutdown.termination_was_dispatched(),
-            shutdown_request.expected_start_failure_was_reported(),
-        );
-        let result = runner_status.and_then(|status| {
-            association_result.result?;
-            Ok(status)
-        });
+        let termination_provenance =
+            TerminationProvenance::new(self.shutdown.termination_was_dispatched());
         RunnerCompletion {
-            result,
-            runner_success,
             runner_signal,
             runner_exit_code,
             termination_provenance,
@@ -413,7 +388,7 @@ const fn runner_signal_is_abnormal(_signal: Option<i32>, _broker_termination: bo
 
 #[cfg(all(windows, target_arch = "x86_64"))]
 const fn runner_exit_code_is_crash(exit_code: Option<i32>) -> bool {
-    matches!(exit_code, Some(code) if code as u32 >= 0x8000_0000)
+    matches!(exit_code, Some(code) if code.cast_unsigned() >= 0x8000_0000)
 }
 
 #[cfg(not(all(windows, target_arch = "x86_64")))]
@@ -422,33 +397,12 @@ const fn runner_exit_code_is_crash(_exit_code: Option<i32>) -> bool {
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
-const fn runner_exit_code_is_expected_shutdown(
-    exit_code: Option<i32>,
-    broker_termination: bool,
-) -> bool {
-    broker_termination && matches!(exit_code, Some(1))
-}
-
-#[cfg(all(windows, target_arch = "x86_64"))]
 const _: () = {
-    let access_violation = 0xc000_0005_u32 as i32;
-    let breakpoint = 0x8000_0003_u32 as i32;
+    let access_violation = 0xc000_0005_u32.cast_signed();
+    let breakpoint = 0x8000_0003_u32.cast_signed();
     assert!(runner_exit_code_is_crash(Some(access_violation)));
     assert!(runner_exit_code_is_crash(Some(breakpoint)));
-    assert!(!runner_exit_code_is_expected_shutdown(
-        Some(access_violation),
-        true
-    ));
-    assert!(runner_exit_code_is_expected_shutdown(Some(1), true));
 };
-
-#[cfg(not(all(windows, target_arch = "x86_64")))]
-const fn runner_exit_code_is_expected_shutdown(
-    _exit_code: Option<i32>,
-    _broker_termination: bool,
-) -> bool {
-    false
-}
 
 fn accept_runner_channel<Channel>(
     deadline: Instant,

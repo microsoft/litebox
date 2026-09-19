@@ -293,6 +293,7 @@ where
         notification_channel,
         shutdown,
         process_manager,
+        is_started_process,
         !is_started_process && process_out.is_none(),
         panicked_out,
         abnormal_out,
@@ -484,6 +485,7 @@ fn dispatch_requests<Memory, RequestSource, ResponseSink, NotificationChannel, S
     mut notification_channel: NotificationChannel,
     shutdown: Shutdown,
     process_manager: Option<Arc<RunnerProcessManager>>,
+    is_started_process: bool,
     finish_process: bool,
     panicked_out: Option<&AtomicBool>,
     abnormal_out: Option<&AtomicBool>,
@@ -506,11 +508,22 @@ where
                 "process association terminated by process-start control",
             ));
         });
-        if let Err(error) =
-            process_manager.register_association(association.process_id(), association_failure)
-        {
-            failure_coordinator.report(error);
-        }
+        process_manager.register_association(
+            association.process_id(),
+            association_failure,
+            is_started_process,
+        )?;
+    } else if is_started_process {
+        return Err(IoError::other(
+            "started process association requires a process manager",
+        ));
+    }
+    if !is_started_process {
+        association.activate_process().map_err(|error| {
+            IoError::other(format!(
+                "failed to activate broker process association: {error}"
+            ))
+        })?;
     }
     let (request_sender, request_receiver) = sync_channel(REQUEST_QUEUE_CAPACITY);
     let request_receiver = Arc::new(Mutex::new(request_receiver));
@@ -849,6 +862,7 @@ mod tests {
             .send_handshake_response(&BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
                 process_id: litebox_broker_protocol::ProcessId(1),
+                initial_thread_id: litebox_broker_protocol::ThreadId(2),
                 startup: None,
             })
             .unwrap();
@@ -980,6 +994,7 @@ mod tests {
                     notifications,
                     shutdown,
                     None,
+                    false,
                     true,
                     None,
                     None,

@@ -127,7 +127,6 @@ pub struct BrokerProcess {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ProcessState {
     Attaching,
-    StartReady { initial_thread_id: Option<ThreadId> },
     Running,
     Exiting,
 }
@@ -182,34 +181,15 @@ impl BrokerProcess {
         matches!(*self.state.lock(), ProcessState::Running)
     }
 
-    /// Records the initial thread supplied by `ProcessReady`.
-    pub fn mark_start_ready(&self, initial_thread_id: Option<ThreadId>) -> Result<()> {
-        let mut state = self.state.lock();
-        match *state {
-            ProcessState::Attaching => {}
-            ProcessState::Exiting => return Err(BrokerError::PeerClosed),
-            ProcessState::StartReady { .. } | ProcessState::Running => {
-                return Err(BrokerError::Internal);
-            }
-        }
-        if let Some(thread_id) = initial_thread_id
-            && !self.threads.lock().contains_key(&thread_id)
-        {
-            return Err(BrokerError::UnknownObject);
-        }
-        *state = ProcessState::StartReady { initial_thread_id };
-        Ok(())
-    }
-
-    /// Completes startup after the runner reports ready.
+    /// Completes startup after the process association becomes active.
     pub fn complete_start(&self) -> Result<()> {
         let mut state = self.state.lock();
         match *state {
-            ProcessState::StartReady { .. } => {
+            ProcessState::Attaching => {
                 *state = ProcessState::Running;
                 Ok(())
             }
-            ProcessState::Attaching | ProcessState::Running => Err(BrokerError::Internal),
+            ProcessState::Running => Err(BrokerError::Internal),
             ProcessState::Exiting => Err(BrokerError::PeerClosed),
         }
     }
@@ -295,20 +275,10 @@ impl BrokerProcess {
 
     /// Records broker thread exit after its local task teardown completes.
     pub fn exit_thread(&self, thread_id: ThreadId) -> Result<()> {
-        let state = self.state.lock();
-        if matches!(
-            *state,
-            ProcessState::StartReady {
-                initial_thread_id: Some(pinned),
-            } if pinned == thread_id
-        ) {
-            return Err(BrokerError::WouldBlock);
-        }
         let mut threads = self.threads.lock();
         let thread = threads
             .remove(&thread_id)
             .ok_or(BrokerError::UnknownObject)?;
-        drop(state);
         drop(threads);
         self.core
             .active_thread_count
@@ -961,28 +931,6 @@ mod tests {
     }
 
     #[test]
-    fn startup_states_defer_initial_thread_exit_until_start_completes() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
-            ObjectRights::all(),
-        ))
-        .build()
-        .unwrap();
-        let parent = broker
-            .create_process(CallerCredential::Unauthenticated)
-            .unwrap();
-        let (process, _) = parent.create_child(&[]).unwrap();
-        let thread = process.create_thread().unwrap();
-
-        process.mark_start_ready(Some(thread)).unwrap();
-        assert_eq!(process.exit_thread(thread), Err(BrokerError::WouldBlock));
-        process.complete_start().unwrap();
-        assert!(process.is_running());
-        assert_eq!(process.exit_thread(thread), Ok(()));
-        process.cleanup(true);
-        parent.cleanup(true);
-    }
-
-    #[test]
     fn child_is_parented_and_requires_start_completion() {
         let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
@@ -994,9 +942,11 @@ mod tests {
             .unwrap();
         let source_handle = crate::event::create(&parent, 1).unwrap();
         let (child, inherited_objects) = parent.create_child(&[source_handle]).unwrap();
+        let initial_thread_id = child.create_thread().unwrap();
         let inherited_handle = inherited_objects[0];
 
         assert_eq!(child.parent_id(), Some(parent.id()));
+        assert!(child.owns_thread(initial_thread_id));
         assert_ne!(inherited_handle, source_handle);
         assert_eq!(
             child.check_readiness(inherited_handle).unwrap(),
@@ -1004,7 +954,6 @@ mod tests {
         );
         assert!(!child.is_running());
 
-        child.mark_start_ready(None).unwrap();
         child.complete_start().unwrap();
         assert!(child.is_running());
         assert_eq!(*child.state.lock(), ProcessState::Running);

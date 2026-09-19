@@ -9,8 +9,7 @@ use std::process::{Child, Command};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use litebox_broker_local::{BrokerLocal, BrokerLocalError};
-use litebox_broker_protocol::error::ErrorCode;
+use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::process::{
     InheritedProcessObjects, ProcessBootstrapFormat, ProcessBootstrapVersion, ProcessStartupData,
 };
@@ -236,8 +235,8 @@ fn run_fake_runner(args: &[OsString]) {
         let bootstrap = marker.as_os_str().as_encoded_bytes();
         let inherited_event = local.create_event_with_count(1).unwrap();
         let inherited_objects = InheritedProcessObjects::new(&[inherited_event]).unwrap();
-        assert!(matches!(
-            local.request_process_start(
+        let failed = local
+            .request_process_start(
                 FAILING_BOOTSTRAP_FORMAT,
                 ProcessBootstrapVersion(1),
                 SharedBufferSequence::new(
@@ -247,9 +246,9 @@ fn run_fake_runner(args: &[OsString]) {
                 .unwrap(),
                 bootstrap,
                 inherited_objects,
-            ),
-            Err(BrokerLocalError::Broker(ErrorCode::UnsupportedOperation))
-        ));
+            )
+            .unwrap();
+        assert_ne!(failed.process_id.0, failed.initial_thread_id.0);
         let started = local
             .request_process_start(
                 TEST_BOOTSTRAP_FORMAT,
@@ -263,7 +262,7 @@ fn run_fake_runner(args: &[OsString]) {
                 inherited_objects,
             )
             .unwrap();
-        assert_eq!(started.initial_thread_id, None);
+        assert_ne!(started.process_id.0, started.initial_thread_id.0);
         wait_for_marker(
             marker,
             &format!("ready:{}\nstarted\nfinished\n", started.process_id.0),
@@ -342,9 +341,6 @@ fn run_fake_child(
     bootstrap: ProcessStartupData,
 ) {
     if bootstrap.format == FAILING_BOOTSTRAP_FORMAT {
-        local
-            .report_process_start_failure(ErrorCode::UnsupportedOperation)
-            .unwrap();
         return;
     }
     assert_eq!(bootstrap.format, TEST_BOOTSTRAP_FORMAT);
@@ -357,11 +353,6 @@ fn run_fake_child(
         ReadinessFlags::READ | ReadinessFlags::WRITE
     );
     std::fs::write(marker, format!("ready:{}\n", local.process_id().0)).unwrap();
-    match local.process_ready(None) {
-        Ok(()) => {}
-        Err(BrokerLocalError::Broker(ErrorCode::PeerClosed)) => return,
-        Err(error) => panic!("child readiness failed: {error}"),
-    }
     std::fs::OpenOptions::new()
         .append(true)
         .open(marker)

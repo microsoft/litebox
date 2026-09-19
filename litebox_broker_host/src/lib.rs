@@ -61,7 +61,7 @@ use litebox_broker_protocol::stdio::{
     IsTerminalStdioRequest, IsTerminalStdioResponse, MAX_STDIO_TRANSFER_SIZE, ReadStdioRequest,
     ReadStdioResponse, WriteStdioRequest, WriteStdioResponse,
 };
-use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, RequestId};
+use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, RequestId, ThreadId};
 use litebox_broker_transport::channel::{HostReceive, HostSetupChannel, PeerCredential};
 use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemory};
 use spin::mutex::SpinMutex;
@@ -115,6 +115,11 @@ impl<'a, Memory: SharedMemory> BrokerHostAssociation<'a, Memory> {
     #[must_use]
     pub fn process_id(&self) -> litebox_broker_protocol::ProcessId {
         self.process.id()
+    }
+
+    /// Marks the process running after deployment-specific association activation.
+    pub fn activate_process(&self) -> litebox_broker_core::Result<()> {
+        self.process.complete_start()
     }
 
     /// Requests cancellation of provider operations after the peer disconnects.
@@ -221,7 +226,7 @@ impl<'a, Memory: SharedMemory> BrokerHostAssociation<'a, Memory> {
 #[allow(clippy::too_many_arguments)]
 pub fn setup_connection<'a, SetupChannel, Memory, ChannelError>(
     core: &BrokerCore,
-    process: Option<Arc<BrokerProcess>>,
+    process: Option<(Arc<BrokerProcess>, ThreadId)>,
     startup: Option<ProcessStartupData>,
     setup_channel: &mut SetupChannel,
     shared_buffers: &'a SharedBufferPool<Memory>,
@@ -312,8 +317,12 @@ where
         }
 
         let finish_on_setup_error = process.is_none();
-        let process = match process.take() {
-            Some(process) if process.caller_credential() == caller_credential => process,
+        let (process, initial_thread_id) = match process.take() {
+            Some((process, initial_thread_id))
+                if process.caller_credential() == caller_credential =>
+            {
+                (process, initial_thread_id)
+            }
             Some(_) => {
                 let error = ErrorCode::PolicyDenied;
                 setup_channel
@@ -321,8 +330,25 @@ where
                     .map_err(BrokerHostError::Channel)?;
                 return Ok(Err(ConnectionTermination::Rejected(error)));
             }
-            None => match core.create_process(caller_credential) {
-                Ok(process) => process,
+            None => match core.create_attaching_process(caller_credential) {
+                Ok(process) => match process.create_thread() {
+                    Ok(initial_thread_id) => (process, initial_thread_id),
+                    Err(
+                        error @ (litebox_broker_core::BrokerError::ResourceExhausted
+                        | litebox_broker_core::BrokerError::OutOfMemory),
+                    ) => {
+                        process.cleanup(true);
+                        let error = ErrorCode::from(error);
+                        setup_channel
+                            .send_handshake_response(&BrokerHandshakeResponse::Error(error))
+                            .map_err(BrokerHostError::Channel)?;
+                        return Ok(Err(ConnectionTermination::Rejected(error)));
+                    }
+                    Err(error) => {
+                        process.cleanup(true);
+                        return Err(BrokerHostError::from(error));
+                    }
+                },
                 Err(litebox_broker_core::BrokerError::ResourceExhausted) => {
                     let error = ErrorCode::ResourceExhausted;
                     setup_channel
@@ -336,6 +362,7 @@ where
         let response = BrokerHandshakeResponse::Negotiated {
             broker_protocol_version: BROKER_PROTOCOL_VERSION,
             process_id: process.id(),
+            initial_thread_id,
             startup,
         };
         let process_retained = retain_process(&process);
@@ -513,9 +540,7 @@ fn handle_request<Memory: SharedMemory>(
         BrokerOperation::File(request) => {
             handle_file_request(process, request, shared_buffers).map(BrokerResult::File)
         }
-        BrokerOperation::StartProcess(_)
-        | BrokerOperation::ReportProcessReady(_)
-        | BrokerOperation::ReportProcessStartFailure(_) => {
+        BrokerOperation::StartProcess(_) => {
             Err(RequestFailure::Respond(ErrorCode::UnsupportedOperation))
         }
     }
@@ -1573,7 +1598,7 @@ mod tests {
             .into_inner()
             .unwrap()
             .expect("deployment owner must retain the negotiated process");
-        assert!(process.is_running());
+        assert!(!process.is_running());
         process.cleanup(true);
     }
 
@@ -1886,6 +1911,7 @@ mod tests {
             BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
                 process_id: root_process_id(1),
+                initial_thread_id: ThreadId(2),
                 startup: None,
             }
         );
@@ -1921,7 +1947,8 @@ mod tests {
                 },
                 BrokerHandshakeResponse::Negotiated {
                     broker_protocol_version: BROKER_PROTOCOL_VERSION,
-                    process_id: root_process_id(2),
+                    process_id: root_process_id(3),
+                    initial_thread_id: ThreadId(4),
                     startup: None,
                 }
             ]
@@ -1960,7 +1987,7 @@ mod tests {
                 .create_process(CallerCredential::Unauthenticated)
                 .unwrap()
                 .id(),
-            root_process_id(3)
+            root_process_id(5)
         );
     }
 
@@ -1995,7 +2022,8 @@ mod tests {
             channel.handshake_responses,
             [BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
-                process_id: root_process_id(4),
+                process_id: root_process_id(6),
+                initial_thread_id: ThreadId(7),
                 startup: None,
             }]
         );
@@ -2807,6 +2835,9 @@ mod tests {
             Ok(association) => association,
             Err(termination) => return Ok(termination),
         };
+        association
+            .activate_process()
+            .expect("test broker process must activate once");
         let result = (|| {
             loop {
                 let request = match control_channel

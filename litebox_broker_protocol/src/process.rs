@@ -85,11 +85,11 @@ pub struct ProcessStartupData {
     pub inherited_objects: InheritedProcessObjects,
 }
 
-/// Reports a child process that completed broker startup.
+/// Identifies a child process whose broker association was established.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StartedProcess {
     /// Broker-assigned child process ID.
     pub process_id: ProcessId,
-    /// Broker-assigned initial thread ID when it differs from the process ID.
-    pub initial_thread_id: Option<ThreadId>,
+    /// Broker-assigned initial thread ID.
+    pub initial_thread_id: ThreadId,
 }

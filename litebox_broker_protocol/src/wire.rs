@@ -50,8 +50,7 @@ const REQUEST_TAG_CREATE_THREAD: u8 = 9;
 const REQUEST_TAG_EXIT_THREAD: u8 = 10;
 const REQUEST_TAG_START_PROCESS: u8 = 11;
 // Tag 12 is reserved for the removed process-start acknowledgement.
-const REQUEST_TAG_PROCESS_READY: u8 = 13;
-const REQUEST_TAG_REPORT_PROCESS_START_FAILURE: u8 = 14;
+// Tags 13 and 14 are reserved for the removed process-ready protocol.
 
 // Paired request and successful-response tags intentionally share values.
 const RESPONSE_TAG_NEGOTIATED: u8 = 0;
@@ -67,8 +66,7 @@ const RESPONSE_TAG_THREAD_CREATED: u8 = 9;
 const RESPONSE_TAG_THREAD_EXITED: u8 = 10;
 const RESPONSE_TAG_PROCESS_STARTED: u8 = 11;
 // Tag 12 is reserved for the removed process-start acknowledgement.
-const RESPONSE_TAG_PROCESS_READY: u8 = 13;
-const RESPONSE_TAG_PROCESS_START_FAILED: u8 = 14;
+// Tags 13 and 14 are reserved for the removed process-ready protocol.
 
 // Reserve the top of the tag space for responses without paired requests.
 const RESPONSE_TAG_ERROR: u8 = 253;
@@ -128,9 +126,7 @@ pub fn decode_handshake_request(frame: &[u8]) -> Result<BrokerHandshakeRequest, 
         | REQUEST_TAG_FILE
         | REQUEST_TAG_CREATE_THREAD
         | REQUEST_TAG_EXIT_THREAD
-        | REQUEST_TAG_START_PROCESS
-        | REQUEST_TAG_PROCESS_READY
-        | REQUEST_TAG_REPORT_PROCESS_START_FAILURE => {
+        | REQUEST_TAG_START_PROCESS => {
             return Err(WireError::WrongMessagePhase);
         }
         _ => return Err(WireError::InvalidTag),
@@ -212,16 +208,6 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
             encoder.shared_buffer_sequence(buffer);
             encode_inherited_objects(&mut encoder, inherited_objects);
         }
-        BrokerOperation::ReportProcessReady(initial_thread_id) => {
-            encoder.u8(REQUEST_TAG_PROCESS_READY);
-            encoder.request_id(request_id);
-            encode_optional_thread_id(&mut encoder, initial_thread_id);
-        }
-        BrokerOperation::ReportProcessStartFailure(error) => {
-            encoder.u8(REQUEST_TAG_REPORT_PROCESS_START_FAILURE);
-            encoder.request_id(request_id);
-            encode_error_code(&mut encoder, error);
-        }
     }
     encoder.finish()
 }
@@ -242,9 +228,7 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         | REQUEST_TAG_FILE
         | REQUEST_TAG_CREATE_THREAD
         | REQUEST_TAG_EXIT_THREAD
-        | REQUEST_TAG_START_PROCESS
-        | REQUEST_TAG_PROCESS_READY
-        | REQUEST_TAG_REPORT_PROCESS_START_FAILURE => {}
+        | REQUEST_TAG_START_PROCESS => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -265,12 +249,6 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
             buffer: decoder.shared_buffer_sequence()?,
             inherited_objects: decode_inherited_objects(&mut decoder)?,
         }),
-        REQUEST_TAG_PROCESS_READY => {
-            BrokerOperation::ReportProcessReady(decode_optional_thread_id(&mut decoder)?)
-        }
-        REQUEST_TAG_REPORT_PROCESS_START_FAILURE => {
-            BrokerOperation::ReportProcessStartFailure(decode_error_code(&mut decoder)?)
-        }
         _ => unreachable!("active request tag was validated"),
     };
     decoder.finish()?;
@@ -290,11 +268,13 @@ pub fn encode_handshake_response(response: BrokerHandshakeResponse) -> Vec<u8> {
         BrokerHandshakeResponse::Negotiated {
             broker_protocol_version,
             process_id,
+            initial_thread_id,
             startup,
         } => {
             encoder.u8(RESPONSE_TAG_NEGOTIATED);
             encoder.protocol_version(broker_protocol_version);
             encoder.process_id(process_id);
+            encoder.thread_id(initial_thread_id);
             match startup {
                 Some(ProcessStartupDescriptor {
                     format,
@@ -333,6 +313,7 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
         RESPONSE_TAG_NEGOTIATED => BrokerHandshakeResponse::Negotiated {
             broker_protocol_version: decoder.protocol_version()?,
             process_id: decoder.process_id()?,
+            initial_thread_id: decoder.thread_id()?,
             startup: match decoder.u8()? {
                 0 => None,
                 1 => Some(ProcessStartupDescriptor {
@@ -355,9 +336,7 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
         | RESPONSE_TAG_FILE
         | RESPONSE_TAG_THREAD_CREATED
         | RESPONSE_TAG_THREAD_EXITED
-        | RESPONSE_TAG_PROCESS_STARTED
-        | RESPONSE_TAG_PROCESS_START_FAILED
-        | RESPONSE_TAG_PROCESS_READY => {
+        | RESPONSE_TAG_PROCESS_STARTED => {
             return Err(WireError::WrongMessagePhase);
         }
         RESPONSE_TAG_VERSION_MISMATCH => BrokerHandshakeResponse::VersionMismatch {
@@ -434,16 +413,7 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
             encoder.u8(RESPONSE_TAG_PROCESS_STARTED);
             encoder.request_id(request_id);
             encoder.process_id(process_id);
-            encode_optional_thread_id(&mut encoder, initial_thread_id);
-        }
-        BrokerResult::ProcessStartFailed(error) => {
-            encoder.u8(RESPONSE_TAG_PROCESS_START_FAILED);
-            encoder.request_id(request_id);
-            encode_error_code(&mut encoder, error);
-        }
-        BrokerResult::ProcessReady => {
-            encoder.u8(RESPONSE_TAG_PROCESS_READY);
-            encoder.request_id(request_id);
+            encoder.thread_id(initial_thread_id);
         }
         BrokerResult::Error(error) => {
             encoder.u8(RESPONSE_TAG_ERROR);
@@ -473,9 +443,7 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         | RESPONSE_TAG_FILE
         | RESPONSE_TAG_THREAD_CREATED
         | RESPONSE_TAG_THREAD_EXITED
-        | RESPONSE_TAG_PROCESS_STARTED
-        | RESPONSE_TAG_PROCESS_START_FAILED
-        | RESPONSE_TAG_PROCESS_READY => {}
+        | RESPONSE_TAG_PROCESS_STARTED => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -493,33 +461,12 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         RESPONSE_TAG_FILE => BrokerResult::File(fs::decode_fs_response(&mut decoder)?),
         RESPONSE_TAG_PROCESS_STARTED => BrokerResult::ProcessStarted(StartedProcess {
             process_id: decoder.process_id()?,
-            initial_thread_id: decode_optional_thread_id(&mut decoder)?,
+            initial_thread_id: decoder.thread_id()?,
         }),
-        RESPONSE_TAG_PROCESS_START_FAILED => {
-            BrokerResult::ProcessStartFailed(decode_error_code(&mut decoder)?)
-        }
-        RESPONSE_TAG_PROCESS_READY => BrokerResult::ProcessReady,
         _ => unreachable!("active response tag was validated"),
     };
     decoder.finish()?;
     Ok(BrokerResponse { request_id, result })
-}
-
-fn encode_optional_thread_id(encoder: &mut Encoder, thread_id: Option<crate::ThreadId>) {
-    encoder.u8(u8::from(thread_id.is_some()));
-    if let Some(thread_id) = thread_id {
-        encoder.thread_id(thread_id);
-    }
-}
-
-fn decode_optional_thread_id(
-    decoder: &mut Decoder<'_>,
-) -> Result<Option<crate::ThreadId>, WireError> {
-    match decoder.u8()? {
-        0 => Ok(None),
-        1 => Ok(Some(decoder.thread_id()?)),
-        _ => Err(WireError::InvalidTag),
-    }
 }
 
 fn encode_inherited_objects(encoder: &mut Encoder, objects: InheritedProcessObjects) {
@@ -695,8 +642,6 @@ mod tests {
                 RESPONSE_TAG_THREAD_CREATED,
                 RESPONSE_TAG_THREAD_EXITED,
                 RESPONSE_TAG_PROCESS_STARTED,
-                RESPONSE_TAG_PROCESS_READY,
-                RESPONSE_TAG_PROCESS_START_FAILED,
             ],
             [
                 REQUEST_TAG_NEGOTIATE,
@@ -711,8 +656,6 @@ mod tests {
                 REQUEST_TAG_CREATE_THREAD,
                 REQUEST_TAG_EXIT_THREAD,
                 REQUEST_TAG_START_PROCESS,
-                REQUEST_TAG_PROCESS_READY,
-                REQUEST_TAG_REPORT_PROCESS_START_FAILURE,
             ]
         );
         assert_eq!(
@@ -993,9 +936,6 @@ mod tests {
                 ])
                 .unwrap(),
             }),
-            BrokerOperation::ReportProcessReady(None),
-            BrokerOperation::ReportProcessReady(Some(thread_id(19))),
-            BrokerOperation::ReportProcessStartFailure(ErrorCode::UnsupportedOperation),
         ];
         let mut maximum_encoded_size = 0;
 
@@ -1169,11 +1109,13 @@ mod tests {
             BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: ProtocolVersion(1),
                 process_id: process_id(1),
+                initial_thread_id: thread_id(2),
                 startup: None,
             },
             BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: ProtocolVersion(1),
                 process_id: process_id(7),
+                initial_thread_id: thread_id(8),
                 startup: Some(ProcessStartupDescriptor {
                     format: ProcessBootstrapFormat(0x7465_7374),
                     version: ProcessBootstrapVersion(1),
@@ -1341,14 +1283,12 @@ mod tests {
             BrokerResult::File(FileResponse::Failed(FileError::Io)),
             BrokerResult::ProcessStarted(StartedProcess {
                 process_id: process_id(u32::MAX),
-                initial_thread_id: None,
+                initial_thread_id: thread_id(u32::MAX - 1),
             }),
             BrokerResult::ProcessStarted(StartedProcess {
                 process_id: process_id(9),
-                initial_thread_id: Some(thread_id(11)),
+                initial_thread_id: thread_id(11),
             }),
-            BrokerResult::ProcessStartFailed(ErrorCode::PeerClosed),
-            BrokerResult::ProcessReady,
             BrokerResult::Error(ErrorCode::PolicyDenied),
             BrokerResult::Error(ErrorCode::WouldBlock),
             BrokerResult::Error(ErrorCode::PeerClosed),
@@ -1854,6 +1794,7 @@ mod tests {
         let negotiated = BrokerHandshakeResponse::Negotiated {
             broker_protocol_version: ProtocolVersion(1),
             process_id: process_id(1),
+            initial_thread_id: thread_id(2),
             startup: None,
         };
         let mut invalid_startup = encode_handshake_response(negotiated.clone());
@@ -1881,11 +1822,13 @@ mod tests {
             BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: ProtocolVersion(1),
                 process_id: process_id(1),
+                initial_thread_id: thread_id(2),
                 startup: None,
             },
             BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: ProtocolVersion(1),
                 process_id: process_id(2),
+                initial_thread_id: thread_id(3),
                 startup: Some(ProcessStartupDescriptor {
                     format: ProcessBootstrapFormat(3),
                     version: ProcessBootstrapVersion(4),

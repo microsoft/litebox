@@ -314,6 +314,22 @@ impl BrokerCore {
         self.create_process_with_parent(None, caller_credential, process::ProcessState::Running)
     }
 
+    /// Allocates one authenticated broker process awaiting association activation.
+    ///
+    /// The deployment must call [`BrokerProcess::complete_start`] after the
+    /// process association becomes active.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the shared ID allocator violates its range or uniqueness
+    /// invariants.
+    pub fn create_attaching_process(
+        &self,
+        caller_credential: CallerCredential,
+    ) -> Result<Arc<BrokerProcess>> {
+        self.create_process_with_parent(None, caller_credential, process::ProcessState::Attaching)
+    }
+
     fn create_process_with_parent(
         &self,
         parent_id: Option<ProcessId>,

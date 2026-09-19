@@ -60,6 +60,7 @@ pub use error::{BrokerLocalError, Result};
 pub struct BrokerLocal<Channel: LocalCallChannel> {
     channel: Channel,
     process_id: ProcessId,
+    initial_thread_id: ThreadId,
     shared_buffers: SharedBufferPool<Arc<dyn SharedMemory>>,
     next_request_id: AtomicU64,
 }
@@ -70,12 +71,18 @@ pub struct BrokerNotifications<Channel: LocalNotificationChannel> {
 }
 
 impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
-    fn new(channel: Channel, process_id: ProcessId, shared_memory: Arc<dyn SharedMemory>) -> Self {
+    fn new(
+        channel: Channel,
+        process_id: ProcessId,
+        initial_thread_id: ThreadId,
+        shared_memory: Arc<dyn SharedMemory>,
+    ) -> Self {
         let shared_buffers = SharedBufferPool::new(shared_memory, SHARED_BUFFER_LAYOUT)
             .expect("broker association shared memory has an invalid size");
         Self {
             channel,
             process_id,
+            initial_thread_id,
             shared_buffers,
             next_request_id: AtomicU64::new(0),
         }
@@ -121,6 +128,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             response @ BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version,
                 process_id,
+                initial_thread_id,
                 startup,
             } => {
                 assert_eq!(
@@ -129,7 +137,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                 );
                 let (channel, shared_memory, activated) =
                     activate(setup).map_err(BrokerLocalError::Channel)?;
-                let local = Self::new(channel, process_id, shared_memory);
+                let local = Self::new(channel, process_id, initial_thread_id, shared_memory);
                 let startup = match startup {
                     Some(startup) => {
                         let mut payload = Vec::new();
@@ -155,7 +163,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             BrokerHandshakeResponse::Error(error) => match error {
                 ErrorCode::UnsupportedVersion
                 | ErrorCode::PolicyDenied
-                | ErrorCode::ResourceExhausted => Err(BrokerLocalError::Broker(error)),
+                | ErrorCode::ResourceExhausted
+                | ErrorCode::OutOfMemory => Err(BrokerLocalError::Broker(error)),
                 ErrorCode::MalformedRequest
                 | ErrorCode::ProtocolState
                 | ErrorCode::UnsupportedOperation
@@ -169,6 +178,12 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     #[must_use]
     pub const fn process_id(&self) -> ProcessId {
         self.process_id
+    }
+
+    /// Returns the broker-assigned initial thread ID.
+    #[must_use]
+    pub const fn initial_thread_id(&self) -> ThreadId {
+        self.initial_thread_id
     }
 
     /// Creates a broker thread belonging to this process.
@@ -373,6 +388,7 @@ mod tests {
             Some(BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
                 process_id: test_process_id(),
+                initial_thread_id: ThreadId(2),
                 startup: None,
             }),
             None,
@@ -396,6 +412,7 @@ mod tests {
         assert_eq!(setup_calls.get(), 1);
         assert!(startup.is_none());
         assert_eq!(local.process_id(), test_process_id());
+        assert_eq!(local.initial_thread_id(), ThreadId(2));
     }
 
     #[test]
@@ -637,6 +654,7 @@ mod tests {
             Some(BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version,
                 process_id: test_process_id(),
+                initial_thread_id: ThreadId(2),
                 startup: None,
             }),
             None,
@@ -689,21 +707,21 @@ mod tests {
     }
 
     #[test]
-    fn negotiate_returns_process_id_exhaustion() {
-        let channel = FakeControlChannel::new(
-            Some(BrokerHandshakeResponse::Error(ErrorCode::ResourceExhausted)),
-            None,
-        );
-        let setup_called = Cell::new(false);
+    fn negotiate_returns_resource_allocation_errors() {
+        for error in [ErrorCode::ResourceExhausted, ErrorCode::OutOfMemory] {
+            let channel =
+                FakeControlChannel::new(Some(BrokerHandshakeResponse::Error(error)), None);
+            let setup_called = Cell::new(false);
 
-        assert!(matches!(
-            BrokerLocal::negotiate(channel, |channel| {
-                setup_called.set(true);
-                Ok((channel, noop_shared_memory(), ()))
-            }),
-            Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted))
-        ));
-        assert!(!setup_called.get());
+            assert!(matches!(
+                BrokerLocal::negotiate(channel, |channel| {
+                    setup_called.set(true);
+                    Ok((channel, noop_shared_memory(), ()))
+                }),
+                Err(BrokerLocalError::Broker(reported)) if reported == error
+            ));
+            assert!(!setup_called.get());
+        }
     }
 
     #[test]
@@ -730,6 +748,7 @@ mod tests {
             Some(BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
                 process_id: test_process_id(),
+                initial_thread_id: ThreadId(2),
                 startup: None,
             }),
             None,
@@ -754,6 +773,7 @@ mod tests {
             Some(BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
                 process_id: test_process_id(),
+                initial_thread_id: ThreadId(2),
                 startup: None,
             }),
             None,

@@ -12,8 +12,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use litebox_broker_protocol::message::{
-    BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerOperation,
-    BrokerRequest, BrokerResponse,
+    BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequest,
+    BrokerResponse,
 };
 use litebox_broker_protocol::wire::{
     decode_handshake_response, decode_notification, decode_response, encode_handshake_request,
@@ -230,17 +230,10 @@ impl LocalCallChannel for WindowsControlRingLocalCallChannel {
     fn call(&self, request: BrokerRequest) -> IoResult<BrokerResponse> {
         let association = &self.association;
         let request_id = request.request_id;
-        let pending_call = if matches!(
-            &request.operation,
-            BrokerOperation::ReportProcessStartFailure(_)
-        ) {
-            association
-                .pending_calls
-                .register_with_reserved_capacity(request_id)
-        } else {
-            association.pending_calls.register(request_id)
-        }
-        .map_err(pending_calls_error)?;
+        let pending_call = association
+            .pending_calls
+            .register(request_id)
+            .map_err(pending_calls_error)?;
         let frame = encode_request(request);
         let write_result = {
             let mut producer = association

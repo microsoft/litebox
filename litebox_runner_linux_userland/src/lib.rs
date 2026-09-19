@@ -3,7 +3,6 @@
 
 use anyhow::{Context as _, Result, anyhow};
 use clap::Parser;
-use litebox_broker_protocol::error::ErrorCode;
 use litebox_platform_linux_userland::LinuxUserland as Platform;
 use std::path::PathBuf;
 
@@ -96,9 +95,6 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
             broker::connect(control_socket_path)
         })?;
     if let Some(bootstrap) = startup {
-        connection
-            .local
-            .report_process_start_failure(ErrorCode::UnsupportedOperation)?;
         return Err(anyhow!(
             "unsupported child Linux process bootstrap format {:?} version {:?}",
             bootstrap.format,
@@ -128,9 +124,11 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
     } = connection;
     let process_id = i32::try_from(broker_local.process_id().0)
         .context("process ID does not fit Linux pid_t")?;
+    let initial_thread_id = broker_local.initial_thread_id();
     broker_positional_io_fds.extend(positional_io_fds);
     broker_shutdown_fds.push(shutdown_fd);
     let litebox = litebox::LiteBox::new_with_broker_local(platform, broker_local);
+    let initial_thread = litebox.adopt_thread(initial_thread_id)?;
     broker_association_coordinator.install_dispatch(litebox.broker_failure_dispatcher());
     litebox_platform_linux_userland::with_guest_signals_blocked(|| {
         broker::start_notification_receiver(
@@ -173,7 +171,8 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         &broker_shutdown_fds,
     );
 
-    let program = shim.load_program(task_params, prog_path, argv, envp)?;
+    let program =
+        shim.load_program_with_initial_thread(task_params, initial_thread, prog_path, argv, envp)?;
 
     #[cfg(feature = "lock_tracing")]
     litebox::sync::start_recording();

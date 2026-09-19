@@ -1,7 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use litebox_broker_protocol::ThreadId;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult};
 use litebox_broker_protocol::process::{
@@ -16,9 +15,9 @@ use crate::{BrokerLocal, BrokerLocalError, Result};
 impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     /// Requests materialization of one child process.
     ///
-    /// This call blocks until the child reports ready or startup fails. The
-    /// caller must retain exclusive ownership of the bootstrap sequence until
-    /// this method returns.
+    /// This call blocks until the child's broker association is active or
+    /// launch fails. The caller must retain exclusive ownership of the
+    /// bootstrap sequence until this method returns.
     ///
     /// # Panics
     ///
@@ -45,38 +44,6 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             BrokerResult::ProcessStarted(started) => Ok(started),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
             response => panic!("broker returned unexpected process-start response: {response:?}"),
-        }
-    }
-
-    /// Reports that this child process is ready and waits for broker startup completion.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the broker returns a response for another operation.
-    pub fn process_ready(&self, initial_thread_id: Option<ThreadId>) -> Result<(), Channel::Error> {
-        match self.request(BrokerOperation::ReportProcessReady(initial_thread_id))? {
-            BrokerResult::ProcessReady => Ok(()),
-            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
-            response => panic!("broker returned unexpected process-ready response: {response:?}"),
-        }
-    }
-
-    /// Reports that this child rejected its startup data before becoming ready.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the broker returns a response for another operation or echoes
-    /// a different failure.
-    pub fn report_process_start_failure(&self, error: ErrorCode) -> Result<(), Channel::Error> {
-        match self.request(BrokerOperation::ReportProcessStartFailure(error))? {
-            BrokerResult::ProcessStartFailed(reported) if reported == error => Ok(()),
-            BrokerResult::ProcessStartFailed(reported) => {
-                panic!("broker reported a different process-start failure: {reported}")
-            }
-            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
-            response => {
-                panic!("broker returned unexpected process-start failure response: {response:?}")
-            }
         }
     }
 }
