@@ -63,7 +63,7 @@ use litebox_broker_protocol::stdio::{
 };
 use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, RequestId, ThreadId};
 use litebox_broker_transport::channel::{HostReceive, HostSetupChannel, PeerCredential};
-use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemory};
+use litebox_broker_transport::shared_memory::{SharedBufferError, SharedBufferPool, SharedMemory};
 use spin::mutex::SpinMutex;
 
 mod error;
@@ -597,7 +597,7 @@ fn handle_file_request<Memory: SharedMemory>(
             buffer,
             offset,
         }) => {
-            let data = copy_shared_buffer(shared_buffers, buffer, MAX_FILE_TRANSFER_SIZE)?;
+            let data = read_shared_buffer(shared_buffers, buffer, MAX_FILE_TRANSFER_SIZE)?;
             match litebox_broker_core::fs::write(process, handle, &data, offset)
                 .map_err(RequestFailure::from)?
             {
@@ -769,25 +769,17 @@ fn allocate_zeroed(length: u32) -> RequestResult<Vec<u8>> {
     Ok(data)
 }
 
-/// Copies a validated operation-scoped shared-buffer sequence.
-pub fn copy_shared_buffer<Memory: SharedMemory>(
+/// Reads a validated operation-scoped shared-buffer sequence.
+pub fn read_shared_buffer<Memory: SharedMemory>(
     shared_buffers: &SharedBufferPool<Memory>,
     buffer: SharedBufferSequence,
     max_length: u32,
 ) -> RequestResult<Vec<u8>> {
     validate_shared_buffer(buffer, max_length)?;
     let mut data = allocate_zeroed(buffer.length())?;
-    let mut offset = 0;
-    for descriptor in buffer
-        .descriptors(shared_buffers.layout())
-        .map_err(|_| RequestFailure::Abort(ErrorCode::MalformedRequest))?
-    {
-        let end = offset + descriptor.length as usize;
-        shared_buffers
-            .read(descriptor.slot_index, &mut data[offset..end])
-            .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
-        offset = end;
-    }
+    shared_buffers
+        .read_sequence(buffer, &mut data)
+        .map_err(shared_buffer_access_failure)?;
     Ok(data)
 }
 
@@ -798,35 +790,23 @@ fn write_shared_buffer<Memory: SharedMemory>(
     max_length: u32,
 ) -> RequestResult<()> {
     validate_shared_buffer(buffer, max_length)?;
-    if data.len() > buffer.length() as usize {
-        return Err(RequestFailure::Abort(ErrorCode::Internal));
+    shared_buffers
+        .write_sequence(buffer, data)
+        .map_err(shared_buffer_access_failure)
+}
+
+fn shared_buffer_access_failure(error: SharedBufferError) -> RequestFailure {
+    match error {
+        SharedBufferError::Layout(_) => RequestFailure::Abort(ErrorCode::MalformedRequest),
+        _ => RequestFailure::Abort(ErrorCode::Internal),
     }
-    let mut offset = 0;
-    for descriptor in buffer
-        .descriptors(shared_buffers.layout())
-        .map_err(|_| RequestFailure::Abort(ErrorCode::MalformedRequest))?
-    {
-        if offset == data.len() {
-            break;
-        }
-        let length = (data.len() - offset).min(descriptor.length as usize);
-        let end = offset + length;
-        shared_buffers
-            .write(descriptor.slot_index, &data[offset..end])
-            .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
-        offset = end;
-    }
-    if offset != data.len() {
-        return Err(RequestFailure::Abort(ErrorCode::Internal));
-    }
-    Ok(())
 }
 
 fn read_file_path<Memory: SharedMemory>(
     shared_buffers: &SharedBufferPool<Memory>,
     buffer: SharedBufferSequence,
 ) -> RequestResult<alloc::string::String> {
-    let data = copy_shared_buffer(shared_buffers, buffer, SHARED_BUFFER_SLOT_SIZE)?;
+    let data = read_shared_buffer(shared_buffers, buffer, SHARED_BUFFER_SLOT_SIZE)?;
     let path = alloc::string::String::from_utf8(data)
         .map_err(|_| RequestFailure::Abort(ErrorCode::MalformedRequest))?;
     if !path.starts_with('/') {
@@ -857,7 +837,7 @@ fn handle_stdio_request<Memory: SharedMemory>(
             }))
         }
         StdioRequest::Write(WriteStdioRequest { stream, buffer }) => {
-            let data = copy_shared_buffer(shared_buffers, buffer, MAX_STDIO_TRANSFER_SIZE)?;
+            let data = read_shared_buffer(shared_buffers, buffer, MAX_STDIO_TRANSFER_SIZE)?;
             let written = litebox_broker_core::stdio::write(process, stream, &data)
                 .map_err(RequestFailure::from)?;
             Ok(StdioResponse::Write(WriteStdioResponse {
@@ -948,7 +928,7 @@ fn handle_socket_request<Memory: SharedMemory>(
                 return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
             }
             let data =
-                copy_shared_buffer(shared_buffers, request.buffer, MAX_SOCKET_TRANSFER_SIZE)?;
+                read_shared_buffer(shared_buffers, request.buffer, MAX_SOCKET_TRANSFER_SIZE)?;
             match litebox_broker_core::socket::send(process, request.handle, data, request.flags)
                 .map_err(RequestFailure::from)?
             {
@@ -967,7 +947,7 @@ fn handle_socket_request<Memory: SharedMemory>(
             {
                 return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
             }
-            let data = copy_shared_buffer(shared_buffers, request.buffer, MAX_UDP_DATAGRAM_SIZE)?;
+            let data = read_shared_buffer(shared_buffers, request.buffer, MAX_UDP_DATAGRAM_SIZE)?;
             match litebox_broker_core::socket::send_to(
                 process,
                 request.handle,
@@ -1144,7 +1124,7 @@ fn handle_pipe_request<Memory: SharedMemory>(
             }))
         }
         PipeRequest::Write(request) => {
-            let data = copy_shared_buffer(shared_buffers, request.buffer, MAX_PIPE_TRANSFER_SIZE)?;
+            let data = read_shared_buffer(shared_buffers, request.buffer, MAX_PIPE_TRANSFER_SIZE)?;
             litebox_broker_core::pipe::write(process, request.handle, &data)
                 .map_err(RequestFailure::from)
                 .and_then(|written| {

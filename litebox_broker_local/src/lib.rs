@@ -273,17 +273,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             buffer.length() as usize,
             "shared data must match its buffer sequence"
         );
-        let mut offset = 0;
-        for descriptor in buffer
-            .descriptors(self.shared_buffers.layout())
-            .expect("shared buffer sequence must identify valid slot ranges")
-        {
-            let end = offset + descriptor.length as usize;
-            self.shared_buffers
-                .write(descriptor.slot_index, &data[offset..end])
-                .expect("validated shared buffer sequence must be accessible");
-            offset = end;
-        }
+        self.shared_buffers
+            .write_sequence(buffer, data)
+            .expect("validated shared buffer sequence must be accessible");
     }
 
     fn read_shared_buffer(&self, buffer: SharedBufferSequence, destination: &mut [u8]) {
@@ -291,26 +283,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             destination.len() <= buffer.length() as usize,
             "shared buffer sequence must cover the destination"
         );
-        let mut offset = 0;
-        for descriptor in buffer
-            .descriptors(self.shared_buffers.layout())
-            .expect("shared buffer sequence must identify valid slot ranges")
-        {
-            if offset == destination.len() {
-                break;
-            }
-            let length = (destination.len() - offset).min(descriptor.length as usize);
-            let end = offset + length;
-            self.shared_buffers
-                .read(descriptor.slot_index, &mut destination[offset..end])
-                .expect("validated shared buffer sequence must be accessible");
-            offset = end;
-        }
-        assert_eq!(
-            offset,
-            destination.len(),
-            "shared buffer sequence must cover the destination"
-        );
+        self.shared_buffers
+            .read_sequence(buffer, destination)
+            .expect("validated shared buffer sequence must be accessible");
     }
 
     /// Checks the current readiness of a broker-owned object.

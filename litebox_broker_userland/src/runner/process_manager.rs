@@ -8,7 +8,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use litebox_broker_core::{BrokerCore, BrokerProcess};
-use litebox_broker_host::{RequestFailure, copy_shared_buffer};
+use litebox_broker_host::{RequestFailure, read_shared_buffer};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult};
 use litebox_broker_protocol::process::{
@@ -135,7 +135,7 @@ impl RunnerProcessManager {
     ) -> Option<Result<BrokerResult, RequestFailure>> {
         match operation {
             BrokerOperation::StartProcess(request) => Some(
-                copy_shared_buffer(shared_buffers, request.buffer, MAX_PROCESS_BOOTSTRAP_SIZE)
+                read_shared_buffer(shared_buffers, request.buffer, MAX_PROCESS_BOOTSTRAP_SIZE)
                     .and_then(|bootstrap| {
                         self.start_process(
                             process,

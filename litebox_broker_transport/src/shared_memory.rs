@@ -13,7 +13,7 @@ use alloc::sync::Arc;
 use thiserror::Error;
 
 use litebox_broker_protocol::shared_buffer::{
-    SharedBufferLayout, SharedBufferLayoutError, SharedBufferSlotIndex,
+    SharedBufferLayout, SharedBufferLayoutError, SharedBufferSequence, SharedBufferSlotIndex,
 };
 
 /// Error accessing a shared-memory resource.
@@ -138,6 +138,9 @@ pub enum SharedBufferError {
     /// The backing shared-memory length does not exactly match the layout.
     #[error("shared-memory length does not match the shared-buffer layout")]
     MemoryLengthMismatch,
+    /// The requested transfer does not fit in the shared-buffer sequence.
+    #[error("shared-buffer sequence does not cover the requested transfer")]
+    TransferExceedsSequence,
     /// The backing shared-memory access failed.
     #[error("shared-memory access failed: {0}")]
     SharedMemory(#[from] SharedMemoryError),
@@ -196,6 +199,58 @@ impl<Memory: SharedMemory> SharedBufferPool<Memory> {
         self.memory.write(range.start, source)?;
         Ok(())
     }
+
+    /// Copies a sequence prefix into `destination`.
+    pub fn read_sequence(
+        &self,
+        sequence: SharedBufferSequence,
+        destination: &mut [u8],
+    ) -> Result<(), SharedBufferError> {
+        let descriptors = sequence.descriptors(self.layout)?;
+        if destination.len() > sequence.length() as usize {
+            return Err(SharedBufferError::TransferExceedsSequence);
+        }
+        let mut offset = 0;
+        for descriptor in descriptors {
+            if offset == destination.len() {
+                break;
+            }
+            let length = (destination.len() - offset).min(descriptor.length as usize);
+            let end = offset + length;
+            self.read(descriptor.slot_index, &mut destination[offset..end])?;
+            offset = end;
+        }
+        if offset != destination.len() {
+            return Err(SharedBufferError::TransferExceedsSequence);
+        }
+        Ok(())
+    }
+
+    /// Copies `source` into a sequence prefix.
+    pub fn write_sequence(
+        &self,
+        sequence: SharedBufferSequence,
+        source: &[u8],
+    ) -> Result<(), SharedBufferError> {
+        let descriptors = sequence.descriptors(self.layout)?;
+        if source.len() > sequence.length() as usize {
+            return Err(SharedBufferError::TransferExceedsSequence);
+        }
+        let mut offset = 0;
+        for descriptor in descriptors {
+            if offset == source.len() {
+                break;
+            }
+            let length = (source.len() - offset).min(descriptor.length as usize);
+            let end = offset + length;
+            self.write(descriptor.slot_index, &source[offset..end])?;
+            offset = end;
+        }
+        if offset != source.len() {
+            return Err(SharedBufferError::TransferExceedsSequence);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -226,6 +281,31 @@ mod tests {
             Err(SharedBufferError::Layout(
                 SharedBufferLayoutError::RangeExceedsSlot
             ))
+        );
+    }
+
+    #[test]
+    fn pool_copies_sequence_prefixes_across_slots() {
+        let layout = SharedBufferLayout::new(4, 3).unwrap();
+        let memory = Arc::new(TestSharedMemory::new(layout.total_len()));
+        let pool = SharedBufferPool::new(Arc::clone(&memory), layout).unwrap();
+        let sequence =
+            SharedBufferSequence::new(&[SharedBufferSlotIndex(0), SharedBufferSlotIndex(2)], 6)
+                .unwrap();
+
+        pool.write_sequence(sequence, &[1, 2, 3, 4, 5, 6]).unwrap();
+        assert_eq!(memory.bytes(), [1, 2, 3, 4, 0, 0, 0, 0, 5, 6, 0, 0]);
+
+        let mut destination = [0; 5];
+        pool.read_sequence(sequence, &mut destination).unwrap();
+        assert_eq!(destination, [1, 2, 3, 4, 5]);
+        assert_eq!(
+            pool.write_sequence(sequence, &[0; 7]),
+            Err(SharedBufferError::TransferExceedsSequence)
+        );
+        assert_eq!(
+            pool.read_sequence(sequence, &mut [0; 7]),
+            Err(SharedBufferError::TransferExceedsSequence)
         );
     }
 
