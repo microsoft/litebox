@@ -66,7 +66,7 @@ pub enum BrokerOperation {
     /// File request family.
     File(FileRequest),
     /// Start one child process from an opaque platform bootstrap.
-    StartProcess(ProcessStartupDescriptor),
+    StartChildProcess(ProcessStartupDescriptor),
 }
 
 impl BrokerOperation {
@@ -101,7 +101,7 @@ impl BrokerOperation {
                 | FileRequest::Mkdir(MkdirFileRequest { path: buffer, .. })
                 | FileRequest::Rmdir(RmdirFileRequest { path: buffer, .. }),
             )
-            | Self::StartProcess(ProcessStartupDescriptor { buffer, .. }) => Some(*buffer),
+            | Self::StartChildProcess(ProcessStartupDescriptor { buffer, .. }) => Some(*buffer),
             Self::CreateThread
             | Self::ExitThread(_)
             | Self::CloseObject(_)

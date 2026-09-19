@@ -540,7 +540,7 @@ fn handle_request<Memory: SharedMemory>(
         BrokerOperation::File(request) => {
             handle_file_request(process, request, shared_buffers).map(BrokerResult::File)
         }
-        BrokerOperation::StartProcess(_) => {
+        BrokerOperation::StartChildProcess(_) => {
             Err(RequestFailure::Respond(ErrorCode::UnsupportedOperation))
         }
     }

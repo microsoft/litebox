@@ -48,7 +48,7 @@ const REQUEST_TAG_STDIO: u8 = 7;
 const REQUEST_TAG_FILE: u8 = 8;
 const REQUEST_TAG_CREATE_THREAD: u8 = 9;
 const REQUEST_TAG_EXIT_THREAD: u8 = 10;
-const REQUEST_TAG_START_PROCESS: u8 = 11;
+const REQUEST_TAG_START_CHILD_PROCESS: u8 = 11;
 // Tag 12 is reserved for the removed process-start acknowledgement.
 // Tags 13 and 14 are reserved for the removed process-ready protocol.
 
@@ -126,7 +126,7 @@ pub fn decode_handshake_request(frame: &[u8]) -> Result<BrokerHandshakeRequest, 
         | REQUEST_TAG_FILE
         | REQUEST_TAG_CREATE_THREAD
         | REQUEST_TAG_EXIT_THREAD
-        | REQUEST_TAG_START_PROCESS => {
+        | REQUEST_TAG_START_CHILD_PROCESS => {
             return Err(WireError::WrongMessagePhase);
         }
         _ => return Err(WireError::InvalidTag),
@@ -195,13 +195,13 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
             encoder.request_id(request_id);
             fs::encode_fs_request(&mut encoder, request);
         }
-        BrokerOperation::StartProcess(ProcessStartupDescriptor {
+        BrokerOperation::StartChildProcess(ProcessStartupDescriptor {
             format,
             version,
             buffer,
             inherited_objects,
         }) => {
-            encoder.u8(REQUEST_TAG_START_PROCESS);
+            encoder.u8(REQUEST_TAG_START_CHILD_PROCESS);
             encoder.request_id(request_id);
             encoder.u32(format.0);
             encoder.u16(version.0);
@@ -228,7 +228,7 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         | REQUEST_TAG_FILE
         | REQUEST_TAG_CREATE_THREAD
         | REQUEST_TAG_EXIT_THREAD
-        | REQUEST_TAG_START_PROCESS => {}
+        | REQUEST_TAG_START_CHILD_PROCESS => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -243,12 +243,14 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         REQUEST_TAG_FILL_RANDOM => BrokerOperation::FillRandom(decoder.shared_buffer_sequence()?),
         REQUEST_TAG_STDIO => BrokerOperation::Stdio(stdio::decode_stdio_request(&mut decoder)?),
         REQUEST_TAG_FILE => BrokerOperation::File(fs::decode_fs_request(&mut decoder)?),
-        REQUEST_TAG_START_PROCESS => BrokerOperation::StartProcess(ProcessStartupDescriptor {
-            format: ProcessBootstrapFormat(decoder.u32()?),
-            version: ProcessBootstrapVersion(decoder.u16()?),
-            buffer: decoder.shared_buffer_sequence()?,
-            inherited_objects: decode_inherited_objects(&mut decoder)?,
-        }),
+        REQUEST_TAG_START_CHILD_PROCESS => {
+            BrokerOperation::StartChildProcess(ProcessStartupDescriptor {
+                format: ProcessBootstrapFormat(decoder.u32()?),
+                version: ProcessBootstrapVersion(decoder.u16()?),
+                buffer: decoder.shared_buffer_sequence()?,
+                inherited_objects: decode_inherited_objects(&mut decoder)?,
+            })
+        }
         _ => unreachable!("active request tag was validated"),
     };
     decoder.finish()?;
@@ -655,7 +657,7 @@ mod tests {
                 REQUEST_TAG_FILE,
                 REQUEST_TAG_CREATE_THREAD,
                 REQUEST_TAG_EXIT_THREAD,
-                REQUEST_TAG_START_PROCESS,
+                REQUEST_TAG_START_CHILD_PROCESS,
             ]
         );
         assert_eq!(
@@ -924,7 +926,7 @@ mod tests {
                 name: TcpOptionName::KeepAlive,
             })),
             BrokerOperation::Socket(SocketRequest::Status(SocketStatusRequest { handle })),
-            BrokerOperation::StartProcess(ProcessStartupDescriptor {
+            BrokerOperation::StartChildProcess(ProcessStartupDescriptor {
                 format: ProcessBootstrapFormat(u32::MAX),
                 version: ProcessBootstrapVersion(u16::MAX),
                 buffer: largest_sequence,

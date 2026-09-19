@@ -63,7 +63,7 @@ struct RunnerProcessManagerState {
 
 pub(crate) type AssociationFailure = Arc<dyn Fn() + Send + Sync>;
 
-/// State for one blocking `StartProcess` request.
+/// State for one blocking `StartChildProcess` request.
 pub(super) struct ProcessStartTransaction {
     parent_id: ProcessId,
     process: Arc<BrokerProcess>,
@@ -134,10 +134,10 @@ impl RunnerProcessManager {
         shared_buffers: &SharedBufferPool<Memory>,
     ) -> Option<Result<BrokerResult, RequestFailure>> {
         match operation {
-            BrokerOperation::StartProcess(request) => Some(
+            BrokerOperation::StartChildProcess(request) => Some(
                 read_shared_buffer(shared_buffers, request.buffer, MAX_PROCESS_BOOTSTRAP_SIZE)
                     .and_then(|bootstrap| {
-                        self.start_process(
+                        self.start_child_process(
                             process,
                             request.format,
                             request.version,
@@ -152,7 +152,7 @@ impl RunnerProcessManager {
         }
     }
 
-    fn start_process(
+    fn start_child_process(
         self: &Arc<Self>,
         parent: &BrokerProcess,
         format: ProcessBootstrapFormat,

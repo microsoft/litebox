@@ -210,12 +210,14 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             return Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted));
         }
         self.write_shared_buffer(buffer, bootstrap);
-        match self.request(BrokerOperation::StartProcess(ProcessStartupDescriptor {
-            format,
-            version,
-            buffer,
-            inherited_objects,
-        }))? {
+        match self.request(BrokerOperation::StartChildProcess(
+            ProcessStartupDescriptor {
+                format,
+                version,
+                buffer,
+                inherited_objects,
+            },
+        ))? {
             BrokerResult::ProcessStarted(started) => Ok(started),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
             response => panic!("broker returned unexpected process-start response: {response:?}"),
