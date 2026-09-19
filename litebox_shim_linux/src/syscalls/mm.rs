@@ -173,8 +173,8 @@ pub(crate) struct ElfPatchKey(Arc<FileFd>);
 
 impl ElfPatchKey {
     #[cfg(target_arch = "aarch64")]
-    pub(crate) fn new(fd: Arc<FileFd>) -> Self {
-        Self(fd)
+    pub(crate) fn new(fd: &Arc<FileFd>) -> Self {
+        Self(Arc::clone(fd))
     }
 }
 

@@ -3,6 +3,8 @@
 
 //! ELF loader for LiteBox
 
+#[cfg(target_arch = "aarch64")]
+use alloc::sync::Arc;
 use alloc::{ffi::CString, vec::Vec};
 use litebox::{
     mm::linux::{CreatePagesFlags, MappingError, PAGE_SIZE},
@@ -18,12 +20,16 @@ use crate::{
 };
 
 use super::stack::UserStack;
+#[cfg(target_arch = "aarch64")]
+use crate::{FileFd, syscalls::file::AnyTypedFd};
 use crate::{ShimPlatform, Task};
 
 // An opened elf file
 struct ElfFile<'a, Platform: ShimPlatform> {
     task: &'a Task<Platform>,
     fd: i32,
+    #[cfg(target_arch = "aarch64")]
+    file_fd: Arc<FileFd>,
     load_high: bool,
 }
 
@@ -32,9 +38,16 @@ impl<'a, Platform: ShimPlatform> ElfFile<'a, Platform> {
         let fd = task
             .sys_open(path, OFlags::RDONLY, Mode::empty())?
             .reinterpret_as_signed();
+        #[cfg(target_arch = "aarch64")]
+        let Ok(AnyTypedFd::Fs(file_fd)) = task.typed_fd(fd) else {
+            let _ = task.sys_close(fd);
+            return Err(Errno::EBADF);
+        };
         Ok(ElfFile {
             task,
             fd,
+            #[cfg(target_arch = "aarch64")]
+            file_fd,
             load_high: false,
         })
     }
@@ -249,18 +262,7 @@ impl<'a, Platform: ShimPlatform> FileAndParsed<'a, Platform> {
         let result = self.parsed.load(&mut self.file, &mut &*platform, reserve)?;
         #[cfg(target_arch = "aarch64")]
         if self.parsed.has_trampoline() {
-            let crate::syscalls::file::AnyTypedFd::Fs(fd) =
-                self.file.task.typed_fd(self.file.fd).map_err(|_| {
-                    ElfLoaderError::LoadError(
-                        litebox_common_linux::loader::ElfLoadError::InvalidProgramHeader,
-                    )
-                })?
-            else {
-                return Err(ElfLoaderError::LoadError(
-                    litebox_common_linux::loader::ElfLoadError::InvalidProgramHeader,
-                ));
-            };
-            let patch_key = crate::syscalls::mm::ElfPatchKey::new(fd);
+            let patch_key = crate::syscalls::mm::ElfPatchKey::new(&self.file.file_fd);
             if !self
                 .file
                 .task
