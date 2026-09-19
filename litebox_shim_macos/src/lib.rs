@@ -102,7 +102,7 @@ impl<P: ShimPlatform> MacosShim<P> {
     /// Load a self-contained static executable from the guest filesystem.
     ///
     /// `path` also supplies the startup apple vector's `executable_path` entry,
-    /// independently of `argv[0]`.
+    /// independently of `argv[0]`. Requires read access; execute permissions are not checked.
     pub fn load_program(
         self,
         params: TaskParams,

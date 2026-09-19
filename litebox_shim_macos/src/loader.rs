@@ -148,6 +148,8 @@ impl<'a> Image<'a> {
         } else {
             Vec::new()
         };
+        // TODO: support images requiring preferred-address placement (without
+        // replacing host mappings) or rebasing when slid.
         let base = reserve(task, self.plan.virtual_range.len())?;
         let relocate = |address: usize| base + (address - self.plan.virtual_range.start);
         for segment in &self.plan.segments {
