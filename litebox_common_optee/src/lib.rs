@@ -692,12 +692,31 @@ impl TeeUuid {
         Self::from_bytes(bytes)
     }
 
+    #[allow(clippy::missing_panics_doc)]
+    pub fn to_u64_array(self) -> [u64; 2] {
+        let bytes = self.to_bytes();
+        [
+            u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+            u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+        ]
+    }
+
     /// Converts the UUID to a 16-byte array with little-endian encoding.
     pub fn to_le_bytes(self) -> [u8; 16] {
         let mut bytes = [0u8; 16];
         bytes[0..4].copy_from_slice(&self.time_low.to_le_bytes());
         bytes[4..6].copy_from_slice(&self.time_mid.to_le_bytes());
         bytes[6..8].copy_from_slice(&self.time_hi_and_version.to_le_bytes());
+        bytes[8..16].copy_from_slice(&self.clock_seq_and_node);
+        bytes
+    }
+
+    /// Converts the UUID to a 16-byte array with big-endian encoding (RFC 4122 format).
+    pub fn to_bytes(self) -> [u8; 16] {
+        let mut bytes = [0u8; 16];
+        bytes[0..4].copy_from_slice(&self.time_low.to_be_bytes());
+        bytes[4..6].copy_from_slice(&self.time_mid.to_be_bytes());
+        bytes[6..8].copy_from_slice(&self.time_hi_and_version.to_be_bytes());
         bytes[8..16].copy_from_slice(&self.clock_seq_and_node);
         bytes
     }
@@ -1431,6 +1450,22 @@ const OPTEE_MSG_RPC_CMD_RPMB_PROBE_RESET: u32 = 22;
 const OPTEE_MSG_RPC_CMD_RPMB_PROBE_NEXT: u32 = 23;
 const OPTEE_MSG_RPC_CMD_RPMB_PROBE_FRAMES: u32 = 24;
 
+/// Memory that can be shared with a non-secure user space application
+const OPTEE_RPC_SHM_TYPE_APPL: u32 = 0;
+/// Memory only shared with non-secure kernel
+const OPTEE_RPC_SHM_TYPE_KERNEL: u32 = 1;
+/// Memory shared with non-secure kernel and exported to a non-secure user
+/// space application
+const OPTEE_RPC_SHM_TYPE_GLOBAL: u32 = 2;
+
+/// OP-TEE RPC shared memory types
+#[repr(u32)]
+pub enum OpteeRpcShmType {
+    Appl = OPTEE_RPC_SHM_TYPE_APPL,
+    Kernel = OPTEE_RPC_SHM_TYPE_KERNEL,
+    Global = OPTEE_RPC_SHM_TYPE_GLOBAL,
+}
+
 /// RPC command IDs from `optee_os/core/include/optee_msg.h`
 ///
 /// These are the command IDs used in the `cmd` field of the RPC `optee_msg_arg`.
@@ -1556,6 +1591,7 @@ const OPTEE_MSG_ATTR_TYPE_TMEM_INOUT: u8 = 0xb;
 /// Meta-parameter marker of the attribute word. Set on the `OpenSession`
 /// TA-UUID and client-identity params.
 const OPTEE_MSG_ATTR_META: u64 = 1 << 8;
+const OPTEE_MSG_ATTR_NONCONTIG: u64 = 1 << 9;
 
 #[non_exhaustive]
 #[derive(Debug, PartialEq, TryFromPrimitive)]
@@ -1604,7 +1640,7 @@ impl OpteeMsgAttr {
 
     /// Returns `true` when the noncontig bit (bit 9) is set.
     pub fn noncontig(&self) -> bool {
-        self.0 & (1 << 9) != 0
+        self.0 & OPTEE_MSG_ATTR_NONCONTIG != 0
     }
 }
 
@@ -2116,6 +2152,54 @@ impl OpteeRpcArgs {
         }
     }
 
+    /// Access a TMEM output parameter with exact direction and flag validation.
+    ///
+    /// The NONCONTIG flag is permitted because an SHM_ALLOC response may return
+    /// either contiguous memory or an OP-TEE page-list descriptor.
+    pub fn get_param_tmem_output(
+        &self,
+        index: usize,
+    ) -> Result<OpteeMsgParamTmem, OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            return Err(OpteeSmcReturnCode::ENotAvail);
+        }
+
+        let param = &self.params[index];
+        if param.attr.attr_type() != OpteeMsgAttrType::TmemOutput as u8
+            || param.attr.0 & !(u64::from(u8::MAX) | OPTEE_MSG_ATTR_NONCONTIG) != 0
+        {
+            return Err(OpteeSmcReturnCode::EBadCmd);
+        }
+        OpteeMsgParamTmem::read_from_bytes(&param.data).map_err(|_| OpteeSmcReturnCode::EBadCmd)
+    }
+
+    /// Return whether an exactly validated TMEM output parameter uses a page list.
+    pub fn is_param_tmem_output_noncontiguous(
+        &self,
+        index: usize,
+    ) -> Result<bool, OpteeSmcReturnCode> {
+        self.get_param_tmem_output(index)?;
+        Ok(self.params[index].attr.noncontig())
+    }
+
+    /// Access an RMEM output parameter with exact direction and flag validation.
+    pub fn get_param_rmem_output(
+        &self,
+        index: usize,
+    ) -> Result<OpteeMsgParamRmem, OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            return Err(OpteeSmcReturnCode::ENotAvail);
+        }
+
+        let param = &self.params[index];
+        if param.attr.attr_type() != OpteeMsgAttrType::RmemOutput as u8
+            || param.attr.0 & !u64::from(u8::MAX) != 0
+        {
+            return Err(OpteeSmcReturnCode::EBadCmd);
+        }
+        OpteeMsgParamRmem::read_from_bytes(&param.data).map_err(|_| OpteeSmcReturnCode::EBadCmd)
+    }
+
     /// Set a value parameter by index with bounds checking against `num_params`.
     pub fn set_param_value(
         &mut self,
@@ -2126,6 +2210,34 @@ impl OpteeRpcArgs {
             Err(OpteeSmcReturnCode::ENotAvail)
         } else {
             self.params[index].data.copy_from_slice(value.as_bytes());
+            Ok(())
+        }
+    }
+
+    /// Set a parameter's attribute type by index with bounds checking against `num_params`.
+    pub fn set_param_attr_type(
+        &mut self,
+        index: usize,
+        attr_type: OpteeMsgAttrType,
+    ) -> Result<(), OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            Err(OpteeSmcReturnCode::ENotAvail)
+        } else {
+            self.params[index].attr = OpteeMsgAttr(attr_type as u64);
+            Ok(())
+        }
+    }
+
+    /// Set an rmem parameter by index with bounds checking against `num_params`.
+    pub fn set_param_rmem(
+        &mut self,
+        index: usize,
+        rmem: OpteeMsgParamRmem,
+    ) -> Result<(), OpteeSmcReturnCode> {
+        if index >= self.num_params as usize {
+            Err(OpteeSmcReturnCode::ENotAvail)
+        } else {
+            self.params[index].data.copy_from_slice(rmem.as_bytes());
             Ok(())
         }
     }
@@ -2143,10 +2255,102 @@ impl OpteeRpcArgs {
             Ok(())
         }
     }
+}
 
-    // Note: RPC does not use rmem params. Rmem requires pre-registered shared memory
-    // references from the normal-world driver, which is a main-messaging-path concept.
-    // RPC uses tmem for buffer references since OP-TEE provides physical addresses directly.
+/// Prepare a shared-memory allocation RPC request to be sent to normal world.
+pub fn prepare_shm_alloc_rpc(
+    rpc_msg_args: &mut OpteeRpcArgs,
+    shm_type: OpteeRpcShmType,
+    size: u64,
+    alignment: u64,
+) -> Result<(), OpteeSmcReturnCode> {
+    rpc_msg_args.cmd = OpteeRpcCommand::ShmAlloc;
+    // Match OP-TEE's get_rpc_arg(): default to failure in case normal world
+    // returns without updating the RPC result.
+    rpc_msg_args.ret = TeeResult::GenericError;
+    rpc_msg_args.num_params = 1;
+
+    rpc_msg_args
+        .set_param_attr_type(0, OpteeMsgAttrType::ValueInput)
+        .map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
+
+    rpc_msg_args.set_param_value(
+        0,
+        OpteeMsgParamValue {
+            a: shm_type as u64,
+            b: size,
+            c: alignment,
+        },
+    )?;
+
+    Ok(())
+}
+
+/// Prepare a shared-memory free RPC request to be sent to normal world.
+/// This will free the memory allocated by SHM_ALLOC request in normal world.
+pub fn prepare_shm_free_rpc(
+    rpc_msg_args: &mut OpteeRpcArgs,
+    shm_type: OpteeRpcShmType,
+    shm_ref: u64,
+) -> Result<(), OpteeSmcReturnCode> {
+    rpc_msg_args.cmd = OpteeRpcCommand::ShmFree;
+    rpc_msg_args.ret = TeeResult::GenericError;
+    rpc_msg_args.num_params = 1;
+    rpc_msg_args.set_param_attr_type(0, OpteeMsgAttrType::ValueInput)?;
+    rpc_msg_args.set_param_value(
+        0,
+        OpteeMsgParamValue {
+            a: shm_type as u64,
+            b: shm_ref,
+            c: 0,
+        },
+    )
+}
+
+/// Prepare a LOAD_TA RPC request to be sent to normal world.
+pub fn prepare_load_ta_rpc(
+    rpc_msg_args: &mut OpteeRpcArgs,
+    ta_uuid: TeeUuid,
+    memref: Option<OpteeMsgParamRmem>,
+) -> Result<(), OpteeSmcReturnCode> {
+    rpc_msg_args.cmd = OpteeRpcCommand::LoadTa;
+    // Match OP-TEE's get_rpc_arg(): default to failure in case normal world
+    // returns without updating the RPC result.
+    rpc_msg_args.ret = TeeResult::GenericError;
+    rpc_msg_args.num_params = 2;
+
+    rpc_msg_args.set_param_attr_type(0, OpteeMsgAttrType::ValueInput)?;
+    let uuid_bytes = ta_uuid.to_u64_array();
+    rpc_msg_args.set_param_value(
+        0,
+        OpteeMsgParamValue {
+            a: uuid_bytes[0],
+            b: uuid_bytes[1],
+            c: 0,
+        },
+    )?;
+
+    if memref.is_none() {
+        // First call of LOAD_TA protocol: normal world returns the TA size in `tmem.size`.
+        rpc_msg_args.set_param_attr_type(1, OpteeMsgAttrType::TmemOutput)?;
+        rpc_msg_args.set_param_tmem(
+            1,
+            OpteeMsgParamTmem {
+                buf_ptr: 0,
+                size: 0,
+                shm_ref: 0,
+            },
+        )?;
+    } else {
+        // Second LOAD_TA: LiteBox passes VTL0-owned memory back to VTL0
+        // so normal world can populate it with the TA binary.
+        rpc_msg_args.set_param_attr_type(1, OpteeMsgAttrType::RmemOutput)?;
+        if let Some(rmem) = memref {
+            rpc_msg_args.set_param_rmem(1, rmem)?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Serialize the params portion as raw bytes into `buf`.
@@ -2229,6 +2433,18 @@ impl OpteeSmcArgs {
         }
     }
 
+    /// Set the context ID used to identify an RPC call in the preserved `args[3]` register.
+    pub fn set_rpc_context_id(&mut self, context_id: u32) {
+        self.args[3] = context_id as usize;
+    }
+
+    /// Get the context ID used to identify an RPC call from the preserved `args[3]` register.
+    pub fn get_rpc_context_id(&self) -> Result<u32, OpteeSmcReturnCode> {
+        self.args[3]
+            .try_into()
+            .map_err(|_| OpteeSmcReturnCode::EBadCmd)
+    }
+
     /// Set the return code of an OP-TEE SMC call
     pub fn set_return_code(&mut self, code: OpteeSmcReturnCode) {
         self.args[0] = code as usize;
@@ -2239,6 +2455,7 @@ impl OpteeSmcArgs {
 /// TODO: Add stuffs based on the OP-TEE driver that LVBS is using.
 const OPTEE_SMC_FUNCID_GET_OS_UUID: usize = 0x0;
 const OPTEE_SMC_FUNCID_GET_OS_REVISION: usize = 0x1;
+const OPTEE_SMC_FUNCID_RETURN_FROM_RPC: usize = 0x3;
 const OPTEE_SMC_FUNCID_CALL_WITH_ARG: usize = 0x4;
 const OPTEE_SMC_FUNCID_EXCHANGE_CAPABILITIES: usize = 0x9;
 const OPTEE_SMC_FUNCID_DISABLE_SHM_CACHE: usize = 0xa;
@@ -2253,6 +2470,7 @@ const OPTEE_SMC_FUNCID_CALLS_REVISION: usize = 0xff03;
 pub enum OpteeSmcFunction {
     GetOsUuid = OPTEE_SMC_FUNCID_GET_OS_UUID,
     GetOsRevision = OPTEE_SMC_FUNCID_GET_OS_REVISION,
+    ReturnFromRpc = OPTEE_SMC_FUNCID_RETURN_FROM_RPC,
     CallWithArg = OPTEE_SMC_FUNCID_CALL_WITH_ARG,
     ExchangeCapabilities = OPTEE_SMC_FUNCID_EXCHANGE_CAPABILITIES,
     DisableShmCache = OPTEE_SMC_FUNCID_DISABLE_SHM_CACHE,
@@ -2300,6 +2518,11 @@ pub enum OpteeSmcResult<'a> {
     CallWithArg {
         msg_args: Box<OpteeMsgArgs>,
         rpc_args: Option<Box<OpteeRpcArgs>>,
+        msg_args_phys_addr: u64,
+    },
+    ReturnFromRpc {
+        msg_args: Box<OpteeMsgArgs>,
+        rpc_args: Box<OpteeRpcArgs>,
         msg_args_phys_addr: u64,
     },
 }
@@ -2363,6 +2586,11 @@ impl From<OpteeSmcResult<'_>> for OpteeSmcArgs {
             OpteeSmcResult::CallWithArg { .. } => {
                 panic!(
                     "OpteeSmcResult::CallWithArg cannot be converted to OpteeSmcArgs directly. Handle the incorporated OpteeMsgArgs."
+                );
+            }
+            OpteeSmcResult::ReturnFromRpc { .. } => {
+                panic!(
+                    "OpteeSmcResult::ReturnFromRpc cannot be converted to OpteeSmcArgs directly. Handle the incorporated OpteeMsgArgs and OpteeRpcArgs."
                 );
             }
         }
@@ -2500,6 +2728,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_rpc_context_id_roundtrip() {
+        for context_id in [0, 1, u32::MAX] {
+            let mut args = OpteeSmcArgs::default();
+            args.set_rpc_context_id(context_id);
+            assert_eq!(args.get_rpc_context_id(), Ok(context_id));
+        }
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn test_rpc_context_id_rejects_upper_bits() {
+        let mut args = OpteeSmcArgs::default();
+        args.args[3] = (u32::MAX as usize) + 1;
+        assert_eq!(args.get_rpc_context_id(), Err(OpteeSmcReturnCode::EBadCmd));
+    }
+
+    #[test]
     fn test_optee_msg_args_header_size_and_layout() {
         use core::mem::{offset_of, size_of};
         assert_eq!(size_of::<OpteeMsgArgsHeader>(), 32);
@@ -2529,6 +2774,29 @@ mod tests {
         assert_eq!(
             uuid.clock_seq_and_node,
             [0xaf, 0x63, 0x00, 0x02, 0xa5, 0xd5, 0xc5, 0x1b]
+        );
+        assert_eq!(
+            uuid.to_u64_array(),
+            [0xe311f8e7_e0b34f38, 0x1bc5d5a5_020063af]
+        );
+        assert_eq!(TeeUuid::from_u64_array(uuid.to_u64_array()), uuid);
+    }
+
+    #[test]
+    fn test_tee_uuid_to_bytes() {
+        let uuid = TeeUuid {
+            time_low: 0x384f_b3e0,
+            time_mid: 0xe7f8,
+            time_hi_and_version: 0x11e3,
+            clock_seq_and_node: [0xaf, 0x63, 0x00, 0x02, 0xa5, 0xd5, 0xc5, 0x1b],
+        };
+
+        assert_eq!(
+            uuid.to_bytes(),
+            [
+                0x38, 0x4f, 0xb3, 0xe0, 0xe7, 0xf8, 0x11, 0xe3, 0xaf, 0x63, 0x00, 0x02, 0xa5, 0xd5,
+                0xc5, 0x1b,
+            ]
         );
     }
 
@@ -2627,6 +2895,137 @@ mod tests {
         assert_eq!(header_out.session, 0);
         assert_eq!(header_out.cancel_id, 0);
         assert_eq!(header_out.num_params, 2);
+    }
+
+    #[test]
+    fn test_optee_rpc_args_attr_and_rmem_setters() {
+        let header = OpteeMsgArgsHeader {
+            cmd: OpteeRpcCommand::LoadTa as u32,
+            func: 0,
+            session: 0,
+            cancel_id: 0,
+            pad: 0,
+            ret: 0,
+            ret_origin: 0,
+            num_params: 1,
+        };
+        let raw_params = [0u8; size_of::<OpteeMsgParam>()];
+        let mut rpc_args = OpteeRpcArgs::from_header_and_raw_params(&header, &raw_params)
+            .expect("should parse RPC args");
+
+        rpc_args.params[0].attr = OpteeMsgAttr::META_VALUE_INPUT;
+        rpc_args
+            .set_param_attr_type(0, OpteeMsgAttrType::RmemOutput)
+            .expect("attribute index should be available");
+        assert_eq!(
+            rpc_args.params[0].attr.attr_type(),
+            OpteeMsgAttrType::RmemOutput as u8
+        );
+        assert!(!rpc_args.params[0].attr.meta());
+        assert!(!rpc_args.params[0].attr.noncontig());
+
+        let rmem = OpteeMsgParamRmem {
+            offs: 0x0102_0304_0506_0708,
+            size: 0x1112_1314_1516_1718,
+            shm_ref: 0x2122_2324_2526_2728,
+        };
+        rpc_args
+            .set_param_rmem(0, rmem)
+            .expect("rmem index should be available");
+        assert_eq!(&rpc_args.params[0].data[0..8], &rmem.offs.to_le_bytes());
+        assert_eq!(&rpc_args.params[0].data[8..16], &rmem.size.to_le_bytes());
+        assert_eq!(
+            &rpc_args.params[0].data[16..24],
+            &rmem.shm_ref.to_le_bytes()
+        );
+
+        assert_eq!(
+            rpc_args.set_param_attr_type(1, OpteeMsgAttrType::RmemOutput),
+            Err(OpteeSmcReturnCode::ENotAvail)
+        );
+        assert_eq!(
+            rpc_args.set_param_rmem(1, rmem),
+            Err(OpteeSmcReturnCode::ENotAvail)
+        );
+    }
+
+    #[test]
+    fn test_optee_rpc_args_exact_output_getters() {
+        let header = OpteeMsgArgsHeader {
+            cmd: OpteeRpcCommand::LoadTa as u32,
+            func: 0,
+            session: 0,
+            cancel_id: 0,
+            pad: 0,
+            ret: 0,
+            ret_origin: 0,
+            num_params: 1,
+        };
+        let raw_params = [0u8; size_of::<OpteeMsgParam>()];
+        let mut rpc_args = OpteeRpcArgs::from_header_and_raw_params(&header, &raw_params)
+            .expect("should parse RPC args");
+
+        rpc_args.params[0].attr = OpteeMsgAttr(OpteeMsgAttrType::TmemOutput as u64);
+        assert!(rpc_args.get_param_tmem_output(0).is_ok());
+        assert_eq!(rpc_args.is_param_tmem_output_noncontiguous(0), Ok(false));
+        rpc_args.params[0].attr =
+            OpteeMsgAttr(OpteeMsgAttrType::TmemOutput as u64 | OPTEE_MSG_ATTR_NONCONTIG);
+        assert!(rpc_args.get_param_tmem_output(0).is_ok());
+        assert_eq!(rpc_args.is_param_tmem_output_noncontiguous(0), Ok(true));
+
+        rpc_args.params[0].attr = OpteeMsgAttr(OpteeMsgAttrType::TmemInout as u64);
+        assert!(matches!(
+            rpc_args.get_param_tmem_output(0),
+            Err(OpteeSmcReturnCode::EBadCmd)
+        ));
+        rpc_args.params[0].attr =
+            OpteeMsgAttr(OpteeMsgAttrType::TmemOutput as u64 | OPTEE_MSG_ATTR_META);
+        assert!(matches!(
+            rpc_args.get_param_tmem_output(0),
+            Err(OpteeSmcReturnCode::EBadCmd)
+        ));
+
+        rpc_args.params[0].attr = OpteeMsgAttr(OpteeMsgAttrType::RmemOutput as u64);
+        assert!(rpc_args.get_param_rmem_output(0).is_ok());
+        rpc_args.params[0].attr =
+            OpteeMsgAttr(OpteeMsgAttrType::RmemOutput as u64 | OPTEE_MSG_ATTR_NONCONTIG);
+        assert!(matches!(
+            rpc_args.get_param_rmem_output(0),
+            Err(OpteeSmcReturnCode::EBadCmd)
+        ));
+        assert!(matches!(
+            rpc_args.get_param_rmem_output(1),
+            Err(OpteeSmcReturnCode::ENotAvail)
+        ));
+    }
+    #[test]
+    fn test_prepare_shm_free_rpc() {
+        let header = OpteeMsgArgsHeader {
+            cmd: OpteeRpcCommand::LoadTa as u32,
+            func: 0,
+            session: 0,
+            cancel_id: 0,
+            pad: 0,
+            ret: TeeResult::Success as u32,
+            ret_origin: 0,
+            num_params: 1,
+        };
+        let raw_params = [0u8; size_of::<OpteeMsgParam>()];
+        let mut rpc_args = OpteeRpcArgs::from_header_and_raw_params(&header, &raw_params)
+            .expect("should parse RPC args");
+
+        prepare_shm_free_rpc(&mut rpc_args, OpteeRpcShmType::Appl, 0x1234)
+            .expect("should prepare SHM_FREE");
+
+        assert_eq!(rpc_args.cmd, OpteeRpcCommand::ShmFree);
+        assert_eq!(rpc_args.ret, TeeResult::GenericError);
+        assert_eq!(rpc_args.num_params, 1);
+        let value = rpc_args
+            .get_param_value(0)
+            .expect("SHM_FREE value parameter should be readable");
+        assert_eq!(value.a, OpteeRpcShmType::Appl as u64);
+        assert_eq!(value.b, 0x1234);
+        assert_eq!(value.c, 0);
     }
 
     #[test]
