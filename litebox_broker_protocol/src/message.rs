@@ -17,6 +17,7 @@ use crate::pipe::{
     CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
     WritePipeResponse,
 };
+use crate::process::{ProcessIdentity, ProcessStartupDescriptor};
 use crate::readiness::ReadinessFlags;
 use crate::shared_buffer::SharedBufferSequence;
 use crate::socket::{
@@ -64,6 +65,8 @@ pub enum BrokerOperation {
     Stdio(StdioRequest),
     /// File request family.
     File(FileRequest),
+    /// Start one child process from an opaque platform bootstrap.
+    StartChildProcess(ProcessStartupDescriptor),
 }
 
 impl BrokerOperation {
@@ -97,7 +100,8 @@ impl BrokerOperation {
                 | FileRequest::Unlink(UnlinkFileRequest { path: buffer, .. })
                 | FileRequest::Mkdir(MkdirFileRequest { path: buffer, .. })
                 | FileRequest::Rmdir(RmdirFileRequest { path: buffer, .. }),
-            ) => Some(*buffer),
+            )
+            | Self::StartChildProcess(ProcessStartupDescriptor { buffer, .. }) => Some(*buffer),
             Self::CreateThread
             | Self::ExitThread(_)
             | Self::CloseObject(_)
@@ -144,6 +148,10 @@ pub enum BrokerHandshakeResponse {
         broker_protocol_version: ProtocolVersion,
         /// Assigned process ID.
         process_id: ProcessId,
+        /// Assigned initial thread ID.
+        initial_thread_id: ThreadId,
+        /// Child startup data, absent for the initial process.
+        startup: Option<ProcessStartupDescriptor>,
     },
     /// Negotiation failed because the requested version is unsupported.
     ///
@@ -234,6 +242,8 @@ pub enum BrokerResult {
     Stdio(StdioResponse),
     /// File response family.
     File(FileResponse),
+    /// A child established its broker association.
+    ProcessStarted(ProcessIdentity),
     /// Operation failed with an ABI-neutral broker error.
     Error(ErrorCode),
 }

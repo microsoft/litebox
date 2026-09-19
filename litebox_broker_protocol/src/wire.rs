@@ -12,8 +12,7 @@
 //!
 //! New object families should add a top-level broker message tag and a private
 //! family codec module instead of adding flat helpers here. Existing payloads
-//! are positional; changing fields is an ABI change, so prefer a new operation
-//! tag or explicit negotiated-version gate for payload evolution.
+//! are positional, so update both endpoints and their codec tests together.
 
 use alloc::vec::Vec;
 use thiserror::Error;
@@ -22,6 +21,10 @@ use crate::error::ErrorCode;
 use crate::message::{
     BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerOperation,
     BrokerRequest, BrokerResponse, BrokerResult, ReadinessNotification,
+};
+use crate::process::{
+    InheritedProcessObjects, MAX_INHERITED_PROCESS_OBJECTS, ProcessBootstrapFormat,
+    ProcessBootstrapVersion, ProcessIdentity, ProcessStartupDescriptor,
 };
 use crate::readiness::ReadinessFlags;
 
@@ -45,6 +48,9 @@ const REQUEST_TAG_STDIO: u8 = 7;
 const REQUEST_TAG_FILE: u8 = 8;
 const REQUEST_TAG_CREATE_THREAD: u8 = 9;
 const REQUEST_TAG_EXIT_THREAD: u8 = 10;
+const REQUEST_TAG_START_CHILD_PROCESS: u8 = 11;
+// Tag 12 is reserved for the removed process-start acknowledgement.
+// Tags 13 and 14 are reserved for the removed process-ready protocol.
 
 // Paired request and successful-response tags intentionally share values.
 const RESPONSE_TAG_NEGOTIATED: u8 = 0;
@@ -58,6 +64,9 @@ const RESPONSE_TAG_STDIO: u8 = 7;
 const RESPONSE_TAG_FILE: u8 = 8;
 const RESPONSE_TAG_THREAD_CREATED: u8 = 9;
 const RESPONSE_TAG_THREAD_EXITED: u8 = 10;
+const RESPONSE_TAG_PROCESS_STARTED: u8 = 11;
+// Tag 12 is reserved for the removed process-start acknowledgement.
+// Tags 13 and 14 are reserved for the removed process-ready protocol.
 
 // Reserve the top of the tag space for responses without paired requests.
 const RESPONSE_TAG_ERROR: u8 = 253;
@@ -67,7 +76,7 @@ const RESPONSE_TAG_VERSION_MISMATCH: u8 = 255;
 const NOTIFICATION_TAG_READINESS: u8 = 0;
 
 /// Maximum byte length of any encoded active request or response.
-pub const MAX_ENCODED_ACTIVE_MESSAGE_SIZE: usize = 67;
+pub const MAX_ENCODED_ACTIVE_MESSAGE_SIZE: usize = 85;
 
 /// Maximum byte length of any encoded broker notification.
 pub const MAX_ENCODED_NOTIFICATION_SIZE: usize = 13;
@@ -116,7 +125,8 @@ pub fn decode_handshake_request(frame: &[u8]) -> Result<BrokerHandshakeRequest, 
         | REQUEST_TAG_STDIO
         | REQUEST_TAG_FILE
         | REQUEST_TAG_CREATE_THREAD
-        | REQUEST_TAG_EXIT_THREAD => {
+        | REQUEST_TAG_EXIT_THREAD
+        | REQUEST_TAG_START_CHILD_PROCESS => {
             return Err(WireError::WrongMessagePhase);
         }
         _ => return Err(WireError::InvalidTag),
@@ -185,6 +195,19 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
             encoder.request_id(request_id);
             fs::encode_fs_request(&mut encoder, request);
         }
+        BrokerOperation::StartChildProcess(ProcessStartupDescriptor {
+            format,
+            version,
+            buffer,
+            inherited_objects,
+        }) => {
+            encoder.u8(REQUEST_TAG_START_CHILD_PROCESS);
+            encoder.request_id(request_id);
+            encoder.u32(format.0);
+            encoder.u16(version.0);
+            encoder.shared_buffer_sequence(buffer);
+            encode_inherited_objects(&mut encoder, inherited_objects);
+        }
     }
     encoder.finish()
 }
@@ -204,7 +227,8 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         | REQUEST_TAG_STDIO
         | REQUEST_TAG_FILE
         | REQUEST_TAG_CREATE_THREAD
-        | REQUEST_TAG_EXIT_THREAD => {}
+        | REQUEST_TAG_EXIT_THREAD
+        | REQUEST_TAG_START_CHILD_PROCESS => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -219,6 +243,14 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         REQUEST_TAG_FILL_RANDOM => BrokerOperation::FillRandom(decoder.shared_buffer_sequence()?),
         REQUEST_TAG_STDIO => BrokerOperation::Stdio(stdio::decode_stdio_request(&mut decoder)?),
         REQUEST_TAG_FILE => BrokerOperation::File(fs::decode_fs_request(&mut decoder)?),
+        REQUEST_TAG_START_CHILD_PROCESS => {
+            BrokerOperation::StartChildProcess(ProcessStartupDescriptor {
+                format: ProcessBootstrapFormat(decoder.u32()?),
+                version: ProcessBootstrapVersion(decoder.u16()?),
+                buffer: decoder.shared_buffer_sequence()?,
+                inherited_objects: decode_inherited_objects(&mut decoder)?,
+            })
+        }
         _ => unreachable!("active request tag was validated"),
     };
     decoder.finish()?;
@@ -238,10 +270,28 @@ pub fn encode_handshake_response(response: BrokerHandshakeResponse) -> Vec<u8> {
         BrokerHandshakeResponse::Negotiated {
             broker_protocol_version,
             process_id,
+            initial_thread_id,
+            startup,
         } => {
             encoder.u8(RESPONSE_TAG_NEGOTIATED);
             encoder.protocol_version(broker_protocol_version);
             encoder.process_id(process_id);
+            encoder.thread_id(initial_thread_id);
+            match startup {
+                Some(ProcessStartupDescriptor {
+                    format,
+                    version,
+                    buffer,
+                    inherited_objects,
+                }) => {
+                    encoder.u8(1);
+                    encoder.u32(format.0);
+                    encoder.u16(version.0);
+                    encoder.shared_buffer_sequence(buffer);
+                    encode_inherited_objects(&mut encoder, inherited_objects);
+                }
+                None => encoder.u8(0),
+            }
         }
         BrokerHandshakeResponse::VersionMismatch {
             broker_protocol_version,
@@ -265,6 +315,17 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
         RESPONSE_TAG_NEGOTIATED => BrokerHandshakeResponse::Negotiated {
             broker_protocol_version: decoder.protocol_version()?,
             process_id: decoder.process_id()?,
+            initial_thread_id: decoder.thread_id()?,
+            startup: match decoder.u8()? {
+                0 => None,
+                1 => Some(ProcessStartupDescriptor {
+                    format: ProcessBootstrapFormat(decoder.u32()?),
+                    version: ProcessBootstrapVersion(decoder.u16()?),
+                    buffer: decoder.shared_buffer_sequence()?,
+                    inherited_objects: decode_inherited_objects(&mut decoder)?,
+                }),
+                _ => return Err(WireError::InvalidTag),
+            },
         },
         RESPONSE_TAG_EVENT
         | RESPONSE_TAG_OBJECT_CLOSED
@@ -276,7 +337,8 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
         | RESPONSE_TAG_STDIO
         | RESPONSE_TAG_FILE
         | RESPONSE_TAG_THREAD_CREATED
-        | RESPONSE_TAG_THREAD_EXITED => {
+        | RESPONSE_TAG_THREAD_EXITED
+        | RESPONSE_TAG_PROCESS_STARTED => {
             return Err(WireError::WrongMessagePhase);
         }
         RESPONSE_TAG_VERSION_MISMATCH => BrokerHandshakeResponse::VersionMismatch {
@@ -346,6 +408,15 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
             encoder.request_id(request_id);
             fs::encode_fs_response(&mut encoder, response);
         }
+        BrokerResult::ProcessStarted(ProcessIdentity {
+            process_id,
+            initial_thread_id,
+        }) => {
+            encoder.u8(RESPONSE_TAG_PROCESS_STARTED);
+            encoder.request_id(request_id);
+            encoder.process_id(process_id);
+            encoder.thread_id(initial_thread_id);
+        }
         BrokerResult::Error(error) => {
             encoder.u8(RESPONSE_TAG_ERROR);
             encoder.request_id(request_id);
@@ -373,7 +444,8 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         | RESPONSE_TAG_STDIO
         | RESPONSE_TAG_FILE
         | RESPONSE_TAG_THREAD_CREATED
-        | RESPONSE_TAG_THREAD_EXITED => {}
+        | RESPONSE_TAG_THREAD_EXITED
+        | RESPONSE_TAG_PROCESS_STARTED => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -389,10 +461,36 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         RESPONSE_TAG_RANDOM_FILLED => BrokerResult::RandomFilled,
         RESPONSE_TAG_STDIO => BrokerResult::Stdio(stdio::decode_stdio_response(&mut decoder)?),
         RESPONSE_TAG_FILE => BrokerResult::File(fs::decode_fs_response(&mut decoder)?),
+        RESPONSE_TAG_PROCESS_STARTED => BrokerResult::ProcessStarted(ProcessIdentity {
+            process_id: decoder.process_id()?,
+            initial_thread_id: decoder.thread_id()?,
+        }),
         _ => unreachable!("active response tag was validated"),
     };
     decoder.finish()?;
     Ok(BrokerResponse { request_id, result })
+}
+
+fn encode_inherited_objects(encoder: &mut Encoder, objects: InheritedProcessObjects) {
+    encoder.u8(u8::try_from(objects.as_slice().len())
+        .expect("bounded inherited-object count must fit in u8"));
+    for handle in objects.as_slice() {
+        encoder.handle(*handle);
+    }
+}
+
+fn decode_inherited_objects(
+    decoder: &mut Decoder<'_>,
+) -> Result<InheritedProcessObjects, WireError> {
+    let count = usize::from(decoder.u8()?);
+    if count > MAX_INHERITED_PROCESS_OBJECTS {
+        return Err(WireError::InvalidTag);
+    }
+    let mut handles = [crate::ObjectHandle(0); MAX_INHERITED_PROCESS_OBJECTS];
+    for handle in &mut handles[..count] {
+        *handle = decoder.handle()?;
+    }
+    InheritedProcessObjects::new(&handles[..count]).ok_or(WireError::InvalidTag)
 }
 
 fn encode_error_code(encoder: &mut Encoder, error: ErrorCode) {
@@ -484,6 +582,10 @@ mod tests {
         CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
         WritePipeResponse,
     };
+    use crate::process::{
+        InheritedProcessObjects, ProcessBootstrapFormat, ProcessBootstrapVersion, ProcessIdentity,
+        ProcessStartupDescriptor,
+    };
     use crate::shared_buffer::{SharedBufferSequence, SharedBufferSlotIndex};
     use crate::socket::{
         AcceptSocketRequest, AcceptSocketResponse, AddressFamily, BindSocketRequest,
@@ -539,6 +641,9 @@ mod tests {
                 RESPONSE_TAG_RANDOM_FILLED,
                 RESPONSE_TAG_STDIO,
                 RESPONSE_TAG_FILE,
+                RESPONSE_TAG_THREAD_CREATED,
+                RESPONSE_TAG_THREAD_EXITED,
+                RESPONSE_TAG_PROCESS_STARTED,
             ],
             [
                 REQUEST_TAG_NEGOTIATE,
@@ -550,6 +655,9 @@ mod tests {
                 REQUEST_TAG_FILL_RANDOM,
                 REQUEST_TAG_STDIO,
                 REQUEST_TAG_FILE,
+                REQUEST_TAG_CREATE_THREAD,
+                REQUEST_TAG_EXIT_THREAD,
+                REQUEST_TAG_START_CHILD_PROCESS,
             ]
         );
         assert_eq!(
@@ -818,6 +926,18 @@ mod tests {
                 name: TcpOptionName::KeepAlive,
             })),
             BrokerOperation::Socket(SocketRequest::Status(SocketStatusRequest { handle })),
+            BrokerOperation::StartChildProcess(ProcessStartupDescriptor {
+                format: ProcessBootstrapFormat(u32::MAX),
+                version: ProcessBootstrapVersion(u16::MAX),
+                buffer: largest_sequence,
+                inherited_objects: InheritedProcessObjects::new(&[
+                    ObjectHandle(1),
+                    ObjectHandle(2),
+                    ObjectHandle(3),
+                    ObjectHandle(4),
+                ])
+                .unwrap(),
+            }),
         ];
         let mut maximum_encoded_size = 0;
 
@@ -991,10 +1111,23 @@ mod tests {
             BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: ProtocolVersion(1),
                 process_id: process_id(1),
+                initial_thread_id: thread_id(2),
+                startup: None,
             },
             BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: ProtocolVersion(1),
                 process_id: process_id(7),
+                initial_thread_id: thread_id(8),
+                startup: Some(ProcessStartupDescriptor {
+                    format: ProcessBootstrapFormat(0x7465_7374),
+                    version: ProcessBootstrapVersion(1),
+                    buffer: sequence(0, 37),
+                    inherited_objects: InheritedProcessObjects::new(&[
+                        ObjectHandle(5),
+                        ObjectHandle(6),
+                    ])
+                    .unwrap(),
+                }),
             },
             BrokerHandshakeResponse::VersionMismatch {
                 broker_protocol_version: ProtocolVersion(1),
@@ -1150,6 +1283,14 @@ mod tests {
             BrokerResult::File(FileResponse::Mkdir),
             BrokerResult::File(FileResponse::Rmdir),
             BrokerResult::File(FileResponse::Failed(FileError::Io)),
+            BrokerResult::ProcessStarted(ProcessIdentity {
+                process_id: process_id(u32::MAX),
+                initial_thread_id: thread_id(u32::MAX - 1),
+            }),
+            BrokerResult::ProcessStarted(ProcessIdentity {
+                process_id: process_id(9),
+                initial_thread_id: thread_id(11),
+            }),
             BrokerResult::Error(ErrorCode::PolicyDenied),
             BrokerResult::Error(ErrorCode::WouldBlock),
             BrokerResult::Error(ErrorCode::PeerClosed),
@@ -1617,7 +1758,7 @@ mod tests {
     #[test]
     fn decode_rejects_malformed_handshake_response_frames() {
         assert_eq!(
-            decode_handshake_response(&[0xfc, 1, 2, 3]),
+            decode_handshake_response(&[0xfb, 1, 2, 3]),
             Err(WireError::InvalidTag)
         );
         assert_eq!(
@@ -1652,10 +1793,20 @@ mod tests {
             Err(WireError::WrongMessagePhase)
         );
 
-        let mut frame = encode_handshake_response(BrokerHandshakeResponse::Negotiated {
+        let negotiated = BrokerHandshakeResponse::Negotiated {
             broker_protocol_version: ProtocolVersion(1),
             process_id: process_id(1),
-        });
+            initial_thread_id: thread_id(2),
+            startup: None,
+        };
+        let mut invalid_startup = encode_handshake_response(negotiated.clone());
+        *invalid_startup.last_mut().unwrap() = 2;
+        assert_eq!(
+            decode_handshake_response(&invalid_startup),
+            Err(WireError::InvalidTag)
+        );
+
+        let mut frame = encode_handshake_response(negotiated);
         frame.push(0xff);
         assert_eq!(
             decode_handshake_response(&frame),
@@ -1666,13 +1817,26 @@ mod tests {
     #[test]
     fn decode_rejects_malformed_response_frames() {
         assert_eq!(
-            decode_response(&[0xfc, 1, 2, 3]),
+            decode_response(&[0xfb, 1, 2, 3]),
             Err(WireError::InvalidTag)
         );
         for response in [
             BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: ProtocolVersion(1),
                 process_id: process_id(1),
+                initial_thread_id: thread_id(2),
+                startup: None,
+            },
+            BrokerHandshakeResponse::Negotiated {
+                broker_protocol_version: ProtocolVersion(1),
+                process_id: process_id(2),
+                initial_thread_id: thread_id(3),
+                startup: Some(ProcessStartupDescriptor {
+                    format: ProcessBootstrapFormat(3),
+                    version: ProcessBootstrapVersion(4),
+                    buffer: sequence(0, 5),
+                    inherited_objects: InheritedProcessObjects::EMPTY,
+                }),
             },
             BrokerHandshakeResponse::VersionMismatch {
                 broker_protocol_version: ProtocolVersion(1),

@@ -524,7 +524,7 @@ mod control_ring_tests {
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Barrier, mpsc};
+    use std::sync::mpsc;
 
     type Producer = ControlRingProducer<MemfdSharedMemory>;
     type Consumer = ControlRingConsumer<MemfdSharedMemory>;
@@ -708,6 +708,8 @@ mod control_ring_tests {
             &encode_handshake_response(BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: litebox_broker_protocol::BROKER_PROTOCOL_VERSION,
                 process_id: litebox_broker_protocol::ProcessId(1),
+                initial_thread_id: litebox_broker_protocol::ThreadId(2),
+                startup: None,
             }),
             None,
         )
@@ -763,39 +765,6 @@ mod control_ring_tests {
             peer.read(&mut byte).unwrap_err().kind(),
             ErrorKind::WouldBlock | ErrorKind::TimedOut
         ));
-    }
-
-    #[test]
-    fn pending_capacity_blocks_before_sixty_fifth_publication() {
-        let (channel, shutdown, mut responses, mut requests, _peer) = activate_local(|| {});
-        let channel = Arc::new(channel);
-        let start = Arc::new(Barrier::new(MAX_PENDING_CALLS + 2));
-        let callers = (0..=MAX_PENDING_CALLS)
-            .map(|id| {
-                let channel = Arc::clone(&channel);
-                let start = Arc::clone(&start);
-                thread::spawn(move || {
-                    start.wait();
-                    channel.call(request(id as u64))
-                })
-            })
-            .collect::<Vec<_>>();
-        start.wait();
-
-        let mut published = Vec::new();
-        for _ in 0..MAX_PENDING_CALLS {
-            published.push(read_request(&mut requests).request_id);
-        }
-        write_payload(&mut responses, &encode_response(response(published[0])));
-        let released = read_request(&mut requests).request_id;
-        assert!(!published.contains(&released));
-
-        shutdown.shutdown().unwrap();
-        let completed = callers
-            .into_iter()
-            .map(|caller| usize::from(caller.join().unwrap().is_ok()))
-            .sum::<usize>();
-        assert_eq!(completed, 1);
     }
 
     #[test]

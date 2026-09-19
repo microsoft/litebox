@@ -6,16 +6,19 @@ use std::io::Result as IoResult;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::Child;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use litebox_broker_core::BrokerCore;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory;
 use litebox_broker_transport_linux_userland::unix_socket::{
     UnixStreamHostSetupChannel, validate_peer_process,
 };
 
-use super::{SETUP_TIMEOUT, accept_runner_channel};
+use super::{
+    RunnerProcessManager, RunnerStartup, SETUP_TIMEOUT, accept_runner_channel, runner_has_exited,
+};
+use crate::runtime::{AssociationFailureCause, AssociationRunResult};
 
 pub(super) struct PlatformRunnerEndpoint {
     socket_path: PathBuf,
@@ -42,13 +45,19 @@ impl PlatformRunnerEndpoint {
         self.socket_path.as_os_str()
     }
 
-    pub(super) fn serve(&mut self, broker: &BrokerCore, runner: &mut Child) -> IoResult<()> {
-        serve_runner_process(
-            broker,
+    pub(super) fn serve(
+        &mut self,
+        runner: &Arc<Mutex<Child>>,
+        startup: Option<RunnerStartup>,
+        process_manager: Arc<RunnerProcessManager>,
+    ) -> AssociationRunResult {
+        serve_association(
             self.listener
                 .as_ref()
                 .expect("a live runner instance must own its control listener"),
             runner,
+            startup,
+            process_manager,
         )
     }
 
@@ -58,27 +67,42 @@ impl PlatformRunnerEndpoint {
     }
 }
 
-fn serve_runner_process(
-    broker: &BrokerCore,
+fn serve_association(
     control_listener: &UnixListener,
-    runner: &mut Child,
-) -> IoResult<()> {
-    let setup_deadline = Instant::now() + SETUP_TIMEOUT;
-    let control_stream = accept_runner_channel(
-        setup_deadline,
-        "control",
-        || {
-            runner
-                .try_wait()
-                .map(|status| status.map(|status| format!("exited with {status}")))
-        },
-        || control_listener.accept().map(|(stream, _)| stream),
-    )?;
-    validate_peer_process(&control_stream, runner.id())?;
-    let control_channel =
-        UnixStreamHostSetupChannel::from_host_guaranteed(control_stream, setup_deadline);
-    crate::runtime::serve_association(
-        broker,
+    runner: &Arc<Mutex<Child>>,
+    startup: Option<RunnerStartup>,
+    process_manager: Arc<RunnerProcessManager>,
+) -> AssociationRunResult {
+    let has_parent_transaction = startup.is_some();
+    let (control_channel, setup_deadline) = match accept_control_channel(control_listener, runner) {
+        Ok(connection) => connection,
+        Err(error) => {
+            let failure_cause = if runner_has_exited(runner).unwrap_or(false) {
+                AssociationFailureCause::RunnerExit
+            } else if has_parent_transaction
+                && matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                )
+            {
+                AssociationFailureCause::PeerClosed
+            } else {
+                AssociationFailureCause::Other
+            };
+            return AssociationRunResult {
+                result: Err(error),
+                process: None,
+                panicked: false,
+                abnormal: failure_cause == AssociationFailureCause::Other,
+                failure_cause,
+            };
+        }
+    };
+    let mut result = crate::runtime::serve_out_of_process_runner_association(
+        startup,
         control_channel,
         || MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE),
         MemfdSharedMemory::create_control_ring,
@@ -88,5 +112,36 @@ fn serve_runner_process(
             Ok(())
         },
         UnixStreamHostSetupChannel::into_active,
-    )
+        process_manager,
+    );
+    if has_parent_transaction
+        && result.failure_cause == AssociationFailureCause::Other
+        && result
+            .result
+            .as_ref()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::BrokenPipe)
+        && runner_has_exited(runner).unwrap_or(false)
+    {
+        result.failure_cause = AssociationFailureCause::RunnerExit;
+    }
+    result
+}
+
+fn accept_control_channel(
+    control_listener: &UnixListener,
+    runner: &Arc<Mutex<Child>>,
+) -> IoResult<(UnixStreamHostSetupChannel, Instant)> {
+    let setup_deadline = Instant::now() + SETUP_TIMEOUT;
+    let runner_id = runner.lock().expect("runner process mutex poisoned").id();
+    let control_stream = accept_runner_channel(
+        setup_deadline,
+        "control",
+        || runner_has_exited(runner).map(|exited| exited.then(|| "exited".to_owned())),
+        || control_listener.accept().map(|(stream, _)| stream),
+    )?;
+    validate_peer_process(&control_stream, runner_id)?;
+    Ok((
+        UnixStreamHostSetupChannel::from_host_guaranteed(control_stream, setup_deadline),
+        setup_deadline,
+    ))
 }

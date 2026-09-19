@@ -107,9 +107,7 @@ pub struct BrokerProcess {
     pub(crate) core: BrokerCore,
     /// Assigned process ID and internal authority.
     pub(crate) id: ProcessId,
-    cleaned_up: bool,
-    /// Authoritative parent process ID, absent for a root process.
-    parent_id: Option<ProcessId>,
+    state: Mutex<ProcessState>,
     /// Broker-entry-authenticated caller credential for this process.
     pub(crate) caller_credential: CallerCredential,
     /// Handles of the live object references owned by this process.
@@ -124,19 +122,24 @@ pub struct BrokerProcess {
     pub(crate) cancellation: AssociationCancellation,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProcessState {
+    Starting,
+    Running,
+    Exiting,
+}
+
 impl BrokerProcess {
     /// Creates authenticated broker process state.
     pub(crate) fn new(
         core: BrokerCore,
         id: ProcessId,
-        parent_id: Option<ProcessId>,
         caller_credential: CallerCredential,
     ) -> Self {
         Self {
             core,
             id,
-            cleaned_up: false,
-            parent_id,
+            state: Mutex::new(ProcessState::Starting),
             caller_credential,
             references: Mutex::new(ProcessReferences {
                 handles: Vec::new(),
@@ -155,10 +158,63 @@ impl BrokerProcess {
         self.id
     }
 
-    /// Returns the current parent process ID, if any.
+    /// Returns the credential authenticated for this process association.
     #[must_use]
-    pub const fn parent_id(&self) -> Option<ProcessId> {
-        self.parent_id
+    pub const fn caller_credential(&self) -> CallerCredential {
+        self.caller_credential
+    }
+
+    /// Returns whether this process completed broker startup.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        matches!(*self.state.lock(), ProcessState::Running)
+    }
+
+    /// Completes startup after the process association becomes active.
+    pub fn complete_start(&self) -> Result<()> {
+        let mut state = self.state.lock();
+        match *state {
+            ProcessState::Starting => {
+                *state = ProcessState::Running;
+                Ok(())
+            }
+            ProcessState::Running => Err(BrokerError::Internal),
+            ProcessState::Exiting => Err(BrokerError::PeerClosed),
+        }
+    }
+
+    /// Duplicates object references into another process.
+    ///
+    /// Each duplicate retains its source reference's rights. Returned handles
+    /// follow the requested source order. If duplication fails, references
+    /// already created by this call are removed from the target before the
+    /// error is returned.
+    pub fn duplicate_object_references_to(
+        &self,
+        handles: &[ObjectHandle],
+        target: &BrokerProcess,
+    ) -> Result<Vec<ObjectHandle>> {
+        let mut duplicates = Vec::new();
+        duplicates
+            .try_reserve_exact(handles.len())
+            .map_err(|_| BrokerError::OutOfMemory)?;
+        for handle in handles {
+            let duplicate = self
+                .object_reference_rights(*handle)
+                .and_then(|rights| self.duplicate_object_reference_to(*handle, target, rights));
+            match duplicate {
+                Ok(duplicate) => duplicates.push(duplicate),
+                Err(error) => {
+                    for duplicate in duplicates.drain(..).rev() {
+                        if target.close_object_reference(duplicate).is_err() {
+                            return Err(BrokerError::Internal);
+                        }
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(duplicates)
     }
 
     /// Creates a broker thread belonging to this process.
@@ -199,13 +255,19 @@ impl BrokerProcess {
         Ok(thread_id)
     }
 
+    /// Returns whether this process owns the live broker thread.
+    #[must_use]
+    pub fn owns_thread(&self, thread_id: ThreadId) -> bool {
+        self.threads.lock().contains_key(&thread_id)
+    }
+
     /// Records broker thread exit after its local task teardown completes.
     pub fn exit_thread(&self, thread_id: ThreadId) -> Result<()> {
-        let thread = self
-            .threads
-            .lock()
+        let mut threads = self.threads.lock();
+        let thread = threads
             .remove(&thread_id)
             .ok_or(BrokerError::UnknownObject)?;
+        drop(threads);
         self.core
             .active_thread_count
             .fetch_sub(1, Ordering::Relaxed);
@@ -219,19 +281,10 @@ impl BrokerProcess {
         self.cancellation.cancel();
     }
 
-    /// Completes non-unwinding process teardown and releases its IDs.
-    ///
-    /// Dropping a process without calling this method performs authority
-    /// cleanup but leaves its numeric IDs occupied so they cannot be reused
-    /// after an unwind.
-    /// # Panics
-    ///
-    /// Panics if another owner still holds this process.
-    pub fn finish(self: Arc<Self>) {
-        let Ok(mut process) = Arc::try_unwrap(self) else {
-            panic!("all broker process owners must be released before teardown");
-        };
-        process.cleanup(true);
+    /// Returns whether association teardown requested cancellation.
+    #[must_use]
+    pub fn is_cancellation_requested(&self) -> bool {
+        self.cancellation.is_cancelled()
     }
 
     pub(crate) fn create_object_reference(&self, object: ObjectEntry) -> Result<ObjectHandle> {
@@ -343,6 +396,15 @@ impl BrokerProcess {
             return Err(BrokerError::PolicyDenied);
         }
         target.create_object_reference_with_rights(object, rights)
+    }
+
+    fn object_reference_rights(&self, handle: ObjectHandle) -> Result<ObjectRights> {
+        let references = self.core.references.read();
+        let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
+        if reference.owner != self.id {
+            return Err(BrokerError::UnknownObject);
+        }
+        Ok(reference.rights)
     }
 
     pub(crate) fn create_object_reference_pair(
@@ -611,11 +673,18 @@ impl BrokerProcess {
         Ok(reference)
     }
 
-    fn cleanup(&mut self, release_ids: bool) -> bool {
-        if self.cleaned_up {
-            return false;
+    /// Cleans up this process, optionally releasing its numeric IDs for reuse.
+    ///
+    /// Set `release_ids` only after fully accounted teardown. Dropping a
+    /// process calls this with `false`, retaining IDs after an unwind or other
+    /// uncertain retirement. Calling this method more than once is harmless.
+    pub fn cleanup(&self, release_ids: bool) {
+        let mut process_state = self.state.lock();
+        if *process_state == ProcessState::Exiting {
+            return;
         }
-        self.cleaned_up = true;
+        *process_state = ProcessState::Exiting;
+        drop(process_state);
 
         let mut invariant_fault = self.references.lock().pending_handles != 0;
         loop {
@@ -685,7 +754,6 @@ impl BrokerProcess {
             }
             ids.release(self.id.0);
         }
-        invariant_fault
     }
 }
 
@@ -770,7 +838,7 @@ fn release_pending_reference(
 
 impl Drop for BrokerProcess {
     fn drop(&mut self) {
-        let _ = self.cleanup(false);
+        self.cleanup(false);
     }
 }
 
@@ -778,7 +846,7 @@ impl Drop for BrokerProcess {
 mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{ProcessReferences, release_pending_reference};
+    use super::{ProcessReferences, ProcessState, release_pending_reference};
     use crate::test_platform::TestPlatform;
     use crate::test_support::{TestBrokerCoreBuilder, TestStdioProvider};
     use crate::{
@@ -816,10 +884,127 @@ mod tests {
             .unwrap();
 
         assert_eq!(first.id().0, 1);
-        assert_eq!(first.parent_id(), None);
         assert_eq!(thread.0, 2);
         assert_eq!(second.id().0, 3);
-        assert_eq!(second.parent_id(), None);
+    }
+
+    #[test]
+    fn process_recognizes_only_its_live_threads() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        let first = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let second = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let thread = first.create_thread().unwrap();
+
+        assert!(first.owns_thread(thread));
+        assert!(!second.owns_thread(thread));
+        first.exit_thread(thread).unwrap();
+        assert!(!first.owns_thread(thread));
+    }
+
+    #[test]
+    fn process_creation_and_reference_inheritance_are_separate() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        let parent = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let source_handle = crate::event::create(&parent, 1).unwrap();
+        let process = broker.create_process(parent.caller_credential()).unwrap();
+        let inherited_objects = parent
+            .duplicate_object_references_to(&[source_handle], &process)
+            .unwrap();
+        let initial_thread_id = process.create_thread().unwrap();
+        let inherited_handle = inherited_objects[0];
+
+        assert!(process.owns_thread(initial_thread_id));
+        assert_ne!(inherited_handle, source_handle);
+        assert_eq!(
+            process.check_readiness(inherited_handle).unwrap(),
+            ReadinessFlags::READ | ReadinessFlags::WRITE
+        );
+        assert!(!process.is_running());
+
+        process.complete_start().unwrap();
+        assert!(process.is_running());
+        assert_eq!(*process.state.lock(), ProcessState::Running);
+    }
+
+    #[test]
+    fn failed_reference_inheritance_rolls_back_target_references() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        let source = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let target = broker.create_process(source.caller_credential()).unwrap();
+        let source_handle = crate::event::create(&source, 1).unwrap();
+
+        assert_eq!(
+            source
+                .duplicate_object_references_to(&[source_handle, ObjectHandle(u64::MAX)], &target,),
+            Err(BrokerError::UnknownObject)
+        );
+        assert!(target.references.lock().handles.is_empty());
+        assert_eq!(
+            source.check_readiness(source_handle).unwrap(),
+            ReadinessFlags::READ | ReadinessFlags::WRITE
+        );
+    }
+
+    #[test]
+    fn finished_starting_process_releases_process_capacity() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .with_limits(BrokerCoreLimits::DEFAULT.with_process_limit(2))
+        .build()
+        .unwrap();
+        let parent = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let process = broker.create_process(parent.caller_credential()).unwrap();
+
+        assert_eq!(
+            broker.create_process(parent.caller_credential()).err(),
+            Some(BrokerError::ResourceExhausted)
+        );
+        process.cleanup(true);
+        assert!(broker.create_process(parent.caller_credential()).is_ok());
+    }
+
+    #[test]
+    fn process_cannot_complete_start_after_teardown() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .with_limits(BrokerCoreLimits::DEFAULT.with_process_limit(2))
+        .build()
+        .unwrap();
+        let parent = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let process = broker.create_process(parent.caller_credential()).unwrap();
+
+        process.cleanup(true);
+        process.cleanup(true);
+
+        assert_eq!(process.complete_start(), Err(BrokerError::PeerClosed));
+        let replacement = broker.create_process(parent.caller_credential()).unwrap();
+        replacement.cleanup(true);
     }
 
     #[test]
@@ -905,7 +1090,7 @@ mod tests {
             Err(BrokerError::ResourceExhausted)
         ));
 
-        first.finish();
+        first.cleanup(true);
         assert!(
             broker
                 .create_process(CallerCredential::Unauthenticated)
@@ -937,7 +1122,7 @@ mod tests {
         assert!(Arc::ptr_eq(&process, &registered));
         drop(registered);
 
-        process.finish();
+        process.cleanup(true);
         assert!(!broker.processes.read().contains_key(&process_id));
         assert_eq!(broker.active_thread_count.load(Ordering::Relaxed), 0);
 

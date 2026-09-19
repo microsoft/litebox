@@ -1903,7 +1903,7 @@ fn udp_queued_datagrams_survive_source_process_teardown() {
         second_receiver,
         ReadinessFlags::READ,
     );
-    source_process.finish();
+    source_process.cleanup(true);
     assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), source);
     assert_eq!(provider.reactor.udp_queued_datagram_count(), 1);
     assert!(

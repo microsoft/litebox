@@ -50,6 +50,10 @@ pub struct Thread {
 }
 
 impl Thread {
+    pub(crate) fn from_broker(id: ThreadId, broker: Arc<dyn BrokerControl>) -> Self {
+        Self { id, broker }
+    }
+
     /// Returns the assigned thread ID.
     #[must_use]
     pub const fn id(&self) -> u32 {

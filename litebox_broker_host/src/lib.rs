@@ -43,9 +43,13 @@ use litebox_broker_protocol::message::{
 use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
 };
+use litebox_broker_protocol::process::{
+    MAX_PROCESS_BOOTSTRAP_SIZE, ProcessStartupData, ProcessStartupDescriptor,
+};
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::shared_buffer::{
     SHARED_BUFFER_LAYOUT, SHARED_BUFFER_SLOT_COUNT, SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence,
+    SharedBufferSlotIndex,
 };
 use litebox_broker_protocol::socket::{
     AcceptSocketResponse, BindSocketResponse, ConnectSocketResponse, CreateSocketResponse,
@@ -57,9 +61,9 @@ use litebox_broker_protocol::stdio::{
     IsTerminalStdioRequest, IsTerminalStdioResponse, MAX_STDIO_TRANSFER_SIZE, ReadStdioRequest,
     ReadStdioResponse, WriteStdioRequest, WriteStdioResponse,
 };
-use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, RequestId};
+use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, RequestId, ThreadId};
 use litebox_broker_transport::channel::{HostReceive, HostSetupChannel, PeerCredential};
-use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemory};
+use litebox_broker_transport::shared_memory::{SharedBufferError, SharedBufferPool, SharedMemory};
 use spin::mutex::SpinMutex;
 
 mod error;
@@ -90,7 +94,34 @@ struct AssociationState {
     shared_buffer_usage: SharedBufferUsage,
 }
 
-impl<Memory: SharedMemory> BrokerHostAssociation<'_, Memory> {
+impl<'a, Memory: SharedMemory> BrokerHostAssociation<'a, Memory> {
+    fn new(
+        process: Arc<BrokerProcess>,
+        shared_buffers: &'a SharedBufferPool<Memory>,
+        readiness_sink: Arc<dyn ReadinessSink>,
+    ) -> Self {
+        Self {
+            process,
+            shared_buffers,
+            readiness_sink,
+            state: SpinMutex::new(AssociationState {
+                failed: false,
+                shared_buffer_usage: SharedBufferUsage::new(),
+            }),
+        }
+    }
+
+    /// Returns the broker-assigned process ID for this association.
+    #[must_use]
+    pub fn process_id(&self) -> litebox_broker_protocol::ProcessId {
+        self.process.id()
+    }
+
+    /// Marks the process running after deployment-specific association activation.
+    pub fn activate_process(&self) -> litebox_broker_core::Result<()> {
+        self.process.complete_start()
+    }
+
     /// Requests cancellation of provider operations after the peer disconnects.
     pub fn request_cancellation(&self) {
         self.process.request_cancellation();
@@ -98,7 +129,7 @@ impl<Memory: SharedMemory> BrokerHostAssociation<'_, Memory> {
 
     /// Completes non-unwinding association teardown and releases its process ID.
     pub fn finish(self) {
-        BrokerProcess::finish(self.process);
+        self.process.cleanup(true);
     }
 
     /// Executes one active request and emits its response.
@@ -111,16 +142,40 @@ impl<Memory: SharedMemory> BrokerHostAssociation<'_, Memory> {
         request: BrokerRequest,
         send_response: impl FnOnce(&BrokerResponse) -> core::result::Result<(), ChannelError>,
     ) -> Result<(), ChannelError> {
+        self.execute_request_with(
+            request,
+            |_process, _operation, _shared_buffers| None,
+            send_response,
+            |_operation, _result| {},
+        )
+    }
+
+    /// Executes one active request with an optional deployment-specific operation handler.
+    ///
+    /// The extension runs after shared-buffer ownership is validated and while
+    /// any operation-scoped sequence remains reserved for this request.
+    pub fn execute_request_with<ChannelError>(
+        &self,
+        request: BrokerRequest,
+        extension: impl FnOnce(
+            &BrokerProcess,
+            &BrokerOperation,
+            &SharedBufferPool<Memory>,
+        ) -> Option<core::result::Result<BrokerResult, RequestFailure>>,
+        send_response: impl FnOnce(&BrokerResponse) -> core::result::Result<(), ChannelError>,
+        response_sent: impl FnOnce(&BrokerOperation, &BrokerResult),
+    ) -> Result<(), ChannelError> {
         let BrokerRequest {
             request_id,
             operation,
         } = request;
+        let response_operation = operation.clone();
         let buffer_sequence = operation.shared_buffer();
 
         {
             let mut state = self.state.lock();
             if state.failed {
-                return Err(BrokerHostError::Broker(ErrorCode::Internal));
+                return Err(BrokerHostError::AssociationFailed);
             }
             if let Some(sequence) = buffer_sequence
                 && let Err(error) = state.shared_buffer_usage.begin(
@@ -134,12 +189,16 @@ impl<Memory: SharedMemory> BrokerHostAssociation<'_, Memory> {
             }
         }
 
-        let result = match complete_request(handle_request(
-            &self.process,
-            operation,
-            self.shared_buffers,
-            &self.readiness_sink,
-        )) {
+        let request_result = match extension(&self.process, &operation, self.shared_buffers) {
+            Some(result) => result,
+            None => handle_request(
+                &self.process,
+                operation,
+                self.shared_buffers,
+                &self.readiness_sink,
+            ),
+        };
+        let result = match complete_request(request_result) {
             Ok(result) => result,
             Err(error) => {
                 self.state.lock().failed = true;
@@ -152,23 +211,27 @@ impl<Memory: SharedMemory> BrokerHostAssociation<'_, Memory> {
                 .shared_buffer_usage
                 .end(request_id, sequence);
         }
-        if let Err(error) = send_response(&BrokerResponse { request_id, result }) {
+        let response = BrokerResponse { request_id, result };
+        if let Err(error) = send_response(&response) {
             self.state.lock().failed = true;
             return Err(BrokerHostError::Channel(error));
         }
+        response_sent(&response_operation, &response.result);
         Ok(())
     }
 }
 
-/// Authenticates and negotiates one broker control connection.
-///
-/// `send_shared_memory` runs after version negotiation and before the active
-/// association is returned.
+/// Authenticates and negotiates one broker control connection while allowing
+/// a deployment owner to retain the negotiated process before setup completes.
+#[allow(clippy::too_many_arguments)]
 pub fn setup_connection<'a, SetupChannel, Memory, ChannelError>(
     core: &BrokerCore,
+    process: Option<(Arc<BrokerProcess>, ThreadId)>,
+    startup: Option<ProcessStartupData>,
     setup_channel: &mut SetupChannel,
     shared_buffers: &'a SharedBufferPool<Memory>,
     readiness_sink: Arc<dyn ReadinessSink>,
+    retain_process: impl FnOnce(&Arc<BrokerProcess>) -> bool,
     send_shared_memory: impl FnOnce(&mut SetupChannel) -> core::result::Result<(), ChannelError>,
 ) -> Result<ConnectionSetup<'a, Memory>, ChannelError>
 where
@@ -178,6 +241,34 @@ where
     if shared_buffers.layout() != SHARED_BUFFER_LAYOUT {
         return Err(BrokerHostError::SharedBufferLayoutMismatch);
     }
+    if process.is_some() != startup.is_some() {
+        return Err(BrokerHostError::Broker(ErrorCode::Internal));
+    }
+    let startup = match startup {
+        Some(ProcessStartupData {
+            format,
+            version,
+            payload,
+            inherited_objects,
+        }) => {
+            if payload.len() > MAX_PROCESS_BOOTSTRAP_SIZE as usize {
+                return Err(BrokerHostError::Broker(ErrorCode::ResourceExhausted));
+            }
+            let bootstrap_length = u32::try_from(payload.len())
+                .map_err(|_| BrokerHostError::Broker(ErrorCode::ResourceExhausted))?;
+            let buffer = SharedBufferSequence::new(&[SharedBufferSlotIndex(0)], bootstrap_length)
+                .map_err(|_| BrokerHostError::Broker(ErrorCode::Internal))?;
+            write_shared_buffer(shared_buffers, buffer, &payload, MAX_PROCESS_BOOTSTRAP_SIZE)
+                .map_err(|error| BrokerHostError::Broker(error.into()))?;
+            Some(ProcessStartupDescriptor {
+                format,
+                version,
+                buffer,
+                inherited_objects,
+            })
+        }
+        None => None,
+    };
     let limits = core.limits();
     // Sockets are currently the only externally backed objects. Add future
     // resource limits here so every live registration fits in the
@@ -195,6 +286,7 @@ where
         PeerCredential::Unauthenticated => CallerCredential::Unauthenticated,
         _ => return Err(BrokerHostError::Broker(ErrorCode::PolicyDenied)),
     };
+    let mut process = process;
     loop {
         let request = match setup_channel
             .recv_handshake_request()
@@ -224,48 +316,84 @@ where
             continue;
         }
 
-        let process = match core.create_process(caller_credential) {
-            Ok(process) => process,
-            Err(litebox_broker_core::BrokerError::ResourceExhausted) => {
-                let error = ErrorCode::ResourceExhausted;
+        let finish_on_setup_error = process.is_none();
+        let (process, initial_thread_id) = match process.take() {
+            Some((process, initial_thread_id))
+                if process.caller_credential() == caller_credential =>
+            {
+                (process, initial_thread_id)
+            }
+            Some(_) => {
+                let error = ErrorCode::PolicyDenied;
                 setup_channel
                     .send_handshake_response(&BrokerHandshakeResponse::Error(error))
                     .map_err(BrokerHostError::Channel)?;
                 return Ok(Err(ConnectionTermination::Rejected(error)));
             }
-            Err(error) => return Err(BrokerHostError::from(error)),
+            None => match core.create_process(caller_credential) {
+                Ok(process) => match process.create_thread() {
+                    Ok(initial_thread_id) => (process, initial_thread_id),
+                    Err(
+                        error @ (litebox_broker_core::BrokerError::ResourceExhausted
+                        | litebox_broker_core::BrokerError::OutOfMemory),
+                    ) => {
+                        process.cleanup(true);
+                        let error = ErrorCode::from(error);
+                        setup_channel
+                            .send_handshake_response(&BrokerHandshakeResponse::Error(error))
+                            .map_err(BrokerHostError::Channel)?;
+                        return Ok(Err(ConnectionTermination::Rejected(error)));
+                    }
+                    Err(error) => {
+                        process.cleanup(true);
+                        return Err(BrokerHostError::from(error));
+                    }
+                },
+                Err(litebox_broker_core::BrokerError::ResourceExhausted) => {
+                    let error = ErrorCode::ResourceExhausted;
+                    setup_channel
+                        .send_handshake_response(&BrokerHandshakeResponse::Error(error))
+                        .map_err(BrokerHostError::Channel)?;
+                    return Ok(Err(ConnectionTermination::Rejected(error)));
+                }
+                Err(error) => return Err(BrokerHostError::from(error)),
+            },
         };
         let response = BrokerHandshakeResponse::Negotiated {
             broker_protocol_version: BROKER_PROTOCOL_VERSION,
             process_id: process.id(),
+            initial_thread_id,
+            startup,
         };
+        let process_retained = retain_process(&process);
         if let Err(error) = setup_channel.send_handshake_response(&response) {
-            BrokerProcess::finish(process);
+            if finish_on_setup_error && !process_retained {
+                process.cleanup(true);
+            }
             return Err(BrokerHostError::Channel(error));
         }
         if let Err(error) = send_shared_memory(setup_channel) {
-            BrokerProcess::finish(process);
+            if finish_on_setup_error && !process_retained {
+                process.cleanup(true);
+            }
             return Err(BrokerHostError::Channel(error));
         }
-        return Ok(Ok(BrokerHostAssociation {
+        return Ok(Ok(BrokerHostAssociation::new(
             process,
             shared_buffers,
             readiness_sink,
-            state: SpinMutex::new(AssociationState {
-                failed: false,
-                shared_buffer_usage: SharedBufferUsage::new(),
-            }),
-        }));
+        )));
     }
 }
 
 type RequestResult<T> = core::result::Result<T, RequestFailure>;
 
+/// Failure classification for broker request handling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RequestFailure {
-    /// Send an error response and continue serving the association.
+pub enum RequestFailure {
+    /// Return an error result and keep serving the association.
     Respond(ErrorCode),
-    /// Terminate the association without sending a response.
+    /// Fail the association without publishing a response.
     Abort(ErrorCode),
 }
 
@@ -277,6 +405,14 @@ impl From<litebox_broker_core::BrokerError> for RequestFailure {
                 Self::Abort(ErrorCode::Internal)
             }
             error => Self::Respond(error.into()),
+        }
+    }
+}
+
+impl From<RequestFailure> for ErrorCode {
+    fn from(error: RequestFailure) -> Self {
+        match error {
+            RequestFailure::Respond(error) | RequestFailure::Abort(error) => error,
         }
     }
 }
@@ -403,6 +539,9 @@ fn handle_request<Memory: SharedMemory>(
         }
         BrokerOperation::File(request) => {
             handle_file_request(process, request, shared_buffers).map(BrokerResult::File)
+        }
+        BrokerOperation::StartChildProcess(_) => {
+            Err(RequestFailure::Respond(ErrorCode::UnsupportedOperation))
         }
     }
 }
@@ -630,24 +769,17 @@ fn allocate_zeroed(length: u32) -> RequestResult<Vec<u8>> {
     Ok(data)
 }
 
-fn read_shared_buffer<Memory: SharedMemory>(
+/// Reads a validated operation-scoped shared-buffer sequence.
+pub fn read_shared_buffer<Memory: SharedMemory>(
     shared_buffers: &SharedBufferPool<Memory>,
     buffer: SharedBufferSequence,
     max_length: u32,
 ) -> RequestResult<Vec<u8>> {
     validate_shared_buffer(buffer, max_length)?;
     let mut data = allocate_zeroed(buffer.length())?;
-    let mut offset = 0;
-    for descriptor in buffer
-        .descriptors(shared_buffers.layout())
-        .map_err(|_| RequestFailure::Abort(ErrorCode::MalformedRequest))?
-    {
-        let end = offset + descriptor.length as usize;
-        shared_buffers
-            .read(descriptor.slot_index, &mut data[offset..end])
-            .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
-        offset = end;
-    }
+    shared_buffers
+        .read_sequence(buffer, &mut data)
+        .map_err(shared_buffer_access_failure)?;
     Ok(data)
 }
 
@@ -658,28 +790,16 @@ fn write_shared_buffer<Memory: SharedMemory>(
     max_length: u32,
 ) -> RequestResult<()> {
     validate_shared_buffer(buffer, max_length)?;
-    if data.len() > buffer.length() as usize {
-        return Err(RequestFailure::Abort(ErrorCode::Internal));
+    shared_buffers
+        .write_sequence(buffer, data)
+        .map_err(shared_buffer_access_failure)
+}
+
+fn shared_buffer_access_failure(error: SharedBufferError) -> RequestFailure {
+    match error {
+        SharedBufferError::Layout(_) => RequestFailure::Abort(ErrorCode::MalformedRequest),
+        _ => RequestFailure::Abort(ErrorCode::Internal),
     }
-    let mut offset = 0;
-    for descriptor in buffer
-        .descriptors(shared_buffers.layout())
-        .map_err(|_| RequestFailure::Abort(ErrorCode::MalformedRequest))?
-    {
-        if offset == data.len() {
-            break;
-        }
-        let length = (data.len() - offset).min(descriptor.length as usize);
-        let end = offset + length;
-        shared_buffers
-            .write(descriptor.slot_index, &data[offset..end])
-            .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
-        offset = end;
-    }
-    if offset != data.len() {
-        return Err(RequestFailure::Abort(ErrorCode::Internal));
-    }
-    Ok(())
 }
 
 fn read_file_path<Memory: SharedMemory>(
@@ -1411,6 +1531,7 @@ mod tests {
         test_channel_continues_after_recoverable_request_failure(&broker);
         test_channel_aborts_on_stale_shared_buffer_request(&broker);
         test_channel_aborts_without_response_on_shared_memory_failure(&broker);
+        setup_failure_transfers_process_to_the_deployment_owner(&broker);
         test_channel_rejects_incompatible_shared_buffer_layout(&broker);
         active_request_allocates_and_releases_thread_id(&broker);
         active_request_closes_object_reference(&broker);
@@ -1423,6 +1544,42 @@ mod tests {
         association_executes_distinct_slots_concurrently(&broker);
         association_allows_slot_reuse_during_response_emission(&broker);
         association_allows_out_of_order_responses(&broker);
+        association_preserves_the_initiating_failure(&broker);
+    }
+
+    fn setup_failure_transfers_process_to_the_deployment_owner(broker: &BrokerCore) {
+        let mut channel = FakeHostControlChannel::new(
+            std::vec::Vec::from([Ok(HostReceive::Message(BrokerHandshakeRequest {
+                protocol_version: BROKER_PROTOCOL_VERSION,
+            }))]),
+            std::vec::Vec::new(),
+        );
+        let shared_buffers = test_shared_buffers();
+        let retained = Mutex::new(None);
+
+        assert!(matches!(
+            setup_connection(
+                broker,
+                None,
+                None,
+                &mut channel,
+                &shared_buffers,
+                test_readiness_sink(),
+                |process| {
+                    *retained.lock().unwrap() = Some(Arc::clone(process));
+                    true
+                },
+                |_| Err(()),
+            ),
+            Err(BrokerHostError::Channel(()))
+        ));
+
+        let process = retained
+            .into_inner()
+            .unwrap()
+            .expect("deployment owner must retain the negotiated process");
+        assert!(!process.is_running());
+        process.cleanup(true);
     }
 
     fn association_shared_buffer_sequences_stage_file_data(broker: &BrokerCore) {
@@ -1734,6 +1891,8 @@ mod tests {
             BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
                 process_id: root_process_id(1),
+                initial_thread_id: ThreadId(2),
+                startup: None,
             }
         );
         let handle = match &channel.results[0] {
@@ -1768,7 +1927,9 @@ mod tests {
                 },
                 BrokerHandshakeResponse::Negotiated {
                     broker_protocol_version: BROKER_PROTOCOL_VERSION,
-                    process_id: root_process_id(2),
+                    process_id: root_process_id(3),
+                    initial_thread_id: ThreadId(4),
+                    startup: None,
                 }
             ]
         );
@@ -1806,7 +1967,7 @@ mod tests {
                 .create_process(CallerCredential::Unauthenticated)
                 .unwrap()
                 .id(),
-            root_process_id(3)
+            root_process_id(5)
         );
     }
 
@@ -1841,7 +2002,9 @@ mod tests {
             channel.handshake_responses,
             [BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
-                process_id: root_process_id(4),
+                process_id: root_process_id(6),
+                initial_thread_id: ThreadId(7),
+                startup: None,
             }]
         );
         assert!(channel.results.is_empty());
@@ -2530,6 +2693,20 @@ mod tests {
         });
     }
 
+    fn association_preserves_the_initiating_failure(broker: &BrokerCore) {
+        let shared_buffers = test_shared_buffers();
+        let association = test_association(broker, &shared_buffers);
+
+        assert!(matches!(
+            association.execute_request(event_create_request(1), |_| Err::<(), _>(())),
+            Err(BrokerHostError::Channel(()))
+        ));
+        assert!(matches!(
+            association.execute_request(event_create_request(2), |_| Ok::<_, ()>(())),
+            Err(BrokerHostError::AssociationFailed)
+        ));
+    }
+
     fn test_association<'a, Memory: SharedMemory>(
         broker: &BrokerCore,
         shared_buffers: &'a SharedBufferPool<Memory>,
@@ -2627,14 +2804,20 @@ mod tests {
     ) -> Result<ConnectionTermination, ()> {
         let association = match setup_connection(
             broker,
+            None,
+            None,
             control_channel,
             shared_buffers,
             test_readiness_sink(),
+            |_| false,
             send_shared_memory,
         )? {
             Ok(association) => association,
             Err(termination) => return Ok(termination),
         };
+        association
+            .activate_process()
+            .expect("test broker process must activate once");
         let result = (|| {
             loop {
                 let request = match control_channel

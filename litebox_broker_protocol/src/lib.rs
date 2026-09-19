@@ -21,6 +21,7 @@ pub mod event;
 pub mod fs;
 pub mod message;
 pub mod pipe;
+pub mod process;
 pub mod random;
 pub mod readiness;
 pub mod shared_buffer;

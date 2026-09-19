@@ -68,13 +68,21 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         .broker_control_channel
         .as_deref()
         .context("file operations require --broker-control-channel")?;
+    let (connection, startup) = broker::connect(control_pipe)?;
+    if let Some(bootstrap) = startup {
+        anyhow::bail!(
+            "unsupported child Linux process bootstrap format {:?} version {:?}",
+            bootstrap.format,
+            bootstrap.version
+        );
+    }
     let broker::BrokerConnection {
         local,
         notifications,
-    } = broker::connect(control_pipe)?;
-    let process_id =
-        i32::try_from(local.process_id().0).context("process ID does not fit Linux pid_t")?;
-    let litebox = litebox::LiteBox::new_with_broker_local(platform, local);
+    } = connection;
+    let (litebox, process_id, initial_thread) =
+        litebox::LiteBox::new_process_with_broker_local(platform, local);
+    let process_id = i32::try_from(process_id.0).context("process ID does not fit Linux pid_t")?;
     broker::start_notification_receiver(
         notifications,
         litebox.broker_notification_dispatcher(),
@@ -109,7 +117,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     };
 
     let program = shim
-        .load_program(
+        .load_program_with_initial_thread(
             litebox_common_linux::TaskParams {
                 pid: process_id,
                 ppid: 0,
@@ -118,6 +126,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 euid: 1000,
                 egid: 1000,
             },
+            initial_thread,
             prog_path,
             argv,
             envp,

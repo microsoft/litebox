@@ -521,9 +521,12 @@ fn run_test_broker_connection(
         std::sync::Arc::new(litebox_broker_userland::readiness::ReadinessPublisherRuntime::new());
     let association = litebox_broker_host::setup_connection(
         broker,
+        None,
+        None,
         &mut channel,
         &shared_buffers,
         readiness.clone(),
+        |_| false,
         |channel| {
             channel.send_memfd(shared_buffers.memory(), Some(setup_deadline))?;
             channel.send_memfd(control_ring.memory(), Some(setup_deadline))

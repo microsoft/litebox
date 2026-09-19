@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result};
 use litebox_broker_local::{BrokerLocal, BrokerNotifications};
 use litebox_broker_protocol::message::BrokerNotification;
+use litebox_broker_protocol::process::ProcessStartupData;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport::control_ring::ControlRing;
 use litebox_broker_transport_windows_userland::control_ring::{
@@ -26,7 +27,7 @@ pub struct BrokerConnection {
 }
 
 /// Connects to and negotiates an association with a Windows-userland broker.
-pub fn connect(control_pipe: &OsStr) -> Result<BrokerConnection> {
+pub fn connect(control_pipe: &OsStr) -> Result<(BrokerConnection, Option<ProcessStartupData>)> {
     let deadline = Instant::now() + SETUP_TIMEOUT;
     let setup =
         WindowsNamedPipeLocalSetupChannel::connect_with_setup_deadline(control_pipe, deadline)
@@ -36,7 +37,7 @@ pub fn connect(control_pipe: &OsStr) -> Result<BrokerConnection> {
                     std::path::Path::new(control_pipe).display()
                 )
             })?;
-    let (local, notifications) = BrokerLocal::negotiate(setup, |mut setup| {
+    let (local, startup, notifications) = BrokerLocal::negotiate(setup, |mut setup| {
         let shared_memory = Arc::new(setup.receive_shared_memory(SHARED_BUFFER_POOL_SIZE)?);
         let control_memory = setup.receive_control_ring()?;
         let control_ring = ControlRing::new(control_memory).map_err(|error| {
@@ -49,10 +50,13 @@ pub fn connect(control_pipe: &OsStr) -> Result<BrokerConnection> {
         Ok((calls, shared_memory, notifications))
     })
     .context("broker negotiation failed")?;
-    Ok(BrokerConnection {
-        local,
-        notifications: BrokerNotifications::new(notifications),
-    })
+    Ok((
+        BrokerConnection {
+            local,
+            notifications: BrokerNotifications::new(notifications),
+        },
+        startup,
+    ))
 }
 
 /// Starts the broker notification receiver for an active association.

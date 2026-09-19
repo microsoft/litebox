@@ -20,7 +20,7 @@ pub struct CliArgs {
     /// The program and arguments passed to it (e.g., `/app/program.exe --help`).
     ///
     /// The program path refers to a path inside the broker-owned file system.
-    #[arg(required = true, trailing_var_arg = true, value_hint = clap::ValueHint::CommandWithArguments)]
+    #[arg(trailing_var_arg = true, value_hint = clap::ValueHint::CommandWithArguments)]
     pub program_and_arguments: Vec<String>,
     /// Environment variables passed to the program (`K=V` pairs; can be invoked multiple times).
     #[arg(long = "env")]
@@ -54,19 +54,28 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         )
         .init();
 
-    let platform = WindowsUserland::new();
-    WindowsUserland::set_guest_tls_mode(GuestTlsMode::Windows);
     let control_pipe = cli_args
         .broker_control_channel
         .as_deref()
         .context("file operations require --broker-control-channel")?;
+    let (connection, startup) = broker::connect(control_pipe)?;
+    if let Some(bootstrap) = startup {
+        anyhow::bail!(
+            "unsupported child Windows process bootstrap format {:?} version {:?}",
+            bootstrap.format,
+            bootstrap.version
+        );
+    }
+
+    let platform = WindowsUserland::new();
+    WindowsUserland::set_guest_tls_mode(GuestTlsMode::Windows);
     let broker::BrokerConnection {
         local,
         notifications,
-    } = broker::connect(control_pipe)?;
-    let process_id = local.process_id().0 as usize;
-    let litebox = litebox::LiteBox::new_with_broker_local(platform, local);
-    let initial_thread = litebox.create_thread()?;
+    } = connection;
+    let (litebox, process_id, initial_thread) =
+        litebox::LiteBox::new_process_with_broker_local(platform, local);
+    let process_id = process_id.0 as usize;
     broker::start_notification_receiver(
         notifications,
         litebox.broker_notification_dispatcher(),
@@ -83,7 +92,7 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
     let (program_path, program_args) = cli_args
         .program_and_arguments
         .split_first()
-        .context("program path missing — clap should have required at least one argument")?;
+        .context("program path missing")?;
 
     let shim = shim_builder.build();
     let argv = std::iter::once(program_path.as_str())

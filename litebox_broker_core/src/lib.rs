@@ -301,7 +301,7 @@ impl BrokerCore {
         Ok((first, second))
     }
 
-    /// Allocates and registers one authenticated broker process.
+    /// Allocates one authenticated process awaiting association activation.
     ///
     /// # Panics
     ///
@@ -320,12 +320,7 @@ impl BrokerCore {
             .map_err(|_| BrokerError::OutOfMemory)?;
         let raw_id = self.ids.lock().allocate()?;
         let id = ProcessId(raw_id);
-        let process = Arc::new(BrokerProcess::new(
-            self.clone(),
-            id,
-            None,
-            caller_credential,
-        ));
+        let process = Arc::new(BrokerProcess::new(self.clone(), id, caller_credential));
         assert!(
             processes.insert(id, Arc::downgrade(&process)).is_none(),
             "the ID allocator returned an occupied process ID"

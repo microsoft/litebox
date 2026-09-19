@@ -45,7 +45,7 @@ pub(crate) fn litebox_with_limits(
 ) -> (litebox::LiteBox<TestPlatform>, i32) {
     let setup = InProcessBrokerSetup::new(test_broker(limits).clone());
     let readiness = setup.readiness_sink();
-    let (broker_local, ()) = BrokerLocal::negotiate(setup, |setup| {
+    let (broker_local, _startup, ()) = BrokerLocal::negotiate(setup, |setup| {
         let memory = setup.shared_memory();
         Ok((setup.activate(), memory, ()))
     })

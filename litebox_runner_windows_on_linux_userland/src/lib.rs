@@ -80,18 +80,27 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         .broker_control_channel
         .as_deref()
         .context("file operations require --broker-control-channel")?;
+    let (connection, startup) =
+        litebox_platform_linux_userland::with_guest_signals_blocked(|| {
+            broker::connect(control_socket)
+        })?;
+    if let Some(bootstrap) = startup {
+        return Err(anyhow::anyhow!(
+            "unsupported child Windows process bootstrap format {:?} version {:?}",
+            bootstrap.format,
+            bootstrap.version
+        ));
+    }
     let broker::BrokerConnection {
         local,
         notifications,
         coordinator,
         positional_io_fds: _broker_positional_io_fds,
         shutdown_fd: _broker_shutdown_fd,
-    } = litebox_platform_linux_userland::with_guest_signals_blocked(|| {
-        broker::connect(control_socket)
-    })?;
-    let process_id = local.process_id().0 as usize;
-    let litebox = litebox::LiteBox::new_with_broker_local(platform, local);
-    let initial_thread = litebox.create_thread()?;
+    } = connection;
+    let (litebox, process_id, initial_thread) =
+        litebox::LiteBox::new_process_with_broker_local(platform, local);
+    let process_id = process_id.0 as usize;
     coordinator.install_dispatch(litebox.broker_failure_dispatcher());
     litebox_platform_linux_userland::with_guest_signals_blocked(|| {
         broker::start_notification_receiver(
