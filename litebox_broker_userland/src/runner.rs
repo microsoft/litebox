@@ -109,25 +109,11 @@ enum RunnerShutdownState {
     Retired,
 }
 
+#[derive(Default)]
 struct RunnerCompletion {
     runner_signal: Option<i32>,
     runner_exit_code: Option<i32>,
-    termination_provenance: TerminationProvenance,
-    association_panicked: bool,
-    shutdown_observation_failed: bool,
-}
-
-#[derive(Clone, Copy, Default)]
-struct TerminationProvenance(bool);
-
-impl TerminationProvenance {
-    const fn new(broker_termination: bool) -> Self {
-        Self(broker_termination)
-    }
-
-    const fn broker_termination(self) -> bool {
-        self.0
-    }
+    broker_termination: bool,
 }
 
 impl RunnerShutdown {
@@ -258,7 +244,6 @@ impl RunnerInstance {
         self.shutdown.retire();
         let runner_status = wait_for_runner_exit(&self.runner);
         let root_abnormal = association_result.abnormal
-            || association_result.panicked
             || runner_exited.is_err()
             || runner_status.is_err()
             || runner_status.as_ref().is_ok_and(|status| {
@@ -268,12 +253,12 @@ impl RunnerInstance {
                 ) || runner_exit_code_is_crash(status.code())
             });
         if let Some(process) = association_result.process.take() {
-            let process_id = process.id();
             if root_abnormal {
                 process.mark_abnormal();
             }
             process.retire(!root_abnormal);
-            launcher.wait_for_drain(process_id);
+            drop(process);
+            launcher.wait_for_drain();
         }
         let runner_status = runner_status?;
         runner_exited?;
@@ -295,30 +280,25 @@ impl RunnerInstance {
         if association_result.abnormal {
             process.mark_abnormal();
         }
-        let runner_exited = if !shutdown_was_expected
-            && !association_result.abnormal
-            && !association_result.panicked
-        {
+        let runner_exited = if !shutdown_was_expected && !association_result.abnormal {
             self.shutdown
                 .wait_for_exit(PROCESS_EXIT_OBSERVATION_TIMEOUT)
         } else {
             self.shutdown.has_exited()
         };
-        let shutdown_observation_failed = match runner_exited {
-            Ok(true) => false,
+        match runner_exited {
+            Ok(true) => {}
             Ok(false) => {
                 if !shutdown_was_expected {
                     process.mark_abnormal();
                 }
-                process.request_shutdown(true);
-                false
+                self.shutdown.shutdown();
             }
             Err(_) => {
                 process.mark_abnormal();
-                process.request_shutdown(true);
-                true
+                self.shutdown.shutdown();
             }
-        };
+        }
         self.shutdown.retire();
         let runner_status = wait_for_runner_exit(&self.runner);
         if runner_status.is_err() {
@@ -330,14 +310,10 @@ impl RunnerInstance {
             .copied()
             .and_then(runner_exit_signal);
         let runner_exit_code = runner_status.as_ref().ok().and_then(ExitStatus::code);
-        let termination_provenance =
-            TerminationProvenance::new(self.shutdown.termination_was_dispatched());
         RunnerCompletion {
             runner_signal,
             runner_exit_code,
-            termination_provenance,
-            association_panicked: association_result.panicked,
-            shutdown_observation_failed,
+            broker_termination: self.shutdown.termination_was_dispatched(),
         }
     }
 }

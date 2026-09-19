@@ -25,7 +25,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use litebox_broker_core::{BrokerCore, BrokerProcess, ProcessControl};
+use litebox_broker_core::{BrokerCore, BrokerProcess};
 use litebox_broker_host::{
     BrokerHostAssociation, BrokerHostError, ConnectionTermination, setup_connection,
 };
@@ -49,8 +49,12 @@ const REQUEST_QUEUE_STALL_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) struct AssociationOutcome {
     pub(crate) result: IoResult<()>,
     pub(crate) process: Option<Arc<BrokerProcess>>,
-    pub(crate) panicked: bool,
     pub(crate) abnormal: bool,
+}
+
+struct AssociationDispatchOutcome {
+    result: IoResult<()>,
+    abnormal: bool,
 }
 
 pub(crate) fn is_peer_closed_error(error: &IoError) -> bool {
@@ -112,9 +116,8 @@ where
         None,
         None,
         None,
-        None,
-        None,
     )
+    .and_then(|outcome| outcome.result)
 }
 
 /// Serves an initial or parent-started association for an out-of-process runner.
@@ -148,12 +151,10 @@ where
     NotificationChannel: HostNotificationChannel<Error = IoError> + Send,
     Shutdown: HostAssociationShutdown<Error = IoError> + Send + Sync + 'static,
 {
-    let panicked = AtomicBool::new(false);
-    let abnormal = AtomicBool::new(false);
-    let process = Mutex::new(None);
+    let mut process = None;
     let defer_process_finish = startup.is_none();
     let broker = launcher.broker();
-    let result = serve_association_inner(
+    let outcome = serve_association_inner(
         &broker,
         control_channel,
         create_shared_memory,
@@ -162,18 +163,19 @@ where
         activate,
         Some(launcher),
         startup,
-        Some(&panicked),
-        Some(&abnormal),
-        defer_process_finish.then_some(&process),
+        defer_process_finish.then_some(&mut process),
     );
+    let (result, abnormal) = match outcome {
+        Ok(outcome) => (outcome.result, outcome.abnormal),
+        Err(error) => (Err(error), false),
+    };
     let result_is_abnormal = result
         .as_ref()
         .is_err_and(|error| !is_peer_closed_error(error));
     AssociationOutcome {
         result,
-        process: process.into_inner().expect("runner process mutex poisoned"),
-        panicked: panicked.load(Ordering::Acquire),
-        abnormal: abnormal.load(Ordering::Acquire) || result_is_abnormal,
+        process,
+        abnormal: abnormal || result_is_abnormal,
     }
 }
 
@@ -197,10 +199,8 @@ fn serve_association_inner<
     ) -> IoResult<(RequestSource, ResponseSink, NotificationChannel, Shutdown)>,
     launcher: Option<Arc<RunnerLauncher>>,
     startup: Option<RunnerStartup>,
-    panicked_out: Option<&AtomicBool>,
-    abnormal_out: Option<&AtomicBool>,
-    process_out: Option<&Mutex<Option<Arc<BrokerProcess>>>>,
-) -> IoResult<()>
+    process_out: Option<&mut Option<Arc<BrokerProcess>>>,
+) -> IoResult<AssociationDispatchOutcome>
 where
     Memory: ControlRingMemory,
     SetupChannel: HostSetupChannel<Error = IoError>,
@@ -210,6 +210,7 @@ where
     Shutdown: HostAssociationShutdown<Error = IoError> + Send + Sync + 'static,
 {
     let has_parent_startup = startup.is_some();
+    let retain_process = process_out.is_some();
     let (process, startup) = match startup {
         Some(startup) => {
             let (process, data) = startup.into_process_and_data();
@@ -235,7 +236,7 @@ where
             let Some(process_out) = process_out else {
                 return false;
             };
-            *process_out.lock().expect("runner process mutex poisoned") = Some(Arc::clone(process));
+            *process_out = Some(Arc::clone(process));
             true
         },
         |channel| send_shared_memory(channel, shared_buffers.memory(), control_ring.memory()),
@@ -266,13 +267,13 @@ where
         match activate(control_channel, control_ring) {
             Ok(active) => active,
             Err(error) => {
-                if !has_parent_startup && process_out.is_none() {
+                if !has_parent_startup && !retain_process {
                     association.finish();
                 }
                 return Err(error);
             }
         };
-    dispatch_requests(
+    Ok(dispatch_requests(
         association,
         readiness,
         request_source,
@@ -280,10 +281,8 @@ where
         notification_channel,
         shutdown,
         launcher,
-        !has_parent_startup && process_out.is_none(),
-        panicked_out,
-        abnormal_out,
-    )
+        !has_parent_startup && !retain_process,
+    ))
 }
 
 /// Maps a host setup or request failure to a precise [`std::io::Error`].
@@ -466,9 +465,7 @@ fn dispatch_requests<Memory, RequestSource, ResponseSink, NotificationChannel, S
     shutdown: Shutdown,
     launcher: Option<Arc<RunnerLauncher>>,
     finish_process: bool,
-    panicked_out: Option<&AtomicBool>,
-    abnormal_out: Option<&AtomicBool>,
-) -> IoResult<()>
+) -> AssociationDispatchOutcome
 where
     Memory: SharedMemory,
     RequestSource: HostRequestSource<Error = IoError>,
@@ -478,23 +475,14 @@ where
 {
     let association = Arc::new(association);
     let failure_coordinator = Arc::new(HostAssociationFailureCoordinator::new(shutdown));
-    let association_failure = launcher.as_ref().map(|_| {
-        let association_failure = Arc::clone(&failure_coordinator);
-        let association_failure: ProcessControl = Arc::new(move || {
-            association_failure.report(IoError::new(
-                ErrorKind::ConnectionAborted,
-                "process association terminated by process-start control",
-            ));
-        });
-        association_failure
-    });
-    association
-        .activate_process(association_failure)
-        .map_err(|error| {
-            IoError::other(format!(
+    if let Err(error) = association.activate_process() {
+        return AssociationDispatchOutcome {
+            result: Err(IoError::other(format!(
                 "failed to activate broker process association: {error}"
-            ))
-        })?;
+            ))),
+            abnormal: true,
+        };
+    }
     let (request_sender, request_receiver) = sync_channel(REQUEST_QUEUE_CAPACITY);
     let request_receiver = Arc::new(Mutex::new(request_receiver));
 
@@ -593,18 +581,13 @@ where
         panic!("all broker association workers must be joined before teardown");
     };
     let panicked = failure_coordinator.panicked();
-    if let Some(panicked_out) = panicked_out {
-        panicked_out.store(panicked, Ordering::Release);
-    }
-    if let Some(abnormal_out) = abnormal_out {
-        abnormal_out.store(failure_coordinator.abnormal(), Ordering::Release);
-    }
+    let abnormal = failure_coordinator.abnormal();
     if panicked || !finish_process {
         drop(association);
     } else {
         association.finish();
     }
-    result
+    AssociationDispatchOutcome { result, abnormal }
 }
 
 fn read_requests<RequestSource, Shutdown>(
@@ -715,7 +698,6 @@ fn run_worker<Memory, ResponseSink, Shutdown>(
                     })
                 },
                 |response| response_sink.send_response(response),
-                |_, _| {},
             )
         })) {
             Ok(Ok(()) | Err(BrokerHostError::AssociationFailed)) => {}
@@ -950,18 +932,19 @@ mod tests {
                 control.into_active(control_ring).unwrap();
             started.recv().unwrap();
             outcome_sender
-                .send(dispatch_requests(
-                    association,
-                    readiness,
-                    request_source,
-                    response_sink,
-                    notifications,
-                    shutdown,
-                    None,
-                    true,
-                    None,
-                    None,
-                ))
+                .send(
+                    dispatch_requests(
+                        association,
+                        readiness,
+                        request_source,
+                        response_sink,
+                        notifications,
+                        shutdown,
+                        None,
+                        true,
+                    )
+                    .result,
+                )
                 .unwrap();
         });
         let (local, notifications, shutdown) = negotiate_local(local_stream);

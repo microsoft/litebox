@@ -82,7 +82,6 @@ fn serve_association(
             return AssociationOutcome {
                 result: Err(error),
                 process: None,
-                panicked: false,
                 abnormal,
             };
         }

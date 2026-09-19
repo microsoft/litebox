@@ -8,18 +8,18 @@ use std::time::{Duration, Instant};
 
 use litebox_broker_core::{BrokerCore, BrokerError, BrokerProcess, ProcessLifecycleSink};
 use litebox_broker_host::{RequestFailure, read_shared_buffer};
+use litebox_broker_protocol::ThreadId;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult};
 use litebox_broker_protocol::process::{
     InheritedProcessObjects, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessBootstrapFormat,
     ProcessBootstrapVersion, ProcessIdentity, ProcessStartupData,
 };
-use litebox_broker_protocol::{ProcessId, ThreadId};
 use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemory};
 
 use super::{
-    RunnerCompletion, RunnerConfig, RunnerInstance, TerminationProvenance,
-    runner_exit_code_is_crash, runner_signal_is_abnormal,
+    RunnerCompletion, RunnerConfig, RunnerInstance, runner_exit_code_is_crash,
+    runner_signal_is_abnormal,
 };
 
 const PROCESS_START_TIMEOUT: Duration = Duration::from_secs(5);
@@ -48,68 +48,54 @@ impl RunnerStartup {
 
 #[derive(Default)]
 struct ProcessLifecycleRuntime {
-    generation: Mutex<u64>,
+    state: Mutex<()>,
     changed: Condvar,
 }
 
 impl ProcessLifecycleSink for ProcessLifecycleRuntime {
-    fn state_changed(&self, _process_id: ProcessId) {
-        self.notify();
-    }
-
-    fn retired(&self, _process_id: ProcessId) {
+    fn changed(&self) {
         self.notify();
     }
 }
 
 impl ProcessLifecycleRuntime {
     fn notify(&self) {
-        let mut generation = self
-            .generation
-            .lock()
-            .expect("process lifecycle mutex poisoned");
-        *generation = generation.wrapping_add(1);
+        let _state = self.state.lock().expect("process lifecycle mutex poisoned");
         self.changed.notify_all();
     }
 
     fn wait_for_start(&self, process: &BrokerProcess, timeout: Duration) -> Result<(), ErrorCode> {
         let deadline = Instant::now() + timeout;
-        let mut generation = self
-            .generation
-            .lock()
-            .expect("process lifecycle mutex poisoned");
+        let mut state = self.state.lock().expect("process lifecycle mutex poisoned");
         loop {
             if let Some(result) = process.startup_result() {
                 return result.map_err(ErrorCode::from);
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                drop(generation);
+                drop(state);
                 process.fail_start(BrokerError::Internal, true, true);
                 return Err(ErrorCode::Internal);
             }
-            let (next_generation, wait_result) = self
+            let (next_state, wait_result) = self
                 .changed
-                .wait_timeout(generation, remaining)
+                .wait_timeout(state, remaining)
                 .expect("process lifecycle mutex poisoned");
-            generation = next_generation;
+            state = next_state;
             if wait_result.timed_out() && process.startup_result().is_none() {
-                drop(generation);
+                drop(state);
                 process.fail_start(BrokerError::Internal, true, true);
                 return Err(ErrorCode::Internal);
             }
         }
     }
 
-    fn wait_for_drain(&self, broker: &BrokerCore, root_process_id: ProcessId) {
-        let mut generation = self
-            .generation
-            .lock()
-            .expect("process lifecycle mutex poisoned");
-        while broker.has_processes_other_than(root_process_id) {
-            generation = self
+    fn wait_for_drain(&self, broker: &BrokerCore) {
+        let mut state = self.state.lock().expect("process lifecycle mutex poisoned");
+        while broker.has_processes() {
+            state = self
                 .changed
-                .wait(generation)
+                .wait(state)
                 .expect("process lifecycle mutex poisoned");
         }
     }
@@ -220,26 +206,8 @@ impl RunnerLauncher {
                 }));
                 let (result, thread_panicked) = match outcome {
                     Ok(Ok(result)) => (result, false),
-                    Ok(Err(_error)) => (
-                        RunnerCompletion {
-                            runner_signal: None,
-                            runner_exit_code: None,
-                            termination_provenance: TerminationProvenance::default(),
-                            association_panicked: false,
-                            shutdown_observation_failed: false,
-                        },
-                        false,
-                    ),
-                    Err(_) => (
-                        RunnerCompletion {
-                            runner_signal: None,
-                            runner_exit_code: None,
-                            termination_provenance: TerminationProvenance::default(),
-                            association_panicked: false,
-                            shutdown_observation_failed: false,
-                        },
-                        true,
-                    ),
+                    Ok(Err(_error)) => (RunnerCompletion::default(), false),
+                    Err(_) => (RunnerCompletion::default(), true),
                 };
                 Self::runner_finished(&completion_process, result, thread_panicked);
             });
@@ -258,21 +226,17 @@ impl RunnerLauncher {
     }
 
     fn runner_finished(process: &BrokerProcess, result: RunnerCompletion, thread_panicked: bool) {
-        let unexpected_crash = runner_signal_is_abnormal(
-            result.runner_signal,
-            result.termination_provenance.broker_termination(),
-        );
+        let unexpected_crash =
+            runner_signal_is_abnormal(result.runner_signal, result.broker_termination);
         let abnormal = thread_panicked
-            || result.association_panicked
-            || result.shutdown_observation_failed
             || unexpected_crash
             || runner_exit_code_is_crash(result.runner_exit_code);
         process.fail_start(BrokerError::PeerClosed, abnormal, false);
         process.retire(!abnormal);
     }
 
-    pub(super) fn wait_for_drain(&self, root_process_id: ProcessId) {
-        self.lifecycle.wait_for_drain(&self.broker, root_process_id);
+    pub(super) fn wait_for_drain(&self) {
+        self.lifecycle.wait_for_drain(&self.broker);
     }
 }
 

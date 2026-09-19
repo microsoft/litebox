@@ -19,15 +19,12 @@ use spin::{Mutex, rwlock::RwLock};
 
 /// Platform-provided notification destination for broker-process lifecycle changes.
 pub trait ProcessLifecycleSink: Send + Sync {
-    /// Wakes waiters after a process startup state changes.
-    fn state_changed(&self, process_id: ProcessId);
-
-    /// Wakes drain waiters after a process is removed from broker authority.
-    fn retired(&self, process_id: ProcessId);
+    /// Wakes waiters after authoritative process state changes.
+    fn changed(&self);
 }
 
-/// Host control action installed into a broker process.
-pub type ProcessControl = Arc<dyn Fn() + Send + Sync>;
+/// Host runner shutdown action installed into a broker process.
+pub type ProcessShutdown = Arc<dyn Fn() + Send + Sync>;
 
 /// Caller identity information supplied by the broker entry layer.
 ///
@@ -142,8 +139,7 @@ struct BrokerProcessState {
     startup: ProcessStartupState,
     retirement: ProcessRetirement,
     shutdown_request: ProcessShutdownRequest,
-    shutdown: Option<ProcessControl>,
-    association_failure: Option<ProcessControl>,
+    shutdown: Option<ProcessShutdown>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -205,7 +201,6 @@ impl BrokerProcess {
                 retirement: ProcessRetirement::Active { abnormal: false },
                 shutdown_request: ProcessShutdownRequest::None,
                 shutdown: None,
-                association_failure: None,
             }),
             caller_credential,
             references: Mutex::new(ProcessReferences {
@@ -223,12 +218,6 @@ impl BrokerProcess {
     #[must_use]
     pub const fn id(&self) -> ProcessId {
         self.id
-    }
-
-    /// Returns the process that requested this process, if any.
-    #[must_use]
-    pub const fn parent_id(&self) -> Option<ProcessId> {
-        self.parent_id
     }
 
     /// Returns the credential authenticated for this process association.
@@ -256,11 +245,6 @@ impl BrokerProcess {
 
     /// Completes startup after the process association becomes active.
     pub fn complete_start(&self) -> Result<()> {
-        self.activate(None)
-    }
-
-    /// Installs association control and completes process startup.
-    pub fn activate(&self, association_failure: Option<ProcessControl>) -> Result<()> {
         {
             let mut state = self.state.lock();
             if !matches!(state.retirement, ProcessRetirement::Active { .. }) {
@@ -271,18 +255,14 @@ impl BrokerProcess {
                 ProcessStartupState::Running => return Err(BrokerError::Internal),
                 ProcessStartupState::Failed(error) => return Err(error),
             }
-            if state.association_failure.is_some() {
-                return Err(BrokerError::Internal);
-            }
-            state.association_failure = association_failure;
             state.startup = ProcessStartupState::Running;
         }
-        self.core.process_lifecycle_sink.state_changed(self.id);
+        self.core.process_lifecycle_sink.changed();
         Ok(())
     }
 
     /// Installs the host runner termination action.
-    pub fn install_shutdown(&self, shutdown: ProcessControl) {
+    pub fn install_shutdown(&self, shutdown: ProcessShutdown) {
         let shutdown = {
             let mut state = self.state.lock();
             state.shutdown = Some(Arc::clone(&shutdown));
@@ -293,9 +273,9 @@ impl BrokerProcess {
         }
     }
 
-    /// Fails pending startup and requests runner and association termination.
+    /// Fails pending startup and requests runner termination.
     pub fn fail_start(&self, error: BrokerError, abnormal: bool, expected_shutdown: bool) {
-        let (association_failure, shutdown) = {
+        let shutdown = {
             let mut state = self.state.lock();
             if abnormal {
                 state.retirement.mark_abnormal();
@@ -311,47 +291,9 @@ impl BrokerProcess {
                     ProcessShutdownRequest::Unexpected
                 };
             }
-            (state.association_failure.clone(), state.shutdown.clone())
-        };
-        self.core.process_lifecycle_sink.state_changed(self.id);
-        if let Some(association_failure) = association_failure {
-            association_failure();
-        }
-        if let Some(shutdown) = shutdown {
-            shutdown();
-        }
-    }
-
-    /// Records that the current association is ending.
-    pub fn association_ending(&self) {
-        let changed = {
-            let mut state = self.state.lock();
-            state.association_failure = None;
-            if matches!(state.startup, ProcessStartupState::Starting) {
-                state.startup = ProcessStartupState::Failed(BrokerError::PeerClosed);
-                true
-            } else {
-                false
-            }
-        };
-        if changed {
-            self.core.process_lifecycle_sink.state_changed(self.id);
-        }
-    }
-
-    /// Requests runner termination.
-    pub fn request_shutdown(&self, expected: bool) {
-        let shutdown = {
-            let mut state = self.state.lock();
-            if state.shutdown_request == ProcessShutdownRequest::None {
-                state.shutdown_request = if expected {
-                    ProcessShutdownRequest::Expected
-                } else {
-                    ProcessShutdownRequest::Unexpected
-                };
-            }
             state.shutdown.clone()
         };
+        self.core.process_lifecycle_sink.changed();
         if let Some(shutdown) = shutdown {
             shutdown();
         }
@@ -374,9 +316,7 @@ impl BrokerProcess {
             let mut state = self.state.lock();
             state.retirement.retire(release_ids);
             state.shutdown = None;
-            state.association_failure = None;
         }
-        self.core.process_lifecycle_sink.state_changed(self.id);
     }
 
     /// Fails every child process that is still awaiting association activation.
@@ -971,7 +911,7 @@ impl BrokerProcess {
             }
             ids.release(self.id.0);
         }
-        self.core.process_lifecycle_sink.retired(self.id);
+        self.core.process_lifecycle_sink.changed();
     }
 }
 
@@ -1080,13 +1020,13 @@ mod tests {
         BrokerCore, BrokerCoreLimits, BrokerError, CallerCredential, ObjectRights, PolicyEngine,
         SocketPolicy,
     };
+    use litebox_broker_protocol::ObjectHandle;
     use litebox_broker_protocol::event::{EventConsumeMode, EventConsumption};
     use litebox_broker_protocol::fs::{
         FileAccessMode, FileError, FileMode, FileOpenFlags, FileSeekWhence, FileType, FileUser,
     };
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_protocol::stdio::StdioOutputStream;
-    use litebox_broker_protocol::{ObjectHandle, ProcessId};
     use std::{sync::Arc, vec, vec::Vec};
 
     const TEST_MAX_REFERENCES: usize = 4;
@@ -1097,17 +1037,12 @@ mod tests {
 
     #[derive(Default)]
     struct TestProcessLifecycleSink {
-        state_changes: AtomicUsize,
-        retirements: AtomicUsize,
+        changes: AtomicUsize,
     }
 
     impl ProcessLifecycleSink for TestProcessLifecycleSink {
-        fn state_changed(&self, _process_id: ProcessId) {
-            self.state_changes.fetch_add(1, Ordering::Relaxed);
-        }
-
-        fn retired(&self, _process_id: ProcessId) {
-            self.retirements.fetch_add(1, Ordering::Relaxed);
+        fn changed(&self) {
+            self.changes.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1207,7 +1142,7 @@ mod tests {
 
         parent.fail_starting_children();
 
-        assert_eq!(child.parent_id(), Some(parent.id()));
+        assert_eq!(child.parent_id, Some(parent.id()));
         assert_eq!(child.startup_result(), Some(Err(BrokerError::PeerClosed)));
         assert_eq!(child.complete_start(), Err(BrokerError::PeerClosed));
         assert_eq!(shutdowns.load(Ordering::Relaxed), 1);
@@ -1235,12 +1170,11 @@ mod tests {
             broker.create_process(CallerCredential::Unauthenticated, None),
             Err(BrokerError::ResourceExhausted)
         ));
-        assert_eq!(sink.state_changes.load(Ordering::Relaxed), 2);
-        assert_eq!(sink.retirements.load(Ordering::Relaxed), 0);
+        assert_eq!(sink.changes.load(Ordering::Relaxed), 1);
 
         drop(retained);
 
-        assert_eq!(sink.retirements.load(Ordering::Relaxed), 1);
+        assert_eq!(sink.changes.load(Ordering::Relaxed), 2);
         assert!(
             broker
                 .create_process(CallerCredential::Unauthenticated, None)

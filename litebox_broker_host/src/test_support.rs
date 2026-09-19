@@ -66,7 +66,7 @@ impl InProcessBrokerSetup {
             .take()
             .expect("the in-process local endpoint must negotiate before activation");
         association
-            .activate_process(None)
+            .activate_process()
             .expect("the in-process broker process must activate once");
         InProcessBrokerChannel {
             association: Some(association),

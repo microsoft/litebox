@@ -24,7 +24,7 @@ extern crate std;
 use alloc::{sync::Arc, vec::Vec};
 
 use litebox_broker_core::readiness::ReadinessSink;
-use litebox_broker_core::{BrokerCore, BrokerProcess, CallerCredential, ProcessControl};
+use litebox_broker_core::{BrokerCore, BrokerProcess, CallerCredential};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse};
 use litebox_broker_protocol::fs::{
@@ -111,29 +111,13 @@ impl<'a, Memory: SharedMemory> BrokerHostAssociation<'a, Memory> {
         }
     }
 
-    /// Returns the broker-assigned process ID for this association.
-    #[must_use]
-    pub fn process_id(&self) -> litebox_broker_protocol::ProcessId {
-        self.process.id()
-    }
-
-    /// Returns shared ownership of the broker process served by this association.
-    #[must_use]
-    pub fn process(&self) -> Arc<BrokerProcess> {
-        Arc::clone(&self.process)
-    }
-
     /// Marks the process running after deployment-specific association activation.
-    pub fn activate_process(
-        &self,
-        association_failure: Option<ProcessControl>,
-    ) -> litebox_broker_core::Result<()> {
-        self.process.activate(association_failure)
+    pub fn activate_process(&self) -> litebox_broker_core::Result<()> {
+        self.process.complete_start()
     }
 
     /// Records association teardown and fails children still awaiting activation.
     pub fn association_ending(&self) {
-        self.process.association_ending();
         self.process.fail_starting_children();
     }
 
@@ -161,7 +145,6 @@ impl<'a, Memory: SharedMemory> BrokerHostAssociation<'a, Memory> {
             request,
             |_process, _operation, _shared_buffers| None,
             send_response,
-            |_operation, _result| {},
         )
     }
 
@@ -178,13 +161,11 @@ impl<'a, Memory: SharedMemory> BrokerHostAssociation<'a, Memory> {
             &SharedBufferPool<Memory>,
         ) -> Option<core::result::Result<BrokerResult, RequestFailure>>,
         send_response: impl FnOnce(&BrokerResponse) -> core::result::Result<(), ChannelError>,
-        response_sent: impl FnOnce(&BrokerOperation, &BrokerResult),
     ) -> Result<(), ChannelError> {
         let BrokerRequest {
             request_id,
             operation,
         } = request;
-        let response_operation = operation.clone();
         let buffer_sequence = operation.shared_buffer();
 
         {
@@ -231,7 +212,6 @@ impl<'a, Memory: SharedMemory> BrokerHostAssociation<'a, Memory> {
             self.state.lock().failed = true;
             return Err(BrokerHostError::Channel(error));
         }
-        response_sent(&response_operation, &response.result);
         Ok(())
     }
 }
@@ -2831,7 +2811,7 @@ mod tests {
             Err(termination) => return Ok(termination),
         };
         association
-            .activate_process(None)
+            .activate_process()
             .expect("test broker process must activate once");
         let result = (|| {
             loop {

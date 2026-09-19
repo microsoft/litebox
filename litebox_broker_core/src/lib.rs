@@ -52,7 +52,7 @@ pub use policy::{
 use process::ObjectReference;
 pub use process::{
     AssociationCancellation, BrokerProcess, BrokerThread, CallerCredential, ObjectRights,
-    ProcessControl, ProcessLifecycleSink,
+    ProcessLifecycleSink, ProcessShutdown,
 };
 use random::RandomProvider;
 use socket::{BrokerSocketPorts, SocketProvider};
@@ -222,9 +222,7 @@ static BROKER_CORE_CREATED: AtomicBool = AtomicBool::new(false);
 struct NoopProcessLifecycleSink;
 
 impl ProcessLifecycleSink for NoopProcessLifecycleSink {
-    fn state_changed(&self, _process_id: ProcessId) {}
-
-    fn retired(&self, _process_id: ProcessId) {}
+    fn changed(&self) {}
 }
 
 impl BrokerCore {
@@ -289,13 +287,10 @@ impl BrokerCore {
         }
     }
 
-    /// Returns whether a process other than `process_id` remains registered.
+    /// Returns whether any broker process remains registered.
     #[must_use]
-    pub fn has_processes_other_than(&self, process_id: ProcessId) -> bool {
-        self.processes
-            .read()
-            .keys()
-            .any(|candidate| *candidate != process_id)
+    pub fn has_processes(&self) -> bool {
+        !self.processes.read().is_empty()
     }
 
     /// Returns the configured authority-state limits.
