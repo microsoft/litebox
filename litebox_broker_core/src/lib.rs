@@ -303,9 +303,6 @@ impl BrokerCore {
 
     /// Allocates one authenticated process awaiting association activation.
     ///
-    /// The deployment must call [`BrokerProcess::complete_start`] after the
-    /// process association becomes active.
-    ///
     /// # Panics
     ///
     /// Panics if the shared ID allocator violates its range or uniqueness

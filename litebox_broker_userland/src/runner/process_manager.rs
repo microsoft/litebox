@@ -167,10 +167,9 @@ impl RunnerProcessManager {
             .broker
             .create_process(parent.caller_credential())
             .map_err(ErrorCode::from)?;
-        let inherited_objects = match parent.duplicate_object_references_to_preserving_rights(
-            requested_inherited_objects.as_slice(),
-            &process,
-        ) {
+        let inherited_objects = match parent
+            .duplicate_object_references_to(requested_inherited_objects.as_slice(), &process)
+        {
             Ok(inherited_objects) => inherited_objects,
             Err(error) => {
                 process.cleanup(true);
@@ -336,6 +335,7 @@ impl RunnerProcessManager {
         process_id: ProcessId,
         failure: AssociationFailure,
         has_parent_transaction: bool,
+        activate_process: impl FnOnce() -> Result<(), ErrorCode>,
     ) -> IoResult<()> {
         let transaction = {
             let mut state = self
@@ -362,23 +362,26 @@ impl RunnerProcessManager {
                 .find(|transaction| transaction.process.id() == process_id)
                 .cloned()
         };
-        if has_parent_transaction {
+        let activation = if has_parent_transaction {
             let Some(transaction) = transaction else {
                 self.unregister_association(process_id);
                 return Err(IoError::other("process has no pending parent transaction"));
             };
             transaction.install_association_failure(failure);
-            if let Err(error) = transaction.activate() {
-                self.unregister_association(process_id);
-                return Err(IoError::other(format!(
-                    "failed to activate broker process association: {error}"
-                )));
-            }
+            transaction.activate(activate_process)
         } else if transaction.is_some() {
             self.unregister_association(process_id);
             return Err(IoError::other(
                 "process without a parent transaction matched a pending transaction",
             ));
+        } else {
+            activate_process()
+        };
+        if let Err(error) = activation {
+            self.unregister_association(process_id);
+            return Err(IoError::other(format!(
+                "failed to activate broker process association: {error}"
+            )));
         }
         Ok(())
     }
@@ -512,7 +515,10 @@ impl ProcessStartTransaction {
         }
     }
 
-    fn activate(&self) -> Result<(), ErrorCode> {
+    fn activate(
+        &self,
+        activate_process: impl FnOnce() -> Result<(), ErrorCode>,
+    ) -> Result<(), ErrorCode> {
         let mut state = self
             .state
             .lock()
@@ -522,7 +528,7 @@ impl ProcessStartTransaction {
             ProcessStartPhase::Failed(error) => return Err(error),
             ProcessStartPhase::Running => return Err(ErrorCode::ProtocolState),
         }
-        match self.process.complete_start().map_err(ErrorCode::from) {
+        match activate_process() {
             Ok(()) => {
                 state.phase = ProcessStartPhase::Running;
                 self.changed.notify_all();
@@ -738,7 +744,10 @@ mod tests {
             waiting.wait_until_running(Instant::now() + Duration::from_secs(1))
         });
 
-        transaction.activate().unwrap();
+        let process = Arc::clone(&transaction.process);
+        transaction
+            .activate(move || process.complete_start().map_err(ErrorCode::from))
+            .unwrap();
         waiter.join().unwrap().unwrap();
         assert!(transaction.process.is_running());
         assert!(
@@ -771,7 +780,10 @@ mod tests {
 
         transaction.abort(ErrorCode::PeerClosed, false, true);
 
-        assert_eq!(transaction.activate(), Err(ErrorCode::PeerClosed));
+        assert_eq!(
+            transaction.activate(|| panic!("aborted transaction must not activate its process")),
+            Err(ErrorCode::PeerClosed)
+        );
         assert_eq!(
             transaction.wait_until_running(Instant::now() + Duration::from_secs(1)),
             Err(ErrorCode::PeerClosed)
@@ -827,12 +839,50 @@ mod tests {
             }),
             drained: Condvar::new(),
         };
+        let process = Arc::clone(&transaction.process);
         manager
-            .register_association(process_id, Arc::new(|| {}), true)
+            .register_association(process_id, Arc::new(|| {}), true, move || {
+                process.complete_start().map_err(ErrorCode::from)
+            })
             .unwrap();
 
         assert!(transaction.process.is_running());
         transaction.process.cleanup(true);
+    }
+
+    #[test]
+    fn association_registration_activates_process_without_parent_transaction() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let process_id = process.id();
+        let manager = RunnerProcessManager {
+            broker,
+            started_runner_config: RunnerConfig::new(PathBuf::new(), Vec::new()),
+            state: Mutex::new(RunnerProcessManagerState {
+                transactions: Vec::new(),
+                associations: Vec::new(),
+                active_instances: 0,
+            }),
+            drained: Condvar::new(),
+        };
+        let process_for_activation = Arc::clone(&process);
+
+        manager
+            .register_association(process_id, Arc::new(|| {}), false, move || {
+                process_for_activation
+                    .complete_start()
+                    .map_err(ErrorCode::from)
+            })
+            .unwrap();
+
+        assert!(process.is_running());
+        process.cleanup(true);
     }
 
     #[test]
@@ -849,10 +899,13 @@ mod tests {
             }),
             drained: Condvar::new(),
         };
+        let process = Arc::clone(&transaction.process);
 
         assert!(
             manager
-                .register_association(process_id, Arc::new(|| {}), true)
+                .register_association(process_id, Arc::new(|| {}), true, move || {
+                    process.complete_start().map_err(ErrorCode::from)
+                })
                 .is_err()
         );
         assert!(!transaction.process.is_running());

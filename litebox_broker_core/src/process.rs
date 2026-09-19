@@ -124,7 +124,7 @@ pub struct BrokerProcess {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ProcessState {
-    Attaching,
+    Starting,
     Running,
     Exiting,
 }
@@ -139,7 +139,7 @@ impl BrokerProcess {
         Self {
             core,
             id,
-            state: Mutex::new(ProcessState::Attaching),
+            state: Mutex::new(ProcessState::Starting),
             caller_credential,
             references: Mutex::new(ProcessReferences {
                 handles: Vec::new(),
@@ -174,7 +174,7 @@ impl BrokerProcess {
     pub fn complete_start(&self) -> Result<()> {
         let mut state = self.state.lock();
         match *state {
-            ProcessState::Attaching => {
+            ProcessState::Starting => {
                 *state = ProcessState::Running;
                 Ok(())
             }
@@ -183,12 +183,13 @@ impl BrokerProcess {
         }
     }
 
-    /// Duplicates object references into another process while preserving rights.
+    /// Duplicates object references into another process.
     ///
-    /// Returned handles follow the requested source order. If duplication
-    /// fails, references already created by this call are removed from the
-    /// target before the error is returned.
-    pub fn duplicate_object_references_to_preserving_rights(
+    /// Each duplicate retains its source reference's rights. Returned handles
+    /// follow the requested source order. If duplication fails, references
+    /// already created by this call are removed from the target before the
+    /// error is returned.
+    pub fn duplicate_object_references_to(
         &self,
         handles: &[ObjectHandle],
         target: &BrokerProcess,
@@ -198,7 +199,10 @@ impl BrokerProcess {
             .try_reserve_exact(handles.len())
             .map_err(|_| BrokerError::OutOfMemory)?;
         for handle in handles {
-            match self.duplicate_object_reference_to_preserving_rights(*handle, target) {
+            let duplicate = self
+                .object_reference_rights(*handle)
+                .and_then(|rights| self.duplicate_object_reference_to(*handle, target, rights));
+            match duplicate {
                 Ok(duplicate) => duplicates.push(duplicate),
                 Err(error) => {
                     for duplicate in duplicates.drain(..).rev() {
@@ -394,20 +398,13 @@ impl BrokerProcess {
         target.create_object_reference_with_rights(object, rights)
     }
 
-    fn duplicate_object_reference_to_preserving_rights(
-        &self,
-        handle: ObjectHandle,
-        target: &BrokerProcess,
-    ) -> Result<ObjectHandle> {
-        let rights = {
-            let references = self.core.references.read();
-            let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
-            if reference.owner != self.id {
-                return Err(BrokerError::UnknownObject);
-            }
-            reference.rights
-        };
-        self.duplicate_object_reference_to(handle, target, rights)
+    fn object_reference_rights(&self, handle: ObjectHandle) -> Result<ObjectRights> {
+        let references = self.core.references.read();
+        let reference = references.get(&handle).ok_or(BrokerError::UnknownObject)?;
+        if reference.owner != self.id {
+            return Err(BrokerError::UnknownObject);
+        }
+        Ok(reference.rights)
     }
 
     pub(crate) fn create_object_reference_pair(
@@ -925,7 +922,7 @@ mod tests {
         let source_handle = crate::event::create(&parent, 1).unwrap();
         let process = broker.create_process(parent.caller_credential()).unwrap();
         let inherited_objects = parent
-            .duplicate_object_references_to_preserving_rights(&[source_handle], &process)
+            .duplicate_object_references_to(&[source_handle], &process)
             .unwrap();
         let initial_thread_id = process.create_thread().unwrap();
         let inherited_handle = inherited_objects[0];
@@ -957,10 +954,8 @@ mod tests {
         let source_handle = crate::event::create(&source, 1).unwrap();
 
         assert_eq!(
-            source.duplicate_object_references_to_preserving_rights(
-                &[source_handle, ObjectHandle(u64::MAX)],
-                &target,
-            ),
+            source
+                .duplicate_object_references_to(&[source_handle, ObjectHandle(u64::MAX)], &target,),
             Err(BrokerError::UnknownObject)
         );
         assert!(target.references.lock().handles.is_empty());
@@ -971,7 +966,7 @@ mod tests {
     }
 
     #[test]
-    fn finished_attaching_process_releases_process_capacity() {
+    fn finished_starting_process_releases_process_capacity() {
         let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))

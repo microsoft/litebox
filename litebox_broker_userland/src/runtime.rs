@@ -512,13 +512,13 @@ where
             association.process_id(),
             association_failure,
             has_parent_transaction,
+            || association.activate_process().map_err(ErrorCode::from),
         )?;
     } else if has_parent_transaction {
         return Err(IoError::other(
             "a process with a parent transaction requires a process manager",
         ));
-    }
-    if !has_parent_transaction {
+    } else {
         association.activate_process().map_err(|error| {
             IoError::other(format!(
                 "failed to activate broker process association: {error}"
