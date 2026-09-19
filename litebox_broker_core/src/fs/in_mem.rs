@@ -293,20 +293,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         flags: super::OFlags,
     ) -> Result<super::backend::DirHandle, OpenError> {
         assert_supported_oflags(flags);
-        if flags.intersects(super::OFlags::WRONLY | super::OFlags::RDWR) {
-            // XXX(jayb): POSIX requires `EISDIR` when write access is requested on a directory, but
-            // `OpenError` has no such variant yet. Allowing write-mode directory handles here is a
-            // workaround for the Windows access-to-`OFlags` mapping introduced by PR #894
-            // (afe6cddc): Windows directory modification rights (such as `DELETE`) use write mode
-            // to trigger permission checks even though the handle is not used as a writable byte
-            // stream. A cleaner design would separate permission-check intent from handle I/O mode,
-            // allowing the Windows shim to request modification permission on a non-stream
-            // directory handle while POSIX opens with `WRONLY` or `RDWR` return `EISDIR`.
-            litebox_util_log::debug!(
-                flags:? = flags;
-                "using writable-directory workaround for permission checks"
-            );
-        }
         Ok(super::backend::DirHandle::from_typed::<Self>(
             InMemDirHandle {
                 flags,

@@ -982,10 +982,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .map_err(litebox::fs::errors::PathError::from)?;
         let (access, open_flags) =
             file_open_options(flags - OFlags::CLOEXEC).map_err(Errno::from)?;
-        self.global
+        let file = self
+            .global
             .litebox
             .open_file(&context, path, access, open_flags, mode)
-            .map_err(Errno::from)
+            .map_err(Errno::from)?;
+        if flags.intersects(OFlags::WRONLY | OFlags::RDWR)
+            && !flags.contains(OFlags::PATH)
+            && file.status().map_err(Errno::from)?.file_type == FileType::Directory
+        {
+            return Err(Errno::EISDIR);
+        }
+        Ok(file)
     }
 
     fn do_openat(
