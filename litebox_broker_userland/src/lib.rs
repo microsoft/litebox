@@ -15,6 +15,8 @@
 //! mode.
 
 pub mod builder;
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+mod process_launcher;
 pub mod readiness;
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 pub mod runner;

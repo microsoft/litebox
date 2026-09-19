@@ -11,10 +11,7 @@ use litebox_broker_host::ProcessLauncher;
 use litebox_broker_protocol::ThreadId;
 use litebox_broker_protocol::process::ProcessStartupData;
 
-use super::{
-    RunnerCompletion, RunnerConfig, RunnerInstance, runner_exit_code_is_crash,
-    runner_signal_is_abnormal,
-};
+use crate::runner::{RunnerCompletion, RunnerConfig, RunnerInstance};
 
 const PROCESS_START_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -119,11 +116,7 @@ impl UserlandProcessLauncher {
     }
 
     fn runner_finished(process: &BrokerProcess, result: RunnerCompletion, thread_panicked: bool) {
-        let unexpected_crash =
-            runner_signal_is_abnormal(result.runner_signal, result.broker_termination);
-        let abnormal = thread_panicked
-            || unexpected_crash
-            || runner_exit_code_is_crash(result.runner_exit_code);
+        let abnormal = result.is_abnormal(thread_panicked);
         process.fail_start(BrokerError::PeerClosed, abnormal, false);
         process.retire(!abnormal);
     }

@@ -40,8 +40,8 @@ use litebox_broker_transport::channel::{
 use litebox_broker_transport::control_ring::ControlRing;
 use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedBufferPool, SharedMemory};
 
+use crate::process_launcher::{PendingRunnerAssociation, UserlandProcessLauncher};
 use crate::readiness::ReadinessPublisherRuntime;
-use crate::runner::{PendingRunnerAssociation, UserlandProcessLauncher};
 
 const REQUEST_QUEUE_CAPACITY: usize = 64;
 const REQUEST_QUEUE_RETRY_DELAY: Duration = Duration::from_millis(1);

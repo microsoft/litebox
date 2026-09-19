@@ -15,13 +15,12 @@ use std::time::{Duration, Instant};
 
 use litebox_broker_core::BrokerCore;
 
-mod launcher;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(all(windows, target_arch = "x86_64"))]
 mod windows;
 
-pub(crate) use launcher::{PendingRunnerAssociation, UserlandProcessLauncher};
+use crate::process_launcher::{PendingRunnerAssociation, UserlandProcessLauncher};
 #[cfg(target_os = "linux")]
 use linux::PlatformRunnerEndpoint;
 #[cfg(all(windows, target_arch = "x86_64"))]
@@ -110,10 +109,18 @@ enum RunnerShutdownState {
 }
 
 #[derive(Default)]
-struct RunnerCompletion {
+pub(crate) struct RunnerCompletion {
     runner_signal: Option<i32>,
     runner_exit_code: Option<i32>,
     broker_termination: bool,
+}
+
+impl RunnerCompletion {
+    pub(crate) const fn is_abnormal(&self, thread_panicked: bool) -> bool {
+        thread_panicked
+            || runner_signal_is_abnormal(self.runner_signal, self.broker_termination)
+            || runner_exit_code_is_crash(self.runner_exit_code)
+    }
 }
 
 impl RunnerShutdown {
@@ -267,7 +274,7 @@ impl RunnerInstance {
         Ok(runner_status)
     }
 
-    fn run_started_process_to_completion(
+    pub(crate) fn run_started_process_to_completion(
         mut self,
         startup: PendingRunnerAssociation,
         broker: BrokerCore,
