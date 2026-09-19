@@ -1571,7 +1571,6 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "getrandom 0.3.4",
- "libc",
  "litebox_broker_core",
  "litebox_broker_host",
  "litebox_broker_local",
@@ -1586,7 +1585,6 @@ dependencies = [
  "litebox_runner_linux_userland",
  "litebox_runner_windows_userland",
  "tempfile",
- "windows-sys 0.60.2",
 ]
 
 [[package]]

@@ -351,8 +351,11 @@ fn runner_exit_signal(_status: ExitStatus) -> Option<i32> {
 }
 
 #[cfg(target_os = "linux")]
+const LINUX_SIGKILL: i32 = 9;
+
+#[cfg(target_os = "linux")]
 const fn runner_signal_is_abnormal(signal: Option<i32>, broker_termination: bool) -> bool {
-    matches!(signal, Some(signal) if signal != libc::SIGKILL || !broker_termination)
+    matches!(signal, Some(signal) if signal != LINUX_SIGKILL || !broker_termination)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -362,9 +365,9 @@ const fn runner_signal_is_abnormal(_signal: Option<i32>, _broker_termination: bo
 
 #[cfg(target_os = "linux")]
 const _: () = {
-    assert!(runner_signal_is_abnormal(Some(libc::SIGSEGV), true));
-    assert!(runner_signal_is_abnormal(Some(libc::SIGKILL), false));
-    assert!(!runner_signal_is_abnormal(Some(libc::SIGKILL), true));
+    assert!(runner_signal_is_abnormal(Some(LINUX_SIGKILL + 1), true));
+    assert!(runner_signal_is_abnormal(Some(LINUX_SIGKILL), false));
+    assert!(!runner_signal_is_abnormal(Some(LINUX_SIGKILL), true));
     assert!(!runner_signal_is_abnormal(None, false));
 };
 
