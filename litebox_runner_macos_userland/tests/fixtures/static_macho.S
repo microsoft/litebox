@@ -9,7 +9,7 @@
 .global _start
 .p2align 2
 _start:
-    // argc, argv terminator, envp, and empty apple vector.
+    // argc, argv terminator, envp, and executable_path apple entry.
     ldr x9, [sp]
     cmp x9, #3
     b.ne fail
@@ -22,6 +22,11 @@ _start:
     ldr x9, [sp, #48]
     cbnz x9, fail
     ldr x9, [sp, #56]
+    cbz x9, fail
+    ldrb w10, [x9]
+    cmp w10, #'e'
+    b.ne fail
+    ldr x9, [sp, #64]
     cbnz x9, fail
 
     mov x19, sp

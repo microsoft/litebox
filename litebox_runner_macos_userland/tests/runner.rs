@@ -74,6 +74,10 @@ fn rewrite(input: &Path) -> PathBuf {
 }
 
 fn assert_svc_gates(original: &[u8], rewritten: &[u8]) -> usize {
+    const INSTRUCTION_BYTES: usize = size_of::<u32>();
+    // AArch64 SVC encoding, ignoring the immediate operand.
+    const SVC_MASK: u32 = 0xffe0_001f;
+    const SVC_OPCODE: u32 = 0xd400_0001;
     use litebox_syscall_rewriter::{
         TargetHost,
         aarch64::{GateMetadata, decode_branch_target},
@@ -92,15 +96,21 @@ fn assert_svc_gates(original: &[u8], rewritten: &[u8]) -> usize {
             .ranges_for_mapping(segment.file_range.start as u64, segment.file_range.len())
             .unwrap()
         {
-            for offset in range.step_by(4) {
+            for offset in range.step_by(INSTRUCTION_BYTES) {
                 let file_offset = segment.file_range.start + offset;
-                let word =
-                    u32::from_le_bytes(original[file_offset..file_offset + 4].try_into().unwrap());
-                if word & 0xffe0_001f != 0xd400_0001 {
+                let word = u32::from_le_bytes(
+                    original[file_offset..file_offset + INSTRUCTION_BYTES]
+                        .try_into()
+                        .unwrap(),
+                );
+                if word & SVC_MASK != SVC_OPCODE {
                     continue;
                 }
-                let patched =
-                    u32::from_le_bytes(rewritten[file_offset..file_offset + 4].try_into().unwrap());
+                let patched = u32::from_le_bytes(
+                    rewritten[file_offset..file_offset + INSTRUCTION_BYTES]
+                        .try_into()
+                        .unwrap(),
+                );
                 let site = segment.virtual_range.start + offset;
                 let target = usize::try_from(
                     decode_branch_target(patched, site as u64)
@@ -127,10 +137,10 @@ fn assert_svc_gates(original: &[u8], rewritten: &[u8]) -> usize {
     count
 }
 
-/// Both feature configurations exercise the same AOT pipeline and gate ABI.
-/// test-broker adds I/O checks; without it the fixture checks stdio is absent.
+/// With `test-broker`, the fixture requires guest filesystem loading and stdio;
+/// without it, the fixture requires stdio to be absent.
 #[test]
-fn static_macho_rewriter_e2e() {
+fn static_macho_loader_e2e() {
     let dir = tempfile::tempdir().unwrap();
     let source = format!(
         ".set TEST_STDIO, {}\n{}",
@@ -156,47 +166,70 @@ fn static_macho_rewriter_e2e() {
         parsed.entry
     );
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_litebox_runner_macos_userland"))
-        .arg("--env")
-        .arg("KEY=VALUE")
-        .arg(&hooked)
-        .args(["one", "two"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    #[cfg(feature = "test-broker")]
-    child.stdin.take().unwrap().write_all(b"hello\n").unwrap();
-    // No input is needed in the default configuration.
-    drop(child.stdin.take());
-    let output = child.wait_with_output().unwrap();
-    #[cfg(feature = "test-broker")]
-    {
-        println!("guest stdout: {}", String::from_utf8_lossy(&output.stdout));
-        eprintln!("guest stderr: {}", String::from_utf8_lossy(&output.stderr));
+    // Rewriter footer offsets are relative to the selected slice, not the container.
+    let fat_raw = dir.path().join("fat-raw");
+    let fat_aot = dir.path().join("fat-aot");
+    for (input, output, expected) in [
+        (&binary, &fat_raw, &original),
+        (&hooked, &fat_aot, &rewritten),
+    ] {
+        let result = Command::new("xcrun")
+            .args(["lipo", "-create", "-arch", "arm64"])
+            .arg(input)
+            .arg("-output")
+            .arg(output)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "lipo: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let fat = std::fs::read(output).unwrap();
+        assert!(
+            fat.len() > expected.len(),
+            "lipo must produce a universal container"
+        );
+        assert_eq!(
+            litebox_common_macos::loader::arm64_slice(&fat).unwrap(),
+            expected
+        );
     }
-    assert_eq!(
-        output.status.code(),
-        Some(42),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let expected: &[u8] = if cfg!(feature = "test-broker") {
-        b"hello\n"
-    } else {
-        b""
-    };
-    assert_eq!(output.stdout, expected);
-    assert_eq!(output.stderr, expected);
-
-    // The runner requires an AOT-processed image.
-    let output = Command::new(env!("CARGO_BIN_EXE_litebox_runner_macos_userland"))
-        .arg(binary)
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("not rewritten"));
+    for executable in [&hooked, &binary, &fat_raw, &fat_aot] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_litebox_runner_macos_userland"))
+            .arg("--env")
+            .arg("KEY=VALUE")
+            .arg(executable)
+            .args(["one", "two"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        #[cfg(feature = "test-broker")]
+        child.stdin.take().unwrap().write_all(b"hello\n").unwrap();
+        // No input is needed in the default configuration.
+        drop(child.stdin.take());
+        let output = child.wait_with_output().unwrap();
+        #[cfg(feature = "test-broker")]
+        {
+            println!("guest stdout: {}", String::from_utf8_lossy(&output.stdout));
+            eprintln!("guest stderr: {}", String::from_utf8_lossy(&output.stderr));
+        }
+        assert_eq!(
+            output.status.code(),
+            Some(42),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let expected: &[u8] = if cfg!(feature = "test-broker") {
+            b"hello\n"
+        } else {
+            b""
+        };
+        assert_eq!(output.stdout, expected);
+        assert_eq!(output.stderr, expected);
+    }
 }
 
 #[test]
@@ -223,7 +256,7 @@ fn invalid_and_dynamic_images_are_rejected() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("loading static Mach-O"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("loading Mach-O"));
 
     // The runner itself is a dynamically linked AArch64 Mach-O.
     let data = std::fs::read(env!("CARGO_BIN_EXE_litebox_runner_macos_userland")).unwrap();
@@ -233,10 +266,22 @@ fn invalid_and_dynamic_images_are_rejected() {
             _
         ))
     ));
+    let result = litebox_shim_macos::MacosShimBuilder::new(
+        litebox_platform_macos_userland::MacosUserland::new(),
+    )
+    .build()
+    .load_program_from_bytes(TaskParams::default(), "/dynamic", &data, vec![], vec![]);
+    assert!(matches!(
+        result,
+        Err(litebox_common_macos::loader::MachoLoaderError::Unsupported(
+            _
+        ))
+    ));
 }
 
 #[test]
 fn incompatible_aot_gate_is_rejected_before_execution() {
+    const INCOMPATIBLE_GATE_PROLOGUE: u32 = 0xd100_83ff; // sub sp, sp, #32 (Linux frame)
     let dir = tempfile::tempdir().unwrap();
     let binary = assemble(
         dir.path(),
@@ -251,8 +296,10 @@ fn incompatible_aot_gate_is_rejected_before_execution() {
         .unwrap();
     // Mach-O SVC gates require the Darwin frame layout. Incompatible payloads
     // are rejected during finalization.
-    let first_gate = trampoline.file_range.start + 16;
-    data[first_gate..first_gate + 4].copy_from_slice(&0xd100_83ffu32.to_le_bytes());
+    let first_gate =
+        trampoline.file_range.start + litebox_syscall_rewriter::aarch64::GATE_ALIGNMENT;
+    data[first_gate..first_gate + size_of::<u32>()]
+        .copy_from_slice(&INCOMPATIBLE_GATE_PROLOGUE.to_le_bytes());
     std::fs::write(&hooked, data).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_litebox_runner_macos_userland"))
         .arg(hooked)
@@ -279,7 +326,7 @@ fn loader_teardown_and_argument_limit() {
     let platform = MacosUserland::new();
     let program = MacosShimBuilder::new(platform)
         .build()
-        .load_program(TaskParams::default(), &data, vec![], vec![])
+        .load_program_from_bytes(TaskParams::default(), "/guest", &data, vec![], vec![])
         .unwrap();
     let mut plan = MachoParsedFile::parse(&data).unwrap();
     let trampoline = plan.parse_trampoline(&data).unwrap().unwrap();
@@ -307,12 +354,15 @@ fn loader_teardown_and_argument_limit() {
     }
 
     let huge_arg = std::ffi::CString::new(vec![b'a'; 9 * 1024 * 1024]).unwrap();
-    let result = MacosShimBuilder::new(platform).build().load_program(
-        TaskParams::default(),
-        &data,
-        vec![huge_arg],
-        vec![],
-    );
+    let result = MacosShimBuilder::new(platform)
+        .build()
+        .load_program_from_bytes(
+            TaskParams::default(),
+            "/guest",
+            &data,
+            vec![huge_arg],
+            vec![],
+        );
     assert!(matches!(
         result,
         Err(litebox_common_macos::loader::MachoLoaderError::ArgumentsTooLarge)
@@ -320,7 +370,7 @@ fn loader_teardown_and_argument_limit() {
     // Failed initialization leaves the platform able to load and run another guest.
     let program = MacosShimBuilder::new(platform)
         .build()
-        .load_program(TaskParams::default(), &data, vec![], vec![])
+        .load_program_from_bytes(TaskParams::default(), "/guest", &data, vec![], vec![])
         .unwrap();
     let litebox_shim_macos::LoadedProgram {
         entrypoints,

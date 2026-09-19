@@ -2014,6 +2014,7 @@ dependencies = [
  "litebox_platform_macos_userland",
  "litebox_syscall_rewriter",
  "litebox_util_log",
+ "tempfile",
 ]
 
 [[package]]

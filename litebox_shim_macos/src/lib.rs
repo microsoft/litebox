@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Minimal Darwin BSD shim for static AArch64 Mach-O guests.
+//! Minimal Darwin BSD shim for self-contained static AArch64 Mach-O guests.
 //!
 //! Guest mappings and file operations use LiteBox. The runner supplies inherited
 //! descriptors. Networking is unsupported.
@@ -20,9 +20,10 @@ use litebox::{
 };
 use litebox_common_macos::{
     PAGE_SIZE, PtRegs, SIGINT, SIGSEGV, STACK_ALIGNMENT, SyscallRequest, TaskParams, errno::Errno,
+    loader::MachoLoaderError,
 };
 
-pub mod loader;
+mod loader;
 pub mod syscalls;
 #[cfg(all(test, target_os = "macos"))]
 mod tests;
@@ -98,14 +99,43 @@ pub struct MacosShim<P: ShimPlatform> {
 }
 
 impl<P: ShimPlatform> MacosShim<P> {
+    /// Load a self-contained static executable from the guest filesystem.
+    ///
+    /// `path` also supplies the startup apple vector's `executable_path` entry,
+    /// independently of `argv[0]`. Requires read access; execute permissions are not checked.
     pub fn load_program(
         self,
         params: TaskParams,
+        path: &str,
+        argv: Vec<CString>,
+        envp: Vec<CString>,
+    ) -> Result<LoadedProgram<P>, MachoLoaderError> {
+        self.load(params, path, None, argv, envp)
+    }
+
+    /// Load a self-contained static executable snapshot without file I/O.
+    ///
+    /// `path` supplies only the startup apple vector's `executable_path` entry;
+    /// it is not opened and need not match `argv[0]`.
+    pub fn load_program_from_bytes(
+        self,
+        params: TaskParams,
+        path: &str,
         image: &[u8],
         argv: Vec<CString>,
         envp: Vec<CString>,
-    ) -> Result<LoadedProgram<P>, loader::MachoLoaderError> {
-        let initial_ctx = loader::load(&self.global.pm, self.global.platform, image, &argv, &envp)?;
+    ) -> Result<LoadedProgram<P>, MachoLoaderError> {
+        self.load(params, path, Some(image), argv, envp)
+    }
+
+    fn load(
+        self,
+        params: TaskParams,
+        path: &str,
+        image: Option<&[u8]>,
+        argv: Vec<CString>,
+        envp: Vec<CString>,
+    ) -> Result<LoadedProgram<P>, MachoLoaderError> {
         let process = Process(Arc::new(AtomicI32::new(-1)));
         let task = Task {
             global: self.global,
@@ -113,6 +143,7 @@ impl<P: ShimPlatform> MacosShim<P> {
             params,
             process: process.clone(),
         };
+        let initial_ctx = loader::load(&task, path, image, &argv, &envp)?;
         Ok(LoadedProgram {
             entrypoints: MacosShimEntrypoints {
                 task,
@@ -240,7 +271,7 @@ impl<P: ShimPlatform> Task<P> {
                 let length = Self::io_length(count)?;
                 self.check_user_buffer(buf.as_usize(), length, Permissions::WRITE)?;
                 let mut bytes = vec![0; length];
-                let size = self.do_read(&fd, &mut bytes)?;
+                let size = self.do_read(&fd, &mut bytes, None)?;
                 if size != 0 {
                     buf.copy_from_slice::<P>(0, &bytes[..size])
                         .ok_or(Errno::EFAULT)?;

@@ -10,12 +10,14 @@ use litebox_common_macos::TaskParams;
 use litebox_platform_macos_userland::{GuestAbi, MacosUserland, set_guest_abi};
 #[cfg(not(feature = "test-broker"))]
 use litebox_shim_macos::MacosShimBuilder;
-use std::ffi::CString;
+use std::{ffi::CString, io::Read as _};
 
 #[derive(Parser, Debug)]
-#[command(about = "Run AOT-rewritten static AArch64 Mach-O programs (no dyld; limited Mach traps)")]
+#[command(about = "Run self-contained static AArch64 Mach-O programs (no dyld)")]
 pub struct CliArgs {
-    /// Host path of a Mach-O processed by litebox_syscall_rewriter, followed by guest arguments.
+    /// Host path of a thin or universal Mach-O, followed by guest arguments.
+    /// Accepts raw or AOT-rewritten static images. No host filesystem passthrough,
+    /// dynamic linking, or shared-cache support.
     #[arg(required = true, trailing_var_arg = true, value_hint = clap::ValueHint::CommandWithArguments)]
     pub program_and_arguments: Vec<String>,
     /// Guest environment entry (KEY=VALUE). Host environment is not forwarded.
@@ -31,7 +33,16 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
     let Some(path) = cli_args.program_and_arguments.first() else {
         bail!("missing program");
     };
-    let data = std::fs::read(path).with_context(|| format!("reading {path}"))?;
+    // Bound allocation even if the file grows; one extra byte detects oversized input.
+    let mut data = Vec::new();
+    std::fs::File::open(path)
+        .with_context(|| format!("opening {path}"))?
+        .take(litebox_common_macos::loader::MAX_IMAGE_SIZE as u64 + 1)
+        .read_to_end(&mut data)
+        .with_context(|| format!("reading {path}"))?;
+    if data.len() > litebox_common_macos::loader::MAX_IMAGE_SIZE {
+        bail!("Mach-O file larger than 256 MiB: {path}");
+    }
     let argv = cli_args
         .program_and_arguments
         .iter()
@@ -48,11 +59,17 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
     #[cfg(not(feature = "test-broker"))]
     let builder = MacosShimBuilder::new(platform);
     #[cfg(feature = "test-broker")]
-    let (builder, stdio) = test_broker::setup(platform)?;
+    let (builder, stdio) = test_broker::setup(platform, data)?;
+    #[cfg(feature = "test-broker")]
     let program = builder
         .build()
-        .load_program(TaskParams::default(), &data, argv, envp)
-        .context("loading static Mach-O")?;
+        .load_program(TaskParams::default(), "/executable", argv, envp);
+    #[cfg(not(feature = "test-broker"))]
+    let program =
+        builder
+            .build()
+            .load_program_from_bytes(TaskParams::default(), path, &data, argv, envp);
+    let program = program.context("loading Mach-O")?;
     let litebox_shim_macos::LoadedProgram {
         entrypoints,
         process,

@@ -69,6 +69,8 @@ pub enum Errno {
     EOPNOTSUPP = 102,
 }
 
+impl core::error::Error for Errno {}
+
 impl Errno {
     /// Return the raw errno value as a positive integer (for the macOS ABI).
     #[allow(clippy::cast_sign_loss)]
