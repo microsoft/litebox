@@ -24,7 +24,6 @@ mod error;
 mod event;
 mod fs;
 mod pipe;
-mod process;
 mod random;
 mod socket;
 mod stdio;
@@ -40,7 +39,10 @@ use litebox_broker_protocol::message::{
     BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerOperation,
     BrokerRequest, BrokerResponse, BrokerResult,
 };
-use litebox_broker_protocol::process::ProcessStartupData;
+use litebox_broker_protocol::process::{
+    InheritedProcessObjects, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessBootstrapFormat,
+    ProcessBootstrapVersion, ProcessStartupData, ProcessStartupDescriptor, StartedProcess,
+};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SharedBufferSequence};
 use litebox_broker_protocol::{
@@ -184,6 +186,40 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     #[must_use]
     pub const fn initial_thread_id(&self) -> ThreadId {
         self.initial_thread_id
+    }
+
+    /// Starts one child process.
+    ///
+    /// This call blocks until the child's broker association is active or
+    /// launch fails. The caller must retain exclusive ownership of the
+    /// bootstrap sequence until this method returns.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the bootstrap length differs from the shared-buffer sequence
+    /// or the broker returns a response for another operation.
+    pub fn start_child_process(
+        &self,
+        format: ProcessBootstrapFormat,
+        version: ProcessBootstrapVersion,
+        buffer: SharedBufferSequence,
+        bootstrap: &[u8],
+        inherited_objects: InheritedProcessObjects,
+    ) -> Result<StartedProcess, Channel::Error> {
+        if buffer.length() > MAX_PROCESS_BOOTSTRAP_SIZE {
+            return Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted));
+        }
+        self.write_shared_buffer(buffer, bootstrap);
+        match self.request(BrokerOperation::StartProcess(ProcessStartupDescriptor {
+            format,
+            version,
+            buffer,
+            inherited_objects,
+        }))? {
+            BrokerResult::ProcessStarted(started) => Ok(started),
+            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
+            response => panic!("broker returned unexpected process-start response: {response:?}"),
+        }
     }
 
     /// Creates a broker thread belonging to this process.
