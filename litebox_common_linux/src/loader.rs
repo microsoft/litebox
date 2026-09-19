@@ -78,11 +78,22 @@ const TRAMPOLINE_FILE_ALIGNMENT: u64 = 4096;
 /// Trampoline header for 64-bit: 8 (magic) + 8 (file_offset) + 8 (vaddr) + 8 (size) = 32 bytes
 #[repr(C, packed)]
 #[derive(FromBytes)]
-struct TrampolineHeader64 {
-    magic: u64,
-    file_offset: u64,
-    vaddr: u64,
-    trampoline_size: u64,
+pub struct TrampolineHeader64 {
+    /// The format magic and version.
+    pub magic: u64,
+    /// The file offset of the trampoline code.
+    pub file_offset: u64,
+    /// The virtual address of the trampoline code.
+    pub vaddr: u64,
+    /// The size of the trampoline code.
+    pub trampoline_size: u64,
+}
+
+impl TrampolineHeader64 {
+    /// Returns whether the header contains the supported trampoline magic.
+    pub fn has_valid_magic(&self) -> bool {
+        self.magic == TRAMPOLINE_MAGIC
+    }
 }
 
 /// Trampoline header for 32-bit: 8 (magic) + 4 (file_offset) + 4 (vaddr) + 4 (size) = 20 bytes
@@ -94,6 +105,13 @@ struct TrampolineHeader32 {
     vaddr: u32,
     trampoline_size: u32,
 }
+
+/// Size in bytes of the trampoline header for the target pointer width.
+pub const TRAMPOLINE_HEADER_SIZE: usize = if cfg!(target_pointer_width = "64") {
+    size_of::<TrampolineHeader64>()
+} else {
+    size_of::<TrampolineHeader32>()
+};
 
 const CLASS: elf::file::Class = if cfg!(target_pointer_width = "64") {
     elf::file::Class::ELF64
@@ -302,11 +320,7 @@ impl ElfParsedFile {
 
         let file_size = file.size().map_err(ElfParseError::Io)?;
 
-        let header_size = if cfg!(target_pointer_width = "64") {
-            size_of::<TrampolineHeader64>()
-        } else {
-            size_of::<TrampolineHeader32>()
-        };
+        let header_size = TRAMPOLINE_HEADER_SIZE;
 
         // File must be large enough to contain the header
         if file_size < header_size as u64 {

@@ -1022,10 +1022,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         match consumed {
             AnyTypedFd::Fs(fd) => {
-                if let Ok(raw_fd) = i32::try_from(raw_fd) {
-                    self.finalize_elf_patch(raw_fd);
-                }
-                self.global.litebox.close_file(&fd).map_err(Errno::from)
+                let result = self.global.litebox.close_file(&fd).map_err(Errno::from);
+                self.finalize_elf_patch(fd);
+                result
             }
             AnyTypedFd::Network(fd) => self.global.close_socket(&self.wait_cx(), fd),
             AnyTypedFd::Pipes(fd) => self.global.close_linux_pipe(&fd),

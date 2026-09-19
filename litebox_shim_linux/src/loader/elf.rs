@@ -24,6 +24,8 @@ use crate::{ShimPlatform, Task};
 struct ElfFile<'a, Platform: ShimPlatform> {
     task: &'a Task<Platform>,
     fd: i32,
+    #[cfg(target_arch = "aarch64")]
+    file_fd: alloc::sync::Arc<crate::FileFd>,
     load_high: bool,
 }
 
@@ -32,9 +34,16 @@ impl<'a, Platform: ShimPlatform> ElfFile<'a, Platform> {
         let fd = task
             .sys_open(path, OFlags::RDONLY, Mode::empty())?
             .reinterpret_as_signed();
+        #[cfg(target_arch = "aarch64")]
+        let Ok(crate::syscalls::file::AnyTypedFd::Fs(file_fd)) = task.typed_fd(fd) else {
+            let _ = task.sys_close(fd);
+            return Err(Errno::EBADF);
+        };
         Ok(ElfFile {
             task,
             fd,
+            #[cfg(target_arch = "aarch64")]
+            file_fd,
             load_high: false,
         })
     }
@@ -248,20 +257,23 @@ impl<'a, Platform: ShimPlatform> FileAndParsed<'a, Platform> {
         };
         let result = self.parsed.load(&mut self.file, &mut &*platform, reserve)?;
         #[cfg(target_arch = "aarch64")]
-        if self.parsed.has_trampoline()
-            && !self
+        if self.parsed.has_trampoline() {
+            let patch_key =
+                crate::syscalls::mm::ElfPatchKey(alloc::sync::Arc::clone(&self.file.file_fd));
+            if !self
                 .file
                 .task
                 .global
                 .elf_patch_cache
                 .lock()
-                .get(&self.file.fd)
+                .get(&patch_key)
                 .is_some_and(crate::syscalls::mm::ElfPatchState::trampoline_is_populated)
-        {
-            litebox_util_log::error!(fd:? = self.file.fd; "AArch64 trampoline was not populated while loading the ELF");
-            return Err(ElfLoaderError::LoadError(
-                litebox_common_linux::loader::ElfLoadError::InvalidProgramHeader,
-            ));
+            {
+                litebox_util_log::error!(fd:? = self.file.fd; "AArch64 trampoline was not populated while loading the ELF");
+                return Err(ElfLoaderError::LoadError(
+                    litebox_common_linux::loader::ElfLoadError::InvalidProgramHeader,
+                ));
+            }
         }
         Ok(result)
     }
