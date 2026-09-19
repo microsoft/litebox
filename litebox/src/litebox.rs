@@ -6,6 +6,7 @@
 use alloc::sync::Arc;
 
 use litebox_broker_local::BrokerLocal;
+use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::message::BrokerNotification;
 use litebox_broker_transport::channel::LocalCallChannel;
 use litebox_platform::time::TimeProvider;
@@ -14,6 +15,7 @@ use crate::{
     broker,
     fd::Descriptors,
     sync::{RawSyncPrimitivesProvider, RwLock},
+    thread::Thread,
 };
 
 /// A full LiteBox system.
@@ -52,12 +54,45 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         Platform: TimeProvider,
         Channel: LocalCallChannel + Send + Sync + 'static,
     {
+        Self::new_with_broker_local_inner(platform, broker_local).0
+    }
+
+    fn new_with_broker_local_inner<Channel>(
+        platform: &'static Platform,
+        broker_local: BrokerLocal<Channel>,
+    ) -> (Self, Arc<dyn broker::BrokerControl>)
+    where
+        Platform: TimeProvider,
+        Channel: LocalCallChannel + Send + Sync + 'static,
+    {
         let broker_pollables = Arc::new(broker::BrokerPollableRegistry::new());
-        let broker_control = Arc::new(broker::BrokerLocalControl::<Platform, Channel>::new(
-            broker_local,
-            Arc::clone(&broker_pollables),
-        ));
-        Self::new_inner(platform, Some(broker_control), broker_pollables)
+        let broker_control: Arc<dyn broker::BrokerControl> =
+            Arc::new(broker::BrokerLocalControl::<Platform, Channel>::new(
+                broker_local,
+                Arc::clone(&broker_pollables),
+            ));
+        let litebox = Self::new_inner(
+            platform,
+            Some(Arc::clone(&broker_control)),
+            broker_pollables,
+        );
+        (litebox, broker_control)
+    }
+
+    /// Creates a broker-backed process and its negotiated initial thread.
+    pub fn new_process_with_broker_local<Channel>(
+        platform: &'static Platform,
+        broker_local: BrokerLocal<Channel>,
+    ) -> (Self, ProcessId, Thread)
+    where
+        Platform: TimeProvider,
+        Channel: LocalCallChannel + Send + Sync + 'static,
+    {
+        let process_id = broker_local.process_id();
+        let initial_thread_id = broker_local.initial_thread_id();
+        let (litebox, broker) = Self::new_with_broker_local_inner(platform, broker_local);
+        let initial_thread = Thread::from_broker(initial_thread_id, broker);
+        (litebox, process_id, initial_thread)
     }
 
     fn new_inner(

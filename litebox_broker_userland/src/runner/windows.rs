@@ -65,14 +65,14 @@ fn serve_association(
     startup: Option<RunnerStartup>,
     process_manager: Arc<RunnerProcessManager>,
 ) -> AssociationRunResult {
-    let is_started_process = startup.is_some();
+    let has_parent_transaction = startup.is_some();
     let (control_channel, _setup_deadline) = match accept_control_channel(control_listener, runner)
     {
         Ok(connection) => connection,
         Err(error) => {
             let failure_cause = if runner_has_exited(runner).unwrap_or(false) {
                 AssociationFailureCause::RunnerExit
-            } else if is_started_process
+            } else if has_parent_transaction
                 && matches!(
                     error.kind(),
                     std::io::ErrorKind::BrokenPipe
@@ -110,7 +110,7 @@ fn serve_association(
         WindowsNamedPipeHostSetupChannel::into_active,
         process_manager,
     );
-    if is_started_process
+    if has_parent_transaction
         && result.failure_cause == AssociationFailureCause::Other
         && result
             .result

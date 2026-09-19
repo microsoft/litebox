@@ -50,6 +50,10 @@ pub struct Thread {
 }
 
 impl Thread {
+    pub(crate) fn from_broker(id: ThreadId, broker: Arc<dyn BrokerControl>) -> Self {
+        Self { id, broker }
+    }
+
     /// Returns the assigned thread ID.
     #[must_use]
     pub const fn id(&self) -> u32 {
@@ -68,15 +72,6 @@ impl Thread {
 }
 
 impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
-    /// Adopts a broker thread allocated during process negotiation.
-    ///
-    /// The caller must pass the initial thread ID from the negotiated broker
-    /// association exactly once.
-    pub fn adopt_thread(&self, id: ThreadId) -> Result<Thread, CreateError> {
-        let broker = self.broker_control().ok_or(CreateError::Unavailable)?;
-        Ok(Thread { id, broker })
-    }
-
     /// Creates a thread belonging to this LiteBox process.
     ///
     /// # Panics

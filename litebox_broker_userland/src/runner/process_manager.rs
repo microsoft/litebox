@@ -163,9 +163,20 @@ impl RunnerProcessManager {
         if !parent.is_running() {
             return Err(ErrorCode::ProtocolState);
         }
-        let (process, inherited_objects) = parent
-            .create_child(requested_inherited_objects.as_slice())
+        let process = self
+            .broker
+            .create_process(parent.caller_credential())
             .map_err(ErrorCode::from)?;
+        let inherited_objects = match parent.duplicate_object_references_to_preserving_rights(
+            requested_inherited_objects.as_slice(),
+            &process,
+        ) {
+            Ok(inherited_objects) => inherited_objects,
+            Err(error) => {
+                process.cleanup(true);
+                return Err(ErrorCode::from(error));
+            }
+        };
         let initial_thread_id = match process.create_thread() {
             Ok(initial_thread_id) => initial_thread_id,
             Err(error) => {
@@ -324,7 +335,7 @@ impl RunnerProcessManager {
         &self,
         process_id: ProcessId,
         failure: AssociationFailure,
-        is_started_process: bool,
+        has_parent_transaction: bool,
     ) -> IoResult<()> {
         let transaction = {
             let mut state = self
@@ -351,12 +362,10 @@ impl RunnerProcessManager {
                 .find(|transaction| transaction.process.id() == process_id)
                 .cloned()
         };
-        if is_started_process {
+        if has_parent_transaction {
             let Some(transaction) = transaction else {
                 self.unregister_association(process_id);
-                return Err(IoError::other(
-                    "started process has no pending start transaction",
-                ));
+                return Err(IoError::other("process has no pending parent transaction"));
             };
             transaction.install_association_failure(failure);
             if let Err(error) = transaction.activate() {
@@ -368,7 +377,7 @@ impl RunnerProcessManager {
         } else if transaction.is_some() {
             self.unregister_association(process_id);
             return Err(IoError::other(
-                "root process unexpectedly has a pending start transaction",
+                "process without a parent transaction matched a pending transaction",
             ));
         }
         Ok(())
@@ -699,7 +708,7 @@ mod tests {
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let parent_id = parent.id();
-        let (process, _) = parent.create_child(&[]).unwrap();
+        let process = broker.create_process(parent.caller_credential()).unwrap();
         let initial_thread_id = process.create_thread().unwrap();
         parent.cleanup(true);
         (
@@ -827,7 +836,7 @@ mod tests {
     }
 
     #[test]
-    fn late_started_association_is_not_activated_as_a_root() {
+    fn late_parented_association_requires_its_transaction() {
         let (broker, transaction) = starting_transaction();
         let process_id = transaction.process.id();
         let manager = RunnerProcessManager {

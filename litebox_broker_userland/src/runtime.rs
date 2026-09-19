@@ -222,7 +222,7 @@ where
     NotificationChannel: HostNotificationChannel<Error = IoError> + Send,
     Shutdown: HostAssociationShutdown<Error = IoError> + Send + Sync + 'static,
 {
-    let is_started_process = startup.is_some();
+    let has_parent_transaction = startup.is_some();
     let (process, startup) = match startup {
         Some(startup) => {
             let (process, data) = startup.into_process_and_data();
@@ -279,7 +279,7 @@ where
         match activate(control_channel, control_ring) {
             Ok(active) => active,
             Err(error) => {
-                if !is_started_process && process_out.is_none() {
+                if !has_parent_transaction && process_out.is_none() {
                     association.finish();
                 }
                 return Err(error);
@@ -293,8 +293,8 @@ where
         notification_channel,
         shutdown,
         process_manager,
-        is_started_process,
-        !is_started_process && process_out.is_none(),
+        has_parent_transaction,
+        !has_parent_transaction && process_out.is_none(),
         panicked_out,
         abnormal_out,
     )
@@ -485,7 +485,7 @@ fn dispatch_requests<Memory, RequestSource, ResponseSink, NotificationChannel, S
     mut notification_channel: NotificationChannel,
     shutdown: Shutdown,
     process_manager: Option<Arc<RunnerProcessManager>>,
-    is_started_process: bool,
+    has_parent_transaction: bool,
     finish_process: bool,
     panicked_out: Option<&AtomicBool>,
     abnormal_out: Option<&AtomicBool>,
@@ -511,14 +511,14 @@ where
         process_manager.register_association(
             association.process_id(),
             association_failure,
-            is_started_process,
+            has_parent_transaction,
         )?;
-    } else if is_started_process {
+    } else if has_parent_transaction {
         return Err(IoError::other(
-            "started process association requires a process manager",
+            "a process with a parent transaction requires a process manager",
         ));
     }
-    if !is_started_process {
+    if !has_parent_transaction {
         association.activate_process().map_err(|error| {
             IoError::other(format!(
                 "failed to activate broker process association: {error}"

@@ -107,8 +107,6 @@ pub struct BrokerProcess {
     pub(crate) core: BrokerCore,
     /// Assigned process ID and internal authority.
     pub(crate) id: ProcessId,
-    /// Authoritative parent process ID, absent for a root process.
-    parent_id: Option<ProcessId>,
     state: Mutex<ProcessState>,
     /// Broker-entry-authenticated caller credential for this process.
     pub(crate) caller_credential: CallerCredential,
@@ -136,15 +134,12 @@ impl BrokerProcess {
     pub(crate) fn new(
         core: BrokerCore,
         id: ProcessId,
-        parent_id: Option<ProcessId>,
         caller_credential: CallerCredential,
-        state: ProcessState,
     ) -> Self {
         Self {
             core,
             id,
-            parent_id,
-            state: Mutex::new(state),
+            state: Mutex::new(ProcessState::Attaching),
             caller_credential,
             references: Mutex::new(ProcessReferences {
                 handles: Vec::new(),
@@ -161,12 +156,6 @@ impl BrokerProcess {
     #[must_use]
     pub const fn id(&self) -> ProcessId {
         self.id
-    }
-
-    /// Returns the current parent process ID, if any.
-    #[must_use]
-    pub const fn parent_id(&self) -> Option<ProcessId> {
-        self.parent_id
     }
 
     /// Returns the credential authenticated for this process association.
@@ -194,39 +183,34 @@ impl BrokerProcess {
         }
     }
 
-    /// Creates one child process inheriting this process's authenticated credential.
+    /// Duplicates object references into another process while preserving rights.
     ///
-    /// Returned handles follow the requested inheritance order. If later host
-    /// launch or association setup fails normally, the caller must finish the
-    /// returned process; dropping it preserves its IDs as unwind protection.
-    pub fn create_child(
+    /// Returned handles follow the requested source order. If duplication
+    /// fails, references already created by this call are removed from the
+    /// target before the error is returned.
+    pub fn duplicate_object_references_to_preserving_rights(
         &self,
-        inherited_objects: &[ObjectHandle],
-    ) -> Result<(Arc<BrokerProcess>, Vec<ObjectHandle>)> {
-        let process = self.core.create_process_with_parent(
-            Some(self.id),
-            self.caller_credential,
-            ProcessState::Attaching,
-        )?;
-        let inherited_result = (|| {
-            let mut child_handles = Vec::new();
-            child_handles
-                .try_reserve_exact(inherited_objects.len())
-                .map_err(|_| BrokerError::OutOfMemory)?;
-            for handle in inherited_objects {
-                let child_handle =
-                    self.duplicate_object_reference_to_preserving_rights(*handle, &process)?;
-                child_handles.push(child_handle);
-            }
-            Ok(child_handles)
-        })();
-        match inherited_result {
-            Ok(child_handles) => Ok((process, child_handles)),
-            Err(error) => {
-                process.cleanup(true);
-                Err(error)
+        handles: &[ObjectHandle],
+        target: &BrokerProcess,
+    ) -> Result<Vec<ObjectHandle>> {
+        let mut duplicates = Vec::new();
+        duplicates
+            .try_reserve_exact(handles.len())
+            .map_err(|_| BrokerError::OutOfMemory)?;
+        for handle in handles {
+            match self.duplicate_object_reference_to_preserving_rights(*handle, target) {
+                Ok(duplicate) => duplicates.push(duplicate),
+                Err(error) => {
+                    for duplicate in duplicates.drain(..).rev() {
+                        if target.close_object_reference(duplicate).is_err() {
+                            return Err(BrokerError::Internal);
+                        }
+                    }
+                    return Err(error);
+                }
             }
         }
+        Ok(duplicates)
     }
 
     /// Creates a broker thread belonging to this process.
@@ -903,10 +887,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(first.id().0, 1);
-        assert_eq!(first.parent_id(), None);
         assert_eq!(thread.0, 2);
         assert_eq!(second.id().0, 3);
-        assert_eq!(second.parent_id(), None);
     }
 
     #[test]
@@ -931,7 +913,7 @@ mod tests {
     }
 
     #[test]
-    fn child_is_parented_and_requires_start_completion() {
+    fn process_creation_and_reference_inheritance_are_separate() {
         let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
@@ -941,47 +923,55 @@ mod tests {
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
         let source_handle = crate::event::create(&parent, 1).unwrap();
-        let (child, inherited_objects) = parent.create_child(&[source_handle]).unwrap();
-        let initial_thread_id = child.create_thread().unwrap();
+        let process = broker.create_process(parent.caller_credential()).unwrap();
+        let inherited_objects = parent
+            .duplicate_object_references_to_preserving_rights(&[source_handle], &process)
+            .unwrap();
+        let initial_thread_id = process.create_thread().unwrap();
         let inherited_handle = inherited_objects[0];
 
-        assert_eq!(child.parent_id(), Some(parent.id()));
-        assert!(child.owns_thread(initial_thread_id));
+        assert!(process.owns_thread(initial_thread_id));
         assert_ne!(inherited_handle, source_handle);
         assert_eq!(
-            child.check_readiness(inherited_handle).unwrap(),
+            process.check_readiness(inherited_handle).unwrap(),
             ReadinessFlags::READ | ReadinessFlags::WRITE
         );
-        assert!(!child.is_running());
+        assert!(!process.is_running());
 
-        child.complete_start().unwrap();
-        assert!(child.is_running());
-        assert_eq!(*child.state.lock(), ProcessState::Running);
+        process.complete_start().unwrap();
+        assert!(process.is_running());
+        assert_eq!(*process.state.lock(), ProcessState::Running);
     }
 
     #[test]
-    fn finished_attaching_child_releases_process_capacity() {
+    fn failed_reference_inheritance_rolls_back_target_references() {
         let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
-        .with_limits(BrokerCoreLimits::DEFAULT.with_process_limit(2))
         .build()
         .unwrap();
-        let parent = broker
+        let source = broker
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
-        let (child, _) = parent.create_child(&[]).unwrap();
+        let target = broker.create_process(source.caller_credential()).unwrap();
+        let source_handle = crate::event::create(&source, 1).unwrap();
 
         assert_eq!(
-            parent.create_child(&[]).err(),
-            Some(BrokerError::ResourceExhausted)
+            source.duplicate_object_references_to_preserving_rights(
+                &[source_handle, ObjectHandle(u64::MAX)],
+                &target,
+            ),
+            Err(BrokerError::UnknownObject)
         );
-        child.cleanup(true);
-        assert!(parent.create_child(&[]).is_ok());
+        assert!(target.references.lock().handles.is_empty());
+        assert_eq!(
+            source.check_readiness(source_handle).unwrap(),
+            ReadinessFlags::READ | ReadinessFlags::WRITE
+        );
     }
 
     #[test]
-    fn child_cannot_complete_start_after_teardown() {
+    fn finished_attaching_process_releases_process_capacity() {
         let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
@@ -991,13 +981,34 @@ mod tests {
         let parent = broker
             .create_process(CallerCredential::Unauthenticated)
             .unwrap();
-        let (child, _) = parent.create_child(&[]).unwrap();
+        let process = broker.create_process(parent.caller_credential()).unwrap();
 
-        child.cleanup(true);
-        child.cleanup(true);
+        assert_eq!(
+            broker.create_process(parent.caller_credential()).err(),
+            Some(BrokerError::ResourceExhausted)
+        );
+        process.cleanup(true);
+        assert!(broker.create_process(parent.caller_credential()).is_ok());
+    }
 
-        assert_eq!(child.complete_start(), Err(BrokerError::PeerClosed));
-        let (replacement, _) = parent.create_child(&[]).unwrap();
+    #[test]
+    fn process_cannot_complete_start_after_teardown() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .with_limits(BrokerCoreLimits::DEFAULT.with_process_limit(2))
+        .build()
+        .unwrap();
+        let parent = broker
+            .create_process(CallerCredential::Unauthenticated)
+            .unwrap();
+        let process = broker.create_process(parent.caller_credential()).unwrap();
+
+        process.cleanup(true);
+        process.cleanup(true);
+
+        assert_eq!(process.complete_start(), Err(BrokerError::PeerClosed));
+        let replacement = broker.create_process(parent.caller_credential()).unwrap();
         replacement.cleanup(true);
     }
 

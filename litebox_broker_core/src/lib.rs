@@ -301,20 +301,7 @@ impl BrokerCore {
         Ok((first, second))
     }
 
-    /// Allocates and registers one authenticated broker process.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the shared ID allocator violates its range or uniqueness
-    /// invariants.
-    pub fn create_process(
-        &self,
-        caller_credential: CallerCredential,
-    ) -> Result<Arc<BrokerProcess>> {
-        self.create_process_with_parent(None, caller_credential, process::ProcessState::Running)
-    }
-
-    /// Allocates one authenticated broker process awaiting association activation.
+    /// Allocates one authenticated process awaiting association activation.
     ///
     /// The deployment must call [`BrokerProcess::complete_start`] after the
     /// process association becomes active.
@@ -323,18 +310,9 @@ impl BrokerCore {
     ///
     /// Panics if the shared ID allocator violates its range or uniqueness
     /// invariants.
-    pub fn create_attaching_process(
+    pub fn create_process(
         &self,
         caller_credential: CallerCredential,
-    ) -> Result<Arc<BrokerProcess>> {
-        self.create_process_with_parent(None, caller_credential, process::ProcessState::Attaching)
-    }
-
-    fn create_process_with_parent(
-        &self,
-        parent_id: Option<ProcessId>,
-        caller_credential: CallerCredential,
-        state: process::ProcessState,
     ) -> Result<Arc<BrokerProcess>> {
         let mut processes = self.processes.write();
         if processes.len() >= self.limits.max_processes {
@@ -345,13 +323,7 @@ impl BrokerCore {
             .map_err(|_| BrokerError::OutOfMemory)?;
         let raw_id = self.ids.lock().allocate()?;
         let id = ProcessId(raw_id);
-        let process = Arc::new(BrokerProcess::new(
-            self.clone(),
-            id,
-            parent_id,
-            caller_credential,
-            state,
-        ));
+        let process = Arc::new(BrokerProcess::new(self.clone(), id, caller_credential));
         assert!(
             processes.insert(id, Arc::downgrade(&process)).is_none(),
             "the ID allocator returned an occupied process ID"

@@ -330,7 +330,7 @@ where
                     .map_err(BrokerHostError::Channel)?;
                 return Ok(Err(ConnectionTermination::Rejected(error)));
             }
-            None => match core.create_attaching_process(caller_credential) {
+            None => match core.create_process(caller_credential) {
                 Ok(process) => match process.create_thread() {
                     Ok(initial_thread_id) => (process, initial_thread_id),
                     Err(
