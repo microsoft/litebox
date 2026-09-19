@@ -15,17 +15,15 @@ use std::time::{Duration, Instant};
 
 use litebox_broker_core::BrokerCore;
 
-use crate::runtime::AssociationFailureCause;
-
+mod launcher;
 #[cfg(target_os = "linux")]
 mod linux;
-mod process_manager;
 #[cfg(all(windows, target_arch = "x86_64"))]
 mod windows;
 
+pub(crate) use launcher::{RunnerLauncher, RunnerStartup};
 #[cfg(target_os = "linux")]
 use linux::PlatformRunnerEndpoint;
-pub(crate) use process_manager::{AssociationFailure, RunnerProcessManager, RunnerStartup};
 #[cfg(all(windows, target_arch = "x86_64"))]
 use windows::PlatformRunnerEndpoint;
 
@@ -107,8 +105,7 @@ struct RunnerShutdown {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RunnerShutdownState {
     Active,
-    Firing,
-    Fired,
+    Terminating,
     Retired,
 }
 
@@ -139,16 +136,16 @@ impl RunnerShutdown {
         loop {
             match *state {
                 RunnerShutdownState::Active => {
-                    *state = RunnerShutdownState::Firing;
+                    *state = RunnerShutdownState::Terminating;
                     break;
                 }
-                RunnerShutdownState::Firing => {
+                RunnerShutdownState::Terminating => {
                     state = self
                         .changed
                         .wait(state)
                         .expect("runner shutdown mutex poisoned");
                 }
-                RunnerShutdownState::Fired | RunnerShutdownState::Retired => return,
+                RunnerShutdownState::Retired => return,
             }
         }
         drop(state);
@@ -170,14 +167,14 @@ impl RunnerShutdown {
             self.termination_dispatched.store(true, Ordering::Release);
         }
         let mut state = self.state.lock().expect("runner shutdown mutex poisoned");
-        debug_assert_eq!(*state, RunnerShutdownState::Firing);
-        *state = RunnerShutdownState::Fired;
+        debug_assert_eq!(*state, RunnerShutdownState::Terminating);
+        *state = RunnerShutdownState::Retired;
         self.changed.notify_all();
     }
 
     fn retire(&self) {
         let mut state = self.state.lock().expect("runner shutdown mutex poisoned");
-        while *state == RunnerShutdownState::Firing {
+        while *state == RunnerShutdownState::Terminating {
             state = self
                 .changed
                 .wait(state)
@@ -244,11 +241,10 @@ impl RunnerInstance {
     ///
     /// Panics if another runner owner poisoned the process mutex.
     pub fn run_to_completion(mut self, broker: &BrokerCore) -> IoResult<ExitStatus> {
-        let process_manager =
-            RunnerProcessManager::new(self.started_runner_config.clone(), broker.clone());
-        let mut association_result =
-            self.endpoint
-                .serve(&self.runner, None, Arc::clone(&process_manager));
+        let launcher = RunnerLauncher::new(self.started_runner_config.clone(), broker.clone());
+        let mut association_result = self
+            .endpoint
+            .serve(&self.runner, None, Arc::clone(&launcher));
         self.endpoint.close();
         let runner_exited = if association_result.result.is_ok() {
             self.shutdown
@@ -272,9 +268,13 @@ impl RunnerInstance {
                 ) || runner_exit_code_is_crash(status.code())
             });
         if let Some(process) = association_result.process.take() {
-            process.cleanup(!root_abnormal);
+            let process_id = process.id();
+            if root_abnormal {
+                process.mark_abnormal();
+            }
+            process.retire(!root_abnormal);
+            launcher.wait_for_drain(process_id);
         }
-        process_manager.wait_for_drain();
         let runner_status = runner_status?;
         runner_exited?;
         association_result.result?;
@@ -284,24 +284,19 @@ impl RunnerInstance {
     fn run_started_process_to_completion(
         mut self,
         startup: RunnerStartup,
-        process_manager: Arc<RunnerProcessManager>,
+        launcher: Arc<RunnerLauncher>,
     ) -> RunnerCompletion {
-        let transaction = startup.transaction();
-        transaction.install_shutdown(Arc::clone(&self.shutdown));
-        let association_result = self
-            .endpoint
-            .serve(&self.runner, Some(startup), process_manager);
+        let process = Arc::clone(&startup.process);
+        let shutdown = Arc::clone(&self.shutdown);
+        process.install_shutdown(Arc::new(move || shutdown.shutdown()));
+        let association_result = self.endpoint.serve(&self.runner, Some(startup), launcher);
         self.endpoint.close();
-        let shutdown_request = transaction.shutdown_request();
-        let shutdown_was_expected = shutdown_request.was_expected();
+        let shutdown_was_expected = process.shutdown_was_expected();
         if association_result.abnormal {
-            transaction.mark_abnormal();
+            process.mark_abnormal();
         }
         let runner_exited = if !shutdown_was_expected
-            && matches!(
-                association_result.failure_cause,
-                AssociationFailureCause::None | AssociationFailureCause::PeerClosed
-            )
+            && !association_result.abnormal
             && !association_result.panicked
         {
             self.shutdown
@@ -310,32 +305,24 @@ impl RunnerInstance {
             self.shutdown.has_exited()
         };
         let shutdown_observation_failed = match runner_exited {
-            Ok(true) => {
-                if association_result.failure_cause == AssociationFailureCause::Other {
-                    transaction.mark_abnormal();
-                }
-                false
-            }
+            Ok(true) => false,
             Ok(false) => {
-                if !shutdown_was_expected
-                    || association_result.failure_cause == AssociationFailureCause::Other
-                {
-                    transaction.mark_abnormal();
+                if !shutdown_was_expected {
+                    process.mark_abnormal();
                 }
-                transaction.mark_shutdown_expected();
-                self.shutdown.shutdown();
+                process.request_shutdown(true);
                 false
             }
             Err(_) => {
-                transaction.mark_abnormal();
-                self.shutdown.shutdown();
+                process.mark_abnormal();
+                process.request_shutdown(true);
                 true
             }
         };
         self.shutdown.retire();
         let runner_status = wait_for_runner_exit(&self.runner);
         if runner_status.is_err() {
-            transaction.mark_abnormal();
+            process.mark_abnormal();
         }
         let runner_signal = runner_status
             .as_ref()
@@ -385,6 +372,14 @@ const fn runner_signal_is_abnormal(signal: Option<i32>, broker_termination: bool
 const fn runner_signal_is_abnormal(_signal: Option<i32>, _broker_termination: bool) -> bool {
     false
 }
+
+#[cfg(target_os = "linux")]
+const _: () = {
+    assert!(runner_signal_is_abnormal(Some(libc::SIGSEGV), true));
+    assert!(runner_signal_is_abnormal(Some(libc::SIGKILL), false));
+    assert!(!runner_signal_is_abnormal(Some(libc::SIGKILL), true));
+    assert!(!runner_signal_is_abnormal(None, false));
+};
 
 #[cfg(all(windows, target_arch = "x86_64"))]
 const fn runner_exit_code_is_crash(exit_code: Option<i32>) -> bool {
@@ -519,24 +514,5 @@ mod tests {
 
         assert!(!shutdown.termination_was_dispatched());
         assert!(!wait_for_runner_exit(&runner).unwrap().success());
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn signal_termination_is_distinct_from_an_ordinary_nonzero_exit() {
-        use super::{runner_exit_signal, runner_signal_is_abnormal};
-        use std::process::Command;
-
-        let signaled = Command::new("sh")
-            .args(["-c", "kill -SEGV $$"])
-            .status()
-            .unwrap();
-        let nonzero = Command::new("sh").args(["-c", "exit 7"]).status().unwrap();
-
-        let signal = runner_exit_signal(signaled);
-        assert!(signal.is_some());
-        assert!(runner_exit_signal(nonzero).is_none());
-        assert!(runner_signal_is_abnormal(signal, true));
-        assert!(!runner_signal_is_abnormal(Some(libc::SIGKILL), true));
     }
 }

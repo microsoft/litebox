@@ -49,8 +49,6 @@ const REQUEST_TAG_FILE: u8 = 8;
 const REQUEST_TAG_CREATE_THREAD: u8 = 9;
 const REQUEST_TAG_EXIT_THREAD: u8 = 10;
 const REQUEST_TAG_START_CHILD_PROCESS: u8 = 11;
-// Tag 12 is reserved for the removed process-start acknowledgement.
-// Tags 13 and 14 are reserved for the removed process-ready protocol.
 
 // Paired request and successful-response tags intentionally share values.
 const RESPONSE_TAG_NEGOTIATED: u8 = 0;
@@ -65,8 +63,6 @@ const RESPONSE_TAG_FILE: u8 = 8;
 const RESPONSE_TAG_THREAD_CREATED: u8 = 9;
 const RESPONSE_TAG_THREAD_EXITED: u8 = 10;
 const RESPONSE_TAG_PROCESS_STARTED: u8 = 11;
-// Tag 12 is reserved for the removed process-start acknowledgement.
-// Tags 13 and 14 are reserved for the removed process-ready protocol.
 
 // Reserve the top of the tag space for responses without paired requests.
 const RESPONSE_TAG_ERROR: u8 = 253;

@@ -52,6 +52,7 @@ pub use policy::{
 use process::ObjectReference;
 pub use process::{
     AssociationCancellation, BrokerProcess, BrokerThread, CallerCredential, ObjectRights,
+    ProcessControl, ProcessLifecycleSink,
 };
 use random::RandomProvider;
 use socket::{BrokerSocketPorts, SocketProvider};
@@ -213,9 +214,18 @@ pub struct BrokerCore {
     pub(crate) socket_provider: Arc<dyn SocketProvider>,
     pub(crate) fs: Arc<dyn FileService>,
     pub(crate) socket_ports: BrokerSocketPorts,
+    pub(crate) process_lifecycle_sink: Arc<dyn ProcessLifecycleSink>,
 }
 
 static BROKER_CORE_CREATED: AtomicBool = AtomicBool::new(false);
+
+struct NoopProcessLifecycleSink;
+
+impl ProcessLifecycleSink for NoopProcessLifecycleSink {
+    fn state_changed(&self, _process_id: ProcessId) {}
+
+    fn retired(&self, _process_id: ProcessId) {}
+}
 
 impl BrokerCore {
     /// Creates the broker core with broker-wide service providers.
@@ -266,7 +276,26 @@ impl BrokerCore {
             socket_provider,
             fs,
             socket_ports: BrokerSocketPorts::default(),
+            process_lifecycle_sink: Arc::new(NoopProcessLifecycleSink),
         })
+    }
+
+    /// Returns a broker handle that publishes process lifecycle changes to `sink`.
+    #[must_use]
+    pub fn with_process_lifecycle_sink(&self, sink: Arc<dyn ProcessLifecycleSink>) -> Self {
+        Self {
+            process_lifecycle_sink: sink,
+            ..self.clone()
+        }
+    }
+
+    /// Returns whether a process other than `process_id` remains registered.
+    #[must_use]
+    pub fn has_processes_other_than(&self, process_id: ProcessId) -> bool {
+        self.processes
+            .read()
+            .keys()
+            .any(|candidate| *candidate != process_id)
     }
 
     /// Returns the configured authority-state limits.
@@ -310,6 +339,7 @@ impl BrokerCore {
     pub fn create_process(
         &self,
         caller_credential: CallerCredential,
+        parent_id: Option<ProcessId>,
     ) -> Result<Arc<BrokerProcess>> {
         let mut processes = self.processes.write();
         if processes.len() >= self.limits.max_processes {
@@ -320,7 +350,12 @@ impl BrokerCore {
             .map_err(|_| BrokerError::OutOfMemory)?;
         let raw_id = self.ids.lock().allocate()?;
         let id = ProcessId(raw_id);
-        let process = Arc::new(BrokerProcess::new(self.clone(), id, caller_credential));
+        let process = Arc::new(BrokerProcess::new(
+            self.clone(),
+            id,
+            parent_id,
+            caller_credential,
+        ));
         assert!(
             processes.insert(id, Arc::downgrade(&process)).is_none(),
             "the ID allocator returned an occupied process ID"

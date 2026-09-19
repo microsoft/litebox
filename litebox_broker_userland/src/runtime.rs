@@ -25,7 +25,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use litebox_broker_core::{BrokerCore, BrokerProcess};
+use litebox_broker_core::{BrokerCore, BrokerProcess, ProcessControl};
 use litebox_broker_host::{
     BrokerHostAssociation, BrokerHostError, ConnectionTermination, setup_connection,
 };
@@ -40,26 +40,27 @@ use litebox_broker_transport::control_ring::ControlRing;
 use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedBufferPool, SharedMemory};
 
 use crate::readiness::ReadinessPublisherRuntime;
-use crate::runner::{RunnerProcessManager, RunnerStartup};
+use crate::runner::{RunnerLauncher, RunnerStartup};
 
 const REQUEST_QUEUE_CAPACITY: usize = 64;
 const REQUEST_QUEUE_RETRY_DELAY: Duration = Duration::from_millis(1);
 const REQUEST_QUEUE_STALL_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub(crate) struct AssociationRunResult {
+pub(crate) struct AssociationOutcome {
     pub(crate) result: IoResult<()>,
     pub(crate) process: Option<Arc<BrokerProcess>>,
     pub(crate) panicked: bool,
     pub(crate) abnormal: bool,
-    pub(crate) failure_cause: AssociationFailureCause,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AssociationFailureCause {
-    None,
-    PeerClosed,
-    RunnerExit,
-    Other,
+pub(crate) fn is_peer_closed_error(error: &IoError) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::BrokenPipe
+            | ErrorKind::UnexpectedEof
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+    )
 }
 
 /// Serves an association for the development-only in-process runner.
@@ -137,8 +138,8 @@ pub(crate) fn serve_out_of_process_runner_association<
         SetupChannel,
         ControlRing<Memory>,
     ) -> IoResult<(RequestSource, ResponseSink, NotificationChannel, Shutdown)>,
-    process_manager: Arc<RunnerProcessManager>,
-) -> AssociationRunResult
+    launcher: Arc<RunnerLauncher>,
+) -> AssociationOutcome
 where
     Memory: ControlRingMemory,
     SetupChannel: HostSetupChannel<Error = IoError>,
@@ -151,7 +152,7 @@ where
     let abnormal = AtomicBool::new(false);
     let process = Mutex::new(None);
     let defer_process_finish = startup.is_none();
-    let broker = process_manager.broker();
+    let broker = launcher.broker();
     let result = serve_association_inner(
         &broker,
         control_channel,
@@ -159,34 +160,20 @@ where
         create_control_memory,
         send_shared_memory,
         activate,
-        Some(process_manager),
+        Some(launcher),
         startup,
         Some(&panicked),
         Some(&abnormal),
         defer_process_finish.then_some(&process),
     );
-    let failure_cause = match result.as_ref() {
-        Ok(()) => AssociationFailureCause::None,
-        Err(error)
-            if matches!(
-                error.kind(),
-                ErrorKind::BrokenPipe
-                    | ErrorKind::UnexpectedEof
-                    | ErrorKind::ConnectionReset
-                    | ErrorKind::ConnectionAborted
-            ) =>
-        {
-            AssociationFailureCause::PeerClosed
-        }
-        Err(_) => AssociationFailureCause::Other,
-    };
-    AssociationRunResult {
+    let result_is_abnormal = result
+        .as_ref()
+        .is_err_and(|error| !is_peer_closed_error(error));
+    AssociationOutcome {
         result,
         process: process.into_inner().expect("runner process mutex poisoned"),
         panicked: panicked.load(Ordering::Acquire),
-        abnormal: abnormal.load(Ordering::Acquire)
-            || failure_cause == AssociationFailureCause::Other,
-        failure_cause,
+        abnormal: abnormal.load(Ordering::Acquire) || result_is_abnormal,
     }
 }
 
@@ -208,7 +195,7 @@ fn serve_association_inner<
         SetupChannel,
         ControlRing<Memory>,
     ) -> IoResult<(RequestSource, ResponseSink, NotificationChannel, Shutdown)>,
-    process_manager: Option<Arc<RunnerProcessManager>>,
+    launcher: Option<Arc<RunnerLauncher>>,
     startup: Option<RunnerStartup>,
     panicked_out: Option<&AtomicBool>,
     abnormal_out: Option<&AtomicBool>,
@@ -222,7 +209,7 @@ where
     NotificationChannel: HostNotificationChannel<Error = IoError> + Send,
     Shutdown: HostAssociationShutdown<Error = IoError> + Send + Sync + 'static,
 {
-    let has_parent_transaction = startup.is_some();
+    let has_parent_startup = startup.is_some();
     let (process, startup) = match startup {
         Some(startup) => {
             let (process, data) = startup.into_process_and_data();
@@ -279,7 +266,7 @@ where
         match activate(control_channel, control_ring) {
             Ok(active) => active,
             Err(error) => {
-                if !has_parent_transaction && process_out.is_none() {
+                if !has_parent_startup && process_out.is_none() {
                     association.finish();
                 }
                 return Err(error);
@@ -292,9 +279,8 @@ where
         response_sink,
         notification_channel,
         shutdown,
-        process_manager,
-        has_parent_transaction,
-        !has_parent_transaction && process_out.is_none(),
+        launcher,
+        !has_parent_startup && process_out.is_none(),
         panicked_out,
         abnormal_out,
     )
@@ -366,13 +352,7 @@ impl<Shutdown: HostAssociationShutdown<Error = IoError>>
     }
 
     fn report(&self, error: IoError) {
-        if !matches!(
-            error.kind(),
-            ErrorKind::BrokenPipe
-                | ErrorKind::UnexpectedEof
-                | ErrorKind::ConnectionReset
-                | ErrorKind::ConnectionAborted
-        ) {
+        if !is_peer_closed_error(&error) {
             self.abnormal.store(true, Ordering::Release);
         }
         if self.failed.swap(true, Ordering::AcqRel) {
@@ -484,8 +464,7 @@ fn dispatch_requests<Memory, RequestSource, ResponseSink, NotificationChannel, S
     response_sink: ResponseSink,
     mut notification_channel: NotificationChannel,
     shutdown: Shutdown,
-    process_manager: Option<Arc<RunnerProcessManager>>,
-    has_parent_transaction: bool,
+    launcher: Option<Arc<RunnerLauncher>>,
     finish_process: bool,
     panicked_out: Option<&AtomicBool>,
     abnormal_out: Option<&AtomicBool>,
@@ -498,33 +477,24 @@ where
     Shutdown: HostAssociationShutdown<Error = IoError> + Send + Sync + 'static,
 {
     let association = Arc::new(association);
-    let process_id = association.process_id();
     let failure_coordinator = Arc::new(HostAssociationFailureCoordinator::new(shutdown));
-    if let Some(process_manager) = &process_manager {
+    let association_failure = launcher.as_ref().map(|_| {
         let association_failure = Arc::clone(&failure_coordinator);
-        let association_failure: crate::runner::AssociationFailure = Arc::new(move || {
+        let association_failure: ProcessControl = Arc::new(move || {
             association_failure.report(IoError::new(
                 ErrorKind::ConnectionAborted,
                 "process association terminated by process-start control",
             ));
         });
-        process_manager.register_association(
-            association.process_id(),
-            association_failure,
-            has_parent_transaction,
-            || association.activate_process().map_err(ErrorCode::from),
-        )?;
-    } else if has_parent_transaction {
-        return Err(IoError::other(
-            "a process with a parent transaction requires a process manager",
-        ));
-    } else {
-        association.activate_process().map_err(|error| {
+        association_failure
+    });
+    association
+        .activate_process(association_failure)
+        .map_err(|error| {
             IoError::other(format!(
                 "failed to activate broker process association: {error}"
             ))
         })?;
-    }
     let (request_sender, request_receiver) = sync_channel(REQUEST_QUEUE_CAPACITY);
     let request_receiver = Arc::new(Mutex::new(request_receiver));
 
@@ -571,7 +541,7 @@ where
             let request_receiver = Arc::clone(&request_receiver);
             let response_sink = response_sink.clone();
             let worker_failure_coordinator = Arc::clone(&failure_coordinator);
-            let process_manager_for_worker = process_manager.clone();
+            let launcher_for_worker = launcher.clone();
             match std::thread::Builder::new()
                 .name(format!("litebox-broker-worker-{worker_id}"))
                 .spawn_scoped(scope, move || {
@@ -580,7 +550,7 @@ where
                         &request_receiver,
                         &response_sink,
                         &worker_failure_coordinator,
-                        process_manager_for_worker.as_ref(),
+                        launcher_for_worker.as_ref(),
                     );
                 }) {
                 Ok(worker) => workers.push(worker),
@@ -593,9 +563,7 @@ where
 
         read_requests(&mut request_source, request_sender, &failure_coordinator);
         drop(cancellation);
-        if let Some(process_manager) = &process_manager {
-            process_manager.association_ending(process_id);
-        }
+        association.association_ending();
         for worker in workers {
             if worker.join().is_err() {
                 failure_coordinator.report_panic(IoError::other("broker request worker panicked"));
@@ -616,10 +584,6 @@ where
             failure_coordinator.report_panic(IoError::other("broker readiness publisher panicked"));
         }
     });
-
-    if let Some(process_manager) = &process_manager {
-        process_manager.association_ended(process_id);
-    }
 
     let result = match failure_coordinator.take_error() {
         Some(error) => Err(error),
@@ -725,7 +689,7 @@ fn run_worker<Memory, ResponseSink, Shutdown>(
     request_receiver: &Mutex<Receiver<BrokerRequest>>,
     response_sink: &ResponseSink,
     failure_coordinator: &HostAssociationFailureCoordinator<Shutdown>,
-    process_manager: Option<&Arc<RunnerProcessManager>>,
+    launcher: Option<&Arc<RunnerLauncher>>,
 ) where
     Memory: SharedMemory,
     ResponseSink: HostResponseSink<Error = IoError>,
@@ -746,8 +710,8 @@ fn run_worker<Memory, ResponseSink, Shutdown>(
             association.execute_request_with(
                 request,
                 |process, operation, shared_buffers| {
-                    process_manager.and_then(|process_manager| {
-                        process_manager.handle_operation(process, operation, shared_buffers)
+                    launcher.and_then(|launcher| {
+                        launcher.handle_operation(process, operation, shared_buffers)
                     })
                 },
                 |response| response_sink.send_response(response),
@@ -994,7 +958,6 @@ mod tests {
                     notifications,
                     shutdown,
                     None,
-                    false,
                     true,
                     None,
                     None,

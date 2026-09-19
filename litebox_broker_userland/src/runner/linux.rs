@@ -16,9 +16,9 @@ use litebox_broker_transport_linux_userland::unix_socket::{
 };
 
 use super::{
-    RunnerProcessManager, RunnerStartup, SETUP_TIMEOUT, accept_runner_channel, runner_has_exited,
+    RunnerLauncher, RunnerStartup, SETUP_TIMEOUT, accept_runner_channel, runner_has_exited,
 };
-use crate::runtime::{AssociationFailureCause, AssociationRunResult};
+use crate::runtime::{AssociationOutcome, is_peer_closed_error};
 
 pub(super) struct PlatformRunnerEndpoint {
     socket_path: PathBuf,
@@ -49,15 +49,15 @@ impl PlatformRunnerEndpoint {
         &mut self,
         runner: &Arc<Mutex<Child>>,
         startup: Option<RunnerStartup>,
-        process_manager: Arc<RunnerProcessManager>,
-    ) -> AssociationRunResult {
+        launcher: Arc<RunnerLauncher>,
+    ) -> AssociationOutcome {
         serve_association(
             self.listener
                 .as_ref()
                 .expect("a live runner instance must own its control listener"),
             runner,
             startup,
-            process_manager,
+            launcher,
         )
     }
 
@@ -71,37 +71,23 @@ fn serve_association(
     control_listener: &UnixListener,
     runner: &Arc<Mutex<Child>>,
     startup: Option<RunnerStartup>,
-    process_manager: Arc<RunnerProcessManager>,
-) -> AssociationRunResult {
-    let has_parent_transaction = startup.is_some();
+    launcher: Arc<RunnerLauncher>,
+) -> AssociationOutcome {
+    let has_parent_startup = startup.is_some();
     let (control_channel, setup_deadline) = match accept_control_channel(control_listener, runner) {
         Ok(connection) => connection,
         Err(error) => {
-            let failure_cause = if runner_has_exited(runner).unwrap_or(false) {
-                AssociationFailureCause::RunnerExit
-            } else if has_parent_transaction
-                && matches!(
-                    error.kind(),
-                    std::io::ErrorKind::BrokenPipe
-                        | std::io::ErrorKind::UnexpectedEof
-                        | std::io::ErrorKind::ConnectionReset
-                        | std::io::ErrorKind::ConnectionAborted
-                )
-            {
-                AssociationFailureCause::PeerClosed
-            } else {
-                AssociationFailureCause::Other
-            };
-            return AssociationRunResult {
+            let abnormal = !(runner_has_exited(runner).unwrap_or(false)
+                || has_parent_startup && is_peer_closed_error(&error));
+            return AssociationOutcome {
                 result: Err(error),
                 process: None,
                 panicked: false,
-                abnormal: failure_cause == AssociationFailureCause::Other,
-                failure_cause,
+                abnormal,
             };
         }
     };
-    let mut result = crate::runtime::serve_out_of_process_runner_association(
+    crate::runtime::serve_out_of_process_runner_association(
         startup,
         control_channel,
         || MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE),
@@ -112,19 +98,8 @@ fn serve_association(
             Ok(())
         },
         UnixStreamHostSetupChannel::into_active,
-        process_manager,
-    );
-    if has_parent_transaction
-        && result.failure_cause == AssociationFailureCause::Other
-        && result
-            .result
-            .as_ref()
-            .is_err_and(|error| error.kind() == std::io::ErrorKind::BrokenPipe)
-        && runner_has_exited(runner).unwrap_or(false)
-    {
-        result.failure_cause = AssociationFailureCause::RunnerExit;
-    }
-    result
+        launcher,
+    )
 }
 
 fn accept_control_channel(
