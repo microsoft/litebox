@@ -406,12 +406,6 @@ impl BrokerProcess {
         Ok(thread_id)
     }
 
-    /// Returns whether this process owns the live broker thread.
-    #[must_use]
-    pub fn owns_thread(&self, thread_id: ThreadId) -> bool {
-        self.threads.lock().contains_key(&thread_id)
-    }
-
     /// Records broker thread exit after its local task teardown completes.
     pub fn exit_thread(&self, thread_id: ThreadId) -> Result<()> {
         let mut threads = self.threads.lock();
@@ -1011,9 +1005,7 @@ impl Drop for BrokerProcess {
 mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{
-        ProcessLifecycleSink, ProcessReferences, ProcessStartupState, release_pending_reference,
-    };
+    use super::{ProcessLifecycleSink, ProcessReferences, release_pending_reference};
     use crate::test_platform::TestPlatform;
     use crate::test_support::{TestBrokerCoreBuilder, TestStdioProvider};
     use crate::{
@@ -1067,60 +1059,6 @@ mod tests {
     }
 
     #[test]
-    fn process_recognizes_only_its_live_threads() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
-            ObjectRights::all(),
-        ))
-        .build()
-        .unwrap();
-        let first = broker
-            .create_process(CallerCredential::Unauthenticated, None)
-            .unwrap();
-        let second = broker
-            .create_process(CallerCredential::Unauthenticated, None)
-            .unwrap();
-        let thread = first.create_thread().unwrap();
-
-        assert!(first.owns_thread(thread));
-        assert!(!second.owns_thread(thread));
-        first.exit_thread(thread).unwrap();
-        assert!(!first.owns_thread(thread));
-    }
-
-    #[test]
-    fn process_creation_and_reference_inheritance_are_separate() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
-            ObjectRights::all(),
-        ))
-        .build()
-        .unwrap();
-        let parent = broker
-            .create_process(CallerCredential::Unauthenticated, None)
-            .unwrap();
-        let source_handle = crate::event::create(&parent, 1).unwrap();
-        let process = broker
-            .create_process(parent.caller_credential(), None)
-            .unwrap();
-        let inherited_objects = parent
-            .duplicate_object_references_to(&[source_handle], &process)
-            .unwrap();
-        let initial_thread_id = process.create_thread().unwrap();
-        let inherited_handle = inherited_objects[0];
-
-        assert!(process.owns_thread(initial_thread_id));
-        assert_ne!(inherited_handle, source_handle);
-        assert_eq!(
-            process.check_readiness(inherited_handle).unwrap(),
-            ReadinessFlags::READ | ReadinessFlags::WRITE
-        );
-        assert!(!process.is_running());
-
-        process.complete_start().unwrap();
-        assert!(process.is_running());
-        assert_eq!(process.state.lock().startup, ProcessStartupState::Running);
-    }
-
-    #[test]
     fn parent_teardown_fails_a_starting_child() {
         let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
@@ -1164,6 +1102,7 @@ mod tests {
         let retained = Arc::clone(&process);
         process.complete_start().unwrap();
         process.retire(true);
+        assert_eq!(process.complete_start(), Err(BrokerError::PeerClosed));
         drop(process);
 
         assert!(matches!(
@@ -1207,60 +1146,6 @@ mod tests {
             source.check_readiness(source_handle).unwrap(),
             ReadinessFlags::READ | ReadinessFlags::WRITE
         );
-    }
-
-    #[test]
-    fn finished_starting_process_releases_process_capacity() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
-            ObjectRights::all(),
-        ))
-        .with_limits(BrokerCoreLimits::DEFAULT.with_process_limit(2))
-        .build()
-        .unwrap();
-        let parent = broker
-            .create_process(CallerCredential::Unauthenticated, None)
-            .unwrap();
-        let process = broker
-            .create_process(parent.caller_credential(), None)
-            .unwrap();
-
-        assert_eq!(
-            broker
-                .create_process(parent.caller_credential(), None)
-                .err(),
-            Some(BrokerError::ResourceExhausted)
-        );
-        process.cleanup(true);
-        assert!(
-            broker
-                .create_process(parent.caller_credential(), None)
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn process_cannot_complete_start_after_teardown() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
-            ObjectRights::all(),
-        ))
-        .with_limits(BrokerCoreLimits::DEFAULT.with_process_limit(2))
-        .build()
-        .unwrap();
-        let parent = broker
-            .create_process(CallerCredential::Unauthenticated, None)
-            .unwrap();
-        let process = broker
-            .create_process(parent.caller_credential(), None)
-            .unwrap();
-
-        process.cleanup(true);
-        process.cleanup(true);
-
-        assert_eq!(process.complete_start(), Err(BrokerError::PeerClosed));
-        let replacement = broker
-            .create_process(parent.caller_credential(), None)
-            .unwrap();
-        replacement.cleanup(true);
     }
 
     #[test]

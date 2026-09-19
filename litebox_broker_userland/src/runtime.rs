@@ -27,7 +27,8 @@ use std::time::{Duration, Instant};
 
 use litebox_broker_core::{BrokerCore, BrokerProcess};
 use litebox_broker_host::{
-    BrokerHostAssociation, BrokerHostError, ConnectionTermination, setup_connection,
+    BrokerHostAssociation, BrokerHostError, ConnectionTermination, handle_process_operation,
+    setup_connection,
 };
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::message::BrokerRequest;
@@ -40,7 +41,7 @@ use litebox_broker_transport::control_ring::ControlRing;
 use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedBufferPool, SharedMemory};
 
 use crate::readiness::ReadinessPublisherRuntime;
-use crate::runner::{RunnerLauncher, RunnerStartup};
+use crate::runner::{PendingRunnerAssociation, UserlandProcessLauncher};
 
 const REQUEST_QUEUE_CAPACITY: usize = 64;
 const REQUEST_QUEUE_RETRY_DELAY: Duration = Duration::from_millis(1);
@@ -50,11 +51,6 @@ pub(crate) struct AssociationOutcome {
     pub(crate) result: IoResult<()>,
     pub(crate) process: Option<Arc<BrokerProcess>>,
     pub(crate) abnormal: bool,
-}
-
-struct AssociationDispatchOutcome {
-    result: IoResult<()>,
-    abnormal: bool,
 }
 
 pub(crate) fn is_peer_closed_error(error: &IoError) -> bool {
@@ -124,6 +120,7 @@ where
 ///
 /// Unlike the in-process path, this reports process ownership and failure
 /// details to `RunnerInstance`, which owns runner termination and cleanup.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn serve_out_of_process_runner_association<
     Memory,
     SetupChannel,
@@ -132,7 +129,8 @@ pub(crate) fn serve_out_of_process_runner_association<
     NotificationChannel,
     Shutdown,
 >(
-    startup: Option<RunnerStartup>,
+    startup: Option<PendingRunnerAssociation>,
+    broker: BrokerCore,
     control_channel: SetupChannel,
     create_shared_memory: impl FnOnce() -> IoResult<Memory>,
     create_control_memory: impl FnOnce() -> IoResult<Memory>,
@@ -141,7 +139,7 @@ pub(crate) fn serve_out_of_process_runner_association<
         SetupChannel,
         ControlRing<Memory>,
     ) -> IoResult<(RequestSource, ResponseSink, NotificationChannel, Shutdown)>,
-    launcher: Arc<RunnerLauncher>,
+    launcher: Arc<UserlandProcessLauncher>,
 ) -> AssociationOutcome
 where
     Memory: ControlRingMemory,
@@ -153,7 +151,6 @@ where
 {
     let mut process = None;
     let defer_process_finish = startup.is_none();
-    let broker = launcher.broker();
     let outcome = serve_association_inner(
         &broker,
         control_channel,
@@ -165,18 +162,21 @@ where
         startup,
         defer_process_finish.then_some(&mut process),
     );
-    let (result, abnormal) = match outcome {
-        Ok(outcome) => (outcome.result, outcome.abnormal),
-        Err(error) => (Err(error), false),
+    let mut outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => AssociationOutcome {
+            result: Err(error),
+            process: None,
+            abnormal: false,
+        },
     };
-    let result_is_abnormal = result
+    outcome.process = process;
+    let result_is_abnormal = outcome
+        .result
         .as_ref()
         .is_err_and(|error| !is_peer_closed_error(error));
-    AssociationOutcome {
-        result,
-        process,
-        abnormal: abnormal || result_is_abnormal,
-    }
+    outcome.abnormal |= result_is_abnormal;
+    outcome
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -197,10 +197,10 @@ fn serve_association_inner<
         SetupChannel,
         ControlRing<Memory>,
     ) -> IoResult<(RequestSource, ResponseSink, NotificationChannel, Shutdown)>,
-    launcher: Option<Arc<RunnerLauncher>>,
-    startup: Option<RunnerStartup>,
+    launcher: Option<Arc<UserlandProcessLauncher>>,
+    startup: Option<PendingRunnerAssociation>,
     process_out: Option<&mut Option<Arc<BrokerProcess>>>,
-) -> IoResult<AssociationDispatchOutcome>
+) -> IoResult<AssociationOutcome>
 where
     Memory: ControlRingMemory,
     SetupChannel: HostSetupChannel<Error = IoError>,
@@ -213,7 +213,7 @@ where
     let retain_process = process_out.is_some();
     let (process, startup) = match startup {
         Some(startup) => {
-            let (process, data) = startup.into_process_and_data();
+            let (process, data) = startup.into_process_and_startup();
             (Some(process), Some(data))
         }
         None => (None, None),
@@ -274,6 +274,7 @@ where
             }
         };
     Ok(dispatch_requests(
+        broker.clone(),
         association,
         readiness,
         request_source,
@@ -457,15 +458,16 @@ impl<Memory: SharedMemory> Drop for AssociationCancellationGuard<'_, '_, Memory>
 /// reactor is currently its production source.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_requests<Memory, RequestSource, ResponseSink, NotificationChannel, Shutdown>(
+    broker: BrokerCore,
     association: BrokerHostAssociation<'_, Memory>,
     readiness: Arc<ReadinessPublisherRuntime>,
     mut request_source: RequestSource,
     response_sink: ResponseSink,
     mut notification_channel: NotificationChannel,
     shutdown: Shutdown,
-    launcher: Option<Arc<RunnerLauncher>>,
+    launcher: Option<Arc<UserlandProcessLauncher>>,
     finish_process: bool,
-) -> AssociationDispatchOutcome
+) -> AssociationOutcome
 where
     Memory: SharedMemory,
     RequestSource: HostRequestSource<Error = IoError>,
@@ -476,10 +478,11 @@ where
     let association = Arc::new(association);
     let failure_coordinator = Arc::new(HostAssociationFailureCoordinator::new(shutdown));
     if let Err(error) = association.activate_process() {
-        return AssociationDispatchOutcome {
+        return AssociationOutcome {
             result: Err(IoError::other(format!(
                 "failed to activate broker process association: {error}"
             ))),
+            process: None,
             abnormal: true,
         };
     }
@@ -530,10 +533,12 @@ where
             let response_sink = response_sink.clone();
             let worker_failure_coordinator = Arc::clone(&failure_coordinator);
             let launcher_for_worker = launcher.clone();
+            let broker_for_worker = broker.clone();
             match std::thread::Builder::new()
                 .name(format!("litebox-broker-worker-{worker_id}"))
                 .spawn_scoped(scope, move || {
                     run_worker(
+                        &broker_for_worker,
                         &association,
                         &request_receiver,
                         &response_sink,
@@ -587,7 +592,11 @@ where
     } else {
         association.finish();
     }
-    AssociationDispatchOutcome { result, abnormal }
+    AssociationOutcome {
+        result,
+        process: None,
+        abnormal,
+    }
 }
 
 fn read_requests<RequestSource, Shutdown>(
@@ -668,11 +677,12 @@ where
 }
 
 fn run_worker<Memory, ResponseSink, Shutdown>(
+    broker: &BrokerCore,
     association: &BrokerHostAssociation<'_, Memory>,
     request_receiver: &Mutex<Receiver<BrokerRequest>>,
     response_sink: &ResponseSink,
     failure_coordinator: &HostAssociationFailureCoordinator<Shutdown>,
-    launcher: Option<&Arc<RunnerLauncher>>,
+    launcher: Option<&Arc<UserlandProcessLauncher>>,
 ) where
     Memory: SharedMemory,
     ResponseSink: HostResponseSink<Error = IoError>,
@@ -694,7 +704,13 @@ fn run_worker<Memory, ResponseSink, Shutdown>(
                 request,
                 |process, operation, shared_buffers| {
                     launcher.and_then(|launcher| {
-                        launcher.handle_operation(process, operation, shared_buffers)
+                        handle_process_operation(
+                            broker,
+                            launcher,
+                            process,
+                            operation,
+                            shared_buffers,
+                        )
                     })
                 },
                 |response| response_sink.send_response(response),
@@ -934,6 +950,7 @@ mod tests {
             outcome_sender
                 .send(
                     dispatch_requests(
+                        broker.clone(),
                         association,
                         readiness,
                         request_source,

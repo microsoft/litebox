@@ -8,6 +8,7 @@ use std::process::Child;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use litebox_broker_core::BrokerCore;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport_windows_userland::named_pipe::{
     WindowsNamedPipeHostSetupChannel, WindowsNamedPipeListener, validate_client_process,
@@ -15,7 +16,8 @@ use litebox_broker_transport_windows_userland::named_pipe::{
 use litebox_broker_transport_windows_userland::shared_memory::WindowsSharedMemory;
 
 use super::{
-    RunnerLauncher, RunnerStartup, SETUP_TIMEOUT, accept_runner_channel, runner_has_exited,
+    PendingRunnerAssociation, SETUP_TIMEOUT, UserlandProcessLauncher, accept_runner_channel,
+    runner_has_exited,
 };
 use crate::runtime::{AssociationOutcome, is_peer_closed_error};
 
@@ -41,8 +43,9 @@ impl PlatformRunnerEndpoint {
     pub(super) fn serve(
         &mut self,
         runner: &Arc<Mutex<Child>>,
-        startup: Option<RunnerStartup>,
-        launcher: Arc<RunnerLauncher>,
+        startup: Option<PendingRunnerAssociation>,
+        broker: BrokerCore,
+        launcher: Arc<UserlandProcessLauncher>,
     ) -> AssociationOutcome {
         serve_association(
             self.listener
@@ -50,6 +53,7 @@ impl PlatformRunnerEndpoint {
                 .expect("a live runner instance must own its control listener"),
             runner,
             startup,
+            broker,
             launcher,
         )
     }
@@ -62,8 +66,9 @@ impl PlatformRunnerEndpoint {
 fn serve_association(
     control_listener: &mut WindowsNamedPipeListener,
     runner: &Arc<Mutex<Child>>,
-    startup: Option<RunnerStartup>,
-    launcher: Arc<RunnerLauncher>,
+    startup: Option<PendingRunnerAssociation>,
+    broker: BrokerCore,
+    launcher: Arc<UserlandProcessLauncher>,
 ) -> AssociationOutcome {
     let has_parent_startup = startup.is_some();
     let (control_channel, _setup_deadline) = match accept_control_channel(control_listener, runner)
@@ -85,6 +90,7 @@ fn serve_association(
         .as_raw_handle();
     crate::runtime::serve_out_of_process_runner_association(
         startup,
+        broker,
         control_channel,
         || WindowsSharedMemory::create(SHARED_BUFFER_POOL_SIZE),
         WindowsSharedMemory::create_control_ring,

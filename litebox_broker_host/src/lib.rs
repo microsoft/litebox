@@ -24,7 +24,7 @@ extern crate std;
 use alloc::{sync::Arc, vec::Vec};
 
 use litebox_broker_core::readiness::ReadinessSink;
-use litebox_broker_core::{BrokerCore, BrokerProcess, CallerCredential};
+use litebox_broker_core::{BrokerCore, BrokerError, BrokerProcess, CallerCredential};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse};
 use litebox_broker_protocol::fs::{
@@ -44,7 +44,8 @@ use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
 };
 use litebox_broker_protocol::process::{
-    MAX_PROCESS_BOOTSTRAP_SIZE, ProcessStartupData, ProcessStartupDescriptor,
+    InheritedProcessObjects, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessBootstrapFormat,
+    ProcessBootstrapVersion, ProcessIdentity, ProcessStartupData, ProcessStartupDescriptor,
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::shared_buffer::{
@@ -776,6 +777,108 @@ pub fn read_shared_buffer<Memory: SharedMemory>(
         .read_sequence(buffer, &mut data)
         .map_err(shared_buffer_access_failure)?;
     Ok(data)
+}
+
+/// Platform implementation that starts execution for a broker-created process.
+///
+/// Once called, the launcher owns final process retirement even when launch
+/// fails. Success means process startup reached `Running`.
+pub trait ProcessLauncher: Send + Sync {
+    /// Starts one process and waits for startup to commit or fail.
+    fn launch(
+        self: Arc<Self>,
+        process: Arc<BrokerProcess>,
+        initial_thread_id: ThreadId,
+        startup: ProcessStartupData,
+    ) -> core::result::Result<(), BrokerError>;
+}
+
+/// Handles a process operation using the configured platform launcher.
+pub fn handle_process_operation<Memory, Launcher>(
+    broker: &BrokerCore,
+    launcher: &Arc<Launcher>,
+    parent: &BrokerProcess,
+    operation: &BrokerOperation,
+    shared_buffers: &SharedBufferPool<Memory>,
+) -> Option<RequestResult<BrokerResult>>
+where
+    Memory: SharedMemory,
+    Launcher: ProcessLauncher + ?Sized,
+{
+    match operation {
+        BrokerOperation::StartChildProcess(request) => Some(
+            read_shared_buffer(shared_buffers, request.buffer, MAX_PROCESS_BOOTSTRAP_SIZE)
+                .and_then(|payload| {
+                    start_child_process(
+                        broker,
+                        Arc::clone(launcher),
+                        parent,
+                        request.format,
+                        request.version,
+                        payload,
+                        request.inherited_objects,
+                    )
+                })
+                .map(BrokerResult::ProcessStarted),
+        ),
+        _ => None,
+    }
+}
+
+fn start_child_process<Launcher: ProcessLauncher + ?Sized>(
+    broker: &BrokerCore,
+    launcher: Arc<Launcher>,
+    parent: &BrokerProcess,
+    format: ProcessBootstrapFormat,
+    version: ProcessBootstrapVersion,
+    payload: Vec<u8>,
+    requested_inherited_objects: InheritedProcessObjects,
+) -> RequestResult<ProcessIdentity> {
+    if !parent.is_running() {
+        return Err(RequestFailure::Abort(ErrorCode::ProtocolState));
+    }
+    let process = broker
+        .create_process(parent.caller_credential(), Some(parent.id()))
+        .map_err(RequestFailure::from)?;
+    let inherited_objects = match parent
+        .duplicate_object_references_to(requested_inherited_objects.as_slice(), &process)
+    {
+        Ok(inherited_objects) => inherited_objects,
+        Err(error) => {
+            process.retire(true);
+            return Err(RequestFailure::from(error));
+        }
+    };
+    let initial_thread_id = match process.create_thread() {
+        Ok(initial_thread_id) => initial_thread_id,
+        Err(error) => {
+            process.retire(true);
+            return Err(RequestFailure::from(error));
+        }
+    };
+    let inherited_objects = InheritedProcessObjects::new(&inherited_objects)
+        .expect("child handle count must match the bounded inheritance request");
+    let process_id = process.id();
+    if parent.is_cancellation_requested() {
+        process.retire(true);
+        return Err(RequestFailure::Respond(ErrorCode::PeerClosed));
+    }
+    launcher
+        .launch(
+            process,
+            initial_thread_id,
+            ProcessStartupData {
+                format,
+                version,
+                payload,
+                inherited_objects,
+            },
+        )
+        .map_err(RequestFailure::from)?;
+    Ok(ProcessIdentity {
+        process_id,
+        initial_thread_id,
+    })
 }
 
 fn write_shared_buffer<Memory: SharedMemory>(

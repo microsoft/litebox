@@ -7,15 +7,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use litebox_broker_core::{BrokerCore, BrokerError, BrokerProcess, ProcessLifecycleSink};
-use litebox_broker_host::{RequestFailure, read_shared_buffer};
+use litebox_broker_host::ProcessLauncher;
 use litebox_broker_protocol::ThreadId;
-use litebox_broker_protocol::error::ErrorCode;
-use litebox_broker_protocol::message::{BrokerOperation, BrokerResult};
-use litebox_broker_protocol::process::{
-    InheritedProcessObjects, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessBootstrapFormat,
-    ProcessBootstrapVersion, ProcessIdentity, ProcessStartupData,
-};
-use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemory};
+use litebox_broker_protocol::process::ProcessStartupData;
 
 use super::{
     RunnerCompletion, RunnerConfig, RunnerInstance, runner_exit_code_is_crash,
@@ -24,22 +18,22 @@ use super::{
 
 const PROCESS_START_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Immutable service used to launch child runners.
-pub(crate) struct RunnerLauncher {
+/// Userland implementation that starts one out-of-process runner per process.
+pub(crate) struct UserlandProcessLauncher {
     broker: BrokerCore,
     started_runner_config: RunnerConfig,
-    lifecycle: Arc<ProcessLifecycleRuntime>,
+    lifecycle: Arc<ProcessLifecycleNotifier>,
 }
 
-/// Startup context for a runner whose broker process was created by its parent.
-pub(crate) struct RunnerStartup {
+/// Pending association for a runner whose broker process was created by its parent.
+pub(crate) struct PendingRunnerAssociation {
     pub(super) process: Arc<BrokerProcess>,
     initial_thread_id: ThreadId,
     data: ProcessStartupData,
 }
 
-impl RunnerStartup {
-    pub(crate) fn into_process_and_data(
+impl PendingRunnerAssociation {
+    pub(crate) fn into_process_and_startup(
         self,
     ) -> ((Arc<BrokerProcess>, ThreadId), ProcessStartupData) {
         ((self.process, self.initial_thread_id), self.data)
@@ -47,35 +41,39 @@ impl RunnerStartup {
 }
 
 #[derive(Default)]
-struct ProcessLifecycleRuntime {
+struct ProcessLifecycleNotifier {
     state: Mutex<()>,
     changed: Condvar,
 }
 
-impl ProcessLifecycleSink for ProcessLifecycleRuntime {
+impl ProcessLifecycleSink for ProcessLifecycleNotifier {
     fn changed(&self) {
         self.notify();
     }
 }
 
-impl ProcessLifecycleRuntime {
+impl ProcessLifecycleNotifier {
     fn notify(&self) {
         let _state = self.state.lock().expect("process lifecycle mutex poisoned");
         self.changed.notify_all();
     }
 
-    fn wait_for_start(&self, process: &BrokerProcess, timeout: Duration) -> Result<(), ErrorCode> {
+    fn wait_for_start(
+        &self,
+        process: &BrokerProcess,
+        timeout: Duration,
+    ) -> Result<(), BrokerError> {
         let deadline = Instant::now() + timeout;
         let mut state = self.state.lock().expect("process lifecycle mutex poisoned");
         loop {
             if let Some(result) = process.startup_result() {
-                return result.map_err(ErrorCode::from);
+                return result;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 drop(state);
                 process.fail_start(BrokerError::Internal, true, true);
-                return Err(ErrorCode::Internal);
+                return Err(BrokerError::Internal);
             }
             let (next_state, wait_result) = self
                 .changed
@@ -85,7 +83,7 @@ impl ProcessLifecycleRuntime {
             if wait_result.timed_out() && process.startup_result().is_none() {
                 drop(state);
                 process.fail_start(BrokerError::Internal, true, true);
-                return Err(ErrorCode::Internal);
+                return Err(BrokerError::Internal);
             }
         }
     }
@@ -101,9 +99,9 @@ impl ProcessLifecycleRuntime {
     }
 }
 
-impl RunnerLauncher {
+impl UserlandProcessLauncher {
     pub(super) fn new(started_runner_config: RunnerConfig, broker: BrokerCore) -> Arc<Self> {
-        let lifecycle = Arc::new(ProcessLifecycleRuntime::default());
+        let lifecycle = Arc::new(ProcessLifecycleNotifier::default());
         let broker = broker.with_process_lifecycle_sink(lifecycle.clone());
         Arc::new(Self {
             broker,
@@ -112,75 +110,35 @@ impl RunnerLauncher {
         })
     }
 
-    pub(crate) fn broker(&self) -> BrokerCore {
+    pub(super) fn broker(&self) -> BrokerCore {
         self.broker.clone()
     }
 
-    pub(crate) fn handle_operation<Memory: SharedMemory>(
-        self: &Arc<Self>,
-        process: &BrokerProcess,
-        operation: &BrokerOperation,
-        shared_buffers: &SharedBufferPool<Memory>,
-    ) -> Option<Result<BrokerResult, RequestFailure>> {
-        match operation {
-            BrokerOperation::StartChildProcess(request) => Some(
-                read_shared_buffer(shared_buffers, request.buffer, MAX_PROCESS_BOOTSTRAP_SIZE)
-                    .and_then(|bootstrap| {
-                        self.start_child_process(
-                            process,
-                            request.format,
-                            request.version,
-                            bootstrap,
-                            request.inherited_objects,
-                        )
-                        .map_err(process_extension_error)
-                    })
-                    .map(BrokerResult::ProcessStarted),
-            ),
-            _ => None,
-        }
+    pub(super) fn wait_for_drain(&self) {
+        self.lifecycle.wait_for_drain(&self.broker);
     }
 
-    fn start_child_process(
-        self: &Arc<Self>,
-        parent: &BrokerProcess,
-        format: ProcessBootstrapFormat,
-        version: ProcessBootstrapVersion,
-        bootstrap: Vec<u8>,
-        requested_inherited_objects: InheritedProcessObjects,
-    ) -> Result<ProcessIdentity, ErrorCode> {
-        if !parent.is_running() {
-            return Err(ErrorCode::ProtocolState);
-        }
-        let process = self
-            .broker
-            .create_process(parent.caller_credential(), Some(parent.id()))
-            .map_err(ErrorCode::from)?;
-        let inherited_objects = match parent
-            .duplicate_object_references_to(requested_inherited_objects.as_slice(), &process)
-        {
-            Ok(inherited_objects) => inherited_objects,
-            Err(error) => {
-                process.retire(true);
-                return Err(ErrorCode::from(error));
-            }
-        };
-        let initial_thread_id = match process.create_thread() {
-            Ok(initial_thread_id) => initial_thread_id,
-            Err(error) => {
-                process.retire(true);
-                return Err(ErrorCode::from(error));
-            }
-        };
-        let inherited_objects = InheritedProcessObjects::new(&inherited_objects)
-            .expect("child handle count must match the bounded inheritance request");
-        let process_id = process.id();
-        if parent.is_cancellation_requested() {
-            process.retire(true);
-            return Err(ErrorCode::PeerClosed);
-        }
+    fn runner_finished(process: &BrokerProcess, result: RunnerCompletion, thread_panicked: bool) {
+        let unexpected_crash =
+            runner_signal_is_abnormal(result.runner_signal, result.broker_termination);
+        let abnormal = thread_panicked
+            || unexpected_crash
+            || runner_exit_code_is_crash(result.runner_exit_code);
+        process.fail_start(BrokerError::PeerClosed, abnormal, false);
+        process.retire(!abnormal);
+    }
+}
 
-        let launcher = Arc::clone(self);
+impl ProcessLauncher for UserlandProcessLauncher {
+    fn launch(
+        self: Arc<Self>,
+        process: Arc<BrokerProcess>,
+        initial_thread_id: ThreadId,
+        data: ProcessStartupData,
+    ) -> Result<(), BrokerError> {
+        let process_id = process.id();
+        let broker = self.broker.clone();
+        let launcher = Arc::clone(&self);
         let config = self.started_runner_config.clone();
         let runner_process = Arc::clone(&process);
         let thread = std::thread::Builder::new()
@@ -190,16 +148,12 @@ impl RunnerLauncher {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     RunnerInstance::start(config).map(|instance| {
                         instance.run_started_process_to_completion(
-                            RunnerStartup {
+                            PendingRunnerAssociation {
                                 process: runner_process,
                                 initial_thread_id,
-                                data: ProcessStartupData {
-                                    format,
-                                    version,
-                                    payload: bootstrap,
-                                    inherited_objects,
-                                },
+                                data,
                             },
+                            broker,
                             Arc::clone(&launcher),
                         )
                     })
@@ -213,43 +167,11 @@ impl RunnerLauncher {
             });
         if thread.is_err() {
             process.retire(true);
-            return Err(ErrorCode::OutOfMemory);
+            return Err(BrokerError::OutOfMemory);
         }
         drop(thread);
 
         self.lifecycle
             .wait_for_start(&process, PROCESS_START_TIMEOUT)
-            .map(|()| ProcessIdentity {
-                process_id,
-                initial_thread_id,
-            })
-    }
-
-    fn runner_finished(process: &BrokerProcess, result: RunnerCompletion, thread_panicked: bool) {
-        let unexpected_crash =
-            runner_signal_is_abnormal(result.runner_signal, result.broker_termination);
-        let abnormal = thread_panicked
-            || unexpected_crash
-            || runner_exit_code_is_crash(result.runner_exit_code);
-        process.fail_start(BrokerError::PeerClosed, abnormal, false);
-        process.retire(!abnormal);
-    }
-
-    pub(super) fn wait_for_drain(&self) {
-        self.lifecycle.wait_for_drain(&self.broker);
-    }
-}
-
-const fn process_extension_error(error: ErrorCode) -> RequestFailure {
-    match error {
-        ErrorCode::PolicyDenied
-        | ErrorCode::UnknownObject
-        | ErrorCode::InvalidRights
-        | ErrorCode::ResourceExhausted
-        | ErrorCode::WouldBlock
-        | ErrorCode::PeerClosed
-        | ErrorCode::OutOfMemory
-        | ErrorCode::UnsupportedOperation => RequestFailure::Respond(error),
-        _ => RequestFailure::Abort(error),
     }
 }

@@ -21,7 +21,7 @@ mod linux;
 #[cfg(all(windows, target_arch = "x86_64"))]
 mod windows;
 
-pub(crate) use launcher::{RunnerLauncher, RunnerStartup};
+pub(crate) use launcher::{PendingRunnerAssociation, UserlandProcessLauncher};
 #[cfg(target_os = "linux")]
 use linux::PlatformRunnerEndpoint;
 #[cfg(all(windows, target_arch = "x86_64"))]
@@ -227,10 +227,11 @@ impl RunnerInstance {
     ///
     /// Panics if another runner owner poisoned the process mutex.
     pub fn run_to_completion(mut self, broker: &BrokerCore) -> IoResult<ExitStatus> {
-        let launcher = RunnerLauncher::new(self.started_runner_config.clone(), broker.clone());
-        let mut association_result = self
-            .endpoint
-            .serve(&self.runner, None, Arc::clone(&launcher));
+        let launcher =
+            UserlandProcessLauncher::new(self.started_runner_config.clone(), broker.clone());
+        let mut association_result =
+            self.endpoint
+                .serve(&self.runner, None, launcher.broker(), launcher.clone());
         self.endpoint.close();
         let runner_exited = if association_result.result.is_ok() {
             self.shutdown
@@ -268,13 +269,16 @@ impl RunnerInstance {
 
     fn run_started_process_to_completion(
         mut self,
-        startup: RunnerStartup,
-        launcher: Arc<RunnerLauncher>,
+        startup: PendingRunnerAssociation,
+        broker: BrokerCore,
+        launcher: Arc<UserlandProcessLauncher>,
     ) -> RunnerCompletion {
         let process = Arc::clone(&startup.process);
         let shutdown = Arc::clone(&self.shutdown);
         process.install_shutdown(Arc::new(move || shutdown.shutdown()));
-        let association_result = self.endpoint.serve(&self.runner, Some(startup), launcher);
+        let association_result = self
+            .endpoint
+            .serve(&self.runner, Some(startup), broker, launcher);
         self.endpoint.close();
         let shutdown_was_expected = process.shutdown_was_expected();
         if association_result.abnormal {
