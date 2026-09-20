@@ -6,6 +6,7 @@ edition = "2024"
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+libc = "0.2"
 litebox_common_macos = { path = "../litebox_common_macos", version = "0.1.0" }
 litebox_platform_macos_userland = { path = "../litebox_platform_macos_userland", version = "0.1.0" }
 litebox_shim_macos = { path = "../litebox_shim_macos", version = "0.1.0" }
@@ -21,7 +22,8 @@ litebox_syscall_rewriter = { path = "../litebox_syscall_rewriter", version = "0.
 litebox = { path = "../litebox", version = "0.1.0" }
 
 [features]
-# Development-only in-process broker fixture.
+default = ["test-broker"]
+# In-process broker used by the standalone macOS runner and its tests.
 test-broker = ["dep:litebox", "dep:litebox_broker_core", "dep:litebox_broker_host", "dep:litebox_broker_local", "dep:litebox_broker_protocol"]
 
 [lints]

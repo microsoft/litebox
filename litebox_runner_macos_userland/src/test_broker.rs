@@ -13,6 +13,7 @@ use litebox_broker_core::{
         in_mem::{InMem, InitialNode},
         resolver::Resolver,
     },
+    random::{RandomProvider, RandomProviderError},
     test_support::{TestBrokerCoreBuilder, TestStdioProvider},
 };
 use litebox_broker_host::test_support::InProcessBrokerSetup;
@@ -27,6 +28,19 @@ use std::{
     io::{Read as _, Write as _},
     sync::Arc,
 };
+
+struct HostRandom;
+
+impl RandomProvider for HostRandom {
+    fn fill(&self, output: &mut [u8]) -> std::result::Result<(), RandomProviderError> {
+        for chunk in output.chunks_mut(256) {
+            if unsafe { libc::getentropy(chunk.as_mut_ptr().cast(), chunk.len()) } != 0 {
+                return Err(RandomProviderError);
+            }
+        }
+        Ok(())
+    }
+}
 
 pub(crate) fn setup(
     platform: &'static MacosUserland,
@@ -75,6 +89,7 @@ pub(crate) fn setup(
     let core = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
         ObjectRights::all(),
     ))
+    .with_random_provider(Arc::new(HostRandom))
     .with_stdio_provider(stdio.clone())
     .with_file_service(Arc::new(Resolver::<MacosUserland, _>::new(fs)))
     .build()
