@@ -3266,11 +3266,6 @@ pub(crate) fn hook_macho(
     callback: u64,
     options: crate::RewriteOptions,
 ) -> Result<Option<HookOutcome>> {
-    if options.target_host() != crate::TargetHost::MacOs {
-        return Err(Error::UnsupportedExecutable(
-            "Mach-O rewriting requires a macOS host".into(),
-        ));
-    }
     let config = RewriteConfig::new(options.target_host(), false)
         .with_host_thread_state_preservation(options.preserves_host_thread_state());
     let sites = find_macho_patch_sites(sections, buf, !options.uses_native_guest_thread_pointer())?;
@@ -3356,11 +3351,6 @@ pub(crate) fn macho_trampoline_size_upper_bound(
     sections: &[TextSectionInfo],
     options: crate::RewriteOptions,
 ) -> Result<usize> {
-    if options.target_host() != crate::TargetHost::MacOs {
-        return Err(Error::UnsupportedExecutable(
-            "Mach-O rewriting requires a macOS host".into(),
-        ));
-    }
     let sites = find_macho_patch_sites(sections, buf, !options.uses_native_guest_thread_pointer())?;
     sites.iter().try_fold(0usize, |total, site| {
         let gate_bytes = site.kind.metadata().map_or(0, |metadata| {

@@ -184,30 +184,35 @@ impl RewriteOptions {
         }
     }
 
-    /// Rewrites Darwin syscalls and thread-pointer reads in live host shared-cache code.
-    ///
-    /// TPIDRRO gates preserve the physical host value outside guest execution
-    /// and select LiteBox's private guest thread state while `in_guest` is set.
-    pub const fn macos_host_shared_cache() -> Self {
+    /// Rewrites Darwin syscalls and thread-pointer reads in code shared between
+    /// the host and guest execution contexts.
+    pub const fn host_aware_thread_pointer(target_host: TargetHost) -> Self {
         Self {
-            target_host: TargetHost::MacOs,
+            target_host,
             virtualize_x18: false,
             preserve_host_thread_state: true,
             native_guest_thread_pointer: false,
         }
     }
 
+    /// Rewrites live macOS shared-cache code.
+    pub const fn macos_host_shared_cache() -> Self {
+        Self::host_aware_thread_pointer(TargetHost::MacOs)
+    }
+
     /// Rewrite Darwin syscalls while leaving TPIDRRO reads native.
-    ///
-    /// Standalone dyld's protected-stack machinery must remain associated with
-    /// the host thread that is actually executing it.
-    pub const fn macos_native_guest_tpidrro() -> Self {
+    pub const fn native_guest_thread_pointer(target_host: TargetHost) -> Self {
         Self {
-            target_host: TargetHost::MacOs,
+            target_host,
             virtualize_x18: false,
             preserve_host_thread_state: false,
             native_guest_thread_pointer: true,
         }
+    }
+
+    /// Rewrite Darwin syscalls for a macOS host while leaving TPIDRRO reads native.
+    pub const fn macos_native_guest_tpidrro() -> Self {
+        Self::native_guest_thread_pointer(TargetHost::MacOs)
     }
 
     /// Returns the selected AArch64 host ABI.

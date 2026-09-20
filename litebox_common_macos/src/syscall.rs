@@ -3,7 +3,7 @@
 
 //! Typed BSD syscall decoding.
 
-use litebox::utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _};
+use litebox::utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt};
 use litebox_broker_protocol::fs::FileMode;
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -30,10 +30,14 @@ pub mod nr {
     pub const MUNMAP: usize = 73;
     pub const MPROTECT: usize = 74;
     pub const MMAP: usize = 197;
+    pub const SYSCTL: usize = 202;
+    pub const SHARED_REGION_CHECK_NP: usize = 294;
+    pub const THREAD_SELFID: usize = 372;
     pub const READ_NOCANCEL: usize = 396;
     pub const WRITE_NOCANCEL: usize = 397;
     pub const OPEN_NOCANCEL: usize = 398;
     pub const CLOSE_NOCANCEL: usize = 399;
+    pub const GETENTROPY: usize = 500;
 }
 
 /// Whether the low 32 bits of an AArch64 syscall selector encode a Mach trap.
@@ -47,10 +51,86 @@ pub fn is_mach_trap_selector(number: usize) -> bool {
 pub mod mach_trap {
     /// `mach_absolute_time()`.
     pub const MACH_ABSOLUTE_TIME: u32 = 3;
+    pub const MACH_VM_ALLOCATE: u32 = 10;
+    pub const MACH_VM_DEALLOCATE: u32 = 12;
+    pub const MACH_VM_PROTECT: u32 = 14;
+    pub const MACH_VM_MAP: u32 = 15;
+    pub const TASK_SELF: u32 = 28;
     /// `mach_timebase_info(mach_timebase_info_t)`.
     pub const MACH_TIMEBASE_INFO: u32 = 89;
     /// `mach_wait_until(deadline)`.
     pub const MACH_WAIT_UNTIL: u32 = 90;
+}
+
+/// Synthetic Mach port name returned by the minimal single-task shim.
+///
+/// These names are ABI-visible handles, not host Mach rights. They only let
+/// dyld identify the shim's one task, one thread, and one host endpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct MachPortName(pub u32);
+
+impl From<MachPortName> for usize {
+    fn from(value: MachPortName) -> Self {
+        value.0 as Self
+    }
+}
+
+/// Stable synthetic names. Keep them distinct from `MACH_PORT_NULL` and from
+/// descriptors allocated later by a future Mach IPC implementation.
+pub mod synthetic_port {
+    use super::MachPortName;
+
+    pub const TASK_SELF: MachPortName = MachPortName(0x103);
+}
+
+bitflags::bitflags! {
+    /// Raw Mach VM flags. XNU combines behavioral bits with a VM allocation tag,
+    /// so callers retain unknown bits even though the shim only honors `ANYWHERE`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct MachVmFlags: i32 {
+        const ANYWHERE = 0x0000_0001;
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct MachVmAddressMask(pub usize);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MachVmProtection {
+    permissions: VmProtection,
+    copy: bool,
+}
+
+impl MachVmProtection {
+    const COPY: i32 = 0x10;
+
+    pub const fn new(permissions: VmProtection, copy: bool) -> Self {
+        Self { permissions, copy }
+    }
+
+    fn from_raw(raw: i32) -> Option<Self> {
+        let permissions = VmProtection::from_bits(raw & !Self::COPY)?;
+        (raw & !(Self::COPY | VmProtection::all().bits()) == 0).then_some(Self {
+            permissions,
+            copy: raw & Self::COPY != 0,
+        })
+    }
+
+    pub const fn permissions(self) -> VmProtection {
+        self.permissions
+    }
+
+    pub const fn requests_copy(self) -> bool {
+        self.copy
+    }
+}
+
+impl MachVmAddressMask {
+    pub const fn is_zero(self) -> bool {
+        self.0 == 0
+    }
 }
 
 /// Darwin's `mach_timebase_info_data_t` output structure.
@@ -87,6 +167,14 @@ pub enum SyscallRequest {
     Dup {
         fd: i32,
     },
+    Sysctl {
+        name: UserPtr<i32>,
+        name_length: u32,
+        old_value: UserPtrMut<u8>,
+        old_length: UserPtrMut<usize>,
+        new_value: UserPtr<u8>,
+        new_length: usize,
+    },
     Mmap {
         address: usize,
         length: usize,
@@ -110,6 +198,41 @@ pub enum SyscallRequest {
     Geteuid,
     Getgid,
     Getegid,
+    ThreadSelfid,
+    Getentropy {
+        buffer: UserPtrMut<u8>,
+        count: usize,
+    },
+    MachVmAllocate {
+        target: MachPortName,
+        address: UserPtrMut<usize>,
+        size: usize,
+        flags: MachVmFlags,
+    },
+    MachVmDeallocate {
+        target: MachPortName,
+        address: usize,
+        size: usize,
+    },
+    MachVmProtect {
+        target: MachPortName,
+        address: usize,
+        size: usize,
+        set_maximum: bool,
+        protection: MachVmProtection,
+    },
+    MachVmMap {
+        target: MachPortName,
+        address: UserPtrMut<usize>,
+        size: usize,
+        mask: MachVmAddressMask,
+        flags: MachVmFlags,
+        current_protection: MachVmProtection,
+    },
+    MachTaskSelf,
+    SharedRegionCheckNp {
+        start_address: UserPtrMut<usize>,
+    },
     MachAbsoluteTime,
     MachTimebaseInfo {
         info: UserPtrMut<MachTimebaseInfo>,
@@ -124,11 +247,40 @@ impl SyscallRequest {
     pub fn from_args(number: usize, args: [usize; 8]) -> Result<Self, Errno> {
         let int_arg = |i: usize| -> i32 { args[i].reinterpret_as_signed().trunc() };
         let u64_arg = |i: usize| -> u64 { args[i] as u64 };
+        let port_arg = |i: usize| MachPortName(TruncateExt::<u32>::trunc(args[i]));
         if is_mach_trap_selector(number) {
             let selector: i32 = number.reinterpret_as_signed().trunc();
             let trap = selector.wrapping_neg().reinterpret_as_unsigned();
             return match trap {
                 mach_trap::MACH_ABSOLUTE_TIME => Ok(Self::MachAbsoluteTime),
+                mach_trap::MACH_VM_ALLOCATE => Ok(Self::MachVmAllocate {
+                    target: port_arg(0),
+                    address: UserPtrMut::from_usize(args[1]),
+                    size: args[2],
+                    flags: MachVmFlags::from_bits_retain(int_arg(3)),
+                }),
+                mach_trap::MACH_VM_DEALLOCATE => Ok(Self::MachVmDeallocate {
+                    target: port_arg(0),
+                    address: args[1],
+                    size: args[2],
+                }),
+                mach_trap::MACH_VM_PROTECT => Ok(Self::MachVmProtect {
+                    target: port_arg(0),
+                    address: args[1],
+                    size: args[2],
+                    set_maximum: args[3] != 0,
+                    protection: MachVmProtection::from_raw(int_arg(4)).ok_or(Errno::EINVAL)?,
+                }),
+                mach_trap::MACH_VM_MAP => Ok(Self::MachVmMap {
+                    target: port_arg(0),
+                    address: UserPtrMut::from_usize(args[1]),
+                    size: args[2],
+                    mask: MachVmAddressMask(args[3]),
+                    flags: MachVmFlags::from_bits_retain(int_arg(4)),
+                    current_protection: MachVmProtection::from_raw(int_arg(5))
+                        .ok_or(Errno::EINVAL)?,
+                }),
+                mach_trap::TASK_SELF => Ok(Self::MachTaskSelf),
                 mach_trap::MACH_TIMEBASE_INFO => Ok(Self::MachTimebaseInfo {
                     info: UserPtrMut::from_usize(args[0]),
                 }),
@@ -152,11 +304,19 @@ impl SyscallRequest {
             },
             nr::OPEN | nr::OPEN_NOCANCEL => Self::Open {
                 path: UserPtr::from_usize(args[0]),
-                flags: OpenFlags::from_bits(int_arg(1)).ok_or(Errno::EINVAL)?,
+                flags: OpenFlags::from_bits_retain(int_arg(1)),
                 mode: FileMode::from_u32_bits_truncate(int_arg(2).reinterpret_as_unsigned()),
             },
             nr::CLOSE | nr::CLOSE_NOCANCEL => Self::Close { fd: int_arg(0) },
             nr::DUP => Self::Dup { fd: int_arg(0) },
+            nr::SYSCTL => Self::Sysctl {
+                name: UserPtr::from_usize(args[0]),
+                name_length: TruncateExt::<u32>::trunc(args[1]),
+                old_value: UserPtrMut::from_usize(args[2]),
+                old_length: UserPtrMut::from_usize(args[3]),
+                new_value: UserPtr::from_usize(args[4]),
+                new_length: args[5],
+            },
             nr::MMAP => Self::Mmap {
                 address: args[0],
                 length: args[1],
@@ -175,11 +335,19 @@ impl SyscallRequest {
                 protection: VmProtection::from_bits(int_arg(2)).ok_or(Errno::EINVAL)?,
             },
             nr::GETPID => Self::Getpid,
+            nr::GETENTROPY => Self::Getentropy {
+                buffer: UserPtrMut::from_usize(args[0]),
+                count: args[1],
+            },
             nr::GETPPID => Self::Getppid,
             nr::GETUID => Self::Getuid,
             nr::GETEUID => Self::Geteuid,
             nr::GETGID => Self::Getgid,
             nr::GETEGID => Self::Getegid,
+            nr::THREAD_SELFID => Self::ThreadSelfid,
+            nr::SHARED_REGION_CHECK_NP => Self::SharedRegionCheckNp {
+                start_address: UserPtrMut::from_usize(args[0]),
+            },
             _ => return Err(Errno::ENOSYS),
         })
     }
@@ -219,7 +387,7 @@ mod tests {
             panic!()
         };
         assert_eq!(status, -1);
-        for number in [0, 0x0200_0004, 0x8000_0000] {
+        for number in [0, 0x0200_0004] {
             assert!(matches!(
                 SyscallRequest::from_args(number, [0; 8]),
                 Err(Errno::ENOSYS)
@@ -230,6 +398,15 @@ mod tests {
             SyscallRequest::from_args(u32::MAX as usize - 2, [0; 8]),
             Ok(SyscallRequest::MachAbsoluteTime)
         ));
+        for number in [
+            0u32.wrapping_sub(47) as usize,
+            (-47isize).reinterpret_as_unsigned(),
+        ] {
+            assert_eq!(
+                SyscallRequest::from_args(number, [0; 8]).unwrap_err(),
+                Errno::ENOSYS
+            );
+        }
         let request = SyscallRequest::from_args(
             nr::MMAP,
             [0x4000, 0x8000, 5, 0x12, usize::MAX, 0x1234, 0, 0],
@@ -257,6 +434,21 @@ mod tests {
                 Errno::EINVAL
             );
         }
+    }
+
+    #[test]
+    fn mach_vm_protection_preserves_copy_semantics() {
+        let mach_protect = SyscallRequest::from_args(
+            0u32.wrapping_sub(mach_trap::MACH_VM_PROTECT) as usize,
+            [0x103, 0x2001, 1, 0, 0x13, 0, 0, 0],
+        )
+        .unwrap();
+        assert!(matches!(
+            mach_protect,
+            SyscallRequest::MachVmProtect { protection, .. }
+                if protection.permissions() == (VmProtection::READ | VmProtection::WRITE)
+                    && protection.requests_copy()
+        ));
     }
 
     #[cfg(target_arch = "aarch64")]
