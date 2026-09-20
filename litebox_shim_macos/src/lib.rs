@@ -1,10 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Minimal Darwin BSD shim for self-contained static AArch64 Mach-O guests.
+//! Darwin BSD shim for AArch64 Mach-O guests.
 //!
-//! Guest mappings and file operations use LiteBox. The runner supplies inherited
-//! descriptors. Networking is unsupported.
+//! Guest mappings and file operations use LiteBox. On macOS, dynamically linked
+//! programs use a private, boot-local instance of the host's dyld shared cache.
+//! Networking is unsupported.
 
 #![no_std]
 #![cfg(target_arch = "aarch64")]
@@ -12,7 +13,7 @@
 extern crate alloc;
 
 use alloc::{collections::BTreeMap, ffi::CString, sync::Arc, vec, vec::Vec};
-use core::sync::atomic::{AtomicI32, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use litebox::platform::page_mgmt::MemoryRegionPermissions as Permissions;
 use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
 use litebox::{
@@ -22,8 +23,8 @@ use litebox::{
     sync::{Mutex, RawSyncPrimitivesProvider},
 };
 use litebox_common_macos::{
-    PAGE_SIZE, PtRegs, SIGINT, SIGSEGV, STACK_ALIGNMENT, SyscallRequest, TaskParams, errno::Errno,
-    loader::MachoLoaderError,
+    KernReturn, PAGE_SIZE, PtRegs, SIGINT, SIGSEGV, STACK_ALIGNMENT, SyscallRequest, TaskParams,
+    VmProtection, errno::Errno, loader::MachoLoaderError,
 };
 
 mod loader;
@@ -90,6 +91,11 @@ impl<P: ShimPlatform> MacosShimBuilder<P> {
                 litebox: self.litebox,
                 macho_mappings: Mutex::new(BTreeMap::new()),
                 macho_trampolines: Mutex::new(BTreeMap::new()),
+                shared_cache_base: AtomicUsize::new(0),
+                shared_cache_range: Mutex::new(None),
+                shared_cache_mappings: Mutex::new(Vec::new()),
+                standalone_dyld_range: Mutex::new(None),
+                next_thread_id: core::sync::atomic::AtomicU64::new(1u64 << 32),
             }),
             files: self.files,
         }
@@ -115,7 +121,22 @@ impl<P: ShimPlatform> MacosShim<P> {
         argv: Vec<CString>,
         envp: Vec<CString>,
     ) -> Result<LoadedProgram<P>, MachoLoaderError> {
-        self.load(params, path, None, argv, envp)
+        self.load(params, path, None, None, argv, envp)
+    }
+
+    /// Load a dynamically linked executable with a standalone copy of host dyld.
+    ///
+    /// This maps the executable and standalone dyld before guest execution.
+    pub fn load_program_with_dyld(
+        self,
+        params: TaskParams,
+        path: &str,
+        image: &[u8],
+        dyld: &[u8],
+        argv: Vec<CString>,
+        envp: Vec<CString>,
+    ) -> Result<LoadedProgram<P>, MachoLoaderError> {
+        self.load(params, path, Some(image), Some(dyld), argv, envp)
     }
 
     /// Load a self-contained static executable snapshot without file I/O.
@@ -130,7 +151,7 @@ impl<P: ShimPlatform> MacosShim<P> {
         argv: Vec<CString>,
         envp: Vec<CString>,
     ) -> Result<LoadedProgram<P>, MachoLoaderError> {
-        self.load(params, path, Some(image), argv, envp)
+        self.load(params, path, Some(image), None, argv, envp)
     }
 
     fn load(
@@ -138,17 +159,23 @@ impl<P: ShimPlatform> MacosShim<P> {
         params: TaskParams,
         path: &str,
         image: Option<&[u8]>,
+        dyld: Option<&[u8]>,
         argv: Vec<CString>,
         envp: Vec<CString>,
     ) -> Result<LoadedProgram<P>, MachoLoaderError> {
         let process = Process(Arc::new(AtomicI32::new(-1)));
+        let thread_id = self.global.next_thread_id.fetch_add(1, Ordering::Relaxed);
         let task = Task {
             global: self.global,
             files: self.files,
             params,
             process: process.clone(),
+            thread: ThreadState {
+                blocked_signals: core::sync::atomic::AtomicU32::new(0),
+                id: thread_id,
+            },
         };
-        let initial_ctx = loader::load(&task, path, image, &argv, &envp)?;
+        let initial_ctx = loader::load(&task, path, image, dyld, &argv, &envp)?;
         Ok(LoadedProgram {
             entrypoints: MacosShimEntrypoints {
                 task,
@@ -191,6 +218,11 @@ struct GlobalState<P: ShimPlatform> {
     pm: PageManager<P, PAGE_SIZE>,
     macho_mappings: Mutex<P, BTreeMap<usize, syscalls::mm::MachoMapping>>,
     macho_trampolines: Mutex<P, BTreeMap<usize, syscalls::mm::MachoRuntimeTrampoline>>,
+    shared_cache_base: AtomicUsize,
+    shared_cache_range: Mutex<P, Option<core::ops::Range<usize>>>,
+    shared_cache_mappings: Mutex<P, Vec<(core::ops::Range<usize>, VmProtection)>>,
+    standalone_dyld_range: Mutex<P, Option<core::ops::Range<usize>>>,
+    next_thread_id: core::sync::atomic::AtomicU64,
 }
 
 impl<P: ShimPlatform> Drop for GlobalState<P> {
@@ -213,11 +245,17 @@ impl<P: ShimPlatform> Drop for GlobalState<P> {
     }
 }
 
+struct ThreadState {
+    blocked_signals: core::sync::atomic::AtomicU32,
+    id: u64,
+}
+
 struct Task<P: ShimPlatform> {
     global: Arc<GlobalState<P>>,
     files: Arc<syscalls::file::FilesState<P>>,
     params: TaskParams,
     process: Process,
+    thread: ThreadState,
 }
 
 const MAX_KERNEL_BUF_SIZE: usize = 64 * 1024;
@@ -256,8 +294,10 @@ impl<P: ShimPlatform> Task<P> {
                 }
             }
             Err(error) => {
-                ctx.regs[0] = error.raw();
-                if !is_mach {
+                if is_mach {
+                    ctx.regs[0] = KernReturn::INVALID_ARGUMENT.into();
+                } else {
+                    ctx.regs[0] = error.raw();
                     ctx.pstate |= CARRY;
                 }
             }
@@ -301,6 +341,19 @@ impl<P: ShimPlatform> Task<P> {
             }
             SyscallRequest::Close { fd } => self.sys_close(fd).to_syscall_result(),
             SyscallRequest::Dup { fd } => self.sys_dup(fd).to_syscall_result(),
+            SyscallRequest::Dup2 { oldfd, newfd } => {
+                self.sys_dup2(oldfd, newfd).to_syscall_result()
+            }
+            SyscallRequest::Sysctl { .. } => {
+                // No host sysctl namespace is exposed. ENOENT tells dyld that
+                // optional policy tunables are absent.
+                Err(Errno::ENOENT)
+            }
+            SyscallRequest::Fcntl {
+                fd,
+                command,
+                argument,
+            } => self.sys_fcntl(fd, command, argument),
             SyscallRequest::Mmap {
                 address,
                 length,
@@ -327,6 +380,99 @@ impl<P: ShimPlatform> Task<P> {
             SyscallRequest::Geteuid => Ok(self.sys_geteuid() as usize),
             SyscallRequest::Getgid => Ok(self.sys_getgid() as usize),
             SyscallRequest::Getegid => Ok(self.sys_getegid() as usize),
+            SyscallRequest::Sigprocmask { how, set, oldset } => {
+                self.sys_sigprocmask(how, set, oldset)
+            }
+            SyscallRequest::ThreadSelfid => {
+                Ok(usize::try_from(self.thread.id).expect("AArch64 thread IDs fit in usize"))
+            }
+            // Native arm64 guests have no Rosetta translation state.
+            SyscallRequest::CrossarchTrap { .. } => Ok(0),
+            // Do not grant access to privileged host CSR policy.
+            SyscallRequest::Csrctl { .. } => Err(Errno::EPERM),
+            SyscallRequest::Csops {
+                pid,
+                operation,
+                user_address,
+                user_size,
+            } => self.sys_csops(pid, operation, user_address, user_size),
+            // Thread creation is not implemented in this bootstrap path.
+            SyscallRequest::BsdthreadCreate { .. } => Err(Errno::EAGAIN),
+            // Never forward filesystem-control requests to the host filesystem.
+            SyscallRequest::Fsctl { .. } => Err(Errno::ENOTTY),
+            SyscallRequest::Fstat64 { fd, buffer } => self.sys_fstat64(fd, buffer),
+            SyscallRequest::Stat64 { path, buffer } => self.sys_stat64(path, buffer),
+            SyscallRequest::Statfs64 { path, buffer } => self.sys_statfs64(path, buffer),
+            SyscallRequest::MacSyscall {
+                policy,
+                operation,
+                argument,
+            } => self.sys_mac_policy(policy, operation, argument),
+            SyscallRequest::AbortWithPayload {
+                namespace,
+                code,
+                payload: _,
+                payload_size: _,
+                reason,
+                reason_flags,
+            } => {
+                let reason = self.read_path(reason).ok();
+                litebox_util_log::error!(namespace, code, reason_flags, reason:? = reason; "guest abort_with_payload");
+                self.process.exit(134);
+                Ok(0)
+            }
+            SyscallRequest::Getentropy { buffer, count } => self.sys_getentropy(buffer, count),
+            SyscallRequest::SharedRegionCheckNp { start_address } => self
+                .sys_shared_region_check_np(start_address)
+                .to_syscall_result(),
+            // The boot-local cache was installed before execution; dyld's map
+            // request must not replace those validated mappings.
+            SyscallRequest::SharedRegionMapAndSlide2Np { .. } => {
+                litebox_util_log::warn!(
+                    "absorbing shared-region map request for preinstalled cache"
+                );
+                Ok(0)
+            }
+            SyscallRequest::MachVmAllocate {
+                target,
+                address,
+                size,
+                flags,
+            } => Ok(self.sys_mach_vm_allocate_compat(target, address, size, flags)),
+            SyscallRequest::MachVmDeallocate {
+                target,
+                address,
+                size,
+            } => Ok(self.sys_mach_vm_deallocate_compat(target, address, size)),
+            SyscallRequest::MachVmProtect {
+                target,
+                address,
+                size,
+                set_maximum,
+                protection,
+            } => {
+                Ok(self.sys_mach_vm_protect_compat(target, address, size, set_maximum, protection))
+            }
+            SyscallRequest::MachVmMap {
+                target,
+                address,
+                size,
+                mask,
+                flags,
+                current_protection,
+            } => Ok(self.sys_mach_vm_map_compat(
+                target,
+                address,
+                size,
+                mask,
+                flags,
+                current_protection,
+            )),
+            SyscallRequest::MachReplyPort => Ok(Self::synthetic_reply_port().into()),
+            SyscallRequest::MachThreadSelf => Ok(Self::synthetic_thread_port().into()),
+            SyscallRequest::MachTaskSelf => Ok(Self::synthetic_task_port().into()),
+            SyscallRequest::MachHostSelf => Ok(Self::synthetic_host_port().into()),
+            SyscallRequest::MachMsg2Trap { options, .. } => Ok(Self::sys_mach_msg2_compat(options)),
             SyscallRequest::MachAbsoluteTime => Ok(self.sys_mach_absolute_time()),
             SyscallRequest::MachTimebaseInfo { info } => {
                 Ok(self.sys_mach_timebase_info(info).into())
@@ -360,10 +506,24 @@ impl<P: ShimPlatform> Task<P> {
             .pm
             .range_has_permissions(address..end, permissions)
         {
-            Ok(())
-        } else {
-            Err(Errno::EFAULT)
+            return Ok(());
         }
+        self.global
+            .shared_cache_mappings
+            .lock()
+            .iter()
+            .any(|(range, protection)| {
+                address >= range.start
+                    && end <= range.end
+                    && (!permissions.contains(Permissions::READ)
+                        || protection.contains(VmProtection::READ))
+                    && (!permissions.contains(Permissions::WRITE)
+                        || protection.contains(VmProtection::WRITE))
+                    && (!permissions.contains(Permissions::EXEC)
+                        || protection.contains(VmProtection::EXECUTE))
+            })
+            .then_some(())
+            .ok_or(Errno::EFAULT)
     }
 
     fn continuation(&self, ctx: &PtRegs) -> ContinueOperation {
@@ -395,9 +555,9 @@ impl<P: ShimPlatform> EnterShim for MacosShimEntrypoints<P> {
         self.task.continuation(ctx)
     }
 
-    fn exception(&self, _ctx: &mut PtRegs, _info: &ExceptionInfo) -> ContinueOperation {
-        // Syscalls enter through the rewriter's direct callback. Unhandled
-        // guest faults terminate the process.
+    fn exception(&self, ctx: &mut PtRegs, info: &ExceptionInfo) -> ContinueOperation {
+        // Syscalls enter through the rewriter's direct callback.
+        litebox_util_log::error!(exception:? = info, pc:? = ctx.pc; "unhandled macOS guest exception");
         self.task.process.exit(128 + SIGSEGV);
         ContinueOperation::Terminate
     }
