@@ -32,8 +32,8 @@ use litebox_platform::time::{
     Instant as InstantTrait, SystemTime as SystemTimeTrait, TimeProvider,
 };
 use litebox_syscall_rewriter::aarch64::{
-    GUEST_X18_OFFSET_FROM_GUEST_TP, SVC_FRAME_BYTES, SVC_FRAME_OFF_RETADDR, SVC_FRAME_OFF_STUB,
-    SVC_FRAME_OFF_X16, is_patchable_guest_tpidr_offset,
+    GUEST_X18_OFFSET_FROM_GUEST_TP, IN_GUEST_OFFSET_FROM_GUEST_TP, SVC_FRAME_BYTES,
+    SVC_FRAME_OFF_RETADDR, SVC_FRAME_OFF_STUB, SVC_FRAME_OFF_X16, is_patchable_guest_tpidr_offset,
 };
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -947,10 +947,11 @@ mod tls_offset {
     pub const PAGE_RECOVERY_LOCK: usize = core::mem::offset_of!(TlsBlock, page_recovery_lock);
 }
 
-// The macOS rewriter gates encode these two offsets directly after loading the
+// The macOS rewriter gates encode these offsets directly after loading the
 // TlsBlock pointer from the pthread key slot.
 const _: () = assert!(tls_offset::GUEST_THREAD_POINTER == 0);
 const _: () = assert!(tls_offset::GUEST_X18 == GUEST_X18_OFFSET_FROM_GUEST_TP);
+const _: () = assert!(tls_offset::IN_GUEST == IN_GUEST_OFFSET_FROM_GUEST_TP as usize);
 
 #[derive(Debug)]
 struct TlsKey(libc::pthread_key_t);

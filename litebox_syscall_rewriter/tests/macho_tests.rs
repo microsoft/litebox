@@ -5,9 +5,9 @@
 #![allow(clippy::cast_possible_truncation)]
 
 use litebox_syscall_rewriter::{
-    Error, TRAMPOLINE_MAGIC, TargetHost,
+    Error, RewriteOptions, TRAMPOLINE_MAGIC, TargetHost,
     aarch64::{self, GateMetadata},
-    hook_syscalls_in_macho,
+    hook_syscalls_in_macho, hook_syscalls_in_macho_with_options,
     macho::{CodeMetadata, Rewriter},
     rewrite_binary,
 };
@@ -121,6 +121,44 @@ fn arm64e_images_and_capability_bits_are_supported() {
 }
 
 #[test]
+fn whole_image_rewriting_preserves_native_tpidrro_mode() {
+    let input = image(&[SVC, MRS]);
+    let output = hook_syscalls_in_macho_with_options(
+        &input,
+        None,
+        RewriteOptions::macos_native_guest_tpidrro(),
+    )
+    .unwrap();
+
+    assert_ne!(u32_at(&output, TEXT), SVC);
+    assert_eq!(u32_at(&output, TEXT + 4), MRS);
+}
+
+#[test]
+fn whole_image_rewriting_emits_host_aware_tpidrro_gates() {
+    let rewriter = Rewriter::new(TargetHost::MacOs).unwrap();
+    let input = image(&[MRS]);
+    let output = hook_syscalls_in_macho_with_options(
+        &input,
+        None,
+        RewriteOptions::macos_host_shared_cache(),
+    )
+    .unwrap();
+    let (offset, base, size) = footer(&output);
+    let mut gates = output[offset..offset + size].to_vec();
+    rewriter.finalize_trampoline_gates(&mut gates, 96).unwrap();
+
+    assert_ne!(u32_at(&output, TEXT), MRS);
+    let gate = rewriter
+        .classify_gate_slot(&gates[16..80], base + 16, base + 16)
+        .unwrap();
+    assert_eq!(
+        gate.metadata(),
+        GateMetadata::HostAwareMrsTpidr { destination: 3 }
+    );
+}
+
+#[test]
 fn load_time_rewriting_uses_mapping_addresses_and_finalizes_gates() {
     let rewriter = Rewriter::new(TargetHost::MacOs).unwrap();
     let mut input = image(&[SVC, MRS, SVC, NOP]);
@@ -150,7 +188,7 @@ fn load_time_rewriting_uses_mapping_addresses_and_finalizes_gates() {
     assert!(
         gates.len()
             <= metadata
-                .trampoline_size_upper_bound(&input, rewriter)
+                .trampoline_size_upper_bound(&input, RewriteOptions::new(TargetHost::MacOs, false),)
                 .unwrap()
     );
     let mut aot_gates = aot[offset..offset + size].to_vec();

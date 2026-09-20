@@ -846,9 +846,11 @@ impl<P: ShimPlatform> Task<P> {
             }
         };
         let slice = &bytes[slice_range.clone()];
-        let rewriter = Rewriter::new(TargetHost::MacOs).map_err(|_| Errno::ENOEXEC)?;
         let trampoline_capacity = metadata
-            .trampoline_size_upper_bound(slice, rewriter)
+            .trampoline_size_upper_bound(
+                slice,
+                litebox_syscall_rewriter::RewriteOptions::new(TargetHost::MacOs, false),
+            )
             .and_then(|size| {
                 size.max(PAGE_SIZE)
                     .checked_next_multiple_of(PAGE_SIZE)

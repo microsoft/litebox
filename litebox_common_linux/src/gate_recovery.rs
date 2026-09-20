@@ -306,7 +306,6 @@ fn canonicalize_impl(
     // re-derive it afterwards rather than exposing a host address to the guest.
     match metadata {
         GateMetadata::MrsTpidr { destination, .. } => {
-            let destination = usize::from(destination);
             let Some(stage) = MrsTpidrGateOffset::from_offset(offset) else {
                 return Aarch64GateSignalResult::InvalidRuntimeState;
             };
@@ -318,6 +317,36 @@ fn canonicalize_impl(
             {
                 return Aarch64GateSignalResult::InvalidRuntimeState;
             }
+            let destination = usize::from(destination);
+            match recovery.value {
+                MrsTpidrValueSource::Register => {}
+                MrsTpidrValueSource::Slot => {
+                    let Some(guest_tp) = read_usize(&mut read, runtime.guest_thread_pointer_addr)
+                    else {
+                        return Aarch64GateSignalResult::InvalidRuntimeState;
+                    };
+                    canonical.regs[destination] = guest_tp;
+                }
+            }
+            if recovery.completed {
+                canonical.pc = site + 4;
+            }
+        }
+        GateMetadata::HostAwareMrsTpidr { destination } => {
+            let Some(stage) =
+                litebox_syscall_rewriter::aarch64::HostAwareMrsTpidrGateOffset::from_offset(offset)
+            else {
+                return Aarch64GateSignalResult::InvalidRuntimeState;
+            };
+            let Some(recovery) = stage.recovery_plan() else {
+                return Aarch64GateSignalResult::InvalidRuntimeState;
+            };
+            if recovery.runtime_access == RuntimeAccess::Memory
+                && interruption == GateInterruption::Synchronous
+            {
+                return Aarch64GateSignalResult::InvalidRuntimeState;
+            }
+            let destination = usize::from(destination);
             match recovery.value {
                 MrsTpidrValueSource::Register => {}
                 MrsTpidrValueSource::Slot => {
@@ -698,6 +727,80 @@ fn canonicalize_impl(
 mod tests {
     use super::*;
     use litebox_syscall_rewriter::{aarch64::DARWIN_SVC_FRAME_BYTES, macho::Rewriter};
+
+    #[test]
+    #[expect(clippy::single_range_in_vec_init, reason = "one executable code range")]
+    fn host_aware_mrs_recovery_canonicalizes_middle_stages() {
+        const SITE: usize = 0x1000_0000;
+        const TRAMPOLINE: usize = 0x1000_4000;
+        const GUEST_TP_SLOT: usize = 0x2000_0000;
+        const GUEST_TP: usize = 0xfeed_1234;
+        const DESTINATION: usize = 9;
+
+        let mut code = 0xd53b_d069u32.to_le_bytes(); // mrs x9, tpidrro_el0
+        let (gates, trapped) = Rewriter::new(TargetHost::MacOs)
+            .unwrap()
+            .patch_host_shared_cache_code(
+                &mut code,
+                SITE as u64,
+                &[0..4],
+                TRAMPOLINE as u64,
+                0x1234,
+                96,
+            )
+            .unwrap();
+        assert!(trapped.is_empty());
+        let guest_tp = GUEST_TP.to_ne_bytes();
+        let read = |address: usize, output: &mut [u8]| {
+            for (base, bytes) in [
+                (SITE, code.as_slice()),
+                (TRAMPOLINE, gates.as_slice()),
+                (GUEST_TP_SLOT, guest_tp.as_slice()),
+            ] {
+                if let Some(offset) = address.checked_sub(base)
+                    && let Some(end) = offset.checked_add(output.len())
+                    && let Some(source) = bytes.get(offset..end)
+                {
+                    output.copy_from_slice(source);
+                    return true;
+                }
+            }
+            false
+        };
+        let runtime = GateRuntimeState {
+            guest_thread_pointer_addr: GUEST_TP_SLOT,
+            expected_outbound_stub: 0,
+            expected_outbound_pc: 0,
+        };
+        for offset in [4, 8, 12, 16, 20, 24, 28, 32, 36] {
+            let mut ctx = PtRegs {
+                pc: TRAMPOLINE + 16 + offset,
+                ..PtRegs::default()
+            };
+            ctx.regs[DESTINATION] = 0xdead;
+            let Aarch64GateSignalResult::Canonicalized(recovered) =
+                canonicalize_darwin(&ctx, runtime, GateInterruption::Asynchronous, read)
+            else {
+                panic!("Darwin MRS recovery failed at offset {offset}")
+            };
+            assert_eq!(recovered.pc, SITE + 4);
+            assert_eq!(recovered.regs[DESTINATION], GUEST_TP);
+        }
+        for offset in [40, 48] {
+            let mut ctx = PtRegs {
+                pc: TRAMPOLINE + 16 + offset,
+                ..PtRegs::default()
+            };
+            ctx.regs[DESTINATION] = GUEST_TP;
+            let Aarch64GateSignalResult::Canonicalized(recovered) =
+                canonicalize_darwin(&ctx, runtime, GateInterruption::Asynchronous, read)
+            else {
+                panic!("Darwin MRS recovery failed at offset {offset}")
+            };
+            assert_eq!(recovered.pc, SITE + 4);
+            assert_eq!(recovered.regs[DESTINATION], GUEST_TP);
+        }
+    }
 
     #[test]
     #[expect(clippy::single_range_in_vec_init, reason = "one executable code range")]

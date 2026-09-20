@@ -48,8 +48,13 @@ impl CodeMetadata {
         Ok(ranges)
     }
 
-    pub fn trampoline_size_upper_bound(&self, image: &[u8], rewriter: Rewriter) -> Result<usize> {
-        aarch64::macho_trampoline_size_upper_bound(image, &self.code, rewriter.host)
+    /// Upper bound for rewriting this image with `options`.
+    pub fn trampoline_size_upper_bound(
+        &self,
+        image: &[u8],
+        options: RewriteOptions,
+    ) -> Result<usize> {
+        aarch64::macho_trampoline_size_upper_bound(image, &self.code, options)
     }
 }
 
@@ -83,6 +88,71 @@ impl Rewriter {
         callback: u64,
         guest_tp_offset: u16,
     ) -> Result<(Vec<u8>, Vec<u64>)> {
+        self.patch_code_segment_with_options(
+            code,
+            code_vaddr,
+            ranges,
+            trampoline_vaddr,
+            callback,
+            guest_tp_offset,
+            RewriteOptions::new(self.host, false),
+        )
+    }
+
+    /// Rewrite SVC sites while leaving TPIDRRO reads on the physical pthread.
+    pub fn patch_native_guest_tpidrro_code(
+        self,
+        code: &mut [u8],
+        code_vaddr: u64,
+        ranges: &[Range<usize>],
+        trampoline_vaddr: u64,
+        callback: u64,
+        guest_tp_offset: u16,
+    ) -> Result<(Vec<u8>, Vec<u64>)> {
+        self.patch_code_segment_with_options(
+            code,
+            code_vaddr,
+            ranges,
+            trampoline_vaddr,
+            callback,
+            guest_tp_offset,
+            RewriteOptions::macos_native_guest_tpidrro(),
+        )
+    }
+
+    /// Rewrite SVC and TPIDRRO sites in live host shared-cache code.
+    /// Host-aware TPIDRRO gates retain native host TLS outside guest execution.
+    pub fn patch_host_shared_cache_code(
+        self,
+        code: &mut [u8],
+        code_vaddr: u64,
+        ranges: &[Range<usize>],
+        trampoline_vaddr: u64,
+        callback: u64,
+        guest_tp_offset: u16,
+    ) -> Result<(Vec<u8>, Vec<u64>)> {
+        self.patch_code_segment_with_options(
+            code,
+            code_vaddr,
+            ranges,
+            trampoline_vaddr,
+            callback,
+            guest_tp_offset,
+            RewriteOptions::macos_host_shared_cache(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn patch_code_segment_with_options(
+        self,
+        code: &mut [u8],
+        code_vaddr: u64,
+        ranges: &[Range<usize>],
+        trampoline_vaddr: u64,
+        callback: u64,
+        guest_tp_offset: u16,
+        options: RewriteOptions,
+    ) -> Result<(Vec<u8>, Vec<u64>)> {
         checked_add_u64(code_vaddr, code.len() as u64, "Mach-O mapping end")?;
         if ranges.windows(2).any(|pair| pair[0].end > pair[1].start) {
             return Err(Error::ParseError(
@@ -91,13 +161,8 @@ impl Rewriter {
         }
         let sections = crate::scan_sections(code_vaddr, ranges, code.len())?;
         let mut patched = code.to_vec();
-        let Some(mut outcome) = aarch64::hook_macho(
-            &mut patched,
-            &sections,
-            trampoline_vaddr,
-            callback,
-            RewriteOptions::new(self.host, false),
-        )?
+        let Some(mut outcome) =
+            aarch64::hook_macho(&mut patched, &sections, trampoline_vaddr, callback, options)?
         else {
             return Ok((Vec::new(), Vec::new()));
         };
@@ -106,7 +171,8 @@ impl Rewriter {
         Ok((outcome.trampoline, outcome.trapped_sites))
     }
 
-    /// Allocation-failure fallback; synchronize the instruction cache before execution.
+    /// Allocation-failure fallback for [`Self::patch_code_segment`].
+    /// Synchronize the instruction cache before execution.
     pub fn trap_code_segment(
         self,
         code: &mut [u8],
@@ -170,7 +236,7 @@ pub fn hook_syscalls_in_macho_with_options(
     let Some(metadata) = parse_image(input)? else {
         return Ok(input.to_vec());
     };
-    let rewriter = Rewriter::new(options.target_host())?;
+    Rewriter::new(options.target_host())?;
     if is_already_hooked(input, Arch::Aarch64) {
         return Ok(input.to_vec());
     }
@@ -186,7 +252,7 @@ pub fn hook_syscalls_in_macho_with_options(
             addr,
             limit,
             callback.unwrap_or(0),
-            rewriter,
+            options,
         )
     };
     if let TrampolinePlacement::InsideLoadSpan { addr, limit, .. } = placement {
@@ -457,16 +523,10 @@ fn rewrite_at(
     addr: u64,
     limit: Option<u64>,
     callback: u64,
-    rewriter: Rewriter,
+    options: RewriteOptions,
 ) -> Result<Vec<u8>> {
     let mut out = input.to_vec();
-    let Some(mut outcome) = aarch64::hook_macho(
-        &mut out,
-        sections,
-        addr,
-        callback,
-        RewriteOptions::new(rewriter.host, false),
-    )?
+    let Some(mut outcome) = aarch64::hook_macho(&mut out, sections, addr, callback, options)?
     else {
         let header = TrampolineHeader64 {
             magic: *TRAMPOLINE_MAGIC,
