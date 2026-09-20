@@ -31,13 +31,17 @@ mod stdio;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::message::{
     BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerOperation,
     BrokerRequest, BrokerResponse, BrokerResult,
+};
+use litebox_broker_protocol::process::{
+    InheritedProcessObjects, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessBootstrapFormat,
+    ProcessBootstrapVersion, ProcessIdentity, ProcessStartupData, ProcessStartupDescriptor,
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SharedBufferSequence};
@@ -58,6 +62,7 @@ pub use error::{BrokerLocalError, Result};
 pub struct BrokerLocal<Channel: LocalCallChannel> {
     channel: Channel,
     process_id: ProcessId,
+    initial_thread_id: ThreadId,
     shared_buffers: SharedBufferPool<Arc<dyn SharedMemory>>,
     next_request_id: AtomicU64,
 }
@@ -68,12 +73,18 @@ pub struct BrokerNotifications<Channel: LocalNotificationChannel> {
 }
 
 impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
-    fn new(channel: Channel, process_id: ProcessId, shared_memory: Arc<dyn SharedMemory>) -> Self {
+    fn new(
+        channel: Channel,
+        process_id: ProcessId,
+        initial_thread_id: ThreadId,
+        shared_memory: Arc<dyn SharedMemory>,
+    ) -> Self {
         let shared_buffers = SharedBufferPool::new(shared_memory, SHARED_BUFFER_LAYOUT)
             .expect("broker association shared memory has an invalid size");
         Self {
             channel,
             process_id,
+            initial_thread_id,
             shared_buffers,
             next_request_id: AtomicU64::new(0),
         }
@@ -87,6 +98,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     /// after negotiation, such as receiving shared memory and starting the
     /// active transport. Any additional endpoints activation produces, such as
     /// a notification receiver, are returned to the caller as `Activated`.
+    /// Child startup data is copied from the negotiated shared-buffer pool and
+    /// returned when present.
     ///
     /// # Panics
     ///
@@ -101,7 +114,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             (Channel, Arc<dyn SharedMemory>, Activated),
             Channel::Error,
         >,
-    ) -> Result<(Self, Activated), Channel::Error> {
+    ) -> Result<(Self, Option<ProcessStartupData>, Activated), Channel::Error> {
         let requested = BROKER_PROTOCOL_VERSION;
         let request = BrokerHandshakeRequest {
             protocol_version: requested,
@@ -117,6 +130,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             response @ BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version,
                 process_id,
+                initial_thread_id,
+                startup,
             } => {
                 assert_eq!(
                     requested, broker_protocol_version,
@@ -124,7 +139,25 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                 );
                 let (channel, shared_memory, activated) =
                     activate(setup).map_err(BrokerLocalError::Channel)?;
-                Ok((Self::new(channel, process_id, shared_memory), activated))
+                let local = Self::new(channel, process_id, initial_thread_id, shared_memory);
+                let startup = match startup {
+                    Some(startup) => {
+                        let mut payload = Vec::new();
+                        payload
+                            .try_reserve_exact(startup.buffer.length() as usize)
+                            .map_err(|_| BrokerLocalError::Broker(ErrorCode::OutOfMemory))?;
+                        payload.resize(startup.buffer.length() as usize, 0);
+                        local.read_shared_buffer(startup.buffer, &mut payload);
+                        Some(ProcessStartupData {
+                            format: startup.format,
+                            version: startup.version,
+                            payload,
+                            inherited_objects: startup.inherited_objects,
+                        })
+                    }
+                    None => None,
+                };
+                Ok((local, startup, activated))
             }
             BrokerHandshakeResponse::VersionMismatch { .. } => {
                 Err(BrokerLocalError::Broker(ErrorCode::UnsupportedVersion))
@@ -132,7 +165,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             BrokerHandshakeResponse::Error(error) => match error {
                 ErrorCode::UnsupportedVersion
                 | ErrorCode::PolicyDenied
-                | ErrorCode::ResourceExhausted => Err(BrokerLocalError::Broker(error)),
+                | ErrorCode::ResourceExhausted
+                | ErrorCode::OutOfMemory => Err(BrokerLocalError::Broker(error)),
                 ErrorCode::MalformedRequest
                 | ErrorCode::ProtocolState
                 | ErrorCode::UnsupportedOperation
@@ -146,6 +180,48 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     #[must_use]
     pub const fn process_id(&self) -> ProcessId {
         self.process_id
+    }
+
+    /// Returns the broker-assigned initial thread ID.
+    #[must_use]
+    pub const fn initial_thread_id(&self) -> ThreadId {
+        self.initial_thread_id
+    }
+
+    /// Starts one child process.
+    ///
+    /// This call blocks until the child's broker association is active or
+    /// launch fails. The caller must retain exclusive ownership of the
+    /// bootstrap sequence until this method returns.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the bootstrap length differs from the shared-buffer sequence
+    /// or the broker returns a response for another operation.
+    pub fn start_child_process(
+        &self,
+        format: ProcessBootstrapFormat,
+        version: ProcessBootstrapVersion,
+        buffer: SharedBufferSequence,
+        bootstrap: &[u8],
+        inherited_objects: InheritedProcessObjects,
+    ) -> Result<ProcessIdentity, Channel::Error> {
+        if buffer.length() > MAX_PROCESS_BOOTSTRAP_SIZE {
+            return Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted));
+        }
+        self.write_shared_buffer(buffer, bootstrap);
+        match self.request(BrokerOperation::StartChildProcess(
+            ProcessStartupDescriptor {
+                format,
+                version,
+                buffer,
+                inherited_objects,
+            },
+        ))? {
+            BrokerResult::ProcessStarted(started) => Ok(started),
+            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
+            response => panic!("broker returned unexpected process-start response: {response:?}"),
+        }
     }
 
     /// Creates a broker thread belonging to this process.
@@ -235,17 +311,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             buffer.length() as usize,
             "shared data must match its buffer sequence"
         );
-        let mut offset = 0;
-        for descriptor in buffer
-            .descriptors(self.shared_buffers.layout())
-            .expect("shared buffer sequence must identify valid slot ranges")
-        {
-            let end = offset + descriptor.length as usize;
-            self.shared_buffers
-                .write(descriptor.slot_index, &data[offset..end])
-                .expect("validated shared buffer sequence must be accessible");
-            offset = end;
-        }
+        self.shared_buffers
+            .write_sequence(buffer, data)
+            .expect("validated shared buffer sequence must be accessible");
     }
 
     fn read_shared_buffer(&self, buffer: SharedBufferSequence, destination: &mut [u8]) {
@@ -253,26 +321,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             destination.len() <= buffer.length() as usize,
             "shared buffer sequence must cover the destination"
         );
-        let mut offset = 0;
-        for descriptor in buffer
-            .descriptors(self.shared_buffers.layout())
-            .expect("shared buffer sequence must identify valid slot ranges")
-        {
-            if offset == destination.len() {
-                break;
-            }
-            let length = (destination.len() - offset).min(descriptor.length as usize);
-            let end = offset + length;
-            self.shared_buffers
-                .read(descriptor.slot_index, &mut destination[offset..end])
-                .expect("validated shared buffer sequence must be accessible");
-            offset = end;
-        }
-        assert_eq!(
-            offset,
-            destination.len(),
-            "shared buffer sequence must cover the destination"
-        );
+        self.shared_buffers
+            .read_sequence(buffer, destination)
+            .expect("validated shared buffer sequence must be accessible");
     }
 
     /// Checks the current readiness of a broker-owned object.
@@ -350,11 +401,13 @@ mod tests {
             Some(BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
                 process_id: test_process_id(),
+                initial_thread_id: ThreadId(2),
+                startup: None,
             }),
             None,
         );
         let setup_calls = Cell::new(0);
-        let (local, ()) = BrokerLocal::negotiate(channel, |channel| {
+        let (local, startup, ()) = BrokerLocal::negotiate(channel, |channel| {
             assert!(channel.sent_handshake_request.is_some());
             assert!(channel.handshake_response.is_none());
             assert!(channel.sent_request.borrow().is_none());
@@ -370,7 +423,9 @@ mod tests {
             })
         );
         assert_eq!(setup_calls.get(), 1);
+        assert!(startup.is_none());
         assert_eq!(local.process_id(), test_process_id());
+        assert_eq!(local.initial_thread_id(), ThreadId(2));
     }
 
     #[test]
@@ -612,6 +667,8 @@ mod tests {
             Some(BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version,
                 process_id: test_process_id(),
+                initial_thread_id: ThreadId(2),
+                startup: None,
             }),
             None,
         );
@@ -663,21 +720,21 @@ mod tests {
     }
 
     #[test]
-    fn negotiate_returns_process_id_exhaustion() {
-        let channel = FakeControlChannel::new(
-            Some(BrokerHandshakeResponse::Error(ErrorCode::ResourceExhausted)),
-            None,
-        );
-        let setup_called = Cell::new(false);
+    fn negotiate_returns_resource_allocation_errors() {
+        for error in [ErrorCode::ResourceExhausted, ErrorCode::OutOfMemory] {
+            let channel =
+                FakeControlChannel::new(Some(BrokerHandshakeResponse::Error(error)), None);
+            let setup_called = Cell::new(false);
 
-        assert!(matches!(
-            BrokerLocal::negotiate(channel, |channel| {
-                setup_called.set(true);
-                Ok((channel, noop_shared_memory(), ()))
-            }),
-            Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted))
-        ));
-        assert!(!setup_called.get());
+            assert!(matches!(
+                BrokerLocal::negotiate(channel, |channel| {
+                    setup_called.set(true);
+                    Ok((channel, noop_shared_memory(), ()))
+                }),
+                Err(BrokerLocalError::Broker(reported)) if reported == error
+            ));
+            assert!(!setup_called.get());
+        }
     }
 
     #[test]
@@ -704,6 +761,8 @@ mod tests {
             Some(BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
                 process_id: test_process_id(),
+                initial_thread_id: ThreadId(2),
+                startup: None,
             }),
             None,
         );
@@ -727,6 +786,8 @@ mod tests {
             Some(BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
                 process_id: test_process_id(),
+                initial_thread_id: ThreadId(2),
+                startup: None,
             }),
             None,
         );

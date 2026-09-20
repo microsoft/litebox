@@ -378,7 +378,7 @@ fn directional_shutdown_survives_readiness_publication_failure() {
     )
     .unwrap();
     let process = broker
-        .create_process(CallerCredential::Unauthenticated)
+        .create_process(CallerCredential::Unauthenticated, None)
         .unwrap();
     let (published, publications) = channel();
     let (retired, _retirements) = channel();

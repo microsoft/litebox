@@ -95,12 +95,20 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // Leaked because the shim requires a `'static` session manager.
     let session_manager: &'static SessionManager<Platform> =
         Box::leak(Box::new(SessionManager::new()));
+    let (connection, startup) = broker::connect(&cli_args.broker_control_channel)?;
+    if let Some(bootstrap) = startup {
+        return Err(anyhow::anyhow!(
+            "unsupported child OP-TEE process bootstrap format {:?} version {:?}",
+            bootstrap.format,
+            bootstrap.version
+        ));
+    }
     let broker::BrokerConnection {
         local,
         notifications,
         coordinator,
         ..
-    } = broker::connect(&cli_args.broker_control_channel)?;
+    } = connection;
     let litebox = litebox::LiteBox::new_with_broker_local(platform, local);
     coordinator.install_dispatch(litebox.broker_failure_dispatcher());
     broker::start_notification_receiver(

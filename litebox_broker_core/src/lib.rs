@@ -52,6 +52,7 @@ pub use policy::{
 use process::ObjectReference;
 pub use process::{
     AssociationCancellation, BrokerProcess, BrokerThread, CallerCredential, ObjectRights,
+    ProcessLifecycleSink, ProcessShutdown,
 };
 use random::RandomProvider;
 use socket::{BrokerSocketPorts, SocketProvider};
@@ -213,9 +214,16 @@ pub struct BrokerCore {
     pub(crate) socket_provider: Arc<dyn SocketProvider>,
     pub(crate) fs: Arc<dyn FileService>,
     pub(crate) socket_ports: BrokerSocketPorts,
+    pub(crate) process_lifecycle_sink: Arc<dyn ProcessLifecycleSink>,
 }
 
 static BROKER_CORE_CREATED: AtomicBool = AtomicBool::new(false);
+
+struct NoopProcessLifecycleSink;
+
+impl ProcessLifecycleSink for NoopProcessLifecycleSink {
+    fn changed(&self) {}
+}
 
 impl BrokerCore {
     /// Creates the broker core with broker-wide service providers.
@@ -266,7 +274,23 @@ impl BrokerCore {
             socket_provider,
             fs,
             socket_ports: BrokerSocketPorts::default(),
+            process_lifecycle_sink: Arc::new(NoopProcessLifecycleSink),
         })
+    }
+
+    /// Returns a broker handle that publishes process lifecycle changes to `sink`.
+    #[must_use]
+    pub fn with_process_lifecycle_sink(&self, sink: Arc<dyn ProcessLifecycleSink>) -> Self {
+        Self {
+            process_lifecycle_sink: sink,
+            ..self.clone()
+        }
+    }
+
+    /// Returns whether any broker process remains registered.
+    #[must_use]
+    pub fn has_processes(&self) -> bool {
+        !self.processes.read().is_empty()
     }
 
     /// Returns the configured authority-state limits.
@@ -301,7 +325,7 @@ impl BrokerCore {
         Ok((first, second))
     }
 
-    /// Allocates and registers one authenticated broker process.
+    /// Allocates one authenticated process awaiting association activation.
     ///
     /// # Panics
     ///
@@ -310,6 +334,7 @@ impl BrokerCore {
     pub fn create_process(
         &self,
         caller_credential: CallerCredential,
+        parent_id: Option<ProcessId>,
     ) -> Result<Arc<BrokerProcess>> {
         let mut processes = self.processes.write();
         if processes.len() >= self.limits.max_processes {
@@ -323,7 +348,7 @@ impl BrokerCore {
         let process = Arc::new(BrokerProcess::new(
             self.clone(),
             id,
-            None,
+            parent_id,
             caller_credential,
         ));
         assert!(

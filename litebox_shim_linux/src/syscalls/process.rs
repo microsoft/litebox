@@ -387,14 +387,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     /// Transfers a surviving nonleader exec caller to the process leader
-    /// identity and retires its former broker thread ID.
+    /// identity while retaining its broker thread ownership.
     fn rebind_exec_identity(&self) {
         let Some(old_tid) = self.thread.rebind_for_exec(self.pid) else {
             return;
         };
 
-        // Publish the leader identity locally before releasing the old broker
-        // ID so no local process state can refer to a reusable thread ID.
         let thread = self
             .litebox_thread
             .take()
@@ -404,14 +402,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             old_tid,
             "LiteBox thread ownership must match the old Linux thread ID"
         );
-        let thread_id = thread.id();
-        if let Err(error) = thread.exit() {
-            litebox_util_log::error!(
-                error:% = error,
-                thread_id;
-                "failed to record thread exit during exec identity rebinding"
-            );
-        }
+        self.litebox_thread.set(Some(thread));
     }
 
     /// Returns true if the task is exiting and should not continue running
@@ -1842,7 +1833,7 @@ mod tests {
     extern crate std;
 
     #[test]
-    fn nonleader_exec_rebinds_identity_and_releases_broker_thread() {
+    fn nonleader_exec_rebinds_identity_and_retains_broker_thread() {
         use litebox::thread::CreateError;
         use litebox_broker_core::BrokerCoreLimits;
 
@@ -1851,14 +1842,14 @@ mod tests {
             super::super::test_broker::MAX_TEST_BROKER_REFERENCES,
             BrokerCoreLimits::DEFAULT.max_total_pipe_capacity,
         )
-        .with_thread_quotas(1, 1);
+        .with_thread_quotas(2, 2);
         let (litebox, process_id) =
             crate::syscalls::test_broker::litebox_with_limits(platform, limits);
         let shim_builder = crate::LinuxShimBuilder::new_with_litebox(platform, litebox, process_id);
         let leader = shim_builder.build().0.new_test_task();
         let task = leader
             .clone_for_test()
-            .expect("the sole broker thread slot must be available");
+            .expect("the thread slot after the negotiated initial thread must be available");
         let old_tid = task.sys_gettid();
         let process = task.process().clone();
 
@@ -1880,10 +1871,16 @@ mod tests {
             assert!(!inner.threads.contains_key(&old_tid));
         }
 
-        let replacement = task
-            .global
+        assert!(matches!(
+            task.global.create_thread(),
+            Err(CreateError::ResourceExhausted)
+        ));
+
+        let global = task.global.clone();
+        drop(task);
+        let replacement = global
             .create_thread()
-            .expect("exec rebinding must release the old broker thread slot");
+            .expect("task exit must release the retained broker thread slot");
         replacement
             .exit()
             .expect("the replacement broker thread must exit");

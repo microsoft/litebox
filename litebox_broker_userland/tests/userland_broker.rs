@@ -2,23 +2,32 @@
 // Licensed under the MIT license.
 
 use std::ffi::{OsStr, OsString};
-use std::io::{ErrorKind, Result};
+use std::io::{ErrorKind, Result, Write as _};
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::Path;
 use std::process::{Child, Command};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use litebox_broker_local::BrokerLocal;
+use litebox_broker_protocol::process::{
+    InheritedProcessObjects, ProcessBootstrapFormat, ProcessBootstrapVersion, ProcessStartupData,
+};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::{
     SHARED_BUFFER_POOL_SIZE, SharedBufferSequence, SharedBufferSlotIndex,
 };
 use litebox_broker_protocol::socket::{ReceiveFromFlags, SendFlags, SocketConnectionStatus};
 use litebox_broker_transport::control_ring::ControlRing;
-use litebox_broker_transport_linux_userland::unix_socket::UnixStreamLocalSetupChannel;
+use litebox_broker_transport_linux_userland::unix_socket::{
+    UnixControlRingLocalCallChannel, UnixStreamLocalSetupChannel,
+};
 
 const RUNNER_ARGUMENT: &str = "broker-userland-test-runner";
 const NETWORK_RUNNER_ARGUMENT: &str = "broker-userland-network-test-runner";
+const CHILD_START_RUNNER_ARGUMENT: &str = "broker-userland-child-start-runner";
+const TEST_BOOTSTRAP_FORMAT: ProcessBootstrapFormat = ProcessBootstrapFormat(0x7465_7374);
+const FAILING_BOOTSTRAP_FORMAT: ProcessBootstrapFormat = ProcessBootstrapFormat(0x6661_696c);
 const BROKER_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn main() {
@@ -49,6 +58,19 @@ fn run_parent_test() {
         .arg(&test_executable)
         .arg(RUNNER_ARGUMENT);
     wait_for_broker(event_command);
+
+    let child_marker = unique_child_marker_path();
+    let mut child_command = Command::new(env!("CARGO_BIN_EXE_litebox-broker-userland"));
+    child_command
+        .arg("--runner")
+        .arg(&test_executable)
+        .arg(CHILD_START_RUNNER_ARGUMENT)
+        .arg(&child_marker);
+    wait_for_broker(child_command);
+    let child_result = std::fs::read_to_string(&child_marker).unwrap();
+    assert!(child_result.starts_with("ready:"));
+    assert!(child_result.ends_with("\nstarted\nfinished\n"));
+    std::fs::remove_file(child_marker).unwrap();
 
     let gateway = std::net::Ipv4Addr::new(10, 0, 2, 1);
     let tcp_listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -110,7 +132,7 @@ fn run_fake_runner(args: &[OsString]) {
 
     let control_socket_path = args.get(2).unwrap();
     let setup_channel = connect_control_with_retry(Path::new(control_socket_path)).unwrap();
-    let (local, ()) = BrokerLocal::negotiate(setup_channel, |mut setup| {
+    let (local, startup, ()) = BrokerLocal::negotiate(setup_channel, |mut setup| {
         let shared_memory = setup.receive_memfd(
             SHARED_BUFFER_POOL_SIZE,
             Some(Instant::now() + Duration::from_secs(5)),
@@ -127,6 +149,10 @@ fn run_fake_runner(args: &[OsString]) {
         Ok((call_channel, Arc::new(shared_memory), ()))
     })
     .unwrap();
+    if let Some(bootstrap) = startup {
+        run_fake_child(local, bootstrap);
+        return;
+    }
     let local = Arc::new(local);
 
     if args.get(3).and_then(|argument| argument.to_str()) == Some(NETWORK_RUNNER_ARGUMENT) {
@@ -203,6 +229,46 @@ fn run_fake_runner(args: &[OsString]) {
         local.close_object(handle).unwrap();
         return;
     }
+    if args.get(3).and_then(|argument| argument.to_str()) == Some(CHILD_START_RUNNER_ARGUMENT) {
+        assert_eq!(args.len(), 5, "unexpected runner arguments: {args:?}");
+        let marker = Path::new(&args[4]);
+        let bootstrap = marker.as_os_str().as_encoded_bytes();
+        let inherited_event = local.create_event_with_count(1).unwrap();
+        let inherited_objects = InheritedProcessObjects::new(&[inherited_event]).unwrap();
+        let failed = local
+            .start_child_process(
+                FAILING_BOOTSTRAP_FORMAT,
+                ProcessBootstrapVersion(1),
+                SharedBufferSequence::new(
+                    &[SharedBufferSlotIndex(0)],
+                    bootstrap.len().try_into().unwrap(),
+                )
+                .unwrap(),
+                bootstrap,
+                inherited_objects,
+            )
+            .unwrap();
+        assert_ne!(failed.process_id.0, failed.initial_thread_id.0);
+        let started = local
+            .start_child_process(
+                TEST_BOOTSTRAP_FORMAT,
+                ProcessBootstrapVersion(1),
+                SharedBufferSequence::new(
+                    &[SharedBufferSlotIndex(0)],
+                    bootstrap.len().try_into().unwrap(),
+                )
+                .unwrap(),
+                bootstrap,
+                inherited_objects,
+            )
+            .unwrap();
+        assert_ne!(started.process_id.0, started.initial_thread_id.0);
+        wait_for_marker(
+            marker,
+            &format!("ready:{}\nstarted\nfinished\n", started.process_id.0),
+        );
+        return;
+    }
     assert_eq!(
         args.get(3).map(OsString::as_os_str),
         Some(OsStr::new(RUNNER_ARGUMENT))
@@ -268,6 +334,65 @@ fn run_fake_runner(args: &[OsString]) {
         .unwrap();
     assert_eq!(&received[..read], data);
     drop(local);
+}
+
+fn run_fake_child(
+    local: BrokerLocal<UnixControlRingLocalCallChannel>,
+    bootstrap: ProcessStartupData,
+) {
+    if bootstrap.format == FAILING_BOOTSTRAP_FORMAT {
+        return;
+    }
+    assert_eq!(bootstrap.format, TEST_BOOTSTRAP_FORMAT);
+    assert_eq!(bootstrap.version, ProcessBootstrapVersion(1));
+    let marker = Path::new(OsStr::from_bytes(&bootstrap.payload));
+    let inherited_objects = bootstrap.inherited_objects.as_slice();
+    assert_eq!(inherited_objects.len(), 1);
+    assert_eq!(
+        local.check_readiness(inherited_objects[0]).unwrap(),
+        ReadinessFlags::READ | ReadinessFlags::WRITE
+    );
+    std::fs::write(marker, format!("ready:{}\n", local.process_id().0)).unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(marker)
+        .unwrap()
+        .write_all(b"started\n")
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(marker)
+        .unwrap()
+        .write_all(b"finished\n")
+        .unwrap();
+}
+
+fn wait_for_marker(path: &Path, expected: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match std::fs::read_to_string(path) {
+            Ok(contents) if contents == expected => return,
+            Ok(_) | Err(_) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result => panic!(
+                "timed out waiting for child marker {}: {result:?}",
+                path.display()
+            ),
+        }
+    }
+}
+
+fn unique_child_marker_path() -> std::path::PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "litebox-child-start-{}-{nonce}",
+        std::process::id()
+    ))
 }
 
 struct ChildGuard {

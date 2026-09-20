@@ -53,15 +53,19 @@ fn spawn_host(
         .build()
         .unwrap();
         let shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();
-        let shared_buffers = SharedBufferPool::new(shared_memory, SHARED_BUFFER_LAYOUT).unwrap();
+        let shared_buffers =
+            Arc::new(SharedBufferPool::new(shared_memory, SHARED_BUFFER_LAYOUT).unwrap());
         let control_memory = MemfdSharedMemory::create_control_ring().unwrap();
         let control_ring = ControlRing::new(control_memory).unwrap();
         let mut control = UnixStreamHostSetupChannel::from_accepted(stream);
         let association = setup_connection(
             &broker,
+            None,
+            None,
             &mut control,
-            &shared_buffers,
+            Arc::clone(&shared_buffers),
             Arc::new(ReadinessPublisherRuntime::new()),
+            |_| false,
             |channel| {
                 channel.send_memfd(shared_buffers.memory(), None)?;
                 channel.send_memfd(control_ring.memory(), None)
@@ -91,7 +95,7 @@ fn negotiate_local(
     BrokerLocal<UnixControlRingLocalCallChannel>,
     BrokerNotifications<UnixControlRingLocalNotificationChannel>,
 ) {
-    let (local, notifications) = BrokerLocal::negotiate(
+    let (local, _startup, notifications) = BrokerLocal::negotiate(
         UnixStreamLocalSetupChannel::from_connected(stream),
         |mut setup| {
             let shared_memory = setup.receive_memfd(SHARED_BUFFER_POOL_SIZE, None)?;
@@ -137,7 +141,7 @@ fn host_serves_control_requests_and_notifications_over_shared_rings() {
     let (local_control, host_control) = UnixStream::pair().unwrap();
     let host_shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();
     let host_shared_buffers =
-        SharedBufferPool::new(host_shared_memory, SHARED_BUFFER_LAYOUT).unwrap();
+        Arc::new(SharedBufferPool::new(host_shared_memory, SHARED_BUFFER_LAYOUT).unwrap());
     let host_control_memory = MemfdSharedMemory::create_control_ring().unwrap();
     let host_control_ring = ControlRing::new(host_control_memory).unwrap();
     let notification = BrokerNotification::Readiness(ReadinessNotification {
@@ -150,9 +154,12 @@ fn host_serves_control_requests_and_notifications_over_shared_rings() {
         let mut control = UnixStreamHostSetupChannel::from_accepted(host_control);
         let association = setup_connection(
             &broker,
+            None,
+            None,
             &mut control,
-            &host_shared_buffers,
+            Arc::clone(&host_shared_buffers),
             Arc::new(ReadinessPublisherRuntime::new()),
+            |_| false,
             |channel| {
                 channel.send_memfd(host_shared_buffers.memory(), None)?;
                 channel.send_memfd(host_control_ring.memory(), None)
@@ -176,7 +183,7 @@ fn host_serves_control_requests_and_notifications_over_shared_rings() {
         }
     });
 
-    let (local, notification_channel) = BrokerLocal::negotiate(
+    let (local, _startup, notification_channel) = BrokerLocal::negotiate(
         UnixStreamLocalSetupChannel::from_connected(local_control),
         |mut setup| {
             let shared_memory = setup.receive_memfd(SHARED_BUFFER_POOL_SIZE, None)?;

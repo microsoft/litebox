@@ -501,11 +501,13 @@ fn run_test_broker_connection(
         litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE,
     )
     .expect("failed to create broker test shared memory");
-    let shared_buffers = litebox_broker_transport::shared_memory::SharedBufferPool::new(
-        shared_memory,
-        litebox_broker_protocol::shared_buffer::SHARED_BUFFER_LAYOUT,
-    )
-    .expect("failed to attach broker test shared-buffer layout");
+    let shared_buffers = std::sync::Arc::new(
+        litebox_broker_transport::shared_memory::SharedBufferPool::new(
+            shared_memory,
+            litebox_broker_protocol::shared_buffer::SHARED_BUFFER_LAYOUT,
+        )
+        .expect("failed to attach broker test shared-buffer layout"),
+    );
     let control_memory =
         litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory::create_control_ring()
             .expect("failed to create broker test control ring");
@@ -521,9 +523,12 @@ fn run_test_broker_connection(
         std::sync::Arc::new(litebox_broker_userland::readiness::ReadinessPublisherRuntime::new());
     let association = litebox_broker_host::setup_connection(
         broker,
+        None,
+        None,
         &mut channel,
-        &shared_buffers,
+        std::sync::Arc::clone(&shared_buffers),
         readiness.clone(),
+        |_| false,
         |channel| {
             channel.send_memfd(shared_buffers.memory(), Some(setup_deadline))?;
             channel.send_memfd(control_ring.memory(), Some(setup_deadline))

@@ -77,11 +77,11 @@ pub enum PendingCallsError<Error> {
 
 /// Concurrent registry of requests awaiting broker responses.
 pub struct PendingCalls<Sync: PendingCallsSync, Error> {
-    state: Sync::Mutex<PendingCallsState<Sync, Error>>,
-    capacity_available: Sync::Condvar<PendingCallsState<Sync, Error>>,
+    state: Sync::Mutex<PendingCallsInner<Sync, Error>>,
+    capacity_available: Sync::Condvar<PendingCallsInner<Sync, Error>>,
 }
 
-struct PendingCallsState<Sync: PendingCallsSync, Error> {
+struct PendingCallsInner<Sync: PendingCallsSync, Error> {
     calls: BTreeMap<RequestId, Arc<PendingCall<Sync, Error>>>,
     failure: Option<Arc<Error>>,
 }
@@ -123,7 +123,7 @@ impl<Sync: PendingCallsSync, Error> PendingCalls<Sync, Error> {
     /// Creates an empty live pending-call registry.
     pub fn new() -> Self {
         Self {
-            state: Sync::mutex(PendingCallsState {
+            state: Sync::mutex(PendingCallsInner {
                 calls: BTreeMap::new(),
                 failure: None,
             }),
@@ -138,7 +138,7 @@ impl<Sync: PendingCallsSync, Error> PendingCalls<Sync, Error> {
     ) -> Result<Arc<PendingCall<Sync, Error>>, PendingCallsError<Error>> {
         let pending_call = Arc::new(PendingCall::new());
         let mut state = self.state.lock();
-        while state.calls.len() == MAX_PENDING_CALLS && state.failure.is_none() {
+        while state.calls.len() >= MAX_PENDING_CALLS && state.failure.is_none() {
             state = self.capacity_available.wait(state);
         }
         if let Some(error) = state.failure.as_ref() {
@@ -154,6 +154,11 @@ impl<Sync: PendingCallsSync, Error> PendingCalls<Sync, Error> {
     }
 
     /// Completes the pending call identified by `response`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal ordinary-call count is inconsistent with the
+    /// registered requests.
     pub fn complete(&self, response: BrokerResponse) -> Result<(), PendingCallsError<Error>> {
         let pending_call = {
             let mut state = self.state.lock();
@@ -163,7 +168,7 @@ impl<Sync: PendingCallsSync, Error> PendingCalls<Sync, Error> {
             let Some(pending_call) = state.calls.remove(&response.request_id) else {
                 return Err(PendingCallsError::UnknownResponseId);
             };
-            self.capacity_available.notify_one();
+            self.capacity_available.notify_all();
             pending_call
         };
         pending_call.resolve(Ok(response));

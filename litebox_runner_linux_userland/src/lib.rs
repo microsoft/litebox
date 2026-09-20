@@ -30,7 +30,7 @@ pub struct CliArgs {
     /// The program and arguments passed to it (e.g., `/usr/bin/python3 --version`).
     ///
     /// The program path must be absolute and refer to a file in the broker-owned file system.
-    #[arg(required = true, trailing_var_arg = true, value_hint = clap::ValueHint::CommandWithArguments)]
+    #[arg(trailing_var_arg = true, value_hint = clap::ValueHint::CommandWithArguments)]
     pub program_and_arguments: Vec<String>,
     /// Environment variables passed to the program (`K=V` pairs; can be invoked multiple times)
     #[arg(long = "env")]
@@ -86,7 +86,26 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         )
         .init();
 
-    let prog_path = &cli_args.program_and_arguments[0];
+    let control_socket_path = cli_args
+        .broker_control_channel
+        .as_deref()
+        .context("file operations require --broker-control-channel")?;
+    let (connection, startup) =
+        litebox_platform_linux_userland::with_guest_signals_blocked(|| {
+            broker::connect(control_socket_path)
+        })?;
+    if let Some(bootstrap) = startup {
+        return Err(anyhow!(
+            "unsupported child Linux process bootstrap format {:?} version {:?}",
+            bootstrap.format,
+            bootstrap.version
+        ));
+    }
+
+    let prog_path = cli_args
+        .program_and_arguments
+        .first()
+        .context("program path missing")?;
     if !prog_path.starts_with('/') {
         anyhow::bail!("program path must be absolute (e.g., /usr/bin/ls), got: {prog_path}");
     }
@@ -96,24 +115,18 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
 
     let mut broker_positional_io_fds = Vec::new();
     let mut broker_shutdown_fds = Vec::new();
-    let control_socket_path = cli_args
-        .broker_control_channel
-        .as_deref()
-        .context("file operations require --broker-control-channel")?;
     let broker::BrokerConnection {
         local: broker_local,
         notifications: broker_notifications,
         coordinator: broker_association_coordinator,
         positional_io_fds,
         shutdown_fd,
-    } = litebox_platform_linux_userland::with_guest_signals_blocked(|| {
-        broker::connect(control_socket_path)
-    })?;
-    let process_id = i32::try_from(broker_local.process_id().0)
-        .context("process ID does not fit Linux pid_t")?;
+    } = connection;
     broker_positional_io_fds.extend(positional_io_fds);
     broker_shutdown_fds.push(shutdown_fd);
-    let litebox = litebox::LiteBox::new_with_broker_local(platform, broker_local);
+    let (litebox, process_id, initial_thread) =
+        litebox::LiteBox::new_process_with_broker_local(platform, broker_local);
+    let process_id = i32::try_from(process_id.0).context("process ID does not fit Linux pid_t")?;
     broker_association_coordinator.install_dispatch(litebox.broker_failure_dispatcher());
     litebox_platform_linux_userland::with_guest_signals_blocked(|| {
         broker::start_notification_receiver(
@@ -156,7 +169,7 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         &broker_shutdown_fds,
     );
 
-    let program = shim.load_program(task_params, prog_path, argv, envp)?;
+    let program = shim.load_program(task_params, initial_thread, prog_path, argv, envp)?;
 
     #[cfg(feature = "lock_tracing")]
     litebox::sync::start_recording();
@@ -220,6 +233,19 @@ mod tests {
             error.to_string(),
             "--broker-proxy-url requires --broker-control-channel"
         );
+    }
+
+    #[test]
+    fn child_runner_cli_does_not_require_root_program() {
+        let args = CliArgs::try_parse_from([
+            "runner",
+            "--unstable",
+            "--broker-control-channel",
+            "/tmp/broker.sock",
+        ])
+        .unwrap();
+
+        assert!(args.program_and_arguments.is_empty());
     }
 
     #[test]

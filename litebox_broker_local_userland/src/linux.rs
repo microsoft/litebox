@@ -14,6 +14,7 @@ use std::{
 use anyhow::{Context as _, Result};
 use litebox_broker_local::{BrokerLocal, BrokerNotifications};
 use litebox_broker_protocol::message::BrokerNotification;
+use litebox_broker_protocol::process::ProcessStartupData;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport::control_ring::ControlRing;
 use litebox_broker_transport_linux_userland::unix_socket::{
@@ -39,7 +40,9 @@ pub struct BrokerConnection {
 }
 
 /// Connects to and negotiates an association with a Linux-userland broker.
-pub fn connect(control_socket_path: &Path) -> Result<BrokerConnection> {
+pub fn connect(
+    control_socket_path: &Path,
+) -> Result<(BrokerConnection, Option<ProcessStartupData>)> {
     let setup_deadline = Instant::now() + SETUP_TIMEOUT;
     let setup_channel = connect_with_retry(
         control_socket_path,
@@ -54,7 +57,7 @@ pub fn connect(control_socket_path: &Path) -> Result<BrokerConnection> {
         )
     })?;
     let association_coordinator = Arc::new(BrokerAssociationFailureCoordinator::new());
-    let (local, (notification_channel, positional_io_fds, shutdown_fd)) =
+    let (local, startup, (notification_channel, positional_io_fds, shutdown_fd)) =
         BrokerLocal::negotiate(setup_channel, |mut setup| {
             let shared_memory =
                 setup.receive_memfd(SHARED_BUFFER_POOL_SIZE, Some(setup_deadline))?;
@@ -85,13 +88,16 @@ pub fn connect(control_socket_path: &Path) -> Result<BrokerConnection> {
             ))
         })
         .context("broker negotiation failed")?;
-    Ok(BrokerConnection {
-        local,
-        notifications: BrokerNotifications::new(notification_channel),
-        coordinator: association_coordinator,
-        positional_io_fds,
-        shutdown_fd,
-    })
+    Ok((
+        BrokerConnection {
+            local,
+            notifications: BrokerNotifications::new(notification_channel),
+            coordinator: association_coordinator,
+            positional_io_fds,
+            shutdown_fd,
+        },
+        startup,
+    ))
 }
 
 /// Starts the broker notification receiver for an active association.
@@ -262,6 +268,8 @@ mod tests {
             &litebox_broker_protocol::message::BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: litebox_broker_protocol::BROKER_PROTOCOL_VERSION,
                 process_id: litebox_broker_protocol::ProcessId(1),
+                initial_thread_id: litebox_broker_protocol::ThreadId(2),
+                startup: None,
             },
         )
         .unwrap();

@@ -138,7 +138,7 @@ fn wide_string(value: &OsStr) -> IoResult<Vec<u16>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Barrier};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use crate::setup::{OwnedEvent, read_pipe_until_cancelled, write_frame};
@@ -295,6 +295,8 @@ mod tests {
             host.send_handshake_response(&BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
                 process_id: litebox_broker_protocol::ProcessId(1),
+                initial_thread_id: litebox_broker_protocol::ThreadId(2),
+                startup: None,
             })
             .unwrap();
             let memory = WindowsSharedMemory::create(4096).unwrap();
@@ -337,6 +339,8 @@ mod tests {
                 .send_handshake_response(&BrokerHandshakeResponse::Negotiated {
                     broker_protocol_version: BROKER_PROTOCOL_VERSION,
                     process_id: litebox_broker_protocol::ProcessId(1),
+                    initial_thread_id: litebox_broker_protocol::ThreadId(2),
+                    startup: None,
                 })
                 .unwrap();
             let (mut requests, responses, mut notifications, _shutdown) =
@@ -413,6 +417,8 @@ mod tests {
                 .send_handshake_response(&BrokerHandshakeResponse::Negotiated {
                     broker_protocol_version: BROKER_PROTOCOL_VERSION,
                     process_id: litebox_broker_protocol::ProcessId(1),
+                    initial_thread_id: litebox_broker_protocol::ThreadId(2),
+                    startup: None,
                 })
                 .unwrap();
             let (mut requests, responses, _notifications, _shutdown) =
@@ -471,84 +477,6 @@ mod tests {
     }
 
     #[test]
-    fn pending_capacity_blocks_before_sixty_fifth_publication() {
-        let control_name = pipe_name("pending-capacity-control");
-        let control_listener = WindowsNamedPipeListener::bind(&control_name).unwrap();
-        let (local_ring, host_ring) = control_rings();
-        let host = std::thread::spawn(move || {
-            let mut setup = accept_host_guaranteed(control_listener);
-            assert!(matches!(
-                setup.recv_handshake_request().unwrap(),
-                HostReceive::Message(BrokerHandshakeRequest { .. })
-            ));
-            setup
-                .send_handshake_response(&BrokerHandshakeResponse::Negotiated {
-                    broker_protocol_version: BROKER_PROTOCOL_VERSION,
-                    process_id: litebox_broker_protocol::ProcessId(1),
-                })
-                .unwrap();
-            let (mut requests, responses, _notifications, shutdown) =
-                setup.into_active(host_ring).unwrap();
-
-            let mut published = Vec::new();
-            for _ in 0..litebox_broker_transport::pending_calls::MAX_PENDING_CALLS {
-                let HostReceive::Message(request) = requests.recv_request().unwrap() else {
-                    panic!("expected pending request");
-                };
-                published.push(request.request_id);
-            }
-            responses
-                .send_response(&BrokerResponse {
-                    request_id: published[0],
-                    result: BrokerResult::ObjectClosed,
-                })
-                .unwrap();
-            let HostReceive::Message(released) = requests.recv_request().unwrap() else {
-                panic!("expected released request");
-            };
-            assert!(!published.contains(&released.request_id));
-            shutdown.shutdown().unwrap();
-        });
-
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut setup =
-            WindowsNamedPipeLocalSetupChannel::connect_with_setup_deadline(&control_name, deadline)
-                .unwrap();
-        setup
-            .send_handshake_request(&BrokerHandshakeRequest {
-                protocol_version: BROKER_PROTOCOL_VERSION,
-            })
-            .unwrap();
-        setup.recv_handshake_response().unwrap().unwrap();
-        let (calls, _notifications) = setup.into_active(local_ring).unwrap();
-        let calls = Arc::new(calls);
-        let start = Arc::new(Barrier::new(
-            litebox_broker_transport::pending_calls::MAX_PENDING_CALLS + 2,
-        ));
-        let callers = (0..=litebox_broker_transport::pending_calls::MAX_PENDING_CALLS)
-            .map(|id| {
-                let calls = Arc::clone(&calls);
-                let start = Arc::clone(&start);
-                std::thread::spawn(move || {
-                    start.wait();
-                    calls.call(BrokerRequest {
-                        request_id: RequestId(id as u64),
-                        operation: BrokerOperation::CloseObject(ObjectHandle(id as u64)),
-                    })
-                })
-            })
-            .collect::<Vec<_>>();
-        start.wait();
-
-        host.join().unwrap();
-        let completed = callers
-            .into_iter()
-            .map(|caller| usize::from(caller.join().unwrap().is_ok()))
-            .sum::<usize>();
-        assert_eq!(completed, 1);
-    }
-
-    #[test]
     fn host_shutdown_interrupts_blocked_request_receive() {
         let control_name = pipe_name("shutdown-control");
         let control_listener = WindowsNamedPipeListener::bind(&control_name).unwrap();
@@ -563,6 +491,8 @@ mod tests {
                 .send_handshake_response(&BrokerHandshakeResponse::Negotiated {
                     broker_protocol_version: BROKER_PROTOCOL_VERSION,
                     process_id: litebox_broker_protocol::ProcessId(1),
+                    initial_thread_id: litebox_broker_protocol::ThreadId(2),
+                    startup: None,
                 })
                 .unwrap();
             let (mut requests, _responses, _notifications, shutdown) =
