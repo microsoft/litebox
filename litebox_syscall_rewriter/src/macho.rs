@@ -83,6 +83,50 @@ impl Rewriter {
         callback: u64,
         guest_tp_offset: u16,
     ) -> Result<(Vec<u8>, Vec<u64>)> {
+        self.patch_code_segment_with_options(
+            code,
+            code_vaddr,
+            ranges,
+            trampoline_vaddr,
+            callback,
+            guest_tp_offset,
+            RewriteOptions::new(self.host, false),
+        )
+    }
+
+    /// Rewrite SVC and TPIDRRO sites in a boot-local copy of host shared-cache code.
+    /// Host-aware TPIDRRO gates retain native host TLS outside guest execution.
+    pub fn patch_host_shared_cache_code(
+        self,
+        code: &mut [u8],
+        code_vaddr: u64,
+        ranges: &[Range<usize>],
+        trampoline_vaddr: u64,
+        callback: u64,
+        guest_tp_offset: u16,
+    ) -> Result<(Vec<u8>, Vec<u64>)> {
+        self.patch_code_segment_with_options(
+            code,
+            code_vaddr,
+            ranges,
+            trampoline_vaddr,
+            callback,
+            guest_tp_offset,
+            RewriteOptions::macos_host_shared_cache(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn patch_code_segment_with_options(
+        self,
+        code: &mut [u8],
+        code_vaddr: u64,
+        ranges: &[Range<usize>],
+        trampoline_vaddr: u64,
+        callback: u64,
+        guest_tp_offset: u16,
+        options: RewriteOptions,
+    ) -> Result<(Vec<u8>, Vec<u64>)> {
         checked_add_u64(code_vaddr, code.len() as u64, "Mach-O mapping end")?;
         if ranges.windows(2).any(|pair| pair[0].end > pair[1].start) {
             return Err(Error::ParseError(
@@ -91,13 +135,8 @@ impl Rewriter {
         }
         let sections = crate::scan_sections(code_vaddr, ranges, code.len())?;
         let mut patched = code.to_vec();
-        let Some(mut outcome) = aarch64::hook_macho(
-            &mut patched,
-            &sections,
-            trampoline_vaddr,
-            callback,
-            RewriteOptions::new(self.host, false),
-        )?
+        let Some(mut outcome) =
+            aarch64::hook_macho(&mut patched, &sections, trampoline_vaddr, callback, options)?
         else {
             return Ok((Vec::new(), Vec::new()));
         };

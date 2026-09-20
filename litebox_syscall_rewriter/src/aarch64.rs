@@ -465,6 +465,10 @@ const X18_BRANCH_BRK_IMM: u16 = 0xB18;
 pub const GATE_ALIGNMENT: usize = 16;
 /// Byte size of a direct-TLS `MRS TPIDR_EL0` gate slot.
 pub const MRS_SLOT_BYTES: usize = 16;
+/// Byte size of a host-aware Darwin shared-cache TPIDRRO gate.
+const HOST_AWARE_MRS_SLOT_BYTES: usize = 64;
+/// Offset of the runtime's guest-mode word from its guest-TP field.
+pub const IN_GUEST_OFFSET_FROM_GUEST_TP: u16 = 32;
 /// Byte size of a direct-TLS `MSR TPIDR_EL0` gate slot.
 pub const MSR_SLOT_BYTES: usize = 48;
 /// First byte after the MSR gate's executable body and recovery branch.
@@ -521,6 +525,8 @@ enum GateKind {
     X18Adr = 5,
     X18Branch = 6,
     X18StackWriteback = 7,
+    /// A Darwin cache TPIDRRO read that selects host or guest state at runtime.
+    HostAwareMrsTpidr = 8,
 }
 
 impl GateKind {
@@ -538,6 +544,7 @@ impl GateKind {
             Self::X18Adr,
             Self::X18Branch,
             Self::X18StackWriteback,
+            Self::HostAwareMrsTpidr,
         ]
         .into_iter()
         .find(|kind| kind.bits() == bits)
@@ -561,6 +568,9 @@ pub enum GateMetadata {
         /// Register the guest thread pointer is read into.
         destination: u8,
     },
+    /// Read TPIDRRO from the physical host or private guest state according to
+    /// the current LiteBox execution mode.
+    HostAwareMrsTpidr { destination: u8 },
     /// A trapped `MSR TPIDR_EL0, <Xs>`, writing the guest thread pointer.
     MsrTpidr {
         /// Register holding the value to write.
@@ -608,12 +618,19 @@ pub(crate) struct EncodedGateMetadata(u32);
 
 impl EncodedGateMetadata {
     pub(crate) fn encode(metadata: GateMetadata) -> Option<Self> {
-        if matches!(metadata, GateMetadata::MrsTpidr { destination: XZR }) {
+        if matches!(
+            metadata,
+            GateMetadata::MrsTpidr { destination: XZR }
+                | GateMetadata::HostAwareMrsTpidr { destination: XZR }
+        ) {
             return None;
         }
         let (kind, register) = match metadata {
             GateMetadata::Svc => (GateKind::Svc, 0),
             GateMetadata::MrsTpidr { destination } => (GateKind::MrsTpidr, destination),
+            GateMetadata::HostAwareMrsTpidr { destination } => {
+                (GateKind::HostAwareMrsTpidr, destination)
+            }
             GateMetadata::MsrTpidr { source } => (GateKind::MsrTpidr, source),
             GateMetadata::X18 { scratch } => (GateKind::X18, scratch),
             GateMetadata::X18CompareBranch { scratch } => (GateKind::X18CompareBranch, scratch),
@@ -652,6 +669,11 @@ impl EncodedGateMetadata {
             GateKind::MrsTpidr if register != XZR => Some(GateMetadata::MrsTpidr {
                 destination: register,
             }),
+            GateKind::HostAwareMrsTpidr if register != XZR => {
+                Some(GateMetadata::HostAwareMrsTpidr {
+                    destination: register,
+                })
+            }
             GateKind::MsrTpidr => Some(GateMetadata::MsrTpidr { source: register }),
             GateKind::X18 if register != XZR => Some(GateMetadata::X18 { scratch: register }),
             GateKind::X18CompareBranch if register != XZR => {
@@ -1942,6 +1964,71 @@ impl MrsTpidrGateOffset {
     }
 }
 
+/// Actual instruction boundaries in a dual-use host-cache TPIDRRO gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum HostAwareMrsTpidrGateOffset {
+    Entry = 0,
+    MaskFirstAnchor = 4,
+    FirstBlockLoad = 8,
+    FirstBlockCheck = 12,
+    ModeLoad = 16,
+    ModeCheck = 20,
+    SecondAnchor = 24,
+    MaskSecondAnchor = 28,
+    SecondBlockLoad = 32,
+    GuestValueLoad = 36,
+    GuestSkip = 40,
+    HostValueRead = 44,
+    Return = 48,
+    ExecutableEnd = 52,
+}
+
+impl HostAwareMrsTpidrGateOffset {
+    const fn as_usize(self) -> usize {
+        self as u8 as usize
+    }
+
+    pub fn from_offset(offset: usize) -> Option<Self> {
+        Some(match offset {
+            0 => Self::Entry,
+            4 => Self::MaskFirstAnchor,
+            8 => Self::FirstBlockLoad,
+            12 => Self::FirstBlockCheck,
+            16 => Self::ModeLoad,
+            20 => Self::ModeCheck,
+            24 => Self::SecondAnchor,
+            28 => Self::MaskSecondAnchor,
+            32 => Self::SecondBlockLoad,
+            36 => Self::GuestValueLoad,
+            40 => Self::GuestSkip,
+            44 => Self::HostValueRead,
+            48 => Self::Return,
+            _ => return None,
+        })
+    }
+
+    pub const fn recovery_plan(self) -> MrsTpidrRecoveryPlan {
+        match self {
+            Self::Entry => MrsTpidrRecoveryPlan {
+                value: MrsTpidrValueSource::Register,
+                completed: false,
+                runtime_access: RuntimeAccess::NoAccess,
+            },
+            Self::GuestSkip | Self::HostValueRead | Self::Return => MrsTpidrRecoveryPlan {
+                value: MrsTpidrValueSource::Register,
+                completed: true,
+                runtime_access: RuntimeAccess::NoAccess,
+            },
+            _ => MrsTpidrRecoveryPlan {
+                value: MrsTpidrValueSource::Slot,
+                completed: true,
+                runtime_access: RuntimeAccess::Memory,
+            },
+        }
+    }
+}
+
 /// Location of guest x16 and SP at an emitted SVC instruction boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SvcFrameState {
@@ -2759,6 +2846,7 @@ impl GateLayout {
 pub(crate) struct RewriteConfig {
     host: Host,
     virtualize_x18: bool,
+    preserve_host_thread_state: bool,
 }
 
 impl From<crate::TargetHost> for Host {
@@ -2776,7 +2864,13 @@ impl RewriteConfig {
         Self {
             host: target.into(),
             virtualize_x18,
+            preserve_host_thread_state: false,
         }
+    }
+
+    fn with_host_thread_state_preservation(mut self, preserve: bool) -> Self {
+        self.preserve_host_thread_state = preserve;
+        self
     }
 }
 
@@ -3152,7 +3246,8 @@ pub(crate) fn hook_macho(
             "Mach-O rewriting requires a macOS host".into(),
         ));
     }
-    let config = RewriteConfig::new(options.target_host(), false);
+    let config = RewriteConfig::new(options.target_host(), false)
+        .with_host_thread_state_preservation(options.preserves_host_thread_state());
     let sites = find_macho_patch_sites(sections, buf)?;
     hook_sites(
         buf,
@@ -3301,6 +3396,7 @@ fn hook_sites(
                     site,
                     rd,
                     config.host,
+                    config.preserve_host_thread_state,
                 )?,
                 PatchKind::X18(X18TransformResult::Supported(transformation)) => emit_x18_gate(
                     &mut trampoline_data,
@@ -3632,7 +3728,18 @@ fn emit_mrs_gate(
     site: &PatchSite,
     rd: u8,
     host: Host,
+    preserve_host_thread_state: bool,
 ) -> Result<GateBuild> {
+    if preserve_host_thread_state {
+        return emit_host_aware_mrs_gate(
+            trampoline_data,
+            gate_offset,
+            trampoline_base_addr,
+            site,
+            rd,
+            host,
+        );
+    }
     let gate_vaddr = checked_add_u64(trampoline_base_addr, gate_offset as u64, "MRS gate")?;
     let mut asm = Asm::new(gate_vaddr);
     host.emit_tls_base_read(&mut asm, rd);
@@ -3652,6 +3759,72 @@ fn emit_mrs_gate(
         gate_vaddr,
         GateMetadata::MrsTpidr { destination: rd },
         GateLayout::linux(host),
+    )?;
+    Ok(GateBuild::Emitted)
+}
+
+fn emit_host_aware_mrs_gate(
+    trampoline_data: &mut Vec<u8>,
+    gate_offset: usize,
+    trampoline_base_addr: u64,
+    site: &PatchSite,
+    rd: u8,
+    host: Host,
+) -> Result<GateBuild> {
+    if host != Host::MacOs {
+        return Err(Error::UnsupportedExecutable(
+            "host-aware TPIDRRO gates require macOS".into(),
+        ));
+    }
+    let gate_vaddr = checked_add_u64(trampoline_base_addr, gate_offset as u64, "MRS gate")?;
+    let mut asm = Asm::new(gate_vaddr);
+
+    // First lookup determines whether this host thread belongs to LiteBox and
+    // whether it is currently executing guest code. The destination register
+    // is intentionally the only scratch: an architectural MRS overwrites it.
+    asm.emit(Insn::MrsTpidrroEl0(rd));
+    asm.emit(anchor_mask(rd));
+    asm.emit(Insn::LdrUimm {
+        rt: rd,
+        rn: rd,
+        imm_bytes: GUEST_TPIDR_OFFSET_PLACEHOLDER,
+    });
+    asm.emit(Insn::CbzX { rt: rd, offset: 32 });
+    asm.emit(Insn::LdrUimm {
+        rt: rd,
+        rn: rd,
+        imm_bytes: IN_GUEST_OFFSET_FROM_GUEST_TP,
+    });
+    asm.emit(Insn::CbzX { rt: rd, offset: 24 });
+
+    // Guest path: repeat the lookup, then select the private guest pointer.
+    asm.emit(Insn::MrsTpidrroEl0(rd));
+    asm.emit(anchor_mask(rd));
+    asm.emit(Insn::LdrUimm {
+        rt: rd,
+        rn: rd,
+        imm_bytes: GUEST_TPIDR_OFFSET_PLACEHOLDER,
+    });
+    asm.emit(Insn::LdrUimm {
+        rt: rd,
+        rn: rd,
+        imm_bytes: 0,
+    });
+    asm.emit(Insn::B(8));
+
+    // Host path: reproduce the original instruction, including the CPU tag.
+    asm.emit(Insn::MrsTpidrroEl0(rd));
+    let return_addr = checked_add_u64(site.vaddr, INSN_BYTES_U64, "MRS return")?;
+    if !asm.branch_to(return_addr)? {
+        return Ok(GateBuild::Unreachable);
+    }
+    append_gate_slot(
+        trampoline_data,
+        asm.finish(),
+        trampoline_base_addr,
+        gate_vaddr,
+        GateMetadata::HostAwareMrsTpidr { destination: rd },
+        GateLayout::darwin(host),
     )?;
     Ok(GateBuild::Emitted)
 }
@@ -4196,6 +4369,67 @@ fn validate_gate_slot_inner_with_layout(
                 }
                 && padding_is_nops(MrsTpidrGateOffset::ExecutableEnd.as_usize())
         }
+        GateMetadata::HostAwareMrsTpidr { destination } => {
+            exact(0, Insn::MrsTpidrroEl0(destination))
+                && exact(4, anchor_mask(destination))
+                && is_tpidr_access(
+                    word_at(8),
+                    Opcode::LdrUimm,
+                    destination,
+                    destination,
+                    Host::Linux,
+                )
+                && exact(
+                    12,
+                    Insn::CbzX {
+                        rt: destination,
+                        offset: 32,
+                    },
+                )
+                && exact(
+                    16,
+                    Insn::LdrUimm {
+                        rt: destination,
+                        rn: destination,
+                        imm_bytes: IN_GUEST_OFFSET_FROM_GUEST_TP,
+                    },
+                )
+                && exact(
+                    20,
+                    Insn::CbzX {
+                        rt: destination,
+                        offset: 24,
+                    },
+                )
+                && exact(24, Insn::MrsTpidrroEl0(destination))
+                && exact(28, anchor_mask(destination))
+                && is_tpidr_access(
+                    word_at(32),
+                    Opcode::LdrUimm,
+                    destination,
+                    destination,
+                    Host::Linux,
+                )
+                && exact(
+                    36,
+                    Insn::LdrUimm {
+                        rt: destination,
+                        rn: destination,
+                        imm_bytes: 0,
+                    },
+                )
+                && exact(40, Insn::B(8))
+                && exact(44, Insn::MrsTpidrroEl0(destination))
+                && match addressing {
+                    SlotAddressing::Unplaced { .. } => {
+                        word_at(48) & OPCODE_TOP6_MASK == Opcode::B.bits()
+                    }
+                    SlotAddressing::Placed { slot_vaddr, .. } => {
+                        decode_branch_target(word_at(48), slot_vaddr + 48).is_some()
+                    }
+                }
+                && padding_is_nops(HostAwareMrsTpidrGateOffset::ExecutableEnd.as_usize())
+        }
         GateMetadata::MsrTpidr { source } => {
             exact(0, Insn::SubSp(MSR_FRAME_BYTES))
                 && exact(
@@ -4555,6 +4789,7 @@ impl GateMetadata {
         match self {
             GateMetadata::Svc => SVC_SLOT_BYTES,
             GateMetadata::MrsTpidr { .. } => MRS_SLOT_BYTES,
+            GateMetadata::HostAwareMrsTpidr { .. } => HOST_AWARE_MRS_SLOT_BYTES,
             GateMetadata::MsrTpidr { .. } => MSR_SLOT_BYTES,
             GateMetadata::X18 { .. } => X18_SLOT_BYTES,
             GateMetadata::X18StackWriteback { .. } => X18_STACK_WRITEBACK_SLOT_BYTES,
@@ -4593,6 +4828,10 @@ impl GateMetadata {
     const fn indirect_tls_anchor_offsets(self) -> &'static [usize] {
         match self {
             GateMetadata::MrsTpidr { .. } => &[MrsTpidrGateOffset::Entry as usize],
+            GateMetadata::HostAwareMrsTpidr { .. } => &[
+                HostAwareMrsTpidrGateOffset::Entry as usize,
+                HostAwareMrsTpidrGateOffset::SecondAnchor as usize,
+            ],
             GateMetadata::MsrTpidr { .. } => &[MsrTpidrGateOffset::ReadAnchor as usize],
             GateMetadata::X18 { .. } => &[
                 X18GateOffset::FirstAnchor as usize,
@@ -4609,6 +4848,9 @@ impl GateMetadata {
     }
 
     const fn offset_for_host(self, host: Host, logical: usize) -> usize {
+        if matches!(self, GateMetadata::HostAwareMrsTpidr { .. }) {
+            return logical;
+        }
         if !matches!(host, Host::MacOs) {
             return logical;
         }
@@ -4627,7 +4869,9 @@ impl GateMetadata {
 
     /// Converts a host-layout instruction offset to its host-neutral recovery stage.
     pub fn recovery_offset_for_host(self, host: crate::TargetHost, host_offset: usize) -> usize {
-        if !matches!(host, crate::TargetHost::MacOs) {
+        if matches!(self, GateMetadata::HostAwareMrsTpidr { .. })
+            || !matches!(host, crate::TargetHost::MacOs)
+        {
             return host_offset;
         }
         let anchors = self.indirect_tls_anchor_offsets();
@@ -4654,6 +4898,9 @@ impl GateMetadata {
         match self {
             GateMetadata::Svc => SvcGateOffset::ExecutableEnd.as_usize(),
             GateMetadata::MrsTpidr { .. } => MrsTpidrGateOffset::ExecutableEnd.as_usize(),
+            GateMetadata::HostAwareMrsTpidr { .. } => {
+                HostAwareMrsTpidrGateOffset::ExecutableEnd.as_usize()
+            }
             GateMetadata::MsrTpidr { .. } => MsrTpidrGateOffset::ExecutableEnd.as_usize(),
             GateMetadata::X18 { .. } => X18GateOffset::ExecutableEnd.as_usize(),
             GateMetadata::X18StackWriteback { .. } => {
@@ -4677,6 +4924,9 @@ impl GateMetadata {
         match self {
             GateMetadata::Svc => SvcGateOffset::Return.as_usize(),
             GateMetadata::MrsTpidr { .. } => MrsTpidrGateOffset::Return.as_usize(),
+            GateMetadata::HostAwareMrsTpidr { .. } => {
+                HostAwareMrsTpidrGateOffset::Return.as_usize()
+            }
             GateMetadata::MsrTpidr { .. } => MsrTpidrGateOffset::Return.as_usize(),
             GateMetadata::X18 { .. } => X18GateOffset::Return.as_usize(),
             GateMetadata::X18StackWriteback { .. } => X18StackWritebackOffset::Return.as_usize(),
@@ -4832,6 +5082,7 @@ pub(crate) fn classify_copied_gate_slot_with_layout(
             slot_vaddr + SvcGateOffset::LoadCallback.as_usize() as u64,
         )?,
         GateMetadata::MrsTpidr { .. }
+        | GateMetadata::HostAwareMrsTpidr { .. }
         | GateMetadata::MsrTpidr { .. }
         | GateMetadata::X18 { .. }
         | GateMetadata::X18StackWriteback { .. }
@@ -5394,7 +5645,9 @@ fn validate_trampoline_offsets_with_layout(
                 | GateMetadata::X18Branch { .. }
         );
         let relevant = match metadata {
-            GateMetadata::MrsTpidr { .. } | GateMetadata::MsrTpidr { .. } => !x18,
+            GateMetadata::MrsTpidr { .. }
+            | GateMetadata::HostAwareMrsTpidr { .. }
+            | GateMetadata::MsrTpidr { .. } => !x18,
             GateMetadata::X18 { .. }
             | GateMetadata::X18StackWriteback { .. }
             | GateMetadata::X18CompareBranch { .. }
@@ -5696,6 +5949,70 @@ mod tests {
     }
 
     #[test]
+    fn macos_host_cache_gate_selects_guest_state_without_changing_host_tpidrro() {
+        let mut code = Insn::MrsTpidrroEl0(9).encode().unwrap().to_le_bytes();
+        let sections = [TextSectionInfo {
+            vaddr: 0x1000,
+            file_offset: 0,
+            size: code.len() as u64,
+        }];
+        let outcome = hook_macho(
+            &mut code,
+            &sections,
+            0x400000,
+            0,
+            crate::RewriteOptions::macos_host_shared_cache(),
+        )
+        .unwrap()
+        .unwrap();
+        let gate = &outcome.trampoline[GATES_START_OFFSET..];
+        assert_eq!(gate.len(), HOST_AWARE_MRS_SLOT_BYTES);
+        assert_eq!(
+            decode_gate_metadata_word(word_at(gate, HOST_AWARE_MRS_SLOT_BYTES - 4)),
+            Some(GateMetadata::HostAwareMrsTpidr { destination: 9 })
+        );
+        assert_eq!(word_at(gate, 0), Insn::MrsTpidrroEl0(9).encode().unwrap());
+        assert_eq!(
+            word_at(gate, 16),
+            Insn::LdrUimm {
+                rt: 9,
+                rn: 9,
+                imm_bytes: IN_GUEST_OFFSET_FROM_GUEST_TP,
+            }
+            .encode()
+            .unwrap()
+        );
+        assert_eq!(word_at(gate, 44), Insn::MrsTpidrroEl0(9).encode().unwrap());
+
+        let mut finalized = outcome.trampoline;
+        finalize_macho_trampoline(&mut finalized, 24, crate::TargetHost::MacOs).unwrap();
+        for offset in [GATES_START_OFFSET + 8, GATES_START_OFFSET + 32] {
+            assert_eq!(
+                word_at(&finalized, offset),
+                Insn::LdrUimm {
+                    rt: 9,
+                    rn: 9,
+                    imm_bytes: 24,
+                }
+                .encode()
+                .unwrap()
+            );
+        }
+        let gate_vaddr = 0x400000 + GATES_START_OFFSET as u64;
+        for offset in (0..HostAwareMrsTpidrGateOffset::ExecutableEnd.as_usize()).step_by(INSN_BYTES)
+        {
+            let classified = classify_copied_gate_slot_with_layout(
+                &finalized[GATES_START_OFFSET..],
+                gate_vaddr,
+                gate_vaddr + offset as u64,
+                GateLayout::darwin(Host::MacOs),
+            )
+            .unwrap();
+            assert_eq!(classified.original_site(), 0x1000);
+        }
+    }
+
+    #[test]
     fn macos_masks_every_emitted_tpidrro_anchor() {
         let words = [
             Insn::MrsTpidrEl0(9).encode().unwrap(),
@@ -5853,6 +6170,7 @@ mod tests {
                 RewriteConfig {
                     host: Host::Linux,
                     virtualize_x18: true,
+                    preserve_host_thread_state: false,
                 },
             )
         };
@@ -6073,6 +6391,7 @@ mod tests {
         RewriteConfig {
             host,
             virtualize_x18: true,
+            preserve_host_thread_state: false,
         }
     }
 
@@ -6202,6 +6521,7 @@ mod tests {
             RewriteConfig {
                 host: Host::Linux,
                 virtualize_x18: false,
+                preserve_host_thread_state: false,
             },
         )
         .unwrap()
@@ -6219,6 +6539,7 @@ mod tests {
             RewriteConfig {
                 host: Host::Linux,
                 virtualize_x18: false,
+                preserve_host_thread_state: false,
             },
         )
     }
@@ -6256,6 +6577,7 @@ mod tests {
             RewriteConfig {
                 host: Host::Linux,
                 virtualize_x18: true,
+                preserve_host_thread_state: false,
             },
         );
         let mut outcome = outcome.unwrap();
@@ -6694,6 +7016,7 @@ mod tests {
         let enabled = RewriteConfig {
             host: Host::Linux,
             virtualize_x18: true,
+            preserve_host_thread_state: false,
         };
         let sites = find_patch_sites(&[section], &bytes, enabled).unwrap();
         assert!(sites.iter().all(|site| matches!(
@@ -7404,6 +7727,10 @@ mod tests {
         let word = |m| EncodedGateMetadata::encode(m).unwrap().0;
         assert_eq!(word(GateMetadata::Svc), 0x0001b807);
         assert_eq!(word(GateMetadata::MrsTpidr { destination: 9 }), 0x0911b807);
+        assert_eq!(
+            word(GateMetadata::HostAwareMrsTpidr { destination: 9 }),
+            0x0981b807
+        );
         assert_eq!(word(GateMetadata::MsrTpidr { source: 9 }), 0x0921b807);
         assert_eq!(
             word(GateMetadata::X18Branch {
@@ -7456,7 +7783,7 @@ mod tests {
                 );
             }
         }
-        for kind in 8..16 {
+        for kind in 9..16 {
             let invalid = (valid & !GATE_METADATA_KIND_MASK) | (kind << GATE_METADATA_KIND_SHIFT);
             assert_eq!(EncodedGateMetadata(invalid).decode(), None, "kind {kind}");
         }
@@ -7513,6 +7840,7 @@ mod tests {
                 RewriteConfig {
                     host: Host::Linux,
                     virtualize_x18: false,
+                    preserve_host_thread_state: false,
                 },
             ),
             Err(Error::AddressOverflow(_))
@@ -7624,7 +7952,7 @@ mod tests {
                 );
             }
         }
-        for kind in 8..16 {
+        for kind in 9..16 {
             let word = (valid & !GATE_METADATA_KIND_MASK) | (kind << GATE_METADATA_KIND_SHIFT);
             assert_eq!(EncodedGateMetadata(word).decode(), None, "kind {kind}");
         }
@@ -7676,7 +8004,8 @@ mod tests {
                         stack_frame_bytes: 0,
                         original_site: 0x1000
                             + match metadata {
-                                GateMetadata::MrsTpidr { .. } => 0,
+                                GateMetadata::MrsTpidr { .. }
+                                | GateMetadata::HostAwareMrsTpidr { .. } => 0,
                                 GateMetadata::MsrTpidr { .. } => 4,
                                 GateMetadata::Svc => 8,
                                 GateMetadata::X18 { .. }

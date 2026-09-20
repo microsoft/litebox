@@ -305,13 +305,26 @@ fn canonicalize_impl(
     // `mrs x0, tpidr_el0` is the host anchor. Whatever the arms below repair,
     // re-derive it afterwards rather than exposing a host address to the guest.
     match metadata {
-        GateMetadata::MrsTpidr { destination, .. } => {
+        GateMetadata::MrsTpidr { destination, .. }
+        | GateMetadata::HostAwareMrsTpidr { destination } => {
             let destination = usize::from(destination);
-            let Some(stage) = MrsTpidrGateOffset::from_offset(offset) else {
-                return Aarch64GateSignalResult::InvalidRuntimeState;
-            };
-            let Some(recovery) = stage.recovery_plan() else {
-                return Aarch64GateSignalResult::InvalidRuntimeState;
+            let recovery = if matches!(metadata, GateMetadata::HostAwareMrsTpidr { .. }) {
+                let Some(stage) =
+                    litebox_syscall_rewriter::aarch64::HostAwareMrsTpidrGateOffset::from_offset(
+                        offset,
+                    )
+                else {
+                    return Aarch64GateSignalResult::InvalidRuntimeState;
+                };
+                stage.recovery_plan()
+            } else {
+                let Some(stage) = MrsTpidrGateOffset::from_offset(offset) else {
+                    return Aarch64GateSignalResult::InvalidRuntimeState;
+                };
+                let Some(recovery) = stage.recovery_plan() else {
+                    return Aarch64GateSignalResult::InvalidRuntimeState;
+                };
+                recovery
             };
             if recovery.runtime_access == RuntimeAccess::Memory
                 && interruption == GateInterruption::Synchronous
