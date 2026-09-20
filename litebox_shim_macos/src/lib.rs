@@ -298,7 +298,21 @@ pub struct LoadedProgram<P: ShimPlatform> {
     pub initial_ctx: PtRegs,
 }
 
+/// Keeps mappings/descriptors alive without retaining live guest tasks.
+pub struct RuntimeResources<P: ShimPlatform> {
+    _global: Arc<GlobalState<P>>,
+    _files: Arc<syscalls::file::FilesState<P>>,
+}
+
 impl<P: ShimPlatform> LoadedProgram<P> {
+    /// Retain storage referenced by the shared runtime until native users stop.
+    pub fn retain_runtime_resources(&self) -> RuntimeResources<P> {
+        RuntimeResources {
+            _global: self.entrypoints.task.global.clone(),
+            _files: self.entrypoints.task.files.clone(),
+        }
+    }
+
     /// Rewrite and register an externally prepared shared cache.
     ///
     /// The provider must keep target mappings alive for the guest lifetime and

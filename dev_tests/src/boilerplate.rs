@@ -87,6 +87,10 @@ const HEADERS_REQUIRED_PREFIX: &[(&str, &str)] = &[
         "// Copyright (c) Microsoft Corporation.\n// Licensed under the MIT license.\n\n",
     ),
     (
+        "cpp",
+        "// Copyright (c) Microsoft Corporation.\n// Licensed under the MIT license.\n\n",
+    ),
+    (
         "sh",
         "#! /bin/bash\n\n# Copyright (c) Microsoft Corporation.\n# Licensed under the MIT license.\n\n",
     ),
