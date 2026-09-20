@@ -109,6 +109,55 @@ pub struct MacosShim<P: ShimPlatform> {
     files: Arc<syscalls::file::FilesState<P>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LiveSharedCacheError {
+    InvalidCacheRange,
+    InvalidRegion,
+    UnreadableAlias,
+    Rewrite,
+}
+
+impl core::fmt::Display for LiveSharedCacheError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidCacheRange => "invalid or uncovered shared-cache base",
+            Self::InvalidRegion => "invalid shared-cache region",
+            Self::UnreadableAlias => "shared-cache writable alias is unreadable",
+            Self::Rewrite => "failed to rewrite shared-cache executable code",
+        })
+    }
+}
+
+impl core::error::Error for LiveSharedCacheError {}
+
+/// Writable staging and final addresses for the cache's shared gate area.
+pub struct LiveSharedCacheTrampoline {
+    pub range: core::ops::Range<usize>,
+    pub writable_alias: usize,
+}
+
+/// One executable mapping in a boot-local private cache clone.
+pub struct LiveSharedCacheMapping {
+    pub range: core::ops::Range<usize>,
+    pub protection: VmProtection,
+}
+
+pub struct LiveSharedCacheRegion<'a> {
+    pub range: core::ops::Range<usize>,
+    pub writable_alias: usize,
+    pub code_ranges: &'a [core::ops::Range<usize>],
+    /// Rewritten ranges whose TPIDRRO gates must select the physical pthread.
+    pub native_tpidrro_ranges: &'a [core::ops::Range<usize>],
+}
+
+/// Complete layout needed to rewrite a boot-local cache instance.
+pub struct LiveSharedCache<'a> {
+    pub range: core::ops::Range<usize>,
+    pub mappings: &'a [LiveSharedCacheMapping],
+    pub executable_regions: &'a [LiveSharedCacheRegion<'a>],
+    pub trampoline: LiveSharedCacheTrampoline,
+}
+
 impl<P: ShimPlatform> MacosShim<P> {
     /// Load a self-contained static executable from the guest filesystem.
     ///
@@ -126,7 +175,9 @@ impl<P: ShimPlatform> MacosShim<P> {
 
     /// Load a dynamically linked executable with a standalone copy of host dyld.
     ///
-    /// This maps the executable and standalone dyld before guest execution.
+    /// This maps the executable and standalone dyld before cache text is
+    /// privatized. Call [`LoadedProgram::adopt_live_shared_cache`] on the
+    /// result before entering guest execution.
     pub fn load_program_with_dyld(
         self,
         params: TaskParams,
@@ -204,6 +255,77 @@ pub struct LoadedProgram<P: ShimPlatform> {
     pub entrypoints: MacosShimEntrypoints<P>,
     pub process: Process,
     pub initial_ctx: PtRegs,
+}
+
+impl<P: ShimPlatform> LoadedProgram<P> {
+    /// Rewrite a boot-local cache after all loader allocation and libc work is complete.
+    pub fn adopt_live_shared_cache(
+        &self,
+        cache: &LiveSharedCache<'_>,
+    ) -> Result<(), LiveSharedCacheError> {
+        if cache.range.start == 0
+            || cache.range.start >= cache.range.end
+            || !cache.range.start.is_multiple_of(PAGE_SIZE)
+            || !cache.range.end.is_multiple_of(PAGE_SIZE)
+            || cache.trampoline.range.start >= cache.trampoline.range.end
+            || !cache.trampoline.range.start.is_multiple_of(PAGE_SIZE)
+            || !cache.trampoline.range.end.is_multiple_of(PAGE_SIZE)
+            || cache.trampoline.writable_alias == 0
+        {
+            return Err(LiveSharedCacheError::InvalidCacheRange);
+        }
+        if cache.mappings.is_empty()
+            || cache.mappings.iter().any(|mapping| {
+                mapping.range.start >= mapping.range.end
+                    || mapping.range.start < cache.range.start
+                    || mapping.range.end > cache.range.end
+                    || !mapping.range.start.is_multiple_of(PAGE_SIZE)
+                    || !mapping.range.end.is_multiple_of(PAGE_SIZE)
+            })
+            || cache
+                .mappings
+                .windows(2)
+                .any(|pair| pair[0].range.end > pair[1].range.start)
+        {
+            return Err(LiveSharedCacheError::InvalidCacheRange);
+        }
+        let mut trampoline_cursor = 0;
+        for region in cache.executable_regions {
+            if region.range.start >= region.range.end
+                || region.writable_alias == 0
+                || !region.range.start.is_multiple_of(PAGE_SIZE)
+                || !region.range.end.is_multiple_of(PAGE_SIZE)
+                || region.range.start < cache.range.start
+                || region.range.end > cache.range.end
+            {
+                return Err(LiveSharedCacheError::InvalidRegion);
+            }
+            trampoline_cursor = self.entrypoints.task.rewrite_live_shared_cache_region(
+                region,
+                &cache.trampoline,
+                trampoline_cursor,
+            )?;
+        }
+        let mut mappings = self.entrypoints.task.global.shared_cache_mappings.lock();
+        mappings.extend(
+            cache
+                .mappings
+                .iter()
+                .map(|mapping| (mapping.range.clone(), mapping.protection)),
+        );
+        mappings.push((
+            cache.trampoline.range.clone(),
+            VmProtection::READ | VmProtection::EXECUTE,
+        ));
+        drop(mappings);
+        *self.entrypoints.task.global.shared_cache_range.lock() = Some(cache.range.clone());
+        self.entrypoints
+            .task
+            .global
+            .shared_cache_base
+            .store(cache.range.start, Ordering::Release);
+        Ok(())
+    }
 }
 
 pub struct MacosShimEntrypoints<P: ShimPlatform> {

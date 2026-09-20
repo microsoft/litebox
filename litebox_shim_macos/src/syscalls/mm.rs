@@ -27,7 +27,7 @@ use litebox_syscall_rewriter::{
     macho::{CodeMetadata, Rewriter},
 };
 
-use crate::{ShimPlatform, Task};
+use crate::{LiveSharedCacheRegion, LiveSharedCacheTrampoline, ShimPlatform, Task};
 
 /// File provenance and rewrite state retained for a live guest mapping.
 pub(crate) struct MachoMapping {
@@ -235,6 +235,17 @@ fn forget_patched_range(patched: &mut BTreeSet<(usize, usize)>, range: Range<usi
     }
 }
 
+fn reserve_live_cache_gates(
+    cursor: usize,
+    gate_length: usize,
+    capacity: usize,
+) -> Option<Range<usize>> {
+    let start =
+        cursor.checked_next_multiple_of(litebox_syscall_rewriter::TRAMPOLINE_CURSOR_ALIGN)?;
+    let end = start.checked_add(gate_length)?;
+    (end <= capacity).then_some(start..end)
+}
+
 impl<P: ShimPlatform> Task<P> {
     pub(crate) fn sys_shared_region_check_np(
         &self,
@@ -270,6 +281,147 @@ impl<P: ShimPlatform> Task<P> {
                 (start < end).then_some((start..end, flags))
             })
             .collect()
+    }
+
+    /// Rewrite one private executable region of the current boot's host cache.
+    pub(crate) fn rewrite_live_shared_cache_region(
+        &self,
+        region: &LiveSharedCacheRegion<'_>,
+        trampoline: &LiveSharedCacheTrampoline,
+        trampoline_cursor: usize,
+    ) -> Result<usize, crate::LiveSharedCacheError> {
+        use crate::LiveSharedCacheError as Error;
+        const DARWIN_SVC: u32 = 0xd400_1001;
+        const MRS_TPIDRRO_MASK: u32 = 0xffff_ffe0;
+        const MRS_TPIDRRO_BITS: u32 = 0xd53b_d060;
+        const MAX_BATCH_SPAN: usize = 64 * 1024;
+
+        let length = region.range.len();
+        let valid_ranges = |ranges: &[Range<usize>]| {
+            !ranges.iter().any(|range| {
+                range.start >= range.end
+                    || range.end > length
+                    || !range.start.is_multiple_of(size_of::<u32>())
+                    || !range.end.is_multiple_of(size_of::<u32>())
+            }) && !ranges.windows(2).any(|pair| pair[0].end > pair[1].start)
+        };
+        if (region.code_ranges.is_empty() && region.native_tpidrro_ranges.is_empty())
+            || !valid_ranges(region.code_ranges)
+            || !valid_ranges(region.native_tpidrro_ranges)
+            || region.code_ranges.iter().any(|normal| {
+                region
+                    .native_tpidrro_ranges
+                    .iter()
+                    .any(|native| normal.start < native.end && native.start < normal.end)
+            })
+        {
+            return Err(Error::InvalidRegion);
+        }
+        let pointer = P::RawMutPointer::<u8>::from_usize(region.writable_alias);
+        let rewriter = Rewriter::new(TargetHost::MacOs).map_err(|_| Error::Rewrite)?;
+        let callback = self.global.platform.get_syscall_entry_point();
+        let tls_offset = self
+            .global
+            .platform
+            .guest_thread_pointer_offset()
+            .and_then(|offset| u16::try_from(offset).ok())
+            .ok_or(Error::Rewrite)?;
+        let mut patches = Vec::new();
+        let mut next_cursor = trampoline_cursor;
+        for (ranges, native_tpidrro) in [
+            (region.code_ranges, false),
+            (region.native_tpidrro_ranges, true),
+        ] {
+            let mut first = 0;
+            while first < ranges.len() {
+                let batch_start = ranges[first].start;
+                let mut batch_end = ranges[first].end;
+                let mut last = first + 1;
+                while let Some(next) = ranges.get(last)
+                    && next.end - batch_start <= MAX_BATCH_SPAN
+                    && next.start - batch_end <= PAGE_SIZE
+                {
+                    batch_end = next.end;
+                    last += 1;
+                }
+                let mut code =
+                    P::RawMutPointer::<u8>::from_usize(region.writable_alias + batch_start)
+                        .to_owned_slice(batch_end - batch_start)
+                        .ok_or(Error::UnreadableAlias)?
+                        .into_vec();
+                let mut local_ranges: Vec<_> = ranges[first..last]
+                    .iter()
+                    .map(|range| range.start - batch_start..range.end - batch_start)
+                    .collect();
+                local_ranges.retain(|range| {
+                    code[range.clone()].as_chunks::<4>().0.iter().any(|word| {
+                        let word = u32::from_le_bytes(*word);
+                        word == DARWIN_SVC
+                            || (!native_tpidrro && word & MRS_TPIDRRO_MASK == MRS_TPIDRRO_BITS)
+                    })
+                });
+                first = last;
+                if local_ranges.is_empty() {
+                    continue;
+                }
+                let cursor = next_cursor
+                    .checked_next_multiple_of(litebox_syscall_rewriter::TRAMPOLINE_CURSOR_ALIGN)
+                    .ok_or(Error::Rewrite)?;
+                let gate_address = trampoline
+                    .range
+                    .start
+                    .checked_add(cursor)
+                    .ok_or(Error::Rewrite)?;
+                let code_address = region
+                    .range
+                    .start
+                    .checked_add(batch_start)
+                    .ok_or(Error::Rewrite)?;
+                let result = if native_tpidrro {
+                    rewriter.patch_native_guest_tpidrro_code(
+                        &mut code,
+                        code_address as u64,
+                        &local_ranges,
+                        gate_address as u64,
+                        callback as u64,
+                        tls_offset,
+                    )
+                } else {
+                    rewriter.patch_host_shared_cache_code(
+                        &mut code,
+                        code_address as u64,
+                        &local_ranges,
+                        gate_address as u64,
+                        callback as u64,
+                        tls_offset,
+                    )
+                };
+                let (gates, trapped) = result.map_err(|error| {
+                    litebox_util_log::warn!(error:?; "failed to build host-cache gates");
+                    Error::Rewrite
+                })?;
+                let gate_range =
+                    reserve_live_cache_gates(next_cursor, gates.len(), trampoline.range.len())
+                        .ok_or(Error::Rewrite)?;
+                if !trapped.is_empty() {
+                    litebox_util_log::warn!(trapped:? = trapped, gates:? = gates.len(), cursor:? = cursor; "host-cache gates do not fit or cannot reach their sites");
+                    return Err(Error::Rewrite);
+                }
+                P::RawMutPointer::<u8>::from_usize(trampoline.writable_alias + gate_range.start)
+                    .copy_from_slice(0, &gates)
+                    .ok_or(Error::Rewrite)?;
+                next_cursor = gate_range.end;
+                patches.push((batch_start, code, local_ranges));
+            }
+        }
+        for (batch_start, code, local_ranges) in patches {
+            for local_range in local_ranges {
+                pointer
+                    .copy_from_slice(batch_start + local_range.start, &code[local_range])
+                    .ok_or(Error::Rewrite)?;
+            }
+        }
+        Ok(next_cursor)
     }
 
     pub(crate) fn sys_mmap(
