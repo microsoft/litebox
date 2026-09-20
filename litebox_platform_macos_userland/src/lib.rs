@@ -46,7 +46,13 @@ pub enum GuestAbi {
     Darwin = litebox_syscall_rewriter::aarch64::DARWIN_SVC_FRAME_BYTES as usize,
 }
 
-static GUEST_ABI: OnceLock<GuestAbi> = OnceLock::new();
+struct GuestConfiguration {
+    abi: GuestAbi,
+    darwin_private_thread_state: AtomicBool,
+    rewritten_host_sigreturn: AtomicBool,
+}
+
+static GUEST_CONFIGURATION: OnceLock<GuestConfiguration> = OnceLock::new();
 
 /// Set the process-wide guest ABI before running or spawning guest threads.
 ///
@@ -54,16 +60,48 @@ static GUEST_ABI: OnceLock<GuestAbi> = OnceLock::new();
 /// Panics if a different ABI has already been configured.
 pub fn set_guest_abi(abi: GuestAbi) {
     assert_eq!(
-        *GUEST_ABI.get_or_init(|| abi),
+        GUEST_CONFIGURATION
+            .get_or_init(|| GuestConfiguration {
+                abi,
+                darwin_private_thread_state: AtomicBool::new(false),
+                rewritten_host_sigreturn: AtomicBool::new(false),
+            })
+            .abi,
         abi,
         "guest ABI is already configured"
     );
 }
 
-fn guest_abi() -> GuestAbi {
-    *GUEST_ABI
+/// Give a Darwin guest private, natively initialized libSystem thread state.
+///
+/// Dynamic guests execute code from the dual-use host shared cache. A parked
+/// donor pthread supplies a valid pthread/TSD object that guest TPIDRRO gates
+/// can expose without allowing guest libc to mutate the runner thread's state.
+///
+/// # Panics
+///
+/// Panics if [`set_guest_abi`] has not been called.
+pub fn set_darwin_private_thread_state(enabled: bool) {
+    guest_configuration()
+        .darwin_private_thread_state
+        .store(enabled, Ordering::Release);
+}
+
+/// Mark host signal return as passing through rewritten shared-cache code.
+///
+/// # Panics
+///
+/// Panics if [`set_guest_abi`] has not been called.
+pub fn enable_rewritten_host_sigreturn() {
+    guest_configuration()
+        .rewritten_host_sigreturn
+        .store(true, Ordering::Release);
+}
+
+fn guest_configuration() -> &'static GuestConfiguration {
+    GUEST_CONFIGURATION
         .get()
-        .expect("guest ABI must be configured before guest execution")
+        .expect("guest ABI must be configured first")
 }
 
 /// Native page size on AArch64 macOS.
@@ -704,6 +742,7 @@ const MACH_PORT_NULL: u32 = 0;
 const BSD_SYS_MMAP: usize = 197;
 const BSD_SYS_MPROTECT: usize = 74;
 const BSD_SYS_PTHREAD_SIGMASK: usize = 329;
+const BSD_SYS_SIGRETURN: usize = 184;
 const MACH_VM_DEALLOCATE_TRAP: usize = 0u32.wrapping_sub(12) as usize;
 const VM_REGION_BASIC_INFO_64: i32 = 9;
 // sizeof(vm_region_basic_info_data_64_t) / sizeof(integer_t) on macOS. The
@@ -1415,6 +1454,7 @@ struct TlsBlock {
     active: usize,
     current_thread: usize,
     in_guest: usize,
+    native_sigreturn_pending: usize,
     vector_state: usize,
     host_fp_state: usize,
     pending_host_signals: AtomicU32,
@@ -1430,6 +1470,8 @@ mod tls_offset {
     pub const ACTIVE: usize = core::mem::offset_of!(TlsBlock, active);
     pub const CURRENT_THREAD: usize = core::mem::offset_of!(TlsBlock, current_thread);
     pub const IN_GUEST: usize = core::mem::offset_of!(TlsBlock, in_guest);
+    pub const NATIVE_SIGRETURN_PENDING: usize =
+        core::mem::offset_of!(TlsBlock, native_sigreturn_pending);
     pub const VECTOR_STATE: usize = core::mem::offset_of!(TlsBlock, vector_state);
     pub const HOST_FP_STATE: usize = core::mem::offset_of!(TlsBlock, host_fp_state);
     pub const PENDING_HOST_SIGNALS: usize = core::mem::offset_of!(TlsBlock, pending_host_signals);
@@ -1528,6 +1570,89 @@ fn create_tls_key() -> Result<TlsKey, i32> {
     Ok(TlsKey(key))
 }
 
+struct PrivateDarwinThreadBootstrap {
+    tpidrro: AtomicUsize,
+    ready: AtomicBool,
+}
+
+#[unsafe(naked)]
+unsafe extern "C" fn park_private_darwin_thread() -> ! {
+    core::arch::naked_asm!(
+        "1:",
+        "mov x0, #-1",
+        "mov w16, #-90", // mach_wait_until(UINT64_MAX)
+        "svc #0x80",
+        "b 1b",
+    );
+}
+
+/// Create private pthread/TSD storage. The donor remains parked until process
+/// exit, but its guest-visible Mach-self slot names the executing thread so
+/// native unfair-lock waits and wakes agree on ownership. Other pthread-object
+/// lifecycle operations on the initial donor-backed thread remain unsupported.
+fn create_private_darwin_thread_state() -> usize {
+    let caller_port = current_host_thread_port() as usize;
+    let bootstrap = Arc::new(PrivateDarwinThreadBootstrap {
+        tpidrro: AtomicUsize::new(0),
+        ready: AtomicBool::new(false),
+    });
+    let donor = Arc::clone(&bootstrap);
+    let thread = std::thread::Builder::new()
+        .name("litebox-darwin-tls".into())
+        .spawn(move || {
+            let mut signals = 0;
+            // SAFETY: signals is writable and this donor remains blocked forever.
+            unsafe {
+                libc::sigfillset(&raw mut signals);
+                assert_eq!(
+                    libc::pthread_sigmask(
+                        libc::SIG_BLOCK,
+                        &raw const signals,
+                        core::ptr::null_mut(),
+                    ),
+                    0,
+                );
+            }
+            donor.tpidrro.store(anchor(), Ordering::Relaxed);
+            donor.ready.store(true, Ordering::Release);
+            // SAFETY: publication is complete; this function never returns or
+            // touches pthread state again.
+            unsafe { park_private_darwin_thread() }
+        })
+        .expect("failed to create private Darwin TLS owner");
+    while !bootstrap.ready.load(Ordering::Acquire) {
+        assert!(
+            !thread.is_finished(),
+            "Darwin TLS donor exited before publication"
+        );
+        std::thread::yield_now();
+    }
+    // Validate on the caller after publication. The donor now uses only its raw
+    // wait loop and never consults pthread state again.
+    let donor_thread = std::os::unix::thread::JoinHandleExt::as_pthread_t(&thread);
+    let tsd = bootstrap.tpidrro.load(Ordering::Relaxed);
+    // SAFETY: the JoinHandle still owns the live, permanently parked donor.
+    let own_port = unsafe { libc::pthread_mach_thread_np(donor_thread) } as usize;
+    assert_eq!(
+        litebox_common_macos::user_pointers::UserPtr::<usize>::from_usize(tsd)
+            .read_at_offset::<MacosUserland>(0),
+        Some(donor_thread),
+        "unsupported donor pthread-self slot"
+    );
+    let slot = litebox_common_macos::user_pointers::UserPtrMut::<usize>::from_usize(
+        tsd + 3 * size_of::<usize>(),
+    );
+    assert_eq!(
+        slot.read_at_offset::<MacosUserland>(0),
+        Some(own_port),
+        "unsupported donor Mach-self slot"
+    );
+    slot.write_at_offset::<MacosUserland>(0, caller_port)
+        .expect("publishing guest lock identity");
+    drop(thread); // Detach; process exit reclaims the permanently parked donor.
+    tsd
+}
+
 fn anchor() -> usize {
     let value: usize;
     // SAFETY: TPIDRRO_EL0 is readable at EL0 on macOS; this changes no memory or flags.
@@ -1596,6 +1721,7 @@ fn initialize_thread_tls() {
         active: 0,
         current_thread: 0,
         in_guest: 0,
+        native_sigreturn_pending: 0,
         vector_state: vector,
         host_fp_state: 0,
         pending_host_signals: AtomicU32::new(0),
@@ -1714,6 +1840,7 @@ struct ThreadContext<'a> {
     outbound_x16: usize,
     outbound_pc: usize,
     outbound_stub: usize,
+    initial_entry: bool,
     interrupted: *const AtomicBool,
     thread: ThreadHandle,
     exit: GuestExit,
@@ -1729,7 +1856,7 @@ fn thread_start(
     set_guest_vector_state(&vector_state);
     // Allow caller to run some code before we return to the new thread.
     let shim = init_thread.init();
-    run_thread_inner_with_process(shim.as_ref(), &mut ctx, process);
+    run_thread_inner_with_process(shim.as_ref(), &mut ctx, process, false);
 }
 
 #[derive(Default)]
@@ -1842,7 +1969,7 @@ impl<const PAGE_SIZE: usize> litebox::platform::ThreadProvider
         ctx: &Self::ExecutionContext,
         init_thread: Box<dyn litebox::shim::InitThread<ExecutionContext = Self::ExecutionContext>>,
     ) -> Result<(), Self::ThreadSpawnError> {
-        if GUEST_ABI.get().is_none() {
+        if GUEST_CONFIGURATION.get().is_none() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "guest ABI must be configured before spawning guest threads",
@@ -2001,6 +2128,8 @@ unsafe extern "C" {
     fn litebox_macos_syscall_callback_in_guest_cleared();
     fn switch_to_guest_via_sigreturn_start();
     fn switch_to_guest_via_sigreturn_end();
+    fn switch_to_guest_direct_start();
+    fn switch_to_guest_direct_end();
     fn switch_to_guest_via_outbound_stub_start();
     fn switch_to_guest_via_outbound_stub_end();
 }
@@ -2037,7 +2166,27 @@ unsafe extern "C" fn syscall_callback() {
         "adrp x17, {tls_key_offset}@PAGE",
         "ldr x17, [x17, {tls_key_offset}@PAGEOFF]",
         "add x16, x16, x17",
-        "ldr x16, [x16]", // LiteBox TlsBlock pointer
+        "ldr x16, [x16]", // LiteBox TlsBlock pointer, or zero for host-only threads
+        "cbz x16, 90f",
+        "ldr x17, [x16, #{in_guest}]",
+        "cbz x17, 90f",
+        // A host signal handler returning into guest state must execute XNU's
+        // sigreturn natively even though the restored context is guest-owned.
+        "ldr x17, [sp, #{frame_x16}]",
+        "sub x17, x17, #{sigreturn}",
+        "cbnz x17, 91f",
+        "ldr x17, [x16, #{native_sigreturn_pending}]",
+        "cbz x17, 91f",
+        "str xzr, [x16, #{native_sigreturn_pending}]",
+        "mov x17, x16",
+        "ldr x16, [sp, #{frame_x16}]",
+        "svc #0x80",
+        // A successful sigreturn never returns. Fail inside the transition
+        // rather than treating its host registers as guest state. SIGTRAP is
+        // still blocked by the handler's mask, so use SIGILL rather than BRK.
+        "str xzr, [x17, #{in_guest}]",
+        "udf #0",
+        "91:",
         "ldr x17, [x16, #{active}]", // ThreadContext
         "ldr x17, [x17, #{context}]", // PtRegs
         "stp x0, x1, [x17, #0]",
@@ -2109,7 +2258,10 @@ unsafe extern "C" fn syscall_callback() {
         "str xzr, [x16, #{in_guest}]",
         "b _litebox_macos_syscall_callback_in_guest_cleared",
         ".cfi_endproc",
+        // Keep the continuation and native path in this Mach-O atom: local
+        // CBZ targets and the prologue's signal-PC bounds must not be split.
         ".globl _litebox_macos_syscall_callback_in_guest_cleared",
+        ".alt_entry _litebox_macos_syscall_callback_in_guest_cleared",
         "_litebox_macos_syscall_callback_in_guest_cleared:",
         ".cfi_startproc",
         ".cfi_def_cfa x29, 160",
@@ -2133,24 +2285,29 @@ unsafe extern "C" fn syscall_callback() {
         ".cfi_offset d13, -24",
         ".cfi_offset d14, -16",
         ".cfi_offset d15, -8",
-        // This label is a separate Mach-O atom, so a linker veneer may have
-        // clobbered x16/x17. Recompute the TLS base before dereferencing it.
-        "mrs x16, tpidrro_el0",
-        "and x16, x16, #0xfffffffffffffff8",
-        "adrp x17, {tls_key_offset}@PAGE",
-        "ldr x17, [x17, {tls_key_offset}@PAGEOFF]",
-        "add x16, x16, x17",
-        "ldr x16, [x16]", // LiteBox TlsBlock pointer
         "ldr x0, [x16, #{active}]", // ThreadContext
         "ldr x1, [x0, #{host_sp}]",
         "mov sp, x1",
         "add x29, sp, #16",
         "bl {syscall_handler}",
         "b {finish_thread_arch}",
+        // A rewritten shared-cache stub may also be called by the runner.
+        // Host execution has no active guest (or no LiteBox TLS entry). Restore
+        // the gate-clobbered registers, issue the original syscall, and resume
+        // after the patched SVC without entering Rust or the shim.
+        "90:",
+        "ldr x16, [sp, #{frame_x16}]",
+        "ldr x17, [sp, #{frame_scratch}]",
+        "svc #0x80",
+        // The outbound stub restores original x16 and SP without changing NZCV.
+        "ldr x16, [sp, #{frame_stub}]",
+        "br x16",
         ".cfi_endproc",
         tls_key_offset = sym TLS_KEY_OFFSET,
         active = const tls_offset::ACTIVE,
         in_guest = const tls_offset::IN_GUEST,
+        native_sigreturn_pending = const tls_offset::NATIVE_SIGRETURN_PENDING,
+        sigreturn = const BSD_SYS_SIGRETURN,
         guest_x18 = const tls_offset::GUEST_X18,
         vector_state = const tls_offset::VECTOR_STATE,
         context = const core::mem::offset_of!(ThreadContext, ctx),
@@ -2210,101 +2367,139 @@ unsafe extern "C" fn switch_to_guest_via_sigreturn() -> ! {
     );
 }
 
+// Both paths keep x0 (ThreadContext) intact until selecting the stack. Only
+// the saved-SP location and final branch target differ; all register restoration
+// and the interrupt boundary are shared.
+macro_rules! restore_guest_registers {
+    (
+        $name:literal,
+        stack = ($stack_base:literal, $stack_offset:expr),
+        branch = ($branch_base:literal, $branch_offset:expr)
+    ) => {
+        core::arch::naked_asm!(
+            "ldr x16, [x0, #{context}]",
+            "mrs x17, tpidrro_el0",
+            "and x17, x17, #0xfffffffffffffff8",
+            "adrp x1, {tls_key_offset}@PAGE",
+            "ldr x1, [x1, {tls_key_offset}@PAGEOFF]",
+            "add x17, x17, x1",
+            "ldr x17, [x17]",
+            "mrs x1, fpsr",
+            "mrs x2, fpcr",
+            "stp w1, w2, [x17, #{host_fp_state}]",
+            concat!(".globl _", $name, "_start"),
+            concat!(".alt_entry _", $name, "_start"),
+            concat!("_", $name, "_start:"),
+            "mov x1, #1",
+            "str x1, [x17, #{in_guest}]",
+            "ldr x1, [x0, #{interrupted}]",
+            "ldarb w1, [x1]",
+            "cbz w1, 1f",
+            "str xzr, [x17, #{in_guest}]",
+            "b _litebox_macos_interrupt_callback",
+            "1:",
+            "ldr x1, [x16, #{regs_x18}]",
+            "str x1, [x17, #{guest_x18}]",
+            "ldr x1, [x17, #{vector_state}]",
+            "ldp q0, q1, [x1, #0]",
+            "ldp q2, q3, [x1, #32]",
+            "ldp q4, q5, [x1, #64]",
+            "ldp q6, q7, [x1, #96]",
+            "ldp q8, q9, [x1, #128]",
+            "ldp q10, q11, [x1, #160]",
+            "ldp q12, q13, [x1, #192]",
+            "ldp q14, q15, [x1, #224]",
+            "ldp q16, q17, [x1, #256]",
+            "ldp q18, q19, [x1, #288]",
+            "ldp q20, q21, [x1, #320]",
+            "ldp q22, q23, [x1, #352]",
+            "ldp q24, q25, [x1, #384]",
+            "ldp q26, q27, [x1, #416]",
+            "ldp q28, q29, [x1, #448]",
+            "ldp q30, q31, [x1, #480]",
+            "ldr w2, [x1, #{vector_fpsr}]",
+            "msr fpsr, x2",
+            "ldr w2, [x1, #{vector_fpcr}]",
+            "msr fpcr, x2",
+            "ldr x1, [x16, #{regs_pstate}]",
+            "msr nzcv, x1",
+            concat!("ldr x9, [", $stack_base, ", #{resume_sp}]"),
+            "mov sp, x9",
+            "ldp x0, x1, [x16, #0]",
+            "ldp x2, x3, [x16, #16]",
+            "ldp x4, x5, [x16, #32]",
+            "ldp x6, x7, [x16, #48]",
+            "ldp x8, x9, [x16, #64]",
+            "ldp x10, x11, [x16, #80]",
+            "ldp x12, x13, [x16, #96]",
+            "ldp x14, x15, [x16, #112]",
+            "ldr x17, [x16, #{regs_x17}]",
+            "ldp x19, x20, [x16, #{regs_x19}]",
+            "ldp x21, x22, [x16, #{regs_x21}]",
+            "ldp x23, x24, [x16, #{regs_x23}]",
+            "ldp x25, x26, [x16, #{regs_x25}]",
+            "ldp x27, x28, [x16, #{regs_x27}]",
+            "ldp x29, x30, [x16, #{regs_x29}]",
+            concat!("ldr x16, [", $branch_base, ", #{resume_pc}]"),
+            "br x16",
+            concat!(".globl _", $name, "_end"),
+            concat!(".alt_entry _", $name, "_end"),
+            concat!("_", $name, "_end:"),
+            "brk #0",
+            tls_key_offset = sym TLS_KEY_OFFSET,
+            context = const core::mem::offset_of!(ThreadContext, ctx),
+            in_guest = const tls_offset::IN_GUEST,
+            guest_x18 = const tls_offset::GUEST_X18,
+            vector_state = const tls_offset::VECTOR_STATE,
+            host_fp_state = const tls_offset::HOST_FP_STATE,
+            interrupted = const core::mem::offset_of!(ThreadContext, interrupted),
+            resume_sp = const $stack_offset,
+            resume_pc = const $branch_offset,
+            regs_pstate = const core::mem::offset_of!(PtRegs, pstate),
+            regs_x17 = const core::mem::offset_of!(PtRegs, regs) + 17 * size_of::<usize>(),
+            regs_x18 = const core::mem::offset_of!(PtRegs, regs) + 18 * size_of::<usize>(),
+            regs_x19 = const core::mem::offset_of!(PtRegs, regs) + 19 * size_of::<usize>(),
+            regs_x21 = const core::mem::offset_of!(PtRegs, regs) + 21 * size_of::<usize>(),
+            regs_x23 = const core::mem::offset_of!(PtRegs, regs) + 23 * size_of::<usize>(),
+            regs_x25 = const core::mem::offset_of!(PtRegs, regs) + 25 * size_of::<usize>(),
+            regs_x27 = const core::mem::offset_of!(PtRegs, regs) + 27 * size_of::<usize>(),
+            regs_x29 = const core::mem::offset_of!(PtRegs, regs) + 29 * size_of::<usize>(),
+            vector_fpsr = const core::mem::offset_of!(GuestVectorState, fpsr),
+            vector_fpcr = const core::mem::offset_of!(GuestVectorState, fpcr),
+        );
+    };
+}
+
+/// Initial Darwin process entry without the synthetic BRK/signal-return round trip.
+/// Darwin leaves initial x16 unspecified, so it can hold the final branch target.
+/// Later resumes must restore x16 too and cannot use this shortcut. Neither this
+/// path nor sigreturn changes the physical TPIDRRO_EL0 value.
+#[unsafe(naked)]
+unsafe extern "C" fn switch_to_guest_direct(_: &mut ThreadContext) -> ! {
+    restore_guest_registers!(
+        "switch_to_guest_direct",
+        stack = ("x16", core::mem::offset_of!(PtRegs, sp)),
+        branch = ("x16", core::mem::offset_of!(PtRegs, pc))
+    );
+}
+
 #[unsafe(naked)]
 unsafe extern "C" fn switch_to_guest_via_outbound_stub(_: &mut ThreadContext) -> ! {
-    core::arch::naked_asm!(
-        // x0 is ThreadContext and remains available if an interrupt is pending.
-        "ldr x16, [x0, #{context}]",
-        "mrs x17, tpidrro_el0",
-        "and x17, x17, #0xfffffffffffffff8",
-        "adrp x1, {tls_key_offset}@PAGE",
-        "ldr x1, [x1, {tls_key_offset}@PAGEOFF]",
-        "add x17, x17, x1",
-        "ldr x17, [x17]", // LiteBox TlsBlock pointer
-        // Save host FP control state before installing the guest's.
-        "mrs x1, fpsr",
-        "mrs x2, fpcr",
-        "stp w1, w2, [x17, #{host_fp_state}]",
-        ".globl _switch_to_guest_via_outbound_stub_start",
-        ".alt_entry _switch_to_guest_via_outbound_stub_start",
-        "_switch_to_guest_via_outbound_stub_start:",
-        "mov x1, #1",
-        "str x1, [x17, #{in_guest}]",
-        "ldr x1, [x0, #{interrupted}]",
-        "ldarb w1, [x1]",
-        "cbz w1, 1f",
-        "b _switch_to_guest_via_outbound_stub_interrupted",
-        "1:",
-        "ldr x1, [x16, #144]",
-        "str x1, [x17, #{guest_x18}]",
-        "ldr x0, [x17, #{vector_state}]",
-        "ldp q0, q1, [x0, #0]",
-        "ldp q2, q3, [x0, #32]",
-        "ldp q4, q5, [x0, #64]",
-        "ldp q6, q7, [x0, #96]",
-        "ldp q8, q9, [x0, #128]",
-        "ldp q10, q11, [x0, #160]",
-        "ldp q12, q13, [x0, #192]",
-        "ldp q14, q15, [x0, #224]",
-        "ldp q16, q17, [x0, #256]",
-        "ldp q18, q19, [x0, #288]",
-        "ldp q20, q21, [x0, #320]",
-        "ldp q22, q23, [x0, #352]",
-        "ldp q24, q25, [x0, #384]",
-        "ldp q26, q27, [x0, #416]",
-        "ldp q28, q29, [x0, #448]",
-        "ldp q30, q31, [x0, #480]",
-        "ldr w1, [x0, #{vector_fpsr}]",
-        "msr fpsr, x1",
-        "ldr w1, [x0, #{vector_fpcr}]",
-        "msr fpcr, x1",
-        // Restore SP to the captured SVC control frame. The outbound stub
-        // restores guest x16 and releases the ABI-specific frame.
-        "ldr x0, [x17, #{active}]",
-        "ldr x0, [x0, #{thread_svc_frame}]",
-        "mov sp, x0",
-        "ldr x0, [x16, #{regs_pstate}]",
-        "msr nzcv, x0",
-        "ldp x0, x1, [x16, #0]",
-        "ldp x2, x3, [x16, #16]",
-        "ldp x4, x5, [x16, #32]",
-        "ldp x6, x7, [x16, #48]",
-        "ldp x8, x9, [x16, #64]",
-        "ldp x10, x11, [x16, #80]",
-        "ldp x12, x13, [x16, #96]",
-        "ldp x14, x15, [x16, #112]",
-        "ldr x17, [x16, #136]",
-        "ldp x19, x20, [x16, #152]",
-        "ldp x21, x22, [x16, #168]",
-        "ldp x23, x24, [x16, #184]",
-        "ldp x25, x26, [x16, #200]",
-        "ldp x27, x28, [x16, #216]",
-        "ldp x29, x30, [x16, #232]",
-        "ldr x16, [sp, #{frame_stub}]",
-        "br x16",
-        "_switch_to_guest_via_outbound_stub_interrupted:",
-        "str xzr, [x17, #{in_guest}]",
-        ".globl _switch_to_guest_via_outbound_stub_end",
-        ".alt_entry _switch_to_guest_via_outbound_stub_end",
-        "_switch_to_guest_via_outbound_stub_end:",
-        "b _litebox_macos_interrupt_callback",
-        tls_key_offset = sym TLS_KEY_OFFSET,
-        in_guest = const tls_offset::IN_GUEST,
-        guest_x18 = const tls_offset::GUEST_X18,
-        vector_state = const tls_offset::VECTOR_STATE,
-        host_fp_state = const tls_offset::HOST_FP_STATE,
-        context = const core::mem::offset_of!(ThreadContext, ctx),
-        interrupted = const core::mem::offset_of!(ThreadContext, interrupted),
-        active = const tls_offset::ACTIVE,
-        thread_svc_frame = const core::mem::offset_of!(ThreadContext, svc_frame),
-        regs_pstate = const core::mem::offset_of!(PtRegs, pstate),
-        vector_fpsr = const core::mem::offset_of!(GuestVectorState, fpsr),
-        vector_fpcr = const core::mem::offset_of!(GuestVectorState, fpcr),
-        frame_stub = const SVC_FRAME_OFF_STUB,
+    // Resume at the captured SVC frame; the outbound stub restores x16 and pops it.
+    restore_guest_registers!(
+        "switch_to_guest_via_outbound_stub",
+        stack = ("x0", core::mem::offset_of!(ThreadContext, svc_frame)),
+        branch = ("sp", SVC_FRAME_OFF_STUB)
     );
 }
 
 /// Run a guest thread using the process-wide syscall convention.
+///
+/// For Darwin, each call is an initial process entry, not a full-register resume:
+/// the initial `ctx.regs[16]` (x16) value is ignored and x16 is used as branch scratch.
+/// When enabled via [`set_darwin_private_thread_state`], each call also creates a
+/// native donor thread that remains parked until process exit, even after this
+/// function returns.
 ///
 /// # Panics
 /// Panics if [`set_guest_abi`] has not been called.
@@ -2320,15 +2515,18 @@ where
 }
 
 fn run_thread_inner(shim: &dyn EnterShim<ExecutionContext = PtRegs>, ctx: &mut PtRegs) {
-    run_thread_inner_with_process(shim, ctx, Arc::new(ProcessState::default()));
+    run_thread_inner_with_process(shim, ctx, Arc::new(ProcessState::default()), true);
 }
 
 fn run_thread_inner_with_process(
     shim: &dyn EnterShim<ExecutionContext = PtRegs>,
     ctx: &mut PtRegs,
     process: Arc<ProcessState>,
+    initial_process_entry: bool,
 ) {
+    let config = guest_configuration();
     initialize_thread_tls();
+    register_exception_handlers().expect("re-registering macOS exception handlers");
     assert!(
         read_tls(tls_offset::ACTIVE) == 0,
         "nested guest entry is not supported"
@@ -2338,7 +2536,17 @@ fn run_thread_inner_with_process(
         pending.store(0, Ordering::Relaxed);
     })
     .expect("initialized thread TLS");
-    set_guest_thread_pointer(0);
+    // Darwin child threads receive their guest TSD from the shim initializer.
+    let initial_guest_thread_pointer = if initial_process_entry
+        && config.abi == GuestAbi::Darwin
+        && config.darwin_private_thread_state.load(Ordering::Acquire)
+    {
+        create_private_darwin_thread_state()
+    } else {
+        0
+    };
+    set_guest_thread_pointer(initial_guest_thread_pointer);
+    // Entry/resume installs x18 from PtRegs, not the donor's native register.
     set_guest_x18(0);
     let thread = ThreadHandle(Arc::new(ThreadState {
         // Unregistered before thread exit.
@@ -2348,7 +2556,7 @@ fn run_thread_inner_with_process(
         waker: Mutex::new(None),
     }));
     let mut thread_ctx = ThreadContext {
-        guest_abi: guest_abi(),
+        guest_abi: config.abi,
         shim,
         ctx,
         host_sp: 0,
@@ -2356,10 +2564,12 @@ fn run_thread_inner_with_process(
         outbound_x16: 0,
         outbound_pc: 0,
         outbound_stub: 0,
+        initial_entry: initial_process_entry,
         interrupted: &raw const thread.0.interrupted,
         thread,
         exit: GuestExit::Interrupt,
     };
+    write_tls(tls_offset::NATIVE_SIGRETURN_PENDING, 0);
     write_tls(tls_offset::ACTIVE, (&raw mut thread_ctx) as usize);
     write_tls(
         tls_offset::CURRENT_THREAD,
@@ -2372,6 +2582,7 @@ fn run_thread_inner_with_process(
         write_tls(tls_offset::ACTIVE, 0);
         write_tls(tls_offset::CURRENT_THREAD, 0);
         write_tls(tls_offset::IN_GUEST, 0);
+        write_tls(tls_offset::NATIVE_SIGRETURN_PENDING, 0);
     });
     // SAFETY: macOS sigset_t is an integer bitmask; zero is valid output storage.
     let mut old_mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
@@ -2426,12 +2637,15 @@ fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
         libc::MAP_FAILED,
         "failed to allocate signal stack"
     );
+    let retain_mapping = Cell::new(false);
     let _unmap_guard = litebox::utils::defer(|| {
-        assert_eq!(
-            // SAFETY: the previous altstack is restored before this owned mapping is freed.
-            unsafe { libc::munmap(stack_base, mapping_size) },
-            0,
-        );
+        if !retain_mapping.get() {
+            assert_eq!(
+                // SAFETY: the previous altstack was restored before this owned mapping is freed.
+                unsafe { libc::munmap(stack_base, mapping_size) },
+                0,
+            );
+        }
     });
     assert_eq!(
         // SAFETY: the first page is exclusively owned and outside the usable signal stack.
@@ -2445,17 +2659,31 @@ fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
     };
     // SAFETY: stack_t consists of a nullable pointer and integers, all zero-valid.
     let mut previous = unsafe { std::mem::zeroed::<libc::stack_t>() };
+    // SAFETY: the writable mapping stays live until the previous altstack is restored.
+    let install_result = unsafe { libc::sigaltstack(&raw const alternate, &raw mut previous) };
     assert_eq!(
-        // SAFETY: the writable mapping stays live until the previous altstack is restored.
-        unsafe { libc::sigaltstack(&raw const alternate, &raw mut previous) },
+        install_result,
         0,
+        "sigaltstack failed: {}",
+        std::io::Error::last_os_error()
     );
+    // Darwin libc checks the minimum size even for SS_DISABLE. The kernel
+    // ignores that field when disabling a stack, including a previously absent one.
+    if previous.ss_flags & libc::SS_DISABLE != 0 {
+        previous.ss_size = libc::MINSIGSTKSZ;
+    }
     let _restore_guard = litebox::utils::defer(|| {
-        assert_eq!(
-            // SAFETY: f and its handlers have returned; the saved descriptor remains live.
-            unsafe { libc::sigaltstack(&raw const previous, core::ptr::null_mut()) },
-            0,
-        );
+        // SAFETY: previous was returned by sigaltstack for this thread and stays live.
+        let result = unsafe { libc::sigaltstack(&raw const previous, core::ptr::null_mut()) };
+        if result != 0 {
+            // The kernel may still reference this mapping. Retain it even when
+            // the failure is fatal; the process will reclaim it at exit.
+            retain_mapping.set(true);
+            panic!(
+                "failed to restore the host signal stack: {}",
+                std::io::Error::last_os_error()
+            );
+        }
     });
     f()
 }
@@ -2479,6 +2707,9 @@ impl ThreadContext<'_> {
 }
 
 unsafe fn switch_to_guest(thread_ctx: &mut ThreadContext) -> ! {
+    // Consume this before selecting a path: every later callback is an
+    // arbitrary resume and must restore all registers, including x16.
+    let initial_entry = core::mem::replace(&mut thread_ctx.initial_entry, false);
     if thread_ctx.outbound_stub != 0
         && thread_ctx.ctx.sp == thread_ctx.svc_frame + thread_ctx.guest_abi as usize
         && thread_ctx.ctx.pc == thread_ctx.outbound_pc
@@ -2507,7 +2738,14 @@ unsafe fn switch_to_guest(thread_ctx: &mut ThreadContext) -> ! {
             unsafe { switch_to_guest_via_outbound_stub(thread_ctx) }
         }
     }
-    // SAFETY: generic resume obtains an XNU-created signal context to restore every register.
+    if initial_entry && thread_ctx.guest_abi == GuestAbi::Darwin {
+        // SAFETY: the caller supplies a live context and initialized TLS/handlers.
+        // Initial Darwin process entry leaves x16 unspecified, so it can serve
+        // as branch scratch to avoid the synthetic signal-return round trip.
+        unsafe { switch_to_guest_direct(thread_ctx) }
+    }
+    // SAFETY: the caller's live context is published in ACTIVE, and the installed
+    // handler recognizes this transition's BRK and restores that context.
     unsafe { switch_to_guest_via_sigreturn() }
 }
 
@@ -2677,19 +2915,78 @@ fn fatal_signal(message: &[u8], pc: usize) -> ! {
     }
 }
 
+fn publish_guest_signal_return() {
+    // Publish the native return requirement before exposing guest execution.
+    write_tls(
+        tls_offset::NATIVE_SIGRETURN_PENDING,
+        usize::from(
+            guest_configuration()
+                .rewritten_host_sigreturn
+                .load(Ordering::Acquire),
+        ),
+    );
+    write_tls(tls_offset::IN_GUEST, 1);
+}
+
+struct SignalReturnGuard {
+    restore_guest: bool,
+}
+
+impl SignalReturnGuard {
+    fn new() -> Self {
+        let restore_guest = read_tls(tls_offset::IN_GUEST) != 0;
+        if restore_guest {
+            write_tls(tls_offset::IN_GUEST, 0);
+        }
+        Self { restore_guest }
+    }
+
+    fn disarm(&mut self) {
+        self.restore_guest = false;
+    }
+}
+
+impl Drop for SignalReturnGuard {
+    fn drop(&mut self) {
+        if self.restore_guest {
+            publish_guest_signal_return();
+        }
+    }
+}
+
 fn resume_or_interrupt(mc: &mut libc::__darwin_mcontext64, thread_ctx: &mut ThreadContext) {
     if thread_ctx.thread.0.interrupted.load(Ordering::Acquire) {
         thread_ctx.exit = GuestExit::Interrupt;
         set_signal_return(mc, thread_ctx);
     } else {
         restore_signal_context(thread_ctx.ctx, mc);
-        write_tls(tls_offset::IN_GUEST, 1);
+        publish_guest_signal_return();
     }
 }
 
+static EXCEPTION_HANDLERS_INSTALLED: Mutex<bool> = Mutex::new(false);
+
+/// Disable platform handlers while libsystem_kernel is replaced in a forked child.
+///
+/// # Panics
+/// Panics if the process-wide handler-state mutex is poisoned.
+pub fn suspend_exception_handlers_for_cache_rewrite() -> std::io::Result<()> {
+    let mut installed = EXCEPTION_HANDLERS_INSTALLED.lock().unwrap();
+    *installed = false;
+    // SAFETY: zero initializes SIG_DFL, an empty mask, and no flags.
+    let action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+    for signal in host_signals() {
+        // SAFETY: action is a fully initialized SIG_DFL disposition; no old action is requested.
+        if unsafe { libc::sigaction(signal, &raw const action, core::ptr::null_mut()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    drop(installed);
+    Ok(())
+}
+
 pub(crate) fn register_exception_handlers() -> std::io::Result<()> {
-    static INSTALLED: Mutex<bool> = Mutex::new(false);
-    let mut installed = INSTALLED.lock().unwrap();
+    let mut installed = EXCEPTION_HANDLERS_INSTALLED.lock().unwrap();
     if *installed {
         return Ok(());
     }
@@ -2820,6 +3117,7 @@ unsafe extern "C" fn exception_signal_handler(
     let uc = unsafe { &mut *raw.cast::<libc::ucontext_t>() };
     // SAFETY: the machine context is live; nested signals receive separate frames.
     let mc = unsafe { &mut *uc.uc_mcontext };
+    let mut signal_return = SignalReturnGuard::new();
     let pc: usize = mc.__ss.__pc.trunc();
     let esr = u64::from(mc.__es.__esr);
     // SAFETY: SA_SIGINFO supplies a live siginfo for this invocation.
@@ -2839,9 +3137,12 @@ unsafe extern "C" fn exception_signal_handler(
         ..switch_to_guest_via_sigreturn_end as *const () as usize)
         .contains(&pc);
     let resuming = breakpoint && in_sigreturn_transition;
-    let in_guest = read_tls(tls_offset::IN_GUEST) != 0;
+    let in_guest = signal_return.restore_guest;
     let in_syscall_callback_prologue = (syscall_callback as *const () as usize
         ..litebox_macos_syscall_callback_in_guest_cleared as *const () as usize)
+        .contains(&pc);
+    let in_direct_transition = (switch_to_guest_direct_start as *const () as usize
+        ..switch_to_guest_direct_end as *const () as usize)
         .contains(&pc);
     let in_outbound_transition = (switch_to_guest_via_outbound_stub_start as *const () as usize
         ..switch_to_guest_via_outbound_stub_end as *const () as usize)
@@ -2870,6 +3171,7 @@ unsafe extern "C" fn exception_signal_handler(
         if !ptr.is_null()
             && (in_guest
                 || in_syscall_callback_prologue
+                || in_direct_transition
                 || in_outbound_transition
                 || in_sigreturn_transition)
         {
@@ -2889,10 +3191,12 @@ unsafe extern "C" fn exception_signal_handler(
         // finish saving a coherent guest context before dispatching it.
         return;
     }
-    if !ptr.is_null() && (in_outbound_transition || in_sigreturn_transition) {
+    if !ptr.is_null() && (in_direct_transition || in_outbound_transition || in_sigreturn_transition)
+    {
         if resuming {
             restore_host_fp_state();
             write_tls(tls_offset::IN_GUEST, 0);
+            signal_return.disarm();
             // SAFETY: ACTIVE remains live while run_thread_arch is suspended.
             resume_or_interrupt(mc, unsafe { &mut *ptr });
             return;
@@ -2907,6 +3211,7 @@ unsafe extern "C" fn exception_signal_handler(
         // SAFETY: ACTIVE remains live while run_thread_arch is suspended.
         let thread_ctx = unsafe { &mut *ptr };
         thread_ctx.exit = GuestExit::Interrupt;
+        signal_return.disarm();
         set_signal_return(mc, thread_ctx);
         return;
     }
@@ -2955,6 +3260,7 @@ unsafe extern "C" fn exception_signal_handler(
         Aarch64GateSignalResult::Canonicalized(ctx) => *thread_ctx.ctx = ctx,
         Aarch64GateSignalResult::ResumeGuest(ctx) => {
             *thread_ctx.ctx = ctx;
+            signal_return.disarm();
             resume_or_interrupt(mc, thread_ctx);
             return;
         }
@@ -2990,6 +3296,7 @@ unsafe extern "C" fn exception_signal_handler(
             kernel_mode: false,
         })
     };
+    signal_return.disarm();
     set_signal_return(mc, thread_ctx);
 }
 
@@ -3167,6 +3474,8 @@ unsafe extern "C" fn finish_thread_arch() {
 
 #[cfg(test)]
 mod tests {
+    mod transitions;
+
     use super::*;
     use litebox::platform::{
         PageManagementProvider as _, RawMutPointer as _, SignalProvider as _,
@@ -3574,6 +3883,61 @@ mod tests {
     }
 
     #[test]
+    fn signal_altstack_restores_disabled_and_enabled_stacks() {
+        extern "C" fn check(_: *mut libc::c_void) -> *mut libc::c_void {
+            // Keep assertion failures from unwinding across the pthread C boundary.
+            let result = std::panic::catch_unwind(|| {
+                let query = || {
+                    // SAFETY: stack_t is zero-valid writable output storage.
+                    let mut stack = unsafe { core::mem::zeroed::<libc::stack_t>() };
+                    // SAFETY: null requests a query; stack is live output for this thread.
+                    assert_eq!(
+                        unsafe { libc::sigaltstack(core::ptr::null(), &raw mut stack) },
+                        0
+                    );
+                    stack
+                };
+                let initial = query();
+                assert_eq!(initial.ss_flags, libc::SS_DISABLE);
+                assert_eq!(initial.ss_size, 0);
+                with_signal_alt_stack(|| {
+                    let outer = query();
+                    assert_eq!(outer.ss_flags & (libc::SS_DISABLE | libc::SS_ONSTACK), 0);
+                    with_signal_alt_stack(|| {
+                        let inner = query();
+                        assert_ne!(inner.ss_sp, outer.ss_sp);
+                        assert_eq!(inner.ss_flags & (libc::SS_DISABLE | libc::SS_ONSTACK), 0);
+                    });
+                    let restored = query();
+                    assert_eq!(restored.ss_sp, outer.ss_sp);
+                    assert_eq!(restored.ss_size, outer.ss_size);
+                    assert_eq!(restored.ss_flags, outer.ss_flags);
+                });
+                assert_eq!(query().ss_flags, libc::SS_DISABLE);
+            });
+            usize::from(result.is_err()) as *mut libc::c_void
+        }
+        let mut thread: libc::pthread_t = 0;
+        // SAFETY: output is writable, default attributes are valid, and check does
+        // not borrow parent data. A native pthread avoids Rust's preinstalled altstack.
+        assert_eq!(
+            unsafe {
+                libc::pthread_create(
+                    &raw mut thread,
+                    core::ptr::null(),
+                    check,
+                    core::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let mut result = core::ptr::null_mut();
+        // SAFETY: successful creation initialized thread; join consumes this live handle.
+        assert_eq!(unsafe { libc::pthread_join(thread, &raw mut result) }, 0);
+        assert!(result.is_null(), "native altstack assertions failed");
+    }
+
+    #[test]
     fn native_page_size_rejects_subpage_operations() {
         let platform = MacosUserland::new();
         assert_eq!(HOST_PAGE_SIZE, 16384);
@@ -3706,6 +4070,7 @@ mod tests {
             &InitOnly(std::cell::RefCell::new(Some(f))),
             &mut PtRegs::default(),
             process,
+            false,
         );
     }
 
@@ -4155,11 +4520,14 @@ mod tests {
             ..litebox_macos_syscall_callback_in_guest_cleared as *const () as usize;
         let sigreturn = switch_to_guest_via_sigreturn_start as *const () as usize
             ..switch_to_guest_via_sigreturn_end as *const () as usize;
+        let direct = switch_to_guest_direct_start as *const () as usize
+            ..switch_to_guest_direct_end as *const () as usize;
         let outbound = switch_to_guest_via_outbound_stub_start as *const () as usize
             ..switch_to_guest_via_outbound_stub_end as *const () as usize;
-        assert_eq!(syscall_prologue.len(), 72 * size_of::<u32>());
+        assert_eq!(syscall_prologue.len(), 86 * size_of::<u32>());
         assert_eq!(sigreturn.len(), 3 * size_of::<u32>());
-        assert_eq!(outbound.len(), 52 * size_of::<u32>());
+        assert_eq!(direct.len(), 51 * size_of::<u32>());
+        assert_eq!(outbound.len(), 51 * size_of::<u32>());
     }
 
     #[test]
@@ -4206,157 +4574,6 @@ mod tests {
             unsafe { run_thread(PanickingShim, &mut ctx) };
         });
         assert!(result.is_err(), "the panic must propagate to the caller");
-    }
-
-    #[test]
-    fn child_inherits_vector_state_and_dispatches_on_host_stack() {
-        use litebox::shim::InitThread;
-        use litebox_syscall_rewriter::{
-            RewriteOptions, TargetHost, patch_code_segment_with_options,
-        };
-
-        #[derive(Debug, PartialEq)]
-        enum Event {
-            VectorStateInherited(bool),
-            EnteredOnHostStack(bool),
-            SyscallOnHostStackWithVectorState(bool),
-            Done,
-        }
-        struct VectorStateProbe {
-            entry: usize,
-            stack: usize,
-            vector_state: GuestVectorState,
-            send: std::sync::mpsc::Sender<Event>,
-        }
-        fn altstack_is_installed_and_inactive() -> bool {
-            // SAFETY: stack_t is zero-valid writable output for this thread's query.
-            let mut stack = unsafe { core::mem::zeroed::<libc::stack_t>() };
-            // SAFETY: null requests a query; stack remains writable for the call.
-            let result = unsafe { libc::sigaltstack(core::ptr::null(), &raw mut stack) };
-            result == 0 && stack.ss_flags & (libc::SS_ONSTACK | libc::SS_DISABLE) == 0
-        }
-        impl InitThread for VectorStateProbe {
-            type ExecutionContext = PtRegs;
-            fn init(self: Box<Self>) -> Box<dyn EnterShim<ExecutionContext = PtRegs>> {
-                self.send
-                    .send(Event::VectorStateInherited(
-                        get_guest_vector_state() == self.vector_state,
-                    ))
-                    .unwrap();
-                self
-            }
-        }
-        impl EnterShim for VectorStateProbe {
-            type ExecutionContext = PtRegs;
-            fn init(&self, ctx: &mut PtRegs) -> ContinueOperation {
-                self.send
-                    .send(Event::EnteredOnHostStack(
-                        altstack_is_installed_and_inactive(),
-                    ))
-                    .unwrap();
-                ctx.pc = self.entry;
-                ctx.sp = self.stack;
-                ctx.regs[8] = 172; // getpid
-                ContinueOperation::Resume
-            }
-            fn syscall(&self, _: &mut PtRegs) -> ContinueOperation {
-                self.send
-                    .send(Event::SyscallOnHostStackWithVectorState(
-                        altstack_is_installed_and_inactive()
-                            && get_guest_vector_state() == self.vector_state,
-                    ))
-                    .unwrap();
-                ContinueOperation::Terminate
-            }
-            fn exception(&self, _: &mut PtRegs, _: &ExceptionInfo) -> ContinueOperation {
-                ContinueOperation::Terminate
-            }
-            fn interrupt(&self, _: &mut PtRegs) -> ContinueOperation {
-                ContinueOperation::Resume
-            }
-        }
-        impl Drop for VectorStateProbe {
-            fn drop(&mut self) {
-                let _ = self.send.send(Event::Done);
-            }
-        }
-
-        set_guest_abi(GuestAbi::Linux);
-        let platform = MacosUserland::new();
-        let memory = platform
-            .allocate_pages(
-                TASK_ADDR_MIN..TASK_ADDR_MIN + 3 * HOST_PAGE_SIZE,
-                RW,
-                false,
-                true,
-                FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
-            )
-            .unwrap();
-        let base = memory.as_usize();
-        let mut code = 0xd4000001u32.to_le_bytes();
-        let (trampoline, trapped) = patch_code_segment_with_options(
-            &mut code,
-            base as u64,
-            (base + HOST_PAGE_SIZE / 2) as u64,
-            platform.get_syscall_entry_point() as u64,
-            RewriteOptions::new(TargetHost::MacOs, true),
-        )
-        .unwrap();
-        assert_eq!(trapped, []);
-        assert_eq!(memory.write_slice_at_offset(0, &code), Some(()));
-        assert_eq!(
-            memory.write_slice_at_offset((HOST_PAGE_SIZE / 2).cast_signed(), &trampoline),
-            Some(())
-        );
-        // SAFETY: code is initialized and has no active readers before publication.
-        unsafe {
-            platform
-                .update_permissions(
-                    base..base + HOST_PAGE_SIZE,
-                    MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
-                )
-                .unwrap();
-        }
-        let original_vector_state = get_guest_vector_state();
-        let _restore = litebox::utils::defer(|| set_guest_vector_state(&original_vector_state));
-        let mut vector_state = GuestVectorState::default();
-        vector_state.registers[0] = 0x1234;
-        vector_state.registers[31] = 0x5678;
-        set_guest_vector_state(&vector_state);
-        let (send, receive) = std::sync::mpsc::channel();
-        // SAFETY: the test retains the child's rewritten code and stack until
-        // VectorStateProbe is dropped.
-        unsafe {
-            platform
-                .spawn_thread(
-                    &PtRegs::default(),
-                    Box::new(VectorStateProbe {
-                        entry: base,
-                        stack: base + 3 * HOST_PAGE_SIZE,
-                        vector_state,
-                        send,
-                    }),
-                )
-                .unwrap();
-        }
-        let observed: Vec<_> = (0..4)
-            .map(|_| receive.recv_timeout(Duration::from_secs(5)).unwrap())
-            .collect();
-        assert_eq!(
-            observed,
-            [
-                Event::VectorStateInherited(true),
-                Event::EnteredOnHostStack(true),
-                Event::SyscallOnHostStackWithVectorState(true),
-                Event::Done
-            ]
-        );
-        // SAFETY: VectorStateProbe has stopped, so the guest mappings are idle.
-        unsafe {
-            platform
-                .release_pages(base..base + 3 * HOST_PAGE_SIZE)
-                .unwrap();
-        }
     }
 
     #[test]
@@ -4430,7 +4647,14 @@ mod tests {
     }
 
     #[test]
+    fn private_darwin_thread_state_can_be_created() {
+        MacosUserland::new();
+        create_private_darwin_thread_state();
+    }
+
+    #[test]
     fn initialization_preserves_tls_across_instances() {
+        set_guest_abi(GuestAbi::Linux);
         let first = MacosUserland::new();
         let original = (
             get_guest_thread_pointer(),
